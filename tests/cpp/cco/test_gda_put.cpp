@@ -146,7 +146,7 @@ int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet)
   // launch
   hipStream_t stream;
   HIP_CHECK(hipStreamCreate(&stream));
-  CCO_GDA_DISPATCH(devComm.ibgda.providerType, GdaAlltoAllKernel<P, float>
+  CCO_GDA_DISPATCH(GdaAlltoAllKernel<P, float>
                    <<<1, 64, 0, stream>>>(sendWin, recvWin, COUNT, devComm));
   HIP_CHECK(hipStreamSynchronize(stream));
   printf("[rank %d] kernel completed\n", rank);

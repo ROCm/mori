@@ -54,6 +54,26 @@ namespace cco {
  *  device-only (uses RDMA core + device builtins).
  * ════════════════════════════════════════════════════════════════════════════ */
 
+// ── Compile-time GDA provider dispatch (per-NIC build, like shmem) ───────────
+// Provider is fixed at build time from the NIC auto-detected by
+// cmake/MoriDetectDevice.cmake (MORI_DEVICE_NIC_*; the python/mori/jit path
+// mirrors it), so only the one ccoGda<P> specialization is built.
+#if defined(MORI_DEVICE_NIC_BNXT)
+#define CCO_GDA_BUILD_PROVIDER ::mori::core::ProviderType::BNXT
+#elif defined(MORI_DEVICE_NIC_IONIC)
+#define CCO_GDA_BUILD_PROVIDER ::mori::core::ProviderType::PSD
+#else
+#define CCO_GDA_BUILD_PROVIDER ::mori::core::ProviderType::MLX5  // default
+#endif
+
+// Launch a GDA kernel against the build's provider; `P` is a constexpr provider:
+//   CCO_GDA_DISPATCH(MyKernel<P, float><<<g, b, 0, s>>>(win, win, n, devComm));
+#define CCO_GDA_DISPATCH(...)                  \
+  do {                                         \
+    constexpr auto P = CCO_GDA_BUILD_PROVIDER; \
+    __VA_ARGS__;                               \
+  } while (0)
+
 // ── low-level type aliases / enums + ccoGda<PrvdType> class declaration ──
 // Window handles use the shared ccoWindow_t (= ccoWindowDevice*) declared above.
 typedef struct {

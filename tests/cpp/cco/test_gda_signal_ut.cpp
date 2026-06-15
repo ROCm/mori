@@ -45,7 +45,7 @@
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 
-static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::PSD;
+static constexpr mori::core::ProviderType kPrvdType = CCO_GDA_BUILD_PROVIDER;  // per-NIC build
 
 // ── shared op/check descriptors ──────────────────────────────────────────────
 //

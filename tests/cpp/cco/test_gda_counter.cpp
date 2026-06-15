@@ -46,7 +46,7 @@
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 static const size_t COUNT = 256;  // float elements per rank-pair slice
 
-static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::PSD;
+static constexpr mori::core::ProviderType kPrvdType = CCO_GDA_BUILD_PROVIDER;  // per-NIC build
 
 // SEND: each thread issues `putsPerPeer` puts to a distinct peer (no counter
 // on put — counter is a separate API). After all puts + flush, one counter()

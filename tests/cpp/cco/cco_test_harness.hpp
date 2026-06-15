@@ -47,7 +47,6 @@
 
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
-#include "mori/core/transport/rdma/core_device_types.hpp"  // mori::core::ProviderType
 
 // Current rank, set at the top of each run_test; used by HIP_CHECK diagnostics.
 inline int g_rank = 0;
@@ -62,30 +61,9 @@ inline int g_rank = 0;
     }                                                                                            \
   } while (0)
 
-// Run a kernel-launch (or any statement) against the ccoGda<PrvdType> provider
-// matching the DevComm's RDMA backend, resolved at runtime. `prvd` is the
-// DevComm's ccoProviderType (devComm.ibgda.providerType); inside __VA_ARGS__,
-// `P` is a constexpr mori::core::ProviderType usable as a template argument.
-#define CCO_GDA_DISPATCH(prvd, ...)                                                              \
-  do {                                                                                           \
-    switch (prvd) {                                                                              \
-      case mori::cco::CCO_PROVIDER_BNXT: {                                                       \
-        constexpr auto P = mori::core::ProviderType::BNXT;                                       \
-        __VA_ARGS__;                                                                             \
-      } break;                                                                                   \
-      case mori::cco::CCO_PROVIDER_MLX5: {                                                       \
-        constexpr auto P = mori::core::ProviderType::MLX5;                                       \
-        __VA_ARGS__;                                                                             \
-      } break;                                                                                   \
-      case mori::cco::CCO_PROVIDER_PSD: {                                                        \
-        constexpr auto P = mori::core::ProviderType::PSD;                                        \
-        __VA_ARGS__;                                                                             \
-      } break;                                                                                   \
-      default:                                                                                   \
-        fprintf(stderr, "[cco gda test] unsupported GDA provider %d\n", static_cast<int>(prvd)); \
-        _exit(1);                                                                                \
-    }                                                                                            \
-  } while (0)
+// GDA provider dispatch (CCO_GDA_DISPATCH) lives in mori/cco/cco_scale_out.hpp
+// now — it is compile-time (per-NIC build), so GDA tests include that header and
+// call CCO_GDA_DISPATCH(Kernel<P, ...><<<...>>>(...)) with no runtime provider.
 
 // Each test implements this; the harness invokes it for every rank.
 int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet);
