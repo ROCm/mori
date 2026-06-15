@@ -49,7 +49,10 @@
 //     order is unit-tested elsewhere; cross-node placement contrast is fully
 //     visible with DRAM + multiple nodes.
 //   * random goes through the production thread_local RNG (FromEnvironment uses
-//     the unseeded ctor), so it is not reproducible run-to-run; use enough iters.
+//     the unseeded ctor), so its node choice is not reproducible run-to-run.
+//     That is fine: per-node cold-start is one-time (see RunCombo), so at most
+//     `peers` timed iters are cold and the median over >2*peers iters is always
+//     a warm sample.  RunCombo enforces that iter floor.
 //
 // CSV (stdout):
 //   select_algo,node_affinity,regime,peers,requester,reader,batch,page_bytes,
@@ -57,9 +60,13 @@
 //   unique_put_nodes,max_node_share,get_wall_ms,get_gibps,get_success,
 //   get_fanout_nodes,local_hit_frac
 // (put/get_wall_ms are the MEDIAN per-iter latency and *_gibps is the median-
-//  batch throughput over it — robust to the one-time cold-start cost; success/
-//  fail counts are summed over measured iters; distribution metrics are the mean
-//  of per-iter values over the routed keys.)
+//  batch throughput over it; success/fail counts are summed over measured iters;
+//  distribution metrics are the mean of per-iter values over the routed keys.
+//  The measured-iter count is floored at 2*peers+1 (RunCombo) so the median is
+//  always a warm sample even for strategies whose target node rotates between
+//  iters (e.g. random): per-node cold-start is one-time, so at most `peers`
+//  iters are cold and they sit in the median's upper tail.  The `iters` CSV
+//  column reports the actual measured count after that floor is applied.)
 //
 // --dump-placement adds a per-node long table to stderr:
 //   select_algo,node_affinity,regime,batch,node,items,bytes
@@ -328,8 +335,12 @@ bool WaitVisible(PoolClient* reader, const std::vector<std::string>& keys) {
 }
 
 // Median is robust to the one-time cold-start cost (first AllocateSlot / peer
-// connection / RDMA registration to a node after Clear) that the mean would
-// fold into every comparison.
+// connection / RDMA registration to a node) that the mean would fold into every
+// comparison.  Per-node cold-start happens at most once (connections survive
+// Clear()), so across a combo at most `peers` timed iters are cold; with the
+// measured-iter count floored at 2*peers+1 (RunCombo) those cold iters are a
+// strict minority in the upper tail and the median is always a warm sample —
+// even when the strategy's target node rotates between iters (e.g. random).
 double Median(std::vector<double> v) {
   if (v.empty()) return 0.0;
   std::sort(v.begin(), v.end());
@@ -372,9 +383,26 @@ void RunCombo(const BenchOpts& o, const std::string& algo, const std::string& af
     sizes[i] = item_bytes;
   }
 
+  // Per-peer cold-start (first peer-service connection + RDMA QP setup to a
+  // node) is paid once per node and then stays warm for the rest of the combo
+  // (connections survive Clear()).  So the number of cold timed iters is at most
+  // `peers` — each node contributes at most one cold first-touch, no matter how
+  // the strategy picks (e.g. `random` rotates its single-node anchor across
+  // iters).  Reporting the MEDIAN (see Median) over iters > 2*peers therefore
+  // guarantees the reported value is a warm sample: the <=peers cold iters are a
+  // strict minority and sit in the upper tail.  We bump the measured-iter count
+  // up to that floor so the result is steady-state regardless of `peers`.
+  const size_t measured_iters = std::max<size_t>(o.iters, 2 * o.peers + 1);
+  if (measured_iters != o.iters) {
+    std::fprintf(stderr,
+                 "[bench] iters bumped %zu -> %zu (>2*peers) so the median excludes per-node "
+                 "cold-start (algo=%s aff=%s regime=%s batch=%zu)\n",
+                 o.iters, measured_iters, algo.c_str(), affinity.c_str(), regime.c_str(), batch);
+  }
+
   ComboResult r;
   // Iter 0 is an unmeasured warm-up (channels / RDMA registration).
-  for (size_t it = 0; it <= o.iters; ++it) {
+  for (size_t it = 0; it <= measured_iters; ++it) {
     if (!cluster.ResetAll()) {
       std::cerr << "capacity did not recover after Clear (algo=" << algo << " aff=" << affinity
                 << " regime=" << regime << " batch=" << batch << ")\n";
@@ -472,7 +500,7 @@ void RunCombo(const BenchOpts& o, const std::string& algo, const std::string& af
     }
   }
 
-  const double inv_iters = o.iters > 0 ? 1.0 / o.iters : 0.0;
+  const double inv_iters = measured_iters > 0 ? 1.0 / measured_iters : 0.0;
   constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
   // wall_ms is the median per-iter latency; throughput is the median-batch bytes
   // over that median latency (outlier-robust, see Median()).
@@ -486,9 +514,9 @@ void RunCombo(const BenchOpts& o, const std::string& algo, const std::string& af
   std::printf(
       "%s,%s,%s,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%.3f,%.3f,%zu,%zu,%.2f,%.3f,%.3f,%.3f,%zu,%.2f,%.3f\n",
       algo.c_str(), affinity.c_str(), regime.c_str(), o.peers, o.requester, o.reader, batch,
-      o.page_bytes, o.per_item_pages, o.iters, put_med_ms, put_gibps, r.put_success, r.put_fail,
-      r.sum_unique_nodes * inv_iters, r.sum_max_share * inv_iters, get_med_ms, get_gibps,
-      r.get_success, r.sum_fanout * inv_iters, r.sum_local_hit * inv_iters);
+      o.page_bytes, o.per_item_pages, measured_iters, put_med_ms, put_gibps, r.put_success,
+      r.put_fail, r.sum_unique_nodes * inv_iters, r.sum_max_share * inv_iters, get_med_ms,
+      get_gibps, r.get_success, r.sum_fanout * inv_iters, r.sum_local_hit * inv_iters);
   std::fflush(stdout);
 
   if (o.dump_placement) {
