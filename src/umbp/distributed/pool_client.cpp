@@ -146,9 +146,8 @@ inline bool LocalAvx2Supported() { return false; }
 #endif
 
 inline void LocalCopyBlock(void* dst, const void* src, size_t size) {
-  static const bool kNt =
-      LocalAvx2Supported() &&
-      !(std::getenv("UMBP_DRAM_NT_COPY") && std::getenv("UMBP_DRAM_NT_COPY")[0] == '0');
+  static const bool kNt = LocalAvx2Supported() && !(std::getenv("UMBP_DRAM_NT_COPY") &&
+                                                    std::getenv("UMBP_DRAM_NT_COPY")[0] == '0');
   static const size_t kNtMinBytes = 256ull << 10;
   if (kNt && size >= kNtMinBytes) {
     LocalNtCopyAvx2(static_cast<char*>(dst), static_cast<const char*>(src), size);
@@ -812,7 +811,8 @@ PoolClient::PartitionBatchPutTargets(const std::vector<std::string>& keys,
     });
     if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
       double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
-                       std::chrono::steady_clock::now() - t0).count();
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
       size_t tot = 0;
       for (size_t k : local_idx) tot += sizes[k];
       MORI_UMBP_INFO("[LocalCopy] PUT keys={} bytes={} threads={} elapsed_ms={:.3f} GiB_s={:.2f}",
@@ -981,7 +981,8 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     }
     if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
       double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
-                       std::chrono::steady_clock::now() - t0).count();
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
       MORI_UMBP_INFO("[LocalCopy] GET keys={} bytes={} threads={} elapsed_ms={:.3f} GiB_s={:.2f}",
                      local_get_idx.size(), tot, nthr, sec * 1000.0,
                      tot / (sec > 0 ? sec : 1e-12) / (1024.0 * 1024 * 1024));

@@ -89,9 +89,8 @@ bool Avx2Supported() { return false; }
 // fall back to glibc memcpy (its small-copy path is faster and they may be hot).
 // Disable NT via UMBP_DRAM_NT_COPY=0.
 inline void CopyBlock(void* dst, const void* src, size_t size) {
-  static const bool kNt =
-      Avx2Supported() &&
-      !(std::getenv("UMBP_DRAM_NT_COPY") && std::getenv("UMBP_DRAM_NT_COPY")[0] == '0');
+  static const bool kNt = Avx2Supported() && !(std::getenv("UMBP_DRAM_NT_COPY") &&
+                                               std::getenv("UMBP_DRAM_NT_COPY")[0] == '0');
   static const size_t kNtMinBytes = 256ull << 10;
   if (kNt && size >= kNtMinBytes) {
     NtCopyAvx2(static_cast<char*>(dst), static_cast<const char*>(src), size);
