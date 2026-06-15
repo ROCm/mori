@@ -41,6 +41,21 @@ target_compile_features(test_master_metadata_store_interface PRIVATE cxx_std_17)
 gtest_discover_tests(test_master_metadata_store_interface)
 
 # ---------------------------------------------------------------------------
+# test_in_memory_master_metadata_store — Phase 2 behavioral suite for the
+# InMemoryMasterMetadataStore implementation of IMasterMetadataStore (§6a).
+# Written against IMasterMetadataStore& so it is reused for the Redis backend.
+# ---------------------------------------------------------------------------
+add_executable(test_in_memory_master_metadata_store
+               test_in_memory_master_metadata_store.cpp)
+
+target_link_libraries(test_in_memory_master_metadata_store
+                      PRIVATE umbp_common GTest::gtest_main)
+
+target_compile_features(test_in_memory_master_metadata_store PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_in_memory_master_metadata_store)
+
+# ---------------------------------------------------------------------------
 # test_external_kv_block_index
 # ---------------------------------------------------------------------------
 add_executable(test_external_kv_block_index test_external_kv_block_index.cpp)
