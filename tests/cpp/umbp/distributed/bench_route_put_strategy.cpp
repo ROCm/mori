@@ -71,8 +71,12 @@
 // --dump-placement adds a per-node long table to stderr:
 //   select_algo,node_affinity,regime,batch,node,items,bytes
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -104,12 +108,38 @@ using mori::umbp::TierType;
 
 namespace {
 
-// Unique peer-service port per PoolClient so each node registers a peer_address
-// and can serve/accept remote AllocateSlot/ResolveKey RPCs.  Monotonic, never
-// reused — fine for the realistic number of clusters one bench run builds.
+// Peer-service port per PoolClient so each node registers a peer_address and can
+// serve/accept remote AllocateSlot/ResolveKey RPCs.  Ask the OS for a currently
+// free port (bind a probe socket to :0, read the assignment, close it) instead
+// of a hardcoded base: a fixed range collides with sockets left in the (host)
+// network namespace by prior/interrupted runs.  A small TOCTOU window remains
+// before PoolClient rebinds, but that is acceptable for a manual bench.
 inline uint16_t NextPeerServicePort() {
-  static std::atomic<uint16_t> next{56000};
-  return next.fetch_add(1);
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    std::cerr << "port probe: socket() failed\n";
+    std::exit(2);
+  }
+  int one = 1;
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = 0;  // OS-assigned
+  if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(fd, 1) != 0) {
+    ::close(fd);
+    std::cerr << "port probe: bind/listen failed\n";
+    std::exit(2);
+  }
+  socklen_t len = sizeof(addr);
+  if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+    ::close(fd);
+    std::cerr << "port probe: getsockname() failed\n";
+    std::exit(2);
+  }
+  const uint16_t port = ntohs(addr.sin_port);
+  ::close(fd);
+  return port;
 }
 
 struct BenchOpts {
