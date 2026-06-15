@@ -32,8 +32,7 @@
 
 namespace mori::umbp {
 
-class GlobalBlockIndex;
-class ClientRegistry;
+class IMasterMetadataStore;
 
 // Fire-and-forget callback for shipping EvictKey RPCs to a peer.  The
 // EvictionManager calls this once per (node_id, peer_address) group of
@@ -57,7 +56,7 @@ class EvictionManager {
   // logs intent but does not ship EvictKey RPCs (useful for routing-
   // only tests).  Master-server-side construction passes a concrete
   // MasterPeerStubPool here.
-  EvictionManager(GlobalBlockIndex& index, ClientRegistry& registry, const EvictionConfig& config,
+  EvictionManager(IMasterMetadataStore& store, const EvictionConfig& config,
                   EvictKeyDispatcher* dispatcher = nullptr);
   ~EvictionManager();
 
@@ -71,8 +70,7 @@ class EvictionManager {
   void EvictionLoop();
   void RunOnce();
 
-  GlobalBlockIndex& index_;
-  ClientRegistry& registry_;
+  IMasterMetadataStore& store_;
   EvictionConfig config_;
   EvictKeyDispatcher* dispatcher_;
   std::thread thread_;

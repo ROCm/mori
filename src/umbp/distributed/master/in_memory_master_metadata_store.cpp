@@ -367,6 +367,11 @@ void InMemoryMasterMetadataStore::UnregisterExternalKvByTier(const std::string& 
   }
 }
 
+void InMemoryMasterMetadataStore::UnregisterExternalKvByNode(const std::string& node_id) {
+  std::unique_lock lock(mutex_);
+  RemoveExternalKvByNodeLocked(node_id);
+}
+
 std::size_t InMemoryMasterMetadataStore::GarbageCollectHits(
     std::chrono::system_clock::time_point cutoff) {
   std::unique_lock lock(mutex_);

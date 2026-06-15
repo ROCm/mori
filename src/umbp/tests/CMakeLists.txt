@@ -131,7 +131,7 @@ target_compile_features(test_global_block_index_events PRIVATE cxx_std_17)
 gtest_discover_tests(test_global_block_index_events)
 
 # ---------------------------------------------------------------------------
-# test_router_dedup — master-side BatchRoutePut dedup via GlobalBlockIndex
+# test_router_dedup — master-side BatchRoutePut dedup via IMasterMetadataStore
 # ---------------------------------------------------------------------------
 add_executable(test_router_dedup test_router_dedup.cpp)
 

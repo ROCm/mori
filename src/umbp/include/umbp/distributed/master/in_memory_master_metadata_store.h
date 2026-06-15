@@ -79,6 +79,7 @@ class InMemoryMasterMetadataStore : public IMasterMetadataStore {
   void UnregisterExternalKv(const std::string& node_id, const std::vector<std::string>& hashes,
                             TierType tier) override;
   void UnregisterExternalKvByTier(const std::string& node_id, TierType tier) override;
+  void UnregisterExternalKvByNode(const std::string& node_id) override;
   std::size_t GarbageCollectHits(std::chrono::system_clock::time_point cutoff) override;
 
   // --- Block reads ---

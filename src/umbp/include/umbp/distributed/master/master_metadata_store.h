@@ -324,6 +324,12 @@ class IMasterMetadataStore {
   // wipe — admin path, not heartbeat).
   virtual void UnregisterExternalKvByTier(const std::string& node_id, TierType tier) = 0;
 
+  // Drop every external-kv entry (all tiers) belonging to `node_id` without
+  // touching the client record. Backs the live RevokeAllExternalKvBlocksForNode
+  // RPC, which a peer issues to wipe its external-KV registration before a
+  // full re-sync. Does NOT check liveness. Idempotent on unknown nodes.
+  virtual void UnregisterExternalKvByNode(const std::string& node_id) = 0;
+
   // Drop every per-hash hit-count entry whose last_seen < cutoff.
   // Returns the number of entries dropped. Replaces
   // ExternalKvHitIndex::GarbageCollect; the cutoff is a system_clock
