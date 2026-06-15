@@ -75,14 +75,14 @@ class Router {
       const std::vector<std::string>& keys, const std::string& node_id,
       const std::unordered_set<std::string>& exclude_nodes);
 
-  void SetLeaseDuration(std::chrono::steady_clock::duration d) { lease_duration_ = d; }
+  void SetLeaseDuration(std::chrono::system_clock::duration d) { lease_duration_ = d; }
 
  private:
   GlobalBlockIndex& index_;
   ClientRegistry& registry_;
   std::unique_ptr<RouteGetStrategy> get_strategy_;
   std::unique_ptr<RoutePutStrategy> put_strategy_;
-  std::chrono::steady_clock::duration lease_duration_{std::chrono::seconds{10}};
+  std::chrono::system_clock::duration lease_duration_{std::chrono::seconds{10}};
 };
 
 }  // namespace mori::umbp

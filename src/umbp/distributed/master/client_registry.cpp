@@ -53,7 +53,7 @@ bool ClientRegistry::RegisterClient(const std::string& node_id, const std::strin
                                     const std::vector<uint8_t>& engine_desc_bytes,
                                     const std::vector<std::string>& tags) {
   std::unique_lock lock(mutex_);
-  const auto now = std::chrono::steady_clock::now();
+  const auto now = std::chrono::system_clock::now();
 
   auto it = clients_.find(node_id);
   if (it != clients_.end()) {
@@ -132,7 +132,7 @@ ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
     }
     auto& record = it->second;
 
-    record.last_heartbeat = std::chrono::steady_clock::now();
+    record.last_heartbeat = std::chrono::system_clock::now();
     record.status = ClientStatus::ALIVE;
     record.tier_capacities = tier_capacities;
 
@@ -235,7 +235,7 @@ void ClientRegistry::ReaperLoop() {
 }
 
 void ClientRegistry::ReapExpiredClients() {
-  const auto now = std::chrono::steady_clock::now();
+  const auto now = std::chrono::system_clock::now();
   const auto expiry = ExpiryDuration();
   std::vector<std::string> dead_nodes;
 

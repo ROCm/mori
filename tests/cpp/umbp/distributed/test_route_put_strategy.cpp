@@ -38,8 +38,8 @@ ClientRecord MakeClient(const std::string& node_id, const std::string& addr,
   rec.node_address = addr;
   rec.peer_address = addr;
   rec.status = ClientStatus::ALIVE;
-  rec.last_heartbeat = std::chrono::steady_clock::now();
-  rec.registered_at = std::chrono::steady_clock::now();
+  rec.last_heartbeat = std::chrono::system_clock::now();
+  rec.registered_at = std::chrono::system_clock::now();
   rec.tier_capacities = std::move(caps);
   return rec;
 }

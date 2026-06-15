@@ -44,32 +44,32 @@ struct BlockEntry {
   std::atomic<int64_t> last_accessed_rep{0};
   std::atomic<uint64_t> atomic_access_count{0};
 
-  void GrantLease(std::chrono::steady_clock::duration duration) {
-    auto expiry = std::chrono::steady_clock::now() + duration;
+  void GrantLease(std::chrono::system_clock::duration duration) {
+    auto expiry = std::chrono::system_clock::now() + duration;
     lease_expiry_rep.store(expiry.time_since_epoch().count(), std::memory_order_release);
   }
 
   bool IsLeased() const {
-    auto now_rep = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto now_rep = std::chrono::system_clock::now().time_since_epoch().count();
     return lease_expiry_rep.load(std::memory_order_acquire) > now_rep;
   }
 
   void RecordAccessAtomic() {
-    last_accessed_rep.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+    last_accessed_rep.store(std::chrono::system_clock::now().time_since_epoch().count(),
                             std::memory_order_release);
     atomic_access_count.fetch_add(1, std::memory_order_relaxed);
   }
 
-  std::chrono::steady_clock::time_point GetLastAccessed() const {
+  std::chrono::system_clock::time_point GetLastAccessed() const {
     auto rep = last_accessed_rep.load(std::memory_order_acquire);
-    return std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(rep));
+    return std::chrono::system_clock::time_point(std::chrono::system_clock::duration(rep));
   }
 };
 
 struct EvictionCandidate {
   std::string key;
   Location location;
-  std::chrono::steady_clock::time_point last_accessed_at;
+  std::chrono::system_clock::time_point last_accessed_at;
   uint64_t size;
 };
 
@@ -104,13 +104,13 @@ class GlobalBlockIndex {
   void RecordAccess(const std::string& key);
 
   // Grant a time-limited lease to protect a key from eviction.
-  void GrantLease(const std::string& key, std::chrono::steady_clock::duration duration);
+  void GrantLease(const std::string& key, std::chrono::system_clock::duration duration);
 
   // Batched Lookup + filter + (on non-empty result) RecordAccess + GrantLease,
   // under a single shared_lock.
   std::vector<std::vector<Location>> BatchLookupForRouteGet(
       const std::vector<std::string>& keys, const std::unordered_set<std::string>& exclude_nodes,
-      std::chrono::steady_clock::duration lease_duration);
+      std::chrono::system_clock::duration lease_duration);
 
   // --- Queries ---
 
@@ -126,15 +126,9 @@ class GlobalBlockIndex {
 
   // --- Eviction ---
 
-  struct NodeTierKey {
-    std::string node_id;
-    TierType tier;
-    bool operator<(const NodeTierKey& o) const {
-      if (node_id != o.node_id) return node_id < o.node_id;
-      return tier < o.tier;
-    }
-    bool operator==(const NodeTierKey& o) const { return node_id == o.node_id && tier == o.tier; }
-  };
+  // Hoisted to umbp/distributed/types.h; alias kept temporarily so existing
+  // callers (e.g. GlobalBlockIndex::NodeTierKey) compile.  Removed in Phase 5.
+  using NodeTierKey = mori::umbp::NodeTierKey;
 
   std::vector<EvictionCandidate> FindEvictionCandidates(
       const std::set<NodeTierKey>& overloaded_node_tiers) const;
