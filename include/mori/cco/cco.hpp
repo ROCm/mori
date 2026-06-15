@@ -271,13 +271,6 @@ struct ccoIbgdaContext {
   application::RdmaEndpointDevice* endpoints;  // [worldSize * numQpPerPe]
   int numQpPerPe;
 
-  // RDMA backend provider of the endpoints above (all peers on a node share
-  // the same NIC vendor). Resolved once at DevComm creation from the first
-  // valid endpoint's vendorId; host-readable so a launcher can dispatch to the
-  // matching ccoGda<PrvdType> kernel instantiation without hardcoding it.
-  // Unknown when gdaConnType==NONE (no endpoints).
-  ccoProviderType providerType{CCO_PROVIDER_UNKNOWN};
-
   // Signal: remote peers atomic +1 here after put completes.
   int signalCount;
   uint64_t* signalBuf;      // [signalCount]  — sub-ptr into resourceWindow
@@ -848,6 +841,11 @@ struct ccoComm {
   // Default # of QPs per peer (from Context). Per-DevComm may override via reqs.
   int defaultNumQpPerPe{4};
   bool iovaZeroMode{true};
+
+  // GDA backend provider of this comm's NICs; resolved at the first
+  // ccoDevCommCreate (CCO_PROVIDER_UNKNOWN until then / when GDA is off).
+  // Informational host-side parameter — GDA dispatch is compile-time per-NIC.
+  ccoProviderType providerType{CCO_PROVIDER_UNKNOWN};
 
   // SDMA queue handles (per-comm, sized lsaSize * sdmaNumQueue, indexed by lsaRank).
   anvil::SdmaQueueDeviceHandle** sdmaDevHandles{nullptr};
