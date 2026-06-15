@@ -22,6 +22,25 @@ enable_testing()
 include(GoogleTest)
 
 # ---------------------------------------------------------------------------
+# test_master_metadata_store_interface — Phase 1 compile/instantiation gate for
+# IMasterMetadataStore. Includes an isolated self-compile TU (proves the header
+# is self-contained) and a GMock mock instantiation/signature-completeness test.
+# ---------------------------------------------------------------------------
+add_executable(
+  test_master_metadata_store_interface test_master_metadata_store_interface.cpp
+                                       master_metadata_store_self_compile.cpp)
+
+target_include_directories(test_master_metadata_store_interface
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+target_link_libraries(test_master_metadata_store_interface
+                      PRIVATE umbp_common GTest::gmock GTest::gtest_main)
+
+target_compile_features(test_master_metadata_store_interface PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_master_metadata_store_interface)
+
+# ---------------------------------------------------------------------------
 # test_external_kv_block_index
 # ---------------------------------------------------------------------------
 add_executable(test_external_kv_block_index test_external_kv_block_index.cpp)

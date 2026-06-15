@@ -107,6 +107,16 @@ struct BlockMetrics {
   uint64_t access_count = 0;
 };
 
+// One eviction-eligible (key, location) row returned by the master metadata
+// store's LRU enumeration.  Hoisted from GlobalBlockIndex because it is part of
+// the IMasterMetadataStore contract (EnumerateLruForEviction returns these).
+struct EvictionCandidate {
+  std::string key;
+  Location location;
+  std::chrono::system_clock::time_point last_accessed_at;
+  uint64_t size;
+};
+
 // Structured form of one (buffer_index, page_index) slot.  Used by the
 // peer DRAM/HBM allocator to describe which page slot a write should
 // land in, and by ResolveKey responses to tell readers where to RDMA
