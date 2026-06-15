@@ -119,8 +119,7 @@ struct ccoGda {
             typename Coop = ccoCoopThread>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes,
-                             RemoteAction remoteAction = ccoGda_NoSignal{},
-                             Coop coop = Coop{},
+                             RemoteAction remoteAction = ccoGda_NoSignal{}, Coop coop = Coop{},
                              uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // putValue: write an immediate value (≤8 bytes) with optional remote signal.
@@ -229,8 +228,8 @@ struct ccoGdaBarrierSession {
 };
 
 template <core::ProviderType PrvdType, typename Coop>
-__device__ inline void ccoGdaBarrier(Coop coop, ccoGda<PrvdType>& gda,
-                                     ccoGdaBarrierHandle handle, uint32_t index);
+__device__ inline void ccoGdaBarrier(Coop coop, ccoGda<PrvdType>& gda, ccoGdaBarrierHandle handle,
+                                     uint32_t index);
 
 // ── provider-specialized primitive layer (putImpl/getImpl/...) ──
 //
@@ -267,11 +266,13 @@ __device__ inline static void quietUntil(application::RdmaEndpointDevice* ep, ui
       }
 
       uint32_t greed = 10;
+      bool pollErr = false;
       while ((wq->doneIdx - targetIdx) & 0x800000) {
         uint32_t oldDoneIdx = wq->doneIdx;
         int err = core::PollCqOnce2(*wq, *cq, activemask, cq->cqAddr, cq->cqeNum, 0);
         if (err != 0) {
           MORI_PRINTF("quietUntil[PSD]: PollCqOnce2 failed, err=%d\n", err);
+          pollErr = true;
           break;
         }
         asm volatile("" ::: "memory");
@@ -282,7 +283,8 @@ __device__ inline static void quietUntil(application::RdmaEndpointDevice* ep, ui
       }
 
       core::spin_lock_release_shared(&cq->pollCqLock, activemask);
-      break;
+
+      if (pollErr) break;
     }
   } else if constexpr (PrvdType == core::ProviderType::MLX5) {
     // MLX5: 16-bit wqe_counter, poll CQ and update DBR record
@@ -304,7 +306,7 @@ __device__ inline static void quietUntil(application::RdmaEndpointDevice* ep, ui
     // that can't take the lock spin re-reading doneIdx (the holder advances it).
     auto doneLt = [&]() {
       return (int32_t)(targetIdx - __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED,
-                                                      __HIP_MEMORY_SCOPE_AGENT)) > 0;
+                                                     __HIP_MEMORY_SCOPE_AGENT)) > 0;
     };
     while (doneLt()) {
       // Only one thread per CQ polls; others spin re-reading doneIdx, which the
@@ -380,8 +382,9 @@ __device__ inline static void ringDoorbellWarpPsd(void* dbrAddr, uint64_t dbrVal
 
 // Wait for doorbell ordering and ring doorbell
 template <core::ProviderType PrvdType>
-__device__ inline static void ringDoorbellOrdered(application::RdmaEndpointDevice* ep, uint32_t myPostIdx,
-                                                  uint32_t numWqes, uint64_t dbrVal) {
+__device__ inline static void ringDoorbellOrdered(application::RdmaEndpointDevice* ep,
+                                                  uint32_t myPostIdx, uint32_t numWqes,
+                                                  uint64_t dbrVal) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
   core::CompletionQueueHandle* cq = &ep->cqHandle;
 
@@ -841,8 +844,8 @@ template <core::ProviderType PrvdType>
 template <ccoTeamMode TeamMode, typename RemoteAction, typename Coop>
 __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_t dstOffset,
                                              ccoWindow_t srcWin, size_t srcOffset, size_t bytes,
-                                             RemoteAction remoteAction,
-                                             Coop coop, uint32_t optFlags) {
+                                             RemoteAction remoteAction, Coop coop,
+                                             uint32_t optFlags) {
   coop.sync();
   if (coop.thread_rank() == 0) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
@@ -884,11 +887,11 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
 
     // step 4: call primitive API (PrvdType is compile-time determined)
     impl::putImpl<PrvdType>(ep, qpn,
-                      bytes > 0,            // hasData
-                      localAddr, srcLkey,   // local
-                      remoteAddr, dstRkey,  // remote
-                      bytes, hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg,
-                      optFlags);
+                            bytes > 0,            // hasData
+                            localAddr, srcLkey,   // local
+                            remoteAddr, dstRkey,  // remote
+                            bytes, hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg,
+                            optFlags);
   }
   coop.sync();
 }
@@ -937,7 +940,7 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
 
     // step 4: call primitive API
     impl::putValueImpl<PrvdType, T>(ep, qpn, remoteAddr, dstRkey, value, hasSignal, signalRaddr,
-                              signalRkey, signalOp, signalOpArg, optFlags);
+                                    signalRkey, signalOp, signalOpArg, optFlags);
   }
   coop.sync();
 }
@@ -1093,7 +1096,8 @@ __device__ inline void ccoGda<PrvdType>::wait(ccoGdaRequest_t& request, Coop coo
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
-    impl::waitImpl<PrvdType>(&ibgda->endpoints[request.qpIdx], static_cast<uint32_t>(request.postIdx));
+    impl::waitImpl<PrvdType>(&ibgda->endpoints[request.qpIdx],
+                             static_cast<uint32_t>(request.postIdx));
   }
   coop.sync();
 }
@@ -1222,8 +1226,7 @@ __device__ inline void ccoGdaBarrierSession<PrvdType, Coop>::sync(Coop) {
     uintptr_t signalRaddr = (signalBase + myRank) * sizeof(uint64_t);
     uint32_t signalRkey = gda.comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
 
-    impl::signalImpl<PrvdType>(ep, ep->qpn, signalRaddr, signalRkey,
-                               ccoGdaSignalInc, 1);
+    impl::signalImpl<PrvdType>(ep, ep->qpn, signalRaddr, signalRkey, ccoGdaSignalInc, 1);
   }
 
   this->coop.sync();
@@ -1234,16 +1237,15 @@ __device__ inline void ccoGdaBarrierSession<PrvdType, Coop>::sync(Coop) {
     if (peer >= nRanks) peer -= nRanks;
 
     ccoGdaSignal_t slotId = signalBase + peer;
-    impl::waitSignalImpl<PrvdType>(ibgda->signalBuf, ibgda->signalShadows,
-                                   slotId, 1, 64);
+    impl::waitSignalImpl<PrvdType>(ibgda->signalBuf, ibgda->signalShadows, slotId, 1, 64);
   }
 
   this->coop.sync();
 }
 
 template <core::ProviderType PrvdType, typename Coop>
-__device__ inline void ccoGdaBarrier(Coop coop, ccoGda<PrvdType>& gda,
-                                     ccoGdaBarrierHandle handle, uint32_t index) {
+__device__ inline void ccoGdaBarrier(Coop coop, ccoGda<PrvdType>& gda, ccoGdaBarrierHandle handle,
+                                     uint32_t index) {
   ccoGdaBarrierSession<PrvdType, Coop> session(coop, gda, handle, index);
   session.sync(coop);
 }
