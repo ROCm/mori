@@ -66,12 +66,8 @@ struct BlockEntry {
   }
 };
 
-struct EvictionCandidate {
-  std::string key;
-  Location location;
-  std::chrono::system_clock::time_point last_accessed_at;
-  uint64_t size;
-};
+// EvictionCandidate hoisted to umbp/distributed/types.h since it is part of the
+// IMasterMetadataStore contract; visible here via the types.h include above.
 
 // Master-side projection of every peer's owned-key set.  In the
 // master-as-advisor design this index is *only* mutated through the
