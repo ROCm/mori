@@ -196,7 +196,7 @@ include/umbp/
 │   └── routing/
 │       ├── router.h
 │       ├── route_get_strategy.h       # TierPriorityRouteGetStrategy (default), RandomRouteGetStrategy
-│       └── route_put_strategy.h       # TierAwareMostAvailableStrategy
+│       └── route_put_strategy.h       # ConfigurableRoutePutStrategy (most_available/random x none/same/local)
 └── local/                             # Standalone (no-net) DRAM+SSD path
     ├── standalone_client.h
     ├── host_mem_allocator.h
@@ -412,7 +412,8 @@ A hash/key may appear in both, but the serving paths are disjoint.
 
 Stateless façade over the two index objects + `ClientRegistry`.
 Dispatches to pluggable strategies; defaults are
-`TierPriorityRouteGetStrategy` and `TierAwareMostAvailableStrategy`.
+`TierPriorityRouteGetStrategy` and
+`ConfigurableRoutePutStrategy(most_available, none)`.
 
 - `RouteGet(key, node_id, exclude_nodes)` returns
   `RouteGetResolution{Location, peer_address}` (so the reader doesn't
@@ -438,11 +439,15 @@ present. `RandomRouteGetStrategy` (uniform across all replicas
 regardless of tier) remains available to inject via
 `MasterServerConfig::get_strategy`.
 
-`RoutePutStrategy::Select(alive_clients, block_size, exclude_nodes)` —
-`TierAwareMostAvailableStrategy` walks **`[HBM, DRAM]`** in order and,
-on the first tier with any node holding `>= block_size` available
-capacity, picks the node with the most available bytes (load
-spreading). **SSD is intentionally not a `RoutePut` target**: there is
+`RoutePutStrategy::SelectBatch(requester_node_id, block_sizes,
+already_exists, candidates, exclude_nodes)` is the single put extension
+point (single-key `RoutePut` is a size-1 batch). The built-in
+`ConfigurableRoutePutStrategy` with `most_available / none` walks
+**`[HBM, DRAM]`** in order and, on the first tier with any node holding
+`>= block_size` available capacity, picks the node with the most
+available bytes (load spreading); each routed pick deducts projected
+capacity on the batch-local `candidates` copy so later keys de-cluster.
+**SSD is intentionally not a `RoutePut` target**: there is
 no direct-SSD-put path — the SSD copy is filled asynchronously by
 copy-on-commit, so even with SSD capacity reported on the heartbeat,
 `RoutePut` must never steer a write at a tier with no direct-put
@@ -561,7 +566,7 @@ has a DRAM/HBM tier or an SSD tier.
        │                         │                            │
        │   RoutePut(key, sz)     │                            │
        │────────────────────────►│  registry.GetAliveClients  │
-       │                         │  strategy.Select(...)      │
+       │                         │  strategy.SelectBatch(...)  │
        │  RoutePutResult{node,   │                            │
        │  peer_address, tier}    │                            │
        │◄────────────────────────│                            │
@@ -930,13 +935,15 @@ calls `GlobalBlockIndex::FindEvictionCandidates` under
 both locks.
 
 Custom routing strategies must be thread-safe — the gRPC handler thread
-pool calls `Select` concurrently. The defaults are:
+pool calls `Select` / `SelectBatch` concurrently. The defaults are:
 
 - `TierPriorityRouteGetStrategy` (default get) — `thread_local
   std::mt19937` for the within-tier random pick, no mutexes.
 - `RandomRouteGetStrategy` (injectable) — `thread_local std::mt19937`,
   no mutexes.
-- `TierAwareMostAvailableStrategy` (default put) — stateless.
+- `ConfigurableRoutePutStrategy` (default put: `most_available/none`) —
+  stateless except for the optional pinned RNG used by `random`
+  (guarded by a mutex; production uses a `thread_local std::mt19937`).
 
 ---
 

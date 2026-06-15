@@ -81,37 +81,6 @@ std::string SummarizeClientTiers(const std::vector<ClientRecord>& alive_clients)
   return JoinStrings(summaries);
 }
 
-// Deduct a routed pick's block_size from the batch-local candidates copy so
-// later entries in the same batch see the reservation.  A routed result always
-// names a node/tier that exists here with enough room (Select / TrySelectOnNode
-// only return such picks, and candidates is a single-thread local copy); a
-// violation means the selector's contract is broken.  This is a best-effort
-// system: on a violation we log a MORI ERROR and return false so the caller
-// drops the route (treats the key as unroutable) instead of crashing.
-bool ApplyProjectedDeduction(std::vector<ClientRecord>& candidates, const RoutePutResult& result,
-                             uint64_t block_size) {
-  auto client_it = std::find_if(candidates.begin(), candidates.end(),
-                                [&](const ClientRecord& c) { return c.node_id == result.node_id; });
-  if (client_it == candidates.end()) {
-    MORI_UMBP_ERROR("[RoutePutStrategy] projected-deduction: selected node not in candidates: {}",
-                    result.node_id);
-    return false;
-  }
-  auto tier_it = client_it->tier_capacities.find(result.tier);
-  if (tier_it == client_it->tier_capacities.end()) {
-    MORI_UMBP_ERROR("[RoutePutStrategy] projected-deduction: selected tier absent on node {}",
-                    result.node_id);
-    return false;
-  }
-  if (tier_it->second.available_bytes < block_size) {
-    MORI_UMBP_ERROR("[RoutePutStrategy] projected-deduction: capacity underflow on node {}",
-                    result.node_id);
-    return false;
-  }
-  tier_it->second.available_bytes -= block_size;
-  return true;
-}
-
 // Indices of candidates that can fit block_size on a single @p tier.
 std::vector<size_t> CollectEligibleOnTier(const std::vector<ClientRecord>& candidates,
                                           TierType tier, uint64_t block_size,
@@ -137,97 +106,50 @@ RoutePutResult MakeRouted(const ClientRecord& client, TierType tier) {
   };
 }
 
+// Available bytes for @p node_id on @p tier in the (projected) candidates copy;
+// 0 when the node or tier is absent.  Used only to report the pre-deduction
+// figure in the routed INFO log.
+uint64_t LookupAvailableBytes(const std::vector<ClientRecord>& candidates,
+                              const std::string& node_id, TierType tier) {
+  auto client_it = std::find_if(candidates.begin(), candidates.end(),
+                                [&](const ClientRecord& c) { return c.node_id == node_id; });
+  if (client_it == candidates.end()) return 0;
+  auto tier_it = client_it->tier_capacities.find(tier);
+  if (tier_it == client_it->tier_capacities.end()) return 0;
+  return tier_it->second.available_bytes;
+}
+
+// Deduct a routed pick's @p block_size from the batch-local @p candidates copy
+// so later entries in the same batch see the reservation.  A routed result
+// always names a node/tier that exists here with enough room; a violation means
+// the selector's contract is broken.  Best-effort: on a violation log a MORI
+// ERROR and return false (caller drops the route, treats the key as unroutable)
+// instead of crashing.  Returns true after a successful deduction.
+bool ApplyProjectedDeduction(std::vector<ClientRecord>& candidates, const RoutePutResult& result,
+                             uint64_t block_size) {
+  auto client_it = std::find_if(candidates.begin(), candidates.end(),
+                                [&](const ClientRecord& c) { return c.node_id == result.node_id; });
+  if (client_it == candidates.end()) {
+    MORI_UMBP_ERROR("[RoutePutStrategy] projected-deduction: selected node not in candidates: {}",
+                    result.node_id);
+    return false;
+  }
+  auto tier_it = client_it->tier_capacities.find(result.tier);
+  if (tier_it == client_it->tier_capacities.end()) {
+    MORI_UMBP_ERROR("[RoutePutStrategy] projected-deduction: selected tier absent on node {}",
+                    result.node_id);
+    return false;
+  }
+  if (tier_it->second.available_bytes < block_size) {
+    MORI_UMBP_ERROR("[RoutePutStrategy] projected-deduction: capacity underflow on node {}",
+                    result.node_id);
+    return false;
+  }
+  tier_it->second.available_bytes -= block_size;
+  return true;
+}
+
 }  // namespace
-
-// ---------------------------------------------------------------------------
-//  RoutePutStrategy (base): default batch planner over the virtual Select()
-// ---------------------------------------------------------------------------
-std::vector<std::optional<RoutePutResult>> RoutePutStrategy::SelectBatch(
-    const std::string& /*requester_node_id*/, const std::vector<uint64_t>& block_sizes,
-    const std::vector<bool>& already_exists, std::vector<ClientRecord> candidates,
-    const std::unordered_set<std::string>& exclude_nodes) {
-  if (already_exists.size() != block_sizes.size()) {
-    MORI_UMBP_ERROR(
-        "[RoutePutStrategy] SelectBatch: already_exists length ({}) must match block_sizes ({}); "
-        "treating every key as unroutable",
-        already_exists.size(), block_sizes.size());
-    return std::vector<std::optional<RoutePutResult>>(block_sizes.size());
-  }
-
-  std::vector<std::optional<RoutePutResult>> results;
-  results.reserve(block_sizes.size());
-
-  for (size_t i = 0; i < block_sizes.size(); ++i) {
-    if (already_exists[i]) {
-      results.push_back(RoutePutResult{.outcome = RoutePutOutcome::kAlreadyExists});
-      continue;
-    }
-    if (candidates.empty()) {
-      results.push_back(std::nullopt);
-      continue;
-    }
-    auto selected = Select(candidates, block_sizes[i], exclude_nodes);
-    if (selected && selected->outcome == RoutePutOutcome::kRouted &&
-        !ApplyProjectedDeduction(candidates, *selected, block_sizes[i])) {
-      // Selector broke its own contract: drop the route (best-effort failure).
-      selected = std::nullopt;
-    }
-    results.push_back(std::move(selected));
-  }
-
-  return results;
-}
-
-// ---------------------------------------------------------------------------
-//  TierAwareMostAvailableStrategy
-// ---------------------------------------------------------------------------
-std::optional<RoutePutResult> TierAwareMostAvailableStrategy::Select(
-    const std::vector<ClientRecord>& alive_clients, uint64_t block_size,
-    const std::unordered_set<std::string>& exclude_nodes) {
-  const std::string exclude_snapshot = FormatExcludeSet(exclude_nodes);
-
-  for (TierType tier : kPutTierOrder) {
-    const ClientRecord* best = nullptr;
-    uint64_t best_available = 0;
-    uint64_t candidates_considered = 0;
-
-    for (const auto& client : alive_clients) {
-      if (exclude_nodes.count(client.node_id)) continue;
-      auto it = client.tier_capacities.find(tier);
-      if (it == client.tier_capacities.end()) continue;
-      if (it->second.available_bytes < block_size) continue;
-      ++candidates_considered;
-      if (best == nullptr || it->second.available_bytes > best_available) {
-        best = &client;
-        best_available = it->second.available_bytes;
-      }
-    }
-
-    if (best != nullptr) {
-      MORI_UMBP_INFO(
-          "[RoutePutStrategy] block_size={} tier={} selected node={} available_bytes={} "
-          "candidates={} excludes=[{}]",
-          block_size, TierTypeName(tier), best->node_id, best_available, candidates_considered,
-          exclude_snapshot);
-      return RoutePutResult{
-          .outcome = RoutePutOutcome::kRouted,
-          .node_id = best->node_id,
-          .peer_address = best->peer_address,
-          .tier = tier,
-      };
-    }
-
-    MORI_UMBP_DEBUG(
-        "[RoutePutStrategy] block_size={} tier={} no eligible node (candidates_checked={} "
-        "excludes=[{}])",
-        block_size, TierTypeName(tier), candidates_considered, exclude_snapshot);
-  }
-
-  MORI_UMBP_WARN(
-      "[RoutePutStrategy] block_size={} no suitable target. excludes=[{}] capacity_snapshot=[{}]",
-      block_size, exclude_snapshot, SummarizeClientTiers(alive_clients));
-  return std::nullopt;
-}
 
 // ---------------------------------------------------------------------------
 //  ConfigurableRoutePutStrategy
@@ -329,14 +251,6 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::SelectByAlgo(
   return std::nullopt;
 }
 
-std::optional<RoutePutResult> ConfigurableRoutePutStrategy::Select(
-    const std::vector<ClientRecord>& alive_clients, uint64_t block_size,
-    const std::unordered_set<std::string>& exclude_nodes) {
-  // Single-key default ignores affinity (no batch context, no requester here);
-  // batch affinity lives in SelectBatch.
-  return SelectByAlgo(alive_clients, block_size, exclude_nodes);
-}
-
 std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectBatch(
     const std::string& requester_node_id, const std::vector<uint64_t>& block_sizes,
     const std::vector<bool>& already_exists, std::vector<ClientRecord> candidates,
@@ -348,6 +262,10 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
         already_exists.size(), block_sizes.size());
     return std::vector<std::optional<RoutePutResult>>(block_sizes.size());
   }
+
+  // exclude_nodes is constant for the whole batch, so format it once for logs.
+  const std::string exclude_snapshot = FormatExcludeSet(exclude_nodes);
+  const std::string algo_desc = Describe();
 
   // Affinity anchor: the node (and optionally tier) we try first for each key
   // before the explicit SelectByAlgo fallback.  Affinity biases node choice and
@@ -385,16 +303,30 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
   std::vector<std::optional<RoutePutResult>> results;
   results.reserve(block_sizes.size());
 
+  // One unroutable log path for every dropped key (empty candidates, no fit, or
+  // a deduction-contract violation), so each carries the projected capacity
+  // snapshot — which reads "<no-alive-clients>" when candidates is empty.
+  auto log_unroutable = [&](uint64_t bs) {
+    MORI_UMBP_WARN(
+        "[RoutePutStrategy] block_size={} no suitable target. algo=[{}] excludes=[{}] "
+        "capacity_snapshot=[{}]",
+        bs, algo_desc, exclude_snapshot, SummarizeClientTiers(candidates));
+  };
+
   for (size_t i = 0; i < block_sizes.size(); ++i) {
     if (already_exists[i]) {
+      // Master-side dedup hit: not a routing failure, so no WARN.
+      MORI_UMBP_DEBUG("[RoutePutStrategy] block_size={} already-exists (dedup hit)",
+                      block_sizes[i]);
       results.push_back(RoutePutResult{.outcome = RoutePutOutcome::kAlreadyExists});
       continue;
     }
+    const uint64_t block_size = block_sizes[i];
     if (candidates.empty()) {
+      log_unroutable(block_size);
       results.push_back(std::nullopt);
       continue;
     }
-    const uint64_t block_size = block_sizes[i];
 
     std::optional<RoutePutResult> selected;
     if (affinity_ == NodeAffinity::kLocal) {
@@ -423,10 +355,25 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
       selected = SelectByAlgo(candidates, block_size, exclude_nodes);
     }
 
-    if (selected && selected->outcome == RoutePutOutcome::kRouted &&
-        !ApplyProjectedDeduction(candidates, *selected, block_size)) {
-      // Selector broke its own contract: drop the route (best-effort failure).
-      selected = std::nullopt;
+    // Apply projected capacity, then log against the FINAL returned value: a
+    // routed pick whose deduction fails is dropped to nullopt and reported as a
+    // failure, never as a route (capture available_bytes before the deduction
+    // so the INFO reflects the snapshot the decision was made on).
+    if (selected && selected->outcome == RoutePutOutcome::kRouted) {
+      const uint64_t available =
+          LookupAvailableBytes(candidates, selected->node_id, selected->tier);
+      if (ApplyProjectedDeduction(candidates, *selected, block_size)) {
+        MORI_UMBP_INFO(
+            "[RoutePutStrategy] block_size={} tier={} selected node={} available_bytes={} "
+            "algo=[{}] excludes=[{}]",
+            block_size, TierTypeName(selected->tier), selected->node_id, available, algo_desc,
+            exclude_snapshot);
+      } else {
+        selected = std::nullopt;  // selector broke its contract (best-effort drop)
+        log_unroutable(block_size);
+      }
+    } else {
+      log_unroutable(block_size);
     }
     results.push_back(std::move(selected));
   }

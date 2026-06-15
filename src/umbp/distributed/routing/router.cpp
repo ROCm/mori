@@ -21,7 +21,6 @@
 // SOFTWARE.
 #include "umbp/distributed/routing/router.h"
 
-#include <algorithm>
 #include <unordered_map>
 
 #include "mori/utils/mori_log.hpp"
@@ -38,8 +37,13 @@ Router::Router(GlobalBlockIndex& index, ClientRegistry& registry,
   // config_.get_strategy.
   get_strategy_ =
       get_strategy ? std::move(get_strategy) : std::make_unique<TierPriorityRouteGetStrategy>();
-  put_strategy_ =
-      put_strategy ? std::move(put_strategy) : std::make_unique<TierAwareMostAvailableStrategy>();
+  // Default to most-available / no-affinity: the single built-in put strategy.
+  // Callers can still inject any RoutePutStrategy (e.g. an env-configured
+  // ConfigurableRoutePutStrategy from master startup) via config_.put_strategy.
+  put_strategy_ = put_strategy ? std::move(put_strategy)
+                               : std::make_unique<ConfigurableRoutePutStrategy>(
+                                     ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable,
+                                     ConfigurableRoutePutStrategy::NodeAffinity::kNone);
 }
 
 std::optional<RouteGetResolution> Router::RouteGet(

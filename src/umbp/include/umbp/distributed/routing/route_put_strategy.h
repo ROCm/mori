@@ -51,27 +51,20 @@ struct RoutePutResult {
   TierType tier = TierType::UNKNOWN;
 };
 
-/// Abstract interface for RoutePut node placement.
-/// Implement this to plug in a custom write-path placement strategy.
+/// Abstract interface for batch RoutePut node placement.  Implement this to
+/// plug in a custom write-path placement strategy.  The Router always routes
+/// through SelectBatch — a single-key RoutePut is just a size-1 batch — so this
+/// is the one and only extension point.
 class RoutePutStrategy {
  public:
   virtual ~RoutePutStrategy() = default;
-
-  /// Select a target node from @p alive_clients that can accommodate
-  /// @p block_size bytes.  Tier selection is the strategy's responsibility.
-  /// Nodes whose `node_id` appears in @p exclude_nodes are skipped — the
-  /// caller has already failed against them (typically ENOSPC at the
-  /// peer's allocator) and would only fail again.
-  /// @return nullopt if no suitable node exists.
-  virtual std::optional<RoutePutResult> Select(
-      const std::vector<ClientRecord>& alive_clients, uint64_t block_size,
-      const std::unordered_set<std::string>& exclude_nodes) = 0;
 
   /// Batch-aware placement with projected capacity: each routed pick deducts
   /// the chosen node/tier's available_bytes in the by-value @p candidates
   /// copy so later entries in the same batch see the reservation.  The copy is
   /// batch-local and never written back to the registry — the peer allocator is
-  /// still the final arbiter.  Result length and order match @p block_sizes.
+  /// still the final ENOSPC arbiter.  Result length and order match
+  /// @p block_sizes.
   ///
   /// @p already_exists must be the same length as @p block_sizes; a mismatch is
   /// logged as a MORI ERROR and yields an all-nullopt result (best-effort, no
@@ -79,26 +72,16 @@ class RoutePutStrategy {
   /// they return kAlreadyExists and consume no projected capacity.
   ///
   /// @p requester_node_id is the node that issued the batch put; node-affinity
-  /// strategies use it to bias placement toward the writer's local node.  The
-  /// default implementation ignores it and reuses the virtual Select()
-  /// unchanged, preserving single-key placement semantics.  Override only to
-  /// implement a smarter batch planner.
+  /// strategies use it to bias placement toward the writer's local node.
   ///
-  /// NOTE: this virtual signature is an internal extension point.  Adding
-  /// @p requester_node_id is a breaking change for any out-of-tree subclass.
+  /// @p exclude_nodes lists nodes the caller has already failed against
+  /// (typically ENOSPC at the peer's allocator); they are skipped because they
+  /// would only fail again.  A per-key entry is the outer
+  /// `std::optional<RoutePutResult>::nullopt` when no suitable node exists.
   virtual std::vector<std::optional<RoutePutResult>> SelectBatch(
       const std::string& requester_node_id, const std::vector<uint64_t>& block_sizes,
       const std::vector<bool>& already_exists, std::vector<ClientRecord> candidates,
-      const std::unordered_set<std::string>& exclude_nodes);
-};
-
-/// Default strategy: try direct-put tiers fastest-first (HBM -> DRAM),
-/// pick the node with the most available space on the first tier that has capacity.
-class TierAwareMostAvailableStrategy : public RoutePutStrategy {
- public:
-  std::optional<RoutePutResult> Select(
-      const std::vector<ClientRecord>& alive_clients, uint64_t block_size,
-      const std::unordered_set<std::string>& exclude_nodes) override;
+      const std::unordered_set<std::string>& exclude_nodes) = 0;
 };
 
 /// Configurable batch put strategy combining two orthogonal knobs:
@@ -108,8 +91,8 @@ class TierAwareMostAvailableStrategy : public RoutePutStrategy {
 /// Both knobs are wired from env vars at master startup
 /// (UMBP_ROUTE_PUT_SELECT_ALGO / UMBP_ROUTE_PUT_NODE_AFFINITY).  Tier order is
 /// always HBM -> DRAM; SSD is never a direct-put target.  Projected capacity is
-/// deducted on the batch-local candidates copy exactly like the base
-/// SelectBatch; nothing is written back to the registry.
+/// deducted on the batch-local candidates copy within SelectBatch; nothing is
+/// written back to the registry.
 class ConfigurableRoutePutStrategy : public RoutePutStrategy {
  public:
   enum class SelectAlgo { kMostAvailable, kRandom };
@@ -119,10 +102,6 @@ class ConfigurableRoutePutStrategy : public RoutePutStrategy {
   /// Test-only ctor: pins the RNG seed so capacity-weighted random draws are
   /// reproducible.  Production uses the thread_local RNG (no shared state).
   ConfigurableRoutePutStrategy(SelectAlgo algo, NodeAffinity affinity, uint64_t rng_seed);
-
-  std::optional<RoutePutResult> Select(
-      const std::vector<ClientRecord>& alive_clients, uint64_t block_size,
-      const std::unordered_set<std::string>& exclude_nodes) override;
 
   std::vector<std::optional<RoutePutResult>> SelectBatch(
       const std::string& requester_node_id, const std::vector<uint64_t>& block_sizes,
