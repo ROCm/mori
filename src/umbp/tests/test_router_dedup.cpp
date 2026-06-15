@@ -159,4 +159,31 @@ TEST(RouterDedup, BatchRoutePutAlreadyExistsBypassesNoAliveClient) {
   EXPECT_FALSE(results[1].has_value());  // distinct from kAlreadyExists
 }
 
+// Single-key RoutePut delegates to the batch path, so master-side dedup applies:
+// an indexed key returns kAlreadyExists while an unknown key still routes.  This
+// locks in the delegation; without it RoutePut would silently skip dedup.
+TEST(RouterDedup, RoutePutMarksAlreadyExistsForIndexedKey) {
+  GlobalBlockIndex index;
+  ClientRegistry registry(ClientRegistryConfig{}, index);
+  Router router(index, registry);
+
+  ASSERT_TRUE(registry.RegisterClient("node-a", "node-a:1", MakeDramCaps(),
+                                      /*peer_address=*/"node-a:peer"));
+  ASSERT_EQ(
+      index.ApplyEvents("node-a", {KvEvent{KvEvent::Kind::ADD, "key-X", TierType::DRAM, 4096}}),
+      1u);
+
+  std::unordered_set<std::string> excludes;
+
+  auto dedup = router.RoutePut("key-X", "requester", 4096, excludes);
+  ASSERT_TRUE(dedup.has_value());
+  EXPECT_EQ(dedup->outcome, RoutePutOutcome::kAlreadyExists);
+  EXPECT_TRUE(dedup->node_id.empty());
+
+  auto routed = router.RoutePut("key-Y", "requester", 4096, excludes);
+  ASSERT_TRUE(routed.has_value());
+  EXPECT_EQ(routed->outcome, RoutePutOutcome::kRouted);
+  EXPECT_EQ(routed->node_id, "node-a");
+}
+
 }  // namespace mori::umbp

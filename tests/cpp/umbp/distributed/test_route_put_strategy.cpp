@@ -24,7 +24,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -219,16 +218,20 @@ TEST(SelectBatchTest, DedupHitConsumesNoCapacity) {
   EXPECT_EQ(results[1]->node_id, "node-a");
 }
 
-TEST(SelectBatchTest, ThrowsOnAlreadyExistsLengthMismatch) {
+// Best-effort: an already_exists/block_sizes length mismatch is not fatal — it
+// logs a MORI ERROR and returns an all-nullopt result sized to block_sizes.
+TEST(SelectBatchTest, AlreadyExistsLengthMismatchYieldsAllNullopt) {
   TierAwareMostAvailableStrategy strategy;
 
   std::vector<ClientRecord> clients = {
       MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 10 * GB}}}),
   };
 
-  EXPECT_THROW(strategy.SelectBatch(/*requester=*/"req", {4096, 4096}, {false}, clients,
-                                    /*exclude=*/{}),
-               std::runtime_error);
+  auto results = strategy.SelectBatch(/*requester=*/"req", {4096, 4096}, {false}, clients,
+                                      /*exclude=*/{});
+  ASSERT_EQ(results.size(), 2u);
+  EXPECT_FALSE(results[0].has_value());
+  EXPECT_FALSE(results[1].has_value());
 }
 
 // The by-value candidates copy is never mutated for the caller: passing the
@@ -269,8 +272,9 @@ TEST(SelectBatchTest, SizeOneMatchesSelect) {
 }
 
 // A strategy whose Select() breaks its own contract (routes to a node/tier
-// without enough room) must trip the projected-capacity invariant and throw,
-// never silently clamp the deduction.
+// without enough room) must trip the projected-capacity invariant.  Best-effort:
+// the offending key is dropped to nullopt (route failure) and a MORI ERROR is
+// logged, rather than throwing or silently clamping the deduction.
 class BrokenContractStrategy : public RoutePutStrategy {
  public:
   std::optional<RoutePutResult> Select(
@@ -285,16 +289,17 @@ class BrokenContractStrategy : public RoutePutStrategy {
   }
 };
 
-TEST(SelectBatchTest, ThrowsOnProjectedCapacityUnderflow) {
+TEST(SelectBatchTest, ProjectedCapacityUnderflowDropsRoute) {
   BrokenContractStrategy strategy;
 
   std::vector<ClientRecord> clients = {
       MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 1 * GB}}}),
   };
 
-  EXPECT_THROW(
-      strategy.SelectBatch(/*requester=*/"req", {4 * GB}, {false}, clients, /*exclude=*/{}),
-      std::runtime_error);
+  auto results =
+      strategy.SelectBatch(/*requester=*/"req", {4 * GB}, {false}, clients, /*exclude=*/{});
+  ASSERT_EQ(results.size(), 1u);
+  EXPECT_FALSE(results[0].has_value());
 }
 
 // ---- ConfigurableRoutePutStrategy tests ----

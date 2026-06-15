@@ -303,5 +303,53 @@ TEST_F(BatchPutWarnTest, AllLocalBatchNoWarn) {
          "un-registered srcs (the WARN lives in the remote else branch only).";
 }
 
+// Zero-size puts are rejected before local/peer execution: the empty entry
+// fails (false) while the surrounding non-zero keys still succeed.  Return
+// vector length is preserved.  Runs on target_ (self/local path) so the
+// assertion does not depend on remote RDMA.
+TEST_F(BatchPutWarnTest, ZeroSizePutEntriesFailOthersSucceed) {
+  std::vector<char> buf(3 * kPerKey, 0);
+  std::memset(buf.data(), 0x21, kPerKey);
+  std::memset(buf.data() + 2 * kPerKey, 0x23, kPerKey);
+
+  std::vector<std::string> keys = {"zs-a", "zs-zero", "zs-b"};
+  std::vector<const void*> srcs = {buf.data(), buf.data() + kPerKey, buf.data() + 2 * kPerKey};
+  std::vector<size_t> sizes = {kPerKey, 0, kPerKey};
+
+  auto results = target_->BatchPut(keys, srcs, sizes);
+  ASSERT_EQ(results.size(), 3u);
+  EXPECT_TRUE(results[0]) << "key=" << keys[0];
+  EXPECT_FALSE(results[1]) << "zero-size put must be filtered to failure";
+  EXPECT_TRUE(results[2]) << "key=" << keys[2];
+}
+
+// Zero-size gets are rejected before local fallback or remote read: they fail
+// (false) while previously-seeded non-zero keys still resolve.  Return vector
+// length is preserved.  Local self put+get on target_ keeps the round trip
+// free of RDMA/registration.
+TEST_F(BatchPutWarnTest, ZeroSizeGetEntriesFailOthersSucceed) {
+  std::vector<char> src(2 * kPerKey, 0);
+  std::memset(src.data(), 0x31, kPerKey);
+  std::memset(src.data() + kPerKey, 0x32, kPerKey);
+  std::vector<std::string> pkeys = {"zg-a", "zg-b"};
+  std::vector<const void*> psrcs = {src.data(), src.data() + kPerKey};
+  std::vector<size_t> psizes = {kPerKey, kPerKey};
+  auto pres = target_->BatchPut(pkeys, psrcs, psizes);
+  ASSERT_EQ(pres.size(), 2u);
+  ASSERT_TRUE(pres[0]);
+  ASSERT_TRUE(pres[1]);
+
+  std::vector<char> dst(3 * kPerKey, 0);
+  std::vector<std::string> gkeys = {"zg-a", "zg-zero", "zg-b"};
+  std::vector<void*> gdsts = {dst.data(), dst.data() + kPerKey, dst.data() + 2 * kPerKey};
+  std::vector<size_t> gsizes = {kPerKey, 0, kPerKey};
+
+  auto gres = target_->BatchGet(gkeys, gdsts, gsizes);
+  ASSERT_EQ(gres.size(), 3u);
+  EXPECT_TRUE(gres[0]) << "key=" << gkeys[0];
+  EXPECT_FALSE(gres[1]) << "zero-size get must be filtered to failure";
+  EXPECT_TRUE(gres[2]) << "key=" << gkeys[2];
+}
+
 }  // namespace
 }  // namespace mori::umbp

@@ -213,13 +213,24 @@ grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
   auto status = GetStub(stub_.get())->RoutePut(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
-  if (!resp.found()) return grpc::Status::OK;
 
-  RoutePutResult r;
-  r.node_id = resp.node_id();
-  r.peer_address = resp.peer_address();
-  r.tier = FromProtoTier(resp.tier());
-  *out_result = std::move(r);
+  switch (resp.outcome()) {
+    case ::umbp::ROUTE_PUT_OUTCOME_ROUTED:
+      *out_result = RoutePutResult{
+          .outcome = RoutePutOutcome::kRouted,
+          .node_id = resp.node_id(),
+          .peer_address = resp.peer_address(),
+          .tier = FromProtoTier(resp.tier()),
+      };
+      break;
+    case ::umbp::ROUTE_PUT_OUTCOME_ALREADY_EXISTS:
+      // Non-nullopt so caller distinguishes dedup from unavailable (= nullopt).
+      *out_result = RoutePutResult{.outcome = RoutePutOutcome::kAlreadyExists};
+      break;
+    case ::umbp::ROUTE_PUT_OUTCOME_UNAVAILABLE:
+    default:
+      break;  // leave as nullopt
+  }
   return grpc::Status::OK;
 }
 

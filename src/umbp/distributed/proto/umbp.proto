@@ -123,11 +123,13 @@ message RoutePutRequest {
   uint64 block_size            = 3;   // Size of the block to write (bytes)
   repeated string exclude_nodes = 4;  // Nodes the caller has already failed against
 }
+// Aligned with BatchRoutePutEntry: `outcome` replaces the old `found` bool so a
+// single RoutePut can also express master-side dedup (ALREADY_EXISTS).
 message RoutePutResponse {
-  bool     found        = 1;
-  string   node_id      = 2;
-  TierType tier         = 3;
-  string   peer_address = 4;
+  RoutePutOutcome outcome      = 1;
+  string          node_id      = 2;
+  TierType        tier         = 3;
+  string          peer_address = 4;
 }
 
 message RouteGetRequest {

@@ -52,21 +52,10 @@ std::optional<RouteGetResolution> Router::RouteGet(
 std::optional<RoutePutResult> Router::RoutePut(
     const std::string& key, const std::string& node_id, uint64_t block_size,
     const std::unordered_set<std::string>& exclude_nodes) {
-  // Master-side dedup lives only in BatchRoutePut (single RoutePut proto carries
-  // no already_exists; PoolClient::Put wraps BatchPut).  Route through
-  // SelectBatch(size=1) so node-affinity logic has a single home; this is the
-  // base most-available/none default's per-key path, so behavior is unchanged.
-  (void)key;
-  auto candidates = registry_.GetAliveClients();
-  if (candidates.empty()) {
-    MORI_UMBP_DEBUG("[Router] RoutePut from={}: no alive clients", node_id);
-    return std::nullopt;
-  }
-  auto results = put_strategy_->SelectBatch(node_id, {block_size}, {false}, std::move(candidates),
-                                            exclude_nodes);
-  if (!results.front()) {
-    MORI_UMBP_DEBUG("[Router] RoutePut from={}: no node with sufficient capacity", node_id);
-  }
+  // Delegate to the batch path (size=1) so master-side dedup (BatchLookupExists)
+  // and projected-capacity logic have a single home; a returned kAlreadyExists
+  // now flows back through RoutePutResponse.outcome.
+  auto results = BatchRoutePut({key}, node_id, {block_size}, exclude_nodes);
   return std::move(results.front());
 }
 
@@ -76,7 +65,8 @@ std::vector<std::optional<RoutePutResult>> Router::BatchRoutePut(
     const std::unordered_set<std::string>& exclude_nodes) {
   // SelectBatch applies dedup + projected capacity on this batch-local snapshot;
   // the peer allocator stays the final ENOSPC arbiter. A keys/block_sizes length
-  // mismatch surfaces as a SelectBatch throw (no silent coercion).
+  // mismatch is logged as a MORI ERROR and yields an all-nullopt result
+  // (best-effort: no throw, every key reads as unroutable).
   auto exists_mask = index_.BatchLookupExists(keys);
   auto candidates = registry_.GetAliveClients();
   return put_strategy_->SelectBatch(node_id, block_sizes, exists_mask, std::move(candidates),

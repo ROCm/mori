@@ -73,9 +73,10 @@ class RoutePutStrategy {
   /// batch-local and never written back to the registry — the peer allocator is
   /// still the final arbiter.  Result length and order match @p block_sizes.
   ///
-  /// @p already_exists must be the same length as @p block_sizes (throws
-  /// otherwise).  Entries with already_exists[i]==true are master-side dedup
-  /// hits: they return kAlreadyExists and consume no projected capacity.
+  /// @p already_exists must be the same length as @p block_sizes; a mismatch is
+  /// logged as a MORI ERROR and yields an all-nullopt result (best-effort, no
+  /// throw).  Entries with already_exists[i]==true are master-side dedup hits:
+  /// they return kAlreadyExists and consume no projected capacity.
   ///
   /// @p requester_node_id is the node that issued the batch put; node-affinity
   /// strategies use it to bias placement toward the writer's local node.  The

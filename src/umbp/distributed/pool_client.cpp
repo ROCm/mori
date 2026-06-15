@@ -691,6 +691,13 @@ PoolClient::PartitionBatchPutTargets(const std::vector<std::string>& keys,
   std::unordered_map<std::string, std::vector<BatchPutItem>> remote_groups;
   const size_t count = keys.size();
   for (size_t i = 0; i < count; ++i) {
+    // Zero-size puts are rejected before local/peer execution: an empty block
+    // is meaningless to store, so leave the result as kFailed and never hand it
+    // to ExecuteLocalPut / peer AllocateSlot.
+    if (sizes[i] == 0) {
+      MORI_UMBP_WARN("[PoolClient] BatchPut: skipping zero-size put for key='{}'", keys[i]);
+      continue;
+    }
     if (i >= routes.size() || !routes[i].has_value()) continue;
     const auto& route = routes[i].value();
     // Master-side dedup hit.
@@ -822,6 +829,13 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
   std::unordered_map<std::string, std::vector<BatchGetItem>> remote_groups;
   std::unordered_map<std::string, std::vector<BatchGetItem>> ssd_remote_groups;
   for (size_t i = 0; i < keys.size(); ++i) {
+    // Zero-size gets are rejected before local fallback or remote read: an
+    // explicit skip is required here because a nullopt route below would
+    // otherwise fall through to a local read (result stays false).
+    if (sizes[i] == 0) {
+      MORI_UMBP_WARN("[PoolClient] BatchGet: skipping zero-size get for key='{}'", keys[i]);
+      continue;
+    }
     if (i >= routes.size() || !routes[i].has_value()) {
       if (peer_alloc_) {
         auto outcome = ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]);

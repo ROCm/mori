@@ -342,10 +342,14 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     auto result =
         router_.RoutePut(request->key(), request->node_id(), request->block_size(), excludes);
     if (!result.has_value()) {
-      response->set_found(false);
+      response->set_outcome(::umbp::ROUTE_PUT_OUTCOME_UNAVAILABLE);
       return grpc::Status::OK;
     }
-    response->set_found(true);
+    if (result->outcome == RoutePutOutcome::kAlreadyExists) {
+      response->set_outcome(::umbp::ROUTE_PUT_OUTCOME_ALREADY_EXISTS);
+      return grpc::Status::OK;
+    }
+    response->set_outcome(::umbp::ROUTE_PUT_OUTCOME_ROUTED);
     response->set_node_id(result->node_id);
     response->set_tier(static_cast<::umbp::TierType>(result->tier));
     response->set_peer_address(result->peer_address);
