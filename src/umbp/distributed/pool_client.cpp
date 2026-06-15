@@ -32,6 +32,9 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 #include <unordered_map>
 
 #include "mori/io/backend.hpp"
@@ -105,6 +108,86 @@ void ObserveBatchBandwidth(MasterClient& master_client, double bytes, double sec
 
 // Bytes belonging to the i-th logical page of a Put/Get spread across
 // `num_pages` pages of `page_size` bytes.  Last page may be partial.
+// --- Parallel + AVX2 NT block copy for self-target (local) pages. ----------
+// In distributed mode 1 key == 1 page (master page_size == KV block size), so
+// the distributed self-target path copies one ~4 MiB block per call. The local
+// tier's (DRAMTier) multi-thread/AVX2 optimization never applied here because
+// it parallelizes *within* a call's pages (always 1). We instead parallelize
+// across the many keys of one BatchPut/BatchGet (different threads -> different
+// keys); per-key NT-AVX2 copy gives the cache-bypass win. Threads via
+// UMBP_DRAM_{READ,WRITE}_THREADS (same envs as DRAMTier).
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx2"))) inline void LocalNtCopyAvx2(char* d, const char* s, size_t n) {
+  size_t head = (32 - (reinterpret_cast<uintptr_t>(d) & 31)) & 31;
+  if (head > n) head = n;
+  std::memcpy(d, s, head);
+  size_t i = head;
+  for (; i + 128 <= n; i += 128) {
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+    __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 32));
+    __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 64));
+    __m256i e = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 96));
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i), a);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 32), b);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 64), c);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 96), e);
+  }
+  for (; i + 32 <= n; i += 32) {
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i), a);
+  }
+  if (i < n) std::memcpy(d + i, s + i, n - i);
+  _mm_sfence();
+}
+inline bool LocalAvx2Supported() { return __builtin_cpu_supports("avx2"); }
+#else
+inline void LocalNtCopyAvx2(char* d, const char* s, size_t n) { std::memcpy(d, s, n); }
+inline bool LocalAvx2Supported() { return false; }
+#endif
+
+inline void LocalCopyBlock(void* dst, const void* src, size_t size) {
+  static const bool kNt =
+      LocalAvx2Supported() &&
+      !(std::getenv("UMBP_DRAM_NT_COPY") && std::getenv("UMBP_DRAM_NT_COPY")[0] == '0');
+  static const size_t kNtMinBytes = 256ull << 10;
+  if (kNt && size >= kNtMinBytes) {
+    LocalNtCopyAvx2(static_cast<char*>(dst), static_cast<const char*>(src), size);
+  } else {
+    std::memcpy(dst, src, size);
+  }
+}
+
+inline int LocalCopyThreads(const char* env_name) {
+  int t = 4;
+  if (const char* e = std::getenv(env_name)) {
+    int x = std::atoi(e);
+    if (x >= 1) t = x;
+  }
+  unsigned hc = std::thread::hardware_concurrency();
+  if (hc > 0 && t > static_cast<int>(hc)) t = static_cast<int>(hc);
+  if (t < 1) t = 1;
+  return t;
+}
+
+template <typename Fn>
+inline void LocalParallelFor(size_t n, int num_threads, Fn&& fn) {
+  if (n == 0) return;
+  if (num_threads > static_cast<int>(n)) num_threads = static_cast<int>(n);
+  if (num_threads <= 1) {
+    for (size_t i = 0; i < n; ++i) fn(i);
+    return;
+  }
+  std::atomic<size_t> next{0};
+  auto worker = [&]() {
+    size_t i;
+    while ((i = next.fetch_add(1)) < n) fn(i);
+  };
+  std::vector<std::thread> pool;
+  pool.reserve(num_threads);
+  for (int t = 0; t < num_threads; ++t) pool.emplace_back(worker);
+  for (auto& th : pool) th.join();
+}
+
 inline uint64_t LogicalPageBytes(size_t i, size_t num_pages, uint64_t page_size,
                                  size_t total_size) {
   return (i + 1 == num_pages) ? (total_size - i * page_size) : page_size;
@@ -558,7 +641,7 @@ bool PoolClient::LocalPutPages(const std::vector<PageLocation>& pages, uint64_t 
       return false;
     }
     const uint64_t bytes = LogicalPageBytes(i, pages.size(), page_size, size);
-    std::memcpy(static_cast<char*>(dram.buffer) + off, src_bytes + i * page_size, bytes);
+    LocalCopyBlock(static_cast<char*>(dram.buffer) + off, src_bytes + i * page_size, bytes);
   }
   return true;
 }
@@ -579,7 +662,7 @@ bool PoolClient::LocalGetPages(const std::vector<PageLocation>& pages, uint64_t 
       return false;
     }
     const uint64_t bytes = LogicalPageBytes(i, pages.size(), page_size, size);
-    std::memcpy(dst_bytes + i * page_size, static_cast<const char*>(dram.buffer) + off, bytes);
+    LocalCopyBlock(dst_bytes + i * page_size, static_cast<const char*>(dram.buffer) + off, bytes);
   }
   return true;
 }
@@ -689,6 +772,7 @@ PoolClient::PartitionBatchPutTargets(const std::vector<std::string>& keys,
                                      const std::vector<std::optional<RoutePutResult>>& routes,
                                      std::vector<PutEntryOutcome>* results) {
   std::unordered_map<std::string, std::vector<BatchPutItem>> remote_groups;
+  std::vector<size_t> local_idx;
   const size_t count = keys.size();
   for (size_t i = 0; i < count; ++i) {
     if (i >= routes.size() || !routes[i].has_value()) continue;
@@ -699,7 +783,22 @@ PoolClient::PartitionBatchPutTargets(const std::vector<std::string>& keys,
       continue;
     }
     if (route.node_id == config_.master_config.node_id) {
-      switch (ExecuteLocalPut(keys[i], srcs[i], sizes[i], route.tier)) {
+      local_idx.push_back(i);
+      continue;
+    }
+    if (route.tier != TierType::DRAM && route.tier != TierType::HBM) continue;
+    remote_groups[route.node_id].push_back(BatchPutItem{
+        .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
+  }
+  // Parallel local writes: different threads handle different keys. The
+  // PeerDramAllocator serializes Allocate/Commit internally (mutex); the heavy
+  // per-key memcpy in ExecuteLocalPut->LocalPutPages runs lock-free in parallel.
+  if (!local_idx.empty()) {
+    const int nthr = LocalCopyThreads("UMBP_DRAM_WRITE_THREADS");
+    const auto t0 = std::chrono::steady_clock::now();
+    LocalParallelFor(local_idx.size(), nthr, [&](size_t k) {
+      const size_t i = local_idx[k];
+      switch (ExecuteLocalPut(keys[i], srcs[i], sizes[i], routes[i]->tier)) {
         case PutAttemptOutcome::kSuccess:
           (*results)[i] = PutEntryOutcome::kSucceeded;
           break;
@@ -708,13 +807,18 @@ PoolClient::PartitionBatchPutTargets(const std::vector<std::string>& keys,
           break;
         case PutAttemptOutcome::kRetry:
         case PutAttemptOutcome::kFatal:
-          break;  // default kFailed
+          break;
       }
-      continue;
+    });
+    if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
+      double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
+                       std::chrono::steady_clock::now() - t0).count();
+      size_t tot = 0;
+      for (size_t k : local_idx) tot += sizes[k];
+      MORI_UMBP_INFO("[LocalCopy] PUT keys={} bytes={} threads={} elapsed_ms={:.3f} GiB_s={:.2f}",
+                     local_idx.size(), tot, nthr, sec * 1000.0,
+                     tot / (sec > 0 ? sec : 1e-12) / (1024.0 * 1024 * 1024));
     }
-    if (route.tier != TierType::DRAM && route.tier != TierType::HBM) continue;
-    remote_groups[route.node_id].push_back(BatchPutItem{
-        .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
   }
   return remote_groups;
 }
@@ -821,25 +925,23 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
   // because each needs its own peer-side staging slot + lease.
   std::unordered_map<std::string, std::vector<BatchGetItem>> remote_groups;
   std::unordered_map<std::string, std::vector<BatchGetItem>> ssd_remote_groups;
+  std::vector<size_t> local_get_idx;
   for (size_t i = 0; i < keys.size(); ++i) {
     if (i >= routes.size() || !routes[i].has_value()) {
-      if (peer_alloc_) {
-        auto outcome = ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]);
-        if (outcome == GetAttemptOutcome::kSuccess) {
-          results[i] = true;
-        }
-      }
+      if (peer_alloc_) local_get_idx.push_back(i);
       continue;
     }
     const auto& route = routes[i].value();
     if (route.node_id == config_.master_config.node_id) {
-      // Self-target fast path: SSD via PeerSsdManager, DRAM/HBM via the allocator.
-      GetAttemptOutcome outcome =
-          route.tier == TierType::SSD
-              ? ExecuteLocalSsdGet(keys[i], const_cast<void*>(dsts[i]), sizes[i])
-              : ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]);
-      if (outcome == GetAttemptOutcome::kSuccess) {
-        results[i] = true;
+      // Self-target fast path: SSD via PeerSsdManager (inline); DRAM/HBM via the
+      // allocator, deferred for batch-parallel copy across keys.
+      if (route.tier == TierType::SSD) {
+        if (ExecuteLocalSsdGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
+            GetAttemptOutcome::kSuccess) {
+          results[i] = true;
+        }
+      } else {
+        local_get_idx.push_back(i);
       }
       continue;
     }
@@ -852,6 +954,37 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
       ssd_remote_groups[route.node_id].push_back(std::move(item));
     } else {
       remote_groups[route.node_id].push_back(std::move(item));
+    }
+  }
+
+  // Parallel local DRAM reads: different threads handle different keys. Resolve
+  // is mutex-serialized in the allocator; the per-key memcpy in
+  // ExecuteLocalGet->LocalGetPages runs lock-free in parallel. results is
+  // std::vector<bool> (bit-packed) so threads write a temp buffer; merge serially.
+  if (!local_get_idx.empty()) {
+    const int nthr = LocalCopyThreads("UMBP_DRAM_READ_THREADS");
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<char> ok(local_get_idx.size(), 0);
+    LocalParallelFor(local_get_idx.size(), nthr, [&](size_t k) {
+      const size_t i = local_get_idx[k];
+      if (ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
+          GetAttemptOutcome::kSuccess) {
+        ok[k] = 1;
+      }
+    });
+    size_t tot = 0;
+    for (size_t k = 0; k < local_get_idx.size(); ++k) {
+      if (ok[k]) {
+        results[local_get_idx[k]] = true;
+        tot += sizes[local_get_idx[k]];
+      }
+    }
+    if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
+      double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
+                       std::chrono::steady_clock::now() - t0).count();
+      MORI_UMBP_INFO("[LocalCopy] GET keys={} bytes={} threads={} elapsed_ms={:.3f} GiB_s={:.2f}",
+                     local_get_idx.size(), tot, nthr, sec * 1000.0,
+                     tot / (sec > 0 ? sec : 1e-12) / (1024.0 * 1024 * 1024));
     }
   }
 

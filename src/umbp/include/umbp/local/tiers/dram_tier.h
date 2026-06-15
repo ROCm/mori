@@ -131,12 +131,12 @@ class DRAMTier : public TierBackend {
   // Threads used by ReadBatchIntoPtr for parallel CopyBlock. Default 8, override
   // via env UMBP_DRAM_READ_THREADS, capped to hardware concurrency. >1 breaks
   // the single-core memcpy ceiling on cold DRAM.
-  int read_threads_ = 8;
+  int read_threads_ = 4;
 
   // Threads used by BatchWrite for parallel CopyBlock. Default 8, override via
   // env UMBP_DRAM_WRITE_THREADS, capped to hardware concurrency. >1 breaks the
   // single-core memcpy ceiling on the PUT (backup) path.
-  int write_threads_ = 8;
+  int write_threads_ = 4;
 
   size_t Allocate(size_t size);                 // Allocate from free_list_
   void Deallocate(size_t offset, size_t size);  // Return to free_list_
