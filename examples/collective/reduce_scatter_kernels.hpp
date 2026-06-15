@@ -448,19 +448,24 @@ __global__ void ReduceScatterPullKernel(int myPe, int npes,
 //              and SDMAs that slot to next (distinct slot per step => no in-flight
 //              source reuse hazard within a launch).
 //   output   : chunkElems (final shard).
-//   readySig : (npes-1)*N uint64 (N = gridDim.x thread blocks). readySig[s*N+b]
-//              is bumped by the producer's SDMA completion atomic when block b's
-//              sub-range of slot s lands here; the consumer (block b) waits for it
-//              to reach `gen`. Monotonic, never reset, one increment per
-//              slot/block per launch (so expected == gen).
+//   readySig : (npes-1)*S uint64 (S = number of slices). readySig[s*S+g] is
+//              bumped by the producer group's single SDMA completion atomic when
+//              group g's slice of slot s lands here; every consumer block in
+//              group g waits for it to reach `gen`. Monotonic, never reset, one
+//              increment per slot/group per launch (so expected == gen).
+//   groupCnt : (npes-1)*S uint32 arrival counters (local, not symmetric). At each
+//              forward step every block in group g increments groupCnt[(k-1)*S+g]
+//              after flushing its sub-portion; the last arriver issues the slice
+//              SDMA. Monotonic (G increments/launch), so (prev+1)%G==0 elects it.
 //
-// Channel-parallel: N thread blocks, block b = blockIdx.x owns a disjoint
-// vecSize-aligned sub-range [bOfs, bOfs+bCnt) of the chunkElems shard and runs
-// the ENTIRE ring (steps k=0..npes-1) over only that sub-range. No cross-block
-// barrier. One SDMA transfer + one signal per (step, block). Cross-step overlap
-// is natural per block (a forward SDMA send of step k overlaps the
-// recv-wait/reduce of step k+1). The partition is identical on every rank, so
-// block b on rank R produces the partial that block b on rank R+1 consumes.
+// Grouped channel-parallel: N thread blocks, group g = b/G (G = N/S) cooperatively
+// reduces slice g (vecSize-aligned, chunkElems/S elems), block b handling its
+// localIdx = b%G sub-portion. The whole slice moves as ONE large SDMA per (step,
+// group), issued by the group's last arriver; this decouples transfer granularity
+// (S) from compute parallelism (N). G==1 (S==N) degenerates to one send per block.
+// The partition is identical on every rank, so group g on rank R produces the
+// partial that group g on rank R+1 consumes. Cross-step overlap is natural (a
+// forward SDMA of step k overlaps the recv-wait/reduce of step k+1).
 //
 // L2 coherence (same concern as the push/two-shot kernels): SDMA writes bypass
 // L2 and land in HBM, and SDMA reads bypass L2 too. So (a) after the CU reduces
@@ -544,7 +549,8 @@ template <int VecBytes, int NumVecs, class T, template <class> class OpT>
 __global__ void ReduceScatterRingKernel(int myPe, int npes, const T* __restrict__ input,
                                         T* __restrict__ recvBuf, T* __restrict__ sendBuf,
                                         T* __restrict__ output, HSAuint64* __restrict__ readySig,
-                                        size_t chunkElems, uint64_t gen) {
+                                        uint32_t* __restrict__ groupCnt, size_t chunkElems, int S,
+                                        uint64_t gen) {
   const int tid = static_cast<int>(threadIdx.x);
   const int N = static_cast<int>(gridDim.x);  // number of channel blocks
   const int b = static_cast<int>(blockIdx.x);
@@ -558,33 +564,46 @@ __global__ void ReduceScatterRingKernel(int myPe, int npes, const T* __restrict_
   auto* heapObj = GetGlobalGpuStatesPtr()->heapObj;
   const int numSdmaQ = static_cast<int>(heapObj->sdmaNumQueue);
 
-  // This block's disjoint sub-range of the shard, aligned down to a vecSize
-  // multiple so the vectorized path stays aligned; the last block absorbs the
-  // remainder (so only it carries a scalar tail).
+  // Grouping: the shard is split into S slices; group g = b / G owns slice g and
+  // is reduced cooperatively by G = N/S blocks (localIdx = b % G handles its
+  // sub-portion). The whole slice travels as ONE large SDMA transfer issued by
+  // the last block in the group to finish (elected via groupCnt), which keeps the
+  // transfer granularity (chunkElems/S) decoupled from compute parallelism (N).
   constexpr int vecSize = VecBytes / sizeof(T);
-  const size_t base = (chunkElems / static_cast<size_t>(N) / vecSize) * vecSize;
-  const size_t bOfs = static_cast<size_t>(b) * base;
-  const size_t bCnt = (b == N - 1) ? (chunkElems - bOfs) : base;
-  const int q = b % numSdmaQ;  // SDMA queue routing for this block
+  const int G = N / S;          // blocks per slice (>= 1; host guarantees N % S == 0)
+  const int g = b / G;          // this block's slice/group index
+  const int localIdx = b % G;   // position within the group
+  const int q = g % numSdmaQ;   // SDMA queue routing per group/slice
 
-  // --- Step 0 (seed): send our own input shard chunk(0) to next.recvBuf[slot 0].
-  // One thread issues the single sub-range copy; it runs asynchronously on the
-  // SDMA engine and overlaps the CU reductions of later steps. Signal at the
-  // per-block slot readySig[0*N + b].
+  // Slice geometry (vecSize-aligned; last slice absorbs the shard remainder).
+  const size_t sliceBase = (chunkElems / static_cast<size_t>(S) / vecSize) * vecSize;
+  const size_t sOfs = static_cast<size_t>(g) * sliceBase;
+  const size_t sCnt = (g == S - 1) ? (chunkElems - sOfs) : sliceBase;  // whole-slice length
+
+  // This block's reduce sub-portion within the slice (last localIdx absorbs the
+  // slice remainder so the G sub-portions tile the slice exactly).
+  const size_t subBase = (sliceBase / static_cast<size_t>(G) / vecSize) * vecSize;
+  const size_t bOfs = sOfs + static_cast<size_t>(localIdx) * subBase;
+  const size_t bCnt = (localIdx == G - 1) ? (sOfs + sCnt - bOfs) : subBase;
+
+  // --- Step 0 (seed): send our own input slice chunk(0) to next.recvBuf[slot 0].
+  // No reduction and no cross-block sync needed (input is read-only / already in
+  // HBM), so one block per group (localIdx == 0) issues the whole-slice copy.
+  // Signal at the per-(slot, group) slot readySig[0*S + g].
   {
     const int sc = chunkOf(0);
     const T* src = input + sc * chunkElems;
-    if (tid == 0) {
-      RingSdmaSend<T>(src + bOfs, recvBuf + bOfs, readySig + b, bCnt * sizeof(T), next, q);
+    if (tid == 0 && localIdx == 0) {
+      RingSdmaSend<T>(src + sOfs, recvBuf + sOfs, readySig + g, sCnt * sizeof(T), next, q);
     }
     __syncthreads();
   }
 
-  // --- Steps 1..npes-1: per-block ring. At each step we wait prev's data-ready
-  // signal for our sub-range, reduce it with our local input, and (unless final)
-  // forward it to next. The SDMA send of step k is fire-and-forget, so it overlaps
-  // the wait+reduce of step k+1 (copy(k) || compute(k+1)). Signals are per-(slot,
-  // block): readySig[slot*N + b].
+  // --- Steps 1..npes-1: grouped ring. Every block waits its group's data-ready
+  // signal, reduces its sub-portion of the slice with our local input, and (unless
+  // final) flushes it to HBM and joins the group's arrival counter. The last
+  // arriver issues ONE large SDMA for the whole slice; the others fall straight
+  // through to the next step's wait. Signals are per-(slot, group): readySig[slot*S+g].
   for (int k = 1; k < npes; ++k) {
     const int recvSlot = k - 1;  // slot prev wrote at its step k-1
     const int rc = chunkOf(k);
@@ -594,23 +613,31 @@ __global__ void ReduceScatterRingKernel(int myPe, int npes, const T* __restrict_
     const T* bin = input + rc * chunkElems;        // our local contribution
     T* dest = isFinal ? output : (sendBuf + k * chunkElems);
 
-    // Wait for our sub-range of recvSlot to land, then acquire (invalidate L2) so
-    // the CU reads the SDMA-written staging fresh from HBM.
+    // Wait for our group's slice of recvSlot to land, then acquire (invalidate L2)
+    // so the CU reads the SDMA-written staging fresh from HBM.
     if (tid == 0) {
-      anvil::waitForSignal(&readySig[static_cast<size_t>(recvSlot) * N + b], gen);
+      anvil::waitForSignal(&readySig[static_cast<size_t>(recvSlot) * S + g], gen);
     }
     __syncthreads();
     __threadfence_system();
 
-    // Reduce just our sub-range: dest[range] = recvBuf[range] (+) input[range].
+    // Reduce just our sub-portion: dest[range] = recvBuf[range] (+) input[range].
     ReduceTwoBlock<VecBytes, NumVecs, T, OpT>(a + bOfs, bin + bOfs, dest + bOfs, bCnt);
 
     if (!isFinal) {
-      RingL2Writeback();  // make our sub-range of dest visible in HBM before SDMA reads it
+      RingL2Writeback();  // make our sub-portion of dest visible in HBM before SDMA reads it
       if (tid == 0) {
-        T* dstSlot = recvBuf + k * chunkElems;  // next.recvBuf slot k
-        RingSdmaSend<T>(dest + bOfs, dstSlot + bOfs, readySig + static_cast<size_t>(k) * N + b,
-                        bCnt * sizeof(T), next, q);
+        // Join the group's arrival barrier. The counter is monotonic and gets
+        // exactly G increments per launch, so (prev+1) % G == 0 uniquely elects
+        // the last arriver every launch with no reset. After it observes all G
+        // arrivals, every sub-portion of the slice is flushed to HBM (each block
+        // did RingL2Writeback before incrementing), so the single SDMA is safe.
+        uint32_t prev = atomicAdd(&groupCnt[static_cast<size_t>(recvSlot) * S + g], 1u);
+        if ((prev + 1) % static_cast<uint32_t>(G) == 0) {
+          T* dstSlot = recvBuf + k * chunkElems;  // next.recvBuf slot k
+          RingSdmaSend<T>(dest + sOfs, dstSlot + sOfs,
+                          readySig + static_cast<size_t>(k) * S + g, sCnt * sizeof(T), next, q);
+        }
       }
       // No trailing __syncthreads: this step's dest region is not touched again
       // this launch, and the next step's wait path re-synchronises the block.
