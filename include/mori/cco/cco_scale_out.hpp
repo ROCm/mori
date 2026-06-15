@@ -111,10 +111,12 @@ struct ccoGda {
   // constructor
   __device__ inline ccoGda(ccoDevComm const&, int contextIndex);
 
-  // ── data transfer ───────────────────────────────────────────────────────
+  template <ccoTeamMode TeamMode>
+  __device__ inline int resolveWorldPeer(int peer) const;
 
   // put: rdma write with optional remote signal.
-  template <typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename RemoteAction = ccoGda_NoSignal,
+            typename Coop = ccoCoopThread>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes,
                              RemoteAction remoteAction = ccoGda_NoSignal{},
@@ -122,13 +124,14 @@ struct ccoGda {
                              uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // putValue: write an immediate value (≤8 bytes) with optional remote signal.
-  template <typename T, typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename T,
+            typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread>
   __device__ inline void putValue(int peer, ccoWindow_t dstWin, size_t dstOffset, T value,
                                   RemoteAction remoteAction = ccoGda_NoSignal{}, Coop coop = Coop{},
                                   uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // get: rdma read — pull peer's window content into our local window.
-  template <typename Coop = ccoCoopThread>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopThread>
   __device__ inline void get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
                              ccoWindow_t localWin, size_t localOffset, size_t bytes,
                              Coop coop = Coop{}, uint32_t optFlags = ccoGdaOptFlagsDefault);
@@ -136,7 +139,8 @@ struct ccoGda {
   // ── signal ──────────────────────────────────────────────────────────────
 
   // signal: send a signal-only message to peer (no data payload).
-  template <typename RemoteAction, typename Coop = ccoCoopThread>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename RemoteAction = ccoGda_NoSignal,
+            typename Coop = ccoCoopThread>
   __device__ inline void signal(int peer, RemoteAction remoteAction, Coop coop = Coop{});
 
   // readSignal: read the local value of one signal slot.
@@ -180,12 +184,12 @@ struct ccoGda {
   __device__ inline void flush(Coop coop = Coop{});
 
   // flush(peer): poll CQ for a single peer until its submitted WQEs complete.
-  template <typename Coop = ccoCoopWarp>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp>
   __device__ inline void flush(int peer, Coop coop = Coop{});
 
   // flushAsync: ring doorbell for peer and return a request handle that
   // wait() can later be used to wait on individually.
-  template <typename Coop = ccoCoopThread>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopThread>
   __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest, Coop coop = Coop{});
 
   // wait: block on a request handle previously returned by flushAsync.
@@ -797,6 +801,16 @@ __device__ inline int WorldPeerToGda(ccoDevComm const& comm, int globalPeer) {
 // Public facade: thin per-method wrappers that select the endpoint and dispatch
 // to the impl:: primitive layer above.
 template <core::ProviderType PrvdType>
+template <ccoTeamMode TeamMode>
+__device__ inline int ccoGda<PrvdType>::resolveWorldPeer(int peer) const {
+  if constexpr (TeamMode == CCO_TEAM_WORLD) {
+    return peer;
+  } else {
+    return impl::GdaPeerToWorld(comm, peer);
+  }
+}
+
+template <core::ProviderType PrvdType>
 __device__ inline ccoGda<PrvdType>::ccoGda(ccoDevComm const& comm_, int contextIndex)
     : comm(comm_), contextId(contextIndex) {
   this->_gdaHandle = (void*)&comm.ibgda;
@@ -824,28 +838,28 @@ __device__ inline ccoGda<PrvdType>::ccoGda(ccoDevComm const& comm_, int contextI
 
 // put: RDMA write with optional signal
 template <core::ProviderType PrvdType>
-template <typename RemoteAction, typename Coop>
+template <ccoTeamMode TeamMode, typename RemoteAction, typename Coop>
 __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_t dstOffset,
                                              ccoWindow_t srcWin, size_t srcOffset, size_t bytes,
                                              RemoteAction remoteAction,
                                              Coop coop, uint32_t optFlags) {
   coop.sync();
   if (coop.thread_rank() == 0) {
-    int teamPeer = impl::WorldPeerToGda(comm, peer);
+    int worldPeer = resolveWorldPeer<TeamMode>(peer);
 
     // step 1: parse windows to extract lkey/rkey
     ccoWindowDevice* dstWinDev = reinterpret_cast<ccoWindowDevice*>(dstWin);
     ccoWindowDevice* srcWinDev = reinterpret_cast<ccoWindowDevice*>(srcWin);
 
     uint32_t srcLkey = srcWinDev->ibgdaWin.lkey;
-    uint32_t dstRkey = dstWinDev->ibgdaWin.peerRkeys[teamPeer];
+    uint32_t dstRkey = dstWinDev->ibgdaWin.peerRkeys[worldPeer];
 
     uintptr_t localAddr = srcOffset;
     uintptr_t remoteAddr = dstOffset;
 
-    // step 2: select endpoint (based on team peer + contextId)
+    // step 2: select endpoint (world-indexed endpoints + contextId)
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
-    int qpIdx = teamPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
+    int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
 
@@ -858,12 +872,12 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
 
     if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalInc>) {
       signalRaddr = remoteAction.signalId * sizeof(uint64_t);
-      signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[teamPeer];
+      signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalInc;
       signalOpArg = 1;
     } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalAdd>) {
       signalRaddr = remoteAction.signalId * sizeof(uint64_t);
-      signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[teamPeer];
+      signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     }
@@ -881,7 +895,7 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
 
 // putValue: write immediate value (≤8 bytes)
 template <core::ProviderType PrvdType>
-template <typename T, typename RemoteAction, typename Coop>
+template <ccoTeamMode TeamMode, typename T, typename RemoteAction, typename Coop>
 __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, size_t dstOffset,
                                                   T value, RemoteAction remoteAction, Coop coop,
                                                   uint32_t optFlags) {
@@ -889,16 +903,16 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
 
   coop.sync();
   if (coop.thread_rank() == 0) {
-    int teamPeer = impl::WorldPeerToGda(comm, peer);
+    int worldPeer = resolveWorldPeer<TeamMode>(peer);
 
     // step 1: parse window to extract rkey
     ccoWindowDevice* dstWinDev = reinterpret_cast<ccoWindowDevice*>(dstWin);
-    uint32_t dstRkey = dstWinDev->ibgdaWin.peerRkeys[teamPeer];
+    uint32_t dstRkey = dstWinDev->ibgdaWin.peerRkeys[worldPeer];
     uintptr_t remoteAddr = dstOffset;
 
     // step 2: select endpoint
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
-    int qpIdx = teamPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
+    int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
 
@@ -911,12 +925,12 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
 
     if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalInc>) {
       signalRaddr = remoteAction.signalId * sizeof(uint64_t);
-      signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[teamPeer];
+      signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalInc;
       signalOpArg = 1;
     } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalAdd>) {
       signalRaddr = remoteAction.signalId * sizeof(uint64_t);
-      signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[teamPeer];
+      signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     }
@@ -930,19 +944,19 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
 
 // get: RDMA read
 template <core::ProviderType PrvdType>
-template <typename Coop>
+template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
                                              ccoWindow_t localWin, size_t localOffset, size_t bytes,
                                              Coop coop, uint32_t optFlags) {
   coop.sync();
   if (coop.thread_rank() == 0) {
-    int teamPeer = impl::WorldPeerToGda(comm, peer);
+    int worldPeer = resolveWorldPeer<TeamMode>(peer);
 
     // step 1: parse windows
     ccoWindowDevice* remoteWinDev = reinterpret_cast<ccoWindowDevice*>(remoteWin);
     ccoWindowDevice* localWinDev = reinterpret_cast<ccoWindowDevice*>(localWin);
 
-    uint32_t remoteRkey = remoteWinDev->ibgdaWin.peerRkeys[teamPeer];
+    uint32_t remoteRkey = remoteWinDev->ibgdaWin.peerRkeys[worldPeer];
     uint32_t localLkey = localWinDev->ibgdaWin.lkey;
 
     uintptr_t remoteAddr = remoteOffset;
@@ -950,7 +964,7 @@ __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, si
 
     // step 2: select endpoint
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
-    int qpIdx = teamPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
+    int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
 
@@ -962,15 +976,15 @@ __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, si
 
 // signal: send to remote peer
 template <core::ProviderType PrvdType>
-template <typename RemoteAction, typename Coop>
+template <ccoTeamMode TeamMode, typename RemoteAction, typename Coop>
 __device__ inline void ccoGda<PrvdType>::signal(int peer, RemoteAction remoteAction, Coop coop) {
   coop.sync();
   if (coop.thread_rank() == 0) {
-    int teamPeer = impl::WorldPeerToGda(comm, peer);
+    int worldPeer = resolveWorldPeer<TeamMode>(peer);
 
     // select endpoint first to get ibgda context
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
-    int qpIdx = teamPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
+    int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
 
@@ -982,12 +996,12 @@ __device__ inline void ccoGda<PrvdType>::signal(int peer, RemoteAction remoteAct
 
     if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalInc>) {
       signalRaddr = remoteAction.signalId * sizeof(uint64_t);
-      signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[teamPeer];
+      signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalInc;
       signalOpArg = 1;
     } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalAdd>) {
       signalRaddr = remoteAction.signalId * sizeof(uint64_t);
-      signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[teamPeer];
+      signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     }
@@ -1015,7 +1029,9 @@ __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
   for (int teamPeer = coop.thread_rank(); teamPeer < this->nRanks; teamPeer += coop.size()) {
     if (teamPeer == this->rank) continue;
-    int qpIdx = teamPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
+    // endpoints are world-indexed; the loop walks the GDA team.
+    int worldPeer = impl::GdaPeerToWorld(comm, teamPeer);
+    int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
     impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
@@ -1026,7 +1042,7 @@ __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
 
 // flush single peer: ring doorbell if needed, then poll CQ until complete.
 template <core::ProviderType PrvdType>
-template <typename Coop>
+template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush(peer) requires at least ccoCoopWarp. "
@@ -1034,9 +1050,9 @@ __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
                 "which breaks the warp-level pollCqLock inside quietUntil.");
   coop.sync();
   if (coop.thread_rank() == 0) {
-    int teamPeer = impl::WorldPeerToGda(comm, peer);
+    int worldPeer = resolveWorldPeer<TeamMode>(peer);
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
-    int qpIdx = teamPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
+    int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
     impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
@@ -1047,14 +1063,14 @@ __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
 
 // flushAsync: ring doorbell for peer, return a request handle for wait().
 template <core::ProviderType PrvdType>
-template <typename Coop>
+template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* outRequest,
                                                     Coop coop) {
   coop.sync();
   if (coop.thread_rank() == 0) {
-    int teamPeer = impl::WorldPeerToGda(comm, peer);
+    int worldPeer = resolveWorldPeer<TeamMode>(peer);
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
-    int qpIdx = teamPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
+    int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
 
     uint32_t postIdx = 0;
@@ -1096,7 +1112,9 @@ __device__ inline void ccoGda<PrvdType>::counter(LocalAction localAction, Coop c
 
   for (int teamPeer = coop.thread_rank(); teamPeer < this->nRanks; teamPeer += coop.size()) {
     if (teamPeer == this->rank) continue;
-    int qpIdx = teamPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
+    // endpoints are world-indexed; the loop walks the GDA team.
+    int worldPeer = impl::GdaPeerToWorld(comm, teamPeer);
+    int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     impl::quietUntil<PrvdType>(ep, ep->wqHandle.postIdx);
   }
@@ -1196,12 +1214,13 @@ __device__ inline void ccoGdaBarrierSession<PrvdType, Coop>::sync(Coop) {
     int peer = 1 + myRank + i;
     if (peer >= nRanks) peer -= nRanks;
 
-    int qpIdx = peer * ibgda->numQpPerPe + (gda.contextId % ibgda->numQpPerPe);
+    // endpoints/peerRkeys are world-indexed; peer is GDA team-local.
+    int worldPeer = impl::GdaPeerToWorld(gda.comm, peer);
+    int qpIdx = worldPeer * ibgda->numQpPerPe + (gda.contextId % ibgda->numQpPerPe);
     application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
 
     uintptr_t signalRaddr = (signalBase + myRank) * sizeof(uint64_t);
-    uint32_t signalRkey = gda.comm.resourceWindow_inlined.ibgdaWin.peerRkeys[
-        impl::GdaPeerToWorld(gda.comm, peer)];
+    uint32_t signalRkey = gda.comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
 
     impl::signalImpl<PrvdType>(ep, ep->qpn, signalRaddr, signalRkey,
                                ccoGdaSignalInc, 1);

@@ -98,6 +98,12 @@ enum ccoGdaConnectionType {
   CCO_GDA_CONNECTION_RAIL = 3,  // QPs only to same-rail cross-node peers — TODO: not yet enforced
 };
 
+enum ccoTeamMode {
+  CCO_TEAM_WORLD = 0,
+  CCO_TEAM_LSA = 1,
+  CCO_TEAM_GDA = 2,
+};
+
 // 3-int rank subset descriptor.
 //   worldRank = commRank + (teamRank - team.rank) * team.stride
 // Built-in teams: ccoTeamWorld / Lsa / CrossNode / Rail (below).
