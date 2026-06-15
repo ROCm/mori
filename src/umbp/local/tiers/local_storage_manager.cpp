@@ -676,6 +676,40 @@ bool LocalStorageManager::WriteFromPtr(const std::string& key, uintptr_t src, si
   return Write(key, reinterpret_cast<const void*>(src), size, tier);
 }
 
+std::vector<bool> LocalStorageManager::WriteBatchFromPtr(const std::vector<std::string>& keys,
+                                                         const std::vector<uintptr_t>& srcs,
+                                                         const std::vector<size_t>& sizes,
+                                                         StorageTier tier) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (n == 0) return results;
+
+  TierBackend* target = GetTier(tier);
+  if (!target) return results;
+
+  // Fast path: parallel batch write when the tier supports it. BatchWrite does
+  // not self-evict, so keys that don't fit come back false; retry those per-key
+  // through Write() which demotes LRU victims to make room.
+  if (target->Capabilities().batch_write && n > 1) {
+    std::vector<const void*> ptrs;
+    ptrs.reserve(n);
+    for (size_t i = 0; i < n; ++i) ptrs.push_back(reinterpret_cast<const void*>(srcs[i]));
+    results = target->BatchWrite(keys, ptrs, sizes);
+    for (size_t i = 0; i < n; ++i) {
+      if (!results[i]) {
+        results[i] = Write(keys[i], reinterpret_cast<const void*>(srcs[i]), sizes[i], tier);
+      }
+    }
+    return results;
+  }
+
+  // Slow path: per-key (also covers single-element batches).
+  for (size_t i = 0; i < n; ++i) {
+    results[i] = Write(keys[i], reinterpret_cast<const void*>(srcs[i]), sizes[i], tier);
+  }
+  return results;
+}
+
 bool LocalStorageManager::ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size) {
   bool ok = ReadIntoPtrNoPromote(key, dst, size);
   if (ok && config_.eviction.auto_promote_on_read) {
