@@ -63,6 +63,48 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   expectedSignals[qId]++;
 }
 
+// Multi-producer-safe single-thread put: copy packet + completion atomic.
+//
+// Unlike SdmaPutThread, this reserves space for BOTH packets in ONE
+// ReserveQueueSpace call and writes them with ONE placePacket call, so the
+// producer's reserved range [startBase, pendingWptr) is a single contiguous
+// block. 
+inline __device__ void SdmaPutThreadFused(void* srcBuf, void* dstBuf, size_t copy_size,
+                                          anvil::SdmaQueueDeviceHandle** deviceHandles,
+                                          HSAuint64* signals, HSAuint64* expectedSignals,
+                                          uint32_t queNum, uint32_t qId) {
+  // A copy-linear packet immediately followed by its completion atomic. Both SDMA
+  // packet structs are made entirely of 4-byte fields, so this aggregate has no
+  // internal padding and its 15 dwords land in the ring exactly as two adjacent
+  // packets would (copy at dwords 0..6, atomic at 7..14).
+  struct SDMA_PKT_COPY_WITH_ATOMIC {
+    SDMA_PKT_COPY_LINEAR copy;
+    SDMA_PKT_ATOMIC atomic;
+  };
+  static_assert(sizeof(SDMA_PKT_COPY_WITH_ATOMIC) ==
+                  sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC),
+              "combined SDMA copy+atomic packet must be tightly packed");
+  uint64_t offset = 0;
+  char* srcPtr = reinterpret_cast<char*>(srcBuf);
+  char* dstPtr = reinterpret_cast<char*>(dstBuf);
+
+  anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
+
+  // Single contiguous reservation for the copy + atomic packets. `offset` is the
+  // wrap-around NOP padding; it precedes the combined packet, which cannot wrap
+  // internally because it was reserved as one block.
+  const uint64_t startBase = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_WITH_ATOMIC), offset);
+  uint64_t pendingWptr = startBase;
+
+  SDMA_PKT_COPY_WITH_ATOMIC packet;
+  packet.copy = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size);
+  packet.atomic = anvil::CreateAtomicIncPacket(signals + qId);
+  handle.template placePacket<SDMA_PKT_COPY_WITH_ATOMIC>(packet, pendingWptr, offset);
+
+  handle.submitPacket(startBase, pendingWptr);
+  expectedSignals[qId]++;
+}
+
 inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
                                    anvil::SdmaQueueDeviceHandle** deviceHandles, HSAuint64* signals,
                                    HSAuint64* expectedSignals, uint32_t queNum) {

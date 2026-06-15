@@ -240,8 +240,6 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
       if (std::strcmp(m, "ring") == 0) return RsMode::kRing;
       if (std::strcmp(m, "push") == 0) return RsMode::kPush;
     }
-    const char* e = std::getenv("RS_PULL");
-    if (e != nullptr && std::atoi(e) != 0) return RsMode::kPull;
     return RsMode::kPush;
   }();
   const char* modeName =
@@ -250,21 +248,24 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   // --- Ring-mode extra symmetric buffers ------------------------------------
   // recvBuf reuses `staging` (N*chunk >= (npes-1)*chunk). sendBuf gets its own
   // (npes-1) slots so a forward step never overwrites an in-flight SDMA source.
-  // readySig: (npes-1)*S uint64 data-ready signals (one increment per slot/slice
-  // per launch), zeroed once and matched against the launch generation.
-  int ringS = 1;
+  // Channel-parallel: ringBlocks (N) thread blocks each own a disjoint sub-range
+  // and run the full ring. readySig: (npes-1)*N uint64 data-ready signals (one
+  // increment per slot/block per launch), zeroed once and matched against gen.
+  int ringBlocks = 1;
   ElemT* ringSend = nullptr;
   HSAuint64* ringSig = nullptr;
   void* ringBuf = nullptr;
   if (mode == RsMode::kRing) {
-    ringS = static_cast<int>(std::min<size_t>(8, chunkElems));
-    if (const char* s = std::getenv("RS_RING_SLICES")) {
+    ringBlocks = std::max(1, prop.multiProcessorCount);
+    if (const char* s = std::getenv("RS_RING_BLOCKS")) {
       int v = std::atoi(s);
-      if (v >= 1) ringS = static_cast<int>(std::min<size_t>(v, chunkElems));
+      if (v >= 1) ringBlocks = v;
     }
-    ringS = std::max(1, std::min(ringS, kThreads));
+    // Every block needs at least one VecSize-wide vector of work.
+    const int maxBlocks = static_cast<int>(std::max<size_t>(1, chunkElems / VecSize));
+    ringBlocks = std::max(1, std::min(ringBlocks, maxBlocks));
     const size_t sendElems = static_cast<size_t>(std::max(1, npes - 1)) * chunkElems;
-    const size_t sigCount = static_cast<size_t>(std::max(1, npes - 1)) * ringS;
+    const size_t sigCount = static_cast<size_t>(std::max(1, npes - 1)) * ringBlocks;
     const size_t sendBytes = sendElems * sizeof(ElemT);
     const size_t sigBytes = sigCount * sizeof(HSAuint64);
     ringBuf = ShmemMalloc(sendBytes + sigBytes);
@@ -281,7 +282,7 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
 
   if (info.deviceId == 0) {
     if (mode == RsMode::kRing) {
-      XPUT("reduce_scatter_test: mode=RING numQ=%d slices=%d (single block, SMs=%d)", numQ, ringS,
+      XPUT("reduce_scatter_test: mode=RING numQ=%d blocks=%d (SMs=%d)", numQ, ringBlocks,
            prop.multiProcessorCount);
     } else {
       XPUT("reduce_scatter_test: mode=%s numQ=%d blocks=%d (SMs=%d)", modeName, numQ, blocks,
@@ -307,15 +308,16 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
       ReduceScatterPullKernel<VecBytes, NumVecs, ElemT, SumOp><<<blocks, kThreads, 0, stream>>>(
           myPe, npes, baseObj, output, chunkElems);
     } else if (mode == RsMode::kRing) {
-      // Single-block SDMA ring. recvBuf reuses `staging`; gen = launch generation
-      // so the per-slot data-ready wait matches the exact per-launch value.
-      ReduceScatterRingKernel<VecBytes, NumVecs, ElemT, SumOp><<<1, kThreads, 0, stream>>>(
-          myPe, npes, input, /*recvBuf=*/staging, ringSend, output, ringSig, chunkElems, ringS,
+      // Channel-parallel SDMA ring: ringBlocks blocks, each owns a sub-range and
+      // runs the full ring. recvBuf reuses `staging`; gen = launch generation so
+      // the per-(slot,block) data-ready wait matches the exact per-launch value.
+      ReduceScatterRingKernel<VecBytes, NumVecs, ElemT, SumOp><<<ringBlocks, kThreads, 0, stream>>>(
+          myPe, npes, input, /*recvBuf=*/staging, ringSend, output, ringSig, chunkElems,
           static_cast<uint64_t>(iter) + 1);
     } else {
       // gen = monotonic launch generation (signals are zeroed once and never
       // reset, so the receive-side wait matches the exact per-launch value).
-      ReduceScatterKernel<VecBytes, NumVecs, ElemT, SumOp><<<blocks, kThreads, 0, stream>>>(
+      ReduceScatterPushKernel<VecBytes, NumVecs, ElemT, SumOp><<<blocks, kThreads, 0, stream>>>(
           myPe, npes, numQ, input, staging, output, chunkElems,
           static_cast<uint64_t>(iter) + 1);
     }
