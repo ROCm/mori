@@ -92,11 +92,49 @@ struct EvictionConfig {
   }
 };
 
+// Policy knobs for the online tier hit-quality coefficients served by
+// GetTierCoeffs.  All retrieval-cost figures are seconds/token.  These are
+// policy scales meant to be calibrated by A/B routing outcome, not measured
+// physical constants.
+struct TierCoeffConfig {
+  // "halving cost": the retrieval cost at which a hit's value drops to 1/2.
+  // Smaller -> larger gaps between tiers / more sensitive to retrieval cost.
+  // Expressed here in seconds; env override is in integer microseconds.
+  double c_half_seconds = 100e-6;  // 100 us/token
+
+  // Fixed wall-clock window over which the cumulative in-memory histograms are
+  // differenced before computing quantiles, so coefficients reflect recent
+  // cost structure rather than all-time accumulation.
+  std::chrono::seconds window{15};
+
+  // Remote bandwidth LOW quantile (-> latency HIGH quantile, conservative) and
+  // gather median.  Not env-overridable (mirrors EvictionConfig watermarks).
+  double remote_bw_quantile = 0.25;
+  double gather_quantile = 0.50;
+
+  // Start-up safety: cap z <= y until A/B validates remote credit.
+  bool clamp_z_le_y = true;
+
+  // KV bytes per token (Kimi MLA fp8 = 34.3 KB), used for c_remote = bytes /
+  // bandwidth.
+  double bytes_per_token = 34.3 * 1024.0;
+
+  static TierCoeffConfig FromEnvironment() {
+    TierCoeffConfig cfg;
+    const auto c_half_us = GetEnvMicroseconds("UMBP_TIER_C_HALF_US", std::chrono::microseconds(100),
+                                              /*min_allowed=*/1);
+    cfg.c_half_seconds = static_cast<double>(c_half_us.count()) * 1e-6;
+    cfg.window = GetEnvSeconds("UMBP_TIER_COEFF_WINDOW_SEC", cfg.window, /*min_allowed=*/1);
+    return cfg;
+  }
+};
+
 struct MasterServerConfig {
   std::string listen_address = "0.0.0.0:50051";
   int metrics_port = 0;  // 0 = disabled; set to a positive port to enable
   ClientRegistryConfig registry_config;
   EvictionConfig eviction_config;
+  TierCoeffConfig tier_coeff_config;
 
   std::unique_ptr<RouteGetStrategy> get_strategy;
   std::unique_ptr<RoutePutStrategy> put_strategy;

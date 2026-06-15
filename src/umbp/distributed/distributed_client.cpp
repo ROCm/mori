@@ -289,6 +289,14 @@ bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& h
   return pool_client_->ReportExternalKvBlocks(hashes, tier);
 }
 
+void DistributedClient::ObserveMetric(
+    const std::string& name, const std::string& help,
+    const std::vector<std::pair<std::string, std::string>>& labels,
+    const std::vector<double>& bounds, double value) {
+  if (!pool_client_) return;
+  pool_client_->Master().Observe(name, help, labels, bounds, value);
+}
+
 bool DistributedClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes,
                                                TierType tier) {
   if (!pool_client_) return false;

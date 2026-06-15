@@ -24,7 +24,13 @@
 #include <grpcpp/grpcpp.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <deque>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -69,6 +75,40 @@ std::chrono::seconds HitIndexGcInterval() {
 uint32_t HitQueryMaxBatch() {
   static const uint32_t v = GetEnvUint32("UMBP_HIT_QUERY_MAX_BATCH", 4096, /*min_allowed=*/1);
   return v;
+}
+
+// GetTierCoeffs fallbacks, returned with epoch_ms=0 when there is no fresh
+// online data.  Mirror the router's static defaults so behavior is sane even if
+// a caller ignores epoch_ms.
+constexpr float kDefaultY = 0.9f;
+constexpr float kDefaultZ = 0.0f;
+constexpr float kDefaultSsd = 0.0f;
+constexpr double kBytesPerGiB = 1073741824.0;  // 1 << 30
+
+// Prometheus-style histogram_quantile over an explicit-bound histogram with
+// CUMULATIVE bucket counts.  `bounds` are finite upper bounds (ascending); the
+// implicit +Inf bucket holds (total - cum.back()).  Linear interpolation within
+// the bucket the requested rank lands in.  Returns NaN when there is no data.
+double QuantileFromBuckets(const std::vector<double>& bounds, const std::vector<uint64_t>& cum,
+                           double total, double q) {
+  if (total <= 0.0 || bounds.empty() || cum.size() != bounds.size()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  const double rank = q * total;
+  std::size_t i = 0;
+  while (i < cum.size() && static_cast<double>(cum[i]) < rank) ++i;
+  if (i == cum.size()) {
+    // Rank falls in the implicit +Inf bucket; best finite estimate is the last
+    // explicit bound.
+    return bounds.back();
+  }
+  const double upper = bounds[i];
+  const double lower = (i == 0) ? 0.0 : bounds[i - 1];
+  const double cum_lower = (i == 0) ? 0.0 : static_cast<double>(cum[i - 1]);
+  const double bucket_count = static_cast<double>(cum[i]) - cum_lower;
+  if (bucket_count <= 0.0) return upper;
+  const double frac = (rank - cum_lower) / bucket_count;
+  return lower + frac * (upper - lower);
 }
 
 uint64_t NowNs() {
@@ -179,6 +219,7 @@ MasterServerConfig MasterServerConfig::FromEnvironment() {
   MasterServerConfig cfg;
   cfg.registry_config = ClientRegistryConfig::FromEnvironment();
   cfg.eviction_config = EvictionConfig::FromEnvironment();
+  cfg.tier_coeff_config = TierCoeffConfig::FromEnvironment();
   return cfg;
 }
 
@@ -190,14 +231,16 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   UMBPMasterServiceImpl(ClientRegistry& registry, GlobalBlockIndex& index,
                         ExternalKvBlockIndex& external_kv_index,
                         ExternalKvHitIndex& external_kv_hit_index, Router& router,
-                        const ClientRegistryConfig& config, mori::metrics::MetricsServer* metrics)
+                        const ClientRegistryConfig& config, mori::metrics::MetricsServer* metrics,
+                        const TierCoeffConfig& tier_cfg = {})
       : registry_(registry),
         index_(index),
         external_kv_index_(external_kv_index),
         external_kv_hit_index_(external_kv_hit_index),
         router_(router),
         config_(config),
-        metrics_(metrics) {}
+        metrics_(metrics),
+        tier_cfg_(tier_cfg) {}
 
   // -------- Client lifecycle --------
 
@@ -657,6 +700,69 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     return grpc::Status::OK;
   }
 
+  // -------- Online tier hit-quality coefficients --------
+  // Read-only.  Reads the in-memory metrics histograms, differences them over a
+  // fixed wall-clock window, and applies the saturating formula.  On
+  // missing/cold/stale data it returns fallbacks with epoch_ms=0, which the
+  // router treats as "use my config".
+  grpc::Status GetTierCoeffs(grpc::ServerContext* /*ctx*/,
+                             const ::umbp::GetTierCoeffsRequest* request,
+                             ::umbp::GetTierCoeffsResponse* response) override {
+    // Resolve the candidate set: explicit list, or all alive clients when empty.
+    std::vector<std::string> nodes(request->candidate_node_ids().begin(),
+                                   request->candidate_node_ids().end());
+    if (nodes.empty()) {
+      for (const auto& record : registry_.GetAliveClients()) nodes.push_back(record.node_id);
+    }
+
+    const uint64_t now_ms =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count());
+
+    for (const auto& node : nodes) {
+      auto* out = response->add_coeffs();
+      out->set_node_id(node);
+      out->set_x(1.0f);           // HBM, c_fetch == 0
+      out->set_ssd(kDefaultSsd);  // reserved; SSD is never matched on this path
+
+      // c_gather = p50 of the per-node gather histogram (already seconds/token).
+      const auto c_gather = WindowedQuantile(MORI_UMBP_METRIC_CLIENT_KV_GATHER_DURATION,
+                                             {{"node", node}}, tier_cfg_.gather_quantile);
+
+      // c_remote = bytes_per_token / bandwidth_lowquantile.  Low bandwidth
+      // quantile -> high latency (conservative).
+      const auto bw_remote =
+          WindowedQuantile(MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
+                           {{"node", node}, {"traffic", "remote"}}, tier_cfg_.remote_bw_quantile);
+
+      const double c_half = tier_cfg_.c_half_seconds;
+      bool fresh = false;
+
+      // y depends only on gather.
+      float y = kDefaultY;
+      if (c_gather && std::isfinite(*c_gather) && *c_gather >= 0.0) {
+        y = static_cast<float>(c_half / (c_half + *c_gather));
+        fresh = true;
+      }
+      out->set_y(y);
+
+      // z needs both remote and gather.
+      float z = kDefaultZ;
+      if (c_gather && std::isfinite(*c_gather) && *c_gather >= 0.0 && bw_remote &&
+          std::isfinite(*bw_remote) && *bw_remote > 0.0) {
+        const double c_remote = tier_cfg_.bytes_per_token / (*bw_remote * kBytesPerGiB);
+        z = static_cast<float>(c_half / (c_half + c_remote + *c_gather));
+        if (tier_cfg_.clamp_z_le_y && z > y) z = y;  // start-up safety
+        fresh = true;
+      }
+      out->set_z(z);
+
+      out->set_epoch_ms(fresh ? now_ms : 0u);
+    }
+    return grpc::Status::OK;
+  }
+
   void SetMetrics(mori::metrics::MetricsServer* metrics) { metrics_ = metrics; }
 
  private:
@@ -691,6 +797,69 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
   }
 
+  // Snapshot the named labeled histogram now, difference it against the snapshot
+  // taken ~window ago (per-series ring), and return the requested quantile over
+  // the DELTA histogram, so the result reflects recent cost rather than all-time
+  // accumulation.  nullopt when metrics are disabled, the series is absent, the
+  // ring has no window-old baseline yet (cold start), or no fresh samples landed
+  // in the window.
+  std::optional<double> WindowedQuantile(const char* metric_name,
+                                         const mori::metrics::MetricsServer::Labels& labels,
+                                         double quantile) {
+    if (!metrics_) return std::nullopt;
+    auto now_snap = metrics_->SnapshotLabeledHistogram(metric_name, labels);
+    if (!now_snap) return std::nullopt;
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto window = tier_cfg_.window;
+
+    // Ring key = metric name + label signature (caller passes labels in a fixed
+    // order, so concatenation is stable).
+    std::string key = metric_name;
+    for (const auto& kv : labels) {
+      key += '|';
+      key += kv.first;
+      key += '=';
+      key += kv.second;
+    }
+
+    std::vector<uint64_t> baseline_counts;
+    uint64_t baseline_total = 0;
+    bool have_baseline = false;
+    {
+      std::lock_guard<std::mutex> lk(coeff_ring_mutex_);
+      auto& ring = coeff_ring_[key];
+      // Pick the newest snapshot that is at least `window` old as the baseline.
+      for (auto it = ring.rbegin(); it != ring.rend(); ++it) {
+        if (now - it->t >= window) {
+          if (it->snap.bucket_counts.size() == now_snap->bucket_counts.size()) {
+            baseline_counts = it->snap.bucket_counts;
+            baseline_total = it->snap.count;
+            have_baseline = true;
+          }
+          break;
+        }
+      }
+      // Record the current snapshot, then prune anything older than 2*window so
+      // the ring stays bounded regardless of polling cadence.
+      ring.push_back(TimedSnapshot{now, *now_snap});
+      while (!ring.empty() && now - ring.front().t > 2 * window) ring.pop_front();
+    }
+
+    if (!have_baseline) return std::nullopt;  // cold start: no window-old baseline
+
+    std::vector<uint64_t> delta(now_snap->bucket_counts.size());
+    for (std::size_t i = 0; i < delta.size(); ++i) {
+      delta[i] = now_snap->bucket_counts[i] - baseline_counts[i];
+    }
+    const double delta_total = static_cast<double>(now_snap->count - baseline_total);
+    if (delta_total <= 0.0) return std::nullopt;  // no fresh samples in window
+
+    const double q = QuantileFromBuckets(now_snap->bounds, delta, delta_total, quantile);
+    if (!std::isfinite(q)) return std::nullopt;
+    return q;
+  }
+
   ClientRegistry& registry_;
   GlobalBlockIndex& index_;
   ExternalKvBlockIndex& external_kv_index_;
@@ -698,6 +867,18 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   Router& router_;
   ClientRegistryConfig config_;
   mori::metrics::MetricsServer* metrics_ = nullptr;
+  TierCoeffConfig tier_cfg_;
+
+  // Per-series ring of timestamped cumulative snapshots, used to difference the
+  // monotonic in-memory histograms over a fixed wall-clock window.  Keyed by the
+  // lookup signature (metric name + required labels) and guarded by its own
+  // mutex; only touched on the GetTierCoeffs path.
+  struct TimedSnapshot {
+    std::chrono::steady_clock::time_point t;
+    mori::metrics::MetricsServer::HistogramSnapshot snap;
+  };
+  std::mutex coeff_ring_mutex_;
+  std::map<std::string, std::deque<TimedSnapshot>> coeff_ring_;
 };
 
 // ---------------------------------------------------------------------------
@@ -710,9 +891,9 @@ MasterServer::MasterServer(MasterServerConfig config)
       external_kv_hit_index_(),
       registry_(config_.registry_config, index_, &external_kv_index_),
       router_(index_, registry_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
-      service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, external_kv_index_,
-                                                       external_kv_hit_index_, router_,
-                                                       config_.registry_config, nullptr)),
+      service_(std::make_unique<UMBPMasterServiceImpl>(
+          registry_, index_, external_kv_index_, external_kv_hit_index_, router_,
+          config_.registry_config, nullptr, config_.tier_coeff_config)),
       peer_stub_pool_(std::make_unique<MasterPeerStubPool>()),
       eviction_manager_(std::make_unique<EvictionManager>(
           index_, registry_, config_.eviction_config, peer_stub_pool_.get())) {

@@ -45,6 +45,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -132,6 +133,23 @@ class MetricsServer {
   // ------------------------------------------------------------------
   int port() const noexcept { return port_; }
   bool running() const noexcept { return running_.load(std::memory_order_relaxed); }
+
+  // Read-only snapshot of one labeled histogram series.  `bucket_counts` is
+  // CUMULATIVE (same convention as observeAggregated).  Returned by value so
+  // the caller never touches internal state outside the lock.
+  struct HistogramSnapshot {
+    std::vector<double> bounds;
+    std::vector<uint64_t> bucket_counts;  // cumulative
+    uint64_t count{0};
+    double sum{0.0};
+  };
+
+  // Snapshot the first series of histogram `name` whose label key contains
+  // every requested label as a `key="value"` token (order-independent subset
+  // match; extra labels on the stored series are ignored).  Returns nullopt
+  // when the metric or a matching series is absent.
+  std::optional<HistogramSnapshot> SnapshotLabeledHistogram(std::string_view name,
+                                                            const Labels& required_labels) const;
 
  private:
   // ---- per-metric storage -------------------------------------------

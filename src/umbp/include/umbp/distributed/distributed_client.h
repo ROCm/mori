@@ -77,6 +77,10 @@ class DistributedClient : public IUMBPClient {
   std::vector<ExternalKvHitCountEntry> GetExternalKvHitCounts(
       const std::vector<std::string>& hashes) override;
 
+  void ObserveMetric(const std::string& name, const std::string& help,
+                     const std::vector<std::pair<std::string, std::string>>& labels,
+                     const std::vector<double>& bounds, double value) override;
+
  private:
   UMBPConfig config_;
   void* dram_pool_ = nullptr;

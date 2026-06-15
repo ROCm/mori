@@ -226,6 +226,37 @@ void MetricsServer::observeAggregated(std::string_view name, std::string_view he
   s.sum += sum;
 }
 
+std::optional<MetricsServer::HistogramSnapshot> MetricsServer::SnapshotLabeledHistogram(
+    std::string_view name, const Labels& required_labels) const {
+  // Build the required `key="value"` tokens once; the closing quote makes
+  // node="R" reject node="R2" (no prefix collisions).
+  std::vector<std::string> tokens;
+  tokens.reserve(required_labels.size());
+  for (const auto& kv : required_labels) {
+    tokens.push_back(kv.first + "=\"" + kv.second + "\"");
+  }
+  std::lock_guard<std::mutex> lk(mutex_);
+  auto fam_it = labeled_histograms_.find(std::string(name));
+  if (fam_it == labeled_histograms_.end()) return std::nullopt;
+  for (const auto& [key, s] : fam_it->second.series) {
+    bool all = true;
+    for (const auto& tok : tokens) {
+      if (key.find(tok) == std::string::npos) {
+        all = false;
+        break;
+      }
+    }
+    if (!all) continue;
+    HistogramSnapshot snap;
+    snap.bounds = s.bounds;
+    snap.bucket_counts = s.bucket_counts;
+    snap.count = s.count;
+    snap.sum = s.sum;
+    return snap;
+  }
+  return std::nullopt;
+}
+
 static std::string FormatLabels(const mori::metrics::MetricsServer::Labels& labels) {
   if (labels.empty()) return "";
   std::string s = "{";

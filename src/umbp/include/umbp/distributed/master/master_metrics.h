@@ -188,6 +188,16 @@
   "BatchGet e2e call bandwidth in GiB/s (successful bytes only, split by client and local/remote " \
   "traffic)"
 
+// --- host->device KV gather device time (sglang-reported) ------------------
+// Per-token device time of the host->device KV gather (load stream), reported
+// by the sglang umbp adapter via observe_metric.  Master injects
+// node=<node_id>; GetTierCoeffs reads its p50 to compute c_gather.  The
+// producer is Python (umbp_store.py) and must emit this exact name with a fixed
+// bucket layout.
+#define MORI_UMBP_METRIC_CLIENT_KV_GATHER_DURATION "mori_umbp_client_kv_gather_duration_seconds"
+#define MORI_UMBP_METRIC_CLIENT_KV_GATHER_DURATION_HELP \
+  "Per-token device time of host->device KV gather (load stream), seconds/token"
+
 // --- MasterClient -> MasterServer RPC latency (client-perceived) -----------
 // Histogram of round-trip latency for every RPC method on the
 // MasterClient channel, reported by clients via ReportMetrics.  Labels

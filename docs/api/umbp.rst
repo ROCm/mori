@@ -474,6 +474,287 @@ methods ``mori.cpp.UMBPClient.report_external_kv_blocks(hashes, tier)``,
 
 ----
 
+Online Tier Coefficients (``GetTierCoeffs``)
+--------------------------------------------
+
+**Purpose — load-aware hit quality.** ``match_external_kv`` tells you *where* a
+prompt's blocks are cached, broken down by tier.  ``GetTierCoeffs`` tells you
+*how much each tier is worth right now* on a given node, as a per-tier
+coefficient that **moves with system load**.  A scheduler multiplies the
+deduped per-tier hit counts from ``match_external_kv`` by these coefficients to
+get a single load-adjusted cache-hit credit per candidate worker.
+
+The coefficients are **saturating hit-quality** values:
+
+.. code-block:: text
+
+   coef = c_half / (c_half + c_fetch)
+
+   x (HBM)    = 1                                       # already on device, no fetch
+   y (DRAM)   = c_half / (c_half + c_gather)            # host->device gather only
+   z (remote) = c_half / (c_half + c_remote + c_gather) # peer RDMA->host, then gather
+
+* Dimensionless, always ``∈ (0, 1]``, HBM is always ``1`` — **never needs
+  clamping, never negative, never > 1**.
+* ``c_gather`` and ``c_remote`` are measured online (see `Inputs`_), so as a
+  node's host→device gather slows (HBM pressure) its ``y`` drops, and as its
+  remote retrieval slows (NIC congestion) its ``z`` drops — steering requests
+  away from expensive-to-fetch nodes rather than just "more hits = better".
+* ``c_half`` is the master's single policy knob (``UMBP_TIER_C_HALF_US``):
+  the retrieval cost at which a hit's value halves.  It is **not** a measured
+  physical constant — tune it by A/B routing outcome.
+
+This is the *relative* quality of a hit; the *absolute* weight of caching in
+routing stays the scheduler's own knob (``cache_token_value``).  The two are
+orthogonal — see `Two orthogonal knobs`_.
+
+**Proto:**
+
+.. code-block:: protobuf
+
+   message GetTierCoeffsRequest {
+     repeated string candidate_node_ids = 1;  // empty = all registered clients
+   }
+   message TierCoeffs {
+     string node_id  = 1;
+     float  x        = 2;   // L1 / HBM    (always 1)
+     float  y        = 3;   // L2 / DRAM
+     float  ssd      = 4;   // reserved (feat/umbp-pr: SSD never matched, == 0)
+     float  z        = 5;   // L3 / remote
+     uint64 epoch_ms = 6;   // freshness; 0 = fallback/default, use your config
+   }
+   message GetTierCoeffsResponse { repeated TierCoeffs coeffs = 1; }
+
+   rpc GetTierCoeffs(GetTierCoeffsRequest) returns (GetTierCoeffsResponse);
+
+**Response fields:**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 78
+
+   * - Field
+     - Description
+   * - ``node_id``
+     - The umbp node these coefficients are for.  Same node identity as the
+       ``node_id`` in ``match_external_kv`` results — align the two when you
+       fold hits into a per-worker score.
+   * - ``x`` / ``y`` / ``z``
+     - Coefficients for HBM / DRAM / remote hits respectively.  Map straight
+       onto the scheduler's ``UmbpTierCoeffs`` as ``x→hbm``, ``y→dram``,
+       ``z→remote``.  Ordering ``x ≥ y ≥ z`` holds by construction.
+   * - ``ssd``
+     - Reserved; currently always ``0`` (this branch never reports an SSD
+       tier).  Map onto ``ssd`` for forward-compatibility.
+   * - ``epoch_ms``
+     - Master wall-clock (ms) when fresh online data produced this value.
+       **``0`` means the master had no usable recent data for this node**
+       (cold start, no samples in the window, or the metric series is
+       missing).  On ``0``, **ignore the returned x/y/z and fall back to your
+       static ``UmbpTierCoeffs`` config** for that node.  (The placeholder
+       values returned alongside ``epoch_ms == 0`` already mirror the
+       scheduler defaults ``1.0 / 0.9 / 0.0``, so misuse is *safe* — but key
+       your fallback off ``epoch_ms``.)
+
+**Semantics & freshness.** The master reads its own in-memory metric
+histograms, differences them over a fixed wall-clock window
+(``UMBP_TIER_COEFF_WINDOW_SEC``, default 15s), and takes a conservative
+quantile per stage (bandwidth low-quantile → high latency; gather p50).  This
+is a **slow, persistent** cost signal (seconds+), deliberately *not* a
+sub-second spike tracker — the scheduler's existing ``live_load`` already
+absorbs instantaneous congestion on the hot path.  The RPC is read-only and
+cheap (no external Prometheus, no background work): poll it on a background
+timer and cache the result; never call it inside ``argmin``.
+
+.. _Inputs:
+
+**Inputs (where the costs come from).** Both ride the same ``ReportMetrics``
+pipeline into master memory, tagged with the reporting node's ``node_id``:
+
+* ``c_remote`` reuses the existing ``mori_umbp_client_batch_get_bandwidth_gibps{traffic="remote"}``
+  histogram (pool_client, ``BatchGet``).  ``c_remote = 34.3KB / bandwidth``.
+* ``c_gather`` is ``mori_umbp_client_kv_gather_duration_seconds`` (seconds/token),
+  produced by the SGLang umbp adapter (``UMBPStore``) via
+  ``mori.cpp.UMBPClient.observe_metric`` — see `Reporting custom metrics`_.
+
+**Consuming from mori-scheduler (Rust / tonic).** The scheduler is the intended
+consumer.  Poll on a background timer, cache with a short TTL, and swap the
+*source* of the per-tier coefficients in ``effective_cached_blocks`` from the
+static config to this cache — the cost formula, L1/L2/L3 folding, ``live_load``
+and ``argmin`` stay exactly as they are.
+
+.. code-block:: rust
+
+   use std::collections::HashMap;
+
+   // tonic-generated from umbp.proto
+   // use umbp::umbp_master_client::UmbpMasterClient;
+   // use umbp::{GetTierCoeffsRequest, TierCoeffs};
+
+   #[derive(Clone, Copy)]
+   pub struct DynCoeffs {
+       pub x: f32, // -> UmbpTierCoeffs.hbm
+       pub y: f32, // -> UmbpTierCoeffs.dram
+       pub ssd: f32,
+       pub z: f32, // -> UmbpTierCoeffs.remote
+       pub epoch_ms: u64,
+   }
+
+   /// Background refresh: poll the master and rebuild the per-node cache.
+   /// Call this on a timer (interval >= UMBP_TIER_COEFF_WINDOW_SEC / 2), NOT
+   /// on the routing hot path.
+   async fn refresh(
+       client: &mut UmbpMasterClient<tonic::transport::Channel>,
+       candidates: Vec<String>, // empty Vec = all registered nodes
+   ) -> HashMap<String, DynCoeffs> {
+       let resp = client
+           .get_tier_coeffs(GetTierCoeffsRequest { candidate_node_ids: candidates })
+           .await;
+
+       let mut out = HashMap::new();
+       let coeffs = match resp {
+           Ok(r) => r.into_inner().coeffs,
+           // Master unreachable: return empty so every lookup falls back to
+           // the static config — never worse than today's static behaviour.
+           Err(_) => return out,
+       };
+       for c in coeffs {
+           // Skip stale/cold entries; the consumer falls back to config when
+           // a node is absent from the cache.
+           if c.epoch_ms == 0 {
+               continue;
+           }
+           out.insert(
+               c.node_id,
+               DynCoeffs { x: c.x, y: c.y, ssd: c.ssd, z: c.z, epoch_ms: c.epoch_ms },
+           );
+       }
+       out
+   }
+
+   /// Hot path: look up the dynamic coefficients for a worker, falling back to
+   /// the static config when missing/stale.  `worker_node_id` is the umbp node
+   /// identity resolved by NodeIdResolver — the same identity match folding
+   /// uses, so the coefficients line up with the per-tier hit counts.
+   fn coeffs_for<'a>(
+       cache: &'a HashMap<String, DynCoeffs>,
+       worker_node_id: &str,
+       config_default: &'a DynCoeffs,
+   ) -> &'a DynCoeffs {
+       cache.get(worker_node_id).unwrap_or(config_default)
+   }
+
+To suppress routing↔load↔coef feedback oscillation, add a **deadband** (only
+update the cache when a coefficient moves past a threshold) on top of the short
+TTL.  A full consumer-side checklist (poll cadence, worker keying via
+``NodeIdResolver``, the single swap point in ``sched_policy.rs``) is in
+``mori_sched_hit_score_consumer_note.md`` at the workspace root.
+
+.. _Two orthogonal knobs:
+
+**Two orthogonal knobs.** Keep these separate when tuning cache weight:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 24 48
+
+   * - Knob
+     - Owner
+     - Controls
+   * - ``cache_token_value``
+     - mori-scheduler config (default ``1.0``)
+     - Absolute weight of caching overall ("how much is a cached token worth").
+   * - ``c_half``
+     - umbp master (``UMBP_TIER_C_HALF_US``, default ``100``)
+     - Relative gap between tiers ("how steeply does fetch cost discount a hit").
+
+Tune overall cache emphasis with ``cache_token_value``; tune tier-to-tier
+discrimination with ``c_half``.  Each owns one dimension; they do not interact.
+
+**Tuning knobs (master process):**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 15 50
+
+   * - Env var
+     - Default
+     - Description
+   * - ``UMBP_TIER_C_HALF_US``
+     - ``100``
+     - ``c_half`` in microseconds/token: the retrieval cost at which a hit's
+       value halves.  Smaller → larger tier gaps / more load-sensitive.
+   * - ``UMBP_TIER_COEFF_WINDOW_SEC``
+     - ``15``
+     - Wall-clock window over which the cumulative metric histograms are
+       differenced before quantiles are taken.  Decoupled from the router's
+       poll interval.
+
+.. _Reporting custom metrics:
+
+Reporting custom metrics (``observe_metric``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This is the **producer** counterpart of ``GetTierCoeffs`` — how a value like
+``c_gather`` lands in master memory in the first place.  It is used by the
+SGLang umbp adapter, not by the scheduler; documented here so the data path is
+complete.
+
+``mori.cpp.UMBPClient.observe_metric(name, help, labels, bounds, value)``
+forwards a single histogram observation to the master through the **same
+already-registered, already-flushing** ``MasterClient`` that carries batch
+bandwidth (``Observe`` → buffer → background flush → ``ReportMetrics``).  The
+master injects ``node=<node_id>`` automatically.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 78
+
+   * - Parameter
+     - Description
+   * - ``name: str``
+     - Metric series name as stored on the master (e.g.
+       ``"mori_umbp_client_kv_gather_duration_seconds"``).  ``GetTierCoeffs``
+       looks up this exact name.
+   * - ``help: str``
+     - Human-readable help string for the series.
+   * - ``labels: list[tuple[str, str]]``
+     - Extra per-sample labels as ``(key, value)`` tuples.  ``node`` is added
+       by the master; do not pass it here.  May be empty.
+   * - ``bounds: list[float]``
+     - Fixed histogram upper bounds.  **First-write-wins** on the master: a
+       later sample with a different layout is dropped after a one-shot WARN,
+       so always send the same bounds for a given ``name``.
+   * - ``value: float``
+     - The observation to record.
+
+* **No-op in standalone mode.** On a non-distributed (``StandaloneClient``)
+  deployment there is no master, so ``observe_metric`` does nothing — the
+  ``IUMBPClient`` interface stays uniform.
+* **Buffer-then-flush.** ``observe_metric`` only buffers; delivery happens on
+  the existing metrics flush tick.  It is therefore cheap to call on warm
+  paths, but the calling client **must be registered** (a fresh, unregistered
+  client buffers forever).  Use the same distributed client you already use for
+  Put/Get.
+
+.. code-block:: python
+
+   # SGLang umbp adapter: report per-token host->device gather cost so the
+   # master can derive c_gather for GetTierCoeffs.
+   KV_GATHER = "mori_umbp_client_kv_gather_duration_seconds"
+   BOUNDS = [1e-6, 2e-6, 5e-6, 1e-5, 2e-5, 5e-5,
+             1e-4, 2e-4, 5e-4, 1e-3, 2e-3, 5e-3, 1e-2]
+
+   client.observe_metric(
+       KV_GATHER,
+       "Per-token device time of host->device KV gather (load stream), seconds/token",
+       [],            # node label injected by the master
+       BOUNDS,        # fixed layout — must be identical on every call
+       seconds_per_token,
+   )
+
+----
+
 UMBPExternalKvHitCountEntry
 ---------------------------
 

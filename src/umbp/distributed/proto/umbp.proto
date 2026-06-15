@@ -308,6 +308,30 @@ message GetExternalKvHitCountsResponse {
   repeated HitCountEntry entries = 1;
 }
 
+// ---- Online tier hit-quality coefficients ---------------------------------
+// Read-only. Returns, per candidate prefill node, the saturating hit-quality
+// coefficients x/y/z derived online from the node's retrieval costs:
+//   x = 1                                       (HBM, zero fetch)
+//   y = c_half / (c_half + c_gather)            (host->device gather only)
+//   z = c_half / (c_half + c_remote + c_gather) (remote RDMA->host, then gather)
+// where c_gather/c_remote are read from the in-memory metrics histograms
+// (kv_gather_duration_seconds / batch_get_bandwidth_gibps{traffic="remote"})
+// and c_half is the master's policy knob.
+message GetTierCoeffsRequest {
+  repeated string candidate_node_ids = 1;  // empty = all registered prefill clients
+}
+message TierCoeffs {
+  string node_id  = 1;
+  float  x        = 2;   // L1 / HBM   (always 1)
+  float  y        = 3;   // L2 / DRAM
+  float  ssd      = 4;   // reserved; SSD is never matched on this path, == 0
+  float  z        = 5;   // L3 / remote
+  uint64 epoch_ms = 6;   // freshness; 0 when this is a fallback/default value
+}
+message GetTierCoeffsResponse {
+  repeated TierCoeffs coeffs = 1;
+}
+
 
 // ============================================================
 //  Service
@@ -344,4 +368,7 @@ service UMBPMaster {
 
   // Client-side metrics reporting
   rpc ReportMetrics(ReportMetricsRequest) returns (ReportMetricsResponse);
+
+  // Online tier hit-quality coefficients (read-only)
+  rpc GetTierCoeffs(GetTierCoeffsRequest) returns (GetTierCoeffsResponse);
 }

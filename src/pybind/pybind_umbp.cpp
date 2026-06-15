@@ -270,6 +270,9 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("match_external_kv", &IUMBPClient::MatchExternalKv, py::arg("hashes"),
            py::arg("count_as_hit") = false, py::call_guard<py::gil_scoped_release>())
       .def("get_external_kv_hit_counts", &IUMBPClient::GetExternalKvHitCounts, py::arg("hashes"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("observe_metric", &IUMBPClient::ObserveMetric, py::arg("name"), py::arg("help"),
+           py::arg("labels"), py::arg("bounds"), py::arg("value"),
            py::call_guard<py::gil_scoped_release>());
 
   // UMBPMasterClient is a read-only query client for the UMBP master.

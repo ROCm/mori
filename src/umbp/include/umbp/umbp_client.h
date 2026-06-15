@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "umbp/common/config.h"
@@ -168,6 +169,15 @@ class IUMBPClient {
       const std::vector<std::string>& /*hashes*/) {
     return {};
   }
+
+  // Forward a single histogram observation to the master via this client's
+  // MasterClient (the same path that carries batch-bandwidth).  The master
+  // injects node=<node_id>; `bounds` are fixed finite upper bounds (first-write-
+  // wins on the master).  Standalone mode has no master, so the default is a
+  // no-op (mirrors RegisterMemory above).
+  virtual void ObserveMetric(const std::string& /*name*/, const std::string& /*help*/,
+                             const std::vector<std::pair<std::string, std::string>>& /*labels*/,
+                             const std::vector<double>& /*bounds*/, double /*value*/) {}
 };
 
 /// Factory: creates the appropriate IUMBPClient implementation.
