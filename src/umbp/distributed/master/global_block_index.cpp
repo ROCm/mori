@@ -93,7 +93,7 @@ size_t GlobalBlockIndex::ApplyEvents(const std::string& node_id,
   if (events.empty()) return 0;
   std::unique_lock lock(mutex_);
   size_t mutated = 0;
-  const auto now = std::chrono::steady_clock::now();
+  const auto now = std::chrono::system_clock::now();
 
   for (const auto& ev : events) {
     if (ev.kind == KvEvent::Kind::CLEAR_AT_TIER) {
@@ -148,7 +148,7 @@ size_t GlobalBlockIndex::ApplyEvents(const std::string& node_id,
 void GlobalBlockIndex::ReplaceNodeLocations(const std::string& node_id,
                                             const std::vector<KvEvent>& adds) {
   std::unique_lock lock(mutex_);
-  const auto now = std::chrono::steady_clock::now();
+  const auto now = std::chrono::system_clock::now();
 
   // O(N_node + |adds|) via the reverse index.
   auto rev_it = node_to_keys_.find(node_id);
@@ -198,7 +198,7 @@ void GlobalBlockIndex::RecordAccess(const std::string& key) {
 }
 
 void GlobalBlockIndex::GrantLease(const std::string& key,
-                                  std::chrono::steady_clock::duration duration) {
+                                  std::chrono::system_clock::duration duration) {
   std::shared_lock lock(mutex_);
   auto it = entries_.find(key);
   if (it != entries_.end()) it->second.GrantLease(duration);
@@ -234,16 +234,16 @@ std::optional<BlockMetrics> GlobalBlockIndex::GetMetrics(const std::string& key)
 
 std::vector<std::vector<Location>> GlobalBlockIndex::BatchLookupForRouteGet(
     const std::vector<std::string>& keys, const std::unordered_set<std::string>& exclude_nodes,
-    std::chrono::steady_clock::duration lease_duration) {
+    std::chrono::system_clock::duration lease_duration) {
   std::vector<std::vector<Location>> out(keys.size());
   if (keys.empty()) return out;
   std::shared_lock lock(mutex_);
   const bool has_exclude = !exclude_nodes.empty();
   // Read the clock once for the whole batch: the per-hit access/lease bump
-  // would otherwise call steady_clock::now() twice per key. All keys in a
+  // would otherwise call system_clock::now() twice per key. All keys in a
   // batch are stamped within the same ~ms, which is well within lease/LRU
   // granularity.
-  const auto now = std::chrono::steady_clock::now();
+  const auto now = std::chrono::system_clock::now();
   for (size_t i = 0; i < keys.size(); ++i) {
     auto it = entries_.find(keys[i]);
     if (it == entries_.end()) continue;

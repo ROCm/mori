@@ -52,18 +52,9 @@ class ExternalKvBlockIndex {
   size_t UnregisterByNodeAtTier(const std::string& node_id, TierType tier);
   size_t UnregisterByNode(const std::string& node_id);
 
-  struct NodeMatch {
-    std::string node_id;
-    std::map<TierType, std::vector<std::string>> hashes_by_tier;
-
-    size_t MatchedHashCount() const {
-      std::unordered_set<std::string_view> seen;
-      for (const auto& [tier, hashes] : hashes_by_tier) {
-        for (const auto& h : hashes) seen.insert(h);
-      }
-      return seen.size();
-    }
-  };
+  // Hoisted to umbp/distributed/types.h; alias kept temporarily so existing
+  // callers (e.g. ExternalKvBlockIndex::NodeMatch) compile.  Removed in Phase 5.
+  using NodeMatch = mori::umbp::NodeMatch;
 
   std::vector<NodeMatch> Match(const std::vector<std::string>& hashes) const;
   size_t GetKvCount(const std::string& node_id) const;

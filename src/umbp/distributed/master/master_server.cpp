@@ -73,7 +73,7 @@ uint32_t HitQueryMaxBatch() {
 
 uint64_t NowNs() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   std::chrono::system_clock::now().time_since_epoch())
                                    .count());
 }
 
