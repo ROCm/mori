@@ -33,8 +33,8 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
-#include "umbp/distributed/master/external_kv_block_index.h"
-#include "umbp/distributed/master/external_kv_hit_index.h"
+#include "umbp/distributed/master/in_memory_master_metadata_store.h"
+#include "umbp/distributed/master/master_metadata_store.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/routing/router.h"
 #include "umbp_peer.grpc.pb.h"
@@ -69,16 +69,6 @@ std::chrono::seconds HitIndexGcInterval() {
 uint32_t HitQueryMaxBatch() {
   static const uint32_t v = GetEnvUint32("UMBP_HIT_QUERY_MAX_BATCH", 4096, /*min_allowed=*/1);
   return v;
-}
-
-uint64_t NowNs() {
-  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   std::chrono::system_clock::now().time_since_epoch())
-                                   .count());
-}
-
-uint64_t ToNs(std::chrono::seconds value) {
-  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(value).count());
 }
 
 KvEvent FromProtoEvent(const ::umbp::KvEvent& pe) {
@@ -203,17 +193,9 @@ MasterServerConfig MasterServerConfig::FromEnvironment() {
 // ---------------------------------------------------------------------------
 class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Service {
  public:
-  UMBPMasterServiceImpl(ClientRegistry& registry, GlobalBlockIndex& index,
-                        ExternalKvBlockIndex& external_kv_index,
-                        ExternalKvHitIndex& external_kv_hit_index, Router& router,
+  UMBPMasterServiceImpl(IMasterMetadataStore& store, Router& router,
                         const ClientRegistryConfig& config, mori::metrics::MetricsServer* metrics)
-      : registry_(registry),
-        index_(index),
-        external_kv_index_(external_kv_index),
-        external_kv_hit_index_(external_kv_hit_index),
-        router_(router),
-        config_(config),
-        metrics_(metrics) {}
+      : store_(store), router_(router), config_(config), metrics_(metrics) {}
 
   // -------- Client lifecycle --------
 
@@ -229,13 +211,21 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
 
     const auto& engine_desc_str = request->engine_desc();
-    std::vector<uint8_t> engine_desc_bytes(engine_desc_str.begin(), engine_desc_str.end());
 
-    std::vector<std::string> tags(request->tags().begin(), request->tags().end());
+    ClientRegistration registration;
+    registration.node_id = request->node_id();
+    registration.node_address = request->node_address();
+    registration.tier_capacities = caps;
+    registration.peer_address = request->peer_address();
+    registration.engine_desc_bytes.assign(engine_desc_str.begin(), engine_desc_str.end());
+    registration.tags.assign(request->tags().begin(), request->tags().end());
 
+    // stale_after mirrors ClientRegistry::ExpiryDuration() (heartbeat_ttl ×
+    // max_missed_heartbeats) so a TTL-stale ALIVE record the reaper hasn't yet
+    // flipped can still be re-registered (hazard #2).
+    const auto stale_after = config_.heartbeat_ttl * config_.max_missed_heartbeats;
     const bool registered =
-        registry_.RegisterClient(request->node_id(), request->node_address(), caps,
-                                 request->peer_address(), engine_desc_bytes, tags);
+        store_.RegisterClient(registration, std::chrono::system_clock::now(), stale_after);
     if (!registered) {
       return grpc::Status(grpc::StatusCode::ALREADY_EXISTS,
                           "node is already alive and cannot be re-registered");
@@ -254,7 +244,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   grpc::Status UnregisterClient(grpc::ServerContext* /*ctx*/,
                                 const ::umbp::UnregisterClientRequest* request,
                                 ::umbp::UnregisterClientResponse* /*response*/) override {
-    registry_.UnregisterClient(request->node_id());
+    store_.UnregisterClient(request->node_id());
     UpdateClientCountMetric();
     return grpc::Status::OK;
   }
@@ -281,13 +271,65 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       bundles.push_back(std::move(bundle));
     }
 
+    // §3e heartbeat adapter: the wire protocol ships EventBundle[] (each with
+    // its own seq) but IMasterMetadataStore::ApplyHeartbeat takes one seq at a
+    // time.  Translate here — the store sees one seq per call, which is exactly
+    // what the seq-CAS (hazard #1) requires.
+    const auto now = std::chrono::system_clock::now();
     uint64_t acked_seq = 0;
     bool request_full_sync = false;
-    auto status =
-        registry_.Heartbeat(request->node_id(), caps, bundles, request->is_full_sync(),
-                            request->delta_seq_baseline(), &acked_seq, &request_full_sync);
+    ClientStatus client_status = ClientStatus::ALIVE;
 
-    response->set_status(static_cast<::umbp::ClientStatus>(status));
+    if (request->is_full_sync()) {
+      // Full sync replaces this node's locations wholesale and re-baselines
+      // last_applied_seq to delta_seq_baseline.  Flatten every bundle's events
+      // into one ApplyHeartbeat call (ReplaceNodeLocations keeps only ADDs).
+      std::vector<KvEvent> events;
+      for (const auto& bundle : bundles) {
+        for (const auto& ev : bundle.events) events.push_back(ev);
+      }
+      auto result = store_.ApplyHeartbeat(request->node_id(), request->delta_seq_baseline(), now,
+                                          caps, events, /*is_full_sync=*/true);
+      if (result.status == HeartbeatResult::UNKNOWN) {
+        client_status = ClientStatus::UNKNOWN;
+      } else {
+        acked_seq = result.acked_seq;
+      }
+    } else if (bundles.empty()) {
+      // Keepalive heartbeat: no events, but liveness must still refresh so the
+      // reaper doesn't expire an idle-but-alive node.  seq=0 deterministically
+      // hits the SEQ_GAP branch, which bumps last_heartbeat + status←ALIVE
+      // without advancing last_applied_seq; the gap is ignored (no full-sync
+      // request) because there is nothing to recover.
+      auto result = store_.ApplyHeartbeat(request->node_id(), /*seq=*/0, now, caps,
+                                          /*events=*/{}, /*is_full_sync=*/false);
+      if (result.status == HeartbeatResult::UNKNOWN) {
+        client_status = ClientStatus::UNKNOWN;
+      } else {
+        acked_seq = result.acked_seq;
+      }
+    } else {
+      // Delta path: apply bundles in ascending-seq order.  A real forward gap
+      // short-circuits the loop and requests a full sync, leaving earlier
+      // bundles applied (Risk item 2 — application is per-bundle, not atomic
+      // across the batch).
+      for (const auto& bundle : bundles) {
+        auto result = store_.ApplyHeartbeat(request->node_id(), bundle.seq, now, caps,
+                                            bundle.events, /*is_full_sync=*/false);
+        if (result.status == HeartbeatResult::UNKNOWN) {
+          client_status = ClientStatus::UNKNOWN;
+          break;
+        }
+        if (result.status == HeartbeatResult::SEQ_GAP) {
+          acked_seq = result.acked_seq;
+          request_full_sync = true;
+          break;
+        }
+        acked_seq = result.acked_seq;
+      }
+    }
+
+    response->set_status(static_cast<::umbp::ClientStatus>(client_status));
     response->set_acked_seq(acked_seq);
     response->set_request_full_sync(request_full_sync);
 
@@ -295,7 +337,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
     if (metrics_ != nullptr && request->tier_kv_counts_size() > 0) {
       mori::metrics::MetricsServer::Labels base = {{"node", request->node_id()}};
-      for (const auto& tag : registry_.GetClientTags(request->node_id())) {
+      for (const auto& tag : store_.GetClientTags(request->node_id())) {
         const auto sep = tag.find('=');
         if (sep != std::string::npos) {
           base.push_back({tag.substr(0, sep), tag.substr(sep + 1)});
@@ -468,7 +510,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   grpc::Status BatchLookup(grpc::ServerContext* /*ctx*/, const ::umbp::BatchLookupRequest* request,
                            ::umbp::BatchLookupResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    auto found = index_.BatchLookupExists(keys);
+    auto found = store_.BatchExistsBlock(keys);
     for (bool b : found) response->add_found(b);
     return grpc::Status::OK;
   }
@@ -486,7 +528,11 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
 
     const TierType tier = static_cast<TierType>(request->tier());
-    if (!registry_.IsClientAlive(request->node_id())) {
+    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+    // Alive-check + write are fused into one atomic store call (closes the
+    // TOCTOU gap between the old IsClientAlive check and Register — §2b.5).
+    const bool applied = store_.RegisterExternalKvIfAlive(request->node_id(), hashes, tier);
+    if (!applied) {
       MORI_UMBP_WARN("[Server] ReportExternalKvBlocks rejected: node not alive: {}",
                      request->node_id());
       if (metrics_) {
@@ -499,14 +545,12 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       return grpc::Status::OK;
     }
 
-    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    const size_t mutated = external_kv_index_.Register(request->node_id(), hashes, tier);
     if (metrics_) {
       const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
                                                            {"tier", TierTypeName(tier)}};
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL,
                            MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL_HELP, labels,
-                           static_cast<uint64_t>(mutated));
+                           static_cast<uint64_t>(hashes.size()));
       metrics_->addCounter(
           MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL, MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP,
           {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
@@ -526,13 +570,13 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
     const TierType tier = static_cast<TierType>(request->tier());
     std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    const size_t mutated = external_kv_index_.Unregister(request->node_id(), hashes, tier);
+    store_.UnregisterExternalKv(request->node_id(), hashes, tier);
     if (metrics_) {
       const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
                                                            {"tier", TierTypeName(tier)}};
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
                            MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP, labels,
-                           static_cast<uint64_t>(mutated));
+                           static_cast<uint64_t>(hashes.size()));
       metrics_->addCounter(
           MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL, MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
           {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
@@ -548,13 +592,12 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
 
     const TierType tier = static_cast<TierType>(request->tier());
-    const size_t mutated = external_kv_index_.UnregisterByNodeAtTier(request->node_id(), tier);
+    // Whole-tier wipe. UnregisterExternalKvByTier returns void (the store
+    // interface does not surface a mutated-block count), so the per-block
+    // counter is no longer emitted for this admin path; the revoke_total
+    // counter still records the operation.
+    store_.UnregisterExternalKvByTier(request->node_id(), tier);
     if (metrics_) {
-      const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
-                                                           {"tier", TierTypeName(tier)}};
-      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP, labels,
-                           static_cast<uint64_t>(mutated));
       metrics_->addCounter(
           MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL, MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
           {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
@@ -569,13 +612,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
     }
 
-    const size_t mutated = external_kv_index_.UnregisterByNode(request->node_id());
+    // All-tier wipe for one node (full-sync recovery path). Returns void, so
+    // the per-block counter is dropped here as in the per-tier wipe above.
+    store_.UnregisterExternalKvByNode(request->node_id());
     if (metrics_) {
-      const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
-                                                           {"tier", "ALL"}};
-      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP, labels,
-                           static_cast<uint64_t>(mutated));
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL,
                            MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
                            {{"node", request->node_id()}, {"tier", "ALL"}, {"result", "ok"}});
@@ -587,10 +627,15 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                                const ::umbp::MatchExternalKvRequest* request,
                                ::umbp::MatchExternalKvResponse* response) override {
     std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    auto matches = external_kv_index_.Match(hashes);
+    // The store fuses the match with the hit-count increment + last_seen stamp
+    // (when count_as_hit) into one lock acquisition; the handler no longer
+    // makes a separate IncrementHits call. `now` crosses the store boundary
+    // (system_clock) and feeds GarbageCollectHits.
+    auto matches =
+        store_.MatchExternalKv(hashes, request->count_as_hit(), std::chrono::system_clock::now());
 
     std::unordered_map<std::string, std::string> peer_map;
-    for (const auto& record : registry_.GetAliveClients()) {
+    for (const auto& record : store_.ListAliveClients()) {
       peer_map[record.node_id] = record.peer_address;
     }
     for (auto& m : matches) {
@@ -602,21 +647,6 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         auto* proto_bucket = proto_match->add_hashes_by_tier();
         proto_bucket->set_tier(static_cast<::umbp::TierType>(tier));
         for (const auto& hash : hashes) proto_bucket->add_hashes(hash);
-      }
-    }
-
-    if (request->count_as_hit() && !matches.empty()) {
-      std::unordered_set<std::string> matched_hashes;
-      for (const auto& m : matches) {
-        for (const auto& [tier, hashes_in_tier] : m.hashes_by_tier) {
-          for (const auto& hash : hashes_in_tier) matched_hashes.insert(hash);
-        }
-      }
-      if (!matched_hashes.empty()) {
-        std::vector<std::string> unique_matched;
-        unique_matched.reserve(matched_hashes.size());
-        for (const auto& hash : matched_hashes) unique_matched.push_back(hash);
-        external_kv_hit_index_.IncrementHits(unique_matched, NowNs());
       }
     }
 
@@ -646,13 +676,11 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
 
     std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    std::vector<std::pair<std::string, uint64_t>> entries;
-    entries.reserve(hashes.size());
-    external_kv_hit_index_.Lookup(hashes, &entries);
-    for (const auto& [hash, total] : entries) {
+    auto entries = store_.GetExternalKvHitCounts(hashes);
+    for (const auto& e : entries) {
       auto* entry = response->add_entries();
-      entry->set_hash(hash);
-      entry->set_hit_count_total(total);
+      entry->set_hash(e.hash);
+      entry->set_hit_count_total(e.hit_count_total);
     }
     return grpc::Status::OK;
   }
@@ -663,7 +691,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     if (!metrics_) return grpc::Status::OK;
 
     mori::metrics::MetricsServer::Labels base = {{"node", request->node_id()}};
-    for (const auto& tag : registry_.GetClientTags(request->node_id())) {
+    for (const auto& tag : store_.GetClientTags(request->node_id())) {
       const auto sep = tag.find('=');
       if (sep != std::string::npos) {
         base.push_back({tag.substr(0, sep), tag.substr(sep + 1)});
@@ -701,7 +729,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   void UpdateClientCountMetric() {
     if (!metrics_) return;
     metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_COUNT, MORI_UMBP_METRIC_CLIENT_COUNT_HELP,
-                       static_cast<double>(registry_.GetAliveClients().size()));
+                       static_cast<double>(store_.AliveClientCount()));
   }
 
   void UpdateClientCapacityMetrics(const std::string& node_id,
@@ -729,10 +757,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
   }
 
-  ClientRegistry& registry_;
-  GlobalBlockIndex& index_;
-  ExternalKvBlockIndex& external_kv_index_;
-  ExternalKvHitIndex& external_kv_hit_index_;
+  IMasterMetadataStore& store_;
   Router& router_;
   ClientRegistryConfig config_;
   mori::metrics::MetricsServer* metrics_ = nullptr;
@@ -743,17 +768,13 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 // ---------------------------------------------------------------------------
 MasterServer::MasterServer(MasterServerConfig config)
     : config_(std::move(config)),
-      index_(),
-      external_kv_index_(),
-      external_kv_hit_index_(),
-      registry_(config_.registry_config, index_, &external_kv_index_),
-      router_(index_, registry_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
-      service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, external_kv_index_,
-                                                       external_kv_hit_index_, router_,
-                                                       config_.registry_config, nullptr)),
+      store_(std::make_unique<InMemoryMasterMetadataStore>()),
+      router_(*store_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
+      service_(std::make_unique<UMBPMasterServiceImpl>(*store_, router_, config_.registry_config,
+                                                       nullptr)),
       peer_stub_pool_(std::make_unique<MasterPeerStubPool>()),
       eviction_manager_(std::make_unique<EvictionManager>(
-          index_, registry_, config_.eviction_config, peer_stub_pool_.get(),
+          *store_, config_.eviction_config, peer_stub_pool_.get(),
           std::move(config_.evict_strategy))) {
   router_.SetLeaseDuration(config_.eviction_config.lease_duration);
 }
@@ -772,7 +793,7 @@ void MasterServer::Run() {
     MORI_UMBP_INFO("[Master] Metrics server listening on port {}", config_.metrics_port);
   }
 
-  registry_.StartReaper();
+  StartReaper();
   eviction_manager_->Start();
   StartHitIndexGc();
 
@@ -797,7 +818,7 @@ void MasterServer::Shutdown() {
     MORI_UMBP_INFO("[Master] Shutting down");
     server_->Shutdown(deadline);
   }
-  registry_.StopReaper();
+  StopReaper();
   StopHitIndexGc();
 }
 
@@ -818,7 +839,7 @@ void MasterServer::StopHitIndexGc() {
 }
 
 void MasterServer::HitIndexGcLoop() {
-  const uint64_t ttl_ns = ToNs(HitIndexTtl());
+  const auto ttl = HitIndexTtl();
   while (hit_index_gc_running_) {
     {
       std::unique_lock lock(hit_index_gc_cv_mutex_);
@@ -827,12 +848,53 @@ void MasterServer::HitIndexGcLoop() {
     }
     if (!hit_index_gc_running_) break;
 
-    const uint64_t now_ns = NowNs();
-    const uint64_t cutoff_ns = now_ns > ttl_ns ? now_ns - ttl_ns : 0;
-    if (cutoff_ns == 0) continue;
-    const size_t dropped = external_kv_hit_index_.GarbageCollect(cutoff_ns);
+    // cutoff is a system_clock time_point now (hazard #7) so it's comparable
+    // to the last_seen the store stamps in MatchExternalKv(count_as_hit=true).
+    const auto cutoff = std::chrono::system_clock::now() - ttl;
+    const size_t dropped = store_->GarbageCollectHits(cutoff);
     if (dropped > 0) {
       MORI_UMBP_DEBUG("[Master] External KV hit index GC dropped {} entries", dropped);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Client-expiry reaper.  Lifted from ClientRegistry — only the schedule lives
+//  here; the per-tick action is one store_->ExpireStaleClients(cutoff) call.
+// ---------------------------------------------------------------------------
+void MasterServer::StartReaper() {
+  bool expected = false;
+  if (!reaper_running_.compare_exchange_strong(expected, true)) return;
+  reaper_thread_ = std::thread(&MasterServer::ReaperLoop, this);
+  const auto expiry =
+      config_.registry_config.heartbeat_ttl * config_.registry_config.max_missed_heartbeats;
+  MORI_UMBP_INFO("[Reaper] Started (interval={}s, expiry={}s)",
+                 config_.registry_config.reaper_interval.count(), expiry.count());
+}
+
+void MasterServer::StopReaper() {
+  bool expected = true;
+  if (!reaper_running_.compare_exchange_strong(expected, false)) return;
+  reaper_cv_.notify_one();
+  if (reaper_thread_.joinable()) reaper_thread_.join();
+  MORI_UMBP_INFO("[Reaper] Stopped");
+}
+
+void MasterServer::ReaperLoop() {
+  const auto expiry =
+      config_.registry_config.heartbeat_ttl * config_.registry_config.max_missed_heartbeats;
+  while (reaper_running_) {
+    {
+      std::unique_lock lock(reaper_cv_mutex_);
+      reaper_cv_.wait_for(lock, config_.registry_config.reaper_interval,
+                          [this] { return !reaper_running_.load(); });
+    }
+    if (!reaper_running_) break;
+
+    const auto cutoff = std::chrono::system_clock::now() - expiry;
+    auto expired = store_->ExpireStaleClients(cutoff);
+    for (const auto& node_id : expired) {
+      MORI_UMBP_WARN("[Reaper] Expired client: {}", node_id);
     }
   }
 }

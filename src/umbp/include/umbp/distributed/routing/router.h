@@ -29,8 +29,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "umbp/distributed/master/client_registry.h"
-#include "umbp/distributed/master/global_block_index.h"
+#include "umbp/distributed/master/master_metadata_store.h"
 #include "umbp/distributed/routing/route_get_strategy.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
 
@@ -45,8 +44,7 @@ struct RouteGetResolution {
 
 class Router {
  public:
-  Router(GlobalBlockIndex& index, ClientRegistry& registry,
-         std::unique_ptr<RouteGetStrategy> get_strategy = nullptr,
+  Router(IMasterMetadataStore& store, std::unique_ptr<RouteGetStrategy> get_strategy = nullptr,
          std::unique_ptr<RoutePutStrategy> put_strategy = nullptr);
   ~Router() = default;
 
@@ -78,8 +76,7 @@ class Router {
   void SetLeaseDuration(std::chrono::system_clock::duration d) { lease_duration_ = d; }
 
  private:
-  GlobalBlockIndex& index_;
-  ClientRegistry& registry_;
+  IMasterMetadataStore& store_;
   std::unique_ptr<RouteGetStrategy> get_strategy_;
   std::unique_ptr<RoutePutStrategy> put_strategy_;
   std::chrono::system_clock::duration lease_duration_{std::chrono::seconds{10}};

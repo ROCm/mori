@@ -105,6 +105,7 @@ TEST(MasterMetadataStoreInterface, EveryMethodIsCallableThroughInterface) {
   EXPECT_TRUE(store.RegisterExternalKvIfAlive("node-a", {"h0"}, TierType::HBM));
   store.UnregisterExternalKv("node-a", {"h0"}, TierType::HBM);
   store.UnregisterExternalKvByTier("node-a", TierType::HBM);
+  store.UnregisterExternalKvByNode("node-a");
   EXPECT_EQ(store.GarbageCollectHits(now), 0u);
 
   // Block reads.

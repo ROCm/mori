@@ -27,10 +27,9 @@
 
 namespace mori::umbp {
 
-Router::Router(GlobalBlockIndex& index, ClientRegistry& registry,
-               std::unique_ptr<RouteGetStrategy> get_strategy,
+Router::Router(IMasterMetadataStore& store, std::unique_ptr<RouteGetStrategy> get_strategy,
                std::unique_ptr<RoutePutStrategy> put_strategy)
-    : index_(index), registry_(registry) {
+    : store_(store) {
   // Default to tier-priority (HBM > DRAM > SSD): with the SSD cold tier live, a
   // random pick could route a key that also has a DRAM/HBM copy to the slow
   // SSD.  Callers can still inject RandomRouteGetStrategy (or any other) via
@@ -56,7 +55,7 @@ std::optional<RouteGetResolution> Router::RouteGet(
 std::optional<RoutePutResult> Router::RoutePut(
     const std::string& key, const std::string& node_id, uint64_t block_size,
     const std::unordered_set<std::string>& exclude_nodes) {
-  // Delegate to the batch path (size=1) so master-side dedup (BatchLookupExists)
+  // Delegate to the batch path (size=1) so master-side dedup (BatchExistsBlock)
   // and projected-capacity logic have a single home; a returned kAlreadyExists
   // now flows back through RoutePutResponse.outcome.
   auto results = BatchRoutePut({key}, node_id, {block_size}, exclude_nodes);
@@ -71,8 +70,8 @@ std::vector<std::optional<RoutePutResult>> Router::BatchRoutePut(
   // the peer allocator stays the final ENOSPC arbiter. A keys/block_sizes length
   // mismatch is logged as a MORI ERROR and yields an all-nullopt result
   // (best-effort: no throw, every key reads as unroutable).
-  auto exists_mask = index_.BatchLookupExists(keys);
-  auto candidates = registry_.GetAliveClients();
+  auto exists_mask = store_.BatchExistsBlock(keys);
+  auto candidates = store_.ListAliveClients();
   return put_strategy_->SelectBatch(node_id, block_sizes, exists_mask, std::move(candidates),
                                     exclude_nodes);
 }
@@ -85,11 +84,15 @@ std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(
   // Snapshot peer addresses once for the whole batch.  Master assumes
   // the snapshot is stable for the duration of one BatchRouteGet.
   std::unordered_map<std::string, std::string> node_to_peer;
-  for (const auto& client : registry_.GetAliveClients()) {
+  for (const auto& client : store_.ListAliveClients()) {
     node_to_peer[client.node_id] = client.peer_address;
   }
 
-  auto all_locs = index_.BatchLookupForRouteGet(keys, exclude_nodes, lease_duration_);
+  // Unlike the old GlobalBlockIndex::BatchLookupForRouteGet (which read the
+  // clock internally), BatchLookupBlockForRouteGet takes an explicit `now`
+  // the router supplies — the timestamp now crosses the store boundary.
+  auto all_locs = store_.BatchLookupBlockForRouteGet(
+      keys, exclude_nodes, std::chrono::system_clock::now(), lease_duration_);
   for (size_t i = 0; i < keys.size(); ++i) {
     auto& locations = all_locs[i];
     if (locations.empty()) {

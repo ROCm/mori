@@ -324,6 +324,12 @@ class IMasterMetadataStore {
   // wipe — admin path, not heartbeat).
   virtual void UnregisterExternalKvByTier(const std::string& node_id, TierType tier) = 0;
 
+  // Drop every external-kv entry (all tiers) belonging to `node_id` without
+  // touching the client record. Backs the live RevokeAllExternalKvBlocksForNode
+  // RPC, which a peer issues to wipe its external-KV registration before a
+  // full re-sync. Does NOT check liveness. Idempotent on unknown nodes.
+  virtual void UnregisterExternalKvByNode(const std::string& node_id) = 0;
+
   // Drop every per-hash hit-count entry whose last_seen < cutoff.
   // Returns the number of entries dropped. Replaces
   // ExternalKvHitIndex::GarbageCollect; the cutoff is a system_clock
@@ -380,31 +386,36 @@ class IMasterMetadataStore {
   // the lease or perturb LRU ordering. One round trip.
   virtual std::vector<bool> BatchExistsBlock(const std::vector<std::string>& keys) const = 0;
 
-  // LRU-prefix eviction enumeration. For each (node, tier) in
-  // `bytes_to_free`, walks the store's per-bucket LRU order
-  // (oldest last_accessed_at first), filters out keys whose
-  // lease_expiry > now, and accumulates rows until the cumulative
-  // `location.size` reaches that bucket's budget. Result map is
-  // keyed by the same NodeTierKeys as the input; absent buckets had
-  // no eligible candidates. Taking the whole budget map in one call
-  // lets a single Lua script fan out over every overloaded bucket
-  // in one round trip — important when dozens of (node, tier) pairs
-  // are over watermark.
+  // Policy-neutral eviction-candidate enumeration. For each (node, tier)
+  // in `buckets`, returns the eviction-eligible rows (lease_expiry <= now
+  // filtered out), in the order requested by `order`, capped at
+  // `max_per_bucket` rows per bucket (0 means no cap). Result map is keyed
+  // by the same NodeTierKeys as the input; absent buckets had no eligible
+  // candidates. Taking the whole bucket set in one call lets a single Lua
+  // script fan out over every overloaded bucket in one round trip —
+  // important when dozens of (node, tier) pairs are over watermark.
+  //
+  // This call does NOT make the eviction decision: it neither sees the
+  // byte budget nor trims to it. The caller (EvictionManager) hands the
+  // returned candidates to a MasterEvictStrategy, which owns victim
+  // selection. `order` and `max_per_bucket` are purely a performance
+  // affordance — they let a backend with an index serve the cheapest
+  // rows instead of shipping every candidate; the eviction policy lives
+  // in the strategy, not here.
   //
   // No EraseBlock on this interface — peers ship REMOVEs on their
   // next heartbeat after EvictKey executes, so the only mutation
   // channels for block locations are ApplyHeartbeat /
   // UnregisterClient / ExpireStaleClients.
   //
-  // How the LRU order is produced is an implementation detail: the
-  // in-memory backend does a full entries_ scan + sort per tick (an
-  // eviction tick is seconds, not a hot path), while the Redis
-  // backend maintains a per-(node, tier) ZSET keyed by
-  // last_accessed_at refreshed on every LookupBlockForRouteGet. The
-  // contract is only "return LRU-ordered candidates within the byte
-  // budget," not the index mechanism.
-  virtual std::map<NodeTierKey, std::vector<EvictionCandidate>> EnumerateLruForEviction(
-      const std::map<NodeTierKey, uint64_t>& bytes_to_free,
+  // How `order` is honored is an implementation detail: the in-memory
+  // backend does a full entries_ scan + partial_sort per tick (an
+  // eviction tick is seconds, not a hot path), while the Redis backend
+  // can maintain a per-(node, tier) ZSET keyed by last_accessed_at and
+  // serve a ZRANGE. The contract is only "return eligible candidates in
+  // the requested order, capped," not the index mechanism.
+  virtual std::map<NodeTierKey, std::vector<EvictionCandidate>> EnumerateEvictionCandidates(
+      const std::vector<NodeTierKey>& buckets, EvictionOrder order, size_t max_per_bucket,
       std::chrono::system_clock::time_point now) const = 0;
 
   // --- Client records ---

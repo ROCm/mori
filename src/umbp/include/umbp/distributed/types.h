@@ -108,13 +108,24 @@ struct BlockMetrics {
 };
 
 // One eviction-eligible (key, location) row returned by the master metadata
-// store's LRU enumeration.  Hoisted from GlobalBlockIndex because it is part of
-// the IMasterMetadataStore contract (EnumerateLruForEviction returns these).
+// store's candidate enumeration.  Hoisted from GlobalBlockIndex because it is
+// part of the IMasterMetadataStore contract (EnumerateEvictionCandidates
+// returns these; MasterEvictStrategy consumes them).
 struct EvictionCandidate {
   std::string key;
   Location location;
   std::chrono::system_clock::time_point last_accessed_at;
   uint64_t size;
+};
+
+// Ordering hint for IMasterMetadataStore::EnumerateEvictionCandidates.  This is
+// a performance affordance, NOT eviction policy: it only tells the store what
+// order to return rows in so a backend with an index (e.g. a Redis ZSET keyed
+// by last_accessed_at) can serve the cheapest top-N rows instead of shipping
+// every candidate.  The actual victim decision belongs to MasterEvictStrategy.
+enum class EvictionOrder : int {
+  kNone = 0,                  // no ordering guarantee; store returns in any order
+  kLeastRecentlyAccessed = 1, // oldest last_accessed_at first
 };
 
 // Structured form of one (buffer_index, page_index) slot.  Used by the

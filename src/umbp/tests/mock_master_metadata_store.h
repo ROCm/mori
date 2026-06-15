@@ -78,6 +78,7 @@ class MockMasterMetadataStore : public IMasterMetadataStore {
               (override));
   MOCK_METHOD(void, UnregisterExternalKvByTier, (const std::string& node_id, TierType tier),
               (override));
+  MOCK_METHOD(void, UnregisterExternalKvByNode, (const std::string& node_id), (override));
   MOCK_METHOD(std::size_t, GarbageCollectHits, (std::chrono::system_clock::time_point cutoff),
               (override));
 

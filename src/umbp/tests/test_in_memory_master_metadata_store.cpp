@@ -529,6 +529,83 @@ TEST(InMemoryStore, GarbageCollectHitsByLastSeen) {
   EXPECT_EQ(counts[0].hash, "fresh");
 }
 
+TEST(InMemoryStore, UnregisterExternalKvByNodeWipesAllTiersOnly) {
+  // Whole-node external-KV wipe (backs RevokeAllExternalKvBlocksForNode). Unlike
+  // UnregisterClient, it must NOT touch the client record or block locations.
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "n1");
+  ASSERT_EQ(Beat(store, "n1", 1, {Add("k1", TierType::HBM, 10)}, kT0).status,
+            HeartbeatResult::APPLIED);
+  ASSERT_TRUE(store.RegisterExternalKvIfAlive("n1", {"h1", "h2"}, TierType::HBM));
+  ASSERT_TRUE(store.RegisterExternalKvIfAlive("n1", {"h1"}, TierType::DRAM));
+  ASSERT_EQ(store.GetExternalKvCount("n1"), 2u);
+
+  store.UnregisterExternalKvByNode("n1");
+
+  // External KV gone across every tier.
+  EXPECT_EQ(store.GetExternalKvCount("n1"), 0u);
+  EXPECT_TRUE(store.MatchExternalKv({"h1", "h2"}, false, kT0).empty());
+
+  // Client record and block locations untouched (distinguishes from UnregisterClient).
+  EXPECT_TRUE(store.IsClientAlive("n1"));
+  EXPECT_EQ(store.LookupBlock("k1").size(), 1u);
+}
+
+TEST(InMemoryStore, UnregisterExternalKvByNodeUnknownIsNoOp) {
+  InMemoryMasterMetadataStore store;
+  store.UnregisterExternalKvByNode("ghost");  // must not crash
+  EXPECT_EQ(store.GetExternalKvCount("ghost"), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// Client reads — GetPeerAddress, GetClientTags, ListAliveClients content
+// ---------------------------------------------------------------------------
+
+TEST(InMemoryStore, GetPeerAddressAliveExpiredAndUnknown) {
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "n1");
+
+  // ALIVE → peer surfaced (MakeReg sets peer:<node>).
+  auto alive = store.GetPeerAddress("n1");
+  ASSERT_TRUE(alive.has_value());
+  EXPECT_EQ(*alive, "peer:n1");
+
+  // EXPIRED rows still surface their peer_address (contract: the row is kept).
+  ASSERT_EQ(store.ExpireStaleClients(kT0 + 10s).size(), 1u);
+  auto expired = store.GetPeerAddress("n1");
+  ASSERT_TRUE(expired.has_value());
+  EXPECT_EQ(*expired, "peer:n1");
+
+  // Unknown node → nullopt.
+  EXPECT_FALSE(store.GetPeerAddress("ghost").has_value());
+}
+
+TEST(InMemoryStore, GetClientTagsReturnsRegisteredTagsAndEmptyForUnknown) {
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "n1");  // MakeReg sets tags = {"role=test"}
+
+  auto tags = store.GetClientTags("n1");
+  ASSERT_EQ(tags.size(), 1u);
+  EXPECT_EQ(tags[0], "role=test");
+
+  EXPECT_TRUE(store.GetClientTags("ghost").empty());
+}
+
+TEST(InMemoryStore, ListAliveClientsReturnsAliveRecordsExcludingExpired) {
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "n1", kT0);
+  RegisterAlive(store, "n2", kT0 + 20s);  // fresher, survives the cutoff below
+
+  // Expire only n1.
+  ASSERT_EQ(store.ExpireStaleClients(kT0 + 10s).size(), 1u);
+
+  auto alive = store.ListAliveClients();
+  ASSERT_EQ(alive.size(), 1u);  // n1 excluded even though its row still exists
+  EXPECT_EQ(alive[0].node_id, "n2");
+  EXPECT_EQ(alive[0].status, ClientStatus::ALIVE);
+  EXPECT_EQ(alive[0].peer_address, "peer:n2");
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency
 // ---------------------------------------------------------------------------

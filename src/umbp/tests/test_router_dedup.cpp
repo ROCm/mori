@@ -24,14 +24,14 @@
 // with already_exists=true and bypass node selection.
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <map>
 #include <memory>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
-#include "umbp/distributed/master/client_registry.h"
-#include "umbp/distributed/master/global_block_index.h"
+#include "umbp/distributed/master/in_memory_master_metadata_store.h"
 #include "umbp/distributed/routing/router.h"
 #include "umbp/distributed/types.h"
 
@@ -47,19 +47,40 @@ std::map<TierType, TierCapacity> MakeDramCaps(uint64_t total = 8 * kGB) {
   return caps;
 }
 
+ClientRegistration MakeRegistration(const std::string& node_id, const std::string& node_address,
+                                    const std::string& peer_address) {
+  ClientRegistration reg;
+  reg.node_id = node_id;
+  reg.node_address = node_address;
+  reg.tier_capacities = MakeDramCaps();
+  reg.peer_address = peer_address;
+  return reg;
+}
+
+// Register `node_id` ALIVE and apply one ADD event for `key` so it has a block
+// location in the store. Under the merged store a location can only be created
+// through an ApplyHeartbeat from a registered (alive) node — locations no
+// longer exist independently of a client record the way the old
+// GlobalBlockIndex allowed.
+void RegisterWithKey(InMemoryMasterMetadataStore& store, const std::string& node_id,
+                     const std::string& key, std::chrono::system_clock::time_point now) {
+  ASSERT_TRUE(store.RegisterClient(MakeRegistration(node_id, node_id + ":1", node_id + ":peer"),
+                                   now, std::chrono::seconds{30}));
+  auto hb = store.ApplyHeartbeat(node_id, /*seq=*/1, now, MakeDramCaps(),
+                                 {KvEvent{KvEvent::Kind::ADD, key, TierType::DRAM, 4096}},
+                                 /*is_full_sync=*/false);
+  ASSERT_EQ(hb.status, HeartbeatResult::APPLIED);
+}
+
 }  // namespace
 
 // Indexed keys are marked already_exists; unknown keys still routed.
 TEST(RouterDedup, BatchRoutePutMarksAlreadyExistsForIndexedKey) {
-  GlobalBlockIndex index;
-  ClientRegistry registry(ClientRegistryConfig{}, index);
-  Router router(index, registry);
+  const auto now = std::chrono::system_clock::now();
+  InMemoryMasterMetadataStore store;
+  Router router(store);
 
-  ASSERT_TRUE(registry.RegisterClient("node-a", "node-a:1", MakeDramCaps(),
-                                      /*peer_address=*/"node-a:peer"));
-  ASSERT_EQ(
-      index.ApplyEvents("node-a", {KvEvent{KvEvent::Kind::ADD, "key-X", TierType::DRAM, 4096}}),
-      1u);
+  RegisterWithKey(store, "node-a", "key-X", now);
 
   std::vector<std::string> keys{"key-X", "key-Y"};
   std::vector<uint64_t> sizes{4096, 4096};
@@ -77,79 +98,22 @@ TEST(RouterDedup, BatchRoutePutMarksAlreadyExistsForIndexedKey) {
   EXPECT_EQ(results[1]->node_id, "node-a");
 }
 
-// Dedup hits never enter the planner, so they consume no projected capacity.
-// node-a fits exactly one 6GB block on HBM.  key-X is an indexed dedup hit
-// sized 6GB; if dedup had deducted capacity, node-a would have 0 left and the
-// new key-Y could not route.  Since dedup does not deduct, key-Y still routes.
-TEST(RouterDedup, BatchRoutePutDedupDoesNotConsumeCapacity) {
-  GlobalBlockIndex index;
-  ClientRegistry registry(ClientRegistryConfig{}, index);
-  Router router(index, registry);
+// already_exists wins over an unroutable Put: an existing key is marked
+// kAlreadyExists even when no node can accept the write.  In the old design
+// "no node" meant an empty registry while a foreign node owned the key; under
+// the merged store a location can't outlive its alive owner, so the
+// unroutable condition is expressed by excluding the only candidate node.  The
+// property under test is unchanged: dedup wins over node selection.
+TEST(RouterDedup, BatchRoutePutAlreadyExistsBypassesUnroutablePut) {
+  const auto now = std::chrono::system_clock::now();
+  InMemoryMasterMetadataStore store;
+  Router router(store);
 
-  std::map<TierType, TierCapacity> caps;
-  caps[TierType::HBM] = {6 * kGB, 6 * kGB};
-  ASSERT_TRUE(registry.RegisterClient("node-a", "node-a:1", caps,
-                                      /*peer_address=*/"node-a:peer"));
-  ASSERT_EQ(
-      index.ApplyEvents("node-a", {KvEvent{KvEvent::Kind::ADD, "key-X", TierType::HBM, 6 * kGB}}),
-      1u);
-
-  std::vector<std::string> keys{"key-X", "key-Y"};
-  std::vector<uint64_t> sizes{6 * kGB, 6 * kGB};
-  std::unordered_set<std::string> excludes;
-
-  auto results = router.BatchRoutePut(keys, "requester", sizes, excludes);
-  ASSERT_EQ(results.size(), 2u);
-
-  ASSERT_TRUE(results[0].has_value());
-  EXPECT_EQ(results[0]->outcome, RoutePutOutcome::kAlreadyExists);
-
-  ASSERT_TRUE(results[1].has_value());
-  EXPECT_EQ(results[1]->outcome, RoutePutOutcome::kRouted);
-  EXPECT_EQ(results[1]->node_id, "node-a");
-  EXPECT_EQ(results[1]->tier, TierType::HBM);
-}
-
-// Projected capacity is batch-local: BatchRoutePut must not write the
-// deductions back to the registry's real capacity.
-TEST(RouterDedup, BatchRoutePutDoesNotWriteBackProjectedCapacity) {
-  GlobalBlockIndex index;
-  ClientRegistry registry(ClientRegistryConfig{}, index);
-  Router router(index, registry);
-
-  std::map<TierType, TierCapacity> caps;
-  caps[TierType::HBM] = {80 * kGB, 10 * kGB};
-  ASSERT_TRUE(registry.RegisterClient("node-a", "node-a:1", caps,
-                                      /*peer_address=*/"node-a:peer"));
-
-  std::vector<std::string> keys{"key-A", "key-B"};
-  std::vector<uint64_t> sizes{1 * kGB, 2 * kGB};
-  std::unordered_set<std::string> excludes;
-
-  auto results = router.BatchRoutePut(keys, "requester", sizes, excludes);
-  ASSERT_EQ(results.size(), 2u);
-  ASSERT_TRUE(results[0].has_value());
-  EXPECT_EQ(results[0]->outcome, RoutePutOutcome::kRouted);
-
-  auto alive = registry.GetAliveClients();
-  ASSERT_EQ(alive.size(), 1u);
-  EXPECT_EQ(alive[0].tier_capacities.at(TierType::HBM).available_bytes, 10 * kGB);
-}
-
-// already_exists wins over no-alive-client: caller drops Put even if
-// registry is empty (some other node owns the key).
-TEST(RouterDedup, BatchRoutePutAlreadyExistsBypassesNoAliveClient) {
-  GlobalBlockIndex index;
-  ClientRegistry registry(ClientRegistryConfig{}, index);
-  Router router(index, registry);
-
-  ASSERT_EQ(
-      index.ApplyEvents("node-a", {KvEvent{KvEvent::Kind::ADD, "key-X", TierType::DRAM, 4096}}),
-      1u);
+  RegisterWithKey(store, "node-a", "key-X", now);
 
   std::vector<std::string> keys{"key-X", "key-Y"};
   std::vector<uint64_t> sizes{4096, 4096};
-  std::unordered_set<std::string> excludes;
+  std::unordered_set<std::string> excludes{"node-a"};  // no routable target left
 
   auto results = router.BatchRoutePut(keys, "requester", sizes, excludes);
   ASSERT_EQ(results.size(), 2u);

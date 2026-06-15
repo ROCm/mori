@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <unordered_set>
 #include <utility>
@@ -367,6 +368,11 @@ void InMemoryMasterMetadataStore::UnregisterExternalKvByTier(const std::string& 
   }
 }
 
+void InMemoryMasterMetadataStore::UnregisterExternalKvByNode(const std::string& node_id) {
+  std::unique_lock lock(mutex_);
+  RemoveExternalKvByNodeLocked(node_id);
+}
+
 std::size_t InMemoryMasterMetadataStore::GarbageCollectHits(
     std::chrono::system_clock::time_point cutoff) {
   std::unique_lock lock(mutex_);
@@ -446,50 +452,57 @@ std::vector<bool> InMemoryMasterMetadataStore::BatchExistsBlock(
 }
 
 std::map<NodeTierKey, std::vector<EvictionCandidate>>
-InMemoryMasterMetadataStore::EnumerateLruForEviction(
-    const std::map<NodeTierKey, uint64_t>& bytes_to_free,
+InMemoryMasterMetadataStore::EnumerateEvictionCandidates(
+    const std::vector<NodeTierKey>& buckets, EvictionOrder order, size_t max_per_bucket,
     std::chrono::system_clock::time_point now) const {
   std::map<NodeTierKey, std::vector<EvictionCandidate>> result;
-  if (bytes_to_free.empty()) return result;
+  if (buckets.empty()) return result;
+
+  // Requested buckets as a set for O(log n) membership during the scan.
+  const std::set<NodeTierKey> wanted(buckets.begin(), buckets.end());
 
   std::shared_lock lock(mutex_);
 
-  // 1. Full scan: collect non-leased candidates whose (node, tier) is a budget
-  //    key. No maintained LRU index — the scan reads entries_ directly, so it
-  //    is always consistent and tie-timestamp candidates are never dropped
-  //    (§2d, Option A).
-  std::map<NodeTierKey, std::vector<EvictionCandidate>> buckets;
+  // 1. Full scan: collect non-leased candidates whose (node, tier) is a
+  //    requested bucket. No maintained LRU index — the scan reads entries_
+  //    directly, so it is always consistent and tie-timestamp candidates are
+  //    never dropped (§2d, Option A). This is policy-neutral: every eligible
+  //    row is collected; the byte budget and victim choice live in the
+  //    strategy, not here.
   for (const auto& [key, entry] : entries_) {
     if (entry.IsLeased(now)) continue;
     const auto last_accessed = entry.GetLastAccessed();
     for (const auto& loc : entry.locations) {
       NodeTierKey ntk{loc.node_id, loc.tier};
-      if (bytes_to_free.find(ntk) == bytes_to_free.end()) continue;
+      if (wanted.find(ntk) == wanted.end()) continue;
       EvictionCandidate c;
       c.key = key;
       c.location = loc;
       c.last_accessed_at = last_accessed;
       c.size = loc.size;
-      buckets[ntk].push_back(std::move(c));
+      result[ntk].push_back(std::move(c));
     }
   }
 
-  // 2 + 3. Sort each bucket oldest-first, then greedily take until the byte
-  //        budget for that bucket is met.
-  for (auto& [ntk, candidates] : buckets) {
-    std::sort(candidates.begin(), candidates.end(),
-              [](const EvictionCandidate& a, const EvictionCandidate& b) {
-                return a.last_accessed_at < b.last_accessed_at;
-              });
-    const uint64_t budget = bytes_to_free.at(ntk);
-    uint64_t freed = 0;
-    std::vector<EvictionCandidate> selected;
-    for (auto& c : candidates) {
-      if (freed >= budget) break;
-      freed += c.size;
-      selected.push_back(std::move(c));
+  // 2. Honor the ordering hint and the per-bucket cap. For LRU, partial_sort
+  //    is enough when a cap is set (an eviction tick is seconds, not a hot
+  //    path). max_per_bucket == 0 means "no cap".
+  const auto older_first = [](const EvictionCandidate& a, const EvictionCandidate& b) {
+    return a.last_accessed_at < b.last_accessed_at;
+  };
+  for (auto& [ntk, candidates] : result) {
+    const bool cap = max_per_bucket > 0 && candidates.size() > max_per_bucket;
+    if (order == EvictionOrder::kLeastRecentlyAccessed) {
+      if (cap) {
+        std::partial_sort(candidates.begin(), candidates.begin() + max_per_bucket,
+                          candidates.end(), older_first);
+        candidates.resize(max_per_bucket);
+      } else {
+        std::sort(candidates.begin(), candidates.end(), older_first);
+      }
+    } else if (cap) {
+      candidates.resize(max_per_bucket);
     }
-    if (!selected.empty()) result[ntk] = std::move(selected);
   }
   return result;
 }

@@ -79,6 +79,7 @@ class InMemoryMasterMetadataStore : public IMasterMetadataStore {
   void UnregisterExternalKv(const std::string& node_id, const std::vector<std::string>& hashes,
                             TierType tier) override;
   void UnregisterExternalKvByTier(const std::string& node_id, TierType tier) override;
+  void UnregisterExternalKvByNode(const std::string& node_id) override;
   std::size_t GarbageCollectHits(std::chrono::system_clock::time_point cutoff) override;
 
   // --- Block reads ---
@@ -92,8 +93,8 @@ class InMemoryMasterMetadataStore : public IMasterMetadataStore {
       std::chrono::system_clock::time_point now,
       std::chrono::system_clock::duration lease_duration) override;
   std::vector<bool> BatchExistsBlock(const std::vector<std::string>& keys) const override;
-  std::map<NodeTierKey, std::vector<EvictionCandidate>> EnumerateLruForEviction(
-      const std::map<NodeTierKey, uint64_t>& bytes_to_free,
+  std::map<NodeTierKey, std::vector<EvictionCandidate>> EnumerateEvictionCandidates(
+      const std::vector<NodeTierKey>& buckets, EvictionOrder order, size_t max_per_bucket,
       std::chrono::system_clock::time_point now) const override;
 
   // --- Client reads ---
