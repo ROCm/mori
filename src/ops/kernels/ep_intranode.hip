@@ -21,6 +21,12 @@ MORI_FP8_ANY(WRAP_BOOL6(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq_noweight_blo
                         hip_bfloat16, false, false, false, true, false, 128))
 MORI_FP8_ANY(WRAP_BOOL6(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq_noweight_block256_vec8,
                         hip_bfloat16, false, false, false, true, false, 256))
+// AccumNum=9 variants: shared-expert fusion routes every token through 9 sources
+// (8 routed + 1 fused shared expert, topk 8->9). Same weightless vec8 path as top8.
+MORI_FP8_ANY(WRAP_BOOL7(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq_noweight_block128_vec8_top9,
+                        hip_bfloat16, false, false, false, true, false, 128, 9))
+MORI_FP8_ANY(WRAP_BOOL7(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq_noweight_block256_vec8_top9,
+                        hip_bfloat16, false, false, false, true, false, 256, 9))
 
 // Convert (used with ENABLE_STANDARD_MOE_ADAPT)
 extern "C" __global__ void mori_ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {

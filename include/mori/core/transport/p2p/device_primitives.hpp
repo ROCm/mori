@@ -1774,13 +1774,12 @@ __device__ __forceinline__ void WarpAccumFp8DequantFullImpl(
   }
 }
 
-template <typename OutT, typename Fp8T, int BlockElems>
+template <typename OutT, typename Fp8T, int BlockElems, int AccumNum = 8>
 __device__ __forceinline__ void WarpAccumFp8DequantFullBlockVec8Top8(
     OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
     const float* const* __restrict__ srcScales, int hiddenDim) {
   static_assert(BlockElems > 0 && (BlockElems & (BlockElems - 1)) == 0,
                 "BlockElems must be a positive power of two");
-  constexpr int AccumNum = 8;
 
   const int laneId = threadIdx.x & (warpSize - 1);
   const Fp8T* cachedSrcs[AccumNum];
@@ -2016,13 +2015,12 @@ __device__ __forceinline__ void WarpAccumFp8DequantSegmentImpl(
 }
 
 // Caller must ensure hiddenDimOffset and hiddenDimSize are 8-byte aligned.
-template <typename OutT, typename Fp8T, int BlockElems>
+template <typename OutT, typename Fp8T, int BlockElems, int AccumNum = 8>
 __device__ __forceinline__ void WarpAccumFp8DequantSegmentBlockVec8Top8(
     OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
     const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize) {
   static_assert(BlockElems > 0 && (BlockElems & (BlockElems - 1)) == 0,
                 "BlockElems must be a positive power of two");
-  constexpr int AccumNum = 8;
 
   const int laneId = threadIdx.x & (warpSize - 1);
   if (hiddenDimSize <= 0) return;
@@ -2052,16 +2050,15 @@ __device__ __forceinline__ void WarpAccumFp8DequantSegmentBlockVec8Top8(
       /*blockElems=*/BlockElems);
 }
 
-// Scalar fallback for the rare misaligned-segment case in the AccumNum=8 vec8 path. Kept tiny
-// on purpose: delegating to WarpAccumFp8DequantSegmentImpl<...,8> would drag the generic
+// Scalar fallback for the rare misaligned-segment case in the vec8 path. Kept tiny
+// on purpose: delegating to WarpAccumFp8DequantSegmentImpl<...,AccumNum> would drag the generic
 // vec16/vec8/vec4 dispatch tree into the caller and push num_vgpr from 79 back to 128.
-template <typename OutT, typename Fp8T, int BlockElems>
+template <typename OutT, typename Fp8T, int BlockElems, int AccumNum = 8>
 __device__ __forceinline__ void WarpAccumFp8DequantSegmentScalarTop8(
     OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
     const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize) {
   static_assert(BlockElems > 0 && (BlockElems & (BlockElems - 1)) == 0,
                 "BlockElems must be a positive power of two");
-  constexpr int AccumNum = 8;
   constexpr int kBlockShift = __builtin_ctz(BlockElems);
 
   const int laneId = threadIdx.x & (warpSize - 1);

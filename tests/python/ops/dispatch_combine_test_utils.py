@@ -668,7 +668,7 @@ class EpDispatchCombineTestCase:
                     )
                 assert weight_match
 
-    def run_test_once(self, op, test_data, check_results=True):
+    def run_test_once(self, op, test_data, check_results=True, weightless=False):
         (
             _,
             all_rank_indices,
@@ -710,7 +710,7 @@ class EpDispatchCombineTestCase:
             )
         combine_output, combine_output_weight = op.combine(
             dispatch_output,
-            dispatch_weights,
+            None if weightless else dispatch_weights,
             all_rank_indices[self.config.rank],
             call_reset=False,
         )
@@ -793,6 +793,8 @@ def run_ep_dispatch_combine_test(
     num_token_override=None,
     check_results=True,
     sentinel_pattern=None,
+    weightless=False,
+    expect_combine_kernel_substr=None,
 ):
     op = mori.ops.EpDispatchCombineOp(config)
     test_case = test_case_cls(config)
@@ -806,4 +808,13 @@ def run_ep_dispatch_combine_test(
     if sentinel_pattern is not None:
         gen_kwargs["sentinel_pattern"] = sentinel_pattern
     test_data = test_case.gen_test_data(**gen_kwargs)
-    test_case.run_test_once(op, test_data, check_results=check_results)
+    test_case.run_test_once(
+        op, test_data, check_results=check_results, weightless=weightless
+    )
+    if expect_combine_kernel_substr is not None:
+        selected = getattr(op, "_last_combine_kernel_name", None)
+        assert selected is not None and expect_combine_kernel_substr in selected, (
+            f"Rank[{config.rank}] expected combine kernel containing "
+            f"{expect_combine_kernel_substr!r} but ran {selected!r} "
+            "(gate fell back to the generic path)"
+        )

@@ -1008,28 +1008,39 @@ class EpDispatchCombineOp:
             EpDispatchCombineKernelType.IntraNodeLL.value,
         ):
             if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
-                # Mirror of the AccumNum=8 + VecBytes=8 specialization gating in
-                # LaunchCombine() / launch.cpp. Keep in sync.
+                # Mirror of the AccumNum=8/9 + VecBytes=8 specialization gating in
+                # LaunchCombine() / launch.cpp. top-k==9 covers shared-expert fusion
+                # (8 routed + 1 fused shared). Keep in sync.
                 fp8_scale_dim = self._fp8_blockwise_combine_scale_dim
                 block_elems = (hidden_dim + fp8_scale_dim - 1) // fp8_scale_dim
                 base_vec8_top8_eligible = (
                     weight_ptr == 0
                     and (hidden_dim % 512) == 0
-                    and self.config.num_experts_per_token == 8
+                    and self.config.num_experts_per_token in (8, 9)
                     and self.config.world_size > 4
                 )
+                top9 = self.config.num_experts_per_token == 9
                 kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq"
                 use_vec8_top8 = False
                 if base_vec8_top8_eligible:
                     if block_elems == 128:
-                        kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8"
+                        kernel_name = (
+                            "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8_top9"
+                            if top9
+                            else "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8"
+                        )
                         use_vec8_top8 = True
                     elif block_elems == 256:
-                        kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8"
+                        kernel_name = (
+                            "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8_top9"
+                            if top9
+                            else "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8"
+                        )
                         use_vec8_top8 = True
                 shared_mem = self._combine_shared_mem(
                     actual_wpb, use_weights=not use_vec8_top8
                 )
+                self._last_combine_kernel_name = kernel_name
                 self._launch(
                     kernel_name,
                     grid,
