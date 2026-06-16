@@ -35,6 +35,7 @@
 #include "hip/hip_runtime_api.h"
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
+#include "mori/application/utils/cpu_affinity.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -665,6 +666,14 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
     delete bootNet;
     return 0;
   }
+
+  // Pin this thread to its GPU's NUMA-local CPUs before any buffer allocation or
+  // worker-thread spawn below (new threads inherit the affinity). This is the
+  // single bind site for the shmem/EP path: every init entry funnels here, and
+  // per the SPMT contract the caller has already hipSetDevice()'d its GPU, so the
+  // calling thread's current device is the rank's GPU in both one-rank-per-GPU
+  // and SPMT (one process, one such thread per GPU) layouts.
+  application::BindCallingThreadToGpuNumaOnce();
 
   // Configure shmem mode
   states->mode = ConfigureShmemMode();
