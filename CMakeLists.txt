@@ -23,9 +23,18 @@ option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
 option(USE_IONIC "Whether to use IONIC" OFF)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
+option(BUILD_BENCHMARK "Whether to build benchmark targets" OFF)
+# MPI is required by mpi_bootstrap, the C++ examples, and every benchmark
+# target (all use the MPI multi-rank launcher), so default it on whenever
+# either is enabled.
+if(BUILD_EXAMPLES OR BUILD_BENCHMARK)
+  set(_with_mpi_default ON)
+else()
+  set(_with_mpi_default OFF)
+endif()
 option(WITH_MPI
-       "Enable MPI support (required for mpi_bootstrap and C++ examples)"
-       ${BUILD_EXAMPLES})
+       "Enable MPI support (required for mpi_bootstrap, C++ examples, benchmarks)"
+       ${_with_mpi_default})
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
 option(BUILD_CCO "Whether to build cco library" ON)
@@ -36,7 +45,6 @@ option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_XLA_FFI_OPS "Whether to build mori xla ffi python bindings" OFF)
 option(BUILD_UMBP "Whether to build UMBP (Unified Memory/Bandwidth Pool)" OFF)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
-option(BUILD_BENCHMARK "Whether to build benchmark targets" OFF)
 option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)

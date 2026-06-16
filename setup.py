@@ -371,6 +371,7 @@ class CMakeBuild(build_ext):
             "ON"
             if (
                 build_examples.upper() == "ON"
+                or build_benchmark.upper() == "ON"
                 or os.environ.get("MORI_WITH_MPI", "OFF").upper() == "ON"
             )
             else "OFF"
@@ -419,6 +420,18 @@ class CMakeBuild(build_ext):
         subprocess.check_call(
             ["cmake", "--build", ".", "-j", f"{os.cpu_count()}"], cwd=str(build_dir)
         )
+
+        # When benchmarks are off, the shared libs are rebuilt without MPI but a
+        # previous BUILD_BENCHMARK=ON run may have left benchmark executables in
+        # build/benchmark/. Running those stale binaries fails with an
+        # undefined MpiBootstrapNetwork symbol. Remove them so the build dir
+        # stays self-consistent.
+        if build_benchmark.upper() != "ON":
+            bench_dir = build_dir / "benchmark"
+            if bench_dir.is_dir():
+                for exe in bench_dir.iterdir():
+                    if exe.is_file() and os.access(exe, os.X_OK):
+                        exe.unlink()
 
         files_to_copy = [
             (
