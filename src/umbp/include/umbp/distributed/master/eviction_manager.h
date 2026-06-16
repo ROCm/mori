@@ -60,11 +60,8 @@ class EvictionManager {
   // only tests).  Master-server-side construction passes a concrete
   // MasterPeerStubPool here.
   //
-  // `strategy` owns the victim-selection policy.  This is the single
-  // default-fallback site: when null the manager installs a
-  // LruMasterEvictStrategy (current behaviour).  Callers wanting a custom
-  // policy inject it here (MasterServer forwards MasterServerConfig::
-  // evict_strategy).
+  // `strategy` is the victim-selection policy; null installs the default
+  // LruMasterEvictStrategy (the single default-fallback site).
   EvictionManager(GlobalBlockIndex& index, ClientRegistry& registry, const EvictionConfig& config,
                   EvictKeyDispatcher* dispatcher = nullptr,
                   std::unique_ptr<MasterEvictStrategy> strategy = nullptr);

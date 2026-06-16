@@ -36,7 +36,6 @@
 
 #include "umbp/distributed/config.h"  // PeerSsdConfig
 #include "umbp/distributed/peer/owned_location_source.h"
-#include "umbp/distributed/peer/ssd_evict_strategy.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -58,18 +57,12 @@ struct SsdReadOutcome {
 // PeerDramAllocator and two DRAM concepts would scramble ownership.
 class PeerSsdManager : public OwnedLocationSource {
  public:
-  // `strategy` owns the victim-selection policy.  Defaults to null so existing
-  // call sites are unchanged; the constructor installs a LruSsdEvictStrategy
-  // (current behaviour) when none is given.  This is the single
-  // default-fallback site for the SSD eviction policy.
-  explicit PeerSsdManager(const PeerSsdConfig& cfg,
-                          std::unique_ptr<SsdEvictStrategy> strategy = nullptr);
+  explicit PeerSsdManager(const PeerSsdConfig& cfg);
 
   // Test-only: inject a ready-made backend and explicit watermarks so unit
   // tests can drive eviction with a controllable (e.g. blocking) fake backend.
   // Production code must use the config constructor.
-  PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark, double low_watermark,
-                 std::unique_ptr<SsdEvictStrategy> strategy = nullptr);
+  PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark, double low_watermark);
 
   ~PeerSsdManager() override;
 
@@ -102,11 +95,15 @@ class PeerSsdManager : public OwnedLocationSource {
   // pipeline first, so no eviction is in flight during a Clear).
   bool Evict(const std::string& key);
 
-  // Local SSD victim selection via SsdEvictStrategy.  Builds a candidate
-  // snapshot under the lock (skipping keys being read or already evicting) and
-  // hands it to the policy.  The snapshot is an oldest-first prefix sized to
-  // bytes_to_free, so it suits recency-based policies; returns fewer keys if
-  // not enough free-able data exists (never blocks).
+  // Local LRU victim selection (oldest first), skipping keys that are
+  // being read (inflight_reads_ > 0) or already being evicted (evicting_).
+  // Accumulates sizes until >= bytes_to_free; returns fewer if not enough
+  // free-able keys exist (never blocks).
+  //
+  // Not pluggable yet (only master-side eviction is).  A real SSD plugin must
+  // own the per-algorithm state that lives here in lru_/owned_, not just the
+  // selection step; target design is a stateful policy with
+  // OnAdd/OnTouch/OnRemove/Clear hooks plus a SelectVictims called under mutex_.
   std::vector<std::string> SelectVictims(size_t bytes_to_free);
 
   // Distributed Clear: drop the logical owned-location map + undrained events,
@@ -184,7 +181,6 @@ class PeerSsdManager : public OwnedLocationSource {
 
   mutable std::mutex mutex_;
   std::unique_ptr<TierBackend> backend_;  // null when cfg.enabled == false
-  std::unique_ptr<SsdEvictStrategy> strategy_;
   double high_watermark_ = 0.9;
   double low_watermark_ = 0.7;
 

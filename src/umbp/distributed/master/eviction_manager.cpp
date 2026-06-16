@@ -118,9 +118,8 @@ void EvictionManager::RunOnce() {
     return;
   }
 
-  // Delegate ranking + per-(node,tier) budget selection to the policy.  Result
-  // is victims grouped by node so the eventual EvictKey RPC takes a single
-  // keys[] per peer instead of N round trips.
+  // Policy ranks candidates and picks victims within budget, grouped by node so
+  // each peer gets a single EvictKey keys[].
   auto per_node_keys = strategy_->SelectVictims(std::move(candidates), std::move(bytes_to_free));
 
   size_t selected = 0;

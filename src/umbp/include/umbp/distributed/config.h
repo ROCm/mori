@@ -102,11 +102,9 @@ struct MasterServerConfig {
   std::unique_ptr<RouteGetStrategy> get_strategy;
   std::unique_ptr<RoutePutStrategy> put_strategy;
 
-  // Master-side DRAM/HBM eviction policy.  Optional code-level plugin: leave
-  // null and EvictionManager installs the default LruMasterEvictStrategy.
-  // FromEnvironment() does NOT populate this — there is only LRU today, so an
-  // env knob would just be a pseudo-config.  Inject programmatically to swap
-  // the policy.
+  // Master-side DRAM/HBM eviction policy (optional code-level plugin).  Null
+  // installs the default LruMasterEvictStrategy.  FromEnvironment() leaves it
+  // null — only LRU exists today, so an env knob would be pseudo-config.
   std::unique_ptr<MasterEvictStrategy> evict_strategy;
 
   // Resolved put-strategy knobs, kept as strings for startup logging because a

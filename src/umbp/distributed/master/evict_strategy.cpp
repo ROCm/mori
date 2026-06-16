@@ -29,16 +29,14 @@ namespace mori::umbp {
 std::unordered_map<std::string, std::vector<std::string>> LruMasterEvictStrategy::SelectVictims(
     std::vector<EvictionCandidate> candidates,
     std::unordered_map<std::string, std::map<TierType, int64_t>> bytes_to_free) {
-  // Oldest-access first (LRU).  Depth-aware tiebreaking is intentionally absent
-  // — peers don't ship depth in KvEvent, so a pure LRU sort is what we get.
+  // Oldest-access first (LRU); no tiebreak (peers don't ship depth in KvEvent).
   std::sort(candidates.begin(), candidates.end(),
             [](const EvictionCandidate& a, const EvictionCandidate& b) {
               return a.last_accessed_at < b.last_accessed_at;
             });
 
-  // Greedy: walk oldest-first and take a candidate whenever its (node, tier)
-  // still has budget left, decrementing as we go.  Victims are grouped by node
-  // so the eventual EvictKey RPC carries a single keys[] per peer.
+  // Walk oldest-first, taking a candidate while its (node, tier) has budget
+  // left.  Group by node so each peer gets a single EvictKey keys[].
   std::unordered_map<std::string, std::vector<std::string>> per_node_keys;
   for (const auto& c : candidates) {
     auto& tier_budget = bytes_to_free[c.location.node_id];

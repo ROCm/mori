@@ -32,30 +32,24 @@
 
 namespace mori::umbp {
 
-// Abstract interface for master-side victim selection.  Implement this to plug
-// in a custom DRAM/HBM eviction policy.  The EvictionManager owns the rest of
-// the cycle (watermark detection, candidate gathering, EvictKey dispatch) and
-// delegates only the ranking + per-(node,tier) budget selection here — the same
-// "manager prepares data, strategy decides" split used by Route{Put,Get}.
-//
-// SSD has its own peer-local policy (SsdEvictStrategy); master never evicts SSD.
+// Master-side victim selection for DRAM/HBM eviction.  EvictionManager handles
+// watermark detection, candidate gathering, and EvictKey dispatch; the strategy
+// only ranks candidates and picks victims within the per-(node,tier) budget.
+// (SSD eviction is peer-local; master never evicts SSD.)
 class MasterEvictStrategy {
  public:
   virtual ~MasterEvictStrategy() = default;
 
-  // Pick victims from @p candidates honouring the per-node, per-tier byte
-  // budget in @p bytes_to_free (used > low_watermark slack the manager wants
-  // freed).  Both arguments are taken by value so an implementation may sort /
-  // decrement freely without touching master state.  @return victim keys
-  // grouped by node_id (one keys[] per peer for a single EvictKey RPC); empty
-  // groups are omitted.
+  // Pick victims from @p candidates within the per-(node,tier) byte budget
+  // @p bytes_to_free.  Both are by value so the impl may sort/decrement freely.
+  // Returns victims grouped by node_id (one keys[] per peer); empty groups
+  // omitted.
   virtual std::unordered_map<std::string, std::vector<std::string>> SelectVictims(
       std::vector<EvictionCandidate> candidates,
       std::unordered_map<std::string, std::map<TierType, int64_t>> bytes_to_free) = 0;
 };
 
-// Default policy: pure LRU.  Evict oldest-access-first until each overloaded
-// (node, tier)'s byte budget is met.
+// Default policy: pure LRU (evict oldest-access-first until each budget is met).
 class LruMasterEvictStrategy : public MasterEvictStrategy {
  public:
   std::unordered_map<std::string, std::vector<std::string>> SelectVictims(
