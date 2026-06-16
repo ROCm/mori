@@ -350,16 +350,16 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
   uint32_t cons = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   if (cons >= exitTarget) return;
 
-  volatile mlx5_cqe64* cqe = reinterpret_cast<volatile mlx5_cqe64*>(cq.cqAddr);
+  volatile core::Mlx5Cqe64* cqe = reinterpret_cast<volatile core::Mlx5Cqe64*>(cq.cqAddr);
   // Device scope: CQE read fresh via volatile from the uncached CQ; doneIdx is a
   // GPU-only counter. Nothing here orders memory the NIC reads.
   __threadfence();
 
   do {
     uint16_t wqeCounter = BE16TOH(cqe->wqe_counter);
-    uint8_t opcode = (reinterpret_cast<volatile uint8_t*>(cq.cqAddr)[sizeof(mlx5_cqe64) - 1]) >> 4;
-    if (opcode == MLX5_CQE_REQ_ERR || opcode == MLX5_CQE_RESP_ERR) {
-      auto error = core::Mlx5HandleErrorCqe(reinterpret_cast<mlx5_err_cqe*>(cq.cqAddr));
+    uint8_t opcode = (reinterpret_cast<volatile uint8_t*>(cq.cqAddr)[sizeof(core::Mlx5Cqe64) - 1]) >> 4;
+    if (opcode == core::MORI_MLX5_CQE_REQ_ERR || opcode == core::MORI_MLX5_CQE_RESP_ERR) {
+      auto error = core::Mlx5HandleErrorCqe(reinterpret_cast<core::Mlx5ErrCqe*>(cq.cqAddr));
       MORI_PRINTF("(%s:%d) collapsed CQE error: %s\n", __FILE__, __LINE__,
                   core::WcStatusString(error));
       assert(false);
