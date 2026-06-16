@@ -37,6 +37,8 @@
 // CSV (stdout):
 //   scenario,batch,page_bytes,iters,wall_ms,gibps
 
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -64,8 +66,12 @@ namespace {
 
 // Unique peer-service port per PoolClient: required so each node registers a
 // peer_address and can serve/accept remote AllocateSlot/ResolveKey RPCs.
+// The base is seeded from the pid so rapidly-restarted bench processes (e.g.
+// a per-(pip,batch) sweep) don't collide on a port left in TIME_WAIT by a
+// prior process.
 inline uint16_t NextPeerServicePort() {
-  static std::atomic<uint16_t> next{55000};
+  static std::atomic<uint16_t> next{
+      static_cast<uint16_t>(20000 + (static_cast<unsigned>(::getpid()) * 16u) % 40000u)};
   return next.fetch_add(1);
 }
 
@@ -150,6 +156,12 @@ class Cluster {
       : page_bytes_(page_bytes), caller_buf_(caller_buf_bytes), caller_local_(caller_local_bytes) {
     MasterServerConfig mcfg;
     mcfg.listen_address = "0.0.0.0:0";
+    // The master index is eventually consistent: a committed key becomes
+    // visible only after the owning peer ships its ADD event on the next
+    // heartbeat (interval = heartbeat_ttl / divisor).  Shorten the TTL so
+    // seeded keys converge in ~0.5s instead of the 5s default, keeping the
+    // pre-Get visibility barrier (WaitAllVisible) cheap.
+    mcfg.registry_config.heartbeat_ttl = std::chrono::seconds{1};
     master_ = std::make_unique<MasterServer>(std::move(mcfg));
     server_thread_ = std::thread([this] { master_->Run(); });
     for (int i = 0; i < 200 && master_->GetBoundPort() == 0; ++i) {
@@ -242,6 +254,32 @@ std::pair<double, size_t> RunOnce(PoolClient* client, const std::vector<std::str
   return {ms, bytes};
 }
 
+// Barrier: block until every key is visible to `client` via the master
+// index.  Committed keys propagate on the owning peer's next heartbeat, so
+// a BatchGet issued immediately after seeding would otherwise route-miss.
+// This runs OUTSIDE the timed BatchGet and never counts toward throughput.
+void WaitAllVisible(PoolClient* client, const std::vector<std::string>& keys,
+                    std::chrono::milliseconds timeout = std::chrono::seconds{10}) {
+  if (keys.empty()) return;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    auto present = client->BatchExists(keys);
+    bool all = true;
+    for (bool p : present) {
+      if (!p) {
+        all = false;
+        break;
+      }
+    }
+    if (all) return;
+    if (std::chrono::steady_clock::now() >= deadline) {
+      std::cerr << "WaitAllVisible: keys not visible before timeout\n";
+      std::exit(2);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+}
+
 // Seed `n` keys onto target peer `k` via that peer's BatchPut.  Returns
 // the list of seeded keys parallel to caller's dsts/sizes.
 void SeedPeer(Cluster& cluster, size_t peer_idx, size_t n, size_t bytes_per_item,
@@ -274,8 +312,12 @@ void RunScenario(const BenchOpts& base, size_t batch_override) {
   size_t num_peers = (o.scenario == "multi_peer") ? std::max<size_t>(o.peers, 2) : 1;
   size_t bytes_per_item = o.per_item_pages * o.page_bytes;
   size_t per_peer_items = (o.batch + num_peers - 1) / num_peers;
-  size_t target_dram =
-      std::max<size_t>(static_cast<size_t>(64) << 20, per_peer_items * bytes_per_item * 4);
+  // Each iter seeds a fresh, unique key set that stays resident in the peer
+  // DRAM pool (no eviction between iters), so the target must hold warmup +
+  // all measured iters' keys plus slack — otherwise late-iter seed Puts hit
+  // ENOSPC.  (+2 = warmup + headroom.)
+  size_t target_dram = std::max<size_t>(static_cast<size_t>(64) << 20,
+                                        per_peer_items * bytes_per_item * (o.iters + 2));
   size_t seed_bytes = per_peer_items * bytes_per_item;
   size_t caller_buf_bytes = o.batch * bytes_per_item;
   // Caller_local: tiny (forces all routes to remote in master placement
@@ -335,6 +377,9 @@ void RunScenario(const BenchOpts& base, size_t batch_override) {
       (*dsts)[i] = cluster.caller_buf().data() + i * bytes_per_item;
       (*sizes)[i] = bytes_per_item;
     }
+    // Visibility barrier (not timed): ensure the caller can route all keys
+    // before the measured BatchGet, otherwise route-miss yields 0 GiB/s.
+    WaitAllVisible(cluster.caller(), *keys);
   };
 
   std::vector<std::string> keys;

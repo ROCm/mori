@@ -341,6 +341,85 @@ TEST_F(CrossNodeMultiPage, CrossBufferScatterPutGet) {
   EXPECT_FALSE(client_a_->Put("xbuf-overflow", src.data(), kPayload));
 }
 
+// Zero-copy BatchGet of several keys whose pages land across MULTIPLE remote
+// buffers.  Exercises per-pair merge with multiple groups (one per distinct
+// remote buffer) and multiple entries contributing to a group, plus the
+// per-key result mapping.  The caller registers a contiguous dst region so
+// every get is zero-copy (not staging).
+TEST_F(CrossNodeMultiPage, BatchGetZeroCopyMultiKeyCrossBuffer) {
+  StartMaster();
+  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize}}, &owned_a_);
+  // Two 2-page buffers: the 4 single-page keys distribute across both, so
+  // their pages span two distinct remote buffer_index values.
+  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 2, kPageSize * 2}}, &owned_b_);
+
+  constexpr size_t kN = 4;
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> srcs(kN);
+  for (size_t k = 0; k < kN; ++k) {
+    keys.push_back("zc-mk-" + std::to_string(k));
+    srcs[k].assign(kPageSize, static_cast<char>(0x41 + k));
+  }
+  for (size_t k = 0; k < kN; ++k) {
+    ASSERT_TRUE(client_a_->Put(keys[k], srcs[k].data(), kPageSize));
+  }
+  for (const auto& key : keys) {
+    EXPECT_TRUE(WaitForExists(client_a_.get(), key));
+    EXPECT_TRUE(WaitForExists(client_b_.get(), key));
+  }
+
+  std::vector<char> dst(kPageSize * kN, 0);
+  client_a_->RegisterMemory(dst.data(), dst.size());
+  std::vector<void*> dsts(kN);
+  std::vector<size_t> sizes(kN, kPageSize);
+  for (size_t k = 0; k < kN; ++k) dsts[k] = dst.data() + k * kPageSize;
+
+  auto res = client_a_->BatchGet(keys, dsts, sizes);
+  ASSERT_EQ(res.size(), kN);
+  for (size_t k = 0; k < kN; ++k) {
+    EXPECT_TRUE(res[k]) << "get failed for " << keys[k];
+    EXPECT_EQ(std::memcmp(dst.data() + k * kPageSize, srcs[k].data(), kPageSize), 0)
+        << "byte mismatch for " << keys[k];
+  }
+}
+
+// Failure isolation: a zero-copy batch where one key is requested with a
+// mismatched size (rejected) must fail ONLY that key; sibling keys still
+// succeed and land byte-exact.  Guards the per-key result mapping that the
+// per-pair merge feeds via entry.failed.
+TEST_F(CrossNodeMultiPage, BatchGetZeroCopyFailureIsolation) {
+  StartMaster();
+  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize}}, &owned_a_);
+  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 4}}, &owned_b_);
+
+  std::vector<std::string> keys = {"iso-0", "iso-1", "iso-2"};
+  std::vector<std::vector<char>> srcs(3);
+  for (size_t k = 0; k < 3; ++k) {
+    srcs[k].assign(kPageSize, static_cast<char>(0x11 * (k + 1)));
+    ASSERT_TRUE(client_a_->Put(keys[k], srcs[k].data(), kPageSize));
+  }
+  for (const auto& key : keys) {
+    EXPECT_TRUE(WaitForExists(client_a_.get(), key));
+    EXPECT_TRUE(WaitForExists(client_b_.get(), key));
+  }
+
+  std::vector<char> dst(kPageSize * 3, 0);
+  client_a_->RegisterMemory(dst.data(), dst.size());
+  std::vector<void*> dsts = {dst.data(), dst.data() + kPageSize, dst.data() + 2 * kPageSize};
+  // Middle key requests a size that mismatches the stored size -> rejected;
+  // the half-page stays within its own dst slot so a clean rejection can't
+  // corrupt siblings.
+  std::vector<size_t> sizes = {kPageSize, kPageSize / 2, kPageSize};
+
+  auto res = client_a_->BatchGet(keys, dsts, sizes);
+  ASSERT_EQ(res.size(), 3u);
+  EXPECT_TRUE(res[0]);
+  EXPECT_FALSE(res[1]) << "size-mismatched key must fail";
+  EXPECT_TRUE(res[2]);
+  EXPECT_EQ(std::memcmp(dst.data(), srcs[0].data(), kPageSize), 0);
+  EXPECT_EQ(std::memcmp(dst.data() + 2 * kPageSize, srcs[2].data(), kPageSize), 0);
+}
+
 // ---------------------------------------------------------------------------
 // Partial-tail tests.  Master allocates ceil(size / page_size) pages even
 // when size is not page-aligned; the last page is partially filled.  These

@@ -25,8 +25,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <msgpack.hpp>
 #include <numeric>
 #include <string>
@@ -38,7 +41,6 @@
 #include <unordered_map>
 
 #include "mori/io/backend.hpp"
-#include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
@@ -54,6 +56,34 @@ namespace mori::umbp {
 namespace {
 
 bool IsValidMemoryDesc(const mori::io::MemoryDesc& desc) { return desc.size > 0; }
+
+// Key for grouping page transfers by their (local MR, remote MR) pair.
+struct PairKey {
+  mori::io::MemoryUniqueId local;
+  mori::io::MemoryUniqueId remote;
+  bool operator==(const PairKey& o) const noexcept {
+    return local == o.local && remote == o.remote;
+  }
+};
+struct PairKeyHash {
+  size_t operator()(const PairKey& k) const noexcept {
+    // hash_combine (boost-style): independent of size_t width.
+    size_t h = std::hash<mori::io::MemoryUniqueId>{}(k.local);
+    h ^= std::hash<mori::io::MemoryUniqueId>{}(k.remote) + 0x9e3779b97f4a7c15ULL + (h << 6) +
+         (h >> 2);
+    return h;
+  }
+};
+
+// True iff [next, ...) is exactly adjacent after [base, base+len), with no
+// size_t overflow in base+len.  Used to coalesce contiguous SG segments.
+inline bool AdjacentNoOverflow(size_t base, size_t len, size_t next) {
+  return len <= std::numeric_limits<size_t>::max() - base && base + len == next;
+}
+
+// ---------------------------------------------------------------------------
+//  Bandwidth metrics
+// ---------------------------------------------------------------------------
 
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
@@ -105,6 +135,10 @@ void ObserveBatchBandwidth(MasterClient& master_client, double bytes, double sec
   master_client.Observe(metric_name, metric_help, std::move(labels), BatchBandwidthBucketsGiBps(),
                         gibps);
 }
+
+// ---------------------------------------------------------------------------
+//  Page / size math
+// ---------------------------------------------------------------------------
 
 // Bytes belonging to the i-th logical page of a Put/Get spread across
 // `num_pages` pages of `page_size` bytes.  Last page may be partial.
@@ -228,6 +262,10 @@ std::vector<ScatterGroup> GroupPagesByBuffer(const std::vector<PageLocation>& pa
   return groups;
 }
 
+// ---------------------------------------------------------------------------
+//  SSD / lease env knobs
+// ---------------------------------------------------------------------------
+
 uint32_t ReleaseLeaseMaxRetries() {
   static const uint32_t v = GetEnvUint32("UMBP_RELEASE_LEASE_MAX_RETRIES", 2, /*min_allowed=*/1);
   return v;
@@ -283,6 +321,10 @@ std::chrono::milliseconds ReleaseLeaseRpcTimeout() {
                                            std::chrono::milliseconds(1000), /*min_allowed=*/1);
   return v;
 }
+
+// ---------------------------------------------------------------------------
+//  Config / proto translation
+// ---------------------------------------------------------------------------
 
 // Build a TierConfig from the PoolClientConfig (DRAM only — HBM
 // support requires per-tier buffer plumbing the upper layers don't
@@ -360,9 +402,13 @@ bool PoolClient::Init() {
     io_engine_ = std::make_unique<mori::io::IOEngine>(config_.master_config.node_id, io_cfg);
     mori::io::RdmaBackendConfig rdma_cfg;
 
-    rdma_cfg.qpPerTransfer = mori::env::GetPositiveIntOr("MORI_UMBP_QP_PER_TRANSFER", 4);
+    rdma_cfg.qpPerTransfer = 4;
     rdma_cfg.enableTransferChunking = true;
     rdma_cfg.numNicsPerTransfer = 4;
+    // UMBP only sets the config defaults above.  All RDMA knobs (qpPerTransfer
+    // / postBatchSize / numWorkerThreads / pollCqMode / chunking / numNics /
+    // ...) are overridable via MORI_IO_* env in the RDMA backend ctor, shared
+    // by every IO backend user; no UMBP-specific entry points.
     io_engine_->CreateBackend(mori::io::BackendType::RDMA, rdma_cfg);
 
     staging_buffer_ = std::make_unique<char[]>(config_.staging_buffer_size);
@@ -1177,6 +1223,60 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
   return true;
 }
 
+std::vector<PoolClient::PairGroup> PoolClient::GroupTransfersByPair(
+    const std::vector<TransferInstruction>& active) {
+  std::vector<PairGroup> groups;
+  groups.reserve(active.size());
+  // Group by (local MR id, remote MR id); first appearance defines order.
+  std::unordered_map<PairKey, size_t, PairKeyHash> pair_to_group;
+  pair_to_group.reserve(active.size() * 2);
+
+  for (const auto& t : active) {
+    const PairKey key{t.local_desc.id, t.remote_desc.id};
+    auto it = pair_to_group.find(key);
+    size_t gi;
+    if (it == pair_to_group.end()) {
+      gi = groups.size();
+      pair_to_group.emplace(key, gi);
+      PairGroup g;
+      g.local_desc = t.local_desc;
+      g.remote_desc = t.remote_desc;
+      groups.push_back(std::move(g));
+    } else {
+      gi = it->second;
+    }
+    PairGroup& g = groups[gi];
+    const size_t lo = static_cast<size_t>(t.local_offset);
+    const size_t ro = static_cast<size_t>(t.remote_offset);
+    const size_t sz = static_cast<size_t>(t.size);
+    // Coalesce with the previous segment when BOTH local and remote are
+    // exactly contiguous.  This is NOT redundant with the backend's WR
+    // merging: the backend would fold these into the same WR either way, but
+    // doing it here shrinks the inner SG vector it has to sort/merge
+    // (O(M log M)) and allocate, which matters when M is large (big batch x
+    // pages).  Same bytes, so per-pair failure granularity is unchanged.
+    // The merged size must stay within uint32_t since the backend stores it
+    // in ibv_sge.length (matches its own WR-merge cap in common.cpp).
+    const bool can_coalesce =
+        !g.sizes.empty() && AdjacentNoOverflow(g.local_offsets.back(), g.sizes.back(), lo) &&
+        AdjacentNoOverflow(g.remote_offsets.back(), g.sizes.back(), ro) &&
+        g.sizes.back() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - sz;
+    if (can_coalesce) {
+      g.sizes.back() += sz;
+    } else {
+      g.local_offsets.push_back(lo);
+      g.remote_offsets.push_back(ro);
+      g.sizes.push_back(sz);
+    }
+    // De-dup contributing entries: a single entry's pages arrive
+    // consecutively within a pair, so a back() check suffices.
+    if (g.entry_indices.empty() || g.entry_indices.back() != t.entry_index) {
+      g.entry_indices.push_back(t.entry_index);
+    }
+  }
+  return groups;
+}
+
 bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, PeerConnection& peer,
                                          std::vector<TransferInstruction>* transfers,
                                          uint64_t* staging_bytes) {
@@ -1185,7 +1285,6 @@ bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, P
 
   for (size_t idx = 0; idx < entries.size(); ++idx) {
     auto& entry = entries[idx];
-    EnsureBufferDescsCached(peer, entry.plan.descs);
 
     auto zero_copy = FindRegisteredMemory(entry.item->src, entry.item->size);
     if (zero_copy.has_value()) {
@@ -1220,30 +1319,38 @@ bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, P
       base_offset = entry.zero_copy->second;
     }
 
+    // Hydrate + snapshot remote descs inside ONE peers_mutex_ window: a
+    // concurrent EnsureBufferDescsCached may resize dram_memories, so the
+    // reads below must not race it.  zero_copy/staging above touch no peer
+    // state and stay outside the lock.
     std::vector<TransferInstruction> entry_transfers;
     entry_transfers.reserve(entry.plan.pages.size());
-    for (size_t p = 0; p < entry.plan.pages.size(); ++p) {
-      const auto& page = entry.plan.pages[p];
-      if (page.buffer_index >= peer.dram_memories.size() ||
-          !IsValidMemoryDesc(peer.dram_memories[page.buffer_index])) {
-        MORI_UMBP_ERROR(
-            "[PoolClient] BuildRemotePutTransfers: invalid peer dram_memories slot, "
-            "key='{}' buffer_index={} peer_dram_size={} page_index={}",
-            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
-            page.buffer_index, peer.dram_memories.size(), page.page_index);
-        entry.failed = true;
-        entry_transfers.clear();
-        break;
+    {
+      std::lock_guard<std::mutex> lock(peers_mutex_);
+      EnsureBufferDescsCachedLocked(peer, entry.plan.descs);
+      for (size_t p = 0; p < entry.plan.pages.size(); ++p) {
+        const auto& page = entry.plan.pages[p];
+        if (page.buffer_index >= peer.dram_memories.size() ||
+            !IsValidMemoryDesc(peer.dram_memories[page.buffer_index])) {
+          MORI_UMBP_ERROR(
+              "[PoolClient] BuildRemotePutTransfers: invalid peer dram_memories slot, "
+              "key='{}' buffer_index={} peer_dram_size={} page_index={}",
+              (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+              page.buffer_index, peer.dram_memories.size(), page.page_index);
+          entry.failed = true;
+          entry_transfers.clear();
+          break;
+        }
+        TransferInstruction instr;
+        instr.entry_index = idx;
+        instr.local_desc = local_desc;
+        instr.local_offset = base_offset + static_cast<uint64_t>(p) * entry.plan.page_size;
+        instr.remote_desc = peer.dram_memories[page.buffer_index];
+        instr.remote_offset = static_cast<uint64_t>(page.page_index) * entry.plan.page_size;
+        instr.size =
+            LogicalPageBytes(p, entry.plan.pages.size(), entry.plan.page_size, entry.item->size);
+        entry_transfers.push_back(std::move(instr));
       }
-      TransferInstruction instr;
-      instr.entry_index = idx;
-      instr.local_desc = local_desc;
-      instr.local_offset = base_offset + static_cast<uint64_t>(p) * entry.plan.page_size;
-      instr.remote_desc = peer.dram_memories[page.buffer_index];
-      instr.remote_offset = static_cast<uint64_t>(page.page_index) * entry.plan.page_size;
-      instr.size =
-          LogicalPageBytes(p, entry.plan.pages.size(), entry.plan.page_size, entry.item->size);
-      entry_transfers.push_back(std::move(instr));
     }
 
     if (!entry_transfers.empty()) {
@@ -1289,36 +1396,45 @@ void PoolClient::ExecuteRemotePutTransfers(std::vector<RemotePutEntry>& entries,
     return;
   }
 
-  const size_t N = active_transfers.size();
-  mori::io::MemDescVec local_descs(N), remote_descs(N);
-  mori::io::BatchSizeVec local_offsets(N), remote_offsets(N), sizes_v(N);
-  std::vector<mori::io::TransferStatus> statuses(N);
-  mori::io::TransferStatusPtrVec status_ptrs(N);
-  mori::io::TransferUniqueIdVec ids(N);
-  for (size_t i = 0; i < N; ++i) {
-    const auto& transfer = active_transfers[i];
-    local_descs[i] = transfer.local_desc;
-    remote_descs[i] = transfer.remote_desc;
-    local_offsets[i].push_back(transfer.local_offset);
-    remote_offsets[i].push_back(transfer.remote_offset);
-    sizes_v[i].push_back(transfer.size);
-    status_ptrs[i] = &statuses[i];
-    ids[i] = io_engine_->AllocateTransferUniqueId();
+  // Collapse all pages of the same (localMR, remoteMR) pair into one outer
+  // transfer (inner offset/size vectors = scatter-gather segments).  One
+  // TransferStatus and one TransferUniqueId per pair instead of per page.
+  auto groups = GroupTransfersByPair(active_transfers);
+  const size_t G = groups.size();
+  mori::io::MemDescVec local_descs(G), remote_descs(G);
+  mori::io::BatchSizeVec local_offsets(G), remote_offsets(G), sizes_v(G);
+  std::vector<mori::io::TransferStatus> statuses(G);  // built once at final size
+  mori::io::TransferStatusPtrVec status_ptrs(G);
+  mori::io::TransferUniqueIdVec ids(G);
+  for (size_t g = 0; g < G; ++g) {
+    local_descs[g] = groups[g].local_desc;
+    remote_descs[g] = groups[g].remote_desc;
+    local_offsets[g] = std::move(groups[g].local_offsets);
+    remote_offsets[g] = std::move(groups[g].remote_offsets);
+    sizes_v[g] = std::move(groups[g].sizes);
+    status_ptrs[g] = &statuses[g];
+    ids[g] = io_engine_->AllocateTransferUniqueId();
   }
 
   io_engine_->BatchWrite(local_descs, local_offsets, remote_descs, remote_offsets, sizes_v,
                          status_ptrs, ids);
-  for (size_t i = 0; i < active_transfers.size(); ++i) {
-    statuses[i].Wait();
-    if (!statuses[i].Succeeded()) {
-      const auto& tr = active_transfers[i];
-      auto& entry = entries[tr.entry_index];
+  // Wait every group (never break early): IN_PROGRESS groups complete here;
+  // INIT (left unsubmitted by an engine early-return) or already-terminal
+  // groups return immediately.  A non-success group fails ALL its
+  // contributing keys (per-item AND semantics — a key fails if any of its
+  // pairs fail).  NOTE: this does not by itself prove safety of backend
+  // partial-post / status-lifetime corner cases (see docs/perf NOTES).
+  for (size_t g = 0; g < G; ++g) {
+    statuses[g].Wait();
+    if (statuses[g].Succeeded()) continue;
+    for (size_t ei : groups[g].entry_indices) {
+      auto& entry = entries[ei];
       MORI_UMBP_ERROR(
           "RemotePut BatchWrite failed: code={} msg='{}' peer_engine='{}' key='{}' "
-          "slot_id={} size={} local_off={} remote_off={} use_staging={}",
-          statuses[i].CodeUint32(), statuses[i].Message(), tr.remote_desc.engineKey,
+          "slot_id={} use_staging={}",
+          statuses[g].CodeUint32(), statuses[g].Message(), groups[g].remote_desc.engineKey,
           (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"}, entry.slot_id,
-          tr.size, tr.local_offset, tr.remote_offset, entry.use_staging);
+          entry.use_staging);
       entry.failed = true;
     }
   }
@@ -1512,7 +1628,6 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, P
 
   for (size_t idx = 0; idx < entries.size(); ++idx) {
     auto& entry = entries[idx];
-    EnsureBufferDescsCached(peer, entry.plan.descs);
 
     auto zero_copy = FindRegisteredMemory(entry.item->dst, entry.item->size);
     if (zero_copy.has_value()) {
@@ -1550,30 +1665,36 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, P
       continue;
     }
 
+    // Hydrate + snapshot remote descs inside ONE peers_mutex_ window (see
+    // BuildRemotePutTransfers).
     std::vector<TransferInstruction> entry_transfers;
     entry_transfers.reserve(entry.plan.pages.size());
-    for (size_t p = 0; p < entry.plan.pages.size(); ++p) {
-      const auto& page = entry.plan.pages[p];
-      if (page.buffer_index >= peer.dram_memories.size() ||
-          !IsValidMemoryDesc(peer.dram_memories[page.buffer_index])) {
-        MORI_UMBP_ERROR(
-            "[PoolClient] BuildRemoteGetTransfers: invalid peer dram_memories slot, "
-            "key='{}' buffer_index={} peer_dram_size={} page_index={}",
-            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
-            page.buffer_index, peer.dram_memories.size(), page.page_index);
-        entry.failed = true;
-        entry_transfers.clear();
-        break;
+    {
+      std::lock_guard<std::mutex> lock(peers_mutex_);
+      EnsureBufferDescsCachedLocked(peer, entry.plan.descs);
+      for (size_t p = 0; p < entry.plan.pages.size(); ++p) {
+        const auto& page = entry.plan.pages[p];
+        if (page.buffer_index >= peer.dram_memories.size() ||
+            !IsValidMemoryDesc(peer.dram_memories[page.buffer_index])) {
+          MORI_UMBP_ERROR(
+              "[PoolClient] BuildRemoteGetTransfers: invalid peer dram_memories slot, "
+              "key='{}' buffer_index={} peer_dram_size={} page_index={}",
+              (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+              page.buffer_index, peer.dram_memories.size(), page.page_index);
+          entry.failed = true;
+          entry_transfers.clear();
+          break;
+        }
+        TransferInstruction instr;
+        instr.entry_index = idx;
+        instr.local_desc = local_desc;
+        instr.local_offset = base_offset + static_cast<uint64_t>(p) * entry.plan.page_size;
+        instr.remote_desc = peer.dram_memories[page.buffer_index];
+        instr.remote_offset = static_cast<uint64_t>(page.page_index) * entry.plan.page_size;
+        instr.size =
+            LogicalPageBytes(p, entry.plan.pages.size(), entry.plan.page_size, entry.item->size);
+        entry_transfers.push_back(std::move(instr));
       }
-      TransferInstruction instr;
-      instr.entry_index = idx;
-      instr.local_desc = local_desc;
-      instr.local_offset = base_offset + static_cast<uint64_t>(p) * entry.plan.page_size;
-      instr.remote_desc = peer.dram_memories[page.buffer_index];
-      instr.remote_offset = static_cast<uint64_t>(page.page_index) * entry.plan.page_size;
-      instr.size =
-          LogicalPageBytes(p, entry.plan.pages.size(), entry.plan.page_size, entry.item->size);
-      entry_transfers.push_back(std::move(instr));
     }
 
     if (!entry_transfers.empty()) {
@@ -1603,36 +1724,41 @@ void PoolClient::ExecuteRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
     return;
   }
 
-  const size_t N = active_transfers.size();
-  mori::io::MemDescVec local_descs(N), remote_descs(N);
-  mori::io::BatchSizeVec local_offsets(N), remote_offsets(N), sizes_v(N);
-  std::vector<mori::io::TransferStatus> statuses(N);
-  mori::io::TransferStatusPtrVec status_ptrs(N);
-  mori::io::TransferUniqueIdVec ids(N);
-  for (size_t i = 0; i < N; ++i) {
-    const auto& transfer = active_transfers[i];
-    remote_descs[i] = transfer.remote_desc;
-    local_descs[i] = transfer.local_desc;
-    remote_offsets[i].push_back(transfer.remote_offset);
-    local_offsets[i].push_back(transfer.local_offset);
-    sizes_v[i].push_back(transfer.size);
-    status_ptrs[i] = &statuses[i];
-    ids[i] = io_engine_->AllocateTransferUniqueId();
+  // Symmetric with the Put path: collapse same-(localMR, remoteMR) pages
+  // into one outer transfer with per-pair status/uid.
+  auto groups = GroupTransfersByPair(active_transfers);
+  const size_t G = groups.size();
+  mori::io::MemDescVec local_descs(G), remote_descs(G);
+  mori::io::BatchSizeVec local_offsets(G), remote_offsets(G), sizes_v(G);
+  std::vector<mori::io::TransferStatus> statuses(G);  // built once at final size
+  mori::io::TransferStatusPtrVec status_ptrs(G);
+  mori::io::TransferUniqueIdVec ids(G);
+  for (size_t g = 0; g < G; ++g) {
+    local_descs[g] = groups[g].local_desc;
+    remote_descs[g] = groups[g].remote_desc;
+    local_offsets[g] = std::move(groups[g].local_offsets);
+    remote_offsets[g] = std::move(groups[g].remote_offsets);
+    sizes_v[g] = std::move(groups[g].sizes);
+    status_ptrs[g] = &statuses[g];
+    ids[g] = io_engine_->AllocateTransferUniqueId();
   }
 
   io_engine_->BatchRead(local_descs, local_offsets, remote_descs, remote_offsets, sizes_v,
                         status_ptrs, ids);
-  for (size_t i = 0; i < active_transfers.size(); ++i) {
-    statuses[i].Wait();
-    if (!statuses[i].Succeeded()) {
-      const auto& tr = active_transfers[i];
-      auto& entry = entries[tr.entry_index];
+  // Wait every group (never break early): IN_PROGRESS groups complete here;
+  // INIT/terminal return immediately.  A non-success group fails all of its
+  // contributing keys (per-item AND semantics).  See the Put path / docs
+  // NOTES re: backend partial-post / status-lifetime caveats.
+  for (size_t g = 0; g < G; ++g) {
+    statuses[g].Wait();
+    if (statuses[g].Succeeded()) continue;
+    for (size_t ei : groups[g].entry_indices) {
+      auto& entry = entries[ei];
       MORI_UMBP_ERROR(
-          "RemoteGet BatchRead failed: code={} msg='{}' peer_engine='{}' key='{}' "
-          "size={} local_off={} remote_off={} use_staging={}",
-          statuses[i].CodeUint32(), statuses[i].Message(), tr.remote_desc.engineKey,
-          (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"}, tr.size,
-          tr.local_offset, tr.remote_offset, entry.use_staging);
+          "RemoteGet BatchRead failed: code={} msg='{}' peer_engine='{}' key='{}' use_staging={}",
+          statuses[g].CodeUint32(), statuses[g].Message(), groups[g].remote_desc.engineKey,
+          (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+          entry.use_staging);
       entry.failed = true;
     }
   }
@@ -1740,10 +1866,10 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(const std::string& node
   return ref;
 }
 
-void PoolClient::EnsureBufferDescsCached(PeerConnection& peer,
-                                         const std::vector<BufferMemoryDescBytes>& descs) {
+void PoolClient::EnsureBufferDescsCachedLocked(PeerConnection& peer,
+                                               const std::vector<BufferMemoryDescBytes>& descs) {
+  // Caller holds peers_mutex_.
   if (!io_engine_) return;
-  std::lock_guard<std::mutex> lock(peers_mutex_);
   for (const auto& d : descs) {
     if (peer.dram_memories.size() <= d.buffer_index) {
       peer.dram_memories.resize(d.buffer_index + 1);
@@ -1754,6 +1880,12 @@ void PoolClient::EnsureBufferDescsCached(PeerConnection& peer,
         msgpack::unpack(reinterpret_cast<const char*>(d.desc_bytes.data()), d.desc_bytes.size());
     peer.dram_memories[d.buffer_index] = handle.get().as<mori::io::MemoryDesc>();
   }
+}
+
+void PoolClient::EnsureBufferDescsCached(PeerConnection& peer,
+                                         const std::vector<BufferMemoryDescBytes>& descs) {
+  std::lock_guard<std::mutex> lock(peers_mutex_);
+  EnsureBufferDescsCachedLocked(peer, descs);
 }
 
 // ---------------------------------------------------------------------------

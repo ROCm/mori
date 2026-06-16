@@ -206,6 +206,12 @@ class PoolClient {
   // `descs`.  Idempotent.  Acquires peers_mutex_ internally.
   void EnsureBufferDescsCached(PeerConnection& peer,
                                const std::vector<BufferMemoryDescBytes>& descs);
+  // Same as above, but the caller MUST already hold peers_mutex_.  Lets the
+  // Build* helpers hydrate AND snapshot remote descs inside a single lock
+  // window so a concurrent hydrate (which may resize dram_memories) cannot
+  // race the reads.
+  void EnsureBufferDescsCachedLocked(PeerConnection& peer,
+                                     const std::vector<BufferMemoryDescBytes>& descs);
 
   // Same-tier RDMA scatter helpers (keep as much of the prior impl as
   // possible — the IO engine call shape is unchanged).
@@ -286,6 +292,26 @@ class PoolClient {
     uint64_t remote_offset;
     uint64_t size;
   };
+
+  // A set of page transfers sharing the same (localMR, remoteMR) pair.  All
+  // its pages collapse into ONE outer IO transfer whose inner offset/size
+  // vectors are scatter-gather segments, cutting CQE/status/post count vs
+  // one-transfer-per-page.  `entry_indices` is the de-duplicated list of
+  // entries contributing pages to this group (for per-key failure mapping).
+  struct PairGroup {
+    mori::io::MemoryDesc local_desc;
+    mori::io::MemoryDesc remote_desc;
+    std::vector<size_t> local_offsets;
+    std::vector<size_t> remote_offsets;
+    std::vector<size_t> sizes;
+    std::vector<size_t> entry_indices;
+  };
+  // Group `active` page transfers by (local_desc.id, remote_desc.id),
+  // preserving first-appearance order (stable).  Assumes a fixed page size
+  // per (localMR, remoteMR) pair (1 buffer == 1 page size in the current
+  // model); mixed page sizes would require folding page size into the key.
+  static std::vector<PairGroup> GroupTransfersByPair(
+      const std::vector<TransferInstruction>& active);
 
   struct RemotePutEntry {
     size_t result_index;
