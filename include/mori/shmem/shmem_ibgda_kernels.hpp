@@ -104,6 +104,24 @@ namespace shmem {
     }                                                                       \
   } while (0)
 
+// Exclusive prefix sum of per-lane psnCnt over active lanes; warp-wide total via
+// outTotal. Used for bnxt PSN accounting when lanes transfer different sizes.
+inline __device__ uint32_t WarpActivePsnPrefix(uint32_t psnCnt, uint64_t activemask,
+                                               uint32_t* outTotal) {
+  const uint32_t myPhys = static_cast<uint32_t>(core::WarpLaneId());
+  uint32_t excl = 0, total = 0;
+  uint64_t m = activemask;
+  while (m) {
+    int l = __ffsll(static_cast<unsigned long long>(m)) - 1;
+    uint32_t v = __shfl(psnCnt, l);
+    total += v;
+    if (static_cast<uint32_t>(l) < myPhys) excl += v;
+    m &= m - 1;
+  }
+  *outTotal = total;
+  return excl;
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    VMM Heap Helper Functions                                   */
 /* ---------------------------------------------------------------------------------------------- */
@@ -504,18 +522,19 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
     uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
     uint32_t psnCnt = 0;
+    uint32_t warp_total_psn = 0, my_psn_excl = 0;
 
     if constexpr (PrvdType == core::ProviderType::BNXT) {
       psnCnt = (transfer_size + wq->mtuSize - 1) / wq->mtuSize;
+      my_psn_excl = WarpActivePsnPrefix(psnCnt, activemask, &warp_total_psn);
     }
     if (is_leader) {
       if constexpr (PrvdType == core::ProviderType::MLX5) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
       } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes,
-                                            psnCnt * num_active_lanes, &warp_msntbl_counter,
-                                            &warp_psn_counter);
+        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, warp_total_psn,
+                                            &warp_msntbl_counter, &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
         __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
@@ -534,7 +553,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);
       my_sq_counter = warp_sq_counter + my_logical_lane_id;
       my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
-      my_psn_counter = warp_psn_counter + psnCnt * my_logical_lane_id;
+      my_psn_counter = warp_psn_counter + my_psn_excl;
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
       my_sq_counter = warp_sq_counter + my_logical_lane_id;
     } else {
@@ -886,24 +905,25 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
     uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
     uint32_t psnCnt = 0;
+    uint32_t warp_total_psn = 0, my_psn_excl = 0;
     // For last chunk: add 1 WQE for signal; for other chunks: just put
     uint32_t num_wqes = isLastChunk ? (onlyOneSignal ? num_active_lanes + 1 : num_active_lanes * 2)
                                     : num_active_lanes;
 
     if constexpr (PrvdType == core::ProviderType::BNXT) {
       psnCnt = (transfer_size + wq->mtuSize - 1) / wq->mtuSize;
+      // Per-lane PSN unit includes this lane's signal WQE when each lane signals.
+      uint32_t psnUnit = (isLastChunk && !onlyOneSignal) ? (psnCnt + 1) : psnCnt;
+      my_psn_excl = WarpActivePsnPrefix(psnUnit, activemask, &warp_total_psn);
+      if (isLastChunk && onlyOneSignal) warp_total_psn += 1;
     }
     if (is_leader) {
       if constexpr (PrvdType == core::ProviderType::MLX5) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
       } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-        uint32_t total_psn = psnCnt * num_active_lanes;
-        if (isLastChunk) {
-          total_psn += (onlyOneSignal ? 1 : num_active_lanes);
-        }
-        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, total_psn, &warp_msntbl_counter,
-                                            &warp_psn_counter);
+        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, warp_total_psn,
+                                            &warp_msntbl_counter, &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
         __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
@@ -926,9 +946,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
       my_msntbl_counter =
           warp_msntbl_counter +
           (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
-      my_psn_counter =
-          warp_psn_counter + (isLastChunk && !onlyOneSignal ? (psnCnt + 1) * my_logical_lane_id
-                                                            : psnCnt * my_logical_lane_id);
+      my_psn_counter = warp_psn_counter + my_psn_excl;
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
       my_sq_counter = warp_sq_counter +
                       (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
@@ -1636,18 +1654,19 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
     uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
     uint32_t psnCnt = 0;
+    uint32_t warp_total_psn = 0, my_psn_excl = 0;
 
     if constexpr (PrvdType == core::ProviderType::BNXT) {
       psnCnt = (transfer_size + wq->mtuSize - 1) / wq->mtuSize;
+      my_psn_excl = WarpActivePsnPrefix(psnCnt, activemask, &warp_total_psn);
     }
     if (is_leader) {
       if constexpr (PrvdType == core::ProviderType::MLX5) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
       } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes,
-                                            psnCnt * num_active_lanes, &warp_msntbl_counter,
-                                            &warp_psn_counter);
+        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, warp_total_psn,
+                                            &warp_msntbl_counter, &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
         __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
@@ -1666,7 +1685,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
       warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);
       my_sq_counter = warp_sq_counter + my_logical_lane_id;
       my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
-      my_psn_counter = warp_psn_counter + my_logical_lane_id * psnCnt;
+      my_psn_counter = warp_psn_counter + my_psn_excl;
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
       my_sq_counter = warp_sq_counter + my_logical_lane_id;
     } else {
@@ -1995,24 +2014,25 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
     uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
     uint32_t psnCnt = 0;
+    uint32_t warp_total_psn = 0, my_psn_excl = 0;
     // For last chunk: add 1 WQE for signal; for other chunks: just put
     uint32_t num_wqes = isLastChunk ? (onlyOneSignal ? num_active_lanes + 1 : num_active_lanes * 2)
                                     : num_active_lanes;
 
     if constexpr (PrvdType == core::ProviderType::BNXT) {
       psnCnt = (transfer_size + wq->mtuSize - 1) / wq->mtuSize;
+      // Per-lane PSN unit includes this lane's signal WQE when each lane signals.
+      uint32_t psnUnit = (isLastChunk && !onlyOneSignal) ? (psnCnt + 1) : psnCnt;
+      my_psn_excl = WarpActivePsnPrefix(psnUnit, activemask, &warp_total_psn);
+      if (isLastChunk && onlyOneSignal) warp_total_psn += 1;
     }
     if (is_leader) {
       if constexpr (PrvdType == core::ProviderType::MLX5) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
       } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-        uint32_t total_psn = psnCnt * num_active_lanes;
-        if (isLastChunk) {
-          total_psn += (onlyOneSignal ? 1 : num_active_lanes);
-        }
-        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, total_psn, &warp_msntbl_counter,
-                                            &warp_psn_counter);
+        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, warp_total_psn,
+                                            &warp_msntbl_counter, &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
         __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
@@ -2035,9 +2055,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
       my_msntbl_counter =
           warp_msntbl_counter +
           (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
-      my_psn_counter =
-          warp_psn_counter + (isLastChunk && !onlyOneSignal ? (psnCnt + 1) * my_logical_lane_id
-                                                            : psnCnt * my_logical_lane_id);
+      my_psn_counter = warp_psn_counter + my_psn_excl;
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
       my_sq_counter = warp_sq_counter +
                       (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
@@ -2630,18 +2648,19 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
     uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
     uint32_t psnCnt = 0;
+    uint32_t warp_total_psn = 0, my_psn_excl = 0;
 
     if constexpr (PrvdType == core::ProviderType::BNXT) {
       psnCnt = (transfer_size + wq->mtuSize - 1) / wq->mtuSize;
+      my_psn_excl = WarpActivePsnPrefix(psnCnt, activemask, &warp_total_psn);
     }
     if (is_leader) {
       if constexpr (PrvdType == core::ProviderType::MLX5) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
       } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes,
-                                            psnCnt * num_active_lanes, &warp_msntbl_counter,
-                                            &warp_psn_counter);
+        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, warp_total_psn,
+                                            &warp_msntbl_counter, &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
         __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
@@ -2660,7 +2679,7 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
       warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);
       my_sq_counter = warp_sq_counter + my_logical_lane_id;
       my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
-      my_psn_counter = warp_psn_counter + psnCnt * my_logical_lane_id;
+      my_psn_counter = warp_psn_counter + my_psn_excl;
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
       my_sq_counter = warp_sq_counter + my_logical_lane_id;
     } else {
@@ -2842,18 +2861,19 @@ inline __device__ void ShmemGetMemNbiThreadKernelAddrImpl(void* dest, const void
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
     uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
     uint32_t psnCnt = 0;
+    uint32_t warp_total_psn = 0, my_psn_excl = 0;
 
     if constexpr (PrvdType == core::ProviderType::BNXT) {
       psnCnt = (transfer_size + wq->mtuSize - 1) / wq->mtuSize;
+      my_psn_excl = WarpActivePsnPrefix(psnCnt, activemask, &warp_total_psn);
     }
     if (is_leader) {
       if constexpr (PrvdType == core::ProviderType::MLX5) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
       } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes,
-                                            psnCnt * num_active_lanes, &warp_msntbl_counter,
-                                            &warp_psn_counter);
+        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, warp_total_psn,
+                                            &warp_msntbl_counter, &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
         __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
@@ -2872,7 +2892,7 @@ inline __device__ void ShmemGetMemNbiThreadKernelAddrImpl(void* dest, const void
       warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);
       my_sq_counter = warp_sq_counter + my_logical_lane_id;
       my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
-      my_psn_counter = warp_psn_counter + my_logical_lane_id * psnCnt;
+      my_psn_counter = warp_psn_counter + my_psn_excl;
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
       my_sq_counter = warp_sq_counter + my_logical_lane_id;
     } else {
