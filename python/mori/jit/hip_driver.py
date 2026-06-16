@@ -32,13 +32,31 @@ from ctypes import c_char_p, c_uint, c_void_p, POINTER, byref
 _hip: ctypes.CDLL | None = None
 
 
+def _already_loaded_libamdhip64() -> str | None:
+    try:
+        with open("/proc/self/maps", "r") as maps:
+            for line in maps:
+                path = line.rstrip("\n").rsplit(" ", 1)[-1]
+                if path.startswith("/") and os.path.basename(path).startswith(
+                    "libamdhip64.so"
+                ):
+                    return path
+    except OSError:
+        pass
+    return None
+
+
 def _get_hip_lib() -> ctypes.CDLL:
     global _hip
     if _hip is not None:
         return _hip
 
     rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
-    candidates = [
+    candidates = []
+    already_loaded = _already_loaded_libamdhip64()
+    if already_loaded is not None:
+        candidates.append(already_loaded)
+    candidates += [
         os.path.join(rocm_path, "lib", "libamdhip64.so"),
         "libamdhip64.so",
     ]
