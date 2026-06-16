@@ -624,6 +624,16 @@ void distRdmaOps(int argc, char* argv[]) {
   std::vector<RdmaMemoryRegion> global_mr_handles(world_size);
   bootNet.Allgather(&mr_handle, global_mr_handles.data(), sizeof(mr_handle));
   global_mr_handles[local_rank] = mr_handle;
+  // WorkQueueHandle::outstandingWqe is now a pointer (mori_shmem leaves it null and
+  // reconstructs completions arithmetically). This example's quiet still uses the
+  // slot->counter table, so allocate one device buffer per QP and attach it before
+  // the handles are copied to the device.
+  for (int i = 0; i < num_qp; ++i) {
+    uint64_t* outstandingWqeBuf = nullptr;
+    HIP_RUNTIME_CHECK(hipMalloc(&outstandingWqeBuf, OUTSTANDING_TABLE_SIZE * sizeof(uint64_t)));
+    HIP_RUNTIME_CHECK(hipMemset(outstandingWqeBuf, 0, OUTSTANDING_TABLE_SIZE * sizeof(uint64_t)));
+    endpoints[i].wqHandle.outstandingWqe = outstandingWqeBuf;
+  }
   RdmaEndpoint* devEndpoints;
   HIP_RUNTIME_CHECK(hipMalloc(&devEndpoints, num_qp * sizeof(RdmaEndpoint)));
   HIP_RUNTIME_CHECK(hipMemcpy(devEndpoints, endpoints.data(), num_qp * sizeof(RdmaEndpoint),

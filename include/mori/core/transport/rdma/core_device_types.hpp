@@ -68,6 +68,10 @@ typedef enum {
   AMO_OP_SENTINEL = INT_MAX,
 } atomicType;
 
+// Size of the optional slot->counter table some callers attach to
+// WorkQueueHandle::outstandingWqe (see below).
+#define OUTSTANDING_TABLE_SIZE (65536)
+
 struct WorkQueueHandle {
   uint32_t postIdx{0};     // numbers of wqe that post to work queue
   uint32_t dbTouchIdx{0};  // numbers of wqe that touched doorbell
@@ -91,6 +95,11 @@ struct WorkQueueHandle {
   uint32_t msntblNum{0};
   uint32_t rqWqeNum{0};
   uint32_t postSendLock{0};
+  // Optional slot->counter table for completion tracking. mori_shmem reconstructs
+  // doneIdx arithmetically and leaves this null (so the GPU-resident handle no
+  // longer carries a 512 KB inline array). Callers that still want a table -- e.g.
+  // the dist_rdma_ops example -- allocate a device buffer and assign it here.
+  uint64_t* outstandingWqe{nullptr};
   bool color;
   uint64_t sq_dbval{0};
   uint64_t rq_dbval{0};
