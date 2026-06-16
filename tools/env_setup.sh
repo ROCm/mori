@@ -24,7 +24,10 @@ BNXT_VENDOR_ID="0x14e4"   # Broadcom
 
 # RoCE QoS constants — shared by the ionic and bnxt paths so MORI_RDMA_SL / TC
 # come out identical regardless of NIC vendor.
-ROCE_PRIO=3        # RoCE packet priority (lossless / PFC no-drop TC)
+#
+# NOTE: reference defaults only. PFC is hop-by-hop — the switch must use the same
+# priority / DSCP / trust mode, or align these constants with the switch.
+ROCE_PRIO=3        # RoCE packet priority (lossless / PFC no-drop)
 ROCE_DSCP=26       # RoCE DSCP
 CNP_PRIO=6         # CNP packet priority
 CNP_DSCP=48        # CNP DSCP
