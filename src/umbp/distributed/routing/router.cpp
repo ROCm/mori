@@ -21,7 +21,6 @@
 // SOFTWARE.
 #include "umbp/distributed/routing/router.h"
 
-#include <algorithm>
 #include <unordered_map>
 
 #include "mori/utils/mori_log.hpp"
@@ -38,8 +37,13 @@ Router::Router(GlobalBlockIndex& index, ClientRegistry& registry,
   // config_.get_strategy.
   get_strategy_ =
       get_strategy ? std::move(get_strategy) : std::make_unique<TierPriorityRouteGetStrategy>();
-  put_strategy_ =
-      put_strategy ? std::move(put_strategy) : std::make_unique<TierAwareMostAvailableStrategy>();
+  // Default to most-available / no-affinity: the single built-in put strategy.
+  // Callers can still inject any RoutePutStrategy (e.g. an env-configured
+  // ConfigurableRoutePutStrategy from master startup) via config_.put_strategy.
+  put_strategy_ = put_strategy ? std::move(put_strategy)
+                               : std::make_unique<ConfigurableRoutePutStrategy>(
+                                     ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable,
+                                     ConfigurableRoutePutStrategy::NodeAffinity::kNone);
 }
 
 std::optional<RouteGetResolution> Router::RouteGet(
@@ -52,42 +56,25 @@ std::optional<RouteGetResolution> Router::RouteGet(
 std::optional<RoutePutResult> Router::RoutePut(
     const std::string& key, const std::string& node_id, uint64_t block_size,
     const std::unordered_set<std::string>& exclude_nodes) {
-  // Master-side dedup lives only in BatchRoutePut (single RoutePut
-  // proto carries no already_exists; PoolClient::Put wraps BatchPut).
-  (void)key;
-  auto candidates = registry_.GetAliveClients();
-  if (candidates.empty()) {
-    MORI_UMBP_DEBUG("[Router] RoutePut from={}: no alive clients", node_id);
-    return std::nullopt;
-  }
-  auto selected = put_strategy_->Select(candidates, block_size, exclude_nodes);
-  if (!selected) {
-    MORI_UMBP_DEBUG("[Router] RoutePut from={}: no node with sufficient capacity", node_id);
-    return std::nullopt;
-  }
-  return selected;
+  // Delegate to the batch path (size=1) so master-side dedup (BatchLookupExists)
+  // and projected-capacity logic have a single home; a returned kAlreadyExists
+  // now flows back through RoutePutResponse.outcome.
+  auto results = BatchRoutePut({key}, node_id, {block_size}, exclude_nodes);
+  return std::move(results.front());
 }
 
 std::vector<std::optional<RoutePutResult>> Router::BatchRoutePut(
     const std::vector<std::string>& keys, const std::string& node_id,
     const std::vector<uint64_t>& block_sizes,
     const std::unordered_set<std::string>& exclude_nodes) {
-  (void)node_id;
-  std::vector<std::optional<RoutePutResult>> results(keys.size());
-  // Single shared_lock for the whole batch: dedup mask + alive snapshot.
-  // Two entries picking the same (node, tier) is fine — peer will sort
-  // out ENOSPC at AllocateSlot.
+  // SelectBatch applies dedup + projected capacity on this batch-local snapshot;
+  // the peer allocator stays the final ENOSPC arbiter. A keys/block_sizes length
+  // mismatch is logged as a MORI ERROR and yields an all-nullopt result
+  // (best-effort: no throw, every key reads as unroutable).
   auto exists_mask = index_.BatchLookupExists(keys);
   auto candidates = registry_.GetAliveClients();
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (i < exists_mask.size() && exists_mask[i]) {
-      results[i] = RoutePutResult{.outcome = RoutePutOutcome::kAlreadyExists};
-      continue;
-    }
-    if (candidates.empty()) continue;
-    results[i] = put_strategy_->Select(candidates, block_sizes[i], exclude_nodes);
-  }
-  return results;
+  return put_strategy_->SelectBatch(node_id, block_sizes, exists_mask, std::move(candidates),
+                                    exclude_nodes);
 }
 
 std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(

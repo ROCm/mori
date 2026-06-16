@@ -65,6 +65,8 @@ Read by the **master process** (`bin/master_main.cpp` via
 | `UMBP_HIT_INDEX_TTL_SEC` | `7200` | sec | External KV hit-count entry TTL. A hash with no counted match for longer than this is removed from the hit index. |
 | `UMBP_HIT_INDEX_GC_INTERVAL_SEC` | `60` | sec | External KV hit-count GC sweep interval. |
 | `UMBP_HIT_QUERY_MAX_BATCH` | `4096` | count | Maximum hashes accepted by one `GetExternalKvHitCounts` request. Oversized requests return gRPC `INVALID_ARGUMENT`; the server does not truncate. |
+| `UMBP_ROUTE_PUT_SELECT_ALGO` | `most_available` | enum | Base RoutePut placement algorithm over eligible nodes (HBM before DRAM; SSD never a direct-put target). `most_available` = pick the node with the most projected free space; `random` = capacity-weighted random (probability proportional to projected `available_bytes`, never picks a node that cannot fit). Unknown value → default + one WARN. |
+| `UMBP_ROUTE_PUT_NODE_AFFINITY` | `none` | enum | Node-affinity bias layered on top of the base algorithm. `none` = pure base algorithm; `same` = try to place the whole batch on one node that fits the non-dedup total, else per-key sticky to the first picked node; `local` = per-key prefer the requester's local node. All three fall back to the base algorithm so affinity never makes a key fail that the base algorithm could route. Unknown value → default + one WARN. |
 
 ## Peer / pool client
 

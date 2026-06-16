@@ -125,6 +125,10 @@ int main(int argc, char** argv) {
     if (!route_put_status.ok()) {
       MORI_UMBP_WARN("[Client] Iteration {} RoutePut RPC failed: {}", iteration,
                      route_put_status.error_message());
+    } else if (put_target.has_value() &&
+               put_target->outcome == mori::umbp::RoutePutOutcome::kAlreadyExists) {
+      MORI_UMBP_INFO("[Client] Iteration {} RoutePut(key={}): already exists (dedup)", iteration,
+                     key);
     } else if (put_target.has_value()) {
       MORI_UMBP_INFO("[Client] Iteration {} RoutePut(key={}): target_node={}, tier={}", iteration,
                      key, put_target->node_id, mori::umbp::TierTypeName(put_target->tier));

@@ -46,6 +46,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -143,6 +144,29 @@ inline uint32_t GetEnvUint32(const char* name, uint32_t def, uint32_t min_allowe
     return def;
   }
   return static_cast<uint32_t>(v);
+}
+
+// Resolve a string-enum env var against a fixed set of allowed values.
+//   - Unset / empty / whitespace-only -> return `def` silently.
+//   - After trimming leading/trailing whitespace, exact (case-sensitive,
+//     lowercase) match against `allowed` -> return the matched value.
+//   - Anything else (unknown value) -> return `def` and WARN once per name.
+// `def` is expected to be one of `allowed`.
+inline std::string GetEnvEnum(const char* name, const char* def,
+                              std::initializer_list<const char*> allowed) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') return def;
+  std::string value(raw);
+  const char* ws = " \t\n\r\f\v";
+  const size_t begin = value.find_first_not_of(ws);
+  if (begin == std::string::npos) return def;  // whitespace-only == empty
+  const size_t end = value.find_last_not_of(ws);
+  value = value.substr(begin, end - begin + 1);
+  for (const char* candidate : allowed) {
+    if (value == candidate) return value;
+  }
+  env_time_detail::WarnOnce(name, "unknown value", raw);
+  return def;
 }
 
 // Test-only: clear the WARN-once registry. Not thread-safe vs readers.
