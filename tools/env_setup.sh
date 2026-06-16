@@ -28,8 +28,8 @@ ROCE_PRIO=3        # RoCE packet priority (lossless / PFC no-drop TC)
 ROCE_DSCP=26       # RoCE DSCP
 CNP_PRIO=6         # CNP packet priority
 CNP_DSCP=48        # CNP DSCP
-ROCE_BW=50         # % link bandwidth for the RoCE TC
-L2_BW=$((100 - ROCE_BW))
+ROCE_BW=90         # % link bandwidth for the RoCE TC (lossless)
+NON_RDMA_BW=$((100 - ROCE_BW))   # % for non-RDMA traffic on TC0
 
 GREEN='\033[0;32m' RED='\033[0;31m' YELLOW='\033[0;33m' NC='\033[0m'
 
@@ -204,11 +204,11 @@ bnxt_setup_pfc() {
 
         if [[ "$cnp_st" == "1" ]]; then
             # 3 TCs preferred; some firmware only accepts the full 8-TC form
-            sudo dcb ets set dev "$ndev" tc-tsa 0:ets 1:ets 2:strict tc-bw 0:$L2_BW 1:$ROCE_BW prio-tc$prio_tc 2>/dev/null \
-                || sudo dcb ets set dev "$ndev" tc-tsa 0:ets 1:ets 2:strict 3:strict 4:strict 5:strict 6:strict 7:strict tc-bw 0:$L2_BW 1:$ROCE_BW prio-tc$prio_tc \
+            sudo dcb ets set dev "$ndev" tc-tsa 0:ets 1:ets 2:strict tc-bw 0:$NON_RDMA_BW 1:$ROCE_BW prio-tc$prio_tc 2>/dev/null \
+                || sudo dcb ets set dev "$ndev" tc-tsa 0:ets 1:ets 2:strict 3:strict 4:strict 5:strict 6:strict 7:strict tc-bw 0:$NON_RDMA_BW 1:$ROCE_BW prio-tc$prio_tc \
                 || { die "bnxt: dcb ets failed on $ndev"; return 1; }
         else
-            sudo dcb ets set dev "$ndev" tc-tsa 0:ets 1:ets tc-bw 0:$L2_BW 1:$ROCE_BW prio-tc$prio_tc \
+            sudo dcb ets set dev "$ndev" tc-tsa 0:ets 1:ets tc-bw 0:$NON_RDMA_BW 1:$ROCE_BW prio-tc$prio_tc \
                 || { die "bnxt: dcb ets failed on $ndev"; return 1; }
         fi
 
@@ -218,7 +218,7 @@ bnxt_setup_pfc() {
         sudo dcb app add dev "$ndev" dgram-port-prio 4791:"$ROCE_PRIO" 2>/dev/null
         sudo dcb app add dev "$ndev" dscp-prio "$ROCE_DSCP":"$ROCE_PRIO" 2>/dev/null
         [[ "$cnp_st" == "1" ]] && sudo dcb app add dev "$ndev" dscp-prio "$CNP_DSCP":"$CNP_PRIO" 2>/dev/null
-        log_ok "bnxt PFC/ETS on $dev ($ndev): prio $ROCE_PRIO lossless, DSCP $ROCE_DSCP, bw L2/$L2_BW RoCE/$ROCE_BW, cnp_service_type=$cnp_st"
+        log_ok "bnxt PFC/ETS on $dev ($ndev): prio $ROCE_PRIO lossless, DSCP $ROCE_DSCP, bw RoCE/$ROCE_BW non-RDMA/$NON_RDMA_BW, cnp_service_type=$cnp_st"
     done
 }
 
