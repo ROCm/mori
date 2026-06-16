@@ -236,7 +236,24 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle& wq = ep[epIndex].wqHandle;
   core::CompletionQueueHandle& cq = ep[epIndex].cqHandle;
-  BnxtCollapsedCqDrain<DrainToLive>(wq, cq);
+
+  // One warp owns the drain; losers spin on cacheable reads and only CAS the lock
+  // when it looks free. Recycle (DrainToLive=false) losers return; final-quiet
+  // losers wait until doneIdx >= postIdx.
+  while (true) {
+    if constexpr (DrainToLive) {
+      uint32_t done = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      uint32_t post = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      if (done >= post) return;
+    }
+    if (__hip_atomic_load(&cq.pollCqLock, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == 0 &&
+        core::AcquireLockOnce(&cq.pollCqLock)) {
+      BnxtCollapsedCqDrain<DrainToLive>(wq, cq);
+      core::ReleaseLock(&cq.pollCqLock);
+      return;
+    }
+    if constexpr (!DrainToLive) return;
+  }
 }
 
 inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
