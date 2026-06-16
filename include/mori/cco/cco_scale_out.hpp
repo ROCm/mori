@@ -352,32 +352,76 @@ __device__ inline static void quietUntil(application::RdmaEndpointDevice* ep, ui
   }
 }
 
-// Reserve WQE slots and wait for SQ space
-template <core::ProviderType PrvdType>
+// Reserve WQE slots and wait for SQ space.
+//
+// In thread mode (ccoCoopThread) every lane of the warp reaches here — the
+// put/get facade's thread_rank()==0 gate passes for all threads — so when those
+// lanes target the SAME work queue, one leader reserves all their slots with a
+// single atomicAdd and runs the SQ-space spin once for the whole warp, instead
+// of every lane contending on wq->postIdx and spinning independently (mirrors
+// shmem's warp-aggregated reserve). Each lane takes a distinct slot range at
+// base + logicalLaneId * numWqesNeeded; this assumes same-QP lanes share
+// numWqesNeeded, true here since it depends only on the constexpr hasSignal and
+// the atomic type. Lanes targeting different QPs fall back to the per-lane
+// reserve. In warp/block mode only lane 0 reaches here, so the aggregation would
+// be a no-op and is compiled out entirely.
+template <core::ProviderType PrvdType, typename Coop = ccoCoopThread>
 __device__ inline static uint32_t reserveWqeSlots(application::RdmaEndpointDevice* ep,
                                                   uint32_t numWqesNeeded) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
 
-  // Atomically allocate WQE slots
-  uint32_t curPostIdx = atomicAdd(&wq->postIdx, numWqesNeeded);
+  if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
+    uint64_t activemask = core::GetActiveLaneMask();
+    int leaderLane = core::GetFirstActiveLaneID(activemask);
+    uint32_t leaderQpn = __shfl(ep->qpn, leaderLane);
+    bool sameQp = (ep->qpn == leaderQpn);
 
-  // Flow control: wait until SQ has enough space
+    if (__ballot(sameQp) == activemask) {
+      // All active lanes target the same QP: one leader reserves the whole warp.
+      uint32_t numActiveLanes = core::GetActiveLaneCount(activemask);
+      uint32_t myLogicalLaneId = core::GetActiveLaneNum(activemask);
+      uint32_t warpWqes = numActiveLanes * numWqesNeeded;
+
+      uint32_t base = 0;
+      if (myLogicalLaneId == 0) {
+        base = atomicAdd(&wq->postIdx, warpWqes);
+      }
+      base = __shfl(base, leaderLane);
+      uint32_t curPostIdx = base + myLogicalLaneId * numWqesNeeded;
+
+      // Flow control once per warp: wait until the SQ has room for the whole warp.
+      while (true) {
+        uint64_t dbTouched =
+            __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        uint64_t dbDone =
+            __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        uint64_t numActiveSqEntries = dbTouched - dbDone;
+        uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
+        uint64_t entriesUntilWarpLast = base + warpWqes - dbTouched;
+        if (numFreeEntries > entriesUntilWarpLast) {
+          break;
+        }
+        quietUntil<PrvdType>(ep, base);
+      }
+      return curPostIdx;
+    }
+    // Mixed QPs: fall through to the per-lane reserve below.
+  }
+
+  // Per-lane reserve: each thread allocates and flow-controls on its own.
+  uint32_t curPostIdx = atomicAdd(&wq->postIdx, numWqesNeeded);
   while (true) {
     uint64_t dbTouched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     uint64_t dbDone = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-
     uint64_t numActiveSqEntries = dbTouched - dbDone;
     uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
     uint64_t entriesUntilMine = curPostIdx + numWqesNeeded - dbTouched;
-
     if (numFreeEntries > entriesUntilMine) {
-      break;  // Enough space available
+      break;
     }
-    // Not enough space, poll CQ to free up slots
     quietUntil<PrvdType>(ep, curPostIdx);
   }
-
   return curPostIdx;
 }
 
@@ -495,14 +539,14 @@ __device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, ui
 }
 
 // putImpl - Pure hardware operation layer
-template <core::ProviderType PrvdType>
+template <core::ProviderType PrvdType, typename Coop = ccoCoopThread>
 __device__ inline static void putImpl(
     // Hardware resources (already selected endpoint)
     application::RdmaEndpointDevice* ep, uint32_t qpn,
 
     // Data transfer parameters (already parsed addresses and keys)
-    bool hasData, uintptr_t localAddr, uint32_t localKey,  // local buffer
-    uintptr_t remoteAddr, uint32_t remoteKey,              // remote buffer
+    uintptr_t localAddr, uint32_t localKey,    // local buffer
+    uintptr_t remoteAddr, uint32_t remoteKey,  // remote buffer
     size_t bytes,
 
     // Signal parameters (already parsed)
@@ -511,30 +555,24 @@ __device__ inline static void putImpl(
 
     // Optimization flags
     uint32_t optFlags = ccoGdaOptFlagsDefault) {
-  if (!hasData && !hasSignal) return;
-
   // Get work queue handle
   core::WorkQueueHandle* wq = &ep->wqHandle;
 
-  // Calculate total WQEs needed
-  uint32_t numWqesNeeded = hasData ? 1 : 0;
+  // Calculate total WQEs needed (always 1 for the data write)
+  uint32_t numWqesNeeded = 1;
   if (hasSignal) {
     numWqesNeeded += getAtomicWqeCount<PrvdType>(core::AMO_FETCH_ADD, sizeof(uint64_t));
   }
 
   // Reserve WQE slots (with flow control)
-  uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, numWqesNeeded);
+  uint32_t curPostIdx = reserveWqeSlots<PrvdType, Coop>(ep, numWqesNeeded);
 
   // Post RDMA Write for data transfer
-  uint64_t dbrVal = 0;
   uint32_t wqeIdx = curPostIdx;
-
-  if (hasData) {
-    recordOutstandingWqe<PrvdType>(wq, wqeIdx);
-    dbrVal = core::PostWrite<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn,
-                                       localAddr, localKey, remoteAddr, remoteKey, bytes);
-    wqeIdx++;
-  }
+  recordOutstandingWqe<PrvdType>(wq, wqeIdx);
+  uint64_t dbrVal = core::PostWrite<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn,
+                                              localAddr, localKey, remoteAddr, remoteKey, bytes);
+  wqeIdx++;
 
   // Post atomic for signal (remote peer notification)
   if (hasSignal) {
@@ -601,17 +639,15 @@ __device__ inline static void putValueImpl(application::RdmaEndpointDevice* ep, 
 }
 
 // New getImpl - RDMA read
-template <core::ProviderType PrvdType>
+template <core::ProviderType PrvdType, typename Coop = ccoCoopThread>
 __device__ inline static void getImpl(application::RdmaEndpointDevice* ep, uint32_t qpn,
                                       uintptr_t localAddr, uint32_t localKey, uintptr_t remoteAddr,
                                       uint32_t remoteKey, size_t bytes,
                                       uint32_t optFlags = ccoGdaOptFlagsDefault) {
-  if (bytes == 0) return;
-
   core::WorkQueueHandle* wq = &ep->wqHandle;
 
   // Reserve WQE slot
-  uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
+  uint32_t curPostIdx = reserveWqeSlots<PrvdType, Coop>(ep, 1);
 
   // Post RDMA Read
   recordOutstandingWqe<PrvdType>(wq, curPostIdx);
@@ -906,12 +942,11 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
     }
 
     // step 4: call primitive API (PrvdType is compile-time determined)
-    impl::putImpl<PrvdType>(ep, qpn,
-                            bytes > 0,            // hasData
-                            localAddr, srcLkey,   // local
-                            remoteAddr, dstRkey,  // remote
-                            bytes, hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg,
-                            optFlags);
+    impl::putImpl<PrvdType, Coop>(ep, qpn,
+                                  localAddr, srcLkey,   // local
+                                  remoteAddr, dstRkey,  // remote
+                                  bytes, hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg,
+                                  optFlags);
   }
   coop.sync();
 }
@@ -992,7 +1027,8 @@ __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, si
     uint32_t qpn = ep->qpn;
 
     // step 3: call primitive API
-    impl::getImpl<PrvdType>(ep, qpn, localAddr, localLkey, remoteAddr, remoteRkey, bytes, optFlags);
+    impl::getImpl<PrvdType, Coop>(ep, qpn, localAddr, localLkey, remoteAddr, remoteRkey, bytes,
+                                  optFlags);
   }
   coop.sync();
 }
