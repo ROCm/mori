@@ -189,20 +189,9 @@ inline __device__ void VmmLookupRemote(uintptr_t addr, int pe, uintptr_t& out_ra
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */
-// Drain a collapsed (one-CQE, cqeNum==1) bnxt CQ and advance wq.doneIdx. The NIC
-// keeps the latest completion in CQE[0]; its 16-bit con_indx gives the completed
-// WQE slot (con_indx % sqWqeNum == completed-count % sqWqeNum, the same identity
-// the old outstandingWqe[] table relied on). Reconstruct the 32-bit monotonic
-// completed count by anchoring on dbTouchIdx (the true upper bound of completions):
-// the unique value V <= dbTouchIdx with V % sqWqeNum == con_indx % sqWqeNum, which
-// is unambiguous because outstanding (dbTouchIdx - doneIdx) <= sqWqeNum. This
-// removes the per-WQE wq.outstandingWqe[] slot->counter table entirely. sqWqeNum is
-// a power of two, so the modulus is a mask. Lock-free / multi-warp safe via
-// atomicMax on doneIdx, mirroring Mlx5CollapsedCqDrain.
-//
-// DrainToLive=false: exit at a snapshot of dbTouchIdx (recycle gate -- just free
-// some slots). true: re-read the live postIdx and wait until every reserved WQE
-// has completed, so no send can still be reading its source (final quiet).
+// Drain a collapsed (cqeNum==1) bnxt CQ and advance wq.doneIdx, reconstructing the
+// completed count from CQE[0].con_indx (lock-free, mirrors Mlx5CollapsedCqDrain).
+// DrainToLive=false drains to a dbTouchIdx snapshot; true waits for the live postIdx.
 template <bool DrainToLive = false>
 inline __device__ void BnxtCollapsedCqDrain(core::WorkQueueHandle& wq,
                                             core::CompletionQueueHandle& cq) {
