@@ -171,6 +171,57 @@ inline __device__ void VmmLookupRemote(uintptr_t addr, int pe, uintptr_t& out_ra
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */
+// Drain a collapsed (one-CQE, cqeNum==1) bnxt CQ and advance wq.doneIdx. The NIC
+// keeps the latest completion in CQE[0]; its 16-bit con_indx gives the completed
+// WQE slot (con_indx % sqWqeNum == completed-count % sqWqeNum, the same identity
+// the old outstandingWqe[] table relied on). Reconstruct the 32-bit monotonic
+// completed count by anchoring on dbTouchIdx (the true upper bound of completions):
+// the unique value V <= dbTouchIdx with V % sqWqeNum == con_indx % sqWqeNum, which
+// is unambiguous because outstanding (dbTouchIdx - doneIdx) <= sqWqeNum. This
+// removes the per-WQE wq.outstandingWqe[] slot->counter table entirely. sqWqeNum is
+// a power of two, so the modulus is a mask. Lock-free / multi-warp safe via
+// atomicMax on doneIdx, mirroring Mlx5CollapsedCqDrain.
+//
+// DrainToLive=false: exit at a snapshot of dbTouchIdx (recycle gate -- just free
+// some slots). true: re-read the live postIdx and wait until every reserved WQE
+// has completed, so no send can still be reading its source (final quiet).
+template <bool DrainToLive = false>
+inline __device__ void BnxtCollapsedCqDrain(core::WorkQueueHandle& wq,
+                                            core::CompletionQueueHandle& cq) {
+  uint32_t exitTarget =
+      DrainToLive ? __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
+                  : __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  uint32_t cons = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  if (cons >= exitTarget) return;
+
+  const uint32_t mask = wq.sqWqeNum - 1;  // sqWqeNum is a power of two
+  __threadfence();
+  do {
+    uint32_t consIdxIgnored = 0;  // collapsed CQ (cqeNum==1) always reads CQE[0]
+    uint32_t wqeCounter = 0;
+    int opcode =
+        core::PollCq<core::ProviderType::BNXT>(cq.cqAddr, cq.cqeNum, &consIdxIgnored, &wqeCounter);
+    if (opcode != BNXT_RE_REQ_ST_OK) {
+      assert(false);
+      return;
+    }
+
+    // Largest V <= dbTouchIdx with V % sqWqeNum == con_indx % sqWqeNum.
+    uint32_t dbTouch =
+        __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t completed = (dbTouch & ~mask) | (wqeCounter & mask);
+    if (completed > dbTouch) completed -= wq.sqWqeNum;
+
+    __hip_atomic_fetch_max(&wq.doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    cons = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if constexpr (DrainToLive) {
+      exitTarget = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+  } while (cons < exitTarget);
+  __threadfence();
+}
+
+template <bool DrainToLive = false>
 inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
   if (core::GetActiveLaneNum() != 0) return;
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
@@ -178,34 +229,7 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle& wq = ep[epIndex].wqHandle;
   core::CompletionQueueHandle& cq = ep[epIndex].cqHandle;
-  if (!core::AcquireLockOnce(&cq.pollCqLock)) return;
-  while (true) {
-    uint32_t dbTouchIdx =
-        __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_AGENT);
-    uint32_t doneIdx = __hip_atomic_load(&wq.doneIdx, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_AGENT);
-    if (dbTouchIdx == doneIdx) {
-      break;
-    }
-
-    uint32_t my_cq_consumer =
-        __hip_atomic_fetch_add(&cq.cq_consumer, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-
-    uint32_t wqe_counter;
-    int opcode =
-        core::PollCq<core::ProviderType::BNXT>(cq.cqAddr, cq.cqeNum, &my_cq_consumer, &wqe_counter);
-    if (opcode != BNXT_RE_REQ_ST_OK) {
-      int rank = globalGpuStates->rank;
-      uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
-      MORI_PRINTF("rank %d dest pe %d consIdx %d opcode %d\n", rank, pe, my_cq_index, opcode);
-      assert(false);
-    }
-    wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
-    uint64_t wqe_id = wq.outstandingWqe[wqe_counter] + 1;
-
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    __hip_atomic_fetch_max(&wq.doneIdx, wqe_id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  }
-  core::ReleaseLock(&cq.pollCqLock);
+  BnxtCollapsedCqDrain<DrainToLive>(wq, cq);
 }
 
 inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
@@ -347,7 +371,7 @@ inline __device__ void ShmemQuietThreadKernelMlnxImpl(int pe, int qpId) {
 template <core::ProviderType PrvdType, bool DrainToLive = false>
 inline __device__ void ShmemQuietThreadKernelImpl(int pe, int qpId) {
   if constexpr (PrvdType == core::ProviderType::BNXT) {
-    ShmemQuietThreadKernelSerialImpl(pe, qpId);
+    ShmemQuietThreadKernelSerialImpl<DrainToLive>(pe, qpId);
   } else if constexpr (PrvdType == core::ProviderType::PSD) {
     ShmemQuietThreadKernelPsdImpl(pe, qpId);
   } else if constexpr (PrvdType == core::ProviderType::MLX5) {
@@ -537,7 +561,6 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
           core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
                                     qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-      wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
       dbr_val =
           core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
                                     is_leader, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
@@ -720,7 +743,6 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
     dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter,
                                               is_leader, qpn, val, raddr, rkey, bytes);
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-    wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
     dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
                                               is_leader, qpn, val, raddr, rkey, bytes);
   } else if constexpr (PrvdType == core::ProviderType::PSD) {
@@ -935,7 +957,6 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
       dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter,
                                           is_leader, qpn, laddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-      wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
       dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
                                           is_leader, qpn, laddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
@@ -966,7 +987,6 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
                 *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
                 &signalValue, signalRaddr, signalRkey, sizeof(signalValue));
           } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-            wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
             dbr_val = core::PostWriteInline<PrvdType>(
                 *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader,
                 qpn, &signalValue, signalRaddr, signalRkey, sizeof(signalValue));
@@ -987,7 +1007,6 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
                 ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
                 sizeof(signalValue), core::atomicType::AMO_ADD);
           } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-            wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
             dbr_val = core::PostAtomic<PrvdType>(
                 *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader,
                 qpn, ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
@@ -1226,10 +1245,6 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
     ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   }
 
-  if constexpr (PrvdType == core::ProviderType::BNXT) {
-    wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
-  }
-
   uint64_t dbr_val;
   if constexpr (PrvdType == core::ProviderType::MLX5) {
     dbr_val =
@@ -1411,10 +1426,6 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
     uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) break;
     ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
-  }
-
-  if constexpr (PrvdType == core::ProviderType::BNXT) {
-    wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
   }
 
   uint64_t dbr_val;
@@ -1683,7 +1694,6 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
           core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
                                     qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-      wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
       dbr_val =
           core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
                                     is_leader, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
@@ -1844,7 +1854,6 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelAddrImpl(const void* dest, 
     dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter,
                                               is_leader, qpn, val, raddr, rkey, bytes);
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-    wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
     dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
                                               is_leader, qpn, val, raddr, rkey, bytes);
   } else if constexpr (PrvdType == core::ProviderType::PSD) {
@@ -2056,7 +2065,6 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
       dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, false,
                                           qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-      wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
       dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
                                           false, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
@@ -2077,7 +2085,6 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
                 *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
                 &signalValue, signalRaddr, signalRkey, sizeof(signalValue));
           } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-            wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
             dbr_val = core::PostWriteInline<PrvdType>(
                 *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader,
                 qpn, &signalValue, signalRaddr, signalRkey, sizeof(signalValue));
@@ -2098,7 +2105,6 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
                 ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
                 sizeof(signalValue), core::atomicType::AMO_ADD);
           } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-            wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
             dbr_val = core::PostAtomic<PrvdType>(
                 *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader,
                 qpn, ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
@@ -2314,10 +2320,6 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelAddrImpl(const void* d
     ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   }
 
-  if constexpr (PrvdType == core::ProviderType::BNXT) {
-    wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
-  }
-
   uint64_t dbr_val;
   if constexpr (PrvdType == core::ProviderType::MLX5) {
     dbr_val =
@@ -2464,10 +2466,6 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelAddrImpl(const void* dest, v
     uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) break;
     ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
-  }
-
-  if constexpr (PrvdType == core::ProviderType::BNXT) {
-    wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
   }
 
   uint64_t dbr_val;
@@ -2689,7 +2687,6 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
           core::PostRead<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader, qpn,
                                    destAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-      wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
       dbr_val =
           core::PostRead<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
                                    qpn, destAddr, lkey, raddr, rkey, transfer_size);
@@ -2902,7 +2899,6 @@ inline __device__ void ShmemGetMemNbiThreadKernelAddrImpl(void* dest, const void
           core::PostRead<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader, qpn,
                                    destAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-      wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
       dbr_val =
           core::PostRead<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
                                    qpn, destAddr, lkey, raddr, rkey, transfer_size);
