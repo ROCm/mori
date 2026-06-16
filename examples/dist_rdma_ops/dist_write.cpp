@@ -59,6 +59,15 @@ void VerifyBuffer(void* buffer, size_t maxSize, char expected) {
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 }
 
+// Largest V <= dbTouchIdx with V % modulus == wrapped % modulus (modulus =
+// sqWqeNum for bnxt/psd, 2^16 for mlx5). Replaces the outstandingWqe[] table.
+__device__ inline uint32_t ReconstructDone(uint32_t wrapped, uint32_t modulus,
+                                           uint32_t dbTouchIdx) {
+  uint32_t v = (dbTouchIdx - (dbTouchIdx % modulus)) + (wrapped % modulus);
+  if (v > dbTouchIdx) v -= modulus;
+  return v;
+}
+
 template <ProviderType P>
 inline __device__ void QuietSerial(RdmaEndpoint* endpoint) {
   if (GetActiveLaneNum() != 0) return;
@@ -92,21 +101,19 @@ inline __device__ void QuietSerial(RdmaEndpoint* endpoint) {
         core::DumpMlx5Wqe(wq.sqAddr, my_cq_index);
         assert(false);
       }
-      wqe_id = wq.outstandingWqe[wqe_counter];
+      wqe_id = ReconstructDone(wqe_counter, 1u << 16, dbTouchIdx);
     } else if constexpr (P == core::ProviderType::BNXT) {
       if (opcode != BNXT_RE_REQ_ST_OK) {
         uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
         assert(false);
       }
-      wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
-      wqe_id = wq.outstandingWqe[wqe_counter] + 1;
+      wqe_id = ReconstructDone(wqe_counter, wq.sqWqeNum, dbTouchIdx);
     } else if constexpr (P == core::ProviderType::PSD) {
       if (opcode != 0) {
         uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
         assert(false);
       }
-      wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
-      wqe_id = wq.outstandingWqe[wqe_counter] + 1;
+      wqe_id = ReconstructDone(wqe_counter, wq.sqWqeNum, dbTouchIdx);
     }
 
     // core::UpdateCqDbrRecord<P>(cq, cq.dbrRecAddr, (uint32_t)(my_cq_consumer + 1), cq.cqeNum);
@@ -171,7 +178,9 @@ __device__ void Quiet(RdmaEndpoint* endpoint) {
       uint32_t wqe_counter;
       PollCq<P>(cqHandle->cqAddr, cqHandle->cqeNum, &my_cq_consumer, &wqe_counter);
       __threadfence_system();
-      wqe_id = endpoint->wqHandle.outstandingWqe[wqe_counter];
+      uint32_t dbTouchIdx = __hip_atomic_load(&endpoint->wqHandle.dbTouchIdx, __ATOMIC_RELAXED,
+                                              __HIP_MEMORY_SCOPE_AGENT);
+      wqe_id = ReconstructDone(wqe_counter, 1u << 16, dbTouchIdx);
       __hip_atomic_fetch_max(&wqe_broadcast[warp_id], wqe_id, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_WORKGROUP);
       __atomic_signal_fence(__ATOMIC_SEQ_CST);
@@ -340,17 +349,14 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
   uintptr_t dstAddr = remoteMr.addr + FlatThreadId() * msg_size;
   uint64_t dbr_val;
   if constexpr (P == ProviderType::MLX5) {
-    wqHandle->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
     dbr_val =
         PostWrite<P>(*wqHandle, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
                      endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
   } else if constexpr (P == ProviderType::BNXT) {
-    wqHandle->outstandingWqe[my_sq_counter % wqHandle->sqWqeNum] = my_sq_counter;
     dbr_val =
         PostWrite<P>(*wqHandle, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
                      endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
   } else if constexpr (P == ProviderType::PSD) {
-    wqHandle->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
     dbr_val =
         PostWrite<P>(*wqHandle, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
                      endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
@@ -624,16 +630,6 @@ void distRdmaOps(int argc, char* argv[]) {
   std::vector<RdmaMemoryRegion> global_mr_handles(world_size);
   bootNet.Allgather(&mr_handle, global_mr_handles.data(), sizeof(mr_handle));
   global_mr_handles[local_rank] = mr_handle;
-  // WorkQueueHandle::outstandingWqe is now a pointer (mori_shmem leaves it null and
-  // reconstructs completions arithmetically). This example's quiet still uses the
-  // slot->counter table, so allocate one device buffer per QP and attach it before
-  // the handles are copied to the device.
-  for (int i = 0; i < num_qp; ++i) {
-    uint64_t* outstandingWqeBuf = nullptr;
-    HIP_RUNTIME_CHECK(hipMalloc(&outstandingWqeBuf, OUTSTANDING_TABLE_SIZE * sizeof(uint64_t)));
-    HIP_RUNTIME_CHECK(hipMemset(outstandingWqeBuf, 0, OUTSTANDING_TABLE_SIZE * sizeof(uint64_t)));
-    endpoints[i].wqHandle.outstandingWqe = outstandingWqeBuf;
-  }
   RdmaEndpoint* devEndpoints;
   HIP_RUNTIME_CHECK(hipMalloc(&devEndpoints, num_qp * sizeof(RdmaEndpoint)));
   HIP_RUNTIME_CHECK(hipMemcpy(devEndpoints, endpoints.data(), num_qp * sizeof(RdmaEndpoint),
