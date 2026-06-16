@@ -43,7 +43,8 @@ bool WatermarksValid(double high, double low) {
 //  Construction
 // ---------------------------------------------------------------------------
 
-PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
+PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg, std::unique_ptr<SsdEvictStrategy> strategy)
+    : strategy_(strategy ? std::move(strategy) : std::make_unique<LruSsdEvictStrategy>()) {
   if (!cfg.enabled) {
     MORI_UMBP_INFO("[PeerSsdManager] constructed disabled (no SSD backend)");
     return;
@@ -93,8 +94,11 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
 }
 
 PeerSsdManager::PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark,
-                               double low_watermark)
-    : backend_(std::move(backend)), high_watermark_(high_watermark), low_watermark_(low_watermark) {
+                               double low_watermark, std::unique_ptr<SsdEvictStrategy> strategy)
+    : backend_(std::move(backend)),
+      strategy_(strategy ? std::move(strategy) : std::make_unique<LruSsdEvictStrategy>()),
+      high_watermark_(high_watermark),
+      low_watermark_(low_watermark) {
   if (!WatermarksValid(high_watermark_, low_watermark_)) {
     throw std::runtime_error(
         "[PeerSsdManager] invalid SSD watermarks (require 0 < low_watermark < "
@@ -250,23 +254,40 @@ bool PeerSsdManager::Evict(const std::string& key) {
 }
 
 std::vector<std::string> PeerSsdManager::SelectVictims(size_t bytes_to_free) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::vector<std::string> victims;
-  if (bytes_to_free == 0) return victims;
+  if (bytes_to_free == 0) return {};
 
-  // Oldest first (LRU tail -> MRU front), skipping keys being read or evicted.
-  size_t freed = 0;
-  for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
-    const std::string& key = *it;
-    if (inflight_reads_.count(key) != 0) continue;
-    if (evicting_.count(key) != 0) continue;
-    auto owned_it = owned_.find(key);
-    if (owned_it == owned_.end()) continue;  // defensive; lru_/owned_ stay in sync
-    victims.push_back(key);
-    freed += owned_it->second.size;
-    if (freed >= bytes_to_free) break;
+  // Build the evictable-candidate snapshot under the lock, then run the policy
+  // outside it.  lru_ is front == MRU, back == LRU, so we walk back -> front
+  // (oldest first) assigning lru_rank 0 to the oldest key.  Keys with a live
+  // read (inflight_reads_) or an in-progress eviction (evicting_) are skipped
+  // here, so the policy never has to know about read priority.
+  //
+  // The walk stops once the accumulated eligible size covers bytes_to_free:
+  // for a recency-ordered policy the oldest-first prefix is all that can be
+  // chosen, so this keeps the lock-held scan bounded (same cost as a direct
+  // tail-walk) instead of materializing the whole tier.  A future policy that
+  // ranks on something other than recency would need the full candidate set
+  // and must lift this early stop.
+  std::vector<SsdEvictCandidate> candidates;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint64_t rank = 0;
+    size_t eligible = 0;
+    for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
+      const std::string& key = *it;
+      if (inflight_reads_.count(key) != 0) continue;
+      if (evicting_.count(key) != 0) continue;
+      auto owned_it = owned_.find(key);
+      if (owned_it == owned_.end()) continue;  // defensive; lru_/owned_ stay in sync
+      candidates.push_back(SsdEvictCandidate{key, owned_it->second.size, rank++});
+      eligible += owned_it->second.size;
+      if (eligible >= bytes_to_free) break;
+    }
   }
-  return victims;
+
+  // The returned victims are re-validated (and skipped if newly read/evicted)
+  // by Evict() under the lock, so racing the snapshot here is safe.
+  return strategy_->SelectVictims(std::move(candidates), bytes_to_free);
 }
 
 void PeerSsdManager::EvictToLowWatermark() {

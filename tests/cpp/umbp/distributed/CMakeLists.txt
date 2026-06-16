@@ -96,6 +96,15 @@ target_link_libraries(test_umbp_route_put_strategy PRIVATE umbp_common
                                                            gtest_main)
 add_test(NAME umbp_route_put_strategy COMMAND test_umbp_route_put_strategy)
 
+# Master eviction policy plug-in: default LRU behavior + the EvictionManager DI
+# seam.  The seam test calls EvictionManager::RunOnce() directly (a public
+# single-pass trigger), so no special compile flags are needed.
+add_executable(test_umbp_master_evict_strategy test_master_evict_strategy.cpp)
+target_link_libraries(test_umbp_master_evict_strategy PRIVATE umbp_common
+                                                              gtest_main)
+add_test(NAME umbp_master_evict_strategy
+         COMMAND test_umbp_master_evict_strategy)
+
 # PageBitmapAllocator (peer-side per-tier page allocator primitive).
 add_executable(test_umbp_page_bitmap_allocator test_page_bitmap_allocator.cpp)
 target_link_libraries(test_umbp_page_bitmap_allocator PRIVATE umbp_common

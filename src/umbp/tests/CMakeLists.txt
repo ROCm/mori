@@ -132,6 +132,20 @@ target_compile_features(test_peer_ssd_eviction PRIVATE cxx_std_17)
 gtest_discover_tests(test_peer_ssd_eviction)
 
 # ---------------------------------------------------------------------------
+# test_ssd_evict_strategy — SSD eviction policy plug-in: default LRU behavior +
+# the PeerSsdManager DI seam (SelectVictims routes through the injected
+# strategy).
+# ---------------------------------------------------------------------------
+add_executable(test_ssd_evict_strategy test_ssd_evict_strategy.cpp)
+
+target_link_libraries(test_ssd_evict_strategy PRIVATE umbp_common
+                                                      GTest::gtest_main)
+
+target_compile_features(test_ssd_evict_strategy PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_ssd_evict_strategy)
+
+# ---------------------------------------------------------------------------
 # test_ssd_copy_pipeline — DramCopyPin + async copy-on-commit pipeline
 # ---------------------------------------------------------------------------
 add_executable(test_ssd_copy_pipeline test_ssd_copy_pipeline.cpp)

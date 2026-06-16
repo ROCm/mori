@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -34,6 +35,7 @@ namespace mori::umbp {
 
 class GlobalBlockIndex;
 class ClientRegistry;
+class MasterEvictStrategy;
 
 // Fire-and-forget callback for shipping EvictKey RPCs to a peer.  The
 // EvictionManager calls this once per (node_id, peer_address) group of
@@ -57,8 +59,15 @@ class EvictionManager {
   // logs intent but does not ship EvictKey RPCs (useful for routing-
   // only tests).  Master-server-side construction passes a concrete
   // MasterPeerStubPool here.
+  //
+  // `strategy` owns the victim-selection policy.  This is the single
+  // default-fallback site: when null the manager installs a
+  // LruMasterEvictStrategy (current behaviour).  Callers wanting a custom
+  // policy inject it here (MasterServer forwards MasterServerConfig::
+  // evict_strategy).
   EvictionManager(GlobalBlockIndex& index, ClientRegistry& registry, const EvictionConfig& config,
-                  EvictKeyDispatcher* dispatcher = nullptr);
+                  EvictKeyDispatcher* dispatcher = nullptr,
+                  std::unique_ptr<MasterEvictStrategy> strategy = nullptr);
   ~EvictionManager();
 
   EvictionManager(const EvictionManager&) = delete;
@@ -69,12 +78,17 @@ class EvictionManager {
 
  private:
   void EvictionLoop();
+
+  // One synchronous eviction pass: detect overloaded node-tiers, ask the
+  // strategy for victims, and dispatch EvictKey.  Driven by the Start()
+  // background timer loop.
   void RunOnce();
 
   GlobalBlockIndex& index_;
   ClientRegistry& registry_;
   EvictionConfig config_;
   EvictKeyDispatcher* dispatcher_;
+  std::unique_ptr<MasterEvictStrategy> strategy_;
   std::thread thread_;
   std::atomic<bool> running_{false};
   std::mutex cv_mutex_;
