@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "hip/hip_runtime.h"
+#include "mori/application/application_device_types.hpp"  // white-box: RdmaEndpointDevice (count QPs)
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/cco/cco.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -269,11 +270,11 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   //   FULL : (worldSize - 1) * qpsPerPe
   //   RAIL : (nNodes - 1) * qpsPerPe  (one peer per other node at same lsaRank)
   // On single-node (nNodes == 1), RAIL collapses to NONE: expected 0.
-  const int nNodes = comm->worldSize / comm->lsaSize;
-  const int qpsNone = CountQpsFor(dcNone, comm->worldSize);
-  const int qpsFull = CountQpsFor(dcFull, comm->worldSize);
-  const int qpsRail = CountQpsFor(dcRail, comm->worldSize);
-  const int expectedFull = (comm->worldSize - 1) * numQpPerPe;
+  const int nNodes = dcFull.worldSize / dcFull.lsaSize;
+  const int qpsNone = CountQpsFor(dcNone, dcFull.worldSize);
+  const int qpsFull = CountQpsFor(dcFull, dcFull.worldSize);
+  const int qpsRail = CountQpsFor(dcRail, dcFull.worldSize);
+  const int expectedFull = (dcFull.worldSize - 1) * numQpPerPe;
   const int expectedRail = (nNodes - 1) * numQpPerPe;
 
   bool ok = true;
@@ -291,7 +292,7 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     snprintf(r->detail, sizeof(r->detail),
              "alloc/register/devcomm OK; NONE=0 FULL=%d RAIL=%d (worldSize=%d lsaSize=%d "
              "nNodes=%d qpsPerPe=%d)",
-             qpsFull, qpsRail, comm->worldSize, comm->lsaSize, nNodes, numQpPerPe);
+             qpsFull, qpsRail, dcFull.worldSize, dcFull.lsaSize, nNodes, numQpPerPe);
   }
 
   printf("[rank %d] NONE=%d FULL=%d RAIL=%d (expected: 0 / %d / %d)\n", rank, qpsNone, qpsFull,

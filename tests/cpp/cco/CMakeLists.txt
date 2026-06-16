@@ -50,6 +50,11 @@ function(add_cco_test src)
       set_target_properties(${target} PROPERTIES HIP_ARCHITECTURES
                                                  "${GPU_TARGETS}")
     endif()
+    # Compile-time GDA provider dispatch (CCO_GDA_DISPATCH in cco_scale_out.hpp)
+    # keys off the auto-detected NIC; without this a BNXT/ionic host defaults to mlx5.
+    if(MORI_DEVICE_NIC_DEFINE)
+      target_compile_definitions(${target} PRIVATE ${MORI_DEVICE_NIC_DEFINE})
+    endif()
   else()
     set_source_files_properties(${src} PROPERTIES LANGUAGE CXX)
   endif()

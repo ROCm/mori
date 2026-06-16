@@ -45,7 +45,7 @@ static const size_t COUNT = 256;  // float elements per (peer, context) slice
 static const int NCTX = 4;        // GDA contexts == gdaContextCount == QPs/peer
 static const int ITERS = 8;       // DevComm create/destroy cycles
 
-static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::PSD;
+static constexpr mori::core::ProviderType kPrvdType = CCO_GDA_BUILD_PROVIDER;  // per-NIC build
 
 // All-to-all where each GDA context sends its own payload slice over its own QP.
 //

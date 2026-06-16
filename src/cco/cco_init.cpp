@@ -26,22 +26,45 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "hip/hip_runtime_api.h"
+#include "mori/application/application.hpp"  // Context, BootstrapNetwork
 #include "mori/application/bootstrap/local_bootstrap.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
+#include "mori/application/memory/va_manager.hpp"  // HeapVAManager
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
-#include "mori/cco/cco.hpp"
+#include "mori/cco/cco.hpp"  // public, self-contained (opaque ccoComm fwd-decl)
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace cco {
+
+// ccoProviderType is cco's self-contained copy of core::ProviderType; the cast
+// below relies on a 1:1 mapping, so guard it (this TU sees both enums).
+static_assert(static_cast<int>(CCO_PROVIDER_UNKNOWN) == static_cast<int>(core::ProviderType::Unknown),
+              "ccoProviderType drifted from core::ProviderType");
+static_assert(static_cast<int>(CCO_PROVIDER_MLX5) == static_cast<int>(core::ProviderType::MLX5),
+              "ccoProviderType drifted from core::ProviderType");
+static_assert(static_cast<int>(CCO_PROVIDER_BNXT) == static_cast<int>(core::ProviderType::BNXT),
+              "ccoProviderType drifted from core::ProviderType");
+static_assert(static_cast<int>(CCO_PROVIDER_PSD) == static_cast<int>(core::ProviderType::PSD),
+              "ccoProviderType drifted from core::ProviderType");
+static_assert(static_cast<int>(CCO_PROVIDER_IBVERBS) == static_cast<int>(core::ProviderType::IBVERBS),
+              "ccoProviderType drifted from core::ProviderType");
+
+// Out-of-line dtor for the unique_ptr<HeapVAManager> member: ccoComm is defined
+// in cco.hpp with HeapVAManager only forward-declared, so its destruction must
+// be emitted here where HeapVAManager (va_manager.hpp) is complete.
+ccoComm::~ccoComm() = default;
 
 static size_t AlignUp(size_t x, size_t align) { return (x + align - 1) & ~(align - 1); }
 
@@ -959,11 +982,11 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       epsHost[i].wqHandle = newEps[i].wqHandle;
       epsHost[i].cqHandle = newEps[i].cqHandle;
       epsHost[i].atomicIbuf = newEps[i].atomicIbuf;
-      // Resolve the GDA backend provider from the first connected endpoint
-      // (empty slots for peers without a QP keep vendorId==Unknown).
-      if (ibgda.providerType == core::ProviderType::Unknown) {
+      // Cache the GDA provider from the first connected endpoint (empty peer
+      // slots keep vendorId==Unknown) as an informational parameter on the comm.
+      if (comm->providerType == CCO_PROVIDER_UNKNOWN) {
         core::ProviderType p = epsHost[i].GetProviderType();
-        if (p != core::ProviderType::Unknown) ibgda.providerType = p;
+        if (p != core::ProviderType::Unknown) comm->providerType = static_cast<ccoProviderType>(p);
       }
     }
 
