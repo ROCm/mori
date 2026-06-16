@@ -38,35 +38,35 @@ extern "C" {
 namespace mori {
 namespace core {
 
-// BNXT request status -> ibv_wc_status (uses bnxt_re_hsi.h, included above).
-static __device__ __host__ enum ibv_wc_status BnxtHandleErrorCqe(int status) {
+// BNXT request status -> WcStatus (uses bnxt_re_hsi.h, included above).
+static __device__ __host__ WcStatus BnxtHandleErrorCqe(int status) {
   switch (status) {
     case BNXT_RE_REQ_ST_OK:
-      return IBV_WC_SUCCESS;
+      return WC_SUCCESS;
     case BNXT_RE_REQ_ST_BAD_RESP:
-      return IBV_WC_BAD_RESP_ERR;
+      return WC_BAD_RESP_ERR;
     case BNXT_RE_REQ_ST_LOC_LEN:
-      return IBV_WC_LOC_LEN_ERR;
+      return WC_LOC_LEN_ERR;
     case BNXT_RE_REQ_ST_LOC_QP_OP:
-      return IBV_WC_LOC_QP_OP_ERR;
+      return WC_LOC_QP_OP_ERR;
     case BNXT_RE_REQ_ST_PROT:
-      return IBV_WC_LOC_PROT_ERR;
+      return WC_LOC_PROT_ERR;
     case BNXT_RE_REQ_ST_MEM_OP:
-      return IBV_WC_LOC_ACCESS_ERR;
+      return WC_LOC_ACCESS_ERR;
     case BNXT_RE_REQ_ST_REM_INVAL:
-      return IBV_WC_REM_INV_REQ_ERR;
+      return WC_REM_INV_REQ_ERR;
     case BNXT_RE_REQ_ST_REM_ACC:
-      return IBV_WC_REM_ACCESS_ERR;
+      return WC_REM_ACCESS_ERR;
     case BNXT_RE_REQ_ST_REM_OP:
-      return IBV_WC_REM_OP_ERR;
+      return WC_REM_OP_ERR;
     case BNXT_RE_REQ_ST_RNR_NAK_XCED:
-      return IBV_WC_RNR_RETRY_EXC_ERR;
+      return WC_RNR_RETRY_EXC_ERR;
     case BNXT_RE_REQ_ST_TRNSP_XCED:
-      return IBV_WC_RETRY_EXC_ERR;
+      return WC_RETRY_EXC_ERR;
     case BNXT_RE_REQ_ST_WR_FLUSH:
-      return IBV_WC_WR_FLUSH_ERR;
+      return WC_WR_FLUSH_ERR;
     default:
-      return IBV_WC_GENERAL_ERR;
+      return WC_GENERAL_ERR;
   }
 }
 

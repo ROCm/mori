@@ -361,7 +361,7 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
     if (opcode == MLX5_CQE_REQ_ERR || opcode == MLX5_CQE_RESP_ERR) {
       auto error = core::Mlx5HandleErrorCqe(reinterpret_cast<mlx5_err_cqe*>(cq.cqAddr));
       MORI_PRINTF("(%s:%d) collapsed CQE error: %s\n", __FILE__, __LINE__,
-                  core::IbvWcStatusString(error));
+                  core::WcStatusString(error));
       assert(false);
       return;
     }

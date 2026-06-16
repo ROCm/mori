@@ -25,42 +25,41 @@
 // (Mlx5/Bnxt/IonicHandleErrorCqe) live in their own provider device headers so
 // this header — included by every provider — stays free of mlx5dv.h and the
 // per-provider firmware headers.
-#include "infiniband/verbs.h"                          // ibv_wc_status
-#include "mori/core/transport/rdma/core_device_types.hpp"  // atomicType
-#include "mori/hip_compat.hpp"                          // __device__ / __host__
+#include "mori/core/transport/rdma/core_device_types.hpp"  // WcStatus, atomicType
+#include "mori/hip_compat.hpp"                              // __device__ / __host__
 
 namespace mori {
 namespace core {
 
-static __device__ __host__ const char* IbvWcStatusString(enum ibv_wc_status status) {
+static __device__ __host__ const char* WcStatusString(WcStatus status) {
   static const char* const wc_status_str[] = {
-      /* IBV_WC_SUCCESS*/ "success",
-      /* IBV_WC_LOC_LEN_ERR*/ "local length error",
-      /* IBV_WC_LOC_QP_OP_ERR*/ "local QP operation error",
-      /* IBV_WC_LOC_EEC_OP_ERR*/ "local EE context operation error",
-      /* IBV_WC_LOC_PROT_ERR*/ "local protection error",
-      /* IBV_WC_WR_FLUSH_ERR*/ "Work Request Flushed Error",
-      /* IBV_WC_MW_BIND_ERR*/ "memory management operation error",
-      /* IBV_WC_BAD_RESP_ERR*/ "bad response error",
-      /* IBV_WC_LOC_ACCESS_ERR*/ "local access error",
-      /* IBV_WC_REM_INV_REQ_ERR*/ "remote invalid request error",
-      /* IBV_WC_REM_ACCESS_ERR*/ "remote access error",
-      /* IBV_WC_REM_OP_ERR*/ "remote operation error",
-      /* IBV_WC_RETRY_EXC_ERR*/ "transport retry counter exceeded",
-      /* IBV_WC_RNR_RETRY_EXC_ERR*/ "RNR retry counter exceeded",
-      /* IBV_WC_LOC_RDD_VIOL_ERR*/ "local RDD violation error",
-      /* IBV_WC_REM_INV_RD_REQ_ERR*/ "remote invalid RD request",
-      /* IBV_WC_REM_ABORT_ERR*/ "aborted error",
-      /* IBV_WC_INV_EECN_ERR*/ "invalid EE context number",
-      /* IBV_WC_INV_EEC_STATE_ERR*/ "invalid EE context state",
-      /* IBV_WC_FATAL_ERR*/ "fatal error",
-      /* IBV_WC_RESP_TIMEOUT_ERR*/ "response timeout error",
-      /* IBV_WC_GENERAL_ERR*/ "general error",
-      /* IBV_WC_TM_ERR*/ "TM error",
-      /* IBV_WC_TM_RNDV_INCOMPLETE*/ "TM software rendezvous",
+      /* WC_SUCCESS*/ "success",
+      /* WC_LOC_LEN_ERR*/ "local length error",
+      /* WC_LOC_QP_OP_ERR*/ "local QP operation error",
+      /* WC_LOC_EEC_OP_ERR*/ "local EE context operation error",
+      /* WC_LOC_PROT_ERR*/ "local protection error",
+      /* WC_WR_FLUSH_ERR*/ "Work Request Flushed Error",
+      /* WC_MW_BIND_ERR*/ "memory management operation error",
+      /* WC_BAD_RESP_ERR*/ "bad response error",
+      /* WC_LOC_ACCESS_ERR*/ "local access error",
+      /* WC_REM_INV_REQ_ERR*/ "remote invalid request error",
+      /* WC_REM_ACCESS_ERR*/ "remote access error",
+      /* WC_REM_OP_ERR*/ "remote operation error",
+      /* WC_RETRY_EXC_ERR*/ "transport retry counter exceeded",
+      /* WC_RNR_RETRY_EXC_ERR*/ "RNR retry counter exceeded",
+      /* WC_LOC_RDD_VIOL_ERR*/ "local RDD violation error",
+      /* WC_REM_INV_RD_REQ_ERR*/ "remote invalid RD request",
+      /* WC_REM_ABORT_ERR*/ "aborted error",
+      /* WC_INV_EECN_ERR*/ "invalid EE context number",
+      /* WC_INV_EEC_STATE_ERR*/ "invalid EE context state",
+      /* WC_FATAL_ERR*/ "fatal error",
+      /* WC_RESP_TIMEOUT_ERR*/ "response timeout error",
+      /* WC_GENERAL_ERR*/ "general error",
+      /* WC_TM_ERR*/ "TM error",
+      /* WC_TM_RNDV_INCOMPLETE*/ "TM software rendezvous",
   };
 
-  if (status < IBV_WC_SUCCESS || status > IBV_WC_TM_RNDV_INCOMPLETE) return "unknown";
+  if (status < WC_SUCCESS || status > WC_TM_RNDV_INCOMPLETE) return "unknown";
 
   return wc_status_str[status];
 }
