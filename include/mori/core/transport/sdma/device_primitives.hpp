@@ -21,11 +21,10 @@
 // SOFTWARE.
 #pragma once
 
-#include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
-#include <hip/hip_runtime_api.h>
 
-#include "mori/application/transport/sdma/anvil_device.hpp"
+#include "mori/core/transport/sdma/anvil_device.hpp"
+#include "mori/core/utils.hpp"  // warpSize
 
 namespace mori {
 namespace core {

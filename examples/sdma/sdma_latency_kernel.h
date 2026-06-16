@@ -33,7 +33,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
-#include "mori/application/transport/sdma/anvil_device.hpp"
+#include "mori/core/transport/sdma/anvil_device.hpp"
 #include "timestamp_handle.hpp"
 
 template <typename T, bool TIMESTAMPING_EN>

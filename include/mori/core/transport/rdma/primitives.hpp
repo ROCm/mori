@@ -22,7 +22,6 @@
 #pragma once
 
 #include "infiniband/verbs.h"
-#include "mori/core/transport/rdma/core_device_types.hpp"
 
 namespace mori {
 namespace core {

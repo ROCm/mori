@@ -22,6 +22,11 @@
 #pragma once
 
 #include <execinfo.h>
+
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <hip/hip_runtime_api.h>
 #include <unistd.h>
 

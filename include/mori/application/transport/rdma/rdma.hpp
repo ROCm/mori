@@ -25,7 +25,9 @@
 // so that device (HIP/CUDA) compilation units can use them without ibverbs/STL dependencies.
 #include <unistd.h>
 
+#include <algorithm>
 #include <cassert>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <sstream>

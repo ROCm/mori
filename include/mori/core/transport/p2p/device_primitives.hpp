@@ -25,7 +25,7 @@
 #include <hip/hip_fp8.h>
 
 #include <algorithm>
-#include <cmath>
+#include <cassert>
 #include <cstdint>
 #include <type_traits>
 

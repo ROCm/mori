@@ -21,123 +21,16 @@
 // SOFTWARE.
 #pragma once
 
-#include <iostream>
-#include <string>
-
-#include "infiniband/mlx5dv.h"
-#include "mori/core/transport/rdma/primitives.hpp"
-#include "mori/core/utils.hpp"
-#include "mori/hip_compat.hpp"
-#if defined(__HIPCC__) || defined(__CUDACC__)
-#include "mori/core/transport/rdma/device_primitives.hpp"
-#endif
-
-extern "C" {
-#include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
-}
-#include "mori/core/transport/rdma/providers/ionic/ionic_dv.h"
-#include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
+// Provider-agnostic RDMA helpers only. Provider-specific CQE error decoders
+// (Mlx5/Bnxt/IonicHandleErrorCqe) live in their own provider device headers so
+// this header — included by every provider — stays free of mlx5dv.h and the
+// per-provider firmware headers.
+#include "infiniband/verbs.h"                          // ibv_wc_status
+#include "mori/core/transport/rdma/core_device_types.hpp"  // atomicType
+#include "mori/hip_compat.hpp"                          // __device__ / __host__
 
 namespace mori {
 namespace core {
-
-static __device__ __host__ enum ibv_wc_status Mlx5HandleErrorCqe(struct mlx5_err_cqe* cqe) {
-  switch (cqe->syndrome) {
-    case MLX5_CQE_SYNDROME_LOCAL_LENGTH_ERR:
-      return IBV_WC_LOC_LEN_ERR;
-    case MLX5_CQE_SYNDROME_LOCAL_QP_OP_ERR:
-      return IBV_WC_LOC_QP_OP_ERR;
-    case MLX5_CQE_SYNDROME_LOCAL_PROT_ERR:
-      return IBV_WC_LOC_PROT_ERR;
-    case MLX5_CQE_SYNDROME_WR_FLUSH_ERR:
-      return IBV_WC_WR_FLUSH_ERR;
-    case MLX5_CQE_SYNDROME_MW_BIND_ERR:
-      return IBV_WC_MW_BIND_ERR;
-    case MLX5_CQE_SYNDROME_BAD_RESP_ERR:
-      return IBV_WC_BAD_RESP_ERR;
-    case MLX5_CQE_SYNDROME_LOCAL_ACCESS_ERR:
-      return IBV_WC_LOC_ACCESS_ERR;
-    case MLX5_CQE_SYNDROME_REMOTE_INVAL_REQ_ERR:
-      return IBV_WC_REM_INV_REQ_ERR;
-    case MLX5_CQE_SYNDROME_REMOTE_ACCESS_ERR:
-      return IBV_WC_REM_ACCESS_ERR;
-    case MLX5_CQE_SYNDROME_REMOTE_OP_ERR:
-      return IBV_WC_REM_OP_ERR;
-    case MLX5_CQE_SYNDROME_TRANSPORT_RETRY_EXC_ERR:
-      return IBV_WC_RETRY_EXC_ERR;
-    case MLX5_CQE_SYNDROME_RNR_RETRY_EXC_ERR:
-      return IBV_WC_RNR_RETRY_EXC_ERR;
-    case MLX5_CQE_SYNDROME_REMOTE_ABORTED_ERR:
-      return IBV_WC_REM_ABORT_ERR;
-    default:
-      return IBV_WC_GENERAL_ERR;
-  }
-}
-
-static __device__ __host__ enum ibv_wc_status BnxtHandleErrorCqe(int status) {
-  switch (status) {
-    case BNXT_RE_REQ_ST_OK:
-      return IBV_WC_SUCCESS;
-    case BNXT_RE_REQ_ST_BAD_RESP:
-      return IBV_WC_BAD_RESP_ERR;
-    case BNXT_RE_REQ_ST_LOC_LEN:
-      return IBV_WC_LOC_LEN_ERR;
-    case BNXT_RE_REQ_ST_LOC_QP_OP:
-      return IBV_WC_LOC_QP_OP_ERR;
-    case BNXT_RE_REQ_ST_PROT:
-      return IBV_WC_LOC_PROT_ERR;
-    case BNXT_RE_REQ_ST_MEM_OP:
-      return IBV_WC_LOC_ACCESS_ERR;
-    case BNXT_RE_REQ_ST_REM_INVAL:
-      return IBV_WC_REM_INV_REQ_ERR;
-    case BNXT_RE_REQ_ST_REM_ACC:
-      return IBV_WC_REM_ACCESS_ERR;
-    case BNXT_RE_REQ_ST_REM_OP:
-      return IBV_WC_REM_OP_ERR;
-    case BNXT_RE_REQ_ST_RNR_NAK_XCED:
-      return IBV_WC_RNR_RETRY_EXC_ERR;
-    case BNXT_RE_REQ_ST_TRNSP_XCED:
-      return IBV_WC_RETRY_EXC_ERR;
-    case BNXT_RE_REQ_ST_WR_FLUSH:
-      return IBV_WC_WR_FLUSH_ERR;
-    default:
-      return IBV_WC_GENERAL_ERR;
-  }
-}
-
-static __device__ __host__ enum ibv_wc_status IonicHandleErrorCqe(int status) {
-  switch (status) {
-    case IONIC_STS_OK:
-      return IBV_WC_SUCCESS;
-    case IONIC_STS_LOCAL_LEN_ERR:
-      return IBV_WC_LOC_LEN_ERR;
-    case IONIC_STS_LOCAL_QP_OPER_ERR:
-      return IBV_WC_LOC_QP_OP_ERR;
-    case IONIC_STS_LOCAL_PROT_ERR:
-      return IBV_WC_LOC_PROT_ERR;
-    case IONIC_STS_WQE_FLUSHED_ERR:
-      return IBV_WC_WR_FLUSH_ERR;
-    case IONIC_STS_MEM_MGMT_OPER_ERR:
-      return IBV_WC_MW_BIND_ERR;
-    case IONIC_STS_BAD_RESP_ERR:
-      return IBV_WC_BAD_RESP_ERR;
-    case IONIC_STS_LOCAL_ACC_ERR:
-      return IBV_WC_LOC_ACCESS_ERR;
-    case IONIC_STS_REMOTE_INV_REQ_ERR:
-      return IBV_WC_REM_INV_REQ_ERR;
-    case IONIC_STS_REMOTE_ACC_ERR:
-      return IBV_WC_REM_ACCESS_ERR;
-    case IONIC_STS_REMOTE_OPER_ERR:
-      return IBV_WC_REM_OP_ERR;
-    case IONIC_STS_RETRY_EXCEEDED:
-      return IBV_WC_RETRY_EXC_ERR;
-    case IONIC_STS_RNR_RETRY_EXCEEDED:
-      return IBV_WC_RNR_RETRY_EXC_ERR;
-    case IONIC_STS_XRC_VIO_ERR:
-    default:
-      return IBV_WC_GENERAL_ERR;
-  }
-}
 
 static __device__ __host__ const char* IbvWcStatusString(enum ibv_wc_status status) {
   static const char* const wc_status_str[] = {
@@ -172,39 +65,7 @@ static __device__ __host__ const char* IbvWcStatusString(enum ibv_wc_status stat
   return wc_status_str[status];
 }
 
-// TODO: write a better verison
-static __device__ __host__ void DumpMlx5Wqe(void* wqeBaseAddr, uint32_t idx) {
-  uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(wqeBaseAddr) + (idx << MLX5_SEND_WQE_SHIFT);
-  mlx5_wqe_ctrl_seg* wqeCtrlSeg = reinterpret_cast<mlx5_wqe_ctrl_seg*>(wqeAddr);
-  uint32_t opmodIdxOpCode = BE32TOH(wqeCtrlSeg->opmod_idx_opcode);
-  uint32_t opcode = opmodIdxOpCode & 0xFF;
-  uint32_t wqeIdx = (opmodIdxOpCode >> 8) & 0xFFFF;
-  uint32_t opmod = (opmodIdxOpCode >> 24) & 0xFF;
-
-  mlx5_wqe_data_seg* wqeDataSeg = reinterpret_cast<mlx5_wqe_data_seg*>(
-      wqeAddr + sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg));
-  uint32_t bytes = BE32TOH(wqeDataSeg->byte_count);
-  MORI_PRINTF("Wqe: opcode = 0x%02x, wqeIdx = %u, opmod = 0x%02x bytes %d\n", opcode, wqeIdx, opmod,
-              bytes);
-}
-
 static __device__ __host__ uint32_t get_num_wqes_in_atomic(atomicType amo_op, uint32_t bytes) {
-  // if (bytes == 8) {
-  //   // RC
-  //   switch (amo_op) {
-  //     case AMO_SIGNAL:
-  //     case AMO_SIGNAL_SET:
-  //     case AMO_SWAP:
-  //     case AMO_SET:
-  //     case AMO_FETCH_AND:
-  //     case AMO_AND:
-  //     case AMO_FETCH_OR:
-  //     case AMO_OR:
-  //       return 2;
-  //     default:
-  //       break;
-  //   }
-  // }
   return 1;
 }
 

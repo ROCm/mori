@@ -58,7 +58,6 @@ int ShmemInit(application::BootstrapNetwork* bootNet);
 int ShmemInit();  // Default initialization using MPI_COMM_WORLD
 int ShmemMpiInit(MPI_Comm);
 #endif
-int ShmemTorchProcessGroupInit(const std::string& groupName);
 
 // UniqueId-based initialization APIs (nvshmem/rocshmem compatible)
 int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid);

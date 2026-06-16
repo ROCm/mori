@@ -24,6 +24,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cassert>
+#include <cstdint>
 
 #include "infiniband/mlx5dv.h"
 #include "mori/core/transport/rdma/device_primitives.hpp"
@@ -33,6 +34,56 @@
 
 namespace mori {
 namespace core {
+
+// MLX5 CQE syndrome -> ibv_wc_status (uses mlx5dv.h, included above).
+static __device__ __host__ enum ibv_wc_status Mlx5HandleErrorCqe(struct mlx5_err_cqe* cqe) {
+  switch (cqe->syndrome) {
+    case MLX5_CQE_SYNDROME_LOCAL_LENGTH_ERR:
+      return IBV_WC_LOC_LEN_ERR;
+    case MLX5_CQE_SYNDROME_LOCAL_QP_OP_ERR:
+      return IBV_WC_LOC_QP_OP_ERR;
+    case MLX5_CQE_SYNDROME_LOCAL_PROT_ERR:
+      return IBV_WC_LOC_PROT_ERR;
+    case MLX5_CQE_SYNDROME_WR_FLUSH_ERR:
+      return IBV_WC_WR_FLUSH_ERR;
+    case MLX5_CQE_SYNDROME_MW_BIND_ERR:
+      return IBV_WC_MW_BIND_ERR;
+    case MLX5_CQE_SYNDROME_BAD_RESP_ERR:
+      return IBV_WC_BAD_RESP_ERR;
+    case MLX5_CQE_SYNDROME_LOCAL_ACCESS_ERR:
+      return IBV_WC_LOC_ACCESS_ERR;
+    case MLX5_CQE_SYNDROME_REMOTE_INVAL_REQ_ERR:
+      return IBV_WC_REM_INV_REQ_ERR;
+    case MLX5_CQE_SYNDROME_REMOTE_ACCESS_ERR:
+      return IBV_WC_REM_ACCESS_ERR;
+    case MLX5_CQE_SYNDROME_REMOTE_OP_ERR:
+      return IBV_WC_REM_OP_ERR;
+    case MLX5_CQE_SYNDROME_TRANSPORT_RETRY_EXC_ERR:
+      return IBV_WC_RETRY_EXC_ERR;
+    case MLX5_CQE_SYNDROME_RNR_RETRY_EXC_ERR:
+      return IBV_WC_RNR_RETRY_EXC_ERR;
+    case MLX5_CQE_SYNDROME_REMOTE_ABORTED_ERR:
+      return IBV_WC_REM_ABORT_ERR;
+    default:
+      return IBV_WC_GENERAL_ERR;
+  }
+}
+
+// TODO: write a better version
+static __device__ __host__ void DumpMlx5Wqe(void* wqeBaseAddr, uint32_t idx) {
+  uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(wqeBaseAddr) + (idx << MLX5_SEND_WQE_SHIFT);
+  mlx5_wqe_ctrl_seg* wqeCtrlSeg = reinterpret_cast<mlx5_wqe_ctrl_seg*>(wqeAddr);
+  uint32_t opmodIdxOpCode = BE32TOH(wqeCtrlSeg->opmod_idx_opcode);
+  uint32_t opcode = opmodIdxOpCode & 0xFF;
+  uint32_t wqeIdx = (opmodIdxOpCode >> 8) & 0xFFFF;
+  uint32_t opmod = (opmodIdxOpCode >> 24) & 0xFF;
+
+  mlx5_wqe_data_seg* wqeDataSeg = reinterpret_cast<mlx5_wqe_data_seg*>(
+      wqeAddr + sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg));
+  uint32_t bytes = BE32TOH(wqeDataSeg->byte_count);
+  MORI_PRINTF("Wqe: opcode = 0x%02x, wqeIdx = %u, opmod = 0x%02x bytes %d\n", opcode, wqeIdx, opmod,
+              bytes);
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Post Tasks                                           */

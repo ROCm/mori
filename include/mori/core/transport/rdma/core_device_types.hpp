@@ -25,6 +25,7 @@
 // Safe to include from both host and device (HIP/CUDA) compilation units.
 #pragma once
 
+#include <endian.h>  // BYTE_ORDER / LITTLE_ENDIAN / BIG_ENDIAN
 #include <limits.h>
 #include <stdint.h>
 

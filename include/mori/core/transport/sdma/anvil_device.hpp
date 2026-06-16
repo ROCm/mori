@@ -28,9 +28,7 @@
  */
 #pragma once
 
-#include <hip/hip_ext.h>
-#include <hip/hip_runtime_api.h>
-#include <stdint.h>  // Required for uint32_t
+#include <stdint.h>  // uint32_t / uint64_t
 
 #include <cassert>
 
@@ -40,7 +38,8 @@
 #include "mori/hip_compat.hpp"
 #endif
 
-#include "hsakmt/hsakmt.h"
+// Only the device-safe type/enum subset is needed (HSAuint64, HSA_QUEUE_PRIORITY*);
+// the host KFD driver API (hsakmt.h) belongs to the host anvil.hpp, not here.
 #include "hsakmt/hsakmttypes.h"
 #include "sdma_pkt_struct.h"
 

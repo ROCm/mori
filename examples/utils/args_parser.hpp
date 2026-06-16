@@ -32,7 +32,7 @@
 #include <string>
 
 #include "common_utils.hpp"
-#include "mori/core/transport/rdma/primitives.hpp"
+#include "mori/core/transport/rdma/core_device_types.hpp"  // atomicType
 
 using namespace mori::core;
 
