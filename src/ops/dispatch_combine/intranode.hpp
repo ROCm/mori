@@ -285,11 +285,25 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
   int warpGroupId = globalWarpId / kWarpsPerGroup;
   int warpGroupNum = globalWarpNum / kWarpsPerGroup;
 
-  // clear shared memory
-  if (inGroupWarpId == 0 && laneId == 0) {
-    groupData[warpGroupIdInBlock] = 0;
-    groupCounters[warpGroupIdInBlock] = kWarpsPerGroup - 1;
+  // Rotate header warp selection so that headers spread evenly across all 4 SIMD units.
+  constexpr int kNumSimds = 4;
+  int headerWarpIdx;
+  if constexpr (kWarpsPerGroup >= kNumSimds) {
+    // Each group spans all SIMDs; pick directly.
+    headerWarpIdx = warpGroupIdInBlock % kNumSimds;
+  } else {
+    // Each group spans fewer SIMDs than available; stagger across groups.
+    // k=2: groups {0,1}→h=0, {2,3}→h=1 → SIMDs {0,2,1,3}.
+    headerWarpIdx = (warpGroupIdInBlock / (kNumSimds / kWarpsPerGroup)) % kWarpsPerGroup;
   }
+  bool isHeaderWarp = (inGroupWarpId == headerWarpIdx);
+
+  // clear shared memory
+  if (warpId == 0 && laneId < kMaxWarpGroups) {
+    groupData[laneId] = 0;
+    groupCounters[laneId] = kWarpsPerGroup - 1;
+  }
+
   __syncthreads();
 
   // Hidden dim split for each warp in group
@@ -308,11 +322,13 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
 
   if (args.tokenIndices && args.inpTokenBuf) {
     // Phase1: send token
-    // Each warp-group (4 warps) processes one token-expert pair
+    // Each warp-group processes one token-expert pair
     for (int i = warpGroupId; i < args.curRankNumToken * config.numExpertPerToken;
          i += warpGroupNum) {
       index_t srcTokId = i / config.numExpertPerToken;
       index_t destExpert = args.tokenIndices[i];
+      index_t tokExpert = args.tokenIndices[srcTokId * config.numExpertPerToken +
+                                            laneId % config.numExpertPerToken];
       index_t destPe = destExpert / config.numExpertPerRank;
       index_t destTokId = 0;
 
@@ -323,27 +339,25 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
       assert(config.numExpertPerToken < warpSize);
       int condition = 0;
       if (laneId < (i % config.numExpertPerToken)) {
-        condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
-                               config.numExpertPerRank);
+        condition = destPe == (tokExpert / config.numExpertPerRank);
       }
       if (__any(condition)) {
         // All 4 warps skip together, only warp 0 writes the skip marker
-        if (inGroupWarpId == 0 && laneId == 0) {
+        if (!isHeaderWarp && laneId == 0) {
           args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
         }
         continue;
       }
 
-      // prefetch remote addr
-      auto dispatchOut = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe);
+      T* dispatchOut = nullptr;
 
       // Header Warp: atomic allocation + notify via shared memory
-      if (inGroupWarpId == 0) {
+      if (isHeaderWarp) {
         if (laneId == 0) {
           // Atomic allocation
           destTokId = atomicAdd(dispTokOffset, 1);
           assert(destTokId < config.MaxNumTokensToRecv() &&
-                 "Total recv token overflow: increase maxTotalRecvTokens");
+                 "total recv token overflow: increase maxTotalRecvTokens");
 
           // Wait for all consumers done (counter == N-1), then set to 0
           while (atomicCAS(&groupCounters[warpGroupIdInBlock], kWarpsPerGroup - 1, 0) !=
@@ -361,6 +375,9 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
         }
         destTokId = __shfl(destTokId, 0);
 
+        // prefetch remote addr
+        dispatchOut = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe);
+
         // Write weights and indices: only warp 0 writes
         if (laneId < config.numExpertPerToken) {
           if (args.weightsBuf) {
@@ -373,8 +390,10 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
               args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
         }
       } else {
-        // Normal Warps: spin wait for iteration match, then consume
-        // Only lane 0 spins, then broadcast to other lanes
+        // prefetch remote addr
+        dispatchOut = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe);
+        // normal Warps: spin wait for iteration match, then consume
+        // only lane 0 spins, then broadcast to other lanes
         if (laneId == 0) {
           uint64_t val;
           do {
@@ -393,8 +412,9 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
       size_t srcTokOffset = srcTokId * hiddenDim;
       size_t destTokOffset = destTokId * hiddenDim;
 
-      core::WarpCopy<T, 2>(dispatchOut + destTokOffset + warpDimOffset,
-                           args.inpTokenBuf + srcTokOffset + warpDimOffset, warpDimChunk);
+      constexpr int unroll_num = std::is_same_v<T, hip_bfloat16> ? 4 : 2;
+      core::WarpCopy<T, unroll_num>(dispatchOut + destTokOffset + warpDimOffset,
+                                    args.inpTokenBuf + srcTokOffset + warpDimOffset, warpDimChunk);
 
       // Write scales: split across 4 warps
       if (hasScales) {
