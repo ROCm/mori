@@ -39,26 +39,36 @@
 namespace mori::cco::benchmark {
 
 // LSA: each block reads its chunk from the peer's send window into the local
-// recv window.
-__global__ void lsa_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
-                           int peerLsa, int iter, int lanes) {
+// recv window. Scope semantics aligned with shmem (see p2p_put_bw): all block
+// threads participate; scope_size only sets the copy cooperation granularity
+// (block=whole block, warp=one wavefront, thread=one thread per contiguous
+// segment).
+__global__ void lsa_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
+                           volatile unsigned int* counter_d, size_t len_doubles, int peerLsa,
+                           int iter, int scope_size) {
   const int bid = blockIdx.x;
   const int nblocks = gridDim.x;
   const int tid = linear_tid();
-  if (tid >= lanes) return;
+  const int nthreads = blockDim.x * blockDim.y * blockDim.z;
 
   const size_t chunk = len_doubles / static_cast<size_t>(nblocks);
-  const size_t off_bytes = static_cast<size_t>(bid) * chunk * sizeof(double);
+  const int nunits = nthreads / scope_size;
+  const int unit = tid / scope_size;
+  const int lane = tid % scope_size;
+  const size_t per_unit = chunk / static_cast<size_t>(nunits);
 
+  const size_t off_bytes =
+      (static_cast<size_t>(bid) * chunk + static_cast<size_t>(unit) * per_unit) * sizeof(double);
   const double* src =
       reinterpret_cast<const double*>(ccoGetLsaPeerPtr(sendWin, peerLsa, off_bytes));
   double* dst = reinterpret_cast<double*>(ccoGetLocalPtr(recvWin, off_bytes));
 
   for (int i = 0; i < iter; i++) {
-    lsa_copy_strided(dst, src, chunk, tid, lanes);
-    // Per-iteration system fence — see p2p_put_bw for the cache-absorption
-    // rationale (repeated same-region traffic otherwise measures cache BW).
+    lsa_copy_strided(dst, src, per_unit, lane, scope_size);
+    // System fence + per-round all-block barrier (mirrors shmem) — see
+    // p2p_put_bw for the cache-absorption + fair-comparison rationale.
     __threadfence_system();
+    bw_cross_block_barrier_round(counter_d, nblocks, i);
   }
 }
 
@@ -96,13 +106,13 @@ __global__ void ibgda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 }
 
 static void launch_lsa(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,
-                       ccoWindow_t recvWin, size_t len_doubles, int peerLsa, int count,
-                       int warp_size) {
-  int lanes = block.x;
-  if (scope == PutScope::kWarp) lanes = warp_size;
-  if (scope == PutScope::kThread) lanes = 1;
-  hipLaunchKernelGGL(lsa_get_bw, grid, block, 0, 0, sendWin, recvWin, len_doubles, peerLsa, count,
-                     lanes);
+                       ccoWindow_t recvWin, unsigned int* counter_d, size_t len_doubles,
+                       int peerLsa, int count, int warp_size) {
+  int scope_size = block.x;
+  if (scope == PutScope::kWarp) scope_size = warp_size;
+  if (scope == PutScope::kThread) scope_size = 1;
+  hipLaunchKernelGGL(lsa_get_bw, grid, block, 0, 0, sendWin, recvWin, counter_d, len_doubles,
+                     peerLsa, count, scope_size);
 }
 
 template <core::ProviderType PrvdType>
@@ -168,8 +178,8 @@ int main(int argc, char** argv) {
     if (run_kernels) {
       const float ms = RunWarmupAndTimed(res, args.warmup, args.iters, [&](int count) {
         if (args.transport == Transport::kLsa) {
-          launch_lsa(args.put_scope, grid, block, ctx.send_win, ctx.recv_win, len_doubles,
-                     ctx.peer_lsa_rank, count, ctx.device_warp_size);
+          launch_lsa(args.put_scope, grid, block, ctx.send_win, ctx.recv_win, res.counter_d,
+                     len_doubles, ctx.peer_lsa_rank, count, ctx.device_warp_size);
         } else {
           CCO_GDA_DISPATCH(launch_ibgda<P>(args.put_scope, grid, block, ctx.send_win, ctx.recv_win,
                                            len_doubles, ctx.devComm, count));

@@ -40,31 +40,48 @@
 
 namespace mori::cco::benchmark {
 
-// ── LSA: flat-VA store loop. Each block copies its chunk into the peer's recv
-// window. `lanes`/`lane0` select how many threads of the block participate
-// (block: all, warp: first warp, thread: thread 0). ──
-__global__ void lsa_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
-                           int peerLsa, int iter, int lanes) {
+// ── LSA: flat-VA store loop, scope semantics aligned with shmem's bw_block /
+// bw_warp / bw_thread. ALL block threads always participate; `scope_size` only
+// changes the cooperation granularity of the copy:
+//   block  scope_size=blockDim → 1 unit, whole block strides the whole chunk
+//   warp   scope_size=warpSize → nwarps units, each warp strides its sub-segment
+//   thread scope_size=1        → blockDim units, each thread copies its own
+//                                contiguous 1/blockDim segment
+// This mirrors ShmemPutMemNbi{Block,Warp,Thread}: same thread count, finer
+// per-unit segments — thread scope is slower because each thread does a small
+// contiguous copy (no wide striding), not because fewer threads participate. ──
+__global__ void lsa_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
+                           volatile unsigned int* counter_d, size_t len_doubles, int peerLsa,
+                           int iter, int scope_size) {
   const int bid = blockIdx.x;
   const int nblocks = gridDim.x;
   const int tid = linear_tid();
-  if (tid >= lanes) return;
+  const int nthreads = blockDim.x * blockDim.y * blockDim.z;
 
   const size_t chunk = len_doubles / static_cast<size_t>(nblocks);
-  const size_t off_bytes = static_cast<size_t>(bid) * chunk * sizeof(double);
+  // Cooperation unit this thread belongs to, and its lane within the unit.
+  const int nunits = nthreads / scope_size;
+  const int unit = tid / scope_size;
+  const int lane = tid % scope_size;
+  const size_t per_unit = chunk / static_cast<size_t>(nunits);
 
+  const size_t off_bytes =
+      (static_cast<size_t>(bid) * chunk + static_cast<size_t>(unit) * per_unit) * sizeof(double);
   double* dst = reinterpret_cast<double*>(ccoGetLsaPeerPtr(recvWin, peerLsa, off_bytes));
   const double* src = reinterpret_cast<const double*>(ccoGetLocalPtr(sendWin, off_bytes));
 
   for (int i = 0; i < iter; i++) {
-    lsa_copy_strided(dst, src, chunk, tid, lanes);
-    // Per-iteration system fence: every iteration writes the SAME src->dst, so
-    // without forcing each round's stores out to the peer they get absorbed by
-    // L2/Infinity cache and the timer measures cache bandwidth, not real P2P
-    // (symptom: mid-size BW spikes far above the NIC/xGMI limit, then drops to
-    // the true rate once the buffer exceeds cache). The fence makes each round's
-    // writes visible to the peer before the next round reuses the same region.
+    // Unit's threads stride over the unit's segment (thread scope: scope_size==1
+    // so a single thread copies its whole per_unit segment contiguously).
+    lsa_copy_strided(dst, src, per_unit, lane, scope_size);
+    // System-scope fence so this round's cross-GPU stores are globally visible
+    // (the barrier's own __threadfence is device scope only). Without it the
+    // repeated same-region traffic is absorbed by L2/Infinity cache and the
+    // timer measures cache bandwidth, not real P2P.
     __threadfence_system();
+    // Per-round all-block barrier (GPU-internal, mirrors shmem) so the measured
+    // window includes the same cross-block sync as the shmem benchmark.
+    bw_cross_block_barrier_round(counter_d, nblocks, i);
   }
 }
 
@@ -113,13 +130,15 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 }
 
 static void launch_lsa(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,
-                       ccoWindow_t recvWin, size_t len_doubles, int peerLsa, int count,
-                       int warp_size) {
-  int lanes = block.x;
-  if (scope == PutScope::kWarp) lanes = warp_size;
-  if (scope == PutScope::kThread) lanes = 1;
-  hipLaunchKernelGGL(lsa_put_bw, grid, block, 0, 0, sendWin, recvWin, len_doubles, peerLsa, count,
-                     lanes);
+                       ccoWindow_t recvWin, unsigned int* counter_d, size_t len_doubles,
+                       int peerLsa, int count, int warp_size) {
+  // scope_size = cooperation granularity of the copy (block: whole block,
+  // warp: one wavefront, thread: a single thread). All threads always run.
+  int scope_size = block.x;
+  if (scope == PutScope::kWarp) scope_size = warp_size;
+  if (scope == PutScope::kThread) scope_size = 1;
+  hipLaunchKernelGGL(lsa_put_bw, grid, block, 0, 0, sendWin, recvWin, counter_d, len_doubles,
+                     peerLsa, count, scope_size);
 }
 
 template <core::ProviderType PrvdType>
@@ -185,8 +204,8 @@ int main(int argc, char** argv) {
     if (run_kernels) {
       const float ms = RunWarmupAndTimed(res, args.warmup, args.iters, [&](int count) {
         if (args.transport == Transport::kLsa) {
-          launch_lsa(args.put_scope, grid, block, ctx.send_win, ctx.recv_win, len_doubles,
-                     ctx.peer_lsa_rank, count, ctx.device_warp_size);
+          launch_lsa(args.put_scope, grid, block, ctx.send_win, ctx.recv_win, res.counter_d,
+                     len_doubles, ctx.peer_lsa_rank, count, ctx.device_warp_size);
         } else {
           CCO_GDA_DISPATCH(launch_ibgda<P>(args.put_scope, grid, block, ctx.send_win, ctx.recv_win,
                                            len_doubles, ctx.devComm, count));

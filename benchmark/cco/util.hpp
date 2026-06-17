@@ -116,6 +116,9 @@ using LaunchFn = std::function<void(int /*count*/)>;
 struct PerfRes {
   hipEvent_t start{};
   hipEvent_t stop{};
+  // [0]=arrival counter, [1]=phase counter for the LSA bw cross-block barrier
+  // (apples-to-apples with shmem). Zeroed before each warmup/timed launch.
+  unsigned int* counter_d = nullptr;
 };
 
 void PerfResAlloc(PerfRes* res);
