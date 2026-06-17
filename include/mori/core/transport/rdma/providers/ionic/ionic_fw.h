@@ -28,11 +28,12 @@
 #ifndef IONIC_FW_H
 #define IONIC_FW_H
 
-// Self-contained: the __u*/__le*/__be* used below used to arrive via the system
-// <infiniband/verbs.h> that the core RDMA path dragged in. Now that the device
-// path is verbs-free, pull the kernel fixed-width types directly. (The C++ branch
+// Self-contained: the __u*/__le*/__be* and uint*_t used below used to arrive via
+// the system <infiniband/verbs.h> that the core RDMA path dragged in. Now that the
+// device path is verbs-free, pull the fixed-width types directly. (The C++ branch
 // below only defines BIT(), not these types.)
 #include <linux/types.h>
+#include <stdint.h>
 
 #if !defined(__cplusplus)
 #include <util/util.h>
@@ -77,31 +78,6 @@ enum ionic_mr_flags {
   IONIC_MRF_MW_2 = IONIC_MRF_IS_MW | IONIC_MRF_INV_EN,
 };
 
-// Host-only ibv<->ionic mapping helpers. They reference IBV_ACCESS_*/IBV_WC_*
-// from <infiniband/verbs.h>; keep them (and that include) out of device compiles
-// so the ionic device path stays verbs-free. Device-side CQE decoding uses the
-// mori::core::WcStatus mirror instead.
-#if !defined(__HIPCC__) && !defined(__CUDACC__)
-#include <infiniband/verbs.h>
-static inline int to_ionic_mr_flags(int access) {
-  int flags = 0;
-
-  if (access & IBV_ACCESS_LOCAL_WRITE) flags |= IONIC_MRF_LOCAL_WRITE;
-
-  if (access & IBV_ACCESS_REMOTE_READ) flags |= IONIC_MRF_REMOTE_READ;
-
-  if (access & IBV_ACCESS_REMOTE_WRITE) flags |= IONIC_MRF_REMOTE_WRITE;
-
-  if (access & IBV_ACCESS_REMOTE_ATOMIC) flags |= IONIC_MRF_REMOTE_ATOMIC;
-
-  if (access & IBV_ACCESS_MW_BIND) flags |= IONIC_MRF_MW_BIND;
-
-  if (access & IBV_ACCESS_ZERO_BASED) flags |= IONIC_MRF_ZERO_BASED;
-
-  return flags;
-}
-#endif  // !__HIPCC__ && !__CUDACC__
-
 /* cqe status indicated in status_length field when err bit is set */
 enum ionic_status {
   IONIC_STS_OK,
@@ -119,42 +95,6 @@ enum ionic_status {
   IONIC_STS_RNR_RETRY_EXCEEDED,
   IONIC_STS_XRC_VIO_ERR,
 };
-
-#if !defined(__HIPCC__) && !defined(__CUDACC__)
-static inline int ionic_to_ibv_status(int sts) {
-  switch (sts) {
-    case IONIC_STS_OK:
-      return IBV_WC_SUCCESS;
-    case IONIC_STS_LOCAL_LEN_ERR:
-      return IBV_WC_LOC_LEN_ERR;
-    case IONIC_STS_LOCAL_QP_OPER_ERR:
-      return IBV_WC_LOC_QP_OP_ERR;
-    case IONIC_STS_LOCAL_PROT_ERR:
-      return IBV_WC_LOC_PROT_ERR;
-    case IONIC_STS_WQE_FLUSHED_ERR:
-      return IBV_WC_WR_FLUSH_ERR;
-    case IONIC_STS_MEM_MGMT_OPER_ERR:
-      return IBV_WC_MW_BIND_ERR;
-    case IONIC_STS_BAD_RESP_ERR:
-      return IBV_WC_BAD_RESP_ERR;
-    case IONIC_STS_LOCAL_ACC_ERR:
-      return IBV_WC_LOC_ACCESS_ERR;
-    case IONIC_STS_REMOTE_INV_REQ_ERR:
-      return IBV_WC_REM_INV_REQ_ERR;
-    case IONIC_STS_REMOTE_ACC_ERR:
-      return IBV_WC_REM_ACCESS_ERR;
-    case IONIC_STS_REMOTE_OPER_ERR:
-      return IBV_WC_REM_OP_ERR;
-    case IONIC_STS_RETRY_EXCEEDED:
-      return IBV_WC_RETRY_EXC_ERR;
-    case IONIC_STS_RNR_RETRY_EXCEEDED:
-      return IBV_WC_RNR_RETRY_EXC_ERR;
-    case IONIC_STS_XRC_VIO_ERR:
-    default:
-      return IBV_WC_GENERAL_ERR;
-  }
-}
-#endif  // !__HIPCC__ && !__CUDACC__
 
 /* fw abi v1 */
 

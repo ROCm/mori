@@ -21,7 +21,7 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/core/transport/rdma/providers/bnxt/bnxt_re_dv.h"
+#include "mori/application/transport/rdma/providers/bnxt/bnxt_re_dv.h"
 extern "C" {
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
 }
