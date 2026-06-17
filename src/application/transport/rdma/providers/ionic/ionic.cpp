@@ -33,9 +33,9 @@
 #include <optional>
 #include <tuple>
 
+#include "mori/application/transport/rdma/providers/ionic/ionic_dv.h"
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
-#include "mori/core/transport/rdma/providers/ionic/ionic_dv.h"
 #include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
 #include "mori/utils/mori_log.hpp"
 

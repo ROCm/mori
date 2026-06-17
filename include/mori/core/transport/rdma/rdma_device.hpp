@@ -21,28 +21,13 @@
 // SOFTWARE.
 #pragma once
 
-#include <string>
-
-#include "mori/application/bootstrap/base_bootstrap.hpp"
-
-namespace mori {
-namespace application {
-
-class TorchBootstrapNetwork : public BootstrapNetwork {
- public:
-  TorchBootstrapNetwork(const std::string& groupName);
-  ~TorchBootstrapNetwork();
-
-  void Initialize();
-  void Finalize();
-
-  void Allgather(void* sendbuf, void* recvbuf, size_t sendcount);
-  void AllToAll(void* sendbuf, void* recvbuf, size_t sendcount);
-  void Barrier();
-
- private:
-  std::string groupName;
-};
-
-}  // namespace application
-}  // namespace mori
+// Device-only RDMA aggregator: the device-side post/poll primitives plus every
+// provider's device specializations (provider selected at runtime/compile-time
+// by the consumer). Kernel TUs that drive RDMA should include THIS; include
+// rdma.hpp instead when you also need the host primitives layer.
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#include "mori/core/transport/rdma/device_primitives.hpp"
+#include "mori/core/transport/rdma/providers/bnxt/bnxt_device_primitives.hpp"
+#include "mori/core/transport/rdma/providers/ionic/ionic_device_primitives.hpp"
+#include "mori/core/transport/rdma/providers/mlx5/mlx5_device_primitives.hpp"
+#endif

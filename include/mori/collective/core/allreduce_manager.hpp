@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include <memory>
+
 #include "mori/application/utils/check.hpp"
 #include "mori/collective/core/algorithm_selector.hpp"
 #include "mori/collective/core/allreduce_config.hpp"

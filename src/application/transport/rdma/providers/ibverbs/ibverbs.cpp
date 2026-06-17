@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 
+#include <infiniband/verbs.h>  // dereferences ibvHandle.qp/cq/srq (forward-declared in core)
+
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
