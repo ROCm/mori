@@ -28,7 +28,7 @@
 
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/mlx5/mlx5_defs.hpp"
-#include "mori/core/transport/rdma/providers/utils.h"
+#include "mori/core/transport/rdma/utils.hpp"
 #include "mori/core/utils.hpp"
 
 namespace mori {

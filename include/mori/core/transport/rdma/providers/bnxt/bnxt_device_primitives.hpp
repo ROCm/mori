@@ -29,7 +29,7 @@
 #include "mori/core/transport/p2p/device_primitives.hpp"
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_defs.hpp"
-#include "mori/core/transport/rdma/providers/utils.h"
+#include "mori/core/transport/rdma/utils.hpp"
 #include "mori/core/utils.hpp"
 extern "C" {
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"

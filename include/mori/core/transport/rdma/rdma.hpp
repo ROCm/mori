@@ -24,7 +24,7 @@
 // Host + device RDMA: the host primitives layer plus (on device) the full
 // device primitive + provider stack via rdma_device.hpp. Device-only kernel TUs
 // can include rdma_device.hpp directly to skip the host layer.
-#include "mori/core/transport/rdma/primitives.hpp"
+#include "mori/core/transport/rdma/ibverbs_handle.hpp"
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include "mori/core/transport/rdma/rdma_device.hpp"
