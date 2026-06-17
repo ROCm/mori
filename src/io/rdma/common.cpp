@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
 
+#include <infiniband/verbs.h>  // dereferences ibvHandle.qp (forward-declared in core)
+
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>

@@ -30,7 +30,21 @@
 #include <cstdint>
 
 #include "hip/hip_runtime_api.h"
+// Host/device split. Device and mixed-hipcc TUs only need the device-safe
+// application types (plus a forward decl of the host-only BootstrapNetwork, used by
+// pointer in ShmemInit below); the full application.hpp would drag the host RDMA
+// stack -> the system verbs.h/mlx5dv.h into the device compile. Host TUs keep
+// application.hpp for the host includes they have historically gotten transitively.
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#include "mori/application/application_device_types.hpp"
+namespace mori {
+namespace application {
+class BootstrapNetwork;  // host-only; defined in application/bootstrap/base_bootstrap.hpp
+}  // namespace application
+}  // namespace mori
+#else
 #include "mori/application/application.hpp"
+#endif
 
 namespace mori {
 namespace shmem {
@@ -58,7 +72,6 @@ int ShmemInit(application::BootstrapNetwork* bootNet);
 int ShmemInit();  // Default initialization using MPI_COMM_WORLD
 int ShmemMpiInit(MPI_Comm);
 #endif
-int ShmemTorchProcessGroupInit(const std::string& groupName);
 
 // UniqueId-based initialization APIs (nvshmem/rocshmem compatible)
 int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid);

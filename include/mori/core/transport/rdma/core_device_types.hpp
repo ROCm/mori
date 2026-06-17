@@ -25,6 +25,7 @@
 // Safe to include from both host and device (HIP/CUDA) compilation units.
 #pragma once
 
+#include <endian.h>  // BYTE_ORDER / LITTLE_ENDIAN / BIG_ENDIAN
 #include <limits.h>
 #include <stdint.h>
 
@@ -41,6 +42,38 @@ enum ProviderType {
   PSD = 3,
   // Ib verbs
   IBVERBS = 4,
+};
+
+// Device-safe mirror of ibverbs' enum ibv_wc_status (same order/values). Lets the
+// device-side CQE error decoders report a completion status without pulling the
+// host <infiniband/verbs.h> into device translation units. Value parity with
+// ibv_wc_status is guarded by static_asserts in a host TU
+// (src/application/transport/rdma/rdma.cpp).
+enum WcStatus {
+  WC_SUCCESS = 0,
+  WC_LOC_LEN_ERR,
+  WC_LOC_QP_OP_ERR,
+  WC_LOC_EEC_OP_ERR,
+  WC_LOC_PROT_ERR,
+  WC_WR_FLUSH_ERR,
+  WC_MW_BIND_ERR,
+  WC_BAD_RESP_ERR,
+  WC_LOC_ACCESS_ERR,
+  WC_REM_INV_REQ_ERR,
+  WC_REM_ACCESS_ERR,
+  WC_REM_OP_ERR,
+  WC_RETRY_EXC_ERR,
+  WC_RNR_RETRY_EXC_ERR,
+  WC_LOC_RDD_VIOL_ERR,
+  WC_REM_INV_RD_REQ_ERR,
+  WC_REM_ABORT_ERR,
+  WC_INV_EECN_ERR,
+  WC_INV_EEC_STATE_ERR,
+  WC_FATAL_ERR,
+  WC_RESP_TIMEOUT_ERR,
+  WC_GENERAL_ERR,
+  WC_TM_ERR,
+  WC_TM_RNDV_INCOMPLETE,
 };
 
 typedef enum {

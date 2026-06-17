@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "src/io/rdma/backend_impl.hpp"
 
+#include <infiniband/verbs.h>  // dereferences ibvHandle.qp/cq/compCh (forward-declared in core)
 #include <sys/epoll.h>
 
 #include <algorithm>

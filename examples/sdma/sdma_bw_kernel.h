@@ -33,7 +33,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
-#include "mori/application/transport/sdma/anvil_device.hpp"
+#include "mori/core/transport/sdma/anvil_device.hpp"
 
 __global__ void multiQueueSDMATransferQueueMapWG(
     size_t iteration_id, void* srcBuf, void** dstBufs, size_t copy_size, size_t numCopyCommands,

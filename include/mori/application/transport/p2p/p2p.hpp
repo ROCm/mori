@@ -21,6 +21,9 @@
 // SOFTWARE.
 #pragma once
 
+#include <stddef.h>
+#include <stdint.h>
+
 #include "hip/hip_runtime_api.h"
 
 namespace mori {

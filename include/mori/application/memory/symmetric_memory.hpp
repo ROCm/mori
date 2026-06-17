@@ -25,9 +25,9 @@
 // application_device_types.hpp so that device (HIP/CUDA) compilation units can include
 // them without pulling in STL or ibverbs headers.
 #include <hip/hip_runtime_api.h>
-#include <linux/types.h>
 #include <stdint.h>
 
+#include <map>
 #include <set>
 #include <unordered_map>
 #include <vector>

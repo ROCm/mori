@@ -21,8 +21,15 @@
 // SOFTWARE.
 #pragma once
 
-#include "infiniband/verbs.h"
-#include "mori/core/transport/rdma/core_device_types.hpp"
+// IBVerbsHandle below holds only host-only libibverbs object *pointers*. Forward-declare
+// the ibv types instead of pulling <infiniband/verbs.h> here, so this header — which is
+// reachable from the device RDMA path (core.hpp -> rdma.hpp) — stays free of verbs.h and
+// does not drag it into every device translation unit. Host TUs that actually dereference
+// these pointers include <infiniband/verbs.h> themselves.
+struct ibv_qp;
+struct ibv_cq;
+struct ibv_srq;
+struct ibv_comp_channel;
 
 namespace mori {
 namespace core {
