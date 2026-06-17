@@ -26,7 +26,6 @@
 #include <cassert>
 #include <cstddef>
 
-#include "mori/core/transport/p2p/device_primitives.hpp"
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_defs.hpp"
 #include "mori/core/transport/rdma/utils.hpp"
@@ -37,6 +36,23 @@ extern "C" {
 
 namespace mori {
 namespace core {
+
+// Single-thread vectorized copy used to lay out BNXT WQE slots. Kept local (and
+// distinctly named) so the bnxt device header doesn't pull p2p/device_primitives.hpp
+// — and its <hip/hip_fp8.h>/<hip/hip_bfloat16.h>/data_types — just for one memcpy.
+template <typename T>
+inline __device__ void BnxtThreadCopy(T* dst, T* src, size_t nelems) {
+  constexpr int vecSize = 16 / sizeof(T);
+  int offset = 0;
+  while ((offset + vecSize) <= nelems) {
+    reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
+    offset += vecSize;
+  }
+  while (offset < nelems) {
+    dst[offset] = src[offset];
+    offset += 1;
+  }
+}
 
 // BNXT request status -> WcStatus (uses bnxt_re_hsi.h, included above).
 static __device__ __host__ WcStatus BnxtHandleErrorCqe(int status) {
@@ -185,10 +201,10 @@ inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx
   sge.length = bytes;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
-  ThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
+  BnxtThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
   *reinterpret_cast<uint64_t*>(base + BNXT_RE_SLOT_SIZE) = 0ULL;
   *reinterpret_cast<uint64_t*>(base + BNXT_RE_SLOT_SIZE + 8) = 0ULL;  // memcpy -> set 0
-  ThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
+  BnxtThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
 
   // fill psns in msn Table for retransmissions
   uint32_t msntblIdx = curMsntblSlotIdx % wq.msntblNum;
@@ -256,10 +272,10 @@ inline __device__ uint64_t BnxtPostRecv(WorkQueueHandle& wq, uint32_t curPostIdx
   sge.length = bytes;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
-  ThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
+  BnxtThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
   *reinterpret_cast<uint64_t*>(base + BNXT_RE_SLOT_SIZE) = 0ULL;
   *reinterpret_cast<uint64_t*>(base + BNXT_RE_SLOT_SIZE + 8) = 0ULL;  // memcpy -> set 0
-  ThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
+  BnxtThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
 
   // recv wqe needn't to fill msntbl
   uint8_t flags = ((curPostIdx + 1) >> (__ffs(wqeNum) - 1)) & 0x1;
@@ -326,9 +342,9 @@ inline __device__ uint64_t BnxtPostReadWriteImpl(WorkQueueHandle& wq, uint32_t c
   sge.length = bytes;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
-  ThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
-  ThreadCopy<char>(base + 1 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&rdma), sizeof(rdma));
-  ThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
+  BnxtThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
+  BnxtThreadCopy<char>(base + 1 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&rdma), sizeof(rdma));
+  BnxtThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
 
   uint32_t msntblIdx = curMsntblSlotIdx % wq.msntblNum;
   bnxt_re_fill_psns_for_msntbl(msntblAddr, slotIdx, curPsnIdx, psnCnt, msntblIdx);
@@ -429,8 +445,8 @@ inline __device__ uint64_t BnxtPostWriteInline(WorkQueueHandle& wq, uint32_t cur
   rdma.rkey = rkey & 0xffffffff;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
-  ThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
-  ThreadCopy<char>(base + 1 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&rdma), sizeof(rdma));
+  BnxtThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
+  BnxtThreadCopy<char>(base + 1 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&rdma), sizeof(rdma));
   uint32_t* wqeDataPtr = reinterpret_cast<uint32_t*>(base + 2 * BNXT_RE_SLOT_SIZE);
   if (bytes == 4) {
     AtomicStoreRelaxed(reinterpret_cast<uint32_t*>(wqeDataPtr),
@@ -547,9 +563,9 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   sge.length = 8;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
-  ThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
-  ThreadCopy<char>(base + 1 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&amo), sizeof(amo));
-  ThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
+  BnxtThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
+  BnxtThreadCopy<char>(base + 1 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&amo), sizeof(amo));
+  BnxtThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
 
   // fill psns in msn Table for retransmissions
   uint32_t msntblIdx = curMsntblSlotIdx % wq.msntblNum;
