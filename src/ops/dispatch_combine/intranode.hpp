@@ -79,6 +79,7 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpDispatchIntraNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
+
 template <typename T, bool EnableStdMoE = false>
 __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
@@ -108,38 +109,75 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
          i += globalWarpNum) {
       index_t srcTokId = i / config.numExpertPerToken;
-      index_t destExpert = args.tokenIndices[i];
-      index_t destPe = destExpert / config.numExpertPerRank;
+      index_t destPe;
       index_t destTokId = 0;
 
-      // Deduplicate
-      assert(config.numExpertPerToken < warpSize);
-      int condition = 0;
-      if (laneId < (i % config.numExpertPerToken)) {
-        condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
-                               config.numExpertPerRank);
-      }
-      if (__any(condition)) {
-        // Indicate that this token is already sent to the destination PE by setting an overflow
-        // token index
-        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-        continue;
-      }
+      if (!args.replayMode) {
+        // Cache routing: decide where this (token, top-k) pair goes via
+        // atomicAdd-based slot assignment. Records the routing into dispDestTokIdMap
+        // (and the symmetric local view via dispTokIdToSrcTokIdMemObj on the
+        // destination PE) so a later replay-routing dispatch / combine can reuse
+        // the same layout deterministically.
+        index_t destExpert = args.tokenIndices[i];
+        // Routing sentinel: a negative expert id means "drop this top-k slot".
+        // Skip the dispatch entirely and write the existing combine-side null sentinel
+        // (PE == worldSize) into dispDestTokIdMap so combine treats this slot as nullptr.
+        if (destExpert < 0) {
+          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+          continue;
+        }
+        destPe = destExpert / config.numExpertPerRank;
+        // Out-of-range expert id guard: destPe is warp-uniform here (one
+        // token-expert per warp) and indexes GetAs(destPe) / destPeTokenCounter
+        // below. An out-of-range id (e.g. an EPLB physical id
+        // >= worldSize*numExpertPerRank) would index those out of bounds (the
+        // assert at dispatch is stripped under NDEBUG) -> HSA page fault. Drop it
+        // via the same overflow sentinel the dedup path uses; the whole warp
+        // skips coherently.
+        if (destPe < 0 || destPe >= config.worldSize) {
+          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+          continue;
+        }
 
-      if (laneId == 0) {
-        // decide token id in dest pe
-        destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-        assert(destTokId < config.MaxNumTokensToRecv() &&
-               "Total recv token overflow: increase maxTotalRecvTokens");
-        atomicAdd(args.destPeTokenCounter + destPe, 1);
-        // In dispDestTokIdMap, record the destination slot for this token-expert pair (flat index
-        // into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE, record which
-        // global source token occupies this slot (for combine-phase routing)
-        args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-            FlatTokenIndex(config, myPe, srcTokId);
+        // Deduplicate
+        assert(config.numExpertPerToken < warpSize);
+        int condition = 0;
+        if (laneId < (i % config.numExpertPerToken)) {
+          index_t otherExpert = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+          condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
+        }
+        if (__any(condition)) {
+          // Indicate that this token is already sent to the destination PE by setting an overflow
+          // token index
+          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+          continue;
+        }
+
+        if (laneId == 0) {
+          // decide token id in dest pe
+          destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+          assert(destTokId < config.MaxNumTokensToRecv() &&
+                 "Total recv token overflow: increase maxTotalRecvTokens");
+          atomicAdd(args.destPeTokenCounter + destPe, 1);
+          // In dispDestTokIdMap, record the destination slot for this token-expert pair (flat index
+          // into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE, record
+          // which global source token occupies this slot (for combine-phase routing)
+          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+              FlatTokenIndex(config, myPe, srcTokId);
+        }
+        destTokId = __shfl(destTokId, 0);
+      } else {
+        // Replay routing: caller already supplied a populated dispDestTokIdMap
+        // from a matching cache-routing dispatch. Recover (destPe, destTokId) directly
+        // and skip CAS / dedup / cross-rank src-id writes. The sentinel slot
+        // (destPe == worldSize) means the original cache-routing dispatch dropped or deduped
+        // this top-k slot, so we skip transmitting payload as well.
+        index_t flat = args.dispDestTokIdMap[i];
+        destPe = PeFromFlatTokenIndex(config, flat);
+        if (destPe >= config.worldSize) continue;
+        destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
       }
-      destTokId = __shfl(destTokId, 0);
 
       // Write weights and indices
       if (laneId < config.numExpertPerToken) {
@@ -169,6 +207,212 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
                      args.inpTokenBuf + srcTokOffset, hiddenDim);
     }
   }
+  __syncthreads();
+  if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+
+  // Send token num & token to expert mapping to other ranks
+  MORI_TRACE_NEXT(seq, Slot::DispatchNotifyPeer);
+  if (globalWarpId == 0) {
+    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+      // Wait until all tokens are sent
+      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
+      __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+
+      // Add 1 so that when token number == 0, receiver side still know the signal is sent
+      index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
+      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
+      shmem::ShmemInt32WaitUntilEquals(signal, 0);
+      core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
+    }
+  }
+
+  // Phase 2: recv token
+  // Each warp wait until sender finished by waiting token number signal
+  MORI_TRACE_NEXT(seq, Slot::DispatchWaitPeerToken);
+  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+  if (globalWarpId == 0) {
+    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+      index_t* signal = recvTokenNums + destPe;
+      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      core::AtomicStoreRelaxedSystem(signal, 0);
+      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+
+      // reset local counter
+      args.destPeTokenCounter[destPe] = 0;
+    }
+
+    // reset counter
+    if (laneId == 0) {
+      args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+    }
+  }
+
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  if constexpr (EnableStdMoE) {
+    InvokeConvertDispatchOutput<T>(args, myPe);
+  }
+#endif
+}
+
+template <typename T, bool EnableStdMoE = false>
+__device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) {
+  const EpDispatchCombineConfig& config = args.config;
+
+  int thdId = threadIdx.x;
+  int thdNum = blockDim.x;
+
+  int laneId = threadIdx.x & (warpSize - 1);
+  int warpId = thdId / warpSize;
+  int warpNum = blockDim.x / warpSize;
+
+  int globalWarpId = blockIdx.x * warpNum + warpId;
+  int globalWarpNum = gridDim.x * warpNum;
+
+  int myPe = config.rank;
+  int npes = config.worldSize;
+  size_t hiddenDim = config.HiddenDimSz();
+  const bool hasScales = args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0);
+
+  // Warp-group coordination: 2 warps per group
+  constexpr int kWarpsPerGroup = 2;
+  constexpr int kMaxWarpGroups = 8;
+
+  __shared__ uint64_t groupData[kMaxWarpGroups];  // (iteration+1, destTokId)
+  __shared__ int groupCounters[kMaxWarpGroups];   // consume counter
+
+  int warpGroupIdInBlock = warpId / kWarpsPerGroup;
+  int inGroupWarpId = warpId % kWarpsPerGroup;
+  int warpGroupId = globalWarpId / kWarpsPerGroup;
+  int warpGroupNum = globalWarpNum / kWarpsPerGroup;
+
+  // clear shared memory
+  if (inGroupWarpId == 0 && laneId == 0) {
+    groupData[warpGroupIdInBlock] = 0;
+    groupCounters[warpGroupIdInBlock] = kWarpsPerGroup - 1;
+  }
+  __syncthreads();
+
+  // Hidden dim split for each warp in group
+  size_t dimPerWarp = (hiddenDim + kWarpsPerGroup - 1) / kWarpsPerGroup;
+  size_t warpDimOffset = (size_t)inGroupWarpId * dimPerWarp;
+  size_t warpDimChunk =
+      (warpDimOffset < hiddenDim) ? min(hiddenDim - warpDimOffset, dimPerWarp) : 0;
+  assert((warpNum % kWarpsPerGroup == 0) && (warpDimChunk > 0) &&
+         "total num of warps must be divisible by the num of warpgroups, "
+         "warpDimChunk must be > 0 for warpgroups to be useful");
+
+  IF_ENABLE_PROFILER(
+      INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
+  MORI_TRACE_SEQ(seq, profiler);
+  MORI_TRACE_NEXT(seq, Slot::DispatchSendTokens);
+
+  if (args.tokenIndices && args.inpTokenBuf) {
+    // Phase1: send token
+    // Each warp-group (4 warps) processes one token-expert pair
+    for (int i = warpGroupId; i < args.curRankNumToken * config.numExpertPerToken;
+         i += warpGroupNum) {
+      index_t srcTokId = i / config.numExpertPerToken;
+      index_t destExpert = args.tokenIndices[i];
+      index_t destPe = destExpert / config.numExpertPerRank;
+      index_t destTokId = 0;
+
+      // prefetch remote addr
+      auto dispTokOffset = args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe);
+
+      // ALL warps in warp-group do dedup independently (same input = same result)
+      assert(config.numExpertPerToken < warpSize);
+      int condition = 0;
+      if (laneId < (i % config.numExpertPerToken)) {
+        condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
+                               config.numExpertPerRank);
+      }
+      if (__any(condition)) {
+        // All 4 warps skip together, only warp 0 writes the skip marker
+        if (inGroupWarpId == 0 && laneId == 0) {
+          args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+        }
+        continue;
+      }
+
+      // prefetch remote addr
+      auto dispatchOut = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe);
+
+      // Header Warp: atomic allocation + notify via shared memory
+      if (inGroupWarpId == 0) {
+        if (laneId == 0) {
+          // Atomic allocation
+          destTokId = atomicAdd(dispTokOffset, 1);
+          assert(destTokId < config.MaxNumTokensToRecv() &&
+                 "Total recv token overflow: increase maxTotalRecvTokens");
+
+          // Wait for all consumers done (counter == N-1), then set to 0
+          while (atomicCAS(&groupCounters[warpGroupIdInBlock], kWarpsPerGroup - 1, 0) !=
+                 kWarpsPerGroup - 1) {
+          }
+          // Write to shared mem: use (i+1) to avoid confusion with initial value 0
+          __hip_atomic_store((unsigned long long*)&groupData[warpGroupIdInBlock],
+                             ((uint64_t)(i + 1) << 32) | (uint32_t)destTokId, __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_WORKGROUP);
+
+          atomicAdd(args.destPeTokenCounter + destPe, 1);
+          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+              FlatTokenIndex(config, myPe, srcTokId);
+        }
+        destTokId = __shfl(destTokId, 0);
+
+        // Write weights and indices: only warp 0 writes
+        if (laneId < config.numExpertPerToken) {
+          if (args.weightsBuf) {
+            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
+                destPe)[destTokId * config.numExpertPerToken + laneId] =
+                args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+          }
+          args.shmemOutIndicesMemObj->template GetAs<index_t*>(
+              destPe)[destTokId * config.numExpertPerToken + laneId] =
+              args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+        }
+      } else {
+        // Normal Warps: spin wait for iteration match, then consume
+        // Only lane 0 spins, then broadcast to other lanes
+        if (laneId == 0) {
+          uint64_t val;
+          do {
+            val = __hip_atomic_load(
+                reinterpret_cast<unsigned long long*>(&groupData[warpGroupIdInBlock]),
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+          } while ((val >> 32) != (uint32_t)(i + 1));
+          atomicAdd(&groupCounters[warpGroupIdInBlock], 1);
+          destTokId = (index_t)(val & 0xFFFFFFFF);
+        }
+
+        destTokId = __shfl(destTokId, 0);
+      }
+
+      // All warps in warpgroup: copy their portion of token data
+      size_t srcTokOffset = srcTokId * hiddenDim;
+      size_t destTokOffset = destTokId * hiddenDim;
+
+      core::WarpCopy<T, 2>(dispatchOut + destTokOffset + warpDimOffset,
+                           args.inpTokenBuf + srcTokOffset + warpDimOffset, warpDimChunk);
+
+      // Write scales: split across 4 warps
+      if (hasScales) {
+        size_t scaleSize = config.scaleDim * config.scaleTypeSize;
+        size_t scalePerWarp = (scaleSize + kWarpsPerGroup - 1) / kWarpsPerGroup;
+        size_t myScaleOffset = (size_t)inGroupWarpId * scalePerWarp;
+        size_t myScaleChunk =
+            (myScaleOffset < scaleSize) ? min(scaleSize - myScaleOffset, scalePerWarp) : 0;
+
+        size_t destScaleOffset = (size_t)destTokId * scaleSize;
+        size_t srcScaleOffset = (size_t)srcTokId * scaleSize;
+        core::WarpCopy(args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) +
+                           destScaleOffset + myScaleOffset,
+                       args.scalesBuf + srcScaleOffset + myScaleOffset, myScaleChunk);
+      }
+    }
+  }
+
   __syncthreads();
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
@@ -305,9 +549,16 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
     }
   } else {
+    // When the caller passes a routing handle, args.dispTokIdToSrcTokIdLocal
+    // holds a per-call snapshot of the symmetric local view. Otherwise fall
+    // back to the shared symmetric buffer.
+    const index_t* localSrcMap =
+        args.dispTokIdToSrcTokIdLocal != nullptr
+            ? args.dispTokIdToSrcTokIdLocal
+            : args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe);
 #ifdef ENABLE_PROFILER
     for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
-      index_t destTokId = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe)[tokenIdx];
+      index_t destTokId = localSrcMap[tokenIdx];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
       index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
@@ -331,8 +582,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       MORI_TRACE_NEXT(seq, Slot::CombineCopyWeights);
       if (args.weightsBuf) {
         for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
-          index_t destTokId =
-              args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe)[tokenIdx];
+          index_t destTokId = localSrcMap[tokenIdx];
           index_t destPe = PeFromFlatTokenIndex(config, destTokId);
           index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
           uint8_t* destStagingPtr =
@@ -346,7 +596,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
     }
 #else
     for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
-      index_t destTokId = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe)[tokenIdx];
+      index_t destTokId = localSrcMap[tokenIdx];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
       index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
@@ -379,7 +629,11 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   // Make sure copy on all GPUs are finished
   MORI_TRACE_NEXT(seq, Slot::CombineBarrier);
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
-  *args.totalRecvTokenNum = 0;
+  // With a routing handle, the caller owns this tensor (it may still be alive in autograd ctx),
+  // so we skip the reset. The next dispatch will allocate or replay its own.
+  if (args.dispTokIdToSrcTokIdLocal == nullptr) {
+    *args.totalRecvTokenNum = 0;
+  }
   if (args.curRankNumToken == 0) return;
 
   MORI_TRACE_NEXT(seq, Slot::CombineAccumSetup);

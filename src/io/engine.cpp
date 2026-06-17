@@ -22,16 +22,21 @@
 #include "mori/io/engine.hpp"
 
 #include <hip/hip_runtime_api.h>
+#include <linux/mempolicy.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "mori/utils/host_utils.hpp"
 #include "src/io/call_diagnostics_internal.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/xgmi/backend_impl.hpp"
@@ -80,6 +85,19 @@ std::string QueryDeviceBusId(int deviceId) {
 bool IsAutoXgmiEnabled() {
   const char* v = std::getenv("MORI_DISABLE_AUTO_XGMI");
   return v != nullptr && v[0] == '0';
+}
+
+int DetectNumaNode(void* addr) {
+#if defined(SYS_get_mempolicy)
+  int node = -1;
+  long rc = syscall(SYS_get_mempolicy, &node, nullptr, 0,
+                    reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr)),
+                    MPOL_F_NODE | MPOL_F_ADDR);
+  return rc == 0 ? node : -1;
+#else
+  (void)addr;
+  return -1;
+#endif
 }
 
 }  // namespace
@@ -152,7 +170,7 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.key = key;
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
-  desc.nodeId = ResolveNodeId(hostname);
+  desc.nodeId = mori::ResolveNodeId(hostname);
   desc.hostname = std::string(hostname);
   desc.host = config.host;
   desc.port = config.port;
@@ -345,6 +363,9 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   memDesc.data = reinterpret_cast<uintptr_t>(data);
   memDesc.size = size;
   memDesc.loc = loc;
+  if (loc == MemoryLocationType::CPU && data != nullptr) {
+    memDesc.numaNode = DetectNumaNode(data);
+  }
 
   for (auto& it : backends) {
     it.second->RegisterMemory(memDesc);
@@ -419,13 +440,6 @@ std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) c
     return std::nullopt;
   }
   return it->second;
-}
-
-std::string IOEngine::ResolveNodeId(const std::string& hostname) const {
-  if (auto nodeId = mori::env::GetString("MORI_IO_NODE_ID"); nodeId.has_value()) {
-    return *nodeId;
-  }
-  return hostname;
 }
 
 #define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend)     \
@@ -554,6 +568,61 @@ bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
     if (popped) return true;
   }
   return false;
+}
+
+StatusCode IOEngine::WaitAll(const std::vector<TransferStatus*>& statuses, int timeoutMs) {
+  if (statuses.empty()) return StatusCode::SUCCESS;
+
+  if (timeoutMs == 0) {
+    bool anyInProgress = false;
+    for (TransferStatus* status : statuses) {
+      if (status == nullptr) continue;
+      StatusCode rc = status->WaitFor(0);
+      if (rc == StatusCode::IN_PROGRESS) {
+        anyInProgress = true;
+        continue;
+      }
+      if (rc != StatusCode::SUCCESS) return rc;
+    }
+    return anyInProgress ? StatusCode::IN_PROGRESS : StatusCode::SUCCESS;
+  }
+
+  if (timeoutMs < 0) {
+    StatusCode firstError = StatusCode::SUCCESS;
+    for (TransferStatus* status : statuses) {
+      if (status == nullptr) continue;
+      StatusCode rc = status->WaitFor(-1);
+      if (rc != StatusCode::SUCCESS && firstError == StatusCode::SUCCESS) {
+        firstError = rc;
+      }
+    }
+    return firstError;
+  }
+
+  using Clock = std::chrono::steady_clock;
+  const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+  StatusCode firstError = StatusCode::SUCCESS;
+  for (TransferStatus* status : statuses) {
+    if (status == nullptr) continue;
+
+    const auto now = Clock::now();
+    if (now >= deadline) {
+      return firstError != StatusCode::SUCCESS ? firstError : StatusCode::IN_PROGRESS;
+    }
+
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    const int remainingMs = remaining.count() > std::numeric_limits<int>::max()
+                                ? std::numeric_limits<int>::max()
+                                : static_cast<int>(remaining.count());
+    StatusCode rc = status->WaitFor(remainingMs);
+    if (rc == StatusCode::IN_PROGRESS) {
+      return firstError != StatusCode::SUCCESS ? firstError : StatusCode::IN_PROGRESS;
+    }
+    if (rc != StatusCode::SUCCESS && firstError == StatusCode::SUCCESS) {
+      firstError = rc;
+    }
+  }
+  return firstError;
 }
 
 }  // namespace io

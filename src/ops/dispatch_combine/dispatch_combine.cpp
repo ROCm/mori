@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/internal.hpp"
@@ -205,7 +206,7 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
                       config.WeightBytes() + config.SrcTokenIdBytes() + blockwiseScaleBytes);
   }
 
-  if (config.kernelType == KernelType::IntraNode) {
+  if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL) {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsIntraNode>();
     bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.dispatchOut = ShmemMallocAndReturnMemObjPtr(dispatchOutSize, hipDeviceMallocUncached);
@@ -218,11 +219,15 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
                              config.MaxXferBytesPerToken();
     size_t stagingSize = static_cast<ssize_t>(2 * nNodes) * config.MaxNumTokensToSendPerRank() *
                          config.MaxXferBytesPerToken();
+    size_t dispatchStagingSize =
+        static_cast<ssize_t>(config.MaxNumTokensToSendPerRank()) * config.MaxXferBytesPerToken();
     bufs.dispatchInp = ShmemMallocAndReturnMemObjPtr(dispatchInpSize, hipDeviceMallocUncached);
     bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.staging = ShmemMallocAndReturnMemObjPtr(stagingSize, hipDeviceMallocUncached);
     bufs.dispatchOut = ShmemMallocAndReturnMemObjPtr(dispatchOutSize, hipDeviceMallocUncached);
     bufs.combineOut = ShmemMallocAndReturnMemObjPtr(combineOutSize, hipDeviceMallocUncached);
+    bufs.dispatchStaging =
+        ShmemMallocAndReturnMemObjPtr(dispatchStagingSize, hipDeviceMallocUncached);
   } else {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsInterNode>();
     // NOTE(ditian12): no overflow protection for dispatchInp/combinInp/staging in async kernel,
@@ -237,7 +242,8 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     bufs.combineOut = ShmemMallocAndReturnMemObjPtr(combineOutSize, hipDeviceMallocUncached);
   }
 
-  size_t maxWeightSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(float);
+  size_t maxWeightSize =
+      static_cast<size_t>(config.MaxNumTokensToRecv()) * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
   shmemDispatchOutWeightsMemObj =
       ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
@@ -262,7 +268,8 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     shmemOutScalesMemObj = ShmemMallocAndReturnMemObjPtr(userScaleSize, hipDeviceMallocUncached);
   }
 
-  size_t maxIndicesSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(index_t);
+  size_t maxIndicesSize =
+      static_cast<size_t>(config.MaxNumTokensToRecv()) * config.numExpertPerToken * sizeof(index_t);
   shmemInpIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
   shmemOutIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
 
@@ -278,7 +285,7 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
 }
 
 void EpDispatchCombineHandle::FinalizeShmemBuf() {
-  if (config.kernelType == KernelType::IntraNode) {
+  if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL) {
     auto& bufs = std::get<ShmemBufsIntraNode>(shmemTokBufs);
     ShmemFree(bufs.dispatchOut->localPtr);
     ShmemFree(bufs.combineInp->localPtr);
@@ -291,6 +298,7 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
     ShmemFree(bufs.dispatchOut->localPtr);
     ShmemFree(bufs.combineOut->localPtr);
     ShmemFree(bufs.staging->localPtr);
+    ShmemFree(bufs.dispatchStaging->localPtr);
   } else {
     auto& bufs = std::get<ShmemBufsInterNode>(shmemTokBufs);
     ShmemFree(bufs.dispatchInp->localPtr);
@@ -336,7 +344,8 @@ void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
 }
 
 void EpDispatchCombineHandle::InitializeOrderMapBuf() {
-  size_t maxNumOutToken = config.MaxNumTokensToSend() * config.numExpertPerRank;
+  size_t maxNumOutToken =
+      static_cast<size_t>(config.MaxNumTokensToSend()) * config.numExpertPerRank;
   HIP_RUNTIME_CHECK(hipMalloc(&dispReceiverIdxMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(index_t)));
 
@@ -367,7 +376,7 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&dispDestTokIdMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
 
-  size_t maxNumInterNodeToken = config.worldSize / config.gpuPerNode *
+  size_t maxNumInterNodeToken = static_cast<size_t>(config.worldSize) / config.gpuPerNode *
                                 config.MaxNumTokensToSendPerRank() * config.numExpertPerToken;
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispDestTokIdMap, maxNumInterNodeToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(
@@ -378,8 +387,8 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(
       hipMemset(blockFlagCounter, 0, config.worldSize / config.gpuPerNode * sizeof(index_t)));
 
-  size_t interNodeDispSendMapSize =
-      config.worldSize / config.gpuPerNode * config.MaxNumTokensToSendPerRank() * sizeof(index_t);
+  size_t interNodeDispSendMapSize = static_cast<size_t>(config.worldSize) / config.gpuPerNode *
+                                    config.MaxNumTokensToSendPerRank() * sizeof(index_t);
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispSendMap, interNodeDispSendMapSize));
   HIP_RUNTIME_CHECK(hipMemset(interNodeDispSendMap, 0, interNodeDispSendMapSize));
 
@@ -429,8 +438,8 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   crossDeviceBarrierMemObj =
       ShmemMallocAndReturnMemObjPtr(barrierSize * 2 * sizeof(uint64_t), hipDeviceMallocUncached);
 
-  size_t interNodeChunkFlagSize =
-      config.worldSize / config.gpuPerNode * config.MaxNumTokensToSendPerRank() * sizeof(uint64_t);
+  size_t interNodeChunkFlagSize = static_cast<size_t>(config.worldSize) / config.gpuPerNode *
+                                  config.MaxNumTokensToSendPerRank() * sizeof(uint64_t);
   interNodeChunkFlagMemObj =
       ShmemMallocAndReturnMemObjPtr(interNodeChunkFlagSize, hipDeviceMallocUncached);
 
@@ -470,7 +479,8 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   args.scalesBuf = handle.scalesBuf;
   args.destPeTokenCounter = handle.destPeTokenCounter;
   args.localPeTokenCounter = handle.localPeTokenCounter;
-  if (handle.config.kernelType == KernelType::IntraNode) {
+  if (handle.config.kernelType == KernelType::IntraNode ||
+      handle.config.kernelType == KernelType::IntraNodeLL) {
     args.intraNodeTokBufs = std::get<ShmemBufsIntraNode>(handle.shmemTokBufs);
   } else if (handle.config.kernelType == KernelType::InterNodeV1 ||
              handle.config.kernelType == KernelType::InterNodeV1LL) {
@@ -519,6 +529,41 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   args.standardPackedRecvLayoutRange = handle.standardPackedRecvLayoutRange;
   args.dispTokToEpSlotMap = handle.dispTokToEpSlotMap;
 #endif
+  return args;
+}
+
+void EpDispatchCombineRoutingPtrs::Validate() const {
+  if (IsValid()) return;
+  std::string missing;
+  auto append = [&](const char* name, const index_t* ptr) {
+    if (ptr == nullptr) {
+      if (!missing.empty()) missing += ", ";
+      missing += name;
+    }
+  };
+  append("dispDestTokIdMap", dispDestTokIdMap);
+  append("interNodeDispDestTokIdMap", interNodeDispDestTokIdMap);
+  append("interNodeDispSendMap", interNodeDispSendMap);
+  append("totalRecvTokenNum", totalRecvTokenNum);
+  append("dispTokIdToSrcTokIdLocal", dispTokIdToSrcTokIdLocal);
+  throw std::invalid_argument(
+      "EpDispatchCombineRoutingPtrs: missing required routing pointer(s): " + missing);
+}
+
+EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
+                                                     int rdmaBlockNum,
+                                                     const EpDispatchCombineRoutingPtrs* routing,
+                                                     bool replayMode) {
+  EpDispatchCombineArgsRaw args = GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum);
+  args.replayMode = replayMode;
+  if (routing != nullptr) {
+    routing->Validate();
+    args.dispDestTokIdMap = routing->dispDestTokIdMap;
+    args.interNodeDispDestTokIdMap = routing->interNodeDispDestTokIdMap;
+    args.interNodeDispSendMap = routing->interNodeDispSendMap;
+    args.totalRecvTokenNum = routing->totalRecvTokenNum;
+    args.dispTokIdToSrcTokIdLocal = routing->dispTokIdToSrcTokIdLocal;
+  }
   return args;
 }
 

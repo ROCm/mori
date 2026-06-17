@@ -23,18 +23,66 @@
 
 #include <hip/hip_runtime.h>
 
-#include "mori/core/transport/p2p/device_primitives.hpp"
+#include <cassert>
+#include <cstddef>
+
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_defs.hpp"
-#include "mori/core/transport/rdma/providers/utils.h"
-#include "mori/core/utils.hpp"
+#include "mori/core/transport/rdma/utils.hpp"
+#include "mori/core/utils/utils.hpp"
 extern "C" {
-#include "mori/core/transport/rdma/providers/bnxt/bnxt_re_dv.h"
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
 }
 
 namespace mori {
 namespace core {
+
+// Each segment is one 16-byte slot. The bnxt ABI structs are packed (alignof 1),
+// so memcpy out (alignment-safe, folds under -O) then one aligned 128-bit store
+// to the 16B-aligned slot. Local copy so the bnxt header needn't pull p2p.
+template <typename Seg>
+inline __device__ void BnxtWriteSlot(void* slot, const Seg& seg) {
+  static_assert(sizeof(Seg) == BNXT_RE_SLOT_SIZE, "WQE segment must occupy exactly one slot");
+  uint4 v;
+  __builtin_memcpy(&v, &seg, sizeof(v));
+  *reinterpret_cast<uint4*>(slot) = v;
+}
+
+inline __device__ void BnxtZeroSlot(void* slot) {
+  *reinterpret_cast<uint4*>(slot) = uint4{0u, 0u, 0u, 0u};
+}
+
+// BNXT request status -> WcStatus (uses bnxt_re_hsi.h, included above).
+static __device__ __host__ WcStatus BnxtHandleErrorCqe(int status) {
+  switch (status) {
+    case BNXT_RE_REQ_ST_OK:
+      return WC_SUCCESS;
+    case BNXT_RE_REQ_ST_BAD_RESP:
+      return WC_BAD_RESP_ERR;
+    case BNXT_RE_REQ_ST_LOC_LEN:
+      return WC_LOC_LEN_ERR;
+    case BNXT_RE_REQ_ST_LOC_QP_OP:
+      return WC_LOC_QP_OP_ERR;
+    case BNXT_RE_REQ_ST_PROT:
+      return WC_LOC_PROT_ERR;
+    case BNXT_RE_REQ_ST_MEM_OP:
+      return WC_LOC_ACCESS_ERR;
+    case BNXT_RE_REQ_ST_REM_INVAL:
+      return WC_REM_INV_REQ_ERR;
+    case BNXT_RE_REQ_ST_REM_ACC:
+      return WC_REM_ACCESS_ERR;
+    case BNXT_RE_REQ_ST_REM_OP:
+      return WC_REM_OP_ERR;
+    case BNXT_RE_REQ_ST_RNR_NAK_XCED:
+      return WC_RNR_RETRY_EXC_ERR;
+    case BNXT_RE_REQ_ST_TRNSP_XCED:
+      return WC_RETRY_EXC_ERR;
+    case BNXT_RE_REQ_ST_WR_FLUSH:
+      return WC_WR_FLUSH_ERR;
+    default:
+      return WC_GENERAL_ERR;
+  }
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         DB Header                                              */
@@ -151,10 +199,9 @@ inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx
   sge.length = bytes;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
-  ThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
-  *reinterpret_cast<uint64_t*>(base + BNXT_RE_SLOT_SIZE) = 0ULL;
-  *reinterpret_cast<uint64_t*>(base + BNXT_RE_SLOT_SIZE + 8) = 0ULL;  // memcpy -> set 0
-  ThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
+  BnxtWriteSlot(base + 0 * BNXT_RE_SLOT_SIZE, hdr);
+  BnxtZeroSlot(base + 1 * BNXT_RE_SLOT_SIZE);  // send slot reserved for UD, set to 0x0
+  BnxtWriteSlot(base + 2 * BNXT_RE_SLOT_SIZE, sge);
 
   // fill psns in msn Table for retransmissions
   uint32_t msntblIdx = curMsntblSlotIdx % wq.msntblNum;
@@ -222,10 +269,9 @@ inline __device__ uint64_t BnxtPostRecv(WorkQueueHandle& wq, uint32_t curPostIdx
   sge.length = bytes;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
-  ThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
-  *reinterpret_cast<uint64_t*>(base + BNXT_RE_SLOT_SIZE) = 0ULL;
-  *reinterpret_cast<uint64_t*>(base + BNXT_RE_SLOT_SIZE + 8) = 0ULL;  // memcpy -> set 0
-  ThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
+  BnxtWriteSlot(base + 0 * BNXT_RE_SLOT_SIZE, hdr);
+  BnxtZeroSlot(base + 1 * BNXT_RE_SLOT_SIZE);  // reserved slot, set to 0x0
+  BnxtWriteSlot(base + 2 * BNXT_RE_SLOT_SIZE, sge);
 
   // recv wqe needn't to fill msntbl
   uint8_t flags = ((curPostIdx + 1) >> (__ffs(wqeNum) - 1)) & 0x1;
@@ -292,9 +338,9 @@ inline __device__ uint64_t BnxtPostReadWriteImpl(WorkQueueHandle& wq, uint32_t c
   sge.length = bytes;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
-  ThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
-  ThreadCopy<char>(base + 1 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&rdma), sizeof(rdma));
-  ThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
+  BnxtWriteSlot(base + 0 * BNXT_RE_SLOT_SIZE, hdr);
+  BnxtWriteSlot(base + 1 * BNXT_RE_SLOT_SIZE, rdma);
+  BnxtWriteSlot(base + 2 * BNXT_RE_SLOT_SIZE, sge);
 
   uint32_t msntblIdx = curMsntblSlotIdx % wq.msntblNum;
   bnxt_re_fill_psns_for_msntbl(msntblAddr, slotIdx, curPsnIdx, psnCnt, msntblIdx);
@@ -395,8 +441,8 @@ inline __device__ uint64_t BnxtPostWriteInline(WorkQueueHandle& wq, uint32_t cur
   rdma.rkey = rkey & 0xffffffff;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
-  ThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
-  ThreadCopy<char>(base + 1 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&rdma), sizeof(rdma));
+  BnxtWriteSlot(base + 0 * BNXT_RE_SLOT_SIZE, hdr);
+  BnxtWriteSlot(base + 1 * BNXT_RE_SLOT_SIZE, rdma);
   uint32_t* wqeDataPtr = reinterpret_cast<uint32_t*>(base + 2 * BNXT_RE_SLOT_SIZE);
   if (bytes == 4) {
     AtomicStoreRelaxed(reinterpret_cast<uint32_t*>(wqeDataPtr),
@@ -513,9 +559,9 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   sge.length = 8;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
-  ThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
-  ThreadCopy<char>(base + 1 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&amo), sizeof(amo));
-  ThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
+  BnxtWriteSlot(base + 0 * BNXT_RE_SLOT_SIZE, hdr);
+  BnxtWriteSlot(base + 1 * BNXT_RE_SLOT_SIZE, amo);
+  BnxtWriteSlot(base + 2 * BNXT_RE_SLOT_SIZE, sge);
 
   // fill psns in msn Table for retransmissions
   uint32_t msntblIdx = curMsntblSlotIdx % wq.msntblNum;
@@ -700,7 +746,7 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
   // Handle error cases
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
-    MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error),
+    MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", WcStatusString(error),
                 opcode, __FILE__, __LINE__);
     return opcode;
   }
@@ -723,7 +769,7 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
     MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d), wqeCounter: %u at %s:%d\n",
-                IbvWcStatusString(error), opcode, *wqeCounter, __FILE__, __LINE__);
+                WcStatusString(error), opcode, *wqeCounter, __FILE__, __LINE__);
     return opcode;
   }
 

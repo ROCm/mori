@@ -22,9 +22,9 @@
 #pragma once
 
 #include "mori/application/transport/rdma/providers/dv_loader.hpp"
+#include "mori/application/transport/rdma/providers/mlx5/mlx5_dv.h"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
-#include "mori/core/transport/rdma/providers/mlx5/mlx5_dv.h"
 
 namespace mori {
 namespace application {

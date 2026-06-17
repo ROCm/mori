@@ -21,89 +21,198 @@
 // SOFTWARE.
 #pragma once
 
+#include <grpcpp/channel.h>
 #include <grpcpp/support/status.h>
 
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
-#include "umbp/common/config.h"
-#include "umbp/common/types.h"
+#include "umbp/distributed/config.h"
+#include "umbp/distributed/peer/owned_location_source.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
+#include "umbp/distributed/types.h"
 
-namespace grpc_impl {
-class Channel;
-}
+// Forward-declared to keep umbp.pb.h out of the public header.
+namespace umbp {
+class HeartbeatRequest;
+class HeartbeatResponse;
+}  // namespace umbp
 
 namespace mori::umbp {
 
+class PeerDramAllocator;
+class PeerSsdManager;
+
+inline constexpr std::size_t kMasterClientMaxPendingHistograms = 15000;
+
+// Result of RouteGet — pure routing advisory.  The reader follows up
+// with peer.ResolveKey to fetch pages/descs/page_size.  `size` is
+// carried so the reader can preflight its destination buffer without
+// a separate round trip.
 struct RouteGetResult {
-  Location location;
+  std::string node_id;
+  TierType tier = TierType::UNKNOWN;
+  uint64_t size = 0;
   std::string peer_address;
-  std::vector<uint8_t> engine_desc_bytes;
-  std::vector<uint8_t> dram_memory_desc_bytes;
 };
 
 class MasterClient {
  public:
-  explicit MasterClient(const MasterClientConfig& config);
+  using Labels = std::vector<std::pair<std::string, std::string>>;
+
+  explicit MasterClient(const UMBPMasterClientConfig& config);
   ~MasterClient();
 
   MasterClient(const MasterClient&) = delete;
   MasterClient& operator=(const MasterClient&) = delete;
 
   // --- Client lifecycle ---
-  // Register with master. If auto_heartbeat, starts heartbeat thread.
-  grpc::Status RegisterSelf(
-      const std::map<TierType, TierCapacity>& tier_capacities, const std::string& peer_address = "",
-      const std::vector<uint8_t>& engine_desc_bytes = {},
-      const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list = {},
-      const std::vector<uint64_t>& dram_buffer_sizes = {},
-      const std::vector<uint64_t>& ssd_store_capacities = {});
+
+  // Register with master.  In the master-as-advisor design only
+  // membership + capacity-snapshot metadata is shipped — DRAM/HBM
+  // descriptors are peer-internal now.  `tier_capacities` is the single
+  // source of per-tier capacity, including SSD (TierType::SSD).
+  grpc::Status RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities,
+                            const std::string& peer_address = "",
+                            const std::vector<uint8_t>& engine_desc_bytes = {});
   grpc::Status UnregisterSelf();
 
-  // --- Block index ---
-  // Register a block key owned by this node in the master index.
-  grpc::Status Register(const std::string& key, const Location& location);
-  // Unregister a block key location owned by this node.
-  // If removed is non-null, returns 1 when removed, otherwise 0.
-  grpc::Status Unregister(const std::string& key, const Location& location,
-                          uint32_t* removed = nullptr);
-  grpc::Status FinalizeAllocation(const std::string& key, const Location& location,
-                                  const std::string& allocation_id);
-  grpc::Status PublishLocalBlock(const std::string& key, const Location& location);
-  grpc::Status AbortAllocation(const std::string& node_id, const std::string& allocation_id,
-                               uint64_t size);
-
   // --- Router ---
-  /// Pick an existing replica to read from.
-  /// Returns the Location via @p out_location (if found).
-  grpc::Status RouteGet(const std::string& key, std::optional<RouteGetResult>* out_result);
 
-  /// Pick a target node to write to.
-  /// After receiving the result, write via MORI-IO, then call FinalizeAllocation()
-  /// or AbortAllocation().
+  // Pick a target node for a Put.  `exclude_nodes` lets the writer
+  // steer master past nodes that already returned ENOSPC at peer
+  // level.
   grpc::Status RoutePut(const std::string& key, uint64_t block_size,
+                        const std::unordered_set<std::string>& exclude_nodes,
                         std::optional<RoutePutResult>* out_result);
 
-  // --- Heartbeat ---
+  // Pick a replica for a Get.  Same exclude semantics as RoutePut,
+  // used to retry past peers that report `found=false` on Resolve.
+  grpc::Status RouteGet(const std::string& key,
+                        const std::unordered_set<std::string>& exclude_nodes,
+                        std::optional<RouteGetResult>* out_result);
+
+  // --- Batch RPCs ---
+  grpc::Status BatchRoutePut(const std::vector<std::string>& keys,
+                             const std::vector<uint64_t>& block_sizes,
+                             const std::unordered_set<std::string>& exclude_nodes,
+                             std::vector<std::optional<RoutePutResult>>* out);
+  grpc::Status BatchRouteGet(const std::vector<std::string>& keys,
+                             const std::unordered_set<std::string>& exclude_nodes,
+                             std::vector<std::optional<RouteGetResult>>* out);
+
+  // Read-only batched existence probe.  out[i] mirrors keys[i].  No
+  // access-count / lease side effects on master, no per-node RouteGet
+  // counters — use this instead of BatchRouteGet when the caller only
+  // wants to know "is the key resident?" and is not about to RDMA-read.
+  grpc::Status BatchLookup(const std::vector<std::string>& keys, std::vector<bool>* out);
+
+  // --- Heartbeat (event-driven) ---
+  // Bind a PeerDramAllocator whose outbox the heartbeat thread will
+  // drain.  Pass nullptr for SSD-only peers (skipped, not registered).
+  // Also keeps the concrete pointer for DRAM-specific duties the
+  // OwnedLocationSource interface does not cover (capacity snapshot,
+  // owned-key counts, distributed-clear write gate).  Must be set before
+  // StartHeartbeat() — the heartbeat thread reads sources once per tick.
+  void SetPeerDramAllocator(PeerDramAllocator* dram_alloc);
+
+  // Bind the SSD manager: registers it as an owned-location event source
+  // AND keeps the concrete pointer so heartbeat can merge live SSD
+  // capacity into tier_capacities.  Pass nullptr to skip.  Must be set
+  // before StartHeartbeat().
+  void SetPeerSsdManager(PeerSsdManager* ssd_manager);
+
+  // Register an additional owned-location event source whose events are
+  // drained/snapshotted into the same heartbeat bundle (single monotonic
+  // seq).  Null is ignored.  Must be set before StartHeartbeat().
+  void AddOwnedLocationSource(OwnedLocationSource* source);
+
   void StartHeartbeat();
   void StopHeartbeat();
 
+  // Synchronously clear this node's UMBP-owned and external HiCache
+  // placement from master. When peer_alloc_ is bound, caller MUST have
+  // already invoked peer_alloc_->ClearLocal() (PoolClient::Clear()
+  // handles this); SSD-only peers skip that step. Returns true only
+  // after both the full-sync heartbeat and the external KV revoke RPC
+  // are acknowledged by master; on any failure returns false and leaves
+  // PeerDramAllocator::clear_full_sync_pending_ closed for the caller
+  // to retry.
+  bool ClearFullSync();
+
+  // --- Client-side metrics ---
+  void AddCounter(std::string name, std::string help, Labels labels, double delta);
+  void SetGauge(std::string name, std::string help, Labels labels, double value);
+  void Observe(std::string name, std::string help, Labels labels, const std::vector<double>& bounds,
+               double value);
+
+  // Register a callback run once per metrics flush tick in the existing metrics
+  // thread (no new thread) so a component can publish counters/gauges from its
+  // own atomics, keeping AddCounter off hot paths.  MUST be called before
+  // RegisterSelf() (the list is read lock-free afterwards; late calls are
+  // rejected).  Caller keeps the provider's data alive until StopMetricsReporting().
+  void AddMetricsProvider(std::function<void()> provider);
+
+  // Stop and join the metrics thread.  Idempotent.  PoolClient::Shutdown calls
+  // it before tearing down the components its provider reads.
+  void StopMetricsReporting();
+
   bool IsRegistered() const { return registered_; }
 
- private:
-  MasterClientConfig config_;
+  // --- External KV block events ---
+  grpc::Status ReportExternalKvBlocks(const std::string& node_id,
+                                      const std::vector<std::string>& hashes, TierType tier);
+  grpc::Status RevokeExternalKvBlocks(const std::string& node_id,
+                                      const std::vector<std::string>& hashes, TierType tier);
+  grpc::Status RevokeAllExternalKvBlocksAtTier(const std::string& node_id, TierType tier);
+  grpc::Status RevokeAllExternalKvBlocksForNode(const std::string& node_id);
 
-  std::shared_ptr<grpc_impl::Channel> channel_;
-  // Use void* to avoid exposing generated stub type in header.
-  // Cast to UMBPMaster::Stub* in the .cpp file.
+  struct ExternalKvNodeMatch {
+    std::string node_id;
+    std::string peer_address;
+    // Matched hashes grouped by every tier they currently live on for this
+    // node.  A single hash MAY appear in multiple tier buckets when the
+    // node holds physical copies on more than one tier (e.g. write_through
+    // created a CPU mirror while the GPU copy is still alive).  std::map
+    // keys iterate in sorted TierType order, so the first non-empty bucket
+    // is the fastest tier currently available on this node.
+    std::map<TierType, std::vector<std::string>> hashes_by_tier;
+
+    // Number of *distinct* matched hashes (size of the union across tiers).
+    // A hash present on HBM+DRAM still counts once.
+    size_t MatchedHashCount() const {
+      std::unordered_set<std::string_view> seen;
+      for (const auto& [tier, hashes] : hashes_by_tier) {
+        for (const auto& h : hashes) seen.insert(h);
+      }
+      return seen.size();
+    }
+  };
+  using ExternalKvHitCountEntry = mori::umbp::ExternalKvHitCountEntry;
+  grpc::Status MatchExternalKv(const std::vector<std::string>& hashes,
+                               std::vector<ExternalKvNodeMatch>* out_matches,
+                               bool count_as_hit = false);
+  grpc::Status GetExternalKvHitCounts(const std::vector<std::string>& hashes,
+                                      std::vector<ExternalKvHitCountEntry>* out_entries);
+
+ private:
+  UMBPMasterClientConfig config_;
+
+  std::shared_ptr<grpc::Channel> channel_;
   std::unique_ptr<void, void (*)(void*)> stub_;
 
   std::thread heartbeat_thread_;
@@ -114,11 +223,127 @@ class MasterClient {
   std::mutex hb_cv_mutex_;
   std::condition_variable hb_cv_;
 
-  // Cached tier capacities for heartbeat reporting
+  // Cached tier capacities — heartbeat reports the latest peer
+  // allocator snapshot when the bound PeerDramAllocator is non-null,
+  // else falls back to whatever was last set here.
   std::mutex caps_mutex_;
   std::map<TierType, TierCapacity> current_capacities_;
 
+  // Peer-event source for the heartbeat thread.  Non-owning; lifetime
+  // is managed by PoolClient.  Kept as a concrete pointer (in addition to
+  // its slot in owned_sources_) for DRAM-specific duties the
+  // OwnedLocationSource interface does not cover: TierCapacitiesSnapshot,
+  // OwnedKeyCountByTier, ClearLocal/ClearFullSyncAcked.
+  PeerDramAllocator* peer_alloc_ = nullptr;
+
+  // Non-owning.  Kept concrete (in addition to owned_sources_) so heartbeat
+  // can merge live SSD capacity into tier_capacities.
+  PeerSsdManager* ssd_manager_ = nullptr;
+
+  // All owned-location event sources (DRAM allocator + SSD manager).  Drained
+  // and snapshotted into a single heartbeat bundle under one monotonic seq.
+  // Populated before StartHeartbeat(); read-only afterwards (no lock needed).
+  std::vector<OwnedLocationSource*> owned_sources_;
+
+  // Serializes the actual Heartbeat RPC: at most one full-sync or
+  // delta heartbeat is on the wire at a time. ClearFullSync() takes
+  // it too so it cannot race with the heartbeat thread.
+  std::mutex hb_send_mutex_;
+
+  // Protects fields shared between the heartbeat thread, RegisterSelf,
+  // and ClearFullSync: outbox_, next_bundle_seq_, hb_last_acked_seq_,
+  // full_sync_pending_.
+  std::mutex hb_state_mutex_;
+  std::deque<EventBundle> outbox_;
+  uint64_t next_bundle_seq_ = 1;
+  uint64_t hb_last_acked_seq_ = 0;
+  // Force the next tick to send a full-sync (reseed master's view).
+  bool full_sync_pending_ = false;
+
   void HeartbeatLoop();
+  bool SendHeartbeatOnce();
+  // The "*Locked" suffix means: caller must hold hb_send_mutex_.
+  bool SendFullSyncHeartbeatLocked(const std::map<TierType, TierCapacity>& caps,
+                                   const std::map<TierType, uint64_t>& kv_counts);
+  bool SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacity>& caps,
+                                const std::map<TierType, uint64_t>& kv_counts);
+  grpc::Status SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
+                                      ::umbp::HeartbeatResponse* resp);
+
+  // Snapshot the freshest tier capacities and refresh the
+  // current_capacities_ fallback cache. When peer_alloc_ is bound,
+  // returns its bitmap-derived snapshot (DRAM/HBM) merged with cached
+  // entries for tiers it does not manage (e.g. SSD). When peer_alloc_
+  // is null, returns the cached snapshot unchanged. Acquires
+  // caps_mutex_ internally.
+  std::map<TierType, TierCapacity> SnapshotAndCacheTierCapacities();
+
+  // --- Metrics buffering ---
+  struct PendingSample {
+    std::string name;
+    std::string help;
+    Labels labels;
+    double value = 0.0;
+  };
+  // Per-series histogram state.  bucket_counts is CUMULATIVE
+  // (bucket_counts[i] = #observations with value <= bounds[i]) so the master
+  // can merge by per-bucket addition without any encoding conversion.
+  // warned_mismatch dedups the "first-write-wins" WARN per series, so a
+  // single misconfigured caller does not silence every other series' WARN.
+  struct HistogramAccumulator {
+    std::string name;
+    std::string help;
+    Labels labels;
+    std::vector<double> bounds;
+    std::vector<uint64_t> bucket_counts;
+    uint64_t count = 0;
+    double sum = 0.0;
+    bool warned_mismatch = false;
+  };
+
+  std::mutex metrics_mutex_;
+  std::unordered_map<std::string, PendingSample> pending_counters_;
+  std::unordered_map<std::string, PendingSample> pending_gauges_;
+  std::unordered_map<std::string, HistogramAccumulator> pending_histogram_aggregates_;
+  std::atomic<uint64_t> metrics_dropped_count_{0};
+
+  // Non-const so a friend test can shrink the cap to exercise the cold drop
+  // path without env vars or config plumbing.  Production reads the constant
+  // default; tests that want to verify the cap install a small override.
+  std::size_t pending_histogram_series_cap_ = kMasterClientMaxPendingHistograms;
+
+  uint64_t metrics_interval_ms_ = 1000;
+
+  std::thread metrics_thread_;
+  std::atomic<bool> metrics_running_{false};
+  std::mutex metrics_cv_mutex_;
+  std::condition_variable metrics_cv_;
+
+  void StartMetricsReporting();
+  void MetricsLoop();
+  // Run providers, swap the pending buffers, and ship one ReportMetrics.  Called
+  // every tick and once more after the loop exits (final shutdown flush).
+  void FlushMetricsOnce();
+
+  // Callbacks run at the top of every MetricsLoop tick (see AddMetricsProvider).
+  // Written only before StartMetricsReporting(); read-only afterwards.
+  std::vector<std::function<void()>> metrics_providers_;
+
+  // --- ScopedRpcTimer integration ---
+  // Called by ScopedRpcTimer at the end of every monitored MasterClient RPC.
+  // Both methods short-circuit when metrics_running_ is false to avoid
+  // unbounded buffer growth on never-registered (Python read-only) clients
+  // and during destructor windows.
+  friend class ScopedRpcTimer;
+  void RecordRpcLatency(std::string_view method, bool ok, double seconds);
+  void RecordRpcError(std::string_view method, std::string_view code);
+
+  // Test-only access: lets the cap-exercise test in
+  // tests/cpp/umbp/distributed/test_master_client_rpc_latency.cpp shrink
+  // pending_histogram_series_cap_ and inspect pending_histogram_aggregates_
+  // / metrics_dropped_count_.  Production code never touches these fields
+  // through this friend.
+  friend class MasterClientRpcLatencyTest;
 };
 
 }  // namespace mori::umbp

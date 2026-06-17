@@ -403,7 +403,7 @@ static void CopyRdmaEndpointsToGpu(ShmemStates* states) {
     return;
   }
 
-  size_t numEndpoints = gpuStates->worldSize * gpuStates->numQpPerPe;
+  size_t numEndpoints = static_cast<size_t>(gpuStates->worldSize) * gpuStates->numQpPerPe;
 
   // Allocate and copy endpoints.
   // Convert from host-side application::RdmaEndpoint (which contains ibverbs handles and QP
@@ -803,18 +803,6 @@ int ShmemMpiInit(MPI_Comm mpiComm) {
 
 int ShmemInit() { return ShmemMpiInit(MPI_COMM_WORLD); }
 #endif
-
-int ShmemTorchProcessGroupInit(const std::string& groupName) {
-#ifdef MORI_HAS_TORCH
-  return ShmemInit(new application::TorchBootstrapNetwork(groupName));
-#else
-  (void)groupName;
-  fprintf(stderr,
-          "[mori] Error: Torch bootstrap not available (built without PyTorch).\n"
-          "[mori] Use ShmemMpiInit() or rebuild with PyTorch installed.\n");
-  return -1;
-#endif
-}
 
 // Query APIs, Module Init, Barriers are in runtime.cpp
 

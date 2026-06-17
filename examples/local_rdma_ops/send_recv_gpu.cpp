@@ -22,8 +22,8 @@
 #include <hip/hip_runtime.h>
 
 #include "mori/application/application.hpp"
-#include "mori/application/utils/udma_barrier.h"
 #include "mori/core/core.hpp"
+#include "mori/core/utils/udma_barrier.h"
 
 using namespace mori;
 using namespace mori::application;
@@ -53,9 +53,17 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr, int 
     printf("RingDoorbell is done\n");
     __threadfence_system();
 
-    int snd_opcode =
-        PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx);
-    printf("send PollCq is done\n");
+    // PSD 4-arg PollCq is non-blocking (returns -1 when the CCQE msg_msn isn't
+    // there yet); BNXT/MLX5 spin internally.  Wrap in a busy-wait loop so this
+    // example works uniformly across all providers.
+    uint32_t snd_wqeIdx = 0;
+    int snd_opcode;
+    do {
+      snd_opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum,
+                             &epSend.cqHandle.consIdx, &snd_wqeIdx);
+    } while (snd_opcode < 0);
+    epSend.cqHandle.consIdx += 1;
+    printf("send PollCq is done, wqeIdx %u\n", snd_wqeIdx);
     UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.consIdx);
     printf("send UpdateCqDbrRecord is done\n");
     // printf("snd_opcode %d val %d\n", snd_opcode, reinterpret_cast<char*>(mrSend.addr)[0]);
@@ -84,9 +92,14 @@ __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr, int 
       printf("recv RingDoorbell is done\n");
     }
 
-    int rcv_opcode =
-        PollCq<P>(epRecv.cqHandle.cqAddr, epRecv.cqHandle.cqeNum, &epRecv.cqHandle.consIdx);
-    printf("recv PollCq is done\n");
+    uint32_t rcv_wqeIdx = 0;
+    int rcv_opcode;
+    do {
+      rcv_opcode = PollCq<P>(epRecv.cqHandle.cqAddr, epRecv.cqHandle.cqeNum,
+                             &epRecv.cqHandle.consIdx, &rcv_wqeIdx);
+    } while (rcv_opcode < 0);
+    epRecv.cqHandle.consIdx += 1;
+    printf("recv PollCq is done, wqeIdx %u\n", rcv_wqeIdx);
     UpdateCqDbrRecord<P>(epRecv.cqHandle, epRecv.cqHandle.consIdx);
     printf("recv UpdateCqDbrRecord is done\n");
 

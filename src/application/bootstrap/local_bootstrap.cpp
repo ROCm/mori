@@ -104,7 +104,7 @@ void LocalBootstrapNetwork::Barrier() {
 
   // Phase 1: All processes arrive
   std::string arriveFile = socketBasePath_ + "barrier_arrive_" + std::to_string(localRank);
-  int fd = open(arriveFile.c_str(), O_CREAT | O_WRONLY, 0666);
+  int fd = open(arriveFile.c_str(), O_CREAT | O_WRONLY, 0600);
   if (fd >= 0) {
     close(fd);
   }
@@ -139,7 +139,7 @@ void LocalBootstrapNetwork::Barrier() {
 
   // Phase 2: Signal departure (safe to proceed)
   std::string departFile = socketBasePath_ + "barrier_depart_" + std::to_string(localRank);
-  fd = open(departFile.c_str(), O_CREAT | O_WRONLY, 0666);
+  fd = open(departFile.c_str(), O_CREAT | O_WRONLY, 0600);
   if (fd >= 0) {
     close(fd);
   }

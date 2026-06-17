@@ -145,3 +145,29 @@ add_shmem_example(ibverbs_test SOURCES application/ibverbs_test.cpp)
 
 add_executable(test_vmm_mpi_write utils/test_vmm_mpi_write.cpp)
 target_link_libraries(test_vmm_mpi_write mori_application hip::host hip::device)
+
+# ============================================================================
+# Static-link SIOF reproducer for mori_shmem's GpuStatesAddrProvider registry
+# ============================================================================
+add_library(
+  mori_shmem_for_siof_static STATIC
+  ${CMAKE_SOURCE_DIR}/src/shmem/init.cpp
+  ${CMAKE_SOURCE_DIR}/src/shmem/runtime.cpp
+  ${CMAKE_SOURCE_DIR}/src/shmem/memory.cpp)
+target_include_directories(
+  mori_shmem_for_siof_static PUBLIC ${CMAKE_SOURCE_DIR}/include
+                                    ${CMAKE_SOURCE_DIR})
+target_link_libraries(mori_shmem_for_siof_static PUBLIC mori_application
+                                                        mori_logging hip::host)
+
+add_executable(static_link_siof_test shmem/static_link_siof_test.cpp)
+
+# Test source is HIP — shmem.hpp's static_init block is gated on __HIPCC__ /
+# __HIP__ / __CUDACC__ and emits the `_s_gpuStatesRegistrar` only when compiled
+# as device code.
+set_source_files_properties(shmem/static_link_siof_test.cpp PROPERTIES LANGUAGE
+                                                                       HIP)
+
+target_link_libraries(
+  static_link_siof_test -Wl,--whole-archive mori_shmem_for_siof_static
+  -Wl,--no-whole-archive hip::host)

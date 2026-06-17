@@ -61,7 +61,7 @@ if(BUILD_COLLECTIVE)
 endif()
 
 if(BUILD_UMBP)
-  target_link_libraries(mori_pybinds umbp_core)
+  target_link_libraries(mori_pybinds umbp_core umbp_common)
   target_include_directories(mori_pybinds
                              PRIVATE ${CMAKE_SOURCE_DIR}/src/umbp/include)
   target_compile_definitions(mori_pybinds PRIVATE MORI_BUILD_UMBP)
@@ -74,16 +74,8 @@ if(BUILD_XLA_FFI_OPS)
 endif()
 
 # For python packages to find dependent libraries
-if(BUILD_TORCH_BOOTSTRAP)
-  set_target_properties(
-    mori_pybinds
-    PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../torch/lib"
-               INSTALL_RPATH "$ORIGIN;$ORIGIN/../torch/lib"
-               BUILD_WITH_INSTALL_RPATH TRUE)
-else()
-  set_target_properties(
-    mori_pybinds
-    PROPERTIES BUILD_RPATH "$ORIGIN"
-               INSTALL_RPATH "$ORIGIN"
-               BUILD_WITH_INSTALL_RPATH TRUE)
-endif()
+set_target_properties(
+  mori_pybinds
+  PROPERTIES BUILD_RPATH "$ORIGIN"
+             INSTALL_RPATH "$ORIGIN"
+             BUILD_WITH_INSTALL_RPATH TRUE)

@@ -26,11 +26,32 @@
 
 #include <cstring>
 #include <future>
+#include <vector>
 
 #include "mori/io/logging.hpp"
+#include "mori/utils/env_utils.hpp"
 
 namespace mori {
 namespace io {
+
+namespace {
+
+// Allowed CPUs of the current process, sorted ascending. Reflects cgroup/cpuset
+// limits. Empty means affinity could not be read.
+std::vector<int> GetAllowedCpus() {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  std::vector<int> cpus;
+  if (sched_getaffinity(0, sizeof(set), &set) != 0) {
+    return cpus;
+  }
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (CPU_ISSET(cpu, &set)) cpus.push_back(cpu);
+  }
+  return cpus;
+}
+
+}  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                   MultithreadExecutor::Worker                                  */
@@ -56,25 +77,35 @@ void MultithreadExecutor::Worker::Shutdown() {
 }
 
 void MultithreadExecutor::Worker::MainLoop() {
-  int coreOffset = 0;
-  const char* env = std::getenv("MORI_CORE_OFFSET");
-  if (env) {
-    coreOffset = std::stoi(env);
-  }
+  // MORI_CORE_OFFSET is relative to the allowed CPU list, so binding stays within the cpuset.
+  if (auto coreOffset = mori::env::GetInt("MORI_CORE_OFFSET")) {
+    std::vector<int> allowed = GetAllowedCpus();
+    if (allowed.empty()) {
+      MORI_IO_WARN(
+          "worker {} could not read allowed CPU set (sched_getaffinity failed); "
+          "worker will run on any available core.",
+          workerId);
+    } else {
+      int n = static_cast<int>(allowed.size());
+      int idx = ((workerId + *coreOffset) % n + n) % n;
+      int targetCore = allowed[idx];
 
-  cpu_set_t cpuset;
-  CPU_ZERO(&cpuset);
-  int targetCore = workerId + coreOffset;
-  CPU_SET(targetCore, &cpuset);
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      CPU_SET(targetCore, &cpuset);
 
-  int rc = pthread_setaffinity_np(thd.native_handle(), sizeof(cpu_set_t), &cpuset);
-  if (rc != 0) {
-    MORI_IO_WARN(
-        "worker {} failed to set affinity to core {}: errno={} ({}). "
-        "Worker will run on any available core. "
-        "This is usually caused by: CPU not available in cpuset, "
-        "NUMA configuration, or container CPU limits.",
-        workerId, targetCore, rc, strerror(rc));
+      int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+      if (rc != 0) {
+        MORI_IO_WARN(
+            "worker {} failed to set affinity to core {} (allowed[{}], allowed size {}): "
+            "errno={} ({}). Worker will run on any available core. "
+            "This is usually caused by NUMA configuration or container CPU limits.",
+            workerId, targetCore, idx, n, rc, strerror(rc));
+      } else {
+        MORI_IO_INFO("worker {} bound to core {} (allowed[{}] of {} allowed CPUs, offset {})",
+                     workerId, targetCore, idx, n, *coreOffset);
+      }
+    }
   }
 
   MORI_IO_INFO("worker {} enter main loop, running on core {}", workerId, sched_getcpu());

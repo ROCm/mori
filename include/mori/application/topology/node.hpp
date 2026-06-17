@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include <cstdint>
+
 namespace mori {
 namespace application {
 

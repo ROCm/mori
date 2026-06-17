@@ -62,10 +62,11 @@ def get_cache_dir(
     profiler: bool = False,
     *,
     cov: int | None = None,
+    ccqe: bool = False,
 ) -> Path:
     """Return the cache directory for a specific arch + NIC + content combo.
 
-    Structure: <cache_root>/<arch>_<nic>[_profiler][_cov<N>]/<content_hash>/
+    Structure: <cache_root>/<arch>_<nic>[_ccqe][_profiler][_cov<N>]/<content_hash>/
 
     Args:
         profiler: When True, appends '_profiler' to the directory name so that
@@ -74,10 +75,17 @@ def get_cache_dir(
              included in the directory name to separate bitcode compiled
              with different ABI versions (e.g. cov5 for Triton, cov6 for
              FlyDSL).  None omits the suffix for backward compatibility.
+        ccqe: When True, appends '_ccqe' so CCQE and non-CCQE kernels are
+              cached separately (they differ by -DIONIC_CCQE compile flag).
     """
     content_hash = _hash_tree(source_paths)
+    ccqe_suffix = "_ccqe" if ccqe else ""
     profiler_suffix = "_profiler" if profiler else ""
     cov_suffix = f"_cov{cov}" if cov is not None else ""
-    d = get_cache_root() / f"{arch}_{nic}{profiler_suffix}{cov_suffix}" / content_hash
+    d = (
+        get_cache_root()
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}"
+        / content_hash
+    )
     d.mkdir(parents=True, exist_ok=True)
     return d

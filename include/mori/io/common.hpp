@@ -23,6 +23,8 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <msgpack.hpp>
 #include <mutex>
@@ -100,14 +102,15 @@ struct MemoryDesc {
   size_t size{0};
   MemoryLocationType loc;
   std::array<char, kIpcHandleSize> ipcHandle{};
+  int numaNode{-1};
 
   constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
            (deviceBusId == rhs.deviceBusId) && (data == rhs.data) && (size == rhs.size) &&
-           (loc == rhs.loc);
+           (loc == rhs.loc) && (numaNode == rhs.numaNode);
   }
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle);
+  MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode);
 };
 
 using TransferUniqueId = uint64_t;
@@ -116,6 +119,10 @@ struct TransferStatus {
  public:
   TransferStatus() = default;
   ~TransferStatus() = default;
+  TransferStatus(const TransferStatus&) = delete;
+  TransferStatus& operator=(const TransferStatus&) = delete;
+  TransferStatus(TransferStatus&&) = delete;
+  TransferStatus& operator=(TransferStatus&&) = delete;
 
   StatusCode Code() { return CodeWithProgress(); }
   uint32_t CodeUint32() { return static_cast<uint32_t>(Code()); }
@@ -126,12 +133,15 @@ struct TransferStatus {
   }
 
   void Update(enum StatusCode val, const std::string& message) {
-    std::lock_guard<std::mutex> lock(msgMu);
-    StatusCode current = code.load(std::memory_order_relaxed);
-    if (current > StatusCode::ERR_BEGIN) return;
+    {
+      std::lock_guard<std::mutex> lock(msgMu);
+      StatusCode current = code.load(std::memory_order_relaxed);
+      if (current > StatusCode::ERR_BEGIN) return;
 
-    msg = message;
-    code.store(val, std::memory_order_release);
+      msg = message;
+      code.store(val, std::memory_order_release);
+    }
+    cv_.notify_all();
   }
 
   bool Init() { return Code() == StatusCode::INIT; }
@@ -139,20 +149,56 @@ struct TransferStatus {
   bool Succeeded() { return Code() == StatusCode::SUCCESS; }
   bool Failed() { return Code() > StatusCode::ERR_BEGIN; }
 
-  void SetCode(enum StatusCode val) { code.store(val, std::memory_order_release); }
+  void SetCode(enum StatusCode val) {
+    {
+      std::lock_guard<std::mutex> lock(msgMu);
+      code.store(val, std::memory_order_release);
+    }
+    if (val != StatusCode::INIT && val != StatusCode::IN_PROGRESS) {
+      cv_.notify_all();
+    }
+  }
   void SetMessage(const std::string& val) {
     std::lock_guard<std::mutex> lock(msgMu);
     msg = val;
   }
 
-  void Wait() {
+  void Wait() { (void)WaitFor(-1); }
+
+  // timeoutMs < 0 waits indefinitely, timeoutMs == 0 polls once, timeoutMs > 0
+  // waits up to the requested deadline. The returned code may still be
+  // IN_PROGRESS when a bounded wait times out.
+  StatusCode WaitFor(int timeoutMs = -1) {
+    StatusCode current = code.load(std::memory_order_acquire);
+    if (current != StatusCode::IN_PROGRESS) return current;
+
     PollProgress();
-    if (waitCallback) {
-      waitCallback();
-      return;
+    if (timeoutMs == 0) {
+      return code.load(std::memory_order_acquire);
     }
-    while (InProgress()) {
+
+    if (timeoutMs < 0) {
+      if (waitCallback) {
+        waitCallback();
+        return code.load(std::memory_order_acquire);
+      }
+
+      std::unique_lock<std::mutex> lock(msgMu);
+      cv_.wait(lock,
+               [&] { return code.load(std::memory_order_acquire) != StatusCode::IN_PROGRESS; });
+      return code.load(std::memory_order_acquire);
     }
+
+    std::unique_lock<std::mutex> lock(msgMu);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (code.load(std::memory_order_acquire) == StatusCode::IN_PROGRESS) {
+      if (std::chrono::steady_clock::now() >= deadline) break;
+      cv_.wait_until(lock, deadline);
+      lock.unlock();
+      PollProgress();
+      lock.lock();
+    }
+    return code.load(std::memory_order_acquire);
   }
 
   void SetWaitCallback(std::function<void()> cb) { waitCallback = std::move(cb); }
@@ -174,6 +220,7 @@ struct TransferStatus {
   std::string msg;
   std::function<void()> waitCallback;
   std::function<void()> progressCallback;
+  std::condition_variable cv_;
 };
 
 using SizeVec = std::vector<size_t>;

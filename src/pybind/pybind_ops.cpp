@@ -84,6 +84,52 @@ int64_t BuildArgs(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum, 
   return reinterpret_cast<int64_t>(&args);
 }
 
+// BuildArgs variant that reads routing from caller-owned tensors; replayMode toggles cache vs
+// replay routing.
+int64_t BuildArgsWithRouting(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum,
+                             int hiddenDim, int useExternalInpBuf, bool replayMode,
+                             int64_t disp_dest_tok_id_map_ptr,
+                             int64_t inter_node_disp_dest_tok_id_map_ptr,
+                             int64_t inter_node_disp_send_map_ptr, int64_t total_recv_token_num_ptr,
+                             int64_t disp_tok_id_to_src_tok_id_local_ptr) {
+  mori::moe::EpDispatchCombineRoutingPtrs routing;
+  routing.dispDestTokIdMap = reinterpret_cast<mori::moe::index_t*>(disp_dest_tok_id_map_ptr);
+  routing.interNodeDispDestTokIdMap =
+      reinterpret_cast<mori::moe::index_t*>(inter_node_disp_dest_tok_id_map_ptr);
+  routing.interNodeDispSendMap =
+      reinterpret_cast<mori::moe::index_t*>(inter_node_disp_send_map_ptr);
+  routing.totalRecvTokenNum = reinterpret_cast<mori::moe::index_t*>(total_recv_token_num_ptr);
+  routing.dispTokIdToSrcTokIdLocal =
+      reinterpret_cast<mori::moe::index_t*>(disp_tok_id_to_src_tok_id_local_ptr);
+  routing.Validate();
+
+  thread_local mori::moe::EpDispatchCombineArgsRaw args;
+  args = mori::moe::GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum, &routing, replayMode);
+  if (hiddenDim > 0) {
+    args.config.hiddenDim = hiddenDim;
+    handle.curHiddenDim = hiddenDim;
+  } else if (handle.curHiddenDim > 0) {
+    args.config.hiddenDim = handle.curHiddenDim;
+  }
+  assert(args.config.hiddenDim > 0 && args.config.hiddenDim <= handle.config.hiddenDim);
+  if (useExternalInpBuf >= 0)
+    args.config.useExternalInpBuffer = static_cast<bool>(useExternalInpBuf);
+  return reinterpret_cast<int64_t>(&args);
+}
+
+// Stream-ordered snapshot of the local view of dispTokIdToSrcTokIdMemObj into a caller tensor.
+void SnapshotDispTokIdToSrcTokIdLocal(mori::moe::EpDispatchCombineHandle& handle, int64_t dst_ptr,
+                                      int64_t stream) {
+  if (!handle.dispTokIdToSrcTokIdMemObj.IsValid()) return;
+  auto* src = handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>();
+  const auto& cfg = handle.config;
+  size_t nelem =
+      static_cast<size_t>(cfg.MaxNumTokensToSend()) * static_cast<size_t>(cfg.numExpertPerRank);
+  size_t nbytes = nelem * sizeof(mori::moe::index_t);
+  HIP_RUNTIME_CHECK(hipMemcpyAsync(reinterpret_cast<void*>(dst_ptr), src, nbytes,
+                                   hipMemcpyDeviceToDevice, reinterpret_cast<hipStream_t>(stream)));
+}
+
 // Backward-compatible helper for call sites that still want a merged API.
 int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t input_ptr,
                             int input_dtype, int64_t num_tokens, int64_t weight_ptr,
@@ -270,6 +316,14 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
         py::arg("indices_ptr"));
   m.def("build_args", &BuildArgs, py::arg("handle"), py::arg("rdma_block_num") = -1,
         py::arg("hidden_dim") = -1, py::arg("use_external_inp_buf") = -1);
+  m.def("build_args_with_routing", &BuildArgsWithRouting, py::arg("handle"),
+        py::arg("rdma_block_num") = -1, py::arg("hidden_dim") = -1,
+        py::arg("use_external_inp_buf") = -1, py::arg("replay_mode") = false,
+        py::arg("disp_dest_tok_id_map_ptr"), py::arg("inter_node_disp_dest_tok_id_map_ptr"),
+        py::arg("inter_node_disp_send_map_ptr"), py::arg("total_recv_token_num_ptr"),
+        py::arg("disp_tok_id_to_src_tok_id_local_ptr"));
+  m.def("snapshot_disp_tok_id_to_src_tok_id_local", &SnapshotDispTokIdToSrcTokIdLocal,
+        py::arg("handle"), py::arg("dst_ptr"), py::arg("stream") = 0);
   m.def("prepare_and_build_args", &PrepareAndBuildArgs, py::arg("handle"), py::arg("inp_ptr"),
         py::arg("dtype"), py::arg("num_tokens"), py::arg("weight_ptr"), py::arg("scale_ptr"),
         py::arg("indices_ptr"), py::arg("rdma_block_num") = -1, py::arg("hidden_dim") = -1,
@@ -305,6 +359,7 @@ namespace mori {
 void RegisterMoriOps(py::module_& m) {
   pybind11::enum_<mori::moe::KernelType>(m, "EpDispatchCombineKernelType")
       .value("IntraNode", mori::moe::KernelType::IntraNode)
+      .value("IntraNodeLL", mori::moe::KernelType::IntraNodeLL)
       .value("InterNode", mori::moe::KernelType::InterNode)
       .value("InterNodeV1", mori::moe::KernelType::InterNodeV1)
       .value("InterNodeV1LL", mori::moe::KernelType::InterNodeV1LL)

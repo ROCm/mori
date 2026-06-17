@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "umbp/distributed/routing/router.h"
 
+#include <unordered_map>
+
 #include "mori/utils/mori_log.hpp"
 
 namespace mori::umbp {
@@ -29,67 +31,84 @@ Router::Router(GlobalBlockIndex& index, ClientRegistry& registry,
                std::unique_ptr<RouteGetStrategy> get_strategy,
                std::unique_ptr<RoutePutStrategy> put_strategy)
     : index_(index), registry_(registry) {
+  // Default to tier-priority (HBM > DRAM > SSD): with the SSD cold tier live, a
+  // random pick could route a key that also has a DRAM/HBM copy to the slow
+  // SSD.  Callers can still inject RandomRouteGetStrategy (or any other) via
+  // config_.get_strategy.
   get_strategy_ =
-      get_strategy ? std::move(get_strategy) : std::make_unique<RandomRouteGetStrategy>();
-  put_strategy_ =
-      put_strategy ? std::move(put_strategy) : std::make_unique<TierAwareMostAvailableStrategy>();
+      get_strategy ? std::move(get_strategy) : std::make_unique<TierPriorityRouteGetStrategy>();
+  // Default to most-available / no-affinity: the single built-in put strategy.
+  // Callers can still inject any RoutePutStrategy (e.g. an env-configured
+  // ConfigurableRoutePutStrategy from master startup) via config_.put_strategy.
+  put_strategy_ = put_strategy ? std::move(put_strategy)
+                               : std::make_unique<ConfigurableRoutePutStrategy>(
+                                     ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable,
+                                     ConfigurableRoutePutStrategy::NodeAffinity::kNone);
 }
 
-std::optional<Location> Router::RouteGet(const std::string& key, const std::string& node_id) {
-  auto locations = index_.Lookup(key);
-
-  if (locations.empty()) {
-    MORI_UMBP_DEBUG("[Router] RouteGet key='{}': not found", key);
-    return std::nullopt;
-  }
-
-  Location selected = get_strategy_->Select(locations, node_id);
-  index_.RecordAccess(key);
-
-  MORI_UMBP_DEBUG("[Router] RouteGet key='{}': selected node={}, location={}", key,
-                  selected.node_id, selected.location_id);
-  return selected;
+std::optional<RouteGetResolution> Router::RouteGet(
+    const std::string& key, const std::string& node_id,
+    const std::unordered_set<std::string>& exclude_nodes) {
+  auto results = BatchRouteGet({key}, node_id, exclude_nodes);
+  return std::move(results.front());
 }
 
-std::optional<RoutePutResult> Router::RoutePut(const std::string& key, const std::string& node_id,
-                                               uint64_t block_size) {
+std::optional<RoutePutResult> Router::RoutePut(
+    const std::string& key, const std::string& node_id, uint64_t block_size,
+    const std::unordered_set<std::string>& exclude_nodes) {
+  // Delegate to the batch path (size=1) so master-side dedup (BatchLookupExists)
+  // and projected-capacity logic have a single home; a returned kAlreadyExists
+  // now flows back through RoutePutResponse.outcome.
+  auto results = BatchRoutePut({key}, node_id, {block_size}, exclude_nodes);
+  return std::move(results.front());
+}
+
+std::vector<std::optional<RoutePutResult>> Router::BatchRoutePut(
+    const std::vector<std::string>& keys, const std::string& node_id,
+    const std::vector<uint64_t>& block_sizes,
+    const std::unordered_set<std::string>& exclude_nodes) {
+  // SelectBatch applies dedup + projected capacity on this batch-local snapshot;
+  // the peer allocator stays the final ENOSPC arbiter. A keys/block_sizes length
+  // mismatch is logged as a MORI ERROR and yields an all-nullopt result
+  // (best-effort: no throw, every key reads as unroutable).
+  auto exists_mask = index_.BatchLookupExists(keys);
   auto candidates = registry_.GetAliveClients();
+  return put_strategy_->SelectBatch(node_id, block_sizes, exists_mask, std::move(candidates),
+                                    exclude_nodes);
+}
 
-  if (candidates.empty()) {
-    MORI_UMBP_DEBUG("[Router] RoutePut key='{}' from={}: no alive clients", key, node_id);
-    return std::nullopt;
+std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(
+    const std::vector<std::string>& keys, const std::string& node_id,
+    const std::unordered_set<std::string>& exclude_nodes) {
+  std::vector<std::optional<RouteGetResolution>> results(keys.size());
+
+  // Snapshot peer addresses once for the whole batch.  Master assumes
+  // the snapshot is stable for the duration of one BatchRouteGet.
+  std::unordered_map<std::string, std::string> node_to_peer;
+  for (const auto& client : registry_.GetAliveClients()) {
+    node_to_peer[client.node_id] = client.peer_address;
   }
 
-  for (;;) {
-    auto result = put_strategy_->Select(candidates, block_size);
-    if (!result) {
-      MORI_UMBP_DEBUG("[Router] RoutePut key='{}' from={}: no node with sufficient capacity", key,
-                      node_id);
-      return std::nullopt;
+  auto all_locs = index_.BatchLookupForRouteGet(keys, exclude_nodes, lease_duration_);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto& locations = all_locs[i];
+    if (locations.empty()) {
+      MORI_UMBP_DEBUG(
+          "[Router] BatchRouteGet key='{}': not routed (missing or every replica excluded)",
+          keys[i]);
+      continue;
     }
+    Location selected = get_strategy_->Select(locations, node_id);
 
-    auto alloc = registry_.AllocateForPut(result->node_id, result->tier, block_size);
-    if (alloc) {
-      result->peer_address = std::move(alloc->peer_address);
-      result->engine_desc_bytes = std::move(alloc->engine_desc_bytes);
-      result->dram_memory_desc_bytes = std::move(alloc->dram_memory_desc_bytes);
-      result->allocated_offset = alloc->allocated_offset;
-      result->buffer_index = alloc->buffer_index;
-      result->allocation_id = std::move(alloc->allocation_id);
-      MORI_UMBP_DEBUG("[Router] RoutePut key='{}' from={}: selected node={}, tier={}, offset={}",
-                      key, node_id, result->node_id, TierTypeName(result->tier),
-                      result->allocated_offset);
-      return result;
-    }
-
-    MORI_UMBP_DEBUG("[Router] RoutePut key='{}': allocation failed on node={} tier={}, retrying",
-                    key, result->node_id, TierTypeName(result->tier));
-    for (auto& c : candidates) {
-      if (c.node_id == result->node_id) {
-        c.tier_capacities.erase(result->tier);
-      }
-    }
+    RouteGetResolution out;
+    out.location = selected;
+    auto it = node_to_peer.find(selected.node_id);
+    if (it != node_to_peer.end()) out.peer_address = it->second;
+    MORI_UMBP_DEBUG("[Router] BatchRouteGet key='{}': selected node={}, tier={}, size={}", keys[i],
+                    selected.node_id, TierTypeName(selected.tier), selected.size);
+    results[i] = std::move(out);
   }
+  return results;
 }
 
 }  // namespace mori::umbp

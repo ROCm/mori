@@ -32,9 +32,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "mori/application/transport/sdma/anvil_device.hpp"
+#include "hip/hip_runtime_api.h"  // hipIpcMemHandle_t
+// Re-exported as a device-safe convenience: this header carries no core:: type
+// itself, but device consumers (shmem/collective) pull the core RDMA POD types
+// through it.
 #include "mori/core/transport/rdma/core_device_types.hpp"
 #include "mori/hip_compat.hpp"
+
+// SymmMemObj holds only an anvil::SdmaQueueDeviceHandle** (a pointer), so a
+// forward declaration is enough — this keeps anvil_device.hpp (-> hsakmt) out of
+// the many consumers that only want the POD memory types. TUs that dereference
+// SymmMemObj::deviceHandles_d include core/transport/sdma/anvil_device.hpp
+// themselves.
+namespace anvil {
+struct SdmaQueueDeviceHandle;
+}
 
 namespace mori {
 namespace application {
@@ -44,6 +56,11 @@ namespace application {
 /* ---------------------------------------------------------------------------------------------- */
 
 enum TransportType { RDMA = 0, P2P = 1, SDMA = 2 };
+
+// Atomic internal buffer configuration. Defined here (device-safe) rather than in
+// the host transport/rdma/rdma.hpp so device kernels (e.g. shmem_ibgda_kernels) can
+// use it without pulling in the host RDMA stack (and system verbs.h/mlx5dv.h).
+static constexpr size_t ATOMIC_IBUF_SLOT_SIZE = 8;  // Each atomic ibuf slot is 8 bytes
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      RDMA Types (device-safe)                                  */
@@ -132,17 +149,17 @@ struct SymmMemObj {
 
   // For Sdma
   anvil::SdmaQueueDeviceHandle** deviceHandles_d = nullptr;  // should only placed on GPU
-  HSAuint64* signalPtrs = nullptr;                           // should only placed on GPU
+  uint64_t* signalPtrs = nullptr;                            // should only placed on GPU
   uint32_t sdmaNumQueue = 2;                                 // number of sdma queue
-  HSAuint64* expectSignalsPtr = nullptr;                     // should only placed on GPU
+  uint64_t* expectSignalsPtr = nullptr;                      // should only placed on GPU
   // Remote signal: peerSignalPtrs[pe] points to PE pe's signalPtrs mapped into local address space.
   // SdmaPutThread writes ATOMIC to peerSignalPtrs[remotePe] + myPe*sdmaNumQueue + qId,
   // so the remote PE can directly read its own signalPtrs to detect completion.
-  HSAuint64** peerSignalPtrs = nullptr;  // should only placed on GPU
+  uint64_t** peerSignalPtrs = nullptr;  // should only placed on GPU
   // Host-side copy of peer signal pointers for IPC cleanup during deregistration.
   // Only entries opened via hipIpcOpenMemHandle need closing; same-process (SPMT)
   // entries are raw VA and must NOT be closed.
-  HSAuint64** peerSignalPtrsHost = nullptr;  // should only placed on CPU
+  uint64_t** peerSignalPtrsHost = nullptr;  // should only placed on CPU
 
   __device__ __host__ RdmaMemoryRegion GetRdmaMemoryRegion(int pe) const {
     RdmaMemoryRegion mr;

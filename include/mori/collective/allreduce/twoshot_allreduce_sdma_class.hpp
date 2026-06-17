@@ -25,6 +25,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <tuple>
