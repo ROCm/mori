@@ -23,7 +23,7 @@
 // CCO p2p get latency — PE 0 pulls from PE 1, one op per iteration.
 //
 //   -T lsa   : single flat-VA load of the whole buffer per iteration.
-//   -T igbda : single RDMA read + flush per iteration.
+//   -T ibgda : single RDMA read + flush per iteration.
 
 #include <cstdio>
 #include <cstdlib>
@@ -53,10 +53,10 @@ __global__ void lsa_get_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, 
   }
 }
 
-// IGBDA: one block issues a single RDMA read of the whole buffer + flush per
+// IBGDA: one block issues a single RDMA read of the whole buffer + flush per
 // iteration.
 template <core::ProviderType PrvdType>
-__global__ void igbda_get_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
+__global__ void ibgda_get_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
                               size_t len_doubles, ccoDevComm devComm, int iter) {
   if (blockIdx.x != 0) return;
   ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
           hipLaunchKernelGGL(lsa_get_lat, grid, block, 0, 0, ctx.send_win, ctx.recv_win,
                              len_doubles, ctx.peer_lsa_rank, count);
         } else {
-          CCO_GDA_DISPATCH(hipLaunchKernelGGL((igbda_get_lat<P>), grid, block, 0, 0, ctx.send_win,
+          CCO_GDA_DISPATCH(hipLaunchKernelGGL((ibgda_get_lat<P>), grid, block, 0, 0, ctx.send_win,
                                               ctx.recv_win, len_doubles, ctx.devComm, count));
         }
         HIP_RUNTIME_CHECK(hipGetLastError());
