@@ -22,6 +22,14 @@
 #pragma once
 
 #include "mori/hip_compat.hpp"
+// The device helpers below use HIP builtins (blockDim/threadIdx/__ballot/
+// __popcll/atomicCAS/...). Include the runtime directly so this header is
+// self-contained under device compilation (e.g. the shmem JIT/bitcode path),
+// rather than relying on an includer pulling it first. hip_compat keeps the
+// host (non-hipcc) parse working for the __device__/__host__-tagged helpers.
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#include <hip/hip_runtime.h>
+#endif
 
 #ifndef warpSize
 #if defined(__GFX8__) || defined(__GFX9__)
