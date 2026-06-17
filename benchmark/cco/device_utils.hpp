@@ -44,15 +44,10 @@ __device__ inline void lsa_copy_strided(T* __restrict__ dst, const T* __restrict
   }
 }
 
-// GPU-internal cross-block barrier (single GPU, NOT cross-rank). All nblocks of
-// this kernel launch rendezvous at the end of round i. This matches shmem's
-// bw_cross_block_barrier_round exactly so the LSA bw measurement window includes
-// the same per-round all-block sync — an apples-to-apples comparison against the
-// shmem benchmark. (CCO's ccoLsaBarrierSession is a *cross-GPU* barrier and is
-// not equivalent here: the LSA bw is unidirectional, only PE 0 runs the kernel.)
-//
-// counter_d[0] = arrival counter, counter_d[1] = phase counter. Call from ALL
-// threads of ALL blocks with the same (counter_d, nblocks, i).
+// GPU-internal all-block barrier (single GPU, not cross-rank), matching shmem's
+// bw_cross_block_barrier_round so the LSA bw timed window includes the same
+// per-round sync. counter_d[0]=arrivals, counter_d[1]=phase; call from all
+// threads of all blocks with the same (counter_d, nblocks, i).
 __device__ inline void bw_cross_block_barrier_round(volatile unsigned int* counter_d, int nblocks,
                                                     int i) {
   __syncthreads();

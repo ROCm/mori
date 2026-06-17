@@ -38,11 +38,8 @@
 
 namespace mori::cco::benchmark {
 
-// LSA: each block reads its chunk from the peer's send window into the local
-// recv window. Scope semantics aligned with shmem (see p2p_put_bw): all block
-// threads participate; scope_size only sets the copy cooperation granularity
-// (block=whole block, warp=one wavefront, thread=one thread per contiguous
-// segment).
+// LSA: flat-VA load loop (peer send → local recv). scope_size = copy
+// granularity; all block threads participate (see p2p_put_bw).
 __global__ void lsa_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
                            volatile unsigned int* counter_d, size_t len_doubles, int peerLsa,
                            int iter, int scope_size) {
@@ -65,17 +62,13 @@ __global__ void lsa_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 
   for (int i = 0; i < iter; i++) {
     lsa_copy_strided(dst, src, per_unit, lane, scope_size);
-    // System fence + per-round all-block barrier (mirrors shmem) — see
-    // p2p_put_bw for the cache-absorption + fair-comparison rationale.
-    __threadfence_system();
+    __threadfence_system();  // see p2p_put_bw (cache absorption)
     bw_cross_block_barrier_round(counter_d, nblocks, i);
   }
 }
 
-// IBGDA: one QP context per block (ginContext=blockIdx) — each block owns its QP
-// and is independent: pipelines its chunk's reads, then flushes its own QP. No
-// cross-block barrier. block scope = one bulk RDMA read per block; warp/thread
-// scope subdivide. See p2p_put_bw for the flush-vs-quiet note.
+// IBGDA: one QP per block; pipeline reads + flush own QP. block scope = one bulk
+// read; warp/thread subdivide (see p2p_put_bw).
 template <core::ProviderType PrvdType, typename Coop>
 __global__ void ibgda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int iter) {
@@ -94,15 +87,13 @@ __global__ void ibgda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const size_t off_bytes = base * sizeof(double);
   const size_t bytes = per_unit * sizeof(double);
 
-  // AggregateRequests: see p2p_put_bw — defer the doorbell to the end flush so
-  // warp/thread-scope threads sharing the per-block QP don't deadlock in
-  // ringDoorbellOrdered. The end flush rings once and polls the CQ.
+  // AggregateRequests: defer doorbell to end flush (see p2p_put_bw).
   for (int i = 0; i < iter; i++) {
     gda.get(peer, reinterpret_cast<ccoWindow_t>(sendWin), off_bytes,
             reinterpret_cast<ccoWindow_t>(recvWin), off_bytes, bytes, coop,
             ccoGdaOptFlagsAggregateRequests);
   }
-  gda.flush(ccoCoopBlock{});  // rings the aggregated doorbell once + drains this block's QP
+  gda.flush(ccoCoopBlock{});
 }
 
 static void launch_lsa(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,

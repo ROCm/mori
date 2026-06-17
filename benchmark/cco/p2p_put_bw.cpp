@@ -40,16 +40,8 @@
 
 namespace mori::cco::benchmark {
 
-// ── LSA: flat-VA store loop, scope semantics aligned with shmem's bw_block /
-// bw_warp / bw_thread. ALL block threads always participate; `scope_size` only
-// changes the cooperation granularity of the copy:
-//   block  scope_size=blockDim → 1 unit, whole block strides the whole chunk
-//   warp   scope_size=warpSize → nwarps units, each warp strides its sub-segment
-//   thread scope_size=1        → blockDim units, each thread copies its own
-//                                contiguous 1/blockDim segment
-// This mirrors ShmemPutMemNbi{Block,Warp,Thread}: same thread count, finer
-// per-unit segments — thread scope is slower because each thread does a small
-// contiguous copy (no wide striding), not because fewer threads participate. ──
+// LSA: flat-VA store loop. scope_size = copy cooperation granularity (block /
+// warp / single thread); all block threads always participate (matches shmem).
 __global__ void lsa_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
                            volatile unsigned int* counter_d, size_t len_doubles, int peerLsa,
                            int iter, int scope_size) {
@@ -59,7 +51,6 @@ __global__ void lsa_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const int nthreads = blockDim.x * blockDim.y * blockDim.z;
 
   const size_t chunk = len_doubles / static_cast<size_t>(nblocks);
-  // Cooperation unit this thread belongs to, and its lane within the unit.
   const int nunits = nthreads / scope_size;
   const int unit = tid / scope_size;
   const int lane = tid % scope_size;
@@ -71,30 +62,18 @@ __global__ void lsa_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const double* src = reinterpret_cast<const double*>(ccoGetLocalPtr(sendWin, off_bytes));
 
   for (int i = 0; i < iter; i++) {
-    // Unit's threads stride over the unit's segment (thread scope: scope_size==1
-    // so a single thread copies its whole per_unit segment contiguously).
     lsa_copy_strided(dst, src, per_unit, lane, scope_size);
-    // System-scope fence so this round's cross-GPU stores are globally visible
-    // (the barrier's own __threadfence is device scope only). Without it the
-    // repeated same-region traffic is absorbed by L2/Infinity cache and the
-    // timer measures cache bandwidth, not real P2P.
+    // System fence forces each round's cross-GPU stores out — otherwise the
+    // repeated same-region traffic is cache-absorbed and we'd time cache BW.
     __threadfence_system();
-    // Per-round all-block barrier (GPU-internal, mirrors shmem) so the measured
-    // window includes the same cross-block sync as the shmem benchmark.
+    // Per-round all-block barrier mirrors shmem so the timed window matches.
     bw_cross_block_barrier_round(counter_d, nblocks, i);
   }
 }
 
-// ── IBGDA: one QP context per block (ginContext=blockIdx). Each block owns its
-// QP and is fully independent — it pipelines its chunk's `iter` writes back to
-// back, then flushes its own QP. No cross-block barrier needed (blocks don't
-// share a QP). block scope = one bulk RDMA write of the whole chunk (nunits==1),
-// same granularity as shmem's ShmemPutMemNbiBlock; warp/thread scope subdivide.
-//
-// NOTE on flush vs shmem quiet: ccoGda::flush is ring-doorbell + poll-CQ
-// combined; shmem rings inside the put and uses poll-only quiet. Data path /
-// completion semantics are otherwise equivalent (post-fix quietUntil waits for
-// the real CQE).
+// IBGDA: one QP per block (ginContext=blockIdx); each block pipelines its chunk
+// then flushes its own QP. block scope = one bulk write (== shmem
+// ShmemPutMemNbiBlock); warp/thread subdivide.
 template <core::ProviderType PrvdType, typename Coop>
 __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int iter) {
@@ -105,8 +84,6 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const int peer = !devComm.rank;
   const size_t chunk = len_doubles / static_cast<size_t>(nblocks);
 
-  // Sub-divide the block's chunk across coop units (block scope: one bulk op;
-  // warp/thread scope: nunits ops).
   const int tid = linear_tid();
   const int unit = tid / coop.size();
   const int nunits = (blockDim.x * blockDim.y * blockDim.z) / coop.size();
@@ -115,18 +92,15 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const size_t off_bytes = base * sizeof(double);
   const size_t bytes = per_unit * sizeof(double);
 
-  // AggregateRequests: accumulate WQEs without ringing the doorbell per op. In
-  // warp/thread scope multiple threads of a block post to the SAME per-block QP;
-  // letting each call ringDoorbellOrdered (which spins until dbTouchIdx==its
-  // postIdx) deadlocks under SIMT lock-step. Aggregating defers the ring to the
-  // single end flush, which rings once and polls the CQ. (block scope has one
-  // posting thread per QP, so this is harmless there.)
+  // AggregateRequests defers the doorbell to the end flush: in warp/thread scope
+  // many threads share one QP, and per-op ringDoorbellOrdered deadlocks under
+  // SIMT lock-step. The end flush rings once + polls the CQ.
   for (int i = 0; i < iter; i++) {
     gda.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), off_bytes,
             reinterpret_cast<ccoWindow_t>(sendWin), off_bytes, bytes, ccoGda_NoSignal{}, coop,
             ccoGdaOptFlagsAggregateRequests);
   }
-  gda.flush(ccoCoopBlock{});  // rings the aggregated doorbell once + drains this block's QP
+  gda.flush(ccoCoopBlock{});
 }
 
 static void launch_lsa(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,
