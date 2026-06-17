@@ -256,7 +256,7 @@ bool DistributedClient::Clear() {
 }
 
 bool DistributedClient::Flush() {
-  MORI_UMBP_DEBUG("[DistributedClient] Flush() — no-op");
+  if (pool_client_) pool_client_->Master().FlushHeartbeat();
   return true;
 }
 

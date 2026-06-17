@@ -447,14 +447,21 @@ void MasterClient::StopHeartbeat() {
   MORI_UMBP_INFO("[Client] Heartbeat thread stopped");
 }
 
+void MasterClient::FlushHeartbeat() {
+  if (!heartbeat_running_) return;
+  flush_requested_ = true;
+  hb_cv_.notify_one();
+}
+
 void MasterClient::HeartbeatLoop() {
   while (heartbeat_running_) {
     {
       std::unique_lock lock(hb_cv_mutex_);
       hb_cv_.wait_for(lock, std::chrono::milliseconds(heartbeat_interval_ms_),
-                      [this] { return !heartbeat_running_.load(); });
+                      [this] { return !heartbeat_running_.load() || flush_requested_.load(); });
     }
     if (!heartbeat_running_) break;
+    flush_requested_ = false;
     SendHeartbeatOnce();
   }
 }
