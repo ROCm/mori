@@ -209,3 +209,13 @@ target_link_libraries(
   bench_umbp_route_put_strategy
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
+
+# GlobalBlockIndex::BatchLookupForRouteGet micro-bench (pure logic; no gRPC /
+# RDMA, so umbp_common only).  Drives the master-side BatchRouteGet hot path
+# directly: hash lookup + exclude filter + access bump + lease grant under a
+# single shared_lock.  Reports us/call, Mlookups/s, and concurrent read scaling
+# via --threads.
+add_executable(bench_umbp_global_block_index_route_get
+               bench_global_block_index_route_get.cpp)
+target_link_libraries(bench_umbp_global_block_index_route_get
+                      PRIVATE umbp_common gtest_main)
