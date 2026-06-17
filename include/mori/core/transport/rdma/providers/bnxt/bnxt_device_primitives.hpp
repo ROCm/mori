@@ -37,12 +37,15 @@ extern "C" {
 namespace mori {
 namespace core {
 
-// Each BNXT WQE segment is exactly one 16-byte slot; write it as a single
-// aligned 128-bit store. Local helper so the bnxt header needn't pull p2p.
+// Each segment is one 16-byte slot. The bnxt ABI structs are packed (alignof 1),
+// so memcpy out (alignment-safe, folds under -O) then one aligned 128-bit store
+// to the 16B-aligned slot. Local copy so the bnxt header needn't pull p2p.
 template <typename Seg>
 inline __device__ void BnxtWriteSlot(void* slot, const Seg& seg) {
   static_assert(sizeof(Seg) == BNXT_RE_SLOT_SIZE, "WQE segment must occupy exactly one slot");
-  *reinterpret_cast<uint4*>(slot) = *reinterpret_cast<const uint4*>(&seg);
+  uint4 v;
+  __builtin_memcpy(&v, &seg, sizeof(v));
+  *reinterpret_cast<uint4*>(slot) = v;
 }
 
 inline __device__ void BnxtZeroSlot(void* slot) {
