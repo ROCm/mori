@@ -609,11 +609,11 @@ check_bnxt_versions() {
         log_fail "niccli not found — cannot check firmware version"; return 1
     fi
 
-    # get list of NIC indices from niccli -l (first column, skip header)
+    # get list of NIC indices from niccli --list (first column, skip header)
     local nic_indices=()
-    mapfile -t nic_indices < <(sudo niccli -l 2>/dev/null | awk 'NR>1 && /^[[:space:]]*[0-9]/{gsub(/[^0-9]/,"",$1); print $1}')
+    mapfile -t nic_indices < <(sudo niccli --list 2>/dev/null | awk 'NR>1 && /^[[:space:]]*[0-9]/{gsub(/[^0-9]/,"",$1); print $1}')
     if [[ ${#nic_indices[@]} -eq 0 ]]; then
-        log_warn "niccli -l returned no devices; defaulting to index 1"
+        log_warn "niccli --list returned no devices; defaulting to index 1"
         nic_indices=(1)
     fi
 
@@ -649,11 +649,11 @@ check_bnxt_versions() {
     [[ ${#failed_idxs[@]} -gt 0 ]] && log_warn "could not read firmware from NIC(s): ${failed_idxs[*]}"
 
     # --- port state, net device, and niccli index mapping via sysfs ---
-    # Build a PCI->niccli_index map from "niccli -l" output:
+    # Build a PCI->niccli_index map from "niccli --list" output:
     #   "  1) BCM57608  <mac>  235.2.40.0  0000:06:00.0  NIC  PCI"
     declare -A _pci2idx=()
     local niccli_list
-    niccli_list=$(sudo niccli -l 2>/dev/null || true)
+    niccli_list=$(sudo niccli --list 2>/dev/null || true)
     while IFS= read -r line; do
         local idx pci
         idx=$(echo "$line" | awk '/^[[:space:]]*[0-9]+\)/{gsub(/[^0-9]/,"",$1); print $1}')

@@ -45,7 +45,7 @@ fi
 Probe optional mount paths on the host and only include ones that exist:
 
 ```bash
-for p in /shared /apps /dev/infiniband; do
+for p in /shared /apps /dev/infiniband /sys/kernel/config /sys/kernel/debug; do
   [ -e "$p" ] && echo "EXISTS: $p" || echo "MISSING: $p"
 done
 ```
@@ -57,6 +57,7 @@ sudo docker run \
     --group-add video \
     --network=host \
     --ulimit nproc=100000:100000 \
+    --ulimit memlock=-1:-1 \
     --pids-limit=-1 \
     --device=/dev/kfd \
     --device=/dev/dri \
@@ -69,6 +70,8 @@ sudo docker run \
     -v /shared:/shared \         # only if exists
     -v /apps:/apps \             # only if exists
     -v /lib/modules:/lib/modules \
+    -v /sys/kernel/config:/sys/kernel/config \   # REQUIRED for bnxt DCQCN (configfs)
+    -v /sys/kernel/debug:/sys/kernel/debug \     # REQUIRED for bnxt DCQCN (debugfs)
     --rm \
     --name $CONTAINER_NAME \
     $IMAGE_NAME \
@@ -77,6 +80,14 @@ sudo docker run \
 
 Notes:
 - `--network=host` + `--device=/dev/infiniband` required for RDMA visibility.
+- `--ulimit memlock=-1:-1` — RDMA pins memory when creating QPs. Without it some
+  NICs fail to come up under the parallel `mori check` mesh (rows/cols of `✗`).
+- `-v /sys/kernel/config` + `-v /sys/kernel/debug` — **required for bnxt (Broadcom)**.
+  `--privileged` alone does NOT propagate these kernel filesystems into the
+  container. Without them `mori check` Step 3 (DCQCN) can't read CC state and
+  `mori setup` can't write congestion-control config via configfs. If the host
+  itself hasn't mounted them, run on the host first:
+  `sudo mount -t configfs none /sys/kernel/config; sudo mount -t debugfs none /sys/kernel/debug`.
 - `--rm` — data outside mounted volumes is lost on stop.
 
 All subsequent steps run **inside** `$CONTAINER_NAME` via `docker exec`.
@@ -88,14 +99,35 @@ All subsequent steps run **inside** `$CONTAINER_NAME` via `docker exec`.
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c "apt-get update && apt-get install -y --no-install-recommends \
     git libpci-dev libdw1 libibverbs-dev ibverbs-utils \
-    locales iputils-ping iproute2 ethtool jq perftest"
+    locales iputils-ping iproute2 ethtool jq perftest \
+    wget unzip ca-certificates curl \
+    libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler"
 ```
 
-`jq` is required by `mori check`. `perftest` provides `ib_write_bw`/`ib_write_lat` for intra/inter-node bandwidth and latency checks.
+Package roles:
+- `jq` — required by `mori check`.
+- `perftest` — provides `ib_write_bw` / `ib_write_lat` for intra/inter-node bandwidth + latency checks.
+- `iproute2` — provides `dcb`, required by `mori setup` on bnxt NICs.
+- `wget unzip ca-certificates curl` — used by the NIC userspace install steps (Step 3a/3b).
+- `libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler` — **mori build deps**:
+  the build defaults to `BUILD_UMBP=ON`, whose CMake step needs gRPC headers
+  (`grpcpp/grpcpp.h`). Without them `pip install .` fails at configure time. The
+  remaining build tooling (`cmake`, `ninja`, `pybind11`) is pulled in automatically
+  by `pyproject.toml`'s build isolation, so it doesn't need to be in the image.
 
 ---
 
-## Step 3: Install AINIC userspace libraries (AINIC only)
+## Step 3: Install NIC userspace libraries
+
+Run the subsection matching the NIC type detected at the top:
+- `ainic` → **Step 3a** (AINIC / Pensando)
+- `thor2` / bnxt → **Step 3b** (Broadcom NetXtreme-E)
+- `cx7` (Mellanox/ConnectX) → userspace libs ship with the base image's
+  `rdma-core`; usually nothing extra needed. Skip to Step 4.
+
+---
+
+## Step 3a: Install AINIC userspace libraries (AINIC only)
 
 **Skip if NIC type is not `ainic`.**
 
@@ -159,6 +191,90 @@ nicctl --version
 
 ---
 
+## Step 3b: Install Broadcom (bnxt / thor2) userspace libraries + tools
+
+**Skip if NIC type is not `thor2` / bnxt.**
+
+A fresh container needs three things for the bnxt path of `mori check` / `mori setup`
+to run clean: (1) the **RoCE userspace lib** (`libbnxt_re`), (2) a **recent
+`niccli`**, and (3) **`dcb`** (from `iproute2`).
+
+### 3b.1 — Detect host bnxt version (match the userspace lib to it)
+
+Run on the **host**:
+
+```bash
+modinfo -F version bnxt_re 2>/dev/null || cat /sys/module/bnxt_re/version
+# e.g. 235.2.88.0  → install the closest bnxt-rocelib (e.g. 235.2.86.0)
+```
+
+### 3b.2 — Install RoCE userspace lib via the Broadcom apt repo
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c '
+set -e
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public \
+    -o /etc/apt/keyrings/broadcom-nic.asc
+chmod a+r /etc/apt/keyrings/broadcom-nic.asc
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] \
+https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" \
+    > /etc/apt/sources.list.d/broadcom-nic.list
+apt-get update
+# pin to match the host bnxt_re version from 3b.1; list options: apt-cache madison bnxt-rocelib
+apt-get install -y ibverbs-utils bnxt-rocelib=235.2.86.0
+# mori check looks for libbnxt_re-<ver>.so under /usr/local/lib — make it visible there
+cp /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/.
+ldconfig
+'
+```
+
+> Replace `235.2.86.0` with the version matching the host (3b.1). If that exact
+> version is gone from the repo, pick the nearest one from `apt-cache madison bnxt-rocelib`.
+
+### 3b.3 — Install a recent `niccli` (MUST support the `qos` subcommand)
+
+**Critical:** old `niccli` (e.g. 233.x) has **no `qos` subcommand**. `mori check`
+Step 2 then parses niccli's error/help text, finds no lossless TC, and falsely
+reports `[FAIL] ... no lossless TC configured — PFC not active`. Use a niccli whose
+version tracks the firmware (236.x / 237.x for BCM57608). Parameterize the version:
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c '
+set -e
+NICCLI_VER=237.1.145.0          # deb version
+NICCLI_PKG=237.1.148.0          # BRCM_<this> path segment in the URL
+URL="https://docs.broadcom.com/docs-and-downloads/ethernet-network-adapters/NXE/BRCM_${NICCLI_PKG}/niccli/Linux/niccli-${NICCLI_VER}_linux.zip"
+apt-get install -y unzip wget
+cd /tmp && wget -q -O niccli.zip "$URL" && unzip -o -q niccli.zip -d niccli
+dpkg -i "$(find ./niccli -name "niccli_*_x86_64.deb" | head -1)"
+niccli -l | head            # must list all NICs
+niccli -i 1 qos --ingress --cosq --show | head   # must print the CoSQ table, NOT an error
+'
+```
+
+> Alternative (no download): the host usually already has a working niccli at
+> `/opt/niccli` (self-contained). You can `sudo docker cp /opt/niccli $CONTAINER_NAME:/opt/`
+> then `docker exec $CONTAINER_NAME ln -sf /opt/niccli/niccli /usr/bin/niccli`.
+
+### 3b.4 — Install `dcb` (iproute2), needed by `mori setup`
+
+`mori setup` configures bnxt PFC/ETS via `dcb`. Without it: `[FAIL] bnxt devices
+found but dcb not available`.
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c "apt-get install -y iproute2 && command -v dcb"
+```
+
+> `mori setup` does host-level NIC configuration (PFC/ETS on the netdev via `dcb`,
+> DCQCN via configfs). With `--network=host` the container shares the host's
+> netns, so it's equivalent to configure on the host. Either run `mori setup` on
+> the host, or ensure the container has `dcb` + configfs/debugfs (Step 1 mounts).
+
+---
+
 ## Step 4: Install MORI
 
 `pybind11` is a required build dep missing from `pyproject.toml`. Run inside the container:
@@ -169,6 +285,15 @@ pip install pybind11 -q
 rm -rf build   # clear stale cmake cache — old build/ can hardcode a wrong ROCm version
 pip install .
 "
+```
+
+**UMBP / gRPC:** the build defaults to `BUILD_UMBP=ON`, whose CMake step needs gRPC
+headers (`grpcpp/grpcpp.h`). Those are installed in Step 2. If you skipped them, the
+build fails with `CMake Error ... Could not find GRPC_INCLUDE_DIR`. To build without
+the UMBP storage component instead (no gRPC needed):
+
+```bash
+sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "BUILD_UMBP=OFF pip install ."
 ```
 
 ---
@@ -212,11 +337,12 @@ ibv_devinfo | head -20
 sudo docker exec $CONTAINER_NAME bash -c "mori check"
 ```
 
-`mori check` validates the full AINIC/RDMA stack in 6 steps:
+`mori check` validates the full RDMA stack in 6 steps (vendor-specific variants
+for ionic vs bnxt, same intent):
 
-1. **firmware & driver** — firmware, nicctl, ionic driver versions must match
-2. **QoS / SL / TC** — DSCP classification, PFC, DWRR scheduling, selects the SL/TC for MORI to use
-3. **DCQCN** — congestion control enabled on all RoCE devices, CNP DSCP consistent
+1. **firmware & driver** — firmware/driver/userspace-lib versions consistent
+2. **QoS / SL / TC** — PFC + lossless TC; selects the SL/TC for MORI to use
+3. **DCQCN** — congestion control enabled on all RoCE devices
 4. **intra-node bandwidth** — `ib_write_bw` between all local NIC pairs (requires `perftest`)
 5. **inter-node bandwidth** — `ib_write_bw` to a peer node; pass peer IP: `mori check <peer_ip>`
 6. **inter-node latency** — `ib_write_lat` to a peer node; same peer IP
