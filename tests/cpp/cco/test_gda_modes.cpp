@@ -74,7 +74,7 @@ struct Result {
 static int CountQpsFor(const mori::cco::ccoDevComm& dc, int worldSize) {
   if (dc.ibgda.endpoints == nullptr || dc.ibgda.numQpPerPe == 0) return 0;
   size_t total = static_cast<size_t>(worldSize) * dc.ibgda.numQpPerPe;
-  std::vector<mori::application::RdmaEndpointDevice> eps(total);
+  std::vector<mori::core::RdmaEndpointDevice> eps(total);
   HIP_CHECK(
       hipMemcpy(eps.data(), dc.ibgda.endpoints, total * sizeof(eps[0]), hipMemcpyDeviceToHost));
   int count = 0;

@@ -25,12 +25,17 @@
 #include <hip/hip_runtime_api.h>
 #include <infiniband/verbs.h>
 
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <optional>
+#include <tuple>
 
+#include "mori/application/transport/rdma/providers/ionic/ionic_dv.h"
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
-#include "mori/core/transport/rdma/providers/ionic/ionic_dv.h"
 #include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
 #include "mori/utils/mori_log.hpp"
 
@@ -39,6 +44,53 @@ namespace application {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
 /* ---------------------------------------------------------------------------------------------- */
+
+namespace {
+
+using FwVersion = std::tuple<int, int, int, int>;
+constexpr FwVersion kCcqeMinFwVersion{1, 117, 5, 58};
+
+// Parse "1.117.5-a-58" or "1.117.5-a58" into (1,117,5,58).
+std::optional<FwVersion> ParseIonicFwVersion(const char* fw_ver) {
+  int major, minor, patch, build;
+  char tag;
+  if (sscanf(fw_ver, "%d.%d.%d-%c-%d", &major, &minor, &patch, &tag, &build) == 5 ||
+      sscanf(fw_ver, "%d.%d.%d-%c%d", &major, &minor, &patch, &tag, &build) == 5) {
+    return FwVersion{major, minor, patch, build};
+  }
+  return std::nullopt;
+}
+
+std::optional<FwVersion> ReadIonicFwVersion(const char* dev_name) {
+  char path[256];
+  snprintf(path, sizeof(path), "/sys/class/infiniband/%s/fw_ver", dev_name);
+
+  FILE* f = fopen(path, "r");
+  if (!f) return std::nullopt;
+
+  char buf[64] = {};
+  fgets(buf, sizeof(buf), f);
+  fclose(f);
+
+  // Strip trailing newline.
+  buf[strcspn(buf, "\n")] = '\0';
+  return ParseIonicFwVersion(buf);
+}
+
+bool IsCcqeSupported(ibv_context* context) {
+  const char* disable_ccqe = std::getenv("MORI_DISABLE_IONIC_CCQE");
+  if (disable_ccqe && std::strcmp(disable_ccqe, "1") == 0) return false;
+  if (IonicDvApi::Instance().create_cq_ex == nullptr) return false;
+
+  /* Minimum firmware version verified by MORI to support CCQE is 1.117.5-a-58. */
+  auto ver = ReadIonicFwVersion(context->device->name);
+  MORI_APP_TRACE("dev: {} fw_ver {}.{}.{}-a-{}", context->device->name,
+                 ver ? std::get<0>(*ver) : -1, ver ? std::get<1>(*ver) : -1,
+                 ver ? std::get<2>(*ver) : -1, ver ? std::get<3>(*ver) : -1);
+  return ver.has_value() && *ver >= kCcqeMinFwVersion;
+}
+
+}  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          IonicCqContainer                            */
@@ -52,14 +104,9 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
 
   cqeNum = config.maxCqeNum;
 
+  const bool ccqe_enabled = IsCcqeSupported(context);
+
   memset(&cq_attr, 0, sizeof(struct ibv_cq_init_attr_ex));
-#ifdef IONIC_CCQE
-  cq_attr.cqe = 0;
-  MORI_APP_TRACE("cqe mode: ccqe mode");
-#else
-  cq_attr.cqe = cqeNum * 2;  // from rocshmem, send&recv?
-  MORI_APP_TRACE("cqe mode: normal mode");
-#endif
   cq_attr.cq_context = nullptr;
   cq_attr.channel = nullptr;
   cq_attr.comp_vector = 0;
@@ -67,7 +114,20 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
   cq_attr.comp_mask = IBV_CQ_INIT_ATTR_MASK_PD;
   cq_attr.parent_domain = pd;
 
-  cq_ex = ibv_create_cq_ex(context, &cq_attr);
+  if (ccqe_enabled) {
+    MORI_APP_TRACE("cqe mode: ccqe mode");
+    struct ionic_cq_init_attr_ex ionic_cq_attr;
+    memset(&ionic_cq_attr, 0, sizeof(struct ionic_cq_init_attr_ex));
+    ionic_cq_attr.comp_mask = IONIC_CQ_INIT_ATTR_MASK_FLAGS;
+    ionic_cq_attr.flags = IONIC_CQ_INIT_ATTR_CCQE;
+    cq_attr.cqe = 1;
+    cq_ex = IonicDvApi::Instance().create_cq_ex(context, &cq_attr, &ionic_cq_attr);
+  } else {
+    MORI_APP_TRACE("cqe mode: normal mode");
+    cq_attr.cqe = cqeNum * 2;  // from rocshmem, send&recv?
+    cq_ex = ibv_create_cq_ex(context, &cq_attr);
+  }
+
   assert(cq_ex);
   cq = ibv_cq_ex_to_cq(cq_ex);
   assert(cq);

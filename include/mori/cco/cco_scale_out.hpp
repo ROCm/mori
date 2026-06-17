@@ -35,9 +35,11 @@
 
 #include "mori/cco/cco.hpp"
 
-// GDA (RDMA) device layer pulls in the provider RDMA core. Device-only.
+// GDA (RDMA) device layer pulls in the core RDMA device aggregator (provider
+// primitives + core::RdmaEndpointDevice/WorkQueueHandle/...). Device-only; no
+// application headers — cco's GDA path depends only on core.
 #if defined(__HIPCC__) || defined(__CUDACC__)
-#include "mori/core/transport/rdma/rdma.hpp"
+#include "mori/core/transport/rdma/rdma_device.hpp"
 #endif
 
 namespace mori {
@@ -259,94 +261,116 @@ __device__ inline void ccoGdaBarrier(Coop coop, ccoGda<PrvdType>& gda, ccoGdaBar
 // helpers don't leak into ADL or autocomplete.
 namespace impl {
 
-// Record the logical WQE id at its SQ slot so quietUntil can map a CQE's slot
-// back to the monotonic WQE id. BNXT indexes by SQ slot (% sqWqeNum); PSD uses
-// the large software table. MLX5 does not use the table here.
+// Poll the CQ until wq.doneIdx reaches targetIdx. Post-#395 collapsed-CQ model:
+// reconstruct the completed WQE count directly from the CQE counter (no
+// outstandingWqe[] table). Mirrors shmem's *CollapsedCqDrain / PSD quiet, but
+// exits at the caller's targetIdx instead of a dbTouchIdx/postIdx snapshot.
 template <core::ProviderType PrvdType>
-__device__ inline static void recordOutstandingWqe(core::WorkQueueHandle* wq, uint32_t idx) {
-  if constexpr (PrvdType == core::ProviderType::BNXT) {
-    wq->outstandingWqe[idx % wq->sqWqeNum] = idx;
-  } else if constexpr (PrvdType == core::ProviderType::PSD) {
-    wq->outstandingWqe[idx % OUTSTANDING_TABLE_SIZE] = idx;
-  }
-}
-
-// Poll CQ and update doneIdx until it catches up to targetIdx
-template <core::ProviderType PrvdType>
-__device__ inline static void quietUntil(application::RdmaEndpointDevice* ep, uint32_t targetIdx) {
+__device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t targetIdx) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
   core::CompletionQueueHandle* cq = &ep->cqHandle;
 
   if constexpr (PrvdType == core::ProviderType::PSD) {
-    // PSD/Ionic: 24-bit MSN field, use sign bit (0x800000) for wraparound comparison
-    while ((wq->doneIdx - targetIdx) & 0x800000) {
-      uint64_t activemask = core::GetActiveLaneMask();
-      if (!core::spin_lock_try_acquire_shared(&cq->pollCqLock, activemask)) {
-        continue;
-      }
+    // PSD/Ionic: 24-bit MSN; warp-parallel poll (one CQE per active lane),
+    // highest-lane-wins, direct doneIdx update + DBR grace. Mirrors shmem
+    // ShmemQuietThreadKernelPsdImpl.
+    const uint64_t activeMask = core::GetActiveLaneMask();
+    const uint32_t myLogicalLaneId = core::GetActiveLaneNum(activeMask);
+    const int myLaneId = core::WarpLaneId();
+    constexpr uint32_t PENDING_WORK_MASK = 0x800000;  // bit 23: 24-bit sign
+    constexpr uint32_t MAX_GREED = 10;
+    constexpr uint32_t CQ_DOORBELL_GRACE = 100;
+    uint32_t wqeCounter;
 
-      uint32_t greed = 10;
-      bool pollErr = false;
-      while ((wq->doneIdx - targetIdx) & 0x800000) {
-        uint32_t oldDoneIdx = wq->doneIdx;
-        int err = core::PollCqOnce2(*wq, *cq, activemask, cq->cqAddr, cq->cqeNum, 0);
-        if (err != 0) {
-          MORI_PRINTF("quietUntil[PSD]: PollCqOnce2 failed, err=%d\n", err);
-          pollErr = true;
-          break;
+    while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
+      if (!core::spin_lock_try_acquire_shared(&cq->pollCqLock, activeMask)) continue;
+      uint32_t greedRemaining = MAX_GREED;
+      while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
+        const uint64_t oldDoneIdx = wq->doneIdx;
+        const uint32_t curConsIdx = cq->cq_consumer;
+        uint32_t myCqPos = curConsIdx + myLogicalLaneId;
+        const int opcode =
+            core::PollCq<core::ProviderType::PSD>(cq->cqAddr, cq->cqeNum, &myCqPos, &wqeCounter);
+        if (opcode > 0) {
+          MORI_PRINTF("quietUntil[PSD]: poll err %d\n", opcode);
+          assert(false);
         }
         asm volatile("" ::: "memory");
-
-        if (!((wq->doneIdx - targetIdx) & 0x800000)) break;
-        if (wq->doneIdx == oldDoneIdx) break;
-        if (!greed--) break;
+        const uint64_t successMask = __ballot(opcode == 0);
+        const int highestLane = core::GetLastActiveLaneID(successMask);
+        if (highestLane == -1) continue;
+        if (myLaneId == highestLane) {
+          cq->cq_consumer = myCqPos + 1;
+          if (((cq->cq_consumer - cq->cq_dbpos) & (cq->cqeNum - 1)) >= CQ_DOORBELL_GRACE) {
+            cq->cq_dbpos = cq->cq_consumer;
+            core::UpdateCqDbrRecord<core::ProviderType::PSD>(*cq, myCqPos + 1);
+          }
+          wq->doneIdx = wqeCounter;
+        }
+        if (!((wq->doneIdx - targetIdx) & PENDING_WORK_MASK)) {
+          if (wq->doneIdx == oldDoneIdx) break;
+          if (greedRemaining == 0) break;
+          --greedRemaining;
+        }
       }
-
-      core::spin_lock_release_shared(&cq->pollCqLock, activemask);
-
-      if (pollErr) break;
+      core::spin_lock_release_shared(&cq->pollCqLock, activeMask);
+      break;
     }
   } else if constexpr (PrvdType == core::ProviderType::MLX5) {
-    // MLX5: 16-bit wqe_counter, poll CQ and update DBR record
-    // Use 16-bit wraparound comparison
-    while ((int16_t)(wq->doneIdx - targetIdx) < 0) {
-      uint32_t wqeCounter = 0;
-      int err = core::PollCq<PrvdType>(cq->cqAddr, cq->cqeNum, &cq->consIdx, &wqeCounter);
-      if (err >= 0) {
-        wq->doneIdx = wqeCounter;
-        core::UpdateCqDbrRecord<PrvdType>(*cq, cq->consIdx);
+    // MLX5: collapsed CQ — read CQE[0] (volatile), reconstruct the 16-bit
+    // wqe_counter against doneIdx, advance via max. Mirrors shmem Mlx5CollapsedCqDrain.
+    auto done = [&]() {
+      return (int32_t)(__hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) -
+                       targetIdx) >= 0;
+    };
+    volatile core::Mlx5Cqe64* cqe = reinterpret_cast<volatile core::Mlx5Cqe64*>(cq->cqAddr);
+    __threadfence();
+    while (!done()) {
+      uint32_t cons = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      uint16_t wqeCounter = BE16TOH(cqe->wqe_counter);
+      uint8_t opcode =
+          (reinterpret_cast<volatile uint8_t*>(cq->cqAddr)[sizeof(core::Mlx5Cqe64) - 1]) >> 4;
+      if (opcode == core::MORI_MLX5_CQE_REQ_ERR || opcode == core::MORI_MLX5_CQE_RESP_ERR) {
+        auto error = core::Mlx5HandleErrorCqe(reinterpret_cast<core::Mlx5ErrCqe*>(cq->cqAddr));
+        MORI_PRINTF("quietUntil[MLX5]: CQE error %s\n", core::WcStatusString(error));
+        assert(false);
+        break;
       }
+      uint16_t comp16 = static_cast<uint16_t>(wqeCounter + 1);
+      uint32_t completed = (cons & ~0xffffu) | comp16;
+      if (completed < cons) completed += 0x10000u;
+      __hip_atomic_fetch_max(&wq->doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       asm volatile("" ::: "memory");
     }
+    __threadfence();
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-    // BNXT: poll until the monotonic doneIdx reaches targetIdx. Mirrors shmem's
-    // BNXT quiet — a single poller per CQ (pollCqLock); each thread claims a CQE
-    // slot via atomic cq_consumer, maps the CQE's SQ slot back to the logical WQE
-    // id through outstandingWqe[], and advances doneIdx with fetch_max. Threads
-    // that can't take the lock spin re-reading doneIdx (the holder advances it).
-    auto doneLt = [&]() {
-      return (int32_t)(targetIdx - __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED,
-                                                     __HIP_MEMORY_SCOPE_AGENT)) > 0;
+    // BNXT: collapsed CQ (cqeNum==1) — single poller (pollCqLock); others spin
+    // re-reading doneIdx (the holder advances it). Reconstruct the completed count
+    // from CQE con_indx against dbTouchIdx, advance doneIdx via max. Non-blocking
+    // PollCqOnce (cco flow-control may wait on slots not yet doorbelled, so a
+    // blocking poll would deadlock). Mirrors shmem BnxtCollapsedCqDrain.
+    const uint32_t mask = wq->sqWqeNum - 1;  // sqWqeNum is a power of two
+    auto done = [&]() {
+      return (int32_t)(__hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) -
+                       targetIdx) >= 0;
     };
-    while (doneLt()) {
-      // Only one thread per CQ polls; others spin re-reading doneIdx, which the
-      // holder advances. BNXT runs with cqeNum==1, so the single CQE is a
-      // rolling slot the NIC overwrites; PollCqOnce returns its current
-      // con_indx (the completed SQ slot) without a phase check.
+    while (!done()) {
       if (!core::AcquireLockOnce(&cq->pollCqLock)) continue;
-      while (doneLt()) {
-        uint32_t idx = cq->cq_consumer;
+      __threadfence();
+      while (!done()) {
+        uint32_t consIdxIgnored = 0;  // cqeNum==1 always reads CQE[0]
         uint32_t wqeCounter = 0;
-        int opcode = core::PollCqOnce<PrvdType>(cq->cqAddr, cq->cqeNum, idx, &wqeCounter);
+        int opcode = core::PollCqOnce<core::ProviderType::BNXT>(cq->cqAddr, cq->cqeNum,
+                                                                consIdxIgnored, &wqeCounter);
         if (opcode < 0) continue;  // no new completion yet
-        cq->cq_consumer = idx + 1;
-        // con_indx points at the slot past the completed WQE; step back one and
-        // map it through outstandingWqe[] to the monotonic logical WQE id.
-        uint32_t slot = (wqeCounter + wq->sqWqeNum - 1) % wq->sqWqeNum;
-        uint64_t wqeId = wq->outstandingWqe[slot] + 1;
-        __hip_atomic_fetch_max(&wq->doneIdx, (uint32_t)wqeId, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
+        // Largest V <= dbTouchIdx with V % sqWqeNum == con_indx % sqWqeNum.
+        uint32_t dbTouch =
+            __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        uint32_t completed = (dbTouch & ~mask) | (wqeCounter & mask);
+        if (completed > dbTouch) completed -= wq->sqWqeNum;
+        __hip_atomic_fetch_max(&wq->doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       }
+      __threadfence();
       core::ReleaseLock(&cq->pollCqLock);
     }
   }
@@ -366,7 +390,7 @@ __device__ inline static void quietUntil(application::RdmaEndpointDevice* ep, ui
 // reserve. In warp/block mode only lane 0 reaches here, so the aggregation would
 // be a no-op and is compiled out entirely.
 template <core::ProviderType PrvdType, typename Coop = ccoCoopThread>
-__device__ inline static uint32_t reserveWqeSlots(application::RdmaEndpointDevice* ep,
+__device__ inline static uint32_t reserveWqeSlots(core::RdmaEndpointDevice* ep,
                                                   uint32_t numWqesNeeded) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
 
@@ -446,9 +470,8 @@ __device__ inline static void ringDoorbellWarpPsd(void* dbrAddr, uint64_t dbrVal
 
 // Wait for doorbell ordering and ring doorbell
 template <core::ProviderType PrvdType>
-__device__ inline static void ringDoorbellOrdered(application::RdmaEndpointDevice* ep,
-                                                  uint32_t myPostIdx, uint32_t numWqes,
-                                                  uint64_t dbrVal) {
+__device__ inline static void ringDoorbellOrdered(core::RdmaEndpointDevice* ep, uint32_t myPostIdx,
+                                                  uint32_t numWqes, uint64_t dbrVal) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
   core::CompletionQueueHandle* cq = &ep->cqHandle;
 
@@ -526,7 +549,7 @@ __device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, ui
   } else if constexpr (PrvdType == core::ProviderType::MLX5) {
     // Read back ctrl seg first qword from SQ buffer
     uintptr_t wqeAddr =
-        reinterpret_cast<uintptr_t>(wq->sqAddr) + (lastWqeIdx << MLX5_SEND_WQE_SHIFT);
+        reinterpret_cast<uintptr_t>(wq->sqAddr) + (lastWqeIdx << core::MORI_MLX5_SEND_WQE_SHIFT);
     return *reinterpret_cast<volatile uint64_t*>(wqeAddr);
   } else {
     // BNXT: reconstruct db header
@@ -542,7 +565,7 @@ __device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, ui
 template <core::ProviderType PrvdType, typename Coop = ccoCoopThread>
 __device__ inline static void putImpl(
     // Hardware resources (already selected endpoint)
-    application::RdmaEndpointDevice* ep, uint32_t qpn,
+    core::RdmaEndpointDevice* ep, uint32_t qpn,
 
     // Data transfer parameters (already parsed addresses and keys)
     uintptr_t localAddr, uint32_t localKey,    // local buffer
@@ -569,15 +592,12 @@ __device__ inline static void putImpl(
 
   // Post RDMA Write for data transfer
   uint32_t wqeIdx = curPostIdx;
-  recordOutstandingWqe<PrvdType>(wq, wqeIdx);
   uint64_t dbrVal = core::PostWrite<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn,
                                               localAddr, localKey, remoteAddr, remoteKey, bytes);
   wqeIdx++;
 
   // Post atomic for signal (remote peer notification)
   if (hasSignal) {
-    recordOutstandingWqe<PrvdType>(wq, wqeIdx);
-
     uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
     uint32_t atomicLkey = ep->atomicIbuf.lkey;
 
@@ -594,7 +614,7 @@ __device__ inline static void putImpl(
 
 // New putValueImpl - Inline write for small values
 template <core::ProviderType PrvdType, typename T>
-__device__ inline static void putValueImpl(application::RdmaEndpointDevice* ep, uint32_t qpn,
+__device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                            uintptr_t remoteAddr, uint32_t remoteKey, T value,
                                            bool hasSignal, uintptr_t signalRemoteAddr,
                                            uint32_t signalRemoteKey, ccoGdaSignalOp_t signalOp,
@@ -615,15 +635,12 @@ __device__ inline static void putValueImpl(application::RdmaEndpointDevice* ep, 
 
   // Post inline write
   uint32_t wqeIdx = curPostIdx;
-  recordOutstandingWqe<PrvdType>(wq, wqeIdx);
   uint64_t dbrVal = core::PostWriteInline<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/,
                                                     qpn, &value, remoteAddr, remoteKey, sizeof(T));
   wqeIdx++;
 
   // Post atomic for signal if requested
   if (hasSignal) {
-    recordOutstandingWqe<PrvdType>(wq, wqeIdx);
-
     uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
     uint32_t atomicLkey = ep->atomicIbuf.lkey;
 
@@ -640,7 +657,7 @@ __device__ inline static void putValueImpl(application::RdmaEndpointDevice* ep, 
 
 // New getImpl - RDMA read
 template <core::ProviderType PrvdType, typename Coop = ccoCoopThread>
-__device__ inline static void getImpl(application::RdmaEndpointDevice* ep, uint32_t qpn,
+__device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                       uintptr_t localAddr, uint32_t localKey, uintptr_t remoteAddr,
                                       uint32_t remoteKey, size_t bytes,
                                       uint32_t optFlags = ccoGdaOptFlagsDefault) {
@@ -650,7 +667,6 @@ __device__ inline static void getImpl(application::RdmaEndpointDevice* ep, uint3
   uint32_t curPostIdx = reserveWqeSlots<PrvdType, Coop>(ep, 1);
 
   // Post RDMA Read
-  recordOutstandingWqe<PrvdType>(wq, curPostIdx);
   uint64_t dbrVal =
       core::PostRead<PrvdType>(*wq, curPostIdx, curPostIdx, curPostIdx, true /*cqeSignal*/, qpn,
                                localAddr, localKey, remoteAddr, remoteKey, bytes);
@@ -664,7 +680,7 @@ __device__ inline static void getImpl(application::RdmaEndpointDevice* ep, uint3
 // FlushAsync: ring doorbell for pending WQEs (skip if already rung),
 // return the postIdx for later wait.
 template <core::ProviderType PrvdType>
-__device__ inline static void flushAsyncImpl(application::RdmaEndpointDevice* ep, uint32_t qpn,
+__device__ inline static void flushAsyncImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                              uint32_t* outPostIdx) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
   core::CompletionQueueHandle* cq = &ep->cqHandle;
@@ -699,13 +715,13 @@ __device__ inline static void flushAsyncImpl(application::RdmaEndpointDevice* ep
 
 // Wait: wait for async request to complete
 template <core::ProviderType PrvdType>
-__device__ inline static void waitImpl(application::RdmaEndpointDevice* ep, uint32_t postIdx) {
+__device__ inline static void waitImpl(core::RdmaEndpointDevice* ep, uint32_t postIdx) {
   quietUntil<PrvdType>(ep, postIdx);
 }
 
 // Signal: send signal to remote peer (RDMA atomic increment/add)
 template <core::ProviderType PrvdType>
-__device__ inline static void signalImpl(application::RdmaEndpointDevice* ep, uint32_t qpn,
+__device__ inline static void signalImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                          uintptr_t signalRemoteAddr, uint32_t signalRemoteKey,
                                          ccoGdaSignalOp_t signalOp, uint64_t signalOpArg,
                                          uint32_t optFlags = ccoGdaOptFlagsDefault) {
@@ -715,7 +731,6 @@ __device__ inline static void signalImpl(application::RdmaEndpointDevice* ep, ui
   uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
 
   // Post RDMA atomic operation
-  recordOutstandingWqe<PrvdType>(wq, curPostIdx);
 
   // RDMA atomic requires local buffer for FetchAdd result (even if unused)
   uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
@@ -919,7 +934,7 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
     // step 2: select endpoint (world-indexed endpoints + contextId)
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
-    application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
+    core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
 
     // step 3: parse RemoteAction -> signal parameters
@@ -942,9 +957,8 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
     }
 
     // step 4: call primitive API (PrvdType is compile-time determined)
-    impl::putImpl<PrvdType, Coop>(ep, qpn,
-                                  localAddr, srcLkey,   // local
-                                  remoteAddr, dstRkey,  // remote
+    impl::putImpl<PrvdType, Coop>(ep, qpn, localAddr, srcLkey,  // local
+                                  remoteAddr, dstRkey,          // remote
                                   bytes, hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg,
                                   optFlags);
   }
@@ -971,7 +985,7 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
     // step 2: select endpoint
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
-    application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
+    core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
 
     // step 3: parse RemoteAction
@@ -1023,7 +1037,7 @@ __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, si
     // step 2: select endpoint
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
-    application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
+    core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
 
     // step 3: call primitive API
@@ -1044,7 +1058,7 @@ __device__ inline void ccoGda<PrvdType>::signal(int peer, RemoteAction remoteAct
     // select endpoint first to get ibgda context
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
-    application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
+    core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
 
     // parse RemoteAction
@@ -1091,7 +1105,7 @@ __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
     // endpoints are world-indexed; the loop walks the GDA team.
     int worldPeer = impl::GdaPeerToWorld(comm, teamPeer);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
-    application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
+    core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
     impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
     impl::waitImpl<PrvdType>(ep, postIdx);
@@ -1112,7 +1126,7 @@ __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
-    application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
+    core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
     impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
     impl::waitImpl<PrvdType>(ep, postIdx);
@@ -1130,7 +1144,7 @@ __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* o
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
-    application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
+    core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
 
     uint32_t postIdx = 0;
     impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
@@ -1175,7 +1189,7 @@ __device__ inline void ccoGda<PrvdType>::counter(LocalAction localAction, Coop c
     // endpoints are world-indexed; the loop walks the GDA team.
     int worldPeer = impl::GdaPeerToWorld(comm, teamPeer);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
-    application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
+    core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     impl::quietUntil<PrvdType>(ep, ep->wqHandle.postIdx);
   }
 
@@ -1277,7 +1291,7 @@ __device__ inline void ccoGdaBarrierSession<PrvdType, Coop>::sync(Coop) {
     // endpoints/peerRkeys are world-indexed; peer is GDA team-local.
     int worldPeer = impl::GdaPeerToWorld(gda.comm, peer);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (gda.contextId % ibgda->numQpPerPe);
-    application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
+    core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
 
     uintptr_t signalRaddr = (signalBase + myRank) * sizeof(uint64_t);
     uint32_t signalRkey = gda.comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];

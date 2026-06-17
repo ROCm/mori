@@ -28,6 +28,13 @@
 #ifndef IONIC_FW_H
 #define IONIC_FW_H
 
+// Self-contained: the __u*/__le*/__be* and uint*_t used below used to arrive via
+// the system <infiniband/verbs.h> that the core RDMA path dragged in. Now that the
+// device path is verbs-free, pull the fixed-width types directly. (The C++ branch
+// below only defines BIT(), not these types.)
+#include <linux/types.h>
+#include <stdint.h>
+
 #if !defined(__cplusplus)
 #include <util/util.h>
 #else
@@ -71,24 +78,6 @@ enum ionic_mr_flags {
   IONIC_MRF_MW_2 = IONIC_MRF_IS_MW | IONIC_MRF_INV_EN,
 };
 
-static inline int to_ionic_mr_flags(int access) {
-  int flags = 0;
-
-  if (access & IBV_ACCESS_LOCAL_WRITE) flags |= IONIC_MRF_LOCAL_WRITE;
-
-  if (access & IBV_ACCESS_REMOTE_READ) flags |= IONIC_MRF_REMOTE_READ;
-
-  if (access & IBV_ACCESS_REMOTE_WRITE) flags |= IONIC_MRF_REMOTE_WRITE;
-
-  if (access & IBV_ACCESS_REMOTE_ATOMIC) flags |= IONIC_MRF_REMOTE_ATOMIC;
-
-  if (access & IBV_ACCESS_MW_BIND) flags |= IONIC_MRF_MW_BIND;
-
-  if (access & IBV_ACCESS_ZERO_BASED) flags |= IONIC_MRF_ZERO_BASED;
-
-  return flags;
-}
-
 /* cqe status indicated in status_length field when err bit is set */
 enum ionic_status {
   IONIC_STS_OK,
@@ -107,40 +96,6 @@ enum ionic_status {
   IONIC_STS_XRC_VIO_ERR,
 };
 
-static inline int ionic_to_ibv_status(int sts) {
-  switch (sts) {
-    case IONIC_STS_OK:
-      return IBV_WC_SUCCESS;
-    case IONIC_STS_LOCAL_LEN_ERR:
-      return IBV_WC_LOC_LEN_ERR;
-    case IONIC_STS_LOCAL_QP_OPER_ERR:
-      return IBV_WC_LOC_QP_OP_ERR;
-    case IONIC_STS_LOCAL_PROT_ERR:
-      return IBV_WC_LOC_PROT_ERR;
-    case IONIC_STS_WQE_FLUSHED_ERR:
-      return IBV_WC_WR_FLUSH_ERR;
-    case IONIC_STS_MEM_MGMT_OPER_ERR:
-      return IBV_WC_MW_BIND_ERR;
-    case IONIC_STS_BAD_RESP_ERR:
-      return IBV_WC_BAD_RESP_ERR;
-    case IONIC_STS_LOCAL_ACC_ERR:
-      return IBV_WC_LOC_ACCESS_ERR;
-    case IONIC_STS_REMOTE_INV_REQ_ERR:
-      return IBV_WC_REM_INV_REQ_ERR;
-    case IONIC_STS_REMOTE_ACC_ERR:
-      return IBV_WC_REM_ACCESS_ERR;
-    case IONIC_STS_REMOTE_OPER_ERR:
-      return IBV_WC_REM_OP_ERR;
-    case IONIC_STS_RETRY_EXCEEDED:
-      return IBV_WC_RETRY_EXC_ERR;
-    case IONIC_STS_RNR_RETRY_EXCEEDED:
-      return IBV_WC_RNR_RETRY_EXC_ERR;
-    case IONIC_STS_XRC_VIO_ERR:
-    default:
-      return IBV_WC_GENERAL_ERR;
-  }
-}
-
 /* fw abi v1 */
 
 /* data payload part of v1 wqe */
@@ -151,22 +106,34 @@ union ionic_v1_pld {
   __u8 data[32];
 };
 
+struct ionic_v1_cqe_send {
+  __u8 rsvd[4];
+  __be32 msg_msn;
+  __u8 rsvd2[8];
+  __le64 npg_wqe_idx_timestamp;
+};
+
+struct ionic_v1_cqe_recv {
+  __le64 wqe_idx_timestamp;
+  __be32 src_qpn_op;
+  __u8 src_mac[6];
+  __be16 vlan_tag;
+  __be32 imm_data_rkey;
+};
+
+struct ionic_v1_cqe_rcqe {
+  __be64 wqe_idx_timestamp;
+  __u8 rsvd[8];
+  __be32 seq_op_flags;
+  __be32 imm_data_rkey;
+};
+
 /* completion queue v1 cqe */
 struct ionic_v1_cqe {
   union {
-    struct {
-      __le64 wqe_idx_timestamp;
-      __be32 src_qpn_op;
-      __u8 src_mac[6];
-      __be16 vlan_tag;
-      __be32 imm_data_rkey;
-    } recv;
-    struct {
-      __u8 rsvd[4];
-      __be32 msg_msn;
-      __u8 rsvd2[8];
-      __le64 npg_wqe_idx_timestamp;
-    } send;
+    struct ionic_v1_cqe_send send;
+    struct ionic_v1_cqe_recv recv;
+    struct ionic_v1_cqe_rcqe rcqe;
   };
   __be32 status_length;
   __be32 qid_type_flags;
@@ -177,6 +144,30 @@ enum ionic_v1_cqe_wqe_idx_timestamp_bits {
   IONIC_V1_CQE_WQE_IDX_MASK = 0xffff,
   IONIC_V1_CQE_TIMESTAMP_SHIFT = 16,
 };
+
+/* bits for rcqe seq_op_flags */
+enum ionic_v1_cqe_rcqe_op_flag_bits {
+  IONIC_V1_CQE_RCQE_SEQ_MASK = 0xffffff,
+  IONIC_V1_CQE_RCQE_FLAG_V = BIT(24),
+  IONIC_V1_CQE_RCQE_FLAG_I = BIT(25),
+  IONIC_V1_CQE_RCQE_OP_SHIFT = 28,
+};
+
+static inline uint32_t ionic_v1_rcqe_seq(uint32_t seq_opf) {
+  return seq_opf & IONIC_V1_CQE_RCQE_SEQ_MASK;
+}
+
+static inline uint8_t ionic_v1_rcqe_op(uint32_t seq_opf) {
+  return seq_opf >> IONIC_V1_CQE_RCQE_OP_SHIFT;
+}
+
+static inline bool ionic_v1_rcqe_valid(uint32_t seq_opf) {
+  return seq_opf & IONIC_V1_CQE_RCQE_FLAG_V;
+}
+
+static inline bool ionic_v1_rcqe_ready(uint32_t seq_opf) {
+  return seq_opf & IONIC_V1_CQE_RCQE_FLAG_I;
+}
 
 /* bits for cqe recv */
 enum ionic_v1_cqe_src_qpn_bits {
@@ -207,7 +198,7 @@ enum ionic_v1_cqe_qtf_bits {
   IONIC_V1_CQE_TYPE_RECV = 1,
   IONIC_V1_CQE_TYPE_SEND_MSN = 2,
   IONIC_V1_CQE_TYPE_SEND_NPG = 3,
-  IONIC_V1_CQE_TYPE_RECV_INDIR = 4,
+  IONIC_V1_CQE_TYPE_RECV_RCQE = 4,
 };
 
 #if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP_PLATFORM_HCC__)
@@ -462,46 +453,25 @@ static inline int ionic_v1_use_spec_sge(int min_sge, int spec) {
 }
 
 #define IONIC_RCQ_SIZE 4096
-#define IONIC_RCQ_DEPTH 128
-#define IONIC_RCQ_DEPTH_LOG2 7
-#define IONIC_RCQ_STRIDE_LOG2 4
 
 struct ionic_rcq_hdr {
-  uint8_t pad[60];
-  uint32_t seq_pad;
-};
-
-struct ionic_rcqe {
-  uint32_t status_length;
-  uint32_t imm_data;
-  uint32_t seq_flags;
-  uint32_t rsvd;
-};
-
-enum ionic_rcqe_flag {
-  IONIC_RCQE_C = BIT(7),
-  IONIC_RCQE_I = BIT(6),
+  __be32 seq;
+  __be32 ack;
 };
 
 struct ionic_rcq {
-  struct ionic_rcq_hdr hdr;
-  struct ionic_rcqe ring[IONIC_RCQ_DEPTH];
+  union {
+    uint8_t bytes[IONIC_RCQ_SIZE];
+    struct ionic_rcq_hdr hdr;
+  };
 };
 
-static inline uint32_t ionic_rcq_hdr_seq(struct ionic_rcq_hdr* hdr) {
-  return be32toh(hdr->seq_pad) >> 8;
+static inline uint32_t ionic_rcq_seq(struct ionic_rcq* rcq) {
+  return be32toh(rcq->hdr.seq) & IONIC_V1_CQE_RCQE_SEQ_MASK;
 }
 
-static inline uint32_t ionic_rcqe_seq(struct ionic_rcqe* rcqe) {
-  return be32toh(rcqe->seq_flags) >> 8;
-}
-
-static inline bool ionic_rcqe_color(struct ionic_rcqe* rcqe) {
-  return !!(rcqe->seq_flags & htobe32(IONIC_RCQE_C));
-}
-
-static inline bool ionic_rcqe_imm(struct ionic_rcqe* rcqe) {
-  return !!(rcqe->seq_flags & htobe32(IONIC_RCQE_I));
+static inline void ionic_rcq_ack(struct ionic_rcq* rcq, uint32_t ack) {
+  rcq->hdr.ack = htobe32(ack);
 }
 
 #endif  // !defined(__cplusplus)

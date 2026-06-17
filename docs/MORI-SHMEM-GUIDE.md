@@ -295,6 +295,7 @@ This copies the current GPU states to the `globalGpuStates` symbol in the dynami
 | `MORI_SHMEM_VMM_CHUNK_SIZE` | VMM mode chunk size in bytes | Auto |
 | `MORI_SOCKET_IFNAME` | Network interface for shmem bootstrap TCP connections (e.g., `"lo"`, `"eth0"`) | Auto-detect |
 | `MORI_RDMA_DEVICES` | RDMA NIC selection. Include: `mlx5_0,mlx5_1`. Exclude: `^mlx5_2,mlx5_3` | All available |
+| `LD_LIBRARY_PATH` | mori loads libibverbs dynamically at runtime (`dlopen`) instead of linking it; to use an out-of-tree libibverbs, put its directory here. | `libibverbs.so` / `libibverbs.so.1` |
 | `MORI_NUM_QP_PER_PE` | Number of RDMA queue pairs per PE | `1` |
 | `MORI_IB_GID_INDEX` | InfiniBand GID index for RDMA connections | Auto-detect |
 | `MORI_RDMA_SL` | RDMA service level | Auto |

@@ -275,16 +275,14 @@ def _copy_jit_sources(root_dir: Path) -> None:
 
 
 _3RDPARTY_DIRS = ["3rdparty/spdlog", "3rdparty/msgpack-c"]
-_3RDPARTY_DIRS_UMBP = ["3rdparty/spdk"]
 
 
 def _ensure_3rdparty(root_dir: Path, extra_dirs: list[str] | None = None) -> None:
     """Ensure 3rdparty submodule directories exist via git submodule update.
 
     Only the submodules in *required_dirs* are initialised.  Pass extra_dirs to
-    opt-in to optional submodules (e.g. ``_3RDPARTY_DIRS_UMBP`` when
-    BUILD_UMBP=ON).  SPDK is intentionally excluded from the default set
-    because it is large and only needed for UMBP builds.
+    opt-in to optional submodules.  SPDK is intentionally excluded from this
+    path because tools/setup_spdk.sh does its own selective checkout.
     """
     required_dirs = _3RDPARTY_DIRS + (extra_dirs or [])
     missing = [
@@ -320,6 +318,17 @@ def _ensure_3rdparty(root_dir: Path, extra_dirs: list[str] | None = None) -> Non
         )
 
 
+def _setup_spdk(root_dir: Path) -> None:
+    setup_spdk = root_dir / "tools" / "setup_spdk.sh"
+    if not setup_spdk.is_file():
+        raise RuntimeError(f"Missing SPDK setup script: {setup_spdk}")
+
+    subprocess.check_call(
+        [str(setup_spdk), "--jobs", str(os.cpu_count() or 1)],
+        cwd=str(root_dir),
+    )
+
+
 class CMakeBuild(build_ext):
     def run(self) -> None:
         try:
@@ -344,8 +353,13 @@ class CMakeBuild(build_ext):
 
         root_dir = Path(__file__).parent
 
-        extra = _3RDPARTY_DIRS_UMBP if _env_flag("BUILD_UMBP", "OFF") else []
-        _ensure_3rdparty(root_dir, extra_dirs=extra)
+        build_umbp_spdk_enabled = _env_flag("BUILD_UMBP_SPDK", "OFF")
+        build_umbp_enabled = _env_flag("BUILD_UMBP", "ON") or build_umbp_spdk_enabled
+
+        _ensure_3rdparty(root_dir)
+        if build_umbp_spdk_enabled:
+            _setup_spdk(root_dir)
+
         build_dir = root_dir / os.environ.get("MORI_PYBUILD_DIR", "build")
         build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -364,8 +378,8 @@ class CMakeBuild(build_ext):
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
         build_benchmark = os.environ.get("BUILD_BENCHMARK", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
-        build_umbp_enabled = _env_flag("BUILD_UMBP", "OFF")
         build_umbp = "ON" if build_umbp_enabled else "OFF"
+        build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
         with_mpi = (
             "ON"
@@ -396,6 +410,7 @@ class CMakeBuild(build_ext):
             f"-DBUILD_BENCHMARK={build_benchmark}",
             f"-DBUILD_TESTS={build_tests}",
             f"-DBUILD_UMBP={build_umbp}",
+            f"-DUSE_SPDK={build_umbp_spdk}",
             f"-DWITH_MPI={with_mpi}",
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
             f"-DBUILD_XLA_FFI_OPS={build_xla_ffi_ops}",
@@ -454,6 +469,10 @@ class CMakeBuild(build_ext):
                 build_dir / "src/io/libmori_io.so",
                 root_dir / "python/mori/libmori_io.so",
             ),
+            (
+                build_dir / "src/metrics/libmori_metrics.so",
+                root_dir / "python/mori/libmori_metrics.so",
+            ),
         ]
         collective_so = build_dir / "src/collective/libmori_collective.so"
         if collective_so.exists():
@@ -467,9 +486,9 @@ class CMakeBuild(build_ext):
         # (no separate .so to copy)
         spdk_proxy_src = build_dir / "src/umbp/spdk_proxy"
         spdk_proxy_dst = root_dir / "python/mori/spdk_proxy"
-        if build_umbp_enabled and spdk_proxy_src.exists():
+        if build_umbp_spdk_enabled and spdk_proxy_src.exists():
             shutil.copyfile(spdk_proxy_src, spdk_proxy_dst)
-            os.chmod(spdk_proxy_dst, 0o755)
+            os.chmod(spdk_proxy_dst, 0o700)
         elif spdk_proxy_dst.exists():
             spdk_proxy_dst.unlink()
 
@@ -477,7 +496,7 @@ class CMakeBuild(build_ext):
         umbp_master_dst = root_dir / "python/mori/umbp_master"
         if umbp_master_src.exists():
             shutil.copyfile(umbp_master_src, umbp_master_dst)
-            os.chmod(umbp_master_dst, 0o755)
+            os.chmod(umbp_master_dst, 0o700)
         elif umbp_master_dst.exists():
             umbp_master_dst.unlink()
 
@@ -581,8 +600,8 @@ mori_package_data = [
     "libmori_ops.so",
     "libmori_io.so",
     "libmori_application.so",
+    "libmori_metrics.so",
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
-    "spdk_proxy",
     "umbp_master",
     "_jit-sources/include/**/*.hpp",
     "_jit-sources/include/**/*.h",
@@ -597,7 +616,7 @@ mori_package_data = [
     "ops/tuning_configs/*.json",
     "tools/*.sh",
 ]
-if _env_flag("BUILD_UMBP", "OFF"):
+if _env_flag("BUILD_UMBP_SPDK", "OFF"):
     mori_package_data.append("spdk_proxy")
 
 setup(

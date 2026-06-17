@@ -29,7 +29,15 @@
 #include <variant>
 #include <vector>
 
+// This header is compiled both into host TUs and into the device .hip kernels.
+// The device side only needs application::SymmMemObjPtr (a device-safe POD from
+// application_device_types.hpp); the full application.hpp pulls the host RDMA
+// stack -> system mlx5dv.h/verbs.h, which must stay out of device compiles.
+#if !defined(__HIPCC__) && !defined(__CUDACC__)
 #include "mori/application/application.hpp"
+#else
+#include "mori/application/application_device_types.hpp"
+#endif
 #include "mori/core/profiler/constants.hpp"
 #include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/hip_compat.hpp"
@@ -45,7 +53,14 @@
 namespace mori {
 namespace moe {
 
-enum KernelType { IntraNode = 0, InterNode = 1, InterNodeV1 = 2, InterNodeV1LL = 3, AsyncLL = 4 };
+enum KernelType {
+  IntraNode = 0,
+  InterNode = 1,
+  InterNodeV1 = 2,
+  InterNodeV1LL = 3,
+  AsyncLL = 4,
+  IntraNodeLL = 5
+};
 enum class QuantType { None = 0, Fp8DirectCast = 1, Fp8BlockwiseQuant = 2 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
@@ -83,6 +98,25 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
 #endif
 
 using index_t = int32_t;
+
+// Caller-owned routing pointers for cached/replay routing dispatch/combine.
+// All fields must be non-null when passed to GetEpDispatchCombineArgsRaw(..., routing, ...).
+struct EpDispatchCombineRoutingPtrs {
+  index_t* dispDestTokIdMap{nullptr};
+  index_t* interNodeDispDestTokIdMap{nullptr};
+  index_t* interNodeDispSendMap{nullptr};
+  index_t* totalRecvTokenNum{nullptr};
+  index_t* dispTokIdToSrcTokIdLocal{nullptr};
+
+  bool IsValid() const {
+    return dispDestTokIdMap != nullptr && interNodeDispDestTokIdMap != nullptr &&
+           interNodeDispSendMap != nullptr && totalRecvTokenNum != nullptr &&
+           dispTokIdToSrcTokIdLocal != nullptr;
+  }
+
+  // Throws std::invalid_argument listing any null required pointer.
+  void Validate() const;
+};
 
 #define MAX_EXPERTS_PER_TOKEN (9)
 struct EpDispatchCombineConfig {
@@ -142,7 +176,9 @@ struct EpDispatchCombineConfig {
     return numExpertPerToken * sizeof(float);
   }
   inline __host__ __device__ size_t SrcTokenIdBytes() const { return sizeof(index_t); }
-  inline __host__ __device__ size_t ScaleBytes() const { return scaleDim * scaleTypeSize; }
+  inline __host__ __device__ size_t ScaleBytes() const {
+    return static_cast<size_t>(scaleDim) * scaleTypeSize;
+  }
   // Size_t accessors for fields used in token-offset arithmetic.
   // Use these instead of the raw int members to avoid int32 overflow when
   // multiplying by token counts (e.g. tokenId * HiddenDimSz() is size_t * size_t).
@@ -175,6 +211,8 @@ struct ShmemBufsInterNodeV1 {
   mori::application::SymmMemObjPtr dispatchOut;
   mori::application::SymmMemObjPtr combineOut;
   mori::application::SymmMemObjPtr staging;
+  // Dispatch send source, separate from `staging` so combine can't overwrite it.
+  mori::application::SymmMemObjPtr dispatchStaging;
 };
 
 // InterNode / AsyncLL: full 5-buffer set used by the non-V1 RDMA paths.
@@ -238,7 +276,7 @@ class EpDispatchCombineHandle {
   int Fp8BlockwiseCombineScaleTypeSize() const { return fp8BlockwiseCombineScaleTypeSize; }
 
   mori::application::SymmMemObjPtr GetShmemDispatchOutTokMemObj() const {
-    if (config.kernelType == KernelType::IntraNode)
+    if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL)
       return std::get<ShmemBufsIntraNode>(shmemTokBufs).dispatchOut;
     if (config.kernelType == KernelType::InterNodeV1 ||
         config.kernelType == KernelType::InterNodeV1LL)
@@ -246,7 +284,7 @@ class EpDispatchCombineHandle {
     return std::get<ShmemBufsInterNode>(shmemTokBufs).dispatchOut;
   }
   mori::application::SymmMemObjPtr GetShmemCombineOutTokMemObj() const {
-    if (config.kernelType == KernelType::IntraNode)
+    if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL)
       return std::get<ShmemBufsIntraNode>(shmemTokBufs).combineOut;
     if (config.kernelType == KernelType::InterNodeV1 ||
         config.kernelType == KernelType::InterNodeV1LL)
@@ -254,7 +292,7 @@ class EpDispatchCombineHandle {
     return std::get<ShmemBufsInterNode>(shmemTokBufs).combineOut;
   }
   mori::application::SymmMemObjPtr GetShmemCombineInpTokMemObj() const {
-    if (config.kernelType == KernelType::IntraNode)
+    if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL)
       return std::get<ShmemBufsIntraNode>(shmemTokBufs).combineInp;
     if (config.kernelType == KernelType::InterNodeV1 ||
         config.kernelType == KernelType::InterNodeV1LL)
@@ -391,6 +429,7 @@ struct EpDispatchCombineArgs {
   EpDispatchCombineConfig config;
   int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
+  bool replayMode{false};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   T* inpTokenBuf{nullptr};
@@ -422,6 +461,7 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
+  index_t* dispTokIdToSrcTokIdLocal{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint64_t* crossDeviceBarrierFlag{nullptr};
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
@@ -454,6 +494,7 @@ struct EpDispatchCombineArgsRaw {
   EpDispatchCombineConfig config;
   int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
+  bool replayMode{false};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   void* inpTokenBuf{nullptr};
@@ -485,6 +526,7 @@ struct EpDispatchCombineArgsRaw {
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
+  index_t* dispTokIdToSrcTokIdLocal{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint64_t* crossDeviceBarrierFlag{nullptr};
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
@@ -516,6 +558,13 @@ static_assert(sizeof(EpDispatchCombineArgsRaw) == sizeof(EpDispatchCombineArgs<h
 
 EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
                                                      int rdmaBlockNum);
+
+// Routing-handle overload: routing pointers come from caller-owned tensors;
+// `replayMode` selects cache vs replay routing dispatch (combine always passes false).
+EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
+                                                     int rdmaBlockNum,
+                                                     const EpDispatchCombineRoutingPtrs* routing,
+                                                     bool replayMode);
 
 struct LocalExpertCountArgs {
   const index_t* indices;

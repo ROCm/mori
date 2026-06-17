@@ -1,0 +1,73 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+#pragma once
+
+// Provider-agnostic RDMA helpers only. Provider-specific CQE error decoders
+// (Mlx5/Bnxt/IonicHandleErrorCqe) live in their own provider device headers so
+// this header — included by every provider — stays free of mlx5dv.h and the
+// per-provider firmware headers.
+#include "mori/core/transport/rdma/core_device_types.hpp"  // WcStatus, atomicType
+#include "mori/hip_compat.hpp"                             // __device__ / __host__
+
+namespace mori {
+namespace core {
+
+static __device__ __host__ const char* WcStatusString(WcStatus status) {
+  static const char* const wc_status_str[] = {
+      /* WC_SUCCESS*/ "success",
+      /* WC_LOC_LEN_ERR*/ "local length error",
+      /* WC_LOC_QP_OP_ERR*/ "local QP operation error",
+      /* WC_LOC_EEC_OP_ERR*/ "local EE context operation error",
+      /* WC_LOC_PROT_ERR*/ "local protection error",
+      /* WC_WR_FLUSH_ERR*/ "Work Request Flushed Error",
+      /* WC_MW_BIND_ERR*/ "memory management operation error",
+      /* WC_BAD_RESP_ERR*/ "bad response error",
+      /* WC_LOC_ACCESS_ERR*/ "local access error",
+      /* WC_REM_INV_REQ_ERR*/ "remote invalid request error",
+      /* WC_REM_ACCESS_ERR*/ "remote access error",
+      /* WC_REM_OP_ERR*/ "remote operation error",
+      /* WC_RETRY_EXC_ERR*/ "transport retry counter exceeded",
+      /* WC_RNR_RETRY_EXC_ERR*/ "RNR retry counter exceeded",
+      /* WC_LOC_RDD_VIOL_ERR*/ "local RDD violation error",
+      /* WC_REM_INV_RD_REQ_ERR*/ "remote invalid RD request",
+      /* WC_REM_ABORT_ERR*/ "aborted error",
+      /* WC_INV_EECN_ERR*/ "invalid EE context number",
+      /* WC_INV_EEC_STATE_ERR*/ "invalid EE context state",
+      /* WC_FATAL_ERR*/ "fatal error",
+      /* WC_RESP_TIMEOUT_ERR*/ "response timeout error",
+      /* WC_GENERAL_ERR*/ "general error",
+      /* WC_TM_ERR*/ "TM error",
+      /* WC_TM_RNDV_INCOMPLETE*/ "TM software rendezvous",
+  };
+
+  if (status < WC_SUCCESS || status > WC_TM_RNDV_INCOMPLETE) return "unknown";
+
+  return wc_status_str[status];
+}
+
+static __device__ __host__ uint32_t get_num_wqes_in_atomic(atomicType /*amo_op*/,
+                                                           uint32_t /*bytes*/) {
+  return 1;
+}
+
+}  // namespace core
+}  // namespace mori

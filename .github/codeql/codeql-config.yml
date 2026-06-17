@@ -1,0 +1,21 @@
+# CodeQL scan configuration for MoRI.
+#
+# Scope the SAST scan to MoRI's own, shippable code: third-party libraries
+# (vendored/submodule under 3rdparty/), test code, and out-of-tree build
+# artifacts (e.g. googletest compiled into the CMake build dir) are not part
+# of the deliverable and are excluded so their alerts don't show up as MoRI
+# findings. This mirrors the pre-commit config, which already excludes 3rdparty/.
+name: "MoRI CodeQL config"
+
+paths-ignore:
+  - "3rdparty"
+  - "3rdparty/**"
+  - "tests"
+  - "tests/**"
+  - "build"
+  - "build/**"
+  - "**/build/**"
+  - "**/_skbuild/**"
+  - "**/googletest/**"
+  - "**/gtest/**"
+  - "**/gmock/**"

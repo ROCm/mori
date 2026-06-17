@@ -1,0 +1,7 @@
+# Keep build outputs, VCS data, and caches out of the docker build context.
+build/
+.git/
+**/__pycache__/
+**/*.egg-info/
+**/*.pyc
+python/mori/_jit-sources/

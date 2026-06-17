@@ -32,6 +32,9 @@ using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
 
+// Counts failed verifications (on PE 1) so main() can return non-zero and fail CI.
+static int gFailures = 0;
+
 // Legacy API: Using SymmMemObjPtr + offset
 __global__ void ConcurrentPutSignalThreadKernelAdd(int myPe, const SymmMemObjPtr dataObj,
                                                    const SymmMemObjPtr signalObj) {
@@ -628,6 +631,7 @@ void ConcurrentPutSignalThread() {
         (threadNum * blockNum + warpSize - 1) / warpSize;  // One signal per warp
     printf("✓ Legacy API AMO_ADD test PASSED! Signal counter: %lu (expected: %lu), Data: %s\n",
            signalValue, expectedSignals, success ? "OK" : "FAILED");
+    if (!success || signalValue != expectedSignals) gFailures++;
   }
 
   // Cleanup Test 1
@@ -682,6 +686,7 @@ void ConcurrentPutSignalThread() {
       printf(
           "✓ Pure Address API AMO_ADD test PASSED! Signal counter: %lu (expected: %lu), Data: %s\n",
           signalValue, expectedSignals, success ? "OK" : "FAILED");
+      if (!success || signalValue != expectedSignals) gFailures++;
     }
 
     // Cleanup Test 2
@@ -736,6 +741,7 @@ void ConcurrentPutSignalThread() {
     uint64_t expectedSignals = blockNum;  // One signal per block
     printf("✓ Legacy Block AMO_ADD test PASSED! Signal counter: %lu (expected: %lu), Data: %s\n",
            signalValue, expectedSignals, success ? "OK" : "FAILED");
+    if (!success || signalValue != expectedSignals) gFailures++;
   }
 
   ShmemFree(dataBuff2b);
@@ -790,6 +796,7 @@ void ConcurrentPutSignalThread() {
           "✓ Pure Address Block AMO_ADD test PASSED! Signal counter: %lu (expected: %lu), Data: "
           "%s\n",
           signalValue, expectedSignals, success ? "OK" : "FAILED");
+      if (!success || signalValue != expectedSignals) gFailures++;
     }
 
     ShmemFree(dataBuff2c);
@@ -855,6 +862,7 @@ void ConcurrentPutSignalThread() {
     }
     printf("✓ Legacy API AMO_SET test PASSED! Data: %s, Valid signals: %d/%d\n",
            dataSuccess ? "OK" : "FAILED", validSignals, totalWarps);
+    if (!dataSuccess || validSignals != totalWarps) gFailures++;
   }
 
   // Cleanup Test 3
@@ -916,6 +924,7 @@ void ConcurrentPutSignalThread() {
     }
     printf("✓ Legacy Block AMO_SET test PASSED! Data: %s, Valid signals: %d/%d\n",
            dataSuccess ? "OK" : "FAILED", validSignals, blockNum);
+    if (!dataSuccess || validSignals != blockNum) gFailures++;
   }
 
   ShmemFree(dataBuff3b);
@@ -979,6 +988,7 @@ void ConcurrentPutSignalThread() {
       }
       printf("✓ Pure Address API AMO_SET test PASSED! Data: %s, Valid signals: %d/%d\n",
              dataSuccess ? "OK" : "FAILED", validSignals, totalWarps);
+      if (!dataSuccess || validSignals != totalWarps) gFailures++;
     }
 
     // Finalize
@@ -1041,6 +1051,7 @@ void ConcurrentPutSignalThread() {
       }
       printf("✓ Pure Address Block AMO_SET test PASSED! Data: %s, Valid signals: %d/%d\n",
              dataSuccess ? "OK" : "FAILED", validSignals, blockNum);
+      if (!dataSuccess || validSignals != blockNum) gFailures++;
     }
 
     ShmemFree(dataBuff4b);
@@ -1118,6 +1129,7 @@ void ConcurrentPutSignalThread() {
            expectedSignals);
     printf("  Data verification: First 1KB: %s, Last 1KB: %s\n", firstOk ? "OK" : "FAILED",
            lastOk ? "OK" : "FAILED");
+    if (!firstOk || !lastOk || signalValue != expectedSignals) gFailures++;
   }
 
   // Cleanup Test 5
@@ -1225,6 +1237,7 @@ void ConcurrentPutSignalThread() {
           totalSizeLarge / (1024.0 * 1024.0 * 1024.0), signalValue, expectedSignals);
       printf("  Data verification: First 1KB: %s, Middle 1KB: %s, Last 1KB: %s\n",
              firstOk ? "OK" : "FAILED", midOk ? "OK" : "FAILED", lastOk ? "OK" : "FAILED");
+      if (!firstOk || !midOk || !lastOk || signalValue != expectedSignals) gFailures++;
     }
 
     // Cleanup Test 6
@@ -1327,6 +1340,7 @@ void ConcurrentPutSignalThread() {
           totalSizeLarge / (1024.0 * 1024.0 * 1024.0), signalValue, expectedSignals);
       printf("  Data verification: First 1KB: %s, Middle 1KB: %s, Last 1KB: %s\n",
              firstOk ? "OK" : "FAILED", midOk ? "OK" : "FAILED", lastOk ? "OK" : "FAILED");
+      if (!firstOk || !midOk || !lastOk || signalValue != expectedSignals) gFailures++;
     }
 
     // Cleanup Test 7
@@ -1345,5 +1359,6 @@ void ConcurrentPutSignalThread() {
 
 int main(int argc, char* argv[]) {
   ConcurrentPutSignalThread();
-  return 0;
+  // Non-zero exit on any failed verification so mpirun/CI catches regressions.
+  return gFailures > 0 ? 1 : 0;
 }

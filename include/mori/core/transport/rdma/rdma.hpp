@@ -21,14 +21,11 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/core/transport/rdma/host_primitives.hpp"
-#include "mori/core/transport/rdma/primitives.hpp"
+// Core RDMA aggregator: the host-side IBVerbsHandle (opaque ibv_* pointers) plus,
+// under HIP/CUDA, the device provider stack via rdma_device.hpp. Device-only kernel
+// TUs can include rdma_device.hpp directly to skip the host side.
+#include "mori/core/transport/rdma/ibverbs_handle.hpp"
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
-#include "mori/core/transport/rdma/device_primitives.hpp"
-#include "mori/core/transport/rdma/providers/bnxt/bnxt_device_primitives.hpp"
-#include "mori/core/transport/rdma/providers/ionic/ionic_device_primitives.hpp"
-#include "mori/core/transport/rdma/providers/mlx5/mlx5_device_primitives.hpp"
+#include "mori/core/transport/rdma/rdma_device.hpp"
 #endif
-
-#include "mori/core/transport/rdma/providers/mlx5/mlx5_host_primitives.hpp"

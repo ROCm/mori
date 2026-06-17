@@ -19,7 +19,8 @@ python/mori/spdk_proxy
 .vscode
 *.log
 *.core
-.claude/
+.claude/*
+!.claude/skills/
 .codex/
 .cache/
 CMakeFiles/

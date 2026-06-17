@@ -372,6 +372,7 @@ class EpDispatchCombineTestCase:
         input_shift=0.0,
         force_scale_active=False,
         combine_scale_dim=None,
+        sentinel_pattern=None,
     ):
         """Generate test data."""
         if num_token_override is not None:
@@ -439,6 +440,23 @@ class EpDispatchCombineTestCase:
                         device=self.device,
                     )
                     indices[i] = perm[: self.config.num_experts_per_token]
+
+            if sentinel_pattern is not None and n > 0:
+                k = self.config.num_experts_per_token
+                if sentinel_pattern == "every_other":
+                    sentinel_slots = list(range(1, k, 2))
+                elif sentinel_pattern == "first_only":
+                    sentinel_slots = list(range(1, k))
+                elif isinstance(sentinel_pattern, int):
+                    assert 0 <= sentinel_pattern < k, (
+                        f"sentinel_pattern={sentinel_pattern} must be in [0, "
+                        f"num_experts_per_token={k})"
+                    )
+                    sentinel_slots = list(range(k - sentinel_pattern, k))
+                else:
+                    raise ValueError(f"Unknown sentinel_pattern: {sentinel_pattern!r}")
+                for j in sentinel_slots:
+                    indices[:, j] = -1
             all_rank_indices.append(indices.to(torch.int32).to(self.device))
 
         all_rank_weights = [
@@ -577,9 +595,13 @@ class EpDispatchCombineTestCase:
             return
 
         for i in range(all_rank_num_token[self.config.rank]):
+            # Ignore -1 routing sentinels: they should be skipped by
+            # both dispatch and combine, so they contribute no PE to the
+            # expected unique-PE multiplier.
             pes = [
                 (idx // self.config.num_experts_per_rank)
                 for idx in all_rank_indices[self.config.rank][i].cpu().tolist()
+                if idx >= 0
             ]
             unique_pes = len(set(pes))
 
@@ -687,7 +709,10 @@ class EpDispatchCombineTestCase:
                 dispatch_output[:total_recv_num_token, :]
             )
         combine_output, combine_output_weight = op.combine(
-            dispatch_output, dispatch_weights, dispatch_indices, call_reset=False
+            dispatch_output,
+            dispatch_weights,
+            all_rank_indices[self.config.rank],
+            call_reset=False,
         )
         self.sync()
         if check_results:
@@ -767,6 +792,7 @@ def run_ep_dispatch_combine_test(
     routing=None,
     num_token_override=None,
     check_results=True,
+    sentinel_pattern=None,
 ):
     op = mori.ops.EpDispatchCombineOp(config)
     test_case = test_case_cls(config)
@@ -777,5 +803,7 @@ def run_ep_dispatch_combine_test(
         gen_kwargs["routing"] = routing
     if num_token_override is not None:
         gen_kwargs["num_token_override"] = num_token_override
+    if sentinel_pattern is not None:
+        gen_kwargs["sentinel_pattern"] = sentinel_pattern
     test_data = test_case.gen_test_data(**gen_kwargs)
     test_case.run_test_once(op, test_data, check_results=check_results)

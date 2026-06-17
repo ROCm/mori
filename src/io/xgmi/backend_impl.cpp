@@ -39,6 +39,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "mori/utils/host_utils.hpp"
 
 namespace mori {
 namespace io {
@@ -466,15 +467,10 @@ bool XgmiBackendSession::Alive() const { return true; }
 XgmiBackend::XgmiBackend(EngineKey k, const IOEngineConfig& engConfig,
                          const XgmiBackendConfig& beConfig)
     : myEngKey(k), config(beConfig), myPid(static_cast<int>(getpid())) {
-  if (auto nodeId = mori::env::GetString("MORI_IO_NODE_ID"); nodeId.has_value()) {
-    myNodeId = *nodeId;
-  }
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
   myHostname = std::string(hostname);
-  if (myNodeId.empty()) {
-    myNodeId = myHostname;
-  }
+  myNodeId = mori::ResolveNodeId(myHostname);
 
   streamPool = std::make_unique<StreamPool>(config.numStreams);
   eventPool = std::make_unique<EventPool>(config.numEvents);

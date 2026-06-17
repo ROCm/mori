@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
 
+#include <infiniband/verbs.h>  // dereferences ibvHandle.qp (forward-declared in core)
+
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -49,7 +51,7 @@ enum class PostSendOpKind : uint8_t {
 
 static int GetSqBackoffTimeoutUs() {
   static const int kBackoffTimeoutUs = []() {
-    int v = 10000;
+    int v = 5000000;
     env::Override("MORI_IO_SQ_BACKOFF_TIMEOUT_US", v, mori::env::detail::ParsePositiveInt);
     return v;
   }();
@@ -255,6 +257,54 @@ static void ReleaseSqDepth(const EpPair& ep, int wrCount) {
   ep.sqDepth->fetch_sub(wrCount, std::memory_order_relaxed);
 }
 
+// Fill `plan` with (offset, len) chunks for a transfer of `total` bytes. Clears
+// `plan` first but keeps its capacity so callers can reuse a pooled buffer.
+static void PlanChunksInto(std::vector<std::pair<uint64_t, uint32_t>>& plan, uint32_t total,
+                           size_t chunkBytes, int maxChunks) {
+  plan.clear();
+  if (total == 0) return;
+  if (chunkBytes == 0) {
+    plan.push_back({0, total});
+    return;
+  }
+  if (maxChunks <= 0) return;
+  if (total <= chunkBytes) {
+    plan.push_back({0, total});
+    return;
+  }
+
+  size_t chunkCount = (static_cast<size_t>(total) + chunkBytes - 1) / chunkBytes;
+  chunkCount = std::max<size_t>(1, std::min(chunkCount, static_cast<size_t>(maxChunks)));
+  const size_t perChunk = (static_cast<size_t>(total) + chunkCount - 1) / chunkCount;
+
+  if (plan.capacity() < chunkCount) plan.reserve(chunkCount);
+  for (size_t offset = 0; offset < total; offset += perChunk) {
+    const uint32_t len =
+        static_cast<uint32_t>(std::min(perChunk, static_cast<size_t>(total) - offset));
+    plan.push_back({offset, len});
+  }
+}
+
+std::vector<std::pair<uint64_t, uint32_t>> PlanChunks(uint32_t total, size_t chunkBytes,
+                                                      int maxChunks) {
+  std::vector<std::pair<uint64_t, uint32_t>> plan;
+  PlanChunksInto(plan, total, chunkBytes, maxChunks);
+  return plan;
+}
+
+struct MergedWorkRequest {
+  ibv_send_wr wr{};
+  std::vector<ibv_sge> sges;
+  size_t totalRemoteLength = 0;
+  size_t mergedRequests = 1;
+};
+
+static void ResetMergedWorkRequestPointers(MergedWorkRequest* wr) {
+  if (wr == nullptr) return;
+  wr->wr.sg_list = wr->sges.empty() ? nullptr : wr->sges.data();
+  wr->wr.num_sge = static_cast<int>(wr->sges.size());
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Rdma Utilities                                         */
 /* ---------------------------------------------------------------------------------------------- */
@@ -310,12 +360,13 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
   return {StatusCode::IN_PROGRESS, ""};
 }
 
-RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
-                             const SizeVec& localOffsets,
-                             const application::RdmaMemoryRegion& remote,
-                             const SizeVec& remoteOffsets, const SizeVec& sizes,
-                             std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
-                             bool isRead, int postBatchSize) {
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
+                             const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                             const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                             const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id, bool isRead, int postBatchSize, size_t chunkBytes,
+                             int maxChunks, bool creditByWrCount) {
   MORI_IO_FUNCTION_TIMER;
 
   if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
@@ -328,52 +379,114 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     return {StatusCode::SUCCESS, ""};
   }
 
-  for (size_t i = 0; i < batchSize; i++) {
-    if (((localOffsets[i] + sizes[i]) > local.length) ||
-        ((remoteOffsets[i] + sizes[i]) > remote.length)) {
-      return {StatusCode::ERR_INVALID_ARGS, "length out of range"};
-    }
-  }
-
   if (eps.empty()) {
     return {StatusCode::ERR_INVALID_ARGS, "no endpoints"};
   }
 
-  std::vector<size_t> indices(batchSize);
+  if (localMrPerEp.size() != eps.size() || remoteMrPerEp.size() != eps.size()) {
+    return {StatusCode::ERR_INVALID_ARGS, "memory-region vectors must align with endpoints"};
+  }
+
+  if (maxChunks <= 0) {
+    return {StatusCode::ERR_INVALID_ARGS, "maxChunks must be >= 1"};
+  }
+
+  const application::RdmaMemoryRegion& baseLocalMr = localMrPerEp.front();
+  const application::RdmaMemoryRegion& baseRemoteMr = remoteMrPerEp.front();
+  for (size_t i = 0; i < batchSize; i++) {
+    if (((localOffsets[i] + sizes[i]) > baseLocalMr.length) ||
+        ((remoteOffsets[i] + sizes[i]) > baseRemoteMr.length)) {
+      return {StatusCode::ERR_INVALID_ARGS, "length out of range"};
+    }
+  }
+
+  // [tls-scratch] Per worker-thread scratch pools eliminate per-batch heap
+  // allocations on the RDMA hot path (slot reuse / resize() / clear() retain
+  // capacity across calls). The pools belong to the OUTERMOST call on a thread;
+  // if RdmaBatchReadWrite is ever re-entered on the same thread (e.g. from a
+  // completion callback), the nested call transparently falls back to local
+  // buffers so the outer call's pools are never clobbered.
+  thread_local std::vector<size_t> tlIndices;
+  thread_local std::vector<MergedWorkRequest> tlMergedPool;
+  thread_local std::vector<MergedWorkRequest> tlChunkedPool;
+  thread_local std::vector<std::pair<uint64_t, uint32_t>> tlChunkPlan;
+  thread_local std::vector<int> tlEpWrsSinceSignal;
+  thread_local std::vector<size_t> tlEpMergedSinceSignal;
+  thread_local int reentryDepth = 0;
+
+  struct ReentryGuard {
+    int& depth;
+    explicit ReentryGuard(int& d) : depth(d) { ++depth; }
+    ~ReentryGuard() { --depth; }
+  } reentryGuard(reentryDepth);
+  const bool usePool = (reentryDepth == 1);
+
+  // Used only on (currently non-existent) same-thread re-entry.
+  std::vector<size_t> localIndices;
+  std::vector<MergedWorkRequest> localMergedPool;
+  std::vector<MergedWorkRequest> localChunkedPool;
+  std::vector<std::pair<uint64_t, uint32_t>> localChunkPlan;
+  std::vector<int> localEpWrsSinceSignal;
+  std::vector<size_t> localEpMergedSinceSignal;
+
+  std::vector<size_t>& indices = usePool ? tlIndices : localIndices;
+  std::vector<MergedWorkRequest>& mergedPool = usePool ? tlMergedPool : localMergedPool;
+  std::vector<MergedWorkRequest>& chunkedPool = usePool ? tlChunkedPool : localChunkedPool;
+  std::vector<std::pair<uint64_t, uint32_t>>& chunkPlan = usePool ? tlChunkPlan : localChunkPlan;
+  std::vector<int>& epWrsSinceSignal = usePool ? tlEpWrsSinceSignal : localEpWrsSinceSignal;
+  std::vector<size_t>& epMergedSinceSignal =
+      usePool ? tlEpMergedSinceSignal : localEpMergedSinceSignal;
+
+  // Bound peak retained memory: if an earlier very large batch grew the pools far
+  // beyond the current need, release the excess so it doesn't stay resident.
+  constexpr size_t kPoolHighWater = 8192;
+  if (usePool && batchSize <= kPoolHighWater / 2) {
+    if (mergedPool.size() > kPoolHighWater) {
+      mergedPool.resize(kPoolHighWater);
+      mergedPool.shrink_to_fit();
+    }
+    if (chunkedPool.size() > kPoolHighWater) {
+      chunkedPool.resize(kPoolHighWater);
+      chunkedPool.shrink_to_fit();
+    }
+  }
+
+  indices.resize(batchSize);
   std::iota(indices.begin(), indices.end(), 0);
 
-  if (std::is_sorted(remoteOffsets.begin(), remoteOffsets.end()) == false)
+  if (!std::is_sorted(remoteOffsets.begin(), remoteOffsets.end())) {
     std::sort(indices.begin(), indices.end(),
               [&](size_t a, size_t b) { return remoteOffsets[a] < remoteOffsets[b]; });
+  }
 
-  struct MergedWorkRequest {
-    ibv_send_wr wr{};
-    std::vector<ibv_sge> sges;
-    size_t totalRemoteLength = 0;
-    size_t mergedRequests = 1;
-  };
-
-  const uint64_t localBaseAddr = reinterpret_cast<uint64_t>(local.addr);
-  const uint64_t remoteBaseAddr = reinterpret_cast<uint64_t>(remote.addr);
+  const uint64_t localBaseAddr = reinterpret_cast<uint64_t>(baseLocalMr.addr);
+  const uint64_t remoteBaseAddr = reinterpret_cast<uint64_t>(baseRemoteMr.addr);
   const uint32_t maxSge =
       std::max(eps[0].local.handle.maxSge, 1u);  // We assume all endpoints have the same maxSge
+  const ibv_wr_opcode opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
 
-  std::vector<MergedWorkRequest> mergedWrs;
-  mergedWrs.reserve(batchSize);
+  // Initialize a pooled slot as a single-SGE WR (shared by the merge builder and
+  // the chunk expander); clears but keeps the slot's sges capacity.
+  auto initSingleSgeWr = [](MergedWorkRequest& w, ibv_wr_opcode op, uint64_t remoteAddr,
+                            uint64_t localAddr, uint32_t len, uint32_t sgeCap) {
+    w.sges.clear();
+    if (w.sges.capacity() < sgeCap) w.sges.reserve(sgeCap);
+    w.sges.push_back(ibv_sge{.addr = localAddr, .length = len, .lkey = 0});
+    w.totalRemoteLength = len;
+    w.mergedRequests = 1;
+    w.wr = ibv_send_wr{};
+    w.wr.opcode = op;
+    w.wr.send_flags = 0;
+    w.wr.wr.rdma.remote_addr = remoteAddr;
+    w.wr.wr.rdma.rkey = 0;
+    ResetMergedWorkRequestPointers(&w);
+  };
 
+  size_t wrCount = 0;
   auto start_new_wr = [&](uint64_t remoteAddr, uint64_t localAddr, uint32_t len) {
-    mergedWrs.emplace_back();
-    MergedWorkRequest& newWr = mergedWrs.back();
-    newWr.sges.reserve(maxSge);  // keep sg_list stable
-    newWr.sges.push_back(ibv_sge{.addr = localAddr, .length = len, .lkey = local.lkey});
-    newWr.totalRemoteLength = len;
-
-    newWr.wr.sg_list = newWr.sges.data();
-    newWr.wr.num_sge = 1;
-    newWr.wr.opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
-    newWr.wr.send_flags = 0;
-    newWr.wr.wr.rdma.remote_addr = remoteAddr;
-    newWr.wr.wr.rdma.rkey = remote.rkey;
+    if (wrCount >= mergedPool.size()) mergedPool.emplace_back();
+    initSingleSgeWr(mergedPool[wrCount], opcode, remoteAddr, localAddr, len, maxSge);
+    ++wrCount;
   };
 
   for (size_t i = 0; i < batchSize; ++i) {
@@ -383,16 +496,14 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     const uint32_t currentSize32 = static_cast<uint32_t>(sizes[idx]);
 
     bool merged = false;
-    if (!mergedWrs.empty()) {
-      MergedWorkRequest& lastWr = mergedWrs.back();
+    if (wrCount > 0) {
+      MergedWorkRequest& lastWr = mergedPool[wrCount - 1];
       const uint64_t expectedRemoteAddr = lastWr.wr.wr.rdma.remote_addr + lastWr.totalRemoteLength;
       if (expectedRemoteAddr == currentRemoteAddr) {
-        // Try to merge into last WR
         ibv_sge& lastSge = lastWr.sges.back();
         const bool localContiguous = (lastSge.addr + lastSge.length) == currentLocalAddr;
 
         if (localContiguous) {
-          // Ensure SGE length doesn't overflow uint32_t
           const uint64_t newLen = static_cast<uint64_t>(lastSge.length) + currentSize32;
           if (newLen <= std::numeric_limits<uint32_t>::max()) {
             lastSge.length = static_cast<uint32_t>(newLen);
@@ -401,16 +512,13 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
             merged = true;
           }
         }
-        if (!merged) {
-          if (lastWr.sges.size() < maxSge) {
-            // Append a new SGE into the same WR
-            lastWr.sges.push_back(
-                ibv_sge{.addr = currentLocalAddr, .length = currentSize32, .lkey = local.lkey});
-            lastWr.wr.num_sge = static_cast<int>(lastWr.sges.size());
-            lastWr.mergedRequests += 1;
-            lastWr.totalRemoteLength += currentSize32;
-            merged = true;
-          }
+        if (!merged && lastWr.sges.size() < maxSge) {
+          lastWr.sges.push_back(
+              ibv_sge{.addr = currentLocalAddr, .length = currentSize32, .lkey = 0});
+          ResetMergedWorkRequestPointers(&lastWr);
+          lastWr.mergedRequests += 1;
+          lastWr.totalRemoteLength += currentSize32;
+          merged = true;
         }
       }
     }
@@ -419,7 +527,63 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     }
   }
 
-  size_t mergedWrCount = mergedWrs.size();
+  // [expand-chunked-precompute] Expand oversized WRs into the pooled `chunkedPool`
+  // in place (slot reuse); `chunkPlan` is reused via PlanChunksInto. Note: small
+  // WRs are still copied as-is into chunkedPool when any WR needs splitting.
+  bool useChunked = false;
+  if (chunkBytes > 0) {
+    for (size_t k = 0; k < wrCount; ++k) {
+      const MergedWorkRequest& wr = mergedPool[k];
+      if (wr.wr.num_sge == 1 && !wr.sges.empty() && wr.sges[0].length > chunkBytes) {
+        useChunked = true;
+        break;
+      }
+    }
+  }
+  size_t chunkedCount = 0;
+  if (useChunked) {
+    auto emit = [&](ibv_wr_opcode op, uint64_t remoteAddr, uint64_t localAddr, uint32_t len) {
+      if (chunkedCount >= chunkedPool.size()) chunkedPool.emplace_back();
+      initSingleSgeWr(chunkedPool[chunkedCount], op, remoteAddr, localAddr, len, 1);
+      ++chunkedCount;
+    };
+    for (size_t k = 0; k < wrCount; ++k) {
+      MergedWorkRequest& wr = mergedPool[k];
+      if (wr.wr.num_sge != 1 || wr.sges.empty() || wr.sges[0].length <= chunkBytes) {
+        // Copy as-is (preserves multi-sge / small WRs) into the pooled slot.
+        if (chunkedCount >= chunkedPool.size()) chunkedPool.emplace_back();
+        MergedWorkRequest& c = chunkedPool[chunkedCount];
+        c.sges.clear();
+        if (c.sges.capacity() < wr.sges.size()) c.sges.reserve(wr.sges.size());
+        for (const auto& s : wr.sges) c.sges.push_back(s);
+        c.totalRemoteLength = wr.totalRemoteLength;
+        c.mergedRequests = wr.mergedRequests;
+        c.wr = wr.wr;
+        ResetMergedWorkRequestPointers(&c);
+        ++chunkedCount;
+        continue;
+      }
+      const uint64_t localBase = wr.sges[0].addr;
+      const uint64_t remoteBase = wr.wr.wr.rdma.remote_addr;
+      const uint32_t totalLength = wr.sges[0].length;
+      PlanChunksInto(chunkPlan, totalLength, chunkBytes, maxChunks);
+      for (const auto& [offset, len] : chunkPlan) {
+        emit(wr.wr.opcode, remoteBase + offset, localBase + offset, len);
+      }
+    }
+  }
+
+  std::vector<MergedWorkRequest>& mergedWrs = useChunked ? chunkedPool : mergedPool;
+  size_t mergedWrCount = useChunked ? chunkedCount : wrCount;
+
+  if (creditByWrCount) {
+    if (mergedWrCount > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      return {StatusCode::ERR_INVALID_ARGS, "final WR count exceeds int range"};
+    }
+    for (size_t k = 0; k < mergedWrCount; ++k) mergedWrs[k].mergedRequests = 1;
+    callbackMeta->totalBatchSize = static_cast<int>(mergedWrCount);
+  }
+
   size_t epNum = eps.size();
   size_t epBatchSize = (mergedWrCount + epNum - 1) / epNum;
 
@@ -441,10 +605,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   if (postBatchSize <= 0) postBatchSize = 1;
   int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
 
-  // Per-EP state for adaptive signaling: track WRs and merged requests
-  // accumulated since the last signaled WR on each EP.
-  std::vector<int> epWrsSinceSignal(epNum, 0);
-  std::vector<size_t> epMergedSinceSignal(epNum, 0);
+  epWrsSinceSignal.assign(epNum, 0);
+  epMergedSinceSignal.assign(epNum, 0);
 
   for (int i = 0; i < numPostBatch; i++) {
     int st = i * postBatchSize;
@@ -453,8 +615,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     int epId = i % epNum;
     int batchWrNum = end - st;
 
-    // Reserve SQ depth for this batch; blocks with backoff if the SQ is full,
-    // waiting for CQEs from earlier signaled WRs to drain depth.
     std::string reserveErr;
     SqReserveFailureKind reserveFailure = SqReserveFailureKind::None;
     if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "batch", &reserveErr, &reserveFailure)) {
@@ -463,12 +623,19 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
       return {StatusCode::ERR_RDMA_OP, reserveErr};
     }
 
+    const auto& localMr = localMrPerEp[epId];
+    const auto& remoteMr = remoteMrPerEp[epId];
     size_t mergedReqSize = 0;
     for (int j = st; j < end; j++) {
-      struct ibv_send_wr& wr = mergedWrs[j].wr;
+      MergedWorkRequest& mergedWr = mergedWrs[j];
+      for (auto& sge : mergedWr.sges) sge.lkey = localMr.lkey;
+      mergedWr.wr.wr.rdma.rkey = remoteMr.rkey;
+      ResetMergedWorkRequestPointers(&mergedWr);
+
+      struct ibv_send_wr& wr = mergedWr.wr;
       wr.wr_id = 0;
       wr.next = (j + 1 < end) ? &mergedWrs[j + 1].wr : nullptr;
-      mergedReqSize += mergedWrs[j].mergedRequests;
+      mergedReqSize += mergedWr.mergedRequests;
     }
 
     epWrsSinceSignal[epId] += batchWrNum;
@@ -523,10 +690,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
       const bool lastWasPosted = (postedCount == batchWrNum);
       if (needSignal && lastWasPosted) {
         // Signaled WR was posted; CQ path (ledger->ReleaseByCqe) owns the release.
-        // The record inserted above remains in Posted state — nothing to do here.
       } else if (needSignal) {
-        // Signaled WR itself was NOT posted; remove the record we just inserted
-        // and release whatever was actually posted (tracked via unpostedCount above).
         int dummy = 0;
         eps[epId].ledger->ReleaseByCqe(recordId, nullptr, &dummy);
       }
@@ -539,8 +703,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
         if (eps[epId].degraded) {
           eps[epId].degraded->store(true, std::memory_order_relaxed);
         }
-        // Ledger record for ALL orphaned posted WRs (including prior unsignaled batches
-        // on this EP): sqDepth held by ledger until recovery.
         if (eps[epId].ledger) {
           eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
                                            static_cast<int>(epMergedSinceSignal[epId]));
@@ -583,6 +745,18 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
   return {StatusCode::IN_PROGRESS, ""};
+}
+
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
+                             const SizeVec& localOffsets,
+                             const application::RdmaMemoryRegion& remote,
+                             const SizeVec& remoteOffsets, const SizeVec& sizes,
+                             std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
+                             bool isRead, int postBatchSize) {
+  std::vector<application::RdmaMemoryRegion> localVec(eps.size(), local);
+  std::vector<application::RdmaMemoryRegion> remoteVec(eps.size(), remote);
+  return RdmaBatchReadWrite(eps, localVec, remoteVec, localOffsets, remoteOffsets, sizes,
+                            callbackMeta, id, isRead, postBatchSize, 0, 1, false);
 }
 
 }  // namespace io

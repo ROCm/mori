@@ -47,7 +47,9 @@ struct MessageRegEndpoint {
   TopoKeyPair topo;
   int devId;
   application::RdmaEndpointHandle eph;
-  MSGPACK_DEFINE(ekey, topo, devId, eph);
+  int nicRank{0};
+  int railId{-1};  // index in availDevices for rail affinity; -1 = unset (backward compat)
+  MSGPACK_DEFINE(ekey, topo, devId, eph, nicRank, railId);
 };
 
 struct MessageAskMemoryRegion {

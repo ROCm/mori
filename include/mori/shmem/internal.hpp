@@ -22,8 +22,10 @@
 #pragma once
 
 // Device-safe includes: no STL, no ibverbs, safe for HIP/CUDA device compilation.
+#include <cassert>  // assert() — used in device code below, needed in both host/device compiles
+
 #include "mori/application/application_device_types.hpp"
-#include "mori/core/utils.hpp"
+#include "mori/core/utils/utils.hpp"
 #include "mori/hip_compat.hpp"
 #include "mori/utils/limits.hpp"
 
@@ -103,12 +105,12 @@ struct MemoryStates {
 /*                          Device-safe GPU-side structures                                      */
 /* ---------------------------------------------------------------------------------------------- */
 
-// GPU-side RDMA endpoint. The type now lives in the application (transport)
-// layer as application::RdmaEndpointDevice — the device-visible projection of
+// GPU-side RDMA endpoint. The type lives in core (core::RdmaEndpointDevice) — a
+// device POD over core's WQ/CQ/Ibuf handles, the device-visible projection of
 // application::RdmaEndpoint — so RDMA-driving backends (shmem, cco, ...) depend
-// on it directly rather than on each other. This alias preserves the historical
+// DOWN on core rather than on each other. This alias preserves the historical
 // shmem::ShmemRdmaEndpoint spelling for existing shmem code.
-using ShmemRdmaEndpoint = application::RdmaEndpointDevice;
+using ShmemRdmaEndpoint = core::RdmaEndpointDevice;
 
 // GpuStates must be declared before ModuleStates and ShmemStates which embed it.
 struct GpuStates {

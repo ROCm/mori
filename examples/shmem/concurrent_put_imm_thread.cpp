@@ -32,6 +32,9 @@ using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
 
+// Counts failed verifications (on PE 1) so main() can return non-zero and fail CI.
+static int gFailures = 0;
+
 // Legacy API: Using SymmMemObjPtr + offset
 __global__ void ConcurrentPutImmThreadKernel(int myPe, const SymmMemObjPtr memObj) {
   constexpr int sendPe = 0;
@@ -144,6 +147,7 @@ void ConcurrentPutImmThread() {
   std::vector<uint32_t> hostBuff1(numEle);
   HIP_RUNTIME_CHECK(hipMemcpy(hostBuff1.data(), buff1, buffSize, hipMemcpyDeviceToHost));
 
+  // Data lands on PE 1 (the put-imm receiver), so PE 1 verifies and gates.
   if (myPe == 1) {
     bool success = true;
     for (int i = 0; i < numEle; i++) {
@@ -153,13 +157,12 @@ void ConcurrentPutImmThread() {
         break;
       }
     }
-    if (success && myPe == 0) {
+    if (success) {
       printf("✓ Legacy API test PASSED! All %d elements verified.\n", numEle);
-    } else if (!success && myPe == 0) {
+    } else {
       printf("✗ Legacy API test FAILED!\n");
+      gFailures++;
     }
-  } else if (myPe == 0) {
-    printf("✓ Legacy API test PASSED! All %d elements verified.\n", numEle);
   }
 
   // ===== Test 2: Pure Address API =====
@@ -197,14 +200,17 @@ void ConcurrentPutImmThread() {
       bool success = true;
       for (int i = 0; i < numEle; i++) {
         if (hostBuff2[i] != 42) {
+          printf("Error at index %d: expected 42, got %u\n", i, hostBuff2[i]);
           success = false;
           break;
         }
       }
-    }
-
-    if (myPe == 0) {
-      printf("✓ Pure address API test PASSED!\n");
+      if (success) {
+        printf("✓ Pure address API test PASSED!\n");
+      } else {
+        printf("✗ Pure address API test FAILED!\n");
+        gFailures++;
+      }
     }
 
     ShmemFree(buff2);
@@ -224,5 +230,6 @@ void ConcurrentPutImmThread() {
 
 int main(int argc, char* argv[]) {
   ConcurrentPutImmThread();
-  return 0;
+  // Non-zero exit on any failed verification so mpirun/CI catches regressions.
+  return gFailures > 0 ? 1 : 0;
 }

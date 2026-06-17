@@ -25,8 +25,11 @@
 // Safe to include from both host and device (HIP/CUDA) compilation units.
 #pragma once
 
+#include <endian.h>  // BYTE_ORDER / LITTLE_ENDIAN / BIG_ENDIAN
 #include <limits.h>
 #include <stdint.h>
+
+#include "mori/hip_compat.hpp"  // __device__ / __host__ (no-op under non-hipcc host parse)
 
 namespace mori {
 namespace core {
@@ -41,6 +44,38 @@ enum ProviderType {
   PSD = 3,
   // Ib verbs
   IBVERBS = 4,
+};
+
+// Device-safe mirror of ibverbs' enum ibv_wc_status (same order/values). Lets the
+// device-side CQE error decoders report a completion status without pulling the
+// host <infiniband/verbs.h> into device translation units. Value parity with
+// ibv_wc_status is guarded by static_asserts in a host TU
+// (src/application/transport/rdma/rdma.cpp).
+enum WcStatus {
+  WC_SUCCESS = 0,
+  WC_LOC_LEN_ERR,
+  WC_LOC_QP_OP_ERR,
+  WC_LOC_EEC_OP_ERR,
+  WC_LOC_PROT_ERR,
+  WC_WR_FLUSH_ERR,
+  WC_MW_BIND_ERR,
+  WC_BAD_RESP_ERR,
+  WC_LOC_ACCESS_ERR,
+  WC_REM_INV_REQ_ERR,
+  WC_REM_ACCESS_ERR,
+  WC_REM_OP_ERR,
+  WC_RETRY_EXC_ERR,
+  WC_RNR_RETRY_EXC_ERR,
+  WC_LOC_RDD_VIOL_ERR,
+  WC_REM_INV_RD_REQ_ERR,
+  WC_REM_ABORT_ERR,
+  WC_INV_EECN_ERR,
+  WC_INV_EEC_STATE_ERR,
+  WC_FATAL_ERR,
+  WC_RESP_TIMEOUT_ERR,
+  WC_GENERAL_ERR,
+  WC_TM_ERR,
+  WC_TM_RNDV_INCOMPLETE,
 };
 
 typedef enum {
@@ -68,7 +103,6 @@ typedef enum {
   AMO_OP_SENTINEL = INT_MAX,
 } atomicType;
 
-#define OUTSTANDING_TABLE_SIZE (65536)
 struct WorkQueueHandle {
   uint32_t postIdx{0};     // numbers of wqe that post to work queue
   uint32_t dbTouchIdx{0};  // numbers of wqe that touched doorbell
@@ -92,7 +126,6 @@ struct WorkQueueHandle {
   uint32_t msntblNum{0};
   uint32_t rqWqeNum{0};
   uint32_t postSendLock{0};
-  uint64_t outstandingWqe[OUTSTANDING_TABLE_SIZE]{0};
   bool color;
   uint64_t sq_dbval{0};
   uint64_t rq_dbval{0};
@@ -120,6 +153,37 @@ struct IbufHandle {
   uint32_t nslots{0};
   uint32_t head{0};
   uint32_t tail{0};
+};
+
+enum class RdmaDeviceVendorId : uint32_t {
+  Unknown = 0,
+  Mellanox = 0x02c9,
+  Broadcom = 0x14E4,
+  Pensando = 0x1dd8,
+};
+
+// Device-side view of an RDMA endpoint: a pure device POD over core's WQ/CQ/Ibuf
+// handles. Filled on the host from application::RdmaEndpoint, hipMemcpy'd to the
+// device, consumed by the RDMA backends (shmem, cco) — which depend down on core.
+struct RdmaEndpointDevice {
+  RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
+  uint32_t qpn{0};  // QP number — extracted from application::RdmaEndpoint::handle.qpn
+  WorkQueueHandle wqHandle;
+  CompletionQueueHandle cqHandle;
+  IbufHandle atomicIbuf;
+
+  __device__ __host__ ProviderType GetProviderType() const {
+    switch (vendorId) {
+      case RdmaDeviceVendorId::Mellanox:
+        return ProviderType::MLX5;
+      case RdmaDeviceVendorId::Broadcom:
+        return ProviderType::BNXT;
+      case RdmaDeviceVendorId::Pensando:
+        return ProviderType::PSD;
+      default:
+        return ProviderType::Unknown;
+    }
+  }
 };
 
 /* ---------------------------------------------------------------------------------------------- */

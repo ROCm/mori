@@ -36,6 +36,7 @@
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/env_utils.hpp"
+#include "mori/utils/host_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
@@ -131,35 +132,36 @@ bool Context::SameProcessP2P(int destRank) const {
 void Context::CollectHostNames() {
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
+  myHostname = std::string(hostname);
 
-  // Keep node identity stable across ranks on the same machine.
-  // Using hostname+IP can split local ranks when different NICs are selected.
+  // Key co-location on node id, not hostname: identical hostnames would mark
+  // cross-node ranks as co-located, over-counting rankInNode (trips assert below).
+  std::string nodeId = ResolveNodeId(myHostname);
 
-  // Pack pid + hostname into a fixed-size buffer for Allgather.
-  // Using a fixed layout avoids string parsing ambiguity.
+  // Allgather a fixed-layout {pid, nodeId} record; fixed size avoids parsing.
   constexpr int kPidSize = sizeof(pid_t);
-  constexpr int kStrMax = HOST_NAME_MAX + 1;  // +1 for '\0'
+  constexpr int kStrMax = 256;  // node id: boot_id, hostname, or override
   constexpr int kRecordSize = kPidSize + kStrMax;
 
   pid_t myPid = getpid();
-  char localBuffer[kRecordSize];
+  char localBuffer[kRecordSize] = {};
   memcpy(localBuffer, &myPid, kPidSize);
-  snprintf(localBuffer + kPidSize, kStrMax, "%s", hostname);
+  snprintf(localBuffer + kPidSize, kStrMax, "%s", nodeId.c_str());
 
   std::vector<char> global(kRecordSize * WorldSize());
   bootNet.Allgather(localBuffer, global.data(), kRecordSize);
 
-  myHostname = std::string(localBuffer + kPidSize);
+  std::string myNodeId(localBuffer + kPidSize);
   peerInfos.resize(WorldSize());
   for (int i = 0; i < WorldSize(); i++) {
     const char* rec = global.data() + i * kRecordSize;
     pid_t peerPid;
     memcpy(&peerPid, rec, kPidSize);
-    std::string peerHost(rec + kPidSize);
-    peerInfos[i].sameHost = (peerHost == myHostname);
+    std::string peerNodeId(rec + kPidSize);
+    peerInfos[i].sameHost = (peerNodeId == myNodeId);
     peerInfos[i].sameProcess = peerInfos[i].sameHost && (peerPid == myPid);
     if (LocalRank() == 0) {
-      MORI_APP_TRACE("rank {} hostname={} pid={} sameHost={} sameProcess={}", i, peerHost, peerPid,
+      MORI_APP_TRACE("rank {} nodeId={} pid={} sameHost={} sameProcess={}", i, peerNodeId, peerPid,
                      peerInfos[i].sameHost, peerInfos[i].sameProcess);
     }
   }

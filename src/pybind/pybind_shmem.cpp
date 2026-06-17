@@ -30,10 +30,6 @@ namespace py = pybind11;
 /*                                           Shmem APIs                                           */
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
-int64_t ShmemTorchProcessGroupInit(const std::string& groupName) {
-  return mori::shmem::ShmemTorchProcessGroupInit(groupName);
-}
-
 int64_t ShmemFinalize() { return mori::shmem::ShmemFinalize(); }
 
 int64_t ShmemModuleInit(uint64_t hipModule) {
@@ -117,10 +113,6 @@ void RegisterMoriShmem(py::module_& m) {
   // Initialization flags
   m.attr("MORI_SHMEM_INIT_WITH_MPI_COMM") = mori::shmem::MORI_SHMEM_INIT_WITH_MPI_COMM;
   m.attr("MORI_SHMEM_INIT_WITH_UNIQUEID") = mori::shmem::MORI_SHMEM_INIT_WITH_UNIQUEID;
-
-  // Traditional initialization APIs
-  m.def("shmem_torch_process_group_init", &ShmemTorchProcessGroupInit, py::arg("group_name"),
-        "Initialize shmem from PyTorch process group");
 
   // UniqueId-based initialization APIs (nvshmem/rocshmem compatible)
   m.def("shmem_get_unique_id", &ShmemGetUniqueId,
