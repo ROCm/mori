@@ -24,7 +24,7 @@
 // window.
 //
 //   -T lsa   : intra-node flat-VA load loop (read peer slot → local).
-//   -T igbda : cross-node one-sided RDMA read via ccoGda<PrvdType>.
+//   -T ibgda : cross-node one-sided RDMA read via ccoGda<PrvdType>.
 
 #include <cstdio>
 #include <cstdlib>
@@ -62,9 +62,12 @@ __global__ void lsa_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, s
   }
 }
 
-// IGBDA: one RDMA read per coop unit of its chunk.
+// IBGDA: one QP context per block (ginContext=blockIdx) — each block owns its QP
+// and is independent: pipelines its chunk's reads, then flushes its own QP. No
+// cross-block barrier. block scope = one bulk RDMA read per block; warp/thread
+// scope subdivide. See p2p_put_bw for the flush-vs-quiet note.
 template <core::ProviderType PrvdType, typename Coop>
-__global__ void igbda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
+__global__ void ibgda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int iter) {
   Coop coop;
   const int bid = blockIdx.x;
@@ -81,13 +84,15 @@ __global__ void igbda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const size_t off_bytes = base * sizeof(double);
   const size_t bytes = per_unit * sizeof(double);
 
-  // RDMA read completions are self-confirming (data has landed locally when the
-  // CQE is reaped). Pipeline the reads, one end flush drains the whole batch.
+  // AggregateRequests: see p2p_put_bw — defer the doorbell to the end flush so
+  // warp/thread-scope threads sharing the per-block QP don't deadlock in
+  // ringDoorbellOrdered. The end flush rings once and polls the CQ.
   for (int i = 0; i < iter; i++) {
     gda.get(peer, reinterpret_cast<ccoWindow_t>(sendWin), off_bytes,
-            reinterpret_cast<ccoWindow_t>(recvWin), off_bytes, bytes, coop);
+            reinterpret_cast<ccoWindow_t>(recvWin), off_bytes, bytes, coop,
+            ccoGdaOptFlagsAggregateRequests);
   }
-  gda.flush(ccoCoopBlock{});
+  gda.flush(ccoCoopBlock{});  // rings the aggregated doorbell once + drains this block's QP
 }
 
 static void launch_lsa(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,
@@ -101,19 +106,19 @@ static void launch_lsa(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWi
 }
 
 template <core::ProviderType PrvdType>
-static void launch_igbda(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,
+static void launch_ibgda(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,
                          ccoWindow_t recvWin, size_t len_doubles, ccoDevComm devComm, int count) {
   switch (scope) {
     case PutScope::kBlock:
-      hipLaunchKernelGGL((igbda_get_bw<PrvdType, ccoCoopBlock>), grid, block, 0, 0, sendWin,
+      hipLaunchKernelGGL((ibgda_get_bw<PrvdType, ccoCoopBlock>), grid, block, 0, 0, sendWin,
                          recvWin, len_doubles, devComm, count);
       break;
     case PutScope::kWarp:
-      hipLaunchKernelGGL((igbda_get_bw<PrvdType, ccoCoopWarp>), grid, block, 0, 0, sendWin, recvWin,
+      hipLaunchKernelGGL((ibgda_get_bw<PrvdType, ccoCoopWarp>), grid, block, 0, 0, sendWin, recvWin,
                          len_doubles, devComm, count);
       break;
     case PutScope::kThread:
-      hipLaunchKernelGGL((igbda_get_bw<PrvdType, ccoCoopThread>), grid, block, 0, 0, sendWin,
+      hipLaunchKernelGGL((ibgda_get_bw<PrvdType, ccoCoopThread>), grid, block, 0, 0, sendWin,
                          recvWin, len_doubles, devComm, count);
       break;
   }
@@ -166,7 +171,7 @@ int main(int argc, char** argv) {
           launch_lsa(args.put_scope, grid, block, ctx.send_win, ctx.recv_win, len_doubles,
                      ctx.peer_lsa_rank, count, ctx.device_warp_size);
         } else {
-          CCO_GDA_DISPATCH(launch_igbda<P>(args.put_scope, grid, block, ctx.send_win, ctx.recv_win,
+          CCO_GDA_DISPATCH(launch_ibgda<P>(args.put_scope, grid, block, ctx.send_win, ctx.recv_win,
                                            len_doubles, ctx.devComm, count));
         }
         HIP_RUNTIME_CHECK(hipGetLastError());

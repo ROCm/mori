@@ -44,11 +44,11 @@ namespace mori::cco::benchmark {
 enum class PutScope { kThread, kWarp, kBlock };
 
 // Which CCO p2p transport to exercise. Selected by the MORI_DISABLE_P2P env
-// var (consistent with the rest of mori): unset or enabled → kIgbda (P2P
+// var (consistent with the rest of mori): unset or enabled → kIbgda (P2P
 // disabled, use RDMA); explicitly disabled (0/false/off/no) → kLsa.
 //   kLsa   — intra-node flat-VA load/store (no NIC), requires same-node peer.
-//   kIgbda — cross-node one-sided RDMA via ccoGda<PrvdType>.
-enum class Transport { kLsa, kIgbda };
+//   kIbgda — cross-node one-sided RDMA via ccoGda<PrvdType>.
+enum class Transport { kLsa, kIbgda };
 
 inline constexpr std::size_t kDefaultMinSize = 8;
 inline constexpr std::size_t kDefaultMaxSize = 64ULL * 1024ULL * 1024ULL;
@@ -77,7 +77,7 @@ struct PerfArgs {
   int threads_per_block = kDefaultThreadsPerBlock;
   PutScope put_scope = PutScope::kBlock;
   // Default IBGDA; overridden in PerfInit from MORI_DISABLE_P2P.
-  Transport transport = Transport::kIgbda;
+  Transport transport = Transport::kIbgda;
 };
 
 // Holds MPI + CCO state for the lifetime of a benchmark run. PerfInit registers
@@ -154,8 +154,8 @@ inline const char* TransportToChar(Transport t) {
   switch (t) {
     case Transport::kLsa:
       return "lsa";
-    case Transport::kIgbda:
-      return "igbda";
+    case Transport::kIbgda:
+      return "ibgda";
   }
   return "none";
 }

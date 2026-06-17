@@ -23,7 +23,7 @@
 // CCO p2p put latency — unidirectional, PE 0 → PE 1, one op per iteration.
 //
 //   -T lsa   : single flat-VA store of the whole buffer + system fence.
-//   -T igbda : single RDMA write + flush per iteration.
+//   -T ibgda : single RDMA write + flush per iteration.
 
 #include <cstdio>
 #include <cstdlib>
@@ -55,11 +55,11 @@ __global__ void lsa_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, 
   }
 }
 
-// IGBDA: one block issues a single RDMA write of the whole buffer + flush per
+// IBGDA: one block issues a single RDMA write of the whole buffer + flush per
 // iteration (mirrors shmem's lat_block put_nbi + quiet). flush drains the local
 // CQ each iteration, so on real hardware the per-op time tracks wire latency.
 template <core::ProviderType PrvdType>
-__global__ void igbda_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
+__global__ void ibgda_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
                               size_t len_doubles, ccoDevComm devComm, int iter) {
   if (blockIdx.x != 0) return;
   ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
           hipLaunchKernelGGL(lsa_put_lat, grid, block, 0, 0, ctx.send_win, ctx.recv_win,
                              len_doubles, ctx.peer_lsa_rank, count);
         } else {
-          CCO_GDA_DISPATCH(hipLaunchKernelGGL((igbda_put_lat<P>), grid, block, 0, 0, ctx.send_win,
+          CCO_GDA_DISPATCH(hipLaunchKernelGGL((ibgda_put_lat<P>), grid, block, 0, 0, ctx.send_win,
                                               ctx.recv_win, len_doubles, ctx.devComm, count));
         }
         HIP_RUNTIME_CHECK(hipGetLastError());

@@ -36,7 +36,7 @@ void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [options]\n"
                "  transport is selected by env MORI_DISABLE_P2P:\n"
-               "    unset / on / 1  -> igbda (RDMA)   [default]\n"
+               "    unset / on / 1  -> ibgda (RDMA)   [default]\n"
                "    off / 0 / false -> lsa   (intra-node P2P)\n"
                "  -b min_bytes   minimum message size\n"
                "  -e max_bytes   maximum message size\n"
@@ -217,7 +217,7 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     if (v != nullptr && v[0] != '\0') {
       p2p_disabled = env::detail::ParseBool(v).value_or(true);
     }
-    args.transport = p2p_disabled ? Transport::kIgbda : Transport::kLsa;
+    args.transport = p2p_disabled ? Transport::kIbgda : Transport::kLsa;
   }
 
   // Local communicator → local rank → device binding. CCO pins the device at
@@ -278,15 +278,11 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     reqs.lsaBarrierCount = 0;
   } else {
     reqs.gdaConnectionType = CCO_GDA_CONNECTION_FULL;
-    // perftest ib_write_bw model: pipeline writes, confirm landing via a
-    // GIN signal (RDMA atomic) on the last op — its completion only fires
-    // after the remote read-modify-write round-trip, and same-QP RC ordering
-    // guarantees the preceding writes landed too. One QP context per block; one
-    // signal slot per block. (GDA rail barrier is unavailable single-node, and
-    // counter polls the same early-completing CQ — only the atomic round-trip
-    // forces true remote landing on intra-node loopback.)
+    // One QP context per block (ginContext=blockIdx): each block drives its own
+    // QP, so blocks are independent — no cross-block barrier, and each block
+    // flushes its own QP. gdaContextCount must cover the largest block count.
     reqs.gdaContextCount = args.nblocks;
-    reqs.gdaSignalCount = args.nblocks;
+    reqs.gdaSignalCount = 0;
     reqs.gdaCounterCount = 0;
     reqs.lsaBarrierCount = 0;
   }
@@ -303,7 +299,7 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
       if (ctx->my_pe == 0) {
         std::fprintf(stderr,
                      "LSA transport requires both PEs on the same node (lsaSize=%d). "
-                     "Run -T igbda for cross-node.\n",
+                     "Run -T ibgda for cross-node.\n",
                      ctx->devComm.lsaSize);
       }
       PerfFinalize(ctx);
@@ -315,7 +311,7 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     if (ctx->devComm.gdaConnType == CCO_GDA_CONNECTION_NONE) {
       if (ctx->my_pe == 0) {
         std::fprintf(stderr,
-                     "IGBDA transport collapsed to NONE — RDMA loopback unsupported on a single "
+                     "IBGDA transport collapsed to NONE — RDMA loopback unsupported on a single "
                      "node? Run across 2 nodes.\n");
       }
       PerfFinalize(ctx);
@@ -331,7 +327,7 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
                   ctx->devComm.lsaSize);
     } else {
       std::printf(
-          "[cco-bench] transport = IGBDA (cross-node RDMA via ccoGda; gdaConnType=%d)\n"
+          "[cco-bench] transport = IBGDA (cross-node RDMA via ccoGda; gdaConnType=%d)\n"
           "            set MORI_DISABLE_P2P=0 to switch to LSA\n",
           static_cast<int>(ctx->devComm.gdaConnType));
     }
