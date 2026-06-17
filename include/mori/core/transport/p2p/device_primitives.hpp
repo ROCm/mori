@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>  // fabsf / fmaxf
 #include <cstdint>
 #include <type_traits>
 

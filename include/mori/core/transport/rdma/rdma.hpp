@@ -21,9 +21,9 @@
 // SOFTWARE.
 #pragma once
 
-// Host + device RDMA: the host primitives layer plus (on device) the full
-// device primitive + provider stack via rdma_device.hpp. Device-only kernel TUs
-// can include rdma_device.hpp directly to skip the host layer.
+// Core RDMA aggregator: the host-side IBVerbsHandle (opaque ibv_* pointers) plus,
+// under HIP/CUDA, the device provider stack via rdma_device.hpp. Device-only kernel
+// TUs can include rdma_device.hpp directly to skip the host side.
 #include "mori/core/transport/rdma/ibverbs_handle.hpp"
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
