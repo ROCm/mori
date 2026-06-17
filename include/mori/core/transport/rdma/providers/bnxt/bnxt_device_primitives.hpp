@@ -743,7 +743,7 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
   // Handle error cases
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
-    MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error),
+    MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", WcStatusString(error),
                 opcode, __FILE__, __LINE__);
     return opcode;
   }
@@ -766,7 +766,7 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
     MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d), wqeCounter: %u at %s:%d\n",
-                IbvWcStatusString(error), opcode, *wqeCounter, __FILE__, __LINE__);
+                WcStatusString(error), opcode, *wqeCounter, __FILE__, __LINE__);
     return opcode;
   }
 

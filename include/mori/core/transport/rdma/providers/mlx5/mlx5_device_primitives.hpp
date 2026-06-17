@@ -788,7 +788,7 @@ inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, 
 
   if (opcode == MORI_MLX5_CQE_RESP_ERR || opcode == MORI_MLX5_CQE_REQ_ERR) {
     auto error = Mlx5HandleErrorCqe(reinterpret_cast<Mlx5ErrCqe*>(cqeAddr));
-    MORI_PRINTF("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, IbvWcStatusString(error));
+    MORI_PRINTF("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, WcStatusString(error));
     return opcode;
   }
   return opcode;
@@ -810,7 +810,7 @@ inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, 
 
   if (opcode == MORI_MLX5_CQE_RESP_ERR || opcode == MORI_MLX5_CQE_REQ_ERR) {
     auto error = Mlx5HandleErrorCqe(reinterpret_cast<Mlx5ErrCqe*>(cqeAddr));
-    // MORI_PRINTF("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, IbvWcStatusString(error));
+    // MORI_PRINTF("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, WcStatusString(error));
     return opcode;
   }
   // wqe_counter is 16-bit, ensure high bits are zero

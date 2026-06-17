@@ -36,7 +36,7 @@ namespace application {
  * file descriptor passing between processes on the same host.
  *
  * IMPORTANT: This only works for processes on the same host. For cross-host
- * communication, use MpiBootstrapNetwork or TorchBootstrapNetwork.
+ * communication, use MpiBootstrapNetwork.
  *
  * Use cases:
  * - VMM shareable handle (file descriptor) exchange
