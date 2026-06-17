@@ -23,7 +23,7 @@
 
 // Device-safe includes: no STL, no ibverbs, safe for HIP/CUDA device compilation.
 #include "mori/application/application_device_types.hpp"
-#include "mori/core/utils.hpp"
+#include "mori/core/utils/utils.hpp"
 #include "mori/hip_compat.hpp"
 #include "mori/utils/limits.hpp"
 

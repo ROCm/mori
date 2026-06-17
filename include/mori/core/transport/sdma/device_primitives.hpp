@@ -24,7 +24,7 @@
 #include <hip/hip_runtime.h>
 
 #include "mori/core/transport/sdma/anvil_device.hpp"
-#include "mori/core/utils.hpp"  // warpSize
+#include "mori/core/utils/utils.hpp"  // warpSize
 
 namespace mori {
 namespace core {

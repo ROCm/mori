@@ -29,7 +29,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "mori/core/utils.hpp"
+#include "mori/core/utils/utils.hpp"
 #include "mori/utils/data_types.hpp"
 
 #ifndef HIP_FP8_CVT_FAST_PATH

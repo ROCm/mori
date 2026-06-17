@@ -29,7 +29,7 @@
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/ionic/ionic_defs.hpp"
 #include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
-#include "mori/core/utils.hpp"
+#include "mori/core/utils/utils.hpp"
 
 namespace mori {
 namespace core {
