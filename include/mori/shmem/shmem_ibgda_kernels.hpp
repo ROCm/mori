@@ -413,7 +413,14 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
   for (int peId = 0; peId < worldSize; peId++) {
     if (peId != rank && globalGpuStates->transportTypes[peId] == application::TransportType::RDMA) {
       for (int qpId = 0; qpId < globalGpuStates->numQpPerPe; qpId++) {
-        DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemQuietThreadKernelImpl, peId, qpId);
+        // Real completion wait (DrainToLive=true), like the per-PE / per-QP overloads.
+        if constexpr (DISPATCH_BNXT == 1) {
+          ShmemQuietThreadKernelImpl<core::ProviderType::BNXT, true>(peId, qpId);
+        } else if constexpr (DISPATCH_PSD == 1) {
+          ShmemQuietThreadKernelImpl<core::ProviderType::PSD, true>(peId, qpId);
+        } else {
+          ShmemQuietThreadKernelImpl<core::ProviderType::MLX5, true>(peId, qpId);
+        }
       }
     }
   }
@@ -447,7 +454,16 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
   int rank = globalGpuStates->rank;
   if (pe == rank) return;
   if (globalGpuStates->transportTypes[pe] != application::TransportType::RDMA) return;
-  DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemQuietThreadKernelImpl, pe, qpId);
+  // Real completion wait (DrainToLive=true): the caller's own WQEs must be done on
+  // return (e.g. a GET reads its local dest right after). Snapshot drain is only
+  // for the recycle gate, which calls ShmemQuietThreadKernelImpl directly.
+  if constexpr (DISPATCH_BNXT == 1) {
+    ShmemQuietThreadKernelImpl<core::ProviderType::BNXT, true>(pe, qpId);
+  } else if constexpr (DISPATCH_PSD == 1) {
+    ShmemQuietThreadKernelImpl<core::ProviderType::PSD, true>(pe, qpId);
+  } else {
+    ShmemQuietThreadKernelImpl<core::ProviderType::MLX5, true>(pe, qpId);
+  }
 }
 
 /* ---------------------------------------------------------------------------------------------- */
