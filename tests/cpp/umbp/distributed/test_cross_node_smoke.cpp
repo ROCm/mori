@@ -527,5 +527,218 @@ TEST_F(CrossNodeMultiPage, PartialTailGetSizeMismatchRejected) {
   EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPayload), 0);
 }
 
+// ===========================================================================
+// Overlap-path coverage (step-2 submit/wait split + schedule reorder).
+//   * MultiPeerZeroCopyByteExact: one BatchGet fans out to TWO source peers,
+//     so two remote-DRAM in-flights are posted before either is waited; guards
+//     against cross-talk between concurrent in-flights.
+//   * MixedLocalAndRemoteZeroCopyByteExact: one batch mixes LOCAL DRAM with
+//     REMOTE_ZC, exercising the S2 reorder (local memcpy inside the remote DRAM
+//     in-flight window).
+// Run the whole binary with UMBP_BATCHGET_OVERLAP=0 to confirm overlap-on and
+// overlap-off agree byte-for-byte.
+// ===========================================================================
+class CrossNodeOverlap : public ::testing::Test {
+ protected:
+  static constexpr size_t kPageSize = 4096;
+
+  void StartMaster(ConfigurableRoutePutStrategy::NodeAffinity affinity =
+                       ConfigurableRoutePutStrategy::NodeAffinity::kNone) {
+    MasterServerConfig master_cfg;
+    master_cfg.listen_address = "0.0.0.0:0";
+    master_cfg.registry_config.heartbeat_ttl = std::chrono::seconds{1};
+    master_cfg.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(
+        ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable, affinity);
+    master_ = std::make_unique<MasterServer>(std::move(master_cfg));
+    server_thread_ = std::thread([this] { master_->Run(); });
+    for (int i = 0; i < 50 && master_->GetBoundPort() == 0; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_NE(master_->GetBoundPort(), 0) << "Master failed to start";
+  }
+
+  PoolClient* MakeClient(const std::string& node_id, const std::vector<size_t>& buffer_sizes) {
+    PoolClientConfig cfg;
+    cfg.master_config.node_id = node_id;
+    cfg.master_config.node_address = "127.0.0.1";
+    cfg.master_config.master_address = "localhost:" + std::to_string(master_->GetBoundPort());
+    cfg.io_engine.host = "0.0.0.0";
+    cfg.io_engine.port = 0;
+    cfg.peer_service_port = NextPeerServicePort();
+    cfg.dram_page_size = kPageSize;
+    uint64_t total = 0;
+    for (size_t sz : buffer_sizes) {
+      void* p = std::malloc(sz);
+      EXPECT_NE(p, nullptr);
+      std::memset(p, 0, sz);
+      owned_bufs_.push_back(p);
+      cfg.dram_buffers.push_back({p, sz});
+      total += sz;
+    }
+    cfg.tier_capacities = {{TierType::DRAM, {total, total}}};
+    auto cli = std::make_unique<PoolClient>(std::move(cfg));
+    EXPECT_TRUE(cli->Init());
+    clients_.push_back(std::move(cli));
+    return clients_.back().get();
+  }
+
+  void TearDown() override {
+    for (auto it = clients_.rbegin(); it != clients_.rend(); ++it) {
+      if (*it) (*it)->Shutdown();
+    }
+    clients_.clear();
+    if (master_) master_->Shutdown();
+    if (server_thread_.joinable()) server_thread_.join();
+    master_.reset();
+    for (void* p : owned_bufs_) std::free(p);
+    owned_bufs_.clear();
+  }
+
+  std::unique_ptr<MasterServer> master_;
+  std::thread server_thread_;
+  std::vector<std::unique_ptr<PoolClient>> clients_;
+  std::vector<void*> owned_bufs_;
+};
+
+TEST_F(CrossNodeOverlap, MultiPeerZeroCopyByteExact) {
+  StartMaster();
+  constexpr size_t kN = 8;
+  // caller has a single page so it never wins most_available and routes every
+  // Put out; the two peers each hold exactly kN/2 pages, forcing the batch to
+  // split across both (and never onto the caller).
+  PoolClient* caller = MakeClient("node-a", {kPageSize});
+  MakeClient("node-b", {kPageSize * (kN / 2)});
+  MakeClient("node-c", {kPageSize * (kN / 2)});
+
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> srcs(kN);
+  std::vector<const void*> psrcs(kN);
+  std::vector<size_t> sizes(kN, kPageSize);
+  for (size_t k = 0; k < kN; ++k) {
+    keys.push_back("mp-" + std::to_string(k));
+    srcs[k].assign(kPageSize, static_cast<char>(0x51 + k));
+    psrcs[k] = srcs[k].data();
+  }
+  auto put = caller->BatchPut(keys, psrcs, sizes);
+  ASSERT_EQ(put.size(), kN);
+  for (size_t k = 0; k < kN; ++k) ASSERT_TRUE(put[k]) << "put failed " << keys[k];
+  for (const auto& key : keys) ASSERT_TRUE(WaitForExists(caller, key));
+
+  std::vector<char> dst(kPageSize * kN, 0);
+  caller->RegisterMemory(dst.data(), dst.size());
+  std::vector<void*> dsts(kN);
+  for (size_t k = 0; k < kN; ++k) dsts[k] = dst.data() + k * kPageSize;
+
+  auto res = caller->BatchGet(keys, dsts, sizes);
+  ASSERT_EQ(res.size(), kN);
+  for (size_t k = 0; k < kN; ++k) {
+    EXPECT_TRUE(res[k]) << "get failed " << keys[k];
+    EXPECT_EQ(std::memcmp(dst.data() + k * kPageSize, srcs[k].data(), kPageSize), 0)
+        << "byte mismatch " << keys[k];
+  }
+}
+
+TEST_F(CrossNodeOverlap, StagingMultiPeerByteExact) {
+  // Caller does NOT register its dst, so remote DRAM reads take the staging
+  // (non-zero-copy) path: per-peer serial submit -> wait -> memcpy out of the
+  // shared staging buffer.  Two source peers exercise the per-peer staging lock
+  // cycling; byte-check guards the staging memcpy + per-key mapping.
+  StartMaster();
+  constexpr size_t kN = 8;
+  PoolClient* caller = MakeClient("node-a", {kPageSize});
+  MakeClient("node-b", {kPageSize * (kN / 2)});
+  MakeClient("node-c", {kPageSize * (kN / 2)});
+
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> srcs(kN);
+  std::vector<const void*> psrcs(kN);
+  std::vector<size_t> sizes(kN, kPageSize);
+  for (size_t k = 0; k < kN; ++k) {
+    keys.push_back("stg-" + std::to_string(k));
+    srcs[k].assign(kPageSize, static_cast<char>(0x31 + k));
+    psrcs[k] = srcs[k].data();
+  }
+  auto put = caller->BatchPut(keys, psrcs, sizes);
+  ASSERT_EQ(put.size(), kN);
+  for (size_t k = 0; k < kN; ++k) ASSERT_TRUE(put[k]) << "put failed " << keys[k];
+  for (const auto& key : keys) ASSERT_TRUE(WaitForExists(caller, key));
+
+  // Deliberately NOT registered -> staging path.
+  std::vector<char> dst(kPageSize * kN, 0);
+  std::vector<void*> dsts(kN);
+  for (size_t k = 0; k < kN; ++k) dsts[k] = dst.data() + k * kPageSize;
+
+  auto res = caller->BatchGet(keys, dsts, sizes);
+  ASSERT_EQ(res.size(), kN);
+  for (size_t k = 0; k < kN; ++k) {
+    EXPECT_TRUE(res[k]) << "get failed " << keys[k];
+    EXPECT_EQ(std::memcmp(dst.data() + k * kPageSize, srcs[k].data(), kPageSize), 0)
+        << "byte mismatch " << keys[k];
+  }
+}
+
+TEST_F(CrossNodeOverlap, MixedLocalAndRemoteZeroCopyByteExact) {
+  // kLocal affinity keeps each node's own Put local, so the caller can seed half
+  // the keys into its OWN DRAM (LOCAL get) and the peer the other half
+  // (REMOTE_ZC).  The single mixed BatchGet then crosses both tiers.
+  StartMaster(ConfigurableRoutePutStrategy::NodeAffinity::kLocal);
+  constexpr size_t kHalf = 3;
+  PoolClient* caller = MakeClient("node-a", {kPageSize * kHalf});
+  PoolClient* peer = MakeClient("node-b", {kPageSize * kHalf});
+
+  std::vector<std::string> local_keys, remote_keys;
+  std::vector<std::vector<char>> local_src(kHalf), remote_src(kHalf);
+  {
+    std::vector<const void*> s(kHalf);
+    std::vector<size_t> sz(kHalf, kPageSize);
+    for (size_t k = 0; k < kHalf; ++k) {
+      local_keys.push_back("loc-" + std::to_string(k));
+      local_src[k].assign(kPageSize, static_cast<char>(0x61 + k));
+      s[k] = local_src[k].data();
+    }
+    auto r = caller->BatchPut(local_keys, s, sz);
+    for (size_t k = 0; k < kHalf; ++k) ASSERT_TRUE(r[k]) << "local put " << local_keys[k];
+  }
+  {
+    std::vector<const void*> s(kHalf);
+    std::vector<size_t> sz(kHalf, kPageSize);
+    for (size_t k = 0; k < kHalf; ++k) {
+      remote_keys.push_back("rem-" + std::to_string(k));
+      remote_src[k].assign(kPageSize, static_cast<char>(0x71 + k));
+      s[k] = remote_src[k].data();
+    }
+    auto r = peer->BatchPut(remote_keys, s, sz);
+    for (size_t k = 0; k < kHalf; ++k) ASSERT_TRUE(r[k]) << "remote put " << remote_keys[k];
+  }
+  for (const auto& key : local_keys) ASSERT_TRUE(WaitForExists(caller, key));
+  for (const auto& key : remote_keys) ASSERT_TRUE(WaitForExists(caller, key));
+
+  // Remote-first ordering so the overlap probe (first remote-DRAM item) is ZC.
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>*> expect;
+  for (size_t k = 0; k < kHalf; ++k) {
+    keys.push_back(remote_keys[k]);
+    expect.push_back(&remote_src[k]);
+  }
+  for (size_t k = 0; k < kHalf; ++k) {
+    keys.push_back(local_keys[k]);
+    expect.push_back(&local_src[k]);
+  }
+  const size_t kN = keys.size();
+  std::vector<char> dst(kPageSize * kN, 0);
+  caller->RegisterMemory(dst.data(), dst.size());
+  std::vector<void*> dsts(kN);
+  std::vector<size_t> sizes(kN, kPageSize);
+  for (size_t k = 0; k < kN; ++k) dsts[k] = dst.data() + k * kPageSize;
+
+  auto res = caller->BatchGet(keys, dsts, sizes);
+  ASSERT_EQ(res.size(), kN);
+  for (size_t k = 0; k < kN; ++k) {
+    EXPECT_TRUE(res[k]) << "get failed " << keys[k];
+    EXPECT_EQ(std::memcmp(dst.data() + k * kPageSize, expect[k]->data(), kPageSize), 0)
+        << "byte mismatch " << keys[k];
+  }
+}
+
 }  // namespace
 }  // namespace mori::umbp

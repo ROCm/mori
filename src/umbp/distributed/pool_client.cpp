@@ -282,6 +282,44 @@ bool SsdStartupDiscardEnabled() {
   return !(s == "0" || s == "false" || s == "FALSE" || s == "off");
 }
 
+// BatchGet local/SSD-in-window overlap switch (default on).  Zero-copy remote
+// DRAM always submits all peers before waiting (multi-peer overlap); this knob
+// only controls whether local DRAM/SSD + remote SSD additionally run INSIDE that
+// in-flight window (see ExecuteBatchGetPlan).  Set UMBP_BATCHGET_OVERLAP=0/false/
+// off to keep local/SSD out of the window (A/B + rollback hook).
+bool BatchGetOverlapEnabled() {
+  static const bool v = []() -> bool {
+    const char* e = std::getenv("UMBP_BATCHGET_OVERLAP");
+    if (e == nullptr) return true;
+    const std::string s(e);
+    return !(s == "0" || s == "false" || s == "FALSE" || s == "off");
+  }();
+  return v;
+}
+
+// Max BatchGet size (key count) for which local DRAM/SSD + remote SSD run INSIDE
+// the zero-copy remote-DRAM in-flight window.  Above it, local/SSD run before the
+// submit instead (out of the window) — but zero-copy remote DRAM still does
+// submit-all/wait-all, so this is NOT a full fall-back to a synchronous baseline.
+// Rationale: overlapping local DRAM memcpy with the remote DRAM RDMA wire is a
+// net win at small/medium batch (latency-bound) but a small net loss at large
+// batch, where the local copy threads contend with the RDMA DMA for host
+// memory / PCIe bandwidth and the hidden local time is tiny relative to the wire
+// time (see docs/perf/overlap/NOTES.md, mixed_tier: +4-5% <=128, -3% at 256).
+// Default 128 (solidly positive; the +/-0 crossover is ~192-224).  Set
+// UMBP_BATCHGET_OVERLAP_MAX_BATCH=0 (or negative) for no limit.
+int64_t BatchGetOverlapMaxBatch() {
+  static const int64_t v = [] {
+    const char* e = std::getenv("UMBP_BATCHGET_OVERLAP_MAX_BATCH");
+    if (e == nullptr) return static_cast<int64_t>(128);
+    char* end = nullptr;
+    const long long parsed = std::strtoll(e, &end, 10);
+    if (end == e) return static_cast<int64_t>(128);  // unparseable -> default
+    return static_cast<int64_t>(parsed);
+  }();
+  return v;
+}
+
 // Total attempts for a remote SSD get.  Retryable outcomes (kRetry) are
 // NO_SLOT (transient slot exhaustion, no slot claimed) and a reader-local lease
 // expiry.  Defaults to 1 (no retry); operators opt into bounded retry to absorb
@@ -973,93 +1011,8 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     routes.resize(keys.size());
   }
 
-  // DRAM/HBM remote reads go through the batched RDMA path (remote_groups);
-  // remote SSD reads go through a per-key staging path (ssd_remote_groups)
-  // because each needs its own peer-side staging slot + lease.
-  std::unordered_map<std::string, std::vector<BatchGetItem>> remote_groups;
-  std::unordered_map<std::string, std::vector<BatchGetItem>> ssd_remote_groups;
-  std::vector<size_t> local_get_idx;
-  for (size_t i = 0; i < keys.size(); ++i) {
-    // Zero-size gets are rejected before local fallback or remote read: an
-    // explicit skip is required here because a nullopt route below would
-    // otherwise fall through to a local read (result stays false).
-    if (sizes[i] == 0) {
-      MORI_UMBP_WARN("[PoolClient] BatchGet: skipping zero-size get for key='{}'", keys[i]);
-      continue;
-    }
-    if (i >= routes.size() || !routes[i].has_value()) {
-      if (peer_alloc_) local_get_idx.push_back(i);
-      continue;
-    }
-    const auto& route = routes[i].value();
-    if (route.node_id == config_.master_config.node_id) {
-      // Self-target fast path: SSD via PeerSsdManager (inline); DRAM/HBM via the
-      // allocator, deferred for batch-parallel copy across keys.
-      if (route.tier == TierType::SSD) {
-        if (ExecuteLocalSsdGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
-            GetAttemptOutcome::kSuccess) {
-          results[i] = true;
-        }
-      } else {
-        local_get_idx.push_back(i);
-      }
-      continue;
-    }
-    BatchGetItem item{.index = i,
-                      .key = &keys[i],
-                      .dst = const_cast<void*>(dsts[i]),
-                      .size = sizes[i],
-                      .route = route};
-    if (route.tier == TierType::SSD) {
-      ssd_remote_groups[route.node_id].push_back(std::move(item));
-    } else {
-      remote_groups[route.node_id].push_back(std::move(item));
-    }
-  }
-
-  // Parallel local DRAM reads: different threads handle different keys. Resolve
-  // is mutex-serialized in the allocator; the per-key memcpy in
-  // ExecuteLocalGet->LocalGetPages runs lock-free in parallel. results is
-  // std::vector<bool> (bit-packed) so threads write a temp buffer; merge serially.
-  if (!local_get_idx.empty()) {
-    const int nthr = LocalCopyThreads("UMBP_DRAM_READ_THREADS");
-    const auto t0 = std::chrono::steady_clock::now();
-    std::vector<char> ok(local_get_idx.size(), 0);
-    LocalParallelFor(local_get_idx.size(), nthr, [&](size_t k) {
-      const size_t i = local_get_idx[k];
-      if (ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
-          GetAttemptOutcome::kSuccess) {
-        ok[k] = 1;
-      }
-    });
-    size_t tot = 0;
-    for (size_t k = 0; k < local_get_idx.size(); ++k) {
-      if (ok[k]) {
-        results[local_get_idx[k]] = true;
-        tot += sizes[local_get_idx[k]];
-      }
-    }
-    if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
-      double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
-                       std::chrono::steady_clock::now() - t0)
-                       .count();
-      MORI_UMBP_INFO("[LocalCopy] GET keys={} bytes={} threads={} elapsed_ms={:.3f} GiB_s={:.2f}",
-                     local_get_idx.size(), tot, nthr, sec * 1000.0,
-                     tot / (sec > 0 ? sec : 1e-12) / (1024.0 * 1024 * 1024));
-    }
-  }
-
-  for (auto& [node_id, items] : remote_groups) {
-    ProcessRemoteBatchGet(items, &results);
-  }
-  for (auto& [node_id, items] : ssd_remote_groups) {
-    ProcessRemoteSsdBatchGet(items, &results);
-  }
-
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (results[i]) continue;
-    results[i] = false;
-  }
+  BatchGetPlan plan = PartitionBatchGetTargets(keys, dsts, sizes, routes);
+  ExecuteBatchGetPlan(plan, keys, dsts, sizes, &results);
 
   const auto call_end = std::chrono::steady_clock::now();
   const double seconds =
@@ -1074,6 +1027,187 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
                           MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "remote");
   }
   return results;
+}
+
+PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
+    const std::vector<std::string>& keys, const std::vector<void*>& dsts,
+    const std::vector<size_t>& sizes, const std::vector<std::optional<RouteGetResult>>& routes) {
+  BatchGetPlan plan;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    // Zero-size gets are rejected before local fallback or remote read: an
+    // explicit skip is required here because a nullopt route below would
+    // otherwise fall through to a local read (result stays false).
+    if (sizes[i] == 0) {
+      MORI_UMBP_WARN("[PoolClient] BatchGet: skipping zero-size get for key='{}'", keys[i]);
+      continue;
+    }
+    if (i >= routes.size() || !routes[i].has_value()) {
+      if (peer_alloc_) plan.local_dram_indices.push_back(i);
+      continue;
+    }
+    const auto& route = routes[i].value();
+    if (route.node_id == config_.master_config.node_id) {
+      // Self-target: both DRAM/HBM and SSD are deferred (collected as indices)
+      // so ExecuteBatchGetPlan can place them inside the remote-DRAM in-flight
+      // window in the overlap path.
+      if (route.tier == TierType::SSD) {
+        plan.local_ssd_indices.push_back(i);
+      } else {
+        plan.local_dram_indices.push_back(i);
+      }
+      continue;
+    }
+    BatchGetItem item{.index = i,
+                      .key = &keys[i],
+                      .dst = const_cast<void*>(dsts[i]),
+                      .size = sizes[i],
+                      .route = route};
+    if (route.tier == TierType::SSD) {
+      plan.remote_ssd_groups[route.node_id].push_back(std::move(item));
+    } else {
+      plan.remote_dram_groups[route.node_id].push_back(std::move(item));
+    }
+  }
+  return plan;
+}
+
+void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
+                                     const std::vector<void*>& dsts,
+                                     const std::vector<size_t>& sizes, std::vector<bool>* results) {
+  // Parallel local DRAM reads: different threads handle different keys. Resolve
+  // is mutex-serialized in the allocator; the per-key memcpy in
+  // ExecuteLocalGet->LocalGetPages runs lock-free in parallel. results is
+  // std::vector<bool> (bit-packed) so threads write a temp buffer; merge serially.
+  auto run_local_dram = [&]() {
+    const auto& idx = plan.local_dram_indices;
+    if (idx.empty()) return;
+    const int nthr = LocalCopyThreads("UMBP_DRAM_READ_THREADS");
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<char> ok(idx.size(), 0);
+    LocalParallelFor(idx.size(), nthr, [&](size_t k) {
+      const size_t i = idx[k];
+      if (ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
+          GetAttemptOutcome::kSuccess) {
+        ok[k] = 1;
+      }
+    });
+    size_t tot = 0;
+    for (size_t k = 0; k < idx.size(); ++k) {
+      if (ok[k]) {
+        (*results)[idx[k]] = true;
+        tot += sizes[idx[k]];
+      }
+    }
+    if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
+      double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+      MORI_UMBP_INFO("[LocalCopy] GET keys={} bytes={} threads={} elapsed_ms={:.3f} GiB_s={:.2f}",
+                     idx.size(), tot, nthr, sec * 1000.0,
+                     tot / (sec > 0 ? sec : 1e-12) / (1024.0 * 1024 * 1024));
+    }
+  };
+
+  // Local SSD self-target reads (deferred from partition): serial on this
+  // thread, reading straight into the user buffer (no staging / RDMA / lease).
+  // Independent per key, so its position in the schedule is correctness-neutral.
+  auto run_local_ssd = [&]() {
+    for (size_t i : plan.local_ssd_indices) {
+      if (ExecuteLocalSsdGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
+          GetAttemptOutcome::kSuccess) {
+        (*results)[i] = true;
+      }
+    }
+  };
+
+  auto run_remote_ssd = [&]() {
+    for (const auto& [node_id, items] : plan.remote_ssd_groups) {
+      ProcessRemoteSsdBatchGet(items, results);
+    }
+  };
+
+  const auto& remote_dram_groups = plan.remote_dram_groups;
+
+  // Zero-copy? The upper layer guarantees a batch is all-ZC or all-staging, so
+  // probe one remote-DRAM item's dst registration (unordered_map order is
+  // unspecified, but any item answers the all-or-nothing question).
+  const bool is_zc = !remote_dram_groups.empty() &&
+                     FindRegisteredMemory(remote_dram_groups.begin()->second.front().dst,
+                                          remote_dram_groups.begin()->second.front().size)
+                         .has_value();
+
+  if (!is_zc) {
+    // Staging (non-zero-copy), or no remote DRAM at all.  Order: local SSD, local
+    // DRAM, staging remote DRAM (per peer), remote SSD.  Staging must submit then
+    // IMMEDIATELY wait per peer: the in-flight holds staging_mutex_ from submit
+    // until the wait copies out of the shared staging_buffer_, so accumulating
+    // staging in-flights into a submit-all list would deadlock on that lock.
+    run_local_ssd();
+    run_local_dram();
+    for (const auto& [node_id, items] : remote_dram_groups) {
+      if (auto f = SubmitRemoteBatchGet(items, results, /*permit_staging=*/true)) {
+        WaitRemoteBatchGet(*f, results);  // immediate; releases staging_mutex_
+      }
+    }
+    run_remote_ssd();
+    return;
+  }
+
+  // Zero-copy remote DRAM: submit every peer (posted, not waited) before waiting
+  // any, so multi-peer wire time overlaps.  Overlap eligibility (S2: also put
+  // local DRAM/SSD + remote SSD INSIDE the in-flight window) requires the env on
+  // and the batch not larger than the max-batch threshold — large batches
+  // regress because the local copy contends with the RDMA DMA for memory/PCIe
+  // bandwidth (see BatchGetOverlapMaxBatch).  Below threshold the window is used;
+  // above it local/SSD run first (out of the window) but remote DRAM still does
+  // submit-all/wait-all.
+  bool overlap_window = false;
+  if (BatchGetOverlapEnabled()) {
+    const int64_t max_batch = BatchGetOverlapMaxBatch();
+    overlap_window = max_batch <= 0 || static_cast<int64_t>(keys.size()) <= max_batch;
+  }
+
+  std::vector<std::unique_ptr<RemoteDramGetInFlight>> inflights;
+  inflights.reserve(remote_dram_groups.size());
+  // RAII drain: guarantee every posted in-flight is waited even on an
+  // exceptional/early exit (e.g. std::bad_alloc), so no posted TransferStatus is
+  // left referenced by the backend CQ callback after this scope.
+  struct InFlightDrainGuard {
+    std::vector<std::unique_ptr<RemoteDramGetInFlight>>& v;
+    ~InFlightDrainGuard() {
+      for (auto& f : v) {
+        if (f && !f->waited) {
+          for (auto& s : f->statuses) s.Wait();
+          f->waited = true;
+        }
+      }
+    }
+  } drain_guard{inflights};
+
+  if (overlap_window) {
+    // Submit every peer, run local/SSD inside the in-flight window, then wait all.
+    for (const auto& [node_id, items] : remote_dram_groups) {
+      if (auto f = SubmitRemoteBatchGet(items, results, /*permit_staging=*/false)) {
+        inflights.push_back(std::move(f));
+      }
+    }
+    run_local_dram();
+    run_local_ssd();
+    run_remote_ssd();
+    for (auto& f : inflights) WaitRemoteBatchGet(*f, results);
+  } else {
+    // Local/SSD run BEFORE the submit (out of the window), but remote DRAM still
+    // submits all peers before waiting any (multi-peer overlap, no contention).
+    run_local_ssd();
+    run_local_dram();
+    for (const auto& [node_id, items] : remote_dram_groups) {
+      if (auto f = SubmitRemoteBatchGet(items, results, /*permit_staging=*/false)) {
+        inflights.push_back(std::move(f));
+      }
+    }
+    for (auto& f : inflights) WaitRemoteBatchGet(*f, results);
+    run_remote_ssd();
+  }
 }
 
 void PoolClient::ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items,
@@ -1507,68 +1641,6 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
   }
 }
 
-void PoolClient::ProcessRemoteBatchGet(const std::vector<BatchGetItem>& items,
-                                       std::vector<bool>* results) {
-  if (items.empty()) return;
-  if (!io_engine_) {
-    MORI_UMBP_ERROR("[PoolClient] ProcessRemoteBatchGet: io_engine_ not initialized (items={})",
-                    items.size());
-    for (const auto& item : items) {
-      (*results)[item.index] = false;
-    }
-    return;
-  }
-
-  const auto& first = items.front();
-  auto& peer = GetOrConnectPeer(first.route.node_id, first.route.peer_address);
-  if (!EnsurePeerServiceConnection(peer)) {
-    MORI_UMBP_WARN(
-        "[PoolClient] ProcessRemoteBatchGet: peer service connection unavailable, node='{}' "
-        "addr='{}' items={}",
-        first.route.node_id, first.route.peer_address, items.size());
-    for (const auto& item : items) {
-      (*results)[item.index] = false;
-    }
-    return;
-  }
-
-  auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
-  ExecuteRemoteBatchGet(items, results, peer, stub);
-}
-
-void PoolClient::ExecuteRemoteBatchGet(const std::vector<BatchGetItem>& items,
-                                       std::vector<bool>* results, PeerConnection& peer,
-                                       ::umbp::UMBPPeer::Stub* stub) {
-  if (items.empty()) return;
-  if (!io_engine_) {
-    for (const auto& item : items) {
-      (*results)[item.index] = false;
-    }
-    return;
-  }
-
-  std::vector<RemoteGetEntry> entries;
-  if (!PrepareRemoteGetEntries(items, stub, &entries, results)) {
-    return;
-  }
-
-  std::vector<TransferInstruction> transfers;
-  uint64_t staging_bytes = 0;
-  if (!BuildRemoteGetTransfers(entries, peer, &transfers, &staging_bytes)) {
-    MORI_UMBP_WARN(
-        "[PoolClient] ExecuteRemoteBatchGet: BuildRemoteGetTransfers failed, node='{}' "
-        "entries={} staging_bytes={}",
-        items.front().route.node_id, entries.size(), staging_bytes);
-    for (auto& entry : entries) {
-      (*results)[entry.result_index] = false;
-    }
-    return;
-  }
-
-  ExecuteRemoteGetTransfers(entries, transfers, staging_bytes);
-  FinalizeRemoteGetEntries(entries, results);
-}
-
 bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
                                          ::umbp::UMBPPeer::Stub* stub,
                                          std::vector<RemoteGetEntry>* entries,
@@ -1706,81 +1778,6 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, P
   return true;
 }
 
-void PoolClient::ExecuteRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
-                                           std::vector<TransferInstruction>& transfers,
-                                           uint64_t staging_bytes) {
-  std::unique_lock<std::mutex> staging_lock(staging_mutex_, std::defer_lock);
-  if (staging_bytes > 0) staging_lock.lock();
-
-  std::vector<TransferInstruction> active_transfers;
-  active_transfers.reserve(transfers.size());
-  for (const auto& transfer : transfers) {
-    if (!entries[transfer.entry_index].failed) {
-      active_transfers.push_back(transfer);
-    }
-  }
-  if (active_transfers.empty()) {
-    if (staging_lock.owns_lock()) staging_lock.unlock();
-    return;
-  }
-
-  // Symmetric with the Put path: collapse same-(localMR, remoteMR) pages
-  // into one outer transfer with per-pair status/uid.
-  auto groups = GroupTransfersByPair(active_transfers);
-  const size_t G = groups.size();
-  mori::io::MemDescVec local_descs(G), remote_descs(G);
-  mori::io::BatchSizeVec local_offsets(G), remote_offsets(G), sizes_v(G);
-  std::vector<mori::io::TransferStatus> statuses(G);  // built once at final size
-  mori::io::TransferStatusPtrVec status_ptrs(G);
-  mori::io::TransferUniqueIdVec ids(G);
-  for (size_t g = 0; g < G; ++g) {
-    local_descs[g] = groups[g].local_desc;
-    remote_descs[g] = groups[g].remote_desc;
-    local_offsets[g] = std::move(groups[g].local_offsets);
-    remote_offsets[g] = std::move(groups[g].remote_offsets);
-    sizes_v[g] = std::move(groups[g].sizes);
-    status_ptrs[g] = &statuses[g];
-    ids[g] = io_engine_->AllocateTransferUniqueId();
-  }
-
-  io_engine_->BatchRead(local_descs, local_offsets, remote_descs, remote_offsets, sizes_v,
-                        status_ptrs, ids);
-  // Wait every group (never break early): IN_PROGRESS groups complete here;
-  // INIT/terminal return immediately.  A non-success group fails all of its
-  // contributing keys (per-item AND semantics).  See the Put path / docs
-  // NOTES re: backend partial-post / status-lifetime caveats.
-  for (size_t g = 0; g < G; ++g) {
-    statuses[g].Wait();
-    if (statuses[g].Succeeded()) continue;
-    for (size_t ei : groups[g].entry_indices) {
-      auto& entry = entries[ei];
-      MORI_UMBP_ERROR(
-          "RemoteGet BatchRead failed: code={} msg='{}' peer_engine='{}' key='{}' use_staging={}",
-          statuses[g].CodeUint32(), statuses[g].Message(), groups[g].remote_desc.engineKey,
-          (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
-          entry.use_staging);
-      entry.failed = true;
-    }
-  }
-
-  if (staging_lock.owns_lock()) {
-    for (auto& entry : entries) {
-      if (entry.failed || !entry.use_staging) continue;
-      if (entry.staging_offset + entry.item->size > config_.staging_buffer_size) {
-        MORI_UMBP_ERROR(
-            "[PoolClient] ExecuteRemoteGetTransfers: staging offset overflow (should not happen), "
-            "key='{}' staging_offset={} size={} cap={}",
-            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
-            entry.staging_offset, entry.item ? entry.item->size : 0, config_.staging_buffer_size);
-        entry.failed = true;
-        continue;
-      }
-      std::memcpy(entry.item->dst, staging_buffer_.get() + entry.staging_offset, entry.item->size);
-    }
-    staging_lock.unlock();
-  }
-}
-
 void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
                                           std::vector<bool>* results) {
   for (auto& entry : entries) {
@@ -1796,6 +1793,159 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
                                {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
     (*results)[entry.result_index] = true;
   }
+}
+
+std::unique_ptr<PoolClient::RemoteDramGetInFlight> PoolClient::SubmitRemoteBatchGet(
+    const std::vector<BatchGetItem>& items, std::vector<bool>* results, bool permit_staging) {
+  if (items.empty()) return nullptr;
+  auto fail_all = [&] {
+    for (const auto& item : items) (*results)[item.index] = false;
+  };
+  if (!io_engine_) {
+    MORI_UMBP_ERROR("[PoolClient] SubmitRemoteBatchGet: io_engine_ not initialized (items={})",
+                    items.size());
+    fail_all();
+    return nullptr;
+  }
+
+  const auto& first = items.front();
+  auto& peer = GetOrConnectPeer(first.route.node_id, first.route.peer_address);
+  if (!EnsurePeerServiceConnection(peer)) {
+    MORI_UMBP_WARN(
+        "[PoolClient] SubmitRemoteBatchGet: peer service connection unavailable, node='{}' "
+        "addr='{}' items={}",
+        first.route.node_id, first.route.peer_address, items.size());
+    fail_all();
+    return nullptr;
+  }
+  auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+
+  auto inflight = std::make_unique<RemoteDramGetInFlight>();
+  inflight->peer = &peer;
+
+  // resolve RPC + per-key validation; failed keys already written to *results.
+  if (!PrepareRemoteGetEntries(items, stub, &inflight->entries, results)) {
+    return nullptr;
+  }
+
+  std::vector<TransferInstruction> transfers;
+  uint64_t staging_bytes = 0;
+  if (!BuildRemoteGetTransfers(inflight->entries, peer, &transfers, &staging_bytes)) {
+    MORI_UMBP_WARN(
+        "[PoolClient] SubmitRemoteBatchGet: BuildRemoteGetTransfers failed, node='{}' entries={}",
+        first.route.node_id, inflight->entries.size());
+    for (auto& entry : inflight->entries) (*results)[entry.result_index] = false;
+    return nullptr;
+  }
+  inflight->staging_bytes = staging_bytes;
+  // Staging needs the shared staging_buffer_, which a cross-peer submit-all
+  // window cannot serialize on the single staging_mutex_ without deadlocking.
+  // So the zero-copy submit-all caller passes permit_staging=false: a batch that
+  // unexpectedly needs staging (upper layer guarantees all-zc or all-staging) is
+  // failed rather than risking a deadlock.  The serial staging caller passes
+  // true and we park staging_mutex_ in the in-flight until the wait copies out.
+  if (staging_bytes > 0) {
+    if (!permit_staging) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] SubmitRemoteBatchGet: unexpected staging_bytes={} on zero-copy path "
+          "node='{}' -> failing batch",
+          staging_bytes, first.route.node_id);
+      for (auto& entry : inflight->entries) (*results)[entry.result_index] = false;
+      return nullptr;
+    }
+    inflight->staging_lock = std::unique_lock<std::mutex>(staging_mutex_);
+  }
+
+  // Drop transfers whose entry failed during build (invalid remote desc etc.).
+  std::vector<TransferInstruction> active_transfers;
+  active_transfers.reserve(transfers.size());
+  for (const auto& t : transfers) {
+    if (!inflight->entries[t.entry_index].failed) active_transfers.push_back(t);
+  }
+  if (active_transfers.empty()) {
+    for (auto& entry : inflight->entries) {
+      if (entry.failed) (*results)[entry.result_index] = false;
+    }
+    return nullptr;  // staging_lock (if held) released by the in-flight's destruction
+  }
+
+  // Collapse same-(localMR, remoteMR) pages into one outer transfer per pair,
+  // then materialise the BatchRead args INTO the in-flight struct so they outlive
+  // the post.
+  inflight->groups = GroupTransfersByPair(active_transfers);
+  const size_t G = inflight->groups.size();
+  inflight->local_descs.resize(G);
+  inflight->remote_descs.resize(G);
+  inflight->local_offsets.resize(G);
+  inflight->remote_offsets.resize(G);
+  inflight->sizes_v.resize(G);
+  // Build statuses at final size once and never resize/move (backend holds raw
+  // TransferStatus*); status_ptrs alias into it.  vector move-assign steals the
+  // buffer (default allocator), so elements are not moved and addresses are
+  // stable for the in-flight lifetime.
+  inflight->statuses = std::vector<mori::io::TransferStatus>(G);
+  inflight->status_ptrs.resize(G);
+  inflight->ids.resize(G);
+  for (size_t g = 0; g < G; ++g) {
+    inflight->local_descs[g] = inflight->groups[g].local_desc;
+    inflight->remote_descs[g] = inflight->groups[g].remote_desc;
+    inflight->local_offsets[g] = std::move(inflight->groups[g].local_offsets);
+    inflight->remote_offsets[g] = std::move(inflight->groups[g].remote_offsets);
+    inflight->sizes_v[g] = std::move(inflight->groups[g].sizes);
+    inflight->status_ptrs[g] = &inflight->statuses[g];
+    inflight->ids[g] = io_engine_->AllocateTransferUniqueId();
+  }
+
+  // POST the reads; do NOT wait.  Everything BatchRead may reference is owned by
+  // *inflight; no allocation happens after this point in the submit window.  For
+  // staging, the RDMA lands in staging_buffer_ under the held staging_lock.
+  io_engine_->BatchRead(inflight->local_descs, inflight->local_offsets, inflight->remote_descs,
+                        inflight->remote_offsets, inflight->sizes_v, inflight->status_ptrs,
+                        inflight->ids);
+  return inflight;
+}
+
+void PoolClient::WaitRemoteBatchGet(RemoteDramGetInFlight& f, std::vector<bool>* results) {
+  if (f.waited) return;
+  f.waited = true;
+  // Wait every group (never break early): IN_PROGRESS groups complete here;
+  // INIT/terminal return immediately.  A non-success group fails all of its
+  // contributing keys (per-item AND).
+  const size_t G = f.groups.size();
+  for (size_t g = 0; g < G; ++g) {
+    f.statuses[g].Wait();
+    if (f.statuses[g].Succeeded()) continue;
+    for (size_t ei : f.groups[g].entry_indices) {
+      auto& entry = f.entries[ei];
+      MORI_UMBP_ERROR(
+          "RemoteGet BatchRead failed: code={} msg='{}' peer_engine='{}' key='{}' use_staging={}",
+          f.statuses[g].CodeUint32(), f.statuses[g].Message(), f.groups[g].remote_desc.engineKey,
+          (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+          entry.use_staging);
+      entry.failed = true;
+    }
+  }
+
+  // Staging (non-zero-copy): RDMA landed in staging_buffer_; copy each surviving
+  // entry out to its user dst, then release staging_mutex_ (held since submit).
+  if (f.staging_lock.owns_lock()) {
+    for (auto& entry : f.entries) {
+      if (entry.failed || !entry.use_staging) continue;
+      if (entry.staging_offset + entry.item->size > config_.staging_buffer_size) {
+        MORI_UMBP_ERROR(
+            "[PoolClient] WaitRemoteBatchGet: staging offset overflow (should not happen), "
+            "key='{}' staging_offset={} size={} cap={}",
+            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+            entry.staging_offset, entry.item ? entry.item->size : 0, config_.staging_buffer_size);
+        entry.failed = true;
+        continue;
+      }
+      std::memcpy(entry.item->dst, staging_buffer_.get() + entry.staging_offset, entry.item->size);
+    }
+    f.staging_lock.unlock();
+  }
+
+  FinalizeRemoteGetEntries(f.entries, results);
 }
 
 bool PoolClient::Exists(const std::string& key) {

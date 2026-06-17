@@ -279,10 +279,42 @@ class PoolClient {
     RouteGetResult route;
   };
 
+  // Routing plan for one BatchGet: which keys go to which tier/target.  Pure
+  // grouping — no IO is issued here.  Remote DRAM/HBM reads go through the
+  // batched RDMA path (remote_dram_groups); remote SSD reads through a per-key
+  // staging+lease path (remote_ssd_groups); self-target DRAM and SSD reads are
+  // deferred (collected as indices) so ExecuteBatchGetPlan can place them inside
+  // the remote-DRAM in-flight window when overlapping.
+  struct BatchGetPlan {
+    std::unordered_map<std::string, std::vector<BatchGetItem>> remote_dram_groups;
+    std::unordered_map<std::string, std::vector<BatchGetItem>> remote_ssd_groups;
+    std::vector<size_t> local_dram_indices;
+    std::vector<size_t> local_ssd_indices;
+  };
+
   std::unordered_map<std::string, std::vector<BatchPutItem>> PartitionBatchPutTargets(
       const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
       const std::vector<size_t>& sizes, const std::vector<std::optional<RoutePutResult>>& routes,
       std::vector<PutEntryOutcome>* results);
+
+  // Group a BatchGet's routes into a BatchGetPlan (no IO issued).  Mirrors
+  // PartitionBatchPutTargets, but deliberately does NOT execute local reads:
+  // ExecuteBatchGetPlan decides where the local reads run so they can overlap
+  // the remote-DRAM RDMA in-flight window.
+  BatchGetPlan PartitionBatchGetTargets(const std::vector<std::string>& keys,
+                                        const std::vector<void*>& dsts,
+                                        const std::vector<size_t>& sizes,
+                                        const std::vector<std::optional<RouteGetResult>>& routes);
+  // Execute a BatchGetPlan: local DRAM/SSD, remote SSD, and the remote-DRAM
+  // submit/wait arrangement.  Zero-copy remote DRAM always submits all peers then
+  // waits all (multi-peer overlap); the overlap window (local DRAM/SSD + remote
+  // SSD run INSIDE that submit..wait gap) is used only when overlap is enabled
+  // and the batch is within the max-batch threshold, otherwise local/SSD run
+  // first.  Staging (non-zero-copy) runs per peer serially (submit -> wait).
+  // Reads the plan; writes per-key outcomes into *results.
+  void ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
+                           const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
+                           std::vector<bool>* results);
 
   struct TransferInstruction {
     size_t entry_index;
@@ -336,7 +368,6 @@ class PoolClient {
 
   void ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items,
                              std::vector<PutEntryOutcome>* results);
-  void ProcessRemoteBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results);
   // Remote SSD reads (one staging slot + lease per key) with bounded retry
   // (default off) on transient NO_SLOT / reader-local lease expiry; an rpc
   // failure is hard not-served, and a NOT_FOUND short-circuits as a miss.
@@ -361,8 +392,6 @@ class PoolClient {
   void ExecuteRemoteBatchPut(const std::vector<BatchPutItem>& items,
                              std::vector<PutEntryOutcome>* results, PeerConnection& peer,
                              ::umbp::UMBPPeer::Stub* stub);
-  void ExecuteRemoteBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results,
-                             PeerConnection& peer, ::umbp::UMBPPeer::Stub* stub);
 
   bool AllocateRemotePutEntries(const std::vector<BatchPutItem>& items,
                                 ::umbp::UMBPPeer::Stub* stub, std::vector<RemotePutEntry>* entries,
@@ -384,10 +413,60 @@ class PoolClient {
   bool BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, PeerConnection& peer,
                                std::vector<TransferInstruction>* transfers,
                                uint64_t* staging_bytes);
-  void ExecuteRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
-                                 std::vector<TransferInstruction>& transfers,
-                                 uint64_t staging_bytes);
   void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results);
+
+  // One posted-but-not-yet-waited remote-DRAM read for a single peer.  Submit
+  // builds + posts (BatchRead, no wait) and returns this; the scheduler waits
+  // it later.  Used by BOTH paths:
+  //   * zero-copy: the scheduler submits every peer first, then waits all, so
+  //     wire time overlaps across peers (and optionally with local/SSD work).
+  //   * staging (non-zc): the scheduler submits then waits ONE peer at a time
+  //     (serial); RDMA lands in the shared staging_buffer_, so `staging_lock`
+  //     holds staging_mutex_ across submit -> wait -> memcpy to serialize use of
+  //     the buffer, and WaitRemoteBatchGet copies staging -> user dst.  Staging
+  //     deliberately does NOT join the cross-peer in-flight window.
+  //
+  // Lifetime contract (why it is owned by a unique_ptr and not moved after
+  // submit): the RDMA backend keeps a RAW TransferStatus* in its CQ callback
+  // meta, so `statuses` must outlive the BatchRead and never move.  It is sized
+  // once to G groups and never resized; `status_ptrs[g]` alias &statuses[g].  The
+  // BatchRead arg vectors are kept alive here too (the multithread-executor path
+  // may read offsets/sizes after the call returns; the default chunking-on path
+  // consumes them synchronously, but keeping them is free and config-robust).
+  struct RemoteDramGetInFlight {
+    PeerConnection* peer = nullptr;
+    std::vector<RemoteGetEntry> entries;
+    std::vector<PairGroup> groups;
+    mori::io::MemDescVec local_descs;
+    mori::io::MemDescVec remote_descs;
+    mori::io::BatchSizeVec local_offsets;
+    mori::io::BatchSizeVec remote_offsets;
+    mori::io::BatchSizeVec sizes_v;
+    std::vector<mori::io::TransferStatus> statuses;  // size G; built once, never resized/moved
+    mori::io::TransferStatusPtrVec status_ptrs;      // &statuses[g]
+    mori::io::TransferUniqueIdVec ids;
+    bool waited = false;  // set by WaitRemoteBatchGet so the RAII guard skips it
+    // Staging (non-zero-copy) state; zero / unlocked for the zero-copy path.
+    uint64_t staging_bytes = 0;
+    std::unique_lock<std::mutex> staging_lock;  // holds staging_mutex_ submit..memcpy
+  };
+
+  // Submit half: GetOrConnectPeer + EnsurePeerServiceConnection +
+  // PrepareRemoteGetEntries + BuildRemoteGetTransfers + GroupTransfersByPair +
+  // BatchRead (NOT waited).  Returns the in-flight handle, or nullptr if nothing
+  // is in flight (peer unreachable / resolve / build failure — failed keys
+  // already written to *results).  When `permit_staging` is false (the zero-copy
+  // submit-all path), a batch that needs staging is treated as a contract
+  // violation and failed rather than acquiring staging_mutex_ (a submit-all over
+  // multiple staging peers would deadlock on the single lock).  When true (the
+  // serial staging path), staging_mutex_ is acquired here and parked in the
+  // in-flight until WaitRemoteBatchGet copies staging -> dst.
+  std::unique_ptr<RemoteDramGetInFlight> SubmitRemoteBatchGet(
+      const std::vector<BatchGetItem>& items, std::vector<bool>* results, bool permit_staging);
+  // Wait half: wait every group (never break early), aggregate per-pair failure
+  // back to per-key (per-item AND); for a staging in-flight, copy staging_buffer_
+  // -> user dst and release staging_mutex_; then FinalizeRemoteGetEntries.
+  void WaitRemoteBatchGet(RemoteDramGetInFlight& inflight, std::vector<bool>* results);
 };
 
 }  // namespace mori::umbp
