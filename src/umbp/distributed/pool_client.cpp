@@ -810,19 +810,14 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalSsdGet(const std::string& 
   return GetAttemptOutcome::kSuccess;
 }
 
-std::unordered_map<std::string, std::vector<PoolClient::BatchPutItem>>
-PoolClient::PartitionBatchPutTargets(const std::vector<std::string>& keys,
-                                     const std::vector<const void*>& srcs,
-                                     const std::vector<size_t>& sizes,
-                                     const std::vector<std::optional<RoutePutResult>>& routes,
-                                     std::vector<PutEntryOutcome>* results) {
-  std::unordered_map<std::string, std::vector<BatchPutItem>> remote_groups;
-  std::vector<size_t> local_idx;
+PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
+    const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
+    const std::vector<size_t>& sizes, const std::vector<std::optional<RoutePutResult>>& routes,
+    std::vector<PutEntryOutcome>* results) {
+  BatchPutPlan plan;
   const size_t count = keys.size();
   for (size_t i = 0; i < count; ++i) {
-    // Zero-size puts are rejected before local/peer execution: an empty block
-    // is meaningless to store, so leave the result as kFailed and never hand it
-    // to ExecuteLocalPut / peer AllocateSlot.
+    // Zero-size puts are meaningless: leave the result kFailed, never execute.
     if (sizes[i] == 0) {
       MORI_UMBP_WARN("[PoolClient] BatchPut: skipping zero-size put for key='{}'", keys[i]);
       continue;
@@ -835,45 +830,17 @@ PoolClient::PartitionBatchPutTargets(const std::vector<std::string>& keys,
       continue;
     }
     if (route.node_id == config_.master_config.node_id) {
-      local_idx.push_back(i);
+      // Self-target: deferred (with its tier) so ExecuteBatchPutPlan can run the
+      // local memcpy inside the remote-DRAM submit..wait window.
+      plan.local_items.push_back(BatchPutItem{
+          .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
       continue;
     }
     if (route.tier != TierType::DRAM && route.tier != TierType::HBM) continue;
-    remote_groups[route.node_id].push_back(BatchPutItem{
+    plan.remote_groups[route.node_id].push_back(BatchPutItem{
         .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
   }
-  // Parallel local writes: different threads handle different keys. The
-  // PeerDramAllocator serializes Allocate/Commit internally (mutex); the heavy
-  // per-key memcpy in ExecuteLocalPut->LocalPutPages runs lock-free in parallel.
-  if (!local_idx.empty()) {
-    const int nthr = LocalCopyThreads("UMBP_DRAM_WRITE_THREADS");
-    const auto t0 = std::chrono::steady_clock::now();
-    LocalParallelFor(local_idx.size(), nthr, [&](size_t k) {
-      const size_t i = local_idx[k];
-      switch (ExecuteLocalPut(keys[i], srcs[i], sizes[i], routes[i]->tier)) {
-        case PutAttemptOutcome::kSuccess:
-          (*results)[i] = PutEntryOutcome::kSucceeded;
-          break;
-        case PutAttemptOutcome::kSuccessAlreadyExists:
-          (*results)[i] = PutEntryOutcome::kAlreadyExists;
-          break;
-        case PutAttemptOutcome::kRetry:
-        case PutAttemptOutcome::kFatal:
-          break;
-      }
-    });
-    if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
-      double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
-                       std::chrono::steady_clock::now() - t0)
-                       .count();
-      size_t tot = 0;
-      for (size_t k : local_idx) tot += sizes[k];
-      MORI_UMBP_INFO("[LocalCopy] PUT keys={} bytes={} threads={} elapsed_ms={:.3f} GiB_s={:.2f}",
-                     local_idx.size(), tot, nthr, sec * 1000.0,
-                     tot / (sec > 0 ? sec : 1e-12) / (1024.0 * 1024 * 1024));
-    }
-  }
-  return remote_groups;
+  return plan;
 }
 
 // ---------------------------------------------------------------------------
@@ -899,6 +866,10 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
 std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
                                        const std::vector<const void*>& srcs,
                                        const std::vector<size_t>& sizes) {
+  // NOTE: BatchPut only lands data in the DRAM/HBM tier. The SSD tier copy is
+  // asynchronous and owner-driven: a successful slot Commit (local in
+  // ExecuteLocalPut, remote on the peer's CommitSlot) enqueues the copy onto the
+  // SsdCopyPipeline. There is no explicit SSD write on this path.
   const auto call_start = std::chrono::steady_clock::now();
   if (keys.size() != srcs.size() || keys.size() != sizes.size()) {
     MORI_UMBP_ERROR("[PoolClient] BatchPut: vector length mismatch");
@@ -923,10 +894,8 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
   }
   if (routes.size() < keys.size()) routes.resize(keys.size());
 
-  auto remote_groups = PartitionBatchPutTargets(keys, srcs, sizes, routes, &outcomes);
-  for (auto& [node_id, items] : remote_groups) {
-    ProcessRemoteBatchPut(items, &outcomes);
-  }
+  BatchPutPlan plan = PartitionBatchPutTargets(keys, srcs, sizes, routes, &outcomes);
+  ExecuteBatchPutPlan(plan, &outcomes);
 
   const auto call_end = std::chrono::steady_clock::now();
   const double seconds =
@@ -1115,27 +1084,12 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
     return;
   }
 
-  // Zero-copy remote DRAM: submit every peer (posted, not waited) so multi-peer
-  // wire time overlaps, run local DRAM/SSD + remote SSD INSIDE that in-flight
-  // window (local memcpy / SSD use CPU / local-mem / SSD resources disjoint from
-  // the NIC, so they overlap the DRAM wire), then wait all peers.
+  // Zero-copy remote DRAM: submit every peer (posted, not waited) to overlap
+  // wire time across peers, run local DRAM/SSD + remote SSD in that window, then
+  // wait all. On early/exceptional exit ~RemoteDramGetInFlight drains in-flight
+  // statuses (lifetime safety); the wait loop does failure mapping + backfill.
   std::vector<std::unique_ptr<RemoteDramGetInFlight>> inflights;
   inflights.reserve(remote_dram_groups.size());
-  // Cleanup-only RAII: on an exceptional/early exit, Wait() any still-in-flight
-  // status so the backend CQ callback isn't left referencing freed memory.  It
-  // does NOT do failure mapping or result backfill (the normal path's
-  // WaitRemoteBatchGet does that) — it only makes status lifetime safe.
-  struct InFlightDrainGuard {
-    std::vector<std::unique_ptr<RemoteDramGetInFlight>>& v;
-    ~InFlightDrainGuard() {
-      for (auto& f : v) {
-        if (f && !f->waited) {
-          for (auto& s : f->statuses) s.Wait();
-          f->waited = true;
-        }
-      }
-    }
-  } drain_guard{inflights};
 
   for (const auto& [node_id, items] : remote_dram_groups) {
     if (auto f = SubmitRemoteBatchGet(items, results, /*permit_staging=*/false)) {
@@ -1149,68 +1103,266 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
   for (auto& f : inflights) WaitRemoteBatchGet(*f, results);
 }
 
-void PoolClient::ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items,
-                                       std::vector<PutEntryOutcome>* results) {
-  if (items.empty()) return;
+void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
+                                     std::vector<PutEntryOutcome>* results) {
+  // Deferred local puts, parallel: per-key memcpy is lock-free (the allocator
+  // serializes Allocate/Commit); results is not vector<bool>-bit-packed, so
+  // workers write distinct indices directly. AddCounter / timing stay here.
+  auto run_local_put = [&]() {
+    const auto& local = plan.local_items;
+    if (local.empty()) return;
+    const int nthr = LocalCopyThreads("UMBP_DRAM_WRITE_THREADS");
+    const auto t0 = std::chrono::steady_clock::now();
+    LocalParallelFor(local.size(), nthr, [&](size_t k) {
+      const auto& item = local[k];
+      switch (ExecuteLocalPut(*item.key, item.src, item.size, item.route.tier)) {
+        case PutAttemptOutcome::kSuccess:
+          (*results)[item.index] = PutEntryOutcome::kSucceeded;
+          break;
+        case PutAttemptOutcome::kSuccessAlreadyExists:
+          (*results)[item.index] = PutEntryOutcome::kAlreadyExists;
+          break;
+        case PutAttemptOutcome::kRetry:
+        case PutAttemptOutcome::kFatal:
+          break;
+      }
+    });
+    if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
+      double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+      size_t tot = 0;
+      for (const auto& item : local) tot += item.size;
+      MORI_UMBP_INFO("[LocalCopy] PUT keys={} bytes={} threads={} elapsed_ms={:.3f} GiB_s={:.2f}",
+                     local.size(), tot, nthr, sec * 1000.0,
+                     tot / (sec > 0 ? sec : 1e-12) / (1024.0 * 1024 * 1024));
+    }
+  };
+
+  const auto& remote_groups = plan.remote_groups;
+
+  // All-ZC or all-staging (upper-layer invariant): probe one item's src.
+  const bool is_zc =
+      !remote_groups.empty() && FindRegisteredMemory(remote_groups.begin()->second.front().src,
+                                                     remote_groups.begin()->second.front().size)
+                                    .has_value();
+
+  if (!is_zc) {
+    // Staging / no remote: each peer submits then IMMEDIATELY waits. The
+    // in-flight holds staging_mutex_ submit..wait, so a submit-all over multiple
+    // staging peers would deadlock on the single lock.
+    run_local_put();
+    for (const auto& [node_id, items] : remote_groups) {
+      if (auto f = SubmitRemoteBatchPut(items, results, /*permit_staging=*/true)) {
+        WaitRemoteBatchPut(*f, results);
+      }
+    }
+    return;
+  }
+
+  // Zero-copy: submit every peer (not waited) to overlap the wire across peers,
+  // run local puts in that window, then wait all + commit. On early exit
+  // ~RemoteDramPutInFlight drains statuses; the wait does mapping + commit/abort.
+  std::vector<std::unique_ptr<RemoteDramPutInFlight>> inflights;
+  inflights.reserve(remote_groups.size());
+  for (const auto& [node_id, items] : remote_groups) {
+    if (auto f = SubmitRemoteBatchPut(items, results, /*permit_staging=*/false)) {
+      inflights.push_back(std::move(f));
+    }
+  }
+  run_local_put();
+  for (auto& f : inflights) WaitRemoteBatchPut(*f, results);
+}
+
+std::unique_ptr<PoolClient::RemoteDramPutInFlight> PoolClient::SubmitRemoteBatchPut(
+    const std::vector<BatchPutItem>& items, std::vector<PutEntryOutcome>* results,
+    bool permit_staging) {
+  if (items.empty()) return nullptr;
   auto fail_all = [&] {
     for (const auto& item : items) (*results)[item.index] = PutEntryOutcome::kFailed;
   };
   if (!io_engine_) {
-    MORI_UMBP_ERROR("[PoolClient] ProcessRemoteBatchPut: io_engine_ not initialized (items={})",
+    MORI_UMBP_ERROR("[PoolClient] SubmitRemoteBatchPut: io_engine_ not initialized (items={})",
                     items.size());
     fail_all();
-    return;
+    return nullptr;
   }
+
   const auto& first = items.front();
   auto& peer = GetOrConnectPeer(first.route.node_id, first.route.peer_address);
   if (!EnsurePeerServiceConnection(peer)) {
     MORI_UMBP_WARN(
-        "[PoolClient] ProcessRemoteBatchPut: peer service connection unavailable, node='{}' "
+        "[PoolClient] SubmitRemoteBatchPut: peer service connection unavailable, node='{}' "
         "addr='{}' items={}",
         first.route.node_id, first.route.peer_address, items.size());
     fail_all();
-    return;
+    return nullptr;
   }
   auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
-  ExecuteRemoteBatchPut(items, results, peer, stub);
-}
 
-void PoolClient::ExecuteRemoteBatchPut(const std::vector<BatchPutItem>& items,
-                                       std::vector<PutEntryOutcome>* results, PeerConnection& peer,
-                                       ::umbp::UMBPPeer::Stub* stub) {
-  if (items.empty()) return;
-  if (!io_engine_) {
-    for (const auto& item : items) (*results)[item.index] = PutEntryOutcome::kFailed;
-    return;
+  auto inflight = std::make_unique<RemoteDramPutInFlight>();
+  inflight->peer = &peer;
+  inflight->stub = stub;
+
+  // Abort already-allocated slots on a synchronous failure that returns nullptr
+  // (no WaitRemoteBatchPut/finalize will run for them).
+  auto abort_now = [&](std::vector<uint64_t> slot_ids) {
+    if (slot_ids.empty()) return;
+    ::umbp::BatchAbortSlotsRequest abort_req;
+    for (uint64_t slot_id : slot_ids) abort_req.add_slot_ids(slot_id);
+    ::umbp::BatchAbortSlotsResponse abort_resp;
+    grpc::ClientContext abort_ctx;
+    // Best-effort: a failed abort just leaves the slots for the peer reaper to
+    // reclaim at pending_ttl. Warn to aid diagnosis but do not propagate.
+    auto s = stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
+    if (!s.ok()) {
+      MORI_UMBP_WARN(
+          "[PoolClient] SubmitRemoteBatchPut: BatchAbortSlots({} slots) failed on {}: {}",
+          slot_ids.size(), first.route.node_id, s.error_message());
+    }
+  };
+
+  // Allocate RPC + per-key dedup/failure mapping; malformed slots go to
+  // inflight->abort_slots. On total failure results are written and the
+  // malformed list already aborted inside the callee — nothing left in flight.
+  if (!AllocateRemotePutEntries(items, stub, &inflight->entries, &inflight->abort_slots, results)) {
+    return nullptr;
   }
-
-  std::vector<RemotePutEntry> entries;
-  std::vector<uint64_t> abort_slots;
-  if (!AllocateRemotePutEntries(items, stub, &entries, &abort_slots, results)) return;
 
   std::vector<TransferInstruction> transfers;
   uint64_t staging_bytes = 0;
-  if (!BuildRemotePutTransfers(entries, peer, &transfers, &staging_bytes)) {
+  if (!BuildRemotePutTransfers(inflight->entries, peer, &transfers, &staging_bytes)) {
     MORI_UMBP_WARN(
-        "[PoolClient] ExecuteRemoteBatchPut: BuildRemotePutTransfers failed, node='{}' "
-        "entries={} staging_bytes={} -> aborting all slots",
-        items.front().route.node_id, entries.size(), staging_bytes);
-    for (auto& entry : entries) {
-      abort_slots.push_back(entry.slot_id);
+        "[PoolClient] SubmitRemoteBatchPut: BuildRemotePutTransfers failed, node='{}' entries={} "
+        "-> aborting all slots",
+        first.route.node_id, inflight->entries.size());
+    // Build failed wholesale: abort everything allocated.
+    std::vector<uint64_t> all = std::move(inflight->abort_slots);
+    for (auto& entry : inflight->entries) {
+      all.push_back(entry.slot_id);
       (*results)[entry.result_index] = PutEntryOutcome::kFailed;
     }
-    if (!abort_slots.empty()) {
-      ::umbp::BatchAbortSlotsRequest abort_req;
-      for (uint64_t slot_id : abort_slots) abort_req.add_slot_ids(slot_id);
-      ::umbp::BatchAbortSlotsResponse abort_resp;
-      grpc::ClientContext abort_ctx;
-      stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
+    abort_now(std::move(all));
+    return nullptr;
+  }
+  inflight->staging_bytes = staging_bytes;
+
+  // Staging uses the shared staging_buffer_, so a cross-peer submit-all cannot
+  // serialize on the single staging_mutex_ without deadlocking: the zero-copy
+  // path passes permit_staging=false and fails such a batch (contract: a batch
+  // is all-zc or all-staging). The serial staging path acquires staging_mutex_,
+  // copies src->staging here (BEFORE BatchWrite, opposite of Get), and parks the
+  // lock in the in-flight until WaitRemoteBatchPut releases it.
+  if (staging_bytes > 0) {
+    if (!permit_staging) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] SubmitRemoteBatchPut: unexpected staging_bytes={} on zero-copy path "
+          "node='{}' -> failing batch",
+          staging_bytes, first.route.node_id);
+      std::vector<uint64_t> all = std::move(inflight->abort_slots);
+      for (auto& entry : inflight->entries) {
+        all.push_back(entry.slot_id);
+        (*results)[entry.result_index] = PutEntryOutcome::kFailed;
+      }
+      abort_now(std::move(all));
+      return nullptr;
     }
-    return;
+    inflight->staging_lock = std::unique_lock<std::mutex>(staging_mutex_);
+    for (auto& entry : inflight->entries) {
+      if (entry.failed || !entry.use_staging) continue;
+      // Defensive re-check before the memcpy (build already validated the cursor).
+      if (entry.staging_offset + entry.item->size > config_.staging_buffer_size) {
+        MORI_UMBP_ERROR(
+            "[PoolClient] SubmitRemoteBatchPut: staging offset overflow (should not happen), "
+            "key='{}' staging_offset={} size={} cap={}",
+            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+            entry.staging_offset, entry.item ? entry.item->size : 0, config_.staging_buffer_size);
+        entry.failed = true;
+        continue;
+      }
+      std::memcpy(staging_buffer_.get() + entry.staging_offset, entry.item->src, entry.item->size);
+    }
   }
 
-  ExecuteRemotePutTransfers(entries, transfers, staging_bytes);
-  FinalizeRemotePutEntries(entries, abort_slots, results, stub);
+  // Drop transfers whose entry failed during build. Those failed entries ride in
+  // inflight->entries and are aborted by FinalizeRemotePutEntries at wait time —
+  // do NOT early-abort them here (they're not a whole-batch failure).
+  std::vector<TransferInstruction> active_transfers;
+  active_transfers.reserve(transfers.size());
+  for (const auto& t : transfers) {
+    if (!inflight->entries[t.entry_index].failed) active_transfers.push_back(t);
+  }
+  if (active_transfers.empty()) {
+    // Nothing to post: no in-flight returned, so finalize never runs. Release
+    // staging_mutex_ before the abort RPC (no need to hold it over the wire),
+    // then abort every allocated slot and fail every key.
+    if (inflight->staging_lock.owns_lock()) inflight->staging_lock.unlock();
+    std::vector<uint64_t> all = std::move(inflight->abort_slots);
+    for (auto& entry : inflight->entries) {
+      all.push_back(entry.slot_id);
+      (*results)[entry.result_index] = PutEntryOutcome::kFailed;
+    }
+    abort_now(std::move(all));
+    return nullptr;
+  }
+
+  // Collapse same-pair pages into one outer transfer, materialised INTO the
+  // in-flight so the args outlive the post (see RemoteDramGetInFlight).
+  inflight->groups = GroupTransfersByPair(active_transfers);
+  const size_t G = inflight->groups.size();
+  inflight->local_descs.resize(G);
+  inflight->remote_descs.resize(G);
+  inflight->local_offsets.resize(G);
+  inflight->remote_offsets.resize(G);
+  inflight->sizes_v.resize(G);
+  inflight->statuses = std::vector<mori::io::TransferStatus>(G);  // built once, never resized/moved
+  inflight->status_ptrs.resize(G);
+  inflight->ids.resize(G);
+  for (size_t g = 0; g < G; ++g) {
+    inflight->local_descs[g] = inflight->groups[g].local_desc;
+    inflight->remote_descs[g] = inflight->groups[g].remote_desc;
+    inflight->local_offsets[g] = std::move(inflight->groups[g].local_offsets);
+    inflight->remote_offsets[g] = std::move(inflight->groups[g].remote_offsets);
+    inflight->sizes_v[g] = std::move(inflight->groups[g].sizes);
+    inflight->status_ptrs[g] = &inflight->statuses[g];
+    inflight->ids[g] = io_engine_->AllocateTransferUniqueId();
+  }
+
+  // POST the writes; do NOT wait. All args are owned by *inflight; for staging
+  // the src bytes are already in staging_buffer_ under staging_lock.
+  io_engine_->BatchWrite(inflight->local_descs, inflight->local_offsets, inflight->remote_descs,
+                         inflight->remote_offsets, inflight->sizes_v, inflight->status_ptrs,
+                         inflight->ids);
+  return inflight;
+}
+
+void PoolClient::WaitRemoteBatchPut(RemoteDramPutInFlight& f,
+                                    std::vector<PutEntryOutcome>* results) {
+  if (f.drained) return;
+  f.drained = true;  // set early (mirror Get) so the destructor never re-waits.
+  // Wait every group (never break early); a non-success group fails all of its
+  // contributing keys (per-item AND).
+  const size_t G = f.groups.size();
+  for (size_t g = 0; g < G; ++g) {
+    f.statuses[g].Wait();
+    if (f.statuses[g].Succeeded()) continue;
+    for (size_t ei : f.groups[g].entry_indices) {
+      auto& entry = f.entries[ei];
+      MORI_UMBP_ERROR(
+          "RemotePut BatchWrite failed: code={} msg='{}' peer_engine='{}' key='{}' slot_id={} "
+          "use_staging={}",
+          f.statuses[g].CodeUint32(), f.statuses[g].Message(), f.groups[g].remote_desc.engineKey,
+          (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"}, entry.slot_id,
+          entry.use_staging);
+      entry.failed = true;
+    }
+  }
+
+  // RDMA has consumed staging_buffer_; release staging_mutex_ (Put has no
+  // staging->dst copy-out — the data went to the peer).
+  if (f.staging_lock.owns_lock()) f.staging_lock.unlock();
+
+  FinalizeRemotePutEntries(f.entries, f.abort_slots, results, f.stub);
 }
 
 bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items,
@@ -1435,86 +1587,6 @@ bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, P
   return true;
 }
 
-void PoolClient::ExecuteRemotePutTransfers(std::vector<RemotePutEntry>& entries,
-                                           std::vector<TransferInstruction>& transfers,
-                                           uint64_t staging_bytes) {
-  std::unique_lock<std::mutex> staging_lock(staging_mutex_, std::defer_lock);
-  if (staging_bytes > 0) staging_lock.lock();
-
-  for (auto& entry : entries) {
-    if (entry.failed) continue;
-    if (entry.use_staging) {
-      if (entry.staging_offset + entry.item->size > config_.staging_buffer_size) {
-        MORI_UMBP_ERROR(
-            "[PoolClient] ExecuteRemotePutTransfers: staging offset overflow (should not happen), "
-            "key='{}' staging_offset={} size={} cap={}",
-            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
-            entry.staging_offset, entry.item ? entry.item->size : 0, config_.staging_buffer_size);
-        entry.failed = true;
-        continue;
-      }
-      std::memcpy(staging_buffer_.get() + entry.staging_offset, entry.item->src, entry.item->size);
-    }
-  }
-
-  std::vector<TransferInstruction> active_transfers;
-  active_transfers.reserve(transfers.size());
-  for (const auto& transfer : transfers) {
-    if (!entries[transfer.entry_index].failed) {
-      active_transfers.push_back(transfer);
-    }
-  }
-  if (active_transfers.empty()) {
-    if (staging_lock.owns_lock()) staging_lock.unlock();
-    return;
-  }
-
-  // Collapse all pages of the same (localMR, remoteMR) pair into one outer
-  // transfer (inner offset/size vectors = scatter-gather segments).  One
-  // TransferStatus and one TransferUniqueId per pair instead of per page.
-  auto groups = GroupTransfersByPair(active_transfers);
-  const size_t G = groups.size();
-  mori::io::MemDescVec local_descs(G), remote_descs(G);
-  mori::io::BatchSizeVec local_offsets(G), remote_offsets(G), sizes_v(G);
-  std::vector<mori::io::TransferStatus> statuses(G);  // built once at final size
-  mori::io::TransferStatusPtrVec status_ptrs(G);
-  mori::io::TransferUniqueIdVec ids(G);
-  for (size_t g = 0; g < G; ++g) {
-    local_descs[g] = groups[g].local_desc;
-    remote_descs[g] = groups[g].remote_desc;
-    local_offsets[g] = std::move(groups[g].local_offsets);
-    remote_offsets[g] = std::move(groups[g].remote_offsets);
-    sizes_v[g] = std::move(groups[g].sizes);
-    status_ptrs[g] = &statuses[g];
-    ids[g] = io_engine_->AllocateTransferUniqueId();
-  }
-
-  io_engine_->BatchWrite(local_descs, local_offsets, remote_descs, remote_offsets, sizes_v,
-                         status_ptrs, ids);
-  // Wait every group (never break early): IN_PROGRESS groups complete here;
-  // INIT (left unsubmitted by an engine early-return) or already-terminal
-  // groups return immediately.  A non-success group fails ALL its
-  // contributing keys (per-item AND semantics — a key fails if any of its
-  // pairs fail).  NOTE: this does not by itself prove safety of backend
-  // partial-post / status-lifetime corner cases.
-  for (size_t g = 0; g < G; ++g) {
-    statuses[g].Wait();
-    if (statuses[g].Succeeded()) continue;
-    for (size_t ei : groups[g].entry_indices) {
-      auto& entry = entries[ei];
-      MORI_UMBP_ERROR(
-          "RemotePut BatchWrite failed: code={} msg='{}' peer_engine='{}' key='{}' "
-          "slot_id={} use_staging={}",
-          statuses[g].CodeUint32(), statuses[g].Message(), groups[g].remote_desc.engineKey,
-          (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"}, entry.slot_id,
-          entry.use_staging);
-      entry.failed = true;
-    }
-  }
-
-  if (staging_lock.owns_lock()) staging_lock.unlock();
-}
-
 void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
                                           std::vector<uint64_t>& abort_slots,
                                           std::vector<PutEntryOutcome>* results,
@@ -1575,7 +1647,13 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
     for (uint64_t slot_id : abort_slots) abort_req.add_slot_ids(slot_id);
     ::umbp::BatchAbortSlotsResponse abort_resp;
     grpc::ClientContext abort_ctx;
-    stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
+    // Best-effort: a failed abort just leaves the slots for the peer reaper to
+    // reclaim at pending_ttl. Warn to aid diagnosis but do not propagate.
+    auto abort_status = stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
+    if (!abort_status.ok()) {
+      MORI_UMBP_WARN("[PoolClient] FinalizeRemotePutEntries: BatchAbortSlots({} slots) failed: {}",
+                     abort_slots.size(), abort_status.error_message());
+    }
     abort_slots.clear();
   }
 }
@@ -1845,8 +1923,8 @@ std::unique_ptr<PoolClient::RemoteDramGetInFlight> PoolClient::SubmitRemoteBatch
 }
 
 void PoolClient::WaitRemoteBatchGet(RemoteDramGetInFlight& f, std::vector<bool>* results) {
-  if (f.waited) return;
-  f.waited = true;
+  if (f.drained) return;
+  f.drained = true;
   // Wait every group (never break early): IN_PROGRESS groups complete here;
   // INIT/terminal return immediately.  A non-success group fails all of its
   // contributing keys (per-item AND).

@@ -557,7 +557,10 @@ class CrossNodeOverlap : public ::testing::Test {
     ASSERT_NE(master_->GetBoundPort(), 0) << "Master failed to start";
   }
 
-  PoolClient* MakeClient(const std::string& node_id, const std::vector<size_t>& buffer_sizes) {
+  // staging_buffer_size==0 keeps the PoolClientConfig default (64 MiB); a small
+  // positive value lets a test force the staging-overflow failure path.
+  PoolClient* MakeClient(const std::string& node_id, const std::vector<size_t>& buffer_sizes,
+                         size_t staging_buffer_size = 0) {
     PoolClientConfig cfg;
     cfg.master_config.node_id = node_id;
     cfg.master_config.node_address = "127.0.0.1";
@@ -566,6 +569,7 @@ class CrossNodeOverlap : public ::testing::Test {
     cfg.io_engine.port = 0;
     cfg.peer_service_port = NextPeerServicePort();
     cfg.dram_page_size = kPageSize;
+    if (staging_buffer_size > 0) cfg.staging_buffer_size = staging_buffer_size;
     uint64_t total = 0;
     for (size_t sz : buffer_sizes) {
       void* p = std::malloc(sz);
@@ -738,6 +742,157 @@ TEST_F(CrossNodeOverlap, MixedLocalAndRemoteZeroCopyByteExact) {
     EXPECT_EQ(std::memcmp(dst.data() + k * kPageSize, expect[k]->data(), kPageSize), 0)
         << "byte mismatch " << keys[k];
   }
+}
+
+// ===========================================================================
+// BatchPut overlap-path coverage (submit/wait split, mirror of the Get tests).
+// Each Put is verified by reading the data back through a (validated) BatchGet:
+// multi-peer ZC (two write in-flights before either waits), mixed local+remote
+// ZC (run_local_put inside the in-flight window), staging multi-peer, and a
+// staging-overflow batch that must fail cleanly and abort its slots.
+// ===========================================================================
+
+// Read every key back into a freshly-registered dst and byte-compare to `srcs`.
+void VerifyReadback(PoolClient* caller, const std::vector<std::string>& keys,
+                    const std::vector<std::vector<char>>& srcs, size_t page_bytes) {
+  const size_t kN = keys.size();
+  std::vector<char> dst(page_bytes * kN, 0);
+  ASSERT_TRUE(caller->RegisterMemory(dst.data(), dst.size()));
+  std::vector<void*> dsts(kN);
+  std::vector<size_t> sizes(kN, page_bytes);
+  for (size_t k = 0; k < kN; ++k) dsts[k] = dst.data() + k * page_bytes;
+  auto res = caller->BatchGet(keys, dsts, sizes);
+  ASSERT_EQ(res.size(), kN);
+  for (size_t k = 0; k < kN; ++k) {
+    EXPECT_TRUE(res[k]) << "readback get failed " << keys[k];
+    EXPECT_EQ(std::memcmp(dst.data() + k * page_bytes, srcs[k].data(), page_bytes), 0)
+        << "readback byte mismatch " << keys[k];
+  }
+  caller->DeregisterMemory(dst.data());
+}
+
+TEST_F(CrossNodeOverlap, PutMultiPeerZeroCopyByteExact) {
+  StartMaster();
+  constexpr size_t kN = 8;
+  // Caller has 1 page (never wins most_available); the two peers hold kN/2 pages
+  // each, so the batch splits across both -> two write in-flights.
+  PoolClient* caller = MakeClient("node-a", {kPageSize});
+  MakeClient("node-b", {kPageSize * (kN / 2)});
+  MakeClient("node-c", {kPageSize * (kN / 2)});
+
+  std::vector<char> src_buf(kPageSize * kN, 0);
+  ASSERT_TRUE(caller->RegisterMemory(src_buf.data(), src_buf.size()));
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> srcs(kN);
+  std::vector<const void*> psrcs(kN);
+  std::vector<size_t> sizes(kN, kPageSize);
+  for (size_t k = 0; k < kN; ++k) {
+    keys.push_back("pmp-" + std::to_string(k));
+    std::memset(src_buf.data() + k * kPageSize, static_cast<int>(0x51 + k), kPageSize);
+    srcs[k].assign(src_buf.data() + k * kPageSize, src_buf.data() + (k + 1) * kPageSize);
+    psrcs[k] = src_buf.data() + k * kPageSize;
+  }
+
+  auto put = caller->BatchPut(keys, psrcs, sizes);
+  ASSERT_EQ(put.size(), kN);
+  for (size_t k = 0; k < kN; ++k) ASSERT_TRUE(put[k]) << "put failed " << keys[k];
+  for (const auto& key : keys) ASSERT_TRUE(WaitForExists(caller, key));
+
+  caller->DeregisterMemory(src_buf.data());
+  VerifyReadback(caller, keys, srcs, kPageSize);
+}
+
+TEST_F(CrossNodeOverlap, PutMixedLocalAndRemoteZeroCopyByteExact) {
+  // kLocal is per-key local-first with spill once local is full. Caller holds
+  // kHalf pages, so a 2*kHalf batch puts the first kHalf local and spills the
+  // rest to the peer -> one batch with both local_items and remote_groups.
+  StartMaster(ConfigurableRoutePutStrategy::NodeAffinity::kLocal);
+  constexpr size_t kHalf = 3;
+  constexpr size_t kN = kHalf * 2;
+  PoolClient* caller = MakeClient("node-a", {kPageSize * kHalf});
+  MakeClient("node-b", {kPageSize * kN});  // roomy spill target
+
+  std::vector<char> src_buf(kPageSize * kN, 0);
+  ASSERT_TRUE(caller->RegisterMemory(src_buf.data(), src_buf.size()));
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> srcs(kN);
+  std::vector<const void*> psrcs(kN);
+  std::vector<size_t> sizes(kN, kPageSize);
+  for (size_t k = 0; k < kN; ++k) {
+    keys.push_back("pmix-" + std::to_string(k));
+    std::memset(src_buf.data() + k * kPageSize, static_cast<int>(0x61 + k), kPageSize);
+    srcs[k].assign(src_buf.data() + k * kPageSize, src_buf.data() + (k + 1) * kPageSize);
+    psrcs[k] = src_buf.data() + k * kPageSize;
+  }
+
+  auto put = caller->BatchPut(keys, psrcs, sizes);
+  ASSERT_EQ(put.size(), kN);
+  for (size_t k = 0; k < kN; ++k) ASSERT_TRUE(put[k]) << "put failed " << keys[k];
+  for (const auto& key : keys) ASSERT_TRUE(WaitForExists(caller, key));
+
+  caller->DeregisterMemory(src_buf.data());
+  VerifyReadback(caller, keys, srcs, kPageSize);
+}
+
+TEST_F(CrossNodeOverlap, PutStagingMultiPeerByteExact) {
+  // Un-registered src -> staging path: per-peer serial submit (src->staging
+  // memcpy before BatchWrite) -> wait. Two peers cycle the staging lock.
+  StartMaster();
+  constexpr size_t kN = 8;
+  PoolClient* caller = MakeClient("node-a", {kPageSize});
+  MakeClient("node-b", {kPageSize * (kN / 2)});
+  MakeClient("node-c", {kPageSize * (kN / 2)});
+
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> srcs(kN);
+  std::vector<const void*> psrcs(kN);
+  std::vector<size_t> sizes(kN, kPageSize);
+  for (size_t k = 0; k < kN; ++k) {
+    keys.push_back("pstg-" + std::to_string(k));
+    srcs[k].assign(kPageSize, static_cast<char>(0x31 + k));  // un-registered src
+    psrcs[k] = srcs[k].data();
+  }
+
+  auto put = caller->BatchPut(keys, psrcs, sizes);
+  ASSERT_EQ(put.size(), kN);
+  for (size_t k = 0; k < kN; ++k) ASSERT_TRUE(put[k]) << "staging put failed " << keys[k];
+  for (const auto& key : keys) ASSERT_TRUE(WaitForExists(caller, key));
+
+  VerifyReadback(caller, keys, srcs, kPageSize);
+}
+
+TEST_F(CrossNodeOverlap, PutStagingOverflowFailsBatchCleanly) {
+  // 1-page staging buffer + un-registered srcs -> BuildRemotePutTransfers
+  // overflow: the whole peer batch fails, every allocated slot is aborted (keys
+  // never visible), and the client stays usable for a later zero-copy Put.
+  StartMaster();
+  constexpr size_t kN = 4;
+  PoolClient* caller = MakeClient("node-a", {kPageSize}, /*staging_buffer_size=*/kPageSize);
+  MakeClient("node-b", {kPageSize * 64});
+
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> srcs(kN);
+  std::vector<const void*> psrcs(kN);
+  std::vector<size_t> sizes(kN, kPageSize);
+  for (size_t k = 0; k < kN; ++k) {
+    keys.push_back("povf-" + std::to_string(k));
+    srcs[k].assign(kPageSize, static_cast<char>(0x41 + k));  // un-registered -> staging
+    psrcs[k] = srcs[k].data();
+  }
+
+  auto put = caller->BatchPut(keys, psrcs, sizes);
+  ASSERT_EQ(put.size(), kN);
+  for (size_t k = 0; k < kN; ++k) EXPECT_FALSE(put[k]) << "overflow key should fail " << keys[k];
+  // Slots were aborted, never committed -> keys must not be visible.
+  auto present = caller->BatchExists(keys);
+  ASSERT_EQ(present.size(), kN);
+  for (size_t k = 0; k < kN; ++k) EXPECT_FALSE(present[k]) << "aborted key visible " << keys[k];
+
+  // Client is still usable: a registered (zero-copy) single Put succeeds.
+  std::vector<char> ok_src(kPageSize, 0x7E);
+  ASSERT_TRUE(caller->RegisterMemory(ok_src.data(), ok_src.size()));
+  EXPECT_TRUE(caller->Put("povf-ok", ok_src.data(), kPageSize));
+  caller->DeregisterMemory(ok_src.data());
 }
 
 }  // namespace
