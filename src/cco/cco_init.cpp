@@ -50,7 +50,8 @@ namespace cco {
 
 // ccoProviderType is cco's self-contained copy of core::ProviderType; the cast
 // below relies on a 1:1 mapping, so guard it (this TU sees both enums).
-static_assert(static_cast<int>(CCO_PROVIDER_UNKNOWN) == static_cast<int>(core::ProviderType::Unknown),
+static_assert(static_cast<int>(CCO_PROVIDER_UNKNOWN) ==
+                  static_cast<int>(core::ProviderType::Unknown),
               "ccoProviderType drifted from core::ProviderType");
 static_assert(static_cast<int>(CCO_PROVIDER_MLX5) == static_cast<int>(core::ProviderType::MLX5),
               "ccoProviderType drifted from core::ProviderType");
@@ -58,7 +59,8 @@ static_assert(static_cast<int>(CCO_PROVIDER_BNXT) == static_cast<int>(core::Prov
               "ccoProviderType drifted from core::ProviderType");
 static_assert(static_cast<int>(CCO_PROVIDER_PSD) == static_cast<int>(core::ProviderType::PSD),
               "ccoProviderType drifted from core::ProviderType");
-static_assert(static_cast<int>(CCO_PROVIDER_IBVERBS) == static_cast<int>(core::ProviderType::IBVERBS),
+static_assert(static_cast<int>(CCO_PROVIDER_IBVERBS) ==
+                  static_cast<int>(core::ProviderType::IBVERBS),
               "ccoProviderType drifted from core::ProviderType");
 
 // Out-of-line dtor for the unique_ptr<HeapVAManager> member: ccoComm is defined
@@ -920,7 +922,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   ibgda.numQpPerPe = numQpPerPe;
 
   size_t numEps = static_cast<size_t>(comm->worldSize) * numQpPerPe;
-  application::RdmaEndpointDevice* epsGpu = nullptr;
+  core::RdmaEndpointDevice* epsGpu = nullptr;
 
   // Build the peer mask once based on connType. Context::CreateAdditional /
   // ConnectAdditional take the same mask. Empty mask if NONE.
@@ -975,7 +977,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     // a TODO; for now, rely on modify_qp's internal check + the transport
     // map dump (MORI_CCO_LOG_TRANSPORT) for visibility.
 
-    std::vector<application::RdmaEndpointDevice> epsHost(numEps);
+    std::vector<core::RdmaEndpointDevice> epsHost(numEps);
     for (size_t i = 0; i < numEps; i++) {
       epsHost[i].vendorId = newEps[i].vendorId;
       epsHost[i].qpn = newEps[i].handle.qpn;
@@ -990,9 +992,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       }
     }
 
-    HIP_RUNTIME_CHECK(hipMalloc(&epsGpu, numEps * sizeof(application::RdmaEndpointDevice)));
-    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(),
-                                numEps * sizeof(application::RdmaEndpointDevice),
+    HIP_RUNTIME_CHECK(hipMalloc(&epsGpu, numEps * sizeof(core::RdmaEndpointDevice)));
+    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(), numEps * sizeof(core::RdmaEndpointDevice),
                                 hipMemcpyHostToDevice));
   }
   ibgda.endpoints = epsGpu;

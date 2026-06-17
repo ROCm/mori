@@ -66,48 +66,15 @@ static constexpr size_t ATOMIC_IBUF_SLOT_SIZE = 8;  // Each atomic ibuf slot is 
 /*                                      RDMA Types (device-safe)                                  */
 /* ---------------------------------------------------------------------------------------------- */
 
-enum class RdmaDeviceVendorId : uint32_t {
-  Unknown = 0,
-  Mellanox = 0x02c9,
-  Broadcom = 0x14E4,
-  Pensando = 0x1dd8,
-};
+// Re-export core's vendor-id enum so application transport code spells it
+// unqualified. (RdmaEndpointDevice also lives in core; backends use core:: directly.)
+using ::mori::core::RdmaDeviceVendorId;
 
 struct RdmaMemoryRegion {
   uintptr_t addr{0};
   uint32_t lkey{0};
   uint32_t rkey{0};
   size_t length{0};
-};
-
-// Device-side view of an RDMA endpoint: the GPU-visible subset of the host
-// application::RdmaEndpoint (transport/rdma/rdma.hpp). Holds only the fields
-// device kernels need to post work — no ibverbs objects, no STL. Populated on
-// the host from application::RdmaEndpoint, then hipMemcpy'd to the device.
-//
-// This lives in the application (transport) layer, not in any higher module,
-// so backends that drive RDMA from kernels (shmem, cco, ...) depend DOWN on it
-// rather than on each other. Only `qpn` is pulled out of RdmaEndpoint::handle;
-// the rest map field-for-field.
-struct RdmaEndpointDevice {
-  RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
-  uint32_t qpn{0};  // QP number — extracted from application::RdmaEndpoint::handle.qpn
-  core::WorkQueueHandle wqHandle;
-  core::CompletionQueueHandle cqHandle;
-  core::IbufHandle atomicIbuf;
-
-  __device__ __host__ core::ProviderType GetProviderType() const {
-    switch (vendorId) {
-      case RdmaDeviceVendorId::Mellanox:
-        return core::ProviderType::MLX5;
-      case RdmaDeviceVendorId::Broadcom:
-        return core::ProviderType::BNXT;
-      case RdmaDeviceVendorId::Pensando:
-        return core::ProviderType::PSD;
-      default:
-        return core::ProviderType::Unknown;
-    }
-  }
 };
 
 /* ---------------------------------------------------------------------------------------------- */

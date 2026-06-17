@@ -107,11 +107,13 @@ class Context;
 // HeapVAManager: ccoComm::vaManager (unique_ptr; ccoComm has an out-of-line
 // dtor in cco_init.cpp so the incomplete type is fine here).
 class HeapVAManager;
-// RdmaEndpointDevice: ccoIbgdaContext::endpoints (pointer only). Full definition
-// reaches GDA device code via cco_scale_out.hpp, and the host impl via
-// application_device_types.hpp.
-struct RdmaEndpointDevice;
 }  // namespace application
+namespace core {
+// RdmaEndpointDevice: ccoIbgdaContext::endpoints (pointer only). Full definition
+// reaches GDA device code via cco_scale_out.hpp (-> rdma_device.hpp), and the
+// host impl via core_device_types.hpp.
+struct RdmaEndpointDevice;
+}  // namespace core
 }  // namespace mori
 namespace anvil {
 // SdmaQueueDeviceHandle: ccoSdmaContext / ccoComm (pointer only).
@@ -268,7 +270,7 @@ typedef ccoWindowDevice* ccoWindow_t;
 //   raddr = signal_slot_id * sizeof(uint64)   (signalBuf is at offset 0
 //                                               within the resource window)
 struct ccoIbgdaContext {
-  application::RdmaEndpointDevice* endpoints;  // [worldSize * numQpPerPe]
+  core::RdmaEndpointDevice* endpoints;  // [worldSize * numQpPerPe]
   int numQpPerPe;
 
   // Signal: remote peers atomic +1 here after put completes.

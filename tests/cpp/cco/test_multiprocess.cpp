@@ -145,7 +145,7 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
     auto countQps = [&](const mori::cco::ccoDevComm& dc) -> int {
       if (!dc.ibgda.endpoints || dc.ibgda.numQpPerPe == 0) return 0;
       size_t n = static_cast<size_t>(dc.worldSize) * dc.ibgda.numQpPerPe;
-      std::vector<mori::application::RdmaEndpointDevice> eps(n);
+      std::vector<mori::core::RdmaEndpointDevice> eps(n);
       HIP_CHECK(
           hipMemcpy(eps.data(), dc.ibgda.endpoints, n * sizeof(eps[0]), hipMemcpyDeviceToHost));
       int c = 0;
