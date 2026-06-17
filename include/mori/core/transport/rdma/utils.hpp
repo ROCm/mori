@@ -64,7 +64,8 @@ static __device__ __host__ const char* WcStatusString(WcStatus status) {
   return wc_status_str[status];
 }
 
-static __device__ __host__ uint32_t get_num_wqes_in_atomic(atomicType amo_op, uint32_t bytes) {
+static __device__ __host__ uint32_t get_num_wqes_in_atomic(atomicType /*amo_op*/,
+                                                           uint32_t /*bytes*/) {
   return 1;
 }
 

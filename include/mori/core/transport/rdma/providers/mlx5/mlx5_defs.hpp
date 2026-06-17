@@ -21,28 +21,14 @@
 // SOFTWARE.
 #pragma once
 
-// Vendored mlx5 WQE/CQE hardware-ABI subset.
-//
-// These structs/constants are a verbatim, device-safe copy of the small, stable
-// subset of mlx5's WQE/CQE layout that the mori device code touches. Vendoring
-// them lets the mlx5 device path drop <infiniband/mlx5dv.h> (and the system
-// <infiniband/verbs.h> it drags in), the same way bnxt/ionic get their ABI from
-// repo-vendored firmware headers. Only <stdint.h> is needed here.
-//
-// The names are mori-prefixed on purpose (Mlx5*, MORI_MLX5_*). A naive same-name
-// copy (mlx5_cqe64, MLX5_OPCODE_SEND, ...) was tried and reverted: host/device/
-// example TUs mix the system ::mlx5_* with the vendored ones and reference them
-// unqualified, which is ambiguous. Distinct names can never collide.
-//
-// These structs overlay NIC hardware memory, so the layout MUST match the system
-// header byte-for-byte. That parity is enforced at compile time by the
-// static_asserts in
-// src/application/transport/rdma/providers/mlx5/mlx5_abi_parity.cpp, which is the
-// one place that includes both this header and the system mlx5dv.h. Any layout
-// drift there is a build error — fix it before trusting these definitions.
-//
-// __beN fields in the system header are kept as plain uintN_t here; the device
-// code byte-swaps explicitly (HTOBE*/BE*TOH).
+// Vendored mlx5 WQE/CQE hardware-ABI subset: a device-safe copy of the small,
+// stable layout the mori device code touches, so the mlx5 device path can drop
+// <infiniband/mlx5dv.h> (like bnxt/ionic get their ABI from vendored headers).
+// Names are mori-prefixed (Mlx5*, MORI_MLX5_*) to avoid ambiguity with the system
+// ::mlx5_* in TUs that see both. These structs overlay NIC memory, so the layout
+// MUST match the system header byte-for-byte — parity is static_asserted in
+// src/application/transport/rdma/providers/mlx5/mlx5_abi_parity.cpp. __beN fields
+// are plain uintN_t; the device code byte-swaps explicitly.
 
 #include <stdint.h>
 
