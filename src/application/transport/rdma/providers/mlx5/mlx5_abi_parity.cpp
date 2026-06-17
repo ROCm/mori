@@ -30,9 +30,9 @@
 // layout drift into a compile error. Keep it isolated (no other mlx5 code) so the
 // dual visibility of system + vendored names causes no ambiguity.
 
-#include <cstddef>
+#include <infiniband/mlx5dv.h>  // system ::mlx5_*
 
-#include <infiniband/mlx5dv.h>                                    // system ::mlx5_*
+#include <cstddef>
 
 #include "mori/core/transport/rdma/providers/mlx5/mlx5_defs.hpp"  // vendored mori::core::Mlx5*
 

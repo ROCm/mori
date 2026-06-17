@@ -22,13 +22,13 @@
 #pragma once
 
 #include <execinfo.h>
+#include <hip/hip_runtime_api.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <hip/hip_runtime_api.h>
-#include <unistd.h>
 
 #include "rocm_smi/rocm_smi.h"
 

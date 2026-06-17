@@ -26,7 +26,7 @@
 // this header — included by every provider — stays free of mlx5dv.h and the
 // per-provider firmware headers.
 #include "mori/core/transport/rdma/core_device_types.hpp"  // WcStatus, atomicType
-#include "mori/hip_compat.hpp"                              // __device__ / __host__
+#include "mori/hip_compat.hpp"                             // __device__ / __host__
 
 namespace mori {
 namespace core {

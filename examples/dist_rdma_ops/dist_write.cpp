@@ -26,8 +26,8 @@
 #include "args_parser.hpp"
 #include "mori/application/application.hpp"
 #include "mori/application/topology/topology.hpp"
-#include "mori/core/utils/udma_barrier.h"
 #include "mori/core/core.hpp"
+#include "mori/core/utils/udma_barrier.h"
 
 using namespace mori;
 using namespace mori::application;

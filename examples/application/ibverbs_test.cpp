@@ -23,8 +23,8 @@
 #include <mpi.h>
 
 #include "mori/application/application.hpp"
-#include "mori/core/utils/udma_barrier.h"
 #include "mori/core/core.hpp"
+#include "mori/core/utils/udma_barrier.h"
 
 using namespace mori;
 using namespace mori::application;

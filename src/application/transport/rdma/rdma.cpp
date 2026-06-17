@@ -43,7 +43,7 @@
 // mori::core::WcStatus is a device-safe mirror of ibverbs' ibv_wc_status so device
 // TUs need not include <infiniband/verbs.h>. This host TU sees both — guard the
 // 1:1 value parity here so any future drift is a compile error.
-#define MORI_WC_STATUS_PARITY(x) \
+#define MORI_WC_STATUS_PARITY(x)                                                        \
   static_assert(static_cast<int>(::mori::core::WC_##x) == static_cast<int>(IBV_WC_##x), \
                 "mori::core::WcStatus drifted from ibv_wc_status")
 MORI_WC_STATUS_PARITY(SUCCESS);

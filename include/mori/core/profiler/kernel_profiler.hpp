@@ -22,8 +22,9 @@
 
 #pragma once
 
-#include <cstdint>  // int64_t / uint8_t
 #include <hip/hip_runtime.h>
+
+#include <cstdint>  // int64_t / uint8_t
 
 #include "mori/core/profiler/constants.hpp"  // MAX_TRACE_EVENTS_PER_WARP, ...
 

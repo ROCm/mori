@@ -356,7 +356,8 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
 
   do {
     uint16_t wqeCounter = BE16TOH(cqe->wqe_counter);
-    uint8_t opcode = (reinterpret_cast<volatile uint8_t*>(cq.cqAddr)[sizeof(core::Mlx5Cqe64) - 1]) >> 4;
+    uint8_t opcode =
+        (reinterpret_cast<volatile uint8_t*>(cq.cqAddr)[sizeof(core::Mlx5Cqe64) - 1]) >> 4;
     if (opcode == core::MORI_MLX5_CQE_REQ_ERR || opcode == core::MORI_MLX5_CQE_RESP_ERR) {
       auto error = core::Mlx5HandleErrorCqe(reinterpret_cast<core::Mlx5ErrCqe*>(cq.cqAddr));
       MORI_PRINTF("(%s:%d) collapsed CQE error: %s\n", __FILE__, __LINE__,

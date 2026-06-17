@@ -77,8 +77,8 @@ static __device__ __host__ void DumpMlx5Wqe(void* wqeBaseAddr, uint32_t idx) {
   uint32_t wqeIdx = (opmodIdxOpCode >> 8) & 0xFFFF;
   uint32_t opmod = (opmodIdxOpCode >> 24) & 0xFF;
 
-  Mlx5WqeDataSeg* wqeDataSeg = reinterpret_cast<Mlx5WqeDataSeg*>(
-      wqeAddr + sizeof(Mlx5WqeCtrlSeg) + sizeof(Mlx5WqeRaddrSeg));
+  Mlx5WqeDataSeg* wqeDataSeg =
+      reinterpret_cast<Mlx5WqeDataSeg*>(wqeAddr + sizeof(Mlx5WqeCtrlSeg) + sizeof(Mlx5WqeRaddrSeg));
   uint32_t bytes = BE32TOH(wqeDataSeg->byte_count);
   MORI_PRINTF("Wqe: opcode = 0x%02x, wqeIdx = %u, opmod = 0x%02x bytes %d\n", opcode, wqeIdx, opmod,
               bytes);
@@ -101,15 +101,15 @@ inline __device__ uint64_t Mlx5PostSend(WorkQueueHandle& wq, uint32_t curPostIdx
   constexpr int numWqeBb = CeilDiv(numOctoWords * 16, int(MORI_MLX5_SEND_WQE_BB));
 
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
-  uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(queueBuffAddr) + (wqeIdx << MORI_MLX5_SEND_WQE_SHIFT);
+  uintptr_t wqeAddr =
+      reinterpret_cast<uintptr_t>(queueBuffAddr) + (wqeIdx << MORI_MLX5_SEND_WQE_SHIFT);
 
   Mlx5WqeCtrlSeg* wqeCtrlSeg = reinterpret_cast<Mlx5WqeCtrlSeg*>(wqeAddr);
   wqeCtrlSeg->opmod_idx_opcode = HTOBE32(((curPostIdx & 0xffff) << 8) | MORI_MLX5_OPCODE_SEND);
   wqeCtrlSeg->qpn_ds = HTOBE32((qpn << 8) | numOctoWords);
   wqeCtrlSeg->fm_ce_se = signalFlag;
 
-  Mlx5WqeDataSeg* wqeDataSeg =
-      reinterpret_cast<Mlx5WqeDataSeg*>(wqeAddr + sizeof(Mlx5WqeCtrlSeg));
+  Mlx5WqeDataSeg* wqeDataSeg = reinterpret_cast<Mlx5WqeDataSeg*>(wqeAddr + sizeof(Mlx5WqeCtrlSeg));
   wqeDataSeg->byte_count = HTOBE32(bytes);
   wqeDataSeg->addr = HTOBE64(laddr);
   wqeDataSeg->lkey = HTOBE32(lkey);
@@ -171,7 +171,8 @@ inline __device__ uint64_t PostRecv<ProviderType::MLX5>(WorkQueueHandle& wq, uin
 static constexpr int SendWqeSize =
     sizeof(Mlx5WqeCtrlSeg) + sizeof(Mlx5WqeRaddrSeg) + sizeof(Mlx5WqeDataSeg);
 static constexpr int SendWqeNumOctoWords = CeilDiv(SendWqeSize, 16);
-static constexpr int SendWqeNumWqeBb = CeilDiv(SendWqeNumOctoWords * 16, int(MORI_MLX5_SEND_WQE_BB));
+static constexpr int SendWqeNumWqeBb =
+    CeilDiv(SendWqeNumOctoWords * 16, int(MORI_MLX5_SEND_WQE_BB));
 
 template <bool IsRead>
 inline __device__ uint64_t Mlx5PostReadWriteImpl(WorkQueueHandle& wq, uint32_t curPostIdx,
@@ -184,7 +185,8 @@ inline __device__ uint64_t Mlx5PostReadWriteImpl(WorkQueueHandle& wq, uint32_t c
   uint32_t wqeNum = wq.sqWqeNum;
 
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
-  uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(queueBuffAddr) + (wqeIdx << MORI_MLX5_SEND_WQE_SHIFT);
+  uintptr_t wqeAddr =
+      reinterpret_cast<uintptr_t>(queueBuffAddr) + (wqeIdx << MORI_MLX5_SEND_WQE_SHIFT);
 
   Mlx5WqeCtrlSeg* wqeCtrlSeg = reinterpret_cast<Mlx5WqeCtrlSeg*>(wqeAddr);
   wqeCtrlSeg->opmod_idx_opcode = HTOBE32(((curPostIdx & 0xffff) << 8) | opcode);
@@ -196,8 +198,8 @@ inline __device__ uint64_t Mlx5PostReadWriteImpl(WorkQueueHandle& wq, uint32_t c
   wqeRaddrSeg->raddr = HTOBE64(raddr);
   wqeRaddrSeg->rkey = HTOBE32(rkey);
 
-  Mlx5WqeDataSeg* wqeDataSeg = reinterpret_cast<Mlx5WqeDataSeg*>(
-      wqeAddr + sizeof(Mlx5WqeCtrlSeg) + sizeof(Mlx5WqeRaddrSeg));
+  Mlx5WqeDataSeg* wqeDataSeg =
+      reinterpret_cast<Mlx5WqeDataSeg*>(wqeAddr + sizeof(Mlx5WqeCtrlSeg) + sizeof(Mlx5WqeRaddrSeg));
   wqeDataSeg->byte_count = HTOBE32(bytes);
   wqeDataSeg->addr = HTOBE64(laddr);
   wqeDataSeg->lkey = HTOBE32(lkey);
@@ -256,10 +258,12 @@ inline __device__ uint64_t Mlx5PostWriteInline(WorkQueueHandle& wq, uint32_t cur
   uint32_t wqeNum = wq.sqWqeNum;
 
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
-  uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(queueBuffAddr) + (wqeIdx << MORI_MLX5_SEND_WQE_SHIFT);
+  uintptr_t wqeAddr =
+      reinterpret_cast<uintptr_t>(queueBuffAddr) + (wqeIdx << MORI_MLX5_SEND_WQE_SHIFT);
 
   Mlx5WqeCtrlSeg* wqeCtrlSeg = reinterpret_cast<Mlx5WqeCtrlSeg*>(wqeAddr);
-  wqeCtrlSeg->opmod_idx_opcode = HTOBE32(((curPostIdx & 0xffff) << 8) | MORI_MLX5_OPCODE_RDMA_WRITE);
+  wqeCtrlSeg->opmod_idx_opcode =
+      HTOBE32(((curPostIdx & 0xffff) << 8) | MORI_MLX5_OPCODE_RDMA_WRITE);
   wqeCtrlSeg->qpn_ds = HTOBE32((qpn << 8) | SendWqeNumOctoWords);
   wqeCtrlSeg->fm_ce_se = signalFlag;
 
@@ -272,9 +276,8 @@ inline __device__ uint64_t Mlx5PostWriteInline(WorkQueueHandle& wq, uint32_t cur
       wqeAddr + sizeof(Mlx5WqeCtrlSeg) + sizeof(Mlx5WqeRaddrSeg));
   wqeInlDataSeg->byte_count = HTOBE32(bytes | MORI_MLX5_INLINE_SEG);
 
-  void* wqeDataPtr =
-      reinterpret_cast<void*>(wqeAddr + sizeof(Mlx5WqeCtrlSeg) + sizeof(Mlx5WqeRaddrSeg) +
-                              sizeof(Mlx5WqeInlDataSeg));
+  void* wqeDataPtr = reinterpret_cast<void*>(wqeAddr + sizeof(Mlx5WqeCtrlSeg) +
+                                             sizeof(Mlx5WqeRaddrSeg) + sizeof(Mlx5WqeInlDataSeg));
 
   // TODO: support other size
   if (bytes == 4) {
@@ -331,8 +334,8 @@ inline __device__ uint64_t mlx5PrepareAtomicWqe_v1(WorkQueueHandle& wq, uint32_t
       sizeof(Mlx5WqeCtrlSeg) + sizeof(Mlx5WqeRaddrSeg) + 2 * sizeof(Mlx5WqeAtomicSeg);
 
   struct Mlx5WqeCtrlSeg* wqeCtrlSeg = reinterpret_cast<Mlx5WqeCtrlSeg*>(wqeAddr);
-  struct Mlx5WqeRaddrSeg* wqeRaddrSeg = reinterpret_cast<Mlx5WqeRaddrSeg*>(
-      reinterpret_cast<char*>(wqeAddr) + sizeof(Mlx5WqeCtrlSeg));
+  struct Mlx5WqeRaddrSeg* wqeRaddrSeg =
+      reinterpret_cast<Mlx5WqeRaddrSeg*>(reinterpret_cast<char*>(wqeAddr) + sizeof(Mlx5WqeCtrlSeg));
   struct Mlx5WqeAtomicSeg* wqeAtomicSeg1 = reinterpret_cast<Mlx5WqeAtomicSeg*>(
       reinterpret_cast<char*>(wqeAddr) + sizeof(Mlx5WqeCtrlSeg) + sizeof(Mlx5WqeRaddrSeg));
   struct Mlx5WqeAtomicSeg* wqeAtomicSeg2 = reinterpret_cast<Mlx5WqeAtomicSeg*>(
@@ -590,13 +593,13 @@ inline __device__ uint64_t mlx5PrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   assert(numOctoWords == 4);
 
   struct Mlx5WqeCtrlSeg* wqeCtrlSeg = reinterpret_cast<Mlx5WqeCtrlSeg*>(wqeAddr);
-  struct Mlx5WqeRaddrSeg* wqeRaddrSeg = reinterpret_cast<Mlx5WqeRaddrSeg*>(
-      reinterpret_cast<char*>(wqeAddr) + sizeof(Mlx5WqeCtrlSeg));
+  struct Mlx5WqeRaddrSeg* wqeRaddrSeg =
+      reinterpret_cast<Mlx5WqeRaddrSeg*>(reinterpret_cast<char*>(wqeAddr) + sizeof(Mlx5WqeCtrlSeg));
   struct Mlx5WqeAtomicSeg* wqeAtomicSeg = reinterpret_cast<Mlx5WqeAtomicSeg*>(
       reinterpret_cast<char*>(wqeAddr) + sizeof(Mlx5WqeCtrlSeg) + sizeof(Mlx5WqeRaddrSeg));
-  struct Mlx5WqeDataSeg* wqeDataSeg = reinterpret_cast<Mlx5WqeDataSeg*>(
-      reinterpret_cast<char*>(wqeAddr) + sizeof(Mlx5WqeCtrlSeg) + sizeof(Mlx5WqeRaddrSeg) +
-      sizeof(Mlx5WqeAtomicSeg));
+  struct Mlx5WqeDataSeg* wqeDataSeg =
+      reinterpret_cast<Mlx5WqeDataSeg*>(reinterpret_cast<char*>(wqeAddr) + sizeof(Mlx5WqeCtrlSeg) +
+                                        sizeof(Mlx5WqeRaddrSeg) + sizeof(Mlx5WqeAtomicSeg));
 
   uint64_t data = val_1 ? *static_cast<uint64_t*>(val_1) : 0;
   uint64_t cmp = val_2 ? *static_cast<uint64_t*>(val_2) : 0;
