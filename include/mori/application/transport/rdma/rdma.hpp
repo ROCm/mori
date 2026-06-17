@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include <cassert>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -153,6 +154,9 @@ struct WorkQueueAttrs {
 struct RdmaEndpoint {
   RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
   RdmaEndpointHandle handle;
+  // Local provider capability. This is intentionally not part of RdmaEndpointHandle because it
+  // must not be serialized to peers; providers that do not populate it retain legacy behavior.
+  uint64_t maxMsgSize{std::numeric_limits<uint64_t>::max()};
   // TODO(@ditian12): we should use an opaque handle to reference the actual transport context
   // handles, for direct verbs it should be WorkQueueHandle/CompletionQueueHandle, for ib verbs, it
   // should be ibv structures

@@ -47,14 +47,18 @@ IBVerbsDeviceContext::~IBVerbsDeviceContext() {
 RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
   ibv_context* context = GetIbvContext();
   const ibv_device_attr_ex* deviceAttr = GetRdmaDevice()->GetDeviceAttr();
+  const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+  if (deviceAttr == nullptr || portAttr == nullptr || portAttr->max_msg_sz == 0) {
+    throw std::runtime_error("RDMA device max_msg_sz is unavailable");
+  }
 
   RdmaEndpoint endpoint;
   endpoint.vendorId = ToRdmaDeviceVendorId(deviceAttr->orig_attr.vendor_id);
+  endpoint.maxMsgSize = portAttr->max_msg_sz;
   endpoint.handle.psn = 0;
   endpoint.handle.portId = config.portId;
   endpoint.handle.maxSge = config.maxMsgSge;
 
-  const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
   assert(portAttr);
   if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
     endpoint.handle.ib.lid = portAttr->lid;
