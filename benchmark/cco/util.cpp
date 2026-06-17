@@ -371,18 +371,22 @@ void PerfFinalize(PerfContext* ctx) {
 void PerfResAlloc(PerfRes* res) {
   HIP_RUNTIME_CHECK(hipEventCreate(&res->start));
   HIP_RUNTIME_CHECK(hipEventCreate(&res->stop));
+  HIP_RUNTIME_CHECK(hipMalloc(&res->counter_d, 2 * sizeof(unsigned int)));
 }
 
 void PerfResFree(PerfRes* res) {
   HIP_RUNTIME_CHECK(hipEventDestroy(res->start));
   HIP_RUNTIME_CHECK(hipEventDestroy(res->stop));
+  if (res->counter_d) HIP_RUNTIME_CHECK(hipFree(res->counter_d));
 }
 
 float RunWarmupAndTimed(PerfRes& res, std::size_t warmup, std::size_t iters, LaunchFn launch) {
+  if (res.counter_d) HIP_RUNTIME_CHECK(hipMemset(res.counter_d, 0, 2 * sizeof(unsigned int)));
   launch(static_cast<int>(warmup));
   HIP_RUNTIME_CHECK(hipGetLastError());
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
+  if (res.counter_d) HIP_RUNTIME_CHECK(hipMemset(res.counter_d, 0, 2 * sizeof(unsigned int)));
   HIP_RUNTIME_CHECK(hipEventRecord(res.start, nullptr));
   launch(static_cast<int>(iters));
   HIP_RUNTIME_CHECK(hipGetLastError());

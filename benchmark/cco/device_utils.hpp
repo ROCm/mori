@@ -44,6 +44,25 @@ __device__ inline void lsa_copy_strided(T* __restrict__ dst, const T* __restrict
   }
 }
 
+// GPU-internal all-block barrier (single GPU, not cross-rank), matching shmem's
+// bw_cross_block_barrier_round so the LSA bw timed window includes the same
+// per-round sync. counter_d[0]=arrivals, counter_d[1]=phase; call from all
+// threads of all blocks with the same (counter_d, nblocks, i).
+__device__ inline void bw_cross_block_barrier_round(volatile unsigned int* counter_d, int nblocks,
+                                                    int i) {
+  __syncthreads();
+  if (linear_tid() == 0) {
+    __threadfence();
+    unsigned int c = atomicInc((unsigned int*)counter_d, 0xffffffffu);
+    if (c == static_cast<unsigned int>(nblocks * (i + 1) - 1)) {
+      counter_d[1] += 1u;
+    }
+    while (counter_d[1] != static_cast<unsigned int>(i + 1)) {
+    }
+  }
+  __syncthreads();
+}
+
 }  // namespace mori::cco::benchmark
 
 // CCO_GDA_DISPATCH is provided by mori/cco/cco_scale_out.hpp: GDA provider is
