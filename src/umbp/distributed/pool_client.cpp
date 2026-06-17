@@ -810,41 +810,8 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalSsdGet(const std::string& 
   return GetAttemptOutcome::kSuccess;
 }
 
-PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
-    const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
-    const std::vector<size_t>& sizes, const std::vector<std::optional<RoutePutResult>>& routes,
-    std::vector<PutEntryOutcome>* results) {
-  BatchPutPlan plan;
-  const size_t count = keys.size();
-  for (size_t i = 0; i < count; ++i) {
-    // Zero-size puts are meaningless: leave the result kFailed, never execute.
-    if (sizes[i] == 0) {
-      MORI_UMBP_WARN("[PoolClient] BatchPut: skipping zero-size put for key='{}'", keys[i]);
-      continue;
-    }
-    if (i >= routes.size() || !routes[i].has_value()) continue;
-    const auto& route = routes[i].value();
-    // Master-side dedup hit.
-    if (route.outcome == RoutePutOutcome::kAlreadyExists) {
-      (*results)[i] = PutEntryOutcome::kAlreadyExists;
-      continue;
-    }
-    if (route.node_id == config_.master_config.node_id) {
-      // Self-target: deferred (with its tier) so ExecuteBatchPutPlan can run the
-      // local memcpy inside the remote-DRAM submit..wait window.
-      plan.local_items.push_back(BatchPutItem{
-          .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
-      continue;
-    }
-    if (route.tier != TierType::DRAM && route.tier != TierType::HBM) continue;
-    plan.remote_groups[route.node_id].push_back(BatchPutItem{
-        .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
-  }
-  return plan;
-}
-
 // ---------------------------------------------------------------------------
-//  Put / Get hot paths
+//  BatchPut
 // ---------------------------------------------------------------------------
 
 bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
@@ -852,14 +819,6 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
   std::vector<const void*> srcs{src};
   std::vector<size_t> sizes{size};
   auto results = BatchPut(keys, srcs, sizes);
-  return !results.empty() && results[0];
-}
-
-bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
-  std::vector<std::string> keys{key};
-  std::vector<void*> dsts{dst};
-  std::vector<size_t> sizes{size};
-  auto results = BatchGet(keys, dsts, sizes);
   return !results.empty() && results[0];
 }
 
@@ -917,190 +876,37 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
   return results;
 }
 
-std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
-                                       const std::vector<void*>& dsts,
-                                       const std::vector<size_t>& sizes) {
-  const auto call_start = std::chrono::steady_clock::now();
-  std::vector<bool> results(keys.size(), false);
-  if (keys.size() != dsts.size() || keys.size() != sizes.size()) {
-    MORI_UMBP_ERROR("[PoolClient] BatchGet: vector length mismatch");
-    return results;
-  }
-  if (!initialized_) {
-    MORI_UMBP_ERROR("[PoolClient] BatchGet: client not initialized");
-    return results;
-  }
-
-  std::vector<std::optional<RouteGetResult>> routes;
-  std::unordered_set<std::string> excludes;
-  auto status = master_client_->BatchRouteGet(keys, excludes, &routes);
-  if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] BatchGet: BatchRouteGet failed: {}", status.error_message());
-    return results;
-  }
-  if (routes.size() < keys.size()) {
-    routes.resize(keys.size());
-  }
-
-  BatchGetPlan plan = PartitionBatchGetTargets(keys, dsts, sizes, routes);
-  ExecuteBatchGetPlan(plan, keys, dsts, sizes, &results);
-
-  const auto call_end = std::chrono::steady_clock::now();
-  const double seconds =
-      std::chrono::duration_cast<std::chrono::duration<double>>(call_end - call_start).count();
-  if (seconds > 0.0) {
-    auto split = ComputeBatchBandwidthBytes(results, sizes, routes, config_.master_config.node_id);
-    ObserveBatchBandwidth(*master_client_, split.local, seconds,
-                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
-                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "local");
-    ObserveBatchBandwidth(*master_client_, split.remote, seconds,
-                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
-                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "remote");
-  }
-  return results;
-}
-
-PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
-    const std::vector<std::string>& keys, const std::vector<void*>& dsts,
-    const std::vector<size_t>& sizes, const std::vector<std::optional<RouteGetResult>>& routes) {
-  BatchGetPlan plan;
-  for (size_t i = 0; i < keys.size(); ++i) {
-    // Zero-size gets are rejected before local fallback or remote read: an
-    // explicit skip is required here because a nullopt route below would
-    // otherwise fall through to a local read (result stays false).
+PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
+    const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
+    const std::vector<size_t>& sizes, const std::vector<std::optional<RoutePutResult>>& routes,
+    std::vector<PutEntryOutcome>* results) {
+  BatchPutPlan plan;
+  const size_t count = keys.size();
+  for (size_t i = 0; i < count; ++i) {
+    // Zero-size puts are meaningless: leave the result kFailed, never execute.
     if (sizes[i] == 0) {
-      MORI_UMBP_WARN("[PoolClient] BatchGet: skipping zero-size get for key='{}'", keys[i]);
+      MORI_UMBP_WARN("[PoolClient] BatchPut: skipping zero-size put for key='{}'", keys[i]);
       continue;
     }
-    if (i >= routes.size() || !routes[i].has_value()) {
-      if (peer_alloc_) plan.local_dram_indices.push_back(i);
-      continue;
-    }
+    if (i >= routes.size() || !routes[i].has_value()) continue;
     const auto& route = routes[i].value();
-    if (route.node_id == config_.master_config.node_id) {
-      // Self-target: both DRAM/HBM and SSD are deferred (collected as indices)
-      // so ExecuteBatchGetPlan can place them inside the remote-DRAM in-flight
-      // window in the overlap path.
-      if (route.tier == TierType::SSD) {
-        plan.local_ssd_indices.push_back(i);
-      } else {
-        plan.local_dram_indices.push_back(i);
-      }
+    // Master-side dedup hit.
+    if (route.outcome == RoutePutOutcome::kAlreadyExists) {
+      (*results)[i] = PutEntryOutcome::kAlreadyExists;
       continue;
     }
-    BatchGetItem item{.index = i,
-                      .key = &keys[i],
-                      .dst = const_cast<void*>(dsts[i]),
-                      .size = sizes[i],
-                      .route = route};
-    if (route.tier == TierType::SSD) {
-      plan.remote_ssd_groups[route.node_id].push_back(std::move(item));
-    } else {
-      plan.remote_dram_groups[route.node_id].push_back(std::move(item));
+    if (route.node_id == config_.master_config.node_id) {
+      // Self-target: deferred (with its tier) so ExecuteBatchPutPlan can run the
+      // local memcpy inside the remote-DRAM submit..wait window.
+      plan.local_items.push_back(BatchPutItem{
+          .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
+      continue;
     }
+    if (route.tier != TierType::DRAM && route.tier != TierType::HBM) continue;
+    plan.remote_groups[route.node_id].push_back(BatchPutItem{
+        .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
   }
   return plan;
-}
-
-void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
-                                     const std::vector<void*>& dsts,
-                                     const std::vector<size_t>& sizes, std::vector<bool>* results) {
-  // Parallel local DRAM reads: different threads handle different keys. Resolve
-  // is mutex-serialized in the allocator; the per-key memcpy in
-  // ExecuteLocalGet->LocalGetPages runs lock-free in parallel. results is
-  // std::vector<bool> (bit-packed) so threads write a temp buffer; merge serially.
-  auto run_local_dram = [&]() {
-    const auto& idx = plan.local_dram_indices;
-    if (idx.empty()) return;
-    const int nthr = LocalCopyThreads("UMBP_DRAM_READ_THREADS");
-    const auto t0 = std::chrono::steady_clock::now();
-    std::vector<char> ok(idx.size(), 0);
-    LocalParallelFor(idx.size(), nthr, [&](size_t k) {
-      const size_t i = idx[k];
-      if (ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
-          GetAttemptOutcome::kSuccess) {
-        ok[k] = 1;
-      }
-    });
-    size_t tot = 0;
-    for (size_t k = 0; k < idx.size(); ++k) {
-      if (ok[k]) {
-        (*results)[idx[k]] = true;
-        tot += sizes[idx[k]];
-      }
-    }
-    if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
-      double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
-                       std::chrono::steady_clock::now() - t0)
-                       .count();
-      MORI_UMBP_INFO("[LocalCopy] GET keys={} bytes={} threads={} elapsed_ms={:.3f} GiB_s={:.2f}",
-                     idx.size(), tot, nthr, sec * 1000.0,
-                     tot / (sec > 0 ? sec : 1e-12) / (1024.0 * 1024 * 1024));
-    }
-  };
-
-  // Local SSD self-target reads (deferred from partition): serial on this
-  // thread, reading straight into the user buffer (no staging / RDMA / lease).
-  // Independent per key, so its position in the schedule is correctness-neutral.
-  auto run_local_ssd = [&]() {
-    for (size_t i : plan.local_ssd_indices) {
-      if (ExecuteLocalSsdGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
-          GetAttemptOutcome::kSuccess) {
-        (*results)[i] = true;
-      }
-    }
-  };
-
-  auto run_remote_ssd = [&]() {
-    for (const auto& [node_id, items] : plan.remote_ssd_groups) {
-      ProcessRemoteSsdBatchGet(items, results);
-    }
-  };
-
-  const auto& remote_dram_groups = plan.remote_dram_groups;
-
-  // Zero-copy? The upper layer guarantees a batch is all-ZC or all-staging, so
-  // probe one remote-DRAM item's dst registration (unordered_map order is
-  // unspecified, but any item answers the all-or-nothing question).
-  const bool is_zc = !remote_dram_groups.empty() &&
-                     FindRegisteredMemory(remote_dram_groups.begin()->second.front().dst,
-                                          remote_dram_groups.begin()->second.front().size)
-                         .has_value();
-
-  if (!is_zc) {
-    // Staging (non-zero-copy), or no remote DRAM at all.  Order: local SSD, local
-    // DRAM, staging remote DRAM (per peer), remote SSD.  Staging must submit then
-    // IMMEDIATELY wait per peer: the in-flight holds staging_mutex_ from submit
-    // until the wait copies out of the shared staging_buffer_, so accumulating
-    // staging in-flights into a submit-all list would deadlock on that lock.
-    run_local_ssd();
-    run_local_dram();
-    for (const auto& [node_id, items] : remote_dram_groups) {
-      if (auto f = SubmitRemoteBatchGet(items, results, /*permit_staging=*/true)) {
-        WaitRemoteBatchGet(*f, results);  // immediate; releases staging_mutex_
-      }
-    }
-    run_remote_ssd();
-    return;
-  }
-
-  // Zero-copy remote DRAM: submit every peer (posted, not waited) to overlap
-  // wire time across peers, run local DRAM/SSD + remote SSD in that window, then
-  // wait all. On early/exceptional exit ~RemoteDramGetInFlight drains in-flight
-  // statuses (lifetime safety); the wait loop does failure mapping + backfill.
-  std::vector<std::unique_ptr<RemoteDramGetInFlight>> inflights;
-  inflights.reserve(remote_dram_groups.size());
-
-  for (const auto& [node_id, items] : remote_dram_groups) {
-    if (auto f = SubmitRemoteBatchGet(items, results, /*permit_staging=*/false)) {
-      inflights.push_back(std::move(f));
-    }
-  }
-  run_local_dram();
-  run_local_ssd();
-  // TODO(perf): remote SSD is still per-key serial (not yet optimized).
-  run_remote_ssd();
-  for (auto& f : inflights) WaitRemoteBatchGet(*f, results);
 }
 
 void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
@@ -1440,66 +1246,19 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
       for (uint64_t slot_id : *abort_slots) abort_req.add_slot_ids(slot_id);
       ::umbp::BatchAbortSlotsResponse abort_resp;
       grpc::ClientContext abort_ctx;
-      stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
+      // Best-effort: a failed abort just leaves the slots for the peer reaper to
+      // reclaim at pending_ttl. Warn to aid diagnosis but do not propagate.
+      auto abort_status = stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
+      if (!abort_status.ok()) {
+        MORI_UMBP_WARN(
+            "[PoolClient] AllocateRemotePutEntries: BatchAbortSlots({} slots) failed: {}",
+            abort_slots->size(), abort_status.error_message());
+      }
       abort_slots->clear();
     }
     return false;
   }
   return true;
-}
-
-std::vector<PoolClient::PairGroup> PoolClient::GroupTransfersByPair(
-    const std::vector<TransferInstruction>& active) {
-  std::vector<PairGroup> groups;
-  groups.reserve(active.size());
-  // Group by (local MR id, remote MR id); first appearance defines order.
-  std::unordered_map<PairKey, size_t, PairKeyHash> pair_to_group;
-  pair_to_group.reserve(active.size() * 2);
-
-  for (const auto& t : active) {
-    const PairKey key{t.local_desc.id, t.remote_desc.id};
-    auto it = pair_to_group.find(key);
-    size_t gi;
-    if (it == pair_to_group.end()) {
-      gi = groups.size();
-      pair_to_group.emplace(key, gi);
-      PairGroup g;
-      g.local_desc = t.local_desc;
-      g.remote_desc = t.remote_desc;
-      groups.push_back(std::move(g));
-    } else {
-      gi = it->second;
-    }
-    PairGroup& g = groups[gi];
-    const size_t lo = static_cast<size_t>(t.local_offset);
-    const size_t ro = static_cast<size_t>(t.remote_offset);
-    const size_t sz = static_cast<size_t>(t.size);
-    // Coalesce with the previous segment when BOTH local and remote are
-    // exactly contiguous.  This is NOT redundant with the backend's WR
-    // merging: the backend would fold these into the same WR either way, but
-    // doing it here shrinks the inner SG vector it has to sort/merge
-    // (O(M log M)) and allocate, which matters when M is large (big batch x
-    // pages).  Same bytes, so per-pair failure granularity is unchanged.
-    // The merged size must stay within uint32_t since the backend stores it
-    // in ibv_sge.length (matches its own WR-merge cap in common.cpp).
-    const bool can_coalesce =
-        !g.sizes.empty() && AdjacentNoOverflow(g.local_offsets.back(), g.sizes.back(), lo) &&
-        AdjacentNoOverflow(g.remote_offsets.back(), g.sizes.back(), ro) &&
-        g.sizes.back() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - sz;
-    if (can_coalesce) {
-      g.sizes.back() += sz;
-    } else {
-      g.local_offsets.push_back(lo);
-      g.remote_offsets.push_back(ro);
-      g.sizes.push_back(sz);
-    }
-    // De-dup contributing entries: a single entry's pages arrive
-    // consecutively within a pair, so a back() check suffices.
-    if (g.entry_indices.empty() || g.entry_indices.back() != t.entry_index) {
-      g.entry_indices.push_back(t.entry_index);
-    }
-  }
-  return groups;
 }
 
 bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, PeerConnection& peer,
@@ -1658,158 +1417,202 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
   }
 }
 
-bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
-                                         ::umbp::UMBPPeer::Stub* stub,
-                                         std::vector<RemoteGetEntry>* entries,
-                                         std::vector<bool>* results) {
-  entries->clear();
-  ::umbp::BatchResolveKeysRequest resolve_req;
-  for (const auto& item : items) resolve_req.add_keys(*item.key);
+// ---------------------------------------------------------------------------
+//  BatchGet
+// ---------------------------------------------------------------------------
 
-  ::umbp::BatchResolveKeysResponse resolve_resp;
-  grpc::ClientContext resolve_ctx;
-  auto resolve_status = stub->BatchResolveKeys(&resolve_ctx, resolve_req, &resolve_resp);
-  if (!resolve_status.ok() || resolve_resp.entries_size() != static_cast<int>(items.size())) {
-    MORI_UMBP_WARN("[PoolClient] BatchResolveKeys failed on {}: {}", items.front().route.node_id,
-                   resolve_status.error_message());
-    for (const auto& item : items) {
-      (*results)[item.index] = false;
-    }
-    return false;
-  }
-
-  entries->reserve(items.size());
-  for (size_t i = 0; i < items.size(); ++i) {
-    const auto& item = items[i];
-    const auto& resp_entry = resolve_resp.entries(static_cast<int>(i));
-    if (!resp_entry.found()) {
-      (*results)[item.index] = false;
-      continue;
-    }
-    if (resp_entry.size() != item.size) {
-      MORI_UMBP_WARN("[PoolClient] BatchGet: size mismatch for key='{}' (wanted {}, got {})",
-                     *item.key, item.size, resp_entry.size());
-      (*results)[item.index] = false;
-      continue;
-    }
-    PoolClient::SlotPlan plan = FromResolveKeyResponse(resp_entry);
-    if (!SizeMatchesAllocation(item.size, plan.pages.size(), plan.page_size)) {
-      MORI_UMBP_ERROR("[PoolClient] BatchGet: malformed slot for key='{}'", *item.key);
-      (*results)[item.index] = false;
-      continue;
-    }
-
-    RemoteGetEntry entry;
-    entry.result_index = item.index;
-    entry.item = &item;
-    entry.plan = std::move(plan);
-    entries->push_back(std::move(entry));
-  }
-
-  return !entries->empty();
+bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
+  std::vector<std::string> keys{key};
+  std::vector<void*> dsts{dst};
+  std::vector<size_t> sizes{size};
+  auto results = BatchGet(keys, dsts, sizes);
+  return !results.empty() && results[0];
 }
 
-bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, PeerConnection& peer,
-                                         std::vector<TransferInstruction>* transfers,
-                                         uint64_t* staging_bytes) {
-  transfers->clear();
-  uint64_t cursor = 0;
-
-  for (size_t idx = 0; idx < entries.size(); ++idx) {
-    auto& entry = entries[idx];
-
-    auto zero_copy = FindRegisteredMemory(entry.item->dst, entry.item->size);
-    if (zero_copy.has_value()) {
-      entry.zero_copy = zero_copy;
-      entry.use_staging = false;
-      entry.staging_offset = 0;
-    } else {
-      entry.zero_copy.reset();
-      entry.use_staging = true;
-      cursor = AlignUp(cursor, entry.plan.page_size);
-      const uint64_t aligned_size = AlignUp(entry.item->size, entry.plan.page_size);
-      if (cursor + aligned_size > config_.staging_buffer_size) {
-        MORI_UMBP_WARN(
-            "[PoolClient] BuildRemoteGetTransfers: staging buffer overflow at entry {}/{}, "
-            "key='{}' size={} aligned={} cursor={} cap={}",
-            idx, entries.size(),
-            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
-            entry.item ? entry.item->size : 0, aligned_size, cursor, config_.staging_buffer_size);
-        return false;
-      }
-      entry.staging_offset = cursor;
-      cursor += aligned_size;
-    }
-
-    mori::io::MemoryDesc local_desc{};
-    uint64_t base_offset = 0;
-    if (entry.use_staging) {
-      local_desc = staging_mem_;
-      base_offset = entry.staging_offset;
-    } else if (entry.zero_copy.has_value()) {
-      local_desc = entry.zero_copy->first;
-      base_offset = entry.zero_copy->second;
-    } else {
-      entry.failed = true;
-      continue;
-    }
-
-    // Hydrate + snapshot remote descs inside ONE peers_mutex_ window (see
-    // BuildRemotePutTransfers).
-    std::vector<TransferInstruction> entry_transfers;
-    entry_transfers.reserve(entry.plan.pages.size());
-    {
-      std::lock_guard<std::mutex> lock(peers_mutex_);
-      EnsureBufferDescsCachedLocked(peer, entry.plan.descs);
-      for (size_t p = 0; p < entry.plan.pages.size(); ++p) {
-        const auto& page = entry.plan.pages[p];
-        if (page.buffer_index >= peer.dram_memories.size() ||
-            !IsValidMemoryDesc(peer.dram_memories[page.buffer_index])) {
-          MORI_UMBP_ERROR(
-              "[PoolClient] BuildRemoteGetTransfers: invalid peer dram_memories slot, "
-              "key='{}' buffer_index={} peer_dram_size={} page_index={}",
-              (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
-              page.buffer_index, peer.dram_memories.size(), page.page_index);
-          entry.failed = true;
-          entry_transfers.clear();
-          break;
-        }
-        TransferInstruction instr;
-        instr.entry_index = idx;
-        instr.local_desc = local_desc;
-        instr.local_offset = base_offset + static_cast<uint64_t>(p) * entry.plan.page_size;
-        instr.remote_desc = peer.dram_memories[page.buffer_index];
-        instr.remote_offset = static_cast<uint64_t>(page.page_index) * entry.plan.page_size;
-        instr.size =
-            LogicalPageBytes(p, entry.plan.pages.size(), entry.plan.page_size, entry.item->size);
-        entry_transfers.push_back(std::move(instr));
-      }
-    }
-
-    if (!entry_transfers.empty()) {
-      transfers->insert(transfers->end(), entry_transfers.begin(), entry_transfers.end());
-    }
+std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
+                                       const std::vector<void*>& dsts,
+                                       const std::vector<size_t>& sizes) {
+  const auto call_start = std::chrono::steady_clock::now();
+  std::vector<bool> results(keys.size(), false);
+  if (keys.size() != dsts.size() || keys.size() != sizes.size()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGet: vector length mismatch");
+    return results;
+  }
+  if (!initialized_) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGet: client not initialized");
+    return results;
   }
 
-  *staging_bytes = cursor;
-  return true;
+  std::vector<std::optional<RouteGetResult>> routes;
+  std::unordered_set<std::string> excludes;
+  auto status = master_client_->BatchRouteGet(keys, excludes, &routes);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGet: BatchRouteGet failed: {}", status.error_message());
+    return results;
+  }
+  if (routes.size() < keys.size()) {
+    routes.resize(keys.size());
+  }
+
+  BatchGetPlan plan = PartitionBatchGetTargets(keys, dsts, sizes, routes);
+  ExecuteBatchGetPlan(plan, keys, dsts, sizes, &results);
+
+  const auto call_end = std::chrono::steady_clock::now();
+  const double seconds =
+      std::chrono::duration_cast<std::chrono::duration<double>>(call_end - call_start).count();
+  if (seconds > 0.0) {
+    auto split = ComputeBatchBandwidthBytes(results, sizes, routes, config_.master_config.node_id);
+    ObserveBatchBandwidth(*master_client_, split.local, seconds,
+                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
+                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "local");
+    ObserveBatchBandwidth(*master_client_, split.remote, seconds,
+                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
+                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "remote");
+  }
+  return results;
 }
 
-void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
-                                          std::vector<bool>* results) {
-  for (auto& entry : entries) {
-    if (entry.failed) {
-      (*results)[entry.result_index] = false;
+PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
+    const std::vector<std::string>& keys, const std::vector<void*>& dsts,
+    const std::vector<size_t>& sizes, const std::vector<std::optional<RouteGetResult>>& routes) {
+  BatchGetPlan plan;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    // Zero-size gets are rejected before local fallback or remote read: an
+    // explicit skip is required here because a nullopt route below would
+    // otherwise fall through to a local read (result stays false).
+    if (sizes[i] == 0) {
+      MORI_UMBP_WARN("[PoolClient] BatchGet: skipping zero-size get for key='{}'", keys[i]);
       continue;
     }
-    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
-                               {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
-    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
-                               {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
-    (*results)[entry.result_index] = true;
+    if (i >= routes.size() || !routes[i].has_value()) {
+      if (peer_alloc_) plan.local_dram_indices.push_back(i);
+      continue;
+    }
+    const auto& route = routes[i].value();
+    if (route.node_id == config_.master_config.node_id) {
+      // Self-target: both DRAM/HBM and SSD are deferred (collected as indices)
+      // so ExecuteBatchGetPlan can place them inside the remote-DRAM in-flight
+      // window in the overlap path.
+      if (route.tier == TierType::SSD) {
+        plan.local_ssd_indices.push_back(i);
+      } else {
+        plan.local_dram_indices.push_back(i);
+      }
+      continue;
+    }
+    BatchGetItem item{.index = i,
+                      .key = &keys[i],
+                      .dst = const_cast<void*>(dsts[i]),
+                      .size = sizes[i],
+                      .route = route};
+    if (route.tier == TierType::SSD) {
+      plan.remote_ssd_groups[route.node_id].push_back(std::move(item));
+    } else {
+      plan.remote_dram_groups[route.node_id].push_back(std::move(item));
+    }
   }
+  return plan;
+}
+
+void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
+                                     const std::vector<void*>& dsts,
+                                     const std::vector<size_t>& sizes, std::vector<bool>* results) {
+  // Parallel local DRAM reads: different threads handle different keys. Resolve
+  // is mutex-serialized in the allocator; the per-key memcpy in
+  // ExecuteLocalGet->LocalGetPages runs lock-free in parallel. results is
+  // std::vector<bool> (bit-packed) so threads write a temp buffer; merge serially.
+  auto run_local_dram = [&]() {
+    const auto& idx = plan.local_dram_indices;
+    if (idx.empty()) return;
+    const int nthr = LocalCopyThreads("UMBP_DRAM_READ_THREADS");
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<char> ok(idx.size(), 0);
+    LocalParallelFor(idx.size(), nthr, [&](size_t k) {
+      const size_t i = idx[k];
+      if (ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
+          GetAttemptOutcome::kSuccess) {
+        ok[k] = 1;
+      }
+    });
+    size_t tot = 0;
+    for (size_t k = 0; k < idx.size(); ++k) {
+      if (ok[k]) {
+        (*results)[idx[k]] = true;
+        tot += sizes[idx[k]];
+      }
+    }
+    if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
+      double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+      MORI_UMBP_INFO("[LocalCopy] GET keys={} bytes={} threads={} elapsed_ms={:.3f} GiB_s={:.2f}",
+                     idx.size(), tot, nthr, sec * 1000.0,
+                     tot / (sec > 0 ? sec : 1e-12) / (1024.0 * 1024 * 1024));
+    }
+  };
+
+  // Local SSD self-target reads (deferred from partition): serial on this
+  // thread, reading straight into the user buffer (no staging / RDMA / lease).
+  // Independent per key, so its position in the schedule is correctness-neutral.
+  auto run_local_ssd = [&]() {
+    for (size_t i : plan.local_ssd_indices) {
+      if (ExecuteLocalSsdGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
+          GetAttemptOutcome::kSuccess) {
+        (*results)[i] = true;
+      }
+    }
+  };
+
+  auto run_remote_ssd = [&]() {
+    for (const auto& [node_id, items] : plan.remote_ssd_groups) {
+      ProcessRemoteSsdBatchGet(items, results);
+    }
+  };
+
+  const auto& remote_dram_groups = plan.remote_dram_groups;
+
+  // Zero-copy? The upper layer guarantees a batch is all-ZC or all-staging, so
+  // probe one remote-DRAM item's dst registration (unordered_map order is
+  // unspecified, but any item answers the all-or-nothing question).
+  const bool is_zc = !remote_dram_groups.empty() &&
+                     FindRegisteredMemory(remote_dram_groups.begin()->second.front().dst,
+                                          remote_dram_groups.begin()->second.front().size)
+                         .has_value();
+
+  if (!is_zc) {
+    // Staging (non-zero-copy), or no remote DRAM at all.  Order: local SSD, local
+    // DRAM, staging remote DRAM (per peer), remote SSD.  Staging must submit then
+    // IMMEDIATELY wait per peer: the in-flight holds staging_mutex_ from submit
+    // until the wait copies out of the shared staging_buffer_, so accumulating
+    // staging in-flights into a submit-all list would deadlock on that lock.
+    run_local_ssd();
+    run_local_dram();
+    for (const auto& [node_id, items] : remote_dram_groups) {
+      if (auto f = SubmitRemoteBatchGet(items, results, /*permit_staging=*/true)) {
+        WaitRemoteBatchGet(*f, results);  // immediate; releases staging_mutex_
+      }
+    }
+    run_remote_ssd();
+    return;
+  }
+
+  // Zero-copy remote DRAM: submit every peer (posted, not waited) to overlap
+  // wire time across peers, run local DRAM/SSD + remote SSD in that window, then
+  // wait all. On early/exceptional exit ~RemoteDramGetInFlight drains in-flight
+  // statuses (lifetime safety); the wait loop does failure mapping + backfill.
+  std::vector<std::unique_ptr<RemoteDramGetInFlight>> inflights;
+  inflights.reserve(remote_dram_groups.size());
+
+  for (const auto& [node_id, items] : remote_dram_groups) {
+    if (auto f = SubmitRemoteBatchGet(items, results, /*permit_staging=*/false)) {
+      inflights.push_back(std::move(f));
+    }
+  }
+  run_local_dram();
+  run_local_ssd();
+  // TODO(perf): remote SSD is still per-key serial (not yet optimized).
+  run_remote_ssd();
+  for (auto& f : inflights) WaitRemoteBatchGet(*f, results);
 }
 
 std::unique_ptr<PoolClient::RemoteDramGetInFlight> PoolClient::SubmitRemoteBatchGet(
@@ -1964,6 +1767,222 @@ void PoolClient::WaitRemoteBatchGet(RemoteDramGetInFlight& f, std::vector<bool>*
 
   FinalizeRemoteGetEntries(f.entries, results);
 }
+
+bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
+                                         ::umbp::UMBPPeer::Stub* stub,
+                                         std::vector<RemoteGetEntry>* entries,
+                                         std::vector<bool>* results) {
+  entries->clear();
+  ::umbp::BatchResolveKeysRequest resolve_req;
+  for (const auto& item : items) resolve_req.add_keys(*item.key);
+
+  ::umbp::BatchResolveKeysResponse resolve_resp;
+  grpc::ClientContext resolve_ctx;
+  auto resolve_status = stub->BatchResolveKeys(&resolve_ctx, resolve_req, &resolve_resp);
+  if (!resolve_status.ok() || resolve_resp.entries_size() != static_cast<int>(items.size())) {
+    MORI_UMBP_WARN("[PoolClient] BatchResolveKeys failed on {}: {}", items.front().route.node_id,
+                   resolve_status.error_message());
+    for (const auto& item : items) {
+      (*results)[item.index] = false;
+    }
+    return false;
+  }
+
+  entries->reserve(items.size());
+  for (size_t i = 0; i < items.size(); ++i) {
+    const auto& item = items[i];
+    const auto& resp_entry = resolve_resp.entries(static_cast<int>(i));
+    if (!resp_entry.found()) {
+      (*results)[item.index] = false;
+      continue;
+    }
+    if (resp_entry.size() != item.size) {
+      MORI_UMBP_WARN("[PoolClient] BatchGet: size mismatch for key='{}' (wanted {}, got {})",
+                     *item.key, item.size, resp_entry.size());
+      (*results)[item.index] = false;
+      continue;
+    }
+    PoolClient::SlotPlan plan = FromResolveKeyResponse(resp_entry);
+    if (!SizeMatchesAllocation(item.size, plan.pages.size(), plan.page_size)) {
+      MORI_UMBP_ERROR("[PoolClient] BatchGet: malformed slot for key='{}'", *item.key);
+      (*results)[item.index] = false;
+      continue;
+    }
+
+    RemoteGetEntry entry;
+    entry.result_index = item.index;
+    entry.item = &item;
+    entry.plan = std::move(plan);
+    entries->push_back(std::move(entry));
+  }
+
+  return !entries->empty();
+}
+
+bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, PeerConnection& peer,
+                                         std::vector<TransferInstruction>* transfers,
+                                         uint64_t* staging_bytes) {
+  transfers->clear();
+  uint64_t cursor = 0;
+
+  for (size_t idx = 0; idx < entries.size(); ++idx) {
+    auto& entry = entries[idx];
+
+    auto zero_copy = FindRegisteredMemory(entry.item->dst, entry.item->size);
+    if (zero_copy.has_value()) {
+      entry.zero_copy = zero_copy;
+      entry.use_staging = false;
+      entry.staging_offset = 0;
+    } else {
+      entry.zero_copy.reset();
+      entry.use_staging = true;
+      cursor = AlignUp(cursor, entry.plan.page_size);
+      const uint64_t aligned_size = AlignUp(entry.item->size, entry.plan.page_size);
+      if (cursor + aligned_size > config_.staging_buffer_size) {
+        MORI_UMBP_WARN(
+            "[PoolClient] BuildRemoteGetTransfers: staging buffer overflow at entry {}/{}, "
+            "key='{}' size={} aligned={} cursor={} cap={}",
+            idx, entries.size(),
+            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+            entry.item ? entry.item->size : 0, aligned_size, cursor, config_.staging_buffer_size);
+        return false;
+      }
+      entry.staging_offset = cursor;
+      cursor += aligned_size;
+    }
+
+    mori::io::MemoryDesc local_desc{};
+    uint64_t base_offset = 0;
+    if (entry.use_staging) {
+      local_desc = staging_mem_;
+      base_offset = entry.staging_offset;
+    } else if (entry.zero_copy.has_value()) {
+      local_desc = entry.zero_copy->first;
+      base_offset = entry.zero_copy->second;
+    } else {
+      entry.failed = true;
+      continue;
+    }
+
+    // Hydrate + snapshot remote descs inside ONE peers_mutex_ window (see
+    // BuildRemotePutTransfers).
+    std::vector<TransferInstruction> entry_transfers;
+    entry_transfers.reserve(entry.plan.pages.size());
+    {
+      std::lock_guard<std::mutex> lock(peers_mutex_);
+      EnsureBufferDescsCachedLocked(peer, entry.plan.descs);
+      for (size_t p = 0; p < entry.plan.pages.size(); ++p) {
+        const auto& page = entry.plan.pages[p];
+        if (page.buffer_index >= peer.dram_memories.size() ||
+            !IsValidMemoryDesc(peer.dram_memories[page.buffer_index])) {
+          MORI_UMBP_ERROR(
+              "[PoolClient] BuildRemoteGetTransfers: invalid peer dram_memories slot, "
+              "key='{}' buffer_index={} peer_dram_size={} page_index={}",
+              (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+              page.buffer_index, peer.dram_memories.size(), page.page_index);
+          entry.failed = true;
+          entry_transfers.clear();
+          break;
+        }
+        TransferInstruction instr;
+        instr.entry_index = idx;
+        instr.local_desc = local_desc;
+        instr.local_offset = base_offset + static_cast<uint64_t>(p) * entry.plan.page_size;
+        instr.remote_desc = peer.dram_memories[page.buffer_index];
+        instr.remote_offset = static_cast<uint64_t>(page.page_index) * entry.plan.page_size;
+        instr.size =
+            LogicalPageBytes(p, entry.plan.pages.size(), entry.plan.page_size, entry.item->size);
+        entry_transfers.push_back(std::move(instr));
+      }
+    }
+
+    if (!entry_transfers.empty()) {
+      transfers->insert(transfers->end(), entry_transfers.begin(), entry_transfers.end());
+    }
+  }
+
+  *staging_bytes = cursor;
+  return true;
+}
+
+void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
+                                          std::vector<bool>* results) {
+  for (auto& entry : entries) {
+    if (entry.failed) {
+      (*results)[entry.result_index] = false;
+      continue;
+    }
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
+                               {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
+                               {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
+    (*results)[entry.result_index] = true;
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Remote DRAM transfer grouping (shared by Put and Get)
+// ---------------------------------------------------------------------------
+
+std::vector<PoolClient::PairGroup> PoolClient::GroupTransfersByPair(
+    const std::vector<TransferInstruction>& active) {
+  std::vector<PairGroup> groups;
+  groups.reserve(active.size());
+  // Group by (local MR id, remote MR id); first appearance defines order.
+  std::unordered_map<PairKey, size_t, PairKeyHash> pair_to_group;
+  pair_to_group.reserve(active.size() * 2);
+
+  for (const auto& t : active) {
+    const PairKey key{t.local_desc.id, t.remote_desc.id};
+    auto it = pair_to_group.find(key);
+    size_t gi;
+    if (it == pair_to_group.end()) {
+      gi = groups.size();
+      pair_to_group.emplace(key, gi);
+      PairGroup g;
+      g.local_desc = t.local_desc;
+      g.remote_desc = t.remote_desc;
+      groups.push_back(std::move(g));
+    } else {
+      gi = it->second;
+    }
+    PairGroup& g = groups[gi];
+    const size_t lo = static_cast<size_t>(t.local_offset);
+    const size_t ro = static_cast<size_t>(t.remote_offset);
+    const size_t sz = static_cast<size_t>(t.size);
+    // Coalesce with the previous segment when BOTH local and remote are
+    // exactly contiguous.  This is NOT redundant with the backend's WR
+    // merging: the backend would fold these into the same WR either way, but
+    // doing it here shrinks the inner SG vector it has to sort/merge
+    // (O(M log M)) and allocate, which matters when M is large (big batch x
+    // pages).  Same bytes, so per-pair failure granularity is unchanged.
+    // The merged size must stay within uint32_t since the backend stores it
+    // in ibv_sge.length (matches its own WR-merge cap in common.cpp).
+    const bool can_coalesce =
+        !g.sizes.empty() && AdjacentNoOverflow(g.local_offsets.back(), g.sizes.back(), lo) &&
+        AdjacentNoOverflow(g.remote_offsets.back(), g.sizes.back(), ro) &&
+        g.sizes.back() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - sz;
+    if (can_coalesce) {
+      g.sizes.back() += sz;
+    } else {
+      g.local_offsets.push_back(lo);
+      g.remote_offsets.push_back(ro);
+      g.sizes.push_back(sz);
+    }
+    // De-dup contributing entries: a single entry's pages arrive
+    // consecutively within a pair, so a back() check suffices.
+    if (g.entry_indices.empty() || g.entry_indices.back() != t.entry_index) {
+      g.entry_indices.push_back(t.entry_index);
+    }
+  }
+  return groups;
+}
+
+// ---------------------------------------------------------------------------
+//  Cluster-wide existence check
+// ---------------------------------------------------------------------------
 
 bool PoolClient::Exists(const std::string& key) {
   auto v = BatchExists({key});
