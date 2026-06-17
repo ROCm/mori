@@ -57,6 +57,11 @@ namespace application {
 
 enum TransportType { RDMA = 0, P2P = 1, SDMA = 2 };
 
+// Atomic internal buffer configuration. Defined here (device-safe) rather than in
+// the host transport/rdma/rdma.hpp so device kernels (e.g. shmem_ibgda_kernels) can
+// use it without pulling in the host RDMA stack (and system verbs.h/mlx5dv.h).
+static constexpr size_t ATOMIC_IBUF_SLOT_SIZE = 8;  // Each atomic ibuf slot is 8 bytes
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      RDMA Types (device-safe)                                  */
 /* ---------------------------------------------------------------------------------------------- */

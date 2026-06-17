@@ -29,7 +29,15 @@
 #include <variant>
 #include <vector>
 
+// This header is compiled both into host TUs and into the device .hip kernels.
+// The device side only needs application::SymmMemObjPtr (a device-safe POD from
+// application_device_types.hpp); the full application.hpp pulls the host RDMA
+// stack -> system mlx5dv.h/verbs.h, which must stay out of device compiles.
+#if !defined(__HIPCC__) && !defined(__CUDACC__)
 #include "mori/application/application.hpp"
+#else
+#include "mori/application/application_device_types.hpp"
+#endif
 #include "mori/core/profiler/constants.hpp"
 #include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/hip_compat.hpp"

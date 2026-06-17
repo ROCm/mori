@@ -58,6 +58,11 @@
 #ifndef __BNXT_RE_HSI_H__
 #define __BNXT_RE_HSI_H__
 
+// Self-contained: the __u8/__u16/__u32/__u64 used below used to arrive via the
+// system <infiniband/verbs.h> that the core RDMA path dragged in. Now that the
+// device path is verbs-free, pull the kernel fixed-width types directly.
+#include <linux/types.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif

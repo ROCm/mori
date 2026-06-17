@@ -73,8 +73,8 @@ RdmaDeviceVendorId ToRdmaDeviceVendorId(T v) {
 // UDP sport configuration constants for multi-provider support
 static constexpr uint32_t RDMA_UDP_SPORT_ARRAY_SIZE = 4;
 
-// Atomic internal buffer configuration
-static constexpr size_t ATOMIC_IBUF_SLOT_SIZE = 8;  // Each atomic ibuf slot is 8 bytes
+// ATOMIC_IBUF_SLOT_SIZE is defined in application_device_types.hpp (included above)
+// so device kernels can use it without pulling the host RDMA stack.
 
 /* -------------------------------------------------------------------------- */
 /*                             Rdma Data Structure                            */
