@@ -231,6 +231,7 @@ jobs:
       - name: MORI-CPP shmem (P2P)
         run: |
           $CT exec $CONTAINER bash -c "
+            set -e
             cd $GITHUB_WORKSPACE
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
@@ -243,6 +244,7 @@ jobs:
       - name: MORI-CPP shmem (IBGDA)
         run: |
           $CT exec $CONTAINER bash -c "
+            set -e
             cd $GITHUB_WORKSPACE
             MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
             MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread

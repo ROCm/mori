@@ -32,6 +32,11 @@ using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
 
+// Counts failed verifications so main() can return non-zero and fail CI. Only the
+// RDMA put-correctness tests feed this; the P2P-only direct-access test is left
+// out since it is expected to differ under MORI_DISABLE_P2P (IBGDA).
+static int gFailures = 0;
+
 // ============================================================================
 // Test Suite Overview
 // ============================================================================
@@ -340,6 +345,7 @@ void Test1_LegacyAPI(int myPe) {
     }
     if (!success) {
       printf("✗ Legacy API test FAILED!\n");
+      gFailures++;
     }
   }
 
@@ -390,6 +396,7 @@ void Test1_LegacyAPI_Block(int myPe) {
     }
     if (!success) {
       printf("✗ Legacy block API test FAILED!\n");
+      gFailures++;
     }
   }
 
@@ -450,6 +457,7 @@ void Test2_PureAddressAPI(int myPe) {
     }
     if (!success) {
       printf("✗ Pure address API test FAILED!\n");
+      gFailures++;
     }
   }
 
@@ -510,6 +518,7 @@ void Test2_PureAddressAPI_Block(int myPe) {
     }
     if (!success) {
       printf("✗ Pure address block API test FAILED!\n");
+      gFailures++;
     }
   }
 
@@ -579,6 +588,7 @@ void Test3_LargeMultiChunk(int myPe) {
     }
     if (!success) {
       printf("✗ Large multi-chunk allocation test FAILED!\n");
+      gFailures++;
     }
   }
 
@@ -636,6 +646,7 @@ void Test4_MixedMallocFree(int myPe) {
   if (testValB != 0xBBBB0000 + myPe) {
     printf("PE %d: ✗ Buffer B corrupted after freeing A! Got 0x%x, expected 0x%x\n", myPe, testValB,
            0xBBBB0000 + myPe);
+    gFailures++;
   } else {
     if (myPe == 0) {
       printf("✓ Buffer B still valid after freeing A (reference counting works!)\n");
@@ -828,5 +839,6 @@ void ConcurrentPutThread() {
 
 int main(int argc, char* argv[]) {
   ConcurrentPutThread();
-  return 0;
+  // Non-zero exit on any failed verification so mpirun/CI catches regressions.
+  return gFailures > 0 ? 1 : 0;
 }
