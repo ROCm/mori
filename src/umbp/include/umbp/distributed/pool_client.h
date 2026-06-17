@@ -306,12 +306,10 @@ class PoolClient {
                                         const std::vector<size_t>& sizes,
                                         const std::vector<std::optional<RouteGetResult>>& routes);
   // Execute a BatchGetPlan: local DRAM/SSD, remote SSD, and the remote-DRAM
-  // submit/wait arrangement.  Zero-copy remote DRAM always submits all peers then
-  // waits all (multi-peer overlap); the overlap window (local DRAM/SSD + remote
-  // SSD run INSIDE that submit..wait gap) is used only when overlap is enabled
-  // and the batch is within the max-batch threshold, otherwise local/SSD run
-  // first.  Staging (non-zero-copy) runs per peer serially (submit -> wait).
-  // Reads the plan; writes per-key outcomes into *results.
+  // submit/wait arrangement.  Zero-copy remote DRAM submits all peers, runs local
+  // DRAM/SSD + remote SSD INSIDE that submit..wait gap (so they overlap the DRAM
+  // wire), then waits all peers.  Staging (non-zero-copy) runs per peer serially
+  // (submit -> wait).  Reads the plan; writes per-key outcomes into *results.
   void ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                            const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
                            std::vector<bool>* results);

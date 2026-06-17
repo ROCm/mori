@@ -282,44 +282,6 @@ bool SsdStartupDiscardEnabled() {
   return !(s == "0" || s == "false" || s == "FALSE" || s == "off");
 }
 
-// BatchGet local/SSD-in-window overlap switch (default on).  Zero-copy remote
-// DRAM always submits all peers before waiting (multi-peer overlap); this knob
-// only controls whether local DRAM/SSD + remote SSD additionally run INSIDE that
-// in-flight window (see ExecuteBatchGetPlan).  Set UMBP_BATCHGET_OVERLAP=0/false/
-// off to keep local/SSD out of the window (A/B + rollback hook).
-bool BatchGetOverlapEnabled() {
-  static const bool v = []() -> bool {
-    const char* e = std::getenv("UMBP_BATCHGET_OVERLAP");
-    if (e == nullptr) return true;
-    const std::string s(e);
-    return !(s == "0" || s == "false" || s == "FALSE" || s == "off");
-  }();
-  return v;
-}
-
-// Max BatchGet size (key count) for which local DRAM/SSD + remote SSD run INSIDE
-// the zero-copy remote-DRAM in-flight window.  Above it, local/SSD run before the
-// submit instead (out of the window) — but zero-copy remote DRAM still does
-// submit-all/wait-all, so this is NOT a full fall-back to a synchronous baseline.
-// Rationale: overlapping local DRAM memcpy with the remote DRAM RDMA wire is a
-// net win at small/medium batch (latency-bound) but a small net loss at large
-// batch, where the local copy threads contend with the RDMA DMA for host
-// memory / PCIe bandwidth and the hidden local time is tiny relative to the wire
-// time (see docs/perf/overlap/NOTES.md, mixed_tier: +4-5% <=128, -3% at 256).
-// Default 128 (solidly positive; the +/-0 crossover is ~192-224).  Set
-// UMBP_BATCHGET_OVERLAP_MAX_BATCH=0 (or negative) for no limit.
-int64_t BatchGetOverlapMaxBatch() {
-  static const int64_t v = [] {
-    const char* e = std::getenv("UMBP_BATCHGET_OVERLAP_MAX_BATCH");
-    if (e == nullptr) return static_cast<int64_t>(128);
-    char* end = nullptr;
-    const long long parsed = std::strtoll(e, &end, 10);
-    if (end == e) return static_cast<int64_t>(128);  // unparseable -> default
-    return static_cast<int64_t>(parsed);
-  }();
-  return v;
-}
-
 // Total attempts for a remote SSD get.  Retryable outcomes (kRetry) are
 // NO_SLOT (transient slot exhaustion, no slot claimed) and a reader-local lease
 // expiry.  Defaults to 1 (no retry); operators opt into bounded retry to absorb
@@ -1153,25 +1115,16 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
     return;
   }
 
-  // Zero-copy remote DRAM: submit every peer (posted, not waited) before waiting
-  // any, so multi-peer wire time overlaps.  Overlap eligibility (S2: also put
-  // local DRAM/SSD + remote SSD INSIDE the in-flight window) requires the env on
-  // and the batch not larger than the max-batch threshold — large batches
-  // regress because the local copy contends with the RDMA DMA for memory/PCIe
-  // bandwidth (see BatchGetOverlapMaxBatch).  Below threshold the window is used;
-  // above it local/SSD run first (out of the window) but remote DRAM still does
-  // submit-all/wait-all.
-  bool overlap_window = false;
-  if (BatchGetOverlapEnabled()) {
-    const int64_t max_batch = BatchGetOverlapMaxBatch();
-    overlap_window = max_batch <= 0 || static_cast<int64_t>(keys.size()) <= max_batch;
-  }
-
+  // Zero-copy remote DRAM: submit every peer (posted, not waited) so multi-peer
+  // wire time overlaps, run local DRAM/SSD + remote SSD INSIDE that in-flight
+  // window (local memcpy / SSD use CPU / local-mem / SSD resources disjoint from
+  // the NIC, so they overlap the DRAM wire), then wait all peers.
   std::vector<std::unique_ptr<RemoteDramGetInFlight>> inflights;
   inflights.reserve(remote_dram_groups.size());
-  // RAII drain: guarantee every posted in-flight is waited even on an
-  // exceptional/early exit (e.g. std::bad_alloc), so no posted TransferStatus is
-  // left referenced by the backend CQ callback after this scope.
+  // Cleanup-only RAII: on an exceptional/early exit, Wait() any still-in-flight
+  // status so the backend CQ callback isn't left referencing freed memory.  It
+  // does NOT do failure mapping or result backfill (the normal path's
+  // WaitRemoteBatchGet does that) — it only makes status lifetime safe.
   struct InFlightDrainGuard {
     std::vector<std::unique_ptr<RemoteDramGetInFlight>>& v;
     ~InFlightDrainGuard() {
@@ -1184,30 +1137,16 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
     }
   } drain_guard{inflights};
 
-  if (overlap_window) {
-    // Submit every peer, run local/SSD inside the in-flight window, then wait all.
-    for (const auto& [node_id, items] : remote_dram_groups) {
-      if (auto f = SubmitRemoteBatchGet(items, results, /*permit_staging=*/false)) {
-        inflights.push_back(std::move(f));
-      }
+  for (const auto& [node_id, items] : remote_dram_groups) {
+    if (auto f = SubmitRemoteBatchGet(items, results, /*permit_staging=*/false)) {
+      inflights.push_back(std::move(f));
     }
-    run_local_dram();
-    run_local_ssd();
-    run_remote_ssd();
-    for (auto& f : inflights) WaitRemoteBatchGet(*f, results);
-  } else {
-    // Local/SSD run BEFORE the submit (out of the window), but remote DRAM still
-    // submits all peers before waiting any (multi-peer overlap, no contention).
-    run_local_ssd();
-    run_local_dram();
-    for (const auto& [node_id, items] : remote_dram_groups) {
-      if (auto f = SubmitRemoteBatchGet(items, results, /*permit_staging=*/false)) {
-        inflights.push_back(std::move(f));
-      }
-    }
-    for (auto& f : inflights) WaitRemoteBatchGet(*f, results);
-    run_remote_ssd();
   }
+  run_local_dram();
+  run_local_ssd();
+  // TODO(perf): remote SSD is still per-key serial (not yet optimized).
+  run_remote_ssd();
+  for (auto& f : inflights) WaitRemoteBatchGet(*f, results);
 }
 
 void PoolClient::ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items,
@@ -1557,7 +1496,7 @@ void PoolClient::ExecuteRemotePutTransfers(std::vector<RemotePutEntry>& entries,
   // groups return immediately.  A non-success group fails ALL its
   // contributing keys (per-item AND semantics — a key fails if any of its
   // pairs fail).  NOTE: this does not by itself prove safety of backend
-  // partial-post / status-lifetime corner cases (see docs/perf NOTES).
+  // partial-post / status-lifetime corner cases.
   for (size_t g = 0; g < G; ++g) {
     statuses[g].Wait();
     if (statuses[g].Succeeded()) continue;
