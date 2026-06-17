@@ -29,7 +29,7 @@ lspci | grep -iE "broadcom.*thor|bnxt"         && echo "→ thor2"
 
 Use the container name from the user's args if provided; ask if not.
 
-Default image: `rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0`
+Default image: `rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0`
 (use this unless the user specifies another).
 
 Check if the container already exists:
@@ -80,13 +80,12 @@ sudo docker run \
 
 Notes:
 - `--network=host` + `--device=/dev/infiniband` required for RDMA visibility.
-- `--ulimit memlock=-1:-1` — RDMA pins memory when creating QPs. Without it some
-  NICs fail to come up under the parallel `mori check` mesh (rows/cols of `✗`).
-- `-v /sys/kernel/config` + `-v /sys/kernel/debug` — **required for bnxt (Broadcom)**.
-  `--privileged` alone does NOT propagate these kernel filesystems into the
-  container. Without them `mori check` Step 3 (DCQCN) can't read CC state and
-  `mori setup` can't write congestion-control config via configfs. If the host
-  itself hasn't mounted them, run on the host first:
+- `--ulimit memlock=-1:-1` — RDMA pins memory when creating QPs; required for the
+  parallel `mori check` bandwidth mesh.
+- `-v /sys/kernel/config` + `-v /sys/kernel/debug` — **required for bnxt (Broadcom)**:
+  `mori check` (DCQCN) and `mori setup` read/write congestion control via configfs.
+  `--privileged` does not propagate these kernel filesystems on its own. If the host
+  hasn't mounted them, mount on the host first:
   `sudo mount -t configfs none /sys/kernel/config; sudo mount -t debugfs none /sys/kernel/debug`.
 - `--rm` — data outside mounted volumes is lost on stop.
 
@@ -111,9 +110,9 @@ Package roles:
 - `wget unzip ca-certificates curl` — used by the NIC userspace install steps (Step 3a/3b).
 - `libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler` — **mori build deps**:
   the build defaults to `BUILD_UMBP=ON`, whose CMake step needs gRPC headers
-  (`grpcpp/grpcpp.h`). Without them `pip install .` fails at configure time. The
-  remaining build tooling (`cmake`, `ninja`, `pybind11`) is pulled in automatically
-  by `pyproject.toml`'s build isolation, so it doesn't need to be in the image.
+  (`grpcpp/grpcpp.h`). The remaining build tooling (`cmake`, `ninja`, `pybind11`) is
+  pulled in automatically by `pyproject.toml`'s build isolation, so it doesn't need
+  to be in the image.
 
 ---
 
@@ -195,9 +194,9 @@ nicctl --version
 
 **Skip if NIC type is not `thor2` / bnxt.**
 
-A fresh container needs three things for the bnxt path of `mori check` / `mori setup`
-to run clean: (1) the **RoCE userspace lib** (`libbnxt_re`), (2) a **recent
-`niccli`**, and (3) **`dcb`** (from `iproute2`).
+The bnxt path of `mori check` / `mori setup` needs two NIC-specific pieces installed
+here: (1) the **RoCE userspace lib** (`libbnxt_re`) and (2) a **recent `niccli`**.
+(`dcb`, the third dependency, comes with `iproute2` from Step 2 — just verified in 3b.4.)
 
 ### 3b.1 — Detect host bnxt version (match the userspace lib to it)
 
@@ -213,8 +212,6 @@ modinfo -F version bnxt_re 2>/dev/null || cat /sys/module/bnxt_re/version
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c '
 set -e
-apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public \
     -o /etc/apt/keyrings/broadcom-nic.asc
@@ -234,12 +231,10 @@ ldconfig
 > Replace `235.2.86.0` with the version matching the host (3b.1). If that exact
 > version is gone from the repo, pick the nearest one from `apt-cache madison bnxt-rocelib`.
 
-### 3b.3 — Install a recent `niccli` (MUST support the `qos` subcommand)
+### 3b.3 — Install a recent `niccli` (must support the `qos` subcommand)
 
-**Critical:** old `niccli` (e.g. 233.x) has **no `qos` subcommand**. `mori check`
-Step 2 then parses niccli's error/help text, finds no lossless TC, and falsely
-reports `[FAIL] ... no lossless TC configured — PFC not active`. Use a niccli whose
-version tracks the firmware (236.x / 237.x for BCM57608). Parameterize the version:
+`mori check` Step 2 uses `niccli ... qos`, so install a niccli whose version tracks
+the firmware (236.x / 237.x for BCM57608). Parameterize the version:
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c '
@@ -247,11 +242,10 @@ set -e
 NICCLI_VER=237.1.145.0          # deb version
 NICCLI_PKG=237.1.148.0          # BRCM_<this> path segment in the URL
 URL="https://docs.broadcom.com/docs-and-downloads/ethernet-network-adapters/NXE/BRCM_${NICCLI_PKG}/niccli/Linux/niccli-${NICCLI_VER}_linux.zip"
-apt-get install -y unzip wget
 cd /tmp && wget -q -O niccli.zip "$URL" && unzip -o -q niccli.zip -d niccli
 dpkg -i "$(find ./niccli -name "niccli_*_x86_64.deb" | head -1)"
 niccli -l | head            # must list all NICs
-niccli -i 1 qos --ingress --cosq --show | head   # must print the CoSQ table, NOT an error
+niccli -i 1 qos --ingress --cosq --show | head   # should print the CoSQ table (TC/State/Mode)
 '
 ```
 
@@ -259,13 +253,13 @@ niccli -i 1 qos --ingress --cosq --show | head   # must print the CoSQ table, NO
 > `/opt/niccli` (self-contained). You can `sudo docker cp /opt/niccli $CONTAINER_NAME:/opt/`
 > then `docker exec $CONTAINER_NAME ln -sf /opt/niccli/niccli /usr/bin/niccli`.
 
-### 3b.4 — Install `dcb` (iproute2), needed by `mori setup`
+### 3b.4 — `dcb` (iproute2), needed by `mori setup`
 
-`mori setup` configures bnxt PFC/ETS via `dcb`. Without it: `[FAIL] bnxt devices
-found but dcb not available`.
+`mori setup` configures bnxt PFC/ETS via `dcb`, which ships with `iproute2`
+(installed in Step 2). Verify it's present:
 
 ```bash
-sudo docker exec $CONTAINER_NAME bash -c "apt-get install -y iproute2 && command -v dcb"
+sudo docker exec $CONTAINER_NAME bash -c "command -v dcb"
 ```
 
 > `mori setup` does host-level NIC configuration (PFC/ETS on the netdev via `dcb`,
@@ -288,9 +282,8 @@ pip install .
 ```
 
 **UMBP / gRPC:** the build defaults to `BUILD_UMBP=ON`, whose CMake step needs gRPC
-headers (`grpcpp/grpcpp.h`). Those are installed in Step 2. If you skipped them, the
-build fails with `CMake Error ... Could not find GRPC_INCLUDE_DIR`. To build without
-the UMBP storage component instead (no gRPC needed):
+headers (installed in Step 2). To build without the UMBP storage component instead
+(no gRPC needed):
 
 ```bash
 sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "BUILD_UMBP=OFF pip install ."
@@ -331,7 +324,7 @@ ibv_devinfo | head -20
 
 ---
 
-## Step 7: Run `mori check`
+## Step 7: Run `mori check` / `mori setup`
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c "mori check"
