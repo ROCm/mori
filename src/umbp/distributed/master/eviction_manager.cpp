@@ -21,23 +21,29 @@
 // SOFTWARE.
 #include "umbp/distributed/master/eviction_manager.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/master/client_registry.h"
+#include "umbp/distributed/master/evict_strategy.h"
 #include "umbp/distributed/master/global_block_index.h"
 
 namespace mori::umbp {
 
 EvictionManager::EvictionManager(GlobalBlockIndex& index, ClientRegistry& registry,
-                                 const EvictionConfig& config, EvictKeyDispatcher* dispatcher)
-    : index_(index), registry_(registry), config_(config), dispatcher_(dispatcher) {}
+                                 const EvictionConfig& config, EvictKeyDispatcher* dispatcher,
+                                 std::unique_ptr<MasterEvictStrategy> strategy)
+    : index_(index),
+      registry_(registry),
+      config_(config),
+      dispatcher_(dispatcher),
+      strategy_(strategy ? std::move(strategy) : std::make_unique<LruMasterEvictStrategy>()) {}
 
 EvictionManager::~EvictionManager() { Stop(); }
 
@@ -112,27 +118,12 @@ void EvictionManager::RunOnce() {
     return;
   }
 
-  // Sort by oldest-access first (LRU).  Depth-aware tiebreaking went away
-  // along with master's per-key depth field — peers don't ship depth in
-  // KvEvent — so a pure LRU sort is what we get.
-  std::sort(candidates.begin(), candidates.end(),
-            [](const EvictionCandidate& a, const EvictionCandidate& b) {
-              return a.last_accessed_at < b.last_accessed_at;
-            });
+  // Policy ranks candidates and picks victims within budget, grouped by node so
+  // each peer gets a single EvictKey keys[].
+  auto per_node_keys = strategy_->SelectVictims(std::move(candidates), std::move(bytes_to_free));
 
-  // Group selected victims by node so the eventual EvictKey RPC takes a
-  // single keys[] per peer instead of N round trips.
-  std::unordered_map<std::string, std::vector<std::string>> per_node_keys;
   size_t selected = 0;
-  for (const auto& c : candidates) {
-    auto& tier_budget = bytes_to_free[c.location.node_id];
-    auto it = tier_budget.find(c.location.tier);
-    if (it == tier_budget.end() || it->second <= 0) continue;
-    per_node_keys[c.location.node_id].push_back(c.key);
-    it->second -= static_cast<int64_t>(c.size);
-    ++selected;
-  }
-
+  for (const auto& [node_id, keys] : per_node_keys) selected += keys.size();
   if (selected == 0) return;
 
   MORI_UMBP_INFO("[EvictionManager] Selected {} victims across {} nodes", selected,

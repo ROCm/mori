@@ -99,6 +99,11 @@ class PeerSsdManager : public OwnedLocationSource {
   // being read (inflight_reads_ > 0) or already being evicted (evicting_).
   // Accumulates sizes until >= bytes_to_free; returns fewer if not enough
   // free-able keys exist (never blocks).
+  //
+  // Not pluggable yet (only master-side eviction is).  A real SSD plugin must
+  // own the per-algorithm state that lives here in lru_/owned_, not just the
+  // selection step; target design is a stateful policy with
+  // OnAdd/OnTouch/OnRemove/Clear hooks plus a SelectVictims called under mutex_.
   std::vector<std::string> SelectVictims(size_t bytes_to_free);
 
   // Distributed Clear: drop the logical owned-location map + undrained events,

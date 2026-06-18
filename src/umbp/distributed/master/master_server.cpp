@@ -735,7 +735,8 @@ MasterServer::MasterServer(MasterServerConfig config)
                                                        config_.registry_config, nullptr)),
       peer_stub_pool_(std::make_unique<MasterPeerStubPool>()),
       eviction_manager_(std::make_unique<EvictionManager>(
-          index_, registry_, config_.eviction_config, peer_stub_pool_.get())) {
+          index_, registry_, config_.eviction_config, peer_stub_pool_.get(),
+          std::move(config_.evict_strategy))) {
   router_.SetLeaseDuration(config_.eviction_config.lease_duration);
 }
 

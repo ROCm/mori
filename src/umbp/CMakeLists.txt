@@ -316,6 +316,7 @@ add_library(
   distributed/master/master_client.cpp
   distributed/master/rpc_latency_timer.cpp
   distributed/master/eviction_manager.cpp
+  distributed/master/evict_strategy.cpp
   distributed/routing/router.cpp
   distributed/routing/route_get_strategy.cpp
   distributed/routing/route_put_strategy.cpp

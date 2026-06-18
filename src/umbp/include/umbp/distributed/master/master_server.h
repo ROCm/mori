@@ -35,6 +35,7 @@
 #include "mori/metrics/prometheus_metrics_server.hpp"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/client_registry.h"
+#include "umbp/distributed/master/evict_strategy.h"
 #include "umbp/distributed/master/eviction_manager.h"
 #include "umbp/distributed/master/external_kv_block_index.h"
 #include "umbp/distributed/master/external_kv_hit_index.h"
