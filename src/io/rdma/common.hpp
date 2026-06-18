@@ -134,6 +134,16 @@ uint64_t MakeNotifSendWrId(TransferUniqueId id);
 std::vector<std::pair<uint64_t, uint32_t>> PlanChunks(uint32_t total, size_t chunkBytes,
                                                       int maxChunks);
 
+struct ChunkedSgeSegment {
+  uint64_t remoteOffset{0};
+  uint64_t localAddr{0};
+  uint32_t length{0};
+};
+
+void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector<ibv_sge>& sges,
+                         uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                         uint64_t maxMessageSize);
+
 struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
       : status(s), id(id_), totalBatchSize(n) {}

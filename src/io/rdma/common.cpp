@@ -23,6 +23,7 @@
 
 #include <infiniband/verbs.h>  // dereferences ibvHandle.qp (forward-declared in core)
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -292,6 +293,59 @@ std::vector<std::pair<uint64_t, uint32_t>> PlanChunks(uint32_t total, size_t chu
   return plan;
 }
 
+void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector<ibv_sge>& sges,
+                         uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                         uint64_t maxMessageSize) {
+  plan.clear();
+  if (totalLength == 0 || maxChunks <= 0 || maxMessageSize == 0) return;
+
+  auto ceilDiv = [](uint64_t value, uint64_t divisor) {
+    return value / divisor + ((value % divisor) != 0);
+  };
+
+  uint64_t softCount = 1;
+  if (chunkBytes > 0 && totalLength > chunkBytes) {
+    softCount = ceilDiv(totalLength, static_cast<uint64_t>(chunkBytes));
+    softCount = std::min<uint64_t>(softCount, static_cast<uint64_t>(maxChunks));
+  }
+
+  const uint64_t hardMinCount = std::max<uint64_t>(ceilDiv(totalLength, maxMessageSize), 1);
+  const uint64_t finalCount = std::max<uint64_t>(softCount, hardMinCount);
+  const uint64_t targetChunkBytes = std::max<uint64_t>(ceilDiv(totalLength, finalCount), 1);
+  const uint64_t maxReserve = static_cast<uint64_t>(plan.max_size());
+  uint64_t reserveHint = finalCount;
+  const uint64_t sgeCount = static_cast<uint64_t>(sges.size());
+  if (reserveHint <= maxReserve && sgeCount <= maxReserve - reserveHint) reserveHint += sgeCount;
+  if (reserveHint <= maxReserve && plan.capacity() < reserveHint) {
+    plan.reserve(static_cast<size_t>(reserveHint));
+  }
+
+  uint64_t remoteStreamOffset = 0;
+  uint64_t targetRemaining = std::min(targetChunkBytes, totalLength);
+  for (const ibv_sge& sge : sges) {
+    uint64_t sgeRemaining = sge.length;
+    uint64_t sgeOffset = 0;
+    while (sgeRemaining > 0) {
+      const uint64_t len64 = std::min({targetRemaining, sgeRemaining, maxMessageSize});
+      if (len64 == 0) return;
+      plan.push_back(ChunkedSgeSegment{
+          .remoteOffset = remoteStreamOffset + sgeOffset,
+          .localAddr = sge.addr + sgeOffset,
+          .length = static_cast<uint32_t>(len64),
+      });
+
+      sgeRemaining -= len64;
+      sgeOffset += len64;
+      targetRemaining -= len64;
+      if (targetRemaining == 0 && remoteStreamOffset + sgeOffset < totalLength) {
+        const uint64_t streamRemaining = totalLength - (remoteStreamOffset + sgeOffset);
+        targetRemaining = std::min(targetChunkBytes, streamRemaining);
+      }
+    }
+    remoteStreamOffset += sge.length;
+  }
+}
+
 struct MergedWorkRequest {
   ibv_send_wr wr{};
   std::vector<ibv_sge> sges;
@@ -409,7 +463,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   thread_local std::vector<size_t> tlIndices;
   thread_local std::vector<MergedWorkRequest> tlMergedPool;
   thread_local std::vector<MergedWorkRequest> tlChunkedPool;
-  thread_local std::vector<std::pair<uint64_t, uint32_t>> tlChunkPlan;
+  thread_local std::vector<ChunkedSgeSegment> tlChunkPlan;
   thread_local std::vector<int> tlEpWrsSinceSignal;
   thread_local std::vector<size_t> tlEpMergedSinceSignal;
   thread_local int reentryDepth = 0;
@@ -425,14 +479,14 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   std::vector<size_t> localIndices;
   std::vector<MergedWorkRequest> localMergedPool;
   std::vector<MergedWorkRequest> localChunkedPool;
-  std::vector<std::pair<uint64_t, uint32_t>> localChunkPlan;
+  std::vector<ChunkedSgeSegment> localChunkPlan;
   std::vector<int> localEpWrsSinceSignal;
   std::vector<size_t> localEpMergedSinceSignal;
 
   std::vector<size_t>& indices = usePool ? tlIndices : localIndices;
   std::vector<MergedWorkRequest>& mergedPool = usePool ? tlMergedPool : localMergedPool;
   std::vector<MergedWorkRequest>& chunkedPool = usePool ? tlChunkedPool : localChunkedPool;
-  std::vector<std::pair<uint64_t, uint32_t>>& chunkPlan = usePool ? tlChunkPlan : localChunkPlan;
+  std::vector<ChunkedSgeSegment>& chunkPlan = usePool ? tlChunkPlan : localChunkPlan;
   std::vector<int>& epWrsSinceSignal = usePool ? tlEpWrsSinceSignal : localEpWrsSinceSignal;
   std::vector<size_t>& epMergedSinceSignal =
       usePool ? tlEpMergedSinceSignal : localEpMergedSinceSignal;
@@ -464,6 +518,25 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   const uint32_t maxSge =
       std::max(eps[0].local.handle.maxSge, 1u);  // We assume all endpoints have the same maxSge
   const ibv_wr_opcode opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
+  uint64_t localMaxMessageSize = std::numeric_limits<uint64_t>::max();
+  for (size_t epId = 0; epId < eps.size(); ++epId) {
+    const uint64_t epMaxMessageSize = eps[epId].local.maxMsgSize;
+    if (epMaxMessageSize == 0) {
+      return {StatusCode::ERR_BAD_STATE,
+              "RDMA endpoint local max_msg_sz is unavailable for ep " + std::to_string(epId)};
+    }
+    localMaxMessageSize = std::min(localMaxMessageSize, epMaxMessageSize);
+  }
+  auto exceedsLocalMaxMessageSize = [&](const MergedWorkRequest& wr) {
+    return static_cast<uint64_t>(wr.totalRemoteLength) > localMaxMessageSize;
+  };
+  auto hasOversizedSge = [&](const MergedWorkRequest& wr) {
+    if (chunkBytes == 0) return false;
+    for (const ibv_sge& sge : wr.sges) {
+      if (sge.length > chunkBytes) return true;
+    }
+    return false;
+  };
 
   // Initialize a pooled slot as a single-SGE WR (shared by the merge builder and
   // the chunk expander); clears but keeps the slot's sges capacity.
@@ -528,13 +601,26 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   }
 
   // [expand-chunked-precompute] Expand oversized WRs into the pooled `chunkedPool`
-  // in place (slot reuse); `chunkPlan` is reused via PlanChunksInto. Note: small
+  // in place (slot reuse); `chunkPlan` is reused by PlanSgeStreamChunks. Note: small
   // WRs are still copied as-is into chunkedPool when any WR needs splitting.
-  bool useChunked = false;
-  if (chunkBytes > 0) {
+  const bool canExpandChunks = creditByWrCount && chunkBytes > 0;
+  if (!canExpandChunks) {
     for (size_t k = 0; k < wrCount; ++k) {
       const MergedWorkRequest& wr = mergedPool[k];
-      if (wr.wr.num_sge == 1 && !wr.sges.empty() && wr.sges[0].length > chunkBytes) {
+      if (!exceedsLocalMaxMessageSize(wr)) continue;
+      return {StatusCode::ERR_INVALID_ARGS,
+              "merged RDMA WR " + std::to_string(k) + " length " +
+                  std::to_string(wr.totalRemoteLength) + " exceeds local max_msg_sz " +
+                  std::to_string(localMaxMessageSize) +
+                  "; enable RDMA transfer chunking or reduce batch size"};
+    }
+  }
+
+  bool useChunked = false;
+  if (canExpandChunks) {
+    for (size_t k = 0; k < wrCount; ++k) {
+      const MergedWorkRequest& wr = mergedPool[k];
+      if (hasOversizedSge(wr) || exceedsLocalMaxMessageSize(wr)) {
         useChunked = true;
         break;
       }
@@ -549,7 +635,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     };
     for (size_t k = 0; k < wrCount; ++k) {
       MergedWorkRequest& wr = mergedPool[k];
-      if (wr.wr.num_sge != 1 || wr.sges.empty() || wr.sges[0].length <= chunkBytes) {
+      if (!hasOversizedSge(wr) && !exceedsLocalMaxMessageSize(wr)) {
         // Copy as-is (preserves multi-sge / small WRs) into the pooled slot.
         if (chunkedCount >= chunkedPool.size()) chunkedPool.emplace_back();
         MergedWorkRequest& c = chunkedPool[chunkedCount];
@@ -563,12 +649,14 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         ++chunkedCount;
         continue;
       }
-      const uint64_t localBase = wr.sges[0].addr;
       const uint64_t remoteBase = wr.wr.wr.rdma.remote_addr;
-      const uint32_t totalLength = wr.sges[0].length;
-      PlanChunksInto(chunkPlan, totalLength, chunkBytes, maxChunks);
-      for (const auto& [offset, len] : chunkPlan) {
-        emit(wr.wr.opcode, remoteBase + offset, localBase + offset, len);
+      PlanSgeStreamChunks(chunkPlan, wr.sges, static_cast<uint64_t>(wr.totalRemoteLength),
+                          chunkBytes, maxChunks, localMaxMessageSize);
+      if (chunkPlan.empty() && wr.totalRemoteLength != 0) {
+        return {StatusCode::ERR_BAD_STATE, "failed to plan RDMA chunks for non-empty SGE stream"};
+      }
+      for (const ChunkedSgeSegment& segment : chunkPlan) {
+        emit(wr.wr.opcode, remoteBase + segment.remoteOffset, segment.localAddr, segment.length);
       }
     }
   }
