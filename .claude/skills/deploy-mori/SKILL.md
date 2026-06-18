@@ -3,9 +3,9 @@ name: deploy-mori
 description: >-
   Deploy and set up the MORI environment in a fresh Docker container or bare host:
   start the container, install ROCm dependencies, NIC userspace libraries
-  (AINIC/Mellanox/Broadcom), RDMA-core, and MORI itself. Use when the user asks
+  (AINIC/Broadcom), RDMA-core, and MORI itself. Use when the user asks
   to deploy MORI, install MORI in a container, set up a fresh dev environment
-  for MORI, or prepare an AINIC / ConnectX / Thor2 box for MORI.
+  for MORI, or prepare an AINIC / Thor2 box for MORI.
 ---
 
 # Deploy MORI
@@ -19,7 +19,6 @@ contains `pyproject.toml`; ask the user otherwise.
 
 ```bash
 lspci | grep -iE "pensando|ionic|dsc|pollara" && echo "→ ainic"
-lspci | grep -iE "mellanox|connectx"           && echo "→ cx7"
 lspci | grep -iE "broadcom.*thor|bnxt"         && echo "→ thor2"
 ```
 
@@ -100,7 +99,8 @@ sudo docker exec $CONTAINER_NAME bash -c "apt-get update && apt-get install -y -
     git libpci-dev libdw1 libibverbs-dev ibverbs-utils \
     locales iputils-ping iproute2 ethtool jq perftest \
     wget unzip ca-certificates curl \
-    libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler"
+    libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler \
+    libopenmpi-dev openmpi-bin"
 ```
 
 Package roles:
@@ -113,6 +113,8 @@ Package roles:
   (`grpcpp/grpcpp.h`). The remaining build tooling (`cmake`, `ninja`, `pybind11`) is
   pulled in automatically by `pyproject.toml`'s build isolation, so it doesn't need
   to be in the image.
+- `libopenmpi-dev openmpi-bin` — **MPI deps**: required for `MORI_WITH_MPI=ON` and
+  `BUILD_BENCHMARK=ON` (benchmark targets are gated behind `WITH_MPI`).
 
 ---
 
@@ -121,8 +123,6 @@ Package roles:
 Run the subsection matching the NIC type detected at the top:
 - `ainic` → **Step 3a** (AINIC / Pensando)
 - `thor2` / bnxt → **Step 3b** (Broadcom NetXtreme-E)
-- `cx7` (Mellanox/ConnectX) → userspace libs ship with the base image's
-  `rdma-core`; usually nothing extra needed. Skip to Step 4.
 
 ---
 
@@ -360,7 +360,7 @@ If any step shows `[FAIL]`:
 ## Done — Report Back
 
 - Base image and OS
-- NIC library installed (`libionic` / `libmlx5` / `libbnxt_re` / none)
+- NIC library installed (`libionic` / `libbnxt_re` / none)
 - Install mode: source (`pip install .`)
 - GPU arch and NIC type as reported by MORI
 - Kernels: JIT on first use (`~/.mori/jit/`)
