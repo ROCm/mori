@@ -49,14 +49,18 @@ export MORI_KERNEL_DIR=/tf/mori/build/lib/gfx942_mlx5
 # export MORI_CORE_LOG_LEVEL=DEBUG
 # export MORI_OPS_LOG_LEVEL=DEBUG
 
+# export ROCR_VISIBLE_DEVICES=4,5,6,7
+export HIP_VISIBLE_DEVICES=0,1,2,3
+
 export MORI_DISABLE_P2P=0
 export MORI_ENABLE_SDMA=1
 # it looks like 1 channel gives the best performance
 export MORI_SDMA_NUM_CHANNELS=1
-
-# export ROCR_VISIBLE_DEVICES=4,5,6,7
-export HIP_VISIBLE_DEVICES=0,1,2,3
-# export AMD_LOG_LEVEL=4
+export MORI_SDMA_ENGINE_SPAN=2
+export RS_MODE=push
+export RS_PUSH_SLICES=4
+export RS_RING_BLOCKS=64
+export RS_RING_SLICES=8
 
 TORCH_LIBS=/usr/local/lib/python3.12/dist-packages/torch/lib
 # TORCH=$TORCH_LIBS/libtorch.so
@@ -69,23 +73,17 @@ export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1 #:/lib/x86_64-linux-gnu/lib
 NUM_PROCS=1
 NUM_GPUS_PER_PROCESS=4
 
-pkill -9 -c -f allgather_test
+pkill -9 -c -f reduce_scatter_test
 rm -f allgather_test_uid.bin zz*.log
 
-export RS_MODE=ring
-#TEST=./build/examples/all2all_test
-# TEST=./build/examples/allgather_test
 TEST=./build/examples/reduce_scatter_test
 
-# Number of GPUs/PEs and the total-element sweep (num_elems = total input elems,
-# doubling each step). num_elems must stay divisible by NUM_GPUS, so keep
-# MIN_SIZE a multiple of NUM_GPUS (doubling preserves divisibility).
 NUM_GPUS=${NUM_GPUS:-4}
-MIN_SIZE=${MIN_SIZE:-262144}
-MAX_SIZE=${MAX_SIZE:-33554432}
+MIN_SIZE=${MIN_SIZE:-1024}
+MAX_SIZE=${MAX_SIZE:-1024*1024*128}
 
 rm -f zzout_0.log
-for ((size = MIN_SIZE; size <= MAX_SIZE; size *= 2)); do
+for ((size = MIN_SIZE; size <= MAX_SIZE; size = size * 2)); do
   $TEST $NUM_GPUS $size $@ 2>&1 | tee -a zzout_0.log
 done
 exit 0

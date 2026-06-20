@@ -244,11 +244,6 @@ __device__ __forceinline__ void ReduceVecGroup(SrcBaseFn srcBase, T* __restrict_
   }
 }
 
-template<typename T>
-__device__ __host__ inline static  T* Xglobal(T* ptr) { 
-  return (T*)(T GLOBAL_SPACE *)reinterpret_cast<uintptr_t>(ptr); 
-}
-
 // ---------------------------------------------------------------------------
 // Fused reduce-scatter kernel
 //
@@ -261,101 +256,120 @@ __device__ __host__ inline static  T* Xglobal(T* ptr) {
 // address-based SDMA put can translate local->peer (offset from heapBaseAddr).
 // ---------------------------------------------------------------------------
 template <int VecBytes, int NumVecs, class T, template <class> class OpT>
-__global__ void ReduceScatterPushKernel(int myPe, int npes, int numQ, const T* __restrict__ input,
+__global__ void ReduceScatterPushKernel(int myPe, int npes, int S, const T* __restrict__ input,
                                     T* __restrict__ staging, T* __restrict__ output,
                                     size_t chunkElems, uint64_t gen) {
   auto* heapObj = GetGlobalGpuStatesPtr()->heapObj;
   const int numSdmaQ = static_cast<int>(heapObj->sdmaNumQueue);
 
-  // === Phase 1: SDMA scatter (block 0 only), one thread per (destPe, queue) ===
-  // Fire-and-forget: the copy packet and its completion atomic ride the SAME
-  // queue, and the atomic targets the *receiver's* signalPtrs, so it fires only
-  // after the data has landed in the peer's staging. There is NO local quiet here
-  // -- completion is observed on the receive side (Phase 2), which also lets us
-  // drop the cross-PE barrier and the block-0 -> all-blocks flag handoff.
+  // The shard is split into S slices (vecSize-aligned; the last slice absorbs the
+  // remainder). Each slice is sent as one SDMA sub-chunk on a SINGLE queue, in
+  // order, so the per-sender completion counter encodes pipeline progress and
+  // group g in Phase 3 reduces exactly the slice-g region.
+  constexpr int vecSize = VecBytes / sizeof(T);
+  const size_t sliceLen = (chunkElems / static_cast<size_t>(S) / vecSize) * vecSize;
+
+  // === Phase 1: SDMA scatter (block 0 only), ONE thread per destination peer ===
+  // Each destPe thread issues all S sub-chunk copies for that peer sequentially on
+  // queue 0, each followed by an atomic increment of the SAME per-sender signal
+  // slot on the receiver. Because a SINGLE thread issues them in loop order and
+  // submitPacket commits in order, the receiver's counter increments 1,2,...,S as
+  // slices 0,1,...,S-1 land -- so a counter value of v means slices [0, v) are
+  // done. Splitting a peer's S transfers across threads would interleave their
+  // commits and break this mapping. Fire-and-forget: the copy + completion atomic
+  // ride the same queue and the atomic targets the *receiver's* signalPtrs, so
+  // completion is observed on the receive side (Phase 2) -- no local quiet, no
+  // cross-PE barrier, no block-0 -> all-blocks handoff.
   int tid = threadIdx.x;
-  if (blockIdx.x == 0 && tid < npes * numQ) {
-    int destPe = tid / numQ, q = tid - destPe * numQ;
+  if (blockIdx.x == 0 && tid < npes && tid != myPe) {
+    int destPe = tid;
     // Local symmetric address of peer destPe's staging slot for me (slot myPe).
     T* dstLocal = staging + static_cast<size_t>(myPe) * chunkElems;
     const T* src = input + static_cast<size_t>(destPe) * chunkElems;
 
-    // This thread's slice of the chunk (queue q of numQ).
-    size_t qChunk = chunkElems / numQ;
-    size_t qOfs = static_cast<size_t>(q) * qChunk;
-    size_t qElems = (q == numQ - 1) ? (chunkElems - qOfs) : qChunk;
+    auto** handles = heapObj->deviceHandles_d + (destPe % 8) * numSdmaQ;
+    // SdmaPutThreadFused still does expectedSignals[0]++ on this local array; that
+    // is now dead bookkeeping (nobody quiets locally) but harmless.
+    HSAuint64* expectedSignals = heapObj->expectSignalsPtr + (destPe % 8) * numSdmaQ;
+    // Completion atomic -> destPe's single per-sender slot (queue 0), keyed by ME:
+    //   destPe.signalPtrs[(myPe % 8) * numSdmaQ]
+    HSAuint64* remoteSig = heapObj->peerSignalPtrs[destPe] + (myPe % 8) * numSdmaQ;
 
-    uintptr_t destAddr = reinterpret_cast<uintptr_t>(dstLocal + qOfs);
-    size_t offset = destAddr - GetGlobalGpuStatesPtr()->heapBaseAddr;
-    uint8_t* srcPtr = Xglobal(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(src + qOfs)));
-    uint8_t* dstPtr = Xglobal(reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + offset));
+    for (int s = 0; s < S; s++) {
+      size_t sOfs = static_cast<size_t>(s) * sliceLen;
+      size_t sElems = (s == S - 1) ? (chunkElems - sOfs) : sliceLen;
 
-    auto** handles = Xglobal(heapObj->deviceHandles_d + (destPe % 8) * numSdmaQ);
-    // SdmaPutThreadFused still does expectedSignals[q]++ on this local array; that is
-    // now dead bookkeeping (nobody quiets locally) but harmless.
-    HSAuint64* expectedSignals = Xglobal(heapObj->expectSignalsPtr + (destPe % 8) * numSdmaQ);
-    // Completion atomic -> destPe's signalPtrs at the slot keyed by ME (sender):
-    //   destPe.signalPtrs[(myPe % 8) * numSdmaQ + q]
-    HSAuint64* remoteSig = Xglobal(heapObj->peerSignalPtrs[destPe] + (myPe % 8) * numSdmaQ);
-    mori::core::SdmaPutThreadFused(srcPtr, dstPtr, qElems * sizeof(T), handles, remoteSig,
-                              expectedSignals, numSdmaQ, q);
+      uintptr_t destAddr = reinterpret_cast<uintptr_t>(dstLocal + sOfs);
+      size_t offset = destAddr - GetGlobalGpuStatesPtr()->heapBaseAddr;
+      uint8_t* srcPtr =
+          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(src + sOfs));
+      uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + offset);
+      // qId = 0: single queue. signals base = remoteSig so signals[qId] == remoteSig,
+      // i.e. every sub-chunk's atomic increments the same per-sender counter.
+      mori::core::SdmaPutThreadFused(srcPtr, dstPtr, sElems * sizeof(T), handles, remoteSig,
+                                expectedSignals, numSdmaQ, /*qId=*/0);
+    }
   }
-  
-  // === Phase 2: every block waits until ALL peers wrote my staging ============
-  // The receive signals live in my local HBM (written by remote SDMA), are
-  // monotonic and never reset, so we wait for the exact generation `gen`. One
-  // thread per (sender, queue) slot polls; all blocks share these few cache lines
-  // (read-only -> L2 hits; a slot is invalidated only once per iteration when its
-  // remote atomic lands).
-  if (tid < npes * numQ) {
-    int p = tid / numQ, q = tid - p * numQ;
-    anvil::waitForSignal(&heapObj->signalPtrs[(p % 8) * numSdmaQ + q], gen);
+
+  // Grouping: partition the N blocks into S groups of G = N/S blocks; group g owns
+  // slice g (the region [g*sliceLen, ...)) and works INDEPENDENTLY of the other
+  // groups -- it waits only until slice g has landed from every sender and reduces
+  // only slice g. S==1 => one group of all blocks reducing the whole chunk.
+  const int N = static_cast<int>(gridDim.x);
+  const int G = N / S;              // blocks per group (host guarantees N % S == 0)
+  const int g = static_cast<int>(blockIdx.x) / G;  // this block's group/slice
+  const int lb = static_cast<int>(blockIdx.x) % G; // local block index within group
+
+  // === Phase 2: wait until THIS slice has landed from all npes senders ========
+  // The per-sender counters live in my local HBM (written by remote SDMA), are
+  // monotonic and never reset, and advance by exactly S per launch. Slice g
+  // (0-indexed) is ready once a sender's counter reaches (gen-1)*S + g + 1. We use
+  // a `>=` wait because a later slice's atomic may have already advanced the
+  // counter past this group's exact threshold. One thread per sender polls its
+  // per-sender slot signalPtrs[(p%8)*numSdmaQ]; every block in the group does its
+  // own wait+acquire (read-only -> L2 hits).
+  if (tid < npes && tid != myPe) {
+    uint64_t want = (gen - 1) * static_cast<uint64_t>(S) + static_cast<uint64_t>(g) + 1;
+    anvil::waitForSignalAtLeast(&heapObj->signalPtrs[(tid % 8) * numSdmaQ], want);
   }
   __syncthreads();
   __threadfence_system();  // acquire: staging visible before Phase 3 reads it
 
-  // === Phase 3: grid-strided vectorized reduce (all blocks) ================
+  // === Phase 3: grid-strided vectorized reduce over slice g (this group) ======
   // Streaming reduction: every staging slot is read exactly once and the output
   // written once, so use the nontemporal load<16>/store<16> primitives from
   // device_primitives.hpp. They move 16-byte vectors with a streaming (LRU
   // bypass) hint, avoiding L2 pollution from single-use data.
-  constexpr int vecSize = VecBytes / sizeof(T);  // elements per VecBytes-wide vector
+  const size_t sOfs = static_cast<size_t>(g) * sliceLen;            // slice base (elems)
+  const size_t sCnt = (g == S - 1) ? (chunkElems - sOfs) : sliceLen;  // slice length
 
-  const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
-  const size_t totalVecs = chunkElems / vecSize;  // total full VecBytes-wide vectors
+  // Stride over the GROUP only (G blocks), so the G blocks cooperatively reduce
+  // just this slice.
+  const size_t ltid = static_cast<size_t>(lb) * blockDim.x + threadIdx.x;
+  const size_t lstride = static_cast<size_t>(G) * blockDim.x;
+  const size_t totalVecs = sCnt / vecSize;  // full VecBytes-wide vectors in this slice
   using AccType = typename AccumulatorType<T>::type;
 
-  // Coalescing-friendly unroll: each thread owns NumVecs vectors spaced gstride
-  // apart, so for a fixed lane index i, neighbouring threads read contiguous
-  // vectors (the load stays coalesced across the warp), while the NumVecs loads
-  // per peer give independent memory ops in flight (ILP/MLP).
-  //
-  // Because the group stride is gstride*NumVecs, each thread has at most ONE
-  // partial group, and it is the last one: once a group's first member is out of
-  // range, the next group (gstride*NumVecs further) is entirely out of range too.
-  // So we run a GUARD-FREE fast path over complete groups (all NumVecs members
-  // in-bounds), then mop up the single trailing partial group one vector at a
-  // time. No per-lane "if (idx < totalVecs)" in the hot loop.
-  // Staging "push" layout: peer pe's contribution is the contiguous chunkElems
-  // slot at staging + pe*chunkElems. Same generic core as the pull kernel.
-  auto srcBase = [staging, chunkElems](int pe) -> const T* {
-    return staging + static_cast<size_t>(pe) * chunkElems;
+  // Same guard-free fast path + single trailing partial group as before, but
+  // scoped to this slice (offset sOfs) and strided over the group.
+  auto srcBase = [staging, input, chunkElems, sOfs, myPe](int pe) -> const T* {
+    return (pe == myPe ? input : staging) + static_cast<size_t>(pe) * chunkElems + sOfs;
   };
+  T* out = output + sOfs;
 
-  size_t g = gtid;
-  for (; g + static_cast<size_t>(NumVecs - 1) * gstride < totalVecs; g += gstride * NumVecs) {
-    ReduceVecGroup<VecBytes, NumVecs, T, OpT>(srcBase, output, npes, g, gstride);
+  size_t v = ltid;
+  for (; v + static_cast<size_t>(NumVecs - 1) * lstride < totalVecs; v += lstride * NumVecs) {
+    ReduceVecGroup<VecBytes, NumVecs, T, OpT>(srcBase, out, npes, v, lstride);
   }
   // Trailing partial group: the remaining in-bounds vectors for this thread.
-  for (size_t idx = g; idx < totalVecs; idx += gstride) {
-    ReduceVecGroup<VecBytes, 1, T, OpT>(srcBase, output, npes, idx, gstride);
+  for (size_t idx = v; idx < totalVecs; idx += lstride) {
+    ReduceVecGroup<VecBytes, 1, T, OpT>(srcBase, out, npes, idx, lstride);
   }
 
-  // Scalar tail for elements not covered by the vectorized loop.
-  for (size_t i = totalVecs * vecSize + gtid; i < chunkElems; i += gstride) {
+  // Scalar tail (only the last slice can be non-vecSize-aligned).
+  for (size_t i = totalVecs * vecSize + ltid; i < sCnt; i += lstride) {
     using Vec = TVecType<sizeof(T)>;
-    const T* base = staging + i;
+    const T* base = srcBase(0) + i;
     AccType a = UpcastF<T>(load<sizeof(T)>(base));
     base += chunkElems;
     for (int pe = 1; pe < npes; pe++, base += chunkElems) {
@@ -363,7 +377,7 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int numQ, const T* _
       a = OpT<T>()(a, UpcastF<T>(V));
     }
     Vec V = __builtin_bit_cast(Vec, DowncastF<T>(a));
-    store<sizeof(T)>(output + i, V);
+    store<sizeof(T)>(out + i, V);
   }
 }
 
@@ -491,19 +505,19 @@ __device__ __forceinline__ void RingSdmaSend(const T* src, T* dstSlotLocal,
   size_t dOff = reinterpret_cast<uintptr_t>(dstSlotLocal) - heapBase;
   size_t sOff = reinterpret_cast<uintptr_t>(sigSlotLocal) - heapBase;
 
-  uint8_t* srcPtr = Xglobal(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(src)));
-  uint8_t* dstPtr = Xglobal(reinterpret_cast<uint8_t*>(heapObj->peerPtrs[next] + dOff));
+  uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(src));
+  uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[next] + dOff);
 
-  auto** handles = Xglobal(heapObj->deviceHandles_d + (next % 8) * numSdmaQ);
-  HSAuint64* expectedSignals = Xglobal(heapObj->expectSignalsPtr + (next % 8) * numSdmaQ);
+  auto** handles = heapObj->deviceHandles_d + (next % 8) * numSdmaQ;
+  HSAuint64* expectedSignals = heapObj->expectSignalsPtr + (next % 8) * numSdmaQ;
   // SdmaPutThreadFused fires its atomic at signals[q]; we want next's readySig slot,
   // so bias the base by -q (pointer arithmetic) => signals[q] == that slot.
   HSAuint64* nextSig = reinterpret_cast<HSAuint64*>(heapObj->peerPtrs[next] + sOff);
-  HSAuint64* signals = Xglobal(nextSig - q);
+  HSAuint64* signals = nextSig - q;
   // Fused (single-reservation) put: required because with N blocks > numSdmaQ
   // multiple blocks issue concurrently on the same queue.
-  mori::core::SdmaPutThreadFused(srcPtr, dstPtr, bytes, handles, signals, expectedSignals, numSdmaQ,
-                                 q);
+  mori::core::SdmaPutThreadFused(srcPtr, dstPtr, bytes, handles, signals, 
+            expectedSignals, numSdmaQ, q);
 }
 
 // Block-strided fused 2-source reduce: out[i] = Op(a[i], b[i]) over `cnt` elems.

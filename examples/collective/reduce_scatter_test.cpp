@@ -123,7 +123,7 @@ using ElemT = float;  // element type used by the test instantiation
 
 // Device/template kernels (push, pull, ring) and the shared streaming
 // load/store + reduction helpers live in this header.
-#include "reduce_scatter_kernels.hpp"
+#include "mori/collective/reduce_scatter_kernels.hpp"
 
 // ---------------------------------------------------------------------------
 // Fill / verify kernels
@@ -229,6 +229,18 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   size_t totalVecs = chunkElems / (VecSize * NumVecs);
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
   int blocks = std::min(wantBlocks, std::max(1, prop.multiProcessorCount));
+  // Push: split each shard into S slices, sent as sequential SDMA sub-chunks on a
+  // SINGLE queue (RS_PUSH_SLICES, default 4). Consumers form S groups (group g
+  // reduces slice g). Clamp S so each slice has >= 1 vector, and round the grid to
+  // a multiple of S (>= 1 block per slice).
+  int pushSlices = 4;
+  if (const char* s = std::getenv("RS_PUSH_SLICES")) {
+    int v = std::atoi(s);
+    if (v >= 1) pushSlices = v;
+  }
+  const int maxSlices = static_cast<int>(std::max<size_t>(1, chunkElems / VecSize));
+  pushSlices = std::max(1, std::min(pushSlices, maxSlices));
+  int pushBlocks = std::max(pushSlices, (blocks / pushSlices) * pushSlices);
 
   // Mode selection: RS_MODE = push|pull|ring (default push). RS_PULL=1 is kept
   // as a back-compat alias for pull.
@@ -307,6 +319,9 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
     if (mode == RsMode::kRing) {
       XPUT("reduce_scatter_test: mode=RING numQ=%d blocks=%d slices=%d (SMs=%d)", numQ, ringBlocks,
            ringSlices, prop.multiProcessorCount);
+    } else if (mode == RsMode::kPush) {
+      XPUT("reduce_scatter_test: mode=PUSH slices=%d blocks=%d (SMs=%d)", pushSlices, pushBlocks,
+           prop.multiProcessorCount);
     } else {
       XPUT("reduce_scatter_test: mode=%s numQ=%d blocks=%d (SMs=%d)", modeName, numQ, blocks,
            prop.multiProcessorCount);
@@ -315,8 +330,8 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   ShmemBarrierAll();
 
   // --- Benchmark ---
-  constexpr int nWarmup = 5;
-  constexpr int nRuns = 20;
+  constexpr int nWarmup = 2;
+  constexpr int nRuns = 5;
   hipEvent_t tStart, tStop;
   HIP_RUNTIME_CHECK(hipEventCreate(&tStart));
   HIP_RUNTIME_CHECK(hipEventCreate(&tStop));
@@ -341,8 +356,8 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
     } else {
       // gen = monotonic launch generation (signals are zeroed once and never
       // reset, so the receive-side wait matches the exact per-launch value).
-      ReduceScatterPushKernel<VecBytes, NumVecs, ElemT, SumOp><<<blocks, kThreads, 0, stream>>>(
-          myPe, npes, numQ, input, staging, output, chunkElems,
+      ReduceScatterPushKernel<VecBytes, NumVecs, ElemT, SumOp><<<pushBlocks, kThreads, 0, stream>>>(
+          myPe, npes, pushSlices, input, staging, output, chunkElems,
           static_cast<uint64_t>(iter) + 1);
     }
     HIP_RUNTIME_CHECK(hipEventRecord(tStop, stream));

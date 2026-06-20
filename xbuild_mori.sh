@@ -25,7 +25,7 @@ if [[ ${full} -eq 1 ]]; then
 #    apt-get install -y openmpi-bin libopenmpi-dev pybind11-dev
 
   rm -rf *
-  DBG=1
+  DBG=0
   if [[ ${DBG} -eq 1 ]]; then
     CMAKE_BUILD_TYPE=RelWithDebInfo
     CMAKE_HIP_FLAGS="-gline-tables-only"

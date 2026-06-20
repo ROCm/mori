@@ -115,6 +115,27 @@ __device__ __forceinline__ bool waitForSignal(HSAuint64* addr, uint64_t expected
   return false;
 }
 
+// Like waitForSignal but spins until the signal reaches AT LEAST `expected`. Used
+// when a single monotonic counter is incremented multiple times per launch (e.g.
+// one increment per delivered sub-chunk): a later increment may have already
+// advanced the counter past an earlier waiter's exact threshold, so an `==`
+// compare would deadlock. Assumes signal is allocated in device memory.
+__device__ __forceinline__ bool waitForSignalAtLeast(HSAuint64* addr, uint64_t expected) {
+  int retries = 0;
+  while (true) {
+    uint64_t value = __hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if (value >= expected) {
+      return true;
+    }
+    if constexpr (BREAK_ON_RETRIES) {
+      if (retries++ == MAX_RETRIES) {
+        break;
+      }
+    }
+  }
+  return false;
+}
+
 #endif  // __HIPCC__ || __CUDACC__
 
 struct SdmaQueueDeviceHandle {
