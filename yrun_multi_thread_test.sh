@@ -59,8 +59,6 @@ export MORI_SDMA_NUM_CHANNELS=1
 export MORI_SDMA_ENGINE_SPAN=2
 export RS_MODE=push
 export RS_PUSH_SLICES=4
-export RS_RING_BLOCKS=64
-export RS_RING_SLICES=8
 
 TORCH_LIBS=/usr/local/lib/python3.12/dist-packages/torch/lib
 # TORCH=$TORCH_LIBS/libtorch.so

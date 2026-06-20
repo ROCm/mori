@@ -121,7 +121,7 @@ using namespace mori::application;
 using ElemT = float;  // element type used by the test instantiation
 #define XPUT(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
 
-// Device/template kernels (push, pull, ring) and the shared streaming
+// Device/template kernels (push, pull) and the shared streaming
 // load/store + reduction helpers live in this header.
 #include "mori/collective/reduce_scatter_kernels.hpp"
 
@@ -242,88 +242,27 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   pushSlices = std::max(1, std::min(pushSlices, maxSlices));
   int pushBlocks = std::max(pushSlices, (blocks / pushSlices) * pushSlices);
 
-  // Mode selection: RS_MODE = push|pull|ring (default push). RS_PULL=1 is kept
-  // as a back-compat alias for pull.
-  enum class RsMode { kPush, kPull, kRing };
+  // Mode selection: RS_MODE = push|pull (default push). RS_PULL=1 is kept as a
+  // back-compat alias for pull.
+  enum class RsMode { kPush, kPull };
   const RsMode mode = [] {
     const char* m = std::getenv("RS_MODE");
     if (m != nullptr) {
       if (std::strcmp(m, "pull") == 0) return RsMode::kPull;
-      if (std::strcmp(m, "ring") == 0) return RsMode::kRing;
       if (std::strcmp(m, "push") == 0) return RsMode::kPush;
+    }
+    if (const char* p = std::getenv("RS_PULL")) {
+      if (std::atoi(p) != 0) return RsMode::kPull;
     }
     return RsMode::kPush;
   }();
-  const char* modeName =
-      (mode == RsMode::kPull) ? "PULL" : (mode == RsMode::kRing) ? "RING" : "PUSH";
-
-  // --- Ring-mode extra symmetric buffers ------------------------------------
-  // recvBuf reuses `staging` (N*chunk >= (npes-1)*chunk). sendBuf gets its own
-  // (npes-1) slots so a forward step never overwrites an in-flight SDMA source.
-  // Grouped channel-parallel: ringBlocks (N) blocks form ringSlices (S) groups of
-  // G = N/S blocks; each group reduces one slice and moves it as one large SDMA.
-  // readySig: (npes-1)*S uint64 data-ready signals (one increment per slot/group
-  // per launch), zeroed once and matched against gen. groupCnt: (npes-1)*S uint32
-  // arrival counters (local), zeroed once and monotonic across launches.
-  int ringBlocks = 1;
-  int ringSlices = 1;
-  ElemT* ringSend = nullptr;
-  HSAuint64* ringSig = nullptr;
-  uint32_t* ringCnt = nullptr;
-  void* ringBuf = nullptr;
-  void* ringCntBuf = nullptr;
-  if (mode == RsMode::kRing) {
-    ringBlocks = std::max(1, prop.multiProcessorCount);
-    if (const char* s = std::getenv("RS_RING_BLOCKS")) {
-      int v = std::atoi(s);
-      if (v >= 1) ringBlocks = v;
-    }
-    // Every block needs at least one VecSize-wide vector of work.
-    const int maxBlocks = static_cast<int>(std::max<size_t>(1, chunkElems / VecSize));
-    ringBlocks = std::max(1, std::min(ringBlocks, maxBlocks));
-
-    // Slices S: default S == N (one block per slice = per-block sends). Clamp to
-    // [1, N] and round N down so that N % S == 0 (G = N/S blocks per slice).
-    ringSlices = ringBlocks;
-    if (const char* s = std::getenv("RS_RING_SLICES")) {
-      int v = std::atoi(s);
-      if (v >= 1) ringSlices = v;
-    }
-    ringSlices = std::max(1, std::min(ringSlices, ringBlocks));
-    ringBlocks = (ringBlocks / ringSlices) * ringSlices;  // make N a multiple of S
-
-    const size_t sendElems = static_cast<size_t>(std::max(1, npes - 1)) * chunkElems;
-    const size_t sigCount = static_cast<size_t>(std::max(1, npes - 1)) * ringSlices;
-    const size_t sendBytes = sendElems * sizeof(ElemT);
-    const size_t sigBytes = sigCount * sizeof(HSAuint64);
-    ringBuf = ShmemMalloc(sendBytes + sigBytes);
-    if (ringBuf == nullptr) {
-      XPUT("ERROR: ShmemMalloc(ring %zu) failed", sendBytes + sigBytes);
-      info.ret_code = -1;
-      return;
-    }
-    ringSend = reinterpret_cast<ElemT*>(ringBuf);
-    ringSig = reinterpret_cast<HSAuint64*>(reinterpret_cast<uint8_t*>(ringBuf) + sendBytes);
-    HIP_RUNTIME_CHECK(hipMemsetAsync(ringBuf, 0, sendBytes + sigBytes, stream));
-
-    // Arrival counters are intra-GPU coordination only (no peer access), so plain
-    // device memory; zeroed once and monotonic (gen-safe via (prev+1) % G == 0).
-    const size_t cntBytes = sigCount * sizeof(uint32_t);
-    HIP_RUNTIME_CHECK(hipMalloc(&ringCntBuf, cntBytes));
-    ringCnt = reinterpret_cast<uint32_t*>(ringCntBuf);
-    HIP_RUNTIME_CHECK(hipMemsetAsync(ringCntBuf, 0, cntBytes, stream));
-    HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
-  }
 
   if (info.deviceId == 0) {
-    if (mode == RsMode::kRing) {
-      XPUT("reduce_scatter_test: mode=RING numQ=%d blocks=%d slices=%d (SMs=%d)", numQ, ringBlocks,
-           ringSlices, prop.multiProcessorCount);
-    } else if (mode == RsMode::kPush) {
+    if (mode == RsMode::kPush) {
       XPUT("reduce_scatter_test: mode=PUSH slices=%d blocks=%d (SMs=%d)", pushSlices, pushBlocks,
            prop.multiProcessorCount);
     } else {
-      XPUT("reduce_scatter_test: mode=%s numQ=%d blocks=%d (SMs=%d)", modeName, numQ, blocks,
+      XPUT("reduce_scatter_test: mode=PULL numQ=%d blocks=%d (SMs=%d)", numQ, blocks,
            prop.multiProcessorCount);
     }
   }
@@ -345,14 +284,6 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
       // input base. output is the local shard buffer.
       ReduceScatterPullKernel<VecBytes, NumVecs, ElemT, SumOp><<<blocks, kThreads, 0, stream>>>(
           myPe, npes, baseObj, output, chunkElems);
-    } else if (mode == RsMode::kRing) {
-      // Grouped SDMA ring: ringBlocks blocks in ringSlices groups; each group
-      // reduces one slice and moves it as one large SDMA. recvBuf reuses `staging`;
-      // gen = launch generation so the per-(slot,group) data-ready wait matches the
-      // exact per-launch value.
-      ReduceScatterRingKernel<VecBytes, NumVecs, ElemT, SumOp><<<ringBlocks, kThreads, 0, stream>>>(
-          myPe, npes, input, /*recvBuf=*/staging, ringSend, output, ringSig, ringCnt, chunkElems,
-          ringSlices, static_cast<uint64_t>(iter) + 1);
     } else {
       // gen = monotonic launch generation (signals are zeroed once and never
       // reset, so the receive-side wait matches the exact per-launch value).
@@ -405,8 +336,6 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   HIP_RUNTIME_CHECK(hipEventDestroy(tStart));
   HIP_RUNTIME_CHECK(hipEventDestroy(tStop));
   HIP_RUNTIME_CHECK(hipStreamDestroy(stream));
-  if (ringBuf != nullptr) ShmemFree(ringBuf);
-  if (ringCntBuf != nullptr) HIP_RUNTIME_CHECK(hipFree(ringCntBuf));
   ShmemFree(baseBuf);
   ShmemFinalize();
   info.ret_code = 0;
