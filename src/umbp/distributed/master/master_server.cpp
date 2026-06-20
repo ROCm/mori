@@ -427,17 +427,35 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     std::unordered_set<std::string> excludes(request->exclude_nodes().begin(),
                                              request->exclude_nodes().end());
     auto results = router_.BatchRouteGet(keys, request->node_id(), excludes);
+    // Columnar response: distinct (node_id, peer_address) pairs are emitted
+    // once into `nodes`; each key carries a 1-based node_ref index (0 = not
+    // found). node_ref/tier/size are parallel arrays aligned with the request
+    // keys, so the per-key fields default to 0 for unresolved keys.
+    response->mutable_node_ref()->Reserve(static_cast<int>(results.size()));
+    response->mutable_tier()->Reserve(static_cast<int>(results.size()));
+    response->mutable_size()->Reserve(static_cast<int>(results.size()));
+    // Maps "node_id\0peer_address" -> 1-based index into response->nodes().
+    std::unordered_map<std::string, uint32_t> node_index;
     for (auto& opt : results) {
-      auto* entry = response->add_entries();
       if (!opt.has_value()) {
-        entry->set_found(false);
+        response->add_node_ref(0);
+        response->add_tier(::umbp::TIER_UNKNOWN);
+        response->add_size(0);
         continue;
       }
-      entry->set_found(true);
-      entry->set_node_id(opt->location.node_id);
-      entry->set_tier(static_cast<::umbp::TierType>(opt->location.tier));
-      entry->set_size(opt->location.size);
-      entry->set_peer_address(opt->peer_address);
+      std::string node_key = opt->location.node_id;
+      node_key.push_back('\0');
+      node_key.append(opt->peer_address);
+      auto [it, inserted] = node_index.try_emplace(node_key, 0);
+      if (inserted) {
+        auto* node = response->add_nodes();
+        node->set_node_id(opt->location.node_id);
+        node->set_peer_address(opt->peer_address);
+        it->second = static_cast<uint32_t>(response->nodes_size());  // 1-based
+      }
+      response->add_node_ref(it->second);
+      response->add_tier(static_cast<::umbp::TierType>(opt->location.tier));
+      response->add_size(opt->location.size);
       if (metrics_) {
         metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET,
                              MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP,

@@ -517,6 +517,30 @@ TEST(PeerDramAllocator, BatchResolveMixedHitsAndMisses) {
   EXPECT_FALSE(results[3].found);
 }
 
+TEST(PeerDramAllocator, BatchResolveIncludeDescsFalseSkipsDescs) {
+  auto a = MakeAllocator();
+  auto p_hit = AllocateOk(*a, "hit", kPageSize * 5, TierType::DRAM);
+  ASSERT_TRUE(p_hit.has_value());
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p_hit->slot_id, "hit", committed_bytes));
+  a->DrainPendingEvents();
+
+  auto ref_hit = a->Resolve("hit");
+  ASSERT_TRUE(ref_hit.found);
+
+  auto results = a->BatchResolve({"hit", "ghost"}, /*include_descs=*/false);
+  ASSERT_EQ(results.size(), 2u);
+
+  EXPECT_TRUE(results[0].found);
+  EXPECT_EQ(results[0].tier, ref_hit.tier);
+  EXPECT_EQ(results[0].pages, ref_hit.pages);
+  EXPECT_EQ(results[0].size, ref_hit.size);
+  EXPECT_TRUE(results[0].descs.empty());
+
+  EXPECT_FALSE(results[1].found);
+  EXPECT_TRUE(results[1].descs.empty());
+}
+
 TEST(PeerDramAllocator, BatchResolveExtendsLeaseForHitsOnly) {
   auto a = std::make_unique<PeerDramAllocator>(kPageSize, MakeDramCfg(), EmptyCfg(),
                                                /*pending_ttl=*/std::chrono::milliseconds{5000},

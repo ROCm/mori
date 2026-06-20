@@ -76,6 +76,22 @@ target_link_libraries(
 add_test(NAME umbp_master_client_rpc_latency
          COMMAND test_umbp_master_client_rpc_latency)
 
+# BatchRouteGet columnar response wire-format round-trip (node-table dedup,
+# 1-based node_ref, node_ref==0 -> not found, parallel tier/size columns). gRPC
+# mock master + real MasterClient; no RDMA.
+add_executable(test_umbp_batch_route_get_columnar
+               test_batch_route_get_columnar.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_batch_route_get_columnar PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_batch_route_get_columnar
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_batch_route_get_columnar
+         COMMAND test_umbp_batch_route_get_columnar)
+
 # Client-tag registration + metrics label injection.
 add_executable(test_umbp_tags test_umbp_tags.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

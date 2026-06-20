@@ -331,15 +331,18 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
   _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
 
-  out->resize(static_cast<size_t>(resp.entries_size()));
-  for (int i = 0; i < resp.entries_size(); ++i) {
-    const auto& e = resp.entries(i);
-    if (!e.found()) continue;
+  // Columnar response: node_ref[i] is a 1-based index into resp.nodes()
+  // (0 = not found); tier[i] / size[i] are parallel per-key arrays.
+  out->resize(static_cast<size_t>(resp.node_ref_size()));
+  for (int i = 0; i < resp.node_ref_size(); ++i) {
+    const uint32_t node_ref = resp.node_ref(i);
+    if (node_ref == 0) continue;  // not found
+    const auto& node = resp.nodes(static_cast<int>(node_ref) - 1);
     RouteGetResult r;
-    r.node_id = e.node_id();
-    r.tier = FromProtoTier(e.tier());
-    r.size = e.size();
-    r.peer_address = e.peer_address();
+    r.node_id = node.node_id();
+    r.tier = FromProtoTier(resp.tier(i));
+    r.size = resp.size(i);
+    r.peer_address = node.peer_address();
     (*out)[i] = std::move(r);
   }
   return grpc::Status::OK;

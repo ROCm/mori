@@ -197,7 +197,35 @@ message BatchAbortSlotsResponse {
 
 message BatchResolveKeysRequest {
   repeated string keys = 1;
+  // When set, the peer omits the per-buffer descriptors from the response: the
+  // client has already hydrated buffer_index -> MemoryDesc from GetPeerInfo
+  // (dram_memory_descs) and the read path looks descriptors up in that cache.
+  // A wrongly-omitted descriptor degrades to a cache miss on the client (the
+  // transfer-build guard rejects the entry), never to a corrupt read.
+  bool omit_descs = 2;
 }
+// Struct-of-arrays layout.  The previous shape repeated a full ResolveKeyResponse
+// per key, each carrying its own copy of the peer's buffer descriptors and
+// page_size — the descriptors and page_size are batch-invariant, so that
+// duplicated O(keys * buffers) payload per BatchGet.  Here the descriptors are
+// deduplicated once per batch (by buffer_index), page_size is hoisted to a
+// single field, the per-key fixed fields live in parallel arrays (index i ==
+// request.keys[i]), and every key's page locations are flattened into
+// buffer_index/page_index with page_count[i] delimiting key i's slice.  This
+// removes the per-key sub-message framing and the descriptor duplication.
 message BatchResolveKeysResponse {
-  repeated ResolveKeyResponse entries = 1;
+  // Deduplicated buffer descriptors, once per batch (empty when the request set
+  // omit_descs, or when no resolved key was found).
+  repeated BufferMemoryDesc descs = 1;
+  // Peer-global page size.
+  uint64 page_size = 2;
+  // Per-key fixed fields, parallel to request.keys.
+  repeated bool     found      = 3;
+  repeated TierType tier       = 4;
+  repeated uint64   size       = 5;
+  repeated uint32   page_count = 6;
+  // Flattened page locations across all keys: key i owns the next page_count[i]
+  // (buffer_index, page_index) pairs, walking keys in order.
+  repeated uint32 buffer_index = 7;
+  repeated uint32 page_index   = 8;
 }

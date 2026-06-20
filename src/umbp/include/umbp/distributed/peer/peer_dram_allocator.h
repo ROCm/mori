@@ -197,7 +197,11 @@ class PeerDramAllocator : public OwnedLocationSource {
 
   // Batched Resolve + BufferDescsForPages under a single mutex_ hold.
   // Per-key behavior byte-identical to Resolve() + BufferDescsForPages().
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys);
+  // `include_descs=false` skips BuildBufferDescsLocked entirely (leaving
+  // descs empty) — for callers that already have the buffer descs cached
+  // (e.g. from GetPeerInfo) and would otherwise discard the result.
+  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
+                                          bool include_descs = true);
 
   // Master-driven eviction.  Idempotent: keys that are unknown or
   // already gone produce zero-bytes entries; keys with active read

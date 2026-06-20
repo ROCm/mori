@@ -413,8 +413,9 @@ class PoolClient {
                                 std::vector<PutEntryOutcome>* results,
                                 ::umbp::UMBPPeer::Stub* stub);
 
-  bool PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items, ::umbp::UMBPPeer::Stub* stub,
-                               std::vector<RemoteGetEntry>* entries, std::vector<bool>* results);
+  bool PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items, PeerConnection& peer,
+                               ::umbp::UMBPPeer::Stub* stub, std::vector<RemoteGetEntry>* entries,
+                               std::vector<bool>* results);
   bool BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, PeerConnection& peer,
                                std::vector<TransferInstruction>* transfers,
                                uint64_t* staging_bytes);

@@ -174,6 +174,24 @@ target_compile_features(test_peer_ssd_read_rpc PRIVATE cxx_std_17)
 gtest_discover_tests(test_peer_ssd_read_rpc)
 
 # ---------------------------------------------------------------------------
+# test_batch_resolve_codec — struct-of-arrays BatchResolveKeysResponse wire
+# codec (batch_resolve_codec.h): encode/decode round-trip, page flattening, desc
+# dedup / omit_descs, malformed-response rejection, and the payload-size win.
+# Needs the generated proto (carried by umbp_common) + protobuf.
+# ---------------------------------------------------------------------------
+add_executable(test_batch_resolve_codec test_batch_resolve_codec.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_batch_resolve_codec PRIVATE -Wl,--no-as-needed)
+endif()
+
+target_link_libraries(test_batch_resolve_codec
+                      PRIVATE umbp_common ${_PROTOBUF_LIB} GTest::gtest_main)
+
+target_compile_features(test_batch_resolve_codec PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_batch_resolve_codec)
+
+# ---------------------------------------------------------------------------
 # test_ssd_read_lease_gating — pure reader-side lease gating decision logic
 # (ssd_read_lease.h).  Header-only under test (no gRPC / RDMA deps).
 # ---------------------------------------------------------------------------
