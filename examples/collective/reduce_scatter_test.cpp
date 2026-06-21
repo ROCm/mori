@@ -106,6 +106,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
@@ -257,13 +258,21 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
     return RsMode::kPush;
   }();
 
+  // Pull uses the all-peers-up-front reduction; NPES is a compile-time template
+  // arg, so the host dispatches on the real npes (supported for npes in [1, 8],
+  // the single-node GPU count).
+  if (mode == RsMode::kPull && (npes < 1 || npes > 8)) {
+    XPUT("ERROR: pull mode supports npes in [1,8], got %d", npes);
+    info.ret_code = -1;
+    return;
+  }
+
   if (info.deviceId == 0) {
     if (mode == RsMode::kPush) {
       XPUT("reduce_scatter_test: mode=PUSH slices=%d blocks=%d (SMs=%d)", pushSlices, pushBlocks,
            prop.multiProcessorCount);
     } else {
-      XPUT("reduce_scatter_test: mode=PULL numQ=%d blocks=%d (SMs=%d)", numQ, blocks,
-           prop.multiProcessorCount);
+      XPUT("reduce_scatter_test: mode=PULL blocks=%d (SMs=%d)", blocks, prop.multiProcessorCount);
     }
   }
   ShmemBarrierAll();
@@ -281,9 +290,22 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
     HIP_RUNTIME_CHECK(hipEventRecord(tStart, stream));
     if (mode == RsMode::kPull) {
       // input lives at offset 0 of baseBuf, so baseObj->peerPtrs[pe] is peer pe's
-      // input base. output is the local shard buffer.
-      ReduceScatterPullKernel<VecBytes, NumVecs, ElemT, SumOp><<<blocks, kThreads, 0, stream>>>(
-          myPe, npes, baseObj, output, chunkElems);
+      // input base. output is the local shard buffer. NPES is compile-time so the
+      // all-peers register tile stays in VGPRs; dispatch on the real npes.
+      auto launch = [&](auto NPES_c) {
+        ReduceScatterPullKernel<VecBytes, NumVecs, decltype(NPES_c)::value, ElemT, SumOp>
+            <<<blocks, kThreads, 0, stream>>>(myPe, baseObj, output, chunkElems);
+      };
+      switch (npes) {
+        case 1: launch(std::integral_constant<int, 1>{}); break;
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 6: launch(std::integral_constant<int, 6>{}); break;
+        case 7: launch(std::integral_constant<int, 7>{}); break;
+        default: launch(std::integral_constant<int, 8>{}); break;
+      }
     } else {
       // gen = monotonic launch generation (signals are zeroed once and never
       // reset, so the receive-side wait matches the exact per-launch value).

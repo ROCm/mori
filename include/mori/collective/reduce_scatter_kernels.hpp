@@ -239,6 +239,49 @@ __device__ __forceinline__ void ReduceVecGroup(SrcBaseFn srcBase, T* __restrict_
   }
 }
 
+// Load M output positions x NPES peers ALL up front into distinct registers, then
+// reduce each position. Unlike ReduceVecGroup (which reuses one buffer per peer and
+// so serializes the remote loads peer-by-peer via a WAR dependency), every load
+// here is independent: with all indices compile-time the regs[][] array stays in
+// VGPRs and the M*NPES loads issue back-to-back, so the long remote-load latency is
+// paid once and the per-position reductions overlap with still-in-flight loads.
+// Callers guarantee every member index (g + m*gstride) is in-bounds.
+template <int VecBytes, int M, int NPES, class T,
+          template <class> class OpT, class SrcBaseFn>
+__device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, T* __restrict__ output,
+                                                    size_t g, size_t gstride) {
+  constexpr int vecSize = VecBytes / sizeof(T);
+  using Vec = TVecType<VecBytes>;
+  using AccType = typename AccumulatorType<T>::type;
+  using Data = std::array<T, vecSize>;
+  Vec regs[M][NPES];
+#pragma unroll
+  for (int m = 0; m < M; m++) {
+    size_t idx = g + static_cast<size_t>(m) * gstride;
+#pragma unroll
+    for (int pe = 0; pe < NPES; pe++)
+      regs[m][pe] = StreamLoad<VecBytes>(srcBase(pe) + idx * vecSize);
+  }
+#pragma unroll
+  for (int m = 0; m < M; m++) {
+    AccType acc[vecSize];
+    Data l0 = __builtin_bit_cast(Data, regs[m][0]);
+#pragma unroll
+    for (int j = 0; j < vecSize; j++) acc[j] = UpcastF<T>(l0[j]);
+#pragma unroll
+    for (int pe = 1; pe < NPES; pe++) {
+      Data l = __builtin_bit_cast(Data, regs[m][pe]);
+#pragma unroll
+      for (int j = 0; j < vecSize; j++) acc[j] = OpT<T>()(acc[j], UpcastF<T>(l[j]));
+    }
+    Data o;
+#pragma unroll
+    for (int j = 0; j < vecSize; j++) o[j] = DowncastF<T>(acc[j]);
+    StreamStore<VecBytes>(output + (g + static_cast<size_t>(m) * gstride) * vecSize,
+                          __builtin_bit_cast(Vec, o));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Fused reduce-scatter kernel
 //
@@ -390,16 +433,22 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int S, const T* __re
 // staging buffer and no cross-block flag handoff, so every block is independent
 // (no co-residency cap) and the kernel is a single fused grid-strided reduce.
 //
+// The fast path uses ReduceAllPeersGroup: each group reduces M = NumVecs/NPES
+// output positions and issues all M*NPES remote loads up front, for maximum
+// memory-level parallelism across peers (the long XGMI read latency is paid once
+// per group instead of once per peer). NPES is a compile-time template arg so the
+// per-position/per-peer register tile stays in VGPRs; the host dispatches on the
+// real npes.
+//
 // Correctness requires all PEs to have produced their input before launch; the
-// host issues a ShmemBarrierAll() before timing. Best for small/medium chunks
-// where the staging round-trip (extra 2N local HBM traffic) and the serial
-// block-0 scatter dominate.
+// host issues a ShmemBarrierAll() before timing.
 // ---------------------------------------------------------------------------
-template <int VecBytes, int NumVecs, class T, template <class> class OpT>
-__global__ void ReduceScatterPullKernel(int myPe, int npes,
+template <int VecBytes, int NumVecs, int NPES, class T, template <class> class OpT>
+__global__ void ReduceScatterPullKernel(int myPe,
                                         mori::application::SymmMemObjPtr srcObj,
                                         T* __restrict__ output, size_t chunkElems) {
   constexpr int vecSize = VecBytes / sizeof(T);
+  constexpr int M = NumVecs / NPES;  // output positions per group (M >= 1 for NPES <= NumVecs)
   const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
   const size_t totalVecs = chunkElems / vecSize;
@@ -411,20 +460,21 @@ __global__ void ReduceScatterPullKernel(int myPe, int npes,
     return reinterpret_cast<const T*>(srcObj->peerPtrs[pe]) + myOfs;
   };
 
-  // Same guard-free fast path + single trailing partial group as the push kernel.
+  // Fast path: M positions per group, all M*NPES loads issued up front.
   size_t g = gtid;
-  for (; g + static_cast<size_t>(NumVecs - 1) * gstride < totalVecs; g += gstride * NumVecs) {
-    ReduceVecGroup<VecBytes, NumVecs, T, OpT>(srcBase, output, npes, g, gstride);
+  for (; g + static_cast<size_t>(M - 1) * gstride < totalVecs; g += gstride * M) {
+    ReduceAllPeersGroup<VecBytes, M, NPES, T, OpT>(srcBase, output, g, gstride);
   }
+  // Trailing in-bounds vectors for this thread (fewer than M left).
   for (size_t idx = g; idx < totalVecs; idx += gstride) {
-    ReduceVecGroup<VecBytes, 1, T, OpT>(srcBase, output, npes, idx, gstride);
+    ReduceVecGroup<VecBytes, 1, T, OpT>(srcBase, output, NPES, idx, gstride);
   }
 
   // Scalar tail for elements not covered by the vectorized loop.
   for (size_t i = totalVecs * vecSize + gtid; i < chunkElems; i += gstride) {
     using Vec = TVecType<sizeof(T)>;
     AccType a = UpcastF<T>(load<sizeof(T)>(srcBase(0) + i));
-    for (int pe = 1; pe < npes; pe++) {
+    for (int pe = 1; pe < NPES; pe++) {
       auto V = load<sizeof(T)>(srcBase(pe) + i);
       a = OpT<T>()(a, UpcastF<T>(V));
     }
