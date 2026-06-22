@@ -39,9 +39,8 @@
 #include <vector>
 
 #include "hip/hip_runtime.h"
-#include "mori/application/application_device_types.hpp"  // white-box: RdmaEndpointDevice (count QPs)
-#include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/cco/cco.hpp"
+#include "mori/core/transport/rdma/core_device_types.hpp"  // core::RdmaEndpointDevice (endpoint readback)
 #include "mori/utils/mori_log.hpp"
 
 #define HIP_CHECK(cmd)                                                            \
@@ -176,7 +175,7 @@ static bool exercise_window_register(mori::cco::ccoComm* comm, mori::cco::ccoWin
   return true;
 }
 
-static void run_rank(int rank, int nranks, const mori::application::UniqueId& uid, Result* r) {
+static void run_rank(int rank, int nranks, const mori::cco::ccoUniqueId& uid, Result* r) {
   r->rank = rank;
   r->passed = false;
 
@@ -193,11 +192,9 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     if (canAccess) (void)hipDeviceEnablePeerAccess(i, 0);
   }
 
-  auto* bootNet = new mori::application::SocketBootstrapNetwork(uid, rank, nranks);
-
-  // Phase 1: ccoCommCreate
+  // Phase 1: ccoCommCreate (cco builds its own socket bootstrap from the uid)
   mori::cco::ccoComm* comm = nullptr;
-  if (mori::cco::ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
+  if (mori::cco::ccoCommCreate(uid, nranks, rank, PER_RANK_VMM_SIZE, &comm) != 0) {
     snprintf(r->detail, sizeof(r->detail), "CommCreate failed");
     return;
   }
@@ -328,7 +325,11 @@ int main(int argc, char** argv) {
 
   printf("=== CCO GDA Connection Modes Test (%d ranks) ===\n\n", nranks);
 
-  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 18458);
+  mori::cco::ccoUniqueId uid;
+  if (mori::cco::ccoGetUniqueId(&uid) != 0) {
+    printf("ccoGetUniqueId failed (set MORI_SOCKET_IFNAME=<iface>)\n");
+    return 1;
+  }
 
   std::vector<Result> results(nranks);
   std::vector<std::thread> threads;

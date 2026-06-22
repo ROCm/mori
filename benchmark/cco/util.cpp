@@ -26,7 +26,8 @@
 #include <string>
 
 #include "hip/hip_runtime.h"
-#include "mori/application/bootstrap/mpi_bootstrap.hpp"
+#include <mpi.h>
+
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/env_utils.hpp"
 
@@ -240,17 +241,27 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     if (can_access) (void)hipDeviceEnablePeerAccess(i, 0);
   }
 
-  // CCO comm. bootNet ownership transfers to comm (freed in ccoCommDestroy).
-  auto* bootNet = new application::MpiBootstrapNetwork(MPI_COMM_WORLD);
+  // CCO comm via the cco-native uniqueId API: rank 0 mints the id (its socket
+  // rendezvous), MPI broadcasts the POD, all ranks create the comm.
+  int world_size = 0;
+  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+  ccoUniqueId uid;
+  if (ctx->world_rank == 0) {
+    if (ccoGetUniqueId(&uid) != 0) {
+      std::fprintf(stderr, "ccoGetUniqueId failed (set MORI_SOCKET_IFNAME=<iface>)\n");
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+  }
+  MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
   const std::size_t per_rank_vmm = 2 * args.max_size + kVmmSlack;
-  if (ccoCommCreate(bootNet, per_rank_vmm, &ctx->comm) != 0) {
+  if (ccoCommCreate(uid, world_size, ctx->world_rank, per_rank_vmm, &ctx->comm) != 0) {
     if (ctx->world_rank == 0) std::fprintf(stderr, "ccoCommCreate failed\n");
     PerfFinalize(ctx);
     return 1;
   }
 
-  ctx->my_pe = ctx->comm->rank;
-  ctx->npes = ctx->comm->worldSize;
+  ctx->my_pe = ctx->world_rank;
+  ctx->npes = world_size;
   if (ctx->npes != 2) {
     if (ctx->my_pe == 0) {
       std::fprintf(stderr, "CCO p2p benchmark requires exactly 2 PEs (npes=%d)\n", ctx->npes);
@@ -338,9 +349,6 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
 }
 
 void PerfFinalize(PerfContext* ctx) {
-  // Free our local communicator first: ccoCommDestroy below calls
-  // bootNet->Finalize(), which invokes MPI_Finalize — any MPI_Comm_free after
-  // that is illegal and aborts the job.
   if (ctx->local_comm != MPI_COMM_NULL) {
     MPI_Comm_free(&ctx->local_comm);
     ctx->local_comm = MPI_COMM_NULL;
@@ -356,16 +364,13 @@ void PerfFinalize(PerfContext* ctx) {
     if (ctx->send_win) ccoWindowDeregister(ctx->comm, ctx->send_win);
     if (ctx->recv_buf) ccoMemFree(ctx->comm, ctx->recv_buf);
     if (ctx->send_buf) ccoMemFree(ctx->comm, ctx->send_buf);
-    // ccoCommDestroy finalizes MPI via bootNet->Finalize().
-    ccoCommDestroy(ctx->comm);
+    ccoCommDestroy(ctx->comm);  // cco's socket bootstrap — does NOT finalize MPI
     ctx->comm = nullptr;
-  } else {
-    int finalized = 0;
-    MPI_Finalized(&finalized);
-    if (!finalized) {
-      MPI_Finalize();
-    }
   }
+  // We own MPI now (uniqueId bootstrap); finalize it ourselves.
+  int finalized = 0;
+  MPI_Finalized(&finalized);
+  if (!finalized) MPI_Finalize();
 }
 
 void PerfResAlloc(PerfRes* res) {

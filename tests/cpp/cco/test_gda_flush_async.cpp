@@ -93,7 +93,7 @@ __global__ void GdaAlltoAllFlushAsyncKernel(mori::cco::ccoWindowDevice* sendWin,
   }
 }
 
-int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
+int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
   g_rank = rank;
 
   int numDevices = 0;
@@ -112,7 +112,7 @@ int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet)
 
   // setup: comm, send/recv buffers, windows
   mori::cco::ccoComm* comm = nullptr;
-  if (mori::cco::ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
+  if (mori::cco::ccoCommCreate(uid, nranks, rank, PER_RANK_VMM_SIZE, &comm) != 0) {
     fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
     return 1;
   }

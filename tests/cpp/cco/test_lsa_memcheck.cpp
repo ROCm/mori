@@ -80,7 +80,7 @@ __global__ void lsa_barrier_kernel(ccoDevComm devComm) {
 }
 
 // ── main ───────────────────────────────────────────────────────────────────
-int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
+int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
   g_rank = rank;
 
   int window_iters = 100;
@@ -100,7 +100,7 @@ int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet)
   CCO_MUST(hipSetDevice(rank % hipDevCount) == hipSuccess);
 
   mori::cco::ccoComm* comm = nullptr;
-  if (ccoCommCreate(bootNet, /*perRankVmmSize=*/0, &comm) != 0) {
+  if (ccoCommCreate(uid, nranks, rank, /*perRankVmmSize=*/0, &comm) != 0) {
     fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
     return 1;
   }

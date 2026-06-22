@@ -610,7 +610,7 @@ static int run_all_tests(UtCtx& ctx) {
 // Host driver — setup, single call to run_all_tests, teardown.
 // ============================================================================
 
-int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
+int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
   g_rank = rank;
 
   // Bind each rank to its own GPU BEFORE ccoCommCreate (which pins
@@ -621,7 +621,7 @@ int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet)
 
   // ── Phase 1: communicator ──
   ccoComm* comm = nullptr;
-  if (ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
+  if (ccoCommCreate(uid, nranks, rank, PER_RANK_VMM_SIZE, &comm) != 0) {
     std::fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
     return 1;
   }

@@ -29,7 +29,6 @@
 #include <vector>
 
 #include "hip/hip_runtime.h"
-#include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/cco/cco.hpp"
 #include "mori/utils/mori_log.hpp"
 
@@ -52,7 +51,7 @@ struct ThreadResult {
   char detail[512];
 };
 
-static void run_rank(int rank, int nranks, const mori::application::UniqueId& uid,
+static void run_rank(int rank, int nranks, const mori::cco::ccoUniqueId& uid,
                      ThreadResult* result) {
   result->rank = rank;
   result->passed = false;
@@ -74,11 +73,9 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
 
   printf("[rank %d] GPU %d\n", rank, dev);
 
-  auto* bootNet = new mori::application::SocketBootstrapNetwork(uid, rank, nranks);
-
-  // Phase 1: CommCreate
+  // Phase 1: CommCreate (cco builds its own socket bootstrap from the uid)
   mori::cco::ccoComm* comm = nullptr;
-  int ret = mori::cco::ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm);
+  int ret = mori::cco::ccoCommCreate(uid, nranks, rank, PER_RANK_VMM_SIZE, &comm);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "CommCreate failed: %d", ret);
     return;
@@ -268,7 +265,11 @@ int main(int argc, char** argv) {
 
   printf("=== CCO Host API Test (%d ranks on %d GPUs) ===\n\n", nranks, numDevices);
 
-  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 18456);
+  mori::cco::ccoUniqueId uid;
+  if (mori::cco::ccoGetUniqueId(&uid) != 0) {
+    printf("ccoGetUniqueId failed (set MORI_SOCKET_IFNAME=<iface>)\n");
+    return 1;
+  }
 
   std::vector<ThreadResult> results(nranks);
   std::vector<std::thread> threads;

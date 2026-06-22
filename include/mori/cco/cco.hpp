@@ -886,21 +886,15 @@ struct ccoComm;  // device/kernel TUs: opaque handle only
 
 // ── Phase 1: Communicator ──
 //
-// Two ways to bootstrap:
+// Self-contained bootstrap (needs only this header). Rank 0 calls
+// ccoGetUniqueId, broadcasts the 128-byte POD id to all ranks out-of-band
+// (MPI_Bcast, a file, your launcher, ...), then every rank calls ccoCommCreate.
+// cco builds its built-in socket bootstrap internally.
 //
-//  A) Self-contained (needs only this header). Rank 0 calls
-//     ccoGetUniqueId, broadcasts the 128-byte POD id to all ranks out-of-band
-//     (MPI_Bcast, a file, your launcher, ...), then every rank calls the
-//     ccoUniqueId overload. cco builds its built-in socket bootstrap internally.
-//
-//       ccoUniqueId id;
-//       if (rank == 0) ccoGetUniqueId(&id);
-//       /* broadcast id to all ranks */
-//       ccoCommCreate(id, nRanks, rank, vmm, &comm);
-//
-//  B) Pluggable transport: construct a concrete bootstrap yourself (include the
-//     matching mori/application/bootstrap/{socket,mpi,torch}_bootstrap.hpp) and
-//     pass it in. cco takes ownership and destroys it in ccoCommDestroy.
+//   ccoUniqueId id;
+//   if (rank == 0) ccoGetUniqueId(&id);
+//   /* broadcast id to all ranks */
+//   ccoCommCreate(id, nRanks, rank, vmm, &comm);
 //
 // ccoUniqueId encodes rank 0's socket rendezvous address; the interface is
 // picked from MORI_SOCKET_IFNAME (see socket bootstrap docs).
@@ -911,9 +905,6 @@ struct ccoUniqueId {
 int ccoGetUniqueId(ccoUniqueId* uniqueId);
 int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
                   ccoComm** comm);
-
-// Overload B: caller-provided bootstrap (ownership transferred to the comm).
-int ccoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize, ccoComm** comm);
 int ccoCommDestroy(ccoComm* comm);
 
 // ── Phase 1.5 (optional): VMM allocation + P2P flat-space mapping ──

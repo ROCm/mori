@@ -20,21 +20,22 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Shared launch harness for multi-rank CCO GDA tests.
+// Shared launch harness for multi-rank CCO tests.
 //
 // Each test provides only:
 //   - its __global__ kernel(s)
-//   - int run_test(int rank, int nranks, mori::application::BootstrapNetwork*)
+//   - int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid)
 //   - a one-line main() that calls ccoTestMain(...)
-// This header owns the rest: HIP_CHECK, the fork / single-rank / gen-uid launch
-// modes, and the MPI/fork dispatch. See test_cco_gda_put.cpp for usage.
+// This header owns the rest: HIP_CHECK and the fork / single-rank / gen-uid /
+// MPI launch modes. It obtains a ccoUniqueId (rank 0 / parent), distributes it
+// over the launch channel (MPI_Bcast or a file), and hands it to run_test, which
+// creates the comm via the cco-native ccoCommCreate(uid, nRanks, rank, ...) API —
+// no application:: bootstrap types are used.
 
 #pragma once
 
 #ifdef MORI_WITH_MPI
 #include <mpi.h>
-
-#include "mori/application/bootstrap/mpi_bootstrap.hpp"
 #endif
 
 #include <sys/wait.h>
@@ -46,7 +47,7 @@
 #include <vector>
 
 #include "hip/hip_runtime.h"
-#include "mori/application/bootstrap/socket_bootstrap.hpp"
+#include "mori/cco/cco.hpp"
 
 // Current rank, set at the top of each run_test; used by HIP_CHECK diagnostics.
 inline int g_rank = 0;
@@ -65,10 +66,11 @@ inline int g_rank = 0;
 // now — it is compile-time (per-NIC build), so GDA tests include that header and
 // call CCO_GDA_DISPATCH(Kernel<P, ...><<<...>>>(...)) with no runtime provider.
 
-// Each test implements this; the harness invokes it for every rank.
-int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet);
+// Each test implements this; the harness invokes it for every rank with the
+// shared cco unique id (rank 0's socket rendezvous, distributed out-of-band).
+int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid);
 
-// ── small file helpers (UID exchange for socket bootstrap) ───────────────────
+// ── small file helpers (UID exchange for fork / cross-host launches) ──────────
 
 static inline void ccoTestWriteFile(const char* path, const void* data, size_t len) {
   FILE* f = fopen(path, "wb");
@@ -86,26 +88,30 @@ static inline bool ccoTestReadFile(const char* path, void* data, size_t len) {
 
 // ── fork mode: spawn nranks children, each binds one GPU ─────────────────────
 
-static inline int ccoTestForkMode(int nranks, const char* name, const char* uidPrefix, int port) {
+static inline int ccoTestForkMode(int nranks, const char* name, const char* uidPrefix,
+                                  int /*port*/) {
   char uidPath[256];
   snprintf(uidPath, sizeof(uidPath), "%s_%d", uidPrefix, getpid());
 
   printf("=== %s Test (fork, %d ranks) ===\n", name, nranks);
   fflush(stdout);
 
-  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", port);
+  mori::cco::ccoUniqueId uid;
+  if (mori::cco::ccoGetUniqueId(&uid) != 0) {
+    fprintf(stderr, "ccoGetUniqueId failed (set MORI_SOCKET_IFNAME=<iface>)\n");
+    return 1;
+  }
   ccoTestWriteFile(uidPath, &uid, sizeof(uid));
 
   std::vector<pid_t> children;
   for (int r = 0; r < nranks; r++) {
     pid_t pid = fork();
     if (pid == 0) {
-      mori::application::UniqueId childUid;
+      mori::cco::ccoUniqueId childUid;
       while (!ccoTestReadFile(uidPath, &childUid, sizeof(childUid))) {
         usleep(10000);
       }
-      auto* boot = new mori::application::SocketBootstrapNetwork(childUid, r, nranks);
-      _exit(run_test(r, nranks, boot));
+      _exit(run_test(r, nranks, childUid));
     }
     children.push_back(pid);
   }
@@ -142,24 +148,23 @@ static inline int ccoTestSingleRankMode(int argc, char** argv) {
   }
   if (rank < 0 || worldSize <= 0 || !uidPath) return -1;
 
-  mori::application::UniqueId uid;
+  mori::cco::ccoUniqueId uid;
+  bool got = false;
   for (int tries = 0; tries < 600; tries++) {
-    FILE* f = fopen(uidPath, "rb");
-    if (f) {
-      size_t n = fread(&uid, 1, sizeof(uid), f);
-      fclose(f);
-      if (n == sizeof(uid)) break;
+    if (ccoTestReadFile(uidPath, &uid, sizeof(uid))) {
+      got = true;
+      break;
     }
     usleep(100000);
   }
+  if (!got) return -1;
 
   if (gpuOffset >= 0) HIP_CHECK(hipSetDevice(rank - gpuOffset));
 
-  auto* boot = new mori::application::SocketBootstrapNetwork(uid, rank, worldSize);
-  return run_test(rank, worldSize, boot);
+  return run_test(rank, worldSize, uid);
 }
 
-// ── gen-uid mode: emit a UID file for cross-host single-rank launches ────────
+// ── gen-uid mode: emit a UID file for cross-host single-rank launches ─────────
 
 static inline int ccoTestGenUidMode(int argc, char** argv) {
   if (argc < 5) {
@@ -167,9 +172,15 @@ static inline int ccoTestGenUidMode(int argc, char** argv) {
     return 1;
   }
   const char* iface = argv[2];
-  int port = atoi(argv[3]);
   const char* outPath = argv[4];
-  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(iface, port);
+  // ccoGetUniqueId reads the interface from MORI_SOCKET_IFNAME and picks a free
+  // port itself; honour the iface arg by exporting it. (PORT is ignored.)
+  setenv("MORI_SOCKET_IFNAME", iface, /*overwrite=*/1);
+  mori::cco::ccoUniqueId uid;
+  if (mori::cco::ccoGetUniqueId(&uid) != 0) {
+    fprintf(stderr, "ccoGetUniqueId failed for iface=%s\n", iface);
+    return 1;
+  }
   FILE* f = fopen(outPath, "wb");
   if (!f) {
     fprintf(stderr, "fopen(%s) failed\n", outPath);
@@ -177,7 +188,7 @@ static inline int ccoTestGenUidMode(int argc, char** argv) {
   }
   fwrite(&uid, 1, sizeof(uid), f);
   fclose(f);
-  printf("Wrote UID (%zu bytes) for iface=%s port=%d to %s\n", sizeof(uid), iface, port, outPath);
+  printf("Wrote UID (%zu bytes) for iface=%s to %s\n", sizeof(uid), iface, outPath);
   return 0;
 }
 
@@ -185,7 +196,7 @@ static inline int ccoTestGenUidMode(int argc, char** argv) {
 //
 // name      — human label printed in headers (e.g. "CCO GDA flushAsync")
 // uidPrefix — fork-mode UID file prefix    (e.g. "/tmp/cco_gda_flush_async_uid")
-// port      — socket bootstrap port for GenerateUniqueIdWithInterface
+// port      — unused (ccoGetUniqueId picks its own free port); kept for API compat
 static inline int ccoTestMain(int argc, char** argv, const char* name, const char* uidPrefix,
                               int port) {
   if (argc >= 2 && !strcmp(argv[1], "--gen-uid")) return ccoTestGenUidMode(argc, argv);
@@ -206,8 +217,17 @@ static inline int ccoTestMain(int argc, char** argv, const char* name, const cha
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nranks);
     if (rank == 0) printf("=== %s Test (MPI, %d ranks) ===\n", name, nranks);
-    auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
-    return run_test(rank, nranks, boot);
+    // Rank 0 mints the cco unique id (its socket rendezvous) and broadcasts the
+    // POD to every rank; all ranks then create the comm via the uniqueId API.
+    mori::cco::ccoUniqueId uid;
+    if (rank == 0) {
+      if (mori::cco::ccoGetUniqueId(&uid) != 0) {
+        fprintf(stderr, "ccoGetUniqueId failed (set MORI_SOCKET_IFNAME=<iface>)\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+      }
+    }
+    MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
+    return run_test(rank, nranks, uid);
   }
 #endif
 
