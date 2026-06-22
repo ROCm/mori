@@ -26,8 +26,10 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -71,6 +73,27 @@ void ValidateRdmaTransferConfig(const RdmaBackendConfig& config) {
 
 bool UsesInlineOnly(const RdmaBackendConfig& config) {
   return config.enableTransferChunking || config.numNicsPerTransfer > 1;
+}
+
+// Parse MORI_IO_POLL_CQ_MODE: "0"/"polling" or "1"/"event" (case-insensitive).
+// Returns nullopt for anything else so env::Override warns and keeps the
+// config value (no silent fallback).
+std::optional<PollCqMode> ParsePollCqMode(const char* raw) {
+  if (std::strcmp(raw, "0") == 0 || mori::env::detail::EqualsIgnoreCase(raw, "polling")) {
+    return PollCqMode::POLLING;
+  }
+  if (std::strcmp(raw, "1") == 0 || mori::env::detail::EqualsIgnoreCase(raw, "event")) {
+    return PollCqMode::EVENT;
+  }
+  return std::nullopt;
+}
+
+// Parse MORI_IO_POST_BATCH_SIZE: only -1 (auto) or a positive int are valid.
+// Rejects 0 / negatives (which the post path would silently clamp to 1) so
+// env::Override warns and keeps the config value.
+std::optional<int> ParsePostBatchSize(const char* raw) {
+  if (std::strcmp(raw, "-1") == 0) return -1;
+  return mori::env::detail::ParsePositiveInt(raw);
 }
 
 int ResolveRequestedNics(const RdmaBackendConfig& config, const TopoKey& local,
@@ -1235,6 +1258,14 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
                 mori::env::detail::ParsePositiveInt);
   env::Override("MORI_IO_NUM_NICS_PER_TRANSFER", config.numNicsPerTransfer,
                 mori::env::detail::ParsePositiveInt);
+  // Perf-sweep / ops overrides for knobs that otherwise only have a config
+  // field.  postBatchSize accepts any int (-1 = auto), the rest are positive.
+  env::Override("MORI_IO_QP_PER_TRANSFER", config.qpPerTransfer,
+                mori::env::detail::ParsePositiveInt);
+  env::Override("MORI_IO_POST_BATCH_SIZE", config.postBatchSize, ParsePostBatchSize);
+  env::Override("MORI_IO_NUM_WORKER_THREADS", config.numWorkerThreads,
+                mori::env::detail::ParsePositiveInt);
+  env::Override("MORI_IO_POLL_CQ_MODE", config.pollCqMode, ParsePollCqMode);
   ValidateRdmaNotificationConfig(config);
   ValidateRdmaTransferConfig(config);
 
