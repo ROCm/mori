@@ -103,14 +103,20 @@ struct MemoryDesc {
   MemoryLocationType loc;
   std::array<char, kIpcHandleSize> ipcHandle{};
   int numaNode{-1};
+  // Byte offset of `data` within its underlying device allocation. IPC handles
+  // are keyed to the allocation base, so a sub-region registration (where
+  // data = allocBase + ipcOffset, e.g. a per-layer view of a paged KV cache)
+  // must add this offset back to the remapped base on the importing side.
+  uintptr_t ipcOffset{0};
 
   constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
            (deviceBusId == rhs.deviceBusId) && (data == rhs.data) && (size == rhs.size) &&
-           (loc == rhs.loc) && (numaNode == rhs.numaNode);
+           (loc == rhs.loc) && (numaNode == rhs.numaNode) && (ipcOffset == rhs.ipcOffset);
   }
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode);
+  MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode,
+                 ipcOffset);
 };
 
 using TransferUniqueId = uint64_t;
