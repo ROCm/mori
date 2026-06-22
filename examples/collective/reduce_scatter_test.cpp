@@ -230,18 +230,32 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   size_t totalVecs = chunkElems / (VecSize * NumVecs);
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
   int blocks = std::min(wantBlocks, std::max(1, prop.multiProcessorCount));
-  // Push: split each shard into S slices, sent as sequential SDMA sub-chunks on a
-  // SINGLE queue (RS_PUSH_SLICES, default 4). Consumers form S groups (group g
-  // reduces slice g). Clamp S so each slice has >= 1 vector, and round the grid to
-  // a multiple of S (>= 1 block per slice).
-  int pushSlices = 4;
+
+  // Push slicing: RS_PUSH_SLICES (default 1) rounded DOWN to a power of two and
+  // clamped to [1,8]; also clamped so each slice has at least one vector. logS =
+  // log2(S) in [0,3]. pushBlocks is rounded to a multiple of S (>= S) so each of
+  // the S groups gets >= 1 block (G = pushBlocks/S).
+  int pushSlices = 1;
   if (const char* s = std::getenv("RS_PUSH_SLICES")) {
-    int v = std::atoi(s);
-    if (v >= 1) pushSlices = v;
+    int req = std::atoi(s);
+    if (req > 1) {
+      int p = 1;
+      while ((p << 1) <= req && p < 8) p <<= 1;
+      pushSlices = p;
+    }
   }
-  const int maxSlices = static_cast<int>(std::max<size_t>(1, chunkElems / VecSize));
-  pushSlices = std::max(1, std::min(pushSlices, maxSlices));
+  {
+    const size_t maxSlicesByData = std::max<size_t>(1, chunkElems / VecSize);
+    while (pushSlices > 1 && static_cast<size_t>(pushSlices) > maxSlicesByData) pushSlices >>= 1;
+  }
+  int logS = 0;
+  while ((1 << logS) < pushSlices) logS++;
   int pushBlocks = std::max(pushSlices, (blocks / pushSlices) * pushSlices);
+
+  // Local-only per-group block counters for the push reset (never peer-written).
+  uint64_t* groupCounters = nullptr;
+  HIP_RUNTIME_CHECK(hipMalloc(&groupCounters, 8 * sizeof(uint64_t)));
+  HIP_RUNTIME_CHECK(hipMemset(groupCounters, 0, 8 * sizeof(uint64_t)));
 
   // Mode selection: RS_MODE = push|pull (default push). RS_PULL=1 is kept as a
   // back-compat alias for pull.
@@ -307,11 +321,10 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
         default: launch(std::integral_constant<int, 8>{}); break;
       }
     } else {
-      // gen = monotonic launch generation (signals are zeroed once and never
-      // reset, so the receive-side wait matches the exact per-launch value).
+      // Sliced push: S = 1<<logS slices, each with its own per-receiver bitmask
+      // flag; the grid is partitioned into S groups, each reset by its last block.
       ReduceScatterPushKernel<VecBytes, NumVecs, ElemT, SumOp><<<pushBlocks, kThreads, 0, stream>>>(
-          myPe, npes, pushSlices, input, staging, output, chunkElems,
-          static_cast<uint64_t>(iter) + 1);
+          myPe, npes, logS, input, staging, output, groupCounters, chunkElems);
     }
     HIP_RUNTIME_CHECK(hipEventRecord(tStop, stream));
     HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
@@ -358,6 +371,7 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   HIP_RUNTIME_CHECK(hipEventDestroy(tStart));
   HIP_RUNTIME_CHECK(hipEventDestroy(tStop));
   HIP_RUNTIME_CHECK(hipStreamDestroy(stream));
+  HIP_RUNTIME_CHECK(hipFree(groupCounters));
   ShmemFree(baseBuf);
   ShmemFinalize();
   info.ret_code = 0;

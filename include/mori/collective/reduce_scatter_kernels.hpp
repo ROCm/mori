@@ -82,6 +82,10 @@ llvm_amdgcn_raw_buffer_load_i32x4(int32x4_t srsrc,
 using rs_v4u = __attribute__((__vector_size__(4 * sizeof(unsigned int)))) unsigned int;
 using rs_v4u_gptr = GLOBAL_SPACE rs_v4u*;
 
+template<typename T>
+__device__ __host__ inline static  T* Tglobal(T* ptr) { 
+  return (T*)(GLOBAL_SPACE T*)reinterpret_cast<uintptr_t>(ptr); 
+} 
 
 template <int Bytes>
 __device__ __forceinline__ TVecType<Bytes> StreamLoad(
@@ -282,117 +286,130 @@ __device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, T* __rest
   }
 }
 
+// Spin until every bit in `mask` is set in *addr. Used by the push kernel's
+// receiver-side completion flag, where each sender ORs in its own bit. Mirrors
+// anvil::waitForSignalAtLeast's relaxed agent-scope load.
+__device__ __forceinline__ void waitForSignalMask(HSAuint64* addr, uint64_t mask) {
+  while ((__hip_atomic_load(Tglobal(addr), __ATOMIC_RELAXED, 
+                  __HIP_MEMORY_SCOPE_AGENT) & mask) != mask) {
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Fused reduce-scatter kernel
+// Fused reduce-scatter kernel ("push", sliced into S = 1<<logS slices)
 //
-//   input    : raw symmetric-heap pointer, N = npes*chunkElems elements
-//   staging  : raw symmetric-heap pointer, npes slots of chunkElems elements
-//   output   : raw symmetric-heap pointer, chunkElems elements
-//   gen      : monotonic launch generation for the receive-side signal wait
+//   input         : raw symmetric-heap pointer, N = npes*chunkElems elements
+//   staging       : raw symmetric-heap pointer, npes slots of chunkElems elements
+//   output        : raw symmetric-heap pointer, chunkElems elements
+//   groupCounters : plain device buffer (>= S uint64), local-only block counters
 //
-// All three buffers MUST live in the symmetric static heap (ShmemMalloc) so the
-// address-based SDMA put can translate local->peer (offset from heapBaseAddr).
+// Each shard is split into S slices. A sender issues S separate SDMA copies; copy
+// s ORs bit (1<<senderPe) via an SDMA ADD64 into the receiver's per-slice bitmask
+// flag signalPtrs[s] (one copy + one atomic per (sender,slice), so adds never
+// collide). The receiver's grid is partitioned into S groups of G = gridDim.x/S
+// blocks; group g spins only on slice g's flag and reduces only slice g, so a
+// group starts as soon as its slice lands (pipelining). The last block of each
+// group zeroes that slice's flag + its local counter (groupCounters[g]) for the
+// next launch -- no monotonic generation counter needed. Limited to npes <= 64.
+//
+// The S*npes copies are issued concurrently across block 0's threads;
+// SdmaPutThreadFused is multi-producer-safe and per-slice flags make the start
+// order irrelevant.
+//
+// input/staging/output MUST live in the symmetric static heap (ShmemMalloc) so
+// the address-based SDMA put can translate local->peer (offset from heapBaseAddr);
+// groupCounters is a plain hipMalloc'd buffer (never peer-written).
 // ---------------------------------------------------------------------------
 template <int VecBytes, int NumVecs, class T, template <class> class OpT>
-__global__ void ReduceScatterPushKernel(int myPe, int npes, int S, const T* __restrict__ input,
+__global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
                                     T* __restrict__ staging, T* __restrict__ output,
-                                    size_t chunkElems, uint64_t gen) {
+                                    uint64_t* __restrict__ groupCounters, size_t chunkElems) {
   auto* heapObj = GetGlobalGpuStatesPtr()->heapObj;
   const int numSdmaQ = static_cast<int>(heapObj->sdmaNumQueue);
-
-  // The shard is split into S slices (vecSize-aligned; the last slice absorbs the
-  // remainder). Each slice is sent as one SDMA sub-chunk on a SINGLE queue, in
-  // order, so the per-sender completion counter encodes pipeline progress and
-  // group g in Phase 3 reduces exactly the slice-g region.
   constexpr int vecSize = VecBytes / sizeof(T);
+
+  const int S = 1 << logS;
+  // vecSize-aligned slice length; the last slice absorbs the remainder.
   const size_t sliceLen = (chunkElems / static_cast<size_t>(S) / vecSize) * vecSize;
 
-  // === Phase 1: SDMA scatter (block 0 only), ONE thread per destination peer ===
-  // Each destPe thread issues all S sub-chunk copies for that peer sequentially on
-  // queue 0, each followed by an atomic increment of the SAME per-sender signal
-  // slot on the receiver. Because a SINGLE thread issues them in loop order and
-  // submitPacket commits in order, the receiver's counter increments 1,2,...,S as
-  // slices 0,1,...,S-1 land -- so a counter value of v means slices [0, v) are
-  // done. Splitting a peer's S transfers across threads would interleave their
-  // commits and break this mapping. Fire-and-forget: the copy + completion atomic
-  // ride the same queue and the atomic targets the *receiver's* signalPtrs, so
-  // completion is observed on the receive side (Phase 2) -- no local quiet, no
-  // cross-PE barrier, no block-0 -> all-blocks handoff.
+  // Completion bitmask: bit p means "sender p's copy has landed". Self-copy is
+  // skipped, so we wait for every peer bit except our own.
+  const uint64_t allMask = (npes >= 64) ? ~0ull : ((1ull << npes) - 1);
+  const uint64_t wantMask = allMask & ~(1ull << myPe);
+
   int tid = threadIdx.x;
-  if (blockIdx.x == 0 && tid < npes && tid != myPe) {
-    int destPe = tid;
-    // Local symmetric address of peer destPe's staging slot for me (slot myPe).
+
+  // === Phase 1: SDMA scatter (block 0 only), one copy per WARP, concurrent ======
+  // Transfer t = (destPe = t/S, slice = t%S) copies slice s of my shard for destPe
+  // and atomically ADD64s (1<<myPe) into destPe's per-slice flag signalPtrs[s]. The
+  // copy + atomic ride queue 0 and the atomic targets the *receiver's* flag, so
+  // completion is observed on the receive side (Phase 2) -- fire-and-forget, no
+  // local quiet, no cross-PE barrier. Per-slice flags make the issue order
+  // irrelevant.
+  //
+  // CRITICAL: transfers are issued one-per-WARP (lane 0 only), NOT one-per-thread.
+  // SdmaPutThreadFused is multi-producer-safe only ACROSS warps: when two producers
+  // hit the same queue, the later one spin-waits in submitPacket for the earlier to
+  // commit. Two such producers in the SAME warp deadlock (the committing thread is
+  // masked off behind the spinning one under SIMT), so each transfer must own a
+  // distinct warp. Warps are scheduled independently, so the wait resolves.
+  if (blockIdx.x == 0 && (tid % warpSize) == 0) {
+    const int wave = tid / warpSize;
+    const int numWaves = blockDim.x / warpSize;
+    // Local symmetric address of the peer's staging slot for me (slot myPe).
     T* dstLocal = staging + myPe * chunkElems;
-    const T* src = input + destPe * chunkElems;
+    auto** handlesBase = heapObj->deviceHandles_d;
+    const size_t heapBase = GetGlobalGpuStatesPtr()->heapBaseAddr;
+    for (int t = wave; t < npes * S; t += numWaves) {
+      int destPe = t / S;
+      int s = t % S;
+      if (destPe == myPe) continue;  // self-shard is reduced directly in Phase 3
+      auto** handles = handlesBase + (destPe % 8) * numSdmaQ;
+      // Per-slice flag base for destPe: flag[s] = peerSignalPtrs[destPe] + s.
+      HSAuint64* remoteFlags = heapObj->peerSignalPtrs[destPe];
 
-    auto** handles = heapObj->deviceHandles_d + (destPe % 8) * numSdmaQ;
-    // SdmaPutThreadFused still does expectedSignals[0]++ on this local array; that
-    // is now dead bookkeeping (nobody quiets locally) but harmless.
-    HSAuint64* expectedSignals = heapObj->expectSignalsPtr + (destPe % 8) * numSdmaQ;
-    // Completion atomic -> destPe's single per-sender slot (queue 0), keyed by ME:
-    //   destPe.signalPtrs[(myPe % 8) * numSdmaQ]
-    HSAuint64* remoteSig = heapObj->peerSignalPtrs[destPe] + (myPe % 8) * numSdmaQ;
-
-    for (int s = 0; s < S; s++) {
       size_t sOfs = static_cast<size_t>(s) * sliceLen;
       size_t sElems = (s == S - 1) ? (chunkElems - sOfs) : sliceLen;
-
+      const T* src = input + destPe * chunkElems + sOfs;
       uintptr_t destAddr = reinterpret_cast<uintptr_t>(dstLocal + sOfs);
-      size_t offset = destAddr - GetGlobalGpuStatesPtr()->heapBaseAddr;
-      uint8_t* srcPtr =
-          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(src + sOfs));
+      size_t offset = destAddr - heapBase;
+      uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(src));
       uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + offset);
-      // qId = 0: single queue. signals base = remoteSig so signals[qId] == remoteSig,
-      // i.e. every sub-chunk's atomic increments the same per-sender counter.
-      mori::core::SdmaPutThreadFused(srcPtr, dstPtr, sElems * sizeof(T), handles, remoteSig,
-                                expectedSignals, numSdmaQ, /*qId=*/0);
+      // signals = remoteFlags + s with qId=0 -> atomic targets flag[s] on queue 0;
+      // addVal = (1<<myPe) sets my bit in the receiver's per-slice bitmask.
+      mori::core::SdmaPutThreadFused(srcPtr, dstPtr, sElems * sizeof(T), handles,
+                                     remoteFlags + s, numSdmaQ, /*qId=*/0,
+                                     /*addVal=*/(1ull << myPe));
     }
   }
 
-  // Grouping: partition the N blocks into S groups of G = N/S blocks; group g owns
-  // slice g (the region [g*sliceLen, ...)) and works INDEPENDENTLY of the other
-  // groups -- it waits only until slice g has landed from every sender and reduces
-  // only slice g. S==1 => one group of all blocks reducing the whole chunk.
-  const int N = static_cast<int>(gridDim.x);
-  const int G = N / S;              // blocks per group (host guarantees N % S == 0)
-  const int bidx = static_cast<int>(blockIdx.x);
-  const int g = bidx / G;  // this block's group/slice
-  const int lb = bidx - g * G; // local block index within group
+  // Grouping: G blocks per slice; group g (= slice g) handles only its slice.
+  const int G = gridDim.x / S;            // host guarantees gridDim.x % S == 0
+  const int g = blockIdx.x / G;           // slice / group index
+  const int lb = blockIdx.x % G;          // local block within the group
 
-  // === Phase 2: wait until THIS slice has landed from all npes senders ========
-  // The per-sender counters live in my local HBM (written by remote SDMA), are
-  // monotonic and never reset, and advance by exactly S per launch. Slice g
-  // (0-indexed) is ready once a sender's counter reaches (gen-1)*S + g + 1. We use
-  // a `>=` wait because a later slice's atomic may have already advanced the
-  // counter past this group's exact threshold. One thread per sender polls its
-  // per-sender slot signalPtrs[(p%8)*numSdmaQ]; every block in the group does its
-  // own wait+acquire (read-only -> L2 hits).
-  if (tid < npes && tid != myPe) {
-    uint64_t want = (gen - 1) * static_cast<uint64_t>(S) + static_cast<uint64_t>(g) + 1;
-    anvil::waitForSignalAtLeast(&heapObj->signalPtrs[(tid % 8) * numSdmaQ], want);
+  // === Phase 2: wait until every sender's bit is set in slice g's flag =========
+  // Each slice's bitmask lives in my local HBM (written by remote SDMA atomics).
+  // One thread per block polls signalPtrs[g]; every block does its own
+  // wait+acquire (read-only -> L2 hits). npes==1 has no peers, nothing to wait for.
+  if (npes > 1 && tid == 0) {
+    waitForSignalMask(&heapObj->signalPtrs[g], wantMask);
   }
   __syncthreads();
   __threadfence_system();  // acquire: staging visible before Phase 3 reads it
-  // if skipping reduce stage completely, we get 232 GB/s vs 224 GB/s (olds)
-  // return;
 
-  // === Phase 3: grid-strided vectorized reduce over slice g (this group) ======
-  // Streaming reduction: every staging slot is read exactly once and the output
-  // written once, so use the nontemporal load<16>/store<16> primitives from
-  // device_primitives.hpp. They move 16-byte vectors with a streaming (LRU
-  // bypass) hint, avoiding L2 pollution from single-use data.
-  const size_t sOfs = static_cast<size_t>(g) * sliceLen;            // slice base (elems)
-  const size_t sCnt = (g == S - 1) ? (chunkElems - sOfs) : sliceLen;  // slice length
-
-  // Stride over the GROUP only (G blocks), so the G blocks cooperatively reduce
-  // just this slice.
+  // === Phase 3: grid-strided vectorized reduce over slice g ===================
+  // Streaming reduction over slice g only, strided over the group's G blocks. Uses
+  // the nontemporal load<16>/store<16> primitives (single-use data, bypass L2).
+  const size_t sOfs = static_cast<size_t>(g) * sliceLen;
+  const size_t sCnt = (g == S - 1) ? (chunkElems - sOfs) : sliceLen;
   const size_t ltid = static_cast<size_t>(lb) * blockDim.x + threadIdx.x;
   const size_t lstride = static_cast<size_t>(G) * blockDim.x;
-  const size_t totalVecs = sCnt / vecSize;  // full VecBytes-wide vectors in this slice
+  const size_t totalVecs = sCnt / vecSize;
   using AccType = typename AccumulatorType<T>::type;
 
-  // Same guard-free fast path + single trailing partial group as before, but
-  // scoped to this slice (offset sOfs) and strided over the group.
+  // Pass the RUNTIME npes to ReduceVecGroup so its per-peer reduce loop stays
+  // rolled (constant-folding it raises VGPR pressure and lowers occupancy).
   auto srcBase = [staging, input, chunkElems, sOfs, myPe](int pe) -> const T* {
     return (pe == myPe ? input : staging) + pe * chunkElems + sOfs;
   };
@@ -419,6 +436,21 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int S, const T* __re
     }
     Vec V = __builtin_bit_cast(Vec, DowncastF<T>(a));
     store<sizeof(T)>(out + i, V);
+  }
+
+  // === Reset: the last block of group g zeroes slice g's flag + counter =========
+  // A block only reaches here after passing Phase 2 (it has observed the full mask
+  // for slice g), so when the group counter hits G every block in the group is past
+  // Phase 2 and clearing the flag cannot drop an unseen bit. Cross-iteration
+  // ordering is guaranteed by the host hipStreamSynchronize + ShmemBarrierAll
+  // between launches. Counters are local-only (plain hipMalloc'd buffer).
+  if (npes > 1 && tid == 0) {
+    uint64_t z = atomicAdd(reinterpret_cast<unsigned long long*>(&groupCounters[g]), 1ull);
+    if (z + 1 == static_cast<uint64_t>(G)) {
+      heapObj->signalPtrs[g] = 0;  // clear slice g's bitmask flag
+      groupCounters[g] = 0;        // clear group g's local counter
+      __threadfence_system();
+    }
   }
 }
 

@@ -71,8 +71,8 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
 // block. 
 inline __device__ void SdmaPutThreadFused(void* srcBuf, void* dstBuf, size_t copy_size,
                                           anvil::SdmaQueueDeviceHandle** deviceHandles,
-                                          HSAuint64* signals, HSAuint64* expectedSignals,
-                                          uint32_t queNum, uint32_t qId) {
+                                          HSAuint64* signals, uint32_t queNum, uint32_t qId,
+                                          uint64_t addVal = 1) {
   // A copy-linear packet immediately followed by its completion atomic. Both SDMA
   // packet structs are made entirely of 4-byte fields, so this aggregate has no
   // internal padding and its 15 dwords land in the ring exactly as two adjacent
@@ -98,11 +98,10 @@ inline __device__ void SdmaPutThreadFused(void* srcBuf, void* dstBuf, size_t cop
 
   SDMA_PKT_COPY_WITH_ATOMIC packet;
   packet.copy = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size);
-  packet.atomic = anvil::CreateAtomicIncPacket(signals + qId);
+  packet.atomic = anvil::CreateAtomicAddPacket(signals + qId, addVal);
   handle.template placePacket<SDMA_PKT_COPY_WITH_ATOMIC>(packet, pendingWptr, offset);
 
   handle.submitPacket(startBase, pendingWptr);
-  expectedSignals[qId]++;
 }
 
 inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
