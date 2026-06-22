@@ -373,6 +373,8 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int S, const T* __re
   }
   __syncthreads();
   __threadfence_system();  // acquire: staging visible before Phase 3 reads it
+  // if skipping reduce stage completely, we get 232 GB/s vs 224 GB/s (olds)
+  // return;
 
   // === Phase 3: grid-strided vectorized reduce over slice g (this group) ======
   // Streaming reduction: every staging slot is read exactly once and the output
