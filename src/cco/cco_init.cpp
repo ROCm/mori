@@ -130,20 +130,27 @@ int ccoGetUniqueId(ccoUniqueId* uniqueId) {
   return -1;
 }
 
+// Internal bootstrap helper: caller-provided transport (ownership transferred to
+// the comm; Finalize()d + deleted in ccoCommDestroy). Not part of the public API
+// — the ccoUniqueId overload below builds the built-in socket bootstrap and
+// delegates here.
+static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
+                             ccoComm** outComm);
+
 // Self-contained overload: build cco's built-in socket bootstrap from the id and
-// delegate to the BootstrapNetwork* overload, which takes ownership (the socket
-// bootstrap is Finalize()d + deleted in ccoCommDestroy).
+// delegate to the internal helper, which takes ownership (the socket bootstrap is
+// Finalize()d + deleted in ccoCommDestroy).
 int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
                   ccoComm** outComm) {
   if (!outComm || nRanks <= 0 || rank < 0 || rank >= nRanks) return -1;
   application::UniqueId appUid;
   std::memcpy(&appUid, &uniqueId, sizeof(appUid));
   auto* boot = new application::SocketBootstrapNetwork(appUid, rank, nRanks);
-  return ccoCommCreate(boot, perRankVmmSize, outComm);
+  return ccoCommCreateImpl(boot, perRankVmmSize, outComm);
 }
 
-int ccoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
-                  ccoComm** outComm) {
+static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
+                             ccoComm** outComm) {
   auto* comm = new ccoComm();
   *outComm = comm;
 

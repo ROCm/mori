@@ -28,7 +28,6 @@
 #ifdef MORI_WITH_MPI
 #include <mpi.h>
 
-#include "mori/application/bootstrap/mpi_bootstrap.hpp"
 #endif
 
 #include <sys/wait.h>
@@ -39,9 +38,8 @@
 #include <vector>
 
 #include "hip/hip_runtime.h"
-#include "mori/application/application_device_types.hpp"  // white-box: RdmaEndpointDevice (count QPs)
-#include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/cco/cco.hpp"
+#include "mori/core/transport/rdma/core_device_types.hpp"  // core::RdmaEndpointDevice (endpoint readback)
 
 static int g_rank = 0;
 
@@ -58,7 +56,7 @@ static int g_rank = 0;
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 static const size_t WINDOW_SIZE = 4096 * 1024;
 
-static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
+static int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
   g_rank = rank;
 
   int numDevices = 0;
@@ -76,7 +74,7 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   printf("[rank %d/%d] pid=%d GPU=%d\n", rank, nranks, getpid(), dev);
 
   mori::cco::ccoComm* comm = nullptr;
-  if (mori::cco::ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
+  if (mori::cco::ccoCommCreate(uid, nranks, rank, PER_RANK_VMM_SIZE, &comm) != 0) {
     fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
     return 1;
   }
@@ -253,20 +251,23 @@ static int run_fork_mode(int nranks) {
   printf("=== CCO Multi-Process Test (fork, %d ranks) ===\n", nranks);
   fflush(stdout);
 
-  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 19876);
+  mori::cco::ccoUniqueId uid;
+  if (mori::cco::ccoGetUniqueId(&uid) != 0) {
+    fprintf(stderr, "ccoGetUniqueId failed (set MORI_SOCKET_IFNAME=<iface>)\n");
+    return 1;
+  }
   write_file(uidPath, &uid, sizeof(uid));
 
   std::vector<pid_t> children;
   for (int r = 0; r < nranks; r++) {
     pid_t pid = fork();
     if (pid == 0) {
-      // Child: read uid, run test
-      mori::application::UniqueId childUid;
+      // Child: read uid, run test (cco builds its own socket bootstrap from it)
+      mori::cco::ccoUniqueId childUid;
       while (!read_file(uidPath, &childUid, sizeof(childUid))) {
         usleep(10000);
       }
-      auto* boot = new mori::application::SocketBootstrapNetwork(childUid, r, nranks);
-      _exit(run_test(r, nranks, boot));
+      _exit(run_test(r, nranks, childUid));
     }
     children.push_back(pid);
   }
@@ -304,7 +305,7 @@ static int run_single_rank_mode(int argc, char** argv) {
   }
   if (rank < 0 || worldSize <= 0 || !uidPath) return -1;
 
-  mori::application::UniqueId uid;
+  mori::cco::ccoUniqueId uid;
   for (int tries = 0; tries < 600; tries++) {
     FILE* f = fopen(uidPath, "rb");
     if (f) {
@@ -320,8 +321,7 @@ static int run_single_rank_mode(int argc, char** argv) {
   // 8..15 -> GPU 0..7 on node B). Otherwise fall back to rank % numDevices.
   if (gpuOffset >= 0) HIP_CHECK(hipSetDevice(rank - gpuOffset));
 
-  auto* boot = new mori::application::SocketBootstrapNetwork(uid, rank, worldSize);
-  return run_test(rank, worldSize, boot);
+  return run_test(rank, worldSize, uid);
 }
 
 // ── --gen-uid IFACE PORT OUTFILE ──
@@ -334,9 +334,15 @@ static int run_gen_uid_mode(int argc, char** argv) {
     return 1;
   }
   const char* iface = argv[2];
-  int port = atoi(argv[3]);
   const char* outPath = argv[4];
-  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(iface, port);
+  // ccoGetUniqueId reads the interface from MORI_SOCKET_IFNAME and picks a free
+  // port itself; honour the iface arg by exporting it. (PORT arg is ignored.)
+  setenv("MORI_SOCKET_IFNAME", iface, /*overwrite=*/1);
+  mori::cco::ccoUniqueId uid;
+  if (mori::cco::ccoGetUniqueId(&uid) != 0) {
+    fprintf(stderr, "ccoGetUniqueId failed for iface=%s\n", iface);
+    return 1;
+  }
   FILE* f = fopen(outPath, "wb");
   if (!f) {
     fprintf(stderr, "fopen(%s) failed\n", outPath);
@@ -344,7 +350,7 @@ static int run_gen_uid_mode(int argc, char** argv) {
   }
   fwrite(&uid, 1, sizeof(uid), f);
   fclose(f);
-  printf("Wrote UID (%zu bytes) for iface=%s port=%d to %s\n", sizeof(uid), iface, port, outPath);
+  printf("Wrote UID (%zu bytes) for iface=%s to %s\n", sizeof(uid), iface, outPath);
   return 0;
 }
 
@@ -372,9 +378,18 @@ int main(int argc, char** argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &nranks);
     if (rank == 0) printf("=== CCO Multi-Process Test (MPI, %d ranks) ===\n", nranks);
 
-    auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
-    int ret = run_test(rank, nranks, boot);
-    // MPI_Finalize is called by MpiBootstrapNetwork::Finalize() inside CommDestroy
+    // Rank 0 mints the cco unique id and broadcasts the POD to every rank; all
+    // ranks create the comm via the uniqueId API (cco's own socket bootstrap).
+    mori::cco::ccoUniqueId uid;
+    if (rank == 0) {
+      if (mori::cco::ccoGetUniqueId(&uid) != 0) {
+        fprintf(stderr, "ccoGetUniqueId failed (set MORI_SOCKET_IFNAME=<iface>)\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+      }
+    }
+    MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
+    int ret = run_test(rank, nranks, uid);
+    MPI_Finalize();
     return ret;
   }
 #endif
