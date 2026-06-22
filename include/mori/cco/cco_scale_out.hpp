@@ -86,6 +86,11 @@ typedef struct {
 typedef uint32_t ccoGdaSignal_t;
 typedef uint32_t ccoGdaCounter_t;
 
+enum ccoGdaWarpMode : uint32_t {
+  ccoGdaWarpDefault = 0,
+  ccoGdaWarpAggregate = 1,
+};
+
 enum ccoGdaOptFlags {
   ccoGdaOptFlagsDefault = 0,
   ccoGdaOptFlagsMaySkipCreditCheck = (1 << 0),
@@ -137,24 +142,24 @@ struct ccoGda {
   __device__ inline int resolveWorldPeer(int peer) const;
 
   // put: rdma write with optional remote signal.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename RemoteAction = ccoGda_NoSignal,
-            typename Coop = ccoCoopThread, bool WarpAggregate = false>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault,
+            typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes,
                              RemoteAction remoteAction = ccoGda_NoSignal{}, Coop coop = Coop{},
                              uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // putValue: write an immediate value (≤8 bytes) with optional remote signal.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename T,
-            typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread,
-            bool WarpAggregate = false>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault,
+            typename T, typename RemoteAction = ccoGda_NoSignal,
+            typename Coop = ccoCoopThread>
   __device__ inline void putValue(int peer, ccoWindow_t dstWin, size_t dstOffset, T value,
                                   RemoteAction remoteAction = ccoGda_NoSignal{}, Coop coop = Coop{},
                                   uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // get: rdma read — pull peer's window content into our local window.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopThread,
-            bool WarpAggregate = false>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault,
+            typename Coop = ccoCoopThread>
   __device__ inline void get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
                              ccoWindow_t localWin, size_t localOffset, size_t bytes,
                              Coop coop = Coop{}, uint32_t optFlags = ccoGdaOptFlagsDefault);
@@ -527,11 +532,11 @@ __device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, ui
 
 // putImpl - Pure hardware operation layer
 //
-// WarpAggregate: when true, all active warp lanes must target the same QP.
+// ccoGdaWarpAggregate: all active warp lanes must target the same QP.
 // Leader reserves slots for (N data WQEs + 1 signal WQE), each lane posts
 // its data WQE, and the leader posts one shared signal WQE + rings one
 // doorbell for the entire batch.
-template <core::ProviderType PrvdType, bool WarpAggregate = false>
+template <core::ProviderType PrvdType, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault>
 __device__ inline static void putImpl(
     // Hardware resources (already selected endpoint)
     core::RdmaEndpointDevice* ep, uint32_t qpn,
@@ -552,7 +557,7 @@ __device__ inline static void putImpl(
   uint32_t signalWqes =
       hasSignal ? getAtomicWqeCount<PrvdType>(core::AMO_FETCH_ADD, sizeof(uint64_t)) : 0;
 
-  if constexpr (WarpAggregate) {
+  if constexpr (WarpMode == ccoGdaWarpAggregate) {
     uint64_t activemask = core::GetActiveLaneMask();
     int leaderLane = core::GetLastActiveLaneID(activemask);
     uint32_t numActiveLanes = core::GetActiveLaneCount(activemask);
@@ -627,7 +632,7 @@ __device__ inline static void putImpl(
 }
 
 // putValueImpl - Inline write for small values
-template <core::ProviderType PrvdType, typename T, bool WarpAggregate = false>
+template <core::ProviderType PrvdType, typename T, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault>
 __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                            uintptr_t remoteAddr, uint32_t remoteKey, T value,
                                            bool hasSignal, uintptr_t signalRemoteAddr,
@@ -641,7 +646,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
   uint32_t signalWqes =
       hasSignal ? getAtomicWqeCount<PrvdType>(core::AMO_FETCH_ADD, sizeof(uint64_t)) : 0;
 
-  if constexpr (WarpAggregate) {
+  if constexpr (WarpMode == ccoGdaWarpAggregate) {
     uint64_t activemask = core::GetActiveLaneMask();
     int leaderLane = core::GetLastActiveLaneID(activemask);
     uint32_t numActiveLanes = core::GetActiveLaneCount(activemask);
@@ -715,14 +720,14 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
 }
 
 // getImpl - RDMA read
-template <core::ProviderType PrvdType, bool WarpAggregate = false>
+template <core::ProviderType PrvdType, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault>
 __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                       uintptr_t localAddr, uint32_t localKey, uintptr_t remoteAddr,
                                       uint32_t remoteKey, size_t bytes,
                                       uint32_t optFlags = ccoGdaOptFlagsDefault) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
 
-  if constexpr (WarpAggregate) {
+  if constexpr (WarpMode == ccoGdaWarpAggregate) {
     uint64_t activemask = core::GetActiveLaneMask();
     int leaderLane = core::GetLastActiveLaneID(activemask);
     uint32_t numActiveLanes = core::GetActiveLaneCount(activemask);
@@ -1010,14 +1015,14 @@ __device__ inline ccoGda<PrvdType>::ccoGda(ccoDevComm const& comm_, int contextI
 
 // put: RDMA write with optional signal
 template <core::ProviderType PrvdType>
-template <ccoTeamMode TeamMode, typename RemoteAction, typename Coop, bool WarpAggregate>
+template <ccoTeamMode TeamMode, ccoGdaWarpMode WarpMode, typename RemoteAction, typename Coop>
 __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_t dstOffset,
                                              ccoWindow_t srcWin, size_t srcOffset, size_t bytes,
                                              RemoteAction remoteAction, Coop coop,
                                              uint32_t optFlags) {
-  if constexpr (WarpAggregate) {
+  if constexpr (WarpMode == ccoGdaWarpAggregate) {
     static_assert(std::is_same_v<Coop, ccoCoopThread>,
-                  "WarpAggregate requires ccoCoopThread — all warp lanes must enter putImpl.");
+                  "ccoGdaWarpAggregate requires ccoCoopThread — all warp lanes must enter putImpl.");
   }
   coop.sync();
   if (coop.thread_rank() == 0) {
@@ -1055,7 +1060,7 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
       signalOpArg = remoteAction.value;
     }
 
-    impl::putImpl<PrvdType, WarpAggregate>(ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey, bytes,
+    impl::putImpl<PrvdType, WarpMode>(ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey, bytes,
                                            hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg,
                                            optFlags);
   }
@@ -1064,15 +1069,15 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
 
 // putValue: write immediate value (≤8 bytes)
 template <core::ProviderType PrvdType>
-template <ccoTeamMode TeamMode, typename T, typename RemoteAction, typename Coop,
-          bool WarpAggregate>
+template <ccoTeamMode TeamMode, ccoGdaWarpMode WarpMode, typename T, typename RemoteAction,
+          typename Coop>
 __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, size_t dstOffset,
                                                   T value, RemoteAction remoteAction, Coop coop,
                                                   uint32_t optFlags) {
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
-  if constexpr (WarpAggregate) {
+  if constexpr (WarpMode == ccoGdaWarpAggregate) {
     static_assert(std::is_same_v<Coop, ccoCoopThread>,
-                  "WarpAggregate requires ccoCoopThread — all warp lanes must enter putValueImpl.");
+                  "ccoGdaWarpAggregate requires ccoCoopThread — all warp lanes must enter putValueImpl.");
   }
 
   coop.sync();
@@ -1106,7 +1111,7 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
       signalOpArg = remoteAction.value;
     }
 
-    impl::putValueImpl<PrvdType, T, WarpAggregate>(ep, qpn, remoteAddr, dstRkey, value, hasSignal,
+    impl::putValueImpl<PrvdType, T, WarpMode>(ep, qpn, remoteAddr, dstRkey, value, hasSignal,
                                                    signalRaddr, signalRkey, signalOp, signalOpArg,
                                                    optFlags);
   }
@@ -1115,13 +1120,13 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
 
 // get: RDMA read
 template <core::ProviderType PrvdType>
-template <ccoTeamMode TeamMode, typename Coop, bool WarpAggregate>
+template <ccoTeamMode TeamMode, ccoGdaWarpMode WarpMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
                                              ccoWindow_t localWin, size_t localOffset, size_t bytes,
                                              Coop coop, uint32_t optFlags) {
-  if constexpr (WarpAggregate) {
+  if constexpr (WarpMode == ccoGdaWarpAggregate) {
     static_assert(std::is_same_v<Coop, ccoCoopThread>,
-                  "WarpAggregate requires ccoCoopThread — all warp lanes must enter getImpl.");
+                  "ccoGdaWarpAggregate requires ccoCoopThread — all warp lanes must enter getImpl.");
   }
   coop.sync();
   if (coop.thread_rank() == 0) {
@@ -1141,7 +1146,7 @@ __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, si
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
 
-    impl::getImpl<PrvdType, WarpAggregate>(ep, qpn, localAddr, localLkey, remoteAddr, remoteRkey,
+    impl::getImpl<PrvdType, WarpMode>(ep, qpn, localAddr, localLkey, remoteAddr, remoteRkey,
                                            bytes, optFlags);
   }
   coop.sync();
