@@ -20,6 +20,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -43,8 +46,32 @@ constexpr size_t kBlockSize = 4096;
 // required for the node to register a peer_address and accept remote
 // AllocateSlot/CommitSlot RPCs; without it remote BatchPut fails with
 // "peer service connection unavailable".
+//
+// The port must be free *at bind time*: PoolClient binds it directly and
+// registers it verbatim as its peer_address (see PoolClient::Init), so a
+// hard-coded base collides with concurrent test processes / leftover servers
+// on a shared (self-hosted CI) host and makes the whole suite flaky.  Ask the
+// kernel for a currently-free ephemeral port instead.
 inline uint16_t NextPeerServicePort() {
-  static std::atomic<uint16_t> next{52000};
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd >= 0) {
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = 0;  // kernel picks a free port
+    socklen_t len = sizeof(addr);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
+      uint16_t port = ntohs(addr.sin_port);
+      ::close(fd);
+      return port;
+    }
+    ::close(fd);
+  }
+  // Fallback: randomized high base to keep collisions unlikely if the probe
+  // path is unavailable.
+  static std::atomic<uint16_t> next{
+      static_cast<uint16_t>(52000 + (static_cast<unsigned>(::getpid()) % 4000))};
   return next.fetch_add(1);
 }
 
