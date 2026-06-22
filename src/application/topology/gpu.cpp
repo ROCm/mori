@@ -22,6 +22,8 @@
 #include "mori/application/topology/gpu.hpp"
 
 #include <cstdio>
+#include <cstring>
+#include <string>
 
 #include "mori/application/utils/check.hpp"
 
@@ -35,49 +37,25 @@ TopoSystemGpu::TopoSystemGpu() { Load(); }
 
 TopoSystemGpu::~TopoSystemGpu() {}
 
-PciBusId RsmiBusId2PciBusId(uint64_t rsmiBusId) {
-  uint16_t domain = (rsmiBusId >> 32);
-  uint8_t bus = (rsmiBusId >> 8);
-  uint8_t dev = (rsmiBusId >> 3) & 0x1f;
-  uint8_t func = rsmiBusId & 0x7;
-  return PciBusId(domain, bus, dev, func);
-}
-
 void TopoSystemGpu::Load() {
-  uint32_t numGpus;
-
-  ROCM_SMI_CHECK(rsmi_init(0));
-  ROCM_SMI_CHECK(rsmi_num_monitor_devices(&numGpus));
-
-  for (uint32_t i = 0; i < numGpus; ++i) {
+  // GPU topology is sourced purely from the HIP runtime (hipDeviceGetPCIBusId).
+  //
+  // We intentionally do NOT use rocm-smi (rsmi_*) here: its rsmi_init() races
+  // across processes (multiple ranks contending on the per-device shared-memory
+  // mutexes under /dev/shm/rocm_smi_*), which returned RSMI_STATUS_INIT_ERROR
+  // and killed ranks. The only extra information rocm-smi provided over HIP was
+  // the GPU<->GPU P2P link graph (type/hops/weight), which is currently unused
+  // anywhere in the codebase. HIP gives us each GPU's PCI bus id, which is all
+  // the NIC-matching logic (TopoSystem::CollectAndSortCandidates) needs.
+  int hipDevCount = 0;
+  HIP_RUNTIME_CHECK(hipGetDeviceCount(&hipDevCount));
+  for (int i = 0; i < hipDevCount; ++i) {
+    char buf[16] = {};
+    HIP_RUNTIME_CHECK(hipDeviceGetPCIBusId(buf, sizeof(buf), i));
     TopoNodeGpu* gpu = new TopoNodeGpu();
+    gpu->busId = PciBusId(std::string(buf));
     gpus.emplace_back(gpu);
-    uint64_t rsmiBusId = 0;
-    ROCM_SMI_CHECK(rsmi_dev_pci_id_get(i, &rsmiBusId));
-    gpu->busId = RsmiBusId2PciBusId(rsmiBusId);
-    // ROCM_SMI_CHECK(rsmi_topo_numa_affinity_get(reinterpret_cast<uint32_t>(i), &gpu->numaNode));
   }
-
-  for (uint32_t i = 0; i < numGpus; ++i) {
-    for (uint32_t j = i; j < numGpus; ++j) {
-      if (i == j) continue;
-      bool accessible = false;
-      ROCM_SMI_CHECK(rsmi_is_P2P_accessible(i, j, &accessible));
-      if (!accessible) continue;
-
-      TopoNodeGpuP2pLink* p2p = new TopoNodeGpuP2pLink();
-      ROCM_SMI_CHECK(rsmi_topo_get_link_type(i, j, &p2p->hops, &p2p->type));
-      ROCM_SMI_CHECK(rsmi_topo_get_link_weight(i, j, &p2p->weight));
-      p2p->gpu1 = gpus[i].get();
-      p2p->gpu2 = gpus[j].get();
-      p2ps.emplace_back(p2p);
-
-      gpus[i]->p2ps.push_back(p2p);
-      gpus[j]->p2ps.push_back(p2p);
-    }
-  }
-
-  ROCM_SMI_CHECK(rsmi_shut_down());
 }
 
 std::vector<TopoNodeGpu*> TopoSystemGpu::GetGpus() const {
@@ -87,10 +65,9 @@ std::vector<TopoNodeGpu*> TopoSystemGpu::GetGpus() const {
 }
 
 TopoNodeGpu* TopoSystemGpu::GetGpuByLogicalId(int id) const {
-  std::string str;
-  str.resize(13);
-  HIP_RUNTIME_CHECK(hipDeviceGetPCIBusId(str.data(), str.size(), id));
-  PciBusId target{str};
+  char buf[16] = {};
+  HIP_RUNTIME_CHECK(hipDeviceGetPCIBusId(buf, sizeof(buf), id));
+  PciBusId target{std::string(buf)};
   for (auto& gpuPtr : gpus) {
     TopoNodeGpu* gpu = gpuPtr.get();
     if (gpu->busId == target) return gpu;
