@@ -102,20 +102,9 @@ void TopoSystemGpu::Load() {
   RSMI_FN(lib, rsmi_shut_down);
   RSMI_FN(lib, rsmi_status_string);
 
-#define RSMI_CHECK(stmt)                                                       \
-  do {                                                                         \
-    rsmi_status_t _r = (stmt);                                                 \
-    if (_r != RSMI_STATUS_SUCCESS) {                                           \
-      const char* _msg = nullptr;                                              \
-      rsmi_status_string(_r, &_msg);                                           \
-      fprintf(stderr, "[ROCm-SMI] %s failed: %s\n", #stmt, _msg ? _msg : "?"); \
-      exit(-1);                                                                \
-    }                                                                          \
-  } while (0)
-
   uint32_t numGpus = 0;
-  RSMI_CHECK(rsmi_init(0));
-  RSMI_CHECK(rsmi_num_monitor_devices(&numGpus));
+  ROCM_SMI_CHECK(rsmi_init(0));
+  ROCM_SMI_CHECK(rsmi_num_monitor_devices(&numGpus));
 
   if (numGpus == 0) {
     fprintf(stderr, "[ROCm-SMI] rsmi_num_monitor_devices reported 0 GPUs\n");
@@ -126,7 +115,7 @@ void TopoSystemGpu::Load() {
     TopoNodeGpu* gpu = new TopoNodeGpu();
     gpus.emplace_back(gpu);
     uint64_t rsmiBusId = 0;
-    RSMI_CHECK(rsmi_dev_pci_id_get(i, &rsmiBusId));
+    ROCM_SMI_CHECK(rsmi_dev_pci_id_get(i, &rsmiBusId));
     gpu->busId = RsmiBusId2PciBusId(rsmiBusId);
   }
 
@@ -134,12 +123,12 @@ void TopoSystemGpu::Load() {
     for (uint32_t j = i; j < numGpus; ++j) {
       if (i == j) continue;
       bool accessible = false;
-      RSMI_CHECK(rsmi_is_P2P_accessible(i, j, &accessible));
+      ROCM_SMI_CHECK(rsmi_is_P2P_accessible(i, j, &accessible));
       if (!accessible) continue;
 
       TopoNodeGpuP2pLink* p2p = new TopoNodeGpuP2pLink();
-      RSMI_CHECK(rsmi_topo_get_link_type(i, j, &p2p->hops, &p2p->type));
-      RSMI_CHECK(rsmi_topo_get_link_weight(i, j, &p2p->weight));
+      ROCM_SMI_CHECK(rsmi_topo_get_link_type(i, j, &p2p->hops, &p2p->type));
+      ROCM_SMI_CHECK(rsmi_topo_get_link_weight(i, j, &p2p->weight));
       p2p->gpu1 = gpus[i].get();
       p2p->gpu2 = gpus[j].get();
       p2ps.emplace_back(p2p);
@@ -149,8 +138,7 @@ void TopoSystemGpu::Load() {
     }
   }
 
-  RSMI_CHECK(rsmi_shut_down());
-#undef RSMI_CHECK
+  ROCM_SMI_CHECK(rsmi_shut_down());
   dlclose(lib);
 }
 

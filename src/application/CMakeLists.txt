@@ -83,17 +83,9 @@ add_library(mori_application SHARED ${MORI_APP_SOURCES})
 
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR})
-find_library(ROCM_SMI_LIB rocm_smi64 HINTS /opt/rocm/lib REQUIRED)
 find_library(HSA_RUNTIME_LIB hsa-runtime64 HINTS /opt/rocm/lib REQUIRED)
-target_link_libraries(
-  mori_application
-  PUBLIC hip::host
-         dl
-         ${ROCM_SMI_LIB}
-         pci
-         mori_logging
-         ${HSA_RUNTIME_LIB}
-         hsakmt::hsakmt)
+target_link_libraries(mori_application PUBLIC hip::host dl pci mori_logging
+                                              ${HSA_RUNTIME_LIB} hsakmt::hsakmt)
 # Embed the libibverbs dlopen shim (object library, hidden visibility).
 target_link_libraries(mori_application PRIVATE mori_ibv_shim)
 
