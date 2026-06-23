@@ -117,7 +117,10 @@ void TopoSystemGpu::Load() {
   RSMI_CHECK(rsmi_init(0));
   RSMI_CHECK(rsmi_num_monitor_devices(&numGpus));
 
-  assert(numGpus > 0);
+  if (numGpus == 0) {
+    fprintf(stderr, "[ROCm-SMI] rsmi_num_monitor_devices reported 0 GPUs\n");
+    exit(-1);
+  }
 
   for (uint32_t i = 0; i < numGpus; ++i) {
     TopoNodeGpu* gpu = new TopoNodeGpu();
