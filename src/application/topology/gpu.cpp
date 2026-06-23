@@ -117,6 +117,7 @@ void TopoSystemGpu::Load() {
     uint64_t rsmiBusId = 0;
     ROCM_SMI_CHECK(rsmi_dev_pci_id_get(i, &rsmiBusId));
     gpu->busId = RsmiBusId2PciBusId(rsmiBusId);
+    // ROCM_SMI_CHECK(rsmi_topo_numa_affinity_get(reinterpret_cast<uint32_t>(i), &gpu->numaNode));
   }
 
   for (uint32_t i = 0; i < numGpus; ++i) {
