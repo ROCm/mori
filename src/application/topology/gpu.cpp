@@ -149,9 +149,10 @@ std::vector<TopoNodeGpu*> TopoSystemGpu::GetGpus() const {
 }
 
 TopoNodeGpu* TopoSystemGpu::GetGpuByLogicalId(int id) const {
-  char buf[16] = {};
-  HIP_RUNTIME_CHECK(hipDeviceGetPCIBusId(buf, sizeof(buf), id));
-  PciBusId target{std::string(buf)};
+  std::string str;
+  str.resize(13);
+  HIP_RUNTIME_CHECK(hipDeviceGetPCIBusId(str.data(), str.size(), id));
+  PciBusId target{str};
   for (auto& gpuPtr : gpus) {
     TopoNodeGpu* gpu = gpuPtr.get();
     if (gpu->busId == target) return gpu;
