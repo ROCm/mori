@@ -162,28 +162,28 @@ __device__ inline void ComputeTokenRoute(EpDispatchCombineArgs<T>& args, int tok
   }
 
   // Expert-slot lanes compute target PE
-  int myTargetPe = -1;
+  int warpTargetPe = -1;
   if (laneId < topK) {
     index_t expertId = args.tokenIndices[tokenId * topK + laneId];
-    myTargetPe = (expertId >= 0) ? (expertId / config.numExpertPerRank) : -1;
+    warpTargetPe = (expertId >= 0) ? (expertId / config.numExpertPerRank) : -1;
   }
 
   // PE dedup via readlane — each PE lane scans all expert slots
   int expertSlotForMe = -1;
 #pragma unroll
   for (int k = 0; k < kMaxGpusPerNode; ++k) {
-    int pe_k = __builtin_amdgcn_readlane(myTargetPe, k);
+    int pe_k = __builtin_amdgcn_readlane(warpTargetPe, k);
     expertSlotForMe = (pe_k == laneId) ? k : expertSlotForMe;
   }
 
   // PE-indexed lanes allocate recv slots
   int didAlloc = 0;
-  index_t mySlot = 0;
+  index_t warpSlot = 0;
 
   if (laneId < numRanks && expertSlotForMe >= 0) {
     didAlloc = 1;
-    mySlot = atomicAdd(dispTokOffset, 1);
-    assert(mySlot < config.MaxNumTokensToRecv() &&
+    warpSlot = atomicAdd(dispTokOffset, 1);
+    assert(warpSlot < config.MaxNumTokensToRecv() &&
            "Total recv token overflow: increase maxTotalRecvTokens");
   }
 
@@ -192,13 +192,13 @@ __device__ inline void ComputeTokenRoute(EpDispatchCombineArgs<T>& args, int tok
   if (didAlloc) {
     int compactPos = __popcll(activeMask & ((1ULL << laneId) - 1));
     route.destRank[compactPos] = laneId;
-    route.recvSlot[compactPos] = mySlot;
+    route.recvSlot[compactPos] = warpSlot;
   }
   if (laneId == 0) route.numDests = __popcll(activeMask);
 
   outDidAlloc = didAlloc;
   outExpertSlotForMe = expertSlotForMe;
-  outMySlot = mySlot;
+  outMySlot = warpSlot;
 }
 
 /* ──────────────────────────────────────────────────────────────────────────────
@@ -207,7 +207,7 @@ __device__ inline void ComputeTokenRoute(EpDispatchCombineArgs<T>& args, int tok
  * ────────────────────────────────────────────────────────────────────────────── */
 template <typename T>
 __device__ inline void WriteDispDestTokIdMap(EpDispatchCombineArgs<T>& args, int tokenId,
-                                             int didAlloc, int expertSlotForMe, index_t mySlot,
+                                             int didAlloc, int expertSlotForMe, index_t warpSlot,
                                              index_t* dispTokIdToSrcBase) {
   const int laneId = threadIdx.x & (warpSize - 1);
   const int topK = args.config.numExpertPerToken;
@@ -218,9 +218,9 @@ __device__ inline void WriteDispDestTokIdMap(EpDispatchCombineArgs<T>& args, int
   }
   if (didAlloc) {
     atomicAdd(args.destPeTokenCounter + laneId, 1);
-    dispTokIdToSrcBase[mySlot] = FlatTokenIndex(args.config, args.config.rank, tokenId);
+    dispTokIdToSrcBase[warpSlot] = FlatTokenIndex(args.config, args.config.rank, tokenId);
     args.dispDestTokIdMap[tokenId * topK + expertSlotForMe] =
-        FlatTokenIndex(args.config, laneId, mySlot);
+        FlatTokenIndex(args.config, laneId, warpSlot);
   }
 }
 
@@ -249,7 +249,7 @@ __device__ void EpDispatchIntraNodeCoopKernel_body(EpDispatchCombineArgs<T> args
   const int laneId = thdId & (warpSize - 1);
   const int warpId = thdId / warpSize;
   const int warpNum = blockDim.x / warpSize;
-  const int myRank = config.rank;
+  const int warpRank = config.rank;
   const int numRanks = config.worldSize;
   const int topK = config.numExpertPerToken;
   const size_t hiddenDim = config.HiddenDimSz();
@@ -277,6 +277,7 @@ __device__ void EpDispatchIntraNodeCoopKernel_body(EpDispatchCombineArgs<T> args
     index_t* dispTokIdToSrcBase = nullptr;
 
     uint8_t* scalesBase = nullptr;
+    T* dispOutBase = nullptr;
 
     if (warpId == 0 && blockIdx.x < numTokens) {
       ComputeTokenRoute(args, blockIdx.x, routeBuf[0], prologueDidAlloc, prologueExpertSlot,
@@ -288,15 +289,10 @@ __device__ void EpDispatchIntraNodeCoopKernel_body(EpDispatchCombineArgs<T> args
         indicesBase = args.shmemOutIndicesMemObj->template GetAs<index_t*>(laneId);
         dispTokIdToSrcBase = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(laneId);
       }
-    }
-
-    // Warp 1: prefetch scale base pointers
-    if (warpId == 1 && hasScales && laneId < numRanks) {
+    } else if (warpId == 1 && hasScales && laneId < numRanks) {
+      // Warp 1: prefetch scale base pointers
       scalesBase = args.shmemOutScalesMemObj->template GetAs<uint8_t*>(laneId);
-    }
-
-    T* dispOutBase = nullptr;
-    if (warpId > 1 && laneId < numRanks) {
+    } else if (warpId > 1 && laneId < numRanks) {
       dispOutBase = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(laneId);
     }
 
@@ -333,22 +329,22 @@ __device__ void EpDispatchIntraNodeCoopKernel_body(EpDispatchCombineArgs<T> args
         const TokenRoute& route = routeBuf[pingPong];
         if (route.numDests > 0) {
           auto srcTokenId = route.srcTokenId;
-          float myWeight = 0.0f;
-          index_t myIndex = 0;
+          float warpWeight = 0.0f;
+          index_t warpIndex = 0;
           if (laneId < topK) {
             if (args.weightsBuf) {
-              myWeight = args.weightsBuf[srcTokenId * topK + laneId];
+              warpWeight = args.weightsBuf[srcTokenId * topK + laneId];
             }
-            myIndex = args.tokenIndices[srcTokenId * topK + laneId];
+            warpIndex = args.tokenIndices[srcTokenId * topK + laneId];
           }
           for (int d = 0; d < route.numDests; ++d) {
             int rank = route.destRank[d];
             index_t slot = route.recvSlot[d];
             if (laneId < topK) {
               if (args.weightsBuf) {
-                (ReadLanePtr(weightsBase, rank) + slot * topK)[laneId] = myWeight;
+                (ReadLanePtr(weightsBase, rank) + slot * topK)[laneId] = warpWeight;
               }
-              (ReadLanePtr(indicesBase, rank) + slot * topK)[laneId] = myIndex;
+              (ReadLanePtr(indicesBase, rank) + slot * topK)[laneId] = warpIndex;
             }
           }
         }
@@ -359,15 +355,15 @@ __device__ void EpDispatchIntraNodeCoopKernel_body(EpDispatchCombineArgs<T> args
         const TokenRoute& route = routeBuf[pingPong];
         if (route.numDests > 0) {
           const size_t scaleSize = config.scaleDim * config.scaleTypeSize;
-          uint8_t* myScaleDstReg = nullptr;
+          uint8_t* warpScaleDstReg = nullptr;
           for (int d = 0; d < route.numDests; ++d) {
             if (laneId == d) {
-              myScaleDstReg = ReadLanePtr(scalesBase, route.destRank[d]) +
-                              (size_t)route.recvSlot[d] * scaleSize;
+              warpScaleDstReg = ReadLanePtr(scalesBase, route.destRank[d]) +
+                                (size_t)route.recvSlot[d] * scaleSize;
             }
           }
           const uint8_t* srcScale = args.scalesBuf + (size_t)route.srcTokenId * scaleSize;
-          WarpLoadBroadcastStore<uint8_t>(myScaleDstReg, route.numDests, srcScale, scaleSize);
+          WarpLoadBroadcastStore<uint8_t>(warpScaleDstReg, route.numDests, srcScale, scaleSize);
         }
       }
 
@@ -377,36 +373,40 @@ __device__ void EpDispatchIntraNodeCoopKernel_body(EpDispatchCombineArgs<T> args
 
         if (route.numDests > 0) {
           const int copyWarpRank = warpId - 2;
-          const int numCopyWarps = warpNum - 2;
 
+          constexpr int kCopyUnroll = 2;
           constexpr size_t kVecElems = 16 / sizeof(T);
-          const size_t elemsPerWarp =
-              ((hiddenDim + numCopyWarps - 1) / numCopyWarps + kVecElems - 1) & ~(kVecElems - 1);
-          const size_t myElemOffset = (size_t)copyWarpRank * elemsPerWarp;
-          const size_t myElemCount =
-              (myElemOffset < hiddenDim) ? min(elemsPerWarp, hiddenDim - myElemOffset) : size_t{0};
+          constexpr size_t elemsPerWarp = kCopyUnroll * warpSize * kVecElems;
+          const size_t warpElemOffset = (size_t)copyWarpRank * elemsPerWarp;
+          const size_t warpElemCount = (warpElemOffset < hiddenDim)
+                                           ? min(elemsPerWarp, hiddenDim - warpElemOffset)
+                                           : size_t{0};
 
-          if (myElemCount > 0) {
+          if (warpElemCount > 0) {
             const T* srcChunk =
-                args.inpTokenBuf + (size_t)route.srcTokenId * hiddenDim + myElemOffset;
+                args.inpTokenBuf + (size_t)route.srcTokenId * hiddenDim + warpElemOffset;
 
-            T* myDstReg = nullptr;
+            int warpDestRank = (laneId < route.numDests) ? route.destRank[laneId] : 0;
+            index_t warpRecvSlot = (laneId < route.numDests) ? route.recvSlot[laneId] : 0;
+
+            T* warpDstReg = nullptr;
             for (int i = 0; i < route.numDests; ++i) {
               int d = (copyWarpRank & 1) ? (route.numDests - 1 - i) : i;
+              int rankD = __builtin_amdgcn_readlane(warpDestRank, d);
+              index_t slotD = __builtin_amdgcn_readlane(warpRecvSlot, d);
               if (laneId == i) {
-                myDstReg = ReadLanePtr(dispOutBase, route.destRank[d]) +
-                           (size_t)route.recvSlot[d] * hiddenDim + myElemOffset;
+                warpDstReg =
+                    ReadLanePtr(dispOutBase, rankD) + (size_t)slotD * hiddenDim + warpElemOffset;
               }
             }
-
-            WarpLoadBroadcastStore<T, kMaxGpusPerNode, 2>(myDstReg, route.numDests, srcChunk,
-                                                          myElemCount);
+            WarpLoadBroadcastStore<T, kMaxGpusPerNode, kCopyUnroll>(warpDstReg, route.numDests,
+                                                                    srcChunk, warpElemCount);
           }
         }
       }
 
       // tEnd = __builtin_amdgcn_s_memrealtime();
-      // if (myRank == 0 && (blockIdx.x == 0 || blockIdx.x == gridDim.x - 1) && laneId == 0) {
+      // if (warpRank == 0 && (blockIdx.x == 0 || blockIdx.x == gridDim.x - 1) && laneId == 0) {
       //   printf("block%d warp%d: %llu cycles hasScales=%d\n", blockIdx.x, warpId, (unsigned long
       //   long)(tEnd - tStart), (int)hasScales);
       // }
@@ -429,7 +429,7 @@ __device__ void EpDispatchIntraNodeCoopKernel_body(EpDispatchCombineArgs<T> args
       __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
       index_t tokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + pe) + 1;
-      index_t* signalSlot = args.recvTokenNumMemObj->template GetAs<index_t*>(pe) + myRank;
+      index_t* signalSlot = args.recvTokenNumMemObj->template GetAs<index_t*>(pe) + warpRank;
       shmem::ShmemInt32WaitUntilEquals(signalSlot, 0);
       core::AtomicStoreRelaxedSystem(signalSlot, tokenSignal);
     }
@@ -454,7 +454,7 @@ __device__ void EpDispatchIntraNodeCoopKernel_body(EpDispatchCombineArgs<T> args
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   if constexpr (EnableStdMoE) {
-    InvokeConvertDispatchOutput<T>(args, myRank);
+    InvokeConvertDispatchOutput<T>(args, warpRank);
   }
 #endif
 }
