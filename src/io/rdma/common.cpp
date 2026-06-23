@@ -52,8 +52,15 @@ enum class PostSendOpKind : uint8_t {
 
 static int GetSqBackoffTimeoutUs() {
   static const int kBackoffTimeoutUs = []() {
-    int v = 5000000;
+    constexpr int kDefaultBackoffTimeoutUs = 5000000;
+    int v = kDefaultBackoffTimeoutUs;
     env::Override("MORI_IO_SQ_BACKOFF_TIMEOUT_US", v, mori::env::detail::ParsePositiveInt);
+    if (v < kDefaultBackoffTimeoutUs) {
+      MORI_IO_WARN(
+          "MORI_IO_SQ_BACKOFF_TIMEOUT_US={} us is below the default {} us; SQ full conditions may "
+          "timeout faster under transient CQ drain delays",
+          v, kDefaultBackoffTimeoutUs);
+    }
     return v;
   }();
   return kBackoffTimeoutUs;
