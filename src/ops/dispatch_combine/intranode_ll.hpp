@@ -373,10 +373,15 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
 
         if (route.numDests > 0) {
           const int copyWarpRank = warpId - 2;
+          const int numCopyWarps = warpNum - 2;
 
           constexpr int kCopyUnroll = 2;
           constexpr size_t kVecElems = 16 / sizeof(T);
-          constexpr size_t elemsPerWarp = kCopyUnroll * warpSize * kVecElems;
+          constexpr size_t kBaseElemsPerWarp = kCopyUnroll * warpSize * kVecElems;
+          const size_t warpsNeeded = (hiddenDim + kBaseElemsPerWarp - 1) / kBaseElemsPerWarp;
+          const size_t elemsPerWarp = (warpsNeeded <= (size_t)numCopyWarps)
+                                          ? kBaseElemsPerWarp
+                                          : ((hiddenDim + numCopyWarps - 1) / numCopyWarps);
           const size_t warpElemOffset = (size_t)copyWarpRank * elemsPerWarp;
           const size_t warpElemCount = (warpElemOffset < hiddenDim)
                                            ? min(elemsPerWarp, hiddenDim - warpElemOffset)
