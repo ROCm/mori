@@ -52,8 +52,15 @@ enum class PostSendOpKind : uint8_t {
 
 static int GetSqBackoffTimeoutUs() {
   static const int kBackoffTimeoutUs = []() {
-    int v = 5000000;
+    constexpr int kDefaultBackoffTimeoutUs = 5000000;
+    int v = kDefaultBackoffTimeoutUs;
     env::Override("MORI_IO_SQ_BACKOFF_TIMEOUT_US", v, mori::env::detail::ParsePositiveInt);
+    if (v < kDefaultBackoffTimeoutUs) {
+      MORI_IO_WARN(
+          "MORI_IO_SQ_BACKOFF_TIMEOUT_US={} us is below the default {} us; SQ full conditions may "
+          "timeout faster under transient CQ drain delays",
+          v, kDefaultBackoffTimeoutUs);
+    }
     return v;
   }();
   return kBackoffTimeoutUs;
@@ -696,11 +703,14 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   epWrsSinceSignal.assign(epNum, 0);
   epMergedSinceSignal.assign(epNum, 0);
 
+  // Rotate the starting EP by transfer id so single-segment (single WR)
+  // transfers spread evenly across all QPs instead of always landing on eps[0].
+  int epStartOffset = static_cast<int>(id % static_cast<uint64_t>(epNum));
   for (int i = 0; i < numPostBatch; i++) {
     int st = i * postBatchSize;
     int end = std::min(static_cast<size_t>(st) + postBatchSize, mergedWrCount);
     if (end - st == 0) break;
-    int epId = i % epNum;
+    int epId = (i + epStartOffset) % static_cast<int>(epNum);
     int batchWrNum = end - st;
 
     std::string reserveErr;

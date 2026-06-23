@@ -403,9 +403,13 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   epConfig.alignment = PAGESIZE;
   epConfig.withCompChannel = (config.pollCqMode == PollCqMode::EVENT);
 
+  bool is_ionic = (deviceAttr->orig_attr.vendor_id ==
+                   static_cast<uint32_t>(application::RdmaDeviceVendorId::Pensando));
+
   uint32_t maxQpWr = static_cast<uint32_t>(deviceAttr->orig_attr.max_qp_wr);
   uint32_t maxCqe = static_cast<uint32_t>(deviceAttr->orig_attr.max_cqe);
   uint32_t maxSge = static_cast<uint32_t>(deviceAttr->orig_attr.max_sge);
+  if (is_ionic) maxSge = std::min(maxSge, 2u);
 
   if (config.enableNotification && maxQpWr < config.notifPerQp) {
     MORI_IO_ERROR(
@@ -449,10 +453,13 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
     epConfig.maxCqeNum = newCqeNum;
   }
   if (desiredMsgSge.has_value()) {
-    epConfig.maxMsgSge = std::min(*desiredMsgSge, maxSge);
+    if (*desiredMsgSge > maxSge) {
+      MORI_IO_WARN("maxMsgSge={} is greater than max_sge={}; clamping to max_sge", *desiredMsgSge,
+                   maxSge);
+      *desiredMsgSge = maxSge;
+    }
+    epConfig.maxMsgSge = *desiredMsgSge;
   } else {
-    bool is_ionic = (deviceAttr->orig_attr.vendor_id ==
-                     static_cast<uint32_t>(application::RdmaDeviceVendorId::Pensando));
     epConfig.maxMsgSge = std::min(maxSge, is_ionic ? 2u : 4u);
   }
   return epConfig;
