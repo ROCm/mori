@@ -808,9 +808,13 @@ def run_ep_dispatch_combine_test(
     if sentinel_pattern is not None:
         gen_kwargs["sentinel_pattern"] = sentinel_pattern
     test_data = test_case.gen_test_data(**gen_kwargs)
-    test_case.run_test_once(
-        op, test_data, check_results=check_results, weightless=weightless
-    )
+    # Only forward ``weightless`` when explicitly requested so test case
+    # subclasses that override ``run_test_once`` without the parameter
+    # (e.g. AsyncLLDispatchCombineTestCase) keep working with the default.
+    run_kwargs = {}
+    if weightless:
+        run_kwargs["weightless"] = True
+    test_case.run_test_once(op, test_data, check_results=check_results, **run_kwargs)
     if expect_combine_kernel_substr is not None:
         selected = getattr(op, "_last_combine_kernel_name", None)
         assert selected is not None and expect_combine_kernel_substr in selected, (
