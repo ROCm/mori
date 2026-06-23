@@ -333,10 +333,18 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
 
   // Columnar response: node_ref[i] is a 1-based index into resp.nodes()
   // (0 = not found); tier[i] / size[i] are parallel per-key arrays.
-  out->resize(static_cast<size_t>(resp.node_ref_size()));
-  for (int i = 0; i < resp.node_ref_size(); ++i) {
+  const int n = resp.node_ref_size();
+  if (resp.tier_size() != n || resp.size_size() != n) {
+    return grpc::Status(grpc::StatusCode::INTERNAL,
+                        "BatchRouteGet: malformed columnar response (array length mismatch)");
+  }
+  out->resize(static_cast<size_t>(n));
+  for (int i = 0; i < n; ++i) {
     const uint32_t node_ref = resp.node_ref(i);
     if (node_ref == 0) continue;  // not found
+    if (node_ref > static_cast<uint32_t>(resp.nodes_size())) {
+      return grpc::Status(grpc::StatusCode::INTERNAL, "BatchRouteGet: node_ref index out of range");
+    }
     const auto& node = resp.nodes(static_cast<int>(node_ref) - 1);
     RouteGetResult r;
     r.node_id = node.node_id();
@@ -444,7 +452,10 @@ void MasterClient::StartHeartbeat() {
 
 void MasterClient::StopHeartbeat() {
   if (!heartbeat_running_) return;
-  heartbeat_running_ = false;
+  {
+    std::lock_guard lock(hb_cv_mutex_);
+    heartbeat_running_ = false;
+  }
   hb_cv_.notify_one();
   if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
   MORI_UMBP_INFO("[Client] Heartbeat thread stopped");
@@ -452,7 +463,10 @@ void MasterClient::StopHeartbeat() {
 
 void MasterClient::FlushHeartbeat() {
   if (!heartbeat_running_) return;
-  flush_requested_ = true;
+  {
+    std::lock_guard lock(hb_cv_mutex_);
+    flush_requested_ = true;
+  }
   hb_cv_.notify_one();
 }
 
@@ -462,9 +476,9 @@ void MasterClient::HeartbeatLoop() {
       std::unique_lock lock(hb_cv_mutex_);
       hb_cv_.wait_for(lock, std::chrono::milliseconds(heartbeat_interval_ms_),
                       [this] { return !heartbeat_running_.load() || flush_requested_.load(); });
+      flush_requested_ = false;
     }
     if (!heartbeat_running_) break;
-    flush_requested_ = false;
     SendHeartbeatOnce();
   }
 }

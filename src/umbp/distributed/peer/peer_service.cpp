@@ -500,8 +500,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                                 const ::umbp::BatchResolveKeysRequest* request,
                                 ::umbp::BatchResolveKeysResponse* response) override {
     if (dram_alloc_ == nullptr) {
-      // SoA layout: one found=false slot per key, no pages, no descs.
-      for (int i = 0; i < request->keys_size(); ++i) response->add_found(false);
+      std::vector<ResolvedKeyEntry> misses(request->keys_size());
+      EncodeBatchResolveResponse(misses, /*page_size=*/0, /*descs=*/{}, response);
       return grpc::Status::OK;
     }
     // The client can suppress descs entirely via omit_descs when it already

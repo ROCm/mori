@@ -82,9 +82,16 @@ def _kill_group(proc):
 
 def _spawn(argv, log_path, env=None) -> subprocess.Popen:
     log = open(log_path, "w")
-    proc = subprocess.Popen(
-        argv, stdout=log, stderr=subprocess.STDOUT, env=env, preexec_fn=_die_with_parent
-    )
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=env,
+            preexec_fn=_die_with_parent,
+        )
+    finally:
+        log.close()
     atexit.register(lambda: _kill_group(proc))
     return proc
 
