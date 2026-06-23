@@ -18,6 +18,7 @@
 #include "src/ops/dispatch_combine/convert.hpp"
 #include "src/ops/dispatch_combine/internode.hpp"
 #include "src/ops/dispatch_combine/intranode.hpp"
+#include "src/ops/dispatch_combine/intranode_ll.hpp"
 
 #define MORI_JIT_GENCO
 #include "src/ops/dispatch_combine/internode_v1.cpp"

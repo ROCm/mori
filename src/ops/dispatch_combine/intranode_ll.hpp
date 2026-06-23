@@ -242,7 +242,7 @@ __device__ inline void WriteDispDestTokIdMap(EpDispatchCombineArgs<T>& args, int
  *      enabling the load-once pattern without cross-block coordination.
  * ────────────────────────────────────────────────────────────────────────────── */
 template <typename T, bool EnableStdMoE = false>
-__device__ void EpDispatchIntraNodeCoopKernel_body(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
   const int thdId = threadIdx.x;
@@ -457,11 +457,6 @@ __device__ void EpDispatchIntraNodeCoopKernel_body(EpDispatchCombineArgs<T> args
     InvokeConvertDispatchOutput<T>(args, warpRank);
   }
 #endif
-}
-
-template <typename T, bool EnableStdMoE = false>
-__global__ void EpDispatchIntraNodeCoopKernel(EpDispatchCombineArgs<T> args) {
-  EpDispatchIntraNodeCoopKernel_body<T, EnableStdMoE>(args);
 }
 
 }  // namespace moe
