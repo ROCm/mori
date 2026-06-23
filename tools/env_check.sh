@@ -865,23 +865,45 @@ check_inter_node_lat() {
 LOCAL_DEVS=()
 
 # detect NIC vendor and run the matching checks
+# Detect NICs by PCI vendor id, not by IB device name: ionic cards may show up as
+# ionic_*, roceensp*, etc., so name matching is not reliable. The vendor id under
+# /sys/class/infiniband/<dev>/device/vendor is stable.
+_ib_has_vendor() {
+    local vid="$1" d
+    [[ -d /sys/class/infiniband ]] || return 1
+    for d in /sys/class/infiniband/*; do
+        [[ -e "$d/device/vendor" ]] || continue
+        [[ "$(cat "$d/device/vendor" 2>/dev/null)" == "$vid" ]] && return 0
+    done
+    return 1
+}
+
 _have_ionic=false
-if command -v nicctl >/dev/null 2>&1; then
-    _nicctl_out=$(nicctl show version firmware 2>&1 || true)
-    echo "$_nicctl_out" | grep -qi "No AMD NICs" || _have_ionic=true
+_ib_has_vendor 0x1dd8 && _have_ionic=true   # AMD/Pensando (ionic)
+
+# The ionic firmware/QoS/DCQCN checks all shell out to `sudo nicctl`. Probe that
+# nicctl is installed AND can actually enumerate the cards; otherwise skip those
+# checks gracefully instead of spewing "Invalid card handle" errors.
+_nicctl_ok=false
+if [[ "$_have_ionic" == "true" ]] && command -v nicctl >/dev/null 2>&1; then
+    _nicctl_out=$(sudo nicctl show version firmware 2>&1 || true)
+    if ! echo "$_nicctl_out" | grep -qiE 'No AMD NICs|Invalid card handle|Failed to get NIC'; then
+        _nicctl_ok=true
+    fi
     unset _nicctl_out
 fi
 
 _have_bnxt=false
-if [[ -d /sys/class/infiniband ]] && \
-   find /sys/class/infiniband -maxdepth 1 -name 'bnxt_re*' 2>/dev/null | grep -q .; then
-    _have_bnxt=true
-fi
+_ib_has_vendor 0x14e4 && _have_bnxt=true     # Broadcom (bnxt_re)
 
 if [[ "$_have_ionic" == "true" ]]; then
-    check_versions
-    check_qos
-    check_dcqcn
+    if [[ "$_nicctl_ok" == "true" ]]; then
+        check_versions
+        check_qos
+        check_dcqcn
+    else
+        log_warn "ionic NICs present but nicctl is unavailable or cannot access them — skipping nicctl-based checks (firmware / QoS / DCQCN)"
+    fi
 elif [[ "$_have_bnxt" == "true" ]]; then
     check_bnxt_versions
     check_bnxt_qos
