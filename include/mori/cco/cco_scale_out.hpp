@@ -381,6 +381,11 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
         int opcode = core::PollCqOnce<core::ProviderType::BNXT>(cq->cqAddr, cq->cqeNum,
                                                                 consIdxIgnored, &wqeCounter);
         if (opcode < 0) continue;  // no new completion yet
+        if (opcode != BNXT_RE_REQ_ST_OK) {
+          MORI_PRINTF("quietUntil[BNXT]: CQE error opcode=%d\n", opcode);
+          assert(false);
+          break;
+        }
         // Largest V <= dbTouchIdx with V % sqWqeNum == con_indx % sqWqeNum.
         uint32_t dbTouch =
             __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -394,15 +399,68 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
   }
 }
 
-// Reserve WQE slots and wait for SQ space (per-lane).
-// For warp-aggregate mode the caller has the leader lane call this once
-// with the warp total, then broadcasts the returned base via __shfl.
+// BNXT only: exclusive prefix-sum of psnCnt over the warp's active lanes (by
+// physical lane id). Returns this lane's prefix; *outTotal = warp total. Mirrors
+// shmem. All active lanes must call together.
+__device__ inline static uint32_t warpActivePsnPrefix(uint32_t psnCnt, uint64_t activemask,
+                                                      uint32_t* outTotal) {
+  const uint32_t myPhys = static_cast<uint32_t>(__lane_id());
+  uint32_t excl = 0, total = 0;
+  uint64_t m = activemask;
+  while (m) {
+    int l = __ffsll(static_cast<unsigned long long>(m)) - 1;
+    uint32_t v = __shfl(psnCnt, l);
+    total += v;
+    if (static_cast<uint32_t>(l) < myPhys) excl += v;
+    m &= m - 1;
+  }
+  *outTotal = total;
+  return excl;
+}
+
+// BNXT warp-aggregate PSN: each active lane contributes dataPsnCnt data packets;
+// the warp leader optionally adds one trailing signal packet. The leader advances
+// wq->msnPack once by the warp totals; returns this lane's data-PSN base and (via
+// outSignalPsn) the PSN for the warp's single signal. BNXT PSN must advance by
+// PACKET count, not WQE count (post-#395 per-lane fix; mirrors shmem).
+__device__ inline static uint32_t warpAggregateBnxtPsn(core::WorkQueueHandle* wq,
+                                                       uint32_t dataPsnCnt, bool hasSignalPacket,
+                                                       uint32_t totalWqes, uint64_t activemask,
+                                                       int leaderLane, bool isLeader,
+                                                       uint32_t* outSignalPsn) {
+  uint32_t warpDataPsnTotal = 0;
+  uint32_t myExcl = warpActivePsnPrefix(dataPsnCnt, activemask, &warpDataPsnTotal);
+  uint32_t warpTotalPsn = warpDataPsnTotal + (hasSignalPacket ? 1u : 0u);
+  uint32_t warpPsnBase = 0;
+  if (isLeader) {
+    uint32_t slotIgnored = 0;
+    core::atomic_add_packed_msn_and_psn(&wq->msnPack, totalWqes, warpTotalPsn, &slotIgnored,
+                                        &warpPsnBase);
+  }
+  warpPsnBase = __shfl(warpPsnBase, leaderLane);
+  if (outSignalPsn) *outSignalPsn = warpPsnBase + warpDataPsnTotal;
+  return warpPsnBase + myExcl;
+}
+
+// Reserve numWqesNeeded SQ slots (per-lane) and wait for SQ space. For BNXT, also
+// reserve lanePsnCnt packet-sequence numbers on wq->msnPack and return the PSN
+// base via outPsnBase (BNXT PSN advances by PACKET count, not WQE count).
+// lanePsnCnt/outPsnBase are ignored for MLX5/PSD. Warp-aggregate callers reserve
+// the whole warp themselves; this is the per-lane path.
 template <core::ProviderType PrvdType>
 __device__ inline static uint32_t reserveWqeSlots(core::RdmaEndpointDevice* ep,
-                                                  uint32_t numWqesNeeded) {
+                                                  uint32_t numWqesNeeded, uint32_t lanePsnCnt = 0,
+                                                  uint32_t* outPsnBase = nullptr) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
 
   uint32_t curPostIdx = atomicAdd(&wq->postIdx, numWqesNeeded);
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    uint32_t slotIgnored = 0;
+    uint32_t psnBase = 0;
+    core::atomic_add_packed_msn_and_psn(&wq->msnPack, numWqesNeeded, lanePsnCnt, &slotIgnored,
+                                        &psnBase);
+    if (outPsnBase) *outPsnBase = psnBase;
+  }
   while (true) {
     uint64_t dbTouched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -413,9 +471,40 @@ __device__ inline static uint32_t reserveWqeSlots(core::RdmaEndpointDevice* ep,
     if (numFreeEntries > entriesUntilMine) {
       break;
     }
-    quietUntil<PrvdType>(ep, curPostIdx);
+    if constexpr (PrvdType == core::ProviderType::BNXT) {
+      // BNXT: drain to the doorbelled snapshot (reachable), not our own
+      // un-doorbelled reservation — else we'd wait on WQEs that may never be
+      // doorbelled and self-deadlock. Mirrors shmem's snapshot drain.
+      quietUntil<PrvdType>(ep, static_cast<uint32_t>(dbTouched));
+    } else {
+      quietUntil<PrvdType>(ep, curPostIdx);
+    }
   }
   return curPostIdx;
+}
+
+// Warp-aggregate flow control: wait until the SQ has room for the whole batch
+// [base, base+totalWqes). BNXT drains to the doorbelled snapshot (not the warp's
+// own un-doorbelled reservation) to avoid self-deadlock (mirrors shmem); other
+// providers keep the original drain-to-reservation behavior.
+template <core::ProviderType PrvdType>
+__device__ inline static void waitSqSpace(core::RdmaEndpointDevice* ep, uint32_t base,
+                                          uint32_t totalWqes) {
+  core::WorkQueueHandle* wq = &ep->wqHandle;
+  while (true) {
+    uint64_t dbTouched =
+        __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint64_t dbDone = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint64_t numActiveSqEntries = dbTouched - dbDone;
+    uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
+    uint64_t entriesUntilBatchLast = base + totalWqes - dbTouched;
+    if (numFreeEntries > entriesUntilBatchLast) break;
+    if constexpr (PrvdType == core::ProviderType::BNXT) {
+      quietUntil<PrvdType>(ep, static_cast<uint32_t>(dbTouched));
+    } else {
+      quietUntil<PrvdType>(ep, base);
+    }
+  }
 }
 
 // PSD/Ionic only: walk the warp's active lane mask and let one lane at a
@@ -566,43 +655,50 @@ __device__ inline static void putImpl(
     uint32_t totalWqes = numActiveLanes + signalWqes;
 
     uint32_t base = 0;
-    if (isLeader) {
-      base = atomicAdd(&wq->postIdx, totalWqes);
-    }
+    if (isLeader) base = atomicAdd(&wq->postIdx, totalWqes);
     base = __shfl(base, leaderLane);
-
-    while (true) {
-      uint64_t dbTouched =
-          __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t dbDone =
-          __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t numActiveSqEntries = dbTouched - dbDone;
-      uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
-      uint64_t entriesUntilBatchLast = base + totalWqes - dbTouched;
-      if (numFreeEntries > entriesUntilBatchLast) break;
-      quietUntil<PrvdType>(ep, base);
-    }
-
     uint32_t mySlot = base + myLogicalLaneId;
-    uint64_t dbrVal =
-        core::PostWrite<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn, localAddr,
-                                  localKey, remoteAddr, remoteKey, bytes);
+    uint32_t signalSlot = base + numActiveLanes;
+    uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
+    uint32_t atomicLkey = ep->atomicIbuf.lkey;
 
-    __threadfence();
-
-    if (isLeader) {
-      if (hasSignal) {
-        uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
-        uint32_t atomicLkey = ep->atomicIbuf.lkey;
-        uint32_t signalSlot = base + numActiveLanes;
-        dbrVal = core::PostAtomic<PrvdType, uint64_t>(
-            *wq, signalSlot, signalSlot, signalSlot, true /*cqeSignal*/, qpn, atomicLaddr,
-            atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/,
-            core::AMO_FETCH_ADD);
+    if constexpr (PrvdType == core::ProviderType::BNXT) {
+      // Reserve per-packet PSNs first (before the SQ-space wait, so PSN order
+      // matches slot order across concurrent warps), then post with packet PSN.
+      uint32_t dataPsnCnt = (bytes == 0) ? 1 : (bytes + wq->mtuSize - 1) / wq->mtuSize;
+      uint32_t sigPsn = 0;
+      uint32_t dataPsn = warpAggregateBnxtPsn(wq, dataPsnCnt, hasSignal, totalWqes, activemask,
+                                              leaderLane, isLeader, &sigPsn);
+      waitSqSpace<PrvdType>(ep, base, totalWqes);
+      uint64_t dbrVal = core::PostWrite<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/,
+                                                  qpn, localAddr, localKey, remoteAddr, remoteKey,
+                                                  bytes);
+      __threadfence();
+      if (isLeader) {
+        if (hasSignal) {
+          dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+              *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+              signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/, core::AMO_FETCH_ADD);
+        }
+        if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+          ringDoorbellOrdered<PrvdType>(ep, base, totalWqes, dbrVal);
       }
-
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-        ringDoorbellOrdered<PrvdType>(ep, base, totalWqes, dbrVal);
+    } else {
+      // MLX5/PSD: the WQE slot index doubles as the PSN.
+      waitSqSpace<PrvdType>(ep, base, totalWqes);
+      uint64_t dbrVal = core::PostWrite<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/,
+                                                  qpn, localAddr, localKey, remoteAddr, remoteKey,
+                                                  bytes);
+      __threadfence();
+      if (isLeader) {
+        if (hasSignal) {
+          dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+              *wq, signalSlot, signalSlot, signalSlot, true /*cqeSignal*/, qpn, atomicLaddr,
+              atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/,
+              core::AMO_FETCH_ADD);
+        }
+        if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+          ringDoorbellOrdered<PrvdType>(ep, base, totalWqes, dbrVal);
       }
     }
     return;
@@ -610,24 +706,40 @@ __device__ inline static void putImpl(
 
   // Per-lane path
   uint32_t numWqesNeeded = 1 + signalWqes;
-  uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, numWqesNeeded);
+  uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
+  uint32_t atomicLkey = ep->atomicIbuf.lkey;
 
-  uint32_t wqeIdx = curPostIdx;
-  uint64_t dbrVal = core::PostWrite<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn,
-                                              localAddr, localKey, remoteAddr, remoteKey, bytes);
-  wqeIdx++;
-
-  if (hasSignal) {
-    uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
-    uint32_t atomicLkey = ep->atomicIbuf.lkey;
-
-    dbrVal = core::PostAtomic<PrvdType, uint64_t>(
-        *wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
-        signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/, core::AMO_FETCH_ADD);
-  }
-
-  if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, numWqesNeeded, dbrVal);
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    uint32_t dataPsnCnt = (bytes == 0) ? 1 : (bytes + wq->mtuSize - 1) / wq->mtuSize;
+    uint32_t psnBase = 0;
+    uint32_t curPostIdx =
+        reserveWqeSlots<PrvdType>(ep, numWqesNeeded, dataPsnCnt + (hasSignal ? 1u : 0u), &psnBase);
+    uint32_t wqeIdx = curPostIdx;
+    uint64_t dbrVal = core::PostWrite<PrvdType>(*wq, wqeIdx, wqeIdx, psnBase, true /*cqeSignal*/,
+                                                qpn, localAddr, localKey, remoteAddr, remoteKey,
+                                                bytes);
+    wqeIdx++;
+    if (hasSignal) {
+      dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+          *wq, wqeIdx, wqeIdx, psnBase + dataPsnCnt, true /*cqeSignal*/, qpn, atomicLaddr,
+          atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/,
+          core::AMO_FETCH_ADD);
+    }
+    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, numWqesNeeded, dbrVal);
+  } else {
+    uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, numWqesNeeded);
+    uint32_t wqeIdx = curPostIdx;
+    uint64_t dbrVal = core::PostWrite<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn,
+                                                localAddr, localKey, remoteAddr, remoteKey, bytes);
+    wqeIdx++;
+    if (hasSignal) {
+      dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+          *wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+          signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/, core::AMO_FETCH_ADD);
+    }
+    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, numWqesNeeded, dbrVal);
   }
 }
 
@@ -655,42 +767,47 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
     uint32_t totalWqes = numActiveLanes + signalWqes;
 
     uint32_t base = 0;
-    if (isLeader) {
-      base = atomicAdd(&wq->postIdx, totalWqes);
-    }
+    if (isLeader) base = atomicAdd(&wq->postIdx, totalWqes);
     base = __shfl(base, leaderLane);
-
-    while (true) {
-      uint64_t dbTouched =
-          __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t dbDone =
-          __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t numActiveSqEntries = dbTouched - dbDone;
-      uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
-      uint64_t entriesUntilBatchLast = base + totalWqes - dbTouched;
-      if (numFreeEntries > entriesUntilBatchLast) break;
-      quietUntil<PrvdType>(ep, base);
-    }
-
     uint32_t mySlot = base + myLogicalLaneId;
-    uint64_t dbrVal =
-        core::PostWriteInline<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
-                                        &value, remoteAddr, remoteKey, sizeof(T));
+    uint32_t signalSlot = base + numActiveLanes;
+    uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
+    uint32_t atomicLkey = ep->atomicIbuf.lkey;
 
-    __threadfence();
-
-    if (isLeader) {
-      if (hasSignal) {
-        uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
-        uint32_t atomicLkey = ep->atomicIbuf.lkey;
-        uint32_t signalSlot = base + numActiveLanes;
-        dbrVal = core::PostAtomic<PrvdType, uint64_t>(
-            *wq, signalSlot, signalSlot, signalSlot, true /*cqeSignal*/, qpn, atomicLaddr,
-            atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
+    if constexpr (PrvdType == core::ProviderType::BNXT) {
+      // Reserve per-packet PSNs first (inline write is 1 packet), then post.
+      uint32_t sigPsn = 0;
+      uint32_t dataPsn = warpAggregateBnxtPsn(wq, /*dataPsnCnt=*/1, hasSignal, totalWqes, activemask,
+                                              leaderLane, isLeader, &sigPsn);
+      waitSqSpace<PrvdType>(ep, base, totalWqes);
+      uint64_t dbrVal = core::PostWriteInline<PrvdType>(*wq, mySlot, mySlot, dataPsn,
+                                                        true /*cqeSignal*/, qpn, &value, remoteAddr,
+                                                        remoteKey, sizeof(T));
+      __threadfence();
+      if (isLeader) {
+        if (hasSignal) {
+          dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+              *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+              signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
+        }
+        if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+          ringDoorbellOrdered<PrvdType>(ep, base, totalWqes, dbrVal);
       }
-
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-        ringDoorbellOrdered<PrvdType>(ep, base, totalWqes, dbrVal);
+    } else {
+      // MLX5/PSD: the WQE slot index doubles as the PSN.
+      waitSqSpace<PrvdType>(ep, base, totalWqes);
+      uint64_t dbrVal = core::PostWriteInline<PrvdType>(*wq, mySlot, mySlot, mySlot,
+                                                        true /*cqeSignal*/, qpn, &value, remoteAddr,
+                                                        remoteKey, sizeof(T));
+      __threadfence();
+      if (isLeader) {
+        if (hasSignal) {
+          dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+              *wq, signalSlot, signalSlot, signalSlot, true /*cqeSignal*/, qpn, atomicLaddr,
+              atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
+        }
+        if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+          ringDoorbellOrdered<PrvdType>(ep, base, totalWqes, dbrVal);
       }
     }
     return;
@@ -698,24 +815,38 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
 
   // Per-lane path
   uint32_t numWqesNeeded = 1 + signalWqes;
-  uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, numWqesNeeded);
+  uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
+  uint32_t atomicLkey = ep->atomicIbuf.lkey;
 
-  uint32_t wqeIdx = curPostIdx;
-  uint64_t dbrVal = core::PostWriteInline<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/,
-                                                    qpn, &value, remoteAddr, remoteKey, sizeof(T));
-  wqeIdx++;
-
-  if (hasSignal) {
-    uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
-    uint32_t atomicLkey = ep->atomicIbuf.lkey;
-
-    dbrVal = core::PostAtomic<PrvdType, uint64_t>(
-        *wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
-        signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
-  }
-
-  if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, numWqesNeeded, dbrVal);
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    uint32_t psnBase = 0;
+    uint32_t curPostIdx =
+        reserveWqeSlots<PrvdType>(ep, numWqesNeeded, 1u + (hasSignal ? 1u : 0u), &psnBase);
+    uint32_t wqeIdx = curPostIdx;
+    uint64_t dbrVal = core::PostWriteInline<PrvdType>(*wq, wqeIdx, wqeIdx, psnBase,
+                                                      true /*cqeSignal*/, qpn, &value, remoteAddr,
+                                                      remoteKey, sizeof(T));
+    wqeIdx++;
+    if (hasSignal) {
+      dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+          *wq, wqeIdx, wqeIdx, psnBase + 1u, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+          signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
+    }
+    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, numWqesNeeded, dbrVal);
+  } else {
+    uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, numWqesNeeded);
+    uint32_t wqeIdx = curPostIdx;
+    uint64_t dbrVal = core::PostWriteInline<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/,
+                                                      qpn, &value, remoteAddr, remoteKey, sizeof(T));
+    wqeIdx++;
+    if (hasSignal) {
+      dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+          *wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+          signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
+    }
+    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, numWqesNeeded, dbrVal);
   }
 }
 
@@ -736,47 +867,53 @@ __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn
     uint32_t totalWqes = numActiveLanes;
 
     uint32_t base = 0;
-    if (isLeader) {
-      base = atomicAdd(&wq->postIdx, totalWqes);
-    }
+    if (isLeader) base = atomicAdd(&wq->postIdx, totalWqes);
     base = __shfl(base, leaderLane);
-
-    while (true) {
-      uint64_t dbTouched =
-          __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t dbDone =
-          __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t numActiveSqEntries = dbTouched - dbDone;
-      uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
-      uint64_t entriesUntilBatchLast = base + totalWqes - dbTouched;
-      if (numFreeEntries > entriesUntilBatchLast) break;
-      quietUntil<PrvdType>(ep, base);
-    }
-
     uint32_t mySlot = base + myLogicalLaneId;
-    uint64_t dbrVal =
-        core::PostRead<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn, localAddr,
-                                 localKey, remoteAddr, remoteKey, bytes);
 
-    __threadfence();
-
-    if (isLeader) {
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
+    if constexpr (PrvdType == core::ProviderType::BNXT) {
+      // Reserve per-packet PSNs first (read consumes response-packet PSNs), then post.
+      uint32_t dataPsnCnt = (bytes == 0) ? 1 : (bytes + wq->mtuSize - 1) / wq->mtuSize;
+      uint32_t dataPsn = warpAggregateBnxtPsn(wq, dataPsnCnt, /*hasSignalPacket=*/false, totalWqes,
+                                              activemask, leaderLane, isLeader,
+                                              /*outSignalPsn=*/nullptr);
+      waitSqSpace<PrvdType>(ep, base, totalWqes);
+      uint64_t dbrVal = core::PostRead<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/,
+                                                 qpn, localAddr, localKey, remoteAddr, remoteKey,
+                                                 bytes);
+      __threadfence();
+      if (isLeader && !(optFlags & ccoGdaOptFlagsAggregateRequests))
         ringDoorbellOrdered<PrvdType>(ep, base, totalWqes, dbrVal);
-      }
+    } else {
+      // MLX5/PSD: the WQE slot index doubles as the PSN.
+      waitSqSpace<PrvdType>(ep, base, totalWqes);
+      uint64_t dbrVal = core::PostRead<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/,
+                                                 qpn, localAddr, localKey, remoteAddr, remoteKey,
+                                                 bytes);
+      __threadfence();
+      if (isLeader && !(optFlags & ccoGdaOptFlagsAggregateRequests))
+        ringDoorbellOrdered<PrvdType>(ep, base, totalWqes, dbrVal);
     }
     return;
   }
 
   // Per-lane path
-  uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
-
-  uint64_t dbrVal =
-      core::PostRead<PrvdType>(*wq, curPostIdx, curPostIdx, curPostIdx, true /*cqeSignal*/, qpn,
-                               localAddr, localKey, remoteAddr, remoteKey, bytes);
-
-  if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    uint32_t dataPsnCnt = (bytes == 0) ? 1 : (bytes + wq->mtuSize - 1) / wq->mtuSize;
+    uint32_t psnBase = 0;
+    uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1, dataPsnCnt, &psnBase);
+    uint64_t dbrVal = core::PostRead<PrvdType>(*wq, curPostIdx, curPostIdx, psnBase,
+                                               true /*cqeSignal*/, qpn, localAddr, localKey,
+                                               remoteAddr, remoteKey, bytes);
+    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+  } else {
+    uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
+    uint64_t dbrVal = core::PostRead<PrvdType>(*wq, curPostIdx, curPostIdx, curPostIdx,
+                                               true /*cqeSignal*/, qpn, localAddr, localKey,
+                                               remoteAddr, remoteKey, bytes);
+    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
   }
 }
 
@@ -829,24 +966,28 @@ __device__ inline static void signalImpl(core::RdmaEndpointDevice* ep, uint32_t 
                                          ccoGdaSignalOp_t signalOp, uint64_t signalOpArg,
                                          uint32_t optFlags = ccoGdaOptFlagsDefault) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
-
-  // Reserve WQE slot
-  uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
-
-  // Post RDMA atomic operation
-
-  // RDMA atomic requires local buffer for FetchAdd result (even if unused)
+  // RDMA atomic requires a local buffer for the FetchAdd result (even if unused).
   uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
   uint32_t atomicLkey = ep->atomicIbuf.lkey;
-
   uint64_t addValue = (signalOp == ccoGdaSignalInc) ? 1 : signalOpArg;
-  uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
-      *wq, curPostIdx, curPostIdx, curPostIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
-      signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
 
-  // Ring doorbell unless AggregateRequests is set
-  if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    // Reserve a WQE slot + 1 packet PSN; post the atomic with the packet PSN.
+    uint32_t psnBase = 0;
+    uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1, /*lanePsnCnt=*/1, &psnBase);
+    uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+        *wq, curPostIdx, curPostIdx, psnBase, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+        signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
+    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+  } else {
+    // MLX5/PSD: the WQE slot index doubles as the PSN.
+    uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
+    uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+        *wq, curPostIdx, curPostIdx, curPostIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+        signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
+    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
   }
 }
 
