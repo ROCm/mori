@@ -86,9 +86,9 @@ typedef struct {
 typedef uint32_t ccoGdaSignal_t;
 typedef uint32_t ccoGdaCounter_t;
 
-enum ccoGdaWarpMode : uint32_t {
-  ccoGdaWarpDefault = 0,
-  ccoGdaWarpAggregate = 1,
+enum ccoGdaThreadMode : uint32_t {
+  ccoGdaThreadIndependent = 0,
+  ccoGdaThreadAggregate = 1,
 };
 
 enum ccoGdaOptFlags {
@@ -142,7 +142,7 @@ struct ccoGda {
   __device__ inline int resolveWorldPeer(int peer) const;
 
   // put: rdma write with optional remote signal.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault,
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent,
             typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes,
@@ -150,7 +150,7 @@ struct ccoGda {
                              uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // putValue: write an immediate value (≤8 bytes) with optional remote signal.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault,
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent,
             typename T, typename RemoteAction = ccoGda_NoSignal,
             typename Coop = ccoCoopThread>
   __device__ inline void putValue(int peer, ccoWindow_t dstWin, size_t dstOffset, T value,
@@ -158,7 +158,7 @@ struct ccoGda {
                                   uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // get: rdma read — pull peer's window content into our local window.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault,
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent,
             typename Coop = ccoCoopThread>
   __device__ inline void get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
                              ccoWindow_t localWin, size_t localOffset, size_t bytes,
@@ -381,6 +381,11 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
         int opcode = core::PollCqOnce<core::ProviderType::BNXT>(cq->cqAddr, cq->cqeNum,
                                                                 consIdxIgnored, &wqeCounter);
         if (opcode < 0) continue;  // no new completion yet
+        if (opcode != BNXT_RE_REQ_ST_OK) {
+          MORI_PRINTF("quietUntil[BNXT]: CQE error opcode=%d\n", opcode);
+          assert(false);
+          break;
+        }
         // Largest V <= dbTouchIdx with V % sqWqeNum == con_indx % sqWqeNum.
         uint32_t dbTouch =
             __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -394,15 +399,64 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
   }
 }
 
-// Reserve WQE slots and wait for SQ space (per-lane).
-// For warp-aggregate mode the caller has the leader lane call this once
-// with the warp total, then broadcasts the returned base via __shfl.
+// BNXT: exclusive prefix-sum of psnCnt over active lanes. Returns this lane's
+// prefix; *outTotal = warp total. All active lanes must call together.
+__device__ inline static uint32_t warpActivePsnPrefix(uint32_t psnCnt, uint64_t activemask,
+                                                      uint32_t* outTotal) {
+  const uint32_t myPhys = static_cast<uint32_t>(__lane_id());
+  uint32_t excl = 0, total = 0;
+  uint64_t m = activemask;
+  while (m) {
+    int l = __ffsll(static_cast<unsigned long long>(m)) - 1;
+    uint32_t v = __shfl(psnCnt, l);
+    total += v;
+    if (static_cast<uint32_t>(l) < myPhys) excl += v;
+    m &= m - 1;
+  }
+  *outTotal = total;
+  return excl;
+}
+
+// BNXT warp-aggregate PSN: each active lane contributes dataPsnCnt data packets,
+// the leader optionally one signal packet. The leader advances wq->msnPack once by
+// the warp totals; returns this lane's data-PSN base and the signal PSN (outSignalPsn).
+// BNXT PSN advances by PACKET count, not WQE count.
+__device__ inline static uint32_t warpAggregateBnxtPsn(core::WorkQueueHandle* wq,
+                                                       uint32_t dataPsnCnt, bool hasSignalPacket,
+                                                       uint32_t totalWqes, uint64_t activemask,
+                                                       int leaderLane, bool isLeader,
+                                                       uint32_t* outSignalPsn) {
+  uint32_t warpDataPsnTotal = 0;
+  uint32_t myExcl = warpActivePsnPrefix(dataPsnCnt, activemask, &warpDataPsnTotal);
+  uint32_t warpTotalPsn = warpDataPsnTotal + (hasSignalPacket ? 1u : 0u);
+  uint32_t warpPsnBase = 0;
+  if (isLeader) {
+    uint32_t slotIgnored = 0;
+    core::atomic_add_packed_msn_and_psn(&wq->msnPack, totalWqes, warpTotalPsn, &slotIgnored,
+                                        &warpPsnBase);
+  }
+  warpPsnBase = __shfl(warpPsnBase, leaderLane);
+  if (outSignalPsn) *outSignalPsn = warpPsnBase + warpDataPsnTotal;
+  return warpPsnBase + myExcl;
+}
+
+// Reserve numWqesNeeded SQ slots (per-lane) and wait for SQ space. BNXT also
+// reserves lanePsnCnt packet PSNs on wq->msnPack and returns the base via
+// outPsnBase (advances by PACKET count); lanePsnCnt/outPsnBase ignored elsewhere.
 template <core::ProviderType PrvdType>
 __device__ inline static uint32_t reserveWqeSlots(core::RdmaEndpointDevice* ep,
-                                                  uint32_t numWqesNeeded) {
+                                                  uint32_t numWqesNeeded, uint32_t lanePsnCnt = 0,
+                                                  uint32_t* outPsnBase = nullptr) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
 
   uint32_t curPostIdx = atomicAdd(&wq->postIdx, numWqesNeeded);
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    uint32_t slotIgnored = 0;
+    uint32_t psnBase = 0;
+    core::atomic_add_packed_msn_and_psn(&wq->msnPack, numWqesNeeded, lanePsnCnt, &slotIgnored,
+                                        &psnBase);
+    if (outPsnBase) *outPsnBase = psnBase;
+  }
   while (true) {
     uint64_t dbTouched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -413,32 +467,68 @@ __device__ inline static uint32_t reserveWqeSlots(core::RdmaEndpointDevice* ep,
     if (numFreeEntries > entriesUntilMine) {
       break;
     }
-    quietUntil<PrvdType>(ep, curPostIdx);
+    if constexpr (PrvdType == core::ProviderType::BNXT) {
+      // BNXT: drain to the doorbelled snapshot, not our un-doorbelled
+      // reservation — else we'd wait on WQEs that may never ring (self-deadlock).
+      quietUntil<PrvdType>(ep, static_cast<uint32_t>(dbTouched));
+    } else {
+      quietUntil<PrvdType>(ep, curPostIdx);
+    }
   }
   return curPostIdx;
 }
 
-// PSD/Ionic only: walk the warp's active lane mask and let one lane at a
-// time issue the doorbell MMIO store. Ionic's dbrAddr is shared across every
-// QP of the same ibv_context; multiple lanes of one warp storing to that
-// shared address in one SIMT instruction get coalesced into a single
-// transaction and only one lane's dbrVal survives. Atomic-store ordering
-// does not protect against this. MLX5/BNXT each have a per-QP dbrAddr so
-// multi-lane stores hit distinct addresses and stay on the fast path.
-__device__ inline static void ringDoorbellWarpPsd(void* dbrAddr, uint64_t dbrVal) {
+// Warp-aggregate flow control: wait until the SQ has room for [base, base+totalWqes).
+// BNXT drains to the doorbelled snapshot (avoids self-deadlock); others drain to
+// the reservation.
+template <core::ProviderType PrvdType>
+__device__ inline static void waitSqSpace(core::RdmaEndpointDevice* ep, uint32_t base,
+                                          uint32_t totalWqes) {
+  core::WorkQueueHandle* wq = &ep->wqHandle;
+  while (true) {
+    uint64_t dbTouched =
+        __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint64_t dbDone = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint64_t numActiveSqEntries = dbTouched - dbDone;
+    uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
+    uint64_t entriesUntilBatchLast = base + totalWqes - dbTouched;
+    if (numFreeEntries > entriesUntilBatchLast) break;
+    if constexpr (PrvdType == core::ProviderType::BNXT) {
+      quietUntil<PrvdType>(ep, static_cast<uint32_t>(dbTouched));
+    } else {
+      quietUntil<PrvdType>(ep, base);
+    }
+  }
+}
+
+// PSD/BNXT: walk the active lane mask, ringing one lane at a time. These providers
+// share one dbrAddr across QPs (Ionic per ibv_context; BNXT per UAR page), so lanes
+// ringing distinct QPs in one SIMT store would coalesce — only one doorbell survives
+// and the rest hang. Serializing per lane avoids that; MLX5 has per-QP dbrAddr.
+// No __syncwarp: wavefronts are lock-step (predication already orders the stores)
+// and a __syncwarp would deadlock on divergent entry.
+template <core::ProviderType PrvdType>
+__device__ inline static void ringDoorbellWalk(core::WorkQueueHandle* wq, uint32_t dbrRecVal,
+                                               uint64_t dbrVal) {
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, dbrRecVal);
+    __threadfence_system();
+  }
   uint64_t mask = core::GetActiveLaneMask();
   while (mask) {
     int lane = __ffsll(static_cast<unsigned long long>(mask)) - 1;
     if (__lane_id() == lane) {
-      core::RingDoorbell<core::ProviderType::PSD>(dbrAddr, dbrVal);
+      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
     }
-    __syncwarp();
     mask &= ~(1ull << lane);
   }
 }
 
-// Wait for doorbell ordering and ring doorbell
-template <core::ProviderType PrvdType>
+// Wait for this QP's doorbell turn (preserve per-QP ordering), then ring.
+// LeaderOnly=true: caller guarantees one active lane rings (per-peer group leader)
+// → single store. LeaderOnly=false: multiple lanes may ring shared-dbrAddr QPs →
+// serialize via ringDoorbellWalk to avoid coalescing.
+template <core::ProviderType PrvdType, bool LeaderOnly = false>
 __device__ inline static void ringDoorbellOrdered(core::RdmaEndpointDevice* ep, uint32_t myPostIdx,
                                                   uint32_t numWqes, uint64_t dbrVal) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
@@ -456,34 +546,21 @@ __device__ inline static void ringDoorbellOrdered(core::RdmaEndpointDevice* ep, 
   // Ring doorbell - provider-specific sequence
   __threadfence_system();
 
-  if constexpr (PrvdType == core::ProviderType::PSD) {
-    // PSD/Ionic: shared dbrAddr, lane-serialize to avoid SIMT same-address
-    // store coalescing dropping doorbells.
-    ringDoorbellWarpPsd(wq->dbrAddr, dbrVal);
+  if constexpr (LeaderOnly) {
+    // Single active lane: MLX5/BNXT update the DBR record first, then one store.
+    if constexpr (PrvdType != core::ProviderType::PSD) {
+      core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, myPostIdx + numWqes);
+      __threadfence_system();
+    }
+    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
   } else if constexpr (PrvdType == core::ProviderType::MLX5) {
-    // MLX5: must update DBR record before ringing doorbell
+    // MLX5: per-QP dbrAddr (no coalescing across lanes); update DBR record + ring.
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, myPostIdx + numWqes);
     __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-  } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-    // BNXT: update DBR record, then ring doorbell. BNXT dedups the UAR page
-    // across endpoints (see BnxtCqContainer / TryRegisterUar), so distinct QPs
-    // in one warp can share the same dbrAddr. A per-thread GDA put has each
-    // active lane targeting a *different* peer's QP in the same SIMT step; if
-    // those QPs share a UAR, same-address store coalescing drops all but one
-    // lane's doorbell — the dropped WQE is never fetched and quiet hangs. Walk
-    // the warp's active lanes one at a time so every doorbell store survives.
-    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, myPostIdx + numWqes);
-    __threadfence_system();
-    uint64_t mask = core::GetActiveLaneMask();
-    while (mask) {
-      int lane = __ffsll(static_cast<unsigned long long>(mask)) - 1;
-      if (__lane_id() == lane) {
-        core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-      }
-      __syncwarp();
-      mask &= ~(1ull << lane);
-    }
+  } else {
+    // PSD/BNXT: lanes may share a dbrAddr → serialize per lane.
+    ringDoorbellWalk<PrvdType>(wq, myPostIdx + numWqes, dbrVal);
   }
 
   __threadfence_system();
@@ -530,13 +607,10 @@ __device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, ui
   }
 }
 
-// putImpl - Pure hardware operation layer
-//
-// ccoGdaWarpAggregate: all active warp lanes must target the same QP.
-// Leader reserves slots for (N data WQEs + 1 signal WQE), each lane posts
-// its data WQE, and the leader posts one shared signal WQE + rings one
-// doorbell for the entire batch.
-template <core::ProviderType PrvdType, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault>
+// putImpl - post one warp-aggregated put for the active lanes (all targeting this
+// ep/qpn; the facade groups by peer). Each lane posts its data WQE into a contiguous
+// reservation; the leader posts the shared signal WQE and rings one doorbell.
+template <core::ProviderType PrvdType>
 __device__ inline static void putImpl(
     // Hardware resources (already selected endpoint)
     core::RdmaEndpointDevice* ep, uint32_t qpn,
@@ -553,86 +627,67 @@ __device__ inline static void putImpl(
     // Optimization flags
     uint32_t optFlags = ccoGdaOptFlagsDefault) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
-
   uint32_t signalWqes =
       hasSignal ? getAtomicWqeCount<PrvdType>(core::AMO_FETCH_ADD, sizeof(uint64_t)) : 0;
 
-  if constexpr (WarpMode == ccoGdaWarpAggregate) {
-    uint64_t activemask = core::GetActiveLaneMask();
-    int leaderLane = core::GetLastActiveLaneID(activemask);
-    uint32_t numActiveLanes = core::GetActiveLaneCount(activemask);
-    uint32_t myLogicalLaneId = core::GetActiveLaneNum(activemask);
-    bool isLeader = (myLogicalLaneId == numActiveLanes - 1);
-    uint32_t totalWqes = numActiveLanes + signalWqes;
+  uint64_t activemask = core::GetActiveLaneMask();
+  int leaderLane = core::GetLastActiveLaneID(activemask);
+  uint32_t numActiveLanes = core::GetActiveLaneCount(activemask);
+  uint32_t myLogicalLaneId = core::GetActiveLaneNum(activemask);
+  bool isLeader = (myLogicalLaneId == numActiveLanes - 1);
+  uint32_t totalWqes = numActiveLanes + signalWqes;
 
-    uint32_t base = 0;
-    if (isLeader) {
-      base = atomicAdd(&wq->postIdx, totalWqes);
-    }
-    base = __shfl(base, leaderLane);
+  uint32_t base = 0;
+  if (isLeader) base = atomicAdd(&wq->postIdx, totalWqes);
+  base = __shfl(base, leaderLane);
+  uint32_t mySlot = base + myLogicalLaneId;
+  uint32_t signalSlot = base + numActiveLanes;
+  uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
+  uint32_t atomicLkey = ep->atomicIbuf.lkey;
 
-    while (true) {
-      uint64_t dbTouched =
-          __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t dbDone =
-          __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t numActiveSqEntries = dbTouched - dbDone;
-      uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
-      uint64_t entriesUntilBatchLast = base + totalWqes - dbTouched;
-      if (numFreeEntries > entriesUntilBatchLast) break;
-      quietUntil<PrvdType>(ep, base);
-    }
-
-    uint32_t mySlot = base + myLogicalLaneId;
-    uint64_t dbrVal =
-        core::PostWrite<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn, localAddr,
-                                  localKey, remoteAddr, remoteKey, bytes);
-
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    // Reserve per-packet PSNs before the SQ-space wait so PSN order matches slot
+    // order across concurrent warps, then post with packet PSN.
+    uint32_t dataPsnCnt = (bytes == 0) ? 1 : (bytes + wq->mtuSize - 1) / wq->mtuSize;
+    uint32_t sigPsn = 0;
+    uint32_t dataPsn = warpAggregateBnxtPsn(wq, dataPsnCnt, hasSignal, totalWqes, activemask,
+                                            leaderLane, isLeader, &sigPsn);
+    waitSqSpace<PrvdType>(ep, base, totalWqes);
+    uint64_t dbrVal = core::PostWrite<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/,
+                                                qpn, localAddr, localKey, remoteAddr, remoteKey,
+                                                bytes);
     __threadfence();
-
     if (isLeader) {
       if (hasSignal) {
-        uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
-        uint32_t atomicLkey = ep->atomicIbuf.lkey;
-        uint32_t signalSlot = base + numActiveLanes;
+        dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+            *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+            signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/, core::AMO_FETCH_ADD);
+      }
+      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+    }
+  } else {
+    // MLX5/PSD: the WQE slot index doubles as the PSN.
+    waitSqSpace<PrvdType>(ep, base, totalWqes);
+    uint64_t dbrVal = core::PostWrite<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
+                                                localAddr, localKey, remoteAddr, remoteKey, bytes);
+    __threadfence();
+    if (isLeader) {
+      if (hasSignal) {
         dbrVal = core::PostAtomic<PrvdType, uint64_t>(
             *wq, signalSlot, signalSlot, signalSlot, true /*cqeSignal*/, qpn, atomicLaddr,
             atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/,
             core::AMO_FETCH_ADD);
       }
-
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-        ringDoorbellOrdered<PrvdType>(ep, base, totalWqes, dbrVal);
-      }
+      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
-    return;
-  }
-
-  // Per-lane path
-  uint32_t numWqesNeeded = 1 + signalWqes;
-  uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, numWqesNeeded);
-
-  uint32_t wqeIdx = curPostIdx;
-  uint64_t dbrVal = core::PostWrite<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn,
-                                              localAddr, localKey, remoteAddr, remoteKey, bytes);
-  wqeIdx++;
-
-  if (hasSignal) {
-    uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
-    uint32_t atomicLkey = ep->atomicIbuf.lkey;
-
-    dbrVal = core::PostAtomic<PrvdType, uint64_t>(
-        *wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
-        signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/, core::AMO_FETCH_ADD);
-  }
-
-  if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, numWqesNeeded, dbrVal);
   }
 }
 
-// putValueImpl - Inline write for small values
-template <core::ProviderType PrvdType, typename T, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault>
+// putValueImpl - Inline write for small values. One group per call (the facade
+// groups lanes by peer); same warp-aggregate posting as putImpl.
+template <core::ProviderType PrvdType, typename T>
 __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                            uintptr_t remoteAddr, uint32_t remoteKey, T value,
                                            bool hasSignal, uintptr_t signalRemoteAddr,
@@ -642,141 +697,102 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
 
   core::WorkQueueHandle* wq = &ep->wqHandle;
-
   uint32_t signalWqes =
       hasSignal ? getAtomicWqeCount<PrvdType>(core::AMO_FETCH_ADD, sizeof(uint64_t)) : 0;
 
-  if constexpr (WarpMode == ccoGdaWarpAggregate) {
-    uint64_t activemask = core::GetActiveLaneMask();
-    int leaderLane = core::GetLastActiveLaneID(activemask);
-    uint32_t numActiveLanes = core::GetActiveLaneCount(activemask);
-    uint32_t myLogicalLaneId = core::GetActiveLaneNum(activemask);
-    bool isLeader = (myLogicalLaneId == numActiveLanes - 1);
-    uint32_t totalWqes = numActiveLanes + signalWqes;
+  uint64_t activemask = core::GetActiveLaneMask();
+  int leaderLane = core::GetLastActiveLaneID(activemask);
+  uint32_t numActiveLanes = core::GetActiveLaneCount(activemask);
+  uint32_t myLogicalLaneId = core::GetActiveLaneNum(activemask);
+  bool isLeader = (myLogicalLaneId == numActiveLanes - 1);
+  uint32_t totalWqes = numActiveLanes + signalWqes;
 
-    uint32_t base = 0;
-    if (isLeader) {
-      base = atomicAdd(&wq->postIdx, totalWqes);
-    }
-    base = __shfl(base, leaderLane);
+  uint32_t base = 0;
+  if (isLeader) base = atomicAdd(&wq->postIdx, totalWqes);
+  base = __shfl(base, leaderLane);
+  uint32_t mySlot = base + myLogicalLaneId;
+  uint32_t signalSlot = base + numActiveLanes;
+  uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
+  uint32_t atomicLkey = ep->atomicIbuf.lkey;
 
-    while (true) {
-      uint64_t dbTouched =
-          __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t dbDone =
-          __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t numActiveSqEntries = dbTouched - dbDone;
-      uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
-      uint64_t entriesUntilBatchLast = base + totalWqes - dbTouched;
-      if (numFreeEntries > entriesUntilBatchLast) break;
-      quietUntil<PrvdType>(ep, base);
-    }
-
-    uint32_t mySlot = base + myLogicalLaneId;
-    uint64_t dbrVal =
-        core::PostWriteInline<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
-                                        &value, remoteAddr, remoteKey, sizeof(T));
-
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    // Reserve per-packet PSNs first (inline write is 1 packet), then post.
+    uint32_t sigPsn = 0;
+    uint32_t dataPsn = warpAggregateBnxtPsn(wq, /*dataPsnCnt=*/1, hasSignal, totalWqes, activemask,
+                                            leaderLane, isLeader, &sigPsn);
+    waitSqSpace<PrvdType>(ep, base, totalWqes);
+    uint64_t dbrVal = core::PostWriteInline<PrvdType>(*wq, mySlot, mySlot, dataPsn,
+                                                      true /*cqeSignal*/, qpn, &value, remoteAddr,
+                                                      remoteKey, sizeof(T));
     __threadfence();
-
     if (isLeader) {
       if (hasSignal) {
-        uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
-        uint32_t atomicLkey = ep->atomicIbuf.lkey;
-        uint32_t signalSlot = base + numActiveLanes;
+        dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+            *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+            signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
+      }
+      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+    }
+  } else {
+    // MLX5/PSD: the WQE slot index doubles as the PSN.
+    waitSqSpace<PrvdType>(ep, base, totalWqes);
+    uint64_t dbrVal = core::PostWriteInline<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/,
+                                                      qpn, &value, remoteAddr, remoteKey, sizeof(T));
+    __threadfence();
+    if (isLeader) {
+      if (hasSignal) {
         dbrVal = core::PostAtomic<PrvdType, uint64_t>(
             *wq, signalSlot, signalSlot, signalSlot, true /*cqeSignal*/, qpn, atomicLaddr,
             atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
       }
-
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-        ringDoorbellOrdered<PrvdType>(ep, base, totalWqes, dbrVal);
-      }
+      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
-    return;
-  }
-
-  // Per-lane path
-  uint32_t numWqesNeeded = 1 + signalWqes;
-  uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, numWqesNeeded);
-
-  uint32_t wqeIdx = curPostIdx;
-  uint64_t dbrVal = core::PostWriteInline<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/,
-                                                    qpn, &value, remoteAddr, remoteKey, sizeof(T));
-  wqeIdx++;
-
-  if (hasSignal) {
-    uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
-    uint32_t atomicLkey = ep->atomicIbuf.lkey;
-
-    dbrVal = core::PostAtomic<PrvdType, uint64_t>(
-        *wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
-        signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
-  }
-
-  if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, numWqesNeeded, dbrVal);
   }
 }
 
-// getImpl - RDMA read
-template <core::ProviderType PrvdType, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault>
+// getImpl - RDMA read. One group per call (the facade groups lanes by peer):
+// each active lane posts its read WQE into a contiguous reservation, the leader
+// rings one doorbell.
+template <core::ProviderType PrvdType>
 __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                       uintptr_t localAddr, uint32_t localKey, uintptr_t remoteAddr,
                                       uint32_t remoteKey, size_t bytes,
                                       uint32_t optFlags = ccoGdaOptFlagsDefault) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
+  uint64_t activemask = core::GetActiveLaneMask();
+  int leaderLane = core::GetLastActiveLaneID(activemask);
+  uint32_t numActiveLanes = core::GetActiveLaneCount(activemask);
+  uint32_t myLogicalLaneId = core::GetActiveLaneNum(activemask);
+  bool isLeader = (myLogicalLaneId == numActiveLanes - 1);
+  uint32_t totalWqes = numActiveLanes;
 
-  if constexpr (WarpMode == ccoGdaWarpAggregate) {
-    uint64_t activemask = core::GetActiveLaneMask();
-    int leaderLane = core::GetLastActiveLaneID(activemask);
-    uint32_t numActiveLanes = core::GetActiveLaneCount(activemask);
-    uint32_t myLogicalLaneId = core::GetActiveLaneNum(activemask);
-    bool isLeader = (myLogicalLaneId == numActiveLanes - 1);
-    uint32_t totalWqes = numActiveLanes;
+  uint32_t base = 0;
+  if (isLeader) base = atomicAdd(&wq->postIdx, totalWqes);
+  base = __shfl(base, leaderLane);
+  uint32_t mySlot = base + myLogicalLaneId;
 
-    uint32_t base = 0;
-    if (isLeader) {
-      base = atomicAdd(&wq->postIdx, totalWqes);
-    }
-    base = __shfl(base, leaderLane);
-
-    while (true) {
-      uint64_t dbTouched =
-          __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t dbDone =
-          __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t numActiveSqEntries = dbTouched - dbDone;
-      uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
-      uint64_t entriesUntilBatchLast = base + totalWqes - dbTouched;
-      if (numFreeEntries > entriesUntilBatchLast) break;
-      quietUntil<PrvdType>(ep, base);
-    }
-
-    uint32_t mySlot = base + myLogicalLaneId;
-    uint64_t dbrVal =
-        core::PostRead<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn, localAddr,
-                                 localKey, remoteAddr, remoteKey, bytes);
-
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    // Reserve per-packet PSNs first (read consumes response-packet PSNs), then post.
+    uint32_t dataPsnCnt = (bytes == 0) ? 1 : (bytes + wq->mtuSize - 1) / wq->mtuSize;
+    uint32_t dataPsn = warpAggregateBnxtPsn(wq, dataPsnCnt, /*hasSignalPacket=*/false, totalWqes,
+                                            activemask, leaderLane, isLeader,
+                                            /*outSignalPsn=*/nullptr);
+    waitSqSpace<PrvdType>(ep, base, totalWqes);
+    uint64_t dbrVal = core::PostRead<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/, qpn,
+                                               localAddr, localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
-
-    if (isLeader) {
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-        ringDoorbellOrdered<PrvdType>(ep, base, totalWqes, dbrVal);
-      }
-    }
-    return;
-  }
-
-  // Per-lane path
-  uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
-
-  uint64_t dbrVal =
-      core::PostRead<PrvdType>(*wq, curPostIdx, curPostIdx, curPostIdx, true /*cqeSignal*/, qpn,
-                               localAddr, localKey, remoteAddr, remoteKey, bytes);
-
-  if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+    if (isLeader && !(optFlags & ccoGdaOptFlagsAggregateRequests))
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+  } else {
+    // MLX5/PSD: the WQE slot index doubles as the PSN.
+    waitSqSpace<PrvdType>(ep, base, totalWqes);
+    uint64_t dbrVal = core::PostRead<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
+                                               localAddr, localKey, remoteAddr, remoteKey, bytes);
+    __threadfence();
+    if (isLeader && !(optFlags & ccoGdaOptFlagsAggregateRequests))
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
   }
 }
 
@@ -800,12 +816,15 @@ __device__ inline static void flushAsyncImpl(core::RdmaEndpointDevice* ep, uint3
 
   __threadfence_system();
 
-  if constexpr (PrvdType == core::ProviderType::PSD) {
-    ringDoorbellWarpPsd(wq->dbrAddr, dbrVal);
-  } else {
+  // flush() is multi-lane (each lane flushes a different peer/QP), so PSD/BNXT
+  // must serialize doorbells per lane (shared dbrAddr/UAR); MLX5 has a per-QP
+  // dbrAddr and rings directly.
+  if constexpr (PrvdType == core::ProviderType::MLX5) {
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, curPostIdx);
     __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
+  } else {
+    ringDoorbellWalk<PrvdType>(wq, curPostIdx, dbrVal);
   }
 
   __threadfence_system();
@@ -829,24 +848,28 @@ __device__ inline static void signalImpl(core::RdmaEndpointDevice* ep, uint32_t 
                                          ccoGdaSignalOp_t signalOp, uint64_t signalOpArg,
                                          uint32_t optFlags = ccoGdaOptFlagsDefault) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
-
-  // Reserve WQE slot
-  uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
-
-  // Post RDMA atomic operation
-
-  // RDMA atomic requires local buffer for FetchAdd result (even if unused)
+  // RDMA atomic requires a local buffer for the FetchAdd result (even if unused).
   uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
   uint32_t atomicLkey = ep->atomicIbuf.lkey;
-
   uint64_t addValue = (signalOp == ccoGdaSignalInc) ? 1 : signalOpArg;
-  uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
-      *wq, curPostIdx, curPostIdx, curPostIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
-      signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
 
-  // Ring doorbell unless AggregateRequests is set
-  if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    // Reserve a WQE slot + 1 packet PSN; post the atomic with the packet PSN.
+    uint32_t psnBase = 0;
+    uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1, /*lanePsnCnt=*/1, &psnBase);
+    uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+        *wq, curPostIdx, curPostIdx, psnBase, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+        signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
+    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+  } else {
+    // MLX5/PSD: the WQE slot index doubles as the PSN.
+    uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
+    uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+        *wq, curPostIdx, curPostIdx, curPostIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+        signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
+    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
+      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
   }
 }
 
@@ -1015,17 +1038,18 @@ __device__ inline ccoGda<PrvdType>::ccoGda(ccoDevComm const& comm_, int contextI
 
 // put: RDMA write with optional signal
 template <core::ProviderType PrvdType>
-template <ccoTeamMode TeamMode, ccoGdaWarpMode WarpMode, typename RemoteAction, typename Coop>
+template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename RemoteAction, typename Coop>
 __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_t dstOffset,
                                              ccoWindow_t srcWin, size_t srcOffset, size_t bytes,
                                              RemoteAction remoteAction, Coop coop,
                                              uint32_t optFlags) {
-  if constexpr (WarpMode == ccoGdaWarpAggregate) {
+  if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(std::is_same_v<Coop, ccoCoopThread>,
-                  "ccoGdaWarpAggregate requires ccoCoopThread — all warp lanes must enter putImpl.");
+                  "ccoGdaThreadAggregate requires ccoCoopThread — all warp lanes must enter putImpl.");
   }
   coop.sync();
   if (coop.thread_rank() == 0) {
+    // Each active lane resolves its own peer endpoint/keys.
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
 
     ccoWindowDevice* dstWinDev = reinterpret_cast<ccoWindowDevice*>(dstWin);
@@ -1060,24 +1084,37 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
       signalOpArg = remoteAction.value;
     }
 
-    impl::putImpl<PrvdType, WarpMode>(ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey, bytes,
-                                           hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg,
-                                           optFlags);
+    // Only mixed-peer thread scope needs per-peer grouping; ThreadAggregate and
+    // CoopWarp/CoopBlock are a single group.
+    if constexpr (ThreadMode == ccoGdaThreadIndependent && std::is_same_v<Coop, ccoCoopThread>) {
+      // Group active lanes by peer: each peer reserves contiguously + one doorbell.
+      bool needTurn = true;
+      for (uint64_t turns = __ballot(needTurn); turns != 0; turns = __ballot(needTurn)) {
+        int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
+        if (peer != __shfl(peer, lead)) continue;
+        needTurn = false;
+        impl::putImpl<PrvdType>(ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey, bytes, hasSignal,
+                                signalRaddr, signalRkey, signalOp, signalOpArg, optFlags);
+      }
+    } else {
+      impl::putImpl<PrvdType>(ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey, bytes, hasSignal,
+                              signalRaddr, signalRkey, signalOp, signalOpArg, optFlags);
+    }
   }
   coop.sync();
 }
 
 // putValue: write immediate value (≤8 bytes)
 template <core::ProviderType PrvdType>
-template <ccoTeamMode TeamMode, ccoGdaWarpMode WarpMode, typename T, typename RemoteAction,
+template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename T, typename RemoteAction,
           typename Coop>
 __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, size_t dstOffset,
                                                   T value, RemoteAction remoteAction, Coop coop,
                                                   uint32_t optFlags) {
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
-  if constexpr (WarpMode == ccoGdaWarpAggregate) {
+  if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(std::is_same_v<Coop, ccoCoopThread>,
-                  "ccoGdaWarpAggregate requires ccoCoopThread — all warp lanes must enter putValueImpl.");
+                  "ccoGdaThreadAggregate requires ccoCoopThread — all warp lanes must enter putValueImpl.");
   }
 
   coop.sync();
@@ -1111,22 +1148,33 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
       signalOpArg = remoteAction.value;
     }
 
-    impl::putValueImpl<PrvdType, T, WarpMode>(ep, qpn, remoteAddr, dstRkey, value, hasSignal,
-                                                   signalRaddr, signalRkey, signalOp, signalOpArg,
-                                                   optFlags);
+    // Only mixed-peer thread scope needs per-peer grouping; else a single group.
+    if constexpr (ThreadMode == ccoGdaThreadIndependent && std::is_same_v<Coop, ccoCoopThread>) {
+      bool needTurn = true;
+      for (uint64_t turns = __ballot(needTurn); turns != 0; turns = __ballot(needTurn)) {
+        int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
+        if (peer != __shfl(peer, lead)) continue;
+        needTurn = false;
+        impl::putValueImpl<PrvdType, T>(ep, qpn, remoteAddr, dstRkey, value, hasSignal, signalRaddr,
+                                        signalRkey, signalOp, signalOpArg, optFlags);
+      }
+    } else {
+      impl::putValueImpl<PrvdType, T>(ep, qpn, remoteAddr, dstRkey, value, hasSignal, signalRaddr,
+                                      signalRkey, signalOp, signalOpArg, optFlags);
+    }
   }
   coop.sync();
 }
 
 // get: RDMA read
 template <core::ProviderType PrvdType>
-template <ccoTeamMode TeamMode, ccoGdaWarpMode WarpMode, typename Coop>
+template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
                                              ccoWindow_t localWin, size_t localOffset, size_t bytes,
                                              Coop coop, uint32_t optFlags) {
-  if constexpr (WarpMode == ccoGdaWarpAggregate) {
+  if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(std::is_same_v<Coop, ccoCoopThread>,
-                  "ccoGdaWarpAggregate requires ccoCoopThread — all warp lanes must enter getImpl.");
+                  "ccoGdaThreadAggregate requires ccoCoopThread — all warp lanes must enter getImpl.");
   }
   coop.sync();
   if (coop.thread_rank() == 0) {
@@ -1146,8 +1194,20 @@ __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, si
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
 
-    impl::getImpl<PrvdType, WarpMode>(ep, qpn, localAddr, localLkey, remoteAddr, remoteRkey,
-                                           bytes, optFlags);
+    // Only mixed-peer thread scope needs per-peer grouping; else a single group.
+    if constexpr (ThreadMode == ccoGdaThreadIndependent && std::is_same_v<Coop, ccoCoopThread>) {
+      bool needTurn = true;
+      for (uint64_t turns = __ballot(needTurn); turns != 0; turns = __ballot(needTurn)) {
+        int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
+        if (peer != __shfl(peer, lead)) continue;
+        needTurn = false;
+        impl::getImpl<PrvdType>(ep, qpn, localAddr, localLkey, remoteAddr, remoteRkey, bytes,
+                                optFlags);
+      }
+    } else {
+      impl::getImpl<PrvdType>(ep, qpn, localAddr, localLkey, remoteAddr, remoteRkey, bytes,
+                              optFlags);
+    }
   }
   coop.sync();
 }

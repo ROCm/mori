@@ -69,7 +69,7 @@ __global__ void lsa_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 
 // IBGDA: one QP per block; pipeline reads + flush own QP. block scope = one bulk
 // read; warp/thread subdivide (see p2p_put_bw).
-template <core::ProviderType PrvdType, typename Coop>
+template <core::ProviderType PrvdType, typename Coop, ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent>
 __global__ void ibgda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int iter) {
   Coop coop;
@@ -87,11 +87,12 @@ __global__ void ibgda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const size_t off_bytes = base * sizeof(double);
   const size_t bytes = per_unit * sizeof(double);
 
-  // AggregateRequests: defer doorbell to end flush (see p2p_put_bw).
+  // Per-op doorbell: per-op flow control drains completions as the SQ fills
+  // (see p2p_put_bw). The trailing flush waits for the last ops before timing.
   for (int i = 0; i < iter; i++) {
-    gda.get(peer, reinterpret_cast<ccoWindow_t>(sendWin), off_bytes,
-            reinterpret_cast<ccoWindow_t>(recvWin), off_bytes, bytes, coop,
-            ccoGdaOptFlagsAggregateRequests);
+    gda.template get<CCO_TEAM_WORLD, ThreadMode>(peer, reinterpret_cast<ccoWindow_t>(sendWin),
+                                               off_bytes, reinterpret_cast<ccoWindow_t>(recvWin),
+                                               off_bytes, bytes, coop);
   }
   gda.flush(ccoCoopBlock{});
 }
@@ -101,7 +102,7 @@ static void launch_lsa(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWi
                        int peerLsa, int count, int warp_size) {
   int scope_size = block.x;
   if (scope == PutScope::kWarp) scope_size = warp_size;
-  if (scope == PutScope::kThread) scope_size = 1;
+  if (scope == PutScope::kThread || scope == PutScope::kThreadAgg) scope_size = 1;
   hipLaunchKernelGGL(lsa_get_bw, grid, block, 0, 0, sendWin, recvWin, counter_d, len_doubles,
                      peerLsa, count, scope_size);
 }
@@ -121,6 +122,10 @@ static void launch_ibgda(PutScope scope, dim3 grid, dim3 block, ccoWindow_t send
     case PutScope::kThread:
       hipLaunchKernelGGL((ibgda_get_bw<PrvdType, ccoCoopThread>), grid, block, 0, 0, sendWin,
                          recvWin, len_doubles, devComm, count);
+      break;
+    case PutScope::kThreadAgg:
+      hipLaunchKernelGGL((ibgda_get_bw<PrvdType, ccoCoopThread, ccoGdaThreadAggregate>), grid, block,
+                         0, 0, sendWin, recvWin, len_doubles, devComm, count);
       break;
   }
 }

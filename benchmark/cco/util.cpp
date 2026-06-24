@@ -46,7 +46,8 @@ void PrintUsage(const char* program) {
                "  -w warmup      warmup iterations\n"
                "  -c grid_x      HIP grid x (blocks)\n"
                "  -t threads     threads per block\n"
-               "  -s scope       thread | warp | block (default block)\n"
+               "  -s scope       thread | warp | block | thread_agg (default block)\n"
+               "                 thread_agg = thread scope + ThreadAggregate (bw only)\n"
                "  -h             this help\n",
                program != nullptr ? program : "program");
 }
@@ -110,6 +111,8 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
           out_args->put_scope = PutScope::kWarp;
         } else if (std::strcmp(optarg, "block") == 0) {
           out_args->put_scope = PutScope::kBlock;
+        } else if (std::strcmp(optarg, "thread_agg") == 0) {
+          out_args->put_scope = PutScope::kThreadAgg;
         } else {
           return 1;
         }
@@ -150,26 +153,57 @@ void PrintPerfTable(const char* test_name, const char* transport_name, const cha
   const char* scope_col = (scope_name != nullptr && scope_name[0] != '\0') ? scope_name : "none";
   const char* tag = (test_name != nullptr && test_name[0] != '\0') ? test_name : "p2p";
 
-  std::printf("# %s transport=%s scope=%s grid=%d block=%d warpSize=%d iters=%zu warmup=%zu\n", tag,
-              transport_name, scope_col, grid_x, block_threads, warp_size, iters, warmup);
+  // Units the total size is split across (one WQE/message each): block=one per
+  // block, warp=one per wavefront, thread=one per thread. Each message is size/units.
+  int units = grid_x;
+  if (scope_name != nullptr && std::strcmp(scope_name, "warp") == 0) {
+    units = grid_x * (warp_size > 0 ? block_threads / warp_size : 1);
+  } else if (scope_name != nullptr && (std::strcmp(scope_name, "thread") == 0 ||
+                                       std::strcmp(scope_name, "thread_agg") == 0)) {
+    units = grid_x * block_threads;
+  }
+  if (units < 1) units = 1;
+
+  std::printf(
+      "# %s transport=%s scope=%s grid=%d block=%d warpSize=%d units=%d iters=%zu warmup=%zu\n", tag,
+      transport_name, scope_col, grid_x, block_threads, warp_size, units, iters, warmup);
 
   constexpr int kWSize = 10;
+  constexpr int kWMsg = 10;
   constexpr int kWScope = 8;
   constexpr int kWNum = 12;
+  constexpr int kWMpps = 10;
 
   const bool is_bw = (metric == PerfTableMetric::kBandwidthGbps);
   const char* num_header = is_bw ? "Bandwidth" : "Latency";
   const char* unit_str = is_bw ? "GB/s" : "us";
 
-  std::printf("%-*s %-*s %*s %s\n", kWSize, "size", kWScope, "scope", kWNum, num_header, unit_str);
+  // "msg" = per-unit message size (size/units). "Mpps" = messages/s issued
+  // (GB/s * 1e3 * units / size), exposing the per-WQE issue-rate ceiling.
+  if (is_bw) {
+    std::printf("%-*s %-*s %-*s %*s %-5s %*s\n", kWSize, "size", kWMsg, "msg", kWScope, "scope",
+                kWNum, num_header, unit_str, kWMpps, "Mpps");
+  } else {
+    std::printf("%-*s %-*s %-*s %*s %s\n", kWSize, "size", kWMsg, "msg", kWScope, "scope", kWNum,
+                num_header, unit_str);
+  }
 
   for (const PerfTableRow& r : rows) {
     std::string sz = fmt_size(r.size_bytes);
+    std::string msg = fmt_size(r.size_bytes / static_cast<std::size_t>(units));
     if (r.skipped) {
-      std::printf("%-*s %-*s %*s\n", kWSize, sz.c_str(), kWScope, scope_col, kWNum, "skip");
+      std::printf("%-*s %-*s %-*s %*s\n", kWSize, sz.c_str(), kWMsg, msg.c_str(), kWScope, scope_col,
+                  kWNum, "skip");
+    } else if (is_bw) {
+      const double mpps = (r.size_bytes > 0)
+                              ? r.value * 1.0e3 * static_cast<double>(units) /
+                                    static_cast<double>(r.size_bytes)
+                              : 0.0;
+      std::printf("%-*s %-*s %-*s %*.3f %-5s %*.3f\n", kWSize, sz.c_str(), kWMsg, msg.c_str(),
+                  kWScope, scope_col, kWNum, r.value, unit_str, kWMpps, mpps);
     } else {
-      std::printf("%-*s %-*s %*.3f %s\n", kWSize, sz.c_str(), kWScope, scope_col, kWNum, r.value,
-                  unit_str);
+      std::printf("%-*s %-*s %-*s %*.3f %s\n", kWSize, sz.c_str(), kWMsg, msg.c_str(), kWScope,
+                  scope_col, kWNum, r.value, unit_str);
     }
   }
   std::fflush(stdout);
