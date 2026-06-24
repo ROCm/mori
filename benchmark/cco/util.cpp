@@ -46,7 +46,8 @@ void PrintUsage(const char* program) {
                "  -w warmup      warmup iterations\n"
                "  -c grid_x      HIP grid x (blocks)\n"
                "  -t threads     threads per block\n"
-               "  -s scope       thread | warp | block (default block)\n"
+               "  -s scope       thread | warp | block | thread_agg (default block)\n"
+               "                 thread_agg = thread scope + WarpAggregate (bw only)\n"
                "  -h             this help\n",
                program != nullptr ? program : "program");
 }
@@ -110,6 +111,8 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
           out_args->put_scope = PutScope::kWarp;
         } else if (std::strcmp(optarg, "block") == 0) {
           out_args->put_scope = PutScope::kBlock;
+        } else if (std::strcmp(optarg, "thread_agg") == 0) {
+          out_args->put_scope = PutScope::kThreadAgg;
         } else {
           return 1;
         }
@@ -156,7 +159,8 @@ void PrintPerfTable(const char* test_name, const char* transport_name, const cha
   int units = grid_x;
   if (scope_name != nullptr && std::strcmp(scope_name, "warp") == 0) {
     units = grid_x * (warp_size > 0 ? block_threads / warp_size : 1);
-  } else if (scope_name != nullptr && std::strcmp(scope_name, "thread") == 0) {
+  } else if (scope_name != nullptr && (std::strcmp(scope_name, "thread") == 0 ||
+                                       std::strcmp(scope_name, "thread_agg") == 0)) {
     units = grid_x * block_threads;
   }
   if (units < 1) units = 1;

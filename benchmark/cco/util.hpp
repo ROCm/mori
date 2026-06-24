@@ -41,7 +41,11 @@
 namespace mori::cco::benchmark {
 
 // Cooperation granularity of the kernel transfer loop / RDMA op.
-enum class PutScope { kThread, kWarp, kBlock };
+// kThreadAgg: thread scope (one WQE per thread) but with ccoGdaWarpAggregate —
+// the warp's same-peer lanes post as one aggregated batch (one reservation +
+// leader doorbell) instead of the default per-peer __ballot grouping. Bandwidth
+// kernels only; latency falls back to thread behavior.
+enum class PutScope { kThread, kWarp, kBlock, kThreadAgg };
 
 // Which CCO p2p transport to exercise. Selected by the MORI_DISABLE_P2P env
 // var (consistent with the rest of mori): unset or enabled → kIbgda (P2P
@@ -149,6 +153,8 @@ inline const char* ScopeToChar(PutScope scope) {
       return "warp";
     case PutScope::kBlock:
       return "block";
+    case PutScope::kThreadAgg:
+      return "thread_agg";
   }
   return "none";
 }
@@ -176,7 +182,7 @@ inline bool size_ok(PutScope scope, std::size_t size_bytes, int nblocks, int thr
     return false;
   }
   const std::size_t per_block = len / static_cast<std::size_t>(nblocks);
-  if (scope == PutScope::kThread) {
+  if (scope == PutScope::kThread || scope == PutScope::kThreadAgg) {
     return per_block % static_cast<std::size_t>(threads_per_block) == 0;
   }
   if (scope == PutScope::kWarp) {

@@ -74,7 +74,7 @@ __global__ void lsa_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 // IBGDA: one QP per block (ginContext=blockIdx); each block pipelines its chunk
 // then flushes its own QP. block scope = one bulk write (== shmem
 // ShmemPutMemNbiBlock); warp/thread subdivide.
-template <core::ProviderType PrvdType, typename Coop>
+template <core::ProviderType PrvdType, typename Coop, ccoGdaWarpMode WarpMode = ccoGdaWarpDefault>
 __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int iter) {
   Coop coop;
@@ -96,8 +96,9 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   // SQ-space flow control inside put drains completions (quietUntil) as the queue
   // fills. The trailing flush waits for the last ops to complete before timing.
   for (int i = 0; i < iter; i++) {
-    gda.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), off_bytes,
-            reinterpret_cast<ccoWindow_t>(sendWin), off_bytes, bytes, ccoGda_NoSignal{}, coop);
+    gda.template put<CCO_TEAM_WORLD, WarpMode>(peer, reinterpret_cast<ccoWindow_t>(recvWin),
+                                               off_bytes, reinterpret_cast<ccoWindow_t>(sendWin),
+                                               off_bytes, bytes, ccoGda_NoSignal{}, coop);
   }
   gda.flush(ccoCoopBlock{});
 }
@@ -109,7 +110,7 @@ static void launch_lsa(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWi
   // warp: one wavefront, thread: a single thread). All threads always run.
   int scope_size = block.x;
   if (scope == PutScope::kWarp) scope_size = warp_size;
-  if (scope == PutScope::kThread) scope_size = 1;
+  if (scope == PutScope::kThread || scope == PutScope::kThreadAgg) scope_size = 1;
   hipLaunchKernelGGL(lsa_put_bw, grid, block, 0, 0, sendWin, recvWin, counter_d, len_doubles,
                      peerLsa, count, scope_size);
 }
@@ -129,6 +130,10 @@ static void launch_ibgda(PutScope scope, dim3 grid, dim3 block, ccoWindow_t send
     case PutScope::kThread:
       hipLaunchKernelGGL((ibgda_put_bw<PrvdType, ccoCoopThread>), grid, block, 0, 0, sendWin,
                          recvWin, len_doubles, devComm, count);
+      break;
+    case PutScope::kThreadAgg:
+      hipLaunchKernelGGL((ibgda_put_bw<PrvdType, ccoCoopThread, ccoGdaWarpAggregate>), grid, block,
+                         0, 0, sendWin, recvWin, len_doubles, devComm, count);
       break;
   }
 }
