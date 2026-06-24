@@ -173,15 +173,23 @@ void PrintPerfTable(const char* test_name, const char* transport_name, const cha
   constexpr int kWMsg = 10;
   constexpr int kWScope = 8;
   constexpr int kWNum = 12;
+  constexpr int kWMpps = 10;
 
   const bool is_bw = (metric == PerfTableMetric::kBandwidthGbps);
   const char* num_header = is_bw ? "Bandwidth" : "Latency";
   const char* unit_str = is_bw ? "GB/s" : "us";
 
   // "msg" = per-unit message size (size / units): the actual bytes carried by one
-  // WQE in this scope.
-  std::printf("%-*s %-*s %-*s %*s %s\n", kWSize, "size", kWMsg, "msg", kWScope, "scope", kWNum,
-              num_header, unit_str);
+  // WQE in this scope. For bandwidth, "Mpps" = WQEs/messages issued per second
+  // (= GB/s * 1e3 * units / size); it exposes the per-WQE issue-rate ceiling that
+  // dominates small messages.
+  if (is_bw) {
+    std::printf("%-*s %-*s %-*s %*s %-5s %*s\n", kWSize, "size", kWMsg, "msg", kWScope, "scope",
+                kWNum, num_header, unit_str, kWMpps, "Mpps");
+  } else {
+    std::printf("%-*s %-*s %-*s %*s %s\n", kWSize, "size", kWMsg, "msg", kWScope, "scope", kWNum,
+                num_header, unit_str);
+  }
 
   for (const PerfTableRow& r : rows) {
     std::string sz = fmt_size(r.size_bytes);
@@ -189,6 +197,13 @@ void PrintPerfTable(const char* test_name, const char* transport_name, const cha
     if (r.skipped) {
       std::printf("%-*s %-*s %-*s %*s\n", kWSize, sz.c_str(), kWMsg, msg.c_str(), kWScope, scope_col,
                   kWNum, "skip");
+    } else if (is_bw) {
+      const double mpps = (r.size_bytes > 0)
+                              ? r.value * 1.0e3 * static_cast<double>(units) /
+                                    static_cast<double>(r.size_bytes)
+                              : 0.0;
+      std::printf("%-*s %-*s %-*s %*.3f %-5s %*.3f\n", kWSize, sz.c_str(), kWMsg, msg.c_str(),
+                  kWScope, scope_col, kWNum, r.value, unit_str, kWMpps, mpps);
     } else {
       std::printf("%-*s %-*s %-*s %*.3f %s\n", kWSize, sz.c_str(), kWMsg, msg.c_str(), kWScope,
                   scope_col, kWNum, r.value, unit_str);
