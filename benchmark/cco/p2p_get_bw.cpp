@@ -87,11 +87,11 @@ __global__ void ibgda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const size_t off_bytes = base * sizeof(double);
   const size_t bytes = per_unit * sizeof(double);
 
-  // AggregateRequests: defer doorbell to end flush (see p2p_put_bw).
+  // Per-op doorbell: per-op flow control drains completions as the SQ fills
+  // (see p2p_put_bw). The trailing flush waits for the last ops before timing.
   for (int i = 0; i < iter; i++) {
     gda.get(peer, reinterpret_cast<ccoWindow_t>(sendWin), off_bytes,
-            reinterpret_cast<ccoWindow_t>(recvWin), off_bytes, bytes, coop,
-            ccoGdaOptFlagsAggregateRequests);
+            reinterpret_cast<ccoWindow_t>(recvWin), off_bytes, bytes, coop);
   }
   gda.flush(ccoCoopBlock{});
 }

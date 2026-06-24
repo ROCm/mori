@@ -92,13 +92,12 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const size_t off_bytes = base * sizeof(double);
   const size_t bytes = per_unit * sizeof(double);
 
-  // AggregateRequests defers the doorbell to the end flush: in warp/thread scope
-  // many threads share one QP, and per-op ringDoorbellOrdered deadlocks under
-  // SIMT lock-step. The end flush rings once + polls the CQ.
+  // Per-op doorbell: each put rings its own (grouped-per-peer) doorbell, so the
+  // SQ-space flow control inside put drains completions (quietUntil) as the queue
+  // fills. The trailing flush waits for the last ops to complete before timing.
   for (int i = 0; i < iter; i++) {
     gda.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), off_bytes,
-            reinterpret_cast<ccoWindow_t>(sendWin), off_bytes, bytes, ccoGda_NoSignal{}, coop,
-            ccoGdaOptFlagsAggregateRequests);
+            reinterpret_cast<ccoWindow_t>(sendWin), off_bytes, bytes, ccoGda_NoSignal{}, coop);
   }
   gda.flush(ccoCoopBlock{});
 }
