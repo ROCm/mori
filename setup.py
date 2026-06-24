@@ -29,6 +29,12 @@ from setuptools import Extension, find_packages, setup
 from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
+try:
+    from Cython.Build import cythonize as _cythonize
+    _HAVE_CYTHON = True
+except ImportError:
+    _HAVE_CYTHON = False
+
 _supported_arch_list = ["gfx942", "gfx950"]
 
 _REQUIRED_SYSTEM_DEPS: list = []
@@ -450,6 +456,10 @@ class CMakeBuild(build_ext):
 
         files_to_copy = [
             (
+                build_dir / "src/cco/libmori_cco.so",
+                root_dir / "python/mori/libmori_cco.so",
+            ),
+            (
                 build_dir / "src/pybind/libmori_pybinds.so",
                 root_dir / "python/mori/libmori_pybinds.so",
             ),
@@ -585,6 +595,30 @@ class CustomBuild(_build):
         super().run()
 
 
+_root_dir = Path(__file__).parent
+
+def _cco_extension() -> list:
+    """Build the mori.cco.cco Cython C++ extension if Cython is available."""
+    if not _HAVE_CYTHON:
+        return []
+    include_dirs = [str(_root_dir / "include")]
+    library_dirs = [str(_root_dir / "python/mori")]
+    ext = Extension(
+        "mori.cco.cco",
+        sources=["python/mori/cco/cco.pyx"],
+        language="c++",
+        include_dirs=include_dirs,
+        library_dirs=library_dirs,
+        libraries=["mori_cco"],
+        runtime_library_dirs=["$ORIGIN/.."],
+        extra_compile_args=["-std=c++17"],
+    )
+    return _cythonize(
+        [ext],
+        compiler_directives={"language_level": "3"},
+    )
+
+
 extensions = [
     Extension(
         "mori",
@@ -592,9 +626,10 @@ extensions = [
         # extra_compile_args=['-ggdb', '-O0'],
         # extra_link_args=['-g'],
     ),
-]
+] + _cco_extension()
 
 mori_package_data = [
+    "libmori_cco.so",
     "libmori_pybinds.so",
     "libmori_shmem.so",
     "libmori_ops.so",
@@ -624,6 +659,7 @@ setup(
     package_dir={"": "python"},
     package_data={
         "mori": mori_package_data,
+        "mori.cco": ["*.pxd"],
         "mori.ir": ["*.bc"],
         "mori.tools": ["*.sh"],
     },
