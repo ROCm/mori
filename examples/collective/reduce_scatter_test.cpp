@@ -283,8 +283,8 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
 
   if (info.deviceId == 0) {
     if (mode == RsMode::kPush) {
-      XPUT("reduce_scatter_test: mode=PUSH slices=%d blocks=%d (SMs=%d)", pushSlices, pushBlocks,
-           prop.multiProcessorCount);
+      XPUT("reduce_scatter_test: mode=PUSH slices=%d blocks=%d (SMs=%d)", pushSlices,
+           pushBlocks, prop.multiProcessorCount);
     } else {
       XPUT("reduce_scatter_test: mode=PULL blocks=%d (SMs=%d)", blocks, prop.multiProcessorCount);
     }
@@ -311,13 +311,8 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
             <<<blocks, kThreads, 0, stream>>>(myPe, baseObj, output, chunkElems);
       };
       switch (npes) {
-        case 1: launch(std::integral_constant<int, 1>{}); break;
         case 2: launch(std::integral_constant<int, 2>{}); break;
-        case 3: launch(std::integral_constant<int, 3>{}); break;
         case 4: launch(std::integral_constant<int, 4>{}); break;
-        case 5: launch(std::integral_constant<int, 5>{}); break;
-        case 6: launch(std::integral_constant<int, 6>{}); break;
-        case 7: launch(std::integral_constant<int, 7>{}); break;
         default: launch(std::integral_constant<int, 8>{}); break;
       }
     } else {

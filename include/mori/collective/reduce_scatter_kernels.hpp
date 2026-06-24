@@ -39,6 +39,7 @@
 #include <array>
 #include <cstdint>
 
+#include "mori/collective/collectives_common.hpp"  // StreamLoad/Store, SdmaPutWarpFusedS
 #include "mori/core/transport/p2p/device_primitives.hpp"  // load<N>/store<N>
 #include "mori/shmem/shmem.hpp"
 #include "mori/shmem/internal.hpp"
@@ -46,77 +47,7 @@
 using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
-
-#define GLOBAL_SPACE __attribute__((address_space(1)))
-
-// ---------------------------------------------------------------------------
-// Streaming (cache-bypassing) 16-byte load/store, RCCL-style (see rccl op128.h).
-#if (defined(__gfx942__) || defined(__gfx950__)) && \
-    __has_builtin(__builtin_amdgcn_global_load_b128) &&  \
-    __has_builtin(__builtin_amdgcn_global_store_b128)
-#define RS_HAVE_GLOBAL_B128 1
-#else
-#define RS_HAVE_GLOBAL_B128 0
-#endif
-
-template <int Bytes>
-using TVecType = typename mori::core::VecTypeSelector<Bytes>::dataType;
-
-/*
-using index_t = int32_t;
-using int32x4_t = int32_t __attribute__((ext_vector_type(4)));
-__device__ void
-llvm_amdgcn_raw_buffer_store_i32x4(int32x4_t vdata,
-                                   int32x4_t rsrc,
-                                   index_t voffset,
-                                   index_t soffset,
-                                   index_t glc_slc) __asm("llvm.amdgcn.raw.buffer.store.v4i32");
-
-__device__ int32x4_t
-llvm_amdgcn_raw_buffer_load_i32x4(int32x4_t srsrc,
-                                  index_t voffset,
-                                  index_t soffset,
-                                  index_t glc_slc) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
-*/
-
-using rs_v4u = __attribute__((__vector_size__(4 * sizeof(unsigned int)))) unsigned int;
-using rs_v4u_gptr = GLOBAL_SPACE rs_v4u*;
-
-template<typename T>
-__device__ __host__ inline static  T* Tglobal(T* ptr) { 
-  return (T*)(GLOBAL_SPACE T*)reinterpret_cast<uintptr_t>(ptr); 
-} 
-
-template <int Bytes>
-__device__ __forceinline__ TVecType<Bytes> StreamLoad(
-    const void* p) {
-  return mori::core::load<Bytes>(p);  // generic fallback (8/4/2/1 byte tails)
-}
-template <int Bytes>
-__device__ __forceinline__ void StreamStore(
-    void* p, TVecType<Bytes> v) {
-  mori::core::store<Bytes>(p, v);
-}
-
-template <>
-__device__ __forceinline__ TVecType<16> StreamLoad<16>(
-    const void* p) {
-#if RS_HAVE_GLOBAL_B128
-  rs_v4u raw = __builtin_amdgcn_global_load_b128((rs_v4u_gptr)p, "");
-  return __builtin_bit_cast(TVecType<16>, raw);
-#else
-  return mori::core::load<16>(p);
-#endif
-}
-template <>
-__device__ __forceinline__ void StreamStore<16>(void* p, TVecType<16> v) {
-#if RS_HAVE_GLOBAL_B128
-  rs_v4u raw = __builtin_bit_cast(rs_v4u, v);
-  __builtin_amdgcn_global_store_b128((rs_v4u_gptr)p, raw, "");
-#else
-  mori::core::store<16>(p, v);
-#endif
-}
+using namespace mori::collective;
 
 // ---------------------------------------------------------------------------
 // Reduction Op functors. Accumulation is done in float (lossless for the
@@ -287,8 +218,7 @@ __device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, T* __rest
 }
 
 // Spin until every bit in `mask` is set in *addr. Used by the push kernel's
-// receiver-side completion flag, where each sender ORs in its own bit. Mirrors
-// anvil::waitForSignalAtLeast's relaxed agent-scope load.
+// receiver-side completion flag, where each sender ORs in its own bit.
 __device__ __forceinline__ void waitForSignalMask(HSAuint64* addr, uint64_t mask) {
   while ((__hip_atomic_load(Tglobal(addr), __ATOMIC_RELAXED, 
                   __HIP_MEMORY_SCOPE_AGENT) & mask) != mask) {
@@ -312,9 +242,9 @@ __device__ __forceinline__ void waitForSignalMask(HSAuint64* addr, uint64_t mask
 // group zeroes that slice's flag + its local counter (groupCounters[g]) for the
 // next launch -- no monotonic generation counter needed. Limited to npes <= 64.
 //
-// The S*npes copies are issued concurrently across block 0's threads;
-// SdmaPutThreadFused is multi-producer-safe and per-slice flags make the start
-// order irrelevant.
+// Phase 1 issues the copies with one warp per peer (lane s -> slice s) via
+// SdmaPutWarpFusedS: only lane 0 reserves/submits, so it is deadlock-free and
+// per-slice flags make the start order irrelevant.
 //
 // input/staging/output MUST live in the symmetric static heap (ShmemMalloc) so
 // the address-based SDMA put can translate local->peer (offset from heapBaseAddr);
@@ -330,7 +260,7 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
 
   const int S = 1 << logS;
   // vecSize-aligned slice length; the last slice absorbs the remainder.
-  const size_t sliceLen = (chunkElems / static_cast<size_t>(S) / vecSize) * vecSize;
+  const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize;
 
   // Completion bitmask: bit p means "sender p's copy has landed". Self-copy is
   // skipped, so we wait for every peer bit except our own.
@@ -339,47 +269,34 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
 
   int tid = threadIdx.x;
 
-  // === Phase 1: SDMA scatter (block 0 only), one copy per WARP, concurrent ======
-  // Transfer t = (destPe = t/S, slice = t%S) copies slice s of my shard for destPe
-  // and atomically ADD64s (1<<myPe) into destPe's per-slice flag signalPtrs[s]. The
-  // copy + atomic ride queue 0 and the atomic targets the *receiver's* flag, so
-  // completion is observed on the receive side (Phase 2) -- fire-and-forget, no
-  // local quiet, no cross-PE barrier. Per-slice flags make the issue order
-  // irrelevant.
+  // === Phase 1: SDMA scatter (block 0 only), one WARP per destination peer ======
+  // Warp w handles destPe (warp-strided over peers); lane s issues slice s: an SDMA
+  // copy of slice s into destPe's staging slot followed by an ADD64 of (1<<myPe)
+  // into destPe's per-slice flag signalPtrs[s]. The atomic targets the *receiver's*
+  // flag, so completion is observed on the receive side (Phase 2) -- fire-and-forget,
+  // no local quiet, no cross-PE barrier. Per-slice flags make the slice order
+  // irrelevant on the receive side.
   //
-  // CRITICAL: transfers are issued one-per-WARP (lane 0 only), NOT one-per-thread.
-  // SdmaPutThreadFused is multi-producer-safe only ACROSS warps: when two producers
-  // hit the same queue, the later one spin-waits in submitPacket for the earlier to
-  // commit. Two such producers in the SAME warp deadlock (the committing thread is
-  // masked off behind the spinning one under SIMT), so each transfer must own a
-  // distinct warp. Warps are scheduled independently, so the wait resolves.
-  if (blockIdx.x == 0 && (tid % warpSize) == 0) {
-    const int wave = tid / warpSize;
-    const int numWaves = blockDim.x / warpSize;
-    // Local symmetric address of the peer's staging slot for me (slot myPe).
+  // Only lane 0 reserves/submits per peer, so there is exactly one spinning thread
+  // per warp -> no same-queue cross-producer spin-wait (which would deadlock threads
+  // sharing a warp under SIMT), and the S reservations + S doorbells per peer
+  // collapse into one of each.
+  if (blockIdx.x == 0) {
+    const int w = tid / warpSize;
+    const int numW = blockDim.x / warpSize;
     T* dstLocal = staging + myPe * chunkElems;
-    auto** handlesBase = heapObj->deviceHandles_d;
     const size_t heapBase = GetGlobalGpuStatesPtr()->heapBaseAddr;
-    for (int t = wave; t < npes * S; t += numWaves) {
-      int destPe = t / S;
-      int s = t % S;
-      if (destPe == myPe) continue;  // self-shard is reduced directly in Phase 3
-      auto** handles = handlesBase + (destPe % 8) * numSdmaQ;
-      // Per-slice flag base for destPe: flag[s] = peerSignalPtrs[destPe] + s.
-      HSAuint64* remoteFlags = heapObj->peerSignalPtrs[destPe];
-
-      size_t sOfs = static_cast<size_t>(s) * sliceLen;
-      size_t sElems = (s == S - 1) ? (chunkElems - sOfs) : sliceLen;
-      const T* src = input + destPe * chunkElems + sOfs;
-      uintptr_t destAddr = reinterpret_cast<uintptr_t>(dstLocal + sOfs);
-      size_t offset = destAddr - heapBase;
-      uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(src));
-      uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + offset);
-      // signals = remoteFlags + s with qId=0 -> atomic targets flag[s] on queue 0;
-      // addVal = (1<<myPe) sets my bit in the receiver's per-slice bitmask.
-      mori::core::SdmaPutThreadFused(srcPtr, dstPtr, sElems * sizeof(T), handles,
-                                     remoteFlags + s, numSdmaQ, /*qId=*/0,
-                                     /*addVal=*/(1ull << myPe));
+    const size_t sliceBytes = sliceLen * sizeof(T);
+    const size_t lastBytes = (chunkElems - (S - 1) * sliceLen) * sizeof(T);
+    for (int destPe = w; destPe < npes; destPe += numW) {
+      if (destPe == myPe) continue;  // uniform across the warp
+      auto** handles = heapObj->deviceHandles_d + (destPe % 8) * numSdmaQ;
+      const T* src = input + destPe * chunkElems;
+      size_t off = reinterpret_cast<uintptr_t>(dstLocal) - heapBase;
+      uint8_t* dst = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + off);
+      mori::collective::SdmaPutWarpFusedS(
+          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(src)), dst, sliceBytes, lastBytes,
+          handles, heapObj->peerSignalPtrs[destPe], /*qId=*/0, S, /*addVal=*/(1ull << myPe));
     }
   }
 

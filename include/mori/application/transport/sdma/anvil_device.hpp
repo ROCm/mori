@@ -70,7 +70,10 @@ __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, v
   return copy_packet;
 }
 
-__device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* signal) {
+// Build an SDMA ADD64 atomic packet that adds an arbitrary 64-bit value to
+// *signal. Used for completion counters (val=1) and for bitmask flags where each
+// sender adds a distinct bit (val=1<<myPe), which behaves as an OR.
+__device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicAddPacket(HSAuint64* signal, uint64_t val) {
   SDMA_PKT_ATOMIC packet = {};
 
   packet.HEADER_UNION.op = SDMA_OP_ATOMIC;
@@ -79,10 +82,14 @@ __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* sign
   packet.ADDR_LO_UNION.addr_31_0 = (uint32_t)((uintptr_t)signal);
   packet.ADDR_HI_UNION.addr_63_32 = (uint32_t)((uintptr_t)signal >> 32);
 
-  packet.SRC_DATA_LO_UNION.src_data_31_0 = 0x1;
-  packet.SRC_DATA_HI_UNION.src_data_63_32 = 0x0;
+  packet.SRC_DATA_LO_UNION.src_data_31_0 = (uint32_t)val;
+  packet.SRC_DATA_HI_UNION.src_data_63_32 = (uint32_t)(val >> 32);
 
   return packet;
+}
+
+__device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* signal) {
+  return CreateAtomicAddPacket(signal, 0x1);
 }
 
 __device__ __forceinline__ SDMA_PKT_FENCE CreateFencePacket(HSAuint64* address, uint32_t data = 1) {
@@ -114,28 +121,6 @@ __device__ __forceinline__ bool waitForSignal(HSAuint64* addr, uint64_t expected
   }
   return false;
 }
-
-// Like waitForSignal but spins until the signal reaches AT LEAST `expected`. Used
-// when a single monotonic counter is incremented multiple times per launch (e.g.
-// one increment per delivered sub-chunk): a later increment may have already
-// advanced the counter past an earlier waiter's exact threshold, so an `==`
-// compare would deadlock. Assumes signal is allocated in device memory.
-__device__ __forceinline__ bool waitForSignalAtLeast(HSAuint64* addr, uint64_t expected) {
-  int retries = 0;
-  while (true) {
-    uint64_t value = __hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    if (value >= expected) {
-      return true;
-    }
-    if constexpr (BREAK_ON_RETRIES) {
-      if (retries++ == MAX_RETRIES) {
-        break;
-      }
-    }
-  }
-  return false;
-}
-
 #endif  // __HIPCC__ || __CUDACC__
 
 struct SdmaQueueDeviceHandle {

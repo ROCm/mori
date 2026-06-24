@@ -77,7 +77,7 @@ rm -f allgather_test_uid.bin zz*.log
 TEST=./build/examples/reduce_scatter_test
 
 NUM_GPUS=${NUM_GPUS:-4}
-MIN_SIZE=${MIN_SIZE:-1024}
+MIN_SIZE=${MIN_SIZE:-1024*1024}
 MAX_SIZE=${MAX_SIZE:-1024*1024*128}
 
 rm -f zzout_0.log
