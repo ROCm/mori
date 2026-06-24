@@ -2,6 +2,7 @@
 
 ## News
 
+- **[2026/05]** 🔥 MORI powers SGLang on AMD Instinct™ MI355X achieves competitive TCO for large-scale DeepSeek disaggregated inference ([blog](https://www.lmsys.org/blog/2026-05-28-mori/)).
 - **[2026/05]** 🔥 MORI becomes the primary EP communication library for AMD platforms in Alibaba RTP-LLM ([MORI-EP PR](https://github.com/alibaba/rtp-llm/pull/977)).
 - **[2026/05]** MORI's SDMA-based AllGather collective is integrated into DeepSpeed for ZeRO-3 optimization on AMD GPUs, delivering up to 10% end-to-end training speedup by offloading AllGather traffic to dedicated SDMA copy engines ([example](https://github.com/deepspeedai/DeepSpeed/blob/master/examples/sdma_allgather/README.md), [post](https://x.com/DeepSpeedAI/status/2056401598839140384)).
 - **[2026/04]** 🔥 Tencent OpenUCL adopts the Mori ecosystem, using Mori's EP-style dispatch/combine pattern in AMD GPU deployments and leveraging MORI-SHMEM for GPU-initiated communication.
