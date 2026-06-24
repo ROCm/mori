@@ -96,7 +96,7 @@ All subsequent steps run **inside** `$CONTAINER_NAME` via `docker exec`.
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c "apt-get update && apt-get install -y --no-install-recommends \
-    git libpci-dev libdw1 libibverbs-dev ibverbs-utils \
+    git libpci-dev pciutils sudo libdw1 libibverbs-dev ibverbs-utils \
     locales iputils-ping iproute2 ethtool jq perftest \
     wget unzip ca-certificates curl \
     libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler \
@@ -105,6 +105,11 @@ sudo docker exec $CONTAINER_NAME bash -c "apt-get update && apt-get install -y -
 
 Package roles:
 - `jq` — required by `mori check`.
+- `pciutils` — provides `lspci`, which `nicctl` shells out to in order to enumerate
+  the NIC cards. Without it `nicctl` fails with `Invalid card handle` and the ionic
+  firmware / QoS / DCQCN checks in `mori check` / `mori setup` break.
+- `sudo` — the ionic and bnxt paths of `mori check` / `mori setup` invoke `nicctl`,
+  `dcb`, `ethtool`, and sysfs writes via `sudo`.
 - `perftest` — provides `ib_write_bw` / `ib_write_lat` for intra/inter-node bandwidth + latency checks.
 - `iproute2` — provides `dcb`, required by `mori setup` on bnxt NICs.
 - `wget unzip ca-certificates curl` — used by the NIC userspace install steps (Step 3a/3b).
