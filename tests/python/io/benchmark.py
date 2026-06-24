@@ -19,7 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from tests.python.utils import get_free_port, TorchDistContext
+from tests.python.utils import TorchDistContext
 import torch
 import torch.distributed as dist
 from mori.io import (
@@ -1020,7 +1020,7 @@ def benchmark_engine(local_rank, node_rank, args):
         sweep_max_size=args.sweep_max_size,
         backend_type="rdma",
         host=args.host,
-        port=get_free_port(),
+        port=0,
         node_rank=node_rank,
         rank_in_node=local_rank,
         num_initiator_dev=args.num_initiator_dev,
