@@ -462,6 +462,14 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   } else {
     epConfig.maxMsgSge = std::min(maxSge, is_ionic ? 2u : 4u);
   }
+
+  // Inline capacity for the small notification SEND (NotifMessage). Providers such as
+  // bnxt_re reject IBV_SEND_INLINE with ENOMEM unless the QP was created with enough
+  // max_inline_data, so request a small but sufficient amount here.
+  uint32_t desiredInline = config.enableNotification ? 64u : 0u;
+  env::Override("MORI_IO_QP_MAX_INLINE_DATA", desiredInline, mori::env::detail::ParsePositiveU32);
+  epConfig.maxInlineData = desiredInline;
+
   return epConfig;
 }
 

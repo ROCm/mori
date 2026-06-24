@@ -105,6 +105,7 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
                                      .max_recv_wr = maxRecvWr,
                                      .max_send_sge = config.maxMsgSge,
                                      .max_recv_sge = config.maxMsgSge,
+                                     .max_inline_data = config.maxInlineData,
                                  },
                              .qp_type = IBV_QPT_RC};
   endpoint.ibvHandle.qp = ibv_create_qp(pd, &qpAttr);
