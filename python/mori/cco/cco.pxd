@@ -27,16 +27,59 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
     cdef cppclass ccoComm:
         pass
 
-    cdef cppclass ccoWindowDevice:
-        pass
+    cdef struct ccoIbgdaWin:
+        uint32_t* peerRkeys
+        uint32_t lkey
+
+    cdef struct ccoWindowDevice:
+        char* winBase
+        uint32_t stride4G
+        int lsaRank
+        ccoIbgdaWin ibgdaWin
 
     ctypedef ccoWindowDevice* ccoWindow_t
+
+    cdef struct ccoWindowTableNode:
+        pass
+
+    cdef cppclass RdmaEndpointDevice:
+        pass
+
+cdef extern from "mori/cco/cco.hpp" namespace "anvil":
+    cdef cppclass SdmaQueueDeviceHandle:
+        pass
+
+cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
 
     cdef struct ccoUniqueId:
         char internal[128]
 
     cdef struct ccoDevResourceRequirements:
         pass
+
+    cdef struct ccoIbgdaContext:
+        RdmaEndpointDevice* endpoints
+        int numQpPerPe
+        int signalCount
+        uint64_t* signalBuf
+        uint64_t* signalShadows
+        int counterCount
+        uint64_t* counterBuf
+
+    cdef struct ccoLsaBarrierHandle:
+        uint32_t bufOffset
+        int nBarriers
+
+    cdef struct ccoGdaBarrierHandle:
+        uint32_t signal0
+        int nBarriers
+
+    cdef struct ccoSdmaContext:
+        uint32_t sdmaNumQueue
+        SdmaQueueDeviceHandle** deviceHandles
+        uint64_t* signalBuf
+        uint64_t* expectSignals
+        uint64_t** peerSignalPtrs
 
     cdef struct ccoDevCommRequirements:
         size_t size
@@ -63,11 +106,15 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
         ccoGdaConnectionType gdaConnType
         void* flatBase
         size_t perRankSize
-        # Remaining fields (windowTable, resourceWindow, ibgda, barriers,
-        # sdma) are opaque to Python.  Total C++ sizeof is 208; the fields
-        # above occupy 40 bytes.  Padding keeps Cython's sizeof in sync so
-        # ccoDevCommCreate doesn't overflow.
-        char _opaque[168]
+        ccoWindowTableNode* windowTable
+        ccoWindowDevice* resourceWindow
+        ccoWindowDevice resourceWindow_inlined
+        ccoIbgdaContext ibgda
+        ccoLsaBarrierHandle lsaBarrier
+        ccoGdaBarrierHandle railGdaBarrier
+        ccoLsaBarrierHandle hybridLsaBarrier
+        ccoGdaBarrierHandle hybridRailGdaBarrier
+        ccoSdmaContext sdma
 
     int ccoGetUniqueId(ccoUniqueId* uniqueId) nogil
     int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank,
