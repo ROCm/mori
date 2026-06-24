@@ -1428,6 +1428,8 @@ int ccoBarrierAll(ccoComm* comm) {
 ccoDevComm* ccoDevCommCopyToDevice(const ccoDevComm* host) {
   ccoDevComm* device = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&device, sizeof(ccoDevComm)));
+  fprintf(stderr, "[ccoDevCommCopyToDevice] hipMalloc ptr=%p  sizeof(ccoDevComm)=%zu\n",
+          (void*)device, sizeof(ccoDevComm));
   HIP_RUNTIME_CHECK(hipMemcpy(device, host, sizeof(ccoDevComm), hipMemcpyHostToDevice));
   return device;
 }

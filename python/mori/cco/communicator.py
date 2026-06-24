@@ -230,11 +230,6 @@ class DevCommHandle(CCOResource):
         return self._dev_comm.ptr
 
     @property
-    def device_ptr(self) -> int:
-        self._check_valid()
-        return self.dev_comm._device_ptr
-
-    @property
     def rank(self) -> int:
         self._check_valid()
         return self._dev_comm.rank

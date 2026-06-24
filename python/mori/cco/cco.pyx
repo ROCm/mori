@@ -209,6 +209,11 @@ cdef class DevComm:
         return <intptr_t>self._device_ptr
 
     @property
+    def host_ptr(self):
+        """intptr_t address of the host-side ccoDevComm struct (for by-value kernel args)."""
+        return <intptr_t>&self._dc
+
+    @property
     def rank(self):
         return self._dc.rank
 

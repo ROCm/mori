@@ -354,6 +354,38 @@ class CMakeBuild(build_ext):
             self.build_extension(ext)
 
     def build_extension(self, ext: Extension) -> None:
+        if ext.sources and any(
+            s.endswith((".pyx", ".cpp")) for s in ext.sources
+        ):
+            if self.compiler is None:
+                self.ensure_finalized()
+                from setuptools._distutils.ccompiler import new_compiler
+                from setuptools._distutils.sysconfig import customize_compiler
+                self.compiler = new_compiler(
+                    verbose=self.verbose,
+                    dry_run=self.dry_run,
+                    force=self.force,
+                )
+                customize_compiler(self.compiler)
+                if self.include_dirs is not None:
+                    self.compiler.set_include_dirs(self.include_dirs)
+                if self.define is not None:
+                    for name, value in self.define:
+                        self.compiler.define_macro(name, value)
+                if self.undef is not None:
+                    for name in self.undef:
+                        self.compiler.undefine_macro(name)
+                if self.libraries is not None:
+                    self.compiler.set_libraries(self.libraries)
+                if self.library_dirs is not None:
+                    self.compiler.set_library_dirs(self.library_dirs)
+                if self.rpath is not None:
+                    self.compiler.set_runtime_library_dirs(self.rpath)
+                if self.link_objects is not None:
+                    self.compiler.set_link_objects(self.link_objects)
+            super().build_extension(ext)
+            return
+
         build_lib = Path(self.build_lib)
         build_lib.mkdir(parents=True, exist_ok=True)
 

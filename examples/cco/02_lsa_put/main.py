@@ -1,27 +1,14 @@
 #!/usr/bin/env python3
 """
-CCO Example 02 — LSA Window Allocation & Validation
-=====================================================
+CCO Example 02 — LSA Put
+=========================
 
-Validates the CCO symmetric window allocation path by writing data to
-each rank's local window slot from the host, then reading it back via
-``hipMemcpy`` to confirm the mapping is correct.
+Each rank launches a GPU kernel that writes its lsaRank into every
+peer's receive slot via the flat VA.  After a host barrier the host
+reads back each rank's local window and validates that all peer
+sentinels arrived.
 
-No GPU kernel is launched — this exercises the window allocation and
-flat VA mapping without requiring a device communicator.
-
-    mpirun -np 4 python main.py
-
-Flow
-----
-1.  Bootstrap  : rank 0 generates UniqueId, MPI broadcasts it.
-2.  CommCreate : CCO sets up the LSA flat VA.
-3.  alloc_window: CCO allocates a symmetric window (overload A).
-4.  Host write : each rank writes its rank index into its local slot.
-5.  hipMemcpy  : D2H copy to a host buffer to verify the mapping.
-6.  barrier    : host-side fence.
-7.  Validate   : compare host buffer against expected values.
-8.  Teardown   : automatic via Communicator context manager.
+    mpirun -np 2 python main.py
 """
 
 import ctypes
@@ -33,82 +20,95 @@ except ImportError:
     print("ERROR: mpi4py required.  pip install mpi4py")
     sys.exit(1)
 
-from mori.cco import Communicator
-from mori.jit.hip_driver import _get_hip_lib, _check
+from mori.cco import Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE
+from mori.jit.core import compile_genco
+from mori.jit.hip_driver import HipModule, _get_hip_lib, _check
+
+PER_RANK_VMM = 4 * 1024 * 1024 * 1024
+NSLOTS = 8
+SLOT_BYTES = NSLOTS * 8
 
 
-# ── Config ───────────────────────────────────────────────────────────────────
-
-NSLOTS     = 4               # uint64 slots per rank
-SLOT_BYTES = NSLOTS * 8      # 32 bytes per rank
-PER_RANK_VMM = 4 * 1024 * 1024 * 1024   # 4 GiB
-
-
-# ── HIP helpers ──────────────────────────────────────────────────────────────
-
-def _set_device(rank: int) -> None:
+def _set_device(rank):
     hip = _get_hip_lib()
     num = ctypes.c_int(0)
     hip.hipGetDeviceCount(ctypes.byref(num))
     _check(hip.hipSetDevice(ctypes.c_int(rank % num.value)), "hipSetDevice")
 
 
-def _memcpy_d2h(dst: ctypes.Array, src_dev: int, size: int) -> None:
-    hipMemcpyDeviceToHost = 2
-    _check(_get_hip_lib().hipMemcpy(
-        dst, ctypes.c_void_p(src_dev),
-        ctypes.c_size_t(size), ctypes.c_int(hipMemcpyDeviceToHost),
-    ), "hipMemcpy D2H")
-
-
-# ── Main ─────────────────────────────────────────────────────────────────────
-
-def main() -> int:
+def main():
     comm_mpi = MPI.COMM_WORLD
-    rank     = comm_mpi.Get_rank()
-    nranks   = comm_mpi.Get_size()
-
+    rank = comm_mpi.Get_rank()
+    nranks = comm_mpi.Get_size()
     _set_device(rank)
 
-    # ── [CCO] Step 1: Bootstrap ──────────────────────────────────────────────
     uid = Communicator.get_unique_id() if rank == 0 else None
     uid = comm_mpi.bcast(uid, root=0)
 
-    with Communicator.init(nranks, rank, uid, per_rank_vmm=PER_RANK_VMM) as comm:
+    hip = _get_hip_lib()
 
+    with Communicator.init(nranks, rank, uid, per_rank_vmm=PER_RANK_VMM) as comm:
         if rank == 0:
             print(f"CommCreate: {nranks} ranks, PER_RANK_VMM={PER_RANK_VMM >> 30} GiB")
 
-        # ── [CCO] Step 2: Allocate window ────────────────────────────────────
-        win = comm.alloc_window(SLOT_BYTES)
+        mem = comm.alloc_mem(SLOT_BYTES)
+        win = comm.register_window(mem.ptr, mem.size)
+
+        # Zero out local window
+        _check(hip.hipMemset(ctypes.c_void_p(mem.ptr), 0, ctypes.c_size_t(SLOT_BYTES)),
+               "hipMemset")
+        _check(hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+
+        dc = comm.create_dev_comm(reqs)
 
         if rank == 0:
-            print(f"Window: handle={win.handle:#x}, local_ptr={win.local_ptr:#x}, "
-                  f"size={win.size}")
+            print(f"DevComm: lsa_size={dc._dev_comm.lsa_size}, lsa_rank={dc._dev_comm.lsa_rank}")
 
-        # ── Step 3: Host write via local_ptr ─────────────────────────────────
-        buf = (ctypes.c_uint64 * NSLOTS).from_address(win.local_ptr)
-        for i in range(NSLOTS):
-            buf[i] = rank * 1000 + i
+        hsaco_path = compile_genco("lsa_put_kernel", source_dir="examples/cco/02_lsa_put")
+        module = HipModule(hsaco_path)
+        func = module.get_function("lsa_put_kernel")
 
-        # ── Step 4: hipMemcpy D2H to verify ──────────────────────────────────
-        host_buf = (ctypes.c_uint64 * NSLOTS)()
-        _memcpy_d2h(host_buf, win.local_ptr, SLOT_BYTES)
+        # Each rank writes into slot 0 of each peer's window.
+        # my_buf_off=0, peer_buf_off=0: everyone writes to byte offset 0.
+        my_buf_off = 0
+        peer_buf_off = 0
 
-        # ── Step 5: Barrier ──────────────────────────────────────────────────
+        func.launch((1,), (1,), 0, 0, dc.ptr, win.handle, my_buf_off, peer_buf_off)
+        _check(hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
+
         comm.barrier()
 
-        # ── Step 6: Validate ─────────────────────────────────────────────────
+        # Read back local window
+        host_buf = (ctypes.c_uint64 * NSLOTS)()
+        _check(hip.hipMemcpy(host_buf, ctypes.c_void_p(mem.ptr),
+                             ctypes.c_size_t(SLOT_BYTES), ctypes.c_int(2)),
+               "hipMemcpy D2H")
+
+        # Validate: slot 0 should contain the peer's lsaRank
+        lsa_rank = dc._dev_comm.lsa_rank
+        lsa_size = dc._dev_comm.lsa_size
         errors = 0
-        for i in range(NSLOTS):
-            expected = rank * 1000 + i
-            got = host_buf[i]
-            if got != expected:
-                print(f"[rank {rank}] MISMATCH slot {i}: "
-                      f"got {got}, expected {expected}")
+
+        val = host_buf[0]
+        if lsa_size > 1:
+            # With 2 ranks: rank 0 expects value 1, rank 1 expects value 0
+            expected_peer = 1 - lsa_rank if lsa_size == 2 else None
+            if expected_peer is not None and val != expected_peer:
+                print(f"[rank {rank}] MISMATCH slot[0]={val}, expected {expected_peer}")
                 errors += 1
             else:
-                print(f"[rank {rank}] OK slot[{i}]={got}")
+                print(f"[rank {rank}] OK slot[0]={val} (from peer lsaRank={val})")
+        else:
+            print(f"[rank {rank}] single rank, no peer writes expected")
+
+        for i in range(1, NSLOTS):
+            if host_buf[i] != 0:
+                print(f"[rank {rank}] unexpected slot[{i}]={host_buf[i]}")
 
     all_errors = comm_mpi.allreduce(errors, op=MPI.SUM)
     if rank == 0:

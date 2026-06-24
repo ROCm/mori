@@ -63,6 +63,11 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
         ccoGdaConnectionType gdaConnType
         void* flatBase
         size_t perRankSize
+        # Remaining fields (windowTable, resourceWindow, ibgda, barriers,
+        # sdma) are opaque to Python.  Total C++ sizeof is 208; the fields
+        # above occupy 40 bytes.  Padding keeps Cython's sizeof in sync so
+        # ccoDevCommCreate doesn't overflow.
+        char _opaque[168]
 
     int ccoGetUniqueId(ccoUniqueId* uniqueId) nogil
     int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank,
