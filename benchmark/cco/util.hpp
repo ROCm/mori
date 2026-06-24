@@ -41,10 +41,8 @@
 namespace mori::cco::benchmark {
 
 // Cooperation granularity of the kernel transfer loop / RDMA op.
-// kThreadAgg: thread scope (one WQE per thread) but with ccoGdaWarpAggregate —
-// the warp's same-peer lanes post as one aggregated batch (one reservation +
-// leader doorbell) instead of the default per-peer __ballot grouping. Bandwidth
-// kernels only; latency falls back to thread behavior.
+// kThreadAgg: thread scope with ccoGdaThreadAggregate (same-peer lanes post as one
+// batch instead of per-peer grouping). Bandwidth kernels only; latency uses thread.
 enum class PutScope { kThread, kWarp, kBlock, kThreadAgg };
 
 // Which CCO p2p transport to exercise. Selected by the MORI_DISABLE_P2P env

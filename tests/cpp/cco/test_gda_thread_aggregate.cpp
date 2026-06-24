@@ -20,10 +20,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// test: cco gda WarpAggregate mode.
+// test: cco gda ThreadAggregate mode.
 //
-// Verifies the WarpAggregate template parameter on put / putValue / get.
-// With WarpAggregate=true all warp lanes target the same peer; the leader
+// Verifies the ccoGdaThreadAggregate template parameter on put / putValue / get.
+// With ThreadAggregate all warp lanes target the same peer; the leader
 // posts one shared signal WQE and rings one doorbell for the batch, instead
 // of each lane posting its own.
 //
@@ -42,14 +42,14 @@ static constexpr mori::core::ProviderType kPrvdType = CCO_GDA_BUILD_PROVIDER;
 
 // ── Kernels ─────────────────────────────────────────────────────────────────
 
-__global__ void WarpPutKernel(mori::cco::ccoWindowDevice* sendWin,
+__global__ void ThreadAggPutKernel(mori::cco::ccoWindowDevice* sendWin,
                               mori::cco::ccoWindowDevice* recvWin, size_t chunkBytes,
                               mori::cco::ccoDevComm devComm, int peer) {
   using namespace mori::cco;
   ccoGda<kPrvdType> gda{devComm, 0};
   int tid = threadIdx.x;
 
-  gda.put<CCO_TEAM_WORLD, ccoGdaWarpAggregate, ccoGda_SignalInc, ccoCoopThread>(
+  gda.put<CCO_TEAM_WORLD, ccoGdaThreadAggregate, ccoGda_SignalInc, ccoCoopThread>(
       peer, reinterpret_cast<ccoWindow_t>(recvWin), tid * chunkBytes,
       reinterpret_cast<ccoWindow_t>(sendWin), tid * chunkBytes, chunkBytes,
       ccoGda_SignalInc{0});
@@ -57,28 +57,28 @@ __global__ void WarpPutKernel(mori::cco::ccoWindowDevice* sendWin,
   gda.flush(ccoCoopWarp{});
 }
 
-__global__ void WarpPutValueKernel(mori::cco::ccoWindowDevice* recvWin,
+__global__ void ThreadAggPutValueKernel(mori::cco::ccoWindowDevice* recvWin,
                                    mori::cco::ccoDevComm devComm, int peer, uint64_t baseVal) {
   using namespace mori::cco;
   ccoGda<kPrvdType> gda{devComm, 0};
   int tid = threadIdx.x;
 
   uint64_t val = baseVal + static_cast<uint64_t>(tid);
-  gda.putValue<CCO_TEAM_WORLD, ccoGdaWarpAggregate, uint64_t, ccoGda_SignalInc, ccoCoopThread>(
+  gda.putValue<CCO_TEAM_WORLD, ccoGdaThreadAggregate, uint64_t, ccoGda_SignalInc, ccoCoopThread>(
       peer, reinterpret_cast<ccoWindow_t>(recvWin), tid * sizeof(uint64_t), val,
       ccoGda_SignalInc{1});
 
   gda.flush(ccoCoopWarp{});
 }
 
-__global__ void WarpGetKernel(mori::cco::ccoWindowDevice* remoteWin,
+__global__ void ThreadAggGetKernel(mori::cco::ccoWindowDevice* remoteWin,
                               mori::cco::ccoWindowDevice* localWin, size_t chunkBytes,
                               mori::cco::ccoDevComm devComm, int peer) {
   using namespace mori::cco;
   ccoGda<kPrvdType> gda{devComm, 0};
   int tid = threadIdx.x;
 
-  gda.get<CCO_TEAM_WORLD, ccoGdaWarpAggregate, ccoCoopThread>(
+  gda.get<CCO_TEAM_WORLD, ccoGdaThreadAggregate, ccoCoopThread>(
       peer, reinterpret_cast<ccoWindow_t>(remoteWin), tid * chunkBytes,
       reinterpret_cast<ccoWindow_t>(localWin), tid * chunkBytes, chunkBytes);
 
@@ -150,7 +150,7 @@ struct UtCtx {
 // ── Test cases ──────────────────────────────────────────────────────────────
 
 // 64 threads put different chunks to same peer, verify data + signal == 1
-static int ut_warp_put(UtCtx& c) {
+static int ut_thread_agg_put(UtCtx& c) {
   c.resetSignals();
 
   size_t totalElems = WARP_SIZE * CHUNK_ELEMS;
@@ -166,11 +166,11 @@ static int ut_warp_put(UtCtx& c) {
   mori::cco::ccoBarrierAll(c.comm);
 
   c.step([&] {
-    WarpPutKernel
+    ThreadAggPutKernel
         <<<1, WARP_SIZE, 0, c.stream>>>(c.sendWin, c.recvWin, chunkBytes, c.dc, c.nextPeer);
   });
 
-  // WarpAggregate → leader posts 1 signal, not 64
+  // ThreadAggregate → leader posts 1 signal, not 64
   c.step([&] {
     CheckSignalKernel<<<1, 1, 0, c.stream>>>(c.dc, 0, 1, 0, c.dErr);
   });
@@ -195,7 +195,7 @@ static int ut_warp_put(UtCtx& c) {
 }
 
 // 64 threads putValue different uint64_t, verify data + signal == 1
-static int ut_warp_putvalue(UtCtx& c) {
+static int ut_thread_agg_putvalue(UtCtx& c) {
   c.resetSignals();
   HIP_CHECK(hipMemset(c.recvBuf, 0xff, c.bufSize));
   mori::cco::ccoBarrierAll(c.comm);
@@ -203,7 +203,7 @@ static int ut_warp_putvalue(UtCtx& c) {
   uint64_t baseVal = static_cast<uint64_t>(c.rank) * 10000;
 
   c.step([&] {
-    WarpPutValueKernel
+    ThreadAggPutValueKernel
         <<<1, WARP_SIZE, 0, c.stream>>>(c.recvWin, c.dc, c.nextPeer, baseVal);
   });
 
@@ -229,7 +229,7 @@ static int ut_warp_putvalue(UtCtx& c) {
 }
 
 // 64 threads get different chunks from same peer, verify data
-static int ut_warp_get(UtCtx& c) {
+static int ut_thread_agg_get(UtCtx& c) {
   size_t totalElems = WARP_SIZE * CHUNK_ELEMS;
   size_t chunkBytes = CHUNK_ELEMS * sizeof(float);
 
@@ -243,7 +243,7 @@ static int ut_warp_get(UtCtx& c) {
   mori::cco::ccoBarrierAll(c.comm);
 
   c.step([&] {
-    WarpGetKernel
+    ThreadAggGetKernel
         <<<1, WARP_SIZE, 0, c.stream>>>(c.sendWin, c.recvWin, chunkBytes, c.dc, c.nextPeer);
   });
 
@@ -273,9 +273,9 @@ static int run_all_tests(UtCtx& ctx) {
     const char* name;
     UtFn fn;
   } kCases[] = {
-      {"put", ut_warp_put},
-      // {"putvalue", ut_warp_putvalue},
-      // {"get", ut_warp_get},
+      {"put", ut_thread_agg_put},
+      // {"putvalue", ut_thread_agg_putvalue},
+      // {"get", ut_thread_agg_get},
   };
   int fails = 0;
   for (const auto& c : kCases) fails += c.fn(ctx);
@@ -368,5 +368,5 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
 }
 
 int main(int argc, char** argv) {
-  return ccoTestMain(argc, argv, "CCO GDA warp aggregate", "/tmp/cco_gda_warp_agg_uid", 19883);
+  return ccoTestMain(argc, argv, "CCO GDA thread aggregate", "/tmp/cco_gda_thread_agg_uid", 19883);
 }

@@ -47,7 +47,7 @@ void PrintUsage(const char* program) {
                "  -c grid_x      HIP grid x (blocks)\n"
                "  -t threads     threads per block\n"
                "  -s scope       thread | warp | block | thread_agg (default block)\n"
-               "                 thread_agg = thread scope + WarpAggregate (bw only)\n"
+               "                 thread_agg = thread scope + ThreadAggregate (bw only)\n"
                "  -h             this help\n",
                program != nullptr ? program : "program");
 }
@@ -153,9 +153,8 @@ void PrintPerfTable(const char* test_name, const char* transport_name, const cha
   const char* scope_col = (scope_name != nullptr && scope_name[0] != '\0') ? scope_name : "none";
   const char* tag = (test_name != nullptr && test_name[0] != '\0') ? test_name : "p2p";
 
-  // Number of cooperative units the total size is split across (one WQE / message
-  // per unit): block scope = one unit per block, warp = one per wavefront, thread
-  // = one per thread. So each message is size / units bytes.
+  // Units the total size is split across (one WQE/message each): block=one per
+  // block, warp=one per wavefront, thread=one per thread. Each message is size/units.
   int units = grid_x;
   if (scope_name != nullptr && std::strcmp(scope_name, "warp") == 0) {
     units = grid_x * (warp_size > 0 ? block_threads / warp_size : 1);
@@ -179,10 +178,8 @@ void PrintPerfTable(const char* test_name, const char* transport_name, const cha
   const char* num_header = is_bw ? "Bandwidth" : "Latency";
   const char* unit_str = is_bw ? "GB/s" : "us";
 
-  // "msg" = per-unit message size (size / units): the actual bytes carried by one
-  // WQE in this scope. For bandwidth, "Mpps" = WQEs/messages issued per second
-  // (= GB/s * 1e3 * units / size); it exposes the per-WQE issue-rate ceiling that
-  // dominates small messages.
+  // "msg" = per-unit message size (size/units). "Mpps" = messages/s issued
+  // (GB/s * 1e3 * units / size), exposing the per-WQE issue-rate ceiling.
   if (is_bw) {
     std::printf("%-*s %-*s %-*s %*s %-5s %*s\n", kWSize, "size", kWMsg, "msg", kWScope, "scope",
                 kWNum, num_header, unit_str, kWMpps, "Mpps");
