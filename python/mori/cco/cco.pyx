@@ -15,8 +15,9 @@ from .cco cimport (
     CCO_GDA_CONNECTION_CROSSNODE, CCO_GDA_CONNECTION_RAIL,
     ccoGetUniqueId, ccoCommCreate, ccoCommDestroy,
     ccoMemAlloc, ccoMemFree,
-    ccoWindowDeregister, ccoDevCommCreate, ccoDevCommDestroy, ccoBarrierAll,
-    ccoWindowRegister,
+    ccoWindowDeregister, ccoDevCommCreate, ccoDevCommDestroy,
+    ccoDevCommCopyToDevice, ccoDevCommFreeDeviceCopy,
+    ccoBarrierAll, ccoWindowRegister,
 )
 
 
@@ -204,8 +205,8 @@ cdef class DevComm:
 
     @property
     def ptr(self):
-        """intptr_t address of the embedded ccoDevComm struct."""
-        return <intptr_t>&self._dc
+        """intptr_t address of the device-side ccoDevComm copy (for kernel arguments)."""
+        return <intptr_t>self._device_ptr
 
     @property
     def rank(self):
@@ -350,22 +351,25 @@ def window_deregister(Comm comm, intptr_t win):
 
 def dev_comm_create(Comm comm, DevCommRequirements reqs):
     """
-    Build a DevComm from the communicator.  The returned DevComm embeds the
-    ccoDevComm struct; its .ptr property gives the intptr_t address for kernel
-    arguments.
+    Build a DevComm from the communicator.  The returned DevComm's .ptr gives
+    a device-side intptr_t address suitable for passing as a kernel argument.
     """
     cdef DevComm dc = DevComm.__new__(DevComm)
     dc._comm = comm
+    dc._device_ptr = NULL
     cdef int ret
     with nogil:
         ret = ccoDevCommCreate(comm._ptr, &reqs._reqs, &dc._dc)
     if ret != 0:
         raise RuntimeError(f"ccoDevCommCreate failed: {ret}")
+    dc._device_ptr = ccoDevCommCopyToDevice(&dc._dc)
     return dc
 
 
 def dev_comm_destroy(Comm comm, DevComm dev_comm):
     """Release device resources held by a DevComm."""
+    ccoDevCommFreeDeviceCopy(dev_comm._device_ptr)
+    dev_comm._device_ptr = NULL
     cdef int ret
     with nogil:
         ret = ccoDevCommDestroy(comm._ptr, &dev_comm._dc)

@@ -78,6 +78,8 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
     int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs,
                          ccoDevComm* outDevComm) nogil
     int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) nogil
+    ccoDevComm* ccoDevCommCopyToDevice(const ccoDevComm* host) nogil
+    void ccoDevCommFreeDeviceCopy(ccoDevComm* devicePtr) nogil
     int ccoBarrierAll(ccoComm* comm) nogil
 
 
@@ -91,5 +93,6 @@ cdef class DevCommRequirements:
     cdef ccoDevCommRequirements _reqs
 
 cdef class DevComm:
-    cdef ccoDevComm _dc
+    cdef ccoDevComm _dc          # host shadow (for DevCommDestroy + property access)
+    cdef ccoDevComm* _device_ptr  # device copy (for kernel pointer arguments)
     cdef object _comm

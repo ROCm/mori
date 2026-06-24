@@ -2,33 +2,26 @@
 #
 # MIT License
 
-"""CCO high-level Communicator class.
-
-Mirrors the nccl4py ``Communicator`` pattern:
-
-* :py:meth:`Communicator.init` — class-method constructor (collective).
-* Resource factory methods (:py:meth:`alloc_mem`, :py:meth:`alloc_window`,
-  :py:meth:`register_window`, :py:meth:`create_dev_comm`) return
-  :py:mod:`~mori.cco.resources` objects that are owned and tracked by the
-  communicator.
-* :py:meth:`destroy` closes all tracked resources and frees the communicator.
-"""
+"""CCO high-level Communicator and resource classes."""
 
 from __future__ import annotations
 
-from typing import Sequence
+from abc import ABC, abstractmethod
 
 import mori.cco.cco as _cco
-from mori.cco.resources import (
-    AllocatedMemory,
-    AllocatedWindow,
-    CCOResource,
-    DevCommHandle,
-    RegisteredWindow,
-)
 
 
-__all__ = ["Communicator", "CCODevCommRequirements", "UniqueId", "get_unique_id"]
+__all__ = [
+    "UniqueId",
+    "get_unique_id",
+    "CCODevCommRequirements",
+    "CCOResource",
+    "AllocatedMemory",
+    "RegisteredWindow",
+    "AllocatedWindow",
+    "DevCommHandle",
+    "Communicator",
+]
 
 
 # ── UniqueId (pure-Python wrapper with pickle support) ───────────────────────
@@ -39,11 +32,6 @@ class UniqueId:
     Wraps the Cython-level ``cco.UniqueId`` with pickle support so that
     ``mpi4py.MPI.Comm.bcast`` (lowercase ``b``, pickle-based) works
     out of the box.
-
-    Serialization paths:
-
-    * **Bytes**: ``bytes(uid)`` / :py:meth:`from_bytes`.
-    * **Pickle**: ``__getstate__`` / ``__setstate__`` — used by MPI bcast.
     """
 
     def __init__(self, _internal: _cco.UniqueId | None = None) -> None:
@@ -83,41 +71,201 @@ class CCODevCommRequirements(_cco.DevCommRequirements):
     Initialised to safe defaults matching
     ``CCO_DEV_COMM_REQUIREMENTS_INITIALIZER``.  Override fields before
     passing to :py:meth:`Communicator.create_dev_comm`.
-
-    Example::
-
-        reqs = CCODevCommRequirements()
-        reqs.gda_connection_type = GDA_CONNECTION_NONE
-        reqs.lsa_barrier_count   = 4
-        dc = comm.create_dev_comm(reqs)
     """
+
+
+# ── Resource base ─────────────────────────────────────────────────────────────
+
+class CCOResource(ABC):
+    """Abstract base for CCO communicator-owned resources."""
+
+    def __init__(self, comm: Communicator) -> None:
+        self._comm = comm
+        self._closed = False
+
+    @abstractmethod
+    def _deallocate(self) -> None: ...
+
+    def close(self) -> None:
+        """Release the resource.  Safe to call multiple times."""
+        if self._closed:
+            return
+        self._closed = True
+        self._deallocate()
+
+    def _check_valid(self) -> None:
+        if self._closed:
+            raise RuntimeError(f"{type(self).__name__} has already been closed")
+
+    @property
+    def is_valid(self) -> bool:
+        return not self._closed
+
+
+# ── AllocatedMemory ───────────────────────────────────────────────────────────
+
+class AllocatedMemory(CCOResource):
+    """Symmetric GPU memory allocated via ``ccoMemAlloc``."""
+
+    def __init__(self, comm: Communicator, size: int) -> None:
+        super().__init__(comm)
+        self._size = size
+        self._ptr = _cco.mem_alloc(comm._raw, size)
+
+    def _deallocate(self) -> None:
+        if self._ptr:
+            _cco.mem_free(self._comm._raw, self._ptr)
+            self._ptr = 0
+
+    @property
+    def ptr(self) -> int:
+        self._check_valid()
+        return self._ptr
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def __repr__(self) -> str:
+        if not self.is_valid:
+            return "<AllocatedMemory: closed>"
+        return f"<AllocatedMemory: ptr={self._ptr:#x}, size={self._size}>"
+
+
+# ── RegisteredWindow ──────────────────────────────────────────────────────────
+
+class RegisteredWindow(CCOResource):
+    """Window registered from a caller-allocated ``ccoMemAlloc`` pointer."""
+
+    def __init__(self, comm: Communicator, ptr: int, size: int) -> None:
+        super().__init__(comm)
+        self._ptr = ptr
+        self._size = size
+        self._handle = _cco.window_register_ptr(comm._raw, ptr, size)
+
+    def _deallocate(self) -> None:
+        if self._handle:
+            _cco.window_deregister(self._comm._raw, self._handle)
+            self._handle = 0
+
+    @property
+    def handle(self) -> int:
+        self._check_valid()
+        return self._handle
+
+    @property
+    def local_ptr(self) -> int:
+        return self._ptr
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def __repr__(self) -> str:
+        if not self.is_valid:
+            return "<RegisteredWindow: closed>"
+        return f"<RegisteredWindow: handle={self._handle:#x}, size={self._size}>"
+
+
+# ── AllocatedWindow ───────────────────────────────────────────────────────────
+
+class AllocatedWindow(CCOResource):
+    """Window where CCO allocates and registers memory internally."""
+
+    def __init__(self, comm: Communicator, size: int) -> None:
+        super().__init__(comm)
+        self._size = size
+        self._handle, self._local_ptr = _cco.window_register(comm._raw, size)
+
+    def _deallocate(self) -> None:
+        if self._handle:
+            _cco.window_deregister(self._comm._raw, self._handle)
+            self._handle = 0
+            self._local_ptr = 0
+
+    @property
+    def handle(self) -> int:
+        self._check_valid()
+        return self._handle
+
+    @property
+    def local_ptr(self) -> int:
+        self._check_valid()
+        return self._local_ptr
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def __repr__(self) -> str:
+        if not self.is_valid:
+            return "<AllocatedWindow: closed>"
+        return (f"<AllocatedWindow: handle={self._handle:#x}, "
+                f"local_ptr={self._local_ptr:#x}, size={self._size}>")
+
+
+# ── DevCommHandle ─────────────────────────────────────────────────────────────
+
+class DevCommHandle(CCOResource):
+    """Device communicator resource wrapping ``ccoDevComm``."""
+
+    def __init__(
+        self,
+        comm: Communicator,
+        requirements: _cco.DevCommRequirements | None = None,
+    ) -> None:
+        super().__init__(comm)
+        if requirements is None:
+            requirements = _cco.DevCommRequirements()
+        self._dev_comm = _cco.dev_comm_create(comm._raw, requirements)
+
+    def _deallocate(self) -> None:
+        if self._dev_comm is not None:
+            _cco.dev_comm_destroy(self._comm._raw, self._dev_comm)
+            self._dev_comm = None
+
+    @property
+    def ptr(self) -> int:
+        self._check_valid()
+        return self._dev_comm.ptr
+
+    @property
+    def device_ptr(self) -> int:
+        self._check_valid()
+        return self.dev_comm._device_ptr
+
+    @property
+    def rank(self) -> int:
+        self._check_valid()
+        return self._dev_comm.rank
+
+    @property
+    def world_size(self) -> int:
+        self._check_valid()
+        return self._dev_comm.world_size
+
+    @property
+    def lsa_size(self) -> int:
+        self._check_valid()
+        return self._dev_comm.lsa_size
+
+    @property
+    def lsa_rank(self) -> int:
+        self._check_valid()
+        return self._dev_comm.lsa_rank
+
+    def __repr__(self) -> str:
+        if not self.is_valid:
+            return "<DevCommHandle: closed>"
+        return (f"<DevCommHandle: ptr={self.ptr:#x}, rank={self.rank}, "
+                f"world_size={self.world_size}, lsa_size={self.lsa_size}>")
 
 
 # ── Communicator ──────────────────────────────────────────────────────────────
 
 class Communicator:
-    """CCO communicator for intra- and inter-node symmetric memory operations.
+    """CCO communicator for intra- and inter-node symmetric memory operations."""
 
-    A communicator groups ``nranks`` processes, each pinned to one GPU.
-    It manages the flat VMM address space used by all CCO symmetric-memory
-    operations.
-
-    Typical lifecycle::
-
-        uid  = Communicator.get_unique_id() if rank == 0 else None
-        uid  = mpi_comm.bcast(uid, root=0)
-        comm = Communicator.init(nranks, rank, uid, per_rank_vmm=4 << 30)
-
-        win  = comm.alloc_window(size)      # allocate + register
-        dc   = comm.create_dev_comm()       # build GPU-side DevComm
-
-        # ... launch kernels using win.handle and dc.ptr ...
-
-        comm.barrier()                      # host collective fence
-        comm.destroy()                      # releases all resources
-    """
-
-    # Default VMM budget: 4 GiB per rank (minimum for stride4G = 1).
     DEFAULT_PER_RANK_VMM: int = 4 * 1024 * 1024 * 1024
 
     def __init__(self) -> None:
@@ -125,22 +273,10 @@ class Communicator:
         self._resources: list[CCOResource] = []
         self._rank: int | None = None
         self._nranks: int | None = None
-        self._lsa_size: int | None = None
-        self._lsa_rank: int | None = None
-
-    # ── Constructors ──────────────────────────────────────────────────────────
 
     @staticmethod
     def get_unique_id() -> UniqueId:
-        """Generate a rendezvous token on rank 0.
-
-        Call only on rank 0, then broadcast the result to all ranks via MPI
-        (or any other out-of-band channel) before calling
-        :py:meth:`Communicator.init`.
-
-        Returns:
-            :py:class:`UniqueId` that serialises to 128 bytes.
-        """
+        """Generate a rendezvous token on rank 0."""
         return get_unique_id()
 
     @classmethod
@@ -151,24 +287,7 @@ class Communicator:
         unique_id: UniqueId,
         per_rank_vmm: int = DEFAULT_PER_RANK_VMM,
     ) -> Communicator:
-        """Collective: create a CCO communicator.
-
-        All ranks must call this with the same ``nranks`` and ``unique_id``
-        (broadcast from rank 0) but different ``rank`` values.
-
-        Args:
-            nranks: Total number of ranks.
-            rank: This rank's index (0 … nranks-1).
-            unique_id: Token generated and broadcast by rank 0.
-            per_rank_vmm: Bytes of flat VA reserved per rank for symmetric
-                memory.  Must be a multiple of the VMM granularity (typically
-                2 MiB on ROCm).  All ``alloc_mem`` / ``alloc_window`` calls
-                on this comm must fit within this budget.
-                Defaults to 4 GiB (minimum for ``stride4G = 1``).
-
-        Returns:
-            Initialised :py:class:`Communicator`.
-        """
+        """Collective: create a CCO communicator."""
         comm = cls()
         uid = unique_id.ptr if isinstance(unique_id, UniqueId) else unique_id
         comm._raw    = _cco.comm_create(uid, nranks, rank, per_rank_vmm)
@@ -176,25 +295,15 @@ class Communicator:
         comm._nranks = nranks
         return comm
 
-    # ── Teardown ──────────────────────────────────────────────────────────────
-
     def destroy(self) -> None:
-        """Destroy the communicator and free all owned resources.
-
-        Closes all tracked resources (windows, device communicators, allocated
-        memory) in reverse-registration order, then frees the communicator.
-        Safe to call multiple times.
-        """
+        """Destroy the communicator and free all owned resources."""
         self.close_all_resources()
         if self._raw is not None:
             _cco.comm_destroy(self._raw)
             self._raw = None
 
     def close_all_resources(self) -> None:
-        """Close all tracked resources (best-effort; errors are suppressed).
-
-        Called automatically by :py:meth:`destroy`.
-        """
+        """Close all tracked resources (best-effort; errors are suppressed)."""
         for r in reversed(self._resources):
             try:
                 r.close()
@@ -202,28 +311,22 @@ class Communicator:
                 pass
         self._resources.clear()
 
-    # ── Properties ────────────────────────────────────────────────────────────
-
     @property
     def is_valid(self) -> bool:
-        """True while the communicator has not been destroyed."""
         return self._raw is not None
 
     @property
     def rank(self) -> int:
-        """This process's rank in the communicator."""
         self._check_valid("get rank")
         return self._rank  # type: ignore[return-value]
 
     @property
     def nranks(self) -> int:
-        """Total number of ranks in the communicator."""
         self._check_valid("get nranks")
         return self._nranks  # type: ignore[return-value]
 
     @property
     def ptr(self) -> int:
-        """Raw ``ccoComm*`` pointer (intptr_t) for advanced use."""
         self._check_valid("get ptr")
         return self._raw.ptr  # type: ignore[union-attr]
 
@@ -231,64 +334,19 @@ class Communicator:
         if not self.is_valid:
             raise RuntimeError(f"Cannot {op}: Communicator has been destroyed")
 
-    # ── Resource factories ────────────────────────────────────────────────────
-
     def alloc_mem(self, size: int) -> AllocatedMemory:
-        """Allocate ``size`` bytes of symmetric GPU memory via ``ccoMemAlloc``.
-
-        The allocation lives in the flat VA space shared by all LSA peers.
-        To make it P2P-accessible, register it as a window with
-        :py:meth:`register_window`.
-
-        Args:
-            size: Number of bytes to allocate.
-
-        Returns:
-            :py:class:`~mori.cco.resources.AllocatedMemory` tracking the
-            allocation.
-        """
         self._check_valid("alloc_mem")
         r = AllocatedMemory(self, size)
         self._resources.append(r)
         return r
 
     def register_window(self, ptr: int, size: int) -> RegisteredWindow:
-        """Register a pre-allocated ``ccoMemAlloc`` pointer as a CCO window.
-
-        Collective: all ranks must call in the same order with the same
-        ``size``.  The caller retains ownership of the memory; close the
-        :py:class:`~mori.cco.resources.AllocatedMemory` only *after* closing
-        the window.
-
-        Args:
-            ptr: Device pointer (``intptr_t``) from :py:meth:`alloc_mem`.
-            size: Size in bytes (must match the allocation).
-
-        Returns:
-            :py:class:`~mori.cco.resources.RegisteredWindow`.
-        """
         self._check_valid("register_window")
         r = RegisteredWindow(self, ptr, size)
         self._resources.append(r)
         return r
 
     def alloc_window(self, size: int) -> AllocatedWindow:
-        """Allocate *and* register a symmetric window in one collective call.
-
-        CCO handles the underlying memory allocation internally.  This is the
-        simplest path when you do not need to separate allocation from
-        registration.
-
-        Collective: all ranks must call in the same order with the same
-        ``size``.
-
-        Args:
-            size: Window size in bytes.
-
-        Returns:
-            :py:class:`~mori.cco.resources.AllocatedWindow` with ``handle``
-            and ``local_ptr``.
-        """
         self._check_valid("alloc_window")
         r = AllocatedWindow(self, size)
         self._resources.append(r)
@@ -298,42 +356,15 @@ class Communicator:
         self,
         requirements: CCODevCommRequirements | None = None,
     ) -> DevCommHandle:
-        """Build a GPU-side ``ccoDevComm`` from this communicator.
-
-        Multiple device communicators can be created from a single host
-        communicator (e.g. one per kernel launch type with different signal
-        counts).
-
-        Args:
-            requirements: Resource configuration.  If ``None``, a default
-                :py:class:`CCODevCommRequirements` is used (CROSSNODE GDA,
-                16 signals, 16 counters, no barriers).
-
-        Returns:
-            :py:class:`~mori.cco.resources.DevCommHandle` whose ``ptr``
-            property gives the ``intptr_t`` address of the ``ccoDevComm``
-            struct for kernel arguments.
-        """
         self._check_valid("create_dev_comm")
         reqs = requirements if requirements is not None else CCODevCommRequirements()
         r = DevCommHandle(self, reqs)
         self._resources.append(r)
         return r
 
-    # ── Collective operations ──────────────────────────────────────────────────
-
     def barrier(self) -> None:
-        """Host-side collective barrier across all ranks.
-
-        Blocks until every rank has called this method.  Use after GPU kernel
-        launches (with ``hipStreamSynchronize`` + ``__threadfence_system`` in
-        the kernel) to guarantee all remote writes are visible before any rank
-        reads them.
-        """
         self._check_valid("barrier")
         _cco.barrier_all(self._raw)
-
-    # ── Dunder ────────────────────────────────────────────────────────────────
 
     def __repr__(self) -> str:
         if not self.is_valid:

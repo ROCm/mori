@@ -32,8 +32,11 @@ from .cco import (
 )
 
 # High-level OO API (mirrors nccl4py style)
-from .communicator import Communicator, CCODevCommRequirements, UniqueId, get_unique_id
-from .resources import (
+from .communicator import (
+    Communicator,
+    CCODevCommRequirements,
+    UniqueId,
+    get_unique_id,
     CCOResource,
     AllocatedMemory,
     RegisteredWindow,
