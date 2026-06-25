@@ -79,6 +79,7 @@
 // this file. Device/kernel TUs skip both the includes and the structs.
 #include <memory>
 #include <mutex>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 #endif
@@ -387,6 +388,8 @@ struct ccoDevComm {
   ccoSdmaContext sdma;
 };
 typedef ccoDevComm* ccoDevComm_t;
+static_assert(std::is_trivially_copyable<ccoDevComm>::value,
+              "ccoDevComm must be trivially copyable for hipMemcpy");
 
 // Look up a registered window by a local pointer that lies within it. Backend-
 // agnostic accessor over the window table built into ccoDevComm above.
@@ -933,6 +936,13 @@ int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win);
 // it references are released by ccoDevCommDestroy(comm, &devComm).
 int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm);
 int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
+
+// Upload a host-side DevComm shadow to device memory so kernels can take a
+// pointer to it (host memory is not GPU-accessible).  Returns a hipMalloc'd
+// device pointer; must be freed with ccoDevCommFreeDeviceCopy once the DevComm
+// is no longer used by any in-flight kernel.
+ccoDevComm* ccoDevCommCopyToDevice(const ccoDevComm* host);
+void        ccoDevCommFreeDeviceCopy(ccoDevComm* devicePtr);
 
 // ── Host barrier ──
 int ccoBarrierAll(ccoComm* comm);
