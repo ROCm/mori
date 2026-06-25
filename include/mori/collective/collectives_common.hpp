@@ -159,8 +159,8 @@ inline __device__ void SdmaPutWarpFusedS(void* srcBase, void* dstBase, size_t sl
   constexpr size_t pkt = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
   // Use the collective-augmented handle (identical layout) so we can issue the
   // b128 placePacketAt / fillNops ring writes.
-  SdmaCollectiveHandle handle =
-      *reinterpret_cast<SdmaCollectiveHandle*>(*(deviceHandles + qId));  // same queue for all lanes
+  auto& handle =
+      *static_cast<SdmaCollectiveHandle*>(*(deviceHandles + qId));  // same queue for all lanes
 
   // Single contiguous reservation for all S packets (done by lane 0). `offset` is
   // wrap-around NOP padding placed before the block so it cannot wrap internally.
@@ -187,6 +187,48 @@ inline __device__ void SdmaPutWarpFusedS(void* srcBase, void* dstBase, size_t sl
   // s_waitcnt(0) inside submitPacket then drains the wave-shared vmcnt for them all.
   __syncwarp();
   if (lane == 0) handle.submitPacket(startBase, startBase + offset + static_cast<uint64_t>(pkt) * S);
+}
+
+
+// Multi-producer-safe single-thread put: copy packet + completion atomic.
+//
+// Unlike SdmaPutThread, this reserves space for BOTH packets in ONE
+// ReserveQueueSpace call and writes them with ONE placePacket call, so the
+// producer's reserved range [startBase, pendingWptr) is a single contiguous
+// block. 
+inline __device__ void SdmaPutThreadFused(void* srcBuf, void* dstBuf, size_t copy_size,
+                                          anvil::SdmaQueueDeviceHandle** deviceHandles,
+                                          HSAuint64* signals, uint32_t queNum, uint32_t qId,
+                                          uint64_t addVal = 1) {
+  // A copy-linear packet immediately followed by its completion atomic. Both SDMA
+  // packet structs are made entirely of 4-byte fields, so this aggregate has no
+  // internal padding and its 15 dwords land in the ring exactly as two adjacent
+  // packets would (copy at dwords 0..6, atomic at 7..14).
+  struct SDMA_PKT_COPY_WITH_ATOMIC {
+    SDMA_PKT_COPY_LINEAR copy;
+    SDMA_PKT_ATOMIC atomic;
+  };
+  static_assert(sizeof(SDMA_PKT_COPY_WITH_ATOMIC) ==
+                  sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC),
+              "combined SDMA copy+atomic packet must be tightly packed");
+  uint64_t offset = 0;
+  char* srcPtr = reinterpret_cast<char*>(srcBuf);
+  char* dstPtr = reinterpret_cast<char*>(dstBuf);
+
+  auto& handle = *static_cast<SdmaCollectiveHandle*>(*(deviceHandles + qId));
+
+  // Single contiguous reservation for the copy + atomic packets. `offset` is the
+  // wrap-around NOP padding; it precedes the combined packet, which cannot wrap
+  // internally because it was reserved as one block.
+  const uint64_t startBase = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_WITH_ATOMIC), offset);
+  uint64_t pendingWptr = startBase;
+
+  SDMA_PKT_COPY_WITH_ATOMIC packet;
+  packet.copy = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size);
+  packet.atomic = anvil::CreateAtomicAddPacket(signals + qId, addVal);
+  handle.placePacket(packet, pendingWptr, offset);
+
+  handle.submitPacket(startBase, pendingWptr);
 }
 
 }  // namespace collective
