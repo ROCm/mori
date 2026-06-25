@@ -63,7 +63,7 @@ jobs:
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         run: |
-          $CT exec $CONTAINER bash $GITHUB_WORKSPACE/tests/cpp/cco/run_all.sh $GITHUB_WORKSPACE/build 4
+          $CT exec $CONTAINER bash $GITHUB_WORKSPACE/tools/run_cco_tests.sh $GITHUB_WORKSPACE/build 4
 
       - name: Cleanup
         if: always()
