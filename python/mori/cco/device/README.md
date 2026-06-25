@@ -10,11 +10,11 @@ machinery; the C++ device implementation (`ccoGda<P>`) is reused **unchanged**.
 ```
 FlyDSL @flyc.kernel
   └─ cco.DevComm(h).gda(0).put(...)         OO handles (method-carrying fx.struct)
-       └─ _bindings.cco_gda_put(...)         1:1 FFI prototypes
+       └─ _bindings.PUT["iw__inc"](...)      per-combo FFI symbol tables
             └─ link_extern(ffi(...), bc)      lazy bind + attach bitcode
-                 └─ llvm.call @cco_gda_put    FlyDSL-emitted IR
-                      └─ libmori_cco_device.bc extern "C" wrapper (runtime template dispatch)
-                           └─ ccoGda<P>::put() the real C++ device impl (unchanged)
+                 └─ llvm.call @cco_gda_put__iw__inc   FlyDSL-emitted IR (one monomorphic symbol)
+                      └─ libmori_cco_device.bc extern "C" wrapper (one template instantiation)
+                           └─ ccoGda<P>::put<Aggregate?,Coop>() the real C++ device impl (unchanged)
 ```
 
 ## What to look at where
@@ -23,7 +23,7 @@ FlyDSL @flyc.kernel
 |---|---|
 | What device ops exist / the C++ wrapper | `src/cco/device/cco_device_wrapper.cpp` |
 | The ABI (exact symbol + scalar arg list) | `python/mori/cco/device/flydsl/_bindings.py` (1:1 with the wrapper) |
-| OO API (`DevComm/Window/Gda`) + enums (`CoopScope/SignalOp`) | `python/mori/cco/device/flydsl/handles.py` |
+| OO API (`DevComm/Window/Gda`) + enums (`CoopScope/SignalOp/ThreadMode`) | `python/mori/cco/device/flydsl/handles.py` |
 | `_ffi` factory + `cco_struct` (handle keeps methods across `if`/`for`) | `flydsl/_internal.py` |
 | How the `.bc` is located at runtime | `python/mori/cco/device/bitcode.py` (`find_cco_bitcode`) |
 | How the `.bc` is built (JIT, per arch+NIC+cov) | `bitcode.py::_jit_compile` (reuses `mori.jit`) |
@@ -34,9 +34,21 @@ FlyDSL @flyc.kernel
 ## Key design points
 
 - **Scalar handles.** FlyDSL FFI is scalar-only, so device objects cross as
-  `uint64` intptrs (`ccoDevComm*`, `ccoWindow_t`); coop-scope / signal-op cross
-  as `int32` enums. The wrapper reinterpret-casts and dispatches at runtime
-  (`CCO_BY_COOP` + signalOp branch). Struct layout lives only in C++.
+  `uint64` intptrs (`ccoDevComm*`, `ccoWindow_t`); signal id/value cross as
+  `int32`/`uint64`. Struct layout lives only in C++.
+- **No dispatch overhead (monomorphization).** Each template axis
+  (`Coop` × `ThreadMode` × `RemoteAction`) is compiled into a *distinct*
+  `extern "C"` symbol, name-mangled with a tag (`cco_gda_put__iw__inc` = indep
+  warp + signal-inc). `coop`/`thread_mode`/`signal_op` are compile-time constants
+  (Python enums), so `handles.py` picks the symbol by name at trace time and the
+  kernel emits **one direct call to one instantiation** — no runtime branch, no
+  type erasure, nothing to constant-fold. Passing a runtime DSL value for any
+  axis is a `TypeError` (it can't select a symbol). `always_inline` (`CCO_DEV`)
+  then inlines the thin forwarder into the kernel.
+- **ThreadMode is selectable** (`ThreadMode.INDEPENDENT` / `AGGREGATE`); the
+  data path carries it as part of its `(ThreadMode,Coop)` tag (`it/iw/ib/at`).
+  `AGGREGATE` is only valid with `CoopScope.THREAD` (cco coalesces the warp's
+  lanes itself — enforced in both the wrapper and `handles.py`).
 - **Provider fixed at build time** via `CCO_GDA_BUILD_PROVIDER` (NIC macro) — one
   `ccoGda<P>` specialization per NIC, same as the C++ kernels / shmem bitcode.
 - **OO handles** (`DevComm/Window/Gda`) are method-carrying `fx.struct`s
@@ -72,11 +84,14 @@ bash tools/run_cco_flydsl_2node.sh examples/cco/03_flydsl_put/main.py
 
 ## Adding a new device op (the path)
 
-1. Add the `extern "C"` wrapper (use `CCO_DEV`, `CCO_BY_COOP` for coop dispatch)
-   in `cco_device_wrapper.cpp`. (JIT re-compiles automatically — the cache key
-   includes the wrapper source hash.)
-2. Add the 1:1 `_ffi(...)` prototype in `_bindings.py` (matching scalar args).
-3. Expose it as a method on `DevComm` / `Window` / `Gda` in `handles.py`.
+1. Add the `extern "C"` wrapper in `cco_device_wrapper.cpp`. For a templated op,
+   define it with the `CCO_TC_LIST` / `CCO_COOP_LIST` X-macros so every valid
+   combination is monomorphized into a tagged symbol (no runtime dispatch). JIT
+   re-compiles automatically — the cache key includes the wrapper source hash.
+2. Add the matching symbol table / `_ffi(...)` prototype in `_bindings.py`
+   (keyed by the same tags).
+3. Expose it as a method on `DevComm` / `Window` / `Gda` in `handles.py`, picking
+   the symbol from the compile-time `coop`/`thread_mode`/`signal_op` constants.
 
 The `_bindings.py` ↔ wrapper ABI is mechanical — it's the natural codegen target.
 
@@ -87,7 +102,7 @@ The `_bindings.py` ↔ wrapper ABI is mechanical — it's the natural codegen ta
 | `03_flydsl_put` | GDA put + signal/wait (single-node FULL + 2-node CROSSNODE) |
 | `04_flydsl_lsa_put` | LSA direct peer-pointer store in the kernel |
 | `05_flydsl_lsa_allreduce` | LSA custom all-reduce: peer pointers + device signal barrier |
-| `06_flydsl_gda_modes` | GDA template matrix: coop {thread,warp,block} × signal {inc,add} |
+| `06_flydsl_gda_modes` | GDA template matrix: (thread_mode,coop) {indep×thread/warp/block, aggr×thread} × signal {inc,add} |
 
 ## FlyDSL kernel-author gotchas
 

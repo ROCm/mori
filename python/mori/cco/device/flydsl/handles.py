@@ -14,8 +14,11 @@ control flow. Build once at kernel entry and reuse::
         gda.put(1, recv, 0, send, 0, n, signal_op=cco.SignalOp.INC, coop=cco.CoopScope.THREAD)
     gda.flush(coop=cco.CoopScope.BLOCK)          # same gda, across the dynamic if
 
-``CoopScope`` / ``SignalOp`` mirror the enums in
-``src/cco/device/cco_device_wrapper.cpp`` (passed as int32).
+``coop`` / ``signal_op`` / ``thread_mode`` must be compile-time constants
+(``CoopScope`` / ``SignalOp`` / ``ThreadMode`` values): each method selects a
+fully-specialized wrapper symbol by name, so the kernel emits one direct call to
+one ``ccoGda<P>`` instantiation — no runtime dispatch. ``ThreadMode.AGGREGATE``
+is only valid with ``CoopScope.THREAD`` (cco coalesces the warp's lanes itself).
 """
 
 import flydsl.expr as fx
@@ -38,6 +41,58 @@ class SignalOp:
     NONE = 0
     INC = 1
     ADD = 2
+
+
+class ThreadMode:
+    """How a thread's lanes contribute to one GDA data-path op.
+
+    ``INDEPENDENT`` — each participating thread issues its own transfer.
+    ``AGGREGATE``   — the warp's lanes are coalesced into one transfer by cco
+                      (requires ``CoopScope.THREAD``; all lanes must enter).
+    """
+
+    INDEPENDENT = 0
+    AGGREGATE = 1
+
+
+# Tag tables — must match the wrapper / _bindings symbol names.
+_SIG_TAG = {SignalOp.NONE: "none", SignalOp.INC: "inc", SignalOp.ADD: "add"}
+_COOP_TAG = {CoopScope.THREAD: "thread", CoopScope.WARP: "warp", CoopScope.BLOCK: "block"}
+_TC_TAG = {
+    (ThreadMode.INDEPENDENT, CoopScope.THREAD): "it",
+    (ThreadMode.INDEPENDENT, CoopScope.WARP): "iw",
+    (ThreadMode.INDEPENDENT, CoopScope.BLOCK): "ib",
+    (ThreadMode.AGGREGATE, CoopScope.THREAD): "at",
+}
+
+
+def _const(value, name):
+    """Require a compile-time constant (the axis selects a wrapper symbol)."""
+    if not isinstance(value, int):
+        raise TypeError(
+            f"cco: {name} must be a compile-time constant (a CoopScope / SignalOp / "
+            f"ThreadMode value), not a runtime DSL value — got {type(value).__name__}. "
+            "The axis picks a specialized wrapper symbol at trace time."
+        )
+    return value
+
+
+def _tc(coop, thread_mode):
+    """(ThreadMode, Coop) -> data-path tag; rejects the invalid aggregate combos."""
+    _const(coop, "coop")
+    _const(thread_mode, "thread_mode")
+    try:
+        return _TC_TAG[(thread_mode, coop)]
+    except KeyError:
+        raise ValueError(
+            "cco: ThreadMode.AGGREGATE requires coop=CoopScope.THREAD "
+            "(cco coalesces the warp's lanes itself)."
+        )
+
+
+def _flush_tag(coop):
+    """flush needs >= warp; THREAD/WARP -> warp, BLOCK -> block."""
+    return "block" if _const(coop, "coop") == CoopScope.BLOCK else "warp"
 
 
 def _win(x):
@@ -73,24 +128,33 @@ class Gda:
 
     # ── data path ──
     def put(self, peer, dst_win, dst_off, src_win, src_off, nbytes, *,
-            signal_op=SignalOp.NONE, signal_id=0, signal_val=0, coop=CoopScope.THREAD):
-        raw.cco_gda_put(self.dev_comm, self.ctx, peer, _win(dst_win), dst_off, _win(src_win),
-                        src_off, nbytes, signal_op, signal_id, signal_val, coop)
+            signal_op=SignalOp.NONE, signal_id=0, signal_val=0,
+            coop=CoopScope.THREAD, thread_mode=ThreadMode.INDEPENDENT):
+        sym = raw.PUT[f"{_tc(coop, thread_mode)}__{_SIG_TAG[_const(signal_op, 'signal_op')]}"]
+        sym(self.dev_comm, self.ctx, peer, _win(dst_win), dst_off, _win(src_win), src_off,
+            nbytes, signal_id, signal_val)
 
     def put_value(self, peer, dst_win, dst_off, value, *,
-                  signal_op=SignalOp.NONE, signal_id=0, signal_val=0, coop=CoopScope.THREAD):
-        raw.cco_gda_put_value(self.dev_comm, self.ctx, peer, _win(dst_win), dst_off, value,
-                              signal_op, signal_id, signal_val, coop)
+                  signal_op=SignalOp.NONE, signal_id=0, signal_val=0,
+                  coop=CoopScope.THREAD, thread_mode=ThreadMode.INDEPENDENT):
+        sym = raw.PUT_VALUE[f"{_tc(coop, thread_mode)}__{_SIG_TAG[_const(signal_op, 'signal_op')]}"]
+        sym(self.dev_comm, self.ctx, peer, _win(dst_win), dst_off, value, signal_id, signal_val)
 
     def get(self, peer, remote_win, remote_off, local_win, local_off, nbytes, *,
-            coop=CoopScope.THREAD):
-        raw.cco_gda_get(self.dev_comm, self.ctx, peer, _win(remote_win), remote_off,
-                        _win(local_win), local_off, nbytes, coop)
+            coop=CoopScope.THREAD, thread_mode=ThreadMode.INDEPENDENT):
+        raw.GET[_tc(coop, thread_mode)](
+            self.dev_comm, self.ctx, peer, _win(remote_win), remote_off,
+            _win(local_win), local_off, nbytes)
 
     # ── signal ──
     def signal(self, peer, *, signal_op=SignalOp.INC, signal_id=0, signal_val=0,
                coop=CoopScope.THREAD):
-        raw.cco_gda_signal(self.dev_comm, self.ctx, peer, signal_op, signal_id, signal_val, coop)
+        _const(signal_op, "signal_op")
+        _const(coop, "coop")
+        if signal_op == SignalOp.NONE:
+            raise ValueError("cco: signal() requires signal_op INC or ADD")
+        raw.SIGNAL[f"{_COOP_TAG[coop]}__{_SIG_TAG[signal_op]}"](
+            self.dev_comm, self.ctx, peer, signal_id, signal_val)
 
     def read_signal(self, signal_id, bits=64):
         return raw.cco_gda_read_signal(self.dev_comm, self.ctx, signal_id, bits)
@@ -99,14 +163,15 @@ class Gda:
         raw.cco_gda_reset_signal(self.dev_comm, self.ctx, signal_id)
 
     def wait_signal(self, signal_id, least, *, bits=64, coop=CoopScope.THREAD):
-        raw.cco_gda_wait_signal(self.dev_comm, self.ctx, signal_id, least, bits, coop)
+        raw.WAIT_SIGNAL[_COOP_TAG[_const(coop, "coop")]](
+            self.dev_comm, self.ctx, signal_id, least, bits)
 
-    # ── completion (>= warp) ──
+    # ── completion (>= warp; THREAD coop maps to warp) ──
     def flush(self, *, coop=CoopScope.WARP):
-        raw.cco_gda_flush(self.dev_comm, self.ctx, coop)
+        raw.FLUSH[_flush_tag(coop)](self.dev_comm, self.ctx)
 
     def flush_peer(self, peer, *, coop=CoopScope.WARP):
-        raw.cco_gda_flush_peer(self.dev_comm, self.ctx, peer, coop)
+        raw.FLUSH_PEER[_flush_tag(coop)](self.dev_comm, self.ctx, peer)
 
 
 @cco_struct

@@ -9,7 +9,7 @@ machinery):
   * :mod:`._bindings`  — 1:1 FFI prototypes for ``libmori_cco_device.bc``.
   * :mod:`._internal`  — the ``_ffi`` factory + ``cco_struct`` decorator.
   * :mod:`.handles`    — OO handles ``DevComm`` / ``Window`` / ``Gda`` and the
-                         ``CoopScope`` / ``SignalOp`` enums.
+                         ``CoopScope`` / ``SignalOp`` / ``ThreadMode`` enums.
 
 Example (inside ``@flyc.kernel``)::
 
@@ -21,7 +21,7 @@ Example (inside ``@flyc.kernel``)::
 """
 
 from mori.cco.device.bitcode import find_cco_bitcode, get_bitcode_path
-from .handles import DevComm, Window, Gda, CoopScope, SignalOp
+from .handles import DevComm, Window, Gda, CoopScope, SignalOp, ThreadMode
 from . import _bindings
 
 __all__ = [
@@ -30,6 +30,7 @@ __all__ = [
     "Gda",
     "CoopScope",
     "SignalOp",
+    "ThreadMode",
     "find_cco_bitcode",
     "get_bitcode_path",
     "_bindings",
