@@ -557,6 +557,20 @@ class CMakeBuild(build_ext):
         elif umbp_master_dst.exists():
             umbp_master_dst.unlink()
 
+        # CCO C++ examples: ship the built binaries when BUILD_EXAMPLES=ON. They
+        # carry an $ORIGIN/../.. rpath (set in examples/CMakeLists.txt) so they
+        # resolve libmori_*.so from site-packages/mori/ once installed here.
+        cco_examples_dst = root_dir / "python/mori/examples/cco"
+        for _exe in ("cco_lsa_put", "cco_gda_put"):
+            src = build_dir / "examples" / _exe
+            dst = cco_examples_dst / _exe
+            if build_examples.upper() == "ON" and src.exists():
+                cco_examples_dst.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+                os.chmod(dst, 0o755)
+            elif dst.exists():
+                dst.unlink()
+
         _copy_jit_sources(root_dir)
 
         if os.environ.get("MORI_SKIP_PRECOMPILE", "").lower() not in (
@@ -697,6 +711,7 @@ mori_package_data = [
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
     "tools/*.sh",
+    "examples/cco/*",  # CCO C++ example binaries (only present when BUILD_EXAMPLES=ON)
 ]
 if _env_flag("BUILD_UMBP_SPDK", "OFF"):
     mori_package_data.append("spdk_proxy")

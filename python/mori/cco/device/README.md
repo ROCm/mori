@@ -29,7 +29,7 @@ FlyDSL @flyc.kernel
 | How the `.bc` is built (JIT, per arch+NIC+cov) | `bitcode.py::_jit_compile` (reuses `mori.jit`) |
 | How to prebuild the `.bc` manually | `tools/build_cco_bitcode.sh` |
 | 2-node launcher | `tools/run_cco_flydsl_2node.sh` |
-| Runnable examples | `examples/cco/03..06_flydsl_*` |
+| Runnable examples | `examples/cco/python/03..06_flydsl_*` |
 
 ## Key design points
 
@@ -72,14 +72,14 @@ FlyDSL @flyc.kernel
 #    first use (cached in ~/.mori/jit, per arch+NIC+cov) — no manual build step.
 export PYTHONPATH=python MORI_SOCKET_IFNAME=lo
 export LD_LIBRARY_PATH=$(find build*/src -name '*.so' -printf '%h\n'|sort -u|tr '\n' ':')
-mpirun -np 2 python examples/cco/03_flydsl_put/main.py     # GDA: set MORI_CCO_GDA_CONN=full intra-node
+mpirun -np 2 python examples/cco/python/03_flydsl_put/main.py     # GDA: set MORI_CCO_GDA_CONN=full intra-node
 
 # (optional) prebuild the bitcode instead of JIT, or override the path:
 #   bash tools/build_cco_bitcode.sh         # -> lib/libmori_cco_device.bc
 #   export MORI_CCO_BC=/path/to/libmori_cco_device.bc
 
 # 4. two physical nodes (GDA, CROSSNODE)
-bash tools/run_cco_flydsl_2node.sh examples/cco/03_flydsl_put/main.py
+bash tools/run_cco_flydsl_2node.sh examples/cco/python/03_flydsl_put/main.py
 ```
 
 ## Adding a new device op (the path)

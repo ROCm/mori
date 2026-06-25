@@ -19,7 +19,7 @@ REMOTE="${REMOTE_HOST:-a07u25}"
 CONTAINER="${CONTAINER:-mori_cco_test}"
 IFACE="${IFACE:-enp159s0np0}"
 CONN="${MORI_CCO_GDA_CONN:-crossnode}"
-EXAMPLE="${1:-examples/cco/03_flydsl_put/main.py}"
+EXAMPLE="${1:-examples/cco/python/03_flydsl_put/main.py}"
 UID_FILE="$MORI/cco_flydsl_uid_$$.bin"
 LOG="/tmp/cco_flydsl_2node_$$"; mkdir -p "$LOG"
 

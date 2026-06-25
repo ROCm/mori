@@ -19,7 +19,7 @@ python/mori/umbp_master
 python/mori/spdk_proxy
 
 # local cco experiments (not for commit)
-examples/cco/_dump_*.py
+examples/cco/**/_dump_*.py
 
 .vscode
 *.log
