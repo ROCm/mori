@@ -112,8 +112,10 @@ mpirun --allow-run-as-root -n 2 ./build/examples/cco_gda_put
 The example binaries carry an `$ORIGIN/../..` rpath (for the installed location)
 plus the build-tree rpath, so they find `libmori_*.so` either way.
 
-For two physical nodes (real cross-node GDA), see
-`tools/run_cco_flydsl_2node.sh` (Python FlyDSL examples).
+For two physical nodes (real cross-node GDA), launch one rank per node with
+`MORI_CCO_GDA_CONN=crossnode`; rank 0 generates the cco `UniqueId` and shares it
+with the other rank out-of-band (MPI bcast, or write it to a file the other rank
+reads — see each example's bootstrap docstring).
 
 ---
 

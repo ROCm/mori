@@ -14,8 +14,8 @@ handle (``dc.ptr``); windows cross as their (already device) handles.
 Bootstrap (two modes):
   * MPI:   ``mpirun -n 2 python main.py``  (uses mpi4py to bcast the UniqueId)
   * env:   set ``CCO_RANK`` / ``CCO_WORLD`` / ``CCO_UID_FILE`` (rank 0 writes the
-           UniqueId bytes to the file; other ranks read it).  Used by the 2-node
-           launcher tools/run_cco_flydsl_2node.sh (no cross-host MPI needed).
+           UniqueId bytes to the file; other ranks read it).  Lets you bring up
+           two nodes without cross-host MPI (share the UniqueId file out-of-band).
 
 GDA connection type via ``MORI_CCO_GDA_CONN`` = ``crossnode`` (default; real
 2-node) or ``full`` (required when peers share a node, e.g. single-node 2-rank).

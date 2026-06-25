@@ -28,7 +28,6 @@ FlyDSL @flyc.kernel
 | How the `.bc` is located at runtime | `python/mori/cco/device/bitcode.py` (`find_cco_bitcode`) |
 | How the `.bc` is built (JIT, per arch+NIC+cov) | `bitcode.py::_jit_compile` (reuses `mori.jit`) |
 | How to prebuild the `.bc` manually | `tools/build_cco_bitcode.sh` |
-| 2-node launcher | `tools/run_cco_flydsl_2node.sh` |
 | Runnable examples | `examples/cco/python/03..06_flydsl_*` |
 
 ## Key design points
@@ -85,10 +84,9 @@ mpirun -n 2 python examples/cco/python/03_flydsl_put/main.py
 ```
 
 See [`examples/cco/README.md`](../../../../examples/cco/README.md) for the full
-run guide (Python + C++). To skip JIT, override with
-`MORI_CCO_BC=/path/to/libmori_cco_device.bc` or prebuild via
-`tools/build_cco_bitcode.sh`. Two physical nodes:
-`tools/run_cco_flydsl_2node.sh examples/cco/python/03_flydsl_put/main.py`.
+run guide (Python + C++), including the two-node (`crossnode`) setup. To skip
+JIT, override with `MORI_CCO_BC=/path/to/libmori_cco_device.bc` or prebuild via
+`tools/build_cco_bitcode.sh`.
 
 ## Adding a new device op (the path)
 
