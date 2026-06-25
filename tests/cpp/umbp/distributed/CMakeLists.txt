@@ -235,3 +235,21 @@ add_executable(bench_umbp_global_block_index_route_get
                bench_global_block_index_route_get.cpp)
 target_link_libraries(bench_umbp_global_block_index_route_get
                       PRIVATE umbp_common gtest_main)
+
+# Multi-client agent KV-event pressure bench: in-process master + N PoolClients
+# driving a put -> LLM-gap -> get schedule (--pattern broadcast|rotate),
+# comparing baseline / compressed-heartbeat / flush kv-event propagation under
+# varying QPS. Reads master per-RPC latency back from the master's own
+# Prometheus endpoint (--metrics-port).  Standalone executable; not a CTest
+# target.  Heartbeat interval is env-driven (UMBP_HEARTBEAT_TTL_SEC /
+# UMBP_HEARTBEAT_INTERVAL_DIVISOR); launch one process per scenario.
+add_executable(bench_umbp_agent_kvevent_pressure
+               bench_agent_kvevent_pressure.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(bench_umbp_agent_kvevent_pressure PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  bench_umbp_agent_kvevent_pressure
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
