@@ -583,22 +583,27 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
     int p2pWorldSize = static_cast<int>(sortedGroup.size());
 
     // Socket path must agree across the group but be unique per (group, window).
-    // groupId = rank 0's pid; slotOffset identifies the window.
-    std::string socketPath =
-        "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" + std::to_string(slotOffset) + "_";
+    // groupId = rank 0's pid; slotOffset identifies the window. The clique
+    // leader (smallest GLOBAL rank in the group) must also be part of the path:
+    // a single node can host several disjoint P2P cliques (e.g. GPUs {0,1,2,3}
+    // and {4,5,6,7}). Every clique shares groupId + slotOffset and renumbers its
+    // members to 0..k-1 internally, so without the leader the cliques would
+    // generate identical socket/barrier filenames and clobber each other's
+    // sockets (manifesting as ENOENT during connect).
+    std::string socketPath = "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" +
+                             std::to_string(slotOffset) + "_g" + std::to_string(sortedGroup[0]) +
+                             "_";
 
-    // Best-effort cleanup of stale sockets from crashed runs.
-    if (myPeerRank == 0) {
-      for (int i = 0; i < p2pWorldSize; i++) {
-        for (int j = 0; j < p2pWorldSize; j++) {
-          std::string stale = socketPath + std::to_string(i) + "_" + std::to_string(j);
-          unlink(stale.c_str());
-        }
-        unlink((socketPath + "barrier_arrive_" + std::to_string(i)).c_str());
-        unlink((socketPath + "barrier_depart_" + std::to_string(i)).c_str());
-      }
-    }
-
+    // NOTE: do NOT blanket-unlink every i_j socket here (even guarded by
+    // myPeerRank == 0). Ranks bind their server sockets as soon as they enter
+    // ExchangeFileDescriptors, and they may do so at very different times (e.g.
+    // single-process multi-thread, where threads serialize on HIP locks). A
+    // leader-side sweep can therefore delete a socket a peer has already bound
+    // and is listening on, making a client connect() fail with ENOENT. Stale
+    // sockets from a prior crashed run are instead handled per-pairing inside
+    // ExchangeFileDescriptors, which unlinks each server path right before
+    // binding it (and groupId/leader/slotOffset make cross-run collisions
+    // effectively impossible).
     application::LocalBootstrapNetwork localBoot(myPeerRank, p2pWorldSize, socketPath);
     localBoot.Initialize();
 
