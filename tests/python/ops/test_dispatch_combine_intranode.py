@@ -84,6 +84,8 @@ def _test_dispatch_combine(
     use_max_token_num=False,
     check_results=True,
     sentinel_pattern=None,
+    weightless=False,
+    expect_combine_kernel_substr=None,
 ):
     config = _make_intranode_config(
         rank=rank,
@@ -106,6 +108,8 @@ def _test_dispatch_combine(
         use_max_token_num=use_max_token_num,
         routing=routing,
         check_results=check_results,
+        weightless=weightless,
+        expect_combine_kernel_substr=expect_combine_kernel_substr,
     )
 
 
@@ -204,6 +208,64 @@ def test_dispatch_combine(
                     scale_dim,
                     scale_type_size,
                     quant_type,
+                ],
+            )
+        )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+# Exercises the fast fp8_blockwise weightless vec8 combine kernels, including the
+# topk=9 (AccumNum=9) shared-experts-fusion specialization. hidden_dim=7168 with the
+# default MORI_FP8_COMBINE_SCALE_DIM=56 yields block_elems=128, so the gate fires and
+# we assert the specialized kernel was actually selected (guards against silent
+# fallback to the generic path, which would produce identical weightless numbers).
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("data_type", (torch.bfloat16,))
+@pytest.mark.parametrize("hidden_dim", (7168,))
+@pytest.mark.parametrize("max_num_inp_token_per_rank", (128,))
+@pytest.mark.parametrize("num_experts_per_rank", (32,))
+@pytest.mark.parametrize("num_experts_per_token", (8, 9))
+@pytest.mark.parametrize("use_external_inp_buf", (True,))
+@pytest.mark.parametrize("quant_type", ("fp8_blockwise",))
+def test_dispatch_combine_weightless_vec8(
+    torch_dist_process_manager,
+    world_size,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    use_external_inp_buf,
+    quant_type,
+):
+    expect_combine_kernel_substr = (
+        "noweight_block128_vec8_top9"
+        if num_experts_per_token == 9
+        else "noweight_block128_vec8"
+    )
+    for i in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine,
+                [
+                    world_size,
+                    data_type,
+                    hidden_dim,
+                    max_num_inp_token_per_rank,
+                    num_experts_per_rank,
+                    num_experts_per_token,
+                    use_external_inp_buf,
+                    0,  # scale_dim
+                    1,  # scale_type_size
+                    quant_type,
+                    0,  # max_total_recv_tokens
+                    None,  # routing
+                    False,  # use_max_token_num
+                    True,  # check_results
+                    None,  # sentinel_pattern
+                    True,  # weightless
+                    expect_combine_kernel_substr,
                 ],
             )
         )
