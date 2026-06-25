@@ -65,22 +65,30 @@ FlyDSL @flyc.kernel
 
 ## Build & run
 
+Set up the environment with the `deploy-mori` skill (`.claude/skills/deploy-mori`),
+then install MORI and the example runtime deps:
+
 ```bash
-# 1. cco host extension must be built (PR #422); see python/mori/cco/
-
-# 2. run an example (one node, 2 ranks). The device bitcode is JIT-compiled on
-#    first use (cached in ~/.mori/jit, per arch+NIC+cov) — no manual build step.
-export PYTHONPATH=python MORI_SOCKET_IFNAME=lo
-export LD_LIBRARY_PATH=$(find build*/src -name '*.so' -printf '%h\n'|sort -u|tr '\n' ':')
-mpirun -np 2 python examples/cco/python/03_flydsl_put/main.py     # GDA: set MORI_CCO_GDA_CONN=full intra-node
-
-# (optional) prebuild the bitcode instead of JIT, or override the path:
-#   bash tools/build_cco_bitcode.sh         # -> lib/libmori_cco_device.bc
-#   export MORI_CCO_BC=/path/to/libmori_cco_device.bc
-
-# 4. two physical nodes (GDA, CROSSNODE)
-bash tools/run_cco_flydsl_2node.sh examples/cco/python/03_flydsl_put/main.py
+pip install .                          # builds + co-locates all libmori_*.so
+pip install mpi4py "flydsl==0.2.2"     # mpi4py: bootstrap; flydsl: the device bindings
 ```
+
+After `pip install .` no `PYTHONPATH` / `LD_LIBRARY_PATH` / `MORI_CCO_BC` is
+needed — the libs are co-located in `site-packages/mori/` (RUNPATH `$ORIGIN`) and
+the device bitcode is JIT-compiled on first use (cached in `~/.mori/jit`, per
+arch+NIC+cov). The only run-time env var is the RDMA interface:
+
+```bash
+export MORI_SOCKET_IFNAME=<iface>      # e.g. enp159s0np0
+export MORI_CCO_GDA_CONN=full          # required for GDA on a single node
+mpirun -n 2 python examples/cco/python/03_flydsl_put/main.py
+```
+
+See [`examples/cco/README.md`](../../../../examples/cco/README.md) for the full
+run guide (Python + C++). To skip JIT, override with
+`MORI_CCO_BC=/path/to/libmori_cco_device.bc` or prebuild via
+`tools/build_cco_bitcode.sh`. Two physical nodes:
+`tools/run_cco_flydsl_2node.sh examples/cco/python/03_flydsl_put/main.py`.
 
 ## Adding a new device op (the path)
 
@@ -114,10 +122,3 @@ The `_bindings.py` ↔ wrapper ABI is mechanical — it's the natural codegen ta
    co_names → cache-key self-recursion).
 4. A constant-count inner loop is lowered to dynamic `scf.for`; use
    `range_constexpr(N)` to unroll (e.g. peer accumulation in the all-reduce).
-
-## Known issue (not this integration)
-
-cco host `ccoCommDestroy` aborts at `src/cco/cco_init.cpp:372`
-(`hipMemAddressFree`) whenever windows were allocated — reproduces with pure
-host code, no FlyDSL. It fires *after* data verification, so it only eats the
-final "SUCCESS" print. Report to PR #422.
