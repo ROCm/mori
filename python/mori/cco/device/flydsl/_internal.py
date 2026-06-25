@@ -21,7 +21,12 @@ Two pieces:
 FlyDSL is required at import (the handles build ``fx.struct`` types).
 """
 
-import flydsl.expr as fx
+try:
+    import flydsl.expr as fx
+except ImportError as e:  # optional dependency
+    raise ImportError(
+        "cco FlyDSL bindings require FlyDSL. Install it with: pip install flydsl"
+    ) from e
 
 from mori.cco.device.bitcode import find_cco_bitcode
 

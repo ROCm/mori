@@ -21,7 +21,12 @@ one ``ccoGda<P>`` instantiation — no runtime dispatch. ``ThreadMode.AGGREGATE`
 is only valid with ``CoopScope.THREAD`` (cco coalesces the warp's lanes itself).
 """
 
-import flydsl.expr as fx
+try:
+    import flydsl.expr as fx
+except ImportError as e:  # optional dependency
+    raise ImportError(
+        "cco FlyDSL bindings require FlyDSL. Install it with: pip install flydsl"
+    ) from e
 
 from . import _bindings as raw
 from ._internal import cco_struct

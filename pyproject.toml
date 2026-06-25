@@ -24,6 +24,13 @@ license = "MIT"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+# FlyDSL device bindings (mori.cco.device.flydsl) are optional — only needed to
+# author/run cco GDA/LSA kernels from FlyDSL. Pinned to match the FlyDSL ABI the
+# device bitcode targets (see cov in mori.cco.device.bitcode). Install with:
+#   pip install amd_mori[flydsl]
+flydsl = ["flydsl==0.2.2"]
+
 [project.urls]
 Homepage = "https://github.com/ROCm/mori"
 Repository = "https://github.com/ROCm/mori"
