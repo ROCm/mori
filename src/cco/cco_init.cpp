@@ -19,8 +19,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
-// MIT License — see LICENSE for details.
 #include <unistd.h>
 
 #include <algorithm>
@@ -258,9 +256,8 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   allocProp.location.type = hipMemLocationTypeDevice;
   allocProp.location.id = comm->hipDev;
 
-  // RECOMMENDED granularity (typically 2 MiB on modern GPUs) trades a small
-  // amount of internal fragmentation for fewer page-table entries, matching
-  // CCO's "few large buffers" usage pattern.
+  // RECOMMENDED granularity: fewer page-table entries, matching CCO's
+  // few-large-buffers usage pattern.
   size_t granularity = 0;
   HIP_RUNTIME_CHECK(hipMemGetAllocationGranularity(&granularity, &allocProp,
                                                    hipMemAllocationGranularityRecommended));
@@ -755,9 +752,8 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   peerRkeys_host[rank] = localRkey;
   comm->bootNet->Allgather(&localRkey, peerRkeys_host.data(), sizeof(uint32_t));
 
-  // SDMA signal pool is per-DevComm, materialized by ccoDevCommCreate.
-  // WindowRegister no longer allocates SDMA state — kernels look up signals
-  // via devComm->sdma.
+  // SDMA signal pool is per-DevComm (materialized by ccoDevCommCreate); kernels
+  // look up signals via devComm->sdma.
 
   uint32_t* peerRkeys_gpu = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&peerRkeys_gpu, sizeof(uint32_t) * worldSize));
@@ -1261,7 +1257,6 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     HIP_RUNTIME_CHECK(hipMalloc(&sdma.peerSignalPtrs, sizeof(HSAuint64*) * comm->lsaSize));
     HIP_RUNTIME_CHECK(hipMemcpy(sdma.peerSignalPtrs, peerPtrs_host.data(),
                                 sizeof(HSAuint64*) * comm->lsaSize, hipMemcpyHostToDevice));
-    // handles / rawVas / peerPtrs_host destructed by std::vector RAII.
 
     sdma.deviceHandles = comm->sdmaDevHandles;
     MORI_SHMEM_TRACE(

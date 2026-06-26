@@ -419,8 +419,7 @@ __device__ inline ccoWindow_t findWindow(ccoDevComm* comm, const void* ptr) {
  *    ccoDevCommCreate(comm, &reqs, &devComm);
  * ──────────────────────────────────────────────────────────────────────────── */
 
-// Per-backend resource buffer reservation node. Currently declared as a Phase 2
-// scaffold; will be consumed when ccoLsa / ccoSdma / ccoLsaBarrierSession land.
+// Per-backend resource buffer reservation node.
 struct ccoDevResourceRequirements {
   ccoDevResourceRequirements* next;
   size_t bufferSize;
@@ -438,7 +437,7 @@ struct ccoDevCommRequirements {
   uint32_t magic;
   uint32_t version;
 
-  // Resource buffer linked list (Phase 2 scaffold).
+  // Resource buffer linked list.
   ccoDevResourceRequirements* resourceRequirementsList;
 
   // GDA (RDMA).
@@ -482,7 +481,8 @@ struct ccoDevCommRequirements {
   }
 
 /* ════════════════════════════════════════════════════════════════════════════
- *  Device-side API (cooperative groups, teams, LSA barrier session, GDA layer).
+ *  Device-side API (cooperative groups, teams, LSA barrier session). The GDA
+ *  device layer lives in cco_scale_out.hpp.
  *
  *  Guarded for device/kernel compilation: these use device-only builtins
  *  (threadIdx, __syncwarp, clock64, __threadfence_system, ...) that are not

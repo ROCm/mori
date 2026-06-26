@@ -36,7 +36,7 @@ def _jit_compile(cov: int) -> str | None:
     """Compile cco_device_wrapper.cpp to bitcode for the runtime arch+NIC (cached).
 
     Reuses mori.jit (same hipcc/opt/cache as shmem). Returns the path, or None if
-    JIT is unavailable (no source tree / hipcc). cco needs no shim, unlike shmem.
+    JIT is unavailable (no source tree / hipcc).
     """
     try:
         from mori.jit.config import detect_build_config, detect_nic_type, get_mori_source_root
