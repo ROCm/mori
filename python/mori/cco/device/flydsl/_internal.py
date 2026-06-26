@@ -17,8 +17,6 @@ Two pieces:
   implements ``__construct_from_ir_values__``, scf.if/for reconstruct the value
   as the *same* (method-augmented) class, so the handle keeps its behavior across
   control flow.
-
-FlyDSL is required at import (the handles build ``fx.struct`` types).
 """
 
 try:
