@@ -481,7 +481,8 @@ struct ccoDevCommRequirements {
   }
 
 /* ════════════════════════════════════════════════════════════════════════════
- *  Device-side API (cooperative groups, teams, LSA barrier session, GDA layer).
+ *  Device-side API (cooperative groups, teams, LSA barrier session). The GDA
+ *  device layer lives in cco_scale_out.hpp.
  *
  *  Guarded for device/kernel compilation: these use device-only builtins
  *  (threadIdx, __syncwarp, clock64, __threadfence_system, ...) that are not
