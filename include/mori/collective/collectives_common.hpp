@@ -22,9 +22,9 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 
 #include "mori/application/transport/sdma/anvil_device.hpp"
-#include "mori/core/transport/p2p/device_primitives.hpp"  // load<N>/store<N>, VecTypeSelector
 #include "mori/core/transport/sdma/device_primitives.hpp"
 
 // ---------------------------------------------------------------------------
@@ -34,10 +34,11 @@
 // ---------------------------------------------------------------------------
 
 #define GLOBAL_SPACE __attribute__((address_space(1)))
+#define USE_BUILTIN_NONTEMPORAL 0
 
 // Streaming (cache-bypassing) 16-byte load/store.
-#if (defined(__gfx942__) || defined(__gfx950__)) && \
-    __has_builtin(__builtin_amdgcn_global_load_b128) &&  \
+#if (defined(__gfx942__) || defined(__gfx950__)) &&     \
+    __has_builtin(__builtin_amdgcn_global_load_b128) && \
     __has_builtin(__builtin_amdgcn_global_store_b128)
 #elif defined(__HIP_DEVICE_COMPILE__)
 #error "Global b128 load/store not supported on this architecture"
@@ -46,11 +47,16 @@
 namespace mori {
 namespace collective {
 
-template <int Bytes>
-using TVecType = typename mori::core::VecTypeSelector<Bytes>::dataType;
-
-using V128 = __attribute__((__vector_size__(4 * sizeof(unsigned int)))) unsigned int;
+using V128 = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
 using V128_GLOBAL = GLOBAL_SPACE V128*;
+template <int VecBytes>
+using TVecType = std::conditional_t<
+    VecBytes == 1, uint8_t,
+    std::conditional_t<
+        VecBytes == 2, uint16_t,
+        std::conditional_t<VecBytes == 4, uint32_t,
+                           std::conditional_t<VecBytes == 8, uint64_t,
+                                              std::conditional_t<VecBytes == 16, V128, void>>>>>;
 
 template <typename T>
 __device__ __host__ inline static T* Tglobal(T* ptr) {
@@ -58,26 +64,44 @@ __device__ __host__ inline static T* Tglobal(T* ptr) {
 }
 
 template <int Bytes>
-__device__ __forceinline__ TVecType<Bytes> StreamLoad(const void* p) {
-  return mori::core::load<Bytes>(p);  // generic fallback (8/4/2/1 byte tails)
-}
-template <int Bytes>
-__device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v, bool isAgent = false) {
-  mori::core::store<Bytes>(p, v);
+__device__ __forceinline__ TVecType<Bytes> StreamLoad(const void* p, bool system_scope = true) {
+  static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
+                "StreamLoad supports 1/2/4/8/16 byte accesses");
+  auto ptr = Tglobal(reinterpret_cast<const TVecType<Bytes>*>(p));
+  if constexpr (Bytes == 16) {
+    if (system_scope) {
+      return __builtin_amdgcn_global_load_b128((V128_GLOBAL)p, "");
+    } else {
+      return __builtin_amdgcn_global_load_b128((V128_GLOBAL)p, "agent");
+    }
+  } else {
+#if USE_BUILTIN_NONTEMPORAL
+    return __builtin_nontemporal_load(ptr);
+#else
+    return __hip_atomic_load(ptr, __ATOMIC_RELAXED,
+                             system_scope ? __HIP_MEMORY_SCOPE_SYSTEM : __HIP_MEMORY_SCOPE_AGENT);
+#endif
+  }
 }
 
-template <>
-__device__ __forceinline__ TVecType<16> StreamLoad<16>(const void* p) {
-  V128 raw = __builtin_amdgcn_global_load_b128((V128_GLOBAL)p, "");
-  return __builtin_bit_cast(TVecType<16>, raw);
-}
-template <>
-__device__ __forceinline__ void StreamStore<16>(void* p, TVecType<16> v, bool isAgent) {
-  V128 raw = __builtin_bit_cast(V128, v);
-  if (isAgent) {
-    __builtin_amdgcn_global_store_b128((V128_GLOBAL)p, raw, "agent");
+template <int Bytes>
+__device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v, bool system_scope = true) {
+  static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
+                "StreamStore supports 1/2/4/8/16 byte accesses");
+  auto ptr = Tglobal(reinterpret_cast<TVecType<Bytes>*>(p));
+  if constexpr (Bytes == 16) {
+    if (system_scope) {
+      __builtin_amdgcn_global_store_b128((V128_GLOBAL)p, v, "");
+    } else {
+      __builtin_amdgcn_global_store_b128((V128_GLOBAL)p, v, "agent");
+    }
   } else {
-    __builtin_amdgcn_global_store_b128((V128_GLOBAL)p, raw, "");
+#if USE_BUILTIN_NONTEMPORAL
+    __builtin_nontemporal_store(v, ptr);
+#else
+    __hip_atomic_store(ptr, v, __ATOMIC_RELAXED,
+                       system_scope ? __HIP_MEMORY_SCOPE_SYSTEM : __HIP_MEMORY_SCOPE_AGENT);
+#endif
   }
 }
 
@@ -99,8 +123,8 @@ struct SdmaCollectiveHandle : anvil::SdmaQueueDeviceHandle {
     size_t i = 0;
 #pragma unroll
     for (; i + 4 <= numDwords; i += 4) {
-      StreamStore<16>(queueBuf + base_index_in_dwords + i, 
-                   *reinterpret_cast<TVecType<16>*>(packetPtr + i), true);
+      StreamStore<16>(queueBuf + base_index_in_dwords + i,
+                      *reinterpret_cast<TVecType<16>*>(packetPtr + i), false);
     }
 #pragma unroll
     for (; i < numDwords; i++) {
@@ -178,24 +202,23 @@ inline __device__ void SdmaPutWarpFusedS(void* srcBase, void* dstBase, size_t sl
     char* d = reinterpret_cast<char*>(dstBase) + lane * sliceBytes;
     size_t sz = (lane == S - 1) ? lastSliceBytes : sliceBytes;
     SDMA_PKT_COPY_WITH_ATOMIC packet = {
-      .copy = anvil::CreateCopyPacket(s, d, sz),
-      .atomic = anvil::CreateAtomicAddPacket(signalsBase + lane, addVal)
-    };
+        .copy = anvil::CreateCopyPacket(s, d, sz),
+        .atomic = anvil::CreateAtomicAddPacket(signalsBase + lane, addVal)};
     handle.placePacketAt(packet, startBase + offset + lane * pkt);
   }
   // Reconverge so all lanes have issued their stores before lane 0 submits; the
   // s_waitcnt(0) inside submitPacket then drains the wave-shared vmcnt for them all.
   __syncwarp();
-  if (lane == 0) handle.submitPacket(startBase, startBase + offset + static_cast<uint64_t>(pkt) * S);
+  if (lane == 0)
+    handle.submitPacket(startBase, startBase + offset + static_cast<uint64_t>(pkt) * S);
 }
-
 
 // Multi-producer-safe single-thread put: copy packet + completion atomic.
 //
 // Unlike SdmaPutThread, this reserves space for BOTH packets in ONE
 // ReserveQueueSpace call and writes them with ONE placePacket call, so the
 // producer's reserved range [startBase, pendingWptr) is a single contiguous
-// block. 
+// block.
 inline __device__ void SdmaPutThreadFused(void* srcBuf, void* dstBuf, size_t copy_size,
                                           anvil::SdmaQueueDeviceHandle** deviceHandles,
                                           HSAuint64* signals, uint32_t queNum, uint32_t qId,
@@ -208,9 +231,9 @@ inline __device__ void SdmaPutThreadFused(void* srcBuf, void* dstBuf, size_t cop
     SDMA_PKT_COPY_LINEAR copy;
     SDMA_PKT_ATOMIC atomic;
   };
-  static_assert(sizeof(SDMA_PKT_COPY_WITH_ATOMIC) ==
-                  sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC),
-              "combined SDMA copy+atomic packet must be tightly packed");
+  static_assert(
+      sizeof(SDMA_PKT_COPY_WITH_ATOMIC) == sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC),
+      "combined SDMA copy+atomic packet must be tightly packed");
   uint64_t offset = 0;
   char* srcPtr = reinterpret_cast<char*>(srcBuf);
   char* dstPtr = reinterpret_cast<char*>(dstBuf);
