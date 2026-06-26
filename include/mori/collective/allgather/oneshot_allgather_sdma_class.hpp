@@ -237,8 +237,16 @@ class AllgatherSdma {
   void resetFlags();
 
   int64_t prepare_sync(T* input, T* output, size_t total_count, hipStream_t stream);
+  int64_t prepare_sync_param_contiguous(T* input, T* output, size_t total_count,
+                                        const size_t* split_sizes,
+                                        const size_t* split_offsets, size_t split_count,
+                                        hipStream_t stream);
   double finish_sync(T* output, size_t total_count, hipStream_t stream);
   int64_t prepare_async_start(T* input, T* output, size_t total_count, hipStream_t stream);
+  int64_t prepare_async_start_param_contiguous(T* input, T* output, size_t total_count,
+                                               const size_t* split_sizes,
+                                               const size_t* split_offsets, size_t split_count,
+                                               hipStream_t stream);
   void after_async_start();
   int64_t prepare_async_wait(hipStream_t stream);
   double finish_async_wait(hipStream_t stream);

@@ -92,6 +92,58 @@ __global__ void OneShotAllGatherSdmaAsyncPutKernel(int myPe, int npes, T* input,
                                              elementCount, dstBaseOffset);
 }
 
+template <typename T>
+__device__ void OneShotAllGatherSdmaParamContiguousAsyncPutKernel_body(
+    int myPe, int npes, T* input, const application::SymmMemObjPtr srcMemObj,
+    const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
+    size_t elementCount, size_t dstBaseOffset, const size_t* splitSizes,
+    const size_t* splitOffsets, size_t splitCount) {
+  if (elementCount == 0 || npes <= 0 || splitCount == 0) {
+    return;
+  }
+
+  const size_t threadLinearId =
+      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  int warpId = threadLinearId / warpSize;
+  const int laneId = threadIdx.x % warpSize;
+  const size_t bytesPerElement = sizeof(T);
+
+  if (warpId < npes && laneId == 0) {
+    int remotePe = warpId;
+    application::SymmMemObjPtr dest = dstMemObj;
+    anvil::SdmaQueueDeviceHandle** devicehandles =
+        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
+    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
+
+    for (size_t split = 0; split < splitCount; ++split) {
+      size_t splitElems = splitSizes[split];
+      if (splitElems == 0) {
+        continue;
+      }
+      size_t inputElemOffset = splitOffsets[split];
+      size_t outputElemOffset = splitOffsets[split] * static_cast<size_t>(npes) +
+                                static_cast<size_t>(myPe) * splitElems;
+      uint8_t* srcPtr = reinterpret_cast<uint8_t*>(input) + inputElemOffset * bytesPerElement;
+      uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset +
+                        outputElemOffset * bytesPerElement;
+      core::SdmaPutThread(srcPtr, dstPtr, splitElems * bytesPerElement, devicehandles, signals,
+                          expectedSignals, dest->sdmaNumQueue, 0);
+    }
+  }
+}
+
+template <typename T>
+__global__ void OneShotAllGatherSdmaParamContiguousAsyncPutKernel(
+    int myPe, int npes, T* input, const application::SymmMemObjPtr srcMemObj,
+    const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
+    size_t elementCount, size_t dstBaseOffset = 0, const size_t* splitSizes = nullptr,
+    const size_t* splitOffsets = nullptr, size_t splitCount = 0) {
+  OneShotAllGatherSdmaParamContiguousAsyncPutKernel_body<T>(
+      myPe, npes, input, srcMemObj, dstMemObj, flagsMemObj, elementCount, dstBaseOffset,
+      splitSizes, splitOffsets, splitCount);
+}
+
 __device__ void OneShotAllGatherSdmaAsyncWaitKernel_body(
     int myPe, int npes, const application::SymmMemObjPtr dstMemObj,
     const application::SymmMemObjPtr flagsMemObj, uint64_t flagVal = 1) {

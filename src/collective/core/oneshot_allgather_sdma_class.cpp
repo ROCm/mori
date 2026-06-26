@@ -26,10 +26,16 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {
 namespace collective {
+namespace {
+bool IsShmemInitialized() {
+  return shmem::ShmemStatesSingleton::GetInstance()->status == shmem::ShmemStatesStatus::Initialized;
+}
+}  // namespace
 #if 0
 // Implementation of ShmemDeleter::operator()
 void ShmemDeleter::operator()(void* ptr) const {
@@ -126,6 +132,13 @@ template <typename T>
 AllgatherSdma<T>::~AllgatherSdma() {
   if (async_in_progress_) {
     cancel_async();
+  }
+  if (!IsShmemInitialized()) {
+    registered_output_buffers_.clear();
+    flags_.release();
+    input_transit_buffer_ptr_.release();
+    output_transit_buffer_ptr_.release();
+    return;
   }
   for (auto& [addr, entry] : registered_output_buffers_) {
     shmem::ShmemSymmetricDeregister(reinterpret_cast<void*>(addr), entry.size);
@@ -389,6 +402,34 @@ int64_t AllgatherSdma<T>::prepare_sync(T* input, T* output, size_t total_count,
   jit_args_.elementCount = total_count;
   jit_args_.dstBaseOffset = direct ? byteOffset : 0;
   jit_args_.flagVal = flag_token;
+  jit_args_.splitSizes = nullptr;
+  jit_args_.splitOffsets = nullptr;
+  jit_args_.splitCount = 0;
+
+  return (int64_t)&jit_args_;
+}
+
+template <typename T>
+int64_t AllgatherSdma<T>::prepare_sync_param_contiguous(
+    T* input, T* output, size_t total_count, const size_t* split_sizes,
+    const size_t* split_offsets, size_t split_count, hipStream_t stream) {
+  (void)stream;
+  uint64_t flag_token = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+  auto [regObj, byteOffset] = find_registered(output);
+  bool direct = regObj.IsValid();
+
+  jit_args_.myPe = myPe_;
+  jit_args_.npes = npes_;
+  jit_args_.input = input;
+  jit_args_.srcMemObj = input_transit_buffer_obj_;
+  jit_args_.dstMemObj = direct ? regObj : output_transit_buffer_obj_;
+  jit_args_.flagsMemObj = flagsObj_;
+  jit_args_.elementCount = total_count;
+  jit_args_.dstBaseOffset = direct ? byteOffset : 0;
+  jit_args_.flagVal = flag_token;
+  jit_args_.splitSizes = split_sizes;
+  jit_args_.splitOffsets = split_offsets;
+  jit_args_.splitCount = split_count;
 
   return (int64_t)&jit_args_;
 }
@@ -451,6 +492,46 @@ int64_t AllgatherSdma<T>::prepare_async_start(T* input, T* output, size_t total_
   jit_args_.elementCount = total_count;
   jit_args_.dstBaseOffset = direct ? byteOffset : 0;
   jit_args_.flagVal = async_flag_token_;
+  jit_args_.splitSizes = nullptr;
+  jit_args_.splitOffsets = nullptr;
+  jit_args_.splitCount = 0;
+
+  return (int64_t)&jit_args_;
+}
+
+template <typename T>
+int64_t AllgatherSdma<T>::prepare_async_start_param_contiguous(
+    T* input, T* output, size_t total_count, const size_t* split_sizes,
+    const size_t* split_offsets, size_t split_count, hipStream_t stream) {
+  bool expected = false;
+  if (!async_in_progress_.compare_exchange_strong(expected, true)) {
+    throw std::runtime_error("Another async operation is already in progress");
+  }
+
+  async_input_ = input;
+  async_output_ = output;
+  async_total_count_ = total_count;
+  async_stream_ = stream;
+  async_start_time_ = CollectiveWallTime();
+  async_flag_token_ = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  auto [regObj, byteOffset] = find_registered(output);
+  bool direct = regObj.IsValid();
+  auto& dst_obj = direct ? regObj : output_transit_buffer_obj_;
+  async_dst_obj_ = dst_obj;
+
+  jit_args_.myPe = myPe_;
+  jit_args_.npes = npes_;
+  jit_args_.input = input;
+  jit_args_.srcMemObj = input_transit_buffer_obj_;
+  jit_args_.dstMemObj = dst_obj;
+  jit_args_.flagsMemObj = flagsObj_;
+  jit_args_.elementCount = total_count;
+  jit_args_.dstBaseOffset = direct ? byteOffset : 0;
+  jit_args_.flagVal = async_flag_token_;
+  jit_args_.splitSizes = split_sizes;
+  jit_args_.splitOffsets = split_offsets;
+  jit_args_.splitCount = split_count;
 
   return (int64_t)&jit_args_;
 }
@@ -474,6 +555,9 @@ int64_t AllgatherSdma<T>::prepare_async_wait(hipStream_t stream) {
   jit_args_.elementCount = 0;
   jit_args_.dstBaseOffset = 0;
   jit_args_.flagVal = async_flag_token_;
+  jit_args_.splitSizes = nullptr;
+  jit_args_.splitOffsets = nullptr;
+  jit_args_.splitCount = 0;
 
   return (int64_t)&jit_args_;
 }
