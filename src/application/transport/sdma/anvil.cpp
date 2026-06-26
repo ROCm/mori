@@ -182,10 +182,10 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   // TODO needed here?
   memset(&queue_, 0, sizeof(HsaQueueResource));
 
-  CHECK_HSAKMT_SUCCESS(hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID,
-                                            100, HSA_QUEUE_PRIORITY_MAXIMUM, engineId,
-                                            queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
-                       "Failed");
+  CHECK_HSAKMT_SUCCESS(
+      hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
+                           engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
+      "Failed");
 
   // Populate Device Handle
   // TODO uncached
@@ -262,7 +262,6 @@ void AnvilLib::init() {
 }
 
 bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
-
   std::lock_guard<std::mutex> lock(channels_mutex_);
   // Spread the channels across the engines recommended for this peer link. On
   // MI350 the mask typically reports 2 engines per peer; on platforms with a
@@ -288,8 +287,8 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
   auto key = std::make_pair(srcDeviceId, dstDeviceId);
   for (int c = 0; c < numChannels; ++c) {
     uint32_t engineId = engines[c % numEngines];
-    sdma_channels_[key].emplace_back(std::make_unique<SdmaQueue>(
-                 srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
+    sdma_channels_[key].emplace_back(
+        std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
   }
   return true;
 }
@@ -301,12 +300,10 @@ uint32_t AnvilLib::getNodeId(int deviceId) {
 }
 
 uint32_t AnvilLib::getRecommendedEngineMask(int srcDeviceId, int dstDeviceId) {
-  uint32_t srcNode = getNodeId(srcDeviceId),
-           dstNode = getNodeId(dstDeviceId);
+  uint32_t srcNode = getNodeId(srcDeviceId), dstNode = getNodeId(dstDeviceId);
 
   HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || 
-                              props.NumIOLinks == 0) {
+  if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0) {
     return 0;
   }
 

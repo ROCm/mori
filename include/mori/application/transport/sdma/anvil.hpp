@@ -120,8 +120,7 @@ class AnvilLib {
 
   std::once_flag init_flag;
   std::mutex channels_mutex_;
-  std::unordered_map<std::pair<int, int>, SdmaQueueVector, PairHash>
-      sdma_channels_;
+  std::unordered_map<std::pair<int, int>, SdmaQueueVector, PairHash> sdma_channels_;
 };
 
 extern AnvilLib& anvil;
