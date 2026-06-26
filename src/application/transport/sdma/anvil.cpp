@@ -29,11 +29,10 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 
-#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
-#include <set>
 #include <stdexcept>
 namespace anvil {
 
