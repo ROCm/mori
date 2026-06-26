@@ -571,6 +571,19 @@ class CMakeBuild(build_ext):
             elif dst.exists():
                 dst.unlink()
 
+        # CCO benchmarks: same pattern, gated on BUILD_BENCHMARK=ON.
+        cco_bench_dst = root_dir / "python/mori/benchmarks/cco"
+        for _exe in ("cco_p2p_put_bw", "cco_p2p_put_latency",
+                     "cco_p2p_get_bw", "cco_p2p_get_latency"):
+            src = build_dir / "benchmark" / _exe
+            dst = cco_bench_dst / _exe
+            if build_benchmark.upper() == "ON" and src.exists():
+                cco_bench_dst.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+                os.chmod(dst, 0o755)
+            elif dst.exists():
+                dst.unlink()
+
         _copy_jit_sources(root_dir)
 
         if os.environ.get("MORI_SKIP_PRECOMPILE", "").lower() not in (
@@ -712,6 +725,7 @@ mori_package_data = [
     "ops/tuning_configs/*.json",
     "tools/*.sh",
     "examples/cco/*",  # CCO C++ example binaries (only present when BUILD_EXAMPLES=ON)
+    "benchmarks/cco/*",  # CCO benchmark binaries (only present when BUILD_BENCHMARK=ON)
 ]
 if _env_flag("BUILD_UMBP_SPDK", "OFF"):
     mori_package_data.append("spdk_proxy")
