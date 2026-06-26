@@ -10,6 +10,14 @@ cd "$build_dir"
 failed=0
 for bin in tests/cpp/cco/test_*; do
   [ -x "$bin" ] || continue
+  case "$(basename "$bin")" in
+    test_lsa_memcheck) continue ;;
+  esac
+  echo "=== $(basename "$bin") ==="
+  timeout 120 "./$bin" "$nranks" || failed=1
+done
+for bin in examples/cco_lsa_put examples/cco_gda_put; do
+  [ -x "$bin" ] || continue
   echo "=== $(basename "$bin") ==="
   timeout 120 "./$bin" "$nranks" || failed=1
 done

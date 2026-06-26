@@ -92,12 +92,18 @@ RUN set -ex && \
     else \
         apt-get update && \
         apt-get install -y --no-install-recommends \
-            libelf-dev libdrm-amdgpu-dev xxd pkg-config rocm-llvm-dev && \
+            libelf-dev xxd pkg-config rocm-llvm-dev && \
         rm -rf /var/lib/apt/lists/* && \
         LIBHSA_TARGET=$(basename $(readlink -f /opt/rocm/lib/libhsa-runtime64.so.1)) && \
         echo "Patching libhsa-runtime64.so on ROCm ${ROCM_VER}, target=${LIBHSA_TARGET}" && \
         git clone --depth 1 --branch develop --quiet \
             https://github.com/ROCm/rocm-systems.git /tmp/rocm-systems && \
+        sed -i 's/;gfx1200;gfx1250//' \
+            /tmp/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/trap_handler/CMakeLists.txt && \
+        sed -i 's/;_gfx12;_gfx12//' \
+            /tmp/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/trap_handler/CMakeLists.txt && \
+        sed -i 's/kCodeTrapHandlerV2_1250/kCodeTrapHandlerV2_11/g; s/kCodeTrapHandlerV2_12/kCodeTrapHandlerV2_11/g' \
+            /tmp/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp && \
         mkdir /tmp/rocm-systems/projects/rocr-runtime/build && \
         cd /tmp/rocm-systems/projects/rocr-runtime/build && \
         cmake -DCMAKE_PREFIX_PATH=/opt/rocm \
