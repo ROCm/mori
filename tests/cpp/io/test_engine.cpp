@@ -263,6 +263,17 @@ void CaseNotificationCompletionFanIn() {
   }
   Require(status.Succeeded(), "final notification completion should finish transfer");
 
+  TransferStatus outOfOrderStatus;
+  outOfOrderStatus.SetCode(StatusCode::IN_PROGRESS);
+  auto outOfOrderMeta = std::make_shared<CqCallbackMeta>(&outOfOrderStatus, 44, 5);
+  (void)outOfOrderMeta->finishedBatchSize.fetch_add(2);  // notification SEND CQEs first
+  finishedBefore = outOfOrderMeta->finishedBatchSize.fetch_add(3);
+  if (finishedBefore + 3 == outOfOrderMeta->totalBatchSize) {
+    outOfOrderStatus.Update(StatusCode::SUCCESS, "data complete after notification");
+  }
+  Require(outOfOrderStatus.Succeeded(),
+          "notification-first completion order must still finish at the exact total");
+
   TransferStatus failedStatus;
   failedStatus.SetCode(StatusCode::IN_PROGRESS);
   auto failedMeta = std::make_shared<CqCallbackMeta>(&failedStatus, 43, 2);

@@ -370,8 +370,7 @@ static void ResetMergedWorkRequestPointers(MergedWorkRequest* wr) {
 /*                                         Rdma Utilities                                         */
 /* ---------------------------------------------------------------------------------------------- */
 
-RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps,
-                             std::shared_ptr<CqCallbackMeta> callbackMeta,
+RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, std::shared_ptr<CqCallbackMeta> callbackMeta,
                              TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
 
@@ -687,8 +686,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     if (mergedWrCount > static_cast<size_t>(std::numeric_limits<int>::max())) {
       return {StatusCode::ERR_INVALID_ARGS, "final WR count exceeds int range"};
     }
+    const int notifBatchSize =
+        std::max(0, callbackMeta->totalBatchSize - static_cast<int>(batchSize));
     for (size_t k = 0; k < mergedWrCount; ++k) mergedWrs[k].mergedRequests = 1;
-    callbackMeta->totalBatchSize = static_cast<int>(mergedWrCount);
+    callbackMeta->totalBatchSize = static_cast<int>(mergedWrCount) + notifBatchSize;
   }
 
   size_t epNum = eps.size();

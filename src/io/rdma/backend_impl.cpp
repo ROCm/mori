@@ -1245,8 +1245,8 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
   const int notifBatchSize = config.enableNotification ? static_cast<int>(eps.size()) : 0;
-  auto callbackMeta = std::make_shared<CqCallbackMeta>(
-      status, id, static_cast<int>(sizes.size()) + notifBatchSize);
+  auto callbackMeta =
+      std::make_shared<CqCallbackMeta>(status, id, static_cast<int>(sizes.size()) + notifBatchSize);
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
   RdmaOpRet ret;
   if (executor) {
