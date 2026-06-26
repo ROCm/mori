@@ -354,9 +354,22 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
         assert(false);
         break;
       }
+      // The CQE only carries the low 16 bits of the completion counter, so rebuild
+      // the full 32-bit value as cons + (forward 16-bit distance from cons to the
+      // CQE). Only trust that distance if it lands within the genuinely in-flight
+      // range (cons, dbTouchIdx]; anything past dbTouchIdx is a stale/torn read and
+      // is ignored. This advances correctly across 16-bit wraps and never reports
+      // more completions than were doorbelled. window is signed: when doneIdx has
+      // caught up to dbTouchIdx it is <= 0, which rejects every delta.
       uint16_t comp16 = static_cast<uint16_t>(wqeCounter + 1);
-      uint32_t completed = (cons & ~0xffffu) | comp16;
-      if (completed < cons) completed += 0x10000u;
+      uint16_t delta = static_cast<uint16_t>(comp16 - static_cast<uint16_t>(cons));
+      uint32_t dbTouched =
+          __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      int32_t window = static_cast<int32_t>(dbTouched - cons);
+      uint32_t completed = cons;
+      if (delta != 0 && static_cast<int32_t>(delta) <= window) {
+        completed = cons + delta;
+      }
       __hip_atomic_fetch_max(&wq->doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       asm volatile("" ::: "memory");
     }

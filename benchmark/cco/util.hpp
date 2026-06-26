@@ -55,7 +55,7 @@ enum class Transport { kLsa, kIbgda };
 inline constexpr std::size_t kDefaultMinSize = 8;
 inline constexpr std::size_t kDefaultMaxSize = 64ULL * 1024ULL * 1024ULL;
 inline constexpr std::size_t kDefaultStepFactor = 2;
-inline constexpr std::size_t kDefaultIters = 10;
+inline constexpr std::size_t kDefaultIters = 100;
 inline constexpr std::size_t kDefaultWarmup = 5;
 inline constexpr int kDefaultNumBlocks = 32;
 inline constexpr int kDefaultThreadsPerBlock = 256;
