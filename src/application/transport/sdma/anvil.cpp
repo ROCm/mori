@@ -222,8 +222,11 @@ SdmaQueue::~SdmaQueue() try {
   CHECK_HIP_ERROR(hipFree(committedWptr_));
   CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(queueBuffer_), "Failed");
   CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(queueBuffer_, SDMA_QUEUE_SIZE), "Failed");
-} catch (const std::exception&e) {
+} catch (const std::exception& e) {
   std::cerr << "Exception in ~SdmaQueue(): " << e.what() << std::endl;
+  std::exit(EXIT_FAILURE);
+} catch (...) {
+  std::cerr << "Unknown exception in ~SdmaQueue()" << std::endl;
   std::exit(EXIT_FAILURE);
 }
 
