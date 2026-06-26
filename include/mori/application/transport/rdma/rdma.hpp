@@ -88,6 +88,8 @@ struct RdmaEndpointConfig {
                           // be large, e.g. notification)
   uint32_t maxCqeNum{128};
   uint32_t maxMsgSge{1};
+  uint32_t maxInlineData{0};  // SEND inline capacity; required by providers (e.g. bnxt_re)
+                              // for IBV_SEND_INLINE
   uint32_t alignment{PAGESIZE};
   bool onGpu{false};
   bool withCompChannel{false};
