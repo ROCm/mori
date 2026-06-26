@@ -25,6 +25,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <iterator>
 #include <set>
 #include <system_error>
@@ -379,9 +380,31 @@ grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
   return grpc::Status::OK;
 }
 
+namespace {
+// Auto-flush the heartbeat once this many KvEvents accumulate at the peer, so a
+// completed batch of puts becomes visible at the master without the application
+// calling FlushHeartbeat().  Defaults to one typical put batch (128 keys).  An
+// unset / unparseable / zero value falls back to the default; to make auto-flush
+// effectively never trigger, set it to a very large number.
+size_t AutoFlushEventThreshold() {
+  static const size_t v = [] {
+    const char* e = std::getenv("UMBP_AUTO_FLUSH_EVENT_THRESHOLD");
+    if (e == nullptr) return size_t{128};
+    char* end = nullptr;
+    unsigned long long n = std::strtoull(e, &end, 10);
+    if (end == e || n == 0) return size_t{128};
+    return static_cast<size_t>(n);
+  }();
+  return v;
+}
+}  // namespace
+
 void MasterClient::SetPeerDramAllocator(PeerDramAllocator* dram_alloc) {
   peer_alloc_ = dram_alloc;
   AddOwnedLocationSource(dram_alloc);
+  if (dram_alloc != nullptr) {
+    dram_alloc->SetAutoFlushHook(AutoFlushEventThreshold(), [this] { FlushHeartbeat(); });
+  }
 }
 
 void MasterClient::SetPeerSsdManager(PeerSsdManager* ssd_manager) {
@@ -545,7 +568,7 @@ bool MasterClient::SendFullSyncHeartbeatLocked(const std::map<TierType, TierCapa
     snapshot.seq = next_bundle_seq_ - 1;
     req.set_delta_seq_baseline(snapshot.seq);
   }
-  snapshot.events = SnapshotAllSources(owned_sources_);
+  snapshot.events = SnapshotAllSourcesForFullSync(owned_sources_);
   FillBundle(req.add_bundles(), snapshot);
 
   ::umbp::HeartbeatResponse resp;
