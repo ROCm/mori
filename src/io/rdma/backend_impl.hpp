@@ -90,6 +90,7 @@ class RdmaManager {
   int CountEndpoint(EngineKey, TopoKeyPair);
   EpPairVec GetAllEndpoint(EngineKey, TopoKeyPair);
   application::RdmaEndpoint CreateEndpoint(int devId);
+  bool DestroyEndpointNoThrow(int devId, const application::RdmaEndpoint& ep) noexcept;
   EndpointId ConnectEndpoint(EngineKey remoteKey, int ldevId, application::RdmaEndpoint local,
                              int rdevId, application::RdmaEndpointHandle remote, TopoKeyPair key,
                              int weight);
@@ -234,6 +235,7 @@ class ControlPlaneServer {
  private:
   void AcceptRemoteEngineConn();
   void HandleControlPlaneProtocol(int fd);
+  void DropConnection(int fd) noexcept;
 
  private:
   EngineKey myEngKey;
