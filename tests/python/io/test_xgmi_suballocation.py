@@ -100,7 +100,9 @@ def _worker(rank, world_size, master_port, result_queue):
             set_log_level("info")
             device = torch.device("cuda", rank)
 
-            engine = IOEngine(key=f"xgmi_suballoc_{rank}", config=IOEngineConfig(host="", port=0))
+            engine = IOEngine(
+                key=f"xgmi_suballoc_{rank}", config=IOEngineConfig(host="", port=0)
+            )
             engine.create_backend(BackendType.XGMI, XgmiBackendConfig())
             engine.register_remote_engine(
                 EngineDesc.unpack(_exchange(engine.get_engine_desc().pack(), rank))
