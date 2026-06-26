@@ -738,13 +738,33 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         struct ibv_recv_wr* bad = nullptr;
         SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
       } else if (wc[i].opcode == IBV_WC_SEND) {
-        if (!IsNotifSendWrId(wc[i].wr_id)) {
-          MORI_IO_WARN(
-              "ProcessOneCqe: unexpected SEND completion with non-notification wr_id {}; "
-              "releasing 1 sqDepth under current SEND invariant",
-              wc[i].wr_id);
+        if (IsNotifSendWrId(wc[i].wr_id)) {
+          // Backward-compatible handling for any notification SENDs posted by
+          // older code that used tagged transfer IDs instead of ledger records.
+          if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
+        } else {
+          int mergedBatchSize = 0;
+          auto meta = ep.ledger
+                          ? ep.ledger->ReleaseByCqe(wc[i].wr_id, ep.sqDepth.get(), &mergedBatchSize)
+                          : nullptr;
+          if (meta) {
+            uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
+            TransferStatus* statusPtr = meta->status;
+            if (statusPtr != nullptr &&
+                (finishedBefore + mergedBatchSize) == meta->totalBatchSize) {
+              statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+            }
+            MORI_IO_TRACE(
+                "ProcessOneCqe: notification SEND CQE for task {} total={} finished={} cur={}",
+                meta->id, meta->totalBatchSize, finishedBefore, mergedBatchSize);
+          } else {
+            MORI_IO_WARN(
+                "ProcessOneCqe: notification SEND CQE has no ledger record for wr_id {}; "
+                "releasing 1 sqDepth under fallback path",
+                wc[i].wr_id);
+            if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
+          }
         }
-        if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
       } else {
         // Batch path: wr_id carries a recordId from the SubmissionLedger.
         uint64_t recordId = wc[i].wr_id;
@@ -1198,7 +1218,8 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
-  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
+  const int notifBatchSize = config.enableNotification ? static_cast<int>(eps.size()) : 0;
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1 + notifBatchSize);
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
 
   RdmaOpRet ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, {localOffset},
@@ -1211,7 +1232,7 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
     status->Update(ret.code, ret.message);
   }
   if (!ret.Failed() && config.enableNotification) {
-    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
+    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, callbackMeta, id);
     if (notifRet.Failed()) {
       status->Update(notifRet.code, notifRet.message);
     }
@@ -1223,7 +1244,9 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
                                         TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
-  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, sizes.size());
+  const int notifBatchSize = config.enableNotification ? static_cast<int>(eps.size()) : 0;
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(
+      status, id, static_cast<int>(sizes.size()) + notifBatchSize);
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
   RdmaOpRet ret;
   if (executor) {
@@ -1241,7 +1264,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     status->Update(ret.code, ret.message);
   }
   if (!ret.Failed() && config.enableNotification) {
-    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
+    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, callbackMeta, id);
     if (notifRet.Failed()) {
       status->Update(notifRet.code, notifRet.message);
     }

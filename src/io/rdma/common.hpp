@@ -242,7 +242,9 @@ struct RdmaOpRet {
   bool Failed() { return code > StatusCode::ERR_BEGIN; }
 };
 
-RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps,
+                             std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id);
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                              const std::vector<application::RdmaMemoryRegion>& localMrPerEp,

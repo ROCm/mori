@@ -246,6 +246,35 @@ void CaseSubmissionLedgerBasic() {
   Require(sqDepth2.load(std::memory_order_relaxed) == 5, "sq depth after posted CQE release");
 }
 
+void CaseNotificationCompletionFanIn() {
+  TransferStatus status;
+  status.SetCode(StatusCode::IN_PROGRESS);
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 42, 3);
+
+  uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(2);
+  if (finishedBefore + 2 == meta->totalBatchSize) {
+    status.Update(StatusCode::SUCCESS, "data complete");
+  }
+  Require(status.InProgress(), "data completion must not finish before notification SEND CQE");
+
+  finishedBefore = meta->finishedBatchSize.fetch_add(1);
+  if (finishedBefore + 1 == meta->totalBatchSize) {
+    status.Update(StatusCode::SUCCESS, "notification complete");
+  }
+  Require(status.Succeeded(), "final notification completion should finish transfer");
+
+  TransferStatus failedStatus;
+  failedStatus.SetCode(StatusCode::IN_PROGRESS);
+  auto failedMeta = std::make_shared<CqCallbackMeta>(&failedStatus, 43, 2);
+  (void)failedMeta->finishedBatchSize.fetch_add(1);
+  failedStatus.Update(StatusCode::ERR_RDMA_OP, "notification failed");
+  finishedBefore = failedMeta->finishedBatchSize.fetch_add(1);
+  if (finishedBefore + 1 == failedMeta->totalBatchSize) {
+    failedStatus.Update(StatusCode::SUCCESS, "late success");
+  }
+  Require(failedStatus.Failed(), "notification failure must not be overwritten by late success");
+}
+
 void CaseWrIdNamespaceHelpers() {
   const uint64_t taggedZero = MakeNotifSendWrId(0);
   Require(taggedZero == kNotifSendWrIdTag, "tagged zero should only set the reserved high bit");
@@ -1451,6 +1480,7 @@ int main(int argc, char* argv[]) {
   SetLogLevel("info");
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
+      {"notification_completion_fan_in", CaseNotificationCompletionFanIn},
       {"wr_id_namespace_helpers", CaseWrIdNamespaceHelpers},
       {"rdma_backend_config_chunking_fields", CaseRdmaBackendConfigChunkingFields},
       {"resolve_requested_nics", CaseResolveRequestedNics},

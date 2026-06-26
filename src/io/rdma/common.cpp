@@ -370,9 +370,10 @@ static void ResetMergedWorkRequestPointers(MergedWorkRequest* wr) {
 /*                                         Rdma Utilities                                         */
 /* ---------------------------------------------------------------------------------------------- */
 
-RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id) {
+RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps,
+                             std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
-  (void)status;
 
   std::string reserveErr;
   int reserved = 0;
@@ -388,6 +389,12 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
   }
 
   for (size_t i = 0; i < eps.size(); i++) {
+    if (!eps[i].ledger) {
+      for (int j = static_cast<int>(i); j < reserved; ++j) ReleaseSqDepth(eps[j], 1);
+      return {StatusCode::ERR_RDMA_OP,
+              "submission ledger is not initialized for notification SEND tracking"};
+    }
+
     const application::RdmaEndpoint& ep = eps[i].local;
     NotifMessage msg{id, static_cast<int>(i), static_cast<int>(eps.size())};
 
@@ -396,8 +403,10 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
     sge.length = sizeof(NotifMessage);
     sge.lkey = 0;
 
+    const uint64_t recordId = eps[i].ledger->Insert(1, true, callbackMeta, 1);
+
     struct ibv_send_wr wr{};
-    wr.wr_id = MakeNotifSendWrId(id);
+    wr.wr_id = recordId;
     wr.opcode = IBV_WR_SEND;
     wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
     wr.sg_list = &sge;
@@ -406,8 +415,11 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
     struct ibv_send_wr* bad_wr = nullptr;
     int ret = ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr);
     if (ret != 0) {
-      // WR i was reserved but failed to post if bad_wr points at this WR.
-      if (bad_wr == &wr) ReleaseSqDepth(eps[i], 1);
+      // This call posts a single WR, so a non-zero return means the current
+      // notification was not accepted and no CQE will arrive for its ledger record.
+      ReleaseSqDepth(eps[i], 1);
+      int dummy = 0;
+      eps[i].ledger->ReleaseByCqe(recordId, nullptr, &dummy);
       // Any remaining endpoints are reserved but not posted yet.
       for (int j = i + 1; j < eps.size(); ++j) ReleaseSqDepth(eps[j], 1);
       std::string message =
