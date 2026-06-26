@@ -128,8 +128,7 @@ struct SdmaCollectiveHandle : anvil::SdmaQueueDeviceHandle {
     }
 #pragma unroll
     for (; i < numDwords; i++) {
-      __hip_atomic_store(queueBuf + base_index_in_dwords + i, packetPtr[i], __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
+      StreamStore<4>(queueBuf + base_index_in_dwords + i, packetPtr[i], false);
     }
   }
 
@@ -139,8 +138,7 @@ struct SdmaCollectiveHandle : anvil::SdmaQueueDeviceHandle {
     uint64_t base_index_in_dwords = WrapIntoRing(wptrIndex) / sizeof(uint32_t);
     const uint64_t numDwords = numBytes / sizeof(uint32_t);
     for (uint64_t i = 0; i < numDwords; i++) {
-      __hip_atomic_store(queueBuf + base_index_in_dwords + i, 0, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
+      StreamStore<4>(queueBuf + base_index_in_dwords + i, 0, false);
     }
   }
 };
