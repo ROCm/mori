@@ -6,15 +6,19 @@
 //
 // GDA model: opaque network ops. Rank 0's kernel issues one GDA put into rank
 // 1's recv window with a completion signal; rank 1's kernel waits on the signal,
-// then the host verifies the payload. Needs a devComm with a GDA connection
-// (FULL for a single node; CROSSNODE for two physical nodes).
+// then the host verifies the payload.
+//
+// We use CCO_GDA_CONNECTION_FULL (full mesh: a GDA QP to every rank, intra- and
+// cross-node), which works whether the 2 ranks share a node or sit on separate
+// nodes. CROSSNODE would be leaner on a big cluster (intra-node peers go over
+// LSA, no QP) but then a same-node GDA put has no QP — so FULL is the simplest
+// universal choice for this example.
 //
 // Only cco_scale_out.hpp is included (it pulls in cco.hpp). The provider is
 // selected at launch by CCO_GDA_DISPATCH from the build-time NIC macro, so build
 // with -DMORI_DEVICE_NIC_* (the CMake target adds it).
 //
-//   mpirun -n 2 ./cco_gda_put     (single node: MORI_CCO_GDA_CONN unused here —
-//                                  we set CCO_GDA_CONNECTION_FULL directly;
+//   mpirun -n 2 ./cco_gda_put     (single node or one rank per node;
 //                                  set MORI_SOCKET_IFNAME=<iface>)
 
 #include <mpi.h>
@@ -105,7 +109,7 @@ int main(int argc, char** argv) {
   }
   HIP_CHECK(hipMemset(recvLocal, 0, NBYTES));
 
-  // devComm with a GDA connection (FULL = single node; CROSSNODE for 2 nodes).
+  // FULL = full mesh (works single-node and one-rank-per-node); see top comment.
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_FULL;
   reqs.gdaContextCount = 1;
