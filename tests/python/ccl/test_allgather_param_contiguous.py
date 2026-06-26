@@ -64,9 +64,9 @@ def _expected_param_contiguous(
     device: torch.device,
     base_offset: int,
 ) -> torch.Tensor:
-    expected = torch.empty(total_count * world_size, dtype=torch.uint32, device=device)
+    expected = torch.empty(total_count * world_size, dtype=torch.float32, device=device)
     for src_rank in range(world_size):
-        src = torch.arange(total_count, dtype=torch.uint32, device=device) + (
+        src = torch.arange(total_count, dtype=torch.float32, device=device) + (
             base_offset + src_rank * 1000
         )
         for split_size, split_offset in zip(split_sizes.tolist(), split_offsets.tolist()):
@@ -102,7 +102,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     total_count = 10
     split_sizes_host = torch.tensor([3, 5, 2], dtype=torch.uint64)
     split_offsets_host = torch.tensor([0, 3, 8], dtype=torch.uint64)
-    total_bytes = total_count * torch.tensor([], dtype=torch.uint32).element_size()
+    total_bytes = total_count * torch.tensor([], dtype=torch.float32).element_size()
 
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         shmem.shmem_torch_process_group_init("default")
@@ -124,11 +124,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         try:
             sync_base = 100
             sync_input = (
-                torch.arange(total_count, dtype=torch.uint32, device=device)
+                torch.arange(total_count, dtype=torch.float32, device=device)
                 + sync_base
                 + rank * 1000
             )
-            sync_output = torch.empty(total_count * world_size, dtype=torch.uint32, device=device)
+            sync_output = torch.empty(total_count * world_size, dtype=torch.float32, device=device)
 
             dist.barrier()
             with torch.cuda.stream(stream):
@@ -143,7 +143,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             assert ok, "enqueue_param_contiguous returned false"
             stream.synchronize()
 
-            sync_got = handle.get_output_transit_buffer(dtype=torch.uint32, device=device)[
+            sync_got = handle.get_output_transit_buffer(dtype=torch.float32, device=device)[
                 : total_count * world_size
             ].clone()
             _assert_matches_param_contiguous(
@@ -159,11 +159,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
             async_base = 10000
             async_input = (
-                torch.arange(total_count, dtype=torch.uint32, device=device)
+                torch.arange(total_count, dtype=torch.float32, device=device)
                 + async_base
                 + rank * 1000
             )
-            async_output = torch.empty(total_count * world_size, dtype=torch.uint32, device=device)
+            async_output = torch.empty(total_count * world_size, dtype=torch.float32, device=device)
 
             dist.barrier()
             with torch.cuda.stream(stream):
@@ -181,7 +181,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             assert elapsed >= 0, "wait_async returned a negative duration"
             stream.synchronize()
 
-            async_got = handle.get_output_transit_buffer(dtype=torch.uint32, device=device)[
+            async_got = handle.get_output_transit_buffer(dtype=torch.float32, device=device)[
                 : total_count * world_size
             ].clone()
             _assert_matches_param_contiguous(
