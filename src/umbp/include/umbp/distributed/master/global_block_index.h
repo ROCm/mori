@@ -45,7 +45,14 @@ struct BlockEntry {
   std::atomic<uint64_t> atomic_access_count{0};
 
   void GrantLease(std::chrono::steady_clock::duration duration) {
-    auto expiry = std::chrono::steady_clock::now() + duration;
+    GrantLease(std::chrono::steady_clock::now(), duration);
+  }
+
+  // Overload taking a caller-supplied "now": lets a batch capture the clock
+  // once and reuse it across many keys instead of re-reading it per key.
+  void GrantLease(std::chrono::steady_clock::time_point now,
+                  std::chrono::steady_clock::duration duration) {
+    auto expiry = now + duration;
     lease_expiry_rep.store(expiry.time_since_epoch().count(), std::memory_order_release);
   }
 
@@ -54,9 +61,11 @@ struct BlockEntry {
     return lease_expiry_rep.load(std::memory_order_acquire) > now_rep;
   }
 
-  void RecordAccessAtomic() {
-    last_accessed_rep.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                            std::memory_order_release);
+  void RecordAccessAtomic() { RecordAccessAtomic(std::chrono::steady_clock::now()); }
+
+  // Overload taking a caller-supplied "now"; see GrantLease above.
+  void RecordAccessAtomic(std::chrono::steady_clock::time_point now) {
+    last_accessed_rep.store(now.time_since_epoch().count(), std::memory_order_release);
     atomic_access_count.fetch_add(1, std::memory_order_relaxed);
   }
 

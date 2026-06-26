@@ -22,6 +22,21 @@ else()
   find_library(_TEST_GRPCPP_LIB NAMES grpc++ REQUIRED)
 endif()
 
+# MasterClient::FlushHeartbeat: immediate wakeup, no-op before start,
+# flush-while-in-flight.
+add_executable(test_umbp_master_client_flush_heartbeat
+               test_master_client_flush_heartbeat.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_master_client_flush_heartbeat PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_master_client_flush_heartbeat
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_master_client_flush_heartbeat
+         COMMAND test_umbp_master_client_flush_heartbeat)
+
 # MasterClient lifecycle: destructor budget, heartbeat thread shutdown, etc.
 add_executable(test_umbp_master_client_lifecycle
                test_master_client_lifecycle.cpp)
@@ -60,6 +75,22 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_master_client_rpc_latency
          COMMAND test_umbp_master_client_rpc_latency)
+
+# BatchRouteGet columnar response wire-format round-trip (node-table dedup,
+# 1-based node_ref, node_ref==0 -> not found, parallel tier/size columns). gRPC
+# mock master + real MasterClient; no RDMA.
+add_executable(test_umbp_batch_route_get_columnar
+               test_batch_route_get_columnar.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_batch_route_get_columnar PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_batch_route_get_columnar
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_batch_route_get_columnar
+         COMMAND test_umbp_batch_route_get_columnar)
 
 # Client-tag registration + metrics label injection.
 add_executable(test_umbp_tags test_umbp_tags.cpp)
@@ -194,3 +225,13 @@ target_link_libraries(
   bench_umbp_route_put_strategy
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
+
+# GlobalBlockIndex::BatchLookupForRouteGet micro-bench (pure logic; no gRPC /
+# RDMA, so umbp_common only).  Drives the master-side BatchRouteGet hot path
+# directly: hash lookup + exclude filter + access bump + lease grant under a
+# single shared_lock.  Reports us/call, Mlookups/s, and concurrent read scaling
+# via --threads.
+add_executable(bench_umbp_global_block_index_route_get
+               bench_global_block_index_route_get.cpp)
+target_link_libraries(bench_umbp_global_block_index_route_get
+                      PRIVATE umbp_common gtest_main)

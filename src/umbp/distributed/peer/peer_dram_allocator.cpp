@@ -263,7 +263,7 @@ PeerDramAllocator::ResolveResult PeerDramAllocator::Resolve(const std::string& k
 }
 
 std::vector<PeerDramAllocator::ResolvedEntry> PeerDramAllocator::BatchResolve(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys, bool include_descs) {
   std::vector<ResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
   std::lock_guard<std::mutex> lock(mutex_);
@@ -276,7 +276,9 @@ std::vector<PeerDramAllocator::ResolvedEntry> PeerDramAllocator::BatchResolve(
     entry.tier = it->second.tier;
     entry.pages = it->second.pages;
     entry.size = it->second.size;
-    entry.descs = BuildBufferDescsLocked(it->second.tier, it->second.pages);
+    if (include_descs) {
+      entry.descs = BuildBufferDescsLocked(it->second.tier, it->second.pages);
+    }
     // Per-key now(): matches single-key Resolve() so the last key in
     // a large batch isn't shortchanged by earlier keys' work.
     read_lease_until_[key] = std::chrono::steady_clock::now() + read_lease_ttl_;

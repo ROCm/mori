@@ -256,7 +256,10 @@ bool DistributedClient::Clear() {
 }
 
 bool DistributedClient::Flush() {
-  MORI_UMBP_DEBUG("[DistributedClient] Flush() — no-op");
+  if (closing_) return true;
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return true;
+  pool_client_->Master().FlushHeartbeat();
   return true;
 }
 

@@ -143,6 +143,8 @@ class MasterClient {
 
   void StartHeartbeat();
   void StopHeartbeat();
+  // Wake the heartbeat thread immediately to drain pending KV events.
+  void FlushHeartbeat();
 
   // Synchronously clear this node's UMBP-owned and external HiCache
   // placement from master. When peer_alloc_ is bound, caller MUST have
@@ -217,6 +219,7 @@ class MasterClient {
 
   std::thread heartbeat_thread_;
   std::atomic<bool> heartbeat_running_{false};
+  std::atomic<bool> flush_requested_{false};
   std::atomic<bool> registered_{false};
   uint64_t heartbeat_interval_ms_ = 5000;
 

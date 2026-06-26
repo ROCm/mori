@@ -238,17 +238,31 @@ std::vector<std::vector<Location>> GlobalBlockIndex::BatchLookupForRouteGet(
   std::vector<std::vector<Location>> out(keys.size());
   if (keys.empty()) return out;
   std::shared_lock lock(mutex_);
+  const bool has_exclude = !exclude_nodes.empty();
+  // Read the clock once for the whole batch: the per-hit access/lease bump
+  // would otherwise call steady_clock::now() twice per key. All keys in a
+  // batch are stamped within the same ~ms, which is well within lease/LRU
+  // granularity.
+  const auto now = std::chrono::steady_clock::now();
   for (size_t i = 0; i < keys.size(); ++i) {
     auto it = entries_.find(keys[i]);
     if (it == entries_.end()) continue;
+    const auto& src = it->second.locations;
     auto& locs = out[i];
-    for (const auto& loc : it->second.locations) {
-      if (!exclude_nodes.empty() && exclude_nodes.count(loc.node_id)) continue;
-      locs.push_back(loc);
+    if (!has_exclude) {
+      // Common case: copy the whole location vector in one allocation
+      // (no per-element vector growth).
+      locs = src;
+    } else {
+      locs.reserve(src.size());
+      for (const auto& loc : src) {
+        if (exclude_nodes.count(loc.node_id)) continue;
+        locs.push_back(loc);
+      }
     }
     if (locs.empty()) continue;
-    it->second.RecordAccessAtomic();
-    it->second.GrantLease(lease_duration);
+    it->second.RecordAccessAtomic(now);
+    it->second.GrantLease(now, lease_duration);
   }
   return out;
 }
