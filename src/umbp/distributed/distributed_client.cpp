@@ -256,7 +256,10 @@ bool DistributedClient::Clear() {
 }
 
 bool DistributedClient::Flush() {
-  if (pool_client_) pool_client_->Master().FlushHeartbeat();
+  if (closing_) return true;
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return true;
+  pool_client_->Master().FlushHeartbeat();
   return true;
 }
 
