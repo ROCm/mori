@@ -501,16 +501,19 @@ __device__ inline static void waitSqSpace(core::RdmaEndpointDevice* ep, uint32_t
   }
 }
 
-// PSD/BNXT: walk the active lane mask, ringing one lane at a time. These providers
-// share one dbrAddr across QPs (Ionic per ibv_context; BNXT per UAR page), so lanes
-// ringing distinct QPs in one SIMT store would coalesce — only one doorbell survives
-// and the rest hang. Serializing per lane avoids that; MLX5 has per-QP dbrAddr.
+// Walk the active lane mask, ringing one lane's doorbell at a time. Needed by
+// ALL providers when several lanes ring different QPs together: PSD/BNXT share
+// one dbrAddr across QPs (Ionic per ibv_context; BNXT per UAR page), and MLX5 —
+// despite a per-QP dbrAddr — still loses doorbell stores when multiple lanes
+// issue them in a single SIMT step (the stores coalesce and only one survives,
+// leaving the other QPs' WQEs unfetched → hang). Serializing per lane avoids it.
 // No __syncwarp: wavefronts are lock-step (predication already orders the stores)
 // and a __syncwarp would deadlock on divergent entry.
 template <core::ProviderType PrvdType>
 __device__ inline static void ringDoorbellWalk(core::WorkQueueHandle* wq, uint32_t dbrRecVal,
                                                uint64_t dbrVal) {
   if constexpr (PrvdType == core::ProviderType::BNXT) {
+    // BNXT: single shared DBR record for the UAR page → update once up front.
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, dbrRecVal);
     __threadfence_system();
   }
@@ -518,6 +521,13 @@ __device__ inline static void ringDoorbellWalk(core::WorkQueueHandle* wq, uint32
   while (mask) {
     int lane = __ffsll(static_cast<unsigned long long>(mask)) - 1;
     if (__lane_id() == lane) {
+      // MLX5 keeps a *per-QP* DBR record, so each lane must publish its own
+      // producer index right before its doorbell store (BNXT did this once
+      // above; PSD has no separate DBR-record write on this path).
+      if constexpr (PrvdType == core::ProviderType::MLX5) {
+        core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, dbrRecVal);
+        __threadfence_system();
+      }
       core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
     }
     mask &= ~(1ull << lane);
@@ -526,8 +536,9 @@ __device__ inline static void ringDoorbellWalk(core::WorkQueueHandle* wq, uint32
 
 // Wait for this QP's doorbell turn (preserve per-QP ordering), then ring.
 // LeaderOnly=true: caller guarantees one active lane rings (per-peer group leader)
-// → single store. LeaderOnly=false: multiple lanes may ring shared-dbrAddr QPs →
-// serialize via ringDoorbellWalk to avoid coalescing.
+// → single store. LeaderOnly=false: multiple lanes may each ring a different QP →
+// serialize via ringDoorbellWalk to avoid doorbell-store coalescing (all providers,
+// including MLX5).
 template <core::ProviderType PrvdType, bool LeaderOnly = false>
 __device__ inline static void ringDoorbellOrdered(core::RdmaEndpointDevice* ep, uint32_t myPostIdx,
                                                   uint32_t numWqes, uint64_t dbrVal) {
@@ -553,13 +564,15 @@ __device__ inline static void ringDoorbellOrdered(core::RdmaEndpointDevice* ep, 
       __threadfence_system();
     }
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-  } else if constexpr (PrvdType == core::ProviderType::MLX5) {
-    // MLX5: per-QP dbrAddr (no coalescing across lanes); update DBR record + ring.
-    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, myPostIdx + numWqes);
-    __threadfence_system();
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
   } else {
-    // PSD/BNXT: lanes may share a dbrAddr → serialize per lane.
+    // Multiple active lanes may each ring a different QP. The doorbell store must
+    // be serialized per lane for ALL providers, not just PSD/BNXT: although MLX5
+    // exposes a per-QP dbrAddr, several lanes issuing their doorbell stores in a
+    // single SIMT step coalesce on the GPU store path and only one survives — the
+    // rest are silently dropped, so those WQEs never get fetched by the NIC and
+    // the peers waiting on them hang. Walking the active-lane mask (one ring per
+    // step) is what makes the barrier's per-peer signaling work on MLX5, matching
+    // the behavior PSD/BNXT already relied on.
     ringDoorbellWalk<PrvdType>(wq, myPostIdx + numWqes, dbrVal);
   }
 
