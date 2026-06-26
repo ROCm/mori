@@ -359,7 +359,12 @@ int ccoCommDestroy(ccoComm* comm) {
     (void)ccoWindowDeregister(comm, wh->devPtr);
   }
 
+  // Safety net for callers that allocated symmetric memory but never freed it:
+  // unmap + release each straggler (same as ccoMemFree) so no mappings remain
+  // in the flat VA. hipMemAddressFree fails if any sub-range is still mapped.
   for (auto& [ptr, meta] : comm->allocTable) {
+    (void)hipMemUnmap(ptr, meta.size);
+    (void)hipMemRelease(meta.physHandle);
     if (meta.shareFd >= 0) close(meta.shareFd);
   }
   comm->allocTable.clear();
@@ -1433,8 +1438,6 @@ int ccoBarrierAll(ccoComm* comm) {
 ccoDevComm* ccoDevCommCopyToDevice(const ccoDevComm* host) {
   ccoDevComm* device = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&device, sizeof(ccoDevComm)));
-  fprintf(stderr, "[ccoDevCommCopyToDevice] hipMalloc ptr=%p  sizeof(ccoDevComm)=%zu\n",
-          (void*)device, sizeof(ccoDevComm));
   HIP_RUNTIME_CHECK(hipMemcpy(device, host, sizeof(ccoDevComm), hipMemcpyHostToDevice));
   return device;
 }

@@ -12,6 +12,7 @@ sentinels arrived.
 """
 
 import ctypes
+import os
 import sys
 
 try:
@@ -69,7 +70,11 @@ def main():
         if rank == 0:
             print(f"DevComm: lsa_size={dc._dev_comm.lsa_size}, lsa_rank={dc._dev_comm.lsa_rank}")
 
-        hsaco_path = compile_genco("lsa_put_kernel", source_dir="examples/cco/02_lsa_put")
+        # Resolve the .hip next to this example (absolute), so it works whether
+        # mori is run from the source tree or pip-installed (compile_genco joins
+        # source_dir onto the mori source root, which is _jit-sources/ when installed).
+        _kernel_dir = os.path.dirname(os.path.abspath(__file__))
+        hsaco_path = compile_genco("lsa_put_kernel", source_dir=_kernel_dir)
         module = HipModule(hsaco_path)
         func = module.get_function("lsa_put_kernel")
 

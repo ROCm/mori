@@ -270,6 +270,14 @@ def _copy_jit_sources(root_dir: Path) -> None:
         if src_file.is_file():
             shutil.copy2(src_file, shmem_dst / name)
 
+    # cco device-API wrapper — JIT-compiled to libmori_cco_device.bc on first use
+    # (mori.cco.device.bitcode). Headers come from the include/ copy above.
+    cco_dev_src = root_dir / "src" / "cco" / "device" / "cco_device_wrapper.cpp"
+    if cco_dev_src.is_file():
+        cco_dst = jit_dir / "src" / "cco" / "device"
+        cco_dst.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cco_dev_src, cco_dst / "cco_device_wrapper.cpp")
+
     for subdir in ["spdlog/include", "msgpack-c/include"]:
         src = root_dir / "3rdparty" / subdir
         if src.is_dir():
@@ -361,11 +369,18 @@ class CMakeBuild(build_ext):
                 self.ensure_finalized()
                 from setuptools._distutils.ccompiler import new_compiler
                 from setuptools._distutils.sysconfig import customize_compiler
-                self.compiler = new_compiler(
-                    verbose=self.verbose,
-                    dry_run=self.dry_run,
-                    force=self.force,
-                )
+                try:
+                    # distutils / older setuptools signature
+                    self.compiler = new_compiler(
+                        verbose=self.verbose,
+                        dry_run=self.dry_run,
+                        force=self.force,
+                    )
+                except TypeError:
+                    # setuptools >= ~80 dropped verbose/dry_run/force kwargs
+                    self.compiler = new_compiler()
+                    for _attr in ("verbose", "dry_run", "force"):
+                        setattr(self.compiler, _attr, getattr(self, _attr))
                 customize_compiler(self.compiler)
                 if self.include_dirs is not None:
                     self.compiler.set_include_dirs(self.include_dirs)
@@ -542,6 +557,33 @@ class CMakeBuild(build_ext):
         elif umbp_master_dst.exists():
             umbp_master_dst.unlink()
 
+        # CCO C++ examples: ship the built binaries when BUILD_EXAMPLES=ON. They
+        # carry an $ORIGIN/../.. rpath (set in examples/CMakeLists.txt) so they
+        # resolve libmori_*.so from site-packages/mori/ once installed here.
+        cco_examples_dst = root_dir / "python/mori/examples/cco"
+        for _exe in ("cco_lsa_put", "cco_gda_put"):
+            src = build_dir / "examples" / _exe
+            dst = cco_examples_dst / _exe
+            if build_examples.upper() == "ON" and src.exists():
+                cco_examples_dst.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+                os.chmod(dst, 0o755)
+            elif dst.exists():
+                dst.unlink()
+
+        # CCO benchmarks: same pattern, gated on BUILD_BENCHMARK=ON.
+        cco_bench_dst = root_dir / "python/mori/benchmarks/cco"
+        for _exe in ("cco_p2p_put_bw", "cco_p2p_put_latency",
+                     "cco_p2p_get_bw", "cco_p2p_get_latency"):
+            src = build_dir / "benchmark" / _exe
+            dst = cco_bench_dst / _exe
+            if build_benchmark.upper() == "ON" and src.exists():
+                cco_bench_dst.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+                os.chmod(dst, 0o755)
+            elif dst.exists():
+                dst.unlink()
+
         _copy_jit_sources(root_dir)
 
         if os.environ.get("MORI_SKIP_PRECOMPILE", "").lower() not in (
@@ -682,6 +724,8 @@ mori_package_data = [
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
     "tools/*.sh",
+    "examples/cco/*",  # CCO C++ example binaries (only present when BUILD_EXAMPLES=ON)
+    "benchmarks/cco/*",  # CCO benchmark binaries (only present when BUILD_BENCHMARK=ON)
 ]
 if _env_flag("BUILD_UMBP_SPDK", "OFF"):
     mori_package_data.append("spdk_proxy")
@@ -692,6 +736,7 @@ setup(
     package_data={
         "mori": mori_package_data,
         "mori.cco": ["*.pxd"],
+        "mori.cco.device": ["*.bc"],
         "mori.ir": ["*.bc"],
         "mori.tools": ["*.sh"],
     },
