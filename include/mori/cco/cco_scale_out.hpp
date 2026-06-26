@@ -268,10 +268,9 @@ __device__ inline void ccoGdaBarrier(Coop coop, ccoGda<PrvdType>& gda, ccoGdaBar
 // helpers don't leak into ADL or autocomplete.
 namespace impl {
 
-// Poll the CQ until wq.doneIdx reaches targetIdx. Post-#395 collapsed-CQ model:
+// Poll the CQ until wq.doneIdx reaches targetIdx. Collapsed-CQ model:
 // reconstruct the completed WQE count directly from the CQE counter (no
-// outstandingWqe[] table). Mirrors shmem's *CollapsedCqDrain / PSD quiet, but
-// exits at the caller's targetIdx instead of a dbTouchIdx/postIdx snapshot.
+// outstandingWqe[] table); exits at the caller's targetIdx.
 template <core::ProviderType PrvdType>
 __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t targetIdx) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
@@ -291,7 +290,6 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
     }
 #else
     // Non-CCQE: warp-parallel poll with color bit alternation.
-    // Mirrors shmem ShmemQuietThreadKernelPsdImpl.
     const uint64_t activeMask = core::GetActiveLaneMask();
     const uint32_t myLogicalLaneId = core::GetActiveLaneNum(activeMask);
     const int myLaneId = core::WarpLaneId();
@@ -336,7 +334,7 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
 #endif
   } else if constexpr (PrvdType == core::ProviderType::MLX5) {
     // MLX5: collapsed CQ — read CQE[0] (volatile), reconstruct the 16-bit
-    // wqe_counter against doneIdx, advance via max. Mirrors shmem Mlx5CollapsedCqDrain.
+    // wqe_counter against doneIdx, advance via max.
     auto done = [&]() {
       return (int32_t)(__hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) -
                        targetIdx) >= 0;
@@ -366,7 +364,7 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
     // re-reading doneIdx (the holder advances it). Reconstruct the completed count
     // from CQE con_indx against dbTouchIdx, advance doneIdx via max. Non-blocking
     // PollCqOnce (cco flow-control may wait on slots not yet doorbelled, so a
-    // blocking poll would deadlock). Mirrors shmem BnxtCollapsedCqDrain.
+    // blocking poll would deadlock).
     const uint32_t mask = wq->sqWqeNum - 1;  // sqWqeNum is a power of two
     auto done = [&]() {
       return (int32_t)(__hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) -
@@ -584,7 +582,6 @@ __device__ inline static void ringDoorbellOrdered(core::RdmaEndpointDevice* ep, 
                      __HIP_MEMORY_SCOPE_AGENT);
 }
 
-// Helper: calculate number of WQEs needed for atomic operation
 template <core::ProviderType PrvdType>
 __device__ inline static uint32_t getAtomicWqeCount(core::atomicType amo_op, uint32_t bytes) {
   if constexpr (PrvdType == core::ProviderType::MLX5) {
@@ -596,7 +593,6 @@ __device__ inline static uint32_t getAtomicWqeCount(core::atomicType amo_op, uin
   }
 }
 
-// Construct provider-correct dbrVal from already-posted WQE state
 template <core::ProviderType PrvdType>
 __device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, uint32_t postIdx,
                                                    uint32_t qpn) {
@@ -848,13 +844,11 @@ __device__ inline static void flushAsyncImpl(core::RdmaEndpointDevice* ep, uint3
                      __HIP_MEMORY_SCOPE_AGENT);
 }
 
-// Wait: wait for async request to complete
 template <core::ProviderType PrvdType>
 __device__ inline static void waitImpl(core::RdmaEndpointDevice* ep, uint32_t postIdx) {
   quietUntil<PrvdType>(ep, postIdx);
 }
 
-// Signal: send signal to remote peer (RDMA atomic increment/add)
 template <core::ProviderType PrvdType>
 __device__ inline static void signalImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                          uintptr_t signalRemoteAddr, uint32_t signalRemoteKey,
@@ -886,7 +880,6 @@ __device__ inline static void signalImpl(core::RdmaEndpointDevice* ep, uint32_t 
   }
 }
 
-// ReadSignal: read local signal value
 template <core::ProviderType PrvdType>
 __device__ inline static uint64_t readSignalImpl(volatile uint64_t* signalBuf,
                                                  volatile uint64_t* signalShadows,
@@ -898,7 +891,6 @@ __device__ inline static uint64_t readSignalImpl(volatile uint64_t* signalBuf,
   return (val - shadow) & mask;
 }
 
-// WaitSignal: wait until local signal reaches specified value
 template <core::ProviderType PrvdType>
 __device__ inline static void waitSignalImpl(volatile uint64_t* signalBuf,
                                              volatile uint64_t* signalShadows,
@@ -915,12 +907,10 @@ __device__ inline static void waitSignalImpl(volatile uint64_t* signalBuf,
       signalShadows[signalId] = (shadow + least) & mask;
       break;
     }
-    // Spin wait
     asm volatile("" ::: "memory");
   }
 }
 
-// ResetSignal: reset local signal to zero
 template <core::ProviderType PrvdType>
 __device__ inline static void resetSignalImpl(volatile uint64_t* signalBuf,
                                               volatile uint64_t* signalShadows,
@@ -929,7 +919,6 @@ __device__ inline static void resetSignalImpl(volatile uint64_t* signalBuf,
   signalShadows[signalId] = 0;
 }
 
-// ReadCounter: read local counter value
 template <core::ProviderType PrvdType>
 __device__ inline static uint64_t readCounterImpl(volatile uint64_t* counterBuf,
                                                   ccoGdaCounter_t counterId, int bits) {
@@ -939,7 +928,6 @@ __device__ inline static uint64_t readCounterImpl(volatile uint64_t* counterBuf,
   return val & mask;
 }
 
-// WaitCounter: wait until local counter reaches specified value
 template <core::ProviderType PrvdType>
 __device__ inline static void waitCounterImpl(volatile uint64_t* counterBuf,
                                               ccoGdaCounter_t counterId, uint64_t least, int bits) {
@@ -951,12 +939,10 @@ __device__ inline static void waitCounterImpl(volatile uint64_t* counterBuf,
     if ((val & mask) >= least) {
       break;
     }
-    // Spin wait
     asm volatile("" ::: "memory");
   }
 }
 
-// ResetCounter: reset local counter to zero
 template <core::ProviderType PrvdType>
 __device__ inline static void resetCounterImpl(volatile uint64_t* counterBuf,
                                                ccoGdaCounter_t counterId) {
@@ -1233,13 +1219,11 @@ __device__ inline void ccoGda<PrvdType>::signal(int peer, RemoteAction remoteAct
   if (coop.thread_rank() == 0) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
 
-    // select endpoint first to get ibgda context
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
 
-    // parse RemoteAction
     ccoGdaSignalOp_t signalOp = ccoGdaSignalInc;
     uint64_t signalOpArg = 0;
     uintptr_t signalRaddr = 0;
@@ -1257,15 +1241,10 @@ __device__ inline void ccoGda<PrvdType>::signal(int peer, RemoteAction remoteAct
       signalOpArg = remoteAction.value;
     }
 
-    // call primitive signal
     impl::signalImpl<PrvdType>(ep, qpn, signalRaddr, signalRkey, signalOp, signalOpArg);
   }
   coop.sync();
 }
-
-// flush = flushAsync + wait per peer.
-// flushAsync rings the doorbell if any WQEs are pending (skips if already rung),
-// then wait polls CQ until all submitted WQEs complete.
 
 // flush all peers: distribute peers across the Coop group (default: warp).
 // all threads in the group must call flush together.
