@@ -298,9 +298,6 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
 
     LDS_BARRIER()
 
-    // uint64_t tStart = __builtin_amdgcn_s_memrealtime();
-    // uint64_t tEnd = 0;
-
     if (warpId == 0 && blockIdx.x < numTokens) {
       WriteDispDestTokIdMap(args, blockIdx.x, prologueDidAlloc, prologueExpertSlot, prologueMySlot,
                             dispTokIdToSrcBase);
@@ -409,13 +406,6 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
           }
         }
       }
-
-      // tEnd = __builtin_amdgcn_s_memrealtime();
-      // if (warpRank == 0 && (blockIdx.x == 0 || blockIdx.x == gridDim.x - 1) && laneId == 0) {
-      //   printf("block%d warp%d: %llu cycles hasScales=%d\n", blockIdx.x, warpId, (unsigned long
-      //   long)(tEnd - tStart), (int)hasScales);
-      // }
-
       LDS_BARRIER()
     }
   }
