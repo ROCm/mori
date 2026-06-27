@@ -40,7 +40,6 @@
 #include <cstdint>
 
 #include "mori/collective/collectives_common.hpp"  // StreamLoad/Store, SdmaPutWarpFusedS
-#include "mori/core/transport/p2p/device_primitives.hpp"  // load<N>/store<N>
 #include "mori/shmem/shmem.hpp"
 #include "mori/shmem/internal.hpp"
 
@@ -345,14 +344,14 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
   for (size_t i = totalVecs * vecSize + ltid; i < sCnt; i += lstride) {
     using Vec = TVecType<sizeof(T)>;
     const T* base = srcBase(0) + i;
-    AccType a = UpcastF<T>(load<sizeof(T)>(base));
+    AccType a = UpcastF<T>(StreamLoad<sizeof(T)>(base));
     base += chunkElems;
     for (int pe = 1; pe < npes; pe++, base += chunkElems) {
-      auto V = load<sizeof(T)>(base);
+      auto V = StreamLoad<sizeof(T)>(base);
       a = OpT<T>()(a, UpcastF<T>(V));
     }
     Vec V = __builtin_bit_cast(Vec, DowncastF<T>(a));
-    store<sizeof(T)>(out + i, V);
+    StreamStore<sizeof(T)>(out + i, V);
   }
 
   // === Reset: the last block of group g zeroes slice g's flag + counter =========
@@ -404,6 +403,13 @@ __global__ void ReduceScatterPullKernel(int myPe,
   const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
   const size_t totalVecs = chunkElems / vecSize;
   using AccType = typename AccumulatorType<T>::type;
+  
+  // Add poison to disable promotion to global memory space
+#if USE_FLAT_MEMORY
+  if (blockIdx.x + myPe == 1777) {
+    output = reinterpret_cast<T*>(srcObj->peerPtrs[777]);
+  }
+#endif
 
   // Peer pe's contribution to my shard: base of peer pe's input + myPe*chunkElems.
   const size_t myOfs = static_cast<size_t>(myPe) * chunkElems;
@@ -424,12 +430,12 @@ __global__ void ReduceScatterPullKernel(int myPe,
   // Scalar tail for elements not covered by the vectorized loop.
   for (size_t i = totalVecs * vecSize + gtid; i < chunkElems; i += gstride) {
     using Vec = TVecType<sizeof(T)>;
-    AccType a = UpcastF<T>(load<sizeof(T)>(srcBase(0) + i));
+    AccType a = UpcastF<T>(StreamLoad<sizeof(T)>(srcBase(0) + i));
     for (int pe = 1; pe < NPES; pe++) {
-      auto V = load<sizeof(T)>(srcBase(pe) + i);
+      auto V = StreamLoad<sizeof(T)>(srcBase(pe) + i);
       a = OpT<T>()(a, UpcastF<T>(V));
     }
     Vec V = __builtin_bit_cast(Vec, DowncastF<T>(a));
-    store<sizeof(T)>(output + i, V);
+    StreamStore<sizeof(T)>(output + i, V);
   }
 }

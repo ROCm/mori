@@ -33,8 +33,13 @@
 // warp-cooperative fused copy+atomic SDMA put used by the push collectives.
 // ---------------------------------------------------------------------------
 
+#define USE_FLAT_MEMORY 1
+#if USE_FLAT_MEMORY
+#define MEM_SPACE __attribute__((address_space(0)))
+#else
+#define MEM_SPACE __attribute__((address_space(1)))
+#endif
 #define GLOBAL_SPACE __attribute__((address_space(1)))
-#define USE_BUILTIN_NONTEMPORAL 0
 
 // Streaming (cache-bypassing) 16-byte load/store.
 #if (defined(__gfx942__) || defined(__gfx950__)) &&     \
@@ -52,22 +57,30 @@ using V128_GLOBAL = GLOBAL_SPACE V128*;
 template <int VecBytes>
 using TVecType = std::conditional_t<
     VecBytes == 1, uint8_t,
-    std::conditional_t<
-        VecBytes == 2, uint16_t,
+        std::conditional_t<VecBytes == 2, uint16_t,
         std::conditional_t<VecBytes == 4, uint32_t,
-                           std::conditional_t<VecBytes == 8, uint64_t,
-                                              std::conditional_t<VecBytes == 16, V128, void>>>>>;
+        std::conditional_t<VecBytes == 8, uint64_t,
+        std::conditional_t<VecBytes == 16, V128, void>>>>>;
 
 template <typename T>
 __device__ __host__ inline static T* Tglobal(T* ptr) {
   return (T*)(GLOBAL_SPACE T*)reinterpret_cast<uintptr_t>(ptr);
 }
 
+template <typename T>
+__device__ __host__ inline static MEM_SPACE T* MemSpace(T* ptr) {
+  uintptr_t u = reinterpret_cast<uintptr_t>(ptr);
+  return reinterpret_cast<MEM_SPACE T*>(u);
+}
+
 template <int Bytes>
 __device__ __forceinline__ TVecType<Bytes> StreamLoad(const void* p, bool system_scope = true) {
   static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
                 "StreamLoad supports 1/2/4/8/16 byte accesses");
-  auto ptr = Tglobal(reinterpret_cast<const TVecType<Bytes>*>(p));
+  auto ptr = reinterpret_cast<const TVecType<Bytes>*>(p); 
+#if 1
+  return __builtin_nontemporal_load(MemSpace(ptr));
+#else
   if constexpr (Bytes == 16) {
     if (system_scope) {
       return __builtin_amdgcn_global_load_b128((V128_GLOBAL)p, "");
@@ -75,20 +88,20 @@ __device__ __forceinline__ TVecType<Bytes> StreamLoad(const void* p, bool system
       return __builtin_amdgcn_global_load_b128((V128_GLOBAL)p, "agent");
     }
   } else {
-#if USE_BUILTIN_NONTEMPORAL
-    return __builtin_nontemporal_load(ptr);
-#else
     return __hip_atomic_load(ptr, __ATOMIC_RELAXED,
                              system_scope ? __HIP_MEMORY_SCOPE_SYSTEM : __HIP_MEMORY_SCOPE_AGENT);
-#endif
   }
+#endif
 }
 
 template <int Bytes>
 __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v, bool system_scope = true) {
   static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
                 "StreamStore supports 1/2/4/8/16 byte accesses");
-  auto ptr = Tglobal(reinterpret_cast<TVecType<Bytes>*>(p));
+  auto ptr = reinterpret_cast<TVecType<Bytes>*>(p);
+#if 1
+  __builtin_nontemporal_store(v, MemSpace(ptr));
+#else
   if constexpr (Bytes == 16) {
     if (system_scope) {
       __builtin_amdgcn_global_store_b128((V128_GLOBAL)p, v, "");
@@ -96,13 +109,10 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v, bool sys
       __builtin_amdgcn_global_store_b128((V128_GLOBAL)p, v, "agent");
     }
   } else {
-#if USE_BUILTIN_NONTEMPORAL
-    __builtin_nontemporal_store(v, ptr);
-#else
     __hip_atomic_store(ptr, v, __ATOMIC_RELAXED,
                        system_scope ? __HIP_MEMORY_SCOPE_SYSTEM : __HIP_MEMORY_SCOPE_AGENT);
-#endif
   }
+#endif
 }
 
 // SDMA queue handle augmented with collective-specific ring writers. It adds no
