@@ -72,8 +72,6 @@ TierType FromProtoTier(::umbp::TierType t) { return static_cast<TierType>(t); }
       return ::umbp::KvEvent::ADD;
     case KvEvent::Kind::REMOVE:
       return ::umbp::KvEvent::REMOVE;
-    case KvEvent::Kind::CLEAR_AT_TIER:
-      return ::umbp::KvEvent::CLEAR_AT_TIER;
   }
   return ::umbp::KvEvent::ADD;
 }

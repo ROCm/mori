@@ -91,9 +91,6 @@ KvEvent FromProtoEvent(const ::umbp::KvEvent& pe) {
     case ::umbp::KvEvent::REMOVE:
       ev.kind = KvEvent::Kind::REMOVE;
       break;
-    case ::umbp::KvEvent::CLEAR_AT_TIER:
-      ev.kind = KvEvent::Kind::CLEAR_AT_TIER;
-      break;
     default:
       ev.kind = KvEvent::Kind::ADD;
       break;

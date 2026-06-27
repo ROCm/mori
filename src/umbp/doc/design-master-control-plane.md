@@ -242,11 +242,11 @@ struct Location {
 // index keys locations by (node, tier), so a key can hold a DRAM and an
 // SSD location at once and a REMOVE only drops the matching tier.
 struct KvEvent {
-  enum class Kind : int { ADD = 0, REMOVE = 1, CLEAR_AT_TIER = 2 };
+  enum class Kind : int { ADD = 0, REMOVE = 1 };
   Kind kind = Kind::ADD;
-  std::string key;            // empty for CLEAR_AT_TIER
+  std::string key;
   TierType tier = TierType::UNKNOWN;
-  uint64_t size = 0;          // ADD only; REMOVE / CLEAR_AT_TIER leave this 0
+  uint64_t size = 0;          // ADD only; REMOVE leaves this 0
 };
 
 // Heartbeat events ride in seq-numbered bundles for ack / gap recovery.
@@ -351,9 +351,6 @@ Mutators:
     untouched; REMOVE for an unknown `(key, node_id, tier)` is a silent
     no-op. The key's entry is erased only once its last location is
     gone.
-  - **CLEAR_AT_TIER** drops every location for `(node_id, tier)` across
-    all keys (keyless event); used to wipe one tier's placements for a
-    node.
 - `ReplaceNodeLocations(node_id, adds[])` — drop every prior location
   for `node_id` and reseed from `adds` (which may mix DRAM/HBM and SSD
   ADDs). Used on full-sync.
