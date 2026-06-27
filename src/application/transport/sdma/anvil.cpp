@@ -214,16 +214,13 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
       hipMemcpy(committedWptr_, &committedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
 }
 
-SdmaQueue::~SdmaQueue() try {
+SdmaQueue::~SdmaQueue() {
   CHECK_HSAKMT_SUCCESS(hsaKmtDestroyQueue(queue_.QueueId), "Failed to destroy queue.");
   CHECK_HIP_ERROR(hipFree(deviceHandle_));
   CHECK_HIP_ERROR(hipFree(cachedWptr_));
   CHECK_HIP_ERROR(hipFree(committedWptr_));
   CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(queueBuffer_), "Failed");
   CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(queueBuffer_, SDMA_QUEUE_SIZE), "Failed");
-} catch (...) {
-  std::cerr << "Exception in ~SdmaQueue()" << std::endl;
-  std::exit(EXIT_FAILURE);
 }
 
 SdmaQueueDeviceHandle* SdmaQueue::deviceHandle() const { return deviceHandle_; }
