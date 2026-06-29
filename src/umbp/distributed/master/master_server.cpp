@@ -587,10 +587,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
     auto matches = external_kv_index_.Match(hashes);
 
-    std::unordered_map<std::string, std::string> peer_map;
-    for (const auto& record : registry_.GetAliveClients()) {
-      peer_map[record.node_id] = record.peer_address;
-    }
+    auto peer_map = registry_.GetAlivePeerView();
     for (auto& m : matches) {
       auto* proto_match = response->add_matches();
       proto_match->set_node_id(m.node_id);
@@ -699,7 +696,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   void UpdateClientCountMetric() {
     if (!metrics_) return;
     metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_COUNT, MORI_UMBP_METRIC_CLIENT_COUNT_HELP,
-                       static_cast<double>(registry_.GetAliveClients().size()));
+                       static_cast<double>(registry_.AliveClientCount()));
   }
 
   void UpdateClientCapacityMetrics(const std::string& node_id,
