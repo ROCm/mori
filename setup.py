@@ -339,6 +339,7 @@ class CMakeBuild(build_ext):
             ) from exn
         mpi_enabled = (
             os.environ.get("BUILD_EXAMPLES", "OFF").upper() == "ON"
+            or os.environ.get("BUILD_BENCHMARK", "OFF").upper() == "ON"
             or os.environ.get("MORI_WITH_MPI", "OFF").upper() == "ON"
         )
         if mpi_enabled:
@@ -381,10 +382,17 @@ class CMakeBuild(build_ext):
         build_umbp = "ON" if build_umbp_enabled else "OFF"
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
+        # Benchmarks and examples both require MPI (they bootstrap via
+        # ShmemMpiInit and run under mpirun); the benchmark targets are wrapped
+        # in `if(WITH_MPI)` in benchmark/CMakeLists.txt, so leaving WITH_MPI=OFF
+        # while BUILD_BENCHMARK=ON silently drops every benchmark target and
+        # produces a libmori_shmem.so without ShmemMpiInit. Keep WITH_MPI in
+        # lockstep with anything that needs it.
         with_mpi = (
             "ON"
             if (
                 build_examples.upper() == "ON"
+                or build_benchmark.upper() == "ON"
                 or os.environ.get("MORI_WITH_MPI", "OFF").upper() == "ON"
             )
             else "OFF"
