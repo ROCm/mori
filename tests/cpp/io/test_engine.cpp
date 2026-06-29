@@ -247,6 +247,92 @@ void CaseSubmissionLedgerBasic() {
   Require(sqDepth2.load(std::memory_order_relaxed) == 5, "sq depth after posted CQE release");
 }
 
+EpPair MakeSqAdmissionEp(int maxSqDepth, int currentDepth, bool withAdmission = true) {
+  EpPair ep{};
+  ep.sqDepth = std::make_shared<std::atomic<int>>(currentDepth);
+  ep.maxSqDepth = maxSqDepth;
+  ep.degraded = std::make_shared<std::atomic<bool>>(false);
+  if (withAdmission) ep.sqAdmission = std::make_shared<SqAdmissionEvent>();
+  return ep;
+}
+
+bool WaitForSqAdmissionWaiter(const EpPair& ep) {
+  Require(ep.sqAdmission != nullptr, "test EP must have sq admission state");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (ep.sqAdmission->waiters.load(kSqAdmissionOrder) > 0) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return false;
+}
+
+void CaseSqAdmissionReleaseWakesWaiter() {
+  EpPair ep = MakeSqAdmissionEp(1, 1);
+  bool reserveOk = false;
+  std::string err;
+
+  std::thread worker([&]() { reserveOk = detail::TryReserveSqDepthForTesting(ep, 1, &err); });
+
+  const bool sawWaiter = WaitForSqAdmissionWaiter(ep);
+  const auto releaseAt = std::chrono::steady_clock::now();
+  ep.sqDepth->fetch_sub(1, kSqAdmissionOrder);
+  NotifySqStateChanged(ep);
+  worker.join();
+
+  Require(sawWaiter, "timed out waiting for SQ admission waiter in release wake");
+  const auto wakeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - releaseAt)
+                          .count();
+  Require(reserveOk, "reserve should succeed after SQ depth release: " + err);
+  Require(wakeMs < 1000, "reserve should wake promptly after SQ depth release");
+  Require(ep.sqDepth->load(kSqAdmissionOrder) == 1, "release wake should reserve returned credit");
+  Require(ep.sqAdmission->waiters.load(kSqAdmissionOrder) == 0,
+          "waiter count should be cleared after release wake");
+}
+
+void CaseSqAdmissionDegradedWakesWaiter() {
+  EpPair ep = MakeSqAdmissionEp(1, 1);
+  bool reserveOk = true;
+  std::string err;
+
+  std::thread worker([&]() { reserveOk = detail::TryReserveSqDepthForTesting(ep, 1, &err); });
+
+  const bool sawWaiter = WaitForSqAdmissionWaiter(ep);
+  const auto notifyAt = std::chrono::steady_clock::now();
+  ep.degraded->store(true, kSqAdmissionOrder);
+  NotifySqStateChanged(ep);
+  worker.join();
+
+  Require(sawWaiter, "timed out waiting for SQ admission waiter in degraded wake");
+  const auto wakeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - notifyAt)
+                          .count();
+  Require(!reserveOk, "reserve should fail after degraded notification");
+  Require(err.find("degraded") != std::string::npos,
+          "degraded wake should report degraded failure, got: " + err);
+  Require(wakeMs < 1000, "reserve should wake promptly after degraded notification");
+  Require(ep.sqAdmission->waiters.load(kSqAdmissionOrder) == 0,
+          "waiter count should be cleared after degraded wake");
+}
+
+void CaseSqAdmissionNegativeDepthReserveRepairsCounter() {
+  EpPair ep = MakeSqAdmissionEp(2, -1);
+  std::string err;
+  Require(detail::TryReserveSqDepthForTesting(ep, 1, &err),
+          "reserve from negative sqDepth should succeed: " + err);
+  Require(ep.sqDepth->load(kSqAdmissionOrder) == 1,
+          "reserve from negative sqDepth should repair counter to requested credit");
+}
+
+void CaseSqAdmissionMissingEventFallsBack() {
+  EpPair ep = MakeSqAdmissionEp(1, 0, false);
+  std::string err;
+  Require(detail::TryReserveSqDepthForTesting(ep, 1, &err),
+          "reserve should work when sqAdmission is absent: " + err);
+  Require(ep.sqDepth->load(kSqAdmissionOrder) == 1,
+          "reserve without sqAdmission should still update sqDepth");
+}
+
 void CaseWrIdNamespaceHelpers() {
   const uint64_t taggedZero = MakeNotifSendWrId(0);
   Require(taggedZero == kNotifSendWrIdTag, "tagged zero should only set the reserved high bit");
@@ -1642,6 +1728,11 @@ int main(int argc, char* argv[]) {
   SetLogLevel("info");
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
+      {"sq_admission_release_wakes_waiter", CaseSqAdmissionReleaseWakesWaiter},
+      {"sq_admission_degraded_wakes_waiter", CaseSqAdmissionDegradedWakesWaiter},
+      {"sq_admission_negative_depth_reserve_repairs_counter",
+       CaseSqAdmissionNegativeDepthReserveRepairsCounter},
+      {"sq_admission_missing_event_falls_back", CaseSqAdmissionMissingEventFallsBack},
       {"wr_id_namespace_helpers", CaseWrIdNamespaceHelpers},
       {"rdma_backend_config_chunking_fields", CaseRdmaBackendConfigChunkingFields},
       {"resolve_requested_nics", CaseResolveRequestedNics},

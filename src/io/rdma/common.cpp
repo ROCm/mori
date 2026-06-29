@@ -22,11 +22,16 @@
 #include "src/io/rdma/common.hpp"
 
 #include <infiniband/verbs.h>  // dereferences ibvHandle.qp (forward-declared in core)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdlib>
+#include <ctime>
 #include <limits>
 #include <numeric>
 #include <thread>
@@ -191,12 +196,131 @@ uint64_t MakeNotifSendWrId(TransferUniqueId id) {
   return kNotifSendWrIdTag | id;
 }
 
-// SQ depth is an admission counter only. It does not publish data dependencies
-// across threads, so relaxed atomics are sufficient for correctness.
+namespace {
+
+int* FutexAddr(std::atomic<uint32_t>* word) {
+  static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t));
+  static_assert(alignof(std::atomic<uint32_t>) >= alignof(uint32_t));
+  static_assert(std::atomic<uint32_t>::is_always_lock_free);
+  // Linux futex ABI requires an int* uaddr. Keep this cast local and pass the
+  // returned pointer only to the syscall; do not dereference it in C++.
+  return reinterpret_cast<int*>(word);
+}
+
+timespec ToTimespec(std::chrono::steady_clock::duration d) {
+  using namespace std::chrono;
+  if (d <= steady_clock::duration::zero()) return timespec{0, 0};
+  const auto ns = duration_cast<nanoseconds>(d);
+  timespec ts{};
+  ts.tv_sec = static_cast<time_t>(ns.count() / 1000000000LL);
+  ts.tv_nsec = static_cast<long>(ns.count() % 1000000000LL);
+  return ts;
+}
+
+enum class FutexWaitResult {
+  WokenOrChanged,
+  TimedOut,
+  Unavailable,
+};
+
+FutexWaitResult FutexWaitUntil(std::atomic<uint32_t>* word, uint32_t expected,
+                               std::chrono::steady_clock::time_point deadline) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) return FutexWaitResult::TimedOut;
+
+  timespec timeout = ToTimespec(deadline - now);
+  const int rc = static_cast<int>(syscall(SYS_futex, FutexAddr(word), FUTEX_WAIT_PRIVATE,
+                                          static_cast<int>(expected), &timeout, nullptr, 0));
+  if (rc == 0) return FutexWaitResult::WokenOrChanged;
+
+  const int e = errno;
+  if (e == ETIMEDOUT) return FutexWaitResult::TimedOut;
+  if (e == EAGAIN || e == EINTR) return FutexWaitResult::WokenOrChanged;
+
+  static std::atomic<bool> loggedUnexpectedFutexWait{false};
+  if (!loggedUnexpectedFutexWait.exchange(true, std::memory_order_relaxed)) {
+    MORI_IO_WARN("FUTEX_WAIT_PRIVATE failed: errno={}", e);
+  }
+  return FutexWaitResult::Unavailable;
+}
+
+void FutexWakeAll(std::atomic<uint32_t>* word) {
+  const int rc = static_cast<int>(
+      syscall(SYS_futex, FutexAddr(word), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0));
+  if (rc < 0) {
+    MORI_IO_WARN("FUTEX_WAKE_PRIVATE failed: errno={}", errno);
+  }
+}
+
+}  // namespace
+
+void NotifySqStateChanged(const EpPair& ep) {
+  auto* event = ep.sqAdmission.get();
+  if (!event) return;
+
+  event->epoch.fetch_add(1, kSqAdmissionOrder);
+  if (event->waiters.load(kSqAdmissionOrder) == 0) return;
+
+  FutexWakeAll(&event->epoch);
+}
+
+static bool TryReserveSqDepthOnce(const EpPair& ep, int wrCount) {
+  int observed = ep.sqDepth->load(kSqAdmissionOrder);
+  while (true) {
+    const int base = std::max(observed, 0);
+    if (base > ep.maxSqDepth - wrCount) return false;
+
+    const int desired = base + wrCount;
+    if (ep.sqDepth->compare_exchange_weak(observed, desired, kSqAdmissionOrder,
+                                          kSqAdmissionOrder)) {
+      return true;
+    }
+  }
+}
+
+static bool TryReserveSqDepthSpin(const EpPair& ep, int wrCount, int epId, const char* opTag,
+                                  std::string* errMsg,
+                                  SqReserveFailureKind* failureKind = nullptr) {
+  const int kBackoffTimeoutUs = GetSqBackoffTimeoutUs();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::microseconds(kBackoffTimeoutUs);
+  int backoff = 0;
+  while (true) {
+    if (ep.degraded && ep.degraded->load(kSqAdmissionOrder)) {
+      SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
+      if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
+      return false;
+    }
+
+    if (TryReserveSqDepthOnce(ep, wrCount)) return true;
+
+    if (std::chrono::steady_clock::now() >= deadline) {
+      SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Timeout);
+      const int cur = ep.sqDepth->load(kSqAdmissionOrder);
+      MORI_IO_WARN(
+          "SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us (backoff={})",
+          opTag, epId, cur, wrCount, ep.maxSqDepth, kBackoffTimeoutUs, backoff);
+      if (errMsg) {
+        *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
+                  " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
+                  " max=" + std::to_string(ep.maxSqDepth);
+      }
+      return false;
+    }
+
+    if (backoff < 16) {
+      std::this_thread::yield();
+    } else {
+      std::this_thread::sleep_for(std::chrono::microseconds(2));
+    }
+    backoff++;
+  }
+}
+
 static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const char* opTag,
                               std::string* errMsg, SqReserveFailureKind* failureKind = nullptr) {
   if (wrCount <= 0 || !ep.sqDepth) return true;
-  if (ep.degraded && ep.degraded->load(std::memory_order_relaxed)) {
+  if (ep.degraded && ep.degraded->load(kSqAdmissionOrder)) {
     SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
     if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
     return false;
@@ -212,58 +336,83 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
     }
     return false;
   }
-  const int kBackoffTimeoutUs = GetSqBackoffTimeoutUs();
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::microseconds(kBackoffTimeoutUs);
-  int backoff = 0;
-  int cur = ep.sqDepth->load(std::memory_order_relaxed);
-  if (cur < 0) cur = 0;  // defensive: clamp stale negative depth
+
+  if (TryReserveSqDepthOnce(ep, wrCount)) return true;
+
+  auto* event = ep.sqAdmission.get();
+  if (!event) {
+    return TryReserveSqDepthSpin(ep, wrCount, epId, opTag, errMsg, failureKind);
+  }
+
+  const int timeoutUs = GetSqBackoffTimeoutUs();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUs);
+  bool useFutex = true;
+  int futexFallbackBackoff = 0;
+
+  struct WaiterGuard {
+    explicit WaiterGuard(SqAdmissionEvent& ev_) : ev(ev_) {
+      ev.waiters.fetch_add(1, kSqAdmissionOrder);
+    }
+    ~WaiterGuard() { ev.waiters.fetch_sub(1, kSqAdmissionOrder); }
+    SqAdmissionEvent& ev;
+  } guard(*event);
+
   while (true) {
-    // Re-check degraded state while waiting to avoid accepting new submissions
-    // after another thread has marked this EP as degraded.
-    if (ep.degraded && ep.degraded->load(std::memory_order_relaxed)) {
+    const uint32_t observedEpoch = event->epoch.load(kSqAdmissionOrder);
+
+    if (ep.degraded && ep.degraded->load(kSqAdmissionOrder)) {
       SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
       if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
       return false;
     }
-    if (cur + wrCount > ep.maxSqDepth) {
-      if (std::chrono::steady_clock::now() >= deadline) {
-        SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Timeout);
-        MORI_IO_WARN(
-            "SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us (backoff={})",
-            opTag, epId, cur, wrCount, ep.maxSqDepth, kBackoffTimeoutUs, backoff);
-        if (errMsg) {
-          *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
-                    " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
-                    " max=" + std::to_string(ep.maxSqDepth);
-        }
-        return false;
+
+    if (TryReserveSqDepthOnce(ep, wrCount)) return true;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Timeout);
+      const int cur = ep.sqDepth->load(kSqAdmissionOrder);
+      MORI_IO_WARN("SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us", opTag,
+                   epId, cur, wrCount, ep.maxSqDepth, timeoutUs);
+      if (errMsg) {
+        *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
+                  " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
+                  " max=" + std::to_string(ep.maxSqDepth);
       }
-      // Phased backoff: short polite yields, then tiny sleeps to reduce CPU burn.
-      if (backoff < 16) {
-        std::this_thread::yield();
-      } else {
-        std::this_thread::sleep_for(std::chrono::microseconds(2));
-      }
-      backoff++;
-      cur = ep.sqDepth->load(std::memory_order_relaxed);
-      continue;
+      return false;
     }
-    if (ep.sqDepth->compare_exchange_weak(cur, cur + wrCount, std::memory_order_relaxed))
-      return true;
-    if (backoff < 16) {
+
+    if (useFutex) {
+      const FutexWaitResult waitResult = FutexWaitUntil(&event->epoch, observedEpoch, deadline);
+      if (waitResult != FutexWaitResult::Unavailable) {
+        continue;
+      }
+      useFutex = false;
+    }
+
+    if (futexFallbackBackoff < 16) {
       std::this_thread::yield();
     } else {
       std::this_thread::sleep_for(std::chrono::microseconds(2));
     }
-    backoff++;
+    futexFallbackBackoff++;
   }
 }
 
 static void ReleaseSqDepth(const EpPair& ep, int wrCount) {
   if (wrCount <= 0 || !ep.sqDepth) return;
-  ep.sqDepth->fetch_sub(wrCount, std::memory_order_relaxed);
+  ep.sqDepth->fetch_sub(wrCount, kSqAdmissionOrder);
+  NotifySqStateChanged(ep);
 }
+
+namespace detail {
+
+bool TryReserveSqDepthForTesting(const EpPair& ep, int wrCount, std::string* errMsg) {
+  SqReserveFailureKind failureKind = SqReserveFailureKind::None;
+  return TryReserveSqDepth(ep, wrCount, 0, "test", errMsg, &failureKind);
+}
+
+}  // namespace detail
 
 // Fill `plan` with (offset, len) chunks for a transfer of `total` bytes. Clears
 // `plan` first but keeps its capacity so callers can reuse a pooled buffer.
@@ -827,13 +976,14 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
             "ibv_post_send partially posted {} / {} WRs without a posted signaled tail; "
             "marking EP {} as degraded until recovery",
             postedCount, batchWrNum, epId);
-        if (eps[epId].degraded) {
-          eps[epId].degraded->store(true, std::memory_order_relaxed);
-        }
         if (eps[epId].ledger) {
           eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
                                            static_cast<int>(epMergedSinceSignal[epId]));
         }
+        if (eps[epId].degraded) {
+          eps[epId].degraded->store(true, kSqAdmissionOrder);
+        }
+        NotifySqStateChanged(eps[epId]);
       }
 
       for (size_t otherEpId = 0; otherEpId < epNum; ++otherEpId) {
@@ -843,9 +993,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
             "ibv_post_send failed on ep {}: moving pending unsignaled WRs on ep {} "
             "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
             epId, otherEpId, epWrsSinceSignal[otherEpId], epMergedSinceSignal[otherEpId]);
-        if (eps[otherEpId].degraded) {
-          eps[otherEpId].degraded->store(true, std::memory_order_relaxed);
-        }
         if (eps[otherEpId].ledger) {
           eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
                                                 static_cast<int>(epMergedSinceSignal[otherEpId]));
@@ -855,6 +1002,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
               "sqDepth may remain stale until endpoint restart",
               otherEpId);
         }
+        if (eps[otherEpId].degraded) {
+          eps[otherEpId].degraded->store(true, kSqAdmissionOrder);
+        }
+        NotifySqStateChanged(eps[otherEpId]);
       }
 
       std::string message = "ibv_post_send failed with " + std::to_string(ret) + ": " +
