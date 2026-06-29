@@ -18,7 +18,6 @@ __all__ = [
     "CCOResource",
     "AllocatedMemory",
     "RegisteredWindow",
-    "AllocatedWindow",
     "DevCommHandle",
     "Communicator",
 ]
@@ -167,43 +166,6 @@ class RegisteredWindow(CCOResource):
         return f"<RegisteredWindow: handle={self._handle:#x}, size={self._size}>"
 
 
-# ── AllocatedWindow ───────────────────────────────────────────────────────────
-
-class AllocatedWindow(CCOResource):
-    """Window where CCO allocates and registers memory internally."""
-
-    def __init__(self, comm: Communicator, size: int) -> None:
-        super().__init__(comm)
-        self._size = size
-        self._handle, self._local_ptr = _cco.window_register(comm._raw, size)
-
-    def _deallocate(self) -> None:
-        if self._handle:
-            _cco.window_deregister(self._comm._raw, self._handle)
-            self._handle = 0
-            self._local_ptr = 0
-
-    @property
-    def handle(self) -> int:
-        self._check_valid()
-        return self._handle
-
-    @property
-    def local_ptr(self) -> int:
-        self._check_valid()
-        return self._local_ptr
-
-    @property
-    def size(self) -> int:
-        return self._size
-
-    def __repr__(self) -> str:
-        if not self.is_valid:
-            return "<AllocatedWindow: closed>"
-        return (f"<AllocatedWindow: handle={self._handle:#x}, "
-                f"local_ptr={self._local_ptr:#x}, size={self._size}>")
-
-
 # ── DevCommHandle ─────────────────────────────────────────────────────────────
 
 class DevCommHandle(CCOResource):
@@ -338,12 +300,6 @@ class Communicator:
     def register_window(self, ptr: int, size: int) -> RegisteredWindow:
         self._check_valid("register_window")
         r = RegisteredWindow(self, ptr, size)
-        self._resources.append(r)
-        return r
-
-    def alloc_window(self, size: int) -> AllocatedWindow:
-        self._check_valid("alloc_window")
-        r = AllocatedWindow(self, size)
         self._resources.append(r)
         return r
 
