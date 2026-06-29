@@ -354,13 +354,9 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
         assert(false);
         break;
       }
-      // The CQE only carries the low 16 bits of the completion counter, so rebuild
-      // the full 32-bit value as cons + (forward 16-bit distance from cons to the
-      // CQE). Only trust that distance if it lands within the genuinely in-flight
-      // range (cons, dbTouchIdx]; anything past dbTouchIdx is a stale/torn read and
-      // is ignored. This advances correctly across 16-bit wraps and never reports
-      // more completions than were doorbelled. window is signed: when doneIdx has
-      // caught up to dbTouchIdx it is <= 0, which rejects every delta.
+      // Rebuild the 32-bit completion from the 16-bit wqe_counter via the forward
+      // delta, accepted only within (cons, dbTouchIdx] to drop stale CQEs. window
+      // is signed: once doneIdx reaches dbTouchIdx it is <= 0 and rejects all.
       uint16_t comp16 = static_cast<uint16_t>(wqeCounter + 1);
       uint16_t delta = static_cast<uint16_t>(comp16 - static_cast<uint16_t>(cons));
       uint32_t dbTouched =
