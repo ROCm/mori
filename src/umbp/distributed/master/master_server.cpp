@@ -33,6 +33,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
+#include "umbp/distributed/master/evict_strategy.h"
 #include "umbp/distributed/master/in_memory_master_metadata_store.h"
 #include "umbp/distributed/master/master_metadata_store.h"
 #include "umbp/distributed/master/master_metrics.h"
@@ -187,6 +188,13 @@ MasterServerConfig MasterServerConfig::FromEnvironment() {
   cfg.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(algo, affinity);
   return cfg;
 }
+
+// Out-of-line special members (declared in config.h).  Defined here because
+// this TU has the complete strategy types in scope.
+MasterServerConfig::MasterServerConfig() = default;
+MasterServerConfig::~MasterServerConfig() = default;
+MasterServerConfig::MasterServerConfig(MasterServerConfig&&) noexcept = default;
+MasterServerConfig& MasterServerConfig::operator=(MasterServerConfig&&) noexcept = default;
 
 // ---------------------------------------------------------------------------
 //  gRPC service implementation
@@ -773,9 +781,9 @@ MasterServer::MasterServer(MasterServerConfig config)
       service_(std::make_unique<UMBPMasterServiceImpl>(*store_, router_, config_.registry_config,
                                                        nullptr)),
       peer_stub_pool_(std::make_unique<MasterPeerStubPool>()),
-      eviction_manager_(std::make_unique<EvictionManager>(
-          *store_, config_.eviction_config, peer_stub_pool_.get(),
-          std::move(config_.evict_strategy))) {
+      eviction_manager_(std::make_unique<EvictionManager>(*store_, config_.eviction_config,
+                                                          peer_stub_pool_.get(),
+                                                          std::move(config_.evict_strategy))) {
   router_.SetLeaseDuration(config_.eviction_config.lease_duration);
 }
 

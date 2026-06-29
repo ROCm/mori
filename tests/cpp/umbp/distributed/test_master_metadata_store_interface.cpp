@@ -78,7 +78,7 @@ TEST(MasterMetadataStoreInterface, EveryMethodIsCallableThroughInterface) {
   ON_CALL(mock, BatchLookupBlockForRouteGet(_, _, _, _))
       .WillByDefault(Return(std::vector<std::vector<Location>>{}));
   ON_CALL(mock, BatchExistsBlock(_)).WillByDefault(Return(std::vector<bool>{}));
-  ON_CALL(mock, EnumerateLruForEviction(_, _))
+  ON_CALL(mock, EnumerateEvictionCandidates(_, _, _, _))
       .WillByDefault(Return(std::map<NodeTierKey, std::vector<EvictionCandidate>>{}));
   ON_CALL(mock, GetClient(_)).WillByDefault(Return(std::nullopt));
   ON_CALL(mock, IsClientAlive(_)).WillByDefault(Return(false));
@@ -113,7 +113,8 @@ TEST(MasterMetadataStoreInterface, EveryMethodIsCallableThroughInterface) {
   EXPECT_TRUE(store.LookupBlockForRouteGet("k0", {}, now, 5s).empty());
   EXPECT_TRUE(store.BatchLookupBlockForRouteGet({"k0"}, {}, now, 5s).empty());
   EXPECT_TRUE(store.BatchExistsBlock({"k0"}).empty());
-  EXPECT_TRUE(store.EnumerateLruForEviction({}, now).empty());
+  EXPECT_TRUE(
+      store.EnumerateEvictionCandidates({}, EvictionOrder::kLeastRecentlyAccessed, 0, now).empty());
 
   // Client reads.
   EXPECT_FALSE(store.GetClient("node-a").has_value());

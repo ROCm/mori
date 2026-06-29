@@ -52,8 +52,6 @@ class MockMasterMetadataStore : public IMasterMetadataStore {
   // Aliases for types whose commas would otherwise break the MOCK_METHOD macro
   // parser (it splits the argument list on top-level commas).
   using CapsMap = std::map<TierType, TierCapacity>;
-  using BudgetMap = std::map<NodeTierKey, uint64_t>;
-  using LruResult = std::map<NodeTierKey, std::vector<EvictionCandidate>>;
   using LocationBatch = std::vector<std::vector<Location>>;
 
   // --- Cross-store writes ---
@@ -97,8 +95,9 @@ class MockMasterMetadataStore : public IMasterMetadataStore {
               (override));
   MOCK_METHOD(std::vector<bool>, BatchExistsBlock, ((const std::vector<std::string>&)keys),
               (const, override));
-  MOCK_METHOD(LruResult, EnumerateLruForEviction,
-              (const BudgetMap& bytes_to_free, std::chrono::system_clock::time_point now),
+  MOCK_METHOD((std::map<NodeTierKey, std::vector<EvictionCandidate>>), EnumerateEvictionCandidates,
+              (const std::vector<NodeTierKey>& buckets, EvictionOrder order, size_t max_per_bucket,
+               std::chrono::system_clock::time_point now),
               (const, override));
 
   // --- Client reads ---

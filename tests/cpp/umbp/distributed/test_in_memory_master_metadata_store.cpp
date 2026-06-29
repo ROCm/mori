@@ -26,8 +26,9 @@
 // are deterministic in CI.
 //
 // State that the interface does not expose directly — lease_expiry and
-// last_accessed_at on block entries — is observed through EnumerateLruForEviction:
-// a leased entry is filtered out, and LRU ordering reflects last_accessed_at.
+// last_accessed_at on block entries — is observed through
+// EnumerateEvictionCandidates: a leased entry is filtered out, and LRU
+// ordering (EvictionOrder::kLeastRecentlyAccessed) reflects last_accessed_at.
 
 #include <gtest/gtest.h>
 
@@ -286,12 +287,15 @@ TEST(InMemoryStore, ExpiredRowExcludedFromAliveAccounting) {
 }
 
 // ---------------------------------------------------------------------------
-// Block reads — lease/access observed via EnumerateLruForEviction
+// Block reads — lease/access observed via EnumerateEvictionCandidates
 // ---------------------------------------------------------------------------
 
-// Helper: budget large enough to take everything in one bucket.
-std::map<NodeTierKey, uint64_t> Budget(const std::string& node, TierType tier, uint64_t bytes) {
-  return {{NodeTierKey{node, tier}, bytes}};
+// Helper: single (node, tier) bucket to enumerate candidates from. The store's
+// candidate enumeration is policy-neutral: it takes the buckets to scan, an
+// ordering hint, and a per-bucket count cap (0 = no cap). The byte-budget /
+// victim decision lives in MasterEvictStrategy, not the store.
+std::vector<NodeTierKey> Buckets(const std::string& node, TierType tier) {
+  return {NodeTierKey{node, tier}};
 }
 
 TEST(InMemoryStore, LookupBlockHasNoLeaseOrAccessSideEffects) {
@@ -305,7 +309,8 @@ TEST(InMemoryStore, LookupBlockHasNoLeaseOrAccessSideEffects) {
   EXPECT_EQ(store.LookupBlock("k1").size(), 1u);
 
   // Not leased → still an eviction candidate at kT0.
-  auto cands = store.EnumerateLruForEviction(Budget("n1", TierType::HBM, 1000), kT0);
+  auto cands = store.EnumerateEvictionCandidates(Buckets("n1", TierType::HBM),
+                                                 EvictionOrder::kLeastRecentlyAccessed, 0, kT0);
   ASSERT_EQ(cands.size(), 1u);
   EXPECT_EQ(cands.begin()->second.size(), 1u);
 }
@@ -320,9 +325,15 @@ TEST(InMemoryStore, LookupBlockForRouteGetGrantsLeaseAndAccess) {
   ASSERT_EQ(locs.size(), 1u);
 
   // Leased until kT0+60s → filtered out of eviction at kT0+10s.
-  EXPECT_TRUE(store.EnumerateLruForEviction(Budget("n1", TierType::HBM, 1000), kT0 + 10s).empty());
+  EXPECT_TRUE(store
+                  .EnumerateEvictionCandidates(Buckets("n1", TierType::HBM),
+                                               EvictionOrder::kLeastRecentlyAccessed, 0, kT0 + 10s)
+                  .empty());
   // After lease expiry it is a candidate again.
-  EXPECT_FALSE(store.EnumerateLruForEviction(Budget("n1", TierType::HBM, 1000), kT0 + 61s).empty());
+  EXPECT_FALSE(store
+                   .EnumerateEvictionCandidates(Buckets("n1", TierType::HBM),
+                                                EvictionOrder::kLeastRecentlyAccessed, 0, kT0 + 61s)
+                   .empty());
 }
 
 TEST(InMemoryStore, RouteGetExcludeNodesNoLeaseWhenFullyExcluded) {
@@ -336,7 +347,10 @@ TEST(InMemoryStore, RouteGetExcludeNodesNoLeaseWhenFullyExcluded) {
   EXPECT_TRUE(locs.empty());  // every location excluded
 
   // No lease granted (hazard #4) → still an eviction candidate immediately.
-  EXPECT_FALSE(store.EnumerateLruForEviction(Budget("n1", TierType::HBM, 1000), kT0).empty());
+  EXPECT_FALSE(store
+                   .EnumerateEvictionCandidates(Buckets("n1", TierType::HBM),
+                                                EvictionOrder::kLeastRecentlyAccessed, 0, kT0)
+                   .empty());
 }
 
 TEST(InMemoryStore, BatchLookupForRouteGetParallelToKeys) {
@@ -365,14 +379,17 @@ TEST(InMemoryStore, BatchExistsBlockNoSideEffects) {
   EXPECT_FALSE(exists[1]);
 
   // No lease granted by an existence check.
-  EXPECT_FALSE(store.EnumerateLruForEviction(Budget("n1", TierType::HBM, 1000), kT0).empty());
+  EXPECT_FALSE(store
+                   .EnumerateEvictionCandidates(Buckets("n1", TierType::HBM),
+                                                EvictionOrder::kLeastRecentlyAccessed, 0, kT0)
+                   .empty());
 }
 
 // ---------------------------------------------------------------------------
-// EnumerateLruForEviction
+// EnumerateEvictionCandidates
 // ---------------------------------------------------------------------------
 
-TEST(InMemoryStore, EvictionLruOrderAndBudget) {
+TEST(InMemoryStore, EvictionLruOrderAndCap) {
   InMemoryMasterMetadataStore store;
   RegisterAlive(store, "n1");
   // Three keys, each 100 bytes, accessed at increasing times so LRU order is
@@ -384,8 +401,11 @@ TEST(InMemoryStore, EvictionLruOrderAndBudget) {
   ASSERT_EQ(Beat(store, "n1", 3, {Add("k_new", TierType::HBM, 100)}, kT0 + 2s).status,
             HeartbeatResult::APPLIED);
 
-  // Budget 150 bytes → should take the two oldest (200 bytes ≥ 150 after second).
-  auto cands = store.EnumerateLruForEviction(Budget("n1", TierType::HBM, 150), kT0 + 10s);
+  // max_per_bucket=2 with LRU order → the two oldest, oldest first. (The store
+  // caps by count; trimming to a byte budget is MasterEvictStrategy's job.)
+  auto cands = store.EnumerateEvictionCandidates(Buckets("n1", TierType::HBM),
+                                                 EvictionOrder::kLeastRecentlyAccessed,
+                                                 /*max_per_bucket=*/2, kT0 + 10s);
   ASSERT_EQ(cands.size(), 1u);
   auto& bucket = cands.at(NodeTierKey{"n1", TierType::HBM});
   ASSERT_EQ(bucket.size(), 2u);
@@ -400,7 +420,10 @@ TEST(InMemoryStore, EvictionSkipsLeased) {
             HeartbeatResult::APPLIED);
   // Lease k1 well past the enumeration time.
   store.LookupBlockForRouteGet("k1", {}, kT0, 1h);
-  EXPECT_TRUE(store.EnumerateLruForEviction(Budget("n1", TierType::HBM, 1000), kT0 + 1s).empty());
+  EXPECT_TRUE(store
+                  .EnumerateEvictionCandidates(Buckets("n1", TierType::HBM),
+                                               EvictionOrder::kLeastRecentlyAccessed, 0, kT0 + 1s)
+                  .empty());
 }
 
 TEST(InMemoryStore, EvictionTieTimestampsAllSurvive) {
@@ -416,20 +439,23 @@ TEST(InMemoryStore, EvictionTieTimestampsAllSurvive) {
   // All keys created (and thus last_accessed) at the identical instant kT0.
   ASSERT_EQ(Beat(store, "n1", 1, adds, kT0).status, HeartbeatResult::APPLIED);
 
-  // Huge budget → take everything; all 50 tied-timestamp candidates must appear.
-  auto cands = store.EnumerateLruForEviction(Budget("n1", TierType::HBM, 100000), kT0 + 10s);
+  // No cap → take everything; all 50 tied-timestamp candidates must appear.
+  auto cands = store.EnumerateEvictionCandidates(Buckets("n1", TierType::HBM),
+                                                 EvictionOrder::kLeastRecentlyAccessed,
+                                                 /*max_per_bucket=*/0, kT0 + 10s);
   ASSERT_EQ(cands.size(), 1u);
   EXPECT_EQ(cands.at(NodeTierKey{"n1", TierType::HBM}).size(), 50u);
 }
 
-TEST(InMemoryStore, EvictionOnlyBudgetedBuckets) {
+TEST(InMemoryStore, EvictionOnlyRequestedBuckets) {
   InMemoryMasterMetadataStore store;
   RegisterAlive(store, "n1");
   ASSERT_EQ(Beat(store, "n1", 1, {Add("kh", TierType::HBM, 10), Add("kd", TierType::DRAM, 10)}, kT0)
                 .status,
             HeartbeatResult::APPLIED);
   // Only ask about the HBM bucket.
-  auto cands = store.EnumerateLruForEviction(Budget("n1", TierType::HBM, 1000), kT0 + 1s);
+  auto cands = store.EnumerateEvictionCandidates(
+      Buckets("n1", TierType::HBM), EvictionOrder::kLeastRecentlyAccessed, 0, kT0 + 1s);
   ASSERT_EQ(cands.size(), 1u);
   EXPECT_EQ(cands.begin()->first.tier, TierType::HBM);
 }
@@ -676,7 +702,9 @@ TEST(InMemoryStore, MixedWorkloadIsRaceFree) {
   threads.emplace_back([&] {
     while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
     for (int i = 0; i < 500; ++i) {
-      store.EnumerateLruForEviction(Budget("n1", TierType::HBM, 50), kT0 + std::chrono::seconds(i));
+      store.EnumerateEvictionCandidates(Buckets("n1", TierType::HBM),
+                                        EvictionOrder::kLeastRecentlyAccessed, 0,
+                                        kT0 + std::chrono::seconds(i));
     }
   });
 

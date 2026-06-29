@@ -124,6 +124,17 @@ struct MasterServerConfig {
   // ~MasterServerConfig to be instantiated in every TU that includes this
   // header, where those types are incomplete.
   static MasterServerConfig FromEnvironment();
+
+  // Special members are user-declared and defined out-of-line in
+  // master_server.cpp.  This struct owns unique_ptrs to forward-declared
+  // strategy types (RouteGetStrategy / RoutePutStrategy / MasterEvictStrategy),
+  // so the destructor and move operations must be emitted in a TU where those
+  // types are complete — not implicitly instantiated in every includer of this
+  // header (which would require each to include all three strategy headers).
+  MasterServerConfig();
+  ~MasterServerConfig();
+  MasterServerConfig(MasterServerConfig&&) noexcept;
+  MasterServerConfig& operator=(MasterServerConfig&&) noexcept;
 };
 
 struct ExportableDram {
