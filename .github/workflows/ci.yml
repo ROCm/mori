@@ -40,8 +40,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # - platform: MI355X_AINIC
-          #   runner: [self-hosted, MI355X-AINIC-TW]
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC-TW]
           - platform: MI325X_BNXT
             runner: [self-hosted, mi325_bnxt]
     timeout-minutes: 15
@@ -88,11 +88,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # - platform: MI355X_AINIC
-          #   runner: [self-hosted, MI355X-AINIC-TW]
-          #   rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
-          #   rdma_sl: 3
-          #   rdma_tc: 104
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC-TW]
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
           - platform: MI325X_BNXT
             runner: [self-hosted, mi325_bnxt]
             rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
@@ -304,10 +304,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # - platform: MI355X_AINIC
-          #   runner: [self-hosted, MI355X-AINIC-TW]
-          #   rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
-          #   gpu_arch: gfx950
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC-TW]
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            gpu_arch: gfx950
           - platform: MI325X_BNXT
             runner: [self-hosted, mi325_bnxt]
             rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
@@ -362,62 +362,61 @@ jobs:
                 chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           fi
 
-  # umbp-unit-test runs only on MI355X-AINIC-TW; commented out (355 task disabled).
-  # umbp-unit-test:
-  #   name: mori umbp unit test (${{ matrix.platform }})
-  #   needs: build
-  #   runs-on: ${{ matrix.runner }}
-  #   strategy:
-  #     fail-fast: false
-  #     matrix:
-  #       include:
-  #         - platform: MI355X_AINIC
-  #           runner: [self-hosted, MI355X-AINIC-TW]
-  #   timeout-minutes: 30
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@v4
-  #       with:
-  #         submodules: true
-  #
-  #     - name: Build CI image
-  #       run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
-  #
-  #     - name: Start container
-  #       run: |
-  #         $CT rm -f $CONTAINER 2>/dev/null || true
-  #         CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
-  #           -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
-  #           -w $GITHUB_WORKSPACE \
-  #           $IMAGE sleep infinity
-  #         $CT exec $CONTAINER \
-  #           git config --global --add safe.directory $GITHUB_WORKSPACE
-  #
-  #     - name: Build mori with UMBP
-  #       run: |
-  #         $CT exec $CONTAINER bash -c \
-  #           "cd $GITHUB_WORKSPACE && BUILD_UMBP=ON BUILD_TESTS=ON pip install -e ."
-  #
-  #     - name: UMBP Python packaging tests
-  #       run: |
-  #         $CT exec $CONTAINER bash -c "
-  #           cd $GITHUB_WORKSPACE
-  #           timeout 60 pytest tests/python/umbp/ -v
-  #         "
-  #
-  #     - name: UMBP C++ unit tests (local + distributed)
-  #       run: |
-  #         $CT exec $CONTAINER bash -c "
-  #           cd $GITHUB_WORKSPACE/build
-  #           timeout 300 ctest --output-on-failure \
-  #             -R '^(umbp_|test_dummy_ssd_tier|test_prefix_aware_eviction|test_ssd_tier)'
-  #         "
-  #
-  #     - name: Cleanup
-  #       if: always()
-  #       run: |
-  #         $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
-  #         $CT rm -f $CONTAINER || true
+  umbp-unit-test:
+    name: mori umbp unit test (${{ matrix.platform }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC-TW]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Build mori with UMBP
+        run: |
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && BUILD_UMBP=ON BUILD_TESTS=ON pip install -e ."
+
+      - name: UMBP Python packaging tests
+        run: |
+          $CT exec $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 60 pytest tests/python/umbp/ -v
+          "
+
+      - name: UMBP C++ unit tests (local + distributed)
+        run: |
+          $CT exec $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE/build
+            timeout 300 ctest --output-on-failure \
+              -R '^(umbp_|test_dummy_ssd_tier|test_prefix_aware_eviction|test_ssd_tier)'
+          "
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT rm -f $CONTAINER || true
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
@@ -427,17 +426,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # - platform: MI355X_AINIC
-          #   runner: [self-hosted, MI355X-AINIC]
-          #   node1_host: 10.2.80.22
-          #   node2_host: 10.2.80.20
-          #   node2_port: 22
-          #   node1_ifname: enp193s0f1np1
-          #   node2_ifname: enp193s0f1np1
-          #   rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
-          #   rdma_sl: 3
-          #   rdma_tc: 104
-          #   ct: podman
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
+            node1_host: 10.2.80.22
+            node2_host: 10.2.80.20
+            node2_port: 22
+            node1_ifname: enp193s0f1np1
+            node2_ifname: enp193s0f1np1
+            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
+            rdma_sl: 3
+            rdma_tc: 104
+            ct: podman
           - platform: MI325X_BNXT
             runner: [self-hosted, mi325_bnxt]
             node1_host: 10.162.224.131
@@ -755,54 +754,53 @@ jobs:
             -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT rm -f $CONTAINER || true"
 
-  # umbp-single-node-hicache runs only on MI355X-AINIC-TW; commented out (355 task disabled).
-  # umbp-single-node-hicache:
-  #   name: mori umbp single-node hicache smoke test
-  #   needs: build
-  #   if: github.event_name == 'workflow_dispatch' && inputs.run_umbp_single_node_hicache == 'true'
-  #   runs-on: [self-hosted, MI355X-AINIC-TW]
-  #   timeout-minutes: 180
-  #   steps:
-  #     - name: Checkout MoRI
-  #       uses: actions/checkout@v4
-  #       with:
-  #         submodules: true
-  #
-  #     - name: Checkout SGLang
-  #       uses: actions/checkout@v4
-  #       with:
-  #         repository: ${{ inputs.sglang_repo }}
-  #         ref: ${{ inputs.sglang_ref }}
-  #         path: sglang
-  #         fetch-depth: 1
-  #
-  #     - name: Ensure hicache script is executable
-  #       run: chmod +x src/umbp/scripts/run_umbp_single_node_hicache.sh
-  #
-  #     - name: Run hicache smoke test
-  #       env:
-  #         SGLANG_REPO: ${{ github.workspace }}/sglang
-  #         MORI_REPO: ${{ github.workspace }}
-  #         RESULTS_DIR: ${{ github.workspace }}/umbp_single_node_results
-  #         USE_DUMMY_WEIGHTS: "true"
-  #         RUN_GSM8K: "false"
-  #         MODEL_PATH: ${{ github.workspace }}/umbp_dummy_model
-  #         ENABLE_DP: ${{ inputs.enable_dp }}
-  #         START_UMBP_MASTER: "false"
-  #       run: |
-  #         set -euo pipefail
-  #         mkdir -p "$RESULTS_DIR"
-  #         ./src/umbp/scripts/run_umbp_single_node_hicache.sh
-  #
-  #     - name: Upload hicache artifacts
-  #       if: always()
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: umbp-single-node-hicache-${{ github.run_id }}
-  #         path: |
-  #           ${{ github.workspace }}/umbp_single_node_results
-  #         if-no-files-found: warn
-  #
-  #     - name: Cleanup hicache container
-  #       if: always()
-  #       run: docker rm -f umbp-single-node >/dev/null 2>&1 || true
+  umbp-single-node-hicache:
+    name: mori umbp single-node hicache smoke test
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.run_umbp_single_node_hicache == 'true'
+    runs-on: [self-hosted, MI355X-AINIC-TW]
+    timeout-minutes: 180
+    steps:
+      - name: Checkout MoRI
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Checkout SGLang
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.sglang_repo }}
+          ref: ${{ inputs.sglang_ref }}
+          path: sglang
+          fetch-depth: 1
+
+      - name: Ensure hicache script is executable
+        run: chmod +x src/umbp/scripts/run_umbp_single_node_hicache.sh
+
+      - name: Run hicache smoke test
+        env:
+          SGLANG_REPO: ${{ github.workspace }}/sglang
+          MORI_REPO: ${{ github.workspace }}
+          RESULTS_DIR: ${{ github.workspace }}/umbp_single_node_results
+          USE_DUMMY_WEIGHTS: "true"
+          RUN_GSM8K: "false"
+          MODEL_PATH: ${{ github.workspace }}/umbp_dummy_model
+          ENABLE_DP: ${{ inputs.enable_dp }}
+          START_UMBP_MASTER: "false"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULTS_DIR"
+          ./src/umbp/scripts/run_umbp_single_node_hicache.sh
+
+      - name: Upload hicache artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: umbp-single-node-hicache-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/umbp_single_node_results
+          if-no-files-found: warn
+
+      - name: Cleanup hicache container
+        if: always()
+        run: docker rm -f umbp-single-node >/dev/null 2>&1 || true
