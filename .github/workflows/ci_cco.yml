@@ -63,13 +63,10 @@ jobs:
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         run: |
-          $CT exec $CONTAINER bash $GITHUB_WORKSPACE/tools/run_cco_tests.sh $GITHUB_WORKSPACE/build 4
+          $CT exec $CONTAINER bash $GITHUB_WORKSPACE/tools/run_cco_tests.sh $GITHUB_WORKSPACE/build 4 2>&1
 
-      - name: Cleanup
+      - name: Print container name for debug
         if: always()
         run: |
-          $CT rm -f $CONTAINER || true
-          if $CT image inspect $IMAGE &>/dev/null; then
-            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
-                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
-          fi
+          echo "Container left running for debug: $CONTAINER"
+          echo "Attach with: docker exec -it $CONTAINER bash"
