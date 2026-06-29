@@ -120,7 +120,6 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             npes=world_size,
             input_buffer_size=total_bytes,
             output_buffer_size=total_bytes * world_size,
-            copy_output_to_user=False,
         )
 
         stream = torch.cuda.Stream(device=device)
@@ -137,6 +136,15 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             sync_output = torch.empty(
                 total_count * world_size, dtype=torch.float32, device=device
             )
+            with pytest.raises(ValueError, match="same length"):
+                handle.enqueue_param_contiguous(
+                    sync_input,
+                    sync_output,
+                    total_count,
+                    split_sizes,
+                    split_offsets[:-1],
+                    stream,
+                )
 
             dist.barrier()
             with torch.cuda.stream(stream):
@@ -151,9 +159,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             assert ok, "enqueue_param_contiguous returned false"
             stream.synchronize()
 
-            sync_got = handle.get_output_transit_buffer(
-                dtype=torch.float32, device=device
-            )[: total_count * world_size].clone()
+            sync_got = sync_output.clone()
             _assert_matches_param_contiguous(
                 sync_got,
                 world_size,
@@ -174,6 +180,15 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             async_output = torch.empty(
                 total_count * world_size, dtype=torch.float32, device=device
             )
+            with pytest.raises(ValueError, match="same length"):
+                handle.start_async_param_contiguous(
+                    async_input,
+                    async_output,
+                    total_count,
+                    split_sizes,
+                    split_offsets[:-1],
+                    stream,
+                )
 
             dist.barrier()
             with torch.cuda.stream(stream):
@@ -191,9 +206,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             assert elapsed >= 0, "wait_async returned a negative duration"
             stream.synchronize()
 
-            async_got = handle.get_output_transit_buffer(
-                dtype=torch.float32, device=device
-            )[: total_count * world_size].clone()
+            async_got = async_output.clone()
             _assert_matches_param_contiguous(
                 async_got,
                 world_size,

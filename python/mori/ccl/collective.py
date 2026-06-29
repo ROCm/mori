@@ -284,6 +284,8 @@ class AllgatherSdma:
         split_offsets,
         stream=None,
     ) -> bool:
+        if split_sizes.numel() != split_offsets.numel():
+            raise ValueError("split_sizes and split_offsets must have the same length")
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
         s = _stream_to_int(stream)
@@ -299,6 +301,7 @@ class AllgatherSdma:
         _get_ccl_func("OneShotAllGatherSdmaParamContiguousKernel_u32").launch_struct(
             (1,), (512,), 0, s, args
         )
+        self._handle.finish_sync(output_data.data_ptr(), u32_count, s)
         return True
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
@@ -323,6 +326,8 @@ class AllgatherSdma:
         split_offsets,
         stream=None,
     ) -> bool:
+        if split_sizes.numel() != split_offsets.numel():
+            raise ValueError("split_sizes and split_offsets must have the same length")
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
         s = _stream_to_int(stream)
