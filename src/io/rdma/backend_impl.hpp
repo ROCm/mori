@@ -100,6 +100,7 @@ class RdmaManager {
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
   size_t NumAvailDevices() const { return availDevices.size(); }
+  bool HasIonicDevice() const;
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);

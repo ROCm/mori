@@ -588,6 +588,17 @@ application::RdmaDeviceContext* RdmaManager::GetRdmaDeviceContext(int devId) {
   return deviceCtxs[devId];
 }
 
+bool RdmaManager::HasIonicDevice() const {
+  for (const auto& [device, portId] : availDevices) {
+    const ibv_device_attr_ex* attr = device->GetDeviceAttr();
+    if (attr && attr->orig_attr.vendor_id ==
+                    static_cast<uint32_t>(application::RdmaDeviceVendorId::Pensando)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<std::shared_ptr<EndpointRuntime>> RdmaManager::SnapshotEndpointRuntimes() {
   std::shared_lock<std::shared_mutex> lock(mu);
   std::vector<std::shared_ptr<EndpointRuntime>> result;
@@ -1466,6 +1477,13 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
   server.reset(new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, config, rdma.get(),
                                       notif.get()));
   server->Start();
+
+  if (config.qpPerTransfer == 1 && rdma->HasIonicDevice()) {
+    MORI_IO_WARN(
+        "ionic NIC detected with qpPerTransfer=1: single-QP ionic performance is prone to SQ "
+        "full under load; consider increasing qpPerTransfer (e.g. 4) and setting "
+        "numWorkerThreads to the same value");
+  }
 
   bool useInlineOnly = UsesInlineOnly(config);
   if (config.numWorkerThreads > 1 && useInlineOnly) {
