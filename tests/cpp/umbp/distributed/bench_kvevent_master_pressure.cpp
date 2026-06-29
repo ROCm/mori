@@ -20,7 +20,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Multi-client "agent" KV-event pressure benchmark.
+// Multi-client master KV-event pressure benchmark (simulates an LLM-agent-style
+// put -> LLM-call-gap -> get workload).
 //
 // PRIMARY GOAL: load the master and quantify whether its per-RPC latency
 // (BatchRoutePut / BatchLookup / BatchRouteGet / Heartbeat ...) degrades as QPS
@@ -292,7 +293,7 @@ struct BenchOpts {
 
 void Usage() {
   std::fprintf(stderr,
-               "Usage: bench_agent_kvevent_pressure [options]\n"
+               "Usage: bench_kvevent_master_pressure [options]\n"
                "  --mode baseline|compressed|flush   (default baseline)\n"
                "  --pattern broadcast|rotate         (default rotate)\n"
                "  --get-mode exists|fetch|both       (default exists)\n"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Driver for bench_umbp_agent_kvevent_pressure.
+# Driver for bench_umbp_kvevent_master_pressure.
 #
 # Runs the master-pressure benchmark across the three kv-event propagation
 # schemes (baseline / compressed / flush) in up to three run classes (select via
@@ -24,7 +24,7 @@
 # unique metrics port.  Two CSV segments per run are split into aggregate files.
 #
 # Env overrides:
-#   BIN                 path to bench_umbp_agent_kvevent_pressure
+#   BIN                 path to bench_umbp_kvevent_master_pressure
 #   OUTDIR              results directory (default ./kvevent_results)
 #   CLASSES             space-separated subset of "pressure miss scale" (default all)
 #   METRICS_PORT_BASE   first Prometheus port (default 19200)
@@ -43,12 +43,12 @@ find_bin() {
   if [[ -n "${BIN:-}" && -x "${BIN}" ]]; then echo "${BIN}"; return; fi
   local c
   for c in \
-    "${SCRIPT_DIR}"/../../../../build*/tests/cpp/umbp/distributed/bench_umbp_agent_kvevent_pressure \
-    "${SCRIPT_DIR}"/../../../../build/tests/cpp/umbp/distributed/bench_umbp_agent_kvevent_pressure; do
+    "${SCRIPT_DIR}"/../../../../build*/tests/cpp/umbp/distributed/bench_umbp_kvevent_master_pressure \
+    "${SCRIPT_DIR}"/../../../../build/tests/cpp/umbp/distributed/bench_umbp_kvevent_master_pressure; do
     if [[ -x "${c}" ]]; then echo "${c}"; return; fi
   done
   # Last resort: search the repo build trees.
-  find "${SCRIPT_DIR}/../../../.." -type f -name bench_umbp_agent_kvevent_pressure -perm -u+x 2>/dev/null | head -n1
+  find "${SCRIPT_DIR}/../../../.." -type f -name bench_umbp_kvevent_master_pressure -perm -u+x 2>/dev/null | head -n1
 }
 
 BIN="$(find_bin)"
