@@ -82,12 +82,9 @@ std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(
     const std::unordered_set<std::string>& exclude_nodes) {
   std::vector<std::optional<RouteGetResolution>> results(keys.size());
 
-  // Snapshot peer addresses once for the whole batch.  Master assumes
-  // the snapshot is stable for the duration of one BatchRouteGet.
-  std::unordered_map<std::string, std::string> node_to_peer;
-  for (const auto& client : registry_.GetAliveClients()) {
-    node_to_peer[client.node_id] = client.peer_address;
-  }
+  // Lightweight membership view (no capacity): an O(nodes) copy of just the
+  // node->peer pairs, far cheaper than GetAliveClients' full per-node records.
+  auto node_to_peer = registry_.GetAlivePeerView();
 
   auto all_locs = index_.BatchLookupForRouteGet(keys, exclude_nodes, lease_duration_);
   for (size_t i = 0; i < keys.size(); ++i) {

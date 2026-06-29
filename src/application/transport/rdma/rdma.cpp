@@ -417,6 +417,17 @@ void RdmaDeviceContext::DeregisterRdmaMemoryRegion(void* ptr) {
   mrPool.erase(ptr);
 }
 
+bool RdmaDeviceContext::DestroyRdmaEndpointNoThrow(const RdmaEndpoint& ep) noexcept {
+  try {
+    MORI_APP_WARN(
+        "DestroyRdmaEndpointNoThrow is unsupported for provider vendorId={} qpn={} cq={}; "
+        "leaving endpoint for normal context teardown",
+        static_cast<uint32_t>(ep.vendorId), ep.handle.qpn, static_cast<void*>(ep.ibvHandle.cq));
+  } catch (...) {
+  }
+  return false;
+}
+
 ibv_srq* RdmaDeviceContext::CreateRdmaSrqIfNx(const RdmaEndpointConfig& config) {
   assert(config.maxMsgSge <= GetRdmaDevice()->GetDeviceAttr()->orig_attr.max_sge);
   if (srq == nullptr) {

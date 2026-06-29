@@ -192,6 +192,10 @@ class FakeSource : public OwnedLocationSource {
     return out;
   }
   std::vector<KvEvent> SnapshotOwnedKeys() const override { return events_; }
+  std::vector<KvEvent> SnapshotOwnedKeysForFullSync() override {
+    drained_ = true;  // outbox dropped by the authoritative full-sync snapshot
+    return events_;
+  }
   bool drained_ = false;
 
  private:
@@ -215,7 +219,7 @@ TEST(OwnedLocationSourceAgg, DrainAndSnapshotConcatAcrossSourcesInOrder) {
   EXPECT_TRUE(dram.drained_);
   EXPECT_TRUE(ssd.drained_);
 
-  auto snap = SnapshotAllSources(sources);
+  auto snap = SnapshotAllSourcesForFullSync(sources);
   ASSERT_EQ(snap.size(), 3u);
   EXPECT_EQ(snap[2].tier, TierType::SSD);
 }
@@ -226,7 +230,7 @@ TEST(OwnedLocationSourceAgg, NullSourcesAreSkipped) {
   auto drained = DrainAllSources(sources);
   ASSERT_EQ(drained.size(), 1u);
   EXPECT_EQ(drained[0].key, "x");
-  EXPECT_TRUE(SnapshotAllSources({nullptr}).empty());
+  EXPECT_TRUE(SnapshotAllSourcesForFullSync({nullptr}).empty());
 }
 
 }  // namespace

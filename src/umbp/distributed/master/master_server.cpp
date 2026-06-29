@@ -25,6 +25,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -89,9 +90,6 @@ KvEvent FromProtoEvent(const ::umbp::KvEvent& pe) {
       break;
     case ::umbp::KvEvent::REMOVE:
       ev.kind = KvEvent::Kind::REMOVE;
-      break;
-    case ::umbp::KvEvent::CLEAR_AT_TIER:
-      ev.kind = KvEvent::Kind::CLEAR_AT_TIER;
       break;
     default:
       ev.kind = KvEvent::Kind::ADD;
@@ -589,10 +587,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
     auto matches = external_kv_index_.Match(hashes);
 
-    std::unordered_map<std::string, std::string> peer_map;
-    for (const auto& record : registry_.GetAliveClients()) {
-      peer_map[record.node_id] = record.peer_address;
-    }
+    auto peer_map = registry_.GetAlivePeerView();
     for (auto& m : matches) {
       auto* proto_match = response->add_matches();
       proto_match->set_node_id(m.node_id);
@@ -701,7 +696,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   void UpdateClientCountMetric() {
     if (!metrics_) return;
     metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_COUNT, MORI_UMBP_METRIC_CLIENT_COUNT_HELP,
-                       static_cast<double>(registry_.GetAliveClients().size()));
+                       static_cast<double>(registry_.AliveClientCount()));
   }
 
   void UpdateClientCapacityMetrics(const std::string& node_id,
@@ -779,6 +774,27 @@ void MasterServer::Run() {
   grpc::ServerBuilder builder;
   builder.SetMaxReceiveMessageSize(64 * 1024 * 1024);
   builder.SetMaxSendMessageSize(64 * 1024 * 1024);
+  // Size the sync-server poller/handler thread pool to the client fan-out.
+  // The default sync server runs only a couple of poller threads, which also
+  // execute the RPC handlers; under many concurrent clients a burst of large
+  // Heartbeat handlers occupies those few threads and starves unrelated RPCs
+  // (e.g. RoutePut), which then queue at the gRPC layer for tens of ms even
+  // though each handler runs in well under 1ms.  Widening the pool removes
+  // that head-of-line blocking.  Tunable via env for large deployments.
+  {
+    auto env_pollers = [](const char* name, int def) -> int {
+      const char* v = std::getenv(name);
+      if (v == nullptr) return def;
+      char* end = nullptr;
+      long n = std::strtol(v, &end, 10);
+      return (end == v || n <= 0) ? def : static_cast<int>(n);
+    };
+    const int min_pollers = env_pollers("UMBP_MASTER_MIN_POLLERS", 8);
+    int max_pollers = env_pollers("UMBP_MASTER_MAX_POLLERS", 64);
+    if (max_pollers < min_pollers) max_pollers = min_pollers;
+    builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MIN_POLLERS, min_pollers);
+    builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MAX_POLLERS, max_pollers);
+  }
   int selected_port = 0;
   builder.AddListeningPort(config_.listen_address, grpc::InsecureServerCredentials(),
                            &selected_port);

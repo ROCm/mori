@@ -140,6 +140,17 @@ struct ChunkedSgeSegment {
   uint32_t length{0};
 };
 
+struct ChunkGeometry {
+  uint64_t finalCount{0};
+  uint64_t targetChunkBytes{0};
+};
+
+ChunkGeometry PlanChunkGeometry(uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                                uint64_t maxMessageSize);
+
+uint64_t CountChunksForSize(uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                            uint64_t maxMessageSize);
+
 void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector<ibv_sge>& sges,
                          uint64_t totalLength, size_t chunkBytes, int maxChunks,
                          uint64_t maxMessageSize);
@@ -244,6 +255,23 @@ struct RdmaOpRet {
 
 RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, std::shared_ptr<CqCallbackMeta> callbackMeta,
                              TransferUniqueId id);
+
+struct RdmaTransferControl {
+  size_t chunkBytes{0};
+  int maxChunks{1};
+  bool creditByWrCount{false};
+  bool ownsTotalBatchSize{true};
+  bool disableMerge{false};
+  int extraCompletionCredits{0};
+};
+
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
+                             const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                             const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                             const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id, bool isRead, int postBatchSize,
+                             const RdmaTransferControl& control);
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                              const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
