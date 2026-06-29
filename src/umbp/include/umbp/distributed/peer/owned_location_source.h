@@ -50,6 +50,15 @@ class OwnedLocationSource {
   // Full snapshot of every owned key as ADD events (full sync on seq gap or
   // master restart).  const: a snapshot must not mutate the source's state.
   virtual std::vector<KvEvent> SnapshotOwnedKeys() const = 0;
+
+  // Snapshot for a full sync that ALSO atomically drops the source's outbox.
+  // After a full sync the snapshot is the authoritative state, so any event
+  // still queued at snapshot time is already reflected in it (ADDs are in the
+  // snapshot; REMOVEs are implied by the master's full replace) and must not be
+  // re-shipped as a redundant post-full-sync delta.  The snapshot and the outbox
+  // clear MUST happen in the SAME critical section — doing it in two separate
+  // locks would drop events committed in between.
+  virtual std::vector<KvEvent> SnapshotOwnedKeysForFullSync() = 0;
 };
 
 // Drain every source and concat into one event list, in source order.  The
@@ -68,13 +77,16 @@ inline std::vector<KvEvent> DrainAllSources(const std::vector<OwnedLocationSourc
   return merged;
 }
 
-// Snapshot every source and concat into one event list, in source order.  Null
-// sources are skipped.
-inline std::vector<KvEvent> SnapshotAllSources(const std::vector<OwnedLocationSource*>& sources) {
+// Snapshot every source and concat into one event list, in source order (full-
+// sync path).  Each source ALSO atomically clears its outbox: the snapshot is
+// authoritative, so the queued delta is redundant and must not be re-shipped
+// afterwards.  Null sources are skipped.  Non-const because it mutates sources.
+inline std::vector<KvEvent> SnapshotAllSourcesForFullSync(
+    const std::vector<OwnedLocationSource*>& sources) {
   std::vector<KvEvent> merged;
-  for (const auto* src : sources) {
+  for (auto* src : sources) {
     if (src == nullptr) continue;
-    auto events = src->SnapshotOwnedKeys();
+    auto events = src->SnapshotOwnedKeysForFullSync();
     merged.insert(merged.end(), std::make_move_iterator(events.begin()),
                   std::make_move_iterator(events.end()));
   }

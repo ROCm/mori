@@ -132,22 +132,6 @@ TEST(GlobalBlockIndexEvents, RemoveDramKeepsSsdBucket) {
   EXPECT_TRUE(HasLocation(locs, "node-A", TierType::SSD, 100));    // SSD bucket retained
 }
 
-TEST(GlobalBlockIndexEvents, ClearAtTierClearsOnlyTargetNodeTier) {
-  GlobalBlockIndex idx;
-  idx.ApplyEvents("node-A", {Add("k1", TierType::DRAM, 1), Add("k2", TierType::SSD, 2),
-                             Add("k3", TierType::DRAM, 3)});
-  idx.ApplyEvents("node-B", {Add("k1", TierType::DRAM, 10)});
-
-  EXPECT_EQ(
-      idx.ApplyEvents("node-A", {KvEvent{KvEvent::Kind::CLEAR_AT_TIER, "", TierType::DRAM, 0}}),
-      2u);
-
-  EXPECT_FALSE(HasLocation(idx.Lookup("k1"), "node-A", TierType::DRAM, 1));
-  EXPECT_TRUE(HasLocation(idx.Lookup("k1"), "node-B", TierType::DRAM, 10));
-  EXPECT_TRUE(HasLocation(idx.Lookup("k2"), "node-A", TierType::SSD, 2));
-  EXPECT_TRUE(idx.Lookup("k3").empty());
-}
-
 // ---- ReplaceNodeLocations: full-sync recovery ------------------------------
 
 TEST(GlobalBlockIndexEvents, ReplaceNodeLocationsClearsThenInserts) {

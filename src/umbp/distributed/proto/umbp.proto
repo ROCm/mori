@@ -79,7 +79,8 @@ message KvEvent {
   enum Kind {
     ADD           = 0;
     REMOVE        = 1;
-    CLEAR_AT_TIER = 2;
+    reserved 2;
+    reserved "CLEAR_AT_TIER";
   }
   Kind          kind  = 1;
   string        key   = 2;
