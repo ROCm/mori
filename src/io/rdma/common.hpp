@@ -253,7 +253,8 @@ struct RdmaOpRet {
   bool Failed() { return code > StatusCode::ERR_BEGIN; }
 };
 
-RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id);
 
 struct RdmaTransferControl {
   size_t chunkBytes{0};
@@ -261,6 +262,7 @@ struct RdmaTransferControl {
   bool creditByWrCount{false};
   bool ownsTotalBatchSize{true};
   bool disableMerge{false};
+  int extraCompletionCredits{0};
 };
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
