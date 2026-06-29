@@ -219,9 +219,8 @@ void RegisterMoriCcl(pybind11::module_& m) {
                 reinterpret_cast<const size_t*>(split_offsets), split_count,
                 reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"),
-          py::arg("split_sizes_ptr"), py::arg("split_offsets_ptr"), py::arg("split_count"),
-          py::arg("stream"))
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("split_sizes_ptr"),
+          py::arg("split_offsets_ptr"), py::arg("split_count"), py::arg("stream"))
       .def(
           "finish_sync",
           [](AllgatherU32& self, uintptr_t output, size_t count, int64_t stream) -> double {
@@ -249,9 +248,8 @@ void RegisterMoriCcl(pybind11::module_& m) {
                 reinterpret_cast<const size_t*>(split_offsets), split_count,
                 reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"),
-          py::arg("split_sizes_ptr"), py::arg("split_offsets_ptr"), py::arg("split_count"),
-          py::arg("stream"))
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("split_sizes_ptr"),
+          py::arg("split_offsets_ptr"), py::arg("split_count"), py::arg("stream"))
       .def("after_async_start", &AllgatherU32::after_async_start)
       .def(
           "prepare_async_wait",

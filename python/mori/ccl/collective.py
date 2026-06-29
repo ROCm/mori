@@ -276,7 +276,13 @@ class AllgatherSdma:
         return True
 
     def enqueue_param_contiguous(
-        self, input_data, output_data, count: int, split_sizes, split_offsets, stream=None
+        self,
+        input_data,
+        output_data,
+        count: int,
+        split_sizes,
+        split_offsets,
+        stream=None,
     ) -> bool:
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
@@ -309,7 +315,13 @@ class AllgatherSdma:
         return True
 
     def start_async_param_contiguous(
-        self, input_data, output_data, count: int, split_sizes, split_offsets, stream=None
+        self,
+        input_data,
+        output_data,
+        count: int,
+        split_sizes,
+        split_offsets,
+        stream=None,
     ) -> bool:
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
@@ -323,9 +335,9 @@ class AllgatherSdma:
             split_sizes.numel(),
             s,
         )
-        _get_ccl_func("OneShotAllGatherSdmaParamContiguousAsyncPutKernel_u32").launch_struct(
-            (1,), (512,), 0, s, args
-        )
+        _get_ccl_func(
+            "OneShotAllGatherSdmaParamContiguousAsyncPutKernel_u32"
+        ).launch_struct((1,), (512,), 0, s, args)
         self._handle.after_async_start()
         return True
 

@@ -96,8 +96,8 @@ template <typename T>
 __device__ void OneShotAllGatherSdmaParamContiguousAsyncPutKernel_body(
     int myPe, int npes, T* input, const application::SymmMemObjPtr srcMemObj,
     const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
-    size_t elementCount, size_t dstBaseOffset, const size_t* splitSizes,
-    const size_t* splitOffsets, size_t splitCount) {
+    size_t elementCount, size_t dstBaseOffset, const size_t* splitSizes, const size_t* splitOffsets,
+    size_t splitCount) {
   if (elementCount == 0 || npes <= 0 || splitCount == 0) {
     return;
   }
@@ -122,8 +122,8 @@ __device__ void OneShotAllGatherSdmaParamContiguousAsyncPutKernel_body(
         continue;
       }
       size_t inputElemOffset = splitOffsets[split];
-      size_t outputElemOffset = splitOffsets[split] * static_cast<size_t>(npes) +
-                                static_cast<size_t>(myPe) * splitElems;
+      size_t outputElemOffset =
+          splitOffsets[split] * static_cast<size_t>(npes) + static_cast<size_t>(myPe) * splitElems;
       uint8_t* srcPtr = reinterpret_cast<uint8_t*>(input) + inputElemOffset * bytesPerElement;
       uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset +
                         outputElemOffset * bytesPerElement;
@@ -140,8 +140,8 @@ __global__ void OneShotAllGatherSdmaParamContiguousAsyncPutKernel(
     size_t elementCount, size_t dstBaseOffset = 0, const size_t* splitSizes = nullptr,
     const size_t* splitOffsets = nullptr, size_t splitCount = 0) {
   OneShotAllGatherSdmaParamContiguousAsyncPutKernel_body<T>(
-      myPe, npes, input, srcMemObj, dstMemObj, flagsMemObj, elementCount, dstBaseOffset,
-      splitSizes, splitOffsets, splitCount);
+      myPe, npes, input, srcMemObj, dstMemObj, flagsMemObj, elementCount, dstBaseOffset, splitSizes,
+      splitOffsets, splitCount);
 }
 
 __device__ void OneShotAllGatherSdmaAsyncWaitKernel_body(

@@ -152,8 +152,8 @@ __device__ void OneShotAllGatherSdmaParamContiguousKernel_body(
         continue;
       }
       size_t inputElemOffset = splitOffsets[split];
-      size_t outputElemOffset = splitOffsets[split] * static_cast<size_t>(npes) +
-                                static_cast<size_t>(myPe) * splitElems;
+      size_t outputElemOffset =
+          splitOffsets[split] * static_cast<size_t>(npes) + static_cast<size_t>(myPe) * splitElems;
       uint8_t* srcPtr = reinterpret_cast<uint8_t*>(input) + inputElemOffset * bytesPerElement;
       uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset +
                         outputElemOffset * bytesPerElement;
@@ -202,9 +202,9 @@ __global__ void OneShotAllGatherSdmaParamContiguousKernel(
     size_t elementCount, size_t dstBaseOffset = 0, uint64_t flagVal = 1,
     const size_t* splitSizes = nullptr, const size_t* splitOffsets = nullptr,
     size_t splitCount = 0) {
-  OneShotAllGatherSdmaParamContiguousKernel_body<T>(
-      myPe, npes, input, srcMemObj, dstMemObj, flagsMemObj, elementCount, dstBaseOffset, flagVal,
-      splitSizes, splitOffsets, splitCount);
+  OneShotAllGatherSdmaParamContiguousKernel_body<T>(myPe, npes, input, srcMemObj, dstMemObj,
+                                                    flagsMemObj, elementCount, dstBaseOffset,
+                                                    flagVal, splitSizes, splitOffsets, splitCount);
 }
 }  // namespace collective
 }  // namespace mori

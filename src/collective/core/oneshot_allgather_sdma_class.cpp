@@ -404,9 +404,10 @@ int64_t AllgatherSdma<T>::prepare_sync(T* input, T* output, size_t total_count,
 }
 
 template <typename T>
-int64_t AllgatherSdma<T>::prepare_sync_param_contiguous(
-    T* input, T* output, size_t total_count, const size_t* split_sizes,
-    const size_t* split_offsets, size_t split_count, hipStream_t stream) {
+int64_t AllgatherSdma<T>::prepare_sync_param_contiguous(T* input, T* output, size_t total_count,
+                                                        const size_t* split_sizes,
+                                                        const size_t* split_offsets,
+                                                        size_t split_count, hipStream_t stream) {
   (void)stream;
   uint64_t flag_token = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
   auto [regObj, byteOffset] = find_registered(output);
@@ -495,8 +496,8 @@ int64_t AllgatherSdma<T>::prepare_async_start(T* input, T* output, size_t total_
 
 template <typename T>
 int64_t AllgatherSdma<T>::prepare_async_start_param_contiguous(
-    T* input, T* output, size_t total_count, const size_t* split_sizes,
-    const size_t* split_offsets, size_t split_count, hipStream_t stream) {
+    T* input, T* output, size_t total_count, const size_t* split_sizes, const size_t* split_offsets,
+    size_t split_count, hipStream_t stream) {
   bool expected = false;
   if (!async_in_progress_.compare_exchange_strong(expected, true)) {
     throw std::runtime_error("Another async operation is already in progress");
