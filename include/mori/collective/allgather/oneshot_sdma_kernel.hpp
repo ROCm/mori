@@ -128,7 +128,8 @@ __device__ void OneShotAllGatherSdmaParamContiguousKernel_body(
     const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
     size_t elementCount, size_t dstBaseOffset, uint64_t flagVal, const size_t* splitSizes,
     const size_t* splitOffsets, size_t splitCount) {
-  if (elementCount == 0 || npes <= 0 || splitCount == 0) {
+  if (elementCount == 0 || npes <= 0 || splitCount == 0 || splitSizes == nullptr ||
+      splitOffsets == nullptr) {
     return;
   }
 
@@ -152,8 +153,11 @@ __device__ void OneShotAllGatherSdmaParamContiguousKernel_body(
         continue;
       }
       size_t inputElemOffset = splitOffsets[split];
+      if (inputElemOffset > elementCount || splitElems > elementCount - inputElemOffset) {
+        continue;
+      }
       size_t outputElemOffset =
-          splitOffsets[split] * static_cast<size_t>(npes) + static_cast<size_t>(myPe) * splitElems;
+          inputElemOffset * static_cast<size_t>(npes) + static_cast<size_t>(myPe) * splitElems;
       uint8_t* srcPtr = reinterpret_cast<uint8_t*>(input) + inputElemOffset * bytesPerElement;
       uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset +
                         outputElemOffset * bytesPerElement;

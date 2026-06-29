@@ -319,8 +319,16 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
   SymmMemObj gpuMemObjHost{};
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(&gpuMemObjHost, memObjPtr.gpu, sizeof(SymmMemObj), hipMemcpyDeviceToHost));
+  bool haveGpuMemObjHost = false;
+  hipError_t copyErr =
+      hipMemcpy(&gpuMemObjHost, memObjPtr.gpu, sizeof(SymmMemObj), hipMemcpyDeviceToHost);
+  if (copyErr == hipSuccess) {
+    haveGpuMemObjHost = true;
+  } else {
+    MORI_APP_WARN("hipMemcpy failed for GPU SymmMemObj during deregistration: {}",
+                  hipGetErrorString(copyErr));
+    (void)hipGetLastError();
+  }
 
   auto freeGpuMetadata = [](void* ptr, const char* name) {
     if (ptr == nullptr) return;
@@ -369,20 +377,24 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
     }
     free(memObjPtr.cpu->peerSignalPtrsHost);
   }
-  freeGpuMetadata(gpuMemObjHost.signalPtrs, "signalPtrs");
-  freeGpuMetadata(gpuMemObjHost.expectSignalsPtr, "expectSignalsPtr");
-  freeGpuMetadata(gpuMemObjHost.peerSignalPtrs, "peerSignalPtrs");
-  freeGpuMetadata(gpuMemObjHost.deviceHandles_d, "deviceHandles_d");
+  if (haveGpuMemObjHost) {
+    freeGpuMetadata(gpuMemObjHost.signalPtrs, "signalPtrs");
+    freeGpuMetadata(gpuMemObjHost.expectSignalsPtr, "expectSignalsPtr");
+    freeGpuMetadata(gpuMemObjHost.peerSignalPtrs, "peerSignalPtrs");
+    freeGpuMetadata(gpuMemObjHost.deviceHandles_d, "deviceHandles_d");
+  }
 
   free(memObjPtr.cpu->peerPtrs);
   free(memObjPtr.cpu->p2pPeerPtrs);
   free(memObjPtr.cpu->peerRkeys);
   free(memObjPtr.cpu->ipcMemHandles);
   free(memObjPtr.cpu);
-  HIP_RUNTIME_CHECK(hipFree(gpuMemObjHost.peerPtrs));
-  HIP_RUNTIME_CHECK(hipFree(gpuMemObjHost.p2pPeerPtrs));
-  HIP_RUNTIME_CHECK(hipFree(gpuMemObjHost.peerRkeys));
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu));
+  if (haveGpuMemObjHost) {
+    freeGpuMetadata(gpuMemObjHost.peerPtrs, "peerPtrs");
+    freeGpuMetadata(gpuMemObjHost.p2pPeerPtrs, "p2pPeerPtrs");
+    freeGpuMetadata(gpuMemObjHost.peerRkeys, "peerRkeys");
+  }
+  freeGpuMetadata(memObjPtr.gpu, "SymmMemObj");
 
   memObjPool.erase(localPtr);
 }
