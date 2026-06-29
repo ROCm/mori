@@ -123,4 +123,90 @@ TEST(RouterDedup, BatchRoutePutAlreadyExistsBypassesUnroutablePut) {
   EXPECT_FALSE(results[1].has_value());  // distinct from kAlreadyExists
 }
 
+// Single-key RoutePut delegates to the batch path, so master-side dedup applies:
+// an indexed key returns kAlreadyExists while an unknown key still routes.  This
+// locks in the delegation; without it RoutePut would silently skip dedup.
+TEST(RouterDedup, RoutePutMarksAlreadyExistsForIndexedKey) {
+  const auto now = std::chrono::system_clock::now();
+  InMemoryMasterMetadataStore store;
+  Router router(store);
+
+  RegisterWithKey(store, "node-a", "key-X", now);
+
+  std::unordered_set<std::string> excludes;
+
+  auto dedup = router.RoutePut("key-X", "requester", 4096, excludes);
+  ASSERT_TRUE(dedup.has_value());
+  EXPECT_EQ(dedup->outcome, RoutePutOutcome::kAlreadyExists);
+  EXPECT_TRUE(dedup->node_id.empty());
+
+  auto routed = router.RoutePut("key-Y", "requester", 4096, excludes);
+  ASSERT_TRUE(routed.has_value());
+  EXPECT_EQ(routed->outcome, RoutePutOutcome::kRouted);
+  EXPECT_EQ(routed->node_id, "node-a");
+}
+
+// Dedup hits never enter the planner, so they consume no projected capacity.
+// node-a fits exactly one 6GB block on DRAM.  key-X is an indexed dedup hit
+// sized 6GB; if dedup had deducted capacity, node-a would have 0 left and the
+// new key-Y could not route.  Since dedup does not deduct, key-Y still routes.
+TEST(RouterDedup, BatchRoutePutDedupDoesNotConsumeCapacity) {
+  const auto now = std::chrono::system_clock::now();
+  InMemoryMasterMetadataStore store;
+  Router router(store);
+
+  // node-a holds exactly one 6GB slot on DRAM, already occupied by key-X.
+  std::map<TierType, TierCapacity> caps;
+  caps[TierType::DRAM] = {6 * kGB, 6 * kGB};
+  ClientRegistration reg = MakeRegistration("node-a", "node-a:1", "node-a:peer");
+  reg.tier_capacities = caps;
+  ASSERT_TRUE(store.RegisterClient(reg, now, std::chrono::seconds{30}));
+  auto hb = store.ApplyHeartbeat("node-a", /*seq=*/1, now, caps,
+                                 {KvEvent{KvEvent::Kind::ADD, "key-X", TierType::DRAM, 6 * kGB}},
+                                 /*is_full_sync=*/false);
+  ASSERT_EQ(hb.status, HeartbeatResult::APPLIED);
+
+  std::vector<std::string> keys{"key-X", "key-Y"};
+  std::vector<uint64_t> sizes{6 * kGB, 6 * kGB};
+  std::unordered_set<std::string> excludes;
+
+  auto results = router.BatchRoutePut(keys, "requester", sizes, excludes);
+  ASSERT_EQ(results.size(), 2u);
+
+  ASSERT_TRUE(results[0].has_value());
+  EXPECT_EQ(results[0]->outcome, RoutePutOutcome::kAlreadyExists);
+
+  ASSERT_TRUE(results[1].has_value());
+  EXPECT_EQ(results[1]->outcome, RoutePutOutcome::kRouted);
+  EXPECT_EQ(results[1]->node_id, "node-a");
+  EXPECT_EQ(results[1]->tier, TierType::DRAM);
+}
+
+// Projected capacity is batch-local: BatchRoutePut must not write the
+// deductions back to the store's real client capacity.
+TEST(RouterDedup, BatchRoutePutDoesNotWriteBackProjectedCapacity) {
+  const auto now = std::chrono::system_clock::now();
+  InMemoryMasterMetadataStore store;
+  Router router(store);
+
+  std::map<TierType, TierCapacity> caps;
+  caps[TierType::DRAM] = {80 * kGB, 10 * kGB};
+  ClientRegistration reg = MakeRegistration("node-a", "node-a:1", "node-a:peer");
+  reg.tier_capacities = caps;
+  ASSERT_TRUE(store.RegisterClient(reg, now, std::chrono::seconds{30}));
+
+  std::vector<std::string> keys{"key-A", "key-B"};
+  std::vector<uint64_t> sizes{1 * kGB, 2 * kGB};
+  std::unordered_set<std::string> excludes;
+
+  auto results = router.BatchRoutePut(keys, "requester", sizes, excludes);
+  ASSERT_EQ(results.size(), 2u);
+  ASSERT_TRUE(results[0].has_value());
+  EXPECT_EQ(results[0]->outcome, RoutePutOutcome::kRouted);
+
+  auto rec = store.GetClient("node-a");
+  ASSERT_TRUE(rec.has_value());
+  EXPECT_EQ(rec->tier_capacities.at(TierType::DRAM).available_bytes, 10 * kGB);
+}
+
 }  // namespace mori::umbp
