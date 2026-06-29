@@ -701,15 +701,19 @@
 <td><p>Disable topology detection</p></td>
 <td><p>Not set</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_GLOBAL_LOG_LEVEL</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IGNORE_CPU_AFFINITY</span></code></p></td>
+<td><p>By default the thread calling <code class="docutils literal notranslate"><span class="pre">ShmemInit</span></code> is pinned to the CPUs local to its GPU (sysfs <code class="docutils literal notranslate"><span class="pre">local_cpulist</span></code>, intersected with the existing cpuset). Set to <code class="docutils literal notranslate"><span class="pre">1</span></code> to disable and leave CPU placement to an outer <code class="docutils literal notranslate"><span class="pre">numactl</span></code>/<code class="docutils literal notranslate"><span class="pre">torchrun</span></code>. Works in SPMT (single-process multi-GPU) too: each per-GPU init thread pins to its own GPU’s NUMA node.</p></td>
+<td><p>Not set (binding on)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_GLOBAL_LOG_LEVEL</span></code></p></td>
 <td><p>Global log verbosity: <code class="docutils literal notranslate"><span class="pre">TRACE</span></code>, <code class="docutils literal notranslate"><span class="pre">DEBUG</span></code>, <code class="docutils literal notranslate"><span class="pre">INFO</span></code>, <code class="docutils literal notranslate"><span class="pre">WARN</span></code>, <code class="docutils literal notranslate"><span class="pre">ERROR</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">INFO</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_PRECOMPILE</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_PRECOMPILE</span></code></p></td>
 <td><p>Precompile all JIT kernels on import</p></td>
 <td><p>Not set</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_JIT</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_JIT</span></code></p></td>
 <td><p>Disable JIT compilation of device bitcode</p></td>
 <td><p>Not set</p></td>
 </tr>
