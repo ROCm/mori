@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -99,6 +100,7 @@ class RdmaManager {
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
   size_t NumAvailDevices() const { return availDevices.size(); }
+  bool HasIonicDevice() const;
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
@@ -264,7 +266,7 @@ class RdmaBackendSession : public BackendSession {
   RdmaBackendSession(const RdmaBackendConfig& config,
                      std::vector<application::RdmaMemoryRegion> localMrPerEp,
                      std::vector<application::RdmaMemoryRegion> remoteMrPerEp, const EpPairVec& eps,
-                     Executor* executor);
+                     Executor* executor, MemoryLocationType localLoc = MemoryLocationType::CPU);
   ~RdmaBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -282,6 +284,9 @@ class RdmaBackendSession : public BackendSession {
   std::vector<application::RdmaMemoryRegion> remoteMrPerEp{};
   EpPairVec eps{};
   Executor* executor{nullptr};
+  MemoryLocationType localLoc_{MemoryLocationType::CPU};
+  std::shared_ptr<std::atomic<bool>> warnedChunkedWorkerFallback_{
+      std::make_shared<std::atomic<bool>>(false)};
 };
 
 /* ---------------------------------------------------------------------------------------------- */

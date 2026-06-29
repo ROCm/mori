@@ -300,27 +300,52 @@ std::vector<std::pair<uint64_t, uint32_t>> PlanChunks(uint32_t total, size_t chu
   return plan;
 }
 
+static uint64_t CeilDiv(uint64_t value, uint64_t divisor) {
+  return value / divisor + ((value % divisor) != 0);
+}
+
+ChunkGeometry PlanChunkGeometry(uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                                uint64_t maxMessageSize) {
+  if (maxChunks <= 0 || maxMessageSize == 0) return {};
+
+  uint64_t softCount = 1;
+  if (chunkBytes > 0 && totalLength > chunkBytes) {
+    softCount = CeilDiv(totalLength, static_cast<uint64_t>(chunkBytes));
+    softCount = std::min<uint64_t>(softCount, static_cast<uint64_t>(maxChunks));
+  }
+
+  const uint64_t hardMinCount = std::max<uint64_t>(CeilDiv(totalLength, maxMessageSize), 1);
+  const uint64_t finalCount = std::max<uint64_t>(softCount, hardMinCount);
+  const uint64_t targetChunkBytes = std::max<uint64_t>(CeilDiv(totalLength, finalCount), 1);
+  return ChunkGeometry{finalCount, targetChunkBytes};
+}
+
+uint64_t CountChunksForSize(uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                            uint64_t maxMessageSize) {
+  if (maxChunks <= 0 || maxMessageSize == 0) return 0;
+  if (totalLength == 0) return 1;
+
+  const bool splittable =
+      (chunkBytes > 0 && totalLength > chunkBytes) || (totalLength > maxMessageSize);
+  if (!splittable) return 1;
+
+  const ChunkGeometry geometry =
+      PlanChunkGeometry(totalLength, chunkBytes, maxChunks, maxMessageSize);
+  if (geometry.targetChunkBytes == 0) return 0;
+  return CeilDiv(totalLength, geometry.targetChunkBytes);
+}
+
 void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector<ibv_sge>& sges,
                          uint64_t totalLength, size_t chunkBytes, int maxChunks,
                          uint64_t maxMessageSize) {
   plan.clear();
   if (totalLength == 0 || maxChunks <= 0 || maxMessageSize == 0) return;
 
-  auto ceilDiv = [](uint64_t value, uint64_t divisor) {
-    return value / divisor + ((value % divisor) != 0);
-  };
-
-  uint64_t softCount = 1;
-  if (chunkBytes > 0 && totalLength > chunkBytes) {
-    softCount = ceilDiv(totalLength, static_cast<uint64_t>(chunkBytes));
-    softCount = std::min<uint64_t>(softCount, static_cast<uint64_t>(maxChunks));
-  }
-
-  const uint64_t hardMinCount = std::max<uint64_t>(ceilDiv(totalLength, maxMessageSize), 1);
-  const uint64_t finalCount = std::max<uint64_t>(softCount, hardMinCount);
-  const uint64_t targetChunkBytes = std::max<uint64_t>(ceilDiv(totalLength, finalCount), 1);
+  const ChunkGeometry geometry =
+      PlanChunkGeometry(totalLength, chunkBytes, maxChunks, maxMessageSize);
+  if (geometry.targetChunkBytes == 0) return;
   const uint64_t maxReserve = static_cast<uint64_t>(plan.max_size());
-  uint64_t reserveHint = finalCount;
+  uint64_t reserveHint = geometry.finalCount;
   const uint64_t sgeCount = static_cast<uint64_t>(sges.size());
   if (reserveHint <= maxReserve && sgeCount <= maxReserve - reserveHint) reserveHint += sgeCount;
   if (reserveHint <= maxReserve && plan.capacity() < reserveHint) {
@@ -328,7 +353,7 @@ void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector
   }
 
   uint64_t remoteStreamOffset = 0;
-  uint64_t targetRemaining = std::min(targetChunkBytes, totalLength);
+  uint64_t targetRemaining = std::min(geometry.targetChunkBytes, totalLength);
   for (const ibv_sge& sge : sges) {
     uint64_t sgeRemaining = sge.length;
     uint64_t sgeOffset = 0;
@@ -346,7 +371,7 @@ void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector
       targetRemaining -= len64;
       if (targetRemaining == 0 && remoteStreamOffset + sgeOffset < totalLength) {
         const uint64_t streamRemaining = totalLength - (remoteStreamOffset + sgeOffset);
-        targetRemaining = std::min(targetChunkBytes, streamRemaining);
+        targetRemaining = std::min(geometry.targetChunkBytes, streamRemaining);
       }
     }
     remoteStreamOffset += sge.length;
@@ -426,8 +451,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                              const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
                              const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                              const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
-                             TransferUniqueId id, bool isRead, int postBatchSize, size_t chunkBytes,
-                             int maxChunks, bool creditByWrCount) {
+                             TransferUniqueId id, bool isRead, int postBatchSize,
+                             const RdmaTransferControl& control) {
   MORI_IO_FUNCTION_TIMER;
 
   if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
@@ -448,13 +473,17 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     return {StatusCode::ERR_INVALID_ARGS, "memory-region vectors must align with endpoints"};
   }
 
-  if (maxChunks <= 0) {
+  if (control.maxChunks <= 0) {
     return {StatusCode::ERR_INVALID_ARGS, "maxChunks must be >= 1"};
   }
 
   const application::RdmaMemoryRegion& baseLocalMr = localMrPerEp.front();
   const application::RdmaMemoryRegion& baseRemoteMr = remoteMrPerEp.front();
   for (size_t i = 0; i < batchSize; i++) {
+    if (sizes[i] > std::numeric_limits<uint32_t>::max()) {
+      return {StatusCode::ERR_INVALID_ARGS, "single request size " + std::to_string(sizes[i]) +
+                                                " exceeds UINT32_MAX; split it before submitting"};
+    }
     if (((localOffsets[i] + sizes[i]) > baseLocalMr.length) ||
         ((remoteOffsets[i] + sizes[i]) > baseRemoteMr.length)) {
       return {StatusCode::ERR_INVALID_ARGS, "length out of range"};
@@ -515,7 +544,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   indices.resize(batchSize);
   std::iota(indices.begin(), indices.end(), 0);
 
-  if (!std::is_sorted(remoteOffsets.begin(), remoteOffsets.end())) {
+  if (!control.disableMerge && !std::is_sorted(remoteOffsets.begin(), remoteOffsets.end())) {
     std::sort(indices.begin(), indices.end(),
               [&](size_t a, size_t b) { return remoteOffsets[a] < remoteOffsets[b]; });
   }
@@ -538,9 +567,9 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     return static_cast<uint64_t>(wr.totalRemoteLength) > localMaxMessageSize;
   };
   auto hasOversizedSge = [&](const MergedWorkRequest& wr) {
-    if (chunkBytes == 0) return false;
+    if (control.chunkBytes == 0) return false;
     for (const ibv_sge& sge : wr.sges) {
-      if (sge.length > chunkBytes) return true;
+      if (sge.length > control.chunkBytes) return true;
     }
     return false;
   };
@@ -576,7 +605,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     const uint32_t currentSize32 = static_cast<uint32_t>(sizes[idx]);
 
     bool merged = false;
-    if (wrCount > 0) {
+    if (!control.disableMerge && wrCount > 0) {
       MergedWorkRequest& lastWr = mergedPool[wrCount - 1];
       const uint64_t expectedRemoteAddr = lastWr.wr.wr.rdma.remote_addr + lastWr.totalRemoteLength;
       if (expectedRemoteAddr == currentRemoteAddr) {
@@ -610,7 +639,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   // [expand-chunked-precompute] Expand oversized WRs into the pooled `chunkedPool`
   // in place (slot reuse); `chunkPlan` is reused by PlanSgeStreamChunks. Note: small
   // WRs are still copied as-is into chunkedPool when any WR needs splitting.
-  const bool canExpandChunks = creditByWrCount && chunkBytes > 0;
+  const bool canExpandChunks = control.creditByWrCount && control.chunkBytes > 0;
   if (!canExpandChunks) {
     for (size_t k = 0; k < wrCount; ++k) {
       const MergedWorkRequest& wr = mergedPool[k];
@@ -658,7 +687,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       }
       const uint64_t remoteBase = wr.wr.wr.rdma.remote_addr;
       PlanSgeStreamChunks(chunkPlan, wr.sges, static_cast<uint64_t>(wr.totalRemoteLength),
-                          chunkBytes, maxChunks, localMaxMessageSize);
+                          control.chunkBytes, control.maxChunks, localMaxMessageSize);
       if (chunkPlan.empty() && wr.totalRemoteLength != 0) {
         return {StatusCode::ERR_BAD_STATE, "failed to plan RDMA chunks for non-empty SGE stream"};
       }
@@ -671,12 +700,12 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   std::vector<MergedWorkRequest>& mergedWrs = useChunked ? chunkedPool : mergedPool;
   size_t mergedWrCount = useChunked ? chunkedCount : wrCount;
 
-  if (creditByWrCount) {
+  if (control.creditByWrCount) {
     if (mergedWrCount > static_cast<size_t>(std::numeric_limits<int>::max())) {
       return {StatusCode::ERR_INVALID_ARGS, "final WR count exceeds int range"};
     }
     for (size_t k = 0; k < mergedWrCount; ++k) mergedWrs[k].mergedRequests = 1;
-    callbackMeta->totalBatchSize = static_cast<int>(mergedWrCount);
+    if (control.ownsTotalBatchSize) callbackMeta->totalBatchSize = static_cast<int>(mergedWrCount);
   }
 
   size_t epNum = eps.size();
@@ -843,6 +872,21 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
   return {StatusCode::IN_PROGRESS, ""};
+}
+
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
+                             const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                             const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                             const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id, bool isRead, int postBatchSize, size_t chunkBytes,
+                             int maxChunks, bool creditByWrCount) {
+  RdmaTransferControl control{};
+  control.chunkBytes = chunkBytes;
+  control.maxChunks = maxChunks;
+  control.creditByWrCount = creditByWrCount;
+  return RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, localOffsets, remoteOffsets, sizes,
+                            callbackMeta, id, isRead, postBatchSize, control);
 }
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,

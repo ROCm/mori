@@ -48,6 +48,8 @@ struct ExecutorReq {
   TransferUniqueId id;
   int postBatchSize;
   bool isRead;
+  size_t chunkBytes{0};
+  int maxChunks{1};
 };
 
 /* ---------------------------------------------------------------------------------------------- */

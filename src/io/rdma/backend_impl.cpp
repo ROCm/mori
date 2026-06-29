@@ -72,8 +72,18 @@ void ValidateRdmaTransferConfig(const RdmaBackendConfig& config) {
   }
 }
 
-bool UsesInlineOnly(const RdmaBackendConfig& config) {
-  return config.enableTransferChunking || config.numNicsPerTransfer > 1;
+bool UsesInlineOnly(const RdmaBackendConfig& config) { return config.numNicsPerTransfer > 1; }
+
+static const char* MemoryLocationTypeName(MemoryLocationType loc) {
+  switch (loc) {
+    case MemoryLocationType::CPU:
+      return "CPU";
+    case MemoryLocationType::GPU:
+      return "GPU";
+    case MemoryLocationType::Unknown:
+    default:
+      return "Unknown";
+  }
 }
 
 // Parse MORI_IO_POLL_CQ_MODE: "0"/"polling" or "1"/"event" (case-insensitive).
@@ -576,6 +586,17 @@ std::shared_ptr<EndpointRuntime> RdmaManager::GetEndpointRuntime(EndpointId id) 
 application::RdmaDeviceContext* RdmaManager::GetRdmaDeviceContext(int devId) {
   std::shared_lock<std::shared_mutex> lock(mu);
   return deviceCtxs[devId];
+}
+
+bool RdmaManager::HasIonicDevice() const {
+  for (const auto& [device, portId] : availDevices) {
+    const ibv_device_attr_ex* attr = device->GetDeviceAttr();
+    if (attr && attr->orig_attr.vendor_id ==
+                    static_cast<uint32_t>(application::RdmaDeviceVendorId::Pensando)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::vector<std::shared_ptr<EndpointRuntime>> RdmaManager::SnapshotEndpointRuntimes() {
@@ -1278,12 +1299,14 @@ EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
 RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
                                        std::vector<application::RdmaMemoryRegion> localMrPerEp,
                                        std::vector<application::RdmaMemoryRegion> remoteMrPerEp,
-                                       const EpPairVec& e, Executor* exec)
+                                       const EpPairVec& e, Executor* exec,
+                                       MemoryLocationType localLoc)
     : config(config),
       localMrPerEp(std::move(localMrPerEp)),
       remoteMrPerEp(std::move(remoteMrPerEp)),
       eps(e),
-      executor(exec) {}
+      executor(exec),
+      localLoc_(localLoc) {}
 
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
@@ -1314,18 +1337,87 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
                                         TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
-  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, sizes.size());
+
+  const bool chunk = config.enableTransferChunking;
+  const bool canUseWorkerChunking =
+      executor != nullptr && chunk && localLoc_ == MemoryLocationType::GPU;
+  if (executor != nullptr && chunk && !canUseWorkerChunking) {
+    bool expected = false;
+    if (warnedChunkedWorkerFallback_->compare_exchange_strong(expected, true,
+                                                              std::memory_order_relaxed)) {
+      MORI_IO_WARN(
+          "executor skipped for chunked transfer: worker chunking requires GPU local memory "
+          "(localLoc={}); falling back to inline posting",
+          MemoryLocationTypeName(localLoc_));
+    }
+  }
+
+  int totalCredit = 0;
+  if (canUseWorkerChunking) {
+    const uint64_t maxMessageSize = eps.front().local.maxMsgSize;
+    uint64_t totalWrCount = 0;
+    for (size_t size : sizes) {
+      if (size > std::numeric_limits<uint32_t>::max()) {
+        status->Update(StatusCode::ERR_INVALID_ARGS,
+                       "single request size exceeds UINT32_MAX; split it before submitting");
+        return;
+      }
+      const uint64_t requestWrCount =
+          CountChunksForSize(size, config.chunkBytes, config.maxChunksPerTransfer, maxMessageSize);
+      if (requestWrCount == 0 ||
+          totalWrCount > static_cast<uint64_t>(std::numeric_limits<int>::max()) - requestWrCount) {
+        status->Update(StatusCode::ERR_INVALID_ARGS, "final WR count exceeds int range");
+        return;
+      }
+      totalWrCount += requestWrCount;
+    }
+    totalCredit = static_cast<int>(totalWrCount);
+  } else {
+    if (sizes.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      status->Update(StatusCode::ERR_INVALID_ARGS, "batch size exceeds int range");
+      return;
+    }
+    totalCredit = static_cast<int>(sizes.size());
+  }
+
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, totalCredit);
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
   RdmaOpRet ret;
-  if (executor) {
-    ExecutorReq req{eps,   localMrPerEp.front(), localOffsets, remoteMrPerEp.front(), remoteOffsets,
-                    sizes, callbackMeta,         id,           config.postBatchSize,  isRead};
+  if (canUseWorkerChunking) {
+    ExecutorReq req{eps,
+                    localMrPerEp.front(),
+                    localOffsets,
+                    remoteMrPerEp.front(),
+                    remoteOffsets,
+                    sizes,
+                    callbackMeta,
+                    id,
+                    config.postBatchSize,
+                    isRead,
+                    config.chunkBytes,
+                    config.maxChunksPerTransfer};
+    ret = executor->RdmaBatchReadWrite(req);
+  } else if (executor != nullptr && !chunk) {
+    ExecutorReq req{eps,
+                    localMrPerEp.front(),
+                    localOffsets,
+                    remoteMrPerEp.front(),
+                    remoteOffsets,
+                    sizes,
+                    callbackMeta,
+                    id,
+                    config.postBatchSize,
+                    isRead,
+                    0,
+                    1};
     ret = executor->RdmaBatchReadWrite(req);
   } else {
+    RdmaTransferControl control{};
+    control.chunkBytes = chunk ? config.chunkBytes : 0;
+    control.maxChunks = config.maxChunksPerTransfer;
+    control.creditByWrCount = chunk;
     ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, localOffsets, remoteOffsets, sizes,
-                             callbackMeta, id, isRead, config.postBatchSize,
-                             config.enableTransferChunking ? config.chunkBytes : 0,
-                             config.maxChunksPerTransfer, config.enableTransferChunking);
+                             callbackMeta, id, isRead, config.postBatchSize, control);
   }
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
@@ -1386,11 +1478,18 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
                                       notif.get()));
   server->Start();
 
+  if (config.qpPerTransfer == 1 && rdma->HasIonicDevice()) {
+    MORI_IO_WARN(
+        "ionic NIC detected with qpPerTransfer=1: single-QP ionic performance is prone to SQ "
+        "full under load; consider increasing qpPerTransfer (e.g. 4) and setting "
+        "numWorkerThreads to the same value");
+  }
+
   bool useInlineOnly = UsesInlineOnly(config);
   if (config.numWorkerThreads > 1 && useInlineOnly) {
     MORI_IO_WARN(
-        "numWorkerThreads={} is ignored because transfer chunking / multi-NIC is enabled; "
-        "using single-thread inline posting",
+        "numWorkerThreads={} is ignored because multi-NIC transfer is enabled; using "
+        "single-thread inline posting",
         config.numWorkerThreads);
   }
   if (config.numWorkerThreads > 1 && !useInlineOnly) {
@@ -1574,7 +1673,7 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   }
 
   sess = RdmaBackendSession(config, std::move(localMrPerEp), std::move(remoteMrPerEp), epSet,
-                            executor.get());
+                            executor.get(), local.loc);
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
