@@ -230,6 +230,12 @@ target_link_libraries(
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
 
+# RouteGet strategy bench: per-key Select() loop vs the batched BatchSelect()
+# the router now calls once per BatchRouteGet. Pure logic (umbp_common only);
+# standalone executable, not a CTest target.
+add_executable(bench_umbp_route_strategy bench_route_strategy.cpp)
+target_link_libraries(bench_umbp_route_strategy PRIVATE umbp_common)
+
 # ===========================================================================
 # Metadata-store / external-KV / SSD-tier suite (migrated from src/umbp/tests).
 # These link umbp_common (pure logic) except test_peer_ssd_read_rpc, which
@@ -337,7 +343,8 @@ add_executable(test_batch_resolve_codec test_batch_resolve_codec.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(test_batch_resolve_codec PRIVATE -Wl,--no-as-needed)
 endif()
-target_link_libraries(test_batch_resolve_codec
-                      PRIVATE umbp_common ${_TEST_PROTOBUF_LIB} GTest::gtest_main)
+target_link_libraries(
+  test_batch_resolve_codec PRIVATE umbp_common ${_TEST_PROTOBUF_LIB}
+                                   GTest::gtest_main)
 target_compile_features(test_batch_resolve_codec PRIVATE cxx_std_17)
 gtest_discover_tests(test_batch_resolve_codec)

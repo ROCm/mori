@@ -93,6 +93,9 @@ std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(
   // the router supplies — the timestamp now crosses the store boundary.
   auto all_locs = store_.BatchLookupBlockForRouteGet(
       keys, exclude_nodes, std::chrono::system_clock::now(), lease_duration_);
+  // One virtual dispatch for the whole batch; empty (unrouted) entries are
+  // skipped inside BatchSelect and left as a default Location.
+  auto selected_all = get_strategy_->BatchSelect(all_locs, node_id);
   for (size_t i = 0; i < keys.size(); ++i) {
     auto& locations = all_locs[i];
     if (locations.empty()) {
@@ -101,7 +104,7 @@ std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(
           keys[i]);
       continue;
     }
-    Location selected = get_strategy_->Select(locations, node_id);
+    Location selected = selected_all[i];
 
     RouteGetResolution out;
     out.location = selected;
