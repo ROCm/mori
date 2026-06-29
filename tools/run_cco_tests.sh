@@ -14,11 +14,6 @@ for bin in tests/cpp/cco/test_*; do
     test_lsa_memcheck) continue ;;
   esac
   echo "=== $(basename "$bin") ==="
-  timeout 120 "./$bin" "$nranks" || failed=1
+  timeout -k 10 120 "./$bin" "$nranks" || failed=1
 done
-# for bin in examples/cco_lsa_put examples/cco_gda_put; do
-#   [ -x "$bin" ] || continue
-#   echo "=== $(basename "$bin") ==="
-#   timeout 120 mpirun --allow-run-as-root -np "$nranks" "./$bin" || failed=1
-# done
-# exit $failed
+exit $failed

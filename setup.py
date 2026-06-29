@@ -674,6 +674,11 @@ _root_dir = Path(__file__).parent
 def _cco_extension() -> list:
     """Build the mori.cco.cco Cython C++ extension if Cython is available."""
     if not _HAVE_CYTHON:
+        print(
+            "[mori] WARNING: Cython not found — skipping mori.cco.cco extension. "
+            "Install Cython to enable: pip install cython",
+            file=sys.stderr,
+        )
         return []
     include_dirs = [str(_root_dir / "include")]
     library_dirs = [str(_root_dir / "python/mori")]
