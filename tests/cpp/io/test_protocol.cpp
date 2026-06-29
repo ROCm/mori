@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <msgpack.hpp>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -243,6 +244,73 @@ void TestRailAffinityDecisionLogic() {
   printf("  PASS: TestRailAffinityDecisionLogic\n");
 }
 
+void TestReadMessageHeaderThrowsOnEof() {
+  auto tcpPair = PrepareTCPEndpoints();
+  tcpPair.first.first->CloseEndpoint(tcpPair.first.second);
+
+  Protocol receiver(tcpPair.second.second);
+  bool threw = false;
+  try {
+    (void)receiver.ReadMessageHeader();
+  } catch (const ProtocolError& e) {
+    threw = true;
+    assert(std::string(e.what()).find("EOF") != std::string::npos);
+  }
+  assert(threw);
+
+  tcpPair.first.first->Close();
+  tcpPair.second.first->Close();
+  delete tcpPair.first.first;
+  delete tcpPair.second.first;
+  printf("  PASS: TestReadMessageHeaderThrowsOnEof\n");
+}
+
+void TestExpectMessageThrowsOnMismatch() {
+  auto tcpPair = PrepareTCPEndpoints();
+  Protocol sender(tcpPair.first.second);
+  Protocol receiver(tcpPair.second.second);
+
+  sender.WriteMessageAskMemoryRegion({});
+  MessageHeader hdr = receiver.ReadMessageHeader();
+
+  bool threw = false;
+  try {
+    ExpectMessage(hdr, MessageType::RegEndpoint, "unit-test");
+  } catch (const ProtocolError& e) {
+    threw = true;
+    std::string what = e.what();
+    assert(what.find("expected RegEndpoint") != std::string::npos);
+    assert(what.find("observed AskMemoryRegion") != std::string::npos);
+  }
+  assert(threw);
+
+  tcpPair.first.first->Close();
+  tcpPair.second.first->Close();
+  delete tcpPair.first.first;
+  delete tcpPair.second.first;
+  printf("  PASS: TestExpectMessageThrowsOnMismatch\n");
+}
+
+void TestOversizedControlMessageRejectedBeforeRead() {
+  auto tcpPair = PrepareTCPEndpoints();
+  Protocol receiver(tcpPair.second.second);
+
+  bool threw = false;
+  try {
+    (void)receiver.ReadMessageRegEndpoint(kMaxControlMessageBytes + 1);
+  } catch (const ProtocolError& e) {
+    threw = true;
+    assert(std::string(e.what()).find("exceeds control-plane limit") != std::string::npos);
+  }
+  assert(threw);
+
+  tcpPair.first.first->Close();
+  tcpPair.second.first->Close();
+  delete tcpPair.first.first;
+  delete tcpPair.second.first;
+  printf("  PASS: TestOversizedControlMessageRejectedBeforeRead\n");
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                    main                                    */
 /* -------------------------------------------------------------------------- */
@@ -253,6 +321,9 @@ int main() {
   TestMessageRegEndpointBackwardCompat();
   TestMessageRegEndpointMsgpackRoundTrip();
   TestRailAffinityDecisionLogic();
+  TestReadMessageHeaderThrowsOnEof();
+  TestExpectMessageThrowsOnMismatch();
+  TestOversizedControlMessageRejectedBeforeRead();
   printf("All protocol tests passed.\n");
   return 0;
 }

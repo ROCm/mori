@@ -25,6 +25,7 @@
 #include <sys/epoll.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -124,6 +125,43 @@ struct CqeFailureAdvice {
     message += hint;
     return message;
   }
+};
+
+class TcpEndpointGuard {
+ public:
+  TcpEndpointGuard(application::TCPContext* ctx, application::TCPEndpointHandle ep)
+      : ctx_(ctx), ep_(ep), armed_(true) {}
+  ~TcpEndpointGuard() {
+    if (armed_ && ctx_ != nullptr) ctx_->CloseEndpointNoThrow(ep_);
+  }
+
+  TcpEndpointGuard(const TcpEndpointGuard&) = delete;
+  TcpEndpointGuard& operator=(const TcpEndpointGuard&) = delete;
+
+ private:
+  application::TCPContext* ctx_{nullptr};
+  application::TCPEndpointHandle ep_{};
+  bool armed_{false};
+};
+
+class PendingEndpointGuard {
+ public:
+  PendingEndpointGuard(RdmaManager* rdma, int devId, application::RdmaEndpoint ep)
+      : rdma_(rdma), devId_(devId), ep_(ep), armed_(true) {}
+  ~PendingEndpointGuard() {
+    if (armed_ && rdma_ != nullptr) rdma_->DestroyEndpointNoThrow(devId_, ep_);
+  }
+
+  PendingEndpointGuard(const PendingEndpointGuard&) = delete;
+  PendingEndpointGuard& operator=(const PendingEndpointGuard&) = delete;
+
+  void Commit() noexcept { armed_ = false; }
+
+ private:
+  RdmaManager* rdma_{nullptr};
+  int devId_{-1};
+  application::RdmaEndpoint ep_{};
+  bool armed_{false};
 };
 
 static void LogAsyncTransferFailureIfNeeded(internal::IoCallDiagnostics* diagnostics, uint32_t code,
@@ -482,6 +520,24 @@ application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
   if (config.pollCqMode == PollCqMode::EVENT)
     SYSCALL_RETURN_ZERO(ibv_req_notify_cq(rdmaEp.ibvHandle.cq, 0));
   return rdmaEp;
+}
+
+bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpoint& ep) noexcept {
+  try {
+    std::unique_lock<std::shared_mutex> lock(mu);
+    if (devId < 0 || devId >= static_cast<int>(deviceCtxs.size()) || deviceCtxs[devId] == nullptr) {
+      MORI_IO_WARN("DestroyEndpointNoThrow: invalid devId={} for qpn={}", devId, ep.handle.qpn);
+      return false;
+    }
+    return deviceCtxs[devId]->DestroyRdmaEndpointNoThrow(ep);
+  } catch (const std::exception& e) {
+    MORI_IO_ERROR("DestroyEndpointNoThrow caught exception for devId={} qpn={}: {}", devId,
+                  ep.handle.qpn, e.what());
+  } catch (...) {
+    MORI_IO_ERROR("DestroyEndpointNoThrow caught unknown exception for devId={} qpn={}", devId,
+                  ep.handle.qpn);
+  }
+  return false;
 }
 
 EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
@@ -930,31 +986,38 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
   application::TCPEndpointHandle tcph;
   {
     std::lock_guard<std::mutex> lock(mu);
-    assert((engines.find(ekey) != engines.end()) && "register engine first");
-    EngineDesc& rdesc = engines[ekey];
+    auto engineIt = engines.find(ekey);
+    if (engineIt == engines.end()) {
+      throw std::runtime_error("BuildRdmaConn: remote engine " + ekey + " is not registered");
+    }
+    EngineDesc& rdesc = engineIt->second;
     tcph = ctx->Connect(rdesc.host, rdesc.port);
   }
+  TcpEndpointGuard tcpGuard(ctx.get(), tcph);
 
   int requestedNics = ResolveRequestedNics(config, topo.local, topo.remote);
   auto candidates = rdma->Search(topo.local, requestedNics);
-  assert(!candidates.empty());
+  if (candidates.empty()) {
+    throw std::runtime_error("BuildRdmaConn: no matching local RDMA NIC candidate");
+  }
   int rank = std::min<int>(nicRank, static_cast<int>(candidates.size()) - 1);
   auto [devId, weight] = candidates[rank];
 
   application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
+  PendingEndpointGuard pendingEndpoint(rdma, devId, lep);
 
   Protocol p(tcph);
   p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle, rank, devId});
   MessageHeader hdr = p.ReadMessageHeader();
-  assert(hdr.type == MessageType::RegEndpoint);
+  ExpectMessage(hdr, MessageType::RegEndpoint, "BuildRdmaConn reply from " + ekey);
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
 
   EndpointId eid = rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
+  pendingEndpoint.Commit();
   auto ert = rdma->GetEndpointRuntime(eid);
   notif->RegisterEndpoint(ert);
   MORI_IO_INFO("Built RdmaConn for engine {} with topo local({},{}) remote({},{})", ekey,
                topo.local.deviceId, topo.local.loc, topo.remote.deviceId, topo.remote.loc);
-  ctx->CloseEndpoint(tcph);
 }
 
 void ControlPlaneServer::RegisterMemory(MemoryDesc& desc) {
@@ -972,15 +1035,20 @@ application::RdmaMemoryRegion ControlPlaneServer::AskRemoteMemoryRegion(EngineKe
   application::TCPEndpointHandle tcph;
   {
     std::lock_guard<std::mutex> lock(mu);
-    assert((engines.find(ekey) != engines.end()) && "register engine first");
-    EngineDesc& rdesc = engines[ekey];
+    auto engineIt = engines.find(ekey);
+    if (engineIt == engines.end()) {
+      throw std::runtime_error("AskRemoteMemoryRegion: remote engine " + ekey +
+                               " is not registered");
+    }
+    EngineDesc& rdesc = engineIt->second;
     tcph = ctx->Connect(rdesc.host, rdesc.port);
   }
+  TcpEndpointGuard tcpGuard(ctx.get(), tcph);
 
   Protocol p(tcph);
   p.WriteMessageAskMemoryRegion({ekey, rdevId, id, {}});
   MessageHeader hdr = p.ReadMessageHeader();
-  assert(hdr.type == MessageType::AskMemoryRegion);
+  ExpectMessage(hdr, MessageType::AskMemoryRegion, "AskRemoteMemoryRegion reply from " + ekey);
   MessageAskMemoryRegion msg = p.ReadMessageAskMemoryRegion(hdr.len);
 
   return msg.mr;
@@ -992,27 +1060,22 @@ void ControlPlaneServer::AcceptRemoteEngineConn() {
     epoll_event ev{};
     ev.events = EPOLLIN | EPOLLET;
     ev.data.fd = ep.fd;
-    SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, ep.fd, &ev));
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, ep.fd, &ev) != 0) {
+      MORI_IO_ERROR("ControlPlaneServer: epoll_ctl ADD failed for fd {}: errno={} ({})", ep.fd,
+                    errno, strerror(errno));
+      ctx->CloseEndpointNoThrow(ep);
+      continue;
+    }
     eps.insert({ep.fd, ep});
   }
 }
 
 void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
-  assert(eps.find(fd) != eps.end());
-  application::TCPEndpointHandle tcph = eps[fd];
-
-  // Detect remote close: Recv returns 0 for both success and EOF, so
-  // SYSCALL_RETURN_ZERO can't distinguish them — peek before reading to avoid
-  // processing an uninitialized header when the peer disconnects.
-  {
-    char probe;
-    if (::recv(fd, &probe, 1, MSG_PEEK) == 0) {
-      MORI_IO_DEBUG("ControlPlaneServer: peer closed connection on fd {}", fd);
-      ctx->CloseEndpoint(tcph);
-      eps.erase(fd);
-      return;
-    }
+  auto epIt = eps.find(fd);
+  if (epIt == eps.end()) {
+    throw ProtocolError("ControlPlaneServer: no TCP endpoint for fd " + std::to_string(fd));
   }
+  application::TCPEndpointHandle tcph = epIt->second;
 
   Protocol p(tcph);
   MessageHeader hdr = p.ReadMessageHeader();
@@ -1041,19 +1104,22 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
         // Fallback: original behavior (topo search + nicRank)
         int requestedNics = ResolveRequestedNics(config, msg.topo.remote, msg.topo.local);
         auto candidates = rdma->Search(msg.topo.remote, requestedNics);
-        assert(!candidates.empty());
+        if (candidates.empty()) {
+          throw ProtocolError("RegEndpoint: no matching local RDMA NIC candidate");
+        }
         int rank = std::min<int>(msg.nicRank, static_cast<int>(candidates.size()) - 1);
         std::tie(devId, weight) = candidates[rank];
       }
 
       application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
+      PendingEndpointGuard pendingEndpoint(rdma, devId, lep);
       EndpointId eid =
           rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
+      pendingEndpoint.Commit();
       auto ert = rdma->GetEndpointRuntime(eid);
       notif->RegisterEndpoint(ert);
       p.WriteMessageRegEndpoint(
           MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle, 0, devId});
-      SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
       break;
     }
     case MessageType::AskMemoryRegion: {
@@ -1073,11 +1139,24 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       break;
     }
     default:
-      assert(false && "not implemented");
+      throw ProtocolError("unsupported control-plane message type " +
+                          std::to_string(static_cast<int>(hdr.type)));
   }
 
-  ctx->CloseEndpoint(tcph);
+  DropConnection(fd);
+}
+
+void ControlPlaneServer::DropConnection(int fd) noexcept {
+  if (fd < 0) return;
+  if (epfd >= 0 && epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL) != 0) {
+    int err = errno;
+    if (err != ENOENT && err != EBADF) {
+      MORI_IO_DEBUG("ControlPlaneServer: epoll_ctl DEL failed for fd {}: errno={} ({})", fd, err,
+                    strerror(err));
+    }
+  }
   eps.erase(fd);
+  if (ctx) ctx->CloseEndpointNoThrow(fd);
 }
 
 void ControlPlaneServer::MainLoop() {
@@ -1096,7 +1175,19 @@ void ControlPlaneServer::MainLoop() {
         continue;
       }
 
-      HandleControlPlaneProtocol(fd);
+      try {
+        HandleControlPlaneProtocol(fd);
+      } catch (const std::exception& e) {
+        MORI_IO_ERROR("control-plane handler for fd {} failed: {}; dropping connection", fd,
+                      e.what());
+        DropConnection(fd);
+      } catch (...) {
+        MORI_IO_ERROR(
+            "control-plane handler for fd {} failed with unknown exception; dropping "
+            "connection",
+            fd);
+        DropConnection(fd);
+      }
     }
   }
 }
@@ -1463,9 +1554,17 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
     if (remoteMrByDev.find(ep.rdevId) == remoteMrByDev.end()) {
       auto remoteMr = rdma->GetRemoteMemory(ekey, ep.rdevId, remote.id);
       if (!remoteMr.has_value()) {
-        remoteMr = server->AskRemoteMemoryRegion(ekey, ep.rdevId, remote.id);
-        assert(remoteMr->length == remote.size);
-        rdma->RegisterRemoteMemory(ekey, ep.rdevId, remote.id, remoteMr.value());
+        application::RdmaMemoryRegion fetchedMr =
+            server->AskRemoteMemoryRegion(ekey, ep.rdevId, remote.id);
+        if (fetchedMr.length != remote.size) {
+          std::stringstream ss;
+          ss << "RdmaBackend::CreateSession: remote MR size mismatch for engine " << ekey
+             << " rdevId=" << ep.rdevId << " memId=" << remote.id << " expected=" << remote.size
+             << " got=" << fetchedMr.length;
+          throw std::runtime_error(ss.str());
+        }
+        remoteMr = fetchedMr;
+        rdma->RegisterRemoteMemory(ekey, ep.rdevId, remote.id, *remoteMr);
       }
       remoteMrByDev[ep.rdevId] = *remoteMr;
     }
