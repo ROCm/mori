@@ -32,6 +32,7 @@ This is the layout FSDP zero-copy allgather consumes.
 
 import os
 import sys
+import importlib
 from pathlib import Path
 
 import pytest
@@ -42,11 +43,14 @@ import mori.shmem as shmem
 from mori.ccl import AllgatherSdma
 
 try:
-    from tests.python.utils import TorchDistContext, get_free_port
+    _test_utils = importlib.import_module("tests.python.utils")
 except ModuleNotFoundError:
     repo_root = Path(__file__).resolve().parents[3]
     sys.path.insert(0, str(repo_root))
-    from tests.python.utils import TorchDistContext, get_free_port
+    _test_utils = importlib.import_module("tests.python.utils")
+
+TorchDistContext = _test_utils.TorchDistContext
+get_free_port = _test_utils.get_free_port
 
 
 pytestmark = pytest.mark.skipif(
