@@ -86,13 +86,6 @@ static const char* MemoryLocationTypeName(MemoryLocationType loc) {
   }
 }
 
-static bool EndpointMaxMessageSizesHomogeneous(const EpPairVec& eps) {
-  if (eps.empty()) return false;
-  const uint64_t first = eps.front().local.maxMsgSize;
-  return std::all_of(eps.begin(), eps.end(),
-                     [&](const EpPair& ep) { return ep.local.maxMsgSize == first; });
-}
-
 // Parse MORI_IO_POLL_CQ_MODE: "0"/"polling" or "1"/"event" (case-insensitive).
 // Returns nullopt for anything else so env::Override warns and keeps the
 // config value (no silent fallback).
@@ -1342,8 +1335,8 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     if (warnedChunkedWorkerFallback_->compare_exchange_strong(expected, true,
                                                               std::memory_order_relaxed)) {
       MORI_IO_WARN(
-          "executor skipped for chunked transfer because worker chunking is only enabled for GPU "
-          "local memory in Phase 1 (localLoc={}); falling back to inline posting",
+          "executor skipped for chunked transfer: worker chunking requires GPU local memory "
+          "(localLoc={}); falling back to inline posting",
           MemoryLocationTypeName(localLoc_));
     }
   }
@@ -1660,13 +1653,6 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
     localMrPerEp.push_back(localMrByDev.at(ep.ldevId));
     remoteMrPerEp.push_back(remoteMrByDev.at(ep.rdevId));
   }
-
-#ifndef NDEBUG
-  if (local.loc == MemoryLocationType::GPU && !epSet.empty()) {
-    assert(EndpointMaxMessageSizesHomogeneous(epSet) &&
-           "Phase 1: GPU worker chunking expects all eps to share maxMsgSize");
-  }
-#endif
 
   sess = RdmaBackendSession(config, std::move(localMrPerEp), std::move(remoteMrPerEp), epSet,
                             executor.get(), local.loc);
