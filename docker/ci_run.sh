@@ -81,12 +81,6 @@ nic_mount_flags() {
             if [[ -n "$host_ibverbs" ]]; then
                 flags+=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
             fi
-            # Locate the host bnxt_re userspace provider. The Broadcom rocelib
-            # package installs into /usr/local/lib/x86_64-linux-gnu, while older
-            # manual builds may sit directly in /usr/local/lib. Probe in priority
-            # order and use the first dir found so the kernel-ABI-matching driver
-            # is mounted (a stale lib in /usr/local/lib otherwise shadows it and
-            # triggers "does not support the kernel ABI" errors in the container).
             local bnxt_dir=""
             for dir in /usr/local/lib/x86_64-linux-gnu /usr/local/lib /usr/lib/x86_64-linux-gnu; do
                 if compgen -G "$dir/libbnxt_re-rdmav*.so" >/dev/null 2>&1; then
