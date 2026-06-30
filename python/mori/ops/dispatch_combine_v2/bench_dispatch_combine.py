@@ -33,6 +33,10 @@ from cco_example_common import set_device, sync, zero  # noqa: E402
 from symm_arena import SymmArena  # noqa: E402
 from dispatch_kernel import make_dispatch  # noqa: E402
 from combine_kernel import make_combine  # noqa: E402
+from stdmoe_kernel import (  # noqa: E402
+    make_convert_dispatch_output,
+    make_convert_combine_input,
+)
 from dist_common import Dist  # noqa: E402
 
 HIDDEN = int(os.environ.get("HIDDEN", 7168))
@@ -46,6 +50,7 @@ WARP_NUM = int(os.environ.get("WARP_NUM", 16))
 WARMUP = int(os.environ.get("WARMUP", 10))
 ITERS = int(os.environ.get("ITERS", 50))
 MODE = os.environ.get("MODE", "both")            # eager | graph | both
+STDMOE = int(os.environ.get("STDMOE", 0))        # 1 = run StdMoE convert pipeline
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,2048").split(",")]
 
 
@@ -169,6 +174,67 @@ def main():
                       f"(hidden={'ok' if ok else 'BAD'} wts={'ok' if ok_w else 'BAD'}; "
                       f"U in [{U.min()},{U.max()}], {ct} tok/rank, identity expert)", flush=True)
             return errs == 0
+
+        if STDMOE:
+            # Full StdMoE pipeline: dispatch -> ConvertDispatchOutput ->
+            # (identity expert GEMM) -> ConvertCombineInput -> combine.
+            # Identity expert => packed_x[slot] == dispatched token, so the
+            # per-rank weighted reduce + cross-rank gather telescopes to
+            #   comb_out[s] == (sum_k wts[s][k]) * input[s]
+            # (independent of routing/dedup; the weights collapse the U-count).
+            mtpe = npes * M
+            packed_x = torch.zeros(EPR * mtpe * HIDDEN, dtype=torch.int16, device=dev)
+            packed_cnt = torch.zeros(EPR, dtype=torch.int32, device=dev)
+            packed_src = torch.zeros(EPR * mtpe, dtype=torch.int32, device=dev)
+            slot_map = torch.full((max_recv * K,), -1, dtype=torch.int64, device=dev)
+            cvt_disp = make_convert_dispatch_output(
+                rank=rank, experts_per_rank=EPR, experts_per_token=K, hidden_dim=HIDDEN,
+                hidden_elem_size=2, max_tok_per_expert=mtpe, block_num=DISP_BLOCK,
+                warp_num_per_block=WARP_NUM)
+            cvt_comb = make_convert_combine_input(
+                rank=rank, experts_per_rank=EPR, experts_per_token=K, hidden_dim=HIDDEN,
+                hidden_elem_size=2, max_tok_per_expert=mtpe, block_num=COMB_BLOCK,
+                warp_num_per_block=WARP_NUM)
+            cdptrs = (arena.local_ptr("out_tok"), arena.local_ptr("out_idx"),
+                      arena.local_ptr("tis"), total_recv.data_ptr(), packed_x.data_ptr(),
+                      packed_cnt.data_ptr(), packed_src.data_ptr(), slot_map.data_ptr())
+            ccptrs = (arena.local_ptr("out_tok"), arena.local_ptr("out_wts"),
+                      total_recv.data_ptr(), packed_x.data_ptr(), slot_map.data_ptr())
+            # flyc.compile LAUNCHES the kernel once to specialize; zero
+            # total_recv first so that compile-launch is a no-op (loops 0 iters)
+            # and does not scribble into out_tok / packed_x.
+            total_recv.zero_(); sync()
+            cdisp_c = flyc.compile(cvt_disp, *[fx.Int64(p) for p in cdptrs], fx.Stream(cur))
+            ccomb_c = flyc.compile(cvt_comb, *[fx.Int64(p) for p in ccptrs], fx.Stream(cur))
+
+            def run_cdisp():
+                cdisp_c(*cdptrs, fx.Stream(torch.cuda.current_stream()))
+
+            def run_ccomb():
+                ccomb_c(*ccptrs, fx.Stream(torch.cuda.current_stream()))
+
+            if rank == 0:
+                print(f"# EP{npes} STDMOE hidden={HIDDEN} topk={K} experts={num_experts}",
+                      flush=True)
+            for ct in SWEEP:
+                total_recv.zero_(); packed_cnt.zero_(); slot_map.fill_(-1); sync()
+                run_disp(ct); sync(); comm.barrier()
+                run_cdisp(); sync(); comm.barrier()    # identity GEMM: packed_x = token
+                run_ccomb(); sync(); comm.barrier()
+                comb_out.zero_(); sync()
+                run_comb(ct); sync(); comm.barrier()
+                # identity expert telescopes to comb_out[s] == (sum_k wts[s][k]) * input[s]
+                ws = wts[:ct].float().cpu().sum(dim=1, keepdim=True)             # (ct,1)
+                exp = (ws * inp[:ct].float().cpu()).to(torch.bfloat16)
+                got = comb_out[:ct * HIDDEN].cpu().view(torch.bfloat16).view(ct, HIDDEN)
+                bad = ~torch.isclose(got, exp, atol=5e-2, rtol=5e-2)
+                nbad = int(bad.sum().item())
+                errs = d.allreduce_sum(nbad)
+                if rank == 0:
+                    print(f"# STDMOE ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "
+                          f"(sum-weighted identity, total_bad={errs})", flush=True)
+            d.shutdown()
+            return
 
         eager = MODE in ("eager", "both")
         graph = MODE in ("graph", "both")
