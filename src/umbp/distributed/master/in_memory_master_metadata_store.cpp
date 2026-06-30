@@ -472,8 +472,8 @@ InMemoryMasterMetadataStore::EnumerateEvictionCandidates(
     const bool cap = max_per_bucket > 0 && candidates.size() > max_per_bucket;
     if (order == EvictionOrder::kLeastRecentlyAccessed) {
       if (cap) {
-        std::partial_sort(candidates.begin(), candidates.begin() + max_per_bucket,
-                          candidates.end(), older_first);
+        std::partial_sort(candidates.begin(), candidates.begin() + max_per_bucket, candidates.end(),
+                          older_first);
         candidates.resize(max_per_bucket);
       } else {
         std::sort(candidates.begin(), candidates.end(), older_first);
@@ -519,8 +519,7 @@ std::vector<ClientRecord> InMemoryMasterMetadataStore::ListAliveClients() const 
   return result;
 }
 
-std::unordered_map<std::string, std::string> InMemoryMasterMetadataStore::GetAlivePeerView()
-    const {
+std::unordered_map<std::string, std::string> InMemoryMasterMetadataStore::GetAlivePeerView() const {
   std::shared_lock lock(mutex_);
   std::unordered_map<std::string, std::string> view;
   view.reserve(clients_.size());

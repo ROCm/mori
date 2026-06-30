@@ -673,8 +673,7 @@ TEST(InMemoryStore, GetAlivePeerViewIgnoresCapacity) {
   RegisterAlive(store, "n1");
 
   auto p1 = store.GetAlivePeerView();
-  ASSERT_EQ(Beat(store, "n1", /*seq=*/1, /*events=*/{}, kT0 + 1s).status,
-            HeartbeatResult::APPLIED);
+  ASSERT_EQ(Beat(store, "n1", /*seq=*/1, /*events=*/{}, kT0 + 1s).status, HeartbeatResult::APPLIED);
   auto p2 = store.GetAlivePeerView();
   EXPECT_EQ(p1, p2);
 }
