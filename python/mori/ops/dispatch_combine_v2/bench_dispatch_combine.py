@@ -101,13 +101,19 @@ def main():
     win_bytes = max_recv * HIDDEN * ESZ + npes * M * HIDDEN * ESZ + (1 << 24)
     with Communicator.init(npes, rank, uid, per_rank_vmm=2 * win_bytes + (1 << 28)) as comm:
         _fp8 = QUANT == "fp8_direct_cast"
-        _wire_esz = 1 if _fp8 else ESZ
+        _bw = QUANT == "fp8_blockwise"
+        _wire_esz = 1 if (_fp8 or _bw) else ESZ
+        bw_scale_dim = HIDDEN // 128 if _bw else 0    # block_elems = 128
+        if _bw:
+            inp.mul_(float(os.environ.get("BW_INSCALE", 200)))  # >448 exercises scaling
         regions = [("tok_off", 4), ("recv_num", npes * 4), ("tis", max_recv * 4),
                    ("out_idx", max_recv * K * 4), ("out_wts", max_recv * K * 4),
                    ("out_tok", max_recv * HIDDEN * ESZ), ("xdb_mem", npes * 8)]
         if COMBINE == "scatter":
             regions.append(("comb_inp", npes * M * HIDDEN * _wire_esz))
             regions.append(("comb_wts", npes * M * K * 4))
+            if _bw:
+                regions.append(("comb_scales", npes * M * bw_scale_dim * 4))
         if SCALE_DIM:
             regions.append(("out_scales", max_recv * _sc_n_i32 * 4))
         arena = SymmArena(comm, regions)
@@ -130,8 +136,9 @@ def main():
                 off_comb_inp=arena.offset("comb_inp"), off_tis=arena.offset("tis"),
                 off_xdb_mem=arena.offset("xdb_mem"), off_out_wts=arena.offset("out_wts"),
                 off_comb_wts=arena.offset("comb_wts"), enable_weights=True,
-                fp8_direct_cast=_fp8, reset_total_recv=False,
-                _s3_cache=int(os.environ.get("S3_CACHE", 2)))
+                fp8_direct_cast=_fp8, fp8_blockwise=_bw, scale_dim=bw_scale_dim,
+                off_comb_scales=arena.offset("comb_scales") if _bw else 0,
+                reset_total_recv=False, _s3_cache=int(os.environ.get("S3_CACHE", 2)))
         else:
             combine = make_combine(
                 rank=rank, npes=npes, experts_per_token=K, hidden_dim=HIDDEN, hidden_elem_size=ESZ,
@@ -201,8 +208,8 @@ def main():
             U = np.array([len({int(idx_c[t, j]) // EPR for j in range(K)}) for t in range(ct)])
             exp = (torch.from_numpy(U).view(ct, 1).float() * inp[:ct].float().cpu()).to(TOK_DT)
             # fp8 wire dtype is lossy (e4m3 ~6-12% rel) -> loose tolerance.
-            _atol, _rtol = (1.5e-1, 1.5e-1) if _fp8 else (2e-2, 2e-2)
-            got_dt = torch.bfloat16 if _fp8 else TOK_DT     # fp8 path outputs bf16
+            _atol, _rtol = (1.0, 1.5e-1) if (_fp8 or _bw) else (2e-2, 2e-2)
+            got_dt = torch.bfloat16 if (_fp8 or _bw) else TOK_DT   # fp8 paths output bf16
             got = comb_out[:ct * HIDDEN].cpu().view(got_dt).view(ct, HIDDEN)
             ok = torch.allclose(got.float(), exp.float(), atol=_atol, rtol=_rtol)
             # weights: out_weights[t][e] == U[t] * wts[t][e] (gather and scatter
