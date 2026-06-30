@@ -38,7 +38,8 @@ def _from_accum2(v2f32):           # v2f32 -> i32 (2 bf16)
 
 def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                  max_tok_per_rank, max_recv, block_num, warp_num_per_block,
-                 off_out_tok, off_xdb_mem, reset_total_recv=True, _s3_cache=2, _unroll=2):
+                 off_out_tok, off_xdb_mem, off_out_wts=0, enable_weights=True,
+                 reset_total_recv=True, _s3_cache=2, _unroll=2):
     assert hidden_elem_size == 2, "basic combine path is bf16-only"
     nbytes = hidden_dim * hidden_elem_size
     n_i32 = nbytes // 4
@@ -47,7 +48,7 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
     @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
     def ep_combine(arena: Int64, addr_tok_map: Int64, addr_comb_bar: Int64,
                    addr_xdb_flag: Int64, addr_total_recv: Int64, addr_out: Int64,
-                   my_lsa_rank: Int32, cur_rank_num_token: Int32):
+                   addr_out_wts: Int64, my_lsa_rank: Int32, cur_rank_num_token: Int32):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid & 63
@@ -91,6 +92,8 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
             if tid == 0:
                 buffer_store(arith.constant(0), _r_trecv, 0)
 
+        rsrc_owts = create_buffer_resource_from_addr(addr_out_wts)
+
         # ── Stage 2: warp-partitioned remote gather + f32 accumulate ──
         # Register-light i32 (2 bf16, v2f32) reads + `_unroll`-way unroll: each
         # lane keeps `_unroll` independent loads/accumulators in flight per k so
@@ -110,6 +113,8 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
             tm_base = tok_id * experts_per_token
             expert_rsrcs = []
             expert_vlds = []
+            expert_pes = []
+            expert_tks = []
             for k_slot in range_constexpr(experts_per_token):
                 enc_k = buffer_load(_r_tok_map, tm_base + k_slot, vec_width=1, dtype=T.i32())
                 dest_pe_k = enc_k // max_recv             # sentinel: dest_pe == npes
@@ -122,6 +127,25 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                              + fx.Int64(safe_tok_k) * fx.Int64(nbytes))
                 expert_rsrcs.append(create_buffer_resource_from_addr(slot_addr))
                 expert_vlds.append(vld_k)
+                expert_pes.append(safe_pe)
+                expert_tks.append(safe_tok_k)
+
+            # Weights (mori UseWeights): once per token (part 0), reduce the K
+            # forwarded weight vectors -> out_weights[tok][e]. Reuses the decode
+            # above and overlaps with this warp's hidden gather.
+            if const_expr(enable_weights):
+                if part_id == arith.constant(0):
+                    if lane < experts_per_token:
+                        wt_acc = arith.constant(0.0, type=T.f32())
+                        for k_slot in range_constexpr(experts_per_token):
+                            waddr = (fx.Int64(w.lsa_ptr(expert_pes[k_slot], off_out_wts))
+                                     + (fx.Int64(expert_tks[k_slot]) * fx.Int64(experts_per_token)
+                                        + fx.Int64(lane)) * fx.Int64(4))
+                            wv = buffer_load(create_buffer_resource_from_addr(waddr), 0,
+                                             vec_width=1, dtype=T.f32())
+                            wt_acc = wt_acc + arith.select(
+                                expert_vlds[k_slot], wv, arith.constant(0.0, type=T.f32()))
+                        buffer_store(wt_acc, rsrc_owts, tm_base + lane)
             rem = arith.constant(n_i32) - unit_base
             eff = arith.select(rem < units_per_warp, rem, units_per_warp)   # i32 units this warp
             out_base = tok_id * n_i32
@@ -159,10 +183,10 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
 
     @flyc.jit
     def run(arena: Int64, addr_tok_map: Int64, addr_comb_bar: Int64, addr_xdb_flag: Int64,
-            addr_total_recv: Int64, addr_out: Int64, my_lsa_rank: Int32,
+            addr_total_recv: Int64, addr_out: Int64, addr_out_wts: Int64, my_lsa_rank: Int32,
             cur_rank_num_token: Int32, stream=fx.Stream(None)):
         ep_combine(arena, addr_tok_map, addr_comb_bar, addr_xdb_flag, addr_total_recv,
-                   addr_out, my_lsa_rank, cur_rank_num_token).launch(
+                   addr_out, addr_out_wts, my_lsa_rank, cur_rank_num_token).launch(
             grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream)
 
     return run

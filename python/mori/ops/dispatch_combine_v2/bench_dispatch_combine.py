@@ -70,6 +70,7 @@ def main():
     comb_bar = torch.zeros(1, dtype=torch.int32, device=dev)
     xdb_flag = torch.ones(1, dtype=torch.int64, device=dev)
     comb_out = torch.zeros(max_tok * HIDDEN, dtype=torch.int16, device=dev)
+    comb_out_wts = torch.zeros(max_tok * K, dtype=torch.float32, device=dev)
 
     uid = Communicator.get_unique_id() if rank == 0 else None
     uid = d.bcast_uid(uid)
@@ -93,14 +94,16 @@ def main():
             rank=rank, npes=npes, experts_per_token=K, hidden_dim=HIDDEN, hidden_elem_size=2,
             max_tok_per_rank=M, max_recv=max_recv, block_num=COMB_BLOCK, warp_num_per_block=WARP_NUM,
             off_out_tok=arena.offset("out_tok"), off_xdb_mem=arena.offset("xdb_mem"),
-            reset_total_recv=False, _s3_cache=int(os.environ.get("S3_CACHE", 2)),
+            off_out_wts=arena.offset("out_wts"), reset_total_recv=False,
+            _s3_cache=int(os.environ.get("S3_CACHE", 2)),
             _unroll=int(os.environ.get("UNROLL", 2)))
 
         cur = torch.cuda.current_stream()
         dptrs = (arena.handle, inp.data_ptr(), idx.data_ptr(), wts.data_ptr(), tok_map.data_ptr(),
                  dest_pe_ctr.data_ptr(), disp_bar.data_ptr(), total_recv.data_ptr())
         cptrs = (arena.handle, tok_map.data_ptr(), comb_bar.data_ptr(),
-                 xdb_flag.data_ptr(), total_recv.data_ptr(), comb_out.data_ptr())
+                 xdb_flag.data_ptr(), total_recv.data_ptr(), comb_out.data_ptr(),
+                 comb_out_wts.data_ptr())
         disp_c = flyc.compile(dispatch, *[fx.Int64(p) for p in dptrs], rank, max_tok, fx.Stream(cur))
         comb_c = flyc.compile(combine, *[fx.Int64(p) for p in cptrs], rank, max_tok, fx.Stream(cur))
 
@@ -155,10 +158,16 @@ def main():
             exp = (torch.from_numpy(U).view(ct, 1).float() * inp[:ct].float().cpu()).to(torch.bfloat16)
             got = comb_out[:ct * HIDDEN].cpu().view(torch.bfloat16).view(ct, HIDDEN)
             ok = torch.allclose(got, exp, atol=2e-2, rtol=2e-2)
-            errs = d.allreduce_sum(0 if ok else 1)
+            # weights: out_weights[t][e] == U[t] * wts[t][e] (sum over valid experts
+            # of the identical forwarded weight vector; #valid == U[t]).
+            exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
+            got_w = comb_out_wts[:ct * K].cpu().view(ct, K)
+            ok_w = torch.allclose(got_w, exp_w, atol=2e-3, rtol=2e-3)
+            errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
             if rank == 0:
                 print(f"# correctness ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "
-                      f"(U in [{U.min()},{U.max()}], {ct} tok/rank, identity expert)", flush=True)
+                      f"(hidden={'ok' if ok else 'BAD'} wts={'ok' if ok_w else 'BAD'}; "
+                      f"U in [{U.min()},{U.max()}], {ct} tok/rank, identity expert)", flush=True)
             return errs == 0
 
         eager = MODE in ("eager", "both")
