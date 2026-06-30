@@ -689,6 +689,10 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   return 0;
 }
 
+bool ShmemIsInitialized() {
+  return ShmemStatesSingleton::GetInstance()->status == ShmemStatesStatus::Initialized;
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Finalization Helpers                                     */
 /* ---------------------------------------------------------------------------------------------- */
