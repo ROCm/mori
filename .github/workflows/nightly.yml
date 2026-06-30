@@ -321,6 +321,7 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
+      NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
       WHEEL_URL: ${{ needs.deploy-staging.outputs.wheel_url }}
       WHEEL_VERSION: ${{ needs.deploy-staging.outputs.version }}
     timeout-minutes: 45
@@ -341,6 +342,7 @@ jobs:
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
+            ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
