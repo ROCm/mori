@@ -23,6 +23,7 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from mori.cco import Communicator
+from mori.tensor_utils import from_gpu_ptr
 import mori.cco.device.flydsl as cco  # noqa: F401
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +55,7 @@ STDMOE = int(os.environ.get("STDMOE", 0))        # 1 = run StdMoE convert pipeli
 DTYPE = os.environ.get("DTYPE", "bf16")          # bf16 | f32
 COMBINE = os.environ.get("COMBINE", "gather")    # gather | scatter
 QUANT = os.environ.get("QUANT", "none")          # none | fp8_direct_cast (scatter only)
+SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = forward per-token scales
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,2048").split(",")]
 
 # (torch token dtype, elem bytes, comb_out storage dtype matching elem bytes)
@@ -83,6 +85,15 @@ def main():
     xdb_flag = torch.ones(1, dtype=torch.int64, device=dev)
     comb_out = torch.zeros(max_tok * HIDDEN, dtype=COMB_DT, device=dev)
     comb_out_wts = torch.zeros(max_tok * K, dtype=torch.float32, device=dev)
+    # per-token scales (int8 bytes): pattern = (rank*100003 + tok) per dword so
+    # the recv side can verify the bijection (origin decoded from tis).
+    _sc_n_i32 = (SCALE_DIM + 3) // 4
+    if SCALE_DIM:
+        scales = torch.empty(max_tok * _sc_n_i32, dtype=torch.int32, device=dev)
+        scales.copy_(torch.arange(max_tok, device=dev).view(max_tok, 1).expand(max_tok, _sc_n_i32)
+                     .contiguous().view(-1) + rank * 100003)
+    else:
+        scales = torch.zeros(1, dtype=torch.int32, device=dev)
 
     uid = Communicator.get_unique_id() if rank == 0 else None
     uid = d.bcast_uid(uid)
@@ -97,6 +108,8 @@ def main():
         if COMBINE == "scatter":
             regions.append(("comb_inp", npes * M * HIDDEN * _wire_esz))
             regions.append(("comb_wts", npes * M * K * 4))
+        if SCALE_DIM:
+            regions.append(("out_scales", max_recv * _sc_n_i32 * 4))
         arena = SymmArena(comm, regions)
         zero(arena.local_ptr("tok_off"), arena.total_bytes)
 
@@ -106,7 +119,9 @@ def main():
             block_num=DISP_BLOCK, warp_num_per_block=WARP_NUM,
             off_tok_off=arena.offset("tok_off"), off_recv_num=arena.offset("recv_num"),
             off_tis=arena.offset("tis"), off_out_idx=arena.offset("out_idx"),
-            off_out_wts=arena.offset("out_wts"), off_out_tok=arena.offset("out_tok"))
+            off_out_wts=arena.offset("out_wts"), off_out_tok=arena.offset("out_tok"),
+            off_out_scales=arena.offset("out_scales") if SCALE_DIM else 0,
+            scale_dim=SCALE_DIM, scale_type_size=1)
         if COMBINE == "scatter":
             combine = make_combine_scatter(
                 rank=rank, npes=npes, experts_per_token=K, hidden_dim=HIDDEN, hidden_elem_size=ESZ,
@@ -128,7 +143,8 @@ def main():
 
         cur = torch.cuda.current_stream()
         dptrs = (arena.handle, inp.data_ptr(), idx.data_ptr(), wts.data_ptr(), tok_map.data_ptr(),
-                 dest_pe_ctr.data_ptr(), disp_bar.data_ptr(), total_recv.data_ptr())
+                 dest_pe_ctr.data_ptr(), disp_bar.data_ptr(), total_recv.data_ptr(),
+                 scales.data_ptr())
         cptrs = (arena.handle, tok_map.data_ptr(), comb_bar.data_ptr(),
                  xdb_flag.data_ptr(), total_recv.data_ptr(), comb_out.data_ptr(),
                  comb_out_wts.data_ptr())
@@ -260,6 +276,25 @@ def main():
                 if rank == 0:
                     print(f"# STDMOE ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "
                           f"(sum-weighted identity, total_bad={errs})", flush=True)
+            d.shutdown()
+            return
+
+        if SCALE_DIM:
+            # Verify per-token scales forwarding: each recv slot's scale block
+            # must equal its origin token's pattern (src_pe*100003 + src_lid),
+            # origin decoded from tis. Mirrors mori's dispatch scale copy.
+            total_recv.zero_(); sync()
+            run_disp(min(SWEEP)); sync(); comm.barrier()
+            recv = int(total_recv.cpu().item())
+            out_sc = from_gpu_ptr(arena.local_ptr("out_scales"),
+                                  (max_recv, _sc_n_i32), torch.int32)[:recv].cpu()
+            tis = from_gpu_ptr(arena.local_ptr("tis"), (max_recv,), torch.int32)[:recv].cpu()
+            exp = ((tis // M) * 100003 + (tis % M)).view(recv, 1)
+            ok = bool((out_sc == exp).all().item()) if recv > 0 else True
+            errs = d.allreduce_sum(0 if ok else 1)
+            if rank == 0:
+                print(f"# SCALES: {'PASS' if errs == 0 else 'FAIL'} "
+                      f"(recv={recv}, scale_dim={SCALE_DIM}, {_sc_n_i32} dwords/tok)", flush=True)
             d.shutdown()
             return
 

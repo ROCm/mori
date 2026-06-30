@@ -23,15 +23,21 @@ import flydsl_prims as P
 def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim,
                   hidden_elem_size, max_tok_per_rank, max_recv, block_num, warp_num_per_block,
                   off_tok_off, off_recv_num, off_tis, off_out_idx, off_out_wts, off_out_tok,
-                  enable_signal=True):
+                  off_out_scales=0, scale_dim=0, scale_type_size=0, enable_signal=True):
     nbytes = hidden_dim * hidden_elem_size
     n_i32 = nbytes // 4
     sentinel_val = npes * max_recv
+    # Optional per-token scales (e.g. fp4/blockwise quant inputs): forwarded
+    # verbatim alongside the token to the dest peer's out_scales (mori parity).
+    scale_bytes = scale_dim * scale_type_size
+    scale_n_i32 = (scale_bytes + 3) // 4
+    enable_scales = scale_bytes > 0
 
     @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
     def ep_dispatch(arena: Int64, addr_inp_tok: Int64, addr_inp_idx: Int64, addr_inp_wts: Int64,
                     addr_tok_map: Int64, addr_dest_pe_ctr: Int64, addr_disp_bar: Int64,
-                    addr_total_recv: Int64, my_lsa_rank: Int32, inp_cur_tok: Int32):
+                    addr_total_recv: Int64, addr_inp_scales: Int64,
+                    my_lsa_rank: Int32, inp_cur_tok: Int32):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid & 63
@@ -99,6 +105,19 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
                     peer_idx = fx.Int64(w.lsa_ptr(dest_pe, off_out_idx))
                     buffer_store(idx_val, create_buffer_resource_from_addr(peer_idx), dest_slot)
 
+            # Per-token scales scatter: forward the src token's scale_n_i32 dwords
+            # to the dest peer's out_scales[dest_tok_id] (lane-strided to cover
+            # scale_dim > one wavefront). Verbatim copy (opaque bytes).
+            if const_expr(enable_scales):
+                if do_publish:
+                    _r_inp_sc = create_buffer_resource_from_addr(addr_inp_scales)
+                    peer_sc = fx.Int64(w.lsa_ptr(dest_pe, off_out_scales))
+                    _r_peer_sc = create_buffer_resource_from_addr(peer_sc)
+                    for k_off in range(lane, scale_n_i32, 64):
+                        sc_val = buffer_load(_r_inp_sc, src_tok * scale_n_i32 + k_off,
+                                             vec_width=1, dtype=T.i32())
+                        buffer_store(sc_val, _r_peer_sc, dest_tok_id * scale_n_i32 + k_off)
+
             # Token-embedding scatter: each lane owns 4 i32 (16B). Dual-issue the
             # main body (2 vec4 loads then 2 vec4 stores, stride 512 i32) for
             # memory-level parallelism; a stride-256 tail covers the remainder.
@@ -164,11 +183,11 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
     @flyc.jit
     def run(arena: Int64, addr_inp_tok: Int64, addr_inp_idx: Int64, addr_inp_wts: Int64,
             addr_tok_map: Int64, addr_dest_pe_ctr: Int64, addr_disp_bar: Int64,
-            addr_total_recv: Int64, my_lsa_rank: Int32, inp_cur_tok: Int32,
-            stream=fx.Stream(None)):
+            addr_total_recv: Int64, addr_inp_scales: Int64, my_lsa_rank: Int32,
+            inp_cur_tok: Int32, stream=fx.Stream(None)):
         ep_dispatch(arena, addr_inp_tok, addr_inp_idx, addr_inp_wts, addr_tok_map,
-                    addr_dest_pe_ctr, addr_disp_bar, addr_total_recv, my_lsa_rank,
-                    inp_cur_tok).launch(grid=(block_num, 1, 1),
-                                        block=[warp_num_per_block * 64, 1, 1], stream=stream)
+                    addr_dest_pe_ctr, addr_disp_bar, addr_total_recv, addr_inp_scales,
+                    my_lsa_rank, inp_cur_tok).launch(
+            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream)
 
     return run
