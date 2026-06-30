@@ -246,8 +246,8 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
 def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                          max_tok_per_rank, max_recv, block_num, warp_num_per_block,
                          off_out_tok, off_comb_inp, off_tis, off_xdb_mem, off_out_wts=0,
-                         enable_weights=True, fp8_direct_cast=False, reset_total_recv=True,
-                         _s3_cache=2):
+                         off_comb_wts=0, enable_weights=True, fp8_direct_cast=False,
+                         reset_total_recv=True, _s3_cache=2):
     """Scatter combine (mori useExternalInpBuffer / _nop2p path).
 
     Stage 1  each computing rank P2P-WRITES its post-expert tokens back to the
@@ -321,13 +321,13 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
                     v = buffer_load(rsrc_s, e, vec_width=1, dtype=T.i32())
                     buffer_store(v, rsrc_d, e)
             if const_expr(enable_weights):
+                # forward this recv slot's weights (dispatch put them in out_wts[rt])
+                # to the ORIGIN's comb_wts[computing_rank*M + lid] (dedicated
+                # region; reusing out_wts would collide with dispatch's layout).
                 wsrc = (fx.Int64(w.lsa_ptr(my_lsa_rank, off_out_wts))
                         + fx.Int64(rt) * fx.Int64(experts_per_token) * fx.Int64(4))
-                wdst = (fx.Int64(w.lsa_ptr(origin_pe, off_out_wts))
+                wdst = (fx.Int64(w.lsa_ptr(origin_pe, off_comb_wts))
                         + fx.Int64(rank * M + origin_lid) * fx.Int64(experts_per_token) * fx.Int64(4))
-                # weights already live in out_wts per recv slot; forward them so
-                # Stage 3b can reduce on the origin. (out_wts doubles as the
-                # scatter weight buffer here.)
                 if lane < experts_per_token:
                     wv = buffer_load(create_buffer_resource_from_addr(wsrc), lane,
                                      vec_width=1, dtype=T.i32())
@@ -386,7 +386,8 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
                     if lane < experts_per_token:
                         wt_acc = arith.constant(0.0, type=T.f32())
                         for k_slot in range_constexpr(experts_per_token):
-                            waddr = (fx.Int64(w.lsa_ptr(my_lsa_rank, off_out_wts))
+                            # LOCAL comb_wts[computing_pe*M + tok_id] (scattered in S1)
+                            waddr = (fx.Int64(w.lsa_ptr(my_lsa_rank, off_comb_wts))
                                      + (fx.Int64(ex_pes[k_slot]) * fx.Int64(M) + fx.Int64(tok_id))
                                      * fx.Int64(experts_per_token) * fx.Int64(4)
                                      + fx.Int64(lane) * fx.Int64(4))

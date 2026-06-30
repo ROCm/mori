@@ -96,6 +96,7 @@ def main():
                    ("out_tok", max_recv * HIDDEN * ESZ), ("xdb_mem", npes * 8)]
         if COMBINE == "scatter":
             regions.append(("comb_inp", npes * M * HIDDEN * _wire_esz))
+            regions.append(("comb_wts", npes * M * K * 4))
         arena = SymmArena(comm, regions)
         zero(arena.local_ptr("tok_off"), arena.total_bytes)
 
@@ -113,7 +114,8 @@ def main():
                 warp_num_per_block=WARP_NUM, off_out_tok=arena.offset("out_tok"),
                 off_comb_inp=arena.offset("comb_inp"), off_tis=arena.offset("tis"),
                 off_xdb_mem=arena.offset("xdb_mem"), off_out_wts=arena.offset("out_wts"),
-                enable_weights=False, fp8_direct_cast=_fp8, reset_total_recv=False,
+                off_comb_wts=arena.offset("comb_wts"), enable_weights=True,
+                fp8_direct_cast=_fp8, reset_total_recv=False,
                 _s3_cache=int(os.environ.get("S3_CACHE", 2)))
         else:
             combine = make_combine(
@@ -187,14 +189,11 @@ def main():
             got_dt = torch.bfloat16 if _fp8 else TOK_DT     # fp8 path outputs bf16
             got = comb_out[:ct * HIDDEN].cpu().view(got_dt).view(ct, HIDDEN)
             ok = torch.allclose(got.float(), exp.float(), atol=_atol, rtol=_rtol)
-            # weights: out_weights[t][e] == U[t] * wts[t][e]. Scatter test runs
-            # with weights disabled, so skip that check there.
-            if COMBINE == "scatter":
-                ok_w = True
-            else:
-                exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
-                got_w = comb_out_wts[:ct * K].cpu().view(ct, K)
-                ok_w = torch.allclose(got_w, exp_w, atol=2e-3, rtol=2e-3)
+            # weights: out_weights[t][e] == U[t] * wts[t][e] (gather and scatter
+            # both reduce the U forwarded copies of the identical weight vector).
+            exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
+            got_w = comb_out_wts[:ct * K].cpu().view(ct, K)
+            ok_w = torch.allclose(got_w, exp_w, atol=2e-3, rtol=2e-3)
             errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
             if rank == 0:
                 print(f"# correctness ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "
