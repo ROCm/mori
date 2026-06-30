@@ -44,6 +44,17 @@ class EpDispatchCombineConfig:
     # over-cap tokens take the dup-sentinel drop path (no OOB).
     max_total_recv_tokens: int = 0
 
+    @classmethod
+    def tuned(cls, **kwargs):
+        """Build a config with block/warp geometry pulled from tuning_configs
+        (unless explicitly overridden in kwargs)."""
+        from tuning_configs import lookup
+        t = lookup(kwargs["world_size"], kwargs["hidden_dim"],
+                   kwargs["num_experts_per_token"])
+        for k, v in t.items():
+            kwargs.setdefault(k, v)
+        return cls(**kwargs)
+
     @property
     def elem_size(self):
         return _DT[self.data_type]
