@@ -302,6 +302,7 @@ This copies the current GPU states to the `globalGpuStates` symbol in the dynami
 | `MORI_RDMA_TC` | RDMA traffic class | Auto |
 | `MORI_DISABLE_P2P` | Disable P2P (XGMI) transport, force RDMA | Not set |
 | `MORI_DISABLE_TOPO` | Disable topology detection | Not set |
+| `MORI_IGNORE_CPU_AFFINITY` | By default the thread calling `ShmemInit` is pinned to the CPUs local to its GPU (sysfs `local_cpulist`, intersected with the existing cpuset). Set to `1` to disable and leave CPU placement to an outer `numactl`/`torchrun`. Works in SPMT (single-process multi-GPU) too: each per-GPU init thread pins to its own GPU's NUMA node. | Not set (binding on) |
 | `MORI_GLOBAL_LOG_LEVEL` | Global log verbosity: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | `INFO` |
 | `MORI_PRECOMPILE` | Precompile all JIT kernels on import | Not set |
 | `MORI_DISABLE_JIT` | Disable JIT compilation of device bitcode | Not set |

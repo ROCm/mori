@@ -227,6 +227,7 @@ class RdmaDeviceContext {
                                uint32_t qpId = 0) {
     assert(false && "not implemented");
   }
+  virtual bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept;
 
   ibv_srq* CreateRdmaSrqIfNx(const RdmaEndpointConfig&);
 

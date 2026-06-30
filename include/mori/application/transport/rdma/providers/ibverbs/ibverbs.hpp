@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include <mutex>
+
 #include "infiniband/verbs.h"
 #include "mori/application/transport/rdma/rdma.hpp"
 
@@ -35,8 +37,10 @@ class IBVerbsDeviceContext : public RdmaDeviceContext {
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
                                uint32_t qpId = 0) override;
+  bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept override;
 
  private:
+  mutable std::mutex poolMu;
   std::unordered_map<void*, ibv_cq*> cqPool;
   std::unordered_map<uint32_t, ibv_qp*> qpPool;
   std::vector<ibv_comp_channel*> compChPool;

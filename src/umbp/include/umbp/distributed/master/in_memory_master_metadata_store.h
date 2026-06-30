@@ -102,6 +102,7 @@ class InMemoryMasterMetadataStore : public IMasterMetadataStore {
   bool IsClientAlive(const std::string& node_id) const override;
   std::optional<std::string> GetPeerAddress(const std::string& node_id) const override;
   std::vector<ClientRecord> ListAliveClients() const override;
+  std::unordered_map<std::string, std::string> GetAlivePeerView() const override;
   std::size_t AliveClientCount() const override;
   std::vector<std::string> GetClientTags(const std::string& node_id) const override;
 

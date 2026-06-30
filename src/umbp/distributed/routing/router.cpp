@@ -81,12 +81,11 @@ std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(
     const std::unordered_set<std::string>& exclude_nodes) {
   std::vector<std::optional<RouteGetResolution>> results(keys.size());
 
-  // Snapshot peer addresses once for the whole batch.  Master assumes
-  // the snapshot is stable for the duration of one BatchRouteGet.
-  std::unordered_map<std::string, std::string> node_to_peer;
-  for (const auto& client : store_.ListAliveClients()) {
-    node_to_peer[client.node_id] = client.peer_address;
-  }
+  // Lightweight membership view (no capacity): an O(nodes) copy of just the
+  // node->peer pairs, far cheaper than ListAliveClients' full per-node records.
+  // Snapshot once for the whole batch — the master assumes it is stable for
+  // the duration of one BatchRouteGet.
+  auto node_to_peer = store_.GetAlivePeerView();
 
   // Unlike the old GlobalBlockIndex::BatchLookupForRouteGet (which read the
   // clock internally), BatchLookupBlockForRouteGet takes an explicit `now`

@@ -83,6 +83,7 @@ that has loaded `libmori_pybinds.so`).
 | `UMBP_SSD_GET_RETRY_BACKOFF_MS` | `2` | ms | Sleep between remote SSD get retries (only applied when another attempt follows). `min_allowed=1`. |
 | `UMBP_RELEASE_LEASE_TIMEOUT_MS` | `1000` | ms | Per-attempt gRPC deadline for the best-effort `ReleaseSsdLease` RPC so a slow peer can't stall the reader. `min_allowed=1`. |
 | `UMBP_SSD_PREPARE_TIMEOUT_MS` | `0` | ms | Per-call gRPC deadline for `PrepareSsdRead` so a hung/slow peer can't stall the serial batch. `0` = fall back to `ssd_lease_timeout_s` (cluster-homogeneous). A timed-out / failed prepare is a hard not-served outcome (NOT retried, and never a miss). `min_allowed=0`. |
+| `UMBP_AUTO_FLUSH_EVENT_THRESHOLD` | `128` | count | Peer-side unshipped `KvEvent` outbox size at which a completed batch of puts auto-triggers a heartbeat flush (`FlushHeartbeat`), so the ADDs become visible at the master without waiting for the heartbeat interval or an explicit `Flush()`. Counted on `PeerDramAllocator` only (SSD events still wait for the interval). Parsed via `std::strtoull` (no WARN on bad input); unset / unparseable / `0` -> default `128`; set to a very large value to make auto-flush effectively never fire. Cached on first use in `MasterClient::SetPeerDramAllocator`. |
 
 ## SPDK proxy
 

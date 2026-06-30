@@ -632,6 +632,53 @@ TEST(InMemoryStore, ListAliveClientsReturnsAliveRecordsExcludingExpired) {
   EXPECT_EQ(alive[0].peer_address, "peer:n2");
 }
 
+// The lightweight peer view maps node->peer (no capacity) and reflects
+// membership changes. Ported from the old ClientRegistry peer-view tests.
+TEST(InMemoryStore, GetAlivePeerViewTracksMembership) {
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "n1");
+
+  auto v1 = store.GetAlivePeerView();
+  EXPECT_EQ(v1.size(), 1u);
+  ASSERT_EQ(v1.count("n1"), 1u);
+  EXPECT_EQ(v1.at("n1"), "peer:n1");  // MakeReg sets peer:<node>
+
+  // Membership change → reflected in a freshly built view.
+  RegisterAlive(store, "n2");
+  auto v2 = store.GetAlivePeerView();
+  EXPECT_EQ(v2.size(), 2u);
+  EXPECT_EQ(v2.at("n2"), "peer:n2");
+}
+
+// EXPIRED rows are excluded from the peer view (unlike GetPeerAddress, which
+// still surfaces a single expired row's peer).
+TEST(InMemoryStore, GetAlivePeerViewExcludesExpired) {
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "n1", kT0);
+  RegisterAlive(store, "n2", kT0 + 20s);  // fresher, survives the cutoff below
+
+  ASSERT_EQ(store.ExpireStaleClients(kT0 + 10s).size(), 1u);  // expires n1 only
+
+  auto view = store.GetAlivePeerView();
+  EXPECT_EQ(view.size(), 1u);
+  EXPECT_EQ(view.count("n1"), 0u);
+  ASSERT_EQ(view.count("n2"), 1u);
+  EXPECT_EQ(view.at("n2"), "peer:n2");
+}
+
+// The peer view carries no capacity, so a capacity-only heartbeat leaves its
+// contents (node → peer) unchanged.
+TEST(InMemoryStore, GetAlivePeerViewIgnoresCapacity) {
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "n1");
+
+  auto p1 = store.GetAlivePeerView();
+  ASSERT_EQ(Beat(store, "n1", /*seq=*/1, /*events=*/{}, kT0 + 1s).status,
+            HeartbeatResult::APPLIED);
+  auto p2 = store.GetAlivePeerView();
+  EXPECT_EQ(p1, p2);
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency
 // ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <cassert>
+#include <system_error>
 #include <vector>
 
 #include "mori/application/transport/tcp/tcp.hpp"
@@ -49,10 +50,55 @@ void TestTcpContext() {
 
   assert(ep1.Send(sendBuf.c_str(), sendBuf.size()) == 0);
   assert(ep2.Recv(recvBuf.data(), sendBuf.size()) == 0);
-  assert(std::string(recvBuf.data()) == sendBuf);
+  assert(std::string(recvBuf.begin(), recvBuf.end()) == sendBuf);
 
   context1.Close();
   context2.Close();
 }
 
-int main() { TestTcpContext(); }
+void TestTcpRecvReportsEof() {
+  std::string host = "127.0.0.1";
+
+  TCPContext context1(host, 0);
+  TCPContext context2(host, 0);
+
+  context1.Listen();
+  context2.Listen();
+
+  TCPEndpointHandle eph1 = context1.Connect(host, context2.GetPort());
+  TCPEndpointHandle eph2 = context2.Accept()[0];
+  context1.CloseEndpoint(eph1);
+
+  TCPEndpoint ep2(eph2);
+  char buf[8]{};
+  size_t consumed = 99;
+  assert(ep2.Recv(buf, sizeof(buf), &consumed) == 1);
+  assert(consumed == 0);
+
+  context2.Close();
+}
+
+void TestTcpConnectFailureThrows() {
+  std::string host = "127.0.0.1";
+
+  TCPContext listener(host, 0);
+  listener.Listen();
+  uint16_t closedPort = listener.GetPort();
+  listener.Close();
+
+  TCPContext client(host, 0);
+  bool threw = false;
+  try {
+    (void)client.Connect(host, closedPort);
+  } catch (const std::system_error& e) {
+    threw = true;
+    assert(e.code().value() != 0);
+  }
+  assert(threw);
+}
+
+int main() {
+  TestTcpContext();
+  TestTcpRecvReportsEof();
+  TestTcpConnectFailureThrows();
+}

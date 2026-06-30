@@ -348,3 +348,20 @@ target_link_libraries(
                                    GTest::gtest_main)
 target_compile_features(test_batch_resolve_codec PRIVATE cxx_std_17)
 gtest_discover_tests(test_batch_resolve_codec)
+# Multi-client agent KV-event pressure bench: in-process master + N PoolClients
+# driving a put -> LLM-gap -> get schedule (--pattern broadcast|rotate),
+# comparing baseline / compressed-heartbeat / flush kv-event propagation under
+# varying QPS. Reads master per-RPC latency back from the master's own
+# Prometheus endpoint (--metrics-port).  Standalone executable; not a CTest
+# target.  Heartbeat interval is env-driven (UMBP_HEARTBEAT_TTL_SEC /
+# UMBP_HEARTBEAT_INTERVAL_DIVISOR); launch one process per scenario.
+add_executable(bench_umbp_kvevent_master_pressure
+               bench_kvevent_master_pressure.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(bench_umbp_kvevent_master_pressure PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  bench_umbp_kvevent_master_pressure
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)

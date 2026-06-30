@@ -169,6 +169,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -440,6 +441,17 @@ class IMasterMetadataStore {
 
   // ALIVE only — does not include EXPIRED records.
   virtual std::vector<ClientRecord> ListAliveClients() const = 0;
+
+  // Lightweight membership view: node_id -> peer_address for every ALIVE
+  // client, and nothing else. Exists as its own method so the hot RouteGet /
+  // MatchExternalKv paths can snapshot just the peer addresses they need
+  // instead of copying every full ClientRecord (capacities, engine desc,
+  // tags) via ListAliveClients. A Redis backend can serve this from a single
+  // node->peer projection (or an SMEMBERS + per-node HGET peer) rather than
+  // HGETALL per node; it stays a single logical round trip and needs no
+  // cross-keyspace atomicity. EXPIRED clients are excluded.
+  virtual std::unordered_map<std::string, std::string> GetAlivePeerView() const = 0;
+
   virtual std::size_t AliveClientCount() const = 0;
 
   virtual std::vector<std::string> GetClientTags(const std::string& node_id) const = 0;

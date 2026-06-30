@@ -62,31 +62,7 @@ size_t InMemoryMasterMetadataStore::ApplyEventsLocked(const std::string& node_id
                                                       std::chrono::system_clock::time_point now) {
   size_t mutated = 0;
   for (const auto& ev : events) {
-    if (ev.kind == KvEvent::Kind::CLEAR_AT_TIER) {
-      for (auto it = entries_.begin(); it != entries_.end();) {
-        auto& locs = it->second.locations;
-        const size_t before = locs.size();
-        locs.erase(std::remove_if(locs.begin(), locs.end(),
-                                  [&](const Location& l) {
-                                    return l.node_id == node_id && l.tier == ev.tier;
-                                  }),
-                   locs.end());
-        const size_t removed = before - locs.size();
-        mutated += removed;
-        if (removed != 0 && !HasLocationForNode(it->second.locations, node_id)) {
-          auto rev_it = node_to_keys_.find(node_id);
-          if (rev_it != node_to_keys_.end()) {
-            rev_it->second.erase(it->first);
-            if (rev_it->second.empty()) node_to_keys_.erase(rev_it);
-          }
-        }
-        if (locs.empty()) {
-          it = entries_.erase(it);
-        } else {
-          ++it;
-        }
-      }
-    } else if (ev.kind == KvEvent::Kind::ADD) {
+    if (ev.kind == KvEvent::Kind::ADD) {
       auto& entry = entries_[ev.key];
       if (entry.locations.empty()) {
         entry.metrics.created_at = now;
@@ -169,20 +145,22 @@ void InMemoryMasterMetadataStore::ReplaceNodeLocationsLocked(
 }
 
 void InMemoryMasterMetadataStore::RemoveBlocksByNodeLocked(const std::string& node_id) {
-  for (auto it = entries_.begin(); it != entries_.end();) {
-    auto& locs = it->second.locations;
-    const size_t before = locs.size();
+  // Drive the removal off the reverse index so the cost is O(node's keys)
+  // rather than a full O(entries_) scan — UnregisterClient/ExpireStaleClients
+  // hit this per dead node.
+  auto rev_it = node_to_keys_.find(node_id);
+  if (rev_it == node_to_keys_.end()) return;
+  auto keys = std::move(rev_it->second);
+  node_to_keys_.erase(rev_it);
+  for (const auto& key : keys) {
+    auto eit = entries_.find(key);
+    if (eit == entries_.end()) continue;
+    auto& locs = eit->second.locations;
     locs.erase(std::remove_if(locs.begin(), locs.end(),
                               [&](const Location& l) { return l.node_id == node_id; }),
                locs.end());
-    if (locs.empty()) {
-      it = entries_.erase(it);
-    } else {
-      ++it;
-    }
-    (void)before;
+    if (locs.empty()) entries_.erase(eit);
   }
-  node_to_keys_.erase(node_id);
 }
 
 void InMemoryMasterMetadataStore::RemoveExternalKvByNodeLocked(const std::string& node_id) {
@@ -539,6 +517,18 @@ std::vector<ClientRecord> InMemoryMasterMetadataStore::ListAliveClients() const 
     if (record.status == ClientStatus::ALIVE) result.push_back(record);
   }
   return result;
+}
+
+std::unordered_map<std::string, std::string> InMemoryMasterMetadataStore::GetAlivePeerView()
+    const {
+  std::shared_lock lock(mutex_);
+  std::unordered_map<std::string, std::string> view;
+  view.reserve(clients_.size());
+  for (const auto& [id, record] : clients_) {
+    if (record.status != ClientStatus::ALIVE) continue;
+    view.emplace(record.node_id, record.peer_address);
+  }
+  return view;
 }
 
 std::size_t InMemoryMasterMetadataStore::AliveClientCount() const {

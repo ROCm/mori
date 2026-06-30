@@ -107,6 +107,8 @@ class MockMasterMetadataStore : public IMasterMetadataStore {
   MOCK_METHOD(std::optional<std::string>, GetPeerAddress, (const std::string& node_id),
               (const, override));
   MOCK_METHOD(std::vector<ClientRecord>, ListAliveClients, (), (const, override));
+  MOCK_METHOD((std::unordered_map<std::string, std::string>), GetAlivePeerView, (),
+              (const, override));
   MOCK_METHOD(std::size_t, AliveClientCount, (), (const, override));
   MOCK_METHOD(std::vector<std::string>, GetClientTags, (const std::string& node_id),
               (const, override));

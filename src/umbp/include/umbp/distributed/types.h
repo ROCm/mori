@@ -161,7 +161,7 @@ struct BufferMemoryDescBytes {
 // allocator (and its unit tests) do not have to depend on the generated
 // proto headers.
 struct KvEvent {
-  enum class Kind : int { ADD = 0, REMOVE = 1, CLEAR_AT_TIER = 2 };
+  enum class Kind : int { ADD = 0, REMOVE = 1 };
   Kind kind = Kind::ADD;
   std::string key;
   TierType tier = TierType::UNKNOWN;

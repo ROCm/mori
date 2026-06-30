@@ -366,9 +366,16 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
       return;
     }
 
+    // Rebuild the 32-bit completion from the 16-bit wqe_counter via the forward
+    // delta, bounded by outstanding (<65536) to drop stale CQEs sitting behind cons.
     uint16_t comp16 = static_cast<uint16_t>(wqeCounter + 1);
-    uint32_t completed = (cons & ~0xffffu) | comp16;
-    if (completed < cons) completed += 0x10000u;  // low-bit wrap into next 64K block
+    uint16_t delta = static_cast<uint16_t>(comp16 - static_cast<uint16_t>(cons));
+    uint32_t live = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t window = live - cons;
+    uint32_t completed = cons;
+    if (delta != 0 && delta <= window) {
+      completed = cons + delta;
+    }
 
     __hip_atomic_fetch_max(&wq.doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     cons = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
