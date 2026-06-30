@@ -258,9 +258,12 @@ void NotifySqStateChanged(const EpPair& ep) {
   auto* event = ep.sqAdmission.get();
   if (!event) return;
 
-  event->epoch.fetch_add(1, kSqAdmissionOrder);
+  // Avoid an atomic RMW on the CQ hot path when no thread is waiting. A waiter
+  // that this load misses registers after the predicate update and re-checks
+  // sqDepth/degraded before sleeping, so it will not block on stale state.
   if (event->waiters.load(kSqAdmissionOrder) == 0) return;
 
+  event->epoch.fetch_add(1, kSqAdmissionOrder);
   FutexWakeAll(&event->epoch);
 }
 
