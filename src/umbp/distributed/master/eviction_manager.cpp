@@ -120,9 +120,9 @@ void EvictionManager::RunOnce() {
   buckets.reserve(bytes_to_free.size());
   for (const auto& [ntk, _bytes] : bytes_to_free) buckets.push_back(ntk);
 
-  auto candidates_by_bucket = store_.EnumerateEvictionCandidates(
-      buckets, EvictionOrder::kLeastRecentlyAccessed, /*max_per_bucket=*/0,
-      std::chrono::system_clock::now());
+  auto candidates_by_bucket =
+      store_.EnumerateEvictionCandidates(buckets, EvictionOrder::kLeastRecentlyAccessed,
+                                         /*max_per_bucket=*/0, std::chrono::system_clock::now());
   if (candidates_by_bucket.empty()) {
     MORI_UMBP_DEBUG("[EvictionManager] No eviction candidates found");
     return;
@@ -140,8 +140,7 @@ void EvictionManager::RunOnce() {
     strategy_budget[ntk.node_id][ntk.tier] = static_cast<int64_t>(bytes);
   }
 
-  auto per_node_keys =
-      strategy_->SelectVictims(std::move(candidates), std::move(strategy_budget));
+  auto per_node_keys = strategy_->SelectVictims(std::move(candidates), std::move(strategy_budget));
 
   size_t selected = 0;
   for (const auto& [node_id, keys] : per_node_keys) selected += keys.size();

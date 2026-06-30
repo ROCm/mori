@@ -124,8 +124,8 @@ struct EvictionCandidate {
 // by last_accessed_at) can serve the cheapest top-N rows instead of shipping
 // every candidate.  The actual victim decision belongs to MasterEvictStrategy.
 enum class EvictionOrder : int {
-  kNone = 0,                  // no ordering guarantee; store returns in any order
-  kLeastRecentlyAccessed = 1, // oldest last_accessed_at first
+  kNone = 0,                   // no ordering guarantee; store returns in any order
+  kLeastRecentlyAccessed = 1,  // oldest last_accessed_at first
 };
 
 // Structured form of one (buffer_index, page_index) slot.  Used by the
