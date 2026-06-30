@@ -18,7 +18,12 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr, T, vector
 from flydsl.expr.buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
-from flydsl.expr.rocdl import cvt_pk_f32_fp8, cvt_pk_fp8_f32
+from flydsl.expr.rocdl import (
+    cvt_pk_f32_fp8,
+    cvt_pk_fp8_f32,
+    cvt_scalef32_pk_f32_fp4,
+    cvt_scalef32_pk_fp4_f32,
+)
 from flydsl.expr.typing import Int32, Int64
 
 import mori.cco.device.flydsl as cco
@@ -27,10 +32,40 @@ import flydsl_prims as P
 _V2BF16 = lambda: T.VectorType.get([2], T.bf16())
 _V2F32 = lambda: T.VectorType.get([2], T.f32())
 _V4F32 = lambda: T.VectorType.get([4], T.f32())
+_V8F32 = lambda: T.VectorType.get([8], T.f32())
 _V1I32 = lambda: T.VectorType.get([1], T.i32())
 
 
-def _accum_funcs(hidden_elem_size, fp8_direct_cast=False):
+def _accum_funcs(hidden_elem_size, fp8_direct_cast=False, fp4=False):
+    if fp4:                            # fp4 e2m1: i32 = 8 packed fp4 -> v8f32
+        # NOTE: cvt_scalef32_pk_*_fp4 are gfx950-only (MI350). On gfx942
+        # (MI300X) codegen fails "instruction not supported on this GPU".
+        # Faithful port of the FlyDSL reference fp4 branch; opt-in (fp4=True).
+        def to_accum(i32_scalar):
+            one = arith.constant(1.0, type=T.f32())
+            pr = [cvt_scalef32_pk_f32_fp4(res=_V2F32(), src=i32_scalar, scale=one,
+                                          src_sel_index=s) for s in range(4)]
+            lo4 = vector.shuffle(pr[0], pr[1], [0, 1, 2, 3])
+            hi4 = vector.shuffle(pr[2], pr[3], [0, 1, 2, 3])
+            return vector.shuffle(lo4, hi4, [0, 1, 2, 3, 4, 5, 6, 7])
+
+        def from_accum(acc):
+            one = arith.constant(1.0, type=T.f32())
+            old = arith.constant(0, type=T.i32())
+            for s in range(4):
+                fa = vector.extract(acc, static_position=[s * 2])
+                fb = vector.extract(acc, static_position=[s * 2 + 1])
+                old = cvt_scalef32_pk_fp4_f32(res=T.i32(), old_vdst=old, src0=fa, src1=fb,
+                                              scale=one, dst_sel_index=s)
+            return old
+
+        def zero_accum():
+            return arith.constant_vector(0.0, _V8F32())
+        return to_accum, from_accum, zero_accum
+    return _accum_funcs_int(hidden_elem_size, fp8_direct_cast)
+
+
+def _accum_funcs_int(hidden_elem_size, fp8_direct_cast=False):
     """Return (to_accum, from_accum, zero_accum) for one i32 'unit' of the
     transport dtype, mirroring the FlyDSL reference's per-dtype branches.
 
@@ -84,12 +119,13 @@ def _accum_funcs(hidden_elem_size, fp8_direct_cast=False):
 def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                  max_tok_per_rank, max_recv, block_num, warp_num_per_block,
                  off_out_tok, off_xdb_mem, off_out_wts=0, enable_weights=True,
-                 fp8_direct_cast=False, reset_total_recv=True, _s3_cache=2, _unroll=2):
+                 fp8_direct_cast=False, fp4=False, reset_total_recv=True,
+                 _s3_cache=2, _unroll=2):
     # Transport dtype = external dtype, except fp8_direct_cast wires fp8 while
-    # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit).
-    _to_accum2, _from_accum2, _zero_accum = _accum_funcs(hidden_elem_size, fp8_direct_cast)
-    nbytes = hidden_dim * hidden_elem_size
-    n_i32 = nbytes // 4
+    # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit). fp4: i32 = 8 fp4.
+    _to_accum2, _from_accum2, _zero_accum = _accum_funcs(hidden_elem_size, fp8_direct_cast, fp4)
+    nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
+    n_i32 = hidden_dim // 8 if fp4 else nbytes // 4
     n_chunks = nbytes // 16          # vec4 (16B) chunks per token
     # fp8_direct_cast: output stride is bf16 (2 i32 per fp8 unit) vs input fp8.
     out_n_i32 = (hidden_dim * 2) // 4 if fp8_direct_cast else n_i32
