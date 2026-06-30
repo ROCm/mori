@@ -197,7 +197,7 @@ class EpDispatchCombineOp:
         stream = fx.Stream(torch.cuda.current_stream())
         self._dispatch(self.arena.handle, input.data_ptr(), indices.data_ptr(),
                        weights.data_ptr(), self.tok_map.data_ptr(), self.dest_pe_ctr.data_ptr(),
-                       self.disp_bar.data_ptr(), self.total_recv.data_ptr(),
+                       self.disp_bar.data_ptr(), self.total_recv.data_ptr(), 0,
                        self.cfg.rank, cur, stream)
         routing = EpDispatchRoutingHandle(cur, self.total_recv, self.tok_map.clone())
         return self.recv_tokens(), int(self.total_recv.cpu().item()), routing
