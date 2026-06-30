@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.join(_ROOT, "examples", "cco", "python"))
 from cco_example_common import set_device, sync, zero  # noqa: E402
 from symm_arena import SymmArena  # noqa: E402
 from dispatch_kernel import make_dispatch  # noqa: E402
-from combine_kernel import make_combine  # noqa: E402
+from combine_kernel import make_combine, make_combine_scatter  # noqa: E402
 from stdmoe_kernel import (  # noqa: E402
     make_convert_dispatch_output,
     make_convert_combine_input,
@@ -52,6 +52,8 @@ ITERS = int(os.environ.get("ITERS", 50))
 MODE = os.environ.get("MODE", "both")            # eager | graph | both
 STDMOE = int(os.environ.get("STDMOE", 0))        # 1 = run StdMoE convert pipeline
 DTYPE = os.environ.get("DTYPE", "bf16")          # bf16 | f32
+COMBINE = os.environ.get("COMBINE", "gather")    # gather | scatter
+QUANT = os.environ.get("QUANT", "none")          # none | fp8_direct_cast (scatter only)
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,2048").split(",")]
 
 # (torch token dtype, elem bytes, comb_out storage dtype matching elem bytes)
@@ -87,9 +89,13 @@ def main():
 
     win_bytes = max_recv * HIDDEN * ESZ + npes * M * HIDDEN * ESZ + (1 << 24)
     with Communicator.init(npes, rank, uid, per_rank_vmm=2 * win_bytes + (1 << 28)) as comm:
+        _fp8 = QUANT == "fp8_direct_cast"
+        _wire_esz = 1 if _fp8 else ESZ
         regions = [("tok_off", 4), ("recv_num", npes * 4), ("tis", max_recv * 4),
                    ("out_idx", max_recv * K * 4), ("out_wts", max_recv * K * 4),
                    ("out_tok", max_recv * HIDDEN * ESZ), ("xdb_mem", npes * 8)]
+        if COMBINE == "scatter":
+            regions.append(("comb_inp", npes * M * HIDDEN * _wire_esz))
         arena = SymmArena(comm, regions)
         zero(arena.local_ptr("tok_off"), arena.total_bytes)
 
@@ -100,13 +106,23 @@ def main():
             off_tok_off=arena.offset("tok_off"), off_recv_num=arena.offset("recv_num"),
             off_tis=arena.offset("tis"), off_out_idx=arena.offset("out_idx"),
             off_out_wts=arena.offset("out_wts"), off_out_tok=arena.offset("out_tok"))
-        combine = make_combine(
-            rank=rank, npes=npes, experts_per_token=K, hidden_dim=HIDDEN, hidden_elem_size=ESZ,
-            max_tok_per_rank=M, max_recv=max_recv, block_num=COMB_BLOCK, warp_num_per_block=WARP_NUM,
-            off_out_tok=arena.offset("out_tok"), off_xdb_mem=arena.offset("xdb_mem"),
-            off_out_wts=arena.offset("out_wts"), reset_total_recv=False,
-            _s3_cache=int(os.environ.get("S3_CACHE", 2)),
-            _unroll=int(os.environ.get("UNROLL", 2)))
+        if COMBINE == "scatter":
+            combine = make_combine_scatter(
+                rank=rank, npes=npes, experts_per_token=K, hidden_dim=HIDDEN, hidden_elem_size=ESZ,
+                max_tok_per_rank=M, max_recv=max_recv, block_num=COMB_BLOCK,
+                warp_num_per_block=WARP_NUM, off_out_tok=arena.offset("out_tok"),
+                off_comb_inp=arena.offset("comb_inp"), off_tis=arena.offset("tis"),
+                off_xdb_mem=arena.offset("xdb_mem"), off_out_wts=arena.offset("out_wts"),
+                enable_weights=False, fp8_direct_cast=_fp8, reset_total_recv=False,
+                _s3_cache=int(os.environ.get("S3_CACHE", 2)))
+        else:
+            combine = make_combine(
+                rank=rank, npes=npes, experts_per_token=K, hidden_dim=HIDDEN, hidden_elem_size=ESZ,
+                max_tok_per_rank=M, max_recv=max_recv, block_num=COMB_BLOCK,
+                warp_num_per_block=WARP_NUM, off_out_tok=arena.offset("out_tok"),
+                off_xdb_mem=arena.offset("xdb_mem"), off_out_wts=arena.offset("out_wts"),
+                reset_total_recv=False, _s3_cache=int(os.environ.get("S3_CACHE", 2)),
+                _unroll=int(os.environ.get("UNROLL", 2)))
 
         cur = torch.cuda.current_stream()
         dptrs = (arena.handle, inp.data_ptr(), idx.data_ptr(), wts.data_ptr(), tok_map.data_ptr(),
@@ -166,13 +182,19 @@ def main():
             idx_c = idx[:ct].cpu().numpy()
             U = np.array([len({int(idx_c[t, j]) // EPR for j in range(K)}) for t in range(ct)])
             exp = (torch.from_numpy(U).view(ct, 1).float() * inp[:ct].float().cpu()).to(TOK_DT)
-            got = comb_out[:ct * HIDDEN].cpu().view(TOK_DT).view(ct, HIDDEN)
-            ok = torch.allclose(got.float(), exp.float(), atol=2e-2, rtol=2e-2)
-            # weights: out_weights[t][e] == U[t] * wts[t][e] (sum over valid experts
-            # of the identical forwarded weight vector; #valid == U[t]).
-            exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
-            got_w = comb_out_wts[:ct * K].cpu().view(ct, K)
-            ok_w = torch.allclose(got_w, exp_w, atol=2e-3, rtol=2e-3)
+            # fp8 wire dtype is lossy (e4m3 ~6-12% rel) -> loose tolerance.
+            _atol, _rtol = (1.5e-1, 1.5e-1) if _fp8 else (2e-2, 2e-2)
+            got_dt = torch.bfloat16 if _fp8 else TOK_DT     # fp8 path outputs bf16
+            got = comb_out[:ct * HIDDEN].cpu().view(got_dt).view(ct, HIDDEN)
+            ok = torch.allclose(got.float(), exp.float(), atol=_atol, rtol=_rtol)
+            # weights: out_weights[t][e] == U[t] * wts[t][e]. Scatter test runs
+            # with weights disabled, so skip that check there.
+            if COMBINE == "scatter":
+                ok_w = True
+            else:
+                exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
+                got_w = comb_out_wts[:ct * K].cpu().view(ct, K)
+                ok_w = torch.allclose(got_w, exp_w, atol=2e-3, rtol=2e-3)
             errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
             if rank == 0:
                 print(f"# correctness ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "
