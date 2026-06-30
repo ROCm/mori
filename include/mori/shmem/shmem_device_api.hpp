@@ -1251,6 +1251,65 @@ inline __device__ void ShmemInternalBarrierBlock() {
   __syncthreads();
 }
 
+// DISSEMINATION barrier — a topology-cheaper drop-in for the
+// PE0-coordinator funnel ShmemInternalBarrierBlock.  root-caused the
+// hier-AllGather residual to the global prepare ShmemBarrierOnStream: the funnel
+// serializes ALL 8 PEs through PE0 (PE0 does n-1 sequential inbound waits + n-1
+// sequential outbound puts, several crossing the node boundary over RDMA). The
+// dissemination algorithm replaces that O(n) serial critical path with
+// ceil(log2 n) parallel rounds (every PE does 1 put + 1 wait per round): for
+// n=8 that is 3 rounds vs ~14 serial PE0 steps. Same GLOBAL scope (all PEs),
+// same proven put/wait primitives, so it preserves the quiet-drain +
+// all-PEs-arrived semantics the prepare relies on.
+//
+// Correctness: monotonic per-PE generation counter (never reset) disambiguates
+// successive barrier calls, so no per-op flag clear (and no clear-vs-signal
+// race) is needed. Each call: gen = ++localGen. Round r (dist = 1<<r): signal
+// partner (pe+dist)%n with gen, then wait until my slot[r] >= gen (written by
+// (pe-dist+n)%n). Waiting each round before advancing gives the standard
+// dissemination guarantee that no PE exits until all entered; the ≤1-barrier
+// cross-PE skew that property permits is handled by the monotonic gen (a peer
+// racing one call ahead only writes a LARGER value, which still satisfies the
+// >= gen wait). Uses a DISJOINT pSync slot region [DISSEM_BASE, DISSEM_BASE+R)
+// + a PE-local gen slot, so it never aliases the funnel's slots [0,n) even if
+// the two barrier flavors interleave within one op.
+inline __device__ void ShmemInternalBarrierDissemBlock() {
+  if (threadIdx.x == 0) {
+    GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+    uint64_t* pSync = globalGpuStates->internalSyncPtr;
+    int pe = globalGpuStates->rank;
+    int n_pes = globalGpuStates->worldSize;
+
+    // Disjoint from the funnel's slots [0, n_pes). MORI_INTERNAL_SYNC_SIZE is
+    // 128 uint64 slots; DISSEM_BASE=64 leaves room for up to ~63 rounds (far
+    // beyond any realistic PE count) and a PE-local generation slot at 127.
+    constexpr int DISSEM_BASE = 64;
+    constexpr int DISSEM_GEN_SLOT = 127;
+
+    uint64_t gen = pSync[DISSEM_GEN_SLOT] + 1;
+    pSync[DISSEM_GEN_SLOT] = gen;
+    __threadfence();
+
+    int r = 0;
+    for (int dist = 1; dist < n_pes; dist <<= 1, ++r) {
+      int partner = pe + dist;
+      if (partner >= n_pes) partner -= n_pes;
+      // Signal partner's round-r slot with this call's generation.
+      ShmemPutUint64ImmNbiThread(&pSync[DISSEM_BASE + r], gen, partner, 0);
+      __threadfence_system();
+      // Wait for the round-r signal from (pe - dist + n_pes) % n_pes.
+      ShmemUint64WaitUntilGreaterThan(&pSync[DISSEM_BASE + r], gen - 1);
+    }
+    __threadfence_system();
+  }
+  __syncthreads();
+}
+
+inline __device__ void ShmemBarrierAllDissemBlock() {
+  ShmemQuietThread();
+  ShmemInternalBarrierDissemBlock();
+}
+
 inline __device__ void ShmemBarrierAllThread() {
   ShmemQuietThread();
   ShmemInternalBarrierThread();

@@ -24,6 +24,14 @@ try:
     from .collective import All2allSdma
     from .collective import AllgatherSdma
     from .collective import AllreduceSdma
+    from .collective import InterNodeRingAllgather
+    from .collective import IntraNodeSubGroupAllgatherSdma
+    from .collective import IntraNodeSubGroupBroadcastSdma
+
+    # Hierarchical cross-node AllGather. Imported inside the guard
+    # because it depends on ``.collective`` (which pulls in the C++ bindings);
+    # if those are unavailable we must not break the whole ``mori.ccl`` package.
+    from .hier_allgather import HierAllGather, hier_allgather_reference
 
     # NCCL/RCCL-style C++ AllGather-into-tensor dispatcher.  The class and its
     # DataType enum are implemented entirely in C++ (see
@@ -41,15 +49,24 @@ try:
         "All2allSdma",
         "AllgatherSdma",
         "AllreduceSdma",
+        "InterNodeRingAllgather",
+        "IntraNodeSubGroupAllgatherSdma",
+        "IntraNodeSubGroupBroadcastSdma",
         "AllGatherIntoTensor",
         "DataType",
         "size_of",
+        "HierAllGather",
+        "hier_allgather_reference",
     ]
 except (ImportError, AttributeError):
+    # C++ bindings unavailable: only the pure-Python executable specs are
+    # importable here. The device classes are exposed via ``__getattr__`` so
+    # accessing them raises a clear ImportError rather than AttributeError.
+    from .hier_allgather import hier_allgather_reference, inter_node_ring_reference
+
     __all__ = [
-        "All2allSdma",
-        "AllgatherSdma",
-        "AllreduceSdma",
+        "hier_allgather_reference",
+        "inter_node_ring_reference",
     ]
 
     def __getattr__(name: str):

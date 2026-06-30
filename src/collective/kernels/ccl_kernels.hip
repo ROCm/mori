@@ -35,6 +35,7 @@
 #include "mori/collective/allgather/oneshot_sdma_kernel.hpp"
 #include "mori/collective/allreduce/twoshot_sdma_async_kernel.hpp"
 #include "mori/collective/allreduce/twoshot_sdma_kernel.hpp"
+#include "mori/collective/inter_node/kernels/all_gather.hpp"
 
 #include "mori/collective/ccl_kernel_args.hpp"
 
@@ -147,10 +148,30 @@ extern "C" __global__ void OneShotAll2allSdmaAsyncWaitKernel_u32(
 CCL_WRAP_ALLGATHER(OneShotAllGatherSdmaKernel, u32, uint32_t)
 CCL_WRAP_ALLGATHER_ASYNC_PUT(OneShotAllGatherSdmaAsyncPutKernel, u32, uint32_t)
 
+// Sub-group intra-node SDMA AllGather. Type-agnostic byte move on
+// u32 lanes; the Python layer rounds the byte count up to u32 elements.
+extern "C" __global__ void OneShotAllGatherSdmaSubGroupKernel_u32(
+    CclAllgatherSubGroupArgs<uint32_t> args) {
+  OneShotAllGatherSdmaSubGroupKernel_body<uint32_t>(
+      args.myPe, args.npes, args.groupSize, args.groupPos, args.peBase, args.peStride, args.input,
+      args.dstMemObj, args.flagsMemObj, args.elementCount, args.dstBaseOffset,
+      args.dstSlotStrideBytes, args.flagVal);
+}
+
 extern "C" __global__ void OneShotAllGatherSdmaAsyncWaitKernel_u32(
     CclAllgatherArgs<uint32_t> args) {
   OneShotAllGatherSdmaAsyncWaitKernel_body(args.myPe, args.npes, args.dstMemObj,
                                            args.flagsMemObj, args.flagVal);
+}
+
+// Sub-group intra-node SDMA broadcast. Type-
+// agnostic byte move on u32 lanes; the Python layer rounds the byte count up to
+// u32 elements. One root (group position 0) fans the full buffer to all members.
+extern "C" __global__ void OneShotBroadcastSdmaSubGroupKernel_u32(
+    CclBroadcastSubGroupArgs<uint32_t> args) {
+  OneShotBroadcastSdmaSubGroupKernel_body<uint32_t>(
+      args.myPe, args.groupSize, args.groupPos, args.peBase, args.peStride, args.input,
+      args.dstMemObj, args.flagsMemObj, args.elementCount, args.dstBaseOffset, args.flagVal);
 }
 
 // ============================================================================
@@ -177,3 +198,46 @@ CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG, AllGatherAsyncPutKernel)
 
 // --- AllGatherAsyncWaitKernel (non-template) ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG_WAIT, AllGatherAsyncWaitKernel)
+
+// ============================================================================
+// Inter-node RDMA ring AllGather
+// ============================================================================
+// Byte-move ring: ``chunkBytes`` per PE, ``npes-1`` rounds over the shmem
+// transport. Type-agnostic (raw bytes), so a single u32 entry serves all
+// dtypes (the Python layer rounds the byte count up to u32 lanes).
+extern "C" __global__ void InterNodeRingAllGatherKernel_u32(CclInterNodeRingArgs args) {
+  // Sub-group ring over {peBase, peBase+peStride, ...}; the flat whole-world
+  // ring is the special case peBase=0, peStride=1, ringSize=npes, ringPos=myPe.
+  AllGatherRingSubGroupKernelBody(args.ringPos, args.ringSize, args.peBase, args.peStride,
+                                  args.memObj, args.flagsObj, args.chunkBytes, args.numQp);
+}
+
+// ============================================================================
+// Fused inter-node ring + intra-node LOCAL-block SDMA gather
+// ============================================================================
+// One launch overlaps Phase A (RDMA ring, NIC) with the Phase-B gather of THIS
+// node's own block (SDMA, XGMI) -- the only half of Phase B that does NOT depend
+// on the ring (each local rank's own shard is present from the start). Blocks
+// [0, ringBlocks) run the ring (with explicit numBlocks=ringBlocks / bid so the
+// RCCL-style multi-block channel logic still tiles each chunk exactly); the
+// remaining block runs the local SDMA gather as a single self-contained block
+// (blockLocal=true). The ring and the gather touch DISJOINT symm objects and
+// flag regions, so the two halves never alias -- the union is byte-identical to
+// running them as two serial kernels, only now concurrent. This is the fused
+// recv+reassemble lever this work proved reaches/beats RCCL @>=32MiB, adopted here
+//. NOTE: this fuses the ring with the LOCAL block only; the
+// REMOTE-block gather (which DOES depend on the ring) still follows as a
+// separate launch -- a later increment may fuse that tail.
+extern "C" __global__ void FusedRingLocalGatherKernel_u32(CclFusedRingLocalGatherArgs args) {
+  if (blockIdx.x < static_cast<unsigned>(args.ringBlocks)) {
+    AllGatherRingSubGroupKernelBody(args.ringPos, args.ringSize, args.ringPeBase, args.ringPeStride,
+                                    args.ringMemObj, args.ringFlagsObj, args.chunkBytes, args.numQp,
+                                    /*numBlocksOverride=*/args.ringBlocks,
+                                    /*bidOverride=*/static_cast<int>(blockIdx.x));
+  } else {
+    OneShotAllGatherSdmaSubGroupKernel_body<uint32_t>(
+        args.myPe, args.npes, args.groupSize, args.groupPos, args.gPeBase, args.gPeStride,
+        args.gInput, args.gDstMemObj, args.gFlagsObj, args.gElementCount, args.gDstBaseOffset,
+        args.gDstSlotStrideBytes, args.gFlagVal, /*blockLocal=*/true);
+  }
+}

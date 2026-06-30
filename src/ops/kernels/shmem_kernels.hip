@@ -17,3 +17,9 @@
 // Keep only one definition in this TU to avoid redefinition with JIT build.
 
 extern "C" __global__ void mori_shmem_barrier_all_block() { mori::shmem::ShmemBarrierAllBlock(); }
+
+// dissemination-topology global barrier (see
+// ShmemInternalBarrierDissemBlock). Launched by ShmemBarrierOnStreamDissem.
+extern "C" __global__ void mori_shmem_barrier_all_block_dissem() {
+  mori::shmem::ShmemBarrierAllDissemBlock();
+}

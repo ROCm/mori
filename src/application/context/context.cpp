@@ -217,6 +217,15 @@ void Context::InitializePossibleTransports() {
   this->numQpPerPe = numQpPerPe;
   // Initialize transport
   int peerRankInNode = -1;
+  // HIP-visible device id of THIS rank within its node (0-based) = number of
+  // same-host peers ordered before us. We must use the within-node index, NOT
+  // (global rank % 8): with ranks-per-node != 8 or a sliced HIP_VISIBLE_DEVICES
+  // (e.g. a 2-node, 4-GPU/node run) the global ranks 4..7 on node 1 map to local
+  // HIP devices 0..3 -- (rank % 8) would pass 4..7 to HIP and fault (only 4
+  // devices visible). peerRankInNode (below) is the same 0-based index per peer.
+  int localDevId = 0;
+  for (int j = 0; j < LocalRank(); j++)
+    if (peerInfos[j].sameHost) localDevId++;
   if (!IsP2PDisabled() && IsSdmaEnabled()) anvil::anvil.init();
 
   int sdmaNumChannels = anvil::GetSdmaNumChannels();
@@ -236,12 +245,12 @@ void Context::InitializePossibleTransports() {
           if (IsSdmaEnabled()) {
             if (i != LocalRank()) {
               transportTypes.push_back(TransportType::SDMA);
-              anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
+              anvil::EnablePeerAccess(localDevId, peerRankInNode);
               // Better performance if allocating all 8 queues
-              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
+              anvil::anvil.connect(localDevId, peerRankInNode, sdmaNumChannels);
             } else {
               transportTypes.push_back(TransportType::SDMA);
-              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
+              anvil::anvil.connect(localDevId, peerRankInNode, sdmaNumChannels);
             }
           } else {
             transportTypes.push_back(TransportType::P2P);

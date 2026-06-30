@@ -218,16 +218,26 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
-  std::vector<int> dstDeviceIds;
-  for (int i = 0; i < worldSize; i++) {
-    if (context.GetTransportType(i) != TransportType::SDMA) continue;
-    dstDeviceIds.push_back(i % 8);  // should be intra devices count
+  // SDMA peers (same-host). Each peer needs its within-node HIP device id
+  // (0-based) for the anvil queue key, but the device-handle array is addressed
+  // by GLOBAL pe in the kernels (deviceHandles_d + pe * numQueues). Keep the two
+  // separate: (pe % 8) is wrong for multi-node / sliced HIP_VISIBLE_DEVICES runs
+  // where global ranks 4..7 on node 1 map to local HIP devices 0..3.
+  std::vector<std::pair<int, int>> sdmaPeers;  // (globalPe, withinNodeDevId)
+  {
+    int within = 0;
+    for (int i = 0; i < worldSize; i++) {
+      if (context.GetTransportType(i) != TransportType::SDMA) continue;
+      sdmaPeers.emplace_back(i, within++);
+    }
   }
-  if (dstDeviceIds.size() != 0) {
-    int srcDeviceId = rank % 8;
+  if (!sdmaPeers.empty()) {
+    int srcDeviceId = 0;  // within-node id of self
+    for (int j = 0; j < rank; j++)
+      if (context.GetTransportType(j) == TransportType::SDMA) srcDeviceId++;
     int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
-    // Allocate based on worldSize (not dstDeviceIds.size()) because indexing uses pe * numQ
-    // where pe ranges 0..worldSize-1. Using dstDeviceIds.size() causes buffer overflow.
+    // Allocate based on worldSize because indexing uses pe * numQ where pe ranges
+    // 0..worldSize-1. Using sdmaPeers.size() causes buffer overflow.
     size_t numDevices = static_cast<size_t>(worldSize);
     HIP_RUNTIME_CHECK(
         hipMalloc(&gpuMemObj->deviceHandles_d,
@@ -236,11 +246,13 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
         hipMemset(gpuMemObj->deviceHandles_d, 0,
                   numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
-    for (auto& dstDeviceId : dstDeviceIds) {
+    for (auto& peer : sdmaPeers) {
+      int dstPe = peer.first;          // global pe -> array index (kernel-facing)
+      int dstDeviceId = peer.second;   // within-node id -> anvil queue key
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
         auto* anvilHandle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
         HIP_RUNTIME_CHECK(
-            hipMemcpy(&gpuMemObj->deviceHandles_d[dstDeviceId * numOfQueuesPerDevice + q],
+            hipMemcpy(&gpuMemObj->deviceHandles_d[dstPe * numOfQueuesPerDevice + q],
                       &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
       }
     }
@@ -355,20 +367,50 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
     }
     free(memObjPtr.cpu->peerSignalPtrsHost);
   }
-  if (memObjPtr.gpu->signalPtrs) HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->signalPtrs));
-  if (memObjPtr.gpu->expectSignalsPtr) HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->expectSignalsPtr));
-  if (memObjPtr.gpu->peerSignalPtrs) HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerSignalPtrs));
-  if (memObjPtr.gpu->deviceHandles_d) HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->deviceHandles_d));
+  // the child arrays below (signalPtrs, peerPtrs, ...) were
+  // hipMalloc'd DEVICE-SIDE at registration and their pointer VALUES were stored
+  // only in the device-resident SymmMemObj struct (memObjPtr.gpu), never mirrored
+  // into cpuMemObj. The original code read them back by host-dereferencing the
+  // device struct (``memObjPtr.gpu->signalPtrs``), which only works when the
+  // hipMalloc'd struct happens to be host-coherent. On configs where it is not,
+  // that read yields a stale/garbage pointer and the wrapping HIP_RUNTIME_CHECK
+  // hipFree ABORTS the whole process at teardown (symmetric_memory.cpp:370) --
+  // AFTER the collective already produced bit-exact results. This is the crash
+  // the slice_direct output-deregister path hit on true xnode ( finding).
+  // Fix: (1) copy the device struct to a HOST staging mirror so we free the REAL
+  // device child pointers regardless of host-coherence; (2) make these teardown
+  // frees NON-FATAL (warn + continue, mirroring the hipIpcCloseMemHandle warning
+  // pattern a few lines above) so a cleanup hiccup never kills a process that has
+  // already finished its work. Only DeregisterSymmMemObj (ShmemSymmetricRegister
+  // objects, e.g. the slice_direct output) uses this path; the ShmemMalloc/VMM
+  // heap has its own teardown, so this cannot regress the main symmetric heap.
+  SymmMemObj gpuMirror{};
+  hipError_t mirrorErr =
+      hipMemcpy(&gpuMirror, memObjPtr.gpu, sizeof(SymmMemObj), hipMemcpyDeviceToHost);
+  if (mirrorErr != hipSuccess) {
+    MORI_APP_WARN("DeregisterSymmMemObj: device-struct readback failed: {}",
+                  hipGetErrorString(mirrorErr));
+  }
+  auto freeNonFatal = [](void* p, const char* what) {
+    if (!p) return;
+    hipError_t e = hipFree(p);
+    if (e != hipSuccess)
+      MORI_APP_WARN("DeregisterSymmMemObj: hipFree({}) failed: {}", what, hipGetErrorString(e));
+  };
+  freeNonFatal(gpuMirror.signalPtrs, "signalPtrs");
+  freeNonFatal(gpuMirror.expectSignalsPtr, "expectSignalsPtr");
+  freeNonFatal(gpuMirror.peerSignalPtrs, "peerSignalPtrs");
+  freeNonFatal(gpuMirror.deviceHandles_d, "deviceHandles_d");
 
   free(memObjPtr.cpu->peerPtrs);
   free(memObjPtr.cpu->p2pPeerPtrs);
   free(memObjPtr.cpu->peerRkeys);
   free(memObjPtr.cpu->ipcMemHandles);
   free(memObjPtr.cpu);
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerPtrs));
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->p2pPeerPtrs));
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerRkeys));
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu));
+  freeNonFatal(gpuMirror.peerPtrs, "gpu.peerPtrs");
+  freeNonFatal(gpuMirror.p2pPeerPtrs, "gpu.p2pPeerPtrs");
+  freeNonFatal(gpuMirror.peerRkeys, "gpu.peerRkeys");
+  freeNonFatal(memObjPtr.gpu, "gpu");
 
   memObjPool.erase(localPtr);
 }
@@ -428,7 +470,7 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
     std::vector<int> dstDeviceIds;
     for (int i = 0; i < worldSize; i++) {
       if (context.GetTransportType(i) != TransportType::SDMA) continue;
-      dstDeviceIds.push_back(i % 8);  // should be intra devices count
+      dstDeviceIds.push_back(i);  // only the count is used below
     }
 
     if (dstDeviceIds.size() != 0) {

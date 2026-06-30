@@ -584,6 +584,13 @@ void GpuStateInit(ShmemStates* states) {
   states->gpuStates.rank = states->bootStates->rank;
   states->gpuStates.worldSize = states->bootStates->worldSize;
   states->gpuStates.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
+  // this work (transport in-flight depth): optional fast-path WQE chunk size. When
+  // set, a large RDMA put is split into multiple in-flight WQEs/QP (see
+  // GpuStates::putChunkBytes). 0/unset keeps the single-WQE behavior.
+  {
+    const char* pcb = std::getenv("MORI_RDMA_PUT_CHUNK_BYTES");
+    states->gpuStates.putChunkBytes = (pcb != nullptr) ? std::strtoull(pcb, nullptr, 10) : 0;
+  }
 
   // Copy communication metadata to GPU
   CopyTransportTypesToGpu(states);
