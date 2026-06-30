@@ -81,16 +81,26 @@ nic_mount_flags() {
             if [[ -n "$host_ibverbs" ]]; then
                 flags+=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
             fi
-            for lib in /usr/local/lib/libbnxt_re-rdmav*.so; do
-                if [[ -f "$lib" ]]; then
-                    flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/libibverbs/$(basename "$lib")")
+            local bnxt_dir=""
+            for dir in /usr/local/lib/x86_64-linux-gnu /usr/local/lib /usr/lib/x86_64-linux-gnu; do
+                if compgen -G "$dir/libbnxt_re-rdmav*.so" >/dev/null 2>&1; then
+                    bnxt_dir="$dir"
+                    break
                 fi
             done
-            for lib in /usr/local/lib/libbnxt_re.so; do
-                if [[ -f "$lib" ]]; then
-                    flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/$(basename "$lib")")
+            if [[ -n "$bnxt_dir" ]]; then
+                for lib in "$bnxt_dir"/libbnxt_re-rdmav*.so; do
+                    [[ -e "$lib" ]] || continue
+                    local real
+                    real=$(readlink -f "$lib")
+                    flags+=(-v "$real:/usr/lib/x86_64-linux-gnu/libibverbs/$(basename "$lib")")
+                done
+                if [[ -e "$bnxt_dir/libbnxt_re.so" ]]; then
+                    local real
+                    real=$(readlink -f "$bnxt_dir/libbnxt_re.so")
+                    flags+=(-v "$real:/usr/lib/x86_64-linux-gnu/libbnxt_re.so")
                 fi
-            done
+            fi
             if [[ -d /etc/libibverbs.d ]]; then
                 flags+=(-v /etc/libibverbs.d:/etc/libibverbs.d:ro)
             fi

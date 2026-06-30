@@ -42,8 +42,8 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-TW]
-          - platform: MI300X_BNXT
-            runner: [self-hosted, MI300X-BNXT]
+          - platform: MI325X_BNXT
+            runner: [self-hosted, 325_bnxt_008]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -93,17 +93,18 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
-          - platform: MI300X_BNXT
-            runner: [self-hosted, MI300X-BNXT]
-            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+          - platform: MI325X_BNXT
+            runner: [self-hosted, 325_bnxt_008]
+            rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             rdma_sl: 3
             rdma_tc: 104
-            socket_ifname: enp159s0np0
+            socket_ifname: enp49s0f1np1
     env:
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
+      NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -122,6 +123,7 @@ jobs:
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
+            ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -308,9 +310,9 @@ jobs:
             runner: [self-hosted, MI355X-AINIC-TW]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             gpu_arch: gfx950
-          - platform: MI300X_BNXT
-            runner: [self-hosted, MI300X-BNXT]
-            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+          - platform: MI325X_BNXT
+            runner: [self-hosted, 325_bnxt_008]
+            rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             gpu_arch: gfx942
     timeout-minutes: 90
     steps:
@@ -437,14 +439,14 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             ct: podman
-          - platform: MI300X_BNXT
-            runner: [self-hosted, MI300X-BNXT]
-            node1_host: 10.245.128.61
-            node2_host: 10.245.128.59
+          - platform: MI325X_BNXT
+            runner: [self-hosted, 325_bnxt_008]
+            node1_host: 10.162.224.20
+            node2_host: 10.162.224.162
             node2_port: 22
-            node1_ifname: enp159s0np0
-            node2_ifname: enp159s0np0
-            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            node1_ifname: enp49s0f1np1
+            node2_ifname: enp49s0f1np1
+            rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             rdma_sl: 3
             rdma_tc: 104
             ct: docker
