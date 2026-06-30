@@ -51,7 +51,12 @@ WARMUP = int(os.environ.get("WARMUP", 10))
 ITERS = int(os.environ.get("ITERS", 50))
 MODE = os.environ.get("MODE", "both")            # eager | graph | both
 STDMOE = int(os.environ.get("STDMOE", 0))        # 1 = run StdMoE convert pipeline
+DTYPE = os.environ.get("DTYPE", "bf16")          # bf16 | f32
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,2048").split(",")]
+
+# (torch token dtype, elem bytes, comb_out storage dtype matching elem bytes)
+_DT = {"bf16": (torch.bfloat16, 2, torch.int16), "f32": (torch.float32, 4, torch.int32)}
+TOK_DT, ESZ, COMB_DT = _DT[DTYPE]
 
 
 def main():
@@ -65,7 +70,7 @@ def main():
     max_recv = npes * M
 
     g = torch.Generator(device="cpu").manual_seed(1234 + rank)
-    inp = torch.randn(max_tok, HIDDEN, generator=g, dtype=torch.float32).to(torch.bfloat16).to(dev)
+    inp = torch.randn(max_tok, HIDDEN, generator=g, dtype=torch.float32).to(TOK_DT).to(dev)
     idx = torch.randint(0, num_experts, (max_tok, K), generator=g, dtype=torch.int32).to(dev)
     wts = torch.rand(max_tok, K, generator=g, dtype=torch.float32).to(dev)
     tok_map = torch.full((max_tok * K,), -1, dtype=torch.int32, device=dev)
@@ -74,29 +79,29 @@ def main():
     total_recv = torch.zeros(1, dtype=torch.int32, device=dev)
     comb_bar = torch.zeros(1, dtype=torch.int32, device=dev)
     xdb_flag = torch.ones(1, dtype=torch.int64, device=dev)
-    comb_out = torch.zeros(max_tok * HIDDEN, dtype=torch.int16, device=dev)
+    comb_out = torch.zeros(max_tok * HIDDEN, dtype=COMB_DT, device=dev)
     comb_out_wts = torch.zeros(max_tok * K, dtype=torch.float32, device=dev)
 
     uid = Communicator.get_unique_id() if rank == 0 else None
     uid = d.bcast_uid(uid)
 
-    win_bytes = max_recv * HIDDEN * 2 + npes * M * HIDDEN * 2 + (1 << 24)
+    win_bytes = max_recv * HIDDEN * ESZ + npes * M * HIDDEN * ESZ + (1 << 24)
     with Communicator.init(npes, rank, uid, per_rank_vmm=2 * win_bytes + (1 << 28)) as comm:
         regions = [("tok_off", 4), ("recv_num", npes * 4), ("tis", max_recv * 4),
                    ("out_idx", max_recv * K * 4), ("out_wts", max_recv * K * 4),
-                   ("out_tok", max_recv * HIDDEN * 2), ("xdb_mem", npes * 8)]
+                   ("out_tok", max_recv * HIDDEN * ESZ), ("xdb_mem", npes * 8)]
         arena = SymmArena(comm, regions)
         zero(arena.local_ptr("tok_off"), arena.total_bytes)
 
         dispatch = make_dispatch(
             rank=rank, npes=npes, experts_per_rank=EPR, experts_per_token=K,
-            hidden_dim=HIDDEN, hidden_elem_size=2, max_tok_per_rank=M, max_recv=max_recv,
+            hidden_dim=HIDDEN, hidden_elem_size=ESZ, max_tok_per_rank=M, max_recv=max_recv,
             block_num=DISP_BLOCK, warp_num_per_block=WARP_NUM,
             off_tok_off=arena.offset("tok_off"), off_recv_num=arena.offset("recv_num"),
             off_tis=arena.offset("tis"), off_out_idx=arena.offset("out_idx"),
             off_out_wts=arena.offset("out_wts"), off_out_tok=arena.offset("out_tok"))
         combine = make_combine(
-            rank=rank, npes=npes, experts_per_token=K, hidden_dim=HIDDEN, hidden_elem_size=2,
+            rank=rank, npes=npes, experts_per_token=K, hidden_dim=HIDDEN, hidden_elem_size=ESZ,
             max_tok_per_rank=M, max_recv=max_recv, block_num=COMB_BLOCK, warp_num_per_block=WARP_NUM,
             off_out_tok=arena.offset("out_tok"), off_xdb_mem=arena.offset("xdb_mem"),
             off_out_wts=arena.offset("out_wts"), reset_total_recv=False,
@@ -160,9 +165,9 @@ def main():
             run_comb(ct); sync(); comm.barrier()
             idx_c = idx[:ct].cpu().numpy()
             U = np.array([len({int(idx_c[t, j]) // EPR for j in range(K)}) for t in range(ct)])
-            exp = (torch.from_numpy(U).view(ct, 1).float() * inp[:ct].float().cpu()).to(torch.bfloat16)
-            got = comb_out[:ct * HIDDEN].cpu().view(torch.bfloat16).view(ct, HIDDEN)
-            ok = torch.allclose(got, exp, atol=2e-2, rtol=2e-2)
+            exp = (torch.from_numpy(U).view(ct, 1).float() * inp[:ct].float().cpu()).to(TOK_DT)
+            got = comb_out[:ct * HIDDEN].cpu().view(TOK_DT).view(ct, HIDDEN)
+            ok = torch.allclose(got.float(), exp.float(), atol=2e-2, rtol=2e-2)
             # weights: out_weights[t][e] == U[t] * wts[t][e] (sum over valid experts
             # of the identical forwarded weight vector; #valid == U[t]).
             exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
@@ -176,6 +181,7 @@ def main():
             return errs == 0
 
         if STDMOE:
+            assert DTYPE == "bf16", "StdMoE convert kernels are bf16-only for now"
             # Full StdMoE pipeline: dispatch -> ConvertDispatchOutput ->
             # (identity expert GEMM) -> ConvertCombineInput -> combine.
             # Identity expert => packed_x[slot] == dispatched token, so the
@@ -225,8 +231,8 @@ def main():
                 run_comb(ct); sync(); comm.barrier()
                 # identity expert telescopes to comb_out[s] == (sum_k wts[s][k]) * input[s]
                 ws = wts[:ct].float().cpu().sum(dim=1, keepdim=True)             # (ct,1)
-                exp = (ws * inp[:ct].float().cpu()).to(torch.bfloat16)
-                got = comb_out[:ct * HIDDEN].cpu().view(torch.bfloat16).view(ct, HIDDEN)
+                exp = (ws * inp[:ct].float().cpu()).to(TOK_DT)
+                got = comb_out[:ct * HIDDEN].cpu().view(TOK_DT).view(ct, HIDDEN)
                 bad = ~torch.isclose(got, exp, atol=5e-2, rtol=5e-2)
                 nbad = int(bad.sum().item())
                 errs = d.allreduce_sum(nbad)
@@ -248,7 +254,7 @@ def main():
             total_recv.zero_(); sync()
             run_disp(ct); sync(); comm.barrier()
             recv = int(total_recv.cpu().item())
-            payload = recv * HIDDEN * 2
+            payload = recv * HIDDEN * ESZ
 
             # combine first (needs total_recv == recv; combine doesn't reset it)
             cb_e = time_eager(run_comb, ct) if eager else 0.0

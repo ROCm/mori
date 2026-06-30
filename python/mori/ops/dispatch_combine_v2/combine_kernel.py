@@ -18,6 +18,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr, T, vector
 from flydsl.expr.buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
+from flydsl.expr.rocdl import cvt_pk_f32_fp8, cvt_pk_fp8_f32
 from flydsl.expr.typing import Int32, Int64
 
 import mori.cco.device.flydsl as cco
@@ -25,25 +26,74 @@ import flydsl_prims as P
 
 _V2BF16 = lambda: T.VectorType.get([2], T.bf16())
 _V2F32 = lambda: T.VectorType.get([2], T.f32())
+_V4F32 = lambda: T.VectorType.get([4], T.f32())
 _V1I32 = lambda: T.VectorType.get([1], T.i32())
 
 
-def _to_accum2(i32_scalar):        # i32 (2 bf16) -> v2f32
-    return vector.bitcast(_V2BF16(), vector.from_elements(_V1I32(), [i32_scalar])).extf(_V2F32())
+def _accum_funcs(hidden_elem_size, fp8_direct_cast=False):
+    """Return (to_accum, from_accum, zero_accum) for one i32 'unit' of the
+    transport dtype, mirroring the FlyDSL reference's per-dtype branches.
 
+    Each i32 packs: 2 bf16 (v2f32), 1 f32 (scalar), or 4 fp8 (v4f32).
+    """
+    if hidden_elem_size == 2:          # bf16: i32 = 2 bf16
+        def to_accum(i32_scalar):
+            return vector.bitcast(_V2BF16(),
+                                  vector.from_elements(_V1I32(), [i32_scalar])).extf(_V2F32())
 
-def _from_accum2(v2f32):           # v2f32 -> i32 (2 bf16)
-    return vector.extract(vector.bitcast(_V1I32(), v2f32.truncf(_V2BF16())), static_position=[0])
+        def from_accum(acc):
+            return vector.extract(vector.bitcast(_V1I32(), acc.truncf(_V2BF16())),
+                                  static_position=[0])
+
+        def zero_accum():
+            return to_accum(arith.constant(0))
+    elif hidden_elem_size == 4:        # f32: i32 = 1 f32
+        def to_accum(i32_scalar):
+            return fx.Float32(arith.bitcast(T.f32(), arith.unwrap(i32_scalar)))
+
+        def from_accum(acc):
+            return fx.Int32(arith.bitcast(T.i32(), arith.unwrap(acc)))
+
+        def zero_accum():
+            return fx.Float32(arith.constant(0.0, type=T.f32()))
+    elif hidden_elem_size == 1:        # fp8 (OCP e4m3): i32 = 4 fp8
+        def to_accum(i32_scalar):
+            lo = cvt_pk_f32_fp8(res=_V2F32(), src=i32_scalar, word_sel=False)
+            hi = cvt_pk_f32_fp8(res=_V2F32(), src=i32_scalar, word_sel=True)
+            return vector.shuffle(lo, hi, [0, 1, 2, 3])
+
+        def from_accum(acc):
+            f0 = vector.extract(acc, static_position=[0])
+            f1 = vector.extract(acc, static_position=[1])
+            f2 = vector.extract(acc, static_position=[2])
+            f3 = vector.extract(acc, static_position=[3])
+            if fp8_direct_cast:        # wire fp8 -> external bf16: v4f32 -> v4bf16 -> 2 i32
+                v4bf16 = acc.truncf(T.VectorType.get([4], T.bf16()))
+                return vector.bitcast(T.VectorType.get([2], T.i32()), v4bf16)
+            zero = arith.constant(0, type=T.i32())
+            lo = cvt_pk_fp8_f32(res=T.i32(), src_a=f0, src_b=f1, old=zero, word_sel=False)
+            return cvt_pk_fp8_f32(res=T.i32(), src_a=f2, src_b=f3, old=lo, word_sel=True)
+
+        def zero_accum():
+            return arith.constant_vector(0.0, _V4F32())
+    else:
+        raise ValueError(f"unsupported hidden_elem_size {hidden_elem_size}")
+    return to_accum, from_accum, zero_accum
 
 
 def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                  max_tok_per_rank, max_recv, block_num, warp_num_per_block,
                  off_out_tok, off_xdb_mem, off_out_wts=0, enable_weights=True,
-                 reset_total_recv=True, _s3_cache=2, _unroll=2):
-    assert hidden_elem_size == 2, "basic combine path is bf16-only"
+                 fp8_direct_cast=False, reset_total_recv=True, _s3_cache=2, _unroll=2):
+    # Transport dtype = external dtype, except fp8_direct_cast wires fp8 while
+    # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit).
+    _to_accum2, _from_accum2, _zero_accum = _accum_funcs(hidden_elem_size, fp8_direct_cast)
     nbytes = hidden_dim * hidden_elem_size
     n_i32 = nbytes // 4
     n_chunks = nbytes // 16          # vec4 (16B) chunks per token
+    # fp8_direct_cast: output stride is bf16 (2 i32 per fp8 unit) vs input fp8.
+    out_n_i32 = (hidden_dim * 2) // 4 if fp8_direct_cast else n_i32
+    out_step_mult = 2 if fp8_direct_cast else 1
 
     @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
     def ep_combine(arena: Int64, addr_tok_map: Int64, addr_comb_bar: Int64,
@@ -148,16 +198,16 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                         buffer_store(wt_acc, rsrc_owts, tm_base + lane)
             rem = arith.constant(n_i32) - unit_base
             eff = arith.select(rem < units_per_warp, rem, units_per_warp)   # i32 units this warp
-            out_base = tok_id * n_i32
+            out_base = tok_id * out_n_i32
             # Nested fn: closure over expert_rsrcs/vlds (lists can't be loop-carried).
-            def _one(off):           # reduce k contributions for one i32 (2 bf16) element
-                acc = _to_accum2(arith.constant(0))
+            def _one(off):           # reduce k contributions for one i32 unit
+                acc = _zero_accum()
                 for k_slot in range_constexpr(experts_per_token):
                     v = buffer_load(expert_rsrcs[k_slot], off, vec_width=1, dtype=T.i32(),
                                     cache_modifier=_s3_cache)
                     v = arith.select(expert_vlds[k_slot], v, arith.constant(0))
                     acc = acc + _to_accum2(v)
-                buffer_store(_from_accum2(acc), rsrc_out, out_base + off)
+                buffer_store(_from_accum2(acc), rsrc_out, out_base + off * out_step_mult)
 
             def _accum_loop():
                 # main: _unroll independent elements per lane per iter
@@ -166,7 +216,7 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                     accs = []
                     base = unit_base + u
                     for r in range_constexpr(_unroll):
-                        accs.append(_to_accum2(arith.constant(0)))
+                        accs.append(_zero_accum())
                     for k_slot in range_constexpr(experts_per_token):
                         vld = expert_vlds[k_slot]
                         rsc = expert_rsrcs[k_slot]
@@ -175,7 +225,8 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                                             cache_modifier=_s3_cache)
                             accs[r] = accs[r] + _to_accum2(arith.select(vld, v, arith.constant(0)))
                     for r in range_constexpr(_unroll):
-                        buffer_store(_from_accum2(accs[r]), rsrc_out, out_base + base + r * 64)
+                        buffer_store(_from_accum2(accs[r]), rsrc_out,
+                                     out_base + (base + r * 64) * out_step_mult)
                 # tail: leftover elements, one per lane
                 for u in range(main_end + lane, eff, 64):
                     _one(unit_base + u)
