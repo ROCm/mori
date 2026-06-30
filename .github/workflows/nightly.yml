@@ -11,7 +11,7 @@ concurrency:
 
 env:
   CT: docker
-  CONTAINER: mori_nightly_${{ github.run_id }}
+  CONTAINER: mori_nightly_${{ github.run_id }}_${{ github.job }}
 
 jobs:
   # ── Stage 1: Build wheels ──────────────────────────────────────────────────
