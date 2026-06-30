@@ -68,6 +68,20 @@ ccoComm::~ccoComm() = default;
 
 static size_t AlignUp(size_t x, size_t align) { return (x + align - 1) & ~(align - 1); }
 
+// Symmetric-window VMM allocation type. Default = uncached (fine-grained),
+// matching mori-shmem's hipDeviceMallocUncached heap: P2P remote reads/writes
+// stay coherent over the fabric without coarse-grained L2 coherence handling.
+// Opt out with CCO_UNCACHED_WINDOW=0 (reverts to coarse-grained pinned memory).
+// MUST be used for BOTH the granularity query and the actual hipMemCreate so
+// the granularity matches the allocation.
+static hipMemAllocationType CcoWindowAllocType() {
+  static const bool cached = [] {
+    const char* e = getenv("CCO_UNCACHED_WINDOW");
+    return e && atoi(e) == 0;
+  }();
+  return cached ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
+}
+
 // Local slot base = the VA where this rank's slice of the flat VA starts.
 // Used as HeapVAManager's baseAddr so Allocate() returns dereferenceable
 // localVa directly. Guaranteed non-zero because flatBase comes from
@@ -251,7 +265,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // Query granularity with the SAME allocProp MemAlloc will use — granularity
   // can shift when requestedHandleType (FD export) is enabled.
   hipMemAllocationProp allocProp = {};
-  allocProp.type = hipMemAllocationTypePinned;
+  allocProp.type = CcoWindowAllocType();
   allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
   allocProp.location.type = hipMemLocationTypeDevice;
   allocProp.location.id = comm->hipDev;
@@ -421,7 +435,7 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   auto rollbackSlot = [&]() { (void)comm->vaManager->Free(slotAddr); };
 
   hipMemAllocationProp allocProp = {};
-  allocProp.type = hipMemAllocationTypePinned;
+  allocProp.type = CcoWindowAllocType();
   allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
   allocProp.location.type = hipMemLocationTypeDevice;
   allocProp.location.id = comm->hipDev;
