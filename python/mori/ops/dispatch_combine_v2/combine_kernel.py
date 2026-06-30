@@ -24,6 +24,7 @@ from flydsl.expr.rocdl import (
     cvt_pk_fp8_f32,
     cvt_scalef32_pk_f32_fp4,
     cvt_scalef32_pk_fp4_f32,
+    ds_bpermute,
     fmed3,
 )
 from flydsl.expr.typing import Int32, Int64
@@ -294,6 +295,17 @@ def _bf16x2(i32_scalar):           # i32 (2 bf16) -> v2f32
                           vector.from_elements(_V1I32(), [i32_scalar])).extf(_V2F32())
 
 
+def _warp_amax(lane, v):
+    """Max-reduce an f32 across all 64 lanes (butterfly via ds_bpermute, which
+    allows a per-lane gather index — unlike readlane's uniform-lane requirement).
+    Every lane returns the wavefront max. ``v`` and the result are raw values."""
+    for off in (32, 16, 8, 4, 2, 1):
+        idx = arith.unwrap((lane ^ off) * 4)                     # byte addr = lane*4
+        o = ds_bpermute(T.i32(), idx, arith.bitcast(T.i32(), arith.unwrap(v)))
+        v = arith.maximumf(v, arith.bitcast(T.f32(), o))
+    return v
+
+
 def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                          max_tok_per_rank, max_recv, block_num, warp_num_per_block,
                          off_out_tok, off_comb_inp, off_tis, off_xdb_mem, off_out_wts=0,
@@ -324,12 +336,11 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
     out_n_i32 = (hidden_dim * 2) // 4 if _fp8_out else wire_n_i32
     out_step_mult = 2 if _fp8_out else 1
     if fp8_blockwise:
-        assert hidden_dim % scale_dim == 0 and scale_dim <= 64, \
-            "blockwise: scale_dim must divide hidden and be <= 64 (one block per lane)"
         block_elems = hidden_dim // scale_dim
-        assert block_elems % 4 == 0, "blockwise: block_elems must be a multiple of 4"
-        be_i32_fp8 = block_elems // 4          # fp8 i32 units per block
-        be_i32_bf16 = block_elems // 2         # bf16 i32 units per block
+        assert hidden_dim % scale_dim == 0 and block_elems == 128, \
+            "blockwise (coalesced path): block_elems must be 128 (scale_dim = hidden/128)"
+        be_i32_fp8 = block_elems // 4          # fp8 i32 units per block (=32)
+        be_i32_bf16 = block_elems // 2         # bf16 i32 units per block (=64)
 
     @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
     def ep_combine_s(arena: Int64, addr_tok_map: Int64, addr_comb_bar: Int64,
@@ -365,49 +376,45 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
             rsrc_s = create_buffer_resource_from_addr(src)
             rsrc_d = create_buffer_resource_from_addr(dst)
             if const_expr(fp8_blockwise):
-                # Blockwise fp8 quant: lane `l` (<scale_dim) owns block l. Pass 1
-                # serial amax over the block; scale = (amax>448)? amax/448 : 1.
-                # Pass 2 quantize (v*448/amax, clamp +/-448) -> fp8. Token-level
-                # sign sentinel: if ANY block scaled, negate block-0's scale.
+                # Blockwise fp8 quant, COALESCED + warp-reduce (block_elems==128
+                # so one i32/lane spans a full block). Per block sb: lanes load
+                # the block coalesced (lane l -> elems 2l,2l+1), ds_bpermute
+                # butterfly gives every lane the block amax, then lane-pairs
+                # combine their 2 fp8 each into one i32 (even lane writes, coalesced).
+                # scale = (amax>MAX)? amax/MAX : 1; quant = clamp(v*MAX/amax).
+                # Token sign sentinel: if ANY block scaled, negate block-0 scale.
                 sc_dst = (fx.Int64(w.lsa_ptr(origin_pe, off_comb_scales))
                           + fx.Int64(rank * M + origin_lid) * fx.Int64(scale_dim) * fx.Int64(4))
                 rsrc_sc = create_buffer_resource_from_addr(sc_dst)
-                lane_scaled = arith.constant(0) != arith.constant(0)   # False
-                if lane < scale_dim:
-                    bf16_base = lane * be_i32_bf16
-                    amax = arith.constant(0.0, type=T.f32())
-                    for j in range_constexpr(be_i32_bf16):
-                        v2 = _bf16x2(buffer_load(rsrc_s, bf16_base + j, vec_width=1, dtype=T.i32()))
-                        amax = arith.maximumf(amax, arith.maximumf(
-                            _fabs(vector.extract(v2, static_position=[0])),
-                            _fabs(vector.extract(v2, static_position=[1]))))
-                    fp8max = arith.constant(_FP8_MAX, type=T.f32())
+                fp8max = arith.constant(_FP8_MAX, type=T.f32())
+                nlim = arith.constant(-_FP8_MAX, type=T.f32())
+                any_scaled = arith.constant(0) != arith.constant(0)   # False (uniform)
+                for sb in range_constexpr(scale_dim):
+                    v2 = _bf16x2(buffer_load(rsrc_s, sb * 64 + lane, vec_width=1, dtype=T.i32()))
+                    e0 = vector.extract(v2, static_position=[0])
+                    e1 = vector.extract(v2, static_position=[1])
+                    amax = _warp_amax(lane, arith.maximumf(_fabs(e0), _fabs(e1)))
                     scaled = amax > fp8max
-                    lane_scaled = scaled
+                    any_scaled = arith.select(scaled, scaled, any_scaled)
                     scale = arith.select(scaled, arith.divf(amax, fp8max),
                                          arith.constant(1.0, type=T.f32()))
                     inv = arith.select(scaled, arith.divf(fp8max, amax),
                                        arith.constant(1.0, type=T.f32()))
-                    buffer_store(scale, rsrc_sc, lane)
-                    nlim = arith.constant(-_FP8_MAX, type=T.f32())
-                    fp8_base = lane * be_i32_fp8
-                    for u in range_constexpr(be_i32_fp8):
-                        v01 = _bf16x2(buffer_load(rsrc_s, bf16_base + 2 * u,
-                                                     vec_width=1, dtype=T.i32()))
-                        v23 = _bf16x2(buffer_load(rsrc_s, bf16_base + 2 * u + 1,
-                                                     vec_width=1, dtype=T.i32()))
-                        fs = [vector.extract(v01, static_position=[0]),
-                              vector.extract(v01, static_position=[1]),
-                              vector.extract(v23, static_position=[0]),
-                              vector.extract(v23, static_position=[1])]
-                        fs = [fmed3(T.f32(), arith.mulf(f, inv), fp8max, nlim) for f in fs]
-                        z = arith.constant(0, type=T.i32())
-                        lo = cvt_pk_fp8_f32(res=T.i32(), src_a=fs[0], src_b=fs[1],
-                                            old=z, word_sel=False)
-                        fp8 = cvt_pk_fp8_f32(res=T.i32(), src_a=fs[2], src_b=fs[3],
-                                             old=lo, word_sel=True)
-                        buffer_store(fp8, rsrc_d, fp8_base + u)
-                if ballot(T.i64(), lane_scaled) != 0:
+                    if lane == 0:
+                        buffer_store(scale, rsrc_sc, sb)
+                    f0 = fmed3(T.f32(), arith.mulf(e0, inv), fp8max, nlim)
+                    f1 = fmed3(T.f32(), arith.mulf(e1, inv), fp8max, nlim)
+                    my = cvt_pk_fp8_f32(res=T.i32(), src_a=f0, src_b=f1,
+                                        old=arith.constant(0, type=T.i32()), word_sel=False)
+                    # neighbour (lane^1)'s 2 fp8 (its low 16) via ds_bpermute.
+                    nbr = ds_bpermute(T.i32(), arith.unwrap((lane ^ arith.constant(1))
+                                                            * arith.constant(4)),
+                                      arith.unwrap(my))
+                    lo16 = my & arith.constant(0xFFFF)
+                    packed = lo16 | ((nbr & arith.constant(0xFFFF)) << arith.constant(16))
+                    if (lane & arith.constant(1)) == arith.constant(0):
+                        buffer_store(packed, rsrc_d, sb * be_i32_fp8 + (lane >> arith.constant(1)))
+                if any_scaled:
                     if lane == 0:
                         s0 = buffer_load(rsrc_sc, 0, vec_width=1, dtype=T.f32())
                         buffer_store(arith.negf(s0), rsrc_sc, 0)
