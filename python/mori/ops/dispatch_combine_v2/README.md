@@ -4,7 +4,13 @@ Intranode (single-node, EP8) MoE dispatch + combine built on **mori-cco LSA**
 (intra-node P2P over the flat symmetric VA) and **FlyDSL** device kernels. A
 mori-parity reimplementation that swaps the mori-shmem provider for cco-LSA:
 peer addresses are computed in-kernel via `cco.Window(arena).lsa_ptr(pe, off)`,
-no host P2P tables. bf16 basic path (no quant / scales / StdMoE / weights).
+no host P2P tables. Reference = ROCm/FlyDSL PR #522
+(`dispatch_combine_intranode_{kernel,op}.py`).
+
+Supported: bf16 + f32 token dtype, weighted combine (`out_weights`), StdMoE
+(ConvertDispatchOutput / ConvertCombineInput), and a mori-parity host op-layer.
+Not yet: fp8/fp4 wire dtype (combine accum scaffolding present, dispatch-side
+TODO), scatter/`skip_stage1` combine variants, scales.
 
 ## Layout
 
@@ -13,9 +19,12 @@ no host P2P tables. bf16 basic path (no quant / scales / StdMoE / weights).
 | `symm_arena.py` | one cco symmetric window carved into named sub-regions (`SymmArena`) |
 | `flydsl_prims.py` | device primitives: system atomics / ordered stores / fences / volatile-spin waits |
 | `dispatch_kernel.py` | `make_dispatch` — P2P-scatter tokens to their experts' ranks (3 phases) |
-| `combine_kernel.py` | `make_combine` — P2P-read (gather) each token's k expert outputs back & reduce in f32 |
+| `combine_kernel.py` | `make_combine` — P2P-read (gather) each token's k expert outputs back & reduce in f32; weighted `out_weights`; bf16/f32/fp8 accum |
+| `stdmoe_kernel.py` | `make_convert_dispatch_output` / `make_convert_combine_input` — StdMoE per-expert repack + weighted inverse (local kernels) |
+| `dispatch_combine_op.py` | `EpDispatchCombineOp` / `EpDispatchCombineConfig` / `EpDispatchRoutingHandle` — mori-parity host op-layer |
 | `dist_common.py` | torchrun bootstrap (gloo only carries the cco unique-id) |
-| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench; runs an end-to-end correctness check (identity expert ⇒ `combine[t] == U[t]·input[t]`, which transitively validates dispatch routing/payload + combine gather) during warmup |
+| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench; end-to-end correctness during warmup. `STDMOE=1` runs the StdMoE pipeline; `DTYPE=bf16\|f32` |
+| `test_op.py` | EP8 correctness test for the host op-layer (bf16 + f32) |
 
 ## Run (inside the gfx942 container)
 
