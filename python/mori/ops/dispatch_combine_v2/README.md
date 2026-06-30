@@ -10,9 +10,10 @@ no host P2P tables. Reference = ROCm/FlyDSL PR #522
 Supported: bf16 + f32 token dtype; gather (UseP2PRead) **and** scatter
 (`_nop2p`) combine; weighted combine (`out_weights`); StdMoE
 (ConvertDispatchOutput / ConvertCombineInput, standalone + wired into the op);
-fp8_direct_cast (scatter); per-token scales forwarding; `max_total_recv_tokens`
-cap; mori-parity host op-layer + tuning table. fp4 accum branch present but
-gfx950-only (these cvt intrinsics don't exist on gfx942). Not done:
+fp8_direct_cast **and fp8_blockwise quant** (scatter); per-token scales
+forwarding; `max_total_recv_tokens` cap; mori-parity host op-layer + tuning
+table. fp4 accum branch present but gfx950-only (these cvt intrinsics don't
+exist on gfx942). Note: gfx942 fp8 is e4m3**fnuz** (max 240). Not done:
 `skip_stage1` (FlyDSL-only).
 
 ## Layout
