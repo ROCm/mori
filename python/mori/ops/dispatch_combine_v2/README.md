@@ -7,10 +7,13 @@ peer addresses are computed in-kernel via `cco.Window(arena).lsa_ptr(pe, off)`,
 no host P2P tables. Reference = ROCm/FlyDSL PR #522
 (`dispatch_combine_intranode_{kernel,op}.py`).
 
-Supported: bf16 + f32 token dtype, weighted combine (`out_weights`), StdMoE
-(ConvertDispatchOutput / ConvertCombineInput), and a mori-parity host op-layer.
-Not yet: fp8/fp4 wire dtype (combine accum scaffolding present, dispatch-side
-TODO), scatter/`skip_stage1` combine variants, scales.
+Supported: bf16 + f32 token dtype; gather (UseP2PRead) **and** scatter
+(`_nop2p`) combine; weighted combine (`out_weights`); StdMoE
+(ConvertDispatchOutput / ConvertCombineInput, standalone + wired into the op);
+fp8_direct_cast (scatter); per-token scales forwarding; `max_total_recv_tokens`
+cap; mori-parity host op-layer + tuning table. fp4 accum branch present but
+gfx950-only (these cvt intrinsics don't exist on gfx942). Not done:
+`skip_stage1` (FlyDSL-only).
 
 ## Layout
 
@@ -18,13 +21,14 @@ TODO), scatter/`skip_stage1` combine variants, scales.
 |---|---|
 | `symm_arena.py` | one cco symmetric window carved into named sub-regions (`SymmArena`) |
 | `flydsl_prims.py` | device primitives: system atomics / ordered stores / fences / volatile-spin waits |
-| `dispatch_kernel.py` | `make_dispatch` — P2P-scatter tokens to their experts' ranks (3 phases) |
-| `combine_kernel.py` | `make_combine` — P2P-read (gather) each token's k expert outputs back & reduce in f32; weighted `out_weights`; bf16/f32/fp8 accum |
+| `dispatch_kernel.py` | `make_dispatch` — P2P-scatter tokens to their experts' ranks (3 phases) + per-token scales forwarding |
+| `combine_kernel.py` | `make_combine` (gather) + `make_combine_scatter` (`_nop2p`); weighted `out_weights`; bf16/f32/fp8(+direct_cast)/fp4 accum |
 | `stdmoe_kernel.py` | `make_convert_dispatch_output` / `make_convert_combine_input` — StdMoE per-expert repack + weighted inverse (local kernels) |
-| `dispatch_combine_op.py` | `EpDispatchCombineOp` / `EpDispatchCombineConfig` / `EpDispatchRoutingHandle` — mori-parity host op-layer |
+| `dispatch_combine_op.py` | `EpDispatchCombineOp` / `EpDispatchCombineConfig` (+`.tuned()`) / `EpDispatchRoutingHandle` — mori-parity host op-layer (StdMoE + recv cap) |
+| `tuning_configs.py` | per-(world,hidden,topk) block/warp lookup |
 | `dist_common.py` | torchrun bootstrap (gloo only carries the cco unique-id) |
-| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench; end-to-end correctness during warmup. `STDMOE=1` runs the StdMoE pipeline; `DTYPE=bf16\|f32` |
-| `test_op.py` | EP8 correctness test for the host op-layer (bf16 + f32) |
+| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast`, `STDMOE=1`, `SCALE_DIM` |
+| `test_op.py` | EP8 op-layer test (standard / StdMoE / recv-cap, bf16 + f32) |
 
 ## Run (inside the gfx942 container)
 
