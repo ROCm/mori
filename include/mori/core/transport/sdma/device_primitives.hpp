@@ -79,6 +79,14 @@ inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
   char* srcPtr = reinterpret_cast<char*>(srcBuf);
   char* dstPtr = reinterpret_cast<char*>(dstBuf);
 
+  // Each queue copies a disjoint contiguous chunk. Queue q owns bytes
+  // [q*rand_size, (q+1)*rand_size); the last queue absorbs the remainder.
+  // The src/dst pointers MUST be advanced to this queue's chunk start, else
+  // every queue copies from offset 0 (overlapping front, tail never copied) —
+  // which is why multi-queue runs were previously broken (NUM_CHANNELS forced 1).
+  srcPtr += static_cast<size_t>(queueId) * rand_size;
+  dstPtr += static_cast<size_t>(queueId) * rand_size;
+
   anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + queueId);
   base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
   pendingWptr = base;
@@ -91,8 +99,6 @@ inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
 
   auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, perq_send_size);
   handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, offset);
-  srcPtr += perq_send_size;
-  dstPtr += perq_send_size;
 
   base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
   pendingWptr = base;

@@ -97,6 +97,11 @@ int ShmemNPes();
 
 void ShmemBarrierAll();
 void ShmemBarrierOnStream(hipStream_t stream);
+// dissemination-topology variant of ShmemBarrierOnStream
+// (same global all-PE semantics, O(log n) parallel rounds instead of the PE0
+// funnel). Falls back to the funnel barrier if the loaded module lacks the
+// dissem kernel.
+void ShmemBarrierOnStreamDissem(hipStream_t stream);
 
 enum ShmemTeamType {
   INVALID = -1,

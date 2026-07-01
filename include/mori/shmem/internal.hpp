@@ -136,6 +136,13 @@ struct GpuStates {
   int rank{-1};
   int worldSize{-1};
   int numQpPerPe{4};  // Default to 4 QPs per peer, consistent with Context default
+  // this work (transport in-flight depth): when >0, the fast-path (non-VMM) RDMA
+  // put in ShmemPutMemNbiThreadKernelImpl splits a large transfer into multiple
+  // WQEs of at most this many bytes, so several writes stay in flight per QP per
+  // put (the WQ free-entry backpressure at lines ~520-532 already supports many
+  // outstanding WQEs). 0 (default) = one WQE for the whole transfer = the proven
+  // the prior behavior. Set from env MORI_RDMA_PUT_CHUNK_BYTES in GpuStateInit.
+  size_t putChunkBytes{0};
   application::TransportType* transportTypes{nullptr};
   ShmemRdmaEndpoint* rdmaEndpoints{nullptr};
   uint32_t* endpointLock{nullptr};
@@ -188,6 +195,10 @@ struct ModuleStates {
   hipModule_t module{nullptr};
   GpuStates* gpuStatesPtr{nullptr};  // device-side globalGpuStates address in JIT module
   hipFunction_t barrierFunc{nullptr};
+  // dissemination-topology barrier kernel (optional; nullptr
+  // if the loaded module predates it, in which case the dissem launcher falls
+  // back to the funnel barrier).
+  hipFunction_t dissemBarrierFunc{nullptr};
 };
 
 struct ShmemStates {

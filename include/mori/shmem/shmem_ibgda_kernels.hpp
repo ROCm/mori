@@ -528,7 +528,15 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
       raddr = dest->peerPtrs[pe] + destOffset + currentOffset;
       rkey = dest->peerRkeys[pe];
-      transfer_size = remaining;
+      // this work (transport in-flight depth): optionally split a large put into
+      // multiple WQEs of at most putChunkBytes so several stay in flight per QP
+      // (the WQ free-entry backpressure below drains as needed). 0 => single WQE
+      // (the proven default). This re-uses the same multi-iteration post loop the
+      // VMM-heap path already exercises, so it is a tested posting pattern.
+      {
+        size_t pcb = globalGpuStates->putChunkBytes;
+        transfer_size = (pcb != 0 && remaining > pcb) ? pcb : remaining;
+      }
     } else {
       // Slow path: VMM Heap - query keys for current chunk
       srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
