@@ -1,7 +1,5 @@
 #!/bin/bash
 
-# TODO: adapt for MLX (Mellanox/NVIDIA) NICs.
-
 set -uo pipefail
 
 # ============================ config ============================
@@ -830,6 +828,157 @@ check_bnxt_dcqcn() {
     [[ $fail -eq 0 ]]
 }
 
+# =================== mlx5 (Mellanox / NVIDIA) checks =================
+# Mellanox has no nicctl/niccli. Firmware comes from mlxfwmanager (PSID-aware,
+# needs MFT + mst + root) with a fallback to the sysfs fw_ver node; driver is the
+# mlx5_core module (empty version => kernel inbox).
+check_mlx_versions() {
+    step "check MLX (Mellanox/NVIDIA) firmware and driver version"
+
+    local ib_root="/sys/class/infiniband" d
+    local devs=()
+    for d in "$ib_root"/*; do
+        [[ "$(cat "$d/device/vendor" 2>/dev/null)" == "0x15b3" ]] && devs+=("$(basename "$d")")
+    done
+    [[ ${#devs[@]} -gt 0 ]] || { log_skip "no Mellanox devices found"; return 0; }
+    log_ok "Mellanox devices (${#devs[@]}): ${devs[*]}"
+
+    local drv; drv=$(modinfo -F version mlx5_core 2>/dev/null)
+    log_ok "mlx5_core driver : ${drv:-inbox ($(uname -r))}"   # inbox module reports empty version
+
+    # firmware: mlxfwmanager (PSID + running FW) if usable, else per-device sysfs fw_ver
+    local q=""
+    command -v mlxfwmanager >/dev/null 2>&1 && { sudo mst start >/dev/null 2>&1; q=$(sudo mlxfwmanager --query 2>/dev/null); }
+    if grep -q "Device Type" <<<"$q"; then
+        awk '/PSID:/{p=$2} /^[[:space:]]*FW[[:space:]]/{print $2" (PSID "p")"}' <<<"$q" | sort -u \
+            | while read -r l; do log_ok "firmware : $l"; done
+    else
+        for d in "${devs[@]}"; do
+            echo "$(cat "$ib_root/$d/fw_ver" 2>/dev/null) (board $(cat "$ib_root/$d/board_id" 2>/dev/null))"
+        done | sort -u | while read -r l; do log_ok "firmware : $l"; done
+    fi
+
+    # port state
+    local state active=0
+    for d in "${devs[@]}"; do
+        state=$(awk -F': *' '{print $2}' "$ib_root/$d/ports/1/state" 2>/dev/null)
+        [[ "$state" == "ACTIVE" ]] && active=$((active+1)) || log_warn "$d : port $state"
+    done
+    log_ok "$active/${#devs[@]} Mellanox ports ACTIVE"
+}
+
+# Derive MORI_RDMA_SL / MORI_RDMA_TC for Mellanox.
+#   InfiniBand : SL/VL + congestion are managed by the subnet manager (opensm),
+#                nothing to configure host-side -> SL 0, TC unused.
+#   RoCE (Eth) : read PFC + DSCP-to-prio + ETS and derive SL = lossless priority,
+#                TC = DSCP << 2 (like the ionic/bnxt paths). Prefer Mellanox's own
+#                `mlnx_qos` (also reports the trust state), fall back to `dcb`.
+# Follows the same "dominant link layer wins" rule the mesh test uses.
+MLX_ROCE_PRIO=3     # reference RoCE lossless priority (align with the switch)
+MLX_ROCE_DSCP=26    # reference RoCE DSCP
+
+# RoCE QoS via the native `mlnx_qos` tool. Sets sl/dscp by reference.
+_mlx_roce_qos_mlnx_qos() {
+    local net="$1"; local -n _sl="$2" _dscp="$3"
+    local q; q=$(sudo mlnx_qos -i "$net" 2>/dev/null) || die "mlnx_qos -i $net failed"
+
+    local trust; trust=$(awk -F': *' '/trust state/{print $2; exit}' <<<"$q")
+    [[ "$trust" == "dscp" ]] && log_ok "trust state : dscp" \
+                             || log_warn "trust state : ${trust:-?} (RoCEv2 expects dscp)"
+
+    # PFC "enabled" row: "enabled  0 0 0 1 0 0 0 0" -> priorities set to 1
+    local prios=() i=0 v
+    for v in $(awk '/^[[:space:]]*enabled/{$1="";print}' <<<"$q"); do
+        [[ "$v" == "1" ]] && prios+=("$i"); i=$((i+1))
+    done
+    [[ ${#prios[@]} -gt 0 ]] || die "$net: PFC not enabled on any priority (RoCE not lossless)"
+    log_ok "PFC no-drop priorities : ${prios[*]}"
+
+    _sl="${prios[0]}"; local p
+    for p in "${prios[@]}"; do [[ "$p" == "$MLX_ROCE_PRIO" ]] && _sl="$p"; done
+
+    # dscp2prio line: "prio:3 dscp:26,27,..." -> prefer reference DSCP, else first
+    local dlist; dlist=$(grep -oE "prio:$_sl dscp:[0-9,]*" <<<"$q"); dlist="${dlist#*dscp:}"
+    if [[ ",$dlist" == *",$MLX_ROCE_DSCP,"* ]]; then _dscp="$MLX_ROCE_DSCP"
+    elif [[ -n "$dlist" ]];                       then _dscp="${dlist%%,*}"
+    else _dscp="$MLX_ROCE_DSCP"; log_warn "no DSCP mapped to priority $_sl — using reference $MLX_ROCE_DSCP"; fi
+    [[ -n "$dlist" ]] && log_ok "DSCP $_dscp -> priority $_sl"
+
+    # ETS bandwidth of the tc carrying our priority ("tc: N ... bw: X%" then "priority: N")
+    local bw; bw=$(awk -v p="$_sl" '/^tc:/{b=""; for(i=1;i<=NF;i++) if($i=="bw:") b=$(i+1)} /priority:/{if($NF==p) print b}' <<<"$q")
+    [[ -n "$bw" ]] && log_ok "lossless TC bandwidth : $bw"
+}
+
+# RoCE QoS via inbox `dcb` (iproute2). Sets sl/dscp by reference.
+_mlx_roce_qos_dcb() {
+    local net="$1"; local -n _sl="$2" _dscp="$3"
+    require_cmd dcb
+
+    local tok prios=()
+    for tok in $(sudo dcb pfc show dev "$net" 2>/dev/null | grep -o 'prio-pfc.*'); do
+        [[ "$tok" == *:on ]] && prios+=("${tok%%:*}")
+    done
+    [[ ${#prios[@]} -gt 0 ]] || die "$net: PFC not enabled on any priority (RoCE not lossless)"
+    log_ok "PFC no-drop priorities : ${prios[*]}"
+
+    _sl="${prios[0]}"; local p
+    for p in "${prios[@]}"; do [[ "$p" == "$MLX_ROCE_PRIO" ]] && _sl="$p"; done
+
+    local app; app=$(sudo dcb app show dev "$net" 2>/dev/null); _dscp=""
+    for tok in $(grep -o 'dscp-prio.*' <<<"$app"); do
+        [[ "$tok" == *:* && "$tok" != dscp-prio ]] || continue
+        [[ "${tok##*:}" == "$_sl" ]] && { [[ "${tok%%:*}" == "$MLX_ROCE_DSCP" || -z "$_dscp" ]] && _dscp="${tok%%:*}"; }
+    done
+    if [[ -z "$_dscp" ]]; then
+        log_warn "no DSCP mapped to priority $_sl (trust=dscp not set?) — using reference $MLX_ROCE_DSCP"; _dscp="$MLX_ROCE_DSCP"
+    else
+        log_ok "DSCP $_dscp -> priority $_sl (trust dscp)"
+    fi
+
+    local ets tc bw
+    ets=$(sudo dcb ets show dev "$net" 2>/dev/null)
+    tc=$(grep -o 'prio-tc.*' <<<"$ets" | grep -o "$_sl:[0-9]*" | head -1); tc="${tc##*:}"
+    bw=$(grep -o 'tc-bw.*'   <<<"$ets" | grep -o "${tc:-$_sl}:[0-9]*" | head -1); bw="${bw##*:}"
+    [[ -n "$bw" ]] && log_ok "lossless TC$tc bandwidth : ${bw}%"
+}
+
+check_mlx_qos() {
+    step "check MLX QoS and derive SL/TC"
+
+    local ib_root="/sys/class/infiniband" d ll
+    local ib_devs=() roce_net=""
+    for d in "$ib_root"/*; do
+        [[ "$(cat "$d/device/vendor" 2>/dev/null)" == "0x15b3" ]] || continue
+        ll=$(cat "$d/ports/1/link_layer" 2>/dev/null)
+        if [[ "$ll" == "InfiniBand" ]]; then
+            ib_devs+=("$(basename "$d")")
+        elif [[ "$ll" == "Ethernet" && -z "$roce_net" ]]; then
+            roce_net=$(basename "$(readlink -f "$d/device/net/"* 2>/dev/null)")
+        fi
+    done
+
+    # InfiniBand dominant (or no RoCE): subnet-manager managed, use SL 0.
+    if [[ -z "$roce_net" || ${#ib_devs[@]} -gt 0 ]]; then
+        MORI_RDMA_SL=0; MORI_RDMA_TC=0
+        log_ok "InfiniBand fabric: QoS managed by subnet manager — using SL=$MORI_RDMA_SL (TC n/a)"
+        return 0
+    fi
+
+    # RoCE path: prefer Mellanox's native mlnx_qos, fall back to dcb.
+    local sl dscp via
+    if command -v mlnx_qos >/dev/null 2>&1; then
+        log_ok "RoCE netdev : $roce_net (via mlnx_qos)"; via=mlnx_qos
+        _mlx_roce_qos_mlnx_qos "$roce_net" sl dscp
+    else
+        log_ok "RoCE netdev : $roce_net (mlnx_qos absent, via dcb)"; via=dcb
+        _mlx_roce_qos_dcb "$roce_net" sl dscp
+    fi
+
+    MORI_RDMA_SL="$sl"
+    MORI_RDMA_TC=$(( dscp * 4 ))
+    log_ok "selected SL=$MORI_RDMA_SL  TC=$MORI_RDMA_TC  (RoCE priority $sl, DSCP $dscp) [$via]"
+}
+
 check_inter_node_lat() {
     step "inter-node latency check (full mesh)"
 
@@ -896,6 +1045,9 @@ fi
 _have_bnxt=false
 _ib_has_vendor 0x14e4 && _have_bnxt=true     # Broadcom (bnxt_re)
 
+_have_mlx=false
+_ib_has_vendor 0x15b3 && _have_mlx=true      # Mellanox / NVIDIA (mlx5)
+
 if [[ "$_have_ionic" == "true" ]]; then
     if [[ "$_nicctl_ok" == "true" ]]; then
         check_versions
@@ -908,8 +1060,13 @@ elif [[ "$_have_bnxt" == "true" ]]; then
     check_bnxt_versions
     check_bnxt_qos
     check_bnxt_dcqcn
+elif [[ "$_have_mlx" == "true" ]]; then
+    # Mellanox: firmware/driver/port checks + QoS. On IB, SL is subnet-manager
+    # managed (SL 0); on RoCE, QoS is derived from PFC/DSCP via dcb.
+    check_mlx_versions
+    check_mlx_qos
 else
-    log_warn "no ionic or bnxt_re NICs detected — skipping NIC-specific checks"
+    log_warn "no ionic, bnxt_re, or mlx5 NICs detected — skipping NIC-specific checks"
 fi
 
 check_intra_node_bw

@@ -128,6 +128,7 @@ Package roles:
 Run the subsection matching the NIC type detected at the top:
 - `ainic` → **Step 3a** (AINIC / Pensando)
 - `thor2` / bnxt → **Step 3b** (Broadcom NetXtreme-E)
+- `mlx5` (Mellanox/NVIDIA ConnectX; `lspci | grep -i mellanox`) → **Step 3c**
 
 ---
 
@@ -271,6 +272,38 @@ sudo docker exec $CONTAINER_NAME bash -c "command -v dcb"
 > DCQCN via configfs). With `--network=host` the container shares the host's
 > netns, so it's equivalent to configure on the host. Either run `mori setup` on
 > the host, or ensure the container has `dcb` + configfs/debugfs (Step 1 mounts).
+
+---
+
+## Step 3c: Install Mellanox (mlx5) tools
+
+**Skip if NIC type is not `mlx5`.**
+
+ConnectX cards use the **inbox `mlx5_core` driver + rdma-core** (already covered by
+`libibverbs-dev` / `ibverbs-utils` in Step 2), so no vendor RoCE userspace lib is
+needed. Only the QoS tooling is missing:
+
+- **`mlnx_qos`** — Mellanox's native QoS tool, used by `mori check` (mlx5 path) to
+  read trust state / PFC / DSCP2prio on RoCE NICs. Not in apt/pip; install from the
+  `mlnx-tools` repo (works with the inbox driver, no full MLNX_OFED required):
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c '
+set -e
+cd /tmp && rm -rf mlnx-tools
+git clone --depth 1 https://github.com/Mellanox/mlnx-tools
+cd mlnx-tools && make install
+mlnx_qos -h >/dev/null && echo "mlnx_qos installed"
+'
+```
+
+> On **InfiniBand** links (`link_layer: InfiniBand`), QoS/SL is managed by the
+> subnet manager and `mlnx_qos` does not apply — `mori check` reports SL 0 and
+> skips PFC/DSCP. `mlnx_qos` only matters for **RoCE** (Ethernet-link) ConnectX NICs.
+> `dcb` (from `iproute2`, Step 2) is the automatic fallback if `mlnx_qos` is absent.
+>
+> Firmware queries use `mlxfwmanager` from **MFT** (`mst start` first); install MFT
+> from the NVIDIA MFT page if it isn't already present on the host/container.
 
 ---
 
