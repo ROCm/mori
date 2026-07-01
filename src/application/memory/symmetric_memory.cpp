@@ -195,7 +195,8 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
     }
   }
   if (rdmaDeviceContext && anyRdmaPeer) {
-    application::RdmaMemoryRegion mr = rdmaDeviceContext->RegisterRdmaMemoryRegion(localPtr, size);
+    application::RdmaMemoryRegion mr =
+        rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
     cpuMemObj->lkey = mr.lkey;
     cpuMemObj->peerRkeys[rank] = mr.rkey;
   }
