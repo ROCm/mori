@@ -48,7 +48,7 @@ std::shared_ptr<CqCallbackMeta> SubmissionLedger::ReleaseByCqe(uint64_t recordId
   auto it = records_.find(recordId);
   if (it == records_.end()) return nullptr;
   SubmissionRecord& rec = it->second;
-  if (sqDepth && rec.postedWr > 0) sqDepth->fetch_sub(rec.postedWr, std::memory_order_relaxed);
+  if (sqDepth && rec.postedWr > 0) sqDepth->fetch_sub(rec.postedWr, kSqAdmissionOrder);
   if (outBatchSize) *outBatchSize = rec.batchSize;
   auto meta = std::move(rec.meta);
   records_.erase(it);
@@ -70,7 +70,7 @@ int SubmissionLedger::ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth) {
       ++it;
     }
   }
-  if (sqDepth && total > 0) sqDepth->fetch_sub(total, std::memory_order_relaxed);
+  if (sqDepth && total > 0) sqDepth->fetch_sub(total, kSqAdmissionOrder);
   return total;
 }
 
