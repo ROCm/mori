@@ -541,21 +541,28 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
         if (fp8ScaleDim <= 0) {
           throw std::runtime_error("Fp8BlockwiseQuant requires internal combine scaleDim > 0");
         }
-        // Pick the AccumNum=8 + VecBytes=8 specialization when (no weights, hidden_dim % 512 == 0,
-        // top-k == 8, EP > 4) and block_elems matches a registered symbol. Keep in sync with the
-        // Python launch path in dispatch_combine.py.
+        // Pick the AccumNum=8/9 + VecBytes=8 specialization when (no weights, hidden_dim % 512 ==
+        // 0, top-k in {8,9}, EP > 4) and block_elems matches a registered symbol. top-k==9 covers
+        // shared-expert fusion (8 routed + 1 fused shared). Keep in sync with the Python launch
+        // path in dispatch_combine.py.
         const int block_elems = (args.config.hiddenDim + fp8ScaleDim - 1) / fp8ScaleDim;
-        const bool baseVec8Top8Eligible = !hasWeights && (args.config.hiddenDim % 512 == 0) &&
-                                          args.config.numExpertPerToken == 8 &&
-                                          args.config.worldSize > 4;
+        const bool baseVec8Top8Eligible =
+            !hasWeights && (args.config.hiddenDim % 512 == 0) &&
+            (args.config.numExpertPerToken == 8 || args.config.numExpertPerToken == 9) &&
+            args.config.worldSize > 4;
+        const bool top9 = (args.config.numExpertPerToken == 9);
         const char* kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq";
         bool useVec8Top8 = false;
         if (baseVec8Top8Eligible) {
           if (block_elems == 128) {
-            kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8";
+            kernel_name =
+                top9 ? "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8_top9"
+                     : "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8";
             useVec8Top8 = true;
           } else if (block_elems == 256) {
-            kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8";
+            kernel_name =
+                top9 ? "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8_top9"
+                     : "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8";
             useVec8Top8 = true;
           }
         }

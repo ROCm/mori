@@ -136,22 +136,46 @@ bool StandaloneClient::Exists(const std::string& key) const {
 std::vector<bool> StandaloneClient::BatchPut(const std::vector<std::string>& keys,
                                              const std::vector<uintptr_t>& srcs,
                                              const std::vector<size_t>& sizes) {
-  std::vector<bool> results(keys.size(), false);
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  // Followers never write; keep results all-false (and skip leader SSD copy).
+  if (role_ == UMBPRole::SharedSSDFollower) return results;
 
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (role_ == UMBPRole::SharedSSDFollower) continue;
+  // Collect keys needing an actual write (skip ones already present), then issue
+  // a single batched write so the payload copies run in parallel inside the tier
+  // (mirrors BatchGet's single ReadBatchIntoPtr dispatch).
+  std::vector<size_t> wmap;
+  std::vector<std::string> wkeys;
+  std::vector<uintptr_t> wsrcs;
+  std::vector<size_t> wsizes;
+  wmap.reserve(n);
+  wkeys.reserve(n);
+  wsrcs.reserve(n);
+  wsizes.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
     if (index_.MayExist(keys[i])) {
       results[i] = true;
       continue;
     }
-    if (!storage_.WriteFromPtr(keys[i], srcs[i], sizes[i])) continue;
-    index_.Insert(keys[i], {StorageTier::CPU_DRAM, 0, sizes[i]});
-    results[i] = true;
+    wmap.push_back(i);
+    wkeys.push_back(keys[i]);
+    wsrcs.push_back(srcs[i]);
+    wsizes.push_back(sizes[i]);
+  }
+
+  if (!wkeys.empty()) {
+    auto wres = storage_.WriteBatchFromPtr(wkeys, wsrcs, wsizes);
+    for (size_t j = 0; j < wkeys.size(); ++j) {
+      if (!wres[j]) continue;
+      size_t i = wmap[j];
+      index_.Insert(keys[i], {StorageTier::CPU_DRAM, 0, sizes[i]});
+      results[i] = true;
+    }
   }
 
   if (role_ == UMBPRole::SharedSSDLeader) {
     std::vector<std::string> ssd_keys;
-    for (size_t i = 0; i < keys.size(); ++i) {
+    for (size_t i = 0; i < n; ++i) {
       if (results[i]) ssd_keys.push_back(keys[i]);
     }
     copy_pipeline_->MaybeBatchCopyToSharedSSD(ssd_keys);

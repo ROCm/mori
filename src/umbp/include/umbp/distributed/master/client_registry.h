@@ -41,6 +41,13 @@ namespace mori::umbp {
 class GlobalBlockIndex;
 class ExternalKvBlockIndex;
 
+// node_id -> peer_address for every ALIVE node, for the read paths that only
+// need to resolve an owning node to its peer-service address (BatchRouteGet,
+// MatchExternalKv).  It deliberately carries NO per-tier capacity, so building it
+// is an O(nodes) copy of just these pairs, skipping the heavy per-node capacity
+// map and engine desc that GetAliveClients copies.
+using AlivePeerView = std::unordered_map<std::string, std::string>;
+
 // Master-side membership ledger + heartbeat ingestion.  In the
 // master-as-advisor design this class no longer owns any allocator
 // state; every per-tier capacity number it stores is the value the peer
@@ -89,8 +96,22 @@ class ClientRegistry {
 
   // --- Queries ---
   bool IsClientAlive(const std::string& node_id) const;
+  // Total registered nodes regardless of status.
   size_t ClientCount() const;
+  // Count of nodes currently in ALIVE status (cheaper than GetAlivePeerView when
+  // only the count is needed — no map is built).  Used by the client-count
+  // metric.
+  size_t AliveClientCount() const;
+  // Deep copy of every alive node's full record (membership + capacities +
+  // engine desc + tags), needed by callers that read capacity (RoutePut,
+  // eviction).  Prefer GetAlivePeerView below when you only need node->peer.
   std::vector<ClientRecord> GetAliveClients() const;
+
+  // node_id -> peer_address for every ALIVE node, built on demand.  Used by
+  // BatchRouteGet and MatchExternalKv; far cheaper than GetAliveClients since it
+  // skips the per-node capacity map / engine desc.
+  AlivePeerView GetAlivePeerView() const;
+
   // Returns the tags registered for node_id, or empty if not found.
   std::vector<std::string> GetClientTags(const std::string& node_id) const;
 

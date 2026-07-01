@@ -43,6 +43,9 @@ using namespace mori::application;
 // Test 3: Large multi-chunk GET (>200MB spanning multiple 64MB chunks)
 // ============================================================================
 
+// Counts failed verifications (on PE 0) so main() can return non-zero and fail CI.
+static int gFailures = 0;
+
 // ============================================================================
 // GPU Kernels
 // ============================================================================
@@ -220,6 +223,7 @@ void Test1_LegacyAPI(int myPe) {
       printf("✓ Legacy API GET test PASSED! All %d elements verified.\n", numEle);
     } else {
       printf("✗ Legacy API GET test FAILED!\n");
+      gFailures++;
     }
   }
 
@@ -278,6 +282,7 @@ void Test1_LegacyAPI_Block(int myPe) {
       printf("✓ Legacy API GET block test PASSED! All %d elements verified.\n", numEle);
     } else {
       printf("✗ Legacy API GET block test FAILED!\n");
+      gFailures++;
     }
   }
 
@@ -345,6 +350,7 @@ void Test2_PureAddressAPI(int myPe) {
       printf("✓ Pure address API GET test PASSED! All %d elements verified.\n", numEle);
     } else {
       printf("✗ Pure address API GET test FAILED!\n");
+      gFailures++;
     }
   }
 
@@ -410,6 +416,7 @@ void Test2_PureAddressAPI_Block(int myPe) {
       printf("✓ Pure address API GET block test PASSED! All %d elements verified.\n", numEle);
     } else {
       printf("✗ Pure address API GET block test FAILED!\n");
+      gFailures++;
     }
   }
 
@@ -484,6 +491,7 @@ void Test3_LargeMultiChunk(int myPe) {
       printf("✓ Large multi-chunk GET test PASSED! Verified %zu elements.\n", testElements);
     } else {
       printf("✗ Large multi-chunk GET test FAILED!\n");
+      gFailures++;
     }
   }
 
@@ -542,6 +550,7 @@ void Test4_BlockingLegacyAPI(int myPe) {
       printf("✓ Blocking GET legacy API test PASSED! All %d elements verified.\n", numEle);
     } else {
       printf("✗ Blocking GET legacy API test FAILED!\n");
+      gFailures++;
     }
   }
 
@@ -607,6 +616,7 @@ void Test5_BlockingPureAddressAPI(int myPe) {
       printf("✓ Blocking GET pure address API test PASSED! All %d elements verified.\n", numEle);
     } else {
       printf("✗ Blocking GET pure address API test FAILED!\n");
+      gFailures++;
     }
   }
 
@@ -676,5 +686,6 @@ void ConcurrentGetThread() {
 
 int main(int argc, char* argv[]) {
   ConcurrentGetThread();
-  return 0;
+  // Non-zero exit on any failed verification so mpirun/CI catches regressions.
+  return gFailures > 0 ? 1 : 0;
 }

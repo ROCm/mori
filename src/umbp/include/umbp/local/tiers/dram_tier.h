@@ -60,6 +60,21 @@ class DRAMTier : public TierBackend {
   // Upper layer (LocalStorageManager) is responsible for demoting keys.
   bool Write(const std::string& key, const void* data, size_t size) override;
   bool ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size) override;
+  // Multi-threaded batch read: parallel CopyBlock of many KV blocks to break
+  // the single-core memcpy ceiling on cold DRAM. Holds mu_ for the whole batch
+  // (consistent with this tier's single-mutex model: serializes against other
+  // reads/writes), while the per-block copies run in parallel within the batch.
+  std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                     const std::vector<uintptr_t>& dst_ptrs,
+                                     const std::vector<size_t>& sizes) override;
+  // Multi-threaded batch write: serial slot allocation (mutates free_list_)
+  // followed by parallel non-temporal CopyBlock of each payload into its slot.
+  // Mirrors ReadBatchIntoPtr to break the single-core memcpy ceiling on the
+  // L2->L3 backup (PUT) path. Does NOT self-evict — keys that don't fit are
+  // left false so the upper layer can demote and retry per-key.
+  std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
+                               const std::vector<const void*>& data_ptrs,
+                               const std::vector<size_t>& sizes) override;
   bool Exists(const std::string& key) const override;
   bool Evict(const std::string& key) override;
   std::pair<size_t, size_t> Capacity() const override;
@@ -112,6 +127,16 @@ class DRAMTier : public TierBackend {
   std::list<FreeBlock> free_list_;
 
   mutable std::mutex mu_;
+
+  // Threads used by ReadBatchIntoPtr for parallel CopyBlock. Default 8, override
+  // via env UMBP_DRAM_READ_THREADS, capped to hardware concurrency. >1 breaks
+  // the single-core memcpy ceiling on cold DRAM.
+  int read_threads_ = 4;
+
+  // Threads used by BatchWrite for parallel CopyBlock. Default 8, override via
+  // env UMBP_DRAM_WRITE_THREADS, capped to hardware concurrency. >1 breaks the
+  // single-core memcpy ceiling on the PUT (backup) path.
+  int write_threads_ = 4;
 
   size_t Allocate(size_t size);                 // Allocate from free_list_
   void Deallocate(size_t offset, size_t size);  // Return to free_list_

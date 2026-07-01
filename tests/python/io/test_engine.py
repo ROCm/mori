@@ -23,7 +23,6 @@ import pytest
 import os
 import time
 from contextlib import contextmanager
-from tests.python.utils import get_free_port
 import torch
 from mori.io import (
     IOEngineConfig,
@@ -48,10 +47,9 @@ def create_connected_engine_pair(
 ):
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     initiator = IOEngine(key=f"{name_prefix}_initiator", config=config)
-    config.port = get_free_port()
     target = IOEngine(key=f"{name_prefix}_target", config=config)
 
     config = RdmaBackendConfig(
@@ -116,7 +114,7 @@ def pre_connected_engine_pair():
 def test_engine_desc():
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     engine = IOEngine(key="engine", config=config)
     engine.create_backend(BackendType.RDMA)
@@ -149,10 +147,10 @@ def test_engine_desc_port_zero_auto_bind():
 
 
 def test_engine_desc_node_id_env_override(monkeypatch):
-    monkeypatch.setenv("MORI_IO_NODE_ID", "node-id-test")
+    monkeypatch.setenv("MORI_NODE_ID", "node-id-test")
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     engine = IOEngine(key="engine_node_id", config=config)
     desc = engine.get_engine_desc()
@@ -191,7 +189,7 @@ def test_rdmabackend_auto_creates_xgmi_backend_for_gpu_mem(monkeypatch):
     monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "0")
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     engine = IOEngine(key="auto_xgmi_engine", config=config)
     engine.create_backend(BackendType.RDMA)
@@ -208,7 +206,7 @@ def test_rdmabackend_auto_xgmi_can_be_disabled(monkeypatch):
     monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "1")
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     engine = IOEngine(key="auto_xgmi_disabled_engine", config=config)
     engine.create_backend(BackendType.RDMA)
@@ -225,7 +223,7 @@ def test_intra_node_prefers_xgmi_after_rdma_creation(monkeypatch):
     monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "0")
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     engine = IOEngine(key="auto_xgmi_route_engine", config=config)
     engine.create_backend(BackendType.RDMA)
@@ -248,7 +246,7 @@ def test_intra_node_prefers_xgmi_after_rdma_creation(monkeypatch):
 def test_mem_desc():
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     engine = IOEngine(key="engine", config=config)
     engine.create_backend(BackendType.RDMA)
@@ -626,10 +624,9 @@ def test_successful_writes_always_have_inbound_notification_under_pressure():
 def test_no_backend():
     config = IOEngineConfig(
         host="127.0.0.1",
-        port=get_free_port(),
+        port=0,
     )
     initiator = IOEngine(key="no_be_initiator", config=config)
-    config.port = get_free_port()
     target = IOEngine(key="no_be_target", config=config)
 
     initiator_desc = initiator.get_engine_desc()

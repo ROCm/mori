@@ -21,12 +21,60 @@
 // SOFTWARE.
 #include "mori/application/topology/gpu.hpp"
 
+#include <dlfcn.h>
+
 #include <cstdio>
+#include <cstdlib>
 
 #include "mori/application/utils/check.hpp"
 
 namespace mori {
 namespace application {
+
+// rocm-smi is loaded via a private dlopen(RTLD_LOCAL) instead of being linked.
+//
+// On the ROCm 7.14 docker we observed that the rsmi_* symbols resolve to two
+// different shared objects in the same process: some calls (e.g. rsmi_init,
+// rsmi_is_P2P_accessible) bind to libamd_smi.so (amdsmi), while the rest bind to
+// librocm_smi64. The two libraries keep separate singletons, so init lands on
+// one and num_monitor_devices on the other -> RSMI_STATUS_INIT_ERROR. This does
+// not happen on ROCm 7.2, so we pin the so ourselves: load librocm_smi64 with
+// RTLD_LOCAL and resolve every rsmi_* symbol from that one handle. Keeping it out
+// of the global scope means all calls hit the same instance.
+//
+// Doing it lazily (after torch has initialized HIP) also lets its NEEDED
+// libamdhip64 resolve to the already-loaded copy instead of pulling in a second
+// HIP runtime, which an LD_PRELOAD of librocm_smi64 would do (causing
+// hipErrorInvalidImage).
+namespace {
+
+void* OpenRocmSmi() {
+  const char* candidates[] = {std::getenv("MORI_ROCM_SMI_PATH"), "librocm_smi64.so.1",
+                              "librocm_smi64.so", "/opt/rocm/lib/librocm_smi64.so.1"};
+  for (const char* path : candidates) {
+    if (path && path[0]) {
+      if (void* h = dlopen(path, RTLD_NOW | RTLD_LOCAL)) return h;
+    }
+  }
+  fprintf(stderr, "[ROCm-SMI] dlopen(librocm_smi64) failed: %s\n", dlerror());
+  exit(-1);
+}
+
+template <typename Fn>
+Fn Sym(void* handle, const char* name) {
+  void* sym = dlsym(handle, name);
+  if (!sym) {
+    fprintf(stderr, "[ROCm-SMI] missing symbol %s\n", name);
+    exit(-1);
+  }
+  return reinterpret_cast<Fn>(sym);
+}
+
+// Declare a local function pointer `name` resolved from `lib`, reusing the exact
+// signature declared in rocm_smi.h so callers below read like normal rsmi calls.
+#define RSMI_FN(lib, name) auto name = Sym<decltype(&::name)>(lib, #name)
+
+}  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          TopoSystemGpu                                         */
@@ -44,10 +92,24 @@ PciBusId RsmiBusId2PciBusId(uint64_t rsmiBusId) {
 }
 
 void TopoSystemGpu::Load() {
-  uint32_t numGpus;
+  void* lib = OpenRocmSmi();
+  RSMI_FN(lib, rsmi_init);
+  RSMI_FN(lib, rsmi_num_monitor_devices);
+  RSMI_FN(lib, rsmi_dev_pci_id_get);
+  RSMI_FN(lib, rsmi_is_P2P_accessible);
+  RSMI_FN(lib, rsmi_topo_get_link_type);
+  RSMI_FN(lib, rsmi_topo_get_link_weight);
+  RSMI_FN(lib, rsmi_shut_down);
+  RSMI_FN(lib, rsmi_status_string);
 
+  uint32_t numGpus = 0;
   ROCM_SMI_CHECK(rsmi_init(0));
   ROCM_SMI_CHECK(rsmi_num_monitor_devices(&numGpus));
+
+  if (numGpus == 0) {
+    fprintf(stderr, "[ROCm-SMI] rsmi_num_monitor_devices reported 0 GPUs\n");
+    exit(-1);
+  }
 
   for (uint32_t i = 0; i < numGpus; ++i) {
     TopoNodeGpu* gpu = new TopoNodeGpu();
@@ -78,6 +140,7 @@ void TopoSystemGpu::Load() {
   }
 
   ROCM_SMI_CHECK(rsmi_shut_down());
+  dlclose(lib);
 }
 
 std::vector<TopoNodeGpu*> TopoSystemGpu::GetGpus() const {

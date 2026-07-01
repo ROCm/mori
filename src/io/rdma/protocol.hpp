@@ -21,7 +21,10 @@
 // SOFTWARE.
 #pragma once
 
+#include <cstddef>
 #include <msgpack.hpp>
+#include <stdexcept>
+#include <string>
 
 #include "mori/io/common.hpp"
 #include "mori/io/msgpack_adaptor.hpp"
@@ -48,7 +51,8 @@ struct MessageRegEndpoint {
   int devId;
   application::RdmaEndpointHandle eph;
   int nicRank{0};
-  MSGPACK_DEFINE(ekey, topo, devId, eph, nicRank);
+  int railId{-1};  // index in availDevices for rail affinity; -1 = unset (backward compat)
+  MSGPACK_DEFINE(ekey, topo, devId, eph, nicRank, railId);
 };
 
 struct MessageAskMemoryRegion {
@@ -63,6 +67,16 @@ struct MessageBuildConn {
   EngineKey key;
   MSGPACK_DEFINE(key);
 };
+
+inline constexpr size_t kMaxControlMessageBytes = 1 << 20;
+
+class ProtocolError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+const char* MessageTypeName(MessageType type);
+void ExpectMessage(const MessageHeader& hdr, MessageType expected, const std::string& context = {});
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Protocol                                            */

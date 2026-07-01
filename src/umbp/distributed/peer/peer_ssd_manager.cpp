@@ -413,13 +413,26 @@ std::vector<KvEvent> PeerSsdManager::DrainPendingEvents() {
   return drained;
 }
 
-std::vector<KvEvent> PeerSsdManager::SnapshotOwnedKeys() const {
-  std::lock_guard<std::mutex> lock(mutex_);
+std::vector<KvEvent> PeerSsdManager::SnapshotOwnedKeysLocked() const {
   std::vector<KvEvent> out;
   out.reserve(owned_.size());
   for (const auto& [key, entry] : owned_) {
     out.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, entry.size});
   }
+  return out;
+}
+
+std::vector<KvEvent> PeerSsdManager::SnapshotOwnedKeys() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return SnapshotOwnedKeysLocked();
+}
+
+std::vector<KvEvent> PeerSsdManager::SnapshotOwnedKeysForFullSync() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto out = SnapshotOwnedKeysLocked();
+  // Snapshot is authoritative now: drop the queued delta (already reflected in
+  // it) so the next delta carries only events produced after this snapshot.
+  pending_events_.clear();
   return out;
 }
 

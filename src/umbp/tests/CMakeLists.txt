@@ -34,6 +34,19 @@ target_compile_features(test_external_kv_block_index PRIVATE cxx_std_17)
 gtest_discover_tests(test_external_kv_block_index)
 
 # ---------------------------------------------------------------------------
+# test_client_registry — membership ledger: register/re-register, capacity
+# round-trip, heartbeat status, and the silent-node reaper.
+# ---------------------------------------------------------------------------
+add_executable(test_client_registry test_client_registry.cpp)
+
+target_link_libraries(test_client_registry PRIVATE umbp_common
+                                                   GTest::gtest_main)
+
+target_compile_features(test_client_registry PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_client_registry)
+
+# ---------------------------------------------------------------------------
 # test_client_registry_external_kv
 # ---------------------------------------------------------------------------
 add_executable(test_client_registry_external_kv
@@ -159,6 +172,24 @@ target_link_libraries(
 target_compile_features(test_peer_ssd_read_rpc PRIVATE cxx_std_17)
 
 gtest_discover_tests(test_peer_ssd_read_rpc)
+
+# ---------------------------------------------------------------------------
+# test_batch_resolve_codec — struct-of-arrays BatchResolveKeysResponse wire
+# codec (batch_resolve_codec.h): encode/decode round-trip, page flattening, desc
+# dedup / omit_descs, malformed-response rejection, and the payload-size win.
+# Needs the generated proto (carried by umbp_common) + protobuf.
+# ---------------------------------------------------------------------------
+add_executable(test_batch_resolve_codec test_batch_resolve_codec.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_batch_resolve_codec PRIVATE -Wl,--no-as-needed)
+endif()
+
+target_link_libraries(test_batch_resolve_codec
+                      PRIVATE umbp_common ${_PROTOBUF_LIB} GTest::gtest_main)
+
+target_compile_features(test_batch_resolve_codec PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_batch_resolve_codec)
 
 # ---------------------------------------------------------------------------
 # test_ssd_read_lease_gating — pure reader-side lease gating decision logic

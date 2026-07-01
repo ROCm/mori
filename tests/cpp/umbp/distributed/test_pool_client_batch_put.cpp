@@ -20,23 +20,24 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Tests for the batch-level "src not registered" WARN.  Three scenarios:
-//   1. Cross-node BatchPut with un-registered caller src → exactly one
-//      batch-level WARN per PoolClient instance, suppressed for 60s on
-//      subsequent batches.
-//   2. Cross-node BatchPut with registered caller src → no batch-level
-//      WARN (zero-copy path).
-//   3. Same-node BatchPut (local memcpy branch) with un-registered src →
-//      no batch-level WARN (the message is gated on the remote else
-//      branch where staging fallback applies).
+// BatchPut staging/registration coverage across three routing scenarios:
+//   1. Cross-node BatchPut with un-registered caller src → staging fallback
+//      still completes every key.
+//   2. Cross-node BatchPut with registered caller src → zero-copy path.
+//   3. Same-node BatchPut (local memcpy branch) with un-registered src.
 //
-// All assertions filter spdlog output by the substring
-// "BatchPut: src not registered for key=" so we don't conflate with the
-// per-call WARN inside RemoteDramScatterWrite.
+// The legacy one-shot "src not registered" batch-level WARN (+ 60s throttle)
+// has been removed from PoolClient; these tests now assert that BatchPut
+// succeeds and that no such WARN is emitted on any path.  Assertions filter
+// spdlog output by the substring "BatchPut: src not registered for key=".
 
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -61,6 +62,36 @@ constexpr size_t kCallerBuf = 1 << 20;
 constexpr size_t kRemoteCap = 8 << 20;
 
 constexpr const char* kBatchPutWarnSubstr = "BatchPut: src not registered for key=";
+
+// Unique peer-service port per PoolClient.  A non-zero peer_service_port is
+// required for a node to register a peer_address and serve remote
+// AllocateSlot/CommitSlot RPCs; without it the caller's remote BatchPut fails
+// with "peer service connection unavailable".
+//
+// The port must be free *at bind time* (PoolClient binds it directly and
+// registers it verbatim), so a hard-coded base collides with concurrent test
+// processes / leftover servers on a shared (self-hosted CI) host.  Ask the
+// kernel for a currently-free ephemeral port instead.
+inline uint16_t NextPeerServicePort() {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd >= 0) {
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = 0;  // kernel picks a free port
+    socklen_t len = sizeof(addr);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
+      uint16_t port = ntohs(addr.sin_port);
+      ::close(fd);
+      return port;
+    }
+    ::close(fd);
+  }
+  static std::atomic<uint16_t> next{
+      static_cast<uint16_t>(53000 + (static_cast<unsigned>(::getpid()) % 4000))};
+  return next.fetch_add(1);
+}
 
 // Minimal sink that copies every payload into a vector for later
 // substring inspection.  Derived from base_sink (mt) so it is safe to
@@ -160,6 +191,7 @@ class BatchPutWarnTest : public ::testing::Test {
     cfg_caller.master_config.master_address = master_addr;
     cfg_caller.io_engine.host = "0.0.0.0";
     cfg_caller.io_engine.port = 0;
+    cfg_caller.peer_service_port = NextPeerServicePort();
     cfg_caller.dram_page_size = kPageSize;
     cfg_caller.dram_buffers = {{caller_local_, kPageSize}};
     cfg_caller.tier_capacities = {{TierType::DRAM, {kPageSize, kPageSize}}};
@@ -172,6 +204,7 @@ class BatchPutWarnTest : public ::testing::Test {
     cfg_target.master_config.master_address = master_addr;
     cfg_target.io_engine.host = "0.0.0.0";
     cfg_target.io_engine.port = 0;
+    cfg_target.peer_service_port = NextPeerServicePort();
     cfg_target.dram_page_size = kPageSize;
     cfg_target.dram_buffers = {{target_buf_, kRemoteCap}};
     cfg_target.tier_capacities = {{TierType::DRAM, {kRemoteCap, kRemoteCap}}};
@@ -218,11 +251,10 @@ class BatchPutWarnTest : public ::testing::Test {
   std::unique_ptr<PoolClient> target_;
 };
 
-// Un-registered src on a remote-bound batch: exactly one batch-level
-// WARN, then a second BatchPut on the same PoolClient is silent (60s
-// throttle).  Per-call WARNs from RemoteDramScatterWrite are deliberately
-// not counted (substring filter).
-TEST_F(BatchPutWarnTest, StagingFallbackEmitsWarnOnceThenThrottles) {
+// Un-registered src on a remote-bound batch still completes (staging
+// fallback): every key succeeds and no batch-level WARN is emitted (the
+// previous one-shot "src not registered" WARN + 60s throttle was removed).
+TEST_F(BatchPutWarnTest, StagingFallbackSucceedsWithoutWarn) {
   UmbpLogCapture cap;
 
   std::vector<std::string> keys;
@@ -235,18 +267,7 @@ TEST_F(BatchPutWarnTest, StagingFallbackEmitsWarnOnceThenThrottles) {
   for (size_t i = 0; i < results.size(); ++i) {
     EXPECT_TRUE(results[i]) << "key=" << keys[i];
   }
-  EXPECT_EQ(cap.CountSubstring(kBatchPutWarnSubstr), 1u)
-      << "Expected exactly one batch-level WARN for the first un-registered "
-         "BatchPut (per-batch suppression after first hit).";
-
-  std::vector<std::string> keys2;
-  std::vector<const void*> srcs2;
-  std::vector<size_t> sizes2;
-  MakeBatch(caller_buf_, /*n=*/3, &keys2, &srcs2, &sizes2, "stg2-");
-  auto results2 = caller_->BatchPut(keys2, srcs2, sizes2);
-  ASSERT_EQ(results2.size(), 3u);
-  EXPECT_EQ(cap.CountSubstring(kBatchPutWarnSubstr), 1u)
-      << "Second BatchPut within 60s must NOT emit another batch-level WARN.";
+  EXPECT_EQ(cap.CountSubstring(kBatchPutWarnSubstr), 0u);
 }
 
 // Registered caller src goes through the zero-copy branch — no batch
@@ -304,6 +325,54 @@ TEST_F(BatchPutWarnTest, AllLocalBatchNoWarn) {
   EXPECT_EQ(cap.CountSubstring(kBatchPutWarnSubstr), 0u)
       << "Local-route BatchPut must not emit the batch-level WARN even with "
          "un-registered srcs (the WARN lives in the remote else branch only).";
+}
+
+// Zero-size puts are rejected before local/peer execution: the empty entry
+// fails (false) while the surrounding non-zero keys still succeed.  Return
+// vector length is preserved.  Runs on target_ (self/local path) so the
+// assertion does not depend on remote RDMA.
+TEST_F(BatchPutWarnTest, ZeroSizePutEntriesFailOthersSucceed) {
+  std::vector<char> buf(3 * kPerKey, 0);
+  std::memset(buf.data(), 0x21, kPerKey);
+  std::memset(buf.data() + 2 * kPerKey, 0x23, kPerKey);
+
+  std::vector<std::string> keys = {"zs-a", "zs-zero", "zs-b"};
+  std::vector<const void*> srcs = {buf.data(), buf.data() + kPerKey, buf.data() + 2 * kPerKey};
+  std::vector<size_t> sizes = {kPerKey, 0, kPerKey};
+
+  auto results = target_->BatchPut(keys, srcs, sizes);
+  ASSERT_EQ(results.size(), 3u);
+  EXPECT_TRUE(results[0]) << "key=" << keys[0];
+  EXPECT_FALSE(results[1]) << "zero-size put must be filtered to failure";
+  EXPECT_TRUE(results[2]) << "key=" << keys[2];
+}
+
+// Zero-size gets are rejected before local fallback or remote read: they fail
+// (false) while previously-seeded non-zero keys still resolve.  Return vector
+// length is preserved.  Local self put+get on target_ keeps the round trip
+// free of RDMA/registration.
+TEST_F(BatchPutWarnTest, ZeroSizeGetEntriesFailOthersSucceed) {
+  std::vector<char> src(2 * kPerKey, 0);
+  std::memset(src.data(), 0x31, kPerKey);
+  std::memset(src.data() + kPerKey, 0x32, kPerKey);
+  std::vector<std::string> pkeys = {"zg-a", "zg-b"};
+  std::vector<const void*> psrcs = {src.data(), src.data() + kPerKey};
+  std::vector<size_t> psizes = {kPerKey, kPerKey};
+  auto pres = target_->BatchPut(pkeys, psrcs, psizes);
+  ASSERT_EQ(pres.size(), 2u);
+  ASSERT_TRUE(pres[0]);
+  ASSERT_TRUE(pres[1]);
+
+  std::vector<char> dst(3 * kPerKey, 0);
+  std::vector<std::string> gkeys = {"zg-a", "zg-zero", "zg-b"};
+  std::vector<void*> gdsts = {dst.data(), dst.data() + kPerKey, dst.data() + 2 * kPerKey};
+  std::vector<size_t> gsizes = {kPerKey, 0, kPerKey};
+
+  auto gres = target_->BatchGet(gkeys, gdsts, gsizes);
+  ASSERT_EQ(gres.size(), 3u);
+  EXPECT_TRUE(gres[0]) << "key=" << gkeys[0];
+  EXPECT_FALSE(gres[1]) << "zero-size get must be filtered to failure";
+  EXPECT_TRUE(gres[2]) << "key=" << gkeys[2];
 }
 
 }  // namespace

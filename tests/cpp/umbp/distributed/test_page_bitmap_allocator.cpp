@@ -21,22 +21,17 @@
 // SOFTWARE.
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <set>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
-#include "umbp/distributed/page_bitmap_allocator.h"
+#include "umbp/distributed/peer/peer_page_allocator.h"
 #include "umbp/distributed/types.h"
 
 namespace {
 
-using mori::umbp::AllocResult;
 using mori::umbp::PageBitmapAllocator;
 using mori::umbp::PageLocation;
-using mori::umbp::ParsedDramLocation;
-using mori::umbp::ParseDramLocationId;
 
 constexpr uint64_t kPageSize = 1024;  // 1 KB pages — small for easier asserts
 
@@ -93,9 +88,8 @@ TEST(PageBitmapAllocatorTest, BasicAllocateSinglePageContinuous) {
 
   auto r = alloc.Allocate(1);
   ASSERT_TRUE(r.has_value());
-  EXPECT_EQ(r->location_id, "0:p0");
-  ASSERT_EQ(r->pages.size(), 1u);
-  EXPECT_EQ(r->pages[0], (PageLocation{0, 0}));
+  ASSERT_EQ(r->size(), 1u);
+  EXPECT_EQ((*r)[0], (PageLocation{0, 0}));
 
   EXPECT_EQ(alloc.AvailableBytes(), total - kPageSize);
   EXPECT_EQ(alloc.UsedBytes(), kPageSize);
@@ -107,11 +101,10 @@ TEST(PageBitmapAllocatorTest, AllocateContinuousMultiplePagesInOneBuffer) {
   auto r = alloc.Allocate(3);
   ASSERT_TRUE(r.has_value());
   // Strategy 1 hit on buffer 0, starting at page 0.
-  EXPECT_EQ(r->location_id, "0:p0,1,2");
-  ASSERT_EQ(r->pages.size(), 3u);
-  EXPECT_EQ(r->pages[0], (PageLocation{0, 0}));
-  EXPECT_EQ(r->pages[1], (PageLocation{0, 1}));
-  EXPECT_EQ(r->pages[2], (PageLocation{0, 2}));
+  ASSERT_EQ(r->size(), 3u);
+  EXPECT_EQ((*r)[0], (PageLocation{0, 0}));
+  EXPECT_EQ((*r)[1], (PageLocation{0, 1}));
+  EXPECT_EQ((*r)[2], (PageLocation{0, 2}));
 }
 
 TEST(PageBitmapAllocatorTest, AllocateDiscreteMultiplePagesInOneBuffer) {
@@ -129,8 +122,8 @@ TEST(PageBitmapAllocatorTest, AllocateDiscreteMultiplePagesInOneBuffer) {
   // 3 discrete free pages within buffer 0.
   auto r = alloc.Allocate(3);
   ASSERT_TRUE(r.has_value());
-  EXPECT_EQ(r->location_id, "0:p1,3,5");
-  EXPECT_EQ(AsSet(r->pages), (std::set<std::pair<uint32_t, uint32_t>>{{0, 1}, {0, 3}, {0, 5}}));
+  // CollectFirstNFree scans low to high, so order is deterministic.
+  EXPECT_EQ(*r, std::vector<PageLocation>({{0, 1}, {0, 3}, {0, 5}}));
   EXPECT_EQ(alloc.AvailableBytes(), 0u);
 }
 
@@ -141,9 +134,8 @@ TEST(PageBitmapAllocatorTest, AllocateAcrossBuffersWhenSingleBufferInsufficient)
 
   auto r = alloc.Allocate(3);
   ASSERT_TRUE(r.has_value());
-  EXPECT_EQ(r->location_id, "0:p0,1;1:p0");
-  EXPECT_EQ(r->pages.size(), 3u);
-  EXPECT_EQ(AsSet(r->pages), (std::set<std::pair<uint32_t, uint32_t>>{{0, 0}, {0, 1}, {1, 0}}));
+  // Strategy 3 greedy fill: buffer 0 (pages 0,1) then buffer 1 (page 0).
+  EXPECT_EQ(*r, std::vector<PageLocation>({{0, 0}, {0, 1}, {1, 0}}));
   EXPECT_EQ(alloc.AvailableBytes(), total - 3u * kPageSize);
 }
 
@@ -184,13 +176,13 @@ TEST(PageBitmapAllocatorTest, DeallocateRoundtrip) {
   ASSERT_TRUE(r.has_value());
   EXPECT_EQ(alloc.AvailableBytes(), total - 5u * kPageSize);
 
-  alloc.Deallocate(r->pages);
+  alloc.Deallocate(*r);
   EXPECT_EQ(alloc.AvailableBytes(), total);
 
   // Re-allocate — should be able to satisfy the same request shape.
   auto r2 = alloc.Allocate(5);
   ASSERT_TRUE(r2.has_value());
-  EXPECT_EQ(AsSet(r2->pages), AsSet(r->pages));
+  EXPECT_EQ(AsSet(*r2), AsSet(*r));
 }
 
 TEST(PageBitmapAllocatorTest, DeallocateIdempotent) {
@@ -199,12 +191,12 @@ TEST(PageBitmapAllocatorTest, DeallocateIdempotent) {
   ASSERT_TRUE(r.has_value());
   uint64_t avail_after_alloc = alloc.AvailableBytes();
 
-  alloc.Deallocate(r->pages);
+  alloc.Deallocate(*r);
   uint64_t avail_after_first_free = alloc.AvailableBytes();
   EXPECT_GT(avail_after_first_free, avail_after_alloc);
 
   // Second Deallocate of the same set must not corrupt state.
-  alloc.Deallocate(r->pages);
+  alloc.Deallocate(*r);
   EXPECT_EQ(alloc.AvailableBytes(), avail_after_first_free);
   for (const auto& b : alloc.Buffers()) {
     EXPECT_EQ(b.free_count, b.total_pages);
@@ -234,36 +226,8 @@ TEST(PageBitmapAllocatorTest, DeallocateOutOfRangeNoOp) {
   }
 
   // Real free still works after the no-op call.
-  alloc.Deallocate(r->pages);
+  alloc.Deallocate(*r);
   EXPECT_EQ(alloc.AvailableBytes(), total);
-}
-
-TEST(PageBitmapAllocatorTest, DeallocateByLocationIdHappy) {
-  auto alloc = MakeAllocator(2, 4);
-  uint64_t total = alloc.TotalBytes();
-
-  auto r = alloc.Allocate(5);  // cross-buffer
-  ASSERT_TRUE(r.has_value());
-  EXPECT_LT(alloc.AvailableBytes(), total);
-
-  alloc.DeallocateByLocationId(r->location_id);
-  EXPECT_EQ(alloc.AvailableBytes(), total);
-}
-
-TEST(PageBitmapAllocatorTest, DeallocateByLocationIdMalformedNoOp) {
-  auto alloc = MakeAllocator(1, 4);
-  auto r = alloc.Allocate(1);
-  ASSERT_TRUE(r.has_value());
-  uint64_t avail_after_alloc = alloc.AvailableBytes();
-
-  alloc.DeallocateByLocationId("");                // empty
-  alloc.DeallocateByLocationId("not-a-location");  // no colon
-  alloc.DeallocateByLocationId("0:x3");            // missing 'p'
-  alloc.DeallocateByLocationId("0:p");             // empty page list
-  alloc.DeallocateByLocationId("abc:p3");          // non-numeric buffer
-  alloc.DeallocateByLocationId("0:pabc");          // non-numeric page
-
-  EXPECT_EQ(alloc.AvailableBytes(), avail_after_alloc);
 }
 
 TEST(PageBitmapAllocatorTest, AllocateExhaustionThenSuccess) {
@@ -275,119 +239,10 @@ TEST(PageBitmapAllocatorTest, AllocateExhaustionThenSuccess) {
   EXPECT_EQ(alloc.AvailableBytes(), 0u);
   EXPECT_FALSE(alloc.Allocate(1).has_value());
 
-  alloc.Deallocate({a->pages[1]});
+  alloc.Deallocate({(*a)[1]});
   auto b = alloc.Allocate(1);
   ASSERT_TRUE(b.has_value());
-  EXPECT_EQ(b->pages[0], a->pages[1]);
-}
-
-// =============================================================================
-// LocationIdSerializationTest
-// =============================================================================
-
-TEST(LocationIdSerializationTest, BuildSinglePage) {
-  EXPECT_EQ(PageBitmapAllocator::BuildLocationId({{0, 3}}), "0:p3");
-}
-
-TEST(LocationIdSerializationTest, BuildSameBufferMultiPages) {
-  EXPECT_EQ(PageBitmapAllocator::BuildLocationId({{0, 3}, {0, 4}}), "0:p3,4");
-  // Out-of-order input must still produce ascending output.
-  EXPECT_EQ(PageBitmapAllocator::BuildLocationId({{0, 4}, {0, 3}}), "0:p3,4");
-}
-
-TEST(LocationIdSerializationTest, BuildCrossBuffer) {
-  EXPECT_EQ(PageBitmapAllocator::BuildLocationId({{0, 1}, {0, 2}, {1, 0}}), "0:p1,2;1:p0");
-  // Out-of-order across buffers — buffer_index also ascending.
-  EXPECT_EQ(PageBitmapAllocator::BuildLocationId({{1, 0}, {0, 2}, {0, 1}}), "0:p1,2;1:p0");
-}
-
-TEST(LocationIdSerializationTest, BuildEmpty) {
-  EXPECT_EQ(PageBitmapAllocator::BuildLocationId({}), "");
-}
-
-TEST(LocationIdSerializationTest, RoundtripSinglePage) {
-  std::vector<PageLocation> in = {{2, 7}};
-  std::string s = PageBitmapAllocator::BuildLocationId(in);
-  auto parsed = ParseDramLocationId(s);
-  ASSERT_TRUE(parsed.has_value());
-  EXPECT_EQ(parsed->pages, in);
-}
-
-TEST(LocationIdSerializationTest, RoundtripCrossBuffer) {
-  std::vector<PageLocation> in = {{0, 1}, {0, 2}, {1, 0}, {3, 5}};
-  std::string s = PageBitmapAllocator::BuildLocationId(in);
-  EXPECT_EQ(s, "0:p1,2;1:p0;3:p5");
-  auto parsed = ParseDramLocationId(s);
-  ASSERT_TRUE(parsed.has_value());
-  EXPECT_EQ(parsed->pages, in);
-}
-
-TEST(LocationIdSerializationTest, ParseEmptyReturnsNullopt) {
-  EXPECT_FALSE(ParseDramLocationId("").has_value());
-}
-
-TEST(LocationIdSerializationTest, ParseMissingColonReturnsNullopt) {
-  EXPECT_FALSE(ParseDramLocationId("0p3").has_value());
-  EXPECT_FALSE(ParseDramLocationId("hello").has_value());
-}
-
-TEST(LocationIdSerializationTest, ParseMissingPPrefixReturnsNullopt) {
-  EXPECT_FALSE(ParseDramLocationId("0:3").has_value());
-  EXPECT_FALSE(ParseDramLocationId("0:x3").has_value());
-}
-
-TEST(LocationIdSerializationTest, ParseNonNumericReturnsNullopt) {
-  EXPECT_FALSE(ParseDramLocationId("abc:p3").has_value());
-  EXPECT_FALSE(ParseDramLocationId("0:pabc").has_value());
-  EXPECT_FALSE(ParseDramLocationId("0:p3,abc").has_value());
-  EXPECT_FALSE(ParseDramLocationId("0:p-1").has_value());
-}
-
-TEST(LocationIdSerializationTest, ParseDuplicatePageInSameBufferReturnsNullopt) {
-  EXPECT_FALSE(ParseDramLocationId("0:p1,1").has_value());
-  EXPECT_FALSE(ParseDramLocationId("0:p1,2,1").has_value());
-}
-
-TEST(LocationIdSerializationTest, ParseDuplicateBufferAcrossSegmentsReturnsNullopt) {
-  // Canonical serialization always groups one buffer into one segment.
-  EXPECT_FALSE(ParseDramLocationId("0:p1;0:p2").has_value());
-}
-
-TEST(LocationIdSerializationTest, ParseTrailingSemicolonReturnsNullopt) {
-  EXPECT_FALSE(ParseDramLocationId("0:p1;").has_value());
-  EXPECT_FALSE(ParseDramLocationId("0:p1;1:p0;").has_value());
-  EXPECT_FALSE(ParseDramLocationId(";0:p1").has_value());
-  EXPECT_FALSE(ParseDramLocationId("0:p1;;1:p0").has_value());
-}
-
-TEST(LocationIdSerializationTest, ParseEmptyPageListReturnsNullopt) {
-  EXPECT_FALSE(ParseDramLocationId("0:p").has_value());
-  EXPECT_FALSE(ParseDramLocationId("0:p,3").has_value());
-  EXPECT_FALSE(ParseDramLocationId("0:p3,").has_value());
-}
-
-TEST(LocationIdSerializationTest, ParseWellFormedSingle) {
-  auto parsed = ParseDramLocationId("0:p3");
-  ASSERT_TRUE(parsed.has_value());
-  ASSERT_EQ(parsed->pages.size(), 1u);
-  EXPECT_EQ(parsed->pages[0], (PageLocation{0, 3}));
-}
-
-TEST(LocationIdSerializationTest, ParseWellFormedMulti) {
-  auto parsed = ParseDramLocationId("0:p3,4");
-  ASSERT_TRUE(parsed.has_value());
-  ASSERT_EQ(parsed->pages.size(), 2u);
-  EXPECT_EQ(parsed->pages[0], (PageLocation{0, 3}));
-  EXPECT_EQ(parsed->pages[1], (PageLocation{0, 4}));
-}
-
-TEST(LocationIdSerializationTest, ParseWellFormedCrossBuffer) {
-  auto parsed = ParseDramLocationId("0:p1,2;1:p0");
-  ASSERT_TRUE(parsed.has_value());
-  ASSERT_EQ(parsed->pages.size(), 3u);
-  EXPECT_EQ(parsed->pages[0], (PageLocation{0, 1}));
-  EXPECT_EQ(parsed->pages[1], (PageLocation{0, 2}));
-  EXPECT_EQ(parsed->pages[2], (PageLocation{1, 0}));
+  EXPECT_EQ((*b)[0], (*a)[1]);
 }
 
 }  // namespace

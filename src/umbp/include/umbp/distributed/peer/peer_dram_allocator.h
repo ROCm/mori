@@ -25,6 +25,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -197,7 +198,11 @@ class PeerDramAllocator : public OwnedLocationSource {
 
   // Batched Resolve + BufferDescsForPages under a single mutex_ hold.
   // Per-key behavior byte-identical to Resolve() + BufferDescsForPages().
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys);
+  // `include_descs=false` skips BuildBufferDescsLocked entirely (leaving
+  // descs empty) — for callers that already have the buffer descs cached
+  // (e.g. from GetPeerInfo) and would otherwise discard the result.
+  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
+                                          bool include_descs = true);
 
   // Master-driven eviction.  Idempotent: keys that are unknown or
   // already gone produce zero-bytes entries; keys with active read
@@ -254,9 +259,21 @@ class PeerDramAllocator : public OwnedLocationSource {
   // the heartbeat shipper; clears the buffer.  OwnedLocationSource.
   std::vector<KvEvent> DrainPendingEvents() override;
 
+  // Register a hook invoked (while the allocator lock is held) once the
+  // unshipped-event outbox reaches `threshold`, so the heartbeat is flushed
+  // automatically after a batch of puts instead of relying on the application to
+  // call FlushHeartbeat().  `cb` MUST be cheap and MUST NOT re-enter the
+  // allocator — it should only signal the heartbeat thread (set a flag +
+  // notify).  `threshold` should be >= 1; pass a very large value to disable.
+  void SetAutoFlushHook(size_t threshold, std::function<void()> cb);
+
   // Full snapshot of every owned key as ADD events.  Used when master
   // requests a full sync (seq gap or master restart).  OwnedLocationSource.
   std::vector<KvEvent> SnapshotOwnedKeys() const override;
+
+  // Full-sync snapshot that also atomically drops the event outbox (and disarms
+  // auto-flush) under the same lock.  See OwnedLocationSource.
+  std::vector<KvEvent> SnapshotOwnedKeysForFullSync() override;
 
   // Live owned-key count per tier.  O(tiers) — cheap to call every
   // heartbeat.  Used by the heartbeat shipper for per-client metrics.
@@ -302,6 +319,14 @@ class PeerDramAllocator : public OwnedLocationSource {
   AllocateResult AllocateLocked(const std::string& key, uint64_t size, TierType tier);
   bool CommitLocked(uint64_t slot_id, const std::string& key, uint64_t& bytes_committed);
   bool AbortLocked(uint64_t slot_id);
+
+  // Single entry point for appending to the event outbox; when the outbox
+  // reaches auto_flush_threshold_ it invokes auto_flush_cb_ (under the lock) to
+  // wake the heartbeat.  Caller MUST hold `mutex_`.
+  void QueueEventLocked(KvEvent event);
+
+  // Build the full ADD list for every owned key.  Caller MUST hold `mutex_`.
+  std::vector<KvEvent> SnapshotOwnedKeysLocked() const;
 
   // Caller MUST hold `mutex_`.  True iff `key`'s read-lease deadline
   // is still in the future.  Drops the entry if it has expired.
@@ -350,6 +375,10 @@ class PeerDramAllocator : public OwnedLocationSource {
   std::unordered_map<std::string, OwnedSlot> owned_;
   std::unordered_map<std::string, std::chrono::steady_clock::time_point> read_lease_until_;
   std::vector<KvEvent> pending_events_;
+
+  // Auto-flush state (see QueueEventLocked):
+  size_t auto_flush_threshold_ = SIZE_MAX;  // events before a flush; default = never
+  std::function<void()> auto_flush_cb_;     // set once at startup; wakes the heartbeat
 
   // Active copy pins.  An entry means `key`'s owned pages are protected
   // from eviction until ReleaseDramCopyPin.  No TTL: lifetime is bound to

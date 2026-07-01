@@ -26,7 +26,6 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
-#include <vector>
 
 namespace mori {
 namespace application {

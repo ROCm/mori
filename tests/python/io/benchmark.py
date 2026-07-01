@@ -19,7 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from tests.python.utils import get_free_port, TorchDistContext
+from tests.python.utils import TorchDistContext
 import torch
 import torch.distributed as dist
 from mori.io import (
@@ -152,6 +152,14 @@ def parse_args():
         help="Number of devices on target side",
     )
     parser.add_argument(
+        "--target-dev-offset",
+        type=int,
+        default=0,
+        help="Shift each target buffer to GPU (role_rank + offset) %% gpu_count, so the "
+        "initiator's GPU i pairs with a different-index target GPU. Used to exercise cross-rail "
+        "transfers on rail-only fabrics (e.g. offset 5 makes GPU0 -> GPU5). GPU memory only.",
+    )
+    parser.add_argument(
         "--num-qp-per-transfer",
         type=int,
         default=4,
@@ -256,6 +264,7 @@ class MoriIoBenchmark:
         rank_in_node: int = 0,
         num_initiator_dev: int = 1,
         num_target_dev: int = 1,
+        target_dev_offset: int = 0,
         num_qp_per_transfer: int = 4,
         num_worker_threads: int = 1,
         poll_cq_mode: str = "polling",
@@ -291,6 +300,7 @@ class MoriIoBenchmark:
         self.role_rank = rank_in_node
         self.num_initiator_dev = num_initiator_dev
         self.num_target_dev = num_target_dev
+        self.target_dev_offset = target_dev_offset
         self.num_qp_per_transfer = num_qp_per_transfer
         self.num_worker_threads = num_worker_threads
         self.poll_cq_mode = (
@@ -343,7 +353,12 @@ class MoriIoBenchmark:
             self.device = torch.device("cpu")
             self.tensor = torch.randint(0, 256, (total_elements,), dtype=torch.uint8)
         else:
-            self.device = torch.device("cuda", self.role_rank)
+            gpu_index = self.role_rank
+            if self.role is EngineRole.TARGET and self.target_dev_offset:
+                gpu_index = (
+                    self.role_rank + self.target_dev_offset
+                ) % torch.cuda.device_count()
+            self.device = torch.device("cuda", gpu_index)
             self.tensor = torch.randn(total_elements).to(
                 self.device, dtype=torch.float8_e4m3fnuz
             )
@@ -404,6 +419,7 @@ class MoriIoBenchmark:
             print(f"  role_rank: {self.role_rank}")
             print(f"  num_initiator_dev: {self.num_initiator_dev}")
             print(f"  num_target_dev: {self.num_target_dev}")
+            print(f"  target_dev_offset: {self.target_dev_offset}")
             print(f"  mem_type: {self.mem_type}")
             print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
             print(f"  num_worker_threads: {self.num_worker_threads}")
@@ -1004,11 +1020,12 @@ def benchmark_engine(local_rank, node_rank, args):
         sweep_max_size=args.sweep_max_size,
         backend_type="rdma",
         host=args.host,
-        port=get_free_port(),
+        port=0,
         node_rank=node_rank,
         rank_in_node=local_rank,
         num_initiator_dev=args.num_initiator_dev,
         num_target_dev=args.num_target_dev,
+        target_dev_offset=args.target_dev_offset,
         num_qp_per_transfer=args.num_qp_per_transfer,
         num_worker_threads=args.num_worker_threads,
         poll_cq_mode=args.poll_cq_mode,

@@ -22,7 +22,7 @@
 #pragma once
 
 #include <memory>
-#include <unordered_map>
+#include <string>
 #include <vector>
 
 #include "mori/application/topology/gpu.hpp"

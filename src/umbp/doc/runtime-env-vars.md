@@ -65,6 +65,8 @@ Read by the **master process** (`bin/master_main.cpp` via
 | `UMBP_HIT_INDEX_TTL_SEC` | `7200` | sec | External KV hit-count entry TTL. A hash with no counted match for longer than this is removed from the hit index. |
 | `UMBP_HIT_INDEX_GC_INTERVAL_SEC` | `60` | sec | External KV hit-count GC sweep interval. |
 | `UMBP_HIT_QUERY_MAX_BATCH` | `4096` | count | Maximum hashes accepted by one `GetExternalKvHitCounts` request. Oversized requests return gRPC `INVALID_ARGUMENT`; the server does not truncate. |
+| `UMBP_ROUTE_PUT_SELECT_ALGO` | `most_available` | enum | Base RoutePut placement algorithm over eligible nodes (HBM before DRAM; SSD never a direct-put target). `most_available` = pick the node with the most projected free space; `random` = capacity-weighted random (probability proportional to projected `available_bytes`, never picks a node that cannot fit). Unknown value → default + one WARN. |
+| `UMBP_ROUTE_PUT_NODE_AFFINITY` | `none` | enum | Node-affinity bias layered on top of the base algorithm. `none` = pure base algorithm; `same` = try to place the whole batch on one node that fits the non-dedup total, else per-key sticky to the first picked node; `local` = per-key prefer the requester's local node. All three fall back to the base algorithm so affinity never makes a key fail that the base algorithm could route. Unknown value → default + one WARN. |
 
 ## Peer / pool client
 
@@ -81,6 +83,8 @@ that has loaded `libmori_pybinds.so`).
 | `UMBP_SSD_GET_RETRY_BACKOFF_MS` | `2` | ms | Sleep between remote SSD get retries (only applied when another attempt follows). `min_allowed=1`. |
 | `UMBP_RELEASE_LEASE_TIMEOUT_MS` | `1000` | ms | Per-attempt gRPC deadline for the best-effort `ReleaseSsdLease` RPC so a slow peer can't stall the reader. `min_allowed=1`. |
 | `UMBP_SSD_PREPARE_TIMEOUT_MS` | `0` | ms | Per-call gRPC deadline for `PrepareSsdRead` so a hung/slow peer can't stall the serial batch. `0` = fall back to `ssd_lease_timeout_s` (cluster-homogeneous). A timed-out / failed prepare is a hard not-served outcome (NOT retried, and never a miss). `min_allowed=0`. |
+| `UMBP_AUTO_FLUSH_EVENT_THRESHOLD` | `128` | count | Peer-side unshipped `KvEvent` outbox size at which a completed batch of puts auto-triggers a heartbeat flush (`FlushHeartbeat`), so the ADDs become visible at the master without waiting for the heartbeat interval or an explicit `Flush()`. Counted on `PeerDramAllocator` only (SSD events still wait for the interval). Parsed via `std::strtoull` (no WARN on bad input); unset / unparseable / `0` -> default `128`; set to a very large value to make auto-flush effectively never fire. Cached on first use in `MasterClient::SetPeerDramAllocator`. |
+| `UMBP_MASTER_INDEX_SHARDS` | `32` | count | Number of independently-locked, key-hashed shards backing the master `GlobalBlockIndex`. A heartbeat's event batch only takes the exclusive lock on the shards its keys hash into, so unrelated `RoutePut` / `BatchLookup` readers on other shards don't block behind a large apply; full-sync (`ReplaceNodeLocations`) likewise becomes N small critical sections instead of one giant one. Read once at master start via `std::strtol`; unset / unparseable / `< 1` -> default `32` (a WARN is logged on unparseable input). `1` reproduces the old single-global-lock behavior. |
 
 ## SPDK proxy
 

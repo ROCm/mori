@@ -130,9 +130,23 @@ void MultithreadExecutor::Worker::MainLoop() {
                            task.req->remoteOffsets.begin() + task.end);
     SizeVec tSizes(task.req->sizes.begin() + task.begin, task.req->sizes.begin() + task.end);
 
+    const bool chunk = task.req->chunkBytes > 0;
+    RdmaTransferControl control{};
+    control.chunkBytes = task.req->chunkBytes;
+    control.maxChunks = task.req->maxChunks;
+    control.creditByWrCount = chunk;
+    control.ownsTotalBatchSize = false;
+    control.disableMerge = chunk;
+
+    thread_local std::vector<application::RdmaMemoryRegion> localMrPerEp(1);
+    thread_local std::vector<application::RdmaMemoryRegion> remoteMrPerEp(1);
+    localMrPerEp[0] = task.req->local;
+    remoteMrPerEp[0] = task.req->remote;
+
     RdmaOpRet ret = mori::io::RdmaBatchReadWrite(
-        {task.req->eps[task.epId]}, task.req->local, tLoclOffsets, task.req->remote, tRemoteOffsets,
-        tSizes, task.req->callbackMeta, task.req->id, task.req->isRead, task.req->postBatchSize);
+        {task.req->eps[task.epId]}, localMrPerEp, remoteMrPerEp, tLoclOffsets, tRemoteOffsets,
+        tSizes, task.req->callbackMeta, task.req->id, task.req->isRead, task.req->postBatchSize,
+        control);
     task.ret.set_value(ret);
     MORI_IO_TRACE("Worker {} execute task {} begin {} end {} ret code {}", workerId, task.req->id,
                   task.begin, task.end, static_cast<uint32_t>(ret.code));
@@ -191,12 +205,18 @@ RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
 
   auto splits = SplitWork(req);
   int numSplits = splits.size();
+  int numEps = static_cast<int>(req.eps.size());
+  // Rotate the starting EP by transfer id so single-segment transfers spread
+  // evenly across all QPs instead of always landing on eps[0].
+  int epOffset = static_cast<int>(req.id % static_cast<uint64_t>(numEps));
   std::vector<std::future<RdmaOpRet>> futs;
 
   for (int i = 0; i < numSplits; i++) {
-    Task task{&req, i, splits[i].first, splits[i].second};
+    int epId = (i + epOffset) % numEps;
+    Task task{&req, epId, splits[i].first, splits[i].second};
     futs.push_back(std::move(task.ret.get_future()));
-    pool[i]->Submit(std::move(task));
+    // Keep each QP owned by a stable worker to preserve QP affinity.
+    pool[epId % numWorker]->Submit(std::move(task));
   }
 
   bool hasFail = false;

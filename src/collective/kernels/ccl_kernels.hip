@@ -76,6 +76,22 @@ using namespace mori::collective;
                      args.dstBaseOffset);                                   \
   }
 
+#define CCL_WRAP_ALLGATHER_PARAM_CONTIGUOUS(kernel, suffix, T)               \
+  extern "C" __global__ void kernel##_##suffix(CclAllgatherArgs<T> args) {  \
+    kernel##_body<T>(args.myPe, args.npes, args.input, args.srcMemObj,      \
+                     args.dstMemObj, args.flagsMemObj, args.elementCount,   \
+                     args.dstBaseOffset, args.flagVal, args.splitSizes,     \
+                     args.splitOffsets, args.splitCount);                   \
+  }
+
+#define CCL_WRAP_ALLGATHER_PARAM_CONTIGUOUS_ASYNC_PUT(kernel, suffix, T)     \
+  extern "C" __global__ void kernel##_##suffix(CclAllgatherArgs<T> args) {  \
+    kernel##_body<T>(args.myPe, args.npes, args.input, args.srcMemObj,      \
+                     args.dstMemObj, args.flagsMemObj, args.elementCount,   \
+                     args.dstBaseOffset, args.splitSizes, args.splitOffsets, \
+                     args.splitCount);                                      \
+  }
+
 // AllReduce reduce-scatter / fused: (myPe, npes, input, dstMemObj,
 //                                    flagsMemObj, barrier, elementCount)
 #define CCL_WRAP_ALLREDUCE_RS(kernel, suffix, T)                              \
@@ -147,6 +163,9 @@ extern "C" __global__ void OneShotAll2allSdmaAsyncWaitKernel_u32(
 
 CCL_WRAP_ALLGATHER(OneShotAllGatherSdmaKernel, u32, uint32_t)
 CCL_WRAP_ALLGATHER_ASYNC_PUT(OneShotAllGatherSdmaAsyncPutKernel, u32, uint32_t)
+CCL_WRAP_ALLGATHER_PARAM_CONTIGUOUS(OneShotAllGatherSdmaParamContiguousKernel, u32, uint32_t)
+CCL_WRAP_ALLGATHER_PARAM_CONTIGUOUS_ASYNC_PUT(OneShotAllGatherSdmaParamContiguousAsyncPutKernel,
+                                              u32, uint32_t)
 
 // Sub-group intra-node SDMA AllGather. Type-agnostic byte move on
 // u32 lanes; the Python layer rounds the byte count up to u32 elements.

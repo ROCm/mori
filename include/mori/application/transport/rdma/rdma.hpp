@@ -25,7 +25,10 @@
 // so that device (HIP/CUDA) compilation units can use them without ibverbs/STL dependencies.
 #include <unistd.h>
 
+#include <algorithm>
 #include <cassert>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -71,8 +74,8 @@ RdmaDeviceVendorId ToRdmaDeviceVendorId(T v) {
 // UDP sport configuration constants for multi-provider support
 static constexpr uint32_t RDMA_UDP_SPORT_ARRAY_SIZE = 4;
 
-// Atomic internal buffer configuration
-static constexpr size_t ATOMIC_IBUF_SLOT_SIZE = 8;  // Each atomic ibuf slot is 8 bytes
+// ATOMIC_IBUF_SLOT_SIZE is defined in application_device_types.hpp (included above)
+// so device kernels can use it without pulling the host RDMA stack.
 
 /* -------------------------------------------------------------------------- */
 /*                             Rdma Data Structure                            */
@@ -85,6 +88,8 @@ struct RdmaEndpointConfig {
                           // be large, e.g. notification)
   uint32_t maxCqeNum{128};
   uint32_t maxMsgSge{1};
+  uint32_t maxInlineData{0};  // SEND inline capacity; required by providers (e.g. bnxt_re)
+                              // for IBV_SEND_INLINE
   uint32_t alignment{PAGESIZE};
   bool onGpu{false};
   bool withCompChannel{false};
@@ -153,6 +158,9 @@ struct WorkQueueAttrs {
 struct RdmaEndpoint {
   RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
   RdmaEndpointHandle handle;
+  // Local provider capability. This is intentionally not part of RdmaEndpointHandle because it
+  // must not be serialized to peers; providers that do not populate it retain legacy behavior.
+  uint64_t maxMsgSize{std::numeric_limits<uint64_t>::max()};
   // TODO(@ditian12): we should use an opaque handle to reference the actual transport context
   // handles, for direct verbs it should be WorkQueueHandle/CompletionQueueHandle, for ib verbs, it
   // should be ibv structures
@@ -219,6 +227,7 @@ class RdmaDeviceContext {
                                uint32_t qpId = 0) {
     assert(false && "not implemented");
   }
+  virtual bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept;
 
   ibv_srq* CreateRdmaSrqIfNx(const RdmaEndpointConfig&);
 

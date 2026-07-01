@@ -329,6 +329,27 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
   if (rdmaDeviceContext) rdmaDeviceContext->DeregisterRdmaMemoryRegion(localPtr);
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
+  SymmMemObj gpuMemObjHost{};
+  bool haveGpuMemObjHost = false;
+  hipError_t copyErr =
+      hipMemcpy(&gpuMemObjHost, memObjPtr.gpu, sizeof(SymmMemObj), hipMemcpyDeviceToHost);
+  if (copyErr == hipSuccess) {
+    haveGpuMemObjHost = true;
+  } else {
+    MORI_APP_WARN("hipMemcpy failed for GPU SymmMemObj during deregistration: {}",
+                  hipGetErrorString(copyErr));
+    (void)hipGetLastError();
+  }
+
+  auto freeGpuMetadata = [](void* ptr, const char* name) {
+    if (ptr == nullptr) return;
+    hipError_t err = hipFree(ptr);
+    if (err != hipSuccess) {
+      MORI_APP_WARN("hipFree failed for GPU metadata {} ptr {:p}: {}", name, ptr,
+                    hipGetErrorString(err));
+      (void)hipGetLastError();
+    }
+  };
 
   // Close IPC handles for peers that had P2P connection.
   // Skip same-process peers: their p2pPeerPtrs are direct VA pointers, not
@@ -367,50 +388,24 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
     }
     free(memObjPtr.cpu->peerSignalPtrsHost);
   }
-  // the child arrays below (signalPtrs, peerPtrs, ...) were
-  // hipMalloc'd DEVICE-SIDE at registration and their pointer VALUES were stored
-  // only in the device-resident SymmMemObj struct (memObjPtr.gpu), never mirrored
-  // into cpuMemObj. The original code read them back by host-dereferencing the
-  // device struct (``memObjPtr.gpu->signalPtrs``), which only works when the
-  // hipMalloc'd struct happens to be host-coherent. On configs where it is not,
-  // that read yields a stale/garbage pointer and the wrapping HIP_RUNTIME_CHECK
-  // hipFree ABORTS the whole process at teardown (symmetric_memory.cpp:370) --
-  // AFTER the collective already produced bit-exact results. This is the crash
-  // the slice_direct output-deregister path hit on true xnode ( finding).
-  // Fix: (1) copy the device struct to a HOST staging mirror so we free the REAL
-  // device child pointers regardless of host-coherence; (2) make these teardown
-  // frees NON-FATAL (warn + continue, mirroring the hipIpcCloseMemHandle warning
-  // pattern a few lines above) so a cleanup hiccup never kills a process that has
-  // already finished its work. Only DeregisterSymmMemObj (ShmemSymmetricRegister
-  // objects, e.g. the slice_direct output) uses this path; the ShmemMalloc/VMM
-  // heap has its own teardown, so this cannot regress the main symmetric heap.
-  SymmMemObj gpuMirror{};
-  hipError_t mirrorErr =
-      hipMemcpy(&gpuMirror, memObjPtr.gpu, sizeof(SymmMemObj), hipMemcpyDeviceToHost);
-  if (mirrorErr != hipSuccess) {
-    MORI_APP_WARN("DeregisterSymmMemObj: device-struct readback failed: {}",
-                  hipGetErrorString(mirrorErr));
+  if (haveGpuMemObjHost) {
+    freeGpuMetadata(gpuMemObjHost.signalPtrs, "signalPtrs");
+    freeGpuMetadata(gpuMemObjHost.expectSignalsPtr, "expectSignalsPtr");
+    freeGpuMetadata(gpuMemObjHost.peerSignalPtrs, "peerSignalPtrs");
+    freeGpuMetadata(gpuMemObjHost.deviceHandles_d, "deviceHandles_d");
   }
-  auto freeNonFatal = [](void* p, const char* what) {
-    if (!p) return;
-    hipError_t e = hipFree(p);
-    if (e != hipSuccess)
-      MORI_APP_WARN("DeregisterSymmMemObj: hipFree({}) failed: {}", what, hipGetErrorString(e));
-  };
-  freeNonFatal(gpuMirror.signalPtrs, "signalPtrs");
-  freeNonFatal(gpuMirror.expectSignalsPtr, "expectSignalsPtr");
-  freeNonFatal(gpuMirror.peerSignalPtrs, "peerSignalPtrs");
-  freeNonFatal(gpuMirror.deviceHandles_d, "deviceHandles_d");
 
   free(memObjPtr.cpu->peerPtrs);
   free(memObjPtr.cpu->p2pPeerPtrs);
   free(memObjPtr.cpu->peerRkeys);
   free(memObjPtr.cpu->ipcMemHandles);
   free(memObjPtr.cpu);
-  freeNonFatal(gpuMirror.peerPtrs, "gpu.peerPtrs");
-  freeNonFatal(gpuMirror.p2pPeerPtrs, "gpu.p2pPeerPtrs");
-  freeNonFatal(gpuMirror.peerRkeys, "gpu.peerRkeys");
-  freeNonFatal(memObjPtr.gpu, "gpu");
+  if (haveGpuMemObjHost) {
+    freeGpuMetadata(gpuMemObjHost.peerPtrs, "peerPtrs");
+    freeGpuMetadata(gpuMemObjHost.p2pPeerPtrs, "p2pPeerPtrs");
+    freeGpuMetadata(gpuMemObjHost.peerRkeys, "peerRkeys");
+  }
+  freeGpuMetadata(memObjPtr.gpu, "SymmMemObj");
 
   memObjPool.erase(localPtr);
 }

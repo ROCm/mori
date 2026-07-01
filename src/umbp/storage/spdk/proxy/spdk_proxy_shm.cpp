@@ -166,7 +166,7 @@ int ProxyShmRegion::Create(const std::string& name, uint32_t max_channels, uint3
 
     unlink(hp_path_.c_str());
 
-    fd_ = open(hp_path_.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
+    fd_ = open(hp_path_.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
     if (fd_ >= 0) {
       if (ftruncate(fd_, static_cast<off_t>(hp_size)) == 0) {
         base_ = mmap(nullptr, hp_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd_, 0);
@@ -190,7 +190,7 @@ int ProxyShmRegion::Create(const std::string& name, uint32_t max_channels, uint3
 
   if (!is_hugepage_) {
     shm_unlink(name_.c_str());
-    fd_ = shm_open(name_.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
+    fd_ = shm_open(name_.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd_ < 0) return -errno;
 
     if (ftruncate(fd_, static_cast<off_t>(size_)) != 0) {
@@ -314,7 +314,7 @@ int ProxyShmRegion::Attach(const std::string& name) {
     is_hugepage_ = true;
   } else {
     hp_path_.clear();
-    fd_ = shm_open(name_.c_str(), O_RDWR, 0666);
+    fd_ = shm_open(name_.c_str(), O_RDWR, 0600);
     if (fd_ < 0) return -errno;
   }
 

@@ -295,12 +295,14 @@ This copies the current GPU states to the `globalGpuStates` symbol in the dynami
 | `MORI_SHMEM_VMM_CHUNK_SIZE` | VMM mode chunk size in bytes | Auto |
 | `MORI_SOCKET_IFNAME` | Network interface for shmem bootstrap TCP connections (e.g., `"lo"`, `"eth0"`) | Auto-detect |
 | `MORI_RDMA_DEVICES` | RDMA NIC selection. Include: `mlx5_0,mlx5_1`. Exclude: `^mlx5_2,mlx5_3` | All available |
+| `LD_LIBRARY_PATH` | mori loads libibverbs dynamically at runtime (`dlopen`) instead of linking it; to use an out-of-tree libibverbs, put its directory here. | `libibverbs.so` / `libibverbs.so.1` |
 | `MORI_NUM_QP_PER_PE` | Number of RDMA queue pairs per PE | `1` |
 | `MORI_IB_GID_INDEX` | InfiniBand GID index for RDMA connections | Auto-detect |
 | `MORI_RDMA_SL` | RDMA service level | Auto |
 | `MORI_RDMA_TC` | RDMA traffic class | Auto |
 | `MORI_DISABLE_P2P` | Disable P2P (XGMI) transport, force RDMA | Not set |
 | `MORI_DISABLE_TOPO` | Disable topology detection | Not set |
+| `MORI_IGNORE_CPU_AFFINITY` | By default the thread calling `ShmemInit` is pinned to the CPUs local to its GPU (sysfs `local_cpulist`, intersected with the existing cpuset). Set to `1` to disable and leave CPU placement to an outer `numactl`/`torchrun`. Works in SPMT (single-process multi-GPU) too: each per-GPU init thread pins to its own GPU's NUMA node. | Not set (binding on) |
 | `MORI_GLOBAL_LOG_LEVEL` | Global log verbosity: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | `INFO` |
 | `MORI_PRECOMPILE` | Precompile all JIT kernels on import | Not set |
 | `MORI_DISABLE_JIT` | Disable JIT compilation of device bitcode | Not set |

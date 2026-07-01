@@ -31,9 +31,9 @@ namespace mori::umbp {
 namespace {
 
 Location MakeLoc(const std::string& node_id, const std::string& loc_id) {
+  (void)loc_id;  // location_id is no longer part of Location; kept for call-site readability
   Location loc;
   loc.node_id = node_id;
-  loc.location_id = loc_id;
   loc.size = 4096;
   loc.tier = TierType::HBM;
   return loc;
@@ -47,7 +47,7 @@ TEST(RandomRouteGetStrategyTest, SingleReplicaReturnedDirectly) {
 
   auto selected = strategy.Select(locations, "requester");
   EXPECT_EQ(selected.node_id, "node-a");
-  EXPECT_EQ(selected.location_id, "loc-1");
+  EXPECT_EQ(selected.size, 4096u);
 }
 
 TEST(RandomRouteGetStrategyTest, MultipleReplicasReturnValidOne) {

@@ -5,8 +5,9 @@ add_library(mori_shmem SHARED ${MORI_SHMEM_SOURCES})
 
 target_include_directories(mori_shmem PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_shmem PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(mori_shmem PUBLIC mori_application mori_logging ibverbs
-                                        hip::host)
+# libibverbs is no longer linked: mori_shmem makes no direct verbs calls and the
+# dlopen shim is embedded in mori_application.
+target_link_libraries(mori_shmem PUBLIC mori_application mori_logging hip::host)
 
 if(MORI_MULTITHREAD_SUPPORT)
   target_compile_definitions(mori_shmem PUBLIC MORI_MULTITHREAD_SUPPORT)

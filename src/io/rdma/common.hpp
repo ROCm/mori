@@ -134,6 +134,27 @@ uint64_t MakeNotifSendWrId(TransferUniqueId id);
 std::vector<std::pair<uint64_t, uint32_t>> PlanChunks(uint32_t total, size_t chunkBytes,
                                                       int maxChunks);
 
+struct ChunkedSgeSegment {
+  uint64_t remoteOffset{0};
+  uint64_t localAddr{0};
+  uint32_t length{0};
+};
+
+struct ChunkGeometry {
+  uint64_t finalCount{0};
+  uint64_t targetChunkBytes{0};
+};
+
+ChunkGeometry PlanChunkGeometry(uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                                uint64_t maxMessageSize);
+
+uint64_t CountChunksForSize(uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                            uint64_t maxMessageSize);
+
+void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector<ibv_sge>& sges,
+                         uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                         uint64_t maxMessageSize);
+
 struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
       : status(s), id(id_), totalBatchSize(n) {}
@@ -233,6 +254,22 @@ struct RdmaOpRet {
 };
 
 RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+
+struct RdmaTransferControl {
+  size_t chunkBytes{0};
+  int maxChunks{1};
+  bool creditByWrCount{false};
+  bool ownsTotalBatchSize{true};
+  bool disableMerge{false};
+};
+
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
+                             const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                             const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                             const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id, bool isRead, int postBatchSize,
+                             const RdmaTransferControl& control);
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                              const std::vector<application::RdmaMemoryRegion>& localMrPerEp,

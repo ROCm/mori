@@ -39,6 +39,7 @@ namespace mori::umbp {
 // Forward declarations for strategy interfaces used by MasterServerConfig.
 class RouteGetStrategy;
 class RoutePutStrategy;
+class MasterEvictStrategy;
 
 struct ClientRegistryConfig {
   std::chrono::seconds heartbeat_ttl{10};
@@ -101,15 +102,27 @@ struct MasterServerConfig {
   std::unique_ptr<RouteGetStrategy> get_strategy;
   std::unique_ptr<RoutePutStrategy> put_strategy;
 
+  // Master-side DRAM/HBM eviction policy (optional code-level plugin).  Null
+  // installs the default LruMasterEvictStrategy.  FromEnvironment() leaves it
+  // null — only LRU exists today, so an env knob would be pseudo-config.
+  std::unique_ptr<MasterEvictStrategy> evict_strategy;
+
+  // Resolved put-strategy knobs, kept as strings for startup logging because a
+  // unique_ptr<RoutePutStrategy> is not cheaply introspectable.  Populated by
+  // FromEnvironment() alongside put_strategy.
+  std::string route_put_algo = "most_available";
+  std::string route_put_affinity = "none";
+
   // Composes ClientRegistryConfig::FromEnvironment() and
   // EvictionConfig::FromEnvironment().  listen_address is NOT read from env
   // here; callers (e.g. bin/master_main.cpp) apply argv overrides after
   // this call so the CLI remains the source of truth.
   //
   // Definition is out-of-line in master_server.cpp because this struct owns
-  // std::unique_ptr<RouteGetStrategy> with a forward-declared T; an inline
-  // body would force ~MasterServerConfig to be instantiated in every TU
-  // that includes this header.
+  // unique_ptrs to forward-declared strategy types (RouteGetStrategy,
+  // RoutePutStrategy, MasterEvictStrategy); an inline body would force
+  // ~MasterServerConfig to be instantiated in every TU that includes this
+  // header, where those types are incomplete.
   static MasterServerConfig FromEnvironment();
 };
 

@@ -35,6 +35,7 @@
 #include "hip/hip_runtime_api.h"
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
+#include "mori/application/utils/cpu_affinity.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -397,7 +398,7 @@ static void CopyRdmaEndpointsToGpu(ShmemStates* states) {
     return;
   }
 
-  size_t numEndpoints = gpuStates->worldSize * gpuStates->numQpPerPe;
+  size_t numEndpoints = static_cast<size_t>(gpuStates->worldSize) * gpuStates->numQpPerPe;
 
   // Allocate and copy endpoints.
   // Convert from host-side application::RdmaEndpoint (which contains ibverbs handles and QP
@@ -673,6 +674,14 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
     return 0;
   }
 
+  // Pin this thread to its GPU's NUMA-local CPUs before any buffer allocation or
+  // worker-thread spawn below (new threads inherit the affinity). This is the
+  // single bind site for the shmem/EP path: every init entry funnels here, and
+  // per the SPMT contract the caller has already hipSetDevice()'d its GPU, so the
+  // calling thread's current device is the rank's GPU in both one-rank-per-GPU
+  // and SPMT (one process, one such thread per GPU) layouts.
+  application::BindCallingThreadToGpuNumaOnce();
+
   // Configure shmem mode
   states->mode = ConfigureShmemMode();
 
@@ -685,6 +694,10 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   states->status = ShmemStatesStatus::Initialized;
   MORI_SHMEM_INFO("Shmem initialization completed");
   return 0;
+}
+
+bool ShmemIsInitialized() {
+  return ShmemStatesSingleton::GetInstance()->status == ShmemStatesStatus::Initialized;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -804,18 +817,6 @@ int ShmemMpiInit(MPI_Comm mpiComm) {
 
 int ShmemInit() { return ShmemMpiInit(MPI_COMM_WORLD); }
 #endif
-
-int ShmemTorchProcessGroupInit(const std::string& groupName) {
-#ifdef MORI_HAS_TORCH
-  return ShmemInit(new application::TorchBootstrapNetwork(groupName));
-#else
-  (void)groupName;
-  fprintf(stderr,
-          "[mori] Error: Torch bootstrap not available (built without PyTorch).\n"
-          "[mori] Use ShmemMpiInit() or rebuild with PyTorch installed.\n");
-  return -1;
-#endif
-}
 
 // Query APIs, Module Init, Barriers are in runtime.cpp
 

@@ -21,28 +21,35 @@
 // SOFTWARE.
 #pragma once
 
+#include <cctype>
+#include <fstream>
 #include <string>
 
-#include "mori/application/bootstrap/base_bootstrap.hpp"
+#include "mori/utils/env_utils.hpp"
 
 namespace mori {
-namespace application {
 
-class TorchBootstrapNetwork : public BootstrapNetwork {
- public:
-  TorchBootstrapNetwork(const std::string& groupName);
-  ~TorchBootstrapNetwork();
+// Identical for all processes on one physical node, distinct across nodes;
+// empty if unavailable.
+inline std::string ReadKernelBootId() {
+  std::ifstream f("/proc/sys/kernel/random/boot_id");
+  std::string id;
+  if (f && std::getline(f, id)) {
+    while (!id.empty() && std::isspace(static_cast<unsigned char>(id.back()))) id.pop_back();
+    return id;
+  }
+  return {};
+}
 
-  void Initialize();
-  void Finalize();
+// Per-physical-node identity, by priority: MORI_NODE_ID override, boot_id, then
+// hostname. boot_id keeps it correct when machines share one hostname.
+inline std::string ResolveNodeId(const std::string& hostname) {
+  if (auto nodeId = env::GetString("MORI_NODE_ID"); nodeId.has_value()) {
+    return *nodeId;
+  }
+  std::string bootId = ReadKernelBootId();
+  if (!bootId.empty()) return bootId;
+  return hostname;
+}
 
-  void Allgather(void* sendbuf, void* recvbuf, size_t sendcount);
-  void AllToAll(void* sendbuf, void* recvbuf, size_t sendcount);
-  void Barrier();
-
- private:
-  std::string groupName;
-};
-
-}  // namespace application
 }  // namespace mori

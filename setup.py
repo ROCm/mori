@@ -339,6 +339,7 @@ class CMakeBuild(build_ext):
             ) from exn
         mpi_enabled = (
             os.environ.get("BUILD_EXAMPLES", "OFF").upper() == "ON"
+            or os.environ.get("BUILD_BENCHMARK", "OFF").upper() == "ON"
             or os.environ.get("MORI_WITH_MPI", "OFF").upper() == "ON"
         )
         if mpi_enabled:
@@ -385,6 +386,7 @@ class CMakeBuild(build_ext):
             "ON"
             if (
                 build_examples.upper() == "ON"
+                or build_benchmark.upper() == "ON"
                 or os.environ.get("MORI_WITH_MPI", "OFF").upper() == "ON"
             )
             else "OFF"
@@ -475,7 +477,7 @@ class CMakeBuild(build_ext):
         spdk_proxy_dst = root_dir / "python/mori/spdk_proxy"
         if build_umbp_spdk_enabled and spdk_proxy_src.exists():
             shutil.copyfile(spdk_proxy_src, spdk_proxy_dst)
-            os.chmod(spdk_proxy_dst, 0o755)
+            os.chmod(spdk_proxy_dst, 0o700)
         elif spdk_proxy_dst.exists():
             spdk_proxy_dst.unlink()
 
@@ -483,7 +485,7 @@ class CMakeBuild(build_ext):
         umbp_master_dst = root_dir / "python/mori/umbp_master"
         if umbp_master_src.exists():
             shutil.copyfile(umbp_master_src, umbp_master_dst)
-            os.chmod(umbp_master_dst, 0o755)
+            os.chmod(umbp_master_dst, 0o700)
         elif umbp_master_dst.exists():
             umbp_master_dst.unlink()
 

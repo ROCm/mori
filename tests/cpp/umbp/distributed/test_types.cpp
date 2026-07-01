@@ -52,9 +52,9 @@ TEST(TypesTest, TierCapacityDefaultInit) {
 }
 
 TEST(TypesTest, LocationEquality) {
-  const Location a{"node-a", "loc-1", 4096, TierType::HBM};
-  const Location b{"node-a", "loc-1", 4096, TierType::HBM};
-  const Location c{"node-a", "loc-2", 4096, TierType::HBM};
+  const Location a{"node-a", 4096, TierType::HBM};
+  const Location b{"node-a", 4096, TierType::HBM};
+  const Location c{"node-a", 8192, TierType::HBM};
 
   EXPECT_TRUE(a == b);
   EXPECT_FALSE(a == c);

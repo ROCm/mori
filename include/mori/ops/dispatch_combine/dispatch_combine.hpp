@@ -29,7 +29,15 @@
 #include <variant>
 #include <vector>
 
+// This header is compiled both into host TUs and into the device .hip kernels.
+// The device side only needs application::SymmMemObjPtr (a device-safe POD from
+// application_device_types.hpp); the full application.hpp pulls the host RDMA
+// stack -> system mlx5dv.h/verbs.h, which must stay out of device compiles.
+#if !defined(__HIPCC__) && !defined(__CUDACC__)
 #include "mori/application/application.hpp"
+#else
+#include "mori/application/application_device_types.hpp"
+#endif
 #include "mori/core/profiler/constants.hpp"
 #include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/hip_compat.hpp"
@@ -168,7 +176,9 @@ struct EpDispatchCombineConfig {
     return numExpertPerToken * sizeof(float);
   }
   inline __host__ __device__ size_t SrcTokenIdBytes() const { return sizeof(index_t); }
-  inline __host__ __device__ size_t ScaleBytes() const { return scaleDim * scaleTypeSize; }
+  inline __host__ __device__ size_t ScaleBytes() const {
+    return static_cast<size_t>(scaleDim) * scaleTypeSize;
+  }
   // Size_t accessors for fields used in token-offset arithmetic.
   // Use these instead of the raw int members to avoid int32 overflow when
   // multiplying by token counts (e.g. tokenId * HiddenDimSz() is size_t * size_t).

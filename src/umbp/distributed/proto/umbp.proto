@@ -79,7 +79,8 @@ message KvEvent {
   enum Kind {
     ADD           = 0;
     REMOVE        = 1;
-    CLEAR_AT_TIER = 2;
+    reserved 2;
+    reserved "CLEAR_AT_TIER";
   }
   Kind          kind  = 1;
   string        key   = 2;
@@ -123,11 +124,13 @@ message RoutePutRequest {
   uint64 block_size            = 3;   // Size of the block to write (bytes)
   repeated string exclude_nodes = 4;  // Nodes the caller has already failed against
 }
+// Aligned with BatchRoutePutEntry: `outcome` replaces the old `found` bool so a
+// single RoutePut can also express master-side dedup (ALREADY_EXISTS).
 message RoutePutResponse {
-  bool     found        = 1;
-  string   node_id      = 2;
-  TierType tier         = 3;
-  string   peer_address = 4;
+  RoutePutOutcome outcome      = 1;
+  string          node_id      = 2;
+  TierType        tier         = 3;
+  string          peer_address = 4;
 }
 
 message RouteGetRequest {
@@ -176,15 +179,25 @@ message BatchRouteGetRequest {
   repeated string keys = 2;
   repeated string exclude_nodes = 3;
 }
-message BatchRouteGetEntry {
-  bool     found        = 1;
-  string   node_id      = 2;
-  TierType tier         = 3;
-  uint64   size         = 4;
-  string   peer_address = 5;
+// Distinct routing target.  Sent once in BatchRouteGetResponse.nodes and
+// referenced per key by a 1-based index, so the (node_id, peer_address)
+// strings are not repeated for every one of the (potentially thousands of)
+// keys that resolve to the same node.
+message NodeInfo {
+  string node_id      = 1;
+  string peer_address = 2;
 }
+// Columnar response: instead of one BatchRouteGetEntry message per key
+// (which repeated the node strings and paid per-entry/per-field tag bytes),
+// the per-key fields are parallel packed arrays aligned with the request's
+// keys.  node_ref folds away the old `found` bool: 0 = not found, otherwise
+// a 1-based index into `nodes`.  tier[i] / size[i] are only meaningful when
+// node_ref[i] != 0.
 message BatchRouteGetResponse {
-  repeated BatchRouteGetEntry entries = 1;
+  repeated NodeInfo nodes    = 1;  // distinct nodes, sent once
+  repeated uint32   node_ref = 2;  // per key; 1-based index into nodes, 0 = not found  [packed]
+  repeated TierType tier     = 3;  // per key  [packed]
+  repeated uint64   size     = 4;  // per key  [packed]
 }
 
 // Read-only batched existence probe.  Unlike BatchRouteGet, this does

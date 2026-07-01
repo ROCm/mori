@@ -53,6 +53,9 @@ struct CclAllgatherArgs {
   size_t elementCount;
   size_t dstBaseOffset;
   uint64_t flagVal;
+  const size_t* splitSizes;
+  const size_t* splitOffsets;
+  size_t splitCount;
 };
 
 // Sub-group intra-node SDMA AllGather. The ``G`` local ranks of a

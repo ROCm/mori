@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -345,6 +346,388 @@ void CasePlanChunksBoundaries() {
   }
 }
 
+void CaseChunkGeometrySingleSgeCountMatchesPlanner() {
+  constexpr uint64_t kKiB = 1024ull;
+  constexpr uint64_t kMiB = 1024ull * kKiB;
+  constexpr uint64_t kGiB = 1024ull * kMiB;
+
+  const std::vector<size_t> chunkBytesValues{4 * kKiB, 64 * kKiB, kMiB, 0};
+  const std::vector<int> maxChunksValues{1, 4, 64, 4096};
+  const std::vector<uint64_t> maxMessageValues{8 * kKiB, kMiB, 0x80000000ull};
+  const std::vector<uint64_t> totals{0, 1, 4095, 4096, 4097, 64 * kKiB, kMiB, kGiB};
+
+  for (size_t chunkBytes : chunkBytesValues) {
+    for (int maxChunks : maxChunksValues) {
+      for (uint64_t maxMessageSize : maxMessageValues) {
+        for (uint64_t total : totals) {
+          const uint64_t actual = CountChunksForSize(total, chunkBytes, maxChunks, maxMessageSize);
+
+          uint64_t expected = 1;
+          const bool splittable =
+              total != 0 && ((chunkBytes > 0 && total > chunkBytes) || total > maxMessageSize);
+          if (splittable) {
+            std::vector<ibv_sge> sges{
+                ibv_sge{.addr = 0x1000000000ull, .length = static_cast<uint32_t>(total), .lkey = 1},
+            };
+            std::vector<ChunkedSgeSegment> segments;
+            PlanSgeStreamChunks(segments, sges, total, chunkBytes, maxChunks, maxMessageSize);
+            expected = segments.size();
+          }
+
+          Require(actual == expected,
+                  "CountChunksForSize mismatch for total=" + std::to_string(total) +
+                      " chunkBytes=" + std::to_string(chunkBytes) +
+                      " maxChunks=" + std::to_string(maxChunks) + " maxMessageSize=" +
+                      std::to_string(maxMessageSize) + " expected=" + std::to_string(expected) +
+                      " actual=" + std::to_string(actual));
+        }
+      }
+    }
+  }
+}
+
+void CaseChunkGeometryProperties() {
+  ChunkGeometry geometry = PlanChunkGeometry(6, 1, 4, 2);
+  Require(geometry.finalCount == 4, "geometry repro should cap soft count at 4");
+  Require(geometry.targetChunkBytes == 2, "geometry target should respect max message size");
+  Require(CountChunksForSize(6, 1, 4, 2) == 3,
+          "actual chunk count should be ceil(total/target), not finalCount");
+
+  const std::vector<uint64_t> totals{1, 4096, 4097, 1024 * 1024, 17 * 1024 * 1024};
+  const std::vector<uint64_t> maxMessages{2, 4096, 65536, 1024 * 1024};
+  for (uint64_t total : totals) {
+    for (uint64_t maxMessage : maxMessages) {
+      ChunkGeometry g = PlanChunkGeometry(total, 4096, 64, maxMessage);
+      Require(g.targetChunkBytes <= maxMessage,
+              "target chunk bytes must not exceed max message size");
+      Require(CountChunksForSize(total, 4096, 64, maxMessage) >= 1,
+              "non-empty requests must emit at least one WR");
+    }
+  }
+}
+
+void CaseChunkCountSplitInvariant() {
+  constexpr size_t kKiB = 1024ull;
+  constexpr size_t kMiB = 1024ull * kKiB;
+  const SizeVec sizes{0, 1, 4096, 4097, 64 * kKiB + 1, kMiB, 3 * kMiB + 7};
+  constexpr size_t kChunkBytes = 64 * kKiB;
+  constexpr int kMaxChunks = 64;
+  constexpr uint64_t kMaxMessageSize = kMiB;
+
+  auto countRange = [&](size_t begin, size_t end) {
+    uint64_t sum = 0;
+    for (size_t i = begin; i < end; ++i) {
+      sum += CountChunksForSize(sizes[i], kChunkBytes, kMaxChunks, kMaxMessageSize);
+    }
+    return sum;
+  };
+
+  const uint64_t full = countRange(0, sizes.size());
+  const std::vector<std::vector<size_t>> partitions{
+      {0, sizes.size()},
+      {0, 1, sizes.size()},
+      {0, 2, 5, sizes.size()},
+      {0, 3, 3, sizes.size()},
+  };
+  for (const auto& cuts : partitions) {
+    uint64_t partitioned = 0;
+    for (size_t i = 1; i < cuts.size(); ++i) {
+      partitioned += countRange(cuts[i - 1], cuts[i]);
+    }
+    Require(partitioned == full, "chunk count must be invariant under worker splits");
+  }
+}
+
+EpPair MakeRejectingEp(uint64_t maxMessageSize, uint32_t maxSge = 8) {
+  EpPair ep{};
+  ep.local.handle.maxSge = maxSge;
+  ep.local.maxMsgSize = maxMessageSize;
+  ep.sqDepth = std::make_shared<std::atomic<int>>(0);
+  ep.maxSqDepth = 0;
+  ep.degraded = std::make_shared<std::atomic<bool>>(false);
+  ep.ledger = std::make_shared<SubmissionLedger>(16);
+  return ep;
+}
+
+void CaseRdmaTransferControlDisableMergeAndOwnsTotal() {
+  EpPairVec eps{MakeRejectingEp(1024 * 1024)};
+  mori::application::RdmaMemoryRegion localMr{
+      .addr = 0x1000000000ull,
+      .lkey = 1,
+      .rkey = 0,
+      .length = 4096,
+  };
+  mori::application::RdmaMemoryRegion remoteMr{
+      .addr = 0x2000000000ull,
+      .lkey = 0,
+      .rkey = 2,
+      .length = 4096,
+  };
+  SizeVec offsets{0, 1024, 2048};
+  SizeVec sizes{1024, 1024, 1024};
+
+  RdmaTransferControl control{};
+  control.chunkBytes = 4096;
+  control.maxChunks = 64;
+  control.creditByWrCount = true;
+  control.ownsTotalBatchSize = true;
+  control.disableMerge = true;
+
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 91, 99);
+  RdmaOpRet ret = RdmaBatchReadWrite(eps, std::vector<mori::application::RdmaMemoryRegion>{localMr},
+                                     std::vector<mori::application::RdmaMemoryRegion>{remoteMr},
+                                     offsets, offsets, sizes, meta, 91, false, -1, control);
+  Require(ret.Failed(), "rejecting EP should fail before post");
+  Require(meta->totalBatchSize == 3, "disableMerge should keep one WR per request");
+  Require(ret.message.find("requested=3") != std::string::npos,
+          "disableMerge path should reserve three WRs; got: " + ret.message);
+
+  control.disableMerge = false;
+  meta = std::make_shared<CqCallbackMeta>(&status, 92, 99);
+  ret = RdmaBatchReadWrite(eps, std::vector<mori::application::RdmaMemoryRegion>{localMr},
+                           std::vector<mori::application::RdmaMemoryRegion>{remoteMr}, offsets,
+                           offsets, sizes, meta, 92, false, -1, control);
+  Require(ret.Failed(), "rejecting EP should fail before post");
+  Require(meta->totalBatchSize == 1, "merge-enabled path should collapse contiguous requests");
+  Require(ret.message.find("requested=1") != std::string::npos,
+          "merge-enabled path should reserve one WR; got: " + ret.message);
+
+  control.disableMerge = true;
+  control.ownsTotalBatchSize = false;
+  meta = std::make_shared<CqCallbackMeta>(&status, 93, 42);
+  ret = RdmaBatchReadWrite(eps, std::vector<mori::application::RdmaMemoryRegion>{localMr},
+                           std::vector<mori::application::RdmaMemoryRegion>{remoteMr}, offsets,
+                           offsets, sizes, meta, 93, false, -1, control);
+  Require(ret.Failed(), "rejecting EP should fail before post");
+  Require(meta->totalBatchSize == 42,
+          "worker control must not overwrite dispatcher-owned totalBatchSize");
+  Require(ret.message.find("requested=3") != std::string::npos,
+          "worker no-merge path should still post one WR per request; got: " + ret.message);
+}
+
+void CaseRdmaRejectsSingleRequestLargerThanUint32() {
+  EpPairVec eps{MakeRejectingEp(1024 * 1024)};
+  const size_t tooLarge = static_cast<size_t>(std::numeric_limits<uint32_t>::max()) + 1;
+  mori::application::RdmaMemoryRegion localMr{
+      .addr = 0x1000000000ull,
+      .lkey = 1,
+      .rkey = 0,
+      .length = tooLarge,
+  };
+  mori::application::RdmaMemoryRegion remoteMr{
+      .addr = 0x2000000000ull,
+      .lkey = 0,
+      .rkey = 2,
+      .length = tooLarge,
+  };
+
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 94, 1);
+  RdmaTransferControl control{};
+  RdmaOpRet ret =
+      RdmaBatchReadWrite(eps, std::vector<mori::application::RdmaMemoryRegion>{localMr},
+                         std::vector<mori::application::RdmaMemoryRegion>{remoteMr}, SizeVec{0},
+                         SizeVec{0}, SizeVec{tooLarge}, meta, 94, false, -1, control);
+
+  Require(ret.Failed(), "single requests larger than uint32 SGE length must be rejected");
+  Require(ret.code == StatusCode::ERR_INVALID_ARGS, "oversized single request status mismatch");
+  Require(ret.message.find("UINT32_MAX") != std::string::npos,
+          "oversized single request error should mention UINT32_MAX");
+}
+
+void CaseChunkingDisabledOversizedWrReturnsError() {
+  constexpr size_t kMiB = 1024ull * 1024ull;
+
+  EpPair ep{};
+  ep.local.handle.maxSge = 2;
+  ep.local.maxMsgSize = 3 * kMiB;
+  EpPairVec eps{ep};
+
+  mori::application::RdmaMemoryRegion localMr{
+      .addr = 0x1000000000ull,
+      .lkey = 1,
+      .rkey = 0,
+      .length = 10 * kMiB,
+  };
+  mori::application::RdmaMemoryRegion remoteMr{
+      .addr = 0x2000000000ull,
+      .lkey = 0,
+      .rkey = 2,
+      .length = 4 * kMiB,
+  };
+  SizeVec localOffsets{0, 8 * kMiB};
+  SizeVec remoteOffsets{0, 2 * kMiB};
+  SizeVec sizes{2 * kMiB, 2 * kMiB};
+
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 77, static_cast<int>(sizes.size()));
+  RdmaOpRet ret =
+      RdmaBatchReadWrite(eps, std::vector<mori::application::RdmaMemoryRegion>{localMr},
+                         std::vector<mori::application::RdmaMemoryRegion>{remoteMr}, localOffsets,
+                         remoteOffsets, sizes, meta, 77, false /* isRead */, -1, 0, 1, false);
+
+  Require(ret.Failed(), "oversized merged WR must fail before ibv_post_send when chunking is off");
+  Require(ret.code == StatusCode::ERR_INVALID_ARGS, "unexpected status for oversized WR");
+  Require(ret.message.find("max_msg_sz") != std::string::npos,
+          "oversized WR error should mention max_msg_sz");
+}
+
+void RequireSgeSegmentCoverage(const std::vector<ChunkedSgeSegment>& segments,
+                               const std::vector<ibv_sge>& sges, uint64_t total) {
+  uint64_t sgeTotal = 0;
+  for (const ibv_sge& sge : sges) sgeTotal += sge.length;
+  Require(sgeTotal == total, "test SGE stream total length mismatch");
+
+  uint64_t expectedOffset = 0;
+  uint64_t totalLength = 0;
+  uint64_t sgeStreamOffset = 0;
+  size_t sgeIndex = 0;
+  for (const ChunkedSgeSegment& segment : segments) {
+    Require(segment.length > 0, "SGE chunk segment length must be non-zero");
+    Require(segment.remoteOffset == expectedOffset, "SGE chunk segments must be contiguous");
+    while (sgeIndex < sges.size() &&
+           segment.remoteOffset >= sgeStreamOffset + sges[sgeIndex].length) {
+      sgeStreamOffset += sges[sgeIndex].length;
+      ++sgeIndex;
+    }
+    Require(sgeIndex < sges.size(), "SGE chunk segment offset exceeds SGE stream");
+
+    const ibv_sge& sge = sges[sgeIndex];
+    const uint64_t sgeOffset = segment.remoteOffset - sgeStreamOffset;
+    Require(sgeOffset + segment.length <= sge.length,
+            "SGE chunk segment must not cross an SGE boundary");
+    Require(segment.localAddr == sge.addr + sgeOffset,
+            "SGE chunk segment local address must match stream offset inside source SGE");
+
+    expectedOffset += segment.length;
+    totalLength += segment.length;
+  }
+  Require(totalLength == total, "SGE chunk segment total length mismatch");
+}
+
+std::vector<ibv_sge> MakeFourGiBTwoSgeStream() {
+  constexpr uint64_t kMiB = 1024ull * 1024ull;
+  constexpr uint64_t kPage = 2ull * kMiB;
+  constexpr uint64_t kFirstLen = 2047ull * kPage;
+  return {
+      ibv_sge{.addr = 0x1000000000ull, .length = static_cast<uint32_t>(kFirstLen), .lkey = 1},
+      ibv_sge{.addr = 0x2000000000ull, .length = static_cast<uint32_t>(kPage), .lkey = 1},
+  };
+}
+
+void CaseSgeStreamChunkingCoversAndRespectsLimits() {
+  constexpr uint64_t kMiB = 1024ull * 1024ull;
+  constexpr uint64_t kTotal = 0x100000000ull;
+  constexpr uint64_t kMaxMessageBytes = 0x80000000ull;
+  std::vector<ibv_sge> sges = MakeFourGiBTwoSgeStream();
+
+  std::vector<ChunkedSgeSegment> segments;
+  PlanSgeStreamChunks(segments, sges, kTotal, 64 * 1024, 64, kMaxMessageBytes);
+
+  RequireSgeSegmentCoverage(segments, sges, kTotal);
+  Require(segments.size() >= 64 && segments.size() <= 65,
+          "4GiB repro should stay near 64 target chunks, allowing one SGE-boundary split");
+  uint32_t maxLen = 0;
+  for (const ChunkedSgeSegment& segment : segments) {
+    Require(segment.length <= kMaxMessageBytes, "segment exceeds max_msg_sz");
+    maxLen = std::max(maxLen, segment.length);
+  }
+  Require(maxLen == 64ull * kMiB, "target chunk geometry should remain 64MiB");
+}
+
+void CaseSgeStreamChunkingNeverCrossesSgeBoundary() {
+  std::vector<ibv_sge> sges = {
+      ibv_sge{.addr = 0x1000000000ull, .length = 30 * 4096, .lkey = 1},
+      ibv_sge{.addr = 0x2000000000ull, .length = 70 * 4096, .lkey = 1},
+  };
+
+  std::vector<ChunkedSgeSegment> segments;
+  PlanSgeStreamChunks(segments, sges, 100 * 4096, 60 * 4096, 2, 1024 * 4096);
+
+  RequireSgeSegmentCoverage(segments, sges, 100 * 4096);
+  Require(segments.size() == 3, "target chunk crossing an SGE boundary should split at boundary");
+  for (const ChunkedSgeSegment& segment : segments) {
+    bool insideAnySge = false;
+    for (const ibv_sge& sge : sges) {
+      const uint64_t sgeBegin = sge.addr;
+      const uint64_t sgeEnd = sge.addr + sge.length;
+      const uint64_t segBegin = segment.localAddr;
+      const uint64_t segEnd = segment.localAddr + segment.length;
+      if (segBegin >= sgeBegin && segEnd <= sgeEnd) {
+        insideAnySge = true;
+        break;
+      }
+    }
+    Require(insideAnySge, "chunk planner must not emit a segment crossing SGE boundaries");
+  }
+}
+
+void CaseChunkingExpandsMultiSgeWrBeforePost() {
+  constexpr size_t kMiB = 1024ull * 1024ull;
+  constexpr size_t kPage = 2 * kMiB;
+  constexpr size_t kFirstLen = 2047 * kPage;
+  constexpr size_t kTotal = kFirstLen + kPage;
+
+  EpPair ep{};
+  ep.local.handle.maxSge = 2;
+  ep.local.maxMsgSize = 0x80000000ull;
+  ep.sqDepth = std::make_shared<std::atomic<int>>(0);
+  ep.maxSqDepth = 0;
+  ep.degraded = std::make_shared<std::atomic<bool>>(false);
+  EpPairVec eps{ep};
+
+  mori::application::RdmaMemoryRegion localMr{
+      .addr = 0x1000000000ull,
+      .lkey = 1,
+      .rkey = 0,
+      .length = kTotal + (8ull * kMiB),
+  };
+  mori::application::RdmaMemoryRegion remoteMr{
+      .addr = 0x2000000000ull,
+      .lkey = 0,
+      .rkey = 2,
+      .length = kTotal,
+  };
+  SizeVec localOffsets{0, 8ull * kMiB};
+  SizeVec remoteOffsets{0, kFirstLen};
+  SizeVec sizes{kFirstLen, kPage};
+
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 88, static_cast<int>(sizes.size()));
+  RdmaOpRet ret = RdmaBatchReadWrite(eps, std::vector<mori::application::RdmaMemoryRegion>{localMr},
+                                     std::vector<mori::application::RdmaMemoryRegion>{remoteMr},
+                                     localOffsets, remoteOffsets, sizes, meta, 88,
+                                     false /* isRead */, -1, 64 * 1024, 64, true);
+
+  Require(ret.Failed(), "zero SQ capacity should reject after chunk expansion");
+  Require(ret.message.find("requested=65") != std::string::npos,
+          "4GiB multi-SGE repro should expand to 65 WRs before posting; got: " + ret.message);
+  Require(meta->totalBatchSize == 65, "chunked completion accounting should use expanded WR count");
+}
+
+void CaseRdmaEndpointCarriesLocalMaxMsgSize() {
+  if (!RdmaBackend::HasActiveDevices()) {
+    throw TestSkip("requires at least one active RDMA device");
+  }
+
+  auto ctx =
+      std::make_unique<mori::application::RdmaContext>(mori::application::RdmaBackendType::IBVerbs);
+  RdmaBackendConfig cfg{};
+  RdmaManager mgr(cfg, ctx.get());
+  (void)ctx.release();
+
+  if (mgr.NumAvailDevices() == 0) throw TestSkip("requires at least one active RDMA device");
+  mori::application::RdmaEndpoint endpoint = mgr.CreateEndpoint(0);
+  const ibv_port_attr* portAttr =
+      mgr.GetRdmaDeviceContext(0)->GetRdmaDevice()->GetPortAttr(endpoint.handle.portId);
+
+  Require(portAttr != nullptr, "port attr must be available");
+  Require(portAttr->max_msg_sz > 0, "port max_msg_sz must be non-zero");
+  Require(endpoint.maxMsgSize == portAttr->max_msg_sz,
+          "endpoint maxMsgSize should match local device max_msg_sz");
+}
+
 void CaseBuildDesiredQpCounts() {
   {
     auto counts = BuildDesiredQpCounts(4, 3);
@@ -403,7 +786,7 @@ void CaseUsesInlineOnly() {
   Require(!UsesInlineOnly(cfg), "default config should keep executor-compatible path");
 
   cfg.enableTransferChunking = true;
-  Require(UsesInlineOnly(cfg), "chunking should force inline-only path");
+  Require(!UsesInlineOnly(cfg), "single-NIC chunking should keep executor-compatible path");
 
   cfg.enableTransferChunking = false;
   cfg.numNicsPerTransfer = 2;
@@ -1263,6 +1646,21 @@ int main(int argc, char* argv[]) {
       {"rdma_backend_config_chunking_fields", CaseRdmaBackendConfigChunkingFields},
       {"resolve_requested_nics", CaseResolveRequestedNics},
       {"plan_chunks_boundaries", CasePlanChunksBoundaries},
+      {"chunk_geometry_single_sge_count_matches_planner",
+       CaseChunkGeometrySingleSgeCountMatchesPlanner},
+      {"chunk_geometry_properties", CaseChunkGeometryProperties},
+      {"chunk_count_split_invariant", CaseChunkCountSplitInvariant},
+      {"rdma_transfer_control_disable_merge_and_owns_total",
+       CaseRdmaTransferControlDisableMergeAndOwnsTotal},
+      {"rdma_rejects_single_request_larger_than_uint32",
+       CaseRdmaRejectsSingleRequestLargerThanUint32},
+      {"chunking_disabled_oversized_wr_returns_error", CaseChunkingDisabledOversizedWrReturnsError},
+      {"sge_stream_chunking_covers_and_respects_limits",
+       CaseSgeStreamChunkingCoversAndRespectsLimits},
+      {"sge_stream_chunking_never_crosses_sge_boundary",
+       CaseSgeStreamChunkingNeverCrossesSgeBoundary},
+      {"chunking_expands_multi_sge_wr_before_post", CaseChunkingExpandsMultiSgeWrBeforePost},
+      {"rdma_endpoint_carries_local_max_msg_size", CaseRdmaEndpointCarriesLocalMaxMsgSize},
       {"build_desired_qp_counts", CaseBuildDesiredQpCounts},
       {"interleave_endpoints_by_local_device", CaseInterleaveEndpointsByLocalDevice},
       {"uses_inline_only", CaseUsesInlineOnly},

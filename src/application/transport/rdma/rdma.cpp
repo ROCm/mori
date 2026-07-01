@@ -40,6 +40,38 @@
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 #include "mori/utils/mori_log.hpp"
 
+// mori::core::WcStatus is a device-safe mirror of ibverbs' ibv_wc_status so device
+// TUs need not include <infiniband/verbs.h>. This host TU sees both — guard the
+// 1:1 value parity here so any future drift is a compile error.
+#define MORI_WC_STATUS_PARITY(x)                                                        \
+  static_assert(static_cast<int>(::mori::core::WC_##x) == static_cast<int>(IBV_WC_##x), \
+                "mori::core::WcStatus drifted from ibv_wc_status")
+MORI_WC_STATUS_PARITY(SUCCESS);
+MORI_WC_STATUS_PARITY(LOC_LEN_ERR);
+MORI_WC_STATUS_PARITY(LOC_QP_OP_ERR);
+MORI_WC_STATUS_PARITY(LOC_EEC_OP_ERR);
+MORI_WC_STATUS_PARITY(LOC_PROT_ERR);
+MORI_WC_STATUS_PARITY(WR_FLUSH_ERR);
+MORI_WC_STATUS_PARITY(MW_BIND_ERR);
+MORI_WC_STATUS_PARITY(BAD_RESP_ERR);
+MORI_WC_STATUS_PARITY(LOC_ACCESS_ERR);
+MORI_WC_STATUS_PARITY(REM_INV_REQ_ERR);
+MORI_WC_STATUS_PARITY(REM_ACCESS_ERR);
+MORI_WC_STATUS_PARITY(REM_OP_ERR);
+MORI_WC_STATUS_PARITY(RETRY_EXC_ERR);
+MORI_WC_STATUS_PARITY(RNR_RETRY_EXC_ERR);
+MORI_WC_STATUS_PARITY(LOC_RDD_VIOL_ERR);
+MORI_WC_STATUS_PARITY(REM_INV_RD_REQ_ERR);
+MORI_WC_STATUS_PARITY(REM_ABORT_ERR);
+MORI_WC_STATUS_PARITY(INV_EECN_ERR);
+MORI_WC_STATUS_PARITY(INV_EEC_STATE_ERR);
+MORI_WC_STATUS_PARITY(FATAL_ERR);
+MORI_WC_STATUS_PARITY(RESP_TIMEOUT_ERR);
+MORI_WC_STATUS_PARITY(GENERAL_ERR);
+MORI_WC_STATUS_PARITY(TM_ERR);
+MORI_WC_STATUS_PARITY(TM_RNDV_INCOMPLETE);
+#undef MORI_WC_STATUS_PARITY
+
 namespace mori {
 namespace application {
 
@@ -385,6 +417,17 @@ void RdmaDeviceContext::DeregisterRdmaMemoryRegion(void* ptr) {
   mrPool.erase(ptr);
 }
 
+bool RdmaDeviceContext::DestroyRdmaEndpointNoThrow(const RdmaEndpoint& ep) noexcept {
+  try {
+    MORI_APP_WARN(
+        "DestroyRdmaEndpointNoThrow is unsupported for provider vendorId={} qpn={} cq={}; "
+        "leaving endpoint for normal context teardown",
+        static_cast<uint32_t>(ep.vendorId), ep.handle.qpn, static_cast<void*>(ep.ibvHandle.cq));
+  } catch (...) {
+  }
+  return false;
+}
+
 ibv_srq* RdmaDeviceContext::CreateRdmaSrqIfNx(const RdmaEndpointConfig& config) {
   assert(config.maxMsgSge <= GetRdmaDevice()->GetDeviceAttr()->orig_attr.max_sge);
   if (srq == nullptr) {
@@ -515,7 +558,12 @@ ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList& devices) {
 RdmaContext::RdmaContext(RdmaBackendType backendType) : backendType(backendType) {
   deviceList = ibv_get_device_list(&nums_device);
   MORI_APP_TRACE("ibv_get_device_list nums_device: {}", nums_device);
-  Initialize();
+  // ibv_get_device_list returns nullptr when libibverbs cannot be loaded (see
+  // ibv_shim.cpp) or device enumeration fails. Treat this the same as "no RDMA
+  // devices": leave rdmaDeviceList empty instead of dereferencing a null array
+  // in Initialize(). Single-node / intranode runs need no RDMA device and the
+  // upper layers already handle an empty list gracefully.
+  if (deviceList != nullptr) Initialize();
 }
 
 RdmaContext::~RdmaContext() {

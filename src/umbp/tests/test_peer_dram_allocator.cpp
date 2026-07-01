@@ -517,6 +517,30 @@ TEST(PeerDramAllocator, BatchResolveMixedHitsAndMisses) {
   EXPECT_FALSE(results[3].found);
 }
 
+TEST(PeerDramAllocator, BatchResolveIncludeDescsFalseSkipsDescs) {
+  auto a = MakeAllocator();
+  auto p_hit = AllocateOk(*a, "hit", kPageSize * 5, TierType::DRAM);
+  ASSERT_TRUE(p_hit.has_value());
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p_hit->slot_id, "hit", committed_bytes));
+  a->DrainPendingEvents();
+
+  auto ref_hit = a->Resolve("hit");
+  ASSERT_TRUE(ref_hit.found);
+
+  auto results = a->BatchResolve({"hit", "ghost"}, /*include_descs=*/false);
+  ASSERT_EQ(results.size(), 2u);
+
+  EXPECT_TRUE(results[0].found);
+  EXPECT_EQ(results[0].tier, ref_hit.tier);
+  EXPECT_EQ(results[0].pages, ref_hit.pages);
+  EXPECT_EQ(results[0].size, ref_hit.size);
+  EXPECT_TRUE(results[0].descs.empty());
+
+  EXPECT_FALSE(results[1].found);
+  EXPECT_TRUE(results[1].descs.empty());
+}
+
 TEST(PeerDramAllocator, BatchResolveExtendsLeaseForHitsOnly) {
   auto a = std::make_unique<PeerDramAllocator>(kPageSize, MakeDramCfg(), EmptyCfg(),
                                                /*pending_ttl=*/std::chrono::milliseconds{5000},
@@ -894,6 +918,69 @@ TEST(PeerDramAllocator, OwnedKeyCountByTierMultiTier) {
   EXPECT_EQ(counts[TierType::DRAM], 2u);
   EXPECT_EQ(counts[TierType::HBM], 1u);
   EXPECT_EQ(counts[TierType::SSD], 0u);
+}
+
+// ---- Auto-flush: cb fires exactly when the outbox first reaches threshold ----
+TEST(PeerDramAllocatorAutoFlush, FiresAtThreshold) {
+  auto a = MakeAllocator();
+  int fires = 0;
+  a->SetAutoFlushHook(3, [&] { ++fires; });
+
+  for (int i = 0; i < 2; ++i) {
+    const std::string k = "af-" + std::to_string(i);
+    auto p = AllocateOk(*a, k, kPageSize, TierType::DRAM);
+    ASSERT_TRUE(p.has_value());
+    uint64_t b = 0;
+    ASSERT_TRUE(a->Commit(p->slot_id, k, b));
+  }
+  EXPECT_EQ(fires, 0);  // below threshold -> no fire
+
+  auto p = AllocateOk(*a, "af-2", kPageSize, TierType::DRAM);
+  ASSERT_TRUE(p.has_value());
+  uint64_t b = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "af-2", b));
+  EXPECT_EQ(fires, 1);  // reached threshold -> exactly one fire
+}
+
+// ---- No hook registered -> auto-flush disabled by default (never fires) ----
+TEST(PeerDramAllocatorAutoFlush, NoHookNoFire) {
+  auto a = MakeAllocator();
+  for (int i = 0; i < 10; ++i) {
+    const std::string k = "nh-" + std::to_string(i);
+    auto p = AllocateOk(*a, k, kPageSize, TierType::DRAM);
+    ASSERT_TRUE(p.has_value());
+    uint64_t b = 0;
+    ASSERT_TRUE(a->Commit(p->slot_id, k, b));
+  }
+  SUCCEED();  // default threshold = SIZE_MAX, empty cb: no crash, no fire
+}
+
+// ---- Full-sync snapshot returns all owned AND atomically clears the outbox ----
+TEST(PeerDramAllocatorAutoFlush, FullSyncSnapshotClearsOutbox) {
+  auto a = MakeAllocator();
+  for (int i = 0; i < 3; ++i) {
+    const std::string k = "fs-" + std::to_string(i);
+    auto p = AllocateOk(*a, k, kPageSize, TierType::DRAM);
+    ASSERT_TRUE(p.has_value());
+    uint64_t b = 0;
+    ASSERT_TRUE(a->Commit(p->slot_id, k, b));
+  }
+  auto snap = a->SnapshotOwnedKeysForFullSync();
+  EXPECT_EQ(snap.size(), 3u);
+  for (const auto& ev : snap) EXPECT_EQ(ev.kind, KvEvent::Kind::ADD);
+
+  // The snapshot is authoritative: the queued ADDs must NOT be re-shipped.
+  EXPECT_TRUE(a->DrainPendingEvents().empty());
+
+  // A commit AFTER the snapshot is a fresh delta (only genuinely new events).
+  auto p = AllocateOk(*a, "fs-new", kPageSize, TierType::DRAM);
+  ASSERT_TRUE(p.has_value());
+  uint64_t b = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "fs-new", b));
+  auto delta = a->DrainPendingEvents();
+  ASSERT_EQ(delta.size(), 1u);
+  EXPECT_EQ(delta[0].key, "fs-new");
+  EXPECT_EQ(delta[0].kind, KvEvent::Kind::ADD);
 }
 
 }  // namespace mori::umbp

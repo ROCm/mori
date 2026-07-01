@@ -23,6 +23,7 @@
 
 #include <cassert>
 
+#include "mori/application/transport/sdma/anvil.hpp"  // CHECK_HIP_ERROR
 #include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem.hpp"
 

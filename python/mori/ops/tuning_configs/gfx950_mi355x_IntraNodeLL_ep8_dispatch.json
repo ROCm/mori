@@ -10,11 +10,11 @@
       "dtype": "bf16",
       "num_tokens": 1,
       "hidden_dim": 7168,
-      "block_num": 4,
+      "block_num": 1,
       "rdma_block_num": 0,
-      "warp_per_block": 4,
+      "warp_per_block": 9,
       "bandwidth_gbps": 2.56,
-      "latency_us": 27.7
+      "latency_us": 11.6
     },
     {
       "dtype": "bf16",
@@ -22,9 +22,9 @@
       "hidden_dim": 7168,
       "block_num": 32,
       "rdma_block_num": 0,
-      "warp_per_block": 16,
+      "warp_per_block": 9,
       "bandwidth_gbps": 79.9,
-      "latency_us": 30.9
+      "latency_us": 15.03
     },
     {
       "dtype": "bf16",
@@ -32,9 +32,9 @@
       "hidden_dim": 7168,
       "block_num": 64,
       "rdma_block_num": 0,
-      "warp_per_block": 16,
+      "warp_per_block": 9,
       "bandwidth_gbps": 145.95,
-      "latency_us": 34.3
+      "latency_us": 23
     }
   ]
 }

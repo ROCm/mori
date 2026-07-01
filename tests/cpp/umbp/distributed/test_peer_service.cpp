@@ -21,7 +21,11 @@
 // SOFTWARE.
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -32,21 +36,42 @@
 
 #include "umbp/common/config.h"
 #include "umbp/distributed/config.h"
+#include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/peer/peer_service.h"
 #include "umbp/distributed/peer/peer_ssd_manager.h"
-#include "umbp/distributed/pool_client.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
 namespace {
 
 constexpr size_t kStagingSize = 4096;
+constexpr uint64_t kPageSize = 4096;
 constexpr uint16_t kBasePort = 50200;
 constexpr int kNumReadSlots = 4;
 constexpr int kLeaseTimeoutS = 2;
 
+// Ask the kernel for a currently-free ephemeral port.  PeerServiceServer binds
+// this port directly, so a hard-coded base (kBasePort) collides with concurrent
+// test processes / leftover servers on a shared (self-hosted CI) host and makes
+// the suite flaky.
 static uint16_t AllocPort() {
-  static std::atomic<uint16_t> next{kBasePort};
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd >= 0) {
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = 0;
+    socklen_t len = sizeof(addr);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
+      uint16_t port = ntohs(addr.sin_port);
+      ::close(fd);
+      return port;
+    }
+    ::close(fd);
+  }
+  static std::atomic<uint16_t> next{
+      static_cast<uint16_t>(kBasePort + (static_cast<unsigned>(::getpid()) % 4000))};
   return next.fetch_add(1);
 }
 
@@ -73,17 +98,20 @@ class PeerServiceSlotTest : public ::testing::Test {
     ssd_cfg.ssd.io.backend = UMBPIoBackend::Posix;
     peer_ssd_ = std::make_unique<PeerSsdManager>(ssd_cfg);
 
-    PoolClientConfig pc_cfg;
-    pc_cfg.master_config.master_address = "localhost:9999";
-    pc_cfg.master_config.node_id = "test_node";
-    coordinator_ = std::make_unique<PoolClient>(std::move(pc_cfg));
+    // Standalone DRAM allocator: the SSD-path RPCs exercised here never
+    // allocate DRAM, but PeerServiceServer requires a non-null allocator.
+    // An empty TierConfig (no DRAM/HBM buffers) is sufficient and avoids
+    // standing up a PoolClient / connecting to a master.
+    dram_alloc_ = std::make_unique<PeerDramAllocator>(kPageSize, PeerDramAllocator::TierConfig{},
+                                                      PeerDramAllocator::TierConfig{},
+                                                      std::chrono::milliseconds{1000});
 
     port_ = AllocPort();
 
     server_ = std::make_unique<PeerServiceServer>(
-        coordinator_->DramAllocator(), peer_ssd_.get(), staging_buffer_, kStagingSize,
-        ssd_staging_mem_desc_, kNumReadSlots, kLeaseTimeoutS, std::vector<uint8_t>{},
-        &coordinator_->Master());
+        dram_alloc_.get(), peer_ssd_.get(), staging_buffer_, kStagingSize, ssd_staging_mem_desc_,
+        kNumReadSlots, kLeaseTimeoutS, std::vector<uint8_t>{},
+        /*master_client=*/nullptr);
     server_->Start(port_);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
@@ -95,7 +123,7 @@ class PeerServiceSlotTest : public ::testing::Test {
   void TearDown() override {
     server_->Stop();
     server_.reset();
-    coordinator_.reset();
+    dram_alloc_.reset();
     peer_ssd_.reset();
     std::free(staging_buffer_);
     std::filesystem::remove_all(ssd_dir_);
@@ -110,7 +138,7 @@ class PeerServiceSlotTest : public ::testing::Test {
   std::vector<uint8_t> ssd_staging_mem_desc_;
   uint16_t port_ = 0;
   std::unique_ptr<PeerSsdManager> peer_ssd_;
-  std::unique_ptr<PoolClient> coordinator_;
+  std::unique_ptr<PeerDramAllocator> dram_alloc_;
   std::unique_ptr<PeerServiceServer> server_;
   std::unique_ptr<::umbp::UMBPPeer::Stub> stub_;
 };

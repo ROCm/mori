@@ -213,6 +213,19 @@ void RegisterMoriCcl(pybind11::module_& m) {
           },
           py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
       .def(
+          "prepare_sync_param_contiguous",
+          [](AllgatherU32& self, uintptr_t input, uintptr_t output, size_t count,
+             uintptr_t split_sizes, uintptr_t split_offsets, size_t split_count,
+             int64_t stream) -> int64_t {
+            return self.prepare_sync_param_contiguous(
+                reinterpret_cast<uint32_t*>(input), reinterpret_cast<uint32_t*>(output), count,
+                reinterpret_cast<const size_t*>(split_sizes),
+                reinterpret_cast<const size_t*>(split_offsets), split_count,
+                reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("split_sizes_ptr"),
+          py::arg("split_offsets_ptr"), py::arg("split_count"), py::arg("stream"))
+      .def(
           "finish_sync",
           [](AllgatherU32& self, uintptr_t output, size_t count, int64_t stream) -> double {
             return self.finish_sync(reinterpret_cast<uint32_t*>(output), count,
@@ -228,6 +241,19 @@ void RegisterMoriCcl(pybind11::module_& m) {
                                             reinterpret_cast<hipStream_t>(stream));
           },
           py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
+      .def(
+          "prepare_async_start_param_contiguous",
+          [](AllgatherU32& self, uintptr_t input, uintptr_t output, size_t count,
+             uintptr_t split_sizes, uintptr_t split_offsets, size_t split_count,
+             int64_t stream) -> int64_t {
+            return self.prepare_async_start_param_contiguous(
+                reinterpret_cast<uint32_t*>(input), reinterpret_cast<uint32_t*>(output), count,
+                reinterpret_cast<const size_t*>(split_sizes),
+                reinterpret_cast<const size_t*>(split_offsets), split_count,
+                reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("split_sizes_ptr"),
+          py::arg("split_offsets_ptr"), py::arg("split_count"), py::arg("stream"))
       .def("after_async_start", &AllgatherU32::after_async_start)
       .def(
           "prepare_async_wait",
