@@ -32,13 +32,13 @@
 #include <vector>
 
 #include "umbp/distributed/master/evict_strategy.h"
-#include "umbp/distributed/master/global_block_index.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+// EvictionCandidate::last_accessed_at is a system_clock time_point.
+using Clock = std::chrono::system_clock;
 
 EvictionCandidate MakeCandidate(const std::string& key, const std::string& node, TierType tier,
                                 uint64_t size, Clock::time_point accessed) {
