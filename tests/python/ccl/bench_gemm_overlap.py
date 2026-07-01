@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
-# the benchmark (THE point of SDMA: 通算并行 compute/comm overlap).
+# the benchmark (THE point of SDMA: compute/comm overlap).
 #
 # Runs a GEMM loop on a dedicated COMPUTE stream concurrently with an AllGather
 # and measures the OVERLAPPED TOTAL time (gemm + AG), for:
@@ -75,7 +75,7 @@ def _bench_size(handle, dtype, numel, rank, world_size, device, reps, warmup,
 
     # GEMM operands. Default bf16 so the matmul maps to the MFMA matrix cores:
     # that path is COMPUTE(CU)-bound with low HBM traffic (arithmetic intensity
-    # ~gemm_n/3 flop/byte), which is the textbook 通算并行 scenario. It isolates
+    # ~gemm_n/3 flop/byte), which is the textbook compute/comm-overlap scenario. It isolates
     # the SDMA advantage cleanly: RCCL's AG steals CUs from the GEMM, while
     # mori's SDMA moves intra-node bytes on the copy engines and leaves the CUs
     # (and thus the GEMM) untouched. An fp32 GEMM instead contends on HBM
@@ -115,7 +115,7 @@ def _bench_size(handle, dtype, numel, rank, world_size, device, reps, warmup,
         # iters~1 (the AG solo time is tiny), so there is no compute on the CUs
         # for RCCL's AG to steal from and the total just measures AG launch
         # latency (where mori's fixed overhead loses). A fixed, meaningful GEMM
-        # is the textbook 通算并行 case: the same CU load is present at EVERY AG
+        # is the textbook compute/comm-overlap case: the same CU load is present at EVERY AG
         # size, so RCCL's CU-stealing AG contends while mori's copy-engine SDMA
         # does not — making the no-CU-contention advantage visible at 4/8MB too.
         iters = gemm_iters_fixed
@@ -223,7 +223,7 @@ def main():
     p.add_argument("--gemm-dtype", type=str, default="bf16",
                    choices=["bf16", "fp16", "fp32"],
                    help="GEMM operand dtype; bf16/fp16 use MFMA matrix cores "
-                        "(compute/CU-bound, the clean 通算并行 contention case)")
+                        "(compute/CU-bound, the clean compute/comm-overlap contention case)")
     p.add_argument("--gemm-iters", type=int, default=0,
                    help="fixed GEMM loop count for ALL sizes (0=auto-tune to "
                         "match AG solo time). A fixed value models a real "

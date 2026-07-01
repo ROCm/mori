@@ -7,7 +7,7 @@ Adds a hierarchical AllGather to MORI-CCL (`mori.ccl.HierAllGather`, an
 the GPU **SDMA copy engines** (XGMI) and moves inter-node traffic over **RDMA**
 (NIC).
 
-Motivation is **compute/communication overlap (通算并行)**: the collective runs
+Motivation is **compute/communication overlap**: the collective runs
 on the dedicated SDMA copy engines instead of the compute units, so an AllGather
 issued concurrently with a GEMM does not steal CUs from the GEMM — parity with
 the native (non-SDMA) path standalone, and a strict win when overlapped with
