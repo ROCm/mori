@@ -71,6 +71,7 @@ _configure_packaged_spdk_proxy()
 _configure_packaged_umbp_master()
 
 from mori.cpp import (
+    CacheRemoteAdmission,
     UMBPClient,
     UMBPConfig,
     UMBPCopyPipelineConfig,
@@ -92,6 +93,7 @@ from mori.cpp import (
 )
 
 __all__ = [
+    "CacheRemoteAdmission",
     "UMBPClient",
     "UMBPConfig",
     "UMBPCopyPipelineConfig",

@@ -184,6 +184,29 @@ struct UMBPIoEngineConfig {
   uint16_t port = 0;  // RDMA engine port; 0 = OS-assigned ephemeral port (formerly io_engine_port)
 };
 
+// Admission policy for re-caching remotely-fetched blocks locally.
+enum class CacheRemoteAdmission : int {
+  SIZE = 0,    // admit if block size <= admission_max_block_bytes AND DRAM has room
+  NEVER = 1,   // never re-cache (equivalent to cache_remote_fetches = false)
+  ALWAYS = 2,  // always attempt re-cache (skip size gate)
+};
+
+// Pure admission predicate for the remote-fetch re-cache gate: decides whether a
+// block of `size` bytes is eligible for local re-caching under the given policy,
+// independent of runtime state (DRAM-capacity enforcement is left to the
+// allocator). Extracted so the gate is unit-testable without a live PoolClient;
+// used by PoolClient::MaybeReCacheAfterRemote.
+inline bool ShouldAdmitReCache(bool cache_remote_fetches, CacheRemoteAdmission policy,
+                               size_t admission_max_block_bytes, size_t size) {
+  if (!cache_remote_fetches) return false;
+  if (size == 0) return false;
+  if (policy == CacheRemoteAdmission::NEVER) return false;
+  if (policy == CacheRemoteAdmission::SIZE) {
+    if (admission_max_block_bytes > 0 && size > admission_max_block_bytes) return false;
+  }
+  return true;  // ALWAYS, or SIZE within cap
+}
+
 // User-facing distributed configuration. Set UMBPConfig::distributed to enable
 // distributed mode. Internally translated to PoolClientConfig by DistributedClient.
 struct UMBPDistributedConfig {
@@ -203,6 +226,13 @@ struct UMBPDistributedConfig {
   uint16_t peer_service_port = 0;  // gRPC peer service port
 
   bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
+
+  // Admission gate for re-caching. Only consulted when cache_remote_fetches is true.
+  CacheRemoteAdmission cache_remote_admission = CacheRemoteAdmission::SIZE;
+
+  // Maximum block size (bytes) eligible for local re-cache under SIZE policy.
+  // 0 means unlimited (no size gate). Default 16 MB.
+  size_t admission_max_block_bytes = 16ULL * 1024 * 1024;
 
   // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
   // tier.  Reported via RegisterClient.  Same value applies to both DRAM
