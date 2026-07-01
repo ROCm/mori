@@ -19,6 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <pybind11/numpy.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -35,6 +36,28 @@ namespace io {
 void* FabricMalloc(size_t size, int device);
 void FabricFree(void* ptr);
 }  // namespace io
+
+namespace {
+
+// Accepts either a numpy array or any Python sequence (list, tuple, ...). When the caller
+// already passes a contiguous numpy array of the matching dtype, this is a single memcpy
+// instead of pybind11/stl.h's generic per-element Python object iteration/conversion.
+using SizeArray = py::array_t<size_t, py::array::c_style | py::array::forcecast>;
+
+mori::io::SizeVec SizeArrayToVec(const SizeArray& arr) {
+  py::buffer_info info = arr.request();
+  const size_t* ptr = static_cast<const size_t*>(info.ptr);
+  return mori::io::SizeVec(ptr, ptr + info.size);
+}
+
+mori::io::BatchSizeVec SizeArraysToBatchVec(const std::vector<SizeArray>& arrs) {
+  mori::io::BatchSizeVec out;
+  out.reserve(arrs.size());
+  for (const auto& a : arrs) out.push_back(SizeArrayToVec(a));
+  return out;
+}
+
+}  // namespace
 
 void RegisterMoriIo(pybind11::module_& m) {
   m.def("set_log_level", &mori::io::SetLogLevel);
@@ -133,6 +156,8 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("SetMessage", &mori::io::TransferStatus::SetMessage)
       .def("Wait", &mori::io::TransferStatus::Wait, py::call_guard<py::gil_scoped_release>())
       .def("WaitFor", &mori::io::TransferStatus::WaitFor, py::arg("timeout_ms") = -1,
+           py::call_guard<py::gil_scoped_release>())
+      .def("WaitBusy", &mori::io::TransferStatus::WaitBusy, py::arg("timeout_ms") = -1,
            py::call_guard<py::gil_scoped_release>());
 
   py::class_<mori::io::EngineDesc>(m, "EngineDesc")
@@ -191,11 +216,27 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("AllocateTransferUniqueId", &mori::io::IOEngineSession::AllocateTransferUniqueId,
            py::call_guard<py::gil_scoped_release>())
       .def("Read", &mori::io::IOEngineSession::Read, py::call_guard<py::gil_scoped_release>())
-      .def("BatchRead", &mori::io::IOEngineSession::BatchRead,
-           py::call_guard<py::gil_scoped_release>())
+      .def("BatchRead",
+           [](mori::io::IOEngineSession& self, const SizeArray& localOffsets,
+              const SizeArray& remoteOffsets, const SizeArray& sizes,
+              mori::io::TransferStatus* status, mori::io::TransferUniqueId id) {
+             mori::io::SizeVec lo = SizeArrayToVec(localOffsets);
+             mori::io::SizeVec ro = SizeArrayToVec(remoteOffsets);
+             mori::io::SizeVec sz = SizeArrayToVec(sizes);
+             py::gil_scoped_release release;
+             self.BatchRead(lo, ro, sz, status, id);
+           })
       .def("Write", &mori::io::IOEngineSession::Write, py::call_guard<py::gil_scoped_release>())
-      .def("BatchWrite", &mori::io::IOEngineSession::BatchWrite,
-           py::call_guard<py::gil_scoped_release>())
+      .def("BatchWrite",
+           [](mori::io::IOEngineSession& self, const SizeArray& localOffsets,
+              const SizeArray& remoteOffsets, const SizeArray& sizes,
+              mori::io::TransferStatus* status, mori::io::TransferUniqueId id) {
+             mori::io::SizeVec lo = SizeArrayToVec(localOffsets);
+             mori::io::SizeVec ro = SizeArrayToVec(remoteOffsets);
+             mori::io::SizeVec sz = SizeArrayToVec(sizes);
+             py::gil_scoped_release release;
+             self.BatchWrite(lo, ro, sz, status, id);
+           })
       .def("Alive", &mori::io::IOEngineSession::Alive);
 
   py::class_<mori::io::IOEngine>(m, "IOEngine")
@@ -210,9 +251,29 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("AllocateTransferUniqueId", &mori::io::IOEngine::AllocateTransferUniqueId,
            py::call_guard<py::gil_scoped_release>())
       .def("Read", &mori::io::IOEngine::Read, py::call_guard<py::gil_scoped_release>())
-      .def("BatchRead", &mori::io::IOEngine::BatchRead, py::call_guard<py::gil_scoped_release>())
+      .def("BatchRead",
+           [](mori::io::IOEngine& self, const mori::io::MemDescVec& localDest,
+              const std::vector<SizeArray>& localOffsets, const mori::io::MemDescVec& remoteSrc,
+              const std::vector<SizeArray>& remoteOffsets, const std::vector<SizeArray>& sizes,
+              mori::io::TransferStatusPtrVec& status, mori::io::TransferUniqueIdVec& ids) {
+             mori::io::BatchSizeVec lo = SizeArraysToBatchVec(localOffsets);
+             mori::io::BatchSizeVec ro = SizeArraysToBatchVec(remoteOffsets);
+             mori::io::BatchSizeVec sz = SizeArraysToBatchVec(sizes);
+             py::gil_scoped_release release;
+             self.BatchRead(localDest, lo, remoteSrc, ro, sz, status, ids);
+           })
       .def("Write", &mori::io::IOEngine::Write, py::call_guard<py::gil_scoped_release>())
-      .def("BatchWrite", &mori::io::IOEngine::BatchWrite, py::call_guard<py::gil_scoped_release>())
+      .def("BatchWrite",
+           [](mori::io::IOEngine& self, const mori::io::MemDescVec& localSrc,
+              const std::vector<SizeArray>& localOffsets, const mori::io::MemDescVec& remoteDest,
+              const std::vector<SizeArray>& remoteOffsets, const std::vector<SizeArray>& sizes,
+              mori::io::TransferStatusPtrVec& status, mori::io::TransferUniqueIdVec& ids) {
+             mori::io::BatchSizeVec lo = SizeArraysToBatchVec(localOffsets);
+             mori::io::BatchSizeVec ro = SizeArraysToBatchVec(remoteOffsets);
+             mori::io::BatchSizeVec sz = SizeArraysToBatchVec(sizes);
+             py::gil_scoped_release release;
+             self.BatchWrite(localSrc, lo, remoteDest, ro, sz, status, ids);
+           })
       .def("CreateSession", &mori::io::IOEngine::CreateSession)
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus,
            py::call_guard<py::gil_scoped_release>())

@@ -188,6 +188,34 @@ struct TransferStatus {
 
   void Wait() { (void)WaitFor(-1); }
 
+  // Busy-poll (spin) on the completion flag until the transfer finishes,
+  // instead of blocking on the condition variable like WaitFor(). This trades a
+  // CPU core for latency: it avoids the cross-thread cv.notify -> futex ->
+  // scheduler wakeup (~5-10us) that WaitFor() pays when a dedicated poller
+  // thread (NotifManager::MainLoop) delivers the completion. The waiter spins on
+  // the same atomic status flag that the poller thread stores via Update(), so
+  // it observes SUCCESS with only cross-thread atomic-visibility latency (~1us).
+  //
+  // timeoutMs < 0 spins indefinitely, == 0 polls once, > 0 spins up to the
+  // deadline. The returned code may still be IN_PROGRESS when a bounded wait
+  // times out.
+  StatusCode WaitBusy(int timeoutMs = -1) {
+    StatusCode current = code.load(std::memory_order_acquire);
+    if (current != StatusCode::IN_PROGRESS) return current;
+
+    const bool bounded = timeoutMs > 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(bounded ? timeoutMs : 0);
+    for (;;) {
+      PollProgress();
+      current = code.load(std::memory_order_acquire);
+      if (current != StatusCode::IN_PROGRESS) return current;
+      if (timeoutMs == 0) return current;
+      if (bounded && std::chrono::steady_clock::now() >= deadline) return current;
+      CpuRelax();
+    }
+  }
+
   // timeoutMs < 0 waits indefinitely, timeoutMs == 0 polls once, timeoutMs > 0
   // waits up to the requested deadline. The returned code may still be
   // IN_PROGRESS when a bounded wait times out.
@@ -228,6 +256,18 @@ struct TransferStatus {
   void SetProgressCallback(std::function<void()> cb) { progressCallback = std::move(cb); }
 
  private:
+  // Spin-loop pause hint: relaxes the core (lowers power / frees SMT resources)
+  // without yielding the OS thread, keeping the waiter hot for low-latency spin.
+  static inline void CpuRelax() {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    std::atomic_thread_fence(std::memory_order_acquire);
+#endif
+  }
+
   StatusCode CodeWithProgress() {
     PollProgress();
     return code.load(std::memory_order_acquire);
