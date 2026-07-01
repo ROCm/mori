@@ -220,5 +220,6 @@ gtest_discover_tests(test_ssd_reliability)
 
 # cache_remote_fetches admission-gate unit test (hermetic; no GPU/RDMA/master)
 add_executable(test_cache_remote_admission test_cache_remote_admission.cpp)
-target_link_libraries(test_cache_remote_admission PRIVATE umbp_common GTest::gtest_main)
+target_link_libraries(test_cache_remote_admission PRIVATE umbp_common
+                                                          GTest::gtest_main)
 gtest_discover_tests(test_cache_remote_admission)
