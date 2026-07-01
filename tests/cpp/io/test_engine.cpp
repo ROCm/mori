@@ -45,6 +45,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/io/io.hpp"
+#include "mori/utils/env_utils.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/rdma/common.hpp"
 
@@ -245,6 +246,45 @@ void CaseSubmissionLedgerBasic() {
   Require(postedMeta != nullptr, "posted record should survive recovery");
   Require(postedBatch == 10, "posted record batch size mismatch");
   Require(sqDepth2.load(std::memory_order_relaxed) == 5, "sq depth after posted CQE release");
+
+  SubmissionLedger ledger3(kNotifPerQp);
+  std::atomic<int> sqDepth3{7};
+  TransferStatus segmentedStatus;
+  auto meta3 = std::make_shared<CqCallbackMeta>(&segmentedStatus, 303, 10);
+  std::array<uint64_t, 3> segmentedIds{
+      ledger3.Insert(2, true, meta3, 3),
+      ledger3.Insert(4, true, meta3, 5),
+      ledger3.Insert(1, true, meta3, 2),
+  };
+  std::array<int, 3> expectedBatchSizes{3, 5, 2};
+  for (size_t i = 0; i < segmentedIds.size(); ++i) {
+    int batch = 0;
+    auto released = ledger3.ReleaseByCqe(segmentedIds[i], &sqDepth3, &batch);
+    Require(released.get() == meta3.get(), "segmented release should return original meta");
+    Require(batch == expectedBatchSizes[i], "segmented batch size mismatch");
+    uint32_t finishedBefore = meta3->finishedBatchSize.fetch_add(batch);
+    if (finishedBefore + batch == meta3->totalBatchSize) {
+      segmentedStatus.Update(StatusCode::SUCCESS, "ok");
+    }
+    Require((i + 1 == segmentedIds.size()) == segmentedStatus.Succeeded(),
+            "segmented transfer should complete only after the final CQE");
+  }
+  Require(meta3->finishedBatchSize.load(std::memory_order_relaxed) == 10,
+          "segmented completion count should match total batch size");
+  Require(sqDepth3.load(std::memory_order_relaxed) == 0,
+          "segmented posted WRs should release all sq depth");
+}
+
+void CaseEnvParseNonNegativeInt() {
+  auto zero = mori::env::detail::ParseNonNegativeInt("0");
+  Require(zero.has_value() && *zero == 0, "non-negative int parser should accept zero");
+  auto positive = mori::env::detail::ParseNonNegativeInt("17");
+  Require(positive.has_value() && *positive == 17,
+          "non-negative int parser should accept positive ints");
+  Require(!mori::env::detail::ParseNonNegativeInt("-1").has_value(),
+          "non-negative int parser should reject negatives");
+  Require(!mori::env::detail::ParseNonNegativeInt("invalid").has_value(),
+          "non-negative int parser should reject invalid input");
 }
 
 EpPair MakeSqAdmissionEp(int maxSqDepth, int currentDepth, bool withAdmission = true) {
@@ -1728,6 +1768,7 @@ int main(int argc, char* argv[]) {
   SetLogLevel("info");
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
+      {"env_parse_non_negative_int", CaseEnvParseNonNegativeInt},
       {"sq_admission_release_wakes_waiter", CaseSqAdmissionReleaseWakesWaiter},
       {"sq_admission_degraded_wakes_waiter", CaseSqAdmissionDegradedWakesWaiter},
       {"sq_admission_negative_depth_reserve_repairs_counter",
