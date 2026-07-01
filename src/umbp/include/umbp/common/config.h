@@ -191,6 +191,22 @@ enum class CacheRemoteAdmission : int {
   ALWAYS = 2,  // always attempt re-cache (skip size gate)
 };
 
+// Pure admission predicate for the remote-fetch re-cache gate: decides whether a
+// block of `size` bytes is eligible for local re-caching under the given policy,
+// independent of runtime state (DRAM-capacity enforcement is left to the
+// allocator). Extracted so the gate is unit-testable without a live PoolClient;
+// used by PoolClient::MaybeReCacheAfterRemote.
+inline bool ShouldAdmitReCache(bool cache_remote_fetches, CacheRemoteAdmission policy,
+                               size_t admission_max_block_bytes, size_t size) {
+  if (!cache_remote_fetches) return false;
+  if (size == 0) return false;
+  if (policy == CacheRemoteAdmission::NEVER) return false;
+  if (policy == CacheRemoteAdmission::SIZE) {
+    if (admission_max_block_bytes > 0 && size > admission_max_block_bytes) return false;
+  }
+  return true;  // ALWAYS, or SIZE within cap
+}
+
 // User-facing distributed configuration. Set UMBPConfig::distributed to enable
 // distributed mode. Internally translated to PoolClientConfig by DistributedClient.
 struct UMBPDistributedConfig {

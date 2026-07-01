@@ -782,20 +782,14 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
 }
 
 void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src, size_t size) {
-  if (!config_.cache_remote_fetches) return;
   if (!peer_alloc_) return;  // no exportable local DRAM tier on this node
-  if (size == 0) return;
-
-  const auto policy = config_.cache_remote_admission;
-  if (policy == CacheRemoteAdmission::NEVER) return;
-  if (policy == CacheRemoteAdmission::SIZE) {
-    if (config_.admission_max_block_bytes > 0 && size > config_.admission_max_block_bytes) {
-      MORI_UMBP_DEBUG(
-          "[PoolClient] MaybeReCacheAfterRemote: key='{}' size={} exceeds "
-          "admission_max_block_bytes={}",
-          key, size, config_.admission_max_block_bytes);
-      return;
-    }
+  // Admission gate (cache_remote_fetches / size==0 / NEVER / SIZE cap): shared
+  // pure predicate, unit-tested in test_cache_remote_admission.cpp.
+  if (!ShouldAdmitReCache(config_.cache_remote_fetches, config_.cache_remote_admission,
+                          config_.admission_max_block_bytes, size)) {
+    MORI_UMBP_DEBUG("[PoolClient] MaybeReCacheAfterRemote: key='{}' size={} not admitted", key,
+                    size);
+    return;
   }
   // ALWAYS and SIZE both delegate DRAM-capacity enforcement to the peer
   // allocator: Allocate returns kFailedNoSpace when the tier is full, which we
