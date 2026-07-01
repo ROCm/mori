@@ -24,11 +24,25 @@
 //
 // This is the single-master / unit-test backend: it folds the four former
 // state holders (GlobalBlockIndex, ClientRegistry, ExternalKvBlockIndex,
-// ExternalKvHitIndex) into one class behind one std::shared_mutex. The logic
-// is a near-verbatim lift of those classes; what changes is the locking
-// (four independent lock domains collapse to one) and that every timestamp
-// crossing the interface boundary is now caller-supplied system_clock — see
-// the hazards in master_metadata_store.h.
+// ExternalKvHitIndex) into one class. The logic is a near-verbatim lift of
+// those classes; what changes is the locking and that every timestamp crossing
+// the interface boundary is now caller-supplied system_clock — see the hazards
+// in master_metadata_store.h.
+//
+// Two lock domains (NOT one global mutex):
+//   - meta_mutex_ (shared_mutex) guards client records, external-kv locations,
+//     and per-hash hit counts (former ClientRegistry / ExternalKvBlockIndex /
+//     ExternalKvHitIndex state).
+//   - The block index (former GlobalBlockIndex) is split into
+//     UMBP_MASTER_INDEX_SHARDS key-hashed shards, each with its own mutex; a
+//     key's forward entry and its reverse-index membership share a shard. A
+//     heartbeat's events only lock the shards they hash into, so readers on
+//     other shards never block behind a large apply — this restores PR #440's
+//     per-shard heartbeat concurrency that a single mutex would serialize away.
+// Cross-domain writes (ApplyHeartbeat / UnregisterClient / ExpireStaleClients)
+// run the meta section then the block section, meta first, WITHOUT nesting the
+// locks — atomic within each domain but NOT globally atomic. See the atomicity
+// contract in master_metadata_store.h.
 //
 // Per-hash hit counts live in process memory and are lost on restart, exactly
 // as the old ExternalKvHitIndex did; crash-durability is a Redis-backend
@@ -40,10 +54,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -55,7 +71,10 @@ namespace mori::umbp {
 
 class InMemoryMasterMetadataStore : public IMasterMetadataStore {
  public:
-  InMemoryMasterMetadataStore() = default;
+  // Reads UMBP_MASTER_INDEX_SHARDS once and builds that many block shards
+  // (default 32, clamped to [1, 4096]; 1 reproduces the old single-lock block
+  // index). See IndexShardCount() in the .cpp.
+  InMemoryMasterMetadataStore();
   ~InMemoryMasterMetadataStore() override = default;
 
   InMemoryMasterMetadataStore(const InMemoryMasterMetadataStore&) = delete;
@@ -119,7 +138,7 @@ class InMemoryMasterMetadataStore : public IMasterMetadataStore {
   // caller-supplied `now` (system_clock) instead of reading the clock
   // internally — the value crosses the store boundary (hazard #7). The
   // lease/access state stays in atomics so the RouteGet path can mutate it
-  // under a shared lock, exactly as today (§2a).
+  // under the shared lock of the key's shard, exactly as today (§2a).
   struct BlockEntry {
     std::vector<Location> locations;
     BlockMetrics metrics;
@@ -150,28 +169,57 @@ class InMemoryMasterMetadataStore : public IMasterMetadataStore {
   };
 
   // Per-hash cumulative hit counter (lifted from ExternalKvHitIndex, collapsed
-  // from 256 atomic shards to a single map under mutex_). last_seen is
+  // from 256 atomic shards to a single map under meta_mutex_). last_seen is
   // system_clock now that it crosses the boundary and feeds GarbageCollectHits.
   struct HitEntry {
     uint64_t count = 0;
     std::chrono::system_clock::time_point last_seen;
   };
 
-  // --- Locked helpers (caller MUST hold the unique lock) ---
-  size_t ApplyEventsLocked(const std::string& node_id, const std::vector<KvEvent>& events,
-                           std::chrono::system_clock::time_point now);
-  void ReplaceNodeLocationsLocked(const std::string& node_id, const std::vector<KvEvent>& adds,
-                                  std::chrono::system_clock::time_point now);
-  void RemoveBlocksByNodeLocked(const std::string& node_id);
+  // One independently-locked partition of the block key space. A key lives in
+  // exactly one shard (chosen by hash), so its forward entry and its
+  // reverse-index membership are always co-located under the same lock.
+  struct Shard {
+    mutable std::shared_mutex mutex;
+    // Block locations (from GlobalBlockIndex).
+    std::unordered_map<std::string, BlockEntry> entries;
+    // Reverse index (shard-local) node_id -> this shard's keys the node owns,
+    // so node-scoped removal skips a full scan.
+    std::unordered_map<std::string, std::unordered_set<std::string>> node_to_keys;
+  };
+
+  size_t shard_index(std::string_view key) const {
+    return std::hash<std::string_view>{}(key) % num_shards_;
+  }
+  Shard& shard_at(size_t i) const { return *shards_[i]; }
+  Shard& shard_for(std::string_view key) const { return shard_at(shard_index(key)); }
+
+  // --- Block-index writes: acquire the relevant shard lock(s) internally.
+  // Callers MUST NOT hold meta_mutex_ when calling these (see the cross-domain
+  // write contract in master_metadata_store.h) ---
+  size_t ApplyEventsToShards(const std::string& node_id, const std::vector<KvEvent>& events,
+                             std::chrono::system_clock::time_point now);
+  void ReplaceNodeLocationsInShards(const std::string& node_id, const std::vector<KvEvent>& adds,
+                                    std::chrono::system_clock::time_point now);
+  void RemoveBlocksByNodeInShards(const std::string& node_id);
+
+  // --- Single-shard block helpers (caller MUST hold that shard's unique lock).
+  // Static members so they can name the private Shard / BlockEntry types. ---
+  // Apply one ADD/REMOVE to a shard; returns 1 iff a location was mutated (a
+  // duplicate ADD is an idempotent no-op that does NOT count).
+  static size_t ApplyAddOrRemoveLocked(Shard& shard, const std::string& node_id, const KvEvent& ev,
+                                       std::chrono::system_clock::time_point now);
+  // Drop every location owned by node_id in one shard, driven by the shard-local
+  // reverse index (O(node's keys in this shard), not a full scan).
+  static void RemoveNodeLocationsLocked(Shard& shard, const std::string& node_id);
+
+  // --- Meta-domain locked helpers (caller MUST hold meta_mutex_'s unique lock
+  // for the mutators, shared for IsClientAliveLocked) ---
   void RemoveExternalKvByNodeLocked(const std::string& node_id);
   bool IsClientAliveLocked(const std::string& node_id) const;
 
-  mutable std::shared_mutex mutex_;
-
-  // Block locations (from GlobalBlockIndex).
-  std::unordered_map<std::string, BlockEntry> entries_;
-  // Reverse index node_id -> keys, so node-scoped removal skips a full scan.
-  std::unordered_map<std::string, std::unordered_set<std::string>> node_to_keys_;
+  // Meta domain: client records + external-kv locations + per-hash hit counts.
+  mutable std::shared_mutex meta_mutex_;
 
   // Client records (from ClientRegistry).
   std::unordered_map<std::string, ClientRecord> clients_;
@@ -183,6 +231,10 @@ class InMemoryMasterMetadataStore : public IMasterMetadataStore {
 
   // Per-hash hit counts (from ExternalKvHitIndex).
   std::unordered_map<std::string, HitEntry> external_kv_hits_;
+
+  // Block domain: key-hashed shards, each independently locked.
+  const size_t num_shards_;
+  std::vector<std::unique_ptr<Shard>> shards_;
 };
 
 }  // namespace mori::umbp

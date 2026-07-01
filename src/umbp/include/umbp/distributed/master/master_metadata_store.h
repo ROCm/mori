@@ -187,28 +187,52 @@ namespace mori::umbp {
 // for in-memory, single-script Lua atomicity for Redis). Callers do
 // not add external locking around these calls.
 //
-// Every write method below is atomic in isolation. Methods that span
+// Every write method below is atomic in isolation. The methods that span
 // what used to be multiple stores (UnregisterClient, ApplyHeartbeat,
-// ExpireStaleClients, RegisterExternalKvIfAlive, and the hit-counting
-// branch of MatchExternalKv) are atomic across those former
-// boundaries — that is the whole reason for the merge.
+// ExpireStaleClients, RegisterExternalKvIfAlive, and the hit-counting branch
+// of MatchExternalKv) are why the four stores were merged behind one
+// interface. HOW atomic they are across those former boundaries is
+// backend-specific:
 //
-// TODO(atomicity-contract): pin down the required isolation level
-// before the Redis backend is written. The default position is
-// "atomic with respect to other writes on this interface; readers
-// may observe pre-state until commit" — i.e. single-script Lua for
-// Redis, shared_mutex unique_lock for in-memory. Document the chosen
-// level here once it's settled and add a conformance test that
-// exercises a concurrent reader against an in-flight cross-store
-// write.
+//   - RedisMasterMetadataStore: globally atomic — one Lua script over the
+//     shared hash tag mutates all keyspaces in one step (also what makes a
+//     large full_sync atomic; see TODO(payload-sizing) below).
+//
+//   - InMemoryMasterMetadataStore: atomic within each lock domain, NOT
+//     globally atomic across them. Two domains: meta_mutex_ (client records +
+//     external-kv + hit counts) and N key-hashed block shards. Cross-domain
+//     writes run the meta section first, then the block section AFTER
+//     releasing meta_mutex_ — never nested. This trades global atomicity for
+//     concurrency: heartbeats to different shards apply in parallel instead of
+//     serializing on one lock (PR #440's headline win). Reader-visible windows:
+//       * ApplyHeartbeat: seq/caps advanced before the events are visible.
+//       * Unregister/Expire: client gone/EXPIRED while its block locations
+//         briefly linger; conversely, since the block wipe runs after
+//         meta_mutex_ is released, a same-node re-register + full_sync inside
+//         the window can have its fresh locations dropped by the late wipe.
+//       * full_sync: atomic per shard (a key's clear+replay never tears), not
+//         across shards.
+//     All benign: a lingering location for a non-ALIVE node is filtered out by
+//     GetAlivePeerView (router.cpp), so it never routes to a dead node; the
+//     re-register case is mere under-representation (a cache miss a re-put
+//     heals). Same windows main/#440 had with its two independent locks. (A
+//     same-node heartbeat reorder is unreachable: the client serializes its
+//     heartbeats via hb_send_mutex_ and the RPC returns only after apply.)
+//
+// TODO(atomicity-contract): DECIDED for in-memory = approach A above. Open for
+// Redis: confirm the Lua path keeps this method set globally atomic. The
+// conformance test (test_in_memory_master_metadata_store.cpp) races a reader
+// against an in-flight full_sync/heartbeat and asserts RouteGet sees
+// old-or-new locations (never torn) and never resolves a peer for an
+// unregistered node.
 //
 // Expected implementations:
-//   - InMemoryMasterMetadataStore: one std::shared_mutex over the
-//     internal sub-maps. Mostly a mechanical lift of the current
-//     classes; keep them as private helpers. Used for single-master
-//     deployments and unit tests. The per-hash hit counts live in
-//     process memory and are lost on restart, exactly as the current
-//     ExternalKvHitIndex does.
+//   - InMemoryMasterMetadataStore: meta_mutex_ + N key-hashed block
+//     shards (see the atomicity contract above). Mostly a mechanical
+//     lift of the former classes, kept as private helpers. Used for
+//     single-master deployments and unit tests. The per-hash hit counts
+//     live in process memory and are lost on restart, exactly as the
+//     current ExternalKvHitIndex does.
 //   - RedisMasterMetadataStore: cross-keyspace ops via Lua scripts.
 //     All key namespaces (node:, block:, extkv:, hit:, lru:, lease:)
 //     must share a hash tag (e.g. `{umbp:<deployment_id>}:node:<id>`)

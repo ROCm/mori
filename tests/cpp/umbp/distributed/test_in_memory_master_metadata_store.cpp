@@ -763,5 +763,135 @@ TEST(InMemoryStore, MixedWorkloadIsRaceFree) {
   EXPECT_EQ(counts[0].hit_count_total, 500u);
 }
 
+// ---------------------------------------------------------------------------
+// Cross-domain atomicity conformance (approach A). These make the intermediate-
+// state declarations in master_metadata_store.h executable: with the block
+// index split into key-hashed shards and cross-domain writes running
+// meta→block WITHOUT nesting the locks, a concurrent RouteGet reader must still
+// (a) never observe a torn per-key location, and (b) never resolve a peer for a
+// node that isn't in the alive-peer view (residual block locations for an
+// erased node are simply skipped by the router-style join — router.cpp).
+// ---------------------------------------------------------------------------
+
+// A writer repeatedly full-syncs a node's whole key set between two well-formed
+// shapes (size 100 vs size 200). full_sync clears+replays per shard; within a
+// shard a single key's replacement is atomic, so a reader must always see an
+// old-or-new value, never a torn one. Also a ThreadSanitizer net for the
+// meta→block split under concurrent full_sync.
+TEST(InMemoryStore, ConcurrentFullSyncRouteGetNeverTears) {
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "w");
+
+  const int kNumKeys = 64;  // spread across shards (default 32)
+  std::vector<std::string> keys;
+  keys.reserve(kNumKeys);
+  std::vector<KvEvent> adds100, adds200;
+  for (int i = 0; i < kNumKeys; ++i) {
+    keys.push_back("k" + std::to_string(i));
+    adds100.push_back(Add(keys.back(), TierType::HBM, 100));
+    adds200.push_back(Add(keys.back(), TierType::HBM, 200));
+  }
+  ASSERT_EQ(store.ApplyHeartbeat("w", 1, kT0, Caps(), adds100, /*is_full_sync=*/false).status,
+            HeartbeatResult::APPLIED);
+
+  std::atomic<bool> start{false};
+  std::atomic<bool> stop{false};
+  std::atomic<bool> torn{false};
+
+  std::thread writer([&] {
+    while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+    uint64_t seq = 100;  // full_sync re-baselines seq, so any increasing value is fine
+    for (int it = 0; it < 2000; ++it) {
+      const auto& adds = (it % 2 == 0) ? adds200 : adds100;
+      store.ApplyHeartbeat("w", seq++, kT0, Caps(), adds, /*is_full_sync=*/true);
+    }
+    stop.store(true, std::memory_order_release);
+  });
+
+  std::vector<std::thread> readers;
+  for (int r = 0; r < 4; ++r) {
+    readers.emplace_back([&] {
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      while (!stop.load(std::memory_order_acquire)) {
+        auto locs = store.BatchLookupBlockForRouteGet(keys, {}, kT0, 30s);
+        for (const auto& per_key : locs) {
+          for (const auto& loc : per_key) {
+            const bool well_formed = loc.node_id == "w" && loc.tier == TierType::HBM &&
+                                     (loc.size == 100 || loc.size == 200);
+            if (!well_formed) torn.store(true, std::memory_order_release);
+          }
+        }
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  writer.join();
+  for (auto& t : readers) t.join();
+  EXPECT_FALSE(torn.load());  // every visible location was a valid old-or-new value
+}
+
+// A writer churns node "b" (Unregister → Register → re-seed key K) while readers
+// do a router-style RouteGet: snapshot GetAlivePeerView, then join it with the
+// block locations. The invariant: a location whose node resolves in the alive
+// view always yields a non-empty peer for a node that WAS alive in that same
+// snapshot — a residual block location for an erased node is absent from the
+// view and thus never routed to. Exercises the meta→block non-atomic window.
+TEST(InMemoryStore, ConcurrentUnregisterRouteGetNeverResolvesDeadPeer) {
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "a");
+  RegisterAlive(store, "b");
+  ASSERT_EQ(Beat(store, "a", 1, {Add("K", TierType::HBM, 10)}, kT0).status,
+            HeartbeatResult::APPLIED);
+  ASSERT_EQ(Beat(store, "b", 1, {Add("K", TierType::HBM, 10)}, kT0).status,
+            HeartbeatResult::APPLIED);
+
+  std::atomic<bool> start{false};
+  std::atomic<bool> bad_peer{false};
+
+  std::thread writer([&] {
+    while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+    for (int it = 0; it < 1000; ++it) {
+      store.UnregisterClient("b");                   // meta erase + block wipe
+      store.RegisterClient(MakeReg("b"), kT0, 30s);  // back to ALIVE
+      store.ApplyHeartbeat("b", 1, kT0, Caps(), {Add("K", TierType::HBM, 10)},
+                           /*is_full_sync=*/true);  // re-seed K@b
+    }
+  });
+
+  std::vector<std::thread> readers;
+  for (int r = 0; r < 4; ++r) {
+    readers.emplace_back([&] {
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      for (int it = 0; it < 2000; ++it) {
+        // Router-style resolution (router.cpp): peer comes from the alive view,
+        // NOT from the block location itself.
+        auto view = store.GetAlivePeerView();
+        auto locs = store.BatchLookupBlockForRouteGet({"K"}, {}, kT0, 30s);
+        for (const auto& loc : locs[0]) {
+          auto pit = view.find(loc.node_id);
+          if (pit != view.end() && pit->second.empty()) {
+            bad_peer.store(true, std::memory_order_release);
+          }
+        }
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  writer.join();
+  for (auto& t : readers) t.join();
+  EXPECT_FALSE(bad_peer.load());
+
+  // Deterministic post-condition: with b unregistered for good, any location we
+  // could route to (i.e. that resolves in the alive view) is a live node, never
+  // a stale b; b's residual location (if still present) is absent from the view.
+  store.UnregisterClient("b");
+  auto view = store.GetAlivePeerView();
+  auto locs = store.BatchLookupBlockForRouteGet({"K"}, {}, kT0, 30s);
+  EXPECT_EQ(view.count("b"), 0u);
+  for (const auto& loc : locs[0]) {
+    if (view.count(loc.node_id)) EXPECT_EQ(loc.node_id, "a");
+  }
+}
+
 }  // namespace
 }  // namespace mori::umbp
