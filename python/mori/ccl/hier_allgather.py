@@ -41,9 +41,47 @@ bf16/fp16/fp32/int32.
 """
 
 import os
+import socket
 from typing import List, Optional, Sequence
 
 import torch
+
+
+def _auto_ranks_per_node(my_pe: int, npes: int) -> int:
+    """Detect how many ranks are co-located on this physical node so callers can
+    use the same signature as the flat ``AllgatherSdma`` (no ``ranks_per_node``).
+
+    Resolution order:
+      1. launcher-provided local world size (``LOCAL_WORLD_SIZE`` from torchrun,
+         or the MPI equivalents),
+      2. group ranks by hostname over the initialized process group,
+      3. fall back to ``npes`` (treat everything as a single node).
+
+    Always returns a positive integer that divides ``npes``.
+    """
+    for key in (
+        "LOCAL_WORLD_SIZE",
+        "OMPI_COMM_WORLD_LOCAL_SIZE",
+        "MV2_COMM_WORLD_LOCAL_SIZE",
+    ):
+        v = os.environ.get(key)
+        if v and v.isdigit():
+            g = int(v)
+            if g > 0 and npes % g == 0:
+                return g
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() == npes:
+            host = socket.gethostname()
+            hosts = [None] * npes
+            dist.all_gather_object(hosts, host)
+            g = sum(1 for h in hosts if h == host)
+            if g > 0 and npes % g == 0:
+                return g
+    except Exception:
+        pass
+    return npes
 
 # NOTE: ``AllgatherSdma`` (and hence the compiled C++ .so) is imported lazily
 # inside ``HierAllGather.__init__`` so that the pure-Python executable specs
@@ -184,8 +222,14 @@ class HierAllGather:
     my_pe, npes:
         Global rank and world size (``npes == num_nodes * ranks_per_node``).
     ranks_per_node:
-        Number of ranks (GPUs) co-located on one node, i.e. ``G``. Defaults
-        to ``npes`` (single node).
+        Number of ranks (GPUs) co-located on one node, i.e. ``G``. Optional
+        and keyword-only: when omitted it is auto-detected (``LOCAL_WORLD_SIZE``
+        from the launcher, else grouping ranks by hostname, else ``npes`` for a
+        single node), so callers can use the same signature as the flat
+        ``AllgatherSdma``.
+    transit_buffer_size:
+        Optional single combined transit size (flat ``AllgatherSdma``
+        compatibility); split into input/output when those are not given.
     input_buffer_size, output_buffer_size:
         Per-rank input byte capacity and total output byte capacity to
         pre-allocate inside the SDMA transit buffers. Sized for the largest
@@ -199,10 +243,12 @@ class HierAllGather:
         self,
         my_pe: int,
         npes: int,
-        ranks_per_node: Optional[int] = None,
         input_buffer_size: Optional[int] = None,
         output_buffer_size: Optional[int] = None,
+        transit_buffer_size: Optional[int] = None,
         copy_output_to_user: bool = True,
+        *,
+        ranks_per_node: Optional[int] = None,
         inter_num_qp: Optional[int] = None,
         leader_only: Optional[bool] = None,
         gather_in_place: Optional[bool] = None,
@@ -750,8 +796,19 @@ class HierAllGather:
                     "result comes from the SDMA broadcast, not the ring buffer)"
                 )
             self.gather_in_place = True
+        # Interface compatibility with the flat AllgatherSdma: accept a single
+        # combined transit size and split it into input/output when the caller
+        # did not size them explicitly.
+        if transit_buffer_size is not None:
+            if input_buffer_size is None:
+                input_buffer_size = transit_buffer_size
+            if output_buffer_size is None:
+                output_buffer_size = transit_buffer_size * npes
+        # Topology is auto-detected so callers use the same signature as the
+        # flat AllgatherSdma (no ranks_per_node needed). Single node -> the
+        # operation degenerates to a pure intra-node SDMA AllGather.
         if ranks_per_node is None:
-            ranks_per_node = npes
+            ranks_per_node = _auto_ranks_per_node(my_pe, npes)
         if ranks_per_node <= 0 or npes % ranks_per_node != 0:
             raise ValueError(
                 f"npes ({npes}) must be a positive multiple of ranks_per_node "
