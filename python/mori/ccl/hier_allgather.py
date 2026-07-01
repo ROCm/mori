@@ -1075,6 +1075,33 @@ class HierAllGather:
         except Exception:
             return False
 
+    def all_gather(self, tensor_list, tensor, stream=None) -> bool:
+        """Traditional list-based AllGather (matches ``torch.distributed.all_gather``).
+
+        Gathers ``tensor`` from every rank into ``tensor_list`` -- a list of
+        ``npes`` tensors, each shaped like ``tensor``. Uses the same
+        hierarchical intra-node SDMA / inter-node RDMA path as the contiguous
+        ``__call__`` (``all_gather_into_tensor`` style); the gathered rank-major
+        output is scattered into the list entries.
+        """
+        if len(tensor_list) != self.npes:
+            raise ValueError(
+                f"tensor_list must have npes={self.npes} entries, got {len(tensor_list)}"
+            )
+        count = tensor.numel()
+        flat = torch.empty(count * self.npes, dtype=tensor.dtype, device=tensor.device)
+        if not self.__call__(tensor, flat, count, stream):
+            return False
+        # The scatter copies read ``flat``, so make the gather visible first.
+        if stream is not None and hasattr(stream, "synchronize"):
+            stream.synchronize()
+        else:
+            torch.cuda.synchronize()
+        view = flat.view(self.npes, *tensor.shape) if tensor.dim() > 0 else flat.view(self.npes)
+        for i in range(self.npes):
+            tensor_list[i].copy_(view[i])
+        return True
+
     def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
         """Gather ``count`` elements/rank into ``output_data`` (rank-major).
 
