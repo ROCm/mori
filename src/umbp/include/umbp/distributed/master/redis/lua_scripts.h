@@ -176,6 +176,12 @@ return { 'APPLIED', tostring(seq) }
 //   Returns an array of n elements; element i is a flat array
 //   [node, size, tier, node, size, tier, ...] of the surviving locations.
 //   Only keys with >=1 surviving location get a lease + access bump.
+//
+//   The per-key HGETALL already returns _acnt, so the lease/access bump folds
+//   into a SINGLE HSET (_lease/_lacc/_acnt) instead of HSET + a separate
+//   HINCRBY. This is semantics-preserving (_acnt still ends at old+1) and drops
+//   the per-touched-key write commands from 2 to 1 — the single-slot server is
+//   redis.call()-count bound, so fewer calls per script is a direct win.
 inline constexpr const char* kRouteGetBatchLua = R"LUA(
 local now = tonumber(ARGV[1])
 local lease = tonumber(ARGV[2])
@@ -187,6 +193,7 @@ for i = 1, #KEYS do
   local flds = redis.call('HGETALL', KEYS[i])
   local locs = {}
   local touched = false
+  local acnt = 0
   local j = 1
   while j <= #flds do
     local f = flds[j]
@@ -205,11 +212,12 @@ for i = 1, #KEYS do
           touched = true
         end
       end
+    elseif f == '_acnt' then
+      acnt = tonumber(v) or 0
     end
   end
   if touched then
-    redis.call('HSET', KEYS[i], '_lease', now + lease, '_lacc', now)
-    redis.call('HINCRBY', KEYS[i], '_acnt', 1)
+    redis.call('HSET', KEYS[i], '_lease', now + lease, '_lacc', now, '_acnt', acnt + 1)
   end
   out[i] = locs
 end
