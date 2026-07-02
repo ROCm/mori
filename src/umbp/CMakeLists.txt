@@ -309,6 +309,7 @@ add_library(
   ${UMBP_PEER_PROTO_SRCS}
   ${UMBP_PEER_GRPC_SRCS}
   distributed/master/in_memory_master_metadata_store.cpp
+  distributed/master/master_metadata_store_factory.cpp
   distributed/master/master_server.cpp
   distributed/master/master_client.cpp
   distributed/master/rpc_latency_timer.cpp
@@ -346,6 +347,28 @@ target_link_libraries(
                      ${_PROTOBUF_LIBS} ${_GRPCPP_LIB})
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
+
+# ---------- Optional Redis / RESP master metadata backend --------------------
+# Makes the master stateless by storing all metadata in an external RESP store
+# (Redis / Dragonfly / Valkey). OFF by default so existing builds are
+# unaffected; enable with -DUSE_REDIS_BACKEND=ON. The RESP client seam is built
+# on hiredis (RespClient isolates the client library from the store).
+option(USE_REDIS_BACKEND
+       "Build the RESP-compatible Redis master metadata backend" OFF)
+if(USE_REDIS_BACKEND)
+  find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h REQUIRED)
+  find_library(HIREDIS_LIB NAMES hiredis REQUIRED)
+  message(
+    STATUS
+      "UMBP Redis backend ENABLED (hiredis lib: ${HIREDIS_LIB}, include: ${HIREDIS_INCLUDE_DIR})"
+  )
+  target_sources(
+    umbp_common PRIVATE distributed/master/redis/resp_client.cpp
+                        distributed/master/redis_master_metadata_store.cpp)
+  target_include_directories(umbp_common PRIVATE ${HIREDIS_INCLUDE_DIR})
+  target_link_libraries(umbp_common PUBLIC ${HIREDIS_LIB})
+  target_compile_definitions(umbp_common PUBLIC USE_REDIS_BACKEND)
+endif()
 
 if(MORI_UMBP_TESTING)
   target_compile_definitions(umbp_common PUBLIC MORI_UMBP_TESTING)

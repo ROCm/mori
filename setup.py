@@ -381,6 +381,7 @@ class CMakeBuild(build_ext):
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
         build_umbp = "ON" if build_umbp_enabled else "OFF"
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
+        use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
         with_mpi = (
             "ON"
@@ -411,6 +412,7 @@ class CMakeBuild(build_ext):
             f"-DBUILD_BENCHMARK={build_benchmark}",
             f"-DBUILD_TESTS={build_tests}",
             f"-DBUILD_UMBP={build_umbp}",
+            f"-DUSE_REDIS_BACKEND={use_redis_backend}",
             f"-DUSE_SPDK={build_umbp_spdk}",
             f"-DWITH_MPI={with_mpi}",
             "-DBUILD_TORCH_BOOTSTRAP=OFF",

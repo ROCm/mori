@@ -365,3 +365,23 @@ target_link_libraries(
   bench_umbp_kvevent_master_pressure
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
+
+# bench_master_metadata_store — store-level microbench isolating the hot-path
+# IMasterMetadataStore methods (RouteGet / Exists / Heartbeat) across backends
+# (UMBP_METADATA_BACKEND). No gRPC / RDMA; links umbp_common only. Standalone
+# executable, not a CTest target.
+add_executable(bench_umbp_master_metadata_store bench_master_metadata_store.cpp)
+target_link_libraries(bench_umbp_master_metadata_store PRIVATE umbp_common)
+target_compile_features(bench_umbp_master_metadata_store PRIVATE cxx_std_17)
+
+# test_redis_master_metadata_store — Phase 1 targeted tests for the RESP/Redis
+# backend. Built only when the Redis backend is compiled in; the test itself
+# skips at runtime when no RESP store is reachable at UMBP_REDIS_URI.
+if(USE_REDIS_BACKEND)
+  add_executable(test_redis_master_metadata_store
+                 test_redis_master_metadata_store.cpp)
+  target_link_libraries(test_redis_master_metadata_store
+                        PRIVATE umbp_common GTest::gtest_main)
+  target_compile_features(test_redis_master_metadata_store PRIVATE cxx_std_17)
+  gtest_discover_tests(test_redis_master_metadata_store)
+endif()

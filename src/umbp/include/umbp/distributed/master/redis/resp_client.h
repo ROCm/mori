@@ -1,0 +1,164 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// RespClient — a thin, RESP-protocol-compatible client seam for the master's
+// Redis metadata backend.
+//
+// This is deliberately the ONLY file in the store that knows which client
+// library is used underneath. Phase 1 implements it on hiredis (the library
+// already present in the build image); the store code above it depends only on
+// the small RespValue / RespClient surface here, so a raw-hiredis client can be
+// swapped for redis-plus-plus (or a cluster client) without touching the store.
+//
+// It speaks only the portable RESP subset (STRING/HASH/SET/ZSET commands plus
+// EVAL/EVALSHA/SCRIPT LOAD), so the same binary connects unchanged to Redis,
+// Dragonfly, and Valkey — selection is connection config only.
+//
+// Threading: a fixed-size connection pool fronts a shared instance. The gRPC
+// handler thread pool calls Command/Pipeline/Eval concurrently; each call
+// borrows one pooled connection for its duration.
+
+#pragma once
+
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+// Forward-declare the hiredis context so this header stays library-agnostic to
+// its includers (only resp_client.cpp includes <hiredis/hiredis.h>).
+struct redisContext;
+
+namespace mori::umbp::redis {
+
+// Thrown on a transport-level failure (connect/socket error, protocol error).
+// Command errors returned BY the server (e.g. a Lua runtime error) are NOT
+// thrown — they surface as a RespValue with type == Error so callers can
+// inspect the message.
+class RespError : public std::runtime_error {
+ public:
+  explicit RespError(const std::string& what) : std::runtime_error(what) {}
+};
+
+// Owned, recursive mirror of a redisReply. Owning it (rather than exposing the
+// raw redisReply*) keeps hiredis out of every includer of this header.
+struct RespValue {
+  enum class Type { Nil, Status, Error, Integer, String, Array };
+
+  Type type = Type::Nil;
+  long long integer = 0;            // Integer
+  std::string str;                  // Status / Error / String (binary-safe)
+  std::vector<RespValue> elements;  // Array
+
+  bool is_nil() const { return type == Type::Nil; }
+  bool is_error() const { return type == Type::Error; }
+  bool is_array() const { return type == Type::Array; }
+  bool ok() const { return type != Type::Error; }
+};
+
+class RespClient {
+ public:
+  struct Options {
+    // e.g. "tcp://127.0.0.1:6379". Only tcp is supported in Phase 1.
+    std::string uri = "tcp://127.0.0.1:6379";
+    std::string password;
+    int connect_timeout_ms = 1000;
+    int socket_timeout_ms = 1000;
+    std::size_t pool_size = 8;
+  };
+
+  explicit RespClient(Options options);
+  ~RespClient();
+
+  RespClient(const RespClient&) = delete;
+  RespClient& operator=(const RespClient&) = delete;
+
+  // One command. `args` is the full argv (command name first); values are
+  // binary-safe. Returns the server's reply (which may be an Error value).
+  RespValue Command(const std::vector<std::string>& args);
+
+  // Pipeline: append every command, then read all replies in order. One round
+  // trip for the whole batch.
+  std::vector<RespValue> Pipeline(const std::vector<std::vector<std::string>>& commands);
+
+  // EVALSHA with transparent SCRIPT LOAD + NOSCRIPT fallback. `script` is the
+  // Lua body; its SHA is loaded once and cached. `keys` then `args` are passed
+  // to the script as KEYS[] / ARGV[].
+  RespValue Eval(const std::string& script, const std::vector<std::string>& keys,
+                 const std::vector<std::string>& args);
+
+  // Liveness probe (PING). Returns false if no connection can be established.
+  bool Ping();
+
+  const Options& options() const { return options_; }
+
+ private:
+  // RAII borrow of one pooled connection.
+  class Lease {
+   public:
+    Lease(RespClient* owner, redisContext* ctx) : owner_(owner), ctx_(ctx) {}
+    ~Lease();
+    Lease(const Lease&) = delete;
+    Lease& operator=(const Lease&) = delete;
+    redisContext* get() const { return ctx_; }
+    void MarkBroken() { healthy_ = false; }
+
+   private:
+    RespClient* owner_;
+    redisContext* ctx_;
+    bool healthy_ = true;
+  };
+
+  redisContext* Connect();  // create + AUTH; throws on failure
+  Lease Acquire();          // borrow (blocks if pool exhausted)
+  void Release(redisContext* ctx, bool healthy);
+
+  // Convert a raw redisReply (void* to avoid leaking the type) into RespValue.
+  static RespValue Convert(void* reply);
+
+  // Run one argv command on a specific connection; sets *broke on transport
+  // failure. Returns a RespValue (Error type on server error).
+  RespValue RunArgv(redisContext* ctx, const std::vector<std::string>& args, bool* broke);
+
+  // SHA for `script`, loaded + cached on first use (deterministic across
+  // connections, so one cache is correct).
+  std::string GetOrLoadSha(redisContext* ctx, const std::string& script, bool* broke);
+
+  Options options_;
+  std::string host_;
+  int port_ = 6379;
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::vector<redisContext*> idle_;
+  std::size_t created_ = 0;
+
+  std::mutex sha_mu_;
+  std::unordered_map<std::string, std::string> sha_cache_;  // script body -> sha1
+};
+
+}  // namespace mori::umbp::redis

@@ -37,6 +37,7 @@
 #include "umbp/distributed/master/evict_strategy.h"
 #include "umbp/distributed/master/in_memory_master_metadata_store.h"
 #include "umbp/distributed/master/master_metadata_store.h"
+#include "umbp/distributed/master/master_metadata_store_factory.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/routing/router.h"
 #include "umbp_peer.grpc.pb.h"
@@ -771,7 +772,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 // ---------------------------------------------------------------------------
 MasterServer::MasterServer(MasterServerConfig config)
     : config_(std::move(config)),
-      store_(std::make_unique<InMemoryMasterMetadataStore>()),
+      store_(MakeMasterMetadataStore()),
       router_(*store_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
       service_(std::make_unique<UMBPMasterServiceImpl>(*store_, router_, config_.registry_config,
                                                        nullptr)),

@@ -1,0 +1,34 @@
+# Single-node RESP backends for the UMBP master Redis-metadata-store Phase 1
+# benchmark. Redis and Dragonfly expose the same RESP wire, so the master's
+# RedisMasterMetadataStore connects to either unchanged — only UMBP_REDIS_URI
+# changes.
+#
+#   docker compose -f src/umbp/tools/redis/docker-compose.yml up -d
+#   UMBP_METADATA_BACKEND=redis UMBP_REDIS_URI=tcp://127.0.0.1:6379 ...   # Redis
+#   UMBP_METADATA_BACKEND=redis UMBP_REDIS_URI=tcp://127.0.0.1:6380 ...   # Dragonfly
+#
+# Note: inside a container that lacks docker-in-docker, use run_local_backends.sh
+# instead, which launches redis-server and dragonfly as plain local processes.
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: umbp-redis
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "6379:6379"
+
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    container_name: umbp-dragonfly
+    ulimits:
+      memlock: -1
+    ports:
+      - "6380:6379"
+    # allow-undeclared-keys keeps the single Lua script implementation portable:
+    # scripts derive auxiliary same-slot keys from the shared hash tag instead of
+    # passing every one via KEYS[]. Redis permits this on a single node; Dragonfly
+    # needs the flag.
+    command:
+      ["dragonfly", "--logtostderr", "--port=6379",
+       "--default_lua_flags=allow-undeclared-keys"]
