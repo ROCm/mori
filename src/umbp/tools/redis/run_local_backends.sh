@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # Launch single-node Redis and Dragonfly as local processes (no docker needed),
-# for the UMBP master Redis-metadata-store Phase 1 benchmark. Both speak RESP,
-# so the master connects to either via UMBP_REDIS_URI only.
+# for the UMBP master Redis-metadata-store benchmark. Both speak RESP, so the
+# master connects to either via UMBP_REDIS_URI only.
 #
 #   Redis     -> tcp://127.0.0.1:6379
 #   Dragonfly -> tcp://127.0.0.1:6380
 #
+# Getting the binaries (in order of preference, auto-selected):
+#   Redis:     redis-server on PATH -> prebuilt in RUN_DIR -> apt-get ->
+#              build the official source with make (works when the apt mirror
+#              is blocked but github over HTTPS is reachable, e.g. this CI image).
+#   Dragonfly: prebuilt in RUN_DIR -> download the official release tarball.
+# Both are the stock upstream binaries; only how they are obtained varies.
+#
 # Usage:
-#   src/umbp/tools/redis/run_local_backends.sh up      # install (if needed) + start
+#   src/umbp/tools/redis/run_local_backends.sh up       # install (if needed) + start
 #   src/umbp/tools/redis/run_local_backends.sh down     # stop
 #   src/umbp/tools/redis/run_local_backends.sh status
 set -euo pipefail
@@ -17,13 +24,65 @@ REDIS_PORT="${UMBP_REDIS_PORT:-6379}"
 DF_PORT="${UMBP_DRAGONFLY_PORT:-6380}"
 DF_VERSION="${UMBP_DRAGONFLY_VERSION:-v1.23.2}"
 DF_BIN="${RUN_DIR}/dragonfly"
+REDIS_VERSION="${UMBP_REDIS_VERSION:-7.2.5}"
+REDIS_SRC="${RUN_DIR}/redis-src"
+
+# Resolved by ensure_redis() / find_redis_cli().
+REDIS_SERVER=""
+REDIS_CLI=""
 
 mkdir -p "${RUN_DIR}"
 
+# Locate a redis-cli without triggering an install (used by status/down).
+find_redis_cli() {
+  if command -v redis-cli >/dev/null 2>&1; then
+    command -v redis-cli
+  elif [[ -x "${RUN_DIR}/redis-cli" ]]; then
+    echo "${RUN_DIR}/redis-cli"
+  fi
+}
+
+build_redis_from_source() {
+  if ! command -v git >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; then
+    echo "[run_local_backends] cannot build redis: need git + make" >&2
+    return 1
+  fi
+  echo "[run_local_backends] building official redis ${REDIS_VERSION} from source..."
+  if [[ ! -d "${REDIS_SRC}" ]]; then
+    git clone --depth 1 --branch "${REDIS_VERSION}" https://github.com/redis/redis.git "${REDIS_SRC}"
+  fi
+  make -C "${REDIS_SRC}" -j"$(nproc)" BUILD_TLS=no USE_SYSTEMD=no MALLOC=libc
+  cp "${REDIS_SRC}/src/redis-server" "${RUN_DIR}/redis-server"
+  cp "${REDIS_SRC}/src/redis-cli" "${RUN_DIR}/redis-cli"
+}
+
 ensure_redis() {
-  if command -v redis-server >/dev/null 2>&1; then return 0; fi
-  echo "[run_local_backends] installing redis-server via apt..."
-  apt-get update -qq && apt-get install -y -qq redis-server >/dev/null
+  # 1) Already installed on PATH.
+  if command -v redis-server >/dev/null 2>&1 && command -v redis-cli >/dev/null 2>&1; then
+    REDIS_SERVER="$(command -v redis-server)"
+    REDIS_CLI="$(command -v redis-cli)"
+    return 0
+  fi
+  # 2) Previously built/downloaded into RUN_DIR.
+  if [[ -x "${RUN_DIR}/redis-server" && -x "${RUN_DIR}/redis-cli" ]]; then
+    REDIS_SERVER="${RUN_DIR}/redis-server"
+    REDIS_CLI="${RUN_DIR}/redis-cli"
+    return 0
+  fi
+  # 3) apt fast path (skipped automatically when the mirror is unreachable).
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "[run_local_backends] trying apt-get install redis-server..."
+    if apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq redis-server >/dev/null 2>&1; then
+      REDIS_SERVER="$(command -v redis-server)"
+      REDIS_CLI="$(command -v redis-cli)"
+      return 0
+    fi
+    echo "[run_local_backends] apt unavailable; falling back to source build"
+  fi
+  # 4) Build the official source (apt mirror blocked but github reachable).
+  build_redis_from_source
+  REDIS_SERVER="${RUN_DIR}/redis-server"
+  REDIS_CLI="${RUN_DIR}/redis-cli"
 }
 
 ensure_dragonfly() {
@@ -50,16 +109,16 @@ up() {
   ensure_redis
   ensure_dragonfly || echo "[run_local_backends] WARN: dragonfly unavailable; redis only"
 
-  if ! redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1; then
+  if ! "${REDIS_CLI}" -p "${REDIS_PORT}" ping >/dev/null 2>&1; then
     echo "[run_local_backends] starting redis-server on ${REDIS_PORT}"
-    redis-server --port "${REDIS_PORT}" --daemonize yes \
+    "${REDIS_SERVER}" --port "${REDIS_PORT}" --daemonize yes \
       --appendonly yes --appendfsync everysec \
       --dir "${RUN_DIR}" --logfile "${RUN_DIR}/redis.log" \
       --save ""
   fi
 
   if [[ -x "${DF_BIN}" ]]; then
-    if ! redis-cli -p "${DF_PORT}" ping >/dev/null 2>&1; then
+    if ! "${REDIS_CLI}" -p "${DF_PORT}" ping >/dev/null 2>&1; then
       echo "[run_local_backends] starting dragonfly on ${DF_PORT}"
       # allow-undeclared-keys: our Lua scripts derive auxiliary same-slot keys
       # (nodes:alive, block:*, ...) from the shared hash tag rather than passing
@@ -78,7 +137,11 @@ up() {
 
 down() {
   echo "[run_local_backends] stopping backends"
-  redis-cli -p "${REDIS_PORT}" shutdown nosave >/dev/null 2>&1 || true
+  local cli
+  cli="$(find_redis_cli)"
+  if [[ -n "${cli}" ]]; then
+    "${cli}" -p "${REDIS_PORT}" shutdown nosave >/dev/null 2>&1 || true
+  fi
   if [[ -f "${RUN_DIR}/dragonfly.pid" ]]; then
     kill "$(cat "${RUN_DIR}/dragonfly.pid")" >/dev/null 2>&1 || true
     rm -f "${RUN_DIR}/dragonfly.pid"
@@ -86,10 +149,12 @@ down() {
 }
 
 status() {
+  local cli
+  cli="$(find_redis_cli)"
   echo -n "[run_local_backends] redis(${REDIS_PORT}): "
-  redis-cli -p "${REDIS_PORT}" ping 2>/dev/null || echo "DOWN"
+  { [[ -n "${cli}" ]] && "${cli}" -p "${REDIS_PORT}" ping 2>/dev/null; } || echo "DOWN"
   echo -n "[run_local_backends] dragonfly(${DF_PORT}): "
-  redis-cli -p "${DF_PORT}" ping 2>/dev/null || echo "DOWN"
+  { [[ -n "${cli}" ]] && "${cli}" -p "${DF_PORT}" ping 2>/dev/null; } || echo "DOWN"
 }
 
 case "${1:-up}" in
