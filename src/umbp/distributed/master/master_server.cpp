@@ -204,322 +204,358 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                         const ClientRegistryConfig& config, mori::metrics::MetricsServer* metrics)
       : store_(store), router_(router), config_(config), metrics_(metrics) {}
 
+  // Run a handler body, converting any exception that escapes the metadata
+  // store into a clean grpc::UNAVAILABLE instead of letting it propagate out of
+  // the gRPC handler and terminate the whole master process. The RESP/Redis
+  // backend signals transport failures (and Phase-2-unimplemented methods) by
+  // throwing; the in-memory backend never throws, so this is a no-op cost
+  // there. This is the master's half of the "degrade, don't fabricate"
+  // contract in design-redis-metadata-store.md §7 — a struggling store drains
+  // this replica via failed RPCs rather than crashing it.
+  template <typename Fn>
+  static grpc::Status GuardStore(const char* rpc, Fn&& fn) {
+    try {
+      return fn();
+    } catch (const std::exception& e) {
+      MORI_UMBP_ERROR("[Master] {} metadata-store error: {}", rpc, e.what());
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                          std::string(rpc) + ": metadata store unavailable: " + e.what());
+    }
+  }
+
   // -------- Client lifecycle --------
 
   grpc::Status RegisterClient(grpc::ServerContext* /*ctx*/,
                               const ::umbp::RegisterClientRequest* request,
                               ::umbp::RegisterClientResponse* response) override {
-    std::map<TierType, TierCapacity> caps;
-    for (const auto& tc : request->tier_capacities()) {
-      TierCapacity c;
-      c.total_bytes = tc.total_capacity_bytes();
-      c.available_bytes = tc.available_capacity_bytes();
-      caps[static_cast<TierType>(tc.tier())] = c;
-    }
+    return GuardStore("RegisterClient", [&]() -> grpc::Status {
+      std::map<TierType, TierCapacity> caps;
+      for (const auto& tc : request->tier_capacities()) {
+        TierCapacity c;
+        c.total_bytes = tc.total_capacity_bytes();
+        c.available_bytes = tc.available_capacity_bytes();
+        caps[static_cast<TierType>(tc.tier())] = c;
+      }
 
-    const auto& engine_desc_str = request->engine_desc();
+      const auto& engine_desc_str = request->engine_desc();
 
-    ClientRegistration registration;
-    registration.node_id = request->node_id();
-    registration.node_address = request->node_address();
-    registration.tier_capacities = caps;
-    registration.peer_address = request->peer_address();
-    registration.engine_desc_bytes.assign(engine_desc_str.begin(), engine_desc_str.end());
-    registration.tags.assign(request->tags().begin(), request->tags().end());
+      ClientRegistration registration;
+      registration.node_id = request->node_id();
+      registration.node_address = request->node_address();
+      registration.tier_capacities = caps;
+      registration.peer_address = request->peer_address();
+      registration.engine_desc_bytes.assign(engine_desc_str.begin(), engine_desc_str.end());
+      registration.tags.assign(request->tags().begin(), request->tags().end());
 
-    // stale_after mirrors ClientRegistry::ExpiryDuration() (heartbeat_ttl ×
-    // max_missed_heartbeats) so a TTL-stale ALIVE record the reaper hasn't yet
-    // flipped can still be re-registered (hazard #2).
-    const auto stale_after = config_.heartbeat_ttl * config_.max_missed_heartbeats;
-    const bool registered =
-        store_.RegisterClient(registration, std::chrono::system_clock::now(), stale_after);
-    if (!registered) {
-      return grpc::Status(grpc::StatusCode::ALREADY_EXISTS,
-                          "node is already alive and cannot be re-registered");
-    }
+      // stale_after mirrors ClientRegistry::ExpiryDuration() (heartbeat_ttl ×
+      // max_missed_heartbeats) so a TTL-stale ALIVE record the reaper hasn't yet
+      // flipped can still be re-registered (hazard #2).
+      const auto stale_after = config_.heartbeat_ttl * config_.max_missed_heartbeats;
+      const bool registered =
+          store_.RegisterClient(registration, std::chrono::system_clock::now(), stale_after);
+      if (!registered) {
+        return grpc::Status(grpc::StatusCode::ALREADY_EXISTS,
+                            "node is already alive and cannot be re-registered");
+      }
 
-    UpdateClientCountMetric();
-    UpdateClientCapacityMetrics(request->node_id(), caps);
+      UpdateClientCountMetric();
+      UpdateClientCapacityMetrics(request->node_id(), caps);
 
-    auto interval_ms =
-        static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) / HeartbeatIntervalDivisor();
-    response->set_heartbeat_interval_ms(interval_ms);
-    response->set_ack_seq(0);
-    return grpc::Status::OK;
+      auto interval_ms =
+          static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) / HeartbeatIntervalDivisor();
+      response->set_heartbeat_interval_ms(interval_ms);
+      response->set_ack_seq(0);
+      return grpc::Status::OK;
+    });
   }
 
   grpc::Status UnregisterClient(grpc::ServerContext* /*ctx*/,
                                 const ::umbp::UnregisterClientRequest* request,
                                 ::umbp::UnregisterClientResponse* /*response*/) override {
-    store_.UnregisterClient(request->node_id());
-    UpdateClientCountMetric();
-    return grpc::Status::OK;
+    return GuardStore("UnregisterClient", [&]() -> grpc::Status {
+      store_.UnregisterClient(request->node_id());
+      UpdateClientCountMetric();
+      return grpc::Status::OK;
+    });
   }
 
   // -------- Heartbeat (event-driven) --------
 
   grpc::Status Heartbeat(grpc::ServerContext* /*ctx*/, const ::umbp::HeartbeatRequest* request,
                          ::umbp::HeartbeatResponse* response) override {
-    std::map<TierType, TierCapacity> caps;
-    for (const auto& tc : request->tier_capacities()) {
-      TierCapacity c;
-      c.total_bytes = tc.total_capacity_bytes();
-      c.available_bytes = tc.available_capacity_bytes();
-      caps[static_cast<TierType>(tc.tier())] = c;
-    }
-
-    std::vector<EventBundle> bundles;
-    bundles.reserve(static_cast<size_t>(request->bundles_size()));
-    for (const auto& pb : request->bundles()) {
-      EventBundle bundle;
-      bundle.seq = pb.seq();
-      bundle.events.reserve(static_cast<size_t>(pb.events_size()));
-      for (const auto& pe : pb.events()) bundle.events.push_back(FromProtoEvent(pe));
-      bundles.push_back(std::move(bundle));
-    }
-
-    // §3e heartbeat adapter: the wire protocol ships EventBundle[] (each with
-    // its own seq) but IMasterMetadataStore::ApplyHeartbeat takes one seq at a
-    // time.  Translate here — the store sees one seq per call, which is exactly
-    // what the seq-CAS (hazard #1) requires.
-    const auto now = std::chrono::system_clock::now();
-    uint64_t acked_seq = 0;
-    bool request_full_sync = false;
-    ClientStatus client_status = ClientStatus::ALIVE;
-
-    if (request->is_full_sync()) {
-      // Full sync replaces this node's locations wholesale and re-baselines
-      // last_applied_seq to delta_seq_baseline.  Flatten every bundle's events
-      // into one ApplyHeartbeat call (ReplaceNodeLocations keeps only ADDs).
-      std::vector<KvEvent> events;
-      for (const auto& bundle : bundles) {
-        for (const auto& ev : bundle.events) events.push_back(ev);
+    return GuardStore("Heartbeat", [&]() -> grpc::Status {
+      std::map<TierType, TierCapacity> caps;
+      for (const auto& tc : request->tier_capacities()) {
+        TierCapacity c;
+        c.total_bytes = tc.total_capacity_bytes();
+        c.available_bytes = tc.available_capacity_bytes();
+        caps[static_cast<TierType>(tc.tier())] = c;
       }
-      auto result = store_.ApplyHeartbeat(request->node_id(), request->delta_seq_baseline(), now,
-                                          caps, events, /*is_full_sync=*/true);
-      if (result.status == HeartbeatResult::UNKNOWN) {
-        client_status = ClientStatus::UNKNOWN;
-      } else {
-        acked_seq = result.acked_seq;
+
+      std::vector<EventBundle> bundles;
+      bundles.reserve(static_cast<size_t>(request->bundles_size()));
+      for (const auto& pb : request->bundles()) {
+        EventBundle bundle;
+        bundle.seq = pb.seq();
+        bundle.events.reserve(static_cast<size_t>(pb.events_size()));
+        for (const auto& pe : pb.events()) bundle.events.push_back(FromProtoEvent(pe));
+        bundles.push_back(std::move(bundle));
       }
-    } else if (bundles.empty()) {
-      // Keepalive heartbeat: no events, but liveness must still refresh so the
-      // reaper doesn't expire an idle-but-alive node.  seq=0 deterministically
-      // hits the SEQ_GAP branch, which bumps last_heartbeat + status←ALIVE
-      // without advancing last_applied_seq; the gap is ignored (no full-sync
-      // request) because there is nothing to recover.
-      auto result = store_.ApplyHeartbeat(request->node_id(), /*seq=*/0, now, caps,
-                                          /*events=*/{}, /*is_full_sync=*/false);
-      if (result.status == HeartbeatResult::UNKNOWN) {
-        client_status = ClientStatus::UNKNOWN;
-      } else {
-        acked_seq = result.acked_seq;
-      }
-    } else {
-      // Delta path: apply bundles in ascending-seq order.  A real forward gap
-      // short-circuits the loop and requests a full sync, leaving earlier
-      // bundles applied (Risk item 2 — application is per-bundle, not atomic
-      // across the batch).
-      for (const auto& bundle : bundles) {
-        auto result = store_.ApplyHeartbeat(request->node_id(), bundle.seq, now, caps,
-                                            bundle.events, /*is_full_sync=*/false);
+
+      // §3e heartbeat adapter: the wire protocol ships EventBundle[] (each with
+      // its own seq) but IMasterMetadataStore::ApplyHeartbeat takes one seq at a
+      // time.  Translate here — the store sees one seq per call, which is exactly
+      // what the seq-CAS (hazard #1) requires.
+      const auto now = std::chrono::system_clock::now();
+      uint64_t acked_seq = 0;
+      bool request_full_sync = false;
+      ClientStatus client_status = ClientStatus::ALIVE;
+
+      if (request->is_full_sync()) {
+        // Full sync replaces this node's locations wholesale and re-baselines
+        // last_applied_seq to delta_seq_baseline.  Flatten every bundle's events
+        // into one ApplyHeartbeat call (ReplaceNodeLocations keeps only ADDs).
+        std::vector<KvEvent> events;
+        for (const auto& bundle : bundles) {
+          for (const auto& ev : bundle.events) events.push_back(ev);
+        }
+        auto result = store_.ApplyHeartbeat(request->node_id(), request->delta_seq_baseline(), now,
+                                            caps, events, /*is_full_sync=*/true);
         if (result.status == HeartbeatResult::UNKNOWN) {
           client_status = ClientStatus::UNKNOWN;
-          break;
-        }
-        if (result.status == HeartbeatResult::SEQ_GAP) {
+        } else {
           acked_seq = result.acked_seq;
-          request_full_sync = true;
-          break;
         }
-        acked_seq = result.acked_seq;
-      }
-    }
-
-    response->set_status(static_cast<::umbp::ClientStatus>(client_status));
-    response->set_acked_seq(acked_seq);
-    response->set_request_full_sync(request_full_sync);
-
-    UpdateClientCapacityMetrics(request->node_id(), caps);
-
-    if (metrics_ != nullptr && request->tier_kv_counts_size() > 0) {
-      mori::metrics::MetricsServer::Labels base = {{"node", request->node_id()}};
-      for (const auto& tag : store_.GetClientTags(request->node_id())) {
-        const auto sep = tag.find('=');
-        if (sep != std::string::npos) {
-          base.push_back({tag.substr(0, sep), tag.substr(sep + 1)});
+      } else if (bundles.empty()) {
+        // Keepalive heartbeat: no events, but liveness must still refresh so the
+        // reaper doesn't expire an idle-but-alive node.  seq=0 deterministically
+        // hits the SEQ_GAP branch, which bumps last_heartbeat + status←ALIVE
+        // without advancing last_applied_seq; the gap is ignored (no full-sync
+        // request) because there is nothing to recover.
+        auto result = store_.ApplyHeartbeat(request->node_id(), /*seq=*/0, now, caps,
+                                            /*events=*/{}, /*is_full_sync=*/false);
+        if (result.status == HeartbeatResult::UNKNOWN) {
+          client_status = ClientStatus::UNKNOWN;
+        } else {
+          acked_seq = result.acked_seq;
+        }
+      } else {
+        // Delta path: apply bundles in ascending-seq order.  A real forward gap
+        // short-circuits the loop and requests a full sync, leaving earlier
+        // bundles applied (Risk item 2 — application is per-bundle, not atomic
+        // across the batch).
+        for (const auto& bundle : bundles) {
+          auto result = store_.ApplyHeartbeat(request->node_id(), bundle.seq, now, caps,
+                                              bundle.events, /*is_full_sync=*/false);
+          if (result.status == HeartbeatResult::UNKNOWN) {
+            client_status = ClientStatus::UNKNOWN;
+            break;
+          }
+          if (result.status == HeartbeatResult::SEQ_GAP) {
+            acked_seq = result.acked_seq;
+            request_full_sync = true;
+            break;
+          }
+          acked_seq = result.acked_seq;
         }
       }
-      uint64_t total = 0;
-      for (const auto& tkc : request->tier_kv_counts()) {
-        total += tkc.count();
-        auto labels = base;
-        labels.push_back({"tier", TierTypeName(static_cast<TierType>(tkc.tier()))});
-        metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT,
-                           MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_HELP, labels,
-                           static_cast<double>(tkc.count()));
-      }
-      metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_TOTAL,
-                         MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_TOTAL_HELP, base,
-                         static_cast<double>(total));
-    }
 
-    if (request_full_sync && metrics_ != nullptr) {
-      metrics_->addCounter("mori_umbp_heartbeat_seq_gap_total",
-                           "Heartbeats rejected due to seq gap (full sync requested)",
-                           {{"node", request->node_id()}});
-    }
-    size_t event_count = 0;
-    for (const auto& bundle : bundles) event_count += bundle.events.size();
-    if (metrics_ != nullptr && event_count > 0) {
-      metrics_->addCounter("mori_umbp_heartbeat_events_applied_total",
-                           "KvEvents applied to GlobalBlockIndex via heartbeat",
-                           {{"node", request->node_id()}}, static_cast<uint64_t>(event_count));
-    }
-    return grpc::Status::OK;
+      response->set_status(static_cast<::umbp::ClientStatus>(client_status));
+      response->set_acked_seq(acked_seq);
+      response->set_request_full_sync(request_full_sync);
+
+      UpdateClientCapacityMetrics(request->node_id(), caps);
+
+      if (metrics_ != nullptr && request->tier_kv_counts_size() > 0) {
+        mori::metrics::MetricsServer::Labels base = {{"node", request->node_id()}};
+        for (const auto& tag : store_.GetClientTags(request->node_id())) {
+          const auto sep = tag.find('=');
+          if (sep != std::string::npos) {
+            base.push_back({tag.substr(0, sep), tag.substr(sep + 1)});
+          }
+        }
+        uint64_t total = 0;
+        for (const auto& tkc : request->tier_kv_counts()) {
+          total += tkc.count();
+          auto labels = base;
+          labels.push_back({"tier", TierTypeName(static_cast<TierType>(tkc.tier()))});
+          metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT,
+                             MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_HELP, labels,
+                             static_cast<double>(tkc.count()));
+        }
+        metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_TOTAL,
+                           MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_TOTAL_HELP, base,
+                           static_cast<double>(total));
+      }
+
+      if (request_full_sync && metrics_ != nullptr) {
+        metrics_->addCounter("mori_umbp_heartbeat_seq_gap_total",
+                             "Heartbeats rejected due to seq gap (full sync requested)",
+                             {{"node", request->node_id()}});
+      }
+      size_t event_count = 0;
+      for (const auto& bundle : bundles) event_count += bundle.events.size();
+      if (metrics_ != nullptr && event_count > 0) {
+        metrics_->addCounter("mori_umbp_heartbeat_events_applied_total",
+                             "KvEvents applied to GlobalBlockIndex via heartbeat",
+                             {{"node", request->node_id()}}, static_cast<uint64_t>(event_count));
+      }
+      return grpc::Status::OK;
+    });
   }
 
   // -------- Routing (read-only) --------
 
   grpc::Status RoutePut(grpc::ServerContext* /*ctx*/, const ::umbp::RoutePutRequest* request,
                         ::umbp::RoutePutResponse* response) override {
-    if (request->key().empty()) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
-    }
-    std::unordered_set<std::string> excludes(request->exclude_nodes().begin(),
-                                             request->exclude_nodes().end());
-    auto result =
-        router_.RoutePut(request->key(), request->node_id(), request->block_size(), excludes);
-    if (!result.has_value()) {
-      response->set_outcome(::umbp::ROUTE_PUT_OUTCOME_UNAVAILABLE);
-      return grpc::Status::OK;
-    }
-    if (result->outcome == RoutePutOutcome::kAlreadyExists) {
-      response->set_outcome(::umbp::ROUTE_PUT_OUTCOME_ALREADY_EXISTS);
-      return grpc::Status::OK;
-    }
-    response->set_outcome(::umbp::ROUTE_PUT_OUTCOME_ROUTED);
-    response->set_node_id(result->node_id);
-    response->set_tier(static_cast<::umbp::TierType>(result->tier));
-    response->set_peer_address(result->peer_address);
+    return GuardStore("RoutePut", [&]() -> grpc::Status {
+      if (request->key().empty()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
+      }
+      std::unordered_set<std::string> excludes(request->exclude_nodes().begin(),
+                                               request->exclude_nodes().end());
+      auto result =
+          router_.RoutePut(request->key(), request->node_id(), request->block_size(), excludes);
+      if (!result.has_value()) {
+        response->set_outcome(::umbp::ROUTE_PUT_OUTCOME_UNAVAILABLE);
+        return grpc::Status::OK;
+      }
+      if (result->outcome == RoutePutOutcome::kAlreadyExists) {
+        response->set_outcome(::umbp::ROUTE_PUT_OUTCOME_ALREADY_EXISTS);
+        return grpc::Status::OK;
+      }
+      response->set_outcome(::umbp::ROUTE_PUT_OUTCOME_ROUTED);
+      response->set_node_id(result->node_id);
+      response->set_tier(static_cast<::umbp::TierType>(result->tier));
+      response->set_peer_address(result->peer_address);
 
-    if (metrics_) {
-      metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_ROUTE_PUT,
-                           MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_HELP, {{"node", result->node_id}});
-    }
-    return grpc::Status::OK;
+      if (metrics_) {
+        metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_ROUTE_PUT,
+                             MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_HELP, {{"node", result->node_id}});
+      }
+      return grpc::Status::OK;
+    });
   }
 
   grpc::Status RouteGet(grpc::ServerContext* /*ctx*/, const ::umbp::RouteGetRequest* request,
                         ::umbp::RouteGetResponse* response) override {
-    if (request->key().empty()) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
-    }
-    std::unordered_set<std::string> excludes(request->exclude_nodes().begin(),
-                                             request->exclude_nodes().end());
-    auto result = router_.RouteGet(request->key(), request->node_id(), excludes);
-    if (!result.has_value()) {
-      response->set_found(false);
-      return grpc::Status::OK;
-    }
-    response->set_found(true);
-    response->set_node_id(result->location.node_id);
-    response->set_tier(static_cast<::umbp::TierType>(result->location.tier));
-    response->set_size(result->location.size);
-    response->set_peer_address(result->peer_address);
+    return GuardStore("RouteGet", [&]() -> grpc::Status {
+      if (request->key().empty()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
+      }
+      std::unordered_set<std::string> excludes(request->exclude_nodes().begin(),
+                                               request->exclude_nodes().end());
+      auto result = router_.RouteGet(request->key(), request->node_id(), excludes);
+      if (!result.has_value()) {
+        response->set_found(false);
+        return grpc::Status::OK;
+      }
+      response->set_found(true);
+      response->set_node_id(result->location.node_id);
+      response->set_tier(static_cast<::umbp::TierType>(result->location.tier));
+      response->set_size(result->location.size);
+      response->set_peer_address(result->peer_address);
 
-    if (metrics_) {
-      metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_ROUTE_GET,
-                           MORI_UMBP_METRIC_CLIENT_ROUTE_GET_HELP,
-                           {{"node", result->location.node_id}});
-    }
-    return grpc::Status::OK;
+      if (metrics_) {
+        metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_ROUTE_GET,
+                             MORI_UMBP_METRIC_CLIENT_ROUTE_GET_HELP,
+                             {{"node", result->location.node_id}});
+      }
+      return grpc::Status::OK;
+    });
   }
 
   grpc::Status BatchRoutePut(grpc::ServerContext* /*ctx*/,
                              const ::umbp::BatchRoutePutRequest* request,
                              ::umbp::BatchRoutePutResponse* response) override {
-    if (request->keys_size() != request->block_sizes_size()) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                          "keys and block_sizes must have the same length");
-    }
-    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    std::vector<uint64_t> block_sizes(request->block_sizes().begin(), request->block_sizes().end());
-    std::unordered_set<std::string> excludes(request->exclude_nodes().begin(),
-                                             request->exclude_nodes().end());
+    return GuardStore("BatchRoutePut", [&]() -> grpc::Status {
+      if (request->keys_size() != request->block_sizes_size()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "keys and block_sizes must have the same length");
+      }
+      std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+      std::vector<uint64_t> block_sizes(request->block_sizes().begin(),
+                                        request->block_sizes().end());
+      std::unordered_set<std::string> excludes(request->exclude_nodes().begin(),
+                                               request->exclude_nodes().end());
 
-    auto results = router_.BatchRoutePut(keys, request->node_id(), block_sizes, excludes);
-    for (auto& opt : results) {
-      auto* entry = response->add_entries();
-      if (!opt.has_value()) continue;  // default UNAVAILABLE
-      if (opt->outcome == RoutePutOutcome::kAlreadyExists) {
-        entry->set_outcome(::umbp::ROUTE_PUT_OUTCOME_ALREADY_EXISTS);
-        continue;
+      auto results = router_.BatchRoutePut(keys, request->node_id(), block_sizes, excludes);
+      for (auto& opt : results) {
+        auto* entry = response->add_entries();
+        if (!opt.has_value()) continue;  // default UNAVAILABLE
+        if (opt->outcome == RoutePutOutcome::kAlreadyExists) {
+          entry->set_outcome(::umbp::ROUTE_PUT_OUTCOME_ALREADY_EXISTS);
+          continue;
+        }
+        entry->set_outcome(::umbp::ROUTE_PUT_OUTCOME_ROUTED);
+        entry->set_node_id(opt->node_id);
+        entry->set_tier(static_cast<::umbp::TierType>(opt->tier));
+        entry->set_peer_address(opt->peer_address);
+        if (metrics_) {
+          metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT,
+                               MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_HELP,
+                               {{"node", opt->node_id}});
+        }
       }
-      entry->set_outcome(::umbp::ROUTE_PUT_OUTCOME_ROUTED);
-      entry->set_node_id(opt->node_id);
-      entry->set_tier(static_cast<::umbp::TierType>(opt->tier));
-      entry->set_peer_address(opt->peer_address);
-      if (metrics_) {
-        metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT,
-                             MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_HELP,
-                             {{"node", opt->node_id}});
-      }
-    }
-    return grpc::Status::OK;
+      return grpc::Status::OK;
+    });
   }
 
   grpc::Status BatchRouteGet(grpc::ServerContext* /*ctx*/,
                              const ::umbp::BatchRouteGetRequest* request,
                              ::umbp::BatchRouteGetResponse* response) override {
-    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    std::unordered_set<std::string> excludes(request->exclude_nodes().begin(),
-                                             request->exclude_nodes().end());
-    auto results = router_.BatchRouteGet(keys, request->node_id(), excludes);
-    // Columnar response: distinct (node_id, peer_address) pairs are emitted
-    // once into `nodes`; each key carries a 1-based node_ref index (0 = not
-    // found). node_ref/tier/size are parallel arrays aligned with the request
-    // keys, so the per-key fields default to 0 for unresolved keys.
-    response->mutable_node_ref()->Reserve(static_cast<int>(results.size()));
-    response->mutable_tier()->Reserve(static_cast<int>(results.size()));
-    response->mutable_size()->Reserve(static_cast<int>(results.size()));
-    // Maps "node_id\0peer_address" -> 1-based index into response->nodes().
-    std::unordered_map<std::string, uint32_t> node_index;
-    for (auto& opt : results) {
-      if (!opt.has_value()) {
-        response->add_node_ref(0);
-        response->add_tier(::umbp::TIER_UNKNOWN);
-        response->add_size(0);
-        continue;
+    return GuardStore("BatchRouteGet", [&]() -> grpc::Status {
+      std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+      std::unordered_set<std::string> excludes(request->exclude_nodes().begin(),
+                                               request->exclude_nodes().end());
+      auto results = router_.BatchRouteGet(keys, request->node_id(), excludes);
+      // Columnar response: distinct (node_id, peer_address) pairs are emitted
+      // once into `nodes`; each key carries a 1-based node_ref index (0 = not
+      // found). node_ref/tier/size are parallel arrays aligned with the request
+      // keys, so the per-key fields default to 0 for unresolved keys.
+      response->mutable_node_ref()->Reserve(static_cast<int>(results.size()));
+      response->mutable_tier()->Reserve(static_cast<int>(results.size()));
+      response->mutable_size()->Reserve(static_cast<int>(results.size()));
+      // Maps "node_id\0peer_address" -> 1-based index into response->nodes().
+      std::unordered_map<std::string, uint32_t> node_index;
+      for (auto& opt : results) {
+        if (!opt.has_value()) {
+          response->add_node_ref(0);
+          response->add_tier(::umbp::TIER_UNKNOWN);
+          response->add_size(0);
+          continue;
+        }
+        std::string node_key = opt->location.node_id;
+        node_key.push_back('\0');
+        node_key.append(opt->peer_address);
+        auto [it, inserted] = node_index.try_emplace(node_key, 0);
+        if (inserted) {
+          auto* node = response->add_nodes();
+          node->set_node_id(opt->location.node_id);
+          node->set_peer_address(opt->peer_address);
+          it->second = static_cast<uint32_t>(response->nodes_size());  // 1-based
+        }
+        response->add_node_ref(it->second);
+        response->add_tier(static_cast<::umbp::TierType>(opt->location.tier));
+        response->add_size(opt->location.size);
+        if (metrics_) {
+          metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET,
+                               MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP,
+                               {{"node", opt->location.node_id}});
+        }
       }
-      std::string node_key = opt->location.node_id;
-      node_key.push_back('\0');
-      node_key.append(opt->peer_address);
-      auto [it, inserted] = node_index.try_emplace(node_key, 0);
-      if (inserted) {
-        auto* node = response->add_nodes();
-        node->set_node_id(opt->location.node_id);
-        node->set_peer_address(opt->peer_address);
-        it->second = static_cast<uint32_t>(response->nodes_size());  // 1-based
-      }
-      response->add_node_ref(it->second);
-      response->add_tier(static_cast<::umbp::TierType>(opt->location.tier));
-      response->add_size(opt->location.size);
-      if (metrics_) {
-        metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET,
-                             MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP,
-                             {{"node", opt->location.node_id}});
-      }
-    }
-    return grpc::Status::OK;
+      return grpc::Status::OK;
+    });
   }
 
   grpc::Status BatchLookup(grpc::ServerContext* /*ctx*/, const ::umbp::BatchLookupRequest* request,
                            ::umbp::BatchLookupResponse* response) override {
-    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    auto found = store_.BatchExistsBlock(keys);
-    for (bool b : found) response->add_found(b);
-    return grpc::Status::OK;
+    return GuardStore("BatchLookup", [&]() -> grpc::Status {
+      std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+      auto found = store_.BatchExistsBlock(keys);
+      for (bool b : found) response->add_found(b);
+      return grpc::Status::OK;
+    });
   }
 
   // -------- External KV mutation/query --------
@@ -527,204 +563,218 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   grpc::Status ReportExternalKvBlocks(
       grpc::ServerContext* /*ctx*/, const ::umbp::ReportExternalKvBlocksRequest* request,
       ::umbp::ReportExternalKvBlocksResponse* /*response*/) override {
-    if (request->node_id().empty()) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
-    }
-    if (request->hashes_size() == 0) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "hashes must not be empty");
-    }
+    return GuardStore("ReportExternalKvBlocks", [&]() -> grpc::Status {
+      if (request->node_id().empty()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
+      }
+      if (request->hashes_size() == 0) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "hashes must not be empty");
+      }
 
-    const TierType tier = static_cast<TierType>(request->tier());
-    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    // Alive-check + write are fused into one atomic store call (closes the
-    // TOCTOU gap between the old IsClientAlive check and Register — §2b.5).
-    const bool applied = store_.RegisterExternalKvIfAlive(request->node_id(), hashes, tier);
-    if (!applied) {
-      MORI_UMBP_WARN("[Server] ReportExternalKvBlocks rejected: node not alive: {}",
-                     request->node_id());
+      const TierType tier = static_cast<TierType>(request->tier());
+      std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+      // Alive-check + write are fused into one atomic store call (closes the
+      // TOCTOU gap between the old IsClientAlive check and Register — §2b.5).
+      const bool applied = store_.RegisterExternalKvIfAlive(request->node_id(), hashes, tier);
+      if (!applied) {
+        MORI_UMBP_WARN("[Server] ReportExternalKvBlocks rejected: node not alive: {}",
+                       request->node_id());
+        if (metrics_) {
+          metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL,
+                               MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP,
+                               {{"node", request->node_id()},
+                                {"tier", TierTypeName(tier)},
+                                {"result", "rejected_not_alive"}});
+        }
+        return grpc::Status::OK;
+      }
+
       if (metrics_) {
-        metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL,
-                             MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP,
-                             {{"node", request->node_id()},
-                              {"tier", TierTypeName(tier)},
-                              {"result", "rejected_not_alive"}});
+        const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
+                                                             {"tier", TierTypeName(tier)}};
+        metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL,
+                             MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL_HELP, labels,
+                             static_cast<uint64_t>(hashes.size()));
+        metrics_->addCounter(
+            MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL, MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP,
+            {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
       }
       return grpc::Status::OK;
-    }
-
-    if (metrics_) {
-      const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
-                                                           {"tier", TierTypeName(tier)}};
-      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL_HELP, labels,
-                           static_cast<uint64_t>(hashes.size()));
-      metrics_->addCounter(
-          MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL, MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP,
-          {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
-    }
-    return grpc::Status::OK;
+    });
   }
 
   grpc::Status RevokeExternalKvBlocks(
       grpc::ServerContext* /*ctx*/, const ::umbp::RevokeExternalKvBlocksRequest* request,
       ::umbp::RevokeExternalKvBlocksResponse* /*response*/) override {
-    if (request->node_id().empty()) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
-    }
-    if (request->hashes_size() == 0) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "hashes must not be empty");
-    }
+    return GuardStore("RevokeExternalKvBlocks", [&]() -> grpc::Status {
+      if (request->node_id().empty()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
+      }
+      if (request->hashes_size() == 0) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "hashes must not be empty");
+      }
 
-    const TierType tier = static_cast<TierType>(request->tier());
-    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    store_.UnregisterExternalKv(request->node_id(), hashes, tier);
-    if (metrics_) {
-      const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
-                                                           {"tier", TierTypeName(tier)}};
-      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP, labels,
-                           static_cast<uint64_t>(hashes.size()));
-      metrics_->addCounter(
-          MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL, MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
-          {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
-    }
-    return grpc::Status::OK;
+      const TierType tier = static_cast<TierType>(request->tier());
+      std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+      store_.UnregisterExternalKv(request->node_id(), hashes, tier);
+      if (metrics_) {
+        const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
+                                                             {"tier", TierTypeName(tier)}};
+        metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
+                             MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP, labels,
+                             static_cast<uint64_t>(hashes.size()));
+        metrics_->addCounter(
+            MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL, MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
+            {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
+      }
+      return grpc::Status::OK;
+    });
   }
 
   grpc::Status RevokeAllExternalKvBlocksAtTier(
       grpc::ServerContext* /*ctx*/, const ::umbp::RevokeAllExternalKvBlocksAtTierRequest* request,
       ::umbp::RevokeAllExternalKvBlocksAtTierResponse* /*response*/) override {
-    if (request->node_id().empty()) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
-    }
+    return GuardStore("RevokeAllExternalKvBlocksAtTier", [&]() -> grpc::Status {
+      if (request->node_id().empty()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
+      }
 
-    const TierType tier = static_cast<TierType>(request->tier());
-    // Whole-tier wipe. UnregisterExternalKvByTier returns void (the store
-    // interface does not surface a mutated-block count), so the per-block
-    // counter is no longer emitted for this admin path; the revoke_total
-    // counter still records the operation.
-    store_.UnregisterExternalKvByTier(request->node_id(), tier);
-    if (metrics_) {
-      metrics_->addCounter(
-          MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL, MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
-          {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
-    }
-    return grpc::Status::OK;
+      const TierType tier = static_cast<TierType>(request->tier());
+      // Whole-tier wipe. UnregisterExternalKvByTier returns void (the store
+      // interface does not surface a mutated-block count), so the per-block
+      // counter is no longer emitted for this admin path; the revoke_total
+      // counter still records the operation.
+      store_.UnregisterExternalKvByTier(request->node_id(), tier);
+      if (metrics_) {
+        metrics_->addCounter(
+            MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL, MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
+            {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
+      }
+      return grpc::Status::OK;
+    });
   }
 
   grpc::Status RevokeAllExternalKvBlocksForNode(
       grpc::ServerContext* /*ctx*/, const ::umbp::RevokeAllExternalKvBlocksForNodeRequest* request,
       ::umbp::RevokeAllExternalKvBlocksForNodeResponse* /*response*/) override {
-    if (request->node_id().empty()) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
-    }
+    return GuardStore("RevokeAllExternalKvBlocksForNode", [&]() -> grpc::Status {
+      if (request->node_id().empty()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
+      }
 
-    // All-tier wipe for one node (full-sync recovery path). Returns void, so
-    // the per-block counter is dropped here as in the per-tier wipe above.
-    store_.UnregisterExternalKvByNode(request->node_id());
-    if (metrics_) {
-      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
-                           {{"node", request->node_id()}, {"tier", "ALL"}, {"result", "ok"}});
-    }
-    return grpc::Status::OK;
+      // All-tier wipe for one node (full-sync recovery path). Returns void, so
+      // the per-block counter is dropped here as in the per-tier wipe above.
+      store_.UnregisterExternalKvByNode(request->node_id());
+      if (metrics_) {
+        metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL,
+                             MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
+                             {{"node", request->node_id()}, {"tier", "ALL"}, {"result", "ok"}});
+      }
+      return grpc::Status::OK;
+    });
   }
 
   grpc::Status MatchExternalKv(grpc::ServerContext* /*ctx*/,
                                const ::umbp::MatchExternalKvRequest* request,
                                ::umbp::MatchExternalKvResponse* response) override {
-    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    // The store fuses the match with the hit-count increment + last_seen stamp
-    // (when count_as_hit) into one lock acquisition; the handler no longer
-    // makes a separate IncrementHits call. `now` crosses the store boundary
-    // (system_clock) and feeds GarbageCollectHits.
-    auto matches =
-        store_.MatchExternalKv(hashes, request->count_as_hit(), std::chrono::system_clock::now());
+    return GuardStore("MatchExternalKv", [&]() -> grpc::Status {
+      std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+      // The store fuses the match with the hit-count increment + last_seen stamp
+      // (when count_as_hit) into one lock acquisition; the handler no longer
+      // makes a separate IncrementHits call. `now` crosses the store boundary
+      // (system_clock) and feeds GarbageCollectHits.
+      auto matches =
+          store_.MatchExternalKv(hashes, request->count_as_hit(), std::chrono::system_clock::now());
 
-    auto peer_map = store_.GetAlivePeerView();
-    for (auto& m : matches) {
-      auto* proto_match = response->add_matches();
-      proto_match->set_node_id(m.node_id);
-      auto peer_it = peer_map.find(m.node_id);
-      if (peer_it != peer_map.end()) proto_match->set_peer_address(peer_it->second);
-      for (const auto& [tier, hashes] : m.hashes_by_tier) {
-        auto* proto_bucket = proto_match->add_hashes_by_tier();
-        proto_bucket->set_tier(static_cast<::umbp::TierType>(tier));
-        for (const auto& hash : hashes) proto_bucket->add_hashes(hash);
+      auto peer_map = store_.GetAlivePeerView();
+      for (auto& m : matches) {
+        auto* proto_match = response->add_matches();
+        proto_match->set_node_id(m.node_id);
+        auto peer_it = peer_map.find(m.node_id);
+        if (peer_it != peer_map.end()) proto_match->set_peer_address(peer_it->second);
+        for (const auto& [tier, hashes] : m.hashes_by_tier) {
+          auto* proto_bucket = proto_match->add_hashes_by_tier();
+          proto_bucket->set_tier(static_cast<::umbp::TierType>(tier));
+          for (const auto& hash : hashes) proto_bucket->add_hashes(hash);
+        }
       }
-    }
 
-    size_t total_matched = 0;
-    for (const auto& m : matches) total_matched += m.MatchedHashCount();
-    if (metrics_) {
-      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL_HELP);
-      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_QUERIED_BLOCKS_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_MATCH_QUERIED_BLOCKS_TOTAL_HELP,
-                           static_cast<uint64_t>(hashes.size()));
-      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_MATCHED_BLOCKS_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_MATCH_MATCHED_BLOCKS_TOTAL_HELP,
-                           static_cast<uint64_t>(total_matched));
-    }
-    return grpc::Status::OK;
+      size_t total_matched = 0;
+      for (const auto& m : matches) total_matched += m.MatchedHashCount();
+      if (metrics_) {
+        metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL,
+                             MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL_HELP);
+        metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_QUERIED_BLOCKS_TOTAL,
+                             MORI_UMBP_METRIC_EXT_KV_MATCH_QUERIED_BLOCKS_TOTAL_HELP,
+                             static_cast<uint64_t>(hashes.size()));
+        metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_MATCHED_BLOCKS_TOTAL,
+                             MORI_UMBP_METRIC_EXT_KV_MATCH_MATCHED_BLOCKS_TOTAL_HELP,
+                             static_cast<uint64_t>(total_matched));
+      }
+      return grpc::Status::OK;
+    });
   }
 
   grpc::Status GetExternalKvHitCounts(grpc::ServerContext* /*ctx*/,
                                       const ::umbp::GetExternalKvHitCountsRequest* request,
                                       ::umbp::GetExternalKvHitCountsResponse* response) override {
-    const size_t max_batch = static_cast<size_t>(HitQueryMaxBatch());
-    if (static_cast<size_t>(request->hashes_size()) > max_batch) {
-      return grpc::Status(
-          grpc::StatusCode::INVALID_ARGUMENT,
-          "hashes size exceeds UMBP_HIT_QUERY_MAX_BATCH=" + std::to_string(max_batch));
-    }
+    return GuardStore("GetExternalKvHitCounts", [&]() -> grpc::Status {
+      const size_t max_batch = static_cast<size_t>(HitQueryMaxBatch());
+      if (static_cast<size_t>(request->hashes_size()) > max_batch) {
+        return grpc::Status(
+            grpc::StatusCode::INVALID_ARGUMENT,
+            "hashes size exceeds UMBP_HIT_QUERY_MAX_BATCH=" + std::to_string(max_batch));
+      }
 
-    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    auto entries = store_.GetExternalKvHitCounts(hashes);
-    for (const auto& e : entries) {
-      auto* entry = response->add_entries();
-      entry->set_hash(e.hash);
-      entry->set_hit_count_total(e.hit_count_total);
-    }
-    return grpc::Status::OK;
+      std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+      auto entries = store_.GetExternalKvHitCounts(hashes);
+      for (const auto& e : entries) {
+        auto* entry = response->add_entries();
+        entry->set_hash(e.hash);
+        entry->set_hit_count_total(e.hit_count_total);
+      }
+      return grpc::Status::OK;
+    });
   }
 
   grpc::Status ReportMetrics(grpc::ServerContext* /*ctx*/,
                              const ::umbp::ReportMetricsRequest* request,
                              ::umbp::ReportMetricsResponse* /*response*/) override {
-    if (!metrics_) return grpc::Status::OK;
+    return GuardStore("ReportMetrics", [&]() -> grpc::Status {
+      if (!metrics_) return grpc::Status::OK;
 
-    mori::metrics::MetricsServer::Labels base = {{"node", request->node_id()}};
-    for (const auto& tag : store_.GetClientTags(request->node_id())) {
-      const auto sep = tag.find('=');
-      if (sep != std::string::npos) {
-        base.push_back({tag.substr(0, sep), tag.substr(sep + 1)});
-      }
-    }
-    for (const auto& s : request->metrics()) {
-      mori::metrics::MetricsServer::Labels labels = base;
-      for (const auto& l : s.labels()) labels.push_back({l.name(), l.value()});
-      switch (s.value_case()) {
-        case ::umbp::MetricSample::kCounterDelta:
-          metrics_->addCounter(s.name(), s.help(), labels,
-                               static_cast<uint64_t>(s.counter_delta()));
-          break;
-        case ::umbp::MetricSample::kGaugeValue:
-          metrics_->setGauge(s.name(), s.help(), labels, s.gauge_value());
-          break;
-        case ::umbp::MetricSample::kHistogramAggregate: {
-          const auto& a = s.histogram_aggregate();
-          std::vector<double> bounds(a.bounds().begin(), a.bounds().end());
-          std::vector<uint64_t> counts(a.bucket_counts().begin(), a.bucket_counts().end());
-          metrics_->observeAggregated(s.name(), s.help(), labels, bounds, counts, a.count(),
-                                      a.sum());
-          break;
+      mori::metrics::MetricsServer::Labels base = {{"node", request->node_id()}};
+      for (const auto& tag : store_.GetClientTags(request->node_id())) {
+        const auto sep = tag.find('=');
+        if (sep != std::string::npos) {
+          base.push_back({tag.substr(0, sep), tag.substr(sep + 1)});
         }
-        default:
-          break;
       }
-    }
-    return grpc::Status::OK;
+      for (const auto& s : request->metrics()) {
+        mori::metrics::MetricsServer::Labels labels = base;
+        for (const auto& l : s.labels()) labels.push_back({l.name(), l.value()});
+        switch (s.value_case()) {
+          case ::umbp::MetricSample::kCounterDelta:
+            metrics_->addCounter(s.name(), s.help(), labels,
+                                 static_cast<uint64_t>(s.counter_delta()));
+            break;
+          case ::umbp::MetricSample::kGaugeValue:
+            metrics_->setGauge(s.name(), s.help(), labels, s.gauge_value());
+            break;
+          case ::umbp::MetricSample::kHistogramAggregate: {
+            const auto& a = s.histogram_aggregate();
+            std::vector<double> bounds(a.bounds().begin(), a.bounds().end());
+            std::vector<uint64_t> counts(a.bucket_counts().begin(), a.bucket_counts().end());
+            metrics_->observeAggregated(s.name(), s.help(), labels, bounds, counts, a.count(),
+                                        a.sum());
+            break;
+          }
+          default:
+            break;
+        }
+      }
+      return grpc::Status::OK;
+    });
   }
 
   void SetMetrics(mori::metrics::MetricsServer* metrics) { metrics_ = metrics; }
@@ -876,9 +926,15 @@ void MasterServer::HitIndexGcLoop() {
     // cutoff is a system_clock time_point now (hazard #7) so it's comparable
     // to the last_seen the store stamps in MatchExternalKv(count_as_hit=true).
     const auto cutoff = std::chrono::system_clock::now() - ttl;
-    const size_t dropped = store_->GarbageCollectHits(cutoff);
-    if (dropped > 0) {
-      MORI_UMBP_DEBUG("[Master] External KV hit index GC dropped {} entries", dropped);
+    // A store hiccup (e.g. RESP transport error) must not kill the GC thread;
+    // swallow, log, and retry on the next tick.
+    try {
+      const size_t dropped = store_->GarbageCollectHits(cutoff);
+      if (dropped > 0) {
+        MORI_UMBP_DEBUG("[Master] External KV hit index GC dropped {} entries", dropped);
+      }
+    } catch (const std::exception& e) {
+      MORI_UMBP_ERROR("[Master] hit-index GC metadata-store error: {}", e.what());
     }
   }
 }
@@ -917,9 +973,14 @@ void MasterServer::ReaperLoop() {
     if (!reaper_running_) break;
 
     const auto cutoff = std::chrono::system_clock::now() - expiry;
-    auto expired = store_->ExpireStaleClients(cutoff);
-    for (const auto& node_id : expired) {
-      MORI_UMBP_WARN("[Reaper] Expired client: {}", node_id);
+    // A store hiccup must not kill the reaper thread; log and retry next tick.
+    try {
+      auto expired = store_->ExpireStaleClients(cutoff);
+      for (const auto& node_id : expired) {
+        MORI_UMBP_WARN("[Reaper] Expired client: {}", node_id);
+      }
+    } catch (const std::exception& e) {
+      MORI_UMBP_ERROR("[Reaper] metadata-store error: {}", e.what());
     }
   }
 }

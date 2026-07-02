@@ -71,7 +71,13 @@ void EvictionManager::EvictionLoop() {
                    [this] { return !running_.load(std::memory_order_relaxed); });
     }
     if (!running_.load(std::memory_order_relaxed)) break;
-    RunOnce();
+    // A metadata-store hiccup (e.g. RESP transport error) must not kill the
+    // eviction thread; log and retry on the next tick.
+    try {
+      RunOnce();
+    } catch (const std::exception& e) {
+      MORI_UMBP_ERROR("[EvictionManager] metadata-store error: {}", e.what());
+    }
   }
 }
 
