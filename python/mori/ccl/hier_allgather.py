@@ -1779,14 +1779,19 @@ class HierAllGather:
         # __call__ path uses, but writing PARAM-CONTIGUOUS straight into the user
         # output (no copy-OUT). The serial Phase-A-then-scatter path forwent this
         # overlap and lost to RCCL (99.7 vs 127 TFLOPS); this recovers it.
+        # OPT-IN (default OFF): the overlap path is bit-exact in the standalone
+        # 2-node test but currently triggers an HSA memory-exception under FSDP's
+        # repeated-call / buffer-reuse pattern (side-stream local scatter). Ship
+        # the proven non-overlap fused scatter as the default zero-copy path;
+        # enable overlap with MORI_HIER_PC_OVERLAP=1 to iterate on the fault.
         overlap = (
             self.stream_intra
             and self.stream_ring
             and self.slice_direct
             and N >= 2
             and not entry_barrier
-            and os.environ.get("MORI_HIER_PC_NO_OVERLAP", "0")
-            not in ("1", "true", "True")
+            and os.environ.get("MORI_HIER_PC_OVERLAP", "0")
+            in ("1", "true", "True")
         )
         if overlap:
             node = self.node_id
