@@ -64,15 +64,33 @@ def _expected_param_contiguous(inp, splits, G, subgroup, device):
     return expected
 
 
-def _run_one(handle, dtype, rank, G, subgroup, device, direct_reg):
+def _gather_once(handle, inp, out, ss_u32, so_u32, blk_stride_u32, G):
+    """One param-contiguous direct gather into an ALREADY-registered ``out``
+    (matches the adapter's register-once + repeated-call contract)."""
+    stream = torch.cuda.current_stream()
+    ok = handle.gather_kernel_direct_param_contiguous(
+        inp, out, blk_stride_u32,
+        1,       # num_blocks = 1 (single node block; pure intra)
+        G,       # world_size for the [param][rank] output stride
+        ss_u32, so_u32,
+        stream=stream, prepare_barrier=True, first_block=0,
+    )
+    assert ok, "gather_kernel_direct_param_contiguous returned False"
+    handle.finish_direct_stream(stream=stream, barrier=True)
+    stream.synchronize()
+    torch.cuda.synchronize()
+
+
+def _run_dtype(handle, dtype, rank, G, subgroup, device, reps):
+    """Register the output ONCE, then gather ``reps`` times into it -- exactly
+    the FSDP adapter pattern (persistent registered output, repeated AG). A race
+    in the completion/quiet path shows up as a run-to-run mismatch here."""
     splits = _PARAM_SPLITS
     count = sum(splits)
     inp = _make_input(dtype, count, rank, device)
     out = torch.empty(count * G, dtype=dtype, device=device)
-
     ref = _expected_param_contiguous(inp, splits, G, subgroup, device)
 
-    # Build the u32-lane split sizes/offsets exactly like the adapter does.
     elem = inp.element_size()
     offsets, acc = [], 0
     for e in splits:
@@ -82,33 +100,34 @@ def _run_one(handle, dtype, rank, G, subgroup, device, direct_reg):
     so_u32 = torch.tensor([(o * elem) // 4 for o in offsets], dtype=torch.int64, device=device)
     blk_stride_u32 = (count * elem) // 4
 
-    stream = torch.cuda.current_stream()
-    # register the (large) output for the direct IPC scatter. Registration is a
-    # collective symmetric op; barrier so every peer's IPC handles are exchanged
-    # before any kernel dereferences peerPtrs (matches the adapter's persistent
-    # register-once + prepare-barrier contract).
+    # register ONCE (collective symmetric op; barrier so every peer's IPC handles
+    # are exchanged before any kernel dereferences peerPtrs).
     handle.register_output_buffer(out)
     torch.cuda.synchronize()
     dist.barrier()
-    ok = handle.gather_kernel_direct_param_contiguous(
-        inp, out, blk_stride_u32,
-        1,       # num_blocks = 1 (single node block; pure intra)
-        G,       # world_size for the [param][rank] output stride
-        ss_u32, so_u32,
-        stream=stream, prepare_barrier=True, first_block=0,
-    )
-    assert ok, f"gather_kernel_direct_param_contiguous returned False dtype={dtype}"
-    handle.finish_direct_stream(stream=stream, barrier=True)
-    stream.synchronize()
-    torch.cuda.synchronize()
-    handle.deregister_output_buffer(out)
-
-    if not torch.equal(out, ref):
-        diff = (out != ref).nonzero(as_tuple=False).flatten()[:8].tolist()
-        raise AssertionError(
-            f"intra param-contiguous mismatch dtype={dtype} rank={rank}: "
-            f"positions={diff} got={out[diff].tolist()} ref={ref[diff].tolist()}"
-        )
+    try:
+        for _rep in range(reps):
+            out.zero_()  # ensure a stale-read race can't be masked by prior data
+            torch.cuda.synchronize()
+            dist.barrier()
+            _gather_once(handle, inp, out, ss_u32, so_u32, blk_stride_u32, G)
+            if rank == 0 and _rep == 0 and dtype == torch.bfloat16:
+                E0 = splits[0]
+                slotvals = [int(out[g * E0].item()) for g in range(G)]
+                bases = [int((g + 1) * 17) for g in range(G)]
+                print(f"RECVDUMP rank0 param0 slot bases got={slotvals} "
+                      f"(expect r-th slot = base {bases}) inp0={int(inp[0].item())}")
+            if not torch.equal(out, ref):
+                diff = (out != ref).nonzero(as_tuple=False).flatten()[:8].tolist()
+                raise AssertionError(
+                    f"intra param-contiguous mismatch dtype={dtype} rank={rank} "
+                    f"rep={_rep}: positions={diff} got={out[diff].tolist()} "
+                    f"ref={ref[diff].tolist()}"
+                )
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        handle.deregister_output_buffer(out)
 
 
 def _worker_body(rank, world_size, G, device):
@@ -136,11 +155,10 @@ def _worker_body(rank, world_size, G, device):
         print(f"intra param-contig: world={world_size} G={G} "
               f"num_nodes={world_size // G} reps={_REPS}")
     try:
-        for _rep in range(_REPS):
-            for dtype in _DTYPES:
-                _run_one(handle, dtype, rank, G, subgroup, device, None)
-                if rank == 0 and _rep == 0:
-                    print(f"  ok dtype={dtype}")
+        for dtype in _DTYPES:
+            _run_dtype(handle, dtype, rank, G, subgroup, device, _REPS)
+            if rank == 0:
+                print(f"  ok dtype={dtype} ({_REPS} reps)")
         torch.cuda.synchronize()
         dist.barrier()
         if rank == 0:
