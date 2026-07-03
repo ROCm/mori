@@ -58,7 +58,27 @@ inline bool HierDissemBarrierEnabled() {
   return enabled;
 }
 
+// MEASUREMENT-ONLY: when MORI_HIER_NO_ENTRY_BARRIER!=0 the ring's prepare entry
+// rendezvous barrier is SKIPPED. This is NOT correctness-safe (it drops the
+// cross-PE fence that orders every PE's op-end flag-reset + own-chunk staging
+// before any peer's next-op atomic increment) -- it exists solely to quantify
+// the EXPOSED per-op barrier cost under back-to-back FSDP all-gathers (the
+// standalone UT device-syncs between reps so it never exposes op-to-op barrier
+// serialization; FSDP issues ~65 AGs/step back-to-back). If skipping recovers
+// the FSDP gap vs RCCL, the generation-counter barrier-free ring (see the
+// prepare_stream flag-reset invariant note) is the justified fix.
+inline bool HierEntryBarrierDisabled() {
+  static const bool disabled = []() {
+    const char* e = std::getenv("MORI_HIER_NO_ENTRY_BARRIER");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  return disabled;
+}
+
 inline void HierPrepareBarrierOnStream(hipStream_t stream) {
+  if (HierEntryBarrierDisabled()) {
+    return;
+  }
   if (HierDissemBarrierEnabled()) {
     shmem::ShmemBarrierOnStreamDissem(stream);
   } else {
