@@ -75,8 +75,26 @@ inline bool HierEntryBarrierDisabled() {
   return disabled;
 }
 
+// MEASUREMENT-ONLY master switch: when MORI_HIER_NO_ALL_BARRIER!=0 EVERY
+// cross-PE barrier (entry ShmemBarrierOnStream, the deferred finish fences, the
+// host ShmemBarrierAll rendezvous in both the inter-node ring AND the intra-node
+// subgroup gather) is skipped. NOT correctness-safe. This is the reviewer's
+// decisive all-barrier-removal A/B: Turn 10 only removed the ENTRY barrier
+// (+1% on a healthy cluster); this removes the FINISH + intra barriers too, to
+// finally decide whether per-op barrier SKEW (each AG waiting for the slowest
+// rank's backward GEMM) is the residual FSDP gap vs RCCL. If flat hier recovers
+// to ~RCCL, the generation-counter barrier-free ring is justified; if it stays
+// ~110, barrier-skew is ruled out and the gap is elsewhere.
+inline bool HierAllBarrierDisabled() {
+  static const bool disabled = []() {
+    const char* e = std::getenv("MORI_HIER_NO_ALL_BARRIER");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  return disabled;
+}
+
 inline void HierPrepareBarrierOnStream(hipStream_t stream) {
-  if (HierEntryBarrierDisabled()) {
+  if (HierEntryBarrierDisabled() || HierAllBarrierDisabled()) {
     return;
   }
   if (HierDissemBarrierEnabled()) {
@@ -194,7 +212,7 @@ class InterNodeRingAllgather {
     // Global barrier: all PEs have cleared flags + staged their own chunk
     // before the ring (with its cross-PE atomic increments) begins. (All PEs
     // call this op -- each participates in exactly one sub-group.)
-    shmem::ShmemBarrierAll();
+    if (!HierAllBarrierDisabled()) shmem::ShmemBarrierAll();
 
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
@@ -308,13 +326,13 @@ class InterNodeRingAllgather {
     size_t total = static_cast<size_t>(ringSize_) * chunkBytes;
     (void)hipMemcpyAsync(reinterpret_cast<void*>(output), ring_, total, hipMemcpyDeviceToDevice,
                          stream);
-    if (barrier) shmem::ShmemBarrierOnStream(stream);
+    if (barrier && !HierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
     return 0.0;
   }
 
   // Stream-ordered counterpart of finish_sync_no_copy (result left in ring buf).
   double finish_stream_no_copy(hipStream_t stream) {
-    shmem::ShmemBarrierOnStream(stream);
+    if (!HierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
     return 0.0;
   }
 
@@ -346,7 +364,7 @@ class InterNodeRingAllgather {
 
     // Global barrier: all PEs have cleared flags + staged their own chunk (the
     // upstream gather already wrote into slot_ptr) before the ring begins.
-    shmem::ShmemBarrierAll();
+    if (!HierAllBarrierDisabled()) shmem::ShmemBarrierAll();
 
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
@@ -371,7 +389,7 @@ class InterNodeRingAllgather {
     (void)hipStreamSynchronize(stream);
     // Barrier so no PE frees/reuses the ring buffer while a peer is still
     // reading from it in a subsequent op.
-    shmem::ShmemBarrierAll();
+    if (!HierAllBarrierDisabled()) shmem::ShmemBarrierAll();
     return 0.0;
   }
 
@@ -395,7 +413,7 @@ class InterNodeRingAllgather {
   // the timed AllGather. So this is expected to be a real win, not a wash.
   double finish_sync_no_copy(hipStream_t stream) {
     (void)hipStreamSynchronize(stream);
-    shmem::ShmemBarrierAll();
+    if (!HierAllBarrierDisabled()) shmem::ShmemBarrierAll();
     return 0.0;
   }
 

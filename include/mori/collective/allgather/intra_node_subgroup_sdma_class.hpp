@@ -37,6 +37,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <stdexcept>
 #include <utility>
@@ -46,6 +47,18 @@
 
 namespace mori {
 namespace collective {
+
+// MEASUREMENT-ONLY (mirror of inter_node_ring_class HierAllBarrierDisabled): when
+// MORI_HIER_NO_ALL_BARRIER!=0 the intra-node subgroup gather's cross-PE barriers
+// are skipped too, so the reviewer's all-barrier-removal A/B covers BOTH phases
+// (inter ring + intra gather). NOT correctness-safe.
+inline bool IntraHierAllBarrierDisabled() {
+  static const bool disabled = []() {
+    const char* e = std::getenv("MORI_HIER_NO_ALL_BARRIER");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  return disabled;
+}
 
 class IntraNodeSubGroupAllgatherSdma {
  private:
@@ -218,7 +231,7 @@ class IntraNodeSubGroupAllgatherSdma {
 
     // All members enter the gather together (flags are monotonic; the token
     // distinguishes this call from the previous one without a reset).
-    if (barrier) shmem::ShmemBarrierAll();
+    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierAll();
 
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
@@ -250,7 +263,7 @@ class IntraNodeSubGroupAllgatherSdma {
     (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
                          stream);
     (void)hipStreamSynchronize(stream);
-    if (barrier) shmem::ShmemBarrierAll();
+    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierAll();
     return 0.0;
   }
 
@@ -284,7 +297,7 @@ class IntraNodeSubGroupAllgatherSdma {
     size_t total = total_count_u32 * sizeof(uint32_t);
     (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
                          stream);
-    if (barrier) shmem::ShmemBarrierOnStream(stream);
+    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
     return 0.0;
   }
 
@@ -366,7 +379,7 @@ class IntraNodeSubGroupAllgatherSdma {
     // (slice_fuse_ib ON) this barrier is skipped entirely (barrier=false); it
     // only fires in the fuse_ib-OFF A/B path, where it must stay on-stream to
     // avoid mixing a host barrier into the stream-ordered sequence.
-    if (barrier) shmem::ShmemBarrierOnStream(stream);
+    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
     jit_args_.groupSize = groupSize_;
@@ -401,7 +414,7 @@ class IntraNodeSubGroupAllgatherSdma {
       throw std::runtime_error(
           "IntraNodeSubGroupAllgatherSdma: output not registered for direct param-contiguous");
     uint64_t flag_token = ++seq_;
-    if (barrier) shmem::ShmemBarrierOnStream(stream);
+    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
     jit_args_pc_.myPe = myPe_;
     jit_args_pc_.npes = npes_;
     jit_args_pc_.groupSize = groupSize_;
@@ -431,7 +444,7 @@ class IntraNodeSubGroupAllgatherSdma {
   // defers the fence to the next op's inter-prepare barrier (same rationale as
   // finish_batch_stream's deferral).
   double finish_direct_stream(hipStream_t stream, bool barrier = true) {
-    if (barrier) shmem::ShmemBarrierOnStream(stream);
+    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
     return 0.0;
   }
 
@@ -456,7 +469,7 @@ class IntraNodeSubGroupAllgatherSdma {
     (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
                          stream);
     (void)hipStreamSynchronize(stream);
-    if (barrier) shmem::ShmemBarrierAll();
+    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierAll();
     return 0.0;
   }
 
