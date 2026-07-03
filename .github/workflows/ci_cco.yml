@@ -41,7 +41,7 @@ jobs:
           submodules: true
 
       - name: Build CI image
-        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.cco .
 
       - name: Start container
         run: |
