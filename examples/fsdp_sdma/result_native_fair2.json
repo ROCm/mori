@@ -1,0 +1,19 @@
+{
+  "avg_step_time_s": 0.3645191871750285,
+  "avg_tflops": 1026.8945942153882,
+  "avg_tflops_per_gpu": 128.36182427692353,
+  "avg_tokens_per_s": 22473.439775521358,
+  "dtype": "bf16",
+  "last_loss": 12.672688484191895,
+  "micro_batch_size": 1,
+  "mode": "native",
+  "mori_enable_sdma": null,
+  "mori_fsdp_enable_sdma": null,
+  "mori_fsdp_zero_copy_output": null,
+  "num_params": 7615616512,
+  "seed": 1234,
+  "seq_len": 1024,
+  "steps": 10,
+  "warmup": 3,
+  "world_size": 8
+}
