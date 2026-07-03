@@ -414,6 +414,12 @@ void RegisterMoriCcl(pybind11::module_& m) {
           py::arg("output_ptr"), py::arg("total_count"), py::arg("stream"),
           py::arg("barrier") = true)
       .def(
+          "get_output_transit_buffer",
+          [](IntraSubGroup& self) -> py::tuple {
+            return py::make_tuple(self.out_ptr(), self.out_bytes());
+          },
+          "Return (ptr, size_bytes) of the internal transit out_ buffer")
+      .def(
           "register_output_buffer",
           [](IntraSubGroup& self, uintptr_t ptr, size_t size) {
             self.register_output_buffer(ptr, size);

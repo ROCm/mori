@@ -670,6 +670,11 @@ class IntraNodeSubGroupAllgatherSdma:
         )
         return True
 
+    def get_output_transit_buffer(self, dtype=None, device=None):
+        dtype, device = _resolve_transit_view_args(dtype, device, torch.uint32)
+        ptr, size_bytes = self._handle.get_output_transit_buffer()
+        return _ptr_to_tensor(ptr, size_bytes, dtype, device)
+
     def finish_batch(self, output_data, total_count: int, stream=None,
                      barrier: bool = True) -> bool:
         # M5: one bulk copy-OUT of ``total_count`` elements (the full

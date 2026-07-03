@@ -827,6 +827,21 @@ class HierAllGather:
         self._debug_sync = os.environ.get("MORI_HIER_DEBUG_SYNC", "0") not in (
             "0", "", "false", "False",
         )
+        # FSDP copy-out coherence fix (CU-domain copy-out). The nodirect
+        # Phase-B copy-OUT is a copy-ENGINE hipMemcpyAsync (out_ -> output); the
+        # FSDP consumer (backward GEMM) reads ``output`` from a COMPUTE UNIT. On
+        # this GPU a copy-engine write is not made coherent with a later CU read
+        # by HIP stream-ordering alone (proven: only a host stream.synchronize
+        # gave loss==native, on-device barriers/system-scope flags did not) ->
+        # occasional stale bytes -> loss drifts ~0.15% high, run-to-run jitter.
+        # When set, the C++ finish copies into a persistent scratch and a torch
+        # ELEMENTWISE (CU) kernel writes scratch -> output, so the producer of
+        # the consumed buffer is a CU op (CU/L2-coherent with the GEMM) WITHOUT a
+        # host stall (preserving the AG<->backward overlap). Default ON.
+        self._py_cu_copyout = os.environ.get("MORI_HIER_PY_CU_COPYOUT", "1") not in (
+            "0", "", "false", "False",
+        )
+        self._cu_copyout_scratch = None
 
         # the deferred slice_direct default (None sentinel) is
         # resolved LATER, after the inter-node ring is built, by probing the
@@ -1106,6 +1121,37 @@ class HierAllGather:
         for i in range(self.npes):
             tensor_list[i].copy_(view[i])
         return True
+
+    def _cu_copyout_finish(self, output_data, total_count_elems, stream):
+        """CU-domain copy-OUT for the nodirect Phase-B (root-cause fix).
+
+        The Phase-B gathers stack the reassembled result into the intra transit
+        ``out_`` via raw SDMA; the receiver ``__threadfence_system`` makes those
+        bytes coherently visible to a CU read but NOT to the copy engine, whose
+        ``hipMemcpyAsync(out_ -> output)`` read is unfenced against the SDMA
+        writes -> occasional stale bytes -> loss drifts ~0.15% high with
+        run-to-run jitter (only a host ``stream.synchronize`` masked it, killing
+        overlap). Here we instead do the copy-OUT as a SINGLE torch ELEMENTWISE
+        (CU) kernel: it reads ``out_`` as a tensor (fenced/coherent CU read) and
+        writes ``output`` in the CU/L2 domain the consumer GEMM reads. No copy
+        engine, no host stall -> deterministic AND overlap preserved. ``add`` by
+        0 is bit-exact for bf16/fp16/fp32 (x rounds to itself) and int dtypes.
+
+        Cross-PE ``out_`` reuse is still fenced by ``finish_direct_stream``'s
+        ShmemBarrierOnStream (deferrable, same as the copy-engine path).
+        """
+        # View the internal transit as the output dtype, rank-major length.
+        transit = self._intra.get_output_transit_buffer(
+            dtype=output_data.dtype, device=output_data.device
+        )[:total_count_elems]
+        out_flat = output_data.view(-1)[:total_count_elems]
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                torch.add(transit, 0, out=out_flat)
+        else:
+            torch.add(transit, 0, out=out_flat)
+        # Cross-PE reuse fence (no copy-OUT): reuse the direct-path stream fence.
+        self._intra.finish_direct_stream(stream=stream, barrier=not self.slice_defer_fin)
 
     def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
         """Gather ``count`` elements/rank into ``output_data`` (rank-major).
@@ -1557,7 +1603,9 @@ class HierAllGather:
                     # prepare barrier (slice_defer_fin) -- the copy-OUT stays
                     # stream-ordered so output is correct; only cross-PE reuse
                     # needs the fence, which the successor op provides.
-                    if self.stream_intra and self.stream_ring:
+                    if self._py_cu_copyout:
+                        self._cu_copyout_finish(output_data, N * block_count, stream)
+                    elif self.stream_intra and self.stream_ring:
                         self._intra.finish_batch_stream(
                             output_data, N * block_count, stream=stream,
                             barrier=not self.slice_defer_fin)

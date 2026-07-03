@@ -474,6 +474,19 @@ class IntraNodeSubGroupAllgatherSdma {
   }
 
   int npes() const { return npes_; }
+
+  // Expose the internal transit ``out_`` so a caller can perform the Phase-B
+  // copy-OUT with a COMPUTE-UNIT kernel (torch elementwise) instead of the
+  // copy-engine hipMemcpyAsync. The SDMA gather's receiver does a
+  // __threadfence_system() after acquiring each peer's completion flag, which
+  // makes the gathered bytes coherently visible to a subsequent CU read -- but
+  // NOT to the separate copy engine, whose read of ``out_`` is not fenced
+  // against the raw-SDMA writes (root cause of the FSDP copy-out loss drift:
+  // only a host stream.synchronize drained it). A CU copy-OUT reads ``out_`` in
+  // the fenced/coherent CU domain and writes the user output in the CU/L2 domain
+  // the consumer GEMM reads, closing the gap WITHOUT a host stall.
+  uintptr_t out_ptr() const { return reinterpret_cast<uintptr_t>(out_); }
+  size_t out_bytes() const { return outBytes_; }
 };
 
 }  // namespace collective
