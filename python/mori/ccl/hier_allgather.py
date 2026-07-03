@@ -1840,6 +1840,17 @@ class HierAllGather:
                 args, collection, u32c, s_main,
                 barrier=not self.slice_defer_inter_fin,
             )
+            # Merge the side local-block scatter BEFORE issuing the remote-block
+            # scatters. The local (side) and remote (main) scatters BOTH call
+            # gather_kernel_direct_param_contiguous, which shares one per-groupPos
+            # flag slot + seq token on this handle; running them concurrently made
+            # a receiver observe the other scatter's flag bump -> premature
+            # completion / spin-deadlock under FSDP (Turn 4/14 hang). Serialize the
+            # two scatter phases here. The KEY overlap (side local scatter || the
+            # inter-node RDMA ring) is PRESERVED: the ring's launch_finish_stream
+            # was already enqueued on main above and runs concurrently with the
+            # side scatter; only the ring-DEPENDENT remote scatters wait.
+            main.wait_stream(side)
             # Remote node-blocks read the ring collection; scatter each into the
             # param-contiguous output (r = m*G+g).
             for m in range(N):
@@ -1857,8 +1868,6 @@ class HierAllGather:
                     prepare_barrier=False,
                     first_block=m,
                 )
-            # Merge the side local-block scatter before the op fence.
-            main.wait_stream(side)
             self._intra.finish_direct_stream(
                 stream=stream, barrier=not self.slice_defer_fin
             )
