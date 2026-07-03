@@ -42,6 +42,7 @@ bf16/fp16/fp32/int32.
 
 import os
 import socket
+import sys
 from typing import List, Optional, Sequence
 
 import torch
@@ -1753,12 +1754,30 @@ class HierAllGather:
         # Register the user output for the direct SDMA push (lockstep, cached).
         out_ptr = output_data.data_ptr()
         out_size = output_data.numel() * output_data.element_size()
-        if (out_ptr, out_size) != (self._direct_reg_ptr, self._direct_reg_size):
+        _reg_changed = (out_ptr, out_size) != (self._direct_reg_ptr, self._direct_reg_size)
+        if _reg_changed:
             if self._direct_reg_ptr is not None:
                 self._intra.deregister_output_buffer_ptr(self._direct_reg_ptr)
             self._intra.register_output_buffer(output_data)
             self._direct_reg_ptr = out_ptr
             self._direct_reg_size = out_size
+        # DIAGNOSTIC (MORI_HIER_REG_STATS=1): count how often the output ptr
+        # CHANGES across per-layer AG calls. Each change is a cross-node COLLECTIVE
+        # (deregister+register ShmemSymmetric*) that RCCL never pays and that cannot
+        # overlap -> a candidate for the in-FSDP per-AG inflation. If steady state
+        # shows ~0 changes/call, registration churn is NOT the bottleneck.
+        if os.environ.get("MORI_HIER_REG_STATS", "0") in ("1", "true", "True"):
+            self._reg_calls = getattr(self, "_reg_calls", 0) + 1
+            if _reg_changed:
+                self._reg_changes = getattr(self, "_reg_changes", 0) + 1
+            if self._reg_calls % 100 == 0:
+                sys.stderr.write(
+                    "[MORI_HIER_REG_STATS] calls=%d reg_changes=%d (%.1f%% of calls "
+                    "trigger a cross-node register collective)\n"
+                    % (self._reg_calls, getattr(self, "_reg_changes", 0),
+                       100.0 * getattr(self, "_reg_changes", 0) / self._reg_calls)
+                )
+                sys.stderr.flush()
 
         # Split geometry in u32 lanes (SDMA byte move); the 4-byte alignment guard
         # above makes these conversions exact. CACHE the u32 GPU tensors keyed by
