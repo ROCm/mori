@@ -32,11 +32,21 @@ from mori.ccl import IntraNodeSubGroupAllgatherSdma
 
 _DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.int32]
 
-# Per-rank per-param element counts (packed shard = concat of these). LARGE so
-# the fresh output allocation lands on its own caching-allocator segment base --
-# required for the direct path's ShmemSymmetricRegister / hipIpcGetMemHandle of
-# the intra-node IPC peers (a sub-allocation aborts). All even -> 4-byte aligned.
-_PARAM_SPLITS = [1048576, 524288, 262144, 131072, 65536]
+# Per-rank per-param element counts (packed shard = concat of these). MUST be
+# LARGE ENOUGH that the fresh output allocation lands on its OWN caching-allocator
+# segment base (output_ptr == the registered segment base). The direct path's
+# ShmemSymmetricRegister / hipIpcGetMemHandle registers the CONTAINING allocation;
+# the scatter writes to peerPtrs[remotePe] + dstBaseOffset assuming peerPtr == the
+# buffer base. If the output is a torch SUB-allocation (small buffer packed inside
+# a larger pool segment) the peer pointer resolves to the SEGMENT base, not the
+# buffer, and the scatter SILENTLY CORRUPTS (writes land at the wrong slots) --
+# this is the "num_blocks=1 scatter bug" that looked like a concurrent-put race
+# for many turns but is really an undersized-output IPC-registration artifact.
+# bf16 (2 bytes/elem) is the smallest tested dtype => its output (sum*G*2 bytes)
+# is the one most at risk of sub-allocation, so size for it: sum ~= 8.1M elems ->
+# bf16 output ~= 65 MB, comfortably above the pool's own-segment threshold.
+# All even -> 4-byte aligned.
+_PARAM_SPLITS = [4194304, 2097152, 1048576, 524288, 262144]
 
 _REPS = 12  # many reps to catch a flag-recycle / stale-read race (loss varied)
 
