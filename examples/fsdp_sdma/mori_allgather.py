@@ -3,10 +3,12 @@
 Intra-node traffic rides the SDMA copy engines (XGMI); inter-node traffic goes
 over RDMA (NIC). Wired into FSDP2 via ``FSDPModule.set_custom_all_gather``.
 
-Unlike the intra-node ``AllgatherSdma`` backend, ``HierAllGather`` exposes a
-flat ``__call__(input, output, count, stream)`` interface (no registered-output
-/ param-contiguous zero-copy path), so this backend always produces a rank-major
-output that FSDP copies out (``supports_param_contiguous_output = False``).
+``HierAllGather`` now exposes a PARAM-CONTIGUOUS zero-copy path
+(``enqueue_param_contiguous``) for the cross-node (num_nodes>=2, slice_direct
+over RDMA) case: the gathered result is PUSHED straight into FSDP's
+``[param][rank]`` output, eliminating the rank-major -> param copy-OUT that made
+SDMA FSDP lose to RCCL. On single-node (num_nodes==1) the direct path is
+unavailable, so this backend keeps the rank-major copy-out there.
 """
 
 import importlib
@@ -49,6 +51,16 @@ class MoriAllGather(AllGather):
         self._world_size: int | None = None
         self._cap_bytes = 0
         self._output_buffer: torch.Tensor | None = None
+        self._pc_split_sizes: torch.Tensor | None = None
+        self._pc_split_offsets: torch.Tensor | None = None
+        # PARAM-CONTIGUOUS zero-copy is only available cross-node (num_nodes>=2,
+        # slice_direct over RDMA). FSDP reads this attribute BEFORE the collective
+        # exists, so derive num_nodes from the launch env (torchrun sets both).
+        world = int(os.environ.get("WORLD_SIZE", "0") or "0")
+        if world > 0:
+            rpn = self._ranks_per_node_value(world)
+            num_nodes = world // rpn if rpn else 1
+            self.supports_param_contiguous_output = num_nodes >= 2
 
     def allocate(
         self,
@@ -131,6 +143,59 @@ class MoriAllGather(AllGather):
                 "MORI FSDP Hier allgather requires 4-byte-aligned input bytes"
             )
 
+    def prepare_param_contiguous_output(
+        self,
+        all_gather_input_split_sizes: list[int],
+        all_gather_input_numel: int,
+        world_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> object | None:
+        """Build per-param split metadata (in DTYPE elements) for the direct
+        param-contiguous scatter. ``HierAllGather.enqueue_param_contiguous``
+        writes param ``s`` (per-rank numel ``E_s`` at cumulative input offset
+        ``O_s``) so global rank ``r``'s slice lands at ``O_s*W + r*E_s`` == the
+        exact ``[param][rank]`` layout FSDP views in place.
+        """
+        self.clear_param_contiguous_output()
+        if not self.supports_param_contiguous_output:
+            return None
+        if not all_gather_input_split_sizes:
+            raise RuntimeError("MORI zero-copy allgather requires non-empty splits")
+        if sum(all_gather_input_split_sizes) != all_gather_input_numel:
+            raise RuntimeError(
+                "MORI zero-copy allgather split sizes do not match input numel"
+            )
+        element_size = torch.empty((), dtype=dtype).element_size()
+        sizes: list[int] = []
+        offsets: list[int] = []
+        offset = 0
+        for split_size in all_gather_input_split_sizes:
+            e = int(split_size)
+            # SDMA byte extents must be 4-byte aligned (both size and offset).
+            if (e * element_size) % 4 != 0 or (offset * element_size) % 4 != 0:
+                raise RuntimeError(
+                    "MORI zero-copy allgather requires 4-byte-aligned splits"
+                )
+            sizes.append(e)
+            offsets.append(offset)
+            offset += e
+        self._pc_split_sizes = torch.tensor(sizes, dtype=torch.int64, device=device)
+        self._pc_split_offsets = torch.tensor(offsets, dtype=torch.int64, device=device)
+        return (self._pc_split_sizes, self._pc_split_offsets)
+
+    def clear_param_contiguous_output(self) -> None:
+        self._pc_split_sizes = None
+        self._pc_split_offsets = None
+
+    def _can_call_param_contiguous(self, input_tensor: torch.Tensor) -> bool:
+        if self._pc_split_sizes is None or self._pc_split_offsets is None:
+            return False
+        if int(self._pc_split_sizes.sum().item()) != input_tensor.numel():
+            self.clear_param_contiguous_output()
+            return False
+        return True
+
     def __call__(
         self,
         output_tensor: torch.Tensor,
@@ -144,9 +209,27 @@ class MoriAllGather(AllGather):
         collective = self._get_collective(group, per_rank_bytes)
         device = input_tensor.device
         stream = torch.cuda.current_stream(device)
-        ok = collective(input_tensor, output_tensor, count, stream=stream)
-        if not ok:
-            raise RuntimeError("MORI HierAllGather call failed")
+        if self._can_call_param_contiguous(input_tensor):
+            ok = collective.enqueue_param_contiguous(
+                input_tensor,
+                output_tensor,
+                count,
+                self._pc_split_sizes,
+                self._pc_split_offsets,
+                stream=stream,
+            )
+            if not ok:
+                # FSDP already committed to the [param][rank] layout; a rank-major
+                # fallback would corrupt it. Fail loudly instead (the cross-node
+                # slice_direct path is expected to be available on the target run).
+                raise RuntimeError(
+                    "MORI HierAllGather param-contiguous path unavailable "
+                    "(slice_direct/RDMA required); refusing rank-major fallback"
+                )
+        else:
+            ok = collective(input_tensor, output_tensor, count, stream=stream)
+            if not ok:
+                raise RuntimeError("MORI HierAllGather call failed")
         if async_op:
             event = torch.cuda.Event()
             event.record(stream)

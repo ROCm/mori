@@ -1671,6 +1671,130 @@ class HierAllGather:
         self._prev_op_completed = True
         return True
 
+    def supports_param_contiguous_output(self) -> bool:
+        """True when the direct-to-output PARAM-CONTIGUOUS zero-copy path is
+        available for this instance (cross-node, slice_direct over RDMA). The
+        FSDP adapter probes this to decide whether it can skip its copy-OUT.
+        """
+        return bool(
+            self.num_nodes >= 2
+            and self.slice_inter
+            and self.slice_direct
+            and self.stream_intra
+            and self.stream_ring
+        )
+
+    def enqueue_param_contiguous(
+        self,
+        input_data,
+        output_data,
+        count: int,
+        split_sizes,
+        split_offsets,
+        stream=None,
+    ) -> bool:
+        """PARAM-CONTIGUOUS zero-copy AllGather (kills the FSDP copy-OUT).
+
+        Motivation: cross-node FSDP2 loses to RCCL only because the copy-out
+        HierAllGather forces the backend to reshuffle rank-major -> param-
+        contiguous on every per-layer gather. This writes the gathered result
+        straight into ``output_data`` in PARAM-CONTIGUOUS layout: for global
+        rank ``r`` and param ``s`` (per-rank elems ``E_s`` at input offset
+        ``O_s``), rank ``r``'s slice lands at ``O_s*W + r*E_s`` -- exactly what
+        FSDP's packed all-gather expects, so no copy-OUT is needed.
+
+        ``split_sizes[s]`` / ``split_offsets[s]`` are in INPUT-DTYPE elements
+        (``E_s`` and ``O_s``); their byte extents must be 4-byte aligned (SDMA).
+        Returns False (caller must fall back to copy-OUT ``__call__``) when the
+        direct param-contiguous path is unavailable for this instance.
+
+        Implementation reuses the proven slice_direct primitives with NO new
+        C++ kernel: Phase A rings each rank's own shard into ``collection``;
+        Phase B PUSHES, per (node-block m, param s), the E_s-element sub-slice
+        via the existing per-slot ``gather_kernel_direct`` with
+        ``dst_block_offset = O_s*W + m*G*E_s`` and ``dst_slot_stride = E_s`` so
+        local member g (global rank r = m*G+g) writes to ``O_s*W + r*E_s``.
+        """
+        if not self.supports_param_contiguous_output():
+            return False
+
+        W = self.npes
+        G = self.ranks_per_node
+        N = self.num_nodes
+
+        ss = split_sizes.tolist() if torch.is_tensor(split_sizes) else list(split_sizes)
+        so = (
+            split_offsets.tolist()
+            if torch.is_tensor(split_offsets)
+            else list(split_offsets)
+        )
+        if len(ss) != len(so):
+            raise ValueError("split_sizes and split_offsets must have equal length")
+        elem = input_data.element_size()
+        # SDMA needs 4-byte-aligned byte extents; the adapter pads params to
+        # honor this, but guard here so a bad layout falls back to copy-OUT
+        # rather than corrupting output.
+        for E, O in zip(ss, so):
+            if (E * elem) % 4 != 0 or (O * elem) % 4 != 0:
+                return False
+
+        slice_total = count * N
+        if (
+            self._slice_scratch is None
+            or self._slice_scratch.numel() < slice_total
+            or self._slice_scratch.dtype != input_data.dtype
+            or self._slice_scratch.device != input_data.device
+        ):
+            self._slice_scratch = torch.empty(
+                slice_total, dtype=input_data.dtype, device=input_data.device
+            )
+        collection = self._slice_scratch[:slice_total]
+
+        # Phase A (inter, RDMA ring): gather THIS rank's own shard across nodes
+        # -> collection == [shard(node0,g), shard(node1,g), ...] (g == local idx).
+        self._inter(
+            input_data,
+            collection,
+            count,
+            stream,
+            stream_ring=self.stream_ring,
+            defer_inter_fin=self.slice_defer_inter_fin,
+        )
+
+        # Register the user output for the direct SDMA push (lockstep, cached).
+        out_ptr = output_data.data_ptr()
+        out_size = output_data.numel() * output_data.element_size()
+        if (out_ptr, out_size) != (self._direct_reg_ptr, self._direct_reg_size):
+            if self._direct_reg_ptr is not None:
+                self._intra.deregister_output_buffer_ptr(self._direct_reg_ptr)
+            self._intra.register_output_buffer(output_data)
+            self._direct_reg_ptr = out_ptr
+            self._direct_reg_size = out_size
+
+        # Phase B (intra, SDMA): direct param-contiguous scatter into output.
+        entry_barrier = not self.slice_fuse_ib
+        first = True
+        for m in range(N):
+            blk = collection[m * count : (m + 1) * count]
+            for E, O in zip(ss, so):
+                if E == 0:
+                    continue
+                self._intra.gather_kernel_direct(
+                    blk[O : O + E],
+                    output_data,
+                    E,
+                    dst_block_offset=O * W + m * G * E,
+                    stream=stream,
+                    prepare_barrier=(entry_barrier and first),
+                    dst_slot_stride=E,
+                )
+                first = False
+        self._intra.finish_direct_stream(
+            stream=stream, barrier=not self.slice_defer_fin
+        )
+        self._prev_op_completed = True
+        return True
+
     def result_tensor(self, count: int, dtype, device=None):
         """Torch view of the gathered result when ``out_in_place`` is enabled.
 
