@@ -231,6 +231,89 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
 }
 
 // ---------------------------------------------------------------------------
+// Fused hierarchical param-contiguous SubGroup gather (ONE launch)
+// ---------------------------------------------------------------------------
+// Replaces HierAllGather.enqueue_param_contiguous's N_nodes*N_params separate
+// SubGroup launches with a single launch: warp ``w`` drives destination member
+// ``w``; this PE (group position ``g == groupPos``) pushes, for every node block
+// ``m`` and every param split ``s``, its E_s-element sub-slice from the Phase-A
+// collection into the member's registered output at param-contiguous element
+// offset ``O_s*W + (m*G+g)*E_s``. Same subgroup flags as the per-slot direct
+// gather: bump slot ``g`` on each member once, then wait for all G members.
+template <typename T>
+__device__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_body(
+    int myPe, int npes, int groupSize, int groupPos, int peBase, int peStride, int numBlocks,
+    T* input, const application::SymmMemObjPtr dstMemObj,
+    const application::SymmMemObjPtr flagsMemObj, size_t blockStrideElems, size_t worldSize,
+    size_t dstBaseOffset, uint64_t flagVal, const size_t* splitSizes, const size_t* splitOffsets,
+    size_t splitCount) {
+  (void)npes;
+  if (groupSize <= 0 || numBlocks <= 0 || splitCount == 0 || splitSizes == nullptr ||
+      splitOffsets == nullptr) {
+    return;
+  }
+
+  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+  const size_t threadLinearId =
+      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  int warpId = threadLinearId / warpSize;
+  const int laneId = threadIdx.x % warpSize;
+  const size_t bytesPerElement = sizeof(T);
+  const size_t G = static_cast<size_t>(groupSize);
+  const size_t g = static_cast<size_t>(groupPos);
+
+  // One warp per destination member; loop node blocks then param splits, all
+  // written to the same param-contiguous offset (constant across members).
+  if (warpId < groupSize && laneId == 0) {
+    int remotePe = peBase + warpId * peStride;
+    application::SymmMemObjPtr dest = dstMemObj;
+    anvil::SdmaQueueDeviceHandle** devicehandles =
+        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
+    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
+    uint8_t* dstBase = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset;
+
+    for (int m = 0; m < numBlocks; ++m) {
+      const size_t r = static_cast<size_t>(m) * G + g;  // global rank
+      uint8_t* blkSrc =
+          reinterpret_cast<uint8_t*>(input) + static_cast<size_t>(m) * blockStrideElems * bytesPerElement;
+      for (size_t s = 0; s < splitCount; ++s) {
+        size_t E = splitSizes[s];
+        if (E == 0) {
+          continue;
+        }
+        size_t O = splitOffsets[s];
+        size_t outElemOffset = O * worldSize + r * E;
+        uint8_t* srcPtr = blkSrc + O * bytesPerElement;
+        uint8_t* dstPtr = dstBase + outElemOffset * bytesPerElement;
+        core::SdmaPutThread(srcPtr, dstPtr, E * bytesPerElement, devicehandles, signals,
+                            expectedSignals, dest->sdmaNumQueue, 0);
+      }
+    }
+  }
+
+  if (warpId < groupSize && laneId == 0) {
+    int remotePe = peBase + warpId * peStride;
+    shmem::ShmemQuietThread(remotePe, dstMemObj);
+    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+        flagsMemObj, static_cast<size_t>(groupPos) * sizeof(uint64_t), &flagVal, 8,
+        core::atomicType::AMO_SET, remotePe, 0);
+  }
+  __syncthreads();
+
+  for (int senderPos = 0; senderPos < groupSize; ++senderPos) {
+    if (senderPos == groupPos) {
+      continue;
+    }
+    if (threadLinearId == 0) {
+      while (core::AtomicLoadRelaxed(flags + senderPos) < flagVal) {
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Sub-group intra-node SDMA broadcast
 // ---------------------------------------------------------------------------
 // One source ("root", group position 0 == global PE ``peBase``) holds a full

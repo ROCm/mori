@@ -442,6 +442,22 @@ void RegisterMoriCcl(pybind11::module_& m) {
           py::arg("output_ptr") = 0, py::arg("dst_block_offset_bytes") = 0,
           py::arg("dst_slot_stride_bytes") = 0)
       .def(
+          "prepare_sync_direct_param_contiguous",
+          [](IntraSubGroup& self, uintptr_t input, int64_t stream, bool barrier,
+             uintptr_t output_ptr, size_t block_stride_u32, int num_blocks, size_t world_size,
+             uintptr_t split_sizes_ptr, uintptr_t split_offsets_ptr, size_t split_count,
+             size_t dst_block_offset_bytes) -> int64_t {
+            return self.prepare_sync_direct_param_contiguous(
+                input, reinterpret_cast<hipStream_t>(stream), barrier, output_ptr, block_stride_u32,
+                num_blocks, world_size, split_sizes_ptr, split_offsets_ptr, split_count,
+                dst_block_offset_bytes);
+          },
+          py::arg("input_ptr"), py::arg("stream"), py::arg("barrier") = true,
+          py::arg("output_ptr") = 0, py::arg("block_stride_u32") = 0, py::arg("num_blocks") = 1,
+          py::arg("world_size") = 0, py::arg("split_sizes_ptr") = 0,
+          py::arg("split_offsets_ptr") = 0, py::arg("split_count") = 0,
+          py::arg("dst_block_offset_bytes") = 0)
+      .def(
           "finish_direct_stream",
           [](IntraSubGroup& self, int64_t stream, bool barrier) -> double {
             return self.finish_direct_stream(reinterpret_cast<hipStream_t>(stream), barrier);

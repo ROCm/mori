@@ -1771,24 +1771,32 @@ class HierAllGather:
             self._direct_reg_ptr = out_ptr
             self._direct_reg_size = out_size
 
-        # Phase B (intra, SDMA): direct param-contiguous scatter into output.
+        # Phase B (intra, SDMA): FUSED single-launch param-contiguous scatter into
+        # the registered output. One OneShotAllGatherSdmaSubGroupParamContiguous
+        # launch loops all N node blocks * P param splits internally, replacing the
+        # old N*P separate gather_kernel_direct launches whose launch overhead made
+        # this path slower than RCCL. All units in u32 lanes (SDMA byte move); the
+        # 4-byte alignment guard above ensures the conversions are exact.
+        u32 = 4
+        blk_stride_u32 = (count * elem) // u32
+        split_sizes_u32 = torch.tensor(
+            [(E * elem) // u32 for E in ss], dtype=torch.int64, device=input_data.device
+        )
+        split_offsets_u32 = torch.tensor(
+            [(O * elem) // u32 for O in so], dtype=torch.int64, device=input_data.device
+        )
         entry_barrier = not self.slice_fuse_ib
-        first = True
-        for m in range(N):
-            blk = collection[m * count : (m + 1) * count]
-            for E, O in zip(ss, so):
-                if E == 0:
-                    continue
-                self._intra.gather_kernel_direct(
-                    blk[O : O + E],
-                    output_data,
-                    E,
-                    dst_block_offset=O * W + m * G * E,
-                    stream=stream,
-                    prepare_barrier=(entry_barrier and first),
-                    dst_slot_stride=E,
-                )
-                first = False
+        self._intra.gather_kernel_direct_param_contiguous(
+            collection,
+            output_data,
+            blk_stride_u32,
+            N,
+            W,
+            split_sizes_u32,
+            split_offsets_u32,
+            stream=stream,
+            prepare_barrier=entry_barrier,
+        )
         self._intra.finish_direct_stream(
             stream=stream, barrier=not self.slice_defer_fin
         )

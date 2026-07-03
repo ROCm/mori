@@ -177,6 +177,17 @@ extern "C" __global__ void OneShotAllGatherSdmaSubGroupKernel_u32(
       args.dstSlotStrideBytes, args.flagVal);
 }
 
+// Fused hierarchical param-contiguous SubGroup gather (ONE launch): loops node
+// blocks + param splits internally, killing the N_nodes*N_params launch overhead.
+extern "C" __global__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_u32(
+    CclAllgatherSubGroupParamContiguousArgs<uint32_t> args) {
+  OneShotAllGatherSdmaSubGroupParamContiguousKernel_body<uint32_t>(
+      args.myPe, args.npes, args.groupSize, args.groupPos, args.peBase, args.peStride,
+      args.numBlocks, args.input, args.dstMemObj, args.flagsMemObj, args.blockStrideElems,
+      args.worldSize, args.dstBaseOffset, args.flagVal, args.splitSizes, args.splitOffsets,
+      args.splitCount);
+}
+
 extern "C" __global__ void OneShotAllGatherSdmaAsyncWaitKernel_u32(
     CclAllgatherArgs<uint32_t> args) {
   OneShotAllGatherSdmaAsyncWaitKernel_body(args.myPe, args.npes, args.dstMemObj,

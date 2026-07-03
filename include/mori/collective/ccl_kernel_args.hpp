@@ -92,6 +92,40 @@ struct CclAllgatherSubGroupArgs {
   uint64_t flagVal;
 };
 
+// Fused hierarchical param-contiguous SubGroup gather. ONE launch replaces the
+// per-(node-block, param) loop that ``HierAllGather.enqueue_param_contiguous``
+// used to issue (N_nodes * N_params separate SubGroup launches, whose launch
+// overhead erased the copy-out saving vs RCCL). Each of ``G`` group members
+// pushes this PE's shard (group position ``groupPos`` == this node's local rank
+// ``g``) DIRECTLY into the registered user output in PARAM-CONTIGUOUS layout:
+// for node block ``m`` (in [0,numBlocks)) and param split ``s`` with per-rank
+// element count ``splitSizes[s]`` (== E_s, u32 lanes) at input element offset
+// ``splitOffsets[s]`` (== O_s within a block of ``blockStrideElems`` u32 lanes),
+// global rank ``r = m*groupSize + g`` lands at output element offset
+// ``O_s*worldSize + r*E_s``. ``input`` is the Phase-A collection buffer
+// (numBlocks contiguous blocks of blockStrideElems u32 lanes). Split arrays are
+// device pointers (size_t / u32-lane units), shared across all blocks.
+template <typename T>
+struct CclAllgatherSubGroupParamContiguousArgs {
+  int myPe;
+  int npes;
+  int groupSize;  // G local ranks per node
+  int groupPos;   // g == this PE's local rank within the node
+  int peBase;
+  int peStride;
+  int numBlocks;   // N node blocks gathered by Phase A
+  T* input;        // Phase-A collection: numBlocks * blockStrideElems u32 lanes
+  application::SymmMemObjPtr dstMemObj;
+  application::SymmMemObjPtr flagsMemObj;
+  size_t blockStrideElems;  // per-node-block stride in input (u32 lanes)
+  size_t worldSize;         // W == npes; output param scaling factor
+  size_t dstBaseOffset;     // byte offset into the registered output segment
+  uint64_t flagVal;
+  const size_t* splitSizes;    // device ptr, u32-lane units (E_s)
+  const size_t* splitOffsets;  // device ptr, u32-lane units (O_s within a block)
+  size_t splitCount;
+};
+
 // Sub-group intra-node SDMA broadcast. The root
 // (group position 0 == global PE ``peBase``) holds a full buffer of
 // ``elementCount`` u32 lanes in ``input`` and SDMA-copies it into the

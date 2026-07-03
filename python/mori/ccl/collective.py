@@ -746,6 +746,29 @@ class IntraNodeSubGroupAllgatherSdma:
         )
         return True
 
+    def gather_kernel_direct_param_contiguous(
+        self, input_data, output_data, block_stride: int, num_blocks: int,
+        world_size: int, split_sizes_u32, split_offsets_u32, stream=None,
+        prepare_barrier: bool = True) -> bool:
+        # FUSED param-contiguous direct gather -- ONE launch scatters ALL node
+        # blocks * param splits from the Phase-A ``input_data`` collection
+        # straight into the (registered) ``output_data`` in PARAM-CONTIGUOUS
+        # layout. Replaces the per-(block, param) gather_kernel_direct loop that
+        # made HierAllGather.enqueue_param_contiguous slower than RCCL. All size
+        # arguments are in u32-lane units. ``split_sizes_u32`` / ``split_offsets_
+        # u32`` are int64 DEVICE tensors (E_s / O_s per param, u32 lanes).
+        s = _stream_to_int(stream)
+        args = self._handle.prepare_sync_direct_param_contiguous(
+            input_data.data_ptr(), s, prepare_barrier, output_data.data_ptr(),
+            block_stride, num_blocks, world_size,
+            split_sizes_u32.data_ptr(), split_offsets_u32.data_ptr(),
+            split_sizes_u32.numel(), 0,
+        )
+        _get_ccl_func("OneShotAllGatherSdmaSubGroupParamContiguousKernel_u32").launch_struct(
+            (1,), (512,), 0, s, args
+        )
+        return True
+
     def prepare_direct_only(self, input_data, output_data, count: int,
                             dst_block_offset: int = 0, stream=None,
                             prepare_barrier: bool = True,

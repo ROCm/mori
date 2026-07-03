@@ -75,6 +75,7 @@ class IntraNodeSubGroupAllgatherSdma {
   uint64_t seq_;
 
   CclAllgatherSubGroupArgs<uint32_t> jit_args_;
+  CclAllgatherSubGroupParamContiguousArgs<uint32_t> jit_args_pc_;
 
   // DIRECT-TO-OUTPUT registration. Maps a user output buffer
   // base address -> its symmetric mem object + size. When the fused sliced
@@ -380,6 +381,44 @@ class IntraNodeSubGroupAllgatherSdma {
     jit_args_.dstSlotStrideBytes = dst_slot_stride_bytes;
     jit_args_.flagVal = flag_token;
     return reinterpret_cast<int64_t>(&jit_args_);
+  }
+
+  // FUSED param-contiguous direct gather: build the jit_args for the single
+  // OneShotAllGatherSdmaSubGroupParamContiguousKernel launch that scatters ALL
+  // node blocks * param splits into the (registered) user output in one launch,
+  // replacing the per-(block,param) prepare_sync_direct loop. ``split_*_ptr``
+  // are DEVICE pointers to size_t arrays in u32-lane units (shared across
+  // blocks). ``block_stride_u32`` is the per-node-block stride in the Phase-A
+  // input collection; ``world_size`` == npes.
+  int64_t prepare_sync_direct_param_contiguous(uintptr_t input, hipStream_t stream, bool barrier,
+                                               uintptr_t output_ptr, size_t block_stride_u32,
+                                               int num_blocks, size_t world_size,
+                                               uintptr_t split_sizes_ptr, uintptr_t split_offsets_ptr,
+                                               size_t split_count, size_t dst_block_offset_bytes = 0) {
+    auto regObj = find_exact(output_ptr);
+    if (!regObj.IsValid())
+      throw std::runtime_error(
+          "IntraNodeSubGroupAllgatherSdma: output not registered for direct param-contiguous");
+    uint64_t flag_token = ++seq_;
+    if (barrier) shmem::ShmemBarrierOnStream(stream);
+    jit_args_pc_.myPe = myPe_;
+    jit_args_pc_.npes = npes_;
+    jit_args_pc_.groupSize = groupSize_;
+    jit_args_pc_.groupPos = groupPos_;
+    jit_args_pc_.peBase = peBase_;
+    jit_args_pc_.peStride = peStride_;
+    jit_args_pc_.numBlocks = num_blocks;
+    jit_args_pc_.input = reinterpret_cast<uint32_t*>(input);
+    jit_args_pc_.dstMemObj = regObj;
+    jit_args_pc_.flagsMemObj = flagsObj_;
+    jit_args_pc_.blockStrideElems = block_stride_u32;
+    jit_args_pc_.worldSize = world_size;
+    jit_args_pc_.dstBaseOffset = dst_block_offset_bytes;
+    jit_args_pc_.flagVal = flag_token;
+    jit_args_pc_.splitSizes = reinterpret_cast<const size_t*>(split_sizes_ptr);
+    jit_args_pc_.splitOffsets = reinterpret_cast<const size_t*>(split_offsets_ptr);
+    jit_args_pc_.splitCount = split_count;
+    return reinterpret_cast<int64_t>(&jit_args_pc_);
   }
 
   // completion fence for the DIRECT path. The gathers already
