@@ -97,13 +97,15 @@ __device__ void OneShotAllGatherSdmaKernel_body(int myPe, int npes, T* input,
       // progress (kernel continues before data is actually ready).
       int spinCount = 0;
       bool warned = false;
-      while (core::AtomicLoadRelaxed(flags + sender) < flagVal) {
+      // SYSTEM-scope acquire (see subgroup gather): remote-agent SDMA producer.
+      while (core::AtomicLoadSeqCstSystem(flags + sender) < flagVal) {
         ++spinCount;
         if (!warned && spinCount > 10000000) {
           printf("PE %d: Slow wait for data from peer %d (still waiting)\n", myPe, sender);
           warned = true;
         }
       }
+      __threadfence_system();
     }
     __syncthreads();
   }
@@ -218,13 +220,21 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
     if (threadLinearId == 0) {
       int spinCount = 0;
       bool warned = false;
-      while (core::AtomicLoadRelaxed(flags + senderPos) < flagVal) {
+      // SYSTEM-scope acquire: the flag (and the data it guards) is written by a
+      // REMOTE peer GPU (a different HSA agent) via SDMA. An AGENT-scope relaxed
+      // load establishes no cross-agent happens-before, so observing the flag
+      // does NOT guarantee the peer's data writes are coherently visible to this
+      // agent's subsequent copy-OUT -> occasional stale bytes under FSDP rapid
+      // reuse (loss nondeterminism). A system-scope acquire + system threadfence
+      // makes the peer's prior data writes visible without a host sync.
+      while (core::AtomicLoadSeqCstSystem(flags + senderPos) < flagVal) {
         ++spinCount;
         if (!warned && spinCount > 10000000) {
           printf("PE %d: Slow wait for sub-group pos %d (still waiting)\n", myPe, senderPos);
           warned = true;
         }
       }
+      __threadfence_system();
     }
     __syncthreads();
   }
@@ -310,8 +320,10 @@ __device__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_body(
       continue;
     }
     if (threadLinearId == 0) {
-      while (core::AtomicLoadRelaxed(flags + senderPos) < flagVal) {
+      // SYSTEM-scope acquire (see subgroup gather): remote-agent SDMA producer.
+      while (core::AtomicLoadSeqCstSystem(flags + senderPos) < flagVal) {
       }
+      __threadfence_system();
     }
     __syncthreads();
   }
@@ -384,13 +396,15 @@ __device__ void OneShotBroadcastSdmaSubGroupKernel_body(
     if (threadLinearId == 0) {
       int spinCount = 0;
       bool warned = false;
-      while (core::AtomicLoadRelaxed(flags + 0) < flagVal) {
+      // SYSTEM-scope acquire (see subgroup gather): remote-agent SDMA producer.
+      while (core::AtomicLoadSeqCstSystem(flags + 0) < flagVal) {
         ++spinCount;
         if (!warned && spinCount > 10000000) {
           printf("PE %d: Slow wait for broadcast root (still waiting)\n", myPe);
           warned = true;
         }
       }
+      __threadfence_system();
     }
     __syncthreads();
   }
@@ -460,7 +474,9 @@ __device__ void OneShotAllGatherSdmaParamContiguousKernel_body(
       int spinCount = 0;
       bool warned = false;
       uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-      while (core::AtomicLoadRelaxed(flags + sender) < flagVal) {
+      // SYSTEM-scope acquire (see subgroup gather): remote-agent SDMA writes the
+      // flag+data; AGENT-scope relaxed gives no cross-agent visibility ordering.
+      while (core::AtomicLoadSeqCstSystem(flags + sender) < flagVal) {
         ++spinCount;
         if (!warned && spinCount > 10000000) {
           printf("PE %d: Slow wait for param-contiguous data from peer %d (still waiting)\n", myPe,
@@ -468,6 +484,7 @@ __device__ void OneShotAllGatherSdmaParamContiguousKernel_body(
           warned = true;
         }
       }
+      __threadfence_system();
     }
     __syncthreads();
   }
