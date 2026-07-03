@@ -823,6 +823,10 @@ class HierAllGather:
         self.node_id = my_pe // ranks_per_node
         self.local_rank = my_pe % ranks_per_node
         self.copy_output_to_user = copy_output_to_user
+        # isolation probe: force full stream completion at op return.
+        self._debug_sync = os.environ.get("MORI_HIER_DEBUG_SYNC", "0") not in (
+            "0", "", "false", "False",
+        )
 
         # the deferred slice_direct default (None sentinel) is
         # resolved LATER, after the inter-node ring is built, by probing the
@@ -1106,9 +1110,23 @@ class HierAllGather:
     def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
         """Gather ``count`` elements/rank into ``output_data`` (rank-major).
 
-        ``output_data`` must hold ``count * npes`` elements of the same dtype
-        as ``input_data``.
+        Thin wrapper over ``_call_impl`` that optionally forces full completion
+        before returning. Set ``MORI_HIER_DEBUG_SYNC=1`` to host-block on the
+        caller's stream at op return -- an isolation switch for the FSDP
+        copy-out loss-nondeterminism probe: if forcing full completion makes the
+        loss deterministic==native, the residual bug is an async completion
+        fence (the op returns before the SDMA/ring work the recorded event is
+        supposed to capture is actually visible); if it stays nondeterministic
+        the bug is a genuine data/layout race in the kernel.
         """
+        ret = self._call_impl(input_data, output_data, count, stream)
+        if self._debug_sync:
+            s = (torch.cuda.current_stream(input_data.device)
+                 if stream is None else stream)
+            s.synchronize()
+        return ret
+
+    def _call_impl(self, input_data, output_data, count: int, stream=None) -> bool:
         if self.num_nodes == 1:
             return self._intra(input_data, output_data, count, stream)
 
