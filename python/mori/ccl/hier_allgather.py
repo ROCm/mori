@@ -1834,6 +1834,20 @@ class HierAllGather:
                 prepare_barrier=False,
                 first_block=node,
             )
+            # INPUT/OUTPUT LIFETIME across the side stream (the loss-drift race,
+            # reviewer T78/T79): input_data and output_data are produced/freed by
+            # FSDP on the MAIN stream, but the local-block scatter above READS
+            # input_data and WRITES output_data on the SIDE stream. The torch
+            # caching allocator only tracks the free-stream (main); without
+            # record_stream it may recycle these blocks while the side kernel is
+            # still draining -> a per-call nondeterministic corruption that shows
+            # up as run-to-run loss drift (12.617/12.566). main.wait_stream(side)
+            # below orders the KERNELS but does NOT inform the allocator about the
+            # side-stream use. Record it so the block is not reused until the side
+            # scatter completes.
+            if hasattr(input_data, "record_stream"):
+                input_data.record_stream(side)
+                output_data.record_stream(side)
             # Ring kernel + finish copy-OUT into collection (main), overlapping
             # the side local-block scatter.
             self._inter.launch_finish_stream(
