@@ -1761,15 +1761,25 @@ class HierAllGather:
             self._direct_reg_size = out_size
 
         # Split geometry in u32 lanes (SDMA byte move); the 4-byte alignment guard
-        # above makes these conversions exact.
+        # above makes these conversions exact. CACHE the u32 GPU tensors keyed by
+        # the split geometry: rebuilding them (torch.tensor + H2D) on every
+        # per-layer all-gather added host overhead per call. FSDP reuses the same
+        # split geometry across a param group, so steady state hits the cache.
         u32 = 4
         blk_stride_u32 = (count * elem) // u32
-        split_sizes_u32 = torch.tensor(
-            [(E * elem) // u32 for E in ss], dtype=torch.int64, device=input_data.device
-        )
-        split_offsets_u32 = torch.tensor(
-            [(O * elem) // u32 for O in so], dtype=torch.int64, device=input_data.device
-        )
+        _u32_key = (tuple(ss), tuple(so), elem, str(input_data.device))
+        if getattr(self, "_pc_u32_key", None) != _u32_key:
+            self._pc_u32_ss = torch.tensor(
+                [(E * elem) // u32 for E in ss],
+                dtype=torch.int64, device=input_data.device,
+            )
+            self._pc_u32_so = torch.tensor(
+                [(O * elem) // u32 for O in so],
+                dtype=torch.int64, device=input_data.device,
+            )
+            self._pc_u32_key = _u32_key
+        split_sizes_u32 = self._pc_u32_ss
+        split_offsets_u32 = self._pc_u32_so
         entry_barrier = not self.slice_fuse_ib
 
         # OVERLAPPED param-contiguous zero-copy (the lever to beat RCCL): the

@@ -51,8 +51,9 @@ class MoriAllGather(AllGather):
         self._world_size: int | None = None
         self._cap_bytes = 0
         self._output_buffer: torch.Tensor | None = None
-        self._pc_split_sizes: torch.Tensor | None = None
-        self._pc_split_offsets: torch.Tensor | None = None
+        self._pc_split_sizes: list[int] | None = None
+        self._pc_split_offsets: list[int] | None = None
+        self._pc_input_numel: int | None = None
         # PARAM-CONTIGUOUS zero-copy is only available cross-node (num_nodes>=2,
         # slice_direct over RDMA). FSDP reads this attribute BEFORE the collective
         # exists, so derive num_nodes from the launch env (torchrun sets both).
@@ -180,18 +181,26 @@ class MoriAllGather(AllGather):
             sizes.append(e)
             offsets.append(offset)
             offset += e
-        self._pc_split_sizes = torch.tensor(sizes, dtype=torch.int64, device=device)
-        self._pc_split_offsets = torch.tensor(offsets, dtype=torch.int64, device=device)
+        # Store PYTHON lists (not GPU tensors): passing GPU tensors into
+        # enqueue_param_contiguous forced a .tolist() D2H sync on EVERY per-layer
+        # all-gather, draining the async pipeline and destroying the AG<->backward
+        # overlap. Lists are consumed sync-free.
+        self._pc_split_sizes = sizes
+        self._pc_split_offsets = offsets
+        self._pc_input_numel = all_gather_input_numel
         return (self._pc_split_sizes, self._pc_split_offsets)
 
     def clear_param_contiguous_output(self) -> None:
         self._pc_split_sizes = None
         self._pc_split_offsets = None
+        self._pc_input_numel = None
 
     def _can_call_param_contiguous(self, input_tensor: torch.Tensor) -> bool:
         if self._pc_split_sizes is None or self._pc_split_offsets is None:
             return False
-        if int(self._pc_split_sizes.sum().item()) != input_tensor.numel():
+        # Compare against the CACHED python-int numel -- no .item()/.sum() D2H
+        # sync (that fired on every call and serialized the whole step).
+        if self._pc_input_numel != input_tensor.numel():
             self.clear_param_contiguous_output()
             return False
         return True
