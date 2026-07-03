@@ -1750,17 +1750,6 @@ class HierAllGather:
             )
         collection = self._slice_scratch[:slice_total]
 
-        # Phase A (inter, RDMA ring): gather THIS rank's own shard across nodes
-        # -> collection == [shard(node0,g), shard(node1,g), ...] (g == local idx).
-        self._inter(
-            input_data,
-            collection,
-            count,
-            stream,
-            stream_ring=self.stream_ring,
-            defer_inter_fin=self.slice_defer_inter_fin,
-        )
-
         # Register the user output for the direct SDMA push (lockstep, cached).
         out_ptr = output_data.data_ptr()
         out_size = output_data.numel() * output_data.element_size()
@@ -1771,12 +1760,8 @@ class HierAllGather:
             self._direct_reg_ptr = out_ptr
             self._direct_reg_size = out_size
 
-        # Phase B (intra, SDMA): FUSED single-launch param-contiguous scatter into
-        # the registered output. One OneShotAllGatherSdmaSubGroupParamContiguous
-        # launch loops all N node blocks * P param splits internally, replacing the
-        # old N*P separate gather_kernel_direct launches whose launch overhead made
-        # this path slower than RCCL. All units in u32 lanes (SDMA byte move); the
-        # 4-byte alignment guard above ensures the conversions are exact.
+        # Split geometry in u32 lanes (SDMA byte move); the 4-byte alignment guard
+        # above makes these conversions exact.
         u32 = 4
         blk_stride_u32 = (count * elem) // u32
         split_sizes_u32 = torch.tensor(
@@ -1786,6 +1771,94 @@ class HierAllGather:
             [(O * elem) // u32 for O in so], dtype=torch.int64, device=input_data.device
         )
         entry_barrier = not self.slice_fuse_ib
+
+        # OVERLAPPED param-contiguous zero-copy (the lever to beat RCCL): the
+        # LOCAL node-block (m == node_id) scatter reads only THIS rank's own input
+        # (no ring dependency) so it runs on a SIDE stream concurrently with the
+        # inter-node RDMA ring -- exactly the ring||gather overlap the copy-OUT
+        # __call__ path uses, but writing PARAM-CONTIGUOUS straight into the user
+        # output (no copy-OUT). The serial Phase-A-then-scatter path forwent this
+        # overlap and lost to RCCL (99.7 vs 127 TFLOPS); this recovers it.
+        overlap = (
+            self.stream_intra
+            and self.stream_ring
+            and self.slice_direct
+            and N >= 2
+            and not entry_barrier
+            and os.environ.get("MORI_HIER_PC_NO_OVERLAP", "0")
+            not in ("1", "true", "True")
+        )
+        if overlap:
+            node = self.node_id
+            if self._overlap_stream is None:
+                self._overlap_stream = torch.cuda.Stream(device=input_data.device)
+            side = self._overlap_stream
+            main = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
+            # Ring prepare = global entry barrier + copy-IN of this rank's shard.
+            args, u32c, s_main = self._inter.prepare_stream_only(
+                input_data, count, stream
+            )
+            # Side stream observes the entry barrier, then scatters the LOCAL
+            # block (r = node*G+g) barrier-free, concurrent with the ring. Source
+            # is this rank's own input (one block); first_block=node maps it to
+            # global ranks node*G..node*G+G-1.
+            side.wait_stream(main)
+            self._intra.gather_kernel_direct_param_contiguous(
+                input_data,
+                output_data,
+                blk_stride_u32,
+                1,
+                W,
+                split_sizes_u32,
+                split_offsets_u32,
+                stream=side,
+                prepare_barrier=False,
+                first_block=node,
+            )
+            # Ring kernel + finish copy-OUT into collection (main), overlapping
+            # the side local-block scatter.
+            self._inter.launch_finish_stream(
+                args, collection, u32c, s_main,
+                barrier=not self.slice_defer_inter_fin,
+            )
+            # Remote node-blocks read the ring collection; scatter each into the
+            # param-contiguous output (r = m*G+g).
+            for m in range(N):
+                if m == node:
+                    continue
+                self._intra.gather_kernel_direct_param_contiguous(
+                    collection[m * count : (m + 1) * count],
+                    output_data,
+                    blk_stride_u32,
+                    1,
+                    W,
+                    split_sizes_u32,
+                    split_offsets_u32,
+                    stream=stream,
+                    prepare_barrier=False,
+                    first_block=m,
+                )
+            # Merge the side local-block scatter before the op fence.
+            main.wait_stream(side)
+            self._intra.finish_direct_stream(
+                stream=stream, barrier=not self.slice_defer_fin
+            )
+            self._prev_op_completed = True
+            return True
+
+        # Non-overlapped fallback: serial Phase A ring then ONE fused scatter.
+        self._inter(
+            input_data,
+            collection,
+            count,
+            stream,
+            stream_ring=self.stream_ring,
+            defer_inter_fin=self.slice_defer_inter_fin,
+        )
         self._intra.gather_kernel_direct_param_contiguous(
             collection,
             output_data,

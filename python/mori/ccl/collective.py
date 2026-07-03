@@ -749,7 +749,7 @@ class IntraNodeSubGroupAllgatherSdma:
     def gather_kernel_direct_param_contiguous(
         self, input_data, output_data, block_stride: int, num_blocks: int,
         world_size: int, split_sizes_u32, split_offsets_u32, stream=None,
-        prepare_barrier: bool = True) -> bool:
+        prepare_barrier: bool = True, first_block: int = 0) -> bool:
         # FUSED param-contiguous direct gather -- ONE launch scatters ALL node
         # blocks * param splits from the Phase-A ``input_data`` collection
         # straight into the (registered) ``output_data`` in PARAM-CONTIGUOUS
@@ -762,7 +762,7 @@ class IntraNodeSubGroupAllgatherSdma:
             input_data.data_ptr(), s, prepare_barrier, output_data.data_ptr(),
             block_stride, num_blocks, world_size,
             split_sizes_u32.data_ptr(), split_offsets_u32.data_ptr(),
-            split_sizes_u32.numel(), 0,
+            split_sizes_u32.numel(), 0, first_block,
         )
         _get_ccl_func("OneShotAllGatherSdmaSubGroupParamContiguousKernel_u32").launch_struct(
             (1,), (512,), 0, s, args

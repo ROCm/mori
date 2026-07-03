@@ -183,9 +183,9 @@ extern "C" __global__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_u32
     CclAllgatherSubGroupParamContiguousArgs<uint32_t> args) {
   OneShotAllGatherSdmaSubGroupParamContiguousKernel_body<uint32_t>(
       args.myPe, args.npes, args.groupSize, args.groupPos, args.peBase, args.peStride,
-      args.numBlocks, args.input, args.dstMemObj, args.flagsMemObj, args.blockStrideElems,
-      args.worldSize, args.dstBaseOffset, args.flagVal, args.splitSizes, args.splitOffsets,
-      args.splitCount);
+      args.numBlocks, args.firstBlock, args.input, args.dstMemObj, args.flagsMemObj,
+      args.blockStrideElems, args.worldSize, args.dstBaseOffset, args.flagVal, args.splitSizes,
+      args.splitOffsets, args.splitCount);
 }
 
 extern "C" __global__ void OneShotAllGatherSdmaAsyncWaitKernel_u32(

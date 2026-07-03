@@ -114,6 +114,7 @@ struct CclAllgatherSubGroupParamContiguousArgs {
   int peBase;
   int peStride;
   int numBlocks;   // N node blocks gathered by Phase A
+  int firstBlock;  // global m of input's first block (source i -> m=firstBlock+i)
   T* input;        // Phase-A collection: numBlocks * blockStrideElems u32 lanes
   application::SymmMemObjPtr dstMemObj;
   application::SymmMemObjPtr flagsMemObj;

@@ -243,7 +243,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
 template <typename T>
 __device__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_body(
     int myPe, int npes, int groupSize, int groupPos, int peBase, int peStride, int numBlocks,
-    T* input, const application::SymmMemObjPtr dstMemObj,
+    int firstBlock, T* input, const application::SymmMemObjPtr dstMemObj,
     const application::SymmMemObjPtr flagsMemObj, size_t blockStrideElems, size_t worldSize,
     size_t dstBaseOffset, uint64_t flagVal, const size_t* splitSizes, const size_t* splitOffsets,
     size_t splitCount) {
@@ -273,10 +273,11 @@ __device__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_body(
     HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
     uint8_t* dstBase = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset;
 
-    for (int m = 0; m < numBlocks; ++m) {
+    for (int i = 0; i < numBlocks; ++i) {
+      const int m = firstBlock + i;                     // global node block
       const size_t r = static_cast<size_t>(m) * G + g;  // global rank
       uint8_t* blkSrc =
-          reinterpret_cast<uint8_t*>(input) + static_cast<size_t>(m) * blockStrideElems * bytesPerElement;
+          reinterpret_cast<uint8_t*>(input) + static_cast<size_t>(i) * blockStrideElems * bytesPerElement;
       for (size_t s = 0; s < splitCount; ++s) {
         size_t E = splitSizes[s];
         if (E == 0) {

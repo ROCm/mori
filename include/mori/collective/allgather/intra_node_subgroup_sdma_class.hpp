@@ -394,7 +394,8 @@ class IntraNodeSubGroupAllgatherSdma {
                                                uintptr_t output_ptr, size_t block_stride_u32,
                                                int num_blocks, size_t world_size,
                                                uintptr_t split_sizes_ptr, uintptr_t split_offsets_ptr,
-                                               size_t split_count, size_t dst_block_offset_bytes = 0) {
+                                               size_t split_count, size_t dst_block_offset_bytes = 0,
+                                               int first_block = 0) {
     auto regObj = find_exact(output_ptr);
     if (!regObj.IsValid())
       throw std::runtime_error(
@@ -408,6 +409,7 @@ class IntraNodeSubGroupAllgatherSdma {
     jit_args_pc_.peBase = peBase_;
     jit_args_pc_.peStride = peStride_;
     jit_args_pc_.numBlocks = num_blocks;
+    jit_args_pc_.firstBlock = first_block;
     jit_args_pc_.input = reinterpret_cast<uint32_t*>(input);
     jit_args_pc_.dstMemObj = regObj;
     jit_args_pc_.flagsMemObj = flagsObj_;
