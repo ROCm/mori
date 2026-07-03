@@ -292,26 +292,13 @@ __device__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_body(
       }
     }
   }
-  // Match the proven flat param-contiguous kernel: fence ALL warps' SDMA puts
-  // before ANY warp quiets + bumps its completion flag. Without this, a warp
-  // whose puts drained early can signal completion while a sibling warp's puts
-  // to the same peer are still in flight on a shared copy engine, letting a
-  // receiver read a half-written / cross-contaminated slot (the num_blocks=1
-  // intra race: correct r, wrong data).
+  // Fence all warps' SDMA puts before any warp quiets + bumps its completion
+  // flag (mirrors the proven flat OneShotAllGatherSdmaParamContiguousKernel_body).
   __syncthreads();
 
   if (warpId < groupSize && laneId == 0) {
     int remotePe = peBase + warpId * peStride;
     shmem::ShmemQuietThread(remotePe, dstMemObj);
-    // The quiet above only guarantees the SDMA copy DRAINED on the local copy
-    // engine; a system-scope fence is needed before the completion flag so the
-    // param-contiguous bytes this warp pushed over XGMI/P2P are GLOBALLY visible
-    // (to the receiving PE's loads) BEFORE the flag that releases it. Without it
-    // the receiver can observe the flag while a peer's P2P write to its output
-    // slot is not yet visible -- the num_blocks=1 intra race (correct r/offset,
-    // wrong/stale data, nondeterministic). The longer num_blocks=N path masks it
-    // by issuing far more puts before signalling.
-    __threadfence_system();
     shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
         flagsMemObj, static_cast<size_t>(groupPos) * sizeof(uint64_t), &flagVal, 8,
         core::atomicType::AMO_SET, remotePe, 0);
@@ -328,9 +315,6 @@ __device__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_body(
     }
     __syncthreads();
   }
-  // Receiver-side system-scope fence: after all senders' flags are seen, ensure
-  // subsequent loads of the output see the P2P-written data (not a cached copy).
-  __threadfence_system();
 }
 
 // ---------------------------------------------------------------------------
