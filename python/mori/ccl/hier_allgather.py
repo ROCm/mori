@@ -742,8 +742,23 @@ class HierAllGather:
         # +41% mori-side and parity EXCEEDED. Engages ONLY on the >=8 MiB sliced
         # path (use_slice gate); small sizes stay on the safe non-slice path so
         # the fused kernel's small-size constraint never triggers.
+        # CORRECTNESS: default flipped to OFF. In-situ FSDP AGVERIFY
+        # (2-node world=8, copy-out, VOCAB=32000 LAYERS=28) shows the FUSED
+        # ring||local-gather kernel produces STALE remote-half AG output on ~48%
+        # of per-layer all-gathers (184/384) under FSDP's tight back-to-back
+        # overlap -- the RDMA-ring buffer is read out (finish_ring_stream copy +
+        # remote-block direct gathers) before the concurrently-launched ring
+        # CTA's remote puts are globally visible to the subsequent readers. The
+        # SERIAL monolithic ring path (fuse_local OFF) drops this to ~2-3%
+        # (8-11/384) at the same config, and DEBUG_SYNC is 0/384 -- i.e. the
+        # fused concurrency is the dominant offender, NOT the ring flag/data QP
+        # ordering (numQp=1 and numQp=4 both still 184/384). The standalone-only
+        # fused bandwidth win (+41% @64MiB) is not worth a wrong training loss,
+        # so the shipped default is the serial direct path until the fused
+        # kernel's ring-completion visibility to the finish readers is fixed
+        # on-device. Opt back in with MORI_HIER_FUSE_LOCAL=1 for standalone A/B.
         self.fuse_local = os.environ.get(
-            "MORI_HIER_FUSE_LOCAL", "1"
+            "MORI_HIER_FUSE_LOCAL", "0"
         ) not in ("0", "", "false", "False")
         # DIRECT-TO-OUTPUT Phase B. The default fused sliced
         # path SDMA-gathers the N node-blocks into an internal symmetric transit
