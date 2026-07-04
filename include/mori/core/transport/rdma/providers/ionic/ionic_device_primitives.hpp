@@ -609,6 +609,46 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
 }
 #endif  // end of PollCq<ProviderType::PSD>
 
+// Receiver half of the Phase-5 inline-flag ring: poll one recv CQE produced by a
+// remote RDMA-WRITE-with-immediate. The recv CQE's color bit signals readiness
+// (same scheme as PollCq), the op field (recv.src_qpn_op) must be RDMA_IMM=3, and
+// the 32-bit immediate is carried in recv.imm_data_rkey (big-endian). Observing
+// this CQE proves the peer's payload DMA has landed remotely -- the CQ event
+// cannot precede its data. Receiver-side scaffold; nothing calls it yet.
+template <>
+inline __device__ int PollRecvCqImm<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum,
+                                                       uint32_t* consIdx, uint32_t* imm) {
+  const uint32_t curConsIdx = *consIdx;
+  const uint32_t cqeIdx = curConsIdx & (cqeNum - 1);
+
+  char* cqeAddr = reinterpret_cast<char*>(cqAddr) + (cqeIdx * sizeof(struct ionic_v1_cqe));
+  struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(cqeAddr);
+
+  // Color bit: CQE is ready only when its color matches the expected phase.
+  constexpr uint32_t colorBit = IONIC_V1_CQE_COLOR;
+  const uint32_t expectedColor = (curConsIdx & cqeNum) ? 0 : colorBit;
+  const uint32_t qtfBe = BE32TOH(*(volatile uint32_t*)(&cqe->qid_type_flags));
+  if ((qtfBe & colorBit) != expectedColor) {
+    return -1;  // CQE not produced yet
+  }
+
+  if (qtfBe & IONIC_V1_CQE_ERROR) {
+    const uint32_t status = BE32TOH(cqe->status_length);
+    return IonicHandleErrorCqe(status);
+  }
+
+  // Decode the recv op; only RDMA_WRITE_WITH_IMM carries a valid immediate.
+  const uint32_t srcQpnOp = BE32TOH(*(volatile uint32_t*)(&cqe->recv.src_qpn_op));
+  const uint32_t op = (srcQpnOp >> IONIC_V1_CQE_RECV_OP_SHIFT) & IONIC_V1_CQE_RECV_OP_MASK;
+  if (op != IONIC_V1_CQE_RECV_OP_RDMA_IMM) {
+    return -1;  // not the completion we are waiting for
+  }
+
+  *imm = BE32TOH(*(volatile uint32_t*)(&cqe->recv.imm_data_rkey));
+  *consIdx = curConsIdx + 1;
+  return 0;
+}
+
 template <>
 inline __device__ void UpdateCqDbrRecord<ProviderType::PSD>(CompletionQueueHandle& cq,
                                                             uint32_t consIdx) {

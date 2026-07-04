@@ -220,6 +220,17 @@ inline __device__ int PollCq(WorkQueueHandle& wqHandle, CompletionQueueHandle& c
                              void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
                              uint16_t* wqeCounter);
 
+// Receiver half of the Phase-5 inline-flag ring protocol. Polls a recv CQ for a
+// single RDMA-WRITE-with-immediate completion. Returns 0 when a fresh RDMA_IMM
+// CQE for slot *consIdx is ready (its payload DMA is proven globally visible),
+// -1 if not ready yet, or a positive error code; on success *imm is set to the
+// decoded 32-bit immediate and *consIdx is advanced. Because the immediate rides
+// the transport CQ (not a separate GPU-memory flag), it can never be observed
+// before its payload lands remotely -- the ordering guarantee the memory-flag
+// path lacks. Receiver-side scaffold; nothing calls it yet.
+template <ProviderType PrvdType>
+inline __device__ int PollRecvCqImm(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint32_t* imm);
+
 template <ProviderType PrvdType>
 inline __device__ void UpdateCqDbrRecord(CompletionQueueHandle& cq, uint32_t consIdx);
 
