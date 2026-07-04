@@ -94,6 +94,10 @@ struct RdmaEndpointConfig {
   bool onGpu{false};
   bool withCompChannel{false};
   bool enableSrq{false};
+  // When true, create a SEPARATE completion queue for the receive queue so that RDMA
+  // WRITE_WITH_IMM recv CQEs do not interleave with the ring's send CQEs on one shared CQ.
+  // Default false => send and recv share one CQ (legacy, byte-identical to the working path).
+  bool dedicatedRecvCq{false};
   uint32_t atomicIbufSlots{512};  // Number of atomic internal buffer slots, each slot is 8B
 };
 
@@ -166,6 +170,10 @@ struct RdmaEndpoint {
   // should be ibv structures
   core::WorkQueueHandle wqHandle;
   core::CompletionQueueHandle cqHandle;
+  // Receive-side completion queue handle for RDMA WRITE_WITH_IMM. When the endpoint was created
+  // without a dedicated recv CQ (config.dedicatedRecvCq == false) this mirrors cqHandle (send and
+  // recv share one CQ), so consumers can always read recvCqHandle uniformly.
+  core::CompletionQueueHandle recvCqHandle;
   core::IBVerbsHandle ibvHandle;
 
   // Atomic internal buffer (ibuf) - independent MR for atomic operations

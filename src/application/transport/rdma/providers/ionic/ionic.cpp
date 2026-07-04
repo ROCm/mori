@@ -225,7 +225,7 @@ void rocm_memory_lock_to_fine_grain(void* ptr, size_t size, void** gpu_ptr, int 
 
 IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfig& config,
                                    ibv_cq* cq, struct ibv_pd* pd_uxdma,
-                                   IonicDeviceContext* device_context)
+                                   IonicDeviceContext* device_context, ibv_cq* recv_cq)
     : context(context), config(config), device_context(device_context) {
   struct ibv_qp_init_attr_ex attr;
   int hip_dev_id{-1};
@@ -247,7 +247,9 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   attr.cap.max_recv_sge = 1;
   attr.pd = pd_uxdma;
   attr.send_cq = cq;
-  attr.recv_cq = cq;
+  // Route recv completions to a dedicated CQ when one was provided (WRITE_WITH_IMM path); otherwise
+  // keep the legacy shared CQ so the working ring path is byte-identical.
+  attr.recv_cq = (recv_cq != nullptr) ? recv_cq : cq;
   qp = ibv_create_qp_ex(context, &attr);
   assert(qp);
 
@@ -275,6 +277,21 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   ionic_cq_buf = reinterpret_cast<ionic_v1_cqe*>(dvcq.q.ptr);
   MORI_APP_TRACE("cq ptr:0x{:x}, cq size:{}, cq mask:0x{:x}",
                  reinterpret_cast<uintptr_t>(dvcq.q.ptr), dvcq.q.size, dvcq.q.mask);
+
+  // Recv CQ device fields. Default to the shared send-CQ values; if a dedicated recv CQ was passed,
+  // decode its own ring buffer / db_val / mask (same CQ doorbell register, distinct db_val encodes
+  // the recv CQ id). The recv path can then poll ionic_recv_cq_buf uniformly.
+  recv_cq_dbval = cq_dbval;
+  recv_cq_mask = cq_mask;
+  ionic_recv_cq_buf = ionic_cq_buf;
+  if (recv_cq != nullptr && recv_cq != cq) {
+    IonicDvApi::Instance().get_cq(&dvrcq, recv_cq, udma_idx);
+    recv_cq_dbval = dvrcq.q.db_val;
+    recv_cq_mask = dvrcq.q.mask;
+    ionic_recv_cq_buf = reinterpret_cast<ionic_v1_cqe*>(dvrcq.q.ptr);
+    MORI_APP_TRACE("recv cq ptr:0x{:x}, recv cq size:{}, recv cq mask:0x{:x}",
+                   reinterpret_cast<uintptr_t>(dvrcq.q.ptr), dvrcq.q.size, dvrcq.q.mask);
+  }
 
   ionic_dv_qp dvqp;
   IonicDvApi::Instance().get_qp(&dvqp, qp);
@@ -505,7 +522,11 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   qp_counter++;
   IonicCqContainer* cq = new IonicCqContainer(context, config, pd);
   // printf("CreateRdmaEndpoint, context:%p, cq->cq:%p, pd_uxdma:%p\n", context, cq->cq, pd);
-  IonicQpContainer* qp = new IonicQpContainer(context, config, cq->cq, pd, this);
+  // Optional dedicated recv CQ for the WRITE_WITH_IMM path (default off => shared CQ, legacy).
+  IonicCqContainer* recvCq = config.dedicatedRecvCq ? new IonicCqContainer(context, config, pd)
+                                                    : nullptr;
+  IonicQpContainer* qp = new IonicQpContainer(context, config, cq->cq, pd, this,
+                                              recvCq ? recvCq->cq : nullptr);
 
   RdmaEndpoint endpoint;
   endpoint.handle.psn = 0;
@@ -544,6 +565,16 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   endpoint.cqHandle.dbrAddr = qp->gpu_db_cq;
   endpoint.cqHandle.dbrRecAddr = qp->gpu_db_cq;
   endpoint.cqHandle.cq_dbval = qp->cq_dbval;
+
+  // Recv CQ handle. Mirrors the send CQ when no dedicated recv CQ was created (default), so the
+  // WRITE_WITH_IMM receiver can always read recvCqHandle uniformly regardless of configuration.
+  endpoint.recvCqHandle.cqAddr = qp->ionic_recv_cq_buf;
+  endpoint.recvCqHandle.consIdx = 0;
+  endpoint.recvCqHandle.cqeNum = qp->recv_cq_mask + 1;
+  endpoint.recvCqHandle.cqeSize = GetIonicCqeSize();
+  endpoint.recvCqHandle.dbrAddr = qp->gpu_db_cq;
+  endpoint.recvCqHandle.dbrRecAddr = qp->gpu_db_cq;
+  endpoint.recvCqHandle.cq_dbval = qp->recv_cq_dbval;
 
   // Set atomic internal buffer information
   endpoint.atomicIbuf.addr = reinterpret_cast<uintptr_t>(qp->atomicIbufAddr);

@@ -75,7 +75,7 @@ typedef struct device_agent {
 class IonicQpContainer {
  public:
   IonicQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq, ibv_pd* pd,
-                   IonicDeviceContext* device_context);
+                   IonicDeviceContext* device_context, ibv_cq* recv_cq = nullptr);
   ~IonicQpContainer();
 
   void ModifyRst2Init();
@@ -120,6 +120,13 @@ class IonicQpContainer {
   uint64_t cq_dbval{0};
   uint64_t cq_mask{0};
   struct ionic_v1_cqe* ionic_cq_buf{nullptr};
+
+  // Dedicated receive CQ (populated only when a separate recv_cq is passed; otherwise these mirror
+  // the shared send CQ fields above so the recv path can be read uniformly).
+  ionic_dv_cq dvrcq;
+  uint64_t recv_cq_dbval{0};
+  uint64_t recv_cq_mask{0};
+  struct ionic_v1_cqe* ionic_recv_cq_buf{nullptr};
   ionic_dv_qp dvqp;
   uint64_t* sq_dbreg{nullptr};
   uint64_t sq_dbval{0};
