@@ -681,6 +681,21 @@ class HierAllGather:
         self.slice_defer_inter_fin = os.environ.get(
             "MORI_HIER_SLICE_DEFER_INTER_FIN", "1"
         ) not in ("0", "", "false", "False")
+        # PHASE-B ENTRY BARRIER (accuracy). Force a full cross-PE
+        # ShmemBarrierOnStream on the FIRST Phase-B reassembly gather even when
+        # slice_fuse_ib would otherwise drop it. The Phase-B intra SDMA gathers
+        # read PEER ranks' `collection` (the inter ring's per-node-block output)
+        # over XGMI; slice_fuse_ib=1 relies on the ring's deferred/own finish for
+        # cross-PE visibility, but under FSDP tight back-to-back overlap the SDMA
+        # read can observe a peer's collection before that peer's ring finish is
+        # globally visible -> the residual completion race (host-sync-recoverable
+        # loss drift). A full entry barrier here strictly orders every peer's ring
+        # finish BEFORE any Phase-B gather reads it, on-device (no host sync).
+        # Default OFF (preserves the perf path); set MORI_HIER_PHASEB_ENTRY_BARRIER=1
+        # to A/B the accuracy fix and measure its one-barrier/op perf cost.
+        self.phaseb_entry_barrier = os.environ.get(
+            "MORI_HIER_PHASEB_ENTRY_BARRIER", "0"
+        ) not in ("0", "", "false", "False")
         # DIRECT-PATH LOCAL-BLOCK OVERLAP. In the shipped
         # slice_direct path the dominant cost is now Phase B (the XGMI reassembly
         # gathers ~2.5ms), not Phase A (the sliced RDMA ring ~1.6ms) -- see the
@@ -1435,7 +1450,7 @@ class HierAllGather:
                 # already synchronizes all PEs, so the m==0 entry barrier is
                 # redundant -- drop it when slice_fuse_ib (default). Keep it only
                 # if explicitly disabled (A/B / safety fallback).
-                entry_barrier = (not self.slice_fuse_ib)
+                entry_barrier = (not self.slice_fuse_ib) or self.phaseb_entry_barrier
                 if self.slice_pipe and self.slice_pipe_chunks > 1:
                     # M5: CHUNKED (strided) Phase-B. Split each block's
                     # reassembly gather into K element-range chunks; chunk j of
