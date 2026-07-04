@@ -131,6 +131,38 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   if (useWarps > warpsPerBlock) useWarps = warpsPerBlock;
   bool fanOut = (useWarps > 1);
 
+  // FANOUT PUT-WITH-SIGNAL (env MORI_HIER_RING_PUT_SIGNAL, default OFF): on the
+  // multi-QP fan-out path the chunk is split across ``useWarps`` QPs, so a SINGLE
+  // completion-flag AMO (even RC-ordered on one QP) only orders after THAT QP's
+  // data -- the other QPs' tail bytes can still be in flight when the receiver
+  // observes the flag (the residual FSDP loss remote-landing race). Fix: have
+  // EACH fan-out warp fuse its data WRITE + a flag AMO_ADD(1) on its OWN QP via
+  // ShmemPutMemNbiSignalWarp. On RC the responder executes each QP's WRITE then
+  // its AMO in order, so every QP's data is globally visible before its own +1.
+  // The receiver waits for the flag to reach the number of active fan-out warps
+  // (``fanActive``) => it can only proceed after ALL QPs' data has landed, with
+  // NO host sync (keeps the ring<->gather overlap). Symmetric homogeneous-RDMA
+  // subgroup ring (leaders): next/prev both RDMA => send/recv counts match.
+  bool fanOutSignal = (usePutSignal && peerIsRdma && !multiBlock && fanOut);
+  int fanActive = 1;
+  if (useWarps > 1) {
+    const size_t kAlignS = 16;
+    size_t nUnitsS = (peChunkSize + kAlignS - 1) / kAlignS;
+    size_t unitsPerWarpS = (nUnitsS + useWarps - 1) / useWarps;
+    if (unitsPerWarpS == 0) unitsPerWarpS = 1;
+    fanActive = static_cast<int>((nUnitsS + unitsPerWarpS - 1) / unitsPerWarpS);
+    if (fanActive > useWarps) fanActive = useWarps;
+    if (fanActive < 1) fanActive = 1;
+  }
+  int prevPos = (ringPos - 1 + ringSize) % ringSize;
+  int prevPeer = peBase + prevPos * peStride;
+  application::TransportType prevXport =
+      shmem::GetGlobalGpuStatesPtr()->transportTypes[prevPeer];
+  bool prevIsRdma = (prevXport == application::TransportType::RDMA);
+  // Expected increments on OUR recv slot = active fan-out warps the sender (prev)
+  // used, iff prev also fans out with signals; else the classic single +1.
+  int expectedRecvSig = (fanOutSignal && prevIsRdma) ? fanActive : 1;
+
   for (int i = 0; i < maxRounds; i++) {
     // Chunk slots are indexed by ring position, not global PE.
     int sendDataRank = (ringPos - i + ringSize) % ringSize;
@@ -193,8 +225,20 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           size_t subEnd = endUnit * kAlign;
           if (subEnd > peChunkSize) subEnd = peChunkSize;  // clamp tail
           size_t subOff = chunkBaseOffset + subStart;
-          shmem::ShmemPutMemNbiWarp(memObj, subOff, memObj, subOff, subEnd - subStart, nextPeer,
-                                    warpId);
+          if (fanOutSignal) {
+            // Fuse THIS warp's data WRITE + a flag AMO_ADD(1) on ITS OWN QP
+            // (qpId=warpId). RC in-order => this QP's data lands remotely before
+            // its +1 fires. Receiver waits for the sum (fanActive) so it proceeds
+            // only after EVERY QP's data has landed -- no separate quiet, no host
+            // sync, ring<->gather overlap preserved.
+            shmem::ShmemPutMemNbiSignalWarp(
+                memObj, subOff, memObj, subOff, subEnd - subStart, flagsObj,
+                (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
+                nextPeer, warpId);
+          } else {
+            shmem::ShmemPutMemNbiWarp(memObj, subOff, memObj, subOff, subEnd - subStart, nextPeer,
+                                      warpId);
+          }
         }
       }
       // All fan-out warps must finish ISSUING their puts before thread 0 drains
@@ -233,10 +277,12 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     // (ringPos-i-1), which is EXACTLY the recvDataRank received in round i, a
     // hard data dependency (you forward onward precisely what you just got).
     bool signalFused = (usePutSignal && peerIsRdma && !multiBlock && !fanOut);
-    if (threadLinearId == 0 && signalFused) {
+    if (threadLinearId == 0 && (signalFused || fanOutSignal)) {
       // The put-with-signal path already carried the completion flag as the last
       // WQE on the data QP (RC-ordered after the data WRITE) -- no separate quiet
       // or AMO is needed. Skipping them is what removes the flag-beats-data race.
+      // On the fan-out path EVERY active warp already issued its own per-QP
+      // signal (fanActive of them), so thread 0 issues no extra AMO here.
     } else if (threadLinearId == 0) {
       // Drain the outbound put before bumping the receiver's flag. On the
       // fan-out path the put used numQp RDMA QPs, so we must quiet ALL of them:
@@ -291,11 +337,18 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // stale). A system-scope acquire + system threadfence makes the peer's prior
       // data writes visible without a host sync -- mirrors the intra SDMA gather's
       // proven AtomicLoadSeqCstSystem + __threadfence_system receiver pattern.
-      while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + recvDataRank) == 0) {
+      // On the fan-out-signal path the sender adds +1 PER active QP, so wait for
+      // the slot to reach ``expectedRecvSig`` (== fanActive); the classic path
+      // adds exactly 1 (expectedRecvSig==1), so this is a strict superset that
+      // stays byte-identical when signals are off.
+      while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + recvDataRank) <
+             (uint64_t)expectedRecvSig) {
         spinCount++;
         if (spinCount > 10000000) {  // Increased timeout threshold
-          printf("ringPos %d: Timeout waiting from ringPos %d (round %d, slot still 0)\n", ringPos,
-                 recvDataRank, i);
+          printf("ringPos %d: Timeout waiting from ringPos %d (round %d, slot=%llu<%d)\n", ringPos,
+                 recvDataRank, i, (unsigned long long)core::AtomicLoadSeqCstSystem(
+                                      flagsArray + flagBase + recvDataRank),
+                 expectedRecvSig);
           break;
         }
       }
