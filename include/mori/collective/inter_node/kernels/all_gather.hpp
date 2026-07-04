@@ -248,7 +248,17 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // Wait for THIS round's slot to become nonzero (not a cumulative count;
       // the previous "!= i+1" form only held for ringSize==2 / a single round).
       int spinCount = 0;
-      while (core::AtomicLoadRelaxed(flagsArray + flagBase + recvDataRank) == 0) {
+      // SYSTEM-scope acquire: the flag is bumped by a REMOTE peer's RDMA AMO and
+      // the chunk it guards is landed by that peer's RDMA put -- both cross-agent
+      // writes. A RELAXED load establishes NO happens-before with those data
+      // writes, so observing the flag does NOT make the received chunk coherently
+      // visible to this GPU's subsequent forward-put / copy-OUT -> the RDMA (remote)
+      // half of the output reads STALE bytes under FSDP tight overlap (the
+      // MI355-exposed loss drift; in-situ probe showed exactly the remote half
+      // stale). A system-scope acquire + system threadfence makes the peer's prior
+      // data writes visible without a host sync -- mirrors the intra SDMA gather's
+      // proven AtomicLoadSeqCstSystem + __threadfence_system receiver pattern.
+      while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + recvDataRank) == 0) {
         spinCount++;
         if (spinCount > 10000000) {  // Increased timeout threshold
           printf("ringPos %d: Timeout waiting from ringPos %d (round %d, slot still 0)\n", ringPos,
@@ -256,6 +266,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           break;
         }
       }
+      __threadfence_system();
     }
     __syncthreads();
   }
