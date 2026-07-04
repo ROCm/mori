@@ -235,6 +235,26 @@ CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG_WAIT, AllGatherAsyncWaitKernel)
 // Byte-move ring: ``chunkBytes`` per PE, ``npes-1`` rounds over the shmem
 // transport. Type-agnostic (raw bytes), so a single u32 entry serves all
 // dtypes (the Python layer rounds the byte count up to u32 lanes).
+// CU-domain ring finish copy-OUT: copy the gathered ring buffer to the user
+// output from the COMPUTE-UNIT coherence domain (vs a copy-engine
+// hipMemcpyAsync D2D). The inter-node ring receiver lands every remote chunk
+// via RDMA into ``src`` (this PE's ring buffer) and the ring kernel's
+// system-scope acquire + __threadfence_system make those bytes visible to the
+// CUs on kernel exit. A subsequent copy-ENGINE (SDMA) D2D read is a SEPARATE
+// hardware agent whose view is NOT ordered by that CU fence, so under tight
+// FSDP overlap it can drain STALE remote-half ring bytes (the MI355
+// receiver/copy-out residual after the sender-side quiet fix). A CU copy reads
+// the same coherent HBM the ring kernel fenced -> closes the residual
+// on-device, no host sync, keeps the ring<->gather overlap.
+extern "C" __global__ void RingFinishCopyKernel_u32(
+    uint32_t* __restrict__ dst, const uint32_t* __restrict__ src, uint64_t n) {
+  uint64_t idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+  for (uint64_t i = idx; i < n; i += stride) {
+    dst[i] = src[i];
+  }
+}
+
 extern "C" __global__ void InterNodeRingAllGatherKernel_u32(CclInterNodeRingArgs args) {
   // Sub-group ring over {peBase, peBase+peStride, ...}; the flat whole-world
   // ring is the special case peBase=0, peStride=1, ringSize=npes, ringPos=myPe.

@@ -78,6 +78,19 @@ _TORCH_DTYPE_TO_NUMPY = {
 }
 
 
+def _ring_cu_copyout_enabled() -> bool:
+    """CU-domain ring finish copy-OUT gate (default ON).
+
+    Reads the ring buffer via a COMPUTE-UNIT kernel instead of the copy-engine
+    hipMemcpyAsync so the finish drain observes the RDMA-landed remote-half
+    bytes the ring kernel fenced (closes the receiver/copy-out completion
+    residual on-device). Set MORI_HIER_RING_CU_COPYOUT=0 to A/B the copy engine.
+    """
+    return os.environ.get("MORI_HIER_RING_CU_COPYOUT", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 def _stream_to_int(stream) -> int:
     if stream is None:
         return 0
@@ -492,11 +505,39 @@ class InterNodeRingAllgather:
                 # prepare_stream barrier (defer_inter_fin) -- the copy-OUT stays
                 # stream-ordered so the collection is correct; only cross-PE ring
                 # reuse needs the fence, which the successor op provides.
-                self._handle.finish_stream(output_data.data_ptr(), u32_count, s,
-                                           barrier=not defer_inter_fin)
+                if _ring_cu_copyout_enabled():
+                    self._cu_finish_copyout(output_data, u32_count, s,
+                                            barrier=not defer_inter_fin)
+                else:
+                    self._handle.finish_stream(output_data.data_ptr(), u32_count, s,
+                                               barrier=not defer_inter_fin)
             else:
                 self._handle.finish_sync(output_data.data_ptr(), u32_count, s)
         return True
+
+    def _cu_finish_copyout(self, output_data, u32_count: int, s: int,
+                           barrier: bool = True) -> None:
+        """CU-domain ring finish copy-OUT + (optional deferred) reuse barrier.
+
+        Copies the gathered ring buffer (``self._handle.buf_ptr()``) into
+        ``output_data`` with the ``RingFinishCopyKernel_u32`` COMPUTE-UNIT
+        kernel rather than the copy-engine hipMemcpyAsync, so the drain observes
+        the RDMA-landed remote-half bytes the ring kernel fenced (the
+        receiver/copy-out completion residual). ``barrier`` mirrors the
+        finish_stream reuse fence (deferred when defer_inter_fin)."""
+        total_u32 = int(u32_count) * int(self.ring_size)
+        block = 256
+        grid = (total_u32 + block - 1) // block
+        if grid < 1:
+            grid = 1
+        if grid > 4096:
+            grid = 4096
+        _get_ccl_func("RingFinishCopyKernel_u32").launch(
+            (grid,), (block,), 0, s,
+            output_data.data_ptr(), self._handle.buf_ptr(), total_u32,
+        )
+        if barrier:
+            self._handle.finish_stream_no_copy(s)
 
     def prepare_stream_only(self, input_data, count: int, stream=None):
         """issue ONLY the stream-ordered ring prepare (the
@@ -546,8 +587,11 @@ class InterNodeRingAllgather:
         byte_count = count * output_data.element_size()
         u32_count = (byte_count + 3) // 4
         s = _stream_to_int(stream)
-        self._handle.finish_stream(output_data.data_ptr(), u32_count, s,
-                                   barrier=barrier)
+        if _ring_cu_copyout_enabled():
+            self._cu_finish_copyout(output_data, u32_count, s, barrier=barrier)
+        else:
+            self._handle.finish_stream(output_data.data_ptr(), u32_count, s,
+                                       barrier=barrier)
         return True
 
     def full_tensor(self, count: int, dtype, device=None):
