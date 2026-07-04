@@ -56,7 +56,8 @@ namespace collective {
 inline __device__ void AllGatherRingSubGroupKernelBody(
     int ringPos, int ringSize, int peBase, int peStride,
     const application::SymmMemObjPtr memObj, const application::SymmMemObjPtr flagsObj,
-    size_t peChunkSize, int numQp = 1, int numBlocksOverride = -1, int bidOverride = -1) {
+    size_t peChunkSize, int numQp = 1, int numBlocksOverride = -1, int bidOverride = -1,
+    bool usePutSignal = false) {
   int nextPos = (ringPos + 1) % ringSize;
   int nextPeer = peBase + nextPos * peStride;
   int maxRounds = ringSize - 1;
@@ -202,8 +203,22 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // path keeps the  thread schedule unchanged.)
       __syncthreads();
     } else if (warpId == 0) {
-      shmem::ShmemPutMemNbiWarp(memObj, chunkBaseOffset, memObj, chunkBaseOffset, peChunkSize,
-                                nextPeer);
+      if (usePutSignal && peerIsRdma) {
+        // FLAG-CAN'T-BEAT-DATA (transport-level): fuse the data WRITE and the
+        // completion-flag AMO into ONE ShmemPutMemNbiSignal so the signal WQE
+        // rides the SAME QP strictly AFTER the data WRITE. On RC the responder
+        // executes them in order and the WRITE's data is globally visible before
+        // the atomic -- so the receiver observing the flag is GUARANTEED the
+        // remote-half bytes have physically landed, with NO host sync (keeps the
+        // ring<->gather overlap). This replaces the separate put + quiet + AMO
+        // whose AMO could land before the (independently-drained) data on a race.
+        shmem::ShmemPutMemNbiSignalWarp(
+            memObj, chunkBaseOffset, memObj, chunkBaseOffset, peChunkSize, flagsObj,
+            (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer);
+      } else {
+        shmem::ShmemPutMemNbiWarp(memObj, chunkBaseOffset, memObj, chunkBaseOffset, peChunkSize,
+                                  nextPeer);
+      }
     }
 
     // M4: overlap the OUTBOUND drain (quiet + flag bump to nextPeer)
@@ -217,7 +232,12 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     // this recv-wait) is IMPOSSIBLE here -- round i+1 sends sendDataRank =
     // (ringPos-i-1), which is EXACTLY the recvDataRank received in round i, a
     // hard data dependency (you forward onward precisely what you just got).
-    if (threadLinearId == 0) {
+    bool signalFused = (usePutSignal && peerIsRdma && !multiBlock && !fanOut);
+    if (threadLinearId == 0 && signalFused) {
+      // The put-with-signal path already carried the completion flag as the last
+      // WQE on the data QP (RC-ordered after the data WRITE) -- no separate quiet
+      // or AMO is needed. Skipping them is what removes the flag-beats-data race.
+    } else if (threadLinearId == 0) {
       // Drain the outbound put before bumping the receiver's flag. On the
       // fan-out path the put used numQp RDMA QPs, so we must quiet ALL of them:
       // ShmemQuietThread(pe) (RDMA) loops qpId 0..numQpPerPe-1. The single-warp

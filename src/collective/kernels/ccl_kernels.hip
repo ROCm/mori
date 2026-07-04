@@ -259,7 +259,9 @@ extern "C" __global__ void InterNodeRingAllGatherKernel_u32(CclInterNodeRingArgs
   // Sub-group ring over {peBase, peBase+peStride, ...}; the flat whole-world
   // ring is the special case peBase=0, peStride=1, ringSize=npes, ringPos=myPe.
   AllGatherRingSubGroupKernelBody(args.ringPos, args.ringSize, args.peBase, args.peStride,
-                                  args.memObj, args.flagsObj, args.chunkBytes, args.numQp);
+                                  args.memObj, args.flagsObj, args.chunkBytes, args.numQp,
+                                  /*numBlocksOverride=*/-1, /*bidOverride=*/-1,
+                                  /*usePutSignal=*/args.usePutSignal != 0);
 }
 
 // ============================================================================

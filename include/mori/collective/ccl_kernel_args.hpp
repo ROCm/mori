@@ -193,6 +193,14 @@ struct CclInterNodeRingArgs {
   // (the kernel checks transportTypes[nextPeer] at runtime so single-node
   // simulation stays single-warp -- see all_gather.hpp).
   int numQp;
+  // Transport-level flag-can't-beat-data: when non-zero, the single-warp RDMA
+  // ring send fuses the data WRITE and the completion-flag AMO into ONE
+  // ShmemPutMemNbiSignal call so the signal WQE rides the SAME QP strictly
+  // AFTER the data WRITE. RC in-order execution then guarantees the remote
+  // peer's data has physically LANDED before its flag is observable -- closing
+  // the residual FSDP loss completion race without any host sync (the flag can
+  // never beat its data). Default 0 = the historical separate put + quiet + AMO.
+  int usePutSignal = 0;
 };
 
 // FUSED inter-node ring + intra-node LOCAL-block SDMA gather.

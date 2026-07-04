@@ -185,6 +185,18 @@ class InterNodeRingAllgather {
     if (flags_ == nullptr) throw std::runtime_error("InterNodeRingAllgather: flags ShmemMalloc failed");
     (void)hipMemset(flags_, 0, flagsBytes);
     flagsObj_ = shmem::ShmemQueryMemObjPtr(flags_);
+
+    // Transport-level flag-can't-beat-data (env MORI_HIER_RING_PUT_SIGNAL, default
+    // OFF). When set, the single-warp RDMA ring send fuses the data WRITE and the
+    // completion-flag AMO into one ShmemPutMemNbiSignal (same QP, signal after
+    // data) so the receiver never observes the flag before the remote data lands
+    // -- the last untried lever for the residual FSDP loss completion race,
+    // on-device with no host sync. Set once here; prepare_* only writes the other
+    // per-call fields, so this persists across calls.
+    {
+      const char* e = std::getenv("MORI_HIER_RING_PUT_SIGNAL");
+      jit_args_.usePutSignal = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
   }
 
   ~InterNodeRingAllgather() {
