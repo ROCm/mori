@@ -146,12 +146,10 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits):
     return 0, n_wrong
 
 
-def _worker_body(rank, world_size, ranks_per_node, device):
-    shmem.shmem_torch_process_group_init("default")
-    assert shmem.shmem_mype() == rank
-    _, _, count = _splits_offsets(device)
-    per_rank_bytes = count * 4 + 4096
-    handle = HierAllGather(
+def _make_handle(rank, world_size, ranks_per_node):
+    # Buffers sized for the LARGEST profile so one handle serves every size band.
+    per_rank_bytes = sum(_PARAM_SPLITS) * 4 + 4096
+    return HierAllGather(
         my_pe=rank,
         npes=world_size,
         ranks_per_node=ranks_per_node,
@@ -159,6 +157,12 @@ def _worker_body(rank, world_size, ranks_per_node, device):
         output_buffer_size=per_rank_bytes * world_size,
         copy_output_to_user=True,
     )
+
+
+def _worker_body(rank, world_size, ranks_per_node, device):
+    shmem.shmem_torch_process_group_init("default")
+    assert shmem.shmem_mype() == rank
+    handle = _make_handle(rank, world_size, ranks_per_node)
     if rank == 0:
         print(
             f"overlap-determinism: world={world_size} rpn={ranks_per_node} "
@@ -166,8 +170,10 @@ def _worker_body(rank, world_size, ranks_per_node, device):
             f"supports={handle.supports_param_contiguous_output()}",
             flush=True,
         )
+    supported = handle.supports_param_contiguous_output()
+    del handle
     try:
-        if not handle.supports_param_contiguous_output():
+        if not supported:
             if rank == 0:
                 print("SKIP: direct param-contiguous path unavailable", flush=True)
             return
@@ -181,13 +187,28 @@ def _worker_body(rank, world_size, ranks_per_node, device):
             [524288],               # single big split
         ]
         _MODES = os.environ.get("OVERLAP_MODES", "copyout,zerocopy").split(",")
+        # FRESH handle per op MODE. Mixing the copy-OUT __call__ path and the
+        # zero-copy enqueue_param_contiguous path on ONE handle contaminates the
+        # shared intra flag/seq + output-registration state (copy-OUT registers a
+        # transit out_, zero-copy registers the USER output), which spuriously
+        # produced a stable-NaN artifact for [zerocopy bf16 nsplit=5] when it ran
+        # right after copy-OUT ops -- NOT a kernel bug (the pure-mode bit-exact
+        # test passes bf16 at this exact config). FSDP uses one mode for a whole
+        # run, so a per-mode handle is the faithful, artifact-free harness.
         for mode in _MODES:
-            for splits in _SIZE_PROFILES:
-                for dtype in _DTYPES:
-                    nd, wr = _run_dtype(handle, dtype, rank, world_size,
-                                        device, mode, list(splits))
-                    total_nd += nd
-                    total_wr += wr
+            handle = _make_handle(rank, world_size, ranks_per_node)
+            try:
+                for splits in _SIZE_PROFILES:
+                    for dtype in _DTYPES:
+                        nd, wr = _run_dtype(handle, dtype, rank, world_size,
+                                            device, mode, list(splits))
+                        total_nd += nd
+                        total_wr += wr
+            finally:
+                torch.cuda.synchronize()
+                dist.barrier()
+                del handle
+                dist.barrier()
         torch.cuda.synchronize()
         dist.barrier()
         if rank == 0:
@@ -199,8 +220,6 @@ def _worker_body(rank, world_size, ranks_per_node, device):
                       f"nondet={total_nd} wrong={total_wr}", flush=True)
     finally:
         torch.cuda.synchronize()
-        dist.barrier()
-        del handle
         dist.barrier()
         shmem.shmem_finalize()
 
