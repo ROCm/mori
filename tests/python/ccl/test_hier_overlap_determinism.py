@@ -36,7 +36,14 @@ from mori.ccl import HierAllGather
 
 _DTYPES = [torch.bfloat16, torch.float32]
 _PARAM_SPLITS = [1048576, 524288, 262144, 131072, 65536]
+# LARGE band = Qwen embed+lm_head (~68M elems/rank; gathered ~2.18GB int32,
+# crosses 2^31 bytes). The <=2M overlap UT never exercised this; if the async
+# remote-landing race is size-dependent this is where it must surface.
+_PARAM_SPLITS_LARGE = [34078720, 34078720]
 _REPS = int(os.environ.get("OVERLAP_REPS", "50"))
+# Large-band reps are cheaper to keep short (each AG moves ~2GB); still enough
+# reps to catch a run-to-run async landing race.
+_REPS_LARGE = int(os.environ.get("OVERLAP_REPS_LARGE", "12"))
 
 
 def _make_input(dtype, count, rank, device):
@@ -68,7 +75,32 @@ def _consume(out, wvec):
     return (out.to(torch.float32) * wvec[:n]).sum()
 
 
-def _run_dtype(handle, dtype, rank, world_size, device, mode, splits):
+def _reference_out(inp, splits, mode, world_size, device):
+    """INDEPENDENT truth: RCCL all_gather -> the layout the mode produces.
+
+    The host-synced ``golden`` is self-referential -- if the copy-out drains the
+    transit ``out_`` before every peer's SDMA put has REMOTELY landed, golden
+    reads the SAME stale bytes as the overlapped pass, so golden==overlapped
+    (wrong=0) even though BOTH are wrong. Comparing against this all_gather-built
+    reference is what actually catches a stable-but-wrong drain (the FSDP loss
+    drift that only host stream.synchronize() removes)."""
+    count = inp.numel()
+    rank_major = torch.empty(count * world_size, dtype=inp.dtype, device=device)
+    dist.all_gather_into_tensor(rank_major, inp)  # [r0_shard, r1_shard, ...]
+    if mode == "copyout":
+        return rank_major  # __call__ produces rank-major [rank][param]
+    # zerocopy: reshuffle rank-major -> param-contiguous [param][rank]
+    ref = torch.empty(count * world_size, dtype=inp.dtype, device=device)
+    o = 0
+    for e in splits:
+        for r in range(world_size):
+            ref[o * world_size + r * e : o * world_size + r * e + e] = \
+                rank_major[r * count + o : r * count + o + e]
+        o += e
+    return ref
+
+
+def _run_dtype(handle, dtype, rank, world_size, device, mode, splits, reps):
     """Overlap-determinism probe for one dtype under one op ``mode``.
 
     ``mode="zerocopy"`` exercises ``enqueue_param_contiguous`` (the direct
@@ -101,10 +133,15 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits):
     comm = torch.cuda.Stream()
     pressure = torch.randn(2048, 2048, dtype=torch.float32, device=device)
 
-    # Golden pass: per-rep host-synced (fresh bytes guaranteed) scalars.
+    # Golden pass: per-rep host-synced (fresh bytes guaranteed) scalars, PLUS an
+    # INDEPENDENT all_gather-built reference scalar per rep (catches stable-wrong).
     golden = []
-    for rep in range(_REPS):
-        do_op(inp_for(rep), main)
+    truth = []
+    for rep in range(reps):
+        inp = inp_for(rep)
+        ref = _reference_out(inp, splits, mode, world_size, device)
+        truth.append(_consume(ref, wvec).item())
+        do_op(inp, main)
         main.synchronize()
         torch.cuda.synchronize()
         golden.append(_consume(out, wvec).item())
@@ -112,7 +149,7 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits):
 
     # Overlapped pass: cross-stream event handoff, NO host sync AG->consumer.
     scalars = []
-    for rep in range(_REPS):
+    for rep in range(reps):
         inp = inp_for(rep)
         for _ in range(4):
             pressure = pressure @ pressure * 1e-3 + 0.1
@@ -135,20 +172,32 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits):
         return v != g
     n_wrong = sum(1 for v, g in zip(vals, golden) if _ne(v, g))
     first_bad = next((i for i, (v, g) in enumerate(zip(vals, golden)) if _ne(v, g)), -1)
+    # CORRECTNESS vs the independent all_gather reference. Use a relative tol on
+    # the huge weighted-sum scalar (bf16 accumulation of ~1e12 has legit ULP
+    # noise); a real drain-stale error shifts many elements and blows past this.
+    def _wrong_vs_truth(v, t):
+        v_nan, t_nan = (v != v), (t != t)
+        if v_nan or t_nan:
+            return v_nan != t_nan  # exactly one NaN = wrong; both NaN = ok
+        return abs(v - t) > 1e-4 * max(abs(t), 1.0)
+    n_truth = sum(1 for v, t in zip(vals, truth) if _wrong_vs_truth(v, t))
+    n_gold_truth = sum(1 for g, t in zip(golden, truth) if _wrong_vs_truth(g, t))
     if rank == 0:
         print(
-            f"  [{mode} nsplit={len(splits)}] dtype={dtype} golden0={golden[0]:.3f} "
-            f"rep0={vals[0]:.3f} wrong={n_wrong}/{_REPS} first_bad={first_bad}"
-            + (f" (got={vals[first_bad]:.6g} want={golden[first_bad]:.6g})"
-               if first_bad >= 0 else ""),
+            f"  [{mode} nsplit={len(splits)} n/rank={sum(splits)}] dtype={dtype} "
+            f"golden0={golden[0]:.3f} truth0={truth[0]:.3f} rep0={vals[0]:.3f} "
+            f"nondet={n_wrong}/{reps} wrong_vs_truth={n_truth}/{reps} "
+            f"gold_vs_truth={n_gold_truth}/{reps}",
             flush=True,
         )
-    return 0, n_wrong
+    # A stable-but-wrong drain shows as nondet=0 but wrong_vs_truth>0 (and
+    # gold_vs_truth>0). Count truth violations as failures too.
+    return 0, n_wrong + n_truth
 
 
 def _make_handle(rank, world_size, ranks_per_node):
     # Buffers sized for the LARGEST profile so one handle serves every size band.
-    per_rank_bytes = sum(_PARAM_SPLITS) * 4 + 4096
+    per_rank_bytes = sum(_PARAM_SPLITS_LARGE) * 4 + 4096
     return HierAllGather(
         my_pe=rank,
         npes=world_size,
@@ -182,9 +231,12 @@ def _worker_body(rank, world_size, ranks_per_node, device):
         # single-split profile (Qwen has small layers that route to the
         # non-slice copy-out fallback -- the untested band).
         _SIZE_PROFILES = [
-            _PARAM_SPLITS,          # large multi-split (proven regime)
-            [65536, 32768, 8192],   # small sizes (num_blocks=1 band), 4B-aligned
-            [524288],               # single big split
+            (_PARAM_SPLITS, _REPS),        # large multi-split (proven regime)
+            ([65536, 32768, 8192], _REPS), # small sizes (num_blocks=1 band)
+            ([524288], _REPS),             # single big split
+            # Qwen embed+lm_head band -- crosses 2^31 bytes; the untested regime
+            # where a size-dependent async landing race would surface.
+            (_PARAM_SPLITS_LARGE, _REPS_LARGE),
         ]
         _MODES = os.environ.get("OVERLAP_MODES", "copyout,zerocopy").split(",")
         # FRESH handle per op MODE. Mixing the copy-OUT __call__ path and the
@@ -198,10 +250,10 @@ def _worker_body(rank, world_size, ranks_per_node, device):
         for mode in _MODES:
             handle = _make_handle(rank, world_size, ranks_per_node)
             try:
-                for splits in _SIZE_PROFILES:
+                for splits, reps in _SIZE_PROFILES:
                     for dtype in _DTYPES:
                         nd, wr = _run_dtype(handle, dtype, rank, world_size,
-                                            device, mode, list(splits))
+                                            device, mode, list(splits), reps)
                         total_nd += nd
                         total_wr += wr
             finally:

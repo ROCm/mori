@@ -34,6 +34,14 @@ _DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.int32]
 # even -> 4-byte aligned byte extents for bf16/fp16.
 _PARAM_SPLITS = [1048576, 524288, 262144, 131072, 65536]
 
+# LARGE profile: matches Qwen-7B's biggest FSDP all-gathers (embed + lm_head,
+# ~544M elems gathered = ~1.09GB/rank bf16). Per-rank shard ~= 544M/8 = 68M.
+# Two ~34M splits so gathered total per param crosses the u32 byte-offset regime:
+# int32 gathered = 8*68M*4 ~= 2.14GB ~= 2^31 bytes -> probes u32 byte-index
+# overflow in the scatter/ring kernels (the remaining unexplored size band that
+# could source the FSDP loss drift). bf16 gathered ~= 1.07GB/rank.
+_PARAM_SPLITS_LARGE = [34078720, 34078720]  # 2 * ~2^25.02; sum = 68157440/rank
+
 
 def _make_input(dtype, count, rank, device):
     base = (rank + 1) * 17
@@ -57,8 +65,7 @@ def _expected_param_contiguous(inp, splits, world_size, rank, device):
     return expected
 
 
-def _run_one(handle, dtype, rank, world_size, device):
-    splits = _PARAM_SPLITS
+def _run_one(handle, dtype, rank, world_size, device, splits):
     count = sum(splits)
     inp = _make_input(dtype, count, rank, device)
     out = torch.empty(count * world_size, dtype=dtype, device=device)
@@ -90,10 +97,10 @@ def _run_one(handle, dtype, rank, world_size, device):
         )
 
 
-def _worker_body(rank, world_size, ranks_per_node, device):
-    shmem.shmem_torch_process_group_init("default")
-    assert shmem.shmem_mype() == rank
-    count = sum(_PARAM_SPLITS)
+def _run_profile(name, splits, dtypes, reps, rank, world_size,
+                 ranks_per_node, device):
+    """Build a fresh handle for this size profile and validate bit-exact."""
+    count = sum(splits)
     per_rank_bytes = count * 4 + 4096
     handle = HierAllGather(
         my_pe=rank,
@@ -105,31 +112,50 @@ def _worker_body(rank, world_size, ranks_per_node, device):
     )
     if rank == 0:
         print(
-            f"param-contig: world={world_size} rpn={ranks_per_node} "
-            f"num_nodes={handle.num_nodes} "
+            f"[{name}] world={world_size} rpn={ranks_per_node} "
+            f"num_nodes={handle.num_nodes} count/rank={count} "
+            f"gathered_int32_bytes={count * world_size * 4} "
             f"supports={handle.supports_param_contiguous_output()}"
         )
     try:
         if not handle.supports_param_contiguous_output():
             if rank == 0:
-                print("SKIP: direct param-contiguous path unavailable "
-                      "(single-node / no slice_direct)")
-            return
-        # Repeat to catch any flag-recycle / reuse race across ops (FSDP does
-        # many back-to-back gathers on one handle).
-        for _rep in range(3):
-            for dtype in _DTYPES:
-                _run_one(handle, dtype, rank, world_size, device)
+                print(f"[{name}] SKIP: direct param-contiguous path unavailable")
+            return True
+        for _rep in range(reps):
+            for dtype in dtypes:
+                _run_one(handle, dtype, rank, world_size, device, splits)
                 if rank == 0 and _rep == 0:
-                    print(f"  ok dtype={dtype}")
+                    print(f"[{name}]   ok dtype={dtype}")
         torch.cuda.synchronize()
         dist.barrier()
         if rank == 0:
-            print("test_hier_allgather_param_contiguous: PASSED")
+            print(f"[{name}] PASSED")
+        return True
     finally:
         torch.cuda.synchronize()
         dist.barrier()
         del handle
+        dist.barrier()
+
+
+def _worker_body(rank, world_size, ranks_per_node, device):
+    shmem.shmem_torch_process_group_init("default")
+    assert shmem.shmem_mype() == rank
+    try:
+        # Small profile: all dtypes, 3 reps (flag-recycle coverage).
+        _run_profile("small", _PARAM_SPLITS, _DTYPES, 3,
+                     rank, world_size, ranks_per_node, device)
+        # LARGE profile: the Qwen embed+lm_head band that the <=2M UT never
+        # exercised. bf16/fp32 (FSDP dtypes) + int32 (probes 2^31 byte-offset
+        # overflow in the scatter/ring). Fewer reps -- each is ~2GB buffers.
+        _run_profile("large", _PARAM_SPLITS_LARGE,
+                     [torch.bfloat16, torch.float32, torch.int32], 2,
+                     rank, world_size, ranks_per_node, device)
+        if rank == 0:
+            print("test_hier_allgather_param_contiguous: PASSED")
+    finally:
+        torch.cuda.synchronize()
         dist.barrier()
         shmem.shmem_finalize()
 
