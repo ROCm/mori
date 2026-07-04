@@ -136,6 +136,18 @@ inline __device__ uint64_t PostRead(WorkQueueHandle& wq, uint32_t qpn, uintptr_t
   return PostReadWrite<PrvdType, true>(wq, qpn, laddr, lkey, raddr, rkey, bytes);
 }
 
+// RDMA WRITE_WITH_IMM: like PostWrite but carries a 32-bit immediate that is
+// delivered to the receiver's completion queue when (and only when) the payload
+// DMA has landed remotely. This is the transport primitive for the inline-flag
+// ring protocol (Phase 5): completion becomes a CQ event that cannot be observed
+// before its data, unlike a separate GPU-memory flag AMO. Send-side only; the
+// receiver consumes the immediate via a recv-CQ poll (see PollRecvCqImm).
+template <ProviderType PrvdType>
+inline __device__ uint64_t PostWriteImm(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                        uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
+                                        bool cqeSignal, uint32_t qpn, uintptr_t laddr, uint64_t lkey,
+                                        uintptr_t raddr, uint64_t rkey, uint32_t imm, size_t bytes);
+
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWriteInline(WorkQueueHandle& wq, uint32_t curPostIdx,
                                            uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,

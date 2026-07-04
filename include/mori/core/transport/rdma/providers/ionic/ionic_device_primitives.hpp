@@ -257,6 +257,60 @@ inline __device__ uint64_t PostReadWrite<ProviderType::PSD, true>(WorkQueueHandl
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                     Write-With-Immediate APIs                                   */
+/* ---------------------------------------------------------------------------------------------- */
+// RDMA WRITE_WITH_IMM: identical WQE layout to a plain RDMA_WRITE but with the
+// IMM opcode and a 32-bit immediate placed in imm_data_key. On RC the immediate
+// reaches the receiver's recv-CQ strictly AFTER the payload DMA lands remotely,
+// so the receiver observing the CQE proves the data is globally visible. This is
+// the Phase-5 inline-flag ring primitive; nothing calls it yet (send-side scaffold).
+inline __device__ uint64_t IonicPostWriteImm(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                             bool cqeSignal, uint32_t qpn, uintptr_t laddr,
+                                             uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+                                             uint32_t imm, size_t bytes) {
+  void* queueBuffAddr = wq.sqAddr;
+  uint32_t wqeNum = wq.sqWqeNum;
+  int32_t size = (int32_t)bytes;
+  uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
+  char* wqeAddr = reinterpret_cast<char*>(queueBuffAddr) + (wqeIdx * sizeof(struct ionic_v1_wqe));
+  struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
+  uint16_t wqe_flags = 0;
+
+  if ((wqeNum & curPostIdx) == 0) {
+    wqe_flags |= HTOBE16(IONIC_V1_FLAG_COLOR);
+  }
+  if (cqeSignal) {
+    wqe_flags |= HTOBE16(IONIC_V1_FLAG_SIG);
+  }
+
+  wqe->base.wqe_idx = curPostIdx;
+  wqe->base.op = IONIC_V2_OP_RDMA_WRITE_IMM;
+  wqe->base.num_sge_key = size ? 1 : 0;
+  wqe->base.imm_data_key = HTOBE32(imm);
+
+  wqe->common.rdma.remote_va_high = HTOBE32(reinterpret_cast<uint64_t>(raddr) >> 32);
+  wqe->common.rdma.remote_va_low = HTOBE32(reinterpret_cast<uint64_t>(raddr));
+  wqe->common.rdma.remote_rkey = HTOBE32(rkey);
+
+  wqe->common.length = HTOBE32(size);
+  wqe->common.pld.sgl[0].va = HTOBE64(reinterpret_cast<uint64_t>(laddr));
+  wqe->common.pld.sgl[0].len = HTOBE32(size);
+  wqe->common.pld.sgl[0].lkey = HTOBE32(lkey);
+
+  __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+
+  return wq.sq_dbval | ((curPostIdx + 1) & (wqeNum - 1));
+}
+
+template <>
+inline __device__ uint64_t PostWriteImm<ProviderType::PSD>(
+    WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
+    bool cqeSignal, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+    uint32_t imm, size_t bytes) {
+  return IonicPostWriteImm(wq, curPostIdx, cqeSignal, qpn, laddr, lkey, raddr, rkey, imm, bytes);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                        WriteInline APIs                                        */
 /* ---------------------------------------------------------------------------------------------- */
 inline __device__ uint64_t IonicPostWriteInline(WorkQueueHandle& wq, uint32_t curPostIdx,
