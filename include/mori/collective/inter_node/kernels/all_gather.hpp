@@ -235,6 +235,19 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
         // drains ALL QPs so the receiver's flag never fires before a tail QP's
         // data lands.
         shmem::ShmemQuietThread(nextPeer);
+      } else if (peerIsRdma) {
+        // CORRECTNESS (flag-beats-data): for a CROSS-NODE (RDMA) neighbour the
+        // single-warp put rode an RDMA QP, but the SDMA-typed memObj-overload
+        // quiet drains only the P2P/SDMA path -- it does NOT wait for the RDMA
+        // send-queue completion, so the flag AMO below can be issued (and land
+        // remotely, RC-ordered on its own QP) BEFORE the data PUT has drained
+        // -> the receiver observes the flag and reads STALE remote-half bytes
+        // (the MI355 FSDP loss drift; in-situ probe: exactly the remote half).
+        // Use the transport-aware quiet (RDMA -> loops all numQpPerPe QPs) so
+        // the outbound put is fully drained before the flag fires. On-device,
+        // no host sync -> keeps the ring<->gather overlap (perf) AND orders
+        // remote landing (accuracy). Mirrors the fan-out path's RDMA quiet.
+        shmem::ShmemQuietThread(nextPeer);
       } else {
         shmem::ShmemQuietThread(nextPeer, memObj);
       }
