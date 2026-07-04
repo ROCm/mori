@@ -68,7 +68,19 @@ def _consume(out, wvec):
     return (out.to(torch.float32) * wvec[:n]).sum()
 
 
-def _run_dtype(handle, dtype, rank, world_size, device):
+def _run_dtype(handle, dtype, rank, world_size, device, mode, splits):
+    """Overlap-determinism probe for one dtype under one op ``mode``.
+
+    ``mode="zerocopy"`` exercises ``enqueue_param_contiguous`` (the direct
+    param-contiguous scatter; proven clean in turn 1). ``mode="copyout"``
+    exercises the plain ``__call__`` copy-OUT path -- the path the deployed FSDP
+    perf config actually uses (MORI_FSDP_NO_ZERO_COPY=1) and the remaining
+    suspect for the ~0.15% loss drift: the intra SDMA gather stacks peers' puts
+    into the transit ``out_`` and a SEPARATE copy-OUT reader may see bytes that
+    haven't finished landing at the receiver.
+    """
+    global _PARAM_SPLITS
+    _PARAM_SPLITS = splits
     ss, so, count = _splits_offsets(device)
     out = torch.empty(count * world_size, dtype=dtype, device=device)
     # position weight so the consumer is layout- and value-sensitive.
@@ -79,6 +91,12 @@ def _run_dtype(handle, dtype, rank, world_size, device):
     def inp_for(rep):
         return _make_input(dtype, count, rank, device) + (rep % 7)
 
+    def do_op(inp, stream):
+        if mode == "zerocopy":
+            assert handle.enqueue_param_contiguous(inp, out, count, ss, so, stream)
+        else:  # copyout: the deployed FSDP path (rank-major __call__)
+            assert handle(inp, out, count, stream)
+
     main = torch.cuda.current_stream()
     comm = torch.cuda.Stream()
     pressure = torch.randn(2048, 2048, dtype=torch.float32, device=device)
@@ -86,8 +104,7 @@ def _run_dtype(handle, dtype, rank, world_size, device):
     # Golden pass: per-rep host-synced (fresh bytes guaranteed) scalars.
     golden = []
     for rep in range(_REPS):
-        inp = inp_for(rep)
-        assert handle.enqueue_param_contiguous(inp, out, count, ss, so, main)
+        do_op(inp_for(rep), main)
         main.synchronize()
         torch.cuda.synchronize()
         golden.append(_consume(out, wvec).item())
@@ -101,7 +118,7 @@ def _run_dtype(handle, dtype, rank, world_size, device):
             pressure = pressure @ pressure * 1e-3 + 0.1
         comm.wait_stream(main)
         with torch.cuda.stream(comm):
-            assert handle.enqueue_param_contiguous(inp, out, count, ss, so, comm)
+            do_op(inp, comm)
         ev = torch.cuda.Event()
         ev.record(comm)
         main.wait_event(ev)
@@ -109,13 +126,20 @@ def _run_dtype(handle, dtype, rank, world_size, device):
     torch.cuda.synchronize()
 
     vals = [s.item() for s in scalars]
-    n_wrong = sum(1 for v, g in zip(vals, golden) if v != g)
-    first_bad = next((i for i, (v, g) in enumerate(zip(vals, golden)) if v != g), -1)
+    # Determinism = overlapped scalar bitwise-matches the host-synced golden.
+    # NaN==NaN is deterministic (a stale-byte race would give DIFFERING run-to-
+    # run values, not a stable NaN), so treat matching NaNs as equal.
+    def _ne(v, g):
+        if v != v and g != g:  # both NaN
+            return False
+        return v != g
+    n_wrong = sum(1 for v, g in zip(vals, golden) if _ne(v, g))
+    first_bad = next((i for i, (v, g) in enumerate(zip(vals, golden)) if _ne(v, g)), -1)
     if rank == 0:
         print(
-            f"  dtype={dtype} golden0={golden[0]:.3f} rep0={vals[0]:.3f} "
-            f"wrong={n_wrong}/{_REPS} first_bad={first_bad}"
-            + (f" (got={vals[first_bad]:.3f} want={golden[first_bad]:.3f})"
+            f"  [{mode} nsplit={len(splits)}] dtype={dtype} golden0={golden[0]:.3f} "
+            f"rep0={vals[0]:.3f} wrong={n_wrong}/{_REPS} first_bad={first_bad}"
+            + (f" (got={vals[first_bad]:.6g} want={golden[first_bad]:.6g})"
                if first_bad >= 0 else ""),
             flush=True,
         )
@@ -148,10 +172,22 @@ def _worker_body(rank, world_size, ranks_per_node, device):
                 print("SKIP: direct param-contiguous path unavailable", flush=True)
             return
         total_nd, total_wr = 0, 0
-        for dtype in _DTYPES:
-            nd, wr = _run_dtype(handle, dtype, rank, world_size, device)
-            total_nd += nd
-            total_wr += wr
+        # Size profiles: the large multi-split (turn-1 regime) + a SMALL/odd
+        # single-split profile (Qwen has small layers that route to the
+        # non-slice copy-out fallback -- the untested band).
+        _SIZE_PROFILES = [
+            _PARAM_SPLITS,          # large multi-split (proven regime)
+            [65536, 32768, 8192],   # small sizes (num_blocks=1 band), 4B-aligned
+            [524288],               # single big split
+        ]
+        _MODES = os.environ.get("OVERLAP_MODES", "copyout,zerocopy").split(",")
+        for mode in _MODES:
+            for splits in _SIZE_PROFILES:
+                for dtype in _DTYPES:
+                    nd, wr = _run_dtype(handle, dtype, rank, world_size,
+                                        device, mode, list(splits))
+                    total_nd += nd
+                    total_wr += wr
         torch.cuda.synchronize()
         dist.barrier()
         if rank == 0:
