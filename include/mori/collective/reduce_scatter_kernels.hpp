@@ -48,6 +48,24 @@ using namespace mori::shmem;
 using namespace mori::application;
 using namespace mori::collective;
 
+// Phase-1 packet emission strategy for the push kernel's single-warp fast path.
+//   RS_PUSH_LDS_STAGE == 0 : each lane writes its packet directly to the ring.
+//   RS_PUSH_LDS_STAGE == 1 : lanes stage packets in LDS (bank-conflict-free,
+//        17-dword padded slots), then up to npes*S*4 threads flush them to the
+//        ring as coalesced b128 stores (one b128 per thread).
+#ifndef RS_PUSH_LDS_STAGE
+#define RS_PUSH_LDS_STAGE 0
+#endif
+
+// Fast-path capacity: npes <= 8 (one warp), S = 1<<logS <= 8. A fused
+// copy+atomic packet is 64B = 16 dwords; pad each LDS slot to 17 dwords so the
+// per-lane build write (stride 17, coprime to the 32 LDS banks) is
+// conflict-free.
+static constexpr int kRSPushMaxPeers = 8;
+static constexpr int kRSPushMaxSlices = 8;
+static constexpr int kRSPushPktDwords = 16;   // sizeof(SDMA_PKT_COPY_WITH_ATOMIC)/4
+static constexpr int kRSPushSlotDwords = 17;  // padded stride (16 + 1)
+
 // ---------------------------------------------------------------------------
 // Reduction Op functors. Accumulation is done in float (lossless for the
 // small integer-valued test patterns, and avoids precision loss for fp16/bf16).
@@ -297,12 +315,87 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
     const size_t off = reinterpret_cast<uintptr_t>(dstLocal) - heapBase;
 
     if (npes * S <= warpSize) {
-      // --- Fast path: one warp issues EVERY (peer, slice) copy concurrently. ---
+      constexpr size_t pkt = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
+#if RS_PUSH_LDS_STAGE
+      // --- Fast path (LDS-staged): build packets into bank-conflict-free LDS ----
+      // slots, then flush them to the rings with up to npes*S*4 threads (one
+      // coalesced b128 store per thread). The build write uses one lane per packet
+      // at a 17-dword slot stride (coprime to the 32 LDS banks) so the 16-dword
+      // packet write is conflict-free. The flush spans multiple warps, so the ring
+      // writes need a block-wide fence + barrier before any leader rings a doorbell
+      // (the submitter's own s_waitcnt(0) only drains its own wave).
+      __shared__ uint32_t pktBuf[kRSPushMaxPeers * kRSPushMaxSlices * kRSPushSlotDwords];
+      __shared__ uint64_t sStart[kRSPushMaxPeers];
+      __shared__ uint64_t sOff[kRSPushMaxPeers];
+
+      // -- Build phase: one lane per packet (peer = lane/S, slice = lane%S). --
+      const int lane = tid;
+      const int peer = (lane < npes * S) ? lane / S : npes;
+      const int slice = (lane < npes * S) ? lane % S : 0;
+      const bool bactive = (lane < npes * S) && (peer != myPe);
+      if (bactive) {
+        auto** handles = heapObj->deviceHandles_d + (peer % 8) * numSdmaQ;
+        auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
+        if (slice == 0) {
+          // Leader reserves the whole S-packet block and publishes base/pad to LDS.
+          uint64_t offset = 0;
+          uint64_t sb = handle->ReserveQueueSpace(pkt * S, offset);
+          if (offset) handle->fillNops(sb, offset);
+          sStart[peer] = sb;
+          sOff[peer] = offset;
+        }
+        const uint8_t* s =
+            reinterpret_cast<const uint8_t*>(input + peer * chunkElems) + slice * sliceBytes;
+        uint8_t* d =
+            reinterpret_cast<uint8_t*>(heapObj->peerPtrs[peer] + off) + slice * sliceBytes;
+        size_t sz = (slice == S - 1) ? lastBytes : sliceBytes;
+        SDMA_PKT_COPY_WITH_ATOMIC packet = {
+            .copy = anvil::CreateCopyPacket(const_cast<uint8_t*>(s), d, sz),
+            .atomic = anvil::CreateAtomicAddPacket(heapObj->peerSignalPtrs[peer] + slice,
+                                                   (1ull << myPe))};
+        const uint32_t* pp = reinterpret_cast<const uint32_t*>(&packet);
+        const int slotBase = lane * kRSPushSlotDwords;  // slot == peer*S + slice == lane
+#pragma unroll
+        for (int k = 0; k < kRSPushPktDwords; k++) pktBuf[slotBase + k] = pp[k];
+      }
+      __syncthreads();
+
+      // -- Flush phase: one thread per b128 (packet = fb/4, b128 = fb%4), block-
+      // strided so it is robust to any blockDim (<= npes*S*4 total b128s). --
+      const int totalB128 = npes * S * 4;
+      for (int fb = tid; fb < totalB128; fb += blockDim.x) {
+        const int fpkt = fb / 4;
+        const int bb = fb % 4;
+        const int fpeer = fpkt / S;
+        const int fslice = fpkt % S;
+        if (fpeer == myPe) continue;  // uniform across the warp (peer-granular)
+        auto** handles = heapObj->deviceHandles_d + (fpeer % 8) * numSdmaQ;
+        auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
+        const uint64_t wptrIndex = sStart[fpeer] + sOff[fpeer] + static_cast<uint64_t>(fslice) * pkt;
+        const uint64_t baseDword = handle->WrapIntoRing(wptrIndex) / sizeof(uint32_t);
+        // Read the b128 from LDS as 4 dwords (stride-17 slot is 4B- but not
+        // 16B-aligned, so avoid ds_read_b128), then store it coalesced to the ring.
+        const int slotBase = fpkt * kRSPushSlotDwords + bb * 4;
+        TVecType<16> v = {pktBuf[slotBase + 0], pktBuf[slotBase + 1], pktBuf[slotBase + 2],
+                          pktBuf[slotBase + 3]};
+        StreamStore<16>(handle->queueBuf + baseDword + bb * 4, v, /*system_scope=*/false);
+      }
+      // All flush warps must finish + be system-visible before any doorbell.
+      __threadfence_system();
+      __syncthreads();
+
+      // -- Submit phase: each peer's leader rings one doorbell on its own queue. --
+      if (bactive && slice == 0) {
+        auto** handles = heapObj->deviceHandles_d + (peer % 8) * numSdmaQ;
+        auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
+        handle->submitPacket(sStart[peer], sStart[peer] + sOff[peer] + static_cast<uint64_t>(pkt) * S);
+      }
+#else
+      // --- Fast path (direct): one warp issues EVERY (peer, slice) copy at once. -
       // Lane `lane` serves peer = lane/S, slice = lane%S (npes*S <= warpSize). Each
       // peer's slice-0 leader reserves the S-packet block and submits once; all
       // lanes write their own packet in parallel. Distinct queues per peer make the
       // per-warp multi-queue reserve/submit deadlock-free.
-      constexpr size_t pkt = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
       const int lane = tid;
       const int peer = lane / S;
       const int slice = lane % S;
@@ -343,6 +436,7 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
       if (tid < warpSize) __syncwarp();
       if (active && slice == 0)
         handle->submitPacket(startBase, startBase + offset + static_cast<uint64_t>(pkt) * S);
+#endif
     } else {
       // --- Fallback (npes*S > warpSize): warp-strided, one warp per peer. ---
       const int w = tid / warpSize;
