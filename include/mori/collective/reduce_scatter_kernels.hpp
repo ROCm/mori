@@ -241,9 +241,15 @@ __device__ __forceinline__ void waitForSignalMask(HSAuint64* addr, uint64_t mask
 // group zeroes that slice's flag + its local counter (groupCounters[g]) for the
 // next launch -- no monotonic generation counter needed. Limited to npes <= 64.
 //
-// Phase 1 issues the copies with one warp per peer (lane s -> slice s) via
-// SdmaPutWarpFusedS: only lane 0 reserves/submits, so it is deadlock-free and
-// per-slice flags make the start order irrelevant.
+// Phase 1 (npes <= 8, i.e. npes*S <= warpSize) uses ONE warp to issue every
+// (peer, slice) copy at once: lane `lane` serves peer = lane/S, slice = lane%S.
+// Each peer's slice-0 lane reserves the S contiguous packets on that peer's queue
+// and submits once (single doorbell); all lanes write their packet in parallel.
+// Peers map to distinct queues (peer%8 is distinct for npes<=8), so the per-warp
+// multi-queue submit has exactly one sole producer per queue and cannot deadlock,
+// and all npes doorbells fire concurrently (no warp-strided waves). For larger
+// npes (npes*S > warpSize) it falls back to the warp-strided SdmaPutWarpFusedS
+// path (one warp per peer, lane 0 reserves/submits), which is also deadlock-free.
 //
 // input/staging/output MUST live in the symmetric static heap (ShmemMalloc) so
 // the address-based SDMA put can translate local->peer (offset from heapBaseAddr);
@@ -268,34 +274,88 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
 
   int tid = threadIdx.x;
 
-  // === Phase 1: SDMA scatter (block 0 only), one WARP per destination peer ======
-  // Warp w handles destPe (warp-strided over peers); lane s issues slice s: an SDMA
-  // copy of slice s into destPe's staging slot followed by an ADD64 of (1<<myPe)
-  // into destPe's per-slice flag signalPtrs[s]. The atomic targets the *receiver's*
-  // flag, so completion is observed on the receive side (Phase 2) -- fire-and-forget,
-  // no local quiet, no cross-PE barrier. Per-slice flags make the slice order
-  // irrelevant on the receive side.
+  // === Phase 1: SDMA scatter (block 0 only) ====================================
+  // Lane (peer,slice) issues an SDMA copy of slice `slice` into destPe's staging
+  // slot followed by an ADD64 of (1<<myPe) into destPe's per-slice flag
+  // signalPtrs[slice]. The atomic targets the *receiver's* flag, so completion is
+  // observed on the receive side (Phase 2) -- fire-and-forget, no local quiet, no
+  // cross-PE barrier. Per-slice flags make the slice order irrelevant on the
+  // receive side.
   //
-  // Only lane 0 reserves/submits per peer, so there is exactly one spinning thread
-  // per warp -> no same-queue cross-producer spin-wait (which would deadlock threads
-  // sharing a warp under SIMT), and the S reservations + S doorbells per peer
-  // collapse into one of each.
+  // Fast path (npes*S <= warpSize, i.e. npes<=8): a single warp issues ALL peers'
+  // copies concurrently; each peer's slice-0 leader reserves the S-packet block and
+  // submits once. Peers use distinct queues (peer%8), so the per-warp multi-queue
+  // reserve/submit has one sole producer per queue and cannot deadlock, and the S
+  // reservations + S doorbells per peer collapse into one of each. Fallback path
+  // (larger npes): warp-strided one-warp-per-peer, lane 0 reserves/submits.
   if (blockIdx.x == 0) {
-    const int w = tid / warpSize;
-    const int numW = blockDim.x / warpSize;
     T* dstLocal = staging + myPe * chunkElems;
     const size_t heapBase = GetGlobalGpuStatesPtr()->heapBaseAddr;
     const size_t sliceBytes = sliceLen * sizeof(T);
-    const size_t lastBytes = (chunkElems - (S - 1) * sliceLen) * sizeof(T);
-    for (int destPe = w; destPe < npes; destPe += numW) {
-      if (destPe == myPe) continue;  // uniform across the warp
-      auto** handles = heapObj->deviceHandles_d + (destPe % 8) * numSdmaQ;
-      const T* src = input + destPe * chunkElems;
-      size_t off = reinterpret_cast<uintptr_t>(dstLocal) - heapBase;
-      uint8_t* dst = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + off);
-      mori::collective::SdmaPutWarpFusedS(
-          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(src)), dst, sliceBytes, lastBytes,
-          handles, heapObj->peerSignalPtrs[destPe], /*qId=*/0, S, /*addVal=*/(1ull << myPe));
+    const size_t lastBytes = (chunkElems - static_cast<size_t>(S - 1) * sliceLen) * sizeof(T);
+    // off is uniform across peers: my data lands in every peer's staging[myPe] slot.
+    const size_t off = reinterpret_cast<uintptr_t>(dstLocal) - heapBase;
+
+    if (npes * S <= warpSize) {
+      // --- Fast path: one warp issues EVERY (peer, slice) copy concurrently. ---
+      // Lane `lane` serves peer = lane/S, slice = lane%S (npes*S <= warpSize). Each
+      // peer's slice-0 leader reserves the S-packet block and submits once; all
+      // lanes write their own packet in parallel. Distinct queues per peer make the
+      // per-warp multi-queue reserve/submit deadlock-free.
+      constexpr size_t pkt = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
+      const int lane = tid;
+      const int peer = lane / S;
+      const int slice = lane % S;
+      const bool active = (tid < warpSize) && (lane < npes * S) && (peer != myPe);
+
+      SdmaCollectiveHandle* handle = nullptr;
+      if (active) {
+        auto** handles = heapObj->deviceHandles_d + (peer % 8) * numSdmaQ;
+        handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
+      }
+
+      // Slice-0 leader of each peer reserves the whole S-packet block on its queue.
+      uint64_t startBase = 0, offset = 0;
+      if (active && slice == 0) startBase = handle->ReserveQueueSpace(pkt * S, offset);
+      // Broadcast (startBase, offset) from each peer's leader lane (= (lane/S)*S).
+      // Executed by the full warp so __shfl stays convergent.
+      if (tid < warpSize) {
+        const int leaderLane = (lane / S) * S;
+        startBase = __shfl(startBase, leaderLane);
+        offset = __shfl(offset, leaderLane);
+      }
+      if (active && slice == 0 && offset) handle->fillNops(startBase, offset);
+
+      if (active) {
+        const uint8_t* s =
+            reinterpret_cast<const uint8_t*>(input + peer * chunkElems) + slice * sliceBytes;
+        uint8_t* d =
+            reinterpret_cast<uint8_t*>(heapObj->peerPtrs[peer] + off) + slice * sliceBytes;
+        size_t sz = (slice == S - 1) ? lastBytes : sliceBytes;
+        SDMA_PKT_COPY_WITH_ATOMIC packet = {
+            .copy = anvil::CreateCopyPacket(const_cast<uint8_t*>(s), d, sz),
+            .atomic = anvil::CreateAtomicAddPacket(heapObj->peerSignalPtrs[peer] + slice,
+                                                   (1ull << myPe))};
+        handle->placePacketAt(packet, startBase + offset + static_cast<uint64_t>(slice) * pkt);
+      }
+      // Reconverge so all packet stores are visible before any leader submits; the
+      // submitter's s_waitcnt(0) inside submitPacket then drains the wave's vmcnt.
+      if (tid < warpSize) __syncwarp();
+      if (active && slice == 0)
+        handle->submitPacket(startBase, startBase + offset + static_cast<uint64_t>(pkt) * S);
+    } else {
+      // --- Fallback (npes*S > warpSize): warp-strided, one warp per peer. ---
+      const int w = tid / warpSize;
+      const int numW = blockDim.x / warpSize;
+      for (int destPe = w; destPe < npes; destPe += numW) {
+        if (destPe == myPe) continue;  // uniform across the warp
+        auto** handles = heapObj->deviceHandles_d + (destPe % 8) * numSdmaQ;
+        const T* src = input + destPe * chunkElems;
+        uint8_t* dst = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + off);
+        mori::collective::SdmaPutWarpFusedS(
+            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(src)), dst, sliceBytes, lastBytes,
+            handles, heapObj->peerSignalPtrs[destPe], /*qId=*/0, S, /*addVal=*/(1ull << myPe));
+      }
     }
   }
 
