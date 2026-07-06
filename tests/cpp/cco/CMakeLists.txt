@@ -13,8 +13,17 @@
 #
 # add a new test by dropping a file here. no further cmake changes needed.
 
-set(CCO_TEST_COMMON_LIBS mori_cco mori_application mori_logging ibverbs pthread)
+# libmori_cco.so is self-contained (absorbs the application layer), so cco tests
+# link only mori_cco (+ pthread; HIP/MPI added per-target below).
+set(CCO_TEST_COMMON_LIBS mori_cco pthread)
 set(CCO_TEST_MPI_RANKS 8)
+
+# MPI is a direct dependency of the cco tests (bootstrap + test_multiprocess).
+# Previously it came transitively via mori_application; find it here now that the
+# tests link only mori_cco.
+if(WITH_MPI)
+  find_package(MPI REQUIRED)
+endif()
 
 # helper: true if `needle` appears anywhere in `src`.
 function(_cco_source_contains src needle out_var)

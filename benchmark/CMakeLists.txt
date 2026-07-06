@@ -56,8 +56,9 @@ function(add_mori_benchmark_cco name)
   endif()
   add_executable(${name} ${ARG_SOURCES})
   set_source_files_properties(${ARG_SOURCES} PROPERTIES LANGUAGE HIP)
-  target_link_libraries(${name} PRIVATE cco_bench_util mori_cco mori_application
-                                        ibverbs hip::host hip::device ${ARG_LIBS})
+  # libmori_cco.so is self-contained (absorbs the application layer).
+  target_link_libraries(${name} PRIVATE cco_bench_util mori_cco hip::host
+                                        hip::device ${ARG_LIBS})
   target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/include
                                              ${CMAKE_CURRENT_SOURCE_DIR}/cco)
   # $ORIGIN-relative rpath (kept alongside the build-tree rpath) so the binaries
@@ -96,6 +97,9 @@ endif()
 
 # --- CCO p2p benchmarks (LSA + IGBDA transports, MPI 2-rank launcher) ---
 if(WITH_MPI AND BUILD_CCO)
+  # MPI is a direct dependency of the cco benchmarks; previously it came
+  # transitively via mori_application, which the benchmarks no longer link.
+  find_package(MPI REQUIRED)
   # Host control-plane (MPI + ccoComm lifecycle) as a plain CXX static lib, so it
   # never gets the kernel TUs' HIP language (which would make ccoComm opaque).
   add_library(cco_bench_util STATIC cco/util.cpp)
@@ -103,8 +107,8 @@ if(WITH_MPI AND BUILD_CCO)
   target_include_directories(cco_bench_util PRIVATE ${CMAKE_SOURCE_DIR}/include
                                                     ${CMAKE_CURRENT_SOURCE_DIR}/cco
                                                     ${MPI_CXX_INCLUDE_DIRS})
-  target_link_libraries(cco_bench_util PRIVATE mori_cco mori_application
-                                               hip::host ${MPI_CXX_LIBRARIES})
+  target_link_libraries(cco_bench_util PRIVATE mori_cco hip::host
+                                               ${MPI_CXX_LIBRARIES})
   set_target_properties(cco_bench_util PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
   add_mori_benchmark_cco(cco_p2p_put_bw SOURCES cco/p2p_put_bw.cpp
