@@ -20,25 +20,27 @@ exist on gfx942). Note: gfx942 fp8 is e4m3**fnuz** (max 240). Not done:
 
 | file | role |
 |---|---|
-| `symm_arena.py` | one cco symmetric window carved into named sub-regions (`SymmArena`) |
 | `flydsl_prims.py` | device primitives: system atomics / ordered stores / fences / volatile-spin waits |
-| `dispatch_kernel.py` | `make_dispatch` — P2P-scatter tokens to their experts' ranks (3 phases) + per-token scales forwarding |
+| `dispatch_kernel.py` | `make_dispatch` — P2P-scatter tokens to their experts' ranks (3 phases) + per-token scales forwarding + replay |
 | `combine_kernel.py` | `make_combine` (gather) + `make_combine_scatter` (`_nop2p`); weighted `out_weights`; bf16/f32/fp8(+direct_cast)/fp4 accum |
 | `stdmoe_kernel.py` | `make_convert_dispatch_output` / `make_convert_combine_input` — StdMoE per-expert repack + weighted inverse (local kernels) |
-| `dispatch_combine_op.py` | `EpDispatchCombineOp` / `EpDispatchCombineConfig` (+`.tuned()`) / `EpDispatchRoutingHandle` — mori-parity host op-layer (StdMoE + recv cap) |
+| `local_expert_count_kernel.py` | `make_local_expert_count` — recv tokens per local expert (mori parity) |
+| `dispatch_combine_op.py` | `SymmArena` + `EpDispatchCombineOp` / `EpDispatchCombineConfig` (+`.tuned()`) / `EpDispatchRoutingHandle` — mori-parity host op-layer (scales, scatter/quant combine, StdMoE, recv cap, LEC, reset, replay) |
 | `tuning_configs.py` | per-(world,hidden,topk) block/warp lookup |
-| `dist_common.py` | torchrun bootstrap (gloo only carries the cco unique-id) |
-| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast`, `STDMOE=1`, `SCALE_DIM` |
-| `test_op.py` | EP8 op-layer test (standard / StdMoE / recv-cap, bf16 + f32) |
+| `tests/dist_common.py` | torchrun bootstrap (gloo only carries the cco unique-id) |
+| `tests/bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM` |
+| `tests/test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
+| `tests/run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
 
 ## Run (inside the gfx942 container)
 
 ```bash
-cd python/mori/ops/dispatch_combine_v2
+cd python/mori/ops/dispatch_combine_v2/tests
 unset PYTHONPATH LD_LIBRARY_PATH MORI_CCO_BC
 export MORI_SOCKET_IFNAME=enp159s0np0 MORI_CCO_GDA_CONN=full
 
 torchrun --standalone --nproc_per_node=8 bench_dispatch_combine.py   # correctness + perf
+torchrun --standalone --nproc_per_node=8 test_op.py                  # op-layer correctness
 ```
 
 Config via env: `HIDDEN`, `TOPK`, `EPR`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`,

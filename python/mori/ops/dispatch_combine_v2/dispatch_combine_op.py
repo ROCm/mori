@@ -11,7 +11,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from mori.tensor_utils import from_gpu_ptr
 
-from symm_arena import SymmArena
 from dispatch_kernel import make_dispatch
 from combine_kernel import make_combine, make_combine_scatter
 from stdmoe_kernel import make_convert_dispatch_output, make_convert_combine_input
@@ -20,6 +19,44 @@ from local_expert_count_kernel import make_local_expert_count
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
 
 _DT = {torch.bfloat16: 2, torch.float32: 4}
+
+
+def _align_up(x, a):
+    return (x + a - 1) // a * a
+
+
+class SymmArena:
+    """One cco symmetric window carved into named, aligned sub-regions. A kernel
+    reaches peer pe's copy of region R via cco.Window(handle).lsa_ptr(pe, off_R)."""
+    _ALIGN = 256
+
+    def __init__(self, comm, regions):
+        self._comm = comm
+        self._offsets = {}
+        self._sizes = {}
+        off = 0
+        for name, nbytes in regions:
+            off = _align_up(off, self._ALIGN)
+            self._offsets[name] = off
+            self._sizes[name] = nbytes
+            off += nbytes
+        self._total = max(_align_up(off, self._ALIGN), self._ALIGN)
+        self._mem = comm.alloc_mem(self._total)
+        self._win = comm.register_window(self._mem.ptr, self._total)
+
+    @property
+    def handle(self):
+        return self._win.handle
+
+    @property
+    def total_bytes(self):
+        return self._total
+
+    def offset(self, name):
+        return self._offsets[name]
+
+    def local_ptr(self, name):
+        return self._win.local_ptr + self._offsets[name]
 
 
 @dataclass

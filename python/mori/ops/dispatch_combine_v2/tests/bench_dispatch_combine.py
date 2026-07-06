@@ -27,11 +27,12 @@ from mori.tensor_utils import from_gpu_ptr
 import mori.cco.device.flydsl as cco  # noqa: F401
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
-_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
+sys.path.insert(0, _HERE)                     # tests/ (dist_common)
+sys.path.insert(0, os.path.dirname(_HERE))    # parent v2/ (op + kernels)
+_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "..", ".."))
 sys.path.insert(0, os.path.join(_ROOT, "examples", "cco", "python"))
 from cco_example_common import set_device, sync, zero  # noqa: E402
-from symm_arena import SymmArena  # noqa: E402
+from dispatch_combine_op import SymmArena  # noqa: E402
 from dispatch_kernel import make_dispatch  # noqa: E402
 from combine_kernel import make_combine, make_combine_scatter  # noqa: E402
 from stdmoe_kernel import (  # noqa: E402
