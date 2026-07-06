@@ -68,31 +68,29 @@ inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
   uint64_t base = 0;
   uint64_t pendingWptr = 0;
   uint64_t startBase = 0;
-  size_t perq_send_size = 0;
   uint64_t offset = 0;
   const int laneId = threadIdx.x % warpSize;
 
   if (laneId >= queNum) return;
   int queueId = laneId;
-  const size_t rand_size = copy_size / queNum;  // per queue rand data
+  const size_t rand_size = copy_size / queNum;  // per queue slice size
 
-  char* srcPtr = reinterpret_cast<char*>(srcBuf);
-  char* dstPtr = reinterpret_cast<char*>(dstBuf);
+  // Each queue owns the contiguous slice [queueId*rand_size, ...); the last
+  // queue absorbs the remainder so uneven sizes are fully covered.
+  const size_t perq_send_size =
+      (queueId < (queNum - 1)) ? rand_size : (copy_size - (queNum - 1) * rand_size);
+  const size_t byteOffset = static_cast<size_t>(queueId) * rand_size;
+
+  char* srcPtr = reinterpret_cast<char*>(srcBuf) + byteOffset;
+  char* dstPtr = reinterpret_cast<char*>(dstBuf) + byteOffset;
 
   anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + queueId);
   base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
   pendingWptr = base;
   startBase = base;
 
-  if (queueId < (queNum - 1))
-    perq_send_size = rand_size;
-  else
-    perq_send_size = copy_size - (queNum - 1) * rand_size;
-
   auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, perq_send_size);
   handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, offset);
-  srcPtr += perq_send_size;
-  dstPtr += perq_send_size;
 
   base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
   pendingWptr = base;
