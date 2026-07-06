@@ -24,9 +24,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC-TW]
-            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+          - platform: MI325X_BNXT
+            runner: [self-hosted, 325_bnxt_108]
+            rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             rdma_sl: 3
             rdma_tc: 104
     env:
