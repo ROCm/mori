@@ -69,7 +69,8 @@ __global__ void lsa_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 
 // IBGDA: one QP per block; pipeline reads + flush own QP. block scope = one bulk
 // read; warp/thread subdivide (see p2p_put_bw).
-template <core::ProviderType PrvdType, typename Coop, ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent>
+template <core::ProviderType PrvdType, typename Coop,
+          ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent>
 __global__ void ibgda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int iter) {
   Coop coop;
@@ -91,8 +92,8 @@ __global__ void ibgda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   // (see p2p_put_bw). The trailing flush waits for the last ops before timing.
   for (int i = 0; i < iter; i++) {
     gda.template get<CCO_TEAM_WORLD, ThreadMode>(peer, reinterpret_cast<ccoWindow_t>(sendWin),
-                                               off_bytes, reinterpret_cast<ccoWindow_t>(recvWin),
-                                               off_bytes, bytes, coop);
+                                                 off_bytes, reinterpret_cast<ccoWindow_t>(recvWin),
+                                                 off_bytes, bytes, coop);
   }
   gda.flush(ccoCoopBlock{});
 }
@@ -124,8 +125,8 @@ static void launch_ibgda(PutScope scope, dim3 grid, dim3 block, ccoWindow_t send
                          recvWin, len_doubles, devComm, count);
       break;
     case PutScope::kThreadAgg:
-      hipLaunchKernelGGL((ibgda_get_bw<PrvdType, ccoCoopThread, ccoGdaThreadAggregate>), grid, block,
-                         0, 0, sendWin, recvWin, len_doubles, devComm, count);
+      hipLaunchKernelGGL((ibgda_get_bw<PrvdType, ccoCoopThread, ccoGdaThreadAggregate>), grid,
+                         block, 0, 0, sendWin, recvWin, len_doubles, devComm, count);
       break;
   }
 }

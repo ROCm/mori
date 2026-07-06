@@ -142,7 +142,8 @@ struct ccoGda {
   __device__ inline int resolveWorldPeer(int peer) const;
 
   // put: rdma write with optional remote signal.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent,
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
+            ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent,
             typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes,
@@ -150,16 +151,16 @@ struct ccoGda {
                              uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // putValue: write an immediate value (≤8 bytes) with optional remote signal.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent,
-            typename T, typename RemoteAction = ccoGda_NoSignal,
-            typename Coop = ccoCoopThread>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
+            ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent, typename T,
+            typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread>
   __device__ inline void putValue(int peer, ccoWindow_t dstWin, size_t dstOffset, T value,
                                   RemoteAction remoteAction = ccoGda_NoSignal{}, Coop coop = Coop{},
                                   uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // get: rdma read — pull peer's window content into our local window.
-  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent,
-            typename Coop = ccoCoopThread>
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
+            ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent, typename Coop = ccoCoopThread>
   __device__ inline void get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
                              ccoWindow_t localWin, size_t localOffset, size_t bytes,
                              Coop coop = Coop{}, uint32_t optFlags = ccoGdaOptFlagsDefault);
@@ -671,9 +672,9 @@ __device__ inline static void putImpl(
     uint32_t dataPsn = warpAggregateBnxtPsn(wq, dataPsnCnt, hasSignal, totalWqes, activemask,
                                             leaderLane, isLeader, &sigPsn);
     waitSqSpace<PrvdType>(ep, base, totalWqes);
-    uint64_t dbrVal = core::PostWrite<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/,
-                                                qpn, localAddr, localKey, remoteAddr, remoteKey,
-                                                bytes);
+    uint64_t dbrVal =
+        core::PostWrite<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/, qpn, localAddr,
+                                  localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
     if (isLeader) {
       if (hasSignal) {
@@ -687,8 +688,9 @@ __device__ inline static void putImpl(
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
     waitSqSpace<PrvdType>(ep, base, totalWqes);
-    uint64_t dbrVal = core::PostWrite<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
-                                                localAddr, localKey, remoteAddr, remoteKey, bytes);
+    uint64_t dbrVal =
+        core::PostWrite<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn, localAddr,
+                                  localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
     if (isLeader) {
       if (hasSignal) {
@@ -739,9 +741,9 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
     uint32_t dataPsn = warpAggregateBnxtPsn(wq, /*dataPsnCnt=*/1, hasSignal, totalWqes, activemask,
                                             leaderLane, isLeader, &sigPsn);
     waitSqSpace<PrvdType>(ep, base, totalWqes);
-    uint64_t dbrVal = core::PostWriteInline<PrvdType>(*wq, mySlot, mySlot, dataPsn,
-                                                      true /*cqeSignal*/, qpn, &value, remoteAddr,
-                                                      remoteKey, sizeof(T));
+    uint64_t dbrVal =
+        core::PostWriteInline<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/, qpn,
+                                        &value, remoteAddr, remoteKey, sizeof(T));
     __threadfence();
     if (isLeader) {
       if (hasSignal) {
@@ -755,8 +757,9 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
     waitSqSpace<PrvdType>(ep, base, totalWqes);
-    uint64_t dbrVal = core::PostWriteInline<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/,
-                                                      qpn, &value, remoteAddr, remoteKey, sizeof(T));
+    uint64_t dbrVal =
+        core::PostWriteInline<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
+                                        &value, remoteAddr, remoteKey, sizeof(T));
     __threadfence();
     if (isLeader) {
       if (hasSignal) {
@@ -798,8 +801,9 @@ __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn
                                             activemask, leaderLane, isLeader,
                                             /*outSignalPsn=*/nullptr);
     waitSqSpace<PrvdType>(ep, base, totalWqes);
-    uint64_t dbrVal = core::PostRead<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/, qpn,
-                                               localAddr, localKey, remoteAddr, remoteKey, bytes);
+    uint64_t dbrVal =
+        core::PostRead<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/, qpn, localAddr,
+                                 localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
     if (isLeader && !(optFlags & ccoGdaOptFlagsAggregateRequests))
       ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
@@ -1052,8 +1056,9 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
                                              RemoteAction remoteAction, Coop coop,
                                              uint32_t optFlags) {
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
-    static_assert(std::is_same_v<Coop, ccoCoopThread>,
-                  "ccoGdaThreadAggregate requires ccoCoopThread — all warp lanes must enter putImpl.");
+    static_assert(
+        std::is_same_v<Coop, ccoCoopThread>,
+        "ccoGdaThreadAggregate requires ccoCoopThread — all warp lanes must enter putImpl.");
   }
   coop.sync();
   if (coop.thread_rank() == 0) {
@@ -1121,8 +1126,9 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
                                                   uint32_t optFlags) {
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
-    static_assert(std::is_same_v<Coop, ccoCoopThread>,
-                  "ccoGdaThreadAggregate requires ccoCoopThread — all warp lanes must enter putValueImpl.");
+    static_assert(
+        std::is_same_v<Coop, ccoCoopThread>,
+        "ccoGdaThreadAggregate requires ccoCoopThread — all warp lanes must enter putValueImpl.");
   }
 
   coop.sync();
@@ -1181,8 +1187,9 @@ __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, si
                                              ccoWindow_t localWin, size_t localOffset, size_t bytes,
                                              Coop coop, uint32_t optFlags) {
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
-    static_assert(std::is_same_v<Coop, ccoCoopThread>,
-                  "ccoGdaThreadAggregate requires ccoCoopThread — all warp lanes must enter getImpl.");
+    static_assert(
+        std::is_same_v<Coop, ccoCoopThread>,
+        "ccoGdaThreadAggregate requires ccoCoopThread — all warp lanes must enter getImpl.");
   }
   coop.sync();
   if (coop.thread_rank() == 0) {

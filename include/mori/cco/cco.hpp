@@ -942,7 +942,7 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
 // device pointer; must be freed with ccoDevCommFreeDeviceCopy once the DevComm
 // is no longer used by any in-flight kernel.
 ccoDevComm* ccoDevCommCopyToDevice(const ccoDevComm* host);
-void        ccoDevCommFreeDeviceCopy(ccoDevComm* devicePtr);
+void ccoDevCommFreeDeviceCopy(ccoDevComm* devicePtr);
 
 // ── Host barrier ──
 int ccoBarrierAll(ccoComm* comm);

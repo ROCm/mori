@@ -1,6 +1,27 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
 
 // C-style device wrappers over the cco GDA device API, compiled to
 // libmori_cco_device.bc and linked into DSL (FlyDSL/...) kernels.
@@ -45,9 +66,12 @@ inline __device__ ccoGdaSignal_t AsSig(int id) { return static_cast<ccoGdaSignal
 
 // Remote-action constructors, keyed by the signal-op tag (sid/sv are the
 // signal-id / signal-value parameters present in each wrapper signature).
-#define CCO_RA_none ccoGda_NoSignal{}
-#define CCO_RA_inc ccoGda_SignalInc{AsSig(sid)}
-#define CCO_RA_add ccoGda_SignalAdd{AsSig(sid), sv}
+#define CCO_RA_none \
+  ccoGda_NoSignal {}
+#define CCO_RA_inc \
+  ccoGda_SignalInc { AsSig(sid) }
+#define CCO_RA_add \
+  ccoGda_SignalAdd { AsSig(sid), sv }
 
 // Valid (tag, ThreadMode, Coop) combos for the data path.
 #define CCO_TC_LIST(X)                          \
@@ -79,14 +103,13 @@ CCO_DEV int cco_devcomm_lsa_rank(uint64_t dc) { return AsDevComm(dc)->lsaRank; }
 CCO_DEV int cco_devcomm_lsa_size(uint64_t dc) { return AsDevComm(dc)->lsaSize; }
 
 // ── GDA put: cco_gda_put__<tc>__<sig> ──
-#define CCO_DEF_PUT(TAG, TM, COOP, SIG)                                              \
-  CCO_DEV void cco_gda_put__##TAG##__##SIG(uint64_t dc, int ctx, int peer,           \
-                                           uint64_t dW, uint64_t dO, uint64_t sW,     \
-                                           uint64_t sO, uint64_t n, int sid,          \
-                                           uint64_t sv) {                             \
-    Gda gda{*AsDevComm(dc), ctx};                                                     \
-    gda.put<CCO_TEAM_WORLD, TM>(peer, AsWindow(dW), dO, AsWindow(sW), sO, n,          \
-                                CCO_RA_##SIG, COOP{});                                \
+#define CCO_DEF_PUT(TAG, TM, COOP, SIG)                                                       \
+  CCO_DEV void cco_gda_put__##TAG##__##SIG(uint64_t dc, int ctx, int peer, uint64_t dW,       \
+                                           uint64_t dO, uint64_t sW, uint64_t sO, uint64_t n, \
+                                           int sid, uint64_t sv) {                            \
+    Gda gda{*AsDevComm(dc), ctx};                                                             \
+    gda.put<CCO_TEAM_WORLD, TM>(peer, AsWindow(dW), dO, AsWindow(sW), sO, n, CCO_RA_##SIG,    \
+                                COOP{});                                                      \
   }
 #define CCO_DEF_PUT_SIGS(TAG, TM, COOP) \
   CCO_DEF_PUT(TAG, TM, COOP, none)      \
@@ -97,12 +120,12 @@ CCO_TC_LIST(CCO_DEF_PUT_SIGS)
 #undef CCO_DEF_PUT
 
 // ── GDA put_value: cco_gda_put_value__<tc>__<sig> ──
-#define CCO_DEF_PUTV(TAG, TM, COOP, SIG)                                                 \
-  CCO_DEV void cco_gda_put_value__##TAG##__##SIG(uint64_t dc, int ctx, int peer,         \
-                                                 uint64_t dW, uint64_t dO, uint64_t value, \
-                                                 int sid, uint64_t sv) {                  \
-    Gda gda{*AsDevComm(dc), ctx};                                                         \
-    gda.putValue<CCO_TEAM_WORLD, TM>(peer, AsWindow(dW), dO, value, CCO_RA_##SIG, COOP{}); \
+#define CCO_DEF_PUTV(TAG, TM, COOP, SIG)                                                      \
+  CCO_DEV void cco_gda_put_value__##TAG##__##SIG(uint64_t dc, int ctx, int peer, uint64_t dW, \
+                                                 uint64_t dO, uint64_t value, int sid,        \
+                                                 uint64_t sv) {                               \
+    Gda gda{*AsDevComm(dc), ctx};                                                             \
+    gda.putValue<CCO_TEAM_WORLD, TM>(peer, AsWindow(dW), dO, value, CCO_RA_##SIG, COOP{});    \
   }
 #define CCO_DEF_PUTV_SIGS(TAG, TM, COOP) \
   CCO_DEF_PUTV(TAG, TM, COOP, none)      \
@@ -113,21 +136,21 @@ CCO_TC_LIST(CCO_DEF_PUTV_SIGS)
 #undef CCO_DEF_PUTV
 
 // ── GDA get (no remote action): cco_gda_get__<tc> ──
-#define CCO_DEF_GET(TAG, TM, COOP)                                                       \
-  CCO_DEV void cco_gda_get__##TAG(uint64_t dc, int ctx, int peer, uint64_t rW,           \
-                                  uint64_t rO, uint64_t lW, uint64_t lO, uint64_t n) {    \
-    Gda gda{*AsDevComm(dc), ctx};                                                         \
-    gda.get<CCO_TEAM_WORLD, TM>(peer, AsWindow(rW), rO, AsWindow(lW), lO, n, COOP{});     \
+#define CCO_DEF_GET(TAG, TM, COOP)                                                          \
+  CCO_DEV void cco_gda_get__##TAG(uint64_t dc, int ctx, int peer, uint64_t rW, uint64_t rO, \
+                                  uint64_t lW, uint64_t lO, uint64_t n) {                   \
+    Gda gda{*AsDevComm(dc), ctx};                                                           \
+    gda.get<CCO_TEAM_WORLD, TM>(peer, AsWindow(rW), rO, AsWindow(lW), lO, n, COOP{});       \
   }
 CCO_TC_LIST(CCO_DEF_GET)
 #undef CCO_DEF_GET
 
 // ── GDA signal (inc/add only): cco_gda_signal__<coop>__<sig> ──
-#define CCO_DEF_SIGNAL(TAG, COOP, SIG)                                          \
-  CCO_DEV void cco_gda_signal__##TAG##__##SIG(uint64_t dc, int ctx, int peer,   \
-                                              int sid, uint64_t sv) {           \
-    Gda gda{*AsDevComm(dc), ctx};                                              \
-    gda.signal<CCO_TEAM_WORLD>(peer, CCO_RA_##SIG, COOP{});                    \
+#define CCO_DEF_SIGNAL(TAG, COOP, SIG)                                                 \
+  CCO_DEV void cco_gda_signal__##TAG##__##SIG(uint64_t dc, int ctx, int peer, int sid, \
+                                              uint64_t sv) {                           \
+    Gda gda{*AsDevComm(dc), ctx};                                                      \
+    gda.signal<CCO_TEAM_WORLD>(peer, CCO_RA_##SIG, COOP{});                            \
   }
 #define CCO_DEF_SIGNAL_SIGS(TAG, COOP) \
   CCO_DEF_SIGNAL(TAG, COOP, inc)       \
@@ -148,24 +171,24 @@ CCO_DEV void cco_gda_reset_signal(uint64_t dc, int ctx, int sigId) {
 }
 
 // ── GDA wait_signal: cco_gda_wait_signal__<coop> ──
-#define CCO_DEF_WAIT(TAG, COOP)                                                     \
-  CCO_DEV void cco_gda_wait_signal__##TAG(uint64_t dc, int ctx, int sid,            \
-                                          uint64_t least, int bits) {               \
-    Gda gda{*AsDevComm(dc), ctx};                                                   \
-    gda.waitSignal(AsSig(sid), least, COOP{}, bits);                                \
+#define CCO_DEF_WAIT(TAG, COOP)                                                          \
+  CCO_DEV void cco_gda_wait_signal__##TAG(uint64_t dc, int ctx, int sid, uint64_t least, \
+                                          int bits) {                                    \
+    Gda gda{*AsDevComm(dc), ctx};                                                        \
+    gda.waitSignal(AsSig(sid), least, COOP{}, bits);                                     \
   }
 CCO_COOP_LIST(CCO_DEF_WAIT)
 #undef CCO_DEF_WAIT
 
 // ── GDA completion (>= warp): cco_gda_flush__<coop> / cco_gda_flush_peer__<coop> ──
-#define CCO_DEF_FLUSH(TAG, COOP)                                            \
-  CCO_DEV void cco_gda_flush__##TAG(uint64_t dc, int ctx) {                 \
-    Gda gda{*AsDevComm(dc), ctx};                                           \
-    gda.flush(COOP{});                                                      \
-  }                                                                         \
-  CCO_DEV void cco_gda_flush_peer__##TAG(uint64_t dc, int ctx, int peer) {  \
-    Gda gda{*AsDevComm(dc), ctx};                                           \
-    gda.flush(peer, COOP{});                                                \
+#define CCO_DEF_FLUSH(TAG, COOP)                                           \
+  CCO_DEV void cco_gda_flush__##TAG(uint64_t dc, int ctx) {                \
+    Gda gda{*AsDevComm(dc), ctx};                                          \
+    gda.flush(COOP{});                                                     \
+  }                                                                        \
+  CCO_DEV void cco_gda_flush_peer__##TAG(uint64_t dc, int ctx, int peer) { \
+    Gda gda{*AsDevComm(dc), ctx};                                          \
+    gda.flush(peer, COOP{});                                               \
   }
 CCO_DEF_FLUSH(warp, ccoCoopWarp)
 CCO_DEF_FLUSH(block, ccoCoopBlock)

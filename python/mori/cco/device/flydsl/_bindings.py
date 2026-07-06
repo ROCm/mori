@@ -1,6 +1,27 @@
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
 # MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
 """FlyDSL FFI prototypes for ``src/cco/device/cco_device_wrapper.cpp``.
 
 The wrapper MONOMORPHIZES each template axis into a distinct ``extern "C"``
@@ -35,22 +56,35 @@ _SIGNAL_ARGS = [_U64, _I32, _I32, _I32, _U64]
 # (devComm, ctx, signalId, least, bits)
 _WAIT_ARGS = [_U64, _I32, _I32, _U64, _I32]
 
-_TC = ("it", "iw", "ib", "at")          # data-path (ThreadMode, Coop) tags
-_SIG = ("none", "inc", "add")           # remote-action tags
-_COOP = ("thread", "warp", "block")     # coop-only tags
+_TC = ("it", "iw", "ib", "at")  # data-path (ThreadMode, Coop) tags
+_SIG = ("none", "inc", "add")  # remote-action tags
+_COOP = ("thread", "warp", "block")  # coop-only tags
 
 # ── monomorphized op tables (keyed by tag) ──
-PUT = {f"{tc}__{s}": _ffi(f"cco_gda_put__{tc}__{s}", _PUT_ARGS, "void")
-       for tc in _TC for s in _SIG}
-PUT_VALUE = {f"{tc}__{s}": _ffi(f"cco_gda_put_value__{tc}__{s}", _PUTV_ARGS, "void")
-             for tc in _TC for s in _SIG}
+PUT = {
+    f"{tc}__{s}": _ffi(f"cco_gda_put__{tc}__{s}", _PUT_ARGS, "void")
+    for tc in _TC
+    for s in _SIG
+}
+PUT_VALUE = {
+    f"{tc}__{s}": _ffi(f"cco_gda_put_value__{tc}__{s}", _PUTV_ARGS, "void")
+    for tc in _TC
+    for s in _SIG
+}
 GET = {tc: _ffi(f"cco_gda_get__{tc}", _GET_ARGS, "void") for tc in _TC}
-SIGNAL = {f"{c}__{s}": _ffi(f"cco_gda_signal__{c}__{s}", _SIGNAL_ARGS, "void")
-          for c in _COOP for s in ("inc", "add")}
+SIGNAL = {
+    f"{c}__{s}": _ffi(f"cco_gda_signal__{c}__{s}", _SIGNAL_ARGS, "void")
+    for c in _COOP
+    for s in ("inc", "add")
+}
 WAIT_SIGNAL = {c: _ffi(f"cco_gda_wait_signal__{c}", _WAIT_ARGS, "void") for c in _COOP}
-FLUSH = {c: _ffi(f"cco_gda_flush__{c}", [_U64, _I32], "void") for c in ("warp", "block")}
-FLUSH_PEER = {c: _ffi(f"cco_gda_flush_peer__{c}", [_U64, _I32, _I32], "void")
-              for c in ("warp", "block")}
+FLUSH = {
+    c: _ffi(f"cco_gda_flush__{c}", [_U64, _I32], "void") for c in ("warp", "block")
+}
+FLUSH_PEER = {
+    c: _ffi(f"cco_gda_flush_peer__{c}", [_U64, _I32, _I32], "void")
+    for c in ("warp", "block")
+}
 
 # ── axis-free symbols ──
 # cco_lsa_ptr(window, peerLsaRank, offset) -> peer's load/store-accessible VA.

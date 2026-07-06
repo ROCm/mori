@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """CCO Example 03 — FlyDSL GDA put + signal/wait
 
 Device-initiated RDMA from a FlyDSL ``@flyc.kernel`` via the cco device bindings
@@ -29,16 +50,19 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 
 from mori.cco import (
-    Communicator, CCODevCommRequirements, UniqueId,
-    GDA_CONNECTION_CROSSNODE, GDA_CONNECTION_FULL,
+    Communicator,
+    CCODevCommRequirements,
+    UniqueId,
+    GDA_CONNECTION_CROSSNODE,
+    GDA_CONNECTION_FULL,
 )
 import mori.cco.device.flydsl as cco
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cco_example_common import set_device, sync, fill, zero, read  # noqa: E402
 
-PER_RANK_VMM = 256 * 1024 * 1024     # 256 MiB flat VMM per rank
-NUM_ELEMS = 1024 * 1024 // 8         # 1 MiB of uint64
+PER_RANK_VMM = 256 * 1024 * 1024  # 256 MiB flat VMM per rank
+NUM_ELEMS = 1024 * 1024 // 8  # 1 MiB of uint64
 NBYTES = NUM_ELEMS * 8
 DST_RANK = 1
 SIGNAL_ID = 0
@@ -52,15 +76,27 @@ SIGNAL_ID = 0
 #  3. Don't name a @flyc.jit launcher `launch` — it collides with the `.launch()`
 #     method name in co_names and self-recurses in the jit cache-key walk.
 
+
 @flyc.kernel
-def cco_put_kernel(dev_comm: fx.Int64, send_win: fx.Int64, recv_win: fx.Int64, nbytes: fx.Int64):
+def cco_put_kernel(
+    dev_comm: fx.Int64, send_win: fx.Int64, recv_win: fx.Int64, nbytes: fx.Int64
+):
     """Rank 0: thread 0 puts send_win -> rank 1's recv_win, bumps a signal."""
     tid = fx.thread_idx.x
-    gda = cco.DevComm(dev_comm).gda(0)          # build once
+    gda = cco.DevComm(dev_comm).gda(0)  # build once
     if tid == 0:
-        gda.put(DST_RANK, recv_win, 0, send_win, 0, nbytes,
-                signal_op=cco.SignalOp.INC, signal_id=SIGNAL_ID, coop=cco.CoopScope.THREAD)
-    gda.flush(coop=cco.CoopScope.BLOCK)         # same obj, across the dynamic if
+        gda.put(
+            DST_RANK,
+            recv_win,
+            0,
+            send_win,
+            0,
+            nbytes,
+            signal_op=cco.SignalOp.INC,
+            signal_id=SIGNAL_ID,
+            coop=cco.CoopScope.THREAD,
+        )
+    gda.flush(coop=cco.CoopScope.BLOCK)  # same obj, across the dynamic if
 
 
 @flyc.kernel
@@ -73,10 +109,16 @@ def cco_wait_kernel(dev_comm: fx.Int64):
 
 
 @flyc.jit
-def run_put(dev_comm: fx.Int64, send_win: fx.Int64, recv_win: fx.Int64, nbytes: fx.Int64,
-            stream=fx.Stream(None)):
+def run_put(
+    dev_comm: fx.Int64,
+    send_win: fx.Int64,
+    recv_win: fx.Int64,
+    nbytes: fx.Int64,
+    stream=fx.Stream(None),
+):
     cco_put_kernel(dev_comm, send_win, recv_win, nbytes).launch(
-        grid=(1, 1, 1), block=[64, 1, 1], stream=stream)
+        grid=(1, 1, 1), block=[64, 1, 1], stream=stream
+    )
 
 
 @flyc.jit
@@ -107,6 +149,7 @@ def _bootstrap():
         return rank, nranks, uid, None  # rely on cco's collective barrier
 
     from mpi4py import MPI
+
     mpi = MPI.COMM_WORLD
     rank, nranks = mpi.Get_rank(), mpi.Get_size()
     uid = Communicator.get_unique_id() if rank == 0 else None
@@ -123,8 +166,11 @@ def main() -> int:
 
     set_device(rank)
 
-    conn = (GDA_CONNECTION_FULL if os.environ.get("MORI_CCO_GDA_CONN", "crossnode") == "full"
-            else GDA_CONNECTION_CROSSNODE)
+    conn = (
+        GDA_CONNECTION_FULL
+        if os.environ.get("MORI_CCO_GDA_CONN", "crossnode") == "full"
+        else GDA_CONNECTION_CROSSNODE
+    )
 
     errors = 0
     with Communicator.init(nranks, rank, uid, per_rank_vmm=PER_RANK_VMM) as comm:
@@ -153,11 +199,17 @@ def main() -> int:
             host = read(recv_win.local_ptr, NUM_ELEMS)
             for i in (0, 1, NUM_ELEMS // 2, NUM_ELEMS - 1):
                 if host[i] != i + 1:
-                    print(f"[rank {rank}] MISMATCH [{i}]: got {host[i]}, expected {i + 1}", flush=True)
+                    print(
+                        f"[rank {rank}] MISMATCH [{i}]: got {host[i]}, expected {i + 1}",
+                        flush=True,
+                    )
                     errors += 1
-            print(f"[rank {rank}] {'payload verified' if errors == 0 else 'FAILED'} "
-                  f"({NBYTES} bytes via GDA put), sample[0,1,-1]="
-                  f"{[host[0], host[1], host[NUM_ELEMS-1]]}", flush=True)
+            print(
+                f"[rank {rank}] {'payload verified' if errors == 0 else 'FAILED'} "
+                f"({NBYTES} bytes via GDA put), sample[0,1,-1]="
+                f"{[host[0], host[1], host[NUM_ELEMS-1]]}",
+                flush=True,
+            )
 
     if rank == 0:
         print("SUCCESS" if errors == 0 else "FAILED", flush=True)

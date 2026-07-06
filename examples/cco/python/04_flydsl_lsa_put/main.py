@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """CCO Example 04 — FlyDSL LSA put (direct peer-pointer load/store)
 
 The LSA model: cco only hands you the peer's *load/store-accessible* pointer
@@ -34,12 +55,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cco_example_common import set_device, sync, fill, zero, read  # noqa: E402
 
 PER_RANK_VMM = 256 * 1024 * 1024
-NUM_ELEMS = 1024 * 1024 // 8     # 1 MiB of uint64
+NUM_ELEMS = 1024 * 1024 // 8  # 1 MiB of uint64
 NBYTES = NUM_ELEMS * 8
-NUM_PACKS = NBYTES // 16         # 16 B (vector<4xi32>) per pack
+NUM_PACKS = NBYTES // 16  # 16 B (vector<4xi32>) per pack
 THREADS = 256
-DST_RANK = 1                     # rank 1's LSA rank
-_CM_UNCACHED = 3                 # SC0|SC1: store bypasses L1+L2 -> reaches peer HBM
+DST_RANK = 1  # rank 1's LSA rank
+_CM_UNCACHED = 3  # SC0|SC1: store bypasses L1+L2 -> reaches peer HBM
 
 
 @flyc.kernel(known_block_size=[THREADS, 1, 1])
@@ -49,12 +70,12 @@ def lsa_put_kernel(dev_comm: Int64, win_handle: Int64):
     tid = fx.thread_idx.x
     dc = cco.DevComm(dev_comm)
     win = cco.Window(win_handle)
-    src = win.lsa_ptr(dc.lsa_rank, 0)     # my own slot (local VA)
-    dst = win.lsa_ptr(DST_RANK, 0)        # rank 1's slot (peer VA) — load/store directly
+    src = win.lsa_ptr(dc.lsa_rank, 0)  # my own slot (local VA)
+    dst = win.lsa_ptr(DST_RANK, 0)  # rank 1's slot (peer VA) — load/store directly
     src_rsrc = buffer_ops.create_buffer_resource_from_addr(src)
     dst_rsrc = buffer_ops.create_buffer_resource_from_addr(dst)
     for pk in range(tid, NUM_PACKS, THREADS):
-        off = pk * 4                      # i32-element offset of this 16 B pack
+        off = pk * 4  # i32-element offset of this 16 B pack
         v = buffer_ops.buffer_load(src_rsrc, off, vec_width=4, dtype=T.i32)
         buffer_ops.buffer_store(v, dst_rsrc, off, cache_modifier=_CM_UNCACHED)
     rocdl.s_waitcnt(0)
@@ -62,7 +83,9 @@ def lsa_put_kernel(dev_comm: Int64, win_handle: Int64):
 
 @flyc.jit
 def run_lsa(dev_comm: Int64, win_handle: Int64, stream=fx.Stream(None)):
-    lsa_put_kernel(dev_comm, win_handle).launch(grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream)
+    lsa_put_kernel(dev_comm, win_handle).launch(
+        grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+    )
 
 
 def main() -> int:
@@ -99,11 +122,17 @@ def main() -> int:
             host = read(win.local_ptr, NUM_ELEMS)
             for i in (0, 1, NUM_ELEMS // 2, NUM_ELEMS - 1):
                 if host[i] != i + 1:
-                    print(f"[rank {rank}] MISMATCH [{i}]: got {host[i]}, expected {i + 1}", flush=True)
+                    print(
+                        f"[rank {rank}] MISMATCH [{i}]: got {host[i]}, expected {i + 1}",
+                        flush=True,
+                    )
                     errors += 1
-            print(f"[rank {rank}] {'payload verified' if errors == 0 else 'FAILED'} "
-                  f"({NBYTES} bytes via direct LSA peer-pointer store), "
-                  f"sample[0,1,-1]={[host[0], host[1], host[NUM_ELEMS-1]]}", flush=True)
+            print(
+                f"[rank {rank}] {'payload verified' if errors == 0 else 'FAILED'} "
+                f"({NBYTES} bytes via direct LSA peer-pointer store), "
+                f"sample[0,1,-1]={[host[0], host[1], host[NUM_ELEMS-1]]}",
+                flush=True,
+            )
 
     all_err = mpi.allreduce(errors, op=MPI.SUM)
     if rank == 0:

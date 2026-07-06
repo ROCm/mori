@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """CCO Example 05 — FlyDSL LSA custom all-reduce (device signal protocol)
 
 A vLLM-style *custom all-reduce* over cco symmetric windows, modeled on FlyDSL's
@@ -44,18 +65,18 @@ from cco_example_common import set_device, sync, fill, zero, read, F32  # noqa: 
 
 # Cache-modifier aux bits (GFX942): SC0=bypass L1, SC1=bypass L2.
 _CM_CACHED = 0
-_CM_SC1 = 2          # uncached read  (see peers' fresh signal writes)
-_CM_SC0_SC1 = 3      # uncached write (signal stores)
+_CM_SC1 = 2  # uncached read  (see peers' fresh signal writes)
+_CM_SC0_SC1 = 3  # uncached write (signal stores)
 
-WS = 2                       # world size (ranks, one GPU each)
+WS = 2  # world size (ranks, one GPU each)
 THREADS = 256
-NUM_ELEMS = 256 * 1024       # f32 elements to all-reduce (1 MiB)
-ELEMS_PER_PACK = 4           # vector<4xi32> = 16 B atomic unit
+NUM_ELEMS = 256 * 1024  # f32 elements to all-reduce (1 MiB)
+ELEMS_PER_PACK = 4  # vector<4xi32> = 16 B atomic unit
 NUM_PACKS = NUM_ELEMS // ELEMS_PER_PACK
 
 # Window layout: [ signal | input | output ]
 SIG_OFF = 0
-SIG_BYTES = 256              # WS u32 arrival slots, padded
+SIG_BYTES = 256  # WS u32 arrival slots, padded
 IN_OFF = SIG_BYTES
 OUT_OFF = IN_OFF + NUM_ELEMS * 4
 WIN_BYTES = OUT_OFF + NUM_ELEMS * 4
@@ -70,7 +91,9 @@ def _store_u32_uncached(rsrc, val):
 
 
 def _load_u32_uncached(rsrc):
-    return buffer_ops.buffer_load(rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC1)
+    return buffer_ops.buffer_load(
+        rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC1
+    )
 
 
 @flyc.kernel(known_block_size=[THREADS, 1, 1])
@@ -97,7 +120,9 @@ def custom_ar_kernel(dev_comm: Int64, win: Int64, flag: Int32):
         wait_addr = self_sig + fx.Int64(tid) * fx.Int64(4)
         i32 = T.i32
         first = _load_u32_uncached(_rsrc(wait_addr))
-        loop = scf.WhileOp([i32], [first.ir_value() if hasattr(first, "ir_value") else first])
+        loop = scf.WhileOp(
+            [i32], [first.ir_value() if hasattr(first, "ir_value") else first]
+        )
         cond = ir.Block.create_at_start(loop.before, [i32])
         body = ir.Block.create_at_start(loop.after, [i32])
         with ir.InsertionPoint(cond):
@@ -116,17 +141,21 @@ def custom_ar_kernel(dev_comm: Int64, win: Int64, flag: Int32):
         elem_off = pk * ELEMS_PER_PACK
         acc = None
         for p in range_constexpr(WS):
-            raw = fx.Vector(buffer_ops.buffer_load(in_rsrc[p], elem_off, vec_width=4, dtype=T.i32))
+            raw = fx.Vector(
+                buffer_ops.buffer_load(in_rsrc[p], elem_off, vec_width=4, dtype=T.i32)
+            )
             vf = raw.bitcast(fx.Float32)
             acc = vf if acc is None else acc + vf
-        buffer_ops.buffer_store(acc.bitcast(fx.Int32), out_rsrc, elem_off,
-                                cache_modifier=_CM_CACHED)
+        buffer_ops.buffer_store(
+            acc.bitcast(fx.Int32), out_rsrc, elem_off, cache_modifier=_CM_CACHED
+        )
 
 
 @flyc.jit
 def run_ar(dev_comm: Int64, win: Int64, flag: Int32, stream=fx.Stream(None)):
-    custom_ar_kernel(dev_comm, win, flag).launch(grid=(1, 1, 1), block=[THREADS, 1, 1],
-                                                 stream=stream)
+    custom_ar_kernel(dev_comm, win, flag).launch(
+        grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+    )
 
 
 def main() -> int:
@@ -148,15 +177,20 @@ def main() -> int:
         #   input[i] = (rank + 1) * (i + 1)  ->  allreduce sum = S * (i+1),
         #   where S = sum_{r=1..WS} r = WS*(WS+1)/2.
         zero(win.local_ptr, WIN_BYTES)
-        fill(win.local_ptr + IN_OFF, [(rank + 1) * (i + 1) for i in range(NUM_ELEMS)], F32)
+        fill(
+            win.local_ptr + IN_OFF,
+            [(rank + 1) * (i + 1) for i in range(NUM_ELEMS)],
+            F32,
+        )
 
         reqs = CCODevCommRequirements()
         reqs.gda_connection_type = GDA_CONNECTION_NONE
-        reqs.gda_signal_count = 0; reqs.gda_counter_count = 0
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
         dc = comm.create_dev_comm(reqs)
 
-        comm.barrier()                      # all inputs + zeroed signals visible
-        run_ar(dc.ptr, win.handle, 1)       # flag = 1 (single round)
+        comm.barrier()  # all inputs + zeroed signals visible
+        run_ar(dc.ptr, win.handle, 1)  # flag = 1 (single round)
         sync()
         comm.barrier()
 
@@ -165,11 +199,17 @@ def main() -> int:
         for i in (0, 1, NUM_ELEMS // 2, NUM_ELEMS - 1):
             exp = float(S * (i + 1))
             if abs(host[i] - exp) > 1e-3 * max(1.0, exp):
-                print(f"[rank {rank}] MISMATCH [{i}]: got {host[i]} expected {exp}", flush=True)
+                print(
+                    f"[rank {rank}] MISMATCH [{i}]: got {host[i]} expected {exp}",
+                    flush=True,
+                )
                 errors += 1
-        print(f"[rank {rank}] {'allreduce verified' if errors == 0 else 'FAILED'} "
-              f"(sum over {WS} ranks of {NUM_ELEMS} f32), "
-              f"out[0,1,-1]={[host[0], host[1], host[NUM_ELEMS-1]]}", flush=True)
+        print(
+            f"[rank {rank}] {'allreduce verified' if errors == 0 else 'FAILED'} "
+            f"(sum over {WS} ranks of {NUM_ELEMS} f32), "
+            f"out[0,1,-1]={[host[0], host[1], host[NUM_ELEMS-1]]}",
+            flush=True,
+        )
 
     all_err = mpi.allreduce(errors, op=MPI.SUM)
     if rank == 0:

@@ -22,12 +22,12 @@
 
 #include "util.hpp"
 
+#include <mpi.h>
+
 #include <cstring>
 #include <string>
 
 #include "hip/hip_runtime.h"
-#include <mpi.h>
-
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/env_utils.hpp"
 
@@ -165,8 +165,8 @@ void PrintPerfTable(const char* test_name, const char* transport_name, const cha
   if (units < 1) units = 1;
 
   std::printf(
-      "# %s transport=%s scope=%s grid=%d block=%d warpSize=%d units=%d iters=%zu warmup=%zu\n", tag,
-      transport_name, scope_col, grid_x, block_threads, warp_size, units, iters, warmup);
+      "# %s transport=%s scope=%s grid=%d block=%d warpSize=%d units=%d iters=%zu warmup=%zu\n",
+      tag, transport_name, scope_col, grid_x, block_threads, warp_size, units, iters, warmup);
 
   constexpr int kWSize = 10;
   constexpr int kWMsg = 10;
@@ -192,13 +192,12 @@ void PrintPerfTable(const char* test_name, const char* transport_name, const cha
     std::string sz = fmt_size(r.size_bytes);
     std::string msg = fmt_size(r.size_bytes / static_cast<std::size_t>(units));
     if (r.skipped) {
-      std::printf("%-*s %-*s %-*s %*s\n", kWSize, sz.c_str(), kWMsg, msg.c_str(), kWScope, scope_col,
-                  kWNum, "skip");
+      std::printf("%-*s %-*s %-*s %*s\n", kWSize, sz.c_str(), kWMsg, msg.c_str(), kWScope,
+                  scope_col, kWNum, "skip");
     } else if (is_bw) {
-      const double mpps = (r.size_bytes > 0)
-                              ? r.value * 1.0e3 * static_cast<double>(units) /
-                                    static_cast<double>(r.size_bytes)
-                              : 0.0;
+      const double mpps = (r.size_bytes > 0) ? r.value * 1.0e3 * static_cast<double>(units) /
+                                                   static_cast<double>(r.size_bytes)
+                                             : 0.0;
       std::printf("%-*s %-*s %-*s %*.3f %-5s %*.3f\n", kWSize, sz.c_str(), kWMsg, msg.c_str(),
                   kWScope, scope_col, kWNum, r.value, unit_str, kWMpps, mpps);
     } else {

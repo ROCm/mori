@@ -31,6 +31,7 @@ from setuptools.command.build_ext import build_ext
 
 try:
     from Cython.Build import cythonize as _cythonize
+
     _HAVE_CYTHON = True
 except ImportError:
     _HAVE_CYTHON = False
@@ -363,13 +364,12 @@ class CMakeBuild(build_ext):
             self.build_extension(ext)
 
     def build_extension(self, ext: Extension) -> None:
-        if ext.sources and any(
-            s.endswith((".pyx", ".cpp")) for s in ext.sources
-        ):
+        if ext.sources and any(s.endswith((".pyx", ".cpp")) for s in ext.sources):
             if self.compiler is None:
                 self.ensure_finalized()
                 from setuptools._distutils.ccompiler import new_compiler
                 from setuptools._distutils.sysconfig import customize_compiler
+
                 try:
                     # distutils / older setuptools signature
                     self.compiler = new_compiler(
@@ -574,8 +574,12 @@ class CMakeBuild(build_ext):
 
         # CCO benchmarks: same pattern, gated on BUILD_BENCHMARK=ON.
         cco_bench_dst = root_dir / "python/mori/benchmarks/cco"
-        for _exe in ("cco_p2p_put_bw", "cco_p2p_put_latency",
-                     "cco_p2p_get_bw", "cco_p2p_get_latency"):
+        for _exe in (
+            "cco_p2p_put_bw",
+            "cco_p2p_put_latency",
+            "cco_p2p_get_bw",
+            "cco_p2p_get_latency",
+        ):
             src = build_dir / "benchmark" / _exe
             dst = cco_bench_dst / _exe
             if build_benchmark.upper() == "ON" and src.exists():
@@ -671,6 +675,7 @@ class CustomBuild(_build):
 
 
 _root_dir = Path(__file__).parent
+
 
 def _cco_extension() -> list:
     """Build the mori.cco.cco Cython C++ extension if Cython is available."""

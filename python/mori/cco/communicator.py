@@ -1,6 +1,27 @@
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
 # MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
 
 """CCO high-level Communicator and resource classes."""
 
@@ -24,6 +45,7 @@ __all__ = [
 
 
 # ── UniqueId (pure-Python wrapper with pickle support) ───────────────────────
+
 
 class UniqueId:
     """CCO unique identifier for communicator initialization.
@@ -75,6 +97,7 @@ class CCODevCommRequirements(_cco.DevCommRequirements):
 
 # ── Resource base ─────────────────────────────────────────────────────────────
 
+
 class CCOResource(ABC):
     """Abstract base for CCO communicator-owned resources."""
 
@@ -102,6 +125,7 @@ class CCOResource(ABC):
 
 
 # ── AllocatedMemory ───────────────────────────────────────────────────────────
+
 
 class AllocatedMemory(CCOResource):
     """Symmetric GPU memory allocated via ``ccoMemAlloc``."""
@@ -132,6 +156,7 @@ class AllocatedMemory(CCOResource):
 
 
 # ── RegisteredWindow ──────────────────────────────────────────────────────────
+
 
 class RegisteredWindow(CCOResource):
     """Window registered from a caller-allocated ``ccoMemAlloc`` pointer."""
@@ -167,6 +192,7 @@ class RegisteredWindow(CCOResource):
 
 
 # ── DevCommHandle ─────────────────────────────────────────────────────────────
+
 
 class DevCommHandle(CCOResource):
     """Device communicator resource wrapping ``ccoDevComm``."""
@@ -214,11 +240,14 @@ class DevCommHandle(CCOResource):
     def __repr__(self) -> str:
         if not self.is_valid:
             return "<DevCommHandle: closed>"
-        return (f"<DevCommHandle: ptr={self.ptr:#x}, rank={self.rank}, "
-                f"world_size={self.world_size}, lsa_size={self.lsa_size}>")
+        return (
+            f"<DevCommHandle: ptr={self.ptr:#x}, rank={self.rank}, "
+            f"world_size={self.world_size}, lsa_size={self.lsa_size}>"
+        )
 
 
 # ── Communicator ──────────────────────────────────────────────────────────────
+
 
 class Communicator:
     """CCO communicator for intra- and inter-node symmetric memory operations."""
@@ -247,8 +276,8 @@ class Communicator:
         """Collective: create a CCO communicator."""
         comm = cls()
         uid = unique_id.ptr if isinstance(unique_id, UniqueId) else unique_id
-        comm._raw    = _cco.comm_create(uid, nranks, rank, per_rank_vmm)
-        comm._rank   = rank
+        comm._raw = _cco.comm_create(uid, nranks, rank, per_rank_vmm)
+        comm._rank = rank
         comm._nranks = nranks
         return comm
 
@@ -320,8 +349,10 @@ class Communicator:
     def __repr__(self) -> str:
         if not self.is_valid:
             return "<Communicator: destroyed>"
-        return (f"<Communicator: rank={self._rank}/{self._nranks}, "
-                f"ptr={self._raw.ptr:#x}>")  # type: ignore[union-attr]
+        return (
+            f"<Communicator: rank={self._rank}/{self._nranks}, "
+            f"ptr={self._raw.ptr:#x}>"
+        )  # type: ignore[union-attr]
 
     def __enter__(self) -> Communicator:
         return self

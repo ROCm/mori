@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """
 CCO Example 02 — LSA Put
 =========================
@@ -56,8 +77,10 @@ def main():
         win = comm.register_window(mem.ptr, mem.size)
 
         # Zero out local window
-        _check(hip.hipMemset(ctypes.c_void_p(mem.ptr), 0, ctypes.c_size_t(SLOT_BYTES)),
-               "hipMemset")
+        _check(
+            hip.hipMemset(ctypes.c_void_p(mem.ptr), 0, ctypes.c_size_t(SLOT_BYTES)),
+            "hipMemset",
+        )
         _check(hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
 
         reqs = CCODevCommRequirements()
@@ -68,7 +91,9 @@ def main():
         dc = comm.create_dev_comm(reqs)
 
         if rank == 0:
-            print(f"DevComm: lsa_size={dc._dev_comm.lsa_size}, lsa_rank={dc._dev_comm.lsa_rank}")
+            print(
+                f"DevComm: lsa_size={dc._dev_comm.lsa_size}, lsa_rank={dc._dev_comm.lsa_rank}"
+            )
 
         # Resolve the .hip next to this example (absolute), so it works whether
         # mori is run from the source tree or pip-installed (compile_genco joins
@@ -90,9 +115,15 @@ def main():
 
         # Read back local window
         host_buf = (ctypes.c_uint64 * NSLOTS)()
-        _check(hip.hipMemcpy(host_buf, ctypes.c_void_p(mem.ptr),
-                             ctypes.c_size_t(SLOT_BYTES), ctypes.c_int(2)),
-               "hipMemcpy D2H")
+        _check(
+            hip.hipMemcpy(
+                host_buf,
+                ctypes.c_void_p(mem.ptr),
+                ctypes.c_size_t(SLOT_BYTES),
+                ctypes.c_int(2),
+            ),
+            "hipMemcpy D2H",
+        )
 
         # Validate: slot 0 should contain the peer's lsaRank
         lsa_rank = dc._dev_comm.lsa_rank

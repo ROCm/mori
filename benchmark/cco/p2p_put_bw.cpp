@@ -74,7 +74,8 @@ __global__ void lsa_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 // IBGDA: one QP per block (ginContext=blockIdx); each block pipelines its chunk
 // then flushes its own QP. block scope = one bulk write (== shmem
 // ShmemPutMemNbiBlock); warp/thread subdivide.
-template <core::ProviderType PrvdType, typename Coop, ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent>
+template <core::ProviderType PrvdType, typename Coop,
+          ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent>
 __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int iter) {
   Coop coop;
@@ -97,8 +98,8 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   // fills. The trailing flush waits for the last ops to complete before timing.
   for (int i = 0; i < iter; i++) {
     gda.template put<CCO_TEAM_WORLD, ThreadMode>(peer, reinterpret_cast<ccoWindow_t>(recvWin),
-                                               off_bytes, reinterpret_cast<ccoWindow_t>(sendWin),
-                                               off_bytes, bytes, ccoGda_NoSignal{}, coop);
+                                                 off_bytes, reinterpret_cast<ccoWindow_t>(sendWin),
+                                                 off_bytes, bytes, ccoGda_NoSignal{}, coop);
   }
   gda.flush(ccoCoopBlock{});
 }
@@ -132,8 +133,8 @@ static void launch_ibgda(PutScope scope, dim3 grid, dim3 block, ccoWindow_t send
                          recvWin, len_doubles, devComm, count);
       break;
     case PutScope::kThreadAgg:
-      hipLaunchKernelGGL((ibgda_put_bw<PrvdType, ccoCoopThread, ccoGdaThreadAggregate>), grid, block,
-                         0, 0, sendWin, recvWin, len_doubles, devComm, count);
+      hipLaunchKernelGGL((ibgda_put_bw<PrvdType, ccoCoopThread, ccoGdaThreadAggregate>), grid,
+                         block, 0, 0, sendWin, recvWin, len_doubles, devComm, count);
       break;
   }
 }

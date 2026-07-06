@@ -43,22 +43,21 @@ static constexpr mori::core::ProviderType kPrvdType = CCO_GDA_BUILD_PROVIDER;
 // ── Kernels ─────────────────────────────────────────────────────────────────
 
 __global__ void ThreadAggPutKernel(mori::cco::ccoWindowDevice* sendWin,
-                              mori::cco::ccoWindowDevice* recvWin, size_t chunkBytes,
-                              mori::cco::ccoDevComm devComm, int peer) {
+                                   mori::cco::ccoWindowDevice* recvWin, size_t chunkBytes,
+                                   mori::cco::ccoDevComm devComm, int peer) {
   using namespace mori::cco;
   ccoGda<kPrvdType> gda{devComm, 0};
   int tid = threadIdx.x;
 
   gda.put<CCO_TEAM_WORLD, ccoGdaThreadAggregate, ccoGda_SignalInc, ccoCoopThread>(
       peer, reinterpret_cast<ccoWindow_t>(recvWin), tid * chunkBytes,
-      reinterpret_cast<ccoWindow_t>(sendWin), tid * chunkBytes, chunkBytes,
-      ccoGda_SignalInc{0});
+      reinterpret_cast<ccoWindow_t>(sendWin), tid * chunkBytes, chunkBytes, ccoGda_SignalInc{0});
 
   gda.flush(ccoCoopWarp{});
 }
 
 __global__ void ThreadAggPutValueKernel(mori::cco::ccoWindowDevice* recvWin,
-                                   mori::cco::ccoDevComm devComm, int peer, uint64_t baseVal) {
+                                        mori::cco::ccoDevComm devComm, int peer, uint64_t baseVal) {
   using namespace mori::cco;
   ccoGda<kPrvdType> gda{devComm, 0};
   int tid = threadIdx.x;
@@ -72,8 +71,8 @@ __global__ void ThreadAggPutValueKernel(mori::cco::ccoWindowDevice* recvWin,
 }
 
 __global__ void ThreadAggGetKernel(mori::cco::ccoWindowDevice* remoteWin,
-                              mori::cco::ccoWindowDevice* localWin, size_t chunkBytes,
-                              mori::cco::ccoDevComm devComm, int peer) {
+                                   mori::cco::ccoWindowDevice* localWin, size_t chunkBytes,
+                                   mori::cco::ccoDevComm devComm, int peer) {
   using namespace mori::cco;
   ccoGda<kPrvdType> gda{devComm, 0};
   int tid = threadIdx.x;
@@ -166,14 +165,12 @@ static int ut_thread_agg_put(UtCtx& c) {
   mori::cco::ccoBarrierAll(c.comm);
 
   c.step([&] {
-    ThreadAggPutKernel
-        <<<1, WARP_SIZE, 0, c.stream>>>(c.sendWin, c.recvWin, chunkBytes, c.dc, c.nextPeer);
+    ThreadAggPutKernel<<<1, WARP_SIZE, 0, c.stream>>>(c.sendWin, c.recvWin, chunkBytes, c.dc,
+                                                      c.nextPeer);
   });
 
   // ThreadAggregate → leader posts 1 signal, not 64
-  c.step([&] {
-    CheckSignalKernel<<<1, 1, 0, c.stream>>>(c.dc, 0, 1, 0, c.dErr);
-  });
+  c.step([&] { CheckSignalKernel<<<1, 1, 0, c.stream>>>(c.dc, 0, 1, 0, c.dErr); });
 
   std::vector<float> hostRecv(totalElems);
   HIP_CHECK(
@@ -203,13 +200,10 @@ static int ut_thread_agg_putvalue(UtCtx& c) {
   uint64_t baseVal = static_cast<uint64_t>(c.rank) * 10000;
 
   c.step([&] {
-    ThreadAggPutValueKernel
-        <<<1, WARP_SIZE, 0, c.stream>>>(c.recvWin, c.dc, c.nextPeer, baseVal);
+    ThreadAggPutValueKernel<<<1, WARP_SIZE, 0, c.stream>>>(c.recvWin, c.dc, c.nextPeer, baseVal);
   });
 
-  c.step([&] {
-    CheckSignalKernel<<<1, 1, 0, c.stream>>>(c.dc, 1, 1, 1, c.dErr);
-  });
+  c.step([&] { CheckSignalKernel<<<1, 1, 0, c.stream>>>(c.dc, 1, 1, 1, c.dErr); });
 
   std::vector<uint64_t> hostRecv(WARP_SIZE);
   HIP_CHECK(
@@ -243,8 +237,8 @@ static int ut_thread_agg_get(UtCtx& c) {
   mori::cco::ccoBarrierAll(c.comm);
 
   c.step([&] {
-    ThreadAggGetKernel
-        <<<1, WARP_SIZE, 0, c.stream>>>(c.sendWin, c.recvWin, chunkBytes, c.dc, c.nextPeer);
+    ThreadAggGetKernel<<<1, WARP_SIZE, 0, c.stream>>>(c.sendWin, c.recvWin, chunkBytes, c.dc,
+                                                      c.nextPeer);
   });
 
   std::vector<float> hostRecv(totalElems);
@@ -347,8 +341,19 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
   HIP_CHECK(hipMalloc(&dErr, sizeof(int)));
   HIP_CHECK(hipMemset(dErr, 0, sizeof(int)));
 
-  UtCtx ctx{comm,    devComm, nullptr, dErr,    nranks,  rank,    sendBuf, recvBuf,
-            sendWin, recvWin, bufSize, (rank + 1) % nranks, (rank - 1 + nranks) % nranks};
+  UtCtx ctx{comm,
+            devComm,
+            nullptr,
+            dErr,
+            nranks,
+            rank,
+            sendBuf,
+            recvBuf,
+            sendWin,
+            recvWin,
+            bufSize,
+            (rank + 1) % nranks,
+            (rank - 1 + nranks) % nranks};
   HIP_CHECK(hipStreamCreate(&ctx.stream));
 
   mori::cco::ccoBarrierAll(comm);

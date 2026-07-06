@@ -44,8 +44,8 @@ template <mori::core::ProviderType PrvdType>
 __global__ void GdaBarrierBasicKernel(mori::cco::ccoDevComm devComm) {
   using namespace mori::cco;
   ccoGda<PrvdType> gda{devComm, 0};
-  ccoGdaBarrierSession<PrvdType, ccoCoopBlock> session(ccoCoopBlock{}, gda,
-                                                       devComm.railGdaBarrier, 0);
+  ccoGdaBarrierSession<PrvdType, ccoCoopBlock> session(ccoCoopBlock{}, gda, devComm.railGdaBarrier,
+                                                       0);
   session.sync(ccoCoopBlock{});
 }
 
@@ -54,8 +54,8 @@ template <mori::core::ProviderType PrvdType>
 __global__ void GdaBarrierMultiKernel(mori::cco::ccoDevComm devComm, int rounds) {
   using namespace mori::cco;
   ccoGda<PrvdType> gda{devComm, 0};
-  ccoGdaBarrierSession<PrvdType, ccoCoopBlock> session(ccoCoopBlock{}, gda,
-                                                       devComm.railGdaBarrier, 0);
+  ccoGdaBarrierSession<PrvdType, ccoCoopBlock> session(ccoCoopBlock{}, gda, devComm.railGdaBarrier,
+                                                       0);
   for (int r = 0; r < rounds; r++) {
     session.sync(ccoCoopBlock{});
   }
@@ -76,8 +76,8 @@ __global__ void GdaBarrierDataVisKernel(mori::cco::ccoWindowDevice* sendWin,
   if (myRank == 0) {
     // Each thread issues the put to a different peer (one QP per peer).
     for (int r = 1 + threadIdx.x; r < nRanks; r += blockDim.x) {
-      gda.put(r, reinterpret_cast<ccoWindow_t>(recvWin), 0,
-              reinterpret_cast<ccoWindow_t>(sendWin), 0, count * sizeof(T));
+      gda.put(r, reinterpret_cast<ccoWindow_t>(recvWin), 0, reinterpret_cast<ccoWindow_t>(sendWin),
+              0, count * sizeof(T));
     }
     // flush is block-cooperative: all threads of the block must participate.
     gda.flush(ccoCoopBlock{});
@@ -239,7 +239,8 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
   HIP_CHECK(hipMalloc(&dErr, sizeof(int)));
   HIP_CHECK(hipMemset(dErr, 0, sizeof(int)));
 
-  UtCtx ctx{comm, devComm, sendWin, recvWin, sendBuf, recvBuf, /*stream=*/nullptr, dErr, nranks, rank};
+  UtCtx ctx{comm, devComm, sendWin, recvWin, sendBuf, recvBuf, /*stream=*/nullptr,
+            dErr, nranks,  rank};
   HIP_CHECK(hipStreamCreate(&ctx.stream));
 
   mori::cco::ccoBarrierAll(comm);

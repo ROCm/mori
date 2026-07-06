@@ -1,6 +1,27 @@
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
 # MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
 """OO handles + enums for the cco device API (FlyDSL).
 
 ``DevComm`` / ``Window`` / ``Gda`` are method-carrying FlyDSL structs (see
@@ -62,7 +83,11 @@ class ThreadMode:
 
 # Tag tables — must match the wrapper / _bindings symbol names.
 _SIG_TAG = {SignalOp.NONE: "none", SignalOp.INC: "inc", SignalOp.ADD: "add"}
-_COOP_TAG = {CoopScope.THREAD: "thread", CoopScope.WARP: "warp", CoopScope.BLOCK: "block"}
+_COOP_TAG = {
+    CoopScope.THREAD: "thread",
+    CoopScope.WARP: "warp",
+    CoopScope.BLOCK: "block",
+}
 _TC_TAG = {
     (ThreadMode.INDEPENDENT, CoopScope.THREAD): "it",
     (ThreadMode.INDEPENDENT, CoopScope.WARP): "iw",
@@ -132,34 +157,104 @@ class Gda:
     ctx: fx.Constexpr
 
     # ── data path ──
-    def put(self, peer, dst_win, dst_off, src_win, src_off, nbytes, *,
-            signal_op=SignalOp.NONE, signal_id=0, signal_val=0,
-            coop=CoopScope.THREAD, thread_mode=ThreadMode.INDEPENDENT):
-        sym = raw.PUT[f"{_tc(coop, thread_mode)}__{_SIG_TAG[_const(signal_op, 'signal_op')]}"]
-        sym(self.dev_comm, self.ctx, peer, _win(dst_win), dst_off, _win(src_win), src_off,
-            nbytes, signal_id, signal_val)
+    def put(
+        self,
+        peer,
+        dst_win,
+        dst_off,
+        src_win,
+        src_off,
+        nbytes,
+        *,
+        signal_op=SignalOp.NONE,
+        signal_id=0,
+        signal_val=0,
+        coop=CoopScope.THREAD,
+        thread_mode=ThreadMode.INDEPENDENT,
+    ):
+        sym = raw.PUT[
+            f"{_tc(coop, thread_mode)}__{_SIG_TAG[_const(signal_op, 'signal_op')]}"
+        ]
+        sym(
+            self.dev_comm,
+            self.ctx,
+            peer,
+            _win(dst_win),
+            dst_off,
+            _win(src_win),
+            src_off,
+            nbytes,
+            signal_id,
+            signal_val,
+        )
 
-    def put_value(self, peer, dst_win, dst_off, value, *,
-                  signal_op=SignalOp.NONE, signal_id=0, signal_val=0,
-                  coop=CoopScope.THREAD, thread_mode=ThreadMode.INDEPENDENT):
-        sym = raw.PUT_VALUE[f"{_tc(coop, thread_mode)}__{_SIG_TAG[_const(signal_op, 'signal_op')]}"]
-        sym(self.dev_comm, self.ctx, peer, _win(dst_win), dst_off, value, signal_id, signal_val)
+    def put_value(
+        self,
+        peer,
+        dst_win,
+        dst_off,
+        value,
+        *,
+        signal_op=SignalOp.NONE,
+        signal_id=0,
+        signal_val=0,
+        coop=CoopScope.THREAD,
+        thread_mode=ThreadMode.INDEPENDENT,
+    ):
+        sym = raw.PUT_VALUE[
+            f"{_tc(coop, thread_mode)}__{_SIG_TAG[_const(signal_op, 'signal_op')]}"
+        ]
+        sym(
+            self.dev_comm,
+            self.ctx,
+            peer,
+            _win(dst_win),
+            dst_off,
+            value,
+            signal_id,
+            signal_val,
+        )
 
-    def get(self, peer, remote_win, remote_off, local_win, local_off, nbytes, *,
-            coop=CoopScope.THREAD, thread_mode=ThreadMode.INDEPENDENT):
+    def get(
+        self,
+        peer,
+        remote_win,
+        remote_off,
+        local_win,
+        local_off,
+        nbytes,
+        *,
+        coop=CoopScope.THREAD,
+        thread_mode=ThreadMode.INDEPENDENT,
+    ):
         raw.GET[_tc(coop, thread_mode)](
-            self.dev_comm, self.ctx, peer, _win(remote_win), remote_off,
-            _win(local_win), local_off, nbytes)
+            self.dev_comm,
+            self.ctx,
+            peer,
+            _win(remote_win),
+            remote_off,
+            _win(local_win),
+            local_off,
+            nbytes,
+        )
 
     # ── signal ──
-    def signal(self, peer, *, signal_op=SignalOp.INC, signal_id=0, signal_val=0,
-               coop=CoopScope.THREAD):
+    def signal(
+        self,
+        peer,
+        *,
+        signal_op=SignalOp.INC,
+        signal_id=0,
+        signal_val=0,
+        coop=CoopScope.THREAD,
+    ):
         _const(signal_op, "signal_op")
         _const(coop, "coop")
         if signal_op == SignalOp.NONE:
             raise ValueError("cco: signal() requires signal_op INC or ADD")
         raw.SIGNAL[f"{_COOP_TAG[coop]}__{_SIG_TAG[signal_op]}"](
-            self.dev_comm, self.ctx, peer, signal_id, signal_val)
+            self.dev_comm, self.ctx, peer, signal_id, signal_val
+        )
 
     def read_signal(self, signal_id, bits=64):
         return raw.cco_gda_read_signal(self.dev_comm, self.ctx, signal_id, bits)
@@ -169,7 +264,8 @@ class Gda:
 
     def wait_signal(self, signal_id, least, *, bits=64, coop=CoopScope.THREAD):
         raw.WAIT_SIGNAL[_COOP_TAG[_const(coop, "coop")]](
-            self.dev_comm, self.ctx, signal_id, least, bits)
+            self.dev_comm, self.ctx, signal_id, least, bits
+        )
 
     # ── completion (>= warp; THREAD coop maps to warp) ──
     def flush(self, *, coop=CoopScope.WARP):
