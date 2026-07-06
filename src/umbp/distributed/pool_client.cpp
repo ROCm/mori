@@ -795,12 +795,20 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
   // allocator: Allocate returns kFailedNoSpace when the tier is full, which we
   // treat as a best-effort miss (the remote read result is unaffected).
 
+  // Prepare the job outside the queue lock: the source buffer is valid for this
+  // call, but copying a multi-MiB block while holding recache_mutex_ would
+  // serialize unrelated Get finalizers behind this memcpy.
+  ReCacheJob job;
+  job.key = key;
+  job.bytes = std::unique_ptr<char[]>(new char[size]);
+  job.size = size;
+  LocalCopyBlock(job.bytes.get(), src, size);
+
   // Enqueue for asynchronous install. The actual DRAM Allocate + copy +
   // Commit→KvEvent::ADD publish is performed by ReCacheWorkerLoop OFF the Get
   // critical path, so it does not add latency to concurrent Gets (the tail-round
-  // TTFT blowup observed with a synchronous on-path install). The block bytes are
-  // copied into the job because `src` (the user dst buffer) is not owned past the
-  // Get return. Bounded queue → drop-on-full keeps best-effort semantics.
+  // TTFT blowup observed with a synchronous on-path install). Bounded queue →
+  // drop-on-full keeps best-effort semantics.
   {
     std::lock_guard<std::mutex> lk(recache_mutex_);
     if (recache_stop_) return;
@@ -808,9 +816,6 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
       MORI_UMBP_DEBUG("[PoolClient] MaybeReCacheAfterRemote: queue full, dropping key='{}'", key);
       return;
     }
-    ReCacheJob job;
-    job.key = key;
-    job.bytes.assign(static_cast<const char*>(src), static_cast<const char*>(src) + size);
     recache_queue_.push_back(std::move(job));
   }
   recache_cv_.notify_one();
@@ -830,10 +835,10 @@ void PoolClient::ReCacheWorkerLoop() {
     // copies the bytes, and Commit queues a KvEvent::ADD that reaches the master
     // via heartbeat — mirroring the local Put publish path. kSuccessAlreadyExists
     // makes this idempotent for a repeat remote read of the same key.
-    switch (ExecuteLocalPut(job.key, job.bytes.data(), job.bytes.size(), TierType::DRAM)) {
+    switch (ExecuteLocalPut(job.key, job.bytes.get(), job.size, TierType::DRAM)) {
       case PutAttemptOutcome::kSuccess:
         MORI_UMBP_DEBUG("[PoolClient] ReCacheWorker: re-cached key='{}' size={}", job.key,
-                        job.bytes.size());
+                        job.size);
         break;
       case PutAttemptOutcome::kSuccessAlreadyExists:
         break;

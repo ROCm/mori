@@ -282,7 +282,8 @@ class PoolClient {
   // worker thread installs it. Bounded to keep memory + publish churn in check.
   struct ReCacheJob {
     std::string key;
-    std::vector<char> bytes;
+    std::unique_ptr<char[]> bytes;
+    size_t size = 0;
   };
   std::deque<ReCacheJob> recache_queue_;
   std::mutex recache_mutex_;
