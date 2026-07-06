@@ -307,20 +307,21 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
-          - platform: MI300X_BNXT
+          - platform: MI325X_BNXT
             python: "3.12"
-            runner: [self-hosted, MI300X-BNXT]
+            runner: [self-hosted, 325_bnxt_108]
             base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
-            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             rdma_sl: 3
             rdma_tc: 104
-            socket_ifname: enp159s0np0
+            socket_ifname: enp49s0f1np1
     env:
       IMAGE: rocm/mori:ci-py${{ matrix.python }}
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
+      NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
       WHEEL_URL: ${{ needs.deploy-staging.outputs.wheel_url }}
       WHEEL_VERSION: ${{ needs.deploy-staging.outputs.version }}
     timeout-minutes: 45
@@ -341,6 +342,7 @@ jobs:
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
+            ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -503,16 +505,16 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             ct: podman
-          - platform: MI300X_BNXT
+          - platform: MI325X_BNXT
             python: "3.12"
-            runner: [self-hosted, MI300X-BNXT]
+            runner: [self-hosted, 325_bnxt_108]
             base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
-            node1_host: 10.245.128.61
-            node2_host: 10.245.128.59
+            node1_host: 10.162.224.131
+            node2_host: 10.162.224.162
             node2_port: 22
-            node1_ifname: enp159s0np0
-            node2_ifname: enp159s0np0
-            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            node1_ifname: enp49s0f1np1
+            node2_ifname: enp49s0f1np1
+            rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             rdma_sl: 3
             rdma_tc: 104
             ct: docker

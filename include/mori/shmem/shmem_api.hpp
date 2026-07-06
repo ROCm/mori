@@ -79,6 +79,7 @@ int ShmemSetAttrUniqueIdArgs(int rank, int nranks, mori_shmem_uniqueid_t* uid,
                              mori_shmem_init_attr_t* attr);
 int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr);
 
+bool ShmemIsInitialized();
 int ShmemFinalize();
 
 int ShmemModuleInit(void* hipModule);

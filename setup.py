@@ -353,6 +353,7 @@ class CMakeBuild(build_ext):
             ) from exn
         mpi_enabled = (
             os.environ.get("BUILD_EXAMPLES", "OFF").upper() == "ON"
+            or os.environ.get("BUILD_BENCHMARK", "OFF").upper() == "ON"
             or os.environ.get("MORI_WITH_MPI", "OFF").upper() == "ON"
         )
         if mpi_enabled:

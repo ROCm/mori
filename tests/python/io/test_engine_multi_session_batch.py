@@ -40,7 +40,6 @@ import os
 import torch
 from contextlib import contextmanager
 
-from tests.python.utils import get_free_port
 from mori.io import (
     IOEngineConfig,
     BackendType,
@@ -62,9 +61,8 @@ def create_connected_engine_pair(
 
     Returns (initiator, target).
     """
-    config = IOEngineConfig(host="127.0.0.1", port=get_free_port())
+    config = IOEngineConfig(host="127.0.0.1", port=0)
     initiator = IOEngine(key=f"{name_prefix}_initiator", config=config)
-    config.port = get_free_port()
     target = IOEngine(key=f"{name_prefix}_target", config=config)
 
     be_cfg = RdmaBackendConfig(

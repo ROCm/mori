@@ -366,21 +366,14 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
       return;
     }
 
-    // The CQE only carries the low 16 bits of the completion counter, so rebuild
-    // the full 32-bit value as cons + (forward 16-bit distance from cons to the
-    // CQE). Only trust that distance if it lands within the genuinely in-flight
-    // range (cons, dbTouchIdx]; anything past dbTouchIdx is a stale/torn read and
-    // is ignored (doneIdx stays put). This advances correctly across 16-bit
-    // wraps and never reports more completions than were actually doorbelled.
-    // window is signed: when doneIdx has already caught up to dbTouchIdx it is
-    // <= 0, which correctly rejects every delta.
+    // Rebuild the 32-bit completion from the 16-bit wqe_counter via the forward
+    // delta, bounded by outstanding (<65536) to drop stale CQEs sitting behind cons.
     uint16_t comp16 = static_cast<uint16_t>(wqeCounter + 1);
     uint16_t delta = static_cast<uint16_t>(comp16 - static_cast<uint16_t>(cons));
-    uint32_t dbTouched =
-        __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    int32_t window = static_cast<int32_t>(dbTouched - cons);
+    uint32_t live = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t window = live - cons;
     uint32_t completed = cons;
-    if (delta != 0 && static_cast<int32_t>(delta) <= window) {
+    if (delta != 0 && delta <= window) {
       completed = cons + delta;
     }
 

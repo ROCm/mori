@@ -18,6 +18,7 @@
 #include "src/ops/dispatch_combine/convert.hpp"
 #include "src/ops/dispatch_combine/internode.hpp"
 #include "src/ops/dispatch_combine/intranode.hpp"
+#include "src/ops/dispatch_combine/intranode_ll.hpp"
 
 #define MORI_JIT_GENCO
 #include "src/ops/dispatch_combine/internode_v1.cpp"
@@ -102,6 +103,11 @@ using namespace mori::moe;
 #define WRAP_BOOL6(kernel, suffix, T, B1, B2, B3, B4, B5, B6)                   \
   extern "C" __global__ void kernel##_##suffix(EpDispatchCombineArgs<T> args) { \
     kernel##_body<T, B1, B2, B3, B4, B5, B6>(args);                             \
+  }
+
+#define WRAP_BOOL7(kernel, suffix, T, B1, B2, B3, B4, B5, B6, B7)               \
+  extern "C" __global__ void kernel##_##suffix(EpDispatchCombineArgs<T> args) { \
+    kernel##_body<T, B1, B2, B3, B4, B5, B6, B7>(args);                         \
   }
 
 #define WRAP_ALL_TYPES_BOOL3(kernel, bool_suffix, B1, B2, B3)                               \

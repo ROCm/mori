@@ -23,14 +23,102 @@
 
 #include <infiniband/verbs.h>  // dereferences ibvHandle.qp/cq/srq (forward-declared in core)
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/mori_log.hpp"
 namespace mori {
 namespace application {
+
+namespace {
+
+class RdmaError : public std::runtime_error {
+ public:
+  RdmaError(int errnoValue, std::string what)
+      : std::runtime_error(std::move(what)), errno_(errnoValue) {}
+
+  int Errno() const noexcept { return errno_; }
+
+ private:
+  int errno_{0};
+};
+
+bool HasAnyNonZeroByte(const uint8_t* bytes, size_t len) {
+  return std::any_of(bytes, bytes + len, [](uint8_t byte) { return byte != 0; });
+}
+
+std::string BytesToHex(const uint8_t* bytes, size_t len) {
+  std::ostringstream os;
+  os << std::hex << std::setfill('0');
+  for (size_t i = 0; i < len; ++i) {
+    if (i != 0) os << ':';
+    os << std::setw(2) << static_cast<unsigned>(bytes[i]);
+  }
+  return os.str();
+}
+
+const char* LinkLayerName(uint8_t linkLayer) {
+  switch (linkLayer) {
+    case IBV_LINK_LAYER_UNSPECIFIED:
+      return "unspecified";
+    case IBV_LINK_LAYER_INFINIBAND:
+      return "infiniband";
+    case IBV_LINK_LAYER_ETHERNET:
+      return "ethernet";
+    default:
+      return "unknown";
+  }
+}
+
+std::string DescribeQpTransition(const char* transition, const ibv_qp_attr& attr, int flags,
+                                 const ibv_device_attr_ex& devAttr, const ibv_port_attr& portAttr,
+                                 const RdmaEndpointHandle& local, const char* devName) {
+  std::ostringstream os;
+  os << "transition=" << (transition != nullptr ? transition : "unknown")
+     << " dev=" << (devName != nullptr ? devName : "unknown") << " flags=0x" << std::hex << flags
+     << std::dec << " qp_state=" << static_cast<int>(attr.qp_state)
+     << " port_num=" << static_cast<int>(attr.port_num)
+     << " path_mtu=" << static_cast<int>(attr.path_mtu) << " dest_qp_num=" << attr.dest_qp_num
+     << " rq_psn=" << attr.rq_psn << " sq_psn=" << attr.sq_psn
+     << " max_dest_rd_atomic=" << static_cast<int>(attr.max_dest_rd_atomic)
+     << " max_rd_atomic=" << static_cast<int>(attr.max_rd_atomic)
+     << " min_rnr_timer=" << static_cast<int>(attr.min_rnr_timer)
+     << " timeout=" << static_cast<int>(attr.timeout)
+     << " retry_cnt=" << static_cast<int>(attr.retry_cnt)
+     << " rnr_retry=" << static_cast<int>(attr.rnr_retry)
+     << " ah_attr.is_global=" << static_cast<int>(attr.ah_attr.is_global)
+     << " ah_attr.sl=" << static_cast<int>(attr.ah_attr.sl) << " ah_attr.dlid=" << attr.ah_attr.dlid
+     << " ah_attr.port_num=" << static_cast<int>(attr.ah_attr.port_num)
+     << " grh.sgid_index=" << static_cast<int>(attr.ah_attr.grh.sgid_index)
+     << " grh.hop_limit=" << static_cast<int>(attr.ah_attr.grh.hop_limit)
+     << " grh.traffic_class=" << static_cast<int>(attr.ah_attr.grh.traffic_class)
+     << " local.qpn=" << local.qpn << " local.psn=" << local.psn << " local.portId=" << local.portId
+     << " local.gidIdx=" << local.eth.gidIdx
+     << " local.gid=" << BytesToHex(local.eth.gid, sizeof(local.eth.gid));
+
+  if (HasAnyNonZeroByte(local.eth.mac, sizeof(local.eth.mac))) {
+    os << " local.mac=" << BytesToHex(local.eth.mac, sizeof(local.eth.mac));
+  }
+
+  os << " caps.max_qp_rd_atom=" << devAttr.orig_attr.max_qp_rd_atom
+     << " caps.max_qp_init_rd_atom=" << devAttr.orig_attr.max_qp_init_rd_atom
+     << " caps.max_qp_wr=" << devAttr.orig_attr.max_qp_wr
+     << " caps.max_sge=" << devAttr.orig_attr.max_sge
+     << " port.active_mtu=" << static_cast<int>(portAttr.active_mtu)
+     << " port.gid_tbl_len=" << static_cast<int>(portAttr.gid_tbl_len)
+     << " port.link_layer=" << LinkLayerName(portAttr.link_layer) << '('
+     << static_cast<int>(portAttr.link_layer) << ')';
+  return os.str();
+}
+
+}  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      IBVerbsDeviceContext                                      */
@@ -39,6 +127,7 @@ IBVerbsDeviceContext::IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd
     : RdmaDeviceContext(rdma_device, inPd) {}
 
 IBVerbsDeviceContext::~IBVerbsDeviceContext() {
+  std::lock_guard<std::mutex> lock(poolMu);
   for (auto& it : qpPool) ibv_destroy_qp(it.second);
   for (auto& it : cqPool) ibv_destroy_cq(it.second);
   for (auto* compCh : compChPool) {
@@ -49,37 +138,56 @@ IBVerbsDeviceContext::~IBVerbsDeviceContext() {
 RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
   ibv_context* context = GetIbvContext();
   const ibv_device_attr_ex* deviceAttr = GetRdmaDevice()->GetDeviceAttr();
+  const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+  if (deviceAttr == nullptr || portAttr == nullptr || portAttr->max_msg_sz == 0) {
+    throw std::runtime_error("RDMA device max_msg_sz is unavailable");
+  }
 
   RdmaEndpoint endpoint;
   endpoint.vendorId = ToRdmaDeviceVendorId(deviceAttr->orig_attr.vendor_id);
+  endpoint.maxMsgSize = portAttr->max_msg_sz;
   endpoint.handle.psn = 0;
   endpoint.handle.portId = config.portId;
   endpoint.handle.maxSge = config.maxMsgSge;
 
-  const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
   assert(portAttr);
   if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
     endpoint.handle.ib.lid = portAttr->lid;
   } else if (portAttr->link_layer == IBV_LINK_LAYER_ETHERNET) {
     GidSelectionResult gidSelection =
         AutoSelectGidIndex(context, config.portId, portAttr, config.gidIdx);
-    assert(gidSelection.gidIdx >= 0 && gidSelection.valid);
+    if (gidSelection.gidIdx < 0 || !gidSelection.valid) {
+      throw std::runtime_error("failed to select a valid RDMA GID index");
+    }
 
     memcpy(endpoint.handle.eth.gid, gidSelection.gid.raw, 16);
     endpoint.handle.eth.gidIdx = gidSelection.gidIdx;
   } else {
-    assert(false && "unsupported link layer");
+    throw std::runtime_error("unsupported RDMA link layer " +
+                             std::to_string(static_cast<int>(portAttr->link_layer)));
   }
 
   // TODO: we need to add more options in config, include min cqe num for ib_create_cq
   endpoint.ibvHandle.compCh = config.withCompChannel ? ibv_create_comp_channel(context) : nullptr;
+  if (config.withCompChannel && !endpoint.ibvHandle.compCh) {
+    MORI_APP_ERROR("ibv_create_comp_channel failed: errno={} ({}); dev={}", errno, strerror(errno),
+                   GetRdmaDevice()->Name());
+    throw std::runtime_error("ibv_create_comp_channel failed: " + std::string(strerror(errno)));
+  }
+
   endpoint.ibvHandle.cq =
       ibv_create_cq(context, config.maxCqeNum, NULL, endpoint.ibvHandle.compCh, 0);
   if (!endpoint.ibvHandle.cq) {
+    size_t cqPoolSize = 0;
+    {
+      std::lock_guard<std::mutex> lock(poolMu);
+      cqPoolSize = cqPool.size();
+    }
     MORI_APP_ERROR(
         "ibv_create_cq failed: errno={} ({}); dev={} max_cqe={} dev_max_cqe={} cqs_in_pool={}",
         errno, strerror(errno), GetRdmaDevice()->Name(), config.maxCqeNum,
-        deviceAttr->orig_attr.max_cqe, cqPool.size());
+        deviceAttr->orig_attr.max_cqe, cqPoolSize);
+    if (endpoint.ibvHandle.compCh) ibv_destroy_comp_channel(endpoint.ibvHandle.compCh);
     throw std::runtime_error("ibv_create_cq failed: " + std::string(strerror(errno)));
   }
 
@@ -88,7 +196,9 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
     assert(endpoint.ibvHandle.compCh &&
            (endpoint.ibvHandle.cq->channel == endpoint.ibvHandle.compCh));
 
-  assert(config.maxMsgSge <= GetRdmaDevice()->GetDeviceAttr()->orig_attr.max_sge);
+  if (config.maxMsgSge > GetRdmaDevice()->GetDeviceAttr()->orig_attr.max_sge) {
+    throw std::runtime_error("requested RDMA maxMsgSge exceeds device max_sge");
+  }
   endpoint.ibvHandle.srq = config.enableSrq ? CreateRdmaSrqIfNx(config) : nullptr;
 
   uint32_t maxRecvWr = config.maxRecvWr != 0 ? config.maxRecvWr : config.maxMsgsNum;
@@ -101,17 +211,25 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
                                      .max_recv_wr = maxRecvWr,
                                      .max_send_sge = config.maxMsgSge,
                                      .max_recv_sge = config.maxMsgSge,
+                                     .max_inline_data = config.maxInlineData,
                                  },
                              .qp_type = IBV_QPT_RC};
   endpoint.ibvHandle.qp = ibv_create_qp(pd, &qpAttr);
   if (!endpoint.ibvHandle.qp) {
+    size_t qpPoolSize = 0;
+    {
+      std::lock_guard<std::mutex> lock(poolMu);
+      qpPoolSize = qpPool.size();
+    }
     MORI_APP_ERROR(
         "ibv_create_qp failed: errno={} ({}); dev={} port={} max_send_wr={} max_recv_wr={} "
         "max_send_sge={} max_cqe={} dev_caps(max_qp_wr={} max_qp={} max_cqe={}) qps_in_pool={}",
         errno, strerror(errno), GetRdmaDevice()->Name(), config.portId, qpAttr.cap.max_send_wr,
         qpAttr.cap.max_recv_wr, qpAttr.cap.max_send_sge, config.maxCqeNum,
         deviceAttr->orig_attr.max_qp_wr, deviceAttr->orig_attr.max_qp,
-        deviceAttr->orig_attr.max_cqe, qpPool.size());
+        deviceAttr->orig_attr.max_cqe, qpPoolSize);
+    ibv_destroy_cq(endpoint.ibvHandle.cq);
+    if (endpoint.ibvHandle.compCh) ibv_destroy_comp_channel(endpoint.ibvHandle.compCh);
     throw std::runtime_error("ibv_create_qp failed: " + std::string(strerror(errno)));
   }
   endpoint.handle.qpn = endpoint.ibvHandle.qp->qp_num;
@@ -119,34 +237,64 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   if (config.enableSrq)
     assert(endpoint.ibvHandle.srq && (endpoint.ibvHandle.qp->srq == endpoint.ibvHandle.srq));
 
-  cqPool.insert({endpoint.ibvHandle.cq, endpoint.ibvHandle.cq});
-  qpPool.insert({endpoint.ibvHandle.qp->qp_num, endpoint.ibvHandle.qp});
-  if (endpoint.ibvHandle.compCh) {
-    compChPool.push_back(endpoint.ibvHandle.compCh);
+  {
+    std::lock_guard<std::mutex> lock(poolMu);
+    cqPool.insert({endpoint.ibvHandle.cq, endpoint.ibvHandle.cq});
+    qpPool.insert({endpoint.ibvHandle.qp->qp_num, endpoint.ibvHandle.qp});
+    if (endpoint.ibvHandle.compCh) {
+      compChPool.push_back(endpoint.ibvHandle.compCh);
+    }
   }
   return endpoint;
 }
 
 void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
                                            const RdmaEndpointHandle& remote, uint32_t qpId) {
-  ibv_qp_attr attr;
+  (void)qpId;
+  ibv_qp_attr attr{};
   int flags;
 
   const ibv_device_attr_ex* devAttr = GetRdmaDevice()->GetDeviceAttr();
-  ibv_qp* qp = qpPool.find(local.qpn)->second;
+  const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(local.portId);
+  if (devAttr == nullptr || portAttr == nullptr) {
+    throw RdmaError(EINVAL, "RDMA device or port attributes are unavailable");
+  }
+
+  ibv_qp* qp = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(poolMu);
+    auto qpIt = qpPool.find(local.qpn);
+    if (qpIt != qpPool.end()) qp = qpIt->second;
+  }
+  if (qp == nullptr) {
+    throw RdmaError(ENOENT, "local RDMA QP is not in the ibverbs pool");
+  }
+
+  auto ModifyOrThrow = [&](const char* transition, ibv_qp_attr& qpAttr, int modifyFlags) {
+    int ret = ibv_modify_qp(qp, &qpAttr, modifyFlags);
+    if (ret == 0) return;
+
+    int err = ret > 0 ? ret : errno;
+    if (err == 0) err = EIO;
+    std::string detail = DescribeQpTransition(transition, qpAttr, modifyFlags, *devAttr, *portAttr,
+                                              local, GetRdmaDevice()->Name().c_str());
+    MORI_APP_ERROR("ibv_modify_qp({}) failed: err={} ({}); {}", transition, err, strerror(err),
+                   detail);
+    throw RdmaError(err, "ibv_modify_qp(" + std::string(transition) +
+                             ") failed: " + std::string(strerror(err)));
+  };
 
   // INIT
-  memset(&attr, 0, sizeof(attr));
+  attr = {};
   attr.qp_state = IBV_QPS_INIT;
   attr.port_num = local.portId;
   attr.pkey_index = 0;
   attr.qp_access_flags = MR_DEFAULT_ACCESS_FLAG;
   flags = IBV_QP_STATE | IBV_QP_PORT | IBV_QP_PKEY_INDEX | IBV_QP_ACCESS_FLAGS;
-  SYSCALL_RETURN_ZERO(ibv_modify_qp(qp, &attr, flags));
+  ModifyOrThrow("INIT", attr, flags);
 
-  const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(local.portId);
-  assert(portAttr);
   // RTR
+  attr = {};
   attr.qp_state = IBV_QPS_RTR;
   {
     ibv_mtu path_mtu = portAttr->active_mtu;
@@ -207,9 +355,10 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   }
   flags = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
           IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER | IBV_QP_AV;
-  SYSCALL_RETURN_ZERO(ibv_modify_qp(qp, &attr, flags));
+  ModifyOrThrow("RTR", attr, flags);
 
   // RTS
+  attr = {};
   attr.qp_state = IBV_QPS_RTS;
   attr.sq_psn = 0;
   attr.timeout = 14;
@@ -218,7 +367,68 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.max_rd_atomic = devAttr->orig_attr.max_qp_init_rd_atom;
   flags = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
           IBV_QP_MAX_QP_RD_ATOMIC;
-  SYSCALL_RETURN_ZERO(ibv_modify_qp(qp, &attr, flags));
+  ModifyOrThrow("RTS", attr, flags);
+}
+
+bool IBVerbsDeviceContext::DestroyRdmaEndpointNoThrow(const RdmaEndpoint& ep) noexcept {
+  bool ok = true;
+  try {
+    std::lock_guard<std::mutex> lock(poolMu);
+
+    auto qpIt = qpPool.find(ep.handle.qpn);
+    if (qpIt != qpPool.end() && qpIt->second != nullptr) {
+      int ret = ibv_destroy_qp(qpIt->second);
+      if (ret == 0) {
+        qpPool.erase(qpIt);
+      } else {
+        int err = ret > 0 ? ret : errno;
+        if (err == 0) err = EIO;
+        MORI_APP_ERROR("ibv_destroy_qp failed during endpoint rollback: qpn={} err={} ({})",
+                       ep.handle.qpn, err, strerror(err));
+        ok = false;
+      }
+    }
+
+    if (ep.ibvHandle.cq != nullptr) {
+      auto cqIt = cqPool.find(ep.ibvHandle.cq);
+      if (cqIt != cqPool.end()) {
+        int ret = ibv_destroy_cq(cqIt->second);
+        if (ret == 0) {
+          cqPool.erase(cqIt);
+        } else {
+          int err = ret > 0 ? ret : errno;
+          if (err == 0) err = EIO;
+          MORI_APP_ERROR("ibv_destroy_cq failed during endpoint rollback: cq={} err={} ({})",
+                         static_cast<void*>(ep.ibvHandle.cq), err, strerror(err));
+          ok = false;
+        }
+      }
+    }
+
+    if (ep.ibvHandle.compCh != nullptr) {
+      auto compIt = std::find(compChPool.begin(), compChPool.end(), ep.ibvHandle.compCh);
+      if (compIt != compChPool.end()) {
+        int ret = ibv_destroy_comp_channel(ep.ibvHandle.compCh);
+        if (ret == 0) {
+          compChPool.erase(compIt);
+        } else {
+          int err = ret > 0 ? ret : errno;
+          if (err == 0) err = EIO;
+          MORI_APP_ERROR(
+              "ibv_destroy_comp_channel failed during endpoint rollback: comp_ch={} err={} ({})",
+              static_cast<void*>(ep.ibvHandle.compCh), err, strerror(err));
+          ok = false;
+        }
+      }
+    }
+  } catch (const std::exception& e) {
+    MORI_APP_ERROR("DestroyRdmaEndpointNoThrow caught exception during rollback: {}", e.what());
+    return false;
+  } catch (...) {
+    MORI_APP_ERROR("DestroyRdmaEndpointNoThrow caught unknown exception during rollback");
+    return false;
+  }
+  return ok;
 }
 
 /* ---------------------------------------------------------------------------------------------- */

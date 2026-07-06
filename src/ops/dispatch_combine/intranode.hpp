@@ -470,7 +470,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0>
+          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8>
 __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   using TokT =
       std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant, core::CombineInternalFp8, T>;
@@ -744,18 +744,18 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       if constexpr (Vec8Top8BlockElems != 0) {
         if (mwIter.warpsPerItem == 1) {
           core::WarpAccumFp8DequantFullBlockVec8Top8<T, core::CombineInternalFp8,
-                                                     Vec8Top8BlockElems>(
+                                                     Vec8Top8BlockElems, Vec8AccumNum>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDim);
         } else if ((hiddenDimOffset & 0x7) == 0 && (hiddenDimSize & 0x7) == 0) {
           core::WarpAccumFp8DequantSegmentBlockVec8Top8<T, core::CombineInternalFp8,
-                                                        Vec8Top8BlockElems>(
+                                                        Vec8Top8BlockElems, Vec8AccumNum>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset, hiddenDimSize);
         } else {
           // Misaligned segment: vec8 helper would fault on the load. Tiny scalar fallback.
           core::WarpAccumFp8DequantSegmentScalarTop8<T, core::CombineInternalFp8,
-                                                     Vec8Top8BlockElems>(
+                                                     Vec8Top8BlockElems, Vec8AccumNum>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset, hiddenDimSize);
         }
@@ -796,10 +796,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0>
+          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8>
 __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast, UseFp8BlockwiseQuant,
-                                UseWeights, Vec8Top8BlockElems>(args);
+                                UseWeights, Vec8Top8BlockElems, Vec8AccumNum>(args);
 }
 
 }  // namespace moe

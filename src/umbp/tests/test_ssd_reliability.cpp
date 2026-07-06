@@ -150,6 +150,10 @@ class FakeOwnedSource : public OwnedLocationSource {
     return out;
   }
   std::vector<KvEvent> SnapshotOwnedKeys() const override { return snapshot; }
+  std::vector<KvEvent> SnapshotOwnedKeysForFullSync() override {
+    delta.clear();  // outbox dropped by the authoritative full-sync snapshot
+    return snapshot;
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -169,7 +173,7 @@ TEST(SsdReliability, FullSyncSnapshotMergesDramAndSsdOwnedKeys) {
   ssd.DrainPendingEvents();  // the ADD SSD delta; snapshot is independent
 
   std::vector<OwnedLocationSource*> sources = {&dram, &ssd};
-  auto snap = SnapshotAllSources(sources);
+  auto snap = SnapshotAllSourcesForFullSync(sources);
 
   EXPECT_EQ(CountTier(snap, KvEvent::Kind::ADD, TierType::DRAM), 1);
   EXPECT_EQ(CountTier(snap, KvEvent::Kind::ADD, TierType::SSD), 1);

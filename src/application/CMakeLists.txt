@@ -9,6 +9,29 @@ if(WITH_MPI)
   endif()
 endif()
 find_package(hsa-runtime64 REQUIRED)
+
+# ROCm 7.14's hsakmt cmake config declares a link dependency on the imported
+# target `numa::numa` but never provides it (no FindNUMA / find_package(NUMA)).
+# Without it, find_package(hsakmt) fails at generate time: "The link interface
+# of target hsakmt::hsakmt contains: numa::numa but the target was not found."
+# Define it ourselves from the system libnuma before pulling in hsakmt.
+if(NOT TARGET numa::numa)
+  find_library(NUMA_LIBRARY NAMES numa)
+  find_path(NUMA_INCLUDE_DIR NAMES numa.h)
+  if(NUMA_LIBRARY)
+    add_library(numa::numa UNKNOWN IMPORTED)
+    set_target_properties(numa::numa PROPERTIES IMPORTED_LOCATION
+                                                "${NUMA_LIBRARY}")
+    if(NUMA_INCLUDE_DIR)
+      set_target_properties(numa::numa PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                                                  "${NUMA_INCLUDE_DIR}")
+    endif()
+  else()
+    message(FATAL_ERROR "libnuma not found but required by hsakmt::hsakmt. "
+                        "Install it (e.g. 'apt install libnuma-dev').")
+  endif()
+endif()
+
 find_package(hsakmt REQUIRED)
 # find_library(IONIC_LIBRARY NAMES ionic HINTS /lib/x86_64-linux-gnu REQUIRED )
 
@@ -60,17 +83,9 @@ add_library(mori_application SHARED ${MORI_APP_SOURCES})
 
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR})
-find_library(ROCM_SMI_LIB rocm_smi64 HINTS /opt/rocm/lib REQUIRED)
 find_library(HSA_RUNTIME_LIB hsa-runtime64 HINTS /opt/rocm/lib REQUIRED)
-target_link_libraries(
-  mori_application
-  PUBLIC hip::host
-         dl
-         ${ROCM_SMI_LIB}
-         pci
-         mori_logging
-         ${HSA_RUNTIME_LIB}
-         hsakmt::hsakmt)
+target_link_libraries(mori_application PUBLIC hip::host dl pci mori_logging
+                                              ${HSA_RUNTIME_LIB} hsakmt::hsakmt)
 # Embed the libibverbs dlopen shim (object library, hidden visibility).
 target_link_libraries(mori_application PRIVATE mori_ibv_shim)
 

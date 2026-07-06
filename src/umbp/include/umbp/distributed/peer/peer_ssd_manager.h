@@ -99,6 +99,11 @@ class PeerSsdManager : public OwnedLocationSource {
   // being read (inflight_reads_ > 0) or already being evicted (evicting_).
   // Accumulates sizes until >= bytes_to_free; returns fewer if not enough
   // free-able keys exist (never blocks).
+  //
+  // Not pluggable yet (only master-side eviction is).  A real SSD plugin must
+  // own the per-algorithm state that lives here in lru_/owned_, not just the
+  // selection step; target design is a stateful policy with
+  // OnAdd/OnTouch/OnRemove/Clear hooks plus a SelectVictims called under mutex_.
   std::vector<std::string> SelectVictims(size_t bytes_to_free);
 
   // Distributed Clear: drop the logical owned-location map + undrained events,
@@ -123,6 +128,10 @@ class PeerSsdManager : public OwnedLocationSource {
   // OwnedLocationSource — all events carry TierType::SSD.
   std::vector<KvEvent> DrainPendingEvents() override;
   std::vector<KvEvent> SnapshotOwnedKeys() const override;
+
+  // Full-sync snapshot that also atomically drops the event outbox under the
+  // same lock.  See OwnedLocationSource.
+  std::vector<KvEvent> SnapshotOwnedKeysForFullSync() override;
 
   // Crash-restart leftover policy (discard): after a crash owned_ is empty but
   // physical SSD bytes may remain, diverging used capacity from owned_.  This
@@ -164,6 +173,9 @@ class PeerSsdManager : public OwnedLocationSource {
   // Splice |key| to the MRU (front) of the recency list.  Caller holds mutex_
   // and must have already inserted the key into owned_.
   void TouchLocked(const std::string& key);
+
+  // Build the full ADD list for every owned SSD key.  Caller MUST hold mutex_.
+  std::vector<KvEvent> SnapshotOwnedKeysLocked() const;
 
   // Evict oldest keys until used <= low_watermark * total.  Runs the backend
   // IO outside mutex_ (via Evict); serialized by eviction_mu_ so concurrent

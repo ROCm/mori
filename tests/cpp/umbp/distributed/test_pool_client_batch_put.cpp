@@ -32,6 +32,9 @@
 // spdlog output by the substring "BatchPut: src not registered for key=".
 
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -64,8 +67,29 @@ constexpr const char* kBatchPutWarnSubstr = "BatchPut: src not registered for ke
 // required for a node to register a peer_address and serve remote
 // AllocateSlot/CommitSlot RPCs; without it the caller's remote BatchPut fails
 // with "peer service connection unavailable".
+//
+// The port must be free *at bind time* (PoolClient binds it directly and
+// registers it verbatim), so a hard-coded base collides with concurrent test
+// processes / leftover servers on a shared (self-hosted CI) host.  Ask the
+// kernel for a currently-free ephemeral port instead.
 inline uint16_t NextPeerServicePort() {
-  static std::atomic<uint16_t> next{53000};
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd >= 0) {
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = 0;  // kernel picks a free port
+    socklen_t len = sizeof(addr);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
+      uint16_t port = ntohs(addr.sin_port);
+      ::close(fd);
+      return port;
+    }
+    ::close(fd);
+  }
+  static std::atomic<uint16_t> next{
+      static_cast<uint16_t>(53000 + (static_cast<unsigned>(::getpid()) % 4000))};
   return next.fetch_add(1);
 }
 

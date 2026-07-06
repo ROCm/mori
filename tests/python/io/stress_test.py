@@ -33,7 +33,7 @@ from typing import List, Tuple
 import torch
 import torch.distributed as dist
 
-from tests.python.utils import get_free_port, TorchDistContext
+from tests.python.utils import TorchDistContext
 from mori.io import (
     IOEngineConfig,
     BackendType,
@@ -745,7 +745,7 @@ def parse_args():
 
 
 def launch_stress(local_rank: int, node_rank: int, args):
-    port = get_free_port()
+    port = 0
     stress = MoriIoStress(
         host=args.host,
         port=port,

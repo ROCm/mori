@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cassert>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -87,6 +88,8 @@ struct RdmaEndpointConfig {
                           // be large, e.g. notification)
   uint32_t maxCqeNum{128};
   uint32_t maxMsgSge{1};
+  uint32_t maxInlineData{0};  // SEND inline capacity; required by providers (e.g. bnxt_re)
+                              // for IBV_SEND_INLINE
   uint32_t alignment{PAGESIZE};
   bool onGpu{false};
   bool withCompChannel{false};
@@ -155,6 +158,9 @@ struct WorkQueueAttrs {
 struct RdmaEndpoint {
   RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
   RdmaEndpointHandle handle;
+  // Local provider capability. This is intentionally not part of RdmaEndpointHandle because it
+  // must not be serialized to peers; providers that do not populate it retain legacy behavior.
+  uint64_t maxMsgSize{std::numeric_limits<uint64_t>::max()};
   // TODO(@ditian12): we should use an opaque handle to reference the actual transport context
   // handles, for direct verbs it should be WorkQueueHandle/CompletionQueueHandle, for ib verbs, it
   // should be ibv structures
@@ -207,8 +213,12 @@ class RdmaDeviceContext {
                                                     int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabuf(void* ptr, size_t size, int dmabuf_fd,
                                                           int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  // dmabuf registration with iova=0 (CCO symmetric flat-VA path; BNXT GDA).
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabufIova0(
       void* ptr, size_t size, int dmabuf_fd, int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  // dmabuf-first registration; falls back to ibv_reg_mr. Disable via MORI_DISABLE_DMABUF_REG.
+  virtual RdmaMemoryRegion RegisterRdmaMemoryRegionAuto(void* ptr, size_t size,
+                                                        int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeregisterRdmaMemoryRegion(void* ptr);
 
   // TODO: query gid entry by ibv_query_gid_table
@@ -223,6 +233,7 @@ class RdmaDeviceContext {
                                uint32_t qpId = 0) {
     assert(false && "not implemented");
   }
+  virtual bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept;
 
   ibv_srq* CreateRdmaSrqIfNx(const RdmaEndpointConfig&);
 
@@ -246,6 +257,7 @@ class RdmaDeviceContext {
  private:
   RdmaDevice* device;
   std::unordered_map<void*, ibv_mr*> mrPool;
+  bool dmabufRegDisabled{false};
 };
 
 /* -------------------------------------------------------------------------- */

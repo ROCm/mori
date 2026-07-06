@@ -25,6 +25,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <iterator>
 #include <set>
 #include <system_error>
@@ -71,8 +72,6 @@ TierType FromProtoTier(::umbp::TierType t) { return static_cast<TierType>(t); }
       return ::umbp::KvEvent::ADD;
     case KvEvent::Kind::REMOVE:
       return ::umbp::KvEvent::REMOVE;
-    case KvEvent::Kind::CLEAR_AT_TIER:
-      return ::umbp::KvEvent::CLEAR_AT_TIER;
   }
   return ::umbp::KvEvent::ADD;
 }
@@ -331,15 +330,26 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
   _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
 
-  out->resize(static_cast<size_t>(resp.entries_size()));
-  for (int i = 0; i < resp.entries_size(); ++i) {
-    const auto& e = resp.entries(i);
-    if (!e.found()) continue;
+  // Columnar response: node_ref[i] is a 1-based index into resp.nodes()
+  // (0 = not found); tier[i] / size[i] are parallel per-key arrays.
+  const int n = resp.node_ref_size();
+  if (resp.tier_size() != n || resp.size_size() != n) {
+    return grpc::Status(grpc::StatusCode::INTERNAL,
+                        "BatchRouteGet: malformed columnar response (array length mismatch)");
+  }
+  out->resize(static_cast<size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    const uint32_t node_ref = resp.node_ref(i);
+    if (node_ref == 0) continue;  // not found
+    if (node_ref > static_cast<uint32_t>(resp.nodes_size())) {
+      return grpc::Status(grpc::StatusCode::INTERNAL, "BatchRouteGet: node_ref index out of range");
+    }
+    const auto& node = resp.nodes(static_cast<int>(node_ref) - 1);
     RouteGetResult r;
-    r.node_id = e.node_id();
-    r.tier = FromProtoTier(e.tier());
-    r.size = e.size();
-    r.peer_address = e.peer_address();
+    r.node_id = node.node_id();
+    r.tier = FromProtoTier(resp.tier(i));
+    r.size = resp.size(i);
+    r.peer_address = node.peer_address();
     (*out)[i] = std::move(r);
   }
   return grpc::Status::OK;
@@ -368,9 +378,31 @@ grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
   return grpc::Status::OK;
 }
 
+namespace {
+// Auto-flush the heartbeat once this many KvEvents accumulate at the peer, so a
+// completed batch of puts becomes visible at the master without the application
+// calling FlushHeartbeat().  Defaults to one typical put batch (128 keys).  An
+// unset / unparseable / zero value falls back to the default; to make auto-flush
+// effectively never trigger, set it to a very large number.
+size_t AutoFlushEventThreshold() {
+  static const size_t v = [] {
+    const char* e = std::getenv("UMBP_AUTO_FLUSH_EVENT_THRESHOLD");
+    if (e == nullptr) return size_t{128};
+    char* end = nullptr;
+    unsigned long long n = std::strtoull(e, &end, 10);
+    if (end == e || n == 0) return size_t{128};
+    return static_cast<size_t>(n);
+  }();
+  return v;
+}
+}  // namespace
+
 void MasterClient::SetPeerDramAllocator(PeerDramAllocator* dram_alloc) {
   peer_alloc_ = dram_alloc;
   AddOwnedLocationSource(dram_alloc);
+  if (dram_alloc != nullptr) {
+    dram_alloc->SetAutoFlushHook(AutoFlushEventThreshold(), [this] { FlushHeartbeat(); });
+  }
 }
 
 void MasterClient::SetPeerSsdManager(PeerSsdManager* ssd_manager) {
@@ -441,10 +473,22 @@ void MasterClient::StartHeartbeat() {
 
 void MasterClient::StopHeartbeat() {
   if (!heartbeat_running_) return;
-  heartbeat_running_ = false;
+  {
+    std::lock_guard lock(hb_cv_mutex_);
+    heartbeat_running_ = false;
+  }
   hb_cv_.notify_one();
   if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
   MORI_UMBP_INFO("[Client] Heartbeat thread stopped");
+}
+
+void MasterClient::FlushHeartbeat() {
+  if (!heartbeat_running_) return;
+  {
+    std::lock_guard lock(hb_cv_mutex_);
+    flush_requested_ = true;
+  }
+  hb_cv_.notify_one();
 }
 
 void MasterClient::HeartbeatLoop() {
@@ -452,7 +496,8 @@ void MasterClient::HeartbeatLoop() {
     {
       std::unique_lock lock(hb_cv_mutex_);
       hb_cv_.wait_for(lock, std::chrono::milliseconds(heartbeat_interval_ms_),
-                      [this] { return !heartbeat_running_.load(); });
+                      [this] { return !heartbeat_running_.load() || flush_requested_.load(); });
+      flush_requested_ = false;
     }
     if (!heartbeat_running_) break;
     SendHeartbeatOnce();
@@ -521,7 +566,7 @@ bool MasterClient::SendFullSyncHeartbeatLocked(const std::map<TierType, TierCapa
     snapshot.seq = next_bundle_seq_ - 1;
     req.set_delta_seq_baseline(snapshot.seq);
   }
-  snapshot.events = SnapshotAllSources(owned_sources_);
+  snapshot.events = SnapshotAllSourcesForFullSync(owned_sources_);
   FillBundle(req.add_bundles(), snapshot);
 
   ::umbp::HeartbeatResponse resp;

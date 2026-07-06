@@ -22,6 +22,21 @@ else()
   find_library(_TEST_GRPCPP_LIB NAMES grpc++ REQUIRED)
 endif()
 
+# MasterClient::FlushHeartbeat: immediate wakeup, no-op before start,
+# flush-while-in-flight.
+add_executable(test_umbp_master_client_flush_heartbeat
+               test_master_client_flush_heartbeat.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_master_client_flush_heartbeat PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_master_client_flush_heartbeat
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_master_client_flush_heartbeat
+         COMMAND test_umbp_master_client_flush_heartbeat)
+
 # MasterClient lifecycle: destructor budget, heartbeat thread shutdown, etc.
 add_executable(test_umbp_master_client_lifecycle
                test_master_client_lifecycle.cpp)
@@ -61,6 +76,22 @@ target_link_libraries(
 add_test(NAME umbp_master_client_rpc_latency
          COMMAND test_umbp_master_client_rpc_latency)
 
+# BatchRouteGet columnar response wire-format round-trip (node-table dedup,
+# 1-based node_ref, node_ref==0 -> not found, parallel tier/size columns). gRPC
+# mock master + real MasterClient; no RDMA.
+add_executable(test_umbp_batch_route_get_columnar
+               test_batch_route_get_columnar.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_batch_route_get_columnar PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_batch_route_get_columnar
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_batch_route_get_columnar
+         COMMAND test_umbp_batch_route_get_columnar)
+
 # Client-tag registration + metrics label injection.
 add_executable(test_umbp_tags test_umbp_tags.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -95,6 +126,15 @@ add_executable(test_umbp_route_put_strategy test_route_put_strategy.cpp)
 target_link_libraries(test_umbp_route_put_strategy PRIVATE umbp_common
                                                            gtest_main)
 add_test(NAME umbp_route_put_strategy COMMAND test_umbp_route_put_strategy)
+
+# Master eviction policy plug-in: default LRU behavior + the EvictionManager DI
+# seam.  The seam test calls EvictionManager::RunOnce() directly (a public
+# single-pass trigger), so no special compile flags are needed.
+add_executable(test_umbp_master_evict_strategy test_master_evict_strategy.cpp)
+target_link_libraries(test_umbp_master_evict_strategy PRIVATE umbp_common
+                                                              gtest_main)
+add_test(NAME umbp_master_evict_strategy
+         COMMAND test_umbp_master_evict_strategy)
 
 # PageBitmapAllocator (peer-side per-tier page allocator primitive).
 add_executable(test_umbp_page_bitmap_allocator test_page_bitmap_allocator.cpp)
@@ -183,5 +223,33 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(
   bench_umbp_route_put_strategy
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+
+# GlobalBlockIndex::BatchLookupForRouteGet micro-bench (pure logic; no gRPC /
+# RDMA, so umbp_common only).  Drives the master-side BatchRouteGet hot path
+# directly: hash lookup + exclude filter + access bump + lease grant under a
+# single shared_lock.  Reports us/call, Mlookups/s, and concurrent read scaling
+# via --threads.
+add_executable(bench_umbp_global_block_index_route_get
+               bench_global_block_index_route_get.cpp)
+target_link_libraries(bench_umbp_global_block_index_route_get
+                      PRIVATE umbp_common gtest_main)
+
+# Multi-client agent KV-event pressure bench: in-process master + N PoolClients
+# driving a put -> LLM-gap -> get schedule (--pattern broadcast|rotate),
+# comparing baseline / compressed-heartbeat / flush kv-event propagation under
+# varying QPS. Reads master per-RPC latency back from the master's own
+# Prometheus endpoint (--metrics-port).  Standalone executable; not a CTest
+# target.  Heartbeat interval is env-driven (UMBP_HEARTBEAT_TTL_SEC /
+# UMBP_HEARTBEAT_INTERVAL_DIVISOR); launch one process per scenario.
+add_executable(bench_umbp_kvevent_master_pressure
+               bench_kvevent_master_pressure.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(bench_umbp_kvevent_master_pressure PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  bench_umbp_kvevent_master_pressure
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
