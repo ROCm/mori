@@ -143,9 +143,11 @@ enum ccoProviderType {
 // GDA backend QP allocation strategy.
 enum ccoGdaConnectionType {
   CCO_GDA_CONNECTION_NONE = 0,  // no GDA QPs
-  CCO_GDA_CONNECTION_FULL = 1,  // QPs to every peer (incl. intra-node) — TODO: not yet enforced
+  // QPs to every RDMA-capable peer, incl. intra-node. Intra-node QPs are
+  // allocated but the device GDA barrier path still prefers LSA for them.
+  CCO_GDA_CONNECTION_FULL = 1,
   CCO_GDA_CONNECTION_CROSSNODE = 2,  // QPs only to cross-node peers (default)
-  CCO_GDA_CONNECTION_RAIL = 3,  // QPs only to same-rail cross-node peers — TODO: not yet enforced
+  CCO_GDA_CONNECTION_RAIL = 3,       // QPs only to same-rail cross-node peers
 };
 
 enum ccoTeamMode {
