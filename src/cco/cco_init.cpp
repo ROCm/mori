@@ -1011,26 +1011,11 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   }
   ibgda.endpoints = epsGpu;
 
-  // Resource window: a CCO symmetric window backing this DevComm's session
-  // state. Lives in the LSA flat VA + has an RDMA MR, so each block inside
-  // is simultaneously P2P-load/store-addressable by intra-node peers AND
-  // RDMA-write-target-addressable by cross-node peers — every per-session
-  // sub-allocation gets the full transport matrix "for free".
-  //
-  // Current residents:
-  //   * IBGDA signal / shadows / counter pool (gdaConnType != NONE)
-  //   * LSA barrier inbox+state buffer        (lsaBarrierCount > 0)
-  //
-  // Layout pins signalBufOffset == 0 so a peer's RDMA atomic add still uses
-  // raddr = signal_slot_id * 8 (no per-rank offset shift needed).
-  // counterBuf is software-incremented (via CQ-polling + GPU store) —
-  // placed in the pool for uniformity even though peers never write to it.
-  //
-  // Allocated BEFORE the windowTable build below so the GPU windowTable
-  // includes it (a kernel can findWindow(devComm.resourceWindow) too).
-  // Rail team size = # of nodes (one peer per node at this lsaRank slot).
-  // GDA-Rail barriers only make sense when there are cross-node peers AND
-  // we actually have RDMA QPs to talk to them; otherwise collapse to 0.
+  // Resource window backing this DevComm's session state (IBGDA
+  // signal/shadows/counter pool, LSA barrier inbox+state). signalBufOffset is
+  // pinned to 0 so a peer's RDMA atomic-add uses raddr = signal_slot_id * 8.
+  // Allocated before the windowTable build below so findWindow() sees it.
+  // GDA-Rail barriers are only usable with cross-node peers AND RDMA QPs.
   int nNodes = comm->worldSize / comm->lsaSize;
   bool gdaRailUsable = (connType != CCO_GDA_CONNECTION_NONE) && (nNodes > 1);
 

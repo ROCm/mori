@@ -22,43 +22,24 @@
 //
 // CCO — core header (everything except the GDA device layer).
 //
-// This header pulls in the CCO surface that does NOT depend on the provider
-// RDMA core: shared GPU-side types + cooperative groups + teams + the LSA
-// (intra-node P2P) barrier session + the host control-plane API. The GDA
-// (cross-node RDMA) device layer lives in cco_scale_out.hpp, which includes
-// this file; include that header instead when you need GDA.
+// Covers the CCO surface that does not need the provider RDMA core: shared
+// GPU-side types, cooperative groups, teams, the LSA (intra-node P2P) barrier
+// session, and the host control-plane API (implemented in cco_init.cpp). The
+// GDA (cross-node RDMA) device layer is in cco_scale_out.hpp (which includes
+// this file); include that instead when you need GDA.
 //
-// Host control-plane code, LSA device/kernel code, and host setup for GDA all
-// include just this file. The host API is implemented in src/cco/cco_init.cpp.
-//
-// Layout (single-file ordering = dependency layering):
-//   1. shared types        (host+device, host-only structs guarded)
-//   ── device-side API (guarded under __HIPCC__ / __CUDACC__) ──
-//   2. cooperative groups  (Coop thread/warp/block)
-//   3. teams               (rank-subset descriptors)
-//   4. LSA barrier session (declaration then definition)
-//   ── host side ──
-//   5. host control-plane API prototypes
-//
-// The GDA device layer (ccoGda<PrvdType> + the mori::cco::impl provider
-// primitives) is in cco_scale_out.hpp.
+// Sections: 1. shared types  2. cooperative groups  3. teams
+// 4. LSA barrier session  5. host control-plane API.
 #pragma once
 
 #include <stddef.h>
 #include <stdint.h>
 
-// HIP/host compatibility shim — keeps this header self-contained:
-//   * Device/kernel TUs (hipcc, -x hip): NO <hip/hip_runtime.h> is pulled in.
-//     The device code uses clang AMDGCN builtins directly (wrapped below in
-//     _cco* helpers), plus __hip_atomic_* builtins / __HIP_MEMORY_SCOPE_*
-//     predefined macros. __device__ / __host__ are provided as attribute-macro
-//     fallbacks (#ifndef-guarded, like aiter's opus/hip_minimal.hpp) so cco.hpp
-//     compiles even with no HIP runtime header AND no hipcc auto-wrapper
-//     (-nogpuinc, or a DSL/JIT front-end) — and still coexists with the real
-//     HIP headers when they ARE present.
-//   * Pure-host TUs (plain g++/clang, no hipcc) get __device__/__host__ as
-//     empty macros so the few __device__ helpers in the shared region compile
-//     as host no-ops, plus the STL used by the host control-plane structs.
+// HIP/host compatibility shim — keeps this header self-contained (no
+// <hip/hip_runtime.h>). Device/kernel TUs use clang AMDGCN builtins directly;
+// __device__/__host__ are #ifndef-guarded attribute macros so the header
+// compiles with or without the HIP runtime header. Pure-host TUs get empty
+// __device__/__host__ macros plus the STL used by the host control-plane structs.
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #ifndef __device__
 #define __device__ __attribute__((device))
@@ -73,10 +54,7 @@
 #ifndef __host__
 #define __host__
 #endif
-// Host-only: STL containers/smart-pointers used by the host control-plane
-// structs (ccoComm / ccoWindowHost) defined further down. System headers only —
-// they keep cco.hpp self-contained (no mori headers) while these structs stay in
-// this file. Device/kernel TUs skip both the includes and the structs.
+// Host-only STL for the host control-plane structs (ccoComm / ccoWindowHost).
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -84,45 +62,22 @@
 #include <vector>
 #endif
 
-// SELF-CONTAINED: this header pulls in NO other mori headers. A user needs only
-// this file + the host .so to drive the CCO host API and write LSA device
-// kernels.
-//   * Device kernels get HIP builtins (__device__, __hip_atomic_*, threadIdx,
-//     __syncthreads, ...) from hipcc — no header needed.
-//   * The few external types referenced below appear ONLY as pointers, so they
-//     are forward-declared (their full definitions are never needed here).
-//   * The host control-plane structs (ccoComm, ccoWindowHost) ARE defined here
-//     (host-only, under #if !defined(__HIPCC__)), but reference the application
-//     layer only through forward-declared pointers / unique_ptr (PImpl dtor), so
-//     no application headers are pulled in — only system STL. Their member
-//     functions live in src/cco/cco_init.cpp. Users treat ccoComm as opaque.
-//   * The GDA (RDMA) device layer — the only consumer of the provider RDMA core
-//     — lives in cco_scale_out.hpp (include that, not this, for GDA).
-//
-// Forward declarations (referenced only via pointer / unique_ptr below):
+// Self-contained: pulls in no other mori headers. External types below are
+// referenced only via pointer/unique_ptr, so forward declarations suffice.
 namespace mori {
 namespace application {
-// BootstrapNetwork / Context: ccoComm members (pointer only).
-class BootstrapNetwork;
-class Context;
-// HeapVAManager: ccoComm::vaManager (unique_ptr; ccoComm has an out-of-line
-// dtor in cco_init.cpp so the incomplete type is fine here).
-class HeapVAManager;
+class BootstrapNetwork;  // ccoComm member (pointer)
+class Context;           // ccoComm member (pointer)
+class HeapVAManager;     // ccoComm::vaManager (unique_ptr; ccoComm dtor is out-of-line)
 }  // namespace application
 namespace core {
-// RdmaEndpointDevice: ccoIbgdaContext::endpoints (pointer only). Full definition
-// reaches GDA device code via cco_scale_out.hpp (-> rdma_device.hpp), and the
-// host impl via core_device_types.hpp.
-struct RdmaEndpointDevice;
+struct RdmaEndpointDevice;  // ccoIbgdaContext::endpoints (pointer)
 }  // namespace core
 }  // namespace mori
 namespace anvil {
-// SdmaQueueDeviceHandle: ccoSdmaContext / ccoComm (pointer only).
-struct SdmaQueueDeviceHandle;
+struct SdmaQueueDeviceHandle;  // ccoSdmaContext / ccoComm (pointer)
 }  // namespace anvil
-// hipMemGenericAllocationHandle_t is an opaque pointer typedef from
-// <hip/hip_runtime_api.h>. Replicated here (identical definition) so ccoComm can
-// name it without pulling the ROCm header into host TUs that include cco.hpp.
+// Opaque HIP typedef, replicated so ccoComm can name it without the ROCm header.
 struct ihipMemGenericAllocationHandle;
 typedef struct ihipMemGenericAllocationHandle* hipMemGenericAllocationHandle_t;
 
@@ -132,19 +87,12 @@ namespace cco {
 /* ════════════════════════════════════════════════════════════════════════════
  *  0. Device intrinsic wrappers (clang AMDGCN builtins)
  *
- *  The reason this header needs NO <hip/hip_runtime.h>: the device code below
- *  goes through these thin wrappers instead of HIP's threadIdx / __syncthreads /
- *  __syncwarp / __threadfence_system / clock64. That avoids pulling in and
- *  parsing the full HIP runtime header (faster compile, minimal dependency),
- *  mirroring aiter's opus.hpp. Bodies copy HIP's amd_detail definitions
- *  verbatim. (__hip_atomic_* used elsewhere are clang builtins and
- *  __HIP_MEMORY_SCOPE_* are compiler-predefined macros under -x hip, so those
- *  need no header either.) Device-only.
+ *  Thin wrappers over AMDGCN builtins for threadIdx / __syncthreads /
+ *  __syncwarp / __threadfence_system / clock64, so the header needs no HIP
+ *  runtime header. Bodies mirror HIP's amd_detail definitions. Device-only.
  * ════════════════════════════════════════════════════════════════════════════ */
 #if defined(__HIPCC__) || defined(__CUDACC__)
-// Internal — not part of the cco API. Kept in mori::cco::impl (the same internal
-// namespace as the GDA provider primitives in cco_scale_out.hpp) so cco's public
-// surface (mori::cco::*) stays free of these generic device-compat helpers.
+// Internal (mori::cco::impl) — not part of the public cco API.
 namespace impl {
 __device__ inline unsigned threadIdxX() { return __builtin_amdgcn_workitem_id_x(); }
 __device__ inline unsigned blockDimX() { return __builtin_amdgcn_workgroup_size_x(); }
@@ -260,16 +208,13 @@ struct ccoWindowDevice {
 };
 typedef ccoWindowDevice* ccoWindow_t;
 
-// IBGDA context: QP endpoints + signal/counter resources for one DevComm.
-// One context per comm today (single NIC). Future multi-NIC may use an array.
-//
-// signalBuf / signalShadows / counterBuf are sub-pointers into the DevComm's
-// resourceWindow (a regular CCO symmetric window). For RDMA atomic add to a
-// peer's signalBuf, kernels use:
+// IBGDA context: QP endpoints + signal/counter resources for one DevComm
+// (one context per comm today; single NIC). signalBuf / signalShadows /
+// counterBuf are sub-pointers into the DevComm's resourceWindow. For an RDMA
+// atomic-add to a peer's signalBuf, kernels use:
 //   lkey  = devComm->resourceWindow_inlined.ibgdaWin.lkey
 //   rkey  = devComm->resourceWindow_inlined.ibgdaWin.peerRkeys[peerWorldRank]
-//   raddr = signal_slot_id * sizeof(uint64)   (signalBuf is at offset 0
-//                                               within the resource window)
+//   raddr = signal_slot_id * sizeof(uint64)   (signalBuf is at window offset 0)
 struct ccoIbgdaContext {
   core::RdmaEndpointDevice* endpoints;  // [worldSize * numQpPerPe]
   int numQpPerPe;
@@ -347,28 +292,12 @@ struct ccoDevComm {
   size_t perRankSize;
   ccoWindowTableNode* windowTable;  // GPU linked list of registered windows
 
-  // Resource window: a CCO-internal symmetric window backing all per-
-  // DevComm session state (today: IBGDA signal/shadows/counter pool).
-  // Lives in the LSA flat VA so peers can either P2P-load/store into it
-  // (intra-node) or RDMA-write to it (cross-node) using the standard
-  // window addressing formula:
-  //   peer_va = winBase + peerLsa * stride4G<<32 + offset
-  //   raddr   = offset, rkey = peerRkeys[peer]
-  //
-  // Two fields, `resourceWindow` + `resourceWindow_inlined`:
-  //   * resourceWindow         : GPU pointer to the window struct. Used
-  //                              by host-side bookkeeping (DevCommDestroy
-  //                              looks up the matching ccoWindowHost via
-  //                              this pointer); also lets `findWindow`
-  //                              from device kernels return a stable
-  //                              handle.
-  //   * resourceWindow_inlined : 32-byte ccoWindowDevice copy embedded
-  //                              right here in the kernel parameter
-  //                              space. Kernels read winBase / stride4G /
-  //                              ibgdaWin.{lkey,peerRkeys} directly out
-  //                              of cmem with no GPU-memory dereference.
-  ccoWindowDevice* resourceWindow;         // pointer into windowTable
-  ccoWindowDevice resourceWindow_inlined;  // host-side snapshot
+  // CCO-internal symmetric window backing per-DevComm session state (IBGDA
+  // signal/shadows/counter pool). In the LSA flat VA, addressed via the standard
+  // formula: peer_va = winBase + peerLsa*stride4G<<32 + offset; raddr = offset,
+  // rkey = peerRkeys[peer].
+  ccoWindowDevice* resourceWindow;         // GPU pointer into windowTable (host bookkeeping)
+  ccoWindowDevice resourceWindow_inlined;  // inlined snapshot; kernels read from cmem directly
 
   // IBGDA context (QP + signal + counter); empty when gdaConnType==NONE.
   ccoIbgdaContext ibgda;
@@ -791,12 +720,9 @@ __device__ inline int ccoLsaBarrierSession<Coop>::sync(Coop coop, uint64_t timeo
 /* ════════════════════════════════════════════════════════════════════════════
  *  5. Host control-plane structs & API
  *
- *  ccoWindowHost / ccoComm are host-only (device/kernel TUs see ccoComm only as
- *  an opaque forward declaration). They reference the application layer purely
- *  through forward-declared pointers / unique_ptr, so this header still pulls in
- *  no application headers — only system STL. Member functions and the
- *  out-of-line ccoComm destructor live in src/cco/cco_init.cpp. To callers,
- *  ccoComm is an opaque handle obtained from ccoCommCreate.
+ *  Host-only (device/kernel TUs see ccoComm as an opaque forward declaration).
+ *  Member functions and the out-of-line ccoComm destructor live in
+ *  src/cco/cco_init.cpp; to callers ccoComm is an opaque handle from ccoCommCreate.
  * ════════════════════════════════════════════════════════════════════════════ */
 
 #if !defined(__HIPCC__) && !defined(__CUDACC__)

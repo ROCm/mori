@@ -22,14 +22,10 @@
 //
 // cco_scale_out.hpp — CCO scale-out (GDA / cross-node IBGDA RDMA) device layer.
 //
-// Split out of cco.hpp. This header is the *sole* consumer of the RDMA core, so
-// keeping it separate lets host-only and LSA-only (scale-up) translation units
-// include just cco.hpp without pulling in the heavy provider RDMA headers.
-//
-// It is self-contained: it includes cco.hpp for the shared GPU-side types,
-// cooperative groups, teams, the LSA barrier session, and the host control-plane
-// API, then adds the GDA device layer (ccoGda<PrvdType> + the provider-
-// specialized primitive layer in mori::cco::impl). Include THIS header (not
+// The sole consumer of the RDMA core, split from cco.hpp so host-only and
+// LSA-only TUs can include cco.hpp without the heavy provider RDMA headers.
+// Includes cco.hpp and adds the GDA device layer (ccoGda<PrvdType> + the
+// provider-specialized primitives in mori::cco::impl). Include this (not
 // cco.hpp) when you need GDA.
 #pragma once
 

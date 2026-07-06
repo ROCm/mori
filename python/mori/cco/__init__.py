@@ -52,7 +52,7 @@ from .cco import (
     GDA_CONNECTION_RAIL,
 )
 
-# High-level OO API (mirrors nccl4py style)
+# High-level OO API
 from .communicator import (
     Communicator,
     CCODevCommRequirements,
