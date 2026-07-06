@@ -21,7 +21,7 @@ exist on gfx942). Note: gfx942 fp8 is e4m3**fnuz** (max 240). Not done:
 | file | role |
 |---|---|
 | `flydsl_prims.py` | device primitives: system atomics / ordered stores / fences / volatile-spin waits |
-| `kernels.py` | all FlyDSL kernel factories: `make_dispatch` (+scales/replay), `make_combine` (gather) / `make_combine_scatter` (`_nop2p`, bf16/f32/fp8/fp4), `make_convert_dispatch_output` / `make_convert_combine_input` (StdMoE), `make_local_expert_count` |
+| `intranode_kernels.py` | all FlyDSL intranode kernel factories: `make_dispatch` (+scales/replay), `make_combine` (gather) / `make_combine_scatter` (`_nop2p`, bf16/f32/fp8/fp4), `make_convert_dispatch_output` / `make_convert_combine_input` (StdMoE), `make_local_expert_count` |
 | `dispatch_combine_op.py` | `SymmArena` + `EpDispatchCombineOp` / `EpDispatchCombineConfig` (+`.tuned()`) / `EpDispatchRoutingHandle` — mori-parity host op-layer (scales, scatter/quant combine, StdMoE, recv cap, LEC, reset, replay) |
 | `tuning_configs.py` | per-(world,hidden,topk) block/warp lookup |
 

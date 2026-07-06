@@ -11,7 +11,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from mori.tensor_utils import from_gpu_ptr
 
-from kernels import (
+from intranode_kernels import (
     make_dispatch,
     make_combine,
     make_combine_scatter,

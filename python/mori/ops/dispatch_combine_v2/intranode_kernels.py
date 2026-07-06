@@ -1,4 +1,7 @@
-"""FlyDSL device kernels for the cco-LSA intranode dispatch/combine op.
+"""FlyDSL intranode device kernels for the cco-LSA dispatch/combine op.
+
+All kernels here are single-node (cco-LSA P2P over the flat symmetric VA);
+internode (RDMA) kernels would live in a separate internode_kernels.py.
 
 Merged factories: dispatch (+scales/replay), combine (gather + scatter/quant),
 StdMoE convert (ConvertDispatchOutput/CombineInput), and local expert count.
