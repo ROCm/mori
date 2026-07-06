@@ -31,6 +31,7 @@
 #include <functional>
 #include <limits>
 #include <msgpack.hpp>
+#include <new>
 #include <numeric>
 #include <string>
 #include <string_view>
@@ -720,7 +721,8 @@ bool PoolClient::LocalGetPages(const std::vector<PageLocation>& pages, uint64_t 
 }
 
 PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key, const void* src,
-                                                          size_t size, TierType tier) {
+                                                          size_t size, TierType tier,
+                                                          bool enqueue_ssd_copy) {
   if (!peer_alloc_) {
     MORI_UMBP_ERROR("[PoolClient] Local Put requested but peer allocator unavailable");
     return PutAttemptOutcome::kFatal;
@@ -747,7 +749,7 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
     return PutAttemptOutcome::kFatal;
   }
   // Owner-side commit succeeded: best-effort async copy to local SSD.
-  if (ssd_copy_pipeline_) {
+  if (enqueue_ssd_copy && ssd_copy_pipeline_) {
     ssd_copy_pipeline_->Enqueue(SsdCopyTask{key, tier, size});
   }
   master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
@@ -800,7 +802,12 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
   // serialize unrelated Get finalizers behind this memcpy.
   ReCacheJob job;
   job.key = key;
-  job.bytes = std::unique_ptr<char[]>(new char[size]);
+  job.bytes = std::unique_ptr<char[]>(new (std::nothrow) char[size]);
+  if (!job.bytes) {
+    MORI_UMBP_DEBUG("[PoolClient] MaybeReCacheAfterRemote: allocation failed for key='{}' size={}",
+                    key, size);
+    return;
+  }
   job.size = size;
   LocalCopyBlock(job.bytes.get(), src, size);
 
@@ -835,7 +842,8 @@ void PoolClient::ReCacheWorkerLoop() {
     // copies the bytes, and Commit queues a KvEvent::ADD that reaches the master
     // via heartbeat — mirroring the local Put publish path. kSuccessAlreadyExists
     // makes this idempotent for a repeat remote read of the same key.
-    switch (ExecuteLocalPut(job.key, job.bytes.get(), job.size, TierType::DRAM)) {
+    switch (ExecuteLocalPut(job.key, job.bytes.get(), job.size, TierType::DRAM,
+                            /*enqueue_ssd_copy=*/false)) {
       case PutAttemptOutcome::kSuccess:
         MORI_UMBP_DEBUG("[PoolClient] ReCacheWorker: re-cached key='{}' size={}", job.key,
                         job.size);

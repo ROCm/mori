@@ -262,7 +262,7 @@ class PoolClient {
   enum class GetAttemptOutcome { kSuccess, kRetry, kFatal };
 
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
-                                    TierType tier);
+                                    TierType tier, bool enqueue_ssd_copy = true);
   GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
   // After a successful remote DRAM fetch, if cache_remote_fetches is enabled and
   // the admission gate admits the block, enqueue it for asynchronous install into
