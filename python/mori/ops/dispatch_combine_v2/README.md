@@ -27,15 +27,20 @@ exist on gfx942). Note: gfx942 fp8 is e4m3**fnuz** (max 240). Not done:
 | `local_expert_count_kernel.py` | `make_local_expert_count` — recv tokens per local expert (mori parity) |
 | `dispatch_combine_op.py` | `SymmArena` + `EpDispatchCombineOp` / `EpDispatchCombineConfig` (+`.tuned()`) / `EpDispatchRoutingHandle` — mori-parity host op-layer (scales, scatter/quant combine, StdMoE, recv cap, LEC, reset, replay) |
 | `tuning_configs.py` | per-(world,hidden,topk) block/warp lookup |
-| `tests/dist_common.py` | torchrun bootstrap (gloo only carries the cco unique-id) |
-| `tests/bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM` |
-| `tests/test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
-| `tests/run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
+
+Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
+
+| file | role |
+|---|---|
+| `dist_common.py` | torchrun bootstrap (gloo only carries the cco unique-id) |
+| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM` |
+| `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
+| `run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
 
 ## Run (inside the gfx942 container)
 
 ```bash
-cd python/mori/ops/dispatch_combine_v2/tests
+cd tests/python/ops/dispatch_combine_v2
 unset PYTHONPATH LD_LIBRARY_PATH MORI_CCO_BC
 export MORI_SOCKET_IFNAME=enp159s0np0 MORI_CCO_GDA_CONN=full
 

@@ -15,10 +15,10 @@ import torch
 from mori.cco import Communicator
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)                     # tests/ (dist_common)
-sys.path.insert(0, os.path.dirname(_HERE))    # parent v2/ (op + kernels)
-_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "..", ".."))
-sys.path.insert(0, os.path.join(_ROOT, "examples", "cco", "python"))
+_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
+sys.path.insert(0, _HERE)                                              # dist_common
+sys.path.insert(0, os.path.join(_ROOT, "python", "mori", "ops", "dispatch_combine_v2"))  # op + kernels
+sys.path.insert(0, os.path.join(_ROOT, "examples", "cco", "python"))   # cco_example_common
 from cco_example_common import set_device, sync  # noqa: E402
 from dist_common import Dist  # noqa: E402
 from dispatch_combine_op import EpDispatchCombineConfig, EpDispatchCombineOp  # noqa: E402

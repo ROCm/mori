@@ -2,7 +2,7 @@
 # Run the EP8 dispatch/combine bench inside the rocm/mori:ci container.
 # Usage: ./run_bench.sh [extra env ...]   e.g.  MODE=eager SWEEP=128 ./run_bench.sh
 set -euo pipefail
-DIR=/home/jiahzhou/workspace/mori/python/mori/ops/dispatch_combine_v2/tests
+DIR=/home/jiahzhou/workspace/mori/tests/python/ops/dispatch_combine_v2
 ENVS=""
 for kv in MODE SWEEP ITERS WARMUP HIDDEN TOPK EPR DISP_BLOCK COMB_BLOCK WARP_NUM \
           UNROLL S3_CACHE STDMOE DTYPE QUANT; do
