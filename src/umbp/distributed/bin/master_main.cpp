@@ -48,11 +48,8 @@ int main(int argc, char** argv) {
 
   MORI_UMBP_INFO(
       "[Master] Resolved timing: heartbeat_ttl={}s reaper_interval={}s "
-      "allocation_ttl={}s finalized_record_ttl={}s max_missed={} "
-      "eviction.check_interval={}s lease_duration={}s",
+      "max_missed={} eviction.check_interval={}s lease_duration={}s",
       config.registry_config.heartbeat_ttl.count(), config.registry_config.reaper_interval.count(),
-      config.registry_config.allocation_ttl.count(),
-      config.registry_config.finalized_record_ttl.count(),
       config.registry_config.max_missed_heartbeats, config.eviction_config.check_interval.count(),
       config.eviction_config.lease_duration.count());
 
