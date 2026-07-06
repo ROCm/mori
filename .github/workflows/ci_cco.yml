@@ -67,4 +67,6 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: $CT rm -f $CONTAINER
+        run: |
+          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT rm -f $CONTAINER || true
