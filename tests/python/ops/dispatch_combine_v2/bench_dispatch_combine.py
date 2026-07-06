@@ -33,9 +33,10 @@ sys.path.insert(0, os.path.join(_ROOT, "python", "mori", "ops", "dispatch_combin
 sys.path.insert(0, os.path.join(_ROOT, "examples", "cco", "python"))   # cco_example_common
 from cco_example_common import set_device, sync, zero  # noqa: E402
 from dispatch_combine_op import SymmArena  # noqa: E402
-from dispatch_kernel import make_dispatch  # noqa: E402
-from combine_kernel import make_combine, make_combine_scatter  # noqa: E402
-from stdmoe_kernel import (  # noqa: E402
+from kernels import (  # noqa: E402
+    make_dispatch,
+    make_combine,
+    make_combine_scatter,
     make_convert_dispatch_output,
     make_convert_combine_input,
 )

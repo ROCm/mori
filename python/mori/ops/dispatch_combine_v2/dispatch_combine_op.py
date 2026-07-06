@@ -11,10 +11,14 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from mori.tensor_utils import from_gpu_ptr
 
-from dispatch_kernel import make_dispatch
-from combine_kernel import make_combine, make_combine_scatter
-from stdmoe_kernel import make_convert_dispatch_output, make_convert_combine_input
-from local_expert_count_kernel import make_local_expert_count
+from kernels import (
+    make_dispatch,
+    make_combine,
+    make_combine_scatter,
+    make_convert_dispatch_output,
+    make_convert_combine_input,
+    make_local_expert_count,
+)
 
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
 
