@@ -457,7 +457,10 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   uint32_t maxQpWr = static_cast<uint32_t>(deviceAttr->orig_attr.max_qp_wr);
   uint32_t maxCqe = static_cast<uint32_t>(deviceAttr->orig_attr.max_cqe);
   uint32_t maxSge = static_cast<uint32_t>(deviceAttr->orig_attr.max_sge);
-  if (is_ionic) maxSge = std::min(maxSge, 2u);
+  if (is_ionic) {
+    maxSge = std::min(maxSge, 2u);
+    maxQpWr = std::min(maxQpWr, 32767u);
+  }
 
   if (config.enableNotification && maxQpWr < config.notifPerQp) {
     MORI_IO_ERROR(
