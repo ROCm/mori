@@ -449,6 +449,9 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
                     buffer_store(wv, create_buffer_resource_from_addr(wdst), lane)
 
         # ── Stage 2: cross-device barrier ──
+        # release Stage-1's P2P comb_inp writes before signaling peers (else
+        # Stage-3's acquire races them -> dropped contributions)
+        P.fence_system_release()
         fx.barrier()
         if tid == 0:
             P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))

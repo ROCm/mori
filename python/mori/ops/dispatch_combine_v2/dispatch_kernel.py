@@ -23,7 +23,8 @@ import flydsl_prims as P
 def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim,
                   hidden_elem_size, max_tok_per_rank, max_recv, block_num, warp_num_per_block,
                   off_tok_off, off_recv_num, off_tis, off_out_idx, off_out_wts, off_out_tok,
-                  off_out_scales=0, scale_dim=0, scale_type_size=0, enable_signal=True):
+                  off_out_scales=0, scale_dim=0, scale_type_size=0, enable_signal=True,
+                  replay=False):
     nbytes = hidden_dim * hidden_elem_size
     n_i32 = nbytes // 4
     sentinel_val = npes * max_recv
@@ -68,23 +69,30 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
             dup_ballot = ballot(T.i64(), dup_per_lane < 64)
             is_dup = dup_ballot != 0
 
-            dest_tok_lane0 = arith.constant(0)
-            if lane == 0:
-                if dup_ballot == 0:
-                    peer_tok_off = fx.Int64(w.lsa_ptr(dest_pe, off_tok_off))
-                    dest_tok_lane0 = P.atomic_add_global(peer_tok_off, fx.Int32(1))
-            dest_tok_id = readlane(T.i32(), dest_tok_lane0, 0)
+            if const_expr(replay):
+                # decode dest_tok_id from cached tok_map (skip atomic alloc; same layout)
+                cached = buffer_load(_r_tok_map, work_idx, vec_width=1, dtype=T.i32())
+                is_dup_or_overflow = cached >= sentinel_val
+                do_publish = cached < sentinel_val
+                dest_tok_id = cached - dest_pe * max_recv
+            else:
+                dest_tok_lane0 = arith.constant(0)
+                if lane == 0:
+                    if dup_ballot == 0:
+                        peer_tok_off = fx.Int64(w.lsa_ptr(dest_pe, off_tok_off))
+                        dest_tok_lane0 = P.atomic_add_global(peer_tok_off, fx.Int32(1))
+                dest_tok_id = readlane(T.i32(), dest_tok_lane0, 0)
+                overflow = dest_tok_id >= max_recv
+                is_dup_or_overflow = arith.select(is_dup, is_dup, overflow)
+                no_dup = dup_ballot == 0
+                in_cap = dest_tok_id < max_recv
+                do_publish = arith.select(no_dup, in_cap, no_dup)
+                tok_map_entry = arith.select(is_dup_or_overflow, sentinel_val,
+                                             dest_pe * max_recv + dest_tok_id)
+                if lane == 0:
+                    buffer_store(tok_map_entry, _r_tok_map, work_idx)
 
-            overflow = dest_tok_id >= max_recv
-            is_dup_or_overflow = arith.select(is_dup, is_dup, overflow)
-            no_dup = dup_ballot == 0
-            in_cap = dest_tok_id < max_recv
-            do_publish = arith.select(no_dup, in_cap, no_dup)
-
-            tok_map_entry = arith.select(is_dup_or_overflow, sentinel_val,
-                                         dest_pe * max_recv + dest_tok_id)
             if lane == 0:
-                buffer_store(tok_map_entry, _r_tok_map, work_idx)
                 if do_publish:
                     src_tok_enc = rank * max_tok_per_rank + src_tok
                     peer_tis = fx.Int64(w.lsa_ptr(dest_pe, off_tis))

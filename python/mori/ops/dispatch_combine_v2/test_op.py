@@ -27,6 +27,9 @@ K = int(os.environ.get("TOPK", 8))
 EPR = int(os.environ.get("EPR", 32))
 DTYPE = {"bf16": torch.bfloat16, "f32": torch.float32}[os.environ.get("DTYPE", "bf16")]
 STDMOE = int(os.environ.get("STDMOE", 0))
+SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = also verify per-token scales forwarding
+COMBINE = os.environ.get("COMBINE", "gather")    # gather | scatter
+QUANT = os.environ.get("QUANT", "none")          # none | fp8_direct_cast | fp8_blockwise
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512").split(",")]
 
 
@@ -43,6 +46,15 @@ def main():
     idx = torch.randint(0, num_experts, (M, K), generator=g, dtype=torch.int32).to(dev)
     wts = torch.rand(M, K, generator=g, dtype=torch.float32).to(dev)
 
+    # Per-token scales (int8 bytes): pattern = rank*100003 + tok per dword, so the
+    # recv side can verify the bijection by decoding the origin from the routing
+    # handle's reverse map (disp_tok_id_to_src_tok_id_local).
+    sc_n_i32 = (SCALE_DIM + 3) // 4
+    scales = None
+    if SCALE_DIM:
+        scales = (torch.arange(M, device=dev).view(M, 1).expand(M, sc_n_i32).contiguous()
+                  + rank * 100003).to(torch.int32)
+
     uid = Communicator.get_unique_id() if rank == 0 else None
     uid = d.bcast_uid(uid)
     win_bytes = npes * M * HIDDEN * _DT() * 2 + (1 << 24)
@@ -50,21 +62,59 @@ def main():
         cfg = EpDispatchCombineConfig(
             rank=rank, world_size=npes, hidden_dim=HIDDEN, max_num_inp_token_per_rank=M,
             num_experts_per_rank=EPR, num_experts_per_token=K, data_type=DTYPE,
-            enable_std_moe=bool(STDMOE),
+            enable_std_moe=bool(STDMOE), scale_dim=SCALE_DIM,
+            scale_type_size=1 if SCALE_DIM else 0,
+            combine_mode=COMBINE, quant_type=QUANT,
             max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)))
         op = EpDispatchCombineOp(cfg, comm)
         comm.barrier()
 
         cap = cfg.effective_max_recv if cfg.max_total_recv_tokens > 0 else None
         for ct in SWEEP:
-            recv_x, total_recv, routing = op.dispatch(inp[:ct], wts[:ct], idx[:ct])
+            if int(os.environ.get("RESET", 0)):
+                op.reset(); sync(); comm.barrier()
+            sc_in = scales[:ct] if SCALE_DIM else None
+            recv_x, _out_w, out_s, _out_i, total_recv_t, routing = op.dispatch(
+                inp[:ct], wts[:ct], sc_in, idx[:ct], return_routing=True)
+            total_recv = int(total_recv_t.cpu().item())
             sync(); comm.barrier()
             idx_c = idx[:ct].cpu().numpy()
+            # local_expert_count: global sum over ranks == world*ct*K (every
+            # (token,k) assignment is recorded on exactly the rank owning it).
+            lec_sum = int(op.local_expert_count().sum().cpu().item())
+            sync(); comm.barrier()
+            lec_total = d.allreduce_sum(lec_sum)
+            if rank == 0:
+                ok_lec = lec_total == npes * ct * K
+                print(f"# OP-LEC ct={ct}: {'PASS' if ok_lec else 'FAIL'} "
+                      f"(sum={lec_total} exp={npes * ct * K})", flush=True)
+            if int(os.environ.get("REPLAY", 0)) and cap is None:
+                ref = recv_x[:total_recv].clone()
+                r2 = op.dispatch(inp[:ct], wts[:ct], sc_in, idx[:ct], routing=routing)
+                sync(); comm.barrier()
+                ok_r = torch.equal(r2[0][:total_recv], ref)
+                errs_r = d.allreduce_sum(0 if ok_r else 1)
+                if rank == 0:
+                    print(f"# OP-REPLAY ct={ct}: {'PASS' if errs_r == 0 else 'FAIL'} "
+                          f"(replayed layout == original)", flush=True)
+            if SCALE_DIM:
+                # Verify per-token scales forwarding via the routing handle's
+                # reverse map: recv slot s came from token disp_tok_id_to_src_tok_id
+                # -> expected dword = (src_rank)*100003 + (src_tok).
+                tis = routing.disp_tok_id_to_src_tok_id_local[:total_recv].cpu()
+                exp = ((tis // M) * 100003 + (tis % M)).view(total_recv, 1)
+                got = out_s[:total_recv].cpu()
+                ok_sc = bool((got == exp.expand(total_recv, sc_n_i32)).all())
+                errs = d.allreduce_sum(0 if ok_sc else 1)
+                if rank == 0:
+                    print(f"# OP-SCALES ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "
+                          f"(recv={total_recv}, scale_dim={SCALE_DIM}, {sc_n_i32} dwords/tok, "
+                          f"reverse-map ok)", flush=True)
             if cap is not None:
                 # Capped run: over-cap tokens are intentionally dropped (mori
                 # parity), so identity-verify won't hold. Validate the cap is
                 # respected and nothing OOB/crashed.
-                op.combine(recv_x, routing); sync(); comm.barrier()
+                op.combine(recv_x, routing=routing); sync(); comm.barrier()
                 ok = total_recv <= cap
                 errs = d.allreduce_sum(0 if ok else 1)
                 if rank == 0:
@@ -76,7 +126,7 @@ def main():
                 sync(); comm.barrier()
                 op.convert_combine_input(routing)
                 sync(); comm.barrier()
-                out, out_w = op.combine(recv_x, routing)
+                out, out_w = op.combine(recv_x, routing=routing)
                 sync(); comm.barrier()
                 # telescopes to (sum_k wts)*input
                 ws = wts[:ct].float().cpu().sum(dim=1, keepdim=True)
@@ -86,14 +136,17 @@ def main():
                 tag = "OP-STDMOE"
             else:
                 # identity expert: recv_x already holds the dispatched tokens.
-                out, out_w = op.combine(recv_x, routing)
+                out, out_w = op.combine(recv_x, routing=routing)
                 sync(); comm.barrier()
                 U = np.array([len({int(idx_c[t, j]) // EPR for j in range(K)}) for t in range(ct)])
                 exp = (torch.from_numpy(U).view(ct, 1).float() * inp[:ct].float().cpu()).to(DTYPE)
                 exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
-                ok = torch.allclose(out.float().cpu(), exp.float(), atol=2e-2, rtol=2e-2)
+                # fp8 quant paths lose precision; relax the hidden tolerance.
+                atol = 3e-1 if QUANT != "none" else 2e-2
+                rtol = 1e-1 if QUANT != "none" else 2e-2
+                ok = torch.allclose(out.float().cpu(), exp.float(), atol=atol, rtol=rtol)
                 ok_w = torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
-                tag = "OP"
+                tag = f"OP-{COMBINE}" + (f"-{QUANT}" if QUANT != "none" else "")
             errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
             if rank == 0:
                 print(f"# {tag} ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "

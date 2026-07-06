@@ -34,7 +34,11 @@ class SymmArena:
             self._sizes[name] = nbytes
             off += nbytes
         self._total = max(_align_up(off, self._ALIGN), self._ALIGN)
-        self._win = comm.alloc_window(self._total)
+        # cco split window allocation into alloc_mem + register_window (the old
+        # one-shot alloc_window was removed); keep the backing memory alive for
+        # the arena's lifetime.
+        self._mem = comm.alloc_mem(self._total)
+        self._win = comm.register_window(self._mem.ptr, self._total)
 
     @property
     def handle(self):
