@@ -900,3 +900,87 @@ int ccoBarrierAll(ccoComm* comm);
 
 }  // namespace cco
 }  // namespace mori
+
+/* ════════════════════════════════════════════════════════════════════════════
+ *  SDMA (intra-node copy-engine) device session.
+ *
+ *  Moves data via the SDMA queues on ccoDevComm::sdma; peers are addressed by
+ *  LSA rank. put/get are non-blocking (single thread per (peer, queueId));
+ *  completion is recorded in the local signal pool and awaited with quiet().
+ *  Device-only — pulls in the SDMA core primitives, so it lives behind the same
+ *  __HIPCC__ guard and is skipped entirely by host translation units.
+ * ════════════════════════════════════════════════════════════════════════════ */
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#include "mori/core/transport/sdma/device_primitives.hpp"
+
+namespace mori {
+namespace cco {
+
+struct ccoSdma {
+  ccoDevComm const& comm;
+
+  __device__ inline ccoSdma(ccoDevComm const& c) : comm(c) {}
+
+  // put: copy local srcWin[srcOffset] -> peer dstWin[dstOffset] (bytes).
+  //   Coop=ccoCoopThread — a single thread drives one queue (queueId).
+  //   Coop=ccoCoopWarp   — a warp drives all queues, one lane per queue; bytes
+  //                        are split across sdmaNumQueue and queueId is ignored.
+  template <typename Coop = ccoCoopThread>
+  __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
+                             size_t srcOffset, size_t bytes, int queueId = 0) {
+    static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp>,
+                  "ccoSdma::put supports ccoCoopThread or ccoCoopWarp");
+    const ccoSdmaContext& s = comm.sdma;
+    const uint32_t n = s.sdmaNumQueue;
+    void* dst = ccoGetLsaPeerPtr(dstWin, peer, dstOffset);
+    void* src = ccoGetLocalPtr(srcWin, srcOffset);
+    if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
+      // Appends COPY + ATOMIC(signal++) on the (peer,queueId) queue, bumps expect.
+      core::SdmaPutThread(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
+                          s.expectSignals + peer * n, n, queueId);
+    } else {
+      core::SdmaPutWarp(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
+                        s.expectSignals + peer * n, n);
+    }
+  }
+
+  // get: copy peer srcWin[srcOffset] -> local dstWin[dstOffset] (bytes). Coop
+  // selects thread (single queue) vs warp (all queues) scope, as in put().
+  template <typename Coop = ccoCoopThread>
+  __device__ inline void get(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
+                             size_t srcOffset, size_t bytes, int queueId = 0) {
+    static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp>,
+                  "ccoSdma::get supports ccoCoopThread or ccoCoopWarp");
+    const ccoSdmaContext& s = comm.sdma;
+    const uint32_t n = s.sdmaNumQueue;
+    void* dst = ccoGetLocalPtr(dstWin, dstOffset);
+    void* src = ccoGetLsaPeerPtr(srcWin, peer, srcOffset);
+    if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
+      core::SdmaPutThread(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
+                          s.expectSignals + peer * n, n, queueId);
+    } else {
+      core::SdmaPutWarp(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
+                        s.expectSignals + peer * n, n);
+    }
+  }
+
+  // quiet: block until outstanding ops have landed. Coop=ccoCoopThread waits on
+  // the single (peer,queueId) queue; Coop=ccoCoopWarp waits on every queue (one
+  // lane per queue), pairing with a warp-scope put/get.
+  template <typename Coop = ccoCoopThread>
+  __device__ inline void quiet(int peer, int queueId = 0) {
+    static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp>,
+                  "ccoSdma::quiet supports ccoCoopThread or ccoCoopWarp");
+    const ccoSdmaContext& s = comm.sdma;
+    const uint32_t n = s.sdmaNumQueue;
+    if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
+      anvil::waitForSignal(s.signalBuf + peer * n + queueId, s.expectSignals[peer * n + queueId]);
+    } else {
+      core::SdmaQueitWarp(s.signalBuf + peer * n, s.expectSignals + peer * n, n);
+    }
+  }
+};
+
+}  // namespace cco
+}  // namespace mori
+#endif  // __HIPCC__ || __CUDACC__
