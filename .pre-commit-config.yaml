@@ -1,7 +1,7 @@
 # Exclude all 3rd-party libraries
 exclude: |
   (?x)^(
-    third_party/.+
+    3rdparty/.+
   )$
 repos:
   # Common hooks
@@ -67,8 +67,10 @@ repos:
     rev: v0.6.13
     hooks:
       - id: cmake-format
+        exclude: '.*CMakeLists\.txt$'
   - repo: https://github.com/PFCCLab/cmake-lint-paddle
     rev: v1.5.2
     hooks:
       - id: cmakelint
         args: [--config=./tools/codestyle/.cmakelintrc]
+        exclude: '.*CMakeLists\.txt$'

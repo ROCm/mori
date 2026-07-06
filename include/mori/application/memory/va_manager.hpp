@@ -61,7 +61,11 @@ class HeapVAManager {
   /**
    * @brief Construct a new VA Manager
    *
-   * @param baseAddr Base virtual address of the heap
+   * @param baseAddr Base virtual address of the heap. MUST be non-zero —
+   *                 Allocate() uses 0 as the failure sentinel, so baseAddr=0
+   *                 would let the first valid allocation alias with failure.
+   *                 Pass the real VMM-reserved VA, or any non-zero sentinel
+   *                 if you only need offset semantics.
    * @param totalSize Total size of the heap virtual address space
    * @param granularity Physical memory allocation granularity (for RDMA boundary alignment, default
    * 0)

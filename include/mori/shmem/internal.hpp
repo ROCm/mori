@@ -105,31 +105,12 @@ struct MemoryStates {
 /*                          Device-safe GPU-side structures                                      */
 /* ---------------------------------------------------------------------------------------------- */
 
-// GPU-side RDMA endpoint: only the fields used by device kernels.
-// Excludes host-only fields: ibvHandle (ibverbs objects) and unused handle sub-fields (psn, portId,
-// mac, gid). Only qpn from handle is needed by device kernels (for doorbell posting).
-// Populated from application::RdmaEndpoint by init.cpp before hipMemcpy to device.
-struct ShmemRdmaEndpoint {
-  application::RdmaDeviceVendorId vendorId{application::RdmaDeviceVendorId::Unknown};
-  uint32_t qpn{0};  // QP number — extracted from application::RdmaEndpoint::handle.qpn
-  core::WorkQueueHandle wqHandle;
-  core::CompletionQueueHandle cqHandle;
-  core::IbufHandle atomicIbuf;
-
-  __device__ __host__ core::ProviderType GetProviderType() {
-    if (vendorId == application::RdmaDeviceVendorId::Mellanox) {
-      return core::ProviderType::MLX5;
-    } else if (vendorId == application::RdmaDeviceVendorId::Broadcom) {
-      return core::ProviderType::BNXT;
-    } else if (vendorId == application::RdmaDeviceVendorId::Pensando) {
-      return core::ProviderType::PSD;
-    } else {
-      MORI_PRINTF("ShmemRdmaEndpoint: unknown vendorId %u\n", static_cast<uint32_t>(vendorId));
-      assert(false);
-      return core::ProviderType::Unknown;
-    }
-  }
-};
+// GPU-side RDMA endpoint. The type lives in core (core::RdmaEndpointDevice) — a
+// device POD over core's WQ/CQ/Ibuf handles, the device-visible projection of
+// application::RdmaEndpoint — so RDMA-driving backends (shmem, cco, ...) depend
+// DOWN on core rather than on each other. This alias preserves the historical
+// shmem::ShmemRdmaEndpoint spelling for existing shmem code.
+using ShmemRdmaEndpoint = core::RdmaEndpointDevice;
 
 // GpuStates must be declared before ModuleStates and ShmemStates which embed it.
 struct GpuStates {

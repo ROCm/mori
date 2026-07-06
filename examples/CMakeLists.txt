@@ -125,6 +125,29 @@ target_link_libraries(intra_node_benchmark mori_collective MPI::MPI_CXX
 target_include_directories(intra_node_benchmark
                            PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+# --- CCO examples ---
+# The CCO LSA test variants (lsa_barrier / lsa_allreduce / lsa_memcheck) live in
+# tests/cpp/cco/test_cco_lsa_*.cpp (auto-discovery harness). The two C++ examples
+# below are HIP, MPI-bootstrapped, and link mori_cco. LSA uses only cco.hpp; GDA
+# uses only cco_scale_out.hpp and needs the NIC define for provider dispatch.
+add_executable(cco_lsa_put cco/cpp/01_lsa_put.cpp)
+set_source_files_properties(cco/cpp/01_lsa_put.cpp PROPERTIES LANGUAGE HIP)
+target_include_directories(cco_lsa_put PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(cco_lsa_put mori_cco MPI::MPI_CXX hip::host hip::device)
+
+add_executable(cco_gda_put cco/cpp/02_gda_put.cpp)
+set_source_files_properties(cco/cpp/02_gda_put.cpp PROPERTIES LANGUAGE HIP)
+target_include_directories(cco_gda_put PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(cco_gda_put mori_cco MPI::MPI_CXX hip::host hip::device)
+if(MORI_DEVICE_NIC_DEFINE)
+  target_compile_definitions(cco_gda_put PRIVATE ${MORI_DEVICE_NIC_DEFINE})
+endif()
+
+# Add an $ORIGIN-relative rpath (kept alongside the build-tree rpath) so the
+# binaries still find libmori_*.so after `pip install .` copies them to
+# site-packages/mori/examples/cco/ (the libs live at site-packages/mori/).
+set_target_properties(cco_lsa_put cco_gda_put PROPERTIES BUILD_RPATH "$ORIGIN/../..")
+
 # --- Application examples ---
 add_executable(context application/context.cpp)
 target_link_libraries(context mori_application hip::host hip::device)
