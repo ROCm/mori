@@ -386,8 +386,7 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
   if (args.transport == Transport::kLsa || args.transport == Transport::kSdma) {
     if (ctx->devComm.lsaSize < 2) {
       if (ctx->my_pe == 0) {
-        std::fprintf(stderr,
-                     "%s transport requires both PEs on the same node (lsaSize=%d).\n",
+        std::fprintf(stderr, "%s transport requires both PEs on the same node (lsaSize=%d).\n",
                      TransportToChar(args.transport), ctx->devComm.lsaSize);
       }
       PerfFinalize(ctx);
