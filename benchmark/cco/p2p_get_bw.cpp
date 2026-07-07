@@ -128,8 +128,9 @@ __global__ void sdma_get_bw_warp(ccoWindowDevice* sendWin, ccoWindowDevice* recv
   sdma.quiet<ccoCoopWarp>(peerLsa);
 }
 
-static void launch_sdma(PutScope scope, ccoWindow_t sendWin, ccoWindow_t recvWin, size_t len_doubles,
-                        ccoDevComm devComm, int peerLsa, int count, int warp_size) {
+static void launch_sdma(PutScope scope, ccoWindow_t sendWin, ccoWindow_t recvWin,
+                        size_t len_doubles, ccoDevComm devComm, int peerLsa, int count,
+                        int warp_size) {
   const int nq = devComm.sdma.sdmaNumQueue;
   if (scope == PutScope::kWarp) {
     hipLaunchKernelGGL(sdma_get_bw_warp, dim3(1), dim3(warp_size), 0, 0, sendWin, recvWin,
