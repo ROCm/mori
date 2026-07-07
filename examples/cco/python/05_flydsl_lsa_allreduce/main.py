@@ -171,7 +171,8 @@ def main() -> int:
 
     errors = 0
     with Communicator.init(nranks, rank, uid, per_rank_vmm=256 * 1024 * 1024) as comm:
-        win = comm.alloc_window(WIN_BYTES)
+        mem = comm.alloc_mem(WIN_BYTES)
+        win = comm.register_window(mem.ptr, mem.size)
 
         # Zero the whole window (incl. signal slots), then fill my input region:
         #   input[i] = (rank + 1) * (i + 1)  ->  allreduce sum = S * (i+1),
