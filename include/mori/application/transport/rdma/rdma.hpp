@@ -216,7 +216,8 @@ class RdmaDeviceContext {
   // dmabuf registration with iova=0 (CCO symmetric flat-VA path; BNXT GDA).
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabufIova0(
       void* ptr, size_t size, int dmabuf_fd, int accessFlag = MR_DEFAULT_ACCESS_FLAG);
-  // dmabuf-first registration; falls back to ibv_reg_mr. Disable via MORI_DISABLE_DMABUF_REG.
+  // ibv_reg_mr-first registration; falls back to dmabuf. Set MORI_ENABLE_DMABUF_REG to try
+  // dmabuf first instead (falling back to ibv_reg_mr).
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionAuto(void* ptr, size_t size,
                                                         int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeregisterRdmaMemoryRegion(void* ptr);
@@ -257,7 +258,7 @@ class RdmaDeviceContext {
  private:
   RdmaDevice* device;
   std::unordered_map<void*, ibv_mr*> mrPool;
-  bool dmabufRegDisabled{false};
+  bool preferDmabufReg{false};
 };
 
 /* -------------------------------------------------------------------------- */
