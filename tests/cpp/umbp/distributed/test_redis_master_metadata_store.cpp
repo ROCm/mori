@@ -22,17 +22,27 @@
 
 // Phase 1 targeted tests for RedisMasterMetadataStore: the six hot-path methods
 // plus the register/heartbeat/unregister/expire semantics that must match the
-// in-memory backend. Requires a live RESP store (Redis / Dragonfly / Valkey) at
-// UMBP_REDIS_URI (default tcp://127.0.0.1:6379). Skips cleanly when none is
-// reachable, so BUILD_TESTS on a host without Redis does not fail.
+// in-memory backend. The store tests run against a live RESP store (Redis /
+// Dragonfly / Valkey) at UMBP_REDIS_URI (default tcp://127.0.0.1:6379) and skip
+// cleanly when none is reachable, so BUILD_TESTS on a host without Redis does
+// not fail. Every store test is parameterized over block_shards (1 = legacy
+// single-tag layout, 16 = sharded) so both the whole-batch and the per-shard
+// fan-out read paths are exercised with identical assertions.
+//
+// The KeySchema tests are pure (no store) and always run — they guard the shard
+// mapping and the "single shard == legacy key strings" invariant even where no
+// Redis is available.
 
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <vector>
 
+#include "umbp/distributed/master/redis/key_schema.h"
 #include "umbp/distributed/master/redis/resp_client.h"
 #include "umbp/distributed/master/redis_master_metadata_store.h"
 
@@ -40,6 +50,52 @@ namespace mori::umbp {
 namespace {
 
 using namespace std::chrono_literals;
+
+// =====================================================================
+// KeySchema — pure unit tests (no live store needed).
+// =====================================================================
+
+TEST(KeySchemaTest, SingleShardIsLegacyLayout) {
+  redis::KeySchema schema("ns", 1);
+  EXPECT_EQ(schema.NumShards(), 1u);
+  EXPECT_EQ(schema.Tag(), "{umbp:ns}");
+  EXPECT_EQ(schema.ShardOf("abc"), 0u);
+  // Byte-identical to the original single-tag schema.
+  EXPECT_EQ(schema.Block("abc"), "{umbp:ns}:block:abc");
+  EXPECT_EQ(schema.Node("n1"), "{umbp:ns}:node:n1");
+  EXPECT_EQ(schema.NodeBlocks("n1"), "{umbp:ns}:node:n1:blocks");
+}
+
+TEST(KeySchemaTest, ZeroShardsClampsToOne) {
+  redis::KeySchema schema("ns", 0);
+  EXPECT_EQ(schema.NumShards(), 1u);
+  EXPECT_EQ(schema.Block("x"), "{umbp:ns}:block:x");
+}
+
+TEST(KeySchemaTest, MultiShardIsDeterministicAndInRange) {
+  constexpr std::size_t kShards = 16;
+  redis::KeySchema schema("ns", kShards);
+  EXPECT_EQ(schema.NumShards(), kShards);
+  for (int i = 0; i < 1000; ++i) {
+    const std::string key = "key-" + std::to_string(i);
+    const std::size_t shard = schema.ShardOf(key);
+    EXPECT_LT(shard, kShards);
+    EXPECT_EQ(shard, schema.ShardOf(key)) << "shard mapping must be deterministic";
+    EXPECT_EQ(schema.Block(key), "{umbp:ns:b" + std::to_string(shard) + "}:block:" + key);
+  }
+}
+
+TEST(KeySchemaTest, ShardsAreReasonablySpread) {
+  constexpr std::size_t kShards = 16;
+  redis::KeySchema schema("ns", kShards);
+  std::vector<int> counts(kShards, 0);
+  for (int i = 0; i < 4096; ++i) counts[schema.ShardOf("k/" + std::to_string(i))]++;
+  for (std::size_t s = 0; s < kShards; ++s) EXPECT_GT(counts[s], 0) << "shard " << s << " is empty";
+}
+
+// =====================================================================
+// Store tests — parameterized over block_shards, require a live RESP store.
+// =====================================================================
 
 std::string RedisUri() {
   const char* v = std::getenv("UMBP_REDIS_URI");
@@ -52,7 +108,7 @@ std::string UniqueNamespace() {
          std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() & 0xffffff);
 }
 
-class RedisStoreTest : public ::testing::Test {
+class RedisStoreTest : public ::testing::TestWithParam<std::size_t> {
  protected:
   void SetUp() override {
     redis::RespClient::Options opts;
@@ -63,9 +119,11 @@ class RedisStoreTest : public ::testing::Test {
       GTEST_SKIP() << "no RESP store reachable at " << RedisUri()
                    << " (set UMBP_REDIS_URI); skipping";
     }
+    ns_ = UniqueNamespace();
     RedisMasterMetadataStore::Config cfg;
     cfg.uri = RedisUri();
-    cfg.namespace_id = UniqueNamespace();
+    cfg.namespace_id = ns_;
+    cfg.block_shards = GetParam();
     store_ = std::make_unique<RedisMasterMetadataStore>(cfg);
     now_ = std::chrono::system_clock::now();
   }
@@ -80,12 +138,33 @@ class RedisStoreTest : public ::testing::Test {
     return r;
   }
 
+  // Raw HGET of a block-hash meta field via the probe client, so tests can
+  // assert lease/access bookkeeping the store API does not expose. Returns -1
+  // when the field (or the whole block key) is absent.
+  long long MetaField(const std::string& user_key, const std::string& field) const {
+    redis::KeySchema schema(ns_, GetParam());
+    redis::RespValue r = probe_->Command({"HGET", schema.Block(user_key), field});
+    if (r.type != redis::RespValue::Type::String) return -1;
+    try {
+      return std::stoll(r.str);
+    } catch (...) {
+      return -1;
+    }
+  }
+
+  std::string ns_;
   std::unique_ptr<redis::RespClient> probe_;
   std::unique_ptr<RedisMasterMetadataStore> store_;
   std::chrono::system_clock::time_point now_;
 };
 
-TEST_F(RedisStoreTest, RegisterMakesClientAlive) {
+INSTANTIATE_TEST_SUITE_P(BlockShards, RedisStoreTest,
+                         ::testing::Values(std::size_t{1}, std::size_t{16}),
+                         [](const ::testing::TestParamInfo<std::size_t>& info) {
+                           return "shards" + std::to_string(info.param);
+                         });
+
+TEST_P(RedisStoreTest, RegisterMakesClientAlive) {
   EXPECT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
   EXPECT_TRUE(store_->IsClientAlive("n1"));
   EXPECT_EQ(store_->AliveClientCount(), 1u);
@@ -103,7 +182,7 @@ TEST_F(RedisStoreTest, RegisterMakesClientAlive) {
   EXPECT_EQ(store_->GetClientTags("n1").size(), 2u);
 }
 
-TEST_F(RedisStoreTest, RegisterRejectsAliveDuplicateButAllowsStale) {
+TEST_P(RedisStoreTest, RegisterRejectsAliveDuplicateButAllowsStale) {
   EXPECT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
   // Alive and not stale -> rejected.
   EXPECT_FALSE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
@@ -111,14 +190,14 @@ TEST_F(RedisStoreTest, RegisterRejectsAliveDuplicateButAllowsStale) {
   EXPECT_TRUE(store_->RegisterClient(MakeReg("n1"), now_ + 1s, 0s));
 }
 
-TEST_F(RedisStoreTest, ListAliveClientsReturnsRecords) {
+TEST_P(RedisStoreTest, ListAliveClientsReturnsRecords) {
   ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
   ASSERT_TRUE(store_->RegisterClient(MakeReg("n2"), now_, 30s));
   auto alive = store_->ListAliveClients();
   EXPECT_EQ(alive.size(), 2u);
 }
 
-TEST_F(RedisStoreTest, HeartbeatAddThenRouteGet) {
+TEST_P(RedisStoreTest, HeartbeatAddThenRouteGet) {
   ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
 
   std::vector<KvEvent> events = {
@@ -144,7 +223,7 @@ TEST_F(RedisStoreTest, HeartbeatAddThenRouteGet) {
   EXPECT_TRUE(locs[1].empty());
 }
 
-TEST_F(RedisStoreTest, RouteGetExcludeFiltersNode) {
+TEST_P(RedisStoreTest, RouteGetExcludeFiltersNode) {
   ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
   ASSERT_TRUE(store_->RegisterClient(MakeReg("n2"), now_, 30s));
   ASSERT_EQ(
@@ -164,7 +243,36 @@ TEST_F(RedisStoreTest, RouteGetExcludeFiltersNode) {
   EXPECT_EQ(locs[0][0].node_id, "n2");
 }
 
-TEST_F(RedisStoreTest, HeartbeatSeqGapAndUnknown) {
+TEST_P(RedisStoreTest, RouteGetBumpsAccessOnlyForTouchedKeys) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_EQ(store_
+                ->ApplyHeartbeat("n1", 1, now_, {},
+                                 {{KvEvent::Kind::ADD, "hit", TierType::DRAM, 7}}, false)
+                .status,
+            HeartbeatResult::APPLIED);
+
+  // Freshly added key starts at _acnt = 0 and no lease.
+  EXPECT_EQ(MetaField("hit", "_acnt"), 0);
+  EXPECT_EQ(MetaField("hit", "_lease"), -1);
+
+  // One RouteGet over a hit + a miss: only the hit is leased / access-bumped;
+  // the miss must not be created.
+  auto locs = store_->BatchLookupBlockForRouteGet({"hit", "miss"}, {}, now_, 10s);
+  ASSERT_EQ(locs.size(), 2u);
+  ASSERT_EQ(locs[0].size(), 1u);
+  EXPECT_TRUE(locs[1].empty());
+
+  EXPECT_EQ(MetaField("hit", "_acnt"), 1);    // touched -> bumped exactly once
+  EXPECT_GT(MetaField("hit", "_lease"), 0);   // touched -> lease granted
+  EXPECT_EQ(MetaField("miss", "_acnt"), -1);  // absent -> still absent (no phantom key)
+
+  // A second RouteGet bumps again by exactly one (guards the NOSCRIPT
+  // retry-only-failed path from double-applying the write).
+  store_->BatchLookupBlockForRouteGet({"hit"}, {}, now_, 10s);
+  EXPECT_EQ(MetaField("hit", "_acnt"), 2);
+}
+
+TEST_P(RedisStoreTest, HeartbeatSeqGapAndUnknown) {
   EXPECT_EQ(store_->ApplyHeartbeat("ghost", 1, now_, {}, {}, false).status,
             HeartbeatResult::UNKNOWN);
 
@@ -175,7 +283,7 @@ TEST_F(RedisStoreTest, HeartbeatSeqGapAndUnknown) {
   EXPECT_EQ(gap.acked_seq, 0u);
 }
 
-TEST_F(RedisStoreTest, HeartbeatRemoveDropsLocation) {
+TEST_P(RedisStoreTest, HeartbeatRemoveDropsLocation) {
   ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
   ASSERT_EQ(
       store_
@@ -192,7 +300,7 @@ TEST_F(RedisStoreTest, HeartbeatRemoveDropsLocation) {
   EXPECT_FALSE(store_->BatchExistsBlock({"k"})[0]);
 }
 
-TEST_F(RedisStoreTest, FullSyncReplacesLocations) {
+TEST_P(RedisStoreTest, FullSyncReplacesLocations) {
   ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
   ASSERT_EQ(store_
                 ->ApplyHeartbeat("n1", 1, now_, {},
@@ -209,7 +317,7 @@ TEST_F(RedisStoreTest, FullSyncReplacesLocations) {
   EXPECT_TRUE(store_->BatchExistsBlock({"new"})[0]);
 }
 
-TEST_F(RedisStoreTest, UnregisterWipesClientAndBlocks) {
+TEST_P(RedisStoreTest, UnregisterWipesClientAndBlocks) {
   ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
   ASSERT_EQ(
       store_
@@ -223,7 +331,7 @@ TEST_F(RedisStoreTest, UnregisterWipesClientAndBlocks) {
   EXPECT_FALSE(store_->BatchExistsBlock({"k"})[0]);
 }
 
-TEST_F(RedisStoreTest, ExpireStaleFlipsAndWipesBlocks) {
+TEST_P(RedisStoreTest, ExpireStaleFlipsAndWipesBlocks) {
   ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
   ASSERT_EQ(
       store_
@@ -241,6 +349,91 @@ TEST_F(RedisStoreTest, ExpireStaleFlipsAndWipesBlocks) {
   auto rec = store_->GetClient("n1");
   ASSERT_TRUE(rec.has_value());
   EXPECT_EQ(rec->status, ClientStatus::EXPIRED);
+}
+
+// ---------------------------------------------------------------------
+// Cross-shard coverage: with block_shards=16 the keys below spread over
+// multiple shards, so these exercise the per-shard fan-out + scatter-merge and
+// the multi-shard wipe paths (a no-op difference when block_shards=1).
+// ---------------------------------------------------------------------
+
+TEST_P(RedisStoreTest, CrossShardBatchPreservesOrderAndMapping) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+
+  constexpr int kKeys = 20;
+  std::vector<KvEvent> events;
+  events.reserve(kKeys);
+  for (int i = 0; i < kKeys; ++i) {
+    // size encodes identity (100 + i) so the merge can be verified per key.
+    events.push_back({KvEvent::Kind::ADD, "key-" + std::to_string(i), TierType::DRAM,
+                      static_cast<uint64_t>(100 + i)});
+  }
+  ASSERT_EQ(store_->ApplyHeartbeat("n1", 1, now_, {}, events, false).status,
+            HeartbeatResult::APPLIED);
+
+  // Scrambled query order, interleaved with a missing key.
+  const std::vector<std::string> query = {"key-5", "missing", "key-0", "key-19", "key-12"};
+  auto locs = store_->BatchLookupBlockForRouteGet(query, {}, now_, 10s);
+  ASSERT_EQ(locs.size(), query.size());
+  ASSERT_EQ(locs[0].size(), 1u);
+  EXPECT_EQ(locs[0][0].size, 105u);
+  EXPECT_TRUE(locs[1].empty());
+  ASSERT_EQ(locs[2].size(), 1u);
+  EXPECT_EQ(locs[2][0].size, 100u);
+  ASSERT_EQ(locs[3].size(), 1u);
+  EXPECT_EQ(locs[3][0].size, 119u);
+  ASSERT_EQ(locs[4].size(), 1u);
+  EXPECT_EQ(locs[4][0].size, 112u);
+
+  // BatchExistsBlock in the same scrambled order maps back correctly too.
+  auto exists = store_->BatchExistsBlock(query);
+  ASSERT_EQ(exists.size(), query.size());
+  EXPECT_TRUE(exists[0]);
+  EXPECT_FALSE(exists[1]);
+  EXPECT_TRUE(exists[2]);
+  EXPECT_TRUE(exists[3]);
+  EXPECT_TRUE(exists[4]);
+}
+
+TEST_P(RedisStoreTest, FullSyncAcrossShardsWipesAllOldLocations) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+
+  constexpr int kKeys = 12;
+  std::vector<KvEvent> old_events;
+  std::vector<KvEvent> new_events;
+  std::vector<std::string> old_keys;
+  std::vector<std::string> new_keys;
+  for (int i = 0; i < kKeys; ++i) {
+    old_keys.push_back("old-" + std::to_string(i));
+    new_keys.push_back("new-" + std::to_string(i));
+    old_events.push_back({KvEvent::Kind::ADD, old_keys.back(), TierType::DRAM, 1});
+    new_events.push_back({KvEvent::Kind::ADD, new_keys.back(), TierType::DRAM, 2});
+  }
+  ASSERT_EQ(store_->ApplyHeartbeat("n1", 1, now_, {}, old_events, false).status,
+            HeartbeatResult::APPLIED);
+  ASSERT_EQ(store_->ApplyHeartbeat("n1", 9, now_, {}, new_events, true).status,
+            HeartbeatResult::APPLIED);
+
+  for (bool e : store_->BatchExistsBlock(old_keys)) EXPECT_FALSE(e);
+  for (bool e : store_->BatchExistsBlock(new_keys)) EXPECT_TRUE(e);
+}
+
+TEST_P(RedisStoreTest, UnregisterWipesBlocksAcrossShards) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+
+  constexpr int kKeys = 12;
+  std::vector<KvEvent> events;
+  std::vector<std::string> keys;
+  for (int i = 0; i < kKeys; ++i) {
+    keys.push_back("u-" + std::to_string(i));
+    events.push_back({KvEvent::Kind::ADD, keys.back(), TierType::DRAM, 1});
+  }
+  ASSERT_EQ(store_->ApplyHeartbeat("n1", 1, now_, {}, events, false).status,
+            HeartbeatResult::APPLIED);
+  ASSERT_TRUE(store_->BatchExistsBlock({keys.front()})[0]);
+
+  store_->UnregisterClient("n1");
+  for (bool e : store_->BatchExistsBlock(keys)) EXPECT_FALSE(e);
 }
 
 }  // namespace

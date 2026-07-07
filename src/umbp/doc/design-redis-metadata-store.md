@@ -163,22 +163,51 @@ replication-safe regardless of the store's replication mode.
 
 ## 4. KeySchema
 
-All keys share the deployment hash tag `H = {umbp:<namespace>}` where
-`<namespace>` comes from `UMBP_REDIS_NAMESPACE` (default `default`). The braces
-are the Redis-cluster hash-tag delimiter, so every key below hashes to the same
-slot.
+Two hash-tag families, split so block lookups can scale past one slot:
+
+- **Control tag** `H = {umbp:<namespace>}` (`<namespace>` from
+  `UMBP_REDIS_NAMESPACE`, default `default`): client records, ALIVE set, peer
+  projection, and the per-node reverse indexes all co-locate here so one Lua
+  script mutates them atomically.
+- **Block-shard tags** `Bs = {umbp:<namespace>:bS}` for `S in [0, N)` where
+  `N = UMBP_REDIS_BLOCK_SHARDS`: a block key is placed under the shard chosen by
+  a stable hash (FNV-1a) of the user key. Spreading blocks over `N` slots is
+  what lets `BatchLookupBlockForRouteGet` / `BatchExistsBlock` run one
+  single-slot script per shard instead of piling every lookup onto one slot /
+  one server thread. **`N == 1` collapses `Bs` back onto `H`, so the emitted key
+  strings are byte-identical to the original single-tag schema.**
 
 | Purpose | Key | Type | Fields / members |
 | --- | --- | --- | --- |
 | Client record | `H:node:<id>` | HASH | `addr`, `peer`, `status` (1=ALIVE,2=EXPIRED), `last_hb`, `reg_at`, `seq`, `caps`, `engine`, `tags` |
 | Alive membership | `H:nodes:alive` | SET | `<id>` for every ALIVE node |
 | Alive peer projection | `H:alive_peers` | HASH | `<id>` -> `peer_address` (ALIVE only) |
-| Block locations | `H:block:<key>` | HASH | `l\|<node>\|<tier>` -> `size`; meta `_lease`, `_lacc`, `_acnt`, `_created` |
-| Node -> its block keys | `H:node:<id>:blocks` | SET | `<key>` (reverse index for node-scoped wipe) |
+| Block locations | `Bs:block:<key>` | HASH | `l\|<node>\|<tier>` -> `size`; meta `_lease`, `_lacc`, `_acnt`, `_created` |
+| Node -> its block keys | `H:node:<id>:blocks` | SET | full `Bs:block:<key>` strings (reverse index for node-scoped wipe) |
 | External-KV entry | `H:extkv:<hash>` | HASH | `<node>` -> tier bitmask (bit per `TierType`) |
 | Node -> its extkv hashes | `H:extkv:node:<id>` | SET | `<hash>` (reverse index) |
 | Hit counter | `H:hit:<hash>` | HASH | `c` (count), `ls` (last_seen ms) |
 | Eviction LRU index | `H:lru:<node>:<tier>` | ZSET | member `<key>`, score `last_accessed_ms` |
+
+Sharding notes:
+
+- The per-node reverse index stays a single set on the control tag, but its
+  **members are now full (already-sharded) block-key strings**. The caller
+  (`KeySchema::Block`) composes the block key and hands it to the write scripts,
+  and the wipe scripts (full_sync / unregister / expire) drain those members and
+  `HDEL` them directly — no shard math in Lua.
+- **Atomicity when `N > 1`**: each block key is still mutated / read atomically
+  in one single-slot script, but a batch read is no longer a whole-batch
+  snapshot (it is one single-slot script per shard). This matches the in-memory
+  backend, whose block index is likewise key-hashed shards read under per-shard
+  locks; the interface only promises per-key semantics.
+- **Write scripts vs. Redis Cluster**: `apply_heartbeat` / `unregister` /
+  `expire` touch the control tag AND block keys across shards in one script,
+  which is valid on a single instance (non-cluster Redis, or Dragonfly with
+  `allow-undeclared-keys`) but would `CROSSSLOT` on Redis Cluster. Splitting
+  those writes into a control script + per-shard block scripts (with idempotent
+  replay) is the documented next step for cluster / multi-endpoint fan-out; the
+  read hot path is already single-slot per script.
 
 Notes:
 
@@ -408,6 +437,7 @@ return 1
 | `UMBP_REDIS_URI` | (none) | e.g. `tcp://127.0.0.1:6379`; comma list for cluster seeds |
 | `UMBP_REDIS_NAMESPACE` | `default` | deployment id used inside the hash tag `{umbp:<ns>}` |
 | `UMBP_REDIS_CLUSTER` | `0` | `1` to use the cluster client |
+| `UMBP_REDIS_BLOCK_SHARDS` | `1` | number of hash-tag shards the block keyspace is spread over. `1` = legacy single-tag layout (byte-identical keys, whole-batch-atomic reads). `>1` spreads block lookups across slots so the read hot path runs one single-slot script per shard — the throughput lever on a threaded store (Dragonfly) or a sharded/cluster deployment. Fixed for a deployment's lifetime (changing it with live data strands keys under their old shard tag); clamped to `[1, 4096]`; `<=0` → `1`. See §4. |
 | `UMBP_REDIS_POOL_SIZE` | (cpu-derived) | connection pool size |
 | `UMBP_REDIS_CONNECT_TIMEOUT_MS` | `1000` | connect timeout |
 | `UMBP_REDIS_SOCKET_TIMEOUT_MS` | `1000` | per-command socket timeout |

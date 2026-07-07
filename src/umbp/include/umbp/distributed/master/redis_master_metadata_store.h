@@ -57,6 +57,12 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
     int connect_timeout_ms = 1000;
     int socket_timeout_ms = 1000;
     std::size_t pool_size = 8;
+    // Number of hash-tag shards the block keyspace is spread over. 1 keeps the
+    // legacy single-tag layout (byte-identical keys, whole-batch-atomic reads).
+    // >1 spreads block lookups across slots so the read hot path runs one
+    // single-slot script per shard — the throughput win on a sharded/threaded
+    // store. See KeySchema and design-redis-metadata-store.md.
+    std::size_t block_shards = 1;
   };
 
   explicit RedisMasterMetadataStore(const Config& config);

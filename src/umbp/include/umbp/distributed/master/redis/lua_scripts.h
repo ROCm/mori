@@ -68,7 +68,10 @@ return 1
 // apply_heartbeat:
 //   KEYS[1] = node key
 //   ARGV = [tag, node_id, seq, now_ms, is_full_sync, caps_blob, n_events,
-//           then per event: kind, key, tier, size]
+//           then per event: kind, block_key, tier, size]
+//   `block_key` is the FULL (already sharded) block key composed by the caller
+//   (KeySchema::Block), so this script never has to know the shard layout. The
+//   node's reverse-index set stores these full block keys as members.
 //   Returns { status_string, acked_seq_string }
 //   status_string in { "UNKNOWN", "SEQ_GAP", "APPLIED" }.
 inline constexpr const char* kApplyHeartbeatLua = R"LUA(
@@ -112,36 +115,33 @@ local function cleanupEmpty(bk)
   if not anyLoc then redis.call('DEL', bk) end
 end
 
-local function addLoc(userkey, tier, size)
-  local bk = tag .. ':block:' .. userkey
-  if redis.call('EXISTS', bk) == 0 then
-    redis.call('HSET', bk, '_created', now, '_lacc', now, '_acnt', 0)
+local function addLoc(blockKey, tier, size)
+  if redis.call('EXISTS', blockKey) == 0 then
+    redis.call('HSET', blockKey, '_created', now, '_lacc', now, '_acnt', 0)
   end
   local field = 'l|' .. nodeId .. '|' .. tier
-  if redis.call('HEXISTS', bk, field) == 0 then
-    redis.call('HSET', bk, field, size)
-    redis.call('SADD', blocksSet, userkey)
+  if redis.call('HEXISTS', blockKey, field) == 0 then
+    redis.call('HSET', blockKey, field, size)
+    redis.call('SADD', blocksSet, blockKey)
   end
 end
 
-local function removeLoc(userkey, tier)
-  local bk = tag .. ':block:' .. userkey
+local function removeLoc(blockKey, tier)
   local field = 'l|' .. nodeId .. '|' .. tier
-  if redis.call('HDEL', bk, field) == 1 then
-    local flds = redis.call('HKEYS', bk)
+  if redis.call('HDEL', blockKey, field) == 1 then
+    local flds = redis.call('HKEYS', blockKey)
     local nodeStill = false
     for _, f in ipairs(flds) do
       if string.sub(f, 1, string.len(nodePfx)) == nodePfx then nodeStill = true break end
     end
-    if not nodeStill then redis.call('SREM', blocksSet, userkey) end
-    cleanupEmpty(bk)
+    if not nodeStill then redis.call('SREM', blocksSet, blockKey) end
+    cleanupEmpty(blockKey)
   end
 end
 
 if full == 1 then
   local members = redis.call('SMEMBERS', blocksSet)
-  for _, userkey in ipairs(members) do
-    local bk = tag .. ':block:' .. userkey
+  for _, bk in ipairs(members) do
     local flds = redis.call('HKEYS', bk)
     for _, f in ipairs(flds) do
       if string.sub(f, 1, string.len(nodePfx)) == nodePfx then
@@ -171,7 +171,9 @@ return { 'APPLIED', tostring(seq) }
 )LUA";
 
 // route_get_batch:
-//   KEYS[1..n] = block keys
+//   KEYS[1..n] = block keys (all in one shard: the caller groups a batch by
+//     shard and runs one invocation per shard via RespClient::EvalPipeline, so
+//     KEYS stays single-slot on Redis Cluster / one proactor on Dragonfly).
 //   ARGV = [now_ms, lease_ms, n_exclude, exclude_node_1..exclude_node_k]
 //   Returns an array of n elements; element i is a flat array
 //   [node, size, tier, node, size, tier, ...] of the surviving locations.
@@ -225,7 +227,8 @@ return out
 )LUA";
 
 // exists_batch:
-//   KEYS[1..n] = block keys
+//   KEYS[1..n] = block keys (single-slot per invocation, grouped by shard by
+//     the caller, same as route_get_batch).
 //   Returns an array of n integers (1 if the key has >=1 location, else 0).
 inline constexpr const char* kExistsBatchLua = R"LUA(
 local out = {}
@@ -273,8 +276,7 @@ redis.call('HDEL', tag .. ':alive_peers', nodeId)
 local blocksSet = tag .. ':node:' .. nodeId .. ':blocks'
 local nodePfx = 'l|' .. nodeId .. '|'
 local members = redis.call('SMEMBERS', blocksSet)
-for _, userkey in ipairs(members) do
-  local bk = tag .. ':block:' .. userkey
+for _, bk in ipairs(members) do
   local flds = redis.call('HKEYS', bk)
   for _, f in ipairs(flds) do
     if string.sub(f, 1, string.len(nodePfx)) == nodePfx then redis.call('HDEL', bk, f) end
@@ -311,8 +313,7 @@ for _, id in ipairs(members) do
     local blocksSet = tag .. ':node:' .. id .. ':blocks'
     local nodePfx = 'l|' .. id .. '|'
     local ms = redis.call('SMEMBERS', blocksSet)
-    for _, userkey in ipairs(ms) do
-      local bk = tag .. ':block:' .. userkey
+    for _, bk in ipairs(ms) do
       local flds = redis.call('HKEYS', bk)
       for _, f in ipairs(flds) do
         if string.sub(f, 1, string.len(nodePfx)) == nodePfx then redis.call('HDEL', bk, f) end

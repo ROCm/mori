@@ -76,7 +76,19 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
     unsigned hw = std::thread::hardware_concurrency();
     const int default_pool = static_cast<int>(std::min(32u, std::max(4u, hw ? hw * 2u : 8u)));
     cfg.pool_size = static_cast<std::size_t>(GetEnvInt("UMBP_REDIS_POOL_SIZE", default_pool));
-    MORI_UMBP_INFO("[MetadataStore] backend=redis uri={} namespace={}", cfg.uri, cfg.namespace_id);
+    // Block-keyspace shards. Default 1 = legacy single-tag layout (no change).
+    // Set >1 to spread block lookups across slots (see KeySchema); the win
+    // shows up on a threaded store (Dragonfly) or a sharded/cluster deployment.
+    constexpr int kMaxBlockShards = 4096;
+    int block_shards = GetEnvInt("UMBP_REDIS_BLOCK_SHARDS", 1);
+    if (block_shards > kMaxBlockShards) {
+      MORI_UMBP_WARN("[MetadataStore] clamping UMBP_REDIS_BLOCK_SHARDS={} to max {}", block_shards,
+                     kMaxBlockShards);
+      block_shards = kMaxBlockShards;
+    }
+    cfg.block_shards = static_cast<std::size_t>(block_shards);
+    MORI_UMBP_INFO("[MetadataStore] backend=redis uri={} namespace={} block_shards={}", cfg.uri,
+                   cfg.namespace_id, cfg.block_shards);
     return std::make_unique<RedisMasterMetadataStore>(cfg);
 #else
     throw std::runtime_error(

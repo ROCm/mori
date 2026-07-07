@@ -111,6 +111,18 @@ class RespClient {
   RespValue Eval(const std::string& script, const std::vector<std::string>& keys,
                  const std::vector<std::string>& args);
 
+  // Pipeline the SAME script over several KEYS groups in one round trip. Call i
+  // runs `script` with KEYS = keys_per_call[i] and ARGV = shared_args; the
+  // returned vector is parallel to keys_per_call. Used by the sharded read path
+  // to fan one batch out to one single-slot EVALSHA per shard.
+  //
+  // On NOSCRIPT the script is reloaded and ONLY the affected calls are retried,
+  // so a script with side effects (e.g. route_get_batch's lease/access bump) is
+  // never applied twice for a call that already ran.
+  std::vector<RespValue> EvalPipeline(const std::string& script,
+                                      const std::vector<std::vector<std::string>>& keys_per_call,
+                                      const std::vector<std::string>& shared_args);
+
   // Liveness probe (PING). Returns false if no connection can be established.
   bool Ping();
 
@@ -143,6 +155,16 @@ class RespClient {
   // Run one argv command on a specific connection; sets *broke on transport
   // failure. Returns a RespValue (Error type on server error).
   RespValue RunArgv(redisContext* ctx, const std::vector<std::string>& args, bool* broke);
+
+  // Append one EVALSHA (using `sha`) per index in `indices`, then read the
+  // replies back in order into (*replies)[idx]. Returns the subset of `indices`
+  // whose reply was a NOSCRIPT error, so the caller can reload + retry just
+  // those. Sets *broke on transport failure.
+  std::vector<std::size_t> PipelineEvalshaBatch(
+      redisContext* ctx, const std::string& sha,
+      const std::vector<std::vector<std::string>>& keys_per_call,
+      const std::vector<std::string>& shared_args, const std::vector<std::size_t>& indices,
+      std::vector<RespValue>* replies, bool* broke);
 
   // SHA for `script`, loaded + cached on first use (deterministic across
   // connections, so one cache is correct).

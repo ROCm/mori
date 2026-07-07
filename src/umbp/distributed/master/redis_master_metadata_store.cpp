@@ -158,10 +158,58 @@ ClientRecord DecodeRecord(const std::string& node_id,
   return rec;
 }
 
+// A batch's block keys bucketed by shard, plus the mapping to scatter each
+// shard's reply back to the caller's original key order. Only shards the batch
+// actually touches get a group, so a single-shard batch is one group.
+struct ShardedBatch {
+  std::vector<std::vector<std::string>> keys_by_shard;   // group -> block keys
+  std::vector<std::vector<size_t>> orig_index_by_shard;  // group -> caller indices
+};
+
+// Bucket `user_keys` by shard, composing the full block key for each and
+// remembering each key's original position for the scatter step.
+ShardedBatch GroupKeysByShard(const redis::KeySchema& schema,
+                              const std::vector<std::string>& user_keys) {
+  ShardedBatch batch;
+  // shard index -> group slot, lazily assigned so we only build touched shards.
+  std::vector<int> group_of_shard(schema.NumShards(), -1);
+  for (size_t i = 0; i < user_keys.size(); ++i) {
+    const size_t shard = schema.ShardOf(user_keys[i]);
+    int& group = group_of_shard[shard];
+    if (group < 0) {
+      group = static_cast<int>(batch.keys_by_shard.size());
+      batch.keys_by_shard.emplace_back();
+      batch.orig_index_by_shard.emplace_back();
+    }
+    batch.keys_by_shard[group].push_back(schema.Block(user_keys[i]));
+    batch.orig_index_by_shard[group].push_back(i);
+  }
+  return batch;
+}
+
+// Walk every shard reply (parallel to batch.keys_by_shard) and invoke
+// on_key(original_index, reply_element_for_that_key). Throws if any shard's
+// script returned an error.
+template <typename Fn>
+void ForEachShardReply(const ShardedBatch& batch, const std::vector<RespValue>& replies,
+                       const char* method, Fn&& on_key) {
+  for (size_t group = 0; group < batch.keys_by_shard.size() && group < replies.size(); ++group) {
+    const RespValue& reply = replies[group];
+    if (reply.is_error()) {
+      throw std::runtime_error(std::string("[RedisStore] ") + method + ": " + reply.str);
+    }
+    if (!reply.is_array()) continue;
+    const auto& orig_indices = batch.orig_index_by_shard[group];
+    for (size_t j = 0; j < orig_indices.size() && j < reply.elements.size(); ++j) {
+      on_key(orig_indices[j], reply.elements[j]);
+    }
+  }
+}
+
 }  // namespace
 
 RedisMasterMetadataStore::RedisMasterMetadataStore(const Config& config)
-    : keys_(config.namespace_id) {
+    : keys_(config.namespace_id, config.block_shards) {
   redis::RespClient::Options opts;
   opts.uri = config.uri;
   opts.password = config.password;
@@ -169,8 +217,8 @@ RedisMasterMetadataStore::RedisMasterMetadataStore(const Config& config)
   opts.socket_timeout_ms = config.socket_timeout_ms;
   opts.pool_size = config.pool_size;
   client_ = std::make_unique<redis::RespClient>(std::move(opts));
-  MORI_UMBP_INFO("[RedisStore] backend at {} namespace={} pool={}", config.uri, config.namespace_id,
-                 config.pool_size);
+  MORI_UMBP_INFO("[RedisStore] backend at {} namespace={} pool={} block_shards={}", config.uri,
+                 config.namespace_id, config.pool_size, keys_.NumShards());
 }
 
 // =====================================================================
@@ -212,7 +260,9 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
   args.push_back(std::to_string(events.size()));
   for (const auto& ev : events) {
     args.push_back(ev.kind == KvEvent::Kind::ADD ? "0" : "1");
-    args.push_back(ev.key);
+    // Pass the fully composed (sharded) block key so the Lua script never has
+    // to know the shard layout; it also becomes the reverse-index member.
+    args.push_back(keys_.Block(ev.key));
     args.push_back(std::to_string(static_cast<int>(ev.tier)));
     args.push_back(std::to_string(ev.size));
   }
@@ -321,10 +371,6 @@ std::vector<std::vector<Location>> RedisMasterMetadataStore::BatchLookupBlockFor
   std::vector<std::vector<Location>> out(keys.size());
   if (keys.empty()) return out;
 
-  std::vector<std::string> block_keys;
-  block_keys.reserve(keys.size());
-  for (const auto& k : keys) block_keys.push_back(keys_.Block(k));
-
   std::vector<std::string> args;
   args.reserve(3 + exclude_nodes.size());
   args.push_back(std::to_string(ToEpochMs(now)));
@@ -332,25 +378,27 @@ std::vector<std::vector<Location>> RedisMasterMetadataStore::BatchLookupBlockFor
   args.push_back(std::to_string(exclude_nodes.size()));
   for (const auto& n : exclude_nodes) args.push_back(n);
 
-  RespValue r = client_->Eval(redis::kRouteGetBatchLua, block_keys, args);
-  if (r.is_error()) throw std::runtime_error("[RedisStore] BatchLookupBlockForRouteGet: " + r.str);
-  if (!r.is_array()) return out;
+  // Fan out one single-slot route_get_batch per shard, in one pipeline; each
+  // shard's reply is a per-key array of flat [node, size, tier, ...] triplets.
+  const ShardedBatch batch = GroupKeysByShard(keys_, keys);
+  const std::vector<RespValue> replies =
+      client_->EvalPipeline(redis::kRouteGetBatchLua, batch.keys_by_shard, args);
 
-  for (size_t i = 0; i < keys.size() && i < r.elements.size(); ++i) {
-    const RespValue& locs = r.elements[i];
-    if (!locs.is_array()) continue;
-    for (size_t j = 0; j + 3 <= locs.elements.size(); j += 3) {
-      Location loc;
-      loc.node_id = locs.elements[j].str;
-      try {
-        loc.size = std::stoull(locs.elements[j + 1].str);
-        loc.tier = static_cast<TierType>(std::stoi(locs.elements[j + 2].str));
-      } catch (...) {
-        continue;
-      }
-      out[i].push_back(std::move(loc));
-    }
-  }
+  ForEachShardReply(batch, replies, "BatchLookupBlockForRouteGet",
+                    [&](size_t orig_index, const RespValue& locs) {
+                      if (!locs.is_array()) return;
+                      for (size_t j = 0; j + 3 <= locs.elements.size(); j += 3) {
+                        Location loc;
+                        loc.node_id = locs.elements[j].str;
+                        try {
+                          loc.size = std::stoull(locs.elements[j + 1].str);
+                          loc.tier = static_cast<TierType>(std::stoi(locs.elements[j + 2].str));
+                        } catch (...) {
+                          continue;
+                        }
+                        out[orig_index].push_back(std::move(loc));
+                      }
+                    });
   return out;
 }
 
@@ -359,16 +407,13 @@ std::vector<bool> RedisMasterMetadataStore::BatchExistsBlock(
   std::vector<bool> results(keys.size(), false);
   if (keys.empty()) return results;
 
-  std::vector<std::string> block_keys;
-  block_keys.reserve(keys.size());
-  for (const auto& k : keys) block_keys.push_back(keys_.Block(k));
+  const ShardedBatch batch = GroupKeysByShard(keys_, keys);
+  const std::vector<RespValue> replies =
+      client_->EvalPipeline(redis::kExistsBatchLua, batch.keys_by_shard, {});
 
-  RespValue r = client_->Eval(redis::kExistsBatchLua, block_keys, {});
-  if (r.is_error()) throw std::runtime_error("[RedisStore] BatchExistsBlock: " + r.str);
-  if (!r.is_array()) return results;
-  for (size_t i = 0; i < results.size() && i < r.elements.size(); ++i) {
-    results[i] = r.elements[i].integer != 0;
-  }
+  ForEachShardReply(
+      batch, replies, "BatchExistsBlock",
+      [&](size_t orig_index, const RespValue& has) { results[orig_index] = has.integer != 0; });
   return results;
 }
 

@@ -304,6 +304,89 @@ RespValue RespClient::Eval(const std::string& script, const std::vector<std::str
   }
 }
 
+std::vector<std::size_t> RespClient::PipelineEvalshaBatch(
+    redisContext* ctx, const std::string& sha,
+    const std::vector<std::vector<std::string>>& keys_per_call,
+    const std::vector<std::string>& shared_args, const std::vector<std::size_t>& indices,
+    std::vector<RespValue>* replies, bool* broke) {
+  // Queue one EVALSHA <sha> <nkeys> <keys...> <shared_args...> per index.
+  for (const std::size_t idx : indices) {
+    const auto& keys = keys_per_call[idx];
+    std::vector<std::string> cmd;
+    cmd.reserve(3 + keys.size() + shared_args.size());
+    cmd.push_back("EVALSHA");
+    cmd.push_back(sha);
+    cmd.push_back(std::to_string(keys.size()));
+    for (const auto& k : keys) cmd.push_back(k);
+    for (const auto& a : shared_args) cmd.push_back(a);
+
+    std::vector<const char*> argv;
+    std::vector<size_t> argvlen;
+    argv.reserve(cmd.size());
+    argvlen.reserve(cmd.size());
+    for (const auto& a : cmd) {
+      argv.push_back(a.data());
+      argvlen.push_back(a.size());
+    }
+    if (redisAppendCommandArgv(ctx, static_cast<int>(argv.size()), argv.data(), argvlen.data()) !=
+        REDIS_OK) {
+      *broke = true;
+      throw RespError("RespClient: EvalPipeline append failed");
+    }
+  }
+
+  // Read replies back in the same order; flag the ones the server didn't have.
+  std::vector<std::size_t> noscript;
+  for (const std::size_t idx : indices) {
+    void* r = nullptr;
+    if (redisGetReply(ctx, &r) != REDIS_OK) {
+      *broke = true;
+      const std::string err = ctx ? std::string(ctx->errstr) : std::string("null");
+      throw RespError("RespClient: EvalPipeline read failed: " + err);
+    }
+    RespValue val = Convert(r);
+    if (r) freeReplyObject(static_cast<redisReply*>(r));
+    if (val.is_error() && val.str.rfind("NOSCRIPT", 0) == 0) noscript.push_back(idx);
+    (*replies)[idx] = std::move(val);
+  }
+  return noscript;
+}
+
+std::vector<RespValue> RespClient::EvalPipeline(
+    const std::string& script, const std::vector<std::vector<std::string>>& keys_per_call,
+    const std::vector<std::string>& shared_args) {
+  std::vector<RespValue> replies(keys_per_call.size());
+  if (keys_per_call.empty()) return replies;
+
+  Lease lease = Acquire();
+  redisContext* ctx = lease.get();
+  bool broke = false;
+  try {
+    const std::string sha = GetOrLoadSha(ctx, script, &broke);
+
+    std::vector<std::size_t> all(keys_per_call.size());
+    for (std::size_t i = 0; i < all.size(); ++i) all[i] = i;
+    std::vector<std::size_t> missing =
+        PipelineEvalshaBatch(ctx, sha, keys_per_call, shared_args, all, &replies, &broke);
+
+    // NOSCRIPT => the server evicted the script from its cache. Reload once and
+    // retry ONLY the calls that missed, so calls that already executed (and, for
+    // route_get_batch, already bumped lease/access) are not run a second time.
+    if (!missing.empty()) {
+      {
+        std::lock_guard<std::mutex> lk(sha_mu_);
+        sha_cache_.erase(script);
+      }
+      const std::string sha2 = GetOrLoadSha(ctx, script, &broke);
+      PipelineEvalshaBatch(ctx, sha2, keys_per_call, shared_args, missing, &replies, &broke);
+    }
+    return replies;
+  } catch (...) {
+    if (broke) lease.MarkBroken();
+    throw;
+  }
+}
+
 bool RespClient::Ping() {
   try {
     RespValue r = Command({"PING"});
