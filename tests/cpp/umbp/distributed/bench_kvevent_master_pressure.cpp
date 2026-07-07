@@ -289,6 +289,13 @@ struct BenchOpts {
   // Put placement (injected directly into the master, NOT via env).
   std::string put_algo = "most_available";  // most_available | random
   std::string put_affinity = "local";       // none | same | local
+  // Multi-process / multi-host: if --external-master is set, do NOT spawn an
+  // in-process MasterServer; connect this process's clients to a standalone
+  // umbp_master shared by every process/host. node_id_prefix / node_address let
+  // each process advertise a globally-unique node id + its own reachable IP.
+  std::string external_master = "";      // "host:port"; empty => in-process master
+  std::string node_id_prefix = "node-";  // per-process unique prefix; client idx appended
+  std::string node_address = "127.0.0.1";
 };
 
 void Usage() {
@@ -314,6 +321,10 @@ void Usage() {
                "  --keep-master-secs F (default 0)\n"
                "  --put-algo most_available|random   (default most_available)\n"
                "  --put-affinity none|same|local     (default local)\n"
+               "  --external-master host:port  (connect to a shared standalone master;\n"
+               "                                empty => spawn an in-process master)\n"
+               "  --node-id-prefix S   (default node-; client index appended)\n"
+               "  --node-address IP    (default 127.0.0.1; this process's reachable IP)\n"
                "Heartbeat interval is env-driven (UMBP_HEARTBEAT_TTL_SEC,\n"
                "UMBP_HEARTBEAT_INTERVAL_DIVISOR); launch one process per scenario.\n");
 }
@@ -388,6 +399,12 @@ bool ParseArgs(int argc, char** argv, BenchOpts* o) {
       o->put_algo = need("--put-algo");
     } else if (a == "--put-affinity") {
       o->put_affinity = need("--put-affinity");
+    } else if (a == "--external-master") {
+      o->external_master = need("--external-master");
+    } else if (a == "--node-id-prefix") {
+      o->node_id_prefix = need("--node-id-prefix");
+    } else if (a == "--node-address") {
+      o->node_address = need("--node-address");
     } else if (a == "-h" || a == "--help") {
       Usage();
       std::exit(0);
@@ -654,25 +671,36 @@ int main(int argc, char** argv) {
   if (!ParseArgs(argc, argv, &o)) return 2;
   const size_t N = o.clients;
 
-  // ---- master (put strategy injected directly; NOT via env) ----
-  MasterServerConfig mcfg;
-  mcfg.listen_address = "0.0.0.0:0";
-  mcfg.metrics_port = o.metrics_port;
-  mcfg.registry_config = ClientRegistryConfig::FromEnvironment();
-  mcfg.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(ParseAlgo(o.put_algo),
-                                                                     ParseAffinity(o.put_affinity));
-  mcfg.route_put_algo = o.put_algo;
-  mcfg.route_put_affinity = o.put_affinity;
-  auto master = std::make_unique<MasterServer>(std::move(mcfg));
-  std::thread server_thread([&] { master->Run(); });
-  for (int i = 0; i < 500 && master->GetBoundPort() == 0; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  // ---- master: spawn in-process (default), unless --external-master points at
+  //      a standalone umbp_master shared by many processes/hosts. ----
+  std::unique_ptr<MasterServer> master;
+  std::thread server_thread;
+  std::string master_addr;
+  if (o.external_master.empty()) {
+    MasterServerConfig mcfg;
+    mcfg.listen_address = "0.0.0.0:0";
+    mcfg.metrics_port = o.metrics_port;
+    mcfg.registry_config = ClientRegistryConfig::FromEnvironment();
+    mcfg.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(
+        ParseAlgo(o.put_algo), ParseAffinity(o.put_affinity));
+    mcfg.route_put_algo = o.put_algo;
+    mcfg.route_put_affinity = o.put_affinity;
+    master = std::make_unique<MasterServer>(std::move(mcfg));
+    server_thread = std::thread([&] { master->Run(); });
+    for (int i = 0; i < 500 && master->GetBoundPort() == 0; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (master->GetBoundPort() == 0) {
+      std::fprintf(stderr, "master failed to start\n");
+      return 2;
+    }
+    master_addr = "localhost:" + std::to_string(master->GetBoundPort());
+  } else {
+    // Standalone master owns put strategy / index shards via its own env; this
+    // process only drives clients. --metrics-port should be 0 here (scrape the
+    // shared master's own endpoint externally, e.g. via parse_master_hist.py).
+    master_addr = o.external_master;
   }
-  if (master->GetBoundPort() == 0) {
-    std::fprintf(stderr, "master failed to start\n");
-    return 2;
-  }
-  const std::string master_addr = "localhost:" + std::to_string(master->GetBoundPort());
 
   // ---- buffer sizing ----
   const size_t total_rounds = o.warmup_rounds + o.rounds;
@@ -694,8 +722,8 @@ int main(int argc, char** argv) {
     if (need_dst) dst_bufs[id].assign(io_bytes, 0);
 
     PoolClientConfig cfg;
-    cfg.master_config.node_id = "node-" + std::to_string(id);
-    cfg.master_config.node_address = "127.0.0.1";
+    cfg.master_config.node_id = o.node_id_prefix + std::to_string(id);
+    cfg.master_config.node_address = o.node_address;
     cfg.master_config.master_address = master_addr;
     cfg.io_engine.host = "0.0.0.0";
     cfg.io_engine.port = 0;
@@ -815,7 +843,7 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(
         std::chrono::milliseconds(static_cast<int64_t>(o.keep_master_secs * 1000.0)));
   }
-  master->Shutdown();
+  if (master) master->Shutdown();
   if (server_thread.joinable()) server_thread.join();
   return 0;
 }
