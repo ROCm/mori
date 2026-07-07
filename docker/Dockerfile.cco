@@ -18,7 +18,7 @@ RUN apt-get update && \
     cmake && \
     rm -rf /var/lib/apt/lists/*
 
-# ── Patch ROCm CLR for SWDEV-568260 (hipMemSetAccess sub-buffer validation bug) ──
+# ── Install patched ROCm CLR + ROCR via amdrocm7.13 package ──
 #
 # Bug: `hipMemSetAccess` validates sub-buffer coverage by iterating from
 # parent's sub-buffer 0, ignoring the ptr argument. Returns InvalidValue
