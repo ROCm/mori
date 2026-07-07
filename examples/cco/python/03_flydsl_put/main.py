@@ -174,8 +174,10 @@ def main() -> int:
 
     errors = 0
     with Communicator.init(nranks, rank, uid, per_rank_vmm=PER_RANK_VMM) as comm:
-        send_win = comm.alloc_window(NBYTES)
-        recv_win = comm.alloc_window(NBYTES)
+        send_mem = comm.alloc_mem(NBYTES)
+        send_win = comm.register_window(send_mem.ptr, send_mem.size)
+        recv_mem = comm.alloc_mem(NBYTES)
+        recv_win = comm.register_window(recv_mem.ptr, recv_mem.size)
 
         zero(recv_win.local_ptr, NBYTES)
         if rank == 0:

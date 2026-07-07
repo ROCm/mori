@@ -101,7 +101,8 @@ def main() -> int:
 
     errors = 0
     with Communicator.init(nranks, rank, uid, per_rank_vmm=PER_RANK_VMM) as comm:
-        win = comm.alloc_window(NBYTES)
+        mem = comm.alloc_mem(NBYTES)
+        win = comm.register_window(mem.ptr, mem.size)
         zero(win.local_ptr, NBYTES)
         if rank == 0:
             fill(win.local_ptr, range(1, NUM_ELEMS + 1))

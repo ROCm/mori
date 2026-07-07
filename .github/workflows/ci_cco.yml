@@ -65,6 +65,19 @@ jobs:
         run: |
           $CT exec $CONTAINER bash $GITHUB_WORKSPACE/tools/run_cco_tests.sh $GITHUB_WORKSPACE/build 4 2>&1
 
+      - name: Run CCO C++ examples (2 ranks)
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_lsa_put && \
+            mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_gda_put"
+
+      - name: Run CCO Python examples (2 ranks)
+        run: |
+          $CT exec $CONTAINER bash -c "pip install mpi4py && \
+            cd $GITHUB_WORKSPACE/examples/cco/python && \
+            mpirun --allow-run-as-root -np 2 python 01_barrier/main.py && \
+            mpirun --allow-run-as-root -np 2 python 02_lsa_put/main.py"
+
       - name: Cleanup
         if: always()
         run: |
