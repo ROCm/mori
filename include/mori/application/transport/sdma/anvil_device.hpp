@@ -92,6 +92,55 @@ __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* sign
   return CreateAtomicAddPacket(signal, 0x1);
 }
 
+// --- In-place dword writers -------------------------------------------------
+// These write a packet's dwords straight to `dw` (which may live in LDS or the
+// HBM ring) via the DW_x_DATA union members: plain 32-bit stores, no bitfield
+// read-modify-write and no register-resident packet struct. ALL dwords of the
+// packet are written (unused ones as literal 0) so no stale slot data survives.
+//
+// NOTE: these are intentionally standalone -- do NOT reimplement the by-value
+// Create*Packet() above as wrappers over these. Doing so would take the address
+// of the returned local and route it through a generic uint32_t*, which can push
+// the optimizer to demote the struct from VGPRs to scratch for existing callers.
+// The header/count dword values are derived here directly to keep them in sync
+// with the Create* builders (SDMA_PKT_COPY_LINEAR = 7 dwords, SDMA_PKT_ATOMIC =
+// 8 dwords).
+
+// Emit SDMA_PKT_COPY_LINEAR into dw[0..6].
+__device__ __forceinline__ void WriteCopyPacket(uint32_t* dw, void* srcBuf, void* dstBuf,
+                                                long long int packetSize) {
+  // Header depends only on constants; a scalar-replaceable local keeps the
+  // bitfield layout authoritative and constant-folds (no address taken).
+  decltype(SDMA_PKT_COPY_LINEAR::HEADER_UNION) hdr;
+  hdr.DW_0_DATA = 0;
+  hdr.op = SDMA_OP_COPY;
+  hdr.sub_op = SDMA_SUBOP_COPY_LINEAR;
+  dw[0] = hdr.DW_0_DATA;
+  dw[1] = static_cast<uint32_t>(packetSize - 1);  // COUNT_UNION.count (reserved bits 0)
+  dw[2] = 0;                                       // PARAMETER_UNION (unused)
+  dw[3] = (uint32_t)(uintptr_t)srcBuf;
+  dw[4] = (uint32_t)((uintptr_t)srcBuf >> 32);
+  dw[5] = (uint32_t)(uintptr_t)dstBuf;
+  dw[6] = (uint32_t)((uintptr_t)dstBuf >> 32);
+}
+
+// Emit SDMA_PKT_ATOMIC (ADD64) into dw[0..7].
+__device__ __forceinline__ void WriteAtomicAddPacket(uint32_t* dw, HSAuint64* signal,
+                                                     uint64_t val) {
+  decltype(SDMA_PKT_ATOMIC::HEADER_UNION) hdr;
+  hdr.DW_0_DATA = 0;
+  hdr.op = SDMA_OP_ATOMIC;
+  hdr.operation = SDMA_ATOMIC_ADD64;
+  dw[0] = hdr.DW_0_DATA;
+  dw[1] = (uint32_t)((uintptr_t)signal);
+  dw[2] = (uint32_t)((uintptr_t)signal >> 32);
+  dw[3] = (uint32_t)val;
+  dw[4] = (uint32_t)(val >> 32);
+  dw[5] = 0;  // CMP_DATA_LO (unused for ADD)
+  dw[6] = 0;  // CMP_DATA_HI (unused for ADD)
+  dw[7] = 0;  // LOOP/interval (unused)
+}
+
 __device__ __forceinline__ SDMA_PKT_FENCE CreateFencePacket(HSAuint64* address, uint32_t data = 1) {
   SDMA_PKT_FENCE packet = {};
 

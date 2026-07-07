@@ -14,18 +14,14 @@ pushd build
 
 if [[ ${full} -eq 1 ]]; then
 
-#  apt-get install -y \
-#     git \
-#    ibverbs-utils libpci-dev \
-#     libdw1 \
-#     cython3 
+#  apt-get install -y git ibverbs-utils libpci-dev libdw1 cython3 
 
 # NOTE this would screw up hipcc installation!!!
 # better install MPI manually
 #    apt-get install -y openmpi-bin libopenmpi-dev pybind11-dev
 
   rm -rf *
-  DBG=1
+  DBG=0
   if [[ ${DBG} -eq 1 ]]; then
     CMAKE_BUILD_TYPE=RelWithDebInfo
     CMAKE_HIP_FLAGS="-gline-tables-only"
@@ -42,7 +38,7 @@ if [[ ${full} -eq 1 ]]; then
       -DENABLE_DEBUG_PRINTF=OFF -DENABLE_STANDARD_MOE_ADAPT=OFF -DBUILD_OPS_DEVICE=OFF \
       -DBUILD_XLA_FFI_OPS=OFF -DWITH_MPI=ON -DMORI_MULTITHREAD_SUPPORT=ON \
       -DBUILD_TORCH_BOOTSTRAP=OFF \
-      -DGPU_TARGETS=gfx950 ..  
+      -DGPU_TARGETS=gfx942 ..  
 fi
 
 

@@ -349,14 +349,16 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
         uint8_t* d =
             reinterpret_cast<uint8_t*>(heapObj->peerPtrs[peer] + off) + slice * sliceBytes;
         size_t sz = (slice == S - 1) ? lastBytes : sliceBytes;
-        SDMA_PKT_COPY_WITH_ATOMIC packet = {
-            .copy = anvil::CreateCopyPacket(const_cast<uint8_t*>(s), d, sz),
-            .atomic = anvil::CreateAtomicAddPacket(heapObj->peerSignalPtrs[peer] + slice,
-                                                   (1ull << myPe))};
-        const uint32_t* pp = reinterpret_cast<const uint32_t*>(&packet);
-        const int slotBase = lane * kRSPushSlotDwords;  // slot == peer*S + slice == lane
-#pragma unroll
-        for (int k = 0; k < kRSPushPktDwords; k++) pktBuf[slotBase + k] = pp[k];
+        // Build the fused copy+atomic packet DIRECTLY into the LDS slot (dword
+        // stores via the DW_x unions), skipping the register-resident struct and
+        // the reg->LDS copy. Layout: copy = dwords 0..6, atomic = dwords 7..14,
+        // trailing single-dword NOP = dword 15. Per-field cross-lane stride stays
+        // kRSPushSlotDwords (17, coprime to 32 banks) so the build is conflict-free.
+        uint32_t* dw = &pktBuf[lane * kRSPushSlotDwords];  // slot == peer*S + slice == lane
+        anvil::WriteCopyPacket(dw, const_cast<uint8_t*>(s), d, sz);
+        anvil::WriteAtomicAddPacket(dw + 7, heapObj->peerSignalPtrs[peer] + slice,
+                                    (1ull << myPe));
+        dw[15] = 0;  // trailing single-dword SDMA NOP (must be 0)
       }
       __syncthreads();
 
