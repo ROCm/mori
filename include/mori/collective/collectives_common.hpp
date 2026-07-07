@@ -33,7 +33,9 @@
 // warp-cooperative fused copy+atomic SDMA put used by the push collectives.
 // ---------------------------------------------------------------------------
 
-#define USE_FLAT_MEMORY 1
+#define USE_FLAT_MEMORY 0
+#define USE_NONTEMPORAL_LOAD 0
+
 #if USE_FLAT_MEMORY
 #define MEM_SPACE __attribute__((address_space(0)))
 #else
@@ -78,7 +80,7 @@ __device__ __forceinline__ TVecType<Bytes> StreamLoad(const void* p, bool system
   static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
                 "StreamLoad supports 1/2/4/8/16 byte accesses");
   auto ptr = reinterpret_cast<const TVecType<Bytes>*>(p); 
-#if 1
+#if USE_NONTEMPORAL_LOAD
   return __builtin_nontemporal_load(MemSpace(ptr));
 #else
   if constexpr (Bytes == 16) {
@@ -99,7 +101,7 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v, bool sys
   static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
                 "StreamStore supports 1/2/4/8/16 byte accesses");
   auto ptr = reinterpret_cast<TVecType<Bytes>*>(p);
-#if 1
+#if USE_NONTEMPORAL_LOAD
   __builtin_nontemporal_store(v, MemSpace(ptr));
 #else
   if constexpr (Bytes == 16) {
