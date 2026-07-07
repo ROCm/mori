@@ -75,4 +75,38 @@ RUN set -ex && \
         cd / && rm -rf /tmp/clr /tmp/hip; \
     fi
 
+# ── Build ROCR runtime (libhsa-runtime64.so) from release tag ──
+#
+# Build rocr-runtime from the matching rocm-X.Y.Z release tag.
+# The release tag already includes the MappedHandle DRM FD fix
+# (ROCm/rocm-systems#4363), so no extra patch is needed.
+#
+# Only applies to ROCm >= 7.0 (matching the CLR patch above).
+RUN set -ex && \
+    ROCM_VER=$(cat /opt/rocm/.info/version 2>/dev/null | head -c 5) && \
+    test -n "${ROCM_VER}" || { echo "ERROR: cannot read /opt/rocm/.info/version"; exit 1; } && \
+    ROCM_MAJOR=$(echo "${ROCM_VER}" | cut -d. -f1) && \
+    if [ "${ROCM_MAJOR}" -lt 7 ]; then \
+        echo "Skipping libhsa-runtime64 patch: ROCm ${ROCM_VER} (< 7.0)"; \
+    else \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            libelf-dev xxd pkg-config rocm-llvm-dev && \
+        rm -rf /var/lib/apt/lists/* && \
+        LIBHSA_TARGET=$(basename $(readlink -f /opt/rocm/lib/libhsa-runtime64.so.1)) && \
+        echo "Building libhsa-runtime64.so from rocm-${ROCM_VER} tag, target=${LIBHSA_TARGET}" && \
+        git clone --depth 1 --branch rocm-${ROCM_VER} --quiet \
+            https://github.com/ROCm/rocm-systems.git /tmp/rocm-systems && \
+        mkdir /tmp/rocm-systems/projects/rocr-runtime/build && \
+        cd /tmp/rocm-systems/projects/rocr-runtime/build && \
+        cmake -DCMAKE_PREFIX_PATH=/opt/rocm \
+              -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+              -DBUILD_SHARED_LIBS=ON .. && \
+        make -j$(nproc) hsa-runtime64 && \
+        BUILT_LIB=$(find . -name 'libhsa-runtime64.so.1.*' -type f | head -1) && \
+        test -f "${BUILT_LIB}" || { echo "ERROR: built libhsa-runtime64 not found"; exit 1; } && \
+        cp "${BUILT_LIB}" /opt/rocm/lib/${LIBHSA_TARGET} && \
+        cd / && rm -rf /tmp/rocm-systems; \
+    fi
+
 RUN pip install --no-cache-dir flydsl
