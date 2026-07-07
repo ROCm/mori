@@ -59,7 +59,7 @@ jobs:
       - name: Build mori with tests
         run: |
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON MORI_WITH_MPI=ON pip install ."
+            "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON MORI_WITH_MPI=ON pip install ."
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         run: |
