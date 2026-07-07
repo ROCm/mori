@@ -106,9 +106,18 @@ class KeySchema {
   // SET: the block keys a node owns (reverse index for node-scoped wipe). Kept
   // on the control tag as one set per node; its members are full (already
   // sharded) block-key strings, so the wipe scripts can HDEL them directly
-  // without recomputing the shard in Lua.
+  // without recomputing the shard in Lua. Used by the single-endpoint path.
   std::string NodeBlocks(const std::string& node_id) const {
     return control_tag_ + ":node:" + node_id + ":blocks";
+  }
+
+  // SET: the block keys a node owns within one shard, placed under that shard's
+  // tag so it co-locates (same slot) with the shard's block keys. The
+  // multi-endpoint path keeps one reverse index per (node, shard) on the shard's
+  // own instance, so each per-shard wipe/full-sync script is single-slot and
+  // touches only its own instance. Members are full block-key strings.
+  std::string NodeBlocks(const std::string& node_id, std::size_t shard) const {
+    return ShardTag(shard) + ":node:" + node_id + ":blocks";
   }
 
   // SET: the external-kv hashes a node registered (reverse index).

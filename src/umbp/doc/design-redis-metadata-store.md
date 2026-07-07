@@ -209,6 +209,39 @@ Sharding notes:
   replay) is the documented next step for cluster / multi-endpoint fan-out; the
   read hot path is already single-slot per script.
 
+### 4.1 Multi-endpoint mode (horizontal scaling)
+
+A single Redis instance is single-threaded, so splitting block lookups into more
+scripts on ONE instance does not raise throughput (it lowers per-script cost but
+runs more scripts on the same thread — measured flat/slightly-worse). The only
+way past that ceiling is to put block shards on **different Redis instances**.
+
+`UMBP_REDIS_SHARD_URIS` gives one instance per block shard (shard count = number
+of URIs). `clients_[0]` (the first URI) is the **control instance**: it holds
+all control-plane keys (`node:`, `nodes:alive`, `alive_peers`, `extkv:`) plus
+block shard 0. Block shard `s` lives on `clients_[s]` under tag `{umbp:<ns>:bs}`,
+with its own per-node reverse index `{umbp:<ns>:bs}:node:<id>:blocks` co-located
+on that instance.
+
+Because no Lua script can span instances, the cross-store writes are split:
+
+| Method | Control instance step | Per-shard-instance step |
+| --- | --- | --- |
+| `ApplyHeartbeat` | `apply_heartbeat_control` (seq-CAS + record + alive/peers) | `apply_block_events` on each shard with events (full_sync clears every shard) |
+| `UnregisterClient` | `unregister_control` (record + alive + peers + extkv) | `wipe_node_blocks` on every shard |
+| `ExpireStaleClients` | `expire_control` (flip status, return dead ids) | `wipe_node_blocks` per dead node per shard |
+
+The control step runs first, then the block steps. Block ADD/REMOVE, full_sync
+clear+replay, and node-wipe are all **idempotent**, so a failed/retried block
+step is safe; a partial failure surfaces as an exception, the peer retries, the
+next heartbeat seq-gaps, and `full_sync` heals the node's locations wholesale.
+This is the same "atomic per key/shard, not globally atomic" posture the
+in-memory backend already documents. Reads (`BatchLookupBlockForRouteGet`,
+`BatchExistsBlock`) group keys by shard and issue one `EvalPipeline` per instance
+(sequential today; throughput still scales because the master serves many
+RouteGets concurrently). Single-endpoint mode (no `UMBP_REDIS_SHARD_URIS`) keeps
+the original single atomic scripts unchanged.
+
 Notes:
 
 - **Timestamps** are `system_clock` epoch milliseconds (int64), never
@@ -437,7 +470,8 @@ return 1
 | `UMBP_REDIS_URI` | (none) | e.g. `tcp://127.0.0.1:6379`; comma list for cluster seeds |
 | `UMBP_REDIS_NAMESPACE` | `default` | deployment id used inside the hash tag `{umbp:<ns>}` |
 | `UMBP_REDIS_CLUSTER` | `0` | `1` to use the cluster client |
-| `UMBP_REDIS_BLOCK_SHARDS` | `1` | number of hash-tag shards the block keyspace is spread over. `1` = legacy single-tag layout (byte-identical keys, whole-batch-atomic reads). `>1` spreads block lookups across slots so the read hot path runs one single-slot script per shard — the throughput lever on a threaded store (Dragonfly) or a sharded/cluster deployment. Fixed for a deployment's lifetime (changing it with live data strands keys under their old shard tag); clamped to `[1, 4096]`; `<=0` → `1`. See §4. |
+| `UMBP_REDIS_SHARD_URIS` | (none) | comma-separated Redis URIs for **multi-endpoint** mode: one instance per block shard, so their scripts run on independent server processes/threads. This is the way past a single instance's single-thread ceiling — measured ~2.9x RouteGet throughput at 4 instances on a dedicated host (`M1 t16 ~5.2k -> M4 t16 ~15k ops/s`), with M1 flat at the single-slot ceiling. When set (>1 URI) it supersedes `UMBP_REDIS_BLOCK_SHARDS`. The first URI is the control instance. See §4.1. |
+| `UMBP_REDIS_BLOCK_SHARDS` | `1` | single-endpoint only: number of hash-tag shards the block keyspace is spread over. `1` = legacy single-tag layout (byte-identical keys, whole-batch-atomic reads). `>1` spreads block lookups across slots (helps a threaded store / cluster, no gain on one single-threaded Redis). Fixed for a deployment's lifetime; clamped to `[1, 4096]`; `<=0` → `1`. See §4. |
 | `UMBP_REDIS_POOL_SIZE` | (cpu-derived) | connection pool size |
 | `UMBP_REDIS_CONNECT_TIMEOUT_MS` | `1000` | connect timeout |
 | `UMBP_REDIS_SOCKET_TIMEOUT_MS` | `1000` | per-command socket timeout |

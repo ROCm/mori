@@ -164,6 +164,7 @@ ClientRecord DecodeRecord(const std::string& node_id,
 struct ShardedBatch {
   std::vector<std::vector<std::string>> keys_by_shard;   // group -> block keys
   std::vector<std::vector<size_t>> orig_index_by_shard;  // group -> caller indices
+  std::vector<std::size_t> shard_of_group;               // group -> shard index
 };
 
 // Bucket `user_keys` by shard, composing the full block key for each and
@@ -180,6 +181,7 @@ ShardedBatch GroupKeysByShard(const redis::KeySchema& schema,
       group = static_cast<int>(batch.keys_by_shard.size());
       batch.keys_by_shard.emplace_back();
       batch.orig_index_by_shard.emplace_back();
+      batch.shard_of_group.push_back(shard);
     }
     batch.keys_by_shard[group].push_back(schema.Block(user_keys[i]));
     batch.orig_index_by_shard[group].push_back(i);
@@ -187,38 +189,132 @@ ShardedBatch GroupKeysByShard(const redis::KeySchema& schema,
   return batch;
 }
 
-// Walk every shard reply (parallel to batch.keys_by_shard) and invoke
-// on_key(original_index, reply_element_for_that_key). Throws if any shard's
-// script returned an error.
-template <typename Fn>
-void ForEachShardReply(const ShardedBatch& batch, const std::vector<RespValue>& replies,
-                       const char* method, Fn&& on_key) {
-  for (size_t group = 0; group < batch.keys_by_shard.size() && group < replies.size(); ++group) {
-    const RespValue& reply = replies[group];
-    if (reply.is_error()) {
-      throw std::runtime_error(std::string("[RedisStore] ") + method + ": " + reply.str);
-    }
-    if (!reply.is_array()) continue;
-    const auto& orig_indices = batch.orig_index_by_shard[group];
-    for (size_t j = 0; j < orig_indices.size() && j < reply.elements.size(); ++j) {
-      on_key(orig_indices[j], reply.elements[j]);
+// Run `script` over a sharded batch, routing each shard-group to the client
+// returned by client_for_group(group) — one EvalPipeline per distinct client.
+// A single-endpoint deployment is one pipelined round trip; a multi-endpoint one
+// issues each instance's pipeline in turn. Throughput still scales with the
+// number of instances because the master serves many RouteGets concurrently
+// (gRPC handler threads), so all instances stay busy in parallel across
+// requests. (Per-request latency is N sequential round trips; issuing them
+// concurrently via a worker pool would cut single-request latency on high-RTT
+// remote stores — a measured follow-up: naive per-call std::async threads cost
+// more in churn than they save. See design-redis-metadata-store.md.)
+// Invokes on_key(orig_index, reply_element) for every key; throws on error.
+template <typename ClientForGroup, typename Fn>
+void RunShardedRead(const ShardedBatch& batch, const std::string& script,
+                    const std::vector<std::string>& shared_args, const char* method,
+                    ClientForGroup client_for_group, Fn&& on_key) {
+  // Bucket group indices by the client that serves them.
+  std::unordered_map<redis::RespClient*, std::vector<size_t>> groups_by_client;
+  for (size_t g = 0; g < batch.keys_by_shard.size(); ++g) {
+    groups_by_client[client_for_group(g)].push_back(g);
+  }
+
+  for (auto& [client, group_indices] : groups_by_client) {
+    std::vector<std::vector<std::string>> keys_per_call;
+    keys_per_call.reserve(group_indices.size());
+    for (size_t g : group_indices) keys_per_call.push_back(batch.keys_by_shard[g]);
+
+    std::vector<RespValue> replies = client->EvalPipeline(script, keys_per_call, shared_args);
+    for (size_t k = 0; k < group_indices.size() && k < replies.size(); ++k) {
+      const RespValue& reply = replies[k];
+      if (reply.is_error()) {
+        throw std::runtime_error(std::string("[RedisStore] ") + method + ": " + reply.str);
+      }
+      if (!reply.is_array()) continue;
+      const auto& orig_indices = batch.orig_index_by_shard[group_indices[k]];
+      for (size_t j = 0; j < orig_indices.size() && j < reply.elements.size(); ++j) {
+        on_key(orig_indices[j], reply.elements[j]);
+      }
     }
   }
 }
 
 }  // namespace
 
+std::size_t RedisMasterMetadataStore::ResolveNumShards(const Config& config) {
+  if (config.shard_uris.size() > 1) return config.shard_uris.size();  // one shard per endpoint
+  return config.block_shards == 0 ? 1 : config.block_shards;          // single-endpoint knob
+}
+
 RedisMasterMetadataStore::RedisMasterMetadataStore(const Config& config)
-    : keys_(config.namespace_id, config.block_shards) {
-  redis::RespClient::Options opts;
-  opts.uri = config.uri;
-  opts.password = config.password;
-  opts.connect_timeout_ms = config.connect_timeout_ms;
-  opts.socket_timeout_ms = config.socket_timeout_ms;
-  opts.pool_size = config.pool_size;
-  client_ = std::make_unique<redis::RespClient>(std::move(opts));
-  MORI_UMBP_INFO("[RedisStore] backend at {} namespace={} pool={} block_shards={}", config.uri,
-                 config.namespace_id, config.pool_size, keys_.NumShards());
+    : keys_(config.namespace_id, ResolveNumShards(config)) {
+  // Endpoints: the shard_uris list when given (multi-endpoint), else the single
+  // `uri`. clients_[0] is the control instance and also backs block shard 0.
+  std::vector<std::string> uris =
+      config.shard_uris.size() > 1 ? config.shard_uris : std::vector<std::string>{config.uri};
+
+  clients_.reserve(uris.size());
+  for (const auto& uri : uris) {
+    redis::RespClient::Options opts;
+    opts.uri = uri;
+    opts.password = config.password;
+    opts.connect_timeout_ms = config.connect_timeout_ms;
+    opts.socket_timeout_ms = config.socket_timeout_ms;
+    opts.pool_size = config.pool_size;
+    clients_.push_back(std::make_unique<redis::RespClient>(std::move(opts)));
+  }
+
+  if (multi_endpoint()) {
+    std::string joined;
+    for (size_t i = 0; i < uris.size(); ++i) joined += (i ? "," : "") + uris[i];
+    MORI_UMBP_INFO("[RedisStore] multi-endpoint namespace={} pool={} endpoints={} [{}]",
+                   config.namespace_id, config.pool_size, uris.size(), joined);
+  } else {
+    MORI_UMBP_INFO("[RedisStore] backend at {} namespace={} pool={} block_shards={}", config.uri,
+                   config.namespace_id, config.pool_size, keys_.NumShards());
+  }
+}
+
+// =====================================================================
+// Multi-endpoint write helpers: run per-shard block scripts on each shard's own
+// instance. Idempotent (ADD overwrites / REMOVE no-op / full_sync clear+replay)
+// so a thrown/retried step is safe; a partial failure surfaces as an exception,
+// the peer retries, seq-gaps, and heals via full_sync.
+// =====================================================================
+
+void RedisMasterMetadataStore::ApplyBlockEventsMulti(const std::string& node_id,
+                                                     const std::vector<KvEvent>& events,
+                                                     bool is_full_sync,
+                                                     std::chrono::system_clock::time_point now) {
+  const std::string node_prefix = "l|" + node_id + "|";
+  const std::string now_ms = std::to_string(ToEpochMs(now));
+
+  // Group events by their shard so each instance gets exactly its own events.
+  std::vector<std::vector<const KvEvent*>> events_by_shard(keys_.NumShards());
+  for (const auto& ev : events) events_by_shard[keys_.ShardOf(ev.key)].push_back(&ev);
+
+  // full_sync must clear the node on EVERY shard (to drop stale locations), even
+  // shards with no new ADDs; a delta only touches shards that have events.
+  for (std::size_t shard = 0; shard < keys_.NumShards(); ++shard) {
+    const auto& shard_events = events_by_shard[shard];
+    if (!is_full_sync && shard_events.empty()) continue;
+
+    std::vector<std::string> args;
+    args.reserve(5 + shard_events.size() * 4);
+    args.push_back(keys_.NodeBlocks(node_id, shard));
+    args.push_back(node_prefix);
+    args.push_back(is_full_sync ? "1" : "0");
+    args.push_back(now_ms);
+    args.push_back(std::to_string(shard_events.size()));
+    for (const KvEvent* ev : shard_events) {
+      args.push_back(ev->kind == KvEvent::Kind::ADD ? "0" : "1");
+      args.push_back(keys_.Block(ev->key));
+      args.push_back(std::to_string(static_cast<int>(ev->tier)));
+      args.push_back(std::to_string(ev->size));
+    }
+    RespValue r = client_for_shard(shard).Eval(redis::kApplyBlockEventsLua, {}, args);
+    if (r.is_error()) throw std::runtime_error("[RedisStore] ApplyBlockEvents: " + r.str);
+  }
+}
+
+void RedisMasterMetadataStore::WipeNodeBlocksMulti(const std::string& node_id) {
+  const std::string node_prefix = "l|" + node_id + "|";
+  for (std::size_t shard = 0; shard < keys_.NumShards(); ++shard) {
+    RespValue r = client_for_shard(shard).Eval(redis::kWipeNodeBlocksLua, {},
+                                               {keys_.NodeBlocks(node_id, shard), node_prefix});
+    if (r.is_error()) throw std::runtime_error("[RedisStore] WipeNodeBlocks: " + r.str);
+  }
 }
 
 // =====================================================================
@@ -230,7 +326,7 @@ bool RedisMasterMetadataStore::RegisterClient(const ClientRegistration& registra
                                               std::chrono::system_clock::duration stale_after) {
   const std::string engine(registration.engine_desc_bytes.begin(),
                            registration.engine_desc_bytes.end());
-  RespValue r = client_->Eval(
+  RespValue r = control().Eval(
       redis::kRegisterClientLua, {keys_.Node(registration.node_id)},
       {keys_.Tag(), registration.node_id, std::to_string(ToEpochMs(now)),
        std::to_string(ToMs(stale_after)), registration.node_address, registration.peer_address,
@@ -240,34 +336,55 @@ bool RedisMasterMetadataStore::RegisterClient(const ClientRegistration& registra
 }
 
 void RedisMasterMetadataStore::UnregisterClient(const std::string& node_id) {
+  if (!multi_endpoint()) {
+    RespValue r =
+        control().Eval(redis::kUnregisterClientLua, {keys_.Node(node_id)}, {keys_.Tag(), node_id});
+    if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterClient: " + r.str);
+    return;
+  }
+  // Multi-endpoint: control record first (so the router stops routing to it),
+  // then wipe its block locations on every shard's instance. A lingering
+  // location for the now-gone node is filtered out by GetAlivePeerView, and the
+  // wipe is idempotent, so a mid-way failure + retry is safe.
   RespValue r =
-      client_->Eval(redis::kUnregisterClientLua, {keys_.Node(node_id)}, {keys_.Tag(), node_id});
-  if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterClient: " + r.str);
+      control().Eval(redis::kUnregisterControlLua, {keys_.Node(node_id)}, {keys_.Tag(), node_id});
+  if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterClient(control): " + r.str);
+  WipeNodeBlocksMulti(node_id);
 }
 
 HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
     const std::string& node_id, uint64_t seq, std::chrono::system_clock::time_point now,
     const std::map<TierType, TierCapacity>& caps, const std::vector<KvEvent>& events,
     bool is_full_sync) {
-  std::vector<std::string> args;
-  args.reserve(7 + events.size() * 4);
-  args.push_back(keys_.Tag());
-  args.push_back(node_id);
-  args.push_back(std::to_string(seq));
-  args.push_back(std::to_string(ToEpochMs(now)));
-  args.push_back(is_full_sync ? "1" : "0");
-  args.push_back(EncodeCaps(caps));
-  args.push_back(std::to_string(events.size()));
-  for (const auto& ev : events) {
-    args.push_back(ev.kind == KvEvent::Kind::ADD ? "0" : "1");
-    // Pass the fully composed (sharded) block key so the Lua script never has
-    // to know the shard layout; it also becomes the reverse-index member.
-    args.push_back(keys_.Block(ev.key));
-    args.push_back(std::to_string(static_cast<int>(ev.tier)));
-    args.push_back(std::to_string(ev.size));
+  RespValue r;
+  if (!multi_endpoint()) {
+    // Single instance: one atomic script does seq-CAS + record + blocks.
+    std::vector<std::string> args;
+    args.reserve(7 + events.size() * 4);
+    args.push_back(keys_.Tag());
+    args.push_back(node_id);
+    args.push_back(std::to_string(seq));
+    args.push_back(std::to_string(ToEpochMs(now)));
+    args.push_back(is_full_sync ? "1" : "0");
+    args.push_back(EncodeCaps(caps));
+    args.push_back(std::to_string(events.size()));
+    for (const auto& ev : events) {
+      args.push_back(ev.kind == KvEvent::Kind::ADD ? "0" : "1");
+      // Pass the fully composed (sharded) block key so the Lua script never has
+      // to know the shard layout; it also becomes the reverse-index member.
+      args.push_back(keys_.Block(ev.key));
+      args.push_back(std::to_string(static_cast<int>(ev.tier)));
+      args.push_back(std::to_string(ev.size));
+    }
+    r = control().Eval(redis::kApplyHeartbeatLua, {keys_.Node(node_id)}, args);
+  } else {
+    // Multi-endpoint: control step (seq-CAS + record + alive/peers) only; block
+    // events are applied per shard afterwards if this heartbeat is APPLIED.
+    r = control().Eval(redis::kApplyHeartbeatControlLua, {keys_.Node(node_id)},
+                       {keys_.Tag(), node_id, std::to_string(seq), std::to_string(ToEpochMs(now)),
+                        is_full_sync ? "1" : "0", EncodeCaps(caps)});
   }
 
-  RespValue r = client_->Eval(redis::kApplyHeartbeatLua, {keys_.Node(node_id)}, args);
   if (r.is_error()) throw std::runtime_error("[RedisStore] ApplyHeartbeat: " + r.str);
   if (!r.is_array() || r.elements.size() < 2) {
     throw std::runtime_error("[RedisStore] ApplyHeartbeat: malformed reply");
@@ -280,18 +397,30 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
   }
   if (status == "UNKNOWN") return HeartbeatResult{HeartbeatResult::UNKNOWN, 0};
   if (status == "SEQ_GAP") return HeartbeatResult{HeartbeatResult::SEQ_GAP, acked};
+
+  // APPLIED. In multi-endpoint mode the control record has advanced; now apply
+  // the block events on each shard's instance (idempotent; a failure throws so
+  // the peer retries, seq-gaps, and heals via full_sync).
+  if (multi_endpoint()) {
+    ApplyBlockEventsMulti(node_id, events, is_full_sync, now);
+  }
   return HeartbeatResult{HeartbeatResult::APPLIED, acked};
 }
 
 std::vector<std::string> RedisMasterMetadataStore::ExpireStaleClients(
     std::chrono::system_clock::time_point cutoff) {
-  RespValue r =
-      client_->Eval(redis::kExpireStaleLua, {}, {keys_.Tag(), std::to_string(ToEpochMs(cutoff))});
+  const char* script = multi_endpoint() ? redis::kExpireControlLua : redis::kExpireStaleLua;
+  RespValue r = control().Eval(script, {}, {keys_.Tag(), std::to_string(ToEpochMs(cutoff))});
   if (r.is_error()) throw std::runtime_error("[RedisStore] ExpireStaleClients: " + r.str);
   std::vector<std::string> dead;
   if (r.is_array()) {
     dead.reserve(r.elements.size());
     for (const auto& e : r.elements) dead.push_back(e.str);
+  }
+  // Multi-endpoint: the control step only flipped status + returned the dead
+  // ids; wipe each dead node's block locations on every shard's instance.
+  if (multi_endpoint()) {
+    for (const auto& id : dead) WipeNodeBlocksMulti(id);
   }
   return dead;
 }
@@ -336,7 +465,7 @@ std::size_t RedisMasterMetadataStore::GarbageCollectHits(std::chrono::system_clo
 // =====================================================================
 
 std::vector<Location> RedisMasterMetadataStore::LookupBlock(const std::string& key) const {
-  RespValue r = client_->Command({"HGETALL", keys_.Block(key)});
+  RespValue r = client_for_shard(keys_.ShardOf(key)).Command({"HGETALL", keys_.Block(key)});
   std::vector<Location> out;
   if (!r.is_array()) return out;
   for (size_t i = 0; i + 1 < r.elements.size(); i += 2) {
@@ -378,27 +507,27 @@ std::vector<std::vector<Location>> RedisMasterMetadataStore::BatchLookupBlockFor
   args.push_back(std::to_string(exclude_nodes.size()));
   for (const auto& n : exclude_nodes) args.push_back(n);
 
-  // Fan out one single-slot route_get_batch per shard, in one pipeline; each
-  // shard's reply is a per-key array of flat [node, size, tier, ...] triplets.
+  // Fan out one single-slot route_get_batch per shard; groups on the same
+  // instance share one pipeline, groups on different instances run against
+  // their own instance. Each key's reply is a flat [node, size, tier, ...] list.
   const ShardedBatch batch = GroupKeysByShard(keys_, keys);
-  const std::vector<RespValue> replies =
-      client_->EvalPipeline(redis::kRouteGetBatchLua, batch.keys_by_shard, args);
-
-  ForEachShardReply(batch, replies, "BatchLookupBlockForRouteGet",
-                    [&](size_t orig_index, const RespValue& locs) {
-                      if (!locs.is_array()) return;
-                      for (size_t j = 0; j + 3 <= locs.elements.size(); j += 3) {
-                        Location loc;
-                        loc.node_id = locs.elements[j].str;
-                        try {
-                          loc.size = std::stoull(locs.elements[j + 1].str);
-                          loc.tier = static_cast<TierType>(std::stoi(locs.elements[j + 2].str));
-                        } catch (...) {
-                          continue;
-                        }
-                        out[orig_index].push_back(std::move(loc));
-                      }
-                    });
+  RunShardedRead(
+      batch, redis::kRouteGetBatchLua, args, "BatchLookupBlockForRouteGet",
+      [&](size_t group) { return &client_for_shard(batch.shard_of_group[group]); },
+      [&](size_t orig_index, const RespValue& locs) {
+        if (!locs.is_array()) return;
+        for (size_t j = 0; j + 3 <= locs.elements.size(); j += 3) {
+          Location loc;
+          loc.node_id = locs.elements[j].str;
+          try {
+            loc.size = std::stoull(locs.elements[j + 1].str);
+            loc.tier = static_cast<TierType>(std::stoi(locs.elements[j + 2].str));
+          } catch (...) {
+            continue;
+          }
+          out[orig_index].push_back(std::move(loc));
+        }
+      });
   return out;
 }
 
@@ -408,11 +537,9 @@ std::vector<bool> RedisMasterMetadataStore::BatchExistsBlock(
   if (keys.empty()) return results;
 
   const ShardedBatch batch = GroupKeysByShard(keys_, keys);
-  const std::vector<RespValue> replies =
-      client_->EvalPipeline(redis::kExistsBatchLua, batch.keys_by_shard, {});
-
-  ForEachShardReply(
-      batch, replies, "BatchExistsBlock",
+  RunShardedRead(
+      batch, redis::kExistsBatchLua, {}, "BatchExistsBlock",
+      [&](size_t group) { return &client_for_shard(batch.shard_of_group[group]); },
       [&](size_t orig_index, const RespValue& has) { results[orig_index] = has.integer != 0; });
   return results;
 }
@@ -433,25 +560,25 @@ RedisMasterMetadataStore::EnumerateEvictionCandidates(const std::vector<NodeTier
 // =====================================================================
 
 std::optional<ClientRecord> RedisMasterMetadataStore::GetClient(const std::string& node_id) const {
-  RespValue r = client_->Command({"HGETALL", keys_.Node(node_id)});
+  RespValue r = control().Command({"HGETALL", keys_.Node(node_id)});
   if (!r.is_array() || r.elements.empty()) return std::nullopt;
   return DecodeRecord(node_id, FlatToMap(r));
 }
 
 bool RedisMasterMetadataStore::IsClientAlive(const std::string& node_id) const {
-  RespValue r = client_->Command({"HGET", keys_.Node(node_id), "status"});
+  RespValue r = control().Command({"HGET", keys_.Node(node_id), "status"});
   return r.type == RespValue::Type::String && r.str == "1";
 }
 
 std::optional<std::string> RedisMasterMetadataStore::GetPeerAddress(
     const std::string& node_id) const {
-  RespValue r = client_->Command({"HGET", keys_.Node(node_id), "peer"});
+  RespValue r = control().Command({"HGET", keys_.Node(node_id), "peer"});
   if (r.is_nil()) return std::nullopt;
   return r.str;
 }
 
 std::vector<ClientRecord> RedisMasterMetadataStore::ListAliveClients() const {
-  RespValue r = client_->Eval(redis::kListAliveLua, {}, {keys_.Tag()});
+  RespValue r = control().Eval(redis::kListAliveLua, {}, {keys_.Tag()});
   if (r.is_error()) throw std::runtime_error("[RedisStore] ListAliveClients: " + r.str);
   std::vector<ClientRecord> out;
   if (!r.is_array()) return out;
@@ -465,7 +592,7 @@ std::vector<ClientRecord> RedisMasterMetadataStore::ListAliveClients() const {
 }
 
 std::unordered_map<std::string, std::string> RedisMasterMetadataStore::GetAlivePeerView() const {
-  RespValue r = client_->Command({"HGETALL", keys_.AlivePeers()});
+  RespValue r = control().Command({"HGETALL", keys_.AlivePeers()});
   std::unordered_map<std::string, std::string> view;
   if (!r.is_array()) return view;
   for (size_t i = 0; i + 1 < r.elements.size(); i += 2) {
@@ -475,12 +602,12 @@ std::unordered_map<std::string, std::string> RedisMasterMetadataStore::GetAliveP
 }
 
 std::size_t RedisMasterMetadataStore::AliveClientCount() const {
-  RespValue r = client_->Command({"SCARD", keys_.NodesAlive()});
+  RespValue r = control().Command({"SCARD", keys_.NodesAlive()});
   return r.type == RespValue::Type::Integer ? static_cast<std::size_t>(r.integer) : 0;
 }
 
 std::vector<std::string> RedisMasterMetadataStore::GetClientTags(const std::string& node_id) const {
-  RespValue r = client_->Command({"HGET", keys_.Node(node_id), "tags"});
+  RespValue r = control().Command({"HGET", keys_.Node(node_id), "tags"});
   if (r.type != RespValue::Type::String) return {};
   return SplitTags(r.str);
 }

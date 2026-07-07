@@ -108,7 +108,18 @@ std::string UniqueNamespace() {
          std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() & 0xffffff);
 }
 
-class RedisStoreTest : public ::testing::TestWithParam<std::size_t> {
+// A store mode to run every assertion under: single-endpoint with N block
+// shards, or multi-endpoint with E endpoints (one shard each). The multi mode
+// points all logical endpoints at the same physical Redis (distinct hash tags
+// keep the keyspaces disjoint), so it exercises the split-write / per-endpoint
+// fan-out code paths without needing several Redis processes.
+struct StoreMode {
+  std::size_t block_shards;  // single-endpoint shard count (endpoints == 1)
+  std::size_t endpoints;     // >1 => multi-endpoint mode (block_shards ignored)
+  const char* name;
+};
+
+class RedisStoreTest : public ::testing::TestWithParam<StoreMode> {
  protected:
   void SetUp() override {
     redis::RespClient::Options opts;
@@ -123,9 +134,20 @@ class RedisStoreTest : public ::testing::TestWithParam<std::size_t> {
     RedisMasterMetadataStore::Config cfg;
     cfg.uri = RedisUri();
     cfg.namespace_id = ns_;
-    cfg.block_shards = GetParam();
+    const StoreMode& m = GetParam();
+    if (m.endpoints > 1) {
+      cfg.shard_uris.assign(m.endpoints, RedisUri());
+    } else {
+      cfg.block_shards = m.block_shards;
+    }
     store_ = std::make_unique<RedisMasterMetadataStore>(cfg);
     now_ = std::chrono::system_clock::now();
+  }
+
+  // Number of block shards the store built (must match KeySchema for MetaField).
+  std::size_t NumShards() const {
+    const StoreMode& m = GetParam();
+    return m.endpoints > 1 ? m.endpoints : m.block_shards;
   }
 
   ClientRegistration MakeReg(const std::string& id) {
@@ -142,7 +164,7 @@ class RedisStoreTest : public ::testing::TestWithParam<std::size_t> {
   // assert lease/access bookkeeping the store API does not expose. Returns -1
   // when the field (or the whole block key) is absent.
   long long MetaField(const std::string& user_key, const std::string& field) const {
-    redis::KeySchema schema(ns_, GetParam());
+    redis::KeySchema schema(ns_, NumShards());
     redis::RespValue r = probe_->Command({"HGET", schema.Block(user_key), field});
     if (r.type != redis::RespValue::Type::String) return -1;
     try {
@@ -158,11 +180,11 @@ class RedisStoreTest : public ::testing::TestWithParam<std::size_t> {
   std::chrono::system_clock::time_point now_;
 };
 
-INSTANTIATE_TEST_SUITE_P(BlockShards, RedisStoreTest,
-                         ::testing::Values(std::size_t{1}, std::size_t{16}),
-                         [](const ::testing::TestParamInfo<std::size_t>& info) {
-                           return "shards" + std::to_string(info.param);
-                         });
+INSTANTIATE_TEST_SUITE_P(
+    BlockShards, RedisStoreTest,
+    ::testing::Values(StoreMode{1, 1, "shards1"}, StoreMode{16, 1, "shards16"},
+                      StoreMode{1, 3, "endpoints3"}),
+    [](const ::testing::TestParamInfo<StoreMode>& info) { return std::string(info.param.name); });
 
 TEST_P(RedisStoreTest, RegisterMakesClientAlive) {
   EXPECT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));

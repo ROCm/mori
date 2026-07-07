@@ -40,6 +40,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "umbp/distributed/master/master_metadata_store.h"
 #include "umbp/distributed/master/redis/key_schema.h"
@@ -52,16 +53,21 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
  public:
   struct Config {
     std::string uri = "tcp://127.0.0.1:6379";
+    // Multi-endpoint mode: one Redis instance per entry, block shards spread one
+    // per instance so their scripts run on independent server threads (the only
+    // way past a single instance's single-thread ceiling). Empty or size 1 =>
+    // single-endpoint mode using `uri`. clients_[0] is the control instance
+    // (client records, alive set, peer view, extkv all live there).
+    std::vector<std::string> shard_uris;
     std::string namespace_id = "default";
     std::string password;
     int connect_timeout_ms = 1000;
     int socket_timeout_ms = 1000;
     std::size_t pool_size = 8;
-    // Number of hash-tag shards the block keyspace is spread over. 1 keeps the
-    // legacy single-tag layout (byte-identical keys, whole-batch-atomic reads).
-    // >1 spreads block lookups across slots so the read hot path runs one
-    // single-slot script per shard — the throughput win on a sharded/threaded
-    // store. See KeySchema and design-redis-metadata-store.md.
+    // Single-endpoint only: number of hash-tag shards the block keyspace is
+    // spread over. 1 keeps the legacy single-tag layout (byte-identical keys,
+    // whole-batch-atomic reads). In multi-endpoint mode the shard count is fixed
+    // to the number of endpoints (one shard per instance). See KeySchema.
     std::size_t block_shards = 1;
   };
 
@@ -123,13 +129,38 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
       const std::vector<std::string>& hashes) const override;
   std::size_t GetExternalKvCount(const std::string& node_id) const override;
 
-  // Best-effort connectivity probe (PING). Used by the factory / readiness.
-  bool Ping() const { return client_->Ping(); }
+  // Best-effort connectivity probe (PING). Every endpoint must answer.
+  bool Ping() const {
+    for (const auto& c : clients_) {
+      if (!c->Ping()) return false;
+    }
+    return true;
+  }
 
  private:
+  // How many block shards to build for a config (one per endpoint in
+  // multi-endpoint mode, else Config::block_shards).
+  static std::size_t ResolveNumShards(const Config& config);
+
+  std::size_t num_endpoints() const { return clients_.size(); }
+  bool multi_endpoint() const { return clients_.size() > 1; }
+  redis::RespClient& control() const { return *clients_[0]; }
+  std::size_t endpoint_of_shard(std::size_t shard) const { return shard % clients_.size(); }
+  redis::RespClient& client_for_shard(std::size_t shard) const {
+    return *clients_[endpoint_of_shard(shard)];
+  }
+
+  // Multi-endpoint write helpers (see .cpp). Each runs the per-shard block
+  // script on the shard's own instance; idempotent so retries are safe.
+  void ApplyBlockEventsMulti(const std::string& node_id,
+                             const std::vector<KvEvent>& events, bool is_full_sync,
+                             std::chrono::system_clock::time_point now);
+  void WipeNodeBlocksMulti(const std::string& node_id);
+
   redis::KeySchema keys_;
+  // clients_[0] is the control instance; clients_[s] backs block shard s.
   // mutable so const read methods can borrow a pooled connection.
-  mutable std::unique_ptr<redis::RespClient> client_;
+  mutable std::vector<std::unique_ptr<redis::RespClient>> clients_;
 };
 
 }  // namespace mori::umbp

@@ -87,8 +87,29 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
       block_shards = kMaxBlockShards;
     }
     cfg.block_shards = static_cast<std::size_t>(block_shards);
-    MORI_UMBP_INFO("[MetadataStore] backend=redis uri={} namespace={} block_shards={}", cfg.uri,
-                   cfg.namespace_id, cfg.block_shards);
+    // Multi-endpoint mode: comma-separated Redis URIs, one instance per block
+    // shard, so their scripts run on independent server threads (the way past a
+    // single instance's single-thread ceiling). When set, it supersedes the
+    // single-endpoint block_shards knob.
+    const std::string shard_uris = GetEnvStr("UMBP_REDIS_SHARD_URIS", "");
+    if (!shard_uris.empty()) {
+      size_t pos = 0;
+      while (pos <= shard_uris.size()) {
+        const size_t comma = shard_uris.find(',', pos);
+        const size_t end = (comma == std::string::npos) ? shard_uris.size() : comma;
+        std::string u = shard_uris.substr(pos, end - pos);
+        if (!u.empty()) cfg.shard_uris.push_back(u);
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+      }
+    }
+    if (cfg.shard_uris.size() > 1) {
+      MORI_UMBP_INFO("[MetadataStore] backend=redis namespace={} endpoints={} (multi-endpoint)",
+                     cfg.namespace_id, cfg.shard_uris.size());
+    } else {
+      MORI_UMBP_INFO("[MetadataStore] backend=redis uri={} namespace={} block_shards={}", cfg.uri,
+                     cfg.namespace_id, cfg.block_shards);
+    }
     return std::make_unique<RedisMasterMetadataStore>(cfg);
 #else
     throw std::runtime_error(

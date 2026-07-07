@@ -333,4 +333,190 @@ end
 return dead
 )LUA";
 
+// =====================================================================
+// Multi-endpoint (sharded across Redis instances) scripts.
+//
+// When block shards live on DIFFERENT Redis instances than the control keys, no
+// single Lua script can span them. The cross-store writes are therefore split
+// into a control script (runs on the control instance) plus per-shard block
+// scripts (run on each shard's own instance, single-slot). The store runs the
+// control step first, then the block step(s); block ADD/REMOVE and full-sync
+// clear+replay are idempotent, so a failed/retried block step is safe and a
+// partial failure is healed by the peer's next SEQ_GAP -> full_sync. The
+// single-endpoint path above (M==1) is unchanged and still fully atomic.
+// =====================================================================
+
+// apply_heartbeat_control (control instance):
+//   KEYS[1] = node key
+//   ARGV = [tag, node_id, seq, now_ms, is_full_sync, caps_blob]
+//   seq-CAS + record + nodes:alive/alive_peers ONLY (no block work).
+//   Returns { status_string, acked_seq_string } like apply_heartbeat.
+inline constexpr const char* kApplyHeartbeatControlLua = R"LUA(
+local nodeKey = KEYS[1]
+local tag = ARGV[1]
+local nodeId = ARGV[2]
+local seq = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+local full = tonumber(ARGV[5])
+local caps = ARGV[6]
+if redis.call('EXISTS', nodeKey) == 0 then
+  return { 'UNKNOWN', '0' }
+end
+local last = tonumber(redis.call('HGET', nodeKey, 'seq') or '0')
+local aliveSet = tag .. ':nodes:alive'
+local peers = tag .. ':alive_peers'
+local peer = redis.call('HGET', nodeKey, 'peer') or ''
+if full == 0 and seq ~= last + 1 then
+  redis.call('HSET', nodeKey, 'last_hb', now, 'status', 1)
+  redis.call('SADD', aliveSet, nodeId)
+  redis.call('HSET', peers, nodeId, peer)
+  return { 'SEQ_GAP', tostring(last) }
+end
+redis.call('HSET', nodeKey, 'last_hb', now, 'status', 1, 'seq', seq, 'caps', caps)
+redis.call('SADD', aliveSet, nodeId)
+redis.call('HSET', peers, nodeId, peer)
+return { 'APPLIED', tostring(seq) }
+)LUA";
+
+// apply_block_events (one shard's instance):
+//   ARGV = [revidx_key, node_prefix, is_full_sync, now_ms, n_events,
+//           then per event: kind, block_key, tier, size]
+//   `revidx_key` is this (node, shard) reverse-index set; `node_prefix` is
+//   'l|<node>|'. All block keys passed in ARGV are on this instance/slot.
+//   Idempotent: ADD overwrites, REMOVE of a missing loc is a no-op, full_sync
+//   clears the node's blocks here then replays the ADDs. Returns 'OK'.
+inline constexpr const char* kApplyBlockEventsLua = R"LUA(
+local revidx = ARGV[1]
+local nodePfx = ARGV[2]
+local full = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+local nev = tonumber(ARGV[5])
+local pfxLen = string.len(nodePfx)
+
+local function cleanupEmpty(bk)
+  local flds = redis.call('HKEYS', bk)
+  for _, f in ipairs(flds) do
+    if string.sub(f, 1, 2) == 'l|' then return end
+  end
+  redis.call('DEL', bk)
+end
+
+local function addLoc(bk, tier, size)
+  if redis.call('EXISTS', bk) == 0 then
+    redis.call('HSET', bk, '_created', now, '_lacc', now, '_acnt', 0)
+  end
+  local field = nodePfx .. tier
+  if redis.call('HEXISTS', bk, field) == 0 then
+    redis.call('HSET', bk, field, size)
+    redis.call('SADD', revidx, bk)
+  end
+end
+
+local function removeLoc(bk, tier)
+  local field = nodePfx .. tier
+  if redis.call('HDEL', bk, field) == 1 then
+    local flds = redis.call('HKEYS', bk)
+    local still = false
+    for _, f in ipairs(flds) do
+      if string.sub(f, 1, pfxLen) == nodePfx then still = true break end
+    end
+    if not still then redis.call('SREM', revidx, bk) end
+    cleanupEmpty(bk)
+  end
+end
+
+if full == 1 then
+  local members = redis.call('SMEMBERS', revidx)
+  for _, bk in ipairs(members) do
+    local flds = redis.call('HKEYS', bk)
+    for _, f in ipairs(flds) do
+      if string.sub(f, 1, pfxLen) == nodePfx then redis.call('HDEL', bk, f) end
+    end
+    cleanupEmpty(bk)
+  end
+  redis.call('DEL', revidx)
+  for i = 0, nev - 1 do
+    local base = 6 + i * 4
+    if tonumber(ARGV[base]) == 0 then addLoc(ARGV[base + 1], ARGV[base + 2], ARGV[base + 3]) end
+  end
+else
+  for i = 0, nev - 1 do
+    local base = 6 + i * 4
+    if tonumber(ARGV[base]) == 0 then
+      addLoc(ARGV[base + 1], ARGV[base + 2], ARGV[base + 3])
+    else
+      removeLoc(ARGV[base + 1], ARGV[base + 2])
+    end
+  end
+end
+return 'OK'
+)LUA";
+
+// wipe_node_blocks (one shard's instance):
+//   ARGV = [revidx_key, node_prefix]
+//   Drains the (node, shard) reverse index, deletes the node's location fields
+//   from each block, drops now-empty blocks, and deletes the reverse index.
+//   Idempotent. Returns 1.
+inline constexpr const char* kWipeNodeBlocksLua = R"LUA(
+local revidx = ARGV[1]
+local nodePfx = ARGV[2]
+local pfxLen = string.len(nodePfx)
+local members = redis.call('SMEMBERS', revidx)
+for _, bk in ipairs(members) do
+  local flds = redis.call('HKEYS', bk)
+  for _, f in ipairs(flds) do
+    if string.sub(f, 1, pfxLen) == nodePfx then redis.call('HDEL', bk, f) end
+  end
+  local flds2 = redis.call('HKEYS', bk)
+  local anyLoc = false
+  for _, f in ipairs(flds2) do
+    if string.sub(f, 1, 2) == 'l|' then anyLoc = true break end
+  end
+  if not anyLoc then redis.call('DEL', bk) end
+end
+redis.call('DEL', revidx)
+return 1
+)LUA";
+
+// unregister_control (control instance):
+//   KEYS[1] = node key; ARGV = [tag, node_id]
+//   Drops the client record + nodes:alive + alive_peers + extkv reverse index.
+//   Block locations are wiped separately per shard. Returns 1 if it existed.
+inline constexpr const char* kUnregisterControlLua = R"LUA(
+local nodeKey = KEYS[1]
+local tag = ARGV[1]
+local nodeId = ARGV[2]
+if redis.call('EXISTS', nodeKey) == 0 then return 0 end
+redis.call('DEL', nodeKey)
+redis.call('SREM', tag .. ':nodes:alive', nodeId)
+redis.call('HDEL', tag .. ':alive_peers', nodeId)
+redis.call('DEL', tag .. ':extkv:node:' .. nodeId)
+return 1
+)LUA";
+
+// expire_control (control instance):
+//   ARGV = [tag, cutoff_ms]
+//   Flips ALIVE->EXPIRED for nodes whose last_hb < cutoff, drops them from
+//   nodes:alive/alive_peers + extkv, and returns the dead node ids. Block
+//   locations are wiped separately per shard by the caller.
+inline constexpr const char* kExpireControlLua = R"LUA(
+local tag = ARGV[1]
+local cutoff = tonumber(ARGV[2])
+local members = redis.call('SMEMBERS', tag .. ':nodes:alive')
+local dead = {}
+for _, id in ipairs(members) do
+  local nk = tag .. ':node:' .. id
+  local status = tonumber(redis.call('HGET', nk, 'status') or '0')
+  local lastHb = tonumber(redis.call('HGET', nk, 'last_hb') or '0')
+  if status == 1 and lastHb < cutoff then
+    redis.call('HSET', nk, 'status', 2)
+    redis.call('SREM', tag .. ':nodes:alive', id)
+    redis.call('HDEL', tag .. ':alive_peers', id)
+    redis.call('DEL', tag .. ':extkv:node:' .. id)
+    dead[#dead + 1] = id
+  end
+end
+return dead
+)LUA";
+
 }  // namespace mori::umbp::redis
