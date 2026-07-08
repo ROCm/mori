@@ -75,13 +75,18 @@ RUN set -ex && \
         cd / && rm -rf /tmp/clr /tmp/hip; \
     fi
 
-# ── Build ROCR runtime (libhsa-runtime64.so) from release tag ──
+# ── Patch ROCR runtime (libhsa-runtime64.so) for MappedHandle DRM FD leak ──
 #
-# Build rocr-runtime from the matching rocm-X.Y.Z release tag.
-# The release tag already includes the MappedHandle DRM FD fix
-# (ROCm/rocm-systems#4363), so no extra patch is needed.
+# Bug: MappedHandleAllowedAgent destructor leaks DRM FDs, causing
+# hipMemMap failures after ~500 mappings (EMFILE).
+#
+# Fix: apply rocr-mapped-handle-fix.patch (from ROCm/rocm-systems#4363,
+# commit e27ce55c5) onto the matching rocm-X.Y.Z release tag.
 #
 # Only applies to ROCm >= 7.0 (matching the CLR patch above).
+#
+# Remove this block once the base image ships a rocr-runtime with the fix.
+COPY docker/rocr-mapped-handle-fix.patch /tmp/rocr-mapped-handle-fix.patch
 RUN set -ex && \
     ROCM_VER=$(cat /opt/rocm/.info/version 2>/dev/null | head -c 5) && \
     test -n "${ROCM_VER}" || { echo "ERROR: cannot read /opt/rocm/.info/version"; exit 1; } && \
@@ -94,11 +99,13 @@ RUN set -ex && \
             libelf-dev xxd pkg-config rocm-llvm-dev && \
         rm -rf /var/lib/apt/lists/* && \
         LIBHSA_TARGET=$(basename $(readlink -f /opt/rocm/lib/libhsa-runtime64.so.1)) && \
-        echo "Building libhsa-runtime64.so from rocm-${ROCM_VER} tag, target=${LIBHSA_TARGET}" && \
+        echo "Patching libhsa-runtime64.so on ROCm ${ROCM_VER}, target=${LIBHSA_TARGET}" && \
         git clone --depth 1 --branch rocm-${ROCM_VER} --quiet \
             https://github.com/ROCm/rocm-systems.git /tmp/rocm-systems && \
-        mkdir /tmp/rocm-systems/projects/rocr-runtime/build && \
-        cd /tmp/rocm-systems/projects/rocr-runtime/build && \
+        cd /tmp/rocm-systems && \
+        git apply /tmp/rocr-mapped-handle-fix.patch && \
+        mkdir projects/rocr-runtime/build && \
+        cd projects/rocr-runtime/build && \
         cmake -DCMAKE_PREFIX_PATH=/opt/rocm \
               -DCMAKE_INSTALL_PREFIX=/opt/rocm \
               -DBUILD_SHARED_LIBS=ON .. && \

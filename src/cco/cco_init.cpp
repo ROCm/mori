@@ -46,6 +46,19 @@
 namespace mori {
 namespace cco {
 
+namespace {
+// Serialize HIP VMM calls across threads in one process. ROCm ROCR can race on
+// concurrent hsa_amd_vmem_map / hipMemSetAccess from SPMT callers.
+std::recursive_mutex& vmmProcessMutex() {
+  static std::recursive_mutex mutex;
+  return mutex;
+}
+
+struct vmmProcessLock {
+  std::lock_guard<std::recursive_mutex> guard{vmmProcessMutex()};
+};
+}  // namespace
+
 // ccoProviderType is cco's self-contained copy of core::ProviderType; the cast
 // below relies on a 1:1 mapping, so guard it (this TU sees both enums).
 static_assert(static_cast<int>(CCO_PROVIDER_UNKNOWN) ==
@@ -256,17 +269,17 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   allocProp.location.type = hipMemLocationTypeDevice;
   allocProp.location.id = comm->hipDev;
 
-  // RECOMMENDED granularity: fewer page-table entries, matching CCO's
-  // few-large-buffers usage pattern.
   size_t granularity = 0;
-  HIP_RUNTIME_CHECK(hipMemGetAllocationGranularity(&granularity, &allocProp,
-                                                   hipMemAllocationGranularityRecommended));
-  comm->vmmGranularity = granularity;
-
   // Flat VA covers the LSA team only. Cross-node peers don't use VA — RDMA
   // goes through iova=0 + offset.
   size_t totalVaSize = static_cast<size_t>(comm->lsaSize) * perRankVmmSize;
-  HIP_RUNTIME_CHECK(hipMemAddressReserve(&comm->flatBase, totalVaSize, granularity, nullptr, 0));
+  {
+    vmmProcessLock vmmLock;
+    HIP_RUNTIME_CHECK(hipMemGetAllocationGranularity(&granularity, &allocProp,
+                                                     hipMemAllocationGranularityRecommended));
+    comm->vmmGranularity = granularity;
+    HIP_RUNTIME_CHECK(hipMemAddressReserve(&comm->flatBase, totalVaSize, granularity, nullptr, 0));
+  }
   MORI_SHMEM_TRACE(
       "ccoCommCreate: flatBase={} totalVA={} (lsaSize={} x perRankSize={}) granularity={}",
       comm->flatBase, totalVaSize, comm->lsaSize, perRankVmmSize, granularity);
@@ -360,6 +373,7 @@ int ccoCommDestroy(ccoComm* comm) {
   // unmap + release each straggler (same as ccoMemFree) so no mappings remain
   // in the flat VA. hipMemAddressFree fails if any sub-range is still mapped.
   for (auto& [ptr, meta] : comm->allocTable) {
+    vmmProcessLock vmmLock;
     (void)hipMemUnmap(ptr, meta.size);
     (void)hipMemRelease(meta.physHandle);
     if (meta.shareFd >= 0) close(meta.shareFd);
@@ -371,6 +385,7 @@ int ccoCommDestroy(ccoComm* comm) {
   // Release flat VA — sized to match the reservation in ccoCommCreate.
   if (comm->flatBase) {
     size_t totalVaSize = static_cast<size_t>(comm->lsaSize) * comm->perRankSize;
+    vmmProcessLock vmmLock;
     HIP_RUNTIME_CHECK(hipMemAddressFree(comm->flatBase, totalVaSize));
   }
 
@@ -427,54 +442,66 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   allocProp.location.id = comm->hipDev;
 
   hipMemGenericAllocationHandle_t physHandle = 0;
-  hipError_t err = hipMemCreate(&physHandle, alignedSize, &allocProp, 0);
-  if (err != hipSuccess) {
-    MORI_SHMEM_ERROR("ccoMemAlloc: hipMemCreate failed: {} ({})", static_cast<int>(err),
-                     hipGetErrorString(err));
-    rollbackSlot();
-    return -1;
-  }
-
-  // Map only the local slot. Peer slots are mapped lazily in WindowRegister.
-  // slotAddr already equals flatBase + lsaRank*perRankSize + slotOffset because
-  // vaManager's baseAddr was set to LocalSlotBase(comm).
+  hipError_t err = hipSuccess;
+  int shareFd = -1;
   void* localVa = reinterpret_cast<void*>(slotAddr);
-  err = hipMemMap(localVa, alignedSize, 0, physHandle, 0);
-  if (err != hipSuccess) {
-    MORI_SHMEM_ERROR("ccoMemAlloc: hipMemMap failed: {} ({})", static_cast<int>(err),
-                     hipGetErrorString(err));
-    (void)hipMemRelease(physHandle);
-    rollbackSlot();
-    return -1;
+  {
+    vmmProcessLock vmmLock;
+    err = hipMemCreate(&physHandle, alignedSize, &allocProp, 0);
+    if (err != hipSuccess) {
+      MORI_SHMEM_ERROR("ccoMemAlloc: hipMemCreate failed: {} ({})", static_cast<int>(err),
+                       hipGetErrorString(err));
+      rollbackSlot();
+      return -1;
+    }
+
+    err = hipMemMap(localVa, alignedSize, 0, physHandle, 0);
+    if (err != hipSuccess) {
+      MORI_SHMEM_ERROR("ccoMemAlloc: hipMemMap failed: {} ({})", static_cast<int>(err),
+                       hipGetErrorString(err));
+      (void)hipMemRelease(physHandle);
+      rollbackSlot();
+      return -1;
+    }
   }
 
   hipMemAccessDesc accessDesc = {};
   accessDesc.location.type = hipMemLocationTypeDevice;
   accessDesc.location.id = comm->hipDev;
   accessDesc.flags = hipMemAccessFlagsProtReadWrite;
-  err = hipMemSetAccess(localVa, alignedSize, &accessDesc, 1);
+  for (int retry = 0; retry < 5; retry++) {
+    {
+      vmmProcessLock vmmLock;
+      err = hipMemSetAccess(localVa, alignedSize, &accessDesc, 1);
+    }
+    if (err == hipSuccess) break;
+    usleep(1000 * (1 << retry));
+  }
   if (err != hipSuccess) {
-    MORI_SHMEM_ERROR("ccoMemAlloc: hipMemSetAccess failed: {} ({})", static_cast<int>(err),
-                     hipGetErrorString(err));
-    (void)hipMemUnmap(localVa, alignedSize);
-    (void)hipMemRelease(physHandle);
+    MORI_SHMEM_ERROR("ccoMemAlloc: hipMemSetAccess failed after retries: {} ({})",
+                     static_cast<int>(err), hipGetErrorString(err));
+    {
+      vmmProcessLock vmmLock;
+      (void)hipMemUnmap(localVa, alignedSize);
+      (void)hipMemRelease(physHandle);
+    }
     rollbackSlot();
     return -1;
   }
 
-  // dma-buf FD is stashed for WindowRegister to share (P2P FD exchange + RDMA MR).
-  int shareFd = -1;
   err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&shareFd), physHandle,
                                       hipMemHandleTypePosixFileDescriptor, 0);
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("ccoMemAlloc: hipMemExportToShareableHandle failed: {} ({})",
                      static_cast<int>(err), hipGetErrorString(err));
-    (void)hipMemUnmap(localVa, alignedSize);
-    (void)hipMemRelease(physHandle);
+    {
+      vmmProcessLock vmmLock;
+      (void)hipMemUnmap(localVa, alignedSize);
+      (void)hipMemRelease(physHandle);
+    }
     rollbackSlot();
     return -1;
   }
-
   {
     std::lock_guard<std::mutex> lock(comm->allocMutex);
     ccoComm::AllocMeta meta;
@@ -518,15 +545,18 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
 
   MORI_SHMEM_TRACE("ccoMemFree: rank={} ptr={} size={}", comm->rank, ptr, alignedSize);
 
-  hipError_t err = hipMemUnmap(ptr, alignedSize);
-  if (err != hipSuccess) {
-    MORI_SHMEM_WARN("ccoMemFree: local hipMemUnmap failed: {} ({})", static_cast<int>(err),
-                    hipGetErrorString(err));
-  }
-  err = hipMemRelease(meta.physHandle);
-  if (err != hipSuccess) {
-    MORI_SHMEM_WARN("ccoMemFree: hipMemRelease failed: {} ({})", static_cast<int>(err),
-                    hipGetErrorString(err));
+  {
+    vmmProcessLock vmmLock;
+    hipError_t err = hipMemUnmap(ptr, alignedSize);
+    if (err != hipSuccess) {
+      MORI_SHMEM_WARN("ccoMemFree: local hipMemUnmap failed: {} ({})", static_cast<int>(err),
+                      hipGetErrorString(err));
+    }
+    err = hipMemRelease(meta.physHandle);
+    if (err != hipSuccess) {
+      MORI_SHMEM_WARN("ccoMemFree: hipMemRelease failed: {} ({})", static_cast<int>(err),
+                      hipGetErrorString(err));
+    }
   }
 
   if (meta.shareFd >= 0) close(meta.shareFd);
@@ -653,6 +683,7 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
     mappedPeers.reserve(p2pPeers.size());
 
     auto rollbackMappedPeers = [&]() {
+      vmmProcessLock vmmLock;
       for (auto& mp : mappedPeers) {
         (void)hipMemUnmap(mp.peerVa, alignedSize);
         (void)hipMemRelease(mp.handle);
@@ -681,39 +712,47 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
       }
 
       hipMemGenericAllocationHandle_t importedHandle;
-      hipError_t err = hipMemImportFromShareableHandleCompat(&importedHandle, peerFd,
-                                                             hipMemHandleTypePosixFileDescriptor);
-      if (err != hipSuccess) {
-        MORI_SHMEM_ERROR("ccoWindowRegister: import from PE {} failed: {}", pe,
-                         static_cast<int>(err));
-        bail();
-        return -1;
-      }
-
       int peerLsaRank = pe - comm->myNodeStart;
       void* peerVa = static_cast<char*>(comm->flatBase) +
                      static_cast<size_t>(peerLsaRank) * comm->perRankSize + slotOffset;
-      hipError_t mapErr = hipMemMap(peerVa, alignedSize, 0, importedHandle, 0);
-      if (mapErr != hipSuccess) {
-        MORI_SHMEM_ERROR("ccoWindowRegister: hipMemMap PE {} failed: {}", pe,
-                         static_cast<int>(mapErr));
-        (void)hipMemRelease(importedHandle);
-        bail();
-        return -1;
+      {
+        vmmProcessLock vmmLock;
+        hipError_t err = hipMemImportFromShareableHandleCompat(&importedHandle, peerFd,
+                                                               hipMemHandleTypePosixFileDescriptor);
+        if (err != hipSuccess) {
+          MORI_SHMEM_ERROR("ccoWindowRegister: import from PE {} failed: {}", pe,
+                           static_cast<int>(err));
+          bail();
+          return -1;
+        }
+
+        hipError_t mapErr = hipMemMap(peerVa, alignedSize, 0, importedHandle, 0);
+        if (mapErr != hipSuccess) {
+          MORI_SHMEM_ERROR("ccoWindowRegister: hipMemMap PE {} failed: {}", pe,
+                           static_cast<int>(mapErr));
+          (void)hipMemRelease(importedHandle);
+          bail();
+          return -1;
+        }
       }
 
-      // hipMemSetAccess can transiently fail under concurrent VMM operations.
       hipError_t setErr = hipSuccess;
       for (int retry = 0; retry < 5; retry++) {
-        setErr = hipMemSetAccess(peerVa, alignedSize, &accessDesc, 1);
+        {
+          vmmProcessLock vmmLock;
+          setErr = hipMemSetAccess(peerVa, alignedSize, &accessDesc, 1);
+        }
         if (setErr == hipSuccess) break;
         usleep(1000 * (1 << retry));
       }
       if (setErr != hipSuccess) {
         MORI_SHMEM_ERROR("ccoWindowRegister: hipMemSetAccess PE {} failed after retries: {}", pe,
                          static_cast<int>(setErr));
-        (void)hipMemUnmap(peerVa, alignedSize);
-        (void)hipMemRelease(importedHandle);
+        {
+          vmmProcessLock vmmLock;
+          (void)hipMemUnmap(peerVa, alignedSize);
+          (void)hipMemRelease(importedHandle);
+        }
         bail();
         return -1;
       }
@@ -850,6 +889,7 @@ int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
   if (allocIt != comm->allocTable.end()) {
     size_t slotOff = allocIt->second.slotOffset;
     size_t allocSize = allocIt->second.size;
+    vmmProcessLock vmmLock;
     for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
       if (lsa == comm->lsaRank) continue;
       int pe = comm->myNodeStart + lsa;
@@ -862,8 +902,11 @@ int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
 
   // Drop refcount on each peer's imported handle. hipMemUnmap above
   // detaches VA mappings but doesn't release the handle itself.
-  for (auto handle : wh->peerImportedHandles) {
-    (void)hipMemRelease(handle);
+  {
+    vmmProcessLock vmmLock;
+    for (auto handle : wh->peerImportedHandles) {
+      (void)hipMemRelease(handle);
+    }
   }
   wh->peerImportedHandles.clear();
 
