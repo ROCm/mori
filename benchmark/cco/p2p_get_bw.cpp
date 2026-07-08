@@ -113,7 +113,7 @@ __global__ void sdma_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, 
   for (int i = 0; i < iter; i++)
     sdma.get(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), off,
              reinterpret_cast<ccoWindow_t>(sendWin), off, bytes, q);
-  sdma.quiet(peerLsa, q);
+  sdma.quietQueue(peerLsa, q);
 }
 
 // SDMA warp scope: one warp drives all SDMA queues via a single warp-scope get

@@ -80,7 +80,7 @@ __global__ void sdma_get_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   for (int i = 0; i < iter; i++) {
     sdma.get(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), 0,
              reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, 0);
-    sdma.quiet(peerLsa, 0);
+    sdma.quietQueue(peerLsa, 0);
   }
 }
 
