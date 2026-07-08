@@ -201,6 +201,20 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   }
   bootNet.Allgather(&cpuMemObj->peerRkeys[rank], cpuMemObj->peerRkeys, sizeof(uint32_t));
 
+  // DUAL-RAIL: also register this buffer on the second (idle) NIC so QPs on that
+  // rail have a valid MR (its own lkey/rkey). The device put selects these keys
+  // for rail-2 QP ids. Exchange the rail-2 rkeys the same way as the primary.
+  RdmaDeviceContext* rdmaDeviceContext2 = context.GetRdmaDeviceContext2();
+  cpuMemObj->peerRkeys2 = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
+  if (rdmaDeviceContext2 && anyRdmaPeer) {
+    application::RdmaMemoryRegion mr2 =
+        rdmaDeviceContext2->RegisterRdmaMemoryRegion(localPtr, size);
+    cpuMemObj->lkey2 = mr2.lkey;
+    cpuMemObj->peerRkeys2[rank] = mr2.rkey;
+    cpuMemObj->hasRail2 = true;
+  }
+  bootNet.Allgather(&cpuMemObj->peerRkeys2[rank], cpuMemObj->peerRkeys2, sizeof(uint32_t));
+
   // Copy memory object to GPU memory, we need to access it from GPU directly
   SymmMemObj* gpuMemObj;
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj, sizeof(SymmMemObj)));
@@ -216,6 +230,13 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
 
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerRkeys, sizeof(uint32_t) * worldSize));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
+                              sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
+
+  // DUAL-RAIL: mirror peerRkeys2 to the device (gpuMemObj was memcpy'd from cpuMemObj
+  // above, so hasRail2/lkey2 scalar fields are already set; only the pointer array
+  // needs its own device allocation). peerRkeys2 is always allocated CPU-side.
+  HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerRkeys2, sizeof(uint32_t) * worldSize));
+  HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys2, cpuMemObj->peerRkeys2,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
   // SDMA peers (same-host). Each peer needs its within-node HIP device id

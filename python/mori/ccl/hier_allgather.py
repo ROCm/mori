@@ -772,9 +772,69 @@ class HierAllGather:
         # so the shipped default is the serial direct path until the fused
         # kernel's ring-completion visibility to the finish readers is fixed
         # on-device. Opt back in with MORI_HIER_FUSE_LOCAL=1 for standalone A/B.
+        # UT GATE-1 RE-CONFIRMED (Turn-4 Phase-5, 2026-07-07, cross-rack
+        # n09-33+n08-29, bench_sweep world=8 N=2 G=4, reps=3, bitexact=True all
+        # points): MORI_HIER_FUSE_LOCAL=1 BEATS RCCL at every size >=32MiB in both
+        # dtypes -- fp32 1.148-1.295x (256/128/64/32MiB = 200.9/202.5/196.2/182.3
+        # GB/s vs 174.9/171.9/155.2/140.8), bf16 1.152-1.291x. The default serial
+        # path (this OFF) is 143/141 GB/s = 0.815/0.885x. So the standalone UT
+        # requirement (ratio>=1.0x, bit-exact) is MET by this path; the ONLY reason
+        # it is not the shipped default is the E2E copy-engine-finish stale-remote
+        # race above (BANNED to chase this phase). Refuted same turn:
+        # MORI_SHMEM_HEAP_TYPE=normal (cached ring buffer) = 143 GB/s, identical to
+        # uncached => RDMA DMA is unaffected by the ring cache attribute. Also moot:
+        # the "leader-only ring + XGMI broadcast" redundancy killer -- the default
+        # slice path already sends 1 shard/NIC ((N-1)*count, the minimum), so no
+        # inter-node redundancy remains for it to eliminate.
         self.fuse_local = os.environ.get(
             "MORI_HIER_FUSE_LOCAL", "0"
         ) not in ("0", "", "false", "False")
+        # PHASE 4: pipeline the inter-node RDMA ring with the REMOTE-block XGMI
+        # reassembly (the 143->168 GB/s lever). When ON (and on the fuse_local
+        # slice_direct path) the fused FusedRingRemoteGatherKernel runs the ring
+        # AND, per landed sub-range, the remote-block SDMA push straight from this
+        # PE's ring buffer into the registered output -- NO ring copy-OUT, NO
+        # whole-phase finish barrier, remote gather overlaps the still-in-flight
+        # NIC ring. Only valid at num_nodes==2 (single ring round); default OFF
+        # until the standalone bit-exact sweep gate passes.
+        self.fuse_remote = os.environ.get(
+            "MORI_HIER_FUSE_REMOTE", "0"
+        ) not in ("0", "", "false", "False")
+        # PHASE 4 E2E COHERENCE: the fuse_local win path forces the RED-LINE-safe
+        # COPY-ENGINE ring finish (bulk bytes off CUs). But the copy engine is a
+        # SEPARATE hw agent whose D2D read of the ring buffer is NOT ordered by the
+        # ring kernel's CU-scope __threadfence_system (ccl_kernels.hip:240-248,
+        # intra out_ptr note) -> under FSDP tight overlap it drains STALE remote-half
+        # ring bytes (the documented ~48% stale-remote race that keeps fuse_local
+        # E2E-nondeterministic). The two known coherence fixes were CU-copy (violates
+        # the HARD RED LINE) and host drain (kills overlap). The THIRD, non-fence,
+        # red-line-safe fix: the inter-node ring's RDMA_WRITE_WITH_IMM completion --
+        # the receiver consumes a recv-CQE that is generated only AFTER the write DMA
+        # has landed GLOBALLY (visible to ALL agents, incl. the copy engine), so the
+        # subsequent copy-engine finish reads coherent bytes with NO host stall and
+        # bulk bytes stay on the NIC/SDMA. The N=2 big-AG multiBlock WRITE_IMM path
+        # (multiBlockWriteImm) exists but was never auto-engaged for fuse_local. Couple
+        # it here (opt-in MORI_HIER_FUSE_LOCAL_WRITE_IMM=1): couple the ring to
+        # WRITE_IMM (the lazily-constructed InterNodeRingAllgather reads
+        # MORI_HIER_RING_WRITE_IMM in its ctor, which happens AFTER this __init__).
+        # KNOWN BUG (Turn 13): with the coupling ON the FUSED ring kernel
+        # (FusedRingLocalGatherKernel) faults/hangs silently before the first AG --
+        # the multiBlockWriteImm recv-CQE pre-post/poll does not work inside the
+        # fused concurrent grid (the standalone InterNodeRingAllGatherKernel WRITE_IMM
+        # path is a separate launch with its own CQ bookkeeping). So keep this
+        # DEFAULT OFF until the recv-CQE plumbing is made fused-grid-safe; the
+        # red-line-safe copy-engine fuse_local path (1.04-1.07x bit-exact) stays
+        # the known-good A/B path in the meantime.
+        if self.fuse_local and os.environ.get(
+            "MORI_HIER_FUSE_LOCAL_WRITE_IMM", "0"
+        ) not in ("0", "", "false", "False"):
+            if os.environ.get("MORI_HIER_RING_WRITE_IMM") is None:
+                os.environ["MORI_HIER_RING_WRITE_IMM"] = "1"
+        self._chunk_ready_flags = None
+        # HOST-PROXY INTER producer (MORI_HIER_HOSTPROXY_REASM): lazily built
+        # against the inter ring buffer; owns the inter leg + publishes flags.
+        self._hp_inter = None
+        self._hp_src_ev = None
         # DIRECT-TO-OUTPUT Phase B. The default fused sliced
         # path SDMA-gathers the N node-blocks into an internal symmetric transit
         # (_intra.out_) and then a finish_batch copies the WHOLE output
@@ -857,6 +917,49 @@ class HierAllGather:
         self._debug_sync = os.environ.get("MORI_HIER_DEBUG_SYNC", "0") not in (
             "0", "", "false", "False",
         )
+        # SYNC_BIG: targeted remote-completion fence on ONLY the big cross-node
+        # all-gathers. Ground-truth probing (Phase 6) showed the residual
+        # fast-path stale reads (~184/384 calls) concentrate in the LARGE
+        # embed/lm_head cross-node AGs (per-rank bytes >> a regular layer); the
+        # many small per-layer AGs converge fine. So instead of a full-op host
+        # sync on EVERY call (DEBUG_SYNC, which forfeits all overlap), host-sync
+        # ONLY when the per-rank payload is >= SYNC_BIG_BYTES. This closes the
+        # remote-landing race exactly where it bites while keeping the ring<->
+        # gather overlap on the numerous small AGs (perf-preserving convergence
+        # fix). Default OFF; threshold 8 MiB/rank cleanly separates embed/lm_head
+        # from the regular transformer-block params for Qwen-class models.
+        self._sync_big = os.environ.get("MORI_HIER_SYNC_BIG", "0") not in (
+            "0", "", "false", "False",
+        )
+        self._sync_big_bytes = int(
+            os.environ.get("MORI_HIER_SYNC_BIG_BYTES", str(8 * 1024 * 1024))
+        )
+        # SYNC_BIG mode: "host" (default) = host stream.synchronize() on the big
+        # AGs (proven bit-exact but stalls the CPU->GPU pipeline ~23%); "barrier"
+        # = a DEVICE-side cross-PE ShmemBarrierOnStream enqueued on the SAME
+        # stream right after the big AG. The barrier kernel quiesces every PE
+        # (drains the RDMA send-queues => RC remote landing) and system-fences
+        # before releasing, so the FSDP consumer (stream-ordered AFTER it) can
+        # only read the AG output once every peer's remote-half bytes have
+        # physically landed -- the same guarantee host-sync gives, but WITHOUT a
+        # host stall (keeps the ring<->gather + AG<->backward overlap). Targets
+        # ONLY the big embed/lm_head cross-node AGs where the residual
+        # remote-landing race lives (Phase-6 ground truth localization).
+        self._sync_big_mode = os.environ.get("MORI_HIER_SYNC_BIG_MODE", "host")
+        # SYNC_BIG mode "throttle": a BOUNDED CPU run-ahead throttle. Phase-6
+        # ground truth localized the residual fast-path loss drift (BUG B) to a
+        # race that ONLY a host stream-drain masks -- yet it is numQp-independent
+        # and every device-side transport fence (13 avenues) failed, so it is NOT
+        # an unlanded-RDMA race. That signature = the CPU running arbitrarily far
+        # ahead of the GPU, so the big embed/lm_head AG's true completion drifts
+        # relative to when its consumer is actually enqueued/observed. Full
+        # SYNC_BIG (host-sync the CURRENT big AG) fixes it but stalls the whole
+        # CPU->GPU pipeline (~24%). "throttle" instead records an event AFTER each
+        # big AG and, on the NEXT big AG, host-waits on the PREVIOUS event. That
+        # bounds CPU run-ahead to ~1 step while the CURRENT big AG still overlaps
+        # with backward compute -- so if BUG B is pure run-ahead, this recovers
+        # ground truth at far lower cost than SYNC_BIG. Default OFF (host mode).
+        self._sync_big_prev_event = None
         # FSDP copy-out coherence fix (CU-domain copy-out). The nodirect
         # Phase-B copy-OUT is a copy-ENGINE hipMemcpyAsync (out_ -> output); the
         # FSDP consumer (backward GEMM) reads ``output`` from a COMPUTE UNIT. On
@@ -945,6 +1048,9 @@ class HierAllGather:
             # inter ring buffer size), not just a single G-shard node-block.
             if self.slice_inter and self.slice_fused:
                 intra_bytes = max(intra_bytes, inter_bytes)
+            # remember the inter ring buffer size for the host-proxy GDR
+            # registration (MORI_HIER_HOSTPROXY_REASM).
+            self._inter_ring_bytes = inter_bytes
 
             # Phase 1 (both paths): intra-node SDMA gather over my node's G ranks.
             self._intra = IntraNodeSubGroupAllgatherSdma(
@@ -1047,6 +1153,18 @@ class HierAllGather:
             # collection C_g = [slice_g(B_0)..slice_g(B_{N-1})] (N*count) gathered
             # by the inter ring before the N intra reassembly gathers.
             self._slice_scratch = None
+            # dbufstream: DEDICATED double-buffered collection scratch for the big
+            # backward AGs. The consecutive big embed/lm_head AGs alternate output
+            # buffers; on the fast contiguous copy-out path they SHARE the single
+            # _slice_scratch with a DEFERRED finish fence, so AG#2's ring copy-IN
+            # can clobber _slice_scratch before AG#1's copy-OUT drains it (the T28
+            # scratch-reuse staleness). Two dedicated buffers, alternated per big
+            # AG, break that reuse without touching the fast per-op path.
+            self._big_scratch = [None, None]
+            self._big_scratch_parity = 0
+            # Toggle set by the dbufstream wrapper so the slice scratch selection
+            # picks _big_scratch[parity] for the one big AG instead of the shared.
+            self._big_dbuf_active = False
             # M5: lazy side stream for the slice-overlap lever (c). The
             # local node-block gather runs here concurrently with the inter ring.
             self._overlap_stream = None
@@ -1088,6 +1206,25 @@ class HierAllGather:
             # so this decision is lockstep-uniform without any extra collective.
             self._direct_reg_ptr = None
             self._direct_reg_size = None
+            # MULTI-ENTRY LRU registration cache. The single-entry
+            # tracker above deregisters the old buffer on EVERY (ptr,size) change,
+            # so two ALTERNATING output buffers (e.g. the embed-grad and
+            # lm_head-grad big backward AGs, which use different unsharded param
+            # buffers) each pay dereg(old)+reg(new) = TWO cross-node collectives
+            # per call -- the dominant cost of the de-fused big-AG path
+            # (serialfast/olapfast). Holding K>=2 registrations lets both stay
+            # resident so steady state pays ZERO register collectives. Keyed by
+            # exact (ptr,size); eviction is deterministic (oldest-first) and the
+            # (ptr,size) sequence is identical on every PE (FSDP issues the same
+            # AGs in the same order), so the register/deregister collectives stay
+            # lockstep-uniform -- the SPMD invariant that motivated the single-
+            # entry design is preserved. Exact-match hits only (no Python-side
+            # overlap logic) so two resident entries are always distinct live
+            # buffers. Insertion-ordered dict = the LRU. Cap via env (default 4;
+            # 0/1 restores single-entry behavior). Value = size (for bookkeeping).
+            self._reg_cache_cap = int(
+                os.environ.get("MORI_HIER_REG_CACHE", "4"))
+            self._direct_reg_lru = {}
 
             # resolve the deferred slice_direct default by
             # PROBING the real transport to a cross-node ring peer. slice_direct
@@ -1102,6 +1239,78 @@ class HierAllGather:
             # leader_only keeps the copy-OUT default.
             if self.slice_direct is None:
                 self.slice_direct = self._probe_rdma_transport()
+
+    def _get_hostproxy_inter(self):
+        """Lazily build the persistent host-proxy inter-node producer against
+        this PE's inter ring buffer (MORI_HIER_HOSTPROXY_REASM)."""
+        if self._hp_inter is None:
+            from .hostproxy_inter import HostProxyInterProducer
+            ring_ptr = self._inter._handle.buf_ptr()
+            # ring buffer holds ring_size chunks; size it generously (the handle
+            # was allocated with inter_bytes >= the full output). Use the full
+            # allocated region so any chunk offset is registered.
+            ring_bytes = self._inter_ring_bytes
+            self._hp_inter = HostProxyInterProducer(
+                my_pe=self.my_pe, npes=self.npes,
+                ranks_per_node=self.ranks_per_node,
+                ring_buf_ptr=ring_ptr, ring_buf_bytes=ring_bytes)
+        return self._hp_inter
+
+    def drain_hostproxy(self):
+        """Join any in-flight async host-proxy inter worker so ALL chunkReadyFlags
+        for the AGs issued so far are published+landed. Called by the deferred FSDP
+        consumer fence (Turn41 async completion-ordering fix). No-op unless the
+        async host-proxy producer is live."""
+        hp = getattr(self, "_hp_inter", None)
+        if hp is not None:
+            return bool(hp.drain())
+        return False
+
+    def _ensure_output_registered(self, output_data):
+        """Register output_data for direct-to-output SDMA push, LRU-cached.
+
+        Lockstep across PEs: the (ptr,size) sequence and eviction order are
+        identical on every rank (FSDP issues the same AGs in order), so the
+        register/deregister collectives stay uniform. Exact-match only. On a hit
+        no collective is issued (steady state = free).
+        """
+        out_ptr = output_data.data_ptr()
+        out_size = output_data.numel() * output_data.element_size()
+        key = (out_ptr, out_size)
+        cap = self._reg_cache_cap
+        if cap <= 1:
+            # single-entry behavior (original path)
+            if key != (self._direct_reg_ptr, self._direct_reg_size):
+                if self._direct_reg_ptr is not None:
+                    self._intra.deregister_output_buffer_ptr(self._direct_reg_ptr)
+                self._intra.register_output_buffer(output_data)
+                self._direct_reg_ptr = out_ptr
+                self._direct_reg_size = out_size
+            return
+        lru = self._direct_reg_lru
+        if key in lru:
+            # hit: refresh recency, no collective. Safe ONLY because the LRU
+            # mirrors C++'s overlap-eviction (below), so a hit is guaranteed
+            # still-registered on the C++ side.
+            lru.pop(key)
+            lru[key] = out_size
+            return
+        # miss. The C++ register_output_buffer evicts ANY prior registration
+        # whose range overlaps [ptr,ptr+size) (torch's caching allocator carves a
+        # fresh output inside a freed segment). We MUST drop those same entries
+        # from the Python LRU here, or a later cache-hit would skip re-register
+        # for a ptr C++ has already evicted -> find_exact fails / "exceeds output"
+        # at the direct gather. Bookkeeping only: C++ does the actual (symmetric)
+        # deregister inside register_output_buffer.
+        for k in [k for k in lru if (k[0] < out_ptr + out_size) and (out_ptr < k[0] + k[1])]:
+            lru.pop(k)
+        # capacity eviction (deterministic oldest-first, lockstep collective).
+        while len(lru) >= cap:
+            old_key = next(iter(lru))
+            lru.pop(old_key)
+            self._intra.deregister_output_buffer_ptr(old_key[0])
+        self._intra.register_output_buffer(output_data)
+        lru[key] = out_size
 
     def _probe_rdma_transport(self) -> bool:
         """Return True iff a cross-node ring peer is reached over RDMA (not IPC).
@@ -1195,8 +1404,447 @@ class HierAllGather:
         supposed to capture is actually visible); if it stays nondeterministic
         the bug is a genuine data/layout race in the kernel.
         """
+        # CROSS-STREAM lifetime guard: this AG may run on a dedicated comm
+        # stream (FSDP2) while the INPUT was produced on -- and is freed/recycled
+        # by reshard on -- the compute stream. The caching allocator only tracks
+        # the input's original stream, so it can hand the input storage to a
+        # later compute-stream op while this AG is still reading it on `stream`
+        # -> the big embed/lm_head AGs read a partially-overwritten input and
+        # diverge (reproduced by the rapid-fire XSTREAM+FREE_INPUT probe).
+        # record_stream marks the buffers in-use on the AG stream so the
+        # allocator defers reuse until this AG completes. Sync-free (no host
+        # stall) -- the standard non-default-stream collective safety contract.
+        if stream is not None and os.environ.get(
+            "MORI_HIER_NO_RECORD_STREAM", "0"
+        ) not in ("1", "true", "True"):
+            if hasattr(input_data, "record_stream"):
+                input_data.record_stream(stream)
+            if hasattr(output_data, "record_stream"):
+                output_data.record_stream(stream)
+        do_sync = self._debug_sync
+        big_ag = False
+        if self._sync_big and self.num_nodes > 1:
+            # Only the big cross-node AGs get a targeted completion fence.
+            if count * input_data.element_size() >= self._sync_big_bytes:
+                big_ag = True
+        # Turn-24: TARGETED RING/INTRA HOST-FINISH on the BACKWARD big AG only.
+        # Phase-6 ground truth pinned the residual fast-path loss drift (BUG B)
+        # to the BACKWARD re-unshard of the big embed/lm_head cross-node AG:
+        # backward-only host stream.synchronize() -> grads BIT-EXACT (T22);
+        # forward exonerated. Every DEVICE-side transport fence (22+, incl.
+        # WRITE_IMM recv-CQ landing proof) failed -> the repair mechanism is a
+        # HOST CPU RDMA-progress round-trip (STREAM_RING=0 host finish, which
+        # does hipStreamSynchronize + host ShmemBarrierAll on the ring/intra
+        # finish). Full stream.synchronize() is bit-exact but -22% because it
+        # also blocks CPU enqueue of the WHOLE rest of the step. This mode runs
+        # ONLY the backward big AG through the host-synced ring+intra finish
+        # (stream_ring/stream_intra off for that ONE call) -- draining just that
+        # op's stream, not the caller's whole compute stream -- while every
+        # other AG stays fully on-stream/overlapped. The host-sync path always
+        # issues full global ShmemBarrierAll (prepare+finish), so cross-PE buffer
+        # reuse stays correct across the mixed on-stream/host ops (T23 NEXT: the
+        # one untested cost point). Gated to autograd backward (grad disabled).
+        _ring_hostfin = (
+            self._sync_big_mode == "ringhostfin"
+            and big_ag
+            and not self._debug_sync
+            and not torch.is_grad_enabled()
+        )
+        _saved_sr = _saved_si = None
+        if _ring_hostfin:
+            _saved_sr, _saved_si = self.stream_ring, self.stream_intra
+            self.stream_ring = False
+            self.stream_intra = False
+        # T25 device-side isolation: does the CONCURRENT fused ring||local-gather
+        # kernel (one grid, NIC ring blocks || XGMI gather block) corrupt the
+        # backward big-AG ordering? Every device landing guarantee (put-signal,
+        # write-imm, oneshot system-scope acquire + threadfence_system) is already
+        # in place and standalone bit-exact, yet FSDP grads need a host round-trip
+        # -- the last un-isolated device variable is the FUSION itself. This mode
+        # forces the SERIAL non-fused, non-overlap slice_direct path (explicit
+        # per-block gathers + a global finish_direct_stream barrier) for the
+        # backward big AG, fully ON-STREAM (stream_ring/intra stay True, NO host
+        # sync). If grads go bit-exact here -> the concurrent grid was the race and
+        # the sync-free fix is "don't fuse the big backward AG"; if still 16x/0.83x
+        # -> the fusion is exonerated and the residual is genuinely host-progress-
+        # only. Gated to autograd backward big AG.
+        _serial_big = (
+            self._sync_big_mode == "serial"
+            and big_ag
+            and not self._debug_sync
+            and not torch.is_grad_enabled()
+        )
+        # T26: "serialfast" -- de-fuse the backward big AG WITHOUT flipping the
+        # global stream flags. T25 proved the concurrent FusedRingLocalGatherKernel
+        # (ring||XGMI gather in one grid) is the BUG-B corruptor: serializing that
+        # ONE big backward AG onto the two-launch on-stream slice_direct direct-
+        # gather path (per-block gather_kernel_direct + finish_direct_stream) gives
+        # DEVICE-SIDE, SYNC-FREE, BIT-EXACT grads. But "serial" mode only reaches
+        # that branch when stream_intra AND stream_ring are True (line ~1644), which
+        # the diagnostic SERIAL_ENV forced GLOBALLY -- flipping EVERY AG off the
+        # shipped fast stream_intra=0 path (222->146 TFLOPS, confounded). serialfast
+        # instead flips stream_intra/ring True (and fuse_local/overlap False) for
+        # ONLY this one big backward AG, so it takes the bit-exact on-stream direct
+        # path while every other AG (forward + small) keeps the shipped fast
+        # stream_intra=0 baseline untouched. ~1-2 de-fused AGs/step -> the overlap
+        # loss is bounded to those calls, not the whole step.
+        _serialfast_big = (
+            self._sync_big_mode == "serialfast"
+            and big_ag
+            and not self._debug_sync
+            and not torch.is_grad_enabled()
+        )
+        # T26: "olapfast" -- de-fuse ONLY the single-grid concurrency, keep the
+        # side-stream ring<->local-gather OVERLAP. serialfast is bit-exact but
+        # -30% (the two-launch SERIAL direct path forgoes overlap AND re-registers
+        # the output buffer per alternating embed/lm_head call). T25 pinned the
+        # corruptor to the CONCURRENT FusedRingLocalGatherKernel (ring||XGMI gather
+        # in ONE grid). Its predecessor slice_direct_overlap uses TWO SEPARATE
+        # launches (ring on main || local-block gather on a side stream, merged by
+        # main.wait_stream(side)) -- overlapped but NOT one concurrent grid. If the
+        # corruption is specifically the single-grid concurrency, this path is
+        # bit-exact AND keeps the overlap (should land far above serialfast's 142).
+        # Gated to the backward big AG only; every other AG stays on the shipped
+        # fast stream_intra=0 baseline.
+        _olapfast_big = (
+            self._sync_big_mode == "olapfast"
+            and big_ag
+            and not self._debug_sync
+            and not torch.is_grad_enabled()
+        )
+        # T28: "olapfast2" -- olapfast (de-fuse the single concurrent grid, keep the
+        # two-launch side-stream ring<->local-gather overlap) PLUS defer the de-fused
+        # big AG's inter-ring finish fence. T27 refuted register churn as the 161-vs-203
+        # gap; the remaining direct-to-output cost is the per-op GLOBAL inter-ring
+        # ShmemBarrier that HIER_ENV forces (SLICE_DEFER_INTER_FIN=0) on every big AG.
+        # The fast finish_batch baseline pays this too, but the direct-overlap path also
+        # ping-pongs a side stream, so the exposed global fence serializes harder. Defer
+        # it (barrier=False) for ONLY this de-fused big AG so the successor op's prepare
+        # barrier covers ring-buffer reuse -- same safety class as slice_defer_fin, which
+        # is already deferred (=1) on this path. Gated to autograd backward big AG.
+        _olapfast2_big = (
+            self._sync_big_mode == "olapfast2"
+            and big_ag
+            and not self._debug_sync
+            and not torch.is_grad_enabled()
+        )
+        # Phase-5 (Team A, director 13:48Z): "devgate" -- run the backward big AG
+        # on the SAME sync-free on-stream olapfast overlap path (two-launch
+        # side-stream ring<->local-gather, stream_ring/intra on) BUT append a
+        # DEVICE landing gate kernel on the caller's stream after finish. The gate
+        # (ShmemQuietThread<RDMA> live-drain of every mlx5 CQ/QP + threadfence_sys)
+        # is the on-device equivalent of the host stream.synchronize that is the
+        # ONLY bit-exact fence on this HW (T11) -- it waits the actual RDMA
+        # hardware landing so the FSDP-recorded event coincides with it, WITHOUT
+        # the host round-trip that costs olapfast/bwdbig ~-22%. Gated to backward
+        # big AG only; every other AG unchanged.
+        _devgate_big = (
+            self._sync_big_mode == "devgate"
+            and big_ag
+            and not self._debug_sync
+            and not torch.is_grad_enabled()
+        )
+        # Phase-5 (Team A, Turn 15): "devtouch" -- COMPOSE the two best near-miss
+        # fences, each of which closes a DIFFERENT half of the backward big-AG
+        # residual and neither of which alone is bit-exact on this MI300X/mlx5:
+        #   - devgate (device landing gate, ShmemQuietThread RDMA CQ live-drain +
+        #     threadfence_system): the strongest TEMPORAL landing fence on-device
+        #     (Δ-0.0042, best near-miss) -- waits the actual RDMA hardware landing.
+        #   - coretouch (L2CoherentRetouch, volatile glc L2-bypass load + CU
+        #     re-publish): closes the CACHE-COHERENCE half (SDMA-copy-engine-written
+        #     output not L2-coherent to the consumer GEMM under FSDP buffer reuse).
+        # Run the gate FIRST (drain RDMA landing so the bytes have physically
+        # landed) THEN the coherent re-touch (pull the freshly-landed HBM into the
+        # CU/L2 domain the GEMM reads). Both on the caller stream, no host stall.
+        _devtouch_big = (
+            self._sync_big_mode == "devtouch"
+            and big_ag
+            and not self._debug_sync
+            and not torch.is_grad_enabled()
+        )
+        # T29: "dbufstream" -- keep the big backward AG on the FAST contiguous
+        # copy-out STRUCTURE (gather all node-blocks into a contiguous scratch,
+        # then ONE bulk finish_batch_stream copy-OUT -- the 222-TFLOPS shipped
+        # path's shape), NOT the ~21%-slower direct-to-output strided writes that
+        # serialfast/olapfast take. To do that force slice_direct=False for this
+        # ONE AG (routes it to the else copy-out branch at ~1922) while turning ON
+        # the stream-ordered ring+copy-out (stream_ring/stream_intra=True), and
+        # DE-FUSE (fuse_local/slice_direct_overlap=False, no concurrent grid). The
+        # copy-out branch reuses the SHARED _slice_scratch with a deferred finish
+        # fence, which is exactly the T28 scratch-reuse staleness for consecutive
+        # big AGs -- so give this AG a DEDICATED double-buffered scratch (see
+        # _big_dbuf_active below). Gated to autograd backward big AG only.
+        _dbufstream_big = (
+            self._sync_big_mode == "dbufstream"
+            and big_ag
+            and not self._debug_sync
+            and not torch.is_grad_enabled()
+        )
+        # Phase-5 (Team A, mlx5): "bwdbigff" -- backward big AG host-drained
+        # (bit-exact, same as bwdbig) BUT the FORWARD big AG (GT-exonerated by
+        # the T22 bisection: forward [FP] bit-exact, only backward [GFP] races)
+        # takes the FAST fused-fill kernel (fuse_local) instead of the default
+        # de-fused slice overlap. Forward carries ~2 big embed/lm_head AGs/step;
+        # filling them faster (fuse_local ~0.9x vs slice ~0.71x on this fabric)
+        # shaves the exposed forward comm while the backward host-drain keeps the
+        # landing->consume ordering the racy backward re-unshard requires. Every
+        # small AG + all backward stays on the correct path unchanged.
+        _bwdbigff_fwd = (
+            self._sync_big_mode == "bwdbigff"
+            and big_ag
+            and not self._debug_sync
+            and torch.is_grad_enabled()
+        )
+        _saved_fl_ff = None
+        if _bwdbigff_fwd:
+            _saved_fl_ff = self.fuse_local
+            self.fuse_local = True
+        _saved_fl = _saved_sdo = None
+        _saved_sr2 = _saved_si2 = None
+        _saved_dif = None
+        if _serial_big:
+            _saved_fl, _saved_sdo = self.fuse_local, self.slice_direct_overlap
+            self.fuse_local = False
+            self.slice_direct_overlap = False
+        if _serialfast_big:
+            _saved_fl, _saved_sdo = self.fuse_local, self.slice_direct_overlap
+            _saved_sr2, _saved_si2 = self.stream_ring, self.stream_intra
+            # on-stream, sync-free: force the two-launch direct-gather serial path
+            self.fuse_local = False
+            self.slice_direct_overlap = False
+            self.stream_ring = True
+            self.stream_intra = True
+        if _olapfast_big or _olapfast2_big or _devgate_big or _devtouch_big:
+            _saved_fl, _saved_sdo = self.fuse_local, self.slice_direct_overlap
+            _saved_sr2, _saved_si2 = self.stream_ring, self.stream_intra
+            # on-stream, sync-free: two-launch side-stream OVERLAP direct path
+            # (no single concurrent grid), keeps ring<->local-gather overlap.
+            self.fuse_local = False
+            self.slice_direct_overlap = True
+            self.stream_ring = True
+            self.stream_intra = True
+        if _olapfast2_big:
+            # defer the exposed global inter-ring finish fence for this big AG.
+            _saved_dif = self.slice_defer_inter_fin
+            self.slice_defer_inter_fin = True
+        _saved_sd = None
+        if _dbufstream_big:
+            _saved_fl, _saved_sdo = self.fuse_local, self.slice_direct_overlap
+            _saved_sr2, _saved_si2 = self.stream_ring, self.stream_intra
+            _saved_sd = self.slice_direct
+            # fast contiguous copy-out shape, de-fused, dedicated double buffer.
+            self.fuse_local = False
+            self.slice_direct_overlap = False
+            self.stream_ring = True
+            self.stream_intra = True
+            self.slice_direct = False
+            self._big_dbuf_active = True
+            self._big_scratch_parity ^= 1
         ret = self._call_impl(input_data, output_data, count, stream)
-        if self._debug_sync:
+        if _bwdbigff_fwd:
+            self.fuse_local = _saved_fl_ff
+        if _serial_big:
+            self.fuse_local, self.slice_direct_overlap = _saved_fl, _saved_sdo
+        if (_serialfast_big or _olapfast_big or _olapfast2_big or _devgate_big
+                or _devtouch_big):
+            self.fuse_local, self.slice_direct_overlap = _saved_fl, _saved_sdo
+            self.stream_ring, self.stream_intra = _saved_sr2, _saved_si2
+        if _devgate_big:
+            # Device landing gate on the caller's stream: drain every posted
+            # inter-node RDMA WQE (mlx5 CQ) on-device before the FSDP event, the
+            # sync-free equivalent of the host stream.synchronize.
+            from .collective import launch_device_landing_gate
+            from .collective import _stream_to_int
+            launch_device_landing_gate(_stream_to_int(stream))
+            return ret
+        if _devtouch_big:
+            # Compose: device RDMA landing gate (temporal landing fence) FIRST,
+            # THEN the L2-coherent re-touch (cache-coherence fence). Both on the
+            # caller stream (stream-ordered, no host stall). Targets the residual
+            # each fence alone leaves: gate=Δ-0.0042, coretouch=Δ-0.0093.
+            from .collective import (launch_device_landing_gate,
+                                     launch_l2_coherent_retouch, _stream_to_int)
+            cs = (torch.cuda.current_stream(input_data.device)
+                  if stream is None else stream)
+            si = _stream_to_int(cs)
+            launch_device_landing_gate(si)
+            n = count * self.ranks_per_node * self.num_nodes
+            u32_count = (n * output_data.element_size() + 3) // 4
+            launch_l2_coherent_retouch(output_data.data_ptr(), u32_count, si)
+            return ret
+        if _olapfast2_big:
+            self.slice_defer_inter_fin = _saved_dif
+        if _dbufstream_big:
+            self.fuse_local, self.slice_direct_overlap = _saved_fl, _saved_sdo
+            self.stream_ring, self.stream_intra = _saved_sr2, _saved_si2
+            self.slice_direct = _saved_sd
+            self._big_dbuf_active = False
+        if _ring_hostfin:
+            self.stream_ring, self.stream_intra = _saved_sr, _saved_si
+            return ret
+        # DEBUG_SYNC always host-syncs; SYNC_BIG (barrier mode) prefers a
+        # device-side cross-PE barrier on the big AGs (no host stall).
+        if big_ag and not self._debug_sync and self._sync_big_mode == "coretouch":
+            # Phase-5 (Team A): barrier (orders RDMA cross-PE landing + intra SDMA
+            # gather) FIRST, THEN an L2-COHERENT re-touch of the consumed output.
+            # This is barriercutouch's compose EXCEPT the re-touch is the
+            # system-scope acquire/release L2CoherentRetouchKernel_u32 (bypasses the
+            # stale L2 line that barriercutouch's torch.add(out,0) read through) --
+            # the direct fix for the residual dL 0.0023 barriercutouch left. Both
+            # ops on the caller stream => stream-ordered, sync-free (keeps overlap).
+            from ..shmem import shmem_barrier_on_stream
+            from .collective import launch_l2_coherent_retouch, _stream_to_int
+            cs = (torch.cuda.current_stream(input_data.device)
+                  if stream is None else stream)
+            shmem_barrier_on_stream(cs)
+            n = count * self.ranks_per_node * self.num_nodes
+            u32_count = (n * output_data.element_size() + 3) // 4
+            launch_l2_coherent_retouch(
+                output_data.data_ptr(), u32_count, _stream_to_int(cs))
+        elif big_ag and not self._debug_sync and self._sync_big_mode == "barriercutouch":
+            # NEW (Phase-5, new-cluster mlx5): the device barrier and the CU
+            # re-touch each close a DIFFERENT half of the big-AG completion race
+            # and neither alone is bit-exact on this MI300X/mlx5 pair:
+            #  - "barrier" alone: cut the olapfast drift ~24x (Δ0.054 -> Δ0.0023)
+            #    at ~139 TFLOPS. The RDMA quiet+rendezvous orders the NIC remote
+            #    landing, but the slice_direct direct-to-output write is done by
+            #    the intra SDMA COPY ENGINE (a separate hw agent) whose bytes are
+            #    not guaranteed CU/L2-coherent to the consumer GEMM just by the
+            #    barrier -> residual Δ0.0023.
+            #  - "cutouch" alone: makes the consumed buffer's LAST writer a CU op
+            #    (CU/L2-coherent with the GEMM) but does NOT order the cross-node
+            #    RDMA landing -> a CU re-touch can read still-unlanded remote bytes.
+            # Compose them: barrier FIRST (quiet the NIC + cross-PE rendezvous so
+            # every peer's remote-half bytes have physically landed and the intra
+            # SDMA gather has run), THEN a CU re-touch (fenced CU read+rewrite of
+            # the landed bytes into the CU/L2 domain the GEMM reads). Both enqueued
+            # on the SAME caller stream => stream-ordered (barrier kernel completes
+            # before the re-touch reads), sync-free (no host stall, keeps overlap).
+            # add-by-0 is bit-exact for bf16/fp16/fp32/int. Targets ONLY the big
+            # embed/lm_head cross-node AGs where the residual race lives.
+            from ..shmem import shmem_barrier_on_stream
+            cs = (torch.cuda.current_stream(input_data.device)
+                  if stream is None else stream)
+            shmem_barrier_on_stream(cs)
+            n = count * self.ranks_per_node * self.num_nodes
+            out_flat = output_data.view(-1)[:n]
+            with torch.cuda.stream(cs):
+                torch.add(out_flat, 0, out=out_flat)
+        elif big_ag and not self._debug_sync and self._sync_big_mode == "devcutouch":
+            # Phase-5 (Team A, Turn 15): THREE fences, each closing a distinct part
+            # of the backward big-AG residual that no single/double compose closed:
+            #   1. shmem_barrier_on_stream -- CROSS-PE RENDEZVOUS: the device gate
+            #      alone drains only THIS PE's outgoing send CQ (proves my writes
+            #      LEFT), it has NO guarantee the NEIGHBOR's RDMA writes have LANDED
+            #      in my output. The barrier is the cross-PE order that guarantees
+            #      every peer's remote-half bytes are in flight/ordered.
+            #   2. device landing gate (ShmemQuietThread RDMA CQ live-drain +
+            #      threadfence_system) -- TEMPORAL HW LANDING: spins the mlx5 CQ
+            #      until every posted WQE completed, so bytes have PHYSICALLY landed
+            #      at HBM (barrier orders but does not drain the hw send queues).
+            #   3. torch.add(out,0) CU re-touch -- L2 REPUBLISH: makes the consumed
+            #      buffer's LAST writer a CU op (CU/L2-coherent with the GEMM). The
+            #      plain add-by-0 (barriercutouch's Δ0.0023 mechanism) beat the
+            #      volatile-glc L2CoherentRetouch (coretouch Δ-0.0093), so use it.
+            # barriercutouch (barrier+retouch) reached Δ0.0023 and devgate
+            # (gate) reached Δ-0.0042; each leaves a DIFFERENT residual, so drain
+            # the hw landing (gate) BETWEEN the rendezvous (barrier) and the CU
+            # republish (retouch). All on the caller stream, no host stall.
+            from ..shmem import shmem_barrier_on_stream
+            from .collective import launch_device_landing_gate, _stream_to_int
+            cs = (torch.cuda.current_stream(input_data.device)
+                  if stream is None else stream)
+            shmem_barrier_on_stream(cs)
+            launch_device_landing_gate(_stream_to_int(cs))
+            n = count * self.ranks_per_node * self.num_nodes
+            out_flat = output_data.view(-1)[:n]
+            with torch.cuda.stream(cs):
+                torch.add(out_flat, 0, out=out_flat)
+        elif big_ag and not self._debug_sync and self._sync_big_mode == "barrier":
+            from ..shmem import shmem_barrier_on_stream
+            bs = (torch.cuda.current_stream(input_data.device)
+                  if stream is None else stream)
+            shmem_barrier_on_stream(bs)
+        elif big_ag and not self._debug_sync and self._sync_big_mode == "barrierthrottle":
+            # NEW (Phase-5, new-cluster mlx5): device barrier (NIC-landing +
+            # cross-PE order) COMPOSED WITH a bounded CPU run-ahead throttle.
+            # RATIONALE: on this MI300X/mlx5 pair "barrier" alone cuts the
+            # olapfast completion-race drift ~24x (Δ0.054 -> Δ0.0023) at fast-path
+            # speed (139 TFLOPS), but leaves a SIGN-FLIPPING residual (the
+            # threshold-8MB run gives +0.0023, threshold-1MB gives -0.018) --
+            # i.e. a NON-DETERMINISTIC residual that ACCUMULATES across steps into
+            # the last_loss drift. Composing the CU re-touch (barriercutouch) made
+            # it WORSE (the re-touch re-reads the window). Instead bound the CPU
+            # run-ahead: after the device barrier orders THIS big AG's landing,
+            # host-wait on the PREVIOUS big AG's completion event (bounds the CPU
+            # to ~1 big-AG ahead of the GPU) and record this AG's event for the
+            # next call. This does NOT re-read the current AG (no reopened window,
+            # unlike barriercutouch) -- it only prevents the tiny per-AG residual
+            # from compounding step-over-step, at far less cost than a full
+            # host-drain of the current AG (which is the 112-TFLOPS bit-exact
+            # floor). If the last_loss drift is an ACCUMULATION of the barrier's
+            # damped residual, this lands bit-exact well above 114 TFLOPS.
+            from ..shmem import shmem_barrier_on_stream
+            bts = (torch.cuda.current_stream(input_data.device)
+                   if stream is None else stream)
+            shmem_barrier_on_stream(bts)
+            if self._sync_big_prev_event is not None:
+                self._sync_big_prev_event.synchronize()
+            ev = torch.cuda.Event()
+            ev.record(bts)
+            self._sync_big_prev_event = ev
+        elif big_ag and not self._debug_sync and self._sync_big_mode == "cutouch":
+            # CU re-touch on the big AGs: the slice_direct direct-to-output path
+            # writes ``output`` with the intra SDMA gather (copy-engine domain)
+            # and has NO CU re-touch (unlike the nodirect copy-out path, which
+            # already routes through _cu_copyout_finish). Phase-6 ground truth
+            # localizes the residual stale-read race to exactly these big
+            # embed/lm_head cross-node AGs. Force the LAST writer of the consumed
+            # buffer to be a CU op on the CALLER stream via an in-place
+            # elementwise re-touch: it does a fenced/coherent CU READ of the
+            # SDMA-written bytes and re-writes them in the CU/L2 domain the
+            # consumer GEMM reads, stream-ordered so FSDP's recorded event
+            # captures it -- the same coherence _cu_copyout_finish gives the
+            # copy-out path, but WITHOUT a host stall (keeps overlap). add-by-0
+            # is bit-exact for bf16/fp16/fp32 (x rounds to itself) and ints.
+            n = count * self.ranks_per_node * self.num_nodes
+            out_flat = output_data.view(-1)[:n]
+            cs = (torch.cuda.current_stream(input_data.device)
+                  if stream is None else stream)
+            with torch.cuda.stream(cs):
+                torch.add(out_flat, 0, out=out_flat)
+        elif big_ag and not self._debug_sync and self._sync_big_mode in (
+            "bwdbig", "bwdbigff"
+        ):
+            # Selective host-drain, TIGHTER than SYNC_BIG=host. Ground-truth
+            # bisection (fwd [FP] bit-exact, bwd [GFP] diverges) exonerates the
+            # FORWARD big embed/lm_head AGs and every small per-layer AG -- only
+            # the BACKWARD re-unshard of the big AG races the consumer GEMM. So
+            # host-drain ONLY that call (FSDP runs the backward re-unshard with
+            # grad DISABLED => not is_grad_enabled()), and let the forward big AG
+            # + all small AGs keep the fast overlap. Same landing->consume
+            # ordering the backward AG needs, half the big-AG host stalls of
+            # SYNC_BIG=host (drops the ~2 exonerated forward big-AG syncs/step).
+            # bwdbigff additionally fast-fills the forward big AG via fuse_local
+            # (toggled above); the backward host-drain is identical.
+            if not torch.is_grad_enabled():
+                s = (torch.cuda.current_stream(input_data.device)
+                     if stream is None else stream)
+                s.synchronize()
+        elif big_ag and not self._debug_sync and self._sync_big_mode == "throttle":
+            # Bounded CPU run-ahead throttle: host-wait on the PREVIOUS big AG's
+            # completion event (bounds run-ahead to ~1 step), then record this
+            # big AG's completion for the next call. The current big AG still
+            # overlaps with compute -- only the CPU is prevented from getting
+            # more than one big-AG ahead of the GPU.
+            s = (torch.cuda.current_stream(input_data.device)
+                 if stream is None else stream)
+            if self._sync_big_prev_event is not None:
+                self._sync_big_prev_event.synchronize()
+            ev = torch.cuda.Event()
+            ev.record(s)
+            self._sync_big_prev_event = ev
+        elif do_sync or big_ag:
             s = (torch.cuda.current_stream(input_data.device)
                  if stream is None else stream)
             s.synchronize()
@@ -1405,16 +2053,37 @@ class HierAllGather:
                     count, input_data.dtype, input_data.device
                 )
             else:
-                if (
-                    self._slice_scratch is None
-                    or self._slice_scratch.numel() < slice_total
-                    or self._slice_scratch.dtype != input_data.dtype
-                    or self._slice_scratch.device != input_data.device
-                ):
-                    self._slice_scratch = torch.empty(
-                        slice_total, dtype=input_data.dtype, device=input_data.device
-                    )
-                collection = self._slice_scratch[:slice_total]
+                if self._big_dbuf_active:
+                    # T29 dbufstream: dedicated double-buffered scratch for the big
+                    # backward AG. Alternating buffers (parity toggled per big AG)
+                    # ensure consecutive big embed/lm_head AGs never share the same
+                    # collection, so a deferred finish fence on AG#1 cannot be
+                    # clobbered by AG#2's ring copy-IN (the T28 staleness).
+                    p = self._big_scratch_parity
+                    buf = self._big_scratch[p]
+                    if (
+                        buf is None
+                        or buf.numel() < slice_total
+                        or buf.dtype != input_data.dtype
+                        or buf.device != input_data.device
+                    ):
+                        buf = torch.empty(
+                            slice_total, dtype=input_data.dtype,
+                            device=input_data.device,
+                        )
+                        self._big_scratch[p] = buf
+                    collection = buf[:slice_total]
+                else:
+                    if (
+                        self._slice_scratch is None
+                        or self._slice_scratch.numel() < slice_total
+                        or self._slice_scratch.dtype != input_data.dtype
+                        or self._slice_scratch.device != input_data.device
+                    ):
+                        self._slice_scratch = torch.empty(
+                            slice_total, dtype=input_data.dtype, device=input_data.device
+                        )
+                    collection = self._slice_scratch[:slice_total]
                 # when the direct-path local-block overlap is
                 # active, the ring is run INTERLEAVED inside Phase B (split into
                 # prepare_stream_only + kernel/finish so the local-block gather
@@ -1492,17 +2161,160 @@ class HierAllGather:
                     # divergent) overlap-eviction. Steady state (same output reused
                     # op-to-op) skips the collective entirely; a buffer change runs
                     # exactly {Dereg(old) if old; Reg(new)} uniformly on every PE.
-                    out_ptr = output_data.data_ptr()
-                    out_size = output_data.numel() * output_data.element_size()
-                    if (out_ptr, out_size) != (self._direct_reg_ptr,
-                                               self._direct_reg_size):
-                        if self._direct_reg_ptr is not None:
-                            self._intra.deregister_output_buffer_ptr(
-                                self._direct_reg_ptr)
-                        self._intra.register_output_buffer(output_data)
-                        self._direct_reg_ptr = out_ptr
-                        self._direct_reg_size = out_size
-                    if self.fuse_local and not entry_barrier and not self.slice_oop:
+                    self._ensure_output_registered(output_data)
+                    if (self.fuse_remote and self.num_nodes == 2
+                            and not entry_barrier and not self.slice_oop):
+                        # PHASE 4 PIPELINE: one fused launch runs the ring AND,
+                        # per landed sub-range, the remote-block SDMA reassembly
+                        # straight from this PE's ring buffer into the registered
+                        # output (no ring copy-OUT, no whole-phase finish barrier).
+                        # The remote gather of sub-range j overlaps ring channel
+                        # j+1 still crossing the NIC -- fuses the two serial phases.
+                        from .collective import launch_fused_ring_remote_gather
+                        node = self.node_id
+                        rb = self._inter.num_blocks
+                        # Persistent chunk-landing flag buffer. DEEP_PIPE splits the
+                        # single ring channel into P temporal sub-chunks, each with
+                        # its own landing flag, so the buffer must hold >= P slots
+                        # (only engages at rb==1). Otherwise >= ring_blocks u64.
+                        _deep_pipe = int(os.environ.get("MORI_HIER_DEEP_PIPE", "1"))
+                        if _deep_pipe < 1:
+                            _deep_pipe = 1
+                        if _deep_pipe > 8:
+                            _deep_pipe = 8
+                        # SIZE GATE (Turn44 A): the per-sub-chunk DEVICE landing
+                        # signal (ShmemQuiet->AMO flag->chunkReadyFlags) is
+                        # bit-exact only while each temporal sub-chunk stays inside
+                        # the MI300X/mlx5 NIC-DMA->HBM/SDMA coherence window.
+                        # UT-measured on 089/119: bit-exact AND >RCCL (P2=1.231x,
+                        # P4=1.170x) at a 32MB per-rank ring chunk, but bit-exact
+                        # MISMATCH at 64MB (the send-CQE fires before the landed
+                        # bytes are SDMA-coherent; no device fence closes it, 15+
+                        # turns proven). So engage DEEP_PIPE only when the ring
+                        # chunk is <= the safe threshold and fall back to the
+                        # bit-exact crown fill for the giant embed/lm_head AG
+                        # (466MB @ step0) which would otherwise drift/crash.
+                        # Default env DEEP_PIPE=1 => this whole block is inert
+                        # (byte-identical shipped path). Threshold overridable.
+                        _dp_chunk_bytes = int(count) * int(input_data.element_size())
+                        _dp_max = int(os.environ.get(
+                            "MORI_HIER_DEEP_PIPE_MAXBYTES",
+                            str(48 * 1024 * 1024)))
+                        if _deep_pipe > 1 and _dp_chunk_bytes > _dp_max:
+                            _deep_pipe = 1
+                        _flag_slots = max(rb, _deep_pipe if rb == 1 else 1, 1)
+                        if (self._chunk_ready_flags is None
+                                or self._chunk_ready_flags.numel() < _flag_slots):
+                            self._chunk_ready_flags = torch.zeros(
+                                _flag_slots, dtype=torch.int64,
+                                device=input_data.device)
+                        flags = self._chunk_ready_flags
+                        flags.zero_()
+                        # HOST-PROXY INTER (MORI_HIER_HOSTPROXY_REASM=1): the
+                        # device ring-send CTAs skip the RDMA send; a persistent
+                        # CPU proxy owns the inter leg and publishes
+                        # chunkReadyFlags[f] after its send-CQ drains. Build the
+                        # producer lazily against THIS PE's ring buffer.
+                        _hp_reasm = os.environ.get(
+                            "MORI_HIER_HOSTPROXY_REASM", "0") not in (
+                            "0", "", "false", "False")
+                        _hp_prod = None
+                        if _hp_reasm:
+                            _hp_prod = self._get_hostproxy_inter()
+                        # Ring prepare = global entry barrier + copy-IN (no launch).
+                        ring_args, u32c, s_main = self._inter.prepare_stream_only(
+                            input_data, count, stream)
+                        if _hp_prod is not None:
+                            # record the copy-IN so the host RDMA read sees it.
+                            if self._hp_src_ev is None:
+                                self._hp_src_ev = torch.cuda.Event()
+                            self._hp_src_ev.record(
+                                torch.cuda.current_stream(input_data.device)
+                                if stream is None else stream)
+                        # Local-block direct-gather jit_args (m == node_id): reads
+                        # this rank's own input, no ring dependency.
+                        gather_args = self._intra.prepare_direct_only(
+                            input_data,
+                            output_data,
+                            count,
+                            dst_block_offset=node * block_count,
+                            stream=stream,
+                            prepare_barrier=False,
+                        )
+                        # PHASE 4 (deadlock-free push-only reassembly): the remote
+                        # blocks are now PUSH-ONLY (each rank writes its own column
+                        # into disjoint output slots, no cross-rank wait) with a
+                        # single completion reader in the local-block CTA, so
+                        # reasm>1 no longer dead-locks. Each reassembly block j uses
+                        # SDMA queue qId=j, so to avoid racing the per-queue signal
+                        # counter reasm MUST be <= the peer's SDMA queue count
+                        # (sdmaNumQueue, default 2). Clamp accordingly. Flags use
+                        # slots [0,G) (local) + [G, G+reasm*(N-1)*G) (reassembly),
+                        # covered by the enlarged intra flags buffer.
+                        reasm = int(os.environ.get(
+                            "MORI_HIER_REASSEM_BLOCKS", "1"))
+                        # Reassembly blocks use SDMA queues [1, nq); queue 0 is
+                        # taken by the concurrent local-block CTA. So max safe
+                        # concurrent reassembly blocks == sdmaNumQueue-1.
+                        _sdma_nq = int(os.environ.get("MORI_HIER_SDMA_NQ", "2"))
+                        if reasm > _sdma_nq - 1:
+                            reasm = _sdma_nq - 1
+                        if reasm < 1:
+                            reasm = 1
+                        launch_fused_ring_remote_gather(
+                            ring_args, gather_args, rb,
+                            flags.data_ptr(), N, node, s_main,
+                            reassembly_blocks=reasm)
+                        if _hp_prod is not None:
+                            # The kernel is now live: ring CTAs no-op (host owns
+                            # inter), reassembly workers spin on chunkReadyFlags.
+                            # The host proxy RDMA-writes this PE's ring chunk into
+                            # the partner's ring buffer, drains its send-CQ (the
+                            # proven landing fence), rail-pair barriers, then
+                            # publishes chunkReadyFlags[f] so the reassembly runs.
+                            chunk_bytes = count * input_data.element_size()
+                            _hp_async = os.environ.get(
+                                "MORI_HIER_HOSTPROXY_ASYNC", "0") not in (
+                                "0", "", "false", "False")
+                            if _hp_async:
+                                # non-blocking: worker owns the inter round-trip
+                                # so the caller keeps issuing / computing while it
+                                # runs; the kernel + deferred fence gate consume.
+                                _hp_prod.fill_async(
+                                    chunk_bytes, _deep_pipe, flags,
+                                    src_ready_event=self._hp_src_ev,
+                                    stream=stream)
+                            else:
+                                _hp_prod.fill(
+                                    chunk_bytes, _deep_pipe, flags,
+                                    src_ready_event=self._hp_src_ev,
+                                    stream=stream)
+                        # Single completion fence (no copy-OUT: gathers already
+                        # pushed straight into the user output).
+                        self._intra.finish_direct_stream(
+                            stream=stream, barrier=not self.slice_defer_fin)
+                        # PHASE-5 CU-COHERENT COPY-OUT (MORI_HIER_FUSE_REMOTE_RETOUCH):
+                        # the fused kernel lands every peer's SDMA push into the
+                        # output (per-queue SdmaQueitThread + threadfence + flag,
+                        # waited by the completion reader) -- fabric-coherent in HBM
+                        # but the consumer GEMM may read a STALE L2 line for the
+                        # reused FSDP output buffer (the +0.018 E2E drift). Republish
+                        # with a FULL-GRID volatile-glc re-touch (bypass stale L2,
+                        # fetch fresh HBM, store back) AFTER the completion fence, so
+                        # it is stream-ordered behind the landing and runs on all
+                        # CUs (fast, not the thread-starved in-kernel pass). No host
+                        # stall. Default OFF (byte-identical shipped path).
+                        if os.environ.get(
+                            "MORI_HIER_FUSE_REMOTE_RETOUCH", "0"
+                        ).strip().lower() in ("1", "true", "yes", "on"):
+                            from .collective import (launch_l2_coherent_retouch,
+                                                     _stream_to_int)
+                            _u32 = (output_data.numel() *
+                                    output_data.element_size()) // 4
+                            launch_l2_coherent_retouch(
+                                output_data.data_ptr(), _u32,
+                                _stream_to_int(stream))
+                    elif self.fuse_local and not entry_barrier and not self.slice_oop:
                         # FUSED ring || local-block gather in ONE
                         # kernel launch (NIC ring blocks [0,num_blocks) || XGMI
                         # local-block SDMA gather in the last block). Replaces the
@@ -1541,22 +2353,87 @@ class HierAllGather:
                             ring_args, gather_args, self._inter.num_blocks, s_main)
                         # Ring finish copy-OUT into the collection scratch (the
                         # ring kernel already ran inside the fused launch -- do NOT
-                        # relaunch it).
-                        self._inter.finish_ring_stream(
-                            collection, count, stream,
-                            barrier=not self.slice_defer_inter_fin)
+                        # relaunch it). RED-LINE: force the COPY-ENGINE finish (not
+                        # the CU RingFinishCopyKernel) so the fuse_local win path
+                        # never moves bulk all-gather bytes on CUs -- Turn-12
+                        # standalone proved the fused overlap ALONE beats RCCL
+                        # bit-exact with the copy-engine finish (fp32 256MiB 175.0
+                        # vs RCCL 162.9 = 1.07x), so the CU copy is pure red-line
+                        # cost with ~1% BW upside. MORI_HIER_RING_CU_COPYOUT can
+                        # still force CU for an explicit A/B, but default stays SDMA.
+                        _fl_cu = os.environ.get(
+                            "MORI_HIER_RING_CU_COPYOUT", "0"
+                        ).strip().lower() in ("1", "true", "yes", "on")
+                        # PHASE 4 E2E-COHERENCE lever (MORI_HIER_FUSE_LOCAL_NOCOPY):
+                        # the finish_ring_stream copy-OUT is a COPY-ENGINE (SDMA)
+                        # D2D read of the ring buffer. Turn-13 pinned exactly this
+                        # copy-engine read as the fuse_local E2E stale-remote race:
+                        # the ring CTA lands the remote half via NIC RDMA and does a
+                        # CU-scope __threadfence_system, but the copy engine is a
+                        # SEPARATE hw agent NOT ordered by that fence, so its D2D
+                        # can drain STALE remote-half ring bytes into ``collection``,
+                        # which the reassembly then propagates. This lever DROPS the
+                        # copy-OUT entirely and points the remote reassembly SDMA
+                        # read straight at the ring buffer (full_tensor view) -- one
+                        # fewer cross-agent hop, no copy-engine D2D of bulk bytes,
+                        # AND a saved ~(N-1)/N copy-out (BW upside). Byte-identical by
+                        # construction: ring slot m == collection[m]. Default OFF for
+                        # A/B; keeps bulk bytes on SDMA (red-line safe).
+                        _fl_nocopy = os.environ.get(
+                            "MORI_HIER_FUSE_LOCAL_NOCOPY", "0"
+                        ).strip().lower() in ("1", "true", "yes", "on")
+                        if _fl_nocopy:
+                            # DROP the copy-OUT: read the ring buffer directly. The
+                            # trailing finish_direct_stream fence + the intra entry
+                            # barrier on the first remote gather (below) order the
+                            # ring landing before any reassembly read and complete
+                            # the op, so no separate ring copy-OUT fence is needed.
+                            reasm_src = self._inter.full_tensor(
+                                count, input_data.dtype, input_data.device)
+                        else:
+                            reasm_src = collection
+                            self._inter.finish_ring_stream(
+                                collection, count, stream,
+                                barrier=not self.slice_defer_inter_fin,
+                                cu_copyout=_fl_cu)
                         # Remaining (remote) blocks read the ring collection.
+                        # PHASE 4 E2E-SAFETY: the remote reassembly is an INTRA-node
+                        # subgroup gather -- each local rank SDMA-pushes its OWN
+                        # collection[m] slice to the G local peers over XGMI. That
+                        # slice was produced by THIS rank's finish_ring_stream copy-
+                        # OUT of the ring buffer. Under FSDP tight back-to-back reuse
+                        # a peer rank's gather can read our collection over XGMI
+                        # BEFORE our copy-OUT (and the concurrently-launched fused
+                        # ring CTA's remote-half landing) is globally visible -> the
+                        # documented ~48% stale-remote-half loss race that keeps
+                        # fuse_local default-OFF. The general fix (phaseb_entry_barrier)
+                        # is a FULL global ShmemBarrierOnStream (NIC quiet-drain +
+                        # inter-node all-to-all) and is coded mutually-exclusive with
+                        # fuse_local. But the dependency here is purely INTRA-node
+                        # (Phase-B reads only same-node peers' collection), so a
+                        # single INTRA-node subgroup entry barrier on the first remote
+                        # gather strictly orders every local rank's ring copy-OUT
+                        # BEFORE any peer reads it -- on-device, XGMI-scope only, NO
+                        # NIC quiet-drain, NO inter-node barrier. Cheap (G ranks) vs
+                        # the global fence, so fuse_local keeps its ~200 GB/s while
+                        # becoming E2E bit-exact. Set MORI_HIER_FUSE_LOCAL_INTRA_BAR=0
+                        # to A/B (restores the racy no-barrier path).
+                        _fl_intra_bar = os.environ.get(
+                            "MORI_HIER_FUSE_LOCAL_INTRA_BAR", "1"
+                        ) not in ("0", "", "false", "False")
+                        _first_remote = True
                         for m in range(N):
                             if m == node:
                                 continue
                             self._intra.gather_kernel_direct(
-                                collection[m * count : (m + 1) * count],
+                                reasm_src[m * count : (m + 1) * count],
                                 output_data,
                                 count,
                                 dst_block_offset=m * block_count,
                                 stream=stream,
-                                prepare_barrier=False,
+                                prepare_barrier=(_fl_intra_bar and _first_remote),
                             )
+                            _first_remote = False
                         self._intra.finish_direct_stream(
                             stream=stream, barrier=not self.slice_defer_fin)
                     elif self.slice_direct_overlap and not entry_barrier and not self.slice_oop:
@@ -1847,16 +2724,15 @@ class HierAllGather:
             )
         collection = self._slice_scratch[:slice_total]
 
-        # Register the user output for the direct SDMA push (lockstep, cached).
+        # Register the user output for the direct SDMA push (lockstep, LRU-cached).
         out_ptr = output_data.data_ptr()
         out_size = output_data.numel() * output_data.element_size()
-        _reg_changed = (out_ptr, out_size) != (self._direct_reg_ptr, self._direct_reg_size)
-        if _reg_changed:
-            if self._direct_reg_ptr is not None:
-                self._intra.deregister_output_buffer_ptr(self._direct_reg_ptr)
-            self._intra.register_output_buffer(output_data)
-            self._direct_reg_ptr = out_ptr
-            self._direct_reg_size = out_size
+        if self._reg_cache_cap <= 1:
+            _reg_changed = (out_ptr, out_size) != (self._direct_reg_ptr,
+                                                   self._direct_reg_size)
+        else:
+            _reg_changed = (out_ptr, out_size) not in self._direct_reg_lru
+        self._ensure_output_registered(output_data)
         # DIAGNOSTIC (MORI_HIER_REG_STATS=1): count how often the output ptr
         # CHANGES across per-layer AG calls. Each change is a cross-node COLLECTIVE
         # (deregister+register ShmemSymmetric*) that RCCL never pays and that cannot

@@ -53,11 +53,56 @@ namespace collective {
 // RCCL parity, ported here. Both default to -1, preserving the
 // historical grid-derived geometry BYTE-FOR-BYTE -- inert until a fused launcher
 // passes them.
+// ``chunkReadyFlags`` (default nullptr, INERT for every existing caller) is the
+// per-chunk landing signal that enables PIPELINING the inter-node RDMA ring with
+// the intra-node SDMA remote-block reassembly (SCOPE_A Phase 4). When non-null it
+// is a device array of at least ``numBlocks`` uint64_t in ordinary (cached) HBM,
+// zeroed by the caller before launch. As soon as THIS block's (channel ``bid``'s)
+// inbound sub-range has fully landed in this PE's ring buffer -- i.e. after the
+// receiver's system-scope acquire + __threadfence_system that already make those
+// bytes coherently visible to this GPU's CUs -- block ``bid`` publishes
+// ``chunkReadyFlags[bid] = 1``. A CONCURRENT reassembly block (in the same fused
+// grid) spins on that flag and, the instant sub-range ``bid`` is ready, SDMA-
+// pushes exactly that sub-range over XGMI while ring channel ``bid+1`` is still
+// crossing the NIC. This overlaps the two hierarchy legs that today run as two
+// serial phases (the 143-vs-168 GB/s gap). Because each PE reassembles a remote
+// block by pushing FROM ITS OWN ring buffer, the only dependency is this PE's own
+// ring landing -- a purely local flag spin, no global barrier. nullptr keeps the
+// standalone ring byte-for-byte identical.
+// DEEP-SQ WQE-DEPTH put helper (MORI_HIER_WQE_DEPTH). Split [base, base+bytes)
+// into ``depth`` back-to-back 16B-aligned non-blocking puts on the SAME qpId, so
+// the NIC SQ carries ``depth`` in-flight WQEs per QP instead of one. The union
+// tiles the sub-range exactly and rides the QP in RC order => byte-identical
+// result and identical per-QP quiet drain; only the SQ depth changes. depth<=1
+// keeps the shipped single-WQE path byte-for-byte.
+inline __device__ void PutDeepNbiWarp(const application::SymmMemObjPtr memObj, size_t base,
+                                      size_t bytes, int depth, int peer, int qpId) {
+  if (depth <= 1 || bytes == 0) {
+    shmem::ShmemPutMemNbiWarp(memObj, base, memObj, base, bytes, peer, qpId);
+    return;
+  }
+  const size_t kAlign = 16;
+  size_t nUnits = (bytes + kAlign - 1) / kAlign;
+  size_t unitsPer = (nUnits + static_cast<size_t>(depth) - 1) / static_cast<size_t>(depth);
+  if (unitsPer == 0) unitsPer = 1;
+  for (int d = 0; d < depth; ++d) {
+    size_t s = static_cast<size_t>(d) * unitsPer;
+    size_t e = s + unitsPer;
+    if (e > nUnits) e = nUnits;
+    if (s >= e) break;
+    size_t so = s * kAlign;
+    size_t eo = e * kAlign;
+    if (eo > bytes) eo = bytes;
+    shmem::ShmemPutMemNbiWarp(memObj, base + so, memObj, base + so, eo - so, peer, qpId);
+  }
+}
+
 inline __device__ void AllGatherRingSubGroupKernelBody(
     int ringPos, int ringSize, int peBase, int peStride,
     const application::SymmMemObjPtr memObj, const application::SymmMemObjPtr flagsObj,
     size_t peChunkSize, int numQp = 1, int numBlocksOverride = -1, int bidOverride = -1,
-    bool usePutSignal = false) {
+    bool usePutSignal = false, bool useWriteImm = false, uint64_t* chunkReadyFlags = nullptr,
+    uint64_t opGen = 0, bool useRead = false, int wqeDepth = 1, int deepPipe = 1) {
   int nextPos = (ringPos + 1) % ringSize;
   int nextPeer = peBase + nextPos * peStride;
   int maxRounds = ringSize - 1;
@@ -131,6 +176,23 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   if (useWarps > warpsPerBlock) useWarps = warpsPerBlock;
   bool fanOut = (useWarps > 1);
 
+  // PUT-WITH-SIGNAL on the MULTI-BLOCK CHANNEL path (env MORI_HIER_RING_PUT_SIGNAL).
+  // At N=2 (numQp==1) the big AG runs multiBlock: each CTA ``bid`` puts its 16B-
+  // aligned sub-range of the chunk on qpId=bid, then thread 0 does a separate
+  // ShmemQuietThread(nextPeer, bid) drain + a separate flag AMO. That quiet-drain
+  // stalls the channel until its RDMA send CQ empties before the receiver's flag
+  // can fire -- the exposed per-round latency of the single ring round. Fusing the
+  // channel's data WRITE + its completion-flag AMO into ONE ShmemPutMemNbiSignal on
+  // the SAME QP (qpId=bid) makes the flag ride strictly AFTER the data WRITE (RC
+  // in-order on that QP), so the receiver observing the per-channel flag is
+  // guaranteed the sub-range has landed globally -- with NO separate quiet and NO
+  // separate AMO. Byte image is identical (same sub-range tiling, same flag slot);
+  // only the completion mechanism changes. This is the same proven put-signal lever
+  // already used on the single-warp (signalFused) and fan-out (fanOutSignal) paths,
+  // now extended to the multiBlock channel path the big AG actually takes at N=2.
+  // Gated on usePutSignal so the default path stays byte-for-byte unchanged.
+  bool multiBlockSignal = (usePutSignal && peerIsRdma && multiBlock);
+
   // FANOUT PUT-WITH-SIGNAL (env MORI_HIER_RING_PUT_SIGNAL, default OFF): on the
   // multi-QP fan-out path the chunk is split across ``useWarps`` QPs, so a SINGLE
   // completion-flag AMO (even RC-ordered on one QP) only orders after THAT QP's
@@ -163,12 +225,215 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   // used, iff prev also fans out with signals; else the classic single +1.
   int expectedRecvSig = (fanOutSignal && prevIsRdma) ? fanActive : 1;
 
+  // RDMA-READ (PULL) ring gate. Engaged only on the single-round (ringSize==2)
+  // all-RDMA inter-node phase -- the 2-node hierarchical AG this cluster runs.
+  // In that case the chunk THIS PE needs (data-rank recvDataRank) is prevPeer's
+  // OWN chunk, already present in prevPeer's ring slot after the intra prepare
+  // barrier -- so it can be PULLED with an RDMA READ rather than waiting for the
+  // peer to PUSH it. The READ completion, drained by our own quiet, is a
+  // consumer-side landing guarantee (bytes physically in this PE's buffer +
+  // system-fence-visible to its CUs): NO cross-PE flag AMO, NO receiver spin, NO
+  // remote-landing race. Restricted to !multiBlock (single-block fan-out) and
+  // maxRounds==1 so larger rings / the multi-channel path / single-node keep the
+  // proven push path byte-for-byte. Result is byte-identical (same slot, bytes).
+  bool useReadRing = (useRead && peerIsRdma && prevIsRdma && maxRounds == 1 && !multiBlock);
+
+  // Phase-6 WRITE_WITH_IMM (single-warp, single-QP cross-node path only). The
+  // sender emits RDMA_WRITE_WITH_IMM instead of put+quiet+flag-AMO; the receiver
+  // consumes the recv-CQ completion instead of spinning the flag. The recv-CQE
+  // cannot be observed before the write payload has landed globally, so this is
+  // the transport-level completion that closes the remote-landing stale-read race
+  // (13 device-side avenues refuted; only host sync worked) WITHOUT the host
+  // stall. Gated to !multiBlock && !fanOut (numQp==1) so numQp>1 / multi-channel
+  // and single-node (P2P/SDMA) paths stay byte-for-byte on the proven flag path.
+  bool writeImm = (useWriteImm && peerIsRdma && !multiBlock && !fanOut);
+  bool recvWriteImm = (useWriteImm && prevIsRdma && !multiBlock && !fanOut);
+  // Phase-6b: WRITE_WITH_IMM on the MULTI-QP FAN-OUT path. This is the ONLY
+  // WRITE_IMM variant that engages on the big embed/lm_head AG, because under
+  // FSDP that AG runs with numQp>1 (fanOut) -- the single-warp writeImm above is
+  // gated !fanOut and so NEVER fires for it (which is why every prior numQp==1
+  // WRITE_IMM FSDP test was inconclusive: at numQp==1 the big AG hits multiBlock,
+  // also gated off). Each active fan-out warp emits its disjoint sub-range as an
+  // RDMA_WRITE_WITH_IMM on its OWN QP (qpId=warpId); the receiver consumes one
+  // recv-CQE per active QP. The recv-CQE is produced only AFTER that QP's payload
+  // has landed globally, so the receiver proceeds coherent with NO host sync and
+  // NO flag AMO -- the transport completion the 20 device/host-bounded avenues
+  // could not give on this path. Gated to fanOut so numQp==1 stays byte-identical.
+  bool fanOutWriteImm = (useWriteImm && peerIsRdma && !multiBlock && fanOut);
+  bool recvFanOutWriteImm = (useWriteImm && prevIsRdma && !multiBlock && fanOut);
+  // WRITE_WITH_IMM on the MULTI-BLOCK CHANNEL path (env MORI_HIER_RING_WRITE_IMM).
+  // At N=2 the big AG runs multiBlock (numQp==1), so the single-warp writeImm
+  // (gated !multiBlock) and fanOutWriteImm (gated fanOut) NEVER fire for it -- it
+  // falls back to the flag-spin recv whose flag can be observed BEFORE the NIC's
+  // WRITE DMA is globally visible to the consumer's CU reads (the FSDP E2E stale-
+  // remote-half completion race; every device-side reader barrier refuted, only a
+  // host drain fixed it). Extend WRITE_WITH_IMM to the channel path: each CTA bid
+  // emits its sub-range as RDMA_WRITE_WITH_IMM on qpId=bid; the receiver consumes
+  // THIS channel's recv-CQE (generated only AFTER the write payload has landed
+  // globally) instead of spinning the flag. Byte image is identical (same sub-range
+  // tiling); only the completion mechanism changes. This is the transport-level
+  // completion the big-AG path needs to make fuse_local E2E bit-exact WITHOUT a
+  // host sync. Gated on useWriteImm so the default path stays byte-for-byte the same.
+  bool multiBlockWriteImm = (useWriteImm && peerIsRdma && multiBlock);
+  bool recvMultiBlockWriteImm = (useWriteImm && prevIsRdma && multiBlock);
+  // Pre-post one recv WQE per ring round so every remote WRITE_WITH_IMM yields a
+  // recv-CQE. bytes=0: a pure write-with-imm does not consume the recv SGL for
+  // payload (data lands at the write's addr/rkey); the WQE only produces the CQE.
+  // recvPostIdx is persisted in the QP handle (rqPostIdx) across launches.
+  if (recvWriteImm && threadLinearId == 0) {
+    shmem::ShmemPostRecvImm(reinterpret_cast<uintptr_t>(memObj->localPtr), memObj->lkey,
+                            /*bytes=*/0, /*count=*/static_cast<uint32_t>(maxRounds), prevPeer, 0);
+  }
+  if (recvFanOutWriteImm && threadLinearId == 0) {
+    // prev fans out across fanActive QPs, so each of our QPs 0..fanActive-1 must
+    // have maxRounds recv WQEs pre-posted (one per round per QP).
+    for (int q = 0; q < fanActive; ++q) {
+      shmem::ShmemPostRecvImm(reinterpret_cast<uintptr_t>(memObj->localPtr), memObj->lkey,
+                              /*bytes=*/0, /*count=*/static_cast<uint32_t>(maxRounds), prevPeer, q);
+    }
+  }
+  if (recvMultiBlockWriteImm && threadLinearId == 0 && blkBytes > 0) {
+    // This channel bid receives prev's sub-range on qpId=bid; pre-post maxRounds
+    // recv WQEs on that QP so every remote WRITE_WITH_IMM yields a recv-CQE.
+    shmem::ShmemPostRecvImm(reinterpret_cast<uintptr_t>(memObj->localPtr), memObj->lkey,
+                            /*bytes=*/0, /*count=*/static_cast<uint32_t>(maxRounds), prevPeer, bid);
+  }
+  __syncthreads();
+
+  // ==========================================================================
+  // DEEP-SQ TEMPORAL PIPELINE (MORI_HIER_DEEP_PIPE=P). Split the chunk into P
+  // temporal sub-chunks issued back-to-back on the SAME full numQp fan-out; a
+  // reassembly worker pushes sub-chunk p over XGMI while p+1.. still cross the NIC
+  // -- hides the 46% intra reassembly under the 54% inter fill with NO inter-fill
+  // growth (unlike the spatial RING_BLOCKS split which drops QPs).
+  //
+  // LANDING FENCE = per-sub-chunk QUIET+flag == the CROWN's own proven fence,
+  // applied per sub-chunk (Turn-30). Turn-30a discovered WRITE_WITH_IMM is
+  // asserted-OUT on this cluster's mlx5 provider ("only supported on PSD/ionic")
+  // -> HW exception, so recv-CQE landing is not available here. Turn-29's
+  // put-with-signal AMO was NOT scale-robust because it SKIPPED the quiet: the
+  // small AMO overtakes the big data WRITE through NIC->HBM->L2 (>=64/P4, 256/P2
+  // read un-landed bytes -- the 22+-refuted device-flag race). The crown whole-
+  // chunk path is bit-exact at 466MB BECAUSE it does ShmemQuietThread (drains the
+  // RC send-CQE == data landed remotely) BEFORE the flag AMO. Do exactly that per
+  // sub-chunk: issue sub-chunk p on the full numQp fan-out, quiet (drains ONLY p
+  // -- p+1.. not yet issued), THEN AMO the peer's flag[p]. The peer, observing
+  // flag[p], is GUARANTEED p landed. The pipeline is preserved because the
+  // reassembly worker (a SEPARATE block) pushes p over XGMI while THIS block fills
+  // p+1 over the NIC -- the per-sub-chunk quiet only serializes issue->land within
+  // this ring block, not the cross-block intra||inter overlap.
+  // Engaged only on the single-round (ringSize==2) all-RDMA fan-out path.
+  // Self-contained: returns before the classic round loop. INERT when
+  // deepPipe<=1 (byte-identical shipped path).
+  bool deepPipeEngaged = (deepPipe > 1 && peerIsRdma && prevIsRdma && maxRounds == 1 &&
+                          !multiBlock && chunkReadyFlags != nullptr && !useReadRing &&
+                          !useWriteImm && useWarps >= 1);
+  if (deepPipeEngaged) {
+    const int P = deepPipe;
+    const int sendRank = ringPos;                       // maxRounds==1: send our own chunk
+    const size_t chunkBaseOffsetSend = static_cast<size_t>(sendRank) * peChunkSize;
+    const size_t kAlignDP = 16;
+    const size_t nUnits = (peChunkSize + kAlignDP - 1) / kAlignDP;
+    const size_t unitsPerP = (nUnits + static_cast<size_t>(P) - 1) / static_cast<size_t>(P);
+    const int sw = useWarps;  // sender fan-out warps per sub-chunk (== numQp fan-out)
+    for (int p = 0; p < P; ++p) {
+      // SENDER: warp w writes its 16B-aligned tile of sub-chunk p on qpId=w (plain
+      // NBI put, deep-SQ within the sub-chunk via wqeDepth). Full numQp fan-out per
+      // sub-chunk => full inter BW; no per-warp flag (one AMO per sub-chunk below).
+      if (warpId < sw) {
+        size_t sU = static_cast<size_t>(p) * unitsPerP;
+        size_t eU = sU + unitsPerP;
+        if (eU > nUnits) eU = nUnits;
+        if (sU < eU) {
+          size_t subUnits = eU - sU;
+          size_t upw = (subUnits + static_cast<size_t>(sw) - 1) / static_cast<size_t>(sw);
+          if (upw == 0) upw = 1;
+          size_t wS = sU + static_cast<size_t>(warpId) * upw;
+          size_t wE = wS + upw;
+          if (wE > eU) wE = eU;
+          if (wS < wE) {
+            size_t so = wS * kAlignDP;
+            size_t eo = wE * kAlignDP;
+            if (eo > peChunkSize) eo = peChunkSize;
+            size_t off = chunkBaseOffsetSend + so;
+            PutDeepNbiWarp(memObj, off, eo - so, wqeDepth, nextPeer, warpId);
+          }
+        }
+      }
+      __syncthreads();
+      if (threadLinearId == 0) {
+        // Drain sub-chunk p's send-CQEs on ALL QPs (RC => p's data has landed
+        // remotely), THEN bump the peer's flag[p]. p+1.. are not yet issued so this
+        // quiet isolates p. This is the crown fence, per sub-chunk -- scale-robust.
+        shmem::ShmemQuietThread(nextPeer);
+        shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
+            flagsObj, (flagBase + p) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer);
+      } else if (threadLinearId == warpSize) {
+        // RECEIVER: wait sub-chunk p's flag (set by the peer AFTER its quiet => p
+        // landed globally) then publish chunkReadyFlags[p] so the reassembly worker
+        // pushes p over XGMI while this block fills p+1 over the NIC.
+        int spin = 0;
+        while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) < 1) {
+          if (++spin > 100000000) break;
+        }
+        __threadfence_system();
+        core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, static_cast<uint64_t>(1));
+      }
+      __syncthreads();
+    }
+    // Reset the recv flag slots (entry barrier in prepare orders every PE's reset
+    // before any peer's next-op AMO, so this end-of-op reset is safe).
+    for (int idx = threadLinearId; idx < P; idx += threadsPerBlock) {
+      flagsArray[flagBase + idx] = 0;
+    }
+    __syncthreads();
+    if (threadLinearId == 0) __threadfence_system();
+    return;
+  }
+  // ==========================================================================
+
   for (int i = 0; i < maxRounds; i++) {
     // Chunk slots are indexed by ring position, not global PE.
     int sendDataRank = (ringPos - i + ringSize) % ringSize;
     int recvDataRank = (ringPos - i - 1 + ringSize) % ringSize;
 
     size_t chunkBaseOffset = static_cast<size_t>(sendDataRank) * peChunkSize;
+
+    if (useReadRing) {
+      // PULL: read prevPeer's own chunk (slot recvDataRank, i.e. prevPeer's OWN
+      // ring slot, present after the intra prepare barrier) into our matching
+      // slot at the SAME offset. Fan the read across the same numQp QPs the push
+      // path uses (warp w -> qpId=w, disjoint 16B-aligned sub-ranges) so the
+      // union tiles the chunk exactly -> byte-identical to a push receive.
+      size_t readBase = static_cast<size_t>(recvDataRank) * peChunkSize;
+      int rWarps = fanOut ? useWarps : 1;
+      if (warpId < rWarps) {
+        const size_t kAlign = 16;
+        size_t nUnits = (peChunkSize + kAlign - 1) / kAlign;
+        size_t unitsPerWarp = (nUnits + rWarps - 1) / rWarps;
+        size_t startUnit = static_cast<size_t>(warpId) * unitsPerWarp;
+        size_t endUnit = startUnit + unitsPerWarp;
+        if (endUnit > nUnits) endUnit = nUnits;
+        if (startUnit < endUnit) {
+          size_t subStart = startUnit * kAlign;
+          size_t subEnd = endUnit * kAlign;
+          if (subEnd > peChunkSize) subEnd = peChunkSize;  // clamp tail
+          shmem::ShmemGetMemNbiWarp(memObj, readBase + subStart, memObj, readBase + subStart,
+                                    subEnd - subStart, prevPeer, warpId);
+        }
+      }
+      __syncthreads();
+      if (threadLinearId == 0) {
+        // Drain ALL QPs' READ completions -> every sub-range has physically
+        // landed in this PE's ring buffer (a READ CQE is produced only after the
+        // response payload is written locally). System fence publishes the landed
+        // bytes to this GPU's CUs for the subsequent reassembly / copy-out.
+        shmem::ShmemQuietThread(prevPeer);
+        __threadfence_system();
+      }
+      __syncthreads();
+      continue;
+    }
     // NOTE (M4, ): tried splitting this put across ALL 8 warps in the
     // block (disjoint 16B-aligned sub-ranges) to parallelize the transfer.
     // VALIDATED NEGATIVE RESULT on device (single-node ring, GPUs 0-3): it
@@ -206,7 +471,24 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // byte-identical result.
       if (warpId == 0 && blkBytes > 0) {
         size_t subOff = chunkBaseOffset + blkOff;
-        shmem::ShmemPutMemNbiWarp(memObj, subOff, memObj, subOff, blkBytes, nextPeer, bid);
+        if (multiBlockWriteImm) {
+          // THIS channel's sub-range as RDMA_WRITE_WITH_IMM on qpId=bid. The
+          // receiver's per-channel recv-CQE proves it landed globally -- no quiet,
+          // no flag AMO, no host sync. imm carries the chunk id for validation.
+          shmem::ShmemPutMemImmWarp(memObj, subOff, memObj, subOff, blkBytes,
+                                    static_cast<uint32_t>(sendDataRank + 1), nextPeer, bid);
+        } else if (multiBlockSignal) {
+          // Fuse THIS channel's data WRITE + its flag AMO_ADD(1) on qpId=bid. RC
+          // in-order => the sub-range lands remotely before its own +1 fires, so
+          // the receiver's per-channel flag never beats the data. No separate
+          // quiet, no separate AMO (skipped in the completion block below).
+          shmem::ShmemPutMemNbiSignalWarp(
+              memObj, subOff, memObj, subOff, blkBytes, flagsObj,
+              (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer,
+              bid);
+        } else {
+          PutDeepNbiWarp(memObj, subOff, blkBytes, wqeDepth, nextPeer, bid);
+        }
       }
     } else if (fanOut) {
       // Split the chunk into ``useWarps`` disjoint 16B-aligned sub-ranges; warp
@@ -225,7 +507,13 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           size_t subEnd = endUnit * kAlign;
           if (subEnd > peChunkSize) subEnd = peChunkSize;  // clamp tail
           size_t subOff = chunkBaseOffset + subStart;
-          if (fanOutSignal) {
+          if (fanOutWriteImm) {
+            // THIS warp's sub-range as RDMA_WRITE_WITH_IMM on ITS OWN QP
+            // (qpId=warpId). The receiver's per-QP recv-CQE proves this sub-range
+            // has landed globally -- no quiet, no flag AMO, no host sync.
+            shmem::ShmemPutMemImmWarp(memObj, subOff, memObj, subOff, subEnd - subStart,
+                                      static_cast<uint32_t>(sendDataRank + 1), nextPeer, warpId);
+          } else if (fanOutSignal) {
             // Fuse THIS warp's data WRITE + a flag AMO_ADD(1) on ITS OWN QP
             // (qpId=warpId). RC in-order => this QP's data lands remotely before
             // its +1 fires. Receiver waits for the sum (fanActive) so it proceeds
@@ -236,8 +524,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                 (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
                 nextPeer, warpId);
           } else {
-            shmem::ShmemPutMemNbiWarp(memObj, subOff, memObj, subOff, subEnd - subStart, nextPeer,
-                                      warpId);
+            PutDeepNbiWarp(memObj, subOff, subEnd - subStart, wqeDepth, nextPeer, warpId);
           }
         }
       }
@@ -247,7 +534,15 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // path keeps the  thread schedule unchanged.)
       __syncthreads();
     } else if (warpId == 0) {
-      if (usePutSignal && peerIsRdma) {
+      if (writeImm) {
+        // RDMA_WRITE_WITH_IMM: data WRITE + a 32-bit immediate on ONE QP. On RC
+        // the responder produces the recv-CQE only AFTER the payload DMA has
+        // landed globally, so the receiver (polling that CQE below) is guaranteed
+        // coherent data with NO quiet, NO flag AMO, NO host sync. imm carries the
+        // chunk id (sendDataRank+1) for optional validation.
+        shmem::ShmemPutMemImmWarp(memObj, chunkBaseOffset, memObj, chunkBaseOffset, peChunkSize,
+                                  static_cast<uint32_t>(sendDataRank + 1), nextPeer);
+      } else if (usePutSignal && peerIsRdma) {
         // FLAG-CAN'T-BEAT-DATA (transport-level): fuse the data WRITE and the
         // completion-flag AMO into ONE ShmemPutMemNbiSignal so the signal WQE
         // rides the SAME QP strictly AFTER the data WRITE. On RC the responder
@@ -260,8 +555,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
             memObj, chunkBaseOffset, memObj, chunkBaseOffset, peChunkSize, flagsObj,
             (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer);
       } else {
-        shmem::ShmemPutMemNbiWarp(memObj, chunkBaseOffset, memObj, chunkBaseOffset, peChunkSize,
-                                  nextPeer);
+        PutDeepNbiWarp(memObj, chunkBaseOffset, peChunkSize, wqeDepth, nextPeer, 0);
       }
     }
 
@@ -277,12 +571,15 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     // (ringPos-i-1), which is EXACTLY the recvDataRank received in round i, a
     // hard data dependency (you forward onward precisely what you just got).
     bool signalFused = (usePutSignal && peerIsRdma && !multiBlock && !fanOut);
-    if (threadLinearId == 0 && (signalFused || fanOutSignal)) {
+    if (threadLinearId == 0 &&
+        (signalFused || fanOutSignal || multiBlockSignal || multiBlockWriteImm || writeImm || fanOutWriteImm)) {
       // The put-with-signal path already carried the completion flag as the last
       // WQE on the data QP (RC-ordered after the data WRITE) -- no separate quiet
       // or AMO is needed. Skipping them is what removes the flag-beats-data race.
       // On the fan-out path EVERY active warp already issued its own per-QP
       // signal (fanActive of them), so thread 0 issues no extra AMO here.
+      // On the WRITE_WITH_IMM path the completion is signalled by the recv-CQE
+      // (polled below), so likewise no quiet + no flag AMO.
     } else if (threadLinearId == 0) {
       // Drain the outbound put before bumping the receiver's flag. On the
       // fan-out path the put used numQp RDMA QPs, so we must quiet ALL of them:
@@ -320,6 +617,36 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
           flagsObj, (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
           nextPeer);
+    } else if (threadLinearId == warpSize && recvFanOutWriteImm) {
+      // Poll one recv-CQE per active QP: prev issued fanActive WRITE_WITH_IMMs
+      // (one per QP), each CQE proving that QP's disjoint sub-range has landed
+      // globally. After all fanActive complete, the whole chunk is coherent, so
+      // the subsequent forward-put / copy-out reads correct bytes with no host
+      // sync. __threadfence_system publishes them to this GPU.
+      for (int q = 0; q < fanActive; ++q) {
+        shmem::ShmemPollRecvCqImm(prevPeer, q);
+      }
+      __threadfence_system();
+    } else if (threadLinearId == warpSize && recvWriteImm) {
+      // WRITE_WITH_IMM receiver: block on the recv-CQ completion for this round's
+      // inbound chunk instead of spinning the flag. Observing the CQE PROVES the
+      // peer's payload has landed globally (the CQE is generated only after the
+      // write DMA completes remotely) -- the transport-level guarantee no device
+      // barrier/quiet gave. threadfence_system makes the landed bytes visible to
+      // this GPU's subsequent forward-put / copy-out with no host sync.
+      shmem::ShmemPollRecvCqImm(prevPeer, 0);
+      __threadfence_system();
+    } else if (threadLinearId == warpSize && recvMultiBlockWriteImm) {
+      // MULTI-BLOCK channel receiver: consume THIS channel's recv-CQE on qpId=bid
+      // instead of spinning the flag. The CQE is produced only AFTER prev's sub-
+      // range WRITE DMA has landed globally (RC transport guarantee), so the
+      // subsequent copy-OUT / remote reassembly reads coherent bytes with NO host
+      // sync -- the device-side completion that closes the fuse_local E2E stale-
+      // remote race the flag path could not. threadfence_system publishes to CUs.
+      if (blkBytes > 0) {
+        shmem::ShmemPollRecvCqImm(prevPeer, bid);
+      }
+      __threadfence_system();
     } else if (threadLinearId == warpSize) {
       // Each round the sender increments a DISTINCT flag slot (index
       // recvDataRank = sendDataRank on the receiver), so every slot is
@@ -341,8 +668,15 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // the slot to reach ``expectedRecvSig`` (== fanActive); the classic path
       // adds exactly 1 (expectedRecvSig==1), so this is a strict superset that
       // stays byte-identical when signals are off.
+      // GEN-RING: when opGen!=0 on the classic single-increment path the flags
+      // ACCUMULATE across ops (no per-op reset), so slot k == opGen after opGen
+      // ops. Wait for the slot to reach the current generation instead of 1.
+      // Restricted to expectedRecvSig==1 (single AMO_ADD(1) per slot per op) so
+      // the accumulation is uniform; fan-out/put-signal keep the classic path.
+      const bool genRecv = (opGen != 0 && expectedRecvSig == 1);
+      const uint64_t recvThreshold = genRecv ? opGen : (uint64_t)expectedRecvSig;
       while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + recvDataRank) <
-             (uint64_t)expectedRecvSig) {
+             recvThreshold) {
         spinCount++;
         if (spinCount > 10000000) {  // Increased timeout threshold
           printf("ringPos %d: Timeout waiting from ringPos %d (round %d, slot=%llu<%d)\n", ringPos,
@@ -357,14 +691,47 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     __syncthreads();
   }
 
-  // Each block resets ONLY its own flag region [flagBase, flagBase+ringSize) so
-  // concurrent channels never race (single-block: flagBase=0, ringSize slots).
-  for (int idx = threadLinearId; idx < ringSize; idx += threadsPerBlock) {
-    flagsArray[flagBase + idx] = 0;
-  }
-  __syncthreads();
-  if (threadLinearId == 0) {
+  // PHASE-4 per-chunk landing publish. After the round loop this block's inbound
+  // sub-range (channel ``bid``) is fully landed AND made visible to this GPU by
+  // the receiver's __threadfence_system inside the loop. Publish the ready flag so
+  // a concurrent reassembly block can start pushing exactly this sub-range over
+  // XGMI without waiting for the whole ring / a global finish barrier. The store
+  // is system-scoped and preceded by a fence so the reassembly reader observes the
+  // landed bytes coherently. INERT when chunkReadyFlags==nullptr (every existing
+  // caller) so the standalone ring stays byte-for-byte identical.
+  if (chunkReadyFlags != nullptr && threadLinearId == 0) {
     __threadfence_system();
+    core::AtomicStoreSeqCstSystem(chunkReadyFlags + bid, static_cast<uint64_t>(1));
+  }
+  // On a WRITE_WITH_IMM completion path the ring flags region
+  // [flagBase, flagBase+ringSize) is NEVER touched this op: the sender emits
+  // RDMA_WRITE_WITH_IMM (no flag AMO) and the receiver consumes the recv-CQE (no
+  // flag spin), so every slot is still at its entry value (0). The per-op reset
+  // loop + its trailing __threadfence_system are therefore dead work here. Because
+  // useWriteImm is a persistent per-handle env (set once, same path every call),
+  // the flags stay 0 across all ops on this handle -> skipping the reset is
+  // byte-for-byte identical while removing per-AG overhead that under FSDP's many
+  // AGs/step erodes the standalone WIN toward E2E parity. Non-writeImm paths keep
+  // the exact reset+fence, so the default path is unchanged.
+  bool usedWriteImm = (multiBlockWriteImm || writeImm || fanOutWriteImm);
+  // GEN-RING: on the classic single-increment path the flags are intentionally
+  // NOT reset -- they accumulate so slot k == opGen after opGen ops (the
+  // receiver waits for >= opGen). Skipping the reset is what lets the prepare
+  // entry barrier be dropped (no reset -> nothing to order against a peer's
+  // next-op increment). Gen-mode only engages when the per-op increment is a
+  // uniform +1 (expectedRecvSig==1, no put-signal/fan-out), matching the
+  // receiver-side gate above; multiBlockSignal/fanOutSignal keep the reset.
+  const bool genReset = (opGen != 0 && !usePutSignal);
+  if (!usedWriteImm && !genReset) {
+    // Each block resets ONLY its own flag region [flagBase, flagBase+ringSize) so
+    // concurrent channels never race (single-block: flagBase=0, ringSize slots).
+    for (int idx = threadLinearId; idx < ringSize; idx += threadsPerBlock) {
+      flagsArray[flagBase + idx] = 0;
+    }
+    __syncthreads();
+    if (threadLinearId == 0) {
+      __threadfence_system();
+    }
   }
 }
 

@@ -114,6 +114,12 @@ struct ShmemRdmaEndpoint {
   uint32_t qpn{0};  // QP number — extracted from application::RdmaEndpoint::handle.qpn
   core::WorkQueueHandle wqHandle;
   core::CompletionQueueHandle cqHandle;
+  // WRITE_WITH_IMM receiver (Phase-6 cross-node ring accuracy fix): the recv-side
+  // completion queue the responder posts RDMA_WRITE_WITH_IMM CQEs into. Mirrors
+  // cqHandle when no dedicated recv CQ is configured (send+recv share one CQ), so
+  // device receivers can always read recvCqHandle uniformly. Populated in init.cpp
+  // from application::RdmaEndpoint::recvCqHandle.
+  core::CompletionQueueHandle recvCqHandle;
   core::IbufHandle atomicIbuf;
 
   __device__ __host__ core::ProviderType GetProviderType() {
@@ -136,6 +142,11 @@ struct GpuStates {
   int rank{-1};
   int worldSize{-1};
   int numQpPerPe{4};  // Default to 4 QPs per peer, consistent with Context default
+  // DUAL-RAIL (idle-NIC fan-out): index within a peer's [0,numQpPerPe) QP block
+  // at/after which QPs live on the SECOND RDMA device (an otherwise-idle NIC).
+  // -1 (default) => single-rail, no QP is on rail 2 and the device put path is
+  // byte-for-byte unchanged. Set from Context by GpuStateInit when dual-rail is on.
+  int rail2QpStart{-1};
   // this work (transport in-flight depth): when >0, the fast-path (non-VMM) RDMA
   // put in ShmemPutMemNbiThreadKernelImpl splits a large transfer into multiple
   // WQEs of at most this many bytes, so several writes stay in flight per QP per

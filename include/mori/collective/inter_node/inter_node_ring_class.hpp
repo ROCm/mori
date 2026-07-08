@@ -104,6 +104,30 @@ inline void HierPrepareBarrierOnStream(hipStream_t stream) {
   }
 }
 
+// The ring FINISH / cross-PE reuse fence. Historically this was always the plain
+// ShmemBarrierOnStream (PE0-funnel rendezvous), even when MORI_HIER_DISSEM_BARRIER
+// routed the ENTRY fence through the O(log n) dissemination barrier. On the
+// de-fused correct (olapfast) path this exposed finish fence is the single
+// biggest remaining per-op serialization cost (HIER_ENV keeps it barrier=ON for
+// the big backward AGs, so it is NOT deferred). The dissemination barrier has
+// IDENTICAL global all-PE ordering semantics (a full rendezvous: every PE waits
+// for every other PE), so routing the finish fence through it does NOT reorder
+// the NIC-landing -> reassembly-consume dependency the correct path relies on --
+// the byte image and the completion ordering are unchanged. It only replaces the
+// PE0 funnel critical path with a parallel log-depth one, cutting the exposed
+// fence latency of every op that has to keep barrier=true. Gated on the same
+// MORI_HIER_DISSEM_BARRIER env so the default path stays byte-for-byte identical.
+inline void HierFinishBarrierOnStream(hipStream_t stream) {
+  if (HierAllBarrierDisabled()) {
+    return;
+  }
+  if (HierDissemBarrierEnabled()) {
+    shmem::ShmemBarrierOnStreamDissem(stream);
+  } else {
+    shmem::ShmemBarrierOnStream(stream);
+  }
+}
+
 class InterNodeRingAllgather {
  private:
   int myPe_;
@@ -141,6 +165,13 @@ class InterNodeRingAllgather {
 
   // Kept alive between prepare and the Python-side kernel launch.
   CclInterNodeRingArgs jit_args_;
+
+  // GEN-RING (env MORI_HIER_GEN_RING): monotonic per-op generation counter and
+  // the enable flag. When on, prepare skips the entry barrier + flag reset and
+  // stamps jit_args_.opGen = ++ringOpGen_ so the kernel waits for the flag to
+  // reach this generation (flags accumulate; never reset). Default off.
+  bool genRing_ = false;
+  uint64_t ringOpGen_ = 0;
 
   InterNodeRingAllgather(const InterNodeRingAllgather&) = delete;
   InterNodeRingAllgather& operator=(const InterNodeRingAllgather&) = delete;
@@ -186,16 +217,59 @@ class InterNodeRingAllgather {
     (void)hipMemset(flags_, 0, flagsBytes);
     flagsObj_ = shmem::ShmemQueryMemObjPtr(flags_);
 
-    // Transport-level flag-can't-beat-data (env MORI_HIER_RING_PUT_SIGNAL, default
-    // OFF). When set, the single-warp RDMA ring send fuses the data WRITE and the
-    // completion-flag AMO into one ShmemPutMemNbiSignal (same QP, signal after
-    // data) so the receiver never observes the flag before the remote data lands
-    // -- the last untried lever for the residual FSDP loss completion race,
-    // on-device with no host sync. Set once here; prepare_* only writes the other
-    // per-call fields, so this persists across calls.
+    // Transport-level flag-can't-beat-data (env MORI_HIER_RING_PUT_SIGNAL). When
+    // ON, the single-warp RDMA ring send fuses the data WRITE and the completion-
+    // flag AMO into one ShmemPutMemNbiSignal (same QP, signal strictly AFTER data
+    // on the RC-ordered QP) so the receiver never observes the flag before the
+    // remote data lands -- this REMOVES the separate post-put ShmemQuietThread
+    // full-CQ drain that the receiver's flag-spin otherwise waits behind (the
+    // per-round quiet-drain latency that, with the 2 global barriers, is the
+    // documented residual 143->168 GB/s UT gap; the per-QP RDMA WRITE itself is
+    // already bandwidth-saturated, so the quiet-drain is the in-op lever the UT
+    // bench can actually expose since it device-syncs only BETWEEN reps).
+    //
+    // DEFAULT OFF (opt-in via MORI_HIER_RING_PUT_SIGNAL=1). Turn-8 measured this
+    // default-ON on the standalone/UT sliced ring: BIT-EXACT on all 14 pts but
+    // BW-NEUTRAL (fp32 128/256MB 144.4/143.5 GB/s == the pre-signal 143 plateau;
+    // small-size 0.6ms floor unchanged). => the removed post-put ShmemQuietThread
+    // full-CQ drain was NOT on the critical path; the residual >=64MB gap vs RCCL
+    // (~0.80x) is per-NIC RDMA-WRITE throughput (mori ~18 vs rccl ~22.5 GB/s/NIC),
+    // not the quiet-drain. So keep the shipped standalone bytes byte-for-byte
+    // unchanged (default OFF); put-signal remains available for opt-in A/B and as
+    // the flag-can't-beat-data completion protocol. The FUSED FSDP builders gate it
+    // independently (HierRingPutSignalExplicitlyOn) so it never leaks into E2E.
     {
       const char* e = std::getenv("MORI_HIER_RING_PUT_SIGNAL");
       jit_args_.usePutSignal = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    // Phase-6 WRITE_WITH_IMM (env MORI_HIER_RING_WRITE_IMM, default OFF). When
+    // set, the single-warp cross-node ring send emits RDMA_WRITE_WITH_IMM and the
+    // receiver consumes the recv-CQ completion instead of the flag spin -- the
+    // recv-CQE cannot precede the payload landing, closing the remote-landing race
+    // with no host stall. Set once here; persists across calls like usePutSignal.
+    {
+      const char* e = std::getenv("MORI_HIER_RING_WRITE_IMM");
+      jit_args_.useWriteImm = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    // RDMA-READ (PULL) ring (env MORI_HIER_RING_READ, default OFF). When set, the
+    // single-round (ringSize==2) all-RDMA inter-node phase PULLS the peer's own
+    // chunk with an RDMA READ instead of the peer PUSHing it -- the READ
+    // completion (our own quiet) is the consumer-side landing fence, no flag AMO
+    // / receiver spin / remote-landing race. Set once here; persists across calls.
+    {
+      const char* e = std::getenv("MORI_HIER_RING_READ");
+      jit_args_.useRead = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    // GENERATION-COUNTER barrier-free ring (env MORI_HIER_GEN_RING, default OFF).
+    // When set, prepare_stream stops resetting the flags (the kernel accumulates
+    // the +1 per op) and DROPS the entry ShmemBarrierOnStream -- one of the two
+    // global barriers per ring round the plateau pays. Only engages on the
+    // classic single-increment path (no put-signal / write-imm), so it is
+    // mutually exclusive with those; if either is also set, gen-ring stays off.
+    {
+      const char* e = std::getenv("MORI_HIER_GEN_RING");
+      genRing_ = (e != nullptr && e[0] != '\0' && e[0] != '0') && jit_args_.usePutSignal == 0 &&
+                 jit_args_.useWriteImm == 0;
     }
   }
 
@@ -273,7 +347,16 @@ class InterNodeRingAllgather {
     // staged their own chunk (stream-ordered before this barrier) before the
     // ring's cross-PE atomic increments begin. dissemination
     // topology when MORI_HIER_DISSEM_BARRIER=1 (same global semantics).
-    HierPrepareBarrierOnStream(stream);
+    // GEN-RING: with accumulating (never-reset) flags there is no reset for a
+    // peer's next-op increment to race, so this entry barrier is redundant and
+    // is skipped. The copy-IN above is stream-ordered before this op's ring
+    // kernel on the same stream, and the trailing finish reuse barrier still
+    // orders ring-buffer reuse -- so dropping ONLY the entry fence is safe.
+    if (genRing_) {
+      jit_args_.opGen = ++ringOpGen_;
+    } else {
+      HierPrepareBarrierOnStream(stream);
+    }
 
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
@@ -300,7 +383,13 @@ class InterNodeRingAllgather {
     // zeroes once, so flags are always 0 on entry. The barrier still orders the
     // cross-PE reset-vs-next-op-increment. dissemination
     // topology when MORI_HIER_DISSEM_BARRIER=1 (same global semantics).
-    HierPrepareBarrierOnStream(stream);
+    // GEN-RING: accumulating flags -> no reset to order -> entry barrier dropped
+    // (see prepare_stream); the in-place chunk is already staged by the caller.
+    if (genRing_) {
+      jit_args_.opGen = ++ringOpGen_;
+    } else {
+      HierPrepareBarrierOnStream(stream);
+    }
 
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
@@ -338,13 +427,13 @@ class InterNodeRingAllgather {
     size_t total = static_cast<size_t>(ringSize_) * chunkBytes;
     (void)hipMemcpyAsync(reinterpret_cast<void*>(output), ring_, total, hipMemcpyDeviceToDevice,
                          stream);
-    if (barrier && !HierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
+    if (barrier) HierFinishBarrierOnStream(stream);
     return 0.0;
   }
 
   // Stream-ordered counterpart of finish_sync_no_copy (result left in ring buf).
   double finish_stream_no_copy(hipStream_t stream) {
-    if (!HierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
+    HierFinishBarrierOnStream(stream);
     return 0.0;
   }
 

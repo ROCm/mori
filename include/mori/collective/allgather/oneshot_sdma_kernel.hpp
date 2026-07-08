@@ -152,12 +152,18 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes, T* input,
 // suffices. Default false keeps the historical grid-wide thread id ->
 // BYTE-FOR-BYTE identical to the shipped single-block (1,)/(512,) launch; inert
 // until a fused launcher sets it.
+// ``flagBase`` (default 0, INERT for every existing caller) offsets the flag
+// slots this gather uses from ``[0, groupSize)`` to ``[flagBase, flagBase+
+// groupSize)``. It lets MULTIPLE independent sub-group gathers run CONCURRENTLY
+// (different blocks of one fused grid, e.g. the Phase-4 chunked remote-block
+// reassembly where sub-range j uses flagBase = j*groupSize) without racing on the
+// shared flag slots. 0 keeps the historical single-region layout byte-for-byte.
 template <typename T>
 __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
     int myPe, int npes, int groupSize, int groupPos, int peBase, int peStride, T* input,
     const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
     size_t elementCount, size_t dstBaseOffset = 0, size_t dstSlotStrideBytes = 0,
-    uint64_t flagVal = 1, bool blockLocal = false) {
+    uint64_t flagVal = 1, bool blockLocal = false, size_t flagBase = 0) {
   (void)npes;
   if (elementCount == 0 || groupSize <= 0) {
     return;
@@ -207,8 +213,16 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
   if (warpId < groupSize && laneId == 0) {
     int remotePe = peBase + warpId * peStride;
     shmem::ShmemQuietThread(remotePe, dstMemObj);
+    // SENDER-SIDE completion fence: ShmemQuietThread drains the SDMA submission
+    // queue, but the peer-visible ORDERING of the raw SDMA data writes vs the
+    // subsequent flag AMO is not otherwise guaranteed at SYSTEM scope. Without
+    // this the receiver can observe the flag (and race past its own
+    // threadfence_system) before the pushed bytes are globally ordered -- the
+    // copy-engine completion gap that only a host stream.synchronize masked
+    // (every prior fix was RECEIVER-side; this is the missing SENDER fence).
+    __threadfence_system();
     shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-        flagsMemObj, static_cast<size_t>(groupPos) * sizeof(uint64_t), &flagVal, 8,
+        flagsMemObj, (flagBase + static_cast<size_t>(groupPos)) * sizeof(uint64_t), &flagVal, 8,
         core::atomicType::AMO_SET, remotePe, 0);
   }
   __syncthreads();
@@ -227,7 +241,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
       // agent's subsequent copy-OUT -> occasional stale bytes under FSDP rapid
       // reuse (loss nondeterminism). A system-scope acquire + system threadfence
       // makes the peer's prior data writes visible without a host sync.
-      while (core::AtomicLoadSeqCstSystem(flags + senderPos) < flagVal) {
+      while (core::AtomicLoadSeqCstSystem(flags + flagBase + senderPos) < flagVal) {
         ++spinCount;
         if (!warned && spinCount > 10000000) {
           printf("PE %d: Slow wait for sub-group pos %d (still waiting)\n", myPe, senderPos);
@@ -238,6 +252,80 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
     }
     __syncthreads();
   }
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 4: PUSH-ONLY sub-group reassembly (deadlock-free, parallel)
+// ---------------------------------------------------------------------------
+// The remote-block reassembly of the hierarchical AllGather is an intra-node
+// sub-group gather among the ``G`` local ranks: rank ``groupPos`` owns one
+// column (its own ring-buffer slice of block ``m``) and must place it into slot
+// ``groupPos`` of block ``m`` in EVERY member's output. Crucially the output
+// slots are DISJOINT per rank, so no rank ever READS another rank's data --
+// each rank only WRITES its own column. That means the cross-rank flag WAIT that
+// the collective gather (OneShotAllGatherSdmaSubGroupKernel_body) performs is not
+// needed for the push itself; it only serves as a completion barrier. Coupling
+// push+wait inside every (block,remote) gather is exactly what dead-locks when
+// several reassembly blocks run concurrently (each block's wait spins on peers
+// whose matching block may not be co-resident -> circular stall).
+//
+// This primitive does the WRITE half ONLY: warp ``w`` SDMA-pushes this rank's
+// ``elementCount``-lane slice into slot ``groupPos`` of member ``w``'s output at
+// ``dstBaseOffset + groupPos*slotStride``, quiets ONLY its own SDMA queue
+// ``qId`` (never drains-all, so concurrent blocks on other queues are
+// unaffected), then bumps completion flag ``flagBase+groupPos`` on member ``w``.
+// It NEVER waits on a peer, so any number of these run concurrently without
+// dead-lock. A SINGLE completion reader (the fused kernel's local-block CTA)
+// later waits for every (block,remote,sender) flag AFTER all pushes are issued.
+// ``qId`` MUST be distinct across blocks that target the same peer so the
+// per-queue signal counter (expectedSignals[qId]) is never raced; callers clamp
+// the number of concurrent reassembly blocks to the peer's SDMA queue count.
+template <typename T>
+__device__ void OneShotSubGroupPushOnly_body(int groupSize, int groupPos, int peBase, int peStride,
+                                             T* input, const application::SymmMemObjPtr dstMemObj,
+                                             const application::SymmMemObjPtr flagsMemObj,
+                                             size_t elementCount, size_t dstBaseOffset,
+                                             size_t dstSlotStrideBytes, uint64_t flagVal,
+                                             size_t flagBase, int qId) {
+  if (elementCount == 0 || groupSize <= 0) {
+    return;
+  }
+  const size_t threadLinearId = static_cast<size_t>(threadIdx.x);  // block-local
+  const size_t bytesPerElement = sizeof(T);
+  const size_t bytesPerPeer = elementCount * bytesPerElement;
+  const size_t slotStride = dstSlotStrideBytes != 0 ? dstSlotStrideBytes : bytesPerPeer;
+  int warpId = threadLinearId / warpSize;
+  const int laneId = threadIdx.x % warpSize;
+
+  if (warpId < groupSize && laneId == 0) {
+    int remotePe = peBase + warpId * peStride;
+    size_t destByteOffset = static_cast<size_t>(groupPos) * slotStride;
+    application::SymmMemObjPtr dest = dstMemObj;
+    const int nq = dest->sdmaNumQueue > 0 ? static_cast<int>(dest->sdmaNumQueue) : 1;
+    const int q = (qId >= 0) ? (qId % nq) : 0;
+    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(input);
+    uint8_t* dstPtr =
+        reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + destByteOffset;
+    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + remotePe * nq;
+    HSAuint64* signals = dest->signalPtrs + remotePe * nq;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * nq;
+    // Push this rank's column on its OWN queue ``q`` (distinct per block).
+    core::SdmaPutThread(srcPtr, dstPtr, bytesPerPeer, devicehandles, signals, expectedSignals, nq, q);
+    // Drain ONLY queue ``q`` (single-queue quiet) so the copy has landed before
+    // the flag fires, WITHOUT touching other blocks' queues.
+    core::SdmaQueitThread(signals + q, expectedSignals + q, 1);
+    // SENDER-SIDE completion fence (see collective body above): system-scope
+    // order the pushed SDMA bytes BEFORE the flag AMO becomes peer-visible, so
+    // the completion reader cannot see the flag ahead of the data. Closes the
+    // copy-engine visibility gap that previously needed a host stream sync.
+    __threadfence_system();
+    // The flag AMO is a DIRECT peer-memory CAS (P2P), not an SDMA-queue signal,
+    // so it never races the per-queue counter. Bump slot ``flagBase+groupPos``.
+    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+        flagsMemObj, (flagBase + static_cast<size_t>(groupPos)) * sizeof(uint64_t), &flagVal, 8,
+        core::atomicType::AMO_SET, remotePe, 0);
+  }
+  __syncthreads();
 }
 
 // ---------------------------------------------------------------------------

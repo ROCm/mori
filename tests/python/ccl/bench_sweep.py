@@ -99,12 +99,22 @@ def _worker(rank, world_size, ranks_per_node, device, sizes_mb, dtypes, reps,
     os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", str(need))
     shmem.shmem_torch_process_group_init("default")
     assert shmem.shmem_mype() == rank
-    handle = HierAllGather(
-        my_pe=rank, npes=world_size, ranks_per_node=ranks_per_node,
-        input_buffer_size=per_rank_bytes,
-        output_buffer_size=per_rank_bytes * world_size,
-        copy_output_to_user=True,
-    )
+    _host_proxy = os.environ.get("MORI_HIER_HOST_PROXY", "0") not in (
+        "0", "", "false", "False")
+    if _host_proxy:
+        # Persistent hierarchical CPU-posted transport (deep-SQ multi-NIC fan).
+        from mori.ccl.host_proxy_ag import HostProxyHierAllGather
+        handle = HostProxyHierAllGather(
+            my_pe=rank, npes=world_size, ranks_per_node=ranks_per_node,
+            output_buffer_size=per_rank_bytes * world_size, device=device,
+        )
+    else:
+        handle = HierAllGather(
+            my_pe=rank, npes=world_size, ranks_per_node=ranks_per_node,
+            input_buffer_size=per_rank_bytes,
+            output_buffer_size=per_rank_bytes * world_size,
+            copy_output_to_user=True,
+        )
     if rank == 0:
         print(f"[sweep] world={world_size} rpn={ranks_per_node} "
               f"num_nodes={handle.num_nodes} sizes_mb={sizes_mb} "

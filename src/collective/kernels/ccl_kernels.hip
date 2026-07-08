@@ -255,13 +255,50 @@ extern "C" __global__ void RingFinishCopyKernel_u32(
   }
 }
 
+// L2-COHERENT RE-TOUCH (Phase-5, Team A -- targets the barriercutouch residual).
+// barriercutouch composes shmem_barrier_on_stream (orders the RDMA cross-PE
+// landing + intra SDMA gather) with a CU re-touch (torch.add(out,0)) and cut the
+// olapfast completion drift ~24x (dL 0.054 -> 0.0023) but never reached bit-exact:
+// the residual dL 0.0023 is the SDMA copy-engine-written output bytes not being
+// L2-coherent to the consumer GEMM under FSDP buffer reuse. The plain add-0
+// re-touch FAILS to fix it because torch.add issues AGENT-scope, cacheable loads
+// -- it reads the SAME STALE L2 line the previous step's GEMM cached for this
+// reused buffer, adds 0, and writes the stale value straight back. This kernel
+// does a SYSTEM-SCOPE ACQUIRE load (glc+dlc: bypass/invalidate L2, fetch the
+// fabric-coherent HBM value the SDMA/RDMA agents actually wrote) followed by a
+// SYSTEM-SCOPE RELEASE store, so the LAST writer of the consumed buffer is a CU
+// op AND the value it re-publishes is the freshly-landed one, not a stale cache
+// line. Stream-ordered after the barrier => no host stall (keeps overlap). Rewrite
+// of the same value is bit-exact for every dtype. Targets ONLY the big cross-node
+// AGs where the residual lives.
+// NOTE: system-scope __hip_atomic_* faults/hangs on gfx942 for coarse-grained
+// torch CUDA memory (they require fine-grained/coherent allocations). Instead use
+// a VOLATILE load, which the CDNA backend lowers to a glc-tagged global load that
+// BYPASSES the L2 line -> reads the fabric-coherent HBM value the SDMA/RDMA agents
+// wrote (skipping the stale L2 line the previous step's GEMM cached for this
+// reused buffer), then a normal store re-publishes it into the CU/L2 domain the
+// consumer GEMM reads. Safe on coarse-grained memory, no atomics.
+extern "C" __global__ void L2CoherentRetouchKernel_u32(
+    uint32_t* __restrict__ out, uint64_t n) {
+  volatile uint32_t* vp = reinterpret_cast<volatile uint32_t*>(out);
+  uint64_t idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+  for (uint64_t i = idx; i < n; i += stride) {
+    uint32_t v = vp[i];
+    out[i] = v;
+  }
+}
+
 extern "C" __global__ void InterNodeRingAllGatherKernel_u32(CclInterNodeRingArgs args) {
   // Sub-group ring over {peBase, peBase+peStride, ...}; the flat whole-world
   // ring is the special case peBase=0, peStride=1, ringSize=npes, ringPos=myPe.
   AllGatherRingSubGroupKernelBody(args.ringPos, args.ringSize, args.peBase, args.peStride,
                                   args.memObj, args.flagsObj, args.chunkBytes, args.numQp,
                                   /*numBlocksOverride=*/-1, /*bidOverride=*/-1,
-                                  /*usePutSignal=*/args.usePutSignal != 0);
+                                  /*usePutSignal=*/args.usePutSignal != 0,
+                                  /*useWriteImm=*/args.useWriteImm != 0,
+                                  /*chunkReadyFlags=*/nullptr, /*opGen=*/args.opGen,
+                                  /*useRead=*/args.useRead != 0);
 }
 
 // ============================================================================
@@ -285,11 +322,290 @@ extern "C" __global__ void FusedRingLocalGatherKernel_u32(CclFusedRingLocalGathe
     AllGatherRingSubGroupKernelBody(args.ringPos, args.ringSize, args.ringPeBase, args.ringPeStride,
                                     args.ringMemObj, args.ringFlagsObj, args.chunkBytes, args.numQp,
                                     /*numBlocksOverride=*/args.ringBlocks,
-                                    /*bidOverride=*/static_cast<int>(blockIdx.x));
+                                    /*bidOverride=*/static_cast<int>(blockIdx.x),
+                                    /*usePutSignal=*/args.usePutSignal != 0,
+                                    /*useWriteImm=*/args.useWriteImm != 0);
   } else {
     OneShotAllGatherSdmaSubGroupKernel_body<uint32_t>(
         args.myPe, args.npes, args.groupSize, args.groupPos, args.gPeBase, args.gPeStride,
         args.gInput, args.gDstMemObj, args.gFlagsObj, args.gElementCount, args.gDstBaseOffset,
         args.gDstSlotStrideBytes, args.gFlagVal, /*blockLocal=*/true);
+  }
+}
+
+// Remote reassembly WORKER (shared by the dedicated reassembly CTAs and, under
+// MORI_HIER_FUSE_REMOTE_ELASTIC, the local-block CTA). Worker ``j`` (of ``stride``
+// total workers) owns ring channels f with (f % stride == j). For each such
+// channel it waits ONLY on that channel's landing flag (chunkReadyFlags[f]) and,
+// the instant it lands, SDMA-pushes THAT channel's 16B-aligned tile of every
+// remote block from this PE's ring buffer straight into the registered output on
+// SDMA queue ``qId`` -- overlapping the ring channels still crossing the NIC. The
+// tile partition mirrors the ring's multi-block tiling exactly. PUSH-ONLY (no
+// cross-rank wait) so the workers never dead-lock; each worker uses a DISTINCT
+// qId so their per-queue signal counters never race.
+// Wall-decomposition profiler landmarks (MORI_HIER_PROFILE). g_hierProf[1] is an
+// atomicMax over reassembly workers of the wall_clock64() at which each ring
+// channel's landing flag was OBSERVED (== when the last inter-node RDMA chunk
+// became reassemblable); [0] kernel-entry reference, [2] completion-reader done,
+// [3] local-gather done. All wall_clock64 (fixed-freq, GPU-uniform). Zeroed at
+// module load; the completion reader resets [1] after reading so the atomicMax
+// starts clean for the next launch.
+__device__ unsigned long long g_hierProf[4] = {0, 0, 0, 0};
+
+__device__ inline void FusedRemoteReassembleWorker(
+    const CclFusedRingRemoteGatherArgs& args, int rb, int j, int stride, int qId) {
+  const size_t kAlign = 16;
+  const size_t nUnits = (args.chunkBytes + kAlign - 1) / kAlign;
+  const size_t unitsPerChan = (nUnits + static_cast<size_t>(rb) - 1) / static_cast<size_t>(rb);
+  const size_t sliceElems = args.chunkBytes / sizeof(uint32_t);
+  const int numRemote = args.numNodes - 1;
+  uint32_t* ringBase = reinterpret_cast<uint32_t*>(args.ringMemObj->localPtr);
+  for (int f = j; f < rb; f += stride) {
+    size_t startUnit = static_cast<size_t>(f) * unitsPerChan;
+    size_t endUnit = startUnit + unitsPerChan;
+    if (endUnit > nUnits) endUnit = nUnits;
+    const size_t subOff = startUnit * kAlign;
+    size_t subEnd = endUnit * kAlign;
+    if (subEnd > args.chunkBytes) subEnd = args.chunkBytes;
+    const size_t subBytes = (subOff < subEnd) ? (subEnd - subOff) : 0;
+    if (threadIdx.x == 0) {
+      int spin = 0;
+      while (mori::core::AtomicLoadSeqCstSystem(args.chunkReadyFlags + f) <
+             static_cast<uint64_t>(1)) {
+        if (++spin > 100000000) break;
+      }
+      __threadfence_system();
+      // PROFILE: record when THIS channel's inter-node RDMA landing flag was
+      // observed. atomicMax across all workers/channels => the LAST inter chunk
+      // land time (the inter-node RDMA-fill completion boundary).
+      if (args.profile != 0) {
+        atomicMax(&g_hierProf[1], static_cast<unsigned long long>(wall_clock64()));
+      }
+    }
+    __syncthreads();
+    if (subBytes == 0) continue;
+    const size_t subElems = subBytes / sizeof(uint32_t);  // 16B-aligned => exact
+    int mi = 0;
+    for (int m = 0; m < args.numNodes; ++m) {
+      if (m == args.nodeId) continue;  // local block handled by the bx==rb CTA gather
+      uint32_t* src =
+          ringBase + static_cast<size_t>(m) * sliceElems + (subOff / sizeof(uint32_t));
+      const size_t dstBase =
+          static_cast<size_t>(m) * static_cast<size_t>(args.groupSize) * sliceElems *
+              sizeof(uint32_t) +
+          subOff;
+      const size_t flagBase = static_cast<size_t>(args.groupSize) +
+                              (static_cast<size_t>(f) * numRemote + mi) *
+                                  static_cast<size_t>(args.groupSize);
+      OneShotSubGroupPushOnly_body<uint32_t>(
+          args.groupSize, args.groupPos, args.gPeBase, args.gPeStride, src, args.gDstMemObj,
+          args.gFlagsObj, subElems, dstBase, /*dstSlotStrideBytes=*/args.chunkBytes,
+          args.gFlagVal, flagBase, /*qId=*/qId);
+      ++mi;
+    }
+  }
+}
+
+// PHASE 4: pipelined ring + REMOTE-block reassembly (see CclFusedRingRemoteGather
+// Args). Grid = 2*ringBlocks + 1. Blocks [0,ringBlocks): ring channels, each
+// publishing chunkReadyFlags[bid] on landing. Block [ringBlocks]: the ring-
+// independent LOCAL block gather (this PE's own input). Blocks
+// (ringBlocks, 2*ringBlocks]: remote reassembly block j = blockIdx.x-ringBlocks-1
+// spins on chunkReadyFlags[j] then SDMA-pushes sub-range j of every remote block
+// from THIS PE's ring buffer (slot m == node m's chunk, ring order) straight into
+// the registered output -- overlapping ring channel j+1 still on the NIC. The
+// sub-range partition mirrors the ring's multi-block 16B-aligned tiling exactly so
+// chunkReadyFlags[j] guards precisely the bytes reassembled here. Each (j, remote
+// m) gather uses a disjoint flagBase so the concurrent reassembly blocks never
+// race on the shared subgroup flag slots.
+extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGatherArgs args) {
+  const int rb = args.ringBlocks;
+  // DEEP-SQ TEMPORAL PIPELINE: when deepPipe>1 (only on rb==1) the single ring
+  // channel splits the chunk into ``pipe`` TEMPORAL sub-chunks each with its own
+  // landing flag, so the reassembly workers + completion reader iterate over
+  // ``pipe`` sub-chunk flags instead of ``rb`` spatial channel flags. deepPipe<=1
+  // => pipe==rb (byte-identical shipped path).
+  const int pipe = args.deepPipe > 1 ? args.deepPipe : rb;
+  const int reasm = args.reassemblyBlocks > 0 ? args.reassemblyBlocks : rb;
+  // ELASTIC REASSEMBLY: the local-block CTA joins reassembly as an extra worker
+  // (index == reasm) on queue 0 after its own gather, so the tail runs on
+  // effReasm = reasm+1 SDMA queues. OFF => effReasm == reasm (byte-identical).
+  const int effReasm = args.elasticReasm != 0 ? reasm + 1 : reasm;
+  const unsigned bx = blockIdx.x;
+  if (bx < static_cast<unsigned>(rb)) {
+    // HOST-PROXY INTER (hostProxyInter): a host proxy owns the inter-node leg --
+    // it posts sub-chunk p's cross-node RDMA writes into the ring buffer, drains
+    // its send-CQ (the proven host-drain landing fence, bit-exact at 466MB where
+    // the device per-sub-chunk signal races/crashes), and publishes
+    // chunkReadyFlags[p] from the host. So the device ring-send blocks do NOTHING
+    // here; the reassembly workers + completion reader (below) consume the
+    // host-published flags unchanged. OFF => device posts inter as before.
+    if (args.hostProxyInter != 0) {
+      // no-op: inter leg owned by the host proxy.
+    } else
+    // Ring channel bx: publishes chunkReadyFlags[bx] on landing.
+    AllGatherRingSubGroupKernelBody(args.ringPos, args.ringSize, args.ringPeBase, args.ringPeStride,
+                                    args.ringMemObj, args.ringFlagsObj, args.chunkBytes, args.numQp,
+                                    /*numBlocksOverride=*/rb, /*bidOverride=*/static_cast<int>(bx),
+                                    /*usePutSignal=*/args.usePutSignal != 0,
+                                    /*useWriteImm=*/args.useWriteImm != 0, args.chunkReadyFlags,
+                                    /*opGen=*/0, /*useRead=*/false, /*wqeDepth=*/args.wqeDepth,
+                                    /*deepPipe=*/args.deepPipe);
+  } else if (bx == static_cast<unsigned>(rb)) {
+    // PROFILE: kernel-entry reference for the wall decomposition (this single CTA
+    // is launched with all others, so its entry ~= kernel start).
+    if (args.profile != 0 && threadIdx.x == 0) {
+      g_hierProf[0] = static_cast<unsigned long long>(wall_clock64());
+    }
+    // Local block (m == nodeId): ring-independent, reads this PE's own input.
+    // Collective gather on flag slots [0, G) -- a SINGLE collective (never nested),
+    // so it cannot dead-lock.
+    OneShotAllGatherSdmaSubGroupKernel_body<uint32_t>(
+        args.myPe, args.npes, args.groupSize, args.groupPos, args.gPeBase, args.gPeStride,
+        args.gInput, args.gDstMemObj, args.gFlagsObj, args.gElementCount, args.gDstBaseOffset,
+        args.gDstSlotStrideBytes, args.gFlagVal, /*blockLocal=*/true, /*flagBase=*/0);
+    // PROFILE: local-block SDMA gather done (ring-independent leg).
+    if (args.profile != 0 && threadIdx.x == 0) {
+      __threadfence();
+      g_hierProf[3] = static_cast<unsigned long long>(wall_clock64());
+    }
+    // ELASTIC REASSEMBLY: this CTA's own-shard gather (queue 0) is done, so join
+    // remote reassembly as worker index==reasm (stride effReasm) on queue 0 --
+    // reassemble the tail channels concurrently with the reasm dedicated blocks,
+    // giving the un-hidden reassembly leg effReasm SDMA queues. Must complete
+    // before the completion reader below (its published flags are counted there).
+    if (args.elasticReasm != 0 && args.chunkReadyFlags != nullptr) {
+      FusedRemoteReassembleWorker(args, pipe, /*j=*/reasm, /*stride=*/effReasm, /*qId=*/0);
+    }
+    // COMPLETION READER: the remote reassembly blocks are PUSH-ONLY (they never
+    // wait on a peer) so this CTA does the single cross-rank completion wait for
+    // the WHOLE remote reassembly. It spins until every (block j, remote node m,
+    // sender g) has published its flag -- guaranteed to finish because every
+    // rank's push blocks always make progress (no circular dependency). Flag slot
+    // for (j, mIdx, senderG) == G + (j*numRemote + mIdx)*G + senderG, disjoint
+    // from the local block's [0, G).
+    const int numRemote = args.numNodes - 1;
+    if (numRemote > 0 && args.chunkReadyFlags != nullptr) {
+      uint64_t* rflags = reinterpret_cast<uint64_t*>(args.gFlagsObj->localPtr);
+      const int G = args.groupSize;
+      // PARALLEL completion reader (Turn-15): the flag slots (channel f, remote
+      // node mi, sender g) occupy the CONTIGUOUS region [G, G + rb*numRemote*G):
+      // idx = G + (f*numRemote + mi)*G + sg with (f,mi,sg) enumerating that range
+      // densely. Previously thread 0 spun over all rb*numRemote*G slots SERIALLY,
+      // so the whole-reassembly completion latency grew linearly with the ring-
+      // channel count -- exactly the per-chunk handshake overhead that collapsed
+      // the pipeline's overlap at rb>1. Fan the wait across the CTA's threads
+      // (each thread polls a strided subset) so the completion tail is O(total /
+      // blockDim) instead of O(total). Bit-exact: same slots, same threshold,
+      // just concurrent; a single CTA-wide fence + barrier still orders every
+      // landed byte before the finish.
+      const size_t total = static_cast<size_t>(pipe) * static_cast<size_t>(numRemote) *
+                           static_cast<size_t>(G);
+      for (size_t t = threadIdx.x; t < total; t += blockDim.x) {
+        const size_t idx = static_cast<size_t>(G) + t;
+        int spin = 0;
+        while (mori::core::AtomicLoadSeqCstSystem(rflags + idx) < args.gFlagVal) {
+          if (++spin > 100000000) break;
+        }
+      }
+      __threadfence_system();
+      // PROFILE: completion reader done == all intra-node SDMA reassembly pushes
+      // have landed in this PE's output. Decompose the wall: t0=entry, t1=last
+      // inter-node RDMA land, t2=reassembly drain done, t3=local-gather done.
+      if (args.profile != 0 && threadIdx.x == 0) {
+        unsigned long long t2 = static_cast<unsigned long long>(wall_clock64());
+        g_hierProf[2] = t2;
+        __threadfence();
+        unsigned long long t0 = g_hierProf[0];
+        unsigned long long t1 = g_hierProf[1];  // last inter-node land (atomicMax)
+        unsigned long long t3 = g_hierProf[3];  // local-gather done
+        unsigned long long tot = (t2 > t0) ? (t2 - t0) : 0;
+        unsigned long long inter = (t1 > t0) ? (t1 - t0) : 0;
+        unsigned long long intraTail = (t2 > t1) ? (t2 - t1) : 0;
+        unsigned long long localLeg = (t3 > t0) ? (t3 - t0) : 0;
+        if (args.myPe == 0 && tot > 0) {
+          double interPct = 100.0 * static_cast<double>(inter) / static_cast<double>(tot);
+          double intraPct = 100.0 * static_cast<double>(intraTail) / static_cast<double>(tot);
+          double localPct = 100.0 * static_cast<double>(localLeg) / static_cast<double>(tot);
+          printf(
+              "[HIERPROF] chunkBytes=%llu nodes=%d rb=%d reasm=%d | wall=%llu cyc | "
+              "inter_land=%llu (%.1f%%) intra_reasm_tail=%llu (%.1f%%) local_gather=%llu (%.1f%%)\n",
+              static_cast<unsigned long long>(args.chunkBytes), args.numNodes, rb,
+              args.reassemblyBlocks, tot, inter, interPct, intraTail, intraPct, localLeg, localPct);
+        }
+        // Reset the atomicMax slot so the next launch starts clean.
+        g_hierProf[1] = 0;
+      }
+    }
+    // CU-COHERENT RE-TOUCH (director-mandated fused copy-out, no host stall):
+    // every peer's SDMA push into THIS PE's output has now landed (all flags set
+    // + system fence above) AND the local-block collective gather (run earlier in
+    // this same CTA) has completed. The bytes are fabric-coherent in HBM but the
+    // consumer GEMM may still hold STALE L2 lines for the reused FSDP output
+    // buffer -> the +0.018 E2E drift. Re-touch the full local output with a
+    // volatile-glc load (bypass stale L2, fetch fresh HBM) + normal store
+    // (re-publish into the CU/L2 domain the GEMM reads). Fused in-kernel after
+    // the ACTUAL HW-completion flag-wait, so no host round-trip. Env-gated
+    // (MORI_HIER_FUSE_REMOTE_RETOUCH); default OFF keeps the path byte-identical.
+    if (args.retouchOut != 0) {
+      volatile uint32_t* out = reinterpret_cast<volatile uint32_t*>(args.gDstMemObj->localPtr);
+      const size_t totalOut = static_cast<size_t>(args.numNodes) *
+                              static_cast<size_t>(args.groupSize) * args.gElementCount;
+      for (size_t i = threadIdx.x; i < totalOut; i += blockDim.x) {
+        uint32_t v = out[i];
+        out[i] = v;
+      }
+      __threadfence_system();
+    }
+    __syncthreads();
+  } else {
+    // Remote reassembly block j in [0, reasm): PIPELINED over ring channels.
+    // Block j owns the ring channels f with (f % reasm == j). For EACH such
+    // channel it waits ONLY on that channel's landing flag (chunkReadyFlags[f])
+    // and, the instant it lands, SDMA-pushes THAT channel's exact 16B-aligned
+    // tile of every remote block from this PE's ring buffer straight into the
+    // registered output -- so channel f's XGMI reassembly overlaps ring channels
+    // f+reasm, f+2*reasm, ... still crossing the NIC. This is the true two-phase
+    // (NIC<->XGMI) pipeline: previously the reassembly waited for ALL ring flags
+    // before pushing anything, collapsing the overlap (the Turn-38 regression).
+    // The tile partition MIRRORS the ring's multiBlock tiling (numBlocks==rb,
+    // 16B units) so chunkReadyFlags[f] guards precisely the bytes pushed here.
+    // PUSH-ONLY (no cross-rank wait) => the blocks never dead-lock. Each block
+    // uses SDMA queue qId=j+1 (distinct per block; local CTA uses queue 0), and
+    // reuses that one queue serially across its channels (never raced).
+    const int j = static_cast<int>(bx) - rb - 1;
+    if (j < 0 || j >= reasm) return;
+    // Worker j of effReasm total workers (stride effReasm); under elastic the
+    // local CTA is the extra worker j==reasm. qId=j+1 (1..reasm) is distinct from
+    // the local CTA's queue 0. Byte-identical to the prior stride==reasm path when
+    // elastic is OFF (effReasm==reasm).
+    FusedRemoteReassembleWorker(args, pipe, /*j=*/j, /*stride=*/effReasm, /*qId=*/j + 1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 5 (Team A) — device-side landing GATE-OP (director spec 2026-07-07 13:48Z)
+// ---------------------------------------------------------------------------
+// The campaign's decisive root-cause (T11): on this MI300X/mlx5, kernel-return +
+// on-stream CUDA events do NOT capture SDMA/RDMA HARDWARE completion -- the async
+// copy-engine / RDMA send WQEs outlive the enqueuing kernel, so the FSDP consumer
+// reading on the SAME stream can race the still-in-flight landing (olapfast drift
+// dL=-0.054). Only a HOST hipStreamSynchronize -- which drains the SDMA HSA-signal
+// queues + the RDMA CQ hardware queues -- was bit-exact, but it stalls the CPU
+// enqueue of the rest of the step (-22%).
+//
+// This gate is the DEVICE equivalent of that host drain, with NO CPU round-trip:
+// a tiny 1-block kernel launched on the comm stream AFTER the big AG's ring/gather
+// kernels. ShmemQuietThread<RDMA>() is the LIVE drain (DrainToLive=true) -- it
+// spins on the mlx5 CQ (Mlx5CollapsedCqDrain) for EVERY peer/QP until every
+// reserved RDMA WQE has completed, i.e. every inter-node write this rank posted
+// has landed at the remote NIC. __threadfence_system() then system-orders those
+// landed bytes before the kernel returns, so the FSDP-recorded completion event
+// on this stream coincides with the actual hardware landing. Single thread runs
+// the (serial) per-QP drain loop, mirroring the ring kernels' quiet calls.
+extern "C" __global__ void DeviceLandingGateKernel_u32(int dummy) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    mori::shmem::ShmemQuietThread();
+    __threadfence_system();
   }
 }

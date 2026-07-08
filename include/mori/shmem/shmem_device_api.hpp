@@ -176,6 +176,34 @@ DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
 DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Block)
 
+// WRITE_WITH_IMM warp put. Cross-node RDMA only (the immediate-in-recv-CQ
+// completion guarantee is an RC/RDMA property), so this dispatches straight to
+// the RDMA kernel rather than through DISPATCH_TRANSPORT_TYPE. Used by the
+// hierarchical inter-node ring to close the remote-landing race on the big
+// cross-node all-gathers without a host stream-drain.
+inline __device__ void ShmemPutMemImmWarp(const application::SymmMemObjPtr dest, size_t destOffset,
+                                          const application::SymmMemObjPtr source,
+                                          size_t sourceOffset, size_t bytes, uint32_t imm, int pe,
+                                          int qpId = 0) {
+  ShmemPutMemImmWarpKernel<application::TransportType::RDMA>(dest, destOffset, source, sourceOffset,
+                                                            bytes, imm, pe, qpId);
+}
+
+// WRITE_WITH_IMM receiver scaffold (cross-node RDMA only). Pre-post recv WQEs
+// (ShmemPostRecvImm) and consume the immediate completion (ShmemPollRecvCqImm)
+// so the hierarchical inter-node ring receiver only proceeds once the peer's
+// payload has physically landed -- closing the remote-landing race without a
+// host stream-drain.
+inline __device__ void ShmemPostRecvImm(uintptr_t laddr, uint64_t lkey, size_t bytes,
+                                        uint32_t count, int pe, int qpId = 0) {
+  ShmemPostRecvImmThreadKernel<application::TransportType::RDMA>(laddr, lkey, bytes, count, pe,
+                                                                qpId);
+}
+
+inline __device__ uint32_t ShmemPollRecvCqImm(int pe, int qpId = 0) {
+  return ShmemPollRecvCqImmThreadKernel<application::TransportType::RDMA>(pe, qpId);
+}
+
 #define DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Scope)                                      \
   template <typename T>                                                                    \
   inline __device__ void ShmemPutTypeNbi##Scope(                                           \

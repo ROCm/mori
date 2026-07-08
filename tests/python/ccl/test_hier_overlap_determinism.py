@@ -222,10 +222,6 @@ def _worker_body(rank, world_size, ranks_per_node, device):
     supported = handle.supports_param_contiguous_output()
     del handle
     try:
-        if not supported:
-            if rank == 0:
-                print("SKIP: direct param-contiguous path unavailable", flush=True)
-            return
         total_nd, total_wr = 0, 0
         # Size profiles: the large multi-split (turn-1 regime) + a SMALL/odd
         # single-split profile (Qwen has small layers that route to the
@@ -234,11 +230,28 @@ def _worker_body(rank, world_size, ranks_per_node, device):
             (_PARAM_SPLITS, _REPS),        # large multi-split (proven regime)
             ([65536, 32768, 8192], _REPS), # small sizes (num_blocks=1 band)
             ([524288], _REPS),             # single big split
+            # THE FSDP culprit band: in-situ AG_VERIFY localized the entire loss
+            # drift to ONE call/step at per-rank count 29,132,224 (~58MB bf16),
+            # ~9592 stale elems, max|diff|~0.15. Reproduce it directly here.
+            ([29132224], _REPS_LARGE),
             # Qwen embed+lm_head band -- crosses 2^31 bytes; the untested regime
             # where a size-dependent async landing race would surface.
             (_PARAM_SPLITS_LARGE, _REPS_LARGE),
         ]
         _MODES = os.environ.get("OVERLAP_MODES", "copyout,zerocopy").split(",")
+        # copy-OUT __call__ needs no param-contiguous support; only zerocopy
+        # (enqueue_param_contiguous) does. Under the deployed FSDP fast env
+        # (STREAM_INTRA=0) supports=False, but the copy-OUT path -- the branch
+        # FSDP actually runs -- must still be probed. Drop only zerocopy then.
+        if not supported:
+            _MODES = [m for m in _MODES if m != "zerocopy"]
+            if rank == 0:
+                print("NOTE: param-contiguous unsupported (STREAM_INTRA=0); "
+                      "running copy-OUT mode only", flush=True)
+        if not _MODES:
+            if rank == 0:
+                print("SKIP: no runnable modes", flush=True)
+            return
         # FRESH handle per op MODE. Mixing the copy-OUT __call__ path and the
         # zero-copy enqueue_param_contiguous path on ONE handle contaminates the
         # shared intra flag/seq + output-registration state (copy-OUT registers a

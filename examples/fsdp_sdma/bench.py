@@ -234,6 +234,53 @@ def _apply_fsdp2(model: torch.nn.Module, dtype: torch.dtype, reshard_root: bool)
             for m in shards:
                 m.set_custom_all_gather(ag)
 
+    # LEVER (MORI_FSDP_FWD_PREFETCH=D, default OFF): explicit FORWARD-prefetch depth.
+    # The crown's residual gap is the CU-free ~50GB/s SDMA-intra fill on the big AGs
+    # sitting on the serial all_gather_stream with too small an overlap window. Backward
+    # prefetch was refuted neutral (SDMA throughput-bound, D=3 breaks bit-exact), but
+    # FORWARD explicit-prefetch depth>=2 is untried: issue each decoder layer's AG D
+    # layers earlier from the CPU so the CU-free SDMA/RDMA fill overlaps more forward
+    # GEMM compute (the thesis dividend the transport levers cannot reach). Since the
+    # per-layer AGs (reshard_after_forward=True) free+recycle their buffer, depth is
+    # capped to what the deferred landing fence covers -- validate bit-exact per depth.
+    # SHIPPED-SAFE GUARD (R121): depth>=2 races the DEFER_HOSTSYNC copy-out fence
+    # (two AGs in flight -> the deferred landing fence covers only ONE), loss
+    # drifts +0.006 -- same physics as the refuted BWD_PREFETCH>2. So the depth is
+    # HARD-CLAMPED to 1 unless MORI_FSDP_FWD_PREFETCH_UNSAFE=1 explicitly opts into
+    # the drifting deeper depth for A/B measurement only (never shipped).
+    _fwd_pf = os.environ.get("MORI_FSDP_FWD_PREFETCH", "").strip()
+    if _fwd_pf and _fwd_pf not in ("0", "false", "False"):
+        depth = max(1, int(_fwd_pf))
+        if depth > 1 and os.environ.get("MORI_FSDP_FWD_PREFETCH_UNSAFE", "") not in (
+            "1", "true", "True", "yes", "on",
+        ):
+            depth = 1
+        layers = list(_iter_decoder_layers(model))
+        for i, layer in enumerate(layers):
+            nxt = layers[i + 1 : i + 1 + depth]
+            if nxt:
+                layer.set_modules_to_forward_prefetch(nxt)
+
+    # LEVER (MORI_FSDP_BIG_PREFETCH=1, default OFF): target the ACTUAL long pole --
+    # the giant embed/lm_head AG (the 54/46 profile: it IS the whole step). Decoder
+    # FWD_PREFETCH above helped 7% but leaves the giant AG exposed. Requires
+    # MORI_FSDP_SPLIT_ROOT so embed_tokens + lm_head are their OWN fully_shard units;
+    # then wire the LAST decoder layer to forward-prefetch the lm_head group, issuing
+    # the giant lm_head AG from the CPU during the last transformer layer's forward
+    # GEMM -- manufacturing the compute window the transport levers cannot reach.
+    # Keeps ONE big AG in flight at a time (last-layer decoder AG has already landed
+    # + resharded before lm_head runs) so the deferred landing fence stays valid.
+    if os.environ.get("MORI_FSDP_BIG_PREFETCH", "") not in ("", "0", "false", "False"):
+        layers = list(_iter_decoder_layers(model))
+        lm_head = getattr(model, "lm_head", None)
+        if layers and lm_head is not None and hasattr(lm_head, "set_modules_to_forward_prefetch"):
+            layers[-1].set_modules_to_forward_prefetch([lm_head])
+        # backward: layers[0] runs last in the backward pass before the root/embed
+        # group is re-gathered -- prefetch the embed group's backward AG into it.
+        embed = getattr(getattr(model, "model", model), "embed_tokens", None)
+        if layers and embed is not None and hasattr(layers[0], "set_modules_to_backward_prefetch"):
+            layers[0].set_modules_to_backward_prefetch([embed])
+
 
 def _estimate_training_tflops(num_params: int, tokens: int, step_time_s: float) -> float:
     # Dense transformer training is commonly approximated as 6 FLOPs per

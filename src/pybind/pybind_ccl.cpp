@@ -525,6 +525,16 @@ void RegisterMoriCcl(pybind11::module_& m) {
         py::arg("gather_args_ptr"), py::arg("ring_blocks"),
         "Merge ring + local-gather jit_args into fused-kernel args; returns int64 ptr");
 
+  // PHASE 4: merge ring + local-gather jit_args plus the pipeline extras
+  // (chunkReadyFlags device ptr, numNodes, nodeId) into CclFusedRingRemoteGather
+  // Args for FusedRingRemoteGatherKernel_u32 (pipelines the inter-node ring with
+  // the remote-block reassembly). Inert until the Python launcher is wired.
+  m.def("build_fused_ring_remote_gather_args",
+        &mori::collective::BuildFusedRingRemoteGatherArgs, py::arg("ring_args_ptr"),
+        py::arg("gather_args_ptr"), py::arg("ring_blocks"), py::arg("chunk_ready_flags_ptr"),
+        py::arg("num_nodes"), py::arg("node_id"), py::arg("reassembly_blocks") = 0,
+        "Merge ring + gather jit_args + pipeline extras into fused-remote args; returns int64 ptr");
+
   // =========================================================================
   // AllGatherIntoTensor — REMOVED
   // The underlying AllgatherSdma<uint32_t>::operator() now throws; this

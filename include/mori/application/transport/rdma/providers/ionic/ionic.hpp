@@ -47,7 +47,8 @@ static size_t GetIonicCqeSize() { return sizeof(struct ionic_v1_cqe); }
 // TODO: refactor IonicCqContainer so its structure is similar to IonicQpContainer
 class IonicCqContainer {
  public:
-  IonicCqContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_pd* pd);
+  IonicCqContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_pd* pd,
+                   bool forceClassic = false);
   ~IonicCqContainer();
 
  public:

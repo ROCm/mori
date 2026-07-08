@@ -217,6 +217,35 @@ void Context::InitializePossibleTransports() {
     numQpPerPe = std::max(1, std::atoi(envNumQp));  // ensure at least 1 QP
   }
   this->numQpPerPe = numQpPerPe;
+
+  // DUAL-RAIL (idle-NIC fan-out): each node exposes more active RDMA NICs than the
+  // GPUs used (e.g. 8 ionic ports, 4 GPU/node) -- the extra NICs sit idle. When
+  // MORI_HIER_DUAL_RAIL is set we bind a SECOND device (the idle partner of the
+  // matched NIC) and create the upper half of each peer's QPs on it, so a single
+  // rank's inter-node writes fan across TWO NICs. The second NIC is chosen as the
+  // matched index offset by half the active-port list (0->4,1->5,... with 8 ports),
+  // which lands on the idle partners and stays symmetric across nodes (both nodes
+  // run identical code, so rank g uses the same pair on each). rail2QpStart splits
+  // a peer's [0,numQpPerPe) block: [0,start) on rail 1, [start,numQpPerPe) on rail 2.
+  int portId2 = -1;
+  RdmaDevice* device2 = nullptr;
+  rail2QpStart = numQpPerPe;  // default: no QP on rail 2 (single-rail)
+  bool dualRail = false;
+  {
+    const char* eDR = std::getenv("MORI_HIER_DUAL_RAIL");
+    dualRail = (eDR != nullptr && eDR[0] != '\0' && eDR[0] != '0');
+  }
+  if (dualRail && device != nullptr && activeDevicePortList.size() >= 2 && numQpPerPe >= 2) {
+    int n = static_cast<int>(activeDevicePortList.size());
+    int idx2 = (devicePortId + n / 2) % n;
+    if (idx2 == devicePortId) idx2 = (devicePortId + 1) % n;
+    device2 = activeDevicePortList[idx2].first;
+    portId2 = activeDevicePortList[idx2].second;
+    rdmaDeviceContext2.reset(device2->CreateRdmaDeviceContext());
+    rail2QpStart = numQpPerPe / 2;
+    MORI_APP_INFO("rank {} DUAL-RAIL rail2 device [{}] {} port {} (rail2QpStart {})", LocalRank(),
+                  idx2, device2->Name(), portId2, rail2QpStart);
+  }
   // Initialize transport
   int peerRankInNode = -1;
   // HIP-visible device id of THIS rank within its node (0-based) = number of
@@ -287,9 +316,30 @@ void Context::InitializePossibleTransports() {
     config.maxCqeNum = (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
     config.alignment = 4096;
     config.onGpu = true;
+    // Phase-6 WRITE_WITH_IMM: the receiver polls recvCqHandle for RDMA_WRITE_WITH_IMM
+    // completions with its OWN consumer index (starting at 0). Without a dedicated recv
+    // CQ, ionic_recv_cq_buf mirrors the send CQ (ionic.cpp), so recvCqHandle.consIdx=0
+    // aliases send CQEs already consumed via cqHandle.consIdx -> the recv poll reads
+    // stale/foreign CQEs and spins forever (both ring peers deadlock). Give WRITE_IMM
+    // its own recv CQ so consIdx=0 is valid and only recv CQEs land there.
+    {
+      const char* eImm = std::getenv("MORI_HIER_RING_WRITE_IMM");
+      if (eImm != nullptr && eImm[0] != '\0' && eImm[0] != '0') config.dedicatedRecvCq = true;
+    }
     for (int qp = 0; qp < numQpPerPe; qp++) {
-      RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(config);
-      rdmaEps.push_back(ep);
+      // DUAL-RAIL: QPs [rail2QpStart, numQpPerPe) are created on the second device
+      // (idle NIC) with its own port; the rest on the primary. Same flat rdmaEps
+      // layout (numQpPerPe consecutive per peer) so init.cpp copies each QP's own
+      // qpn/wq/cq handle unchanged -- only the underlying NIC differs.
+      if (rdmaDeviceContext2 && qp >= rail2QpStart) {
+        RdmaEndpointConfig config2 = config;
+        config2.portId = portId2;
+        RdmaEndpoint ep = rdmaDeviceContext2->CreateRdmaEndpoint(config2);
+        rdmaEps.push_back(ep);
+      } else {
+        RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(config);
+        rdmaEps.push_back(ep);
+      }
     }
     transportTypes.push_back(TransportType::RDMA);
   }
@@ -315,8 +365,16 @@ void Context::InitializePossibleTransports() {
     }
     for (int qp = 0; qp < numQpPerPe; qp++) {
       int epIndex = peer * numQpPerPe + qp;
-      rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[epIndex],
-                                         peerToLocalEpHandles[epIndex], qp);
+      // DUAL-RAIL: rail-2 QPs were created on rdmaDeviceContext2, whose qpPool
+      // (keyed by local qpn) holds them; connect them there. ionic's ConnectEndpoint
+      // resolves the QP from local.qpn, so the per-context call is all that matters.
+      if (rdmaDeviceContext2 && qp >= rail2QpStart) {
+        rdmaDeviceContext2->ConnectEndpoint(localToPeerEpHandles[epIndex],
+                                            peerToLocalEpHandles[epIndex], qp);
+      } else {
+        rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[epIndex],
+                                           peerToLocalEpHandles[epIndex], qp);
+      }
     }
   }
 }

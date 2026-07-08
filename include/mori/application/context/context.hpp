@@ -49,6 +49,14 @@ class Context {
   RdmaContext* GetRdmaContext() const { return rdmaContext.get(); }
   RdmaDeviceContext* GetRdmaDeviceContext() const { return rdmaDeviceContext.get(); }
   bool RdmaTransportEnabled() const { return GetRdmaDeviceContext() != nullptr; }
+  // DUAL-RAIL (idle-NIC fan-out): the second RDMA device context (an otherwise-
+  // idle NIC) on which the upper half of each peer's QPs are created. nullptr
+  // unless MORI_HIER_DUAL_RAIL is enabled.
+  RdmaDeviceContext* GetRdmaDeviceContext2() const { return rdmaDeviceContext2.get(); }
+  bool DualRailEnabled() const { return rdmaDeviceContext2.get() != nullptr; }
+  // Local QP index (within a peer's [0,numQpPerPe) block) at/after which QPs live
+  // on the second rail. Equals numQpPerPe when dual-rail is off (no rail-2 QP).
+  int GetRail2QpStart() const { return rail2QpStart; }
 
   // Check if P2P connection is possible with a peer (same node)
   bool CanUseP2P(int destRank) const;
@@ -90,6 +98,9 @@ class Context {
 
   std::unique_ptr<RdmaContext> rdmaContext{nullptr};
   std::unique_ptr<RdmaDeviceContext> rdmaDeviceContext{nullptr};
+  // DUAL-RAIL second device context (idle NIC). nullptr unless MORI_HIER_DUAL_RAIL.
+  std::unique_ptr<RdmaDeviceContext> rdmaDeviceContext2{nullptr};
+  int rail2QpStart{-1};
 
   std::vector<RdmaEndpoint> rdmaEps;
 

@@ -118,6 +118,29 @@ inline __device__ void ShmemPutMemNbiBlockKernel(const application::SymmMemObjPt
                                                  size_t sourceOffset, size_t bytes, int pe,
                                                  int qpId = 0);
 
+// WRITE_WITH_IMM warp put (cross-node RDMA only). Same posting path as the plain
+// Nbi warp put but emits an RDMA_WRITE_WITH_IMM WQE carrying a 32-bit immediate;
+// on RC the immediate reaches the peer's recv-CQ strictly AFTER the payload DMA
+// lands remotely, so a receiver consuming the recv-CQE is guaranteed the data is
+// globally visible. Only the RDMA transport is specialized (see ibgda kernels).
+template <application::TransportType TsptType>
+inline __device__ void ShmemPutMemImmWarpKernel(const application::SymmMemObjPtr dest,
+                                                size_t destOffset,
+                                                const application::SymmMemObjPtr source,
+                                                size_t sourceOffset, size_t bytes, uint32_t imm,
+                                                int pe, int qpId = 0);
+
+// WRITE_WITH_IMM receiver scaffold (cross-node RDMA only). ShmemPostRecvImmThreadKernel
+// pre-posts recv WQEs so the responder can generate RDMA_WRITE_WITH_IMM CQEs;
+// ShmemPollRecvCqImmThreadKernel spins the recv-CQ until such a completion lands
+// and returns its immediate. Only the RDMA transport is specialized.
+template <application::TransportType TsptType>
+inline __device__ void ShmemPostRecvImmThreadKernel(uintptr_t laddr, uint64_t lkey, size_t bytes,
+                                                    uint32_t count, int pe, int qpId = 0);
+
+template <application::TransportType TsptType>
+inline __device__ uint32_t ShmemPollRecvCqImmThreadKernel(int pe, int qpId = 0);
+
 template <application::TransportType TsptType>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel(const application::SymmMemObjPtr dest,
                                                       size_t destOffset, void* val, size_t bytes,

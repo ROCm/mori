@@ -172,7 +172,21 @@ class IntraNodeSubGroupAllgatherSdma {
     if (!outObj_.IsValid())
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: out register failed");
 
-    size_t flagsBytes = static_cast<size_t>(npes_) * sizeof(uint64_t);
+    // Phase-4 parallel remote reassembly: the fused ring+remote-gather kernel
+    // (FusedRingRemoteGatherKernel) runs ``reasm`` concurrent reassembly blocks,
+    // each of which launches a blockLocal subgroup gather at a DISJOINT flagBase
+    // = (j*numNodes + m)*groupSize so the concurrent gathers never race on the
+    // shared flag slots. The max flag slot used is reasm*numNodes*groupSize ==
+    // reasm*npes. The single-block (reasm=1) path only needs ``npes`` slots, but
+    // sizing the buffer for up to ``kMaxReassemblyBlocks`` reassembly blocks lets
+    // MORI_HIER_REASSEM_BLOCKS>1 parallelise the XGMI reassembly WITHOUT the OOB
+    // flag write that previously hung reasm>1. Cost is tiny (a few KiB of the
+    // symmetric heap) and identical across PEs (npes is collective), so the
+    // symmetric layout stays consistent. flagBase=0 (the classic single gather
+    // and the fused local block) still occupies [0, groupSize) unchanged.
+    constexpr size_t kMaxReassemblyBlocks = 32;
+    size_t flagsSlots = static_cast<size_t>(npes_) * (kMaxReassemblyBlocks + 1);
+    size_t flagsBytes = flagsSlots * sizeof(uint64_t);
     flags_ = shmem::ShmemMalloc(flagsBytes);
     if (flags_ == nullptr)
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: flags ShmemMalloc failed");

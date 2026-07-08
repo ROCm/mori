@@ -71,3 +71,11 @@ except (ImportError, AttributeError):
 
     def __getattr__(name: str):
         raise ImportError(f"mori.ccl.{name} is not available — not yet ported to JIT.")
+
+# Host-proxy hierarchical all-gather (persistent CPU-posted transport). Pure
+# Python (depends only on mori.io, imported lazily inside its ctor), so it is
+# always importable regardless of the C++ collective-binding availability above.
+from .host_proxy_ag import HostProxyHierAllGather  # noqa: E402
+
+if "HostProxyHierAllGather" not in __all__:
+    __all__.append("HostProxyHierAllGather")

@@ -106,6 +106,14 @@ struct SymmMemObj {
   // For Rdma
   uint32_t lkey{0};
   uint32_t* peerRkeys{nullptr};
+  // DUAL-RAIL (idle-NIC fan-out): when this symmetric buffer is ALSO registered
+  // on a second RDMA device (an otherwise-idle NIC), lkey2/peerRkeys2 carry that
+  // second MR's local/remote keys. The device put selects these for QP ids that
+  // live on rail 2 (see ShmemPutMemNbiThreadKernelImpl). hasRail2==false (default)
+  // => single-rail, these are never read and the byte path is unchanged.
+  bool hasRail2{false};
+  uint32_t lkey2{0};
+  uint32_t* peerRkeys2{nullptr};
 
   // For VMM allocations: chunk key information (nvshmem-style)
   // vmmLkeyInfo[i] contains lkey and next_addr for chunk i

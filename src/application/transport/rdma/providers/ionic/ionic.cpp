@@ -96,7 +96,7 @@ bool IsCcqeSupported(ibv_context* context) {
 /*                                          IonicCqContainer                            */
 /* ---------------------------------------------------------------------------------------------- */
 IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfig& config,
-                                   ibv_pd* pd)
+                                   ibv_pd* pd, bool forceClassic)
     : config(config) {
   int status;
   struct ibv_cq_init_attr_ex cq_attr;
@@ -104,7 +104,14 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
 
   cqeNum = config.maxCqeNum;
 
-  const bool ccqe_enabled = IsCcqeSupported(context);
+  // forceClassic: create this CQ in the classic per-CQE color-bit format even
+  // when CCQE (compact msn-counter completions) is supported. The device-side
+  // WRITE_WITH_IMM receiver (PollRecvCqImm) only implements the classic color-bit
+  // decode -- it has no CCQE variant -- so a CCQE-format recv CQ would never
+  // present a matching color and the recv poll spins forever. The dedicated recv
+  // CQ is created with forceClassic=true so the classic receiver matches its
+  // format; the send CQ stays CCQE (fast path untouched). No-op when CCQE is off.
+  const bool ccqe_enabled = IsCcqeSupported(context) && !forceClassic;
 
   memset(&cq_attr, 0, sizeof(struct ibv_cq_init_attr_ex));
   cq_attr.cq_context = nullptr;
@@ -523,8 +530,11 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   IonicCqContainer* cq = new IonicCqContainer(context, config, pd);
   // printf("CreateRdmaEndpoint, context:%p, cq->cq:%p, pd_uxdma:%p\n", context, cq->cq, pd);
   // Optional dedicated recv CQ for the WRITE_WITH_IMM path (default off => shared CQ, legacy).
-  IonicCqContainer* recvCq = config.dedicatedRecvCq ? new IonicCqContainer(context, config, pd)
-                                                    : nullptr;
+  // forceClassic=true: the WRITE_WITH_IMM device receiver (PollRecvCqImm) only
+  // decodes classic color-bit CQEs, so the dedicated recv CQ must NOT be CCQE.
+  IonicCqContainer* recvCq =
+      config.dedicatedRecvCq ? new IonicCqContainer(context, config, pd, /*forceClassic=*/true)
+                             : nullptr;
   IonicQpContainer* qp = new IonicQpContainer(context, config, cq->cq, pd, this,
                                               recvCq ? recvCq->cq : nullptr);
 

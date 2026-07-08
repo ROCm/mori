@@ -413,6 +413,8 @@ static void CopyRdmaEndpointsToGpu(ShmemStates* states) {
       shmemEndpoints[i].qpn = hostEndpoints[i].handle.qpn;
       shmemEndpoints[i].wqHandle = hostEndpoints[i].wqHandle;
       shmemEndpoints[i].cqHandle = hostEndpoints[i].cqHandle;
+      // WRITE_WITH_IMM receiver CQ (mirrors cqHandle unless dedicatedRecvCq).
+      shmemEndpoints[i].recvCqHandle = hostEndpoints[i].recvCqHandle;
       shmemEndpoints[i].atomicIbuf = hostEndpoints[i].atomicIbuf;
     }
     HIP_RUNTIME_CHECK(hipMemcpy(gpuStates->rdmaEndpoints, shmemEndpoints.data(),
@@ -585,6 +587,17 @@ void GpuStateInit(ShmemStates* states) {
   states->gpuStates.rank = states->bootStates->rank;
   states->gpuStates.worldSize = states->bootStates->worldSize;
   states->gpuStates.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
+  // DUAL-RAIL: split point at/after which a peer's QPs live on the second NIC.
+  // Context returns numQpPerPe (no rail-2 QP) when dual-rail is off; convert that
+  // to -1 so the device gate (rail2QpStart>=0) stays inert on the single-rail path.
+  {
+    int r2 = states->rdmaStates->commContext->GetRail2QpStart();
+    states->gpuStates.rail2QpStart =
+        (states->rdmaStates->commContext->DualRailEnabled() &&
+         r2 < states->gpuStates.numQpPerPe)
+            ? r2
+            : -1;
+  }
   // this work (transport in-flight depth): optional fast-path WQE chunk size. When
   // set, a large RDMA put is split into multiple in-flight WQEs/QP (see
   // GpuStates::putChunkBytes). 0/unset keeps the single-WQE behavior.

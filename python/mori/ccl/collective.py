@@ -575,7 +575,7 @@ class InterNodeRingAllgather:
         return True
 
     def finish_ring_stream(self, output_data, count: int, stream=None,
-                           barrier: bool = True) -> bool:
+                           barrier: bool = True, cu_copyout: Optional[bool] = None) -> bool:
         """stream-ordered ring finish copy-OUT ONLY -- the ring
         kernel was already launched ELSEWHERE (e.g. by the FUSED
         ``FusedRingLocalGatherKernel_u32`` that runs the ring concurrently with
@@ -583,11 +583,22 @@ class InterNodeRingAllgather:
         the gathered ring buffer into ``output_data`` + the (optionally deferred)
         ShmemBarrierOnStream reuse fence. Pairs with ``prepare_stream_only`` +
         the external fused kernel launch. ``barrier`` mirrors ``defer_inter_fin``.
+
+        ``cu_copyout`` overrides the global MORI_HIER_RING_CU_COPYOUT choice for
+        THIS call: the CU RingFinishCopyKernel_u32 moves the WHOLE ring buffer on
+        COMPUTE UNITS, which burns CUs on bulk all-gather bytes -- forbidden on
+        the fuse_local win path (the thesis is bulk bytes ride SDMA/RDMA only, so
+        CUs stay free for the GEMM). Standalone sweep (Turn 12, N=2 G=4) proved the
+        fused ring||local-gather overlap already beats RCCL bit-exact with the
+        COPY-ENGINE finish (fp32 256MiB 175.0 vs RCCL 162.9 = 1.07x), i.e. the win
+        is the overlap, not the CU copy. So the fuse_local caller passes
+        cu_copyout=False to stay red-line compliant. None = use the global env.
         """
         byte_count = count * output_data.element_size()
         u32_count = (byte_count + 3) // 4
         s = _stream_to_int(stream)
-        if _ring_cu_copyout_enabled():
+        use_cu = _ring_cu_copyout_enabled() if cu_copyout is None else bool(cu_copyout)
+        if use_cu:
             self._cu_finish_copyout(output_data, u32_count, s, barrier=barrier)
         else:
             self._handle.finish_stream(output_data.data_ptr(), u32_count, s,
@@ -687,6 +698,53 @@ class IntraNodeSubGroupAllgatherSdma:
             (1,), (512,), 0, s, args
         )
         self._handle.finish_sync(output_data.data_ptr(), u32_count, s, barrier)
+        return True
+
+    def call_direct(self, input_data, output_full, count: int,
+                    dst_block_offset_elems: int = 0, stream=None,
+                    barrier: bool = True, prepare_barrier: bool = True,
+                    host_sync: bool = False) -> bool:
+        """DIRECT-to-output, fully STREAM-ORDERED sub-group SDMA gather.
+
+        PUSHes each member's ``count``-element shard straight into slot
+        ``group_pos`` of the node-block at element offset
+        ``dst_block_offset_elems`` inside the (registered) ``output_full``
+        tensor -- there is NO internal transit and NO transit->output copy-OUT.
+        Completion is an on-device ``ShmemBarrierOnStream`` rather than the
+        host ``hipStreamSynchronize`` + host ``ShmemBarrierAll`` of ``__call__``,
+        so the whole gather stays enqueued on ``stream`` and OVERLAPS the
+        caller's compute (the two per-AG host stalls of the finish_sync path
+        are removed). The pushed bytes are made CU-visible by the kernel's
+        post-flag ``__threadfence_system`` -- the same coherence contract the
+        shipped device HierAllGather direct path relies on, so a consumer GEMM
+        reading ``output_full`` sees the gathered bytes without a host sync.
+
+        ``output_full`` is registered collectively on first sight (cached; the
+        C++ handle no-ops an already-registered exact buffer), so callers MUST
+        invoke this in SPMD lockstep across the sub-group.
+        """
+        elsize = input_data.element_size()
+        byte_count = count * elsize
+        u32_count = (byte_count + 3) // 4
+        dst_off_bytes = dst_block_offset_elems * elsize
+        out_bytes = output_full.numel() * output_full.element_size()
+        s = _stream_to_int(stream)
+        # Register the user output for direct PUSH (collective + cached).
+        self._handle.register_output_buffer(output_full.data_ptr(), out_bytes)
+        args = self._handle.prepare_sync_direct(
+            input_data.data_ptr(), u32_count, s, prepare_barrier,
+            output_full.data_ptr(), dst_off_bytes, 0)
+        _get_ccl_func("OneShotAllGatherSdmaSubGroupKernel_u32").launch_struct(
+            (1,), (512,), 0, s, args
+        )
+        self._handle.finish_direct_stream(s, barrier)
+        if host_sync:
+            # Triage variant: keep the copy-OUT eliminated (direct push) but
+            # restore a HOST completion fence (drain the stream so the SDMA
+            # pushes have globally landed before the consumer reads) -- isolates
+            # whether copy-out elimination is independently bit-exact from the
+            # stream-barrier weakening. Reintroduces a per-call host stall.
+            (torch.cuda.current_stream() if stream is None else stream).synchronize()
         return True
 
     def gather_kernel(self, input_data, count: int, dst_base_offset: int = 0, stream=None,
@@ -850,6 +908,40 @@ class IntraNodeSubGroupAllgatherSdma:
         return True
 
 
+def launch_device_landing_gate(s: int) -> bool:
+    """PHASE 5 (Team A gate-op): launch the DeviceLandingGateKernel_u32 on stream
+    ``s`` -- a 1-block/1-thread device drain of every mlx5 RDMA CQ/QP
+    (ShmemQuietThread<RDMA> live drain) + __threadfence_system. On-device
+    equivalent of a host stream.synchronize's hardware-queue drain, with NO CPU
+    round-trip: when it returns on the comm stream the FSDP-recorded completion
+    event coincides with the actual landing of every posted inter-node RDMA write.
+    Used as the landing fence for the backward big AG (MORI_HIER_SYNC_BIG_MODE=devgate).
+    """
+    _get_ccl_func("DeviceLandingGateKernel_u32").launch(
+        (1,), (64,), 0, s, 0
+    )
+    return True
+
+
+def launch_l2_coherent_retouch(out_ptr: int, u32_count: int, s: int) -> bool:
+    """PHASE 5 (Team A): launch L2CoherentRetouchKernel_u32 over ``u32_count``
+    uint32 words at device address ``out_ptr`` on stream ``s``. System-scope
+    acquire-load + release-store re-touch that bypasses stale L2 (the residual the
+    barriercutouch plain add-0 re-touch could not fix). Stream-ordered, no host
+    stall. See the kernel comment in ccl_kernels.hip.
+    """
+    if u32_count <= 0:
+        return True
+    threads = 256
+    blocks = (u32_count + threads - 1) // threads
+    if blocks > 4096:
+        blocks = 4096
+    _get_ccl_func("L2CoherentRetouchKernel_u32").launch(
+        (blocks,), (threads,), 0, s, out_ptr, int(u32_count)
+    )
+    return True
+
+
 def launch_fused_ring_local_gather(ring_args: int, gather_args: int,
                                    ring_blocks: int, s: int) -> bool:
     """merge a prepared inter-node ring's jit_args with a
@@ -867,6 +959,32 @@ def launch_fused_ring_local_gather(ring_args: int, gather_args: int,
     fused = mori_cpp.build_fused_ring_local_gather_args(ring_args, gather_args, rb)
     _get_ccl_func("FusedRingLocalGatherKernel_u32").launch_struct(
         (rb + 1,), (512,), 0, s, fused
+    )
+    return True
+
+
+def launch_fused_ring_remote_gather(ring_args: int, gather_args: int, ring_blocks: int,
+                                    chunk_ready_flags_ptr: int, num_nodes: int, node_id: int,
+                                    s: int, reassembly_blocks: int = 0) -> bool:
+    """PHASE 4: launch the FUSED, PIPELINED ``FusedRingRemoteGatherKernel_u32`` ONCE
+    on stream ``s`` with ``2*ring_blocks + 1`` CTAs. Blocks ``[0, ring_blocks)`` run
+    the RDMA ring (Phase A) and each publishes ``chunkReadyFlags[bid]`` on landing;
+    block ``[ring_blocks]`` runs the ring-independent LOCAL node-block SDMA gather;
+    blocks ``(ring_blocks, 2*ring_blocks]`` each spin on ``chunkReadyFlags[j]`` and,
+    the instant sub-range ``j`` lands, SDMA-push that sub-range of every remote block
+    from this PE's ring buffer straight into the registered output -- overlapping ring
+    channel ``j+1`` still crossing the NIC (closes the two-serial-phases gap). The
+    ``gather_args`` must be the LOCAL block's prepared direct-gather jit_args
+    (dst_slot_stride == count, dst_block_offset == node_id*block_count); the remote
+    blocks derive their offsets from the ring buffer. ``chunk_ready_flags_ptr`` is a
+    device uint64 buffer of >= ring_blocks entries, ZEROED before this launch.
+    """
+    rb = ring_blocks if ring_blocks and ring_blocks >= 1 else 1
+    reasm = reassembly_blocks if reassembly_blocks and reassembly_blocks >= 1 else rb
+    fused = mori_cpp.build_fused_ring_remote_gather_args(
+        ring_args, gather_args, rb, chunk_ready_flags_ptr, num_nodes, node_id, reasm)
+    _get_ccl_func("FusedRingRemoteGatherKernel_u32").launch_struct(
+        (rb + 1 + reasm,), (512,), 0, s, fused
     )
     return True
 
