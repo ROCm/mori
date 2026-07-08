@@ -851,6 +851,24 @@ def _optional_kwargs(**kwargs):
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
+KERNEL_TYPE_CHOICES = {
+    "IntraNode": mori.ops.EpDispatchCombineKernelType.IntraNode,
+    "IntraNodeLL": mori.ops.EpDispatchCombineKernelType.IntraNodeLL,
+    "InterNode": mori.ops.EpDispatchCombineKernelType.InterNode,
+    "InterNodeV1": mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+    "InterNodeV1LL": mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+    "AsyncLL": mori.ops.EpDispatchCombineKernelType.AsyncLL,
+}
+
+
+def _resolve_bench_kernel_type(name):
+    if name not in KERNEL_TYPE_CHOICES:
+        raise ValueError(
+            f"Unknown kernel_type={name!r}; choose from {sorted(KERNEL_TYPE_CHOICES)}"
+        )
+    return KERNEL_TYPE_CHOICES[name]
+
+
 def _get_default_launch_config(
     world_size,
     max_num_inp_token_per_rank,
@@ -912,6 +930,7 @@ def _bench_dispatch_combine(
     iters=None,
     verify=True,
     routing="random",
+    kernel_type="IntraNode",
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -954,6 +973,7 @@ def _bench_dispatch_combine(
         use_external_inp_buf=not zero_copy,  # zero-copy mode requires use_external_inp_buf=False
         gpu_per_node=world_size,
         quant_type=quant_type,
+        kernel_type=_resolve_bench_kernel_type(kernel_type),
     )
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
@@ -1258,6 +1278,7 @@ def bench_dispatch_combine(
     iters=None,
     verify=True,
     routing="random",
+    kernel_type="IntraNode",
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -1294,6 +1315,7 @@ def bench_dispatch_combine(
             iters,
             verify,
             routing,
+            kernel_type,
         ),
         nprocs=world_size,
         join=True,
@@ -1538,6 +1560,13 @@ if __name__ == "__main__":
             "warmup. --cmd bench only"
         ),
     )
+    parser.add_argument(
+        "--kernel-type",
+        type=str,
+        default="IntraNode",
+        choices=sorted(KERNEL_TYPE_CHOICES),
+        help="Dispatch/combine kernel implementation to benchmark (default: IntraNode)",
+    )
     args = parser.parse_args()
 
     if args.num_experts_per_rank is None:
@@ -1580,7 +1609,8 @@ if __name__ == "__main__":
         f"dispatch_block_num: {args.dispatch_block_num}, "
         f"dispatch_warp_per_block: {args.dispatch_warp_per_block}, "
         f"combine_block_num: {args.combine_block_num}, "
-        f"combine_warp_per_block: {args.combine_warp_per_block}"
+        f"combine_warp_per_block: {args.combine_warp_per_block}, "
+        f"kernel_type: {args.kernel_type}"
     )
     print("-" * 60)
     bench_dispatch_combine(
@@ -1611,4 +1641,5 @@ if __name__ == "__main__":
         iters=args.iters,
         verify=bool(args.verify),
         routing=args.routing,
+        kernel_type=args.kernel_type,
     )
