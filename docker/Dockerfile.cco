@@ -75,43 +75,4 @@ RUN set -ex && \
         cd / && rm -rf /tmp/clr /tmp/hip; \
     fi
 
-# ── Patch ROCR runtime (libhsa-runtime64.so) from develop branch ──
-#
-# Build the latest rocr-runtime from the develop branch of rocm-systems
-# and replace the system libhsa-runtime64.so.
-#
-# Only applies to ROCm >= 7.0 (matching the CLR patch above).
-#
-# Remove this block once the base image ships a sufficient rocr-runtime.
-RUN set -ex && \
-    ROCM_VER=$(cat /opt/rocm/.info/version 2>/dev/null | head -c 5) && \
-    test -n "${ROCM_VER}" || { echo "ERROR: cannot read /opt/rocm/.info/version"; exit 1; } && \
-    ROCM_MAJOR=$(echo "${ROCM_VER}" | cut -d. -f1) && \
-    if [ "${ROCM_MAJOR}" -lt 7 ]; then \
-        echo "Skipping libhsa-runtime64 patch: ROCm ${ROCM_VER} (< 7.0)"; \
-    else \
-        apt-get update && \
-        apt-get install -y --no-install-recommends \
-            libelf-dev xxd pkg-config rocm-llvm-dev && \
-        rm -rf /var/lib/apt/lists/* && \
-        LIBHSA_TARGET=$(basename $(readlink -f /opt/rocm/lib/libhsa-runtime64.so.1)) && \
-        echo "Patching libhsa-runtime64.so on ROCm ${ROCM_VER}, target=${LIBHSA_TARGET}" && \
-        git clone --depth 1 --branch develop --quiet \
-            https://github.com/ROCm/rocm-systems.git /tmp/rocm-systems && \
-        sed -i 's/;gfx1200;gfx1250//' \
-            /tmp/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/trap_handler/CMakeLists.txt && \
-        sed -i 's/;_gfx12;_gfx12//' \
-            /tmp/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/trap_handler/CMakeLists.txt && \
-        sed -i 's/kCodeTrapHandlerV2_1250/kCodeTrapHandlerV2_11/g; s/kCodeTrapHandlerV2_12/kCodeTrapHandlerV2_11/g' \
-            /tmp/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp && \
-        mkdir /tmp/rocm-systems/projects/rocr-runtime/build && \
-        cd /tmp/rocm-systems/projects/rocr-runtime/build && \
-        cmake -DCMAKE_PREFIX_PATH=/opt/rocm \
-              -DCMAKE_INSTALL_PREFIX=/opt/rocm \
-              -DBUILD_SHARED_LIBS=ON .. && \
-        make -j$(nproc) hsa-runtime64 && \
-        BUILT_LIB=$(find . -name 'libhsa-runtime64.so.1.*' -type f | head -1) && \
-        test -f "${BUILT_LIB}" || { echo "ERROR: built libhsa-runtime64 not found"; exit 1; } && \
-        cp "${BUILT_LIB}" /opt/rocm/lib/${LIBHSA_TARGET} && \
-        cd / && rm -rf /tmp/rocm-systems; \
-    fi
+RUN pip install --no-cache-dir flydsl

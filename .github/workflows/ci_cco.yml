@@ -76,7 +76,11 @@ jobs:
           $CT exec $CONTAINER bash -c "pip install mpi4py && \
             cd $GITHUB_WORKSPACE/examples/cco/python && \
             mpirun --allow-run-as-root -np 2 python 01_barrier/main.py && \
-            mpirun --allow-run-as-root -np 2 python 02_lsa_put/main.py"
+            mpirun --allow-run-as-root -np 2 python 02_lsa_put/main.py && \
+            mpirun --allow-run-as-root -np 2 python 03_flydsl_put/main.py && \
+            mpirun --allow-run-as-root -np 2 python 04_flydsl_lsa_put/main.py && \
+            mpirun --allow-run-as-root -np 2 python 05_flydsl_lsa_allreduce/main.py && \
+            mpirun --allow-run-as-root -np 2 python 06_flydsl_gda_modes/main.py"
 
       - name: Cleanup
         if: always()
