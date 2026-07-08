@@ -481,6 +481,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         graph_replay_iters=10,
         skip_e2e=False,
         call_local_expert_count=False,
+        verify=True,
     ):
         test_data = self.gen_test_data()
         for _ in range(warmup):
@@ -491,6 +492,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 dispatch_warp_per_block,
                 combine_block_num,
                 combine_warp_per_block,
+                check=verify,
                 call_local_expert_count=call_local_expert_count,
             )
 
@@ -905,6 +907,7 @@ def _bench_dispatch_combine(
     report_scale_stats=False,
     warmup=None,
     iters=None,
+    verify=True,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -1007,6 +1010,7 @@ def _bench_dispatch_combine(
                 combine_block_num=combine_block_num,
                 combine_warp_per_block=combine_warp_per_block,
                 call_local_expert_count=call_local_expert_count,
+                verify=verify,
                 **_optional_kwargs(warmup=warmup, iters=iters),
             )
 
@@ -1247,6 +1251,7 @@ def bench_dispatch_combine(
     report_scale_stats=False,
     warmup=None,
     iters=None,
+    verify=True,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -1281,6 +1286,7 @@ def bench_dispatch_combine(
             report_scale_stats,
             warmup,
             iters,
+            verify,
         ),
         nprocs=world_size,
         join=True,
@@ -1499,6 +1505,16 @@ if __name__ == "__main__":
             "(default: 10) and --cmd profile (default: 3) "
         ),
     )
+    parser.add_argument(
+        "--verify",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help=(
+            "When 1 (default), verify dispatch/combine correctness during "
+            "warmup. --cmd bench only"
+        ),
+    )
     args = parser.parse_args()
 
     if args.num_experts_per_rank is None:
@@ -1570,4 +1586,5 @@ if __name__ == "__main__":
         report_scale_stats=bool(args.report_scale_stats),
         warmup=args.warmup,
         iters=args.iters,
+        verify=bool(args.verify),
     )
