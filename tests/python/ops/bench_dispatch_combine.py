@@ -52,8 +52,10 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         force_scale_active=False,
         report_scale_stats=False,
         combine_scale_dim=None,
+        routing="random",
     ):
         super().__init__(config)
+        self.routing = routing
         self.combine_data_type = (
             combine_data_type if combine_data_type is not None else config.data_type
         )
@@ -83,6 +85,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         self.config.hidden_dim = self.dispatch_hidden_dim
         result = super().gen_test_data(
             use_max_token_num=True,
+            routing=self.routing,
             input_dist=self.input_dist,
             input_scale=self.input_scale,
             input_shift=self.input_shift,
@@ -908,6 +911,7 @@ def _bench_dispatch_combine(
     warmup=None,
     iters=None,
     verify=True,
+    routing="random",
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -973,6 +977,7 @@ def _bench_dispatch_combine(
             force_scale_active=force_scale_active,
             report_scale_stats=report_scale_stats,
             combine_scale_dim=bench_combine_scale_dim,
+            routing=routing,
         )
 
         (
@@ -1252,6 +1257,7 @@ def bench_dispatch_combine(
     warmup=None,
     iters=None,
     verify=True,
+    routing="random",
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -1287,6 +1293,7 @@ def bench_dispatch_combine(
             warmup,
             iters,
             verify,
+            routing,
         ),
         nprocs=world_size,
         join=True,
@@ -1506,6 +1513,22 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--routing",
+        type=str,
+        default="random",
+        choices=[
+            "random",
+            "round_robin",
+            "remote_round_robin",
+            "spread",
+            "all_to_one",
+        ],
+        help=(
+            "Token-to-expert routing pattern used to generate test data "
+            "(default: random)"
+        ),
+    )
+    parser.add_argument(
         "--verify",
         type=int,
         default=1,
@@ -1587,4 +1610,5 @@ if __name__ == "__main__":
         warmup=args.warmup,
         iters=args.iters,
         verify=bool(args.verify),
+        routing=args.routing,
     )
