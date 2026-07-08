@@ -931,6 +931,7 @@ def _bench_dispatch_combine(
     verify=True,
     routing="random",
     kernel_type="IntraNode",
+    graph_replay_iters=None,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -1036,7 +1037,9 @@ def _bench_dispatch_combine(
                 combine_warp_per_block=combine_warp_per_block,
                 call_local_expert_count=call_local_expert_count,
                 verify=verify,
-                **_optional_kwargs(warmup=warmup, iters=iters),
+                **_optional_kwargs(
+                    warmup=warmup, iters=iters, graph_replay_iters=graph_replay_iters
+                ),
             )
 
         elif cmd == "stress":
@@ -1279,6 +1282,7 @@ def bench_dispatch_combine(
     verify=True,
     routing="random",
     kernel_type="IntraNode",
+    graph_replay_iters=None,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -1316,6 +1320,7 @@ def bench_dispatch_combine(
             verify,
             routing,
             kernel_type,
+            graph_replay_iters,
         ),
         nprocs=world_size,
         join=True,
@@ -1535,6 +1540,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--graph-replay-iters",
+        type=int,
+        default=None,
+        help=(
+            "Number of times each captured CUDA graph is replayed per "
+            "timed --iters sample (default: 10). --cmd bench only"
+        ),
+    )
+    parser.add_argument(
         "--routing",
         type=str,
         default="random",
@@ -1610,7 +1624,8 @@ if __name__ == "__main__":
         f"dispatch_warp_per_block: {args.dispatch_warp_per_block}, "
         f"combine_block_num: {args.combine_block_num}, "
         f"combine_warp_per_block: {args.combine_warp_per_block}, "
-        f"kernel_type: {args.kernel_type}"
+        f"kernel_type: {args.kernel_type}, "
+        f"graph_replay_iters: {args.graph_replay_iters}"
     )
     print("-" * 60)
     bench_dispatch_combine(
@@ -1642,4 +1657,5 @@ if __name__ == "__main__":
         verify=bool(args.verify),
         routing=args.routing,
         kernel_type=args.kernel_type,
+        graph_replay_iters=args.graph_replay_iters,
     )
