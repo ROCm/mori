@@ -841,6 +841,11 @@ LaunchConfig = namedtuple(
 )
 
 
+def _optional_kwargs(**kwargs):
+    """Drop keys whose value is None, so the callee's own default applies."""
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+
 def _get_default_launch_config(
     world_size,
     max_num_inp_token_per_rank,
@@ -898,6 +903,8 @@ def _bench_dispatch_combine(
     input_shift=0.0,
     force_scale_active=False,
     report_scale_stats=False,
+    warmup=None,
+    iters=None,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -1000,6 +1007,7 @@ def _bench_dispatch_combine(
                 combine_block_num=combine_block_num,
                 combine_warp_per_block=combine_warp_per_block,
                 call_local_expert_count=call_local_expert_count,
+                **_optional_kwargs(warmup=warmup, iters=iters),
             )
 
         elif cmd == "stress":
@@ -1033,6 +1041,7 @@ def _bench_dispatch_combine(
                 combine_block_num=combine_block_num,
                 combine_warp_per_block=combine_warp_per_block,
                 call_local_expert_count=call_local_expert_count,
+                **_optional_kwargs(warmup=warmup, capture_iters=iters),
             )
 
         elif cmd == "tuning":
@@ -1236,6 +1245,8 @@ def bench_dispatch_combine(
     input_shift=0.0,
     force_scale_active=False,
     report_scale_stats=False,
+    warmup=None,
+    iters=None,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -1268,6 +1279,8 @@ def bench_dispatch_combine(
             input_shift,
             force_scale_active,
             report_scale_stats,
+            warmup,
+            iters,
         ),
         nprocs=world_size,
         join=True,
@@ -1468,6 +1481,24 @@ if __name__ == "__main__":
             "p50/p90/p99/max) for the generated input."
         ),
     )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        help=(
+            "Number of warmup iterations before timing. Applies to --cmd bench "
+            "(default: 1) and --cmd profile (default: 5);"
+        ),
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=None,
+        help=(
+            "Number of timed/captured iterations. Applies to --cmd bench "
+            "(default: 10) and --cmd profile (default: 3) "
+        ),
+    )
     args = parser.parse_args()
 
     if args.num_experts_per_rank is None:
@@ -1537,4 +1568,6 @@ if __name__ == "__main__":
         input_shift=args.input_shift,
         force_scale_active=bool(args.force_scale_active),
         report_scale_stats=bool(args.report_scale_stats),
+        warmup=args.warmup,
+        iters=args.iters,
     )
