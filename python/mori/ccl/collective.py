@@ -260,7 +260,6 @@ class AllgatherSdma:
         _get_ccl_func("OneShotAllGatherSdmaKernel_u32").launch_struct(
             (1,), (512,), 0, s, args
         )
-        self._handle.finish_sync(output_data.data_ptr(), u32_count, s)
         return True
 
     def enqueue(self, input_data, output_data, count: int, stream=None) -> bool:
@@ -302,7 +301,6 @@ class AllgatherSdma:
         _get_ccl_func("OneShotAllGatherSdmaParamContiguousKernel_u32").launch_struct(
             (1,), (512,), 0, s, args
         )
-        self._handle.finish_sync(output_data.data_ptr(), u32_count, s)
         return True
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:

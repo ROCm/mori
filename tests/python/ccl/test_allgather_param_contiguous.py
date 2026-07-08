@@ -159,7 +159,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             assert ok, "enqueue_param_contiguous returned false"
             stream.synchronize()
 
-            sync_got = sync_output.clone()
+            sync_got = handle.get_output_transit_buffer(
+                dtype=torch.float32, device=device
+            )[: total_count * world_size].clone()
             _assert_matches_param_contiguous(
                 sync_got,
                 world_size,
