@@ -32,6 +32,33 @@ _MI308X_TABLE = {
     (8, 2048, 8): dict(schedule=_MI308X_SCHEDULE),
 }
 
+# ── MI325X (gfx942, 304 CU, DID 0x74a5) — measured 2026-07-08, EP8, full 2D block x
+# warp sweep (graph, ITERS>=300, tok 8..8192), selected by min LATENCY (us). Key
+# lessons vs MI308X: (a) dispatch always wants warp 8 (not 16), block grows with tok
+# (64->152->228->304); (b) combine is latency-bound at small/mid tok — on this big
+# 304-CU part a SMALL block (64) + warp 4 wins (the 0.5*CU block's grid-barrier cost
+# dominates), only bandwidth-bound large tok (>1024) want b~0.5*CU (152) + warp 2;
+# at the tiniest tok (8) combine warp 2 edges warp 4. b64 combine beats MI308X at
+# every small size. Measured combine us: 8=20 64=38 128=53 256=83 512=145 1024=267
+# 2048=497 4096=961 8192=1839; dispatch us: 8=18 64=30 128=47 256=78 512=138 1024=256
+# 2048=490 4096=960 8192=1881.
+_MI325X_SCHEDULE = (
+    (8,     64, 8,   64, 2),   # <=8 tok: tiny, combine warp 2
+    (64,    64, 8,   64, 4),   # <=64:   small block both
+    (1024, 152, 8,   64, 4),   # <=1024: disp 0.5*CU, comb small-block/warp4 (latency)
+    (4096, 228, 8,  152, 2),   # <=4096: comb 0.5*CU/warp2 (bandwidth)
+    (None, 304, 8,  152, 2),   # >4096 (peak)
+)
+_MI325X_DEFAULT = dict(dispatch_block_num=304, combine_block_num=152,
+                       warp_num_per_block=8, combine_warp_num_per_block=2,
+                       schedule=_MI325X_SCHEDULE)
+# hidden 4096 / 2048 reuse the 7168 schedule until separately tuned.
+_MI325X_TABLE = {
+    (8, 7168, 8): dict(schedule=_MI325X_SCHEDULE),
+    (8, 4096, 8): dict(schedule=_MI325X_SCHEDULE),
+    (8, 2048, 8): dict(schedule=_MI325X_SCHEDULE),
+}
+
 # ── MI300X (gfx942, 304 CU) — TODO: re-tune. Falls back to CU-scaled default. ──
 _MI300X_DEFAULT = None   # None => derive from CU count (see _cu_scaled_default)
 _MI300X_TABLE = {}
@@ -42,6 +69,7 @@ _MI355X_TABLE = {}
 
 _DEVICES = {
     "mi308x": (_MI308X_DEFAULT, _MI308X_TABLE),
+    "mi325x": (_MI325X_DEFAULT, _MI325X_TABLE),
     "mi300x": (_MI300X_DEFAULT, _MI300X_TABLE),
     "mi355x": (_MI355X_DEFAULT, _MI355X_TABLE),
 }
@@ -51,7 +79,7 @@ _DEVICES = {
 # gfx950 parts (MI350/MI355X) are matched by arch below since their DIDs vary.
 _DID_TO_KEY = {
     0x74A1: "mi300x",   # MI300X
-    0x74A5: "mi300x",   # MI325X (same 304-CU gfx942 class; share until re-tuned)
+    0x74A5: "mi325x",   # MI325X (304-CU gfx942; tuned 2026-07-08)
     0x74A2: "mi308x",   # MI308X (80 CU)
 }
 
