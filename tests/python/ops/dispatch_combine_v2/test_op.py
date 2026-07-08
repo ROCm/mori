@@ -67,6 +67,9 @@ def main():
             scale_type_size=1 if SCALE_DIM else 0,
             combine_mode=COMBINE, quant_type=QUANT,
             max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)))
+        if int(os.environ.get("TUNED", 0)):
+            from tuning_configs import lookup
+            cfg.schedule = lookup(npes, HIDDEN, K)["schedule"]
         op = EpDispatchCombineOp(cfg, comm)
         comm.barrier()
 

@@ -84,6 +84,15 @@ def load_i64_acquire(addr_i64):
                           ordering=_llvm_d.AtomicOrdering.monotonic, syncscope="one-as").res
 
 
+def load_i32_nt(base_i64, offset):
+    """Non-temporal global i32 load at base + offset*4 (addrspace 1). A raw global
+    load (VGPR address) avoids the per-expert buffer-descriptor waterfall, keeping
+    the K combine loads in flight. Caller must ensure the address is in-bounds."""
+    addr = _addr_plus(base_i64, offset, 4)
+    gptr = _llvm_d.IntToPtrOp(_llvm_d.PointerType.get(address_space=1), addr).result
+    return _llvm_d.LoadOp(_I32(), gptr, alignment=4, nontemporal=True).res
+
+
 def _spin(addr_i64, keep_waiting):
     """Spin on a volatile/atomic i32 load at addr_i64; keep_waiting(cur_fx_i32)
     returns the fx-bool "should keep spinning". Returns the awaited fx.Int32.

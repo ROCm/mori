@@ -45,11 +45,12 @@ from dist_common import Dist  # noqa: E402
 HIDDEN = int(os.environ.get("HIDDEN", 7168))
 K = int(os.environ.get("TOPK", 8))
 EPR = int(os.environ.get("EPR", 32))
-# dispatch (remote writes) saturates with fewer blocks; combine (remote reads)
-# is latency-bound and needs more warps -> use separate block counts.
+# dispatch and combine want different block/warp counts -> separate knobs.
 DISP_BLOCK = int(os.environ.get("DISP_BLOCK", os.environ.get("BLOCK_NUM", 64)))
-COMB_BLOCK = int(os.environ.get("COMB_BLOCK", os.environ.get("BLOCK_NUM", 128)))
+COMB_BLOCK = int(os.environ.get("COMB_BLOCK", os.environ.get("BLOCK_NUM", 80)))
 WARP_NUM = int(os.environ.get("WARP_NUM", 16))
+# combine's K-deep per-lane MLP saturates with few warps.
+COMB_WARP = int(os.environ.get("COMB_WARP", WARP_NUM))
 WARMUP = int(os.environ.get("WARMUP", 10))
 ITERS = int(os.environ.get("ITERS", 50))
 MODE = os.environ.get("MODE", "both")            # eager | graph | both
@@ -134,7 +135,7 @@ def main():
             combine = make_combine_scatter(
                 rank=rank, npes=npes, experts_per_token=K, hidden_dim=HIDDEN, hidden_elem_size=ESZ,
                 max_tok_per_rank=M, max_recv=max_recv, block_num=COMB_BLOCK,
-                warp_num_per_block=WARP_NUM, off_out_tok=arena.offset("out_tok"),
+                warp_num_per_block=COMB_WARP, off_out_tok=arena.offset("out_tok"),
                 off_comb_inp=arena.offset("comb_inp"), off_tis=arena.offset("tis"),
                 off_xdb_mem=arena.offset("xdb_mem"), off_out_wts=arena.offset("out_wts"),
                 off_comb_wts=arena.offset("comb_wts"), enable_weights=True,
@@ -145,7 +146,7 @@ def main():
             combine = make_combine(
                 rank=rank, npes=npes, experts_per_token=K, hidden_dim=HIDDEN, hidden_elem_size=ESZ,
                 max_tok_per_rank=M, max_recv=max_recv, block_num=COMB_BLOCK,
-                warp_num_per_block=WARP_NUM, off_out_tok=arena.offset("out_tok"),
+                warp_num_per_block=COMB_WARP, off_out_tok=arena.offset("out_tok"),
                 off_xdb_mem=arena.offset("xdb_mem"), off_out_wts=arena.offset("out_wts"),
                 reset_total_recv=False, _s3_cache=int(os.environ.get("S3_CACHE", 2)),
                 _unroll=int(os.environ.get("UNROLL", 2)))

@@ -379,7 +379,7 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
             part_id = s3_idx % warps_per_tok
             unit_base = part_id * units_per_warp
             tm_base = tok_id * experts_per_token
-            expert_rsrcs = []
+            expert_bases = []
             expert_vlds = []
             expert_pes = []
             expert_tks = []
@@ -390,10 +390,12 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                 vld_k = dest_pe_k < npes
                 safe_pe = arith.select(vld_k, dest_pe_k, arith.constant(rank))
                 safe_tok_k = arith.select(vld_k, dest_tok_k, arith.constant(0))
-                # REMOTE: peer[dest_pe].out_tok[dest_tok_id]
+                # Remote base peer[dest_pe].out_tok[dest_tok]; gather via global
+                # loads (no per-expert buffer descriptor) to keep all K loads in
+                # flight — see P.load_i32_nt.
                 slot_addr = (fx.Int64(w.lsa_ptr(safe_pe, off_out_tok))
                              + fx.Int64(safe_tok_k) * fx.Int64(nbytes))
-                expert_rsrcs.append(create_buffer_resource_from_addr(slot_addr))
+                expert_bases.append(slot_addr)
                 expert_vlds.append(vld_k)
                 expert_pes.append(safe_pe)
                 expert_tks.append(safe_tok_k)
@@ -417,34 +419,37 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
             rem = arith.constant(n_i32) - unit_base
             eff = arith.select(rem < units_per_warp, rem, units_per_warp)   # i32 units this warp
             out_base = tok_id * out_n_i32
-            # Nested fn: closure over expert_rsrcs/vlds (lists can't be loop-carried).
+            # Nested fn: closure over expert_bases/vlds (lists can't be loop-carried).
             def _one(off):           # reduce k contributions for one i32 unit
+                # Load all K experts, then reduce (K-deep MLP per lane).
+                vals = []
+                for k_slot in range_constexpr(experts_per_token):
+                    v = P.load_i32_nt(expert_bases[k_slot], off)
+                    vals.append(arith.select(expert_vlds[k_slot], v, arith.constant(0)))
                 acc = _zero_accum()
                 for k_slot in range_constexpr(experts_per_token):
-                    v = buffer_load(expert_rsrcs[k_slot], off, vec_width=1, dtype=T.i32(),
-                                    cache_modifier=_s3_cache)
-                    v = arith.select(expert_vlds[k_slot], v, arith.constant(0))
-                    acc = acc + _to_accum2(v)
+                    acc = acc + _to_accum2(vals[k_slot])
                 buffer_store(_from_accum2(acc), rsrc_out, out_base + off * out_step_mult)
 
             def _accum_loop():
-                # main: _unroll independent elements per lane per iter
+                # _unroll elements/lane per iter; per element load all K experts
+                # then reduce, so a lane keeps K loads in flight (unrolled
+                # r-blocks add more overlap) to hide xGMI read latency.
                 main_end = (eff // STEP) * STEP
                 for u in range(lane, main_end, STEP):
-                    accs = []
                     base = unit_base + u
                     for r in range_constexpr(_unroll):
-                        accs.append(_zero_accum())
-                    for k_slot in range_constexpr(experts_per_token):
-                        vld = expert_vlds[k_slot]
-                        rsc = expert_rsrcs[k_slot]
-                        for r in range_constexpr(_unroll):
-                            v = buffer_load(rsc, base + r * 64, vec_width=1, dtype=T.i32(),
-                                            cache_modifier=_s3_cache)
-                            accs[r] = accs[r] + _to_accum2(arith.select(vld, v, arith.constant(0)))
-                    for r in range_constexpr(_unroll):
-                        buffer_store(_from_accum2(accs[r]), rsrc_out,
-                                     out_base + (base + r * 64) * out_step_mult)
+                        off = base + r * 64
+                        vals = []
+                        for k_slot in range_constexpr(experts_per_token):
+                            v = P.load_i32_nt(expert_bases[k_slot], off)
+                            vals.append(arith.select(expert_vlds[k_slot], v,
+                                                     arith.constant(0)))
+                        acc = _zero_accum()
+                        for k_slot in range_constexpr(experts_per_token):
+                            acc = acc + _to_accum2(vals[k_slot])
+                        buffer_store(_from_accum2(acc), rsrc_out,
+                                     out_base + off * out_step_mult)
                 # tail: leftover elements, one per lane
                 for u in range(main_end + lane, eff, 64):
                     _one(unit_base + u)

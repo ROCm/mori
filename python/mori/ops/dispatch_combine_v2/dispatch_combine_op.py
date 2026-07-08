@@ -79,8 +79,16 @@ class EpDispatchCombineConfig:
     combine_mode: str = "gather"
     quant_type: str = "none"          # none | fp8_direct_cast | fp8_blockwise
     dispatch_block_num: int = 64
-    combine_block_num: int = 128
+    combine_block_num: int = 80
     warp_num_per_block: int = 16
+    # Combine wants few warps (K-deep per-lane MLP already saturates); kept
+    # separate from dispatch's warp count.
+    combine_warp_num_per_block: int = 4
+    # Optional per-token plan: tuple of (max_tok_inclusive | None, disp_block,
+    # disp_warp, comb_block, comb_warp) buckets. When set, the op precompiles the
+    # distinct (block, warp) variants and picks one at runtime from
+    # cur_rank_num_token. None => single-shot fallback fields above.
+    schedule: tuple = None
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0    # mori maxTotalRecvTokens; 0 = worst-case ws*M
 
@@ -223,35 +231,55 @@ class EpDispatchCombineOp:
         self.comb_out_wts = torch.zeros(M * K, dtype=torch.float32, device=dev)
 
         a = self.arena
+        # Distinct (block, warp) variants to precompile. With a per-token schedule
+        # the op picks the best (block, warp) at runtime from cur_rank_num_token;
+        # otherwise it is single-shot. Scatter combine is not schedule-tuned.
+        sched = c.schedule
+        if sched:
+            disp_specs = sorted({(db, dw) for (_, db, dw, _, _) in sched})
+            comb_specs = sorted({(cb, cw) for (_, _, _, cb, cw) in sched})
+        else:
+            disp_specs = [(c.dispatch_block_num, c.warp_num_per_block)]
+            comb_specs = [(c.combine_block_num, c.combine_warp_num_per_block)]
+        if c.is_scatter:
+            comb_specs = [(c.combine_block_num, c.combine_warp_num_per_block)]
+        self._disp_specs = disp_specs
+        self._comb_specs = comb_specs
+
         self._disp_kwargs = dict(
             rank=c.rank, npes=c.world_size, experts_per_rank=c.num_experts_per_rank,
             experts_per_token=K, hidden_dim=hid, hidden_elem_size=esz, max_tok_per_rank=M,
-            max_recv=mr, block_num=c.dispatch_block_num, warp_num_per_block=c.warp_num_per_block,
+            max_recv=mr,
             off_tok_off=a.offset("tok_off"), off_recv_num=a.offset("recv_num"),
             off_tis=a.offset("tis"), off_out_idx=a.offset("out_idx"),
             off_out_wts=a.offset("out_wts"), off_out_tok=a.offset("out_tok"),
             off_out_scales=a.offset("out_scales") if self._enable_scales else 0,
             scale_dim=c.scale_dim, scale_type_size=c.scale_type_size)
-        self._dispatch = make_dispatch(**self._disp_kwargs)
-        self._dispatch_replay = None   # lazily compiled
+        # (block, warp) -> compiled dispatch / combine kernel.
+        self._disp_variants = {
+            (b, w): make_dispatch(block_num=b, warp_num_per_block=w, **self._disp_kwargs)
+            for (b, w) in disp_specs}
+        self._disp_replay_variants = {}   # lazily compiled per (block, warp)
         if c.is_scatter:
-            self._combine = make_combine_scatter(
+            self._combine_variants = {(b, w): make_combine_scatter(
                 rank=c.rank, npes=c.world_size, experts_per_token=K, hidden_dim=hid,
                 hidden_elem_size=esz, max_tok_per_rank=M, max_recv=mr,
-                block_num=c.combine_block_num, warp_num_per_block=c.warp_num_per_block,
+                block_num=b, warp_num_per_block=w,
                 off_out_tok=a.offset("out_tok"), off_comb_inp=a.offset("comb_inp"),
                 off_tis=a.offset("tis"), off_xdb_mem=a.offset("xdb_mem"),
                 off_out_wts=a.offset("out_wts"), off_comb_wts=a.offset("comb_wts"),
                 off_comb_scales=a.offset("comb_scales") if c.fp8_blockwise else 0,
                 fp8_direct_cast=c.fp8_direct_cast, fp8_blockwise=c.fp8_blockwise,
                 scale_dim=c.combine_scale_dim, reset_total_recv=False)
+                for (b, w) in comb_specs}
         else:
-            self._combine = make_combine(
+            self._combine_variants = {(b, w): make_combine(
                 rank=c.rank, npes=c.world_size, experts_per_token=K, hidden_dim=hid,
                 hidden_elem_size=esz, max_tok_per_rank=M, max_recv=mr,
-                block_num=c.combine_block_num, warp_num_per_block=c.warp_num_per_block,
+                block_num=b, warp_num_per_block=w,
                 off_out_tok=a.offset("out_tok"), off_xdb_mem=a.offset("xdb_mem"),
                 off_out_wts=a.offset("out_wts"), reset_total_recv=True)
+                for (b, w) in comb_specs}
 
         self._lec_buf = torch.zeros(c.num_experts_per_rank, dtype=torch.int32, device=dev)
         self._local_expert_count = make_local_expert_count(
@@ -326,6 +354,29 @@ class EpDispatchCombineOp:
         return from_gpu_ptr(self.arena.local_ptr("out_scales"),
                             (self._mr, self._scale_n_i32), torch.int32)
 
+    def _pick(self, cur):
+        """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
+        count via the per-token schedule; falls back to the single-shot specs
+        otherwise. Returned specs are clamped to the precompiled variants."""
+        sched = self.cfg.schedule
+        d = cb = None
+        if sched:
+            for bucket in sched:
+                max_tok = bucket[0]
+                if max_tok is None or cur <= max_tok:
+                    d, cb = (bucket[1], bucket[2]), (bucket[3], bucket[4])
+                    break
+            if d is None:
+                last = sched[-1]
+                d, cb = (last[1], last[2]), (last[3], last[4])
+        else:
+            d, cb = self._disp_specs[0], self._comb_specs[0]
+        if d not in self._disp_variants:
+            d = self._disp_specs[-1]
+        if cb not in self._combine_variants:
+            cb = self._comb_specs[-1]
+        return d, cb
+
     def dispatch(self, input, weights, scales, indices, *,
                  routing=None, return_routing=False):
         """mori-parity dispatch. input [n_tok,hidden], weights [n_tok,topk] f32,
@@ -339,23 +390,28 @@ class EpDispatchCombineOp:
         if routing is not None and return_routing:
             raise ValueError("pass either routing= (replay) or return_routing=True, not both")
         cur = input.shape[0]
+        dspec, _ = self._pick(cur)
         self.total_recv.zero_()
         scale_ptr = scales.data_ptr() if (scales is not None and self._enable_scales) else 0
         stream = fx.Stream(torch.cuda.current_stream())
         weight_ptr = weights.data_ptr() if weights is not None else 0
         if routing is not None:
-            if self._dispatch_replay is None:
-                self._dispatch_replay = make_dispatch(replay=True, **self._disp_kwargs)
+            kern = self._disp_replay_variants.get(dspec)
+            if kern is None:
+                kern = self._disp_replay_variants[dspec] = make_dispatch(
+                    replay=True, block_num=dspec[0], warp_num_per_block=dspec[1],
+                    **self._disp_kwargs)
             tok_map_ptr = routing.disp_dest_tok_id_map.data_ptr()
-            self._dispatch_replay(self.arena.handle, input.data_ptr(), indices.data_ptr(),
-                                  weight_ptr, tok_map_ptr, self.dest_pe_ctr.data_ptr(),
-                                  self.disp_bar.data_ptr(), self.total_recv.data_ptr(), scale_ptr,
-                                  self.cfg.rank, cur, stream)
+            kern(self.arena.handle, input.data_ptr(), indices.data_ptr(),
+                 weight_ptr, tok_map_ptr, self.dest_pe_ctr.data_ptr(),
+                 self.disp_bar.data_ptr(), self.total_recv.data_ptr(), scale_ptr,
+                 self.cfg.rank, cur, stream)
         else:
-            self._dispatch(self.arena.handle, input.data_ptr(), indices.data_ptr(),
-                           weight_ptr, self.tok_map.data_ptr(), self.dest_pe_ctr.data_ptr(),
-                           self.disp_bar.data_ptr(), self.total_recv.data_ptr(), scale_ptr,
-                           self.cfg.rank, cur, stream)
+            self._disp_variants[dspec](
+                self.arena.handle, input.data_ptr(), indices.data_ptr(),
+                weight_ptr, self.tok_map.data_ptr(), self.dest_pe_ctr.data_ptr(),
+                self.disp_bar.data_ptr(), self.total_recv.data_ptr(), scale_ptr,
+                self.cfg.rank, cur, stream)
 
         out = self.recv_tokens()
         out_weights = self.recv_weights()
@@ -388,11 +444,13 @@ class EpDispatchCombineOp:
             dst.copy_(input.reshape(-1))
         self.comb_out.zero_()
         stream = fx.Stream(torch.cuda.current_stream())
-        self._combine(self.arena.handle, routing.disp_dest_tok_id_map.data_ptr(),
-                      self.comb_bar.data_ptr(),
-                      self.xdb_flag.data_ptr(), routing.total_recv_token_num.data_ptr(),
-                      self.comb_out.data_ptr(), self.comb_out_wts.data_ptr(),
-                      self.cfg.rank, routing.cur_rank_num_token, stream)
+        _, cspec = self._pick(routing.cur_rank_num_token)
+        self._combine_variants[cspec](
+            self.arena.handle, routing.disp_dest_tok_id_map.data_ptr(),
+            self.comb_bar.data_ptr(),
+            self.xdb_flag.data_ptr(), routing.total_recv_token_num.data_ptr(),
+            self.comb_out.data_ptr(), self.comb_out_wts.data_ptr(),
+            self.cfg.rank, routing.cur_rank_num_token, stream)
         ct, hid, K = routing.cur_rank_num_token, self.cfg.hidden_dim, self.cfg.num_experts_per_token
         out = self.comb_out[: ct * hid].view(self.cfg.data_type).view(ct, hid)
         return out, self.comb_out_wts[: ct * K].view(ct, K)
