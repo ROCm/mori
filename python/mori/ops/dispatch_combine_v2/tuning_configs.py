@@ -63,9 +63,21 @@ _MI325X_TABLE = {
 _MI300X_DEFAULT = None   # None => derive from CU count (see _cu_scaled_default)
 _MI300X_TABLE = {}
 
-# ── MI355X (gfx950) — TODO: re-tune. Falls back to CU-scaled default. ──
-_MI355X_DEFAULT = None
-_MI355X_TABLE = {}
+# ── MI355X (gfx950, 256 CU) — measured 2026-07-08, EP8, fine block x warp sweep.
+# dispatch: warp 8 throughout (warp 16 worse); block 128 (<=2048) / 192 (>=4096).
+# combine : warp 4; block 128 (>=256), 48 for <=64 tok (small blocks win at tiny
+#           batches; 256 blocks are worse — unlike MI308X's ~1 block/CU).
+_MI355X_SCHEDULE = (
+    (64,   128, 8, 48, 8),
+    (2048, 128, 8, 128, 4),
+    (None, 192, 8, 128, 4),
+)
+_MI355X_DEFAULT = dict(dispatch_block_num=192, combine_block_num=128,
+                       warp_num_per_block=8, combine_warp_num_per_block=4,
+                       schedule=_MI355X_SCHEDULE)
+_MI355X_TABLE = {
+    (8, 7168, 8): dict(schedule=_MI355X_SCHEDULE),
+}
 
 _DEVICES = {
     "mi308x": (_MI308X_DEFAULT, _MI308X_TABLE),

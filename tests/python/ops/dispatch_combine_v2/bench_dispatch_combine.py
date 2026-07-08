@@ -62,7 +62,8 @@ SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = forward per-token scales
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,2048").split(",")]
 
 # (torch token dtype, elem bytes, comb_out storage dtype matching elem bytes)
-_DT = {"bf16": (torch.bfloat16, 2, torch.int16), "f32": (torch.float32, 4, torch.int32)}
+_DT = {"bf16": (torch.bfloat16, 2, torch.int16), "f32": (torch.float32, 4, torch.int32),
+       "fp8": (torch.float8_e4m3fnuz, 1, torch.int8)}
 TOK_DT, ESZ, COMB_DT = _DT[DTYPE]
 
 
