@@ -16,6 +16,15 @@ table. fp4 accum branch present but gfx950-only (these cvt intrinsics don't
 exist on gfx942). Note: gfx942 fp8 is e4m3**fnuz** (max 240). Not done:
 `skip_stage1` (FlyDSL-only).
 
+> **Test-only, not a mori API (yet).** These modules import each other by
+> top-level name (`from intranode_kernels import ...`, `import flydsl_prims as P`)
+> and have no `__init__.py`; they only resolve after the tests do
+> `sys.path.insert(0, <this dir>)`. There is no `mori.ops.dispatch_combine_v2`
+> package export, so `import mori.ops.dispatch_combine_v2.dispatch_combine_op`
+> will fail. Use it via the test/bench harnesses below. Wiring it in as a real
+> package (relative imports + `__init__.py` + `ops/__init__.py` export) is a
+> follow-up.
+
 ## Layout
 
 | file | role |
@@ -30,7 +39,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | file | role |
 |---|---|
 | `dist_common.py` | torchrun bootstrap (gloo only carries the cco unique-id) |
-| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM` |
+| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM` |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
 | `run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
 

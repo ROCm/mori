@@ -282,7 +282,7 @@ def main():
             total_recv.zero_(); sync()
             run_disp(ct); sync(); comm.barrier()
             recv = int(total_recv.cpu().item())
-            payload = recv * HIDDEN * ESZ
+            payload = recv * TOK_NB   # true per-token transport bytes (fp4 = hidden/2)
 
             # combine first (needs total_recv == recv; combine doesn't reset it)
             cb_e = time_eager(run_comb, ct) if eager else 0.0

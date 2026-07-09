@@ -110,6 +110,19 @@ class EpDispatchCombineConfig:
             raise ValueError(f"combine_mode must be gather|scatter, got {self.combine_mode!r}")
         if self.quant_type != "none":
             self.combine_mode = "scatter"
+        # The dispatch grid barrier iterates peers as `range(lane, npes, 64)` and
+        # resets the barrier inside the loop, which is only correct when each lane
+        # runs it at most once (npes <= wavefront). Intranode is single-node so
+        # this always holds, but make the assumption explicit.
+        if self.world_size > 64:
+            raise ValueError(f"intranode op supports world_size <= 64, got {self.world_size}")
+        # Token copy moves whole 16 B (vec4) chunks; a non-16 B-aligned per-token
+        # size would over-read/write a few dwords past the token.
+        if self.token_nbytes % 16 != 0:
+            raise ValueError(
+                f"per-token transport bytes must be 16 B aligned (vec4 copy); "
+                f"hidden_dim={self.hidden_dim}, data_type={self.data_type} -> "
+                f"token_nbytes={self.token_nbytes}")
 
     @property
     def is_scatter(self):
