@@ -192,7 +192,6 @@ class EpDispatchCombineConfig:
         return self.world_size * self.effective_max_recv_per_rank
 
 
-@dataclass
 class EpDispatchRoutingHandle:
     """Per-call routing snapshot (mori EpDispatchRoutingHandle parity).
 
@@ -200,13 +199,38 @@ class EpDispatchRoutingHandle:
     disp_tok_id_to_src_tok_id_local: reverse recv-slot->src token (v2 tis).
     inter_node_*: empty placeholders (v2 is intranode-only; kept for 5-tensor
     shape parity so downstream unpacking works).
+
+    The reverse map (disp_tok_id_to_src_tok_id_local) is materialized LAZILY on
+    first access. recv_to_src_token is written into this rank's arena by peers via
+    P2P during dispatch and, per the mori contract, is only visible after the
+    caller's post-dispatch comm.barrier(). Cloning it eagerly inside dispatch()
+    (before that barrier) races those P2P writes and captures stale entries on
+    high-CU parts (seen flaky on MI355X at high occupancy). Deferring the clone to
+    first access lets it run after the barrier; it also skips the copy entirely for
+    the common combine path, which never reads the reverse map.
     """
-    disp_dest_tok_id_map: torch.Tensor
-    inter_node_disp_dest_tok_id_map: torch.Tensor
-    inter_node_disp_send_map: torch.Tensor
-    total_recv_token_num: torch.Tensor
-    disp_tok_id_to_src_tok_id_local: torch.Tensor
-    cur_rank_num_token: int = 0
+
+    def __init__(self, disp_dest_tok_id_map, inter_node_disp_dest_tok_id_map,
+                 inter_node_disp_send_map, total_recv_token_num,
+                 disp_tok_id_to_src_tok_id_local=None, cur_rank_num_token=0,
+                 *, reverse_src_view=None):
+        self.disp_dest_tok_id_map = disp_dest_tok_id_map
+        self.inter_node_disp_dest_tok_id_map = inter_node_disp_dest_tok_id_map
+        self.inter_node_disp_send_map = inter_node_disp_send_map
+        self.total_recv_token_num = total_recv_token_num
+        self.cur_rank_num_token = cur_rank_num_token
+        # Either an already-materialized reverse map (from_tensors round-trip) or
+        # a live arena view to clone on first access (dispatch()).
+        self._reverse_cache = disp_tok_id_to_src_tok_id_local
+        self._reverse_src_view = reverse_src_view
+
+    @property
+    def disp_tok_id_to_src_tok_id_local(self):
+        if self._reverse_cache is None:
+            # First access (post-barrier): clone off the arena so it survives the
+            # next dispatch overwriting the region.
+            self._reverse_cache = self._reverse_src_view.clone()
+        return self._reverse_cache
 
     def tensors(self):
         return (
@@ -265,9 +289,6 @@ class EpDispatchCombineOp:
 
         self.token_dest_map = torch.full((max_tok_per_rank * topk,), -1, dtype=torch.int32,
                                          device=device)
-        # snapshot of the arena recv_to_src_token region, so a routing handle
-        # outlives the next dispatch
-        self.token_src_snapshot = torch.zeros(recv_cap, dtype=torch.int32, device=device)
         self._empty_i32 = torch.empty(0, dtype=torch.int32, device=device)  # inter-node placeholders
         self.dest_pe_counter = torch.zeros(cfg.world_size, dtype=torch.int32, device=device)
         self.dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
@@ -492,16 +513,17 @@ class EpDispatchCombineOp:
         if not return_routing:
             return base
 
+        # Pass a live arena view; the reverse map is cloned lazily on first
+        # access (post-barrier), see EpDispatchRoutingHandle.
         recv_to_src_view = from_gpu_ptr(self.arena.local_ptr("recv_to_src_token"),
                                         (self._recv_cap,), torch.int32)
-        self.token_src_snapshot.copy_(recv_to_src_view)
         routing = EpDispatchRoutingHandle(
             disp_dest_tok_id_map=self.token_dest_map.clone(),
             inter_node_disp_dest_tok_id_map=self._empty_i32,
             inter_node_disp_send_map=self._empty_i32,
             total_recv_token_num=self.total_recv,
-            disp_tok_id_to_src_tok_id_local=self.token_src_snapshot.clone(),
             cur_rank_num_token=num_input_tokens,
+            reverse_src_view=recv_to_src_view,
         )
         return base + (routing,)
 
