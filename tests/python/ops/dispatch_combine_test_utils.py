@@ -623,6 +623,11 @@ class EpDispatchCombineTestCase:
             elif getattr(self.config, "quant_type", "none") == "fp8_blockwise":
                 # FP8 E4M3 quantization can exceed 5% after combine accumulation.
                 atol, rtol = 7e-2, 7e-2
+            elif getattr(self.config, "quant_type", "none") == "fp4_blockwise":
+                # FP4 (E2M1) is far coarser (~1 mantissa bit); blockwise-scaled + summed over
+                # top-k experts stays within a loose bound. This guards against gross corruption
+                # (wrong packing/indexing) rather than asserting FP8-level precision.
+                atol, rtol = 2.5e-1, 2.5e-1
             result_match = torch.allclose(
                 got.float(), expected.float(), atol=atol, rtol=rtol
             )

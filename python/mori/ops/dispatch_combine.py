@@ -47,6 +47,10 @@ _QUANT_TYPE_MAP = {
     "none": EpDispatchCombineQuantType.None_,
     "fp8_direct_cast": EpDispatchCombineQuantType.Fp8DirectCast,
     "fp8_blockwise": EpDispatchCombineQuantType.Fp8BlockwiseQuant,
+    # Blockwise FP4 (E2M1) combine reuses the FP8-blockwise staging/scale infrastructure at the
+    # config level (same 1-byte-slot buffers + float scales) but selects packed-FP4 combine
+    # kernels at launch (see _combine_is_fp4); it transports 0.5 byte/elem instead of 1.
+    "fp4_blockwise": EpDispatchCombineQuantType.Fp8BlockwiseQuant,
 }
 
 
@@ -262,6 +266,12 @@ class EpDispatchCombineOp:
         self._fp8_blockwise_combine_scale_type_size = self._handle_info[
             "fp8_blockwise_combine_scale_type_size"
         ]
+        # "fp4_blockwise" maps to the Fp8BlockwiseQuant enum (shared buffers/scales) but selects
+        # packed-FP4 combine kernels at launch time.
+        self._combine_is_fp4 = (
+            isinstance(config.quant_type, str)
+            and config.quant_type.strip().lower() == "fp4_blockwise"
+        )
 
         self._dispatch_out_ptrs = mori_cpp.get_dispatch_output_ptrs(self._handle, True)
         self._combine_out_ptrs = mori_cpp.get_combine_output_ptrs(self._handle, True)
@@ -1037,6 +1047,10 @@ class EpDispatchCombineOp:
                             else "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8"
                         )
                         use_vec8_top8 = True
+                # Blockwise FP4: select the packed-FP4 kernel variants (identical launch config to
+                # the fp8bwq variants; only the in-kernel quant/dequant math differs).
+                if self._combine_is_fp4:
+                    kernel_name = kernel_name.replace("_fp8bwq", "_fp4bwq")
                 shared_mem = self._combine_shared_mem(
                     actual_wpb, use_weights=not use_vec8_top8
                 )

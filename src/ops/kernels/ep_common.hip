@@ -110,6 +110,11 @@ using namespace mori::moe;
     kernel##_body<T, B1, B2, B3, B4, B5, B6, B7>(args);                         \
   }
 
+#define WRAP_BOOL8(kernel, suffix, T, B1, B2, B3, B4, B5, B6, B7, B8)           \
+  extern "C" __global__ void kernel##_##suffix(EpDispatchCombineArgs<T> args) { \
+    kernel##_body<T, B1, B2, B3, B4, B5, B6, B7, B8>(args);                     \
+  }
+
 #define WRAP_ALL_TYPES_BOOL3(kernel, bool_suffix, B1, B2, B3)                               \
   WRAP_BOOL3(kernel, bf16##bool_suffix, hip_bfloat16, B1, B2, B3)                           \
   MORI_FP8_FNUZ(WRAP_BOOL3(kernel, fp8_fnuz##bool_suffix, __hip_fp8_e4m3_fnuz, B1, B2, B3)) \
