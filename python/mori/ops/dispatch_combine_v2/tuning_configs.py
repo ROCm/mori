@@ -25,11 +25,13 @@ _MI308X_SCHEDULE = (
 _MI308X_DEFAULT = dict(dispatch_block_num=64, combine_block_num=80,
                        warp_num_per_block=16, combine_warp_num_per_block=4,
                        schedule=_MI308X_SCHEDULE)
+# Per-shape -> per-dtype schedules. These were tuned as fp8-dispatch + bf16-combine,
+# so they live under "fp8" (the default / fallback for any untuned dtype).
 # hidden 4096 / 2048 reuse the 7168 schedule until separately tuned.
 _MI308X_TABLE = {
-    (8, 7168, 8): dict(schedule=_MI308X_SCHEDULE),
-    (8, 4096, 8): dict(schedule=_MI308X_SCHEDULE),
-    (8, 2048, 8): dict(schedule=_MI308X_SCHEDULE),
+    (8, 7168, 8): {"fp8": _MI308X_SCHEDULE},
+    (8, 4096, 8): {"fp8": _MI308X_SCHEDULE},
+    (8, 2048, 8): {"fp8": _MI308X_SCHEDULE},
 }
 
 # ── MI325X (gfx942, 304 CU, DID 0x74a5) — measured 2026-07-08, EP8, full 2D block x
@@ -54,9 +56,9 @@ _MI325X_DEFAULT = dict(dispatch_block_num=304, combine_block_num=152,
                        schedule=_MI325X_SCHEDULE)
 # hidden 4096 / 2048 reuse the 7168 schedule until separately tuned.
 _MI325X_TABLE = {
-    (8, 7168, 8): dict(schedule=_MI325X_SCHEDULE),
-    (8, 4096, 8): dict(schedule=_MI325X_SCHEDULE),
-    (8, 2048, 8): dict(schedule=_MI325X_SCHEDULE),
+    (8, 7168, 8): {"fp8": _MI325X_SCHEDULE},
+    (8, 4096, 8): {"fp8": _MI325X_SCHEDULE},
+    (8, 2048, 8): {"fp8": _MI325X_SCHEDULE},
 }
 
 # ── MI300X (gfx942, 304 CU) — TODO: re-tune. Falls back to CU-scaled default. ──
@@ -67,16 +69,26 @@ _MI300X_TABLE = {}
 # dispatch: warp 8 throughout (warp 16 worse); block 128 (<=2048) / 192 (>=4096).
 # combine : warp 4; block 128 (>=256), 48 for <=64 tok (small blocks win at tiny
 #           batches; 256 blocks are worse — unlike MI308X's ~1 block/CU).
-_MI355X_SCHEDULE = (
+# fp8-dispatch + bf16-combine schedule (also the fallback for bf16/untuned dtypes):
+_MI355X_SCHED_FP8 = (
     (64,   128, 8, 48, 8),
     (2048, 128, 8, 128, 4),
     (None, 192, 8, 128, 4),
 )
+# fp4 dispatch + fp4 combine (data_type=fp4 does both) — measured 2026-07-09 via a
+# 2D block x warp sweep on MI355X (DTYPE=fp4). fp4 = 0.5 B/elem, so both phases are
+# less bandwidth-bound than fp8: dispatch block 128 throughout (warp 4 <=2048,
+# 8 >=4096); combine small block at small tok (64/8 <=256), 128/4 mid, 128/8 large.
+_MI355X_SCHED_FP4 = (
+    (256,  128, 4, 64,  8),
+    (2048, 128, 4, 128, 4),
+    (None, 128, 8, 128, 8),
+)
 _MI355X_DEFAULT = dict(dispatch_block_num=192, combine_block_num=128,
                        warp_num_per_block=8, combine_warp_num_per_block=4,
-                       schedule=_MI355X_SCHEDULE)
+                       schedule=_MI355X_SCHED_FP8)
 _MI355X_TABLE = {
-    (8, 7168, 8): dict(schedule=_MI355X_SCHEDULE),
+    (8, 7168, 8): {"fp8": _MI355X_SCHED_FP8, "fp4": _MI355X_SCHED_FP4},
 }
 
 _DEVICES = {
@@ -145,9 +157,14 @@ def _cu_scaled_default():
                 warp_num_per_block=16, combine_warp_num_per_block=4, schedule=None)
 
 
-def lookup(world_size, hidden_dim, topk):
+def lookup(world_size, hidden_dim, topk, dtype="fp8"):
     """Return {dispatch_block_num, combine_block_num, warp_num_per_block,
-    combine_warp_num_per_block, schedule} for the current GPU and shape.
+    combine_warp_num_per_block, schedule} for the current GPU, shape, and dtype.
+
+    `dtype` (the token / dispatch dtype: "bf16" | "fp8" | "fp4") selects the
+    per-dtype schedule, because dtype sets the communication volume (fp4 = 0.5 B,
+    fp8 = 1 B, bf16 = 2 B per element) and thus the best block/warp. It falls back
+    to the "fp8" schedule, then to the device default, when a dtype isn't tuned.
 
     `schedule` (or None) is a per-token-count launch plan: a tuple of
     (max_tok_inclusive | None, disp_block, disp_warp, comb_block, comb_warp)
@@ -161,5 +178,7 @@ def lookup(world_size, hidden_dim, topk):
     dev_default, dev_table = _DEVICES[key]
     base = dict(dev_default) if dev_default is not None else _cu_scaled_default()
     base.setdefault("schedule", None)
-    base.update(dev_table.get((world_size, hidden_dim, topk), {}))
+    entry = dev_table.get((world_size, hidden_dim, topk))
+    if entry:
+        base["schedule"] = entry.get(dtype) or entry.get("fp8") or base["schedule"]
     return base

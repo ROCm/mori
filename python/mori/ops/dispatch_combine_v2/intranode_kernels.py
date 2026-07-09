@@ -48,8 +48,10 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
                   hidden_elem_size, max_tok_per_rank, max_recv, block_num, warp_num_per_block,
                   off_tok_off, off_recv_num, off_tis, off_out_idx, off_out_wts, off_out_tok,
                   off_out_scales=0, scale_dim=0, scale_type_size=0, enable_signal=True,
-                  replay=False):
-    nbytes = hidden_dim * hidden_elem_size
+                  replay=False, fp4=False):
+    # fp4 (e2m1) packs 2 values per byte, so a token is hidden_dim/2 bytes; dispatch
+    # is a pure byte mover (no fp4 decode), matching mori v1's plain-fp4 path.
+    nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
     n_i32 = nbytes // 4
     # Dropped-slot marker stored in tok_map (see module docstring "sentinel"):
     # its encoded dest_pe (value // max_recv) equals npes, i.e. no real PE.

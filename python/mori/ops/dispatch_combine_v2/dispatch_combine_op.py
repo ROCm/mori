@@ -137,15 +137,32 @@ class EpDispatchCombineConfig:
         """Build a config with block/warp geometry pulled from tuning_configs
         (unless explicitly overridden in kwargs)."""
         from tuning_configs import lookup
+        dtype = "fp4" if kwargs.get("data_type") == torch.float4_e2m1fn_x2 else "bf16"
         t = lookup(kwargs["world_size"], kwargs["hidden_dim"],
-                   kwargs["num_experts_per_token"])
+                   kwargs["num_experts_per_token"], dtype=dtype)
         for k, v in t.items():
             kwargs.setdefault(k, v)
         return cls(**kwargs)
 
     @property
+    def is_fp4(self):
+        return self.data_type == torch.float4_e2m1fn_x2
+
+    @property
     def elem_size(self):
-        return _DT[self.data_type]
+        # fp4 is 0.5 B/elem; return a nominal 1 (kernels use the fp4 flag +
+        # token_nbytes for actual sizing, never elem_size for fp4 token buffers).
+        return 1 if self.is_fp4 else _DT[self.data_type]
+
+    @property
+    def token_nbytes(self):
+        """Per-token transport bytes (fp4 packs 2 e2m1/byte -> hidden/2)."""
+        return self.hidden_dim // 2 if self.is_fp4 else self.hidden_dim * self.elem_size
+
+    @property
+    def dtype_str(self):
+        """Token/dispatch dtype key for tuning_configs.lookup (fp4 vs default)."""
+        return "fp4" if self.is_fp4 else "bf16"
 
     @property
     def max_recv(self):
@@ -202,6 +219,10 @@ class EpDispatchCombineOp:
         device = torch.device("cuda", torch.cuda.current_device())
         self.dev = device
         elem_size = cfg.elem_size
+        is_fp4 = cfg.is_fp4
+        token_nbytes = cfg.token_nbytes          # per-token transport bytes (fp4 = hidden/2)
+        if is_fp4 and cfg.is_scatter:
+            raise ValueError("fp4 is gather-only (no scatter/quant path)")
         topk = cfg.num_experts_per_token
         hidden_dim = cfg.hidden_dim
         max_tok_per_rank = cfg.max_num_inp_token_per_rank
@@ -215,7 +236,7 @@ class EpDispatchCombineOp:
         regions = [("tok_off", 4), ("recv_num", cfg.world_size * 4),
                    ("recv_to_src_token", recv_cap * 4),
                    ("out_idx", recv_cap * topk * 4), ("out_wts", recv_cap * topk * 4),
-                   ("out_tok", recv_cap * hidden_dim * elem_size),
+                   ("out_tok", recv_cap * token_nbytes),
                    ("cross_device_barrier", cfg.world_size * 8)]
         if self._enable_scales:
             regions.append(("out_scales", recv_cap * self._scale_num_i32 * 4))
@@ -241,9 +262,13 @@ class EpDispatchCombineOp:
         self.total_recv = torch.zeros(1, dtype=torch.int32, device=device)
         self.combine_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self.cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
-        self.combine_out = torch.zeros(max_tok_per_rank * hidden_dim,
-                                       dtype=torch.int16 if elem_size == 2 else torch.int32,
-                                       device=device)
+        if is_fp4:   # fp4 combine outputs fp4 (hidden/2 bytes/token)
+            self.combine_out = torch.zeros(max_tok_per_rank * (hidden_dim // 2),
+                                           dtype=torch.int8, device=device)
+        else:
+            self.combine_out = torch.zeros(max_tok_per_rank * hidden_dim,
+                                           dtype=torch.int16 if elem_size == 2 else torch.int32,
+                                           device=device)
         self.combine_out_weights = torch.zeros(max_tok_per_rank * topk, dtype=torch.float32,
                                                device=device)
 
@@ -271,7 +296,7 @@ class EpDispatchCombineOp:
             off_tis=arena.offset("recv_to_src_token"), off_out_idx=arena.offset("out_idx"),
             off_out_wts=arena.offset("out_wts"), off_out_tok=arena.offset("out_tok"),
             off_out_scales=arena.offset("out_scales") if self._enable_scales else 0,
-            scale_dim=cfg.scale_dim, scale_type_size=cfg.scale_type_size)
+            scale_dim=cfg.scale_dim, scale_type_size=cfg.scale_type_size, fp4=is_fp4)
         # (block, warp) -> compiled dispatch / combine kernel.
         self._dispatch_variants = {
             (b, w): make_dispatch(block_num=b, warp_num_per_block=w, **self._dispatch_kwargs)
@@ -297,7 +322,7 @@ class EpDispatchCombineOp:
                 block_num=b, warp_num_per_block=w,
                 off_out_tok=arena.offset("out_tok"),
                 off_xdb_mem=arena.offset("cross_device_barrier"),
-                off_out_wts=arena.offset("out_wts"), reset_total_recv=True)
+                off_out_wts=arena.offset("out_wts"), reset_total_recv=True, fp4=is_fp4)
                 for (b, w) in combine_specs}
 
         self._local_expert_count_buf = torch.zeros(cfg.num_experts_per_rank, dtype=torch.int32,
@@ -329,9 +354,11 @@ class EpDispatchCombineOp:
                 block_num=cfg.combine_block_num, warp_num_per_block=cfg.combine_warp_num_per_block)
 
     def recv_tokens(self):
-        """Arena out_tok [max_recv, hidden] (dispatch dest / expert-GEMM input)."""
+        """Arena out_tok [max_recv, hidden] (dispatch dest / expert-GEMM input).
+        fp4 packs 2 e2m1 per float4_e2m1fn_x2 element -> last dim is hidden/2."""
+        cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
         return from_gpu_ptr(self.arena.local_ptr("out_tok"),
-                            (self._recv_cap, self.cfg.hidden_dim), self.cfg.data_type)
+                            (self._recv_cap, cols), self.cfg.data_type)
 
     def convert_dispatch_output(self):
         """mori ConvertDispatchOutput: repack recv tokens into per-local-expert
@@ -484,7 +511,8 @@ class EpDispatchCombineOp:
         count = routing.cur_rank_num_token
         hidden_dim = self.cfg.hidden_dim
         topk = self.cfg.num_experts_per_token
-        out = self.combine_out[: count * hidden_dim].view(self.cfg.data_type).view(count, hidden_dim)
+        cols = hidden_dim // 2 if self.cfg.is_fp4 else hidden_dim   # fp4 out is hidden/2 float4 elems
+        out = self.combine_out[: count * cols].view(self.cfg.data_type).view(count, cols)
         return out, self.combine_out_weights[: count * topk].view(count, topk)
 
     def local_expert_count(self):
