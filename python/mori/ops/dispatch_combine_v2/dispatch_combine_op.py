@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 import torch
 
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 from mori.tensor_utils import from_gpu_ptr
 
@@ -22,7 +21,9 @@ from intranode_kernels import (
 
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
 
-_DT = {torch.bfloat16: 2, torch.float32: 4}
+_DT = {torch.bfloat16: 2, torch.float32: 4,
+       torch.float8_e4m3fnuz: 1, torch.float8_e4m3fn: 1}
+_FP8_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
 
 def _align_up(x, a):
@@ -137,7 +138,8 @@ class EpDispatchCombineConfig:
         """Build a config with block/warp geometry pulled from tuning_configs
         (unless explicitly overridden in kwargs)."""
         from tuning_configs import lookup
-        dtype = "fp4" if kwargs.get("data_type") == torch.float4_e2m1fn_x2 else "bf16"
+        dt = kwargs.get("data_type", torch.bfloat16)
+        dtype = "fp4" if dt == torch.float4_e2m1fn_x2 else ("fp8" if dt in _FP8_DTYPES else "bf16")
         t = lookup(kwargs["world_size"], kwargs["hidden_dim"],
                    kwargs["num_experts_per_token"], dtype=dtype)
         for k, v in t.items():
@@ -147,6 +149,10 @@ class EpDispatchCombineConfig:
     @property
     def is_fp4(self):
         return self.data_type == torch.float4_e2m1fn_x2
+
+    @property
+    def is_fp8(self):
+        return self.data_type in _FP8_DTYPES
 
     @property
     def elem_size(self):
@@ -161,8 +167,12 @@ class EpDispatchCombineConfig:
 
     @property
     def dtype_str(self):
-        """Token/dispatch dtype key for tuning_configs.lookup (fp4 vs default)."""
-        return "fp4" if self.is_fp4 else "bf16"
+        """Token/dispatch dtype key for tuning_configs.lookup (fp4/fp8/default)."""
+        if self.is_fp4:
+            return "fp4"
+        if self.is_fp8:
+            return "fp8"
+        return "bf16"
 
     @property
     def max_recv(self):
@@ -220,9 +230,11 @@ class EpDispatchCombineOp:
         self.dev = device
         elem_size = cfg.elem_size
         is_fp4 = cfg.is_fp4
+        is_fp8 = cfg.is_fp8
         token_nbytes = cfg.token_nbytes          # per-token transport bytes (fp4 = hidden/2)
-        if is_fp4 and cfg.is_scatter:
-            raise ValueError("fp4 is gather-only (no scatter/quant path)")
+        if (is_fp4 or is_fp8) and cfg.is_scatter:
+            raise ValueError("plain fp4/fp8 token dtype is gather-only "
+                             "(fp8 quant uses quant_type=fp8_direct_cast, not data_type)")
         topk = cfg.num_experts_per_token
         hidden_dim = cfg.hidden_dim
         max_tok_per_rank = cfg.max_num_inp_token_per_rank
@@ -264,6 +276,9 @@ class EpDispatchCombineOp:
         self.cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
         if is_fp4:   # fp4 combine outputs fp4 (hidden/2 bytes/token)
             self.combine_out = torch.zeros(max_tok_per_rank * (hidden_dim // 2),
+                                           dtype=torch.int8, device=device)
+        elif is_fp8:  # fp8 combine outputs fp8 (1 byte/elem)
+            self.combine_out = torch.zeros(max_tok_per_rank * hidden_dim,
                                            dtype=torch.int8, device=device)
         else:
             self.combine_out = torch.zeros(max_tok_per_rank * hidden_dim,

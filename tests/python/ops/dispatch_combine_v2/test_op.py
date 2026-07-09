@@ -26,9 +26,13 @@ from dispatch_combine_op import EpDispatchCombineConfig, EpDispatchCombineOp  # 
 HIDDEN = int(os.environ.get("HIDDEN", 7168))
 K = int(os.environ.get("TOPK", 8))
 EPR = int(os.environ.get("EPR", 32))
+# fp8 flavor is arch-specific: OCP e4m3 on gfx950, fnuz on gfx942.
+import tuning_configs as _tc  # noqa: E402
+_FP8_DT = torch.float8_e4m3fn if _tc._topology()[1] == 90500 else torch.float8_e4m3fnuz
 DTYPE = {"bf16": torch.bfloat16, "f32": torch.float32,
-         "fp4": torch.float4_e2m1fn_x2}[os.environ.get("DTYPE", "bf16")]
+         "fp8": _FP8_DT, "fp4": torch.float4_e2m1fn_x2}[os.environ.get("DTYPE", "bf16")]
 _IS_FP4 = DTYPE == torch.float4_e2m1fn_x2
+_IS_FP8 = DTYPE == _FP8_DT
 STDMOE = int(os.environ.get("STDMOE", 0))
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = also verify per-token scales forwarding
 COMBINE = os.environ.get("COMBINE", "gather")    # gather | scatter
@@ -75,8 +79,8 @@ def main():
             max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)))
         if int(os.environ.get("TUNED", 0)):
             from tuning_configs import lookup
-            cfg.schedule = lookup(npes, HIDDEN, K,
-                                  dtype="fp4" if _IS_FP4 else "bf16")["schedule"]
+            _dt = "fp4" if _IS_FP4 else ("fp8" if _IS_FP8 else "bf16")
+            cfg.schedule = lookup(npes, HIDDEN, K, dtype=_dt)["schedule"]
         op = EpDispatchCombineOp(cfg, comm)
         comm.barrier()
 
@@ -158,9 +162,10 @@ def main():
                 else:
                     exp = (torch.from_numpy(U).view(ct, 1).float()
                            * inp[:ct].float().cpu()).to(DTYPE)
-                    # fp8 quant paths lose precision; relax the hidden tolerance.
-                    atol = 3e-1 if QUANT != "none" else 2e-2
-                    rtol = 1e-1 if QUANT != "none" else 2e-2
+                    # fp8 paths (quant or plain fp8 token) lose precision; relax.
+                    lossy = QUANT != "none" or _IS_FP8
+                    atol = 3e-1 if lossy else 2e-2
+                    rtol = 1e-1 if lossy else 2e-2
                     ok = torch.allclose(out.float().cpu(), exp.float(), atol=atol, rtol=rtol)
                 ok_w = torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
                 tag = f"OP-{COMBINE}" + (f"-{QUANT}" if QUANT != "none" else "")
@@ -173,7 +178,8 @@ def main():
 
 
 def _DT():
-    return {torch.bfloat16: 2, torch.float32: 4, torch.float4_e2m1fn_x2: 1}[DTYPE]
+    return {torch.bfloat16: 2, torch.float32: 4, torch.float4_e2m1fn_x2: 1,
+            torch.float8_e4m3fnuz: 1, torch.float8_e4m3fn: 1}[DTYPE]
 
 
 if __name__ == "__main__":

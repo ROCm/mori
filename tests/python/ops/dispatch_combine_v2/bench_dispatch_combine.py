@@ -20,7 +20,6 @@ import sys
 import numpy as np
 import torch
 
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 from mori.cco import Communicator
 from mori.tensor_utils import from_gpu_ptr
@@ -31,15 +30,8 @@ _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
 sys.path.insert(0, _HERE)                                              # dist_common
 sys.path.insert(0, os.path.join(_ROOT, "python", "mori", "ops", "dispatch_combine_v2"))  # op + kernels
 sys.path.insert(0, os.path.join(_ROOT, "examples", "cco", "python"))   # cco_example_common
-from cco_example_common import set_device, sync, zero  # noqa: E402
-from dispatch_combine_op import SymmArena  # noqa: E402
-from intranode_kernels import (  # noqa: E402
-    make_dispatch,
-    make_combine,
-    make_combine_scatter,
-    make_convert_dispatch_output,
-    make_convert_combine_input,
-)
+from cco_example_common import set_device, sync  # noqa: E402
+from dispatch_combine_op import EpDispatchCombineConfig, EpDispatchCombineOp  # noqa: E402
 from dist_common import Dist  # noqa: E402
 
 HIDDEN = int(os.environ.get("HIDDEN", 7168))
@@ -64,11 +56,11 @@ SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,2048").split(",")]
 # fp8 flavor is arch-specific: OCP e4m3 on gfx950, fnuz on gfx942.
 import tuning_configs as _tc  # noqa: E402
 _FP8_DT = torch.float8_e4m3fn if _tc._topology()[1] == 90500 else torch.float8_e4m3fnuz
-# (torch token dtype, elem bytes, comb_out storage dtype matching elem bytes)
-# fp4 packs 2 e2m1/byte -> 0.5 B/elem; per-token bytes handled via TOK_NB below.
-_DT = {"bf16": (torch.bfloat16, 2, torch.int16), "f32": (torch.float32, 4, torch.int32),
-       "fp8": (_FP8_DT, 1, torch.int8), "fp4": (torch.float4_e2m1fn_x2, 1, torch.int8)}
-TOK_DT, ESZ, COMB_DT = _DT[DTYPE]
+# (torch token dtype, elem bytes). fp4 packs 2 e2m1/byte -> 0.5 B/elem;
+# per-token bytes handled via TOK_NB below.
+_DT = {"bf16": (torch.bfloat16, 2), "f32": (torch.float32, 4),
+       "fp8": (_FP8_DT, 1), "fp4": (torch.float4_e2m1fn_x2, 1)}
+TOK_DT, ESZ = _DT[DTYPE]
 _FP4 = DTYPE == "fp4"
 TOK_NB = HIDDEN // 2 if _FP4 else HIDDEN * ESZ   # per-token transport bytes
 
@@ -91,16 +83,8 @@ def main():
         inp = torch.randn(max_tok, HIDDEN, generator=g, dtype=torch.float32).to(TOK_DT).to(dev)
     idx = torch.randint(0, num_experts, (max_tok, K), generator=g, dtype=torch.int32).to(dev)
     wts = torch.rand(max_tok, K, generator=g, dtype=torch.float32).to(dev)
-    tok_map = torch.full((max_tok * K,), -1, dtype=torch.int32, device=dev)
-    dest_pe_ctr = torch.zeros(npes, dtype=torch.int32, device=dev)
-    disp_bar = torch.zeros(1, dtype=torch.int32, device=dev)
-    total_recv = torch.zeros(1, dtype=torch.int32, device=dev)
-    comb_bar = torch.zeros(1, dtype=torch.int32, device=dev)
-    xdb_flag = torch.ones(1, dtype=torch.int64, device=dev)
-    comb_out = torch.zeros(max_tok * (HIDDEN // 2 if _FP4 else HIDDEN), dtype=COMB_DT, device=dev)
-    comb_out_wts = torch.zeros(max_tok * K, dtype=torch.float32, device=dev)
     # per-token scales (int8 bytes): pattern = (rank*100003 + tok) per dword so
-    # the recv side can verify the bijection (origin decoded from tis).
+    # the recv side can verify the bijection (origin decoded from recv_to_src_token).
     _sc_n_i32 = (SCALE_DIM + 3) // 4
     if SCALE_DIM:
         scales = torch.empty(max_tok * _sc_n_i32, dtype=torch.int32, device=dev)
@@ -116,69 +100,46 @@ def main():
     with Communicator.init(npes, rank, uid, per_rank_vmm=2 * win_bytes + (1 << 28)) as comm:
         _fp8 = QUANT == "fp8_direct_cast"
         _bw = QUANT == "fp8_blockwise"
-        _wire_esz = 1 if (_fp8 or _bw) else ESZ
-        bw_scale_dim = HIDDEN // 128 if _bw else 0    # block_elems = 128
         if _bw:
             inp.mul_(float(os.environ.get("BW_INSCALE", 200)))  # >448 exercises scaling
-        regions = [("tok_off", 4), ("recv_num", npes * 4), ("tis", max_recv * 4),
-                   ("out_idx", max_recv * K * 4), ("out_wts", max_recv * K * 4),
-                   ("out_tok", max_recv * TOK_NB), ("xdb_mem", npes * 8)]
-        if COMBINE == "scatter":
-            regions.append(("comb_inp", npes * M * HIDDEN * _wire_esz))
-            regions.append(("comb_wts", npes * M * K * 4))
-            if _bw:
-                regions.append(("comb_scales", npes * M * bw_scale_dim * 4))
-        if SCALE_DIM:
-            regions.append(("out_scales", max_recv * _sc_n_i32 * 4))
-        arena = SymmArena(comm, regions)
-        zero(arena.local_ptr("tok_off"), arena.total_bytes)
-
-        dispatch = make_dispatch(
-            rank=rank, npes=npes, experts_per_rank=EPR, experts_per_token=K,
-            hidden_dim=HIDDEN, hidden_elem_size=ESZ, max_tok_per_rank=M, max_recv=max_recv,
-            block_num=DISP_BLOCK, warp_num_per_block=WARP_NUM,
-            off_tok_off=arena.offset("tok_off"), off_recv_num=arena.offset("recv_num"),
-            off_tis=arena.offset("tis"), off_out_idx=arena.offset("out_idx"),
-            off_out_wts=arena.offset("out_wts"), off_out_tok=arena.offset("out_tok"),
-            off_out_scales=arena.offset("out_scales") if SCALE_DIM else 0,
-            scale_dim=SCALE_DIM, scale_type_size=1, fp4=_FP4)
-        if COMBINE == "scatter":
-            combine = make_combine_scatter(
-                rank=rank, npes=npes, experts_per_token=K, hidden_dim=HIDDEN, hidden_elem_size=ESZ,
-                max_tok_per_rank=M, max_recv=max_recv, block_num=COMB_BLOCK,
-                warp_num_per_block=COMB_WARP, off_out_tok=arena.offset("out_tok"),
-                off_comb_inp=arena.offset("comb_inp"), off_tis=arena.offset("tis"),
-                off_xdb_mem=arena.offset("xdb_mem"), off_out_wts=arena.offset("out_wts"),
-                off_comb_wts=arena.offset("comb_wts"), enable_weights=True,
-                fp8_direct_cast=_fp8, fp8_blockwise=_bw, scale_dim=bw_scale_dim,
-                off_comb_scales=arena.offset("comb_scales") if _bw else 0,
-                reset_total_recv=False, _s3_cache=int(os.environ.get("S3_CACHE", 2)))
-        else:
-            combine = make_combine(
-                rank=rank, npes=npes, experts_per_token=K, hidden_dim=HIDDEN, hidden_elem_size=ESZ,
-                max_tok_per_rank=M, max_recv=max_recv, block_num=COMB_BLOCK,
-                warp_num_per_block=COMB_WARP, off_out_tok=arena.offset("out_tok"),
-                off_xdb_mem=arena.offset("xdb_mem"), off_out_wts=arena.offset("out_wts"),
-                reset_total_recv=False, _s3_cache=int(os.environ.get("S3_CACHE", 2)),
-                _unroll=int(os.environ.get("UNROLL", 2)), fp4=_FP4)
-
-        cur = torch.cuda.current_stream()
-        dptrs = (arena.handle, inp.data_ptr(), idx.data_ptr(), wts.data_ptr(), tok_map.data_ptr(),
-                 dest_pe_ctr.data_ptr(), disp_bar.data_ptr(), total_recv.data_ptr(),
-                 scales.data_ptr())
-        cptrs = (arena.handle, tok_map.data_ptr(), comb_bar.data_ptr(),
-                 xdb_flag.data_ptr(), total_recv.data_ptr(), comb_out.data_ptr(),
-                 comb_out_wts.data_ptr())
-        disp_c = flyc.compile(dispatch, *[fx.Int64(p) for p in dptrs], rank, max_tok, fx.Stream(cur))
-        comb_c = flyc.compile(combine, *[fx.Int64(p) for p in cptrs], rank, max_tok, fx.Stream(cur))
+        # Build kernels + arena THROUGH the op-layer (single source of truth for
+        # dtype/mode support — the bench can no longer test a config the op can't
+        # express). schedule=None + explicit block/warp => the op precompiles
+        # exactly the (DISP_BLOCK,WARP_NUM) / (COMB_BLOCK,COMB_WARP) variants we
+        # sweep; we time those, reusing the op's arena + buffers.
+        cfg = EpDispatchCombineConfig(
+            rank=rank, world_size=npes, hidden_dim=HIDDEN,
+            max_num_inp_token_per_rank=M, num_experts_per_rank=EPR,
+            num_experts_per_token=K, data_type=TOK_DT,
+            combine_mode=COMBINE, quant_type=QUANT,
+            dispatch_block_num=DISP_BLOCK, warp_num_per_block=WARP_NUM,
+            combine_block_num=COMB_BLOCK, combine_warp_num_per_block=COMB_WARP,
+            schedule=None, scale_dim=SCALE_DIM, scale_type_size=1 if SCALE_DIM else 0,
+            enable_std_moe=bool(STDMOE))
+        op = EpDispatchCombineOp(cfg, comm)
+        op.reset()
+        arena = op.arena
+        # aliases so the correctness / perf code below reads the op's own buffers
+        total_recv = op.total_recv
+        comb_out = op.combine_out
+        comb_out_wts = op.combine_out_weights
+        tok_map = op.token_dest_map
+        disp_kern = op._dispatch_variants[(DISP_BLOCK, WARP_NUM)]
+        comb_kern = op._combine_variants[(COMB_BLOCK, COMB_WARP)]
 
         # Launch on the CURRENT stream each call: under torch.cuda.graph capture
         # that resolves to the capture stream, so the kernel is actually recorded.
         def run_disp(ct):
-            disp_c(*dptrs, rank, ct, fx.Stream(torch.cuda.current_stream()))
+            disp_kern(arena.handle, inp.data_ptr(), idx.data_ptr(), wts.data_ptr(),
+                      tok_map.data_ptr(), op.dest_pe_counter.data_ptr(),
+                      op.dispatch_barrier.data_ptr(), total_recv.data_ptr(),
+                      scales.data_ptr(), rank, ct, fx.Stream(torch.cuda.current_stream()))
 
         def run_comb(ct):
-            comb_c(*cptrs, rank, ct, fx.Stream(torch.cuda.current_stream()))
+            comb_kern(arena.handle, tok_map.data_ptr(), op.combine_barrier.data_ptr(),
+                      op.cross_device_flag.data_ptr(), total_recv.data_ptr(),
+                      comb_out.data_ptr(), comb_out_wts.data_ptr(),
+                      rank, ct, fx.Stream(torch.cuda.current_stream()))
 
         def time_eager(fn, ct):
             for _ in range(WARMUP):
@@ -225,9 +186,10 @@ def main():
             idx_c = idx[:ct].cpu().numpy()
             U = np.array([len({int(idx_c[t, j]) // EPR for j in range(K)}) for t in range(ct)])
             exp = (torch.from_numpy(U).view(ct, 1).float() * inp[:ct].float().cpu()).to(TOK_DT)
-            # fp8 wire dtype is lossy (e4m3 ~6-12% rel) -> loose tolerance.
-            _atol, _rtol = (1.0, 1.5e-1) if (_fp8 or _bw) else (2e-2, 2e-2)
-            got_dt = torch.bfloat16 if (_fp8 or _bw) else TOK_DT   # fp8 paths output bf16
+            # fp8 (quant wire or plain fp8 token) is lossy (e4m3 ~6-12% rel).
+            lossy = _fp8 or _bw or DTYPE == "fp8"
+            _atol, _rtol = (1.0, 1.5e-1) if lossy else (2e-2, 2e-2)
+            got_dt = torch.bfloat16 if (_fp8 or _bw) else TOK_DT   # quant paths output bf16
             got = comb_out[:ct * HIDDEN].cpu().view(got_dt).view(ct, HIDDEN)
             ok = torch.allclose(got.float(), exp.float(), atol=_atol, rtol=_rtol)
             # weights: out_weights[t][e] == U[t] * wts[t][e] (gather and scatter
@@ -250,42 +212,26 @@ def main():
             # per-rank weighted reduce + cross-rank gather telescopes to
             #   comb_out[s] == (sum_k wts[s][k]) * input[s]
             # (independent of routing/dedup; the weights collapse the U-count).
-            mtpe = npes * M
-            packed_x = torch.zeros(EPR * mtpe * HIDDEN, dtype=torch.int16, device=dev)
-            packed_cnt = torch.zeros(EPR, dtype=torch.int32, device=dev)
-            packed_src = torch.zeros(EPR * mtpe, dtype=torch.int32, device=dev)
-            slot_map = torch.full((max_recv * K,), -1, dtype=torch.int64, device=dev)
-            cvt_disp = make_convert_dispatch_output(
-                rank=rank, experts_per_rank=EPR, experts_per_token=K, hidden_dim=HIDDEN,
-                hidden_elem_size=2, max_tok_per_expert=mtpe, block_num=DISP_BLOCK,
-                warp_num_per_block=WARP_NUM)
-            cvt_comb = make_convert_combine_input(
-                rank=rank, experts_per_rank=EPR, experts_per_token=K, hidden_dim=HIDDEN,
-                hidden_elem_size=2, max_tok_per_expert=mtpe, block_num=COMB_BLOCK,
-                warp_num_per_block=WARP_NUM)
-            cdptrs = (arena.local_ptr("out_tok"), arena.local_ptr("out_idx"),
-                      arena.local_ptr("tis"), total_recv.data_ptr(), packed_x.data_ptr(),
-                      packed_cnt.data_ptr(), packed_src.data_ptr(), slot_map.data_ptr())
-            ccptrs = (arena.local_ptr("out_tok"), arena.local_ptr("out_wts"),
-                      total_recv.data_ptr(), packed_x.data_ptr(), slot_map.data_ptr())
-            # flyc.compile LAUNCHES the kernel once to specialize; zero
-            # total_recv first so that compile-launch is a no-op (loops 0 iters)
-            # and does not scribble into out_tok / packed_x.
-            total_recv.zero_(); sync()
-            cdisp_c = flyc.compile(cvt_disp, *[fx.Int64(p) for p in cdptrs], fx.Stream(cur))
-            ccomb_c = flyc.compile(cvt_comb, *[fx.Int64(p) for p in ccptrs], fx.Stream(cur))
-
+            # convert kernels + packed buffers come from the op (enable_std_moe).
             def run_cdisp():
-                cdisp_c(*cdptrs, fx.Stream(torch.cuda.current_stream()))
+                op._convert_dispatch(
+                    arena.local_ptr("out_tok"), arena.local_ptr("out_idx"),
+                    arena.local_ptr("recv_to_src_token"), total_recv.data_ptr(),
+                    op.packed_x.data_ptr(), op.packed_count.data_ptr(),
+                    op.packed_src.data_ptr(), op.slot_map.data_ptr(),
+                    fx.Stream(torch.cuda.current_stream()))
 
             def run_ccomb():
-                ccomb_c(*ccptrs, fx.Stream(torch.cuda.current_stream()))
+                op._convert_combine(
+                    arena.local_ptr("out_tok"), arena.local_ptr("out_wts"),
+                    total_recv.data_ptr(), op.packed_x.data_ptr(), op.slot_map.data_ptr(),
+                    fx.Stream(torch.cuda.current_stream()))
 
             if rank == 0:
                 print(f"# EP{npes} STDMOE hidden={HIDDEN} topk={K} experts={num_experts}",
                       flush=True)
             for ct in SWEEP:
-                total_recv.zero_(); packed_cnt.zero_(); slot_map.fill_(-1); sync()
+                total_recv.zero_(); op.packed_count.zero_(); op.slot_map.fill_(-1); sync()
                 run_disp(ct); sync(); comm.barrier()
                 run_cdisp(); sync(); comm.barrier()    # identity GEMM: packed_x = token
                 run_ccomb(); sync(); comm.barrier()
@@ -313,7 +259,8 @@ def main():
             recv = int(total_recv.cpu().item())
             out_sc = from_gpu_ptr(arena.local_ptr("out_scales"),
                                   (max_recv, _sc_n_i32), torch.int32)[:recv].cpu()
-            tis = from_gpu_ptr(arena.local_ptr("tis"), (max_recv,), torch.int32)[:recv].cpu()
+            tis = from_gpu_ptr(arena.local_ptr("recv_to_src_token"),
+                               (max_recv,), torch.int32)[:recv].cpu()
             exp = ((tis // M) * 100003 + (tis % M)).view(recv, 1)
             ok = bool((out_sc == exp).all().item()) if recv > 0 else True
             errs = d.allreduce_sum(0 if ok else 1)
