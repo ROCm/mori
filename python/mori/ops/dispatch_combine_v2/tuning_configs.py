@@ -1,3 +1,24 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """Per-device, per-shape block/warp tuning for the cco-LSA dispatch/combine
 kernels.
 
@@ -17,14 +38,18 @@ import glob
 # (max_tok_inclusive | None, disp_block, disp_warp, comb_block, comb_warp) buckets;
 # the op precompiles the distinct (block, warp) variants and picks by token count.
 _MI308X_SCHEDULE = (
-    (256,  64, 8,  64, 4),
+    (256, 64, 8, 64, 4),
     (2048, 64, 16, 64, 4),
     (None, 64, 16, 80, 4),
 )
 # Single-shot fallback (schedule ignored) = peak-optimal.
-_MI308X_DEFAULT = dict(dispatch_block_num=64, combine_block_num=80,
-                       warp_num_per_block=16, combine_warp_num_per_block=4,
-                       schedule=_MI308X_SCHEDULE)
+_MI308X_DEFAULT = dict(
+    dispatch_block_num=64,
+    combine_block_num=80,
+    warp_num_per_block=16,
+    combine_warp_num_per_block=4,
+    schedule=_MI308X_SCHEDULE,
+)
 # Per-shape -> per-dtype schedules. These were tuned as fp8-dispatch + bf16-combine,
 # so they live under "fp8" (the default / fallback for any untuned dtype).
 # hidden 4096 / 2048 reuse the 7168 schedule until separately tuned.
@@ -45,15 +70,19 @@ _MI308X_TABLE = {
 # 2048=497 4096=961 8192=1839; dispatch us: 8=18 64=30 128=47 256=78 512=138 1024=256
 # 2048=490 4096=960 8192=1881.
 _MI325X_SCHEDULE = (
-    (8,     64, 8,   64, 2),   # <=8 tok: tiny, combine warp 2
-    (64,    64, 8,   64, 4),   # <=64:   small block both
-    (1024, 152, 8,   64, 4),   # <=1024: disp 0.5*CU, comb small-block/warp4 (latency)
-    (4096, 228, 8,  152, 2),   # <=4096: comb 0.5*CU/warp2 (bandwidth)
-    (None, 304, 8,  152, 2),   # >4096 (peak)
+    (8, 64, 8, 64, 2),  # <=8 tok: tiny, combine warp 2
+    (64, 64, 8, 64, 4),  # <=64:   small block both
+    (1024, 152, 8, 64, 4),  # <=1024: disp 0.5*CU, comb small-block/warp4 (latency)
+    (4096, 228, 8, 152, 2),  # <=4096: comb 0.5*CU/warp2 (bandwidth)
+    (None, 304, 8, 152, 2),  # >4096 (peak)
 )
-_MI325X_DEFAULT = dict(dispatch_block_num=304, combine_block_num=152,
-                       warp_num_per_block=8, combine_warp_num_per_block=2,
-                       schedule=_MI325X_SCHEDULE)
+_MI325X_DEFAULT = dict(
+    dispatch_block_num=304,
+    combine_block_num=152,
+    warp_num_per_block=8,
+    combine_warp_num_per_block=2,
+    schedule=_MI325X_SCHEDULE,
+)
 # hidden 4096 / 2048 reuse the 7168 schedule until separately tuned.
 _MI325X_TABLE = {
     (8, 7168, 8): {"fp8": _MI325X_SCHEDULE},
@@ -62,7 +91,7 @@ _MI325X_TABLE = {
 }
 
 # ── MI300X (gfx942, 304 CU) — TODO: re-tune. Falls back to CU-scaled default. ──
-_MI300X_DEFAULT = None   # None => derive from CU count (see _cu_scaled_default)
+_MI300X_DEFAULT = None  # None => derive from CU count (see _cu_scaled_default)
 _MI300X_TABLE = {}
 
 # ── MI355X (gfx950, 256 CU) — measured 2026-07-08, EP8, fine block x warp sweep.
@@ -71,7 +100,7 @@ _MI300X_TABLE = {}
 #           batches; 256 blocks are worse — unlike MI308X's ~1 block/CU).
 # fp8-dispatch + bf16-combine schedule (also the fallback for bf16/untuned dtypes):
 _MI355X_SCHED_FP8 = (
-    (64,   128, 8, 48, 8),
+    (64, 128, 8, 48, 8),
     (2048, 128, 8, 128, 4),
     (None, 192, 8, 128, 4),
 )
@@ -80,13 +109,17 @@ _MI355X_SCHED_FP8 = (
 # less bandwidth-bound than fp8: dispatch block 128 throughout (warp 4 <=2048,
 # 8 >=4096); combine small block at small tok (64/8 <=256), 128/4 mid, 128/8 large.
 _MI355X_SCHED_FP4 = (
-    (256,  128, 4, 64,  8),
+    (256, 128, 4, 64, 8),
     (2048, 128, 4, 128, 4),
     (None, 128, 8, 128, 8),
 )
-_MI355X_DEFAULT = dict(dispatch_block_num=192, combine_block_num=128,
-                       warp_num_per_block=8, combine_warp_num_per_block=4,
-                       schedule=_MI355X_SCHED_FP8)
+_MI355X_DEFAULT = dict(
+    dispatch_block_num=192,
+    combine_block_num=128,
+    warp_num_per_block=8,
+    combine_warp_num_per_block=4,
+    schedule=_MI355X_SCHED_FP8,
+)
 _MI355X_TABLE = {
     (8, 7168, 8): {"fp8": _MI355X_SCHED_FP8, "fp4": _MI355X_SCHED_FP4},
 }
@@ -102,9 +135,9 @@ _DEVICES = {
 # PCI device IDs (KFD `device_id`) → device table key. gfx942 family only; the
 # gfx950 parts (MI350/MI355X) are matched by arch below since their DIDs vary.
 _DID_TO_KEY = {
-    0x74A1: "mi300x",   # MI300X
-    0x74A5: "mi325x",   # MI325X (304-CU gfx942; tuned 2026-07-08)
-    0x74A2: "mi308x",   # MI308X (80 CU)
+    0x74A1: "mi300x",  # MI300X
+    0x74A5: "mi325x",  # MI325X (304-CU gfx942; tuned 2026-07-08)
+    0x74A2: "mi308x",  # MI308X (80 CU)
 }
 
 
@@ -123,10 +156,14 @@ def _topology():
                     if len(parts) == 2:
                         vals[parts[0]] = int(parts[1])
             simd = vals.get("simd_count", 0)
-            if simd <= 0:               # CPU / non-GPU node
+            if simd <= 0:  # CPU / non-GPU node
                 continue
             spc = vals.get("simd_per_cu", 0) or 1
-            return simd // spc, vals.get("gfx_target_version", 0), vals.get("device_id", 0)
+            return (
+                simd // spc,
+                vals.get("gfx_target_version", 0),
+                vals.get("device_id", 0),
+            )
         except Exception:
             continue
     return 0, 0, 0
@@ -143,7 +180,7 @@ def _device_key():
     key = _DID_TO_KEY.get(did)
     if key is not None:
         return key
-    if gfx == 90500:                    # gfx950 (MI350 / MI355X), DID varies
+    if gfx == 90500:  # gfx950 (MI350 / MI355X), DID varies
         return "mi355x"
     return None
 
@@ -153,8 +190,13 @@ def _cu_scaled_default():
     dispatch, few warps for combine, no per-token schedule (single-shot). Used
     for devices without a measured table."""
     cu = _cu_count() or 80
-    return dict(dispatch_block_num=cu, combine_block_num=cu,
-                warp_num_per_block=16, combine_warp_num_per_block=4, schedule=None)
+    return dict(
+        dispatch_block_num=cu,
+        combine_block_num=cu,
+        warp_num_per_block=16,
+        combine_warp_num_per_block=4,
+        schedule=None,
+    )
 
 
 def lookup(world_size, hidden_dim, topk, dtype="fp8"):

@@ -1,3 +1,24 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """FlyDSL intranode device kernels for the cco-LSA dispatch/combine op.
 
 All kernels here are single-node (cco-LSA P2P over the flat symmetric VA);
@@ -26,7 +47,11 @@ Recurring conventions used throughout:
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr, T, vector
-from flydsl.expr.buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
+from flydsl.expr.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource_from_addr,
+)
 from flydsl.expr.rocdl import (
     ballot,
     readlane,
@@ -44,11 +69,32 @@ import flydsl_prims as P
 
 # ── dispatch ──────────────────────────────────────────────────────────────
 
-def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim,
-                  hidden_elem_size, max_tok_per_rank, max_recv, block_num, warp_num_per_block,
-                  off_tok_off, off_recv_num, off_tis, off_out_idx, off_out_wts, off_out_tok,
-                  off_out_scales=0, scale_dim=0, scale_type_size=0, enable_signal=True,
-                  replay=False, fp4=False):
+
+def make_dispatch(
+    *,
+    rank,
+    npes,
+    experts_per_rank,
+    experts_per_token,
+    hidden_dim,
+    hidden_elem_size,
+    max_tok_per_rank,
+    max_recv,
+    block_num,
+    warp_num_per_block,
+    off_tok_off,
+    off_recv_num,
+    off_tis,
+    off_out_idx,
+    off_out_wts,
+    off_out_tok,
+    off_out_scales=0,
+    scale_dim=0,
+    scale_type_size=0,
+    enable_signal=True,
+    replay=False,
+    fp4=False,
+):
     # fp4 (e2m1) packs 2 values per byte, so a token is hidden_dim/2 bytes; dispatch
     # is a pure byte mover (no fp4 decode), matching mori v1's plain-fp4 path.
     nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
@@ -63,10 +109,19 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
     enable_scales = scale_bytes > 0
 
     @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
-    def ep_dispatch(arena: Int64, addr_inp_tok: Int64, addr_inp_idx: Int64, addr_inp_wts: Int64,
-                    addr_tok_map: Int64, addr_dest_pe_ctr: Int64, addr_disp_bar: Int64,
-                    addr_total_recv: Int64, addr_inp_scales: Int64,
-                    my_lsa_rank: Int32, inp_cur_tok: Int32):
+    def ep_dispatch(
+        arena: Int64,
+        addr_inp_tok: Int64,
+        addr_inp_idx: Int64,
+        addr_inp_wts: Int64,
+        addr_tok_map: Int64,
+        addr_dest_pe_ctr: Int64,
+        addr_disp_bar: Int64,
+        addr_total_recv: Int64,
+        addr_inp_scales: Int64,
+        my_lsa_rank: Int32,
+        inp_cur_tok: Int32,
+    ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid & 63
@@ -86,19 +141,26 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
         for work_idx in range(global_warp_id, work_limit, global_warp_num):
             src_tok = work_idx // experts_per_token
             k_slot = work_idx % experts_per_token
-            dest_expert = buffer_load(rsrc_inp_idx, work_idx, vec_width=1, dtype=T.i32())
+            dest_expert = buffer_load(
+                rsrc_inp_idx, work_idx, vec_width=1, dtype=T.i32()
+            )
             # Dedup: one token routed to several experts on the SAME dest PE must
             # be sent only once. Each lane l (< k) inspects this token's l-th
             # expert; if a LOWER lane already targets our dest_pe, this
             # (src_tok, k_slot) is a duplicate and gets dropped. safe_lane keeps
             # the probe in-bounds for lanes >= k_slot.
             safe_lane = arith.select(lane < k_slot, lane, 0)
-            lane_expert = buffer_load(rsrc_inp_idx, src_tok * experts_per_token + safe_lane,
-                                      vec_width=1, dtype=T.i32())
+            lane_expert = buffer_load(
+                rsrc_inp_idx,
+                src_tok * experts_per_token + safe_lane,
+                vec_width=1,
+                dtype=T.i32(),
+            )
             dest_pe = dest_expert // experts_per_rank
             lane_dest_pe = lane_expert // experts_per_rank
-            dup_per_lane = arith.select(lane_dest_pe == dest_pe,
-                                        arith.select(lane < k_slot, lane, 64), 64)
+            dup_per_lane = arith.select(
+                lane_dest_pe == dest_pe, arith.select(lane < k_slot, lane, 64), 64
+            )
             dup_ballot = ballot(T.i64(), dup_per_lane < 64)
             is_dup = dup_ballot != 0
 
@@ -120,8 +182,9 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
                 no_dup = dup_ballot == 0
                 in_cap = dest_tok_id < max_recv
                 do_publish = arith.select(no_dup, in_cap, no_dup)
-                tok_map_entry = arith.select(is_dup_or_overflow, sentinel_val,
-                                             dest_pe * max_recv + dest_tok_id)
+                tok_map_entry = arith.select(
+                    is_dup_or_overflow, sentinel_val, dest_pe * max_recv + dest_tok_id
+                )
                 if lane == 0:
                     buffer_store(tok_map_entry, rsrc_tok_map, work_idx)
 
@@ -131,24 +194,37 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
                     # (recv slot -> global source token id) for combine routing.
                     src_tok_encoded = rank * max_tok_per_rank + src_tok
                     peer_tis = fx.Int64(window.lsa_ptr(dest_pe, off_tis))
-                    buffer_store(src_tok_encoded, create_buffer_resource_from_addr(peer_tis),
-                                 dest_tok_id)
-                    dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(dest_pe) * fx.Int64(4)
+                    buffer_store(
+                        src_tok_encoded,
+                        create_buffer_resource_from_addr(peer_tis),
+                        dest_tok_id,
+                    )
+                    dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
+                        dest_pe
+                    ) * fx.Int64(4)
                     P.atomic_add_global(dest_ctr_addr, fx.Int32(1))
 
             # Per-lane (weight, expert-idx) scatter (lanes < k).
             if lane < experts_per_token:
                 if do_publish:
                     weight_src_off = src_tok * experts_per_token + lane
-                    weight_val = buffer_load(rsrc_inp_wts, weight_src_off, vec_width=1,
-                                             dtype=T.f32())
-                    idx_val = buffer_load(rsrc_inp_idx, weight_src_off, vec_width=1, dtype=T.i32())
+                    weight_val = buffer_load(
+                        rsrc_inp_wts, weight_src_off, vec_width=1, dtype=T.f32()
+                    )
+                    idx_val = buffer_load(
+                        rsrc_inp_idx, weight_src_off, vec_width=1, dtype=T.i32()
+                    )
                     dest_slot = dest_tok_id * experts_per_token + lane
                     peer_wts = fx.Int64(window.lsa_ptr(dest_pe, off_out_wts))
-                    buffer_store(arith.bitcast(T.i32(), weight_val),
-                                 create_buffer_resource_from_addr(peer_wts), dest_slot)
+                    buffer_store(
+                        arith.bitcast(T.i32(), weight_val),
+                        create_buffer_resource_from_addr(peer_wts),
+                        dest_slot,
+                    )
                     peer_idx = fx.Int64(window.lsa_ptr(dest_pe, off_out_idx))
-                    buffer_store(idx_val, create_buffer_resource_from_addr(peer_idx), dest_slot)
+                    buffer_store(
+                        idx_val, create_buffer_resource_from_addr(peer_idx), dest_slot
+                    )
 
             # Per-token scales scatter: forward the src token's scale_num_i32 dwords
             # to the dest peer's out_scales[dest_tok_id] (lane-strided to cover
@@ -159,10 +235,17 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
                     peer_scales = fx.Int64(window.lsa_ptr(dest_pe, off_out_scales))
                     rsrc_peer_scales = create_buffer_resource_from_addr(peer_scales)
                     for k_off in range(lane, scale_num_i32, 64):
-                        scale_val = buffer_load(rsrc_inp_scales, src_tok * scale_num_i32 + k_off,
-                                                vec_width=1, dtype=T.i32())
-                        buffer_store(scale_val, rsrc_peer_scales,
-                                     dest_tok_id * scale_num_i32 + k_off)
+                        scale_val = buffer_load(
+                            rsrc_inp_scales,
+                            src_tok * scale_num_i32 + k_off,
+                            vec_width=1,
+                            dtype=T.i32(),
+                        )
+                        buffer_store(
+                            scale_val,
+                            rsrc_peer_scales,
+                            dest_tok_id * scale_num_i32 + k_off,
+                        )
 
             # Token-embedding scatter: each lane owns 4 i32 (16B). The main body
             # runs two independent vec4 load/store streams (this lane's chunk and
@@ -171,16 +254,22 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
             # Dropped slots (dup/overflow) set copy_end == lane_i32_off → no-op.
             peer_tok_base = fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
             remote_tok_addr = peer_tok_base + fx.Int64(dest_tok_id) * fx.Int64(nbytes)
-            local_tok_addr = fx.Int64(addr_inp_tok) + fx.Int64(src_tok) * fx.Int64(nbytes)
+            local_tok_addr = fx.Int64(addr_inp_tok) + fx.Int64(src_tok) * fx.Int64(
+                nbytes
+            )
             rsrc_src = create_buffer_resource_from_addr(local_tok_addr)
             rsrc_dst = create_buffer_resource_from_addr(remote_tok_addr)
             lane_i32_off = lane * 4
             safe_end_i32 = (n_i32 // 512) * 512
             if const_expr(n_i32 >= 512 and safe_end_i32 > 0):
-                copy_end_main = arith.select(is_dup_or_overflow, lane_i32_off, safe_end_i32)
+                copy_end_main = arith.select(
+                    is_dup_or_overflow, lane_i32_off, safe_end_i32
+                )
                 for chunk in range(lane_i32_off, copy_end_main, 512):
                     vec_a = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
-                    vec_b = buffer_load(rsrc_src, chunk + 256, vec_width=4, dtype=T.i32())
+                    vec_b = buffer_load(
+                        rsrc_src, chunk + 256, vec_width=4, dtype=T.i32()
+                    )
                     buffer_store(vec_a, rsrc_dst, chunk)
                     buffer_store(vec_b, rsrc_dst, chunk + 256)
             if const_expr(safe_end_i32 < n_i32):
@@ -202,8 +291,11 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
             # total_recv, so there is no cross-block race.
             if global_warp_id == 0:
                 if lane == 0:
-                    buffer_store(arith.constant(0),
-                                 create_buffer_resource_from_addr(addr_total_recv), 0)
+                    buffer_store(
+                        arith.constant(0),
+                        create_buffer_resource_from_addr(addr_total_recv),
+                        0,
+                    )
                 P.fence_system_release()
 
             # ── Phase 2: grid barrier + per-peer count signal ──
@@ -217,12 +309,16 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
                     P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
                     P.fence_system_acquire()
                     buffer_store(arith.constant(0), rsrc_disp_bar, 0)
-                    signal_value = buffer_load(rsrc_dest_ctr, dest_pe, vec_width=1,
-                                               dtype=T.i32()) + 1
+                    signal_value = (
+                        buffer_load(rsrc_dest_ctr, dest_pe, vec_width=1, dtype=T.i32())
+                        + 1
+                    )
                     peer_recv_num = fx.Int64(window.lsa_ptr(dest_pe, off_recv_num))
                     recv_num_remote_addr = peer_recv_num + fx.Int64(rank) * fx.Int64(4)
                     P.spin_until_eq_i32(recv_num_remote_addr, 0)
-                    P.store_i32_system(recv_num_remote_addr, arith.constant(0), signal_value)
+                    P.store_i32_system(
+                        recv_num_remote_addr, arith.constant(0), signal_value
+                    )
 
             # ── Phase 3: collect per-source counts into total_recv ──
             for src_pe in range(lane, npes, 64):
@@ -230,45 +326,89 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
                     recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
                     signal_value = P.spin_until_gt_i32(recv_num_src_addr, 0)
                     peer_recv_count = signal_value - 1
-                    P.store_i32_system(recv_num_src_addr, arith.constant(0), arith.constant(0))
+                    P.store_i32_system(
+                        recv_num_src_addr, arith.constant(0), arith.constant(0)
+                    )
                     P.atomic_add_global(fx.Int64(addr_total_recv), peer_recv_count)
                     buffer_store(arith.constant(0), rsrc_dest_ctr, src_pe)
 
             if global_warp_id == 0:
                 if lane == 0:
                     local_tok_off = fx.Int64(window.lsa_ptr(my_lsa_rank, off_tok_off))
-                    P.store_i32_system(local_tok_off, arith.constant(0), arith.constant(0))
+                    P.store_i32_system(
+                        local_tok_off, arith.constant(0), arith.constant(0)
+                    )
 
     @flyc.jit
-    def run(arena: Int64, addr_inp_tok: Int64, addr_inp_idx: Int64, addr_inp_wts: Int64,
-            addr_tok_map: Int64, addr_dest_pe_ctr: Int64, addr_disp_bar: Int64,
-            addr_total_recv: Int64, addr_inp_scales: Int64, my_lsa_rank: Int32,
-            inp_cur_tok: Int32, stream=fx.Stream(None)):
-        ep_dispatch(arena, addr_inp_tok, addr_inp_idx, addr_inp_wts, addr_tok_map,
-                    addr_dest_pe_ctr, addr_disp_bar, addr_total_recv, addr_inp_scales,
-                    my_lsa_rank, inp_cur_tok).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream)
+    def run(
+        arena: Int64,
+        addr_inp_tok: Int64,
+        addr_inp_idx: Int64,
+        addr_inp_wts: Int64,
+        addr_tok_map: Int64,
+        addr_dest_pe_ctr: Int64,
+        addr_disp_bar: Int64,
+        addr_total_recv: Int64,
+        addr_inp_scales: Int64,
+        my_lsa_rank: Int32,
+        inp_cur_tok: Int32,
+        stream=fx.Stream(None),
+    ):
+        ep_dispatch(
+            arena,
+            addr_inp_tok,
+            addr_inp_idx,
+            addr_inp_wts,
+            addr_tok_map,
+            addr_dest_pe_ctr,
+            addr_disp_bar,
+            addr_total_recv,
+            addr_inp_scales,
+            my_lsa_rank,
+            inp_cur_tok,
+        ).launch(
+            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream
+        )
 
     return run
 
+
 # ── combine (gather + scatter/quant) ──────────────────────────────────────
 
-_V2BF16 = lambda: T.VectorType.get([2], T.bf16())
-_V2F32 = lambda: T.VectorType.get([2], T.f32())
-_V4F32 = lambda: T.VectorType.get([4], T.f32())
-_V8F32 = lambda: T.VectorType.get([8], T.f32())
-_V1I32 = lambda: T.VectorType.get([1], T.i32())
+
+def _V2BF16():
+    return T.VectorType.get([2], T.bf16())
+
+
+def _V2F32():
+    return T.VectorType.get([2], T.f32())
+
+
+def _V4F32():
+    return T.VectorType.get([4], T.f32())
+
+
+def _V8F32():
+    return T.VectorType.get([8], T.f32())
+
+
+def _V1I32():
+    return T.VectorType.get([1], T.i32())
 
 
 def _accum_funcs(hidden_elem_size, fp8_direct_cast=False, fp4=False):
-    if fp4:                            # fp4 e2m1: i32 = 8 packed fp4 -> v8f32
+    if fp4:  # fp4 e2m1: i32 = 8 packed fp4 -> v8f32
         # NOTE: cvt_scalef32_pk_*_fp4 are gfx950-only (MI350). On gfx942
         # (MI300X) codegen fails "instruction not supported on this GPU".
         # Faithful port of the FlyDSL reference fp4 branch; opt-in (fp4=True).
         def to_accum(i32_scalar):
             one = arith.constant(1.0, type=T.f32())
-            pairs = [cvt_scalef32_pk_f32_fp4(res=_V2F32(), src=i32_scalar, scale=one,
-                                             src_sel_index=s) for s in range(4)]
+            pairs = [
+                cvt_scalef32_pk_f32_fp4(
+                    res=_V2F32(), src=i32_scalar, scale=one, src_sel_index=s
+                )
+                for s in range(4)
+            ]
             lo4 = vector.shuffle(pairs[0], pairs[1], [0, 1, 2, 3])
             hi4 = vector.shuffle(pairs[2], pairs[3], [0, 1, 2, 3])
             return vector.shuffle(lo4, hi4, [0, 1, 2, 3, 4, 5, 6, 7])
@@ -279,12 +419,19 @@ def _accum_funcs(hidden_elem_size, fp8_direct_cast=False, fp4=False):
             for s in range(4):
                 fa = vector.extract(acc, static_position=[s * 2])
                 fb = vector.extract(acc, static_position=[s * 2 + 1])
-                old = cvt_scalef32_pk_fp4_f32(res=T.i32(), old_vdst=old, src0=fa, src1=fb,
-                                              scale=one, dst_sel_index=s)
+                old = cvt_scalef32_pk_fp4_f32(
+                    res=T.i32(),
+                    old_vdst=old,
+                    src0=fa,
+                    src1=fb,
+                    scale=one,
+                    dst_sel_index=s,
+                )
             return old
 
         def zero_accum():
             return arith.constant_vector(0.0, _V8F32())
+
         return to_accum, from_accum, zero_accum
     return _accum_funcs_int(hidden_elem_size, fp8_direct_cast)
 
@@ -295,18 +442,23 @@ def _accum_funcs_int(hidden_elem_size, fp8_direct_cast=False):
 
     Each i32 packs: 2 bf16 (v2f32), 1 f32 (scalar), or 4 fp8 (v4f32).
     """
-    if hidden_elem_size == 2:          # bf16: i32 = 2 bf16
+    if hidden_elem_size == 2:  # bf16: i32 = 2 bf16
+
         def to_accum(i32_scalar):
-            return vector.bitcast(_V2BF16(),
-                                  vector.from_elements(_V1I32(), [i32_scalar])).extf(_V2F32())
+            return vector.bitcast(
+                _V2BF16(), vector.from_elements(_V1I32(), [i32_scalar])
+            ).extf(_V2F32())
 
         def from_accum(acc):
-            return vector.extract(vector.bitcast(_V1I32(), acc.truncf(_V2BF16())),
-                                  static_position=[0])
+            return vector.extract(
+                vector.bitcast(_V1I32(), acc.truncf(_V2BF16())), static_position=[0]
+            )
 
         def zero_accum():
             return to_accum(arith.constant(0))
-    elif hidden_elem_size == 4:        # f32: i32 = 1 f32
+
+    elif hidden_elem_size == 4:  # f32: i32 = 1 f32
+
         def to_accum(i32_scalar):
             return fx.Float32(arith.bitcast(T.f32(), arith.unwrap(i32_scalar)))
 
@@ -315,7 +467,9 @@ def _accum_funcs_int(hidden_elem_size, fp8_direct_cast=False):
 
         def zero_accum():
             return fx.Float32(arith.constant(0.0, type=T.f32()))
-    elif hidden_elem_size == 1:        # fp8 (OCP e4m3): i32 = 4 fp8
+
+    elif hidden_elem_size == 1:  # fp8 (OCP e4m3): i32 = 4 fp8
+
         def to_accum(i32_scalar):
             lo = cvt_pk_f32_fp8(res=_V2F32(), src=i32_scalar, word_sel=False)
             hi = cvt_pk_f32_fp8(res=_V2F32(), src=i32_scalar, word_sel=True)
@@ -326,39 +480,69 @@ def _accum_funcs_int(hidden_elem_size, fp8_direct_cast=False):
             f1 = vector.extract(acc, static_position=[1])
             f2 = vector.extract(acc, static_position=[2])
             f3 = vector.extract(acc, static_position=[3])
-            if fp8_direct_cast:        # wire fp8 -> external bf16: v4f32 -> v4bf16 -> 2 i32
+            if fp8_direct_cast:  # wire fp8 -> external bf16: v4f32 -> v4bf16 -> 2 i32
                 v4bf16 = acc.truncf(T.VectorType.get([4], T.bf16()))
                 return vector.bitcast(T.VectorType.get([2], T.i32()), v4bf16)
             zero = arith.constant(0, type=T.i32())
-            lo = cvt_pk_fp8_f32(res=T.i32(), src_a=f0, src_b=f1, old=zero, word_sel=False)
-            return cvt_pk_fp8_f32(res=T.i32(), src_a=f2, src_b=f3, old=lo, word_sel=True)
+            lo = cvt_pk_fp8_f32(
+                res=T.i32(), src_a=f0, src_b=f1, old=zero, word_sel=False
+            )
+            return cvt_pk_fp8_f32(
+                res=T.i32(), src_a=f2, src_b=f3, old=lo, word_sel=True
+            )
 
         def zero_accum():
             return arith.constant_vector(0.0, _V4F32())
+
     else:
         raise ValueError(f"unsupported hidden_elem_size {hidden_elem_size}")
     return to_accum, from_accum, zero_accum
 
 
-def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
-                 max_tok_per_rank, max_recv, block_num, warp_num_per_block,
-                 off_out_tok, off_xdb_mem, off_out_wts=0, enable_weights=True,
-                 fp8_direct_cast=False, fp4=False, reset_total_recv=True,
-                 _s3_cache=2, _unroll=2):
+def make_combine(
+    *,
+    rank,
+    npes,
+    experts_per_token,
+    hidden_dim,
+    hidden_elem_size,
+    max_tok_per_rank,
+    max_recv,
+    block_num,
+    warp_num_per_block,
+    off_out_tok,
+    off_xdb_mem,
+    off_out_wts=0,
+    enable_weights=True,
+    fp8_direct_cast=False,
+    fp4=False,
+    reset_total_recv=True,
+    _s3_cache=2,
+    _unroll=2,
+):
     # Transport dtype = external dtype, except fp8_direct_cast wires fp8 while
     # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit). fp4: i32 = 8 fp4.
-    _to_accum2, _from_accum2, _zero_accum = _accum_funcs(hidden_elem_size, fp8_direct_cast, fp4)
+    _to_accum2, _from_accum2, _zero_accum = _accum_funcs(
+        hidden_elem_size, fp8_direct_cast, fp4
+    )
     nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
     n_i32 = hidden_dim // 8 if fp4 else nbytes // 4
-    n_chunks = nbytes // 16          # vec4 (16B) chunks per token
     # fp8_direct_cast: output stride is bf16 (2 i32 per fp8 unit) vs input fp8.
     out_n_i32 = (hidden_dim * 2) // 4 if fp8_direct_cast else n_i32
     out_step_mult = 2 if fp8_direct_cast else 1
 
     @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
-    def ep_combine(arena: Int64, addr_tok_map: Int64, addr_comb_bar: Int64,
-                   addr_xdb_flag: Int64, addr_total_recv: Int64, addr_out: Int64,
-                   addr_out_wts: Int64, my_lsa_rank: Int32, cur_rank_num_token: Int32):
+    def ep_combine(
+        arena: Int64,
+        addr_tok_map: Int64,
+        addr_comb_bar: Int64,
+        addr_xdb_flag: Int64,
+        addr_total_recv: Int64,
+        addr_out: Int64,
+        addr_out_wts: Int64,
+        my_lsa_rank: Int32,
+        cur_rank_num_token: Int32,
+    ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid & 63
@@ -387,18 +571,22 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
             P.spin_until_eq_i32(fx.Int64(addr_comb_bar), block_num)
             P.fence_system_acquire()
             buffer_store(arith.constant(0), rsrc_comb_bar, 0)
-            xdb_remote = (fx.Int64(window.lsa_ptr(grid_thread_id, off_xdb_mem))
-                          + fx.Int64(rank) * fx.Int64(8))
+            xdb_remote = fx.Int64(
+                window.lsa_ptr(grid_thread_id, off_xdb_mem)
+            ) + fx.Int64(rank) * fx.Int64(8)
             P.store_i64_system(xdb_remote, arith.constant(0), xdb_cur_flag)
         if grid_thread_id == 0:
-            P.atomic_add_global(fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64()))
+            P.atomic_add_global(
+                fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64())
+            )
         if tid < npes:
-            xdb_peer_slot = (fx.Int64(window.lsa_ptr(my_lsa_rank, off_xdb_mem))
-                             + fx.Int64(tid) * fx.Int64(8))
+            xdb_peer_slot = fx.Int64(
+                window.lsa_ptr(my_lsa_rank, off_xdb_mem)
+            ) + fx.Int64(tid) * fx.Int64(8)
             P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
             P.fence_system_acquire()
         fx.barrier()
-        P.fence_system_acquire()           # ALL threads: peers' out_tok visible
+        P.fence_system_acquire()  # ALL threads: peers' out_tok visible
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
@@ -412,10 +600,17 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
         # VecBytes=4, Unroll=2). Partition each token's hidden across
         # warps_per_tok warps so small batches still fill the grid.
         STEP = _unroll * 64
-        safe_tok = arith.select(cur_rank_num_token == arith.constant(0),
-                                arith.constant(1), cur_rank_num_token)
-        warps_per_tok = (arith.constant(global_warp_num) + safe_tok - arith.constant(1)) // safe_tok
-        units_per_warp = (arith.constant(n_i32) + warps_per_tok - arith.constant(1)) // warps_per_tok
+        safe_tok = arith.select(
+            cur_rank_num_token == arith.constant(0),
+            arith.constant(1),
+            cur_rank_num_token,
+        )
+        warps_per_tok = (
+            arith.constant(global_warp_num) + safe_tok - arith.constant(1)
+        ) // safe_tok
+        units_per_warp = (
+            arith.constant(n_i32) + warps_per_tok - arith.constant(1)
+        ) // warps_per_tok
         stage3_total = cur_rank_num_token * warps_per_tok
         for stage3_idx in range(global_warp_id, stage3_total, global_warp_num):
             tok_id = stage3_idx // warps_per_tok
@@ -427,18 +622,20 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
             expert_pes = []
             expert_toks = []
             for k_slot in range_constexpr(experts_per_token):
-                encoded_k = buffer_load(rsrc_tok_map, tok_map_base + k_slot, vec_width=1,
-                                        dtype=T.i32())
-                dest_pe_k = encoded_k // max_recv         # sentinel: dest_pe == npes
-                dest_tok_k = encoded_k % max_recv         # peer-local recv slot
+                encoded_k = buffer_load(
+                    rsrc_tok_map, tok_map_base + k_slot, vec_width=1, dtype=T.i32()
+                )
+                dest_pe_k = encoded_k // max_recv  # sentinel: dest_pe == npes
+                dest_tok_k = encoded_k % max_recv  # peer-local recv slot
                 valid_k = dest_pe_k < npes
                 safe_pe = arith.select(valid_k, dest_pe_k, arith.constant(rank))
                 safe_tok_k = arith.select(valid_k, dest_tok_k, arith.constant(0))
                 # Remote base peer[dest_pe].out_tok[dest_tok]; gather via global
                 # loads (no per-expert buffer descriptor) to keep all K loads in
                 # flight — see P.load_i32_nt.
-                slot_addr = (fx.Int64(window.lsa_ptr(safe_pe, off_out_tok))
-                             + fx.Int64(safe_tok_k) * fx.Int64(nbytes))
+                slot_addr = fx.Int64(window.lsa_ptr(safe_pe, off_out_tok)) + fx.Int64(
+                    safe_tok_k
+                ) * fx.Int64(nbytes)
                 expert_bases.append(slot_addr)
                 expert_valids.append(valid_k)
                 expert_pes.append(safe_pe)
@@ -452,31 +649,48 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                     if lane < experts_per_token:
                         weight_acc = arith.constant(0.0, type=T.f32())
                         for k_slot in range_constexpr(experts_per_token):
-                            weight_addr = (fx.Int64(window.lsa_ptr(expert_pes[k_slot], off_out_wts))
-                                           + (fx.Int64(expert_toks[k_slot])
-                                              * fx.Int64(experts_per_token)
-                                              + fx.Int64(lane)) * fx.Int64(4))
+                            weight_addr = fx.Int64(
+                                window.lsa_ptr(expert_pes[k_slot], off_out_wts)
+                            ) + (
+                                fx.Int64(expert_toks[k_slot])
+                                * fx.Int64(experts_per_token)
+                                + fx.Int64(lane)
+                            ) * fx.Int64(
+                                4
+                            )
                             weight_val = buffer_load(
-                                create_buffer_resource_from_addr(weight_addr), 0,
-                                vec_width=1, dtype=T.f32())
+                                create_buffer_resource_from_addr(weight_addr),
+                                0,
+                                vec_width=1,
+                                dtype=T.f32(),
+                            )
                             weight_acc = weight_acc + arith.select(
-                                expert_valids[k_slot], weight_val,
-                                arith.constant(0.0, type=T.f32()))
+                                expert_valids[k_slot],
+                                weight_val,
+                                arith.constant(0.0, type=T.f32()),
+                            )
                         buffer_store(weight_acc, rsrc_out_wts, tok_map_base + lane)
             rem = arith.constant(n_i32) - unit_base
-            eff = arith.select(rem < units_per_warp, rem, units_per_warp)   # i32 units this warp
+            eff = arith.select(
+                rem < units_per_warp, rem, units_per_warp
+            )  # i32 units this warp
             out_base = tok_id * out_n_i32
+
             # Nested fn: closure over expert_bases/valids (lists can't be loop-carried).
-            def _one(off):           # reduce k contributions for one i32 unit
+            def _one(off):  # reduce k contributions for one i32 unit
                 # Load all K experts, then reduce (K-deep MLP per lane).
                 vals = []
                 for k_slot in range_constexpr(experts_per_token):
                     v = P.load_i32_nt(expert_bases[k_slot], off)
-                    vals.append(arith.select(expert_valids[k_slot], v, arith.constant(0)))
+                    vals.append(
+                        arith.select(expert_valids[k_slot], v, arith.constant(0))
+                    )
                 acc = _zero_accum()
                 for k_slot in range_constexpr(experts_per_token):
                     acc = acc + _to_accum2(vals[k_slot])
-                buffer_store(_from_accum2(acc), rsrc_out, out_base + off * out_step_mult)
+                buffer_store(
+                    _from_accum2(acc), rsrc_out, out_base + off * out_step_mult
+                )
 
             def _accum_loop():
                 # _unroll elements/lane per iter; per element load all K experts
@@ -490,40 +704,65 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                         vals = []
                         for k_slot in range_constexpr(experts_per_token):
                             v = P.load_i32_nt(expert_bases[k_slot], off)
-                            vals.append(arith.select(expert_valids[k_slot], v,
-                                                     arith.constant(0)))
+                            vals.append(
+                                arith.select(
+                                    expert_valids[k_slot], v, arith.constant(0)
+                                )
+                            )
                         acc = _zero_accum()
                         for k_slot in range_constexpr(experts_per_token):
                             acc = acc + _to_accum2(vals[k_slot])
-                        buffer_store(_from_accum2(acc), rsrc_out,
-                                     out_base + off * out_step_mult)
+                        buffer_store(
+                            _from_accum2(acc), rsrc_out, out_base + off * out_step_mult
+                        )
                 # tail: leftover elements, one per lane
                 for u in range(main_end + lane, eff, 64):
                     _one(unit_base + u)
+
             _accum_loop()
 
     @flyc.jit
-    def run(arena: Int64, addr_tok_map: Int64, addr_comb_bar: Int64, addr_xdb_flag: Int64,
-            addr_total_recv: Int64, addr_out: Int64, addr_out_wts: Int64, my_lsa_rank: Int32,
-            cur_rank_num_token: Int32, stream=fx.Stream(None)):
-        ep_combine(arena, addr_tok_map, addr_comb_bar, addr_xdb_flag, addr_total_recv,
-                   addr_out, addr_out_wts, my_lsa_rank, cur_rank_num_token).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream)
+    def run(
+        arena: Int64,
+        addr_tok_map: Int64,
+        addr_comb_bar: Int64,
+        addr_xdb_flag: Int64,
+        addr_total_recv: Int64,
+        addr_out: Int64,
+        addr_out_wts: Int64,
+        my_lsa_rank: Int32,
+        cur_rank_num_token: Int32,
+        stream=fx.Stream(None),
+    ):
+        ep_combine(
+            arena,
+            addr_tok_map,
+            addr_comb_bar,
+            addr_xdb_flag,
+            addr_total_recv,
+            addr_out,
+            addr_out_wts,
+            my_lsa_rank,
+            cur_rank_num_token,
+        ).launch(
+            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream
+        )
 
     return run
 
 
-_FP8_MAX = 240.0   # gfx942 native fp8 is e4m3fnuz: max finite 240 (NOT OCP 448);
-                   # clamping above 240 yields NaN from cvt_pk_fp8_f32 on this arch
+_FP8_MAX = 240.0  # gfx942 native fp8 is e4m3fnuz: max finite 240 (NOT OCP 448);
+# clamping above 240 yields NaN from cvt_pk_fp8_f32 on this arch
 
 
 def _fabs(f):
     return arith.maximumf(f, arith.negf(f))
 
 
-def _bf16x2(i32_scalar):           # i32 (2 bf16) -> v2f32
-    return vector.bitcast(_V2BF16(),
-                          vector.from_elements(_V1I32(), [i32_scalar])).extf(_V2F32())
+def _bf16x2(i32_scalar):  # i32 (2 bf16) -> v2f32
+    return vector.bitcast(_V2BF16(), vector.from_elements(_V1I32(), [i32_scalar])).extf(
+        _V2F32()
+    )
 
 
 def _warp_amax(lane, v):
@@ -531,18 +770,37 @@ def _warp_amax(lane, v):
     allows a per-lane gather index — unlike readlane's uniform-lane requirement).
     Every lane returns the wavefront max. ``v`` and the result are raw values."""
     for off in (32, 16, 8, 4, 2, 1):
-        idx = arith.unwrap((lane ^ off) * 4)                     # byte addr = lane*4
+        idx = arith.unwrap((lane ^ off) * 4)  # byte addr = lane*4
         o = ds_bpermute(T.i32(), idx, arith.bitcast(T.i32(), arith.unwrap(v)))
         v = arith.maximumf(v, arith.bitcast(T.f32(), o))
     return v
 
 
-def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
-                         max_tok_per_rank, max_recv, block_num, warp_num_per_block,
-                         off_out_tok, off_comb_inp, off_tis, off_xdb_mem, off_out_wts=0,
-                         off_comb_wts=0, off_comb_scales=0, enable_weights=True,
-                         fp8_direct_cast=False, fp8_blockwise=False, scale_dim=0,
-                         reset_total_recv=True, _s3_cache=2):
+def make_combine_scatter(
+    *,
+    rank,
+    npes,
+    experts_per_token,
+    hidden_dim,
+    hidden_elem_size,
+    max_tok_per_rank,
+    max_recv,
+    block_num,
+    warp_num_per_block,
+    off_out_tok,
+    off_comb_inp,
+    off_tis,
+    off_xdb_mem,
+    off_out_wts=0,
+    off_comb_wts=0,
+    off_comb_scales=0,
+    enable_weights=True,
+    fp8_direct_cast=False,
+    fp8_blockwise=False,
+    scale_dim=0,
+    reset_total_recv=True,
+    _s3_cache=2,
+):
     """Scatter combine (mori useExternalInpBuffer / _nop2p path).
 
     Stage 1  each computing rank P2P-WRITES its post-expert tokens back to the
@@ -559,23 +817,30 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
     _fp8_out = fp8_direct_cast or fp8_blockwise
     wire_elem_size = 1 if _fp8_out else hidden_elem_size
     to_acc, from_acc, zero_acc = _accum_funcs(wire_elem_size, _fp8_out)
-    inp_nbytes = hidden_dim * hidden_elem_size      # source out_tok (bf16/f32)
-    wire_nbytes = hidden_dim * wire_elem_size       # comb_inp transport
-    src_n_i32 = inp_nbytes // 4
+    inp_nbytes = hidden_dim * hidden_elem_size  # source out_tok (bf16/f32)
+    wire_nbytes = hidden_dim * wire_elem_size  # comb_inp transport
     wire_n_i32 = wire_nbytes // 4
     out_n_i32 = (hidden_dim * 2) // 4 if _fp8_out else wire_n_i32
     out_step_mult = 2 if _fp8_out else 1
     if fp8_blockwise:
         block_elems = hidden_dim // scale_dim
-        assert hidden_dim % scale_dim == 0 and block_elems == 128, \
-            "blockwise (coalesced path): block_elems must be 128 (scale_dim = hidden/128)"
-        block_i32_fp8 = block_elems // 4          # fp8 i32 units per block (=32)
-        block_i32_bf16 = block_elems // 2         # bf16 i32 units per block (=64)
+        assert (
+            hidden_dim % scale_dim == 0 and block_elems == 128
+        ), "blockwise (coalesced path): block_elems must be 128 (scale_dim = hidden/128)"
+        block_i32_fp8 = block_elems // 4  # fp8 i32 units per block (=32)
 
     @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
-    def ep_combine_s(arena: Int64, addr_tok_map: Int64, addr_comb_bar: Int64,
-                     addr_xdb_flag: Int64, addr_total_recv: Int64, addr_out: Int64,
-                     addr_out_wts: Int64, my_lsa_rank: Int32, cur_rank_num_token: Int32):
+    def ep_combine_s(
+        arena: Int64,
+        addr_tok_map: Int64,
+        addr_comb_bar: Int64,
+        addr_xdb_flag: Int64,
+        addr_total_recv: Int64,
+        addr_out: Int64,
+        addr_out_wts: Int64,
+        my_lsa_rank: Int32,
+        cur_rank_num_token: Int32,
+    ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid & 63
@@ -588,7 +853,9 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
         rsrc_tok_map = create_buffer_resource_from_addr(addr_tok_map)
         rsrc_comb_bar = create_buffer_resource_from_addr(addr_comb_bar)
         rsrc_total_recv = create_buffer_resource_from_addr(addr_total_recv)
-        rsrc_tis = create_buffer_resource_from_addr(fx.Int64(window.lsa_ptr(my_lsa_rank, off_tis)))
+        rsrc_tis = create_buffer_resource_from_addr(
+            fx.Int64(window.lsa_ptr(my_lsa_rank, off_tis))
+        )
         rsrc_out = create_buffer_resource_from_addr(addr_out)
         rsrc_out_wts = create_buffer_resource_from_addr(addr_out_wts)
         xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
@@ -598,11 +865,14 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
         src_tok_base = fx.Int64(window.lsa_ptr(my_lsa_rank, off_out_tok))
         for recv_slot in range(global_warp_id, total_recv, global_warp_num):
             # tis encodes origin = src_pe*max_tok_per_rank + local_id
-            encoded_origin = buffer_load(rsrc_tis, recv_slot, vec_width=1, dtype=T.i32())
+            encoded_origin = buffer_load(
+                rsrc_tis, recv_slot, vec_width=1, dtype=T.i32()
+            )
             origin_pe = encoded_origin // max_tok_per_rank
             origin_lid = encoded_origin % max_tok_per_rank
-            dst = (fx.Int64(window.lsa_ptr(origin_pe, off_comb_inp))
-                   + (fx.Int64(rank * max_tok_per_rank + origin_lid)) * fx.Int64(wire_nbytes))
+            dst = fx.Int64(window.lsa_ptr(origin_pe, off_comb_inp)) + (
+                fx.Int64(rank * max_tok_per_rank + origin_lid)
+            ) * fx.Int64(wire_nbytes)
             src = src_tok_base + fx.Int64(recv_slot) * fx.Int64(inp_nbytes)
             rsrc_src = create_buffer_resource_from_addr(src)
             rsrc_dst = create_buffer_resource_from_addr(dst)
@@ -615,41 +885,68 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
                 # writes, coalesced). scale = (amax>MAX)? amax/MAX : 1;
                 # quant = clamp(v*MAX/amax). Token sign sentinel: if ANY block
                 # scaled, negate block-0 scale.
-                scale_dst = (fx.Int64(window.lsa_ptr(origin_pe, off_comb_scales))
-                             + fx.Int64(rank * max_tok_per_rank + origin_lid)
-                             * fx.Int64(scale_dim) * fx.Int64(4))
+                scale_dst = fx.Int64(
+                    window.lsa_ptr(origin_pe, off_comb_scales)
+                ) + fx.Int64(rank * max_tok_per_rank + origin_lid) * fx.Int64(
+                    scale_dim
+                ) * fx.Int64(
+                    4
+                )
                 rsrc_scales = create_buffer_resource_from_addr(scale_dst)
                 fp8max = arith.constant(_FP8_MAX, type=T.f32())
                 nlim = arith.constant(-_FP8_MAX, type=T.f32())
-                any_scaled = arith.constant(0) != arith.constant(0)   # False (uniform)
+                any_scaled = arith.constant(0) != arith.constant(0)  # False (uniform)
                 for scale_block in range_constexpr(scale_dim):
-                    v2 = _bf16x2(buffer_load(rsrc_src, scale_block * 64 + lane, vec_width=1,
-                                             dtype=T.i32()))
+                    v2 = _bf16x2(
+                        buffer_load(
+                            rsrc_src,
+                            scale_block * 64 + lane,
+                            vec_width=1,
+                            dtype=T.i32(),
+                        )
+                    )
                     e0 = vector.extract(v2, static_position=[0])
                     e1 = vector.extract(v2, static_position=[1])
                     amax = _warp_amax(lane, arith.maximumf(_fabs(e0), _fabs(e1)))
                     scaled = amax > fp8max
                     any_scaled = arith.select(scaled, scaled, any_scaled)
-                    scale = arith.select(scaled, arith.divf(amax, fp8max),
-                                         arith.constant(1.0, type=T.f32()))
-                    inv = arith.select(scaled, arith.divf(fp8max, amax),
-                                       arith.constant(1.0, type=T.f32()))
+                    scale = arith.select(
+                        scaled,
+                        arith.divf(amax, fp8max),
+                        arith.constant(1.0, type=T.f32()),
+                    )
+                    inv = arith.select(
+                        scaled,
+                        arith.divf(fp8max, amax),
+                        arith.constant(1.0, type=T.f32()),
+                    )
                     if lane == 0:
                         buffer_store(scale, rsrc_scales, scale_block)
                     f0 = fmed3(T.f32(), arith.mulf(e0, inv), fp8max, nlim)
                     f1 = fmed3(T.f32(), arith.mulf(e1, inv), fp8max, nlim)
-                    my_packed = cvt_pk_fp8_f32(res=T.i32(), src_a=f0, src_b=f1,
-                                               old=arith.constant(0, type=T.i32()), word_sel=False)
+                    my_packed = cvt_pk_fp8_f32(
+                        res=T.i32(),
+                        src_a=f0,
+                        src_b=f1,
+                        old=arith.constant(0, type=T.i32()),
+                        word_sel=False,
+                    )
                     # neighbour (lane^1)'s 2 fp8 (its low 16) via ds_bpermute.
-                    nbr_packed = ds_bpermute(T.i32(), arith.unwrap((lane ^ arith.constant(1))
-                                                                   * arith.constant(4)),
-                                             arith.unwrap(my_packed))
+                    nbr_packed = ds_bpermute(
+                        T.i32(),
+                        arith.unwrap((lane ^ arith.constant(1)) * arith.constant(4)),
+                        arith.unwrap(my_packed),
+                    )
                     my_lo16 = my_packed & arith.constant(0xFFFF)
-                    packed_pair = my_lo16 | ((nbr_packed & arith.constant(0xFFFF))
-                                             << arith.constant(16))
+                    packed_pair = my_lo16 | (
+                        (nbr_packed & arith.constant(0xFFFF)) << arith.constant(16)
+                    )
                     if (lane & arith.constant(1)) == arith.constant(0):
-                        buffer_store(packed_pair, rsrc_dst,
-                                     scale_block * block_i32_fp8 + (lane >> arith.constant(1)))
+                        buffer_store(
+                            packed_pair,
+                            rsrc_dst,
+                            scale_block * block_i32_fp8 + (lane >> arith.constant(1)),
+                        )
                 if any_scaled:
                     if lane == 0:
                         s0 = buffer_load(rsrc_scales, 0, vec_width=1, dtype=T.f32())
@@ -658,14 +955,20 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
                 # 2 bf16 i32 -> v4f32 -> cvt_pk_fp8 x2 -> 1 fp8 i32
                 for elem in range(lane, wire_n_i32, 64):
                     bf = buffer_load(rsrc_src, elem * 2, vec_width=2, dtype=T.i32())
-                    v4 = vector.bitcast(T.VectorType.get([4], T.bf16()), bf).extf(_V4F32())
+                    v4 = vector.bitcast(T.VectorType.get([4], T.bf16()), bf).extf(
+                        _V4F32()
+                    )
                     f0 = vector.extract(v4, static_position=[0])
                     f1 = vector.extract(v4, static_position=[1])
                     f2 = vector.extract(v4, static_position=[2])
                     f3 = vector.extract(v4, static_position=[3])
                     z = arith.constant(0, type=T.i32())
-                    lo = cvt_pk_fp8_f32(res=T.i32(), src_a=f0, src_b=f1, old=z, word_sel=False)
-                    fp8 = cvt_pk_fp8_f32(res=T.i32(), src_a=f2, src_b=f3, old=lo, word_sel=True)
+                    lo = cvt_pk_fp8_f32(
+                        res=T.i32(), src_a=f0, src_b=f1, old=z, word_sel=False
+                    )
+                    fp8 = cvt_pk_fp8_f32(
+                        res=T.i32(), src_a=f2, src_b=f3, old=lo, word_sel=True
+                    )
                     buffer_store(fp8, rsrc_dst, elem)
             else:
                 for elem in range(lane, wire_n_i32, 64):
@@ -675,15 +978,26 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
                 # forward this recv slot's weights (dispatch put them in out_wts[recv_slot])
                 # to the ORIGIN's comb_wts[computing_rank*M + lid] (dedicated
                 # region; reusing out_wts would collide with dispatch's layout).
-                weight_src = (fx.Int64(window.lsa_ptr(my_lsa_rank, off_out_wts))
-                              + fx.Int64(recv_slot) * fx.Int64(experts_per_token) * fx.Int64(4))
-                weight_dst = (fx.Int64(window.lsa_ptr(origin_pe, off_comb_wts))
-                              + fx.Int64(rank * max_tok_per_rank + origin_lid)
-                              * fx.Int64(experts_per_token) * fx.Int64(4))
+                weight_src = fx.Int64(
+                    window.lsa_ptr(my_lsa_rank, off_out_wts)
+                ) + fx.Int64(recv_slot) * fx.Int64(experts_per_token) * fx.Int64(4)
+                weight_dst = fx.Int64(
+                    window.lsa_ptr(origin_pe, off_comb_wts)
+                ) + fx.Int64(rank * max_tok_per_rank + origin_lid) * fx.Int64(
+                    experts_per_token
+                ) * fx.Int64(
+                    4
+                )
                 if lane < experts_per_token:
-                    weight_val = buffer_load(create_buffer_resource_from_addr(weight_src), lane,
-                                             vec_width=1, dtype=T.i32())
-                    buffer_store(weight_val, create_buffer_resource_from_addr(weight_dst), lane)
+                    weight_val = buffer_load(
+                        create_buffer_resource_from_addr(weight_src),
+                        lane,
+                        vec_width=1,
+                        dtype=T.i32(),
+                    )
+                    buffer_store(
+                        weight_val, create_buffer_resource_from_addr(weight_dst), lane
+                    )
 
         # ── Stage 2: cross-device barrier ──
         # release Stage-1's P2P comb_inp writes before signaling peers (else
@@ -696,14 +1010,18 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
             P.spin_until_eq_i32(fx.Int64(addr_comb_bar), block_num)
             P.fence_system_acquire()
             buffer_store(arith.constant(0), rsrc_comb_bar, 0)
-            xdb_remote = (fx.Int64(window.lsa_ptr(grid_thread_id, off_xdb_mem))
-                          + fx.Int64(rank) * fx.Int64(8))
+            xdb_remote = fx.Int64(
+                window.lsa_ptr(grid_thread_id, off_xdb_mem)
+            ) + fx.Int64(rank) * fx.Int64(8)
             P.store_i64_system(xdb_remote, arith.constant(0), xdb_cur_flag)
         if grid_thread_id == 0:
-            P.atomic_add_global(fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64()))
+            P.atomic_add_global(
+                fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64())
+            )
         if tid < npes:
-            xdb_slot = (fx.Int64(window.lsa_ptr(my_lsa_rank, off_xdb_mem))
-                        + fx.Int64(tid) * fx.Int64(8))
+            xdb_slot = fx.Int64(window.lsa_ptr(my_lsa_rank, off_xdb_mem)) + fx.Int64(
+                tid
+            ) * fx.Int64(8)
             P.spin_until_eq_i64(xdb_slot, xdb_cur_flag)
             P.fence_system_acquire()
         fx.barrier()
@@ -714,10 +1032,17 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
 
         # ── Stage 3: local read of comb_inp + reduce ──
         comb_inp_base = fx.Int64(window.lsa_ptr(my_lsa_rank, off_comb_inp))
-        safe_tok = arith.select(cur_rank_num_token == arith.constant(0),
-                                arith.constant(1), cur_rank_num_token)
-        warps_per_tok = (arith.constant(global_warp_num) + safe_tok - arith.constant(1)) // safe_tok
-        units_per_warp = (arith.constant(wire_n_i32) + warps_per_tok - arith.constant(1)) // warps_per_tok
+        safe_tok = arith.select(
+            cur_rank_num_token == arith.constant(0),
+            arith.constant(1),
+            cur_rank_num_token,
+        )
+        warps_per_tok = (
+            arith.constant(global_warp_num) + safe_tok - arith.constant(1)
+        ) // safe_tok
+        units_per_warp = (
+            arith.constant(wire_n_i32) + warps_per_tok - arith.constant(1)
+        ) // warps_per_tok
         stage3_total = cur_rank_num_token * warps_per_tok
         for stage3_idx in range(global_warp_id, stage3_total, global_warp_num):
             tok_id = stage3_idx // warps_per_tok
@@ -729,21 +1054,30 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
             expert_pes = []
             expert_scales = []
             for k_slot in range_constexpr(experts_per_token):
-                encoded_k = buffer_load(rsrc_tok_map, tok_map_base + k_slot, vec_width=1,
-                                        dtype=T.i32())
+                encoded_k = buffer_load(
+                    rsrc_tok_map, tok_map_base + k_slot, vec_width=1, dtype=T.i32()
+                )
                 dest_pe = encoded_k // max_recv
                 valid = dest_pe < npes
                 safe_pe = arith.select(valid, dest_pe, arith.constant(rank))
                 # LOCAL comb_inp[computing_pe*M + tok_id]
-                src_addr = (comb_inp_base + (fx.Int64(safe_pe) * fx.Int64(max_tok_per_rank)
-                                             + fx.Int64(tok_id)) * fx.Int64(wire_nbytes))
+                src_addr = comb_inp_base + (
+                    fx.Int64(safe_pe) * fx.Int64(max_tok_per_rank) + fx.Int64(tok_id)
+                ) * fx.Int64(wire_nbytes)
                 expert_rsrcs.append(create_buffer_resource_from_addr(src_addr))
                 expert_valids.append(valid)
                 expert_pes.append(safe_pe)
                 if const_expr(fp8_blockwise):
-                    scale_addr = (fx.Int64(window.lsa_ptr(my_lsa_rank, off_comb_scales))
-                                  + (fx.Int64(safe_pe) * fx.Int64(max_tok_per_rank)
-                                     + fx.Int64(tok_id)) * fx.Int64(scale_dim) * fx.Int64(4))
+                    scale_addr = fx.Int64(
+                        window.lsa_ptr(my_lsa_rank, off_comb_scales)
+                    ) + (
+                        fx.Int64(safe_pe) * fx.Int64(max_tok_per_rank)
+                        + fx.Int64(tok_id)
+                    ) * fx.Int64(
+                        scale_dim
+                    ) * fx.Int64(
+                        4
+                    )
                     expert_scales.append(create_buffer_resource_from_addr(scale_addr))
             if const_expr(enable_weights):
                 if part_id == arith.constant(0):
@@ -751,17 +1085,28 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
                         weight_acc = arith.constant(0.0, type=T.f32())
                         for k_slot in range_constexpr(experts_per_token):
                             # LOCAL comb_wts[computing_pe*M + tok_id] (scattered in S1)
-                            weight_addr = (fx.Int64(window.lsa_ptr(my_lsa_rank, off_comb_wts))
-                                           + (fx.Int64(expert_pes[k_slot])
-                                              * fx.Int64(max_tok_per_rank) + fx.Int64(tok_id))
-                                           * fx.Int64(experts_per_token) * fx.Int64(4)
-                                           + fx.Int64(lane) * fx.Int64(4))
+                            weight_addr = (
+                                fx.Int64(window.lsa_ptr(my_lsa_rank, off_comb_wts))
+                                + (
+                                    fx.Int64(expert_pes[k_slot])
+                                    * fx.Int64(max_tok_per_rank)
+                                    + fx.Int64(tok_id)
+                                )
+                                * fx.Int64(experts_per_token)
+                                * fx.Int64(4)
+                                + fx.Int64(lane) * fx.Int64(4)
+                            )
                             weight_val = buffer_load(
-                                create_buffer_resource_from_addr(weight_addr), 0,
-                                vec_width=1, dtype=T.f32())
+                                create_buffer_resource_from_addr(weight_addr),
+                                0,
+                                vec_width=1,
+                                dtype=T.f32(),
+                            )
                             weight_acc = weight_acc + arith.select(
-                                expert_valids[k_slot], weight_val,
-                                arith.constant(0.0, type=T.f32()))
+                                expert_valids[k_slot],
+                                weight_val,
+                                arith.constant(0.0, type=T.f32()),
+                            )
                         buffer_store(weight_acc, rsrc_out_wts, tok_map_base + lane)
             rem = arith.constant(wire_n_i32) - unit_base
             eff = arith.select(rem < units_per_warp, rem, units_per_warp)
@@ -772,20 +1117,36 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
                 # blockwise: 4 fp8 per i32 unit are 4 consecutive elements in the
                 # same block -> one scale per unit. scale_block = (off*4)//block_elems.
                 if const_expr(fp8_blockwise):
-                    scale_block = (off * arith.constant(4)) // arith.constant(block_elems)
+                    scale_block = (off * arith.constant(4)) // arith.constant(
+                        block_elems
+                    )
                     is_b0 = scale_block == arith.constant(0)
                 for k_slot in range_constexpr(experts_per_token):
-                    v = buffer_load(expert_rsrcs[k_slot], off, vec_width=1, dtype=T.i32(),
-                                    cache_modifier=_s3_cache)
+                    v = buffer_load(
+                        expert_rsrcs[k_slot],
+                        off,
+                        vec_width=1,
+                        dtype=T.i32(),
+                        cache_modifier=_s3_cache,
+                    )
                     v = arith.select(expert_valids[k_slot], v, arith.constant(0))
                     if const_expr(fp8_blockwise):
-                        scale = buffer_load(expert_scales[k_slot], scale_block, vec_width=1,
-                                            dtype=T.f32())
-                        scale = arith.select(is_b0, _fabs(scale), scale)  # undo block-0 sign sentinel
+                        scale = buffer_load(
+                            expert_scales[k_slot],
+                            scale_block,
+                            vec_width=1,
+                            dtype=T.f32(),
+                        )
+                        scale = arith.select(
+                            is_b0, _fabs(scale), scale
+                        )  # undo block-0 sign sentinel
                         # invalid expert -> v already 0; force finite scale so a
                         # stale/garbage comb_scales slot can't make 0*NaN = NaN.
-                        scale = arith.select(expert_valids[k_slot], scale,
-                                             arith.constant(1.0, type=T.f32()))
+                        scale = arith.select(
+                            expert_valids[k_slot],
+                            scale,
+                            arith.constant(1.0, type=T.f32()),
+                        )
                         acc = acc + to_acc(v) * scale
                     else:
                         acc = acc + to_acc(v)
@@ -794,35 +1155,69 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
             def _loop():
                 for u in range(lane, eff, 64):
                     _one(unit_base + u)
+
             _loop()
 
     @flyc.jit
-    def run(arena: Int64, addr_tok_map: Int64, addr_comb_bar: Int64, addr_xdb_flag: Int64,
-            addr_total_recv: Int64, addr_out: Int64, addr_out_wts: Int64, my_lsa_rank: Int32,
-            cur_rank_num_token: Int32, stream=fx.Stream(None)):
-        ep_combine_s(arena, addr_tok_map, addr_comb_bar, addr_xdb_flag, addr_total_recv,
-                     addr_out, addr_out_wts, my_lsa_rank, cur_rank_num_token).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream)
+    def run(
+        arena: Int64,
+        addr_tok_map: Int64,
+        addr_comb_bar: Int64,
+        addr_xdb_flag: Int64,
+        addr_total_recv: Int64,
+        addr_out: Int64,
+        addr_out_wts: Int64,
+        my_lsa_rank: Int32,
+        cur_rank_num_token: Int32,
+        stream=fx.Stream(None),
+    ):
+        ep_combine_s(
+            arena,
+            addr_tok_map,
+            addr_comb_bar,
+            addr_xdb_flag,
+            addr_total_recv,
+            addr_out,
+            addr_out_wts,
+            my_lsa_rank,
+            cur_rank_num_token,
+        ).launch(
+            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream
+        )
 
     return run
 
+
 # ── StdMoE convert ────────────────────────────────────────────────────────
 
-def _to_accum2(i32_scalar):        # i32 (2 bf16) -> v2f32
-    return vector.bitcast(_V2BF16(), vector.from_elements(_V1I32(), [i32_scalar])).extf(_V2F32())
+
+def _to_accum2(i32_scalar):  # i32 (2 bf16) -> v2f32
+    return vector.bitcast(_V2BF16(), vector.from_elements(_V1I32(), [i32_scalar])).extf(
+        _V2F32()
+    )
 
 
-def _from_accum2(v2f32):           # v2f32 -> i32 (2 bf16)
-    return vector.extract(vector.bitcast(_V1I32(), v2f32.truncf(_V2BF16())), static_position=[0])
+def _from_accum2(v2f32):  # v2f32 -> i32 (2 bf16)
+    return vector.extract(
+        vector.bitcast(_V1I32(), v2f32.truncf(_V2BF16())), static_position=[0]
+    )
 
 
-def _splat2(f32_scalar):           # f32 -> v2f32 (broadcast)
+def _splat2(f32_scalar):  # f32 -> v2f32 (broadcast)
     return vector.from_elements(_V2F32(), [f32_scalar, f32_scalar])
 
 
-def make_convert_dispatch_output(*, rank, experts_per_rank, experts_per_token,
-                                 hidden_dim, hidden_elem_size, max_tok_per_expert,
-                                 block_num, warp_num_per_block):
+def make_convert_dispatch_output(
+    *,
+    rank,
+    experts_per_rank,
+    experts_per_token,
+    hidden_dim,
+    hidden_elem_size,
+    max_tok_per_expert,
+    block_num,
+    warp_num_per_block,
+):
     """Per-expert packing of dispatched tokens. One warp per (recv_tok, k_slot):
     lane0 bumps packed_cnt[localExpert] to claim a slot, then the warp copies the
     token embedding into packed_x[slot]."""
@@ -831,9 +1226,16 @@ def make_convert_dispatch_output(*, rank, experts_per_rank, experts_per_token,
     n_i32 = nbytes // 4
 
     @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
-    def convert_disp(addr_out_tok: Int64, addr_out_idx: Int64, addr_tis: Int64,
-                     addr_total_recv: Int64, addr_packed_x: Int64, addr_packed_cnt: Int64,
-                     addr_packed_src: Int64, addr_slot_map: Int64):
+    def convert_disp(
+        addr_out_tok: Int64,
+        addr_out_idx: Int64,
+        addr_tis: Int64,
+        addr_total_recv: Int64,
+        addr_packed_x: Int64,
+        addr_packed_cnt: Int64,
+        addr_packed_src: Int64,
+        addr_slot_map: Int64,
+    ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid & 63
@@ -845,7 +1247,6 @@ def make_convert_dispatch_output(*, rank, experts_per_rank, experts_per_token,
         rsrc_tis = create_buffer_resource_from_addr(addr_tis)
         rsrc_total_recv = create_buffer_resource_from_addr(addr_total_recv)
         rsrc_packed_src = create_buffer_resource_from_addr(addr_packed_src)
-        rsrc_slot_map = create_buffer_resource_from_addr(addr_slot_map)
 
         total_recv = buffer_load(rsrc_total_recv, 0, vec_width=1, dtype=T.i32())
         work_limit = total_recv * experts_per_token
@@ -855,27 +1256,38 @@ def make_convert_dispatch_output(*, rank, experts_per_rank, experts_per_token,
             local_expert = expert - arith.constant(rank * experts_per_rank)
             # MUST be unsigned ult: signed slt would treat negative local_expert
             # (non-local experts) as in-range and trigger an OOB copy.
-            is_local = arith.cmpi(arith.CmpIPredicate.ult, local_expert,
-                                  arith.constant(experts_per_rank))
+            is_local = arith.cmpi(
+                arith.CmpIPredicate.ult, local_expert, arith.constant(experts_per_rank)
+            )
             # lane0 claims a per-expert packing slot, then broadcasts.
             slot_lane0 = arith.constant(0)
             if lane == 0:
                 if is_local:
-                    cnt_addr = fx.Int64(addr_packed_cnt) + fx.Int64(local_expert) * fx.Int64(4)
+                    cnt_addr = fx.Int64(addr_packed_cnt) + fx.Int64(
+                        local_expert
+                    ) * fx.Int64(4)
                     slot_lane0 = P.atomic_add_global(cnt_addr, fx.Int32(1))
             slot = readlane(T.i32(), slot_lane0, 0)
             safe_local_expert = arith.select(is_local, local_expert, arith.constant(0))
-            packed_lin_idx = safe_local_expert * arith.constant(max_tok_per_expert) + slot
-            slot_val = arith.select(is_local, fx.Int64(packed_lin_idx),
-                                    arith.constant(-1, type=T.i64()))
+            packed_lin_idx = (
+                safe_local_expert * arith.constant(max_tok_per_expert) + slot
+            )
+            slot_val = arith.select(
+                is_local, fx.Int64(packed_lin_idx), arith.constant(-1, type=T.i64())
+            )
             if lane == 0:
-                P.store_i64_system(fx.Int64(addr_slot_map) + fx.Int64(i) * fx.Int64(8),
-                                   arith.constant(0), slot_val)
+                P.store_i64_system(
+                    fx.Int64(addr_slot_map) + fx.Int64(i) * fx.Int64(8),
+                    arith.constant(0),
+                    slot_val,
+                )
                 if is_local:
                     src = buffer_load(rsrc_tis, recv_tok, vec_width=1, dtype=T.i32())
                     buffer_store(src, rsrc_packed_src, packed_lin_idx)
             if is_local:
-                dst = fx.Int64(addr_packed_x) + fx.Int64(packed_lin_idx) * fx.Int64(nbytes)
+                dst = fx.Int64(addr_packed_x) + fx.Int64(packed_lin_idx) * fx.Int64(
+                    nbytes
+                )
                 src_t = fx.Int64(addr_out_tok) + fx.Int64(recv_tok) * fx.Int64(nbytes)
                 rsrc_dst = create_buffer_resource_from_addr(dst)
                 rsrc_src = create_buffer_resource_from_addr(src_t)
@@ -884,19 +1296,44 @@ def make_convert_dispatch_output(*, rank, experts_per_rank, experts_per_token,
                     buffer_store(v, rsrc_dst, chunk)
 
     @flyc.jit
-    def run(addr_out_tok: Int64, addr_out_idx: Int64, addr_tis: Int64, addr_total_recv: Int64,
-            addr_packed_x: Int64, addr_packed_cnt: Int64, addr_packed_src: Int64,
-            addr_slot_map: Int64, stream=fx.Stream(None)):
-        convert_disp(addr_out_tok, addr_out_idx, addr_tis, addr_total_recv, addr_packed_x,
-                     addr_packed_cnt, addr_packed_src, addr_slot_map).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream)
+    def run(
+        addr_out_tok: Int64,
+        addr_out_idx: Int64,
+        addr_tis: Int64,
+        addr_total_recv: Int64,
+        addr_packed_x: Int64,
+        addr_packed_cnt: Int64,
+        addr_packed_src: Int64,
+        addr_slot_map: Int64,
+        stream=fx.Stream(None),
+    ):
+        convert_disp(
+            addr_out_tok,
+            addr_out_idx,
+            addr_tis,
+            addr_total_recv,
+            addr_packed_x,
+            addr_packed_cnt,
+            addr_packed_src,
+            addr_slot_map,
+        ).launch(
+            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream
+        )
 
     return run
 
 
-def make_convert_combine_input(*, rank, experts_per_rank, experts_per_token,
-                               hidden_dim, hidden_elem_size, max_tok_per_expert,
-                               block_num, warp_num_per_block):
+def make_convert_combine_input(
+    *,
+    rank,
+    experts_per_rank,
+    experts_per_token,
+    hidden_dim,
+    hidden_elem_size,
+    max_tok_per_expert,
+    block_num,
+    warp_num_per_block,
+):
     """Inverse: reduce each recv token's local-expert outputs with routing
     weights back into out_tok (the combine input staging). Warp-partitioned over
     hidden; out_tok[recv_t][e] = sum_{k: slot_k valid} wts[k]*packed_x[slot_k][e]."""
@@ -905,8 +1342,13 @@ def make_convert_combine_input(*, rank, experts_per_rank, experts_per_token,
     n_i32 = nbytes // 4
 
     @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
-    def convert_comb(addr_out_tok: Int64, addr_out_wts: Int64, addr_total_recv: Int64,
-                     addr_packed_x: Int64, addr_slot_map: Int64):
+    def convert_comb(
+        addr_out_tok: Int64,
+        addr_out_wts: Int64,
+        addr_total_recv: Int64,
+        addr_packed_x: Int64,
+        addr_slot_map: Int64,
+    ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid & 63
@@ -915,13 +1357,18 @@ def make_convert_combine_input(*, rank, experts_per_rank, experts_per_token,
         global_warp_num = block_num * warp_num_per_block
 
         rsrc_out_wts = create_buffer_resource_from_addr(addr_out_wts)
-        rsrc_slot_map = create_buffer_resource_from_addr(addr_slot_map)
         rsrc_total_recv = create_buffer_resource_from_addr(addr_total_recv)
 
         total_recv = buffer_load(rsrc_total_recv, 0, vec_width=1, dtype=T.i32())
-        safe_recv = arith.select(total_recv == arith.constant(0), arith.constant(1), total_recv)
-        warps_per_tok = (arith.constant(global_warp_num) + safe_recv - arith.constant(1)) // safe_recv
-        units_per_warp = (arith.constant(n_i32) + warps_per_tok - arith.constant(1)) // warps_per_tok
+        safe_recv = arith.select(
+            total_recv == arith.constant(0), arith.constant(1), total_recv
+        )
+        warps_per_tok = (
+            arith.constant(global_warp_num) + safe_recv - arith.constant(1)
+        ) // safe_recv
+        units_per_warp = (
+            arith.constant(n_i32) + warps_per_tok - arith.constant(1)
+        ) // warps_per_tok
         stage_total = total_recv * warps_per_tok
         for stage_idx in range(global_warp_id, stage_total, global_warp_num):
             recv_tok = stage_idx // warps_per_tok
@@ -932,26 +1379,37 @@ def make_convert_combine_input(*, rank, experts_per_rank, experts_per_token,
             expert_valids = []
             expert_weights = []
             for k_slot in range_constexpr(experts_per_token):
-                slot = P.load_i64_acquire(fx.Int64(addr_slot_map)
-                                          + fx.Int64(slot_map_base + k_slot) * fx.Int64(8))
+                slot = P.load_i64_acquire(
+                    fx.Int64(addr_slot_map)
+                    + fx.Int64(slot_map_base + k_slot) * fx.Int64(8)
+                )
                 valid = slot != arith.constant(-1, type=T.i64())
                 safe_slot = arith.select(valid, slot, arith.constant(0, type=T.i64()))
                 x_addr = fx.Int64(addr_packed_x) + safe_slot * fx.Int64(nbytes)
                 expert_rsrcs.append(create_buffer_resource_from_addr(x_addr))
                 expert_valids.append(valid)
-                expert_weights.append(buffer_load(rsrc_out_wts, slot_map_base + k_slot,
-                                                  vec_width=1, dtype=T.f32()))
+                expert_weights.append(
+                    buffer_load(
+                        rsrc_out_wts, slot_map_base + k_slot, vec_width=1, dtype=T.f32()
+                    )
+                )
             rsrc_out = create_buffer_resource_from_addr(
-                fx.Int64(addr_out_tok) + fx.Int64(recv_tok) * fx.Int64(nbytes))
+                fx.Int64(addr_out_tok) + fx.Int64(recv_tok) * fx.Int64(nbytes)
+            )
             rem = arith.constant(n_i32) - unit_base
             eff = arith.select(rem < units_per_warp, rem, units_per_warp)
 
             def _one(off):
                 acc = _to_accum2(arith.constant(0))
                 for k_slot in range_constexpr(experts_per_token):
-                    v = buffer_load(expert_rsrcs[k_slot], off, vec_width=1, dtype=T.i32())
-                    weight_val = arith.select(expert_valids[k_slot], expert_weights[k_slot],
-                                              arith.constant(0.0, type=T.f32()))
+                    v = buffer_load(
+                        expert_rsrcs[k_slot], off, vec_width=1, dtype=T.i32()
+                    )
+                    weight_val = arith.select(
+                        expert_valids[k_slot],
+                        expert_weights[k_slot],
+                        arith.constant(0.0, type=T.f32()),
+                    )
                     # v2f32 vector * f32 scalar (broadcast), matching the
                     # FlyDSL reference _weighted_accum_experts.
                     acc = acc + _to_accum2(v) * weight_val
@@ -960,42 +1418,68 @@ def make_convert_combine_input(*, rank, experts_per_rank, experts_per_token,
             def _loop():
                 for u in range(lane, eff, 64):
                     _one(unit_base + u)
+
             _loop()
 
     @flyc.jit
-    def run(addr_out_tok: Int64, addr_out_wts: Int64, addr_total_recv: Int64,
-            addr_packed_x: Int64, addr_slot_map: Int64, stream=fx.Stream(None)):
-        convert_comb(addr_out_tok, addr_out_wts, addr_total_recv, addr_packed_x,
-                     addr_slot_map).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream)
+    def run(
+        addr_out_tok: Int64,
+        addr_out_wts: Int64,
+        addr_total_recv: Int64,
+        addr_packed_x: Int64,
+        addr_slot_map: Int64,
+        stream=fx.Stream(None),
+    ):
+        convert_comb(
+            addr_out_tok, addr_out_wts, addr_total_recv, addr_packed_x, addr_slot_map
+        ).launch(
+            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream
+        )
 
     return run
 
+
 # ── local expert count ────────────────────────────────────────────────────
 
-def make_local_expert_count(*, rank, experts_per_rank, experts_per_token,
-                            block_num, warp_num_per_block):
+
+def make_local_expert_count(
+    *, rank, experts_per_rank, experts_per_token, block_num, warp_num_per_block
+):
     expert_base = rank * experts_per_rank
     block_size = warp_num_per_block * 64
 
     @flyc.kernel(known_block_size=[block_size, 1, 1])
-    def local_expert_count_kernel(addr_out_idx: Int64, addr_total_recv: Int64, addr_count: Int64):
+    def local_expert_count_kernel(
+        addr_out_idx: Int64, addr_total_recv: Int64, addr_count: Int64
+    ):
         global_thread_id = fx.block_idx.x * block_size + fx.thread_idx.x
         global_thread_num = block_num * block_size
         rsrc_out_idx = create_buffer_resource_from_addr(addr_out_idx)
         rsrc_total_recv = create_buffer_resource_from_addr(addr_total_recv)
-        limit = buffer_load(rsrc_total_recv, 0, vec_width=1, dtype=T.i32()) * experts_per_token
+        limit = (
+            buffer_load(rsrc_total_recv, 0, vec_width=1, dtype=T.i32())
+            * experts_per_token
+        )
         for i in range(global_thread_id, limit, global_thread_num):
-            local_expert = buffer_load(rsrc_out_idx, i, vec_width=1, dtype=T.i32()) - expert_base
+            local_expert = (
+                buffer_load(rsrc_out_idx, i, vec_width=1, dtype=T.i32()) - expert_base
+            )
             if local_expert >= 0:
                 if local_expert < experts_per_rank:
-                    P.atomic_add_global(fx.Int64(addr_count) + fx.Int64(local_expert) * fx.Int64(4),
-                                        fx.Int32(1))
+                    P.atomic_add_global(
+                        fx.Int64(addr_count) + fx.Int64(local_expert) * fx.Int64(4),
+                        fx.Int32(1),
+                    )
 
     @flyc.jit
-    def run(addr_out_idx: Int64, addr_total_recv: Int64, addr_count: Int64,
-            stream=fx.Stream(None)):
+    def run(
+        addr_out_idx: Int64,
+        addr_total_recv: Int64,
+        addr_count: Int64,
+        stream=fx.Stream(None),
+    ):
         local_expert_count_kernel(addr_out_idx, addr_total_recv, addr_count).launch(
-            grid=(block_num, 1, 1), block=[block_size, 1, 1], stream=stream)
+            grid=(block_num, 1, 1), block=[block_size, 1, 1], stream=stream
+        )
 
     return run

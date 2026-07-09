@@ -59,19 +59,29 @@ def _run(extra_env, timeout=600):
     env.update({k: str(v) for k, v in extra_env.items()})
     env.setdefault("SWEEP", _SWEEP)
     cmd = [
-        sys.executable, "-m", "torch.distributed.run",
-        "--standalone", f"--nproc_per_node={_NPROC}", _TEST_OP,
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={_NPROC}",
+        _TEST_OP,
     ]
     proc = subprocess.run(
-        cmd, cwd=_HERE, env=env, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True, timeout=timeout,
+        cmd,
+        cwd=_HERE,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
     )
     return proc.returncode, proc.stdout
 
 
 def _assert_all_pass(rc, out):
-    results = [ln for ln in out.splitlines()
-               if "ct=" in ln and ("PASS" in ln or "FAIL" in ln)]
+    results = [
+        ln for ln in out.splitlines() if "ct=" in ln and ("PASS" in ln or "FAIL" in ln)
+    ]
     assert results, f"no OP result lines found (rc={rc}); output:\n{out}"
     fails = [ln for ln in results if "FAIL" in ln]
     assert not fails, "FAIL(s):\n" + "\n".join(fails) + f"\n\nfull output:\n{out}"
@@ -94,32 +104,46 @@ def _cases():
     yield pytest.param({"DTYPE": "f32", "COMBINE": "scatter"}, id="f32-scatter")
     yield pytest.param(  # fp4 gather (tuned schedule), gfx950-only
         {"DTYPE": "fp4", "COMBINE": "gather", "TUNED": 1},
-        id="fp4-gather", marks=_skip_fp4,
+        id="fp4-gather",
+        marks=_skip_fp4,
     )
     # plain fp8 token dtype (gather-only), any arch (fnuz on gfx942, OCP on gfx950)
     yield pytest.param({"DTYPE": "fp8", "COMBINE": "gather"}, id="fp8-gather")
-    yield pytest.param({"DTYPE": "fp8", "COMBINE": "gather", "TUNED": 1}, id="fp8-gather-tuned")
+    yield pytest.param(
+        {"DTYPE": "fp8", "COMBINE": "gather", "TUNED": 1}, id="fp8-gather-tuned"
+    )
     # quant paths (scatter-only, compress-on-write)
-    yield pytest.param({"DTYPE": "bf16", "COMBINE": "scatter",
-                        "QUANT": "fp8_direct_cast"}, id="bf16-scatter-fp8direct")
-    yield pytest.param({"DTYPE": "bf16", "COMBINE": "scatter",
-                        "QUANT": "fp8_blockwise"}, id="bf16-scatter-fp8blockwise")
+    yield pytest.param(
+        {"DTYPE": "bf16", "COMBINE": "scatter", "QUANT": "fp8_direct_cast"},
+        id="bf16-scatter-fp8direct",
+    )
+    yield pytest.param(
+        {"DTYPE": "bf16", "COMBINE": "scatter", "QUANT": "fp8_blockwise"},
+        id="bf16-scatter-fp8blockwise",
+    )
     # per-token scale forwarding (v1 uses scale_dim=32), on both combine modes
-    yield pytest.param({"DTYPE": "bf16", "COMBINE": "gather", "SCALE_DIM": 32},
-                       id="bf16-gather-scales")
-    yield pytest.param({"DTYPE": "bf16", "COMBINE": "scatter", "SCALE_DIM": 32},
-                       id="bf16-scatter-scales")
+    yield pytest.param(
+        {"DTYPE": "bf16", "COMBINE": "gather", "SCALE_DIM": 32}, id="bf16-gather-scales"
+    )
+    yield pytest.param(
+        {"DTYPE": "bf16", "COMBINE": "scatter", "SCALE_DIM": 32},
+        id="bf16-scatter-scales",
+    )
     # topk variations (topk=9 is the shared-experts-fusion / AccumNum=9 path)
     for k in (4, 9):
-        yield pytest.param({"DTYPE": "bf16", "COMBINE": "gather", "TOPK": k},
-                           id=f"bf16-gather-topk{k}")
+        yield pytest.param(
+            {"DTYPE": "bf16", "COMBINE": "gather", "TOPK": k}, id=f"bf16-gather-topk{k}"
+        )
     # feature paths
-    yield pytest.param({"DTYPE": "bf16", "COMBINE": "gather", "TUNED": 1},
-                       id="bf16-gather-tuned")
-    yield pytest.param({"DTYPE": "bf16", "COMBINE": "gather", "REPLAY": 1},
-                       id="bf16-gather-replay")
-    yield pytest.param({"DTYPE": "bf16", "COMBINE": "gather", "STDMOE": 1},
-                       id="bf16-stdmoe")
+    yield pytest.param(
+        {"DTYPE": "bf16", "COMBINE": "gather", "TUNED": 1}, id="bf16-gather-tuned"
+    )
+    yield pytest.param(
+        {"DTYPE": "bf16", "COMBINE": "gather", "REPLAY": 1}, id="bf16-gather-replay"
+    )
+    yield pytest.param(
+        {"DTYPE": "bf16", "COMBINE": "gather", "STDMOE": 1}, id="bf16-stdmoe"
+    )
 
 
 @pytest.mark.parametrize("env", list(_cases()))

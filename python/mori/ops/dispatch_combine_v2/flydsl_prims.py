@@ -1,3 +1,24 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """Shared FlyDSL device primitives for the cco-LSA dispatch/combine kernels.
 
 Thin wrappers over flydsl._mlir.dialects.llvm for system-scope atomics / ordered
@@ -12,13 +33,23 @@ from flydsl.expr import arith
 from flydsl.expr.typing import T
 import flydsl.expr as fx
 
-_I64 = lambda: ir.IntegerType.get_signless(64)
-_I32 = lambda: ir.IntegerType.get_signless(32)
-_NUW = lambda: ir.Attribute.parse("#llvm.overflow<none>")
+
+def _I64():
+    return ir.IntegerType.get_signless(64)
+
+
+def _I32():
+    return ir.IntegerType.get_signless(32)
+
+
+def _NUW():
+    return ir.Attribute.parse("#llvm.overflow<none>")
 
 
 def _gptr(addr_i64):
-    return _llvm_d.IntToPtrOp(_llvm_d.PointerType.get(address_space=1), arith.unwrap(addr_i64)).result
+    return _llvm_d.IntToPtrOp(
+        _llvm_d.PointerType.get(address_space=1), arith.unwrap(addr_i64)
+    ).result
 
 
 def _addr_plus(base_i64, offset, elem_bytes):
@@ -33,24 +64,38 @@ def _addr_plus(base_i64, offset, elem_bytes):
 
 def atomic_add_global(addr_i64, val):
     """Monotonic remote global fetch-and-add at addr_i64; returns old (i64/i32 per val)."""
-    return _llvm_d.AtomicRMWOp(_llvm_d.AtomicBinOp.add, _gptr(addr_i64), arith.unwrap(val),
-                               _llvm_d.AtomicOrdering.monotonic).res
+    return _llvm_d.AtomicRMWOp(
+        _llvm_d.AtomicBinOp.add,
+        _gptr(addr_i64),
+        arith.unwrap(val),
+        _llvm_d.AtomicOrdering.monotonic,
+    ).res
 
 
 def store_i32_system(addr_i64, offset, val):
     """System-release i32 store at addr + offset*4."""
     addr = _addr_plus(addr_i64, offset, 4)
     gptr = _llvm_d.IntToPtrOp(_llvm_d.PointerType.get(address_space=1), addr).result
-    _llvm_d.StoreOp(arith.unwrap(val), gptr, alignment=4,
-                    ordering=_llvm_d.AtomicOrdering.release, syncscope="one-as")
+    _llvm_d.StoreOp(
+        arith.unwrap(val),
+        gptr,
+        alignment=4,
+        ordering=_llvm_d.AtomicOrdering.release,
+        syncscope="one-as",
+    )
 
 
 def store_i64_system(addr_i64, offset, val):
     """System-release i64 store at addr + offset*8."""
     addr = _addr_plus(addr_i64, offset, 8)
     gptr = _llvm_d.IntToPtrOp(_llvm_d.PointerType.get(address_space=1), addr).result
-    _llvm_d.StoreOp(arith.unwrap(val), gptr, alignment=8,
-                    ordering=_llvm_d.AtomicOrdering.release, syncscope="one-as")
+    _llvm_d.StoreOp(
+        arith.unwrap(val),
+        gptr,
+        alignment=8,
+        ordering=_llvm_d.AtomicOrdering.release,
+        syncscope="one-as",
+    )
 
 
 def fence_system_acquire():
@@ -73,15 +118,27 @@ def load_i32_acquire(addr_i64):
     LICM, making the loop spin forever on a stale value.
     """
     gptr = _gptr(addr_i64)
-    return _llvm_d.LoadOp(_I32(), gptr, alignment=4, volatile_=True,
-                          ordering=_llvm_d.AtomicOrdering.monotonic, syncscope="one-as").res
+    return _llvm_d.LoadOp(
+        _I32(),
+        gptr,
+        alignment=4,
+        volatile_=True,
+        ordering=_llvm_d.AtomicOrdering.monotonic,
+        syncscope="one-as",
+    ).res
 
 
 def load_i64_acquire(addr_i64):
     """Volatile monotonic i64 load at addr_i64 (global addrspace 1)."""
     gptr = _gptr(addr_i64)
-    return _llvm_d.LoadOp(_I64(), gptr, alignment=8, volatile_=True,
-                          ordering=_llvm_d.AtomicOrdering.monotonic, syncscope="one-as").res
+    return _llvm_d.LoadOp(
+        _I64(),
+        gptr,
+        alignment=8,
+        volatile_=True,
+        ordering=_llvm_d.AtomicOrdering.monotonic,
+        syncscope="one-as",
+    ).res
 
 
 def load_i32_nt(base_i64, offset):
