@@ -29,6 +29,7 @@
 #include <thread>
 #include <vector>
 
+#include "umbp/codec/kv_encoding.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 
 namespace mori::umbp {
@@ -62,6 +63,21 @@ std::optional<PeerDramAllocator::PendingSlot> AllocateOk(PeerDramAllocator& a,
   return a.Allocate(key, size, tier).slot;
 }
 
+KvEncodingDescriptor TestEncoding(uint64_t stored_bytes) {
+  KvEncodingDescriptor d = RawKvEncoding(stored_bytes, KvDType::BF16);
+  d.kind = KvEncodingKind::TURBOQUANT;
+  d.preset = "turboquant_k8v4";
+  d.key_bits = 8;
+  d.value_bits = 4;
+  d.head_dim = 128;
+  d.block_size = 16;
+  d.num_layers = 2;
+  d.num_tokens = 16;
+  d.num_heads = 1;
+  d.hidden_dim = 128;
+  return d;
+}
+
 }  // namespace
 
 // ---- Allocate / Commit / Resolve happy path ---------------------------------
@@ -88,6 +104,31 @@ TEST(PeerDramAllocator, CommitMakesKeyResolvable) {
   EXPECT_EQ(events[0].key, "key-1");
   EXPECT_EQ(events[0].size, kPageSize);
   EXPECT_EQ(events[0].tier, TierType::DRAM);
+}
+
+TEST(PeerDramAllocator, EncodingDescriptorSurvivesCommitResolveAndSnapshot) {
+  auto a = MakeAllocator();
+  auto encoding = TestEncoding(kPageSize);
+
+  auto result = a->Allocate("encoded", kPageSize, TierType::DRAM, encoding);
+  ASSERT_EQ(result.outcome, PeerDramAllocator::Outcome::kSuccessAllocated);
+  ASSERT_TRUE(result.slot.has_value());
+  EXPECT_EQ(result.slot->encoding, encoding);
+
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(result.slot->slot_id, "encoded", committed_bytes));
+
+  auto resolved = a->Resolve("encoded");
+  ASSERT_TRUE(resolved.found);
+  EXPECT_EQ(resolved.encoding, encoding);
+
+  auto events = a->DrainPendingEvents();
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].encoding, encoding);
+
+  auto snapshot = a->SnapshotOwnedKeys();
+  ASSERT_EQ(snapshot.size(), 1u);
+  EXPECT_EQ(snapshot[0].encoding, encoding);
 }
 
 // ---- Allocate-side dedup ----------------------------------------------------

@@ -96,6 +96,7 @@ message AllocateSlotRequest {
   uint64   size = 1;
   TierType tier = 2;
   string   key  = 3;  // owned_ dedup (master-index-lag fallback)
+  KvEncodingDescriptor encoding = 4;
 }
 // AllocateSlot / BatchAllocateSlots per-entry outcome.
 // FAILED_NO_SPACE is split out so the writer can keep retrying with
@@ -150,6 +151,7 @@ message ResolveKeyResponse {
   uint64 page_size = 3;
   repeated BufferMemoryDesc descs = 4;
   uint64 size      = 5;
+  KvEncodingDescriptor encoding = 6;
 }
 
 // Master-driven eviction.  Idempotent: already-evicted keys produce a
@@ -228,4 +230,7 @@ message BatchResolveKeysResponse {
   // (buffer_index, page_index) pairs, walking keys in order.
   repeated uint32 buffer_index = 7;
   repeated uint32 page_index   = 8;
+  // Per-key encoding descriptors, parallel to found/tier/size. Older peers may
+  // omit this; clients treat missing descriptors as raw bytes.
+  repeated KvEncodingDescriptor encoding = 9;
 }

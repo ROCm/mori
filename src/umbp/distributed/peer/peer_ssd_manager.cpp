@@ -25,6 +25,7 @@
 #include <stdexcept>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/codec/kv_encoding.h"
 #include "umbp/local/tiers/spdk_proxy_tier.h"
 #include "umbp/local/tiers/ssd_tier.h"
 #include "umbp/local/tiers/tier_backend.h"
@@ -132,6 +133,12 @@ void PeerSsdManager::TouchLocked(const std::string& key) {
 bool PeerSsdManager::Write(const std::string& key,
                            const std::vector<std::pair<const void*, size_t>>& segments,
                            size_t total_size) {
+  return Write(key, segments, total_size, RawKvEncoding(total_size));
+}
+
+bool PeerSsdManager::Write(const std::string& key,
+                           const std::vector<std::pair<const void*, size_t>>& segments,
+                           size_t total_size, const KvEncodingDescriptor& encoding) {
   if (!backend_) return false;
 
   // Optimization, not just defense: the DRAM pin only dedups *concurrent*
@@ -197,8 +204,12 @@ bool PeerSsdManager::Write(const std::string& key,
       TouchLocked(key);
     } else {
       lru_.push_front(key);
-      owned_.emplace(key, OwnedEntry{total_size, lru_.begin()});
-      pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, total_size});
+      KvEncodingDescriptor stored_encoding = encoding;
+      if (stored_encoding.stored_bytes == 0) stored_encoding.stored_bytes = total_size;
+      if (stored_encoding.logical_bytes == 0) stored_encoding.logical_bytes = stored_encoding.stored_bytes;
+      owned_.emplace(key, OwnedEntry{total_size, stored_encoding, lru_.begin()});
+      pending_events_.push_back(
+          KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, total_size, stored_encoding});
     }
   }
 
@@ -417,7 +428,7 @@ std::vector<KvEvent> PeerSsdManager::SnapshotOwnedKeysLocked() const {
   std::vector<KvEvent> out;
   out.reserve(owned_.size());
   for (const auto& [key, entry] : owned_) {
-    out.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, entry.size});
+    out.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, entry.size, entry.encoding});
   }
   return out;
 }

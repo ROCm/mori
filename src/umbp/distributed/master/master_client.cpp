@@ -35,6 +35,7 @@
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/master/rpc_latency_timer.h"
+#include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/peer/peer_ssd_manager.h"
 
@@ -108,6 +109,7 @@ void FillBundle(::umbp::EventBundle* dst, const EventBundle& src) {
     pe->set_key(ev.key);
     pe->set_tier(ToProtoTier(ev.tier));
     pe->set_size(ev.size);
+    FillProtoKvEncoding(ev.encoding, pe->mutable_encoding());
   }
 }
 
@@ -258,6 +260,7 @@ grpc::Status MasterClient::RouteGet(const std::string& key,
   r.node_id = resp.node_id();
   r.tier = FromProtoTier(resp.tier());
   r.size = resp.size();
+  r.encoding = KvEncodingFromProto(resp.encoding(), r.size);
   r.peer_address = resp.peer_address();
   *out_result = std::move(r);
   return grpc::Status::OK;
@@ -333,7 +336,8 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
   // Columnar response: node_ref[i] is a 1-based index into resp.nodes()
   // (0 = not found); tier[i] / size[i] are parallel per-key arrays.
   const int n = resp.node_ref_size();
-  if (resp.tier_size() != n || resp.size_size() != n) {
+  if (resp.tier_size() != n || resp.size_size() != n ||
+      (resp.encoding_size() != 0 && resp.encoding_size() != n)) {
     return grpc::Status(grpc::StatusCode::INTERNAL,
                         "BatchRouteGet: malformed columnar response (array length mismatch)");
   }
@@ -349,6 +353,8 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
     r.node_id = node.node_id();
     r.tier = FromProtoTier(resp.tier(i));
     r.size = resp.size(i);
+    r.encoding =
+        resp.encoding_size() == n ? KvEncodingFromProto(resp.encoding(i), r.size) : RawKvEncoding(r.size);
     r.peer_address = node.peer_address();
     (*out)[i] = std::move(r);
   }

@@ -37,6 +37,60 @@ enum class TierType : int {
   SSD = 3,
 };
 
+enum class KvEncodingKind : int {
+  UNKNOWN = 0,
+  RAW = 1,
+  TURBOQUANT = 2,
+};
+
+enum class KvDType : int {
+  UNKNOWN = 0,
+  FP16 = 1,
+  BF16 = 2,
+  FP8 = 3,
+  UINT8 = 4,
+};
+
+// Semantic descriptor for the bytes stored under one KV key. Mori-IO still moves
+// opaque byte ranges; this descriptor is UMBP/client-layer metadata that lets the
+// consumer know how to interpret those bytes.
+struct KvEncodingDescriptor {
+  uint32_t schema_version = 1;
+  KvEncodingKind kind = KvEncodingKind::RAW;
+  KvDType original_dtype = KvDType::UNKNOWN;
+  std::string preset;
+
+  uint32_t key_bits = 0;
+  uint32_t value_bits = 0;
+  uint32_t head_dim = 0;
+  uint32_t block_size = 0;
+  uint32_t num_layers = 0;
+  uint32_t num_tokens = 0;
+  uint32_t num_heads = 0;
+  uint32_t hidden_dim = 0;
+  uint32_t skip_first_layers = 0;
+  uint32_t skip_last_layers = 0;
+  uint32_t packing_version = 1;
+
+  uint64_t stored_bytes = 0;
+  uint64_t logical_bytes = 0;
+
+  bool operator==(const KvEncodingDescriptor& other) const {
+    return schema_version == other.schema_version && kind == other.kind &&
+           original_dtype == other.original_dtype && preset == other.preset &&
+           key_bits == other.key_bits && value_bits == other.value_bits &&
+           head_dim == other.head_dim && block_size == other.block_size &&
+           num_layers == other.num_layers && num_tokens == other.num_tokens &&
+           num_heads == other.num_heads && hidden_dim == other.hidden_dim &&
+           skip_first_layers == other.skip_first_layers &&
+           skip_last_layers == other.skip_last_layers &&
+           packing_version == other.packing_version && stored_bytes == other.stored_bytes &&
+           logical_bytes == other.logical_bytes;
+  }
+
+  bool operator!=(const KvEncodingDescriptor& other) const { return !(*this == other); }
+};
+
 struct TierCapacity {
   uint64_t total_bytes = 0;
   uint64_t available_bytes = 0;
@@ -55,9 +109,11 @@ struct Location {
   std::string node_id;
   uint64_t size = 0;
   TierType tier = TierType::UNKNOWN;
+  KvEncodingDescriptor encoding;
 
   bool operator==(const Location& other) const {
-    return node_id == other.node_id && size == other.size && tier == other.tier;
+    return node_id == other.node_id && size == other.size && tier == other.tier &&
+           encoding == other.encoding;
   }
 };
 
@@ -111,6 +167,7 @@ struct KvEvent {
   std::string key;
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;  // ADD only; REMOVE leaves this 0
+  KvEncodingDescriptor encoding;
 };
 
 struct EventBundle {

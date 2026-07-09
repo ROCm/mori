@@ -67,6 +67,7 @@ struct RouteGetResult {
   std::string node_id;
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;
+  KvEncodingDescriptor encoding;
   std::string peer_address;
 };
 

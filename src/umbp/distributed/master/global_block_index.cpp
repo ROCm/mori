@@ -130,6 +130,9 @@ size_t ApplyAddOrRemoveLocked(EntryMap& entries, NodeToKeys& node_to_keys,
       return 0;
     }
     loc->size = ev.size;
+    loc->encoding = ev.encoding;
+    if (loc->encoding.stored_bytes == 0) loc->encoding.stored_bytes = ev.size;
+    if (loc->encoding.logical_bytes == 0) loc->encoding.logical_bytes = loc->encoding.stored_bytes;
     return 1;
   }
   // REMOVE
@@ -222,6 +225,9 @@ void GlobalBlockIndex::ReplaceNodeLocations(const std::string& node_id,
       auto [loc, inserted] = FindOrInsertLocation(entry, node_id, ev->tier);
       (void)inserted;
       loc->size = ev->size;
+      loc->encoding = ev->encoding;
+      if (loc->encoding.stored_bytes == 0) loc->encoding.stored_bytes = ev->size;
+      if (loc->encoding.logical_bytes == 0) loc->encoding.logical_bytes = loc->encoding.stored_bytes;
       sh.node_to_keys[node_id].insert(ev->key);
     }
   }

@@ -12,6 +12,40 @@ enum TierType {
   TIER_SSD     = 3;   // NVMe SSD
 }
 
+enum KvEncodingKind {
+  KV_ENCODING_UNKNOWN    = 0;
+  KV_ENCODING_RAW        = 1;
+  KV_ENCODING_TURBOQUANT = 2;
+}
+
+enum KvDType {
+  KV_DTYPE_UNKNOWN = 0;
+  KV_DTYPE_FP16    = 1;
+  KV_DTYPE_BF16    = 2;
+  KV_DTYPE_FP8     = 3;
+  KV_DTYPE_UINT8   = 4;
+}
+
+message KvEncodingDescriptor {
+  uint32 schema_version    = 1;
+  KvEncodingKind kind      = 2;
+  KvDType original_dtype   = 3;
+  string preset            = 4;
+  uint32 key_bits          = 5;
+  uint32 value_bits        = 6;
+  uint32 head_dim          = 7;
+  uint32 block_size        = 8;
+  uint32 num_layers        = 9;
+  uint32 num_tokens        = 10;
+  uint32 num_heads         = 11;
+  uint32 hidden_dim        = 12;
+  uint32 skip_first_layers = 13;
+  uint32 skip_last_layers  = 14;
+  uint32 packing_version   = 15;
+  uint64 stored_bytes      = 16;
+  uint64 logical_bytes     = 17;
+}
+
 // Per-tier capacity reported by a peer node.  Master treats every value
 // as ground truth and applies it unconditionally — the peer's allocator
 // is the single source of physical capacity.
@@ -86,6 +120,7 @@ message KvEvent {
   string        key   = 2;
   TierType      tier  = 3;
   uint64        size  = 4;   // ADD only
+  KvEncodingDescriptor encoding = 5; // ADD only; absent/zero means raw bytes
 }
 
 message EventBundle {
@@ -144,6 +179,7 @@ message RouteGetResponse {
   TierType tier         = 3;
   uint64   size         = 4;
   string   peer_address = 5;
+  KvEncodingDescriptor encoding = 6;
 }
 
 // ============================================================
@@ -198,6 +234,7 @@ message BatchRouteGetResponse {
   repeated uint32   node_ref = 2;  // per key; 1-based index into nodes, 0 = not found  [packed]
   repeated TierType tier     = 3;  // per key  [packed]
   repeated uint64   size     = 4;  // per key  [packed]
+  repeated KvEncodingDescriptor encoding = 5; // per key; default raw when absent
 }
 
 // Read-only batched existence probe.  Unlike BatchRouteGet, this does

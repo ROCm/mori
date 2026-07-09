@@ -205,6 +205,17 @@ target_compile_features(test_ssd_read_lease_gating PRIVATE cxx_std_17)
 gtest_discover_tests(test_ssd_read_lease_gating)
 
 # ---------------------------------------------------------------------------
+# test_kv_encoding — raw/TurboQuant descriptor validation and byte sizing.
+# ---------------------------------------------------------------------------
+add_executable(test_kv_encoding test_kv_encoding.cpp)
+
+target_link_libraries(test_kv_encoding PRIVATE umbp_common GTest::gtest_main)
+
+target_compile_features(test_kv_encoding PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_kv_encoding)
+
+# ---------------------------------------------------------------------------
 # test_ssd_reliability — cross-component reliability: owned-source DRAM+SSD
 # merge, SSD evict -> REMOVE -> master index convergence, tier-priority over the
 # real index, crash-restart discard, and observability counters.

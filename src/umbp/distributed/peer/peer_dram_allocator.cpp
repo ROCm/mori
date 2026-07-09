@@ -28,6 +28,7 @@
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/codec/kv_encoding.h"
 
 namespace mori::umbp {
 
@@ -101,12 +102,18 @@ const PageBitmapAllocator* PeerDramAllocator::AllocatorForLocked(TierType tier) 
 
 PeerDramAllocator::AllocateResult PeerDramAllocator::Allocate(const std::string& key, uint64_t size,
                                                               TierType tier) {
+  return Allocate(key, size, tier, RawKvEncoding(size));
+}
+
+PeerDramAllocator::AllocateResult PeerDramAllocator::Allocate(
+    const std::string& key, uint64_t size, TierType tier, const KvEncodingDescriptor& encoding) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return AllocateLocked(key, size, tier);
+  return AllocateLocked(key, size, tier, encoding);
 }
 
 PeerDramAllocator::AllocateResult PeerDramAllocator::AllocateLocked(const std::string& key,
-                                                                    uint64_t size, TierType tier) {
+                                                                    uint64_t size, TierType tier,
+                                                                    const KvEncodingDescriptor& encoding) {
   auto fail = [&](Outcome outcome, const char* reason) {
     MORI_UMBP_WARN("[PeerDramAllocator] Allocate reason={} key='{}' size={} tier={}", reason, key,
                    size, static_cast<int>(tier));
@@ -145,6 +152,9 @@ PeerDramAllocator::AllocateResult PeerDramAllocator::AllocateLocked(const std::s
   slot.tier = tier;
   slot.pages = std::move(*pages);
   slot.size = size;
+  slot.encoding = encoding;
+  if (slot.encoding.stored_bytes == 0) slot.encoding.stored_bytes = size;
+  if (slot.encoding.logical_bytes == 0) slot.encoding.logical_bytes = slot.encoding.stored_bytes;
   slot.deadline = std::chrono::steady_clock::now() + pending_ttl_;
   slot.generation = allocator_generation_;
   pending_[slot.slot_id] = slot;
@@ -160,7 +170,7 @@ std::vector<PeerDramAllocator::BatchAllocateResult> PeerDramAllocator::BatchAllo
   std::lock_guard<std::mutex> lock(mutex_);
   for (size_t i = 0; i < entries.size(); ++i) {
     const auto& entry = entries[i];
-    auto result = AllocateLocked(entry.key, entry.size, entry.tier);
+    auto result = AllocateLocked(entry.key, entry.size, entry.tier, entry.encoding);
     out[i].outcome = result.outcome;
     out[i].slot = std::move(result.slot);
     if (out[i].outcome == Outcome::kSuccessAllocated && out[i].slot.has_value()) {
@@ -219,7 +229,8 @@ bool PeerDramAllocator::CommitLocked(uint64_t slot_id, const std::string& key,
   owned.tier = it->second.tier;
   owned.pages = std::move(it->second.pages);
   owned.size = it->second.size;
-  QueueEventLocked(KvEvent{KvEvent::Kind::ADD, key, owned.tier, owned.size});
+  owned.encoding = it->second.encoding;
+  QueueEventLocked(KvEvent{KvEvent::Kind::ADD, key, owned.tier, owned.size, owned.encoding});
   owned_[key] = std::move(owned);
   pending_.erase(it);
   bytes_committed = owned_[key].size;
@@ -276,6 +287,7 @@ PeerDramAllocator::ResolveResult PeerDramAllocator::Resolve(const std::string& k
   r.tier = it->second.tier;
   r.pages = it->second.pages;
   r.size = it->second.size;
+  r.encoding = it->second.encoding;
   // Extend the read lease so concurrent Evict reports bytes_freed=0 for
   // this key.  steady_clock is monotonic and read_lease_ttl_ is fixed,
   // so this assignment is always >= any previous deadline for the key.
@@ -297,6 +309,7 @@ std::vector<PeerDramAllocator::ResolvedEntry> PeerDramAllocator::BatchResolve(
     entry.tier = it->second.tier;
     entry.pages = it->second.pages;
     entry.size = it->second.size;
+    entry.encoding = it->second.encoding;
     if (include_descs) {
       entry.descs = BuildBufferDescsLocked(it->second.tier, it->second.pages);
     }
@@ -360,6 +373,7 @@ std::optional<PeerDramAllocator::DramCopyPin> PeerDramAllocator::AcquireDramCopy
 
   DramCopyPin pin;
   pin.total_size = it->second.size;
+  pin.encoding = it->second.encoding;
   pin.segments = BuildCopySegmentsLocked(it->second.tier, it->second.pages, it->second.size);
   pin.pin_token = next_pin_token_++;
   pins_[key] = PinState{pin.pin_token, std::chrono::steady_clock::now()};
@@ -496,7 +510,8 @@ std::vector<KvEvent> PeerDramAllocator::SnapshotOwnedKeysLocked() const {
   std::vector<KvEvent> out;
   out.reserve(owned_.size());
   for (const auto& kv : owned_) {
-    out.push_back(KvEvent{KvEvent::Kind::ADD, kv.first, kv.second.tier, kv.second.size});
+    out.push_back(
+        KvEvent{KvEvent::Kind::ADD, kv.first, kv.second.tier, kv.second.size, kv.second.encoding});
   }
   return out;
 }

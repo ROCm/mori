@@ -49,6 +49,26 @@ BufferMemoryDescBytes MakeDesc(uint32_t buffer_index, const std::string& bytes) 
   return d;
 }
 
+KvEncodingDescriptor MakeTurboQuantEncoding(uint64_t stored_bytes) {
+  KvEncodingDescriptor d;
+  d.kind = KvEncodingKind::TURBOQUANT;
+  d.original_dtype = KvDType::BF16;
+  d.preset = "turboquant_k8v4";
+  d.key_bits = 8;
+  d.value_bits = 4;
+  d.head_dim = 128;
+  d.block_size = 16;
+  d.num_layers = 32;
+  d.num_tokens = 16;
+  d.num_heads = 8;
+  d.hidden_dim = 1024;
+  d.skip_first_layers = 1;
+  d.skip_last_layers = 1;
+  d.stored_bytes = stored_bytes;
+  d.logical_bytes = stored_bytes;
+  return d;
+}
+
 // A representative batch: 4 keys mixing found / not-found, varying page counts
 // (including a found-but-zero-page key), and several tiers.
 std::vector<ResolvedKeyEntry> SampleEntries() {
@@ -57,6 +77,7 @@ std::vector<ResolvedKeyEntry> SampleEntries() {
   entries[0].found = true;
   entries[0].tier = TierType::HBM;
   entries[0].size = 3 * 4096;
+  entries[0].encoding = MakeTurboQuantEncoding(entries[0].size);
   entries[0].pages = {{0, 10}, {1, 11}, {0, 12}};
 
   entries[1].found = false;  // miss: no tier / size / pages
@@ -64,6 +85,7 @@ std::vector<ResolvedKeyEntry> SampleEntries() {
   entries[2].found = true;
   entries[2].tier = TierType::DRAM;
   entries[2].size = 4096;
+  entries[2].encoding = RawKvEncoding(entries[2].size, KvDType::FP16);
   entries[2].pages = {{2, 7}};
 
   entries[3].found = true;
@@ -79,6 +101,7 @@ void ExpectKeyMatches(const ResolvedKeyEntry& src, const DecodedResolveKey& dec)
   if (!src.found) return;
   EXPECT_EQ(src.tier, dec.tier);
   EXPECT_EQ(src.size, dec.size);
+  EXPECT_EQ(src.encoding, dec.encoding);
   ASSERT_EQ(src.pages.size(), dec.pages.size());
   for (size_t p = 0; p < src.pages.size(); ++p) {
     EXPECT_EQ(src.pages[p].buffer_index, dec.pages[p].buffer_index);

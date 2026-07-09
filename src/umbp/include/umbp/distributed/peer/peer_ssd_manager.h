@@ -80,6 +80,8 @@ class PeerSsdManager : public OwnedLocationSource {
   // (best-effort clean).
   bool Write(const std::string& key, const std::vector<std::pair<const void*, size_t>>& segments,
              size_t total_size);
+  bool Write(const std::string& key, const std::vector<std::pair<const void*, size_t>>& segments,
+             size_t total_size, const KvEncodingDescriptor& encoding);
 
   // Local eviction of a single key.  Read priority: a key with an
   // in-flight PrepareRead (inflight_reads_ > 0) is NOT evicted (returns false).
@@ -167,6 +169,7 @@ class PeerSsdManager : public OwnedLocationSource {
   // a touch is an O(1) splice and a victim lookup is an O(1) walk from the tail.
   struct OwnedEntry {
     uint64_t size = 0;
+    KvEncodingDescriptor encoding;
     std::list<std::string>::iterator lru_it;  // position of this key in lru_
   };
 

@@ -42,6 +42,7 @@
 
 #include "mori/io/backend.hpp"
 #include "mori/utils/mori_log.hpp"
+#include "umbp/codec/kv_encoding.h"
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
@@ -699,12 +700,13 @@ bool PoolClient::LocalGetPages(const std::vector<PageLocation>& pages, uint64_t 
 }
 
 PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key, const void* src,
-                                                          size_t size, TierType tier) {
+                                                          size_t size, TierType tier,
+                                                          const KvEncodingDescriptor& encoding) {
   if (!peer_alloc_) {
     MORI_UMBP_ERROR("[PoolClient] Local Put requested but peer allocator unavailable");
     return PutAttemptOutcome::kFatal;
   }
-  auto alloc_res = peer_alloc_->Allocate(key, size, tier);
+  auto alloc_res = peer_alloc_->Allocate(key, size, tier, encoding);
   switch (alloc_res.outcome) {
     case PeerDramAllocator::Outcome::kSuccessAlreadyExists:
       return PutAttemptOutcome::kSuccessAlreadyExists;
@@ -739,7 +741,8 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
 }
 
 PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key, void* dst,
-                                                          size_t size) {
+                                                          size_t size,
+                                                          KvEncodingDescriptor* out_encoding) {
   if (!peer_alloc_) {
     MORI_UMBP_ERROR("[PoolClient] Local Get requested but peer allocator unavailable");
     return GetAttemptOutcome::kFatal;
@@ -751,6 +754,7 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
   if (!LocalGetPages(resolved.pages, peer_alloc_->PageSize(), dst, size)) {
     return GetAttemptOutcome::kFatal;
   }
+  if (out_encoding != nullptr) *out_encoding = resolved.encoding;
   master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
                              MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
                              {{"traffic", "local"}}, static_cast<double>(size));
@@ -801,22 +805,38 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalSsdGet(const std::string& 
 // ---------------------------------------------------------------------------
 
 bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
+  return PutEncoded(key, src, size, RawKvEncoding(size));
+}
+
+bool PoolClient::PutEncoded(const std::string& key, const void* src, size_t size,
+                            const KvEncodingDescriptor& encoding) {
   std::vector<std::string> keys{key};
   std::vector<const void*> srcs{src};
   std::vector<size_t> sizes{size};
-  auto results = BatchPut(keys, srcs, sizes);
+  std::vector<KvEncodingDescriptor> encodings{encoding};
+  auto results = BatchPutEncoded(keys, srcs, sizes, encodings);
   return !results.empty() && results[0];
 }
 
 std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
                                        const std::vector<const void*>& srcs,
                                        const std::vector<size_t>& sizes) {
+  std::vector<KvEncodingDescriptor> encodings;
+  encodings.reserve(sizes.size());
+  for (size_t size : sizes) encodings.push_back(RawKvEncoding(size));
+  return BatchPutEncoded(keys, srcs, sizes, encodings);
+}
+
+std::vector<bool> PoolClient::BatchPutEncoded(const std::vector<std::string>& keys,
+                                              const std::vector<const void*>& srcs,
+                                              const std::vector<size_t>& sizes,
+                                              const std::vector<KvEncodingDescriptor>& encodings) {
   // NOTE: BatchPut only lands data in the DRAM/HBM tier. The SSD tier copy is
   // asynchronous and owner-driven: a successful slot Commit (local in
   // ExecuteLocalPut, remote on the peer's CommitSlot) enqueues the copy onto the
   // SsdCopyPipeline. There is no explicit SSD write on this path.
   const auto call_start = std::chrono::steady_clock::now();
-  if (keys.size() != srcs.size() || keys.size() != sizes.size()) {
+  if (keys.size() != srcs.size() || keys.size() != sizes.size() || keys.size() != encodings.size()) {
     MORI_UMBP_ERROR("[PoolClient] BatchPut: vector length mismatch");
     return std::vector<bool>(keys.size(), false);
   }
@@ -830,6 +850,23 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
 
   std::vector<uint64_t> block_sizes(keys.size());
   for (size_t i = 0; i < sizes.size(); ++i) block_sizes[i] = static_cast<uint64_t>(sizes[i]);
+  for (size_t i = 0; i < encodings.size(); ++i) {
+    std::string err;
+    if (!ValidateKvEncodingDescriptor(encodings[i], &err)) {
+      MORI_UMBP_ERROR("[PoolClient] BatchPut: invalid encoding for key='{}': {}", keys[i], err);
+      return std::vector<bool>(keys.size(), false);
+    }
+    uint64_t expected_size = encodings[i].stored_bytes;
+    if (expected_size == 0 && encodings[i].kind == KvEncodingKind::TURBOQUANT) {
+      auto layout = ComputeTurboQuantLayout(encodings[i]);
+      if (layout.has_value()) expected_size = layout->stored_bytes;
+    }
+    if (expected_size != sizes[i]) {
+      MORI_UMBP_ERROR("[PoolClient] BatchPut: encoding size mismatch for key='{}' (expected {}, got {})",
+                      keys[i], expected_size, sizes[i]);
+      return std::vector<bool>(keys.size(), false);
+    }
+  }
   std::vector<std::optional<RoutePutResult>> routes;
   std::unordered_set<std::string> excludes;
   auto status = master_client_->BatchRoutePut(keys, block_sizes, excludes, &routes);
@@ -839,7 +876,7 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
   }
   if (routes.size() < keys.size()) routes.resize(keys.size());
 
-  BatchPutPlan plan = PartitionBatchPutTargets(keys, srcs, sizes, routes, &outcomes);
+  BatchPutPlan plan = PartitionBatchPutTargets(keys, srcs, sizes, encodings, routes, &outcomes);
   ExecuteBatchPutPlan(plan, &outcomes);
 
   const auto call_end = std::chrono::steady_clock::now();
@@ -864,7 +901,8 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
 
 PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
     const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
-    const std::vector<size_t>& sizes, const std::vector<std::optional<RoutePutResult>>& routes,
+    const std::vector<size_t>& sizes, const std::vector<KvEncodingDescriptor>& encodings,
+    const std::vector<std::optional<RoutePutResult>>& routes,
     std::vector<PutEntryOutcome>* results) {
   BatchPutPlan plan;
   const size_t count = keys.size();
@@ -885,12 +923,22 @@ PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
       // Self-target: deferred (with its tier) so ExecuteBatchPutPlan can run the
       // local memcpy inside the remote-DRAM submit..wait window.
       plan.local_items.push_back(BatchPutItem{
-          .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
+          .index = i,
+          .key = &keys[i],
+          .src = srcs[i],
+          .size = sizes[i],
+          .encoding = &encodings[i],
+          .route = route});
       continue;
     }
     if (route.tier != TierType::DRAM && route.tier != TierType::HBM) continue;
     plan.remote_groups[route.node_id].push_back(BatchPutItem{
-        .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
+        .index = i,
+        .key = &keys[i],
+        .src = srcs[i],
+        .size = sizes[i],
+        .encoding = &encodings[i],
+        .route = route});
   }
   return plan;
 }
@@ -907,7 +955,7 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
     const auto t0 = std::chrono::steady_clock::now();
     LocalParallelFor(local.size(), nthr, [&](size_t k) {
       const auto& item = local[k];
-      switch (ExecuteLocalPut(*item.key, item.src, item.size, item.route.tier)) {
+      switch (ExecuteLocalPut(*item.key, item.src, item.size, item.route.tier, *item.encoding)) {
         case PutAttemptOutcome::kSuccess:
           (*results)[item.index] = PutEntryOutcome::kSucceeded;
           break;
@@ -1169,6 +1217,7 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
     entry->set_size(item.size);
     entry->set_tier(static_cast<::umbp::TierType>(item.route.tier));
     entry->set_key(*item.key);
+    FillProtoKvEncoding(*item.encoding, entry->mutable_encoding());
   }
 
   ::umbp::BatchAllocateSlotsResponse alloc_resp;
@@ -1222,6 +1271,7 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
     entry.result_index = item.index;
     entry.item = &item;
     entry.slot_id = plan.slot_id;
+    entry.encoding = *item.encoding;
     entry.plan = std::move(plan);
     entries->push_back(std::move(entry));
   }
@@ -1408,16 +1458,30 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
 // ---------------------------------------------------------------------------
 
 bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
+  return GetEncoded(key, dst, size, nullptr);
+}
+
+bool PoolClient::GetEncoded(const std::string& key, void* dst, size_t size,
+                            KvEncodingDescriptor* out_encoding) {
   std::vector<std::string> keys{key};
   std::vector<void*> dsts{dst};
   std::vector<size_t> sizes{size};
-  auto results = BatchGet(keys, dsts, sizes);
+  std::vector<KvEncodingDescriptor> encodings;
+  auto results = BatchGetEncoded(keys, dsts, sizes, out_encoding == nullptr ? nullptr : &encodings);
+  if (out_encoding != nullptr && !encodings.empty()) *out_encoding = encodings.front();
   return !results.empty() && results[0];
 }
 
 std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
                                        const std::vector<void*>& dsts,
                                        const std::vector<size_t>& sizes) {
+  return BatchGetEncoded(keys, dsts, sizes, nullptr);
+}
+
+std::vector<bool> PoolClient::BatchGetEncoded(const std::vector<std::string>& keys,
+                                              const std::vector<void*>& dsts,
+                                              const std::vector<size_t>& sizes,
+                                              std::vector<KvEncodingDescriptor>* out_encodings) {
   const auto call_start = std::chrono::steady_clock::now();
   std::vector<bool> results(keys.size(), false);
   if (keys.size() != dsts.size() || keys.size() != sizes.size()) {
@@ -1427,6 +1491,9 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
   if (!initialized_) {
     MORI_UMBP_ERROR("[PoolClient] BatchGet: client not initialized");
     return results;
+  }
+  if (out_encodings != nullptr) {
+    out_encodings->assign(keys.size(), KvEncodingDescriptor{});
   }
 
   std::vector<std::optional<RouteGetResult>> routes;
@@ -1440,8 +1507,8 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     routes.resize(keys.size());
   }
 
-  BatchGetPlan plan = PartitionBatchGetTargets(keys, dsts, sizes, routes);
-  ExecuteBatchGetPlan(plan, keys, dsts, sizes, &results);
+  BatchGetPlan plan = PartitionBatchGetTargets(keys, dsts, sizes, out_encodings, routes);
+  ExecuteBatchGetPlan(plan, keys, dsts, sizes, out_encodings, &results);
 
   const auto call_end = std::chrono::steady_clock::now();
   const double seconds =
@@ -1460,7 +1527,8 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
 
 PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
     const std::vector<std::string>& keys, const std::vector<void*>& dsts,
-    const std::vector<size_t>& sizes, const std::vector<std::optional<RouteGetResult>>& routes) {
+    const std::vector<size_t>& sizes, std::vector<KvEncodingDescriptor>* out_encodings,
+    const std::vector<std::optional<RouteGetResult>>& routes) {
   BatchGetPlan plan;
   for (size_t i = 0; i < keys.size(); ++i) {
     // Zero-size gets are rejected before local fallback or remote read: an
@@ -1475,22 +1543,23 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
       continue;
     }
     const auto& route = routes[i].value();
+    BatchGetItem item{.index = i,
+                      .key = &keys[i],
+                      .dst = const_cast<void*>(dsts[i]),
+                      .size = sizes[i],
+                      .out_encoding = out_encodings == nullptr ? nullptr : &(*out_encodings)[i],
+                      .route = route};
     if (route.node_id == config_.master_config.node_id) {
       // Self-target: both DRAM/HBM and SSD are deferred (collected as indices)
       // so ExecuteBatchGetPlan can place them inside the remote-DRAM in-flight
       // window in the overlap path.
       if (route.tier == TierType::SSD) {
-        plan.local_ssd_indices.push_back(i);
+        plan.local_ssd_items.push_back(std::move(item));
       } else {
         plan.local_dram_indices.push_back(i);
       }
       continue;
     }
-    BatchGetItem item{.index = i,
-                      .key = &keys[i],
-                      .dst = const_cast<void*>(dsts[i]),
-                      .size = sizes[i],
-                      .route = route};
     if (route.tier == TierType::SSD) {
       plan.remote_ssd_groups[route.node_id].push_back(std::move(item));
     } else {
@@ -1502,7 +1571,9 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
 
 void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                                      const std::vector<void*>& dsts,
-                                     const std::vector<size_t>& sizes, std::vector<bool>* results) {
+                                     const std::vector<size_t>& sizes,
+                                     std::vector<KvEncodingDescriptor>* out_encodings,
+                                     std::vector<bool>* results) {
   // Parallel local DRAM reads: different threads handle different keys. Resolve
   // is mutex-serialized in the allocator; the per-key memcpy in
   // ExecuteLocalGet->LocalGetPages runs lock-free in parallel. results is
@@ -1515,7 +1586,9 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
     std::vector<char> ok(idx.size(), 0);
     LocalParallelFor(idx.size(), nthr, [&](size_t k) {
       const size_t i = idx[k];
-      if (ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
+      KvEncodingDescriptor* out_encoding =
+          out_encodings == nullptr ? nullptr : &(*out_encodings)[i];
+      if (ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i], out_encoding) ==
           GetAttemptOutcome::kSuccess) {
         ok[k] = 1;
       }
@@ -1541,10 +1614,11 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
   // thread, reading straight into the user buffer (no staging / RDMA / lease).
   // Independent per key, so its position in the schedule is correctness-neutral.
   auto run_local_ssd = [&]() {
-    for (size_t i : plan.local_ssd_indices) {
-      if (ExecuteLocalSsdGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
+    for (const auto& item : plan.local_ssd_items) {
+      if (ExecuteLocalSsdGet(*item.key, item.dst, item.size) ==
           GetAttemptOutcome::kSuccess) {
-        (*results)[i] = true;
+        if (item.out_encoding != nullptr) *item.out_encoding = item.route.encoding;
+        (*results)[item.index] = true;
       }
     }
   };
@@ -1827,6 +1901,7 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
     entry.item = &item;
     entry.plan.page_size = decoded.page_size;
     entry.plan.pages = std::move(decoded.keys[i].pages);
+    entry.encoding = key.encoding;
     // Descriptors were hydrated batch-level above; the per-entry plan carries
     // none (BuildRemoteGetTransfers' EnsureBufferDescsCached call is a no-op on
     // an empty list and the read path resolves descriptors by buffer_index).
@@ -1935,6 +2010,7 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
                                {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
+    if (entry.item->out_encoding != nullptr) *entry.item->out_encoding = entry.encoding;
     (*results)[entry.result_index] = true;
   }
 }
@@ -2478,6 +2554,7 @@ void PoolClient::ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items
       switch (outcome) {
         case SsdGetOutcome::kSuccess:
           (*results)[item.index] = true;
+          if (item.out_encoding != nullptr) *item.out_encoding = item.route.encoding;
           done = true;
           break;
         case SsdGetOutcome::kMiss:   // definitive miss

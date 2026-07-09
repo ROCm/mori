@@ -106,13 +106,25 @@ class PoolClient {
   // adds the failed node to the exclude set.
   bool Put(const std::string& key, const void* src, size_t size);
   bool Get(const std::string& key, void* dst, size_t size);
+  bool PutEncoded(const std::string& key, const void* src, size_t size,
+                  const KvEncodingDescriptor& encoding);
+  bool GetEncoded(const std::string& key, void* dst, size_t size,
+                  KvEncodingDescriptor* out_encoding);
 
   std::vector<bool> BatchPut(const std::vector<std::string>& keys,
                              const std::vector<const void*>& srcs,
                              const std::vector<size_t>& sizes);
+  std::vector<bool> BatchPutEncoded(const std::vector<std::string>& keys,
+                                    const std::vector<const void*>& srcs,
+                                    const std::vector<size_t>& sizes,
+                                    const std::vector<KvEncodingDescriptor>& encodings);
 
   std::vector<bool> BatchGet(const std::vector<std::string>& keys, const std::vector<void*>& dsts,
                              const std::vector<size_t>& sizes);
+  std::vector<bool> BatchGetEncoded(const std::vector<std::string>& keys,
+                                    const std::vector<void*>& dsts,
+                                    const std::vector<size_t>& sizes,
+                                    std::vector<KvEncodingDescriptor>* out_encodings);
 
   // Cluster-wide existence check — issues a RouteGet and reports
   // whether master surfaced any replica.  No RDMA, no lease bump.
@@ -259,8 +271,9 @@ class PoolClient {
   enum class GetAttemptOutcome { kSuccess, kRetry, kFatal };
 
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
-                                    TierType tier);
-  GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
+                                    TierType tier, const KvEncodingDescriptor& encoding);
+  GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size,
+                                    KvEncodingDescriptor* out_encoding);
   // Self-target SSD get: read straight from the local SSD tier into the user
   // buffer (no staging / RDMA / lease).
   GetAttemptOutcome ExecuteLocalSsdGet(const std::string& key, void* dst, size_t size);
@@ -269,6 +282,7 @@ class PoolClient {
     const std::string* key;
     const void* src;
     size_t size;
+    const KvEncodingDescriptor* encoding;
     RoutePutResult route;
   };
   struct BatchGetItem {
@@ -276,6 +290,7 @@ class PoolClient {
     const std::string* key;
     void* dst;
     size_t size;
+    KvEncodingDescriptor* out_encoding;
     RouteGetResult route;
   };
 
@@ -289,7 +304,7 @@ class PoolClient {
     std::unordered_map<std::string, std::vector<BatchGetItem>> remote_dram_groups;
     std::unordered_map<std::string, std::vector<BatchGetItem>> remote_ssd_groups;
     std::vector<size_t> local_dram_indices;
-    std::vector<size_t> local_ssd_indices;
+    std::vector<BatchGetItem> local_ssd_items;
   };
 
   // Pure grouping for one BatchPut (no IO, no local put executed; mirrors
@@ -305,6 +320,7 @@ class PoolClient {
   BatchPutPlan PartitionBatchPutTargets(const std::vector<std::string>& keys,
                                         const std::vector<const void*>& srcs,
                                         const std::vector<size_t>& sizes,
+                                        const std::vector<KvEncodingDescriptor>& encodings,
                                         const std::vector<std::optional<RoutePutResult>>& routes,
                                         std::vector<PutEntryOutcome>* results);
   // Execute a BatchPutPlan.  Zero-copy submits all peers (not waited), runs the
@@ -319,6 +335,7 @@ class PoolClient {
   BatchGetPlan PartitionBatchGetTargets(const std::vector<std::string>& keys,
                                         const std::vector<void*>& dsts,
                                         const std::vector<size_t>& sizes,
+                                        std::vector<KvEncodingDescriptor>* out_encodings,
                                         const std::vector<std::optional<RouteGetResult>>& routes);
   // Execute a BatchGetPlan: local DRAM/SSD, remote SSD, and the remote-DRAM
   // submit/wait arrangement.  Zero-copy remote DRAM submits all peers, runs local
@@ -327,6 +344,7 @@ class PoolClient {
   // (submit -> wait).  Reads the plan; writes per-key outcomes into *results.
   void ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                            const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
+                           std::vector<KvEncodingDescriptor>* out_encodings,
                            std::vector<bool>* results);
 
   struct TransferInstruction {
@@ -363,6 +381,7 @@ class PoolClient {
     const BatchPutItem* item;
     SlotPlan plan;
     uint64_t slot_id;
+    KvEncodingDescriptor encoding;
     std::optional<std::pair<mori::io::MemoryDesc, size_t>> zero_copy;
     bool use_staging = false;
     uint64_t staging_offset = 0;
@@ -373,6 +392,7 @@ class PoolClient {
     size_t result_index;
     const BatchGetItem* item;
     SlotPlan plan;
+    KvEncodingDescriptor encoding;
     std::optional<std::pair<mori::io::MemoryDesc, size_t>> zero_copy;
     bool use_staging = false;
     uint64_t staging_offset = 0;

@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/external_kv_block_index.h"
@@ -98,6 +99,7 @@ KvEvent FromProtoEvent(const ::umbp::KvEvent& pe) {
   ev.key = pe.key();
   ev.tier = static_cast<TierType>(pe.tier());
   ev.size = pe.size();
+  ev.encoding = KvEncodingFromProto(pe.encoding(), ev.size);
   return ev;
 }
 
@@ -376,6 +378,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     response->set_tier(static_cast<::umbp::TierType>(result->location.tier));
     response->set_size(result->location.size);
     response->set_peer_address(result->peer_address);
+    FillProtoKvEncoding(result->location.encoding, response->mutable_encoding());
 
     if (metrics_) {
       metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_ROUTE_GET,
@@ -439,6 +442,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         response->add_node_ref(0);
         response->add_tier(::umbp::TIER_UNKNOWN);
         response->add_size(0);
+        FillProtoKvEncoding(RawKvEncoding(0), response->add_encoding());
         continue;
       }
       std::string node_key = opt->location.node_id;
@@ -454,6 +458,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       response->add_node_ref(it->second);
       response->add_tier(static_cast<::umbp::TierType>(opt->location.tier));
       response->add_size(opt->location.size);
+      FillProtoKvEncoding(opt->location.encoding, response->add_encoding());
       if (metrics_) {
         metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET,
                              MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP,

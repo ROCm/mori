@@ -98,6 +98,7 @@ class PeerDramAllocator : public OwnedLocationSource {
     TierType tier = TierType::UNKNOWN;
     std::vector<PageLocation> pages;
     uint64_t size = 0;
+    KvEncodingDescriptor encoding;
     std::chrono::steady_clock::time_point deadline;
     // Snapshot of allocator_generation_ at Allocate().  Commit()
     // rejects slots whose generation no longer matches the current.
@@ -108,6 +109,7 @@ class PeerDramAllocator : public OwnedLocationSource {
     TierType tier = TierType::UNKNOWN;
     std::vector<PageLocation> pages;
     uint64_t size = 0;
+    KvEncodingDescriptor encoding;
   };
 
   struct ResolveResult {
@@ -115,6 +117,7 @@ class PeerDramAllocator : public OwnedLocationSource {
     TierType tier = TierType::UNKNOWN;
     std::vector<PageLocation> pages;
     uint64_t size = 0;
+    KvEncodingDescriptor encoding;
   };
 
   // ResolveResult + descs built under the same lock.
@@ -123,6 +126,7 @@ class PeerDramAllocator : public OwnedLocationSource {
     TierType tier = TierType::UNKNOWN;
     std::vector<PageLocation> pages;
     uint64_t size = 0;
+    KvEncodingDescriptor encoding;
     std::vector<BufferMemoryDescBytes> descs;
   };
 
@@ -151,6 +155,7 @@ class PeerDramAllocator : public OwnedLocationSource {
     std::string key;
     uint64_t size = 0;
     TierType tier = TierType::UNKNOWN;
+    KvEncodingDescriptor encoding;
   };
 
   struct BatchAllocateResult {
@@ -172,6 +177,8 @@ class PeerDramAllocator : public OwnedLocationSource {
   // Reserve `size` bytes on `tier` for `key`.  `key` enables owned_
   // dedup (master-index-lag fallback; primary dedup is at BatchRoutePut).
   AllocateResult Allocate(const std::string& key, uint64_t size, TierType tier);
+  AllocateResult Allocate(const std::string& key, uint64_t size, TierType tier,
+                          const KvEncodingDescriptor& encoding);
 
   std::vector<BatchAllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries);
 
@@ -220,6 +227,7 @@ class PeerDramAllocator : public OwnedLocationSource {
   struct DramCopyPin {
     std::vector<std::pair<const void*, size_t>> segments;
     size_t total_size = 0;
+    KvEncodingDescriptor encoding;
     uint64_t pin_token = 0;  // release-time validation
   };
 
@@ -316,7 +324,8 @@ class PeerDramAllocator : public OwnedLocationSource {
   PageBitmapAllocator* AllocatorForLocked(TierType tier);
   const PageBitmapAllocator* AllocatorForLocked(TierType tier) const;
 
-  AllocateResult AllocateLocked(const std::string& key, uint64_t size, TierType tier);
+  AllocateResult AllocateLocked(const std::string& key, uint64_t size, TierType tier,
+                                const KvEncodingDescriptor& encoding);
   bool CommitLocked(uint64_t slot_id, const std::string& key, uint64_t& bytes_committed);
   bool AbortLocked(uint64_t slot_id);
 

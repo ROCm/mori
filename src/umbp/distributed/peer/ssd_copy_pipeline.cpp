@@ -169,7 +169,7 @@ void SsdCopyPipeline::RunTask(const SsdCopyTask& task) {
 
   // Backend IO runs outside the allocator lock; the pin keeps the source
   // pages alive for the duration of this synchronous Write.
-  if (ssd_->Write(task.key, pin->segments, pin->total_size)) {
+  if (ssd_->Write(task.key, pin->segments, pin->total_size, pin->encoding)) {
     metrics_.copied_ok.fetch_add(1, std::memory_order_relaxed);
   } else {
     metrics_.failed.fetch_add(1, std::memory_order_relaxed);

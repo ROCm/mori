@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 
+#include "umbp/codec/kv_encoding.h"
 #include "umbp/distributed/types.h"
 #include "umbp_peer.pb.h"
 
@@ -42,6 +43,7 @@ struct ResolvedKeyEntry {
   bool found = false;
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;
+  KvEncodingDescriptor encoding;
   std::vector<PageLocation> pages;
 };
 
@@ -51,6 +53,7 @@ struct DecodedResolveKey {
   bool found = false;
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;
+  KvEncodingDescriptor encoding;
   std::vector<PageLocation> pages;
 };
 
@@ -88,6 +91,103 @@ inline ::umbp::TierType BatchResolveTierToProto(TierType t) {
   }
 }
 
+inline ::umbp::KvEncodingKind KvEncodingKindToProto(KvEncodingKind kind) {
+  switch (kind) {
+    case KvEncodingKind::RAW:
+      return ::umbp::KV_ENCODING_RAW;
+    case KvEncodingKind::TURBOQUANT:
+      return ::umbp::KV_ENCODING_TURBOQUANT;
+    default:
+      return ::umbp::KV_ENCODING_UNKNOWN;
+  }
+}
+
+inline KvEncodingKind KvEncodingKindFromProto(::umbp::KvEncodingKind kind) {
+  switch (kind) {
+    case ::umbp::KV_ENCODING_RAW:
+      return KvEncodingKind::RAW;
+    case ::umbp::KV_ENCODING_TURBOQUANT:
+      return KvEncodingKind::TURBOQUANT;
+    default:
+      return KvEncodingKind::UNKNOWN;
+  }
+}
+
+inline ::umbp::KvDType KvDTypeToProto(KvDType dtype) {
+  switch (dtype) {
+    case KvDType::FP16:
+      return ::umbp::KV_DTYPE_FP16;
+    case KvDType::BF16:
+      return ::umbp::KV_DTYPE_BF16;
+    case KvDType::FP8:
+      return ::umbp::KV_DTYPE_FP8;
+    case KvDType::UINT8:
+      return ::umbp::KV_DTYPE_UINT8;
+    default:
+      return ::umbp::KV_DTYPE_UNKNOWN;
+  }
+}
+
+inline KvDType KvDTypeFromProto(::umbp::KvDType dtype) {
+  switch (dtype) {
+    case ::umbp::KV_DTYPE_FP16:
+      return KvDType::FP16;
+    case ::umbp::KV_DTYPE_BF16:
+      return KvDType::BF16;
+    case ::umbp::KV_DTYPE_FP8:
+      return KvDType::FP8;
+    case ::umbp::KV_DTYPE_UINT8:
+      return KvDType::UINT8;
+    default:
+      return KvDType::UNKNOWN;
+  }
+}
+
+inline void FillProtoKvEncoding(const KvEncodingDescriptor& src,
+                                ::umbp::KvEncodingDescriptor* dst) {
+  dst->set_schema_version(src.schema_version);
+  dst->set_kind(KvEncodingKindToProto(src.kind));
+  dst->set_original_dtype(KvDTypeToProto(src.original_dtype));
+  dst->set_preset(src.preset);
+  dst->set_key_bits(src.key_bits);
+  dst->set_value_bits(src.value_bits);
+  dst->set_head_dim(src.head_dim);
+  dst->set_block_size(src.block_size);
+  dst->set_num_layers(src.num_layers);
+  dst->set_num_tokens(src.num_tokens);
+  dst->set_num_heads(src.num_heads);
+  dst->set_hidden_dim(src.hidden_dim);
+  dst->set_skip_first_layers(src.skip_first_layers);
+  dst->set_skip_last_layers(src.skip_last_layers);
+  dst->set_packing_version(src.packing_version);
+  dst->set_stored_bytes(src.stored_bytes);
+  dst->set_logical_bytes(src.logical_bytes);
+}
+
+inline KvEncodingDescriptor KvEncodingFromProto(const ::umbp::KvEncodingDescriptor& src,
+                                                uint64_t fallback_size = 0) {
+  KvEncodingDescriptor out;
+  out.schema_version = src.schema_version() == 0 ? 1 : src.schema_version();
+  out.kind = KvEncodingKindFromProto(src.kind());
+  if (out.kind == KvEncodingKind::UNKNOWN) out.kind = KvEncodingKind::RAW;
+  out.original_dtype = KvDTypeFromProto(src.original_dtype());
+  out.preset = src.preset();
+  out.key_bits = src.key_bits();
+  out.value_bits = src.value_bits();
+  out.head_dim = src.head_dim();
+  out.block_size = src.block_size();
+  out.num_layers = src.num_layers();
+  out.num_tokens = src.num_tokens();
+  out.num_heads = src.num_heads();
+  out.hidden_dim = src.hidden_dim();
+  out.skip_first_layers = src.skip_first_layers();
+  out.skip_last_layers = src.skip_last_layers();
+  out.packing_version = src.packing_version() == 0 ? 1 : src.packing_version();
+  out.stored_bytes = src.stored_bytes() == 0 ? fallback_size : src.stored_bytes();
+  out.logical_bytes = src.logical_bytes() == 0 ? out.stored_bytes : src.logical_bytes();
+  return out;
+}
+
 // Encode resolved keys into the SoA response.  `descs` are the batch-level
 // deduplicated buffer descriptors (by buffer_index); pass an empty vector to
 // omit them (honoring BatchResolveKeysRequest.omit_descs).  Clears `resp`
@@ -110,6 +210,7 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
   resp->mutable_found()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_tier()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_size()->Reserve(static_cast<int>(keys.size()));
+  resp->mutable_encoding()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_page_count()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_buffer_index()->Reserve(static_cast<int>(total_pages));
   resp->mutable_page_index()->Reserve(static_cast<int>(total_pages));
@@ -118,6 +219,7 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
     resp->add_found(k.found);
     resp->add_tier(BatchResolveTierToProto(k.tier));
     resp->add_size(k.size);
+    FillProtoKvEncoding(k.encoding, resp->add_encoding());
     resp->add_page_count(static_cast<uint32_t>(k.pages.size()));
     for (const auto& p : k.pages) {
       resp->add_buffer_index(p.buffer_index);
@@ -155,7 +257,8 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
   // hold at least the summed page_count.  Anything else is a malformed peer
   // response; refuse to decode it.
   if (resp.tier_size() != n || resp.size_size() != n || resp.page_count_size() != n ||
-      resp.buffer_index_size() != resp.page_index_size()) {
+      resp.buffer_index_size() != resp.page_index_size() ||
+      (resp.encoding_size() != 0 && resp.encoding_size() != n)) {
     return out;
   }
 
@@ -172,6 +275,8 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
     k.found = resp.found(i);
     k.tier = BatchResolveTierFromProto(resp.tier(i));
     k.size = resp.size(i);
+    k.encoding = resp.encoding_size() == n ? KvEncodingFromProto(resp.encoding(i), k.size)
+                                           : RawKvEncoding(k.size);
     const uint32_t pc = resp.page_count(i);
     k.pages.reserve(pc);
     for (uint32_t p = 0; p < pc; ++p) {

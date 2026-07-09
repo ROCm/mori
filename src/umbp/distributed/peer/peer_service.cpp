@@ -319,8 +319,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
       return grpc::Status::OK;
     }
-    auto result =
-        dram_alloc_->Allocate(request->key(), request->size(), FromProtoTier(request->tier()));
+    auto result = dram_alloc_->Allocate(request->key(), request->size(), FromProtoTier(request->tier()),
+                                        KvEncodingFromProto(request->encoding(), request->size()));
     switch (result.outcome) {
       case PeerDramAllocator::Outcome::kSuccessAlreadyExists:
         response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS);
@@ -381,6 +381,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     auto descs = dram_alloc_->BufferDescsForPages(r.tier, r.pages);
     FillPagesAndDescs(response, r.pages, dram_alloc_->PageSize(), descs);
     response->set_size(r.size);
+    FillProtoKvEncoding(r.encoding, response->mutable_encoding());
     RecordInboundGet(r.size, "remote");
     return grpc::Status::OK;
   }
@@ -421,6 +422,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       alloc_entry.key = entry.key();
       alloc_entry.size = entry.size();
       alloc_entry.tier = FromProtoTier(entry.tier());
+      alloc_entry.encoding = KvEncodingFromProto(entry.encoding(), entry.size());
       entries.push_back(std::move(alloc_entry));
     }
 
@@ -525,6 +527,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       if (r.found) {
         e.tier = r.tier;
         e.size = r.size;
+        e.encoding = r.encoding;
         e.pages = std::move(r.pages);
         total_bytes += r.size;
         if (!omit_descs) {
