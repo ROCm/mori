@@ -239,7 +239,10 @@ void RegisterMoriUmbp(py::module_& m) {
       .def(py::init<>())
       .def_readwrite("address", &UMBPStandaloneProcessConfig::address)
       .def_readwrite("auto_start", &UMBPStandaloneProcessConfig::auto_start)
-      .def_readwrite("startup_timeout_ms", &UMBPStandaloneProcessConfig::startup_timeout_ms);
+      .def_readwrite("startup_timeout_ms", &UMBPStandaloneProcessConfig::startup_timeout_ms)
+      .def_readwrite("worker_node_id", &UMBPStandaloneProcessConfig::worker_node_id)
+      .def_readwrite("worker_node_address", &UMBPStandaloneProcessConfig::worker_node_address)
+      .def_readwrite("tags", &UMBPStandaloneProcessConfig::tags);
 
   py::class_<UMBPConfig>(m, "UMBPConfig")
       .def(py::init<>())

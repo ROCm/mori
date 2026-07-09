@@ -472,6 +472,9 @@ bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size) {
     req.set_client_id(client_id);
     req.set_worker_base(reinterpret_cast<uintptr_t>(allocation->base));
     req.set_size(allocation->mapped_size);
+    req.set_worker_node_id(standalone_config_.worker_node_id);
+    req.set_worker_node_address(standalone_config_.worker_node_address);
+    for (const auto& tag : standalone_config_.tags) req.add_tags(tag);
     ::umbp::BoolResponse resp;
     grpc::Status rpc_status = stub_->RegisterMemory(&ctx, req, &resp);
     if (!rpc_status.ok() || !resp.ok()) {
@@ -528,6 +531,7 @@ bool StandaloneProcessClient::ReportExternalKvBlocks(const std::vector<std::stri
   ::umbp::StandaloneExternalKvMutationRequest req;
   for (const auto& hash : hashes) req.add_hashes(hash);
   req.set_tier(TierToProto(tier));
+  req.set_client_id(ClientId());
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->ReportExternalKvBlocks(&ctx, req, &resp);
   return status.ok() && resp.ok();
@@ -539,6 +543,7 @@ bool StandaloneProcessClient::RevokeExternalKvBlocks(const std::vector<std::stri
   ::umbp::StandaloneExternalKvMutationRequest req;
   for (const auto& hash : hashes) req.add_hashes(hash);
   req.set_tier(TierToProto(tier));
+  req.set_client_id(ClientId());
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->RevokeExternalKvBlocks(&ctx, req, &resp);
   return status.ok() && resp.ok();
@@ -548,6 +553,7 @@ bool StandaloneProcessClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
   grpc::ClientContext ctx;
   ::umbp::StandaloneExternalKvTierRequest req;
   req.set_tier(TierToProto(tier));
+  req.set_client_id(ClientId());
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->RevokeAllExternalKvBlocksAtTier(&ctx, req, &resp);
   return status.ok() && resp.ok();
@@ -559,6 +565,7 @@ std::vector<IUMBPClient::ExternalKvMatch> StandaloneProcessClient::MatchExternal
   ::umbp::StandaloneMatchExternalKvRequest req;
   for (const auto& hash : hashes) req.add_hashes(hash);
   req.set_count_as_hit(count_as_hit);
+  req.set_client_id(ClientId());
   ::umbp::StandaloneMatchExternalKvResponse resp;
   grpc::Status status = stub_->MatchExternalKv(&ctx, req, &resp);
   if (!status.ok()) return {};
@@ -583,6 +590,7 @@ std::vector<IUMBPClient::ExternalKvHitCountEntry> StandaloneProcessClient::GetEx
   grpc::ClientContext ctx;
   ::umbp::StandaloneExternalKvHitCountsRequest req;
   for (const auto& hash : hashes) req.add_hashes(hash);
+  req.set_client_id(ClientId());
   ::umbp::StandaloneExternalKvHitCountsResponse resp;
   grpc::Status status = stub_->GetExternalKvHitCounts(&ctx, req, &resp);
   if (!status.ok()) return {};

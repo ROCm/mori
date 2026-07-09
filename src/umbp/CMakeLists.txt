@@ -348,6 +348,7 @@ add_library(
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
   distributed/distributed_client.cpp
+  standalone/external_kv_identity_client.cpp
   standalone/ipc.cpp
   standalone/standalone_process_client.cpp
   standalone/standalone_server.cpp)

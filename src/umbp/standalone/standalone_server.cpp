@@ -37,14 +37,17 @@
 #include <climits>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
-#include "umbp/local/standalone_client.h"
+#include "umbp/standalone/external_kv_identity_client.h"
 #include "umbp/standalone/ipc.h"
+#include "umbp/umbp_client.h"
 #include "umbp_standalone.grpc.pb.h"
 
 namespace mori::umbp::standalone {
@@ -107,6 +110,26 @@ bool SetFdSocketTimeouts(int fd, std::chrono::milliseconds timeout) {
          setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
 }
 
+UMBPConfig NormalizeBackendConfig(UMBPConfig config) {
+  // Older callers pass the worker-facing standalone_process field to the
+  // server constructor. The server backend must never consume that field,
+  // otherwise CreateUMBPClient would recursively create a client to itself.
+  config.standalone_process.reset();
+  return config;
+}
+
+::umbp::StandaloneBackendMode BackendModeToProto(UMBPDeploymentMode mode) {
+  switch (mode) {
+    case UMBPDeploymentMode::Distributed:
+      return ::umbp::STANDALONE_BACKEND_DISTRIBUTED;
+    case UMBPDeploymentMode::Local:
+      return ::umbp::STANDALONE_BACKEND_LOCAL;
+    case UMBPDeploymentMode::StandaloneProcess:
+    default:
+      return ::umbp::STANDALONE_BACKEND_UNKNOWN;
+  }
+}
+
 std::chrono::milliseconds FdHandshakeTimeout() {
   const char* raw = std::getenv("UMBP_STANDALONE_FD_HANDSHAKE_TIMEOUT_MS");
   if (!raw || raw[0] == '\0') return std::chrono::milliseconds(5000);
@@ -122,7 +145,8 @@ std::chrono::milliseconds FdHandshakeTimeout() {
 class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
  public:
   Impl(const UMBPConfig& config, std::string address)
-      : client_(config),
+      : backend_config_(NormalizeBackendConfig(config)),
+        client_(CreateUMBPClient(backend_config_)),
         address_(std::move(address)),
         fd_socket_path_(DeriveFdSocketPath(address_)) {}
 
@@ -180,12 +204,16 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (server_) {
       server_->Shutdown(std::chrono::system_clock::now() + ShutdownDeadline());
     }
+    UnregisterAllExternalIdentities();
     {
       std::lock_guard<std::mutex> lock(client_mu_);
-      client_.Flush();
-      client_.Close();
+      client_->Flush();
     }
     UnmapAll();
+    {
+      std::lock_guard<std::mutex> lock(client_mu_);
+      client_->Close();
+    }
     unlink(UnixPathFromGrpcAddress(address_).c_str());
     unlink(fd_socket_path_.c_str());
   }
@@ -193,6 +221,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status Ping(grpc::ServerContext*, const ::umbp::Empty*,
                     ::umbp::PingResponse* response) override {
     response->set_ready(!shutdown_.load());
+    response->set_deployment_mode(BackendModeToProto(client_->GetDeploymentMode()));
     return grpc::Status::OK;
   }
 
@@ -208,7 +237,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
     }
-    SetBool(response, client_.Put(request->key(), ptr, static_cast<size_t>(request->size())));
+    SetBool(response, client_->Put(request->key(), ptr, static_cast<size_t>(request->size())));
     return grpc::Status::OK;
   }
 
@@ -224,7 +253,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
     }
-    SetBool(response, client_.Get(request->key(), ptr, static_cast<size_t>(request->size())));
+    SetBool(response, client_->Get(request->key(), ptr, static_cast<size_t>(request->size())));
     return grpc::Status::OK;
   }
 
@@ -242,7 +271,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
-    FillResults(client_.BatchPut(keys, ptrs, sizes), response);
+    FillResults(client_->BatchPut(keys, ptrs, sizes), response);
     return grpc::Status::OK;
   }
 
@@ -274,7 +303,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
-    FillResults(client_.BatchPutWithDepth(keys, ptrs, sizes, depths), response);
+    FillResults(client_->BatchPutWithDepth(keys, ptrs, sizes, depths), response);
     return grpc::Status::OK;
   }
 
@@ -292,7 +321,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
-    FillResults(client_.BatchGet(keys, ptrs, sizes), response);
+    FillResults(client_->BatchGet(keys, ptrs, sizes), response);
     return grpc::Status::OK;
   }
 
@@ -303,7 +332,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
     }
-    SetBool(response, client_.Exists(request->key()));
+    SetBool(response, client_->Exists(request->key()));
     return grpc::Status::OK;
   }
 
@@ -315,7 +344,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
-    FillResults(client_.BatchExists(keys), response);
+    FillResults(client_->BatchExists(keys), response);
     return grpc::Status::OK;
   }
 
@@ -327,7 +356,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       response->set_count(0);
       return grpc::Status::OK;
     }
-    response->set_count(client_.BatchExistsConsecutive(keys));
+    response->set_count(client_->BatchExistsConsecutive(keys));
     return grpc::Status::OK;
   }
 
@@ -338,7 +367,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
     }
-    SetBool(response, client_.Clear());
+    SetBool(response, client_->Clear());
     return grpc::Status::OK;
   }
 
@@ -349,7 +378,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
     }
-    SetBool(response, client_.Flush());
+    SetBool(response, client_->Flush());
     return grpc::Status::OK;
   }
 
@@ -359,51 +388,117 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
     }
-    std::lock_guard<std::mutex> lock(memory_mu_);
-    auto it = memory_.find(request->client_id());
-    bool ok = it != memory_.end() && it->second.worker_base == request->worker_base() &&
-              it->second.size >= request->size();
-    SetBool(response, ok, ok ? "" : "fd handoff registration was not found");
+    std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
+    bool ok = false;
+    {
+      std::lock_guard<std::mutex> lock(memory_mu_);
+      auto it = memory_.find(request->client_id());
+      ok = it != memory_.end() && it->second.worker_base == request->worker_base() &&
+           it->second.size >= request->size();
+    }
+    if (!ok) {
+      SetBool(response, false, "fd handoff registration was not found");
+      return grpc::Status::OK;
+    }
+
+    if (!EnsureExternalIdentity(*request)) {
+      MORI_UMBP_WARN(
+          "[StandaloneServer] external-KV identity registration failed for client_id={} "
+          "worker_node_id={}; continuing with core memory registration",
+          request->client_id(), request->worker_node_id());
+    }
+    SetBool(response, true);
     return grpc::Status::OK;
   }
 
   grpc::Status DeregisterMemory(grpc::ServerContext*,
                                 const ::umbp::DeregisterMemoryRequest* request,
                                 ::umbp::Empty*) override {
+    std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
+    RemoveExternalIdentity(request->client_id());
     UnmapClient(request->client_id());
     return grpc::Status::OK;
   }
 
   grpc::Status ReportExternalKvBlocks(grpc::ServerContext*,
-                                      const ::umbp::StandaloneExternalKvMutationRequest*,
+                                      const ::umbp::StandaloneExternalKvMutationRequest* request,
                                       ::umbp::BoolResponse* response) override {
-    SetBool(response, true);
+    if (!BackendIsDistributed()) {
+      SetBool(response, true);
+      return grpc::Status::OK;
+    }
+    auto identity = GetExternalIdentity(request->client_id());
+    if (!identity) {
+      SetBool(response, false, "external-KV identity is not registered for client_id");
+      return grpc::Status::OK;
+    }
+    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+    SetBool(response, identity->ReportExternalKvBlocks(hashes, TierFromProto(request->tier())));
     return grpc::Status::OK;
   }
 
   grpc::Status RevokeExternalKvBlocks(grpc::ServerContext*,
-                                      const ::umbp::StandaloneExternalKvMutationRequest*,
+                                      const ::umbp::StandaloneExternalKvMutationRequest* request,
                                       ::umbp::BoolResponse* response) override {
-    SetBool(response, true);
+    if (!BackendIsDistributed()) {
+      SetBool(response, true);
+      return grpc::Status::OK;
+    }
+    auto identity = GetExternalIdentity(request->client_id());
+    if (!identity) {
+      SetBool(response, false, "external-KV identity is not registered for client_id");
+      return grpc::Status::OK;
+    }
+    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+    SetBool(response, identity->RevokeExternalKvBlocks(hashes, TierFromProto(request->tier())));
     return grpc::Status::OK;
   }
 
-  grpc::Status RevokeAllExternalKvBlocksAtTier(grpc::ServerContext*,
-                                               const ::umbp::StandaloneExternalKvTierRequest*,
-                                               ::umbp::BoolResponse* response) override {
-    SetBool(response, true);
+  grpc::Status RevokeAllExternalKvBlocksAtTier(
+      grpc::ServerContext*, const ::umbp::StandaloneExternalKvTierRequest* request,
+      ::umbp::BoolResponse* response) override {
+    if (!BackendIsDistributed()) {
+      SetBool(response, true);
+      return grpc::Status::OK;
+    }
+    auto identity = GetExternalIdentity(request->client_id());
+    if (!identity) {
+      SetBool(response, false, "external-KV identity is not registered for client_id");
+      return grpc::Status::OK;
+    }
+    SetBool(response, identity->RevokeAllExternalKvBlocksAtTier(TierFromProto(request->tier())));
     return grpc::Status::OK;
   }
 
   grpc::Status MatchExternalKv(grpc::ServerContext*,
-                               const ::umbp::StandaloneMatchExternalKvRequest*,
-                               ::umbp::StandaloneMatchExternalKvResponse*) override {
+                               const ::umbp::StandaloneMatchExternalKvRequest* request,
+                               ::umbp::StandaloneMatchExternalKvResponse* response) override {
+    if (!BackendIsDistributed()) return grpc::Status::OK;
+    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+    std::vector<IUMBPClient::ExternalKvMatch> matches;
+    if (auto identity = GetExternalIdentity(request->client_id())) {
+      matches = identity->MatchExternalKv(hashes, request->count_as_hit());
+    } else {
+      std::lock_guard<std::mutex> lock(client_mu_);
+      if (!shutdown_.load()) matches = client_->MatchExternalKv(hashes, request->count_as_hit());
+    }
+    FillExternalKvMatches(matches, response);
     return grpc::Status::OK;
   }
 
-  grpc::Status GetExternalKvHitCounts(grpc::ServerContext*,
-                                      const ::umbp::StandaloneExternalKvHitCountsRequest*,
-                                      ::umbp::StandaloneExternalKvHitCountsResponse*) override {
+  grpc::Status GetExternalKvHitCounts(
+      grpc::ServerContext*, const ::umbp::StandaloneExternalKvHitCountsRequest* request,
+      ::umbp::StandaloneExternalKvHitCountsResponse* response) override {
+    if (!BackendIsDistributed()) return grpc::Status::OK;
+    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+    std::vector<IUMBPClient::ExternalKvHitCountEntry> entries;
+    if (auto identity = GetExternalIdentity(request->client_id())) {
+      entries = identity->GetExternalKvHitCounts(hashes);
+    } else {
+      std::lock_guard<std::mutex> lock(client_mu_);
+      if (!shutdown_.load()) entries = client_->GetExternalKvHitCounts(hashes);
+    }
+    FillExternalKvHitCounts(entries, response);
     return grpc::Status::OK;
   }
 
@@ -413,6 +508,83 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     uint64_t worker_base = 0;
     uint64_t size = 0;
   };
+
+  bool BackendIsDistributed() const {
+    return client_ && client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed;
+  }
+
+  std::string BackendPeerAddress() const {
+    if (!backend_config_.distributed.has_value()) return "";
+    const auto& dist = backend_config_.distributed.value();
+    if (dist.peer_service_port == 0 || dist.master_config.node_address.empty()) return "";
+    return dist.master_config.node_address + ":" + std::to_string(dist.peer_service_port);
+  }
+
+  bool EnsureExternalIdentity(const ::umbp::RegisterMemoryRequest& request) {
+    if (!BackendIsDistributed()) return true;
+    if (request.worker_node_id().empty()) return true;
+    if (!backend_config_.distributed.has_value()) return false;
+
+    std::shared_ptr<ExternalKvIdentityClient> old;
+    {
+      std::lock_guard<std::mutex> lock(external_identity_mu_);
+      auto it = external_identities_.find(request.client_id());
+      if (it != external_identities_.end()) {
+        if (it->second && it->second->node_id() == request.worker_node_id()) return true;
+        old = std::move(it->second);
+        external_identities_.erase(it);
+      }
+    }
+    if (old) old->Stop();
+
+    const auto& dist = backend_config_.distributed.value();
+    ExternalKvIdentityClient::Config cfg;
+    cfg.master_address = dist.master_config.master_address;
+    cfg.node_id = request.worker_node_id();
+    cfg.node_address = request.worker_node_address();
+    cfg.peer_address = BackendPeerAddress();
+    cfg.tags.assign(request.tags().begin(), request.tags().end());
+
+    auto identity = std::make_shared<ExternalKvIdentityClient>(std::move(cfg));
+    if (!identity->Start()) return false;
+
+    {
+      std::lock_guard<std::mutex> lock(external_identity_mu_);
+      external_identities_[request.client_id()] = identity;
+    }
+    return true;
+  }
+
+  std::shared_ptr<ExternalKvIdentityClient> GetExternalIdentity(const std::string& client_id) {
+    std::lock_guard<std::mutex> lock(external_identity_mu_);
+    auto it = external_identities_.find(client_id);
+    return it == external_identities_.end() ? nullptr : it->second;
+  }
+
+  void RemoveExternalIdentity(const std::string& client_id) {
+    std::shared_ptr<ExternalKvIdentityClient> identity;
+    {
+      std::lock_guard<std::mutex> lock(external_identity_mu_);
+      auto it = external_identities_.find(client_id);
+      if (it == external_identities_.end()) return;
+      identity = std::move(it->second);
+      external_identities_.erase(it);
+    }
+    if (identity) identity->Stop();
+  }
+
+  void UnregisterAllExternalIdentities() {
+    std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
+    std::vector<std::shared_ptr<ExternalKvIdentityClient>> identities;
+    {
+      std::lock_guard<std::mutex> lock(external_identity_mu_);
+      for (auto& kv : external_identities_) identities.push_back(std::move(kv.second));
+      external_identities_.clear();
+    }
+    for (auto& identity : identities) {
+      if (identity) identity->Stop();
+    }
+  }
 
   bool StartFdListener() {
     listen_fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -509,33 +681,63 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       MORI_UMBP_WARN("[StandaloneServer] mmap received fd failed: {}", std::strerror(errno));
       return false;
     }
+    if (!RegisterBackendMemory(mapped, static_cast<size_t>(msg.size))) {
+      MORI_UMBP_WARN("[StandaloneServer] backend RegisterMemory failed for client_id={}",
+                     msg.client_id);
+      munmap(mapped, static_cast<size_t>(msg.size));
+      return false;
+    }
 
     std::string client_id(msg.client_id);
-    std::lock_guard<std::mutex> lock(memory_mu_);
-    auto old = memory_.find(client_id);
-    if (old != memory_.end() && old->second.base) {
-      munmap(old->second.base, static_cast<size_t>(old->second.size));
+    std::optional<RegisteredMemory> old_mem;
+    {
+      std::lock_guard<std::mutex> lock(memory_mu_);
+      auto old = memory_.find(client_id);
+      if (old != memory_.end()) old_mem = old->second;
+      memory_[client_id] =
+          RegisteredMemory{mapped, static_cast<uint64_t>(msg.worker_base), msg.size};
     }
-    memory_[client_id] = RegisteredMemory{mapped, static_cast<uint64_t>(msg.worker_base), msg.size};
+    if (old_mem.has_value()) ReleaseRegisteredMemory(*old_mem);
     MORI_UMBP_INFO("[StandaloneServer] registered shm client_id={} worker_base=0x{:x} size={}MB",
                    client_id, msg.worker_base, msg.size / (1024 * 1024));
     return true;
   }
 
   void UnmapClient(const std::string& client_id) {
-    std::lock_guard<std::mutex> lock(memory_mu_);
-    auto it = memory_.find(client_id);
-    if (it == memory_.end()) return;
-    if (it->second.base) munmap(it->second.base, static_cast<size_t>(it->second.size));
-    memory_.erase(it);
+    std::optional<RegisteredMemory> mem;
+    {
+      std::lock_guard<std::mutex> lock(memory_mu_);
+      auto it = memory_.find(client_id);
+      if (it == memory_.end()) return;
+      mem = it->second;
+      memory_.erase(it);
+    }
+    ReleaseRegisteredMemory(*mem);
   }
 
   void UnmapAll() {
-    std::lock_guard<std::mutex> lock(memory_mu_);
-    for (auto& kv : memory_) {
-      if (kv.second.base) munmap(kv.second.base, static_cast<size_t>(kv.second.size));
+    std::vector<RegisteredMemory> entries;
+    {
+      std::lock_guard<std::mutex> lock(memory_mu_);
+      for (auto& kv : memory_) entries.push_back(kv.second);
+      memory_.clear();
     }
-    memory_.clear();
+    for (const auto& mem : entries) ReleaseRegisteredMemory(mem);
+  }
+
+  bool RegisterBackendMemory(void* base, size_t size) {
+    std::lock_guard<std::mutex> lock(client_mu_);
+    if (shutdown_.load()) return false;
+    return client_->RegisterMemory(reinterpret_cast<uintptr_t>(base), size);
+  }
+
+  void ReleaseRegisteredMemory(const RegisteredMemory& mem) {
+    if (!mem.base) return;
+    {
+      std::lock_guard<std::mutex> lock(client_mu_);
+      client_->DeregisterMemory(reinterpret_cast<uintptr_t>(mem.base));
+    }
+    munmap(mem.base, static_cast<size_t>(mem.size));
   }
 
   bool ResolveRange(const std::string& client_id, uint64_t offset, uint64_t size,
@@ -584,7 +786,32 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     for (int i = 0; i < n; ++i) response->add_ok(false);
   }
 
-  StandaloneClient client_;
+  static void FillExternalKvMatches(const std::vector<IUMBPClient::ExternalKvMatch>& matches,
+                                    ::umbp::StandaloneMatchExternalKvResponse* response) {
+    for (const auto& match : matches) {
+      auto* out = response->add_matches();
+      out->set_node_id(match.node_id);
+      out->set_peer_address(match.peer_address);
+      for (const auto& [tier, hashes] : match.hashes_by_tier) {
+        auto* bucket = out->add_hashes_by_tier();
+        bucket->set_tier(TierToProto(tier));
+        for (const auto& hash : hashes) bucket->add_hashes(hash);
+      }
+    }
+  }
+
+  static void FillExternalKvHitCounts(
+      const std::vector<IUMBPClient::ExternalKvHitCountEntry>& entries,
+      ::umbp::StandaloneExternalKvHitCountsResponse* response) {
+    for (const auto& entry : entries) {
+      auto* out = response->add_entries();
+      out->set_hash(entry.hash);
+      out->set_hit_count_total(entry.hit_count_total);
+    }
+  }
+
+  UMBPConfig backend_config_;
+  std::unique_ptr<IUMBPClient> client_;
   std::string address_;
   std::string fd_socket_path_;
   std::unique_ptr<grpc::Server> server_;
@@ -593,6 +820,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   std::mutex client_mu_;
   std::mutex memory_mu_;
   std::map<std::string, RegisteredMemory> memory_;
+  std::mutex external_identity_lifecycle_mu_;
+  std::mutex external_identity_mu_;
+  std::map<std::string, std::shared_ptr<ExternalKvIdentityClient>> external_identities_;
 
   std::atomic<bool> fd_running_{false};
   int listen_fd_ = -1;

@@ -250,6 +250,13 @@ struct UMBPStandaloneProcessConfig {
   std::string address;             // e.g. unix:///run/umbp/standalone/node0.grpc.sock
   bool auto_start = false;         // opt-in fork+exec convenience path
   int startup_timeout_ms = 30000;  // readiness wait bound for auto_start
+
+  // Optional distributed identity for external-KV reports routed through a
+  // distributed-backed standalone server. Empty means external-KV identity is
+  // not requested for this worker.
+  std::string worker_node_id;
+  std::string worker_node_address;
+  std::vector<std::string> tags;
 };
 
 struct UMBPConfig {
