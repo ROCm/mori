@@ -458,5 +458,64 @@ TEST_P(RedisStoreTest, UnregisterWipesBlocksAcrossShards) {
   for (bool e : store_->BatchExistsBlock(keys)) EXPECT_FALSE(e);
 }
 
+// Fault tolerance: with one shard instance down, reads for keys on the healthy
+// shards still resolve and keys on the dead shard degrade to a miss (no throw).
+// Control + shard 0 live; shard 1 points at a closed port.
+TEST(RedisFaultToleranceTest, DownShardDegradesToMissNotError) {
+  redis::RespClient::Options opts;
+  opts.uri = RedisUri();
+  opts.pool_size = 2;
+  redis::RespClient probe(opts);
+  if (!probe.Ping()) {
+    GTEST_SKIP() << "no RESP store reachable at " << RedisUri() << "; skipping";
+  }
+
+  const std::string ns = UniqueNamespace();
+  // Two shards: pick a key on each (shard 0 = live endpoint 0, shard 1 = dead).
+  redis::KeySchema schema(ns, 2);
+  std::string live_key, dead_key;
+  for (int i = 0; (live_key.empty() || dead_key.empty()) && i < 100000; ++i) {
+    const std::string k = "ft-" + std::to_string(i);
+    if (schema.ShardOf(k) == 0 && live_key.empty()) live_key = k;
+    if (schema.ShardOf(k) == 1 && dead_key.empty()) dead_key = k;
+  }
+  ASSERT_FALSE(live_key.empty());
+  ASSERT_FALSE(dead_key.empty());
+
+  RedisMasterMetadataStore::Config cfg;
+  cfg.namespace_id = ns;
+  cfg.connect_timeout_ms = 300;  // fail fast on the dead endpoint
+  cfg.socket_timeout_ms = 300;
+  cfg.shard_uris = {RedisUri(), "tcp://127.0.0.1:6399"};  // 6399: nothing listening
+  RedisMasterMetadataStore store(cfg);
+
+  const auto now = std::chrono::system_clock::now();
+  ClientRegistration reg;
+  reg.node_id = "ftn";
+  reg.node_address = "a";
+  reg.peer_address = "p:1";
+  reg.tier_capacities[TierType::DRAM] = TierCapacity{1u << 20, 1u << 20};
+  ASSERT_TRUE(store.RegisterClient(reg, now, 30s));  // control endpoint is live
+
+  // Seed only the live shard (a delta touching just shard 0's instance).
+  ASSERT_EQ(store.ApplyHeartbeat("ftn", 1, now, {}, {{KvEvent::Kind::ADD, live_key, TierType::DRAM, 7}},
+                                 false)
+                .status,
+            HeartbeatResult::APPLIED);
+
+  // Batch spanning the live and the dead shard must NOT throw; live key resolves,
+  // dead-shard key reads as a miss.
+  auto exists = store.BatchExistsBlock({live_key, dead_key});
+  ASSERT_EQ(exists.size(), 2u);
+  EXPECT_TRUE(exists[0]);
+  EXPECT_FALSE(exists[1]);
+
+  auto locs = store.BatchLookupBlockForRouteGet({live_key, dead_key}, {}, now, 10s);
+  ASSERT_EQ(locs.size(), 2u);
+  ASSERT_EQ(locs[0].size(), 1u);
+  EXPECT_EQ(locs[0][0].size, 7u);
+  EXPECT_TRUE(locs[1].empty());
+}
+
 }  // namespace
 }  // namespace mori::umbp

@@ -22,7 +22,6 @@
 #include "umbp/distributed/master/redis_master_metadata_store.h"
 
 #include <algorithm>
-#include <exception>
 #include <future>
 #include <stdexcept>
 #include <unordered_map>
@@ -193,12 +192,14 @@ ShardedBatch GroupKeysByShard(const redis::KeySchema& schema,
 }
 
 // One instance's slice of a sharded batch: which groups it serves, the block
-// keys per group, and (after the call) that instance's replies.
+// keys per group, and (after the call) that instance's replies or an error.
 struct ShardCall {
   redis::RespClient* client = nullptr;
   std::vector<size_t> groups;
   std::vector<std::vector<std::string>> keys;
   std::vector<RespValue> replies;
+  bool ok = true;
+  std::string error;
 };
 
 // Run `script` over a sharded batch, routing each shard-group to the client
@@ -207,8 +208,14 @@ struct ShardCall {
 // thread (no pool use). A multi-endpoint one issues each instance's pipeline
 // CONCURRENTLY via `pool` (one round trip instead of N — the win on high-RTT
 // remote stores), then scatters replies on the calling thread so on_key needs
-// no locking. Invokes on_key(orig_index, reply_element) for every key; throws
-// on a script error or transport failure.
+// no locking.
+//
+// Fault tolerance: in multi-endpoint mode a single instance that is down /
+// erroring does NOT fail the whole batch — its keys are simply left untouched
+// (the caller's default is a miss: empty locations / exists=false), so RouteGet
+// keeps serving keys on the healthy shards. A WARN is logged per failed
+// instance. In single-endpoint mode there is nothing to fall back to, so a
+// failure propagates (a total outage must surface, not masquerade as misses).
 template <typename ClientForGroup, typename Fn>
 void RunShardedRead(const ShardedBatch& batch, const std::string& script,
                     const std::vector<std::string>& shared_args, const char* method,
@@ -230,40 +237,50 @@ void RunShardedRead(const ShardedBatch& batch, const std::string& script,
     calls.push_back(std::move(c));
   }
 
-  auto do_eval = [&](ShardCall& c) { c.replies = c.client->EvalPipeline(script, c.keys, shared_args); };
+  // Capture a transport failure into the ShardCall rather than throwing, so one
+  // dead instance can be tolerated below instead of aborting the fan-out.
+  auto do_eval = [&](ShardCall& c) {
+    try {
+      c.replies = c.client->EvalPipeline(script, c.keys, shared_args);
+    } catch (const std::exception& e) {
+      c.ok = false;
+      c.error = e.what();
+    }
+  };
 
   if (calls.size() <= 1 || pool == nullptr) {
     for (auto& c : calls) do_eval(c);  // single instance / no pool: inline.
   } else {
     // Fan the extra instances out to the pool, run the first inline, then join
-    // every future before propagating so no task outlives this scope.
+    // every future so no task outlives this scope (do_eval never throws).
     std::vector<std::future<void>> futs;
     futs.reserve(calls.size() - 1);
     for (size_t i = 1; i < calls.size(); ++i) {
       futs.push_back(pool->Enqueue([&do_eval, &calls, i] { do_eval(calls[i]); }));
     }
-    std::exception_ptr err;
-    try {
-      do_eval(calls[0]);
-    } catch (...) {
-      err = std::current_exception();
-    }
-    for (auto& f : futs) {
-      try {
-        f.get();
-      } catch (...) {
-        if (!err) err = std::current_exception();
-      }
-    }
-    if (err) std::rethrow_exception(err);
+    do_eval(calls[0]);
+    for (auto& f : futs) f.get();
   }
+
+  const bool tolerate = calls.size() > 1;  // multi-endpoint: degrade a down shard to misses.
 
   // Scatter replies back to caller order (single-threaded; on_key is unlocked).
   for (const ShardCall& c : calls) {
+    if (!c.ok) {
+      if (!tolerate) throw std::runtime_error(std::string("[RedisStore] ") + method + ": " + c.error);
+      MORI_UMBP_WARN("[RedisStore] {}: shard instance unavailable, its keys read as miss: {}",
+                     method, c.error);
+      continue;  // leave this shard's keys at the caller's default (miss).
+    }
     for (size_t k = 0; k < c.groups.size() && k < c.replies.size(); ++k) {
       const RespValue& reply = c.replies[k];
       if (reply.is_error()) {
-        throw std::runtime_error(std::string("[RedisStore] ") + method + ": " + reply.str);
+        if (!tolerate) {
+          throw std::runtime_error(std::string("[RedisStore] ") + method + ": " + reply.str);
+        }
+        MORI_UMBP_WARN("[RedisStore] {}: shard script error, its keys read as miss: {}", method,
+                       reply.str);
+        continue;
       }
       if (!reply.is_array()) continue;
       const auto& orig_indices = batch.orig_index_by_shard[c.groups[k]];

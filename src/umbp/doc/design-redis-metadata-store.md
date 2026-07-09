@@ -248,6 +248,17 @@ thread churn). The pool is sized `min(64, endpoints*8)`; single-endpoint mode
 uses no pool and runs inline (zero change). Replies are scattered on the calling
 thread, so the per-key decode needs no locking.
 
+**Read fault tolerance.** In multi-endpoint mode, if one shard instance is down
+or errors, the batch read does NOT fail: that shard's keys are left at the
+caller's default (a miss — empty locations / `exists=false`) and a WARN is
+logged, so RouteGet keeps serving keys on the healthy shards. Single-endpoint
+mode still propagates the error (a total outage must surface, not masquerade as
+misses). The **write** path (heartbeat / unregister / expire) is deliberately
+strict: a down shard makes that node's block-apply throw so the peer retries
+rather than silently dropping locations; the node's updates resume (and any gap
+heals via `full_sync`) once the shard is back. Gracefully degrading writes with
+a recovery marker is a possible follow-up.
+
 Single-endpoint mode (no `UMBP_REDIS_SHARD_URIS`) keeps the original single
 atomic scripts unchanged.
 
