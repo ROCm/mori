@@ -7,14 +7,16 @@ peer addresses are computed in-kernel via `cco.Window(arena).lsa_ptr(pe, off)`,
 no host P2P tables. Reference = ROCm/FlyDSL PR #522
 (`dispatch_combine_intranode_{kernel,op}.py`).
 
-Supported: bf16 + f32 token dtype; gather (UseP2PRead) **and** scatter
-(`_nop2p`) combine; weighted combine (`out_weights`); StdMoE
-(ConvertDispatchOutput / ConvertCombineInput, standalone + wired into the op);
-fp8_direct_cast **and fp8_blockwise quant** (scatter); per-token scales
-forwarding; `max_total_recv_tokens` cap; mori-parity host op-layer + tuning
-table. fp4 accum branch present but gfx950-only (these cvt intrinsics don't
-exist on gfx942). Note: gfx942 fp8 is e4m3**fnuz** (max 240). Not done:
-`skip_stage1` (FlyDSL-only).
+Supported token dtypes: **bf16**, **f32**, **fp8** (gather-only; OCP e4m3 on
+gfx950, e4m3**fnuz** max 240 on gfx942) and **fp4** (e2m1, gather-only,
+**gfx950-only** — the `cvt_scalef32_*_fp4` intrinsics don't exist on gfx942).
+Combine: gather (UseP2PRead) **and** scatter (`_nop2p`); weighted combine
+(`out_weights`); StdMoE (ConvertDispatchOutput / ConvertCombineInput, standalone
++ wired into the op); fp8 combine-wire **quant** (`fp8_direct_cast` **and**
+`fp8_blockwise`, scatter-only — distinct from the plain fp8 token dtype, which
+keeps a bf16 external payload); per-token scales forwarding;
+`max_total_recv_tokens` cap; mori-parity host op-layer + per-device,
+dtype-aware tuning table. Not done: `skip_stage1` (FlyDSL-only).
 
 > **Test-only, not a mori API (yet).** These modules import each other by
 > top-level name (`from intranode_kernels import ...`, `import flydsl_prims as P`)
@@ -38,24 +40,28 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 
 | file | role |
 |---|---|
-| `dist_common.py` | torchrun bootstrap (gloo only carries the cco unique-id) |
-| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM` |
+| `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
+| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED` |
 | `run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
 
-## Run (inside the gfx942 container)
+(Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
+
+## Run (inside the container, 8 GPUs)
+
+`torchrun --standalone` uses a localhost rendezvous, so no socket-iface env is
+needed. Intranode only (no GDA/RDMA).
 
 ```bash
 cd tests/python/ops/dispatch_combine_v2
-unset PYTHONPATH LD_LIBRARY_PATH MORI_CCO_BC
-export MORI_SOCKET_IFNAME=enp159s0np0 MORI_CCO_GDA_CONN=full
 
-torchrun --standalone --nproc_per_node=8 bench_dispatch_combine.py   # correctness + perf
-torchrun --standalone --nproc_per_node=8 test_op.py                  # op-layer correctness
+pytest test_dispatch_combine_v2_intranode.py -v                       # EP8 correctness (all modes)
+torchrun --standalone --nproc_per_node=8 test_op.py                   # op-layer correctness (env-driven)
+torchrun --standalone --nproc_per_node=8 bench_dispatch_combine.py    # perf + e2e correctness
 ```
 
-Config via env: `HIDDEN`, `TOPK`, `EPR`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`,
-`MODE=eager|graph|both`.
+Config via env: `HIDDEN`, `TOPK`, `EPR`, `SWEEP`, `DTYPE`, `COMBINE`, `QUANT`,
+`DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE=eager|graph|both`, `TUNED`.
 
 ## Design notes
 
@@ -71,13 +77,16 @@ Config via env: `HIDDEN`, `TOPK`, `EPR`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WA
 - Self-written volatile/atomic spin-waits (`flydsl_prims.spin_until_*`) — mori-shmem's
   `wait_until_*` assert on a cco-only stack. Counters self-reset in-kernel → CUDAGraph-safe.
 
-## Perf (EP8, hidden=7168, top-k=8, 256 experts; dispatch 64blk / combine 128blk × 16warp, CUDA-graph)
+## Perf (EP8, hidden=7168, top-k=8, 256 experts; dispatch 64blk / combine 128blk × 16warp, CUDA-graph, bf16)
 
-Per-rank bandwidth (`recv_tok * hidden * 2 / time`); saturates near MI300X xGMI
-(mori reference on the same node: dispatch 304, combine 333 GB/s):
+Per-rank bandwidth = `recv_tok * per_token_bytes / time` (the bench sizes the
+payload per dtype, `hidden*2` for bf16). Indicative bf16 numbers on **MI308X
+(gfx942)** xGMI:
 
 | tok/rank | dispatch | combine |
 |---:|---:|---:|
 | 512  | 268 GB/s | 213 GB/s |
 | 2048 | 306 GB/s | 294 GB/s |
 | 8192 | 314 GB/s | 323 GB/s |
+
+Cross-impl (v2 vs mori v1) latency tables for fp8/fp4 are in PR ROCm/mori#448.

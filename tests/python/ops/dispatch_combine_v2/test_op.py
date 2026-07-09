@@ -32,12 +32,12 @@ import sys
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from mori.cco import Communicator
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
-sys.path.insert(0, _HERE)  # dist_common
 sys.path.insert(
     0, os.path.join(_ROOT, "python", "mori", "ops", "dispatch_combine_v2")
 )  # op + kernels
@@ -45,11 +45,39 @@ sys.path.insert(
     0, os.path.join(_ROOT, "examples", "cco", "python")
 )  # cco_example_common
 from cco_example_common import set_device, sync  # noqa: E402
-from dist_common import Dist  # noqa: E402
 from dispatch_combine_op import (  # noqa: E402
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
 )
+
+
+class Dist:
+    """Minimal torchrun/gloo bootstrap: RANK/WORLD_SIZE/LOCAL_RANK, carry the cco
+    unique-id (broadcast) and a test-only int allreduce. gloo (CPU) is just the
+    courier for the uid + pass/fail counts; cco does the GPU comm."""
+
+    def __init__(self):
+        self.rank = int(os.environ["RANK"])
+        self.world = int(os.environ["WORLD_SIZE"])
+        self.local_rank = int(os.environ["LOCAL_RANK"])
+        if not dist.is_initialized():
+            dist.init_process_group(backend="gloo")
+        torch.cuda.set_device(self.local_rank)
+
+    def bcast_uid(self, uid):
+        objs = [uid if self.rank == 0 else None]
+        dist.broadcast_object_list(objs, src=0)
+        return objs[0]
+
+    def allreduce_sum(self, value):
+        t = torch.tensor([value], dtype=torch.int64)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        return int(t.item())
+
+    def shutdown(self):
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
 
 HIDDEN = int(os.environ.get("HIDDEN", 7168))
 K = int(os.environ.get("TOPK", 8))
