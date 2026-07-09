@@ -18,7 +18,7 @@ RUN apt-get update && \
     cmake && \
     rm -rf /var/lib/apt/lists/*
 
-# ── Patch ROCm CLR for SWDEV-568260 (hipMemSetAccess sub-buffer validation bug) ──
+# ── Install patched ROCm CLR + ROCR via amdrocm7.13 package ──
 #
 # Bug: `hipMemSetAccess` validates sub-buffer coverage by iterating from
 # parent's sub-buffer 0, ignoring the ptr argument. Returns InvalidValue
@@ -75,14 +75,18 @@ RUN set -ex && \
         cd / && rm -rf /tmp/clr /tmp/hip; \
     fi
 
-# ── Patch ROCR runtime (libhsa-runtime64.so) from develop branch ──
+# ── Patch ROCR runtime (libhsa-runtime64.so) for MappedHandle DRM FD leak ──
 #
-# Build the latest rocr-runtime from the develop branch of rocm-systems
-# and replace the system libhsa-runtime64.so.
+# Bug: MappedHandleAllowedAgent destructor leaks DRM FDs, causing
+# hipMemMap failures after ~500 mappings (EMFILE).
+#
+# Fix: apply rocr-mapped-handle-fix.patch (from ROCm/rocm-systems#4363,
+# commit e27ce55c5) onto the matching rocm-X.Y.Z release tag.
 #
 # Only applies to ROCm >= 7.0 (matching the CLR patch above).
 #
-# Remove this block once the base image ships a sufficient rocr-runtime.
+# Remove this block once the base image ships a rocr-runtime with the fix.
+COPY docker/rocr-mapped-handle-fix.patch /tmp/rocr-mapped-handle-fix.patch
 RUN set -ex && \
     ROCM_VER=$(cat /opt/rocm/.info/version 2>/dev/null | head -c 5) && \
     test -n "${ROCM_VER}" || { echo "ERROR: cannot read /opt/rocm/.info/version"; exit 1; } && \
@@ -96,16 +100,12 @@ RUN set -ex && \
         rm -rf /var/lib/apt/lists/* && \
         LIBHSA_TARGET=$(basename $(readlink -f /opt/rocm/lib/libhsa-runtime64.so.1)) && \
         echo "Patching libhsa-runtime64.so on ROCm ${ROCM_VER}, target=${LIBHSA_TARGET}" && \
-        git clone --depth 1 --branch develop --quiet \
+        git clone --depth 1 --branch rocm-${ROCM_VER} --quiet \
             https://github.com/ROCm/rocm-systems.git /tmp/rocm-systems && \
-        sed -i 's/;gfx1200;gfx1250//' \
-            /tmp/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/trap_handler/CMakeLists.txt && \
-        sed -i 's/;_gfx12;_gfx12//' \
-            /tmp/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/trap_handler/CMakeLists.txt && \
-        sed -i 's/kCodeTrapHandlerV2_1250/kCodeTrapHandlerV2_11/g; s/kCodeTrapHandlerV2_12/kCodeTrapHandlerV2_11/g' \
-            /tmp/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp && \
-        mkdir /tmp/rocm-systems/projects/rocr-runtime/build && \
-        cd /tmp/rocm-systems/projects/rocr-runtime/build && \
+        cd /tmp/rocm-systems && \
+        git apply /tmp/rocr-mapped-handle-fix.patch && \
+        mkdir projects/rocr-runtime/build && \
+        cd projects/rocr-runtime/build && \
         cmake -DCMAKE_PREFIX_PATH=/opt/rocm \
               -DCMAKE_INSTALL_PREFIX=/opt/rocm \
               -DBUILD_SHARED_LIBS=ON .. && \
@@ -115,3 +115,5 @@ RUN set -ex && \
         cp "${BUILT_LIB}" /opt/rocm/lib/${LIBHSA_TARGET} && \
         cd / && rm -rf /tmp/rocm-systems; \
     fi
+
+RUN pip install --no-cache-dir flydsl
