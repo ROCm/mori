@@ -45,6 +45,7 @@
 #include "umbp/distributed/master/master_metadata_store.h"
 #include "umbp/distributed/master/redis/key_schema.h"
 #include "umbp/distributed/master/redis/resp_client.h"
+#include "umbp/distributed/master/redis/thread_pool.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -161,6 +162,9 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
   // clients_[0] is the control instance; clients_[s] backs block shard s.
   // mutable so const read methods can borrow a pooled connection.
   mutable std::vector<std::unique_ptr<redis::RespClient>> clients_;
+  // Workers that issue a multi-endpoint read fan-out's per-instance calls
+  // concurrently (one round trip instead of N). Null in single-endpoint mode.
+  std::unique_ptr<redis::ThreadPool> fanout_pool_;
 };
 
 }  // namespace mori::umbp

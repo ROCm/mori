@@ -236,11 +236,20 @@ clear+replay, and node-wipe are all **idempotent**, so a failed/retried block
 step is safe; a partial failure surfaces as an exception, the peer retries, the
 next heartbeat seq-gaps, and `full_sync` heals the node's locations wholesale.
 This is the same "atomic per key/shard, not globally atomic" posture the
-in-memory backend already documents. Reads (`BatchLookupBlockForRouteGet`,
-`BatchExistsBlock`) group keys by shard and issue one `EvalPipeline` per instance
-(sequential today; throughput still scales because the master serves many
-RouteGets concurrently). Single-endpoint mode (no `UMBP_REDIS_SHARD_URIS`) keeps
-the original single atomic scripts unchanged.
+in-memory backend already documents.
+
+Reads (`BatchLookupBlockForRouteGet`, `BatchExistsBlock`) group keys by shard
+and issue each instance's `EvalPipeline` **concurrently** through a small
+persistent worker pool (`redis/thread_pool.h`), so a batch's latency is one
+round trip rather than N — measured ~3.3x RouteGet throughput at 4 instances on
+a dedicated host (t8: 5.2k -> 17.3k ops/s, p50 1527us -> 462us), better than the
+sequential fan-out (13k) and far better than per-call `std::async` (8k, killed by
+thread churn). The pool is sized `min(64, endpoints*8)`; single-endpoint mode
+uses no pool and runs inline (zero change). Replies are scattered on the calling
+thread, so the per-key decode needs no locking.
+
+Single-endpoint mode (no `UMBP_REDIS_SHARD_URIS`) keeps the original single
+atomic scripts unchanged.
 
 Notes:
 

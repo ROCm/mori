@@ -21,6 +21,9 @@
 // SOFTWARE.
 #include "umbp/distributed/master/redis_master_metadata_store.h"
 
+#include <algorithm>
+#include <exception>
+#include <future>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -189,40 +192,81 @@ ShardedBatch GroupKeysByShard(const redis::KeySchema& schema,
   return batch;
 }
 
+// One instance's slice of a sharded batch: which groups it serves, the block
+// keys per group, and (after the call) that instance's replies.
+struct ShardCall {
+  redis::RespClient* client = nullptr;
+  std::vector<size_t> groups;
+  std::vector<std::vector<std::string>> keys;
+  std::vector<RespValue> replies;
+};
+
 // Run `script` over a sharded batch, routing each shard-group to the client
 // returned by client_for_group(group) — one EvalPipeline per distinct client.
-// A single-endpoint deployment is one pipelined round trip; a multi-endpoint one
-// issues each instance's pipeline in turn. Throughput still scales with the
-// number of instances because the master serves many RouteGets concurrently
-// (gRPC handler threads), so all instances stay busy in parallel across
-// requests. (Per-request latency is N sequential round trips; issuing them
-// concurrently via a worker pool would cut single-request latency on high-RTT
-// remote stores — a measured follow-up: naive per-call std::async threads cost
-// more in churn than they save. See design-redis-metadata-store.md.)
-// Invokes on_key(orig_index, reply_element) for every key; throws on error.
+// A single-endpoint deployment is one pipelined round trip on the calling
+// thread (no pool use). A multi-endpoint one issues each instance's pipeline
+// CONCURRENTLY via `pool` (one round trip instead of N — the win on high-RTT
+// remote stores), then scatters replies on the calling thread so on_key needs
+// no locking. Invokes on_key(orig_index, reply_element) for every key; throws
+// on a script error or transport failure.
 template <typename ClientForGroup, typename Fn>
 void RunShardedRead(const ShardedBatch& batch, const std::string& script,
                     const std::vector<std::string>& shared_args, const char* method,
-                    ClientForGroup client_for_group, Fn&& on_key) {
+                    redis::ThreadPool* pool, ClientForGroup client_for_group, Fn&& on_key) {
   // Bucket group indices by the client that serves them.
   std::unordered_map<redis::RespClient*, std::vector<size_t>> groups_by_client;
   for (size_t g = 0; g < batch.keys_by_shard.size(); ++g) {
     groups_by_client[client_for_group(g)].push_back(g);
   }
 
+  std::vector<ShardCall> calls;
+  calls.reserve(groups_by_client.size());
   for (auto& [client, group_indices] : groups_by_client) {
-    std::vector<std::vector<std::string>> keys_per_call;
-    keys_per_call.reserve(group_indices.size());
-    for (size_t g : group_indices) keys_per_call.push_back(batch.keys_by_shard[g]);
+    ShardCall c;
+    c.client = client;
+    c.groups = std::move(group_indices);
+    c.keys.reserve(c.groups.size());
+    for (size_t g : c.groups) c.keys.push_back(batch.keys_by_shard[g]);
+    calls.push_back(std::move(c));
+  }
 
-    std::vector<RespValue> replies = client->EvalPipeline(script, keys_per_call, shared_args);
-    for (size_t k = 0; k < group_indices.size() && k < replies.size(); ++k) {
-      const RespValue& reply = replies[k];
+  auto do_eval = [&](ShardCall& c) { c.replies = c.client->EvalPipeline(script, c.keys, shared_args); };
+
+  if (calls.size() <= 1 || pool == nullptr) {
+    for (auto& c : calls) do_eval(c);  // single instance / no pool: inline.
+  } else {
+    // Fan the extra instances out to the pool, run the first inline, then join
+    // every future before propagating so no task outlives this scope.
+    std::vector<std::future<void>> futs;
+    futs.reserve(calls.size() - 1);
+    for (size_t i = 1; i < calls.size(); ++i) {
+      futs.push_back(pool->Enqueue([&do_eval, &calls, i] { do_eval(calls[i]); }));
+    }
+    std::exception_ptr err;
+    try {
+      do_eval(calls[0]);
+    } catch (...) {
+      err = std::current_exception();
+    }
+    for (auto& f : futs) {
+      try {
+        f.get();
+      } catch (...) {
+        if (!err) err = std::current_exception();
+      }
+    }
+    if (err) std::rethrow_exception(err);
+  }
+
+  // Scatter replies back to caller order (single-threaded; on_key is unlocked).
+  for (const ShardCall& c : calls) {
+    for (size_t k = 0; k < c.groups.size() && k < c.replies.size(); ++k) {
+      const RespValue& reply = c.replies[k];
       if (reply.is_error()) {
         throw std::runtime_error(std::string("[RedisStore] ") + method + ": " + reply.str);
       }
       if (!reply.is_array()) continue;
-      const auto& orig_indices = batch.orig_index_by_shard[group_indices[k]];
+      const auto& orig_indices = batch.orig_index_by_shard[c.groups[k]];
       for (size_t j = 0; j < orig_indices.size() && j < reply.elements.size(); ++j) {
         on_key(orig_indices[j], reply.elements[j]);
       }
@@ -256,10 +300,17 @@ RedisMasterMetadataStore::RedisMasterMetadataStore(const Config& config)
   }
 
   if (multi_endpoint()) {
+    // Workers to fan the per-instance read calls out concurrently. Sized so a
+    // handful of in-flight RouteGets can each parallelize their N instance calls
+    // without per-call thread churn; workers block on Redis I/O so a generous
+    // count is cheap. Capped to keep it bounded.
+    const std::size_t pool_threads = std::min<std::size_t>(64, clients_.size() * 8);
+    fanout_pool_ = std::make_unique<redis::ThreadPool>(pool_threads);
+
     std::string joined;
     for (size_t i = 0; i < uris.size(); ++i) joined += (i ? "," : "") + uris[i];
-    MORI_UMBP_INFO("[RedisStore] multi-endpoint namespace={} pool={} endpoints={} [{}]",
-                   config.namespace_id, config.pool_size, uris.size(), joined);
+    MORI_UMBP_INFO("[RedisStore] multi-endpoint namespace={} pool={} endpoints={} fanout={} [{}]",
+                   config.namespace_id, config.pool_size, uris.size(), pool_threads, joined);
   } else {
     MORI_UMBP_INFO("[RedisStore] backend at {} namespace={} pool={} block_shards={}", config.uri,
                    config.namespace_id, config.pool_size, keys_.NumShards());
@@ -512,7 +563,7 @@ std::vector<std::vector<Location>> RedisMasterMetadataStore::BatchLookupBlockFor
   // their own instance. Each key's reply is a flat [node, size, tier, ...] list.
   const ShardedBatch batch = GroupKeysByShard(keys_, keys);
   RunShardedRead(
-      batch, redis::kRouteGetBatchLua, args, "BatchLookupBlockForRouteGet",
+      batch, redis::kRouteGetBatchLua, args, "BatchLookupBlockForRouteGet", fanout_pool_.get(),
       [&](size_t group) { return &client_for_shard(batch.shard_of_group[group]); },
       [&](size_t orig_index, const RespValue& locs) {
         if (!locs.is_array()) return;
@@ -538,7 +589,7 @@ std::vector<bool> RedisMasterMetadataStore::BatchExistsBlock(
 
   const ShardedBatch batch = GroupKeysByShard(keys_, keys);
   RunShardedRead(
-      batch, redis::kExistsBatchLua, {}, "BatchExistsBlock",
+      batch, redis::kExistsBatchLua, {}, "BatchExistsBlock", fanout_pool_.get(),
       [&](size_t group) { return &client_for_shard(batch.shard_of_group[group]); },
       [&](size_t orig_index, const RespValue& has) { results[orig_index] = has.integer != 0; });
   return results;
