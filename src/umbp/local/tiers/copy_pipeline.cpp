@@ -76,6 +76,13 @@ void CopyPipeline::MaybeBatchCopyToSharedSSD(const std::vector<std::string>& key
   }
 }
 
+bool CopyPipeline::Drain(std::chrono::milliseconds timeout) {
+  if (copy_workers_.empty()) return true;
+  std::unique_lock<std::mutex> lock(copy_mu_);
+  return drain_cv_.wait_for(lock, timeout,
+                            [&]() { return copy_queue_.empty() && in_flight_copies_ == 0; });
+}
+
 bool CopyPipeline::EnqueueCopyToSSD(const std::string& key) {
   std::unique_lock<std::mutex> lock(copy_mu_);
   if (copy_queue_.size() >= config_.queue_depth) return false;
@@ -112,12 +119,19 @@ void CopyPipeline::CopyWorkerLoop() {
         batch.push_back(std::move(copy_queue_.front().key));
         copy_queue_.pop_front();
       }
+      ++in_flight_copies_;
     }
 
     if (batch.size() == 1) {
       storage_.CopyToSSD(batch[0]);
     } else {
       storage_.CopyToSSDBatch(batch);
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(copy_mu_);
+      if (in_flight_copies_ > 0) --in_flight_copies_;
+      if (copy_queue_.empty() && in_flight_copies_ == 0) drain_cv_.notify_all();
     }
   }
 }

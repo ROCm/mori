@@ -19,31 +19,30 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
 #pragma once
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <vector>
 
-#include "umbp/distributed/pool_client.h"
-#include "umbp/local/host_mem_allocator.h"
 #include "umbp/umbp_client.h"
+#include "umbp_standalone.grpc.pb.h"
 
-namespace mori::umbp {
+namespace mori::umbp::standalone {
 
-/// Distributed IUMBPClient implementation — master-led global routing
-/// with RDMA/MORI-IO data plane.  All routing decisions go through the
-/// Master; this client does not use LocalStorageManager or LocalBlockIndex.
-class DistributedClient : public IUMBPClient {
+class StandaloneProcessClient : public IUMBPClient {
  public:
-  explicit DistributedClient(const UMBPConfig& config);
-  ~DistributedClient() override;
+  explicit StandaloneProcessClient(const UMBPConfig& config);
+  ~StandaloneProcessClient() override;
 
-  // ---- IUMBPClient interface ----
   bool Put(const std::string& key, uintptr_t src, size_t size) override;
   bool Get(const std::string& key, uintptr_t dst, size_t size) override;
   bool Exists(const std::string& key) const override;
@@ -64,8 +63,10 @@ class DistributedClient : public IUMBPClient {
   bool Clear() override;
   bool Flush() override;
   void Close() override;
-  bool IsDistributed() const override;
-  UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Distributed; }
+  bool IsDistributed() const override { return false; }
+  UMBPDeploymentMode GetDeploymentMode() const override {
+    return UMBPDeploymentMode::StandaloneProcess;
+  }
 
   bool RegisterMemory(uintptr_t ptr, size_t size) override;
   void DeregisterMemory(uintptr_t ptr) override;
@@ -79,14 +80,28 @@ class DistributedClient : public IUMBPClient {
       const std::vector<std::string>& hashes) override;
 
  private:
+  bool OffsetFor(uintptr_t ptr, size_t size, uint64_t* offset) const;
+  bool WaitReady(int timeout_ms) const;
+  void MaybeAutoStart();
+  std::string ClientId();
+  void DeregisterMemoryLocked();
+
   UMBPConfig config_;
-  void* dram_pool_ = nullptr;
-  size_t dram_pool_size_ = 0;
-  HostBufferHandle dram_pool_handle_;
-  std::unique_ptr<PoolClient> pool_client_;
-  std::atomic<bool> closing_{false};
+  UMBPStandaloneProcessConfig standalone_config_;
+  std::string address_;
+  std::string fd_socket_path_;
+  std::shared_ptr<::grpc::ChannelInterface> channel_;
+  std::unique_ptr<::umbp::UMBPStandalone::Stub> stub_;
+
   mutable std::shared_mutex op_mutex_;
+  std::atomic<bool> closing_{false};
   bool closed_ = false;
+
+  mutable std::mutex registration_mu_;
+  std::string client_id_;
+  uintptr_t registered_base_ = 0;
+  size_t registered_size_ = 0;
+  bool registered_ = false;
 };
 
-}  // namespace mori::umbp
+}  // namespace mori::umbp::standalone

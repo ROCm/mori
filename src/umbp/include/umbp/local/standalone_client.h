@@ -63,6 +63,7 @@ class StandaloneClient : public IUMBPClient {
   bool Flush() override;
   void Close() override;
   bool IsDistributed() const override;
+  UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Local; }
 
   bool ReportExternalKvBlocks(const std::vector<std::string>& /*hashes*/,
                               TierType /*tier*/) override {

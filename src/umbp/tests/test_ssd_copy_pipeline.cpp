@@ -35,6 +35,9 @@
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/peer/peer_ssd_manager.h"
 #include "umbp/distributed/peer/ssd_copy_pipeline.h"
+#include "umbp/local/block_index/local_block_index.h"
+#include "umbp/local/tiers/copy_pipeline.h"
+#include "umbp/local/tiers/local_storage_manager.h"
 
 namespace mori::umbp {
 namespace {
@@ -335,6 +338,34 @@ TEST_F(SsdCopyPipelineTest, QuiesceThenClearLeavesNoStaleSsdState) {
   EXPECT_TRUE(ssd_->DrainPendingEvents().empty());
 
   pipeline.Stop();
+}
+
+TEST(LocalCopyPipelineDrainTest, DrainWaitsForQueuedCopies) {
+  UMBPConfig cfg;
+  cfg.role = UMBPRole::SharedSSDLeader;
+  cfg.force_ssd_copy_on_write = true;
+  cfg.dram.capacity_bytes = 1 << 20;
+  cfg.ssd.enabled = true;
+  cfg.ssd.ssd_backend = "dummy_storage";
+  cfg.ssd.capacity_bytes = 1 << 20;
+  cfg.copy_pipeline.async_enabled = true;
+  cfg.copy_pipeline.worker_threads = 1;
+  cfg.copy_pipeline.queue_depth = 8;
+
+  LocalBlockIndex index;
+  LocalStorageManager storage(cfg, &index);
+  CopyPipeline pipeline(storage, cfg.copy_pipeline, cfg.ResolveRole());
+
+  std::string payload = "copy-pipeline-drain";
+  ASSERT_TRUE(
+      storage.WriteFromPtr("k", reinterpret_cast<uintptr_t>(payload.data()), payload.size()));
+  index.Insert("k", {StorageTier::CPU_DRAM, 0, payload.size()});
+
+  ASSERT_TRUE(pipeline.MaybeCopyToSharedSSD("k"));
+  EXPECT_TRUE(pipeline.Drain(std::chrono::seconds(2)));
+  auto* ssd = storage.GetTier(StorageTier::LOCAL_SSD);
+  ASSERT_NE(ssd, nullptr);
+  EXPECT_TRUE(ssd->Exists("k"));
 }
 
 }  // namespace
