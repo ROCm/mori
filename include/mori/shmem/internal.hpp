@@ -154,6 +154,16 @@ struct GpuStates {
   // outstanding WQEs). 0 (default) = one WQE for the whole transfer = the proven
   // the prior behavior. Set from env MORI_RDMA_PUT_CHUNK_BYTES in GpuStateInit.
   size_t putChunkBytes{0};
+  // this work (drain-free landing fence): mlx5 ctrl-segment fence-mode value OR'd
+  // into fm_ce_se on the fused signal ATOMIC WQE. On RoCE RC a WRITE is NOT ordered
+  // before a following ATOMIC on the same QP, so the DEEP_PIPE put-with-signal AMO
+  // can be executed by the responder before its own large payload WRITE lands
+  // (>=64MB flag-beats-data race). A strong-ordering fence on the atomic WQE makes
+  // it wait for all prior WQEs (incl. the payload write) => the flag never precedes
+  // the landing, WITHOUT the send-CQ quiet-drain round-trip (which serializes the
+  // pipeline back to ~0.88x). 0 (default) = no fence bit = byte-identical shipped
+  // path. Set from env MORI_HIER_SIGNAL_FENCE in GpuStateInit (MLX5 only).
+  int signalFenceMode{0};
   application::TransportType* transportTypes{nullptr};
   ShmemRdmaEndpoint* rdmaEndpoints{nullptr};
   uint32_t* endpointLock{nullptr};

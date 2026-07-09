@@ -605,6 +605,19 @@ void GpuStateInit(ShmemStates* states) {
     const char* pcb = std::getenv("MORI_RDMA_PUT_CHUNK_BYTES");
     states->gpuStates.putChunkBytes = (pcb != nullptr) ? std::strtoull(pcb, nullptr, 10) : 0;
   }
+  // this work (drain-free landing fence): mlx5 strong-ordering fence bit on the
+  // fused signal ATOMIC WQE so it cannot overtake its own preceding large payload
+  // WRITE on RoCE RC (the >=64MB DEEP_PIPE flag-beats-data race). Value is OR'd
+  // into fm_ce_se; 3=STRONG_ORDERING (recommended), 2=FENCE. 0/unset = off =
+  // byte-identical shipped path. See GpuStates::signalFenceMode.
+  {
+    const char* sf = std::getenv("MORI_HIER_SIGNAL_FENCE");
+    int v = (sf != nullptr) ? std::atoi(sf) : 0;
+    // Encode the raw fence bits (shift into fm_ce_se[7:5]); accept 0..4 as the
+    // fence-mode selector, or a preshifted value. 1..4 => v<<5.
+    if (v >= 1 && v <= 4) v = v << 5;
+    states->gpuStates.signalFenceMode = v;
+  }
 
   // Copy communication metadata to GPU
   CopyTransportTypesToGpu(states);

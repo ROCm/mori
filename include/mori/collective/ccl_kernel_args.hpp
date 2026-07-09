@@ -66,6 +66,24 @@ inline bool HierFuseRemoteElasticOn() {
   const char* e = std::getenv("MORI_HIER_FUSE_REMOTE_ELASTIC");
   return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
 }
+// IN-KERNEL COPY-IN lever (MORI_HIER_FUSE_COPYIN, default OFF). The PERSISTENT-
+// SINGLE-KERNEL port (director 13:44Z): mori's per-op cost is the AGGREGATE ramp of
+// several serial GPU ops -- {host hipMemcpyAsync copy-IN of this PE's input into its
+// ring slot} -> {entry barrier} -> {fused ring+gather kernel} -> {finish fence} --
+// vs RCCL's ONE persistent fused kernel. This lever folds the copy-IN INTO the fused
+// kernel: each ring channel CTA stages its OWN send sub-range of gInput into the
+// local ring slot then __syncthreads() before the RDMA put, so the put sources valid
+// data with NO cross-CTA dependency (channel bx writes exactly the bytes it sends).
+// Combined with MORI_HIER_GEN_RING (drops the entry barrier) + slice_defer_fin
+// (defers the finish fence) the whole AG collapses to a SINGLE host kernel launch --
+// the untested aggregate collapse (copy-IN alone and GEN_RING alone were each
+// separately NEUTRAL; the persistent-kernel thesis is that killing the inter-launch
+// ramps TOGETHER closes the fixed ~0.3-0.5ms per-op floor that walls 64-128MB).
+// Default OFF => the host copy-IN runs, byte-identical shipped path.
+inline bool HierFuseCopyInOn() {
+  const char* e = std::getenv("MORI_HIER_FUSE_COPYIN");
+  return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+}
 // DEEP-SQ WQE-DEPTH lever (MORI_HIER_WQE_DEPTH, default 1 = byte-identical).
 // The crown big embed/lm_head inter-node put takes the fan-out path: the chunk is
 // split across numQp warps -> numQp QPs, each warp issuing ONE whole-sub-range
@@ -113,7 +131,7 @@ inline int HierDeepPipe() {
   if (e == nullptr || e[0] == '\0') return 1;
   int v = std::atoi(e);
   if (v < 1) return 1;
-  if (v > 8) return 8;
+  if (v > 16) return 16;
   return v;
 }
 
@@ -133,6 +151,31 @@ inline size_t HierDeepPipeMaxBytes() {
   long v = std::atol(e);
   if (v <= 0) return 0;
   return static_cast<size_t>(v) * 1024ull * 1024ull;
+}
+// WRITE_WITH_IMM per-sub-chunk landing for DEEP_PIPE (MORI_HIER_DEEP_PIPE_IMM,
+// default OFF). recv-CQE = definitive remote-landing (RC in-order per QP), but the
+// WRITE_WITH_IMM path is HW-unavailable on this mlx5 provider (asserts out), so this
+// stays OFF here; kept for portability. Only meaningful when deepPipe>1.
+inline bool HierDeepPipeImmOn() {
+  const char* e = std::getenv("MORI_HIER_DEEP_PIPE_IMM");
+  return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+}
+// QUIET-FENCE per-sub-chunk landing for DEEP_PIPE (MORI_HIER_DEEP_PIPE_QUIET,
+// default OFF). The put-with-signal AMO (deepPipeImm==0) fails bit-exact >=64MB
+// because the AMO can beat its own large-transfer data landing; WRITE_WITH_IMM
+// (deepPipeImm==1) is HW-unavailable on this mlx5 provider. This is the third,
+// scale-robust option: dedicate ONE QP per temporal sub-chunk, then instead of
+// fusing put+AMO, issue a PLAIN put and drain THAT QP's send-CQ with
+// ShmemQuietThread(pe, qpId) (== the sub-chunk's data has landed remotely, the
+// proven teamC quiet-drain fence, RC in-order) BEFORE the separate flag AMO. So
+// chunkReadyFlags[p] is published only after sub-chunk p physically landed --
+// bit-exact at scale (the mechanism teamC's ring uses for its >=32MiB parity)
+// while preserving the temporal pipeline (p's flag fires before p+1's data
+// finishes, since each sub-chunk drains its own QP in order). Only meaningful
+// when deepPipe>1; takes precedence over the racy put-signal path.
+inline bool HierDeepPipeQuietOn() {
+  const char* e = std::getenv("MORI_HIER_DEEP_PIPE_QUIET");
+  return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
 }
 
 // HOST-PROXY INTER + DEVICE REASSEMBLY composition (MORI_HIER_HOSTPROXY_REASM).
@@ -566,12 +609,28 @@ struct CclFusedRingRemoteGatherArgs {
   // P temporal sub-chunks with per-sub-chunk landing flags so reassembly overlaps
   // the still-in-flight later sub-chunks. 1 = OFF (byte-identical shipped path).
   int deepPipe = 1;
+  // Deep-SQ temporal pipeline landing fence: 0 = per-sub-chunk put-with-signal AMO
+  // (fails bit-exact >=64MB/P4 -- the AMO can beat its own large-transfer data);
+  // 1 = per-sub-chunk RDMA_WRITE_WITH_IMM (recv-CQE = definitive remote-landing,
+  // RC in-order per QP). See HierDeepPipeImmOn. Only meaningful when deepPipe>1.
+  int deepPipeImm = 0;
+  // Deep-SQ temporal pipeline QUIET landing fence (see HierDeepPipeQuietOn). 1 =>
+  // each temporal sub-chunk rides its OWN QP with a PLAIN put; thread drains that
+  // QP's send-CQ (ShmemQuietThread(pe,qpId) = sub-chunk landed remotely) BEFORE the
+  // separate flag AMO, so the flag never fires ahead of the data landing (bit-exact
+  // at scale, unlike the racy fused put-signal). 0 = OFF. Only when deepPipe>1.
+  int deepPipeQuiet = 0;
   // HOST-PROXY INTER + DEVICE REASSEMBLY (see HierHostProxyReasm). 1 => the device
   // ring-send blocks SKIP the RDMA send (a host proxy owns the inter leg and
   // publishes chunkReadyFlags[p] from the host after its send-CQ drains); the
   // device reassembly workers + completion reader are UNCHANGED. 0 = OFF
   // (byte-identical shipped path: device posts inter and publishes the flags).
   int hostProxyInter = 0;
+  // IN-KERNEL COPY-IN (see HierFuseCopyInOn). 1 => each ring channel CTA stages its
+  // own send sub-range of gInput into the local ring slot before the put (the host
+  // hipMemcpyAsync copy-IN is skipped on the Python side, prepare_stream_in_place).
+  // 0 = OFF (byte-identical shipped path: host copies input into the slot).
+  int fuseCopyIn = 0;
 };
 
 // Builder: merge an already-built ring args (CclInterNodeRingArgs) and gather
@@ -637,20 +696,27 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
   // chunk falls through to the whole-chunk crown fence (bit-exact at 466MB). 0 => no
   // gate (legacy).
   {
-    size_t dpMax = HierDeepPipeMaxBytes();
+    // dpMax is the PER-SUB-CHUNK coherence window (chunkBytes/dp), NOT the total
+    // chunk. The device per-sub-chunk landing flag is a pipeline HINT (E2E landing
+    // is anchored by the crown DEFER_HOSTSYNC host fence, T43 fence-role control);
+    // the real HW hazards are (a) the CRASH on very large sub-chunks (466MB giant
+    // AG) and (b) the >=32MB sub-chunk send-CQE-before-SDMA-coherent race. Gating on
+    // the SUB-CHUNK keeps DEEP_PIPE=4 engaged on the 34-67MB steady-state decoder AGs
+    // (8.5-16.75MB sub-chunks, strictly under 32MB) while the 466MB giant AG (116MB
+    // sub-chunk) falls through to the whole-chunk crown fence. Strict '<' so a 32MB
+    // sub-chunk (e.g. 64MB@dp=2) is caged, not engaged. Explicit MORI_HIER_DEEP_PIPE_MAX_MB
+    // overrides the window. dp<=1 => byte-identical shipped path.
+    size_t dpWindow = HierDeepPipeMaxBytes();
     const int dp = (fused.ringBlocks == 1) ? HierDeepPipe() : 1;
-    // SELF-SAFE DEFAULT (Turn44 A, 089/119): the device per-sub-chunk pipeline is
-    // bit-exact AND >native (P2=1.219-1.231x, P4=1.170x) at a 32MB per-PE chunk but
-    // bit-exact MISMATCHes at 64MB / crashes at 466MB (send-CQE fires before landed
-    // bytes are SDMA-coherent on this mlx5 provider). If the pipeline is enabled
-    // (dp>1) but no explicit MORI_HIER_DEEP_PIPE_MAX_MB gate is set, default the
-    // gate to 32MB so MORI_HIER_DEEP_PIPE=2 ALONE stays E2E bit-exact (the 466MB
-    // embed/lm_head giant AG falls through to the whole-chunk crown fence). An
-    // explicit MAX_MB=<n> overrides; dp<=1 keeps the byte-identical shipped path.
-    if (dp > 1 && dpMax == 0) dpMax = 32ull * 1024ull * 1024ull;
-    fused.deepPipe = (dpMax == 0 || fused.chunkBytes <= dpMax) ? dp : 1;
+    if (dp > 1 && dpWindow == 0) dpWindow = 32ull * 1024ull * 1024ull;
+    size_t subChunk = (dp > 1) ? (fused.chunkBytes / static_cast<size_t>(dp))
+                               : fused.chunkBytes;
+    fused.deepPipe = (dpWindow == 0 || subChunk < dpWindow) ? dp : 1;
   }
+  fused.deepPipeImm = HierDeepPipeImmOn() ? 1 : 0;
+  fused.deepPipeQuiet = HierDeepPipeQuietOn() ? 1 : 0;
   fused.hostProxyInter = HierHostProxyReasm();
+  fused.fuseCopyIn = HierFuseCopyInOn() ? 1 : 0;
 
   return reinterpret_cast<int64_t>(&fused);
 }

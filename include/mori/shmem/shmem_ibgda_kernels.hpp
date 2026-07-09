@@ -103,6 +103,26 @@ namespace shmem {
     }                                                                       \
   } while (0)
 
+// DRAIN-FREE LANDING FENCE helper (MORI_HIER_SIGNAL_FENCE, MLX5 only). On RoCE RC
+// a WRITE is not ordered before a following ATOMIC on the SAME QP, so the fused
+// put-with-signal AMO can reach the receiver's flag slot before its own large
+// payload WRITE lands (>=64MB flag-beats-data race -> stale-read, loses bit-exact).
+// OR the mlx5 strong-ordering fence bits into the just-posted atomic WQE's fm_ce_se
+// (ctrl byte 11) so the HCA holds the atomic until all prior WQEs (incl. the payload
+// write) complete. Near-free HW fence vs the send-CQ quiet-drain (which serializes
+// the DEEP_PIPE pipeline back to ~0.88x). INERT when signalFenceMode==0 (default) =>
+// byte-identical shipped path. atomicPostIdx = the WQE index passed to PostAtomic.
+inline __device__ void MaybeFenceSignalAtomicWqe(core::WorkQueueHandle* wq,
+                                                 uint32_t atomicPostIdx) {
+  int fenceMode = GetGlobalGpuStatesPtr()->signalFenceMode;
+  if (fenceMode == 0) return;
+  uint32_t wqeIdx = atomicPostIdx & (wq->sqWqeNum - 1);
+  uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(wq->sqAddr) +
+                      (static_cast<uintptr_t>(wqeIdx) << core::MORI_MLX5_SEND_WQE_SHIFT);
+  core::Mlx5WqeCtrlSeg* atomicCtrl = reinterpret_cast<core::Mlx5WqeCtrlSeg*>(wqeAddr);
+  atomicCtrl->fm_ce_se |= static_cast<uint8_t>(fenceMode);
+}
+
 // Exclusive prefix sum of per-lane psnCnt over active lanes; warp-wide total via
 // outTotal. Used for bnxt PSN accounting when lanes transfer different sizes.
 inline __device__ uint32_t WarpActivePsnPrefix(uint32_t psnCnt, uint64_t activemask,
@@ -1344,6 +1364,10 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
                 *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
                 ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
                 sizeof(signalValue), core::atomicType::AMO_ADD);
+            // Drain-free landing fence: strong-order this signal AMO after the
+            // payload WRITE on the same QP (see MaybeFenceSignalAtomicWqe). INERT
+            // unless MORI_HIER_SIGNAL_FENCE is set (byte-identical shipped path).
+            MaybeFenceSignalAtomicWqe(wq, my_sq_counter + 1);
           } else if constexpr (PrvdType == core::ProviderType::BNXT) {
             dbr_val = core::PostAtomic<PrvdType>(
                 *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader,
@@ -2451,6 +2475,10 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
                 *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
                 ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
                 sizeof(signalValue), core::atomicType::AMO_ADD);
+            // Drain-free landing fence: strong-order this signal AMO after the
+            // payload WRITE on the same QP (see MaybeFenceSignalAtomicWqe). INERT
+            // unless MORI_HIER_SIGNAL_FENCE is set (byte-identical shipped path).
+            MaybeFenceSignalAtomicWqe(wq, my_sq_counter + 1);
           } else if constexpr (PrvdType == core::ProviderType::BNXT) {
             dbr_val = core::PostAtomic<PrvdType>(
                 *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader,

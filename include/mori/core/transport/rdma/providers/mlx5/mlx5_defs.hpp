@@ -121,6 +121,15 @@ enum {
 
   MORI_MLX5_WQE_CTRL_CQ_UPDATE = 2 << 2,
 
+  // Fence-mode field lives in fm_ce_se[7:5] (mlx5 ctrl segment). STRONG_ORDERING
+  // makes this WQE execute only after ALL prior WQEs on the QP (incl. RDMA WRITE)
+  // have landed -- the drain-free cure for a fused signal ATOMIC overtaking its
+  // own preceding large payload WRITE (>=64MB) on RoCE RC.
+  MORI_MLX5_FENCE_MODE_INITIATOR_SMALL = 1 << 5,
+  MORI_MLX5_FENCE_MODE_FENCE = 2 << 5,
+  MORI_MLX5_FENCE_MODE_STRONG_ORDERING = 3 << 5,
+  MORI_MLX5_FENCE_MODE_SMALL_AND_FENCE = 4 << 5,
+
   MORI_MLX5_CQE_OWNER_MASK = 1,
   MORI_MLX5_CQE_REQ_ERR = 13,
   MORI_MLX5_CQE_RESP_ERR = 14,

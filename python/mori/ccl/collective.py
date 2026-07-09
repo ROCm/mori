@@ -560,6 +560,20 @@ class InterNodeRingAllgather:
         args = self._handle.prepare_stream(input_data.data_ptr(), u32_count, s)
         return args, u32_count, s
 
+    def prepare_stream_only_no_copyin(self, input_data, count: int, stream=None):
+        """like ``prepare_stream_only`` but SKIP the host copy-IN of ``input_data``
+        into the ring slot -- the fused kernel stages it in-kernel (fuseCopyIn).
+        Runs only the entry rendezvous (or the GEN_RING generation bump) so the AG
+        collapses toward a single host kernel launch. Pairs with
+        MORI_HIER_FUSE_COPYIN=1 (the kernel does the copy) and the external fused
+        launch. The chunk MUST be staged in-kernel before the ring put (guaranteed
+        by the fused kernel's per-channel copy + __syncthreads)."""
+        byte_count = count * input_data.element_size()
+        u32_count = (byte_count + 3) // 4
+        s = _stream_to_int(stream)
+        args = self._handle.prepare_stream_in_place(u32_count, s)
+        return args, u32_count, s
+
     def launch_finish_stream(self, args, output_data, u32_count: int, s: int,
                              barrier: bool = True) -> bool:
         """launch the ring kernel for a previously-prepared op
@@ -923,6 +937,23 @@ def launch_device_landing_gate(s: int) -> bool:
     return True
 
 
+def launch_l2_inv_only(s: int) -> bool:
+    """PHASE 5 (Team A, Turn 14 — director 2026-07-08T18:03Z WAIT-then-INV lever):
+    launch L2InvOnlyKernel_u32 UNCONDITIONALLY (no env gate) on stream ``s`` -- a
+    tiny 512x1 fence-only grid whose system-scope ACQUIRE fence lowers to
+    ``buffer_inv sc0 sc1`` on gfx942, invalidating the shared device L2 so the
+    stream-ordered consumer GEMM re-fetches the fabric-landed HBM bytes. This is the
+    INVALIDATE half of the consume-side landing gate; it MUST be stream-ordered
+    AFTER the landing WAIT (device landing gate CQ-drain) so it drops a LANDED line,
+    not an un-landed one (the director's key correction: INV-only alone re-fetches
+    stale HBM because the peer RDMA-WRITE has not landed yet). ~0 bytes moved.
+    """
+    _get_ccl_func("L2InvOnlyKernel_u32").launch(
+        (512,), (1,), 0, s, 0, 0
+    )
+    return True
+
+
 def launch_l2_coherent_retouch(out_ptr: int, u32_count: int, s: int) -> bool:
     """PHASE 5 (Team A): launch L2CoherentRetouchKernel_u32 over ``u32_count``
     uint32 words at device address ``out_ptr`` on stream ``s``. System-scope
@@ -932,11 +963,34 @@ def launch_l2_coherent_retouch(out_ptr: int, u32_count: int, s: int) -> bool:
     """
     if u32_count <= 0:
         return True
+    _truthy = ("1", "true", "yes", "on")
+    # MORI_HIER_L2INV_ONLY (Team A, director 2026-07-08T14:54Z — CHEAP variant):
+    # buffer_inv is a whole-cache op (invalidates the shared device L2, not an
+    # address range), so we do NOT need to touch every u32 to make the consumer GEMM
+    # re-fetch from HBM. Launch a tiny grid (one wave per CU is plenty to cover every
+    # per-CU L1 + the shared L2) that ONLY issues the system-scope ACQUIRE fence — ~0
+    # bytes moved vs the ~7% E2E cost of the full-buffer L2InvRetouch rewrite. Takes
+    # precedence over MORI_HIER_L2INV when both set. Default OFF.
+    if os.environ.get("MORI_HIER_L2INV_ONLY", "0").strip().lower() in _truthy:
+        # MI300X gfx942 has ~304 CUs; 512 single-thread blocks covers every CU's L1.
+        _get_ccl_func("L2InvOnlyKernel_u32").launch(
+            (512,), (1,), 0, s, out_ptr, int(u32_count)
+        )
+        return True
     threads = 256
     blocks = (u32_count + threads - 1) // threads
     if blocks > 4096:
         blocks = 4096
-    _get_ccl_func("L2CoherentRetouchKernel_u32").launch(
+    # MORI_HIER_L2INV (Team A, director 2026-07-08T14:54Z): use the L2-INVALIDATE
+    # retouch (real system-scope acquire/release fence => buffer_inv sc0 sc1 on
+    # gfx942) instead of the volatile-only kernel, which only bypasses L1 and so
+    # republishes the stale L2 line the consumer GEMM cached. This is the concrete
+    # consumer-coherence bug fix for the DEEP_PIPE device-fence drift. Default OFF
+    # (byte-identical shipped path).
+    _kern = "L2CoherentRetouchKernel_u32"
+    if os.environ.get("MORI_HIER_L2INV", "0").strip().lower() in _truthy:
+        _kern = "L2InvRetouchKernel_u32"
+    _get_ccl_func(_kern).launch(
         (blocks,), (threads,), 0, s, out_ptr, int(u32_count)
     )
     return True

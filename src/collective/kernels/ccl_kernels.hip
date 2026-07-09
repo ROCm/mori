@@ -289,6 +289,58 @@ extern "C" __global__ void L2CoherentRetouchKernel_u32(
   }
 }
 
+// L2InvRetouchKernel_u32 (Team A, director 2026-07-08T14:54Z sole lever):
+// the CONCRETE consumer-coherence fix the volatile-only L2CoherentRetouchKernel
+// above could NOT close. On gfx942 a `volatile` load lowers to a glc-tagged load
+// that bypasses only the per-CU L1 vector cache -- it STILL HITS the stale line in
+// the DEVICE-SCOPE L2 that the previous FSDP step's consumer GEMM cached for this
+// reused output buffer, so the re-touch republishes the SAME stale value and the
+// DEEP_PIPE device-fence path drifts (T55: retouch did not fix it). The real fix is
+// a device-side L2 INVALIDATE. The prior author avoided system-scope work because
+// __hip_atomic_* faults on coarse-grained torch memory -- but that is true only for
+// atomic OPERATIONS (they need fine-grained/coherent allocations); a pure
+// __builtin_amdgcn_fence is a CACHE-CONTROL barrier that touches no buffer word and
+// is SAFE on any allocation. A system-scope ACQUIRE fence lowers on gfx942 to
+// `buffer_inv sc0 sc1` (invalidate BOTH L1 and L2), so the subsequent loads MISS the
+// stale L2 line and fetch the fabric-coherent HBM value the SDMA/RDMA agents landed.
+// Both load and store go through the glc `volatile` alias so no dirty L2 line exists
+// for a concurrent wave's whole-L2 invalidate to drop; a trailing system-scope
+// RELEASE fence (`buffer_wbinvl2`/writeback + s_waitcnt) drains every store to HBM
+// before the kernel completes, so the consumer GEMM (stream-ordered after) reads the
+// freshly-landed bytes. Rewrite of the identical value is bit-exact for every dtype.
+extern "C" __global__ void L2InvRetouchKernel_u32(
+    uint32_t* __restrict__ out, uint64_t n) {
+  volatile uint32_t* vp = reinterpret_cast<volatile uint32_t*>(out);
+  // Device-side L2 invalidate BEFORE any read: drop stale L2 lines cached by the
+  // previous step's GEMM for this reused buffer -> loads fall through to HBM.
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+  uint64_t idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+  for (uint64_t i = idx; i < n; i += stride) {
+    uint32_t v = vp[i];
+    vp[i] = v;
+  }
+  // Writeback/drain every store to HBM before the consumer GEMM (ordered after).
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+}
+
+// L2InvOnlyKernel_u32 (Team A, director 2026-07-08T14:54Z lever — CHEAP variant):
+// the DEEP_PIPE consumer-coherence fix WITHOUT the full-buffer rewrite. The stale
+// data lives in the DEVICE-SCOPE L2 (shared across all CUs); the freshly-landed
+// SDMA/RDMA bytes are already in HBM. A single system-scope ACQUIRE fence lowers to
+// `buffer_inv sc0 sc1` on gfx942 (VERIFIED by ISA disasm 2026-07-08) which drops the
+// device L2 lines, so the stream-ordered consumer GEMM MISSES L2 and re-fetches the
+// fabric-coherent HBM value. buffer_inv is a whole-cache op (not address-ranged) so
+// no bulk traffic is needed — one wave per CU covers every per-CU L1 and the shared
+// L2, at ~0 bytes moved (vs L2InvRetouch which rewrites every u32 ~= +7% E2E). The
+// `out`/`n` args are accepted for launch-signature parity but unused. No writeback
+// fence: this kernel writes nothing, so there are no dirty lines to drain.
+extern "C" __global__ void L2InvOnlyKernel_u32(
+    uint32_t* __restrict__ out, uint64_t n) {
+  (void)out; (void)n;
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+}
+
 extern "C" __global__ void InterNodeRingAllGatherKernel_u32(CclInterNodeRingArgs args) {
   // Sub-group ring over {peBase, peBase+peStride, ...}; the flat whole-world
   // ring is the special case peBase=0, peStride=1, ringSize=npes, ringPos=myPe.
@@ -352,15 +404,28 @@ extern "C" __global__ void FusedRingLocalGatherKernel_u32(CclFusedRingLocalGathe
 // starts clean for the next launch.
 __device__ unsigned long long g_hierProf[4] = {0, 0, 0, 0};
 
+// ``partition`` = number of disjoint 16B-aligned byte sub-ranges the chunk is
+// split into for the intra-node SDMA reassembly push. Worker ``j`` (stride
+// ``stride``) owns parts f=j, j+stride, ... . ``spatial`` selects the LANDING
+// FLAG each part waits on: for the temporal deep-pipe (spatial=false) part f
+// waits on chunkReadyFlags[f] (its own sub-chunk landed); for the SPATIAL split
+// at a single-channel ring (spatial=true) EVERY part waits on the ONE landing
+// flag chunkReadyFlags[0] (the whole chunk landed), so multiple SDMA engines
+// reassemble disjoint sub-ranges of that one landed chunk CONCURRENTLY --
+// shrinking the serial intra_reasm_tail (HIERPROF ~40-45% of the giant-AG wall)
+// without changing the inter-node ring (no new inter race). Flag SLOT region is
+// per-part (flagBase uses ``f``) so concurrent parts never race a shared slot.
 __device__ inline void FusedRemoteReassembleWorker(
-    const CclFusedRingRemoteGatherArgs& args, int rb, int j, int stride, int qId) {
+    const CclFusedRingRemoteGatherArgs& args, int partition, int j, int stride, int qId,
+    bool spatial) {
   const size_t kAlign = 16;
   const size_t nUnits = (args.chunkBytes + kAlign - 1) / kAlign;
-  const size_t unitsPerChan = (nUnits + static_cast<size_t>(rb) - 1) / static_cast<size_t>(rb);
+  const size_t unitsPerChan =
+      (nUnits + static_cast<size_t>(partition) - 1) / static_cast<size_t>(partition);
   const size_t sliceElems = args.chunkBytes / sizeof(uint32_t);
   const int numRemote = args.numNodes - 1;
   uint32_t* ringBase = reinterpret_cast<uint32_t*>(args.ringMemObj->localPtr);
-  for (int f = j; f < rb; f += stride) {
+  for (int f = j; f < partition; f += stride) {
     size_t startUnit = static_cast<size_t>(f) * unitsPerChan;
     size_t endUnit = startUnit + unitsPerChan;
     if (endUnit > nUnits) endUnit = nUnits;
@@ -370,7 +435,8 @@ __device__ inline void FusedRemoteReassembleWorker(
     const size_t subBytes = (subOff < subEnd) ? (subEnd - subOff) : 0;
     if (threadIdx.x == 0) {
       int spin = 0;
-      while (mori::core::AtomicLoadSeqCstSystem(args.chunkReadyFlags + f) <
+      const int flagIdx = spatial ? 0 : f;
+      while (mori::core::AtomicLoadSeqCstSystem(args.chunkReadyFlags + flagIdx) <
              static_cast<uint64_t>(1)) {
         if (++spin > 100000000) break;
       }
@@ -431,6 +497,17 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
   // (index == reasm) on queue 0 after its own gather, so the tail runs on
   // effReasm = reasm+1 SDMA queues. OFF => effReasm == reasm (byte-identical).
   const int effReasm = args.elasticReasm != 0 ? reasm + 1 : reasm;
+  // SPATIAL REASSEMBLY SPLIT (Turn 51, A): on the single-channel giant-AG ring
+  // (rb==1) with NO temporal deep-pipe, split the ONE landed chunk into
+  // ``effReasm`` disjoint byte sub-ranges so effReasm SDMA engines reassemble it
+  // concurrently -- directly attacks the ~40-45% serial intra_reasm_tail HIERPROF
+  // localised, WITHOUT touching the inter ring (no new inter race, unlike rb>1
+  // which grows the RDMA fill 1:1). Each part waits the single landing flag
+  // chunkReadyFlags[0]. reasm>1 requires sdmaNumQueue>=reasm+1 (Python clamp).
+  const bool spatialSplit = (rb == 1 && args.deepPipe <= 1 && effReasm > 1);
+  // Partition count for the reassembly byte split: temporal pipe channels, or the
+  // spatial effReasm sub-ranges when the spatial split engages.
+  const int partition = spatialSplit ? effReasm : pipe;
   const unsigned bx = blockIdx.x;
   if (bx < static_cast<unsigned>(rb)) {
     // HOST-PROXY INTER (hostProxyInter): a host proxy owns the inter-node leg --
@@ -442,7 +519,50 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
     // host-published flags unchanged. OFF => device posts inter as before.
     if (args.hostProxyInter != 0) {
       // no-op: inter leg owned by the host proxy.
-    } else
+    } else {
+    // IN-KERNEL COPY-IN (fuseCopyIn): stage this ring channel's OWN send sub-range
+    // of gInput into the local ring slot before the RDMA put, so the host
+    // hipMemcpyAsync copy-IN can be dropped (single-launch collapse). The tiling
+    // MIRRORS AllGatherRingSubGroupKernelBody's multiBlock split so channel bx
+    // writes exactly the bytes it sends (no cross-CTA dependency; __syncthreads
+    // orders the stage before the send within this CTA). The remote reassembly /
+    // completion reader never read the LOCAL slot (they gate on the received
+    // chunks' flags), so no other consumer races this stage.
+    if (args.fuseCopyIn != 0) {
+      const int nextPeer =
+          args.ringPeBase + ((args.ringPos + 1) % args.ringSize) * args.ringPeStride;
+      const mori::application::TransportType nx =
+          mori::shmem::GetGlobalGpuStatesPtr()->transportTypes[nextPeer];
+      const bool peerRdma = (nx == mori::application::TransportType::RDMA);
+      const bool mb = (rb > 1 && peerRdma);
+      size_t blkOff = 0;
+      size_t blkBytes = args.chunkBytes;
+      if (mb) {
+        const size_t kAlignB = 16;
+        size_t nUnits = (args.chunkBytes + kAlignB - 1) / kAlignB;
+        size_t unitsPerBlk = (nUnits + static_cast<size_t>(rb) - 1) / static_cast<size_t>(rb);
+        size_t startUnit = static_cast<size_t>(bx) * unitsPerBlk;
+        size_t endUnit = startUnit + unitsPerBlk;
+        if (endUnit > nUnits) endUnit = nUnits;
+        blkOff = startUnit * kAlignB;
+        size_t blkEnd = endUnit * kAlignB;
+        if (blkEnd > args.chunkBytes) blkEnd = args.chunkBytes;
+        blkBytes = (blkOff < blkEnd) ? (blkEnd - blkOff) : 0;
+      } else if (rb > 1 && !peerRdma && bx != 0) {
+        // single-node simulation: only channel 0 sends (mirrors the ring body).
+        blkBytes = 0;
+      }
+      if (blkBytes > 0) {
+        char* ringBase = reinterpret_cast<char*>(args.ringMemObj->localPtr) +
+                         static_cast<size_t>(args.ringPos) * args.chunkBytes;
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(
+            reinterpret_cast<const char*>(args.gInput) + blkOff);
+        uint32_t* dst = reinterpret_cast<uint32_t*>(ringBase + blkOff);
+        const size_t n32 = blkBytes / 4;
+        for (size_t i = threadIdx.x; i < n32; i += blockDim.x) dst[i] = src[i];
+      }
+      __syncthreads();
+    }
     // Ring channel bx: publishes chunkReadyFlags[bx] on landing.
     AllGatherRingSubGroupKernelBody(args.ringPos, args.ringSize, args.ringPeBase, args.ringPeStride,
                                     args.ringMemObj, args.ringFlagsObj, args.chunkBytes, args.numQp,
@@ -450,7 +570,9 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
                                     /*usePutSignal=*/args.usePutSignal != 0,
                                     /*useWriteImm=*/args.useWriteImm != 0, args.chunkReadyFlags,
                                     /*opGen=*/0, /*useRead=*/false, /*wqeDepth=*/args.wqeDepth,
-                                    /*deepPipe=*/args.deepPipe);
+                                    /*deepPipe=*/args.deepPipe, /*deepPipeImm=*/args.deepPipeImm,
+                                    /*deepPipeQuiet=*/args.deepPipeQuiet);
+    }
   } else if (bx == static_cast<unsigned>(rb)) {
     // PROFILE: kernel-entry reference for the wall decomposition (this single CTA
     // is launched with all others, so its entry ~= kernel start).
@@ -475,7 +597,8 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
     // giving the un-hidden reassembly leg effReasm SDMA queues. Must complete
     // before the completion reader below (its published flags are counted there).
     if (args.elasticReasm != 0 && args.chunkReadyFlags != nullptr) {
-      FusedRemoteReassembleWorker(args, pipe, /*j=*/reasm, /*stride=*/effReasm, /*qId=*/0);
+      FusedRemoteReassembleWorker(args, partition, /*j=*/reasm, /*stride=*/effReasm, /*qId=*/0,
+                                  spatialSplit);
     }
     // COMPLETION READER: the remote reassembly blocks are PUSH-ONLY (they never
     // wait on a peer) so this CTA does the single cross-rank completion wait for
@@ -499,7 +622,7 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
       // blockDim) instead of O(total). Bit-exact: same slots, same threshold,
       // just concurrent; a single CTA-wide fence + barrier still orders every
       // landed byte before the finish.
-      const size_t total = static_cast<size_t>(pipe) * static_cast<size_t>(numRemote) *
+      const size_t total = static_cast<size_t>(partition) * static_cast<size_t>(numRemote) *
                            static_cast<size_t>(G);
       for (size_t t = threadIdx.x; t < total; t += blockDim.x) {
         const size_t idx = static_cast<size_t>(G) + t;
@@ -579,7 +702,8 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
     // local CTA is the extra worker j==reasm. qId=j+1 (1..reasm) is distinct from
     // the local CTA's queue 0. Byte-identical to the prior stride==reasm path when
     // elastic is OFF (effReasm==reasm).
-    FusedRemoteReassembleWorker(args, pipe, /*j=*/j, /*stride=*/effReasm, /*qId=*/j + 1);
+    FusedRemoteReassembleWorker(args, partition, /*j=*/j, /*stride=*/effReasm, /*qId=*/j + 1,
+                                spatialSplit);
   }
 }
 

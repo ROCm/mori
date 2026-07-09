@@ -69,40 +69,13 @@ namespace collective {
 // block by pushing FROM ITS OWN ring buffer, the only dependency is this PE's own
 // ring landing -- a purely local flag spin, no global barrier. nullptr keeps the
 // standalone ring byte-for-byte identical.
-// DEEP-SQ WQE-DEPTH put helper (MORI_HIER_WQE_DEPTH). Split [base, base+bytes)
-// into ``depth`` back-to-back 16B-aligned non-blocking puts on the SAME qpId, so
-// the NIC SQ carries ``depth`` in-flight WQEs per QP instead of one. The union
-// tiles the sub-range exactly and rides the QP in RC order => byte-identical
-// result and identical per-QP quiet drain; only the SQ depth changes. depth<=1
-// keeps the shipped single-WQE path byte-for-byte.
-inline __device__ void PutDeepNbiWarp(const application::SymmMemObjPtr memObj, size_t base,
-                                      size_t bytes, int depth, int peer, int qpId) {
-  if (depth <= 1 || bytes == 0) {
-    shmem::ShmemPutMemNbiWarp(memObj, base, memObj, base, bytes, peer, qpId);
-    return;
-  }
-  const size_t kAlign = 16;
-  size_t nUnits = (bytes + kAlign - 1) / kAlign;
-  size_t unitsPer = (nUnits + static_cast<size_t>(depth) - 1) / static_cast<size_t>(depth);
-  if (unitsPer == 0) unitsPer = 1;
-  for (int d = 0; d < depth; ++d) {
-    size_t s = static_cast<size_t>(d) * unitsPer;
-    size_t e = s + unitsPer;
-    if (e > nUnits) e = nUnits;
-    if (s >= e) break;
-    size_t so = s * kAlign;
-    size_t eo = e * kAlign;
-    if (eo > bytes) eo = bytes;
-    shmem::ShmemPutMemNbiWarp(memObj, base + so, memObj, base + so, eo - so, peer, qpId);
-  }
-}
-
 inline __device__ void AllGatherRingSubGroupKernelBody(
     int ringPos, int ringSize, int peBase, int peStride,
     const application::SymmMemObjPtr memObj, const application::SymmMemObjPtr flagsObj,
     size_t peChunkSize, int numQp = 1, int numBlocksOverride = -1, int bidOverride = -1,
     bool usePutSignal = false, bool useWriteImm = false, uint64_t* chunkReadyFlags = nullptr,
-    uint64_t opGen = 0, bool useRead = false, int wqeDepth = 1, int deepPipe = 1) {
+    uint64_t opGen = 0, bool useRead = false, int wqeDepth = 1, int deepPipe = 1,
+    int deepPipeImm = 0, int deepPipeQuiet = 0) {
   int nextPos = (ringPos + 1) % ringSize;
   int nextPeer = peBase + nextPos * peStride;
   int maxRounds = ringSize - 1;
@@ -302,29 +275,15 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
 
   // ==========================================================================
   // DEEP-SQ TEMPORAL PIPELINE (MORI_HIER_DEEP_PIPE=P). Split the chunk into P
-  // temporal sub-chunks issued back-to-back on the SAME full numQp fan-out; a
-  // reassembly worker pushes sub-chunk p over XGMI while p+1.. still cross the NIC
-  // -- hides the 46% intra reassembly under the 54% inter fill with NO inter-fill
-  // growth (unlike the spatial RING_BLOCKS split which drops QPs).
-  //
-  // LANDING FENCE = per-sub-chunk QUIET+flag == the CROWN's own proven fence,
-  // applied per sub-chunk (Turn-30). Turn-30a discovered WRITE_WITH_IMM is
-  // asserted-OUT on this cluster's mlx5 provider ("only supported on PSD/ionic")
-  // -> HW exception, so recv-CQE landing is not available here. Turn-29's
-  // put-with-signal AMO was NOT scale-robust because it SKIPPED the quiet: the
-  // small AMO overtakes the big data WRITE through NIC->HBM->L2 (>=64/P4, 256/P2
-  // read un-landed bytes -- the 22+-refuted device-flag race). The crown whole-
-  // chunk path is bit-exact at 466MB BECAUSE it does ShmemQuietThread (drains the
-  // RC send-CQE == data landed remotely) BEFORE the flag AMO. Do exactly that per
-  // sub-chunk: issue sub-chunk p on the full numQp fan-out, quiet (drains ONLY p
-  // -- p+1.. not yet issued), THEN AMO the peer's flag[p]. The peer, observing
-  // flag[p], is GUARANTEED p landed. The pipeline is preserved because the
-  // reassembly worker (a SEPARATE block) pushes p over XGMI while THIS block fills
-  // p+1 over the NIC -- the per-sub-chunk quiet only serializes issue->land within
-  // this ring block, not the cross-block intra||inter overlap.
-  // Engaged only on the single-round (ringSize==2) all-RDMA fan-out path.
-  // Self-contained: returns before the classic round loop. INERT when
-  // deepPipe<=1 (byte-identical shipped path).
+  // temporal sub-chunks issued back-to-back on the SAME full numQp fan-out with a
+  // per-sub-chunk put-with-signal; sub-chunk p's landing flag fires (RC in-order)
+  // before p+1's, so a reassembly worker pushes p over XGMI while p+1.. still
+  // cross the NIC -- hides the 46% intra reassembly under the 54% inter fill with
+  // NO inter-fill growth (unlike the spatial RING_BLOCKS split which drops QPs).
+  // Engaged only on the single-round (ringSize==2) all-RDMA fan-out path. Uses the
+  // full useWarps QP fan-out per sub-chunk (full inter BW), publishes P
+  // chunkReadyFlags in temporal order. Self-contained: returns before the classic
+  // round loop. INERT when deepPipe<=1 (byte-identical shipped path).
   bool deepPipeEngaged = (deepPipe > 1 && peerIsRdma && prevIsRdma && maxRounds == 1 &&
                           !multiBlock && chunkReadyFlags != nullptr && !useReadRing &&
                           !useWriteImm && useWarps >= 1);
@@ -336,57 +295,272 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     const size_t nUnits = (peChunkSize + kAlignDP - 1) / kAlignDP;
     const size_t unitsPerP = (nUnits + static_cast<size_t>(P) - 1) / static_cast<size_t>(P);
     const int sw = useWarps;  // sender fan-out warps per sub-chunk (== numQp fan-out)
-    for (int p = 0; p < P; ++p) {
-      // SENDER: warp w writes its 16B-aligned tile of sub-chunk p on qpId=w (plain
-      // NBI put, deep-SQ within the sub-chunk via wqeDepth). Full numQp fan-out per
-      // sub-chunk => full inter BW; no per-warp flag (one AMO per sub-chunk below).
-      if (warpId < sw) {
+    // Per-sub-chunk active-warp count, computed identically to the sender tiling.
+    // active(p) = # of warps that actually get a non-empty tile of sub-chunk p.
+    auto activeOf = [&](int p) -> int {
+      size_t sU = static_cast<size_t>(p) * unitsPerP;
+      size_t eU = sU + unitsPerP;
+      if (eU > nUnits) eU = nUnits;
+      if (sU >= eU) return 0;
+      size_t subUnits = eU - sU;
+      size_t upw = (subUnits + static_cast<size_t>(sw) - 1) / static_cast<size_t>(sw);
+      if (upw == 0) upw = 1;
+      int a = static_cast<int>((subUnits + upw - 1) / upw);
+      if (a > sw) a = sw;
+      if (a < 1) a = 1;
+      return a;
+    };
+    // DEEP_PIPE_QUIET: scale-robust per-sub-chunk landing fence via QP quiet-drain.
+    // The put-signal AMO can beat its own data >=64MB and WRITE_WITH_IMM is HW-
+    // unavailable here, but a SEND-CQ drain of the sub-chunk's QP is a definitive
+    // remote-landing proof (the teamC ring's >=32MiB-parity mechanism). Give each
+    // temporal sub-chunk p its OWN QP (qpId = p % sw), issue a PLAIN put (no fused
+    // AMO), then in temporal order drain qpId=(p%sw) with ShmemQuietThread(nextPeer,
+    // qp) (== sub-chunk p landed at nextPeer, RC in-order per QP) and only THEN AMO
+    // the receiver's flag slot p. Because distinct sub-chunks ride distinct QPs, the
+    // temporal pipeline is preserved (p's flag fires before p+1's data finishes),
+    // yet the flag NEVER precedes the landing => bit-exact even at 64-256MB. Self-
+    // contained: returns before the IMM/signal branches. Requires chunkReadyFlags.
+    if (deepPipeQuiet) {
+      // Disjoint QP GROUP per temporal sub-chunk so distinct sub-chunks stay on
+      // distinct QPs (temporal landing order preserved => p's flag can fire while
+      // p+1.. still cross the NIC) AND each sub-chunk still fans across g = sw/P
+      // QPs for full per-sub-chunk BW (the 1-QP mapping under-filled the NIC ->
+      // 0.86x). group(p) = QPs [p*g, p*g+g); warp within the group tiles the
+      // sub-chunk in 16B units. When sw < P (P>sw) groups wrap (g==1, p%sw) --
+      // then some sub-chunks share a QP and the drain also covers the later one
+      // (still bit-exact, just less overlap). Draining a sub-chunk's WHOLE group
+      // (all g QPs) before its AMO is the landing fence.
+      const int g = (sw >= P) ? (sw / P) : 1;               // QPs per sub-chunk
+      auto grpBase = [&](int p) -> int { return (sw >= P) ? (p * g) : (p % sw); };
+      auto nonEmptyDP = [&](int p) -> bool {
         size_t sU = static_cast<size_t>(p) * unitsPerP;
         size_t eU = sU + unitsPerP;
         if (eU > nUnits) eU = nUnits;
-        if (sU < eU) {
-          size_t subUnits = eU - sU;
-          size_t upw = (subUnits + static_cast<size_t>(sw) - 1) / static_cast<size_t>(sw);
-          if (upw == 0) upw = 1;
-          size_t wS = sU + static_cast<size_t>(warpId) * upw;
-          size_t wE = wS + upw;
-          if (wE > eU) wE = eU;
-          if (wS < wE) {
-            size_t so = wS * kAlignDP;
-            size_t eo = wE * kAlignDP;
+        return sU < eU;
+      };
+      // SENDER: warp w belongs to sub-chunk p = w / g (when sw>=P), lane role wl =
+      // w % g drives qpId = grpBase(p)+wl on its disjoint 16B tile of sub-chunk p.
+      if (warpId < sw) {
+        int p, wl, gg;
+        if (sw >= P) {
+          p = warpId / g;
+          wl = warpId % g;
+          gg = g;
+          if (p >= P) p = -1;                                // extra warps idle
+        } else {
+          p = warpId;                                        // P>sw: each of first sw warps -> its own sub-chunk group start
+          wl = 0;
+          gg = 1;
+        }
+        if (p >= 0) {
+          for (int pp = p; pp < P; pp += (sw >= P ? P : sw)) {  // sw<P: warp handles pp = warpId, warpId+sw, ...
+            size_t sU = static_cast<size_t>(pp) * unitsPerP;
+            size_t eU = sU + unitsPerP;
+            if (eU > nUnits) eU = nUnits;
+            if (sU >= eU) { if (sw >= P) break; else continue; }
+            size_t subUnits = eU - sU;
+            // Tile sub-chunk pp across gg QPs; lane wl takes its slice.
+            size_t upl = (subUnits + static_cast<size_t>(gg) - 1) / static_cast<size_t>(gg);
+            if (upl == 0) upl = 1;
+            size_t lS = sU + static_cast<size_t>(wl) * upl;
+            size_t lE = lS + upl;
+            if (lE > eU) lE = eU;
+            if (lS >= lE) { if (sw >= P) continue; else continue; }
+            size_t so = lS * kAlignDP;
+            size_t eo = lE * kAlignDP;
             if (eo > peChunkSize) eo = peChunkSize;
             size_t off = chunkBaseOffsetSend + so;
-            PutDeepNbiWarp(memObj, off, eo - so, wqeDepth, nextPeer, warpId);
+            int qp = grpBase(pp) + wl;
+            shmem::ShmemPutMemNbiWarp(memObj, off, memObj, off, eo - so, nextPeer, qp);
+            if (sw >= P) break;   // sw>=P: one warp issues exactly one sub-chunk tile
           }
         }
       }
       __syncthreads();
-      if (threadLinearId == 0) {
-        // Drain sub-chunk p's send-CQEs on ALL QPs (RC => p's data has landed
-        // remotely), THEN bump the peer's flag[p]. p+1.. are not yet issued so this
-        // quiet isolates p. This is the crown fence, per sub-chunk -- scale-robust.
-        shmem::ShmemQuietThread(nextPeer);
-        shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
-            flagsObj, (flagBase + p) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer);
+      // PARALLEL SEND-DRAIN + RECV-PUBLISH: the prior serial thread-0 drain loop
+      // (quiet group 0, AMO 0, quiet group 1, AMO 1, ...) forced flag p to wait on
+      // EVERY earlier group's drain even when group p landed first, throttling the
+      // inter->intra pipeline to ~0.86-0.98x. Give each sub-chunk p its OWN drain
+      // warp-leader (thread p*warpSize) and its OWN publish warp-leader (thread
+      // (P+p)*warpSize) so a landed group fires its flag the INSTANT its own QP
+      // group drains -- concurrently with the other groups still crossing the NIC.
+      // Distinct sub-chunks ride DISJOINT QP groups => distinct ep[]/CQ state, so
+      // concurrent ShmemQuietThread(nextPeer, qp) calls never share a WQ/CQ =>
+      // bit-exact (same drains, same AMOs, same flag slots; only the ORDER of
+      // independent completions is relaxed, which the per-slot flags already allow).
+      // ONE warp-leader per sub-chunk (thread p*warpSize): it drains its OWN QP
+      // group, AMOs the remote landing flag p, THEN waits for its OWN incoming flag
+      // p and publishes chunkReadyFlags[p]. Merging send-drain + recv-publish into a
+      // SINGLE leader per p (was two leaders, thread p*ws and (P+p)*ws) is required
+      // on wave64 HW: block=512 => warpsPerBlock = 512/64 = 8, so the old 2*P-warp
+      // split DEADLOCKED at P=8 (recv-publish leaders warps 8..15 do not exist =>
+      // chunkReadyFlags never published => hang). P leaders fit P<=warpsPerBlock, so
+      // this enables DEEP_PIPE=8 parallel drain. All P leaders still run CONCURRENTLY
+      // across sub-chunks (each on its DISJOINT QP group => disjoint WQ/CQ => no
+      // shared-completion race, bit-exact); the per-p drain->recv sequence is the
+      // natural inter->intra dependency for that sub-chunk, not a cross-p serialize.
+      // ONLY safe when sw>=P (disjoint QP group per sub-chunk) AND P<=warpsPerBlock
+      // (a leader warp exists for every p). Else fall back to the serial thread-0
+      // drain (P>sw groups WRAP grpBase=p%sw sharing a QP; or too few warps).
+      if (sw >= P && P <= warpsPerBlock) {
+        const int myWarp = threadLinearId / warpSize;
+        const bool warpLead = (threadLinearId % warpSize) == 0;
+        if (warpLead && myWarp < P) {
+          int p = myWarp;
+          if (nonEmptyDP(p)) {
+            int base = grpBase(p);
+            for (int q = 0; q < g; ++q) shmem::ShmemQuietThread(nextPeer, base + q);
+            __threadfence_system();
+            shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
+                flagsObj, (flagBase + p) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
+                nextPeer);
+            long long spin = 0;
+            while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
+                   static_cast<uint64_t>(1)) {
+              // Landing fence MUST wait for the group to land; a timeout escape
+              // that published chunkReadyFlags[p] anyway would allow a stale-read
+              // (R188-R191). Abort loudly instead of silently corrupting bytes.
+              if (++spin > 10000000000LL) __builtin_trap();
+            }
+            __threadfence_system();
+            core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, static_cast<uint64_t>(1));
+          }
+        }
+      } else if (threadLinearId == 0) {
+        // WRAP fallback (P>sw): serial drain, groups share QPs.
+        for (int p = 0; p < P; ++p) {
+          if (!nonEmptyDP(p)) continue;
+          shmem::ShmemQuietThread(nextPeer, grpBase(p));
+          __threadfence_system();
+          shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
+              flagsObj, (flagBase + p) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer);
+        }
       } else if (threadLinearId == warpSize) {
-        // RECEIVER: wait sub-chunk p's flag (set by the peer AFTER its quiet => p
-        // landed globally) then publish chunkReadyFlags[p] so the reassembly worker
-        // pushes p over XGMI while this block fills p+1 over the NIC.
-        int spin = 0;
-        while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) < 1) {
-          if (++spin > 100000000) break;
+        for (int p = 0; p < P; ++p) {
+          if (nonEmptyDP(p)) {
+            long long spin = 0;
+            while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
+                   static_cast<uint64_t>(1)) {
+              if (++spin > 10000000000LL) __builtin_trap();
+            }
+          }
+          __threadfence_system();
+          core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, static_cast<uint64_t>(1));
+        }
+      }
+      __syncthreads();
+      if (threadLinearId == 0) {
+        shmem::ShmemQuietThread(nextPeer);
+      }
+      __syncthreads();
+      for (int idx = threadLinearId; idx < P; idx += threadsPerBlock) {
+        flagsArray[flagBase + idx] = 0;
+      }
+      __syncthreads();
+      if (threadLinearId == 0) __threadfence_system();
+      return;
+    }
+    // DEEP_PIPE_IMM: per-sub-chunk landing fence via RDMA_WRITE_WITH_IMM instead of
+    // put-with-signal. The put-signal AMO can beat its own data on large / many-in-
+    // flight transfers (a device flag does NOT order a large RDMA landing -- fails
+    // bit-exact >=64MB/P4), whereas a recv-CQE is produced ONLY after the write DMA
+    // has landed globally (RC transport guarantee, in-order per QP), so it is a
+    // definitive per-sub-chunk landing fence -> bit-exact even at 466MB E2E.
+    // Pre-post P recv WQEs on each QP w in [0,sw) so every remote WRITE_WITH_IMM
+    // yields a recv-CQE; the entry barrier in prepare orders every PE's post before
+    // any peer's write. bytes=0: a pure write-with-imm does not consume the recv
+    // SGL for payload (data lands at the write's addr/rkey); the WQE only makes the
+    // CQE. On RC per QP, sub-chunk p's CQE precedes p+1's, so polling one CQE per
+    // active QP for p, in order, republishes chunkReadyFlags[p] in temporal order.
+    if (deepPipeImm) {
+      if (threadLinearId == 0) {
+        for (int w = 0; w < sw; ++w) {
+          int cnt = 0;
+          for (int p = 0; p < P; ++p)
+            if (activeOf(p) > w) ++cnt;
+          if (cnt > 0) {
+            shmem::ShmemPostRecvImm(reinterpret_cast<uintptr_t>(memObj->localPtr), memObj->lkey,
+                                    /*bytes=*/0, /*count=*/static_cast<uint32_t>(cnt), prevPeer, w);
+          }
+        }
+      }
+      __syncthreads();
+    }
+    // SENDER: warps [0,sw). For each temporal sub-chunk p, warp w sends its
+    // 16B-aligned tile on qpId=w. All P sub-chunks ride qpId=w back-to-back (deep
+    // SQ) so p's data lands before p+1's -- temporal landing order preserved.
+    // IMM path: RDMA_WRITE_WITH_IMM (imm = p+1). Signal path: put-with-signal AMO.
+    if (warpId < sw) {
+      for (int p = 0; p < P; ++p) {
+        size_t sU = static_cast<size_t>(p) * unitsPerP;
+        size_t eU = sU + unitsPerP;
+        if (eU > nUnits) eU = nUnits;
+        if (sU >= eU) break;
+        size_t subUnits = eU - sU;
+        size_t upw = (subUnits + static_cast<size_t>(sw) - 1) / static_cast<size_t>(sw);
+        if (upw == 0) upw = 1;
+        size_t wS = sU + static_cast<size_t>(warpId) * upw;
+        size_t wE = wS + upw;
+        if (wE > eU) wE = eU;
+        if (wS >= wE) continue;
+        size_t so = wS * kAlignDP;
+        size_t eo = wE * kAlignDP;
+        if (eo > peChunkSize) eo = peChunkSize;
+        size_t off = chunkBaseOffsetSend + so;
+        if (deepPipeImm) {
+          shmem::ShmemPutMemImmWarp(memObj, off, memObj, off, eo - so,
+                                    static_cast<uint32_t>(p + 1), nextPeer, warpId);
+        } else {
+          shmem::ShmemPutMemNbiSignalWarp(memObj, off, memObj, off, eo - so, flagsObj,
+                                          (flagBase + p) * sizeof(uint64_t), 1,
+                                          core::atomicType::AMO_ADD, nextPeer, warpId);
+        }
+      }
+    }
+    // RECEIVER: republish chunkReadyFlags[p] in temporal order so the reassembly
+    // worker can push sub-chunk p while later sub-chunks still cross the NIC.
+    // IMM path: poll one recv-CQE per active QP for p (RC in-order per QP =>
+    // temporal order preserved), then publish. Signal path: spin the flag sum.
+    if (deepPipeImm) {
+      if (threadLinearId == warpSize) {
+        for (int p = 0; p < P; ++p) {
+          int active = activeOf(p);
+          for (int w = 0; w < active; ++w) {
+            shmem::ShmemPollRecvCqImm(prevPeer, w);
+          }
+          __threadfence_system();
+          core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, static_cast<uint64_t>(1));
+        }
+      }
+    } else if (threadLinearId == 0) {
+      for (int p = 0; p < P; ++p) {
+        int active = activeOf(p);
+        if (active > 0) {
+          long long spin = 0;
+          while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
+                 static_cast<uint64_t>(active)) {
+            if (++spin > 10000000000LL) __builtin_trap();
+          }
         }
         __threadfence_system();
         core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, static_cast<uint64_t>(1));
       }
-      __syncthreads();
-    }
-    // Reset the recv flag slots (entry barrier in prepare orders every PE's reset
-    // before any peer's next-op AMO, so this end-of-op reset is safe).
-    for (int idx = threadLinearId; idx < P; idx += threadsPerBlock) {
-      flagsArray[flagBase + idx] = 0;
     }
     __syncthreads();
+    // Drain our own send QPs once (buffer-reuse safety), then reset the recv slots
+    // (entry barrier in prepare orders every PE's reset before any peer's next-op
+    // AMO, so this end-of-op reset is safe).
+    if (threadLinearId == 0) {
+      shmem::ShmemQuietThread(nextPeer);
+    }
+    __syncthreads();
+    if (!deepPipeImm) {
+      for (int idx = threadLinearId; idx < P; idx += threadsPerBlock) {
+        flagsArray[flagBase + idx] = 0;
+      }
+      __syncthreads();
+    }
     if (threadLinearId == 0) __threadfence_system();
     return;
   }
@@ -487,7 +661,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
               (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer,
               bid);
         } else {
-          PutDeepNbiWarp(memObj, subOff, blkBytes, wqeDepth, nextPeer, bid);
+          shmem::ShmemPutMemNbiWarp(memObj, subOff, memObj, subOff, blkBytes, nextPeer, bid);
         }
       }
     } else if (fanOut) {
@@ -524,7 +698,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                 (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
                 nextPeer, warpId);
           } else {
-            PutDeepNbiWarp(memObj, subOff, subEnd - subStart, wqeDepth, nextPeer, warpId);
+            shmem::ShmemPutMemNbiWarp(memObj, subOff, memObj, subOff, subEnd - subStart, nextPeer,
+                                      warpId);
           }
         }
       }
@@ -555,7 +730,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
             memObj, chunkBaseOffset, memObj, chunkBaseOffset, peChunkSize, flagsObj,
             (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer);
       } else {
-        PutDeepNbiWarp(memObj, chunkBaseOffset, peChunkSize, wqeDepth, nextPeer, 0);
+        shmem::ShmemPutMemNbiWarp(memObj, chunkBaseOffset, memObj, chunkBaseOffset, peChunkSize,
+                                  nextPeer);
       }
     }
 
