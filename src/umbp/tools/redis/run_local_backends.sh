@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
-# Launch single-node Redis and Dragonfly as local processes (no docker needed),
-# for the UMBP master Redis-metadata-store benchmark. Both speak RESP, so the
-# master connects to either via UMBP_REDIS_URI only.
+# FALLBACK launcher — prefer store.sh (docker compose) for the productized path.
+#
+# This launches single-node Redis and Dragonfly as local PROCESSES (source-built
+# / downloaded binaries, no docker), for environments without host docker access
+# (e.g. working purely inside an app container). The productized way to run the
+# stores as independent containers is `store.sh {up|down|status} <topology>`
+# (docker-compose.yml), which also covers the Redis Cluster topology this script
+# does not. store.sh auto-falls-back to this script for single/dragonfly when
+# docker is unavailable.
+#
+# Both speak RESP, so the master connects to either via UMBP_REDIS_URI only.
 #
 #   Redis     -> tcp://127.0.0.1:6379
 #   Dragonfly -> tcp://127.0.0.1:6380
