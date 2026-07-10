@@ -225,7 +225,7 @@ ShardedBatch GroupKeysByShard(const redis::KeySchema& schema,
 // One instance's slice of a sharded batch: which groups it serves, the block
 // keys per group, and (after the call) that instance's replies or an error.
 struct ShardCall {
-  redis::RespClient* client = nullptr;
+  redis::IRespClient* client = nullptr;
   std::vector<size_t> groups;
   std::vector<std::vector<std::string>> keys;
   std::vector<RespValue> replies;
@@ -252,7 +252,7 @@ void RunShardedRead(const ShardedBatch& batch, const std::string& script,
                     const std::vector<std::string>& shared_args, const char* method,
                     redis::ThreadPool* pool, ClientForGroup client_for_group, Fn&& on_key) {
   // Bucket group indices by the client that serves them.
-  std::unordered_map<redis::RespClient*, std::vector<size_t>> groups_by_client;
+  std::unordered_map<redis::IRespClient*, std::vector<size_t>> groups_by_client;
   for (size_t g = 0; g < batch.keys_by_shard.size(); ++g) {
     groups_by_client[client_for_group(g)].push_back(g);
   }

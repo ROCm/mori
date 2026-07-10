@@ -49,38 +49,18 @@
 #include <unordered_map>
 #include <vector>
 
+#include "umbp/distributed/master/redis/resp_value.h"
+
 // Forward-declare the hiredis context so this header stays library-agnostic to
 // its includers (only resp_client.cpp includes <hiredis/hiredis.h>).
 struct redisContext;
 
 namespace mori::umbp::redis {
 
-// Thrown on a transport-level failure (connect/socket error, protocol error).
-// Command errors returned BY the server (e.g. a Lua runtime error) are NOT
-// thrown — they surface as a RespValue with type == Error so callers can
-// inspect the message.
-class RespError : public std::runtime_error {
- public:
-  explicit RespError(const std::string& what) : std::runtime_error(what) {}
-};
+// RespError and RespValue live in resp_value.h so the redis-plus-plus cluster
+// client can share them without pulling in hiredis.
 
-// Owned, recursive mirror of a redisReply. Owning it (rather than exposing the
-// raw redisReply*) keeps hiredis out of every includer of this header.
-struct RespValue {
-  enum class Type { Nil, Status, Error, Integer, String, Array };
-
-  Type type = Type::Nil;
-  long long integer = 0;            // Integer
-  std::string str;                  // Status / Error / String (binary-safe)
-  std::vector<RespValue> elements;  // Array
-
-  bool is_nil() const { return type == Type::Nil; }
-  bool is_error() const { return type == Type::Error; }
-  bool is_array() const { return type == Type::Array; }
-  bool ok() const { return type != Type::Error; }
-};
-
-class RespClient {
+class RespClient : public IRespClient {
  public:
   struct Options {
     // e.g. "tcp://127.0.0.1:6379". Only tcp is supported in Phase 1.
@@ -99,17 +79,17 @@ class RespClient {
 
   // One command. `args` is the full argv (command name first); values are
   // binary-safe. Returns the server's reply (which may be an Error value).
-  RespValue Command(const std::vector<std::string>& args);
+  RespValue Command(const std::vector<std::string>& args) override;
 
   // Pipeline: append every command, then read all replies in order. One round
-  // trip for the whole batch.
+  // trip for the whole batch. (Not part of IRespClient; single-endpoint only.)
   std::vector<RespValue> Pipeline(const std::vector<std::vector<std::string>>& commands);
 
   // EVALSHA with transparent SCRIPT LOAD + NOSCRIPT fallback. `script` is the
   // Lua body; its SHA is loaded once and cached. `keys` then `args` are passed
   // to the script as KEYS[] / ARGV[].
   RespValue Eval(const std::string& script, const std::vector<std::string>& keys,
-                 const std::vector<std::string>& args);
+                 const std::vector<std::string>& args) override;
 
   // Pipeline the SAME script over several KEYS groups in one round trip. Call i
   // runs `script` with KEYS = keys_per_call[i] and ARGV = shared_args; the
@@ -121,10 +101,10 @@ class RespClient {
   // never applied twice for a call that already ran.
   std::vector<RespValue> EvalPipeline(const std::string& script,
                                       const std::vector<std::vector<std::string>>& keys_per_call,
-                                      const std::vector<std::string>& shared_args);
+                                      const std::vector<std::string>& shared_args) override;
 
   // Liveness probe (PING). Returns false if no connection can be established.
-  bool Ping();
+  bool Ping() override;
 
   const Options& options() const { return options_; }
 

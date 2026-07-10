@@ -150,9 +150,9 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
 
   std::size_t num_endpoints() const { return clients_.size(); }
   bool multi_endpoint() const { return clients_.size() > 1; }
-  redis::RespClient& control() const { return *clients_[0]; }
+  redis::IRespClient& control() const { return *clients_[0]; }
   std::size_t endpoint_of_shard(std::size_t shard) const { return shard % clients_.size(); }
-  redis::RespClient& client_for_shard(std::size_t shard) const {
+  redis::IRespClient& client_for_shard(std::size_t shard) const {
     return *clients_[endpoint_of_shard(shard)];
   }
 
@@ -165,8 +165,10 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
 
   redis::KeySchema keys_;
   // clients_[0] is the control instance; clients_[s] backs block shard s.
+  // Held as IRespClient so the same store logic drives the hiredis single-node
+  // client (single / multi-endpoint) and the redis-plus-plus cluster client.
   // mutable so const read methods can borrow a pooled connection.
-  mutable std::vector<std::unique_ptr<redis::RespClient>> clients_;
+  mutable std::vector<std::unique_ptr<redis::IRespClient>> clients_;
   // Workers that issue a multi-endpoint read fan-out's per-instance calls
   // concurrently (one round trip instead of N). Null in single-endpoint mode.
   std::unique_ptr<redis::ThreadPool> fanout_pool_;
