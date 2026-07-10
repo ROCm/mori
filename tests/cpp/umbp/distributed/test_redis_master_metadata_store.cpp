@@ -47,6 +47,7 @@
 #include "mori/metrics/prometheus_metrics_server.hpp"
 #include "umbp/distributed/master/redis/key_schema.h"
 #include "umbp/distributed/master/redis/resp_client.h"
+#include "umbp/distributed/master/redis/resp_cluster_client.h"
 #include "umbp/distributed/master/redis_master_metadata_store.h"
 
 namespace mori::umbp {
@@ -111,6 +112,25 @@ std::string UniqueNamespace() {
          std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() & 0xffffff);
 }
 
+// Cluster seeds for the "cluster" StoreMode, from UMBP_REDIS_CLUSTER_SEEDS
+// (comma-separated tcp:// URIs). Empty => cluster tests skip.
+std::vector<std::string> ClusterSeeds() {
+  std::vector<std::string> out;
+  const char* v = std::getenv("UMBP_REDIS_CLUSTER_SEEDS");
+  if (v == nullptr || *v == '\0') return out;
+  std::string s(v);
+  size_t pos = 0;
+  while (pos <= s.size()) {
+    const size_t comma = s.find(',', pos);
+    const size_t end = (comma == std::string::npos) ? s.size() : comma;
+    std::string tok = s.substr(pos, end - pos);
+    if (!tok.empty()) out.push_back(tok);
+    if (comma == std::string::npos) break;
+    pos = comma + 1;
+  }
+  return out;
+}
+
 // A store mode to run every assertion under: single-endpoint with N block
 // shards, or multi-endpoint with E endpoints (one shard each). The multi mode
 // points all logical endpoints at the same physical Redis (distinct hash tags
@@ -120,28 +140,49 @@ struct StoreMode {
   std::size_t block_shards;  // single-endpoint shard count (endpoints == 1)
   std::size_t endpoints;     // >1 => multi-endpoint mode (block_shards ignored)
   const char* name;
+  bool cluster = false;      // true => Redis Cluster mode (needs UMBP_REDIS_CLUSTER_SEEDS)
 };
 
 class RedisStoreTest : public ::testing::TestWithParam<StoreMode> {
  protected:
   void SetUp() override {
-    redis::RespClient::Options opts;
-    opts.uri = RedisUri();
-    opts.pool_size = 2;
-    probe_ = std::make_unique<redis::RespClient>(opts);
-    if (!probe_->Ping()) {
-      GTEST_SKIP() << "no RESP store reachable at " << RedisUri()
-                   << " (set UMBP_REDIS_URI); skipping";
-    }
+    const StoreMode& m = GetParam();
     ns_ = UniqueNamespace();
     RedisMasterMetadataStore::Config cfg;
-    cfg.uri = RedisUri();
     cfg.namespace_id = ns_;
-    const StoreMode& m = GetParam();
-    if (m.endpoints > 1) {
-      cfg.shard_uris.assign(m.endpoints, RedisUri());
-    } else {
+
+    if (m.cluster) {
+      const std::vector<std::string> seeds = ClusterSeeds();
+      if (seeds.empty()) {
+        GTEST_SKIP() << "no UMBP_REDIS_CLUSTER_SEEDS set; skipping cluster mode";
+      }
+      redis::RespClusterClient::Options popts;
+      popts.seeds = seeds;
+      popts.pool_size = 2;
+      try {
+        probe_ = std::make_unique<redis::RespClusterClient>(popts);
+      } catch (const std::exception& e) {
+        GTEST_SKIP() << "no Redis Cluster reachable (" << e.what() << "); skipping";
+      }
+      if (!probe_->Ping()) GTEST_SKIP() << "Redis Cluster not reachable; skipping";
+      cfg.cluster = true;
+      cfg.cluster_seeds = seeds;
       cfg.block_shards = m.block_shards;
+    } else {
+      redis::RespClient::Options opts;
+      opts.uri = RedisUri();
+      opts.pool_size = 2;
+      probe_ = std::make_unique<redis::RespClient>(opts);
+      if (!probe_->Ping()) {
+        GTEST_SKIP() << "no RESP store reachable at " << RedisUri()
+                     << " (set UMBP_REDIS_URI); skipping";
+      }
+      cfg.uri = RedisUri();
+      if (m.endpoints > 1) {
+        cfg.shard_uris.assign(m.endpoints, RedisUri());
+      } else {
+        cfg.block_shards = m.block_shards;
+      }
     }
     store_ = std::make_unique<RedisMasterMetadataStore>(cfg);
     now_ = std::chrono::system_clock::now();
@@ -150,6 +191,7 @@ class RedisStoreTest : public ::testing::TestWithParam<StoreMode> {
   // Number of block shards the store built (must match KeySchema for MetaField).
   std::size_t NumShards() const {
     const StoreMode& m = GetParam();
+    if (m.cluster) return m.block_shards;
     return m.endpoints > 1 ? m.endpoints : m.block_shards;
   }
 
@@ -178,7 +220,7 @@ class RedisStoreTest : public ::testing::TestWithParam<StoreMode> {
   }
 
   std::string ns_;
-  std::unique_ptr<redis::RespClient> probe_;
+  std::unique_ptr<redis::IRespClient> probe_;
   std::unique_ptr<RedisMasterMetadataStore> store_;
   std::chrono::system_clock::time_point now_;
 };
@@ -186,7 +228,10 @@ class RedisStoreTest : public ::testing::TestWithParam<StoreMode> {
 INSTANTIATE_TEST_SUITE_P(
     BlockShards, RedisStoreTest,
     ::testing::Values(StoreMode{1, 1, "shards1"}, StoreMode{16, 1, "shards16"},
-                      StoreMode{1, 3, "endpoints3"}),
+                      StoreMode{1, 3, "endpoints3"},
+                      // Redis Cluster: 16 block-shard tags spread across nodes by
+                      // slot. Skips unless UMBP_REDIS_CLUSTER_SEEDS is set.
+                      StoreMode{16, 1, "cluster", true}),
     [](const ::testing::TestParamInfo<StoreMode>& info) { return std::string(info.param.name); });
 
 TEST_P(RedisStoreTest, RegisterMakesClientAlive) {
