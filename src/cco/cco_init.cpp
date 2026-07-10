@@ -74,6 +74,11 @@ static_assert(static_cast<int>(CCO_PROVIDER_IBVERBS) ==
                   static_cast<int>(core::ProviderType::IBVERBS),
               "ccoProviderType drifted from core::ProviderType");
 
+// ccoFabricHandle_t (cco.hpp, self-contained) and hipMemFabricHandle_compat_t
+// (hip_compat.hpp) are both 64-byte PODs; guard layout compatibility.
+static_assert(sizeof(ccoFabricHandle_t) == sizeof(hipMemFabricHandle_compat_t),
+              "ccoFabricHandle_t / hipMemFabricHandle_compat_t size mismatch");
+
 // Out-of-line dtor for the unique_ptr<HeapVAManager> member: ccoComm is defined
 // in cco.hpp with HeapVAManager only forward-declared, so its destruction must
 // be emitted here where HeapVAManager (va_manager.hpp) is complete.
@@ -275,11 +280,45 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // the calling thread bound to this device for any later CCO API on this comm.
   HIP_RUNTIME_CHECK(hipGetDevice(&comm->hipDev));
 
+  // Probe fabric handle support: try to allocate + export with the fabric
+  // handle type. If it works, all subsequent allocations use fabric handles
+  // (64-byte tokens exchangeable via Allgather) instead of dma-buf FDs
+  // (which require Unix socket + SCM_RIGHTS).
+  {
+    hipMemAllocationProp probeProp = {};
+    probeProp.type = hipMemAllocationTypePinned;
+    probeProp.requestedHandleType = hipMemHandleTypeFabricCompat;
+    probeProp.location.type = hipMemLocationTypeDevice;
+    probeProp.location.id = comm->hipDev;
+
+    size_t probeGranularity = 0;
+    hipError_t probeErr =
+        hipMemGetAllocationGranularity(&probeGranularity, &probeProp,
+                                       hipMemAllocationGranularityRecommended);
+    if (probeErr == hipSuccess && probeGranularity > 0) {
+      hipMemGenericAllocationHandle_t probeHandle = 0;
+      probeErr = hipMemCreate(&probeHandle, probeGranularity, &probeProp, 0);
+      if (probeErr == hipSuccess) {
+        hipMemFabricHandle_compat_t probeFabric;
+        probeErr = hipMemExportToShareableHandle(&probeFabric, probeHandle,
+                                                  hipMemHandleTypeFabricCompat, 0);
+        (void)hipMemRelease(probeHandle);
+        if (probeErr == hipSuccess) {
+          comm->handleType = static_cast<int>(hipMemHandleTypeFabricCompat);
+          MORI_SHMEM_INFO("ccoCommCreate: fabric handle probe succeeded");
+        }
+      }
+    }
+    if (comm->handleType != static_cast<int>(hipMemHandleTypeFabricCompat)) {
+      MORI_SHMEM_INFO("ccoCommCreate: fabric handle probe failed, using FD path");
+    }
+  }
+
   // Query granularity with the SAME allocProp MemAlloc will use — granularity
-  // can shift when requestedHandleType (FD export) is enabled.
+  // can shift when requestedHandleType (FD export vs fabric) is enabled.
   hipMemAllocationProp allocProp = {};
   allocProp.type = CcoWindowAllocType();
-  allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
+  allocProp.requestedHandleType = static_cast<hipMemAllocationHandleType>(comm->handleType);
   allocProp.location.type = hipMemLocationTypeDevice;
   allocProp.location.id = comm->hipDev;
 
@@ -348,10 +387,11 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
 
   MORI_SHMEM_INFO(
       "ccoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
-      "granularity={} defaultNumQpPerPe={} sdmaNumQueue={} rdma={}",
+      "granularity={} defaultNumQpPerPe={} sdmaNumQueue={} rdma={} fabric={}",
       comm->rank, comm->worldSize, comm->groupId, comm->flatBase, comm->perRankSize,
       comm->vmmGranularity, comm->defaultNumQpPerPe, comm->sdmaNumQueue,
-      comm->ctx->RdmaTransportEnabled());
+      comm->ctx->RdmaTransportEnabled(),
+      comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat));
   return 0;
 }
 
@@ -390,7 +430,7 @@ int ccoCommDestroy(ccoComm* comm) {
     vmmProcessLock vmmLock;
     (void)hipMemUnmap(ptr, meta.size);
     (void)hipMemRelease(meta.physHandle);
-    if (meta.shareFd >= 0) close(meta.shareFd);
+    if (!meta.isFabric && meta.shareFd >= 0) close(meta.shareFd);
   }
   comm->allocTable.clear();
 
@@ -449,15 +489,16 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   // Return the reserved slot to the vaManager on any failure after this point.
   auto rollbackSlot = [&]() { (void)comm->vaManager->Free(slotAddr); };
 
+  const bool useFabric =
+      (comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat));
   hipMemAllocationProp allocProp = {};
   allocProp.type = CcoWindowAllocType();
-  allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
+  allocProp.requestedHandleType = static_cast<hipMemAllocationHandleType>(comm->handleType);
   allocProp.location.type = hipMemLocationTypeDevice;
   allocProp.location.id = comm->hipDev;
 
   hipMemGenericAllocationHandle_t physHandle = 0;
   hipError_t err = hipSuccess;
-  int shareFd = -1;
   void* localVa = reinterpret_cast<void*>(slotAddr);
   {
     vmmProcessLock vmmLock;
@@ -503,8 +544,23 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
     return -1;
   }
 
-  err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&shareFd), physHandle,
-                                      hipMemHandleTypePosixFileDescriptor, 0);
+  // Export a shareable handle for WindowRegister (P2P mapping + RDMA MR).
+  // Fabric path: 64-byte token (exchangeable via Allgather — no Unix sockets).
+  // FD path: dma-buf FD (exchanged via LocalBootstrapNetwork + SCM_RIGHTS).
+  ccoComm::AllocMeta meta;
+  meta.physHandle = physHandle;
+  meta.isFabric = useFabric;
+  meta.slotOffset = slotOffset;
+  meta.size = alignedSize;
+
+  if (useFabric) {
+    err = hipMemExportToShareableHandle(&meta.fabricHandle, physHandle,
+                                        hipMemHandleTypeFabricCompat, 0);
+  } else {
+    meta.shareFd = -1;
+    err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&meta.shareFd), physHandle,
+                                        hipMemHandleTypePosixFileDescriptor, 0);
+  }
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("ccoMemAlloc: hipMemExportToShareableHandle failed: {} ({})",
                      static_cast<int>(err), hipGetErrorString(err));
@@ -518,11 +574,6 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   }
   {
     std::lock_guard<std::mutex> lock(comm->allocMutex);
-    ccoComm::AllocMeta meta;
-    meta.physHandle = physHandle;
-    meta.shareFd = shareFd;
-    meta.slotOffset = slotOffset;
-    meta.size = alignedSize;
     comm->allocTable[localVa] = meta;
   }
 
@@ -573,7 +624,7 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
     }
   }
 
-  if (meta.shareFd >= 0) close(meta.shareFd);
+  if (!meta.isFabric && meta.shareFd >= 0) close(meta.shareFd);
 
   return 0;
 }
@@ -591,21 +642,21 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
 
   auto& meta = it->second;
   size_t slotOffset = meta.slotOffset;
-  int shareFd = meta.shareFd;
   void* localPtr = ptr;
   int worldSize = comm->worldSize;
   int rank = comm->rank;
+  const bool useFabric = meta.isFabric;
 
   size_t alignedSize = meta.size;
 
-  MORI_SHMEM_TRACE("ccoWindowRegister: rank={} ptr={} size={} slotOffset={}", rank, ptr, size,
-                   slotOffset);
+  MORI_SHMEM_TRACE("ccoWindowRegister: rank={} ptr={} size={} slotOffset={} fabric={}", rank, ptr,
+                   size, slotOffset, useFabric);
 
-  // P2P imported handles — collected during the FD-exchange loop below,
+  // P2P imported handles — collected during the exchange loop below,
   // ownership later transferred to ccoWindowHost so Deregister can release.
   std::vector<hipMemGenericAllocationHandle_t> p2pImportedHandles;
 
-  // P2P: exchange dma-buf FDs with same-node peers and map their slots into
+  // P2P: exchange handles with same-node peers and map their slots into
   // the LSA flat VA.
   std::vector<int> p2pPeers;
   for (int pe = 0; pe < worldSize; pe++) {
@@ -615,80 +666,12 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   }
 
   if (!p2pPeers.empty()) {
-    std::vector<int> sortedGroup = p2pPeers;
-    sortedGroup.push_back(rank);
-    std::sort(sortedGroup.begin(), sortedGroup.end());
-
-    int myPeerRank = 0;
-    for (int i = 0; i < static_cast<int>(sortedGroup.size()); i++) {
-      if (sortedGroup[i] == rank) {
-        myPeerRank = i;
-        break;
-      }
-    }
-    int p2pWorldSize = static_cast<int>(sortedGroup.size());
-
-    // Socket path must agree across the group but be unique per (group, window).
-    // groupId = rank 0's pid; slotOffset identifies the window. The clique
-    // leader (smallest GLOBAL rank in the group) must also be part of the path:
-    // a single node can host several disjoint P2P cliques (e.g. GPUs {0,1,2,3}
-    // and {4,5,6,7}). Every clique shares groupId + slotOffset and renumbers its
-    // members to 0..k-1 internally, so without the leader the cliques would
-    // generate identical socket/barrier filenames and clobber each other's
-    // sockets (manifesting as ENOENT during connect).
-    std::string socketPath = "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" +
-                             std::to_string(slotOffset) + "_g" + std::to_string(sortedGroup[0]) +
-                             "_";
-
-    // NOTE: do NOT blanket-unlink every i_j socket here (even guarded by
-    // myPeerRank == 0). Ranks bind their server sockets as soon as they enter
-    // ExchangeFileDescriptors, and they may do so at very different times (e.g.
-    // single-process multi-thread, where threads serialize on HIP locks). A
-    // leader-side sweep can therefore delete a socket a peer has already bound
-    // and is listening on, making a client connect() fail with ENOENT. Stale
-    // sockets from a prior crashed run are instead handled per-pairing inside
-    // ExchangeFileDescriptors, which unlinks each server path right before
-    // binding it (and groupId/leader/slotOffset make cross-run collisions
-    // effectively impossible).
-    application::LocalBootstrapNetwork localBoot(myPeerRank, p2pWorldSize, socketPath);
-    localBoot.Initialize();
-
-    std::vector<int> myFds = {shareFd};
-    std::vector<std::vector<int>> allFds;
-    if (!localBoot.ExchangeFileDescriptors(myFds, allFds)) {
-      MORI_SHMEM_ERROR("ccoWindowRegister: P2P FD exchange failed");
-      localBoot.Finalize();
-      return -1;
-    }
-
-    // All peer-supplied fds (everything in allFds except our own slot) must
-    // be close()'d exactly once — closing them at the very end on every
-    // exit path (success and bail) is the easiest invariant to enforce.
-    // hipMemImportFromShareableHandle already dup's the underlying dma-buf
-    // reference internally, so it's safe to delay the close to here.
-    auto closePeerFds = [&]() {
-      for (int i = 0; i < static_cast<int>(allFds.size()); i++) {
-        if (i == myPeerRank) continue;  // our own shareFd is owned by meta
-        for (int fd : allFds[i]) {
-          if (fd >= 0) close(fd);
-        }
-      }
-      allFds.clear();
-    };
-
-    std::vector<int> globalToPeer(worldSize, -1);
-    for (int i = 0; i < p2pWorldSize; i++) {
-      globalToPeer[sortedGroup[i]] = i;
-    }
-
+    // Common peer-mapping helpers shared by both fabric and FD paths.
     hipMemAccessDesc accessDesc = {};
     accessDesc.location.type = hipMemLocationTypeDevice;
     accessDesc.location.id = comm->hipDev;
     accessDesc.flags = hipMemAccessFlagsProtReadWrite;
 
-    // Track already-mapped peers so we can roll back if any later peer
-    // fails — partial success would leave the window with missing P2P
-    // links and silently segfault when a kernel touches a missing peer.
     struct MappedPeer {
       hipMemGenericAllocationHandle_t handle;
       void* peerVa;
@@ -705,51 +688,23 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
       mappedPeers.clear();
     };
 
-    auto bail = [&]() {
-      rollbackMappedPeers();
-      closePeerFds();
-      localBoot.Finalize();
-    };
-
-    for (int pe : p2pPeers) {
-      int pr = globalToPeer[pe];
-      if (pr < 0 || pr >= static_cast<int>(allFds.size())) {
-        MORI_SHMEM_ERROR("ccoWindowRegister: PE {} missing in FD exchange result", pe);
-        bail();
-        return -1;
-      }
-      int peerFd = allFds[pr][0];
-      if (peerFd < 0) {
-        MORI_SHMEM_ERROR("ccoWindowRegister: PE {} delivered invalid FD ({})", pe, peerFd);
-        bail();
-        return -1;
-      }
-
-      hipMemGenericAllocationHandle_t importedHandle;
+    // Import + map a single peer's handle into our flat VA. Returns 0 on
+    // success, -1 on failure (rolls back all prior mappings).
+    auto mapPeer = [&](int pe, hipMemGenericAllocationHandle_t importedHandle) -> int {
       int peerLsaRank = pe - comm->myNodeStart;
       void* peerVa = static_cast<char*>(comm->flatBase) +
                      static_cast<size_t>(peerLsaRank) * comm->perRankSize + slotOffset;
       {
         vmmProcessLock vmmLock;
-        hipError_t err = hipMemImportFromShareableHandleCompat(&importedHandle, peerFd,
-                                                               hipMemHandleTypePosixFileDescriptor);
-        if (err != hipSuccess) {
-          MORI_SHMEM_ERROR("ccoWindowRegister: import from PE {} failed: {}", pe,
-                           static_cast<int>(err));
-          bail();
-          return -1;
-        }
-
         hipError_t mapErr = hipMemMap(peerVa, alignedSize, 0, importedHandle, 0);
         if (mapErr != hipSuccess) {
           MORI_SHMEM_ERROR("ccoWindowRegister: hipMemMap PE {} failed: {}", pe,
                            static_cast<int>(mapErr));
           (void)hipMemRelease(importedHandle);
-          bail();
+          rollbackMappedPeers();
           return -1;
         }
       }
-
       hipError_t setErr = hipSuccess;
       for (int retry = 0; retry < 5; retry++) {
         {
@@ -767,19 +722,122 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
           (void)hipMemUnmap(peerVa, alignedSize);
           (void)hipMemRelease(importedHandle);
         }
-        bail();
+        rollbackMappedPeers();
+        return -1;
+      }
+      mappedPeers.push_back({importedHandle, peerVa});
+      return 0;
+    };
+
+    if (useFabric) {
+      // Fabric path: Allgather 64-byte fabric handles via the bootstrap
+      // network — no Unix sockets, no SCM_RIGHTS.
+      std::vector<hipMemFabricHandle_compat_t> allFabricHandles(worldSize);
+      comm->bootNet->Allgather(&meta.fabricHandle, allFabricHandles.data(),
+                               sizeof(hipMemFabricHandle_compat_t));
+
+      for (int pe : p2pPeers) {
+        hipMemGenericAllocationHandle_t importedHandle;
+        hipError_t err = hipMemImportFromShareableHandle(
+            &importedHandle, &allFabricHandles[pe], hipMemHandleTypeFabricCompat);
+        if (err != hipSuccess) {
+          MORI_SHMEM_ERROR("ccoWindowRegister: fabric import from PE {} failed: {}", pe,
+                           static_cast<int>(err));
+          rollbackMappedPeers();
+          return -1;
+        }
+        if (mapPeer(pe, importedHandle) != 0) return -1;
+      }
+    } else {
+      // FD path (fallback): exchange dma-buf FDs via LocalBootstrapNetwork +
+      // SCM_RIGHTS (one Unix socket pair per peer).
+      int shareFd = meta.shareFd;
+
+      std::vector<int> sortedGroup = p2pPeers;
+      sortedGroup.push_back(rank);
+      std::sort(sortedGroup.begin(), sortedGroup.end());
+
+      int myPeerRank = 0;
+      for (int i = 0; i < static_cast<int>(sortedGroup.size()); i++) {
+        if (sortedGroup[i] == rank) {
+          myPeerRank = i;
+          break;
+        }
+      }
+      int p2pWorldSize = static_cast<int>(sortedGroup.size());
+
+      std::string socketPath = "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" +
+                               std::to_string(slotOffset) + "_g" + std::to_string(sortedGroup[0]) +
+                               "_";
+
+      application::LocalBootstrapNetwork localBoot(myPeerRank, p2pWorldSize, socketPath);
+      localBoot.Initialize();
+
+      std::vector<int> myFds = {shareFd};
+      std::vector<std::vector<int>> allFds;
+      if (!localBoot.ExchangeFileDescriptors(myFds, allFds)) {
+        MORI_SHMEM_ERROR("ccoWindowRegister: P2P FD exchange failed");
+        localBoot.Finalize();
         return -1;
       }
 
-      mappedPeers.push_back({importedHandle, peerVa});
+      auto closePeerFds = [&]() {
+        for (int i = 0; i < static_cast<int>(allFds.size()); i++) {
+          if (i == myPeerRank) continue;
+          for (int fd : allFds[i]) {
+            if (fd >= 0) close(fd);
+          }
+        }
+        allFds.clear();
+      };
+
+      std::vector<int> globalToPeer(worldSize, -1);
+      for (int i = 0; i < p2pWorldSize; i++) {
+        globalToPeer[sortedGroup[i]] = i;
+      }
+
+      auto bailFd = [&]() {
+        rollbackMappedPeers();
+        closePeerFds();
+        localBoot.Finalize();
+      };
+
+      for (int pe : p2pPeers) {
+        int pr = globalToPeer[pe];
+        if (pr < 0 || pr >= static_cast<int>(allFds.size())) {
+          MORI_SHMEM_ERROR("ccoWindowRegister: PE {} missing in FD exchange result", pe);
+          bailFd();
+          return -1;
+        }
+        int peerFd = allFds[pr][0];
+        if (peerFd < 0) {
+          MORI_SHMEM_ERROR("ccoWindowRegister: PE {} delivered invalid FD ({})", pe, peerFd);
+          bailFd();
+          return -1;
+        }
+
+        hipMemGenericAllocationHandle_t importedHandle;
+        hipError_t err = hipMemImportFromShareableHandleCompat(&importedHandle, peerFd,
+                                                               hipMemHandleTypePosixFileDescriptor);
+        if (err != hipSuccess) {
+          MORI_SHMEM_ERROR("ccoWindowRegister: import from PE {} failed: {}", pe,
+                           static_cast<int>(err));
+          bailFd();
+          return -1;
+        }
+        if (mapPeer(pe, importedHandle) != 0) {
+          closePeerFds();
+          localBoot.Finalize();
+          return -1;
+        }
+      }
+
+      closePeerFds();
+      localBoot.Finalize();
     }
 
-    // Stash handles on the WindowHost so Deregister can release them.
     p2pImportedHandles.reserve(mappedPeers.size());
     for (auto& mp : mappedPeers) p2pImportedHandles.push_back(mp.handle);
-
-    closePeerFds();
-    localBoot.Finalize();
   }
 
   // RDMA MR registration + rkey Allgather.
@@ -787,12 +845,14 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   uint32_t localRkey = 0;
 
   application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
-  if (rdmaDevCtx && shareFd >= 0) {
+  if (rdmaDevCtx) {
     application::RdmaMemoryRegion mr;
-    if (comm->iovaZeroMode) {
-      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(localPtr, size, shareFd);
+    if (useFabric) {
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionAuto(localPtr, size);
+    } else if (comm->iovaZeroMode) {
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(localPtr, size, meta.shareFd);
     } else {
-      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabuf(localPtr, size, shareFd);
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabuf(localPtr, size, meta.shareFd);
     }
     lkey = mr.lkey;
     localRkey = mr.rkey;
@@ -842,8 +902,9 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   *outWin = devPtr;
 
   char* winBase = static_cast<char*>(comm->flatBase) + slotOffset;
-  MORI_SHMEM_INFO("ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={}",
-                  rank, (void*)devPtr, (void*)winBase, size, slotOffset, lkey);
+  MORI_SHMEM_INFO(
+      "ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={} fabric={}",
+      rank, (void*)devPtr, (void*)winBase, size, slotOffset, lkey, useFabric);
   for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
     int pe = comm->myNodeStart + lsa;
     void* peerVa = winBase + static_cast<size_t>(lsa) * comm->perRankSize;
