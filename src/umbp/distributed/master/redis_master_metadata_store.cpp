@@ -22,11 +22,14 @@
 #include "umbp/distributed/master/redis_master_metadata_store.h"
 
 #include <algorithm>
+#include <chrono>
 #include <future>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
+#include "mori/metrics/prometheus_metrics_server.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/master/redis/lua_scripts.h"
 
@@ -35,6 +38,34 @@ namespace mori::umbp {
 namespace {
 
 using redis::RespValue;
+
+// Records store-op latency into mori_umbp_store_op_latency_seconds{op,backend=redis}
+// on scope exit when a metrics sink is attached; a cheap no-op otherwise. Lets a
+// dashboard separate backend round-trip cost per store method.
+class ScopedStoreOp {
+ public:
+  ScopedStoreOp(mori::metrics::MetricsServer* metrics, const char* op)
+      : metrics_(metrics), op_(op) {
+    if (metrics_) t0_ = std::chrono::steady_clock::now();
+  }
+  ~ScopedStoreOp() {
+    if (!metrics_) return;
+    const double sec =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_).count();
+    static const std::vector<double> kBounds = {0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01,
+                                                0.025,  0.05,    0.1,    0.25,  0.5,    1.0};
+    metrics_->observe("mori_umbp_store_op_latency_seconds",
+                      "Latency of IMasterMetadataStore operations against the backend",
+                      {{"op", op_}, {"backend", "redis"}}, kBounds, sec);
+  }
+  ScopedStoreOp(const ScopedStoreOp&) = delete;
+  ScopedStoreOp& operator=(const ScopedStoreOp&) = delete;
+
+ private:
+  mori::metrics::MetricsServer* metrics_;
+  const char* op_;
+  std::chrono::steady_clock::time_point t0_;
+};
 
 int64_t ToEpochMs(std::chrono::system_clock::time_point tp) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()).count();
@@ -392,6 +423,7 @@ void RedisMasterMetadataStore::WipeNodeBlocksMulti(const std::string& node_id) {
 bool RedisMasterMetadataStore::RegisterClient(const ClientRegistration& registration,
                                               std::chrono::system_clock::time_point now,
                                               std::chrono::system_clock::duration stale_after) {
+  ScopedStoreOp _op(metrics_, "RegisterClient");
   const std::string engine(registration.engine_desc_bytes.begin(),
                            registration.engine_desc_bytes.end());
   RespValue r = control().Eval(
@@ -404,6 +436,7 @@ bool RedisMasterMetadataStore::RegisterClient(const ClientRegistration& registra
 }
 
 void RedisMasterMetadataStore::UnregisterClient(const std::string& node_id) {
+  ScopedStoreOp _op(metrics_, "UnregisterClient");
   if (!multi_endpoint()) {
     RespValue r =
         control().Eval(redis::kUnregisterClientLua, {keys_.Node(node_id)}, {keys_.Tag(), node_id});
@@ -424,6 +457,7 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
     const std::string& node_id, uint64_t seq, std::chrono::system_clock::time_point now,
     const std::map<TierType, TierCapacity>& caps, const std::vector<KvEvent>& events,
     bool is_full_sync) {
+  ScopedStoreOp _op(metrics_, "ApplyHeartbeat");
   RespValue r;
   if (!multi_endpoint()) {
     // Single instance: one atomic script does seq-CAS + record + blocks.
@@ -477,6 +511,7 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
 
 std::vector<std::string> RedisMasterMetadataStore::ExpireStaleClients(
     std::chrono::system_clock::time_point cutoff) {
+  ScopedStoreOp _op(metrics_, "ExpireStaleClients");
   const char* script = multi_endpoint() ? redis::kExpireControlLua : redis::kExpireStaleLua;
   RespValue r = control().Eval(script, {}, {keys_.Tag(), std::to_string(ToEpochMs(cutoff))});
   if (r.is_error()) throw std::runtime_error("[RedisStore] ExpireStaleClients: " + r.str);
@@ -533,6 +568,7 @@ std::size_t RedisMasterMetadataStore::GarbageCollectHits(std::chrono::system_clo
 // =====================================================================
 
 std::vector<Location> RedisMasterMetadataStore::LookupBlock(const std::string& key) const {
+  ScopedStoreOp _op(metrics_, "LookupBlock");
   RespValue r = client_for_shard(keys_.ShardOf(key)).Command({"HGETALL", keys_.Block(key)});
   std::vector<Location> out;
   if (!r.is_array()) return out;
@@ -567,6 +603,7 @@ std::vector<std::vector<Location>> RedisMasterMetadataStore::BatchLookupBlockFor
     std::chrono::system_clock::time_point now, std::chrono::system_clock::duration lease_duration) {
   std::vector<std::vector<Location>> out(keys.size());
   if (keys.empty()) return out;
+  ScopedStoreOp _op(metrics_, "BatchLookupBlockForRouteGet");
 
   std::vector<std::string> args;
   args.reserve(3 + exclude_nodes.size());
@@ -603,6 +640,7 @@ std::vector<bool> RedisMasterMetadataStore::BatchExistsBlock(
     const std::vector<std::string>& keys) const {
   std::vector<bool> results(keys.size(), false);
   if (keys.empty()) return results;
+  ScopedStoreOp _op(metrics_, "BatchExistsBlock");
 
   const ShardedBatch batch = GroupKeysByShard(keys_, keys);
   RunShardedRead(
@@ -646,6 +684,7 @@ std::optional<std::string> RedisMasterMetadataStore::GetPeerAddress(
 }
 
 std::vector<ClientRecord> RedisMasterMetadataStore::ListAliveClients() const {
+  ScopedStoreOp _op(metrics_, "ListAliveClients");
   RespValue r = control().Eval(redis::kListAliveLua, {}, {keys_.Tag()});
   if (r.is_error()) throw std::runtime_error("[RedisStore] ListAliveClients: " + r.str);
   std::vector<ClientRecord> out;
@@ -660,6 +699,7 @@ std::vector<ClientRecord> RedisMasterMetadataStore::ListAliveClients() const {
 }
 
 std::unordered_map<std::string, std::string> RedisMasterMetadataStore::GetAlivePeerView() const {
+  ScopedStoreOp _op(metrics_, "GetAlivePeerView");
   RespValue r = control().Command({"HGETALL", keys_.AlivePeers()});
   std::unordered_map<std::string, std::string> view;
   if (!r.is_array()) return view;

@@ -37,11 +37,14 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "mori/metrics/prometheus_metrics_server.hpp"
 #include "umbp/distributed/master/redis/key_schema.h"
 #include "umbp/distributed/master/redis/resp_client.h"
 #include "umbp/distributed/master/redis_master_metadata_store.h"
@@ -515,6 +518,61 @@ TEST(RedisFaultToleranceTest, DownShardDegradesToMissNotError) {
   ASSERT_EQ(locs[0].size(), 1u);
   EXPECT_EQ(locs[0][0].size, 7u);
   EXPECT_TRUE(locs[1].empty());
+}
+
+// A metrics sink attached to the store exports per-op latency as
+// mori_umbp_store_op_latency_seconds{op,backend="redis"}. Drives the store
+// directly (no gRPC/GPU) and scrapes the Prometheus endpoint over HTTP.
+TEST(RedisStoreMetricsTest, EmitsStoreOpLatencyHistogram) {
+  redis::RespClient::Options opts;
+  opts.uri = RedisUri();
+  opts.pool_size = 2;
+  redis::RespClient probe(opts);
+  if (!probe.Ping()) {
+    GTEST_SKIP() << "no RESP store reachable at " << RedisUri() << "; skipping";
+  }
+
+  const int port = 19099;
+  std::unique_ptr<mori::metrics::MetricsServer> server;
+  try {
+    server = std::make_unique<mori::metrics::MetricsServer>(port);
+  } catch (const std::exception& e) {
+    GTEST_SKIP() << "could not start metrics server on " << port << ": " << e.what();
+  }
+
+  RedisMasterMetadataStore::Config cfg;
+  cfg.namespace_id = UniqueNamespace();
+  RedisMasterMetadataStore store(cfg);
+  store.SetMetricsSink(server.get());
+
+  const auto now = std::chrono::system_clock::now();
+  ClientRegistration reg;
+  reg.node_id = "mn";
+  reg.node_address = "a";
+  reg.peer_address = "p:1";
+  reg.tier_capacities[TierType::DRAM] = TierCapacity{1u << 20, 1u << 20};
+  ASSERT_TRUE(store.RegisterClient(reg, now, 30s));
+  ASSERT_EQ(store.ApplyHeartbeat("mn", 1, now, {}, {{KvEvent::Kind::ADD, "mk", TierType::DRAM, 4}},
+                                 false)
+                .status,
+            HeartbeatResult::APPLIED);
+  store.BatchLookupBlockForRouteGet({"mk"}, {}, now, 10s);
+  store.BatchExistsBlock({"mk"});
+
+  // Scrape /metrics via curl (present in the build image).
+  const std::string cmd = "curl -s http://127.0.0.1:" + std::to_string(port) + "/metrics";
+  std::string body;
+  FILE* f = popen(cmd.c_str(), "r");
+  ASSERT_NE(f, nullptr);
+  char buf[8192];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) body.append(buf, n);
+  pclose(f);
+
+  EXPECT_NE(body.find("mori_umbp_store_op_latency_seconds"), std::string::npos) << body;
+  EXPECT_NE(body.find("backend=\"redis\""), std::string::npos);
+  EXPECT_NE(body.find("op=\"BatchLookupBlockForRouteGet\""), std::string::npos);
+  EXPECT_NE(body.find("op=\"ApplyHeartbeat\""), std::string::npos);
 }
 
 }  // namespace

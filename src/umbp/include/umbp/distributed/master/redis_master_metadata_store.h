@@ -130,6 +130,11 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
       const std::vector<std::string>& hashes) const override;
   std::size_t GetExternalKvCount(const std::string& node_id) const override;
 
+  // Attach the master's Prometheus server so hot ops export
+  // mori_umbp_store_op_latency_seconds{op,backend="redis"}. Null (default) =
+  // no metrics (e.g. the standalone microbench).
+  void SetMetricsSink(mori::metrics::MetricsServer* metrics) override { metrics_ = metrics; }
+
   // Best-effort connectivity probe (PING). Every endpoint must answer.
   bool Ping() const {
     for (const auto& c : clients_) {
@@ -165,6 +170,8 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
   // Workers that issue a multi-endpoint read fan-out's per-instance calls
   // concurrently (one round trip instead of N). Null in single-endpoint mode.
   std::unique_ptr<redis::ThreadPool> fanout_pool_;
+  // Optional Prometheus sink for per-op latency; null = no metrics.
+  mori::metrics::MetricsServer* metrics_ = nullptr;
 };
 
 }  // namespace mori::umbp

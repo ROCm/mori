@@ -175,6 +175,10 @@
 
 #include "umbp/distributed/types.h"
 
+namespace mori::metrics {
+class MetricsServer;
+}
+
 namespace mori::umbp {
 
 // =====================================================================
@@ -242,6 +246,12 @@ namespace mori::umbp {
 class IMasterMetadataStore {
  public:
   virtual ~IMasterMetadataStore() = default;
+
+  // Optional observability hook: attach the master's Prometheus metrics server
+  // so a backend can export per-op latency (e.g. store->Redis round trips).
+  // Default no-op — backends that don't emit store metrics (in-memory) ignore
+  // it. Called once at master startup (after the metrics server is created).
+  virtual void SetMetricsSink(mori::metrics::MetricsServer* /*metrics*/) {}
 
   // ===================================================================
   // Cross-store write operations — each call is atomic.

@@ -842,6 +842,7 @@ void MasterServer::Run() {
   if (config_.metrics_port > 0) {
     metrics_server_ = std::make_unique<mori::metrics::MetricsServer>(config_.metrics_port);
     service_->SetMetrics(metrics_server_.get());
+    store_->SetMetricsSink(metrics_server_.get());
     metrics_server_->setGauge(MORI_UMBP_METRIC_CLIENT_COUNT, MORI_UMBP_METRIC_CLIENT_COUNT_HELP,
                               0.0);
     MORI_UMBP_INFO("[Master] Metrics server listening on port {}", config_.metrics_port);
