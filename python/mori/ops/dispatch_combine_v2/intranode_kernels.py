@@ -34,13 +34,25 @@ from flydsl.expr.rocdl import (
     fmed3,
     cvt_pk_f32_fp8,
     cvt_pk_fp8_f32,
-    cvt_scalef32_pk_f32_fp4,
-    cvt_scalef32_pk_fp4_f32,
+    cvt_scale_pk8_f32_fp4,
+    cvt_scalef32_pk8_fp4_f32,
 )
 from flydsl.expr.typing import Int32, Int64
 
 import mori.cco.device.flydsl as cco
 import flydsl_prims as P
+
+# ── wavefront size ─────────────────────────────────────────────────────────
+# MI450 / gfx1250 is wave32-ONLY (MI400 Shader Programming Guide §1.5: "Only
+# wave32 is supported"; the toolchain rejects +wavefrontsize64 for gfx1250).
+# This port was originally wave64 (gfx942/MI300X); every lane-id mask, warp
+# shift, block size, warp-strided loop, dual-issue copy span, blockwise
+# coalesce span and butterfly-reduce offset that hard-coded 64 is now expressed
+# via _WAVE so the kernels are correct on wave32. NOTE: warp_num_per_block in
+# tuning_configs.py was tuned for wave64 and should be re-swept for wave32.
+_WAVE = 32                 # lanes per wavefront (gfx1250)
+_LANE_MASK = _WAVE - 1     # tid & _LANE_MASK -> lane id
+_LANE_BITS = 5             # tid >> _LANE_BITS -> warp id (== log2(_WAVE))
 
 # ── dispatch ──────────────────────────────────────────────────────────────
 
@@ -62,15 +74,15 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
     scale_num_i32 = (scale_bytes + 3) // 4
     enable_scales = scale_bytes > 0
 
-    @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
+    @flyc.kernel(known_block_size=[warp_num_per_block * _WAVE, 1, 1])
     def ep_dispatch(arena: Int64, addr_inp_tok: Int64, addr_inp_idx: Int64, addr_inp_wts: Int64,
                     addr_tok_map: Int64, addr_dest_pe_ctr: Int64, addr_disp_bar: Int64,
                     addr_total_recv: Int64, addr_inp_scales: Int64,
                     my_lsa_rank: Int32, inp_cur_tok: Int32):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        lane = tid & 63
-        warp = tid >> 6
+        lane = tid & _LANE_MASK
+        warp = tid >> _LANE_BITS
         global_warp_id = bid * warp_num_per_block + warp
         global_warp_num = block_num * warp_num_per_block
         work_limit = inp_cur_tok * experts_per_token
@@ -97,9 +109,11 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
                                       vec_width=1, dtype=T.i32())
             dest_pe = dest_expert // experts_per_rank
             lane_dest_pe = lane_expert // experts_per_rank
+            # sentinel _WAVE (>= any real lane id) marks "not a duplicate";
+            # wave32 ballot returns a 32-bit lane mask (i32, not i64).
             dup_per_lane = arith.select(lane_dest_pe == dest_pe,
-                                        arith.select(lane < k_slot, lane, 64), 64)
-            dup_ballot = ballot(T.i64(), dup_per_lane < 64)
+                                        arith.select(lane < k_slot, lane, _WAVE), _WAVE)
+            dup_ballot = ballot(T.i32(), dup_per_lane < _WAVE)
             is_dup = dup_ballot != 0
 
             if const_expr(replay):
@@ -158,7 +172,7 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
                     rsrc_inp_scales = create_buffer_resource_from_addr(addr_inp_scales)
                     peer_scales = fx.Int64(window.lsa_ptr(dest_pe, off_out_scales))
                     rsrc_peer_scales = create_buffer_resource_from_addr(peer_scales)
-                    for k_off in range(lane, scale_num_i32, 64):
+                    for k_off in range(lane, scale_num_i32, _WAVE):
                         scale_val = buffer_load(rsrc_inp_scales, src_tok * scale_num_i32 + k_off,
                                                 vec_width=1, dtype=T.i32())
                         buffer_store(scale_val, rsrc_peer_scales,
@@ -166,31 +180,35 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
 
             # Token-embedding scatter: each lane owns 4 i32 (16B). The main body
             # runs two independent vec4 load/store streams (this lane's chunk and
-            # chunk+256, stride 512 i32) so both are in flight together
-            # (memory-level parallelism); a stride-256 tail covers the remainder.
+            # chunk+_CP_SPAN1, stride _CP_SPAN2 i32) so both are in flight together
+            # (memory-level parallelism); a stride-_CP_SPAN1 tail covers the
+            # remainder. On wave32 one lane-sweep covers _WAVE*4 i32 (was 256 on
+            # wave64), so the dual-issue span halves.
             # Dropped slots (dup/overflow) set copy_end == lane_i32_off → no-op.
+            _CP_SPAN1 = _WAVE * 4          # one vec4 sweep across the wavefront
+            _CP_SPAN2 = 2 * _CP_SPAN1      # two interleaved sweeps
             peer_tok_base = fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
             remote_tok_addr = peer_tok_base + fx.Int64(dest_tok_id) * fx.Int64(nbytes)
             local_tok_addr = fx.Int64(addr_inp_tok) + fx.Int64(src_tok) * fx.Int64(nbytes)
             rsrc_src = create_buffer_resource_from_addr(local_tok_addr)
             rsrc_dst = create_buffer_resource_from_addr(remote_tok_addr)
             lane_i32_off = lane * 4
-            safe_end_i32 = (n_i32 // 512) * 512
-            if const_expr(n_i32 >= 512 and safe_end_i32 > 0):
+            safe_end_i32 = (n_i32 // _CP_SPAN2) * _CP_SPAN2
+            if const_expr(n_i32 >= _CP_SPAN2 and safe_end_i32 > 0):
                 copy_end_main = arith.select(is_dup_or_overflow, lane_i32_off, safe_end_i32)
-                for chunk in range(lane_i32_off, copy_end_main, 512):
+                for chunk in range(lane_i32_off, copy_end_main, _CP_SPAN2):
                     vec_a = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
-                    vec_b = buffer_load(rsrc_src, chunk + 256, vec_width=4, dtype=T.i32())
+                    vec_b = buffer_load(rsrc_src, chunk + _CP_SPAN1, vec_width=4, dtype=T.i32())
                     buffer_store(vec_a, rsrc_dst, chunk)
-                    buffer_store(vec_b, rsrc_dst, chunk + 256)
+                    buffer_store(vec_b, rsrc_dst, chunk + _CP_SPAN1)
             if const_expr(safe_end_i32 < n_i32):
                 copy_end_tail = arith.select(is_dup_or_overflow, lane_i32_off, n_i32)
-                for chunk in range(lane_i32_off + safe_end_i32, copy_end_tail, 256):
+                for chunk in range(lane_i32_off + safe_end_i32, copy_end_tail, _CP_SPAN1):
                     vec_a = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
                     buffer_store(vec_a, rsrc_dst, chunk)
-            elif const_expr(n_i32 < 512):
+            elif const_expr(n_i32 < _CP_SPAN2):
                 copy_end_small = arith.select(is_dup_or_overflow, lane_i32_off, n_i32)
-                for chunk in range(lane_i32_off, copy_end_small, 256):
+                for chunk in range(lane_i32_off, copy_end_small, _CP_SPAN1):
                     vec_a = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
                     buffer_store(vec_a, rsrc_dst, chunk)
 
@@ -212,7 +230,7 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
                 P.atomic_add_global(fx.Int64(addr_disp_bar), arith.constant(1))
 
             local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
-            for dest_pe in range(lane, npes, 64):
+            for dest_pe in range(lane, npes, _WAVE):
                 if global_warp_id == 0:
                     P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
                     P.fence_system_acquire()
@@ -225,7 +243,7 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
                     P.store_i32_system(recv_num_remote_addr, arith.constant(0), signal_value)
 
             # ── Phase 3: collect per-source counts into total_recv ──
-            for src_pe in range(lane, npes, 64):
+            for src_pe in range(lane, npes, _WAVE):
                 if global_warp_id == 0:
                     recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
                     signal_value = P.spin_until_gt_i32(recv_num_src_addr, 0)
@@ -247,7 +265,7 @@ def make_dispatch(*, rank, npes, experts_per_rank, experts_per_token, hidden_dim
         ep_dispatch(arena, addr_inp_tok, addr_inp_idx, addr_inp_wts, addr_tok_map,
                     addr_dest_pe_ctr, addr_disp_bar, addr_total_recv, addr_inp_scales,
                     my_lsa_rank, inp_cur_tok).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream)
+            grid=(block_num, 1, 1), block=[warp_num_per_block * _WAVE, 1, 1], stream=stream)
 
     return run
 
@@ -261,27 +279,26 @@ _V1I32 = lambda: T.VectorType.get([1], T.i32())
 
 
 def _accum_funcs(hidden_elem_size, fp8_direct_cast=False, fp4=False):
-    if fp4:                            # fp4 e2m1: i32 = 8 packed fp4 -> v8f32
-        # NOTE: cvt_scalef32_pk_*_fp4 are gfx950-only (MI350). On gfx942
-        # (MI300X) codegen fails "instruction not supported on this GPU".
-        # Faithful port of the FlyDSL reference fp4 branch; opt-in (fp4=True).
+    if fp4:                            # fp4 e2m1: i32 = 8 packed fp4 <-> v8f32
+        # gfx1250 (MI450) has NO gfx950 pk (2-at-a-time) fp4 scale-cvt
+        # (`fp4-cvt-scale-insts`); it uses the pk8 block converts that turn a
+        # whole i32 (8 fp4) <-> v8f32 in ONE op with a single f32 scale — which
+        # matches this transport layout exactly (was 4 pk calls + shuffles on
+        # gfx950). scale = 1.0 (plain-fp4 transport, mori v1 parity; no
+        # microscaling). scale_sel=0 selects the (single) scale byte.
+        # Emits v_cvt_scale_pk8_f32_fp4 / v_cvt_scalef32_pk8_fp4_f32 on gfx1250.
+        # unpack `cvt_scale_pk8_f32_fp4` takes an i32 E8M0 scale (scale_sel picks
+        # the byte); E8M0 0x7F == 2^(127-127) == 1.0. pack `cvt_scalef32_pk8`
+        # takes an f32 scale. Both = 1.0 (plain-fp4 transport, no microscaling).
         def to_accum(i32_scalar):
-            one = arith.constant(1.0, type=T.f32())
-            pairs = [cvt_scalef32_pk_f32_fp4(res=_V2F32(), src=i32_scalar, scale=one,
-                                             src_sel_index=s) for s in range(4)]
-            lo4 = vector.shuffle(pairs[0], pairs[1], [0, 1, 2, 3])
-            hi4 = vector.shuffle(pairs[2], pairs[3], [0, 1, 2, 3])
-            return vector.shuffle(lo4, hi4, [0, 1, 2, 3, 4, 5, 6, 7])
+            e8m0_one = arith.constant(0x7F, type=T.i32())
+            return fx.Vector(cvt_scale_pk8_f32_fp4(res=_V8F32(), src=arith.unwrap(i32_scalar),
+                                                   scale=arith.unwrap(e8m0_one), scale_sel=0))
 
         def from_accum(acc):
             one = arith.constant(1.0, type=T.f32())
-            old = arith.constant(0, type=T.i32())
-            for s in range(4):
-                fa = vector.extract(acc, static_position=[s * 2])
-                fb = vector.extract(acc, static_position=[s * 2 + 1])
-                old = cvt_scalef32_pk_fp4_f32(res=T.i32(), old_vdst=old, src0=fa, src1=fb,
-                                              scale=one, dst_sel_index=s)
-            return old
+            return cvt_scalef32_pk8_fp4_f32(res=T.i32(), src=arith.unwrap(acc),
+                                            scale=arith.unwrap(one))
 
         def zero_accum():
             return arith.constant_vector(0.0, _V8F32())
@@ -355,17 +372,17 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
     out_n_i32 = (hidden_dim * 2) // 4 if fp8_direct_cast else n_i32
     out_step_mult = 2 if fp8_direct_cast else 1
 
-    @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
+    @flyc.kernel(known_block_size=[warp_num_per_block * _WAVE, 1, 1])
     def ep_combine(arena: Int64, addr_tok_map: Int64, addr_comb_bar: Int64,
                    addr_xdb_flag: Int64, addr_total_recv: Int64, addr_out: Int64,
                    addr_out_wts: Int64, my_lsa_rank: Int32, cur_rank_num_token: Int32):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        lane = tid & 63
-        warp = tid >> 6
+        lane = tid & _LANE_MASK
+        warp = tid >> _LANE_BITS
         global_warp_id = bid * warp_num_per_block + warp
         global_warp_num = block_num * warp_num_per_block
-        grid_thread_id = bid * (warp_num_per_block * 64) + tid
+        grid_thread_id = bid * (warp_num_per_block * _WAVE) + tid
 
         window = cco.Window(arena)
         rsrc_tok_map = create_buffer_resource_from_addr(addr_tok_map)
@@ -411,7 +428,7 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
         # a warp hides xGMI read latency with fewer warps (mori WarpAccum,
         # VecBytes=4, Unroll=2). Partition each token's hidden across
         # warps_per_tok warps so small batches still fill the grid.
-        STEP = _unroll * 64
+        STEP = _unroll * _WAVE
         safe_tok = arith.select(cur_rank_num_token == arith.constant(0),
                                 arith.constant(1), cur_rank_num_token)
         warps_per_tok = (arith.constant(global_warp_num) + safe_tok - arith.constant(1)) // safe_tok
@@ -486,7 +503,7 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                 for u in range(lane, main_end, STEP):
                     base = unit_base + u
                     for r in range_constexpr(_unroll):
-                        off = base + r * 64
+                        off = base + r * _WAVE
                         vals = []
                         for k_slot in range_constexpr(experts_per_token):
                             v = P.load_i32_nt(expert_bases[k_slot], off)
@@ -498,7 +515,7 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
                         buffer_store(_from_accum2(acc), rsrc_out,
                                      out_base + off * out_step_mult)
                 # tail: leftover elements, one per lane
-                for u in range(main_end + lane, eff, 64):
+                for u in range(main_end + lane, eff, _WAVE):
                     _one(unit_base + u)
             _accum_loop()
 
@@ -508,7 +525,7 @@ def make_combine(*, rank, npes, experts_per_token, hidden_dim, hidden_elem_size,
             cur_rank_num_token: Int32, stream=fx.Stream(None)):
         ep_combine(arena, addr_tok_map, addr_comb_bar, addr_xdb_flag, addr_total_recv,
                    addr_out, addr_out_wts, my_lsa_rank, cur_rank_num_token).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream)
+            grid=(block_num, 1, 1), block=[warp_num_per_block * _WAVE, 1, 1], stream=stream)
 
     return run
 
@@ -527,10 +544,12 @@ def _bf16x2(i32_scalar):           # i32 (2 bf16) -> v2f32
 
 
 def _warp_amax(lane, v):
-    """Max-reduce an f32 across all 64 lanes (butterfly via ds_bpermute, which
+    """Max-reduce an f32 across all _WAVE lanes (butterfly via ds_bpermute, which
     allows a per-lane gather index — unlike readlane's uniform-lane requirement).
-    Every lane returns the wavefront max. ``v`` and the result are raw values."""
-    for off in (32, 16, 8, 4, 2, 1):
+    Every lane returns the wavefront max. ``v`` and the result are raw values.
+    Butterfly offsets start at _WAVE//2 (16 on wave32; the wave64 '32' step is
+    dropped since lanes 32..63 do not exist)."""
+    for off in (16, 8, 4, 2, 1):
         idx = arith.unwrap((lane ^ off) * 4)                     # byte addr = lane*4
         o = ds_bpermute(T.i32(), idx, arith.bitcast(T.i32(), arith.unwrap(v)))
         v = arith.maximumf(v, arith.bitcast(T.f32(), o))
@@ -572,17 +591,17 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
         block_i32_fp8 = block_elems // 4          # fp8 i32 units per block (=32)
         block_i32_bf16 = block_elems // 2         # bf16 i32 units per block (=64)
 
-    @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
+    @flyc.kernel(known_block_size=[warp_num_per_block * _WAVE, 1, 1])
     def ep_combine_s(arena: Int64, addr_tok_map: Int64, addr_comb_bar: Int64,
                      addr_xdb_flag: Int64, addr_total_recv: Int64, addr_out: Int64,
                      addr_out_wts: Int64, my_lsa_rank: Int32, cur_rank_num_token: Int32):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        lane = tid & 63
-        warp = tid >> 6
+        lane = tid & _LANE_MASK
+        warp = tid >> _LANE_BITS
         global_warp_id = bid * warp_num_per_block + warp
         global_warp_num = block_num * warp_num_per_block
-        grid_thread_id = bid * (warp_num_per_block * 64) + tid
+        grid_thread_id = bid * (warp_num_per_block * _WAVE) + tid
 
         window = cco.Window(arena)
         rsrc_tok_map = create_buffer_resource_from_addr(addr_tok_map)
@@ -607,14 +626,16 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
             rsrc_src = create_buffer_resource_from_addr(src)
             rsrc_dst = create_buffer_resource_from_addr(dst)
             if const_expr(fp8_blockwise):
-                # Blockwise fp8 quant, COALESCED + warp-reduce (block_elems==128
-                # so one i32/lane spans a full block). Per block scale_block:
-                # lanes load the block coalesced (lane l -> elems 2l,2l+1),
-                # ds_bpermute butterfly gives every lane the block amax, then
-                # lane-pairs combine their 2 fp8 each into one i32 (even lane
-                # writes, coalesced). scale = (amax>MAX)? amax/MAX : 1;
-                # quant = clamp(v*MAX/amax). Token sign sentinel: if ANY block
-                # scaled, negate block-0 scale.
+                # Blockwise fp8 quant, COALESCED + warp-reduce. block_elems==128 =
+                # 64 i32 = _WAVE_HALVES sweeps of _WAVE i32 on wave32 (was one
+                # 64-lane sweep on wave64). Pass 1 computes the block amax over
+                # ALL 128 elems (both half-sweeps, then a _WAVE-lane butterfly);
+                # Pass 2 quantizes+packs each half: lane l -> elems 2l,2l+1 of the
+                # half, ds_bpermute pairs lane^1, even lane writes one fp8 i32.
+                # scale = (amax>MAX)? amax/MAX : 1; quant = clamp(v*MAX/amax).
+                # Token sign sentinel: if ANY block scaled, negate block-0 scale.
+                _BLK_I32 = block_elems // 2         # bf16 i32 per block (=64)
+                _WAVE_HALVES = _BLK_I32 // _WAVE     # half-sweeps per block (=2 on wave32)
                 scale_dst = (fx.Int64(window.lsa_ptr(origin_pe, off_comb_scales))
                              + fx.Int64(rank * max_tok_per_rank + origin_lid)
                              * fx.Int64(scale_dim) * fx.Int64(4))
@@ -623,11 +644,18 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
                 nlim = arith.constant(-_FP8_MAX, type=T.f32())
                 any_scaled = arith.constant(0) != arith.constant(0)   # False (uniform)
                 for scale_block in range_constexpr(scale_dim):
-                    v2 = _bf16x2(buffer_load(rsrc_src, scale_block * 64 + lane, vec_width=1,
-                                             dtype=T.i32()))
-                    e0 = vector.extract(v2, static_position=[0])
-                    e1 = vector.extract(v2, static_position=[1])
-                    amax = _warp_amax(lane, arith.maximumf(_fabs(e0), _fabs(e1)))
+                    blk_base = scale_block * _BLK_I32
+                    # Pass 1: this lane's |max| over its i32 units in every half,
+                    # then a wavefront butterfly -> full-block amax on all lanes.
+                    local_max = arith.constant(0.0, type=T.f32())
+                    for h in range_constexpr(_WAVE_HALVES):
+                        v2 = _bf16x2(buffer_load(rsrc_src, blk_base + h * _WAVE + lane,
+                                                 vec_width=1, dtype=T.i32()))
+                        e0 = vector.extract(v2, static_position=[0])
+                        e1 = vector.extract(v2, static_position=[1])
+                        local_max = arith.maximumf(local_max,
+                                                   arith.maximumf(_fabs(e0), _fabs(e1)))
+                    amax = _warp_amax(lane, local_max)
                     scaled = amax > fp8max
                     any_scaled = arith.select(scaled, scaled, any_scaled)
                     scale = arith.select(scaled, arith.divf(amax, fp8max),
@@ -636,27 +664,35 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
                                        arith.constant(1.0, type=T.f32()))
                     if lane == 0:
                         buffer_store(scale, rsrc_scales, scale_block)
-                    f0 = fmed3(T.f32(), arith.mulf(e0, inv), fp8max, nlim)
-                    f1 = fmed3(T.f32(), arith.mulf(e1, inv), fp8max, nlim)
-                    my_packed = cvt_pk_fp8_f32(res=T.i32(), src_a=f0, src_b=f1,
-                                               old=arith.constant(0, type=T.i32()), word_sel=False)
-                    # neighbour (lane^1)'s 2 fp8 (its low 16) via ds_bpermute.
-                    nbr_packed = ds_bpermute(T.i32(), arith.unwrap((lane ^ arith.constant(1))
-                                                                   * arith.constant(4)),
-                                             arith.unwrap(my_packed))
-                    my_lo16 = my_packed & arith.constant(0xFFFF)
-                    packed_pair = my_lo16 | ((nbr_packed & arith.constant(0xFFFF))
-                                             << arith.constant(16))
-                    if (lane & arith.constant(1)) == arith.constant(0):
-                        buffer_store(packed_pair, rsrc_dst,
-                                     scale_block * block_i32_fp8 + (lane >> arith.constant(1)))
+                    # Pass 2: quantize + pack each half.
+                    for h in range_constexpr(_WAVE_HALVES):
+                        v2 = _bf16x2(buffer_load(rsrc_src, blk_base + h * _WAVE + lane,
+                                                 vec_width=1, dtype=T.i32()))
+                        e0 = vector.extract(v2, static_position=[0])
+                        e1 = vector.extract(v2, static_position=[1])
+                        f0 = fmed3(T.f32(), arith.mulf(e0, inv), fp8max, nlim)
+                        f1 = fmed3(T.f32(), arith.mulf(e1, inv), fp8max, nlim)
+                        my_packed = cvt_pk_fp8_f32(res=T.i32(), src_a=f0, src_b=f1,
+                                                   old=arith.constant(0, type=T.i32()),
+                                                   word_sel=False)
+                        # neighbour (lane^1)'s 2 fp8 (its low 16) via ds_bpermute.
+                        nbr_packed = ds_bpermute(T.i32(), arith.unwrap((lane ^ arith.constant(1))
+                                                                       * arith.constant(4)),
+                                                 arith.unwrap(my_packed))
+                        my_lo16 = my_packed & arith.constant(0xFFFF)
+                        packed_pair = my_lo16 | ((nbr_packed & arith.constant(0xFFFF))
+                                                 << arith.constant(16))
+                        if (lane & arith.constant(1)) == arith.constant(0):
+                            buffer_store(packed_pair, rsrc_dst,
+                                         scale_block * block_i32_fp8 + h * (_WAVE >> 1)
+                                         + (lane >> arith.constant(1)))
                 if any_scaled:
                     if lane == 0:
                         s0 = buffer_load(rsrc_scales, 0, vec_width=1, dtype=T.f32())
                         buffer_store(arith.negf(s0), rsrc_scales, 0)
             elif const_expr(fp8_direct_cast):
                 # 2 bf16 i32 -> v4f32 -> cvt_pk_fp8 x2 -> 1 fp8 i32
-                for elem in range(lane, wire_n_i32, 64):
+                for elem in range(lane, wire_n_i32, _WAVE):
                     bf = buffer_load(rsrc_src, elem * 2, vec_width=2, dtype=T.i32())
                     v4 = vector.bitcast(T.VectorType.get([4], T.bf16()), bf).extf(_V4F32())
                     f0 = vector.extract(v4, static_position=[0])
@@ -668,7 +704,7 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
                     fp8 = cvt_pk_fp8_f32(res=T.i32(), src_a=f2, src_b=f3, old=lo, word_sel=True)
                     buffer_store(fp8, rsrc_dst, elem)
             else:
-                for elem in range(lane, wire_n_i32, 64):
+                for elem in range(lane, wire_n_i32, _WAVE):
                     v = buffer_load(rsrc_src, elem, vec_width=1, dtype=T.i32())
                     buffer_store(v, rsrc_dst, elem)
             if const_expr(enable_weights):
@@ -792,7 +828,7 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
                 buffer_store(from_acc(acc), rsrc_out, out_base + off * out_step_mult)
 
             def _loop():
-                for u in range(lane, eff, 64):
+                for u in range(lane, eff, _WAVE):
                     _one(unit_base + u)
             _loop()
 
@@ -802,7 +838,7 @@ def make_combine_scatter(*, rank, npes, experts_per_token, hidden_dim, hidden_el
             cur_rank_num_token: Int32, stream=fx.Stream(None)):
         ep_combine_s(arena, addr_tok_map, addr_comb_bar, addr_xdb_flag, addr_total_recv,
                      addr_out, addr_out_wts, my_lsa_rank, cur_rank_num_token).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream)
+            grid=(block_num, 1, 1), block=[warp_num_per_block * _WAVE, 1, 1], stream=stream)
 
     return run
 
@@ -830,14 +866,14 @@ def make_convert_dispatch_output(*, rank, experts_per_rank, experts_per_token,
     nbytes = hidden_dim * hidden_elem_size
     n_i32 = nbytes // 4
 
-    @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
+    @flyc.kernel(known_block_size=[warp_num_per_block * _WAVE, 1, 1])
     def convert_disp(addr_out_tok: Int64, addr_out_idx: Int64, addr_tis: Int64,
                      addr_total_recv: Int64, addr_packed_x: Int64, addr_packed_cnt: Int64,
                      addr_packed_src: Int64, addr_slot_map: Int64):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        lane = tid & 63
-        warp = tid >> 6
+        lane = tid & _LANE_MASK
+        warp = tid >> _LANE_BITS
         global_warp_id = bid * warp_num_per_block + warp
         global_warp_num = block_num * warp_num_per_block
 
@@ -879,7 +915,7 @@ def make_convert_dispatch_output(*, rank, experts_per_rank, experts_per_token,
                 src_t = fx.Int64(addr_out_tok) + fx.Int64(recv_tok) * fx.Int64(nbytes)
                 rsrc_dst = create_buffer_resource_from_addr(dst)
                 rsrc_src = create_buffer_resource_from_addr(src_t)
-                for chunk in range(lane * 4, n_i32, 256):
+                for chunk in range(lane * 4, n_i32, _WAVE * 4):
                     v = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
                     buffer_store(v, rsrc_dst, chunk)
 
@@ -889,7 +925,7 @@ def make_convert_dispatch_output(*, rank, experts_per_rank, experts_per_token,
             addr_slot_map: Int64, stream=fx.Stream(None)):
         convert_disp(addr_out_tok, addr_out_idx, addr_tis, addr_total_recv, addr_packed_x,
                      addr_packed_cnt, addr_packed_src, addr_slot_map).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream)
+            grid=(block_num, 1, 1), block=[warp_num_per_block * _WAVE, 1, 1], stream=stream)
 
     return run
 
@@ -904,13 +940,13 @@ def make_convert_combine_input(*, rank, experts_per_rank, experts_per_token,
     nbytes = hidden_dim * hidden_elem_size
     n_i32 = nbytes // 4
 
-    @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
+    @flyc.kernel(known_block_size=[warp_num_per_block * _WAVE, 1, 1])
     def convert_comb(addr_out_tok: Int64, addr_out_wts: Int64, addr_total_recv: Int64,
                      addr_packed_x: Int64, addr_slot_map: Int64):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        lane = tid & 63
-        warp = tid >> 6
+        lane = tid & _LANE_MASK
+        warp = tid >> _LANE_BITS
         global_warp_id = bid * warp_num_per_block + warp
         global_warp_num = block_num * warp_num_per_block
 
@@ -958,7 +994,7 @@ def make_convert_combine_input(*, rank, experts_per_rank, experts_per_token,
                 buffer_store(_from_accum2(acc), rsrc_out, off)
 
             def _loop():
-                for u in range(lane, eff, 64):
+                for u in range(lane, eff, _WAVE):
                     _one(unit_base + u)
             _loop()
 
@@ -967,7 +1003,7 @@ def make_convert_combine_input(*, rank, experts_per_rank, experts_per_token,
             addr_packed_x: Int64, addr_slot_map: Int64, stream=fx.Stream(None)):
         convert_comb(addr_out_tok, addr_out_wts, addr_total_recv, addr_packed_x,
                      addr_slot_map).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * 64, 1, 1], stream=stream)
+            grid=(block_num, 1, 1), block=[warp_num_per_block * _WAVE, 1, 1], stream=stream)
 
     return run
 
@@ -976,7 +1012,7 @@ def make_convert_combine_input(*, rank, experts_per_rank, experts_per_token,
 def make_local_expert_count(*, rank, experts_per_rank, experts_per_token,
                             block_num, warp_num_per_block):
     expert_base = rank * experts_per_rank
-    block_size = warp_num_per_block * 64
+    block_size = warp_num_per_block * _WAVE
 
     @flyc.kernel(known_block_size=[block_size, 1, 1])
     def local_expert_count_kernel(addr_out_idx: Int64, addr_total_recv: Int64, addr_count: Int64):
