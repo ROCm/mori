@@ -302,9 +302,12 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   const uint64_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
   // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
-  // When TokT != T (e.g. fp8 combine), staging layout uses TokT-sized tokens
+  // When TokT != T (e.g. fp8 combine), staging layout uses TokT-sized tokens. FP4 blockwise packs
+  // two E2M1 values per byte, so its token region is half the FP8 one -- keep this in sync with
+  // EpDispatchCombineConfig::CombineTokenRegionBytes() used by the host staging allocator.
   const size_t hiddenDim = config.HiddenDimSz();
-  const size_t hiddenBytes = hiddenDim * sizeof(TokT);
+  const size_t hiddenBytes =
+      UseFp4Combine ? ((hiddenDim + 1) / 2) * sizeof(TokT) : hiddenDim * sizeof(TokT);
   const size_t weightBytes =
       (UseWeights && args.weightsBuf != nullptr) ? config.numExpertPerToken * sizeof(float) : 0;
   const size_t scaleBytes =
