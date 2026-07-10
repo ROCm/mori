@@ -205,7 +205,7 @@ def _test_dispatch_combine_multi_iteration(
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 128))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
-@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast"))
+@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast", "fp8_blockwise"))
 def test_dispatch_combine(
     torch_dist_process_manager,
     world_size,
@@ -220,6 +220,8 @@ def test_dispatch_combine(
 ):
     if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
         pytest.skip("fp8_direct_cast is only supported for bfloat16 data type")
+    if quant_type == "fp8_blockwise" and data_type is not torch.bfloat16:
+        pytest.skip("fp8_blockwise is only supported for bfloat16 data type")
 
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(

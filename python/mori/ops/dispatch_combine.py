@@ -946,9 +946,10 @@ class EpDispatchCombineOp:
             if kt not in (
                 EpDispatchCombineKernelType.IntraNode.value,
                 EpDispatchCombineKernelType.IntraNodeLL.value,
+                EpDispatchCombineKernelType.AsyncLL.value,
             ):
                 raise ValueError(
-                    "Fp8BlockwiseQuant currently only supports IntraNode/IntraNodeLL combine"
+                    "Fp8BlockwiseQuant currently only supports IntraNode/IntraNodeLL/AsyncLL combine"
                 )
             if sfx != "bf16":
                 raise ValueError(f"Fp8BlockwiseQuant only supports bf16, got {sfx}")
@@ -1095,6 +1096,18 @@ class EpDispatchCombineOp:
                     stream,
                     args_ptr,
                 )
+            elif quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+                self._launch_multi(
+                    [
+                        "EpCombineLowLatencyAsyncSendCopy_bf16_fp8bwq",
+                        "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8bwq",
+                    ],
+                    [mp_aligned, self.config.world_size],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, 0],
+                    stream,
+                    args_ptr,
+                )
             else:
                 self._launch_multi(
                     [
@@ -1176,6 +1189,18 @@ class EpDispatchCombineOp:
                     [
                         "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8cast",
                         "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8cast",
+                    ],
+                    [self.config.world_size, mp_aligned],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, shared_mem],
+                    stream,
+                    args_ptr,
+                )
+            elif quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+                self._launch_multi(
+                    [
+                        "EpCombineLowLatencyAsyncRecvTransfer_bf16",
+                        "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bwq",
                     ],
                     [self.config.world_size, mp_aligned],
                     [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
