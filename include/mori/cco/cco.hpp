@@ -944,7 +944,7 @@ struct ccoSdma {
     }
   }
 
-  // quietQueue: wait on a single (peer, queueId) queue only.
+  // quietQueue: wait on a single (peer, queueId) queue only
   __device__ inline void quietQueue(int peer, int queueId) {
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
