@@ -520,6 +520,54 @@ TEST(RedisFaultToleranceTest, DownShardDegradesToMissNotError) {
   EXPECT_TRUE(locs[1].empty());
 }
 
+// Write fault tolerance: a heartbeat whose events span a down shard does NOT
+// error the RPC — it returns SEQ_GAP (so the peer full_syncs and self-heals) and
+// the node stays ALIVE. Events on the live shard are still applied.
+TEST(RedisWriteFaultToleranceTest, HeartbeatToDownShardSelfHealsNotError) {
+  redis::RespClient::Options opts;
+  opts.uri = RedisUri();
+  opts.pool_size = 2;
+  redis::RespClient probe(opts);
+  if (!probe.Ping()) {
+    GTEST_SKIP() << "no RESP store reachable at " << RedisUri() << "; skipping";
+  }
+
+  const std::string ns = UniqueNamespace();
+  redis::KeySchema schema(ns, 2);
+  std::string live_key, dead_key;
+  for (int i = 0; (live_key.empty() || dead_key.empty()) && i < 100000; ++i) {
+    const std::string k = "wft-" + std::to_string(i);
+    if (schema.ShardOf(k) == 0 && live_key.empty()) live_key = k;
+    if (schema.ShardOf(k) == 1 && dead_key.empty()) dead_key = k;
+  }
+  ASSERT_FALSE(live_key.empty());
+  ASSERT_FALSE(dead_key.empty());
+
+  RedisMasterMetadataStore::Config cfg;
+  cfg.namespace_id = ns;
+  cfg.connect_timeout_ms = 300;
+  cfg.socket_timeout_ms = 300;
+  cfg.shard_uris = {RedisUri(), "tcp://127.0.0.1:6399"};  // shard 1 down
+  RedisMasterMetadataStore store(cfg);
+
+  const auto now = std::chrono::system_clock::now();
+  ClientRegistration reg;
+  reg.node_id = "wn";
+  reg.node_address = "a";
+  reg.peer_address = "p:1";
+  reg.tier_capacities[TierType::DRAM] = TierCapacity{1u << 20, 1u << 20};
+  ASSERT_TRUE(store.RegisterClient(reg, now, 30s));  // control instance is live
+
+  auto res = store.ApplyHeartbeat("wn", 1, now, {},
+                                  {{KvEvent::Kind::ADD, live_key, TierType::DRAM, 1},
+                                   {KvEvent::Kind::ADD, dead_key, TierType::DRAM, 1}},
+                                  false);
+  // Down shard -> self-heal signal, not an exception.
+  EXPECT_EQ(res.status, HeartbeatResult::SEQ_GAP);
+  EXPECT_TRUE(store.IsClientAlive("wn"));            // control committed -> node alive
+  EXPECT_TRUE(store.BatchExistsBlock({live_key})[0]);  // live shard still got its event
+}
+
 // A metrics sink attached to the store exports per-op latency as
 // mori_umbp_store_op_latency_seconds{op,backend="redis"}. Drives the store
 // directly (no gRPC/GPU) and scrapes the Prometheus endpoint over HTTP.

@@ -409,10 +409,22 @@ void RedisMasterMetadataStore::ApplyBlockEventsMulti(const std::string& node_id,
 
 void RedisMasterMetadataStore::WipeNodeBlocksMulti(const std::string& node_id) {
   const std::string node_prefix = "l|" + node_id + "|";
+  // Best-effort per shard: a down shard must not block wiping the reachable
+  // ones. The node is already gone/EXPIRED on the control instance, so any
+  // locations lingering on an unreachable shard point at a dead node and are
+  // filtered out of reads by GetAlivePeerView until that shard returns.
   for (std::size_t shard = 0; shard < keys_.NumShards(); ++shard) {
-    RespValue r = client_for_shard(shard).Eval(redis::kWipeNodeBlocksLua, {},
-                                               {keys_.NodeBlocks(node_id, shard), node_prefix});
-    if (r.is_error()) throw std::runtime_error("[RedisStore] WipeNodeBlocks: " + r.str);
+    try {
+      RespValue r = client_for_shard(shard).Eval(redis::kWipeNodeBlocksLua, {},
+                                                 {keys_.NodeBlocks(node_id, shard), node_prefix});
+      if (r.is_error()) {
+        MORI_UMBP_WARN("[RedisStore] WipeNodeBlocks: shard {} script error, skipped: {}", shard,
+                       r.str);
+      }
+    } catch (const std::exception& e) {
+      MORI_UMBP_WARN("[RedisStore] WipeNodeBlocks: shard {} unavailable, skipped: {}", shard,
+                     e.what());
+    }
   }
 }
 
@@ -500,11 +512,21 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
   if (status == "UNKNOWN") return HeartbeatResult{HeartbeatResult::UNKNOWN, 0};
   if (status == "SEQ_GAP") return HeartbeatResult{HeartbeatResult::SEQ_GAP, acked};
 
-  // APPLIED. In multi-endpoint mode the control record has advanced; now apply
-  // the block events on each shard's instance (idempotent; a failure throws so
-  // the peer retries, seq-gaps, and heals via full_sync).
+  // APPLIED. In multi-endpoint mode the control record has advanced (so the node
+  // is already marked ALIVE and won't be reaped); now apply the block events on
+  // each shard's instance. If a shard is down, don't fail the RPC — return
+  // SEQ_GAP so the peer full_syncs and self-heals via the existing recovery path
+  // once the shard is back (block ops are idempotent, so the replay is safe).
   if (multi_endpoint()) {
-    ApplyBlockEventsMulti(node_id, events, is_full_sync, now);
+    try {
+      ApplyBlockEventsMulti(node_id, events, is_full_sync, now);
+    } catch (const std::exception& e) {
+      MORI_UMBP_WARN(
+          "[RedisStore] ApplyHeartbeat: block apply degraded for node {} (a shard is "
+          "unavailable); requesting full_sync to self-heal: {}",
+          node_id, e.what());
+      return HeartbeatResult{HeartbeatResult::SEQ_GAP, acked};
+    }
   }
   return HeartbeatResult{HeartbeatResult::APPLIED, acked};
 }

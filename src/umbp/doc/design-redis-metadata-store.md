@@ -253,11 +253,17 @@ or errors, the batch read does NOT fail: that shard's keys are left at the
 caller's default (a miss — empty locations / `exists=false`) and a WARN is
 logged, so RouteGet keeps serving keys on the healthy shards. Single-endpoint
 mode still propagates the error (a total outage must surface, not masquerade as
-misses). The **write** path (heartbeat / unregister / expire) is deliberately
-strict: a down shard makes that node's block-apply throw so the peer retries
-rather than silently dropping locations; the node's updates resume (and any gap
-heals via `full_sync`) once the shard is back. Gracefully degrading writes with
-a recovery marker is a possible follow-up.
+misses).
+
+**Write fault tolerance.** A down shard no longer aborts writes either. The
+control step runs first (seq-CAS + record + alive/peers), so the node is already
+ALIVE and won't be reaped. If a per-shard block step then fails, `ApplyHeartbeat`
+returns `SEQ_GAP` instead of throwing — the master already turns that into a
+`full_sync` request, so the peer re-ships a full snapshot and the node self-heals
+once the shard is back (block ops are idempotent, so the replay is safe).
+`UnregisterClient` / `ExpireStaleClients` wipe best-effort per shard: a down
+shard is skipped (its lingering locations point at a gone node and are filtered
+out of reads by `GetAlivePeerView`) and cleaned when it returns.
 
 Single-endpoint mode (no `UMBP_REDIS_SHARD_URIS`) keeps the original single
 atomic scripts unchanged.
