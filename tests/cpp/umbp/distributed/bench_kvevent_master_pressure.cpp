@@ -725,7 +725,10 @@ int main(int argc, char** argv) {
     cfg.master_config.node_id = o.node_id_prefix + std::to_string(id);
     cfg.master_config.node_address = o.node_address;
     cfg.master_config.master_address = master_addr;
-    cfg.io_engine.host = "0.0.0.0";
+    // Advertise the routable node address for the RDMA engine so cross-machine
+    // peers can reach it. "0.0.0.0" makes the published EngineDesc non-routable
+    // (resolves to loopback), which only works when all peers are on one host.
+    cfg.io_engine.host = o.node_address;
     cfg.io_engine.port = 0;
     cfg.peer_service_port = NextPeerServicePort();
     cfg.dram_page_size = o.page_bytes;
