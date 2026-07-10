@@ -32,6 +32,14 @@ from tests.python.ops.dispatch_combine_test_utils import (
 )
 
 
+def _combine_fp4_supported():
+    # Packed-FP4 combine needs the gfx950 OCP FP4 conversion instructions.
+    try:
+        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
 def _make_intranode_config(
     rank,
     world_size,
@@ -192,6 +200,10 @@ def test_dispatch_combine(
             pytest.skip(f"{quant_type} only supports bfloat16 input")
         if not use_external_inp_buf:
             pytest.skip(f"{quant_type} requires use_external_inp_buf=True")
+        if quant_type == "fp4_blockwise" and not _combine_fp4_supported():
+            pytest.skip(
+                "fp4_blockwise combine requires a gfx950 GPU (OCP FP4 instructions)"
+            )
         # blockwise combine ignores scale_dim/scale_type_size (driven by
         # MORI_FP8_COMBINE_SCALE_DIM internally). fp4_blockwise reuses the same path
         # but transports packed FP4 (E2M1) instead of FP8.
@@ -242,6 +254,10 @@ def test_dispatch_combine_weightless_vec8(
     use_external_inp_buf,
     quant_type,
 ):
+    if quant_type == "fp4_blockwise" and not _combine_fp4_supported():
+        pytest.skip(
+            "fp4_blockwise combine requires a gfx950 GPU (OCP FP4 instructions)"
+        )
     expect_combine_kernel_substr = (
         "noweight_block128_vec8_top9"
         if num_experts_per_token == 9
@@ -309,6 +325,10 @@ def test_dispatch_combine_ll(
             pytest.skip(f"{quant_type} only supports bfloat16 input")
         if not use_external_inp_buf:
             pytest.skip(f"{quant_type} requires use_external_inp_buf=True")
+        if quant_type == "fp4_blockwise" and not _combine_fp4_supported():
+            pytest.skip(
+                "fp4_blockwise combine requires a gfx950 GPU (OCP FP4 instructions)"
+            )
         # blockwise combine ignores scale_dim/scale_type_size (driven by
         # MORI_FP8_COMBINE_SCALE_DIM internally). fp4_blockwise reuses the same path
         # but transports packed FP4 (E2M1) instead of FP8.

@@ -2246,6 +2246,14 @@ __device__ __forceinline__ void WarpQuantizeToFp4Blockwise(Fp8T* __restrict__ ds
                                                     scaleDim);
     return;
   }
+  // Fast path: 64-lane warp, blockElems == 256 == 8 subwarps * 32 elems (mirrors the fp8bwq
+  // block256 vec8 variant so block256 configs are not left on the scalar path).
+  if (warpSize == 64 && blockElems == 256 && (hiddenDim % 256) == 0 &&
+      std::is_same_v<InT, hip_bfloat16>) {
+    WarpQuantizeToFp4BlockwiseVec<8, 32, Fp8T, InT>(dstToken, dstScales, srcToken, hiddenDim,
+                                                    scaleDim);
+    return;
+  }
 
   for (int sb = 0; sb < scaleDim; ++sb) {
     const int start = sb * blockElems;
@@ -2471,6 +2479,90 @@ __device__ __forceinline__ void WarpAccumFp4DequantSegmentBlockVec8Top8(
     const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize) {
   WarpAccumFp4DequantVecBlockwiseScaleWave<OutT, Fp8T, AccumNum>(
       dstToken, srcs, srcScales, hiddenDimOffset, /*start=*/0, /*end=*/hiddenDimSize, BlockElems);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/* Combine quant/dequant dispatch on UseFp4. FP8 and FP4 blockwise combine share the staging/scale
+ */
+/* layout; only the element codec differs. These thin wrappers select the codec from a single */
+/* template bool so the intra-node combine body calls one function per site instead of duplicating
+ */
+/* an fp4/fp8 branch (and identical argument list) at every call site. */
+/* ---------------------------------------------------------------------------------------------- */
+template <bool UseFp4, typename Fp8T, typename InT>
+__device__ __forceinline__ void WarpQuantizeToCombineBlockwise(Fp8T* __restrict__ dstToken,
+                                                               float* __restrict__ dstScales,
+                                                               const InT* __restrict__ srcToken,
+                                                               int hiddenDim, int scaleDim) {
+  if constexpr (UseFp4)
+    WarpQuantizeToFp4Blockwise<Fp8T>(dstToken, dstScales, srcToken, hiddenDim, scaleDim);
+  else
+    WarpQuantizeToFp8Blockwise<Fp8T>(dstToken, dstScales, srcToken, hiddenDim, scaleDim);
+}
+
+template <bool UseFp4, typename OutT, typename Fp8T, int BlockElems, int AccumNum>
+__device__ __forceinline__ void WarpAccumCombineDequantFullBlockVec8Top8(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDim) {
+  if constexpr (UseFp4)
+    WarpAccumFp4DequantFullBlockVec8Top8<OutT, Fp8T, BlockElems, AccumNum>(dstToken, srcs,
+                                                                           srcScales, hiddenDim);
+  else
+    WarpAccumFp8DequantFullBlockVec8Top8<OutT, Fp8T, BlockElems, AccumNum>(dstToken, srcs,
+                                                                           srcScales, hiddenDim);
+}
+
+template <bool UseFp4, typename OutT, typename Fp8T, int BlockElems, int AccumNum>
+__device__ __forceinline__ void WarpAccumCombineDequantSegmentBlockVec8Top8(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize) {
+  if constexpr (UseFp4)
+    WarpAccumFp4DequantSegmentBlockVec8Top8<OutT, Fp8T, BlockElems, AccumNum>(
+        dstToken, srcs, srcScales, hiddenDimOffset, hiddenDimSize);
+  else
+    WarpAccumFp8DequantSegmentBlockVec8Top8<OutT, Fp8T, BlockElems, AccumNum>(
+        dstToken, srcs, srcScales, hiddenDimOffset, hiddenDimSize);
+}
+
+// Misaligned-segment scalar fallback for the vec8 top-k path. The codecs use different helpers
+// here (fp4 reuses the generic segment accumulator with a fixed top-k count; fp8 has a dedicated
+// scalar-top8 helper), so the divergence is encapsulated in one place.
+template <bool UseFp4, typename OutT, typename Fp8T, int BlockElems, int AccumNum>
+__device__ __forceinline__ void WarpAccumCombineDequantSegmentScalarTop8(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize,
+    int hiddenDim, int scaleDim) {
+  if constexpr (UseFp4)
+    WarpAccumFp4DequantSegment<OutT, Fp8T>(dstToken, srcs, srcScales, AccumNum, hiddenDimOffset,
+                                           hiddenDimSize, hiddenDim, scaleDim);
+  else
+    WarpAccumFp8DequantSegmentScalarTop8<OutT, Fp8T, BlockElems, AccumNum>(
+        dstToken, srcs, srcScales, hiddenDimOffset, hiddenDimSize);
+}
+
+template <bool UseFp4, typename OutT, typename Fp8T>
+__device__ __forceinline__ void WarpAccumCombineDequantFull(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int validAccumCount, int hiddenDim, int scaleDim) {
+  if constexpr (UseFp4)
+    WarpAccumFp4DequantFull<OutT, Fp8T>(dstToken, srcs, srcScales, validAccumCount, hiddenDim,
+                                        scaleDim);
+  else
+    WarpAccumFp8DequantFull<OutT, Fp8T>(dstToken, srcs, srcScales, validAccumCount, hiddenDim,
+                                        scaleDim);
+}
+
+template <bool UseFp4, typename OutT, typename Fp8T>
+__device__ __forceinline__ void WarpAccumCombineDequantSegment(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int validAccumCount, int hiddenDimOffset,
+    int hiddenDimSize, int hiddenDim, int scaleDim) {
+  if constexpr (UseFp4)
+    WarpAccumFp4DequantSegment<OutT, Fp8T>(dstToken, srcs, srcScales, validAccumCount,
+                                           hiddenDimOffset, hiddenDimSize, hiddenDim, scaleDim);
+  else
+    WarpAccumFp8DequantSegment<OutT, Fp8T>(dstToken, srcs, srcScales, validAccumCount,
+                                           hiddenDimOffset, hiddenDimSize, hiddenDim, scaleDim);
 }
 
 template <typename T>

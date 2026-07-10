@@ -362,17 +362,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
                                 SendBufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
       if constexpr (UseFp8BlockwiseQuant) {
-        if constexpr (UseFp4Combine) {
-          core::WarpQuantizeToFp4Blockwise<core::CombineInternalFp8>(
-              reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
-              reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
-              args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
-        } else {
-          core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8>(
-              reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
-              reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
-              args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
-        }
+        core::WarpQuantizeToCombineBlockwise<UseFp4Combine, core::CombineInternalFp8>(
+            reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
+            reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
+            args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
       } else if constexpr (!std::is_same_v<T, TokT> &&
                            std::is_same_v<TokT, core::CombineInternalFp8>) {
         core::WarpCastBf16ToCombineInternalFp8<T>(reinterpret_cast<TokT*>(destStagingPtr),
@@ -407,17 +400,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
                                 SendBufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
       if constexpr (UseFp8BlockwiseQuant) {
-        if constexpr (UseFp4Combine) {
-          core::WarpQuantizeToFp4Blockwise<core::CombineInternalFp8>(
-              reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
-              reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
-              args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
-        } else {
-          core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8>(
-              reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
-              reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
-              args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
-        }
+        core::WarpQuantizeToCombineBlockwise<UseFp4Combine, core::CombineInternalFp8>(
+            reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
+            reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
+            args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
       } else if constexpr (!std::is_same_v<T, TokT> &&
                            std::is_same_v<TokT, core::CombineInternalFp8>) {
         core::WarpCastBf16ToCombineInternalFp8<T>(reinterpret_cast<TokT*>(destStagingPtr),
@@ -555,71 +541,34 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
       if constexpr (Vec8Top8BlockElems != 0) {
         if (mwIter.warpsPerItem == 1) {
-          if constexpr (UseFp4Combine) {
-            core::WarpAccumFp4DequantFullBlockVec8Top8<T, core::CombineInternalFp8,
-                                                       Vec8Top8BlockElems, Vec8AccumNum>(
-                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-                reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDim);
-          } else {
-            core::WarpAccumFp8DequantFullBlockVec8Top8<T, core::CombineInternalFp8,
-                                                       Vec8Top8BlockElems, Vec8AccumNum>(
-                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-                reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDim);
-          }
+          core::WarpAccumCombineDequantFullBlockVec8Top8<UseFp4Combine, T, core::CombineInternalFp8,
+                                                         Vec8Top8BlockElems, Vec8AccumNum>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDim);
         } else if ((hiddenDimOffset & 0x7) == 0 && (hiddenDimSize & 0x7) == 0) {
-          if constexpr (UseFp4Combine) {
-            core::WarpAccumFp4DequantSegmentBlockVec8Top8<T, core::CombineInternalFp8,
-                                                          Vec8Top8BlockElems, Vec8AccumNum>(
-                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-                reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset,
-                hiddenDimSize);
-          } else {
-            core::WarpAccumFp8DequantSegmentBlockVec8Top8<T, core::CombineInternalFp8,
-                                                          Vec8Top8BlockElems, Vec8AccumNum>(
-                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-                reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset,
-                hiddenDimSize);
-          }
+          core::WarpAccumCombineDequantSegmentBlockVec8Top8<
+              UseFp4Combine, T, core::CombineInternalFp8, Vec8Top8BlockElems, Vec8AccumNum>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset, hiddenDimSize);
         } else {
           // Misaligned segment: vec8 helper would fault on the load. Tiny scalar fallback.
-          if constexpr (UseFp4Combine) {
-            core::WarpAccumFp4DequantSegment<T, core::CombineInternalFp8>(
-                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-                reinterpret_cast<const float* const*>(srcScalePtrs), Vec8AccumNum, hiddenDimOffset,
-                hiddenDimSize, hiddenDim, args.fp8BlockwiseCombineScaleDim);
-          } else {
-            core::WarpAccumFp8DequantSegmentScalarTop8<T, core::CombineInternalFp8,
-                                                       Vec8Top8BlockElems, Vec8AccumNum>(
-                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-                reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset,
-                hiddenDimSize);
-          }
+          core::WarpAccumCombineDequantSegmentScalarTop8<UseFp4Combine, T, core::CombineInternalFp8,
+                                                         Vec8Top8BlockElems, Vec8AccumNum>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset, hiddenDimSize,
+              hiddenDim, args.fp8BlockwiseCombineScaleDim);
         }
       } else {
         if (mwIter.warpsPerItem == 1) {
-          if constexpr (UseFp4Combine) {
-            core::WarpAccumFp4DequantFull<T, core::CombineInternalFp8>(
-                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-                reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDim,
-                args.fp8BlockwiseCombineScaleDim);
-          } else {
-            core::WarpAccumFp8DequantFull<T, core::CombineInternalFp8>(
-                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-                reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDim,
-                args.fp8BlockwiseCombineScaleDim);
-          }
+          core::WarpAccumCombineDequantFull<UseFp4Combine, T, core::CombineInternalFp8>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDim,
+              args.fp8BlockwiseCombineScaleDim);
         } else {
-          if constexpr (UseFp4Combine) {
-            core::WarpAccumFp4DequantSegment<T, core::CombineInternalFp8>(
-                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-                reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount,
-                hiddenDimOffset, hiddenDimSize, hiddenDim, args.fp8BlockwiseCombineScaleDim);
-          } else {
-            core::WarpAccumFp8DequantSegment<T, core::CombineInternalFp8>(
-                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-                reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount,
-                hiddenDimOffset, hiddenDimSize, hiddenDim, args.fp8BlockwiseCombineScaleDim);
-          }
+          core::WarpAccumCombineDequantSegment<UseFp4Combine, T, core::CombineInternalFp8>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDimOffset,
+              hiddenDimSize, hiddenDim, args.fp8BlockwiseCombineScaleDim);
         }
       }
     } else if constexpr (!std::is_same_v<T, TokT> &&

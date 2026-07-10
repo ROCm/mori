@@ -272,6 +272,19 @@ class EpDispatchCombineOp:
             isinstance(config.quant_type, str)
             and config.quant_type.strip().lower() == "fp4_blockwise"
         )
+        if self._combine_is_fp4:
+            # The packed-FP4 combine relies on the gfx950 OCP FP4 conversion instructions
+            # (cvt_scalef32_pk_f32_fp4). On other archs there is no hardware path, so fail fast
+            # instead of silently selecting an fp4 kernel that would fall back to slow software.
+            from mori.jit.config import detect_gpu_arch
+
+            _arch = str(detect_gpu_arch())
+            if "gfx950" not in _arch:
+                raise ValueError(
+                    f"quant_type='fp4_blockwise' combine requires a gfx950 GPU (OCP FP4 "
+                    f"conversion instructions); detected arch '{_arch}'. Use 'fp8_blockwise' "
+                    f"instead on this device."
+                )
 
         self._dispatch_out_ptrs = mori_cpp.get_dispatch_output_ptrs(self._handle, True)
         self._combine_out_ptrs = mori_cpp.get_combine_output_ptrs(self._handle, True)

@@ -617,23 +617,47 @@ class EpDispatchCombineTestCase:
                 inp_converted.to(torch.float32) * unique_pes
             ).to(combine_data_type)
 
-            atol, rtol = 1e-2, 1e-2
-            if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
-                atol, rtol = 1e-1, 1e-1
-            elif getattr(self.config, "quant_type", "none") == "fp8_blockwise":
-                # FP8 E4M3 quantization can exceed 5% after combine accumulation.
-                atol, rtol = 7e-2, 7e-2
-            elif getattr(self.config, "quant_type", "none") == "fp4_blockwise":
-                # FP4 (E2M1) is far coarser (~1 mantissa bit); blockwise-scaled + summed over
-                # top-k experts stays within a loose bound. This guards against gross corruption
-                # (wrong packing/indexing) rather than asserting FP8-level precision.
-                atol, rtol = 2.5e-1, 2.5e-1
-            result_match = torch.allclose(
-                got.float(), expected.float(), atol=atol, rtol=rtol
-            )
-            if not result_match:
+            quant = getattr(self.config, "quant_type", "none")
+            if quant == "fp4_blockwise":
+                # FP4 (E2M1) is lossy, so comparing against the exact bf16 reference with a fixed
+                # rtol is not meaningful: a small element inside a high-max block rounds to 0 or
+                # 0.5*scale (~100% relative error). Instead bound the per-element error by FP4's
+                # actual worst-case rounding. Within a block scaled to [-6, 6] the largest grid
+                # step is |6 - 4| = 2, so the max round error is 1.0 in scaled units == blockMax/6
+                # in real units. Each combined element is the same input summed `unique_pes` times,
+                # so the bound scales with unique_pes. This is an exact bound for blockwise FP4,
+                # not a guessed tolerance.
+                fp4_max = 6.0
+                scale_dim = op._fp8_blockwise_combine_scale_dim
+                hidden = inp_converted.numel()
+                block_elems = (hidden + scale_dim - 1) // scale_dim
+                absv = inp_converted.float().abs()
+                pad = scale_dim * block_elems - hidden
+                if pad:
+                    absv = torch.cat([absv, absv.new_zeros(pad)])
+                block_max = absv.reshape(scale_dim, block_elems).amax(dim=1)
+                per_elem_block_max = block_max.repeat_interleave(block_elems)[:hidden]
+                tol = (
+                    per_elem_block_max / fp4_max * unique_pes  # FP4 quantization bound
+                    + 5e-2
+                    * expected.float().abs()  # bf16 output rounding + accumulation slack
+                    + 1e-2
+                )
+                diff = (got.float() - expected.float()).abs()
+                result_match = bool((diff <= tol).all())
+            else:
+                atol, rtol = 1e-2, 1e-2
+                if quant == "fp8_direct_cast":
+                    atol, rtol = 1e-1, 1e-1
+                elif quant == "fp8_blockwise":
+                    # FP8 E4M3 quantization can exceed 5% after combine accumulation.
+                    atol, rtol = 7e-2, 7e-2
+                result_match = torch.allclose(
+                    got.float(), expected.float(), atol=atol, rtol=rtol
+                )
                 diff = (got.float() - expected.float()).abs()
                 tol = atol + rtol * expected.float().abs()
+            if not result_match:
                 max_idx = int(diff.argmax().item())
                 print(f"Rank[{self.config.rank}] result mismatch for token {i}:")
                 print(
@@ -762,7 +786,7 @@ def run_ep_dispatch_local_expert_count_test(config):
     test_case = EpDispatchCombineTestCase(config)
     test_data = test_case.gen_test_data()
 
-    (_, all_rank_indices, all_rank_input, all_rank_weights, all_rank_scales) = test_data
+    _, all_rank_indices, all_rank_input, all_rank_weights, all_rank_scales = test_data
     rank = config.rank
 
     kt = config.kernel_type
@@ -770,7 +794,7 @@ def run_ep_dispatch_local_expert_count_test(config):
     if kt.value == asyncll_type.value:
         # AsyncLL: recv kernels fill the output indices, so local_expert_count
         # must be requested on dispatch_recv (not dispatch_send).
-        (_, _, _, dispatch_indices, dispatch_recv_num_token) = op.dispatch_send(
+        _, _, _, dispatch_indices, dispatch_recv_num_token = op.dispatch_send(
             all_rank_input[rank],
             all_rank_weights[rank],
             all_rank_scales[rank],
@@ -778,7 +802,7 @@ def run_ep_dispatch_local_expert_count_test(config):
         )
         op.dispatch_recv(call_local_expert_count=True)
     else:
-        (_, _, _, dispatch_indices, dispatch_recv_num_token) = op.dispatch(
+        _, _, _, dispatch_indices, dispatch_recv_num_token = op.dispatch(
             all_rank_input[rank],
             all_rank_weights[rank],
             all_rank_scales[rank],
