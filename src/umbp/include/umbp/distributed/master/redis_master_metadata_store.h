@@ -68,8 +68,17 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
     // Single-endpoint only: number of hash-tag shards the block keyspace is
     // spread over. 1 keeps the legacy single-tag layout (byte-identical keys,
     // whole-batch-atomic reads). In multi-endpoint mode the shard count is fixed
-    // to the number of endpoints (one shard per instance). See KeySchema.
+    // to the number of endpoints (one shard per instance). In cluster mode it is
+    // the number of block shard tags spread (by CRC16 slot) across the cluster's
+    // nodes. See KeySchema.
     std::size_t block_shards = 1;
+    // Redis Cluster mode: one redis-plus-plus RedisCluster client routes every
+    // command/script to the node owning its hash-tag slot, with MOVED/ASK and
+    // master-failover handled by the client. Mutually exclusive with shard_uris.
+    // cluster_seeds are bootstrap nodes (any reachable one; the rest are
+    // discovered via CLUSTER SLOTS).
+    bool cluster = false;
+    std::vector<std::string> cluster_seeds;
   };
 
   explicit RedisMasterMetadataStore(const Config& config);
@@ -148,6 +157,15 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
   // multi-endpoint mode, else Config::block_shards).
   static std::size_t ResolveNumShards(const Config& config);
 
+  // Deployment topology. kSingle = one instance, one atomic script (legacy).
+  // kMulti = one instance per block shard (UMBP_REDIS_SHARD_URIS). kCluster =
+  // one Redis Cluster client routing by slot. kMulti and kCluster both use the
+  // split control-script + per-shard-block-script write path (their control and
+  // block keys live in different slots), so gate that on split_writes(), NOT on
+  // the endpoint count (cluster is a single client but still needs the split).
+  enum class Mode { kSingle, kMulti, kCluster };
+  bool split_writes() const { return mode_ != Mode::kSingle; }
+
   std::size_t num_endpoints() const { return clients_.size(); }
   bool multi_endpoint() const { return clients_.size() > 1; }
   redis::IRespClient& control() const { return *clients_[0]; }
@@ -164,10 +182,13 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
   void WipeNodeBlocksMulti(const std::string& node_id);
 
   redis::KeySchema keys_;
-  // clients_[0] is the control instance; clients_[s] backs block shard s.
-  // Held as IRespClient so the same store logic drives the hiredis single-node
-  // client (single / multi-endpoint) and the redis-plus-plus cluster client.
-  // mutable so const read methods can borrow a pooled connection.
+  Mode mode_ = Mode::kSingle;
+  // clients_[0] is the control instance; clients_[s] backs block shard s. In
+  // cluster mode there is a single entry (the cluster client) that internally
+  // routes every shard by slot. Held as IRespClient so the same store logic
+  // drives the hiredis single-node client (single / multi-endpoint) and the
+  // redis-plus-plus cluster client. mutable so const read methods can borrow a
+  // pooled connection.
   mutable std::vector<std::unique_ptr<redis::IRespClient>> clients_;
   // Workers that issue a multi-endpoint read fan-out's per-instance calls
   // concurrently (one round trip instead of N). Null in single-endpoint mode.

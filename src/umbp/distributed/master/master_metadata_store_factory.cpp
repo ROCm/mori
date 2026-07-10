@@ -26,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/master/in_memory_master_metadata_store.h"
@@ -65,6 +66,21 @@ bool GetEnvBool(const char* key, bool def) {
   return def;
 }
 
+// Split a comma-separated list, dropping empty entries.
+std::vector<std::string> SplitCsv(const std::string& s) {
+  std::vector<std::string> out;
+  size_t pos = 0;
+  while (pos <= s.size()) {
+    const size_t comma = s.find(',', pos);
+    const size_t end = (comma == std::string::npos) ? s.size() : comma;
+    std::string tok = s.substr(pos, end - pos);
+    if (!tok.empty()) out.push_back(tok);
+    if (comma == std::string::npos) break;
+    pos = comma + 1;
+  }
+  return out;
+}
+
 }  // namespace
 
 std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
@@ -86,11 +102,17 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
     unsigned hw = std::thread::hardware_concurrency();
     const int default_pool = static_cast<int>(std::min(32u, std::max(4u, hw ? hw * 2u : 8u)));
     cfg.pool_size = static_cast<std::size_t>(GetEnvInt("UMBP_REDIS_POOL_SIZE", default_pool));
-    // Block-keyspace shards. Default 1 = legacy single-tag layout (no change).
-    // Set >1 to spread block lookups across slots (see KeySchema); the win
-    // shows up on a threaded store (Dragonfly) or a sharded/cluster deployment.
+    // Redis Cluster mode (UMBP_REDIS_CLUSTER=1): one redis-plus-plus client
+    // routes by hash-tag slot with MOVED/ASK + master-failover handled for us.
+    // Read early because it changes the block-shard default.
+    const bool cluster = GetEnvBool("UMBP_REDIS_CLUSTER", false);
+
+    // Block-keyspace shards. Default 1 = legacy single-tag layout (no change) for
+    // single/multi. In cluster mode default to 16 so block keys spread across the
+    // cluster's nodes by slot (1 would pin every block on one node). Override
+    // with UMBP_REDIS_BLOCK_SHARDS.
     constexpr int kMaxBlockShards = 4096;
-    int block_shards = GetEnvInt("UMBP_REDIS_BLOCK_SHARDS", 1);
+    int block_shards = GetEnvInt("UMBP_REDIS_BLOCK_SHARDS", cluster ? 16 : 1);
     if (block_shards > kMaxBlockShards) {
       MORI_UMBP_WARN("[MetadataStore] clamping UMBP_REDIS_BLOCK_SHARDS={} to max {}", block_shards,
                      kMaxBlockShards);
@@ -101,36 +123,22 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
     // shard, so their scripts run on independent server threads (the way past a
     // single instance's single-thread ceiling). When set, it supersedes the
     // single-endpoint block_shards knob.
-    const std::string shard_uris = GetEnvStr("UMBP_REDIS_SHARD_URIS", "");
-    if (!shard_uris.empty()) {
-      size_t pos = 0;
-      while (pos <= shard_uris.size()) {
-        const size_t comma = shard_uris.find(',', pos);
-        const size_t end = (comma == std::string::npos) ? shard_uris.size() : comma;
-        std::string u = shard_uris.substr(pos, end - pos);
-        if (!u.empty()) cfg.shard_uris.push_back(u);
-        if (comma == std::string::npos) break;
-        pos = comma + 1;
-      }
-    }
+    cfg.shard_uris = SplitCsv(GetEnvStr("UMBP_REDIS_SHARD_URIS", ""));
 
-    // Mode selection + validation. single-endpoint (UMBP_REDIS_URI),
-    // multi-endpoint (UMBP_REDIS_SHARD_URIS) and Redis Cluster
-    // (UMBP_REDIS_CLUSTER) are mutually exclusive. Cluster mode is on the
-    // roadmap but not wired into the store yet, so recognize the flag and fail
-    // clearly instead of silently falling back to single-endpoint.
-    const bool cluster = GetEnvBool("UMBP_REDIS_CLUSTER", false);
+    // single-endpoint / multi-endpoint / cluster are mutually exclusive.
     if (cluster && cfg.shard_uris.size() > 1) {
       throw std::runtime_error(
           "UMBP_REDIS_CLUSTER=1 and UMBP_REDIS_SHARD_URIS are mutually exclusive; set only one");
     }
-    if (cluster) {
-      throw std::runtime_error(
-          "UMBP_REDIS_CLUSTER=1 is not supported yet (Redis Cluster mode is on the roadmap); "
-          "use single-endpoint (UMBP_REDIS_URI) or multi-endpoint (UMBP_REDIS_SHARD_URIS)");
-    }
 
-    if (cfg.shard_uris.size() > 1) {
+    if (cluster) {
+      cfg.cluster = true;
+      // Seeds: the UMBP_REDIS_URI comma list (any reachable node bootstraps the
+      // rest via CLUSTER SLOTS).
+      cfg.cluster_seeds = SplitCsv(GetEnvStr("UMBP_REDIS_URI", "tcp://127.0.0.1:6379"));
+      MORI_UMBP_INFO("[MetadataStore] backend=redis namespace={} seeds={} block_shards={} (cluster)",
+                     cfg.namespace_id, cfg.cluster_seeds.size(), cfg.block_shards);
+    } else if (cfg.shard_uris.size() > 1) {
       MORI_UMBP_INFO("[MetadataStore] backend=redis namespace={} endpoints={} (multi-endpoint)",
                      cfg.namespace_id, cfg.shard_uris.size());
     } else {

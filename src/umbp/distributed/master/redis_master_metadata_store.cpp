@@ -32,6 +32,7 @@
 #include "mori/metrics/prometheus_metrics_server.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/master/redis/lua_scripts.h"
+#include "umbp/distributed/master/redis/resp_cluster_client.h"
 
 namespace mori::umbp {
 
@@ -325,12 +326,33 @@ void RunShardedRead(const ShardedBatch& batch, const std::string& script,
 }  // namespace
 
 std::size_t RedisMasterMetadataStore::ResolveNumShards(const Config& config) {
+  if (config.cluster) return config.block_shards == 0 ? 1 : config.block_shards;  // slot-spread tags
   if (config.shard_uris.size() > 1) return config.shard_uris.size();  // one shard per endpoint
   return config.block_shards == 0 ? 1 : config.block_shards;          // single-endpoint knob
 }
 
 RedisMasterMetadataStore::RedisMasterMetadataStore(const Config& config)
-    : keys_(config.namespace_id, ResolveNumShards(config)) {
+    : keys_(config.namespace_id, ResolveNumShards(config)),
+      mode_(config.cluster            ? Mode::kCluster
+            : config.shard_uris.size() > 1 ? Mode::kMulti
+                                           : Mode::kSingle) {
+  if (mode_ == Mode::kCluster) {
+    // One Redis Cluster client routes every shard by slot; the store still uses
+    // the split control + per-shard-block write path (their keys live in
+    // different slots), driven by split_writes().
+    redis::RespClusterClient::Options opts;
+    opts.seeds = config.cluster_seeds.empty() ? std::vector<std::string>{config.uri}
+                                              : config.cluster_seeds;
+    opts.password = config.password;
+    opts.connect_timeout_ms = config.connect_timeout_ms;
+    opts.socket_timeout_ms = config.socket_timeout_ms;
+    opts.pool_size = config.pool_size;
+    clients_.push_back(std::make_unique<redis::RespClusterClient>(std::move(opts)));
+    MORI_UMBP_INFO("[RedisStore] cluster namespace={} pool={} seeds={} block_shards={}",
+                   config.namespace_id, config.pool_size, opts.seeds.size(), keys_.NumShards());
+    return;
+  }
+
   // Endpoints: the shard_uris list when given (multi-endpoint), else the single
   // `uri`. clients_[0] is the control instance and also backs block shard 0.
   std::vector<std::string> uris =
@@ -402,7 +424,12 @@ void RedisMasterMetadataStore::ApplyBlockEventsMulti(const std::string& node_id,
       args.push_back(std::to_string(static_cast<int>(ev->tier)));
       args.push_back(std::to_string(ev->size));
     }
-    RespValue r = client_for_shard(shard).Eval(redis::kApplyBlockEventsLua, {}, args);
+    // KEYS[1] = this shard's reverse-index key (a shard-tag key) so the cluster
+    // client can route to the shard's slot; the script reads all its keys from
+    // ARGV (same slot). Harmless in single / multi-endpoint mode (a standalone
+    // Redis does not slot-check, and the script ignores KEYS).
+    RespValue r = client_for_shard(shard).Eval(redis::kApplyBlockEventsLua,
+                                               {keys_.NodeBlocks(node_id, shard)}, args);
     if (r.is_error()) throw std::runtime_error("[RedisStore] ApplyBlockEvents: " + r.str);
   }
 }
@@ -415,8 +442,9 @@ void RedisMasterMetadataStore::WipeNodeBlocksMulti(const std::string& node_id) {
   // filtered out of reads by GetAlivePeerView until that shard returns.
   for (std::size_t shard = 0; shard < keys_.NumShards(); ++shard) {
     try {
-      RespValue r = client_for_shard(shard).Eval(redis::kWipeNodeBlocksLua, {},
-                                                 {keys_.NodeBlocks(node_id, shard), node_prefix});
+      RespValue r = client_for_shard(shard).Eval(
+          redis::kWipeNodeBlocksLua, {keys_.NodeBlocks(node_id, shard)},
+          {keys_.NodeBlocks(node_id, shard), node_prefix});
       if (r.is_error()) {
         MORI_UMBP_WARN("[RedisStore] WipeNodeBlocks: shard {} script error, skipped: {}", shard,
                        r.str);
@@ -449,7 +477,7 @@ bool RedisMasterMetadataStore::RegisterClient(const ClientRegistration& registra
 
 void RedisMasterMetadataStore::UnregisterClient(const std::string& node_id) {
   ScopedStoreOp _op(metrics_, "UnregisterClient");
-  if (!multi_endpoint()) {
+  if (!split_writes()) {
     RespValue r =
         control().Eval(redis::kUnregisterClientLua, {keys_.Node(node_id)}, {keys_.Tag(), node_id});
     if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterClient: " + r.str);
@@ -471,7 +499,7 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
     bool is_full_sync) {
   ScopedStoreOp _op(metrics_, "ApplyHeartbeat");
   RespValue r;
-  if (!multi_endpoint()) {
+  if (!split_writes()) {
     // Single instance: one atomic script does seq-CAS + record + blocks.
     std::vector<std::string> args;
     args.reserve(7 + events.size() * 4);
@@ -517,7 +545,7 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
   // each shard's instance. If a shard is down, don't fail the RPC — return
   // SEQ_GAP so the peer full_syncs and self-heals via the existing recovery path
   // once the shard is back (block ops are idempotent, so the replay is safe).
-  if (multi_endpoint()) {
+  if (split_writes()) {
     try {
       ApplyBlockEventsMulti(node_id, events, is_full_sync, now);
     } catch (const std::exception& e) {
@@ -534,17 +562,20 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
 std::vector<std::string> RedisMasterMetadataStore::ExpireStaleClients(
     std::chrono::system_clock::time_point cutoff) {
   ScopedStoreOp _op(metrics_, "ExpireStaleClients");
-  const char* script = multi_endpoint() ? redis::kExpireControlLua : redis::kExpireStaleLua;
-  RespValue r = control().Eval(script, {}, {keys_.Tag(), std::to_string(ToEpochMs(cutoff))});
+  const char* script = split_writes() ? redis::kExpireControlLua : redis::kExpireStaleLua;
+  // KEYS[1] = a control-tag key (nodes:alive) to route + fix the slot in cluster
+  // mode; the script reads tag from ARGV and touches only control-tag keys.
+  RespValue r =
+      control().Eval(script, {keys_.NodesAlive()}, {keys_.Tag(), std::to_string(ToEpochMs(cutoff))});
   if (r.is_error()) throw std::runtime_error("[RedisStore] ExpireStaleClients: " + r.str);
   std::vector<std::string> dead;
   if (r.is_array()) {
     dead.reserve(r.elements.size());
     for (const auto& e : r.elements) dead.push_back(e.str);
   }
-  // Multi-endpoint: the control step only flipped status + returned the dead
-  // ids; wipe each dead node's block locations on every shard's instance.
-  if (multi_endpoint()) {
+  // Split-write modes: the control step only flipped status + returned the dead
+  // ids; wipe each dead node's block locations on every shard.
+  if (split_writes()) {
     for (const auto& id : dead) WipeNodeBlocksMulti(id);
   }
   return dead;
@@ -707,7 +738,9 @@ std::optional<std::string> RedisMasterMetadataStore::GetPeerAddress(
 
 std::vector<ClientRecord> RedisMasterMetadataStore::ListAliveClients() const {
   ScopedStoreOp _op(metrics_, "ListAliveClients");
-  RespValue r = control().Eval(redis::kListAliveLua, {}, {keys_.Tag()});
+  // KEYS[1] = a control-tag key (nodes:alive) to route + fix the slot in cluster
+  // mode; the script reads tag from ARGV and touches only control-tag keys.
+  RespValue r = control().Eval(redis::kListAliveLua, {keys_.NodesAlive()}, {keys_.Tag()});
   if (r.is_error()) throw std::runtime_error("[RedisStore] ListAliveClients: " + r.str);
   std::vector<ClientRecord> out;
   if (!r.is_array()) return out;
