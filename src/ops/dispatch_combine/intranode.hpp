@@ -34,8 +34,45 @@
 #include "mori/profiler/profiler.hpp"
 #endif
 
+// Set to 1 to print the fully-resolved dispDestTokIdMap once per PE right after
+// EpDispatchIntraNodeKernel finishes routing (dedup + slot assignment). Set to 0
+// to compile it out. Mirrors the debug print low_latency_async.cpp does for its
+// own dispDestTokIdMap.
+#define INTRANODE_DISPATCH_DEBUG_PRINT 1
+#if INTRANODE_DISPATCH_DEBUG_PRINT
+#define INTRANODE_DISPATCH_PRINTF(...) printf(__VA_ARGS__)
+#else
+#define INTRANODE_DISPATCH_PRINTF(...) \
+  do {                                 \
+  } while (0)
+#endif
+
+// Set to 1 to print the Stage1-resolved combineInp staging buffer once per PE, right
+// after EpCombineIntraNodeKernel's cross-device barrier (Stage1 copy/push writes from
+// every PE are guaranteed visible at that point). Set to 0 to compile it out.
+#define INTRANODE_COMBINE_DEBUG_PRINT 1
+#if INTRANODE_COMBINE_DEBUG_PRINT
+#define INTRANODE_COMBINE_PRINTF(...) printf(__VA_ARGS__)
+#else
+#define INTRANODE_COMBINE_PRINTF(...) \
+  do {                                \
+  } while (0)
+#endif
+
 namespace mori {
 namespace moe {
+
+// Best-effort scalar float conversion for debug prints. Most TokT types (bf16, fp8, fp32)
+// convert straight to float; mori_fp4x2_e2m1 packs 2 fp4 values per element and only exposes
+// an operator float2() (no plain operator float()) -- fall back to that and print lane 0.
+template <typename U>
+__device__ __forceinline__ float IntranodeDebugToFloat(const U& v) {
+  if constexpr (std::is_convertible_v<U, float>) {
+    return static_cast<float>(v);
+  } else {
+    return static_cast<float2>(v).x;
+  }
+}
 
 #define MAX_GPUS_PER_NODE 8
 
@@ -223,6 +260,28 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
+    }
+
+    // Debug: dump the fully-resolved dispDestTokIdMap for this PE. Safe to read
+    // here — the dispatchGridBarrier wait above already guarantees every block's
+    // Phase1 writes (including the dedup sentinel writes) are done.
+    if (laneId == 0 && args.tokenIndices) {
+      int totalEntries = args.curRankNumToken * config.numExpertPerToken;
+      INTRANODE_DISPATCH_PRINTF("[PE%d][dispDestTokIdMap]\n", myPe);
+      for (int i = 0; i < totalEntries; ++i) {
+        int tokId = i / config.numExpertPerToken;
+        int k = i % config.numExpertPerToken;
+        int flat = args.dispDestTokIdMap[i];
+        int decodedPe = flat / config.MaxNumTokensToSend();
+        if (decodedPe >= npes) {
+          INTRANODE_DISPATCH_PRINTF("[PE%d]   tok%d-k%d (expert%d) -> [dedup/dropped]\n", myPe,
+                                    tokId, k, args.tokenIndices[i]);
+        } else {
+          int decodedSlot = flat % config.MaxNumTokensToSend();
+          INTRANODE_DISPATCH_PRINTF("[PE%d]   tok%d-k%d (expert%d) -> PE%d slot%d\n", myPe, tokId,
+                                    k, args.tokenIndices[i], decodedPe, decodedSlot);
+        }
+      }
     }
   }
 
@@ -423,6 +482,61 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   // Make sure copy on all GPUs are finished
   MORI_TRACE_NEXT(seq, Slot::CombineBarrier);
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
+
+  // Debug: dump the Stage1-resolved combineInp staging buffer for this PE. Safe to read
+  // here -- the barrier above guarantees every PE's Stage1 writes (P2P mode: the owner
+  // itself only stages its own recv tokens; push mode: every contributing PE) are done.
+  if (globalThdId == 0) {
+    if constexpr (UseP2PRead) {
+      INTRANODE_COMBINE_PRINTF("[PE%d][combineInp] (P2P mode, %lld local recv tokens)\n", myPe,
+                               (long long)totalRecvTokenNum);
+      for (index_t i = 0; i < totalRecvTokenNum; ++i) {
+        TokT* slot = args.intraNodeTokBufs.combineInp->template GetAs<TokT*>() + i * hiddenDim;
+        int printDim = hiddenDim < 8 ? (int)hiddenDim : 8;
+        INTRANODE_COMBINE_PRINTF("[PE%d]   recvSlot%lld: [", myPe, (long long)i);
+        for (int d = 0; d < printDim; ++d)
+          INTRANODE_COMBINE_PRINTF("%s%f", d ? "," : "", IntranodeDebugToFloat(slot[d]));
+        INTRANODE_COMBINE_PRINTF("%s]\n", (size_t)printDim < hiddenDim ? ",..." : "");
+      }
+    } else {
+      // Push mode: combineInp[myPe] is laid out as a [contributor PE] x [my local tokenId]
+      // table (SendBufSlotOffset = contributor * MaxNumTokensToSendPerRank() + tokenId). Print
+      // it in that shape, one row per contributor PE, one column per local token; a cell is
+      // "-" if this token never routed to that PE (dedup'd or simply not one of its top-k
+      // destinations) -- checked via dispDestTokIdMap, same lookup the accumulate phase does.
+      INTRANODE_COMBINE_PRINTF(
+          "[PE%d][combineInp] (push mode, %d local tokens x %d contributors)\n", myPe,
+          args.curRankNumToken, npes);
+      INTRANODE_COMBINE_PRINTF("[PE%d]                ", myPe);
+      for (int tok = 0; tok < args.curRankNumToken; ++tok)
+        INTRANODE_COMBINE_PRINTF("        tok%-3d", tok);
+      INTRANODE_COMBINE_PRINTF("\n");
+      for (int pe = 0; pe < npes; ++pe) {
+        INTRANODE_COMBINE_PRINTF("[PE%d]   contributor=PE%d", myPe, pe);
+        for (int tok = 0; tok < args.curRankNumToken; ++tok) {
+          bool routedHere = false;
+          for (int j = 0; j < config.numExpertPerToken; ++j) {
+            index_t destTokId = args.dispDestTokIdMap[tok * config.numExpertPerToken + j];
+            if (PeFromFlatTokenIndex(config, destTokId) == pe) {
+              routedHere = true;
+              break;
+            }
+          }
+          if (!routedHere) {
+            INTRANODE_COMBINE_PRINTF("      [  -  ]");
+            continue;
+          }
+          uint8_t* slotPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
+                             SendBufSlotOffset(config, pe, tok) * combXferBytes;
+          TokT* dataPtr = reinterpret_cast<TokT*>(slotPtr);
+          INTRANODE_COMBINE_PRINTF("  [%.1f,%.1f]", IntranodeDebugToFloat(dataPtr[0]),
+                                   IntranodeDebugToFloat(dataPtr[hiddenDim - 1]));
+        }
+        INTRANODE_COMBINE_PRINTF("\n");
+      }
+    }
+  }
+
   // With a routing handle, the caller owns this tensor (it may still be alive in autograd ctx),
   // so we skip the reset. The next dispatch will allocate or replay its own.
   if (args.dispTokIdToSrcTokIdLocal == nullptr) {

@@ -164,7 +164,6 @@ add_shmem_example(ibverbs_test SOURCES application/ibverbs_test.cpp)
 add_executable(test_vmm_mpi_write utils/test_vmm_mpi_write.cpp)
 target_link_libraries(test_vmm_mpi_write mori_application hip::host hip::device)
 
-<<<<<<< HEAD
 # ============================================================================
 # Static-link SIOF reproducer for mori_shmem's GpuStatesAddrProvider registry
 # ============================================================================
