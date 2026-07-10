@@ -109,10 +109,14 @@ QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast (scatter only)
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = forward per-token scales
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,2048").split(",")]
 
-# fp8 flavor is arch-specific: OCP e4m3 on gfx950, fnuz on gfx942.
+# fp8 flavor is arch-specific: OCP e4m3 on gfx950/gfx1250, fnuz on gfx942.
 import tuning_configs as _tc  # noqa: E402
 
-_FP8_DT = torch.float8_e4m3fn if _tc._topology()[1] == 90500 else torch.float8_e4m3fnuz
+_FP8_DT = (
+    torch.float8_e4m3fn
+    if _tc._topology()[1] in (90500, 120500)
+    else torch.float8_e4m3fnuz
+)
 # (torch token dtype, elem bytes). fp4 packs 2 e2m1/byte -> 0.5 B/elem;
 # per-token bytes handled via TOK_NB below.
 _DT = {
