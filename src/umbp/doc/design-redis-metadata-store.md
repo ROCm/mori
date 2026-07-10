@@ -490,12 +490,19 @@ failover.
   satisfies redis++'s >= 0.12.1 minimum). Building from source keeps any build
   image working without an extra system package; if/when this ships in the
   product image, redis++ can move to a prebuilt package.
-- **`RespClient` seam** (`redis/resp_client.h`): the store depends only on this
-  small surface (`Eval/EvalSha/ScriptLoad`, `Pipeline`, pooled connections).
-  Phase 1 implemented it directly on raw `hiredis`; the seam exists precisely so
-  the single/multi/cluster/sentinel modes can be re-based onto redis++ without
-  touching store code — that migration is the next dev phase (redis++ is
-  currently vendored and build-verified, but the store does not use it yet).
+- **`IRespClient` seam** (`redis/resp_value.h`): the store depends only on this
+  small surface (`Command`, `Eval`, `EvalPipeline`, `Ping`). Two implementations
+  live behind it:
+  - `RespClient` (`redis/resp_client.h`) — raw `hiredis`, one endpoint; drives
+    single and multi-endpoint (`UMBP_REDIS_SHARD_URIS`) modes.
+  - `RespClusterClient` (`redis/resp_cluster_client.h`) — `redis-plus-plus`
+    `RedisCluster`; drives cluster mode. It routes each command (by the key) and
+    script (by KEYS[0]) to the owning node and delegates MOVED/ASK redirection,
+    slot-map refresh, and master-failover reconnect to redis++.
+  Cluster mode is implemented and verified against a real 3-master+3-replica
+  cluster (conformance suite + failover + live reshard). Converging single/
+  multi-endpoint onto redis++ (and adding a Sentinel mode) is a possible later
+  cleanup; both client paths already share the store's hot-path logic.
 
 ---
 
@@ -506,10 +513,10 @@ failover.
 | `UMBP_METADATA_BACKEND` | `inmemory` | `inmemory` or `redis` |
 | `UMBP_REDIS_URI` | (none) | e.g. `tcp://127.0.0.1:6379`; comma list for cluster seeds |
 | `UMBP_REDIS_NAMESPACE` | `default` | deployment id used inside the hash tag `{umbp:<ns>}` |
-| `UMBP_REDIS_CLUSTER` | `0` | `1` selects Redis Cluster mode. Recognized and validated (mutually exclusive with `UMBP_REDIS_SHARD_URIS`), but the store's cluster path is not implemented yet, so the factory currently fails fast with a clear message rather than silently running single-endpoint. |
+| `UMBP_REDIS_CLUSTER` | `0` | `1` selects Redis Cluster mode: a redis-plus-plus `RedisCluster` client routes every command/script by hash-tag slot, with MOVED/ASK and master-failover handled by the client. Mutually exclusive with `UMBP_REDIS_SHARD_URIS`. Seeds come from the `UMBP_REDIS_URI` comma list (any reachable node bootstraps the rest). Block keys spread across nodes via `UMBP_REDIS_BLOCK_SHARDS` tags (default 16 in cluster mode). |
 | `UMBP_REDIS_REQUIRED` | `1` | Startup readiness gate. `1` (default) fails master startup if the store is unreachable (the factory pings every endpoint), so a misconfigured store surfaces immediately instead of `UNAVAILABLE` on every RPC. `0` starts degraded and relies on runtime reconnect. |
 | `UMBP_REDIS_SHARD_URIS` | (none) | comma-separated Redis URIs for **multi-endpoint** mode: one instance per block shard, so their scripts run on independent server processes/threads. This is the way past a single instance's single-thread ceiling — measured ~2.9x RouteGet throughput at 4 instances on a dedicated host (`M1 t16 ~5.2k -> M4 t16 ~15k ops/s`), with M1 flat at the single-slot ceiling. When set (>1 URI) it supersedes `UMBP_REDIS_BLOCK_SHARDS`. The first URI is the control instance. See §4.1. |
-| `UMBP_REDIS_BLOCK_SHARDS` | `1` | single-endpoint only: number of hash-tag shards the block keyspace is spread over. `1` = legacy single-tag layout (byte-identical keys, whole-batch-atomic reads). `>1` spreads block lookups across slots (helps a threaded store / cluster, no gain on one single-threaded Redis). Fixed for a deployment's lifetime; clamped to `[1, 4096]`; `<=0` → `1`. See §4. |
+| `UMBP_REDIS_BLOCK_SHARDS` | `1` (16 in cluster) | number of hash-tag shards the block keyspace is spread over. `1` = legacy single-tag layout (byte-identical keys, whole-batch-atomic reads). `>1` spreads block lookups across slots (helps a threaded store / cluster, no gain on one single-threaded Redis). Ignored in multi-endpoint mode (shard count = number of URIs); in cluster mode it is the number of block-shard tags spread across nodes by slot (defaults to 16). Fixed for a deployment's lifetime; clamped to `[1, 4096]`; `<=0` → `1`. See §4. |
 | `UMBP_REDIS_POOL_SIZE` | (cpu-derived) | connection pool size |
 | `UMBP_REDIS_CONNECT_TIMEOUT_MS` | `1000` | connect timeout |
 | `UMBP_REDIS_SOCKET_TIMEOUT_MS` | `1000` | per-command socket timeout |
