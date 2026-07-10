@@ -384,4 +384,17 @@ if(USE_REDIS_BACKEND)
                         PRIVATE umbp_common GTest::gtest_main)
   target_compile_features(test_redis_master_metadata_store PRIVATE cxx_std_17)
   gtest_discover_tests(test_redis_master_metadata_store)
+
+  # redis-plus-plus link/build smoke test. Proves the submodule compiles with
+  # this toolchain and links (static redis++ + system hiredis) before any store
+  # code depends on it; at runtime it connects to UMBP_REDIS_URI if reachable,
+  # else skips. redis++_static carries its own include dirs; hiredis must be
+  # linked explicitly (the system hiredis ships no CMake config, so redis++ does
+  # not propagate it for the static lib).
+  add_executable(test_redispp_smoke test_redispp_smoke.cpp)
+  target_link_libraries(test_redispp_smoke
+                        PRIVATE redis++_static ${HIREDIS_LIB} GTest::gtest_main)
+  target_include_directories(test_redispp_smoke PRIVATE ${HIREDIS_INCLUDE_DIR})
+  target_compile_features(test_redispp_smoke PRIVATE cxx_std_17)
+  gtest_discover_tests(test_redispp_smoke)
 endif()
