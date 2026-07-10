@@ -55,6 +55,16 @@ int GetEnvInt(const char* key, int def) {
   return static_cast<int>(n);
 }
 
+bool GetEnvBool(const char* key, bool def) {
+  const char* v = std::getenv(key);
+  if (v == nullptr || *v == '\0') return def;
+  const std::string s(v);
+  if (s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "on") return true;
+  if (s == "0" || s == "false" || s == "FALSE" || s == "no" || s == "off") return false;
+  MORI_UMBP_WARN("[MetadataStore] ignoring invalid {}='{}', using default {}", key, v, def);
+  return def;
+}
+
 }  // namespace
 
 std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
@@ -103,6 +113,23 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
         pos = comma + 1;
       }
     }
+
+    // Mode selection + validation. single-endpoint (UMBP_REDIS_URI),
+    // multi-endpoint (UMBP_REDIS_SHARD_URIS) and Redis Cluster
+    // (UMBP_REDIS_CLUSTER) are mutually exclusive. Cluster mode is on the
+    // roadmap but not wired into the store yet, so recognize the flag and fail
+    // clearly instead of silently falling back to single-endpoint.
+    const bool cluster = GetEnvBool("UMBP_REDIS_CLUSTER", false);
+    if (cluster && cfg.shard_uris.size() > 1) {
+      throw std::runtime_error(
+          "UMBP_REDIS_CLUSTER=1 and UMBP_REDIS_SHARD_URIS are mutually exclusive; set only one");
+    }
+    if (cluster) {
+      throw std::runtime_error(
+          "UMBP_REDIS_CLUSTER=1 is not supported yet (Redis Cluster mode is on the roadmap); "
+          "use single-endpoint (UMBP_REDIS_URI) or multi-endpoint (UMBP_REDIS_SHARD_URIS)");
+    }
+
     if (cfg.shard_uris.size() > 1) {
       MORI_UMBP_INFO("[MetadataStore] backend=redis namespace={} endpoints={} (multi-endpoint)",
                      cfg.namespace_id, cfg.shard_uris.size());
@@ -110,7 +137,32 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
       MORI_UMBP_INFO("[MetadataStore] backend=redis uri={} namespace={} block_shards={}", cfg.uri,
                      cfg.namespace_id, cfg.block_shards);
     }
-    return std::make_unique<RedisMasterMetadataStore>(cfg);
+
+    auto store = std::make_unique<RedisMasterMetadataStore>(cfg);
+
+    // Startup readiness probe. Pinging every configured endpoint turns a
+    // misconfigured / unreachable store into a clear, immediate failure instead
+    // of a master that starts "healthy" and then returns UNAVAILABLE on every
+    // RPC. Gated by UMBP_REDIS_REQUIRED (default true): set 0 to start in a
+    // degraded state (e.g. when some shards are expected to come up later) and
+    // rely on the runtime reconnect path.
+    const std::string where = cfg.shard_uris.size() > 1
+                                  ? ("endpoints=" + std::to_string(cfg.shard_uris.size()))
+                                  : cfg.uri;
+    if (store->Ping()) {
+      MORI_UMBP_INFO("[MetadataStore] backend=redis readiness probe OK ({})", where);
+    } else if (GetEnvBool("UMBP_REDIS_REQUIRED", true)) {
+      throw std::runtime_error(
+          "backend=redis but the store is unreachable at " + where +
+          " (readiness probe failed). Fix the store/connection, or set UMBP_REDIS_REQUIRED=0 to "
+          "start in a degraded state.");
+    } else {
+      MORI_UMBP_WARN(
+          "[MetadataStore] backend=redis store unreachable at {} at startup; starting degraded "
+          "(UMBP_REDIS_REQUIRED=0) — RPCs return UNAVAILABLE until it recovers.",
+          where);
+    }
+    return store;
 #else
     throw std::runtime_error(
         "UMBP_METADATA_BACKEND=redis but the Redis backend was not compiled in; "
