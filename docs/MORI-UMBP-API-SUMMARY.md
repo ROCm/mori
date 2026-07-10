@@ -25,7 +25,7 @@ UMBP 的核心能力包括：
 - RDMA zero-copy 所需的内存注册
 - 可选 Prometheus metrics 和 SGLang HiCache 部署集成
 
-## 2. 总体设计
+## 2. 必要背景
 
 UMBP 当前采用 `master-as-advisor` 设计。
 
@@ -486,132 +486,11 @@ MORI_UMBP_LOG_LEVEL=DEBUG ./build/src/umbp/umbp_master 127.0.0.1:15558
 
 Python `mori.umbp` 包会尝试自动发现 wheel 中打包的 `umbp_master`，并设置 `UMBP_MASTER_BIN`。用户也可以显式设置该环境变量。
 
-## 11. Master / Peer gRPC 语义
-
-### 11.1 UMBP Master RPC
-
-UMBP master 暴露 `UMBPMaster` gRPC 服务。
-
-主要 RPC：
-
-| RPC | 作用 |
-| --- | --- |
-| `RegisterClient` | 注册 node、peer address、engine desc、tier capacities |
-| `UnregisterClient` | 注销 node |
-| `Heartbeat` | peer 向 master 上报容量和 `KvEvent`，是 authoritative update channel |
-| `RoutePut` | 为 put 选择目标 node 和 tier |
-| `RouteGet` | 为 get 选择 source replica |
-| `BatchRoutePut` / `BatchRouteGet` | 批量路由 |
-| `BatchLookup` | 纯存在性批量查询，不 bump access，也不 grant lease |
-| `ReportExternalKvBlocks` / `RevokeExternalKvBlocks` / `MatchExternalKv` | external KV index |
-| `ReportMetrics` | client metrics 上报 |
-
-### 11.2 UMBP Peer RPC
-
-每个拥有 DRAM/HBM 或 SSD tier 的 peer 运行 `UMBPPeer` 服务。
-
-主要 RPC：
-
-| RPC | 作用 |
-| --- | --- |
-| `GetPeerInfo` | 获取 peer 的 engine desc、buffer desc、SSD staging 信息 |
-| `AllocateSlot` | 为 DRAM/HBM put 预留 slot |
-| `CommitSlot` | 提交 slot，pending 转 owned，并排队 `KvEvent{ADD}` |
-| `AbortSlot` | 丢弃 pending slot |
-| `ResolveKey` | DRAM/HBM read-side lookup |
-| `EvictKey` | master 触发 DRAM/HBM eviction |
-| `PrepareSsdRead` | 远端 SSD read staging |
-| `ReleaseSsdLease` | 释放 SSD read staging lease |
-
-SSD 不是 direct put 目标。成功的 DRAM/HBM commit 后，如果 SSD tier 启用，peer 会异步执行 copy-on-commit，把数据复制到 SSD。SSD copy 成功后才会上报 `KvEvent{ADD, tier=SSD}`。
-
-## 12. Heartbeat 和 `KvEvent` 更新流程
-
-UMBP 中 master 索引的更新通过 heartbeat 异步完成。
-
-流程：
-
-1. Peer 本地发生 KV 状态变化，例如 commit、remove、clear tier。
-2. Peer 生成 `KvEvent`。
-3. 事件被放入本地 outbox，并打包成带 seq 的 `EventBundle`。
-4. `MasterClient` heartbeat thread 周期性发送 `HeartbeatRequest`。
-5. Master 按 seq 应用 bundle。
-6. Master 更新 `GlobalBlockIndex`。
-7. Master 返回 `acked_seq`。
-8. Peer 清理已 ack 的事件。
-9. 如果 master 检测到 seq gap，会设置 `request_full_sync=true`，要求 peer 下一轮发送完整快照。
-
-`KvEvent` 类型：
-
-| 类型 | 说明 |
-| --- | --- |
-| `ADD` | 添加 `(key, node_id, tier, size)` |
-| `REMOVE` | 删除指定 `(key, node_id, tier)` |
-| `CLEAR_AT_TIER` | 删除某 node 在某 tier 上所有 key |
-
-因此 master 不是强一致目录，它是 peer 真实状态的异步投影。
-
-## 13. Hot Path 数据流
-
-### 13.1 Put
-
-简化流程：
-
-```text
-Client
-  -> Master RoutePut(key, size)
-  <- RoutePutResult(node, peer_address, tier)
-  -> Peer AllocateSlot(key, size, tier)
-  <- slot_id, pages, descs
-  -> RDMA write pages
-  -> Peer CommitSlot(slot_id, key)
-  <- success
-  -> later heartbeat sends KvEvent{ADD}
-```
-
-特点：
-
-- Master 只建议写到哪里。
-- Peer 真正分配 slot。
-- 如果 peer 返回 ENOSPC，client 会把该 node 加入 `exclude_nodes` 后重试 `RoutePut`。
-- SSD 不作为 direct put tier。
-
-### 13.2 Get
-
-简化流程：
-
-```text
-Client
-  -> Master RouteGet(key)
-  <- RouteGetResult(node, tier, size, peer_address)
-  -> Peer ResolveKey(key)       # DRAM/HBM path
-  <- pages, descs, page_size
-  -> RDMA read pages
-```
-
-如果 route 到 SSD：
-
-```text
-Client
-  -> Peer PrepareSsdRead(key, max_size)
-  <- staging_offset, size, lease_id
-  -> RDMA read from SSD staging buffer
-  -> Peer ReleaseSsdLease(lease_id)
-```
-
-默认读 tier 优先级是：
-
-```text
-HBM > DRAM > SSD
-```
-
-因此只有当没有 HBM/DRAM replica 时，SSD replica 才会被选中。
-
-## 14. Runtime 环境变量
+## 11. Runtime 环境变量
 
 UMBP 文档把环境变量分为几类。
 
-### 14.1 Master / registry
+### 11.1 Master / registry
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -625,7 +504,7 @@ UMBP 文档把环境变量分为几类。
 | `UMBP_ROUTE_PUT_SELECT_ALGO` | `most_available` | put 路由算法 |
 | `UMBP_ROUTE_PUT_NODE_AFFINITY` | `none` | put node affinity 策略 |
 
-### 14.2 Pool client / peer
+### 11.2 Pool client / peer
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -637,7 +516,7 @@ UMBP 文档把环境变量分为几类。
 | `UMBP_RELEASE_LEASE_TIMEOUT_MS` | `1000` | release SSD lease timeout |
 | `UMBP_SSD_PREPARE_TIMEOUT_MS` | `0` | PrepareSsdRead deadline |
 
-### 14.3 Client 配置 overlay
+### 11.3 Client 配置 overlay
 
 | 环境变量 | 说明 |
 | --- | --- |
@@ -651,7 +530,7 @@ UMBP 文档把环境变量分为几类。
 | `UMBP_ROLE` | `leader` / `follower` / `standalone` |
 | `UMBP_SPDK_*` | SPDK 和 SPDK proxy 配置 |
 
-### 14.4 部署脚本变量
+### 11.4 部署脚本变量
 
 这些通常由 SGLang / HiCache wrapper 或 UMBP 脚本使用：
 
@@ -669,55 +548,9 @@ UMBP 文档把环境变量分为几类。
 
 环境变量解析通常在首次使用时缓存。修改 env 后通常需要重启进程。
 
-## 15. 部署场景
+## 12. API 使用建议
 
-### 15.1 单节点 smoke test
-
-`docs/MORI-UMBP-SINGLE-NODE-GUIDE.md` 描述的流程是：
-
-1. 启动 ROCm container。
-2. 构建 MORI，启用 UMBP。
-3. 启动单节点 SGLang server。
-4. 启动或连接 UMBP master。
-5. 发送 probe completion。
-6. 收集 server 和 master logs。
-
-关键变量：
-
-```bash
-START_UMBP_MASTER=true
-UMBP_MASTER_ADDRESS=127.0.0.1:15558
-UMBP_NODE_ADDRESS=<node-ip>
-UMBP_IO_ENGINE_PORT=16000
-UMBP_PEER_SERVICE_PORT=17000
-UMBP_SSD_STAGING_BYTES=268435456
-```
-
-### 15.2 Prefill-Decode disaggregation benchmark
-
-`docs/MORI-UMBP-PD-BENCHMARK.md` 描述 N 个 prefill 节点 + 1 个 decode 节点的场景：
-
-- `PREFILL_NODES[0]` 是 primary prefill，运行唯一 UMBP master。
-- 其它 prefill 和 decode 节点设置 `UMBP_MASTER_AUTO_START=false`。
-- 所有节点连接到同一个 master。
-- 每个节点设置唯一的 `UMBP_NODE_ADDRESS`。
-- `UMBP_IO_ENGINE_PORT` 和 `UMBP_PEER_SERVICE_PORT` 在启用 distributed 模式时必须设置。
-
-典型设置：
-
-```bash
-export UMBP_MASTER_ADDRESS=${IP_PREFILL_PRIMARY}:15558
-export UMBP_MASTER_AUTO_START=false
-export UMBP_NODE_ADDRESS=${node_ip}
-export UMBP_IO_ENGINE_HOST=127.0.0.1
-export UMBP_IO_ENGINE_PORT=16000
-export UMBP_PEER_SERVICE_PORT=16001
-export UMBP_CACHE_REMOTE_FETCHES=false
-```
-
-## 16. API 使用建议
-
-### 16.1 数据面优先使用 `UMBPClient`
+### 12.1 数据面优先使用 `UMBPClient`
 
 如果调用方需要真正读写 KV bytes，应使用：
 
@@ -730,7 +563,7 @@ UMBPClient.batch_get_into_ptr(...)
 
 不要用 `UMBPMasterClient` 搬数据。它只做控制面。
 
-### 16.2 调度器和 dashboard 使用 `UMBPMasterClient`
+### 12.2 调度器和 dashboard 使用 `UMBPMasterClient`
 
 如果只需要：
 
@@ -741,15 +574,15 @@ UMBPClient.batch_get_into_ptr(...)
 
 则使用 `UMBPMasterClient`。
 
-### 16.3 `count_as_hit=True` 只能用于真实路由路径
+### 12.3 `count_as_hit=True` 只能用于真实路由路径
 
 不要在 debug、health check、dashboard、probe 中设置 `count_as_hit=True`，否则会污染 hotness counter。
 
-### 16.4 不要混淆 external KV 和 UMBP-owned KV
+### 12.4 不要混淆 external KV 和 UMBP-owned KV
 
 External KV 是调度 metadata，不一定由 UMBP 存储 bytes。UMBP-owned KV 是 UMBP 自己 Put/Get 管理的数据，可以通过 UMBP 数据面读取。
 
-### 16.5 远端 SSD staging 需要按模型 KV 大小配置
+### 12.5 远端 SSD staging 需要按模型 KV 大小配置
 
 文档中提到 remote SSD read 必须让单个 key 的完整 value 放进一个 staging slot：
 
@@ -759,7 +592,7 @@ per_slot = ssd_staging_buffer_size / ssd_staging_buffer_slots
 
 如果 slot 太小，会出现 `size_too_large`，请求通常不会报错，但会退回 recompute，导致 hit rate 和吞吐下降。修复方式是增大 `UMBP_SSD_STAGING_BYTES` 或减少 slot 数。
 
-## 17. 总结
+## 13. 总结
 
 UMBP 对外 API 可以用一句话概括：
 
