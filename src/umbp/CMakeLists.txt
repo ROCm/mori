@@ -386,9 +386,12 @@ if(USE_REDIS_BACKEND)
 
   target_sources(
     umbp_common PRIVATE distributed/master/redis/resp_client.cpp
+                        distributed/master/redis/resp_cluster_client.cpp
                         distributed/master/redis_master_metadata_store.cpp)
   target_include_directories(umbp_common PRIVATE ${HIREDIS_INCLUDE_DIR})
-  target_link_libraries(umbp_common PUBLIC ${HIREDIS_LIB})
+  # redis++_static carries its own (and hiredis') include dirs; link it before
+  # hiredis so the static archive's hiredis symbols resolve.
+  target_link_libraries(umbp_common PUBLIC redis++_static ${HIREDIS_LIB})
   target_compile_definitions(umbp_common PUBLIC USE_REDIS_BACKEND)
 endif()
 

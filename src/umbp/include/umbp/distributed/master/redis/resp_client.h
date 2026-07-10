@@ -108,6 +108,12 @@ class RespClient : public IRespClient {
 
   const Options& options() const { return options_; }
 
+  // Convert a raw redisReply (void* to avoid leaking the hiredis type into this
+  // header) into a RespValue. Public + static so the redis-plus-plus cluster
+  // client can reuse the exact same reply decoding (its ReplyUPtr is a
+  // hiredis redisReply under the hood).
+  static RespValue Convert(void* reply);
+
  private:
   // RAII borrow of one pooled connection.
   class Lease {
@@ -128,9 +134,6 @@ class RespClient : public IRespClient {
   redisContext* Connect();  // create + AUTH; throws on failure
   Lease Acquire();          // borrow (blocks if pool exhausted)
   void Release(redisContext* ctx, bool healthy);
-
-  // Convert a raw redisReply (void* to avoid leaking the type) into RespValue.
-  static RespValue Convert(void* reply);
 
   // Run one argv command on a specific connection; sets *broke on transport
   // failure. Returns a RespValue (Error type on server error).
