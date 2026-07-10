@@ -1,0 +1,40 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx950",
+  "gpu_model": "mi350x",
+  "kernel_type": "IntraNodeLL",
+  "ep_size": 8,
+  "phase": "dispatch",
+  "rules": [
+    {
+      "dtype": "bf16",
+      "num_tokens": 1,
+      "hidden_dim": 7168,
+      "block_num": 144,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 3.95,
+      "latency_us": 22.25
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 32,
+      "hidden_dim": 7168,
+      "block_num": 32,
+      "rdma_block_num": 0,
+      "warp_per_block": 10,
+      "bandwidth_gbps": 94.96,
+      "latency_us": 25.72
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 64,
+      "hidden_dim": 7168,
+      "block_num": 72,
+      "rdma_block_num": 0,
+      "warp_per_block": 10,
+      "bandwidth_gbps": 148.82,
+      "latency_us": 32.7
+    }
+  ]
+}
