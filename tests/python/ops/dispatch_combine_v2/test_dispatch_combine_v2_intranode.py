@@ -121,6 +121,17 @@ def _cases():
         {"DTYPE": "bf16", "COMBINE": "scatter", "QUANT": "fp8_blockwise"},
         id="bf16-scatter-fp8blockwise",
     )
+    # blockwise with INSCALE>fp8_max so amax exceeds the fp8 range -> exercises the
+    # per-block scaling branch (the plain case above never triggers it).
+    yield pytest.param(
+        {
+            "DTYPE": "bf16",
+            "COMBINE": "scatter",
+            "QUANT": "fp8_blockwise",
+            "INSCALE": 200,
+        },
+        id="bf16-scatter-fp8blockwise-scaled",
+    )
     # per-token scale forwarding (v1 uses scale_dim=32), on both combine modes
     yield pytest.param(
         {"DTYPE": "bf16", "COMBINE": "gather", "SCALE_DIM": 32}, id="bf16-gather-scales"

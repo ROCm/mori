@@ -100,6 +100,9 @@ SCALE_DIM = int(
 )  # >0 = also verify per-token scales forwarding
 COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
 QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast | fp8_blockwise
+# Scale the input up so per-token/-block amax exceeds the fp8 max -> exercises the
+# fp8_blockwise per-block scaling branch (randn ~N(0,1) never triggers it).
+INSCALE = float(os.environ.get("INSCALE", 1))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512").split(",")]
 
 
@@ -119,7 +122,10 @@ def main():
             .to(dev)
         )
     else:
-        inp = torch.randn(M, HIDDEN, generator=g, dtype=torch.float32).to(DTYPE).to(dev)
+        inp = torch.randn(M, HIDDEN, generator=g, dtype=torch.float32)
+        if INSCALE != 1.0:
+            inp = inp * INSCALE
+        inp = inp.to(DTYPE).to(dev)
     idx = torch.randint(0, num_experts, (M, K), generator=g, dtype=torch.int32).to(dev)
     wts = torch.rand(M, K, generator=g, dtype=torch.float32).to(dev)
 
