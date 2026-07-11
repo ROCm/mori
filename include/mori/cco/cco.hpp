@@ -787,6 +787,11 @@ struct ccoComm {
   // Stored as int to avoid pulling hip_runtime_api.h into this header.
   int handleType{0x1};  // hipMemHandleTypePosixFileDescriptor
 
+  // Hardcoded cross-node LSA: when fabric probe succeeds on a multi-node
+  // comm, expand lsaSize to worldSize so all peers are flat-VA reachable.
+  bool fabricCrossNodeLsa{false};
+  std::vector<int> peerHipDevs;
+
   // GDA backend provider of this comm's NICs; resolved at the first
   // ccoDevCommCreate (CCO_PROVIDER_UNKNOWN until then / when GDA is off).
   // Informational host-side parameter — GDA dispatch is compile-time per-NIC.

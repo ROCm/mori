@@ -179,6 +179,16 @@ int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perR
   return ccoCommCreateImpl(boot, perRankVmmSize, outComm);
 }
 
+static bool CcoCanLsaMapPeer(const ccoComm* comm, int pe) {
+  if (pe == comm->rank) return false;
+  if (comm->fabricCrossNodeLsa) return true;
+  return comm->ctx->CanUseP2P(pe);
+}
+
+static int CcoPeToLsaRank(const ccoComm* comm, int pe) {
+  return comm->fabricCrossNodeLsa ? pe : (pe - comm->myNodeStart);
+}
+
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
                              ccoComm** outComm) {
   auto* comm = new ccoComm();
@@ -279,6 +289,8 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // Register) reuse this without re-querying hipGetDevice. Callers MUST keep
   // the calling thread bound to this device for any later CCO API on this comm.
   HIP_RUNTIME_CHECK(hipGetDevice(&comm->hipDev));
+  comm->peerHipDevs.assign(comm->worldSize, comm->hipDev);
+  comm->bootNet->Allgather(&comm->hipDev, comm->peerHipDevs.data(), sizeof(int));
 
   // Probe fabric handle support: try to allocate + export with the fabric
   // handle type. If it works, all subsequent allocations use fabric handles
@@ -290,6 +302,9 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
     probeProp.requestedHandleType = hipMemHandleTypeFabricCompat;
     probeProp.location.type = hipMemLocationTypeDevice;
     probeProp.location.id = comm->hipDev;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    probeProp.allocFlags.gpuDirectRDMACapable = 1;
+#endif
 
     size_t probeGranularity = 0;
     hipError_t probeErr =
@@ -314,6 +329,17 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
     }
   }
 
+  // Hardcoded cross-node LSA: fabric handle + multi-node => world-wide flat VA.
+  if (comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat) &&
+      comm->worldSize > comm->lsaSize) {
+    comm->fabricCrossNodeLsa = true;
+    comm->lsaSize = comm->worldSize;
+    comm->myNodeStart = 0;
+    comm->lsaRank = comm->rank;
+    MORI_SHMEM_INFO("ccoCommCreate: fabric cross-node LSA enabled (lsaSize=worldSize={})",
+                    comm->worldSize);
+  }
+
   // Query granularity with the SAME allocProp MemAlloc will use — granularity
   // can shift when requestedHandleType (FD export vs fabric) is enabled.
   hipMemAllocationProp allocProp = {};
@@ -323,8 +349,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   allocProp.location.id = comm->hipDev;
 
   size_t granularity = 0;
-  // Flat VA covers the LSA team only. Cross-node peers don't use VA — RDMA
-  // goes through iova=0 + offset.
+  // Flat VA covers the LSA team (world-wide when fabricCrossNodeLsa).
   size_t totalVaSize = static_cast<size_t>(comm->lsaSize) * perRankVmmSize;
   {
     vmmProcessLock vmmLock;
@@ -496,6 +521,9 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   allocProp.requestedHandleType = static_cast<hipMemAllocationHandleType>(comm->handleType);
   allocProp.location.type = hipMemLocationTypeDevice;
   allocProp.location.id = comm->hipDev;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  allocProp.allocFlags.gpuDirectRDMACapable = 1;
+#endif
 
   hipMemGenericAllocationHandle_t physHandle = 0;
   hipError_t err = hipSuccess;
@@ -660,7 +688,7 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   // the LSA flat VA.
   std::vector<int> p2pPeers;
   for (int pe = 0; pe < worldSize; pe++) {
-    if (comm->ctx->CanUseP2P(pe)) {
+    if (CcoCanLsaMapPeer(comm, pe)) {
       p2pPeers.push_back(pe);
     }
   }
@@ -691,9 +719,23 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
     // Import + map a single peer's handle into our flat VA. Returns 0 on
     // success, -1 on failure (rolls back all prior mappings).
     auto mapPeer = [&](int pe, hipMemGenericAllocationHandle_t importedHandle) -> int {
-      int peerLsaRank = pe - comm->myNodeStart;
+      int peerLsaRank = CcoPeToLsaRank(comm, pe);
       void* peerVa = static_cast<char*>(comm->flatBase) +
                      static_cast<size_t>(peerLsaRank) * comm->perRankSize + slotOffset;
+      const bool crossNodePeer =
+          comm->fabricCrossNodeLsa && !comm->ctx->GetPeerCapabilities(pe).sameHost;
+      // hipDeviceEnablePeerAccess is intra-node only; cross-node fabric P2P
+      // does not use this API (peerDev indices are local and collide across nodes).
+      if (!crossNodePeer && pe < static_cast<int>(comm->peerHipDevs.size())) {
+        int peerDev = comm->peerHipDevs[pe];
+        if (peerDev != comm->hipDev) {
+          hipError_t peerErr = hipDeviceEnablePeerAccess(peerDev, 0);
+          if (peerErr != hipSuccess && peerErr != hipErrorPeerAccessAlreadyEnabled) {
+            MORI_SHMEM_WARN("ccoWindowRegister: hipDeviceEnablePeerAccess PE {} dev {} failed: {}",
+                            pe, peerDev, static_cast<int>(peerErr));
+          }
+        }
+      }
       {
         vmmProcessLock vmmLock;
         hipError_t mapErr = hipMemMap(peerVa, alignedSize, 0, importedHandle, 0);
@@ -715,15 +757,22 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
         usleep(1000 * (1 << retry));
       }
       if (setErr != hipSuccess) {
-        MORI_SHMEM_ERROR("ccoWindowRegister: hipMemSetAccess PE {} failed after retries: {}", pe,
-                         static_cast<int>(setErr));
-        {
-          vmmProcessLock vmmLock;
-          (void)hipMemUnmap(peerVa, alignedSize);
-          (void)hipMemRelease(importedHandle);
+        if (crossNodePeer) {
+          MORI_SHMEM_WARN(
+              "ccoWindowRegister: hipMemSetAccess PE {} cross-node failed: {} "
+              "(continuing — fabric import may already grant access)",
+              pe, static_cast<int>(setErr));
+        } else {
+          MORI_SHMEM_ERROR("ccoWindowRegister: hipMemSetAccess PE {} failed after retries: {}", pe,
+                           static_cast<int>(setErr));
+          {
+            vmmProcessLock vmmLock;
+            (void)hipMemUnmap(peerVa, alignedSize);
+            (void)hipMemRelease(importedHandle);
+          }
+          rollbackMappedPeers();
+          return -1;
         }
-        rollbackMappedPeers();
-        return -1;
       }
       mappedPeers.push_back({importedHandle, peerVa});
       return 0;
@@ -906,13 +955,15 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
       "ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={} fabric={}",
       rank, (void*)devPtr, (void*)winBase, size, slotOffset, lkey, useFabric);
   for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
-    int pe = comm->myNodeStart + lsa;
+    int pe = comm->fabricCrossNodeLsa ? lsa : (comm->myNodeStart + lsa);
     void* peerVa = winBase + static_cast<size_t>(lsa) * comm->perRankSize;
     MORI_SHMEM_INFO("  LSA[{}] (PE {}): flatVA={} rkey={}", lsa, pe, peerVa, peerRkeys_host[pe]);
   }
-  for (int pe = 0; pe < worldSize; pe++) {
-    if (pe >= comm->myNodeStart && pe < comm->myNodeStart + comm->lsaSize) continue;
-    MORI_SHMEM_INFO("  XNODE PE {}: rkey={} (RDMA via iova=0)", pe, peerRkeys_host[pe]);
+  if (!comm->fabricCrossNodeLsa) {
+    for (int pe = 0; pe < worldSize; pe++) {
+      if (pe >= comm->myNodeStart && pe < comm->myNodeStart + comm->lsaSize) continue;
+      MORI_SHMEM_INFO("  XNODE PE {}: rkey={} (RDMA via iova=0)", pe, peerRkeys_host[pe]);
+    }
   }
   // peerRkeys_host is std::vector — destructs cleanly at scope exit.
 
@@ -967,8 +1018,8 @@ int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
     vmmProcessLock vmmLock;
     for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
       if (lsa == comm->lsaRank) continue;
-      int pe = comm->myNodeStart + lsa;
-      if (!comm->ctx->CanUseP2P(pe)) continue;
+      int pe = comm->fabricCrossNodeLsa ? lsa : (comm->myNodeStart + lsa);
+      if (!CcoCanLsaMapPeer(comm, pe)) continue;
       void* peerVa = static_cast<char*>(comm->flatBase) +
                      static_cast<size_t>(lsa) * comm->perRankSize + slotOff;
       (void)hipMemUnmap(peerVa, allocSize);
