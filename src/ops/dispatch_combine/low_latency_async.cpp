@@ -434,9 +434,9 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
     if (laneId == 0) stagingTokId = args.dispReceiverIdxMap[tokenId];
     stagingTokId = __shfl(stagingTokId, 0);
     if constexpr (UseFp8BlockwiseQuant) {
-      // Blockwise-FP8 (E4M3) combine: per-128-elem block max-scale, staged as [fp8 token | f32 scales].
-      // Accurate fp8 combine for the AsyncLL path (matches intranode blockwise), unlike the lossy
-      // direct-cast. Only instantiated for bf16 T.
+      // Blockwise-FP8 (E4M3) combine: per-128-elem block max-scale, staged as [fp8 token | f32
+      // scales]. Accurate fp8 combine for the AsyncLL path (matches intranode blockwise), unlike
+      // the lossy direct-cast. Only instantiated for bf16 T.
       if constexpr (std::is_same_v<T, hip_bfloat16>) {
         const int _sd = args.fp8BlockwiseCombineScaleDim;
         const size_t _slotB =
@@ -563,8 +563,8 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
   extern __shared__ char sharedMem[];
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
   // Blockwise-FP8 combine: per-expert block-scale pointer array, laid right after srcPtrs.
-  float** srcScalePtrs = reinterpret_cast<float**>(sharedMem) +
-                         warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
+  float** srcScalePtrs = reinterpret_cast<float**>(sharedMem) + warpNum * config.numExpertPerToken +
+                         warpId * config.numExpertPerToken;
 
   if (args.curRankNumToken != 0) {
     MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
@@ -610,7 +610,8 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
           auto _S = reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs);
           auto _SC = reinterpret_cast<const float* const*>(srcScalePtrs);
           const int _be = args.fp8BlockwiseCombineScaleDim > 0
-                              ? (int)(hiddenDim / args.fp8BlockwiseCombineScaleDim) : 0;
+                              ? (int)(hiddenDim / args.fp8BlockwiseCombineScaleDim)
+                              : 0;
           const int _an = config.numExpertPerToken;
           const bool _al = ((hiddenDimOffset & 0x7) == 0) && ((hiddenDimSize & 0x7) == 0);
           bool _fast = true;
