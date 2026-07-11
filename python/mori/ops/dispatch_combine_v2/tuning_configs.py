@@ -149,9 +149,23 @@ _GFX1250_DEFAULT = dict(
     combine_warp_num_per_block=16,
     schedule=_GFX1250_SCHED_BF16,
 )
-# bf16-tuned (EP4). fp8/fp4 fall back to this bf16 schedule until separately tuned.
+# DeepSeek-V4-Pro shape (hidden 7168, topk 6, 384 experts) — measured 2026-07-11,
+# EP4 bf16, same 2D sweep. Same shape family as topk=8, geometry ~identical (block/
+# warp track token count, not topk); disp shifts to block 192 a notch earlier and
+# peaks higher (fewer recv copies at topk 6: 360/141 GB/s @8192). Measured GB/s
+# (disp/comb): 64=24/11 128=46/17 256=90/28 512=150/39 1024=227/57 2048=278/84
+# 4096=320/113 8192=360/141.
+_GFX1250_SCHED_BF16_T6 = (
+    (128, 128, 8, 64, 4),  # <=128:  latency-bound
+    (256, 192, 16, 64, 8),  # <=256
+    (1024, 192, 32, 64, 16),  # <=1024: disp peak warp; comb small block/warp16
+    (4096, 192, 32, 128, 16),  # <=4096: comb block 128 (bandwidth)
+    (None, 192, 32, 192, 16),  # >4096 (peak): disp 360 / comb 141 GB/s
+)
+# bf16-tuned (EP4). fp8/fp4 fall back to the bf16 schedule until separately tuned.
 _GFX1250_TABLE = {
     (4, 7168, 8): {"bf16": _GFX1250_SCHED_BF16},
+    (4, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_T6},  # DeepSeek-V4-Pro
 }
 
 _DEVICES = {
