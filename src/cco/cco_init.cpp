@@ -189,6 +189,25 @@ static int CcoPeToLsaRank(const ccoComm* comm, int pe) {
   return comm->fabricCrossNodeLsa ? pe : (pe - comm->myNodeStart);
 }
 
+// Cross-node LSA (world-wide flat VA over the fabric) is opt-in: a successful
+// fabric-handle probe only proves LOCAL export works, not that a peer's imported
+// handle is load/store-reachable across nodes. Auto-enabling on an RDMA-only
+// fabric would map peer VAs that fault on first device access. Enable only on a
+// genuine scale-up fabric via MORI_CCO_FABRIC_CROSSNODE_LSA=1.
+static bool CcoFabricCrossNodeLsaEnabled() {
+  const char* e = getenv("MORI_CCO_FABRIC_CROSSNODE_LSA");
+  return e && atoi(e) != 0;
+}
+
+// By default a cross-node hipMemSetAccess failure is fatal at register time
+// (fail loudly instead of leaving a silently-unusable peer mapping that faults
+// mid-kernel). MORI_CCO_FABRIC_LENIENT=1 restores continue-on-failure, for
+// fabrics where the import itself already grants access.
+static bool CcoFabricLenient() {
+  const char* e = getenv("MORI_CCO_FABRIC_LENIENT");
+  return e && atoi(e) != 0;
+}
+
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
                              ccoComm** outComm) {
   auto* comm = new ccoComm();
@@ -329,9 +348,10 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
     }
   }
 
-  // Hardcoded cross-node LSA: fabric handle + multi-node => world-wide flat VA.
+  // Cross-node LSA: fabric handle + multi-node => world-wide flat VA. Opt-in
+  // (MORI_CCO_FABRIC_CROSSNODE_LSA=1) — only safe on a scale-up fabric.
   if (comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat) &&
-      comm->worldSize > comm->lsaSize) {
+      comm->worldSize > comm->lsaSize && CcoFabricCrossNodeLsaEnabled()) {
     comm->fabricCrossNodeLsa = true;
     comm->lsaSize = comm->worldSize;
     comm->myNodeStart = 0;
@@ -757,14 +777,21 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
         usleep(1000 * (1 << retry));
       }
       if (setErr != hipSuccess) {
-        if (crossNodePeer) {
+        if (crossNodePeer && CcoFabricLenient()) {
+          // Opt-in leniency: some fabrics grant load/store access at import time
+          // and return non-success from hipMemSetAccess. Trust the mapping.
           MORI_SHMEM_WARN(
               "ccoWindowRegister: hipMemSetAccess PE {} cross-node failed: {} "
-              "(continuing — fabric import may already grant access)",
+              "(MORI_CCO_FABRIC_LENIENT=1 — continuing, import may already grant access)",
               pe, static_cast<int>(setErr));
         } else {
-          MORI_SHMEM_ERROR("ccoWindowRegister: hipMemSetAccess PE {} failed after retries: {}", pe,
-                           static_cast<int>(setErr));
+          // Fail loudly at register time rather than leaving a peer VA that
+          // faults on first device access. For cross-node this most likely means
+          // the fabric is not a scale-up (load/store) domain.
+          MORI_SHMEM_ERROR(
+              "ccoWindowRegister: hipMemSetAccess PE {} failed after retries: {}{}", pe,
+              static_cast<int>(setErr),
+              crossNodePeer ? " (cross-node fabric not load/store-reachable?)" : "");
           {
             vmmProcessLock vmmLock;
             (void)hipMemUnmap(peerVa, alignedSize);
