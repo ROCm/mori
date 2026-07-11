@@ -124,11 +124,42 @@ _MI355X_TABLE = {
     (8, 7168, 8): {"fp8": _MI355X_SCHED_FP8, "fp4": _MI355X_SCHED_FP4},
 }
 
+# ── gfx1250 (256 CU, wave32) — measured 2026-07-11, EP4, bf16, full block x warp
+# sweep (dispatch and combine tuned independently across tok 8..8192). Key lessons:
+# (a) dispatch loves more parallelism — warp grows 8->16->32 with tok, block 128
+#     (<=1024) then 192 (>=2048); warp 32 nearly 4x's large-tok dispatch BW.
+# (b) combine wants the OPPOSITE — few warps at small tok (over-parallelizing the
+#     gather+xdb barrier collapses it: block 64 warp 8 at small, warp grows to 16
+#     and block to 128/192 only for bandwidth-bound large tok.
+# (c) GUARDRAIL: block_num MUST stay < CU count (256). The dispatch Phase-2 grid
+#     barrier needs all blocks co-resident; block 256 deadlocks (100% spin). 192 is
+#     the safe ceiling here. Measured bf16 GB/s (disp/comb): 64=25/11 128=50/19
+#     256=93/28 512=161/41 1024=204/61 2048=259/90 4096=292/120 8192=335/149.
+_GFX1250_SCHED_BF16 = (
+    (64, 128, 8, 64, 8),  # <=64:   disp 128/8, comb 64/8 (latency-bound)
+    (256, 128, 16, 64, 8),  # <=256:  disp warp 16
+    (1024, 128, 32, 128, 8),  # <=1024: disp warp 32; comb block 128
+    (4096, 192, 32, 128, 16),  # <=4096: disp 0.75*CU; comb warp 16 (bandwidth)
+    (None, 192, 32, 192, 16),  # >4096 (peak): disp 335 / comb 149 GB/s
+)
+_GFX1250_DEFAULT = dict(
+    dispatch_block_num=192,
+    combine_block_num=192,
+    warp_num_per_block=32,
+    combine_warp_num_per_block=16,
+    schedule=_GFX1250_SCHED_BF16,
+)
+# bf16-tuned (EP4). fp8/fp4 fall back to this bf16 schedule until separately tuned.
+_GFX1250_TABLE = {
+    (4, 7168, 8): {"bf16": _GFX1250_SCHED_BF16},
+}
+
 _DEVICES = {
     "mi308x": (_MI308X_DEFAULT, _MI308X_TABLE),
     "mi325x": (_MI325X_DEFAULT, _MI325X_TABLE),
     "mi300x": (_MI300X_DEFAULT, _MI300X_TABLE),
     "mi355x": (_MI355X_DEFAULT, _MI355X_TABLE),
+    "gfx1250": (_GFX1250_DEFAULT, _GFX1250_TABLE),
 }
 
 
@@ -182,6 +213,8 @@ def _device_key():
         return key
     if gfx == 90500:  # gfx950 (MI350 / MI355X), DID varies
         return "mi355x"
+    if gfx == 120500:  # gfx1250 (256 CU, wave32), DID varies
+        return "gfx1250"
     return None
 
 
