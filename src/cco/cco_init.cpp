@@ -179,24 +179,29 @@ int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perR
   return ccoCommCreateImpl(boot, perRankVmmSize, outComm);
 }
 
+// The LSA team is always the contiguous rank range [myNodeStart, myNodeStart+
+// lsaSize) — its width is set by the topology step (same host by default, same
+// vPOD when grouping is enabled). Membership + flat-VA index derive purely from
+// that range, so the same formula covers intra-node, cross-node-vPOD, and
+// whole-world layouts.
 static bool CcoCanLsaMapPeer(const ccoComm* comm, int pe) {
   if (pe == comm->rank) return false;
-  if (comm->fabricCrossNodeLsa) return true;
-  return comm->ctx->CanUseP2P(pe);
+  return pe >= comm->myNodeStart && pe < comm->myNodeStart + comm->lsaSize;
 }
 
-static int CcoPeToLsaRank(const ccoComm* comm, int pe) {
-  return comm->fabricCrossNodeLsa ? pe : (pe - comm->myNodeStart);
-}
+static int CcoPeToLsaRank(const ccoComm* comm, int pe) { return pe - comm->myNodeStart; }
 
-// Cross-node LSA (world-wide flat VA over the fabric) is opt-in: a successful
-// fabric-handle probe only proves LOCAL export works, not that a peer's imported
-// handle is load/store-reachable across nodes. Auto-enabling on an RDMA-only
-// fabric would map peer VAs that fault on first device access. Enable only on a
-// genuine scale-up fabric via MORI_CCO_FABRIC_CROSSNODE_LSA=1.
-static bool CcoFabricCrossNodeLsaEnabled() {
-  const char* e = getenv("MORI_CCO_FABRIC_CROSSNODE_LSA");
-  return e && atoi(e) != 0;
+// A vPOD is a scale-up fabric domain that may span multiple physical hosts: ranks
+// sharing it can LSA-interconnect (flat VA over the fabric) directly, not just
+// intra-node. Each rank declares its vPOD via MORI_VPOD_ID; ranks with the same
+// value form one LSA team. MORI_CCO_FABRIC_CROSSNODE_LSA=1 is shorthand for
+// "the whole world is one vPOD". Unset on all ranks => group by host (default).
+static int CcoLocalVpodId() {
+  const char* e = getenv("MORI_VPOD_ID");
+  if (e && *e) return atoi(e);
+  const char* w = getenv("MORI_CCO_FABRIC_CROSSNODE_LSA");
+  if (w && atoi(w) != 0) return 0;  // whole world = one vPOD
+  return -1;                        // group by host
 }
 
 // By default a cross-node hipMemSetAccess failure is fatal at register time
@@ -232,36 +237,64 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   comm->ctx = new application::Context(*comm->bootNet);
   comm->defaultNumQpPerPe = comm->ctx->GetNumQpPerPe();
 
-  // Step 2.5: detect intra-node topology (LSA = Local Symmetric Access).
-  // Use Context's capability discovery (PeerCapabilities.sameHost) rather
-  // than the chosen transport — LSA membership is a hardware fact and must
-  // not flip even if policy routes intra-node traffic via RDMA.
+  // Step 2.5: detect LSA (Local Symmetric Access) team topology.
+  // Membership is a HARDWARE fact — peers whose memory this rank can load/store
+  // through a flat VA — captured before transport policy: same host by default,
+  // or the same vPOD (a scale-up fabric domain that may span hosts) when vPOD
+  // grouping is enabled (see CcoLocalVpodId).
   //
   // HARD CONTRACT — violations are fatal:
-  //   (a) node-major contiguous ranks (same-host peers form a single block)
+  //   (a) LSA-major contiguous ranks (team peers form a single block)
   //   (b) every rank observes the same lsaSize
   // Both are required by the flat-VA formula `lsaFlatBase + lsaRank * stride`.
+
+  // Resolve vPOD grouping (all-or-none across the job). vpodMode widens the LSA
+  // team from same-host to same-vPOD; lsaSpansHosts records whether the team
+  // actually crosses a host boundary (=> cross-node fabric mapping is required).
+  int myVpodId = CcoLocalVpodId();
+  std::vector<int> allVpodIds(comm->worldSize);
+  comm->bootNet->Allgather(&myVpodId, allVpodIds.data(), sizeof(int));
+  bool anyVpod = false, allVpod = true;
+  for (int v : allVpodIds) {
+    anyVpod |= (v >= 0);
+    allVpod &= (v >= 0);
+  }
+  if (anyVpod && !allVpod) {
+    MORI_SHMEM_ERROR(
+        "ccoCommCreate: MORI_VPOD_ID set on some ranks but not all — vPOD grouping "
+        "must be all-or-none across the job.");
+    delete comm->ctx;
+    comm->bootNet->Finalize();
+    delete comm;
+    *outComm = nullptr;
+    return -1;
+  }
+  const bool vpodMode = allVpod;
+  bool lsaSpansHosts = false;
   {
     int lsaCount = 0;
-    int firstSameNode = comm->rank;
-    int lastSameNode = comm->rank;
+    int firstInTeam = comm->rank;
+    int lastInTeam = comm->rank;
     for (int pe = 0; pe < comm->worldSize; pe++) {
       const auto& cap = comm->ctx->GetPeerCapabilities(pe);
-      const bool sameNode = (pe == comm->rank) || cap.sameHost;
-      if (sameNode) {
-        if (pe < firstSameNode) firstSameNode = pe;
-        if (pe > lastSameNode) lastSameNode = pe;
+      const bool sameHost = (pe == comm->rank) || cap.sameHost;
+      const bool inTeam = vpodMode ? (allVpodIds[pe] == myVpodId) : sameHost;
+      if (inTeam) {
+        if (pe < firstInTeam) firstInTeam = pe;
+        if (pe > lastInTeam) lastInTeam = pe;
         lsaCount++;
+        if (!sameHost) lsaSpansHosts = true;  // team member on another host
       }
     }
 
-    if (lastSameNode - firstSameNode + 1 != lsaCount) {
+    if (lastInTeam - firstInTeam + 1 != lsaCount) {
       MORI_SHMEM_ERROR(
           "ccoCommCreate: non-contiguous lsa membership "
           "(rank {}: first={} last={} count={}). CCO requires "
-          "node-major contiguous rank layout. Reorder ranks in your "
-          "launch (mpirun -host A:N,B:N or equivalent).",
-          comm->rank, firstSameNode, lastSameNode, lsaCount);
+          "LSA-major contiguous rank layout. Reorder ranks in your "
+          "launch (mpirun -host A:N,B:N or equivalent), or align MORI_VPOD_ID "
+          "with contiguous rank blocks.",
+          comm->rank, firstInTeam, lastInTeam, lsaCount);
       delete comm->ctx;
       comm->bootNet->Finalize();
       delete comm;
@@ -276,7 +309,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
         MORI_SHMEM_ERROR(
             "ccoCommCreate: heterogeneous lsa sizes detected "
             "(my rank {} sees lsaSize={}, rank {} sees lsaSize={}). "
-            "CCO requires uniform GPUs-per-node across all nodes.",
+            "CCO requires uniform LSA-team size across all ranks.",
             comm->rank, lsaCount, r, allLsaSizes[r]);
         delete comm->ctx;
         comm->bootNet->Finalize();
@@ -287,11 +320,13 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
     }
 
     comm->lsaSize = lsaCount;
-    comm->myNodeStart = firstSameNode;
-    comm->lsaRank = comm->rank - firstSameNode;
+    comm->myNodeStart = firstInTeam;
+    comm->lsaRank = comm->rank - firstInTeam;
 
-    MORI_SHMEM_INFO("ccoCommCreate: lsa topology rank={} lsaSize={} lsaRank={} myNodeStart={}",
-                    comm->rank, comm->lsaSize, comm->lsaRank, comm->myNodeStart);
+    MORI_SHMEM_INFO(
+        "ccoCommCreate: lsa topology rank={} lsaSize={} lsaRank={} lsaStart={} "
+        "vpodMode={} spansHosts={}",
+        comm->rank, comm->lsaSize, comm->lsaRank, comm->myNodeStart, vpodMode, lsaSpansHosts);
   }
 
   // Step 3: reserve flat VA. Always 4GB-aligned so stride4G = perRankSize >> 32
@@ -348,16 +383,27 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
     }
   }
 
-  // Cross-node LSA: fabric handle + multi-node => world-wide flat VA. Opt-in
-  // (MORI_CCO_FABRIC_CROSSNODE_LSA=1) — only safe on a scale-up fabric.
-  if (comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat) &&
-      comm->worldSize > comm->lsaSize && CcoFabricCrossNodeLsaEnabled()) {
+  // Cross-node LSA: when the LSA team (vPOD) spans hosts, its peers are only
+  // reachable through fabric handles mapped into the flat VA. lsaSize/myNodeStart
+  // already describe the (contiguous) team; here we just require fabric and flag
+  // that peer mapping must go cross-node (fabric import, no hipDeviceEnablePeer-
+  // Access). A scale-up fabric is mandatory — fail loudly if it's missing.
+  if (lsaSpansHosts) {
+    if (comm->handleType != static_cast<int>(hipMemHandleTypeFabricCompat)) {
+      MORI_SHMEM_ERROR(
+          "ccoCommCreate: LSA team spans hosts (cross-node vPOD, lsaSize={}) but fabric "
+          "handle support is unavailable — cannot map peer VAs across nodes. Fix the "
+          "fabric/driver, or scope MORI_VPOD_ID to a single host.",
+          comm->lsaSize);
+      delete comm->ctx;
+      comm->bootNet->Finalize();
+      delete comm;
+      *outComm = nullptr;
+      return -1;
+    }
     comm->fabricCrossNodeLsa = true;
-    comm->lsaSize = comm->worldSize;
-    comm->myNodeStart = 0;
-    comm->lsaRank = comm->rank;
-    MORI_SHMEM_INFO("ccoCommCreate: fabric cross-node LSA enabled (lsaSize=worldSize={})",
-                    comm->worldSize);
+    MORI_SHMEM_INFO("ccoCommCreate: cross-node vPOD LSA enabled (lsaSize={} spans hosts)",
+                    comm->lsaSize);
   }
 
   // Query granularity with the SAME allocProp MemAlloc will use — granularity
@@ -982,15 +1028,14 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
       "ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={} fabric={}",
       rank, (void*)devPtr, (void*)winBase, size, slotOffset, lkey, useFabric);
   for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
-    int pe = comm->fabricCrossNodeLsa ? lsa : (comm->myNodeStart + lsa);
+    int pe = comm->myNodeStart + lsa;
     void* peerVa = winBase + static_cast<size_t>(lsa) * comm->perRankSize;
     MORI_SHMEM_INFO("  LSA[{}] (PE {}): flatVA={} rkey={}", lsa, pe, peerVa, peerRkeys_host[pe]);
   }
-  if (!comm->fabricCrossNodeLsa) {
-    for (int pe = 0; pe < worldSize; pe++) {
-      if (pe >= comm->myNodeStart && pe < comm->myNodeStart + comm->lsaSize) continue;
-      MORI_SHMEM_INFO("  XNODE PE {}: rkey={} (RDMA via iova=0)", pe, peerRkeys_host[pe]);
-    }
+  // Peers outside the LSA team (different vPOD / host) are reached via RDMA.
+  for (int pe = 0; pe < worldSize; pe++) {
+    if (pe >= comm->myNodeStart && pe < comm->myNodeStart + comm->lsaSize) continue;
+    MORI_SHMEM_INFO("  XNODE PE {}: rkey={} (RDMA via iova=0)", pe, peerRkeys_host[pe]);
   }
   // peerRkeys_host is std::vector — destructs cleanly at scope exit.
 

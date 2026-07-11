@@ -787,8 +787,10 @@ struct ccoComm {
   // Stored as int to avoid pulling hip_runtime_api.h into this header.
   int handleType{0x1};  // hipMemHandleTypePosixFileDescriptor
 
-  // Hardcoded cross-node LSA: when fabric probe succeeds on a multi-node
-  // comm, expand lsaSize to worldSize so all peers are flat-VA reachable.
+  // Cross-node LSA: set when the LSA team (vPOD) spans hosts, so peer windows
+  // are mapped via fabric handles into the flat VA (no intra-node peer-access).
+  // lsaSize/myNodeStart still describe the contiguous team; this only selects
+  // the cross-node mapping path in ccoWindowRegister.
   bool fabricCrossNodeLsa{false};
   std::vector<int> peerHipDevs;
 
