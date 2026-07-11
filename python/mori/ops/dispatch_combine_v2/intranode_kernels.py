@@ -61,6 +61,8 @@ from flydsl.expr.rocdl import (
     cvt_pk_fp8_f32,
     cvt_scalef32_pk_f32_fp4,
     cvt_scalef32_pk_fp4_f32,
+    cvt_scale_pk8_f32_fp4,
+    cvt_scalef32_pk8_fp4_f32,
 )
 from flydsl.expr.typing import Int32, Int64
 
@@ -425,6 +427,30 @@ def _V1I32():
 
 def _accum_funcs(hidden_elem_size, fp8_direct_cast=False, fp4=False):
     if fp4:  # fp4 e2m1: i32 = 8 packed fp4 -> v8f32
+        if WAVE == 32:
+            # gfx1250: one pack-8 instr converts all 8 fp4/i32 at once. The
+            # gfx950 pk-2 (cvt_scalef32_pk_*_fp4, src/dst_sel) don't exist here
+            # ("Cannot select"); dequant only has the E8M0 scale family
+            # (cvt_scale_pk8_f32_fp4), quant has scalef32 (cvt_scalef32_pk8_fp4_f32).
+            # Plain fp4 (no microscaling) => scale 1.0, scale_sel 0.
+            def to_accum(i32_scalar):
+                # dequant uses the E8M0 block-scale (i32); 1.0 == 2^(127-127) => 127.
+                return cvt_scale_pk8_f32_fp4(
+                    res=_V8F32(),
+                    src=i32_scalar,
+                    scale=arith.constant(127, type=T.i32()),
+                    scale_sel=0,
+                )
+
+            def from_accum(acc):
+                return cvt_scalef32_pk8_fp4_f32(
+                    res=T.i32(), src=acc, scale=arith.constant(1.0, type=T.f32())
+                )
+
+            def zero_accum():
+                return arith.constant_vector(0.0, _V8F32())
+
+            return to_accum, from_accum, zero_accum
         # NOTE: cvt_scalef32_pk_*_fp4 are gfx950-only (MI350). On gfx942
         # (MI300X) codegen fails "instruction not supported on this GPU".
         # Faithful port of the FlyDSL reference fp4 branch; opt-in (fp4=True).
