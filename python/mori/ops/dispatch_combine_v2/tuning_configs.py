@@ -179,6 +179,11 @@ _GFX1250_TABLE = {
     (4, 7168, 8): {"bf16": _GFX1250_SCHED_BF16},
     (4, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_T6},  # DeepSeek-V4-Pro
     (8, 7168, 8): {"bf16": _GFX1250_SCHED_BF16_EP8},  # cross-node / single-node EP8
+    # V4-Pro topk=6 EP8 cross-node (measured 2026-07-12): geometry is topk-
+    # independent (tracks token count) — optimum matches topk=8, so reuse it.
+    # Measured GB/s (disp/comb): 8=4/3 64=32/16 512=163/56 2048=199/113
+    # 4096=200/145 8192=206/171.
+    (8, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_EP8},
 }
 
 _DEVICES = {
