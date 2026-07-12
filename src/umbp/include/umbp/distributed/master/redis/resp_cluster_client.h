@@ -74,6 +74,12 @@ class RespClusterClient : public IRespClient {
   RespClusterClient(const RespClusterClient&) = delete;
   RespClusterClient& operator=(const RespClusterClient&) = delete;
 
+  // Connect to the cluster and return how many master nodes it has (from
+  // CLUSTER SLOTS). Used to auto-size the block-shard count (~2x masters) so a
+  // RouteGet batch spreads across nodes without over-splitting into too many
+  // per-shard scripts. Throws RespError if no seed is reachable.
+  static std::size_t DiscoverMasterCount(const Options& options);
+
   // Single command; routed by the key at args[1] (all store commands put the key
   // there: HGETALL/HGET/SCARD <key> ...). Returns the reply (Error value on a
   // server error), throws RespError on a transport/redirection failure.

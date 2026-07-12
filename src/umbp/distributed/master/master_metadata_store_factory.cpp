@@ -32,6 +32,7 @@
 #include "umbp/distributed/master/in_memory_master_metadata_store.h"
 
 #ifdef USE_REDIS_BACKEND
+#include "umbp/distributed/master/redis/resp_cluster_client.h"
 #include "umbp/distributed/master/redis_master_metadata_store.h"
 #endif
 
@@ -108,9 +109,12 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
     const bool cluster = GetEnvBool("UMBP_REDIS_CLUSTER", false);
 
     // Block-keyspace shards. Default 1 = legacy single-tag layout (no change) for
-    // single/multi. In cluster mode default to 16 so block keys spread across the
-    // cluster's nodes by slot (1 would pin every block on one node). Override
-    // with UMBP_REDIS_BLOCK_SHARDS.
+    // single/multi. In cluster mode, if left unset it is auto-sized to ~2x the
+    // discovered master count (below) so a RouteGet batch spreads across nodes
+    // without over-splitting into too many per-shard scripts; 16 is only the
+    // fallback if discovery fails. Override explicitly with UMBP_REDIS_BLOCK_SHARDS.
+    const char* bs_env = std::getenv("UMBP_REDIS_BLOCK_SHARDS");
+    const bool bs_explicit = (bs_env != nullptr && *bs_env != '\0');
     constexpr int kMaxBlockShards = 4096;
     int block_shards = GetEnvInt("UMBP_REDIS_BLOCK_SHARDS", cluster ? 16 : 1);
     if (block_shards > kMaxBlockShards) {
@@ -136,6 +140,33 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
       // Seeds: the UMBP_REDIS_URI comma list (any reachable node bootstraps the
       // rest via CLUSTER SLOTS).
       cfg.cluster_seeds = SplitCsv(GetEnvStr("UMBP_REDIS_URI", "tcp://127.0.0.1:6379"));
+      // Auto-size block shards to ~2x the master count unless the operator set
+      // UMBP_REDIS_BLOCK_SHARDS. ~2x spreads a batch across nodes while keeping
+      // per-batch scripts few (more shards = more per-batch EVALs = lower
+      // throughput; fewer = uneven node load). Falls back to the fixed default
+      // if the cluster is unreachable (the readiness probe then surfaces that).
+      if (!bs_explicit) {
+        try {
+          redis::RespClusterClient::Options opts;
+          opts.seeds = cfg.cluster_seeds;
+          opts.password = cfg.password;
+          opts.connect_timeout_ms = cfg.connect_timeout_ms;
+          opts.socket_timeout_ms = cfg.socket_timeout_ms;
+          opts.pool_size = cfg.pool_size;
+          const std::size_t masters = redis::RespClusterClient::DiscoverMasterCount(opts);
+          if (masters > 0) {
+            const std::size_t auto_shards =
+                std::min<std::size_t>(kMaxBlockShards, std::max<std::size_t>(1, 2 * masters));
+            cfg.block_shards = auto_shards;
+            MORI_UMBP_INFO("[MetadataStore] cluster auto block_shards={} (2x {} masters)",
+                           auto_shards, masters);
+          }
+        } catch (const std::exception& e) {
+          MORI_UMBP_WARN(
+              "[MetadataStore] cluster master-count discovery failed ({}); using block_shards={}",
+              e.what(), cfg.block_shards);
+        }
+      }
       MORI_UMBP_INFO("[MetadataStore] backend=redis namespace={} seeds={} block_shards={} (cluster)",
                      cfg.namespace_id, cfg.cluster_seeds.size(), cfg.block_shards);
     } else if (cfg.shard_uris.size() > 1) {

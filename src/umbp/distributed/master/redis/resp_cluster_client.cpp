@@ -58,37 +58,44 @@ void ParseSeed(const std::string& uri, std::string* host, int* port) {
   }
 }
 
-}  // namespace
-
-RespClusterClient::RespClusterClient(Options options) : options_(std::move(options)) {
-  if (options_.seeds.empty()) {
-    throw RespError("RespClusterClient: no cluster seeds configured");
-  }
-  if (options_.pool_size == 0) options_.pool_size = 1;
-
+// Connect to the cluster by trying each seed until one lets redis-plus-plus
+// fetch the topology (its RedisCluster ctor runs CLUSTER SLOTS and throws if the
+// seed is down). Shared by the client ctor and DiscoverMasterCount.
+std::unique_ptr<sw::redis::RedisCluster> ConnectCluster(const RespClusterClient::Options& o) {
+  if (o.seeds.empty()) throw RespError("RespClusterClient: no cluster seeds configured");
   sw::redis::ConnectionPoolOptions pool_opts;
-  pool_opts.size = options_.pool_size;
-
-  // Try each seed until one lets us discover the cluster topology (RedisCluster's
-  // constructor fetches CLUSTER SLOTS from the seed and throws if it is down).
+  pool_opts.size = o.pool_size == 0 ? 1 : o.pool_size;
   std::string last_err;
-  for (const auto& seed : options_.seeds) {
+  for (const auto& seed : o.seeds) {
     sw::redis::ConnectionOptions co;
     ParseSeed(seed, &co.host, &co.port);
-    if (!options_.password.empty()) co.password = options_.password;
-    co.connect_timeout = std::chrono::milliseconds(options_.connect_timeout_ms);
-    co.socket_timeout = std::chrono::milliseconds(options_.socket_timeout_ms);
+    if (!o.password.empty()) co.password = o.password;
+    co.connect_timeout = std::chrono::milliseconds(o.connect_timeout_ms);
+    co.socket_timeout = std::chrono::milliseconds(o.socket_timeout_ms);
     try {
-      cluster_ = std::make_unique<sw::redis::RedisCluster>(co, pool_opts);
-      break;
+      return std::make_unique<sw::redis::RedisCluster>(co, pool_opts);
     } catch (const sw::redis::Error& e) {
       last_err = e.what();
       MORI_UMBP_WARN("[RedisCluster] seed {} unreachable, trying next: {}", seed, e.what());
     }
   }
-  if (!cluster_) {
-    throw RespError("RespClusterClient: no reachable cluster seed (last error: " + last_err + ")");
-  }
+  throw RespError("RespClusterClient: no reachable cluster seed (last error: " + last_err + ")");
+}
+
+}  // namespace
+
+std::size_t RespClusterClient::DiscoverMasterCount(const Options& options) {
+  auto cluster = ConnectCluster(options);
+  // for_each iterates one pool per master (the slot-serving nodes), so counting
+  // the callbacks yields the master count.
+  std::size_t masters = 0;
+  cluster->for_each([&masters](sw::redis::Redis&) { ++masters; });
+  return masters;
+}
+
+RespClusterClient::RespClusterClient(Options options) : options_(std::move(options)) {
+  if (options_.pool_size == 0) options_.pool_size = 1;
+  cluster_ = ConnectCluster(options_);
 
   // Workers to fan a multi-slot EvalPipeline out concurrently (one round trip
   // per node instead of N sequential). Each task is an independent
