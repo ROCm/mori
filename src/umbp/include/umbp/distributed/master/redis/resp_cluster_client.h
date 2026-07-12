@@ -40,7 +40,9 @@
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "umbp/distributed/master/redis/resp_value.h"
@@ -77,9 +79,9 @@ class RespClusterClient : public IRespClient {
   // server error), throws RespError on a transport/redirection failure.
   RespValue Command(const std::vector<std::string>& args) override;
 
-  // EVAL routed by keys[0]'s slot (we send the script body — no per-node EVALSHA
-  // cache to keep across failover/resharding; Redis caches by SHA server-side
-  // anyway). keys must be non-empty.
+  // EVALSHA routed by keys[0]'s slot, with a transparent SCRIPT LOAD + NOSCRIPT
+  // retry (a newly-promoted replica or resharded node may not have the script
+  // cached). keys must be non-empty. The SHA is loaded once and cached.
   RespValue Eval(const std::string& script, const std::vector<std::string>& keys,
                  const std::vector<std::string>& args) override;
 
@@ -99,9 +101,21 @@ class RespClusterClient : public IRespClient {
   // errors become an Error RespValue; transport failures throw RespError.
   RespValue RunArgvRouted(const std::vector<std::string>& argv, const std::string& routing_key);
 
+  // EVALSHA of `script` routed by keys[0], reloading the script on the target
+  // node and retrying once on NOSCRIPT. keys must be non-empty.
+  RespValue EvalShaRouted(const std::string& script, const std::vector<std::string>& keys,
+                          const std::vector<std::string>& args);
+
+  // SHA1 of `script`, obtained via SCRIPT LOAD once and cached (the digest is
+  // content-addressed, so it is the same on every node).
+  std::string GetOrLoadSha(const std::string& script);
+
   Options options_;
   std::unique_ptr<sw::redis::RedisCluster> cluster_;
   std::unique_ptr<ThreadPool> pool_;
+
+  std::mutex sha_mu_;
+  std::unordered_map<std::string, std::string> sha_cache_;  // script body -> sha1
 };
 
 }  // namespace mori::umbp::redis

@@ -136,6 +136,47 @@ RespValue RespClusterClient::RunArgvRouted(const std::vector<std::string>& argv,
   }
 }
 
+std::string RespClusterClient::GetOrLoadSha(const std::string& script) {
+  {
+    std::lock_guard<std::mutex> lk(sha_mu_);
+    auto it = sha_cache_.find(script);
+    if (it != sha_cache_.end()) return it->second;
+  }
+  // SCRIPT LOAD on any node returns the content-addressed SHA (same everywhere).
+  RespValue r = RunArgvRouted({"SCRIPT", "LOAD", script}, "sha");
+  if (r.type != RespValue::Type::String) {
+    throw RespError("RespClusterClient: SCRIPT LOAD did not return a sha: " + r.str);
+  }
+  {
+    std::lock_guard<std::mutex> lk(sha_mu_);
+    sha_cache_[script] = r.str;
+  }
+  return r.str;
+}
+
+RespValue RespClusterClient::EvalShaRouted(const std::string& script,
+                                           const std::vector<std::string>& keys,
+                                           const std::vector<std::string>& args) {
+  const std::string sha = GetOrLoadSha(script);
+  std::vector<std::string> argv;
+  argv.reserve(3 + keys.size() + args.size());
+  argv.push_back("EVALSHA");
+  argv.push_back(sha);
+  argv.push_back(std::to_string(keys.size()));
+  for (const auto& k : keys) argv.push_back(k);
+  for (const auto& a : args) argv.push_back(a);
+
+  RespValue r = RunArgvRouted(argv, keys.front());
+  if (r.is_error() && r.str.rfind("NOSCRIPT", 0) == 0) {
+    // The node serving this slot doesn't have the script cached (e.g. a promoted
+    // replica or a resharded node). Load it there (routed by the same key) and
+    // retry once. EVALSHA has no side effects until it runs, so this is safe.
+    RunArgvRouted({"SCRIPT", "LOAD", script}, keys.front());
+    r = RunArgvRouted(argv, keys.front());
+  }
+  return r;
+}
+
 RespValue RespClusterClient::Command(const std::vector<std::string>& args) {
   if (args.empty()) throw RespError("RespClusterClient::Command: empty argv");
   // Store commands put the key at args[1] (HGETALL/HGET/SCARD <key> ...); fall
@@ -149,14 +190,7 @@ RespValue RespClusterClient::Eval(const std::string& script, const std::vector<s
   if (keys.empty()) {
     throw RespError("RespClusterClient::Eval: a routing key (KEYS[1]) is required in cluster mode");
   }
-  std::vector<std::string> argv;
-  argv.reserve(3 + keys.size() + args.size());
-  argv.push_back("EVAL");
-  argv.push_back(script);
-  argv.push_back(std::to_string(keys.size()));
-  for (const auto& k : keys) argv.push_back(k);
-  for (const auto& a : args) argv.push_back(a);
-  return RunArgvRouted(argv, keys.front());
+  return EvalShaRouted(script, keys, args);
 }
 
 std::vector<RespValue> RespClusterClient::EvalPipeline(
@@ -176,15 +210,8 @@ std::vector<RespValue> RespClusterClient::EvalPipeline(
       replies[i] = std::move(v);
       return;
     }
-    std::vector<std::string> argv;
-    argv.reserve(3 + keys.size() + shared_args.size());
-    argv.push_back("EVAL");
-    argv.push_back(script);
-    argv.push_back(std::to_string(keys.size()));
-    for (const auto& k : keys) argv.push_back(k);
-    for (const auto& a : shared_args) argv.push_back(a);
     try {
-      replies[i] = RunArgvRouted(argv, keys.front());
+      replies[i] = EvalShaRouted(script, keys, shared_args);
     } catch (const std::exception& e) {
       // Keep parallel-to-input: a failed group becomes an Error value the caller
       // can inspect (mirrors the hiredis EvalPipeline's per-call replies).
