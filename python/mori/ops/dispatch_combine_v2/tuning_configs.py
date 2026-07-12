@@ -163,26 +163,30 @@ _GFX1250_SCHED_BF16_T6 = (
     (None, 192, 32, 192, 16),  # >4096 (peak): disp 360 / comb 141 GB/s
 )
 # EP8 (world_size=8) measured 2026-07-12 on gfx1250 CROSS-NODE (2 nodes x 4 GPUs
-# over the UALink fabric), bf16, same 2-pass block x warp sweep. dispatch peaks at
-# block 128 warp 32 for >=512 (128/32 >= 192/32 here); combine wants 128/8 at 512
-# then 128/16 for bandwidth-bound large tok. Measured GB/s (disp/comb): 8=5/4
-# 64=36/17 512=160/63 2048=197/120 4096=200/151 8192=200/173. Cross-node fabric
-# caps disp ~200 (vs intra-node xGMI ~335); geometry is world_size-independent so
-# this also serves single-node EP8.
+# over the UALink fabric), bf16, full 2-pass block x warp sweep (tok 8..8192).
+# dispatch warp ramps 8->16->32 (block 128 near-optimal throughout, 192 only
+# marginally higher at 512); combine wants small block/warp early (64/4..64/16)
+# then block 128 warp 16 for bandwidth-bound large tok. Cross-node fabric caps
+# disp ~200 GB/s (vs intra-node xGMI ~335); geometry is world_size-independent so
+# this also serves single-node EP8. Measured GB/s (disp/comb): 8=5/4 64=36/17
+# 128=74/28 256=128/42 512=164/63 1024=189/96 2048=197/120 4096=200/151 8192=200/173.
 _GFX1250_SCHED_BF16_EP8 = (
-    (64, 128, 8, 64, 8),  # <=64:  latency-bound
-    (512, 128, 32, 128, 8),  # <=512: disp warp 32 peak; comb block 128 warp 8
-    (None, 128, 32, 128, 16),  # >512 (peak): disp ~200 / comb ~173 GB/s
+    (64, 128, 8, 64, 8),  # <=64:   latency-bound
+    (128, 128, 8, 64, 4),  # <=128
+    (256, 128, 16, 64, 8),  # <=256:  disp warp 16
+    (512, 128, 32, 128, 8),  # <=512:  disp warp 32; comb block 128
+    (1024, 128, 32, 64, 16),  # <=1024: comb warp 16
+    (None, 128, 32, 128, 16),  # >1024 (peak): disp ~200 / comb ~173 GB/s
 )
 # bf16-tuned (EP4 + EP8). fp8/fp4 fall back to the bf16 schedule until separately tuned.
 _GFX1250_TABLE = {
     (4, 7168, 8): {"bf16": _GFX1250_SCHED_BF16},
     (4, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_T6},  # DeepSeek-V4-Pro
     (8, 7168, 8): {"bf16": _GFX1250_SCHED_BF16_EP8},  # cross-node / single-node EP8
-    # V4-Pro topk=6 EP8 cross-node (measured 2026-07-12): geometry is topk-
-    # independent (tracks token count) — optimum matches topk=8, so reuse it.
-    # Measured GB/s (disp/comb): 8=4/3 64=32/16 512=163/56 2048=199/113
-    # 4096=200/145 8192=206/171.
+    # V4-Pro topk=6 EP8 cross-node (measured 2026-07-12, full tok 8..8192 sweep):
+    # geometry is topk-independent (tracks token count) — per-size optimum matches
+    # topk=8, so reuse the same schedule. Measured GB/s (disp/comb): 8=4/3 64=32/16
+    # 128=65/25 256=119/39 512=163/56 1024=178/81 2048=199/113 4096=200/145 8192=206/171.
     (8, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_EP8},
 }
 
