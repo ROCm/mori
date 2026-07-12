@@ -162,10 +162,23 @@ _GFX1250_SCHED_BF16_T6 = (
     (4096, 192, 32, 128, 16),  # <=4096: comb block 128 (bandwidth)
     (None, 192, 32, 192, 16),  # >4096 (peak): disp 360 / comb 141 GB/s
 )
-# bf16-tuned (EP4). fp8/fp4 fall back to the bf16 schedule until separately tuned.
+# EP8 (world_size=8) measured 2026-07-12 on gfx1250 CROSS-NODE (2 nodes x 4 GPUs
+# over the UALink fabric), bf16, same 2-pass block x warp sweep. dispatch peaks at
+# block 128 warp 32 for >=512 (128/32 >= 192/32 here); combine wants 128/8 at 512
+# then 128/16 for bandwidth-bound large tok. Measured GB/s (disp/comb): 8=5/4
+# 64=36/17 512=160/63 2048=197/120 4096=200/151 8192=200/173. Cross-node fabric
+# caps disp ~200 (vs intra-node xGMI ~335); geometry is world_size-independent so
+# this also serves single-node EP8.
+_GFX1250_SCHED_BF16_EP8 = (
+    (64, 128, 8, 64, 8),  # <=64:  latency-bound
+    (512, 128, 32, 128, 8),  # <=512: disp warp 32 peak; comb block 128 warp 8
+    (None, 128, 32, 128, 16),  # >512 (peak): disp ~200 / comb ~173 GB/s
+)
+# bf16-tuned (EP4 + EP8). fp8/fp4 fall back to the bf16 schedule until separately tuned.
 _GFX1250_TABLE = {
     (4, 7168, 8): {"bf16": _GFX1250_SCHED_BF16},
     (4, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_T6},  # DeepSeek-V4-Pro
+    (8, 7168, 8): {"bf16": _GFX1250_SCHED_BF16_EP8},  # cross-node / single-node EP8
 }
 
 _DEVICES = {
