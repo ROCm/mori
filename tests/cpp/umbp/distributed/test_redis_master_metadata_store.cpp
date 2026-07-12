@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "mori/metrics/prometheus_metrics_server.hpp"
+#include "umbp/distributed/master/redis/cluster_slots.h"
 #include "umbp/distributed/master/redis/key_schema.h"
 #include "umbp/distributed/master/redis/resp_client.h"
 #include "umbp/distributed/master/redis/resp_cluster_client.h"
@@ -98,6 +99,52 @@ TEST(KeySchemaTest, ShardsAreReasonablySpread) {
 }
 
 // =====================================================================
+// ClusterSlots — pure unit tests for the CRC16 / hash-tag slot math used to
+// place one block-shard tag per master (balanced placement). Reference slot
+// values verified against `redis-cli CLUSTER KEYSLOT`.
+// =====================================================================
+
+TEST(ClusterSlotsTest, MatchesRedisKeyslot) {
+  EXPECT_EQ(redis::SlotOfKey("foo"), 12182);
+  EXPECT_EQ(redis::SlotOfKey("bar"), 5061);
+  // 0x31C3 — the canonical CRC16/XMODEM check value for "123456789".
+  EXPECT_EQ(redis::SlotOfKey("123456789"), 12739);
+  EXPECT_EQ(redis::SlotOfKey("{umbp:default:b0}"), 14816);
+}
+
+TEST(ClusterSlotsTest, HonorsHashTag) {
+  // Only the {...} body is hashed, so a block key routes by its shard tag.
+  EXPECT_EQ(redis::SlotOfKey("{foo}bar"), redis::SlotOfKey("foo"));
+  EXPECT_EQ(redis::SlotOfKey("prefix{foo}suffix"), redis::SlotOfKey("foo"));
+  EXPECT_EQ(redis::SlotOfKey("{umbp:default:b0}:block:k/5"),
+            redis::SlotOfKey("{umbp:default:b0}"));
+  // Empty braces are not a tag: the whole key is hashed.
+  EXPECT_EQ(redis::SlotOfKey("{}foo"), 9500);
+  EXPECT_NE(redis::SlotOfKey("{}foo"), redis::SlotOfKey("foo"));
+}
+
+TEST(ClusterSlotsTest, FindTagLandsInRanges) {
+  const std::vector<redis::SlotRange> ranges = {{5000, 5500}, {10000, 10200}};
+  std::string tag;
+  ASSERT_TRUE(redis::FindTagForRanges("ns", ranges, &tag));
+  EXPECT_TRUE(redis::SlotInRanges(redis::SlotOfKey(tag), ranges));
+  EXPECT_EQ(tag.rfind("{umbp:ns:b", 0), 0u);  // expected tag shape
+}
+
+TEST(ClusterSlotsTest, FindTagPerDisjointRangeIsDistinct) {
+  // Model "one tag per master": two disjoint ranges must yield two tags, each
+  // in its own range (so different masters get different, correctly-placed tags).
+  const std::vector<redis::SlotRange> a = {{0, 5460}};
+  const std::vector<redis::SlotRange> b = {{10923, 16383}};
+  std::string ta, tb;
+  ASSERT_TRUE(redis::FindTagForRanges("ns", a, &ta));
+  ASSERT_TRUE(redis::FindTagForRanges("ns", b, &tb));
+  EXPECT_NE(ta, tb);
+  EXPECT_TRUE(redis::SlotInRanges(redis::SlotOfKey(ta), a));
+  EXPECT_TRUE(redis::SlotInRanges(redis::SlotOfKey(tb), b));
+}
+
+// =====================================================================
 // Store tests — parameterized over block_shards, require a live RESP store.
 // =====================================================================
 
@@ -141,6 +188,8 @@ struct StoreMode {
   std::size_t endpoints;     // >1 => multi-endpoint mode (block_shards ignored)
   const char* name;
   bool cluster = false;      // true => Redis Cluster mode (needs UMBP_REDIS_CLUSTER_SEEDS)
+  bool balanced = false;     // cluster only: compute one balanced tag per master
+                             // (exercises the factory's balanced-placement path)
 };
 
 class RedisStoreTest : public ::testing::TestWithParam<StoreMode> {
@@ -167,7 +216,27 @@ class RedisStoreTest : public ::testing::TestWithParam<StoreMode> {
       if (!probe_->Ping()) GTEST_SKIP() << "Redis Cluster not reachable; skipping";
       cfg.cluster = true;
       cfg.cluster_seeds = seeds;
-      cfg.block_shards = m.block_shards;
+      if (m.balanced) {
+        // Balanced placement: same computation the factory does — one tag per
+        // master, each on a slot that master owns.
+        std::vector<std::vector<redis::SlotRange>> ranges;
+        try {
+          ranges = redis::RespClusterClient::DiscoverMasterSlotRanges(popts);
+        } catch (const std::exception& e) {
+          GTEST_SKIP() << "CLUSTER SLOTS discovery failed (" << e.what() << "); skipping";
+        }
+        for (const auto& node_ranges : ranges) {
+          std::string tag;
+          if (redis::FindTagForRanges(ns_, node_ranges, &tag)) block_tags_.push_back(tag);
+        }
+        if (block_tags_.empty() || block_tags_.size() != ranges.size()) {
+          GTEST_SKIP() << "balanced tag search incomplete; skipping";
+        }
+        cfg.cluster_block_tags = block_tags_;
+        cfg.block_shards = block_tags_.size();
+      } else {
+        cfg.block_shards = m.block_shards;
+      }
     } else {
       redis::RespClient::Options opts;
       opts.uri = RedisUri();
@@ -207,9 +276,11 @@ class RedisStoreTest : public ::testing::TestWithParam<StoreMode> {
 
   // Raw HGET of a block-hash meta field via the probe client, so tests can
   // assert lease/access bookkeeping the store API does not expose. Returns -1
-  // when the field (or the whole block key) is absent.
+  // when the field (or the whole block key) is absent. Uses the balanced tags
+  // when the store was built with them, else the formulaic schema.
   long long MetaField(const std::string& user_key, const std::string& field) const {
-    redis::KeySchema schema(ns_, NumShards());
+    redis::KeySchema schema = block_tags_.empty() ? redis::KeySchema(ns_, NumShards())
+                                                  : redis::KeySchema(ns_, block_tags_);
     redis::RespValue r = probe_->Command({"HGET", schema.Block(user_key), field});
     if (r.type != redis::RespValue::Type::String) return -1;
     try {
@@ -220,6 +291,9 @@ class RedisStoreTest : public ::testing::TestWithParam<StoreMode> {
   }
 
   std::string ns_;
+  // Non-empty only in cluster-balanced mode: the per-master tags the store was
+  // built with, so MetaField reconstructs the same block keys.
+  std::vector<std::string> block_tags_;
   std::unique_ptr<redis::IRespClient> probe_;
   std::unique_ptr<RedisMasterMetadataStore> store_;
   std::chrono::system_clock::time_point now_;
@@ -231,7 +305,10 @@ INSTANTIATE_TEST_SUITE_P(
                       StoreMode{1, 3, "endpoints3"},
                       // Redis Cluster: 16 block-shard tags spread across nodes by
                       // slot. Skips unless UMBP_REDIS_CLUSTER_SEEDS is set.
-                      StoreMode{16, 1, "cluster", true}),
+                      StoreMode{16, 1, "cluster", true},
+                      // Redis Cluster with balanced placement: one tag per master
+                      // (the factory's default path). block_shards is derived.
+                      StoreMode{0, 1, "clusterbalanced", true, true}),
     [](const ::testing::TestParamInfo<StoreMode>& info) { return std::string(info.param.name); });
 
 TEST_P(RedisStoreTest, RegisterMakesClientAlive) {
