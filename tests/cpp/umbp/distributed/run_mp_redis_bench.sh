@@ -42,6 +42,10 @@ PARSE="${SCRIPT_DIR}/parse_master_hist.py"
 
 BACKEND="${BACKEND:-redis}"
 REDIS_URI="${REDIS_URI:-tcp://127.0.0.1:6379}"
+# Redis deployment: REDIS_CLUSTER=1 => cluster (REDIS_URI is the comma seed list);
+# SHARD_URIS set => multi-endpoint (one instance per block shard); else single.
+REDIS_CLUSTER="${REDIS_CLUSTER:-0}"
+SHARD_URIS="${SHARD_URIS:-}"
 PROCS="${PROCS:-8}"; CLIENTS="${CLIENTS:-2}"
 ROUNDS="${ROUNDS:-300}"; WARMUP="${WARMUP:-20}"; BATCH="${BATCH:-32}"
 GAP="${GAP:-0}"; GETMODE="${GETMODE:-both}"; KEYSPACE="${KEYSPACE:-4096}"
@@ -63,9 +67,18 @@ echo "=== ${LABEL}: total_clients=$((PROCS*CLIENTS)) backend=${BACKEND} redis=${
 pkill -f "umbp_master 0.0.0.0:${PORT}" 2>/dev/null; sleep 1
 ENV="UMBP_METADATA_BACKEND=${BACKEND}"
 if [[ "$BACKEND" == "redis" ]]; then
-  "$REDIS_CLI" -h "$RHOST" -p "$RPORT" FLUSHALL   >/dev/null 2>&1 || { echo "ERROR: cannot reach redis $REDIS_URI"; exit 2; }
-  "$REDIS_CLI" -h "$RHOST" -p "$RPORT" CONFIG RESETSTAT >/dev/null 2>&1
-  ENV="${ENV} UMBP_REDIS_URI=${REDIS_URI} UMBP_REDIS_NAMESPACE=mp_${LABEL}_$(date +%s) UMBP_REDIS_POOL_SIZE=${UMBP_REDIS_POOL_SIZE:-32} UMBP_REDIS_CONNECT_TIMEOUT_MS=1000 UMBP_REDIS_SOCKET_TIMEOUT_MS=1000"
+  REDIS_EXTRA="UMBP_REDIS_NAMESPACE=mp_${LABEL}_$(date +%s) UMBP_REDIS_POOL_SIZE=${UMBP_REDIS_POOL_SIZE:-32} UMBP_REDIS_CONNECT_TIMEOUT_MS=1000 UMBP_REDIS_SOCKET_TIMEOUT_MS=1000"
+  if [[ "$REDIS_CLUSTER" == "1" ]]; then
+    # Cluster: unique namespace isolates runs, so no cluster-wide FLUSHALL needed.
+    "$REDIS_CLI" -h "$RHOST" -p "$RPORT" ping >/dev/null 2>&1 || { echo "ERROR: cannot reach cluster seed $RHOST:$RPORT"; exit 2; }
+    ENV="${ENV} UMBP_REDIS_CLUSTER=1 UMBP_REDIS_URI=${REDIS_URI} ${REDIS_EXTRA}"
+  elif [[ -n "$SHARD_URIS" ]]; then
+    ENV="${ENV} UMBP_REDIS_SHARD_URIS=${SHARD_URIS} ${REDIS_EXTRA}"
+  else
+    "$REDIS_CLI" -h "$RHOST" -p "$RPORT" FLUSHALL   >/dev/null 2>&1 || { echo "ERROR: cannot reach redis $REDIS_URI"; exit 2; }
+    "$REDIS_CLI" -h "$RHOST" -p "$RPORT" CONFIG RESETSTAT >/dev/null 2>&1
+    ENV="${ENV} UMBP_REDIS_URI=${REDIS_URI} ${REDIS_EXTRA}"
+  fi
 fi
 env $ENV UMBP_ROUTE_PUT_NODE_AFFINITY=local "$MASTER_BIN" "0.0.0.0:${PORT}" "$METRICS" > "${OUT}/master_${LABEL}.log" 2>&1 &
 MPID=$!
