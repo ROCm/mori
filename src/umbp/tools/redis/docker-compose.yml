@@ -53,11 +53,15 @@ services:
     restart: unless-stopped
     ulimits:
       memlock: -1
-    # allow-undeclared-keys: single-node Lua scripts derive same-slot auxiliary
-    # keys from the shared hash tag instead of passing every one via KEYS[].
+    # NO global --default_lua_flags: it would force EVERY Lua script (incl. the
+    # read hot path) into Dragonfly's global-transaction mode (store-wide lock),
+    # serializing all proactor threads and erasing the block-sharding win. The
+    # write/control scripts instead carry a first-line "--!df flags=..." directive
+    # (a plain Lua comment on Redis), and the read scripts declare all keys via
+    # KEYS[], so route_get_batch/exists_batch run per-shard in parallel. See
+    # src/umbp/include/umbp/distributed/master/redis/lua_scripts.h.
     command:
-      ["dragonfly", "--port", "6380",
-       "--default_lua_flags=allow-undeclared-keys", "--logtostderr"]
+      ["dragonfly", "--port", "6380", "--logtostderr"]
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "6380", "ping"]
       interval: 2s

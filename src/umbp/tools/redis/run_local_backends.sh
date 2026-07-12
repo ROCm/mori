@@ -128,13 +128,13 @@ up() {
   if [[ -x "${DF_BIN}" ]]; then
     if ! "${REDIS_CLI}" -p "${DF_PORT}" ping >/dev/null 2>&1; then
       echo "[run_local_backends] starting dragonfly on ${DF_PORT}"
-      # allow-undeclared-keys: our Lua scripts derive auxiliary same-slot keys
-      # (nodes:alive, block:*, ...) from the shared hash tag rather than passing
-      # every one via KEYS[]. Redis single-node permits this; Dragonfly enforces
-      # declared keys unless told otherwise. One deployment flag keeps a single
-      # script implementation portable across both.
+      # NO global --default_lua_flags: it forces every Lua script (incl. the read
+      # hot path) into Dragonfly's global-transaction mode (store-wide lock),
+      # serializing all proactor threads and erasing the block-sharding win. The
+      # write/control scripts carry a per-script "--!df flags=allow-undeclared-keys"
+      # directive (a no-op Lua comment on Redis) while the read scripts declare
+      # all keys via KEYS[], so they run per-shard in parallel. See lua_scripts.h.
       "${DF_BIN}" --port "${DF_PORT}" --logtostderr --alsologtostderr=false \
-        --default_lua_flags=allow-undeclared-keys \
         --dir "${RUN_DIR}" >"${RUN_DIR}/dragonfly.log" 2>&1 &
       echo $! >"${RUN_DIR}/dragonfly.pid"
       sleep 1

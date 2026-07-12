@@ -25,6 +25,23 @@
 // the deployment hash tag (passed as ARGV[1]) so it stays single-slot and
 // cross-key atomic on Redis Cluster / Dragonfly / Valkey too.
 //
+// Dragonfly multithreading (per-script "--!df" flag, NOT the global launch flag):
+//   Dragonfly parallelizes scripts across proactor threads ONLY when a script
+//   declares every key it touches (lock-ahead mode: each shard's script runs on
+//   its slot's thread, concurrently with others). A script that reaches keys not
+//   in KEYS[] must run as a GLOBAL transaction, which takes a store-wide lock and
+//   serializes ALL shards — so launching Dragonfly with
+//   `--default_lua_flags=allow-undeclared-keys` forces EVERY script (including the
+//   read hot path) global and kills the sharding win.
+//   Fix: the two read hot-path scripts (route_get_batch / exists_batch) already
+//   pass every key via KEYS[], so they need no flag and run per-shard in parallel.
+//   The write/control scripts below DO derive auxiliary same-slot keys from the
+//   hash tag, so each carries a first-line "--!df flags=allow-undeclared-keys"
+//   directive that lets Dragonfly run just that script global. Redis treats the
+//   line as a plain Lua comment (it only honours a "#!" shebang), so this is a
+//   no-op there and the single-node / Cluster behaviour is byte-for-byte
+//   unchanged. Deploy Dragonfly WITHOUT the global flag to get the parallelism.
+//
 // Determinism: scripts never read the server clock or randomkey; every
 // timestamp is passed in by the caller as epoch-milliseconds (hazard #7 in
 // master_metadata_store.h), so they are replication-safe.
@@ -41,7 +58,7 @@ namespace mori::umbp::redis {
 //   KEYS[1] = node key
 //   ARGV = [tag, node_id, now_ms, stale_after_ms, addr, peer, caps, engine, tags]
 //   Returns 1 if registered/revived, 0 if rejected (ALIVE and not stale).
-inline constexpr const char* kRegisterClientLua = R"LUA(
+inline constexpr const char* kRegisterClientLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
 local nodeId = ARGV[2]
@@ -74,7 +91,7 @@ return 1
 //   node's reverse-index set stores these full block keys as members.
 //   Returns { status_string, acked_seq_string }
 //   status_string in { "UNKNOWN", "SEQ_GAP", "APPLIED" }.
-inline constexpr const char* kApplyHeartbeatLua = R"LUA(
+inline constexpr const char* kApplyHeartbeatLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
 local nodeId = ARGV[2]
@@ -247,7 +264,7 @@ return out
 //   ARGV = [tag]
 //   Returns an array; each element is { node_id, flat_hgetall_of_node_hash }
 //   for every ALIVE node.
-inline constexpr const char* kListAliveLua = R"LUA(
+inline constexpr const char* kListAliveLua = R"LUA(--!df flags=allow-undeclared-keys
 local tag = ARGV[1]
 local members = redis.call('SMEMBERS', tag .. ':nodes:alive')
 local out = {}
@@ -265,7 +282,7 @@ return out
 //   KEYS[1] = node key
 //   ARGV = [tag, node_id]
 //   Returns 1 if the client existed, 0 otherwise.
-inline constexpr const char* kUnregisterClientLua = R"LUA(
+inline constexpr const char* kUnregisterClientLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
 local nodeId = ARGV[2]
@@ -297,7 +314,7 @@ return 1
 //   ARGV = [tag, cutoff_ms]
 //   Flips ALIVE->EXPIRED for nodes whose last_hb < cutoff (keeping the row),
 //   drops their block locations + external-kv, and returns the dead node ids.
-inline constexpr const char* kExpireStaleLua = R"LUA(
+inline constexpr const char* kExpireStaleLua = R"LUA(--!df flags=allow-undeclared-keys
 local tag = ARGV[1]
 local cutoff = tonumber(ARGV[2])
 local members = redis.call('SMEMBERS', tag .. ':nodes:alive')
@@ -351,7 +368,7 @@ return dead
 //   ARGV = [tag, node_id, seq, now_ms, is_full_sync, caps_blob]
 //   seq-CAS + record + nodes:alive/alive_peers ONLY (no block work).
 //   Returns { status_string, acked_seq_string } like apply_heartbeat.
-inline constexpr const char* kApplyHeartbeatControlLua = R"LUA(
+inline constexpr const char* kApplyHeartbeatControlLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
 local nodeId = ARGV[2]
@@ -385,7 +402,7 @@ return { 'APPLIED', tostring(seq) }
 //   'l|<node>|'. All block keys passed in ARGV are on this instance/slot.
 //   Idempotent: ADD overwrites, REMOVE of a missing loc is a no-op, full_sync
 //   clears the node's blocks here then replays the ADDs. Returns 'OK'.
-inline constexpr const char* kApplyBlockEventsLua = R"LUA(
+inline constexpr const char* kApplyBlockEventsLua = R"LUA(--!df flags=allow-undeclared-keys
 local revidx = ARGV[1]
 local nodePfx = ARGV[2]
 local full = tonumber(ARGV[3])
@@ -457,7 +474,7 @@ return 'OK'
 //   Drains the (node, shard) reverse index, deletes the node's location fields
 //   from each block, drops now-empty blocks, and deletes the reverse index.
 //   Idempotent. Returns 1.
-inline constexpr const char* kWipeNodeBlocksLua = R"LUA(
+inline constexpr const char* kWipeNodeBlocksLua = R"LUA(--!df flags=allow-undeclared-keys
 local revidx = ARGV[1]
 local nodePfx = ARGV[2]
 local pfxLen = string.len(nodePfx)
@@ -482,7 +499,7 @@ return 1
 //   KEYS[1] = node key; ARGV = [tag, node_id]
 //   Drops the client record + nodes:alive + alive_peers + extkv reverse index.
 //   Block locations are wiped separately per shard. Returns 1 if it existed.
-inline constexpr const char* kUnregisterControlLua = R"LUA(
+inline constexpr const char* kUnregisterControlLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
 local nodeId = ARGV[2]
@@ -499,7 +516,7 @@ return 1
 //   Flips ALIVE->EXPIRED for nodes whose last_hb < cutoff, drops them from
 //   nodes:alive/alive_peers + extkv, and returns the dead node ids. Block
 //   locations are wiped separately per shard by the caller.
-inline constexpr const char* kExpireControlLua = R"LUA(
+inline constexpr const char* kExpireControlLua = R"LUA(--!df flags=allow-undeclared-keys
 local tag = ARGV[1]
 local cutoff = tonumber(ARGV[2])
 local members = redis.call('SMEMBERS', tag .. ':nodes:alive')
