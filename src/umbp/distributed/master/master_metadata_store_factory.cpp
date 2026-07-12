@@ -140,11 +140,14 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
       // Seeds: the UMBP_REDIS_URI comma list (any reachable node bootstraps the
       // rest via CLUSTER SLOTS).
       cfg.cluster_seeds = SplitCsv(GetEnvStr("UMBP_REDIS_URI", "tcp://127.0.0.1:6379"));
-      // Auto-size block shards to ~2x the master count unless the operator set
-      // UMBP_REDIS_BLOCK_SHARDS. ~2x spreads a batch across nodes while keeping
-      // per-batch scripts few (more shards = more per-batch EVALs = lower
-      // throughput; fewer = uneven node load). Falls back to the fixed default
-      // if the cluster is unreachable (the readiness probe then surfaces that).
+      // Balanced placement (unless the operator set UMBP_REDIS_BLOCK_SHARDS):
+      // read CLUSTER SLOTS and put exactly one block-shard tag on each master
+      // (a tag whose CRC16 slot that node owns), so a RouteGet batch spreads
+      // evenly — one EVALSHA per node — instead of piling onto whichever node the
+      // formulaic tags happen to hash to. Measured to lift cluster throughput
+      // from ~single-node to ~85% of multi-endpoint. Falls back to formulaic
+      // shards if discovery / tag search fails (readiness probe surfaces a real
+      // outage).
       if (!bs_explicit) {
         try {
           redis::RespClusterClient::Options opts;
@@ -153,17 +156,30 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
           opts.connect_timeout_ms = cfg.connect_timeout_ms;
           opts.socket_timeout_ms = cfg.socket_timeout_ms;
           opts.pool_size = cfg.pool_size;
-          const std::size_t masters = redis::RespClusterClient::DiscoverMasterCount(opts);
-          if (masters > 0) {
-            const std::size_t auto_shards =
-                std::min<std::size_t>(kMaxBlockShards, std::max<std::size_t>(1, 2 * masters));
-            cfg.block_shards = auto_shards;
-            MORI_UMBP_INFO("[MetadataStore] cluster auto block_shards={} (2x {} masters)",
-                           auto_shards, masters);
+          const auto ranges = redis::RespClusterClient::DiscoverMasterSlotRanges(opts);
+          std::vector<std::string> tags;
+          tags.reserve(ranges.size());
+          for (const auto& node_ranges : ranges) {
+            std::string tag;
+            if (redis::FindTagForRanges(cfg.namespace_id, node_ranges, &tag)) tags.push_back(tag);
+          }
+          if (!tags.empty() && tags.size() == ranges.size()) {
+            cfg.cluster_block_tags = tags;
+            cfg.block_shards = tags.size();  // one balanced tag per master
+            MORI_UMBP_INFO("[MetadataStore] cluster balanced placement: {} tags, one per master",
+                           tags.size());
+          } else {
+            const std::size_t fallback = std::min<std::size_t>(
+                kMaxBlockShards, std::max<std::size_t>(1, 2 * std::max<std::size_t>(1, ranges.size())));
+            cfg.block_shards = fallback;
+            MORI_UMBP_WARN(
+                "[MetadataStore] cluster balanced tag search matched {}/{} masters; "
+                "using formulaic block_shards={}",
+                tags.size(), ranges.size(), fallback);
           }
         } catch (const std::exception& e) {
           MORI_UMBP_WARN(
-              "[MetadataStore] cluster master-count discovery failed ({}); using block_shards={}",
+              "[MetadataStore] cluster topology discovery failed ({}); using block_shards={}",
               e.what(), cfg.block_shards);
         }
       }

@@ -45,6 +45,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "umbp/distributed/master/redis/cluster_slots.h"
 #include "umbp/distributed/master/redis/resp_value.h"
 
 namespace sw::redis {
@@ -79,6 +80,13 @@ class RespClusterClient : public IRespClient {
   // RouteGet batch spreads across nodes without over-splitting into too many
   // per-shard scripts. Throws RespError if no seed is reachable.
   static std::size_t DiscoverMasterCount(const Options& options);
+
+  // Connect and return each master's owned slot ranges (from CLUSTER SLOTS), one
+  // vector per master, ordered by the master's lowest slot (stable across
+  // restarts). Used for balanced placement: pick one block-shard tag whose slot
+  // lands on each master so a RouteGet batch spreads evenly. Throws RespError if
+  // no seed is reachable.
+  static std::vector<std::vector<SlotRange>> DiscoverMasterSlotRanges(const Options& options);
 
   // Single command; routed by the key at args[1] (all store commands put the key
   // there: HGETALL/HGET/SCARD <key> ...). Returns the reply (Error value on a

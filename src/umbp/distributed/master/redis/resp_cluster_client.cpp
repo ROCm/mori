@@ -21,11 +21,14 @@
 // SOFTWARE.
 #include "umbp/distributed/master/redis/resp_cluster_client.h"
 
+#include <hiredis/hiredis.h>
 #include <sw/redis++/redis++.h>
 
 #include <algorithm>
 #include <chrono>
 #include <future>
+#include <numeric>
+#include <unordered_map>
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
@@ -82,6 +85,60 @@ std::unique_ptr<sw::redis::RedisCluster> ConnectCluster(const RespClusterClient:
   throw RespError("RespClusterClient: no reachable cluster seed (last error: " + last_err + ")");
 }
 
+// Parse a CLUSTER SLOTS reply into per-master slot ranges, ordered by each
+// master's lowest slot (stable). Reply shape: array of
+// [start, end, [master_ip, master_port, master_id, ...], [replica...], ...].
+std::vector<std::vector<SlotRange>> ParseClusterSlots(const redisReply* reply) {
+  std::vector<std::vector<SlotRange>> ranges;
+  std::vector<uint16_t> min_slot;
+  std::unordered_map<std::string, std::size_t> master_idx;
+  if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY) return ranges;
+
+  for (std::size_t i = 0; i < reply->elements; ++i) {
+    const redisReply* e = reply->element[i];
+    if (e == nullptr || e->type != REDIS_REPLY_ARRAY || e->elements < 3) continue;
+    if (e->element[0]->type != REDIS_REPLY_INTEGER || e->element[1]->type != REDIS_REPLY_INTEGER) {
+      continue;
+    }
+    const auto start = static_cast<uint16_t>(e->element[0]->integer);
+    const auto end = static_cast<uint16_t>(e->element[1]->integer);
+    const redisReply* m = e->element[2];  // master node descriptor
+    if (m == nullptr || m->type != REDIS_REPLY_ARRAY || m->elements < 2) continue;
+
+    // Key a master by its node id (element[2]) when present, else ip:port.
+    std::string key;
+    if (m->elements >= 3 && m->element[2] != nullptr && m->element[2]->type == REDIS_REPLY_STRING) {
+      key.assign(m->element[2]->str, m->element[2]->len);
+    } else {
+      const std::string ip = (m->element[0]->type == REDIS_REPLY_STRING)
+                                 ? std::string(m->element[0]->str, m->element[0]->len)
+                                 : std::string();
+      const long long port = (m->element[1]->type == REDIS_REPLY_INTEGER) ? m->element[1]->integer : 0;
+      key = ip + ":" + std::to_string(port);
+    }
+
+    auto it = master_idx.find(key);
+    if (it == master_idx.end()) {
+      master_idx.emplace(key, ranges.size());
+      ranges.push_back({SlotRange{start, end}});
+      min_slot.push_back(start);
+    } else {
+      ranges[it->second].push_back(SlotRange{start, end});
+      if (start < min_slot[it->second]) min_slot[it->second] = start;
+    }
+  }
+
+  // Order masters by their lowest slot so the tag assignment is deterministic.
+  std::vector<std::size_t> order(ranges.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(order.begin(), order.end(),
+            [&](std::size_t a, std::size_t b) { return min_slot[a] < min_slot[b]; });
+  std::vector<std::vector<SlotRange>> ordered;
+  ordered.reserve(ranges.size());
+  for (std::size_t o : order) ordered.push_back(std::move(ranges[o]));
+  return ordered;
+}
+
 }  // namespace
 
 std::size_t RespClusterClient::DiscoverMasterCount(const Options& options) {
@@ -91,6 +148,29 @@ std::size_t RespClusterClient::DiscoverMasterCount(const Options& options) {
   std::size_t masters = 0;
   cluster->for_each([&masters](sw::redis::Redis&) { ++masters; });
   return masters;
+}
+
+std::vector<std::vector<SlotRange>> RespClusterClient::DiscoverMasterSlotRanges(
+    const Options& options) {
+  if (options.seeds.empty()) throw RespError("RespClusterClient: no cluster seeds configured");
+  // CLUSTER SLOTS is a node command (no key), so query a plain connection to the
+  // first reachable seed rather than routing through the cluster client.
+  std::string last_err;
+  for (const auto& seed : options.seeds) {
+    try {
+      sw::redis::ConnectionOptions co;
+      ParseSeed(seed, &co.host, &co.port);
+      if (!options.password.empty()) co.password = options.password;
+      co.connect_timeout = std::chrono::milliseconds(options.connect_timeout_ms);
+      co.socket_timeout = std::chrono::milliseconds(options.socket_timeout_ms);
+      sw::redis::Redis r(co);
+      auto reply = r.command("CLUSTER", "SLOTS");
+      return ParseClusterSlots(reply.get());
+    } catch (const sw::redis::Error& e) {
+      last_err = e.what();
+    }
+  }
+  throw RespError("RespClusterClient: CLUSTER SLOTS discovery failed (last error: " + last_err + ")");
 }
 
 RespClusterClient::RespClusterClient(Options options) : options_(std::move(options)) {

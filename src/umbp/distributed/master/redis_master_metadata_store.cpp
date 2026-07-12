@@ -331,8 +331,17 @@ std::size_t RedisMasterMetadataStore::ResolveNumShards(const Config& config) {
   return config.block_shards == 0 ? 1 : config.block_shards;          // single-endpoint knob
 }
 
+redis::KeySchema RedisMasterMetadataStore::BuildKeySchema(const Config& config) {
+  // Cluster balanced placement: use the explicit per-master tags when the
+  // factory supplied them; otherwise fall back to formulaic shard tags.
+  if (config.cluster && !config.cluster_block_tags.empty()) {
+    return redis::KeySchema(config.namespace_id, config.cluster_block_tags);
+  }
+  return redis::KeySchema(config.namespace_id, ResolveNumShards(config));
+}
+
 RedisMasterMetadataStore::RedisMasterMetadataStore(const Config& config)
-    : keys_(config.namespace_id, ResolveNumShards(config)),
+    : keys_(BuildKeySchema(config)),
       mode_(config.cluster            ? Mode::kCluster
             : config.shard_uris.size() > 1 ? Mode::kMulti
                                            : Mode::kSingle) {

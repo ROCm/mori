@@ -79,6 +79,12 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
     // discovered via CLUSTER SLOTS).
     bool cluster = false;
     std::vector<std::string> cluster_seeds;
+    // Cluster balanced placement: explicit block-shard tags (one per master,
+    // each on a distinct node's slot), computed by the factory from CLUSTER
+    // SLOTS. When set (cluster mode), these replace the formulaic {umbp:<ns>:bS}
+    // tags so a RouteGet batch spreads evenly across nodes. Empty => formulaic
+    // tags sized by block_shards.
+    std::vector<std::string> cluster_block_tags;
   };
 
   explicit RedisMasterMetadataStore(const Config& config);
@@ -156,6 +162,10 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
   // How many block shards to build for a config (one per endpoint in
   // multi-endpoint mode, else Config::block_shards).
   static std::size_t ResolveNumShards(const Config& config);
+
+  // Build the KeySchema: explicit per-master tags for cluster balanced placement
+  // (Config::cluster_block_tags), else the formulaic shard tags.
+  static redis::KeySchema BuildKeySchema(const Config& config);
 
   // Deployment topology. kSingle = one instance, one atomic script (legacy).
   // kMulti = one instance per block shard (UMBP_REDIS_SHARD_URIS). kCluster =

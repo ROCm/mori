@@ -74,6 +74,18 @@ class KeySchema {
     }
   }
 
+  // Explicit block-shard tags (Redis Cluster balanced placement): the caller
+  // supplies one tag per master, each chosen so its slot is served by a distinct
+  // node, so a RouteGet batch spreads evenly instead of piling onto whichever
+  // node the formulaic {umbp:<ns>:bS} tags happen to hash to. num_shards is the
+  // number of tags; user keys still distribute across them by StableHash.
+  KeySchema(const std::string& ns, std::vector<std::string> block_tags)
+      : control_tag_("{umbp:" + ns + "}"),
+        num_shards_(block_tags.empty() ? 1 : block_tags.size()),
+        block_tags_(std::move(block_tags)) {
+    if (block_tags_.empty()) block_tags_.push_back(control_tag_);
+  }
+
   std::size_t NumShards() const { return num_shards_; }
 
   // The control-plane hash tag, e.g. "{umbp:default}". Passed to Lua as ARGV[1]
