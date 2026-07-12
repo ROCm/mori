@@ -322,6 +322,23 @@ static bool CcoFabricLenient() {
   return e && atoi(e) != 0;
 }
 
+// Zero a symmetric-window buffer WITHOUT hipMemset. On UALink fabric-exportable
+// pools hipMemset returns hipErrorOutOfMemory (observed on ROCm 7.15), so we
+// initialize via chunked host->device copies from a small zeroed staging buffer
+// (host-only HIP runtime API — mori_cco links hip::host, not device code).
+static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
+  if (bytes == 0) return hipSuccess;
+  const size_t chunk = std::min<size_t>(bytes, 4u << 20);  // 4 MB staging
+  std::vector<char> zeros(chunk, 0);
+  char* dst = static_cast<char*>(ptr);
+  for (size_t off = 0; off < bytes; off += chunk) {
+    size_t n = std::min(chunk, bytes - off);
+    hipError_t e = hipMemcpy(dst + off, zeros.data(), n, hipMemcpyHostToDevice);
+    if (e != hipSuccess) return e;
+  }
+  return hipSuccess;
+}
+
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
                              ccoComm** outComm) {
   auto* comm = new ccoComm();
@@ -1470,7 +1487,9 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
       return -1;
     }
-    HIP_RUNTIME_CHECK(hipMemset(resourceWindowPtr, 0, layout.totalSize));
+    // resourceWindowPtr is fabric-exportable (ccoMemAlloc) — avoid hipMemset,
+    // which returns OOM on UALink fabric pools (ROCm 7.15).
+    HIP_RUNTIME_CHECK(CcoZeroWindowMem(resourceWindowPtr, layout.totalSize));
     if (ccoWindowRegister(comm, resourceWindowPtr, layout.totalSize, &resourceWindow) != 0) {
       MORI_SHMEM_ERROR("ccoDevCommCreate: resource window Register failed");
       (void)ccoMemFree(comm, resourceWindowPtr);
