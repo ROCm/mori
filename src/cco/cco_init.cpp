@@ -22,6 +22,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -191,17 +193,124 @@ static bool CcoCanLsaMapPeer(const ccoComm* comm, int pe) {
 
 static int CcoPeToLsaRank(const ccoComm* comm, int pe) { return pe - comm->myNodeStart; }
 
-// A vPOD is a scale-up fabric domain that may span multiple physical hosts: ranks
-// sharing it can LSA-interconnect (flat VA over the fabric) directly, not just
-// intra-node. Each rank declares its vPOD via MORI_VPOD_ID; ranks with the same
-// value form one LSA team. MORI_CCO_FABRIC_CROSSNODE_LSA=1 is shorthand for
-// "the whole world is one vPOD". Unset on all ranks => group by host (default).
-static int CcoLocalVpodId() {
-  const char* e = getenv("MORI_VPOD_ID");
-  if (e && *e) return atoi(e);
+// ── LSA-team (vPOD) topology detection ───────────────────────────────────────
+// A vPOD is a scale-up fabric domain (AMD UALink) that may span multiple hosts;
+// its GPUs are directly flat-VA (P2P) interconnectable. We mirror RCCL's MNNVL
+// clique model: group ranks by (ppod_id UUID, vpod_id) read from the per-GPU
+// UALink sysfs, gated on the accelerator being ACTIVE/READY. ppod_id (a UUID) is
+// what makes the key globally unique — hive_id collides across hosts.
+//   Precedence: MORI_CCO_FABRIC_DISABLE=1 -> force host-only LSA
+//               MORI_VPOD_ID=<n>          -> explicit override (all-or-none)
+//               MORI_CCO_FABRIC_CROSSNODE_LSA=1 -> whole world is one team
+//               auto                      -> UALink (ppod_id, vpod_id)
+//               else                      -> group by host (default)
+enum CcoLsaMode { CCO_LSA_HOST = 0, CCO_LSA_MANUAL = 1, CCO_LSA_FABRIC = 2 };
+
+struct CcoLsaKey {
+  int mode;                  // CcoLsaMode
+  int vpodId;                // manual value or UALink vpod_id
+  int vpodSize;              // UALink vpod_size (0 if n/a)
+  unsigned char ppodId[16];  // UALink ppod_id UUID (zeros if n/a)
+};
+
+static bool CcoReadSysfsLine(const std::string& path, std::string& out) {
+  FILE* f = fopen(path.c_str(), "r");
+  if (!f) return false;
+  char buf[128] = {0};
+  bool ok = fgets(buf, sizeof(buf), f) != nullptr;
+  fclose(f);
+  if (!ok) return false;
+  out = buf;
+  while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
+    out.pop_back();
+  return true;
+}
+
+// Parse "9217fed9-c6cf-4c9e-9d9c-7110b90917cc" into 16 bytes; false (zeros) if
+// it isn't a well-formed, non-zero UUID.
+static bool CcoParseUuid(const std::string& s, unsigned char out[16]) {
+  memset(out, 0, 16);
+  int b = 0;
+  unsigned hi = 0;
+  bool haveHi = false, any = false;
+  for (char c : s) {
+    if (c == '-') continue;
+    int v;
+    if (c >= '0' && c <= '9')
+      v = c - '0';
+    else if (c >= 'a' && c <= 'f')
+      v = c - 'a' + 10;
+    else if (c >= 'A' && c <= 'F')
+      v = c - 'A' + 10;
+    else
+      return false;
+    if (!haveHi) {
+      hi = v;
+      haveHi = true;
+    } else {
+      if (b >= 16) return false;
+      out[b] = static_cast<unsigned char>((hi << 4) | v);
+      if (out[b]) any = true;
+      b++;
+      haveHi = false;
+    }
+  }
+  return b == 16 && !haveHi && any;
+}
+
+// Read the local GPU's UALink fabric identity from sysfs, mirroring RCCL's
+// alt_rsmi ARSMI_get_fabric_info. True only if the fabric is present and the
+// accelerator is ACTIVE/READY (i.e. usable for cross-node LSA).
+static bool CcoReadFabricKey(int hipDev, CcoLsaKey* key) {
+  char bdf[32] = {0};
+  if (hipDeviceGetPCIBusId(bdf, sizeof(bdf), hipDev) != hipSuccess) return false;
+  for (char* p = bdf; *p; ++p) *p = static_cast<char>(tolower(*p));
+  std::string dir = std::string("/sys/bus/pci/devices/") + bdf + "/ualink";
+
+  std::string link, state, ppod;
+  if (!CcoReadSysfsLine(dir + "/link_type", link)) return false;  // not a UALink GPU
+  if (link != "UALoE" && link != "UALLink") return false;
+  if (!CcoReadSysfsLine(dir + "/accel_state", state)) return false;
+  if (state != "active" && state != "ready") return false;  // not usable yet
+  if (!CcoReadSysfsLine(dir + "/ppod_id", ppod)) return false;
+  if (!CcoParseUuid(ppod, key->ppodId)) return false;  // zero/garbage UUID
+
+  std::string v;
+  key->vpodId = CcoReadSysfsLine(dir + "/vpod_id", v) ? atoi(v.c_str()) : 0;
+  key->vpodSize = CcoReadSysfsLine(dir + "/vpod_size", v) ? atoi(v.c_str()) : 0;
+  key->mode = CCO_LSA_FABRIC;
+  return true;
+}
+
+// Compute this rank's LSA-team key by the precedence above.
+static void CcoComputeLsaKey(int hipDev, CcoLsaKey* key) {
+  memset(key, 0, sizeof(*key));
+  key->mode = CCO_LSA_HOST;
+  const char* dis = getenv("MORI_CCO_FABRIC_DISABLE");
+  if (dis && atoi(dis) != 0) return;  // forced host-only
+  const char* mv = getenv("MORI_VPOD_ID");
+  if (mv && *mv) {
+    key->mode = CCO_LSA_MANUAL;
+    key->vpodId = atoi(mv);
+    return;
+  }
   const char* w = getenv("MORI_CCO_FABRIC_CROSSNODE_LSA");
-  if (w && atoi(w) != 0) return 0;  // whole world = one vPOD
-  return -1;                        // group by host
+  if (w && atoi(w) != 0) {  // whole world = one team
+    key->mode = CCO_LSA_MANUAL;
+    key->vpodId = 0;
+    return;
+  }
+  CcoReadFabricKey(hipDev, key);  // sets FABRIC on success, leaves HOST otherwise
+}
+
+// Two ranks share an LSA team iff their keys match. HOST mode is resolved by the
+// sameHost predicate instead (this returns false for it).
+static bool CcoLsaKeySame(const CcoLsaKey& a, const CcoLsaKey& b) {
+  if (a.mode != b.mode) return false;
+  if (a.mode == CCO_LSA_MANUAL) return a.vpodId == b.vpodId;
+  if (a.mode == CCO_LSA_FABRIC)
+    return a.vpodId == b.vpodId && memcmp(a.ppodId, b.ppodId, sizeof(a.ppodId)) == 0;
+  return false;
 }
 
 // By default a cross-node hipMemSetAccess failure is fatal at register time
@@ -237,39 +346,61 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   comm->ctx = new application::Context(*comm->bootNet);
   comm->defaultNumQpPerPe = comm->ctx->GetNumQpPerPe();
 
+  // Cache the bound device once (used by topology detection below and later by
+  // ccoMemAlloc / ccoWindowRegister). Callers MUST keep the calling thread bound
+  // to this device for any later CCO API on this comm.
+  HIP_RUNTIME_CHECK(hipGetDevice(&comm->hipDev));
+  comm->peerHipDevs.assign(comm->worldSize, comm->hipDev);
+  comm->bootNet->Allgather(&comm->hipDev, comm->peerHipDevs.data(), sizeof(int));
+
   // Step 2.5: detect LSA (Local Symmetric Access) team topology.
   // Membership is a HARDWARE fact — peers whose memory this rank can load/store
   // through a flat VA — captured before transport policy: same host by default,
-  // or the same vPOD (a scale-up fabric domain that may span hosts) when vPOD
-  // grouping is enabled (see CcoLocalVpodId).
+  // or the same vPOD (a scale-up UALink fabric domain that may span hosts) when
+  // fabric/manual grouping applies (see CcoComputeLsaKey).
   //
   // HARD CONTRACT — violations are fatal:
   //   (a) LSA-major contiguous ranks (team peers form a single block)
   //   (b) every rank observes the same lsaSize
   // Both are required by the flat-VA formula `lsaFlatBase + lsaRank * stride`.
 
-  // Resolve vPOD grouping (all-or-none across the job). vpodMode widens the LSA
-  // team from same-host to same-vPOD; lsaSpansHosts records whether the team
-  // actually crosses a host boundary (=> cross-node fabric mapping is required).
-  int myVpodId = CcoLocalVpodId();
-  std::vector<int> allVpodIds(comm->worldSize);
-  comm->bootNet->Allgather(&myVpodId, allVpodIds.data(), sizeof(int));
-  bool anyVpod = false, allVpod = true;
-  for (int v : allVpodIds) {
-    anyVpod |= (v >= 0);
-    allVpod &= (v >= 0);
+  // Each rank computes its LSA-team key (host / manual vPOD / UALink fabric),
+  // then we allgather + decide the job-wide grouping. Manual (MORI_VPOD_ID) is
+  // all-or-none; UALink fabric grouping only kicks in when EVERY rank reports a
+  // ready fabric (else fall back to host LSA + RDMA, like RCCL disabling MNNVL).
+  CcoLsaKey myKey;
+  CcoComputeLsaKey(comm->hipDev, &myKey);
+  std::vector<CcoLsaKey> allKeys(comm->worldSize);
+  comm->bootNet->Allgather(&myKey, allKeys.data(), sizeof(CcoLsaKey));
+
+  int manualCnt = 0, fabricCnt = 0;
+  for (const auto& k : allKeys) {
+    if (k.mode == CCO_LSA_MANUAL) manualCnt++;
+    else if (k.mode == CCO_LSA_FABRIC) fabricCnt++;
   }
-  if (anyVpod && !allVpod) {
-    MORI_SHMEM_ERROR(
-        "ccoCommCreate: MORI_VPOD_ID set on some ranks but not all — vPOD grouping "
-        "must be all-or-none across the job.");
-    delete comm->ctx;
-    comm->bootNet->Finalize();
-    delete comm;
-    *outComm = nullptr;
-    return -1;
+  bool vpodMode;
+  if (manualCnt > 0) {
+    if (manualCnt != comm->worldSize) {
+      MORI_SHMEM_ERROR(
+          "ccoCommCreate: MORI_VPOD_ID set on {}/{} ranks — manual vPOD grouping must "
+          "be all-or-none across the job.",
+          manualCnt, comm->worldSize);
+      delete comm->ctx;
+      comm->bootNet->Finalize();
+      delete comm;
+      *outComm = nullptr;
+      return -1;
+    }
+    vpodMode = true;
+  } else if (fabricCnt == comm->worldSize) {
+    vpodMode = true;  // every rank on a ready UALink fabric
+  } else {
+    vpodMode = false;  // host LSA + RDMA (default / no fabric / mixed readiness)
+    if (fabricCnt > 0)
+      MORI_SHMEM_INFO(
+          "ccoCommCreate: UALink fabric ready on only {}/{} ranks — using host LSA + RDMA",
+          fabricCnt, comm->worldSize);
   }
-  const bool vpodMode = allVpod;
   bool lsaSpansHosts = false;
   {
     int lsaCount = 0;
@@ -278,7 +409,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
     for (int pe = 0; pe < comm->worldSize; pe++) {
       const auto& cap = comm->ctx->GetPeerCapabilities(pe);
       const bool sameHost = (pe == comm->rank) || cap.sameHost;
-      const bool inTeam = vpodMode ? (allVpodIds[pe] == myVpodId) : sameHost;
+      const bool inTeam = vpodMode ? CcoLsaKeySame(allKeys[pe], myKey) : sameHost;
       if (inTeam) {
         if (pe < firstInTeam) firstInTeam = pe;
         if (pe > lastInTeam) lastInTeam = pe;
@@ -323,10 +454,21 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
     comm->myNodeStart = firstInTeam;
     comm->lsaRank = comm->rank - firstInTeam;
 
+    // Sanity: on a UALink fabric the team should match the reported vpod_size
+    // (a mismatch just means a subset of the vPOD was launched — informational).
+    if (myKey.mode == CCO_LSA_FABRIC && myKey.vpodSize > 0 && lsaCount != myKey.vpodSize) {
+      MORI_SHMEM_INFO(
+          "ccoCommCreate: LSA team size {} != UALink vpod_size {} (subset of the vPOD "
+          "launched?)",
+          lsaCount, myKey.vpodSize);
+    }
+
     MORI_SHMEM_INFO(
         "ccoCommCreate: lsa topology rank={} lsaSize={} lsaRank={} lsaStart={} "
-        "vpodMode={} spansHosts={}",
-        comm->rank, comm->lsaSize, comm->lsaRank, comm->myNodeStart, vpodMode, lsaSpansHosts);
+        "mode={} spansHosts={}",
+        comm->rank, comm->lsaSize, comm->lsaRank, comm->myNodeStart,
+        (myKey.mode == CCO_LSA_FABRIC ? "fabric" : (vpodMode ? "manual" : "host")),
+        lsaSpansHosts);
   }
 
   // Step 3: reserve flat VA. Always 4GB-aligned so stride4G = perRankSize >> 32
@@ -338,13 +480,6 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   }
   perRankVmmSize = AlignUp(perRankVmmSize, 1ULL << 32);
   comm->perRankSize = perRankVmmSize;
-
-  // Cache the device once — subsequent API calls (ccoMemAlloc, ccoWindow-
-  // Register) reuse this without re-querying hipGetDevice. Callers MUST keep
-  // the calling thread bound to this device for any later CCO API on this comm.
-  HIP_RUNTIME_CHECK(hipGetDevice(&comm->hipDev));
-  comm->peerHipDevs.assign(comm->worldSize, comm->hipDev);
-  comm->bootNet->Allgather(&comm->hipDev, comm->peerHipDevs.data(), sizeof(int));
 
   // Probe fabric handle support: try to allocate + export with the fabric
   // handle type. If it works, all subsequent allocations use fabric handles
