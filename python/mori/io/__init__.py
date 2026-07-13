@@ -20,6 +20,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 from .engine import *
+from .fabric_allocator import (
+    fabric_torch_allocator,
+    use_fabric_torch_allocator,
+    make_fabric_mem_pool,
+    fabric_mem_pool,
+)
 from mori.cpp import (
     IOEngineConfig,
     StatusCode,
