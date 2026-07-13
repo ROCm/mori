@@ -53,6 +53,7 @@
 namespace {
 using namespace mori::cco;
 using Gda = ccoGda<CCO_GDA_BUILD_PROVIDER>;
+using Sdma = ccoSdma;
 
 inline __device__ const ccoDevComm* AsDevComm(uint64_t h) {
   return reinterpret_cast<const ccoDevComm*>(h);
@@ -94,6 +95,37 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
   ccoWindowDevice* w = AsWindow(window);
   uint64_t stride = static_cast<uint64_t>(w->stride4G) << 32;
   return reinterpret_cast<uint64_t>(w->winBase) + static_cast<uint64_t>(peer) * stride + offset;
+}
+
+// Expose SDMA C API
+#define CCO_DEF_SDMA_XFER(OP, TAG, COOP)                                               \
+  CCO_DEV void cco_sdma_##OP##__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO, \
+                                      uint64_t sW, uint64_t sO, uint64_t n, int qid) { \
+    Sdma sdma{*AsDevComm(dc)};                                                         \
+    sdma.OP<COOP>(peer, AsWindow(dW), dO, AsWindow(sW), sO, n, qid);                   \
+  }
+
+CCO_DEF_SDMA_XFER(put, thread, ccoCoopThread)
+CCO_DEF_SDMA_XFER(put, warp, ccoCoopWarp)
+CCO_DEF_SDMA_XFER(get, thread, ccoCoopThread)
+CCO_DEF_SDMA_XFER(get, warp, ccoCoopWarp)
+
+#undef CCO_DEF_SDMA_XFER
+
+// ── SDMA quiet: cco_sdma_quiet__<coop> (wait for outstanding ops to peer) ──
+#define CCO_DEF_SDMA_QUIET(TAG, COOP)                         \
+  CCO_DEV void cco_sdma_quiet__##TAG(uint64_t dc, int peer) { \
+    Sdma sdma{*AsDevComm(dc)};                                \
+    sdma.quiet<COOP>(peer);                                   \
+  }
+CCO_DEF_SDMA_QUIET(thread, ccoCoopThread)
+CCO_DEF_SDMA_QUIET(warp, ccoCoopWarp)
+#undef CCO_DEF_SDMA_QUIET
+
+// quiet a single (peer, queueId) queue only.
+CCO_DEV void cco_sdma_quiet_queue(uint64_t dc, int peer, int qid) {
+  Sdma sdma{*AsDevComm(dc)};
+  sdma.quietQueue(peer, qid);
 }
 
 // ── ccoDevComm field accessors ──
