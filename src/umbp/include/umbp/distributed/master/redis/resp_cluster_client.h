@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "umbp/distributed/master/redis/cluster_slots.h"
+#include "umbp/distributed/master/redis/resp_detail.h"
 #include "umbp/distributed/master/redis/resp_value.h"
 
 namespace sw::redis {
@@ -128,11 +129,8 @@ class RespClusterClient : public IRespClient {
   // no metrics. Set once at startup.
   mori::metrics::MetricsServer* metrics_ = nullptr;
 
-  std::mutex sha_mu_;
-  // Keyed by the script object's ADDRESS, not its text (see resp_client.h and the
-  // pointer-identity contract in lua_scripts.h): avoids rehashing ~1.5KB of Lua
-  // under sha_mu_ on every routed EVALSHA.
-  std::unordered_map<const void*, std::string> sha_cache_;  // &script -> sha1
+  // EVALSHA SHA cache, keyed by script identity (see ScriptCache / lua_scripts.h).
+  ScriptCache script_cache_;
 };
 
 }  // namespace mori::umbp::redis

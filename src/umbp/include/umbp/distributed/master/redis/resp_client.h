@@ -49,6 +49,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "umbp/distributed/master/redis/resp_detail.h"
 #include "umbp/distributed/master/redis/resp_value.h"
 
 // Forward-declare the hiredis context so this header stays library-agnostic to
@@ -175,13 +176,9 @@ class RespClient : public IRespClient {
   // Optional cold-path metrics sink; null = no metrics. Set once at startup.
   mori::metrics::MetricsServer* metrics_ = nullptr;
 
-  std::mutex sha_mu_;
-  // Keyed by the script object's ADDRESS, not its text: every Lua script is a
-  // single `inline const std::string` (lua_scripts.h), so `&script` is stable and
-  // unique per script. This keeps the read hot path from rehashing/comparing
-  // ~1.5KB of Lua under sha_mu_ on every EVALSHA. See lua_scripts.h for the
-  // pointer-identity contract (never pass a freshly-constructed std::string).
-  std::unordered_map<const void*, std::string> sha_cache_;  // &script -> sha1
+  // EVALSHA SHA cache, keyed by script identity (see ScriptCache / lua_scripts.h
+  // for the pointer-identity contract: never pass a freshly-constructed string).
+  ScriptCache script_cache_;
 };
 
 }  // namespace mori::umbp::redis

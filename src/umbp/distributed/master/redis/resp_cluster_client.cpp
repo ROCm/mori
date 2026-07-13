@@ -201,12 +201,7 @@ RespValue RespClusterClient::RunArgvRouted(const std::vector<std::string>& argv,
   auto sender = [&argv](sw::redis::Connection& conn, const sw::redis::StringView&) {
     std::vector<const char*> ptrs;
     std::vector<std::size_t> lens;
-    ptrs.reserve(argv.size());
-    lens.reserve(argv.size());
-    for (const auto& a : argv) {
-      ptrs.push_back(a.data());
-      lens.push_back(a.size());
-    }
+    ToArgv(argv, ptrs, lens);
     conn.send(static_cast<int>(ptrs.size()), ptrs.data(), lens.data());
   };
 
@@ -233,35 +228,21 @@ RespValue RespClusterClient::RunArgvRouted(const std::vector<std::string>& argv,
 }
 
 std::string RespClusterClient::GetOrLoadSha(const std::string& script) {
-  const void* key = static_cast<const void*>(&script);
-  {
-    std::lock_guard<std::mutex> lk(sha_mu_);
-    auto it = sha_cache_.find(key);
-    if (it != sha_cache_.end()) return it->second;
-  }
-  // SCRIPT LOAD on any node returns the content-addressed SHA (same everywhere).
-  RespValue r = RunArgvRouted({"SCRIPT", "LOAD", script}, "sha");
-  if (r.type != RespValue::Type::String) {
-    throw RespError("RespClusterClient: SCRIPT LOAD did not return a sha: " + r.str);
-  }
-  {
-    std::lock_guard<std::mutex> lk(sha_mu_);
-    sha_cache_[key] = r.str;
-  }
-  return r.str;
+  return script_cache_.GetOrLoad(script, [&](const std::string& s) {
+    // SCRIPT LOAD on any node returns the content-addressed SHA (same everywhere).
+    RespValue r = RunArgvRouted({"SCRIPT", "LOAD", s}, "sha");
+    if (r.type != RespValue::Type::String) {
+      throw RespError("RespClusterClient: SCRIPT LOAD did not return a sha: " + r.str);
+    }
+    return r.str;
+  });
 }
 
 RespValue RespClusterClient::EvalShaRouted(const std::string& script,
                                            const std::vector<std::string>& keys,
                                            const std::vector<std::string>& args) {
   const std::string sha = GetOrLoadSha(script);
-  std::vector<std::string> argv;
-  argv.reserve(3 + keys.size() + args.size());
-  argv.push_back("EVALSHA");
-  argv.push_back(sha);
-  argv.push_back(std::to_string(keys.size()));
-  for (const auto& k : keys) argv.push_back(k);
-  for (const auto& a : args) argv.push_back(a);
+  std::vector<std::string> argv = BuildEvalshaArgv(sha, keys, args);
 
   RespValue r = RunArgvRouted(argv, keys.front());
   if (r.is_error() && r.str.rfind("NOSCRIPT", 0) == 0) {

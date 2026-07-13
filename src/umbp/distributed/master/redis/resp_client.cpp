@@ -232,12 +232,7 @@ RespValue RespClient::RunArgv(redisContext* ctx, const std::vector<std::string>&
                               bool* broke) {
   std::vector<const char*> argv;
   std::vector<size_t> argvlen;
-  argv.reserve(args.size());
-  argvlen.reserve(args.size());
-  for (const auto& a : args) {
-    argv.push_back(a.data());
-    argvlen.push_back(a.size());
-  }
+  ToArgv(args, argv, argvlen);
   auto* reply = static_cast<redisReply*>(
       redisCommandArgv(ctx, static_cast<int>(argv.size()), argv.data(), argvlen.data()));
   if (reply == nullptr) {
@@ -283,12 +278,7 @@ std::vector<RespValue> RespClient::Pipeline(const std::vector<std::vector<std::s
   for (const auto& cmd : commands) {
     std::vector<const char*> argv;
     std::vector<size_t> argvlen;
-    argv.reserve(cmd.size());
-    argvlen.reserve(cmd.size());
-    for (const auto& a : cmd) {
-      argv.push_back(a.data());
-      argvlen.push_back(a.size());
-    }
+    ToArgv(cmd, argv, argvlen);
     if (redisAppendCommandArgv(ctx, static_cast<int>(argv.size()), argv.data(), argvlen.data()) !=
         REDIS_OK) {
       lease.MarkBroken();
@@ -309,21 +299,13 @@ std::vector<RespValue> RespClient::Pipeline(const std::vector<std::vector<std::s
 }
 
 std::string RespClient::GetOrLoadSha(redisContext* ctx, const std::string& script, bool* broke) {
-  const void* key = static_cast<const void*>(&script);
-  {
-    std::lock_guard<std::mutex> lk(sha_mu_);
-    auto it = sha_cache_.find(key);
-    if (it != sha_cache_.end()) return it->second;
-  }
-  RespValue r = RunArgv(ctx, {"SCRIPT", "LOAD", script}, broke);
-  if (r.type != RespValue::Type::String) {
-    throw RespError("RespClient: SCRIPT LOAD did not return a sha: " + r.str);
-  }
-  {
-    std::lock_guard<std::mutex> lk(sha_mu_);
-    sha_cache_[key] = r.str;
-  }
-  return r.str;
+  return script_cache_.GetOrLoad(script, [&](const std::string& s) {
+    RespValue r = RunArgv(ctx, {"SCRIPT", "LOAD", s}, broke);
+    if (r.type != RespValue::Type::String) {
+      throw RespError("RespClient: SCRIPT LOAD did not return a sha: " + r.str);
+    }
+    return r.str;
+  });
 }
 
 RespValue RespClient::Eval(const std::string& script, const std::vector<std::string>& keys,
@@ -333,25 +315,14 @@ RespValue RespClient::Eval(const std::string& script, const std::vector<std::str
   bool broke = false;
   try {
     const std::string sha = GetOrLoadSha(ctx, script, &broke);
-
-    std::vector<std::string> cmd;
-    cmd.reserve(3 + keys.size() + args.size());
-    cmd.push_back("EVALSHA");
-    cmd.push_back(sha);
-    cmd.push_back(std::to_string(keys.size()));
-    for (const auto& k : keys) cmd.push_back(k);
-    for (const auto& a : args) cmd.push_back(a);
+    std::vector<std::string> cmd = BuildEvalshaArgv(sha, keys, args);
 
     RespValue r = RunArgv(ctx, cmd, &broke);
     if (r.is_error() && r.str.rfind("NOSCRIPT", 0) == 0) {
       // Script evicted from the server cache; reload and retry once.
       CountNoscriptReload();
-      {
-        std::lock_guard<std::mutex> lk(sha_mu_);
-        sha_cache_.erase(static_cast<const void*>(&script));
-      }
-      const std::string sha2 = GetOrLoadSha(ctx, script, &broke);
-      cmd[1] = sha2;
+      script_cache_.Invalidate(script);
+      cmd[1] = GetOrLoadSha(ctx, script, &broke);
       r = RunArgv(ctx, cmd, &broke);
     }
     return r;
@@ -368,23 +339,10 @@ std::vector<std::size_t> RespClient::PipelineEvalshaBatch(
     std::vector<RespValue>* replies, bool* broke) {
   // Queue one EVALSHA <sha> <nkeys> <keys...> <shared_args...> per index.
   for (const std::size_t idx : indices) {
-    const auto& keys = keys_per_call[idx];
-    std::vector<std::string> cmd;
-    cmd.reserve(3 + keys.size() + shared_args.size());
-    cmd.push_back("EVALSHA");
-    cmd.push_back(sha);
-    cmd.push_back(std::to_string(keys.size()));
-    for (const auto& k : keys) cmd.push_back(k);
-    for (const auto& a : shared_args) cmd.push_back(a);
-
+    std::vector<std::string> cmd = BuildEvalshaArgv(sha, keys_per_call[idx], shared_args);
     std::vector<const char*> argv;
     std::vector<size_t> argvlen;
-    argv.reserve(cmd.size());
-    argvlen.reserve(cmd.size());
-    for (const auto& a : cmd) {
-      argv.push_back(a.data());
-      argvlen.push_back(a.size());
-    }
+    ToArgv(cmd, argv, argvlen);
     if (redisAppendCommandArgv(ctx, static_cast<int>(argv.size()), argv.data(), argvlen.data()) !=
         REDIS_OK) {
       *broke = true;
@@ -433,10 +391,7 @@ std::vector<RespValue> RespClient::EvalPipeline(
     // route_get_batch, already bumped lease/access) are not run a second time.
     if (!missing.empty()) {
       CountNoscriptReload();
-      {
-        std::lock_guard<std::mutex> lk(sha_mu_);
-        sha_cache_.erase(static_cast<const void*>(&script));
-      }
+      script_cache_.Invalidate(script);
       const std::string sha2 = GetOrLoadSha(ctx, script, &broke);
       PipelineEvalshaBatch(ctx, sha2, keys_per_call, shared_args, missing, &replies, &broke);
     }
