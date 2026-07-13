@@ -19,19 +19,22 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from .engine import *
-from mori.cpp import (
-    IOEngineConfig,
-    StatusCode,
-    BackendType,
-    EngineDesc,
-    MemoryDesc,
-    MemoryLocationType,
-    PollCqMode,
-    RdmaBackendConfig,
-    XgmiBackendConfig,
-    FabricBackendConfig,
-    fabric_alloc,
-    fabric_free,
-    set_log_level,
-)
+"""JIT compilation for the Fabric backend contiguous copy kernel.
+
+Compiles src/io/kernels/fabric_copy.hip via hipcc --genco on first use.
+The resulting .hsaco is loaded by C++ FabricBackend via hipModuleLoad.
+"""
+
+from __future__ import annotations
+
+_hsaco_path: str | None = None
+
+
+def ensure_fabric_copy_kernel() -> str:
+    """JIT compile the fabric copy kernel and return the .hsaco path."""
+    global _hsaco_path
+    if _hsaco_path is None:
+        from mori.jit.core import compile_genco
+
+        _hsaco_path = compile_genco("fabric_copy", source_dir="src/io/kernels")
+    return _hsaco_path

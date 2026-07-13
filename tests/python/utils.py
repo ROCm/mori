@@ -99,12 +99,22 @@ class TorchDistContext:
         torch.cuda.set_device(self.device_id)
         device = torch.device("cuda", self.device_id)
 
-        dist.init_process_group(
-            backend=self.backend,
-            rank=self.rank,
-            world_size=self.world_size,
-            device_id=device,
-        )
+        try:
+            dist.init_process_group(
+                backend=self.backend,
+                rank=self.rank,
+                world_size=self.world_size,
+                device_id=device,
+            )
+        except (ValueError, RuntimeError):
+            # Some torch/ROCm builds report 0 "accelerators" and reject the
+            # device_id even though HIP devices exist. device_id is only a hint
+            # for accelerator backends; the gloo OOB path does not need it.
+            dist.init_process_group(
+                backend=self.backend,
+                rank=self.rank,
+                world_size=self.world_size,
+            )
 
         world_group = torch.distributed.group.WORLD
         assert world_group is not None

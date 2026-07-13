@@ -95,11 +95,15 @@ class IOEngine:
                 config = mori_cpp.RdmaBackendConfig()
             elif type is mori_cpp.BackendType.XGMI:
                 config = mori_cpp.XgmiBackendConfig()
+            elif type is mori_cpp.BackendType.FABRIC:
+                config = mori_cpp.FabricBackendConfig()
             else:
                 raise NotImplementedError("backend not implemented yet")
         result = self._engine.CreateBackend(type, config)
         if type is mori_cpp.BackendType.XGMI:
             self._load_scatter_gather_kernel()
+        elif type is mori_cpp.BackendType.FABRIC:
+            self._load_fabric_copy_kernel()
         return result
 
     def _load_scatter_gather_kernel(self):
@@ -108,6 +112,15 @@ class IOEngine:
 
             hsaco_path = ensure_scatter_gather_kernel()
             self._engine.LoadScatterGatherModule(hsaco_path)
+        except Exception:
+            pass
+
+    def _load_fabric_copy_kernel(self):
+        try:
+            from mori.io.fabric_copy_jit import ensure_fabric_copy_kernel
+
+            hsaco_path = ensure_fabric_copy_kernel()
+            self._engine.LoadFabricCopyModule(hsaco_path)
         except Exception:
             pass
 

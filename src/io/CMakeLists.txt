@@ -6,7 +6,9 @@ set(MORI_IO_SOURCES
     rdma/common.cpp
     rdma/ledger.cpp
     xgmi/backend_impl.cpp
-    xgmi/hip_resource_pool.cpp)
+    xgmi/hip_resource_pool.cpp
+    fabric/backend_impl.cpp
+    fabric/vpod_topology.cpp)
 
 set_source_files_properties(${MORI_IO_SOURCES} PROPERTIES LANGUAGE CXX)
 add_library(mori_io SHARED ${MORI_IO_SOURCES})

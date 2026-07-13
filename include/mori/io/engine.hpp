@@ -109,6 +109,7 @@ class IOEngine {
 
   std::optional<IOEngineSession> CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   void LoadScatterGatherModule(const std::string& hsacoPath);
+  void LoadFabricCopyModule(const std::string& hsacoPath);
 
  private:
   struct RouteCacheKey {

@@ -93,6 +93,10 @@ using MemoryUniqueId = uint32_t;
 
 constexpr size_t kIpcHandleSize = 64;
 
+// Fabric (UALink super-node) shareable handle size. Equals the IPC handle size
+// (hipMemFabricHandle_t is a 64-byte token, same width as hipIpcMemHandle_t).
+constexpr size_t kFabricHandleSize = kIpcHandleSize;
+
 struct MemoryDesc {
   EngineKey engineKey;
   MemoryUniqueId id{0};
@@ -103,6 +107,13 @@ struct MemoryDesc {
   MemoryLocationType loc;
   std::array<char, kIpcHandleSize> ipcHandle{};
   int numaNode{-1};
+  // Fabric backend metadata. Populated by FabricBackend::RegisterMemory when the
+  // GPU allocation is exportable over a scale-up fabric (UALink vPOD). Kept
+  // separate from ipcHandle so XGMI and Fabric backends can register the same
+  // memory without clobbering each other's handle.
+  std::array<char, kFabricHandleSize> fabricHandle{};  // 64B fabric token (empty when N/A)
+  int vpodId{-1};                                      // UALink vPOD id of deviceId (-1 = N/A)
+  std::string vpodPpodId;                              // UALink ppod_id UUID ("" = N/A)
 
   constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
@@ -110,7 +121,8 @@ struct MemoryDesc {
            (loc == rhs.loc) && (numaNode == rhs.numaNode);
   }
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode);
+  MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode,
+                 fabricHandle, vpodId, vpodPpodId);
 };
 
 using TransferUniqueId = uint64_t;
