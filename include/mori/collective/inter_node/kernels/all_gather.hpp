@@ -24,6 +24,20 @@
 namespace mori {
 namespace collective {
 
+// CU-yield backoff for the inter-node RDMA landing spins. The inter leg of the
+// hierarchical AllGather is CU-driven: warp leaders busy-spin on a system-scope
+// atomic landing flag while the cross-node RDMA write (~1.5ms round trip) is in
+// flight. Under a concurrent backward GEMM those spinning wavefronts contend with
+// the GEMM for CU issue slots, so the AllGather cannot hide behind compute. A
+// short s_sleep between polls parks the polling wavefront for ~64*N cycles,
+// handing its SIMD issue quanta back to the co-resident GEMM without changing any
+// memory ordering (the post-loop __threadfence_system still gates visibility, so
+// the result is bit-identical to the pure busy-spin -- this is a timing-only
+// lever). 0 => OFF: the guarded call compiles out, byte-identical baseline.
+// Rebuild to change (device track). Applied only to the long REMOTE-landing spins,
+// never the fast intra-block counter joins.
+constexpr int kHierInterPollSleep = 0;
+
 // Ring AllGather data movement over an arithmetic sub-group of global PEs:
 // ``{peBase, peBase+peStride, ..., peBase+(ringSize-1)*peStride}``. This PE is
 // at position ``ringPos`` within that sub-group. The chunk size is passed
@@ -421,6 +435,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + warpId) <
                  static_cast<uint64_t>(1)) {
             if (++spin > 10000000000LL) __builtin_trap();
+            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
           }
           __threadfence_system();
           core::AtomicStoreSeqCstSystem(chunkReadyFlags + warpId,
@@ -512,6 +527,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
                  static_cast<uint64_t>(1)) {
             if (++spin > 10000000000LL) __builtin_trap();
+            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
           }
           __threadfence_system();
           core::AtomicStoreSeqCstSystem(chunkReadyFlags + p,
@@ -580,6 +596,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
             while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
                    static_cast<uint64_t>(1)) {
               if (++spin > 10000000000LL) __builtin_trap();
+            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
             }
           }
           __threadfence_system();
@@ -740,6 +757,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
             while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + 0) <
                    static_cast<uint64_t>(1)) {
               if (++spin > 10000000000LL) __builtin_trap();
+            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
             }
             __threadfence_system();
             core::AtomicStoreSeqCstSystem(chunkReadyFlags + 0, opGen ? opGen : static_cast<uint64_t>(1)); // GEN-TOKEN T28
@@ -778,6 +796,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                 // that published chunkReadyFlags[p] anyway would allow a stale-read
                 // (R188-R191). Abort loudly instead of silently corrupting bytes.
                 if (++spin > 10000000000LL) __builtin_trap();
+            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
               }
               __threadfence_system();
               core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, opGen ? opGen : static_cast<uint64_t>(1)); // GEN-TOKEN T28
@@ -816,6 +835,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
             while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
                    static_cast<uint64_t>(1)) {
               if (++spin > 10000000000LL) __builtin_trap();
+            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
             }
             __threadfence_system();
             core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, opGen ? opGen : static_cast<uint64_t>(1)); // GEN-TOKEN T28
@@ -837,6 +857,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
             while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
                    static_cast<uint64_t>(1)) {
               if (++spin > 10000000000LL) __builtin_trap();
+            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
             }
           }
           __threadfence_system();
@@ -989,6 +1010,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
                  static_cast<uint64_t>(active)) {
             if (++spin > 10000000000LL) __builtin_trap();
+            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
           }
         }
         __threadfence_system();
