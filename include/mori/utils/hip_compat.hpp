@@ -83,5 +83,4 @@ typedef struct {
 inline hipMemAllocationHandleType hipMemHandleTypeFabricCompat_value() {
   return MORI_MEM_HANDLE_TYPE_FABRIC;
 }
-static const hipMemAllocationHandleType hipMemHandleTypeFabricCompat =
-    MORI_MEM_HANDLE_TYPE_FABRIC;
+static const hipMemAllocationHandleType hipMemHandleTypeFabricCompat = MORI_MEM_HANDLE_TYPE_FABRIC;

@@ -174,13 +174,19 @@ class EpDispatchCombineConfig:
             # dispatch output (disp_out, dispatch dtype) and combine staging
             # (out_tok, combine dtype) are separate buffers. gather/non-quant/
             # non-StdMoE only (the asymmetric path is implemented for gather).
-            if self.combine_mode != "gather" or self.quant_type != "none" or self.enable_std_moe:
+            if (
+                self.combine_mode != "gather"
+                or self.quant_type != "none"
+                or self.enable_std_moe
+            ):
                 raise ValueError(
                     "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
                     "quant_type=none, enable_std_moe=False"
                 )
             if torch.float4_e2m1fn_x2 in (self.dispatch_dtype, self.combine_dtype):
-                raise ValueError("asymmetric dispatch/combine dtype does not support fp4")
+                raise ValueError(
+                    "asymmetric dispatch/combine dtype does not support fp4"
+                )
             if self.combine_token_nbytes % 16 != 0:
                 raise ValueError(
                     f"combine per-token bytes must be 16 B aligned; combine_data_type="
@@ -238,7 +244,11 @@ class EpDispatchCombineConfig:
     @property
     def dispatch_dtype(self):
         """Dispatch transport dtype (== data_type unless dispatch_data_type set)."""
-        return self.dispatch_data_type if self.dispatch_data_type is not None else self.data_type
+        return (
+            self.dispatch_data_type
+            if self.dispatch_data_type is not None
+            else self.data_type
+        )
 
     @property
     def is_fp4(self):
@@ -262,7 +272,11 @@ class EpDispatchCombineConfig:
     @property
     def combine_dtype(self):
         """Combine transport dtype (== data_type unless combine_data_type set)."""
-        return self.combine_data_type if self.combine_data_type is not None else self.data_type
+        return (
+            self.combine_data_type
+            if self.combine_data_type is not None
+            else self.data_type
+        )
 
     @property
     def combine_elem_size(self):
@@ -615,14 +629,22 @@ class EpDispatchCombineOp:
         fp4 packs 2 e2m1 per float4_e2m1fn_x2 element -> last dim is hidden/2."""
         cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
         return from_gpu_ptr(
-            self.arena.local_ptr("disp_out"), (self._recv_cap, cols), self.cfg.dispatch_dtype
+            self.arena.local_ptr("disp_out"),
+            (self._recv_cap, cols),
+            self.cfg.dispatch_dtype,
         )
 
     def combine_in_view(self):
         """out_tok as combine dtype [max_recv, hidden] — combine()'s copy target."""
         cdt = self.cfg.combine_dtype
-        cols = self.cfg.hidden_dim // 2 if cdt == torch.float4_e2m1fn_x2 else self.cfg.hidden_dim
-        return from_gpu_ptr(self.arena.local_ptr("out_tok"), (self._recv_cap, cols), cdt)
+        cols = (
+            self.cfg.hidden_dim // 2
+            if cdt == torch.float4_e2m1fn_x2
+            else self.cfg.hidden_dim
+        )
+        return from_gpu_ptr(
+            self.arena.local_ptr("out_tok"), (self._recv_cap, cols), cdt
+        )
 
     def convert_dispatch_output(self):
         """mori ConvertDispatchOutput: repack recv tokens into per-local-expert

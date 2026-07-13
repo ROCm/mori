@@ -392,8 +392,10 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
 
   int manualCnt = 0, fabricCnt = 0;
   for (const auto& k : allKeys) {
-    if (k.mode == CCO_LSA_MANUAL) manualCnt++;
-    else if (k.mode == CCO_LSA_FABRIC) fabricCnt++;
+    if (k.mode == CCO_LSA_MANUAL)
+      manualCnt++;
+    else if (k.mode == CCO_LSA_FABRIC)
+      fabricCnt++;
   }
   bool vpodMode;
   if (manualCnt > 0) {
@@ -484,8 +486,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
         "ccoCommCreate: lsa topology rank={} lsaSize={} lsaRank={} lsaStart={} "
         "mode={} spansHosts={}",
         comm->rank, comm->lsaSize, comm->lsaRank, comm->myNodeStart,
-        (myKey.mode == CCO_LSA_FABRIC ? "fabric" : (vpodMode ? "manual" : "host")),
-        lsaSpansHosts);
+        (myKey.mode == CCO_LSA_FABRIC ? "fabric" : (vpodMode ? "manual" : "host")), lsaSpansHosts);
   }
 
   // Step 3: reserve flat VA. Always 4GB-aligned so stride4G = perRankSize >> 32
@@ -513,16 +514,15 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
 #endif
 
     size_t probeGranularity = 0;
-    hipError_t probeErr =
-        hipMemGetAllocationGranularity(&probeGranularity, &probeProp,
-                                       hipMemAllocationGranularityRecommended);
+    hipError_t probeErr = hipMemGetAllocationGranularity(&probeGranularity, &probeProp,
+                                                         hipMemAllocationGranularityRecommended);
     if (probeErr == hipSuccess && probeGranularity > 0) {
       hipMemGenericAllocationHandle_t probeHandle = 0;
       probeErr = hipMemCreate(&probeHandle, probeGranularity, &probeProp, 0);
       if (probeErr == hipSuccess) {
         hipMemFabricHandle_compat_t probeFabric;
         probeErr = hipMemExportToShareableHandle(&probeFabric, probeHandle,
-                                                  hipMemHandleTypeFabricCompat, 0);
+                                                 hipMemHandleTypeFabricCompat, 0);
         (void)hipMemRelease(probeHandle);
         if (probeErr == hipSuccess) {
           comm->handleType = static_cast<int>(hipMemHandleTypeFabricCompat);
@@ -732,8 +732,7 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   // Return the reserved slot to the vaManager on any failure after this point.
   auto rollbackSlot = [&]() { (void)comm->vaManager->Free(slotAddr); };
 
-  const bool useFabric =
-      (comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat));
+  const bool useFabric = (comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat));
   hipMemAllocationProp allocProp = {};
   allocProp.type = CcoWindowAllocType();
   allocProp.requestedHandleType = static_cast<hipMemAllocationHandleType>(comm->handleType);
@@ -986,10 +985,9 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
           // Fail loudly at register time rather than leaving a peer VA that
           // faults on first device access. For cross-node this most likely means
           // the fabric is not a scale-up (load/store) domain.
-          MORI_SHMEM_ERROR(
-              "ccoWindowRegister: hipMemSetAccess PE {} failed after retries: {}{}", pe,
-              static_cast<int>(setErr),
-              crossNodePeer ? " (cross-node fabric not load/store-reachable?)" : "");
+          MORI_SHMEM_ERROR("ccoWindowRegister: hipMemSetAccess PE {} failed after retries: {}{}",
+                           pe, static_cast<int>(setErr),
+                           crossNodePeer ? " (cross-node fabric not load/store-reachable?)" : "");
           {
             vmmProcessLock vmmLock;
             (void)hipMemUnmap(peerVa, alignedSize);
@@ -1012,8 +1010,8 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
 
       for (int pe : p2pPeers) {
         hipMemGenericAllocationHandle_t importedHandle;
-        hipError_t err = hipMemImportFromShareableHandle(
-            &importedHandle, &allFabricHandles[pe], hipMemHandleTypeFabricCompat);
+        hipError_t err = hipMemImportFromShareableHandle(&importedHandle, &allFabricHandles[pe],
+                                                         hipMemHandleTypeFabricCompat);
         if (err != hipSuccess) {
           MORI_SHMEM_ERROR("ccoWindowRegister: fabric import from PE {} failed: {}", pe,
                            static_cast<int>(err));
@@ -1177,8 +1175,8 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
 
   char* winBase = static_cast<char*>(comm->flatBase) + slotOffset;
   MORI_SHMEM_INFO(
-      "ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={} fabric={}",
-      rank, (void*)devPtr, (void*)winBase, size, slotOffset, lkey, useFabric);
+      "ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={} fabric={}", rank,
+      (void*)devPtr, (void*)winBase, size, slotOffset, lkey, useFabric);
   for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
     int pe = comm->myNodeStart + lsa;
     void* peerVa = winBase + static_cast<size_t>(lsa) * comm->perRankSize;

@@ -91,7 +91,7 @@ WAVE = _detect_wave_size()
 LANE_MASK = WAVE - 1
 LOG2_WAVE = WAVE.bit_length() - 1
 _BALLOT_INT = T.i64 if WAVE == 64 else T.i32
-_LANE_STRIDE_I32 = WAVE * 4          # one wave of lanes, vec4 (16B) each
+_LANE_STRIDE_I32 = WAVE * 4  # one wave of lanes, vec4 (16B) each
 _MAIN_STRIDE_I32 = 2 * _LANE_STRIDE_I32
 _BUTTERFLY_OFFSETS = tuple(WAVE >> i for i in range(1, LOG2_WAVE + 1))
 
@@ -396,7 +396,9 @@ def make_dispatch(
             my_lsa_rank,
             inp_cur_tok,
         ).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * WAVE, 1, 1], stream=stream
+            grid=(block_num, 1, 1),
+            block=[warp_num_per_block * WAVE, 1, 1],
+            stream=stream,
         )
 
     return run
@@ -451,6 +453,7 @@ def _accum_funcs(hidden_elem_size, fp8_direct_cast=False, fp4=False):
                 return arith.constant_vector(0.0, _V8F32())
 
             return to_accum, from_accum, zero_accum
+
         # NOTE: cvt_scalef32_pk_*_fp4 are gfx950-only (MI350). On gfx942
         # (MI300X) codegen fails "instruction not supported on this GPU".
         # Faithful port of the FlyDSL reference fp4 branch; opt-in (fp4=True).
@@ -764,15 +767,21 @@ def make_combine(
                             for j in range_constexpr(VEC):
                                 acc = _zero_accum()
                                 for k_slot in range_constexpr(experts_per_token):
-                                    elem = vector.extract(vecs[k_slot], static_position=[j])
-                                    v = arith.select(expert_valids[k_slot], elem, arith.constant(0))
+                                    elem = vector.extract(
+                                        vecs[k_slot], static_position=[j]
+                                    )
+                                    v = arith.select(
+                                        expert_valids[k_slot], elem, arith.constant(0)
+                                    )
                                     acc = acc + _to_accum2(v)
                                 buffer_store(
                                     _from_accum2(acc), rsrc_out, out_base + off + j
                                 )
                     for u in range(main_end + lane, eff, WAVE):
                         _one(unit_base + u)
+
             else:
+
                 def _accum_loop():
                     main_end = (eff // STEP) * STEP
                     for u in range(lane, main_end, STEP):
@@ -791,7 +800,9 @@ def make_combine(
                             for k_slot in range_constexpr(experts_per_token):
                                 acc = acc + _to_accum2(vals[k_slot])
                             buffer_store(
-                                _from_accum2(acc), rsrc_out, out_base + off * out_step_mult
+                                _from_accum2(acc),
+                                rsrc_out,
+                                out_base + off * out_step_mult,
                             )
                     for u in range(main_end + lane, eff, WAVE):
                         _one(unit_base + u)
@@ -822,7 +833,9 @@ def make_combine(
             my_lsa_rank,
             cur_rank_num_token,
         ).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * WAVE, 1, 1], stream=stream
+            grid=(block_num, 1, 1),
+            block=[warp_num_per_block * WAVE, 1, 1],
+            stream=stream,
         )
 
     return run
@@ -1263,7 +1276,9 @@ def make_combine_scatter(
             my_lsa_rank,
             cur_rank_num_token,
         ).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * WAVE, 1, 1], stream=stream
+            grid=(block_num, 1, 1),
+            block=[warp_num_per_block * WAVE, 1, 1],
+            stream=stream,
         )
 
     return run
@@ -1398,7 +1413,9 @@ def make_convert_dispatch_output(
             addr_packed_src,
             addr_slot_map,
         ).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * WAVE, 1, 1], stream=stream
+            grid=(block_num, 1, 1),
+            block=[warp_num_per_block * WAVE, 1, 1],
+            stream=stream,
         )
 
     return run
@@ -1514,7 +1531,9 @@ def make_convert_combine_input(
         convert_comb(
             addr_out_tok, addr_out_wts, addr_total_recv, addr_packed_x, addr_slot_map
         ).launch(
-            grid=(block_num, 1, 1), block=[warp_num_per_block * WAVE, 1, 1], stream=stream
+            grid=(block_num, 1, 1),
+            block=[warp_num_per_block * WAVE, 1, 1],
+            stream=stream,
         )
 
     return run

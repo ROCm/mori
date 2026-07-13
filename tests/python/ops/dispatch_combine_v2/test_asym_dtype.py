@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """Asymmetric dtype test: fp8 dispatch + bf16 combine.
 
 Models the fmoe use case where an expert op sits between dispatch and combine and
@@ -25,7 +46,10 @@ _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
 sys.path.insert(0, os.path.join(_ROOT, "python", "mori", "ops", "dispatch_combine_v2"))
 sys.path.insert(0, os.path.join(_ROOT, "examples", "cco", "python"))
 from cco_example_common import set_device, sync  # noqa: E402
-from dispatch_combine_op import EpDispatchCombineConfig, EpDispatchCombineOp  # noqa: E402
+from dispatch_combine_op import (  # noqa: E402
+    EpDispatchCombineConfig,
+    EpDispatchCombineOp,
+)
 from mori.cco import Communicator  # noqa: E402
 
 FP8 = torch.float8_e4m3fn  # gfx1250/gfx950 OCP e4m3
@@ -83,7 +107,9 @@ def main():
     uid = Communicator.get_unique_id() if rank == 0 else None
     uid = d.bcast_uid(uid)
     win_bytes = npes * M * HIDDEN * 2 * 2 + (1 << 24)  # sized for bf16 (the larger)
-    with Communicator.init(npes, rank, uid, per_rank_vmm=2 * win_bytes + (1 << 28)) as comm:
+    with Communicator.init(
+        npes, rank, uid, per_rank_vmm=2 * win_bytes + (1 << 28)
+    ) as comm:
         cfg = EpDispatchCombineConfig(
             rank=rank,
             world_size=npes,
@@ -131,11 +157,13 @@ def main():
             U = np.array(
                 [len({int(idx_c[t, j]) // EPR for j in range(K)}) for t in range(ct)]
             )
-            exp = (
-                torch.from_numpy(U).view(ct, 1).float() * inp[:ct].float().cpu()
-            ).to(torch.bfloat16)
+            exp = (torch.from_numpy(U).view(ct, 1).float() * inp[:ct].float().cpu()).to(
+                torch.bfloat16
+            )
             exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
-            ok_comb = torch.allclose(out.float().cpu(), exp.float(), atol=3e-1, rtol=1e-1)
+            ok_comb = torch.allclose(
+                out.float().cpu(), exp.float(), atol=3e-1, rtol=1e-1
+            )
             ok_w = torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
             # dtype sanity: dispatch recv is fp8, combine out is bf16
             ok_dt = recv_x.dtype == FP8 and out.dtype == torch.bfloat16
