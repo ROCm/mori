@@ -385,6 +385,15 @@ if(USE_REDIS_BACKEND)
   target_compile_features(test_redis_master_metadata_store PRIVATE cxx_std_17)
   gtest_discover_tests(test_redis_master_metadata_store)
 
+  # test_sharded_read — pure unit tests for the block-read fan-out
+  # (redis/sharded_read.h) against a fake IRespClient. No live store needed, so
+  # it always runs (unlike test_redis_master_metadata_store, which skips without
+  # a reachable backend).
+  add_executable(test_sharded_read test_sharded_read.cpp)
+  target_link_libraries(test_sharded_read PRIVATE umbp_common GTest::gtest_main)
+  target_compile_features(test_sharded_read PRIVATE cxx_std_17)
+  gtest_discover_tests(test_sharded_read)
+
   # redis-plus-plus link/build smoke test. Proves the submodule compiles with
   # this toolchain and links (static redis++ + system hiredis) before any store
   # code depends on it; at runtime it connects to UMBP_REDIS_URI if reachable,
