@@ -386,6 +386,29 @@ class MoriAllGather(AllGather):
                 if rpn < 8:
                     _sd("MORI_HIER_DEEP_PIPE", "auto")
                     _sd("MORI_SDMA_NUM_CHANNELS", "8")
+                else:
+                    # rpn >= 8 (world>=16, 8 GPU/node) CORRECTNESS gate (Team A
+                    # Turn 2). At 8 ranks/node the zero-copy param-contiguous
+                    # scatter (enqueue_param_contiguous) produces UNIFORM-garbage
+                    # output (loss stuck at ln(vocab); works at rpn==4/w8), and the
+                    # copy-out __call__'s HIP-graph capture poisons the HIP context
+                    # -> a "Shmem state is not initialized" SIGABRT at the first
+                    # cross-node AG. The reliably bit-exact dense-node base is the
+                    # COPY-OUT path with the full per-op host-drain landing fence:
+                    #   * MORI_FSDP_NO_ZERO_COPY=1 routes off the broken zero-copy
+                    #     scatter to the rank-major copy-out __call__ path;
+                    #   * MORI_HIER_DEBUG_SYNC=1 is the host stream.synchronize()
+                    #     landing fence that drains the cross-PE RDMA/SDMA
+                    #     completions (the only bit-exact fence at 8 ranks/node) AND
+                    #     disables the poison-prone HIP-graph capture (the __call__
+                    #     graph path is gated `and not self._debug_sync`).
+                    #   * MORI_HIER_CUDA_GRAPH=0 belt-and-suspenders (redundant once
+                    #     DEBUG_SYNC is on, but explicit for anyone toggling sync).
+                    # Verified w16 bit-exact (last_loss == native GT) AND > native
+                    # TFLOPS; w8 (rpn==4) never enters this branch -> unchanged.
+                    _sd("MORI_FSDP_NO_ZERO_COPY", "1")
+                    _sd("MORI_HIER_DEBUG_SYNC", "1")
+                    _sd("MORI_HIER_CUDA_GRAPH", "0")
                 # Deferred host landing fence: issue the AG non-blocking and drain
                 # the one reliable host fence at copy-out so it overlaps the
                 # backward GEMM / forward prefetch instead of stalling inline.
