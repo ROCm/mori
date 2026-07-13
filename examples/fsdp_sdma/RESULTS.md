@@ -17,40 +17,51 @@ world=8 (2 nodes x 4 GPU), fp32:
 
 | size | HierAllGather | RCCL | ratio |
 |------|--------------:|-----:|------:|
-| 32MB  | 171.7 | 171.4 | 1.00x |
-| 64MB  | 178.1 | 174.2 | 1.02x |
-| 128MB | 181.8 | 176.4 | 1.03x |
-| 256MB | 186.0 | 176.7 | 1.05x |
-| 512MB | 172.3 | 178.9 | 0.96x |
+| 4MB   |  61.2 | 112.9 | 0.54x |
+| 8MB   | 114.8 | 141.5 | 0.81x |
+| 16MB  | 132.8 | 159.3 | 0.83x |
+| 32MB  | 148.0 | 170.2 | 0.87x |
+| 64MB  | 153.7 | 177.0 | 0.87x |
+| 128MB | 156.0 | 177.4 | 0.88x |
+| 256MB | 171.5 | 175.6 | 0.98x |
+| 512MB | 189.5 | 176.9 | 1.07x |
 
-world=16 (2 nodes x 8 GPU), fp32:
+world=16 (2 nodes x 8 GPU), fp32, `MORI_HIER_CROWN=1`:
 
 | size | HierAllGather | RCCL | ratio |
 |------|--------------:|-----:|------:|
-| 32MB  | 346.1 | 365.9 | 0.95x |
-| 64MB  | 375.9 | 374.4 | 1.00x |
-| 128MB | 390.1 | 379.3 | 1.03x |
-| 256MB | 384.6 | 382.2 | 1.01x |
-| 512MB | 393.3 | 384.3 | 1.02x |
+| 8MB   | 212.4 | 265.6 | 0.80x |
+| 16MB  | 250.6 | 345.4 | 0.73x |
+| 32MB  | 344.3 | 370.2 | 0.93x |
+| 64MB  | 374.6 | 375.1 | 1.00x |
+| 128MB | 390.7 | 379.6 | 1.03x |
+| 256MB | 395.7 | 380.9 | 1.04x |
+| 512MB | 393.1 | 383.2 | 1.03x |
 
-At 32MB and below a fixed per-op cost (one SDMA transaction round-trip per peer)
-dominates and the ratio drops; from 64MB up the path matches or beats RCCL.
-world=16 uses `MORI_HIER_CROWN=1` (the intra-node broadcast schedule that folds
-the self-fill onto a free warp and batches its completion drain).
+At small/mid sizes a fixed per-op SDMA cost (a ~3-launch pipeline ramp per op)
+dominates; the copy engine reaches RCCL's per-NIC bandwidth at large messages
+(w8 512MB 1.07x, w16 ≥64MB parity/above). world=16 uses `MORI_HIER_CROWN=1` — the
+intra-node broadcast schedule that folds the self-fill onto a free warp and
+batches its completion drain. (4MB w16 is a small-buffer case and is omitted.)
+Standalone parity is sufficient; the end-to-end win comes from the dividend below.
 
 ## 2. Bandwidth under a concurrent GEMM (no-CU-contention dividend)
 
 `gemm_overlap.png` — `bench_data/overlap_w8.csv`. world=8, bf16, AllGather timed
-in isolation and again with a CU-saturating GEMM on a side stream.
+in isolation and again with a CU-saturating GEMM on a side stream (the overlap
+regime; sub-32MB is launch-latency-bound and omitted).
 
 | per-rank | RCCL slowdown | HierAllGather slowdown |
 |----------|--------------:|-----------------------:|
-| 34MB | 2.73x | 1.90x |
-| 67MB | 2.52x | 0.96x |
+| 34MB  | 2.96x | 1.67x |
+| 67MB  | 2.26x | 1.79x |
+| 134MB | 1.48x | 1.08x |
+| 268MB | 1.21x | 1.06x |
+| 537MB | 1.11x | 1.02x |
 
-RCCL's copy kernels compete with the GEMM for CUs and lose >2.5x of their
-bandwidth; the SDMA copy engine does not touch CUs, so HierAllGather keeps its
-bandwidth and is faster than RCCL under contention.
+RCCL's copy kernels compete with the GEMM for CUs and lose bandwidth; the SDMA
+copy engine does not touch CUs, so HierAllGather slows far less and is faster than
+RCCL with the GEMM running.
 
 ## 3. End-to-end FSDP2 training (Qwen-7B, seq 2048, 500 steps)
 

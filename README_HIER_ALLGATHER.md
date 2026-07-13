@@ -44,33 +44,42 @@ Full tables, CSVs, and chart scripts are under
 `make_bench_charts.py`); the figures below are regenerated from that data with no
 GPU required.
 
-**Standalone AllGather bandwidth vs RCCL** — world=8 matches/exceeds RCCL at
-≥32 MB; world=16 uses the intra-node crown broadcast schedule
-(`MORI_HIER_CROWN`) to match RCCL at ≥64 MB:
+**Standalone AllGather bandwidth vs RCCL** — full size sweep. world=16 uses the
+intra-node crown broadcast schedule (`MORI_HIER_CROWN`) and reaches parity/above
+RCCL at ≥64 MB; world=8 (4 GPU/node) is bounded by a fixed per-op SDMA cost at
+small/mid sizes and reaches parity at the largest message:
 
 | size | w8 ratio | w16 ratio |
 |-----:|---------:|----------:|
-| 32 MB  | 1.00 | 0.95 |
-| 64 MB  | 1.02 | 1.00 |
-| 128 MB | 1.03 | 1.03 |
-| 256 MB | 1.05 | 1.01 |
-| 512 MB | 0.96 | 1.02 |
+| 4 MB   | 0.54 |  —   |
+| 8 MB   | 0.81 | 0.80 |
+| 16 MB  | 0.83 | 0.73 |
+| 32 MB  | 0.87 | 0.93 |
+| 64 MB  | 0.87 | 1.00 |
+| 128 MB | 0.88 | 1.03 |
+| 256 MB | 0.98 | 1.04 |
+| 512 MB | 1.07 | 1.03 |
 
-Below 32 MB a fixed per-op SDMA round-trip dominates; large-message bandwidth is
-at parity. (w8 numbers are from clean, uncontended nodes and are node-pair
-dependent.)
+The small/mid-size deficit is a fixed per-op SDMA round-trip (a ~3-launch
+pipeline ramp), not a bandwidth gap — the mori copy engine reaches RCCL's per-NIC
+bandwidth at large messages. Standalone bandwidth parity is sufficient because the
+end-to-end win comes from the no-CU-contention dividend below, not from beating
+RCCL on an isolated AllGather.
 
 ![standalone](examples/fsdp_sdma/ut_allgather_bw.png)
 
 **Bandwidth under a concurrent GEMM (no-CU-contention dividend)** — RCCL's copy
-kernels compete with the GEMM for CUs and lose >2.5× of their bandwidth; the SDMA
-copy engine does not touch CUs, so HierAllGather holds bandwidth and is faster
-than RCCL under contention:
+kernels compete with the GEMM for CUs and lose bandwidth; the SDMA copy engine
+does not touch CUs, so HierAllGather slows far less and is faster than RCCL under
+contention (m/r < 1 = mori faster with the GEMM running):
 
 | per-rank | RCCL slowdown | HierAllGather slowdown |
 |---------:|--------------:|-----------------------:|
-| 34 MB | 2.73× | 1.90× |
-| 67 MB | 2.52× | 0.96× |
+| 34 MB  | 2.96× | 1.67× |
+| 67 MB  | 2.26× | 1.79× |
+| 134 MB | 1.48× | 1.08× |
+| 268 MB | 1.21× | 1.06× |
+| 537 MB | 1.11× | 1.02× |
 
 ![gemm overlap](examples/fsdp_sdma/gemm_overlap.png)
 
