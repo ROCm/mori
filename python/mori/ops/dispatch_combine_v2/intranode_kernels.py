@@ -582,6 +582,8 @@ def make_combine(
     n_i32 = hidden_dim // 8 if fp4 else nbytes // 4
     # fp8_direct_cast: output stride is bf16 (2 i32 per fp8 unit) vs input fp8.
     out_n_i32 = (hidden_dim * 2) // 4 if fp8_direct_cast else n_i32
+    # vec4 gather: 4 i32 per load (global_load_dwordx4) when output is 1:1.
+    _use_vec4 = (n_i32 % 4 == 0) and not fp8_direct_cast
     out_step_mult = 2 if fp8_direct_cast else 1
 
     @flyc.kernel(known_block_size=[warp_num_per_block * WAVE, 1, 1])
@@ -731,7 +733,6 @@ def make_combine(
 
             # Nested fn: closure over expert_bases/valids (lists can't be loop-carried).
             def _one(off):  # reduce k contributions for one i32 unit
-                # Load all K experts, then reduce (K-deep MLP per lane).
                 vals = []
                 for k_slot in range_constexpr(experts_per_token):
                     v = P.load_i32_nt(expert_bases[k_slot], off)
@@ -745,32 +746,55 @@ def make_combine(
                     _from_accum2(acc), rsrc_out, out_base + off * out_step_mult
                 )
 
-            def _accum_loop():
-                # _unroll elements/lane per iter; per element load all K experts
-                # then reduce, so a lane keeps K loads in flight (unrolled
-                # r-blocks add more overlap) to hide xGMI read latency.
-                main_end = (eff // STEP) * STEP
-                for u in range(lane, main_end, STEP):
-                    base = unit_base + u
-                    for r in range_constexpr(_unroll):
-                        off = base + r * WAVE
-                        vals = []
-                        for k_slot in range_constexpr(experts_per_token):
-                            v = P.load_i32_nt(expert_bases[k_slot], off)
-                            vals.append(
-                                arith.select(
-                                    expert_valids[k_slot], v, arith.constant(0)
+            if const_expr(_use_vec4):
+                # Vec4 path: load 4 i32 (16B, global_load_dwordx4) per expert
+                # per iteration, reducing xGMI load count 4×.
+                VEC = 4
+                STEP_V4 = _unroll * WAVE * VEC
+
+                def _accum_loop():
+                    main_end = (eff // STEP_V4) * STEP_V4
+                    for u in range(lane * VEC, main_end, STEP_V4):
+                        base = unit_base + u
+                        for r in range_constexpr(_unroll):
+                            off = base + r * WAVE * VEC
+                            vecs = []
+                            for k_slot in range_constexpr(experts_per_token):
+                                vecs.append(P.load_v4i32_nt(expert_bases[k_slot], off))
+                            for j in range_constexpr(VEC):
+                                acc = _zero_accum()
+                                for k_slot in range_constexpr(experts_per_token):
+                                    elem = vector.extract(vecs[k_slot], static_position=[j])
+                                    v = arith.select(expert_valids[k_slot], elem, arith.constant(0))
+                                    acc = acc + _to_accum2(v)
+                                buffer_store(
+                                    _from_accum2(acc), rsrc_out, out_base + off + j
                                 )
+                    for u in range(main_end + lane, eff, WAVE):
+                        _one(unit_base + u)
+            else:
+                def _accum_loop():
+                    main_end = (eff // STEP) * STEP
+                    for u in range(lane, main_end, STEP):
+                        base = unit_base + u
+                        for r in range_constexpr(_unroll):
+                            off = base + r * WAVE
+                            vals = []
+                            for k_slot in range_constexpr(experts_per_token):
+                                v = P.load_i32_nt(expert_bases[k_slot], off)
+                                vals.append(
+                                    arith.select(
+                                        expert_valids[k_slot], v, arith.constant(0)
+                                    )
+                                )
+                            acc = _zero_accum()
+                            for k_slot in range_constexpr(experts_per_token):
+                                acc = acc + _to_accum2(vals[k_slot])
+                            buffer_store(
+                                _from_accum2(acc), rsrc_out, out_base + off * out_step_mult
                             )
-                        acc = _zero_accum()
-                        for k_slot in range_constexpr(experts_per_token):
-                            acc = acc + _to_accum2(vals[k_slot])
-                        buffer_store(
-                            _from_accum2(acc), rsrc_out, out_base + off * out_step_mult
-                        )
-                # tail: leftover elements, one per lane
-                for u in range(main_end + lane, eff, WAVE):
-                    _one(unit_base + u)
+                    for u in range(main_end + lane, eff, WAVE):
+                        _one(unit_base + u)
 
             _accum_loop()
 
