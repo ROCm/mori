@@ -61,6 +61,20 @@ void ParseSeed(const std::string& uri, std::string* host, int* port) {
   }
 }
 
+// Build a redis-plus-plus ConnectionOptions for one seed from our Options
+// (host/port from the seed URI, plus the shared password + timeouts). Shared by
+// ConnectCluster and DiscoverMasterSlotRanges so the seed->options mapping lives
+// in one place.
+sw::redis::ConnectionOptions SeedConnectionOptions(const RespClusterClient::Options& o,
+                                                   const std::string& seed) {
+  sw::redis::ConnectionOptions co;
+  ParseSeed(seed, &co.host, &co.port);
+  if (!o.password.empty()) co.password = o.password;
+  co.connect_timeout = std::chrono::milliseconds(o.connect_timeout_ms);
+  co.socket_timeout = std::chrono::milliseconds(o.socket_timeout_ms);
+  return co;
+}
+
 // Connect to the cluster by trying each seed until one lets redis-plus-plus
 // fetch the topology (its RedisCluster ctor runs CLUSTER SLOTS and throws if the
 // seed is down). Shared by the client ctor and DiscoverMasterCount.
@@ -70,11 +84,7 @@ std::unique_ptr<sw::redis::RedisCluster> ConnectCluster(const RespClusterClient:
   pool_opts.size = o.pool_size == 0 ? 1 : o.pool_size;
   std::string last_err;
   for (const auto& seed : o.seeds) {
-    sw::redis::ConnectionOptions co;
-    ParseSeed(seed, &co.host, &co.port);
-    if (!o.password.empty()) co.password = o.password;
-    co.connect_timeout = std::chrono::milliseconds(o.connect_timeout_ms);
-    co.socket_timeout = std::chrono::milliseconds(o.socket_timeout_ms);
+    sw::redis::ConnectionOptions co = SeedConnectionOptions(o, seed);
     try {
       return std::make_unique<sw::redis::RedisCluster>(co, pool_opts);
     } catch (const sw::redis::Error& e) {
@@ -158,12 +168,7 @@ std::vector<std::vector<SlotRange>> RespClusterClient::DiscoverMasterSlotRanges(
   std::string last_err;
   for (const auto& seed : options.seeds) {
     try {
-      sw::redis::ConnectionOptions co;
-      ParseSeed(seed, &co.host, &co.port);
-      if (!options.password.empty()) co.password = options.password;
-      co.connect_timeout = std::chrono::milliseconds(options.connect_timeout_ms);
-      co.socket_timeout = std::chrono::milliseconds(options.socket_timeout_ms);
-      sw::redis::Redis r(co);
+      sw::redis::Redis r(SeedConnectionOptions(options, seed));
       auto reply = r.command("CLUSTER", "SLOTS");
       return ParseClusterSlots(reply.get());
     } catch (const sw::redis::Error& e) {

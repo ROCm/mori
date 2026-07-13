@@ -82,6 +82,30 @@ std::vector<std::string> SplitCsv(const std::string& s) {
   return out;
 }
 
+#ifdef USE_REDIS_BACKEND
+// Best-effort probe: does the single-endpoint server report itself as Dragonfly?
+// (`INFO server` carries "dragonfly_version" on Dragonfly; Redis/Valkey do not.)
+// Only used to nudge operators to shard the block keyspace so Dragonfly's
+// proactor threads are actually used; any error just returns false (the real
+// readiness probe below surfaces an outage).
+bool ServerLooksLikeDragonfly(const std::string& uri, const std::string& password,
+                              int connect_timeout_ms, int socket_timeout_ms) {
+  try {
+    redis::RespClient::Options o;
+    o.uri = uri;
+    o.password = password;
+    o.connect_timeout_ms = connect_timeout_ms;
+    o.socket_timeout_ms = socket_timeout_ms;
+    o.pool_size = 1;
+    redis::RespClient client(std::move(o));
+    const redis::RespValue r = client.Command({"INFO", "server"});
+    return r.str.find("dragonfly") != std::string::npos;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+#endif
+
 }  // namespace
 
 std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
@@ -189,6 +213,21 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
       MORI_UMBP_INFO("[MetadataStore] backend=redis namespace={} endpoints={} (multi-endpoint)",
                      cfg.namespace_id, cfg.shard_uris.size());
     } else {
+      // Single-endpoint. Dragonfly is multi-threaded, but with the default
+      // block_shards=1 every block key shares one hash tag => one proactor
+      // thread, so the RouteGet hot path does not scale. We do NOT silently bump
+      // the default (block_shards is fixed for a deployment's lifetime — changing
+      // it strands existing block keys), but nudge the operator to set it.
+      if (!bs_explicit && ServerLooksLikeDragonfly(cfg.uri, cfg.password, cfg.connect_timeout_ms,
+                                                   cfg.socket_timeout_ms)) {
+        MORI_UMBP_WARN(
+            "[MetadataStore] Dragonfly at {} with default UMBP_REDIS_BLOCK_SHARDS=1: block reads "
+            "run on a single proactor thread. Set UMBP_REDIS_BLOCK_SHARDS to ~the Dragonfly "
+            "--proactor_threads count (e.g. 8) to parallelize the RouteGet hot path. NOTE: this "
+            "value is fixed for the deployment's lifetime — pick one and keep it (changing it "
+            "strands existing block keys).",
+            cfg.uri);
+      }
       MORI_UMBP_INFO("[MetadataStore] backend=redis uri={} namespace={} block_shards={}", cfg.uri,
                      cfg.namespace_id, cfg.block_shards);
     }
