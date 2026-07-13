@@ -29,11 +29,13 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <unordered_map>
 namespace anvil {
 
 auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int line) {
@@ -123,11 +125,11 @@ void SetUpKFD() {
 }
 
 // void SetUpKFD(uint32_t targetDevice) {
-//     HsaNodeProperties m_node_props;
-//     CHECK_HSAKMT_SUCCESS(hsaKmtGetNodeProperties(targetDevice, &m_node_props), "Failed!");
-//     std::cout << "Num of PCIe SDMA Queues: " << m_node_props.NumSdmaEngines << std::endl;
-//     std::cout << "Num of XGMI SDMA Queues: " << m_node_props.NumSdmaXgmiEngines << std::endl;
-//     std::cout << "Device Id: " << m_node_props.DeviceId << std::endl;
+// HsaNodeProperties m_node_props;
+// CHECK_HSAKMT_SUCCESS(hsaKmtGetNodeProperties(targetDevice, &m_node_props), "Failed!");
+// std::cout << "Num of PCIe SDMA Queues: " << m_node_props.NumSdmaEngines << std::endl;
+// std::cout << "Num of XGMI SDMA Queues: " << m_node_props.NumSdmaXgmiEngines << std::endl;
+// std::cout << "Device Id: " << m_node_props.DeviceId << std::endl;
 // }
 
 void CloseKFD() { (void)hsaKmtCloseKFD(); }
@@ -146,11 +148,49 @@ static const std::string getBusId(int deviceId) {
   return std::string(busIdChar);
 }
 
+// hsa_iterate_agents (SetUp) enumerates ALL physical GPU agents in HSA order,
+// which is NOT filtered by HIP_VISIBLE_DEVICES. The srcDeviceId/deviceId that the
+// collective passes in is a HIP device ORDINAL (indexes only visible devices).
+// When the two diverge (e.g. HIP_VISIBLE_DEVICES=4,5,6,7) indexing gpuAgents_ by
+// the raw HIP ordinal selects the WRONG physical GPU -> the SDMA queue is created
+// on the wrong KFD node while the compute kernel runs on the intended GPU ->
+// "Memory access fault by GPU node-N". Match HIP ordinal -> HSA agent by PCI BDF
+// so the selection is correct in all cases. In the common HIP_VISIBLE_DEVICES=
+// 0..N-1 case this resolves to the identity map (BDF matches at the same index)
+// so the shipped path is behavior-identical.
+static int gpuAgentIndexForHipDevice(int hipDeviceId) {
+  static std::mutex mapMutex;
+  static std::unordered_map<int, int> hipToAgent;
+  std::lock_guard<std::mutex> lock(mapMutex);
+  auto it = hipToAgent.find(hipDeviceId);
+  if (it != hipToAgent.end()) return it->second;
+
+  // BDF of the HIP device, parsed from its "domain:bus:device.function" string.
+  std::string busId = getBusId(hipDeviceId);
+  unsigned domain = 0, bus = 0, dev = 0, func = 0;
+  std::sscanf(busId.c_str(), "%x:%x:%x.%x", &domain, &bus, &dev, &func);
+  uint32_t hipBdf = ((bus & 0xFF) << 8) | ((dev & 0x1F) << 3) | (func & 0x7);
+
+  int match = hipDeviceId;  // safe fallback: identity (also correct when aligned)
+  for (size_t a = 0; a < gpuAgents_.size(); ++a) {
+    uint32_t bdfid = 0;
+    if (hsa_agent_get_info(gpuAgents_[a], (hsa_agent_info_t)HSA_AMD_AGENT_INFO_BDFID, &bdfid) !=
+        HSA_STATUS_SUCCESS)
+      continue;
+    if ((bdfid & 0xFFFF) == (hipBdf & 0xFFFF)) {
+      match = static_cast<int>(a);
+      break;
+    }
+  }
+  hipToAgent[hipDeviceId] = match;
+  return match;
+}
+
 SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAgent,
                      uint32_t engineId)
     : remoteDeviceId_(remoteDeviceId) {
-  // cachedWptr_(detail::gpuCallocUncachedShared<uint64_t>()),
-  // committedWptr_(detail::gpuCallocUncachedShared<uint64_t>()) {
+  // cachedWptr_(detail::gpuCallocUncachedShared<uint64_t>),
+  // committedWptr_(detail::gpuCallocUncachedShared<uint64_t>) {
   int originalDeviceId;
 
   CHECK_HIP_ERROR(hipGetDevice(&originalDeviceId));  // Save the current device
@@ -235,7 +275,7 @@ AnvilLib::~AnvilLib() {
 
 void AnvilLib::init() {
   std::call_once(init_flag, []() {
-    //   std::atexit(CloseKFD); // Register cleanup
+    // std::atexit(CloseKFD); // Register cleanup
 
     // HSA
     hsa_status_t status{hsa_init()};
@@ -263,16 +303,56 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
   // Spread the channels across the engines recommended for this peer link. On
   // MI350 the mask typically reports 2 engines per peer; on platforms with a
   // single recommended engine all channels share it.
+  // DISTINCT-ENGINE-PER-DESTINATION intra-gather engine mapping.
+  // ROOT CAUSE (single-node diag): the flat 8-way local gather fires G-1=7
+  // concurrent outbound SDMA copies per GPU, but each peer's channel-0 queue is
+  // bound to engines[0] = the FIRST bit of the KFD recommended_sdma_engine_id_mask
+  // for that link. If KFD recommends the SAME low engine(s) for every peer of a
+  // source, all 7 copies collapse onto ~2 physical SDMA engines (3.5:1
+  // oversubscribe -> serialize -> the 8-way intra can't saturate while 4-way w8
+  // can). The static mi300xOamMap already encodes a DISTINCT engine per (src,dst)
+  // pair (row 0 = {0,7,6,1,2,4,5,3}, all 8 unique), which would spread the 7 peer
+  // copies across 7 distinct engines = full-mesh XGMI concurrency. MORI_SDMA_ENGINE_OAM=1
+  // forces channel 0 onto that OAM engine, bypassing the possibly-collapsing KFD
+  // mask. Default (unset) => byte-identical shipped mapping.
+  // REFUTATION (w16 fp32, the [SDMAENG] diagnostic below,
+  // control run oam=0): for src=0 the 7 cross-node peers dst=1..7 bind to ch0eng =
+  // {14,2,10,6,12,8,4} -- SEVEN DISTINCT physical SDMA engines, fromKFD=1, nEng=1 each.
+  // KFD does NOT collapse the 7 peer copies onto ~2 engines: the flat 8-way local gather
+  // is ALREADY optimally engine-spread (each peer link on its own recommended engine).
+  // => the engine-collapse root cause is FALSE, ENGINE_OAM is a no-op (KFD mask
+  // already spreads), and the director's mechanistic ARGUMENT FOR the 2x4 rebuild
+  // ("4-way=3 peers fits distinct engines where 8-way's 7 oversubscribe") is disproven
+  // (8-way already has 7 distinct engines). Also retro-explains ENGINE_SPREAD's
+  // 0.701 regression (the KFD 1-engine/link map is optimal; any other engine mis-routes)
+  // and corrects the "2 saturated SDMA engines" inference (it is 7). The flat-8way
+  // gap is NOT engine-count -- it is the inter-node reasm/fill byte volume. Keep OFF.
+  static const int engMode = []() {
+    const char* e = getenv("MORI_SDMA_ENGINE_OAM");
+    return e ? atoi(e) : 0;
+  }();
   std::vector<uint32_t> engines;
+  bool fromKfd = false;
   if (srcDeviceId == dstDeviceId) {
     // A loopback copy never traverses xGMI and has no self io_link, so KFD
     // reports no recommended engine. Use a general (non-xGMI) SDMA engine.
     engines.push_back(0);
+  } else if (engMode != 0) {
+    // Force the distinct-per-destination OAM engine on channel 0 (the flat-gather
+    // queue). Higher channels append the KFD-recommended engines (if any) so the
+    // multi-queue path still has spread; channel 0 is what the local gather drives.
+    int base = getSdmaEngineId(srcDeviceId, dstDeviceId);
+    engines.push_back(static_cast<uint32_t>(base));
+    uint32_t mask = getRecommendedEngineMask(srcDeviceId, dstDeviceId);
+    for (uint32_t b = 0; b < 32; ++b) {
+      if ((mask & (1u << b)) && b != static_cast<uint32_t>(base)) engines.push_back(b);
+    }
   } else {
     uint32_t mask = getRecommendedEngineMask(srcDeviceId, dstDeviceId);
     for (uint32_t b = 0; b < 32; ++b) {
       if (mask & (1u << b)) engines.push_back(b);
     }
+    fromKfd = !engines.empty();
     // Fall back to the static OAM table if KFD did not report a mask.
     if (engines.empty()) {
       int e = getSdmaEngineId(srcDeviceId, dstDeviceId);
@@ -280,19 +360,32 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
     }
   }
   int numEngines = static_cast<int>(engines.size());
+  // One-time-per-connect diagnostic: which physical SDMA engine each peer link's
+  // channel 0 binds to. Reading this across the 7 peers of a source reveals
+  // whether the flat gather spreads across distinct engines or collapses.
+  {
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "[SDMAENG] src=%d dst=%d fromKFD=%d ch0eng=%u nEng=%d oam=%d\n",
+                     srcDeviceId, dstDeviceId, fromKfd ? 1 : 0, engines.empty() ? 999u : engines[0],
+                     numEngines, engMode);
+    (void)n;
+    fputs(buf, stderr);
+  }
 
   auto key = std::make_pair(srcDeviceId, dstDeviceId);
   for (int c = 0; c < numChannels; ++c) {
     uint32_t engineId = engines[c % numEngines];
     sdma_channels_[key].emplace_back(
-        std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
+        std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId,
+                                    gpuAgents_[gpuAgentIndexForHipDevice(srcDeviceId)], engineId));
   }
   return true;
 }
 
 uint32_t AnvilLib::getNodeId(int deviceId) {
   uint32_t nodeId = 0;
-  CHECK_HSA_ERROR(hsa_agent_get_info(gpuAgents_[deviceId], HSA_AGENT_INFO_NODE, &nodeId));
+  CHECK_HSA_ERROR(hsa_agent_get_info(gpuAgents_[gpuAgentIndexForHipDevice(deviceId)],
+                                     HSA_AGENT_INFO_NODE, &nodeId));
   return nodeId;
 }
 

@@ -1,0 +1,5 @@
+config,world,backend,e2e_ratio_vs_native,e2e_ratio_lo,e2e_ratio_hi,last_loss,bit_exact
+2node x 4gpu,8,native baseline,1.000,1.000,1.000,10.411232,1
+2node x 4gpu,8,mori SDMA hier,1.031,1.031,1.091,10.411232,1
+2node x 8gpu,16,native baseline,1.000,1.000,1.000,10.391944,1
+2node x 8gpu,16,mori SDMA hier,1.017,1.017,1.380,10.391944,1

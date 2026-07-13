@@ -457,7 +457,10 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   uint32_t maxQpWr = static_cast<uint32_t>(deviceAttr->orig_attr.max_qp_wr);
   uint32_t maxCqe = static_cast<uint32_t>(deviceAttr->orig_attr.max_cqe);
   uint32_t maxSge = static_cast<uint32_t>(deviceAttr->orig_attr.max_sge);
-  if (is_ionic) maxSge = std::min(maxSge, 2u);
+  if (is_ionic) {
+    maxSge = std::min(maxSge, 2u);
+    maxQpWr = std::min(maxQpWr, 32767u);
+  }
 
   if (config.enableNotification && maxQpWr < config.notifPerQp) {
     MORI_IO_ERROR(
@@ -567,7 +570,8 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
             std::make_shared<std::atomic<int>>(0),
             static_cast<int>(epConfig.maxMsgsNum),
             std::make_shared<std::atomic<bool>>(false),
-            std::make_shared<SubmissionLedger>(config.notifPerQp)};
+            std::make_shared<SubmissionLedger>(config.notifPerQp),
+            std::make_shared<SqAdmissionEvent>()};
   meta.rTable[topoKey].push_back(ep);
 
   EndpointId id = nextEndpointId_.fetch_add(1);
@@ -747,15 +751,19 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
             statusPtr->Update(StatusCode::ERR_RDMA_OP, failureAdvice.ComposeStatusMessage());
             meta->status = nullptr;
           }
-          if (ep.degraded && ep.degraded->load(std::memory_order_relaxed) && ep.ledger) {
+          if (ep.degraded && ep.degraded->load(kSqAdmissionOrder) && ep.ledger) {
             const int orphanedReleased = ep.ledger->ReleaseOrphanedByRecovery(ep.sqDepth.get());
-            ep.degraded->store(false, std::memory_order_relaxed);
+            ep.degraded->store(false, kSqAdmissionOrder);
             MORI_IO_WARN(
                 "ProcessOneCqe: recovered degraded EP eid={} qpn={} by releasing {} orphaned WRs",
                 rt->id, ep.local.handle.qpn, orphanedReleased);
           }
+          NotifySqStateChanged(ep);
         } else if (IsNotifSendWrId(wc[i].wr_id)) {
-          if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
+          if (ep.sqDepth) {
+            ep.sqDepth->fetch_sub(1, kSqAdmissionOrder);
+            NotifySqStateChanged(ep);
+          }
           if (!isFlush) {
             MORI_IO_WARN(
                 "ProcessOneCqe: failed notification SEND CQE, transfer_id={}, released 1 sqDepth",
@@ -821,7 +829,10 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
               "releasing 1 sqDepth under current SEND invariant",
               wc[i].wr_id);
         }
-        if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
+        if (ep.sqDepth) {
+          ep.sqDepth->fetch_sub(1, kSqAdmissionOrder);
+          NotifySqStateChanged(ep);
+        }
       } else {
         // Batch path: wr_id carries a recordId from the SubmissionLedger.
         uint64_t recordId = wc[i].wr_id;
@@ -830,6 +841,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
                         ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &mergedBatchSize)
                         : nullptr;
         if (meta) {
+          NotifySqStateChanged(ep);
           uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
           TransferStatus* statusPtr = meta->status;
           if (statusPtr != nullptr && (finishedBefore + mergedBatchSize) == meta->totalBatchSize) {

@@ -102,6 +102,10 @@ void ShmemBarrierOnStream(hipStream_t stream);
 // funnel). Falls back to the funnel barrier if the loaded module lacks the
 // dissem kernel.
 void ShmemBarrierOnStreamDissem(hipStream_t stream);
+// hierarchical 2-level variant of ShmemBarrierOnStream (same global all-PE
+// semantics; crosses the RDMA node boundary only via per-node coordinators).
+// Falls back to the funnel barrier if the loaded module lacks the hier kernel.
+void ShmemBarrierOnStreamHier(hipStream_t stream, int ranksPerNode);
 
 enum ShmemTeamType {
   INVALID = -1,

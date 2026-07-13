@@ -367,6 +367,9 @@ void RegisterMoriCcl(pybind11::module_& m) {
             return self.finish_stream_no_copy(reinterpret_cast<hipStream_t>(stream));
           },
           py::arg("stream"))
+      .def(
+          "parity_counter_ptr",
+          [](InterNodeRing& self) -> uintptr_t { return self.parity_counter_ptr(); })
       .def("npes", &InterNodeRing::npes)
       .def("num_blocks", &InterNodeRing::num_blocks);
 
@@ -439,14 +442,14 @@ void RegisterMoriCcl(pybind11::module_& m) {
           "prepare_sync_direct",
           [](IntraSubGroup& self, uintptr_t input, size_t count, int64_t stream, bool barrier,
              uintptr_t output_ptr, size_t dst_block_offset_bytes,
-             size_t dst_slot_stride_bytes) -> int64_t {
+             size_t dst_slot_stride_bytes, size_t flag_slot_base) -> int64_t {
             return self.prepare_sync_direct(input, count, reinterpret_cast<hipStream_t>(stream),
                                             barrier, output_ptr, dst_block_offset_bytes,
-                                            dst_slot_stride_bytes);
+                                            dst_slot_stride_bytes, flag_slot_base);
           },
           py::arg("input_ptr"), py::arg("count"), py::arg("stream"), py::arg("barrier") = true,
           py::arg("output_ptr") = 0, py::arg("dst_block_offset_bytes") = 0,
-          py::arg("dst_slot_stride_bytes") = 0)
+          py::arg("dst_slot_stride_bytes") = 0, py::arg("flag_slot_base") = 0)
       .def(
           "prepare_sync_direct_param_contiguous",
           [](IntraSubGroup& self, uintptr_t input, int64_t stream, bool barrier,
@@ -533,6 +536,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
         &mori::collective::BuildFusedRingRemoteGatherArgs, py::arg("ring_args_ptr"),
         py::arg("gather_args_ptr"), py::arg("ring_blocks"), py::arg("chunk_ready_flags_ptr"),
         py::arg("num_nodes"), py::arg("node_id"), py::arg("reassembly_blocks") = 0,
+        py::arg("op_gen") = 0, py::arg("reasm_deep_sq") = 0,
         "Merge ring + gather jit_args + pipeline extras into fused-remote args; returns int64 ptr");
 
   // =========================================================================

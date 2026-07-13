@@ -1,25 +1,25 @@
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
-# HOST-PROXY INTER-NODE PRODUCER for the crown fused-ring reassembly consumer.
+# HOST-PROXY INTER-NODE PRODUCER for the fused-ring reassembly consumer.
 #
 # The device fused-ring giant-AG kernel (FusedRingRemoteGatherKernel_u32) splits
 # into three concurrent CTA groups: ring channels (inter-node RDMA fill), the
 # local-block SDMA gather, and the reassembly workers that SDMA-push each landed
-# ring slot into the output. On this mlx5 provider the DEVICE per-sub-chunk
-# landing signal is refuted (WRITE_WITH_IMM HW-faults; put-signal/quiet races
-# >=64MB / crashes 466MB), so the reassembly can never SAFELY overlap the inter
-# fill on-device -- the two run serial (the 54/46 giant-AG wall).
+# ring slot into the output. On this mlx5 provider the device per-sub-chunk
+# landing signal is not usable (WRITE_WITH_IMM HW-faults; put-signal/quiet races
+# mismatch or crash at large sizes), so the reassembly cannot safely overlap the
+# inter fill on-device -- the two run serial.
 #
-# This producer moves the inter-node leg OFF the device: with
+# This producer moves the inter-node leg off the device: with
 # MORI_HIER_HOSTPROXY_REASM=1 the device ring-send CTAs skip the RDMA send and the
 # reassembly workers spin on host-published chunkReadyFlags[f]. A persistent CPU
-# proxy RDMA-writes each ring chunk into the partner's DEVICE ring buffer, drains
-# its send-CQ (the proven host-drain landing fence -- bit-exact at 466MB where the
-# device signal dies), rail-pair barriers so the partner's write into MY ring
-# buffer has landed, then publishes chunkReadyFlags[f] device-visibly. The device
-# reassembly worker then SDMA-pushes chunk f the instant its host flag lands,
-# overlapping the still-in-flight later chunks -- the same pipeline the device
-# signal could not make bit-exact.
+# proxy RDMA-writes each ring chunk into the partner's device ring buffer, drains
+# its send-CQ (the host-drain landing fence, bit-exact at the giant-AG size where
+# the device signal dies), rail-pair barriers so the partner's write into this
+# rank's ring buffer has landed, then publishes chunkReadyFlags[f] device-visibly.
+# The device reassembly worker then SDMA-pushes chunk f the instant its host flag
+# lands, overlapping the still-in-flight later chunks -- the same pipeline the
+# device signal could not make bit-exact.
 #
 # Flat crown ring (rb==1, ring_size==N==2): PE(node,L) rail-exchanges its single
 # chunk with PE(1-node,L). ring buffer slot m == node m's chunk (ring order); this
@@ -320,15 +320,15 @@ class HostProxyInterProducer:
         the background worker has posted+drained the inter RDMA leg AND published
         (fs.synchronize) ALL chunkReadyFlags for every AG queued so far.
 
-        This is the async-composition completion-ordering fence (director Turn41).
-        In async mode fill_async() returns immediately, so the deferred consumer
-        fence (_DeviceDeferredHostSyncWork.wait -> stream.synchronize) could fire
-        at copy-out WHILE the off-thread worker is still publishing a later AG's
-        chunkReadyFlags -- the reassembly then reads un-published (stale) flags and
-        the loss drifts (Turn40: async 0.90x but -0.0044). Joining the worker queue
-        here forces the flags to be published+landed BEFORE the caller-stream
-        synchronize gates the consumer, restoring the sync path's ordering while
-        keeping the overlap dividend the worker already banked during compute.
+        This is the async-composition completion-ordering fence. In async mode
+        fill_async() returns immediately, so the deferred consumer fence
+        (_DeviceDeferredHostSyncWork.wait -> stream.synchronize) could fire at
+        copy-out while the off-thread worker is still publishing a later AG's
+        chunkReadyFlags -- the reassembly then reads unpublished (stale) flags and
+        the loss drifts. Joining the worker queue here forces the flags to be
+        published and landed before the caller-stream synchronize gates the
+        consumer, restoring the sync path's ordering while keeping the overlap the
+        worker gained during compute.
         """
         drained = self._worker_q is not None
         if drained:

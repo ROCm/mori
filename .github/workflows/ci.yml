@@ -43,7 +43,7 @@ jobs:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-TW]
           - platform: MI325X_BNXT
-            runner: [self-hosted, 325_bnxt_008]
+            runner: [self-hosted, 325_bnxt_108]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -94,7 +94,7 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
           - platform: MI325X_BNXT
-            runner: [self-hosted, 325_bnxt_008]
+            runner: [self-hosted, 325_bnxt_108]
             rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             rdma_sl: 3
             rdma_tc: 104
@@ -317,7 +317,7 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             gpu_arch: gfx950
           - platform: MI325X_BNXT
-            runner: [self-hosted, 325_bnxt_008]
+            runner: [self-hosted, 325_bnxt_108]
             rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             gpu_arch: gfx942
     timeout-minutes: 90
@@ -446,8 +446,8 @@ jobs:
             rdma_tc: 104
             ct: podman
           - platform: MI325X_BNXT
-            runner: [self-hosted, 325_bnxt_008]
-            node1_host: 10.162.224.20
+            runner: [self-hosted, 325_bnxt_108]
+            node1_host: 10.162.224.131
             node2_host: 10.162.224.162
             node2_port: 22
             node1_ifname: enp49s0f1np1
@@ -474,6 +474,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: true
+
+      - name: Recover podman if needed
+        if: ${{ matrix.ct == 'podman' }}
+        run: podman system migrate || true
 
       - name: Build CI image
         run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .

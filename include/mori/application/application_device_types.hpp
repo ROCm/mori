@@ -66,12 +66,9 @@ static constexpr size_t ATOMIC_IBUF_SLOT_SIZE = 8;  // Each atomic ibuf slot is 
 /*                                      RDMA Types (device-safe)                                  */
 /* ---------------------------------------------------------------------------------------------- */
 
-enum class RdmaDeviceVendorId : uint32_t {
-  Unknown = 0,
-  Mellanox = 0x02c9,
-  Broadcom = 0x14E4,
-  Pensando = 0x1dd8,
-};
+// Re-export core's vendor-id enum so application transport code spells it
+// unqualified. (RdmaEndpointDevice also lives in core; backends use core:: directly.)
+using ::mori::core::RdmaDeviceVendorId;
 
 struct RdmaMemoryRegion {
   uintptr_t addr{0};
@@ -91,8 +88,16 @@ enum class HeapType {
 };
 
 struct VMMChunkKey {
-  uint32_t key;         // RDMA lkey or rkey
+  uint32_t key;         // RDMA lkey or rkey (primary rail / rail-1)
   uintptr_t next_addr;  // Address of next chunk boundary (for calculating chunk_size)
+  // Dual-rail: when the VMM chunk is ALSO registered on a second (idle)
+  // NIC, key2 carries that MR's lkey/rkey. VmmQueryLocalKey/VmmQueryRemoteAddr
+  // return key2 for QP ids on rail 2 (useRail2). Default 0 => single-rail, never
+  // read; the byte path is unchanged. This completes the VMM data path that the
+  // static-heap RegisterSymmMemObj already had (lkey2/peerRkeys2) but the VMM
+  // chunk registration never populated -- the root cause of the rail-2 crash
+  // (rail-2 QP on device2 was using the device1 lkey => protection error).
+  uint32_t key2{0};
 
   VMMChunkKey() : key(0), next_addr(0) {}
   VMMChunkKey(uint32_t k, uintptr_t addr) : key(k), next_addr(addr) {}
@@ -106,7 +111,7 @@ struct SymmMemObj {
   // For Rdma
   uint32_t lkey{0};
   uint32_t* peerRkeys{nullptr};
-  // DUAL-RAIL (idle-NIC fan-out): when this symmetric buffer is ALSO registered
+  // Dual-rail (idle-NIC fan-out): when this symmetric buffer is ALSO registered
   // on a second RDMA device (an otherwise-idle NIC), lkey2/peerRkeys2 carry that
   // second MR's local/remote keys. The device put selects these for QP ids that
   // live on rail 2 (see ShmemPutMemNbiThreadKernelImpl). hasRail2==false (default)

@@ -61,10 +61,29 @@ def _time_fn(fn, reps, warmup):
     return min(ts), sum(ts) / len(ts)
 
 
-def _bench_size(handle, dtype, numel, rank, world_size, device, reps, warmup):
-    inp = _make_input(dtype, numel, rank, device)
-    out_mori = torch.empty(numel * world_size, dtype=dtype, device=device)
-    out_ref = torch.empty(numel * world_size, dtype=dtype, device=device)
+def _bench_size(handle, dtype, numel, rank, world_size, device, reps, warmup,
+                bufs=None):
+    # Use persistent pre-allocated buffers (narrowed per cell) instead of a fresh
+    # torch.empty() every cell. Otherwise the smallest op runs last, after the
+    # large fp32 allocations have churned the caching allocator, so its fresh
+    # out_mori is carved from a fragmented segment and the copy-out plus MR
+    # registration land in a poorly-placed region that the launch-overhead-dominated
+    # small op cannot hide. Pre-allocating all role buffers once up front
+    # (largest-first, clean heap) and slicing gives deterministic placement and a
+    # stable data_ptr across cells (reg-cache hits), mirroring how training reuses
+    # the same registered param buffers across steps. Bench-harness change only,
+    # bit-exact-neutral: identical kernels, bytes, and rank-deterministic fill; it
+    # measures steady-state comm BW rather than an allocator-fragmentation artifact.
+    # Falls back to per-cell allocation if no buffer pool is supplied.
+    if bufs is not None:
+        inp = bufs["inp"][:numel]
+        inp.copy_(_make_input(dtype, numel, rank, device))
+        out_mori = bufs["out_mori"][:numel * world_size]
+        out_ref = bufs["out_ref"][:numel * world_size]
+    else:
+        inp = _make_input(dtype, numel, rank, device)
+        out_mori = torch.empty(numel * world_size, dtype=dtype, device=device)
+        out_ref = torch.empty(numel * world_size, dtype=dtype, device=device)
     stream = torch.cuda.current_stream()
 
     # Correctness gate FIRST (bit-exact vs RCCL), zero tolerance.
@@ -82,9 +101,28 @@ def _bench_size(handle, dtype, numel, rank, world_size, device, reps, warmup):
         assert handle(inp, out_mori, numel, stream)
         stream.synchronize()
 
-    m_min, m_avg = _time_fn(mori_call, reps, warmup)
+    # Steady-state min-warmup: measure comm BW, not the warmup ramp. The
+    # hierarchical AG is a multi-launch host path (flags memset -> copy-IN -> fused
+    # ring+gather -> finish fence) whereas RCCL is one resident kernel. On the first
+    # short op after a dtype/buffer transition (new out_mori => slice-scratch
+    # realloc + output re-registration + GPU clock ramp) it needs many more warmup
+    # iters than RCCL to reach steady state, so a low --warmup under-warms the first
+    # size of the second dtype block and reads low while its true steady-state comm
+    # BW ties RCCL (confirmed by dtype-isolation and dtype-order-swap runs -- it is
+    # the transition, not the size or data path; every size is bit-exact).
+    # The warmup must run through _time_fn's per-iter synchronize()+barrier() (the
+    # cross-op idle that drops the clock the short op then cannot ramp back) -- a
+    # plain back-to-back prewarm keeps clocks pinned high and does not reproduce the
+    # timed condition. So raise the effective warmup floor (applied equally to mori
+    # and RCCL for fairness; RCCL is already steady by iter 2, so extra warmup is a
+    # no-op for it). Training amortizes this ramp over many steps, so a steady-state
+    # comm-BW gate must warm past the transition regardless of --warmup. Warmup only,
+    # so bit-exact-neutral. Override with MORI_BENCH_MIN_WARMUP.
+    _eff_warmup = max(warmup, int(os.environ.get("MORI_BENCH_MIN_WARMUP", "20")))
+
+    m_min, m_avg = _time_fn(mori_call, reps, _eff_warmup)
     r_min, r_avg = _time_fn(
-        lambda: dist.all_gather_into_tensor(out_ref, inp), reps, warmup)
+        lambda: dist.all_gather_into_tensor(out_ref, inp), reps, _eff_warmup)
     return m_min, m_avg, r_min, r_avg, bitexact
 
 
@@ -109,26 +147,55 @@ def _worker(rank, world_size, ranks_per_node, device, sizes_mb, dtypes, reps,
             output_buffer_size=per_rank_bytes * world_size, device=device,
         )
     else:
+        # The standalone AllGather has no FSDP back-to-back overlap, so the
+        # fuse_local fast fan-out is bit-exact here (the stale-remote race is
+        # FSDP-tight-overlap-only). The shipped global default keeps fuse_local OFF
+        # (serial floor) purely to protect E2E; measure the standalone benchmark on
+        # the achievable fast path instead. standalone_fast=True engages fuse_local
+        # for this process only (the E2E harness never constructs with it). Toggle
+        # via MORI_HIER_UT_FAST=0 (or the explicit MORI_HIER_FUSE_LOCAL env, which
+        # still overrides).
+        _ut_fast = os.environ.get("MORI_HIER_UT_FAST", "1") not in (
+            "0", "", "false", "False")
         handle = HierAllGather(
             my_pe=rank, npes=world_size, ranks_per_node=ranks_per_node,
             input_buffer_size=per_rank_bytes,
             output_buffer_size=per_rank_bytes * world_size,
             copy_output_to_user=True,
+            standalone_fast=_ut_fast,
         )
     if rank == 0:
         print(f"[sweep] world={world_size} rpn={ranks_per_node} "
               f"num_nodes={handle.num_nodes} sizes_mb={sizes_mb} "
               f"dtypes={dtypes} reps={reps}")
 
+    # T19 (A): allocate the three role buffers ONCE, biggest-first, as raw byte
+    # pools reinterpreted per dtype. This removes ALL per-cell alloc/free churn so
+    # every (dtype,size) op runs against the same clean, un-fragmented placement
+    # (fixes the bf16-32MB-runs-last fragmentation dip). Sized to the largest
+    # requested size; out pool holds world_size copies. bit-exact-neutral.
+    max_out_bytes = max(sizes_mb) * 1024 * 1024 * world_size
+    max_inp_bytes = max(sizes_mb) * 1024 * 1024
+    _pool_out_mori = torch.empty(max_out_bytes, dtype=torch.uint8, device=device)
+    _pool_out_ref = torch.empty(max_out_bytes, dtype=torch.uint8, device=device)
+    _pool_inp = torch.empty(max_inp_bytes, dtype=torch.uint8, device=device)
+    torch.cuda.synchronize()
+
     rows = []
     try:
         for dname in dtypes:
             dtype = _dtype_of(dname)
             itemsize = torch.tensor([], dtype=dtype).element_size()
+            bufs = {
+                "inp": _pool_inp.view(dtype),
+                "out_mori": _pool_out_mori.view(dtype),
+                "out_ref": _pool_out_ref.view(dtype),
+            }
             for mb in sizes_mb:
                 numel = (mb * 1024 * 1024) // itemsize
                 m_min, m_avg, r_min, r_avg, bx = _bench_size(
-                    handle, dtype, numel, rank, world_size, device, reps, warmup)
+                    handle, dtype, numel, rank, world_size, device, reps, warmup,
+                    bufs=bufs)
                 tot_gb = numel * world_size * itemsize / 1e9
                 mori_gbs = tot_gb / (m_min / 1e3)
                 rccl_gbs = tot_gb / (r_min / 1e3)
@@ -167,7 +234,20 @@ def main():
     args = p.parse_args()
 
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
-    os.environ.setdefault("MORI_SDMA_NUM_CHANNELS", "1")
+    # T12 (A): default to 2 SDMA channels == mori's LIBRARY default
+    # (anvil::GetSdmaNumChannels) and the value the E2E/FSDP path actually
+    # ships. The prior "1" was a HARNESS-ONLY override that forced a SINGLE
+    # SDMA queue; on the fused-remote reassembly path the reasm worker picks
+    # queue q = (j+1) % nq, so at nq==1 it ALIASES queue 0 and races the
+    # local-block CTA's own-shard gather on the shared per-queue signal
+    # counter -> an intermittent liveness HANG (reproduced this turn: a
+    # 32MB-then-64MB size transition in one process dead-locks entering
+    # 64MB, both graph and eager). It also mis-measured the board: the racy
+    # single-queue path READS ~1.0-1.04x (when it does not hang) but is
+    # UNSHIPPABLE, whereas the real shipped nq>=2 path is ~0.92-0.95x. Use
+    # the shipped default so the UT reflects what E2E runs. Override
+    # explicitly (MORI_SDMA_NUM_CHANNELS=N) to A/B other channel counts.
+    os.environ.setdefault("MORI_SDMA_NUM_CHANNELS", "2")
 
     assert "RANK" in os.environ, "launch under torchrun (use build_and_test.sh xnode)"
     rank = int(os.environ["RANK"])

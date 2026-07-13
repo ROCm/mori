@@ -93,6 +93,13 @@ int LoadShmemModule(const char* hsaco_path) {
     (void)hipGetLastError();
     MORI_SHMEM_TRACE("mori_shmem_barrier_all_block_dissem not in module; using funnel fallback");
   }
+  // optional hierarchical 2-level barrier kernel. Non-fatal if missing.
+  err = hipModuleGetFunction(&ms.hierBarrierFunc, ms.module, "mori_shmem_barrier_all_block_hier");
+  if (err != hipSuccess) {
+    ms.hierBarrierFunc = nullptr;
+    (void)hipGetLastError();
+    MORI_SHMEM_TRACE("mori_shmem_barrier_all_block_hier not in module; using funnel fallback");
+  }
   MORI_SHMEM_TRACE("Loaded shmem JIT module: globalGpuStates={:p}, barrier={:p}",
                    (void*)ms.gpuStatesPtr, (void*)ms.barrierFunc);
   return 0;
@@ -129,6 +136,7 @@ void FinalizeRuntime(ShmemStates* states) {
     ms.gpuStatesPtr = nullptr;
     ms.barrierFunc = nullptr;
     ms.dissemBarrierFunc = nullptr;
+    ms.hierBarrierFunc = nullptr;
   }
   states->gpuStates = {};
 }
@@ -245,6 +253,25 @@ void ShmemBarrierOnStreamDissem(hipStream_t stream) {
     assert(err == hipSuccess && "ShmemBarrierOnStreamDissem launch failed");
   } else {
     // No dissem kernel in this module: preserve correctness via the funnel.
+    ShmemBarrierOnStream(stream);
+  }
+}
+
+// hierarchical 2-level global barrier on a stream. Same all-PE semantics as
+// ShmemBarrierOnStream but crosses the RDMA node boundary only through per-node
+// coordinators (intra-node XGMI gather/release + 1 cross-node coordinator
+// exchange). Falls back to the funnel barrier if the module lacks the hier kernel.
+void ShmemBarrierOnStreamHier(hipStream_t stream, int ranksPerNode) {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+
+  if (states->moduleStates.hierBarrierFunc != nullptr) {
+    void* kernelArgs[] = {&ranksPerNode};
+    hipError_t err = hipModuleLaunchKernel(states->moduleStates.hierBarrierFunc, 1, 1, 1, 1, 1, 1, 0,
+                                           stream, kernelArgs, nullptr);
+    assert(err == hipSuccess && "ShmemBarrierOnStreamHier launch failed");
+  } else {
+    // No hier kernel in this module: preserve correctness via the funnel.
     ShmemBarrierOnStream(stream);
   }
 }

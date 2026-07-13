@@ -53,8 +53,20 @@ constexpr bool BREAK_ON_RETRIES = true;
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 
+// (packet-primitive layer): optional COPY_LINEAR DW2 coherence hint.
+// The gfx942 SDMA_PKT_COPY_LINEAR PARAMETER_UNION (DW2) exposes ONLY src_sw/dst_sw
+// (2-bit endian SWAP -- nonzero CORRUPTS byte data) and src_ha/dst_ha (1-bit
+// host-access / coherence-routing hint). There is NO L2 cache-policy / streaming
+// field in this packet on CDNA3 (verified against ROCr amd_blit_sdma BuildCopyCommand,
+// rocshmem anvil_device, and kfdtest sdma_pkt_struct -- ALL leave DW2 == 0 for peak
+// D2D/XGMI copy BW). ``cacheHint`` bit0 -> dst_ha, bit1 -> src_ha; swap bits are
+// deliberately NOT exposed (they would break bit-exactness). cacheHint==0 =>
+// byte-identical shipped packet. This is the ONLY non-corrupting DW2 knob and lets us
+// EMPIRICALLY confirm (not just source-read) that the coherence hint is neutral/worse
+// on the XGMI-egress-bound local-gather pole.
 __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, void* dstBuf,
-                                                                 long long int packetSize) {
+                                                                 long long int packetSize,
+                                                                 int cacheHint = 0) {
   SDMA_PKT_COPY_LINEAR copy_packet = {};
 
   copy_packet.HEADER_UNION.op = SDMA_OP_COPY;
@@ -65,6 +77,11 @@ __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, v
   copy_packet.SRC_ADDR_HI_UNION.src_addr_63_32 = (uint32_t)((uintptr_t)srcBuf >> 32);
   copy_packet.DST_ADDR_LO_UNION.dst_addr_31_0 = (uint32_t)(uintptr_t)dstBuf;
   copy_packet.DST_ADDR_HI_UNION.dst_addr_63_32 = (uint32_t)((uintptr_t)dstBuf >> 32);
+
+  if (cacheHint != 0) {
+    copy_packet.PARAMETER_UNION.dst_ha = (cacheHint & 0x1) ? 1u : 0u;
+    copy_packet.PARAMETER_UNION.src_ha = (cacheHint & 0x2) ? 1u : 0u;
+  }
 
   return copy_packet;
 }

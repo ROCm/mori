@@ -177,6 +177,12 @@ void RdmaStatesInit(ShmemStates* states) {
   int rank = states->bootStates->rank;
   int worldSize = states->bootStates->worldSize;
   rdmaStates->commContext = new application::Context(*states->bootStates->bootNet);
+  // SHMEM consumes the initial RDMA endpoint set (worldSize × numQpPerPe QPs)
+  // via Context::GetRdmaEndpoints() later in CopyRdmaEndpointsToGpu(). Build &
+  // connect them now — this is a collective op (one AllToAll + per-peer RTR/RTS).
+  // CCO skips this step because it builds its own per-DevComm QP sets via
+  // ctx->CreateAdditionalEndpoints().
+  rdmaStates->commContext->BuildInitialEndpoints();
   MORI_SHMEM_TRACE("RdmaStatesInit: rank {}, worldSize {}", rank, worldSize);
 }
 
@@ -605,6 +611,15 @@ void GpuStateInit(ShmemStates* states) {
     const char* pcb = std::getenv("MORI_RDMA_PUT_CHUNK_BYTES");
     states->gpuStates.putChunkBytes = (pcb != nullptr) ? std::strtoull(pcb, nullptr, 10) : 0;
   }
+  // this work (transport in-flight depth, batched doorbell): ring the mlx5 send
+  // doorbell ONCE per multi-WQE put instead of once per chunk WQE (removes the
+  // per-WQE MMIO + 3 threadfence_system overhead that made plain putChunkBytes
+  // neutral). Only meaningful with MORI_RDMA_PUT_CHUNK_BYTES>0. 0/unset = off.
+  {
+    const char* bdb = std::getenv("MORI_RDMA_PUT_BATCH_DB");
+    states->gpuStates.batchPutDoorbell =
+        (bdb != nullptr) && (std::strtoul(bdb, nullptr, 10) != 0);
+  }
   // this work (drain-free landing fence): mlx5 strong-ordering fence bit on the
   // fused signal ATOMIC WQE so it cannot overtake its own preceding large payload
   // WRITE on RoCE RC (the >=64MB DEEP_PIPE flag-beats-data race). Value is OR'd
@@ -617,6 +632,14 @@ void GpuStateInit(ShmemStates* states) {
     // fence-mode selector, or a preshifted value. 1..4 => v<<5.
     if (v >= 1 && v <= 4) v = v << 5;
     states->gpuStates.signalFenceMode = v;
+  }
+  // this work (packet-fill cross-validation, A-lane): one-shot print of the actual
+  // inter-node RDMA WRITE message size (transfer_size) for the first N WQEs per QP.
+  // Pins the crown's per-QP WRITE granularity at the code level (cross-check for
+  // B's NIC-counter half-MTU finding). 0/unset = off = byte-identical shipped path.
+  {
+    const char* dps = std::getenv("MORI_DIAG_PUTSIZE");
+    states->gpuStates.diagPutSize = (dps != nullptr) ? std::atoi(dps) : 0;
   }
 
   // Copy communication metadata to GPU

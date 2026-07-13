@@ -168,6 +168,12 @@ struct PoolClientConfig {
 
   uint16_t peer_service_port = 0;
 
+  // Re-cache remotely-fetched blocks into local DRAM + publish to master so this
+  // node becomes an additional serving replica (LMCache-style P2P pull).
+  bool cache_remote_fetches = true;
+  CacheRemoteAdmission cache_remote_admission = CacheRemoteAdmission::SIZE;
+  size_t admission_max_block_bytes = 16ULL * 1024 * 1024;
+
   // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
   // tier.  Reported via RegisterClient.  Same value applies to both DRAM
   // and HBM.  Forwarded unmodified to MasterClient::RegisterSelf by
@@ -200,6 +206,9 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
   pc.peer_service_port = dc.peer_service_port;
+  pc.cache_remote_fetches = dc.cache_remote_fetches;
+  pc.cache_remote_admission = dc.cache_remote_admission;
+  pc.admission_max_block_bytes = dc.admission_max_block_bytes;
   // 0 propagates through PoolClient -> MasterClient::RegisterSelf ->
   // proto -> ClientRegistry, where it is interpreted as "use the
   // registry-wide default_dram_page_size".

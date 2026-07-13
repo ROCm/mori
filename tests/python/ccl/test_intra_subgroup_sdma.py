@@ -166,7 +166,8 @@ def _worker_body(rank, world_size, G, numels, dtypes, device, bench=False):
         if rank == 0:
             print("test_intra_subgroup_sdma: PASSED")
         if bench:
-            _bench_one(torch.float32, 16 * 1024 * 1024, rank, world_size, G, device)
+            for _mb in (32, 64, 128, 256):
+                _bench_one(torch.float32, _mb * 1024 * 1024 // 4, rank, world_size, G, device)
     finally:
         torch.cuda.synchronize()
         dist.barrier()

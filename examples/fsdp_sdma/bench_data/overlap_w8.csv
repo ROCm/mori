@@ -1,0 +1,3 @@
+per_rank_mb,iso_mori_gbs,iso_rccl_gbs,gemm_mori_gbs,gemm_rccl_gbs,mori_slowdown,rccl_slowdown
+33.6,143.8,171.6,75.5,62.8,1.90,2.73
+67.1,92.0,174.4,95.8,69.2,0.96,2.52

@@ -60,6 +60,17 @@ inline bool IntraHierAllBarrierDisabled() {
   return disabled;
 }
 
+// T5 A (MORI_INTRA_MQ): drive ALL sdmaNumQueue SDMA queues (both recommended XGMI
+// engines per peer link) for each intra all-to-all column instead of only queue 0.
+// Default OFF => byte-identical shipped put. See oneshot_sdma_kernel.hpp body.
+inline int IntraMultiQueue() {
+  static const int mq = []() {
+    const char* e = std::getenv("MORI_INTRA_MQ");
+    return (e != nullptr) ? std::atoi(e) : 0;
+  }();
+  return mq;
+}
+
 class IntraNodeSubGroupAllgatherSdma {
  private:
   int myPe_;
@@ -260,6 +271,9 @@ class IntraNodeSubGroupAllgatherSdma {
     jit_args_.dstBaseOffset = dst_base_offset_bytes;
     jit_args_.dstSlotStrideBytes = dst_slot_stride_bytes;
     jit_args_.flagVal = flag_token;
+    // classic prepare_sync (transit path): always base 0 (single gather).
+    jit_args_.flagBase = 0;
+    jit_args_.multiQueue = IntraMultiQueue();
     return reinterpret_cast<int64_t>(&jit_args_);
   }
 
@@ -373,7 +387,7 @@ class IntraNodeSubGroupAllgatherSdma {
   // copy-OUT) to complete the op. Throws if ``output_ptr`` is not registered.
   int64_t prepare_sync_direct(uintptr_t input, size_t count_u32, hipStream_t stream, bool barrier,
                               uintptr_t output_ptr, size_t dst_block_offset_bytes = 0,
-                              size_t dst_slot_stride_bytes = 0) {
+                              size_t dst_slot_stride_bytes = 0, size_t flag_slot_base = 0) {
     auto regObj = find_exact(output_ptr);
     if (!regObj.IsValid())
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: output not registered for direct");
@@ -383,6 +397,16 @@ class IntraNodeSubGroupAllgatherSdma {
     size_t last_slot_end = base_off + static_cast<size_t>(groupSize_ - 1) * slot_stride + copy_bytes;
     if (last_slot_end > regObj->size) {
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: direct gather exceeds output");
+    }
+    // T22: RACE-FREE concurrent direct gathers. Lane j passes a DISJOINT
+    // flag_slot_base = j*groupSize so simultaneous launches (REASM_STREAMS)
+    // never collide on the shared flag slots. The flags buffer is sized for
+    // npes*(kMaxReassemblyBlocks+1) slots (see ctor); guard against OOB.
+    constexpr size_t kMaxReassemblyBlocks = 32;
+    size_t flags_slot_cap = static_cast<size_t>(npes_) * (kMaxReassemblyBlocks + 1);
+    if (flag_slot_base + static_cast<size_t>(groupSize_) > flags_slot_cap) {
+      throw std::runtime_error(
+          "IntraNodeSubGroupAllgatherSdma: direct flag_slot_base exceeds flag capacity");
     }
     uint64_t flag_token = ++seq_;
     // keep the entry fence STREAM-ORDERED (no host CPU<->GPU
@@ -407,6 +431,7 @@ class IntraNodeSubGroupAllgatherSdma {
     jit_args_.dstBaseOffset = base_off;
     jit_args_.dstSlotStrideBytes = dst_slot_stride_bytes;
     jit_args_.flagVal = flag_token;
+    jit_args_.flagBase = flag_slot_base;
     return reinterpret_cast<int64_t>(&jit_args_);
   }
 

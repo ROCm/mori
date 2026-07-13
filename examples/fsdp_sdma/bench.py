@@ -234,20 +234,17 @@ def _apply_fsdp2(model: torch.nn.Module, dtype: torch.dtype, reshard_root: bool)
             for m in shards:
                 m.set_custom_all_gather(ag)
 
-    # LEVER (MORI_FSDP_FWD_PREFETCH=D, default OFF): explicit FORWARD-prefetch depth.
-    # The crown's residual gap is the CU-free ~50GB/s SDMA-intra fill on the big AGs
-    # sitting on the serial all_gather_stream with too small an overlap window. Backward
-    # prefetch was refuted neutral (SDMA throughput-bound, D=3 breaks bit-exact), but
-    # FORWARD explicit-prefetch depth>=2 is untried: issue each decoder layer's AG D
-    # layers earlier from the CPU so the CU-free SDMA/RDMA fill overlaps more forward
-    # GEMM compute (the thesis dividend the transport levers cannot reach). Since the
-    # per-layer AGs (reshard_after_forward=True) free+recycle their buffer, depth is
-    # capped to what the deferred landing fence covers -- validate bit-exact per depth.
-    # SHIPPED-SAFE GUARD (R121): depth>=2 races the DEFER_HOSTSYNC copy-out fence
-    # (two AGs in flight -> the deferred landing fence covers only ONE), loss
-    # drifts +0.006 -- same physics as the refuted BWD_PREFETCH>2. So the depth is
-    # HARD-CLAMPED to 1 unless MORI_FSDP_FWD_PREFETCH_UNSAFE=1 explicitly opts into
-    # the drifting deeper depth for A/B measurement only (never shipped).
+    # MORI_FSDP_FWD_PREFETCH=D (default OFF): explicit forward-prefetch depth.
+    # The residual gap is the CU-free SDMA-intra fill on the big AGs sitting on the
+    # serial all_gather_stream with too small an overlap window. Issue each decoder
+    # layer's AG D layers earlier from the CPU so the CU-free SDMA/RDMA fill overlaps
+    # more forward GEMM compute. Since the per-layer AGs
+    # (reshard_after_forward=True) free and recycle their buffer, depth is capped to
+    # what the deferred landing fence covers.
+    # Shipped-safe guard: depth>=2 races the deferred copy-out fence (two AGs in
+    # flight, so the deferred landing fence covers only one) and the loss drifts, so
+    # depth is hard-clamped to 1 unless MORI_FSDP_FWD_PREFETCH_UNSAFE=1 explicitly
+    # opts into the drifting deeper depth for measurement only (never shipped).
     _fwd_pf = os.environ.get("MORI_FSDP_FWD_PREFETCH", "").strip()
     if _fwd_pf and _fwd_pf not in ("0", "false", "False"):
         depth = max(1, int(_fwd_pf))

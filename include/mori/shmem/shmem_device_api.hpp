@@ -1280,7 +1280,7 @@ inline __device__ void ShmemInternalBarrierBlock() {
 }
 
 // DISSEMINATION barrier — a topology-cheaper drop-in for the
-// PE0-coordinator funnel ShmemInternalBarrierBlock.  root-caused the
+// PE0-coordinator funnel ShmemInternalBarrierBlock. root-caused the
 // hier-AllGather residual to the global prepare ShmemBarrierOnStream: the funnel
 // serializes ALL 8 PEs through PE0 (PE0 does n-1 sequential inbound waits + n-1
 // sequential outbound puts, several crossing the node boundary over RDMA). The
@@ -1336,6 +1336,87 @@ inline __device__ void ShmemInternalBarrierDissemBlock() {
 inline __device__ void ShmemBarrierAllDissemBlock() {
   ShmemQuietThread();
   ShmemInternalBarrierDissemBlock();
+}
+
+// HIERARCHICAL 2-LEVEL barrier — a topology-AWARE drop-in for the flat
+// funnel/dissem barriers. Both of those cross the RDMA node boundary many times:
+// the funnel serializes ALL n-1 arrivals + n-1 releases through PE0 (~n/rpn of
+// EACH crossing the boundary SEQUENTIALLY = the small-size rendezvous-latency
+// pole); dissem parallelizes into log2(n) rounds but STILL issues a cross-node
+// RDMA put for every PE in the boundary-crossing round. This barrier exploits the
+// XGMI(intra-node)/RDMA(inter-node) asymmetry and crosses the boundary EXACTLY
+// ONCE each way (only the per-node coordinators exchange over RDMA):
+// 1. intra-node gather : each local PE signals its node coordinator over XGMI.
+// 2. inter-node exchange: coordinators all-to-all over RDMA (numNodes-1 puts).
+// 3. intra-node release: coordinator releases its local PEs over XGMI.
+// For w16 (n=16, ranksPerNode=8, 2 nodes) = 2 cross-node RDMA ops total vs the
+// funnel's ~16 serial. Same GLOBAL all-PE arrived-before-any-exits semantics.
+// Monotonic per-PE generation counter (never reset) => graph-replay-safe, no
+// clear-vs-signal race (same discipline as dissem). Uses a DISJOINT pSync slot
+// region so it never aliases the funnel [0,n) or dissem [64..~70]+127 flavors.
+inline __device__ void ShmemInternalBarrierHierBlock(int ranksPerNode) {
+  if (threadIdx.x == 0) {
+    GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+    uint64_t* pSync = globalGpuStates->internalSyncPtr;
+    int pe = globalGpuStates->rank;
+    int n_pes = globalGpuStates->worldSize;
+    // Degenerate ranksPerNode => behave as a single-node (all-local) barrier.
+    if (ranksPerNode <= 0 || ranksPerNode > n_pes) ranksPerNode = n_pes;
+
+    // Disjoint slot layout in the 128-uint64 internalSync region:
+    // HIER_PEER_BASE[96 .. 96+numNodes) coordinator inter-node inbox (by src node)
+    // HIER_LOCAL_BASE[112 .. 112+rpn) local PE -> coordinator inbox (by localIdx)
+    // HIER_REL_SLOT [120] coordinator -> local release
+    // HIER_GEN_SLOT [126] PE-local monotonic generation
+    constexpr int HIER_PEER_BASE = 96;
+    constexpr int HIER_LOCAL_BASE = 112;
+    constexpr int HIER_REL_SLOT = 120;
+    constexpr int HIER_GEN_SLOT = 126;
+
+    uint64_t gen = pSync[HIER_GEN_SLOT] + 1;
+    pSync[HIER_GEN_SLOT] = gen;
+    __threadfence();
+
+    int node = pe / ranksPerNode;
+    int localIdx = pe % ranksPerNode;
+    int numNodes = n_pes / ranksPerNode;
+    int coord = node * ranksPerNode;
+
+    if (localIdx != 0) {
+      // Non-coordinator: signal my node coordinator (XGMI), wait for release.
+      ShmemPutUint64ImmNbiThread(&pSync[HIER_LOCAL_BASE + localIdx], gen, coord, 0);
+      __threadfence_system();
+      ShmemUint64WaitUntilGreaterThan(&pSync[HIER_REL_SLOT], gen - 1);
+    } else {
+      // Coordinator.
+      // 1. wait for all local PEs to arrive (XGMI reads of my own inbox).
+      for (int i = 1; i < ranksPerNode; ++i)
+        ShmemUint64WaitUntilGreaterThan(&pSync[HIER_LOCAL_BASE + i], gen - 1);
+      __threadfence_system();
+      // 2. inter-node all-to-all among coordinators (the ONLY cross-node RDMA hop).
+      for (int nn = 0; nn < numNodes; ++nn) {
+        if (nn == node) continue;
+        ShmemPutUint64ImmNbiThread(&pSync[HIER_PEER_BASE + node], gen, nn * ranksPerNode, 0);
+      }
+      __threadfence_system();
+      for (int nn = 0; nn < numNodes; ++nn) {
+        if (nn == node) continue;
+        ShmemUint64WaitUntilGreaterThan(&pSync[HIER_PEER_BASE + nn], gen - 1);
+      }
+      __threadfence_system();
+      // 3. release my local PEs (XGMI). All n PEs have now ARRIVED.
+      for (int i = 1; i < ranksPerNode; ++i)
+        ShmemPutUint64ImmNbiThread(&pSync[HIER_REL_SLOT], gen, coord + i, 0);
+      __threadfence_system();
+    }
+  }
+  // All threads in the block wait until thread 0 completes the inter-PE barrier.
+  __syncthreads();
+}
+
+inline __device__ void ShmemBarrierAllHierBlock(int ranksPerNode) {
+  ShmemQuietThread();
+  ShmemInternalBarrierHierBlock(ranksPerNode);
 }
 
 inline __device__ void ShmemBarrierAllThread() {

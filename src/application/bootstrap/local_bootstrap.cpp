@@ -258,48 +258,81 @@ bool LocalBootstrapNetwork::ExchangeFileDescriptors(const std::vector<int>& loca
   // Store our own FDs
   allFds[localRank] = localFds;
 
-  // Exchange FDs with each peer
+  // Phase 1: bind+listen ALL server sockets (peers with localRank < peer) up
+  // front, before doing any blocking accept(). This is critical for robustness
+  // under rank skew (e.g. single-process multi-thread, where threads serialize
+  // on HIP runtime locks and enter the exchange far apart in time): the socket
+  // files for every higher-ranked peer exist the moment this rank enters the
+  // exchange. If we instead bound lazily inside the per-peer loop, a server
+  // blocked in accept() for a slow low-ranked peer would not yet have bound the
+  // socket that a higher-ranked client needs, so that client would see ENOENT
+  // ("No such file or directory") and time out — then, having bailed, never
+  // serve its own higher-ranked clients, cascading the failure.
+  std::vector<int> serverFds(worldSize, -1);
+
+  auto closeServerFds = [&]() {
+    for (int peer = 0; peer < worldSize; ++peer) {
+      if (serverFds[peer] >= 0) {
+        close(serverFds[peer]);
+        serverFds[peer] = -1;
+        unlink(GetSocketPath(localRank, peer).c_str());
+      }
+    }
+  };
+
+  for (int peer = 0; peer < worldSize; ++peer) {
+    if (peer == localRank || localRank >= peer) continue;
+
+    std::string socketPath = GetSocketPath(localRank, peer);
+    unlink(socketPath.c_str());
+
+    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+      MORI_APP_ERROR("Rank {} failed to create socket for peer {}: {}", localRank, peer,
+                     strerror(errno));
+      closeServerFds();
+      return false;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+      MORI_APP_ERROR("Rank {} failed to bind socket for peer {}: {}", localRank, peer,
+                     strerror(errno));
+      close(server_fd);
+      closeServerFds();
+      return false;
+    }
+
+    if (listen(server_fd, 1) < 0) {
+      MORI_APP_ERROR("Rank {} failed to listen on socket for peer {}: {}", localRank, peer,
+                     strerror(errno));
+      close(server_fd);
+      closeServerFds();
+      return false;
+    }
+
+    serverFds[peer] = server_fd;
+  }
+
+  // Phase 2: exchange FDs with each peer. Lower rank is server, higher is client.
   for (int peer = 0; peer < worldSize; ++peer) {
     if (peer == localRank) continue;
 
     std::string socketPath = GetSocketPath(localRank, peer);
 
     if (localRank < peer) {
-      // Act as server
-
-      unlink(socketPath.c_str());
-
-      int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-      if (server_fd < 0) {
-        MORI_APP_ERROR("Rank {} failed to create socket for peer {}: {}", localRank, peer,
-                       strerror(errno));
-        return false;
-      }
-
-      struct sockaddr_un addr;
-      memset(&addr, 0, sizeof(addr));
-      addr.sun_family = AF_UNIX;
-      strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
-
-      if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        MORI_APP_ERROR("Rank {} failed to bind socket for peer {}: {}", localRank, peer,
-                       strerror(errno));
-        close(server_fd);
-        return false;
-      }
-
-      if (listen(server_fd, 1) < 0) {
-        MORI_APP_ERROR("Rank {} failed to listen on socket for peer {}: {}", localRank, peer,
-                       strerror(errno));
-        close(server_fd);
-        return false;
-      }
+      // Act as server (socket already bound+listening from phase 1).
+      int server_fd = serverFds[peer];
 
       int client_fd = accept(server_fd, NULL, NULL);
       if (client_fd < 0) {
         MORI_APP_ERROR("Rank {} failed to accept connection from peer {}: {}", localRank, peer,
                        strerror(errno));
-        close(server_fd);
+        closeServerFds();
         return false;
       }
 
@@ -309,8 +342,7 @@ bool LocalBootstrapNetwork::ExchangeFileDescriptors(const std::vector<int>& loca
           MORI_APP_ERROR("Rank {} failed to send FD {} to peer {}: {}", localRank, i, peer,
                          strerror(errno));
           close(client_fd);
-          close(server_fd);
-          unlink(socketPath.c_str());
+          closeServerFds();
           return false;
         }
       }
@@ -331,15 +363,15 @@ bool LocalBootstrapNetwork::ExchangeFileDescriptors(const std::vector<int>& loca
           }
 
           close(client_fd);
-          close(server_fd);
-          unlink(socketPath.c_str());
+          closeServerFds();
           return false;
         }
         allFds[peer][i] = receivedFd;
       }
 
       close(client_fd);
-      close(server_fd);
+      close(serverFds[peer]);
+      serverFds[peer] = -1;
       unlink(socketPath.c_str());
 
     } else {
@@ -348,6 +380,7 @@ bool LocalBootstrapNetwork::ExchangeFileDescriptors(const std::vector<int>& loca
       if (client_fd < 0) {
         MORI_APP_ERROR("Rank {} failed to create client socket for peer {}: {}", localRank, peer,
                        strerror(errno));
+        closeServerFds();
         return false;
       }
 
@@ -359,8 +392,12 @@ bool LocalBootstrapNetwork::ExchangeFileDescriptors(const std::vector<int>& loca
       std::string peerSocketPath = GetSocketPath(peer, localRank);
       strncpy(addr.sun_path, peerSocketPath.c_str(), sizeof(addr.sun_path) - 1);
 
-      // Retry connection (up to 5 seconds)
-      const int MAX_CONNECT_RETRIES = 500;
+      // Retry connection. With phase-1 up-front binding the only reason a
+      // connect fails is that the peer (server) has not yet entered the
+      // exchange. Allow a generous deadline so large rank skew (e.g. heavy
+      // multi-threaded HIP allocation contention across several windows) does
+      // not spuriously fail the exchange.
+      const int MAX_CONNECT_RETRIES = 6000;  // up to ~60 seconds
       const int RETRY_INTERVAL_MS = 10;
       bool connected = false;
 
@@ -376,6 +413,7 @@ bool LocalBootstrapNetwork::ExchangeFileDescriptors(const std::vector<int>& loca
         MORI_APP_ERROR("Rank {} failed to connect to peer {}: {}", localRank, peer,
                        strerror(errno));
         close(client_fd);
+        closeServerFds();
         return false;
       }
 
@@ -395,6 +433,7 @@ bool LocalBootstrapNetwork::ExchangeFileDescriptors(const std::vector<int>& loca
           }
 
           close(client_fd);
+          closeServerFds();
           return false;
         }
         allFds[peer][i] = receivedFd;
@@ -415,6 +454,7 @@ bool LocalBootstrapNetwork::ExchangeFileDescriptors(const std::vector<int>& loca
           }
 
           close(client_fd);
+          closeServerFds();
           return false;
         }
       }

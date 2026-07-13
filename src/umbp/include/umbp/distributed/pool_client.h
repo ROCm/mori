@@ -22,12 +22,15 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -259,8 +262,35 @@ class PoolClient {
   enum class GetAttemptOutcome { kSuccess, kRetry, kFatal };
 
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
-                                    TierType tier);
+                                    TierType tier, bool enqueue_ssd_copy = true);
   GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
+  // After a successful remote DRAM fetch, if cache_remote_fetches is enabled and
+  // the admission gate admits the block, enqueue it for asynchronous install into
+  // this node's local DRAM tier (see ReCacheWorkerLoop). The install (DRAM
+  // Allocate + copy + Commit→KvEvent::ADD publish) happens OFF the Get critical
+  // path so it does not add latency to concurrent Gets. Idempotent
+  // (kSuccessAlreadyExists) and best-effort: the queue is bounded and drops on
+  // full; failure does not affect the returned Get result.
+  void MaybeReCacheAfterRemote(const std::string& key, const void* src, size_t size);
+  // Background worker that drains recache_queue_ and performs the DRAM install
+  // via ExecuteLocalPut. Started in Init (when cache_remote_fetches), stopped in
+  // Shutdown before peer_alloc_ is torn down.
+  void ReCacheWorkerLoop();
+
+  // Async re-cache install queue. MaybeReCacheAfterRemote copies the block bytes
+  // into a job here (the source buffer is not owned past the Get return), and the
+  // worker thread installs it. Bounded to keep memory + publish churn in check.
+  struct ReCacheJob {
+    std::string key;
+    std::unique_ptr<char[]> bytes;
+    size_t size = 0;
+  };
+  std::deque<ReCacheJob> recache_queue_;
+  std::mutex recache_mutex_;
+  std::condition_variable recache_cv_;
+  std::thread recache_worker_;
+  bool recache_stop_ = false;
+  size_t recache_queue_max_ = 1024;
   // Self-target SSD get: read straight from the local SSD tier into the user
   // buffer (no staging / RDMA / lease).
   GetAttemptOutcome ExecuteLocalSsdGet(const std::string& key, void* dst, size_t size);

@@ -22,7 +22,7 @@
 #pragma once
 
 // Device-safe includes: no STL, no ibverbs, safe for HIP/CUDA device compilation.
-#include <cassert>  // assert() — used in device code below, needed in both host/device compiles
+#include <cassert>  // assert — used in device code below, needed in both host/device compiles
 
 #include "mori/application/application_device_types.hpp"
 #include "mori/core/utils/utils.hpp"
@@ -105,44 +105,21 @@ struct MemoryStates {
 /*                          Device-safe GPU-side structures                                      */
 /* ---------------------------------------------------------------------------------------------- */
 
-// GPU-side RDMA endpoint: only the fields used by device kernels.
-// Excludes host-only fields: ibvHandle (ibverbs objects) and unused handle sub-fields (psn, portId,
-// mac, gid). Only qpn from handle is needed by device kernels (for doorbell posting).
-// Populated from application::RdmaEndpoint by init.cpp before hipMemcpy to device.
-struct ShmemRdmaEndpoint {
-  application::RdmaDeviceVendorId vendorId{application::RdmaDeviceVendorId::Unknown};
-  uint32_t qpn{0};  // QP number — extracted from application::RdmaEndpoint::handle.qpn
-  core::WorkQueueHandle wqHandle;
-  core::CompletionQueueHandle cqHandle;
-  // WRITE_WITH_IMM receiver (Phase-6 cross-node ring accuracy fix): the recv-side
-  // completion queue the responder posts RDMA_WRITE_WITH_IMM CQEs into. Mirrors
-  // cqHandle when no dedicated recv CQ is configured (send+recv share one CQ), so
-  // device receivers can always read recvCqHandle uniformly. Populated in init.cpp
-  // from application::RdmaEndpoint::recvCqHandle.
-  core::CompletionQueueHandle recvCqHandle;
-  core::IbufHandle atomicIbuf;
-
-  __device__ __host__ core::ProviderType GetProviderType() {
-    if (vendorId == application::RdmaDeviceVendorId::Mellanox) {
-      return core::ProviderType::MLX5;
-    } else if (vendorId == application::RdmaDeviceVendorId::Broadcom) {
-      return core::ProviderType::BNXT;
-    } else if (vendorId == application::RdmaDeviceVendorId::Pensando) {
-      return core::ProviderType::PSD;
-    } else {
-      MORI_PRINTF("ShmemRdmaEndpoint: unknown vendorId %u\n", static_cast<uint32_t>(vendorId));
-      assert(false);
-      return core::ProviderType::Unknown;
-    }
-  }
-};
+// GPU-side RDMA endpoint. The type lives in core (core::RdmaEndpointDevice) — a
+// device POD over core's WQ/CQ/Ibuf handles, the device-visible projection of
+// application::RdmaEndpoint — so RDMA-driving backends (shmem, cco, ...) depend
+// DOWN on core rather than on each other. This alias preserves the historical
+// shmem::ShmemRdmaEndpoint spelling for existing shmem code. The recvCqHandle
+// field used by the hierarchical AllGather's WRITE_WITH_IMM receiver now lives on
+// core::RdmaEndpointDevice itself (see core_device_types.hpp).
+using ShmemRdmaEndpoint = core::RdmaEndpointDevice;
 
 // GpuStates must be declared before ModuleStates and ShmemStates which embed it.
 struct GpuStates {
   int rank{-1};
   int worldSize{-1};
   int numQpPerPe{4};  // Default to 4 QPs per peer, consistent with Context default
-  // DUAL-RAIL (idle-NIC fan-out): index within a peer's [0,numQpPerPe) QP block
+  // Dual-rail (idle-NIC fan-out): index within a peer's [0,numQpPerPe) QP block
   // at/after which QPs live on the SECOND RDMA device (an otherwise-idle NIC).
   // -1 (default) => single-rail, no QP is on rail 2 and the device put path is
   // byte-for-byte unchanged. Set from Context by GpuStateInit when dual-rail is on.
@@ -154,6 +131,20 @@ struct GpuStates {
   // outstanding WQEs). 0 (default) = one WQE for the whole transfer = the proven
   // the prior behavior. Set from env MORI_RDMA_PUT_CHUNK_BYTES in GpuStateInit.
   size_t putChunkBytes{0};
+  // this work (transport in-flight depth, batched doorbell): when true AND
+  // putChunkBytes>0, the multi-WQE fast-path put in ShmemPutMemNbiThreadKernelImpl
+  // rings the mlx5 send doorbell exactly ONCE (after posting every chunk WQE)
+  // instead of once per chunk. Each RingDoorbell is an MMIO write + 3
+  // __threadfence_system; paying it per WQE is exactly why plain putChunkBytes
+  // measured NEUTRAL on the old fabric (per-WQE doorbell overhead cancels the
+  // inflight-depth gain). Batching submits all K WQEs with one doorbell (the
+  // persistent-kernel pattern), keeping K writes in flight per QP at the cost of a
+  // single doorbell. Deadlock-safe: deferral engages only when the whole put's WQE
+  // count fits comfortably in the SQ (<= sqWqeNum/4) so the free-entry backpressure
+  // never needs a mid-put drain (which would require a prior ring). 0 (default) =
+  // ring per WQE = byte-identical to plain putChunkBytes. Set from env
+  // MORI_RDMA_PUT_BATCH_DB in GpuStateInit.
+  bool batchPutDoorbell{false};
   // this work (drain-free landing fence): mlx5 ctrl-segment fence-mode value OR'd
   // into fm_ce_se on the fused signal ATOMIC WQE. On RoCE RC a WRITE is NOT ordered
   // before a following ATOMIC on the same QP, so the DEEP_PIPE put-with-signal AMO
@@ -164,6 +155,15 @@ struct GpuStates {
   // pipeline back to ~0.88x). 0 (default) = no fence bit = byte-identical shipped
   // path. Set from env MORI_HIER_SIGNAL_FENCE in GpuStateInit (MLX5 only).
   int signalFenceMode{0};
+  // Packet-fill diagnostic: when >0, the leader lane of the inter-node RDMA put
+  // emits a one-shot device printf of the actual posted RDMA WRITE message size
+  // (transfer_size) for the first ``diagPutSize`` WQEs per QP per rank. This
+  // exposes the per-QP inter-node WRITE granularity at the code level (whether a
+  // full multi-MB WRITE is posted for the NIC to segment into full-MTU packets,
+  // or many sub-MTU writes are issued). Pure observability: no data path change,
+  // no WQE change. 0 (default) = no print = byte-identical shipped path. Set from
+  // env MORI_DIAG_PUTSIZE in GpuStateInit.
+  int diagPutSize{0};
   application::TransportType* transportTypes{nullptr};
   ShmemRdmaEndpoint* rdmaEndpoints{nullptr};
   uint32_t* endpointLock{nullptr};
@@ -204,7 +204,7 @@ struct RemoteAddrInfo {
 enum ShmemStatesStatus {
   New = 0,
   Initialized = 1,
-  // Finalized: reserved. ShmemFinalize() currently resets the slot to `New`
+  // Finalized: reserved. ShmemFinalize currently resets the slot to `New`
   // so the same GPU can be re-initialized later (needed by SPMT test suites
   // that run multiple init/finalize cycles). Keep this value for the case
   // where future finalize semantics need to mark the slot as terminally done.
@@ -220,6 +220,9 @@ struct ModuleStates {
   // if the loaded module predates it, in which case the dissem launcher falls
   // back to the funnel barrier).
   hipFunction_t dissemBarrierFunc{nullptr};
+  // hierarchical 2-level barrier kernel (optional; nullptr if the loaded
+  // module predates it, in which case the hier launcher falls back to the funnel).
+  hipFunction_t hierBarrierFunc{nullptr};
 };
 
 struct ShmemStates {
@@ -261,19 +264,19 @@ class ShmemStatesSingleton {
   // SPMT: rank → HIP device id mapping, populated at ShmemInit.
   //
   // Needed by FFI/custom-call handlers (e.g. XLA) that run on framework worker
-  // threads where hipGetDevice() does not return the rank's device. The handler
-  // can look up the device for a given rank and hipSetDevice() to it before
+  // threads where hipGetDevice does not return the rank's device. The handler
+  // can look up the device for a given rank and hipSetDevice to it before
   // touching MORI state.
   //
   // Returns -1 if no rank-to-device mapping has been recorded yet (caller
-  // should fall back to hipGetDevice()-based lookup or fail loudly).
+  // should fall back to hipGetDevice-based lookup or fail loudly).
   static void RegisterRankDevice(int rank, int deviceId);
   static int GetDeviceByRank(int rank);
 #endif
 
  private:
 #ifdef MORI_MULTITHREAD_SUPPORT
-  // One ShmemStates slot per GPU, indexed by hipGetDevice().
+  // One ShmemStates slot per GPU, indexed by hipGetDevice.
   // std::array gives stable addresses (no realloc unlike deque/vector).
   // No lock needed: SPMT contract is one thread per GPU, so each slot is
   // accessed serially by its owning thread; the rank → device map below is

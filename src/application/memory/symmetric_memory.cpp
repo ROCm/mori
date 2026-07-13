@@ -75,7 +75,7 @@ void SymmMemManager::HostFree(void* localPtr) {
 
 SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
   void* ptr = nullptr;
-  // Use the Context-cached snapshot rather than getenv() so this stays
+  // Use the Context-cached snapshot rather than getenv so this stays
   // consistent with the transport selection that was made when the Context
   // was constructed. Without this, late env mutations (e.g. a test setting
   // MORI_ENABLE_SDMA after worker init) flip allocations to uncached
@@ -122,9 +122,9 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
 
   // P2P context: exchange ipc mem handles and open them for all same-node peers
   // p2pPeerPtrs layout:
-  //   - [rank]: local pointer (self)
-  //   - [same-node peers]: P2P pointers from hipIpcOpenMemHandle
-  //   - [different-node peers]: 0
+  // - [rank]: local pointer (self)
+  // - [same-node peers]: P2P pointers from hipIpcOpenMemHandle
+  // - [different-node peers]: 0
   cpuMemObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   cpuMemObj->p2pPeerPtrs[rank] = reinterpret_cast<uintptr_t>(localPtr);  // Set self pointer
 
@@ -195,13 +195,14 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
     }
   }
   if (rdmaDeviceContext && anyRdmaPeer) {
-    application::RdmaMemoryRegion mr = rdmaDeviceContext->RegisterRdmaMemoryRegion(localPtr, size);
+    application::RdmaMemoryRegion mr =
+        rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
     cpuMemObj->lkey = mr.lkey;
     cpuMemObj->peerRkeys[rank] = mr.rkey;
   }
   bootNet.Allgather(&cpuMemObj->peerRkeys[rank], cpuMemObj->peerRkeys, sizeof(uint32_t));
 
-  // DUAL-RAIL: also register this buffer on the second (idle) NIC so QPs on that
+  // Dual-rail: also register this buffer on the second (idle) NIC so QPs on that
   // rail have a valid MR (its own lkey/rkey). The device put selects these keys
   // for rail-2 QP ids. Exchange the rail-2 rkeys the same way as the primary.
   RdmaDeviceContext* rdmaDeviceContext2 = context.GetRdmaDeviceContext2();
@@ -232,7 +233,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
-  // DUAL-RAIL: mirror peerRkeys2 to the device (gpuMemObj was memcpy'd from cpuMemObj
+  // Dual-rail: mirror peerRkeys2 to the device (gpuMemObj was memcpy'd from cpuMemObj
   // above, so hasRail2/lkey2 scalar fields are already set; only the pointer array
   // needs its own device allocation). peerRkeys2 is always allocated CPU-side.
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerRkeys2, sizeof(uint32_t) * worldSize));
@@ -258,7 +259,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       if (context.GetTransportType(j) == TransportType::SDMA) srcDeviceId++;
     int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
     // Allocate based on worldSize because indexing uses pe * numQ where pe ranges
-    // 0..worldSize-1. Using sdmaPeers.size() causes buffer overflow.
+    // 0..worldSize-1. Using sdmaPeers.size causes buffer overflow.
     size_t numDevices = static_cast<size_t>(worldSize);
     HIP_RUNTIME_CHECK(
         hipMalloc(&gpuMemObj->deviceHandles_d,
@@ -465,6 +466,20 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
   cpuMemObj->lkey = heapObj->cpu->lkey;
   cpuMemObj->sdmaNumQueue = heapObj->cpu->sdmaNumQueue;
 
+  // Dual-rail: a static-heap sub-region shares the heap's rail-2 MR (keys are
+  // per-MR, not per-offset), so mirror lkey2/hasRail2/peerRkeys2 from the heap object
+  // exactly like the rail-1 keys above. Without this the sub-object carried lkey2==0 and
+  // peerRkeys2==nullptr, so a rail-2 QP on the non-chunking (static-heap) UT path posted
+  // a rail-1/zero key -> the local-protection residual (source->lkey2==0). Default
+  // path: heap hasRail2 is false => keys stay 0/zeroed and useRail2 is false => the
+  // kernel never reads them, so behavior is byte-identical to single-rail.
+  cpuMemObj->peerRkeys2 = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
+  if (heapObj->cpu->hasRail2) {
+    memcpy(cpuMemObj->peerRkeys2, heapObj->cpu->peerRkeys2, sizeof(uint32_t) * worldSize);
+    cpuMemObj->lkey2 = heapObj->cpu->lkey2;
+    cpuMemObj->hasRail2 = true;
+  }
+
   SymmMemObj* gpuMemObj;
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj, sizeof(SymmMemObj)));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj, cpuMemObj, sizeof(SymmMemObj), hipMemcpyHostToDevice));
@@ -479,6 +494,14 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
 
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerRkeys, sizeof(uint32_t) * worldSize));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
+                              sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
+
+  // Dual-rail: give the sub-region its own device peerRkeys2 array (the scalar
+  // lkey2/hasRail2 already rode the sizeof(SymmMemObj) memcpy above). Matches the
+  // full-registration path which always allocs peerRkeys2; zeroed + never read on the
+  // default single-rail path (useRail2 false).
+  HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerRkeys2, sizeof(uint32_t) * worldSize));
+  HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys2, cpuMemObj->peerRkeys2,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
   // Copy SDMA resources from heap object (shared across all heap allocations)
@@ -511,11 +534,13 @@ void SymmMemManager::DeregisterStaticHeapSubRegion(void* localPtr) {
   free(memObjPtr.cpu->peerPtrs);
   free(memObjPtr.cpu->p2pPeerPtrs);
   free(memObjPtr.cpu->peerRkeys);
+  free(memObjPtr.cpu->peerRkeys2);  // Dual-rail: mirror of the rail-1 free
   free(memObjPtr.cpu->ipcMemHandles);
   free(memObjPtr.cpu);
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerPtrs));
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->p2pPeerPtrs));
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerRkeys));
+  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerRkeys2));  // Dual-rail
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu));
 
   memObjPool.erase(localPtr);
@@ -1356,6 +1381,15 @@ void SymmMemManager::RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded, 
 
   MORI_APP_TRACE("VMMAlloc: rank={} RDMA register {} chunks", rank, chunksNeeded);
 
+  // Dual-rail: the second (idle) NIC context, if dual-rail is enabled.
+  // Each VMM chunk must ALSO be registered on this device so rail-2 QPs (created
+  // on it in context.cpp) have a valid MR with its OWN lkey/rkey (stored in
+  // VMMChunkKey.key2). Without this the rail-2 QP posted the device-1 lkey and
+  // the NIC raised a protection error -> Mlx5CollapsedCqDrain assert (the
+  // crash). rdmaDeviceContext2 == nullptr => single-rail, key2 stays 0/unused.
+  RdmaDeviceContext* rdmaDeviceContext2 = context.GetRdmaDeviceContext2();
+  std::vector<uint32_t> localChunkRkeys2(rdmaDeviceContext2 ? chunksNeeded : 0);
+
   // Collect local chunk RDMA keys
   std::vector<uint32_t> localChunkRkeys(chunksNeeded);
 
@@ -1365,6 +1399,11 @@ void SymmMemManager::RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded, 
     // Skip if this chunk already has RDMA registration (for reused chunks)
     if (vmmChunks[chunkIdx].rdmaRegistered) {
       localChunkRkeys[i] = vmmChunks[chunkIdx].peerRkeys[rank];
+      // Dual-rail reuse: the rail-2 lkey/rkey were persisted into the VMMChunkKey
+      // arrays on first registration; pull the local rail-2 rkey back for re-exchange.
+      if (rdmaDeviceContext2) {
+        localChunkRkeys2[i] = vmmHeapObj.cpu->vmmRkeyInfo[chunkIdx * worldSize + rank].key2;
+      }
       MORI_APP_TRACE("VMMAlloc: rank={} chunk={} RDMA reuse lkey={}", rank, chunkIdx,
                      vmmChunks[chunkIdx].lkey);
       continue;
@@ -1393,6 +1432,19 @@ void SymmMemManager::RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded, 
     vmmHeapObj.cpu->vmmLkeyInfo[chunkIdx].key = mr.lkey;
     vmmHeapObj.cpu->vmmRkeyInfo[chunkIdx * worldSize + rank].key = mr.rkey;
 
+    // Dual-rail: register the SAME chunk on the second NIC. ibv_reg_dmabuf_mr
+    // does not consume the fd, so the still-open shareableHandle re-registers on
+    // device2's PD, yielding a distinct lkey/rkey stored in the .key2 slot.
+    if (rdmaDeviceContext2) {
+      application::RdmaMemoryRegion mr2 =
+          rdmaDeviceContext2->RegisterRdmaMemoryRegionDmabuf(chunkPtr, vmmChunkSize, dmabufFd);
+      vmmHeapObj.cpu->vmmLkeyInfo[chunkIdx].key2 = mr2.lkey;
+      vmmHeapObj.cpu->vmmRkeyInfo[chunkIdx * worldSize + rank].key2 = mr2.rkey;
+      localChunkRkeys2[i] = mr2.rkey;
+      MORI_APP_TRACE("VMMAlloc: rank={} DUAL-RAIL chunk={} rail2 lkey={} rkey={}", rank, chunkIdx,
+                     mr2.lkey, mr2.rkey);
+    }
+
     MORI_APP_TRACE("VMMAlloc: rank={} RDMA chunk={} addr={:p} fd={} lkey={} rkey={}", rank,
                    chunkIdx, chunkPtr, dmabufFd, mr.lkey, mr.rkey);
   }
@@ -1415,6 +1467,31 @@ void SymmMemManager::RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded, 
       uint32_t rkeyValue = allChunkRkeysFlat[pe * chunksNeeded + i];
       vmmChunks[chunkIdx].peerRkeys[pe] = rkeyValue;
       vmmHeapObj.cpu->vmmRkeyInfo[chunkIdx * worldSize + pe].key = rkeyValue;
+    }
+  }
+
+  // Dual-rail: exchange + store the rail-2 rkeys the SAME way, into the
+  // .key2 slot. The hipMemcpy below copies the whole VMMChunkKey (sizeof grew to
+  // include key2), so both rails reach the GPU in one shot. Mark the VMM heap as
+  // rail-2-capable so the device useRail2 predicate (dest->hasRail2) engages.
+  if (rdmaDeviceContext2) {
+    std::vector<uint32_t> allChunkRkeys2Flat(worldSize * chunksNeeded, 0);
+    for (size_t i = 0; i < chunksNeeded; ++i) {
+      allChunkRkeys2Flat[rank * chunksNeeded + i] = localChunkRkeys2[i];
+    }
+    bootNet.Allgather(localChunkRkeys2.data(), allChunkRkeys2Flat.data(),
+                      sizeof(uint32_t) * chunksNeeded);
+    for (int pe = 0; pe < worldSize; ++pe) {
+      for (size_t i = 0; i < chunksNeeded; ++i) {
+        size_t chunkIdx = startChunk + i;
+        vmmHeapObj.cpu->vmmRkeyInfo[chunkIdx * worldSize + pe].key2 =
+            allChunkRkeys2Flat[pe * chunksNeeded + i];
+      }
+    }
+    if (!vmmHeapObj.cpu->hasRail2) {
+      vmmHeapObj.cpu->hasRail2 = true;
+      HIP_RUNTIME_CHECK(hipMemcpy(&vmmHeapObj.gpu->hasRail2, &vmmHeapObj.cpu->hasRail2, sizeof(bool),
+                                  hipMemcpyHostToDevice));
     }
   }
 

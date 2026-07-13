@@ -539,6 +539,12 @@ class InterNodeRingAllgather:
         if barrier:
             self._handle.finish_stream_no_copy(s)
 
+    def parity_counter_ptr(self) -> int:
+        """Device pointer of the double-buffer per-op parity counter (0 unless
+        MORI_HIER_GEN_RING_DBL is engaged). The launcher fires the captured
+        RingParityBumpKernel_u32 on this before each fused-kernel launch."""
+        return int(self._handle.parity_counter_ptr())
+
     def prepare_stream_only(self, input_data, count: int, stream=None):
         """issue ONLY the stream-ordered ring prepare (the
         global on-stream ShmemBarrierOnStream entry barrier + the per-PE copy-IN
@@ -847,12 +853,15 @@ class IntraNodeSubGroupAllgatherSdma:
 
     def gather_kernel_direct(self, input_data, output_data, count: int, dst_block_offset: int = 0,
                              stream=None, prepare_barrier: bool = True,
-                             dst_slot_stride: int = 0) -> bool:
+                             dst_slot_stride: int = 0, flag_slot_base: int = 0) -> bool:
         # DIRECT gather -- SDMA-PUSH each member's slice straight
         # into the (registered) ``output_data`` at element offset
         # ``dst_block_offset`` (of the input dtype), no internal transit + no
         # copy-OUT. ``output_data`` MUST have been registered via
         # register_output_buffer. ``dst_slot_stride`` matches gather_kernel.
+        # T22: ``flag_slot_base`` gives a CONCURRENT lane a disjoint flag-slot
+        # region [flag_slot_base, +groupSize) so multi-stream reassembly gathers
+        # (MORI_HIER_REASM_STREAMS) never race on the shared flag slots (0=off).
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
         dst_block_offset_bytes = dst_block_offset * input_data.element_size()
@@ -860,7 +869,7 @@ class IntraNodeSubGroupAllgatherSdma:
         s = _stream_to_int(stream)
         args = self._handle.prepare_sync_direct(
             input_data.data_ptr(), u32_count, s, prepare_barrier, output_data.data_ptr(),
-            dst_block_offset_bytes, dst_slot_stride_bytes,
+            dst_block_offset_bytes, dst_slot_stride_bytes, flag_slot_base,
         )
         _get_ccl_func("OneShotAllGatherSdmaSubGroupKernel_u32").launch_struct(
             (1,), (512,), 0, s, args
@@ -1019,7 +1028,9 @@ def launch_fused_ring_local_gather(ring_args: int, gather_args: int,
 
 def launch_fused_ring_remote_gather(ring_args: int, gather_args: int, ring_blocks: int,
                                     chunk_ready_flags_ptr: int, num_nodes: int, node_id: int,
-                                    s: int, reassembly_blocks: int = 0) -> bool:
+                                    s: int, reassembly_blocks: int = 0,
+                                    op_gen: int = 0, reasm_deep_sq: int = 0,
+                                    parity_ptr: int = 0) -> bool:
     """PHASE 4: launch the FUSED, PIPELINED ``FusedRingRemoteGatherKernel_u32`` ONCE
     on stream ``s`` with ``2*ring_blocks + 1`` CTAs. Blocks ``[0, ring_blocks)`` run
     the RDMA ring (Phase A) and each publishes ``chunkReadyFlags[bid]`` on landing;
@@ -1036,9 +1047,30 @@ def launch_fused_ring_remote_gather(ring_args: int, gather_args: int, ring_block
     rb = ring_blocks if ring_blocks and ring_blocks >= 1 else 1
     reasm = reassembly_blocks if reassembly_blocks and reassembly_blocks >= 1 else rb
     fused = mori_cpp.build_fused_ring_remote_gather_args(
-        ring_args, gather_args, rb, chunk_ready_flags_ptr, num_nodes, node_id, reasm)
+        ring_args, gather_args, rb, chunk_ready_flags_ptr, num_nodes, node_id, reasm,
+        op_gen, reasm_deep_sq)
+    # SAME-CTA INLINE REASSEMBLY (MORI_HIER_INLINE_REASM): on the multiBlock ring
+    # (rb>1) each ring channel CTA reassembles its OWN landed sub-range inline, so the
+    # dedicated reassembly CTAs are redundant -- drop them (grid rb+1 instead of
+    # 2*rb+1). Mirror the C++ builder gate: rb>1, no host-proxy inter, default reasm
+    # (reassembly_blocks<=0 => reasm==rb, no elastic). deepPipe is forced 1 at rb>1.
+    _inline_reasm = False
+    if rb > 1 and (reassembly_blocks is None or reassembly_blocks <= 0):
+        _e = os.environ.get("MORI_HIER_INLINE_REASM", "")
+        _hp = os.environ.get("MORI_HIER_HOSTPROXY_REASM", "")
+        _el = os.environ.get("MORI_HIER_FUSE_REMOTE_ELASTIC", "")
+        _inline_reasm = (_e not in ("", "0")) and (_hp in ("", "0")) and (_el in ("", "0"))
+    _reasm_ctas = 0 if _inline_reasm else reasm
+    # Double-buffer: bump the per-op parity counter on-stream before the fused
+    # kernel (captured, so it advances under graph replay; every kernel block then
+    # reads one stable post-bump value to pick the active ring half). parity_ptr==0
+    # => single-buffer (no bump, byte-identical).
+    if parity_ptr:
+        _get_ccl_func("RingParityBumpKernel_u32").launch(
+            (1,), (1,), 0, s, parity_ptr
+        )
     _get_ccl_func("FusedRingRemoteGatherKernel_u32").launch_struct(
-        (rb + 1 + reasm,), (512,), 0, s, fused
+        (rb + 1 + _reasm_ctas,), (512,), 0, s, fused
     )
     return True
 

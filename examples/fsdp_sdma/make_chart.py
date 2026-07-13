@@ -1,62 +1,63 @@
 #!/usr/bin/env python3
-"""Build compare_chart.png: RCCL (native) vs MORI SDMA HierAllGather, 2-node FSDP2 Qwen-7B."""
-import json, glob, os
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+"""Build compare_chart.png: end-to-end FSDP2 training-step throughput of
+the mori SDMA cross-node HierAllGather vs the framework-default ("native")
+AllGather, for the two target topologies (2-node x 4 GPU and 2-node x 8 GPU).
+
+Throughput is normalized to native = 1.0 (per-window paired comparison); the
+bit-exact training loss is annotated under each config as the correctness result.
+Reads e2e_gate2.csv. No GPU needed:  python3 make_chart.py
+"""
+import csv
+import os
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-D = "/apps/mingzliu/fsdp_hier"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+rows = list(csv.DictReader(open(os.path.join(_HERE, "e2e_gate2.csv"))))
 
-def load(paths):
-    out = []
-    for p in paths:
-        fp = os.path.join(D, p)
-        if os.path.exists(fp):
-            out.append(json.load(open(fp)))
-    return out
+configs = []
+for r in rows:
+    if r["config"] not in configs:
+        configs.append(r["config"])
 
-native = load(["result_native_fair.json", "result_native_fair2.json"])
-hier   = load(["result_hier.json", "result_hier2.json"])
-assert native and hier, "missing results"
+fig, ax = plt.subplots(figsize=(9, 5.4))
+w = 0.36
+x = np.arange(len(configs))
+native_r = [1.0 for _ in configs]
+mori_r, mori_lo, mori_hi, mori_loss = [], [], [], []
+for c in configs:
+    m = next(r for r in rows if r["config"] == c and r["backend"] == "mori SDMA hier")
+    mori_r.append(float(m["e2e_ratio_vs_native"]))
+    mori_lo.append(float(m["e2e_ratio_vs_native"]) - float(m["e2e_ratio_lo"]))
+    mori_hi.append(float(m["e2e_ratio_hi"]) - float(m["e2e_ratio_vs_native"]))
+    mori_loss.append(m["last_loss"])
 
-def mean(rows, k): return float(np.mean([r[k] for r in rows]))
+ax.bar(x - w / 2, native_r, w, label="native baseline", color="#4C72B0")
+ax.bar(x + w / 2, mori_r, w, yerr=[mori_lo, mori_hi], capsize=5,
+       label="mori SDMA hier (this work)", color="#55A868")
+ax.axhline(1.0, color="#888", lw=0.8, ls="--")
 
-n_tf, h_tf = mean(native, "avg_tflops_per_gpu"), mean(hier, "avg_tflops_per_gpu")
-n_st, h_st = mean(native, "avg_step_time_s"),     mean(hier, "avg_step_time_s")
-n_tok, h_tok = mean(native, "avg_tokens_per_s"),  mean(hier, "avg_tokens_per_s")
-n_loss = [r["last_loss"] for r in native]
-h_loss = [r["last_loss"] for r in hier]
+for i, c in enumerate(configs):
+    ax.annotate(f"{mori_r[i]:.3f}x", (i + w / 2, mori_r[i]),
+                textcoords="offset points", xytext=(0, 6), ha="center",
+                fontsize=10, fontweight="bold")
+    ax.annotate(f"loss={mori_loss[i]}\n(bit-exact vs native)", (i, 0.04),
+                ha="center", va="bottom", fontsize=8, color="#1a1a1a")
 
-fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-colors = ["#1f77b4", "#d62728"]
-labels = ["RCCL\n(native)", "SDMA\nHierAllGather"]
-
-# TFLOPS/GPU (higher better)
-b = ax[0].bar(labels, [n_tf, h_tf], color=colors)
-ax[0].set_title("TFLOPS / GPU  (higher = better)")
-ax[0].set_ylabel("TFLOPS/GPU")
-for r, v in zip(b, [n_tf, h_tf]): ax[0].text(r.get_x()+r.get_width()/2, v, f"{v:.1f}", ha="center", va="bottom")
-
-# step time (lower better)
-b = ax[1].bar(labels, [n_st, h_st], color=colors)
-ax[1].set_title("Avg step time (s)  (lower = better)")
-ax[1].set_ylabel("seconds/step")
-for r, v in zip(b, [n_st, h_st]): ax[1].text(r.get_x()+r.get_width()/2, v, f"{v:.3f}", ha="center", va="bottom")
-
-# throughput (higher better)
-b = ax[2].bar(labels, [n_tok, h_tok], color=colors)
-ax[2].set_title("Throughput (tokens/s)  (higher = better)")
-ax[2].set_ylabel("tokens/s")
-for r, v in zip(b, [n_tok, h_tok]): ax[2].text(r.get_x()+r.get_width()/2, v, f"{v:.0f}", ha="center", va="bottom")
-
-fig.suptitle(
-    "FSDP2 Qwen-7B, cross-node (2 nodes x 4 GPU = world 8), bf16, seq=1024, steps=10/warmup=3\n"
-    f"last_loss  RCCL={n_loss}  SDMA={h_loss}  (match within bf16 noise -> correctness control)",
-    fontsize=10)
-fig.tight_layout(rect=[0, 0, 1, 0.92])
-out = os.path.join(D, "compare_chart.png")
+ax.set_xticks(x)
+ax.set_xticklabels([f"{c}\n(world={next(r['world'] for r in rows if r['config']==c)})"
+                    for c in configs])
+ax.set_ylabel("E2E FSDP2 training-step throughput\n(normalized, native = 1.0; higher=better)")
+ax.set_title("Cross-node FSDP2 (Qwen-7B) end-to-end throughput — "
+             "mori SDMA HierAllGather vs native baseline (bit-exact)")
+ax.set_ylim(0, max(mori_r) + 0.25)
+ax.legend(loc="upper left")
+ax.grid(axis="y", alpha=0.3)
+fig.tight_layout()
+out = os.path.join(_HERE, "compare_chart.png")
 fig.savefig(out, dpi=130)
 print("wrote", out)
-print(f"native tflops/gpu={n_tf:.2f} step={n_st:.4f} tok/s={n_tok:.0f} loss={n_loss}")
-print(f"hier   tflops/gpu={h_tf:.2f} step={h_st:.4f} tok/s={h_tok:.0f} loss={h_loss}")

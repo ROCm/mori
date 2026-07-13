@@ -58,7 +58,7 @@ HcaCapability QueryHcaCap(ibv_context* context);
 // TODO: refactor Mlx5CqContainer so its structure is similar to Mlx5QpContainer
 class Mlx5CqContainer {
  public:
-  Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig& config);
+  Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig& config, bool collapsed = true);
   ~Mlx5CqContainer();
 
  public:
@@ -80,7 +80,7 @@ class Mlx5DeviceContext;  // Forward declaration
 class Mlx5QpContainer {
  public:
   Mlx5QpContainer(ibv_context* context, const RdmaEndpointConfig& config, uint32_t cqn,
-                  uint32_t pdn, Mlx5DeviceContext* device_context);
+                  uint32_t pdn, Mlx5DeviceContext* device_context, uint32_t cqnRcv = 0);
   ~Mlx5QpContainer();
 
   void ModifyRst2Init();
@@ -96,7 +96,7 @@ class Mlx5QpContainer {
 
  private:
   void ComputeQueueAttrs(const RdmaEndpointConfig& config);
-  void CreateQueuePair(uint32_t cqn, uint32_t pdn);
+  void CreateQueuePair(uint32_t cqn, uint32_t pdn, uint32_t cqnRcv);
   void DestroyQueuePair();
 
  public:

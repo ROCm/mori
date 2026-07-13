@@ -29,6 +29,8 @@
 #include <limits.h>
 #include <stdint.h>
 
+#include "mori/hip_compat.hpp"  // __device__ / __host__ (no-op under non-hipcc host parse)
+
 namespace mori {
 namespace core {
 
@@ -157,6 +159,43 @@ struct IbufHandle {
   uint32_t nslots{0};
   uint32_t head{0};
   uint32_t tail{0};
+};
+
+enum class RdmaDeviceVendorId : uint32_t {
+  Unknown = 0,
+  Mellanox = 0x02c9,
+  Broadcom = 0x14E4,
+  Pensando = 0x1dd8,
+};
+
+// Device-side view of an RDMA endpoint: a pure device POD over core's WQ/CQ/Ibuf
+// handles. Filled on the host from application::RdmaEndpoint, hipMemcpy'd to the
+// device, consumed by the RDMA backends (shmem, cco) — which depend down on core.
+struct RdmaEndpointDevice {
+  RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
+  uint32_t qpn{0};  // QP number — extracted from application::RdmaEndpoint::handle.qpn
+  WorkQueueHandle wqHandle;
+  CompletionQueueHandle cqHandle;
+  // WRITE_WITH_IMM receiver (hierarchical AllGather cross-node ring accuracy fix): the
+  // recv-side completion queue the responder posts RDMA_WRITE_WITH_IMM CQEs into. Mirrors
+  // cqHandle when no dedicated recv CQ is configured (send+recv share one CQ), so device
+  // receivers can always read recvCqHandle uniformly. Populated in init.cpp from
+  // application::RdmaEndpoint::recvCqHandle.
+  CompletionQueueHandle recvCqHandle;
+  IbufHandle atomicIbuf;
+
+  __device__ __host__ ProviderType GetProviderType() const {
+    switch (vendorId) {
+      case RdmaDeviceVendorId::Mellanox:
+        return ProviderType::MLX5;
+      case RdmaDeviceVendorId::Broadcom:
+        return ProviderType::BNXT;
+      case RdmaDeviceVendorId::Pensando:
+        return ProviderType::PSD;
+      default:
+        return ProviderType::Unknown;
+    }
+  }
 };
 
 /* ---------------------------------------------------------------------------------------------- */
