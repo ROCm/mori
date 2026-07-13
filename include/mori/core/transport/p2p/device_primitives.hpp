@@ -2243,7 +2243,7 @@ __device__ __forceinline__ void WarpQuantizeToFp4Blockwise(PackedT* __restrict__
   if (warpSize == 64 && blockElems == 128 && (hiddenDim % 128) == 0 &&
       std::is_same_v<InT, hip_bfloat16>) {
     WarpQuantizeToFp4BlockwiseVec<8, 16, PackedT, InT>(dstToken, dstScales, srcToken, hiddenDim,
-                                                    scaleDim);
+                                                       scaleDim);
     return;
   }
   // Fast path: 64-lane warp, blockElems == 256 == 8 subwarps * 32 elems (mirrors the fp8bwq
@@ -2251,7 +2251,7 @@ __device__ __forceinline__ void WarpQuantizeToFp4Blockwise(PackedT* __restrict__
   if (warpSize == 64 && blockElems == 256 && (hiddenDim % 256) == 0 &&
       std::is_same_v<InT, hip_bfloat16>) {
     WarpQuantizeToFp4BlockwiseVec<8, 32, PackedT, InT>(dstToken, dstScales, srcToken, hiddenDim,
-                                                    scaleDim);
+                                                       scaleDim);
     return;
   }
 
