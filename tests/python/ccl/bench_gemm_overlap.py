@@ -164,11 +164,28 @@ def _worker(rank, world_size, ranks_per_node, device, sizes_mb, dtypes, reps,
     if os.environ.get("MORI_HIER_OVERLAP_HOSTSYNC", "0") not in ("0", "false", "False"):
         os.environ["MORI_HIER_STREAM_RING"] = "0"
         os.environ["MORI_HIER_STREAM_INTRA"] = "0"
+    # STANDALONE-FAST overlap path (env MORI_HIER_UT_FAST, default OFF to keep the
+    # recorded baseline byte-identical). The overlap UT was constructing the SLOW
+    # default HierAllGather (serial floor, fuse_local OFF), NOT the achievable fast
+    # crown path the BW sweep already measures (bench_sweep.py standalone_fast=True).
+    # That is why mori's SOLO AG lagged RCCL (512MB 30.0 vs 23.7ms) and lost the
+    # overlap ratio despite mori's overlap EXTRA (total-solo) already being SMALLER
+    # than RCCL's -- i.e. mori already hides behind the GEMM; it was just running the
+    # slow AG. This is a STANDALONE bench: every AG is bracketed by a full
+    # torch.cuda.synchronize() + dist.barrier() (see _host_time), so there is no
+    # FSDP tight-overlap, and the fuse_local stale-remote race (FSDP-only) cannot
+    # occur -- exactly the invariant bench_sweep.py relies on. standalone_fast keeps
+    # the bulk bytes on the XGMI-SDMA copy engine (intra) + RDMA (inter); NO CU
+    # vectorized copy (honours MOTIVATION_RULES: bulk bytes stay on SDMA/RDMA). The
+    # per-size zero-tolerance bit-exact gate below still guards correctness.
+    _ut_fast = os.environ.get("MORI_HIER_UT_FAST", "0") not in (
+        "0", "", "false", "False")
     handle = HierAllGather(
         my_pe=rank, npes=world_size, ranks_per_node=ranks_per_node,
         input_buffer_size=per_rank_bytes,
         output_buffer_size=per_rank_bytes * world_size,
         copy_output_to_user=True,
+        standalone_fast=_ut_fast,
     )
     compute_stream = torch.cuda.Stream()
     if rank == 0:
