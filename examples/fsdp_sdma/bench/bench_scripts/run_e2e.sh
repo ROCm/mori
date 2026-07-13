@@ -17,9 +17,9 @@ WORKER="${WORKER:-useocpm2m-097-115}"
 MASTER_IP="${MASTER_IP:-10.158.213.63}"
 CTR="${CTR:-mori-sglang-mingzhi}"
 # repo root = three levels up from this script (examples/fsdp_sdma/scripts/..)
-WT="${MORI_REPO:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+WT="${MORI_REPO:-$(cd "$(dirname "$0")/../../../.." && pwd)}"
 EX="$WT/examples/fsdp_sdma"
-CFG="${QWEN_CFG:-$EX/scripts/qwen7b_vocab32000}"   # Qwen2 config dir, vocab_size=32000
+CFG="${QWEN_CFG:-$EX/bench/bench_scripts/qwen7b_vocab32000}"   # Qwen2 config dir, vocab_size=32000
 IFACE="${IFACE:-eth0}"
 IB="${MORI_RDMA_DEVICES:-mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9}"
 GID="${NCCL_IB_GID_INDEX:-3}"
