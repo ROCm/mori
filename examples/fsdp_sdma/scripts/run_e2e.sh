@@ -37,11 +37,15 @@ run_world() {  # <w8|w16>
   esac
   # mori backend routing: MORI_FSDP_ENABLE_HIER=1 selects the HierAllGather adapter
   # (the plain MORI_ENABLE_SDMA default routes to the flat oneshot backend that
-  # faults cross-node). w16 uses the adapter's rpn>=8 host-drain bit-exact base;
-  # w8 uses the host-proxy transport (the device rpn=4 kernel needs a .so fix).
+  # faults cross-node). w16 runs the deferred landing fence (no inline host-drain):
+  # MORI_HIER_DEBUG_SYNC=0 drops the inline stream.synchronize() so the adapter's
+  # deferred event.synchronize() at copy-out overlaps the backward GEMM -> >native
+  # AND bit-exact (500-step verified on 040/083 + 089/121). w8 uses the host-proxy
+  # transport (the device rpn=4 kernel needs a .so fix).
   local menv=""
   if [ "$MODE" = mori ]; then
     menv="MORI_ENABLE_SDMA=1 MORI_FSDP_ENABLE_HIER=1"
+    [ "$world" = w16 ] && menv="$menv MORI_HIER_DEBUG_SYNC=0"
     [ "$world" = w8 ] && menv="$menv MORI_FSDP_HOST_PROXY=1 MORI_FSDP_HOSTPROXY_CAP_MB=512 MORI_SHMEM_HEAP_SIZE=17179869184"
   fi
   local port=$(( 29500 + RANDOM % 300 ))
