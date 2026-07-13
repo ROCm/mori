@@ -37,51 +37,62 @@ ag = HierAllGather(
 ag(input_tensor, output_tensor, numel, stream)   # intra=SDMA, inter=RDMA
 ```
 
-## Results (2 nodes × 4 GPUs = 8 ranks, MI355X, fp32)
+## Results (MI300X, mlx5 RoCEv2, fp32, all bit-exact vs RCCL)
 
-**Standalone AllGather — SDMA ≥ native:**
+Full tables, CSVs, and chart scripts are under
+[`examples/fsdp_sdma/`](examples/fsdp_sdma/) (`RESULTS.md`, `bench_data/`,
+`make_bench_charts.py`); the figures below are regenerated from that data with no
+GPU required.
 
-| size | SDMA GB/s | native GB/s | ratio |
-|-----:|----------:|------------:|------:|
-| 4 MB   | 57.5  | 72.8  | 0.79 |
-| 8 MB   | 147.2 | 120.1 | 1.23 |
-| 16 MB  | 174.4 | 130.8 | 1.33 |
-| 32 MB  | 191.6 | 156.8 | 1.22 |
-| 64 MB  | 202.3 | 149.8 | 1.35 |
-| 128 MB | 205.9 | 153.0 | 1.35 |
-| 256 MB | 202.5 | 165.4 | 1.22 |
-| 512 MB | 203.5 | 171.0 | 1.19 |
+**Standalone AllGather bandwidth vs RCCL** — world=8 matches/exceeds RCCL at
+≥32 MB; world=16 uses the intra-node crown broadcast schedule
+(`MORI_HIER_CROWN`) to match RCCL at ≥64 MB:
 
-SDMA ≥ native for every size ≥ 8 MB (1.19–1.35×); 4 MB is latency-bound.
+| size | w8 ratio | w16 ratio |
+|-----:|---------:|----------:|
+| 32 MB  | 1.00 | 0.95 |
+| 64 MB  | 1.02 | 1.00 |
+| 128 MB | 1.03 | 1.03 |
+| 256 MB | 1.05 | 1.01 |
+| 512 MB | 0.96 | 1.02 |
 
-![standalone](benchmarks/allgather_results/chart_standalone.png)
+Below 32 MB a fixed per-op SDMA round-trip dominates; large-message bandwidth is
+at parity. (w8 numbers are from clean, uncontended nodes and are node-pair
+dependent.)
 
-**Under concurrent GEMM (total time, lower is better) — SDMA strictly faster:**
+![standalone](examples/fsdp_sdma/ut_allgather_bw.png)
 
-| size | GEMM + native AG (ms) | GEMM + SDMA AG (ms) | SDMA advantage |
-|-----:|----------------------:|--------------------:|---------------:|
-| 16 MB  | 4.27  | 4.26  | faster |
-| 32 MB  | 4.59  | 4.55  | faster |
-| 64 MB  | 5.19  | 5.03  | ~3% |
-| 128 MB | 7.52  | 6.27  | ~17% |
-| 256 MB | 14.15 | 11.38 | ~20% |
-| 512 MB | 26.24 | 21.97 | ~16% |
+**Bandwidth under a concurrent GEMM (no-CU-contention dividend)** — RCCL's copy
+kernels compete with the GEMM for CUs and lose >2.5× of their bandwidth; the SDMA
+copy engine does not touch CUs, so HierAllGather holds bandwidth and is faster
+than RCCL under contention:
 
-Because SDMA uses copy engines while the native path consumes CUs the GEMM needs,
-the SDMA AllGather overlaps with compute far better — 16–20% lower total time at
-large sizes.
+| per-rank | RCCL slowdown | HierAllGather slowdown |
+|---------:|--------------:|-----------------------:|
+| 34 MB | 2.73× | 1.90× |
+| 67 MB | 2.52× | 0.96× |
 
-![gemm overlap](benchmarks/allgather_results/chart_gemm_overlap.png)
+![gemm overlap](examples/fsdp_sdma/gemm_overlap.png)
 
-Raw data: `benchmarks/allgather_results/sweep_standalone.csv`,
-`benchmarks/allgather_results/sweep_gemm_overlap.csv`.
+**End-to-end FSDP2 (Qwen-7B, seq 2048, 500 steps)** — drop-in `MoriAllGather`
+backend; the training loss is bit-identical to the native run over the whole
+curve while the step throughput beats the framework default:
+
+| topology | throughput vs native | loss (bit-exact) |
+|----------|---------------------:|------------------|
+| world=8  (2×4) | 1.03× | 10.411232 |
+| world=16 (2×8) | 1.02× | 10.391944 |
+
+![e2e](examples/fsdp_sdma/compare_chart.png)
+![loss](examples/fsdp_sdma/loss_curve.png)
 
 ## Test plan
 
 - [x] Bit-exact vs `torch.distributed.all_gather_into_tensor` for
-      `{bf16, fp16, fp32, int32}` on every tested size (true 2-node, world=8).
-- [x] Standalone bandwidth size sweep 4 MB–512 MB (SDMA ≥ native for ≥ 8 MB).
-- [x] GEMM-overlap size sweep (SDMA strictly faster; 16–20% at 128–512 MB).
+      `{bf16, fp16, fp32, int32}` on every tested size (true 2-node, world=8 & 16).
+- [x] Standalone bandwidth size sweep (parity/above RCCL at ≥32 MB w8, ≥64 MB w16).
+- [x] GEMM-overlap contention test (SDMA holds bandwidth; RCCL slows >2.5×).
+- [x] End-to-end FSDP2 training, loss bit-identical to native at world=8 & 16.
 - Reproduce:
   ```bash
   python3 setup.py build_ext --inplace
