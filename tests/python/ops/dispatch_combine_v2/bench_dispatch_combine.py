@@ -325,9 +325,13 @@ def main():
             run_disp(ct)
             sync()
             comm.barrier()
-            if _ASYM:  # expert op converts dispatch dtype -> combine dtype
-                mock_fmoe()
-                sync()
+            # Identity expert: stage the dispatched tokens (disp_out) into out_tok,
+            # the combine input. Since the disp_out/out_tok arena split, dispatch no
+            # longer writes out_tok directly, so this copy is required for ALL dtypes
+            # (mock_fmoe also does the asym dispatch->combine dtype conversion). A
+            # real expert op would write its output into out_tok here instead.
+            mock_fmoe()
+            sync()
             comb_out.zero_()
             sync()
             run_comb(ct)
