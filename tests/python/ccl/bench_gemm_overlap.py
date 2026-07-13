@@ -67,10 +67,24 @@ def _host_time(fn, reps, warmup):
 
 
 def _bench_size(handle, dtype, numel, rank, world_size, device, reps, warmup,
-                gemm_n, compute_stream, gemm_dtype, gemm_iters_fixed):
-    inp = _make_input(dtype, numel, rank, device)
-    out_mori = torch.empty(numel * world_size, dtype=dtype, device=device)
-    out_ref = torch.empty(numel * world_size, dtype=dtype, device=device)
+                gemm_n, compute_stream, gemm_dtype, gemm_iters_fixed, bufs=None):
+    # PERSISTENT-BUFFER crown path (Turn5 A). When bufs is supplied (only on the
+    # MORI_HIER_UT_FAST crown route) slice the input/output from a pool allocated
+    # ONCE up front, exactly like bench_sweep.py: stable data_ptr => the crown
+    # path's collective output (re)registration runs ONCE, not per size. The
+    # per-size fresh-buffer alloc forced a crown output dereg/reg every size which
+    # DEADLOCKED standalone_fast at w16 (bench_sweep, byte-identical handle but
+    # pooled buffers, does NOT hang). Default path (bufs=None) keeps the original
+    # per-size alloc => the recorded T2 baseline stays byte-identical.
+    if bufs is not None:
+        inp = bufs["inp"][:numel]
+        inp.copy_(_make_input(dtype, numel, rank, device))
+        out_mori = bufs["out_mori"][:numel * world_size]
+        out_ref = bufs["out_ref"][:numel * world_size]
+    else:
+        inp = _make_input(dtype, numel, rank, device)
+        out_mori = torch.empty(numel * world_size, dtype=dtype, device=device)
+        out_ref = torch.empty(numel * world_size, dtype=dtype, device=device)
     main_stream = torch.cuda.current_stream()
 
     # GEMM operands. Default bf16 so the matmul maps to the MFMA matrix cores:
@@ -81,8 +95,12 @@ def _bench_size(handle, dtype, numel, rank, world_size, device, reps, warmup,
     # (and thus the GEMM) untouched. An fp32 GEMM instead contends on HBM
     # bandwidth (it does not use the fast matrix cores), which masks the
     # CU-freeing advantage — that was why T46 saw 32/64MB regress.
-    a = torch.randn(gemm_n, gemm_n, device=device, dtype=gemm_dtype)
-    b = torch.randn(gemm_n, gemm_n, device=device, dtype=gemm_dtype)
+    if bufs is not None:
+        a = bufs["a"]
+        b = bufs["b"]
+    else:
+        a = torch.randn(gemm_n, gemm_n, device=device, dtype=gemm_dtype)
+        b = torch.randn(gemm_n, gemm_n, device=device, dtype=gemm_dtype)
 
     # ---- correctness gate (zero tolerance) ----
     dist.all_gather_into_tensor(out_ref, inp)
@@ -102,8 +120,16 @@ def _bench_size(handle, dtype, numel, rank, world_size, device, reps, warmup,
     # ---- solo AG times (no overlap) to size the GEMM loop ----
     def solo(ag):
         ag(); main_stream.synchronize()
-    r_solo, _ = _host_time(lambda: solo(rccl_ag), reps, warmup)
-    m_solo, _ = _host_time(lambda: solo(mori_ag), reps, warmup)
+    # On the crown route (bufs set) time mori FIRST, then RCCL -- bench_sweep does
+    # mori fully before any RCCL loop; interleaving RCCL all_gathers between the mori
+    # correctness gate and the mori solo loop was a second suspected crown deadlock
+    # trigger at w16. Default path keeps rccl-then-mori (byte-identical T2 order).
+    if bufs is not None:
+        m_solo, _ = _host_time(lambda: solo(mori_ag), reps, warmup)
+        r_solo, _ = _host_time(lambda: solo(rccl_ag), reps, warmup)
+    else:
+        r_solo, _ = _host_time(lambda: solo(rccl_ag), reps, warmup)
+        m_solo, _ = _host_time(lambda: solo(mori_ag), reps, warmup)
 
     # one-GEMM time to pick iters so gemm_solo ~ max(AG solo).
     def one_gemm():
@@ -188,21 +214,47 @@ def _worker(rank, world_size, ranks_per_node, device, sizes_mb, dtypes, reps,
         standalone_fast=_ut_fast,
     )
     compute_stream = torch.cuda.Stream()
+    # PERSISTENT crown pool (Turn5 A): only on the MORI_HIER_UT_FAST crown route,
+    # allocate the input/output byte pools ONCE (largest size, reinterpreted per
+    # dtype) + the fixed-size GEMM operands, so the crown output registers once and
+    # standalone_fast stops hanging (see _bench_size note). Default path => bufs None
+    # => original per-size alloc => byte-identical recorded baseline.
+    bufs = None
+    if _ut_fast:
+        max_mb = max(sizes_mb)
+        _pool_out_mori = torch.empty(max_mb * 1024 * 1024 * world_size,
+                                     dtype=torch.uint8, device=device)
+        _pool_out_ref = torch.empty(max_mb * 1024 * 1024 * world_size,
+                                    dtype=torch.uint8, device=device)
+        _pool_inp = torch.empty(max_mb * 1024 * 1024, dtype=torch.uint8,
+                                device=device)
+        _pool_a = torch.randn(gemm_n, gemm_n, device=device, dtype=gemm_dtype)
+        _pool_b = torch.randn(gemm_n, gemm_n, device=device, dtype=gemm_dtype)
+        torch.cuda.synchronize()
     if rank == 0:
         print(f"[gemm-ovlp] world={world_size} rpn={ranks_per_node} "
               f"num_nodes={handle.num_nodes} sizes_mb={sizes_mb} "
-              f"gemm_n={gemm_n} gemm_dtype={gemm_dtype} reps={reps}")
+              f"gemm_n={gemm_n} gemm_dtype={gemm_dtype} reps={reps} "
+              f"ut_fast={_ut_fast}")
     rows = []
     try:
         for dname in dtypes:
             dtype = _dtype_of(dname)
             itemsize = torch.tensor([], dtype=dtype).element_size()
+            if _ut_fast:
+                bufs = {
+                    "inp": _pool_inp.view(dtype),
+                    "out_mori": _pool_out_mori.view(dtype),
+                    "out_ref": _pool_out_ref.view(dtype),
+                    "a": _pool_a,
+                    "b": _pool_b,
+                }
             for mb in sizes_mb:
                 numel = (mb * 1024 * 1024) // itemsize
                 r_tot, m_tot, r_solo, m_solo, iters, bx = _bench_size(
                     handle, dtype, numel, rank, world_size, device, reps,
                     warmup, gemm_n, compute_stream, gemm_dtype,
-                    gemm_iters_fixed)
+                    gemm_iters_fixed, bufs=bufs)
                 if rank == 0:
                     win = "mori" if m_tot < r_tot else "RCCL"
                     print(f"[gemm-ovlp] {dname} {mb}MB iters={iters} | "
