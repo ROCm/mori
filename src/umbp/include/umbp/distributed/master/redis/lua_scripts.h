@@ -52,13 +52,24 @@
 
 #pragma once
 
+#include <string>
+
 namespace mori::umbp::redis {
+
+// Each script is a single, stable global object (not a per-use temporary): the
+// SHA cache in RespClient / RespClusterClient keys on the script object's ADDRESS
+// (`&script`), not its ~1.5KB text, so the read hot path never rehashes/compares
+// the whole Lua body under the cache lock on every EVALSHA. That only works if a
+// call site passes a reference to THESE objects (an `inline const std::string`,
+// one instance per literal across the program) rather than constructing a fresh
+// std::string from a `const char*` each call. Do NOT copy a script into a local
+// std::string before Eval() — that would defeat the pointer-identity cache.
 
 // register_client:
 //   KEYS[1] = node key
 //   ARGV = [tag, node_id, now_ms, stale_after_ms, addr, peer, caps, engine, tags]
 //   Returns 1 if registered/revived, 0 if rejected (ALIVE and not stale).
-inline constexpr const char* kRegisterClientLua = R"LUA(--!df flags=allow-undeclared-keys
+inline const std::string kRegisterClientLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
 local nodeId = ARGV[2]
@@ -91,7 +102,7 @@ return 1
 //   node's reverse-index set stores these full block keys as members.
 //   Returns { status_string, acked_seq_string }
 //   status_string in { "UNKNOWN", "SEQ_GAP", "APPLIED" }.
-inline constexpr const char* kApplyHeartbeatLua = R"LUA(--!df flags=allow-undeclared-keys
+inline const std::string kApplyHeartbeatLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
 local nodeId = ARGV[2]
@@ -201,7 +212,7 @@ return { 'APPLIED', tostring(seq) }
 //   HINCRBY. This is semantics-preserving (_acnt still ends at old+1) and drops
 //   the per-touched-key write commands from 2 to 1 — the single-slot server is
 //   redis.call()-count bound, so fewer calls per script is a direct win.
-inline constexpr const char* kRouteGetBatchLua = R"LUA(
+inline const std::string kRouteGetBatchLua = R"LUA(
 local now = tonumber(ARGV[1])
 local lease = tonumber(ARGV[2])
 local ne = tonumber(ARGV[3])
@@ -247,7 +258,7 @@ return out
 //   KEYS[1..n] = block keys (single-slot per invocation, grouped by shard by
 //     the caller, same as route_get_batch).
 //   Returns an array of n integers (1 if the key has >=1 location, else 0).
-inline constexpr const char* kExistsBatchLua = R"LUA(
+inline const std::string kExistsBatchLua = R"LUA(
 local out = {}
 for i = 1, #KEYS do
   local flds = redis.call('HKEYS', KEYS[i])
@@ -264,7 +275,7 @@ return out
 //   ARGV = [tag]
 //   Returns an array; each element is { node_id, flat_hgetall_of_node_hash }
 //   for every ALIVE node.
-inline constexpr const char* kListAliveLua = R"LUA(--!df flags=allow-undeclared-keys
+inline const std::string kListAliveLua = R"LUA(--!df flags=allow-undeclared-keys
 local tag = ARGV[1]
 local members = redis.call('SMEMBERS', tag .. ':nodes:alive')
 local out = {}
@@ -282,7 +293,7 @@ return out
 //   KEYS[1] = node key
 //   ARGV = [tag, node_id]
 //   Returns 1 if the client existed, 0 otherwise.
-inline constexpr const char* kUnregisterClientLua = R"LUA(--!df flags=allow-undeclared-keys
+inline const std::string kUnregisterClientLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
 local nodeId = ARGV[2]
@@ -314,7 +325,7 @@ return 1
 //   ARGV = [tag, cutoff_ms]
 //   Flips ALIVE->EXPIRED for nodes whose last_hb < cutoff (keeping the row),
 //   drops their block locations + external-kv, and returns the dead node ids.
-inline constexpr const char* kExpireStaleLua = R"LUA(--!df flags=allow-undeclared-keys
+inline const std::string kExpireStaleLua = R"LUA(--!df flags=allow-undeclared-keys
 local tag = ARGV[1]
 local cutoff = tonumber(ARGV[2])
 local members = redis.call('SMEMBERS', tag .. ':nodes:alive')
@@ -368,7 +379,7 @@ return dead
 //   ARGV = [tag, node_id, seq, now_ms, is_full_sync, caps_blob]
 //   seq-CAS + record + nodes:alive/alive_peers ONLY (no block work).
 //   Returns { status_string, acked_seq_string } like apply_heartbeat.
-inline constexpr const char* kApplyHeartbeatControlLua = R"LUA(--!df flags=allow-undeclared-keys
+inline const std::string kApplyHeartbeatControlLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
 local nodeId = ARGV[2]
@@ -402,7 +413,7 @@ return { 'APPLIED', tostring(seq) }
 //   'l|<node>|'. All block keys passed in ARGV are on this instance/slot.
 //   Idempotent: ADD overwrites, REMOVE of a missing loc is a no-op, full_sync
 //   clears the node's blocks here then replays the ADDs. Returns 'OK'.
-inline constexpr const char* kApplyBlockEventsLua = R"LUA(--!df flags=allow-undeclared-keys
+inline const std::string kApplyBlockEventsLua = R"LUA(--!df flags=allow-undeclared-keys
 local revidx = ARGV[1]
 local nodePfx = ARGV[2]
 local full = tonumber(ARGV[3])
@@ -474,7 +485,7 @@ return 'OK'
 //   Drains the (node, shard) reverse index, deletes the node's location fields
 //   from each block, drops now-empty blocks, and deletes the reverse index.
 //   Idempotent. Returns 1.
-inline constexpr const char* kWipeNodeBlocksLua = R"LUA(--!df flags=allow-undeclared-keys
+inline const std::string kWipeNodeBlocksLua = R"LUA(--!df flags=allow-undeclared-keys
 local revidx = ARGV[1]
 local nodePfx = ARGV[2]
 local pfxLen = string.len(nodePfx)
@@ -499,7 +510,7 @@ return 1
 //   KEYS[1] = node key; ARGV = [tag, node_id]
 //   Drops the client record + nodes:alive + alive_peers + extkv reverse index.
 //   Block locations are wiped separately per shard. Returns 1 if it existed.
-inline constexpr const char* kUnregisterControlLua = R"LUA(--!df flags=allow-undeclared-keys
+inline const std::string kUnregisterControlLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
 local nodeId = ARGV[2]
@@ -516,7 +527,7 @@ return 1
 //   Flips ALIVE->EXPIRED for nodes whose last_hb < cutoff, drops them from
 //   nodes:alive/alive_peers + extkv, and returns the dead node ids. Block
 //   locations are wiped separately per shard by the caller.
-inline constexpr const char* kExpireControlLua = R"LUA(--!df flags=allow-undeclared-keys
+inline const std::string kExpireControlLua = R"LUA(--!df flags=allow-undeclared-keys
 local tag = ARGV[1]
 local cutoff = tonumber(ARGV[2])
 local members = redis.call('SMEMBERS', tag .. ':nodes:alive')

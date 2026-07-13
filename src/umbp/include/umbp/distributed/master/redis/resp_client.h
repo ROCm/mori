@@ -83,6 +83,9 @@ class RespClient : public IRespClient {
 
   // Pipeline: append every command, then read all replies in order. One round
   // trip for the whole batch. (Not part of IRespClient; single-endpoint only.)
+  // NOTE: currently has no in-tree caller — retained as the single-endpoint
+  // general-purpose batch primitive (the hot path uses EvalPipeline instead). If
+  // it stays unused long-term, consider dropping it.
   std::vector<RespValue> Pipeline(const std::vector<std::vector<std::string>>& commands);
 
   // EVALSHA with transparent SCRIPT LOAD + NOSCRIPT fallback. `script` is the
@@ -105,6 +108,8 @@ class RespClient : public IRespClient {
 
   // Liveness probe (PING). Returns false if no connection can be established.
   bool Ping() override;
+
+  void SetMetrics(mori::metrics::MetricsServer* metrics) override { metrics_ = metrics; }
 
   const Options& options() const { return options_; }
 
@@ -153,6 +158,11 @@ class RespClient : public IRespClient {
   // connections, so one cache is correct).
   std::string GetOrLoadSha(redisContext* ctx, const std::string& script, bool* broke);
 
+  // Cold-path metric helpers (no-op when metrics_ is null). Kept off the hot
+  // success path — called only on a transport failure / NOSCRIPT reload.
+  void CountTransportError();
+  void CountNoscriptReload();
+
   Options options_;
   std::string host_;
   int port_ = 6379;
@@ -162,8 +172,16 @@ class RespClient : public IRespClient {
   std::vector<redisContext*> idle_;
   std::size_t created_ = 0;
 
+  // Optional cold-path metrics sink; null = no metrics. Set once at startup.
+  mori::metrics::MetricsServer* metrics_ = nullptr;
+
   std::mutex sha_mu_;
-  std::unordered_map<std::string, std::string> sha_cache_;  // script body -> sha1
+  // Keyed by the script object's ADDRESS, not its text: every Lua script is a
+  // single `inline const std::string` (lua_scripts.h), so `&script` is stable and
+  // unique per script. This keeps the read hot path from rehashing/comparing
+  // ~1.5KB of Lua under sha_mu_ on every EVALSHA. See lua_scripts.h for the
+  // pointer-identity contract (never pass a freshly-constructed std::string).
+  std::unordered_map<const void*, std::string> sha_cache_;  // &script -> sha1
 };
 
 }  // namespace mori::umbp::redis

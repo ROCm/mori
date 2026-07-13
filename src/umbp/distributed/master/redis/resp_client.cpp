@@ -23,12 +23,18 @@
 
 #include <hiredis/hiredis.h>
 
+#include <chrono>
 #include <cstring>
 #include <utility>
+
+#include "mori/metrics/prometheus_metrics_server.hpp"
 
 namespace mori::umbp::redis {
 
 namespace {
+
+// Backend label shared by every RESP-client cold-path metric.
+const mori::metrics::MetricsServer::Labels kRedisLabels = {{"backend", "redis"}};
 
 // Parse "tcp://host:port" (or "host:port") into (host, port). Throws on a
 // malformed URI so a misconfigured master fails fast at startup.
@@ -71,6 +77,18 @@ RespClient::~RespClient() {
   idle_.clear();
 }
 
+void RespClient::CountTransportError() {
+  if (metrics_ == nullptr) return;
+  metrics_->addCounter("mori_umbp_redis_transport_errors_total",
+                       "RESP client transport failures (connect/socket/protocol)", kRedisLabels);
+}
+
+void RespClient::CountNoscriptReload() {
+  if (metrics_ == nullptr) return;
+  metrics_->addCounter("mori_umbp_redis_noscript_reload_total",
+                       "EVALSHA NOSCRIPT reloads (server evicted the cached script)", kRedisLabels);
+}
+
 redisContext* RespClient::Connect() {
   timeval tv{};
   tv.tv_sec = options_.connect_timeout_ms / 1000;
@@ -103,10 +121,26 @@ redisContext* RespClient::Connect() {
 
 RespClient::Lease RespClient::Acquire() {
   std::unique_lock<std::mutex> lk(mu_);
+  // Pool-wait timing is armed lazily: only when we actually block on an exhausted
+  // pool (the else branch below). The fast path (idle conn available or room to
+  // create one) reads no clock and touches no metric.
+  bool waited = false;
+  std::chrono::steady_clock::time_point wait_start;
+  auto observe_wait = [&] {
+    if (!waited || metrics_ == nullptr) return;
+    const double sec =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - wait_start).count();
+    static const std::vector<double> kBounds = {0.0001, 0.00025, 0.0005, 0.001, 0.0025,
+                                                0.005,  0.01,    0.025,  0.05,  0.1};
+    metrics_->observe("mori_umbp_redis_pool_wait_seconds",
+                      "Time a caller blocked waiting for a free pooled RESP connection",
+                      kRedisLabels, kBounds, sec);
+  };
   for (;;) {
     if (!idle_.empty()) {
       redisContext* c = idle_.back();
       idle_.pop_back();
+      observe_wait();
       return Lease(this, c);
     }
     if (created_ < options_.pool_size) {
@@ -121,7 +155,15 @@ RespClient::Lease RespClient::Acquire() {
         cv_.notify_one();
         throw;
       }
+      observe_wait();
       return Lease(this, c);
+    }
+    if (metrics_ != nullptr && !waited) {
+      waited = true;
+      wait_start = std::chrono::steady_clock::now();
+      metrics_->addCounter("mori_umbp_redis_pool_exhausted_total",
+                           "Times a caller found the RESP connection pool exhausted and blocked",
+                           kRedisLabels);
     }
     cv_.wait(lk);
   }
@@ -200,6 +242,7 @@ RespValue RespClient::RunArgv(redisContext* ctx, const std::vector<std::string>&
       redisCommandArgv(ctx, static_cast<int>(argv.size()), argv.data(), argvlen.data()));
   if (reply == nullptr) {
     *broke = true;
+    CountTransportError();
     const std::string err = ctx ? std::string(ctx->errstr) : std::string("null reply");
     throw RespError("RespClient: command failed (transport): " + err);
   }
@@ -209,14 +252,26 @@ RespValue RespClient::RunArgv(redisContext* ctx, const std::vector<std::string>&
 }
 
 RespValue RespClient::Command(const std::vector<std::string>& args) {
-  Lease lease = Acquire();
-  bool broke = false;
-  try {
-    return RunArgv(lease.get(), args, &broke);
-  } catch (...) {
-    if (broke) lease.MarkBroken();
-    throw;
+  // Command backs only pure-READ metadata lookups (HGETALL/HGET/SCARD), so a
+  // transport failure on a stale pooled connection — a server/LB drops an idle
+  // socket and hiredis trips ctx->err only on the next use — is safe to retry
+  // once on a fresh connection. This is deliberately NOT done for Eval /
+  // EvalPipeline: route_get_batch bumps _lease/_lacc/_acnt, so a blind retry of a
+  // script that may already have run server-side could double-apply a side
+  // effect. A connect failure (Acquire throws) is a different case and propagates
+  // immediately. A second transport failure propagates.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    Lease lease = Acquire();
+    bool broke = false;
+    try {
+      return RunArgv(lease.get(), args, &broke);
+    } catch (const RespError&) {
+      if (broke) lease.MarkBroken();
+      if (broke && attempt == 0) continue;  // stale socket: retry once, fresh conn.
+      throw;
+    }
   }
+  throw RespError("RespClient: command retry exhausted");  // unreachable
 }
 
 std::vector<RespValue> RespClient::Pipeline(const std::vector<std::vector<std::string>>& commands) {
@@ -254,9 +309,10 @@ std::vector<RespValue> RespClient::Pipeline(const std::vector<std::vector<std::s
 }
 
 std::string RespClient::GetOrLoadSha(redisContext* ctx, const std::string& script, bool* broke) {
+  const void* key = static_cast<const void*>(&script);
   {
     std::lock_guard<std::mutex> lk(sha_mu_);
-    auto it = sha_cache_.find(script);
+    auto it = sha_cache_.find(key);
     if (it != sha_cache_.end()) return it->second;
   }
   RespValue r = RunArgv(ctx, {"SCRIPT", "LOAD", script}, broke);
@@ -265,7 +321,7 @@ std::string RespClient::GetOrLoadSha(redisContext* ctx, const std::string& scrip
   }
   {
     std::lock_guard<std::mutex> lk(sha_mu_);
-    sha_cache_[script] = r.str;
+    sha_cache_[key] = r.str;
   }
   return r.str;
 }
@@ -289,9 +345,10 @@ RespValue RespClient::Eval(const std::string& script, const std::vector<std::str
     RespValue r = RunArgv(ctx, cmd, &broke);
     if (r.is_error() && r.str.rfind("NOSCRIPT", 0) == 0) {
       // Script evicted from the server cache; reload and retry once.
+      CountNoscriptReload();
       {
         std::lock_guard<std::mutex> lk(sha_mu_);
-        sha_cache_.erase(script);
+        sha_cache_.erase(static_cast<const void*>(&script));
       }
       const std::string sha2 = GetOrLoadSha(ctx, script, &broke);
       cmd[1] = sha2;
@@ -331,6 +388,7 @@ std::vector<std::size_t> RespClient::PipelineEvalshaBatch(
     if (redisAppendCommandArgv(ctx, static_cast<int>(argv.size()), argv.data(), argvlen.data()) !=
         REDIS_OK) {
       *broke = true;
+      CountTransportError();
       throw RespError("RespClient: EvalPipeline append failed");
     }
   }
@@ -341,6 +399,7 @@ std::vector<std::size_t> RespClient::PipelineEvalshaBatch(
     void* r = nullptr;
     if (redisGetReply(ctx, &r) != REDIS_OK) {
       *broke = true;
+      CountTransportError();
       const std::string err = ctx ? std::string(ctx->errstr) : std::string("null");
       throw RespError("RespClient: EvalPipeline read failed: " + err);
     }
@@ -373,9 +432,10 @@ std::vector<RespValue> RespClient::EvalPipeline(
     // retry ONLY the calls that missed, so calls that already executed (and, for
     // route_get_batch, already bumped lease/access) are not run a second time.
     if (!missing.empty()) {
+      CountNoscriptReload();
       {
         std::lock_guard<std::mutex> lk(sha_mu_);
-        sha_cache_.erase(script);
+        sha_cache_.erase(static_cast<const void*>(&script));
       }
       const std::string sha2 = GetOrLoadSha(ctx, script, &broke);
       PipelineEvalshaBatch(ctx, sha2, keys_per_call, shared_args, missing, &replies, &broke);

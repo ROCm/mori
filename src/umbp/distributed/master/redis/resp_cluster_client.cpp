@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "mori/metrics/prometheus_metrics_server.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/master/redis/resp_client.h"
 #include "umbp/distributed/master/redis/thread_pool.h"
@@ -38,6 +39,9 @@
 namespace mori::umbp::redis {
 
 namespace {
+
+// Backend label shared by every cluster-client cold-path metric.
+const mori::metrics::MetricsServer::Labels kRedisLabels = {{"backend", "redis"}};
 
 // Parse "tcp://host:port" (or "host:port") into a redis-plus-plus
 // ConnectionOptions host/port. Throws RespError on a malformed seed.
@@ -77,7 +81,8 @@ sw::redis::ConnectionOptions SeedConnectionOptions(const RespClusterClient::Opti
 
 // Connect to the cluster by trying each seed until one lets redis-plus-plus
 // fetch the topology (its RedisCluster ctor runs CLUSTER SLOTS and throws if the
-// seed is down). Shared by the client ctor and DiscoverMasterCount.
+// seed is down). Shared by the client ctor and DiscoverMasterSlotRanges's
+// callers.
 std::unique_ptr<sw::redis::RedisCluster> ConnectCluster(const RespClusterClient::Options& o) {
   if (o.seeds.empty()) throw RespError("RespClusterClient: no cluster seeds configured");
   sw::redis::ConnectionPoolOptions pool_opts;
@@ -123,7 +128,8 @@ std::vector<std::vector<SlotRange>> ParseClusterSlots(const redisReply* reply) {
       const std::string ip = (m->element[0]->type == REDIS_REPLY_STRING)
                                  ? std::string(m->element[0]->str, m->element[0]->len)
                                  : std::string();
-      const long long port = (m->element[1]->type == REDIS_REPLY_INTEGER) ? m->element[1]->integer : 0;
+      const long long port =
+          (m->element[1]->type == REDIS_REPLY_INTEGER) ? m->element[1]->integer : 0;
       key = ip + ":" + std::to_string(port);
     }
 
@@ -151,15 +157,6 @@ std::vector<std::vector<SlotRange>> ParseClusterSlots(const redisReply* reply) {
 
 }  // namespace
 
-std::size_t RespClusterClient::DiscoverMasterCount(const Options& options) {
-  auto cluster = ConnectCluster(options);
-  // for_each iterates one pool per master (the slot-serving nodes), so counting
-  // the callbacks yields the master count.
-  std::size_t masters = 0;
-  cluster->for_each([&masters](sw::redis::Redis&) { ++masters; });
-  return masters;
-}
-
 std::vector<std::vector<SlotRange>> RespClusterClient::DiscoverMasterSlotRanges(
     const Options& options) {
   if (options.seeds.empty()) throw RespError("RespClusterClient: no cluster seeds configured");
@@ -175,7 +172,8 @@ std::vector<std::vector<SlotRange>> RespClusterClient::DiscoverMasterSlotRanges(
       last_err = e.what();
     }
   }
-  throw RespError("RespClusterClient: CLUSTER SLOTS discovery failed (last error: " + last_err + ")");
+  throw RespError("RespClusterClient: CLUSTER SLOTS discovery failed (last error: " + last_err +
+                  ")");
 }
 
 RespClusterClient::RespClusterClient(Options options) : options_(std::move(options)) {
@@ -185,11 +183,12 @@ RespClusterClient::RespClusterClient(Options options) : options_(std::move(optio
   // Workers to fan a multi-slot EvalPipeline out concurrently (one round trip
   // per node instead of N sequential). Each task is an independent
   // redirection-aware call, so a slow/failing node cannot block the others.
-  const std::size_t threads = std::min<std::size_t>(64, std::max<std::size_t>(4, options_.pool_size));
+  const std::size_t threads =
+      std::min<std::size_t>(64, std::max<std::size_t>(4, options_.pool_size));
   pool_ = std::make_unique<ThreadPool>(threads);
 
-  MORI_UMBP_INFO("[RedisCluster] connected via {} seed(s), pool={}, fanout={}", options_.seeds.size(),
-                 options_.pool_size, threads);
+  MORI_UMBP_INFO("[RedisCluster] connected via {} seed(s), pool={}, fanout={}",
+                 options_.seeds.size(), options_.pool_size, threads);
 }
 
 RespClusterClient::~RespClusterClient() = default;
@@ -224,14 +223,20 @@ RespValue RespClusterClient::RunArgvRouted(const std::vector<std::string>& argv,
     return v;
   } catch (const sw::redis::Error& e) {
     // Transport / redirection-exhausted / cluster-down: a real failure.
+    if (metrics_ != nullptr) {
+      metrics_->addCounter("mori_umbp_redis_transport_errors_total",
+                           "RESP client transport failures (connect/socket/protocol)",
+                           kRedisLabels);
+    }
     throw RespError(std::string("RespClusterClient: ") + e.what());
   }
 }
 
 std::string RespClusterClient::GetOrLoadSha(const std::string& script) {
+  const void* key = static_cast<const void*>(&script);
   {
     std::lock_guard<std::mutex> lk(sha_mu_);
-    auto it = sha_cache_.find(script);
+    auto it = sha_cache_.find(key);
     if (it != sha_cache_.end()) return it->second;
   }
   // SCRIPT LOAD on any node returns the content-addressed SHA (same everywhere).
@@ -241,7 +246,7 @@ std::string RespClusterClient::GetOrLoadSha(const std::string& script) {
   }
   {
     std::lock_guard<std::mutex> lk(sha_mu_);
-    sha_cache_[script] = r.str;
+    sha_cache_[key] = r.str;
   }
   return r.str;
 }
@@ -263,6 +268,11 @@ RespValue RespClusterClient::EvalShaRouted(const std::string& script,
     // The node serving this slot doesn't have the script cached (e.g. a promoted
     // replica or a resharded node). Load it there (routed by the same key) and
     // retry once. EVALSHA has no side effects until it runs, so this is safe.
+    if (metrics_ != nullptr) {
+      metrics_->addCounter("mori_umbp_redis_noscript_reload_total",
+                           "EVALSHA NOSCRIPT reloads (server evicted the cached script)",
+                           kRedisLabels);
+    }
     RunArgvRouted({"SCRIPT", "LOAD", script}, keys.front());
     r = RunArgvRouted(argv, keys.front());
   }

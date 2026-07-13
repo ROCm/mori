@@ -148,7 +148,13 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
   // Attach the master's Prometheus server so hot ops export
   // mori_umbp_store_op_latency_seconds{op,backend="redis"}. Null (default) =
   // no metrics (e.g. the standalone microbench).
-  void SetMetricsSink(mori::metrics::MetricsServer* metrics) override { metrics_ = metrics; }
+  void SetMetricsSink(mori::metrics::MetricsServer* metrics) override {
+    metrics_ = metrics;
+    // Propagate to the underlying RESP clients so their cold-path counters
+    // (transport errors, NOSCRIPT reloads, pool waits) export too. Clients are
+    // built in the ctor, before this is called, so wire the sink in here.
+    for (auto& c : clients_) c->SetMetrics(metrics);
+  }
 
   // Best-effort connectivity probe (PING). Every endpoint must answer.
   bool Ping() const {
@@ -176,7 +182,6 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
   enum class Mode { kSingle, kMulti, kCluster };
   bool split_writes() const { return mode_ != Mode::kSingle; }
 
-  std::size_t num_endpoints() const { return clients_.size(); }
   bool multi_endpoint() const { return clients_.size() > 1; }
   redis::IRespClient& control() const { return *clients_[0]; }
   std::size_t endpoint_of_shard(std::size_t shard) const { return shard % clients_.size(); }
@@ -186,9 +191,8 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
 
   // Multi-endpoint write helpers (see .cpp). Each runs the per-shard block
   // script on the shard's own instance; idempotent so retries are safe.
-  void ApplyBlockEventsMulti(const std::string& node_id,
-                             const std::vector<KvEvent>& events, bool is_full_sync,
-                             std::chrono::system_clock::time_point now);
+  void ApplyBlockEventsMulti(const std::string& node_id, const std::vector<KvEvent>& events,
+                             bool is_full_sync, std::chrono::system_clock::time_point now);
   void WipeNodeBlocksMulti(const std::string& node_id);
 
   redis::KeySchema keys_;

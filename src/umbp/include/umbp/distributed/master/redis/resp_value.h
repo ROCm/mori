@@ -42,6 +42,12 @@
 #include <string>
 #include <vector>
 
+// Forward-declared so the interface can carry an optional metrics sink without
+// this lightweight header pulling in the Prometheus server.
+namespace mori::metrics {
+class MetricsServer;
+}
+
 namespace mori::umbp::redis {
 
 // Thrown on a transport-level failure (connect/socket error, protocol error).
@@ -96,6 +102,12 @@ class IRespClient {
 
   // Liveness probe. Returns false if the endpoint(s) cannot be reached.
   virtual bool Ping() = 0;
+
+  // Attach an optional metrics sink for COLD-PATH counters/histograms only
+  // (transport errors, NOSCRIPT reloads, connection-pool waits). Default no-op.
+  // Set once at startup, before serving traffic; the hot success path records
+  // nothing (every emit is gated on a non-null sink and only on rare paths).
+  virtual void SetMetrics(mori::metrics::MetricsServer* /*metrics*/) {}
 };
 
 }  // namespace mori::umbp::redis

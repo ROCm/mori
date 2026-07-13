@@ -75,12 +75,6 @@ class RespClusterClient : public IRespClient {
   RespClusterClient(const RespClusterClient&) = delete;
   RespClusterClient& operator=(const RespClusterClient&) = delete;
 
-  // Connect to the cluster and return how many master nodes it has (from
-  // CLUSTER SLOTS). Used to auto-size the block-shard count (~2x masters) so a
-  // RouteGet batch spreads across nodes without over-splitting into too many
-  // per-shard scripts. Throws RespError if no seed is reachable.
-  static std::size_t DiscoverMasterCount(const Options& options);
-
   // Connect and return each master's owned slot ranges (from CLUSTER SLOTS), one
   // vector per master, ordered by the master's lowest slot (stable across
   // restarts). Used for balanced placement: pick one block-shard tag whose slot
@@ -103,11 +97,13 @@ class RespClusterClient : public IRespClient {
   // keys[0]. Groups are issued concurrently through a small worker pool (each is
   // an independent redirection-aware call), so a batch spanning several nodes is
   // ~one round trip per node rather than N sequential ones.
-  std::vector<RespValue> EvalPipeline(
-      const std::string& script, const std::vector<std::vector<std::string>>& keys_per_call,
-      const std::vector<std::string>& shared_args) override;
+  std::vector<RespValue> EvalPipeline(const std::string& script,
+                                      const std::vector<std::vector<std::string>>& keys_per_call,
+                                      const std::vector<std::string>& shared_args) override;
 
   bool Ping() override;
+
+  void SetMetrics(mori::metrics::MetricsServer* metrics) override { metrics_ = metrics; }
 
  private:
   // Send `argv` to the node owning `routing_key`'s slot via redis-plus-plus's
@@ -128,8 +124,15 @@ class RespClusterClient : public IRespClient {
   std::unique_ptr<sw::redis::RedisCluster> cluster_;
   std::unique_ptr<ThreadPool> pool_;
 
+  // Optional cold-path metrics sink (transport errors, NOSCRIPT reloads); null =
+  // no metrics. Set once at startup.
+  mori::metrics::MetricsServer* metrics_ = nullptr;
+
   std::mutex sha_mu_;
-  std::unordered_map<std::string, std::string> sha_cache_;  // script body -> sha1
+  // Keyed by the script object's ADDRESS, not its text (see resp_client.h and the
+  // pointer-identity contract in lua_scripts.h): avoids rehashing ~1.5KB of Lua
+  // under sha_mu_ on every routed EVALSHA.
+  std::unordered_map<const void*, std::string> sha_cache_;  // &script -> sha1
 };
 
 }  // namespace mori::umbp::redis

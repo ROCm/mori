@@ -242,16 +242,32 @@ struct ShardCall {
 // remote stores), then scatters replies on the calling thread so on_key needs
 // no locking.
 //
-// Fault tolerance: in multi-endpoint mode a single instance that is down /
-// erroring does NOT fail the whole batch — its keys are simply left untouched
-// (the caller's default is a miss: empty locations / exists=false), so RouteGet
-// keeps serving keys on the healthy shards. A WARN is logged per failed
-// instance. In single-endpoint mode there is nothing to fall back to, so a
-// failure propagates (a total outage must surface, not masquerade as misses).
+// Fault tolerance (tolerate_shard_failures): when the keyspace is spread across
+// multiple nodes/instances (multi-endpoint OR cluster), a single node that is
+// down / erroring does NOT fail the whole batch — its keys are simply left
+// untouched (the caller's default is a miss: empty locations / exists=false), so
+// RouteGet keeps serving keys on the healthy shards. A WARN is logged per failed
+// shard. In single-endpoint mode there is nothing to fall back to, so a failure
+// propagates (a total outage must surface, not masquerade as misses).
+//
+// NOTE: this must be decided by the caller (topology), NOT inferred from the
+// number of distinct clients — in cluster mode a single cluster client fronts
+// every node, so `calls.size()` is always 1 even though the keys are spread
+// across nodes and per-node failures SHOULD degrade to misses.
 template <typename ClientForGroup, typename Fn>
 void RunShardedRead(const ShardedBatch& batch, const std::string& script,
                     const std::vector<std::string>& shared_args, const char* method,
-                    redis::ThreadPool* pool, ClientForGroup client_for_group, Fn&& on_key) {
+                    redis::ThreadPool* pool, bool tolerate_shard_failures,
+                    mori::metrics::MetricsServer* metrics, ClientForGroup client_for_group,
+                    Fn&& on_key) {
+  // Cold path only: count a shard whose keys we degraded to miss (node down /
+  // script error). No-op when no metrics sink is attached.
+  auto count_degraded = [&] {
+    if (metrics == nullptr) return;
+    metrics->addCounter("mori_umbp_redis_degraded_shard_total",
+                        "Shard reads degraded to miss because a node was down / erroring",
+                        {{"backend", "redis"}, {"method", method}});
+  };
   // Bucket group indices by the client that serves them.
   std::unordered_map<redis::IRespClient*, std::vector<size_t>> groups_by_client;
   for (size_t g = 0; g < batch.keys_by_shard.size(); ++g) {
@@ -294,14 +310,17 @@ void RunShardedRead(const ShardedBatch& batch, const std::string& script,
     for (auto& f : futs) f.get();
   }
 
-  const bool tolerate = calls.size() > 1;  // multi-endpoint: degrade a down shard to misses.
+  const bool tolerate =
+      tolerate_shard_failures;  // multi-endpoint/cluster: degrade a down shard to misses.
 
   // Scatter replies back to caller order (single-threaded; on_key is unlocked).
   for (const ShardCall& c : calls) {
     if (!c.ok) {
-      if (!tolerate) throw std::runtime_error(std::string("[RedisStore] ") + method + ": " + c.error);
+      if (!tolerate)
+        throw std::runtime_error(std::string("[RedisStore] ") + method + ": " + c.error);
       MORI_UMBP_WARN("[RedisStore] {}: shard instance unavailable, its keys read as miss: {}",
                      method, c.error);
+      count_degraded();
       continue;  // leave this shard's keys at the caller's default (miss).
     }
     for (size_t k = 0; k < c.groups.size() && k < c.replies.size(); ++k) {
@@ -312,6 +331,7 @@ void RunShardedRead(const ShardedBatch& batch, const std::string& script,
         }
         MORI_UMBP_WARN("[RedisStore] {}: shard script error, its keys read as miss: {}", method,
                        reply.str);
+        count_degraded();
         continue;
       }
       if (!reply.is_array()) continue;
@@ -326,7 +346,8 @@ void RunShardedRead(const ShardedBatch& batch, const std::string& script,
 }  // namespace
 
 std::size_t RedisMasterMetadataStore::ResolveNumShards(const Config& config) {
-  if (config.cluster) return config.block_shards == 0 ? 1 : config.block_shards;  // slot-spread tags
+  if (config.cluster)
+    return config.block_shards == 0 ? 1 : config.block_shards;        // slot-spread tags
   if (config.shard_uris.size() > 1) return config.shard_uris.size();  // one shard per endpoint
   return config.block_shards == 0 ? 1 : config.block_shards;          // single-endpoint knob
 }
@@ -342,7 +363,7 @@ redis::KeySchema RedisMasterMetadataStore::BuildKeySchema(const Config& config) 
 
 RedisMasterMetadataStore::RedisMasterMetadataStore(const Config& config)
     : keys_(BuildKeySchema(config)),
-      mode_(config.cluster            ? Mode::kCluster
+      mode_(config.cluster                 ? Mode::kCluster
             : config.shard_uris.size() > 1 ? Mode::kMulti
                                            : Mode::kSingle) {
   if (mode_ == Mode::kCluster) {
@@ -350,8 +371,8 @@ RedisMasterMetadataStore::RedisMasterMetadataStore(const Config& config)
     // the split control + per-shard-block write path (their keys live in
     // different slots), driven by split_writes().
     redis::RespClusterClient::Options opts;
-    opts.seeds = config.cluster_seeds.empty() ? std::vector<std::string>{config.uri}
-                                              : config.cluster_seeds;
+    opts.seeds =
+        config.cluster_seeds.empty() ? std::vector<std::string>{config.uri} : config.cluster_seeds;
     opts.password = config.password;
     opts.connect_timeout_ms = config.connect_timeout_ms;
     opts.socket_timeout_ms = config.socket_timeout_ms;
@@ -451,9 +472,9 @@ void RedisMasterMetadataStore::WipeNodeBlocksMulti(const std::string& node_id) {
   // filtered out of reads by GetAlivePeerView until that shard returns.
   for (std::size_t shard = 0; shard < keys_.NumShards(); ++shard) {
     try {
-      RespValue r = client_for_shard(shard).Eval(
-          redis::kWipeNodeBlocksLua, {keys_.NodeBlocks(node_id, shard)},
-          {keys_.NodeBlocks(node_id, shard), node_prefix});
+      RespValue r = client_for_shard(shard).Eval(redis::kWipeNodeBlocksLua,
+                                                 {keys_.NodeBlocks(node_id, shard)},
+                                                 {keys_.NodeBlocks(node_id, shard), node_prefix});
       if (r.is_error()) {
         MORI_UMBP_WARN("[RedisStore] WipeNodeBlocks: shard {} script error, skipped: {}", shard,
                        r.str);
@@ -571,11 +592,13 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
 std::vector<std::string> RedisMasterMetadataStore::ExpireStaleClients(
     std::chrono::system_clock::time_point cutoff) {
   ScopedStoreOp _op(metrics_, "ExpireStaleClients");
-  const char* script = split_writes() ? redis::kExpireControlLua : redis::kExpireStaleLua;
+  // Bind a reference (not const char*) so the SHA cache's pointer-identity key
+  // (&script) stays stable — see lua_scripts.h.
+  const std::string& script = split_writes() ? redis::kExpireControlLua : redis::kExpireStaleLua;
   // KEYS[1] = a control-tag key (nodes:alive) to route + fix the slot in cluster
   // mode; the script reads tag from ARGV and touches only control-tag keys.
-  RespValue r =
-      control().Eval(script, {keys_.NodesAlive()}, {keys_.Tag(), std::to_string(ToEpochMs(cutoff))});
+  RespValue r = control().Eval(script, {keys_.NodesAlive()},
+                               {keys_.Tag(), std::to_string(ToEpochMs(cutoff))});
   if (r.is_error()) throw std::runtime_error("[RedisStore] ExpireStaleClients: " + r.str);
   std::vector<std::string> dead;
   if (r.is_array()) {
@@ -680,6 +703,7 @@ std::vector<std::vector<Location>> RedisMasterMetadataStore::BatchLookupBlockFor
   const ShardedBatch batch = GroupKeysByShard(keys_, keys);
   RunShardedRead(
       batch, redis::kRouteGetBatchLua, args, "BatchLookupBlockForRouteGet", fanout_pool_.get(),
+      /*tolerate_shard_failures=*/mode_ != Mode::kSingle, metrics_,
       [&](size_t group) { return &client_for_shard(batch.shard_of_group[group]); },
       [&](size_t orig_index, const RespValue& locs) {
         if (!locs.is_array()) return;
@@ -707,6 +731,7 @@ std::vector<bool> RedisMasterMetadataStore::BatchExistsBlock(
   const ShardedBatch batch = GroupKeysByShard(keys_, keys);
   RunShardedRead(
       batch, redis::kExistsBatchLua, {}, "BatchExistsBlock", fanout_pool_.get(),
+      /*tolerate_shard_failures=*/mode_ != Mode::kSingle, metrics_,
       [&](size_t group) { return &client_for_shard(batch.shard_of_group[group]); },
       [&](size_t orig_index, const RespValue& has) { results[orig_index] = has.integer != 0; });
   return results;
