@@ -36,7 +36,7 @@ namespace collective {
 // lever). 0 => OFF: the guarded call compiles out, byte-identical baseline.
 // Rebuild to change (device track). Applied only to the long REMOTE-landing spins,
 // never the fast intra-block counter joins.
-constexpr int kHierInterPollSleep = 2;
+constexpr int kHierInterPollSleep = 0;
 
 // Ring AllGather data movement over an arithmetic sub-group of global PEs:
 // ``{peBase, peBase+peStride, ..., peBase+(ringSize-1)*peStride}``. This PE is
