@@ -83,6 +83,12 @@ jobs:
             # mpirun --allow-run-as-root -np 2 python 05_flydsl_lsa_allreduce/main.py && \
             # mpirun --allow-run-as-root -np 2 python 06_flydsl_gda_modes/main.py
 
+      - name: Run CCO SDMA Python API tests (spawn, up to 8 GPUs)
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
+
       - name: Cleanup
         if: always()
         run: |
