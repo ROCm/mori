@@ -947,6 +947,12 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
         int peerDev = comm->peerHipDevs[pe];
         if (peerDev != comm->hipDev) {
           hipError_t peerErr = hipDeviceEnablePeerAccess(peerDev, 0);
+          // Consume the sticky last-error: hipDeviceEnablePeerAccess leaves the
+          // runtime's last-error set (e.g. AlreadyEnabled / NotSupported), which
+          // a later torch op would pick up via hipGetLastError() and raise as
+          // "operation not supported" (observed on gfx950). Mirrors the sibling
+          // ccoDevCommCreate call site.
+          (void)hipGetLastError();
           if (peerErr != hipSuccess && peerErr != hipErrorPeerAccessAlreadyEnabled) {
             MORI_SHMEM_WARN("ccoWindowRegister: hipDeviceEnablePeerAccess PE {} dev {} failed: {}",
                             pe, peerDev, static_cast<int>(peerErr));
