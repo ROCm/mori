@@ -2170,8 +2170,8 @@ __device__ __forceinline__ void WarpAccumFp8DequantSegment(
 // Requires: InT == hip_bfloat16, blockElems == SubwarpSize*kVecElems, kVecElems % 8 == 0,
 // and block byte-alignment (start even). Uses vector loads (int4 = 8 bf16) and vector stores
 // (uint32 = 8 packed fp4) so the send-quant is not bottlenecked on scalar accesses.
-template <int SubwarpSize, int kVecElems, typename Fp8T, typename InT>
-__device__ __forceinline__ void WarpQuantizeToFp4BlockwiseVec(Fp8T* __restrict__ dstToken,
+template <int SubwarpSize, int kVecElems, typename PackedT, typename InT>
+__device__ __forceinline__ void WarpQuantizeToFp4BlockwiseVec(PackedT* __restrict__ dstToken,
                                                               float* __restrict__ dstScales,
                                                               const InT* __restrict__ srcToken,
                                                               int hiddenDim, int scaleDim) {
@@ -2229,8 +2229,8 @@ __device__ __forceinline__ void WarpQuantizeToFp4BlockwiseVec(Fp8T* __restrict__
   if (laneId == 0) dstScales[0] = -dstScales[0];
 }
 
-template <typename Fp8T, typename InT>
-__device__ __forceinline__ void WarpQuantizeToFp4Blockwise(Fp8T* __restrict__ dstToken,
+template <typename PackedT, typename InT>
+__device__ __forceinline__ void WarpQuantizeToFp4Blockwise(PackedT* __restrict__ dstToken,
                                                            float* __restrict__ dstScales,
                                                            const InT* __restrict__ srcToken,
                                                            int hiddenDim, int scaleDim) {
@@ -2242,7 +2242,7 @@ __device__ __forceinline__ void WarpQuantizeToFp4Blockwise(Fp8T* __restrict__ ds
   // Fast path: 64-lane warp, blockElems == 128 == 8 subwarps * 16 elems (the DeepSeek config).
   if (warpSize == 64 && blockElems == 128 && (hiddenDim % 128) == 0 &&
       std::is_same_v<InT, hip_bfloat16>) {
-    WarpQuantizeToFp4BlockwiseVec<8, 16, Fp8T, InT>(dstToken, dstScales, srcToken, hiddenDim,
+    WarpQuantizeToFp4BlockwiseVec<8, 16, PackedT, InT>(dstToken, dstScales, srcToken, hiddenDim,
                                                     scaleDim);
     return;
   }
@@ -2250,7 +2250,7 @@ __device__ __forceinline__ void WarpQuantizeToFp4Blockwise(Fp8T* __restrict__ ds
   // block256 vec8 variant so block256 configs are not left on the scalar path).
   if (warpSize == 64 && blockElems == 256 && (hiddenDim % 256) == 0 &&
       std::is_same_v<InT, hip_bfloat16>) {
-    WarpQuantizeToFp4BlockwiseVec<8, 32, Fp8T, InT>(dstToken, dstScales, srcToken, hiddenDim,
+    WarpQuantizeToFp4BlockwiseVec<8, 32, PackedT, InT>(dstToken, dstScales, srcToken, hiddenDim,
                                                     scaleDim);
     return;
   }
@@ -2290,9 +2290,9 @@ __device__ __forceinline__ void WarpQuantizeToFp4Blockwise(Fp8T* __restrict__ ds
   if (laneId == 0) dstScales[0] = -dstScales[0];
 }
 
-template <typename OutT, typename Fp8T>
+template <typename OutT, typename PackedT>
 __device__ __forceinline__ void WarpAccumFp4DequantFull(OutT* __restrict__ dstToken,
-                                                        const Fp8T* const* __restrict__ srcs,
+                                                        const PackedT* const* __restrict__ srcs,
                                                         const float* const* __restrict__ srcScales,
                                                         int accumNum, int hiddenDim, int scaleDim) {
   const int laneId = threadIdx.x & (warpSize - 1);
@@ -2340,9 +2340,9 @@ __device__ __forceinline__ void WarpAccumFp4DequantFull(OutT* __restrict__ dstTo
   }
 }
 
-template <typename OutT, typename Fp8T>
+template <typename OutT, typename PackedT>
 __device__ __forceinline__ void WarpAccumFp4DequantSegment(
-    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    OutT* __restrict__ dstToken, const PackedT* const* __restrict__ srcs,
     const float* const* __restrict__ srcScales, int accumNum, int hiddenDimOffset,
     int hiddenDimSize, int hiddenDim, int scaleDim) {
   const int laneId = threadIdx.x & (warpSize - 1);
@@ -2381,9 +2381,9 @@ __device__ __forceinline__ void WarpAccumFp4DequantSegment(
 /* (tb = srcs[i] - hiddenDimOffset) and index in packed (half-byte) units. Blocks/offsets are */
 /* byte-aligned (blockElems and hiddenDimOffset even) for all supported configs. */
 /* ---------------------------------------------------------------------------------------------- */
-template <typename OutT, typename Fp8T, int AccumNum>
+template <typename OutT, typename PackedT, int AccumNum>
 __device__ __forceinline__ void WarpAccumFp4DequantVecBlockwiseScaleWave(
-    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    OutT* __restrict__ dstToken, const PackedT* const* __restrict__ srcs,
     const float* const* __restrict__ srcScales, int hiddenDimOffset, int start, int end,
     int blockElems) {
   const int laneId = threadIdx.x & (warpSize - 1);
@@ -2406,7 +2406,7 @@ __device__ __forceinline__ void WarpAccumFp4DequantVecBlockwiseScaleWave(
     float sArr[AccumNum];
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
-      const Fp8T* src = srcs[i];
+      const PackedT* src = srcs[i];
       if (src == nullptr) {
         sArr[i] = 0.0f;  // sentinel: contributes nothing
         bitsArr[i] = 0u;
@@ -2448,7 +2448,7 @@ __device__ __forceinline__ void WarpAccumFp4DequantVecBlockwiseScaleWave(
     float acc = 0.0f;
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
-      const Fp8T* src = srcs[i];
+      const PackedT* src = srcs[i];
       if (src == nullptr) continue;
       float s = 1.0f;
       if (srcScales != nullptr && srcScales[i] != nullptr) {
@@ -2465,19 +2465,19 @@ __device__ __forceinline__ void WarpAccumFp4DequantVecBlockwiseScaleWave(
   }
 }
 
-template <typename OutT, typename Fp8T, int BlockElems, int AccumNum = 8>
+template <typename OutT, typename PackedT, int BlockElems, int AccumNum = 8>
 __device__ __forceinline__ void WarpAccumFp4DequantFullBlockVec8Top8(
-    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    OutT* __restrict__ dstToken, const PackedT* const* __restrict__ srcs,
     const float* const* __restrict__ srcScales, int hiddenDim) {
-  WarpAccumFp4DequantVecBlockwiseScaleWave<OutT, Fp8T, AccumNum>(
+  WarpAccumFp4DequantVecBlockwiseScaleWave<OutT, PackedT, AccumNum>(
       dstToken, srcs, srcScales, /*hiddenDimOffset=*/0, /*start=*/0, /*end=*/hiddenDim, BlockElems);
 }
 
-template <typename OutT, typename Fp8T, int BlockElems, int AccumNum = 8>
+template <typename OutT, typename PackedT, int BlockElems, int AccumNum = 8>
 __device__ __forceinline__ void WarpAccumFp4DequantSegmentBlockVec8Top8(
-    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    OutT* __restrict__ dstToken, const PackedT* const* __restrict__ srcs,
     const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize) {
-  WarpAccumFp4DequantVecBlockwiseScaleWave<OutT, Fp8T, AccumNum>(
+  WarpAccumFp4DequantVecBlockwiseScaleWave<OutT, PackedT, AccumNum>(
       dstToken, srcs, srcScales, hiddenDimOffset, /*start=*/0, /*end=*/hiddenDimSize, BlockElems);
 }
 
