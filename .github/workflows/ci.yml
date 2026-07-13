@@ -475,6 +475,10 @@ jobs:
         with:
           submodules: true
 
+      - name: Recover podman if needed
+        if: ${{ matrix.ct == 'podman' }}
+        run: podman system migrate || true
+
       - name: Build CI image
         run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
 
