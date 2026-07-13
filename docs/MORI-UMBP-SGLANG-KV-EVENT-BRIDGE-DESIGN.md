@@ -62,12 +62,31 @@ bridge.start()
 bridge.stop()
 ```
 
+多 worker 场景建议使用 `sources[]`，每个 source 独立配置 `node_id` 和 `server_info_url`：
+
+```python
+cfg = UMBPSglangKvEventBridgeConfig(
+    master_address="127.0.0.1:15558",
+    sources=[
+        UMBPSglangKvEventSource(
+            node_id="worker-0",
+            sglang_server_info_url="http://worker-0:30000/server_info",
+        ),
+        UMBPSglangKvEventSource(
+            node_id="worker-1",
+            sglang_server_info_url="http://worker-1:30000/server_info",
+        ),
+    ],
+)
+```
+
 ## 4. Config 字段
 
 | 字段 | 说明 |
 | --- | --- |
 | `master_address` | UMBP master 地址 |
-| `node_id` | 这些 KV events 对应的 SGLang worker / UMBP node |
+| `node_id` | 单 source 模式下，表示当前订阅的 SGLang worker / UMBP node |
+| `sources` | 多 worker 模式下的 source 列表；每个 source 独立配置 `node_id` 和 `sglang_server_info_url` |
 | `sglang_server_info_url` | 推荐入口，通过 SGLang `/server_info` 自动发现 KV event publisher |
 | `zmq_endpoint` | 可选，手动指定 ZMQ endpoint；设置后覆盖 `server_info` |
 | `zmq_topic` | 可选，ZMQ topic；默认从 `server_info.kv_events.topic` 读取 |
@@ -75,9 +94,7 @@ bridge.stop()
 | `medium_to_tier` | SGLang `StorageMedium` 到 UMBP tier 的映射 |
 | `hash_format` | block hash 编码格式，默认 `decimal` |
 | `ignore_unknown_medium` | 遇到未知 medium 时跳过还是报错 |
-| `replay_endpoint` | 可选，未来支持 SGLang replay |
-| `start_seq` | 可选，未来从指定 sequence replay |
-| `batch_report_size` | 聚合多少 hashes 后批量 report / revoke |
+| `batch_report_size` | 按 action 和 tier 聚合的 block hash 数量阈值，达到后批量 report / revoke |
 | `poll_timeout_ms` | `poll_once()` 的 ZMQ poll timeout |
 
 ## 5. Runtime API
@@ -195,7 +212,7 @@ def encode_hash(h: int) -> str:
 | --- | --- |
 | ZMQ 暂时无消息 | `poll_once()` 返回 `0` |
 | msgpack decode 失败 | 计入 `decode_errors`，跳过该 batch |
-| sequence gap | 计入 `dropped_batches`，未来可通过 replay 修复 |
+| sequence gap | 计入 `dropped_batches`，用于观测是否存在事件丢失 |
 | unknown medium | 默认跳过，计入 `skipped_unknown_medium` |
 | UMBP master RPC 失败 | 有限重试；失败后计入 `report_errors` / `revoke_errors` |
 | `AllBlocksCleared` | 对所有 mapped tier 执行 revoke-all，保证 metadata 收敛 |
@@ -247,7 +264,6 @@ revoke_all_external_kv_blocks_at_tier(node_id, tier)
 | `BlockRemoved` revoke | 是 |
 | `AllBlocksCleared` revoke-all | 是 |
 | sequence gap 统计 | 是 |
-| replay endpoint 补消息 | 预留接口，后续实现 |
 | bytes put/get | 不做，继续只走 metadata |
 
 ## 14. 总结
