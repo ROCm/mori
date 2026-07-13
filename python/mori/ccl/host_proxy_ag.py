@@ -154,6 +154,29 @@ class HostProxyHierAllGather:
         self._n_post = 0
         self._n_complete = 0
 
+        # ASYNC double-buffered receive staging (MORI_HOSTPROXY_ASYNC_RING, default
+        # 1 = OFF = byte-identical). The ASYNC path's NaN is a staging read/write
+        # race (diag: FSDP DOES wait() every AG, so no completion is skipped): after
+        # the rail-pair barrier, _complete(N)'s step-3 GPU gather READS my recv
+        # staging slot, but the partner is then free to run op(N+1)'s _post which
+        # RDMA-WRITES the SAME staging bytes; under deferral the read can be
+        # overtaken -> torn recv -> NaN. RING>=2 lands op N and op N+1 in DISJOINT
+        # byte regions so the partner's next write cannot clobber this op's read.
+        # The heap (cap*world bytes) already dwarfs the 2 shards an op uses, so the
+        # ring regions are carved from the existing allocation (no extra memory, no
+        # host fence, bulk bytes stay on RDMA/SDMA). Both ranks derive the slot from
+        # the same monotone op counter (FSDP issues AGs in identical order per rank).
+        self._async_ring = int(os.environ.get("MORI_HOSTPROXY_ASYNC_RING", "1") or "1")
+        if self._async_ring < 1:
+            self._async_ring = 1
+        # Per-rank staging slot size (one shard cap). _max_bytes == cap*npes.
+        self._cap_stage_bytes = self._max_bytes // npes
+        if self._async_ring > 1 and (1 + self._async_ring) > npes:
+            raise RuntimeError(
+                f"MORI_HOSTPROXY_ASYNC_RING={self._async_ring} needs "
+                f"{1 + self._async_ring} staging slots but only {npes} exist")
+        self._op_ctr = 0
+
         # Persistent byte-addressable staging heap (registered on the NIC once).
         self._stage = torch.zeros(self._max_bytes, dtype=torch.uint8, device=device)
 
@@ -354,19 +377,41 @@ class HostProxyHierAllGather:
                                e, stream, out_full=out, block_off_elems=base * e)
                 return None
 
-            # The staging heap only carries single shards (send from sv[my_pe],
-            # receive into sv[partner]); the intra gathers write STRAIGHT into the
-            # user's ``out`` so there is no full-output copy-out.
-            sv = self._stage_view(inp.dtype, e * world)
-
-            # Stage my shard for the NIC and make it device-visible for the GDR read.
-            sv[self.my_pe * e:(self.my_pe + 1) * e].copy_(inp)
+            # Staging layout for the cross-node shard exchange.
+            #   send_local_off : byte offset of MY shard I read for the RDMA write.
+            #   write_remote_off: byte offset in the PARTNER's heap I write to (==
+            #     where the partner reads its recv), so both sides must agree.
+            #   recv_slot      : local view where the PARTNER's shard lands (== the
+            #     partner's write_remote_off into MY heap, so it matches by symmetry).
+            # Default (ring==1): pe-indexed slots (send from sv[my_pe], the partner
+            # writes into MY sv[my_pe] and I read sv[partner]) -- byte-identical.
+            # RING>1: send region [0,cap), recv region cap*(1+slot) with slot cycled
+            # per op, so op N and op N+1 land in DISJOINT bytes (breaks the async
+            # read/write race). K forced to 1 (single-chunk ring math).
+            if self._async_ring > 1:
+                self._op_ctr += 1
+                slot = self._op_ctr % self._async_ring
+                cap = self._cap_stage_bytes
+                send_local_off = 0
+                write_remote_off = cap * (1 + slot)
+                sv_send = self._stage[send_local_off:send_local_off + shard_bytes].view(inp.dtype)
+                sv_send.copy_(inp)
+                recv_slot = self._stage[write_remote_off:write_remote_off + shard_bytes].view(inp.dtype)
+            else:
+                # The staging heap only carries single shards (send from sv[my_pe],
+                # receive into sv[partner]); the intra gathers write STRAIGHT into
+                # the user's ``out`` so there is no full-output copy-out.
+                sv = self._stage_view(inp.dtype, e * world)
+                # Stage my shard for the NIC and make it device-visible (GDR read).
+                sv[self.my_pe * e:(self.my_pe + 1) * e].copy_(inp)
+                send_local_off = self.my_pe * shard_bytes
+                write_remote_off = self.my_pe * shard_bytes
+                recv_slot = sv[self._partner * e:(self._partner + 1) * e]
             self._copy_ev.record(stream)
             self._copy_ev.synchronize()
 
             other_node = 1 - self.node_id
             obase = other_node * rpn
-            recv_slot = sv[self._partner * e:(self._partner + 1) * e]
             other_out_slots = [out[(obase + i) * e:(obase + i + 1) * e] for i in range(rpn)]
 
             # Element-space chunk boundaries for the K-way cross-node/step-3 pipeline.
@@ -383,7 +428,9 @@ class HostProxyHierAllGather:
             # The NCCL fallback gathers into per-slot offset VIEWS (slots_k), so it
             # handles K>1 fine. The barrier-free pipe-flag removes the per-chunk
             # collective barrier but does NOT change these layout constraints.
-            if self._sdma is not None and not self._sdma_direct:
+            if self._async_ring > 1:
+                K = 1  # ring layout carves single-shard recv regions (no chunking)
+            elif self._sdma is not None and not self._sdma_direct:
                 K = 1  # non-direct SDMA cannot chunk-with-stride; force whole shard
             else:
                 K = max(1, self._pipe_chunks)
@@ -403,9 +450,10 @@ class HostProxyHierAllGather:
                 if nb == 0:
                     sts.append(None)
                     continue
-                b0 = self.my_pe * shard_bytes + o0 * elsize
+                b0_local = send_local_off + o0 * elsize
+                b0_remote = write_remote_off + o0 * elsize
                 uid = self._engine.allocate_transfer_uid()
-                sts.append(self._session.write(b0, b0, nb, uid))
+                sts.append(self._session.write(b0_local, b0_remote, nb, uid))
 
             # step 1 (intra XGMI, overlapped): gather my node's block into out
             # while the fabric writes are in flight.
