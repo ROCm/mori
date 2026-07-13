@@ -838,7 +838,12 @@ class EpDispatchCombineOp:
         routing carries the mapping). Returns (out [ct,hidden], out_weights [ct,topk]).
         """
         out_tok_ptr = self.arena.local_ptr("out_tok")
-        if input.data_ptr() != out_tok_ptr:
+        # StdMoE: convert_combine_input() has already staged the weighted-reduced
+        # tokens into out_tok, so `input` is unused here — copying it in would
+        # clobber that result. (Non-StdMoE: `input` holds the post-expert tokens
+        # to combine; since the disp_out/out_tok split it no longer aliases out_tok,
+        # so the copy is required.)
+        if not self.cfg.enable_std_moe and input.data_ptr() != out_tok_ptr:
             # copy in the combine-dtype layout (not recv_tokens()'s dispatch view)
             dst = self.combine_in_view().view(-1)[: input.numel()]
             dst.copy_(input.reshape(-1))
