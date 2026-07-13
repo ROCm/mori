@@ -86,6 +86,23 @@ FLUSH_PEER = {
     for c in ("warp", "block")
 }
 
+# ── SDMA ──
+
+_SDMA_XFER_ARGS = [_U64, _I32, _U64, _U64, _U64, _U64, _U64, _I32]
+
+SDMA_XFER = {
+    f"{op}__{s}": _ffi(f"cco_sdma_{op}__{s}", _SDMA_XFER_ARGS, "void")
+    for op in ("put", "get")
+    for s in ("thread", "warp")
+}
+
+# quiet: (devComm, peer)
+SDMA_QUIET = {
+    s: _ffi(f"cco_sdma_quiet__{s}", [_U64, _I32], "void") for s in ("thread", "warp")
+}
+# quiet_queue: (devComm, peer, queueId)
+cco_sdma_quiet_queue = _ffi("cco_sdma_quiet_queue", [_U64, _I32, _I32], "void")
+
 # ── axis-free symbols ──
 # cco_lsa_ptr(window, peerLsaRank, offset) -> peer's load/store-accessible VA.
 cco_lsa_ptr = _ffi("cco_lsa_ptr", [_U64, _I32, _U64], _U64, pure=True)

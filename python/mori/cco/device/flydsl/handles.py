@@ -276,6 +276,71 @@ class Gda:
 
 
 @cco_struct
+class Sdma:
+    dev_comm: fx.Int64
+
+    def put(
+        self,
+        peer,
+        dst_win,
+        dst_off,
+        src_win,
+        src_off,
+        nbytes,
+        qid,
+        *,
+        coop=CoopScope.THREAD,
+    ):
+        if _const(coop, "coop") == CoopScope.BLOCK:
+            raise ValueError("cco: SDMA put has no block-level API yet")
+        raw.SDMA_XFER[f"put__{_COOP_TAG[coop]}"](
+            self.dev_comm,
+            peer,
+            _win(dst_win),
+            dst_off,
+            _win(src_win),
+            src_off,
+            nbytes,
+            qid,
+        )
+
+    def get(
+        self,
+        peer,
+        dst_win,
+        dst_off,
+        src_win,
+        src_off,
+        nbytes,
+        qid,
+        *,
+        coop=CoopScope.THREAD,
+    ):
+        if _const(coop, "coop") == CoopScope.BLOCK:
+            raise ValueError("cco: SDMA get has no block-level API yet")
+        raw.SDMA_XFER[f"get__{_COOP_TAG[coop]}"](
+            self.dev_comm,
+            peer,
+            _win(dst_win),
+            dst_off,
+            _win(src_win),
+            src_off,
+            nbytes,
+            qid,
+        )
+
+    def quiet(self, peer, *, coop=CoopScope.THREAD):
+        """Wait for all outstanding SDMA ops to `peer` across every queue."""
+        if _const(coop, "coop") == CoopScope.BLOCK:
+            raise ValueError("cco: SDMA quiet has no block-level API yet")
+        raw.SDMA_QUIET[_COOP_TAG[coop]](self.dev_comm, peer)
+
+    def quiet_queue(self, peer, qid):
+        """Wait on a single (peer, queueId) queue only."""
+        raw.cco_sdma_quiet_queue(self.dev_comm, peer, qid)
+
+
+@cco_struct
 class DevComm:
     """Handle for a device-resident ``ccoDevComm``."""
 
@@ -300,3 +365,7 @@ class DevComm:
     def gda(self, ctx=0) -> Gda:
         """Build a GDA handle on this devComm for the given (compile-time) context index."""
         return Gda(dev_comm=self.ptr, ctx=ctx)
+
+    def sdma(self) -> Sdma:
+        """Build an SDMA handle on this devComm (LSA copy-engine put/get)."""
+        return Sdma(dev_comm=self.ptr)
