@@ -449,8 +449,21 @@ class MoriAllGather(AllGather):
         # trip overlaps the caller's compute instead of stalling the host mid-AG.
         self._hostproxy_async = os.environ.get(
             "MORI_HOSTPROXY_ASYNC", "") not in ("", "0", "false", "False")
-        # Discriminator: host-drain the AG stream after the deferred _complete (see
-        # _HostProxyDeferredWork.wait). Default OFF.
+        # ASYNC correctness defaults (Team A Turn 9). The deferred-completion path is
+        # bit-exact + >native (269 TFLOPS = 1.07x, vs sync 232) ONLY with BOTH of:
+        #   * ASYNC_DRAIN: host-drain the AG stream after _complete so step-3 (the
+        #     remote-half broadcast) is landed+visible before FSDP's copy-out reads
+        #     ``out`` (else a completion-visibility race -> garbage remote half ->
+        #     total NaN);
+        #   * ASYNC_RING=2: double-buffer the recv staging so the partner's next-op
+        #     RDMA write cannot overtake this op's step-3 read (else a residual
+        #     nondeterministic drift in later windows).
+        # Enabling ASYNC without these is a NaN/drift footgun, so turn them on by
+        # default whenever ASYNC is requested (setdefault => explicit overrides win,
+        # so a 0/1 A/B is still available). Both verified bit-exact 3 reps @50/20.
+        if self._hostproxy_async:
+            os.environ.setdefault("MORI_HOSTPROXY_ASYNC_DRAIN", "1")
+            os.environ.setdefault("MORI_HOSTPROXY_ASYNC_RING", "2")
         self._hostproxy_async_drain = os.environ.get(
             "MORI_HOSTPROXY_ASYNC_DRAIN", "") not in ("", "0", "false", "False")
         # DEFERRED device-path host landing fence (MORI_FSDP_DEFER_HOSTSYNC=1,
