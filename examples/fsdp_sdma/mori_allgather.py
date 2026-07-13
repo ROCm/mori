@@ -196,15 +196,26 @@ class _HostProxyDeferredWork(dist.distributed_c10d.Work):
     is a ``dist.distributed_c10d.Work``.
     """
 
-    def __init__(self, collective, handle) -> None:
+    def __init__(self, collective, handle, drain=False) -> None:
         super().__init__()
         self._collective = collective
         self._handle = handle
+        self._drain = drain
         self._done = False
 
     def wait(self, timeout=None) -> bool:  # noqa: ARG002
         if not self._done:
             self._collective._complete(self._handle)
+            # DISCRIMINATOR (MORI_HOSTPROXY_ASYNC_DRAIN=1): host-drain the AG stream
+            # AFTER _complete so step-3 (the remote-half broadcast) is guaranteed
+            # landed+visible before FSDP's copy-out reads ``out``. _complete only
+            # ENQUEUES step-3 on the captured AG stream; if the consumer stream is
+            # not ordered after it, copy-out races the still-pending step-3 -> the
+            # remote half stays garbage -> NaN. If DRAIN makes the loss bit-exact,
+            # the NaN is a completion-visibility race (fixable with a cheaper
+            # cross-stream event wait); if it stays NaN, it is a transport data race.
+            if self._drain:
+                self._handle["stream"].synchronize()
             self._collective._pending = None
             self._done = True
         return True
@@ -438,6 +449,10 @@ class MoriAllGather(AllGather):
         # trip overlaps the caller's compute instead of stalling the host mid-AG.
         self._hostproxy_async = os.environ.get(
             "MORI_HOSTPROXY_ASYNC", "") not in ("", "0", "false", "False")
+        # Discriminator: host-drain the AG stream after the deferred _complete (see
+        # _HostProxyDeferredWork.wait). Default OFF.
+        self._hostproxy_async_drain = os.environ.get(
+            "MORI_HOSTPROXY_ASYNC_DRAIN", "") not in ("", "0", "false", "False")
         # DEFERRED device-path host landing fence (MORI_FSDP_DEFER_HOSTSYNC=1,
         # default OFF). For the DEVICE HierAllGather (fused fill), issue the AG
         # non-blocking and return a c10d Work whose wait() does the host
@@ -738,7 +753,8 @@ class MoriAllGather(AllGather):
                 input_tensor, output_tensor, count, stream=stream)
             if handle is None:  # single-node degenerate path (already blocking)
                 return None
-            work = _HostProxyDeferredWork(collective, handle)
+            work = _HostProxyDeferredWork(
+                collective, handle, drain=self._hostproxy_async_drain)
             collective._pending = work
             return work
 
