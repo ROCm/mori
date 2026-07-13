@@ -114,6 +114,12 @@ struct MemoryDesc {
   std::array<char, kFabricHandleSize> fabricHandle{};  // 64B fabric token (empty when N/A)
   int vpodId{-1};                                      // UALink vPOD id of deviceId (-1 = N/A)
   std::string vpodPpodId;                              // UALink ppod_id UUID ("" = N/A)
+  // data may be a sub-allocation inside a larger fabric VMM allocation (e.g. a
+  // torch tensor carved out of a MemPool segment). fabricHandle exports the whole
+  // allocation; these locate `data` within it so the importer maps the allocation
+  // and offsets to the right address.
+  uint64_t fabricOffset{0};     // data - allocation base
+  uint64_t fabricAllocSize{0};  // full size of the exported allocation
 
   constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
@@ -122,7 +128,7 @@ struct MemoryDesc {
   }
 
   MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode,
-                 fabricHandle, vpodId, vpodPpodId);
+                 fabricHandle, vpodId, vpodPpodId, fabricOffset, fabricAllocSize);
 };
 
 using TransferUniqueId = uint64_t;

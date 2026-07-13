@@ -617,8 +617,28 @@ void FabricBackend::RegisterMemory(MemoryDesc& desc) {
 
   static_assert(sizeof(fh) == kFabricHandleSize, "fabric handle size mismatch");
   std::memcpy(desc.fabricHandle.data(), &fh, sizeof(fh));
-  MORI_IO_TRACE("FABRIC: Registered memory id={}, addr={}, size={} (fabric-exportable)", desc.id,
-                desc.data, desc.size);
+
+  // The registered pointer may be a sub-allocation inside a larger fabric VMM
+  // allocation (e.g. a torch tensor carved out of a MemPool segment). Record its
+  // offset + the full allocation size so the peer maps the whole allocation and
+  // offsets to the right address.
+  void* base = nullptr;
+  size_t rangeSize = 0;
+  hipError_t rangeErr =
+      hipMemGetAddressRange(&base, &rangeSize, reinterpret_cast<hipDeviceptr_t>(desc.data));
+  if (rangeErr == hipSuccess && base != nullptr && rangeSize > 0) {
+    desc.fabricOffset = desc.data - reinterpret_cast<uintptr_t>(base);
+    desc.fabricAllocSize = rangeSize;
+  } else {
+    (void)hipGetLastError();
+    desc.fabricOffset = 0;
+    desc.fabricAllocSize = desc.size;
+  }
+
+  MORI_IO_TRACE(
+      "FABRIC: Registered memory id={}, addr={}, size={}, fabricOffset={}, allocSize={} "
+      "(fabric-exportable)",
+      desc.id, desc.data, desc.size, desc.fabricOffset, desc.fabricAllocSize);
 }
 
 void FabricBackend::DeregisterMemory(const MemoryDesc& desc) {
@@ -654,7 +674,7 @@ void* FabricBackend::GetImportedAddress(const MemoryDesc& desc, int localDeviceI
     std::shared_lock<std::shared_mutex> rlock(importMutex);
     auto it = importedRegions.find(cacheKey);
     if (it != importedRegions.end() && it->second.mappedAddr != nullptr) {
-      return it->second.mappedAddr;
+      return static_cast<char*>(it->second.mappedAddr) + desc.fabricOffset;
     }
   }
 
@@ -680,7 +700,9 @@ void* FabricBackend::GetImportedAddress(const MemoryDesc& desc, int localDeviceI
     return nullptr;
   }
 
-  size_t mapSize = AlignToFabricGranularity(localDeviceId, desc.size);
+  // Map the whole exported allocation, then offset to `data` within it.
+  size_t allocBytes = desc.fabricAllocSize != 0 ? desc.fabricAllocSize : desc.size;
+  size_t mapSize = AlignToFabricGranularity(localDeviceId, allocBytes);
   void* va = nullptr;
   err = hipMemAddressReserve(&va, mapSize, 0, 0, 0);
   if (err != hipSuccess) {
@@ -718,12 +740,12 @@ void* FabricBackend::GetImportedAddress(const MemoryDesc& desc, int localDeviceI
     (void)hipMemUnmap(va, mapSize);
     (void)hipMemAddressFree(va, mapSize);
     (void)hipMemRelease(handle);
-    return winner;
+    return static_cast<char*>(winner) + desc.fabricOffset;
   }
   importedRegions[cacheKey] = {handle, va, mapSize};
-  MORI_IO_TRACE("FABRIC: Imported fabric handle for id={} on device {}, mapped={}", desc.id,
-                localDeviceId, va);
-  return va;
+  MORI_IO_TRACE("FABRIC: Imported fabric handle for id={} on device {}, mapped={} offset={}",
+                desc.id, localDeviceId, va, desc.fabricOffset);
+  return static_cast<char*>(va) + desc.fabricOffset;
 }
 
 void FabricBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
