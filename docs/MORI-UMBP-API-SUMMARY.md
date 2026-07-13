@@ -362,7 +362,57 @@ allocator.free(handle)
 
 `AnonymousHugetlb` 失败时会 fallback 到 `Anonymous`，返回的 handle 中 `actual_backing` 会反映真实 backing。
 
-## 8. 总结
+## 8. UMBP Feature 总结
+
+| Feature | 相关组件 / API | 简明说明 |
+| --- | --- | --- |
+| 本地 `Put` / `Get` | `UMBPClient.put_from_ptr()` / `get_into_ptr()`、`LocalStorageManager` | 默认先写入或读取本地 DRAM/SSD tier；同一个 key 视为 content-addressed block，重复写入会 dedup。 |
+| 分布式 `Get` | `PoolClient.GetRemote()`、`RouteGet`、`PeerService` | 本地 miss 后可向 master 查询 remote placement，再从远端 DRAM 直接 RDMA read，或从远端 SSD staging slot 读取。 |
+| 分布式 `Put` | `PoolClient.PutRemote()`、`RoutePut`、`FinalizeAllocation` | 可通过 master 选择目标节点和 tier，远端 DRAM 走 RDMA write，远端 SSD 走 write staging slot + commit。 |
+| 批量操作 | `batch_put_from_ptr()` / `batch_get_into_ptr()` / `batch_exists()` | 面向 KV block 批量写入、读取和存在性检查，适合 prefix cache / block cache 场景。 |
+| 分层存储 | `LocalStorageManager`、`DRAMTier`、`SSDTier`、`SpdkSsdTier`、`SpdkProxyTier` | 本地存储按最快到最慢 tier 管理，支持 DRAM、POSIX/file SSD、SPDK SSD、SPDK proxy 等后端。 |
+| Eviction / Demotion | `LocalStorageManager.Evict()` / `Demote()` / `SelectVictim()` | DRAM 空间不足时可按策略选择 victim 并 demote 到更慢 tier；SSD tier 也有各自的 eviction 实现。 |
+| Read Promotion | `ReadIntoPtr()`、`MaybeAutoPromote()`、`Promote()` | 读取慢 tier 命中后可按配置自动 promote 到更快 tier，提高后续访问性能。 |
+| Tier-change 发布 | `SetOnTierChange()`、`PublishLocalBlock()`、`UnregisterFromMaster()` | block 在 DRAM/SSD 间迁移或被完全淘汰时，回调会更新 master 上的 placement，避免 global index 长期指向旧位置。 |
+| 异步 DRAM→SSD copy | `CopyPipeline`、`MaybeCopyToSharedSSD()` | 写入 DRAM 后可异步复制到 shared SSD，用于 shared-SSD leader/follower 或低成本持久化路径。 |
+| Global Block Index | `GlobalBlockIndex` | master 侧维护 `key -> locations`，每个 key 可对应多个 node/tier/location，并记录访问指标。 |
+| Local Block Index | `LocalBlockIndex` | client 本地维护 `key -> tier/size/location` hint，用于快速判断本地命中和清理 stale hint。 |
+| Global Routing | `Router`、`RouteGetStrategy`、`RoutePutStrategy` | `RouteGet` 从多个 replica 中选择读源；`RoutePut` 从 alive clients 中选择写入节点和 tier。 |
+| `Put` / `Get` / Eviction 扩展点 | `RoutePutStrategy`、`RouteGetStrategy`、`UMBPEvictionConfig`、`TierBackend` | 写入放置、读取 replica 选择、淘汰 victim 选择和存储 tier 后端都有独立扩展点；当前主要在构造期或配置期替换。 |
+| 可插拔路由策略 | `RouteGetStrategy` / `RoutePutStrategy` | 读写路由策略通过接口注入，默认读策略是随机 replica，默认写策略是 fastest-tier-first + most-available。当前主要是构造期替换。 |
+| 可插拔存储后端 | `TierBackend` | DRAM、file SSD、SPDK、SPDK proxy 等都通过 tier backend 接口接入，便于扩展新的存储实现。 |
+| 可配置 eviction 策略 | `UMBPEvictionConfig`、`SelectVictim()` | eviction policy 可配置，例如普通 LRU 或 prefix-aware LRU；当前主要是配置期选择。 |
+| Remote SSD staging | `PeerService`、`PrepareSsdRead`、`AllocateWriteSlot`、`CommitSsdWrite` | 远端 SSD 读写通过固定 staging slot 和 lease 协议完成，避免多个 RDMA/SSD I/O 并发覆盖同一 buffer。 |
+| RDMA zero-copy | `register_memory()` / `deregister_memory()`、`PoolClient` | 调用方可注册 host buffer，分布式路径在匹配已注册内存时走更直接的数据传输。 |
+| External KV metadata | `report_external_kv_blocks()` / `match_external_kv()` | 支持上报外部系统持有的 KV cache placement，用于调度查询；UMBP 不拥有 external KV bytes。 |
+| Hit count primitive | `match_external_kv(..., count_as_hit=True)` / `get_external_kv_hit_counts()` | master 记录真实路由查询命中的累计计数，供 scheduler 或 sidecar 做热度策略。 |
+| 节点生命周期 | `UMBPMasterClient.register_self()` / `unregister_self()`、heartbeat/reaper | 节点注册、注销和心跳用于维护 alive clients，master 索引会随节点失效清理。 |
+
+### 8.1 未来规划：Agent Hints
+
+目标：让 scheduler 根据 session 生命周期和 semantic spans，提前决定 sticky routing、UMBP admission 和 session-scoped metadata 清理。
+
+| Hint | 首期用途 |
+| --- | --- |
+| `session_id` | sticky session routing，提高本地 HiCache L1/L2 命中率 |
+| `session_action` | 管理 `bind` / `open` / `close` 生命周期边界 |
+| `session_timeout_ms` | inactivity cleanup，处理漏发 `close` 的场景 |
+| semantic spans | 首期识别 `SYSTEM_PROMPT`、`USER_QUERY`、`RESPONSE` |
+| admission action | 收敛为 `skip` / `report` / `put` |
+
+| Semantic phase | Admission | 策略 |
+| --- | --- | --- |
+| `SYSTEM_PROMPT` | `report`，后续可开放 `put` | 优先 L1/L2 命中；未命中可从 UMBP prefetch；close 后仍可保留 |
+| `USER_QUERY` | 默认 `skip` UMBP | 只走本地 HiCache / engine prefix cache；close 时清理 session-scoped metadata |
+| `RESPONSE` | 默认 `skip` UMBP | 避免污染外部缓存；close 时标记为可淘汰 |
+
+| 组件 | 首期职责 |
+| --- | --- |
+| Scheduler | 解析 session hints 和 semantic spans；执行 sticky routing、lifecycle handling 和 semantic admission |
+| HiCache | 执行 worker 内部 L1/L2 分层缓存，包括本地 prefix match、load back 和 selective write-through |
+| UMBP | 作为共享 KV backend 或 external metadata path，提供跨 worker KV 发现、`report` / `revoke` 和可选 bytes `put` / `get` |
+
+## 9. 总结
 
 UMBP 对外 API 可以总结为：
 
