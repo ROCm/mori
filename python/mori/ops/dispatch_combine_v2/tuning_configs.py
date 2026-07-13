@@ -162,21 +162,21 @@ _GFX1250_SCHED_BF16_T6 = (
     (4096, 192, 32, 128, 16),  # <=4096: comb block 128 (bandwidth)
     (None, 192, 32, 192, 16),  # >4096 (peak): disp 360 / comb 141 GB/s
 )
-# EP8 (world_size=8) measured 2026-07-12 on gfx1250 CROSS-NODE (2 nodes x 4 GPUs
-# over the UALink fabric), bf16, full 2-pass block x warp sweep (tok 8..8192).
-# dispatch warp ramps 8->16->32 (block 128 near-optimal throughout, 192 only
-# marginally higher at 512); combine wants small block/warp early (64/4..64/16)
-# then block 128 warp 16 for bandwidth-bound large tok. Cross-node fabric caps
-# disp ~200 GB/s (vs intra-node xGMI ~335); geometry is world_size-independent so
-# this also serves single-node EP8. Measured GB/s (disp/comb): 8=5/4 64=36/17
-# 128=74/28 256=128/42 512=164/63 1024=189/96 2048=197/120 4096=200/151 8192=200/173.
+# EP8 (world_size=8) RE-TUNED 2026-07-13 on gfx1250 CROSS-NODE (2 nodes x 4 GPUs
+# over the UALink fabric), bf16, with the vec4 combine-gather kernel, full 2-pass
+# block x warp sweep (tok 8..8192). dispatch unchanged by vec4: block 128, warp
+# ramps 16->32. combine SHIFTED: block 64 is now uniformly best (128 loses even at
+# 8192 with vec4's wider loads), warp ramps 4->8->16. Cross-node fabric caps disp
+# ~200 GB/s; geometry is world_size-independent so this also serves single-node EP8.
+# Measured vec4 GB/s at scheduled geom (disp/comb): 8=5/3 64=17/23 128=71/47
+# 256=127/76 512=162/105 1024=187/135 2048=198/152 4096=200/176 8192=200/200
+# (<=64 disp is launch-latency noise). vs pre-vec4 scalar tuned comb 8192=173
+# 512=63 256=42 -> +15% / +67% / +80%. topk6 (384 exp) reuses this schedule,
+# comb 8192=198 512=99 256=68 (geometry is topk-independent).
 _GFX1250_SCHED_BF16_EP8 = (
-    (64, 128, 8, 64, 8),  # <=64:   latency-bound
-    (128, 128, 8, 64, 4),  # <=128
-    (256, 128, 16, 64, 8),  # <=256:  disp warp 16
-    (512, 128, 32, 128, 8),  # <=512:  disp warp 32; comb block 128
-    (1024, 128, 32, 64, 16),  # <=1024: comb warp 16
-    (None, 128, 32, 128, 16),  # >1024 (peak): disp ~200 / comb ~173 GB/s
+    (256, 128, 16, 64, 4),  # <=256:  disp warp 16, comb 64/4 (latency-bound)
+    (1024, 128, 32, 64, 8),  # <=1024: disp warp 32, comb 64/8
+    (None, 128, 32, 64, 16),  # >1024 (peak): disp ~200 / comb ~200 GB/s
 )
 # bf16-tuned (EP4 + EP8). fp8/fp4 fall back to the bf16 schedule until separately tuned.
 _GFX1250_TABLE = {
