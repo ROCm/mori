@@ -1,0 +1,335 @@
+W0713 13:43:33.789000 82783 /root/wuyl/pytorch-main/torch/distributed/run.py:874] 
+W0713 13:43:33.789000 82783 /root/wuyl/pytorch-main/torch/distributed/run.py:874] *****************************************
+W0713 13:43:33.789000 82783 /root/wuyl/pytorch-main/torch/distributed/run.py:874] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0713 13:43:33.789000 82783 /root/wuyl/pytorch-main/torch/distributed/run.py:874] *****************************************
+[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[SDMAENG] src=2 dst=0 fromKFD=1 ch0eng=2 nEng=1 oam=0
+[SDMAENG] src=2 dst=1 fromKFD=1 ch0eng=10 nEng=1 oam=0
+[SDMAENG] src=2 dst=2 fromKFD=0 ch0eng=0 nEng=1 oam=0
+[SDMAENG] src=2 dst=3 fromKFD=1 ch0eng=12 nEng=1 oam=0
+[SDMAENG] src=2 dst=4 fromKFD=1 ch0eng=4 nEng=1 oam=0
+[SDMAENG] src=2 dst=5 fromKFD=1 ch0eng=8 nEng=1 oam=0
+[SDMAENG] src=5 dst=0 fromKFD=1 ch0eng=12 nEng=1 oam=0
+[SDMAENG] src=2 dst=6 fromKFD=1 ch0eng=14 nEng=1 oam=0
+[SDMAENG] src=5 dst=1 fromKFD=1 ch0eng=6 nEng=1 oam=0
+[SDMAENG] src=2 dst=7 fromKFD=1 ch0eng=6 nEng=1 oam=0
+[SDMAENG] src=5 dst=2 fromKFD=1 ch0eng=8 nEng=1 oam=0
+[SDMAENG] src=0 dst=0 fromKFD=0 ch0eng=0 nEng=1 oam=0
+[SDMAENG] src=7 dst=0 fromKFD=1 ch0eng=4 nEng=1 oam=0
+[SDMAENG] src=0 dst=1 fromKFD=1 ch0eng=14 nEng=1 oam=0
+[SDMAENG] src=5 dst=3 fromKFD=1 ch0eng=4 nEng=1 oam=0
+[SDMAENG] src=7 dst=1 fromKFD=1 ch0eng=8 nEng=1 oam=0
+[SDMAENG] src=6 dst=0 fromKFD=1 ch0eng=8 nEng=1 oam=0
+[SDMAENG] src=0 dst=2 fromKFD=1 ch0eng=2 nEng=1 oam=0
+[SDMAENG] src=3 dst=0 fromKFD=1 ch0eng=12 nEng=1 oam=0
+[SDMAENG] src=5 dst=4 fromKFD=1 ch0eng=14 nEng=1 oam=0
+[SDMAENG] src=4 dst=0 fromKFD=1 ch0eng=6 nEng=1 oam=0
+[SDMAENG] src=7 dst=2 fromKFD=1 ch0eng=6 nEng=1 oam=0
+[SDMAENG] src=6 dst=1 fromKFD=1 ch0eng=4 nEng=1 oam=0
+[SDMAENG] src=1 dst=0 fromKFD=1 ch0eng=14 nEng=1 oam=0
+[SDMAENG] src=3 dst=1 fromKFD=1 ch0eng=2 nEng=1 oam=0
+[SDMAENG] src=0 dst=3 fromKFD=1 ch0eng=10 nEng=1 oam=0
+[SDMAENG] src=4 dst=1 fromKFD=1 ch0eng=10 nEng=1 oam=0
+[SDMAENG] src=5 dst=5 fromKFD=0 ch0eng=0 nEng=1 oam=0
+[SDMAENG] src=7 dst=3 fromKFD=1 ch0eng=14 nEng=1 oam=0
+[SDMAENG] src=6 dst=2 fromKFD=1 ch0eng=14 nEng=1 oam=0
+[SDMAENG] src=1 dst=1 fromKFD=0 ch0eng=0 nEng=1 oam=0
+[SDMAENG] src=3 dst=2 fromKFD=1 ch0eng=10 nEng=1 oam=0
+[SDMAENG] src=0 dst=4 fromKFD=1 ch0eng=6 nEng=1 oam=0
+[SDMAENG] src=4 dst=2 fromKFD=1 ch0eng=4 nEng=1 oam=0
+[SDMAENG] src=5 dst=6 fromKFD=1 ch0eng=2 nEng=1 oam=0
+[SDMAENG] src=7 dst=4 fromKFD=1 ch0eng=2 nEng=1 oam=0
+[SDMAENG] src=6 dst=3 fromKFD=1 ch0eng=6 nEng=1 oam=0
+[SDMAENG] src=1 dst=2 fromKFD=1 ch0eng=12 nEng=1 oam=0
+[SDMAENG] src=3 dst=3 fromKFD=0 ch0eng=0 nEng=1 oam=0
+[SDMAENG] src=0 dst=5 fromKFD=1 ch0eng=12 nEng=1 oam=0
+[SDMAENG] src=4 dst=3 fromKFD=1 ch0eng=8 nEng=1 oam=0
+[SDMAENG] src=5 dst=7 fromKFD=1 ch0eng=10 nEng=1 oam=0
+[SDMAENG] src=7 dst=5 fromKFD=1 ch0eng=10 nEng=1 oam=0
+[SDMAENG] src=6 dst=4 fromKFD=1 ch0eng=12 nEng=1 oam=0
+[SDMAENG] src=1 dst=3 fromKFD=1 ch0eng=2 nEng=1 oam=0
+[SDMAENG] src=3 dst=4 fromKFD=1 ch0eng=8 nEng=1 oam=0
+[SDMAENG] src=0 dst=6 fromKFD=1 ch0eng=8 nEng=1 oam=0
+[SDMAENG] src=4 dst=4 fromKFD=0 ch0eng=0 nEng=1 oam=0
+[SDMAENG] src=7 dst=6 fromKFD=1 ch0eng=12 nEng=1 oam=0
+[SDMAENG] src=1 dst=4 fromKFD=1 ch0eng=10 nEng=1 oam=0
+[SDMAENG] src=6 dst=5 fromKFD=1 ch0eng=2 nEng=1 oam=0
+[SDMAENG] src=3 dst=5 fromKFD=1 ch0eng=4 nEng=1 oam=0
+[SDMAENG] src=4 dst=5 fromKFD=1 ch0eng=14 nEng=1 oam=0
+[SDMAENG] src=0 dst=7 fromKFD=1 ch0eng=4 nEng=1 oam=0
+[SDMAENG] src=7 dst=7 fromKFD=0 ch0eng=0 nEng=1 oam=0
+[SDMAENG] src=1 dst=5 fromKFD=1 ch0eng=6 nEng=1 oam=0
+[SDMAENG] src=6 dst=6 fromKFD=0 ch0eng=0 nEng=1 oam=0
+[SDMAENG] src=3 dst=6 fromKFD=1 ch0eng=6 nEng=1 oam=0
+[SDMAENG] src=4 dst=6 fromKFD=1 ch0eng=12 nEng=1 oam=0
+[SDMAENG] src=1 dst=6 fromKFD=1 ch0eng=4 nEng=1 oam=0
+[SDMAENG] src=3 dst=7 fromKFD=1 ch0eng=14 nEng=1 oam=0
+[SDMAENG] src=6 dst=7 fromKFD=1 ch0eng=10 nEng=1 oam=0
+[SDMAENG] src=4 dst=7 fromKFD=1 ch0eng=2 nEng=1 oam=0
+[SDMAENG] src=1 dst=7 fromKFD=1 ch0eng=8 nEng=1 oam=0
+[DIAG_QP_MTU] devx qpc mtu enum=5 bytes=4096 (portId=1)
+[DIAG_QP_MTU] devx qpc mtu enum=5 bytes=4096 (portId=1)
+[DIAG_QP_MTU] devx qpc mtu enum=5 bytes=4096 (portId=1)
+[DIAG_QP_MTU] devx qpc mtu enum=5 bytes=4096 (portId=1)
+[DIAG_QP_MTU] devx qpc mtu enum=5 bytes=4096 (portId=1)
+[DIAG_QP_MTU] devx qpc mtu enum=5 bytes=4096 (portId=1)
+[DIAG_QP_MTU] devx qpc mtu enum=5 bytes=4096 (portId=1)
+[DIAG_QP_MTU] devx qpc mtu enum=5 bytes=4096 (portId=1)
+Loading Qwen model config and initializing weights...
+Applying FSDP2 layer-by-layer sharding (num_params=6,754,997,760)...
+FSDP2 model is ready; starting optimizer setup and benchmark.
+/root/wuyl/pytorch-main/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+steps=0-4 mode=mori avg_time_s=0.965528 min_time_s=0.682801 max_time_s=1.256217 tokens_per_s=33937.89 tflops=1375.50 tflops_per_gpu=85.97 loss=11.056550
+steps=5-9 mode=mori avg_time_s=0.775510 min_time_s=0.566513 max_time_s=1.217905 tokens_per_s=42253.47 tflops=1712.53 tflops_per_gpu=107.03 loss=11.110868
+steps=10-14 mode=mori avg_time_s=0.887003 min_time_s=0.589088 max_time_s=1.912491 tokens_per_s=36942.36 tflops=1497.27 tflops_per_gpu=93.58 loss=11.091245
+steps=15-19 mode=mori avg_time_s=0.711777 min_time_s=0.527799 max_time_s=0.982984 tokens_per_s=46036.89 tflops=1865.87 tflops_per_gpu=116.62 loss=11.053947
+steps=20-24 mode=mori avg_time_s=0.559175 min_time_s=0.510425 max_time_s=0.635361 tokens_per_s=58600.57 tflops=2375.08 tflops_per_gpu=148.44 loss=11.125942
+steps=25-29 mode=mori avg_time_s=0.530778 min_time_s=0.509739 max_time_s=0.601610 tokens_per_s=61735.81 tflops=2502.15 tflops_per_gpu=156.38 loss=11.071662
+steps=30-34 mode=mori avg_time_s=0.512896 min_time_s=0.510389 max_time_s=0.515099 tokens_per_s=63888.14 tflops=2589.39 tflops_per_gpu=161.84 loss=11.038200
+steps=35-39 mode=mori avg_time_s=0.526475 min_time_s=0.509722 max_time_s=0.572955 tokens_per_s=62240.42 tflops=2522.60 tflops_per_gpu=157.66 loss=11.150709
+steps=40-44 mode=mori avg_time_s=0.516890 min_time_s=0.510079 max_time_s=0.525020 tokens_per_s=63394.50 tflops=2569.38 tflops_per_gpu=160.59 loss=11.024789
+steps=45-49 mode=mori avg_time_s=0.512009 min_time_s=0.509830 max_time_s=0.514028 tokens_per_s=63998.85 tflops=2593.87 tflops_per_gpu=162.12 loss=11.149323
+steps=50-54 mode=mori avg_time_s=0.514924 min_time_s=0.511406 max_time_s=0.520330 tokens_per_s=63636.58 tflops=2579.19 tflops_per_gpu=161.20 loss=11.093224
+steps=55-59 mode=mori avg_time_s=0.512482 min_time_s=0.509798 max_time_s=0.516395 tokens_per_s=63939.86 tflops=2591.48 tflops_per_gpu=161.97 loss=11.059204
+steps=60-64 mode=mori avg_time_s=0.515223 min_time_s=0.514613 max_time_s=0.516358 tokens_per_s=63599.67 tflops=2577.69 tflops_per_gpu=161.11 loss=11.042061
+steps=65-69 mode=mori avg_time_s=0.510961 min_time_s=0.509205 max_time_s=0.513633 tokens_per_s=64130.20 tflops=2599.20 tflops_per_gpu=162.45 loss=11.097533
+steps=70-74 mode=mori avg_time_s=0.512653 min_time_s=0.511478 max_time_s=0.513911 tokens_per_s=63918.54 tflops=2590.62 tflops_per_gpu=161.91 loss=11.085835
+steps=75-79 mode=mori avg_time_s=0.513340 min_time_s=0.512170 max_time_s=0.514810 tokens_per_s=63832.88 tflops=2587.15 tflops_per_gpu=161.70 loss=11.001960
+steps=80-84 mode=mori avg_time_s=0.512507 min_time_s=0.510258 max_time_s=0.514471 tokens_per_s=63936.75 tflops=2591.36 tflops_per_gpu=161.96 loss=10.608568
+steps=85-89 mode=mori avg_time_s=0.512906 min_time_s=0.510472 max_time_s=0.515352 tokens_per_s=63887.01 tflops=2589.34 tflops_per_gpu=161.83 loss=10.482648
+steps=90-94 mode=mori avg_time_s=0.511446 min_time_s=0.509756 max_time_s=0.512782 tokens_per_s=64069.35 tflops=2596.73 tflops_per_gpu=162.30 loss=10.462100
+steps=95-99 mode=mori avg_time_s=0.510767 min_time_s=0.508092 max_time_s=0.514078 tokens_per_s=64154.56 tflops=2600.18 tflops_per_gpu=162.51 loss=10.454423
+steps=100-104 mode=mori avg_time_s=0.509760 min_time_s=0.508951 max_time_s=0.510436 tokens_per_s=64281.24 tflops=2605.32 tflops_per_gpu=162.83 loss=10.466361
+steps=105-109 mode=mori avg_time_s=0.511863 min_time_s=0.508886 max_time_s=0.514208 tokens_per_s=64017.19 tflops=2594.62 tflops_per_gpu=162.16 loss=10.451502
+steps=110-114 mode=mori avg_time_s=0.510655 min_time_s=0.509338 max_time_s=0.511987 tokens_per_s=64168.60 tflops=2600.75 tflops_per_gpu=162.55 loss=10.431813
+steps=115-119 mode=mori avg_time_s=0.511877 min_time_s=0.510612 max_time_s=0.513650 tokens_per_s=64015.37 tflops=2594.54 tflops_per_gpu=162.16 loss=10.486911
+steps=120-124 mode=mori avg_time_s=0.511314 min_time_s=0.508088 max_time_s=0.514391 tokens_per_s=64085.88 tflops=2597.40 tflops_per_gpu=162.34 loss=10.439996
+steps=125-129 mode=mori avg_time_s=0.511066 min_time_s=0.509361 max_time_s=0.513032 tokens_per_s=64116.94 tflops=2598.66 tflops_per_gpu=162.42 loss=10.432615
+steps=130-134 mode=mori avg_time_s=0.510476 min_time_s=0.507286 max_time_s=0.513227 tokens_per_s=64191.05 tflops=2601.66 tflops_per_gpu=162.60 loss=10.428904
+steps=135-139 mode=mori avg_time_s=0.511185 min_time_s=0.508460 max_time_s=0.512799 tokens_per_s=64102.04 tflops=2598.05 tflops_per_gpu=162.38 loss=10.423329
+steps=140-144 mode=mori avg_time_s=0.511316 min_time_s=0.509941 max_time_s=0.512886 tokens_per_s=64085.65 tflops=2597.39 tflops_per_gpu=162.34 loss=10.425684
+steps=145-149 mode=mori avg_time_s=0.509868 min_time_s=0.505998 max_time_s=0.513444 tokens_per_s=64267.62 tflops=2604.77 tflops_per_gpu=162.80 loss=10.428890
+steps=150-154 mode=mori avg_time_s=0.511789 min_time_s=0.508880 max_time_s=0.514231 tokens_per_s=64026.38 tflops=2594.99 tflops_per_gpu=162.19 loss=10.420262
+steps=155-159 mode=mori avg_time_s=0.512445 min_time_s=0.510050 max_time_s=0.514437 tokens_per_s=63944.43 tflops=2591.67 tflops_per_gpu=161.98 loss=10.424459
+steps=160-164 mode=mori avg_time_s=0.511842 min_time_s=0.509789 max_time_s=0.513885 tokens_per_s=64019.76 tflops=2594.72 tflops_per_gpu=162.17 loss=10.420005
+steps=165-169 mode=mori avg_time_s=0.510043 min_time_s=0.507792 max_time_s=0.512149 tokens_per_s=64245.51 tflops=2603.87 tflops_per_gpu=162.74 loss=10.415198
+steps=170-174 mode=mori avg_time_s=0.511634 min_time_s=0.507451 max_time_s=0.514051 tokens_per_s=64045.79 tflops=2595.77 tflops_per_gpu=162.24 loss=10.415887
+steps=175-179 mode=mori avg_time_s=0.513405 min_time_s=0.508558 max_time_s=0.523914 tokens_per_s=63824.90 tflops=2586.82 tflops_per_gpu=161.68 loss=10.439404
+steps=180-184 mode=mori avg_time_s=0.509084 min_time_s=0.505257 max_time_s=0.511303 tokens_per_s=64366.57 tflops=2608.78 tflops_per_gpu=163.05 loss=10.419936
+steps=185-189 mode=mori avg_time_s=0.508021 min_time_s=0.504754 max_time_s=0.512568 tokens_per_s=64501.32 tflops=2614.24 tflops_per_gpu=163.39 loss=10.414042
+steps=190-194 mode=mori avg_time_s=0.508628 min_time_s=0.507259 max_time_s=0.510170 tokens_per_s=64424.34 tflops=2611.12 tflops_per_gpu=163.19 loss=10.408988
+steps=195-199 mode=mori avg_time_s=0.511300 min_time_s=0.507666 max_time_s=0.525056 tokens_per_s=64087.56 tflops=2597.47 tflops_per_gpu=162.34 loss=10.412635
+steps=200-204 mode=mori avg_time_s=0.508288 min_time_s=0.505573 max_time_s=0.510365 tokens_per_s=64467.42 tflops=2612.86 tflops_per_gpu=163.30 loss=10.414392
+steps=205-209 mode=mori avg_time_s=0.507667 min_time_s=0.504897 max_time_s=0.510953 tokens_per_s=64546.25 tflops=2616.06 tflops_per_gpu=163.50 loss=10.431414
+steps=210-214 mode=mori avg_time_s=0.510752 min_time_s=0.507479 max_time_s=0.512994 tokens_per_s=64156.43 tflops=2600.26 tflops_per_gpu=162.52 loss=10.419351
+steps=215-219 mode=mori avg_time_s=0.508727 min_time_s=0.506485 max_time_s=0.509830 tokens_per_s=64411.73 tflops=2610.61 tflops_per_gpu=163.16 loss=10.426434
+steps=220-224 mode=mori avg_time_s=0.511271 min_time_s=0.510435 max_time_s=0.512498 tokens_per_s=64091.23 tflops=2597.62 tflops_per_gpu=162.35 loss=10.425734
+steps=225-229 mode=mori avg_time_s=0.508738 min_time_s=0.507452 max_time_s=0.511107 tokens_per_s=64410.42 tflops=2610.55 tflops_per_gpu=163.16 loss=10.409653
+steps=230-234 mode=mori avg_time_s=0.510647 min_time_s=0.509247 max_time_s=0.512371 tokens_per_s=64169.56 tflops=2600.79 tflops_per_gpu=162.55 loss=10.439339
+steps=235-239 mode=mori avg_time_s=0.509220 min_time_s=0.508340 max_time_s=0.511000 tokens_per_s=64349.45 tflops=2608.08 tflops_per_gpu=163.01 loss=10.421317
+steps=240-244 mode=mori avg_time_s=0.509721 min_time_s=0.508948 max_time_s=0.511308 tokens_per_s=64286.09 tflops=2605.51 tflops_per_gpu=162.84 loss=10.398472
+steps=245-249 mode=mori avg_time_s=0.508097 min_time_s=0.506752 max_time_s=0.509345 tokens_per_s=64491.63 tflops=2613.84 tflops_per_gpu=163.37 loss=10.414646
+steps=250-254 mode=mori avg_time_s=0.509904 min_time_s=0.507558 max_time_s=0.512118 tokens_per_s=64263.09 tflops=2604.58 tflops_per_gpu=162.79 loss=10.417610
+steps=255-259 mode=mori avg_time_s=0.509141 min_time_s=0.506579 max_time_s=0.511026 tokens_per_s=64359.40 tflops=2608.49 tflops_per_gpu=163.03 loss=10.420110
+steps=260-264 mode=mori avg_time_s=0.508565 min_time_s=0.506079 max_time_s=0.510399 tokens_per_s=64432.22 tflops=2611.44 tflops_per_gpu=163.21 loss=10.408531
+steps=265-269 mode=mori avg_time_s=0.507639 min_time_s=0.505138 max_time_s=0.510299 tokens_per_s=64549.78 tflops=2616.20 tflops_per_gpu=163.51 loss=10.417700
+steps=270-274 mode=mori avg_time_s=0.509527 min_time_s=0.507564 max_time_s=0.511327 tokens_per_s=64310.59 tflops=2606.51 tflops_per_gpu=162.91 loss=10.418205
+steps=275-279 mode=mori avg_time_s=0.507791 min_time_s=0.504413 max_time_s=0.509880 tokens_per_s=64530.51 tflops=2615.42 tflops_per_gpu=163.46 loss=10.410354
+steps=280-284 mode=mori avg_time_s=0.511358 min_time_s=0.505558 max_time_s=0.519059 tokens_per_s=64080.40 tflops=2597.18 tflops_per_gpu=162.32 loss=10.405777
+steps=285-289 mode=mori avg_time_s=0.507733 min_time_s=0.504102 max_time_s=0.509088 tokens_per_s=64537.80 tflops=2615.72 tflops_per_gpu=163.48 loss=10.413412
+steps=290-294 mode=mori avg_time_s=0.508208 min_time_s=0.506542 max_time_s=0.510021 tokens_per_s=64477.58 tflops=2613.28 tflops_per_gpu=163.33 loss=10.407798
+steps=295-299 mode=mori avg_time_s=0.508651 min_time_s=0.505709 max_time_s=0.510759 tokens_per_s=64421.38 tflops=2611.00 tflops_per_gpu=163.19 loss=10.401942
+steps=300-304 mode=mori avg_time_s=0.508557 min_time_s=0.506341 max_time_s=0.510648 tokens_per_s=64433.28 tflops=2611.48 tflops_per_gpu=163.22 loss=10.409913
+steps=305-309 mode=mori avg_time_s=0.508874 min_time_s=0.506341 max_time_s=0.510325 tokens_per_s=64393.14 tflops=2609.85 tflops_per_gpu=163.12 loss=10.411578
+steps=310-314 mode=mori avg_time_s=0.508092 min_time_s=0.506349 max_time_s=0.510957 tokens_per_s=64492.26 tflops=2613.87 tflops_per_gpu=163.37 loss=10.416896
+steps=315-319 mode=mori avg_time_s=0.508183 min_time_s=0.505082 max_time_s=0.511929 tokens_per_s=64480.65 tflops=2613.40 tflops_per_gpu=163.34 loss=10.410246
+steps=320-324 mode=mori avg_time_s=0.508957 min_time_s=0.506163 max_time_s=0.510744 tokens_per_s=64382.59 tflops=2609.43 tflops_per_gpu=163.09 loss=10.417995
+steps=325-329 mode=mori avg_time_s=0.508737 min_time_s=0.506878 max_time_s=0.510630 tokens_per_s=64410.45 tflops=2610.55 tflops_per_gpu=163.16 loss=10.412692
+steps=330-334 mode=mori avg_time_s=0.508822 min_time_s=0.506810 max_time_s=0.510368 tokens_per_s=64399.72 tflops=2610.12 tflops_per_gpu=163.13 loss=10.404508
+steps=335-339 mode=mori avg_time_s=0.508574 min_time_s=0.506160 max_time_s=0.511329 tokens_per_s=64431.19 tflops=2611.40 tflops_per_gpu=163.21 loss=10.409002
+steps=340-344 mode=mori avg_time_s=0.508827 min_time_s=0.505678 max_time_s=0.511359 tokens_per_s=64399.16 tflops=2610.10 tflops_per_gpu=163.13 loss=10.405272
+steps=345-349 mode=mori avg_time_s=0.510878 min_time_s=0.505765 max_time_s=0.516649 tokens_per_s=64140.61 tflops=2599.62 tflops_per_gpu=162.48 loss=10.396426
+steps=350-354 mode=mori avg_time_s=0.507640 min_time_s=0.506330 max_time_s=0.510605 tokens_per_s=64549.67 tflops=2616.20 tflops_per_gpu=163.51 loss=10.400418
+steps=355-359 mode=mori avg_time_s=0.509179 min_time_s=0.507339 max_time_s=0.511836 tokens_per_s=64354.62 tflops=2608.29 tflops_per_gpu=163.02 loss=10.410520
+steps=360-364 mode=mori avg_time_s=0.509935 min_time_s=0.508721 max_time_s=0.512202 tokens_per_s=64259.15 tflops=2604.42 tflops_per_gpu=162.78 loss=10.412429
+steps=365-369 mode=mori avg_time_s=0.508884 min_time_s=0.506323 max_time_s=0.510618 tokens_per_s=64391.92 tflops=2609.80 tflops_per_gpu=163.11 loss=10.399417
+steps=370-374 mode=mori avg_time_s=0.509855 min_time_s=0.505692 max_time_s=0.512365 tokens_per_s=64269.26 tflops=2604.83 tflops_per_gpu=162.80 loss=10.397747
+steps=375-379 mode=mori avg_time_s=0.509544 min_time_s=0.507119 max_time_s=0.511967 tokens_per_s=64308.43 tflops=2606.42 tflops_per_gpu=162.90 loss=10.402036
+steps=380-384 mode=mori avg_time_s=0.509722 min_time_s=0.507773 max_time_s=0.512718 tokens_per_s=64285.99 tflops=2605.51 tflops_per_gpu=162.84 loss=10.410472
+steps=385-389 mode=mori avg_time_s=0.509212 min_time_s=0.506833 max_time_s=0.511434 tokens_per_s=64350.41 tflops=2608.12 tflops_per_gpu=163.01 loss=10.414874
+steps=390-394 mode=mori avg_time_s=0.507487 min_time_s=0.505127 max_time_s=0.509405 tokens_per_s=64569.17 tflops=2616.99 tflops_per_gpu=163.56 loss=10.418283
+steps=395-399 mode=mori avg_time_s=0.509161 min_time_s=0.507071 max_time_s=0.511013 tokens_per_s=64356.86 tflops=2608.38 tflops_per_gpu=163.02 loss=10.406141
+steps=400-404 mode=mori avg_time_s=0.508612 min_time_s=0.505870 max_time_s=0.511271 tokens_per_s=64426.33 tflops=2611.20 tflops_per_gpu=163.20 loss=10.406618
+steps=405-409 mode=mori avg_time_s=0.508527 min_time_s=0.503101 max_time_s=0.511594 tokens_per_s=64437.03 tflops=2611.63 tflops_per_gpu=163.23 loss=10.411079
+steps=410-414 mode=mori avg_time_s=0.507511 min_time_s=0.506783 max_time_s=0.508154 tokens_per_s=64566.03 tflops=2616.86 tflops_per_gpu=163.55 loss=10.410490
+steps=415-419 mode=mori avg_time_s=0.508682 min_time_s=0.506686 max_time_s=0.511866 tokens_per_s=64417.51 tflops=2610.84 tflops_per_gpu=163.18 loss=10.410180
+steps=420-424 mode=mori avg_time_s=0.515577 min_time_s=0.506440 max_time_s=0.530598 tokens_per_s=63556.00 tflops=2575.92 tflops_per_gpu=161.00 loss=10.410049
+steps=425-429 mode=mori avg_time_s=0.509987 min_time_s=0.508982 max_time_s=0.511224 tokens_per_s=64252.58 tflops=2604.16 tflops_per_gpu=162.76 loss=10.416072
+steps=430-434 mode=mori avg_time_s=0.513462 min_time_s=0.505937 max_time_s=0.531655 tokens_per_s=63817.74 tflops=2586.53 tflops_per_gpu=161.66 loss=10.410398
+steps=435-439 mode=mori avg_time_s=0.509397 min_time_s=0.505870 max_time_s=0.512714 tokens_per_s=64327.01 tflops=2607.17 tflops_per_gpu=162.95 loss=10.405985
+steps=440-444 mode=mori avg_time_s=0.530653 min_time_s=0.505167 max_time_s=0.618724 tokens_per_s=61750.31 tflops=2502.74 tflops_per_gpu=156.42 loss=10.409744
+steps=445-449 mode=mori avg_time_s=0.546936 min_time_s=0.508191 max_time_s=0.696947 tokens_per_s=59911.89 tflops=2428.23 tflops_per_gpu=151.76 loss=10.401978
+steps=450-454 mode=mori avg_time_s=0.509062 min_time_s=0.506781 max_time_s=0.510414 tokens_per_s=64369.39 tflops=2608.89 tflops_per_gpu=163.06 loss=10.401290
+steps=455-459 mode=mori avg_time_s=0.509090 min_time_s=0.507756 max_time_s=0.511008 tokens_per_s=64365.81 tflops=2608.75 tflops_per_gpu=163.05 loss=10.404170
+steps=460-464 mode=mori avg_time_s=0.507776 min_time_s=0.505619 max_time_s=0.509789 tokens_per_s=64532.38 tflops=2615.50 tflops_per_gpu=163.47 loss=10.394443
+steps=465-469 mode=mori avg_time_s=0.508334 min_time_s=0.507277 max_time_s=0.510089 tokens_per_s=64461.57 tflops=2612.63 tflops_per_gpu=163.29 loss=10.401308
+steps=470-474 mode=mori avg_time_s=0.508028 min_time_s=0.505743 max_time_s=0.509937 tokens_per_s=64500.40 tflops=2614.20 tflops_per_gpu=163.39 loss=10.408751
+steps=475-479 mode=mori avg_time_s=0.509483 min_time_s=0.505884 max_time_s=0.510809 tokens_per_s=64316.23 tflops=2606.74 tflops_per_gpu=162.92 loss=10.413774
+steps=480-484 mode=mori avg_time_s=0.507071 min_time_s=0.505804 max_time_s=0.508936 tokens_per_s=64622.13 tflops=2619.13 tflops_per_gpu=163.70 loss=10.404832
+steps=485-489 mode=mori avg_time_s=0.509301 min_time_s=0.506280 max_time_s=0.511491 tokens_per_s=64339.21 tflops=2607.67 tflops_per_gpu=162.98 loss=10.402088
+steps=490-494 mode=mori avg_time_s=0.509995 min_time_s=0.507969 max_time_s=0.513613 tokens_per_s=64251.55 tflops=2604.11 tflops_per_gpu=162.76 loss=10.402368
+steps=495-499 mode=mori avg_time_s=0.508826 min_time_s=0.507001 max_time_s=0.509818 tokens_per_s=64399.20 tflops=2610.10 tflops_per_gpu=163.13 loss=10.391944
+{
+  "avg_step_time_s": 0.5245068501382484,
+  "avg_tflops": 2532.0672156102937,
+  "avg_tflops_per_gpu": 158.25420097564336,
+  "avg_tokens_per_s": 62473.92191610669,
+  "dtype": "bf16",
+  "last_loss": 10.39194393157959,
+  "micro_batch_size": 1,
+  "mode": "mori",
+  "mori_enable_sdma": "1",
+  "mori_fsdp_enable_sdma": "1",
+  "mori_fsdp_zero_copy_output": null,
+  "num_params": 6754997760,
+  "seed": 1234,
+  "seq_len": 2048,
+  "steps": 500,
+  "warmup": 4,
+  "world_size": 16
+}
+/root/wuyl/pytorch-main/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+Shmem state is not initialized, call ShmemInit*/shmem_init_attr first.
+python: /home/mingzliu/sdma/mori/include/mori/shmem/internal.hpp:244: void mori::shmem::ShmemStates::CheckStatusValid(): Assertion `false' failed.
+Shmem state is not initialized, call ShmemInit*/shmem_init_attr first.
+python: /home/mingzliu/sdma/mori/include/mori/shmem/internal.hpp:244: void mori::shmem::ShmemStates::CheckStatusValid(): Assertion `false' failed.
+Shmem state is not initialized, call ShmemInit*/shmem_init_attr first.
+python: /home/mingzliu/sdma/mori/include/mori/shmem/internal.hpp:244: void mori::shmem::ShmemStates::CheckStatusValid(): Assertion `false' failed.
+Shmem state is not initialized, call ShmemInit*/shmem_init_attr first.
+python: /home/mingzliu/sdma/mori/include/mori/shmem/internal.hpp:244: void mori::shmem::ShmemStates::CheckStatusValid(): Assertion `false' failed.
+Shmem state is not initialized, call ShmemInit*/shmem_init_attr first.
+python: /home/mingzliu/sdma/mori/include/mori/shmem/internal.hpp:244: void mori::shmem::ShmemStates::CheckStatusValid(): Assertion `false' failed.
+Shmem state is not initialized, call ShmemInit*/shmem_init_attr first.
+python: /home/mingzliu/sdma/mori/include/mori/shmem/internal.hpp:244: void mori::shmem::ShmemStates::CheckStatusValid(): Assertion `false' failed.
+Shmem state is not initialized, call ShmemInit*/shmem_init_attr first.
+python: /home/mingzliu/sdma/mori/include/mori/shmem/internal.hpp:244: void mori::shmem::ShmemStates::CheckStatusValid(): Assertion `false' failed.
+Shmem state is not initialized, call ShmemInit*/shmem_init_attr first.
+python: /home/mingzliu/sdma/mori/include/mori/shmem/internal.hpp:244: void mori::shmem::ShmemStates::CheckStatusValid(): Assertion `false' failed.
+W0713 13:49:48.934000 82783 /root/wuyl/pytorch-main/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 82853 closing signal SIGTERM
+W0713 13:49:48.934000 82783 /root/wuyl/pytorch-main/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 82854 closing signal SIGTERM
+W0713 13:49:48.934000 82783 /root/wuyl/pytorch-main/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 82855 closing signal SIGTERM
+W0713 13:49:48.934000 82783 /root/wuyl/pytorch-main/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 82856 closing signal SIGTERM
+W0713 13:49:48.934000 82783 /root/wuyl/pytorch-main/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 82857 closing signal SIGTERM
+W0713 13:49:48.934000 82783 /root/wuyl/pytorch-main/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 82859 closing signal SIGTERM
+W0713 13:49:48.934000 82783 /root/wuyl/pytorch-main/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 82860 closing signal SIGTERM
+E0713 13:49:49.051000 82783 /root/wuyl/pytorch-main/torch/distributed/elastic/multiprocessing/api.py:1002] failed (exitcode: -6) local_rank: 5 (pid: 82858) of binary: /opt/conda/envs/py_3.10/bin/python
+Traceback (most recent call last):
+  File "/opt/conda/envs/py_3.10/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+  File "/root/wuyl/pytorch-main/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 380, in wrapper
+    return f(*args, **kwargs)
+  File "/root/wuyl/pytorch-main/torch/distributed/run.py", line 1028, in main
+    run(args)
+  File "/root/wuyl/pytorch-main/torch/distributed/run.py", line 1019, in run
+    elastic_launch(
+  File "/root/wuyl/pytorch-main/torch/distributed/launcher/api.py", line 194, in __call__
+    return launch_agent(
+  File "/root/wuyl/pytorch-main/torch/distributed/launcher/api.py", line 383, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+======================================================
+bench.py FAILED
+------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-07-13_13:49:49
+  host      : useocpm2m-097-040.amd.com
+  rank      : 0 (local_rank: 0)
+  exitcode  : -6 (pid: 82853)  (SIGABRT)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 82853
+[2]:
+  time      : 2026-07-13_13:49:49
+  host      : useocpm2m-097-040.amd.com
+  rank      : 1 (local_rank: 1)
+  exitcode  : -6 (pid: 82854)  (SIGABRT)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 82854
+[3]:
+  time      : 2026-07-13_13:49:49
+  host      : useocpm2m-097-040.amd.com
+  rank      : 2 (local_rank: 2)
+  exitcode  : -6 (pid: 82855)  (SIGABRT)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 82855
+[4]:
+  time      : 2026-07-13_13:49:49
+  host      : useocpm2m-097-040.amd.com
+  rank      : 3 (local_rank: 3)
+  exitcode  : -6 (pid: 82856)  (SIGABRT)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 82856
+[5]:
+  time      : 2026-07-13_13:49:49
+  host      : useocpm2m-097-040.amd.com
+  rank      : 4 (local_rank: 4)
+  exitcode  : -6 (pid: 82857)  (SIGABRT)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 82857
+[6]:
+  time      : 2026-07-13_13:49:49
+  host      : useocpm2m-097-040.amd.com
+  rank      : 6 (local_rank: 6)
+  exitcode  : -6 (pid: 82859)  (SIGABRT)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 82859
+[7]:
+  time      : 2026-07-13_13:49:49
+  host      : useocpm2m-097-040.amd.com
+  rank      : 7 (local_rank: 7)
+  exitcode  : -6 (pid: 82860)  (SIGABRT)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 82860
+------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-07-13_13:49:48
+  host      : useocpm2m-097-040.amd.com
+  rank      : 5 (local_rank: 5)
+  exitcode  : -6 (pid: 82858)  (SIGABRT)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 82858
+======================================================
