@@ -171,8 +171,9 @@ class EpDispatchCombineConfig:
                 f"token_nbytes={self.token_nbytes}"
             )
         if self.is_asymmetric_dtype:
-            # out_tok holds dispatch output then (post-expert) combine input; the
-            # two dtype layouts never coexist. gather/non-quant/non-StdMoE only.
+            # dispatch output (disp_out, dispatch dtype) and combine staging
+            # (out_tok, combine dtype) are separate buffers. gather/non-quant/
+            # non-StdMoE only (the asymmetric path is implemented for gather).
             if self.combine_mode != "gather" or self.quant_type != "none" or self.enable_std_moe:
                 raise ValueError(
                     "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
@@ -400,8 +401,12 @@ class EpDispatchCombineOp:
             ("recv_to_src_token", recv_cap * 4),
             ("out_idx", recv_cap * topk * 4),
             ("out_wts", recv_cap * topk * 4),
-            # out_tok holds dispatch output then combine input — size to the larger.
-            ("out_tok", recv_cap * max(token_nbytes, cfg.combine_token_nbytes)),
+            # disp_out: dispatch scatter dest / expert-GEMM input (recv_x). Kept
+            # separate from out_tok so combine's copy-in never clobbers the
+            # dispatched tokens the expert still reads — callers can skip .clone().
+            ("disp_out", recv_cap * token_nbytes),
+            # out_tok: combine staging (post-expert results that peers gather).
+            ("out_tok", recv_cap * cfg.combine_token_nbytes),
             ("cross_device_barrier", cfg.world_size * 8),
         ]
         if self._enable_scales:
@@ -489,7 +494,7 @@ class EpDispatchCombineOp:
             off_tis=arena.offset("recv_to_src_token"),
             off_out_idx=arena.offset("out_idx"),
             off_out_wts=arena.offset("out_wts"),
-            off_out_tok=arena.offset("out_tok"),
+            off_out_tok=arena.offset("disp_out"),
             off_out_scales=arena.offset("out_scales") if self._enable_scales else 0,
             scale_dim=cfg.scale_dim,
             scale_type_size=cfg.scale_type_size,
@@ -604,11 +609,13 @@ class EpDispatchCombineOp:
             )
 
     def recv_tokens(self):
-        """Arena out_tok [max_recv, hidden] (dispatch dest / expert-GEMM input).
+        """Arena disp_out [max_recv, hidden] (dispatch dest / expert-GEMM input).
+        Separate from out_tok, so combine's copy-in never overwrites it — the
+        expert can read this in place without a defensive .clone().
         fp4 packs 2 e2m1 per float4_e2m1fn_x2 element -> last dim is hidden/2."""
         cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
         return from_gpu_ptr(
-            self.arena.local_ptr("out_tok"), (self._recv_cap, cols), self.cfg.dispatch_dtype
+            self.arena.local_ptr("disp_out"), (self._recv_cap, cols), self.cfg.dispatch_dtype
         )
 
     def combine_in_view(self):
@@ -627,7 +634,7 @@ class EpDispatchCombineOp:
         arena = self.arena
         stream = fx.Stream(torch.cuda.current_stream())
         self._convert_dispatch(
-            arena.local_ptr("out_tok"),
+            arena.local_ptr("disp_out"),
             arena.local_ptr("out_idx"),
             arena.local_ptr("recv_to_src_token"),
             self.total_recv.data_ptr(),
@@ -724,7 +731,8 @@ class EpDispatchCombineOp:
         routing=: replay a prior handle (reuse cached dest-slot layout, skip
         atomic routing). return_routing=: also return the handle. Mutually
         exclusive. Returns (out, out_weights, out_scales, out_indices,
-        total_recv[, routing]); out == arena out_tok.
+        total_recv[, routing]); out == arena disp_out (safe to read without
+        .clone() — combine stages into a separate out_tok buffer).
         """
         if routing is not None and return_routing:
             raise ValueError(
