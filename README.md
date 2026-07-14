@@ -221,7 +221,7 @@ IBGDA — the wrong version is a common blocker, check yours with `mori check` o
 |--------|-----------------|
 | AMD Pollara (AINIC) | `>= 1.117.5-a-45` is solid. The `1.117.1` major does **not** support IBGDA. |
 | Broadcom (Thor2) | Solid on `237.1.137.x` (official Broadcom release) and `235.2.86.x` (customer-specific build). `231.x` is too old for IBGDA. |
-| Mellanox (ConnectX, mlx5) | No real version requirement — works out of the box. |
+| Mellanox (ConnectX, mlx5) | Good backward compatibility; no known minimum version. Internally tested on `ConnectX-7`. |
 
 > For all NICs, the userspace library must match the corresponding kernel driver version.
 

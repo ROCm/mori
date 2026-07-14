@@ -6,7 +6,7 @@
 #   - AINIC     : >= 1.117.5-a-45 is solid. The 1.117.1 major does NOT support IBGDA.
 #   - Broadcom  : solid on 237.1.137.x (official release) and 235.2.86.x
 #                 (customer-specific build); 231.x is too old for IBGDA.
-#   - Mellanox  : no real version requirement — mlx5 just works out of the box.
+#   - Mellanox  : good backward compatibility, no known minimum version.
 # For all NICs, the userspace library must match the corresponding kernel driver.
 
 set -uo pipefail
@@ -982,7 +982,7 @@ elif [[ "$_have_bnxt" == "true" ]]; then
     check_bnxt_dcqcn
 elif [[ "$_have_mlx" == "true" ]]; then
     step "check mlx5 (Mellanox) NIC"
-    log_ok "Mellanox ConnectX (mlx5) detected — no specific firmware/driver version requirement, IBGDA works out of the box via libmlx5"
+    log_ok "Mellanox ConnectX (mlx5) detected — good backward compatibility, no known minimum version for IBGDA"
 else
     log_warn "no ionic, bnxt_re, or mlx5 NICs detected — skipping NIC-specific checks"
 fi
