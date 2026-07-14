@@ -317,7 +317,17 @@ for _, bk in ipairs(members) do
   if not anyLoc then redis.call('DEL', bk) end
 end
 redis.call('DEL', blocksSet)
-redis.call('DEL', tag .. ':extkv:node:' .. nodeId)
+-- Wipe this node's external-kv: clear its bit from every hash it registered and
+-- drop the reverse index (mirrors UnregisterExternalKvByNode). Previously this
+-- only DEL'd the reverse index, orphaning the forward extkv:<hash> entries.
+local exNode = tag .. ':extkv:node:' .. nodeId
+local exHashes = redis.call('SMEMBERS', exNode)
+for _, h in ipairs(exHashes) do
+  local ekey = tag .. ':extkv:' .. h
+  redis.call('HDEL', ekey, nodeId)
+  if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+end
+redis.call('DEL', exNode)
 return 1
 )LUA";
 
@@ -354,7 +364,14 @@ for _, id in ipairs(members) do
       if not anyLoc then redis.call('DEL', bk) end
     end
     redis.call('DEL', blocksSet)
-    redis.call('DEL', tag .. ':extkv:node:' .. id)
+    local exNode = tag .. ':extkv:node:' .. id
+    local exHashes = redis.call('SMEMBERS', exNode)
+    for _, h in ipairs(exHashes) do
+      local ekey = tag .. ':extkv:' .. h
+      redis.call('HDEL', ekey, id)
+      if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+    end
+    redis.call('DEL', exNode)
     dead[#dead + 1] = id
   end
 end
@@ -518,7 +535,14 @@ if redis.call('EXISTS', nodeKey) == 0 then return 0 end
 redis.call('DEL', nodeKey)
 redis.call('SREM', tag .. ':nodes:alive', nodeId)
 redis.call('HDEL', tag .. ':alive_peers', nodeId)
-redis.call('DEL', tag .. ':extkv:node:' .. nodeId)
+local exNode = tag .. ':extkv:node:' .. nodeId
+local exHashes = redis.call('SMEMBERS', exNode)
+for _, h in ipairs(exHashes) do
+  local ekey = tag .. ':extkv:' .. h
+  redis.call('HDEL', ekey, nodeId)
+  if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+end
+redis.call('DEL', exNode)
 return 1
 )LUA";
 
@@ -540,11 +564,280 @@ for _, id in ipairs(members) do
     redis.call('HSET', nk, 'status', 2)
     redis.call('SREM', tag .. ':nodes:alive', id)
     redis.call('HDEL', tag .. ':alive_peers', id)
-    redis.call('DEL', tag .. ':extkv:node:' .. id)
+    local exNode = tag .. ':extkv:node:' .. id
+    local exHashes = redis.call('SMEMBERS', exNode)
+    for _, h in ipairs(exHashes) do
+      local ekey = tag .. ':extkv:' .. h
+      redis.call('HDEL', ekey, id)
+      if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+    end
+    redis.call('DEL', exNode)
     dead[#dead + 1] = id
   end
 end
 return dead
+)LUA";
+
+// =====================================================================
+// External-KV / hit-count / eviction scripts (Phase 2, #5).
+//
+// Placement (design §4, handoff): extkv + hit + the hit reverse-index all live
+// under the CONTROL tag {umbp:<ns>}, so each is one single-slot Lua on the
+// control instance in every mode. The tier-set is a bitmask int per node (bit ==
+// 1<<TierType), computed with plain arithmetic — NO Lua `bit`/bitop library, so
+// the same script runs on Redis / Dragonfly / Valkey. Eviction reuses the
+// existing per-node block reverse index + the _lease/_lacc already on each block
+// hash (the read hot path is untouched); it is enumerated per shard and
+// aggregated by RunShardedRead. See design-redis-metadata-store.md §5.
+// =====================================================================
+
+// register_external_kv (control):
+//   KEYS[1] = node key (for the alive-check + routing).
+//   ARGV = [tag, node_id, tier, n_hashes, hash1, hash2, ...]
+//   Alive-gate + write in one atomic step (TOCTOU): only if the node's status is
+//   ALIVE (==1) does it OR `tier`'s bit into extkv:<hash>[node] and add the hash
+//   to the node's reverse index. Idempotent (re-registering the same tier is a
+//   no-op). Returns 1 if alive and applied, 0 if not alive (nothing written).
+inline const std::string kRegisterExternalKvLua = R"LUA(--!df flags=allow-undeclared-keys
+local nodeKey = KEYS[1]
+local tag = ARGV[1]
+local nodeId = ARGV[2]
+local tier = tonumber(ARGV[3])
+if redis.call('HGET', nodeKey, 'status') ~= '1' then return 0 end
+local bit = 2 ^ tier
+local n = tonumber(ARGV[4])
+local revidx = tag .. ':extkv:node:' .. nodeId
+for i = 1, n do
+  local hash = ARGV[4 + i]
+  local ekey = tag .. ':extkv:' .. hash
+  local mask = tonumber(redis.call('HGET', ekey, nodeId) or '0')
+  if math.floor(mask / bit) % 2 == 0 then
+    redis.call('HSET', ekey, nodeId, mask + bit)
+  end
+  redis.call('SADD', revidx, hash)
+end
+return 1
+)LUA";
+
+// unregister_external_kv (control):
+//   KEYS[1] = the node's extkv reverse-index key (routing).
+//   ARGV = [tag, node_id, tier, n_hashes, hash1, ...]
+//   Clears `tier`'s bit for each (node, hash). When a hash's bitmask for the node
+//   reaches 0 the node field is dropped (and the extkv:<hash> key + reverse-index
+//   membership with it). No liveness check (peers unregister during teardown).
+inline const std::string kUnregisterExternalKvLua = R"LUA(--!df flags=allow-undeclared-keys
+local tag = ARGV[1]
+local nodeId = ARGV[2]
+local tier = tonumber(ARGV[3])
+local bit = 2 ^ tier
+local n = tonumber(ARGV[4])
+local revidx = tag .. ':extkv:node:' .. nodeId
+for i = 1, n do
+  local hash = ARGV[4 + i]
+  local ekey = tag .. ':extkv:' .. hash
+  local mask = tonumber(redis.call('HGET', ekey, nodeId) or '0')
+  if math.floor(mask / bit) % 2 == 1 then
+    local newmask = mask - bit
+    if newmask == 0 then
+      redis.call('HDEL', ekey, nodeId)
+      if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+      redis.call('SREM', revidx, hash)
+    else
+      redis.call('HSET', ekey, nodeId, newmask)
+    end
+  end
+end
+return 1
+)LUA";
+
+// unregister_external_kv_by_tier (control):
+//   KEYS[1] = the node's extkv reverse-index key (routing).
+//   ARGV = [tag, node_id, tier]
+//   Clears `tier` from every hash the node registered (admin whole-tier wipe).
+inline const std::string kUnregisterExternalKvByTierLua = R"LUA(--!df flags=allow-undeclared-keys
+local tag = ARGV[1]
+local nodeId = ARGV[2]
+local tier = tonumber(ARGV[3])
+local bit = 2 ^ tier
+local revidx = tag .. ':extkv:node:' .. nodeId
+local hashes = redis.call('SMEMBERS', revidx)
+for _, hash in ipairs(hashes) do
+  local ekey = tag .. ':extkv:' .. hash
+  local mask = tonumber(redis.call('HGET', ekey, nodeId) or '0')
+  if math.floor(mask / bit) % 2 == 1 then
+    local newmask = mask - bit
+    if newmask == 0 then
+      redis.call('HDEL', ekey, nodeId)
+      if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+      redis.call('SREM', revidx, hash)
+    else
+      redis.call('HSET', ekey, nodeId, newmask)
+    end
+  end
+end
+return 1
+)LUA";
+
+// unregister_external_kv_by_node (control):
+//   KEYS[1] = the node's extkv reverse-index key (routing).
+//   ARGV = [tag, node_id]
+//   Drops every external-kv entry for the node (all tiers) without touching its
+//   client record or block locations. Same body the unregister/expire cascades
+//   inline. Idempotent.
+inline const std::string kUnregisterExternalKvByNodeLua = R"LUA(--!df flags=allow-undeclared-keys
+local tag = ARGV[1]
+local nodeId = ARGV[2]
+local revidx = tag .. ':extkv:node:' .. nodeId
+local hashes = redis.call('SMEMBERS', revidx)
+for _, hash in ipairs(hashes) do
+  local ekey = tag .. ':extkv:' .. hash
+  redis.call('HDEL', ekey, nodeId)
+  if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+end
+redis.call('DEL', revidx)
+return 1
+)LUA";
+
+// match_external_kv (control):
+//   KEYS[1] = a control-tag key (routing).
+//   ARGV = [tag, count_as_hit, now_ms, n_hashes, hash1, ...]
+//   For each UNIQUE input hash with >=1 registered node, returns { hash,
+//   flat_hgetall(extkv:<hash>) } (flat = [node, mask, node, mask, ...]); the
+//   caller decodes the bitmask into tiers and groups by node. When count_as_hit
+//   == 1, bumps hit:<hash>.c and stamps ls=now (only if ls<now) once per matched
+//   hash, and adds the hash to the hit reverse index — all atomic here.
+inline const std::string kMatchExternalKvLua = R"LUA(--!df flags=allow-undeclared-keys
+local tag = ARGV[1]
+local countHit = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local n = tonumber(ARGV[4])
+local out = {}
+local seen = {}
+for i = 1, n do
+  local hash = ARGV[4 + i]
+  if not seen[hash] then
+    seen[hash] = true
+    local ekey = tag .. ':extkv:' .. hash
+    local flat = redis.call('HGETALL', ekey)
+    if #flat > 0 then
+      out[#out + 1] = { hash, flat }
+      if countHit == 1 then
+        local hkey = tag .. ':hit:' .. hash
+        redis.call('HINCRBY', hkey, 'c', 1)
+        local ls = tonumber(redis.call('HGET', hkey, 'ls') or '0')
+        if ls < now then redis.call('HSET', hkey, 'ls', now) end
+        redis.call('SADD', tag .. ':hit:index', hash)
+      end
+    end
+  end
+end
+return out
+)LUA";
+
+// get_external_kv_hit_counts (control):
+//   KEYS[1] = a control-tag key (routing).
+//   ARGV = [tag, n_hashes, hash1, ...]
+//   Returns { hash, count } for each UNIQUE input hash that has a recorded
+//   counter (hashes with no count are omitted). Pure read.
+inline const std::string kGetHitCountsLua = R"LUA(--!df flags=allow-undeclared-keys
+local tag = ARGV[1]
+local n = tonumber(ARGV[2])
+local out = {}
+local seen = {}
+for i = 1, n do
+  local hash = ARGV[2 + i]
+  if not seen[hash] then
+    seen[hash] = true
+    local c = redis.call('HGET', tag .. ':hit:' .. hash, 'c')
+    if c then out[#out + 1] = { hash, c } end
+  end
+end
+return out
+)LUA";
+
+// garbage_collect_hits (control):
+//   KEYS[1] = the hit reverse-index key (routing).
+//   ARGV = [tag, cutoff_ms]
+//   Drops every hit counter whose ls < cutoff, using the hit:index reverse set
+//   (no SCAN). Returns the number dropped.
+inline const std::string kGarbageCollectHitsLua = R"LUA(--!df flags=allow-undeclared-keys
+local tag = ARGV[1]
+local cutoff = tonumber(ARGV[2])
+local idx = tag .. ':hit:index'
+local hashes = redis.call('SMEMBERS', idx)
+local dropped = 0
+for _, hash in ipairs(hashes) do
+  local hkey = tag .. ':hit:' .. hash
+  local ls = tonumber(redis.call('HGET', hkey, 'ls') or '0')
+  if ls < cutoff then
+    redis.call('DEL', hkey)
+    redis.call('SREM', idx, hash)
+    dropped = dropped + 1
+  end
+end
+return dropped
+)LUA";
+
+// enumerate_eviction (per shard):
+//   KEYS[1..k] = per-node block reverse-index sets to scan (control-tag
+//     node:<id>:blocks in single mode, or this shard's shard-tag
+//     node:<id>:blocks in split modes). Members are full block-hash keys.
+//   ARGV = [now_ms, n_wanted, node1, tier1, node2, tier2, ...]
+//   For each set, walks its block hashes, skips leased ones (_lease > now), and
+//   for every location field l|node|tier whose (node,tier) is wanted emits a
+//   flat 5-tuple [block_key, node, tier, size, last_accessed_ms]. Returns one
+//   flat array per KEYS entry (parallel to KEYS). Ordering / per-bucket cap are
+//   applied by the caller in C++ (an eviction tick is seconds, not a hot path).
+inline const std::string kEnumerateEvictionLua = R"LUA(--!df flags=allow-undeclared-keys
+local now = tonumber(ARGV[1])
+local nw = tonumber(ARGV[2])
+local wanted = {}
+for i = 1, nw do
+  local node = ARGV[2 + i * 2 - 1]
+  local tier = ARGV[2 + i * 2]
+  wanted[node] = wanted[node] or {}
+  wanted[node][tier] = true
+end
+local out = {}
+for ki = 1, #KEYS do
+  local members = redis.call('SMEMBERS', KEYS[ki])
+  local cands = {}
+  for _, bk in ipairs(members) do
+    local flat = redis.call('HGETALL', bk)
+    local lease = 0
+    local lacc = 0
+    for j = 1, #flat, 2 do
+      local f = flat[j]
+      if f == '_lease' then
+        lease = tonumber(flat[j + 1]) or 0
+      elseif f == '_lacc' then
+        lacc = tonumber(flat[j + 1]) or 0
+      end
+    end
+    if lease <= now then
+      for j = 1, #flat, 2 do
+        local f = flat[j]
+        if string.sub(f, 1, 2) == 'l|' then
+          local rest = string.sub(f, 3)
+          local sep = string.find(rest, '|', 1, true)
+          if sep ~= nil then
+            local node = string.sub(rest, 1, sep - 1)
+            local tier = string.sub(rest, sep + 1)
+            if wanted[node] and wanted[node][tier] then
+              cands[#cands + 1] = bk
+              cands[#cands + 1] = node
+              cands[#cands + 1] = tier
+              cands[#cands + 1] = flat[j + 1]
+              cands[#cands + 1] = tostring(lacc)
+            end
+          end
+        end
+      end
+    end
+  end
+  out[ki] = cands
+end
+return out
 )LUA";
 
 }  // namespace mori::umbp::redis

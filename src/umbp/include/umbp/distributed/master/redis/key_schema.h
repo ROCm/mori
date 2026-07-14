@@ -137,6 +137,20 @@ class KeySchema {
     return control_tag_ + ":extkv:node:" + node_id;
   }
 
+  // HASH: one external-kv entry, node_id -> tier bitmask (bit == 1<<TierType).
+  // On the control tag so a single Lua matches/mutates it atomically in every
+  // mode (single / multi-endpoint control instance / cluster control slot).
+  std::string ExtKv(const std::string& hash) const { return control_tag_ + ":extkv:" + hash; }
+
+  // HASH: one per-hash hit counter, fields `c` (count) and `ls` (last_seen ms).
+  std::string Hit(const std::string& hash) const { return control_tag_ + ":hit:" + hash; }
+
+  // SET: every hash that currently has a hit counter. A Redis-specific reverse
+  // index (the in-memory backend just iterates its map) so GarbageCollectHits is
+  // one keyed Lua over this set instead of a SCAN — SCAN has no key and cannot be
+  // routed per-node in cluster mode.
+  std::string HitIndex() const { return control_tag_ + ":hit:index"; }
+
  private:
   // FNV-1a (32-bit): small, fast, and stable across builds/runs. std::hash is
   // avoided on purpose — it is implementation-defined, so its bucketing could

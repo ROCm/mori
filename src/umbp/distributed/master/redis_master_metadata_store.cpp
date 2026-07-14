@@ -468,38 +468,67 @@ std::vector<std::string> RedisMasterMetadataStore::ExpireStaleClients(
 }
 
 // =====================================================================
-// External-KV writes — Phase 2 (not exercised by the hot-path benchmark).
-// GarbageCollectHits is a safe no-op so the master's hit-GC thread never
-// throws while the external-KV hit path is unimplemented.
+// External-KV writes. extkv + hit live on the control tag, so each is one
+// single-slot Lua on the control instance in every mode (single / multi-endpoint
+// control instance / cluster control slot). See design §4/§5.
 // =====================================================================
 
-bool RedisMasterMetadataStore::RegisterExternalKvIfAlive(const std::string&,
-                                                         const std::vector<std::string>&,
-                                                         TierType) {
-  throw std::logic_error(
-      "RedisMasterMetadataStore::RegisterExternalKvIfAlive unimplemented (phase 1)");
+bool RedisMasterMetadataStore::RegisterExternalKvIfAlive(const std::string& node_id,
+                                                         const std::vector<std::string>& hashes,
+                                                         TierType tier) {
+  ScopedStoreOp _op(metrics_, "RegisterExternalKvIfAlive");
+  std::vector<std::string> args;
+  args.reserve(4 + hashes.size());
+  args.push_back(keys_.Tag());
+  args.push_back(node_id);
+  args.push_back(std::to_string(static_cast<int>(tier)));
+  args.push_back(std::to_string(hashes.size()));
+  for (const auto& h : hashes) args.push_back(h);
+  RespValue r = control().Eval(redis::kRegisterExternalKvLua, {keys_.Node(node_id)}, args);
+  if (r.is_error()) throw std::runtime_error("[RedisStore] RegisterExternalKvIfAlive: " + r.str);
+  return r.integer == 1;
 }
 
-void RedisMasterMetadataStore::UnregisterExternalKv(const std::string&,
-                                                    const std::vector<std::string>&, TierType) {
-  throw std::logic_error("RedisMasterMetadataStore::UnregisterExternalKv unimplemented (phase 1)");
+void RedisMasterMetadataStore::UnregisterExternalKv(const std::string& node_id,
+                                                    const std::vector<std::string>& hashes,
+                                                    TierType tier) {
+  ScopedStoreOp _op(metrics_, "UnregisterExternalKv");
+  std::vector<std::string> args;
+  args.reserve(4 + hashes.size());
+  args.push_back(keys_.Tag());
+  args.push_back(node_id);
+  args.push_back(std::to_string(static_cast<int>(tier)));
+  args.push_back(std::to_string(hashes.size()));
+  for (const auto& h : hashes) args.push_back(h);
+  RespValue r = control().Eval(redis::kUnregisterExternalKvLua, {keys_.ExtKvNode(node_id)}, args);
+  if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterExternalKv: " + r.str);
 }
 
-void RedisMasterMetadataStore::UnregisterExternalKvByTier(const std::string&, TierType) {
-  throw std::logic_error(
-      "RedisMasterMetadataStore::UnregisterExternalKvByTier unimplemented (phase 1)");
+void RedisMasterMetadataStore::UnregisterExternalKvByTier(const std::string& node_id,
+                                                          TierType tier) {
+  ScopedStoreOp _op(metrics_, "UnregisterExternalKvByTier");
+  RespValue r = control().Eval(redis::kUnregisterExternalKvByTierLua, {keys_.ExtKvNode(node_id)},
+                               {keys_.Tag(), node_id, std::to_string(static_cast<int>(tier))});
+  if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterExternalKvByTier: " + r.str);
 }
 
-void RedisMasterMetadataStore::UnregisterExternalKvByNode(const std::string&) {
-  throw std::logic_error(
-      "RedisMasterMetadataStore::UnregisterExternalKvByNode unimplemented (phase 1)");
+void RedisMasterMetadataStore::UnregisterExternalKvByNode(const std::string& node_id) {
+  ScopedStoreOp _op(metrics_, "UnregisterExternalKvByNode");
+  RespValue r = control().Eval(redis::kUnregisterExternalKvByNodeLua, {keys_.ExtKvNode(node_id)},
+                               {keys_.Tag(), node_id});
+  if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterExternalKvByNode: " + r.str);
 }
 
-std::size_t RedisMasterMetadataStore::GarbageCollectHits(std::chrono::system_clock::time_point) {
-  // Phase 1: external-KV hit counts are not written, so there is nothing to GC.
-  // Implemented as a safe no-op (rather than throwing) because the master's
-  // hit-index GC thread calls this on every tick.
-  return 0;
+std::size_t RedisMasterMetadataStore::GarbageCollectHits(
+    std::chrono::system_clock::time_point cutoff) {
+  ScopedStoreOp _op(metrics_, "GarbageCollectHits");
+  // Drop every hit counter whose last_seen < cutoff via the hit:index reverse
+  // set (no SCAN — cluster-routable by the index key). Runs on the slow hit-GC
+  // timer, not the hot path.
+  RespValue r = control().Eval(redis::kGarbageCollectHitsLua, {keys_.HitIndex()},
+                               {keys_.Tag(), std::to_string(ToEpochMs(cutoff))});
+  if (r.is_error()) throw std::runtime_error("[RedisStore] GarbageCollectHits: " + r.str);
+  return r.type == RespValue::Type::Integer ? static_cast<std::size_t>(r.integer) : 0;
 }
 
 // =====================================================================
@@ -664,22 +693,93 @@ std::vector<std::string> RedisMasterMetadataStore::GetClientTags(const std::stri
 }
 
 // =====================================================================
-// External-KV reads — Phase 2.
+// External-KV reads. extkv + hit live on the control tag (single-slot Lua).
 // =====================================================================
 
 std::vector<NodeMatch> RedisMasterMetadataStore::MatchExternalKv(
-    const std::vector<std::string>&, bool, std::chrono::system_clock::time_point) {
-  throw std::logic_error("RedisMasterMetadataStore::MatchExternalKv unimplemented (phase 1)");
+    const std::vector<std::string>& hashes, bool count_as_hit,
+    std::chrono::system_clock::time_point now) {
+  ScopedStoreOp _op(metrics_, "MatchExternalKv");
+  std::vector<NodeMatch> result;
+  if (hashes.empty()) return result;
+
+  std::vector<std::string> args;
+  args.reserve(4 + hashes.size());
+  args.push_back(keys_.Tag());
+  args.push_back(count_as_hit ? "1" : "0");
+  args.push_back(std::to_string(ToEpochMs(now)));
+  args.push_back(std::to_string(hashes.size()));
+  for (const auto& h : hashes) args.push_back(h);
+  RespValue r = control().Eval(redis::kMatchExternalKvLua, {keys_.NodesAlive()}, args);
+  if (r.is_error()) throw std::runtime_error("[RedisStore] MatchExternalKv: " + r.str);
+  if (!r.is_array()) return result;
+
+  // Reply: array of { hash, flat_hgetall[node, mask, node, mask, ...] }.
+  // Group by node, decoding each node's tier bitmask (bit == 1<<TierType) into
+  // the tiers that hold the hash — a hash mirrored across tiers lands in several
+  // buckets (MatchedHashCount dedupes it), matching the in-memory backend.
+  std::unordered_map<std::string, std::map<TierType, std::vector<std::string>>> acc;
+  for (const auto& entry : r.elements) {
+    if (!entry.is_array() || entry.elements.size() < 2) continue;
+    const std::string& hash = entry.elements[0].str;
+    const RespValue& flat = entry.elements[1];
+    if (!flat.is_array()) continue;
+    for (size_t i = 0; i + 1 < flat.elements.size(); i += 2) {
+      const std::string& node = flat.elements[i].str;
+      long long mask = 0;
+      try {
+        mask = std::stoll(flat.elements[i + 1].str);
+      } catch (...) {
+        continue;
+      }
+      auto& by_tier = acc[node];
+      for (int t = 0; t < 16; ++t) {
+        if ((mask >> t) & 1) by_tier[static_cast<TierType>(t)].push_back(hash);
+      }
+    }
+  }
+  result.reserve(acc.size());
+  for (auto& [node_id, by_tier] : acc) {
+    NodeMatch m;
+    m.node_id = node_id;
+    m.hashes_by_tier = std::move(by_tier);
+    result.push_back(std::move(m));
+  }
+  return result;
 }
 
 std::vector<ExternalKvHitCountEntry> RedisMasterMetadataStore::GetExternalKvHitCounts(
-    const std::vector<std::string>&) const {
-  throw std::logic_error(
-      "RedisMasterMetadataStore::GetExternalKvHitCounts unimplemented (phase 1)");
+    const std::vector<std::string>& hashes) const {
+  std::vector<ExternalKvHitCountEntry> out;
+  if (hashes.empty()) return out;
+  std::vector<std::string> args;
+  args.reserve(2 + hashes.size());
+  args.push_back(keys_.Tag());
+  args.push_back(std::to_string(hashes.size()));
+  for (const auto& h : hashes) args.push_back(h);
+  RespValue r = control().Eval(redis::kGetHitCountsLua, {keys_.NodesAlive()}, args);
+  if (r.is_error()) throw std::runtime_error("[RedisStore] GetExternalKvHitCounts: " + r.str);
+  if (!r.is_array()) return out;
+  out.reserve(r.elements.size());
+  for (const auto& entry : r.elements) {
+    if (!entry.is_array() || entry.elements.size() < 2) continue;
+    ExternalKvHitCountEntry e;
+    e.hash = entry.elements[0].str;
+    try {
+      e.hit_count_total = std::stoull(entry.elements[1].str);
+    } catch (...) {
+      continue;
+    }
+    out.push_back(std::move(e));
+  }
+  return out;
 }
 
-std::size_t RedisMasterMetadataStore::GetExternalKvCount(const std::string&) const {
-  throw std::logic_error("RedisMasterMetadataStore::GetExternalKvCount unimplemented (phase 1)");
+std::size_t RedisMasterMetadataStore::GetExternalKvCount(const std::string& node_id) const {
+  // O(1) via the per-node reverse index — the in-memory backend scans its whole
+  // map here only because it lacks a by-node index; Redis has one.
+  RespValue r = control().Command({"SCARD", keys_.ExtKvNode(node_id)});
+  return r.type == RespValue::Type::Integer ? static_cast<std::size_t>(r.integer) : 0;
 }
 
 }  // namespace mori::umbp
