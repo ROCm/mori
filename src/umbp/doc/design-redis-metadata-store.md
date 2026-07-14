@@ -470,6 +470,54 @@ return 1
   `shared_mutex` read (nanoseconds) to a network + Lua round trip
   (microseconds-to-milliseconds). Whether this is acceptable is exactly what
   Phase 1 measures.
+- **The store is rebuildable soft state; disk persistence is optional.** All
+  metadata here is a projection of what storage nodes report via heartbeats — the
+  source of truth is the peers, not Redis (Redis only holds "who has which
+  block", never the data itself). There are three recovery sources, and they
+  cover *different* failures: (1) **replica failover** for a single-node crash,
+  (2) **disk persistence (RDB/AOF)** for a *total*-outage restart + backups +
+  rollback, and (3) **heartbeat rebuild** (`SEQ_GAP -> full_sync`), which an
+  ordinary datastore does not have. Because (3) always exists, disk persistence
+  is optional: even a total wipe self-heals within one heartbeat cycle (RouteGet
+  returns *misses* meanwhile — cache misses, not data loss). Persistence is a
+  *separate axis* from replication (it is **not** "single-instance only"): keep
+  replicas if a single-node crash must be transparent, and note persistence only
+  buys a shorter warm-up window here, which is not worth its cost (next bullet).
+- **Read = write amplification; do NOT enable synchronous persistence.**
+  `route_get_batch` bumps `_lease`/`_lacc`/`_acnt` on every touched key, so every
+  "read" is a *write* on the server. With `AOF appendfsync=always` each read would
+  block on a disk fsync and read throughput collapses; with replicas each read
+  also propagates. Deploy with `appendonly no` / `save ""` (both bench and prod).
+  This — not the durability argument above — is the operational reason disk
+  persistence stays off.
+- **The control plane does not scale horizontally.** `clients_[0]` (the control
+  instance, or the node owning the control tag in cluster mode) holds every
+  control-plane key — `nodes:alive`, `alive_peers`, `extkv`, the per-node reverse
+  indexes — so every control op (`RegisterClient`, `ApplyHeartbeat`,
+  `ListAliveClients`, `ExpireStaleClients`) serializes on that one
+  (single-threaded) node. Block reads/writes shard across instances/nodes; the
+  control plane does not. For typical fleet sizes this is fine, but a very large
+  fleet or a heartbeat-heavy workload hits this single-node ceiling *before* the
+  block-read ceiling. Phase-2 extkv/hit placed on the control tag adds to this
+  load; sharding the control plane (like blocks) is a separate design if needed.
+- **Dragonfly-in-cluster underperformance is largely a client limitation, not
+  purely topological.** Measured: Dragonfly in cluster mode tops out ~2–5k
+  routeget ops/s vs ~11–43k non-cluster, while a raw `redis-benchmark` (keyed
+  EVAL) on the same node sustains ~144k rps — the server is not slow. The main
+  cause is the client, not the topology: single/multi-endpoint pipelines a batch's
+  N per-shard EVALSHAs into **one** round trip (`RespClient::EvalPipeline`, via
+  hiredis), whereas `RespClusterClient::EvalPipeline` issues **N independent,
+  separately-routed** round trips (concurrent through a thread pool, but no
+  cross-slot pipelining). The slot -> single-thread pinning only bites under
+  balanced (one-tag-per-node) placement; with more tags Dragonfly *does* spread a
+  node's slots across its threads (measured CPU rises), yet the per-batch
+  round-trip fan-out still caps throughput. The lever that would actually help
+  (Redis Cluster too) is grouping a batch **by node** and pipelining each node's
+  EVALSHAs in one round trip — nontrivial, since redis++ does not expose
+  slot -> node (it needs per-node raw connections keyed off `CLUSTER SLOTS` +
+  CRC16). Until then: for throughput use non-cluster Dragonfly or multi-endpoint;
+  use cluster only when cross-node automatic failover (HA) is required, and do
+  **not** run Dragonfly in cluster mode.
 
 ---
 
