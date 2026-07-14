@@ -176,7 +176,10 @@ else
     EXTRA_ARGS+=(--ulimit nproc=100000:100000 --pids-limit=-1)
 fi
 
+# --init (tini as PID 1) reaps exited child processes so zombies don't keep KFD
+# contexts / VRAM alive, and forwards SIGTERM from `docker stop` to the group.
 exec "$RUNTIME" run \
+    --init \
     --group-add video \
     --network=host \
     --device=/dev/kfd \

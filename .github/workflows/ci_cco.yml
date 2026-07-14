@@ -101,5 +101,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
+          # Restore workspace ownership (build ran as root in the container).
           $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
-          $CT rm -f $CONTAINER || true
+          # Graceful stop so GPU ranks release HIP/KFD contexts (not SIGKILLed).
+          CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
