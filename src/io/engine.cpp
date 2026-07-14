@@ -38,6 +38,7 @@
 #include "mori/io/logging.hpp"
 #include "mori/utils/host_utils.hpp"
 #include "src/io/call_diagnostics_internal.hpp"
+#include "src/io/fabric/backend_impl.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/xgmi/backend_impl.hpp"
 
@@ -253,6 +254,11 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
                                                  static_cast<const XgmiBackendConfig&>(beConfig));
     backends.insert({type, std::move(backend)});
     InvalidateRouteCache();
+  } else if (type == BackendType::FABRIC) {
+    auto backend = std::make_unique<FabricBackend>(
+        desc.key, config, static_cast<const FabricBackendConfig&>(beConfig));
+    backends.insert({type, std::move(backend)});
+    InvalidateRouteCache();
   } else {
     assert(false && "not implemented");
   }
@@ -396,7 +402,8 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
     return nullptr;
   }
 
-  RouteCacheKey routeKey{remote.engineKey, local.loc, remote.loc, local.deviceId, remote.deviceId};
+  RouteCacheKey routeKey{remote.engineKey, local.loc, remote.loc, local.deviceId,
+                         remote.deviceId,  local.id,  remote.id};
 
   if (auto cachedType = QueryRouteCache(routeKey); cachedType.has_value()) {
     auto cachedBackend = backends.find(cachedType.value());
@@ -411,6 +418,14 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
   if (isIntraNodeCapable) {
     UpdateRouteCache(routeKey, BackendType::XGMI);
     return xgmiIt->second.get();
+  }
+
+  // Next prefer FABRIC: cross-node GPU pairs in the same scale-up domain (vPOD)
+  // reachable over the UALink super-node fabric, which is faster than RDMA.
+  auto fabricIt = backends.find(BackendType::FABRIC);
+  if (fabricIt != backends.end() && fabricIt->second->CanHandle(local, remote)) {
+    UpdateRouteCache(routeKey, BackendType::FABRIC);
+    return fabricIt->second.get();
   }
 
   auto rdmaIt = backends.find(BackendType::RDMA);
@@ -557,6 +572,13 @@ void IOEngine::LoadScatterGatherModule(const std::string& hsacoPath) {
   auto it = backends.find(BackendType::XGMI);
   if (it != backends.end()) {
     static_cast<XgmiBackend*>(it->second.get())->LoadScatterGatherModule(hsacoPath);
+  }
+}
+
+void IOEngine::LoadFabricCopyModule(const std::string& hsacoPath) {
+  auto it = backends.find(BackendType::FABRIC);
+  if (it != backends.end()) {
+    static_cast<FabricBackend*>(it->second.get())->LoadFabricCopyModule(hsacoPath);
   }
 }
 
