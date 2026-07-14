@@ -161,3 +161,26 @@ def _cases():
 def test_dispatch_combine_v2_intranode(env):
     rc, out = _run(env)
     _assert_all_pass(rc, out)
+
+
+def test_op_lifecycle():
+    """Repeated op build/close on one comm must not leak (see test_op_lifecycle.py)."""
+    script = os.path.join(_HERE, "test_op_lifecycle.py")
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node=2",
+        script,
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=_HERE,
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=300,
+    )
+    assert "# LIFECYCLE: PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout}"
