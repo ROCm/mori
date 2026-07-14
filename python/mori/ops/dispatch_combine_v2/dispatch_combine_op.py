@@ -99,6 +99,11 @@ class SymmArena:
             ptr, nbytes = self.local_ptr(name), self._sizes[name]
         from_gpu_ptr(ptr, (nbytes,), torch.int8).zero_()
 
+    def close(self):
+        """Free the symmetric window (deregister before freeing the backing mem)."""
+        self._win.close()
+        self._mem.close()
+
 
 @dataclass
 class EpDispatchCombineConfig:
@@ -621,6 +626,22 @@ class EpDispatchCombineOp:
                 block_num=cfg.combine_block_num,
                 warp_num_per_block=cfg.combine_warp_num_per_block,
             )
+        self._closed = False
+
+    def close(self):
+        """Free this op's symmetric arena window. Call (or use as a context
+        manager) when the op is discarded but its Communicator lives on —
+        otherwise the arena stays in comm._resources until the comm is destroyed."""
+        if self._closed:
+            return
+        self._closed = True
+        self.arena.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     def recv_tokens(self):
         """Arena disp_out [max_recv, hidden] (dispatch dest / expert-GEMM input).

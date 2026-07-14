@@ -114,6 +114,10 @@ class CCOResource(ABC):
             return
         self._closed = True
         self._deallocate()
+        try:  # untrack so a long-lived comm's resource list doesn't grow
+            self._comm._resources.remove(self)
+        except (ValueError, AttributeError):
+            pass
 
     def _check_valid(self) -> None:
         if self._closed:
@@ -290,7 +294,7 @@ class Communicator:
 
     def close_all_resources(self) -> None:
         """Close all tracked resources (best-effort; errors are suppressed)."""
-        for r in reversed(self._resources):
+        for r in reversed(list(self._resources)):  # snapshot: close() untracks
             try:
                 r.close()
             except Exception:
