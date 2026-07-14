@@ -26,6 +26,7 @@
 #include <future>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -138,6 +139,21 @@ std::vector<std::string> SplitTags(const std::string& blob) {
     out.push_back(blob.substr(pos, end - pos));
     if (nl == std::string::npos) break;
     pos = nl + 1;
+  }
+  return out;
+}
+
+// Dedup a hash list preserving first-seen order. The external-KV read scripts
+// used to dedup with a Lua `seen` table; doing it here lets every touched key be
+// declared in KEYS[] (no allow-undeclared-keys) and lets a match/hit result be
+// scattered back by first-seen position.
+std::vector<std::string> DedupPreserveOrder(const std::vector<std::string>& in) {
+  std::vector<std::string> out;
+  out.reserve(in.size());
+  std::unordered_set<std::string> seen;
+  seen.reserve(in.size() * 2);
+  for (const auto& s : in) {
+    if (seen.insert(s).second) out.push_back(s);
   }
   return out;
 }
@@ -340,6 +356,28 @@ void RedisMasterMetadataStore::WipeNodeBlocksMulti(const std::string& node_id) {
   }
 }
 
+void RedisMasterMetadataStore::WipeNodeExtKvMulti(const std::string& node_id) {
+  // Best-effort per shard: a down shard must not block wiping the reachable ones.
+  // The node record is already gone/EXPIRED on the control instance, so any extkv
+  // entry lingering on an unreachable shard points at a dead node and is filtered
+  // out of matches by GetAlivePeerView until that shard returns. Members of the
+  // per-(node, shard) reverse index are full extkv keys, so the script HDELs them
+  // directly. Idempotent.
+  for (std::size_t shard = 0; shard < keys_.NumShards(); ++shard) {
+    try {
+      RespValue r = client_for_shard(shard).Eval(redis::kUnregisterExternalKvByNodeLua,
+                                                 {keys_.ExtKvNode(node_id, shard)}, {node_id});
+      if (r.is_error()) {
+        MORI_UMBP_WARN("[RedisStore] WipeNodeExtKv: shard {} script error, skipped: {}", shard,
+                       r.str);
+      }
+    } catch (const std::exception& e) {
+      MORI_UMBP_WARN("[RedisStore] WipeNodeExtKv: shard {} unavailable, skipped: {}", shard,
+                     e.what());
+    }
+  }
+}
+
 // =====================================================================
 // Cross-store writes
 // =====================================================================
@@ -361,20 +399,26 @@ bool RedisMasterMetadataStore::RegisterClient(const ClientRegistration& registra
 
 void RedisMasterMetadataStore::UnregisterClient(const std::string& node_id) {
   ScopedStoreOp _op(metrics_, "UnregisterClient");
+  // wipe_extkv=1 wipes the node's external-kv inline in the control/single script
+  // (num_shards==1: extkv lives on the control slot). When extkv is sharded it is
+  // wiped per shard afterwards (WipeNodeExtKvMulti); the inline step is skipped.
+  const std::string wipe_extkv = extkv_sharded() ? "0" : "1";
   if (!split_writes()) {
-    RespValue r =
-        control().Eval(redis::kUnregisterClientLua, {keys_.Node(node_id)}, {keys_.Tag(), node_id});
+    RespValue r = control().Eval(redis::kUnregisterClientLua, {keys_.Node(node_id)},
+                                 {keys_.Tag(), node_id, wipe_extkv});
     if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterClient: " + r.str);
+    if (extkv_sharded()) WipeNodeExtKvMulti(node_id);
     return;
   }
   // Multi-endpoint: control record first (so the router stops routing to it),
   // then wipe its block locations on every shard's instance. A lingering
   // location for the now-gone node is filtered out by GetAlivePeerView, and the
   // wipe is idempotent, so a mid-way failure + retry is safe.
-  RespValue r =
-      control().Eval(redis::kUnregisterControlLua, {keys_.Node(node_id)}, {keys_.Tag(), node_id});
+  RespValue r = control().Eval(redis::kUnregisterControlLua, {keys_.Node(node_id)},
+                               {keys_.Tag(), node_id, wipe_extkv});
   if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterClient(control): " + r.str);
   WipeNodeBlocksMulti(node_id);
+  if (extkv_sharded()) WipeNodeExtKvMulti(node_id);
 }
 
 HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
@@ -449,10 +493,11 @@ std::vector<std::string> RedisMasterMetadataStore::ExpireStaleClients(
   // Bind a reference (not const char*) so the SHA cache's pointer-identity key
   // (&script) stays stable — see lua_scripts.h.
   const std::string& script = split_writes() ? redis::kExpireControlLua : redis::kExpireStaleLua;
+  const std::string wipe_extkv = extkv_sharded() ? "0" : "1";
   // KEYS[1] = a control-tag key (nodes:alive) to route + fix the slot in cluster
   // mode; the script reads tag from ARGV and touches only control-tag keys.
   RespValue r = control().Eval(script, {keys_.NodesAlive()},
-                               {keys_.Tag(), std::to_string(ToEpochMs(cutoff))});
+                               {keys_.Tag(), std::to_string(ToEpochMs(cutoff)), wipe_extkv});
   if (r.is_error()) throw std::runtime_error("[RedisStore] ExpireStaleClients: " + r.str);
   std::vector<std::string> dead;
   if (r.is_array()) {
@@ -464,71 +509,138 @@ std::vector<std::string> RedisMasterMetadataStore::ExpireStaleClients(
   if (split_writes()) {
     for (const auto& id : dead) WipeNodeBlocksMulti(id);
   }
+  // Sharded extkv: wipe each dead node's external-kv per shard (the control step
+  // skipped it when wipe_extkv==0).
+  if (extkv_sharded()) {
+    for (const auto& id : dead) WipeNodeExtKvMulti(id);
+  }
   return dead;
 }
 
 // =====================================================================
-// External-KV writes. extkv + hit live on the control tag, so each is one
-// single-slot Lua on the control instance in every mode (single / multi-endpoint
-// control instance / cluster control slot). See design §4/§5.
+// External-KV writes. The extkv/hit keyspace is sharded by ExtKvShardOf(hash),
+// so every op fans out one single-slot script per touched shard (grouped like
+// the block read hot path). For num_shards == 1 this collapses onto the control
+// slot — one atomic script, byte-identical to the legacy layout. See design
+// §4/§5 + the PHASE 2 note in lua_scripts.h.
 // =====================================================================
 
 bool RedisMasterMetadataStore::RegisterExternalKvIfAlive(const std::string& node_id,
                                                          const std::vector<std::string>& hashes,
                                                          TierType tier) {
   ScopedStoreOp _op(metrics_, "RegisterExternalKvIfAlive");
-  std::vector<std::string> args;
-  args.reserve(4 + hashes.size());
-  args.push_back(keys_.Tag());
-  args.push_back(node_id);
-  args.push_back(std::to_string(static_cast<int>(tier)));
-  args.push_back(std::to_string(hashes.size()));
-  for (const auto& h : hashes) args.push_back(h);
-  RespValue r = control().Eval(redis::kRegisterExternalKvLua, {keys_.Node(node_id)}, args);
-  if (r.is_error()) throw std::runtime_error("[RedisStore] RegisterExternalKvIfAlive: " + r.str);
-  return r.integer == 1;
+  if (hashes.empty()) return IsClientAlive(node_id);
+  const std::string tier_str = std::to_string(static_cast<int>(tier));
+
+  if (!extkv_sharded()) {
+    // num_shards == 1: alive-gate + write in one atomic script (KEYS declared, no
+    // allow-undeclared-keys flag — Dragonfly-single would still run it global, but
+    // that path is num_shards>1). extkv reverse index + extkv keys all on shard 0
+    // (== control slot).
+    std::vector<std::string> keys;
+    keys.reserve(2 + hashes.size());
+    keys.push_back(keys_.Node(node_id));            // KEYS[1] alive-check
+    keys.push_back(keys_.ExtKvNode(node_id, 0));    // KEYS[2] reverse index
+    for (const auto& h : hashes) keys.push_back(keys_.ExtKv(h));  // KEYS[3..]
+    RespValue r = control().Eval(redis::kRegisterExternalKvLua, keys, {node_id, tier_str});
+    if (r.is_error()) throw std::runtime_error("[RedisStore] RegisterExternalKvIfAlive: " + r.str);
+    return r.integer == 1;
+  }
+
+  // Sharded: alive-check on the control instance first, then fan out the write to
+  // each touched shard. The check + write are not one atomic step across shards
+  // (the node key and the sharded extkv keys live in different slots), a TOCTOU
+  // window consistent with the split block-write path — a node that dies between
+  // the check and the write leaves extkv entries the unregister/expire cascade
+  // reaps. Idempotent, so a retried shard is safe.
+  if (!IsClientAlive(node_id)) return false;
+
+  // Group hashes by shard; each group's KEYS = [reverse index] ++ [extkv keys].
+  redis::ShardedBatch batch;
+  std::vector<int> group_of_shard(keys_.NumShards(), -1);
+  for (const auto& h : hashes) {
+    const std::size_t shard = keys_.ExtKvShardOf(h);
+    int& g = group_of_shard[shard];
+    if (g < 0) {
+      g = static_cast<int>(batch.keys_by_shard.size());
+      batch.keys_by_shard.emplace_back(1, keys_.ExtKvNode(node_id, shard));  // KEYS[1]
+      batch.orig_index_by_shard.emplace_back();
+      batch.shard_of_group.push_back(shard);
+    }
+    batch.keys_by_shard[g].push_back(keys_.ExtKv(h));
+  }
+  redis::RunShardedRead(
+      batch, redis::kRegisterExternalKvWriteLua, {node_id, tier_str}, "RegisterExternalKvIfAlive",
+      fanout_pool_.get(), /*tolerate_shard_failures=*/false, metrics_,
+      [&](size_t g) { return &client_for_shard(batch.shard_of_group[g]); },
+      [](size_t, const RespValue&) {});
+  return true;
 }
 
 void RedisMasterMetadataStore::UnregisterExternalKv(const std::string& node_id,
                                                     const std::vector<std::string>& hashes,
                                                     TierType tier) {
   ScopedStoreOp _op(metrics_, "UnregisterExternalKv");
-  std::vector<std::string> args;
-  args.reserve(4 + hashes.size());
-  args.push_back(keys_.Tag());
-  args.push_back(node_id);
-  args.push_back(std::to_string(static_cast<int>(tier)));
-  args.push_back(std::to_string(hashes.size()));
-  for (const auto& h : hashes) args.push_back(h);
-  RespValue r = control().Eval(redis::kUnregisterExternalKvLua, {keys_.ExtKvNode(node_id)}, args);
-  if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterExternalKv: " + r.str);
+  if (hashes.empty()) return;
+  const std::string tier_str = std::to_string(static_cast<int>(tier));
+
+  // Group hashes by shard; each group's KEYS = [reverse index] ++ [extkv keys].
+  // num_shards == 1 => one group on the control slot (one atomic script).
+  redis::ShardedBatch batch;
+  std::vector<int> group_of_shard(keys_.NumShards(), -1);
+  for (const auto& h : hashes) {
+    const std::size_t shard = keys_.ExtKvShardOf(h);
+    int& g = group_of_shard[shard];
+    if (g < 0) {
+      g = static_cast<int>(batch.keys_by_shard.size());
+      batch.keys_by_shard.emplace_back(1, keys_.ExtKvNode(node_id, shard));
+      batch.orig_index_by_shard.emplace_back();
+      batch.shard_of_group.push_back(shard);
+    }
+    batch.keys_by_shard[g].push_back(keys_.ExtKv(h));
+  }
+  redis::RunShardedRead(
+      batch, redis::kUnregisterExternalKvLua, {node_id, tier_str}, "UnregisterExternalKv",
+      fanout_pool_.get(), /*tolerate_shard_failures=*/false, metrics_,
+      [&](size_t g) { return &client_for_shard(batch.shard_of_group[g]); },
+      [](size_t, const RespValue&) {});
 }
 
 void RedisMasterMetadataStore::UnregisterExternalKvByTier(const std::string& node_id,
                                                           TierType tier) {
   ScopedStoreOp _op(metrics_, "UnregisterExternalKvByTier");
-  RespValue r = control().Eval(redis::kUnregisterExternalKvByTierLua, {keys_.ExtKvNode(node_id)},
-                               {keys_.Tag(), node_id, std::to_string(static_cast<int>(tier))});
-  if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterExternalKvByTier: " + r.str);
+  // Enumerates via the per-(node, shard) reverse index, so it must touch every
+  // shard. One script per shard, routed to that shard.
+  const std::string tier_str = std::to_string(static_cast<int>(tier));
+  for (std::size_t shard = 0; shard < keys_.NumShards(); ++shard) {
+    RespValue r = client_for_shard(shard).Eval(redis::kUnregisterExternalKvByTierLua,
+                                               {keys_.ExtKvNode(node_id, shard)},
+                                               {node_id, tier_str});
+    if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterExternalKvByTier: " + r.str);
+  }
 }
 
 void RedisMasterMetadataStore::UnregisterExternalKvByNode(const std::string& node_id) {
   ScopedStoreOp _op(metrics_, "UnregisterExternalKvByNode");
-  RespValue r = control().Eval(redis::kUnregisterExternalKvByNodeLua, {keys_.ExtKvNode(node_id)},
-                               {keys_.Tag(), node_id});
-  if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterExternalKvByNode: " + r.str);
+  // Same per-shard wipe the client-record cascades use.
+  WipeNodeExtKvMulti(node_id);
 }
 
 std::size_t RedisMasterMetadataStore::GarbageCollectHits(
     std::chrono::system_clock::time_point cutoff) {
   ScopedStoreOp _op(metrics_, "GarbageCollectHits");
-  // Drop every hit counter whose last_seen < cutoff via the hit:index reverse
-  // set (no SCAN — cluster-routable by the index key). Runs on the slow hit-GC
-  // timer, not the hot path.
-  RespValue r = control().Eval(redis::kGarbageCollectHitsLua, {keys_.HitIndex()},
-                               {keys_.Tag(), std::to_string(ToEpochMs(cutoff))});
-  if (r.is_error()) throw std::runtime_error("[RedisStore] GarbageCollectHits: " + r.str);
-  return r.type == RespValue::Type::Integer ? static_cast<std::size_t>(r.integer) : 0;
+  // Drop every hit counter whose last_seen < cutoff via each shard's hit index
+  // (no SCAN — cluster-routable by the index key). One script per shard; runs on
+  // the slow hit-GC timer, not the hot path. num_shards == 1 => one call.
+  const std::string cutoff_str = std::to_string(ToEpochMs(cutoff));
+  std::size_t dropped = 0;
+  for (std::size_t shard = 0; shard < keys_.NumShards(); ++shard) {
+    RespValue r = client_for_shard(shard).Eval(redis::kGarbageCollectHitsLua,
+                                               {keys_.HitIndex(shard)}, {cutoff_str});
+    if (r.is_error()) throw std::runtime_error("[RedisStore] GarbageCollectHits: " + r.str);
+    if (r.type == RespValue::Type::Integer) dropped += static_cast<std::size_t>(r.integer);
+  }
+  return dropped;
 }
 
 // =====================================================================
@@ -793,7 +905,10 @@ std::vector<std::string> RedisMasterMetadataStore::GetClientTags(const std::stri
 }
 
 // =====================================================================
-// External-KV reads. extkv + hit live on the control tag (single-slot Lua).
+// External-KV reads. The extkv/hit keyspace is sharded by ExtKvShardOf(hash), so
+// a batch fans out one single-slot script per touched shard (grouped + scattered
+// by RunShardedRead like the block read hot path). num_shards == 1 collapses to
+// one group on the control instance.
 // =====================================================================
 
 std::vector<NodeMatch> RedisMasterMetadataStore::MatchExternalKv(
@@ -803,41 +918,68 @@ std::vector<NodeMatch> RedisMasterMetadataStore::MatchExternalKv(
   std::vector<NodeMatch> result;
   if (hashes.empty()) return result;
 
-  std::vector<std::string> args;
-  args.reserve(4 + hashes.size());
-  args.push_back(keys_.Tag());
-  args.push_back(count_as_hit ? "1" : "0");
-  args.push_back(std::to_string(ToEpochMs(now)));
-  args.push_back(std::to_string(hashes.size()));
-  for (const auto& h : hashes) args.push_back(h);
-  RespValue r = control().Eval(redis::kMatchExternalKvLua, {keys_.NodesAlive()}, args);
-  if (r.is_error()) throw std::runtime_error("[RedisStore] MatchExternalKv: " + r.str);
-  if (!r.is_array()) return result;
+  // Dedup preserving first-seen order (lets each touched key be declared in
+  // KEYS[] — no allow-undeclared-keys — and lets a per-hash reply be scattered
+  // back by first-seen position).
+  const std::vector<std::string> uniq = DedupPreserveOrder(hashes);
 
-  // Reply: array of { hash, flat_hgetall[node, mask, node, mask, ...] }.
-  // Group by node, decoding each node's tier bitmask (bit == 1<<TierType) into
-  // the tiers that hold the hash — a hash mirrored across tiers lands in several
-  // buckets (MatchedHashCount dedupes it), matching the in-memory backend.
-  std::unordered_map<std::string, std::map<TierType, std::vector<std::string>>> acc;
-  for (const auto& entry : r.elements) {
-    if (!entry.is_array() || entry.elements.size() < 2) continue;
-    const std::string& hash = entry.elements[0].str;
-    const RespValue& flat = entry.elements[1];
-    if (!flat.is_array()) continue;
-    for (size_t i = 0; i + 1 < flat.elements.size(); i += 2) {
-      const std::string& node = flat.elements[i].str;
-      long long mask = 0;
-      try {
-        mask = std::stoll(flat.elements[i + 1].str);
-      } catch (...) {
-        continue;
-      }
-      auto& by_tier = acc[node];
-      for (int t = 0; t < 16; ++t) {
-        if ((mask >> t) & 1) by_tier[static_cast<TierType>(t)].push_back(hash);
-      }
+  // Group unique hashes by their extkv shard. Each group's KEYS starts as the k
+  // extkv keys (reply is parallel to these, scattered back by orig index); when
+  // counting hits, the k hit keys + the shard's hit index are appended so the
+  // script can bump the counter in the same single-slot call.
+  redis::ShardedBatch batch;
+  std::vector<int> group_of_shard(keys_.NumShards(), -1);
+  for (std::size_t i = 0; i < uniq.size(); ++i) {
+    const std::size_t shard = keys_.ExtKvShardOf(uniq[i]);
+    int& g = group_of_shard[shard];
+    if (g < 0) {
+      g = static_cast<int>(batch.keys_by_shard.size());
+      batch.keys_by_shard.emplace_back();
+      batch.orig_index_by_shard.emplace_back();
+      batch.shard_of_group.push_back(shard);
+    }
+    batch.keys_by_shard[g].push_back(keys_.ExtKv(uniq[i]));
+    batch.orig_index_by_shard[g].push_back(i);
+  }
+  if (count_as_hit) {
+    for (std::size_t g = 0; g < batch.keys_by_shard.size(); ++g) {
+      auto& ks = batch.keys_by_shard[g];
+      const auto& idx = batch.orig_index_by_shard[g];
+      const std::size_t kg = idx.size();
+      ks.reserve(2 * kg + 1);
+      for (std::size_t j = 0; j < kg; ++j) ks.push_back(keys_.Hit(uniq[idx[j]]));
+      ks.push_back(keys_.HitIndex(batch.shard_of_group[g]));
     }
   }
+
+  const std::vector<std::string> shared_args = {count_as_hit ? "1" : "0",
+                                                std::to_string(ToEpochMs(now))};
+
+  // Group by node, decoding each node's tier bitmask (bit == 1<<TierType) into the
+  // tiers that hold the hash — a hash mirrored across tiers lands in several
+  // buckets (MatchedHashCount dedupes it), matching the in-memory backend.
+  std::unordered_map<std::string, std::map<TierType, std::vector<std::string>>> acc;
+  redis::RunShardedRead(
+      batch, redis::kMatchExternalKvLua, shared_args, "MatchExternalKv", fanout_pool_.get(),
+      /*tolerate_shard_failures=*/mode_ != Mode::kSingle, metrics_,
+      [&](size_t g) { return &client_for_shard(batch.shard_of_group[g]); },
+      [&](size_t orig_index, const RespValue& flat) {
+        if (!flat.is_array()) return;
+        const std::string& hash = uniq[orig_index];
+        for (size_t i = 0; i + 1 < flat.elements.size(); i += 2) {
+          const std::string& node = flat.elements[i].str;
+          long long mask = 0;
+          try {
+            mask = std::stoll(flat.elements[i + 1].str);
+          } catch (...) {
+            continue;
+          }
+          auto& by_tier = acc[node];
+          for (int t = 0; t < 16; ++t) {
+            if ((mask >> t) & 1) by_tier[static_cast<TierType>(t)].push_back(hash);
+          }
+        }
+      });
   result.reserve(acc.size());
   for (auto& [node_id, by_tier] : acc) {
     NodeMatch m;
@@ -852,34 +994,57 @@ std::vector<ExternalKvHitCountEntry> RedisMasterMetadataStore::GetExternalKvHitC
     const std::vector<std::string>& hashes) const {
   std::vector<ExternalKvHitCountEntry> out;
   if (hashes.empty()) return out;
-  std::vector<std::string> args;
-  args.reserve(2 + hashes.size());
-  args.push_back(keys_.Tag());
-  args.push_back(std::to_string(hashes.size()));
-  for (const auto& h : hashes) args.push_back(h);
-  RespValue r = control().Eval(redis::kGetHitCountsLua, {keys_.NodesAlive()}, args);
-  if (r.is_error()) throw std::runtime_error("[RedisStore] GetExternalKvHitCounts: " + r.str);
-  if (!r.is_array()) return out;
-  out.reserve(r.elements.size());
-  for (const auto& entry : r.elements) {
-    if (!entry.is_array() || entry.elements.size() < 2) continue;
-    ExternalKvHitCountEntry e;
-    e.hash = entry.elements[0].str;
-    try {
-      e.hit_count_total = std::stoull(entry.elements[1].str);
-    } catch (...) {
-      continue;
+  const std::vector<std::string> uniq = DedupPreserveOrder(hashes);
+
+  // Group hit keys by shard; reply per shard is parallel to that shard's hit
+  // keys, scattered back by orig index.
+  redis::ShardedBatch batch;
+  std::vector<int> group_of_shard(keys_.NumShards(), -1);
+  for (std::size_t i = 0; i < uniq.size(); ++i) {
+    const std::size_t shard = keys_.ExtKvShardOf(uniq[i]);
+    int& g = group_of_shard[shard];
+    if (g < 0) {
+      g = static_cast<int>(batch.keys_by_shard.size());
+      batch.keys_by_shard.emplace_back();
+      batch.orig_index_by_shard.emplace_back();
+      batch.shard_of_group.push_back(shard);
     }
-    out.push_back(std::move(e));
+    batch.keys_by_shard[g].push_back(keys_.Hit(uniq[i]));
+    batch.orig_index_by_shard[g].push_back(i);
+  }
+
+  std::vector<ExternalKvHitCountEntry> scratch(uniq.size());
+  std::vector<bool> present(uniq.size(), false);
+  redis::RunShardedRead(
+      batch, redis::kGetHitCountsLua, {}, "GetExternalKvHitCounts", fanout_pool_.get(),
+      /*tolerate_shard_failures=*/mode_ != Mode::kSingle, metrics_,
+      [&](size_t g) { return &client_for_shard(batch.shard_of_group[g]); },
+      [&](size_t orig_index, const RespValue& c) {
+        if (c.type != RespValue::Type::String) return;
+        try {
+          scratch[orig_index].hit_count_total = std::stoull(c.str);
+        } catch (...) {
+          return;
+        }
+        scratch[orig_index].hash = uniq[orig_index];
+        present[orig_index] = true;
+      });
+  out.reserve(uniq.size());
+  for (std::size_t i = 0; i < uniq.size(); ++i) {
+    if (present[i]) out.push_back(std::move(scratch[i]));
   }
   return out;
 }
 
 std::size_t RedisMasterMetadataStore::GetExternalKvCount(const std::string& node_id) const {
-  // O(1) via the per-node reverse index — the in-memory backend scans its whole
-  // map here only because it lacks a by-node index; Redis has one.
-  RespValue r = control().Command({"SCARD", keys_.ExtKvNode(node_id)});
-  return r.type == RespValue::Type::Integer ? static_cast<std::size_t>(r.integer) : 0;
+  // Sum the per-(node, shard) reverse-index cardinalities. num_shards == 1 => one
+  // SCARD on the control slot (byte-identical to the legacy single index).
+  std::size_t total = 0;
+  for (std::size_t shard = 0; shard < keys_.NumShards(); ++shard) {
+    RespValue r = client_for_shard(shard).Command({"SCARD", keys_.ExtKvNode(node_id, shard)});
+    if (r.type == RespValue::Type::Integer) total += static_cast<std::size_t>(r.integer);
+  }
+  return total;
 }
 
 }  // namespace mori::umbp

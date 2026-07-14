@@ -291,12 +291,17 @@ return out
 
 // unregister_client:
 //   KEYS[1] = node key
-//   ARGV = [tag, node_id]
+//   ARGV = [tag, node_id, wipe_extkv]
+//   wipe_extkv == 1 (num_shards == 1): the node's external-kv lives on the
+//     control tag, so wipe it inline (reverse-index members are full extkv keys).
+//   wipe_extkv == 0 (num_shards > 1): extkv is sharded off the control slot; the
+//     store wipes it separately per shard (WipeNodeExtKvMulti) after this runs.
 //   Returns 1 if the client existed, 0 otherwise.
 inline const std::string kUnregisterClientLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
 local nodeId = ARGV[2]
+local wipeExtkv = tonumber(ARGV[3])
 if redis.call('EXISTS', nodeKey) == 0 then return 0 end
 redis.call('DEL', nodeKey)
 redis.call('SREM', tag .. ':nodes:alive', nodeId)
@@ -317,27 +322,30 @@ for _, bk in ipairs(members) do
   if not anyLoc then redis.call('DEL', bk) end
 end
 redis.call('DEL', blocksSet)
--- Wipe this node's external-kv: clear its bit from every hash it registered and
--- drop the reverse index (mirrors UnregisterExternalKvByNode). Previously this
--- only DEL'd the reverse index, orphaning the forward extkv:<hash> entries.
-local exNode = tag .. ':extkv:node:' .. nodeId
-local exHashes = redis.call('SMEMBERS', exNode)
-for _, h in ipairs(exHashes) do
-  local ekey = tag .. ':extkv:' .. h
-  redis.call('HDEL', ekey, nodeId)
-  if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+-- Wipe this node's external-kv: clear its bit from every extkv:<hash> it
+-- registered (reverse-index members are full keys) and drop the reverse index.
+if wipeExtkv == 1 then
+  local exNode = tag .. ':extkv:node:' .. nodeId
+  local ekeys = redis.call('SMEMBERS', exNode)
+  for _, ekey in ipairs(ekeys) do
+    redis.call('HDEL', ekey, nodeId)
+    if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+  end
+  redis.call('DEL', exNode)
 end
-redis.call('DEL', exNode)
 return 1
 )LUA";
 
 // expire_stale:
-//   ARGV = [tag, cutoff_ms]
+//   ARGV = [tag, cutoff_ms, wipe_extkv]
 //   Flips ALIVE->EXPIRED for nodes whose last_hb < cutoff (keeping the row),
-//   drops their block locations + external-kv, and returns the dead node ids.
+//   drops their block locations, and (wipe_extkv == 1, num_shards == 1) their
+//   external-kv inline; when wipe_extkv == 0 the store wipes sharded extkv per
+//   shard afterwards. Returns the dead node ids.
 inline const std::string kExpireStaleLua = R"LUA(--!df flags=allow-undeclared-keys
 local tag = ARGV[1]
 local cutoff = tonumber(ARGV[2])
+local wipeExtkv = tonumber(ARGV[3])
 local members = redis.call('SMEMBERS', tag .. ':nodes:alive')
 local dead = {}
 for _, id in ipairs(members) do
@@ -364,14 +372,15 @@ for _, id in ipairs(members) do
       if not anyLoc then redis.call('DEL', bk) end
     end
     redis.call('DEL', blocksSet)
-    local exNode = tag .. ':extkv:node:' .. id
-    local exHashes = redis.call('SMEMBERS', exNode)
-    for _, h in ipairs(exHashes) do
-      local ekey = tag .. ':extkv:' .. h
-      redis.call('HDEL', ekey, id)
-      if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+    if wipeExtkv == 1 then
+      local exNode = tag .. ':extkv:node:' .. id
+      local ekeys = redis.call('SMEMBERS', exNode)
+      for _, ekey in ipairs(ekeys) do
+        redis.call('HDEL', ekey, id)
+        if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+      end
+      redis.call('DEL', exNode)
     end
-    redis.call('DEL', exNode)
     dead[#dead + 1] = id
   end
 end
@@ -524,36 +533,42 @@ return 1
 )LUA";
 
 // unregister_control (control instance):
-//   KEYS[1] = node key; ARGV = [tag, node_id]
-//   Drops the client record + nodes:alive + alive_peers + extkv reverse index.
-//   Block locations are wiped separately per shard. Returns 1 if it existed.
+//   KEYS[1] = node key; ARGV = [tag, node_id, wipe_extkv]
+//   Drops the client record + nodes:alive + alive_peers. External-kv is wiped
+//   inline only when wipe_extkv == 1 (num_shards == 1: extkv on the control tag);
+//   for num_shards > 1 the store wipes sharded extkv per shard afterwards. Block
+//   locations are wiped separately per shard. Returns 1 if it existed.
 inline const std::string kUnregisterControlLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
 local tag = ARGV[1]
 local nodeId = ARGV[2]
+local wipeExtkv = tonumber(ARGV[3])
 if redis.call('EXISTS', nodeKey) == 0 then return 0 end
 redis.call('DEL', nodeKey)
 redis.call('SREM', tag .. ':nodes:alive', nodeId)
 redis.call('HDEL', tag .. ':alive_peers', nodeId)
-local exNode = tag .. ':extkv:node:' .. nodeId
-local exHashes = redis.call('SMEMBERS', exNode)
-for _, h in ipairs(exHashes) do
-  local ekey = tag .. ':extkv:' .. h
-  redis.call('HDEL', ekey, nodeId)
-  if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+if wipeExtkv == 1 then
+  local exNode = tag .. ':extkv:node:' .. nodeId
+  local ekeys = redis.call('SMEMBERS', exNode)
+  for _, ekey in ipairs(ekeys) do
+    redis.call('HDEL', ekey, nodeId)
+    if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+  end
+  redis.call('DEL', exNode)
 end
-redis.call('DEL', exNode)
 return 1
 )LUA";
 
 // expire_control (control instance):
-//   ARGV = [tag, cutoff_ms]
+//   ARGV = [tag, cutoff_ms, wipe_extkv]
 //   Flips ALIVE->EXPIRED for nodes whose last_hb < cutoff, drops them from
-//   nodes:alive/alive_peers + extkv, and returns the dead node ids. Block
-//   locations are wiped separately per shard by the caller.
+//   nodes:alive/alive_peers, and (wipe_extkv == 1) their extkv inline; returns
+//   the dead node ids. Block locations (and sharded extkv when wipe_extkv == 0)
+//   are wiped separately per shard by the caller.
 inline const std::string kExpireControlLua = R"LUA(--!df flags=allow-undeclared-keys
 local tag = ARGV[1]
 local cutoff = tonumber(ARGV[2])
+local wipeExtkv = tonumber(ARGV[3])
 local members = redis.call('SMEMBERS', tag .. ':nodes:alive')
 local dead = {}
 for _, id in ipairs(members) do
@@ -564,14 +579,15 @@ for _, id in ipairs(members) do
     redis.call('HSET', nk, 'status', 2)
     redis.call('SREM', tag .. ':nodes:alive', id)
     redis.call('HDEL', tag .. ':alive_peers', id)
-    local exNode = tag .. ':extkv:node:' .. id
-    local exHashes = redis.call('SMEMBERS', exNode)
-    for _, h in ipairs(exHashes) do
-      local ekey = tag .. ':extkv:' .. h
-      redis.call('HDEL', ekey, id)
-      if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+    if wipeExtkv == 1 then
+      local exNode = tag .. ':extkv:node:' .. id
+      local ekeys = redis.call('SMEMBERS', exNode)
+      for _, ekey in ipairs(ekeys) do
+        redis.call('HDEL', ekey, id)
+        if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
+      end
+      redis.call('DEL', exNode)
     end
-    redis.call('DEL', exNode)
     dead[#dead + 1] = id
   end
 end
@@ -591,57 +607,105 @@ return dead
 // aggregated by RunShardedRead. See design-redis-metadata-store.md §5.
 // =====================================================================
 
-// register_external_kv (control):
-//   KEYS[1] = node key (for the alive-check + routing).
-//   ARGV = [tag, node_id, tier, n_hashes, hash1, hash2, ...]
-//   Alive-gate + write in one atomic step (TOCTOU): only if the node's status is
-//   ALIVE (==1) does it OR `tier`'s bit into extkv:<hash>[node] and add the hash
-//   to the node's reverse index. Idempotent (re-registering the same tier is a
-//   no-op). Returns 1 if alive and applied, 0 if not alive (nothing written).
-inline const std::string kRegisterExternalKvLua = R"LUA(--!df flags=allow-undeclared-keys
+// =====================================================================
+// PHASE 2 — sharded external-KV keyspace.
+//
+// extkv:<hash> / hit:<hash> are placed in the hash's OWN shard slot
+// (KeySchema::ExtKv/Hit use ShardOf(hash)), not the single control slot. This
+// lets the external-KV hot path spread across shards / instances / Dragonfly
+// proactor threads instead of piling every match + hit-count write onto one
+// slot. For num_shards == 1 the shard tag IS the control tag, so the key strings
+// are byte-identical to the legacy layout.
+//
+// The per-(node, shard) reverse index (KeySchema::ExtKvNode(node, shard)) stores
+// the FULL extkv:<hash> KEY as each member (like NodeBlocks stores full block
+// keys), and the per-shard hit index (KeySchema::HitIndex(shard)) stores the
+// FULL hit:<hash> KEY. That lets every wipe / GC script HDEL/DEL a member
+// directly with no in-Lua key composition, and — crucially — lets the hot
+// register/unregister write scripts take ONLY [node_id, tier] as shared ARGV
+// (all per-hash data is in KEYS[]), so a whole batch fans out one single-slot
+// script per shard with identical ARGV via EvalPipeline.
+//
+// The multi-key mutations that used to hang off the control slot (register,
+// unregister, match, hit-count GC, node wipe) are therefore driven by the store
+// as one single-slot script PER TOUCHED SHARD, grouped + fanned out by
+// RunShardedRead exactly like the block read hot path. Cross-shard atomicity is
+// not needed (each hash is independent). num_shards == 1 collapses to one group
+// on the control instance — one script, still atomic, byte-identical keys.
+// =====================================================================
+
+// register_external_kv (single-shard atomic path, num_shards == 1): alive-gate +
+// write in one script. Keys declared (no flag; Dragonfly lock-ahead).
+//   KEYS[1] = node key (alive-check), KEYS[2] = extkv reverse index,
+//   KEYS[3 .. 2+k] = extkv:<hash> per hash.   ARGV = [node_id, tier]
+//   Only if the node is ALIVE (status == 1) does it OR `tier`'s bit into
+//   extkv:<hash>[node] and add the extkv KEY to the reverse index. Idempotent;
+//   the reverse-index SADD is skipped when the node already holds the hash at
+//   some tier (mask != 0 ⇒ already a member). Returns 1 if alive, 0 if not.
+inline const std::string kRegisterExternalKvLua = R"LUA(
 local nodeKey = KEYS[1]
-local tag = ARGV[1]
-local nodeId = ARGV[2]
-local tier = tonumber(ARGV[3])
+local revidx = KEYS[2]
+local nodeId = ARGV[1]
+local tier = tonumber(ARGV[2])
 if redis.call('HGET', nodeKey, 'status') ~= '1' then return 0 end
 local bit = 2 ^ tier
-local n = tonumber(ARGV[4])
-local revidx = tag .. ':extkv:node:' .. nodeId
-for i = 1, n do
-  local hash = ARGV[4 + i]
-  local ekey = tag .. ':extkv:' .. hash
+for i = 3, #KEYS do
+  local ekey = KEYS[i]
   local mask = tonumber(redis.call('HGET', ekey, nodeId) or '0')
-  if math.floor(mask / bit) % 2 == 0 then
+  if mask == 0 then
+    redis.call('HSET', ekey, nodeId, bit)
+    redis.call('SADD', revidx, ekey)
+  elseif math.floor(mask / bit) % 2 == 0 then
     redis.call('HSET', ekey, nodeId, mask + bit)
   end
-  redis.call('SADD', revidx, hash)
 end
 return 1
 )LUA";
 
-// unregister_external_kv (control):
-//   KEYS[1] = the node's extkv reverse-index key (routing).
-//   ARGV = [tag, node_id, tier, n_hashes, hash1, ...]
-//   Clears `tier`'s bit for each (node, hash). When a hash's bitmask for the node
-//   reaches 0 the node field is dropped (and the extkv:<hash> key + reverse-index
-//   membership with it). No liveness check (peers unregister during teardown).
-inline const std::string kUnregisterExternalKvLua = R"LUA(--!df flags=allow-undeclared-keys
-local tag = ARGV[1]
-local nodeId = ARGV[2]
-local tier = tonumber(ARGV[3])
+// register_external_kv_write (per-shard, num_shards > 1): the write half of the
+// hot register, WITHOUT the alive-gate (the caller checked node status on the
+// control instance first). One invocation per touched shard, routed to that
+// shard. Keys declared (no flag; Dragonfly runs each shard's script on its own
+// proactor thread concurrently).
+//   KEYS[1] = extkv reverse index for (node, shard), KEYS[2..] = extkv:<hash>.
+//   ARGV = [node_id, tier]   (uniform across shards → EvalPipeline-friendly)
+inline const std::string kRegisterExternalKvWriteLua = R"LUA(
+local revidx = KEYS[1]
+local nodeId = ARGV[1]
+local tier = tonumber(ARGV[2])
 local bit = 2 ^ tier
-local n = tonumber(ARGV[4])
-local revidx = tag .. ':extkv:node:' .. nodeId
-for i = 1, n do
-  local hash = ARGV[4 + i]
-  local ekey = tag .. ':extkv:' .. hash
+for i = 2, #KEYS do
+  local ekey = KEYS[i]
+  local mask = tonumber(redis.call('HGET', ekey, nodeId) or '0')
+  if mask == 0 then
+    redis.call('HSET', ekey, nodeId, bit)
+    redis.call('SADD', revidx, ekey)
+  elseif math.floor(mask / bit) % 2 == 0 then
+    redis.call('HSET', ekey, nodeId, mask + bit)
+  end
+end
+return 1
+)LUA";
+
+// unregister_external_kv (per-shard): clears `tier`'s bit for each (node, hash).
+// When a hash's bitmask for the node reaches 0 the node field is dropped (and the
+// extkv:<hash> key + reverse-index membership with it). No liveness check. Keys
+// declared (no flag). One invocation per touched shard.
+//   KEYS[1] = extkv reverse index, KEYS[2..] = extkv:<hash>.  ARGV = [node_id, tier]
+inline const std::string kUnregisterExternalKvLua = R"LUA(
+local revidx = KEYS[1]
+local nodeId = ARGV[1]
+local tier = tonumber(ARGV[2])
+local bit = 2 ^ tier
+for i = 2, #KEYS do
+  local ekey = KEYS[i]
   local mask = tonumber(redis.call('HGET', ekey, nodeId) or '0')
   if math.floor(mask / bit) % 2 == 1 then
     local newmask = mask - bit
     if newmask == 0 then
       redis.call('HDEL', ekey, nodeId)
       if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
-      redis.call('SREM', revidx, hash)
+      redis.call('SREM', revidx, ekey)
     else
       redis.call('HSET', ekey, nodeId, newmask)
     end
@@ -650,26 +714,25 @@ end
 return 1
 )LUA";
 
-// unregister_external_kv_by_tier (control):
-//   KEYS[1] = the node's extkv reverse-index key (routing).
-//   ARGV = [tag, node_id, tier]
-//   Clears `tier` from every hash the node registered (admin whole-tier wipe).
+// unregister_external_kv_by_tier (per-shard): clears `tier` from every hash the
+// node registered in this shard (admin whole-tier wipe). Enumerates via the
+// reverse index whose members are full extkv keys (undeclared but same slot, so
+// the allow-undeclared-keys flag only matters on Dragonfly — cold path).
+//   KEYS[1] = extkv reverse index for (node, shard).  ARGV = [node_id, tier]
 inline const std::string kUnregisterExternalKvByTierLua = R"LUA(--!df flags=allow-undeclared-keys
-local tag = ARGV[1]
-local nodeId = ARGV[2]
-local tier = tonumber(ARGV[3])
+local revidx = KEYS[1]
+local nodeId = ARGV[1]
+local tier = tonumber(ARGV[2])
 local bit = 2 ^ tier
-local revidx = tag .. ':extkv:node:' .. nodeId
-local hashes = redis.call('SMEMBERS', revidx)
-for _, hash in ipairs(hashes) do
-  local ekey = tag .. ':extkv:' .. hash
+local ekeys = redis.call('SMEMBERS', revidx)
+for _, ekey in ipairs(ekeys) do
   local mask = tonumber(redis.call('HGET', ekey, nodeId) or '0')
   if math.floor(mask / bit) % 2 == 1 then
     local newmask = mask - bit
     if newmask == 0 then
       redis.call('HDEL', ekey, nodeId)
       if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
-      redis.call('SREM', revidx, hash)
+      redis.call('SREM', revidx, ekey)
     else
       redis.call('HSET', ekey, nodeId, newmask)
     end
@@ -678,19 +741,15 @@ end
 return 1
 )LUA";
 
-// unregister_external_kv_by_node (control):
-//   KEYS[1] = the node's extkv reverse-index key (routing).
-//   ARGV = [tag, node_id]
-//   Drops every external-kv entry for the node (all tiers) without touching its
-//   client record or block locations. Same body the unregister/expire cascades
-//   inline. Idempotent.
+// unregister_external_kv_by_node / cascade wipe (per-shard): drops every
+// external-kv entry for the node in this shard (all tiers) and deletes the
+// reverse index. Members are full extkv keys. Idempotent.
+//   KEYS[1] = extkv reverse index for (node, shard).  ARGV = [node_id]
 inline const std::string kUnregisterExternalKvByNodeLua = R"LUA(--!df flags=allow-undeclared-keys
-local tag = ARGV[1]
-local nodeId = ARGV[2]
-local revidx = tag .. ':extkv:node:' .. nodeId
-local hashes = redis.call('SMEMBERS', revidx)
-for _, hash in ipairs(hashes) do
-  local ekey = tag .. ':extkv:' .. hash
+local revidx = KEYS[1]
+local nodeId = ARGV[1]
+local ekeys = redis.call('SMEMBERS', revidx)
+for _, ekey in ipairs(ekeys) do
   redis.call('HDEL', ekey, nodeId)
   if redis.call('HLEN', ekey) == 0 then redis.call('DEL', ekey) end
 end
@@ -698,80 +757,70 @@ redis.call('DEL', revidx)
 return 1
 )LUA";
 
-// match_external_kv (control):
-//   KEYS[1] = a control-tag key (routing).
-//   ARGV = [tag, count_as_hit, now_ms, n_hashes, hash1, ...]
-//   For each UNIQUE input hash with >=1 registered node, returns { hash,
-//   flat_hgetall(extkv:<hash>) } (flat = [node, mask, node, mask, ...]); the
-//   caller decodes the bitmask into tiers and groups by node. When count_as_hit
-//   == 1, bumps hit:<hash>.c and stamps ls=now (only if ls<now) once per matched
-//   hash, and adds the hash to the hit reverse index — all atomic here.
-inline const std::string kMatchExternalKvLua = R"LUA(--!df flags=allow-undeclared-keys
-local tag = ARGV[1]
-local countHit = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
-local n = tonumber(ARGV[4])
+// match_external_kv (per-shard): THE external-KV hot read. Keys are declared in
+// KEYS[] so the script touches no undeclared key and needs no
+// allow-undeclared-keys flag — on Dragonfly each shard's script runs on its own
+// proactor thread (lock-ahead) instead of taking a store-wide GLOBAL lock.
+//
+//   count == 0: KEYS = [extkv:h1 .. extkv:hk]                      ARGV = [0, now]
+//   count == 1: KEYS = [extkv:h1 .. extkv:hk, hit:h1 .. hit:hk, hitidx] ARGV = [1, now]
+//   Returns an array PARALLEL to the k extkv keys: element i = flat
+//   HGETALL(extkv:<hash_i>) ([] when the hash has no registered node). The caller
+//   scatters element i back to hash i (RunShardedRead) and decodes each node's
+//   tier bitmask.
+//
+// Hit path (count == 1) costs 3 redis.call() per matched hash steady state
+// instead of the old 5: HGETALL + HINCRBY + HSET(ls); the SADD into the shard's
+// hit index fires ONLY on the counter's first hit (HINCRBY returns 1), and ls is
+// stamped with an unconditional HSET (the old read-then-guard HGET is dropped — a
+// backward clock skew merely makes an entry look marginally less recent to the
+// coarse hit-GC, benign). The server is redis.call()-count bound, so this cut is
+// a direct throughput win on top of the cross-shard parallelism.
+inline const std::string kMatchExternalKvLua = R"LUA(
+local countHit = tonumber(ARGV[1])
+local now = tonumber(ARGV[2])
+local k = #KEYS
+if countHit == 1 then k = (k - 1) / 2 end
 local out = {}
-local seen = {}
-for i = 1, n do
-  local hash = ARGV[4 + i]
-  if not seen[hash] then
-    seen[hash] = true
-    local ekey = tag .. ':extkv:' .. hash
-    local flat = redis.call('HGETALL', ekey)
-    if #flat > 0 then
-      out[#out + 1] = { hash, flat }
-      if countHit == 1 then
-        local hkey = tag .. ':hit:' .. hash
-        redis.call('HINCRBY', hkey, 'c', 1)
-        local ls = tonumber(redis.call('HGET', hkey, 'ls') or '0')
-        if ls < now then redis.call('HSET', hkey, 'ls', now) end
-        redis.call('SADD', tag .. ':hit:index', hash)
-      end
-    end
+for i = 1, k do
+  local flat = redis.call('HGETALL', KEYS[i])
+  out[i] = flat
+  if countHit == 1 and #flat > 0 then
+    local hkey = KEYS[k + i]
+    local c = redis.call('HINCRBY', hkey, 'c', 1)
+    redis.call('HSET', hkey, 'ls', now)
+    if c == 1 then redis.call('SADD', KEYS[2 * k + 1], hkey) end
   end
 end
 return out
 )LUA";
 
-// get_external_kv_hit_counts (control):
-//   KEYS[1] = a control-tag key (routing).
-//   ARGV = [tag, n_hashes, hash1, ...]
-//   Returns { hash, count } for each UNIQUE input hash that has a recorded
-//   counter (hashes with no count are omitted). Pure read.
-inline const std::string kGetHitCountsLua = R"LUA(--!df flags=allow-undeclared-keys
-local tag = ARGV[1]
-local n = tonumber(ARGV[2])
+// get_external_kv_hit_counts (per-shard): keys declared (no flag). Returns an
+// array PARALLEL to KEYS; element i = the count string of hit:<hash_i> (nil if no
+// counter). The caller scatters back to hash i.
+//   KEYS = [hit:h1 .. hit:hk]   ARGV = []
+inline const std::string kGetHitCountsLua = R"LUA(
 local out = {}
-local seen = {}
-for i = 1, n do
-  local hash = ARGV[2 + i]
-  if not seen[hash] then
-    seen[hash] = true
-    local c = redis.call('HGET', tag .. ':hit:' .. hash, 'c')
-    if c then out[#out + 1] = { hash, c } end
-  end
+for i = 1, #KEYS do
+  out[i] = redis.call('HGET', KEYS[i], 'c')
 end
 return out
 )LUA";
 
-// garbage_collect_hits (control):
-//   KEYS[1] = the hit reverse-index key (routing).
-//   ARGV = [tag, cutoff_ms]
-//   Drops every hit counter whose ls < cutoff, using the hit:index reverse set
-//   (no SCAN). Returns the number dropped.
+// garbage_collect_hits (per-shard): drops every hit counter in this shard whose
+// ls < cutoff, via the shard's hit index (members are full hit keys; no SCAN).
+// Returns the number dropped. Cold path (GC timer).
+//   KEYS[1] = hit index for this shard.  ARGV = [cutoff_ms]
 inline const std::string kGarbageCollectHitsLua = R"LUA(--!df flags=allow-undeclared-keys
-local tag = ARGV[1]
-local cutoff = tonumber(ARGV[2])
-local idx = tag .. ':hit:index'
-local hashes = redis.call('SMEMBERS', idx)
+local idx = KEYS[1]
+local cutoff = tonumber(ARGV[1])
+local hkeys = redis.call('SMEMBERS', idx)
 local dropped = 0
-for _, hash in ipairs(hashes) do
-  local hkey = tag .. ':hit:' .. hash
+for _, hkey in ipairs(hkeys) do
   local ls = tonumber(redis.call('HGET', hkey, 'ls') or '0')
   if ls < cutoff then
     redis.call('DEL', hkey)
-    redis.call('SREM', idx, hash)
+    redis.call('SREM', idx, hkey)
     dropped = dropped + 1
   end
 end

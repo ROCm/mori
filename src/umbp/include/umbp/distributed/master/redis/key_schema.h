@@ -132,24 +132,45 @@ class KeySchema {
     return ShardTag(shard) + ":node:" + node_id + ":blocks";
   }
 
-  // SET: the external-kv hashes a node registered (reverse index).
-  std::string ExtKvNode(const std::string& node_id) const {
-    return control_tag_ + ":extkv:node:" + node_id;
+  // The shard a block-hash (external-kv key) belongs to. Same StableHash
+  // bucketing as ShardOf so an extkv:<hash> and its hit:<hash> always co-locate,
+  // and so a batch of hashes spreads across shards exactly like a block batch.
+  std::size_t ExtKvShardOf(const std::string& hash) const { return ShardOf(hash); }
+
+  // SET: the external-kv hashes a node registered within one shard (reverse
+  // index for the node-scoped wipe), placed under that shard's tag so it
+  // co-locates with the shard's extkv:<hash> keys. One set per (node, shard) so
+  // every extkv mutation/wipe stays single-slot and touches only its own shard,
+  // exactly like NodeBlocks(node, shard). Members are hash strings.
+  // For num_shards == 1, shard 0's tag IS the control tag, so this is
+  // byte-identical to the legacy single control-tag reverse index.
+  std::string ExtKvNode(const std::string& node_id, std::size_t shard) const {
+    return ShardTag(shard) + ":extkv:node:" + node_id;
   }
 
   // HASH: one external-kv entry, node_id -> tier bitmask (bit == 1<<TierType).
-  // On the control tag so a single Lua matches/mutates it atomically in every
-  // mode (single / multi-endpoint control instance / cluster control slot).
-  std::string ExtKv(const std::string& hash) const { return control_tag_ + ":extkv:" + hash; }
+  // Placed in the hash's own shard slot (num_shards == 1 => control tag, legacy
+  // byte-identical layout) so the external-KV hot path spreads across shards /
+  // instances / proactor threads instead of piling every match + hit-count write
+  // onto the single control slot. A single Lua still mutates it atomically within
+  // its shard; cross-shard extkv ops fan out one single-slot script per shard.
+  std::string ExtKv(const std::string& hash) const {
+    return ShardTag(ShardOf(hash)) + ":extkv:" + hash;
+  }
 
   // HASH: one per-hash hit counter, fields `c` (count) and `ls` (last_seen ms).
-  std::string Hit(const std::string& hash) const { return control_tag_ + ":hit:" + hash; }
+  // Co-located with its extkv:<hash> (same shard) so a match + hit-count bump is
+  // one single-slot script per shard.
+  std::string Hit(const std::string& hash) const {
+    return ShardTag(ShardOf(hash)) + ":hit:" + hash;
+  }
 
-  // SET: every hash that currently has a hit counter. A Redis-specific reverse
-  // index (the in-memory backend just iterates its map) so GarbageCollectHits is
-  // one keyed Lua over this set instead of a SCAN — SCAN has no key and cannot be
-  // routed per-node in cluster mode.
-  std::string HitIndex() const { return control_tag_ + ":hit:index"; }
+  // SET: every hash that currently has a hit counter WITHIN one shard. A
+  // Redis-specific reverse index (the in-memory backend just iterates its map) so
+  // GarbageCollectHits is one keyed Lua per shard over this set instead of a SCAN
+  // — SCAN has no key and cannot be routed per-node in cluster mode. One index
+  // per shard so GC fans out; num_shards == 1 => control tag (byte-identical).
+  std::string HitIndex(std::size_t shard) const { return ShardTag(shard) + ":hit:index"; }
 
  private:
   // FNV-1a (32-bit): small, fast, and stable across builds/runs. std::hash is

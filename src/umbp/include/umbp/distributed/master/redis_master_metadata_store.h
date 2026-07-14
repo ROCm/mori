@@ -182,6 +182,18 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
   enum class Mode { kSingle, kMulti, kCluster };
   bool split_writes() const { return mode_ != Mode::kSingle; }
 
+  // Whether the external-KV keyspace (extkv:<hash> / hit:<hash> / hit index /
+  // per-node reverse index) is spread across more than one shard tag. When true,
+  // every external-KV op fans out one single-slot script per touched shard
+  // (grouped by KeySchema::ExtKvShardOf), and the client-record cascades wipe the
+  // node's sharded extkv separately (WipeNodeExtKvMulti) instead of inline. When
+  // false (num_shards == 1) the extkv keyspace collapses onto the control slot —
+  // one atomic script, byte-identical to the legacy layout. This is keyed on the
+  // shard count, NOT split_writes(): a single Dragonfly instance runs with
+  // num_shards > 1 (kSingle) precisely so extkv spreads across its proactor
+  // threads.
+  bool extkv_sharded() const { return keys_.NumShards() > 1; }
+
   bool multi_endpoint() const { return clients_.size() > 1; }
   redis::IRespClient& control() const { return *clients_[0]; }
   std::size_t endpoint_of_shard(std::size_t shard) const { return shard % clients_.size(); }
@@ -194,6 +206,12 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
   void ApplyBlockEventsMulti(const std::string& node_id, const std::vector<KvEvent>& events,
                              bool is_full_sync, std::chrono::system_clock::time_point now);
   void WipeNodeBlocksMulti(const std::string& node_id);
+
+  // Drop a node's sharded external-kv on every shard (best-effort per shard,
+  // mirroring WipeNodeBlocksMulti). Used by the client-record cascades and
+  // UnregisterExternalKvByNode when extkv_sharded(). One single-slot script per
+  // shard, routed to that shard's instance/slot.
+  void WipeNodeExtKvMulti(const std::string& node_id);
 
   redis::KeySchema keys_;
   Mode mode_ = Mode::kSingle;
