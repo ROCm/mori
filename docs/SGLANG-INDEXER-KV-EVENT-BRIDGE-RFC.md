@@ -166,3 +166,19 @@ Indexer 位于 metadata 控制面核心路径，语言选择需要兼顾 RPC 并
 | Rust | 性能接近 C++，内存和线程安全更好，async / gRPC / 存储生态成熟 | 学习曲线更高 |
 
 推荐使用 **Rust** 实现 indexer。它能提供接近 C++ 的性能，同时通过类型系统降低 shared metadata map / counter 并发读写中的内存和数据竞争风险。首期可以用 Rust 实现 in-memory store，并保留 store trait，后续扩展 Redis、MySQL / PostgreSQL 或 RocksDB 后端。
+
+## 附录：UMBP Feature 总结
+
+UMBP 已经具备一组可复用的 KV backend、分层存储、路由和 metadata 能力。SGLang Indexer Bridge 主要复用其中的 External KV metadata / hit count 思路，并将其抽取为独立 indexer 组件。
+
+| Feature | 相关组件 / API | 简明说明 |
+| --- | --- | --- |
+| 本地 `Put` / `Get` | `put_from_ptr()` / `get_into_ptr()`、local storage manager | 默认在本地 tier 内完成 KV block 写入和读取；同一个 key 可作为 content-addressed block 做 dedup。 |
+| 分布式 `Put` / `Get` | route get / route put、peer service | 本地 miss 后可查询 remote placement，并从远端节点读取或写入 KV block；这是 bytes path，不属于本 RFC 的 bridge 范围。 |
+| 批量操作 | batch put / get / exists | 面向 prefix cache / block cache 的批量访问模式，减少逐 block RPC 或查询开销。 |
+| 分层存储 | HBM / DRAM / SSD tier | KV block 可以分布在不同速度和容量的 tier 上；调度时可优先选择更快 tier。 |
+| Global / Local Block Index | global placement index、local hint index | 全局 index 维护跨节点 placement，本地 index 维护快速命中 hint；独立 indexer 会复用类似的 metadata 建模方式。 |
+| Global Routing | route get / route put strategy | 根据 placement、节点状态和 tier 信息选择读源或写入目标；External KV 的 `match` 结果可作为调度输入。 |
+| External KV metadata | `report` / `revoke` / `match` | 允许外部系统上报自己持有的 KV placement；indexer 只记录 metadata，用于跨 worker KV 发现。 |
+| Hit count primitive | `match(..., count_as_hit=True)`、hit-count query | 将真实路由查询命中累计成 per-hash 热度信号，供 scheduler 或 bridge 后续策略使用。 |
+| Agent Hints | `session_id`、semantic spans、admission action | 后续可把 session 生命周期和语义阶段传给 scheduler / indexer，用于 sticky routing、admission 和 metadata 清理。 |
