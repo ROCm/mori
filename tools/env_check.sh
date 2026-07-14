@@ -1,6 +1,13 @@
 #!/bin/bash
 
-# TODO: adapt for MLX (Mellanox/NVIDIA) NICs.
+# NIC version recommendations for cross-node MORI (EP over RDMA / IBGDA).
+# The wrong NIC firmware/driver version is a common blocker, so `mori check`
+# validates the detected version against these known-good/known-bad ranges:
+#   - AINIC     : >= 1.117.5-a-45 is solid. The 1.117.1 major does NOT support IBGDA.
+#   - Broadcom  : solid on 237.1.137.x (official release) and 235.2.86.x
+#                 (customer-specific build); 231.x is too old for IBGDA.
+#   - Mellanox  : no real version requirement — mlx5 just works out of the box.
+# For all NICs, the userspace library must match the corresponding kernel driver.
 
 set -uo pipefail
 
@@ -12,6 +19,9 @@ LAT_THRESHOLD=10    # microseconds
 MSG_SIZE=65536      # 64K
 LAT_MSG_SIZE=2      # bytes (small message for latency)
 IB_PORT=18515       # base port for ib_write_bw / ib_write_lat
+AINIC_MIN_VER="1.117.5-a-45"       # minimum recommended AINIC firmware for IBGDA
+BNXT_MIN_VER_235="235.2.86.0"      # minimum solid version on the 235.x branch
+BNXT_MIN_VER_237="237.1.137.0"     # minimum solid version on the 237.x branch
 # Kept <= sshd MaxSessions (default 10): all remote servers multiplex over one
 # ssh master connection, so too many concurrent exec sessions would be refused.
 MESH_PARALLEL=8     # max concurrent pair probes for mesh tests
@@ -310,6 +320,56 @@ mesh_report() {
     else log_warn "$title: $ok/$total reachable, $fail unreachable (see ✗ cells)"; fi
 }
 
+# version_ge <candidate> <min>
+#   true if <candidate> >= <min>, comparing dotted/hyphenated version strings
+#   (e.g. "1.117.5-a-45", "237.1.145.0") via `sort -V`.
+version_ge() {
+    local cand="$1" min="$2"
+    [[ "$cand" == "$min" ]] && return 0
+    [[ "$(printf '%s\n%s\n' "$cand" "$min" | sort -V | head -1)" == "$min" ]]
+}
+
+# check_ainic_version_recommendation <fw_version>
+#   warns if the AINIC firmware is on the IBGDA-incapable 1.117.1 branch, or
+#   below the recommended minimum for cross-node MORI (EP over RDMA / IBGDA).
+check_ainic_version_recommendation() {
+    local ver="$1"
+    [[ -n "$ver" ]] || { log_warn "cannot verify AINIC firmware version against recommendation (empty)"; return; }
+    if [[ "$ver" == 1.117.1* ]]; then
+        log_warn "AINIC firmware $ver is on the 1.117.1 branch, which does NOT support IBGDA — upgrade to >= $AINIC_MIN_VER"
+    elif version_ge "$ver" "$AINIC_MIN_VER"; then
+        log_ok "AINIC firmware $ver meets the recommended minimum (>= $AINIC_MIN_VER) for cross-node IBGDA"
+    else
+        log_warn "AINIC firmware $ver is below the recommended minimum (>= $AINIC_MIN_VER) for cross-node IBGDA"
+    fi
+}
+
+# check_bnxt_version_recommendation <fw_version>
+#   classifies Broadcom firmware by major branch against known-good/known-bad
+#   ranges for cross-node MORI (EP over RDMA / IBGDA).
+check_bnxt_version_recommendation() {
+    local ver="$1" major="${1%%.*}"
+    [[ -n "$ver" ]] || { log_warn "cannot verify Broadcom firmware version against recommendation (empty)"; return; }
+    case "$major" in
+        231)
+            log_warn "Broadcom firmware $ver is on the 231.x branch, which is too old for IBGDA — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"
+            ;;
+        235)
+            version_ge "$ver" "$BNXT_MIN_VER_235" \
+                && log_ok "Broadcom firmware $ver is solid (>= $BNXT_MIN_VER_235 on the 235.x branch)" \
+                || log_warn "Broadcom firmware $ver is below the solid minimum on the 235.x branch (>= $BNXT_MIN_VER_235)"
+            ;;
+        237)
+            version_ge "$ver" "$BNXT_MIN_VER_237" \
+                && log_ok "Broadcom firmware $ver is solid (>= $BNXT_MIN_VER_237 on the 237.x branch)" \
+                || log_warn "Broadcom firmware $ver is below the solid minimum on the 237.x branch (>= $BNXT_MIN_VER_237)"
+            ;;
+        *)
+            log_warn "Broadcom firmware $ver is on an unverified branch ($major.x) — known-solid: $BNXT_MIN_VER_235, $BNXT_MIN_VER_237; known-bad: 231.x"
+            ;;
+    esac
+}
+
 # dominant_group <out_array_name> <dev...>
 #   sets the named array to the largest same-vendor-prefix subset of the inputs.
 dominant_group() {
@@ -338,8 +398,11 @@ check_versions() {
     if [[ $fw_count -ne 1 ]]; then
         log_warn "firmware versions not consistent across NICs:"
         echo "$fw_versions"
+        local v
+        while read -r v; do check_ainic_version_recommendation "$v"; done <<< "$fw_versions"
     else
         log_ok "firmware         : $fw_versions"
+        check_ainic_version_recommendation "$fw_versions"
     fi
 
     local nicctl_ver
@@ -648,6 +711,12 @@ check_bnxt_versions() {
     _report_fw "RoCE firmware" "${roce_versions[@]}"
     [[ ${#failed_idxs[@]} -gt 0 ]] && log_warn "could not read firmware from NIC(s): ${failed_idxs[*]}"
 
+    if [[ ${#roce_versions[@]} -gt 0 ]]; then
+        local v
+        while read -r v; do check_bnxt_version_recommendation "$v"; done \
+            < <(printf '%s\n' "${roce_versions[@]}" | sort -u)
+    fi
+
     # --- port state, net device, and niccli index mapping via sysfs ---
     # Build a PCI->niccli_index map from "niccli --list" output:
     #   "  1) BCM57608  <mac>  235.2.40.0  0000:06:00.0  NIC  PCI"
@@ -896,6 +965,9 @@ fi
 _have_bnxt=false
 _ib_has_vendor 0x14e4 && _have_bnxt=true     # Broadcom (bnxt_re)
 
+_have_mlx=false
+_ib_has_vendor 0x15b3 && _have_mlx=true      # Mellanox (mlx5)
+
 if [[ "$_have_ionic" == "true" ]]; then
     if [[ "$_nicctl_ok" == "true" ]]; then
         check_versions
@@ -908,8 +980,11 @@ elif [[ "$_have_bnxt" == "true" ]]; then
     check_bnxt_versions
     check_bnxt_qos
     check_bnxt_dcqcn
+elif [[ "$_have_mlx" == "true" ]]; then
+    step "check mlx5 (Mellanox) NIC"
+    log_ok "Mellanox ConnectX (mlx5) detected — no specific firmware/driver version requirement, IBGDA works out of the box via libmlx5"
 else
-    log_warn "no ionic or bnxt_re NICs detected — skipping NIC-specific checks"
+    log_warn "no ionic, bnxt_re, or mlx5 NICs detected — skipping NIC-specific checks"
 fi
 
 check_intra_node_bw

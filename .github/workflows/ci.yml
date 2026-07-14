@@ -44,7 +44,7 @@ jobs:
             runner: [self-hosted, MI355X-AINIC-TW]
           - platform: MI325X_BNXT
             runner: [self-hosted, 325_bnxt_108]
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -72,6 +72,9 @@ jobs:
 
       - name: Verify installation
         run: $CT exec $CONTAINER python -c "import mori; print('mori ' + mori.__version__ + ' OK')"
+
+      - name: mori check (environment validation)
+        run: $CT exec $CONTAINER bash -c "mori check"
 
       - name: Cleanup
         if: always()
