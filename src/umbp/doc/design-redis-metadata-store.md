@@ -20,6 +20,14 @@ the go/no-go results in
 [`redis-backend-phase1-bench.md`](./redis-backend-phase1-bench.md); Phase 2
 directions are in that report's §5.
 
+Phase 2 external-KV / hit-count / eviction (#5) is now delivered too: the
+external-KV read/write family, `MatchExternalKv` hit accounting,
+`GarbageCollectHits`, and `EnumerateEvictionCandidates` are implemented against
+real Lua and pass the parameterized conformance suite in all modes
+(single / multi-endpoint / Redis Cluster; Dragonfly). The read hot path
+(`route_get_batch`) is unchanged, so read throughput does not regress. This
+unblocks a real hicache PD (`kv_events_subscriber=true`) on the Redis backend.
+
 ---
 
 ## 1. Goals and non-goals
@@ -184,10 +192,30 @@ Two hash-tag families, split so block lookups can scale past one slot:
 | Alive peer projection | `H:alive_peers` | HASH | `<id>` -> `peer_address` (ALIVE only) |
 | Block locations | `Bs:block:<key>` | HASH | `l\|<node>\|<tier>` -> `size`; meta `_lease`, `_lacc`, `_acnt`, `_created` |
 | Node -> its block keys | `H:node:<id>:blocks` | SET | full `Bs:block:<key>` strings (reverse index for node-scoped wipe) |
-| External-KV entry | `H:extkv:<hash>` | HASH | `<node>` -> tier bitmask (bit per `TierType`) |
+| External-KV entry | `H:extkv:<hash>` | HASH | `<node>` -> tier bitmask (bit `1<<TierType`) |
 | Node -> its extkv hashes | `H:extkv:node:<id>` | SET | `<hash>` (reverse index) |
 | Hit counter | `H:hit:<hash>` | HASH | `c` (count), `ls` (last_seen ms) |
-| Eviction LRU index | `H:lru:<node>:<tier>` | ZSET | member `<key>`, score `last_accessed_ms` |
+| Hit reverse index | `H:hit:index` | SET | every `<hash>` with a live counter (drives GC without SCAN) |
+
+**External-KV / hit placement.** `extkv:*`, `hit:*`, and `hit:index` all live on the
+**control tag** `H`, so `RegisterExternalKvIfAlive` / `MatchExternalKv` (with the
+hit-count branch) / `Unregister*` / `GarbageCollectHits` are each one single-slot Lua
+on the control instance (control slot in cluster) — no cross-instance step. This adds to
+the control-plane load noted in §8; sharding it is a separate design if a match-heavy
+workload needs it. The tier-set is a bitmask int (bit `1<<TierType`) computed with plain
+arithmetic in Lua (no `bit`/bitop library) so the same script runs on Redis / Dragonfly /
+Valkey.
+
+**Eviction has no maintained LRU ZSET.** A per-`(node,tier)` ZSET keyed by
+`last_accessed_ms` would have to be updated inside `route_get_batch`, but the `lru` key is
+data-derived (the `(node,tier)` is only known after reading the block *inside* the script),
+so it cannot be pre-declared in `KEYS[]`; adding it under `allow-undeclared-keys` would
+force `route_get_batch` global on Dragonfly and lose the ~2–9x read-parallel win.
+`EnumerateEvictionCandidates` instead **reuses the existing per-node block reverse index
+(`node:<id>:blocks`) plus the `_lease`/`_lacc` already on each block hash** — the read hot
+path is untouched — enumerated per shard (one keyed Lua per shard, aggregated by
+`RunShardedRead`) with the ordering/cap applied in C++, exactly like the in-memory backend's
+scan-and-sort.
 
 Sharding notes:
 
@@ -326,8 +354,8 @@ Legend: **RT** = round trips. **P** = pipeline. **L** = single Lua `EVALSHA`.
 | `MatchExternalKv` | Lua `match_external_kv`: for each hash read `H:extkv:<hash>`, group by node/tier; if `count_as_hit`, `HINCRBY H:hit:<hash> c 1` + set `ls=now` for each unique matched hash | 1 (L) |
 | `GetExternalKvHitCounts` | pipelined `HGET H:hit:<hash> c` | 1 (P) |
 | `GetExternalKvCount` | `SCARD H:extkv:node:<id>` | 1 |
-| `GarbageCollectHits` | Lua/`SCAN`-driven: drop `H:hit:*` whose `ls < cutoff` (see [note](#8-scan-caveat)) | bounded |
-| `EnumerateEvictionCandidates` | Lua `enumerate_eviction`: per `H:lru:<node>:<tier>` ZSET, `ZRANGEBYSCORE` ascending, `HGET` each block's `_lease`, skip leased, collect up to `max_per_bucket` | 1 (L) |
+| `GarbageCollectHits` | Lua `garbage_collect_hits`: walk `H:hit:index`, drop each `H:hit:<hash>` whose `ls < cutoff` (+`SREM` from the index). One keyed Lua, no `SCAN` | 1 (L) |
+| `EnumerateEvictionCandidates` | Lua `enumerate_eviction` per shard: walk each requested node's `node:<id>:blocks` set, skip leased (`_lease > now`), emit `(key,node,tier,size,_lacc)` for wanted `(node,tier)`; C++ sorts by `_lacc` + caps. Aggregated across shards by `RunShardedRead`. Read hot path unchanged | 1 per shard |
 
 ---
 
@@ -459,10 +487,13 @@ return 1
   MUST be atomic, so the mitigation is on the peer: cap full_sync batch size
   (proposed 100k events) and fragment larger resyncs. Documented as a peer-side
   follow-up; the store enforces atomicity per call.
-- <a id="8-scan-caveat"></a>**`GarbageCollectHits` / hit-key enumeration.** There
-  is no reverse index over all hit keys. `GarbageCollectHits` uses `SCAN
-  MATCH H:hit:*` in bounded batches (cursor-based, non-atomic across batches),
-  which is acceptable because it runs on a slow GC timer, not the hot path.
+- <a id="8-scan-caveat"></a>**`GarbageCollectHits` / hit-key enumeration.**
+  Rather than `SCAN MATCH H:hit:*` (which has no key and cannot be routed
+  per-node in cluster mode), the backend maintains a `H:hit:index` reverse SET
+  of every hash with a live counter, updated by `MatchExternalKv`'s hit branch.
+  `GarbageCollectHits` is one keyed Lua that walks that set, drops each counter
+  whose `ls < cutoff`, and `SREM`s it — single-slot, cluster-routable, and runs
+  on the slow GC timer, not the hot path.
 - **Dragonfly Lua atomicity** is validated by the conformance race suite, not
   assumed. If a divergence surfaces, the fallback is to gate the Redis-backend
   "multi-master" claim to Redis/Valkey and treat Dragonfly as single-writer.
