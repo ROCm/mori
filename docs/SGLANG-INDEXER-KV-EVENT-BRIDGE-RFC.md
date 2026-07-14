@@ -167,7 +167,7 @@ Indexer 位于 metadata 控制面核心路径，语言选择需要兼顾 RPC 并
 
 推荐使用 **Rust** 实现 indexer。它能提供接近 C++ 的性能，同时通过类型系统降低 shared metadata map / counter 并发读写中的内存和数据竞争风险。首期可以用 Rust 实现 in-memory store，并保留 store trait，后续扩展 Redis、MySQL / PostgreSQL 或 RocksDB 后端。
 
-## 附录：UMBP Feature 总结
+## 附录：UMBP Feature Proposal
 
 UMBP 已经具备一组可复用的 KV backend、分层存储、路由和 metadata 能力。SGLang Indexer Bridge 主要复用其中的 External KV metadata / hit count 思路，并将其抽取为独立 indexer 组件。
 
