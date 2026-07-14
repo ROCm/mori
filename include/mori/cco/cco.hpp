@@ -191,6 +191,12 @@ struct ccoIbgdaWin {
   uint32_t lkey;
 };
 
+#if defined(__HIP_DEVICE_COMPILE__)
+using ccoGlobalChar = char __attribute__((address_space(1)));
+#else
+using ccoGlobalChar = char;
+#endif
+
 struct ccoWindowDevice {
   // LSA flat-VA addressing (intra-node only). winBase is the window's slot in
   // the LSA-sized flat VA reservation. Peer addressing uses LSA rank, not
@@ -198,7 +204,7 @@ struct ccoWindowDevice {
   //   winBase = flatBase + slotOffset
   //   peer_va = winBase + ((uint64_t)peerLsaRank * stride4G << 32) + offset
   //   local   = winBase + ((uint64_t)lsaRank     * stride4G << 32) + offset
-  char* winBase;
+  ccoGlobalChar* winBase;
   uint32_t stride4G;  // perRankSize >> 32 (perRankSize is 4GB-aligned)
   int lsaRank;        // caller's index in the LSA team
 
@@ -583,7 +589,7 @@ struct ccoLsaBarrierSession {
     // formula here matches ccoGetLsaPeerPtr / ccoLsaBarrierHandle
     // comment (winBase + peer*stride4G<<32 + bufOffset).
     const auto& rw = comm->resourceWindow_inlined;
-    char* base = rw.winBase + ((uint64_t)owner * rw.stride4G << 32);
+    auto* base = rw.winBase + ((uint64_t)owner * rw.stride4G << 32);
     uint32_t* state = reinterpret_cast<uint32_t*>(base + handle.bufOffset);
     return state + handle.nBarriers + index * comm->lsaSize + peer;
   }
@@ -621,7 +627,7 @@ __device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop coop, cc
   // window. Use the standard LSA peer-addressing formula off the resource
   // window's own slot (winBase already = flatBase + resource window slotOffset).
   const auto& rw = comm->resourceWindow_inlined;
-  char* base = rw.winBase + ((uint64_t)comm->lsaRank * rw.stride4G << 32);
+  auto* base = rw.winBase + ((uint64_t)comm->lsaRank * rw.stride4G << 32);
   uint32_t* state = reinterpret_cast<uint32_t*>(base + h.bufOffset);
   this->epoch = state[idx];  // unicast epoch slot
 }
@@ -630,7 +636,7 @@ template <typename Coop>
 __device__ inline ccoLsaBarrierSession<Coop>::~ccoLsaBarrierSession() {
   // Persist epoch so the next session on this barrier slot resumes correctly.
   const auto& rw = this->comm->resourceWindow_inlined;
-  char* base = rw.winBase + ((uint64_t)this->comm->lsaRank * rw.stride4G << 32);
+  auto* base = rw.winBase + ((uint64_t)this->comm->lsaRank * rw.stride4G << 32);
   uint32_t* state = reinterpret_cast<uint32_t*>(base + this->handle.bufOffset);
   if (this->coop.thread_rank() == 0) {
     state[this->index] = this->epoch;  // unicast epoch slot
