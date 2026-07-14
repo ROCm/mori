@@ -21,6 +21,11 @@ enable_testing()
 
 include(GoogleTest)
 
+# Discover tests at ctest time: POST_BUILD runs each binary under the parallel
+# build, and the mori/HSA/grpc init blows past the 5s timeout -> empty JSON that
+# CMake 4.4's strict parser rejects.
+set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
+
 # ---------------------------------------------------------------------------
 # test_external_kv_block_index
 # ---------------------------------------------------------------------------
