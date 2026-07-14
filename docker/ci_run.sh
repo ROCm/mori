@@ -176,7 +176,15 @@ else
     EXTRA_ARGS+=(--ulimit nproc=100000:100000 --pids-limit=-1)
 fi
 
+# --init runs a minimal init (tini) as PID 1 so that exited child processes
+# (MPI ranks, torchrun workers, fork-mode test children) are reaped instead of
+# lingering as zombies. Unreaped zombies keep their KFD contexts — and thus
+# VRAM — alive after the owning process is gone, which is the root cause of the
+# "process exited but GPU memory still occupied" leaks on the shared runner.
+# tini also forwards SIGTERM from `docker stop` to the whole process group so
+# ranks can tear down their HIP contexts cleanly instead of being SIGKILLed.
 exec "$RUNTIME" run \
+    --init \
     --group-add video \
     --network=host \
     --device=/dev/kfd \

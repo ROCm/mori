@@ -101,5 +101,13 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
+          # Restore workspace ownership (build ran as root inside the container)
+          # while the container is still alive.
           $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
-          $CT rm -f $CONTAINER || true
+          # Gracefully stop (SIGINT -> docker stop via tini -> rm) so GPU ranks
+          # tear down their HIP/KFD contexts instead of being SIGKILLed.
+          CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
+
+      - name: Ensure VRAM is clear
+        if: always()
+        run: bash docker/ensure_vram_clear.sh || true
