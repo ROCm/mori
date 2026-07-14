@@ -621,14 +621,114 @@ std::vector<bool> RedisMasterMetadataStore::BatchExistsBlock(
 }
 
 std::map<NodeTierKey, std::vector<EvictionCandidate>>
-RedisMasterMetadataStore::EnumerateEvictionCandidates(const std::vector<NodeTierKey>&,
-                                                      EvictionOrder, size_t,
-                                                      std::chrono::system_clock::time_point) const {
-  // Phase 1: master-driven eviction (the per-(node,tier) LRU index + candidate
-  // enumeration) is Phase 2. Returning no candidates makes the eviction tick a
-  // safe no-op; the hot-path benchmark does not cross watermark. See
-  // design-redis-metadata-store.md.
-  return {};
+RedisMasterMetadataStore::EnumerateEvictionCandidates(
+    const std::vector<NodeTierKey>& buckets, EvictionOrder order, size_t max_per_bucket,
+    std::chrono::system_clock::time_point now) const {
+  std::map<NodeTierKey, std::vector<EvictionCandidate>> result;
+  if (buckets.empty()) return result;
+  ScopedStoreOp _op(metrics_, "EnumerateEvictionCandidates");
+
+  // The read hot path is untouched: eviction reuses the per-node block reverse
+  // index + the _lease/_lacc already maintained on each block hash. Candidates
+  // are enumerated per shard by kEnumerateEvictionLua and aggregated here; the
+  // ordering / per-bucket cap is applied in C++ (an eviction tick is seconds,
+  // not a hot path), mirroring the in-memory backend's scan-and-sort.
+
+  // Distinct nodes to scan, and the wanted (node, tier) pairs the script filters
+  // on (passed as ARGV pairs, so a node id may contain any byte).
+  std::vector<std::string> nodes;
+  {
+    std::unordered_set<std::string> seen;
+    for (const auto& b : buckets) {
+      if (seen.insert(b.node_id).second) nodes.push_back(b.node_id);
+    }
+  }
+  std::vector<std::string> shared_args;
+  shared_args.reserve(2 + buckets.size() * 2);
+  shared_args.push_back(std::to_string(ToEpochMs(now)));
+  shared_args.push_back(std::to_string(buckets.size()));
+  for (const auto& b : buckets) {
+    shared_args.push_back(b.node_id);
+    shared_args.push_back(std::to_string(static_cast<int>(b.tier)));
+  }
+
+  // Build the per-shard groups. split_writes() (multi-endpoint / cluster) keeps a
+  // reverse index per (node, shard) on that shard's instance/slot, so one group
+  // per shard routed to that shard. Single mode keeps one control-tag reverse
+  // index per node, so one group on the control instance.
+  redis::ShardedBatch batch;
+  auto add_group = [&](std::size_t shard, std::vector<std::string> node_block_keys) {
+    const std::size_t g = batch.keys_by_shard.size();
+    batch.orig_index_by_shard.emplace_back();
+    for (std::size_t j = 0; j < node_block_keys.size(); ++j) {
+      batch.orig_index_by_shard[g].push_back(j);  // unused (node is in each tuple)
+    }
+    batch.keys_by_shard.push_back(std::move(node_block_keys));
+    batch.shard_of_group.push_back(shard);
+  };
+  if (split_writes()) {
+    for (std::size_t s = 0; s < keys_.NumShards(); ++s) {
+      std::vector<std::string> ks;
+      ks.reserve(nodes.size());
+      for (const auto& n : nodes) ks.push_back(keys_.NodeBlocks(n, s));
+      add_group(s, std::move(ks));
+    }
+  } else {
+    std::vector<std::string> ks;
+    ks.reserve(nodes.size());
+    for (const auto& n : nodes) ks.push_back(keys_.NodeBlocks(n));
+    add_group(/*shard=*/0, std::move(ks));
+  }
+
+  // Strip "<shardtag>:block:" from a redis block key to recover the user key.
+  auto user_key_of = [](const std::string& block_key) -> std::string {
+    const size_t pos = block_key.find(":block:");
+    return pos == std::string::npos ? block_key : block_key.substr(pos + 7);
+  };
+
+  redis::RunShardedRead(
+      batch, redis::kEnumerateEvictionLua, shared_args, "EnumerateEvictionCandidates",
+      fanout_pool_.get(), /*tolerate_shard_failures=*/mode_ != Mode::kSingle, metrics_,
+      [&](size_t group) { return &client_for_shard(batch.shard_of_group[group]); },
+      [&](size_t /*orig_index*/, const RespValue& cands) {
+        if (!cands.is_array()) return;
+        // Flat 5-tuples: [block_key, node, tier, size, last_accessed_ms].
+        for (size_t j = 0; j + 5 <= cands.elements.size(); j += 5) {
+          EvictionCandidate c;
+          c.key = user_key_of(cands.elements[j].str);
+          c.location.node_id = cands.elements[j + 1].str;
+          try {
+            c.location.tier = static_cast<TierType>(std::stoi(cands.elements[j + 2].str));
+            c.location.size = std::stoull(cands.elements[j + 3].str);
+            c.last_accessed_at = FromEpochMs(std::stoll(cands.elements[j + 4].str));
+          } catch (...) {
+            continue;
+          }
+          c.size = c.location.size;
+          result[NodeTierKey{c.location.node_id, c.location.tier}].push_back(std::move(c));
+        }
+      });
+
+  // Honor the ordering hint and the per-bucket cap (same policy as in-memory).
+  const auto older_first = [](const EvictionCandidate& a, const EvictionCandidate& b) {
+    return a.last_accessed_at < b.last_accessed_at;
+  };
+  for (auto& [ntk, candidates] : result) {
+    (void)ntk;
+    const bool cap = max_per_bucket > 0 && candidates.size() > max_per_bucket;
+    if (order == EvictionOrder::kLeastRecentlyAccessed) {
+      if (cap) {
+        std::partial_sort(candidates.begin(), candidates.begin() + max_per_bucket, candidates.end(),
+                          older_first);
+        candidates.resize(max_per_bucket);
+      } else {
+        std::sort(candidates.begin(), candidates.end(), older_first);
+      }
+    } else if (cap) {
+      candidates.resize(max_per_bucket);
+    }
+  }
+  return result;
 }
 
 // =====================================================================
