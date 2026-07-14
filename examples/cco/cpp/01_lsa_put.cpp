@@ -23,7 +23,7 @@
 //
 // MIT License
 
-// CCO C++ example 01 — LSA put (intra-node, direct peer pointer)
+// CCO C++ example 01 — LSA put (direct peer pointer via flat VA)
 //
 // LSA model: cco hands the kernel the peer's load/store-accessible VA via
 // ccoGetLsaPeerPtr(); the kernel writes it *directly* — cco does NOT move the
@@ -31,8 +31,8 @@
 // the symmetric flat VA, and the window device handle already carries
 // winBase / stride4G / lsaRank.
 //
-// Rank 0 copies its send window into rank 1's recv window slot. Single node,
-// 2 ranks. Only cco.hpp is included.
+// Rank 0 copies its send window into rank 1's recv window slot (2 ranks).
+// With fabric cross-node LSA enabled, ranks may span multiple nodes.
 //
 //   mpirun -n 2 ./cco_lsa_put        (set MORI_SOCKET_IFNAME=<iface>)
 
@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &nranks);
   if (nranks != 2) {
-    if (rank == 0) fprintf(stderr, "This example needs exactly 2 ranks on one node.\n");
+    if (rank == 0) fprintf(stderr, "This example needs exactly 2 ranks.\n");
     MPI_Finalize();
     return 1;
   }
@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
 
   CCO_CHECK(ccoBarrierAll(comm));
 
-  // Rank 0 writes into rank 1's window slot (peer lsaRank = 1 on a single node).
+  // Rank 0 writes into rank 1's window slot (peer lsaRank = 1).
   if (rank == 0) {
     LsaPutKernel<<<1, 256>>>(sendWin, recvWin, /*peerLsaRank=*/1, COUNT);
     HIP_CHECK(hipDeviceSynchronize());

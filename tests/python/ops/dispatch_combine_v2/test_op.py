@@ -82,10 +82,14 @@ class Dist:
 HIDDEN = int(os.environ.get("HIDDEN", 7168))
 K = int(os.environ.get("TOPK", 8))
 EPR = int(os.environ.get("EPR", 32))
-# fp8 flavor is arch-specific: OCP e4m3 on gfx950, fnuz on gfx942.
+# fp8 flavor is arch-specific: OCP e4m3 on gfx950/gfx1250, fnuz on gfx942.
 import tuning_configs as _tc  # noqa: E402
 
-_FP8_DT = torch.float8_e4m3fn if _tc._topology()[1] == 90500 else torch.float8_e4m3fnuz
+_FP8_DT = (
+    torch.float8_e4m3fn
+    if _tc._topology()[1] in (90500, 120500)
+    else torch.float8_e4m3fnuz
+)
 DTYPE = {
     "bf16": torch.bfloat16,
     "f32": torch.float32,
