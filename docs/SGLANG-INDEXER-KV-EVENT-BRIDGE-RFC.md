@@ -113,11 +113,11 @@ ZMQ message
 
 ### 错误处理
 
-Bridge 对事件流采用 best-effort 同步模型。ZMQ 暂时无消息时不视为错误；decode 失败、unknown medium、sequence gap 和 indexer RPC 失败都会进入统计。`AllBlocksCleared` 需要尽量收敛 metadata，因此应对 revoke-all 做有限重试，失败后保留错误计数，交给上层监控或后续补偿流程处理。
+Bridge 对事件流采用 best-effort 同步模型。ZMQ 暂时无消息时不视为错误；decode 失败、unknown medium、sequence gap 和 indexer RPC 失败都会进入统计。
 
 ## Indexer RPC API 设计
 
-`SglangIndexKvEventBridge` 调用的是 indexer 的 External KV metadata API。这组 API 通过 protobuf / gRPC 暴露在 indexer service 中；在本 RFC 中可以把这组接口理解为 indexer RPC API。它们只维护 placement metadata，不代表 indexer 拥有 KV bytes。
+`SglangIndexKvEventBridge` 调用的是 indexer 的 External KV metadata API。这组 API 通过 protobuf / gRPC 暴露在 indexer service 中；在本 RFC 中可以把这组接口理解为 indexer RPC API。
 
 ### API 概览
 
@@ -151,17 +151,9 @@ External KV placement index 可以抽象为 `hash -> node_id -> set<tier>`。因
 
 Hit count 单独维护为 `hash -> hit_count_total`。只有 `match_external_kv(..., count_as_hit=True)` 且实际命中的 hash 才会增加计数；未命中的 hash 不计数，查询时也不会返回空记录。
 
-### Server 行为
+### 实现边界
 
-| RPC | 行为摘要 |
-| --- | --- |
-| `ReportExternalKvBlocks` | 校验 `node_id` 和 `hashes`，写入 External KV placement index |
-| `RevokeExternalKvBlocks` | 删除指定 `(hash, node_id, tier)` |
-| `RevokeAllExternalKvBlocksAtTier` | 删除该 node 在指定 tier 的全部 external KV placement |
-| `MatchExternalKv` | 查询 placement index，补充 alive peer 的 `peer_address`，必要时累加 hit count |
-| `GetExternalKvHitCounts` | 查询 hit index，并限制单次查询 batch 大小 |
-
-这组 RPC 与 indexer-owned data-plane API 分离。`PublishLocalBlock`、`Put`、`RouteGet`、`ResolveKey` 表示 indexer-owned KV 数据路径；External KV RPC 只表示外部系统持有 KV bytes，indexer 记录可用于调度的 metadata。
+External KV RPC 只更新和查询 indexer 的 metadata index，不进入 data-plane 路径。`report` / `revoke` 更新 placement，`match` 查询 placement，`get_external_kv_hit_counts` 查询命中统计。
 
 ## Indexer 编程实现语言选择
 
