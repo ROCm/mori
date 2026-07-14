@@ -62,6 +62,7 @@ std::string DeviceBdfLower(int hipDevice) {
 }  // namespace
 
 bool DeviceSupportsFabric(int hipDevice) {
+#if HIP_VERSION >= 71400000
   int vmm = 0;
   int fabric = 0;
   hipError_t err =
@@ -76,6 +77,10 @@ bool DeviceSupportsFabric(int hipDevice) {
     return false;
   }
   return vmm != 0 && fabric != 0;
+#else
+  (void)hipDevice;
+  return false;
+#endif
 }
 
 VpodKey ReadVpodKey(int hipDevice) {
