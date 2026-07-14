@@ -680,18 +680,16 @@ def make_combine(
             expert_valids = []
             expert_pes = []
             expert_toks = []
+            encoded_my = buffer_load(
+                rsrc_tok_map, tok_map_base + lane, vec_width=1, dtype=T.i32()
+            )
             for k_slot in range_constexpr(experts_per_token):
-                encoded_k = buffer_load(
-                    rsrc_tok_map, tok_map_base + k_slot, vec_width=1, dtype=T.i32()
-                )
-                dest_pe_k = encoded_k // max_recv  # sentinel: dest_pe == npes
-                dest_tok_k = encoded_k % max_recv  # peer-local recv slot
+                encoded_k = readlane(T.i32(), encoded_my, k_slot)
+                dest_pe_k = encoded_k // max_recv
+                dest_tok_k = encoded_k % max_recv
                 valid_k = dest_pe_k < npes
                 safe_pe = arith.select(valid_k, dest_pe_k, arith.constant(rank))
                 safe_tok_k = arith.select(valid_k, dest_tok_k, arith.constant(0))
-                # Remote base peer[dest_pe].out_tok[dest_tok]; gather via global
-                # loads (no per-expert buffer descriptor) to keep all K loads in
-                # flight — see P.load_i32_nt.
                 slot_addr = fx.Int64(window.lsa_ptr(safe_pe, off_out_tok)) + fx.Int64(
                     safe_tok_k
                 ) * fx.Int64(nbytes)
