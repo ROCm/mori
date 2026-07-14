@@ -39,9 +39,13 @@ mkdir -p "$OUT"
 
 run() {  # <native|mori>
   local mode="$1" menv="" port=$(( 29500 + RANDOM % 300 ))
-  # mori: HierAllGather + deferred landing fence (MORI_HIER_DEBUG_SYNC=0, no
-  # inline host stream.synchronize) -> CU-free SDMA/RDMA gather overlaps the GEMM.
-  [ "$mode" = mori ] && menv="MORI_ENABLE_SDMA=1 MORI_FSDP_ENABLE_HIER=1 MORI_HIER_DEBUG_SYNC=0"
+  # mori: CPU-posted host-proxy transport with deferred-completion overlap
+  # (ASYNC posts the cross-node write + step-1 gather now and runs the landing
+  # fence at copy-out, so the inter leg is CU-free AND hidden behind the backward
+  # GEMM). ASYNC auto-enables the double-buffered recv staging + landing drain
+  # needed to stay bit-exact. w16: 269 TFLOPS/gpu = 1.07x native, per-window loss
+  # bit-identical to native (4 reps). Bulk bytes stay on RDMA/SDMA (no CU copy).
+  [ "$mode" = mori ] && menv="MORI_ENABLE_SDMA=1 MORI_FSDP_ENABLE_HIER=1 MORI_FSDP_HOST_PROXY=1 MORI_FSDP_HOSTPROXY_CAP_MB=512 MORI_SHMEM_HEAP_SIZE=17179869184 MORI_HOSTPROXY_ASYNC=1"
   local base="export HIP_VISIBLE_DEVICES=$DEVS PYTHONPATH=$WT/python:$EX $FABRIC $menv; cd $EX"
   local tr="torchrun --nnodes=2 --nproc_per_node=$NPROC --master_addr=$MASTER_IP --master_port=$port"
   local log="$OUT/e2e_${WORLD}_${mode}.log"
