@@ -107,7 +107,3 @@ jobs:
           # Gracefully stop (SIGINT -> docker stop via tini -> rm) so GPU ranks
           # tear down their HIP/KFD contexts instead of being SIGKILLed.
           CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
-
-      - name: Ensure VRAM is clear
-        if: always()
-        run: bash docker/ensure_vram_clear.sh || true
