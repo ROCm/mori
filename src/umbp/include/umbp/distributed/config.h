@@ -148,6 +148,14 @@ struct PoolClientConfig {
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;
 
+  // See UMBPDistributedConfig's field of the same name: hugepage-backed
+  // allocation for the RDMA staging buffer, with automatic fallback to
+  // anonymous pages if hugepages aren't available.
+  bool staging_buffer_use_hugepages = true;
+  size_t staging_buffer_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+  int staging_buffer_numa_node = -1;                         // -1 = no NUMA binding
+  bool staging_buffer_prefault = true;
+
   // SSD read-staging tuning (peer side).  More slots reduce NO_SLOT under large
   // concurrent prefetch batches, but shrink per-slot size (= staging_buffer_size
   // / slots), which must stay >= the largest single SSD block.  The lease TTL
@@ -197,6 +205,10 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;
   pc.staging_buffer_size = dc.staging_buffer_size;
+  pc.staging_buffer_use_hugepages = dc.staging_buffer_use_hugepages;
+  pc.staging_buffer_hugepage_size = dc.staging_buffer_hugepage_size;
+  pc.staging_buffer_numa_node = dc.staging_buffer_numa_node;
+  pc.staging_buffer_prefault = dc.staging_buffer_prefault;
   pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
   pc.peer_service_port = dc.peer_service_port;

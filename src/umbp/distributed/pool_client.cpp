@@ -411,10 +411,30 @@ bool PoolClient::Init() {
     // by every IO backend user; no UMBP-specific entry points.
     io_engine_->CreateBackend(mori::io::BackendType::RDMA, rdma_cfg);
 
-    staging_buffer_ = std::make_unique<char[]>(config_.staging_buffer_size);
-    std::memset(staging_buffer_.get(), 0, config_.staging_buffer_size);
-    staging_mem_ = io_engine_->RegisterMemory(staging_buffer_.get(), config_.staging_buffer_size,
-                                              -1, mori::io::MemoryLocationType::CPU);
+    HostMemAllocator staging_allocator;
+    HostBufferOptions staging_opts;
+    staging_opts.backing = config_.staging_buffer_use_hugepages
+                               ? HostBufferBacking::kAnonymousHugetlb
+                               : HostBufferBacking::kAnonymous;
+    staging_opts.hugepage_size = config_.staging_buffer_hugepage_size;
+    staging_opts.numa_node = config_.staging_buffer_numa_node;
+    staging_opts.prefault = config_.staging_buffer_prefault;
+    staging_buffer_handle_ = staging_allocator.Alloc(config_.staging_buffer_size, staging_opts);
+    if (!staging_buffer_handle_.valid()) {
+      MORI_UMBP_ERROR("[PoolClient] Init: failed to allocate {}-byte staging buffer",
+                      config_.staging_buffer_size);
+      initialized_ = false;
+      return false;
+    }
+    staging_buffer_ = static_cast<char*>(staging_buffer_handle_.ptr);
+    MORI_UMBP_INFO("[PoolClient] staging buffer allocated: size={} mapped_size={} backing={}",
+                   config_.staging_buffer_size, staging_buffer_handle_.mapped_size,
+                   staging_buffer_handle_.actual_backing == HostBufferBacking::kAnonymousHugetlb
+                       ? "hugetlb"
+                       : "anonymous");
+    std::memset(staging_buffer_, 0, config_.staging_buffer_size);
+    staging_mem_ = io_engine_->RegisterMemory(staging_buffer_, config_.staging_buffer_size, -1,
+                                              mori::io::MemoryLocationType::CPU);
 
     for (const auto& dram : config_.dram_buffers) {
       if (dram.buffer && dram.size > 0) {
@@ -585,7 +605,8 @@ void PoolClient::Shutdown() {
     for (auto& mem : export_dram_mems_) io_engine_->DeregisterMemory(mem);
     export_dram_mems_.clear();
     io_engine_.reset();
-    staging_buffer_.reset();
+    HostMemAllocator().Free(staging_buffer_handle_);
+    staging_buffer_ = nullptr;
   }
 
   master_client_.reset();
@@ -1086,7 +1107,7 @@ std::unique_ptr<PoolClient::RemoteDramPutInFlight> PoolClient::SubmitRemoteBatch
         entry.failed = true;
         continue;
       }
-      std::memcpy(staging_buffer_.get() + entry.staging_offset, entry.item->src, entry.item->size);
+      std::memcpy(staging_buffer_ + entry.staging_offset, entry.item->src, entry.item->size);
     }
   }
 
@@ -1760,7 +1781,7 @@ void PoolClient::WaitRemoteBatchGet(RemoteDramGetInFlight& f, std::vector<bool>*
         entry.failed = true;
         continue;
       }
-      std::memcpy(entry.item->dst, staging_buffer_.get() + entry.staging_offset, entry.item->size);
+      std::memcpy(entry.item->dst, staging_buffer_ + entry.staging_offset, entry.item->size);
     }
     f.staging_lock.unlock();
   }
@@ -2100,7 +2121,7 @@ bool PoolClient::RemoteDramScatterWrite(PeerConnection& peer,
   if (!used_zero_copy) {
     if (size > config_.staging_buffer_size) return false;
     staging_lock.lock();
-    std::memcpy(staging_buffer_.get(), src, size);
+    std::memcpy(staging_buffer_, src, size);
     local_mem = staging_mem_;
     local_base_offset = 0;
   }
@@ -2224,7 +2245,7 @@ bool PoolClient::RemoteDramScatterRead(PeerConnection& peer, const std::vector<P
     if (!s.Succeeded()) all_ok = false;
   }
   if (!all_ok) return false;
-  if (!used_zero_copy) std::memcpy(dst, staging_buffer_.get(), size);
+  if (!used_zero_copy) std::memcpy(dst, staging_buffer_, size);
   return true;
 }
 
@@ -2402,7 +2423,7 @@ PoolClient::SsdGetOutcome PoolClient::RemoteSsdReadOnce(PeerConnection& peer,
                      uid);
     status.Wait();
     if (status.Succeeded()) {
-      std::memcpy(dst, staging_buffer_.get(), size);
+      std::memcpy(dst, staging_buffer_, size);
       rdma_ok = true;
     }
   }

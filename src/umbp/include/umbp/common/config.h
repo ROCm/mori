@@ -192,6 +192,18 @@ struct UMBPDistributedConfig {
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
 
+  // Host memory backing for the RDMA staging buffer. Some RDMA NICs (e.g.
+  // ionic/Pensando) have been observed to reject ibv_reg_mr for large
+  // anonymous-page regions (EINVAL); hugepage-backed allocations shrink the
+  // MR's page-table footprint and register more reliably at larger sizes.
+  // Falls back to anonymous pages automatically if hugepages are unavailable
+  // (see HostMemAllocator). Mirrors UMBPDramConfig's
+  // use_hugepages/hugepage_size/numa_node/prefault knobs.
+  bool staging_buffer_use_hugepages = true;
+  size_t staging_buffer_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+  int staging_buffer_numa_node = -1;                         // -1 = no NUMA binding
+  bool staging_buffer_prefault = true;
+
   // Dedicated SSD read staging, allocated only when ssd.enabled. Per-slot
   // (this / ssd_staging_buffer_slots) must be >= the largest single-key page KV
   // (61-layer MLA page ~= 4.5 MB).

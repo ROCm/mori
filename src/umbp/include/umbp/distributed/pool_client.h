@@ -37,6 +37,7 @@
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/types.h"
+#include "umbp/local/host_mem_allocator.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -177,7 +178,11 @@ class PoolClient {
   std::unique_ptr<mori::io::IOEngine> io_engine_;
   mori::io::MemoryDesc staging_mem_{};
   std::vector<mori::io::MemoryDesc> export_dram_mems_;
-  std::unique_ptr<char[]> staging_buffer_;
+  // Backing allocation for staging_buffer_; owns the mapping (possibly
+  // hugepage-backed, see PoolClientConfig::staging_buffer_use_hugepages) and
+  // is released via HostMemAllocator::Free in Shutdown.
+  HostBufferHandle staging_buffer_handle_;
+  char* staging_buffer_ = nullptr;
   std::mutex staging_mutex_;
 
   std::unique_ptr<char[]> ssd_staging_buffer_;
