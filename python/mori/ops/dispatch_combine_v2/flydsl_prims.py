@@ -156,11 +156,12 @@ def _V4I32():
 
 def load_v4i32_nt(base_i64, offset):
     """Non-temporal global vec4 i32 load at base + offset*4 (addrspace 1).
-    Returns vector<4xi32> (16 bytes, codegen: global_load_dwordx4).
-    offset is in i32 units; caller must ensure 16-byte alignment."""
+    Returns vector<4xi32> (16 bytes, codegen: global_load_dwordx4). offset is in
+    i32 units; alignment=4 since the caller's per-warp offset is only 4B-aligned
+    (AMDGPU emits dwordx4 for a 4B-aligned global vector load)."""
     addr = _addr_plus(base_i64, offset, 4)
     gptr = _llvm_d.IntToPtrOp(_llvm_d.PointerType.get(address_space=1), addr).result
-    return _llvm_d.LoadOp(_V4I32(), gptr, alignment=16, nontemporal=True).res
+    return _llvm_d.LoadOp(_V4I32(), gptr, alignment=4, nontemporal=True).res
 
 
 def _spin(addr_i64, keep_waiting):
