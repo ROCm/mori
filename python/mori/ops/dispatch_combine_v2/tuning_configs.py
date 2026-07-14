@@ -94,34 +94,50 @@ _MI325X_TABLE = {
 _MI300X_DEFAULT = None  # None => derive from CU count (see _cu_scaled_default)
 _MI300X_TABLE = {}
 
-# ── MI355X (gfx950, 256 CU) — measured 2026-07-08, EP8, fine block x warp sweep.
-# dispatch: warp 8 throughout (warp 16 worse); block 128 (<=2048) / 192 (>=4096).
-# combine : warp 4; block 128 (>=256), 48 for <=64 tok (small blocks win at tiny
-#           batches; 256 blocks are worse — unlike MI308X's ~1 block/CU).
-# fp8-dispatch + bf16-combine schedule (also the fallback for bf16/untuned dtypes):
-_MI355X_SCHED_FP8 = (
-    (64, 128, 8, 48, 8),
-    (2048, 128, 8, 128, 4),
-    (None, 192, 8, 128, 4),
+# ── MI355X (gfx950, wave64) — re-tuned 2026-07-13 for the vec4 combine gather,
+# EP8, 8x gfx950 single-node xGMI, 2-pass block x warp sweep (tok 8..8192). vec4
+# combine wants a small block (32-48) + warp up to 16; dispatch grows block 96->160.
+# wave64 => warp <= 16 (1024-thread block). Geometry is topk-independent.
+# bf16 dispatch + bf16 combine:
+_MI355X_SCHED_BF16 = (
+    (128, 128, 8, 32, 8),
+    (256, 96, 8, 64, 8),
+    (1024, 96, 8, 32, 16),
+    (4096, 160, 8, 32, 16),
+    (None, 128, 16, 48, 16),
 )
-# fp4 dispatch + fp4 combine (data_type=fp4 does both) — measured 2026-07-09 via a
-# 2D block x warp sweep on MI355X (DTYPE=fp4). fp4 = 0.5 B/elem, so both phases are
-# less bandwidth-bound than fp8: dispatch block 128 throughout (warp 4 <=2048,
-# 8 >=4096); combine small block at small tok (64/8 <=256), 128/4 mid, 128/8 large.
+# fp8 dispatch + bf16 combine (combine geometry shared with bf16):
+_MI355X_SCHED_FP8 = (
+    (128, 128, 8, 32, 8),
+    (256, 160, 8, 64, 8),
+    (1024, 128, 8, 32, 16),
+    (4096, 160, 8, 32, 16),
+    (None, 128, 16, 48, 16),
+)
+# fp4 dispatch + fp4 combine (0.5 B/elem):
 _MI355X_SCHED_FP4 = (
-    (256, 128, 4, 64, 8),
-    (2048, 128, 4, 128, 4),
-    (None, 128, 8, 128, 8),
+    (256, 128, 4, 32, 8),
+    (2048, 144, 4, 64, 16),
+    (None, 128, 8, 64, 16),
 )
 _MI355X_DEFAULT = dict(
-    dispatch_block_num=192,
-    combine_block_num=128,
-    warp_num_per_block=8,
-    combine_warp_num_per_block=4,
-    schedule=_MI355X_SCHED_FP8,
+    dispatch_block_num=128,
+    combine_block_num=48,
+    warp_num_per_block=16,
+    combine_warp_num_per_block=16,
+    schedule=_MI355X_SCHED_BF16,
 )
 _MI355X_TABLE = {
-    (8, 7168, 8): {"fp8": _MI355X_SCHED_FP8, "fp4": _MI355X_SCHED_FP4},
+    (8, 7168, 8): {
+        "bf16": _MI355X_SCHED_BF16,
+        "fp8": _MI355X_SCHED_FP8,
+        "fp4": _MI355X_SCHED_FP4,
+    },
+    (8, 7168, 6): {
+        "bf16": _MI355X_SCHED_BF16,
+        "fp8": _MI355X_SCHED_FP8,
+        "fp4": _MI355X_SCHED_FP4,
+    },
 }
 
 # ── gfx1250 (256 CU, wave32) — measured 2026-07-11, EP4, bf16, full block x warp
