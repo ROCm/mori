@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RES = os.path.normpath(os.path.join(HERE, "..", "results"))
+RES = os.path.normpath(os.path.join(HERE, "..", "results", "mi300x_mlx5"))
 HW = "MI300X, mlx5 RoCEv2, world=16 (2 nodes x 8 GPU)"
 
 
