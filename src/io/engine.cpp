@@ -402,7 +402,8 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
     return nullptr;
   }
 
-  RouteCacheKey routeKey{remote.engineKey, local.loc, remote.loc, local.deviceId, remote.deviceId};
+  RouteCacheKey routeKey{remote.engineKey, local.loc, remote.loc, local.deviceId,
+                         remote.deviceId,  local.id,  remote.id};
 
   if (auto cachedType = QueryRouteCache(routeKey); cachedType.has_value()) {
     auto cachedBackend = backends.find(cachedType.value());
