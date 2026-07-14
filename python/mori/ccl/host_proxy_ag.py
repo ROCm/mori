@@ -309,7 +309,35 @@ class HostProxyHierAllGather:
                 self._sdma.call_direct(inp_1d, out_full, count, block_off_elems, stream,
                                        host_sync=self._sdma_direct_hostsync)
             else:
-                self._sdma(inp_1d, out_block_1d, count, stream)
+                # The non-direct sub-group gather's default prepare_sync/finish_sync
+                # each issue a WORLD host ShmemBarrierAll (runtime.cpp:218 -> the mori
+                # socket-bootstrap TCP recursive-doubling barrier). Driven per-AG on
+                # this hot path -- thousands of times per training step -- that host
+                # barrier is both slow (~84 vs ~160 tflops/gpu for the NCCL leg) and
+                # FRAGILE: it reproducibly fails ("Barrier operation failed") at ~step
+                # 15 of the E2E, the second defect behind the SDMA-intra hang (the NCCL
+                # leg at line below uses dist.all_gather with no such barrier and runs
+                # 60 steps clean). The barrier's only job is inter-op ordering on the
+                # shared transit ``out_``, and the gather involves ONLY this node's
+                # sub-group -- a WORLD barrier is both wrong-scope and needlessly on the
+                # fragile bootstrap channel. Replace it 1:1 with a NODE-LOCAL barrier on
+                # the robust torch PG (self._intra_group, the 8 same-node ranks): the
+                # entry barrier frees every peer's ``out_`` from the previous op, the
+                # exit barrier ensures all peers finished pushing before copy-out. Both
+                # are node-local invariants, so the data path is byte-for-byte unchanged
+                # (prepare_sync(barrier=False) only skips the ShmemBarrierAll; the
+                # monotonic flag token, arg setup and copy-out are untouched).
+                #
+                # ONE barrier per AG suffices: this EXIT barrier fires after finish_sync
+                # (which stream-syncs this rank's copy-out of out_), so once all 8 peers
+                # pass it every rank has copied out this op -> the NEXT op's pushes into
+                # out_ are safe with NO separate entry barrier (the first op needs none:
+                # out_ is freshly allocated). Halving the per-AG host-barrier count keeps
+                # the SDMA leg off the critical path (perf, rule 2) while preserving the
+                # inter-op ordering invariant.
+                self._sdma(inp_1d, out_block_1d, count, stream,
+                           barrier=False, prepare_barrier=False)
+                dist.barrier(group=self._intra_group)
         else:
             dist.all_gather(out_slots, inp_1d, group=self._intra_group)
 

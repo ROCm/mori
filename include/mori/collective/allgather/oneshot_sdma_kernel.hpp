@@ -30,6 +30,35 @@
 
 namespace mori {
 namespace collective {
+
+// Correctly-indexed SDMA completion drain for the sub-group SDMA gathers.
+//
+// ROOT CAUSE of the MORI_HOSTPROXY_SDMA_INTRA torn-bytes / "Slow wait for
+// sub-group pos" hang: SubGroupSdmaDrainPe(pe, dest) indexes the per-PE SDMA
+// signal / handle arrays with `pe % 8` (shmem_sdma_kernels.hpp), but those arrays
+// are allocated worldSize*sdmaNumQueue and indexed by the GLOBAL pe -- the PUT
+// side here uses `remotePe * nq` (see SdmaPutThread call sites) and
+// symmetric_memory.cpp:261 stores each peer's handles at `dstPe * numQ` where
+// dstPe is the global pe ("indexing uses pe*numQ where pe ranges 0..worldSize-1;
+// using sdmaPeers.size causes buffer overflow"). For the 2nd+ node (peBase>=8)
+// `pe % 8` drains slots [0,8) which are ZEROED (only same-node peer slots are
+// armed), so the drain returns WITHOUT waiting for the real SDMA completion and
+// the subsequent flag AMO fires before the pushed bytes have landed => the
+// receiver observes the flag but reads torn/stale data (NaN/loss-drift, or the
+// timing case where a flag is never seen = the reported hang).
+//
+// This helper drains the GLOBAL-pe slots, matching the PUT side exactly. It is
+// BYTE-IDENTICAL to the old path for any pe < 8 (pe % 8 == pe), i.e. every
+// single-node run and node 0 of any multi-node run are unchanged -- so the
+// device-ibgda path (MOTIVATION_RULES rule 3) cannot regress; only the
+// previously-broken peBase>=8 drain is corrected.
+__device__ __forceinline__ void SubGroupSdmaDrainPe(int pe,
+                                                    const application::SymmMemObjPtr dest) {
+  const uint32_t nq = dest->sdmaNumQueue;
+  core::SdmaQueitThread(dest->signalPtrs + static_cast<size_t>(pe) * nq,
+                        dest->expectSignalsPtr + static_cast<size_t>(pe) * nq, nq);
+}
+
 template <typename T>
 __device__ void OneShotAllGatherSdmaKernel_body(int myPe, int npes, T* input,
                                                 const application::SymmMemObjPtr srcMemObj,
@@ -84,7 +113,7 @@ __device__ void OneShotAllGatherSdmaKernel_body(int myPe, int npes, T* input,
 
   if (warpId < npes && laneId == 0) {
     int remotePe = warpId;
-    shmem::ShmemQuietThread(remotePe, dstMemObj);
+    SubGroupSdmaDrainPe(remotePe, dstMemObj);
     shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
         flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flagVal, 8,
         core::atomicType::AMO_SET, remotePe, 0);
@@ -1085,7 +1114,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
       HSAuint64* sig = dest->signalPtrs + selfPe * nq;
       HSAuint64* esig = dest->expectSignalsPtr + selfPe * nq;
       core::SdmaPutThread(myIn, localOut + selfOff, bytesPerPeer, dh, sig, esig, nq, 0, 1);
-      shmem::ShmemQuietThread(selfPe, dest);
+      SubGroupSdmaDrainPe(selfPe, dest);
     }
     __syncthreads();
     if (threadLinearId == 0) __threadfence_system();
@@ -1124,7 +1153,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
     // (5) drain own pull queues (self-completion; no cross-node landing flag needed).
     if (warpId < groupSize && warpId != groupPos && laneId == 0) {
       int remotePe = peBase + warpId * peStride;
-      shmem::ShmemQuietThread(remotePe, dest);
+      SubGroupSdmaDrainPe(remotePe, dest);
     }
     __syncthreads();
     if (threadLinearId == 0) __threadfence_system();
@@ -1207,7 +1236,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
       }
       __syncthreads();
       if (warpId < H - 1 && laneId == 0 && a1pos >= 0) {
-        shmem::ShmemQuietThread(peBase + a1pos * peStride, dest);
+        SubGroupSdmaDrainPe(peBase + a1pos * peStride, dest);
       }
       __syncthreads();
       if (threadLinearId == 0) __threadfence_system();
@@ -1247,7 +1276,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
               core::SdmaPutThread(outBuf + off, peerBase + off, bytesPerPeer, dh, sig, esig, nq, 0);
             }
           }
-          shmem::ShmemQuietThread(remotePe, dest);
+          SubGroupSdmaDrainPe(remotePe, dest);
         }
         __syncthreads();
         if (threadLinearId == 0) __threadfence_system();
@@ -1291,7 +1320,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
               core::SdmaPutThread(outBuf + off, peerBase + off, bytesPerPeer, dh, sig, esig, nq, 0);
             }
           }
-          shmem::ShmemQuietThread(remotePe, dest);
+          SubGroupSdmaDrainPe(remotePe, dest);
         }
         __syncthreads();
         if (threadLinearId == 0) __threadfence_system();
@@ -1370,7 +1399,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
       // queue-1 signal-counter liveness hazard (see ccl_kernels.hip reasm qId note), so
       // this variant is disabled by default.
       if (warpId <= H && laneId == 0 && p1pos >= 0) {
-        shmem::ShmemQuietThread(peBase + p1pos * peStride, dest);
+        SubGroupSdmaDrainPe(peBase + p1pos * peStride, dest);
       }
       __syncthreads();
       if (threadLinearId == 0) __threadfence_system();
@@ -1401,7 +1430,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
       }
       __syncthreads();
       if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
-        shmem::ShmemQuietThread(peBase + p2pos * peStride, dest);
+        SubGroupSdmaDrainPe(peBase + p2pos * peStride, dest);
       }
       __syncthreads();
       if (threadLinearId == 0) __threadfence_system();
@@ -1417,7 +1446,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
       // H peer targets (self carries no flag: the final wait skips groupPos), local-wait
       // partner shard, fence, then phase 2.
       if (warpId <= H && laneId == 0 && p1pos >= 0) {
-        shmem::ShmemQuietThread(peBase + p1pos * peStride, dest);
+        SubGroupSdmaDrainPe(peBase + p1pos * peStride, dest);
       }
       __syncthreads();
       if (threadLinearId == 0) __threadfence_system();
@@ -1450,7 +1479,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
       }
       __syncthreads();
       if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
-        shmem::ShmemQuietThread(peBase + p2pos * peStride, dest);
+        SubGroupSdmaDrainPe(peBase + p2pos * peStride, dest);
       }
       __syncthreads();
       if (threadLinearId == 0) __threadfence_system();
@@ -1538,7 +1567,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
       // ---- DRAIN wave ph to completion BEFORE the next wave submits ----
       if (warpId < groupSize && laneId == 0 && myPhase == ph) {
         int remotePe = peBase + warpId * peStride;
-        shmem::ShmemQuietThread(remotePe, dest);
+        SubGroupSdmaDrainPe(remotePe, dest);
       }
       __syncthreads();
       if (threadLinearId == 0) __threadfence_system();
@@ -1630,7 +1659,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
   if (!qFlagActive && !batchFenceActive && !h2x4Active && !intra2Active && warpId >= pLo &&
       warpId < pHi && laneId == 0) {
     int remotePe = peBase + warpId * peStride;
-    shmem::ShmemQuietThread(remotePe, dstMemObj);
+    SubGroupSdmaDrainPe(remotePe, dstMemObj);
     // Sender-side completion fence: ShmemQuietThread drains the SDMA submission queue,
     // but the peer-visible ordering of the raw SDMA data writes vs the subsequent flag
     // AMO is not otherwise guaranteed at system scope. Without it the receiver can
@@ -1650,7 +1679,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
     // drains and before all AMOs).
     if (warpId < groupSize && laneId == 0) {
       int remotePe = peBase + warpId * peStride;
-      shmem::ShmemQuietThread(remotePe, dstMemObj);
+      SubGroupSdmaDrainPe(remotePe, dstMemObj);
     }
     __syncthreads();
     if (threadLinearId == 0) __threadfence_system();
@@ -2120,7 +2149,7 @@ __device__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_body(
 
   if (warpId < groupSize && laneId == 0) {
     int remotePe = peBase + warpId * peStride;
-    shmem::ShmemQuietThread(remotePe, dstMemObj);
+    SubGroupSdmaDrainPe(remotePe, dstMemObj);
     shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
         flagsMemObj, static_cast<size_t>(groupPos) * sizeof(uint64_t), &flagVal, 8,
         core::atomicType::AMO_SET, remotePe, 0);
@@ -2202,7 +2231,7 @@ __device__ void OneShotBroadcastSdmaSubGroupKernel_body(
       HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
       core::SdmaPutThread(srcPtr, dstPtr, bytesTotal, devicehandles, signals, expectedSignals,
                           dest->sdmaNumQueue, 0);
-      shmem::ShmemQuietThread(remotePe, dstMemObj);
+      SubGroupSdmaDrainPe(remotePe, dstMemObj);
       shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
           flagsMemObj, 0, &flagVal, 8, core::atomicType::AMO_SET, remotePe, 0);
     }
@@ -2276,7 +2305,7 @@ __device__ void OneShotAllGatherSdmaParamContiguousKernel_body(
 
   if (warpId < npes && laneId == 0) {
     int remotePe = warpId;
-    shmem::ShmemQuietThread(remotePe, dstMemObj);
+    SubGroupSdmaDrainPe(remotePe, dstMemObj);
     shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
         flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flagVal, 8,
         core::atomicType::AMO_SET, remotePe, 0);

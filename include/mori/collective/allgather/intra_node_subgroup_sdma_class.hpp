@@ -208,6 +208,18 @@ class IntraNodeSubGroupAllgatherSdma {
   }
 
   ~IntraNodeSubGroupAllgatherSdma() {
+    // TEARDOWN-ORDERING GUARD. This handle is owned (via HostProxyHierAllGather /
+    // MoriAllGather) by Python, whose GC destroys it at interpreter shutdown --
+    // which, in the FSDP bench, runs AFTER bench.py's shmem_finalize(). Once the
+    // runtime is finalized every ShmemFree hits CheckStatusValid()'s assert(false)
+    // -> SIGABRT on all ranks (observed only on the SDMA_INTRA path, the only one
+    // that constructs this handle; the non-SDMA host-proxy path and device-ibgda
+    // never build it). If shmem is already gone the symmetric heap it owned has
+    // been reclaimed by finalize, so skipping the free is correct (at worst a
+    // benign leak in a process that is exiting anyway). This is TEARDOWN-ONLY:
+    // during operation shmem is always initialized, so the free path is
+    // byte-for-byte unchanged -- no effect on any live gather or on device-ibgda.
+    if (!shmem::ShmemIsInitialized()) return;
     if (out_) shmem::ShmemFree(out_);
     if (flags_) shmem::ShmemFree(flags_);
   }
