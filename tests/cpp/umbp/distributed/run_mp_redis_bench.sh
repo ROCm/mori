@@ -49,6 +49,12 @@ SHARD_URIS="${SHARD_URIS:-}"
 PROCS="${PROCS:-8}"; CLIENTS="${CLIENTS:-2}"
 ROUNDS="${ROUNDS:-300}"; WARMUP="${WARMUP:-20}"; BATCH="${BATCH:-32}"
 GAP="${GAP:-0}"; GETMODE="${GETMODE:-both}"; KEYSPACE="${KEYSPACE:-4096}"
+# External-KV knobs (default off). EXT_KV=1 also drives ReportExternalKvBlocks +
+# MatchExternalKv through the full Router/gRPC path. EXT_KV_ONLY=1 exercises ONLY
+# those two (skips BatchPut/Get + RDMA) so the backend comparison is on the extkv
+# hot path alone. EXT_KV_COUNT_AS_HIT=1 (default) makes MatchExternalKv perform
+# the real per-hash hit-count write, as the production route/prefix path does.
+EXT_KV="${EXT_KV:-0}"; EXT_KV_ONLY="${EXT_KV_ONLY:-0}"; EXT_KV_COUNT_AS_HIT="${EXT_KV_COUNT_AS_HIT:-1}"
 PORT="${PORT:-15560}"; METRICS="${METRICS:-9092}"
 OUT="${OUT:-./mp_redis_out}"
 
@@ -60,7 +66,17 @@ if [[ ! -x "$BIN" ]]; then echo "ERROR: bench not built: $BIN (build with USE_RE
 mkdir -p "$OUT"; ulimit -n 1048576 2>/dev/null || true
 export MORI_IO_QP_MAX_SEND_WR="${MORI_IO_QP_MAX_SEND_WR:-1024}"
 HOSTIP="$(hostname -i 2>/dev/null | awk '{print $1}')"; HOSTIP="${HOSTIP:-127.0.0.1}"
-LABEL="${BACKEND}_p${PROCS}c${CLIENTS}_gap${GAP}_${GETMODE}"
+# External-KV client args (appended to every client process launch).
+EXTKV_ARGS=""
+EXTKV_TAG=""
+if [[ "$EXT_KV_ONLY" == "1" ]]; then
+  EXTKV_ARGS="--ext-kv-only --ext-kv-count-as-hit ${EXT_KV_COUNT_AS_HIT}"
+  EXTKV_TAG="_extkvonly"
+elif [[ "$EXT_KV" == "1" ]]; then
+  EXTKV_ARGS="--with-external-kv --ext-kv-count-as-hit ${EXT_KV_COUNT_AS_HIT}"
+  EXTKV_TAG="_extkv"
+fi
+LABEL="${BACKEND}_p${PROCS}c${CLIENTS}_gap${GAP}_${GETMODE}${EXTKV_TAG}"
 echo "=== ${LABEL}: total_clients=$((PROCS*CLIENTS)) backend=${BACKEND} redis=${REDIS_URI} ==="
 
 # ---- start standalone master ----
@@ -91,7 +107,7 @@ for p in $(seq 0 $((PROCS-1))); do
          --node-id-prefix "p${p}-" --node-address "$HOSTIP" \
          --clients "$CLIENTS" --rounds "$ROUNDS" --warmup-rounds "$WARMUP" --batch "$BATCH" \
          --key-space "$KEYSPACE" --read-lag-rounds 1 --pattern rotate --get-mode "$GETMODE" \
-         --gap-ms "$GAP" --mode baseline --put-affinity local --metrics-port 0 \
+         --gap-ms "$GAP" --mode baseline --put-affinity local --metrics-port 0 $EXTKV_ARGS \
          > "${OUT}/${LABEL}_p${p}.csv" 2>&1 &
   pids+=($!)
 done

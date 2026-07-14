@@ -374,6 +374,16 @@ add_executable(bench_umbp_master_metadata_store bench_master_metadata_store.cpp)
 target_link_libraries(bench_umbp_master_metadata_store PRIVATE umbp_common)
 target_compile_features(bench_umbp_master_metadata_store PRIVATE cxx_std_17)
 
+# bench_master_metadata_store_extkv — sibling microbench isolating the
+# EXTERNAL-KV hot-path IMasterMetadataStore methods (MatchExternalKv /
+# RegisterExternalKvIfAlive / UnregisterExternalKv / GetExternalKvHitCounts)
+# across backends (UMBP_METADATA_BACKEND). No gRPC / RDMA; links umbp_common
+# only. Standalone executable, not a CTest target.
+add_executable(bench_umbp_master_metadata_store_extkv
+               bench_master_metadata_store_extkv.cpp)
+target_link_libraries(bench_umbp_master_metadata_store_extkv PRIVATE umbp_common)
+target_compile_features(bench_umbp_master_metadata_store_extkv PRIVATE cxx_std_17)
+
 # test_redis_master_metadata_store — Phase 1 targeted tests for the RESP/Redis
 # backend. Built only when the Redis backend is compiled in; the test itself
 # skips at runtime when no RESP store is reachable at UMBP_REDIS_URI.

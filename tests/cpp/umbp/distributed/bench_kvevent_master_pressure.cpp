@@ -282,6 +282,17 @@ struct BenchOpts {
   bool randomize = false;  // mix broadcast/rotate per round
   uint64_t seed = 1234;
   bool with_external_kv = false;
+  // MatchExternalKv hit-count mode. The real hot path (route/prefix lookup)
+  // counts hits — the increment + last_seen stamp is part of the cost. Default
+  // true so --with-external-kv measures the true hot-path Match; set false to
+  // isolate the pure read.
+  bool ext_kv_count_as_hit = true;
+  // Isolate the external-KV path at the gRPC+backend layer: skip BatchPut /
+  // BatchLookup / BatchGet (and thus all RDMA) and exercise ONLY
+  // ReportExternalKvBlocks (producer) + MatchExternalKv (consumer). Implies
+  // --with-external-kv. Lets the proxy compare backends on the external-KV hot
+  // path without the block data plane in the way.
+  bool ext_kv_only = false;
   size_t key_space = 0;         // 0 = unique keys per round; >0 = recycle per producer
   int metrics_port = 0;         // 0 = no Prometheus scrape
   double keep_master_secs = 0;  // keep master alive at the end for Grafana
@@ -316,6 +327,8 @@ void Usage() {
                "  --randomize        (mix broadcast/rotate per round)\n"
                "  --seed N           (default 1234)\n"
                "  --with-external-kv (default off)\n"
+               "  --ext-kv-count-as-hit 0|1 (default 1; MatchExternalKv hit-count write)\n"
+               "  --ext-kv-only      (only report+match, no BatchPut/Get/RDMA; implies --with-external-kv)\n"
                "  --key-space N      (0=unique per round; >0 recycle)\n"
                "  --metrics-port P   (0=off; >0 enable master Prometheus + scrape)\n"
                "  --keep-master-secs F (default 0)\n"
@@ -386,6 +399,11 @@ bool ParseArgs(int argc, char** argv, BenchOpts* o) {
     } else if (a == "--seed") {
       o->seed = std::strtoull(need("--seed"), nullptr, 10);
     } else if (a == "--with-external-kv") {
+      o->with_external_kv = true;
+    } else if (a == "--ext-kv-count-as-hit") {
+      o->ext_kv_count_as_hit = std::strtol(need("--ext-kv-count-as-hit"), nullptr, 10) != 0;
+    } else if (a == "--ext-kv-only") {
+      o->ext_kv_only = true;
       o->with_external_kv = true;
     } else if (a == "--key-space") {
       o->key_space = std::strtoull(need("--key-space"), nullptr, 10);
@@ -560,19 +578,23 @@ void Worker(size_t id, size_t round_begin, size_t round_end, bool measure, Ctx c
     if (IsProducer(pat, id)) {
       std::vector<std::string> keys(batch);
       for (size_t b = 0; b < batch; ++b) keys[b] = MakeKey(id, r, b, o);
-      const auto t0 = Clock::now();
-      auto res = cli->BatchPut(keys, srcs, sizes);
-      const auto t1 = Clock::now();
-      if (measure) {
-        put_ms.push_back(DurMs(t1 - t0));
-        ctx.m->put_calls.fetch_add(1, std::memory_order_relaxed);
-        ctx.m->put_keys.fetch_add(batch, std::memory_order_relaxed);
-        size_t fails = 0;
-        for (bool ok : res)
-          if (!ok) ++fails;
-        if (fails) ctx.m->put_fail_keys.fetch_add(fails, std::memory_order_relaxed);
+      // --ext-kv-only skips the block data plane (BatchPut + RDMA) so the proxy
+      // measures only the external-KV control path (report + match) end to end.
+      if (!o.ext_kv_only) {
+        const auto t0 = Clock::now();
+        auto res = cli->BatchPut(keys, srcs, sizes);
+        const auto t1 = Clock::now();
+        if (measure) {
+          put_ms.push_back(DurMs(t1 - t0));
+          ctx.m->put_calls.fetch_add(1, std::memory_order_relaxed);
+          ctx.m->put_keys.fetch_add(batch, std::memory_order_relaxed);
+          size_t fails = 0;
+          for (bool ok : res)
+            if (!ok) ++fails;
+          if (fails) ctx.m->put_fail_keys.fetch_add(fails, std::memory_order_relaxed);
+        }
+        if (o.mode == "flush") cli->Master().FlushHeartbeat();
       }
-      if (o.mode == "flush") cli->Master().FlushHeartbeat();
       if (o.with_external_kv) {
         const bool ok = cli->ReportExternalKvBlocks(keys, TierType::DRAM);
         if (measure && ok) ctx.m->ext_report_calls.fetch_add(1, std::memory_order_relaxed);
@@ -597,7 +619,7 @@ void Worker(size_t id, size_t round_begin, size_t round_end, bool measure, Ctx c
     std::vector<std::string> rkeys(batch);
     for (size_t b = 0; b < batch; ++b) rkeys[b] = MakeKey(producer, static_cast<size_t>(rr), b, o);
 
-    if (o.get_mode == GetMode::kExists || o.get_mode == GetMode::kBoth) {
+    if (!o.ext_kv_only && (o.get_mode == GetMode::kExists || o.get_mode == GetMode::kBoth)) {
       std::vector<bool> found;
       const auto t0 = Clock::now();
       grpc::Status st = cli->Master().BatchLookup(rkeys, &found);
@@ -618,7 +640,7 @@ void Worker(size_t id, size_t round_begin, size_t round_end, bool measure, Ctx c
         }
       }
     }
-    if (o.get_mode == GetMode::kFetch || o.get_mode == GetMode::kBoth) {
+    if (!o.ext_kv_only && (o.get_mode == GetMode::kFetch || o.get_mode == GetMode::kBoth)) {
       const auto t0 = Clock::now();
       auto bg = cli->BatchGet(rkeys, dsts, sizes);
       const auto t1 = Clock::now();
@@ -640,7 +662,7 @@ void Worker(size_t id, size_t round_begin, size_t round_end, bool measure, Ctx c
     }
     if (o.with_external_kv) {
       std::vector<MasterClient::ExternalKvNodeMatch> matches;
-      const bool ok = cli->MatchExternalKv(rkeys, &matches, /*count_as_hit=*/false);
+      const bool ok = cli->MatchExternalKv(rkeys, &matches, o.ext_kv_count_as_hit);
       if (measure && ok) {
         ctx.m->ext_match_calls.fetch_add(1, std::memory_order_relaxed);
         size_t matched = 0;
