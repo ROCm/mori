@@ -1246,7 +1246,7 @@ int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
     vmmProcessLock vmmLock;
     for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
       if (lsa == comm->lsaRank) continue;
-      int pe = comm->fabricCrossNodeLsa ? lsa : (comm->myNodeStart + lsa);
+      int pe = comm->myNodeStart + lsa;  // global pe (matches register's p2pPeers)
       if (!CcoCanLsaMapPeer(comm, pe)) continue;
       void* peerVa = static_cast<char*>(comm->flatBase) +
                      static_cast<size_t>(lsa) * comm->perRankSize + slotOff;
