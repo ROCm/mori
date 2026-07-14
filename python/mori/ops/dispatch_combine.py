@@ -47,7 +47,31 @@ _QUANT_TYPE_MAP = {
     "none": EpDispatchCombineQuantType.None_,
     "fp8_direct_cast": EpDispatchCombineQuantType.Fp8DirectCast,
     "fp8_blockwise": EpDispatchCombineQuantType.Fp8BlockwiseQuant,
+    # Blockwise FP4 (E2M1) combine is its own quant type. It shares the blockwise staging/scale
+    # layout with FP8 but transports packed FP4 (0.5 byte/elem) and uses half-sized staging slots.
+    "fp4_blockwise": EpDispatchCombineQuantType.Fp4BlockwiseQuant,
 }
+
+# Blockwise combine quant types share the staging/scale layout and kernel launch config; only the
+# element codec (and staging slot size) differ, so kernel selection treats them together and then
+# swaps the codec token (fp8bwq <-> fp4bwq) in the kernel name.
+_BLOCKWISE_COMBINE_QUANT_TYPES = (
+    EpDispatchCombineQuantType.Fp8BlockwiseQuant,
+    EpDispatchCombineQuantType.Fp4BlockwiseQuant,
+)
+
+# The FP4 blockwise combine kernels registered in ep_intranode.hip. Kernel-name selection derives
+# an fp4bwq name from the fp8bwq one; the result is asserted against this set so a mismatch fails
+# loudly instead of launching a non-existent symbol.
+_FP4_COMBINE_KERNELS = frozenset(
+    {
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp4bwq",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp4bwq_noweight_block128_vec8",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp4bwq_noweight_block256_vec8",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp4bwq_noweight_block128_vec8_top9",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp4bwq_noweight_block256_vec8_top9",
+    }
+)
 
 
 def _normalize_quant_type(quant_type):
@@ -262,6 +286,25 @@ class EpDispatchCombineOp:
         self._fp8_blockwise_combine_scale_type_size = self._handle_info[
             "fp8_blockwise_combine_scale_type_size"
         ]
+        # Detect the fp4_blockwise combine so we can fail fast on unsupported archs at construction.
+        # (Kernel selection keys off the Fp4BlockwiseQuant enum directly.)
+        self._combine_is_fp4 = (
+            isinstance(config.quant_type, str)
+            and config.quant_type.strip().lower() == "fp4_blockwise"
+        )
+        if self._combine_is_fp4:
+            # The packed-FP4 combine relies on the gfx950 OCP FP4 conversion instructions
+            # (cvt_scalef32_pk_f32_fp4). On other archs there is no hardware path, so fail fast
+            # instead of silently selecting an fp4 kernel that would fall back to slow software.
+            from mori.jit.config import detect_gpu_arch
+
+            _arch = str(detect_gpu_arch())
+            if "gfx950" not in _arch:
+                raise ValueError(
+                    f"quant_type='fp4_blockwise' combine requires a gfx950 GPU (OCP FP4 "
+                    f"conversion instructions); detected arch '{_arch}'. Use 'fp8_blockwise' "
+                    f"instead on this device."
+                )
 
         self._dispatch_out_ptrs = mori_cpp.get_dispatch_output_ptrs(self._handle, True)
         self._combine_out_ptrs = mori_cpp.get_combine_output_ptrs(self._handle, True)
@@ -434,7 +477,7 @@ class EpDispatchCombineOp:
         """Shared memory for combine kernels."""
         quant_type = _normalize_quant_type(self.config.quant_type)
         num_ptr_arrays = 1 + int(bool(use_weights))
-        if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+        if quant_type in _BLOCKWISE_COMBINE_QUANT_TYPES:
             num_ptr_arrays += 1
         return (
             warp_per_block
@@ -942,25 +985,38 @@ class EpDispatchCombineOp:
         quant_type = _normalize_quant_type(self.config.quant_type)
         shared_mem = self._combine_shared_mem(actual_wpb)
 
-        if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
-            if kt not in (
+        if quant_type in _BLOCKWISE_COMBINE_QUANT_TYPES:
+            label = (
+                "fp4_blockwise"
+                if quant_type == EpDispatchCombineQuantType.Fp4BlockwiseQuant
+                else "fp8_blockwise"
+            )
+            # fp8 blockwise also runs on AsyncLL; fp4 blockwise is IntraNode-only.
+            allowed_kts = [
                 EpDispatchCombineKernelType.IntraNode.value,
                 EpDispatchCombineKernelType.IntraNodeLL.value,
-                EpDispatchCombineKernelType.AsyncLL.value,
-            ):
+            ]
+            if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+                allowed_kts.append(EpDispatchCombineKernelType.AsyncLL.value)
+            if kt not in allowed_kts:
+                supported = (
+                    "IntraNode/IntraNodeLL/AsyncLL"
+                    if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant
+                    else "IntraNode/IntraNodeLL"
+                )
                 raise ValueError(
-                    "Fp8BlockwiseQuant currently only supports IntraNode/IntraNodeLL/AsyncLL combine"
+                    f"{label} combine currently only supports {supported} combine"
                 )
             if sfx != "bf16":
-                raise ValueError(f"Fp8BlockwiseQuant only supports bf16, got {sfx}")
+                raise ValueError(f"{label} combine only supports bf16, got {sfx}")
             if not actual_use_ext:
                 raise ValueError(
-                    "Fp8BlockwiseQuant currently requires --zero-copy 0 "
+                    f"{label} combine currently requires --zero-copy 0 "
                     "(useExternalInpBuffer=True). P2P read path not yet implemented."
                 )
             if self._fp8_blockwise_combine_scale_dim <= 0:
                 raise ValueError(
-                    "Fp8BlockwiseQuant requires internal combine scale_dim > 0"
+                    f"{label} combine requires internal combine scale_dim > 0"
                 )
 
         if kt == EpDispatchCombineKernelType.InterNode.value:
@@ -1008,7 +1064,7 @@ class EpDispatchCombineOp:
             EpDispatchCombineKernelType.IntraNode.value,
             EpDispatchCombineKernelType.IntraNodeLL.value,
         ):
-            if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+            if quant_type in _BLOCKWISE_COMBINE_QUANT_TYPES:
                 # Mirror of the AccumNum=8/9 + VecBytes=8 specialization gating in
                 # LaunchCombine() / launch.cpp. top-k==9 covers shared-expert fusion
                 # (8 routed + 1 fused shared). Keep in sync.
@@ -1038,6 +1094,14 @@ class EpDispatchCombineOp:
                             else "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8"
                         )
                         use_vec8_top8 = True
+                # Blockwise FP4: select the packed-FP4 kernel variants (identical launch config to
+                # the fp8bwq variants; only the in-kernel quant/dequant math differs). Assert the
+                # derived name is a registered fp4bwq symbol so a naming mismatch fails loudly.
+                if quant_type == EpDispatchCombineQuantType.Fp4BlockwiseQuant:
+                    kernel_name = kernel_name.replace("_fp8bwq", "_fp4bwq")
+                    assert (
+                        kernel_name in _FP4_COMBINE_KERNELS
+                    ), f"fp4_blockwise combine selected unregistered kernel '{kernel_name}'"
                 shared_mem = self._combine_shared_mem(
                     actual_wpb, use_weights=not use_vec8_top8
                 )

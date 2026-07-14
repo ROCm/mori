@@ -109,10 +109,14 @@ QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast (scatter only)
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = forward per-token scales
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,2048").split(",")]
 
-# fp8 flavor is arch-specific: OCP e4m3 on gfx950, fnuz on gfx942.
+# fp8 flavor is arch-specific: OCP e4m3 on gfx950/gfx1250, fnuz on gfx942.
 import tuning_configs as _tc  # noqa: E402
 
-_FP8_DT = torch.float8_e4m3fn if _tc._topology()[1] == 90500 else torch.float8_e4m3fnuz
+_FP8_DT = (
+    torch.float8_e4m3fn
+    if _tc._topology()[1] in (90500, 120500)
+    else torch.float8_e4m3fnuz
+)
 # (torch token dtype, elem bytes). fp4 packs 2 e2m1/byte -> 0.5 B/elem;
 # per-token bytes handled via TOK_NB below.
 _DT = {
@@ -124,6 +128,17 @@ _DT = {
 TOK_DT, ESZ = _DT[DTYPE]
 _FP4 = DTYPE == "fp4"
 TOK_NB = HIDDEN // 2 if _FP4 else HIDDEN * ESZ  # per-token transport bytes
+
+# Asymmetric I/O: dispatch fp8 + combine bf16 (an expert op converts between the
+# two). DISPATCH_DT/COMBINE_DT override DTYPE per-op; unset => symmetric (DTYPE).
+DISPATCH_DT = os.environ.get("DISPATCH_DT")
+COMBINE_DT = os.environ.get("COMBINE_DT")
+_ASYM = (DISPATCH_DT is not None) or (COMBINE_DT is not None)
+_disp_s, _comb_s = DISPATCH_DT or DTYPE, COMBINE_DT or DTYPE
+DISP_DT, DISP_ESZ = _DT[_disp_s]
+COMB_DT, COMB_ESZ = _DT[_comb_s]
+DISP_NB = HIDDEN // 2 if _disp_s == "fp4" else HIDDEN * DISP_ESZ  # dispatch bytes/tok
+COMB_NB = HIDDEN // 2 if _comb_s == "fp4" else HIDDEN * COMB_ESZ  # combine bytes/tok
 
 
 def main():
@@ -150,7 +165,7 @@ def main():
     else:
         inp = (
             torch.randn(max_tok, HIDDEN, generator=g, dtype=torch.float32)
-            .to(TOK_DT)
+            .to(DISP_DT)
             .to(dev)
         )
     idx = torch.randint(
@@ -176,7 +191,8 @@ def main():
     uid = Communicator.get_unique_id() if rank == 0 else None
     uid = d.bcast_uid(uid)
 
-    win_bytes = max_recv * TOK_NB + npes * M * TOK_NB + (1 << 24)
+    _max_nb = max(DISP_NB, COMB_NB)  # out_tok sized to the larger (bf16) side
+    win_bytes = max_recv * _max_nb + npes * M * _max_nb + (1 << 24)
     with Communicator.init(
         npes, rank, uid, per_rank_vmm=2 * win_bytes + (1 << 28)
     ) as comm:
@@ -197,6 +213,9 @@ def main():
             num_experts_per_rank=EPR,
             num_experts_per_token=K,
             data_type=TOK_DT,
+            # asymmetric dispatch/combine dtype (all-or-none); None => symmetric
+            dispatch_data_type=(DISP_DT if _ASYM else None),
+            combine_data_type=(COMB_DT if _ASYM else None),
             combine_mode=COMBINE,
             quant_type=QUANT,
             dispatch_block_num=DISP_BLOCK,
@@ -251,6 +270,12 @@ def main():
                 fx.Stream(torch.cuda.current_stream()),
             )
 
+        def mock_fmoe():
+            # expert-op stand-in: dequant dispatched tokens to the combine dtype in
+            # out_tok. Via a scratch — in-place would alias (differing strides).
+            scratch = op.recv_tokens().to(COMB_DT)
+            op.combine_in_view().view(-1).copy_(scratch.view(-1))
+
         def time_eager(fn, ct):
             for _ in range(WARMUP):
                 fn(ct)
@@ -300,6 +325,13 @@ def main():
             run_disp(ct)
             sync()
             comm.barrier()
+            # Identity expert: stage the dispatched tokens (disp_out) into out_tok,
+            # the combine input. Since the disp_out/out_tok arena split, dispatch no
+            # longer writes out_tok directly, so this copy is required for ALL dtypes
+            # (mock_fmoe also does the asym dispatch->combine dtype conversion). A
+            # real expert op would write its output into out_tok here instead.
+            mock_fmoe()
+            sync()
             comb_out.zero_()
             sync()
             run_comb(ct)
@@ -317,13 +349,13 @@ def main():
                 [len({int(idx_c[t, j]) // EPR for j in range(K)}) for t in range(ct)]
             )
             exp = (torch.from_numpy(U).view(ct, 1).float() * inp[:ct].float().cpu()).to(
-                TOK_DT
+                COMB_DT
             )
-            # fp8 (quant wire or plain fp8 token) is lossy (e4m3 ~6-12% rel).
-            lossy = _fp8 or _bw or DTYPE == "fp8"
+            # fp8 (quant wire, plain fp8 token, or asymmetric fp8 side) is lossy.
+            lossy = _fp8 or _bw or "fp8" in (DTYPE, _disp_s, _comb_s)
             _atol, _rtol = (1.0, 1.5e-1) if lossy else (2e-2, 2e-2)
             got_dt = (
-                torch.bfloat16 if (_fp8 or _bw) else TOK_DT
+                torch.bfloat16 if (_fp8 or _bw) else COMB_DT
             )  # quant paths output bf16
             got = comb_out[: ct * HIDDEN].cpu().view(got_dt).view(ct, HIDDEN)
             ok = torch.allclose(got.float(), exp.float(), atol=_atol, rtol=_rtol)
@@ -461,8 +493,11 @@ def main():
             sync()
             comm.barrier()
             recv = int(total_recv.cpu().item())
-            payload = recv * TOK_NB  # true per-token transport bytes (fp4 = hidden/2)
+            disp_payload, comb_payload = recv * DISP_NB, recv * COMB_NB
 
+            if _ASYM:  # expert op converts dispatch dtype -> combine dtype
+                mock_fmoe()
+                sync()
             # combine first (needs total_recv == recv; combine doesn't reset it)
             cb_e = time_eager(run_comb, ct) if eager else 0.0
             cb_g = time_graph(run_comb, ct) if graph else 0.0
@@ -471,18 +506,22 @@ def main():
             dp_g = time_graph(run_disp, ct) if graph else 0.0
 
             if rank == 0:
-                parts = [
-                    f"tok/rank {ct:5d}  recv {recv:6d}  payload {payload/1e6:7.2f}MB"
-                ]
+                # payload shown = disp/comb bytes (same unless asymmetric dtype)
+                pl = (
+                    f"payload {disp_payload/1e6:.2f}/{comb_payload/1e6:.2f}MB"
+                    if _ASYM
+                    else f"payload {comb_payload/1e6:7.2f}MB"
+                )
+                parts = [f"tok/rank {ct:5d}  recv {recv:6d}  {pl}"]
                 if eager:
                     parts.append(
-                        f"| EAGER disp {dp_e:8.2f}us/{bw(payload,dp_e):6.1f}GB/s "
-                        f"comb {cb_e:8.2f}us/{bw(payload,cb_e):6.1f}GB/s"
+                        f"| EAGER disp {dp_e:8.2f}us/{bw(disp_payload,dp_e):6.1f}GB/s "
+                        f"comb {cb_e:8.2f}us/{bw(comb_payload,cb_e):6.1f}GB/s"
                     )
                 if graph:
                     parts.append(
-                        f"| GRAPH disp {dp_g:8.2f}us/{bw(payload,dp_g):6.1f}GB/s "
-                        f"comb {cb_g:8.2f}us/{bw(payload,cb_g):6.1f}GB/s"
+                        f"| GRAPH disp {dp_g:8.2f}us/{bw(disp_payload,dp_g):6.1f}GB/s "
+                        f"comb {cb_g:8.2f}us/{bw(comb_payload,cb_g):6.1f}GB/s"
                     )
                 print("  ".join(parts), flush=True)
     d.shutdown()
