@@ -116,8 +116,7 @@ TEST(ClusterSlotsTest, HonorsHashTag) {
   // Only the {...} body is hashed, so a block key routes by its shard tag.
   EXPECT_EQ(redis::SlotOfKey("{foo}bar"), redis::SlotOfKey("foo"));
   EXPECT_EQ(redis::SlotOfKey("prefix{foo}suffix"), redis::SlotOfKey("foo"));
-  EXPECT_EQ(redis::SlotOfKey("{umbp:default:b0}:block:k/5"),
-            redis::SlotOfKey("{umbp:default:b0}"));
+  EXPECT_EQ(redis::SlotOfKey("{umbp:default:b0}:block:k/5"), redis::SlotOfKey("{umbp:default:b0}"));
   // Empty braces are not a tag: the whole key is hashed.
   EXPECT_EQ(redis::SlotOfKey("{}foo"), 9500);
   EXPECT_NE(redis::SlotOfKey("{}foo"), redis::SlotOfKey("foo"));
@@ -187,9 +186,9 @@ struct StoreMode {
   std::size_t block_shards;  // single-endpoint shard count (endpoints == 1)
   std::size_t endpoints;     // >1 => multi-endpoint mode (block_shards ignored)
   const char* name;
-  bool cluster = false;      // true => Redis Cluster mode (needs UMBP_REDIS_CLUSTER_SEEDS)
-  bool balanced = false;     // cluster only: compute one balanced tag per master
-                             // (exercises the factory's balanced-placement path)
+  bool cluster = false;   // true => Redis Cluster mode (needs UMBP_REDIS_CLUSTER_SEEDS)
+  bool balanced = false;  // cluster only: compute one balanced tag per master
+                          // (exercises the factory's balanced-placement path)
 };
 
 class RedisStoreTest : public ::testing::TestWithParam<StoreMode> {
@@ -583,6 +582,225 @@ TEST_P(RedisStoreTest, UnregisterWipesBlocksAcrossShards) {
   for (bool e : store_->BatchExistsBlock(keys)) EXPECT_FALSE(e);
 }
 
+// =====================================================================
+// External-KV: register / match / unregister, tier bitmask, reverse-index count.
+// Asserts the master_metadata_store.h contract (not in-memory internals); runs
+// in every StoreMode (extkv/hit live on the control tag in all modes).
+// =====================================================================
+
+TEST_P(RedisStoreTest, ExternalKvAliveGateAndMatch) {
+  // Unknown / not-alive node is rejected and writes nothing.
+  EXPECT_FALSE(store_->RegisterExternalKvIfAlive("ghost", {"h1"}, TierType::HBM));
+  EXPECT_TRUE(store_->MatchExternalKv({"h1"}, false, now_).empty());
+
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  EXPECT_TRUE(store_->RegisterExternalKvIfAlive("n1", {"h1", "h2"}, TierType::HBM));
+
+  auto m = store_->MatchExternalKv({"h1", "h2"}, false, now_);
+  ASSERT_EQ(m.size(), 1u);
+  EXPECT_EQ(m[0].node_id, "n1");
+  ASSERT_EQ(m[0].hashes_by_tier.count(TierType::HBM), 1u);
+  EXPECT_EQ(m[0].hashes_by_tier[TierType::HBM].size(), 2u);
+  EXPECT_EQ(store_->GetExternalKvCount("n1"), 2u);
+}
+
+TEST_P(RedisStoreTest, ExternalKvUnregisterByTierAndHash) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_TRUE(store_->RegisterExternalKvIfAlive("n1", {"h1"}, TierType::HBM));
+  ASSERT_TRUE(store_->RegisterExternalKvIfAlive("n1", {"h1"}, TierType::DRAM));
+
+  // Drop only HBM; DRAM remains, so the (node,hash) entry survives.
+  store_->UnregisterExternalKv("n1", {"h1"}, TierType::HBM);
+  auto m = store_->MatchExternalKv({"h1"}, false, now_);
+  ASSERT_EQ(m.size(), 1u);
+  EXPECT_EQ(m[0].hashes_by_tier.count(TierType::HBM), 0u);
+  EXPECT_EQ(m[0].hashes_by_tier.count(TierType::DRAM), 1u);
+  EXPECT_EQ(store_->GetExternalKvCount("n1"), 1u);
+
+  // Whole-tier wipe of DRAM removes the last tier → entry gone.
+  store_->UnregisterExternalKvByTier("n1", TierType::DRAM);
+  EXPECT_TRUE(store_->MatchExternalKv({"h1"}, false, now_).empty());
+  EXPECT_EQ(store_->GetExternalKvCount("n1"), 0u);
+}
+
+TEST_P(RedisStoreTest, ExternalKvMatchedHashCountAcrossTiers) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_TRUE(store_->RegisterExternalKvIfAlive("n1", {"h1"}, TierType::HBM));
+  ASSERT_TRUE(store_->RegisterExternalKvIfAlive("n1", {"h1"}, TierType::DRAM));
+
+  auto m = store_->MatchExternalKv({"h1"}, false, now_);
+  ASSERT_EQ(m.size(), 1u);
+  EXPECT_EQ(m[0].hashes_by_tier.size(), 2u);  // one hash, two tier buckets
+  EXPECT_EQ(m[0].MatchedHashCount(), 1u);     // deduped to one unique hash
+}
+
+TEST_P(RedisStoreTest, ExternalKvUnregisterByNodeWipesAllTiers) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_TRUE(store_->RegisterExternalKvIfAlive("n1", {"h1", "h2"}, TierType::HBM));
+  ASSERT_TRUE(store_->RegisterExternalKvIfAlive("n1", {"h1"}, TierType::DRAM));
+  ASSERT_EQ(store_->GetExternalKvCount("n1"), 2u);
+
+  store_->UnregisterExternalKvByNode("n1");
+  EXPECT_EQ(store_->GetExternalKvCount("n1"), 0u);
+  EXPECT_TRUE(store_->MatchExternalKv({"h1", "h2"}, false, now_).empty());
+  // Must NOT have touched the client record.
+  EXPECT_TRUE(store_->IsClientAlive("n1"));
+}
+
+TEST_P(RedisStoreTest, ExternalKvHitCounting) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_TRUE(store_->RegisterExternalKvIfAlive("n1", {"h1", "h2"}, TierType::HBM));
+
+  // Pure read leaves the hit map untouched.
+  store_->MatchExternalKv({"h1", "h2"}, /*count_as_hit=*/false, now_);
+  EXPECT_TRUE(store_->GetExternalKvHitCounts({"h1", "h2"}).empty());
+
+  // count_as_hit accumulates across calls; increments once per unique hash.
+  store_->MatchExternalKv({"h1", "h2"}, /*count_as_hit=*/true, now_);
+  store_->MatchExternalKv({"h1"}, /*count_as_hit=*/true, now_ + 1s);
+
+  auto counts = store_->GetExternalKvHitCounts({"h1", "h2"});
+  std::map<std::string, uint64_t> by_hash;
+  for (const auto& e : counts) by_hash[e.hash] = e.hit_count_total;
+  EXPECT_EQ(by_hash["h1"], 2u);
+  EXPECT_EQ(by_hash["h2"], 1u);
+
+  // GetExternalKvHitCounts dedupes and skips hashes with no count.
+  auto c2 = store_->GetExternalKvHitCounts({"missing", "h1", "h1"});
+  ASSERT_EQ(c2.size(), 1u);
+  EXPECT_EQ(c2[0].hash, "h1");
+  EXPECT_EQ(c2[0].hit_count_total, 2u);
+}
+
+TEST_P(RedisStoreTest, GarbageCollectHitsByLastSeen) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_TRUE(store_->RegisterExternalKvIfAlive("n1", {"old", "fresh"}, TierType::HBM));
+  store_->MatchExternalKv({"old"}, true, now_);
+  store_->MatchExternalKv({"fresh"}, true, now_ + 100s);
+
+  // Drop entries last seen before now_+50s → only "old" goes.
+  EXPECT_EQ(store_->GarbageCollectHits(now_ + 50s), 1u);
+  auto counts = store_->GetExternalKvHitCounts({"old", "fresh"});
+  ASSERT_EQ(counts.size(), 1u);
+  EXPECT_EQ(counts[0].hash, "fresh");
+}
+
+// Cascade fix: UnregisterClient / ExpireStaleClients must drop the node's
+// external-kv entries, not just the reverse index (previously orphaned).
+TEST_P(RedisStoreTest, UnregisterClientCascadesExternalKv) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_TRUE(store_->RegisterExternalKvIfAlive("n1", {"h1", "h2"}, TierType::HBM));
+  ASSERT_EQ(store_->GetExternalKvCount("n1"), 2u);
+
+  store_->UnregisterClient("n1");
+  EXPECT_EQ(store_->GetExternalKvCount("n1"), 0u);
+  EXPECT_TRUE(store_->MatchExternalKv({"h1", "h2"}, false, now_).empty());
+}
+
+TEST_P(RedisStoreTest, ExpireStaleCascadesExternalKv) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_TRUE(store_->RegisterExternalKvIfAlive("n1", {"h1"}, TierType::HBM));
+
+  auto dead = store_->ExpireStaleClients(now_ + 10s);
+  ASSERT_EQ(dead.size(), 1u);
+  EXPECT_EQ(store_->GetExternalKvCount("n1"), 0u);
+  EXPECT_TRUE(store_->MatchExternalKv({"h1"}, false, now_).empty());
+}
+
+// =====================================================================
+// EnumerateEvictionCandidates: reverse-index scan (route_get_batch untouched).
+// =====================================================================
+
+namespace {
+std::vector<NodeTierKey> Buckets(const std::string& node, TierType tier) {
+  return {NodeTierKey{node, tier}};
+}
+}  // namespace
+
+TEST_P(RedisStoreTest, EvictionLruOrderAndCap) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  // Each ADD stamps _lacc = the heartbeat's now, so three ADDs at increasing
+  // times give LRU order k_old < k_mid < k_new.
+  ASSERT_EQ(store_
+                ->ApplyHeartbeat("n1", 1, now_, {},
+                                 {{KvEvent::Kind::ADD, "k_old", TierType::HBM, 100}}, false)
+                .status,
+            HeartbeatResult::APPLIED);
+  ASSERT_EQ(store_
+                ->ApplyHeartbeat("n1", 2, now_ + 1s, {},
+                                 {{KvEvent::Kind::ADD, "k_mid", TierType::HBM, 100}}, false)
+                .status,
+            HeartbeatResult::APPLIED);
+  ASSERT_EQ(store_
+                ->ApplyHeartbeat("n1", 3, now_ + 2s, {},
+                                 {{KvEvent::Kind::ADD, "k_new", TierType::HBM, 100}}, false)
+                .status,
+            HeartbeatResult::APPLIED);
+
+  auto cands = store_->EnumerateEvictionCandidates(Buckets("n1", TierType::HBM),
+                                                   EvictionOrder::kLeastRecentlyAccessed,
+                                                   /*max_per_bucket=*/2, now_ + 10s);
+  ASSERT_EQ(cands.size(), 1u);
+  auto& bucket = cands.at(NodeTierKey{"n1", TierType::HBM});
+  ASSERT_EQ(bucket.size(), 2u);
+  EXPECT_EQ(bucket[0].key, "k_old");  // oldest first
+  EXPECT_EQ(bucket[1].key, "k_mid");
+  EXPECT_EQ(bucket[0].location.node_id, "n1");
+  EXPECT_EQ(bucket[0].location.tier, TierType::HBM);
+  EXPECT_EQ(bucket[0].size, 100u);
+}
+
+TEST_P(RedisStoreTest, EvictionSkipsLeased) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_EQ(store_
+                ->ApplyHeartbeat("n1", 1, now_, {},
+                                 {{KvEvent::Kind::ADD, "k1", TierType::HBM, 100}}, false)
+                .status,
+            HeartbeatResult::APPLIED);
+  // Lease k1 far past the enumeration time.
+  store_->BatchLookupBlockForRouteGet({"k1"}, {}, now_, 1h);
+  EXPECT_TRUE(store_
+                  ->EnumerateEvictionCandidates(Buckets("n1", TierType::HBM),
+                                                EvictionOrder::kLeastRecentlyAccessed, 0, now_ + 1s)
+                  .empty());
+}
+
+TEST_P(RedisStoreTest, EvictionOnlyRequestedBuckets) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_EQ(store_
+                ->ApplyHeartbeat("n1", 1, now_, {},
+                                 {{KvEvent::Kind::ADD, "kh", TierType::HBM, 10},
+                                  {KvEvent::Kind::ADD, "kd", TierType::DRAM, 10}},
+                                 false)
+                .status,
+            HeartbeatResult::APPLIED);
+  auto cands = store_->EnumerateEvictionCandidates(
+      Buckets("n1", TierType::HBM), EvictionOrder::kLeastRecentlyAccessed, 0, now_ + 1s);
+  ASSERT_EQ(cands.size(), 1u);
+  EXPECT_EQ(cands.begin()->first.tier, TierType::HBM);
+  EXPECT_EQ(cands.begin()->second.size(), 1u);
+  EXPECT_EQ(cands.begin()->second[0].key, "kh");
+}
+
+// Tie timestamps (a batch RouteGet stamps one `now` across keys) and cross-shard
+// aggregation: all candidates must appear, none dropped.
+TEST_P(RedisStoreTest, EvictionTieTimestampsAndCrossShard) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  constexpr int kKeys = 30;
+  std::vector<KvEvent> adds;
+  for (int i = 0; i < kKeys; ++i) {
+    adds.push_back({KvEvent::Kind::ADD, "ek-" + std::to_string(i), TierType::HBM, 10});
+  }
+  ASSERT_EQ(store_->ApplyHeartbeat("n1", 1, now_, {}, adds, false).status,
+            HeartbeatResult::APPLIED);
+
+  auto cands = store_->EnumerateEvictionCandidates(Buckets("n1", TierType::HBM),
+                                                   EvictionOrder::kLeastRecentlyAccessed,
+                                                   /*max_per_bucket=*/0, now_ + 10s);
+  ASSERT_EQ(cands.size(), 1u);
+  EXPECT_EQ(cands.at(NodeTierKey{"n1", TierType::HBM}).size(), static_cast<size_t>(kKeys));
+}
+
 // Fault tolerance: with one shard instance down, reads for keys on the healthy
 // shards still resolve and keys on the dead shard degrade to a miss (no throw).
 // Control + shard 0 live; shard 1 points at a closed port.
@@ -623,8 +841,9 @@ TEST(RedisFaultToleranceTest, DownShardDegradesToMissNotError) {
   ASSERT_TRUE(store.RegisterClient(reg, now, 30s));  // control endpoint is live
 
   // Seed only the live shard (a delta touching just shard 0's instance).
-  ASSERT_EQ(store.ApplyHeartbeat("ftn", 1, now, {}, {{KvEvent::Kind::ADD, live_key, TierType::DRAM, 7}},
-                                 false)
+  ASSERT_EQ(store
+                .ApplyHeartbeat("ftn", 1, now, {},
+                                {{KvEvent::Kind::ADD, live_key, TierType::DRAM, 7}}, false)
                 .status,
             HeartbeatResult::APPLIED);
 
@@ -686,7 +905,7 @@ TEST(RedisWriteFaultToleranceTest, HeartbeatToDownShardSelfHealsNotError) {
                                   false);
   // Down shard -> self-heal signal, not an exception.
   EXPECT_EQ(res.status, HeartbeatResult::SEQ_GAP);
-  EXPECT_TRUE(store.IsClientAlive("wn"));            // control committed -> node alive
+  EXPECT_TRUE(store.IsClientAlive("wn"));              // control committed -> node alive
   EXPECT_TRUE(store.BatchExistsBlock({live_key})[0]);  // live shard still got its event
 }
 
@@ -722,10 +941,10 @@ TEST(RedisStoreMetricsTest, EmitsStoreOpLatencyHistogram) {
   reg.peer_address = "p:1";
   reg.tier_capacities[TierType::DRAM] = TierCapacity{1u << 20, 1u << 20};
   ASSERT_TRUE(store.RegisterClient(reg, now, 30s));
-  ASSERT_EQ(store.ApplyHeartbeat("mn", 1, now, {}, {{KvEvent::Kind::ADD, "mk", TierType::DRAM, 4}},
-                                 false)
-                .status,
-            HeartbeatResult::APPLIED);
+  ASSERT_EQ(
+      store.ApplyHeartbeat("mn", 1, now, {}, {{KvEvent::Kind::ADD, "mk", TierType::DRAM, 4}}, false)
+          .status,
+      HeartbeatResult::APPLIED);
   store.BatchLookupBlockForRouteGet({"mk"}, {}, now, 10s);
   store.BatchExistsBlock({"mk"});
 
