@@ -22,6 +22,7 @@
 from mori import cpp as mori_cpp
 import torch
 import ctypes
+import warnings
 
 _PyCapsule_New = ctypes.pythonapi.PyCapsule_New
 _PyCapsule_New.restype = ctypes.py_object
@@ -121,8 +122,15 @@ class IOEngine:
 
             hsaco_path = ensure_fabric_copy_kernel()
             self._engine.LoadFabricCopyModule(hsaco_path)
-        except Exception:
-            pass
+        except Exception as e:
+            # Without this kernel, large FABRIC transfers fail (no memcpy fallback).
+            warnings.warn(
+                f"Failed to load fabric_copy kernel ({e}); FABRIC transfers "
+                "have no accelerated copy path and large transfers may fail. "
+                "Check that the fabric_copy kernel can be JIT-compiled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def remove_backend(self, type: mori_cpp.BackendType):
         return self._engine.RemoveBackend(type)

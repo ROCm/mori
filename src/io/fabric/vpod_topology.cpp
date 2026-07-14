@@ -62,7 +62,10 @@ std::string DeviceBdfLower(int hipDevice) {
 }  // namespace
 
 bool DeviceSupportsFabric(int hipDevice) {
-#if HIP_VERSION >= 71400000
+  // Guard hipDeviceAttributeHandleTypeFabricSupported: it is absent on older
+  // ROCm (e.g. 7.2.4), and HIP_FABRIC_API is not defined on 7.14 where the enum
+  // does exist. Older ROCm reports fabric unsupported and falls back to XGMI/RDMA.
+#if defined(HIP_FABRIC_API) || (HIP_VERSION >= 71400000)
   int vmm = 0;
   int fabric = 0;
   hipError_t err =

@@ -106,10 +106,12 @@ class TorchDistContext:
                 world_size=self.world_size,
                 device_id=device,
             )
-        except (ValueError, RuntimeError):
-            # Some torch/ROCm builds report 0 "accelerators" and reject the
-            # device_id even though HIP devices exist. device_id is only a hint
-            # for accelerator backends; the gloo OOB path does not need it.
+        except (ValueError, RuntimeError) as e:
+            # Some torch/ROCm builds reject device_id (report 0 accelerators)
+            # though HIP devices exist; retry without it only for that case.
+            msg = str(e).lower()
+            if "device_id" not in msg and "accelerator" not in msg:
+                raise
             dist.init_process_group(
                 backend=self.backend,
                 rank=self.rank,

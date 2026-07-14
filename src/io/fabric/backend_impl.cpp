@@ -276,9 +276,17 @@ hipError_t FabricBackendSession::LaunchCopy(void* dst, const void* src, size_t s
 
   hipFunction_t fn = backend != nullptr ? backend->GetFabricCopyFunc(localDevice) : nullptr;
   if (fn == nullptr) {
-    // Kernel unavailable: fall back to hipMemcpyAsync. Correct for small
-    // payloads; large imported-fabric-pointer copies should always have the
-    // kernel loaded (see fabric_copy.hip note).
+    // hipMemcpyAsync livelocks on imported fabric pointers for large payloads
+    // (see fabric_copy.hip); fail fast instead of hanging, only allow it small.
+    constexpr size_t kFabricMemcpyFallbackMax = 4ull * 1024 * 1024;
+    if (size >= kFabricMemcpyFallbackMax) {
+      MORI_IO_WARN(
+          "FABRIC: fabric_copy kernel not loaded; refusing hipMemcpyAsync "
+          "fallback for {} byte transfer (>= {} B may livelock on imported "
+          "fabric pointers). Load the fabric_copy module first.",
+          size, kFabricMemcpyFallbackMax);
+      return hipErrorNotSupported;
+    }
     return hipMemcpyAsync(dst, src, size, hipMemcpyDefault, stream);
   }
 
