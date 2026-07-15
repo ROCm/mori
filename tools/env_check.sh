@@ -335,7 +335,7 @@ version_ge() {
 check_ainic_version_recommendation() {
     local ver="$1"
     [[ -n "$ver" ]] || { log_warn "cannot verify AINIC firmware version against recommendation (empty)"; return; }
-    if [[ "$ver" == 1.117.1* ]]; then
+    if [[ "$ver" =~ ^1\.117\.1([.-]|$) ]]; then
         log_warn "AINIC firmware $ver is on the 1.117.1 branch, which does NOT support IBGDA — upgrade to >= $AINIC_MIN_VER"
     elif version_ge "$ver" "$AINIC_MIN_VER"; then
         log_ok "AINIC firmware $ver meets the recommended minimum (>= $AINIC_MIN_VER) for cross-node IBGDA"
@@ -372,6 +372,8 @@ check_bnxt_version_recommendation() {
 
 # dominant_group <out_array_name> <dev...>
 #   sets the named array to the largest same-vendor-prefix subset of the inputs.
+#   Fallback for when the PCI vendor id isn't known (see devs_of_vendor below) —
+#   guesses vendor grouping from device-name prefixes instead.
 dominant_group() {
     local -n _out="$1"; shift
     local -A _pref=(); local d p best="" bc=0
@@ -381,6 +383,18 @@ dominant_group() {
         (( ${#g[@]} > bc )) && { bc=${#g[@]}; best="$p"; }
     done
     read -ra _out <<< "${_pref[$best]}"
+}
+
+# devs_of_vendor <out_array_name> <pci_vendor_id> <dev...>
+#   sets the named array to the subset of the given IB device names whose PCI
+#   vendor id (/sys/class/infiniband/<dev>/device/vendor) matches.
+devs_of_vendor() {
+    local -n _out="$1"; local vid="$2"; shift 2
+    _out=()
+    local d
+    for d in "$@"; do
+        [[ "$(cat "/sys/class/infiniband/$d/device/vendor" 2>/dev/null)" == "$vid" ]] && _out+=("$d")
+    done
 }
 
 # ======================== check functions =======================
@@ -556,8 +570,14 @@ check_intra_node_bw() {
     [[ ${#all_devs[@]} -gt 0 ]] || { log_fail "no local RDMA devices found (check ibv_devices)"; return 1; }
     log_ok "local RDMA devices (${#all_devs[@]}): ${all_devs[*]}"
 
-    # Pick the largest same-vendor group; exported via LOCAL_DEVS for inter-node tests.
-    dominant_group LOCAL_DEVS "${all_devs[@]}"
+    # Use the same dominant-vendor NICs that got firmware/QoS-checked above
+    # (falls back to name-prefix guessing if no known vendor was detected).
+    # Exported via LOCAL_DEVS for inter-node tests.
+    if [[ -n "${_dominant_vid:-}" ]]; then
+        devs_of_vendor LOCAL_DEVS "$_dominant_vid" "${all_devs[@]}"
+    else
+        dominant_group LOCAL_DEVS "${all_devs[@]}"
+    fi
     if (( ${#all_devs[@]} != ${#LOCAL_DEVS[@]} )); then
         log_warn "mixed NIC vendors detected; using ${#LOCAL_DEVS[@]} devices for tests: ${LOCAL_DEVS[*]}"
     fi
@@ -933,59 +953,72 @@ check_inter_node_lat() {
 
 LOCAL_DEVS=()
 
-# detect NIC vendor and run the matching checks
-# Detect NICs by PCI vendor id, not by IB device name: ionic cards may show up as
-# ionic_*, roceensp*, etc., so name matching is not reliable. The vendor id under
-# /sys/class/infiniband/<dev>/device/vendor is stable.
-_ib_has_vendor() {
-    local vid="$1" d
-    [[ -d /sys/class/infiniband ]] || return 1
+# Detect NICs by PCI vendor id (stable), not IB device name (ionic cards may
+# show up as ionic_*, roceensp*, etc.). On mixed-vendor hosts, run the checks
+# for whichever vendor has the most devices ("dominant"), so e.g. one stray
+# bnxt_re management NIC can't steal the checks away from 8x mlx5 GPU NICs.
+_VENDOR_IDS=(ionic:0x1dd8 bnxt:0x14e4 mlx:0x15b3)
+
+ib_count_vendor() {   # <pci_vendor_id> -> number of matching IB devices
+    local vid="$1" d n=0
     for d in /sys/class/infiniband/*; do
-        [[ -e "$d/device/vendor" ]] || continue
-        [[ "$(cat "$d/device/vendor" 2>/dev/null)" == "$vid" ]] && return 0
+        [[ "$(cat "$d/device/vendor" 2>/dev/null)" == "$vid" ]] && (( n++ ))
     done
-    return 1
+    echo "$n"
 }
 
-_have_ionic=false
-_ib_has_vendor 0x1dd8 && _have_ionic=true   # AMD/Pensando (ionic)
+declare -A _VENDOR_COUNT=()
+_dominant_vendor="none"; _dominant_count=0; _dominant_vid=""
+for _nv in "${_VENDOR_IDS[@]}"; do
+    _name="${_nv%%:*}"; _vid="${_nv#*:}"
+    _VENDOR_COUNT[$_name]=$(ib_count_vendor "$_vid")
+    if (( _VENDOR_COUNT[$_name] > _dominant_count )); then
+        _dominant_vendor="$_name"; _dominant_count=${_VENDOR_COUNT[$_name]}; _dominant_vid="$_vid"
+    fi
+done
 
-# The ionic firmware/QoS/DCQCN checks all shell out to `sudo nicctl`. Probe that
-# nicctl is installed AND can actually enumerate the cards; otherwise skip those
-# checks gracefully instead of spewing "Invalid card handle" errors.
+# ionic checks shell out to `sudo nicctl`; probe it can actually see a card
+# before relying on it, to skip gracefully instead of spewing driver errors.
 _nicctl_ok=false
-if [[ "$_have_ionic" == "true" ]] && command -v nicctl >/dev/null 2>&1; then
+if (( ${_VENDOR_COUNT[ionic]} > 0 )) && command -v nicctl >/dev/null 2>&1; then
     _nicctl_out=$(sudo nicctl show version firmware 2>&1 || true)
-    if ! echo "$_nicctl_out" | grep -qiE 'No AMD NICs|Invalid card handle|Failed to get NIC'; then
-        _nicctl_ok=true
-    fi
-    unset _nicctl_out
+    echo "$_nicctl_out" | grep -qiE 'No AMD NICs|Invalid card handle|Failed to get NIC' || _nicctl_ok=true
 fi
 
-_have_bnxt=false
-_ib_has_vendor 0x14e4 && _have_bnxt=true     # Broadcom (bnxt_re)
+# warn about non-dominant vendors present but not checked above
+minority_note() {
+    local nv name
+    for nv in "${_VENDOR_IDS[@]}"; do
+        name="${nv%%:*}"
+        [[ "$name" == "$_dominant_vendor" || "${_VENDOR_COUNT[$name]}" -eq 0 ]] && continue
+        log_warn "also detected ${_VENDOR_COUNT[$name]} $name NIC(s) (not the dominant vendor) — skipping their firmware/QoS/DCQCN checks"
+    done
+}
 
-_have_mlx=false
-_ib_has_vendor 0x15b3 && _have_mlx=true      # Mellanox (mlx5)
-
-if [[ "$_have_ionic" == "true" ]]; then
-    if [[ "$_nicctl_ok" == "true" ]]; then
-        check_versions
-        check_qos
-        check_dcqcn
-    else
-        log_warn "ionic NICs present but nicctl is unavailable or cannot access them — skipping nicctl-based checks (firmware / QoS / DCQCN)"
-    fi
-elif [[ "$_have_bnxt" == "true" ]]; then
-    check_bnxt_versions
-    check_bnxt_qos
-    check_bnxt_dcqcn
-elif [[ "$_have_mlx" == "true" ]]; then
-    step "check mlx5 (Mellanox) NIC"
-    log_ok "Mellanox ConnectX (mlx5) detected — good backward compatibility, no known minimum version for IBGDA"
-else
-    log_warn "no ionic, bnxt_re, or mlx5 NICs detected — skipping NIC-specific checks"
-fi
+case "$_dominant_vendor" in
+    ionic)
+        if [[ "$_nicctl_ok" == "true" ]]; then
+            check_versions
+            check_qos
+            check_dcqcn
+        else
+            log_warn "ionic NICs present but nicctl is unavailable or cannot access them — skipping nicctl-based checks (firmware / QoS / DCQCN)"
+        fi
+        ;;
+    bnxt)
+        check_bnxt_versions
+        check_bnxt_qos
+        check_bnxt_dcqcn
+        ;;
+    mlx)
+        step "check mlx5 (Mellanox) NIC"
+        log_ok "Mellanox ConnectX (mlx5) detected (${_dominant_count}) — good backward compatibility, no known minimum version for IBGDA"
+        ;;
+    *)
+        log_warn "no ionic, bnxt_re, or mlx5 NICs detected — skipping NIC-specific checks"
+        ;;
+esac
+minority_note
 
 check_intra_node_bw
 check_inter_node_bw
