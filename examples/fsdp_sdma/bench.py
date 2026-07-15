@@ -378,7 +378,20 @@ def main() -> None:
     torch.cuda.synchronize(device)
     profiler = None
     profiled_steps = 0
+    # A gen-2 Python GC pass over the large FSDP object graph causes a sporadic
+    # ~250ms pause that stalls one rank; the other ranks then spin-wait at the
+    # cross-node all-gather landing fence, showing up as a single tail spike per
+    # run. gc.freeze() after warmup moves the model graph to a permanent
+    # generation so gen-2 GC never re-scans it, removing the spike. GC never
+    # touches tensor values -> bit-exact. Default ON; MORI_FREEZE_GC=off disables.
+    _gc_mode = os.environ.get("MORI_FREEZE_GC", "freeze").strip().lower()
     for step in range(total_steps):
+        if step == args.warmup and _gc_mode in ("freeze", "1", "on", "true"):
+            import gc as _gc
+            _gc.collect()
+            _gc.freeze()
+            if rank == 0:
+                print("[gc] gc.freeze() applied after warmup", flush=True)
         measured_step_for_profile = step - args.warmup
         should_start_profile = (
             args.profile_dir is not None
