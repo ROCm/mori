@@ -652,19 +652,14 @@ check_bnxt_versions() {
     log_ok "bnxt_re devices (${#BNXT_DEVS[@]}): ${BNXT_DEVS[*]}"
 
     # --- kernel modules ---
-    # bnxt_re/bnxt_en both export /sys/module/<m>/version when loaded, so that's
-    # the only "is it loaded, and what version" signal we need; no lsmod fallback.
-    local m disk_ver load_ver
+    # Only the loaded (in-memory) driver version matters here.
+    local m load_ver
     for m in bnxt_re bnxt_en; do
-        disk_ver=$(modinfo -F version "$m" 2>/dev/null || true)
         if [[ -r "/sys/module/$m/version" ]]; then
             load_ver=$(cat "/sys/module/$m/version")
             log_ok "$m driver : $load_ver"
-            [[ -n "$disk_ver" && "$disk_ver" != "$load_ver" ]] \
-                && log_warn "$m on-disk ($disk_ver) differs from loaded ($load_ver) — reboot needed?"
         else
-            [[ -n "$disk_ver" ]] && log_ok "$m driver (on-disk, not loaded) : $disk_ver" \
-                                 || log_fail "$m : not installed"
+            log_fail "$m : not loaded"
         fi
     done
 
