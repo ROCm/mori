@@ -5,11 +5,10 @@ No GPU, no intermediate CSVs.
 
   python3 plot.py
 
-Reads (../results/):   ut_w16.log, ut_overlap_w16.log,
-                       e2e_w16_native.log, e2e_w16_mori.log
-Writes (../results/):  ut_w16.png, ut_overlap_w16.png,
-                       e2e_w16_loss.png, e2e_w16_tflops.png
+Reads (../results/):   ut_w16.log, e2e_w16_native.log, e2e_w16_mori.log
+Writes (../results/):  ut_w16.png, e2e_w16_loss.png, e2e_w16_tflops.png
 Any figure whose log is missing is skipped.
+(The compute/comm overlap figure is now the cross-node test_overlap_w16.py UT.)
 """
 import os
 import re
@@ -61,54 +60,6 @@ def ut_bandwidth():
     ax.legend(loc="lower right")
     fig.tight_layout()
     out = os.path.join(RES, "ut_w16.png")
-    fig.savefig(out, dpi=130)
-    print("wrote", out)
-
-
-def ut_overlap():
-    txt = _read("ut_overlap_w16.log")
-    if not txt:
-        return
-    pat = re.compile(
-        r"\[gemm-ovlp\] \w+ (\d+)MB .* rccl_total=([\d.]+)ms mori_total=([\d.]+)ms "
-        r"\| solo rccl=([\d.]+) mori=([\d.]+)")
-    rows = [(int(mb), float(rt), float(mt), float(rs), float(ms))
-            for mb, rt, mt, rs, ms in pat.findall(txt)]
-    if not rows:
-        return
-    sizes = [f"{r[0]}MB" for r in rows]
-    x = np.arange(len(sizes))
-    w = 0.35
-    solo_r = [r[3] for r in rows]
-    solo_m = [r[4] for r in rows]
-    tot_r = [r[1] for r in rows]
-    tot_m = [r[2] for r in rows]
-
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 5))
-    for ax, rccl, mori, sub in [
-        (a1, solo_r, solo_m, "AllGather alone (no compute)"),
-        (a2, tot_r, tot_m, "AllGather overlapped with a GEMM"),
-    ]:
-        ax.bar(x - w / 2, rccl, w, color="#ca0020", label="RCCL")
-        ax.bar(x + w / 2, mori, w, color="#0571b0", label="mori HierAllGather (SDMA)")
-        for xi, v in zip(x - w / 2, rccl):
-            ax.annotate(f"{v:.1f}", (xi, v), textcoords="offset points",
-                        xytext=(0, 3), ha="center", fontsize=8)
-        for xi, v in zip(x + w / 2, mori):
-            ax.annotate(f"{v:.1f}", (xi, v), textcoords="offset points",
-                        xytext=(0, 3), ha="center", fontsize=8)
-        ax.set_xticks(x)
-        ax.set_xticklabels(sizes)
-        ax.set_xlabel("per-rank message size")
-        ax.set_ylabel("time (ms, lower = better)")
-        ax.set_title(sub)
-        ax.legend()
-        ax.grid(axis="y", alpha=0.3)
-    fig.suptitle(
-        "AllGather under a concurrent GEMM: RCCL's CU collective contends at large "
-        f"size, mori's SDMA does not\n{HW}", fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
-    out = os.path.join(RES, "ut_overlap_w16.png")
     fig.savefig(out, dpi=130)
     print("wrote", out)
 
@@ -176,5 +127,4 @@ def e2e_curves():
 
 if __name__ == "__main__":
     ut_bandwidth()
-    ut_overlap()
     e2e_curves()

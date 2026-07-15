@@ -109,5 +109,5 @@ curve while the step throughput beats the framework default:
   torchrun --nnodes=2 --nproc_per_node=4 --master_addr=<ip> --master_port=29500 \
     tests/python/ccl/test_hier_allgather.py
   torchrun --nnodes=2 --nproc_per_node=4 ... tests/python/ccl/bench_sweep.py
-  torchrun --nnodes=2 --nproc_per_node=4 ... tests/python/ccl/bench_gemm_overlap.py
+  torchrun --nnodes=2 --nproc_per_node=8 ... tests/python/ccl/test_overlap_w16.py
   ```
