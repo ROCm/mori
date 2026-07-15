@@ -1016,8 +1016,15 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
 
       for (int pe : p2pPeers) {
         hipMemGenericAllocationHandle_t importedHandle;
-        hipError_t err = hipMemImportFromShareableHandle(&importedHandle, &allFabricHandles[pe],
-                                                         hipMemHandleTypeFabricCompat);
+        hipError_t err;
+        {
+          // Import must share the VMM serialization: ROCr races on concurrent
+          // import vs map/setaccess across SPMT threads -> hipMemSetAccess
+          // InvalidValue. #455 serialized map/setaccess but not import.
+          vmmProcessLock vmmLock;
+          err = hipMemImportFromShareableHandle(&importedHandle, &allFabricHandles[pe],
+                                                hipMemHandleTypeFabricCompat);
+        }
         if (err != hipSuccess) {
           MORI_SHMEM_ERROR("ccoWindowRegister: fabric import from PE {} failed: {}", pe,
                            static_cast<int>(err));
@@ -1095,8 +1102,12 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
         }
 
         hipMemGenericAllocationHandle_t importedHandle;
-        hipError_t err = hipMemImportFromShareableHandleCompat(&importedHandle, peerFd,
-                                                               hipMemHandleTypePosixFileDescriptor);
+        hipError_t err;
+        {
+          vmmProcessLock vmmLock;  // serialize import w/ map/setaccess (SPMT race)
+          err = hipMemImportFromShareableHandleCompat(&importedHandle, peerFd,
+                                                      hipMemHandleTypePosixFileDescriptor);
+        }
         if (err != hipSuccess) {
           MORI_SHMEM_ERROR("ccoWindowRegister: import from PE {} failed: {}", pe,
                            static_cast<int>(err));
