@@ -1,4 +1,4 @@
-# RFC: SGLang Indexer KV Event Bridge
+# RFC: SGLang KV Indexer
 
 ## 目标
 
