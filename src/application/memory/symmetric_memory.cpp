@@ -106,7 +106,8 @@ void SymmMemManager::Free(void* localPtr) {
 /*                                    SymmMemObj Registration                                    */
 /* ---------------------------------------------------------------------------------------------- */
 
-SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bool heap_begin) {
+SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bool heap_begin,
+                                                 bool rdmaRegister) {
   int worldSize = bootNet.GetWorldSize();
   int rank = bootNet.GetLocalRank();
 
@@ -194,7 +195,12 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       break;
     }
   }
-  if (rdmaDeviceContext && anyRdmaPeer) {
+  // SDMA/P2P-only transits pass rdmaRegister=false to skip ibv_reg_mr (the
+  // buffer is never an RDMA src/dst). This dodges the ionic single-MR limit
+  // (ibv_reg_mr fails at >=~2 GiB) for the hierarchical AllGather's intra
+  // node-block. The rkey stays 0 and the Allgather below still runs, so the
+  // collective register stays in lockstep.
+  if (rdmaDeviceContext && anyRdmaPeer && rdmaRegister) {
     application::RdmaMemoryRegion mr =
         rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
     cpuMemObj->lkey = mr.lkey;
@@ -207,7 +213,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   // for rail-2 QP ids. Exchange the rail-2 rkeys the same way as the primary.
   RdmaDeviceContext* rdmaDeviceContext2 = context.GetRdmaDeviceContext2();
   cpuMemObj->peerRkeys2 = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
-  if (rdmaDeviceContext2 && anyRdmaPeer) {
+  if (rdmaDeviceContext2 && anyRdmaPeer && rdmaRegister) {
     application::RdmaMemoryRegion mr2 =
         rdmaDeviceContext2->RegisterRdmaMemoryRegion(localPtr, size);
     cpuMemObj->lkey2 = mr2.lkey;

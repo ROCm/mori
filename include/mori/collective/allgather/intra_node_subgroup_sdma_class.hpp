@@ -245,7 +245,11 @@ class IntraNodeSubGroupAllgatherSdma {
     out_ = shmem::ShmemMalloc(outBytes_);
     if (out_ == nullptr)
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: out ShmemMalloc failed");
-    outObj_ = shmem::ShmemSymmetricRegister(out_, outBytes_);
+    // The out_ transit is the intra-node node-block: gathered and consumed ONLY
+    // via P2P/SDMA (XGMI) — never an RDMA src/dst (the inter ring uses its own
+    // RDMA-registered buffer). Register P2P/SDMA-only (rdmaRegister=false) so the
+    // node-block buffer dodges the ionic single-MR limit at large _max_bytes.
+    outObj_ = shmem::ShmemSymmetricRegister(out_, outBytes_, /*rdmaRegister=*/false);
     if (!outObj_.IsValid())
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: out register failed");
 
