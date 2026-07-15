@@ -1,11 +1,5 @@
 # RFC: SGLang Indexer KV Event Bridge
 
-## 背景
-
-SGLang / HiCache 会通过 ZMQ 发布 KV cache 事件，例如 block 写入、删除和整体清空。Indexer 需要感知这些外部 KV cache 的 placement metadata，以便后续进行跨 worker 的 KV 查询、调度和命中统计。
-
-`SglangIndexKvEventBridge` 是一个独立 bridge / sidecar。它只同步 metadata，不搬运 KV bytes，也不把 external KV 纳入 indexer-owned 数据面。
-
 ## 目标
 
 1. Bridge 将 SGLang KV event 转换成 indexer 的 KV 位置索引操作。
