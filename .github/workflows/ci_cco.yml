@@ -14,7 +14,7 @@ env:
   IMAGE: rocm/mori:ci-cco
   BASE_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
   CONTAINER: mori_cco_ci_${{ github.run_id }}
-  CT: docker
+  CT: podman  # MI355X-AINIC runner is podman rootless (no docker daemon)
 
 jobs:
   cco-unit-test:
