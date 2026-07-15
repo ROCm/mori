@@ -348,26 +348,19 @@ check_ainic_version_recommendation() {
 #   classifies Broadcom firmware by major branch against known-good/known-bad
 #   ranges for cross-node MORI (EP over RDMA / IBGDA).
 check_bnxt_version_recommendation() {
-    local ver="$1" major="${1%%.*}"
+    local ver="$1" major="${1%%.*}" min=""
     [[ -n "$ver" ]] || { log_warn "cannot verify Broadcom firmware version against recommendation (empty)"; return; }
     case "$major" in
-        231)
-            log_warn "Broadcom firmware $ver is on the 231.x branch, which is too old for IBGDA — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"
-            ;;
-        235)
-            version_ge "$ver" "$BNXT_MIN_VER_235" \
-                && log_ok "Broadcom firmware $ver is solid (>= $BNXT_MIN_VER_235 on the 235.x branch)" \
-                || log_warn "Broadcom firmware $ver is below the solid minimum on the 235.x branch (>= $BNXT_MIN_VER_235)"
-            ;;
-        237)
-            version_ge "$ver" "$BNXT_MIN_VER_237" \
-                && log_ok "Broadcom firmware $ver is solid (>= $BNXT_MIN_VER_237 on the 237.x branch)" \
-                || log_warn "Broadcom firmware $ver is below the solid minimum on the 237.x branch (>= $BNXT_MIN_VER_237)"
-            ;;
-        *)
-            log_warn "Broadcom firmware $ver is on an unverified branch ($major.x) — known-solid: $BNXT_MIN_VER_235, $BNXT_MIN_VER_237; known-bad: 231.x"
-            ;;
+        231) log_warn "Broadcom firmware $ver is on the 231.x branch, which is too old for IBGDA — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"; return ;;
+        235) min="$BNXT_MIN_VER_235" ;;
+        237) min="$BNXT_MIN_VER_237" ;;
+        *)   log_warn "Broadcom firmware $ver is on an unverified branch ($major.x) — known-solid: $BNXT_MIN_VER_235, $BNXT_MIN_VER_237; known-bad: 231.x"; return ;;
     esac
+    if version_ge "$ver" "$min"; then
+        log_ok "Broadcom firmware $ver is solid (>= $min on the $major.x branch)"
+    else
+        log_warn "Broadcom firmware $ver is below the solid minimum on the $major.x branch (>= $min)"
+    fi
 }
 
 # dominant_group <out_array_name> <dev...>
@@ -683,9 +676,14 @@ check_bnxt_versions() {
         log_fail "niccli not found — cannot check firmware version"; return 1
     fi
 
+    # One "niccli --list" call, reused below both for the index list and for
+    # the PCI->niccli_index map (used to be fetched twice).
+    local niccli_list
+    niccli_list=$(sudo niccli --list 2>/dev/null || true)
+
     # get list of NIC indices from niccli --list (first column, skip header)
     local nic_indices=()
-    mapfile -t nic_indices < <(sudo niccli --list 2>/dev/null | awk 'NR>1 && /^[[:space:]]*[0-9]/{gsub(/[^0-9]/,"",$1); print $1}')
+    mapfile -t nic_indices < <(awk 'NR>1 && /^[[:space:]]*[0-9]/{gsub(/[^0-9]/,"",$1); print $1}' <<< "$niccli_list")
     if [[ ${#nic_indices[@]} -eq 0 ]]; then
         log_warn "niccli --list returned no devices; defaulting to index 1"
         nic_indices=(1)
@@ -694,19 +692,34 @@ check_bnxt_versions() {
     # field <output> <label> -> value after the ':' for the line starting with <label>
     _niccli_field() { awk -F: -v k="$2" 'index($0,k)==1 {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' <<<"$1"; }
 
+    # `niccli -i <idx> show` has no "all NICs at once" form (unlike nicctl for
+    # ionic), so query every index in parallel instead of one-by-one; each call
+    # is a slow round trip to the NIC's firmware. Throttled like the mesh tests.
     local fw_versions=() roce_versions=() failed_idxs=()
-    local idx
+    local idx tmpd running=0
+    tmpd=$(mktemp -d)
     for idx in "${nic_indices[@]}"; do
-        local show_out fw_ver roce_ver
-        show_out=$(sudo niccli -i "$idx" show 2>/dev/null || true)
-        fw_ver=$(_niccli_field "$show_out" "Firmware Version")
-        roce_ver=$(_niccli_field "$show_out" "RoCE Firmware Version")
+        (
+            show_out=$(sudo niccli -i "$idx" show 2>/dev/null || true)
+            printf '%s\n%s\n' "$(_niccli_field "$show_out" "Firmware Version")" \
+                               "$(_niccli_field "$show_out" "RoCE Firmware Version")" > "$tmpd/$idx"
+        ) &
+        running=$(( running + 1 ))
+        if (( running >= MESH_PARALLEL )); then wait -n 2>/dev/null; running=$(( running - 1 )); fi
+    done
+    wait
+
+    for idx in "${nic_indices[@]}"; do
+        local fw_ver roce_ver
+        fw_ver=$(sed -n '1p' "$tmpd/$idx" 2>/dev/null)
+        roce_ver=$(sed -n '2p' "$tmpd/$idx" 2>/dev/null)
         if [[ -n "$fw_ver" ]]; then
             fw_versions+=("$fw_ver"); roce_versions+=("${roce_ver:-$fw_ver}")
         else
             failed_idxs+=("$idx")
         fi
     done
+    rm -rf "$tmpd"
 
     _report_fw() {  # <label> <versions...>
         local label="$1"; shift
@@ -731,11 +744,9 @@ check_bnxt_versions() {
     fi
 
     # --- port state, net device, and niccli index mapping via sysfs ---
-    # Build a PCI->niccli_index map from "niccli --list" output:
+    # Build a PCI->niccli_index map from the "niccli --list" output fetched above:
     #   "  1) BCM57608  <mac>  235.2.40.0  0000:06:00.0  NIC  PCI"
     declare -A _pci2idx=()
-    local niccli_list
-    niccli_list=$(sudo niccli --list 2>/dev/null || true)
     while IFS= read -r line; do
         local idx pci
         idx=$(echo "$line" | awk '/^[[:space:]]*[0-9]+\)/{gsub(/[^0-9]/,"",$1); print $1}')
