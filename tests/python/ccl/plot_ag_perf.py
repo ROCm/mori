@@ -62,24 +62,20 @@ def main():
     # subtle band between the two curves
     ax.fill_between(x, rccl, mori_e2e, color="#1f77b4", alpha=0.08, zorder=0)
 
-    for i in range(len(sizes)):
-        ax.annotate(f"{rccl[i]:.0f}", (i, rccl[i]), textcoords="offset points",
-                    xytext=(0, 10), ha="center", fontsize=9, color="#4b5157")
-        ax.annotate(f"{mori_e2e[i]:.0f}", (i, mori_e2e[i]), textcoords="offset points",
-                    xytext=(0, -16), ha="center", fontsize=9, color="#1f77b4")
-
     ax.set_xticks(x)
     ax.set_xticklabels([f"{s} MB" for s in sizes])
     ax.set_ylabel("algorithmic bandwidth (GB/s)")
     ax.set_xlabel("per-rank AllGather message size")
     ax.set_title("Cross-node AllGather UT (w16 = 2 node x 8 MI300X)\n"
                  "E2E-stable config is bit-exact & proven E2E-safe (Jul-13 500-step run)")
-    ax.legend(fontsize=9, loc="lower right")
+    ax.legend(fontsize=10, loc="lower right", frameon=False)
     # full range from 0 with a tall axis: the ~20-40 GB/s gap reads as a small
     # fraction of the scale (the two curves track close together).
     ax.set_ylim(0, max(rccl) * 1.15)
     ax.margins(x=0.08)
-    ax.grid(axis="y", ls=":", alpha=0.5)
+    ax.grid(axis="y", ls=":", alpha=0.45)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
     fig.tight_layout()
 
     png = os.path.join(RES, "ag_perf_e2e_stable_w16.png")
