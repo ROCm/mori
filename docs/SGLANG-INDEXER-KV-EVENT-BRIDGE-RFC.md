@@ -174,7 +174,7 @@ UMBP 已经具备一组可复用的 KV backend、分层存储、路由和 metada
 | 分布式 `Put` / `Get` | route get / route put、peer service | 本地 miss 后可查询 remote placement，并从远端节点读取或写入 KV block；这是 bytes path，不属于本 RFC 的 bridge 范围。 |
 | 批量操作 | batch put / get / exists | 面向 prefix cache / block cache 的批量访问模式，减少逐 block RPC 或查询开销。 |
 | 分层存储 | HBM / DRAM / SSD tier | KV block 可以分布在不同速度和容量的 tier 上；调度时可优先选择更快 tier。 |
-| Global / Local Block Index | global placement index、local hint index | 全局 index 维护跨节点 placement，本地 index 维护快速命中 hint；独立 indexer 会复用类似的 metadata 建模方式。 |
+| Global / Local Block Index | global placement index、local hint index | 全局 index 维护跨节点 placement，本地 index 维护快速命中 hint。 |
 | Global Routing | route get / route put strategy | 根据 placement、节点状态和 tier 信息选择读源或写入目标；External KV 的 `match` 结果可作为调度输入。 |
 | External KV metadata | `report` / `revoke` / `match` | 允许外部系统上报自己持有的 KV placement；indexer 只记录 metadata，用于跨 worker KV 发现。 |
 | Hit count primitive | `match(..., count_as_hit=True)`、hit-count query | 将真实路由查询命中累计成 per-hash 热度信号，供 scheduler 或 bridge 后续策略使用。 |
