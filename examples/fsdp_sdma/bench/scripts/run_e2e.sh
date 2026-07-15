@@ -18,8 +18,12 @@
 #   bash run_e2e.sh ibgda_sdma   # RCCL + ibgda_sdma
 #   WORLD=w8 bash run_e2e.sh     # world=8 (default w16)
 #
-# Node pair + repo from env (defaults below). Writes raw logs to
-# ../results/mi300x_mlx5/raw/e2e_<world>_{RCCL,<variant>}.log .
+# Platform (node pair + NIC fabric) is a choice; default mi300x_mlx5:
+#   PLATFORM=mi355x_ainic bash run_e2e.sh   # MI355X + AINIC (ionic) node pair & NICs
+#
+# Node pair + repo from env (platform defaults below; individual env still
+# overrides). Writes raw logs to
+# ../results/<platform>/raw/e2e_<world>_{RCCL,<variant>}.log .
 # ==========================================================================
 set -u
 VARIANT="${1:-hp_sdma}"
@@ -36,17 +40,30 @@ case "$VARIANT" in
   ibgda_sdma)  MORI_ENV="MORI_HIER_DEBUG_SYNC=0" ;;
   *) echo "usage: bash run_e2e.sh [hp_sdma|hp_cu|ibgda_sdma]   (default: hp_sdma)"; exit 2 ;;
 esac
-MASTER="${MASTER:-useocpm2m-097-040}"
-WORKER="${WORKER:-useocpm2m-097-083}"
-MASTER_IP="${MASTER_IP:-10.158.213.159}"
+# Platform = node pair + NIC fabric. PLATFORM=mi300x_mlx5 (default) or mi355x_ainic.
+# Any of MASTER/WORKER/MASTER_IP/IFACE/NCCL_IB_GID_INDEX/MORI_RDMA_DEVICES still
+# override individually; the platform only fills the ones left unset.
+PLATFORM="${PLATFORM:-mi300x_mlx5}"
+case "$PLATFORM" in
+  mi300x_mlx5)   # MI300X + Mellanox mlx5 (RoCEv2 on GID 3)
+    : "${MASTER:=useocpm2m-097-040}"; : "${WORKER:=useocpm2m-097-083}"; : "${MASTER_IP:=10.158.213.159}"
+    : "${IFACE:=eth0}"; : "${NCCL_IB_GID_INDEX:=3}"
+    : "${MORI_RDMA_DEVICES:=mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9}" ;;
+  mi355x_ainic)  # MI355X + AINIC (ionic RoCEv2 on GID 1)
+    : "${MASTER:=smci355-ccs-aus-n09-33.prov.aus.ccs.cpe.ice.amd.com}"
+    : "${WORKER:=smci355-ccs-aus-n09-29.prov.aus.ccs.cpe.ice.amd.com}"; : "${MASTER_IP:=10.235.192.86}"
+    : "${IFACE:=enp81s0f1}"; : "${NCCL_IB_GID_INDEX:=1}"
+    : "${MORI_RDMA_DEVICES:=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7}" ;;
+  *) echo "PLATFORM must be mi300x_mlx5 or mi355x_ainic"; exit 2 ;;
+esac
 CTR="${CTR:-mori-sglang-mingzhi}"
 WT="${MORI_REPO:-$(cd "$(dirname "$0")/../../../.." && pwd)}"
 EX="$WT/examples/fsdp_sdma"
 CFG="${QWEN_CFG:-$(cd "$(dirname "$0")" && pwd)/qwen7b_vocab32000}"
-OUT="${OUT:-$(cd "$(dirname "$0")/.." && pwd)/results/mi300x_mlx5/raw}"
-IFACE="${IFACE:-eth0}"
-IB="${MORI_RDMA_DEVICES:-mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9}"
-GID="${NCCL_IB_GID_INDEX:-3}"
+OUT="${OUT:-$(cd "$(dirname "$0")/.." && pwd)/results/$PLATFORM/raw}"
+IFACE="$IFACE"
+IB="$MORI_RDMA_DEVICES"
+GID="$NCCL_IB_GID_INDEX"
 WORLD="${WORLD:-w16}"
 STEPS="${STEPS:-500}"
 
