@@ -1,0 +1,5 @@
+size_mb,rccl_gbps,ibgda_sdma_gbps,bitexact
+64,376.0,337.2,True
+128,379.2,356.2,True
+256,382.6,364.2,True
+512,384.9,368.2,True

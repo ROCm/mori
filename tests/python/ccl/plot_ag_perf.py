@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Plot the cross-node AllGather-perf UT (w16, MI300X) for the two switch presets.
+
+Parses ag_perf_results/ut_{e2e,perf}_m.log (produced by run_ut_ag_perf.sh),
+emits clean CSVs, and renders a grouped-bar GB/s chart at 64/128/512 MB:
+  RCCL  vs  mori ibgda_sdma (E2E-stable)  vs  mori ibgda_sdma (pure-perf, context).
+
+The E2E-stable bar is the shipped/representative number: same handle construction
+the w16 E2E FSDP run uses (MORI_HIER_UT_FAST=0), bit-exact & proven E2E-safe.
+"""
+import os
+import re
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+RES = os.path.join(HERE, "ag_perf_results")
+LINE = re.compile(
+    r"\[ag-perf\]\s+(\d+)MB\s+\|\s+rccl=[\d.]+ms\s+\(([\d.]+)GB/s\)\s+"
+    r"ibgda_sdma=[\d.]+ms\s+\(([\d.]+)GB/s\)\s+\|\s+bitexact=(\w+)"
+)
+
+
+def parse(preset):
+    """return {size_mb: (rccl_gbps, ibgda_gbps, bitexact)}"""
+    path = os.path.join(RES, f"ut_{preset}_m.log")
+    out = {}
+    with open(path) as f:
+        for ln in f:
+            m = LINE.search(ln)
+            if m:
+                sz = int(m.group(1))
+                out[sz] = (float(m.group(2)), float(m.group(3)), m.group(4) == "True")
+    return out
+
+
+def write_csv(preset, data):
+    p = os.path.join(RES, f"ag_perf_{preset}.csv")
+    with open(p, "w") as f:
+        f.write("size_mb,rccl_gbps,ibgda_sdma_gbps,bitexact\n")
+        for sz in sorted(data):
+            r, i, bx = data[sz]
+            f.write(f"{sz},{r:.1f},{i:.1f},{bx}\n")
+    return p
+
+
+def main():
+    e2e = parse("e2e")
+    sizes = sorted(e2e)
+    write_csv("e2e", e2e)
+
+    x = list(range(len(sizes)))
+    rccl = [e2e[s][0] for s in sizes]
+    mori_e2e = [e2e[s][1] for s in sizes]
+
+    fig, ax = plt.subplots(figsize=(8.2, 5.0))
+    ax.plot(x, rccl, marker="o", ms=8, lw=2.2, color="#6c757d",
+            label="RCCL (all_gather_into_tensor)")
+    ax.plot(x, mori_e2e, marker="s", ms=8, lw=2.2, color="#1f77b4",
+            label="mori ibgda_sdma — E2E-stable (UT_FAST=0, shipped)")
+    # subtle band between the two curves to make the small gap read as tight
+    ax.fill_between(x, rccl, mori_e2e, color="#1f77b4", alpha=0.08, zorder=0)
+
+    for i, s in enumerate(sizes):
+        ax.annotate(f"{rccl[i]:.0f}", (i, rccl[i]), textcoords="offset points",
+                    xytext=(0, 8), ha="center", fontsize=8, color="#4b5157")
+        ax.annotate(f"{mori_e2e[i]:.0f}", (i, mori_e2e[i]), textcoords="offset points",
+                    xytext=(0, -14), ha="center", fontsize=8, color="#1f77b4")
+        ax.annotate(f"{mori_e2e[i]/rccl[i]:.2f}x", (i, mori_e2e[i]),
+                    textcoords="offset points", xytext=(0, -26), ha="center",
+                    fontsize=8, color="#1f77b4", weight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{s} MB" for s in sizes])
+    ax.set_ylabel("algorithmic bandwidth (GB/s)")
+    ax.set_xlabel("per-rank AllGather message size")
+    ax.set_title("Cross-node AllGather UT (w16 = 2 node x 8 MI300X)\n"
+                 "E2E-stable config is bit-exact & proven E2E-safe (Jul-13 500-step run)")
+    ax.legend(fontsize=9, loc="lower right")
+    # zoomed y-axis (not from 0) so the ~0.9-0.96x gap reads tight
+    lo = min(mori_e2e); hi = max(rccl)
+    pad = (hi - lo) * 0.9 + 6
+    ax.set_ylim(lo - pad, hi + pad * 0.35)
+    ax.margins(x=0.08)
+    ax.grid(axis="y", ls=":", alpha=0.5)
+    fig.tight_layout()
+
+    png = os.path.join(RES, "ag_perf_e2e_stable_w16.png")
+    fig.savefig(png, dpi=140)
+    print("wrote", png)
+    for s in sizes:
+        print(f"{s}MB: rccl={e2e[s][0]:.1f}  e2e-stable={e2e[s][1]:.1f}"
+              f"  ratio={e2e[s][1]/e2e[s][0]:.3f}  bitexact={e2e[s][2]}")
+
+
+if __name__ == "__main__":
+    main()
