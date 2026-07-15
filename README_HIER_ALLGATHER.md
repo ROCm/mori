@@ -37,77 +37,88 @@ ag = HierAllGather(
 ag(input_tensor, output_tensor, numel, stream)   # intra=SDMA, inter=RDMA
 ```
 
-## Results (MI300X, mlx5 RoCEv2, fp32, all bit-exact vs RCCL)
+## Results (MI300X, mlx5 RoCEv2 — w16 = 2 node × 8 GPU; all bit-exact vs RCCL)
 
-Full tables, CSVs, and chart scripts are under
-[`examples/fsdp_sdma/`](examples/fsdp_sdma/) (`RESULTS.md`, `bench_data/`,
-`make_bench_charts.py`); the figures below are regenerated from that data with no
-GPU required.
+Raw logs, CSVs, and the plot scripts live under
+[`examples/fsdp_sdma/bench/`](examples/fsdp_sdma/bench/); every figure below is
+regenerated from that data. See **Reproduce** for the exact commands.
 
-**Standalone AllGather bandwidth vs RCCL** — full size sweep. world=16 uses the
-intra-node crown broadcast schedule (`MORI_HIER_CROWN`) and reaches parity/above
-RCCL at ≥64 MB; world=8 (4 GPU/node) is bounded by a fixed per-op SDMA cost at
-small/mid sizes and reaches parity at the largest message:
+### 1. Standalone AllGather bandwidth vs RCCL (E2E-stable config)
 
-| size | w8 ratio | w16 ratio |
-|-----:|---------:|----------:|
-| 4 MB   | 0.54 |  —   |
-| 8 MB   | 0.81 | 0.80 |
-| 16 MB  | 0.83 | 0.73 |
-| 32 MB  | 0.87 | 0.93 |
-| 64 MB  | 0.87 | 1.00 |
-| 128 MB | 0.88 | 1.03 |
-| 256 MB | 0.98 | 1.04 |
-| 512 MB | 1.07 | 1.03 |
+The shipped E2E construction (`MORI_HIER_UT_FAST=0`, device `ibgda_sdma`) is
+bit-exact and tracks RCCL closely, converging as the message grows. A single
+AllGather is **not** where the win is — the collective is network-bound and
+GPU-light, so standalone bandwidth is near-parity, not a beat:
 
-The small/mid-size deficit is a fixed per-op SDMA round-trip (a ~3-launch
-pipeline ramp), not a bandwidth gap — the mori copy engine reaches RCCL's per-NIC
-bandwidth at large messages. Standalone bandwidth parity is sufficient because the
-end-to-end win comes from the no-CU-contention dividend below, not from beating
-RCCL on an isolated AllGather.
+| per-rank size | ibgda_sdma / RCCL |
+|--------------:|:-----------------:|
+| 64 MB  | 0.90× |
+| 128 MB | 0.94× |
+| 256 MB | 0.95× |
+| 512 MB | 0.96× |
 
-![standalone](examples/fsdp_sdma/ut_allgather_bw.png)
+![standalone AllGather bandwidth](examples/fsdp_sdma/bench/results/mi300x_mlx5/ag_perf_e2e_stable_w16.png)
 
-**Bandwidth under a concurrent GEMM (no-CU-contention dividend)** — RCCL's copy
-kernels compete with the GEMM for CUs and lose bandwidth; the SDMA copy engine
-does not touch CUs, so HierAllGather slows far less and is faster than RCCL under
-contention (m/r < 1 = mori faster with the GEMM running):
+### 2. GEMM time under concurrent AllGather (the no-CU-contention dividend)
 
-| per-rank | RCCL slowdown | HierAllGather slowdown |
-|---------:|--------------:|-----------------------:|
-| 34 MB  | 2.96× | 1.67× |
-| 67 MB  | 2.26× | 1.79× |
-| 134 MB | 1.48× | 1.08× |
-| 268 MB | 1.21× | 1.06× |
-| 537 MB | 1.11× | 1.02× |
+Where the win actually comes from: RCCL's CU-resident AllGather kernels steal the
+GPU from concurrent GEMMs; `hp_sdma` keeps the cross-node leg on the CPU and the
+intra-node leg on the SDMA copy engine, so the GEMMs finish faster while 50
+AllGathers run concurrently (lower = better, bit-exact vs RCCL):
 
-![gemm overlap](examples/fsdp_sdma/gemm_overlap.png)
+| 50 AGs ‖ 50 GEMMs | RCCL | hp_sdma | speedup |
+|---|--:|--:|:--:|
+| 8 MB,  GEMM n=2048 | 3.5 ms  | 2.6 ms  | 1.33× |
+| 8 MB,  GEMM n=4096 | 17.5 ms | 15.8 ms | 1.11× |
+| 16 MB, GEMM n=4096 | 19.1 ms | 16.0 ms | 1.20× |
 
-**End-to-end FSDP2 (Qwen-7B, seq 2048, 500 steps)** — drop-in `MoriAllGather`
-backend; the training loss is bit-identical to the native run over the whole
-curve while the step throughput beats the framework default:
+![GEMM time under concurrent AllGather](examples/fsdp_sdma/bench/results/mi300x_mlx5/overlap_w16_gemm_time.png)
 
-| topology | throughput vs native | loss (bit-exact) |
-|----------|---------------------:|------------------|
-| world=8  (2×4) | 1.03× | 10.411232 |
-| world=16 (2×8) | 1.02× | 10.391944 |
+### 3. End-to-end FSDP2 (Qwen-7B, seq 2048, w16) — drop-in MoriAllGather
 
-![e2e](examples/fsdp_sdma/compare_chart.png)
-![loss](examples/fsdp_sdma/loss_curve.png)
+Training loss is bit-identical to the native run over the whole curve while step
+throughput beats the framework default. Three mori variants (intra × inter leg):
+
+| variant | inter-node leg | intra-node leg | throughput vs RCCL |
+|---|---|---|--:|
+| `hp_sdma`    | host-proxy (CPU-posted RDMA) | SDMA (XGMI, CU-free) | ~1.20× |
+| `hp_cu`      | host-proxy                   | NCCL (CU)            | ~1.10× |
+| `ibgda_sdma` | device IBGDA (GPU-posted RDMA) | SDMA               | ~1.07× |
+
+![E2E loss](examples/fsdp_sdma/bench/results/mi300x_mlx5/e2e_all_w16_loss.png)
+![E2E throughput](examples/fsdp_sdma/bench/results/mi300x_mlx5/e2e_all_w16_tflops.png)
+
+## Reproduce
+
+Each benchmark launches the 2-node run itself (ssh into master + worker, clear
+stale procs, start `torchrun`). The node pair / NIC list is at the top of each
+script — edit it for a different cluster.
+
+```bash
+# 1) Standalone AllGather bandwidth UT (device ibgda_sdma vs RCCL)
+#    -> reproduces ag_perf_e2e_stable_w16.png
+cd tests/python/ccl
+bash run_ut_ag_perf.sh e2e  64 128 256 512   # E2E-stable (shipped) config
+bash run_ut_ag_perf.sh perf 64 128 256 512   # pure-perf (standalone_fast, NOT E2E-legal), for context
+
+# 2) Compute/comm overlap UT (GEMM time under 50 concurrent AGs, hp_sdma vs RCCL)
+#    -> reproduces overlap_w16_gemm_time.png   (args: gemm_n size_mb nops)
+bash run_ut_overlap.sh 2048  8 50
+bash run_ut_overlap.sh 4096  8 50
+bash run_ut_overlap.sh 4096 16 50
+
+# 3) End-to-end FSDP2 (Qwen-7B): RCCL baseline + one mori variant, bit-exact loss + tflops
+cd ../../../examples/fsdp_sdma/bench/scripts
+bash run_e2e.sh              # RCCL + hp_sdma (default)
+bash run_e2e.sh hp_cu
+bash run_e2e.sh ibgda_sdma
+WORLD=w8 bash run_e2e.sh     # world=8 (default w16)
+```
 
 ## Test plan
 
 - [x] Bit-exact vs `torch.distributed.all_gather_into_tensor` for
       `{bf16, fp16, fp32, int32}` on every tested size (true 2-node, world=8 & 16).
-- [x] Standalone bandwidth size sweep (parity/above RCCL at ≥32 MB w8, ≥64 MB w16).
-- [x] GEMM-overlap contention test (SDMA holds bandwidth; RCCL slows >2.5×).
+- [x] Standalone AllGather bandwidth sweep, E2E-stable config (near-parity, bit-exact).
+- [x] Compute/comm overlap UT — GEMM finishes 1.1–1.3× faster under 50 concurrent AGs.
 - [x] End-to-end FSDP2 training, loss bit-identical to native at world=8 & 16.
-- Reproduce:
-  ```bash
-  python3 setup.py build_ext --inplace
-  export PYTHONPATH=$PWD:$PWD/python:$PYTHONPATH MORI_ENABLE_SDMA=1
-  torchrun --nnodes=2 --nproc_per_node=4 --master_addr=<ip> --master_port=29500 \
-    tests/python/ccl/test_hier_allgather.py
-  torchrun --nnodes=2 --nproc_per_node=4 ... tests/python/ccl/bench_sweep.py
-  torchrun --nnodes=2 --nproc_per_node=8 ... tests/python/ccl/test_overlap_w16.py
-  ```
