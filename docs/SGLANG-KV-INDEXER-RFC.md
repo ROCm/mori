@@ -6,6 +6,8 @@ This RFC proposes a SGLang KV Indexer for collecting and querying distributed KV
 
 SGLang workers already emit KV cache lifecycle events such as `BlockStored`, `BlockRemoved`, and `AllBlocksCleared`. A bridge component converts these events into indexer metadata updates. Query clients can then ask the indexer which workers may hold a given set of KV block hashes.
 
+The initial project will be implemented out of tree as an independent Rust service. It integrates with SGLang through the existing KV event stream and gRPC APIs, without requiring the indexer code to live inside the SGLang source tree.
+
 ## Goals
 
 1. Collect KV location metadata from SGLang workers.
@@ -70,7 +72,7 @@ This allows a KV block hash to exist on multiple workers and on multiple tiers o
 
 ## Bridge
 
-The bridge adapts SGLang KV events into indexer metadata operations. It can be deployed as a sidecar near each SGLang worker, embedded into SGLang, or embedded into the indexer. The recommended first implementation is a sidecar because it avoids changes to the SGLang worker process and can be deployed independently.
+The bridge adapts SGLang KV events into indexer metadata operations. The initial implementation will run out of tree, most likely as a sidecar near each SGLang worker. This avoids changes to the SGLang worker process and keeps the indexer deployable independently while the API stabilizes.
 
 | Function | Description |
 | --- | --- |
@@ -128,81 +130,28 @@ enum TierType {
   TIER_SSD = 3;
 }
 
-message ReportExternalKvBlocksRequest {
-  string worker_id = 1;
-  repeated string hashes = 2;
-  TierType tier = 3;
-}
-
-message RevokeExternalKvBlocksRequest {
-  string worker_id = 1;
-  repeated string hashes = 2;
-  TierType tier = 3;
-}
-
-message RevokeAllExternalKvBlocksAtTierRequest {
-  string worker_id = 1;
-  TierType tier = 2;
-}
-
-message MatchExternalKvRequest {
-  repeated string hashes = 1;
-  bool count_as_hit = 2;
-}
-
-message TierHashes {
-  TierType tier = 1;
-  repeated string hashes = 2;
-}
-
-message ExternalKvNodeMatch {
-  string worker_id = 1;
-  string address = 2;
-  repeated TierHashes hashes_by_tier = 3;
-}
-
-message MatchExternalKvResponse {
-  repeated ExternalKvNodeMatch matches = 1;
-}
-
-message HitCountEntry {
-  string hash = 1;
-  uint64 hit_count_total = 2;
-}
-
-message GetExternalKvHitCountsRequest {
-  repeated string hashes = 1;
-}
-
-message GetExternalKvHitCountsResponse {
-  repeated HitCountEntry entries = 1;
-}
-
 service KVIndexer {
-  rpc ReportExternalKvBlocks(ReportExternalKvBlocksRequest)
-      returns (google.protobuf.Empty);
-  rpc RevokeExternalKvBlocks(RevokeExternalKvBlocksRequest)
-      returns (google.protobuf.Empty);
-  rpc RevokeAllExternalKvBlocksAtTier(RevokeAllExternalKvBlocksAtTierRequest)
-      returns (google.protobuf.Empty);
-  rpc MatchExternalKv(MatchExternalKvRequest)
-      returns (MatchExternalKvResponse);
-  rpc GetExternalKvHitCounts(GetExternalKvHitCountsRequest)
-      returns (GetExternalKvHitCountsResponse);
+  rpc ReportExternalKvBlocks(worker_id, hashes, tier) returns (Empty);
+  rpc RevokeExternalKvBlocks(worker_id, hashes, tier) returns (Empty);
+  rpc RevokeAllExternalKvBlocksAtTier(worker_id, tier) returns (Empty);
+  rpc MatchExternalKv(hashes, count_as_hit) returns (matches);
+  rpc GetExternalKvHitCounts(hashes) returns (hit_counts);
 }
 ```
 
+`MatchExternalKv` returns matches grouped by worker and tier, for example `worker_id -> tier -> hashes`. `GetExternalKvHitCounts` returns `hash -> hit_count_total`.
+
 `count_as_hit` is used to distinguish real scheduling lookups from diagnostic queries. When it is true, only matched hashes should increase hit-count statistics.
 
-## Implementation Language
+## Implementation Approach
 
-Rust is recommended for the indexer service. It provides near-C++ performance, strong memory and thread-safety guarantees, and a mature async / gRPC ecosystem. Python is attractive for prototyping but less suitable for a high-QPS metadata service. C++ is performant but has higher long-term maintenance risk for concurrent metadata state.
+The indexer service will be implemented in Rust. Rust provides near-C++ performance, strong memory and thread-safety guarantees, and a mature async / gRPC ecosystem. This is a good fit for a high-QPS metadata service with concurrent location updates and lookups.
 
-The first implementation can use `tonic` for gRPC, `tokio` for async runtime, and an in-memory metadata store. The store interface should allow Redis, SQL, or RocksDB backends later.
+The first implementation can use `tonic` for gRPC, `tokio` for async runtime, and an in-memory metadata store. The project should remain out of tree from SGLang and keep the store interface stable so Redis, SQL, or RocksDB backends can be added later without changing the gRPC API.
 
 ## Open Questions
 
-- Should the bridge be shipped as a sidecar first, or embedded into SGLang after the API stabilizes?
+- Should the out-of-tree bridge remain a sidecar long term, or should parts of it be upstreamed into SGLang after the API stabilizes?
 - Should the indexer store only block-level hashes initially, or also accept prefix-chain information for future prefix-aware routing?
 - What consistency guarantees are required between SGLang KV events and indexer metadata?
 - Which metadata store backend should be recommended for production deployment?
