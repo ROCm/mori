@@ -169,17 +169,24 @@ echo "[ci_run] Runtime: $RUNTIME | NIC type: $NIC_TYPE"
 
 read -ra NIC_MOUNTS <<< "$(nic_mount_flags "$NIC_TYPE")"
 
+# --init (tini/catatonit as PID 1) reaps exited child processes so zombies don't
+# keep KFD contexts / VRAM alive, and forwards SIGTERM from `stop` to the group.
 EXTRA_ARGS=()
 if [[ "$RUNTIME" == "podman" ]]; then
     EXTRA_ARGS+=(--security-opt label=disable)
+    # podman's --init needs catatonit; skip it if the host lacks the binary
+    # (avoids "container-init binary not found: .../catatonit"). ci_stop.sh
+    # still pkills/reaps on teardown.
+    if [[ -x /usr/libexec/podman/catatonit ]] || command -v catatonit &>/dev/null; then
+        EXTRA_ARGS+=(--init)
+    elif command -v tini &>/dev/null; then
+        EXTRA_ARGS+=(--init --init-path "$(command -v tini)")
+    fi
 else
-    EXTRA_ARGS+=(--ulimit nproc=100000:100000 --pids-limit=-1)
+    EXTRA_ARGS+=(--ulimit nproc=100000:100000 --pids-limit=-1 --init)
 fi
 
-# --init (tini as PID 1) reaps exited child processes so zombies don't keep KFD
-# contexts / VRAM alive, and forwards SIGTERM from `docker stop` to the group.
 exec "$RUNTIME" run \
-    --init \
     --group-add video \
     --network=host \
     --device=/dev/kfd \
