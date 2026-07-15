@@ -25,7 +25,7 @@ jobs:
       matrix:
         include:
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC-TW]
+            runner: [self-hosted, MI355X-AINIC]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
@@ -69,8 +69,10 @@ jobs:
       - name: Run CCO C++ examples (2 ranks)
         run: |
           $CT exec $CONTAINER bash -c "\
-            mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_lsa_put && \
-            mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_gda_put"
+            mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_lsa_put"
+          # TEMP: cco_gda_put bypassed on the MI355X-AINIC runner (GDA put not
+          # working there yet); re-enable once GDA is supported on this runner.
+          # mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_gda_put
 
       - name: Run CCO Python examples (2 ranks)
         run: |
