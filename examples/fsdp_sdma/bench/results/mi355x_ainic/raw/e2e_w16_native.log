@@ -1,0 +1,163 @@
+W0715 06:56:02.185000 511 /root/wuyl/pytorch-main/torch/distributed/run.py:874] 
+W0715 06:56:02.185000 511 /root/wuyl/pytorch-main/torch/distributed/run.py:874] *****************************************
+W0715 06:56:02.185000 511 /root/wuyl/pytorch-main/torch/distributed/run.py:874] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0715 06:56:02.185000 511 /root/wuyl/pytorch-main/torch/distributed/run.py:874] *****************************************
+[verify-fsdp] fsdp package:[verify-fsdp] fsdp package:[verify-fsdp] fsdp package:[verify-fsdp] fsdp package:[verify-fsdp] fsdp package:[verify-fsdp] fsdp package:[verify-fsdp] fsdp package: [verify-fsdp] fsdp package:     /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py  /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py/root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py/root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py/root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py/root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
+/root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
+/root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
+
+
+
+[verify-fsdp] fully_shard module:
+
+[verify-fsdp] fully_shard module:[verify-fsdp] fully_shard module: [verify-fsdp] fully_shard module:[verify-fsdp] fully_shard module:[verify-fsdp] fully_shard module:  [verify-fsdp] fully_shard module:  [verify-fsdp] fully_shard module:/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+ 
+/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+
+/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module:/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module:[verify-fsdp] param_group module:[verify-fsdp] param_group module: 
+
+[verify-fsdp] param_group module:[verify-fsdp] param_group module:    /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py[verify-fsdp] param_group module:/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+ 
+/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+
+
+/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module:[verify-fsdp] mori sdma module:
+[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py[verify-fsdp] mori sdma module:
+
+[verify-fsdp] mori sdma module:[verify-fsdp] mori sdma module:   [verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py [verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+
+/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+ 
+/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+
+
+Loading Qwen model config and initializing weights...
+Applying FSDP2 layer-by-layer sharding (num_params=6,754,997,760)...
+FSDP2 model is ready; starting optimizer setup and benchmark.
+/root/wuyl/pytorch-main/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+[rank0]:[W715 06:56:48.949723607 ProcessGroupNCCL.cpp:5293] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+steps=0-4 mode=native avg_time_s=0.331218 min_time_s=0.329062 max_time_s=0.332291 tokens_per_s=98931.84 tflops=4009.71 tflops_per_gpu=250.61 loss=11.103961
+steps=5-9 mode=native avg_time_s=0.330380 min_time_s=0.329432 max_time_s=0.331870 tokens_per_s=99182.83 tflops=4019.88 tflops_per_gpu=251.24 loss=11.115269
+steps=10-14 mode=native avg_time_s=0.330934 min_time_s=0.329741 max_time_s=0.331912 tokens_per_s=99016.57 tflops=4013.14 tflops_per_gpu=250.82 loss=11.103737
+steps=15-19 mode=native avg_time_s=0.330083 min_time_s=0.329393 max_time_s=0.330889 tokens_per_s=99272.00 tflops=4023.49 tflops_per_gpu=251.47 loss=11.059937
+steps=20-24 mode=native avg_time_s=0.330395 min_time_s=0.329291 max_time_s=0.331922 tokens_per_s=99178.21 tflops=4019.69 tflops_per_gpu=251.23 loss=11.104100
+steps=25-29 mode=native avg_time_s=0.330546 min_time_s=0.328520 max_time_s=0.331606 tokens_per_s=99133.00 tflops=4017.86 tflops_per_gpu=251.12 loss=11.071856
+steps=30-34 mode=native avg_time_s=0.330993 min_time_s=0.330123 max_time_s=0.331983 tokens_per_s=98999.18 tflops=4012.44 tflops_per_gpu=250.78 loss=11.095465
+steps=35-39 mode=native avg_time_s=0.330477 min_time_s=0.328737 max_time_s=0.331486 tokens_per_s=99153.80 tflops=4018.70 tflops_per_gpu=251.17 loss=11.099360
+steps=40-44 mode=native avg_time_s=0.329912 min_time_s=0.328747 max_time_s=0.331345 tokens_per_s=99323.50 tflops=4025.58 tflops_per_gpu=251.60 loss=11.038152
+steps=45-49 mode=native avg_time_s=0.330184 min_time_s=0.329672 max_time_s=0.330619 tokens_per_s=99241.66 tflops=4022.26 tflops_per_gpu=251.39 loss=11.044635
+steps=50-54 mode=native avg_time_s=0.331258 min_time_s=0.330395 max_time_s=0.332870 tokens_per_s=98919.80 tflops=4009.22 tflops_per_gpu=250.58 loss=11.105977
+steps=55-59 mode=native avg_time_s=0.331145 min_time_s=0.330286 max_time_s=0.333438 tokens_per_s=98953.77 tflops=4010.60 tflops_per_gpu=250.66 loss=11.059418
+steps=60-64 mode=native avg_time_s=0.330417 min_time_s=0.328725 max_time_s=0.332181 tokens_per_s=99171.62 tflops=4019.42 tflops_per_gpu=251.21 loss=11.070611
+steps=65-69 mode=native avg_time_s=0.331082 min_time_s=0.330850 max_time_s=0.331387 tokens_per_s=98972.55 tflops=4011.36 tflops_per_gpu=250.71 loss=11.092161
+steps=70-74 mode=native avg_time_s=0.330802 min_time_s=0.329788 max_time_s=0.332189 tokens_per_s=99056.09 tflops=4014.74 tflops_per_gpu=250.92 loss=11.060676
+steps=75-79 mode=native avg_time_s=0.330534 min_time_s=0.329006 max_time_s=0.332123 tokens_per_s=99136.41 tflops=4018.00 tflops_per_gpu=251.12 loss=10.815099
+steps=80-84 mode=native avg_time_s=0.330269 min_time_s=0.328958 max_time_s=0.331411 tokens_per_s=99215.94 tflops=4021.22 tflops_per_gpu=251.33 loss=10.563243
+steps=85-89 mode=native avg_time_s=0.330717 min_time_s=0.329873 max_time_s=0.331907 tokens_per_s=99081.55 tflops=4015.77 tflops_per_gpu=250.99 loss=10.448511
+steps=90-94 mode=native avg_time_s=0.329883 min_time_s=0.328524 max_time_s=0.331076 tokens_per_s=99332.15 tflops=4025.93 tflops_per_gpu=251.62 loss=10.447808
+steps=95-99 mode=native avg_time_s=0.330904 min_time_s=0.329833 max_time_s=0.332458 tokens_per_s=99025.65 tflops=4013.51 tflops_per_gpu=250.84 loss=10.459554
+steps=100-104 mode=native avg_time_s=0.331058 min_time_s=0.329139 max_time_s=0.333915 tokens_per_s=98979.76 tflops=4011.65 tflops_per_gpu=250.73 loss=10.462593
+steps=105-109 mode=native avg_time_s=0.331171 min_time_s=0.330338 max_time_s=0.332192 tokens_per_s=98945.99 tflops=4010.28 tflops_per_gpu=250.64 loss=10.420835
+steps=110-114 mode=native avg_time_s=0.330085 min_time_s=0.329409 max_time_s=0.330907 tokens_per_s=99271.38 tflops=4023.47 tflops_per_gpu=251.47 loss=10.410594
+steps=115-119 mode=native avg_time_s=0.329916 min_time_s=0.328404 max_time_s=0.330773 tokens_per_s=99322.33 tflops=4025.53 tflops_per_gpu=251.60 loss=10.442756
+steps=120-124 mode=native avg_time_s=0.329793 min_time_s=0.328406 max_time_s=0.331213 tokens_per_s=99359.39 tflops=4027.03 tflops_per_gpu=251.69 loss=10.416581
+steps=125-129 mode=native avg_time_s=0.330811 min_time_s=0.329573 max_time_s=0.331598 tokens_per_s=99053.43 tflops=4014.63 tflops_per_gpu=250.91 loss=10.429108
+steps=130-134 mode=native avg_time_s=0.331022 min_time_s=0.330458 max_time_s=0.332388 tokens_per_s=98990.47 tflops=4012.08 tflops_per_gpu=250.76 loss=10.422722
+steps=135-139 mode=native avg_time_s=0.329883 min_time_s=0.329029 max_time_s=0.330964 tokens_per_s=99332.29 tflops=4025.94 tflops_per_gpu=251.62 loss=10.420877
+steps=140-144 mode=native avg_time_s=0.330094 min_time_s=0.329474 max_time_s=0.331176 tokens_per_s=99268.59 tflops=4023.35 tflops_per_gpu=251.46 loss=10.426985
+steps=145-149 mode=native avg_time_s=0.330406 min_time_s=0.329016 max_time_s=0.332564 tokens_per_s=99174.94 tflops=4019.56 tflops_per_gpu=251.22 loss=10.421007
+steps=150-154 mode=native avg_time_s=0.330316 min_time_s=0.329402 max_time_s=0.331432 tokens_per_s=99201.89 tflops=4020.65 tflops_per_gpu=251.29 loss=10.426419
+steps=155-159 mode=native avg_time_s=0.330182 min_time_s=0.329598 max_time_s=0.330874 tokens_per_s=99242.13 tflops=4022.28 tflops_per_gpu=251.39 loss=10.414809
+steps=160-164 mode=native avg_time_s=0.330037 min_time_s=0.329639 max_time_s=0.330547 tokens_per_s=99285.82 tflops=4024.05 tflops_per_gpu=251.50 loss=10.413651
+steps=165-169 mode=native avg_time_s=0.330372 min_time_s=0.329826 max_time_s=0.330914 tokens_per_s=99185.05 tflops=4019.97 tflops_per_gpu=251.25 loss=10.411091
+steps=170-174 mode=native avg_time_s=0.329980 min_time_s=0.329129 max_time_s=0.330887 tokens_per_s=99303.03 tflops=4024.75 tflops_per_gpu=251.55 loss=10.424997
+steps=175-179 mode=native avg_time_s=0.329364 min_time_s=0.329258 max_time_s=0.329535 tokens_per_s=99488.62 tflops=4032.27 tflops_per_gpu=252.02 loss=10.421928
+steps=180-184 mode=native avg_time_s=0.329573 min_time_s=0.328319 max_time_s=0.330423 tokens_per_s=99425.61 tflops=4029.72 tflops_per_gpu=251.86 loss=10.411405
+steps=185-189 mode=native avg_time_s=0.330323 min_time_s=0.329174 max_time_s=0.331784 tokens_per_s=99199.83 tflops=4020.57 tflops_per_gpu=251.29 loss=10.425861
+steps=190-194 mode=native avg_time_s=0.329970 min_time_s=0.328671 max_time_s=0.331139 tokens_per_s=99305.94 tflops=4024.87 tflops_per_gpu=251.55 loss=10.400294
+steps=195-199 mode=native avg_time_s=0.329780 min_time_s=0.328444 max_time_s=0.330761 tokens_per_s=99363.25 tflops=4027.19 tflops_per_gpu=251.70 loss=10.411977
+steps=200-204 mode=native avg_time_s=0.330016 min_time_s=0.328096 max_time_s=0.331554 tokens_per_s=99292.08 tflops=4024.31 tflops_per_gpu=251.52 loss=10.413054
+steps=205-209 mode=native avg_time_s=0.330016 min_time_s=0.327800 max_time_s=0.331206 tokens_per_s=99292.18 tflops=4024.31 tflops_per_gpu=251.52 loss=10.418045
+steps=210-214 mode=native avg_time_s=0.330181 min_time_s=0.329494 max_time_s=0.330794 tokens_per_s=99242.56 tflops=4022.30 tflops_per_gpu=251.39 loss=10.418280
+steps=215-219 mode=native avg_time_s=0.329904 min_time_s=0.328712 max_time_s=0.330741 tokens_per_s=99325.92 tflops=4025.68 tflops_per_gpu=251.60 loss=10.412444
+steps=220-224 mode=native avg_time_s=0.330380 min_time_s=0.328887 max_time_s=0.332529 tokens_per_s=99182.63 tflops=4019.87 tflops_per_gpu=251.24 loss=10.414086
+steps=225-229 mode=native avg_time_s=0.329979 min_time_s=0.329691 max_time_s=0.330319 tokens_per_s=99303.44 tflops=4024.77 tflops_per_gpu=251.55 loss=10.424077
+steps=230-234 mode=native avg_time_s=0.329820 min_time_s=0.328478 max_time_s=0.330614 tokens_per_s=99351.28 tflops=4026.71 tflops_per_gpu=251.67 loss=10.408420
+steps=235-239 mode=native avg_time_s=0.330516 min_time_s=0.328719 max_time_s=0.331780 tokens_per_s=99141.94 tflops=4018.22 tflops_per_gpu=251.14 loss=10.411784
+steps=240-244 mode=native avg_time_s=0.329948 min_time_s=0.328758 max_time_s=0.331948 tokens_per_s=99312.68 tflops=4025.14 tflops_per_gpu=251.57 loss=10.410940
+steps=245-249 mode=native avg_time_s=0.330008 min_time_s=0.328215 max_time_s=0.331897 tokens_per_s=99294.54 tflops=4024.41 tflops_per_gpu=251.53 loss=10.399067
+steps=250-254 mode=native avg_time_s=0.330089 min_time_s=0.328729 max_time_s=0.331110 tokens_per_s=99270.30 tflops=4023.42 tflops_per_gpu=251.46 loss=10.414158
+steps=255-259 mode=native avg_time_s=0.329259 min_time_s=0.328978 max_time_s=0.329625 tokens_per_s=99520.36 tflops=4033.56 tflops_per_gpu=252.10 loss=10.420002
+steps=260-264 mode=native avg_time_s=0.329813 min_time_s=0.328561 max_time_s=0.331224 tokens_per_s=99353.34 tflops=4026.79 tflops_per_gpu=251.67 loss=10.426946
+steps=265-269 mode=native avg_time_s=0.330261 min_time_s=0.328976 max_time_s=0.331075 tokens_per_s=99218.36 tflops=4021.32 tflops_per_gpu=251.33 loss=10.405441
+steps=270-274 mode=native avg_time_s=0.329334 min_time_s=0.328953 max_time_s=0.329842 tokens_per_s=99497.83 tflops=4032.65 tflops_per_gpu=252.04 loss=10.410146
+steps=275-279 mode=native avg_time_s=0.330551 min_time_s=0.329166 max_time_s=0.331905 tokens_per_s=99131.30 tflops=4017.79 tflops_per_gpu=251.11 loss=10.436230
+steps=280-284 mode=native avg_time_s=0.330486 min_time_s=0.329347 max_time_s=0.331823 tokens_per_s=99151.00 tflops=4018.59 tflops_per_gpu=251.16 loss=10.400687
+steps=285-289 mode=native avg_time_s=0.330783 min_time_s=0.329182 max_time_s=0.332352 tokens_per_s=99061.86 tflops=4014.98 tflops_per_gpu=250.94 loss=10.409003
+steps=290-294 mode=native avg_time_s=0.330191 min_time_s=0.328677 max_time_s=0.331286 tokens_per_s=99239.47 tflops=4022.17 tflops_per_gpu=251.39 loss=10.409412
+steps=295-299 mode=native avg_time_s=0.330779 min_time_s=0.330064 max_time_s=0.331451 tokens_per_s=99063.16 tflops=4015.03 tflops_per_gpu=250.94 loss=10.413779
+steps=300-304 mode=native avg_time_s=0.330289 min_time_s=0.329618 max_time_s=0.331742 tokens_per_s=99210.20 tflops=4020.99 tflops_per_gpu=251.31 loss=10.402374
+steps=305-309 mode=native avg_time_s=0.330434 min_time_s=0.329095 max_time_s=0.331740 tokens_per_s=99166.61 tflops=4019.22 tflops_per_gpu=251.20 loss=10.450521
+steps=310-314 mode=native avg_time_s=0.330536 min_time_s=0.329370 max_time_s=0.332404 tokens_per_s=99135.94 tflops=4017.98 tflops_per_gpu=251.12 loss=10.408820
+steps=315-319 mode=native avg_time_s=0.329783 min_time_s=0.328601 max_time_s=0.330765 tokens_per_s=99362.44 tflops=4027.16 tflops_per_gpu=251.70 loss=10.408575
+steps=320-324 mode=native avg_time_s=0.330397 min_time_s=0.329987 max_time_s=0.331173 tokens_per_s=99177.54 tflops=4019.66 tflops_per_gpu=251.23 loss=10.409336
+steps=325-329 mode=native avg_time_s=0.329963 min_time_s=0.327759 max_time_s=0.332991 tokens_per_s=99308.20 tflops=4024.96 tflops_per_gpu=251.56 loss=10.414957
+steps=330-334 mode=native avg_time_s=0.330477 min_time_s=0.329140 max_time_s=0.331674 tokens_per_s=99153.79 tflops=4018.70 tflops_per_gpu=251.17 loss=10.400920
+steps=335-339 mode=native avg_time_s=0.330769 min_time_s=0.330151 max_time_s=0.331401 tokens_per_s=99066.12 tflops=4015.15 tflops_per_gpu=250.95 loss=10.410416
+steps=340-344 mode=native avg_time_s=0.329813 min_time_s=0.328991 max_time_s=0.331079 tokens_per_s=99353.19 tflops=4026.78 tflops_per_gpu=251.67 loss=10.425086
+steps=345-349 mode=native avg_time_s=0.329904 min_time_s=0.329123 max_time_s=0.331066 tokens_per_s=99325.78 tflops=4025.67 tflops_per_gpu=251.60 loss=10.407241
+steps=350-354 mode=native avg_time_s=0.330013 min_time_s=0.328986 max_time_s=0.330720 tokens_per_s=99293.04 tflops=4024.35 tflops_per_gpu=251.52 loss=10.409372
+steps=355-359 mode=native avg_time_s=0.329626 min_time_s=0.329074 max_time_s=0.330221 tokens_per_s=99409.63 tflops=4029.07 tflops_per_gpu=251.82 loss=10.415973
+steps=360-364 mode=native avg_time_s=0.331122 min_time_s=0.330344 max_time_s=0.331737 tokens_per_s=98960.46 tflops=4010.87 tflops_per_gpu=250.68 loss=10.407104
+steps=365-369 mode=native avg_time_s=0.330343 min_time_s=0.329084 max_time_s=0.331270 tokens_per_s=99193.79 tflops=4020.32 tflops_per_gpu=251.27 loss=10.407273
+steps=370-374 mode=native avg_time_s=0.330294 min_time_s=0.329957 max_time_s=0.330857 tokens_per_s=99208.50 tflops=4020.92 tflops_per_gpu=251.31 loss=10.409973
+steps=375-379 mode=native avg_time_s=0.330174 min_time_s=0.328772 max_time_s=0.332159 tokens_per_s=99244.69 tflops=4022.39 tflops_per_gpu=251.40 loss=10.403781
+steps=380-384 mode=native avg_time_s=0.329691 min_time_s=0.328368 max_time_s=0.330774 tokens_per_s=99389.93 tflops=4028.27 tflops_per_gpu=251.77 loss=10.406817
+steps=385-389 mode=native avg_time_s=0.330015 min_time_s=0.329329 max_time_s=0.331059 tokens_per_s=99292.58 tflops=4024.33 tflops_per_gpu=251.52 loss=10.412999
+steps=390-394 mode=native avg_time_s=0.329392 min_time_s=0.328261 max_time_s=0.331187 tokens_per_s=99480.23 tflops=4031.93 tflops_per_gpu=252.00 loss=10.411244
+steps=395-399 mode=native avg_time_s=0.330367 min_time_s=0.329942 max_time_s=0.331158 tokens_per_s=99186.76 tflops=4020.04 tflops_per_gpu=251.25 loss=10.416597
+steps=400-404 mode=native avg_time_s=0.330532 min_time_s=0.329927 max_time_s=0.331617 tokens_per_s=99137.25 tflops=4018.03 tflops_per_gpu=251.13 loss=10.402834
+steps=405-409 mode=native avg_time_s=0.330543 min_time_s=0.329577 max_time_s=0.332177 tokens_per_s=99133.97 tflops=4017.90 tflops_per_gpu=251.12 loss=10.413700
+steps=410-414 mode=native avg_time_s=0.329557 min_time_s=0.327880 max_time_s=0.331788 tokens_per_s=99430.55 tflops=4029.92 tflops_per_gpu=251.87 loss=10.408983
+steps=415-419 mode=native avg_time_s=0.330129 min_time_s=0.328706 max_time_s=0.331737 tokens_per_s=99258.21 tflops=4022.93 tflops_per_gpu=251.43 loss=10.412267
+steps=420-424 mode=native avg_time_s=0.330815 min_time_s=0.329720 max_time_s=0.331179 tokens_per_s=99052.46 tflops=4014.59 tflops_per_gpu=250.91 loss=10.404212
+steps=425-429 mode=native avg_time_s=0.329046 min_time_s=0.328353 max_time_s=0.329838 tokens_per_s=99584.91 tflops=4036.17 tflops_per_gpu=252.26 loss=10.415688
+steps=430-434 mode=native avg_time_s=0.329867 min_time_s=0.328789 max_time_s=0.330561 tokens_per_s=99337.08 tflops=4026.13 tflops_per_gpu=251.63 loss=10.394389
+steps=435-439 mode=native avg_time_s=0.329533 min_time_s=0.328852 max_time_s=0.330110 tokens_per_s=99437.58 tflops=4030.20 tflops_per_gpu=251.89 loss=10.408159
+steps=440-444 mode=native avg_time_s=0.330460 min_time_s=0.329131 max_time_s=0.331650 tokens_per_s=99158.77 tflops=4018.90 tflops_per_gpu=251.18 loss=10.405683
+steps=445-449 mode=native avg_time_s=0.329265 min_time_s=0.327776 max_time_s=0.330947 tokens_per_s=99518.53 tflops=4033.48 tflops_per_gpu=252.09 loss=10.404913
+steps=450-454 mode=native avg_time_s=0.329741 min_time_s=0.328578 max_time_s=0.331319 tokens_per_s=99374.86 tflops=4027.66 tflops_per_gpu=251.73 loss=10.405396
+steps=455-459 mode=native avg_time_s=0.329115 min_time_s=0.328526 max_time_s=0.330524 tokens_per_s=99564.07 tflops=4035.33 tflops_per_gpu=252.21 loss=10.408931
+steps=460-464 mode=native avg_time_s=0.329875 min_time_s=0.329260 max_time_s=0.330503 tokens_per_s=99334.57 tflops=4026.03 tflops_per_gpu=251.63 loss=10.408277
+steps=465-469 mode=native avg_time_s=0.330842 min_time_s=0.330342 max_time_s=0.331216 tokens_per_s=99044.37 tflops=4014.27 tflops_per_gpu=250.89 loss=10.403536
+steps=470-474 mode=native avg_time_s=0.330062 min_time_s=0.329032 max_time_s=0.331400 tokens_per_s=99278.39 tflops=4023.75 tflops_per_gpu=251.48 loss=10.401815
+steps=475-479 mode=native avg_time_s=0.330456 min_time_s=0.329568 max_time_s=0.331786 tokens_per_s=99159.97 tflops=4018.95 tflops_per_gpu=251.18 loss=10.407910
+steps=480-484 mode=native avg_time_s=0.329925 min_time_s=0.328911 max_time_s=0.330867 tokens_per_s=99319.40 tflops=4025.41 tflops_per_gpu=251.59 loss=10.405967
+steps=485-489 mode=native avg_time_s=0.329580 min_time_s=0.328989 max_time_s=0.330701 tokens_per_s=99423.47 tflops=4029.63 tflops_per_gpu=251.85 loss=10.405092
+steps=490-494 mode=native avg_time_s=0.330163 min_time_s=0.328652 max_time_s=0.331535 tokens_per_s=99247.98 tflops=4022.52 tflops_per_gpu=251.41 loss=10.405653
+steps=495-499 mode=native avg_time_s=0.329484 min_time_s=0.328585 max_time_s=0.330223 tokens_per_s=99452.49 tflops=4030.81 tflops_per_gpu=251.93 loss=10.402266
+{
+  "avg_step_time_s": 0.33021504818391983,
+  "avg_tflops": 4021.8839416984283,
+  "avg_tflops_per_gpu": 251.36774635615177,
+  "avg_tokens_per_s": 99232.30385839113,
+  "dtype": "bf16",
+  "last_loss": 10.402265548706055,
+  "micro_batch_size": 1,
+  "mode": "native",
+  "mori_enable_sdma": null,
+  "mori_fsdp_enable_sdma": null,
+  "mori_fsdp_zero_copy_output": null,
+  "num_params": 6754997760,
+  "seed": 1234,
+  "seq_len": 2048,
+  "steps": 500,
+  "warmup": 6,
+  "world_size": 16
+}
+/root/wuyl/pytorch-main/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
