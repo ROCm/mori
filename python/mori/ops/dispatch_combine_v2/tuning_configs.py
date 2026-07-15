@@ -206,6 +206,71 @@ _GFX1250_TABLE = {
     (8, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_EP8},
 }
 
+# ── gfx1250 (256 CU, wave32) — measured 2026-07-11, EP4, bf16, full block x warp
+# sweep (dispatch and combine tuned independently across tok 8..8192). Key lessons:
+# (a) dispatch loves more parallelism — warp grows 8->16->32 with tok, block 128
+#     (<=1024) then 192 (>=2048); warp 32 nearly 4x's large-tok dispatch BW.
+# (b) combine wants the OPPOSITE — few warps at small tok (over-parallelizing the
+#     gather+xdb barrier collapses it: block 64 warp 8 at small, warp grows to 16
+#     and block to 128/192 only for bandwidth-bound large tok.
+# (c) GUARDRAIL: block_num MUST stay < CU count (256). The dispatch Phase-2 grid
+#     barrier needs all blocks co-resident; block 256 deadlocks (100% spin). 192 is
+#     the safe ceiling here. Measured bf16 GB/s (disp/comb): 64=25/11 128=50/19
+#     256=93/28 512=161/41 1024=204/61 2048=259/90 4096=292/120 8192=335/149.
+_GFX1250_SCHED_BF16 = (
+    (64, 128, 8, 64, 8),  # <=64:   disp 128/8, comb 64/8 (latency-bound)
+    (256, 128, 16, 64, 8),  # <=256:  disp warp 16
+    (1024, 128, 32, 128, 8),  # <=1024: disp warp 32; comb block 128
+    (4096, 192, 32, 128, 16),  # <=4096: disp 0.75*CU; comb warp 16 (bandwidth)
+    (None, 192, 32, 192, 16),  # >4096 (peak): disp 335 / comb 149 GB/s
+)
+_GFX1250_DEFAULT = dict(
+    dispatch_block_num=192,
+    combine_block_num=192,
+    warp_num_per_block=32,
+    combine_warp_num_per_block=16,
+    schedule=_GFX1250_SCHED_BF16,
+)
+# DeepSeek-V4-Pro shape (hidden 7168, topk 6, 384 experts) — measured 2026-07-11,
+# EP4 bf16, same 2D sweep. Same shape family as topk=8, geometry ~identical (block/
+# warp track token count, not topk); disp shifts to block 192 a notch earlier and
+# peaks higher (fewer recv copies at topk 6: 360/141 GB/s @8192). Measured GB/s
+# (disp/comb): 64=24/11 128=46/17 256=90/28 512=150/39 1024=227/57 2048=278/84
+# 4096=320/113 8192=360/141.
+# RE-TUNED 2026-07-14 EP4 bf16 post inner-unroll vec4 combine sweep:
+# @8192 comb 64/16=205 GB/s; @16384 comb 128/8=274 GB/s (disp 192/32=294 GB/s).
+_GFX1250_SCHED_BF16_T6 = (
+    (128, 128, 8, 64, 4),  # <=128:  latency-bound
+    (256, 192, 16, 64, 8),  # <=256
+    (1024, 192, 32, 64, 16),  # <=1024: disp peak warp; comb small block/warp16
+    (4096, 192, 32, 128, 16),  # <=4096: comb block 128 (bandwidth)
+    (8192, 192, 32, 64, 16),  # <=8192: comb 64/16 (205 GB/s @8192)
+    (None, 192, 32, 128, 8),  # >8192 @16384: comb 128/8 (274 GB/s)
+)
+# EP8 (world_size=8) measured 2026-07-12 on gfx1250 CROSS-NODE (2 nodes x 4 GPUs
+# over the UALink fabric), bf16, same 2-pass block x warp sweep. dispatch peaks at
+# block 128 warp 32 for >=512 (128/32 >= 192/32 here); combine wants 128/8 at 512
+# then 128/16 for bandwidth-bound large tok. Measured GB/s (disp/comb): 8=5/4
+# 64=36/17 512=160/63 2048=197/120 4096=200/151 8192=200/173. Cross-node fabric
+# caps disp ~200 (vs intra-node xGMI ~335); geometry is world_size-independent so
+# this also serves single-node EP8.
+_GFX1250_SCHED_BF16_EP8 = (
+    (64, 128, 8, 64, 8),  # <=64:  latency-bound
+    (512, 128, 32, 128, 8),  # <=512: disp warp 32 peak; comb block 128 warp 8
+    (None, 128, 32, 128, 16),  # >512 (peak): disp ~200 / comb ~173 GB/s
+)
+# bf16-tuned (EP4 + EP8). fp8/fp4 fall back to the bf16 schedule until separately tuned.
+_GFX1250_TABLE = {
+    (4, 7168, 8): {"bf16": _GFX1250_SCHED_BF16},
+    (4, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_T6},  # DeepSeek-V4-Pro
+    (8, 7168, 8): {"bf16": _GFX1250_SCHED_BF16_EP8},  # cross-node / single-node EP8
+    # V4-Pro topk=6 EP8 cross-node (measured 2026-07-12): geometry is topk-
+    # independent (tracks token count) — optimum matches topk=8, so reuse it.
+    # Measured GB/s (disp/comb): 8=4/3 64=32/16 512=163/56 2048=199/113
+    # 4096=200/145 8192=206/171.
+    (8, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_EP8},
+}
+
 _DEVICES = {
     "mi308x": (_MI308X_DEFAULT, _MI308X_TABLE),
     "mi325x": (_MI325X_DEFAULT, _MI325X_TABLE),

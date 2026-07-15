@@ -753,25 +753,41 @@ def make_combine(
                 # Vec4 path: load 4 i32 (16B, global_load_dwordx4) per expert
                 # per iteration, reducing xGMI load count 4×.
                 VEC = 4
-                STEP_V4 = _unroll * WAVE * VEC
+                STEP_CHUNK = WAVE * VEC
+                STEP_V4 = _unroll * STEP_CHUNK
+
+                def _load_expert_vecs(off):
+                    vecs = []
+                    valids = []
+                    for k_slot in range_constexpr(experts_per_token):
+                        vecs.append(P.load_v4i32_nt(expert_bases[k_slot], off))
+                        valids.append(expert_valids[k_slot])
+                    return vecs, valids
 
                 def _accum_loop():
                     main_end = (eff // STEP_V4) * STEP_V4
                     for u in range(lane * VEC, main_end, STEP_V4):
                         base = unit_base + u
+                        # Issue all remote loads first (both unroll rounds) so stores
+                        # in the j/r nest cannot block the next load batch.
+                        pre_vecs = []
+                        pre_valids = []
                         for r in range_constexpr(_unroll):
-                            off = base + r * WAVE * VEC
-                            vecs = []
-                            for k_slot in range_constexpr(experts_per_token):
-                                vecs.append(P.load_v4i32_nt(expert_bases[k_slot], off))
-                            for j in range_constexpr(VEC):
+                            off_r = base + r * STEP_CHUNK
+                            vecs_r, valids_r = _load_expert_vecs(off_r)
+                            pre_vecs.append(vecs_r)
+                            pre_valids.append(valids_r)
+                        # Reduce+store: j outer, r inner (unroll innermost).
+                        for j in range_constexpr(VEC):
+                            for r in range_constexpr(_unroll):
+                                off = base + r * STEP_CHUNK
                                 acc = _zero_accum()
                                 for k_slot in range_constexpr(experts_per_token):
                                     elem = vector.extract(
-                                        vecs[k_slot], static_position=[j]
+                                        pre_vecs[r][k_slot], static_position=[j]
                                     )
                                     v = arith.select(
-                                        expert_valids[k_slot], elem, arith.constant(0)
+                                        pre_valids[r][k_slot], elem, arith.constant(0)
                                     )
                                     acc = acc + _to_accum2(v)
                                 buffer_store(
@@ -786,19 +802,23 @@ def make_combine(
                     main_end = (eff // STEP) * STEP
                     for u in range(lane, main_end, STEP):
                         base = unit_base + u
+                        pre_vals = []
                         for r in range_constexpr(_unroll):
-                            off = base + r * WAVE
-                            vals = []
+                            off_r = base + r * WAVE
+                            vals_r = []
                             for k_slot in range_constexpr(experts_per_token):
-                                v = P.load_i32_nt(expert_bases[k_slot], off)
-                                vals.append(
+                                v = P.load_i32_nt(expert_bases[k_slot], off_r)
+                                vals_r.append(
                                     arith.select(
                                         expert_valids[k_slot], v, arith.constant(0)
                                     )
                                 )
+                            pre_vals.append(vals_r)
+                        for r in range_constexpr(_unroll):
+                            off = base + r * WAVE
                             acc = _zero_accum()
                             for k_slot in range_constexpr(experts_per_token):
-                                acc = acc + _to_accum2(vals[k_slot])
+                                acc = acc + _to_accum2(pre_vals[r][k_slot])
                             buffer_store(
                                 _from_accum2(acc),
                                 rsrc_out,
