@@ -164,6 +164,123 @@ Indexer 位于 metadata 控制面核心路径，语言选择需要兼顾 RPC 并
 
 推荐使用 **Rust** 实现 indexer。它能提供接近 C++ 的性能，同时通过类型系统降低 shared metadata map / counter 并发读写中的内存和数据竞争风险。首期可以用 Rust 实现 in-memory store，并保留 store trait，后续扩展 Redis、MySQL / PostgreSQL 或 RocksDB 后端。
 
+## Redis backend 实现现状与性能
+
+上文的 in-memory store 是首期形态。UMBP 侧已经落地了一个 RESP/Redis metadata backend（ROCm/mori PR #468），把 master 变成 stateless：store 里的状态是心跳投影出的可重建软状态，因此磁盘持久化是可选项，和副本 HA 相互独立。indexer 后续接入 external store 时可以直接复用这套实现和结论。
+
+**选型速览**（详细数字与推理见下方「性能对比」与「关键结论」）：
+
+| 后端 | 读 / 写吞吐（store 直连峰值） | 横向扩展 | HA | 定位 |
+|---|---|---|---|---|
+| in-memory | 5.5M / ~128k | `index_shards` | 无 | 性能上限参照，无持久 / HA |
+| redis 多实例 | 24.5k / 18k | 加实例 | 无 | 吞吐 / 核最高，但无 HA / 容错 |
+| **redis cluster** | ≈ 多实例 85–90% / ~15k | 加 master | 跨机自动 failover | **高可用首选**，性能约多实例的 85–90% |
+| dragonfly 单实例 | 读随 proactor 扩展 / 写塌陷 ~0.4k | `proactor_threads` | 无 | 只适合读极重、写极轻 |
+
+### 实现现状
+
+后端在 client-agnostic 的 `IRespClient` seam 之下，通过 `UMBP_METADATA_BACKEND=redis` + `UMBP_REDIS_URI` 选择三种部署：
+
+| 部署 | 选择方式 | 客户端 | 说明 |
+| --- | --- | --- | --- |
+| 单节点 Redis / Dragonfly | `UMBP_REDIS_URI` | hiredis `RespClient` | 单端口，读靠分片喂满 Dragonfly proactor |
+| 多实例 | `UMBP_REDIS_SHARD_URIS`（逗号分隔，一实例一 shard） | hiredis `RespClient` | 每个 block shard 落在独立 server 进程上 |
+| Redis Cluster | `UMBP_REDIS_CLUSTER=1` + seed 列表 | redis-plus-plus `RespClusterClient` | 副本 + 自动 failover，跨机 HA |
+
+横向扩展靠三个旋钮：
+
+- **分片**：block keyspace 按 hash 切成多个 shard（`UMBP_REDIS_BLOCK_SHARDS`）；
+- **多端点**：每个 shard 落到独立 server（`UMBP_REDIS_SHARD_URIS`），突破单实例单线程上限；
+- **并发读**：worker pool 把一次 `BatchLookup` 向各实例并发下发（pipeline），只花一趟 round trip。
+
+External-KV 全套已落地（report / revoke / revoke-all、`match`（含 `count_as_hit` 命中计数）、get_hit_counts、hit GC、eviction 候选枚举），extkv / hit 已按 hash 分片、不再挤在单一 control slot，tier-set 用 per-node bitmask。原子性靠 Lua 脚本（EVALSHA），时间戳由调用方传入保证跨后端确定性，每个 store op 的耗时经 `mori_umbp_store_op_latency_seconds` 打点。
+
+### 高可用与容错
+
+- **Redis Cluster**：redis-plus-plus `RedisCluster`，副本 + 自动 failover，`MOVED` / `ASK` / reshard 全交客户端；启动时按 `CLUSTER SLOTS` 做 balanced per-master shard 放置。已实测「kill master → 副本升主」「live reshard 容忍」后一致性 / bench 仍过。
+- **读容错**：某 shard 实例挂 → 该 key 记 miss、不拖垮整批读；单端点模式保持严格，让整体宕机可见而非伪装成全 miss。
+- **写容错**：某 shard 挂 → `ApplyHeartbeat` 返回 `SEQ_GAP` → master 转 full_sync → peer 重发快照自愈（block ADD/REMOVE 幂等）。
+- **启动就绪**：factory 启动时 Ping 每个 endpoint，`UMBP_REDIS_REQUIRED`（默认 true）控制 fail-fast 或降级启动。
+
+### 性能对比
+
+数字均取自 store 直连 microbench（`bench_umbp_master_metadata_store` / `_extkv`，无 gRPC/RDMA）与全链路 8 进程 proxy；batch=32、keys=50000，单机多核独占、loopback，glibc redis 7.2.5 / dragonfly v1.23.2。单元格为 `ops/s (p50 ms)`，同列 client 线程数 `t`（施加负载）一致，行间差距即后端本身。
+
+**主元数据 · store 直连 · RouteGet（读热路径，含 lease 写记账）**
+
+| 模式 | 内部配置 | t8 | t16 | t32 | t64 | t128 | t256 |
+|---|---|---|---|---|---|---|---|
+| in-memory | `index_shards=256` | 620,399 (0.01) | 1,082,374 (0.01) | 1,958,402 (0.02) | 3,271,864 (0.02) | 4,316,796 (0.03) | 5,106,055 (0.04) |
+| redis 多实例 | 8 实例, pool=128 | 25,356 (0.3) | 26,445 (0.6) | 27,194 (1.2) | 26,958 (2.4) | 26,892 (4.7) | 26,727 (9.6) |
+| redis cluster | 8主 + 8从, balanced | 20,909 (0.4) | 21,790 (0.7) | 21,174 (1.6) | 22,681 (2.8) | 21,048 (6.1) | 21,638 (11.7) |
+| dragonfly 单实例 | `proactor_threads=32, block_shards=64`, pool=256 | 5,430 (1.4) | 10,391 (1.5) | 18,914 (1.6) | 28,645 (2.1) | 38,252 (3.2) | 43,894 (5.2) |
+
+**主元数据 · store 直连 · Heartbeat（写热路径）**
+
+| 模式 | 内部配置 | t8 | t16 | t32 | t64 | t128 |
+|---|---|---|---|---|---|---|
+| in-memory | `index_shards=256` | 88,375 (0.05) | 121,136 (0.06) | 147,339 (0.15) | 119,426 (0.4) | 99,950 (1.0) |
+| redis 多实例 | 8 实例 | 14,139 (0.5) | 18,634 (0.8) | 19,332 (1.5) | 20,948 (2.9) | 20,644 (6.1) |
+| redis cluster | 8主 + 8从 | 11,212 (0.7) | 13,197 (1.1) | 12,456 (2.3) | 15,423 (4.1) | 15,195 (8.4) |
+| dragonfly 单实例 | proactor=32 | 403 (19.8) | 400 (40.0) | 402 (79.5) | 392 (163) | 402 (318) |
+
+**主元数据 · 全链路 8 进程 proxy**（`umbp_master` + Router/gRPC，8 客户端进程打同一 master）：`GETMODE=exists` 单元格 = `get QPS / BatchLookup p50 (ms)`；`GETMODE=both`（真读热路径 `route_get_batch` + 一次 RDMA 取数）单元格 = `get QPS / BatchRouteGet p50 (ms)`（both 每轮计 lookup+fetch ≈ 2 次，只在本表内比）。
+
+| 模式 | exists 8c | exists 32c | exists 64c | both 8c | both 32c |
+|---|---|---|---|---|---|
+| in-memory | 24,969 / 0.50 | 62,986 / 0.50 | 81,320 / 0.51 | 40,827 / 0.50 | 66,377 / 0.50 |
+| redis 多实例 | 9,444 / 0.51 | 4,455 / 1.67 | 1,388 / 30.5 | 13,206 / 0.50 | 8,843 / 1.81 |
+| redis cluster | 9,381 / 0.51 | 3,829 / 1.90 | 1,344 / 18.7 | 11,664 / 0.50 | 7,464 / 2.54 |
+| dragonfly 单实例 | 863 / 3.06 | 653 / 17.5 | 393 / 67.6 | 1,740 / 2.73 | 1,474 / 13.17 |
+
+**External-KV · store 直连**（`bench_umbp_master_metadata_store_extkv`，batch=32 / keys=50000 / nodes=8）。`match` = `MatchExternalKv(count_as_hit=true)`（读 + 每-hash 命中计数写），`match_nohit` 隔离纯读，`report` = `RegisterExternalKvIfAlive`（写）。cluster = 8主+8从（16 进程，8 个服务）。
+
+`match`（读 + 命中计数写）：
+
+| 模式 | t16 | t32 | t64 |
+|---|--:|--:|--:|
+| in-memory | 54,684 (0.02) | 54,652 (0.02) | 54,355 (0.02) |
+| redis 多实例 | 33,116 (0.5) | 29,814 (1.1) | 31,839 (2.0) |
+| redis cluster | 26,901 (0.6) | 27,966 (1.1) | 27,344 (2.3) |
+| redis 单实例 | 8,216 (2.3) | 8,289 (3.2) | 8,098 (7.2) |
+| dragonfly | 3,422 (4.3) | 5,559 (5.3) | 10,275 (5.9) |
+
+dragonfly 过 t64 仍在爬：t128 9,313 (12.6) → t256 11,134 (15.9)。
+
+`match_nohit`（纯读，不写命中）：
+
+| 模式 | t16 | t32 | t64 |
+|---|--:|--:|--:|
+| in-memory | 1,673,248 (0.01) | 3,269,436 (0.01) | 3,909,725 (0.01) |
+| redis 多实例 | 46,754 (0.3) | 49,644 (0.6) | 48,737 (1.3) |
+| redis cluster | 44,761 (0.3) | 44,220 (0.7) | 44,514 (1.4) |
+| redis 单实例 | 13,763 (1.4) | 13,800 (2.0) | 13,691 (4.3) |
+| dragonfly | 14,296 (1.1) | 24,227 (1.2) | 40,641 (1.5) |
+
+dragonfly：t128 54,933 (2.1) → t256 63,113 (3.8)。
+
+`report`（写）：
+
+| 模式 | t16 | t32 | t64 |
+|---|--:|--:|--:|
+| in-memory | 27,469 (0.03) | 27,228 (0.03) | 26,092 (0.03) |
+| redis 多实例 | 29,769 (0.5) | 28,869 (1.0) | 26,327 (2.2) |
+| redis cluster | 21,834 (0.7) | 23,442 (1.3) | 25,149 (2.6) |
+| redis 单实例 | 8,614 (1.8) | 8,660 (2.9) | 10,063 (6.2) |
+| dragonfly | 4,389 (3.4) | 8,208 (3.6) | 11,265 (5.4) |
+
+dragonfly：t128 13,968 (8.9) → t256 11,667 (20.7)（已过拐点）。
+
+**性能要点与根因**（选型建议见节首「选型速览」，此处只讲各后端的性能特征与原因）：
+
+- **in-memory**：纯读差距最大（`match_nohit` 随核数爬到 3.9M，比 redis 高 45~280×），但一旦带写，全局写锁把 `match`/`report` 在 t16 就压到和 redis 同一个几万量级（读 5.5M / 写 ~128k）；无 stateless master / HA / 持久，只作上限参照。
+- **redis 多实例**：吞吐/核最高（8 进程 ~24.5k ≈ 3k/核），读写都稳（读 24.5k / 写 18k），t64 即饱和；但自身无副本、无 failover（无 HA），需客户端 fan-out。
+- **redis cluster**：随 master 数近线性扩展（读 3→9.7k / 6→18.6k / 8→22k ≈ 同节点数多实例的 85–90%；8 主写 ~15k），并自带副本 + 跨机自动 failover——有高可用要求时的形态（代价是 per-command slot 校验 + redis++ MOVED/ASK 路由，evalsha ~73µs vs ~26µs）。
+- **dragonfly 单实例**：单端口读随 proactor 扩展（P32 43.7k → P48 ~51k → P64 ~53k，收益递减），但心跳写走 store-wide 全局锁 → 塌陷到 ~0.4k。只适合读极重、写/心跳极轻。
+- redis 相对 in-memory 慢的根因 = 每 op 一次网络 RTT + RESP 序列化 + Lua 脚本 + 单 slot 单线程执行；而 in-memory 是进程内内存访问、且读可并发（`shared_lock`）。
+
+> 复现命令见来源文档（占位符 `CTR=umbp-app`、`DEV=/path/to/workdir`），此处不重复。主元数据详表见 `dev/perf_cmp/PERF-COMPARISON-{zh,en}.md`，External-KV 详解见 `dev/perf_cmp/EXTKV-PERF.md`。
+
 ## 附录：UMBP Feature Proposal
 
 UMBP 已经具备一组可复用的 KV backend、分层存储、路由和 metadata 能力。SGLang Indexer Bridge 主要复用其中的 External KV metadata / hit count 思路，并将其抽取为独立 indexer 组件。
