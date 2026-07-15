@@ -2,7 +2,7 @@
 
 ## 目标
 
-1. Bridge 将 SGLang KV event 转换成 indexer 的 KV 位置索引操作。
+1. Indexer 需要感知和收集 KV 位置索引，因此设计 Bridge 将 SGLang KV event 转换成 indexer 的 KV 位置索引操作。
 
    Bridge 订阅 SGLang ZMQ `KVEventBatch`，将 `BlockStored` / `BlockRemoved` / `AllBlocksCleared` 转换成 `report` / `revoke` / `revoke-all`，用于维护 `hash -> node -> tier` 形式的 KV 位置索引。
 
