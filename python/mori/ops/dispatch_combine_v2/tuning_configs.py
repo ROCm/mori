@@ -141,20 +141,23 @@ _MI355X_TABLE = {
 }
 
 # ── gfx1250 (256 CU, wave32) — RE-TUNED 2026-07-15 EP4, bf16, with the vec4 combine
-# kernel + inner-unroll load-first scheduling, full 2-pass block x warp sweep
-# (tok 16..16384). Key lessons: (a) dispatch unchanged by vec4 — warp grows 8->32,
-# block 128 (tiny) then 192; peaks ~287 GB/s @16384. (b) combine SHIFTED with vec4:
-# block 64 for small/mid (<=512), 128 for large; warp 4 (<=4096) then 8. The old
-# pre-vec4 schedule (comb block ramping to 192, warp 16) is stale — comb 192/16
-# @8192 was 189, vec4-tuned comb 128/8 hits 242 (+28%); mid 512 55->102 (+84%).
-# (c) GUARDRAIL: block_num < CU (256); 192 safe ceiling (Phase-2 grid barrier needs
-# co-residence). Measured vec4 GB/s (disp/comb): 16=7/5 256=110/61 512=181/102
-# 1024=211/126 2048=248/174 4096=264/207 8192=282/242 16384=287/274.
+# kernel + inner-unroll load-first scheduling, FINE 2-pass block x warp sweep
+# (tok 16..16384; comb block 48..192, warp 2..16). Key lessons: (a) dispatch
+# unchanged by vec4 — warp grows to 32, block 192; peaks ~287 GB/s @16384.
+# (b) combine SHIFTED with vec4 AND is very warp-sensitive at small tok: warp 2 wins
+# <=128 (64/2: 64tok 27 vs warp4 21 vs warp16 11 — over-parallelizing the gather+xdb
+# barrier collapses it), warp 4 for mid, warp 8 for large; block grows 64->96->128.
+# The old pre-vec4 schedule (comb block->192, warp 16) is stale: comb @8192 189->242
+# (+28%), mid 512 55->102 (+84%), tiny 64 ~11->27 (2.4x). (c) GUARDRAIL: block_num
+# < CU (256); 192 safe ceiling (Phase-2 grid barrier needs co-residence). Measured
+# vec4 GB/s (disp/comb): 64=29/27 128=56/47 256=114/74 512=182/102 1024=214/132
+# 2048=248/174 4096=264/207 8192=282/242 16384=287/273.
 _GFX1250_SCHED_BF16 = (
-    (64, 128, 8, 64, 4),  # <=64:   latency-bound (disp 128/8, comb 64/4)
-    (512, 192, 32, 64, 4),  # <=512:  disp peak; comb small block/warp 4
-    (4096, 192, 32, 128, 4),  # <=4096: comb block 128 (bandwidth)
-    (None, 192, 32, 128, 8),  # >4096:  comb warp 8 (242/274 GB/s @8192/16384)
+    (128, 128, 8, 64, 2),  # <=128:  latency-bound; combine warp 2 (fewest warps win)
+    (512, 192, 32, 64, 4),  # <=512:  disp peak; comb 64/4
+    (1536, 192, 32, 96, 4),  # <=1536: comb block 96
+    (4096, 192, 32, 128, 4),  # <=4096: comb block 128
+    (None, 192, 32, 128, 8),  # >4096:  comb warp 8 (242/273 GB/s @8192/16384)
 )
 _GFX1250_DEFAULT = dict(
     dispatch_block_num=192,
