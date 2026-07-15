@@ -15,7 +15,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RES = os.path.join(HERE, "ag_perf_results")
+# results live under the canonical bench-results dir, not in the tests tree
+RES = os.path.abspath(os.path.join(
+    HERE, "..", "..", "..", "examples", "fsdp_sdma", "bench", "results", "mi300x_mlx5"))
 LINE = re.compile(
     r"\[ag-perf\]\s+(\d+)MB\s+\|\s+rccl=[\d.]+ms\s+\(([\d.]+)GB/s\)\s+"
     r"ibgda_sdma=[\d.]+ms\s+\(([\d.]+)GB/s\)\s+\|\s+bitexact=(\w+)"

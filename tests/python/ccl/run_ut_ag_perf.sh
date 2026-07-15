@@ -21,7 +21,7 @@ SIZES="${*:-64 128 512}"
 MASTER=useocpm2m-097-040 ; MASTER_IP=10.158.213.159 ; WORKER=useocpm2m-097-083
 CTR=mori-sglang-mingzhi
 WT=/home/mingzliu/hp_cu_opt/deliver
-OUT=$WT/tests/python/ccl/ag_perf_results ; mkdir -p "$OUT"
+OUT=$WT/examples/fsdp_sdma/bench/results/mi300x_mlx5 ; mkdir -p "$OUT"
 IFACE=eth0
 IB=mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9
 FABRIC="GLOO_SOCKET_IFNAME=$IFACE NCCL_SOCKET_IFNAME=$IFACE MORI_SOCKET_IFNAME=$IFACE \
@@ -47,13 +47,5 @@ ssh -o BatchMode=yes "$WORKER" "docker exec $CTR bash -lc '$BASE && $TR --node_r
 wp=$!; sleep 5
 timeout 400 ssh -o BatchMode=yes "$MASTER" "docker exec $CTR bash -lc '$BASE && $TR --node_rank=0 $RUN 2>&1'" | tee "$OUT/ut_${PRESET}_m.log"
 wait "$wp" 2>/dev/null || true
-# distill a clean csv: size_mb,rccl_gbps,ibgda_gbps
-awk -F'[ =()]+' '/\[ag-perf\] [0-9]+MB \|/{
-  for(i=1;i<=NF;i++){
-    if($i ~ /MB$/){sz=$i; sub("MB","",sz)}
-    if($i=="rccl"){rms=$(i+1); rg=$(i+3)}
-    if($i=="ibgda_sdma"){ig=$(i+3)}
-  }
-  print sz","rg","ig
-}' "$OUT/ut_${PRESET}_m.log" > "$OUT/ag_perf_${PRESET}.csv"
-echo "[$PRESET] csv:"; cat "$OUT/ag_perf_${PRESET}.csv"
+echo "[$PRESET] result lines:"; grep -E "\[ag-perf\] [0-9]+MB" "$OUT/ut_${PRESET}_m.log"
+echo "[$PRESET] -> run plot_ag_perf.py to (re)generate ag_perf_e2e.csv + ag_perf_e2e_stable_w16.png"

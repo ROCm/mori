@@ -40,7 +40,7 @@ ag(input_tensor, output_tensor, numel, stream)   # intra=SDMA, inter=RDMA
 ## Results (MI300X, mlx5 RoCEv2 — w16 = 2 node × 8 GPU; all bit-exact vs RCCL)
 
 Raw logs, CSVs, and the plot scripts live under
-[`examples/fsdp_sdma/bench/`](examples/fsdp_sdma/bench/); every figure below is
+[`bench/`](bench/); every figure below is
 regenerated from that data. See **Reproduce** for the exact commands.
 
 ### 1. Standalone AllGather bandwidth vs RCCL (E2E-stable config)
@@ -57,7 +57,7 @@ GPU-light, so standalone bandwidth is near-parity, not a beat:
 | 256 MB | 0.95× |
 | 512 MB | 0.96× |
 
-![standalone AllGather bandwidth](examples/fsdp_sdma/bench/results/mi300x_mlx5/ag_perf_e2e_stable_w16.png)
+![standalone AllGather bandwidth](bench/results/mi300x_mlx5/ag_perf_e2e_stable_w16.png)
 
 ### 2. GEMM time under concurrent AllGather (the no-CU-contention dividend)
 
@@ -72,7 +72,7 @@ AllGathers run concurrently (lower = better, bit-exact vs RCCL):
 | 8 MB,  GEMM n=4096 | 17.5 ms | 15.8 ms | 1.11× |
 | 16 MB, GEMM n=4096 | 19.1 ms | 16.0 ms | 1.20× |
 
-![GEMM time under concurrent AllGather](examples/fsdp_sdma/bench/results/mi300x_mlx5/overlap_w16_gemm_time.png)
+![GEMM time under concurrent AllGather](bench/results/mi300x_mlx5/overlap_w16_gemm_time.png)
 
 ### 3. End-to-end FSDP2 (Qwen-7B, seq 2048, w16) — drop-in MoriAllGather
 
@@ -85,14 +85,15 @@ throughput beats the framework default. Three mori variants (intra × inter leg)
 | `hp_cu`      | host-proxy                   | NCCL (CU)            | ~1.10× |
 | `ibgda_sdma` | device IBGDA (GPU-posted RDMA) | SDMA               | ~1.07× |
 
-![E2E loss](examples/fsdp_sdma/bench/results/mi300x_mlx5/e2e_all_w16_loss.png)
-![E2E throughput](examples/fsdp_sdma/bench/results/mi300x_mlx5/e2e_all_w16_tflops.png)
+![E2E loss](bench/results/mi300x_mlx5/e2e_all_w16_loss.png)
+![E2E throughput](bench/results/mi300x_mlx5/e2e_all_w16_tflops.png)
 
 ## Reproduce
 
 Each benchmark launches the 2-node run itself (ssh into master + worker, clear
 stale procs, start `torchrun`). The node pair / NIC list is at the top of each
-script — edit it for a different cluster.
+script — edit it for a different cluster. Run the commands below **from the repo
+root**; results are written under `examples/fsdp_sdma/bench/results/mi300x_mlx5/`.
 
 ```bash
 # 1) Standalone AllGather bandwidth UT (device ibgda_sdma vs RCCL)

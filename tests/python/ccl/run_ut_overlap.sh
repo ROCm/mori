@@ -19,7 +19,7 @@ GEMM_N="${1:-2048}" ; SIZE_MB="${2:-8}" ; NOPS="${3:-50}"
 MASTER=useocpm2m-097-040 ; MASTER_IP=10.158.213.159 ; WORKER=useocpm2m-097-083
 CTR=mori-sglang-mingzhi
 WT=/home/mingzliu/hp_cu_opt/deliver
-OUT=$WT/tests/python/ccl/ag_perf_results ; mkdir -p "$OUT"
+OUT=$WT/examples/fsdp_sdma/bench/results/mi300x_mlx5 ; mkdir -p "$OUT"
 IFACE=eth0
 IB=mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9
 FABRIC="GLOO_SOCKET_IFNAME=$IFACE NCCL_SOCKET_IFNAME=$IFACE MORI_SOCKET_IFNAME=$IFACE \
