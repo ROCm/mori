@@ -883,12 +883,14 @@ check_bnxt_dcqcn() {
 
     for dev in "${BNXT_DEVS[@]}"; do
         # Method 1: configfs (CNP_SERVICE_TYPE=0, driver-managed CC)
+        # sudo'd like the niccli/nicctl calls above: configfs/debugfs are root-only
+        # on most distros, and this script isn't required to run as root itself.
         local cc_path="/sys/kernel/config/bnxt_re/$dev/ports/1/cc"
-        if mkdir -p "/sys/kernel/config/bnxt_re/$dev" 2>/dev/null && [[ -d "$cc_path" ]]; then
+        if sudo mkdir -p "/sys/kernel/config/bnxt_re/$dev" 2>/dev/null && [[ -d "$cc_path" ]]; then
             local ecn_enable cc_mode
-            ecn_enable=$(cat "$cc_path/ecn_enable" 2>/dev/null || true)
-            cc_mode=$(cat    "$cc_path/cc_mode"    2>/dev/null || true)
-            rmdir -p "/sys/kernel/config/bnxt_re/$dev" 2>/dev/null || true
+            ecn_enable=$(sudo cat "$cc_path/ecn_enable" 2>/dev/null || true)
+            cc_mode=$(sudo cat    "$cc_path/cc_mode"    2>/dev/null || true)
+            sudo rmdir -p "/sys/kernel/config/bnxt_re/$dev" 2>/dev/null || true
 
             if [[ "$ecn_enable" == "0x1" || "$ecn_enable" == "1" ]] && \
                [[ "$cc_mode"    == "0x1" || "$cc_mode" == "1" ]]; then
@@ -901,10 +903,11 @@ check_bnxt_dcqcn() {
         fi
 
         # Method 2: debugfs (CNP_SERVICE_TYPE=1, firmware-managed CC)
-        local debug_info="/sys/kernel/debug/bnxt_re/$dev/info"
-        if [[ -r "$debug_info" ]]; then
+        local debug_info="/sys/kernel/debug/bnxt_re/$dev/info" debug_out
+        debug_out=$(sudo cat "$debug_info" 2>/dev/null || true)
+        if [[ -n "$debug_out" ]]; then
             local prof_type
-            prof_type=$(grep "fw_service_prof_type_sup" "$debug_info" 2>/dev/null | awk '{print $3}')
+            prof_type=$(echo "$debug_out" | grep "fw_service_prof_type_sup" | awk '{print $3}')
             if [[ "$prof_type" == "1" ]]; then
                 log_ok "$dev : DCQCN managed by firmware (fw_service_prof_type_sup=1) [debugfs]"
             else
