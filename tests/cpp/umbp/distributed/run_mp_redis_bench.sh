@@ -100,6 +100,14 @@ env $ENV UMBP_ROUTE_PUT_NODE_AFFINITY=local "$MASTER_BIN" "0.0.0.0:${PORT}" "$ME
 MPID=$!
 for i in $(seq 1 30); do curl -sf "http://127.0.0.1:${METRICS}/metrics" >/dev/null 2>&1 && break; sleep 1; done
 
+# ---- cross-process end-of-run barrier (fetch/both) ----
+# All PROCS processes reach it before any tears down, so a straggler's RDMA read
+# never hits a peer that already shut down (the transport-reset crash). For a
+# MULTI-HOST run, point every launcher at the SAME shared-FS BARRIER_DIR and set
+# --barrier-size to the TOTAL process count across hosts.
+BARRIER_DIR="${BARRIER_DIR:-${OUT}/barrier}"; rm -rf "$BARRIER_DIR" 2>/dev/null; mkdir -p "$BARRIER_DIR"
+BARRIER_SIZE="${BARRIER_SIZE:-$PROCS}"
+
 # ---- launch PROCS client processes (each CLIENTS clients) ----
 pids=()
 for p in $(seq 0 $((PROCS-1))); do
@@ -108,6 +116,7 @@ for p in $(seq 0 $((PROCS-1))); do
          --clients "$CLIENTS" --rounds "$ROUNDS" --warmup-rounds "$WARMUP" --batch "$BATCH" \
          --key-space "$KEYSPACE" --read-lag-rounds 1 --pattern rotate --get-mode "$GETMODE" \
          --gap-ms "$GAP" --mode baseline --put-affinity local --metrics-port 0 $EXTKV_ARGS \
+         --barrier-dir "$BARRIER_DIR" --barrier-size "$BARRIER_SIZE" --barrier-tag "run" \
          > "${OUT}/${LABEL}_p${p}.csv" 2>&1 &
   pids+=($!)
 done
