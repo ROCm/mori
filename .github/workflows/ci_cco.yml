@@ -64,7 +64,10 @@ jobs:
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         run: |
-          $CT exec $CONTAINER bash $GITHUB_WORKSPACE/tools/run_cco_tests.sh $GITHUB_WORKSPACE/build 4 2>&1
+          # MORI_CCO_SKIP_GDA_FULL=1: the MI355X-AINIC runner has no intranode
+          # cross-rail RDMA, so GDA-FULL tests (gda_flush_async/gda_modes/
+          # multiprocess) can't form FULL connections; skip them here.
+          $CT exec -e MORI_CCO_SKIP_GDA_FULL=1 $CONTAINER bash $GITHUB_WORKSPACE/tools/run_cco_tests.sh $GITHUB_WORKSPACE/build 4 2>&1
 
       - name: Run CCO C++ examples (2 ranks)
         run: |
