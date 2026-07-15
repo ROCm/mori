@@ -1,0 +1,4 @@
+[overlap-w16] nops=50 shard=8MB gemm_n=2048 | GEMM time under concurrent AllGather: rccl=2.04ms hp_sdma=1.31ms | hp_sdma 1.56x faster | win=hp_sdma | bitexact=True
+[overlap-w16] nops=50 shard=32MB gemm_n=2048 | GEMM time under concurrent AllGather: rccl=2.06ms hp_sdma=1.32ms | hp_sdma 1.56x faster | win=hp_sdma | bitexact=True
+[overlap-w16] nops=50 shard=64MB gemm_n=2048 | GEMM time under concurrent AllGather: rccl=2.08ms hp_sdma=1.33ms | hp_sdma 1.57x faster | win=hp_sdma | bitexact=True
+[overlap-w16] nops=50 shard=128MB gemm_n=2048 | GEMM time under concurrent AllGather: rccl=2.12ms hp_sdma=1.33ms | hp_sdma 1.60x faster | win=hp_sdma | bitexact=True
