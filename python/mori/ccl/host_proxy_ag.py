@@ -116,6 +116,28 @@ class HostProxyHierAllGather:
         # and matches the shipped device-path coherence contract. Default OFF.
         self._sdma_direct = os.environ.get("MORI_HOSTPROXY_SDMA_DIRECT", "0") not in (
             "0", "", "false", "False")
+        # TWIN-TRANSIT (MORI_HOSTPROXY_SDMA_TWIN=1, default ON). In the shared-handle
+        # path step-1 (own node block, in _post) and step-3 (remote node block, in
+        # _complete) both drive the SAME IntraNodeSubGroupAllgatherSdma handle -> the
+        # SAME internal transit ``out_``. Reusing one transit forces TWO node-local
+        # dist.barrier per AG: the step-1 EXIT barrier must free out_ (all peers
+        # finished the step-1 copy-OUT that reads out_) before step-3 SDMA-pushes into
+        # it, and the step-3 EXIT barrier frees out_ for the NEXT op. Giving step-3 its
+        # OWN handle (disjoint transit) removes the intra-AG WAR entirely: step-1 needs
+        # no exit barrier because step-3 no longer touches step-1's transit, and a
+        # SINGLE barrier at the end of _complete frees BOTH transits for the next op.
+        # Net: 2->1 node-local barrier per AG. Costs one extra transit ShmemMalloc
+        # (sized to one node-block). Only the non-direct 2-node SDMA-intra path
+        # benefits; single-node / direct keep the single-handle contract. Copy-OUT
+        # unchanged so bytes are identical. Ported from Team A (COORD 18:25Z; +0.95%
+        # E2E, bit-exact on A's nodes). Team B confirm (089/121, w16 Qwen-7B seq2048
+        # bf16, clean, all bit-exact 10.481612): 120-step fair 3v3 twin ON
+        # 147.96/148.02/148.55 mean 148.18 vs OFF 146.79/147.33/146.12 mean 146.75
+        # (+1.43, ~+0.97%; ON min > OFF max = clean separation). 500-step: twin ON
+        # 152.71 avg vs native 148.67, bit-exact 10.408024, ~1.027x. hp_cu (SDMA_INTRA=0)
+        # 162.14 bit-exact, no regression. Set =0 to A/B-revert.
+        self._sdma_twin = os.environ.get(
+            "MORI_HOSTPROXY_SDMA_TWIN", "1") not in ("0", "", "false", "False")
         # Triage: direct PUSH (copy-out eliminated) but with a per-call HOST
         # completion fence restored, to isolate copy-out elimination from the
         # stream-barrier weakening (the direct/stream path drifts/NaNs E2E).
@@ -197,6 +219,7 @@ class HostProxyHierAllGather:
         # the destination node-block region differ per call. Requires
         # MORI_ENABLE_SDMA=1 (the harness sets it) + shmem initialized.
         self._sdma = None
+        self._sdma3 = None  # twin transit for step-3 (see _sdma_twin)
         if self._sdma_intra:
             from mori.ccl import IntraNodeSubGroupAllgatherSdma
             self._sdma = IntraNodeSubGroupAllgatherSdma(
@@ -205,6 +228,20 @@ class HostProxyHierAllGather:
                 group_size=self.ranks_per_node, group_pos=self.local_rank,
                 pe_base=self.node_id * self.ranks_per_node, pe_stride=1,
             )
+            # Twin transit: a SECOND handle (disjoint out_) drives step-3 so it
+            # never contends step-1's transit. Only for the non-direct 2-node path
+            # (direct pushes into the user output, no transit to double). Every rank
+            # builds it in lockstep (ShmemMalloc is collective-symmetric). Sized to
+            # exactly one node-block (_max_bytes // num_nodes) so the 2nd malloc fits
+            # the heap alongside the first handle (which over-allocates full output).
+            if self._sdma_twin and not self._sdma_direct and self.num_nodes == 2:
+                twin_bytes = self._max_bytes // self.num_nodes
+                self._sdma3 = IntraNodeSubGroupAllgatherSdma(
+                    my_pe=self.my_pe, npes=self.npes,
+                    out_buffer_bytes=twin_bytes,
+                    group_size=self.ranks_per_node, group_pos=self.local_rank,
+                    pe_base=self.node_id * self.ranks_per_node, pe_stride=1,
+                )
 
         if self.num_nodes == 1:
             # Degenerate: no fabric transport needed.
@@ -291,7 +328,8 @@ class HostProxyHierAllGather:
         return self._stage[:nbytes].view(dtype)
 
     def _intra_ag(self, inp_1d, out_slots, out_block_1d, count, stream,
-                  out_full=None, block_off_elems=0):
+                  out_full=None, block_off_elems=0, sdma_handle=None,
+                  barrier_after=True):
         """Gather ``count``-element shards over this node's local sub-group.
 
         SDMA path (on-thesis): PUSH-gather over XGMI straight into the
@@ -304,10 +342,11 @@ class HostProxyHierAllGather:
         dist.all_gather into the per-slot views ``out_slots``. All variants
         leave the node-block laid out in local-index order, bit-exact.
         """
-        if self._sdma is not None:
+        hnd = sdma_handle if sdma_handle is not None else self._sdma
+        if hnd is not None:
             if self._sdma_direct and out_full is not None:
-                self._sdma.call_direct(inp_1d, out_full, count, block_off_elems, stream,
-                                       host_sync=self._sdma_direct_hostsync)
+                hnd.call_direct(inp_1d, out_full, count, block_off_elems, stream,
+                                host_sync=self._sdma_direct_hostsync)
             else:
                 # The non-direct sub-group gather's default prepare_sync/finish_sync
                 # each issue a WORLD host ShmemBarrierAll (runtime.cpp:218 -> the mori
@@ -335,9 +374,10 @@ class HostProxyHierAllGather:
                 # out_ is freshly allocated). Halving the per-AG host-barrier count keeps
                 # the SDMA leg off the critical path (perf, rule 2) while preserving the
                 # inter-op ordering invariant.
-                self._sdma(inp_1d, out_block_1d, count, stream,
-                           barrier=False, prepare_barrier=False)
-                dist.barrier(group=self._intra_group)
+                hnd(inp_1d, out_block_1d, count, stream,
+                    barrier=False, prepare_barrier=False)
+                if barrier_after:
+                    dist.barrier(group=self._intra_group)
         else:
             dist.all_gather(out_slots, inp_1d, group=self._intra_group)
 
@@ -484,9 +524,13 @@ class HostProxyHierAllGather:
                 sts.append(self._session.write(b0_local, b0_remote, nb, uid))
 
             # step 1 (intra XGMI, overlapped): gather my node's block into out
-            # while the fabric writes are in flight.
+            # while the fabric writes are in flight. TWIN: skip the step-1 exit
+            # barrier -- step-3 uses a disjoint transit (self._sdma3) so there is
+            # no intra-AG WAR, and _complete's single end barrier frees step-1's
+            # transit for the next op.
             self._intra_ag(inp, my_out_slots, out[base * e:(base + rpn) * e],
-                           e, stream, out_full=out, block_off_elems=base * e)
+                           e, stream, out_full=out, block_off_elems=base * e,
+                           barrier_after=(self._sdma3 is None))
 
         if self._async_diag:
             self._n_post += 1
@@ -521,9 +565,13 @@ class HostProxyHierAllGather:
             o0, o1 = bounds[k], bounds[k + 1]
             recv_k = recv_slot[o0:o1]
             slots_k = [s[o0:o1] for s in other_out_slots]
+            # TWIN: drive step-3 on the disjoint transit (self._sdma3) so it never
+            # contends step-1's out_. The trailing barrier stays here -- it now
+            # frees BOTH transits for the next op.
             self._intra_ag(recv_k, slots_k,
                            out[obase * e:(obase + rpn) * e], o1 - o0, stream,
-                           out_full=out, block_off_elems=obase * e + o0)
+                           out_full=out, block_off_elems=obase * e + o0,
+                           sdma_handle=self._sdma3)
 
         with torch.cuda.stream(stream):
             if self._flag_session is not None:

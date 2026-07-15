@@ -71,6 +71,55 @@ inline int IntraMultiQueue() {
   return mq;
 }
 
+// EVENT-SCOPED finish_sync copy-OUT (MORI_INTRA_EVENT_SYNC). The default
+// finish_sync host-blocks on hipStreamSynchronize(stream) -- but ``stream`` is
+// the CALLER's compute stream (host_proxy_ag runs the whole AG inside
+// ``with torch.cuda.stream(stream)``), so the drain waits for the ENTIRE stream
+// to reach the copy-OUT, not just the SDMA copy. When set, the copy-OUT is
+// issued on a PRIVATE stream that only waits (via event) on the gather kernel,
+// then the host waits on a copy-done event -- scoping the host stall to
+// gather+copy instead of the full caller stream. DEFAULT ON (validated +14%
+// win); MORI_INTRA_EVENT_SYNC=0 restores the legacy path where the copy-OUT
+// stays on ``stream`` and the host does a full hipStreamSynchronize. See
+// finish_sync.
+inline bool IntraEventSync() {
+  static const bool on = []() {
+    const char* e = std::getenv("MORI_INTRA_EVENT_SYNC");
+    // DEFAULT ON: the event-scoped copy-OUT is a validated +14% hp_sdma win
+    // (Team B, 089/121: 500-step 175.57 vs native 148.86, bit-exact 10.408024,
+    // no regression). Set MORI_INTRA_EVENT_SYNC=0 to force the legacy
+    // full-stream-drain path.
+    if (e == nullptr) return true;
+    return std::atoi(e) != 0;
+  }();
+  return on;
+}
+
+// EVENT-SCOPED finish_sync WITHOUT the host event wait (MORI_INTRA_EVENT_NOSYNC).
+// The EVENT_SYNC path already GPU-orders the caller stream after the copy-OUT via
+// hipStreamWaitEvent(stream, copy_ev_): every downstream consumer AND the deferred
+// node-local dist.barrier(intra_group) (enqueued on the caller stream) are gated on
+// the landed copy-OUT on the DEVICE. On the hot path (barrier=false) no host-side
+// ShmemBarrierAll follows finish_sync, so the trailing host hipEventSynchronize
+// blocks the LAUNCH thread for a completion that nothing on the host actually needs
+// -- it only prevents the host from racing ahead to post the next AG. Skipping it
+// (when barrier=false only) lets the host launch the next op's RDMA + gather while
+// this op's copy-OUT is still draining on the copy engine, without weakening any
+// correctness fence (device ordering is intact). DEFAULT ON: validated +4.3%
+// hp_sdma win on top of EVENT_SYNC (Team B, 089/121: 120-step 3v3 176.27 vs
+// 169.04 clean separation; 500-step 181.65 vs native 150.72, bit-exact
+// 10.408024, no regression -- hp_cu 161.15). The standalone UT (barrier=true)
+// always keeps the host wait. Set MORI_INTRA_EVENT_NOSYNC=0 to restore the
+// per-AG host event wait on the hot path.
+inline bool IntraEventNoSync() {
+  static const bool on = []() {
+    const char* e = std::getenv("MORI_INTRA_EVENT_NOSYNC");
+    if (e == nullptr) return true;
+    return std::atoi(e) != 0;
+  }();
+  return on;
+}
+
 class IntraNodeSubGroupAllgatherSdma {
  private:
   int myPe_;
@@ -100,6 +149,23 @@ class IntraNodeSubGroupAllgatherSdma {
 
   CclAllgatherSubGroupArgs<uint32_t> jit_args_;
   CclAllgatherSubGroupParamContiguousArgs<uint32_t> jit_args_pc_;
+
+  // MORI_INTRA_EVENT_SYNC scratch (lazily created on first use, never in the
+  // default path). ``copy_stream_`` carries only the copy-OUT; ``gather_ev_``
+  // orders it after the gather on the caller stream; ``copy_ev_`` is what the
+  // host waits on -- scoping the stall to gather+copy, not the whole caller
+  // stream. All null unless the env lever is on.
+  hipStream_t copy_stream_ = nullptr;
+  hipEvent_t gather_ev_ = nullptr;
+  hipEvent_t copy_ev_ = nullptr;
+
+  void ensure_event_sync_scratch() {
+    if (copy_stream_ == nullptr) {
+      (void)hipStreamCreateWithFlags(&copy_stream_, hipStreamNonBlocking);
+      (void)hipEventCreateWithFlags(&gather_ev_, hipEventDisableTiming);
+      (void)hipEventCreateWithFlags(&copy_ev_, hipEventDisableTiming);
+    }
+  }
 
   // DIRECT-TO-OUTPUT registration. Maps a user output buffer
   // base address -> its symmetric mem object + size. When the fused sliced
@@ -219,6 +285,9 @@ class IntraNodeSubGroupAllgatherSdma {
     // benign leak in a process that is exiting anyway). This is TEARDOWN-ONLY:
     // during operation shmem is always initialized, so the free path is
     // byte-for-byte unchanged -- no effect on any live gather or on device-ibgda.
+    if (copy_ev_) (void)hipEventDestroy(copy_ev_);
+    if (gather_ev_) (void)hipEventDestroy(gather_ev_);
+    if (copy_stream_) (void)hipStreamDestroy(copy_stream_);
     if (!shmem::ShmemIsInitialized()) return;
     if (out_) shmem::ShmemFree(out_);
     if (flags_) shmem::ShmemFree(flags_);
@@ -517,6 +586,36 @@ class IntraNodeSubGroupAllgatherSdma {
   // (e.g. test_intra_subgroup_sdma) byte-for-byte unchanged.
   double finish_sync(uintptr_t output, size_t count_u32, hipStream_t stream, bool barrier = true) {
     size_t total = static_cast<size_t>(groupSize_) * count_u32 * sizeof(uint32_t);
+    if (IntraEventSync()) {
+      // EVENT-SCOPED path: run the copy-OUT on a private stream ordered AFTER
+      // the gather (via gather_ev_ on the caller stream), then host-wait ONLY on
+      // the copy-done event. The gather kernel already spun in-kernel until all
+      // peers pushed (out_ is complete on kernel return), so ordering the copy
+      // after the gather is sufficient; the host stall then covers gather+copy
+      // instead of every op queued on the caller's compute stream.
+      ensure_event_sync_scratch();
+      (void)hipEventRecord(gather_ev_, stream);
+      (void)hipStreamWaitEvent(copy_stream_, gather_ev_, 0);
+      (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
+                           copy_stream_);
+      (void)hipEventRecord(copy_ev_, copy_stream_);
+      // Make the caller stream observe the copy-OUT (downstream consumers gate on
+      // it) without a host drain of the caller stream.
+      (void)hipStreamWaitEvent(stream, copy_ev_, 0);
+      // Host-wait on the copy-OUT ONLY when a host-side ShmemBarrierAll follows
+      // (barrier=true, the standalone contract) -- there the host must know the
+      // copy landed before entering the cross-PE rendezvous. On the hot path
+      // (barrier=false) nothing on the host consumes the copy: the caller stream
+      // is already device-ordered after it (hipStreamWaitEvent above), so the
+      // MORI_INTRA_EVENT_NOSYNC lever lets the launch thread skip the host wait
+      // and race ahead to post the next AG while this copy drains on the copy
+      // engine. DEFAULT OFF => host wait always taken (byte+timing identical).
+      if (barrier || !IntraEventNoSync()) {
+        (void)hipEventSynchronize(copy_ev_);
+      }
+      if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierAll();
+      return 0.0;
+    }
     (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
                          stream);
     (void)hipStreamSynchronize(stream);
