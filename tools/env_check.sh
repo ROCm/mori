@@ -727,14 +727,16 @@ check_bnxt_versions() {
             log_ok "$label : $uniq (consistent across all ${#nic_indices[@]} NICs)"
         fi
     }
-    _report_fw "firmware"      "${fw_versions[@]}"
-    _report_fw "RoCE firmware" "${roce_versions[@]}"
+    _report_fw "firmware" "${fw_versions[@]}"
     [[ ${#failed_idxs[@]} -gt 0 ]] && log_warn "could not read firmware from NIC(s): ${failed_idxs[*]}"
 
     if [[ ${#roce_versions[@]} -gt 0 ]]; then
+        local roce_uniq; roce_uniq=$(printf '%s\n' "${roce_versions[@]}" | sort -u)
+        if [[ $(grep -c . <<<"$roce_uniq") -gt 1 ]]; then
+            log_warn "RoCE firmware inconsistent across NICs:"; printf '         %s\n' $roce_uniq
+        fi
         local v
-        while read -r v; do check_bnxt_version_recommendation "$v"; done \
-            < <(printf '%s\n' "${roce_versions[@]}" | sort -u)
+        while read -r v; do check_bnxt_version_recommendation "$v"; done <<< "$roce_uniq"
     fi
 
     # --- port state, net device, and niccli index mapping via sysfs ---
