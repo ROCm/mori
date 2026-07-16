@@ -14,11 +14,11 @@ python/mori/_version.py
 python/mori/_jit-sources/
 python/mori/*.so
 python/mori/cco/*.so
-python/mori/cco/cco.cpp          # Cython-generated from cco.pyx (build artifact)
+python/mori/cco/cco.cpp
 python/mori/umbp_master
 python/mori/spdk_proxy
-python/mori/examples/          # BUILD_EXAMPLES=ON copies example binaries here
-python/mori/benchmarks/        # BUILD_BENCHMARK=ON copies benchmark binaries here
+python/mori/examples/
+python/mori/benchmarks/
 
 # local cco experiments (not for commit)
 examples/cco/**/_dump_*.py
