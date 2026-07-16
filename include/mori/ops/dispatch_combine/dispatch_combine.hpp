@@ -242,7 +242,10 @@ struct ShmemBufsInterNode {
 
 class EpDispatchCombineHandle {
  public:
-  EpDispatchCombineHandle(EpDispatchCombineConfig config);
+  // ccoCommPtr (raw ccoComm*, as uintptr_t) selects the CCO backend for symmetric
+  // buffers; 0 keeps the legacy shmem heap. Reuses a caller-owned cco communicator
+  // (e.g. the one created by the Python mori.cco.Communicator, via comm.ptr).
+  EpDispatchCombineHandle(EpDispatchCombineConfig config, uintptr_t ccoCommPtr = 0);
   ~EpDispatchCombineHandle();
 
   void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,
@@ -329,6 +332,13 @@ class EpDispatchCombineHandle {
   void InitializeBarrier();
   void FinalizeBarrier();
 
+  // Symmetric allocation router: a CCO window (when useCcoComm) or the shmem heap.
+  // Returns a SymmMemObjPtr whose device p2pPeerPtrs[pe] address peer pe directly,
+  // so the existing kernels (GetAs<T*>(pe)) work unchanged on either backend.
+  mori::application::SymmMemObjPtr MallocSymm(size_t size, unsigned int flags);
+  void FreeSymmByLocalPtr(void* localPtr);
+  void FinalizeCcoAllocs();
+
  public:
   // Updated at each round of inference
   index_t curRankNumToken{0};
@@ -340,6 +350,29 @@ class EpDispatchCombineHandle {
  public:
   // Config
   EpDispatchCombineConfig config;
+
+  // CCO backend: when ccoCommPtr != nullptr, symmetric buffers are carved from a
+  // cco window (LSA flat-VA) instead of the shmem heap. Lets intra-node EP run on
+  // archs where mori-shmem is unavailable (e.g. gfx1250). ccoAllocs tracks the
+  // per-buffer resources so the handle can release them on teardown.
+  void* ccoCommPtr{nullptr};
+  bool useCcoComm{false};
+  struct CcoSymmAlloc {
+    void* win{nullptr};  // ccoWindow_t
+    void* localPtr{nullptr};
+    mori::application::SymmMemObj* cpuObj{nullptr};
+    mori::application::SymmMemObj* gpuObj{nullptr};
+    uintptr_t* p2pDev{nullptr};
+  };
+  std::vector<CcoSymmAlloc> ccoAllocs;
+  // Single CCO arena carved into sub-regions by bump offset (mirrors FlyDSL's
+  // SymmArena). gfx942/ROCm fails hipMemSetAccess after a few *separate* VMM
+  // allocations, so all symmetric buffers share ONE window.
+  void* ccoArenaWin{nullptr};
+  void* ccoArenaLocalPtr{nullptr};
+  size_t ccoArenaSize{0};
+  size_t ccoArenaBump{0};
+
   int fp8BlockwiseCombineScaleDim{0};
   int fp8BlockwiseCombineScaleTypeSize{0};
   // Routed expert indices for tokens
@@ -446,6 +479,9 @@ struct EpDispatchCombineArgs {
   int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
   bool replayMode{false};
+  // BW diagnostic (MORI_BW_DUMMY_ATOMICS): extra remote atomicAdds injected per
+  // sent token in intra-node dispatch to test the remote-atomic bottleneck.
+  int bwDummyAtomics{0};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   T* inpTokenBuf{nullptr};
@@ -511,6 +547,8 @@ struct EpDispatchCombineArgsRaw {
   int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
   bool replayMode{false};
+  // BW diagnostic (MORI_BW_DUMMY_ATOMICS): keep in sync with EpDispatchCombineArgs<T>.
+  int bwDummyAtomics{0};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   void* inpTokenBuf{nullptr};

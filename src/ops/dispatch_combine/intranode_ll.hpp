@@ -43,11 +43,13 @@ using core::VecTypeSelector;
 
 constexpr int kMaxGpusPerNode = 8;
 
-#define LDS_BARRIER()                     \
-  {                                       \
-    asm volatile("s_waitcnt lgkmcnt(0)"); \
-    __builtin_amdgcn_s_barrier();         \
-  }
+// Workgroup barrier that also guarantees prior LDS writes are visible. The old
+// body ("s_waitcnt lgkmcnt(0)" + s_barrier) hard-codes the gfx9 ISA and fails to
+// assemble on gfx1250 (RDNA4 split the waitcnt encoding and renamed s_barrier).
+// __syncthreads() is the arch-portable equivalent: the compiler emits the correct
+// LDS wait + workgroup barrier for the target arch (mirrors FlyDSL's fx.barrier()).
+#define LDS_BARRIER() \
+  { __syncthreads(); }
 
 /* ──────────────────────────────────────────────────────────────────────────────
  * ReadLanePtr — broadcast a 64-bit pointer from one lane to all via

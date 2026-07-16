@@ -739,7 +739,13 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   allocProp.location.type = hipMemLocationTypeDevice;
   allocProp.location.id = comm->hipDev;
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-  allocProp.allocFlags.gpuDirectRDMACapable = 1;
+  // gpuDirectRDMACapable VMM can fail hipMemSetAccess under concurrent multi-process
+  // allocation on some archs/drivers (observed: gfx942 multi-rank -> invalid argument).
+  // Allow disabling via CCO_GDR_CAPABLE=0 to fall back to a plain device allocation.
+  {
+    const char* _gdr = getenv("CCO_GDR_CAPABLE");
+    allocProp.allocFlags.gpuDirectRDMACapable = (_gdr && atoi(_gdr) == 0) ? 0 : 1;
+  }
 #endif
 
   hipMemGenericAllocationHandle_t physHandle = 0;
@@ -769,6 +775,12 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   accessDesc.location.type = hipMemLocationTypeDevice;
   accessDesc.location.id = comm->hipDev;
   accessDesc.flags = hipMemAccessFlagsProtReadWrite;
+  {
+    int _curDev = -1;
+    (void)hipGetDevice(&_curDev);
+    MORI_SHMEM_ERROR("ccoMemAlloc DIAG: hipDev={} curDev={} localVa={} alignedSize={} handleType={}",
+                     comm->hipDev, _curDev, localVa, alignedSize, comm->handleType);
+  }
   for (int retry = 0; retry < 5; retry++) {
     {
       vmmProcessLock vmmLock;
@@ -1226,6 +1238,25 @@ int ccoWindowRegister(ccoComm* comm, size_t size, ccoWindow_t* outWin, void** lo
 
   *localPtr = ptr;
   return 0;
+}
+
+/* ========================================================================== */
+/*                          ccoGetPeerPtr (host)                           */
+/* ========================================================================== */
+
+// Host mirror of the device ccoGetLsaPeerPtr. A symmetric slot lives at the same
+// slotOffset within every LSA rank's perRankSize slice of the flat VA, so:
+//   localPtr = flatBase + lsaRank      * perRankSize + slotOffset
+//   peerVa   = flatBase + peerLsaRank  * perRankSize + slotOffset
+//            = localPtr + (peerLsaRank - lsaRank) * perRankSize
+// No allocTable lookup or slotOffset needed. Returns nullptr if pe is outside
+// this rank's LSA (intra-node) team.
+void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe) {
+  if (comm == nullptr || localPtr == nullptr) return nullptr;
+  int peerLsaRank = CcoPeToLsaRank(comm, pe);
+  if (peerLsaRank < 0 || peerLsaRank >= comm->lsaSize) return nullptr;
+  ptrdiff_t slices = static_cast<ptrdiff_t>(peerLsaRank) - static_cast<ptrdiff_t>(comm->lsaRank);
+  return static_cast<char*>(localPtr) + slices * static_cast<ptrdiff_t>(comm->perRankSize);
 }
 
 /* ========================================================================== */

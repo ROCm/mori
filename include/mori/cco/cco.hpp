@@ -874,6 +874,15 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* win);
 // Teardown order: WindowDeregister → MemFree (if using separate alloc)
 int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win);
 
+// Host-side peer flat-VA for a symmetric pointer (intra-node LSA). Mirrors the
+// device-side ccoGetLsaPeerPtr but is computable on the host, so callers can
+// pre-fill peer-pointer tables (e.g. a SymmMemObj::p2pPeerPtrs array) that a
+// kernel later dereferences directly. `localPtr` must be a pointer returned by
+// ccoMemAlloc / ccoWindowRegister on this comm; `pe` is a world rank in the
+// same LSA (intra-node) team. Returns the peer's flat VA (valid device address),
+// or nullptr if pe is not reachable via LSA.
+void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe);
+
 // ── Phase 3: Device communicator ──
 //
 // Initialize `reqs` via CCO_DEV_COMM_REQUIREMENTS_INITIALIZER and override

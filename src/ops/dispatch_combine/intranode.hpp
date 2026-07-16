@@ -179,6 +179,18 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
       }
 
+      // BW diagnostic: inject N dummy remote atomicAdds per sent token onto an
+      // intra-node-unused symmetric counter (sendAtomicSignal[destPe]). Mirrors
+      // the real per-token remote atomic on dispTokOffset[destPe]. If dispatch
+      // bandwidth degrades ~linearly with N, per-token remote atomics dominate;
+      // if it stays flat, the bottleneck is elsewhere. Non-destructive.
+      if (args.bwDummyAtomics > 0 && laneId == 0) {
+        index_t* dummyRemote = args.sendAtomicSignalMemObj->template GetAs<index_t*>(destPe);
+        for (int d = 0; d < args.bwDummyAtomics; ++d) {
+          atomicAdd(dummyRemote, 1);
+        }
+      }
+
       // Write weights and indices
       if (laneId < config.numExpertPerToken) {
         if (args.weightsBuf) {
