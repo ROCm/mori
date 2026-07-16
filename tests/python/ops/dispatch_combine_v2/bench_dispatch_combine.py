@@ -50,13 +50,10 @@ import mori.cco.device.flydsl as cco  # noqa: F401
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
 sys.path.insert(
-    0, os.path.join(_ROOT, "python", "mori", "ops", "dispatch_combine_v2")
-)  # op + kernels
-sys.path.insert(
     0, os.path.join(_ROOT, "examples", "cco", "python")
 )  # cco_example_common
 from cco_example_common import set_device, sync  # noqa: E402
-from dispatch_combine_op import (  # noqa: E402
+from mori.ops.dispatch_combine_v2 import (  # noqa: E402
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
 )
@@ -110,7 +107,7 @@ SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = forward per-token scales
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,2048").split(",")]
 
 # fp8 flavor is arch-specific: OCP e4m3 on gfx950/gfx1250, fnuz on gfx942.
-import tuning_configs as _tc  # noqa: E402
+from mori.ops.dispatch_combine_v2 import tuning_configs as _tc  # noqa: E402
 
 _FP8_DT = (
     torch.float8_e4m3fn

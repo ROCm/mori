@@ -31,7 +31,7 @@ import torch
 import flydsl.expr as fx
 from mori.tensor_utils import from_gpu_ptr
 
-from intranode_kernels import (
+from .intranode_kernels import (
     make_dispatch,
     make_combine,
     make_combine_scatter,
@@ -228,7 +228,7 @@ class EpDispatchCombineConfig:
     def tuned(cls, **kwargs):
         """Build a config with block/warp geometry pulled from tuning_configs
         (unless explicitly overridden in kwargs)."""
-        from tuning_configs import lookup
+        from .tuning_configs import lookup
 
         dt = kwargs.get("data_type", torch.bfloat16)
         dtype = (
