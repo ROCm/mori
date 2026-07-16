@@ -234,14 +234,12 @@ pip install amd_mori
 #### Nightly (pre-built, tested daily)
 
 ```bash
-# From PyPI
 pip install --pre amd-mori-nightly
-
-# Or from GitHub Pages
-pip install --no-index --force-reinstall --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori
 ```
 
-Browse all nightly builds: https://rocm.github.io/mori/nightly/
+> **Deprecated**: the GitHub Pages nightly index
+> (`https://rocm.github.io/mori/nightly/`) is being retired. Please install
+> nightly builds from PyPI (`amd-mori-nightly`) as shown above.
 
 > **Note**: `amd-mori` and `amd-mori-nightly` both provide the `mori` Python module.
 > Do not install both at the same time — uninstall one before installing the other.
