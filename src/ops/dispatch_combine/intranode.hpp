@@ -225,10 +225,14 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 
       {
         // Fine-grained timing: the actual hidden-dim payload WarpCopy to the
-        // destination PE (the bulk P2P write).
+        // destination PE (the bulk P2P write). Unroll=8 issues 8 in-flight 16B
+        // loads before the stores (memory-level parallelism) to hide the
+        // higher per-access latency of the CCO peer path; matches the v2/FlyDSL
+        // multi-stream copy that keeps dispatch fast.
         MORI_TRACE_SPAN(profiler, Slot::DispTokenCopy);
-        core::WarpCopy(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-                       args.inpTokenBuf + srcTokOffset, hiddenDim);
+        core::WarpCopy<T, 8>(
+            args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
+            args.inpTokenBuf + srcTokOffset, hiddenDim);
       }
     }
   }
