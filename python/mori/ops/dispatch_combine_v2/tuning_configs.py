@@ -140,23 +140,24 @@ _MI355X_TABLE = {
     },
 }
 
-# ── gfx1250 (256 CU, wave32) — measured 2026-07-11, EP4, bf16, full block x warp
-# sweep (dispatch and combine tuned independently across tok 8..8192). Key lessons:
-# (a) dispatch loves more parallelism — warp grows 8->16->32 with tok, block 128
-#     (<=1024) then 192 (>=2048); warp 32 nearly 4x's large-tok dispatch BW.
-# (b) combine wants the OPPOSITE — few warps at small tok (over-parallelizing the
-#     gather+xdb barrier collapses it: block 64 warp 8 at small, warp grows to 16
-#     and block to 128/192 only for bandwidth-bound large tok.
-# (c) GUARDRAIL: block_num MUST stay < CU count (256). The dispatch Phase-2 grid
-#     barrier needs all blocks co-resident; block 256 deadlocks (100% spin). 192 is
-#     the safe ceiling here. Measured bf16 GB/s (disp/comb): 64=25/11 128=50/19
-#     256=93/28 512=161/41 1024=204/61 2048=259/90 4096=292/120 8192=335/149.
+# ── gfx1250 (256 CU, wave32) — RE-TUNED 2026-07-15 EP4, bf16, with the vec4 combine
+# kernel + inner-unroll load-first scheduling, FINE 2-pass block x warp sweep
+# (tok 16..16384; comb block 48..192, warp 2..16). Key lessons: (a) dispatch
+# unchanged by vec4 — warp grows to 32, block 192; peaks ~287 GB/s @16384.
+# (b) combine SHIFTED with vec4 AND is very warp-sensitive at small tok: warp 2 wins
+# <=128 (64/2: 64tok 27 vs warp4 21 vs warp16 11 — over-parallelizing the gather+xdb
+# barrier collapses it), warp 4 for mid, warp 8 for large; block grows 64->96->128.
+# The old pre-vec4 schedule (comb block->192, warp 16) is stale: comb @8192 189->242
+# (+28%), mid 512 55->102 (+84%), tiny 64 ~11->27 (2.4x). (c) GUARDRAIL: block_num
+# < CU (256); 192 safe ceiling (Phase-2 grid barrier needs co-residence). Measured
+# vec4 GB/s (disp/comb): 64=29/27 128=56/47 256=114/74 512=182/102 1024=214/132
+# 2048=248/174 4096=264/207 8192=282/242 16384=287/273.
 _GFX1250_SCHED_BF16 = (
-    (64, 128, 8, 64, 8),  # <=64:   disp 128/8, comb 64/8 (latency-bound)
-    (256, 128, 16, 64, 8),  # <=256:  disp warp 16
-    (1024, 128, 32, 128, 8),  # <=1024: disp warp 32; comb block 128
-    (4096, 192, 32, 128, 16),  # <=4096: disp 0.75*CU; comb warp 16 (bandwidth)
-    (None, 192, 32, 192, 16),  # >4096 (peak): disp 335 / comb 149 GB/s
+    (128, 128, 8, 64, 2),  # <=128:  latency-bound; combine warp 2 (fewest warps win)
+    (512, 192, 32, 64, 4),  # <=512:  disp peak; comb 64/4
+    (1536, 192, 32, 96, 4),  # <=1536: comb block 96
+    (4096, 192, 32, 128, 4),  # <=4096: comb block 128
+    (None, 192, 32, 128, 8),  # >4096:  comb warp 8 (242/273 GB/s @8192/16384)
 )
 _GFX1250_DEFAULT = dict(
     dispatch_block_num=192,
@@ -165,19 +166,12 @@ _GFX1250_DEFAULT = dict(
     combine_warp_num_per_block=16,
     schedule=_GFX1250_SCHED_BF16,
 )
-# DeepSeek-V4-Pro shape (hidden 7168, topk 6, 384 experts) — measured 2026-07-11,
-# EP4 bf16, same 2D sweep. Same shape family as topk=8, geometry ~identical (block/
-# warp track token count, not topk); disp shifts to block 192 a notch earlier and
-# peaks higher (fewer recv copies at topk 6: 360/141 GB/s @8192). Measured GB/s
-# (disp/comb): 64=24/11 128=46/17 256=90/28 512=150/39 1024=227/57 2048=278/84
-# 4096=320/113 8192=360/141.
-_GFX1250_SCHED_BF16_T6 = (
-    (128, 128, 8, 64, 4),  # <=128:  latency-bound
-    (256, 192, 16, 64, 8),  # <=256
-    (1024, 192, 32, 64, 16),  # <=1024: disp peak warp; comb small block/warp16
-    (4096, 192, 32, 128, 16),  # <=4096: comb block 128 (bandwidth)
-    (None, 192, 32, 192, 16),  # >4096 (peak): disp 360 / comb 141 GB/s
-)
+# DeepSeek-V4-Pro shape (hidden 7168, topk 6, 384 experts). RE-VALIDATED 2026-07-15
+# EP4 bf16 vec4 at the topk=8 schedule geometries: geometry is topk-independent
+# (tracks token count, not topk) — per-size optimum matches topk=8, so reuse the
+# same schedule. Measured vec4 GB/s (disp/comb): 16=6/4 256=95/67 512=164/93
+# 1024=212/116 2048=252/164 4096=281/200 8192=293/238 16384=300/272.
+_GFX1250_SCHED_BF16_T6 = _GFX1250_SCHED_BF16
 # EP8 (world_size=8) RE-TUNED 2026-07-13 on gfx1250 CROSS-NODE (2 nodes x 4 GPUs
 # over the UALink fabric), bf16, with the vec4 combine-gather kernel, full 2-pass
 # block x warp sweep (tok 8..8192). dispatch unchanged by vec4: block 128, warp
