@@ -213,6 +213,14 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 > typically pre-installed with the kernel OFED stack. For Thor2 and Pollara, install the
 > corresponding userspace library from your NIC vendor.
 
+**Recommended NIC firmware/driver versions** (check with `mori check` or `tools/env_check.sh`):
+
+| Vendor | Recommendation |
+|--------|-----------------|
+| AMD Pollara (AINIC) | `>= 1.117.5-a-45` (`1.117.1` major lacks IBGDA support) |
+| Broadcom (Thor2) | `237.1.137.x` / `235.2.86.x`; `231.x` too old for IBGDA |
+| Mellanox (ConnectX, mlx5) | No known minimum; tested on `ConnectX-7` |
+
 ### Install
 
 MoRI can be installed in three ways: from PyPI (stable), nightly pre-built wheels (latest dev), or from source.

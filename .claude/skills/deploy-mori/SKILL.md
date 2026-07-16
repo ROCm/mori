@@ -20,6 +20,7 @@ contains `pyproject.toml`; ask the user otherwise.
 ```bash
 lspci | grep -iE "pensando|ionic|dsc|pollara" && echo "→ ainic"
 lspci | grep -iE "broadcom.*thor|bnxt"         && echo "→ thor2"
+lspci | grep -iE "mellanox|connectx"           && echo "→ mlx5 (no Step 3 needed, works out of the box)"
 ```
 
 ---
@@ -135,6 +136,11 @@ Run the subsection matching the NIC type detected at the top:
 
 **Skip if NIC type is not `ainic`.**
 
+> **Recommended version**: for cross-node MORI (EP over RDMA / IBGDA), AINIC firmware
+> `>= 1.117.5-a-45` is solid. The `1.117.1` major does **not** support IBGDA — if the
+> host is on that branch, flag it to the user and recommend upgrading before proceeding.
+> The userspace library (`libionic`) must match the kernel driver version.
+
 ### Detect host AINIC version and check against public repo
 
 Run on the **host** (outside container):
@@ -198,6 +204,12 @@ nicctl --version
 ## Step 3b: Install Broadcom (bnxt / thor2) userspace libraries + tools
 
 **Skip if NIC type is not `thor2` / bnxt.**
+
+> **Recommended version**: for cross-node MORI (EP over RDMA / IBGDA), Broadcom firmware
+> is solid on `237.1.137.x` (official Broadcom release) and `235.2.86.x` (customer-specific
+> build). `231.x` is too old for IBGDA — if the host is on that branch, flag it to the user
+> and recommend upgrading. The userspace library (`libbnxt_re`, 3b.2) must match the kernel
+> driver version detected in 3b.1.
 
 The bnxt path of `mori check` / `mori setup` needs two NIC-specific pieces installed
 here: (1) the **RoCE userspace lib** (`libbnxt_re`) and (2) a **recent `niccli`**.

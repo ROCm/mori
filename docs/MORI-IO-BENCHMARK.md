@@ -25,10 +25,35 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
     tests/python/io/benchmark.py --host="10.194.129.65"
 ```
 
+### Fabric (cross-node scale-up UALink super-node)
+
+The `fabric` backend transfers between two nodes that share the same scale-up
+fabric domain (**same vPOD** — verify with `amd-smi fabric` that `PPOD_ID` and
+`VPOD_ID` match and `ACCEL_STATE` is `READY` on both). Buffers are allocated as
+fabric-exportable VMM memory internally, so no `--host`/QP options are needed;
+OOB metadata is still exchanged over gloo (torchrun).
+
+```bash
+# node A (initiator)
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+    --master_addr="<nodeA_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --backend fabric \
+    --all --enable-sess --enable-batch-transfer --transfer-batch-size 1 \
+    --sweep-start-size 1048576 --sweep-max-size 268435456 --op-type read
+
+# node B (target): same command with --node_rank=1
+```
+
+> Requires ROCm ≥ 7.15 (HIP fabric VMM APIs). Only GPU memory is supported
+> (`--mem-type gpu`). If the two nodes are not in the same vPOD, session creation
+> fails fast with a clear error.
+
 ## Benchmark Arguments
 
 | Argument | Description |
 |----------|-------------|
+| `--backend` | `rdma` (cross-node), `xgmi` (intra-node), or `fabric` (cross-node UALink super-node, same vPOD) |
+| `--num-streams` / `--num-events` | HIP stream/event pool size for `xgmi`/`fabric` backends (default `64`) |
 | `--buffer-size` | Message size per transfer (bytes) |
 | `--all` | Sweep message size from 8B to 1MB |
 | `--sweep-start-size` | Starting message size when using `--all` sweep |

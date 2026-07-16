@@ -99,6 +99,11 @@ class SymmArena:
             ptr, nbytes = self.local_ptr(name), self._sizes[name]
         from_gpu_ptr(ptr, (nbytes,), torch.int8).zero_()
 
+    def close(self):
+        """Free the symmetric window (deregister before freeing the backing mem)."""
+        self._win.close()
+        self._mem.close()
+
 
 @dataclass
 class EpDispatchCombineConfig:
@@ -108,7 +113,12 @@ class EpDispatchCombineConfig:
     max_num_inp_token_per_rank: int
     num_experts_per_rank: int
     num_experts_per_token: int
+    # Base token dtype; dispatch_data_type / combine_data_type override it per-op
+    # (None => data_type). Asymmetric (fp8 dispatch -> bf16 combine) fits an expert
+    # op that converts dtype between the two. gather mode only.
     data_type: torch.dtype = torch.bfloat16
+    dispatch_data_type: torch.dtype = None
+    combine_data_type: torch.dtype = None
     # Per-token quant scales forwarded verbatim to dest out_scales (0 disables).
     scale_dim: int = 0
     scale_type_size: int = 0
@@ -130,6 +140,15 @@ class EpDispatchCombineConfig:
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
 
     def __post_init__(self):
+        # all-or-none: setting only one silently defaults the other to data_type.
+        if (self.dispatch_data_type is None) != (self.combine_data_type is None):
+            raise ValueError(
+                "dispatch_data_type / combine_data_type must be set together "
+                "(all-or-none): got dispatch_data_type="
+                f"{self.dispatch_data_type}, combine_data_type={self.combine_data_type}. "
+                "Set data_type alone for a symmetric op, or set both explicitly for "
+                "asymmetric dispatch/combine dtypes."
+            )
         if self.quant_type not in _QUANT_TYPES:
             raise ValueError(
                 f"quant_type must be one of {_QUANT_TYPES}, got {self.quant_type!r}"
@@ -153,9 +172,31 @@ class EpDispatchCombineConfig:
         if self.token_nbytes % 16 != 0:
             raise ValueError(
                 f"per-token transport bytes must be 16 B aligned (vec4 copy); "
-                f"hidden_dim={self.hidden_dim}, data_type={self.data_type} -> "
+                f"hidden_dim={self.hidden_dim}, dispatch_dtype={self.dispatch_dtype} -> "
                 f"token_nbytes={self.token_nbytes}"
             )
+        if self.is_asymmetric_dtype:
+            # dispatch output (disp_out, dispatch dtype) and combine staging
+            # (out_tok, combine dtype) are separate buffers. gather/non-quant/
+            # non-StdMoE only (the asymmetric path is implemented for gather).
+            if (
+                self.combine_mode != "gather"
+                or self.quant_type != "none"
+                or self.enable_std_moe
+            ):
+                raise ValueError(
+                    "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
+                    "quant_type=none, enable_std_moe=False"
+                )
+            if torch.float4_e2m1fn_x2 in (self.dispatch_dtype, self.combine_dtype):
+                raise ValueError(
+                    "asymmetric dispatch/combine dtype does not support fp4"
+                )
+            if self.combine_token_nbytes % 16 != 0:
+                raise ValueError(
+                    f"combine per-token bytes must be 16 B aligned; combine_data_type="
+                    f"{self.combine_data_type} -> {self.combine_token_nbytes}"
+                )
 
     @property
     def is_scatter(self):
@@ -206,23 +247,59 @@ class EpDispatchCombineConfig:
         return cls(**kwargs)
 
     @property
+    def dispatch_dtype(self):
+        """Dispatch transport dtype (== data_type unless dispatch_data_type set)."""
+        return (
+            self.dispatch_data_type
+            if self.dispatch_data_type is not None
+            else self.data_type
+        )
+
+    @property
     def is_fp4(self):
-        return self.data_type == torch.float4_e2m1fn_x2
+        return self.dispatch_dtype == torch.float4_e2m1fn_x2
 
     @property
     def is_fp8(self):
-        return self.data_type in _FP8_DTYPES
+        return self.dispatch_dtype in _FP8_DTYPES
 
     @property
     def elem_size(self):
         # fp4 is 0.5 B/elem; return a nominal 1 (kernels use the fp4 flag +
         # token_nbytes for actual sizing, never elem_size for fp4 token buffers).
-        return 1 if self.is_fp4 else _DT[self.data_type]
+        return 1 if self.is_fp4 else _DT[self.dispatch_dtype]
 
     @property
     def token_nbytes(self):
         """Per-token transport bytes (fp4 packs 2 e2m1/byte -> hidden/2)."""
         return self.hidden_dim // 2 if self.is_fp4 else self.hidden_dim * self.elem_size
+
+    @property
+    def combine_dtype(self):
+        """Combine transport dtype (== data_type unless combine_data_type set)."""
+        return (
+            self.combine_data_type
+            if self.combine_data_type is not None
+            else self.data_type
+        )
+
+    @property
+    def combine_elem_size(self):
+        cdt = self.combine_dtype
+        return 1 if cdt == torch.float4_e2m1fn_x2 else _DT[cdt]
+
+    @property
+    def combine_token_nbytes(self):
+        cdt = self.combine_dtype
+        return (
+            self.hidden_dim // 2
+            if cdt == torch.float4_e2m1fn_x2
+            else self.hidden_dim * self.combine_elem_size
+        )
+
+    @property
+    def is_asymmetric_dtype(self):
+        return self.dispatch_dtype != self.combine_dtype
 
     @property
     def dtype_str(self):
@@ -343,7 +420,12 @@ class EpDispatchCombineOp:
             ("recv_to_src_token", recv_cap * 4),
             ("out_idx", recv_cap * topk * 4),
             ("out_wts", recv_cap * topk * 4),
-            ("out_tok", recv_cap * token_nbytes),
+            # disp_out: dispatch scatter dest / expert-GEMM input (recv_x). Kept
+            # separate from out_tok so combine's copy-in never clobbers the
+            # dispatched tokens the expert still reads — callers can skip .clone().
+            ("disp_out", recv_cap * token_nbytes),
+            # out_tok: combine staging (post-expert results that peers gather).
+            ("out_tok", recv_cap * cfg.combine_token_nbytes),
             ("cross_device_barrier", cfg.world_size * 8),
         ]
         if self._enable_scales:
@@ -381,18 +463,20 @@ class EpDispatchCombineOp:
         self.total_recv = torch.zeros(1, dtype=torch.int32, device=device)
         self.combine_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self.cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
-        if is_fp4:  # fp4 combine outputs fp4 (hidden/2 bytes/token)
+        c_dt = cfg.combine_dtype  # combine output dtype
+        c_elem = cfg.combine_elem_size
+        if c_dt == torch.float4_e2m1fn_x2:  # fp4 combine outputs fp4 (hidden/2 B/token)
             self.combine_out = torch.zeros(
                 max_tok_per_rank * (hidden_dim // 2), dtype=torch.int8, device=device
             )
-        elif is_fp8:  # fp8 combine outputs fp8 (1 byte/elem)
+        elif c_dt in _FP8_DTYPES:  # fp8 combine outputs fp8 (1 byte/elem)
             self.combine_out = torch.zeros(
                 max_tok_per_rank * hidden_dim, dtype=torch.int8, device=device
             )
         else:
             self.combine_out = torch.zeros(
                 max_tok_per_rank * hidden_dim,
-                dtype=torch.int16 if elem_size == 2 else torch.int32,
+                dtype=torch.int16 if c_elem == 2 else torch.int32,
                 device=device,
             )
         self.combine_out_weights = torch.zeros(
@@ -429,7 +513,7 @@ class EpDispatchCombineOp:
             off_tis=arena.offset("recv_to_src_token"),
             off_out_idx=arena.offset("out_idx"),
             off_out_wts=arena.offset("out_wts"),
-            off_out_tok=arena.offset("out_tok"),
+            off_out_tok=arena.offset("disp_out"),
             off_out_scales=arena.offset("out_scales") if self._enable_scales else 0,
             scale_dim=cfg.scale_dim,
             scale_type_size=cfg.scale_type_size,
@@ -478,7 +562,7 @@ class EpDispatchCombineOp:
                     npes=cfg.world_size,
                     experts_per_token=topk,
                     hidden_dim=hidden_dim,
-                    hidden_elem_size=elem_size,
+                    hidden_elem_size=cfg.combine_elem_size,
                     max_tok_per_rank=max_tok_per_rank,
                     max_recv=recv_cap,
                     block_num=b,
@@ -487,7 +571,7 @@ class EpDispatchCombineOp:
                     off_xdb_mem=arena.offset("cross_device_barrier"),
                     off_out_wts=arena.offset("out_wts"),
                     reset_total_recv=True,
-                    fp4=is_fp4,
+                    fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
                 )
                 for (b, w) in combine_specs
             }
@@ -542,13 +626,45 @@ class EpDispatchCombineOp:
                 block_num=cfg.combine_block_num,
                 warp_num_per_block=cfg.combine_warp_num_per_block,
             )
+        self._closed = False
+
+    def close(self):
+        """Free this op's symmetric arena window. Call (or use as a context
+        manager) when the op is discarded but its Communicator lives on —
+        otherwise the arena stays in comm._resources until the comm is destroyed."""
+        if self._closed:
+            return
+        self._closed = True
+        self.arena.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     def recv_tokens(self):
-        """Arena out_tok [max_recv, hidden] (dispatch dest / expert-GEMM input).
+        """Arena disp_out [max_recv, hidden] (dispatch dest / expert-GEMM input).
+        Separate from out_tok, so combine's copy-in never overwrites it — the
+        expert can read this in place without a defensive .clone().
         fp4 packs 2 e2m1 per float4_e2m1fn_x2 element -> last dim is hidden/2."""
         cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
         return from_gpu_ptr(
-            self.arena.local_ptr("out_tok"), (self._recv_cap, cols), self.cfg.data_type
+            self.arena.local_ptr("disp_out"),
+            (self._recv_cap, cols),
+            self.cfg.dispatch_dtype,
+        )
+
+    def combine_in_view(self):
+        """out_tok as combine dtype [max_recv, hidden] — combine()'s copy target."""
+        cdt = self.cfg.combine_dtype
+        cols = (
+            self.cfg.hidden_dim // 2
+            if cdt == torch.float4_e2m1fn_x2
+            else self.cfg.hidden_dim
+        )
+        return from_gpu_ptr(
+            self.arena.local_ptr("out_tok"), (self._recv_cap, cols), cdt
         )
 
     def convert_dispatch_output(self):
@@ -561,7 +677,7 @@ class EpDispatchCombineOp:
         arena = self.arena
         stream = fx.Stream(torch.cuda.current_stream())
         self._convert_dispatch(
-            arena.local_ptr("out_tok"),
+            arena.local_ptr("disp_out"),
             arena.local_ptr("out_idx"),
             arena.local_ptr("recv_to_src_token"),
             self.total_recv.data_ptr(),
@@ -577,7 +693,7 @@ class EpDispatchCombineOp:
         packed_x_view = from_gpu_ptr(
             self.packed_x.data_ptr(),
             (experts_per_rank, max_tok_per_expert, hidden_dim),
-            self.cfg.data_type,
+            self.cfg.dispatch_dtype,
         )
         return packed_x_view, self.packed_count, self.packed_src
 
@@ -658,7 +774,8 @@ class EpDispatchCombineOp:
         routing=: replay a prior handle (reuse cached dest-slot layout, skip
         atomic routing). return_routing=: also return the handle. Mutually
         exclusive. Returns (out, out_weights, out_scales, out_indices,
-        total_recv[, routing]); out == arena out_tok.
+        total_recv[, routing]); out == arena disp_out (safe to read without
+        .clone() — combine stages into a separate out_tok buffer).
         """
         if routing is not None and return_routing:
             raise ValueError(
@@ -742,8 +859,14 @@ class EpDispatchCombineOp:
         routing carries the mapping). Returns (out [ct,hidden], out_weights [ct,topk]).
         """
         out_tok_ptr = self.arena.local_ptr("out_tok")
-        if input.data_ptr() != out_tok_ptr:
-            dst = self.recv_tokens().view(-1)[: input.numel()]
+        # StdMoE: convert_combine_input() has already staged the weighted-reduced
+        # tokens into out_tok, so `input` is unused here — copying it in would
+        # clobber that result. (Non-StdMoE: `input` holds the post-expert tokens
+        # to combine; since the disp_out/out_tok split it no longer aliases out_tok,
+        # so the copy is required.)
+        if not self.cfg.enable_std_moe and input.data_ptr() != out_tok_ptr:
+            # copy in the combine-dtype layout (not recv_tokens()'s dispatch view)
+            dst = self.combine_in_view().view(-1)[: input.numel()]
             dst.copy_(input.reshape(-1))
         self.combine_out.zero_()
         stream = fx.Stream(torch.cuda.current_stream())
@@ -763,12 +886,11 @@ class EpDispatchCombineOp:
         count = routing.cur_rank_num_token
         hidden_dim = self.cfg.hidden_dim
         topk = self.cfg.num_experts_per_token
+        cdt = self.cfg.combine_dtype
         cols = (
-            hidden_dim // 2 if self.cfg.is_fp4 else hidden_dim
+            hidden_dim // 2 if cdt == torch.float4_e2m1fn_x2 else hidden_dim
         )  # fp4 out is hidden/2 float4 elems
-        out = (
-            self.combine_out[: count * cols].view(self.cfg.data_type).view(count, cols)
-        )
+        out = self.combine_out[: count * cols].view(cdt).view(count, cols)
         return out, self.combine_out_weights[: count * topk].view(count, topk)
 
     def local_expert_count(self):

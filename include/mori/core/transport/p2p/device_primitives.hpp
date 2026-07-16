@@ -792,6 +792,11 @@ static constexpr float kCombineInternalFp8MaxFinite = 448.0f;
 static constexpr float kCombineInternalFp8MaxFinite = 240.0f;
 #endif
 
+// Max finite magnitude of OCP FP4 (E2M1): representable positive values are
+// {0, 0.5, 1, 1.5, 2, 3, 4, 6}. Used by the fp4_blockwise combine transport to derive
+// per-128-element block scales.
+static constexpr float kCombineInternalFp4MaxFinite = 6.0f;
+
 __device__ __forceinline__ float WarpReduceMaxF32(float val) {
   for (int delta = (warpSize >> 1); delta > 0; delta >>= 1) {
     val = fmaxf(val, __shfl_down(val, delta));
@@ -2137,6 +2142,428 @@ __device__ __forceinline__ void WarpAccumFp8DequantSegment(
   }
 }
 #endif
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                    Experimental blockwise FP4 (E2M1) combine transport                         */
+/*                                                                                                */
+/* Mirrors the FP8 blockwise combine path but quantizes each element to OCP FP4 (E2M1), packed */
+/* two values per byte (low nibble = even element, high nibble = odd element). This HALVES the */
+/* combine token traffic vs FP8, which is the source of the decode speed-up (combine is transport-
+ */
+/* bound). The staging slot stride is left unchanged (the packed token occupies the first */
+/* hiddenDim/2 bytes of the FP8-sized token region and the block scales stay at their FP8 offset),
+ */
+/* so no host-side buffer/stride plumbing has to change. */
+/*                                                                                                  */
+/* Unlike FP8 (which only scales blocks whose max-abs exceeds the FP8 range), FP4 is far coarser, */
+/* so every block is scaled to map its max-abs onto FP4_MAX (6.0). Scale-sign sentinel matches the
+ */
+/* FP8 path: dstScales[0] is negated to mark the token as quantized. blockElems is even for all */
+/* supported configs (hiddenDim and scaleDim are powers-of-two-ish), so scale blocks are byte- */
+/* aligned; a scalar tail handles any odd remainder defensively. */
+/* ---------------------------------------------------------------------------------------------- */
+// Subwarp-vectorized FP4 blockwise quantizer (mirrors WarpQuantizeBf16ToFp8BlockwiseVec).
+// The warp is split into warpSize/SubwarpSize subwarps; each subwarp owns one scale block and
+// covers it in a single kVecElems-wide iteration (requires blockElems == SubwarpSize*kVecElems).
+// This replaces the scalar path's 56 serial full-warp max-reductions with cheap per-subwarp
+// reductions across 8 blocks in parallel — the dominant FP4 send-side quant cost.
+// Requires: InT == hip_bfloat16, blockElems == SubwarpSize*kVecElems, kVecElems % 8 == 0,
+// and block byte-alignment (start even). Uses vector loads (int4 = 8 bf16) and vector stores
+// (uint32 = 8 packed fp4) so the send-quant is not bottlenecked on scalar accesses.
+template <int SubwarpSize, int kVecElems, typename PackedT, typename InT>
+__device__ __forceinline__ void WarpQuantizeToFp4BlockwiseVec(PackedT* __restrict__ dstToken,
+                                                              float* __restrict__ dstScales,
+                                                              const InT* __restrict__ srcToken,
+                                                              int hiddenDim, int scaleDim) {
+  constexpr float fp4Max = kCombineInternalFp4MaxFinite;
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int subLaneId = laneId & (SubwarpSize - 1);
+  const int subWarpId = laneId / SubwarpSize;
+  constexpr int kSubwarpsPerWarp = warpSize / SubwarpSize;
+  auto* dstPacked = reinterpret_cast<mori::mori_fp4x2_storage*>(dstToken);
+  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+
+  for (int sbBase = 0; sbBase < scaleDim; sbBase += kSubwarpsPerWarp) {
+    const int sb = sbBase + subWarpId;
+    if (sb >= scaleDim) continue;
+    const int start = sb * blockElems;
+    const int base = start + subLaneId * kVecElems;
+
+    // Vector-load kVecElems bf16 into registers (int4 == 16 bytes == 8 bf16).
+    hip_bfloat16 reg[kVecElems];
+#pragma unroll
+    for (int j = 0; j < kVecElems; j += 8) {
+      *reinterpret_cast<int4*>(&reg[j]) = *reinterpret_cast<const int4*>(srcToken + base + j);
+    }
+
+    float localMax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kVecElems; ++j)
+      localMax = fmaxf(localMax, fabsf(static_cast<float>(reg[j])));
+    float m = localMax;
+#pragma unroll
+    for (int off = SubwarpSize / 2; off > 0; off >>= 1)
+      m = fmaxf(m, __shfl_down(m, off, SubwarpSize));
+    const float maxAbs = __shfl(m, 0, SubwarpSize);
+
+    const float scale = (maxAbs > 0.0f) ? (maxAbs / fp4Max) : 1.0f;
+    const float invScale = (maxAbs > 0.0f) ? (fp4Max / maxAbs) : 0.0f;
+    if (subLaneId == 0) dstScales[sb] = scale;
+
+    // Convert to packed fp4 and vector-store (uint32 == 8 packed fp4 == 4 bytes).
+#pragma unroll
+    for (int w = 0; w < kVecElems / 8; ++w) {
+      uint32_t u = 0;
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+        const int e = w * 8 + p * 2;
+        const float v0 = static_cast<float>(reg[e]) * invScale;
+        const float v1 = static_cast<float>(reg[e + 1]) * invScale;
+        const uint8_t b = mori::float2_to_fp4x2_e2m1(float2{v0, v1});
+        u |= static_cast<uint32_t>(b) << (p * 8);
+      }
+      *reinterpret_cast<uint32_t*>(dstPacked + (base >> 1) + w * 4) = u;
+    }
+  }
+  // FP4 always scales -> always mark the token as quantized.
+  if (laneId == 0) dstScales[0] = -dstScales[0];
+}
+
+template <typename PackedT, typename InT>
+__device__ __forceinline__ void WarpQuantizeToFp4Blockwise(PackedT* __restrict__ dstToken,
+                                                           float* __restrict__ dstScales,
+                                                           const InT* __restrict__ srcToken,
+                                                           int hiddenDim, int scaleDim) {
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+  constexpr float fp4Max = kCombineInternalFp4MaxFinite;
+  auto* dstPacked = reinterpret_cast<mori::mori_fp4x2_storage*>(dstToken);
+
+  // Fast path: 64-lane warp, blockElems == 128 == 8 subwarps * 16 elems (the DeepSeek config).
+  if (warpSize == 64 && blockElems == 128 && (hiddenDim % 128) == 0 &&
+      std::is_same_v<InT, hip_bfloat16>) {
+    WarpQuantizeToFp4BlockwiseVec<8, 16, PackedT, InT>(dstToken, dstScales, srcToken, hiddenDim,
+                                                       scaleDim);
+    return;
+  }
+  // Fast path: 64-lane warp, blockElems == 256 == 8 subwarps * 32 elems (mirrors the fp8bwq
+  // block256 vec8 variant so block256 configs are not left on the scalar path).
+  if (warpSize == 64 && blockElems == 256 && (hiddenDim % 256) == 0 &&
+      std::is_same_v<InT, hip_bfloat16>) {
+    WarpQuantizeToFp4BlockwiseVec<8, 32, PackedT, InT>(dstToken, dstScales, srcToken, hiddenDim,
+                                                       scaleDim);
+    return;
+  }
+
+  for (int sb = 0; sb < scaleDim; ++sb) {
+    const int start = sb * blockElems;
+    const int end = std::min(start + blockElems, hiddenDim);
+
+    float localMaxAbs = 0.0f;
+    for (int idx = start + laneId; idx < end; idx += warpSize) {
+      localMaxAbs = fmaxf(localMaxAbs, fabsf(static_cast<float>(srcToken[idx])));
+    }
+    float maxAbs = WarpReduceMaxF32(localMaxAbs);
+    maxAbs = __shfl(maxAbs, 0);
+
+    const float scale = (maxAbs > 0.0f) ? (maxAbs / fp4Max) : 1.0f;
+    const float invScale = (maxAbs > 0.0f) ? (fp4Max / maxAbs) : 0.0f;
+    if (laneId == 0) dstScales[sb] = scale;
+
+    // Pack element pairs (2 FP4/byte). Blocks are byte-aligned (start even, blockElems even).
+    const int pStart = start >> 1;
+    const int pEnd = end >> 1;
+    for (int p = pStart + laneId; p < pEnd; p += warpSize) {
+      const float v0 = static_cast<float>(srcToken[2 * p]) * invScale;
+      const float v1 = static_cast<float>(srcToken[2 * p + 1]) * invScale;
+      dstPacked[p] = mori::float2_to_fp4x2_e2m1(float2{v0, v1});
+    }
+    // Defensive scalar tail for an odd block end (does not occur for supported configs).
+    if ((end & 1) && laneId == 0) {
+      const int idx = end - 1;
+      const float v = static_cast<float>(srcToken[idx]) * invScale;
+      auto* dstBytes = reinterpret_cast<mori::mori_fp4_storage*>(dstToken);
+      dstBytes[idx >> 1] = mori::float_to_fp4_e2m1(v);  // low nibble
+    }
+  }
+  // Always mark as quantized so the dequant path applies the block scales.
+  if (laneId == 0) dstScales[0] = -dstScales[0];
+}
+
+template <typename OutT, typename PackedT>
+__device__ __forceinline__ void WarpAccumFp4DequantFull(OutT* __restrict__ dstToken,
+                                                        const PackedT* const* __restrict__ srcs,
+                                                        const float* const* __restrict__ srcScales,
+                                                        int accumNum, int hiddenDim, int scaleDim) {
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+  for (int sb = 0; sb < scaleDim; ++sb) {
+    const int start = sb * blockElems;
+    const int end = std::min(start + blockElems, hiddenDim);
+    const int pStart = start >> 1;
+    const int pEnd = end >> 1;
+    for (int p = pStart + laneId; p < pEnd; p += warpSize) {
+      float acc0 = 0.0f;
+      float acc1 = 0.0f;
+      for (int i = 0; i < accumNum; ++i) {
+        if (srcs[i] == nullptr) continue;
+        float s = 1.0f;
+        if (srcScales != nullptr && srcScales[i] != nullptr) {
+          s = srcScales[i][sb];
+          if (sb == 0 && s < 0.0f) s = -s;
+        }
+        mori::mori_fp4x2_e2m1 e;
+        e.x = reinterpret_cast<const mori::mori_fp4x2_storage*>(srcs[i])[p];
+        const float2 v = static_cast<float2>(e);
+        acc0 = fmaf(v.x, s, acc0);
+        acc1 = fmaf(v.y, s, acc1);
+      }
+      dstToken[2 * p] = OutT(acc0);
+      dstToken[2 * p + 1] = OutT(acc1);
+    }
+    if ((end & 1) && laneId == 0) {
+      const int idx = end - 1;
+      float acc = 0.0f;
+      for (int i = 0; i < accumNum; ++i) {
+        if (srcs[i] == nullptr) continue;
+        float s = 1.0f;
+        if (srcScales != nullptr && srcScales[i] != nullptr) {
+          s = srcScales[i][sb];
+          if (sb == 0 && s < 0.0f) s = -s;
+        }
+        mori::mori_fp4_e2m1 e;
+        e.x = reinterpret_cast<const mori::mori_fp4_storage*>(srcs[i])[idx >> 1];
+        acc += static_cast<float>(e) * s;
+      }
+      dstToken[idx] = OutT(acc);
+    }
+  }
+}
+
+template <typename OutT, typename PackedT>
+__device__ __forceinline__ void WarpAccumFp4DequantSegment(
+    OutT* __restrict__ dstToken, const PackedT* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int accumNum, int hiddenDimOffset,
+    int hiddenDimSize, int hiddenDim, int scaleDim) {
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+  // Per-element (robust to any parity) safety fallback for misaligned segments. Callers pass
+  // srcs[i] advanced by hiddenDimOffset *elements* (== bytes under FP8); recover the token base
+  // (tb) and index the packed byte at (hiddenDimOffset+localIdx)/2, selecting the nibble by parity.
+  for (int localIdx = laneId; localIdx < hiddenDimSize; localIdx += warpSize) {
+    const int globalIdx = hiddenDimOffset + localIdx;
+    const int sb = globalIdx / blockElems;
+    float acc = 0.0f;
+    for (int i = 0; i < accumNum; ++i) {
+      if (srcs[i] == nullptr) continue;
+      float s = 1.0f;
+      if (srcScales != nullptr && srcScales[i] != nullptr) {
+        s = srcScales[i][sb];
+        if (sb == 0 && s < 0.0f) s = -s;
+      }
+      const uint8_t* tb = reinterpret_cast<const uint8_t*>(srcs[i]) - hiddenDimOffset;
+      mori::mori_fp4x2_e2m1 e;
+      e.x = tb[globalIdx >> 1];
+      const float2 v = static_cast<float2>(e);
+      acc = fmaf(((globalIdx & 1) == 0) ? v.x : v.y, s, acc);
+    }
+    dstToken[localIdx] = OutT(acc);
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*        Vectorized packed-FP4 dequant-accumulate (analog of the FP8 vec8 blockwise path)        */
+/*                                                                                                */
+/* Each lane processes 8 elements = 4 packed bytes per step, unpacking with the native gfx950 */
+/* mxfp4->f32 conversion (via mori_fp4x4_e2m1) and FMA-accumulating into fp32. This keeps the */
+/* vectorization of the FP8 vec8 kernel while transporting half the bytes. Callers pass srcs[i] */
+/* advanced by hiddenDimOffset *elements* (== bytes in the FP8 layout); we recover the token base */
+/* (tb = srcs[i] - hiddenDimOffset) and index in packed (half-byte) units. Blocks/offsets are */
+/* byte-aligned (blockElems and hiddenDimOffset even) for all supported configs. */
+/* ---------------------------------------------------------------------------------------------- */
+template <typename OutT, typename PackedT, int AccumNum>
+__device__ __forceinline__ void WarpAccumFp4DequantVecBlockwiseScaleWave(
+    OutT* __restrict__ dstToken, const PackedT* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDimOffset, int start, int end,
+    int blockElems) {
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const bool blockPow2 = (blockElems & (blockElems - 1)) == 0;
+  const int blockShift = blockPow2 ? (__ffs(blockElems) - 1) : 0;
+  constexpr int kElems = 8;           // 4 packed bytes -> 8 FP4 elements per lane per step
+  constexpr int kWords = kElems / 4;  // number of fp4x4 (uint16) groups
+
+  const int vecEnd = start + ((end - start) / kElems) * kElems;
+  for (int idx = start + laneId * kElems; idx < vecEnd; idx += warpSize * kElems) {
+    const int globalIdx = hiddenDimOffset + idx;
+    const int sb = blockPow2 ? (globalIdx >> blockShift) : (globalIdx / blockElems);
+    float acc[kElems];
+#pragma unroll
+    for (int e = 0; e < kElems; ++e) acc[e] = 0.0f;
+
+    // Hoist all source loads up front for memory-level parallelism (issue the AccumNum packed
+    // reads back-to-back so their latencies overlap), then convert + FMA-accumulate.
+    uint32_t bitsArr[AccumNum];
+    float sArr[AccumNum];
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      const PackedT* src = srcs[i];
+      if (src == nullptr) {
+        sArr[i] = 0.0f;  // sentinel: contributes nothing
+        bitsArr[i] = 0u;
+        continue;
+      }
+      float s = 1.0f;
+      if (srcScales != nullptr && srcScales[i] != nullptr) {
+        s = srcScales[i][sb];
+        if (sb == 0 && s < 0.0f) s = -s;
+      }
+      sArr[i] = s;
+      const uint8_t* tb = reinterpret_cast<const uint8_t*>(src) - hiddenDimOffset;
+      bitsArr[i] = load<4>(tb + (globalIdx >> 1));
+    }
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      const float s = sArr[i];
+#pragma unroll
+      for (int w = 0; w < kWords; ++w) {
+        mori::mori_fp4x4_e2m1 q;
+        q.x = static_cast<uint16_t>((bitsArr[i] >> (w * 16)) & 0xFFFFull);
+        const float4 f = static_cast<float4>(q);
+        acc[w * 4 + 0] = fmaf(f.x, s, acc[w * 4 + 0]);
+        acc[w * 4 + 1] = fmaf(f.y, s, acc[w * 4 + 1]);
+        acc[w * 4 + 2] = fmaf(f.z, s, acc[w * 4 + 2]);
+        acc[w * 4 + 3] = fmaf(f.w, s, acc[w * 4 + 3]);
+      }
+    }
+#pragma unroll
+    for (int e = 0; e < kElems; e += 2) {
+      StoreOutPair(dstToken, idx + e, float2{acc[e], acc[e + 1]});
+    }
+  }
+
+  // Scalar tail for the ragged end (unpacks a single element from its packed byte).
+  for (int j = vecEnd + laneId; j < end; j += warpSize) {
+    const int globalIdx = hiddenDimOffset + j;
+    const int sb = blockPow2 ? (globalIdx >> blockShift) : (globalIdx / blockElems);
+    float acc = 0.0f;
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      const PackedT* src = srcs[i];
+      if (src == nullptr) continue;
+      float s = 1.0f;
+      if (srcScales != nullptr && srcScales[i] != nullptr) {
+        s = srcScales[i][sb];
+        if (sb == 0 && s < 0.0f) s = -s;
+      }
+      const uint8_t* tb = reinterpret_cast<const uint8_t*>(src) - hiddenDimOffset;
+      mori::mori_fp4x2_e2m1 e2;
+      e2.x = tb[globalIdx >> 1];
+      const float2 v = static_cast<float2>(e2);
+      acc = fmaf(((globalIdx & 1) == 0) ? v.x : v.y, s, acc);
+    }
+    dstToken[j] = OutT(acc);
+  }
+}
+
+template <typename OutT, typename PackedT, int BlockElems, int AccumNum = 8>
+__device__ __forceinline__ void WarpAccumFp4DequantFullBlockVec8Top8(
+    OutT* __restrict__ dstToken, const PackedT* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDim) {
+  WarpAccumFp4DequantVecBlockwiseScaleWave<OutT, PackedT, AccumNum>(
+      dstToken, srcs, srcScales, /*hiddenDimOffset=*/0, /*start=*/0, /*end=*/hiddenDim, BlockElems);
+}
+
+template <typename OutT, typename PackedT, int BlockElems, int AccumNum = 8>
+__device__ __forceinline__ void WarpAccumFp4DequantSegmentBlockVec8Top8(
+    OutT* __restrict__ dstToken, const PackedT* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize) {
+  WarpAccumFp4DequantVecBlockwiseScaleWave<OutT, PackedT, AccumNum>(
+      dstToken, srcs, srcScales, hiddenDimOffset, /*start=*/0, /*end=*/hiddenDimSize, BlockElems);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/* Combine quant/dequant dispatch on UseFp4. FP8 and FP4 blockwise combine share the staging/scale
+ */
+/* layout; only the element codec differs. These thin wrappers select the codec from a single */
+/* template bool so the intra-node combine body calls one function per site instead of duplicating
+ */
+/* an fp4/fp8 branch (and identical argument list) at every call site. */
+/* ---------------------------------------------------------------------------------------------- */
+template <bool UseFp4, typename Fp8T, typename InT>
+__device__ __forceinline__ void WarpQuantizeToCombineBlockwise(Fp8T* __restrict__ dstToken,
+                                                               float* __restrict__ dstScales,
+                                                               const InT* __restrict__ srcToken,
+                                                               int hiddenDim, int scaleDim) {
+  if constexpr (UseFp4)
+    WarpQuantizeToFp4Blockwise<Fp8T>(dstToken, dstScales, srcToken, hiddenDim, scaleDim);
+  else
+    WarpQuantizeToFp8Blockwise<Fp8T>(dstToken, dstScales, srcToken, hiddenDim, scaleDim);
+}
+
+template <bool UseFp4, typename OutT, typename Fp8T, int BlockElems, int AccumNum>
+__device__ __forceinline__ void WarpAccumCombineDequantFullBlockVec8Top8(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDim) {
+  if constexpr (UseFp4)
+    WarpAccumFp4DequantFullBlockVec8Top8<OutT, Fp8T, BlockElems, AccumNum>(dstToken, srcs,
+                                                                           srcScales, hiddenDim);
+  else
+    WarpAccumFp8DequantFullBlockVec8Top8<OutT, Fp8T, BlockElems, AccumNum>(dstToken, srcs,
+                                                                           srcScales, hiddenDim);
+}
+
+template <bool UseFp4, typename OutT, typename Fp8T, int BlockElems, int AccumNum>
+__device__ __forceinline__ void WarpAccumCombineDequantSegmentBlockVec8Top8(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize) {
+  if constexpr (UseFp4)
+    WarpAccumFp4DequantSegmentBlockVec8Top8<OutT, Fp8T, BlockElems, AccumNum>(
+        dstToken, srcs, srcScales, hiddenDimOffset, hiddenDimSize);
+  else
+    WarpAccumFp8DequantSegmentBlockVec8Top8<OutT, Fp8T, BlockElems, AccumNum>(
+        dstToken, srcs, srcScales, hiddenDimOffset, hiddenDimSize);
+}
+
+// Misaligned-segment scalar fallback for the vec8 top-k path. The codecs use different helpers
+// here (fp4 reuses the generic segment accumulator with a fixed top-k count; fp8 has a dedicated
+// scalar-top8 helper), so the divergence is encapsulated in one place.
+template <bool UseFp4, typename OutT, typename Fp8T, int BlockElems, int AccumNum>
+__device__ __forceinline__ void WarpAccumCombineDequantSegmentScalarTop8(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize,
+    int hiddenDim, int scaleDim) {
+  if constexpr (UseFp4)
+    WarpAccumFp4DequantSegment<OutT, Fp8T>(dstToken, srcs, srcScales, AccumNum, hiddenDimOffset,
+                                           hiddenDimSize, hiddenDim, scaleDim);
+  else
+    WarpAccumFp8DequantSegmentScalarTop8<OutT, Fp8T, BlockElems, AccumNum>(
+        dstToken, srcs, srcScales, hiddenDimOffset, hiddenDimSize);
+}
+
+template <bool UseFp4, typename OutT, typename Fp8T>
+__device__ __forceinline__ void WarpAccumCombineDequantFull(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int validAccumCount, int hiddenDim, int scaleDim) {
+  if constexpr (UseFp4)
+    WarpAccumFp4DequantFull<OutT, Fp8T>(dstToken, srcs, srcScales, validAccumCount, hiddenDim,
+                                        scaleDim);
+  else
+    WarpAccumFp8DequantFull<OutT, Fp8T>(dstToken, srcs, srcScales, validAccumCount, hiddenDim,
+                                        scaleDim);
+}
+
+template <bool UseFp4, typename OutT, typename Fp8T>
+__device__ __forceinline__ void WarpAccumCombineDequantSegment(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int validAccumCount, int hiddenDimOffset,
+    int hiddenDimSize, int hiddenDim, int scaleDim) {
+  if constexpr (UseFp4)
+    WarpAccumFp4DequantSegment<OutT, Fp8T>(dstToken, srcs, srcScales, validAccumCount,
+                                           hiddenDimOffset, hiddenDimSize, hiddenDim, scaleDim);
+  else
+    WarpAccumFp8DequantSegment<OutT, Fp8T>(dstToken, srcs, srcScales, validAccumCount,
+                                           hiddenDimOffset, hiddenDimSize, hiddenDim, scaleDim);
+}
 
 template <typename T>
 __forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(

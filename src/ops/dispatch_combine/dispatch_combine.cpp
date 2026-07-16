@@ -118,12 +118,13 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
                   shmemNumQpPerPe, shmemNumQpPerPe);
   }
 
-  if (config.quantType == QuantType::Fp8BlockwiseQuant) {
+  if (IsBlockwiseCombineQuant(config.quantType)) {
     fp8BlockwiseCombineScaleDim =
         env::GetPositiveIntOr(kFp8BlockwiseScaleDimEnv, kDefaultFp8BlockwiseScaleDim);
     fp8BlockwiseCombineScaleTypeSize = static_cast<int>(sizeof(float));
     if (config.rank == 0) {
-      MORI_OPS_INFO("Fp8BlockwiseQuant combine scale_dim={} (override via {})",
+      MORI_OPS_INFO("Blockwise combine ({}) scale_dim={} (override via {})",
+                    config.quantType == QuantType::Fp4BlockwiseQuant ? "FP4" : "FP8",
                     fp8BlockwiseCombineScaleDim, kFp8BlockwiseScaleDimEnv);
     }
   }
@@ -195,14 +196,15 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
                            config.HiddenDimSz() * config.maxTokenTypeSize;
   size_t maxStagingSize =
       static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.MaxXferBytesPerToken();
-  if (config.kernelType == KernelType::IntraNode &&
-      config.quantType == QuantType::Fp8BlockwiseQuant) {
+  if (config.kernelType == KernelType::IntraNode && IsBlockwiseCombineQuant(config.quantType)) {
     size_t blockwiseScaleBytes =
         (fp8BlockwiseCombineScaleDim > 0)
             ? static_cast<size_t>(fp8BlockwiseCombineScaleDim) * fp8BlockwiseCombineScaleTypeSize
             : 0;
+    // FP4 packs the token region at 0.5 byte/elem (CombineTokenRegionBytes()), so its staging slot
+    // is half the FP8 one -- no FP8-sized over-allocation for FP4.
     maxStagingSize = static_cast<size_t>(config.MaxNumTokensToRecv()) *
-                     (config.HiddenBytes(config.maxTokenTypeSize) + config.IndexBytes() +
+                     (config.CombineTokenRegionBytes() + config.IndexBytes() +
                       config.WeightBytes() + config.SrcTokenIdBytes() + blockwiseScaleBytes);
   }
 
@@ -256,7 +258,7 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
         static_cast<size_t>(config.MaxNumTokensToRecv()) * config.scaleDim * config.scaleTypeSize;
   }
   size_t fp8BlockwiseScaleSize = 0;
-  if (config.quantType == QuantType::Fp8BlockwiseQuant && fp8BlockwiseCombineScaleDim > 0) {
+  if (IsBlockwiseCombineQuant(config.quantType) && fp8BlockwiseCombineScaleDim > 0) {
     fp8BlockwiseScaleSize = static_cast<size_t>(config.MaxNumTokensToRecv()) *
                             fp8BlockwiseCombineScaleDim * fp8BlockwiseCombineScaleTypeSize;
   }

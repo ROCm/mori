@@ -22,6 +22,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -73,6 +75,11 @@ static_assert(static_cast<int>(CCO_PROVIDER_PSD) == static_cast<int>(core::Provi
 static_assert(static_cast<int>(CCO_PROVIDER_IBVERBS) ==
                   static_cast<int>(core::ProviderType::IBVERBS),
               "ccoProviderType drifted from core::ProviderType");
+
+// ccoFabricHandle_t (cco.hpp, self-contained) and hipMemFabricHandle_compat_t
+// (hip_compat.hpp) are both 64-byte PODs; guard layout compatibility.
+static_assert(sizeof(ccoFabricHandle_t) == sizeof(hipMemFabricHandle_compat_t),
+              "ccoFabricHandle_t / hipMemFabricHandle_compat_t size mismatch");
 
 // Out-of-line dtor for the unique_ptr<HeapVAManager> member: ccoComm is defined
 // in cco.hpp with HeapVAManager only forward-declared, so its destruction must
@@ -174,6 +181,164 @@ int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perR
   return ccoCommCreateImpl(boot, perRankVmmSize, outComm);
 }
 
+// The LSA team is always the contiguous rank range [myNodeStart, myNodeStart+
+// lsaSize) — its width is set by the topology step (same host by default, same
+// vPOD when grouping is enabled). Membership + flat-VA index derive purely from
+// that range, so the same formula covers intra-node, cross-node-vPOD, and
+// whole-world layouts.
+static bool CcoCanLsaMapPeer(const ccoComm* comm, int pe) {
+  if (pe == comm->rank) return false;
+  return pe >= comm->myNodeStart && pe < comm->myNodeStart + comm->lsaSize;
+}
+
+static int CcoPeToLsaRank(const ccoComm* comm, int pe) { return pe - comm->myNodeStart; }
+
+// ── LSA-team (vPOD) topology detection ───────────────────────────────────────
+// A vPOD is a scale-up fabric domain (AMD UALink) that may span multiple hosts;
+// its GPUs are directly flat-VA (P2P) interconnectable. We mirror RCCL's MNNVL
+// clique model: group ranks by (ppod_id UUID, vpod_id) read from the per-GPU
+// UALink sysfs, gated on the accelerator being ACTIVE/READY. ppod_id (a UUID) is
+// what makes the key globally unique — hive_id collides across hosts.
+//   Precedence: MORI_CCO_FABRIC_DISABLE=1 -> force host-only LSA
+//               MORI_VPOD_ID=<n>          -> explicit override (all-or-none)
+//               MORI_CCO_FABRIC_CROSSNODE_LSA=1 -> whole world is one team
+//               auto                      -> UALink (ppod_id, vpod_id)
+//               else                      -> group by host (default)
+enum CcoLsaMode { CCO_LSA_HOST = 0, CCO_LSA_MANUAL = 1, CCO_LSA_FABRIC = 2 };
+
+struct CcoLsaKey {
+  int mode;                  // CcoLsaMode
+  int vpodId;                // manual value or UALink vpod_id
+  int vpodSize;              // UALink vpod_size (0 if n/a)
+  unsigned char ppodId[16];  // UALink ppod_id UUID (zeros if n/a)
+};
+
+static bool CcoReadSysfsLine(const std::string& path, std::string& out) {
+  FILE* f = fopen(path.c_str(), "r");
+  if (!f) return false;
+  char buf[128] = {0};
+  bool ok = fgets(buf, sizeof(buf), f) != nullptr;
+  fclose(f);
+  if (!ok) return false;
+  out = buf;
+  while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
+    out.pop_back();
+  return true;
+}
+
+// Parse "9217fed9-c6cf-4c9e-9d9c-7110b90917cc" into 16 bytes; false (zeros) if
+// it isn't a well-formed, non-zero UUID.
+static bool CcoParseUuid(const std::string& s, unsigned char out[16]) {
+  memset(out, 0, 16);
+  int b = 0;
+  unsigned hi = 0;
+  bool haveHi = false, any = false;
+  for (char c : s) {
+    if (c == '-') continue;
+    int v;
+    if (c >= '0' && c <= '9')
+      v = c - '0';
+    else if (c >= 'a' && c <= 'f')
+      v = c - 'a' + 10;
+    else if (c >= 'A' && c <= 'F')
+      v = c - 'A' + 10;
+    else
+      return false;
+    if (!haveHi) {
+      hi = v;
+      haveHi = true;
+    } else {
+      if (b >= 16) return false;
+      out[b] = static_cast<unsigned char>((hi << 4) | v);
+      if (out[b]) any = true;
+      b++;
+      haveHi = false;
+    }
+  }
+  return b == 16 && !haveHi && any;
+}
+
+// Read the local GPU's UALink fabric identity from sysfs, mirroring RCCL's
+// alt_rsmi ARSMI_get_fabric_info. True only if the fabric is present and the
+// accelerator is ACTIVE/READY (i.e. usable for cross-node LSA).
+static bool CcoReadFabricKey(int hipDev, CcoLsaKey* key) {
+  char bdf[32] = {0};
+  if (hipDeviceGetPCIBusId(bdf, sizeof(bdf), hipDev) != hipSuccess) return false;
+  for (char* p = bdf; *p; ++p) *p = static_cast<char>(tolower(*p));
+  std::string dir = std::string("/sys/bus/pci/devices/") + bdf + "/ualink";
+
+  std::string link, state, ppod;
+  if (!CcoReadSysfsLine(dir + "/link_type", link)) return false;  // not a UALink GPU
+  if (link != "UALoE" && link != "UALLink") return false;
+  if (!CcoReadSysfsLine(dir + "/accel_state", state)) return false;
+  if (state != "active" && state != "ready") return false;  // not usable yet
+  if (!CcoReadSysfsLine(dir + "/ppod_id", ppod)) return false;
+  if (!CcoParseUuid(ppod, key->ppodId)) return false;  // zero/garbage UUID
+
+  std::string v;
+  key->vpodId = CcoReadSysfsLine(dir + "/vpod_id", v) ? atoi(v.c_str()) : 0;
+  key->vpodSize = CcoReadSysfsLine(dir + "/vpod_size", v) ? atoi(v.c_str()) : 0;
+  key->mode = CCO_LSA_FABRIC;
+  return true;
+}
+
+// Compute this rank's LSA-team key by the precedence above.
+static void CcoComputeLsaKey(int hipDev, CcoLsaKey* key) {
+  memset(key, 0, sizeof(*key));
+  key->mode = CCO_LSA_HOST;
+  const char* dis = getenv("MORI_CCO_FABRIC_DISABLE");
+  if (dis && atoi(dis) != 0) return;  // forced host-only
+  const char* mv = getenv("MORI_VPOD_ID");
+  if (mv && *mv) {
+    key->mode = CCO_LSA_MANUAL;
+    key->vpodId = atoi(mv);
+    return;
+  }
+  const char* w = getenv("MORI_CCO_FABRIC_CROSSNODE_LSA");
+  if (w && atoi(w) != 0) {  // whole world = one team
+    key->mode = CCO_LSA_MANUAL;
+    key->vpodId = 0;
+    return;
+  }
+  CcoReadFabricKey(hipDev, key);  // sets FABRIC on success, leaves HOST otherwise
+}
+
+// Two ranks share an LSA team iff their keys match. HOST mode is resolved by the
+// sameHost predicate instead (this returns false for it).
+static bool CcoLsaKeySame(const CcoLsaKey& a, const CcoLsaKey& b) {
+  if (a.mode != b.mode) return false;
+  if (a.mode == CCO_LSA_MANUAL) return a.vpodId == b.vpodId;
+  if (a.mode == CCO_LSA_FABRIC)
+    return a.vpodId == b.vpodId && memcmp(a.ppodId, b.ppodId, sizeof(a.ppodId)) == 0;
+  return false;
+}
+
+// By default a cross-node hipMemSetAccess failure is fatal at register time
+// (fail loudly instead of leaving a silently-unusable peer mapping that faults
+// mid-kernel). MORI_CCO_FABRIC_LENIENT=1 restores continue-on-failure, for
+// fabrics where the import itself already grants access.
+static bool CcoFabricLenient() {
+  const char* e = getenv("MORI_CCO_FABRIC_LENIENT");
+  return e && atoi(e) != 0;
+}
+
+// Zero a symmetric-window buffer WITHOUT hipMemset. On UALink fabric-exportable
+// pools hipMemset returns hipErrorOutOfMemory (observed on ROCm 7.15), so we
+// initialize via chunked host->device copies from a small zeroed staging buffer
+// (host-only HIP runtime API — mori_cco links hip::host, not device code).
+static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
+  if (bytes == 0) return hipSuccess;
+  const size_t chunk = std::min<size_t>(bytes, 4u << 20);  // 4 MB staging
+  std::vector<char> zeros(chunk, 0);
+  char* dst = static_cast<char*>(ptr);
+  for (size_t off = 0; off < bytes; off += chunk) {
+    size_t n = std::min(chunk, bytes - off);
+    hipError_t e = hipMemcpy(dst + off, zeros.data(), n, hipMemcpyHostToDevice);
+    if (e != hipSuccess) return e;
+  }
+  return hipSuccess;
+}
+
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
                              ccoComm** outComm) {
   auto* comm = new ccoComm();
@@ -198,36 +363,88 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   comm->ctx = new application::Context(*comm->bootNet);
   comm->defaultNumQpPerPe = comm->ctx->GetNumQpPerPe();
 
-  // Step 2.5: detect intra-node topology (LSA = Local Symmetric Access).
-  // Use Context's capability discovery (PeerCapabilities.sameHost) rather
-  // than the chosen transport — LSA membership is a hardware fact and must
-  // not flip even if policy routes intra-node traffic via RDMA.
+  // Cache the bound device once (used by topology detection below and later by
+  // ccoMemAlloc / ccoWindowRegister). Callers MUST keep the calling thread bound
+  // to this device for any later CCO API on this comm.
+  HIP_RUNTIME_CHECK(hipGetDevice(&comm->hipDev));
+  comm->peerHipDevs.assign(comm->worldSize, comm->hipDev);
+  comm->bootNet->Allgather(&comm->hipDev, comm->peerHipDevs.data(), sizeof(int));
+
+  // Step 2.5: detect LSA (Local Symmetric Access) team topology.
+  // Membership is a HARDWARE fact — peers whose memory this rank can load/store
+  // through a flat VA — captured before transport policy: same host by default,
+  // or the same vPOD (a scale-up UALink fabric domain that may span hosts) when
+  // fabric/manual grouping applies (see CcoComputeLsaKey).
   //
   // HARD CONTRACT — violations are fatal:
-  //   (a) node-major contiguous ranks (same-host peers form a single block)
+  //   (a) LSA-major contiguous ranks (team peers form a single block)
   //   (b) every rank observes the same lsaSize
   // Both are required by the flat-VA formula `lsaFlatBase + lsaRank * stride`.
+
+  // Each rank computes its LSA-team key (host / manual vPOD / UALink fabric),
+  // then we allgather + decide the job-wide grouping. Manual (MORI_VPOD_ID) is
+  // all-or-none; UALink fabric grouping only kicks in when EVERY rank reports a
+  // ready fabric (else fall back to host LSA + RDMA, like RCCL disabling MNNVL).
+  CcoLsaKey myKey;
+  CcoComputeLsaKey(comm->hipDev, &myKey);
+  std::vector<CcoLsaKey> allKeys(comm->worldSize);
+  comm->bootNet->Allgather(&myKey, allKeys.data(), sizeof(CcoLsaKey));
+
+  int manualCnt = 0, fabricCnt = 0;
+  for (const auto& k : allKeys) {
+    if (k.mode == CCO_LSA_MANUAL)
+      manualCnt++;
+    else if (k.mode == CCO_LSA_FABRIC)
+      fabricCnt++;
+  }
+  bool vpodMode;
+  if (manualCnt > 0) {
+    if (manualCnt != comm->worldSize) {
+      MORI_SHMEM_ERROR(
+          "ccoCommCreate: MORI_VPOD_ID set on {}/{} ranks — manual vPOD grouping must "
+          "be all-or-none across the job.",
+          manualCnt, comm->worldSize);
+      delete comm->ctx;
+      comm->bootNet->Finalize();
+      delete comm;
+      *outComm = nullptr;
+      return -1;
+    }
+    vpodMode = true;
+  } else if (fabricCnt == comm->worldSize) {
+    vpodMode = true;  // every rank on a ready UALink fabric
+  } else {
+    vpodMode = false;  // host LSA + RDMA (default / no fabric / mixed readiness)
+    if (fabricCnt > 0)
+      MORI_SHMEM_INFO(
+          "ccoCommCreate: UALink fabric ready on only {}/{} ranks — using host LSA + RDMA",
+          fabricCnt, comm->worldSize);
+  }
+  bool lsaSpansHosts = false;
   {
     int lsaCount = 0;
-    int firstSameNode = comm->rank;
-    int lastSameNode = comm->rank;
+    int firstInTeam = comm->rank;
+    int lastInTeam = comm->rank;
     for (int pe = 0; pe < comm->worldSize; pe++) {
       const auto& cap = comm->ctx->GetPeerCapabilities(pe);
-      const bool sameNode = (pe == comm->rank) || cap.sameHost;
-      if (sameNode) {
-        if (pe < firstSameNode) firstSameNode = pe;
-        if (pe > lastSameNode) lastSameNode = pe;
+      const bool sameHost = (pe == comm->rank) || cap.sameHost;
+      const bool inTeam = vpodMode ? CcoLsaKeySame(allKeys[pe], myKey) : sameHost;
+      if (inTeam) {
+        if (pe < firstInTeam) firstInTeam = pe;
+        if (pe > lastInTeam) lastInTeam = pe;
         lsaCount++;
+        if (!sameHost) lsaSpansHosts = true;  // team member on another host
       }
     }
 
-    if (lastSameNode - firstSameNode + 1 != lsaCount) {
+    if (lastInTeam - firstInTeam + 1 != lsaCount) {
       MORI_SHMEM_ERROR(
           "ccoCommCreate: non-contiguous lsa membership "
           "(rank {}: first={} last={} count={}). CCO requires "
-          "node-major contiguous rank layout. Reorder ranks in your "
-          "launch (mpirun -host A:N,B:N or equivalent).",
-          comm->rank, firstSameNode, lastSameNode, lsaCount);
+          "LSA-major contiguous rank layout. Reorder ranks in your "
+          "launch (mpirun -host A:N,B:N or equivalent), or align MORI_VPOD_ID "
+          "with contiguous rank blocks.",
+          comm->rank, firstInTeam, lastInTeam, lsaCount);
       delete comm->ctx;
       comm->bootNet->Finalize();
       delete comm;
@@ -242,7 +459,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
         MORI_SHMEM_ERROR(
             "ccoCommCreate: heterogeneous lsa sizes detected "
             "(my rank {} sees lsaSize={}, rank {} sees lsaSize={}). "
-            "CCO requires uniform GPUs-per-node across all nodes.",
+            "CCO requires uniform LSA-team size across all ranks.",
             comm->rank, lsaCount, r, allLsaSizes[r]);
         delete comm->ctx;
         comm->bootNet->Finalize();
@@ -253,11 +470,23 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
     }
 
     comm->lsaSize = lsaCount;
-    comm->myNodeStart = firstSameNode;
-    comm->lsaRank = comm->rank - firstSameNode;
+    comm->myNodeStart = firstInTeam;
+    comm->lsaRank = comm->rank - firstInTeam;
 
-    MORI_SHMEM_INFO("ccoCommCreate: lsa topology rank={} lsaSize={} lsaRank={} myNodeStart={}",
-                    comm->rank, comm->lsaSize, comm->lsaRank, comm->myNodeStart);
+    // Sanity: on a UALink fabric the team should match the reported vpod_size
+    // (a mismatch just means a subset of the vPOD was launched — informational).
+    if (myKey.mode == CCO_LSA_FABRIC && myKey.vpodSize > 0 && lsaCount != myKey.vpodSize) {
+      MORI_SHMEM_INFO(
+          "ccoCommCreate: LSA team size {} != UALink vpod_size {} (subset of the vPOD "
+          "launched?)",
+          lsaCount, myKey.vpodSize);
+    }
+
+    MORI_SHMEM_INFO(
+        "ccoCommCreate: lsa topology rank={} lsaSize={} lsaRank={} lsaStart={} "
+        "mode={} spansHosts={}",
+        comm->rank, comm->lsaSize, comm->lsaRank, comm->myNodeStart,
+        (myKey.mode == CCO_LSA_FABRIC ? "fabric" : (vpodMode ? "manual" : "host")), lsaSpansHosts);
   }
 
   // Step 3: reserve flat VA. Always 4GB-aligned so stride4G = perRankSize >> 32
@@ -270,22 +499,75 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   perRankVmmSize = AlignUp(perRankVmmSize, 1ULL << 32);
   comm->perRankSize = perRankVmmSize;
 
-  // Cache the device once — subsequent API calls (ccoMemAlloc, ccoWindow-
-  // Register) reuse this without re-querying hipGetDevice. Callers MUST keep
-  // the calling thread bound to this device for any later CCO API on this comm.
-  HIP_RUNTIME_CHECK(hipGetDevice(&comm->hipDev));
+  // Probe fabric handle support: try to allocate + export with the fabric
+  // handle type. If it works, all subsequent allocations use fabric handles
+  // (64-byte tokens exchangeable via Allgather) instead of dma-buf FDs
+  // (which require Unix socket + SCM_RIGHTS).
+  {
+    hipMemAllocationProp probeProp = {};
+    probeProp.type = hipMemAllocationTypePinned;
+    probeProp.requestedHandleType = hipMemHandleTypeFabricCompat;
+    probeProp.location.type = hipMemLocationTypeDevice;
+    probeProp.location.id = comm->hipDev;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    probeProp.allocFlags.gpuDirectRDMACapable = 1;
+#endif
+
+    size_t probeGranularity = 0;
+    hipError_t probeErr = hipMemGetAllocationGranularity(&probeGranularity, &probeProp,
+                                                         hipMemAllocationGranularityRecommended);
+    if (probeErr == hipSuccess && probeGranularity > 0) {
+      hipMemGenericAllocationHandle_t probeHandle = 0;
+      probeErr = hipMemCreate(&probeHandle, probeGranularity, &probeProp, 0);
+      if (probeErr == hipSuccess) {
+        hipMemFabricHandle_compat_t probeFabric;
+        probeErr = hipMemExportToShareableHandle(&probeFabric, probeHandle,
+                                                 hipMemHandleTypeFabricCompat, 0);
+        (void)hipMemRelease(probeHandle);
+        if (probeErr == hipSuccess) {
+          comm->handleType = static_cast<int>(hipMemHandleTypeFabricCompat);
+          MORI_SHMEM_INFO("ccoCommCreate: fabric handle probe succeeded");
+        }
+      }
+    }
+    if (comm->handleType != static_cast<int>(hipMemHandleTypeFabricCompat)) {
+      MORI_SHMEM_INFO("ccoCommCreate: fabric handle probe failed, using FD path");
+    }
+  }
+
+  // Cross-node LSA: when the LSA team (vPOD) spans hosts, its peers are only
+  // reachable through fabric handles mapped into the flat VA. lsaSize/myNodeStart
+  // already describe the (contiguous) team; here we just require fabric and flag
+  // that peer mapping must go cross-node (fabric import, no hipDeviceEnablePeer-
+  // Access). A scale-up fabric is mandatory — fail loudly if it's missing.
+  if (lsaSpansHosts) {
+    if (comm->handleType != static_cast<int>(hipMemHandleTypeFabricCompat)) {
+      MORI_SHMEM_ERROR(
+          "ccoCommCreate: LSA team spans hosts (cross-node vPOD, lsaSize={}) but fabric "
+          "handle support is unavailable — cannot map peer VAs across nodes. Fix the "
+          "fabric/driver, or scope MORI_VPOD_ID to a single host.",
+          comm->lsaSize);
+      delete comm->ctx;
+      comm->bootNet->Finalize();
+      delete comm;
+      *outComm = nullptr;
+      return -1;
+    }
+    comm->fabricCrossNodeLsa = true;
+    MORI_SHMEM_INFO("ccoCommCreate: cross-node vPOD LSA enabled (lsaSize={} spans hosts)",
+                    comm->lsaSize);
+  }
 
   // Query granularity with the SAME allocProp MemAlloc will use — granularity
-  // can shift when requestedHandleType (FD export) is enabled.
+  // can shift when requestedHandleType (FD export vs fabric) is enabled.
   hipMemAllocationProp allocProp = {};
   allocProp.type = CcoWindowAllocType();
-  allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
+  allocProp.requestedHandleType = static_cast<hipMemAllocationHandleType>(comm->handleType);
   allocProp.location.type = hipMemLocationTypeDevice;
   allocProp.location.id = comm->hipDev;
 
   size_t granularity = 0;
-  // Flat VA covers the LSA team only. Cross-node peers don't use VA — RDMA
-  // goes through iova=0 + offset.
+  // Flat VA covers the LSA team (world-wide when fabricCrossNodeLsa).
   size_t totalVaSize = static_cast<size_t>(comm->lsaSize) * perRankVmmSize;
   {
     vmmProcessLock vmmLock;
@@ -348,10 +630,11 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
 
   MORI_SHMEM_INFO(
       "ccoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
-      "granularity={} defaultNumQpPerPe={} sdmaNumQueue={} rdma={}",
+      "granularity={} defaultNumQpPerPe={} sdmaNumQueue={} rdma={} fabric={}",
       comm->rank, comm->worldSize, comm->groupId, comm->flatBase, comm->perRankSize,
       comm->vmmGranularity, comm->defaultNumQpPerPe, comm->sdmaNumQueue,
-      comm->ctx->RdmaTransportEnabled());
+      comm->ctx->RdmaTransportEnabled(),
+      comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat));
   return 0;
 }
 
@@ -390,7 +673,7 @@ int ccoCommDestroy(ccoComm* comm) {
     vmmProcessLock vmmLock;
     (void)hipMemUnmap(ptr, meta.size);
     (void)hipMemRelease(meta.physHandle);
-    if (meta.shareFd >= 0) close(meta.shareFd);
+    if (!meta.isFabric && meta.shareFd >= 0) close(meta.shareFd);
   }
   comm->allocTable.clear();
 
@@ -449,15 +732,18 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   // Return the reserved slot to the vaManager on any failure after this point.
   auto rollbackSlot = [&]() { (void)comm->vaManager->Free(slotAddr); };
 
+  const bool useFabric = (comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat));
   hipMemAllocationProp allocProp = {};
   allocProp.type = CcoWindowAllocType();
-  allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
+  allocProp.requestedHandleType = static_cast<hipMemAllocationHandleType>(comm->handleType);
   allocProp.location.type = hipMemLocationTypeDevice;
   allocProp.location.id = comm->hipDev;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  allocProp.allocFlags.gpuDirectRDMACapable = 1;
+#endif
 
   hipMemGenericAllocationHandle_t physHandle = 0;
   hipError_t err = hipSuccess;
-  int shareFd = -1;
   void* localVa = reinterpret_cast<void*>(slotAddr);
   {
     vmmProcessLock vmmLock;
@@ -503,8 +789,23 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
     return -1;
   }
 
-  err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&shareFd), physHandle,
-                                      hipMemHandleTypePosixFileDescriptor, 0);
+  // Export a shareable handle for WindowRegister (P2P mapping + RDMA MR).
+  // Fabric path: 64-byte token (exchangeable via Allgather — no Unix sockets).
+  // FD path: dma-buf FD (exchanged via LocalBootstrapNetwork + SCM_RIGHTS).
+  ccoComm::AllocMeta meta;
+  meta.physHandle = physHandle;
+  meta.isFabric = useFabric;
+  meta.slotOffset = slotOffset;
+  meta.size = alignedSize;
+
+  if (useFabric) {
+    err = hipMemExportToShareableHandle(&meta.fabricHandle, physHandle,
+                                        hipMemHandleTypeFabricCompat, 0);
+  } else {
+    meta.shareFd = -1;
+    err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&meta.shareFd), physHandle,
+                                        hipMemHandleTypePosixFileDescriptor, 0);
+  }
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("ccoMemAlloc: hipMemExportToShareableHandle failed: {} ({})",
                      static_cast<int>(err), hipGetErrorString(err));
@@ -518,11 +819,6 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   }
   {
     std::lock_guard<std::mutex> lock(comm->allocMutex);
-    ccoComm::AllocMeta meta;
-    meta.physHandle = physHandle;
-    meta.shareFd = shareFd;
-    meta.slotOffset = slotOffset;
-    meta.size = alignedSize;
     comm->allocTable[localVa] = meta;
   }
 
@@ -573,7 +869,7 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
     }
   }
 
-  if (meta.shareFd >= 0) close(meta.shareFd);
+  if (!meta.isFabric && meta.shareFd >= 0) close(meta.shareFd);
 
   return 0;
 }
@@ -591,104 +887,36 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
 
   auto& meta = it->second;
   size_t slotOffset = meta.slotOffset;
-  int shareFd = meta.shareFd;
   void* localPtr = ptr;
   int worldSize = comm->worldSize;
   int rank = comm->rank;
+  const bool useFabric = meta.isFabric;
 
   size_t alignedSize = meta.size;
 
-  MORI_SHMEM_TRACE("ccoWindowRegister: rank={} ptr={} size={} slotOffset={}", rank, ptr, size,
-                   slotOffset);
+  MORI_SHMEM_TRACE("ccoWindowRegister: rank={} ptr={} size={} slotOffset={} fabric={}", rank, ptr,
+                   size, slotOffset, useFabric);
 
-  // P2P imported handles — collected during the FD-exchange loop below,
+  // P2P imported handles — collected during the exchange loop below,
   // ownership later transferred to ccoWindowHost so Deregister can release.
   std::vector<hipMemGenericAllocationHandle_t> p2pImportedHandles;
 
-  // P2P: exchange dma-buf FDs with same-node peers and map their slots into
+  // P2P: exchange handles with same-node peers and map their slots into
   // the LSA flat VA.
   std::vector<int> p2pPeers;
   for (int pe = 0; pe < worldSize; pe++) {
-    if (comm->ctx->CanUseP2P(pe)) {
+    if (CcoCanLsaMapPeer(comm, pe)) {
       p2pPeers.push_back(pe);
     }
   }
 
   if (!p2pPeers.empty()) {
-    std::vector<int> sortedGroup = p2pPeers;
-    sortedGroup.push_back(rank);
-    std::sort(sortedGroup.begin(), sortedGroup.end());
-
-    int myPeerRank = 0;
-    for (int i = 0; i < static_cast<int>(sortedGroup.size()); i++) {
-      if (sortedGroup[i] == rank) {
-        myPeerRank = i;
-        break;
-      }
-    }
-    int p2pWorldSize = static_cast<int>(sortedGroup.size());
-
-    // Socket path must agree across the group but be unique per (group, window).
-    // groupId = rank 0's pid; slotOffset identifies the window. The clique
-    // leader (smallest GLOBAL rank in the group) must also be part of the path:
-    // a single node can host several disjoint P2P cliques (e.g. GPUs {0,1,2,3}
-    // and {4,5,6,7}). Every clique shares groupId + slotOffset and renumbers its
-    // members to 0..k-1 internally, so without the leader the cliques would
-    // generate identical socket/barrier filenames and clobber each other's
-    // sockets (manifesting as ENOENT during connect).
-    std::string socketPath = "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" +
-                             std::to_string(slotOffset) + "_g" + std::to_string(sortedGroup[0]) +
-                             "_";
-
-    // NOTE: do NOT blanket-unlink every i_j socket here (even guarded by
-    // myPeerRank == 0). Ranks bind their server sockets as soon as they enter
-    // ExchangeFileDescriptors, and they may do so at very different times (e.g.
-    // single-process multi-thread, where threads serialize on HIP locks). A
-    // leader-side sweep can therefore delete a socket a peer has already bound
-    // and is listening on, making a client connect() fail with ENOENT. Stale
-    // sockets from a prior crashed run are instead handled per-pairing inside
-    // ExchangeFileDescriptors, which unlinks each server path right before
-    // binding it (and groupId/leader/slotOffset make cross-run collisions
-    // effectively impossible).
-    application::LocalBootstrapNetwork localBoot(myPeerRank, p2pWorldSize, socketPath);
-    localBoot.Initialize();
-
-    std::vector<int> myFds = {shareFd};
-    std::vector<std::vector<int>> allFds;
-    if (!localBoot.ExchangeFileDescriptors(myFds, allFds)) {
-      MORI_SHMEM_ERROR("ccoWindowRegister: P2P FD exchange failed");
-      localBoot.Finalize();
-      return -1;
-    }
-
-    // All peer-supplied fds (everything in allFds except our own slot) must
-    // be close()'d exactly once — closing them at the very end on every
-    // exit path (success and bail) is the easiest invariant to enforce.
-    // hipMemImportFromShareableHandle already dup's the underlying dma-buf
-    // reference internally, so it's safe to delay the close to here.
-    auto closePeerFds = [&]() {
-      for (int i = 0; i < static_cast<int>(allFds.size()); i++) {
-        if (i == myPeerRank) continue;  // our own shareFd is owned by meta
-        for (int fd : allFds[i]) {
-          if (fd >= 0) close(fd);
-        }
-      }
-      allFds.clear();
-    };
-
-    std::vector<int> globalToPeer(worldSize, -1);
-    for (int i = 0; i < p2pWorldSize; i++) {
-      globalToPeer[sortedGroup[i]] = i;
-    }
-
+    // Common peer-mapping helpers shared by both fabric and FD paths.
     hipMemAccessDesc accessDesc = {};
     accessDesc.location.type = hipMemLocationTypeDevice;
     accessDesc.location.id = comm->hipDev;
     accessDesc.flags = hipMemAccessFlagsProtReadWrite;
 
-    // Track already-mapped peers so we can roll back if any later peer
-    // fails — partial success would leave the window with missing P2P
-    // links and silently segfault when a kernel touches a missing peer.
     struct MappedPeer {
       hipMemGenericAllocationHandle_t handle;
       void* peerVa;
@@ -705,51 +933,43 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
       mappedPeers.clear();
     };
 
-    auto bail = [&]() {
-      rollbackMappedPeers();
-      closePeerFds();
-      localBoot.Finalize();
-    };
-
-    for (int pe : p2pPeers) {
-      int pr = globalToPeer[pe];
-      if (pr < 0 || pr >= static_cast<int>(allFds.size())) {
-        MORI_SHMEM_ERROR("ccoWindowRegister: PE {} missing in FD exchange result", pe);
-        bail();
-        return -1;
-      }
-      int peerFd = allFds[pr][0];
-      if (peerFd < 0) {
-        MORI_SHMEM_ERROR("ccoWindowRegister: PE {} delivered invalid FD ({})", pe, peerFd);
-        bail();
-        return -1;
-      }
-
-      hipMemGenericAllocationHandle_t importedHandle;
-      int peerLsaRank = pe - comm->myNodeStart;
+    // Import + map a single peer's handle into our flat VA. Returns 0 on
+    // success, -1 on failure (rolls back all prior mappings).
+    auto mapPeer = [&](int pe, hipMemGenericAllocationHandle_t importedHandle) -> int {
+      int peerLsaRank = CcoPeToLsaRank(comm, pe);
       void* peerVa = static_cast<char*>(comm->flatBase) +
                      static_cast<size_t>(peerLsaRank) * comm->perRankSize + slotOffset;
+      const bool crossNodePeer =
+          comm->fabricCrossNodeLsa && !comm->ctx->GetPeerCapabilities(pe).sameHost;
+      // hipDeviceEnablePeerAccess is intra-node only; cross-node fabric P2P
+      // does not use this API (peerDev indices are local and collide across nodes).
+      if (!crossNodePeer && pe < static_cast<int>(comm->peerHipDevs.size())) {
+        int peerDev = comm->peerHipDevs[pe];
+        if (peerDev != comm->hipDev) {
+          hipError_t peerErr = hipDeviceEnablePeerAccess(peerDev, 0);
+          // Consume the sticky last-error: hipDeviceEnablePeerAccess leaves the
+          // runtime's last-error set (e.g. AlreadyEnabled / NotSupported), which
+          // a later torch op would pick up via hipGetLastError() and raise as
+          // "operation not supported" (observed on gfx950). Mirrors the sibling
+          // ccoDevCommCreate call site.
+          (void)hipGetLastError();
+          if (peerErr != hipSuccess && peerErr != hipErrorPeerAccessAlreadyEnabled) {
+            MORI_SHMEM_WARN("ccoWindowRegister: hipDeviceEnablePeerAccess PE {} dev {} failed: {}",
+                            pe, peerDev, static_cast<int>(peerErr));
+          }
+        }
+      }
       {
         vmmProcessLock vmmLock;
-        hipError_t err = hipMemImportFromShareableHandleCompat(&importedHandle, peerFd,
-                                                               hipMemHandleTypePosixFileDescriptor);
-        if (err != hipSuccess) {
-          MORI_SHMEM_ERROR("ccoWindowRegister: import from PE {} failed: {}", pe,
-                           static_cast<int>(err));
-          bail();
-          return -1;
-        }
-
         hipError_t mapErr = hipMemMap(peerVa, alignedSize, 0, importedHandle, 0);
         if (mapErr != hipSuccess) {
           MORI_SHMEM_ERROR("ccoWindowRegister: hipMemMap PE {} failed: {}", pe,
                            static_cast<int>(mapErr));
           (void)hipMemRelease(importedHandle);
-          bail();
+          rollbackMappedPeers();
           return -1;
         }
       }
-
       hipError_t setErr = hipSuccess;
       for (int retry = 0; retry < 5; retry++) {
         {
@@ -760,26 +980,153 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
         usleep(1000 * (1 << retry));
       }
       if (setErr != hipSuccess) {
-        MORI_SHMEM_ERROR("ccoWindowRegister: hipMemSetAccess PE {} failed after retries: {}", pe,
-                         static_cast<int>(setErr));
-        {
-          vmmProcessLock vmmLock;
-          (void)hipMemUnmap(peerVa, alignedSize);
-          (void)hipMemRelease(importedHandle);
+        if (crossNodePeer && CcoFabricLenient()) {
+          // Opt-in leniency: some fabrics grant load/store access at import time
+          // and return non-success from hipMemSetAccess. Trust the mapping.
+          MORI_SHMEM_WARN(
+              "ccoWindowRegister: hipMemSetAccess PE {} cross-node failed: {} "
+              "(MORI_CCO_FABRIC_LENIENT=1 — continuing, import may already grant access)",
+              pe, static_cast<int>(setErr));
+        } else {
+          // Fail loudly at register time rather than leaving a peer VA that
+          // faults on first device access. For cross-node this most likely means
+          // the fabric is not a scale-up (load/store) domain.
+          MORI_SHMEM_ERROR("ccoWindowRegister: hipMemSetAccess PE {} failed after retries: {}{}",
+                           pe, static_cast<int>(setErr),
+                           crossNodePeer ? " (cross-node fabric not load/store-reachable?)" : "");
+          {
+            vmmProcessLock vmmLock;
+            (void)hipMemUnmap(peerVa, alignedSize);
+            (void)hipMemRelease(importedHandle);
+          }
+          rollbackMappedPeers();
+          return -1;
         }
-        bail();
+      }
+      mappedPeers.push_back({importedHandle, peerVa});
+      return 0;
+    };
+
+    if (useFabric) {
+      // Fabric path: Allgather 64-byte fabric handles via the bootstrap
+      // network — no Unix sockets, no SCM_RIGHTS.
+      std::vector<hipMemFabricHandle_compat_t> allFabricHandles(worldSize);
+      comm->bootNet->Allgather(&meta.fabricHandle, allFabricHandles.data(),
+                               sizeof(hipMemFabricHandle_compat_t));
+
+      for (int pe : p2pPeers) {
+        hipMemGenericAllocationHandle_t importedHandle;
+        hipError_t err;
+        {
+          // Import must share the VMM serialization: ROCr races on concurrent
+          // import vs map/setaccess across SPMT threads -> hipMemSetAccess
+          // InvalidValue. #455 serialized map/setaccess but not import.
+          vmmProcessLock vmmLock;
+          err = hipMemImportFromShareableHandle(&importedHandle, &allFabricHandles[pe],
+                                                hipMemHandleTypeFabricCompat);
+        }
+        if (err != hipSuccess) {
+          MORI_SHMEM_ERROR("ccoWindowRegister: fabric import from PE {} failed: {}", pe,
+                           static_cast<int>(err));
+          rollbackMappedPeers();
+          return -1;
+        }
+        if (mapPeer(pe, importedHandle) != 0) return -1;
+      }
+    } else {
+      // FD path (fallback): exchange dma-buf FDs via LocalBootstrapNetwork +
+      // SCM_RIGHTS (one Unix socket pair per peer).
+      int shareFd = meta.shareFd;
+
+      std::vector<int> sortedGroup = p2pPeers;
+      sortedGroup.push_back(rank);
+      std::sort(sortedGroup.begin(), sortedGroup.end());
+
+      int myPeerRank = 0;
+      for (int i = 0; i < static_cast<int>(sortedGroup.size()); i++) {
+        if (sortedGroup[i] == rank) {
+          myPeerRank = i;
+          break;
+        }
+      }
+      int p2pWorldSize = static_cast<int>(sortedGroup.size());
+
+      std::string socketPath = "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" +
+                               std::to_string(slotOffset) + "_g" + std::to_string(sortedGroup[0]) +
+                               "_";
+
+      application::LocalBootstrapNetwork localBoot(myPeerRank, p2pWorldSize, socketPath);
+      localBoot.Initialize();
+
+      std::vector<int> myFds = {shareFd};
+      std::vector<std::vector<int>> allFds;
+      if (!localBoot.ExchangeFileDescriptors(myFds, allFds)) {
+        MORI_SHMEM_ERROR("ccoWindowRegister: P2P FD exchange failed");
+        localBoot.Finalize();
         return -1;
       }
 
-      mappedPeers.push_back({importedHandle, peerVa});
+      auto closePeerFds = [&]() {
+        for (int i = 0; i < static_cast<int>(allFds.size()); i++) {
+          if (i == myPeerRank) continue;
+          for (int fd : allFds[i]) {
+            if (fd >= 0) close(fd);
+          }
+        }
+        allFds.clear();
+      };
+
+      std::vector<int> globalToPeer(worldSize, -1);
+      for (int i = 0; i < p2pWorldSize; i++) {
+        globalToPeer[sortedGroup[i]] = i;
+      }
+
+      auto bailFd = [&]() {
+        rollbackMappedPeers();
+        closePeerFds();
+        localBoot.Finalize();
+      };
+
+      for (int pe : p2pPeers) {
+        int pr = globalToPeer[pe];
+        if (pr < 0 || pr >= static_cast<int>(allFds.size())) {
+          MORI_SHMEM_ERROR("ccoWindowRegister: PE {} missing in FD exchange result", pe);
+          bailFd();
+          return -1;
+        }
+        int peerFd = allFds[pr][0];
+        if (peerFd < 0) {
+          MORI_SHMEM_ERROR("ccoWindowRegister: PE {} delivered invalid FD ({})", pe, peerFd);
+          bailFd();
+          return -1;
+        }
+
+        hipMemGenericAllocationHandle_t importedHandle;
+        hipError_t err;
+        {
+          vmmProcessLock vmmLock;  // serialize import w/ map/setaccess (SPMT race)
+          err = hipMemImportFromShareableHandleCompat(&importedHandle, peerFd,
+                                                      hipMemHandleTypePosixFileDescriptor);
+        }
+        if (err != hipSuccess) {
+          MORI_SHMEM_ERROR("ccoWindowRegister: import from PE {} failed: {}", pe,
+                           static_cast<int>(err));
+          bailFd();
+          return -1;
+        }
+        if (mapPeer(pe, importedHandle) != 0) {
+          closePeerFds();
+          localBoot.Finalize();
+          return -1;
+        }
+      }
+
+      closePeerFds();
+      localBoot.Finalize();
     }
 
-    // Stash handles on the WindowHost so Deregister can release them.
     p2pImportedHandles.reserve(mappedPeers.size());
     for (auto& mp : mappedPeers) p2pImportedHandles.push_back(mp.handle);
-
-    closePeerFds();
-    localBoot.Finalize();
   }
 
   // RDMA MR registration + rkey Allgather.
@@ -787,12 +1134,14 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   uint32_t localRkey = 0;
 
   application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
-  if (rdmaDevCtx && shareFd >= 0) {
+  if (rdmaDevCtx) {
     application::RdmaMemoryRegion mr;
-    if (comm->iovaZeroMode) {
-      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(localPtr, size, shareFd);
+    if (useFabric) {
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionAuto(localPtr, size);
+    } else if (comm->iovaZeroMode) {
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(localPtr, size, meta.shareFd);
     } else {
-      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabuf(localPtr, size, shareFd);
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabuf(localPtr, size, meta.shareFd);
     }
     lkey = mr.lkey;
     localRkey = mr.rkey;
@@ -842,13 +1191,15 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   *outWin = devPtr;
 
   char* winBase = static_cast<char*>(comm->flatBase) + slotOffset;
-  MORI_SHMEM_INFO("ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={}",
-                  rank, (void*)devPtr, (void*)winBase, size, slotOffset, lkey);
+  MORI_SHMEM_INFO(
+      "ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={} fabric={}", rank,
+      (void*)devPtr, (void*)winBase, size, slotOffset, lkey, useFabric);
   for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
     int pe = comm->myNodeStart + lsa;
     void* peerVa = winBase + static_cast<size_t>(lsa) * comm->perRankSize;
     MORI_SHMEM_INFO("  LSA[{}] (PE {}): flatVA={} rkey={}", lsa, pe, peerVa, peerRkeys_host[pe]);
   }
+  // Peers outside the LSA team (different vPOD / host) are reached via RDMA.
   for (int pe = 0; pe < worldSize; pe++) {
     if (pe >= comm->myNodeStart && pe < comm->myNodeStart + comm->lsaSize) continue;
     MORI_SHMEM_INFO("  XNODE PE {}: rkey={} (RDMA via iova=0)", pe, peerRkeys_host[pe]);
@@ -906,8 +1257,8 @@ int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
     vmmProcessLock vmmLock;
     for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
       if (lsa == comm->lsaRank) continue;
-      int pe = comm->myNodeStart + lsa;
-      if (!comm->ctx->CanUseP2P(pe)) continue;
+      int pe = comm->myNodeStart + lsa;  // global pe (matches register's p2pPeers)
+      if (!CcoCanLsaMapPeer(comm, pe)) continue;
       void* peerVa = static_cast<char*>(comm->flatBase) +
                      static_cast<size_t>(lsa) * comm->perRankSize + slotOff;
       (void)hipMemUnmap(peerVa, allocSize);
@@ -1151,7 +1502,9 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
       return -1;
     }
-    HIP_RUNTIME_CHECK(hipMemset(resourceWindowPtr, 0, layout.totalSize));
+    // resourceWindowPtr is fabric-exportable (ccoMemAlloc) — avoid hipMemset,
+    // which returns OOM on UALink fabric pools (ROCm 7.15).
+    HIP_RUNTIME_CHECK(CcoZeroWindowMem(resourceWindowPtr, layout.totalSize));
     if (ccoWindowRegister(comm, resourceWindowPtr, layout.totalSize, &resourceWindow) != 0) {
       MORI_SHMEM_ERROR("ccoDevCommCreate: resource window Register failed");
       (void)ccoMemFree(comm, resourceWindowPtr);
