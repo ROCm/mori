@@ -3,9 +3,9 @@ name: deploy-mori
 description: >-
   Deploy and set up the MORI environment in a fresh Docker container or bare host:
   start the container, install ROCm dependencies, NIC userspace libraries
-  (AINIC/Broadcom), RDMA-core, and MORI itself. Use when the user asks
+  (AINIC/Broadcom/Mellanox-NVIDIA), RDMA-core, and MORI itself. Use when the user asks
   to deploy MORI, install MORI in a container, set up a fresh dev environment
-  for MORI, or prepare an AINIC / Thor2 box for MORI.
+  for MORI, or prepare an AINIC / Thor2 / mlx5 box for MORI.
 ---
 
 # Deploy MORI
@@ -18,9 +18,20 @@ contains `pyproject.toml`; ask the user otherwise.
 **Detect NIC type** — determines whether Step 3 is needed:
 
 ```bash
-lspci | grep -iE "pensando|ionic|dsc|pollara" && echo "→ ainic"
-lspci | grep -iE "broadcom.*thor|bnxt"         && echo "→ thor2"
-lspci | grep -iE "mellanox|connectx"           && echo "→ mlx5 (no Step 3 needed, works out of the box)"
+lspci | grep -iE "pensando|ionic|dsc|pollara"      && echo "→ ainic"
+lspci | grep -iE "broadcom.*thor|bnxt"             && echo "→ thor2"
+lspci | grep -iE "mellanox|connectx|nvidia.*bluefield" && echo "→ mlx5"
+```
+
+A host can have more than one type present — that's fine, `mori check`/`mori
+setup` only act on the vendor with the most matching RDMA devices.
+
+For mlx5, also check RoCE vs native InfiniBand (changes what Step 3c installs):
+
+```bash
+for d in /sys/class/infiniband/mlx5_*; do
+  echo "$(basename "$d"): $(cat "$d/ports/1/link_layer" 2>/dev/null)"
+done
 ```
 
 ---
@@ -28,11 +39,8 @@ lspci | grep -iE "mellanox|connectx"           && echo "→ mlx5 (no Step 3 need
 ## Step 1: Start the Docker container
 
 Use the container name from the user's args if provided; ask if not.
-
 Default image: `rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0`
-(use this unless the user specifies another).
-
-Check if the container already exists:
+(use unless the user specifies another).
 
 ```bash
 if sudo docker inspect $CONTAINER_NAME &>/dev/null; then
@@ -42,7 +50,7 @@ else
 fi
 ```
 
-Probe optional mount paths on the host and only include ones that exist:
+Probe optional mount paths on the host, only include ones that exist:
 
 ```bash
 for p in /shared /apps /dev/infiniband /sys/kernel/config /sys/kernel/debug; do
@@ -80,13 +88,12 @@ sudo docker run \
 
 Notes:
 - `--network=host` + `--device=/dev/infiniband` required for RDMA visibility.
-- `--ulimit memlock=-1:-1` — RDMA pins memory when creating QPs; required for the
+- `--ulimit memlock=-1:-1` — RDMA pins memory on QP creation; needed for the
   parallel `mori check` bandwidth mesh.
-- `-v /sys/kernel/config` + `-v /sys/kernel/debug` — **required for bnxt (Broadcom)**:
-  `mori check` (DCQCN) and `mori setup` read/write congestion control via configfs.
-  `--privileged` does not propagate these kernel filesystems on its own. If the host
-  hasn't mounted them, mount on the host first:
-  `sudo mount -t configfs none /sys/kernel/config; sudo mount -t debugfs none /sys/kernel/debug`.
+- configfs/debugfs mounts are **required for bnxt** DCQCN (`mori check`/`mori
+  setup` read/write congestion control through them). `--privileged` alone
+  doesn't propagate them — if missing on the host: `sudo mount -t configfs
+  none /sys/kernel/config; sudo mount -t debugfs none /sys/kernel/debug`.
 - `--rm` — data outside mounted volumes is lost on stop.
 
 All subsequent steps run **inside** `$CONTAINER_NAME` via `docker exec`.
@@ -97,38 +104,34 @@ All subsequent steps run **inside** `$CONTAINER_NAME` via `docker exec`.
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c "apt-get update && apt-get install -y --no-install-recommends \
-    git libpci-dev pciutils sudo libdw1 libibverbs-dev ibverbs-utils \
+    git libpci-dev pciutils sudo libdw1 libibverbs-dev ibverbs-utils rdma-core \
     locales iputils-ping iproute2 ethtool jq perftest \
     wget unzip ca-certificates curl \
     libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler \
     libopenmpi-dev openmpi-bin"
 ```
 
-Package roles:
-- `jq` — required by `mori check`.
-- `pciutils` — provides `lspci`, which `nicctl` shells out to in order to enumerate
-  the NIC cards. Without it `nicctl` fails with `Invalid card handle` and the ionic
-  firmware / QoS / DCQCN checks in `mori check` / `mori setup` break.
-- `sudo` — the ionic and bnxt paths of `mori check` / `mori setup` invoke `nicctl`,
-  `dcb`, `ethtool`, and sysfs writes via `sudo`.
-- `perftest` — provides `ib_write_bw` / `ib_write_lat` for intra/inter-node bandwidth + latency checks.
-- `iproute2` — provides `dcb`, required by `mori setup` on bnxt NICs.
-- `wget unzip ca-certificates curl` — used by the NIC userspace install steps (Step 3a/3b).
-- `libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler` — **mori build deps**:
-  the build defaults to `BUILD_UMBP=ON`, whose CMake step needs gRPC headers
-  (`grpcpp/grpcpp.h`). The remaining build tooling (`cmake`, `ninja`, `pybind11`) is
-  pulled in automatically by `pyproject.toml`'s build isolation, so it doesn't need
-  to be in the image.
-- `libopenmpi-dev openmpi-bin` — **MPI deps**: required for `MORI_WITH_MPI=ON` and
-  `BUILD_BENCHMARK=ON` (benchmark targets are gated behind `WITH_MPI`).
+Non-obvious package roles:
+- `rdma-core` — version info `mori check` Step 1 reads. Without it, Step 1
+  still passes but logs a cosmetic `[WARN] rdma-core package not found`.
+- `pciutils` (`lspci`) — `nicctl` shells out to it; missing it breaks the
+  ionic firmware/QoS/DCQCN checks with `Invalid card handle`.
+- `sudo` — ionic/bnxt paths of `mori check`/`mori setup` invoke `nicctl`,
+  `dcb`, `ethtool`, sysfs writes via `sudo`.
+- `perftest` — `ib_write_bw`/`ib_write_lat` for bandwidth/latency checks.
+- `iproute2` — provides `dcb`, needed by `mori setup` on bnxt.
+- `libgrpc++-dev` + protobuf packages — build defaults to `BUILD_UMBP=ON`,
+  whose CMake step needs gRPC headers. (`cmake`/`ninja`/`pybind11` come from
+  `pyproject.toml` build isolation automatically.)
+- `libopenmpi-dev openmpi-bin` — needed for `MORI_WITH_MPI=ON` /
+  `BUILD_BENCHMARK=ON` (benchmarks are gated behind `WITH_MPI`).
 
 ---
 
 ## Step 3: Install NIC userspace libraries
 
-Run the subsection matching the NIC type detected at the top:
-- `ainic` → **Step 3a** (AINIC / Pensando)
-- `thor2` / bnxt → **Step 3b** (Broadcom NetXtreme-E)
+Run the subsection matching the NIC type detected above:
+- `ainic` → **Step 3a**, `thor2`/bnxt → **Step 3b**, `mlx5` → **Step 3c**
 
 ---
 
@@ -143,7 +146,7 @@ Run the subsection matching the NIC type detected at the top:
 
 ### Detect host AINIC version and check against public repo
 
-Run on the **host** (outside container):
+Run on the **host**:
 
 ```bash
 IB_DEV=$(ls /sys/class/infiniband/ 2>/dev/null | head -1)
@@ -203,7 +206,7 @@ nicctl --version
 
 ## Step 3b: Install Broadcom (bnxt / thor2) userspace libraries + tools
 
-**Skip if NIC type is not `thor2` / bnxt.**
+**Skip if NIC type is not `thor2`/bnxt.**
 
 > **Recommended version**: for cross-node MORI (EP over RDMA / IBGDA), Broadcom firmware
 > is solid on `237.1.137.x` (official Broadcom release) and `235.2.86.x` (customer-specific
@@ -245,13 +248,13 @@ ldconfig
 '
 ```
 
-> Replace `235.2.86.0` with the version matching the host (3b.1). If that exact
-> version is gone from the repo, pick the nearest one from `apt-cache madison bnxt-rocelib`.
+> Replace `235.2.86.0` with the version matching the host (3b.1). If gone from
+> the repo, pick the nearest from `apt-cache madison bnxt-rocelib`.
 
 ### 3b.3 — Install a recent `niccli` (must support the `qos` subcommand)
 
-`mori check` Step 2 uses `niccli ... qos`, so install a niccli whose version tracks
-the firmware (236.x / 237.x for BCM57608). Parameterize the version:
+`mori check` Step 2 uses `niccli ... qos`, so install one tracking the
+firmware (236.x/237.x for BCM57608):
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c '
@@ -266,29 +269,113 @@ niccli -i 1 qos --ingress --cosq --show | head   # should print the CoSQ table (
 '
 ```
 
-> Alternative (no download): the host usually already has a working niccli at
-> `/opt/niccli` (self-contained). You can `sudo docker cp /opt/niccli $CONTAINER_NAME:/opt/`
-> then `docker exec $CONTAINER_NAME ln -sf /opt/niccli/niccli /usr/bin/niccli`.
+> Alternative (no download): host usually has a working niccli at
+> `/opt/niccli`. `sudo docker cp /opt/niccli $CONTAINER_NAME:/opt/` then
+> `docker exec $CONTAINER_NAME ln -sf /opt/niccli/niccli /usr/bin/niccli`.
 
 ### 3b.4 — `dcb` (iproute2), needed by `mori setup`
-
-`mori setup` configures bnxt PFC/ETS via `dcb`, which ships with `iproute2`
-(installed in Step 2). Verify it's present:
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c "command -v dcb"
 ```
 
-> `mori setup` does host-level NIC configuration (PFC/ETS on the netdev via `dcb`,
-> DCQCN via configfs). With `--network=host` the container shares the host's
-> netns, so it's equivalent to configure on the host. Either run `mori setup` on
-> the host, or ensure the container has `dcb` + configfs/debugfs (Step 1 mounts).
+> `mori setup` configures PFC/ETS via `dcb` and DCQCN via configfs, both at
+> host level. With `--network=host` the container shares the host netns, so
+> running it in-container is equivalent — just needs `dcb` + Step 1's mounts.
+
+---
+
+## Step 3c: Install Mellanox/NVIDIA (mlx5) userspace libraries + tools
+
+**Skip if NIC type is not `mlx5`.**
+
+The mlx5 RoCE userspace provider is **inbox** (Ubuntu's `rdma-core`/
+`ibverbs-providers`, already pulled in by Step 2, includes `libmlx5`) — RDMA
+works with no vendor repo at all. What's still missing for the full `mori
+check`/`mori setup` flow are two small, optional, standalone tools (**neither
+needs a full MLNX_OFED install**):
+
+- **`mlnx_qos`** (package `mlnx-tools`) — reads trust/PFC/DSCP state on RoCE ports.
+- **`mlxconfig`/`mst`** (NVIDIA MFT) — reads `ROCE_CC_PRIO_MASK_P1`/`CNP_DSCP_P1`
+  from firmware NV config.
+
+Both optional: if missing, `mori check` logs `[WARN]` and skips those checks.
+If native IB ports outnumber RoCE ports, `mori check` treats RoCE port(s) as
+incidental and skips QoS/DCQCN anyway — Step 3c becomes unnecessary.
+
+> **`mori setup` has no mlx5 auto-fix path** (only ionic/bnxt). On an mlx5
+> QoS/DCQCN `[FAIL]`, fix manually, e.g. `sudo mlnx_qos -i <netdev> --trust dscp`.
+
+### 3c.1 — Detect host mlx5 driver/firmware version (informational only)
+
+```bash
+cat /sys/class/infiniband/mlx5_*/fw_ver 2>/dev/null | sort -u   # firmware version(s)
+modinfo -F version mlx5_core 2>/dev/null                        # driver version
+```
+
+### 3c.2 — Install `mlnx_qos` (package: `mlnx-tools`)
+
+**Build from source from the upstream GitHub repo** — don't pull full
+MLNX_OFED just for this tiny, dependency-free, pure-Python tool. No version
+coupling to the host driver/firmware.
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c '
+set -e
+apt-get install -y --no-install-recommends make
+cd /tmp && rm -rf mlnx-tools
+git clone --depth 1 https://github.com/Mellanox/mlnx-tools.git
+cd mlnx-tools && make install
+mlnx_qos -i <netdev>   # sanity check; replace <netdev> with a real RoCE netdev
+'
+```
+
+> `make install` places `mlnx_qos` at `/usr/bin/mlnx_qos`, helpers at
+> `/usr/share/mlnx-tools/python/` (script adds this to `sys.path` itself).
+
+### 3c.3 — Install NVIDIA MFT (`mlxconfig`/`mst`)
+
+Proprietary/standalone, not in any apt repo — download the tarball and run
+its installer. **No firmware/driver version matching needed**: MFT is broadly
+backward/forward compatible across generations (verified: MFT 4.30.1 drives
+ConnectX-7 firmware 28.40.1702 fine). Just match arch/package type to the
+container OS; browse
+https://network.nvidia.com/products/adapter-software/firmware-tools/ if the
+URL below is stale.
+
+> **Prerequisite (fails silently without it):** `mst start` shells out to
+> `lsmod`/`modprobe`/`udevadm`. Minimal images (e.g. `rocm/pytorch`) lack
+> these — `install.sh` still reports success and `mst start` exits 0 despite
+> printing `No such file or directory`/`command not found`, but `mst status
+> -v` then shows `MST` column as `NA` and `/dev/mst/` stays empty (silently
+> broken `mlxconfig`/`mst`). Install first:
+> ```bash
+> sudo docker exec $CONTAINER_NAME bash -c "apt-get install -y --no-install-recommends kmod udev usbutils"
+> ```
+> Verify `mst status -v` shows real paths (e.g. `/dev/mst/mt4129_pciconf0`),
+> not `NA`, before trusting `mlxconfig`/`mst` output.
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c '
+set -e
+MFT_VER=4.30.1-1216
+ARCH=x86_64
+URL="https://www.mellanox.com/downloads/MFT/mft-${MFT_VER}-${ARCH}-deb.tgz"
+cd /tmp && curl -fsSL -O "$URL" && tar -xzf mft-*-deb.tgz
+cd mft-*-deb && ./install.sh --without-kernel
+mst start
+mst status -v
+'
+```
+
+> `--without-kernel` skips the optional `mst_pci` kernel module — MFT falls
+> back to plain PCI-config-space access, covered by Step 1's `--privileged`.
 
 ---
 
 ## Step 4: Install MORI
 
-`pybind11` is a required build dep missing from `pyproject.toml`. Run inside the container:
+`pybind11` is a required build dep missing from `pyproject.toml`:
 
 ```bash
 sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "
@@ -298,9 +385,8 @@ pip install .
 "
 ```
 
-**UMBP / gRPC:** the build defaults to `BUILD_UMBP=ON`, whose CMake step needs gRPC
-headers (installed in Step 2). To build without the UMBP storage component instead
-(no gRPC needed):
+**UMBP/gRPC:** build defaults to `BUILD_UMBP=ON` (needs gRPC headers from
+Step 2). To skip the storage component and its gRPC dep:
 
 ```bash
 sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "BUILD_UMBP=OFF pip install ."
@@ -347,37 +433,62 @@ ibv_devinfo | head -20
 sudo docker exec $CONTAINER_NAME bash -c "mori check"
 ```
 
-`mori check` validates the full RDMA stack in 6 steps (vendor-specific variants
-for ionic vs bnxt, same intent):
+`mori check` validates the RDMA stack in 6 steps (vendor-specific variants,
+same intent):
 
-1. **firmware & driver** — firmware/driver/userspace-lib versions consistent
-2. **QoS / SL / TC** — PFC + lossless TC; selects the SL/TC for MORI to use
+1. **firmware & driver** — versions consistent
+2. **QoS / SL / TC** — PFC + lossless TC; selects SL/TC for MORI
 3. **DCQCN** — congestion control enabled on all RoCE devices
-4. **intra-node bandwidth** — `ib_write_bw` between all local NIC pairs (requires `perftest`)
-5. **inter-node bandwidth** — `ib_write_bw` to a peer node; pass peer IP: `mori check <peer_ip>`
-6. **inter-node latency** — `ib_write_lat` to a peer node; same peer IP
+4. **intra-node bandwidth** — `ib_write_bw` full mesh (needs `perftest`)
+5. **inter-node bandwidth** — `ib_write_bw` to a peer: `mori check <peer_ip>`
+6. **inter-node latency** — `ib_write_lat` to a peer: same peer IP
 
-Steps 5 and 6 are skipped when no peer IP is given — run `mori check <peer_ip>` from both nodes to test cross-node connectivity.
+Steps 5/6 are skipped without a peer IP — run from both nodes to test cross-node connectivity.
+
+**mlx5 note:** native IB ports don't use PFC/DSCP/DCQCN (IB has its own
+credit-based flow control managed by the fabric SM) — steps 2/3 only run
+against Ethernet/RoCE ports, and are skipped entirely if IB ports outnumber
+RoCE ports (RoCE treated as an incidental management NIC). Steps 1/4/5/6 still
+cover every mlx5 device.
+
+> **Step 4 still probes incidental RoCE/management ports**, unlike 2/3 — the
+> full-mesh test tries every pair regardless, so a management NIC (e.g.
+> `mlx5_8`) on a separate Ethernet fabric shows unreachable (`✗`) against
+> every IB device both ways: `[WARN] intra-node BW: N/72 unreachable` where
+> `N = 2 × incidental_ports × fabric_ports`. Expected, not a fabric problem —
+> confirm the `✗` cells are only that port's row/column.
 
 If any step shows `[FAIL]`:
 
-- Run `mori setup` to auto-apply recommended QoS/PFC/DCQCN settings:
-  ```bash
-  sudo docker exec $CONTAINER_NAME bash -c "mori setup"
-  ```
-  Note: env vars (`MORI_RDMA_SL`/`TC`) do **not** persist in the calling shell. To export them, use `source $(mori setup --path)` instead.
+- `sudo docker exec $CONTAINER_NAME bash -c "mori setup"` auto-applies
+  QoS/PFC/DCQCN (ionic/bnxt only — on mlx5, fix manually per 3c then re-run
+  `mori check`). Env vars don't persist in the calling shell; use
+  `source $(mori setup --path)` to export them.
+- Still failing: `sudo docker exec $CONTAINER_NAME bash -c "mori diagnose"`.
 
-- If the issue persists, run `mori diagnose` for deeper diagnostics:
-  ```bash
-  sudo docker exec $CONTAINER_NAME bash -c "mori diagnose"
-  ```
+### mlx5 hardware faults (CQ errors / firmware health)
+
+`dmesg` repeating `cq_err_event_notifier: CQ error ..., syndrome 0x2`
+(LOCAL_QP_OP_ERR) or `poll_health: device's health compromised` means the
+card's *firmware* faulted. `mlxfwreset -d <mst_device> q` will likely show
+only `4: Warm Reboot` supported — a host reboot is the only recovery path.
+
+> **Caveat (hit on this box):** an OS-level `reboot` fixed the mlx5 fault but
+> left every GPU on the same baseboard (AMD MI300/Aqua Vanjaram) failing to
+> probe (`amdgpu: get invalid ip discovery binary signature`, all GPUs at
+> once) — a warm reboot doesn't fully power-cycle the GPU baseboard's PSP.
+> Neither `modprobe -r/+ amdgpu` nor per-device PCIe reset
+> (`echo 1 > /sys/bus/pci/devices/0000:XX:00.0/reset`) fixed it; only a real
+> BMC power cycle did: `sudo ipmitool chassis power cycle`. This is far more
+> disruptive than `reboot` (drops every user's session on a shared host) —
+> confirm no one else needs the box, or escalate to the hardware owner instead.
 
 ---
 
 ## Done — Report Back
 
 - Base image and OS
-- NIC library installed (`libionic` / `libbnxt_re` / none)
+- NIC library installed (`libionic` / `libbnxt_re` / mlx5 inbox `libmlx5` + optional `mlnx-tools`/MFT / none)
 - Install mode: source (`pip install .`)
 - GPU arch and NIC type as reported by MORI
 - Kernels: JIT on first use (`~/.mori/jit/`)
