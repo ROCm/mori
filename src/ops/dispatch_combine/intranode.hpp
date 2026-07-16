@@ -610,7 +610,9 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                                               validAccumCount, laneId, hiddenDimSize);
     } else {
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
-      core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
+      // 16B vec load + load-first/unroll gather (v2-style): keep AccumNum*Unroll
+      // remote peer reads in flight to hide CCO/xGMI latency (gfx1250 combine).
+      core::WarpAccumLF<T, 16>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
     }
 
     if constexpr (UseWeights) {
