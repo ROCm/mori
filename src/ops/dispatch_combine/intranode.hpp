@@ -153,20 +153,25 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
           continue;
         }
 
-        if (laneId == 0) {
-          // decide token id in dest pe
-          destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-          assert(destTokId < config.MaxNumTokensToRecv() &&
-                 "Total recv token overflow: increase maxTotalRecvTokens");
-          atomicAdd(args.destPeTokenCounter + destPe, 1);
-          // In dispDestTokIdMap, record the destination slot for this token-expert pair (flat index
-          // into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE, record
-          // which global source token occupies this slot (for combine-phase routing)
-          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-              FlatTokenIndex(config, myPe, srcTokId);
+        {
+          // Fine-grained timing: slot assignment = remote returning atomic on
+          // dispTokOffset[destPe] + the two remote metadata writes.
+          MORI_TRACE_SPAN(profiler, Slot::DispSlotAssign);
+          if (laneId == 0) {
+            // decide token id in dest pe
+            destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+            assert(destTokId < config.MaxNumTokensToRecv() &&
+                   "Total recv token overflow: increase maxTotalRecvTokens");
+            atomicAdd(args.destPeTokenCounter + destPe, 1);
+            // In dispDestTokIdMap, record the destination slot for this token-expert pair (flat
+            // index into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE,
+            // record which global source token occupies this slot (for combine-phase routing)
+            args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
+            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+                FlatTokenIndex(config, myPe, srcTokId);
+          }
+          destTokId = __shfl(destTokId, 0);
         }
-        destTokId = __shfl(destTokId, 0);
       } else {
         // Replay routing: caller already supplied a populated dispDestTokIdMap
         // from a matching cache-routing dispatch. Recover (destPe, destTokId) directly
@@ -192,15 +197,18 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
 
       // Write weights and indices
-      if (laneId < config.numExpertPerToken) {
-        if (args.weightsBuf) {
-          args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
+      {
+        MORI_TRACE_SPAN(profiler, Slot::DispWriteMeta);
+        if (laneId < config.numExpertPerToken) {
+          if (args.weightsBuf) {
+            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
+                destPe)[destTokId * config.numExpertPerToken + laneId] =
+                args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+          }
+          args.shmemOutIndicesMemObj->template GetAs<index_t*>(
               destPe)[destTokId * config.numExpertPerToken + laneId] =
-              args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+              args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
         }
-        args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-            destPe)[destTokId * config.numExpertPerToken + laneId] =
-            args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
       }
 
       // Write scales
@@ -215,8 +223,13 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       size_t srcTokOffset = srcTokId * hiddenDim;
       size_t destTokOffset = destTokId * hiddenDim;
 
-      core::WarpCopy(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-                     args.inpTokenBuf + srcTokOffset, hiddenDim);
+      {
+        // Fine-grained timing: the actual hidden-dim payload WarpCopy to the
+        // destination PE (the bulk P2P write).
+        MORI_TRACE_SPAN(profiler, Slot::DispTokenCopy);
+        core::WarpCopy(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
+                       args.inpTokenBuf + srcTokOffset, hiddenDim);
+      }
     }
   }
   __syncthreads();
