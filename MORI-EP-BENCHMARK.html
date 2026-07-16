@@ -1,0 +1,840 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MORI-EP Benchmark &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="MORI-IO Benchmark" href="MORI-IO-BENCHMARK.html" />
+    <link rel="prev" title="MORI-VIZ (Visualizer)" href="PROFILER.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning">10. Tuning</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#overview">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-config-files">Tuning Config Files</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node-tuning">Intra-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node-tuning">Inter-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-on-a-new-gpu-platform">Tuning on a New GPU Platform</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">11. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">12. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">MORI CCO Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#communicator-ccocomm">Communicator (<code class="docutils literal notranslate"><span class="pre">ccoComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#symmetric-memory-and-windows">Symmetric memory and windows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator-ccodevcomm">Device communicator (<code class="docutils literal notranslate"><span class="pre">ccoDevComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#teams">Teams</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#initialization">2. Initialization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#memory-and-windows">3. Memory and Windows</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator">4. Device Communicator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#host-barrier">5. Host Barrier</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-side-programming">6. Device-Side Programming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#c-api">8. C++ API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#environment-variables">9. Environment Variables</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="current reference internal" href="#">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#intra-node">Intra-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#profiling-intranode-kernels">Profiling intranode kernels</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#inter-node">Inter-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#nic-selection">NIC Selection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#bandwidth-computation">Bandwidth Computation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#rdma-bandwidth">RDMA bandwidth</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#algo-bw-vs-physical-bw">Algo BW vs Physical BW</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#nvl-xgmi-bandwidth">NVL / XGMI bandwidth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#why-deepep-and-mori-rdma-token-counts-are-equivalent">Why DeepEP and Mori RDMA token counts are equivalent</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#combine">Combine</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#reference-print-bw-values-py">Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#profiling-internode-kernels">Profiling Internode Kernels</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-commands">Benchmark Commands</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#fabric-cross-node-scale-up-ualink-super-node">Fabric (cross-node scale-up UALink super-node)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP Master Client</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#starting-the-master-server">Starting the Master Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbptiertype">UMBPTierType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvnodematch">UMBPExternalKvNodeMatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpmasterclient">UMBPMasterClient</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#cache-hit-tracking">Cache Hit Tracking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#finding-hot-kv-blocks-the-typical-workflow">Finding hot KV blocks (the typical workflow)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#lifetime-cumulative-not-a-rate">Lifetime cumulative — not a rate</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvhitcountentry">UMBPExternalKvHitCountEntry</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#usage-examples">Usage Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#end-to-end-example">End-to-End Example</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">MORI-EP Benchmark</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/MORI-EP-BENCHMARK.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="mori-ep-benchmark">
+<h1>MORI-EP Benchmark<a class="headerlink" href="#mori-ep-benchmark" title="Link to this heading"></a></h1>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#intra-node"><span class="xref myst">Intra-node</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#profiling-intranode-kernels"><span class="xref myst">Profiling intranode kernels</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#inter-node"><span class="xref myst">Inter-node</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#nic-selection"><span class="xref myst">NIC Selection</span></a></p></li>
+<li><p><a class="reference internal" href="#bandwidth-computation"><span class="xref myst">Bandwidth Computation</span></a></p></li>
+<li><p><a class="reference internal" href="#profiling-internode-kernels"><span class="xref myst">Profiling Internode Kernels</span></a></p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="intra-node">
+<h2>Intra-node<a class="headerlink" href="#intra-node" title="Link to this heading"></a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/path/to/mori
+<span class="nb">export</span><span class="w"> </span><span class="nv">PYTHONPATH</span><span class="o">=</span>/path/to/mori:<span class="nv">$PYTHONPATH</span>
+
+<span class="c1"># Benchmark performance</span>
+python3<span class="w"> </span>tests/python/ops/bench_dispatch_combine.py
+</pre></div>
+</div>
+<section id="profiling-intranode-kernels">
+<h3>Profiling intranode kernels<a class="headerlink" href="#profiling-intranode-kernels" title="Link to this heading"></a></h3>
+<p><strong>1. Build with profiler enabled</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">ENABLE_PROFILER</span><span class="o">=</span>ON<span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.<span class="w"> </span>--no-build-isolation<span class="w"> </span>-v
+</pre></div>
+</div>
+<p><strong>2. Clear the JIT cache</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rm<span class="w"> </span>-rf<span class="w"> </span>~/.mori
+</pre></div>
+</div>
+<p><strong>3. Run the profiling job</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">ENABLE_PROFILER</span><span class="o">=</span>ON
+
+torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">1</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/ops/bench_dispatch_combine.py<span class="w"> </span>--cmd<span class="w"> </span>profile
+</pre></div>
+</div>
+<p>Traces land as <code class="docutils literal notranslate"><span class="pre">trace_intranode_rank&lt;rank&gt;_&lt;timestamp&gt;.json</span></code> in the current working directory — one file per rank.  Open them in <a class="reference external" href="https://ui.perfetto.dev">Perfetto UI</a> or analyze with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code> as described in the <a class="reference internal" href="#profiling-ep-kernels"><span class="xref myst">Profiling EP Kernels</span></a> section.</p>
+</section>
+</section>
+<section id="inter-node">
+<h2>Inter-node<a class="headerlink" href="#inter-node" title="Link to this heading"></a></h2>
+<p>Run the following command on each node and replace <code class="docutils literal notranslate"><span class="pre">node_rank</span></code> with its actual rank. <code class="docutils literal notranslate"><span class="pre">master_addr</span></code> should be the hostname or IP of the rank 0 node. <code class="docutils literal notranslate"><span class="pre">GLOO_SOCKET_IFNAME</span></code> should be set to the TCP socket interface you want to use.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">GLOO_SOCKET_IFNAME</span><span class="o">=</span>enp81s0f1
+<span class="nb">export</span><span class="w"> </span><span class="nv">MORI_RDMA_DEVICES</span><span class="o">=</span>^mlx5_0,mlx5_1<span class="w">  </span><span class="c1"># Optional: use `^` prefix to exclude specified devices</span>
+
+torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.129.65&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>examples/ops/dispatch_combine/test_dispatch_combine_internode.py<span class="w"> </span>--bench
+</pre></div>
+</div>
+<p>The output includes total number of tokens received, total number of RDMA tokens received, and total bandwidth (XGMI + RDMA combined). To calculate RDMA-only bandwidth:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>RDMA BW = Total BW × (RDMA tokens / Total tokens)
+</pre></div>
+</div>
+<section id="nic-selection">
+<h3>NIC Selection<a class="headerlink" href="#nic-selection" title="Link to this heading"></a></h3>
+<p>For RoCE networks, you can specify which RDMA devices to use with the <code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES</span></code> environment variable:</p>
+<ul class="simple">
+<li><p><strong>Include specific devices</strong>: <code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES=mlx5_0,mlx5_1</span></code></p></li>
+<li><p><strong>Exclude devices</strong>: <code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES=^mlx5_2,mlx5_3</span></code> (use <code class="docutils literal notranslate"><span class="pre">^</span></code> prefix to exclude specified devices)</p></li>
+<li><p><strong>Default</strong>: If not set, all available RDMA devices will be used</p></li>
+</ul>
+</section>
+<section id="bandwidth-computation">
+<h3>Bandwidth Computation<a class="headerlink" href="#bandwidth-computation" title="Link to this heading"></a></h3>
+<p>Two fabrics are measured: <strong>RDMA</strong> (inter-node) and <strong>NVL/XGMI</strong> (intra-node).</p>
+</section>
+<hr class="docutils" />
+<section id="rdma-bandwidth">
+<h3>RDMA bandwidth<a class="headerlink" href="#rdma-bandwidth" title="Link to this heading"></a></h3>
+<p><strong>What it measures:</strong> For each token, count how many distinct nodes it needs to be sent to. Multiply that total count by the token size to get the bytes transferred over the inter-node network.</p>
+<section id="algo-bw-vs-physical-bw">
+<h4>Algo BW vs Physical BW<a class="headerlink" href="#algo-bw-vs-physical-bw" title="Link to this heading"></a></h4>
+<p>The kernel allocates buffer slots for <strong>all</strong> destination nodes including the local node, so the “algo” token count includes local-node destinations even though those bytes never actually travel over RDMA (they go over NVLink/XGMI instead). The “physical” count excludes the local node:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>physical_tokens = algo_tokens × (num_nodes - 1) / num_nodes
+physical_bw     = algo_bw     × (num_nodes - 1) / num_nodes
+</pre></div>
+</div>
+<p>Both DeepEP and Mori report the <strong>algo</strong> figure. The physical figure is <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code>’s <code class="docutils literal notranslate"><span class="pre">num_rdma_token_sent</span> <span class="pre">(physical)</span></code>.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>DeepEP</p></th>
+<th class="head"><p>Mori</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>Token count</strong></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">num_rdma_token_sent</span> <span class="pre">=</span> <span class="pre">rdma_idx.ne(-1).sum()</span></code> where <code class="docutils literal notranslate"><span class="pre">rdma_idx</span> <span class="pre">=</span> <span class="pre">topk_idx</span> <span class="pre">//</span> <span class="pre">(num_experts</span> <span class="pre">//</span> <span class="pre">num_nodes)</span></code>, deduplicated per token</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">total_rdma_recv_num_token</span> <span class="pre">=</span> <span class="pre">compute_rdma_algo_token_count(topk_idx,</span> <span class="pre">...)</span></code> — same logic, vectorised with <code class="docutils literal notranslate"><span class="pre">scatter_</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>Bytes</strong></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">num_rdma_token_sent</span> <span class="pre">×</span> <span class="pre">hidden</span> <span class="pre">×</span> <span class="pre">2</span></code> (BF16)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">total_rdma_recv_num_token</span> <span class="pre">×</span> <span class="pre">hidden_dim</span> <span class="pre">×</span> <span class="pre">element_size</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><strong>BW</strong></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rdma_bytes</span> <span class="pre">/</span> <span class="pre">1e9</span> <span class="pre">/</span> <span class="pre">t</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rdma_bytes</span> <span class="pre">/</span> <span class="pre">1000³</span> <span class="pre">/</span> <span class="pre">(t_ms</span> <span class="pre">/</span> <span class="pre">1000)</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<hr class="docutils" />
+<section id="nvl-xgmi-bandwidth">
+<h3>NVL / XGMI bandwidth<a class="headerlink" href="#nvl-xgmi-bandwidth" title="Link to this heading"></a></h3>
+<p><strong>What it measures:</strong> The number of tokens this rank actually received (from peers on the same node and forwarded from other nodes), multiplied by the token size. This reflects real data landed in local GPU memory via the intra-node fabric.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>DeepEP</p></th>
+<th class="head"><p>Mori</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>Token count</strong></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">recv_x.numel()</span> <span class="pre">/</span> <span class="pre">hidden</span></code> — size of the received tensor after dispatch</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">total_recv_num_token</span></code> from <code class="docutils literal notranslate"><span class="pre">dispatch_recv_num_token[0]</span></code> returned by the kernel</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>Bytes</strong></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">recv_x.numel()</span> <span class="pre">×</span> <span class="pre">2</span></code> (BF16)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">total_recv_num_token</span> <span class="pre">×</span> <span class="pre">hidden_dim</span> <span class="pre">×</span> <span class="pre">element_size</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><strong>BW</strong></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nvl_bytes</span> <span class="pre">/</span> <span class="pre">1e9</span> <span class="pre">/</span> <span class="pre">t</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nvl_bytes</span> <span class="pre">/</span> <span class="pre">1000³</span> <span class="pre">/</span> <span class="pre">(t_ms</span> <span class="pre">/</span> <span class="pre">1000)</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="why-deepep-and-mori-rdma-token-counts-are-equivalent">
+<h3>Why DeepEP and Mori RDMA token counts are equivalent<a class="headerlink" href="#why-deepep-and-mori-rdma-token-counts-are-equivalent" title="Link to this heading"></a></h3>
+<p>Both compute the same quantity — unique <code class="docutils literal notranslate"><span class="pre">(token,</span> <span class="pre">destination-node)</span></code> pairs — just with different data structures.</p>
+<p><strong>Step 1: same divisor.</strong>
+Both map an expert ID to a node ID by dividing by the number of experts per node:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>DeepEP: rdma_idx  = topk_idx // (num_experts // num_nodes)
+Mori:   node_idx  = topk_idx // (num_experts_per_rank × gpu_per_node)
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">num_experts</span> <span class="pre">//</span> <span class="pre">num_nodes</span></code> and <code class="docutils literal notranslate"><span class="pre">num_experts_per_rank</span> <span class="pre">×</span> <span class="pre">gpu_per_node</span></code> are identical — both equal experts per node.</p>
+<p><strong>Step 2: same deduplication.</strong>
+Each token can map to the same node via multiple expert slots; both implementations collapse those duplicates:</p>
+<ul class="simple">
+<li><p>DeepEP: <code class="docutils literal notranslate"><span class="pre">inplace_unique(rdma_idx,</span> <span class="pre">num_nodes)</span></code> rewrites each token row in-place, replacing duplicates with -1.</p></li>
+<li><p>Mori: <code class="docutils literal notranslate"><span class="pre">node_presence.scatter_(1,</span> <span class="pre">node_idx,</span> <span class="pre">True)</span></code> writes into a <code class="docutils literal notranslate"><span class="pre">[T,</span> <span class="pre">num_nodes]</span></code> boolean matrix, so hitting the same node twice is a no-op.</p></li>
+</ul>
+<p>Both produce exactly the set of unique nodes visited by each token.</p>
+<p><strong>Step 3: same counting.</strong></p>
+<ul class="simple">
+<li><p>DeepEP: <code class="docutils literal notranslate"><span class="pre">rdma_idx.ne(-1).sum()</span></code> counts non-empty slots in the deduped rows.</p></li>
+<li><p>Mori: <code class="docutils literal notranslate"><span class="pre">node_presence.sum()</span></code> counts <code class="docutils literal notranslate"><span class="pre">True</span></code> entries in the boolean matrix.</p></li>
+</ul>
+<p>The results are identical.</p>
+<p><strong>Step 4: validate by program.</strong></p>
+<p>Run each tool and compare the RDMA token count for the same configuration.</p>
+<p><em>DeepEP</em> — use <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code>, which prints both algo and physical counts per rank. Note: this script replicates DeepEP’s data generation and token-count logic exactly (mirroring <code class="docutils literal notranslate"><span class="pre">test_internode.py</span></code>) so the numbers are directly comparable. The full script is listed in the <a class="reference internal" href="#reference-print_bw_valuespy"><span class="xref myst">Reference section</span></a> at the bottom of this document.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">python</span> <span class="n">DeepEP</span><span class="o">/</span><span class="n">tests</span><span class="o">/</span><span class="n">print_bw_values</span><span class="o">.</span><span class="n">py</span> <span class="o">--</span><span class="n">num</span><span class="o">-</span><span class="n">nodes</span> <span class="mi">2</span> <span class="o">--</span><span class="n">gpu</span><span class="o">-</span><span class="n">per</span><span class="o">-</span><span class="n">node</span> <span class="mi">8</span> <span class="o">--</span><span class="n">num</span><span class="o">-</span><span class="n">tokens</span> <span class="mi">4096</span> \
+       <span class="o">--</span><span class="n">hidden</span> <span class="mi">7168</span> <span class="o">--</span><span class="n">num</span><span class="o">-</span><span class="n">experts</span> <span class="mi">256</span> <span class="o">--</span><span class="n">num</span><span class="o">-</span><span class="n">topk</span> <span class="mi">8</span>
+</pre></div>
+</div>
+<p>Look for the line:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>  num_rdma_token_sent (algo)    = 8166  (all node-destinations incl. local — matches original)
+</pre></div>
+</div>
+<p><em>Mori</em> — run the bench script with <code class="docutils literal notranslate"><span class="pre">--cmd</span> <span class="pre">bench</span></code>:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">torchrun</span> <span class="o">--</span><span class="n">nnodes</span><span class="o">=</span><span class="mi">2</span> <span class="o">--</span><span class="n">node_rank</span><span class="o">=</span><span class="mi">0</span> <span class="o">--</span><span class="n">nproc_per_node</span><span class="o">=</span><span class="mi">8</span> <span class="o">...</span> \
+    <span class="n">test_dispatch_combine_internode</span><span class="o">.</span><span class="n">py</span> <span class="o">--</span><span class="nb">max</span><span class="o">-</span><span class="n">tokens</span> <span class="mi">128</span> <span class="o">--</span><span class="n">cmd</span> <span class="n">bench</span>
+</pre></div>
+</div>
+<p>Look for the line printed by <code class="docutils literal notranslate"><span class="pre">run_bench_once</span></code> (line 770):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">rank</span> <span class="mi">8</span> <span class="n">recv</span> <span class="mi">26757</span> <span class="n">tokens</span> <span class="mi">8166</span> <span class="n">rdma</span> <span class="n">tokens</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">8166</span> <span class="pre">rdma</span> <span class="pre">tokens</span></code> value is the algo RDMA token count and should match the DeepEP figure for the same routing configuration.</p>
+</section>
+<hr class="docutils" />
+<section id="combine">
+<h3>Combine<a class="headerlink" href="#combine" title="Link to this heading"></a></h3>
+<p>Combine is symmetric to dispatch — same byte counts, reversed direction:</p>
+<ul class="simple">
+<li><p>RDMA recv bytes = dispatch RDMA send bytes</p></li>
+<li><p>NVL/XGMI send bytes = dispatch NVL/XGMI recv bytes</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="reference-print-bw-values-py">
+<h3>Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code><a class="headerlink" href="#reference-print-bw-values-py" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">Standalone script to print DeepEP internode bandwidth-related values</span>
+<span class="sd">without running any deep_ep kernels.</span>
+
+<span class="sd">Mirrors the routing logic of test_internode.py and computes:</span>
+<span class="sd">  - num_rdma_token_sent  (= rdma_idx.ne(-1).sum())</span>
+<span class="sd">  - recv_x_numel         (= gbl_num_tokens_per_rank[rank] * hidden)</span>
+<span class="sd">  - dispatch RDMA bytes / NVL bytes</span>
+<span class="sd">  - combine RDMA bytes / NVL bytes</span>
+<span class="sd">  - fp8-adjusted variants</span>
+
+<span class="sd">Uses gloo (CPU) backend so any number of logical ranks can be simulated</span>
+<span class="sd">on however many physical GPUs are available.</span>
+
+<span class="sd">Usage:</span>
+<span class="sd">  python print_bw_values.py [--num-nodes N] [--gpu-per-node G]</span>
+<span class="sd">                            [--num-tokens T] [--hidden H]</span>
+<span class="sd">                            [--num-experts E] [--num-topk K]</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">inplace_unique</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">num_slots</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+    <span class="c1"># Exact copy of DeepEP/tests/utils.py — device=x.device preserved</span>
+    <span class="k">assert</span> <span class="n">x</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">2</span>
+    <span class="n">mask</span> <span class="o">=</span> <span class="n">x</span> <span class="o">&lt;</span> <span class="mi">0</span>
+    <span class="n">x_padded</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">num_slots</span><span class="p">)</span>
+    <span class="n">bin_count</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="n">x</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">num_slots</span> <span class="o">+</span> <span class="mi">1</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">x</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">bin_count</span><span class="o">.</span><span class="n">scatter_add_</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">x_padded</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones_like</span><span class="p">(</span><span class="n">x_padded</span><span class="p">))</span>
+    <span class="n">bin_count</span> <span class="o">=</span> <span class="n">bin_count</span><span class="p">[:,</span> <span class="p">:</span><span class="n">num_slots</span><span class="p">]</span>
+    <span class="n">sorted_bin_count</span><span class="p">,</span> <span class="n">sorted_bin_idx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sort</span><span class="p">(</span><span class="n">bin_count</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">descending</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">sorted_bin_idx</span><span class="o">.</span><span class="n">masked_fill_</span><span class="p">(</span><span class="n">sorted_bin_count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">sorted_bin_idx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sort</span><span class="p">(</span><span class="n">sorted_bin_idx</span><span class="p">,</span> <span class="n">descending</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">values</span>
+    <span class="n">x</span><span class="p">[:,</span> <span class="p">:]</span><span class="o">.</span><span class="n">fill_</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">valid_len</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">num_slots</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">1</span><span class="p">))</span>
+    <span class="n">x</span><span class="p">[:,</span> <span class="p">:</span><span class="n">valid_len</span><span class="p">]</span> <span class="o">=</span> <span class="n">sorted_bin_idx</span><span class="p">[:,</span> <span class="p">:</span><span class="n">valid_len</span><span class="p">]</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">create_grouped_scores</span><span class="p">(</span><span class="n">scores</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">group_idx</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">num_groups</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+    <span class="c1"># Exact copy of DeepEP/tests/utils.py</span>
+    <span class="n">num_tokens</span><span class="p">,</span> <span class="n">num_experts</span> <span class="o">=</span> <span class="n">scores</span><span class="o">.</span><span class="n">shape</span>
+    <span class="n">scores</span> <span class="o">=</span> <span class="n">scores</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">num_groups</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">num_groups</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">scores</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">mask</span> <span class="o">=</span> <span class="n">mask</span><span class="o">.</span><span class="n">scatter_</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">group_idx</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">expand_as</span><span class="p">(</span><span class="n">scores</span><span class="p">)</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">scores</span> <span class="o">*</span> <span class="n">mask</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">num_experts</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">worker</span><span class="p">(</span><span class="n">local_rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_processes</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">args</span><span class="p">:</span> <span class="n">argparse</span><span class="o">.</span><span class="n">Namespace</span><span class="p">):</span>
+    <span class="n">rank</span>         <span class="o">=</span> <span class="n">local_rank</span>
+    <span class="n">world_size</span>   <span class="o">=</span> <span class="n">num_processes</span>
+    <span class="n">num_nodes</span>    <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">num_nodes</span>
+    <span class="n">gpu_per_node</span> <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">gpu_per_node</span>
+    <span class="k">assert</span> <span class="n">world_size</span> <span class="o">==</span> <span class="n">num_nodes</span> <span class="o">*</span> <span class="n">gpu_per_node</span>
+
+    <span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span>
+        <span class="n">backend</span><span class="o">=</span><span class="s1">&#39;gloo&#39;</span><span class="p">,</span>        <span class="c1"># CPU-only; no NCCL needed, no GPU conflicts</span>
+        <span class="n">init_method</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;tcp://127.0.0.1:</span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">port</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
+        <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span>
+        <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">num_tokens</span>      <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">num_tokens</span>
+    <span class="n">hidden</span>          <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">hidden</span>
+    <span class="n">num_experts</span>     <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">num_experts</span>
+    <span class="n">num_topk</span>        <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">num_topk</span>
+    <span class="n">num_ranks</span>       <span class="o">=</span> <span class="n">world_size</span>
+    <span class="n">num_topk_groups</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">num_nodes</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span>
+
+    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
+
+    <span class="c1"># ---- Mirror test_internode.py &quot;Random data&quot; block exactly ------------</span>
+    <span class="c1"># Original line 36: x_pure_rand is generated BEFORE scores, advancing RNG.</span>
+    <span class="c1"># We replicate this so scores sees the same RNG state as in the original.</span>
+    <span class="n">_</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">((</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">hidden</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>   <span class="c1"># matches x_pure_rand</span>
+    <span class="c1"># Original line 40:</span>
+    <span class="n">scores</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">((</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">num_experts</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span> <span class="o">+</span> <span class="mi">1</span>
+    <span class="c1"># Original line 41:</span>
+    <span class="n">group_scores</span> <span class="o">=</span> <span class="n">scores</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">num_nodes</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">amax</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="c1"># Original line 42:</span>
+    <span class="n">group_idx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="n">group_scores</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">num_topk_groups</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="nb">sorted</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span><span class="o">.</span><span class="n">indices</span>
+    <span class="c1"># Original line 43:</span>
+    <span class="n">masked_scores</span> <span class="o">=</span> <span class="n">create_grouped_scores</span><span class="p">(</span><span class="n">scores</span><span class="p">,</span> <span class="n">group_idx</span><span class="p">,</span> <span class="n">num_nodes</span><span class="p">)</span>
+    <span class="c1"># Original line 44:</span>
+    <span class="n">topk_idx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="n">masked_scores</span><span class="p">,</span> <span class="n">num_topk</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">largest</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="nb">sorted</span><span class="o">=</span><span class="kc">False</span><span class="p">)[</span><span class="mi">1</span><span class="p">]</span>
+    <span class="c1"># Original line 45: deep_ep.topk_idx_t == torch.int64 (TOPK_IDX_BITS=64 by default)</span>
+    <span class="n">topk_idx</span> <span class="o">=</span> <span class="n">topk_idx</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+
+    <span class="c1"># ---- Mirror test_internode.py lines 48-54 ----------------------------</span>
+    <span class="c1"># Original line 48: rank_idx = topk_idx // (num_experts // num_ranks)</span>
+    <span class="n">rank_idx</span> <span class="o">=</span> <span class="n">topk_idx</span> <span class="o">//</span> <span class="p">(</span><span class="n">num_experts</span> <span class="o">//</span> <span class="n">num_ranks</span><span class="p">)</span>
+    <span class="c1"># Original line 49: rank_idx = rank_idx.to(torch.int64)  (no-op: already int64)</span>
+    <span class="n">rank_idx</span> <span class="o">=</span> <span class="n">rank_idx</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+    <span class="c1"># Original line 50:</span>
+    <span class="n">rank_idx</span><span class="o">.</span><span class="n">masked_fill_</span><span class="p">(</span><span class="n">topk_idx</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="c1"># Original line 51:</span>
+    <span class="n">inplace_unique</span><span class="p">(</span><span class="n">rank_idx</span><span class="p">,</span> <span class="n">num_ranks</span><span class="p">)</span>
+    <span class="c1"># Original line 52: rdma_rank_idx = rank_idx // num_local_ranks</span>
+    <span class="n">rdma_rank_idx</span> <span class="o">=</span> <span class="n">rank_idx</span> <span class="o">//</span> <span class="n">gpu_per_node</span>
+    <span class="c1"># Original line 53:</span>
+    <span class="n">rdma_rank_idx</span><span class="o">.</span><span class="n">masked_fill_</span><span class="p">(</span><span class="n">rank_idx</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="c1"># Original line 54:</span>
+    <span class="n">inplace_unique</span><span class="p">(</span><span class="n">rdma_rank_idx</span><span class="p">,</span> <span class="n">num_nodes</span><span class="p">)</span>
+
+    <span class="c1"># ---- Mirror test_internode.py lines 58-61 (RDMA dispatch counts) -----</span>
+    <span class="c1"># Original line 58: rdma_idx = topk_idx // (num_experts // num_nodes)</span>
+    <span class="n">rdma_idx</span> <span class="o">=</span> <span class="n">topk_idx</span> <span class="o">//</span> <span class="p">(</span><span class="n">num_experts</span> <span class="o">//</span> <span class="n">num_nodes</span><span class="p">)</span>
+    <span class="c1"># Original line 59:</span>
+    <span class="n">rdma_idx</span><span class="o">.</span><span class="n">masked_fill_</span><span class="p">(</span><span class="n">topk_idx</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="c1"># Original line 60:</span>
+    <span class="n">inplace_unique</span><span class="p">(</span><span class="n">rdma_idx</span><span class="p">,</span> <span class="n">num_nodes</span><span class="p">)</span>
+    <span class="c1"># Original line 61: counts ALL (token, node) pairs including local node</span>
+    <span class="n">num_rdma_token_sent</span> <span class="o">=</span> <span class="n">rdma_idx</span><span class="o">.</span><span class="n">ne</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+
+    <span class="c1"># Physical cross-node count (not in original; added for comparison)</span>
+    <span class="n">my_node</span> <span class="o">=</span> <span class="n">rank</span> <span class="o">//</span> <span class="n">gpu_per_node</span>
+    <span class="n">rdma_idx_cross</span> <span class="o">=</span> <span class="n">rdma_idx</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+    <span class="n">rdma_idx_cross</span><span class="o">.</span><span class="n">masked_fill_</span><span class="p">(</span><span class="n">rdma_idx_cross</span> <span class="o">==</span> <span class="n">my_node</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">num_rdma_token_sent_physical</span> <span class="o">=</span> <span class="n">rdma_idx_cross</span><span class="o">.</span><span class="n">ne</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+
+    <span class="c1"># ---- Mirror test_internode.py lines 71-86 (rank layout meta) ---------</span>
+    <span class="c1"># Original line 71: num_tokens_per_rank = torch.empty((num_ranks,), dtype=torch.int, ...)</span>
+    <span class="n">num_tokens_per_rank</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">((</span><span class="n">num_ranks</span><span class="p">,),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int</span><span class="p">)</span>
+    <span class="c1"># Original lines 74-75:</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_ranks</span><span class="p">):</span>
+        <span class="n">num_tokens_per_rank</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">rank_idx</span> <span class="o">==</span> <span class="n">i</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+    <span class="c1"># Original line 85:</span>
+    <span class="n">gbl_num_tokens_per_rank</span> <span class="o">=</span> <span class="n">num_tokens_per_rank</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+    <span class="c1"># Original line 86:</span>
+    <span class="n">dist</span><span class="o">.</span><span class="n">all_reduce</span><span class="p">(</span><span class="n">gbl_num_tokens_per_rank</span><span class="p">)</span>
+
+    <span class="n">recv_num_tokens</span> <span class="o">=</span> <span class="n">gbl_num_tokens_per_rank</span><span class="p">[</span><span class="n">rank</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+    <span class="n">recv_x_numel</span>    <span class="o">=</span> <span class="n">recv_num_tokens</span> <span class="o">*</span> <span class="n">hidden</span>
+
+    <span class="c1"># byte counts</span>
+    <span class="n">dispatch_bf16_rdma_send_bytes</span> <span class="o">=</span> <span class="n">num_rdma_token_sent</span> <span class="o">*</span> <span class="n">hidden</span> <span class="o">*</span> <span class="mi">2</span>
+    <span class="n">dispatch_bf16_nvl_recv_bytes</span>  <span class="o">=</span> <span class="n">recv_x_numel</span> <span class="o">*</span> <span class="mi">2</span>
+    <span class="n">combine_bf16_nvl_send_bytes</span>   <span class="o">=</span> <span class="n">dispatch_bf16_nvl_recv_bytes</span>
+    <span class="n">combine_bf16_rdma_recv_bytes</span>  <span class="o">=</span> <span class="n">dispatch_bf16_rdma_send_bytes</span>
+
+    <span class="n">fp8_factor</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">+</span> <span class="mi">4</span> <span class="o">/</span> <span class="mi">128</span><span class="p">)</span> <span class="o">/</span> <span class="mi">2</span>
+    <span class="n">dispatch_fp8_rdma_send_bytes</span> <span class="o">=</span> <span class="n">dispatch_bf16_rdma_send_bytes</span> <span class="o">*</span> <span class="n">fp8_factor</span>
+    <span class="n">dispatch_fp8_nvl_recv_bytes</span>  <span class="o">=</span> <span class="n">dispatch_bf16_nvl_recv_bytes</span>  <span class="o">*</span> <span class="n">fp8_factor</span>
+
+    <span class="n">dist</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_ranks</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="n">r</span><span class="p">:</span>
+            <span class="n">node</span> <span class="o">=</span> <span class="n">rank</span> <span class="o">//</span> <span class="n">gpu_per_node</span>
+            <span class="n">gpu</span>  <span class="o">=</span> <span class="n">rank</span> <span class="o">%</span>  <span class="n">gpu_per_node</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[rank </span><span class="si">{</span><span class="n">rank</span><span class="si">:</span><span class="s2">2d</span><span class="si">}</span><span class="s2">  node=</span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2"> gpu=</span><span class="si">{</span><span class="n">gpu</span><span class="si">}</span><span class="s2">]&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  num_tokens sent               = </span><span class="si">{</span><span class="n">num_tokens</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  recv_num_tokens               = </span><span class="si">{</span><span class="n">recv_num_tokens</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  recv_x_numel                  = </span><span class="si">{</span><span class="n">recv_x_numel</span><span class="si">:</span><span class="s2">,</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">recv_x_numel</span><span class="o">*</span><span class="mi">2</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2"> GB BF16)&quot;</span><span class="p">)</span>
+            <span class="n">phys_ratio</span> <span class="o">=</span> <span class="n">num_rdma_token_sent_physical</span> <span class="o">/</span> <span class="n">num_rdma_token_sent</span> <span class="k">if</span> <span class="n">num_rdma_token_sent</span> <span class="k">else</span> <span class="mi">0</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  num_rdma_token_sent (algo)    = </span><span class="si">{</span><span class="n">num_rdma_token_sent</span><span class="si">}</span><span class="s2">  (all node-destinations incl. local — matches original)&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  num_rdma_token_sent (physical)= </span><span class="si">{</span><span class="n">num_rdma_token_sent_physical</span><span class="si">}</span><span class="s2">  (cross-node only, ratio=</span><span class="si">{</span><span class="n">phys_ratio</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  -- BF16 algorithm bandwidth bytes (as reported by original) --&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  dispatch RDMA send (algo)     = </span><span class="si">{</span><span class="n">dispatch_bf16_rdma_send_bytes</span><span class="si">:</span><span class="s2">&gt;14,</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">dispatch_bf16_rdma_send_bytes</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2"> GB)&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  dispatch RDMA send (physical) = </span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">dispatch_bf16_rdma_send_bytes</span><span class="o">*</span><span class="n">phys_ratio</span><span class="p">)</span><span class="si">:</span><span class="s2">&gt;14,</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">dispatch_bf16_rdma_send_bytes</span><span class="o">*</span><span class="n">phys_ratio</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2"> GB,  algo*</span><span class="si">{</span><span class="n">phys_ratio</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  dispatch NVL  recv            = </span><span class="si">{</span><span class="n">dispatch_bf16_nvl_recv_bytes</span><span class="si">:</span><span class="s2">&gt;14,</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">dispatch_bf16_nvl_recv_bytes</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2"> GB)&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  combine  RDMA recv (algo)     = </span><span class="si">{</span><span class="n">combine_bf16_rdma_recv_bytes</span><span class="si">:</span><span class="s2">&gt;14,</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">combine_bf16_rdma_recv_bytes</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2"> GB)&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  combine  NVL  send            = </span><span class="si">{</span><span class="n">combine_bf16_nvl_send_bytes</span><span class="si">:</span><span class="s2">&gt;14,</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">combine_bf16_nvl_send_bytes</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2"> GB)&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  -- FP8 (factor=</span><span class="si">{</span><span class="n">fp8_factor</span><span class="si">:</span><span class="s2">.5f</span><span class="si">}</span><span class="s2">) --&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  dispatch RDMA send (algo)     = </span><span class="si">{</span><span class="n">dispatch_fp8_rdma_send_bytes</span><span class="si">:</span><span class="s2">&gt;14,.0f</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">dispatch_fp8_rdma_send_bytes</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2"> GB)&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  dispatch NVL  recv            = </span><span class="si">{</span><span class="n">dispatch_fp8_nvl_recv_bytes</span><span class="si">:</span><span class="s2">&gt;14,.0f</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">dispatch_fp8_nvl_recv_bytes</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2"> GB)&quot;</span><span class="p">)</span>
+            <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+        <span class="n">dist</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+
+    <span class="n">dist</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
+
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">parser</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">()</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--num-nodes&#39;</span><span class="p">,</span>    <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--gpu-per-node&#39;</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">8</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--num-tokens&#39;</span><span class="p">,</span>   <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">4096</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--hidden&#39;</span><span class="p">,</span>       <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">7168</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--num-experts&#39;</span><span class="p">,</span>  <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">256</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--num-topk&#39;</span><span class="p">,</span>     <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">8</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--port&#39;</span><span class="p">,</span>         <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">29501</span><span class="p">)</span>
+    <span class="n">args</span> <span class="o">=</span> <span class="n">parser</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+
+    <span class="n">num_processes</span> <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">num_nodes</span> <span class="o">*</span> <span class="n">args</span><span class="o">.</span><span class="n">gpu_per_node</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Simulating </span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">num_nodes</span><span class="si">}</span><span class="s2"> node(s) × </span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">gpu_per_node</span><span class="si">}</span><span class="s2"> GPUs = </span><span class="si">{</span><span class="n">num_processes</span><span class="si">}</span><span class="s2"> ranks&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;num_tokens=</span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">num_tokens</span><span class="si">}</span><span class="s2">, hidden=</span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">hidden</span><span class="si">}</span><span class="s2">, &quot;</span>
+          <span class="sa">f</span><span class="s2">&quot;num_experts=</span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">num_experts</span><span class="si">}</span><span class="s2">, num_topk=</span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">num_topk</span><span class="si">}</span><span class="s2">, &quot;</span>
+          <span class="sa">f</span><span class="s2">&quot;num_topk_groups=</span><span class="si">{</span><span class="nb">min</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">num_nodes</span><span class="p">,</span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">multiprocessing</span><span class="o">.</span><span class="n">spawn</span><span class="p">(</span><span class="n">worker</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">num_processes</span><span class="p">,</span> <span class="n">args</span><span class="p">),</span> <span class="n">nprocs</span><span class="o">=</span><span class="n">num_processes</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<hr class="docutils" />
+<section id="profiling-internode-kernels">
+<h3>Profiling Internode Kernels<a class="headerlink" href="#profiling-internode-kernels" title="Link to this heading"></a></h3>
+<p>Mori ships a profiler that emits Perfetto-compatible JSON traces for each EP kernel invocation.</p>
+<p><strong>1. Build with profiler enabled</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/apps/ditian12/mori
+<span class="nv">ENABLE_PROFILER</span><span class="o">=</span>ON<span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.<span class="w"> </span>--no-build-isolation<span class="w"> </span>-v
+</pre></div>
+</div>
+<p><strong>2. Clear the JIT cache</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rm<span class="w"> </span>-rf<span class="w"> </span>~/.mori
+</pre></div>
+</div>
+<p><strong>3. Run the profiling job</strong></p>
+<p>Run on each node, substituting <code class="docutils literal notranslate"><span class="pre">node_rank</span></code> and <code class="docutils literal notranslate"><span class="pre">master_addr</span></code> as in the <a class="reference internal" href="#inter-node"><span class="xref myst">Inter-node</span></a> section.  Use <code class="docutils literal notranslate"><span class="pre">--cmd</span> <span class="pre">profile</span></code> and pass the desired kernel type via <code class="docutils literal notranslate"><span class="pre">--kernel-type</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">ENABLE_PROFILER</span><span class="o">=</span>ON
+<span class="nb">export</span><span class="w"> </span><span class="nv">GLOO_SOCKET_IFNAME</span><span class="o">=</span>enp81s0f1
+<span class="nb">export</span><span class="w"> </span><span class="nv">MORI_RDMA_DEVICES</span><span class="o">=</span>^mlx5_0,mlx5_1<span class="w">  </span><span class="c1"># optional</span>
+
+torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.129.65&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>examples/ops/dispatch_combine/test_dispatch_combine_internode.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--cmd<span class="w"> </span>profile<span class="w"> </span>--kernel-type<span class="w"> </span>v1
+</pre></div>
+</div>
+<p>Repeat for <code class="docutils literal notranslate"><span class="pre">--kernel-type</span> <span class="pre">v1_ll</span></code> and <code class="docutils literal notranslate"><span class="pre">--kernel-type</span> <span class="pre">async_ll</span></code>.  Traces land as <code class="docutils literal notranslate"><span class="pre">trace_rank_&lt;rank&gt;_&lt;timestamp&gt;.json</span></code> in the current working directory.</p>
+</section>
+<section id="analyzing-traces-with-analyze-ep-kernel-trace-py">
+<h3>Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code><a class="headerlink" href="#analyzing-traces-with-analyze-ep-kernel-trace-py" title="Link to this heading"></a></h3>
+<p><a class="reference download internal" download="" href="_downloads/3d366d3f7cc7bc0fad6f2222e7e22275/analyze_ep_kernel_trace.py"><span class="xref download myst">tools/profiler/analyze_ep_kernel_trace.py</span></a> parses a single <code class="docutils literal notranslate"><span class="pre">trace_rank_*.json</span></code> file and produces a Gantt-style PNG showing how EP kernels overlap within each dispatch+combine iteration.</p>
+<p><strong>Usage</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>tools/profiler/analyze_ep_kernel_trace.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>/apps/ditian12/mori/profile/v1/trace_rank_0_&lt;timestamp&gt;.json<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--out<span class="w"> </span>timeline_v1.png
+</pre></div>
+</div>
+<p>The script prints a text summary and saves the PNG next to the trace file by default.</p>
+<p><strong>Example output</strong></p>
+<p>The plot has one subplot per iteration.  Each subplot shows:</p>
+<ul class="simple">
+<li><p><strong>Serial kernels</strong> (full-height bars): <code class="docutils literal notranslate"><span class="pre">copy_to_staging</span></code> at the left, <code class="docutils literal notranslate"><span class="pre">dispatch_sync</span></code> and <code class="docutils literal notranslate"><span class="pre">combine_sync</span></code> as barriers between phases, and <code class="docutils literal notranslate"><span class="pre">combine_all</span></code> at the right.</p></li>
+<li><p><strong>Internode lane</strong> (red/purple bars): <code class="docutils literal notranslate"><span class="pre">disp_send</span></code> and <code class="docutils literal notranslate"><span class="pre">disp_recv</span></code> during the dispatch phase, <code class="docutils literal notranslate"><span class="pre">comb_inter</span></code> during the combine phase.</p></li>
+<li><p><strong>Intranode lane</strong> (green/teal bars): <code class="docutils literal notranslate"><span class="pre">disp_intra</span></code> and <code class="docutils literal notranslate"><span class="pre">comb_intra</span></code> running concurrently with the internode lane (grey shaded region labelled <em>concurrent</em>).</p></li>
+<li><p><strong>Bar width</strong> is wall-clock duration in microseconds, relative to the start of each iteration.</p></li>
+</ul>
+<p><img alt="timeline_internode_v1" src="_images/timeline_internode_v1.png" /></p>
+<p><strong>What the output shows</strong></p>
+<p>Each subplot corresponds to one dispatch+combine iteration.  Kernels are assigned to semantic lanes:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Lane</p></th>
+<th class="head"><p>Kernels</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>internode</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dispatch_inter_node_{send,recv}</span></code>, <code class="docutils literal notranslate"><span class="pre">combine_inter_node</span></code> (and <code class="docutils literal notranslate"><span class="pre">_ll</span></code> variants)</p></td>
+</tr>
+<tr class="row-odd"><td><p>intranode</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dispatch_intra</span></code>, <code class="docutils literal notranslate"><span class="pre">combine_intra_node</span></code> (and <code class="docutils literal notranslate"><span class="pre">_ll</span></code> variants)</p></td>
+</tr>
+<tr class="row-even"><td><p>serial (full-height)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ep_dispatch_copy_to_staging</span></code>, <code class="docutils literal notranslate"><span class="pre">dispatch_sync</span></code>, <code class="docutils literal notranslate"><span class="pre">combine_sync</span></code>, <code class="docutils literal notranslate"><span class="pre">ep_combine_all</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<p>The grey shaded region labelled <strong>concurrent</strong> marks where internode and intranode kernels overlap.  Bar width is wall-clock duration in microseconds.</p>
+<p><strong>Text summary</strong></p>
+<p>The script also prints per-iteration kernel start/end/duration and aggregate per-thread duration stats (mean, min, max, call count) across all iterations, which is useful for spotting outlier iterations or load-imbalance between threads.</p>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="PROFILER.html" class="btn btn-neutral float-left" title="MORI-VIZ (Visualizer)" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="MORI-IO-BENCHMARK.html" class="btn btn-neutral float-right" title="MORI-IO Benchmark" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

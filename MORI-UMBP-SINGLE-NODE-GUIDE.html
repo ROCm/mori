@@ -1,0 +1,601 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MORI UMBP Single-Node Smoke Test &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning">10. Tuning</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#overview">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-config-files">Tuning Config Files</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node-tuning">Intra-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node-tuning">Inter-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-on-a-new-gpu-platform">Tuning on a New GPU Platform</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">11. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">12. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">MORI CCO Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#communicator-ccocomm">Communicator (<code class="docutils literal notranslate"><span class="pre">ccoComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#symmetric-memory-and-windows">Symmetric memory and windows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator-ccodevcomm">Device communicator (<code class="docutils literal notranslate"><span class="pre">ccoDevComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#teams">Teams</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#initialization">2. Initialization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#memory-and-windows">3. Memory and Windows</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator">4. Device Communicator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#host-barrier">5. Host Barrier</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-side-programming">6. Device-Side Programming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#c-api">8. C++ API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#environment-variables">9. Environment Variables</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-intranode-kernels">Profiling intranode kernels</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#bandwidth-computation">Bandwidth Computation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#rdma-bandwidth">RDMA bandwidth</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="MORI-EP-BENCHMARK.html#algo-bw-vs-physical-bw">Algo BW vs Physical BW</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nvl-xgmi-bandwidth">NVL / XGMI bandwidth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#why-deepep-and-mori-rdma-token-counts-are-equivalent">Why DeepEP and Mori RDMA token counts are equivalent</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#combine">Combine</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#reference-print-bw-values-py">Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-internode-kernels">Profiling Internode Kernels</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-commands">Benchmark Commands</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#fabric-cross-node-scale-up-ualink-super-node">Fabric (cross-node scale-up UALink super-node)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP Master Client</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#starting-the-master-server">Starting the Master Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbptiertype">UMBPTierType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvnodematch">UMBPExternalKvNodeMatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpmasterclient">UMBPMasterClient</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#cache-hit-tracking">Cache Hit Tracking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#finding-hot-kv-blocks-the-typical-workflow">Finding hot KV blocks (the typical workflow)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#lifetime-cumulative-not-a-rate">Lifetime cumulative — not a rate</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvhitcountentry">UMBPExternalKvHitCountEntry</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#usage-examples">Usage Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#end-to-end-example">End-to-End Example</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">MORI UMBP Single-Node Smoke Test</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/MORI-UMBP-SINGLE-NODE-GUIDE.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="mori-umbp-single-node-smoke-test">
+<h1>MORI UMBP Single-Node Smoke Test<a class="headerlink" href="#mori-umbp-single-node-smoke-test" title="Link to this heading"></a></h1>
+<p>This guide documents how to run the single-node UMBP + SGLang correctness smoke test that ships with Mori. The flow mirrors the <code class="docutils literal notranslate"><span class="pre">umbp-single-node-launcher</span></code> skill and launches the <a class="reference download internal" download="" href="_downloads/2a71e436c0b4c3535804f4dc53a137f5/run_umbp_single_node_hicache.sh"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">run_umbp_single_node_hicache.sh</span></code></span></a> helper script inside a ROCm container.</p>
+<p>Use the placeholders in this document to map the workflow to any target node. Every environment-dependent value is surfaced as an argument or environment variable; update those inputs and the script can run unchanged.</p>
+<p>For the underlying architecture see
+<span class="xref myst"><code class="docutils literal notranslate"><span class="pre">src/umbp/doc/design-master-control-plane.md</span></code></span>;
+for the full env-var inventory see
+<span class="xref myst"><code class="docutils literal notranslate"><span class="pre">src/umbp/doc/runtime-env-vars.md</span></code></span>.</p>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h2>
+<p>The script spins up the Docker image, rebuilds Mori with UMBP enabled, launches a single-node SGLang server backed by UMBP hierarchical cache, issues a probe completion, and collects logs under <code class="docutils literal notranslate"><span class="pre">~/umbp_single_node_results</span></code>. It is intended as a fast health check for DP+EP configurations.</p>
+</section>
+<section id="prerequisites">
+<h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p>Access to the target node (for example <code class="docutils literal notranslate"><span class="pre">&lt;node-name&gt;</span></code>), including an active reservation if required by the cluster scheduler.</p></li>
+<li><p>Mori and SGLang checkouts on the node.</p></li>
+<li><p>Access to a checkpoint directory when running with real weights.</p></li>
+<li><p>Docker privileges on the node.</p></li>
+</ul>
+</section>
+<section id="configuration-inputs">
+<h2>Configuration Inputs<a class="headerlink" href="#configuration-inputs" title="Link to this heading"></a></h2>
+<section id="script-constants">
+<h3>Script constants<a class="headerlink" href="#script-constants" title="Link to this heading"></a></h3>
+<p>The script declares a few host-specific defaults near the top. Update them before running if your environment differs.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Purpose</p></th>
+<th class="head"><p>Typical override</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">USER_HOME</span></code></p></td>
+<td><p>Home directory mounted into the container.</p></td>
+<td><p>Set to your <code class="docutils literal notranslate"><span class="pre">${HOME}</span></code> path on the node.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NFS_BASE</span></code></p></td>
+<td><p>Base path containing the repositories.</p></td>
+<td><p>Point to the shared filesystem path that holds Mori and SGLang.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">EXTRA_MOUNTS</span></code></p></td>
+<td><p>Additional <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">run</span></code> bind mounts.</p></td>
+<td><p>Remove entries that do not exist or add the host paths you require.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DOCKER_IMAGE</span></code></p></td>
+<td><p>ROCm container tag.</p></td>
+<td><p>Change if you need a different toolchain.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="runtime-environment-variables">
+<h3>Runtime environment variables<a class="headerlink" href="#runtime-environment-variables" title="Link to this heading"></a></h3>
+<p>Export the variables below to adapt the run to your environment. The script reads these values at launch time.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Default in script</p></th>
+<th class="head"><p>When to change</p></th>
+<th class="head"><p>Example</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MODEL_PATH</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/apps/data/models/DeepSeek-V3-0324</span></code></p></td>
+<td><p>Real checkpoint location.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/apps/data/models/DeepSeek-V3-0324</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SGLANG_REPO</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">${NFS_BASE}/sglang</span></code></p></td>
+<td><p>Local SGLang checkout.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/apps/ditian12/sglang</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_REPO</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">${NFS_BASE}/mori</span></code></p></td>
+<td><p>Local Mori checkout.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/apps/ditian12/mori</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RESULTS_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">${USER_HOME}/umbp_single_node_results</span></code></p></td>
+<td><p>Where to store logs.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/tmp/umbp_results</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ENABLE_DP</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td><p>Enable DP+EP mode.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DP_SIZE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+<td><p>Data parallel group size.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">4</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">EP_SIZE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+<td><p>Expert parallel group size.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">2</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TP_SIZE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+<td><p>Tensor parallel group size.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">START_UMBP_MASTER</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+<td><p>Disable if you already manage the master.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_ADDRESS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">127.0.0.1:15558</span></code></p></td>
+<td><p>Master listener address.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;host-ip&gt;:15558</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_NODE_ADDRESS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">127.0.0.1</span></code></p></td>
+<td><p>IP advertised to clients.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;node-ip&gt;</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_IO_ENGINE_PORT</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">16000</span></code></p></td>
+<td><p>Hicache IO engine port.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">16010</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_PEER_SERVICE_PORT</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">17000</span></code></p></td>
+<td><p>Peer service port.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">17010</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_SSD_STAGING_BYTES</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">268435456</span></code> (256 MiB)</p></td>
+<td><p>Size of the dedicated remote-SSD read staging buffer. Allocated <strong>only</strong> when SSD is enabled (DRAM-only runs allocate nothing and are unaffected). Raise for large-KV models so each read slot fits one key’s value.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">268435456</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">USE_DUMMY_WEIGHTS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td><p>Skip checkpoint validation.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MEM_FRACTION_STATIC</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.7</span></code></p></td>
+<td><p>Fraction reserved for static allocations.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.6</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PROBE_MAX_TIME</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">300</span></code></p></td>
+<td><p>Timeout for probe request in seconds.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">600</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<p>The script also respects <code class="docutils literal notranslate"><span class="pre">MORI_BRANCH</span></code>, <code class="docutils literal notranslate"><span class="pre">SGLANG_BRANCH</span></code>, and <code class="docutils literal notranslate"><span class="pre">MORI_PIP_FLAGS</span></code> if they are supplied.</p>
+</section>
+</section>
+<section id="launch-steps">
+<h2>Launch Steps<a class="headerlink" href="#launch-steps" title="Link to this heading"></a></h2>
+<ol class="arabic">
+<li><p><strong>SSH to the target node</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>ssh<span class="w"> </span>-o<span class="w"> </span><span class="nv">StrictHostKeyChecking</span><span class="o">=</span>no<span class="w"> </span>&lt;node-name&gt;
+</pre></div>
+</div>
+</li>
+<li><p><strong>Review script constants</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sed<span class="w"> </span>-n<span class="w"> </span><span class="s1">&#39;1,120p&#39;</span><span class="w"> </span>run_umbp_single_node_hicache.sh
+</pre></div>
+</div>
+<p>Update <code class="docutils literal notranslate"><span class="pre">USER_HOME</span></code>, <code class="docutils literal notranslate"><span class="pre">NFS_BASE</span></code>, <code class="docutils literal notranslate"><span class="pre">EXTRA_MOUNTS</span></code>, and <code class="docutils literal notranslate"><span class="pre">DOCKER_IMAGE</span></code> if the defaults do not match your environment.</p>
+</li>
+<li><p><strong>Export runtime variables</strong> (fill placeholders with your values):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MODEL_PATH</span><span class="o">=</span>&lt;path-to-model-checkpoints&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">SGLANG_REPO</span><span class="o">=</span>&lt;path-to-sglang&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">MORI_REPO</span><span class="o">=</span>&lt;path-to-mori&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">RESULTS_DIR</span><span class="o">=</span>&lt;path-for-results&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">ENABLE_DP</span><span class="o">=</span>&lt;true<span class="p">|</span>false&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">DP_SIZE</span><span class="o">=</span>&lt;dp-size&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">EP_SIZE</span><span class="o">=</span>&lt;ep-size&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">TP_SIZE</span><span class="o">=</span>&lt;tp-size&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">START_UMBP_MASTER</span><span class="o">=</span><span class="nb">true</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_NODE_ADDRESS</span><span class="o">=</span><span class="k">$(</span>hostname<span class="w"> </span>-I<span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span><span class="s1">&#39;{print $1}&#39;</span><span class="k">)</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">USE_DUMMY_WEIGHTS</span><span class="o">=</span><span class="nb">false</span>
+</pre></div>
+</div>
+<p>Add any other overrides from the table above as needed.</p>
+</li>
+<li><p><strong>Run the script</strong> with the desired weight mode:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>run_umbp_single_node_hicache.sh<span class="w"> </span>--real-weights
+<span class="c1"># or</span>
+bash<span class="w"> </span>run_umbp_single_node_hicache.sh<span class="w"> </span>--use-dummy-weights
+</pre></div>
+</div>
+<p>The script will:</p>
+<ul class="simple">
+<li><p>Start or recycle the <code class="docutils literal notranslate"><span class="pre">umbp-single-node</span></code> container.</p></li>
+<li><p>Rebuild Mori with <code class="docutils literal notranslate"><span class="pre">BUILD_UMBP=ON</span></code> via <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span></code>.</p></li>
+<li><p>Compute network interface settings for NCCL/Gloo.</p></li>
+<li><p>Launch the SGLang server with the configured parallelism values and hicache settings.</p></li>
+</ul>
+</li>
+<li><p><strong>Monitor the probe and cleanup</strong>:</p>
+<ul class="simple">
+<li><p>The script waits up to one hour for <code class="docutils literal notranslate"><span class="pre">http://127.0.0.1:30000/health</span></code> to report ready.</p></li>
+<li><p>It issues a probe request and stores the output in <code class="docutils literal notranslate"><span class="pre">${RESULTS_DIR}/probe_response.json</span></code>.</p></li>
+<li><p>On success, the script terminates the SGLang server and UMBP master, leaving artifacts in <code class="docutils literal notranslate"><span class="pre">${RESULTS_DIR}</span></code>.</p></li>
+</ul>
+</li>
+</ol>
+</section>
+<section id="core-dumps">
+<h2>Core Dumps<a class="headerlink" href="#core-dumps" title="Link to this heading"></a></h2>
+<p>By default the container routes crashes through Apport (<code class="docutils literal notranslate"><span class="pre">/usr/share/apport/apport</span></code>). If raw core files are required, disable Apport inside the container and set:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sysctl<span class="w"> </span>-w<span class="w"> </span>kernel.core_pattern<span class="o">=</span>/nfs/users/&lt;user&gt;/cores/core.%e.%p
+<span class="nb">ulimit</span><span class="w"> </span>-c<span class="w"> </span>unlimited
+</pre></div>
+</div>
+<p>Make sure the directory exists and has enough space.</p>
+</section>
+<section id="troubleshooting">
+<h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>Container launch</strong>: <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">ps</span></code> should show <code class="docutils literal notranslate"><span class="pre">umbp-single-node</span></code>. If it exits immediately, check <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">logs</span></code>.</p></li>
+<li><p><strong>Server logs</strong>: Available under <code class="docutils literal notranslate"><span class="pre">${RESULTS_DIR}/server_*.log</span></code>.</p></li>
+<li><p><strong>UMBP master logs</strong>: Saved alongside server logs when <code class="docutils literal notranslate"><span class="pre">START_UMBP_MASTER=true</span></code>.</p></li>
+<li><p><strong>Model validation</strong>: The script validates that <code class="docutils literal notranslate"><span class="pre">MODEL_PATH</span></code> contains <code class="docutils literal notranslate"><span class="pre">model-*.safetensors</span></code> when running with real weights.</p></li>
+<li><p><strong>Probe failures</strong>: Inspect the tail of the server log; the script prints it automatically on errors.</p></li>
+<li><p><strong>Remote SSD reads silently recompute (<code class="docutils literal notranslate"><span class="pre">size_too_large</span></code>)</strong>: A remote SSD read must fit a key’s whole value into one slot, where <code class="docutils literal notranslate"><span class="pre">per_slot</span> <span class="pre">=</span> <span class="pre">ssd_staging_buffer_size</span> <span class="pre">/</span> <span class="pre">ssd_staging_buffer_slots</span></code> (defaults 256 MiB / 16 = 16 MiB). The single-key page KV for an MLA model ≈ <code class="docutils literal notranslate"><span class="pre">page_size</span> <span class="pre">×</span> <span class="pre">(kv_lora_rank</span> <span class="pre">+</span> <span class="pre">qk_rope_head_dim)</span> <span class="pre">×</span> <span class="pre">dtype_bytes</span> <span class="pre">×</span> <span class="pre">num_layers</span></code> (DeepSeek-V3 5-layer ≈ 360 KB; full R1/V3 61-layer ≈ 4.5 MB). If <code class="docutils literal notranslate"><span class="pre">per_slot</span></code> is smaller, the read is dropped and the block is recomputed — requests don’t error, but <code class="docutils literal notranslate"><span class="pre">mori_umbp_ssd_read_total{status=&quot;size_too_large&quot;}</span></code> climbs and hit rate/throughput fall. Fix: raise <code class="docutils literal notranslate"><span class="pre">UMBP_SSD_STAGING_BYTES</span></code> or lower <code class="docutils literal notranslate"><span class="pre">ssd_staging_buffer_slots</span></code> so <code class="docutils literal notranslate"><span class="pre">per_slot</span> <span class="pre">≥</span></code> the single-key page KV. (<code class="docutils literal notranslate"><span class="pre">ssd_staging_buffer_size</span></code> is allocated only when SSD is enabled, separate from the general <code class="docutils literal notranslate"><span class="pre">staging_buffer_size</span></code>.)</p></li>
+</ul>
+<p>Refer back to this document whenever the single-node smoke test needs to be run or automated. For the original skill instructions see <code class="docutils literal notranslate"><span class="pre">/home/ditian12/.codex/skills/umbp-single-node-launcher/SKILL.md</span></code>.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

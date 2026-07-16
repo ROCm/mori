@@ -1,0 +1,1223 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UMBP Master Client &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=01f34227"></script>
+      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="prev" title="MORI-VIZ Kernel Profiler" href="profiler.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#tuning">10. Tuning</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#overview">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#tuning-config-files">Tuning Config Files</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#intra-node-tuning">Intra-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#inter-node-tuning">Inter-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-GUIDE.html#tuning-on-a-new-gpu-platform">Tuning on a New GPU Platform</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#profiling-with-mori-viz">11. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#framework-integration">12. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../MORI-CCO-GUIDE.html">MORI CCO Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-CCO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-CCO-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-CCO-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-CCO-GUIDE.html#communicator-ccocomm">Communicator (<code class="docutils literal notranslate"><span class="pre">ccoComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-CCO-GUIDE.html#symmetric-memory-and-windows">Symmetric memory and windows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-CCO-GUIDE.html#device-communicator-ccodevcomm">Device communicator (<code class="docutils literal notranslate"><span class="pre">ccoDevComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-CCO-GUIDE.html#teams">Teams</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-CCO-GUIDE.html#initialization">2. Initialization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-CCO-GUIDE.html#memory-and-windows">3. Memory and Windows</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-CCO-GUIDE.html#device-communicator">4. Device Communicator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-CCO-GUIDE.html#host-barrier">5. Host Barrier</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-CCO-GUIDE.html#device-side-programming">6. Device-Side Programming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-CCO-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-CCO-GUIDE.html#c-api">8. C++ API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-CCO-GUIDE.html#environment-variables">9. Environment Variables</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#intra-node">Intra-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#profiling-intranode-kernels">Profiling intranode kernels</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#inter-node">Inter-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#bandwidth-computation">Bandwidth Computation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#rdma-bandwidth">RDMA bandwidth</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#algo-bw-vs-physical-bw">Algo BW vs Physical BW</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#nvl-xgmi-bandwidth">NVL / XGMI bandwidth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#why-deepep-and-mori-rdma-token-counts-are-equivalent">Why DeepEP and Mori RDMA token counts are equivalent</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#combine">Combine</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#reference-print-bw-values-py">Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#profiling-internode-kernels">Profiling Internode Kernels</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-EP-BENCHMARK.html#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-BENCHMARK.html#benchmark-commands">Benchmark Commands</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IO-BENCHMARK.html#fabric-cross-node-scale-up-ualink-super-node">Fabric (cross-node scale-up UALink super-node)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">UMBP Master Client</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#starting-the-master-server">Starting the Master Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#umbptiertype">UMBPTierType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#umbpexternalkvnodematch">UMBPExternalKvNodeMatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#umbpmasterclient">UMBPMasterClient</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#cache-hit-tracking">Cache Hit Tracking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#finding-hot-kv-blocks-the-typical-workflow">Finding hot KV blocks (the typical workflow)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#lifetime-cumulative-not-a-rate">Lifetime cumulative — not a rate</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#umbpexternalkvhitcountentry">UMBPExternalKvHitCountEntry</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#usage-examples">Usage Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#end-to-end-example">End-to-End Example</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">UMBP Master Client</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/api/umbp.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="umbp-master-client">
+<h1>UMBP Master Client<a class="headerlink" href="#umbp-master-client" title="Link to this heading"></a></h1>
+<p><code class="docutils literal notranslate"><span class="pre">UMBPMasterClient</span></code> is a lightweight Python <strong>control-plane</strong> client for the
+UMBP master.  It can register a node, report/revoke externally-managed KV-cache
+blocks, and query which nodes hold a given set of blocks — enabling cross-node
+KV-cache-aware scheduling for externally-managed L1/L2/L3 caches such as
+SGLang HiCache (GPU HBM, pinned host DRAM, and storage-backed L3).</p>
+<p>It is <em>not</em> the full UMBP data-plane client. Hot-path Put/Get with RDMA / MORI-IO
+goes through the C++ <code class="docutils literal notranslate"><span class="pre">IUMBPClient</span></code> (<code class="docutils literal notranslate"><span class="pre">mori.cpp.UMBPClient</span></code> in Python) backed by a
+<code class="docutils literal notranslate"><span class="pre">DistributedClient</span></code> + <code class="docutils literal notranslate"><span class="pre">PoolClient</span></code>. <code class="docutils literal notranslate"><span class="pre">UMBPMasterClient</span></code> only speaks to the master
+control plane and never registers a peer service or starts a heartbeat thread.
+Schedulers and sidecars can use it for synchronous external-KV
+<code class="docutils literal notranslate"><span class="pre">report</span></code>/<code class="docutils literal notranslate"><span class="pre">revoke</span></code> calls on behalf of a registered worker; SGLang HiCache
+event forwarding normally uses the distributed UMBP client owned by
+<code class="docutils literal notranslate"><span class="pre">UMBPStore</span></code> so high-rate writes are batched through heartbeats.</p>
+<p>For the full architecture see <code class="docutils literal notranslate"><span class="pre">src/umbp/doc/design-master-control-plane.md</span></code>.</p>
+<hr class="docutils" />
+<section id="starting-the-master-server">
+<h2>Starting the Master Server<a class="headerlink" href="#starting-the-master-server" title="Link to this heading"></a></h2>
+<p>The master server is a standalone binary built alongside the mori wheel.</p>
+<p><strong>Binary location:</strong></p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span># After cmake build
+build/src/umbp/umbp_master
+
+# Inside an installed wheel (auto-detected by UMBPMasterClient)
+python/mori/umbp_master
+
+# Override at runtime
+export UMBP_MASTER_BIN=/path/to/umbp_master
+</pre></div>
+</div>
+<p><strong>Usage:</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>umbp_master<span class="w"> </span><span class="o">[</span>listen_address<span class="o">]</span><span class="w"> </span><span class="o">[</span>metrics_port<span class="o">]</span>
+</pre></div>
+</div>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 25.0%" />
+<col style="width: 15.0%" />
+<col style="width: 60.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Argument</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">listen_address</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.0.0.0:50051</span></code></p></td>
+<td><p>gRPC listen address in <code class="docutils literal notranslate"><span class="pre">host:port</span></code> format</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">metrics_port</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">9091</span></code></p></td>
+<td><p>Prometheus metrics HTTP port</p></td>
+</tr>
+</tbody>
+</table>
+<p>All <code class="docutils literal notranslate"><span class="pre">UMBP_*</span></code> timing knobs (<code class="docutils literal notranslate"><span class="pre">UMBP_HEARTBEAT_TTL_SEC</span></code>, <code class="docutils literal notranslate"><span class="pre">UMBP_REAPER_INTERVAL_SEC</span></code>,
+<code class="docutils literal notranslate"><span class="pre">UMBP_LEASE_DURATION_SEC</span></code>, …) are honored at master startup and printed once as
+<code class="docutils literal notranslate"><span class="pre">[Master]</span> <span class="pre">Resolved</span> <span class="pre">timing:</span> <span class="pre">...</span></code>. See
+<a class="reference external" href="../../src/umbp/doc/runtime-env-vars.md">runtime-env-vars.md</a> for the full list.</p>
+<p><strong>Examples:</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Defaults: gRPC on 0.0.0.0:50051, metrics on 9091</span>
+./build/src/umbp/umbp_master
+
+<span class="c1"># Custom gRPC port (matches the SGLang/hicache default), default metrics port</span>
+./build/src/umbp/umbp_master<span class="w"> </span><span class="m">127</span>.0.0.1:15558
+
+<span class="c1"># Both custom</span>
+./build/src/umbp/umbp_master<span class="w"> </span><span class="m">127</span>.0.0.1:15558<span class="w"> </span><span class="m">9099</span>
+
+<span class="c1"># With debug logging</span>
+<span class="nv">MORI_UMBP_LOG_LEVEL</span><span class="o">=</span>DEBUG<span class="w"> </span>./build/src/umbp/umbp_master<span class="w"> </span><span class="m">127</span>.0.0.1:15558
+</pre></div>
+</div>
+<p>The server exits cleanly on <code class="docutils literal notranslate"><span class="pre">SIGINT</span></code> / <code class="docutils literal notranslate"><span class="pre">SIGTERM</span></code> (e.g. <code class="docutils literal notranslate"><span class="pre">Ctrl-C</span></code> or <code class="docutils literal notranslate"><span class="pre">kill</span></code>).</p>
+<p><strong>Building the binary:</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mkdir<span class="w"> </span>-p<span class="w"> </span>build<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>build
+cmake<span class="w"> </span>..<span class="w"> </span>-DUMBP<span class="o">=</span>ON
+make<span class="w"> </span>-j<span class="k">$(</span>nproc<span class="k">)</span><span class="w"> </span>umbp_master
+</pre></div>
+</div>
+<p>The Python <code class="docutils literal notranslate"><span class="pre">mori.umbp</span></code> package auto-detects <code class="docutils literal notranslate"><span class="pre">umbp_master</span></code> packaged inside the
+wheel and exports <code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_BIN</span></code> to that path (see
+<code class="docutils literal notranslate"><span class="pre">mori/python/mori/umbp/__init__.py::_configure_packaged_umbp_master</span></code>). Set
+<code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_BIN</span></code> explicitly to point at a custom build.</p>
+<hr class="docutils" />
+<p><strong>Imports:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.cpp</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">UMBPMasterClient</span><span class="p">,</span>
+    <span class="n">UMBPTierType</span><span class="p">,</span>
+    <span class="n">UMBPExternalKvNodeMatch</span><span class="p">,</span>
+    <span class="n">UMBPExternalKvHitCountEntry</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<hr class="docutils" />
+<section id="umbptiertype">
+<h2>UMBPTierType<a class="headerlink" href="#umbptiertype" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 25.0%" />
+<col style="width: 75.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Value</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBPTierType.Unknown</span></code></p></td>
+<td><p>Unknown / unspecified tier</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBPTierType.HBM</span></code></p></td>
+<td><p>High-bandwidth memory (on-device)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBPTierType.DRAM</span></code></p></td>
+<td><p>Host DRAM</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBPTierType.SSD</span></code></p></td>
+<td><p>Solid-state drive</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="umbpexternalkvnodematch">
+<h2>UMBPExternalKvNodeMatch<a class="headerlink" href="#umbpexternalkvnodematch" title="Link to this heading"></a></h2>
+<p>Returned by <code class="docutils literal notranslate"><span class="pre">match_external_kv()</span></code>. Each instance describes one node that holds
+a subset of the queried KV blocks, grouped by every tier each block lives on
+for that node.</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 30.0%" />
+<col style="width: 70.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Attribute / method</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">node_id:</span> <span class="pre">str</span></code></p></td>
+<td><p>Identifier of the node holding the blocks</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">peer_address:</span> <span class="pre">str</span></code></p></td>
+<td><p>PeerService gRPC address of the node, when the node registered one.
+This is used by UMBP data-plane clients for direct transfer.  It may be
+empty for lightweight <code class="docutils literal notranslate"><span class="pre">UMBPMasterClient.register_self()</span></code> examples or
+for schedulers that only need <code class="docutils literal notranslate"><span class="pre">node_id</span></code> for routing decisions.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">hashes_by_tier:</span> <span class="pre">dict[UMBPTierType,</span> <span class="pre">list[str]]</span></code></p></td>
+<td><p>Matched hashes grouped by every tier they currently live on for this
+node.  A single block held on multiple tiers (e.g. write_through has
+created a CPU mirror while the GPU copy is still alive) appears in
+<strong>every</strong> tier bucket it physically resides on — bucket sizes do not
+sum to the distinct count.  Iterating the dict yields tiers in
+sorted <code class="docutils literal notranslate"><span class="pre">UMBPTierType</span></code> order, so the first non-empty bucket is the
+fastest tier currently available on this node.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">matched_hash_count()</span> <span class="pre">-&gt;</span> <span class="pre">int</span></code></p></td>
+<td><p>Number of <em>distinct</em> matched hashes (size of the union across tiers).
+A hash on HBM+DRAM still counts once.  This is the right value to
+feed into “how much of the prompt does this worker have cached?”
+routing decisions; use <code class="docutils literal notranslate"><span class="pre">hashes_by_tier</span></code> for per-tier cost models.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="umbpmasterclient">
+<h2>UMBPMasterClient<a class="headerlink" href="#umbpmasterclient" title="Link to this heading"></a></h2>
+<p><strong>Constructor:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">UMBPMasterClient</span><span class="p">(</span>
+    <span class="n">master_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">node_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="p">,</span>
+    <span class="n">node_address</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 25.0%" />
+<col style="width: 75.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Parameter</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">master_address</span></code></p></td>
+<td><p>Address of the UMBP master server, e.g. <code class="docutils literal notranslate"><span class="pre">&quot;127.0.0.1:15558&quot;</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">node_id</span></code></p></td>
+<td><p>Identifier for this node (required for registration)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">node_address</span></code></p></td>
+<td><p>This node’s own gRPC address, used by peers to connect back</p></td>
+</tr>
+</tbody>
+</table>
+<p>Construction is non-blocking — the gRPC channel is created lazily and will not
+raise even if the master is unreachable. <code class="docutils literal notranslate"><span class="pre">auto_heartbeat</span></code> is forced to <code class="docutils literal notranslate"><span class="pre">False</span></code>
+on this client (no heartbeat thread is started); <code class="docutils literal notranslate"><span class="pre">UMBPMasterClient</span></code> is intended
+for one-shot or short-lived lookups, not for long-running peer membership.</p>
+<p><strong>Methods:</strong></p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 45.0%" />
+<col style="width: 55.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Method</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">register_self(tier_capacities)</span></code></p></td>
+<td><p>Register this node with the master. <code class="docutils literal notranslate"><span class="pre">tier_capacities</span></code> is a <code class="docutils literal notranslate"><span class="pre">dict[UMBPTierType,</span> <span class="pre">tuple[int,</span> <span class="pre">int]]</span></code> mapping each tier to <code class="docutils literal notranslate"><span class="pre">(total_bytes,</span> <span class="pre">available_bytes)</span></code>. Raises <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> on failure.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">unregister_self()</span></code></p></td>
+<td><p>Unregister this node. Raises <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> if the node is not registered or the call fails.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">is_registered()</span> <span class="pre">-&gt;</span> <span class="pre">bool</span></code></p></td>
+<td><p>Return <code class="docutils literal notranslate"><span class="pre">True</span></code> if this node is currently registered.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">report_external_kv_blocks(node_id,</span> <span class="pre">hashes,</span> <span class="pre">tier)</span></code></p></td>
+<td><p><strong>Additive</strong>: announce that <code class="docutils literal notranslate"><span class="pre">node_id</span></code> now holds <code class="docutils literal notranslate"><span class="pre">hashes</span></code> at
+<code class="docutils literal notranslate"><span class="pre">tier</span></code>.  Existing tier buckets for the same hashes are untouched
+(a re-report at the same tier is a no-op; reporting at a new tier
+adds a bucket without removing previously reported ones).  Raises
+<code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> if <code class="docutils literal notranslate"><span class="pre">node_id</span></code> or <code class="docutils literal notranslate"><span class="pre">hashes</span></code> is empty, or the call
+fails.  <code class="docutils literal notranslate"><span class="pre">node_id</span></code> must already be registered and alive; reports for
+unknown or expired nodes are ignored by the master.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">revoke_external_kv_blocks(node_id,</span> <span class="pre">hashes,</span> <span class="pre">tier)</span></code></p></td>
+<td><p>Remove <code class="docutils literal notranslate"><span class="pre">hashes</span></code> from a single tier on this node.  Other tier
+buckets for the same hashes are untouched.  No-op for hashes that
+were never reported at <code class="docutils literal notranslate"><span class="pre">tier</span></code>.  Unlike report, revoke does not
+require <code class="docutils literal notranslate"><span class="pre">node_id</span></code> to be alive.  Raises <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> if
+<code class="docutils literal notranslate"><span class="pre">node_id</span></code> or <code class="docutils literal notranslate"><span class="pre">hashes</span></code> is empty.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">revoke_all_external_kv_blocks_at_tier(node_id,</span> <span class="pre">tier)</span></code></p></td>
+<td><p><strong>Bulk</strong>: revoke every hash currently registered by <code class="docutils literal notranslate"><span class="pre">node_id</span></code> at
+<code class="docutils literal notranslate"><span class="pre">tier</span></code>.  Used when an entire tier is wiped (storage backend clear
+or detach, host-pool reset).  Other tier buckets are untouched.
+Unlike report, revoke does not require <code class="docutils literal notranslate"><span class="pre">node_id</span></code> to be alive.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">match_external_kv(hashes,</span> <span class="pre">count_as_hit=False)</span> <span class="pre">-&gt;</span> <span class="pre">list[UMBPExternalKvNodeMatch]</span></code></p></td>
+<td><p>Query the master for nodes that hold any of the requested <code class="docutils literal notranslate"><span class="pre">hashes</span></code>.
+Returns an empty list when no matches exist or <code class="docutils literal notranslate"><span class="pre">hashes</span></code> is empty. Set
+<code class="docutils literal notranslate"><span class="pre">count_as_hit=True</span></code> <strong>only</strong> on the real user-request routing path —
+this is what feeds the hit-tracking index (see
+<a class="reference internal" href="#cache-hit-tracking">Cache Hit Tracking</a>).  Diagnostic, health-check, dashboard, or
+speculative-probe callers must leave the default <code class="docutils literal notranslate"><span class="pre">False</span></code> to avoid
+polluting the counters.  Raises <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> on connection failure.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">get_external_kv_hit_counts(hashes)</span> <span class="pre">-&gt;</span> <span class="pre">list[UMBPExternalKvHitCountEntry]</span></code></p></td>
+<td><p>Sparse lookup of cumulative per-hash routing-hit counters maintained by
+the master.  Hashes that have never been counted, or whose entry was
+garbage-collected after <code class="docutils literal notranslate"><span class="pre">UMBP_HIT_INDEX_TTL_SEC</span></code> of inactivity, are
+omitted from the response (not returned with <code class="docutils literal notranslate"><span class="pre">hit_count_total=0</span></code>).
+Duplicate request hashes are de-duplicated by the server and yield at
+most one entry each. Response order is not guaranteed to match request
+order — build a <code class="docutils literal notranslate"><span class="pre">{hash:</span> <span class="pre">entry}</span></code> map if you need alignment.  Requests
+larger than <code class="docutils literal notranslate"><span class="pre">UMBP_HIT_QUERY_MAX_BATCH</span></code> (default <code class="docutils literal notranslate"><span class="pre">4096</span></code>) fail with
+<code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> carrying <code class="docutils literal notranslate"><span class="pre">UMBP_HIT_QUERY_MAX_BATCH</span></code> in the message;
+the server does <strong>not</strong> silently truncate.</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Protocol notes for non-Python clients:</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">MatchExternalKv</span></code> returns one <code class="docutils literal notranslate"><span class="pre">ExternalKvNodeMatch</span></code> per node.  Each match
+contains <code class="docutils literal notranslate"><span class="pre">repeated</span> <span class="pre">TierHashes</span> <span class="pre">hashes_by_tier</span></code> rather than the legacy
+<code class="docutils literal notranslate"><span class="pre">matched_hashes</span> <span class="pre">+</span> <span class="pre">tier</span></code> shape.  A single hash may appear in multiple tier
+buckets for the same node, so consumers must de-duplicate by hash before using a
+match count for routing.</p>
+<p><code class="docutils literal notranslate"><span class="pre">MatchExternalKvRequest.count_as_hit</span></code> is optional and defaults to <code class="docutils literal notranslate"><span class="pre">false</span></code>.
+When set to <code class="docutils literal notranslate"><span class="pre">true</span></code>, the master increments <code class="docutils literal notranslate"><span class="pre">hit_count_total</span></code> once for every
+unique queried hash that is actually matched in the external KV placement
+index. Missing hashes are not counted, and the number of nodes or tiers holding
+the same hash does not multiply the increment.</p>
+<p><code class="docutils literal notranslate"><span class="pre">GetExternalKvHitCounts</span></code> returns <code class="docutils literal notranslate"><span class="pre">HitCountEntry</span></code> values sparsely: absent
+hashes are omitted rather than returned with zero. Response ordering is not
+guaranteed to match request ordering, so callers should build a <code class="docutils literal notranslate"><span class="pre">hash</span> <span class="pre">-&gt;</span> <span class="pre">entry</span></code>
+map when alignment matters.</p>
+</section>
+<hr class="docutils" />
+<section id="cache-hit-tracking">
+<h2>Cache Hit Tracking<a class="headerlink" href="#cache-hit-tracking" title="Link to this heading"></a></h2>
+<p><strong>Purpose — hot KV block awareness.</strong> This API tells you, for any KV block
+hash you care about, <strong>how many real-request routing lookups have matched
+it</strong> in the external KV placement index.  That is the basic hotness signal
+you need to identify hot blocks; what you do with that signal — pin them
+to a faster tier, replicate them to more workers, bias the scheduler away
+from evicting them, expose a “hottest prompts” operator dashboard, … — is
+intentionally left to the caller.</p>
+<p>The counter records <em>lookup matches</em>, not <em>cache reads</em>: the master
+increments it the moment a <code class="docutils literal notranslate"><span class="pre">count_as_hit=True</span></code> query hits a hash in the
+placement index, with no further visibility into whether the caller went
+on to dispatch the request, whether the routed worker actually served
+from cache, or whether the request was later canceled.  In practice this
+is close enough to traffic hotness as long as <code class="docutils literal notranslate"><span class="pre">count_as_hit=True</span></code> is
+restricted to the real routing path (see below); it is <strong>not</strong> a “this
+block was definitely served” log.</p>
+<p>UMBP itself does <strong>not</strong> change where blocks live, what gets evicted, or how
+routing decisions are made based on hotness.  It exposes the counter as a
+primitive; downstream policies are user-built on top.</p>
+<p>The mechanism is a single in-memory per-hash counter on the master:</p>
+<ul class="simple">
+<li><p><strong>Increment</strong> on the real user-request routing path by calling
+<code class="docutils literal notranslate"><span class="pre">match_external_kv(hashes,</span> <span class="pre">count_as_hit=True)</span></code>.</p></li>
+<li><p><strong>Read</strong> the counter from any process by calling
+<code class="docutils literal notranslate"><span class="pre">get_external_kv_hit_counts(hashes)</span></code>.</p></li>
+</ul>
+<p>Keeping <code class="docutils literal notranslate"><span class="pre">count_as_hit=True</span></code> out of diagnostic / probe / dashboard / health-
+check callers is what gives the counter its meaning as a <em>real-routing-path</em>
+signal; otherwise it degenerates into “how many times did anyone ask about
+this hash”.</p>
+<section id="finding-hot-kv-blocks-the-typical-workflow">
+<h3>Finding hot KV blocks (the typical workflow)<a class="headerlink" href="#finding-hot-kv-blocks-the-typical-workflow" title="Link to this heading"></a></h3>
+<p>This is the main flow this API is designed for. Four steps:</p>
+<ol class="arabic simple">
+<li><p><strong>Wire ``count_as_hit=True`` into the routing path, and only there.</strong>
+The component that does the placement lookup for an incoming user
+request should call <code class="docutils literal notranslate"><span class="pre">match_external_kv(hashes,</span> <span class="pre">count_as_hit=True)</span></code>.
+No other caller should set this flag.  This is what keeps the counter
+meaningful as a routing-path signal instead of degenerating into
+“anyone who asked”.  (The master only sees the lookup itself, not
+whether the routing decision was followed through — keeping the flag
+off auxiliary callers is what makes the signal close to real traffic in
+practice.)</p></li>
+<li><p><strong>Maintain the hash universe you want to observe in the caller.</strong>
+There is no scan, no iteration, no “give me the top-K hottest hashes” RPC
+— <code class="docutils literal notranslate"><span class="pre">get_external_kv_hit_counts</span></code> is a sparse point lookup keyed by the
+hashes you pass in.  Track the set of hashes you care about yourself
+(e.g. the union of hashes your workers have reported via
+<code class="docutils literal notranslate"><span class="pre">report_external_kv_blocks</span></code>, or the prefix hashes your scheduler has
+seen).  Split large universes into <code class="docutils literal notranslate"><span class="pre">UMBP_HIT_QUERY_MAX_BATCH</span></code> (default
+<code class="docutils literal notranslate"><span class="pre">4096</span></code>) chunks per RPC.</p></li>
+<li><p><strong>Periodically read the counters and rank them.</strong> Any process with
+network access to the master can do this — your scheduler, a sidecar
+analyzer, an operator script, a Prometheus exporter.  <code class="docutils literal notranslate"><span class="pre">hit_count_total</span></code>
+is comparable across hashes, so a simple <code class="docutils literal notranslate"><span class="pre">sorted(...,</span> <span class="pre">reverse=True)</span></code>
+on the returned list gives you a hotness ranking.</p></li>
+<li><p><strong>Plug the ranking into your own policy.</strong>  Examples of what users
+typically do once they know which blocks are hot — <em>none of these are
+implemented by UMBP</em>; they are the kinds of things this API is meant to
+enable:</p>
+<ul class="simple">
+<li><p>Pin the top-K blocks to a faster tier (HBM) and stop evicting them.</p></li>
+<li><p>Replicate hot blocks to additional workers for more read concurrency.</p></li>
+<li><p>Skip the recompute fallback for hot prefixes even on a partial cache
+miss.</p></li>
+<li><p>Bias the scheduler toward workers that already hold hot blocks, to
+compound locality.</p></li>
+<li><p>Expose a “hottest prompts” dashboard to operators.</p></li>
+</ul>
+</li>
+</ol>
+</section>
+<section id="lifetime-cumulative-not-a-rate">
+<h3>Lifetime cumulative — not a rate<a class="headerlink" href="#lifetime-cumulative-not-a-rate" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">hit_count_total</span></code> is a <strong>lifetime cumulative</strong> counter, not a rate, not
+a sliding window, not exponentially decayed.  It only goes up while the
+entry exists, and is reset only when the entry disappears (master restart,
+or <code class="docutils literal notranslate"><span class="pre">UMBP_HIT_INDEX_TTL_SEC</span></code> of inactivity).</p>
+<p>For “recent” hotness — i.e. a current-QPS-style ranking instead of an all-
+time ranking — snapshot the counter at two points and diff:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">snapshot_counts</span><span class="p">(</span><span class="n">client</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">batch</span><span class="o">=</span><span class="mi">4096</span><span class="p">):</span>
+    <span class="n">counts</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">hashes</span><span class="p">),</span> <span class="n">batch</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">entry</span> <span class="ow">in</span> <span class="n">client</span><span class="o">.</span><span class="n">get_external_kv_hit_counts</span><span class="p">(</span><span class="n">hashes</span><span class="p">[</span><span class="n">i</span> <span class="p">:</span> <span class="n">i</span> <span class="o">+</span> <span class="n">batch</span><span class="p">]):</span>
+            <span class="n">counts</span><span class="p">[</span><span class="n">entry</span><span class="o">.</span><span class="n">hash</span><span class="p">]</span> <span class="o">=</span> <span class="n">entry</span><span class="o">.</span><span class="n">hit_count_total</span>
+    <span class="k">return</span> <span class="n">counts</span>
+
+<span class="n">before</span> <span class="o">=</span> <span class="n">snapshot_counts</span><span class="p">(</span><span class="n">monitor</span><span class="p">,</span> <span class="n">hash_universe</span><span class="p">)</span>
+<span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mi">300</span><span class="p">)</span>  <span class="c1"># 5 minutes</span>
+<span class="n">after</span> <span class="o">=</span> <span class="n">snapshot_counts</span><span class="p">(</span><span class="n">monitor</span><span class="p">,</span> <span class="n">hash_universe</span><span class="p">)</span>
+
+<span class="n">delta</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="n">h</span><span class="p">:</span> <span class="n">after</span><span class="p">[</span><span class="n">h</span><span class="p">]</span> <span class="o">-</span> <span class="n">before</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">h</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">h</span> <span class="ow">in</span> <span class="n">after</span>
+    <span class="k">if</span> <span class="n">after</span><span class="p">[</span><span class="n">h</span><span class="p">]</span> <span class="o">-</span> <span class="n">before</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">h</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span>
+<span class="p">}</span>
+<span class="n">recent_hottest</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">delta</span><span class="o">.</span><span class="n">items</span><span class="p">(),</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">kv</span><span class="p">:</span> <span class="n">kv</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">reverse</span><span class="o">=</span><span class="kc">True</span><span class="p">)[:</span><span class="mi">32</span><span class="p">]</span>
+<span class="c1"># delta[h] is &quot;hits during the 5-minute window&quot;.  Hashes absent from</span>
+<span class="c1"># `after` either had zero traffic in the window or were GC&#39;d from the</span>
+<span class="c1"># hit index after UMBP_HIT_INDEX_TTL_SEC of inactivity.</span>
+</pre></div>
+</div>
+<p>The raw <code class="docutils literal notranslate"><span class="pre">hit_count_total</span></code> itself is most useful as an “ever was hot”
+signal (e.g. when deciding whether to re-warm a block that has just been
+evicted from every tier).</p>
+<p><strong>Counting rules at a glance:</strong></p>
+<ul class="simple">
+<li><p>Increments happen on the master, not on the client. There is no client-side
+buffering or batching.</p></li>
+<li><p>Per call, each unique input hash is incremented <strong>at most once</strong>, regardless
+of how many <code class="docutils literal notranslate"><span class="pre">ExternalKvNodeMatch</span></code> entries reference it (same hash on
+HBM+DRAM+SSD on the same node still counts once; the same hash held by
+N nodes still counts once).</p></li>
+<li><p>A query that does <strong>not</strong> match anything in the placement index increments
+nothing — even with <code class="docutils literal notranslate"><span class="pre">count_as_hit=True</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">revoke_external_kv_blocks</span></code> and <code class="docutils literal notranslate"><span class="pre">revoke_all_external_kv_blocks_at_tier</span></code>
+do <strong>not</strong> clear the corresponding counters; a block can carry a non-zero
+lifetime count after its last replica has been dropped.  This is the basis
+for “this block was hot and just got evicted — should I re-warm it?”
+policies.</p></li>
+<li><p>The hit index is in-memory only. Counters are lost when the master
+restarts.</p></li>
+<li><p>Each entry has its own TTL (<code class="docutils literal notranslate"><span class="pre">UMBP_HIT_INDEX_TTL_SEC</span></code>).  An entry is
+dropped if no <code class="docutils literal notranslate"><span class="pre">count_as_hit=True</span></code> call has touched it for that long; the
+master sweeps for expired entries every <code class="docutils literal notranslate"><span class="pre">UMBP_HIT_INDEX_GC_INTERVAL_SEC</span></code>.
+Absent ≠ <code class="docutils literal notranslate"><span class="pre">hit_count_total</span> <span class="pre">==</span> <span class="pre">0</span></code> — treat absent as “no recent real
+traffic / no signal”.</p></li>
+</ul>
+<p><strong>Tuning knobs (master process):</strong></p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 35.0%" />
+<col style="width: 15.0%" />
+<col style="width: 50.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Env var</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_HIT_INDEX_TTL_SEC</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">7200</span></code></p></td>
+<td><p>Per-entry inactivity TTL. A hash with no counted match for longer
+than this is removed from the hit index.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_HIT_INDEX_GC_INTERVAL_SEC</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">60</span></code></p></td>
+<td><p>Background GC sweep period.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_HIT_QUERY_MAX_BATCH</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">4096</span></code></p></td>
+<td><p>Maximum hashes accepted by one <code class="docutils literal notranslate"><span class="pre">get_external_kv_hit_counts</span></code>
+call. Oversized requests fail with <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> (gRPC
+<code class="docutils literal notranslate"><span class="pre">INVALID_ARGUMENT</span></code>).  The server does not truncate; split your
+request batch on the client side.</p></td>
+</tr>
+</tbody>
+</table>
+<p>See the
+<a class="reference external" href="../../src/umbp/doc/runtime-env-vars.md">master env-var reference</a> for the
+full master env-var list.</p>
+<p><strong>Where to call from.</strong>  External-KV query methods are reachable through two
+Python clients.  Both ultimately go to the same master and read the same
+placement and hit-count indexes, but their <strong>error semantics differ</strong> — pick
+the one whose behaviour matches what you want:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">UMBPMasterClient</span></code> — the lightweight control-plane client documented on
+this page.  Use it from schedulers, controllers, dashboards, or any
+process that does not need the RDMA / MORI-IO data plane.  Failures
+(connection refused, oversized batch, master returning <code class="docutils literal notranslate"><span class="pre">INVALID_ARGUMENT</span></code>,
+…) surface as Python <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mori.cpp.UMBPClient</span></code> — the distributed data-plane client backed by
+<code class="docutils literal notranslate"><span class="pre">DistributedClient</span></code> + <code class="docutils literal notranslate"><span class="pre">PoolClient</span></code>.  HiCache / data-plane integrations
+can call <code class="docutils literal notranslate"><span class="pre">match_external_kv(hashes,</span> <span class="pre">count_as_hit=...)</span></code> and
+<code class="docutils literal notranslate"><span class="pre">get_external_kv_hit_counts(hashes)</span></code> on the same client they already
+use for Put/Get, avoiding a second connection.  <strong>Caveat:</strong> the
+data-plane wrapper currently swallows RPC failures and returns an
+<strong>empty list</strong> rather than raising — an empty response from this client
+means “no matches <strong>or</strong> the underlying RPC failed”.  If you need to
+distinguish the two (e.g. surface oversized-batch errors), call through
+<code class="docutils literal notranslate"><span class="pre">UMBPMasterClient</span></code> instead.</p></li>
+</ul>
+<p>Both methods are also defined on <code class="docutils literal notranslate"><span class="pre">StandaloneClient</span></code>, but the standalone
+implementation is a stub that always returns an empty list and never
+contacts a master — it exists only so the <code class="docutils literal notranslate"><span class="pre">IUMBPClient</span></code> interface stays
+uniform for non-distributed deployments.</p>
+<p>For placement writes, use <code class="docutils literal notranslate"><span class="pre">UMBPMasterClient.report_external_kv_blocks(node_id,</span>
+<span class="pre">hashes,</span> <span class="pre">tier)</span></code> when a scheduler or sidecar reports on behalf of a registered
+worker.  In-process distributed clients use the two-argument synchronous
+methods <code class="docutils literal notranslate"><span class="pre">mori.cpp.UMBPClient.report_external_kv_blocks(hashes,</span> <span class="pre">tier)</span></code>,
+<code class="docutils literal notranslate"><span class="pre">revoke_external_kv_blocks(hashes,</span> <span class="pre">tier)</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">revoke_all_external_kv_blocks_at_tier(tier)</span></code> for their own node.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="umbpexternalkvhitcountentry">
+<h2>UMBPExternalKvHitCountEntry<a class="headerlink" href="#umbpexternalkvhitcountentry" title="Link to this heading"></a></h2>
+<p>Returned by <code class="docutils literal notranslate"><span class="pre">get_external_kv_hit_counts()</span></code>.</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 30.0%" />
+<col style="width: 70.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Attribute</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">hash:</span> <span class="pre">str</span></code></p></td>
+<td><p>KV block hash.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">hit_count_total:</span> <span class="pre">int</span></code></p></td>
+<td><p>Lifetime cumulative count of <code class="docutils literal notranslate"><span class="pre">match_external_kv(...,</span> <span class="pre">count_as_hit=True)</span></code>
+calls in which this hash was actually matched. The count is dropped if
+the entry is garbage-collected after <code class="docutils literal notranslate"><span class="pre">UMBP_HIT_INDEX_TTL_SEC</span></code> of
+inactivity or if the master restarts.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="usage-examples">
+<h2>Usage Examples<a class="headerlink" href="#usage-examples" title="Link to this heading"></a></h2>
+<p><strong>Basic node registration:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.cpp</span><span class="w"> </span><span class="kn">import</span> <span class="n">UMBPMasterClient</span><span class="p">,</span> <span class="n">UMBPTierType</span>
+
+<span class="n">_1GB</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+
+<span class="n">client</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span>
+    <span class="s2">&quot;127.0.0.1:15558&quot;</span><span class="p">,</span>
+    <span class="n">node_id</span><span class="o">=</span><span class="s2">&quot;worker-0&quot;</span><span class="p">,</span>
+    <span class="n">node_address</span><span class="o">=</span><span class="s2">&quot;worker-0:8080&quot;</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="c1"># Register with available DRAM capacity</span>
+<span class="n">client</span><span class="o">.</span><span class="n">register_self</span><span class="p">({</span><span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">:</span> <span class="p">(</span><span class="n">_1GB</span><span class="p">,</span> <span class="n">_1GB</span><span class="p">)})</span>
+<span class="k">assert</span> <span class="n">client</span><span class="o">.</span><span class="n">is_registered</span><span class="p">()</span>
+
+<span class="c1"># ... do work ...</span>
+
+<span class="n">client</span><span class="o">.</span><span class="n">unregister_self</span><span class="p">()</span>
+</pre></div>
+</div>
+<p><strong>Reporting and matching KV blocks:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.cpp</span><span class="w"> </span><span class="kn">import</span> <span class="n">UMBPMasterClient</span><span class="p">,</span> <span class="n">UMBPTierType</span>
+
+<span class="n">_1GB</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+<span class="n">master</span> <span class="o">=</span> <span class="s2">&quot;127.0.0.1:15558&quot;</span>
+
+<span class="c1"># Node A reports that it holds some KV blocks in DRAM</span>
+<span class="n">node_a</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">,</span> <span class="n">node_id</span><span class="o">=</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">node_address</span><span class="o">=</span><span class="s2">&quot;node-a:8080&quot;</span><span class="p">)</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">register_self</span><span class="p">({</span><span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">:</span> <span class="p">(</span><span class="n">_1GB</span><span class="p">,</span> <span class="n">_1GB</span><span class="p">)})</span>
+
+<span class="n">hashes</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;sha256-abc&quot;</span><span class="p">,</span> <span class="s2">&quot;sha256-def&quot;</span><span class="p">,</span> <span class="s2">&quot;sha256-ghi&quot;</span><span class="p">]</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">)</span>
+
+<span class="c1"># Node B queries which nodes hold these blocks</span>
+<span class="n">node_b</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">)</span>
+<span class="n">matches</span> <span class="o">=</span> <span class="n">node_b</span><span class="o">.</span><span class="n">match_external_kv</span><span class="p">(</span><span class="n">hashes</span><span class="p">)</span>
+
+<span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">matches</span><span class="p">:</span>
+    <span class="n">per_tier</span> <span class="o">=</span> <span class="p">{</span><span class="n">t</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">hs</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span><span class="p">,</span> <span class="n">hs</span> <span class="ow">in</span> <span class="n">m</span><span class="o">.</span><span class="n">hashes_by_tier</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+    <span class="n">peer</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">peer_address</span> <span class="ow">or</span> <span class="s2">&quot;&lt;no PeerService&gt;&quot;</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;node </span><span class="si">{</span><span class="n">m</span><span class="o">.</span><span class="n">node_id</span><span class="si">}</span><span class="s2"> @ </span><span class="si">{</span><span class="n">peer</span><span class="si">}</span><span class="s2"> has </span><span class="si">{</span><span class="n">m</span><span class="o">.</span><span class="n">matched_hash_count</span><span class="p">()</span><span class="si">}</span><span class="s2"> blocks: </span><span class="si">{</span><span class="n">per_tier</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="c1"># → &quot;node node-a @ &lt;no PeerService&gt; has 3 blocks: {&#39;DRAM&#39;: 3}&quot;</span>
+</pre></div>
+</div>
+<p><strong>Revoking blocks when one tier is evicted:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># GPU was evicted but the host (DRAM) mirror is still alive — drop only</span>
+<span class="c1"># the HBM bucket; node-a stays in the index with its DRAM bucket intact.</span>
+<span class="n">evicted</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;sha256-abc&quot;</span><span class="p">,</span> <span class="s2">&quot;sha256-def&quot;</span><span class="p">]</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">revoke_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">evicted</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">HBM</span><span class="p">)</span>
+</pre></div>
+</div>
+<p><strong>Bulk revoke when an entire tier is wiped:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Storage backend was cleared — drop every SSD bucket this node has in</span>
+<span class="c1"># one RPC.  HBM and DRAM buckets are untouched.</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">revoke_all_external_kv_blocks_at_tier</span><span class="p">(</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">SSD</span><span class="p">)</span>
+</pre></div>
+</div>
+<p><strong>Same node holding the same blocks on multiple tiers:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># write_through created a CPU mirror while the GPU copy is still alive</span>
+<span class="c1"># — report both tiers; the master keeps both buckets.</span>
+<span class="n">hashes</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;sha256-prefix-0&quot;</span><span class="p">,</span> <span class="s2">&quot;sha256-prefix-1&quot;</span><span class="p">]</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">HBM</span><span class="p">)</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">)</span>
+
+<span class="n">matches</span> <span class="o">=</span> <span class="n">node_a</span><span class="o">.</span><span class="n">match_external_kv</span><span class="p">(</span><span class="n">hashes</span><span class="p">)</span>
+<span class="n">m</span> <span class="o">=</span> <span class="n">matches</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="c1"># m.hashes_by_tier == {UMBPTierType.HBM: [...], UMBPTierType.DRAM: [...]}</span>
+<span class="c1"># m.matched_hash_count() == 2  (distinct, NOT 4 — same hash on two tiers)</span>
+</pre></div>
+</div>
+<p><strong>Multiple nodes holding the same blocks (different tiers):</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">_1GB</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+<span class="n">hashes</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;sha256-shared-0&quot;</span><span class="p">,</span> <span class="s2">&quot;sha256-shared-1&quot;</span><span class="p">]</span>
+
+<span class="n">node_a</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">,</span> <span class="n">node_id</span><span class="o">=</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">node_address</span><span class="o">=</span><span class="s2">&quot;node-a:8080&quot;</span><span class="p">)</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">register_self</span><span class="p">({</span><span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">:</span> <span class="p">(</span><span class="n">_1GB</span><span class="p">,</span> <span class="n">_1GB</span><span class="p">)})</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">)</span>
+
+<span class="n">node_b</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">,</span> <span class="n">node_id</span><span class="o">=</span><span class="s2">&quot;node-b&quot;</span><span class="p">,</span> <span class="n">node_address</span><span class="o">=</span><span class="s2">&quot;node-b:8080&quot;</span><span class="p">)</span>
+<span class="n">node_b</span><span class="o">.</span><span class="n">register_self</span><span class="p">({</span><span class="n">UMBPTierType</span><span class="o">.</span><span class="n">HBM</span><span class="p">:</span> <span class="p">(</span><span class="n">_1GB</span><span class="p">,</span> <span class="n">_1GB</span><span class="p">)})</span>
+<span class="n">node_b</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;node-b&quot;</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">HBM</span><span class="p">)</span>
+
+<span class="c1"># match_external_kv returns one entry per node; each entry breaks the</span>
+<span class="c1"># matched hashes down by every tier they live on for that node.</span>
+<span class="n">matches</span> <span class="o">=</span> <span class="n">node_a</span><span class="o">.</span><span class="n">match_external_kv</span><span class="p">(</span><span class="n">hashes</span><span class="p">)</span>
+<span class="n">matched_nodes</span> <span class="o">=</span> <span class="p">{</span><span class="n">m</span><span class="o">.</span><span class="n">node_id</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">hashes_by_tier</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span> <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">matches</span><span class="p">}</span>
+<span class="c1"># → {&quot;node-a&quot;: [UMBPTierType.DRAM], &quot;node-b&quot;: [UMBPTierType.HBM]}</span>
+</pre></div>
+</div>
+<p><strong>Using ``match_external_kv`` for KV-cache-aware scheduling:</strong></p>
+<p><code class="docutils literal notranslate"><span class="pre">match_external_kv</span></code> is intentionally grouped by node, then by tier.  A
+scheduler such as mori-scheduler can derive both a per-worker cache-hit score
+and per-hash source locations from this response.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">defaultdict</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mori.cpp</span><span class="w"> </span><span class="kn">import</span> <span class="n">UMBPMasterClient</span><span class="p">,</span> <span class="n">UMBPTierType</span>
+
+<span class="n">master</span> <span class="o">=</span> <span class="s2">&quot;127.0.0.1:15558&quot;</span>
+<span class="n">query_client</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">)</span>
+
+<span class="n">query_hashes</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="s2">&quot;sha256-prefix-0&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;sha256-prefix-1&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;sha256-prefix-2&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;sha256-prefix-3&quot;</span><span class="p">,</span>
+<span class="p">]</span>
+<span class="n">matches</span> <span class="o">=</span> <span class="n">query_client</span><span class="o">.</span><span class="n">match_external_kv</span><span class="p">(</span><span class="n">query_hashes</span><span class="p">)</span>
+
+<span class="c1"># hash -&gt; list of candidate locations.  Useful for building a future</span>
+<span class="c1"># prefetch hint or for explaining why a request was routed to a worker.</span>
+<span class="n">locations_by_hash</span> <span class="o">=</span> <span class="n">defaultdict</span><span class="p">(</span><span class="nb">list</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">matches</span><span class="p">:</span>
+    <span class="k">for</span> <span class="n">tier</span><span class="p">,</span> <span class="n">hashes</span> <span class="ow">in</span> <span class="n">m</span><span class="o">.</span><span class="n">hashes_by_tier</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="k">for</span> <span class="n">h</span> <span class="ow">in</span> <span class="n">hashes</span><span class="p">:</span>
+            <span class="n">locations_by_hash</span><span class="p">[</span><span class="n">h</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                <span class="p">{</span>
+                    <span class="s2">&quot;node_id&quot;</span><span class="p">:</span> <span class="n">m</span><span class="o">.</span><span class="n">node_id</span><span class="p">,</span>
+                    <span class="s2">&quot;peer_address&quot;</span><span class="p">:</span> <span class="n">m</span><span class="o">.</span><span class="n">peer_address</span><span class="p">,</span>
+                    <span class="s2">&quot;tier&quot;</span><span class="p">:</span> <span class="n">tier</span><span class="p">,</span>
+                <span class="p">}</span>
+            <span class="p">)</span>
+
+<span class="c1"># Per-node summaries for routing.  Do NOT sum bucket sizes to get a hit</span>
+<span class="c1"># count: the same hash can appear in HBM+DRAM+SSD on the same node.</span>
+<span class="n">summaries</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">matches</span><span class="p">:</span>
+    <span class="n">best_tier_by_hash</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">for</span> <span class="n">tier</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">hashes_by_tier</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">h</span> <span class="ow">in</span> <span class="n">m</span><span class="o">.</span><span class="n">hashes_by_tier</span><span class="p">[</span><span class="n">tier</span><span class="p">]:</span>
+            <span class="n">best_tier_by_hash</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">h</span><span class="p">,</span> <span class="n">tier</span><span class="p">)</span>
+
+    <span class="n">summaries</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+        <span class="p">{</span>
+            <span class="s2">&quot;node_id&quot;</span><span class="p">:</span> <span class="n">m</span><span class="o">.</span><span class="n">node_id</span><span class="p">,</span>
+            <span class="s2">&quot;matched_blocks&quot;</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">best_tier_by_hash</span><span class="p">),</span>  <span class="c1"># distinct hashes</span>
+            <span class="s2">&quot;per_tier_blocks&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="n">tier</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">hashes</span><span class="p">))</span>
+                <span class="k">for</span> <span class="n">tier</span><span class="p">,</span> <span class="n">hashes</span> <span class="ow">in</span> <span class="n">m</span><span class="o">.</span><span class="n">hashes_by_tier</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+            <span class="p">},</span>
+            <span class="c1"># Fastest tier for each matched hash on this node.</span>
+            <span class="s2">&quot;best_tier_by_hash&quot;</span><span class="p">:</span> <span class="n">best_tier_by_hash</span><span class="p">,</span>
+        <span class="p">}</span>
+    <span class="p">)</span>
+
+<span class="n">not_found</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">query_hashes</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">locations_by_hash</span><span class="p">)</span>
+<span class="n">best_node</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">summaries</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">s</span><span class="p">:</span> <span class="n">s</span><span class="p">[</span><span class="s2">&quot;matched_blocks&quot;</span><span class="p">],</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+
+<span class="c1"># Example policy sketch:</span>
+<span class="c1"># - HBM hits are best routed to the same worker/rank.</span>
+<span class="c1"># - DRAM hits are cheaper than recompute but require H2D load-back.</span>
+<span class="c1"># - SSD hits are L3/storage hits and should carry a higher fetch cost.</span>
+<span class="n">tier_cost</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">HBM</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+    <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
+    <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">SSD</span><span class="p">:</span> <span class="mi">3</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">estimated_fetch_cost</span><span class="p">(</span><span class="n">summary</span><span class="p">):</span>
+    <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span>
+        <span class="n">tier_cost</span><span class="p">[</span><span class="n">tier</span><span class="p">]</span>
+        <span class="k">for</span> <span class="n">tier</span> <span class="ow">in</span> <span class="n">summary</span><span class="p">[</span><span class="s2">&quot;best_tier_by_hash&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
+    <span class="p">)</span>
+
+<span class="n">cost_aware_node</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">summaries</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="n">estimated_fetch_cost</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+<span class="c1"># Production policies should combine this tier cost with recompute cost for</span>
+<span class="c1"># `not_found`, queue depth, and worker health/load signals.</span>
+</pre></div>
+</div>
+<p><strong>Identifying hot KV blocks (end-to-end):</strong></p>
+<p>The hot-block use case has two pieces, usually but not necessarily in
+different processes:</p>
+<p><em>Piece 1 — On the request-routing path,</em> call <code class="docutils literal notranslate"><span class="pre">match_external_kv</span></code>
+with <code class="docutils literal notranslate"><span class="pre">count_as_hit=True</span></code> so each unique hash matched on this lookup
+gets one increment on the master:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.cpp</span><span class="w"> </span><span class="kn">import</span> <span class="n">UMBPMasterClient</span>
+
+<span class="n">router</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="s2">&quot;127.0.0.1:15558&quot;</span><span class="p">)</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">route_request</span><span class="p">(</span><span class="n">prefix_hashes</span><span class="p">):</span>
+    <span class="c1"># count_as_hit=True is the ONLY thing that feeds the hit index.</span>
+    <span class="c1"># Each unique hash in `prefix_hashes` that actually matches in the</span>
+    <span class="c1"># placement index is incremented exactly once on the master.</span>
+    <span class="n">matches</span> <span class="o">=</span> <span class="n">router</span><span class="o">.</span><span class="n">match_external_kv</span><span class="p">(</span><span class="n">prefix_hashes</span><span class="p">,</span> <span class="n">count_as_hit</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">matches</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>  <span class="c1"># cache miss — fall back to a recompute worker</span>
+    <span class="k">return</span> <span class="n">pick_worker_from_matches</span><span class="p">(</span><span class="n">matches</span><span class="p">)</span>  <span class="c1"># caller-defined policy</span>
+
+<span class="c1"># Anywhere else (dashboards, probes, health checks, debug tools) that</span>
+<span class="c1"># also wants the placement of these hashes must use count_as_hit=False</span>
+<span class="c1"># so it does not pollute the counter.</span>
+</pre></div>
+</div>
+<p><em>Piece 2 — From anywhere with access to the master,</em> read the
+counters back to rank your hashes by hotness.  Maintain the hash
+universe in your caller; the master has no scan / top-N RPC.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mori.cpp</span><span class="w"> </span><span class="kn">import</span> <span class="n">UMBPMasterClient</span>
+
+<span class="n">monitor</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="s2">&quot;127.0.0.1:15558&quot;</span><span class="p">)</span>
+
+<span class="c1"># The set of hashes you want to observe — typically the union of</span>
+<span class="c1"># hashes your workers have reported, or the prefix hashes your</span>
+<span class="c1"># scheduler has seen.  You own this set; the master does not enumerate</span>
+<span class="c1"># it for you.</span>
+<span class="n">tracked_hashes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">load_tracked_prefix_hashes</span><span class="p">()</span>
+
+<span class="c1"># Split into UMBP_HIT_QUERY_MAX_BATCH (default 4096) chunks to avoid</span>
+<span class="c1"># RuntimeError on oversized requests.</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">fetch_counts</span><span class="p">(</span><span class="n">client</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">batch</span><span class="o">=</span><span class="mi">4096</span><span class="p">):</span>
+    <span class="n">counts</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">hashes</span><span class="p">),</span> <span class="n">batch</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">entry</span> <span class="ow">in</span> <span class="n">client</span><span class="o">.</span><span class="n">get_external_kv_hit_counts</span><span class="p">(</span><span class="n">hashes</span><span class="p">[</span><span class="n">i</span> <span class="p">:</span> <span class="n">i</span> <span class="o">+</span> <span class="n">batch</span><span class="p">]):</span>
+            <span class="n">counts</span><span class="p">[</span><span class="n">entry</span><span class="o">.</span><span class="n">hash</span><span class="p">]</span> <span class="o">=</span> <span class="n">entry</span><span class="o">.</span><span class="n">hit_count_total</span>
+    <span class="k">return</span> <span class="n">counts</span>
+
+<span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+    <span class="n">counts</span> <span class="o">=</span> <span class="n">fetch_counts</span><span class="p">(</span><span class="n">monitor</span><span class="p">,</span> <span class="n">tracked_hashes</span><span class="p">)</span>
+    <span class="c1"># Hashes with no recorded routing hit are absent — that is NOT the</span>
+    <span class="c1"># same as hit_count_total == 0.  Treat absent as &quot;no counted</span>
+    <span class="c1"># routing lookup yet&quot; / &quot;GC&#39;d after UMBP_HIT_INDEX_TTL_SEC of</span>
+    <span class="c1"># inactivity&quot;.</span>
+    <span class="n">hottest</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">counts</span><span class="o">.</span><span class="n">items</span><span class="p">(),</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">kv</span><span class="p">:</span> <span class="n">kv</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">reverse</span><span class="o">=</span><span class="kc">True</span><span class="p">)[:</span><span class="mi">32</span><span class="p">]</span>
+
+    <span class="c1"># What you do with `hottest` is entirely up to you — UMBP does not</span>
+    <span class="c1"># change placement or eviction based on this signal.  Examples:</span>
+    <span class="c1">#</span>
+    <span class="c1">#   pin_to_hbm([h for h, _ in hottest])</span>
+    <span class="c1">#   replicate_to_more_workers([h for h, _ in hottest])</span>
+    <span class="c1">#   export_to_prometheus(hottest)</span>
+    <span class="c1">#</span>
+    <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mi">30</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>If you need <em>recent</em> hotness rather than lifetime hotness, replace the
+single <code class="docutils literal notranslate"><span class="pre">fetch_counts</span></code> call with the snapshot-and-diff pattern shown in
+the <a class="reference internal" href="#cache-hit-tracking">Cache Hit Tracking</a> section above.</p>
+<p><strong>A few subtle properties worth remembering:</strong></p>
+<ul class="simple">
+<li><p>A counter survives <code class="docutils literal notranslate"><span class="pre">revoke_external_kv_blocks</span></code> /
+<code class="docutils literal notranslate"><span class="pre">revoke_all_external_kv_blocks_at_tier</span></code> — the placement index and the
+hit index are decoupled.  This is what lets the caller say “this block
+is no longer cached anywhere but it was hot, let’s re-warm it”.</p></li>
+<li><p>A counter does <strong>not</strong> survive a master restart or
+<code class="docutils literal notranslate"><span class="pre">UMBP_HIT_INDEX_TTL_SEC</span></code> of inactivity.  Long-tail hashes will
+eventually fall out of the index; only persistently hot blocks stay.</p></li>
+<li><p>The two pieces above can live in the same process or in different
+processes on different hosts — both work.  They can use either
+<code class="docutils literal notranslate"><span class="pre">UMBPMasterClient</span></code> or the data-plane <code class="docutils literal notranslate"><span class="pre">mori.cpp.UMBPClient</span></code>; both
+share the same hit index on the master.</p></li>
+</ul>
+<p><strong>For Rust / tonic consumers</strong>, mirror the current proto shape.
+<code class="docutils literal notranslate"><span class="pre">MatchExternalKv</span></code>:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">collections</span><span class="p">::{</span><span class="n">HashMap</span><span class="p">,</span><span class="w"> </span><span class="n">HashSet</span><span class="p">};</span>
+
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">NodeMatch</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">node_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">peer_address</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">hashes_by_tier</span><span class="p">:</span><span class="w"> </span><span class="nc">HashMap</span><span class="o">&lt;</span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="k">impl</span><span class="w"> </span><span class="n">NodeMatch</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">matched_hash_count</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">seen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">HashSet</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="n">hashes</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">hashes_by_tier</span><span class="p">.</span><span class="n">values</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">for</span><span class="w"> </span><span class="n">h</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">hashes</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">seen</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="n">h</span><span class="p">);</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">seen</span><span class="p">.</span><span class="n">len</span><span class="p">()</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>Do not keep using a legacy <code class="docutils literal notranslate"><span class="pre">matched_hashes:</span> <span class="pre">Vec&lt;String&gt;,</span> <span class="pre">tier:</span> <span class="pre">i32</span></code> wrapper:
+it cannot represent one block living on multiple HiCache tiers and will either
+lose tier information or double-count hits.</p>
+<p><code class="docutils literal notranslate"><span class="pre">GetExternalKvHitCounts</span></code>:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">HitCountEntry</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">hash</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">hit_count_total</span><span class="p">:</span><span class="w"> </span><span class="kt">u64</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="c1">// Request: GetExternalKvHitCountsRequest { hashes: Vec&lt;String&gt; }</span>
+<span class="c1">// Response: GetExternalKvHitCountsResponse { entries: Vec&lt;HitCountEntry&gt; }</span>
+<span class="c1">//</span>
+<span class="c1">// - Entries are sparse: hashes that have never been counted, or that</span>
+<span class="c1">//   expired after UMBP_HIT_INDEX_TTL_SEC, are simply omitted.</span>
+<span class="c1">// - Response order is not guaranteed to follow request order; build a</span>
+<span class="c1">//   HashMap&lt;String, u64&gt; keyed by hash.</span>
+<span class="c1">// - Batches larger than UMBP_HIT_QUERY_MAX_BATCH (default 4096) return</span>
+<span class="c1">//   gRPC INVALID_ARGUMENT — split client-side.</span>
+</pre></div>
+</div>
+<p><strong>Context-manager pattern for automatic cleanup:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">contextlib</span>
+
+<span class="nd">@contextlib</span><span class="o">.</span><span class="n">contextmanager</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">registered_client</span><span class="p">(</span><span class="n">master_address</span><span class="p">,</span> <span class="n">node_id</span><span class="p">,</span> <span class="n">tier_caps</span><span class="p">):</span>
+    <span class="n">client</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master_address</span><span class="p">,</span> <span class="n">node_id</span><span class="o">=</span><span class="n">node_id</span><span class="p">,</span> <span class="n">node_address</span><span class="o">=</span><span class="n">node_id</span><span class="p">)</span>
+    <span class="n">client</span><span class="o">.</span><span class="n">register_self</span><span class="p">(</span><span class="n">tier_caps</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">yield</span> <span class="n">client</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="k">with</span> <span class="n">contextlib</span><span class="o">.</span><span class="n">suppress</span><span class="p">(</span><span class="ne">Exception</span><span class="p">):</span>
+            <span class="n">client</span><span class="o">.</span><span class="n">unregister_self</span><span class="p">()</span>
+
+<span class="n">_1GB</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+<span class="k">with</span> <span class="n">registered_client</span><span class="p">(</span><span class="s2">&quot;127.0.0.1:15558&quot;</span><span class="p">,</span> <span class="s2">&quot;worker-0&quot;</span><span class="p">,</span> <span class="p">{</span><span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">:</span> <span class="p">(</span><span class="n">_1GB</span><span class="p">,</span> <span class="n">_1GB</span><span class="p">)})</span> <span class="k">as</span> <span class="n">c</span><span class="p">:</span>
+    <span class="n">c</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;worker-0&quot;</span><span class="p">,</span> <span class="p">[</span><span class="s2">&quot;sha256-abc&quot;</span><span class="p">],</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">)</span>
+    <span class="n">matches</span> <span class="o">=</span> <span class="n">c</span><span class="o">.</span><span class="n">match_external_kv</span><span class="p">([</span><span class="s2">&quot;sha256-abc&quot;</span><span class="p">])</span>
+</pre></div>
+</div>
+</section>
+<hr class="docutils" />
+<section id="end-to-end-example">
+<h2>End-to-End Example<a class="headerlink" href="#end-to-end-example" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">examples/umbp/umbp_master_client_demo.py</span></code> is a self-contained script that
+starts the master binary as a subprocess, runs a multi-tier
+report/match/revoke scenario, then shuts everything down cleanly.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># From the repo root — binary auto-detected from build/</span>
+python<span class="w"> </span>examples/umbp/umbp_master_client_demo.py
+
+<span class="c1"># Point at a specific binary</span>
+<span class="nv">UMBP_MASTER_BIN</span><span class="o">=</span>/path/to/umbp_master<span class="w"> </span>python<span class="w"> </span>examples/umbp/umbp_master_client_demo.py
+</pre></div>
+</div>
+<p>The script is reproduced in full at
+<a class="reference external" href="../../examples/umbp/umbp_master_client_demo.py">examples/umbp/umbp_master_client_demo.py</a>.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="profiler.html" class="btn btn-neutral float-left" title="MORI-VIZ Kernel Profiler" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

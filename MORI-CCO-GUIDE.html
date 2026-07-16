@@ -1,0 +1,674 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MORI CCO Guide &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="MORI-IR Guide" href="MORI-IR-GUIDE.html" />
+    <link rel="prev" title="MORI Shmem Guide" href="MORI-SHMEM-GUIDE.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning">10. Tuning</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#overview">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-config-files">Tuning Config Files</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node-tuning">Intra-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node-tuning">Inter-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-on-a-new-gpu-platform">Tuning on a New GPU Platform</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">11. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">12. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">MORI CCO Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#communicator-ccocomm">Communicator (<code class="docutils literal notranslate"><span class="pre">ccoComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#symmetric-memory-and-windows">Symmetric memory and windows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#device-communicator-ccodevcomm">Device communicator (<code class="docutils literal notranslate"><span class="pre">ccoDevComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#teams">Teams</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#initialization">2. Initialization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#memory-and-windows">3. Memory and Windows</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#device-communicator">4. Device Communicator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#host-barrier">5. Host Barrier</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#device-side-programming">6. Device-Side Programming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#c-api">8. C++ API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#environment-variables">9. Environment Variables</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-intranode-kernels">Profiling intranode kernels</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#bandwidth-computation">Bandwidth Computation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#rdma-bandwidth">RDMA bandwidth</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="MORI-EP-BENCHMARK.html#algo-bw-vs-physical-bw">Algo BW vs Physical BW</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nvl-xgmi-bandwidth">NVL / XGMI bandwidth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#why-deepep-and-mori-rdma-token-counts-are-equivalent">Why DeepEP and Mori RDMA token counts are equivalent</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#combine">Combine</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#reference-print-bw-values-py">Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-internode-kernels">Profiling Internode Kernels</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-commands">Benchmark Commands</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#fabric-cross-node-scale-up-ualink-super-node">Fabric (cross-node scale-up UALink super-node)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP Master Client</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#starting-the-master-server">Starting the Master Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbptiertype">UMBPTierType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvnodematch">UMBPExternalKvNodeMatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpmasterclient">UMBPMasterClient</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#cache-hit-tracking">Cache Hit Tracking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#finding-hot-kv-blocks-the-typical-workflow">Finding hot KV blocks (the typical workflow)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#lifetime-cumulative-not-a-rate">Lifetime cumulative — not a rate</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvhitcountentry">UMBPExternalKvHitCountEntry</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#usage-examples">Usage Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#end-to-end-example">End-to-End Example</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">MORI CCO Guide</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/MORI-CCO-GUIDE.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="mori-cco-guide">
+<h1>MORI CCO Guide<a class="headerlink" href="#mori-cco-guide" title="Link to this heading"></a></h1>
+<p><strong>CCO</strong> (Collective Communication Object) is MORI’s GPU communication layer
+built around an explicit communicator handle. Unlike a process-global singleton,
+every <code class="docutils literal notranslate"><span class="pre">ccoComm</span></code> is independently allocated, so a single process can hold multiple
+independent communicators and drive them concurrently from multiple threads.</p>
+<p>CCO exposes GPU-initiated one-sided communication over three transports:</p>
+<ul class="simple">
+<li><p><strong>LSA</strong> (Local Symmetric Access) — intra-node peer-to-peer over a flat
+symmetric virtual address space (XGMI). The kernel gets a peer’s
+load/store-addressable pointer and writes it directly.</p></li>
+<li><p><strong>GDA</strong> (GPU-Direct Async) — cross-node one-sided RDMA (put / get / signal /
+counter) issued from the device.</p></li>
+<li><p><strong>SDMA</strong> — copy-engine transfers with a device-visible signal pool.</p></li>
+</ul>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
+<ol class="arabic simple">
+<li><p><a class="reference internal" href="#quick-reference"><span class="xref myst">Quick Reference</span></a></p></li>
+<li><p><a class="reference internal" href="#1-concepts"><span class="xref myst">Concepts</span></a></p></li>
+<li><p><a class="reference internal" href="#2-initialization"><span class="xref myst">Initialization</span></a></p></li>
+<li><p><a class="reference internal" href="#3-memory-and-windows"><span class="xref myst">Memory and Windows</span></a></p></li>
+<li><p><a class="reference internal" href="#4-device-communicator"><span class="xref myst">Device Communicator</span></a></p></li>
+<li><p><a class="reference internal" href="#5-host-barrier"><span class="xref myst">Host Barrier</span></a></p></li>
+<li><p><a class="reference internal" href="#6-device-side-programming"><span class="xref myst">Device-Side Programming</span></a></p></li>
+<li><p><a class="reference internal" href="#7-examples"><span class="xref myst">Examples</span></a></p></li>
+<li><p><a class="reference internal" href="#8-c-api"><span class="xref myst">C++ API</span></a></p></li>
+<li><p><a class="reference internal" href="#9-environment-variables"><span class="xref myst">Environment Variables</span></a></p></li>
+</ol>
+</section>
+<section id="quick-reference">
+<h2>Quick Reference<a class="headerlink" href="#quick-reference" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.cco</span><span class="w"> </span><span class="kn">import</span> <span class="n">Communicator</span><span class="p">,</span> <span class="n">CCODevCommRequirements</span><span class="p">,</span> <span class="n">GDA_CONNECTION_NONE</span>
+
+<span class="c1"># Bootstrap: rank 0 mints a unique id, broadcast it out-of-band (MPI / torch.dist)</span>
+<span class="n">uid</span> <span class="o">=</span> <span class="n">Communicator</span><span class="o">.</span><span class="n">get_unique_id</span><span class="p">()</span> <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="kc">None</span>
+<span class="n">uid</span> <span class="o">=</span> <span class="n">comm_mpi</span><span class="o">.</span><span class="n">bcast</span><span class="p">(</span><span class="n">uid</span><span class="p">,</span> <span class="n">root</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+<span class="c1"># Create the communicator (reserves per-rank flat VMM)</span>
+<span class="k">with</span> <span class="n">Communicator</span><span class="o">.</span><span class="n">init</span><span class="p">(</span><span class="n">nranks</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">uid</span><span class="p">,</span> <span class="n">per_rank_vmm</span><span class="o">=</span><span class="mi">256</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">)</span> <span class="k">as</span> <span class="n">comm</span><span class="p">:</span>
+    <span class="c1"># Allocate symmetric memory and register a P2P/RDMA window over it</span>
+    <span class="n">mem</span> <span class="o">=</span> <span class="n">comm</span><span class="o">.</span><span class="n">alloc_mem</span><span class="p">(</span><span class="mi">4096</span><span class="p">)</span>
+    <span class="n">win</span> <span class="o">=</span> <span class="n">comm</span><span class="o">.</span><span class="n">register_window</span><span class="p">(</span><span class="n">mem</span><span class="o">.</span><span class="n">ptr</span><span class="p">,</span> <span class="n">mem</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
+
+    <span class="c1"># Create a device communicator (pass into kernels)</span>
+    <span class="n">reqs</span> <span class="o">=</span> <span class="n">CCODevCommRequirements</span><span class="p">()</span>
+    <span class="n">reqs</span><span class="o">.</span><span class="n">gda_connection_type</span> <span class="o">=</span> <span class="n">GDA_CONNECTION_NONE</span>
+    <span class="n">reqs</span><span class="o">.</span><span class="n">lsa_barrier_count</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">dc</span> <span class="o">=</span> <span class="n">comm</span><span class="o">.</span><span class="n">create_dev_comm</span><span class="p">(</span><span class="n">reqs</span><span class="p">)</span>
+
+    <span class="n">comm</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>   <span class="c1"># collective host barrier</span>
+<span class="c1"># resources are released on context exit</span>
+</pre></div>
+</div>
+<p>Run with any launcher that can broadcast the unique id:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mpirun<span class="w"> </span>-np<span class="w"> </span><span class="m">8</span><span class="w"> </span>python<span class="w"> </span>main.py<span class="w">         </span><span class="c1"># mpi4py bootstrap</span>
+<span class="c1"># or torchrun --standalone --nproc_per_node=8 main.py  (torch.distributed gloo)</span>
+</pre></div>
+</div>
+</section>
+<section id="concepts">
+<h2>1. Concepts<a class="headerlink" href="#concepts" title="Link to this heading"></a></h2>
+<section id="communicator-ccocomm">
+<h3>Communicator (<code class="docutils literal notranslate"><span class="pre">ccoComm</span></code>)<a class="headerlink" href="#communicator-ccocomm" title="Link to this heading"></a></h3>
+<p>An explicit handle created collectively by all ranks. Holds the flat symmetric
+VA reservation, the per-rank slot allocator, intra-node topology, and transport
+resources. Multiple communicators can coexist in one process.</p>
+</section>
+<section id="symmetric-memory-and-windows">
+<h3>Symmetric memory and windows<a class="headerlink" href="#symmetric-memory-and-windows" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">alloc_mem(size)</span></code> reserves GPU memory inside the communicator’s flat VA at the
+same offset on every rank. <code class="docutils literal notranslate"><span class="pre">register_window(ptr,</span> <span class="pre">size)</span></code> makes that region
+peer-reachable: it P2P-maps the region to intra-node peers and registers an RDMA
+memory region for cross-node peers. A registered window is therefore reachable
+by <strong>both</strong> LSA (intra-node) and GDA (cross-node) with no extra setup.</p>
+</section>
+<section id="device-communicator-ccodevcomm">
+<h3>Device communicator (<code class="docutils literal notranslate"><span class="pre">ccoDevComm</span></code>)<a class="headerlink" href="#device-communicator-ccodevcomm" title="Link to this heading"></a></h3>
+<p>A trivially-copyable host struct filled by <code class="docutils literal notranslate"><span class="pre">create_dev_comm</span></code>. It carries device
+pointers plus topology and per-session resources (signal/counter pools,
+barriers). Pass it <strong>by value</strong> into kernels — it lands in kernel-argument space,
+so kernels read it without a GPU-memory dereference.</p>
+</section>
+<section id="teams">
+<h3>Teams<a class="headerlink" href="#teams" title="Link to this heading"></a></h3>
+<p>Logical rank-subset descriptors (<code class="docutils literal notranslate"><span class="pre">world</span></code>, <code class="docutils literal notranslate"><span class="pre">lsa</span></code>, <code class="docutils literal notranslate"><span class="pre">cross-node</span></code>, <code class="docutils literal notranslate"><span class="pre">rail</span></code>) that let
+device code address peers without hard-coding topology.</p>
+</section>
+</section>
+<section id="initialization">
+<h2>2. Initialization<a class="headerlink" href="#initialization" title="Link to this heading"></a></h2>
+<p>CCO uses a self-contained socket bootstrap that needs only a 128-byte unique id.
+Rank 0 generates it; you broadcast it to all ranks with any out-of-band channel
+(MPI, <code class="docutils literal notranslate"><span class="pre">torch.distributed</span></code>, a file), then every rank calls <code class="docutils literal notranslate"><span class="pre">init</span></code>.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mpi4py</span><span class="w"> </span><span class="kn">import</span> <span class="n">MPI</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mori.cco</span><span class="w"> </span><span class="kn">import</span> <span class="n">Communicator</span>
+
+<span class="n">comm_mpi</span> <span class="o">=</span> <span class="n">MPI</span><span class="o">.</span><span class="n">COMM_WORLD</span>
+<span class="n">rank</span><span class="p">,</span> <span class="n">nranks</span> <span class="o">=</span> <span class="n">comm_mpi</span><span class="o">.</span><span class="n">Get_rank</span><span class="p">(),</span> <span class="n">comm_mpi</span><span class="o">.</span><span class="n">Get_size</span><span class="p">()</span>
+
+<span class="n">uid</span> <span class="o">=</span> <span class="n">Communicator</span><span class="o">.</span><span class="n">get_unique_id</span><span class="p">()</span> <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="kc">None</span>
+<span class="n">uid</span> <span class="o">=</span> <span class="n">comm_mpi</span><span class="o">.</span><span class="n">bcast</span><span class="p">(</span><span class="n">uid</span><span class="p">,</span> <span class="n">root</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+<span class="n">comm</span> <span class="o">=</span> <span class="n">Communicator</span><span class="o">.</span><span class="n">init</span><span class="p">(</span><span class="n">nranks</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">uid</span><span class="p">,</span> <span class="n">per_rank_vmm</span><span class="o">=</span><span class="mi">256</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">)</span>
+<span class="c1"># ... use comm ...</span>
+<span class="n">comm</span><span class="o">.</span><span class="n">destroy</span><span class="p">()</span>   <span class="c1"># or use `with Communicator.init(...) as comm:`</span>
+</pre></div>
+</div>
+<p>The rendezvous network interface is selected via <code class="docutils literal notranslate"><span class="pre">MORI_SOCKET_IFNAME</span></code>
+(see <a class="reference internal" href="#9-environment-variables"><span class="xref myst">Environment Variables</span></a>).</p>
+</section>
+<section id="memory-and-windows">
+<h2>3. Memory and Windows<a class="headerlink" href="#memory-and-windows" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">mem</span> <span class="o">=</span> <span class="n">comm</span><span class="o">.</span><span class="n">alloc_mem</span><span class="p">(</span><span class="n">size</span><span class="p">)</span>          <span class="c1"># AllocatedMemory: .ptr, .size</span>
+<span class="n">win</span> <span class="o">=</span> <span class="n">comm</span><span class="o">.</span><span class="n">register_window</span><span class="p">(</span><span class="n">mem</span><span class="o">.</span><span class="n">ptr</span><span class="p">,</span> <span class="n">mem</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>   <span class="c1"># RegisteredWindow: .handle, .local_ptr</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">alloc_mem</span></code> / <code class="docutils literal notranslate"><span class="pre">register_window</span></code> are the two-step form; both track the resource
+on the communicator, so they are freed automatically on <code class="docutils literal notranslate"><span class="pre">comm.destroy()</span></code> (or
+context exit).</p></li>
+<li><p>Window registration is <strong>collective</strong>: all ranks must call it in the same order
+with the same size.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">win.handle</span></code> is the device-side window handle to hand to kernels;
+<code class="docutils literal notranslate"><span class="pre">win.local_ptr</span></code> is this rank’s local pointer into the window.</p></li>
+</ul>
+</section>
+<section id="device-communicator">
+<h2>4. Device Communicator<a class="headerlink" href="#device-communicator" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">create_dev_comm</span></code> allocates the per-session device resources described by a
+<code class="docutils literal notranslate"><span class="pre">CCODevCommRequirements</span></code>. Common fields:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gda_connection_type</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">GDA_CONNECTION_NONE</span></code> / <code class="docutils literal notranslate"><span class="pre">CROSSNODE</span></code> / <code class="docutils literal notranslate"><span class="pre">FULL</span></code> / <code class="docutils literal notranslate"><span class="pre">RAIL</span></code> — which peers get RDMA QPs</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">gda_signal_count</span></code></p></td>
+<td><p># of GDA signal slots (completion signalling)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gda_counter_count</span></code></p></td>
+<td><p># of GDA counter slots</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lsa_barrier_count</span></code></p></td>
+<td><p># of intra-node (LSA) barriers</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sdma_queue_count</span></code></p></td>
+<td><p># of SDMA queues (0 = default)</p></td>
+</tr>
+</tbody>
+</table>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">reqs</span> <span class="o">=</span> <span class="n">CCODevCommRequirements</span><span class="p">()</span>          <span class="c1"># safe defaults</span>
+<span class="n">reqs</span><span class="o">.</span><span class="n">gda_connection_type</span> <span class="o">=</span> <span class="n">GDA_CONNECTION_CROSSNODE</span>
+<span class="n">reqs</span><span class="o">.</span><span class="n">gda_signal_count</span> <span class="o">=</span> <span class="mi">128</span>
+<span class="n">dc</span> <span class="o">=</span> <span class="n">comm</span><span class="o">.</span><span class="n">create_dev_comm</span><span class="p">(</span><span class="n">reqs</span><span class="p">)</span>
+<span class="c1"># dc.rank / dc.world_size / dc.lsa_size / dc.lsa_rank query topology</span>
+</pre></div>
+</div>
+</section>
+<section id="host-barrier">
+<h2>5. Host Barrier<a class="headerlink" href="#host-barrier" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">comm</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>   <span class="c1"># collective across all ranks in the communicator</span>
+</pre></div>
+</div>
+</section>
+<section id="device-side-programming">
+<h2>6. Device-Side Programming<a class="headerlink" href="#device-side-programming" title="Link to this heading"></a></h2>
+<p>Device kernels include the CCO header directly and take the <code class="docutils literal notranslate"><span class="pre">ccoDevComm</span></code> by value.</p>
+<ul>
+<li><p><strong>LSA (intra-node):</strong> get a peer’s directly-addressable pointer and
+load/store it in the kernel.</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;mori/cco/cco.hpp&quot;</span>
+<span class="c1">// win: ccoWindow_t obtained on the host</span>
+<span class="kt">void</span><span class="o">*</span><span class="w"> </span><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ccoGetLsaPeerPtr</span><span class="p">(</span><span class="n">win</span><span class="p">,</span><span class="w"> </span><span class="n">peerLsaRank</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">);</span>
+<span class="c1">// *peer is a normal load/store target</span>
+</pre></div>
+</div>
+</li>
+<li><p><strong>GDA (cross-node):</strong> GPU-initiated RDMA put/get with signalling, via the
+scale-out header. Provider dispatch is compile-time (per NIC).</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;mori/cco/cco_scale_out.hpp&quot;</span><span class="c1">   // pulls in cco.hpp + RDMA core</span>
+</pre></div>
+</div>
+</li>
+<li><p><strong>Barriers:</strong> the LSA barrier session (<code class="docutils literal notranslate"><span class="pre">ccoLsaBarrierSession</span></code>) and the GDA
+barrier session provide <code class="docutils literal notranslate"><span class="pre">arrive</span></code> / <code class="docutils literal notranslate"><span class="pre">wait</span></code> / <code class="docutils literal notranslate"><span class="pre">sync</span></code> at thread / warp / block
+granularity (<code class="docutils literal notranslate"><span class="pre">ccoCoopThread</span></code> / <code class="docutils literal notranslate"><span class="pre">ccoCoopWarp</span></code> / <code class="docutils literal notranslate"><span class="pre">ccoCoopBlock</span></code>).</p></li>
+</ul>
+<p>FlyDSL kernels can drive the same device API — see the Python examples below.</p>
+</section>
+<section id="examples">
+<h2>7. Examples<a class="headerlink" href="#examples" title="Link to this heading"></a></h2>
+<p>Runnable examples live in <a class="reference internal" href="#../examples/cco/"><span class="xref myst"><code class="docutils literal notranslate"><span class="pre">examples/cco/</span></code></span></a>:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Example</p></th>
+<th class="head"><p>Lang</p></th>
+<th class="head"><p>Shows</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">python/01_barrier</span></code></p></td>
+<td><p>py</p></td>
+<td><p>host barrier across ranks (full lifecycle, no kernel)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">python/02_lsa_put</span></code></p></td>
+<td><p>py</p></td>
+<td><p>intra-node LSA put via a hand-written <code class="docutils literal notranslate"><span class="pre">.hip</span></code> kernel</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">python/03_flydsl_put</span></code></p></td>
+<td><p>py</p></td>
+<td><p>FlyDSL GDA put + signal/wait</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">python/04_flydsl_lsa_put</span></code></p></td>
+<td><p>py</p></td>
+<td><p>FlyDSL LSA direct peer-pointer store</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">python/05_flydsl_lsa_allreduce</span></code></p></td>
+<td><p>py</p></td>
+<td><p>FlyDSL LSA custom all-reduce</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">python/06_flydsl_gda_modes</span></code></p></td>
+<td><p>py</p></td>
+<td><p>FlyDSL GDA (thread_mode, coop) × signal matrix</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cpp/01_lsa_put.cpp</span></code></p></td>
+<td><p>c++</p></td>
+<td><p>intra-node LSA put (includes only <code class="docutils literal notranslate"><span class="pre">cco.hpp</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cpp/02_gda_put.cpp</span></code></p></td>
+<td><p>c++</p></td>
+<td><p>GPU-initiated RDMA put + signal/wait (<code class="docutils literal notranslate"><span class="pre">cco_scale_out.hpp</span></code>)</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="c-api">
+<h2>8. C++ API<a class="headerlink" href="#c-api" title="Link to this heading"></a></h2>
+<p>The host control plane and device layer are a self-contained header pair;
+include <code class="docutils literal notranslate"><span class="pre">cco.hpp</span></code> for host + LSA, or <code class="docutils literal notranslate"><span class="pre">cco_scale_out.hpp</span></code> for GDA.</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;mori/cco/cco.hpp&quot;</span>
+
+<span class="n">ccoUniqueId</span><span class="w"> </span><span class="n">id</span><span class="p">;</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">rank</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="n">ccoGetUniqueId</span><span class="p">(</span><span class="o">&amp;</span><span class="n">id</span><span class="p">);</span>
+<span class="cm">/* broadcast id to all ranks */</span>
+<span class="n">ccoComm</span><span class="o">*</span><span class="w"> </span><span class="n">comm</span><span class="p">;</span>
+<span class="n">ccoCommCreate</span><span class="p">(</span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">nRanks</span><span class="p">,</span><span class="w"> </span><span class="n">rank</span><span class="p">,</span><span class="w"> </span><span class="n">perRankVmmSize</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">comm</span><span class="p">);</span>
+
+<span class="kt">void</span><span class="o">*</span><span class="w"> </span><span class="n">ptr</span><span class="p">;</span>
+<span class="n">ccoMemAlloc</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span><span class="w"> </span><span class="n">size</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">ptr</span><span class="p">);</span>
+<span class="n">ccoWindow_t</span><span class="w"> </span><span class="n">win</span><span class="p">;</span>
+<span class="n">ccoWindowRegister</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span><span class="w"> </span><span class="n">ptr</span><span class="p">,</span><span class="w"> </span><span class="n">size</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">win</span><span class="p">);</span><span class="w">   </span><span class="c1">// or the size-only overload (alloc+register)</span>
+
+<span class="n">ccoDevCommRequirements</span><span class="w"> </span><span class="n">reqs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">CCO_DEV_COMM_REQUIREMENTS_INITIALIZER</span><span class="p">;</span>
+<span class="n">reqs</span><span class="p">.</span><span class="n">gdaConnectionType</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">CCO_GDA_CONNECTION_CROSSNODE</span><span class="p">;</span>
+<span class="n">ccoDevComm</span><span class="w"> </span><span class="n">devComm</span><span class="p">;</span>
+<span class="n">ccoDevCommCreate</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">reqs</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">devComm</span><span class="p">);</span><span class="w">     </span><span class="c1">// pass devComm by value into kernels</span>
+
+<span class="n">ccoBarrierAll</span><span class="p">(</span><span class="n">comm</span><span class="p">);</span>
+
+<span class="n">ccoDevCommDestroy</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">devComm</span><span class="p">);</span>
+<span class="n">ccoWindowDeregister</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span><span class="w"> </span><span class="n">win</span><span class="p">);</span>
+<span class="n">ccoMemFree</span><span class="p">(</span><span class="n">comm</span><span class="p">,</span><span class="w"> </span><span class="n">ptr</span><span class="p">);</span>
+<span class="n">ccoCommDestroy</span><span class="p">(</span><span class="n">comm</span><span class="p">);</span>
+</pre></div>
+</div>
+</section>
+<section id="environment-variables">
+<h2>9. Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Purpose</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SOCKET_IFNAME</span></code></p></td>
+<td><p>Network interface for the unique-id socket rendezvous</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES</span></code></p></td>
+<td><p>Comma-separated RDMA devices to use (GDA)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_TC</span></code></p></td>
+<td><p>RDMA traffic class (GDA)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_SL</span></code></p></td>
+<td><p>RDMA service level (GDA)</p></td>
+</tr>
+</tbody>
+</table>
+<p>Supported GPUs: MI308X / MI300X / MI325X / MI355X. Supported NICs: AMD Pollara
+(AINIC), Mellanox ConnectX-7, Broadcom Thor2.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="MORI-SHMEM-GUIDE.html" class="btn btn-neutral float-left" title="MORI Shmem Guide" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="MORI-IR-GUIDE.html" class="btn btn-neutral float-right" title="MORI-IR Guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
