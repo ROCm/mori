@@ -2,7 +2,7 @@ name: Nightly Wheel Build
 
 on:
   schedule:
-    - cron: '0 17 * * *'  # daily 01:00 Beijing (UTC+8)
+    - cron: '0 20 * * *'  # daily 04:00 Beijing (UTC+8)
   workflow_dispatch:       # manual trigger
 
 concurrency:
