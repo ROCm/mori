@@ -15,6 +15,19 @@ You are helping the user deploy MORI inside a Docker container.
 **Locate `MORI_REPO_DIR`**: default to the current working directory if it
 contains `pyproject.toml`; ask the user otherwise.
 
+**Detect whether `docker` needs `sudo`** — every `docker` command below is
+written with a `sudo` prefix, but on hosts where the calling user is already
+in the `docker` group, `sudo docker ...` fails non-interactively with `sudo:
+a password is required` (no TTY to prompt for a password). Check first:
+
+```bash
+docker ps &>/dev/null && echo "docker works without sudo" || echo "docker needs sudo"
+```
+
+If it works without `sudo`, drop the `sudo` prefix from **every** `docker`
+command in this skill (run/exec/inspect/start/cp/ps, …) for the rest of the
+session.
+
 **Detect NIC type** — determines whether Step 3 is needed:
 
 ```bash
@@ -110,6 +123,17 @@ sudo docker exec $CONTAINER_NAME bash -c "apt-get update && apt-get install -y -
     libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler \
     libopenmpi-dev openmpi-bin"
 ```
+
+> **If `apt-get update` can't reach `archive.ubuntu.com`/`security.ubuntu.com`**
+> (`Network is unreachable` / `connection timed out`, often on cloud hosts
+> whose network only routes to a provider-internal mirror — e.g. seen on an
+> Oracle Cloud instance routed through `iad-ad-1.clouds.archive.ubuntu.com`):
+> the container's default `/etc/apt/sources.list` doesn't know about that
+> mirror even though the **host** does. Fix by copying the host's working
+> sources into the container before retrying:
+> ```bash
+> sudo docker cp /etc/apt/sources.list $CONTAINER_NAME:/etc/apt/sources.list
+> ```
 
 Non-obvious package roles:
 - `rdma-core` — version info `mori check` Step 1 reads. Without it, Step 1
@@ -295,16 +319,22 @@ works with no vendor repo at all. What's still missing for the full `mori
 check`/`mori setup` flow are two small, optional, standalone tools (**neither
 needs a full MLNX_OFED install**):
 
-- **`mlnx_qos`** (package `mlnx-tools`) — reads trust/PFC/DSCP state on RoCE ports.
-- **`mlxconfig`/`mst`** (NVIDIA MFT) — reads `ROCE_CC_PRIO_MASK_P1`/`CNP_DSCP_P1`
+- **`mlnx_qos`** (package `mlnx-tools`) — reads/sets trust/PFC/DSCP state on RoCE ports.
+- **`mlxconfig`/`mst`** (NVIDIA MFT) — reads/sets `ROCE_CC_PRIO_MASK_P1`/`CNP_DSCP_P1`
   from firmware NV config.
 
-Both optional: if missing, `mori check` logs `[WARN]` and skips those checks.
-If native IB ports outnumber RoCE ports, `mori check` treats RoCE port(s) as
-incidental and skips QoS/DCQCN anyway — Step 3c becomes unnecessary.
+Both optional: if missing, `mori check` logs `[WARN]` and skips those checks
+(and `mori setup` skips the corresponding fix). If native IB ports outnumber
+RoCE ports, `mori check` treats RoCE port(s) as incidental and skips
+QoS/DCQCN anyway — Step 3c becomes unnecessary.
 
-> **`mori setup` has no mlx5 auto-fix path** (only ionic/bnxt). On an mlx5
-> QoS/DCQCN `[FAIL]`, fix manually, e.g. `sudo mlnx_qos -i <netdev> --trust dscp`.
+> **`mori setup`'s mlx5 path** sets trust=dscp, maps the RoCE DSCP to its
+> priority, enables PFC no-drop on it, leaves TC arbitration on `vendor`
+> (no bandwidth split), and flips the `ROCE_CC_PRIO_MASK_P1` enable bit for
+> DCQCN via `mlxconfig` — CNP DSCP and the CC algorithm itself are left at
+> firmware defaults. A `mlxconfig` NV-config change needs a firmware reset
+> (`mlxfwreset -d <pci> -y reset`) or reboot to take effect; `mori setup`
+> only warns about this, it doesn't reset the NIC itself.
 
 ### 3c.1 — Detect host mlx5 driver/firmware version (informational only)
 
@@ -326,12 +356,25 @@ apt-get install -y --no-install-recommends make
 cd /tmp && rm -rf mlnx-tools
 git clone --depth 1 https://github.com/Mellanox/mlnx-tools.git
 cd mlnx-tools && make install
-mlnx_qos -i <netdev>   # sanity check; replace <netdev> with a real RoCE netdev
 '
 ```
 
 > `make install` places `mlnx_qos` at `/usr/bin/mlnx_qos`, helpers at
 > `/usr/share/mlnx-tools/python/` (script adds this to `sys.path` itself).
+
+**Sanity check — resolve a real netdev first.** `mlnx_qos -i <netdev>` needs
+an actual interface name; there's no way to hardcode one since it depends on
+which mlx5 device you pick. Resolve it from `/sys/class/infiniband/` instead
+of guessing:
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c '
+IB_DEV=$(ls /sys/class/infiniband/ | grep mlx5 | head -1)
+NETDEV=$(ls /sys/class/infiniband/$IB_DEV/device/net/ | head -1)
+echo "Using $IB_DEV -> $NETDEV"
+mlnx_qos -i "$NETDEV"
+'
+```
 
 ### 3c.3 — Install NVIDIA MFT (`mlxconfig`/`mst`)
 
@@ -452,18 +495,32 @@ RoCE ports (RoCE treated as an incidental management NIC). Steps 1/4/5/6 still
 cover every mlx5 device.
 
 > **Step 4 still probes incidental RoCE/management ports**, unlike 2/3 — the
-> full-mesh test tries every pair regardless, so a management NIC (e.g.
-> `mlx5_8`) on a separate Ethernet fabric shows unreachable (`✗`) against
-> every IB device both ways: `[WARN] intra-node BW: N/72 unreachable` where
-> `N = 2 × incidental_ports × fabric_ports`. Expected, not a fabric problem —
-> confirm the `✗` cells are only that port's row/column.
+> full-mesh test tries every pair regardless of link type or physical
+> network, so any port not on the main RDMA fabric shows unreachable (`✗`)
+> against every fabric port. This happens even with **zero native IB** —
+> e.g. a host with 8 ConnectX-7 fabric ports plus 2 ConnectX-6 Dx management
+> ports (`eth0`/`eth1` — a different HW generation, visible as its own
+> firmware-family group in Step 1's output) showed `[WARN] intra-node BW:
+> 34/90 unreachable`, with every `✗` confined to those two ports'
+> rows/columns — including the mgmt↔mgmt pair itself (also unreachable,
+> since the two management ports aren't on the same subnet as each other
+> either). Expected, not a fabric problem — confirm the `✗` cells are only
+> in incidental ports' rows/columns.
+>
+> General formula for the unreachable count: `N = n×(n-1) − f×(f-1)` where
+> `n` = total local RDMA devices and `f` = devices actually on the fabric
+> (equivalently `N = k×(k-1) + 2×k×f` for `k = n−f` incidental ports). This
+> is **not** `2 × incidental_ports × fabric_ports` — that simpler formula
+> only holds for exactly one incidental port; with 2+ incidental ports it
+> undercounts by missing the incidental↔incidental pairs (e.g. predicts 32
+> instead of the actual 34 in the example above).
 
 If any step shows `[FAIL]`:
 
 - `sudo docker exec $CONTAINER_NAME bash -c "mori setup"` auto-applies
-  QoS/PFC/DCQCN (ionic/bnxt only — on mlx5, fix manually per 3c then re-run
-  `mori check`). Env vars don't persist in the calling shell; use
-  `source $(mori setup --path)` to export them.
+  QoS/PFC/DCQCN on ionic/bnxt/mlx5. Env vars don't persist in the calling
+  shell; use `source $(mori setup --path)` to export them. On mlx5, a
+  DCQCN fix may need a firmware reset/reboot to take effect — see 3c.
 - Still failing: `sudo docker exec $CONTAINER_NAME bash -c "mori diagnose"`.
 
 ### mlx5 hardware faults (CQ errors / firmware health)

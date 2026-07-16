@@ -966,16 +966,46 @@ check_bnxt_dcqcn() {
 }
 
 # =================== mlx5 (Mellanox/NVIDIA) checks ==================
-# All three functions below skip gracefully on non-mlx5 hosts. QoS/DCQCN
-# checks only apply to ports running as Ethernet (RoCE) -- native
-# InfiniBand link layer ports use IB's own congestion control, not DCQCN,
-# and mlnx_qos/mlxconfig CC params don't apply to them.
-# They share the MLX5_ROCE_DEVS / MLX5_ROCE_ETH arrays populated by
-# check_mlx5_versions(); call that one first.
+# QoS/DCQCN only apply to Ethernet/RoCE ports (native IB uses its own CC).
+# Call check_mlx5_versions() first; it populates the arrays below.
 
 MLX5_DEVS=()        # all mlx5 IB device names (IB + Ethernet link layer)
-MLX5_ROCE_DEVS=()   # subset of the above running as Ethernet (RoCE-capable)
+MLX5_ROCE_DEVS=()   # subset running as Ethernet (RoCE-capable)
 MLX5_ROCE_ETH=()    # corresponding net devices, same order as MLX5_ROCE_DEVS
+
+# dscp2prio + PFC-enabled map from mlnx_qos, filled by check_mlx5_qos() and
+# reused by check_mlx5_dcqcn() to resolve a DSCP's priority/PFC state.
+declare -A MLX5_QOS_PRIO_DSCP=()   # priority -> comma-list of DSCPs
+MLX5_QOS_PFC_ENABLED=()            # index=priority, "1"/"0"
+
+# mlx5_prio_pfc_for_dscp <dscp> -> prints "<priority> <enabled|disabled>".
+# Fails if check_mlx5_qos() hasn't populated the maps above.
+mlx5_prio_pfc_for_dscp() {
+    local dscp="$1" p
+    for p in "${!MLX5_QOS_PRIO_DSCP[@]}"; do
+        [[ ",${MLX5_QOS_PRIO_DSCP[$p]}," == *",$dscp,"* ]] || continue
+        local pfc="disabled"
+        [[ "${MLX5_QOS_PFC_ENABLED[$p]:-0}" == "1" ]] && pfc="enabled"
+        echo "$p $pfc"
+        return 0
+    done
+    return 1
+}
+
+# mlx5_report_dscp_prio <label> <dscp> -> logs the priority/PFC state for a
+# DSCP (via mlx5_prio_pfc_for_dscp) and sets MLX5_LAST_PFC to "enabled" /
+# "disabled" (empty if unresolvable) for the caller to act on. Must be
+# called directly (not via $(...)) so its log_* output isn't captured.
+mlx5_report_dscp_prio() {
+    local label="$1" dscp="$2" lookup
+    MLX5_LAST_PFC=""
+    if lookup=$(mlx5_prio_pfc_for_dscp "$dscp"); then
+        MLX5_LAST_PFC="${lookup#* }"
+        log_ok "$(printf '%-4s' "$label") DSCP=$dscp : priority ${lookup% *}, PFC $MLX5_LAST_PFC"
+    else
+        log_warn "$(printf '%-4s' "$label") DSCP=$dscp : priority/PFC unknown (check_mlx5_qos didn't run or has no dscp2prio mapping)"
+    fi
+}
 
 # Populate MLX5_DEVS / MLX5_ROCE_DEVS / MLX5_ROCE_ETH, check fw/driver versions.
 check_mlx5_versions() {
@@ -996,91 +1026,56 @@ check_mlx5_versions() {
     fi
     log_ok "mlx5 devices (${#MLX5_DEVS[@]}): ${MLX5_DEVS[*]}"
 
-    # --- kernel module version ---
     report_driver_version mlx5_core
-
-    # mlx5_ib has no standalone `version:` field in modinfo (it's built from
-    # the same driver source/package as mlx5_core), so report_driver_version's
-    # modinfo-based approach doesn't apply -- confirm it's loaded and resolve
-    # its version via the owning package (e.g. mlnx-ofed-kernel-modules) instead.
     if lsmod | awk '{print $1}' | grep -qx mlx5_ib; then
-        local mlx5_ib_ko mlx5_ib_pkg_ver
-        mlx5_ib_ko=$(modinfo -F filename mlx5_ib 2>/dev/null || true)
-        mlx5_ib_pkg_ver=$([[ -n "$mlx5_ib_ko" ]] && dpkg -S "$mlx5_ib_ko" 2>/dev/null \
-            | cut -d: -f1 | xargs -r dpkg-query -W -f='${Version}' 2>/dev/null || true)
-        if [[ -n "$mlx5_ib_pkg_ver" ]]; then
-            log_ok "mlx5_ib driver : $mlx5_ib_pkg_ver (bundled with mlx5_core, same driver package)"
-        else
-            log_ok "mlx5_ib driver : loaded (inbox kernel module, tied to kernel $(uname -r))"
-        fi
+        log_ok "mlx5_ib driver : loaded (same package as mlx5_core)"
     else
         log_fail "mlx5_ib : not loaded"
     fi
 
-    # --- RoCE userspace library (rdma-core ships libmlx5) ---
     local rdma_core_ver
     rdma_core_ver=$(dpkg-query -W -f='${Version}' rdma-core 2>/dev/null || true)
     [[ -n "$rdma_core_ver" ]] && log_ok "rdma-core (libmlx5) userspace : $rdma_core_ver" \
                               || log_warn "rdma-core package not found (libmlx5 version unknown)"
 
-    # --- per-device firmware version, link layer, port state, netdev ---
-    # fw_ver / link_layer / port state are all plain sysfs reads (no MFT
-    # needed). Only Ethernet/RoCE ports are required to be ACTIVE; native
-    # IB ports may legitimately be Down on a RoCE-only host.
-    local dev state link fw_ver eth_dev devid
-    local active_count=0 inactive_devs=()
-    local -A fw_by_model=()  # PCI device id -> space-separated fw versions seen
+    # Only Ethernet/RoCE ports must be ACTIVE; native IB ports may legitimately
+    # be Down on a RoCE-only host.
+    local dev state link fw_ver eth_dev devid inactive_devs=()
+    local -A fw_by_model=()  # PCI device id -> space-separated fw versions
     for dev in "${MLX5_DEVS[@]}"; do
-        state=$(awk -F': *' '{print $2}' "$ib_root/$dev/ports/1/state" 2>/dev/null || true)
-        link=$(cat "$ib_root/$dev/ports/1/link_layer" 2>/dev/null || true)
-        fw_ver=$(cat "$ib_root/$dev/fw_ver" 2>/dev/null || true)
-        eth_dev=$(basename "$(readlink -f "$ib_root/$dev/device/net/"* 2>/dev/null)" 2>/dev/null || true)
-        devid=$(cat "$ib_root/$dev/device/device" 2>/dev/null || echo "unknown")
+        state=$(awk -F': *' '{print $2}' "$ib_root/$dev/ports/1/state" 2>/dev/null)
+        link=$(cat "$ib_root/$dev/ports/1/link_layer" 2>/dev/null)
+        fw_ver=$(cat "$ib_root/$dev/fw_ver" 2>/dev/null)
+        eth_dev=$(basename "$(readlink -f "$ib_root/$dev/device/net/"* 2>/dev/null)" 2>/dev/null)
+        devid=$(cat "$ib_root/$dev/device/device" 2>/dev/null)
 
-        [[ -n "$fw_ver" ]] && fw_by_model["$devid"]+="$fw_ver "
-
+        [[ -n "$fw_ver" ]] && fw_by_model["${devid:-?}"]+="$fw_ver "
         if [[ "$link" == "Ethernet" ]]; then
             MLX5_ROCE_DEVS+=("$dev")
             [[ -n "$eth_dev" ]] && MLX5_ROCE_ETH+=("$eth_dev")
+            [[ "$state" == "ACTIVE" ]] || inactive_devs+=("$dev")
         fi
 
-        if [[ "${state:-}" == "ACTIVE" ]]; then
-            (( active_count++ ))
-            log_ok "$dev : fw=${fw_ver:-?}  link=${link:-?}  eth=${eth_dev:-none}  state=$state"
+        if [[ "$state" == "ACTIVE" ]]; then
+            log_ok   "$dev : fw=${fw_ver:-?}  link=${link:-?}  eth=${eth_dev:-none}  state=$state"
         else
-            [[ "$link" == "Ethernet" ]] && inactive_devs+=("$dev")
             log_warn "$dev : fw=${fw_ver:-?}  link=${link:-?}  eth=${eth_dev:-none}  state=${state:-?}"
         fi
     done
 
-    # --- firmware version consistency, grouped per card model (PCI device id) ---
-    # Different mlx5 card generations legitimately run different firmware
-    # baselines (e.g. a ConnectX-7 fleet plus a ConnectX-5 management NIC),
-    # so only flag inconsistency *within* the same model, not across models.
-    if [[ ${#fw_by_model[@]} -eq 0 ]]; then
-        log_warn "could not read firmware version from any mlx5 device"
-    else
-        local model devname fw_uniq n_devs
-        for model in "${!fw_by_model[@]}"; do
-            devname=$(lspci -d "15b3:$model" -mm 2>/dev/null | head -1 | awk -F'"' '{print $6}')
-            fw_uniq=$(tr ' ' '\n' <<<"${fw_by_model[$model]}" | sed '/^$/d' | sort -u)
-            n_devs=$(tr ' ' '\n' <<<"${fw_by_model[$model]}" | sed '/^$/d' | wc -l)
-            if [[ $(grep -c . <<<"$fw_uniq") -gt 1 ]]; then
-                log_warn "mlx5 firmware inconsistent across ${devname:-PCI id $model} devices:"
-                printf '         %s\n' $fw_uniq
-            else
-                log_ok "mlx5 firmware (${devname:-PCI id $model}) : $fw_uniq (consistent across $n_devs device(s))"
-            fi
-        done
-    fi
+    # Different card models legitimately run different firmware, so only check
+    # consistency within a model (PCI device id).
+    [[ ${#fw_by_model[@]} -gt 0 ]] || log_warn "could not read firmware version from any mlx5 device"
+    local model devname fws
+    for model in "${!fw_by_model[@]}"; do
+        devname=$(lspci -d "15b3:$model" -mm 2>/dev/null | head -1 | awk -F'"' '{print $6}')
+        read -ra fws <<< "${fw_by_model[$model]}"
+        report_uniform "mlx5 firmware (${devname:-PCI id $model})" "${fws[@]}"
+    done
 
-    # If native IB ports outnumber RoCE ports, the RoCE port(s) are most
-    # likely an incidental management/other-purpose NIC rather than the
-    # fabric MORI actually runs its RDMA traffic over (e.g. 8 IB ports used
-    # for MORI + 1 RoCE port used only for SSH/management). In that case,
-    # skip QoS/DCQCN checks entirely instead of failing on a port that
-    # doesn't matter for MORI -- clearing MLX5_ROCE_DEVS routes both
-    # check_mlx5_qos and check_mlx5_dcqcn to their "nothing to check" skip.
+    # If native IB ports outnumber RoCE ports, the RoCE port(s) are likely an
+    # incidental management NIC, not MORI's fabric. Clear MLX5_ROCE_DEVS so
+    # QoS/DCQCN are skipped rather than failing on a port that doesn't matter.
     local ib_count=$(( ${#MLX5_DEVS[@]} - ${#MLX5_ROCE_DEVS[@]} ))
     if [[ ${#MLX5_ROCE_DEVS[@]} -eq 0 ]]; then
         log_warn "no mlx5 ports running as Ethernet/RoCE — skipping QoS/DCQCN checks (native IB uses its own CC)"
@@ -1098,9 +1093,9 @@ check_mlx5_versions() {
     fi
 }
 
-# Check PFC and DSCP-based QoS for mlx5 RoCE ports via mlnx_qos; derive
-# MORI_RDMA_SL / MORI_RDMA_TC. Uses the first RoCE-capable port as the
-# representative (QoS config is expected to be homogeneous across NICs).
+# Check PFC and DSCP-based QoS on every mlx5 RoCE port via mlnx_qos, cross-
+# checking they all agree. Derives MORI_RDMA_SL/TC and publishes the
+# dscp2prio/PFC maps (MLX5_QOS_*) that check_mlx5_dcqcn() reuses.
 check_mlx5_qos() {
     step "check mlx5 QoS / PFC (Mellanox/NVIDIA NICs)"
 
@@ -1112,75 +1107,84 @@ check_mlx5_qos() {
         log_warn "mlnx_qos not found, cannot check QoS/PFC"; return 0
     fi
 
-    local rep_dev="${MLX5_ROCE_DEVS[0]}" rep_eth="${MLX5_ROCE_ETH[0]:-}"
-    if [[ -z "$rep_eth" ]]; then
-        log_fail "$rep_dev : cannot resolve underlying net device"; return 1
-    fi
-
-    # mlnx_qos wants the *net device* name (e.g. ens14np0), NOT the RDMA
-    # device name (e.g. mlx5_8) -- passing the RDMA name fails with a
-    # netlink ENODEV that the tool masks as "not supported on your system".
-    local qos_output
-    qos_output=$(sudo mlnx_qos -i "$rep_eth" 2>&1)
-
-    # Non-fatal from here on (unlike ionic's check_qos): a misconfigured
-    # RoCE port must not abort the whole script when the host's actual RDMA
-    # fabric is native IB (or another RoCE port) -- the later intra/inter
-    # node mesh tests should still get a chance to run.
-    local trust
-    trust=$(echo "$qos_output" | grep "Priority trust state" | head -1 | awk '{print $NF}')
-    if [[ "$trust" != "dscp" ]]; then
-        log_fail "$rep_eth : trust state is '$trust', expected 'dscp'"; return 1
-    fi
-    log_ok "$rep_eth : trust state = dscp"
-
-    # PFC configuration table:
-    #   priority    0   1   2   3   4   5   6   7
-    #   enabled     0   0   1   1   0   0   0   0
-    local pfc_line enabled_arr=() nd_prios=()
-    pfc_line=$(echo "$qos_output" | grep -A2 "PFC configuration" | tail -1)
-    read -ra enabled_arr <<< "$(echo "$pfc_line" | awk '{$1=""; print}')"
-    local p
-    for p in "${!enabled_arr[@]}"; do
-        [[ "${enabled_arr[$p]}" == "1" ]] && nd_prios+=("$p")
-    done
-    if [[ ${#nd_prios[@]} -eq 0 ]]; then
-        log_fail "$rep_eth : PFC is not enabled on any priority"; return 1
-    fi
-    log_ok "$rep_eth : PFC enabled on priorities: ${nd_prios[*]}"
-
-    # dscp2prio mapping (only printed when trust=dscp):
-    #   prio:3 dscp:24,26,46,...
-    local -A prio_dscp=()
-    while IFS= read -r line; do
-        [[ "$line" =~ prio:([0-9]+)[[:space:]]+dscp:([0-9,]+) ]] || continue
-        prio_dscp["${BASH_REMATCH[1]}"]+="${BASH_REMATCH[2]}"
-    done < <(echo "$qos_output" | grep -E "^[[:space:]]*prio:[0-9]+[[:space:]]+dscp:")
-
-    # Pick a no-drop priority + DSCP. Preference order (mirrors check_qos):
-    #   1) DSCP 26 (RoCEv2 convention; also what env_setup.sh explicitly maps)
-    #      if it maps to any no-drop priority
-    #   2) otherwise the first no-drop priority's first mapped DSCP
-    local best_prio="" best_dscp=""
-    for p in "${nd_prios[@]}"; do
-        local dl="${prio_dscp[$p]:-}"
-        if [[ -z "$dl" ]]; then
-            log_warn "$rep_eth : no DSCP mapped to no-drop priority $p"; continue
+    local fail=0 sl_derived=0
+    local trust_vals=() pfc_prio_vals=() data_map_vals=()
+    local i dev eth line
+    for i in "${!MLX5_ROCE_DEVS[@]}"; do
+        dev="${MLX5_ROCE_DEVS[$i]}"
+        eth="${MLX5_ROCE_ETH[$i]:-}"
+        if [[ -z "$eth" ]]; then
+            log_fail "$dev : cannot resolve underlying net device"; fail=1; continue
         fi
-        log_ok "$rep_eth : priority $p : DSCPs=[${dl%,}]"
-        if [[ ",$dl" == *",26,"* ]]; then
-            best_prio="$p"; best_dscp=26; break
-        fi
-        [[ -z "$best_prio" ]] && { best_prio="$p"; best_dscp="${dl%%,*}"; }
-    done
-    if [[ -z "$best_prio" ]]; then
-        log_fail "$rep_eth : could not derive SL/TC from QoS info"; return 1
-    fi
 
-    # TC = DSCP << 2 (DSCP occupies the upper 6 bits of the 8-bit TC/TOS field)
-    MORI_RDMA_SL="$best_prio"
-    MORI_RDMA_TC=$(( best_dscp * 4 ))
-    log_ok "selected SL=$MORI_RDMA_SL  TC=$MORI_RDMA_TC  (priority $best_prio, DSCP $best_dscp)"
+        # mlnx_qos wants the net device (not the RDMA name), else it errors as
+        # "not supported on your system".
+        local qos_output trust pfc_line data_dscp data_prio dl p pp
+        local -a enabled_arr=() nd_prios=()
+        local -A prio_dscp=()
+        qos_output=$(sudo mlnx_qos -i "$eth" 2>&1)
+
+        trust=$(echo "$qos_output" | grep "Priority trust state" | head -1 | awk '{print $NF}')
+        if [[ "$trust" != "dscp" ]]; then
+            log_fail "$dev ($eth) : trust state is '${trust:-?}', expected 'dscp'"; fail=1; continue
+        fi
+
+        # PFC config table: "priority 0 1 2.." / "enabled 0 0 1.."
+        pfc_line=$(echo "$qos_output" | grep -A2 "PFC configuration" | tail -1)
+        read -ra enabled_arr <<< "$(echo "$pfc_line" | awk '{$1=""; print}')"
+        for p in "${!enabled_arr[@]}"; do
+            [[ "${enabled_arr[$p]}" == "1" ]] && nd_prios+=("$p")
+        done
+        if [[ ${#nd_prios[@]} -eq 0 ]]; then
+            log_fail "$dev ($eth) : PFC is not enabled on any priority"; fail=1; continue
+        fi
+
+        # dscp2prio, e.g. "prio:3 dscp:24,26,46"
+        while IFS= read -r line; do
+            [[ "$line" =~ prio:([0-9]+)[[:space:]]+dscp:([0-9,]+) ]] || continue
+            prio_dscp["${BASH_REMATCH[1]}"]+="${BASH_REMATCH[2]}"
+        done < <(echo "$qos_output" | grep -E "^[[:space:]]*prio:[0-9]+[[:space:]]+dscp:")
+
+        # Discover this card's data lane: the PFC no-drop priority, and the
+        # DSCP mapped to it. dscp2prio is many-to-one (a whole DSCP block
+        # shares one priority), so when several DSCPs sit on the lossless
+        # priority we break the tie toward 26 (RoCEv2 data convention, and
+        # what env_setup programs); otherwise we take whatever is actually
+        # there. Nothing is assumed -- absent 26, the real DSCP is reported.
+        data_dscp=""; data_prio="unmapped"
+        for p in "${nd_prios[@]}"; do
+            dl="${prio_dscp[$p]:-}"; [[ -z "$dl" ]] && continue
+            if [[ ",$dl" == *",26,"* ]]; then data_prio="$p"; data_dscp=26; break; fi
+            [[ -z "$data_dscp" ]] && { data_prio="$p"; data_dscp="${dl%%,*}"; }
+        done
+
+        log_ok "$dev ($eth) : trust=dscp, PFC prio ${nd_prios[*]}, data DSCP ${data_dscp:-?}->prio ${data_prio}"
+
+        trust_vals+=("$trust")
+        pfc_prio_vals+=("${nd_prios[*]}")
+        data_map_vals+=("${data_dscp}->${data_prio}")
+
+        # Adopt the first usable card's mapping as MORI_RDMA_SL/TC and the
+        # MLX5_QOS_* maps (homogeneity is verified below via report_uniform).
+        if [[ $sl_derived -eq 0 ]]; then
+            for pp in "${!prio_dscp[@]}"; do MLX5_QOS_PRIO_DSCP["$pp"]="${prio_dscp[$pp]%,}"; done
+            MLX5_QOS_PFC_ENABLED=("${enabled_arr[@]}")
+            MORI_RDMA_SL="$data_prio"
+            MORI_RDMA_TC=$(( data_dscp * 4 ))  # TC = DSCP << 2
+            sl_derived=1
+        fi
+    done
+
+    report_uniform "trust state"     "${trust_vals[@]}"
+    report_uniform "PFC priorities"  "${pfc_prio_vals[@]}"
+    report_uniform "data DSCP->prio" "${data_map_vals[@]}"
+
+    if [[ $sl_derived -eq 0 ]]; then
+        log_fail "could not derive SL/TC from QoS info on any RoCE port"; return 1
+    fi
+    log_ok "selected SL=$MORI_RDMA_SL  TC=$MORI_RDMA_TC  (priority $MORI_RDMA_SL, DSCP $(( MORI_RDMA_TC / 4 )))"
+
+    [[ $fail -eq 0 ]]
 }
 
 # Check DCQCN (ECN-based congestion control) for mlx5 RoCE ports via
@@ -1196,16 +1200,19 @@ check_mlx5_dcqcn() {
     if ! command -v mlxconfig >/dev/null 2>&1; then
         log_warn "mlxconfig not found (NVIDIA MFT not installed), cannot check DCQCN"; return 0
     fi
-    command -v mst >/dev/null 2>&1 && sudo mst start >/dev/null 2>&1
+    command -v mst >/dev/null 2>&1 && sudo mst start >/dev/null 2>&1 </dev/null
 
-    local fail=0 cnp_dscps=()
-    local dev pci q mask cnp_dscp
+    # Query each device's firmware NV config serially. mlxconfig is slow
+    # (~4s/device, mostly /dev/mst re-enumeration), but running the queries
+    # in parallel barely helped, so keep it simple. </dev/null keeps
+    # mlxconfig from switching the TTY to raw mode for its progress display.
+    local fail=0 cnp_dscps=() dev pci q mask cnp_dscp
     for dev in "${MLX5_ROCE_DEVS[@]}"; do
         pci=$(basename "$(readlink -f "/sys/class/infiniband/$dev/device")" 2>/dev/null)
         if [[ -z "$pci" ]]; then
             log_warn "$dev : cannot resolve PCI address"; continue
         fi
-        q=$(sudo mlxconfig -d "$pci" q 2>/dev/null)
+        q=$(sudo mlxconfig -d "$pci" q 2>/dev/null </dev/null)
         mask=$(echo "$q" | grep -i "ROCE_CC_PRIO_MASK_P1" | awk '{print $NF}')
         cnp_dscp=$(echo "$q" | grep -i "CNP_DSCP_P1" | awk '{print $NF}')
         if [[ -z "$mask" ]]; then
@@ -1220,6 +1227,16 @@ check_mlx5_dcqcn() {
     done
 
     report_uniform "CNP DSCP" "${cnp_dscps[@]}"
+
+    # Data and CNP should normally sit on different priorities: CNP must
+    # get back to the sender fast, so sharing data's PFC (lossless) queue
+    # would let backpressure delay the very signal meant to relieve it.
+    mlx5_report_dscp_prio data "$(( MORI_RDMA_TC / 4 ))"
+    if [[ ${#cnp_dscps[@]} -gt 0 ]]; then
+        mlx5_report_dscp_prio CNP "${cnp_dscps[0]}"
+        [[ "$MLX5_LAST_PFC" == "enabled" ]] && \
+            log_warn "CNP shares a PFC (lossless) priority with data — congestion signal could be delayed by backpressure on that same queue"
+    fi
 
     [[ $fail -eq 0 ]]
 }
