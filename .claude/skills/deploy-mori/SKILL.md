@@ -20,6 +20,7 @@ contains `pyproject.toml`; ask the user otherwise.
 ```bash
 lspci | grep -iE "pensando|ionic|dsc|pollara" && echo "→ ainic"
 lspci | grep -iE "broadcom.*thor|bnxt"         && echo "→ thor2"
+lspci | grep -iE "mellanox|connectx"           && echo "→ mlx5 (no Step 3 needed, works out of the box)"
 ```
 
 ---
@@ -96,7 +97,7 @@ All subsequent steps run **inside** `$CONTAINER_NAME` via `docker exec`.
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c "apt-get update && apt-get install -y --no-install-recommends \
-    git libpci-dev libdw1 libibverbs-dev ibverbs-utils \
+    git libpci-dev pciutils sudo libdw1 libibverbs-dev ibverbs-utils \
     locales iputils-ping iproute2 ethtool jq perftest \
     wget unzip ca-certificates curl \
     libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler \
@@ -105,6 +106,11 @@ sudo docker exec $CONTAINER_NAME bash -c "apt-get update && apt-get install -y -
 
 Package roles:
 - `jq` — required by `mori check`.
+- `pciutils` — provides `lspci`, which `nicctl` shells out to in order to enumerate
+  the NIC cards. Without it `nicctl` fails with `Invalid card handle` and the ionic
+  firmware / QoS / DCQCN checks in `mori check` / `mori setup` break.
+- `sudo` — the ionic and bnxt paths of `mori check` / `mori setup` invoke `nicctl`,
+  `dcb`, `ethtool`, and sysfs writes via `sudo`.
 - `perftest` — provides `ib_write_bw` / `ib_write_lat` for intra/inter-node bandwidth + latency checks.
 - `iproute2` — provides `dcb`, required by `mori setup` on bnxt NICs.
 - `wget unzip ca-certificates curl` — used by the NIC userspace install steps (Step 3a/3b).
@@ -129,6 +135,11 @@ Run the subsection matching the NIC type detected at the top:
 ## Step 3a: Install AINIC userspace libraries (AINIC only)
 
 **Skip if NIC type is not `ainic`.**
+
+> **Recommended version**: for cross-node MORI (EP over RDMA / IBGDA), AINIC firmware
+> `>= 1.117.5-a-45` is solid. The `1.117.1` major does **not** support IBGDA — if the
+> host is on that branch, flag it to the user and recommend upgrading before proceeding.
+> The userspace library (`libionic`) must match the kernel driver version.
 
 ### Detect host AINIC version and check against public repo
 
@@ -193,6 +204,12 @@ nicctl --version
 ## Step 3b: Install Broadcom (bnxt / thor2) userspace libraries + tools
 
 **Skip if NIC type is not `thor2` / bnxt.**
+
+> **Recommended version**: for cross-node MORI (EP over RDMA / IBGDA), Broadcom firmware
+> is solid on `237.1.137.x` (official Broadcom release) and `235.2.86.x` (customer-specific
+> build). `231.x` is too old for IBGDA — if the host is on that branch, flag it to the user
+> and recommend upgrading. The userspace library (`libbnxt_re`, 3b.2) must match the kernel
+> driver version detected in 3b.1.
 
 The bnxt path of `mori check` / `mori setup` needs two NIC-specific pieces installed
 here: (1) the **RoCE userspace lib** (`libbnxt_re`) and (2) a **recent `niccli`**.

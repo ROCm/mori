@@ -42,8 +42,8 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-TW]
-          - platform: MI300X_BNXT
-            runner: [self-hosted, MI300X-BNXT]
+          - platform: MI325X_BNXT
+            runner: [self-hosted, 325_bnxt_108]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -93,17 +93,18 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
-          - platform: MI300X_BNXT
-            runner: [self-hosted, MI300X-BNXT]
-            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+          - platform: MI325X_BNXT
+            runner: [self-hosted, 325_bnxt_108]
+            rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             rdma_sl: 3
             rdma_tc: 104
-            socket_ifname: enp159s0np0
+            socket_ifname: enp49s0f1np1
     env:
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
+      NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -122,6 +123,7 @@ jobs:
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
+            ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -155,6 +157,12 @@ jobs:
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE && MORI_ENABLE_SDMA=1 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+          "
+
+      - name: MORI-CCL (param-contiguous allgather SDMA)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && MORI_ENABLE_SDMA=1 timeout 300 pytest tests/python/ccl/test_allgather_param_contiguous.py -v
           "
 
       - name: MORI-EP (async_ll IBGDA)
@@ -308,9 +316,9 @@ jobs:
             runner: [self-hosted, MI355X-AINIC-TW]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             gpu_arch: gfx950
-          - platform: MI300X_BNXT
-            runner: [self-hosted, MI300X-BNXT]
-            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+          - platform: MI325X_BNXT
+            runner: [self-hosted, 325_bnxt_108]
+            rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             gpu_arch: gfx942
     timeout-minutes: 90
     steps:
@@ -437,14 +445,14 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             ct: podman
-          - platform: MI300X_BNXT
-            runner: [self-hosted, MI300X-BNXT]
-            node1_host: 10.245.128.61
-            node2_host: 10.245.128.59
+          - platform: MI325X_BNXT
+            runner: [self-hosted, 325_bnxt_108]
+            node1_host: 10.162.224.131
+            node2_host: 10.162.224.162
             node2_port: 22
-            node1_ifname: enp159s0np0
-            node2_ifname: enp159s0np0
-            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            node1_ifname: enp49s0f1np1
+            node2_ifname: enp49s0f1np1
+            rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             rdma_sl: 3
             rdma_tc: 104
             ct: docker
@@ -466,6 +474,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: true
+
+      - name: Recover podman if needed
+        if: ${{ matrix.ct == 'podman' }}
+        run: podman system migrate || true
 
       - name: Build CI image
         run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
@@ -630,10 +642,42 @@ jobs:
             --num-initiator-dev 8 --num-target-dev 8
           wait
 
-      - name: MORI-IO internode cross-rail write (rail affinity)
+      - name: MORI-IO internode multi-worker executor correctness (chunking on)
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           PORT=29125
+          # Phase-1 worker+chunking path: GPU memory, single NIC, batch API,
+          # numWorkerThreads>1. Sweep crosses the default 64 KiB chunk size,
+          # covering both unsplit and actually chunk-expanded requests.
+          for OP in write read; do
+            echo "=== MORI-IO internode benchmark: multi-worker executor (chunking on, $OP sweep) port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              -- --op-type $OP --transfer-batch-size 64 --all
+              --sweep-start-size 1024 --sweep-max-size 1048576 --iters 4
+              --enable-sess --enable-batch-transfer
+              --num-qp-per-transfer 4 --num-worker-threads 4
+              --num-initiator-dev 8 --num-target-dev 8
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              -- --op-type $OP --transfer-batch-size 64 --all \
+              --sweep-start-size 1024 --sweep-max-size 1048576 --iters 4 \
+              --enable-sess --enable-batch-transfer \
+              --num-qp-per-transfer 4 --num-worker-threads 4 \
+              --num-initiator-dev 8 --num-target-dev 8
+            wait
+            PORT=$((PORT + 1))
+          done
+
+      - name: MORI-IO internode cross-rail write (rail affinity)
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=29127
           # Cross-rail validation: --target-dev-offset 5 makes GPU-0 pair with GPU-5
           # (different NUMA → different NIC preference). With MORI_IO_RAIL_AFFINITY=1
           # the receiver must follow the sender's railId, keeping traffic on-rail.

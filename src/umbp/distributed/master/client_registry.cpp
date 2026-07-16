@@ -190,6 +190,15 @@ size_t ClientRegistry::ClientCount() const {
   return clients_.size();
 }
 
+size_t ClientRegistry::AliveClientCount() const {
+  std::shared_lock lock(mutex_);
+  size_t count = 0;
+  for (const auto& [id, record] : clients_) {
+    if (record.status == ClientStatus::ALIVE) ++count;
+  }
+  return count;
+}
+
 std::vector<ClientRecord> ClientRegistry::GetAliveClients() const {
   std::shared_lock lock(mutex_);
   std::vector<ClientRecord> result;
@@ -197,6 +206,17 @@ std::vector<ClientRecord> ClientRegistry::GetAliveClients() const {
     if (record.status == ClientStatus::ALIVE) result.push_back(record);
   }
   return result;
+}
+
+AlivePeerView ClientRegistry::GetAlivePeerView() const {
+  std::shared_lock lock(mutex_);
+  AlivePeerView view;
+  view.reserve(clients_.size());
+  for (const auto& [id, record] : clients_) {
+    if (record.status != ClientStatus::ALIVE) continue;
+    view.emplace(record.node_id, record.peer_address);
+  }
+  return view;
 }
 
 std::vector<std::string> ClientRegistry::GetClientTags(const std::string& node_id) const {

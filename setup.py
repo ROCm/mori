@@ -29,6 +29,13 @@ from setuptools import Extension, find_packages, setup
 from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
+try:
+    from Cython.Build import cythonize as _cythonize
+
+    _HAVE_CYTHON = True
+except ImportError:
+    _HAVE_CYTHON = False
+
 _supported_arch_list = ["gfx942", "gfx950"]
 
 _REQUIRED_SYSTEM_DEPS: list = []
@@ -264,6 +271,14 @@ def _copy_jit_sources(root_dir: Path) -> None:
         if src_file.is_file():
             shutil.copy2(src_file, shmem_dst / name)
 
+    # cco device-API wrapper — JIT-compiled to libmori_cco_device.bc on first use
+    # (mori.cco.device.bitcode). Headers come from the include/ copy above.
+    cco_dev_src = root_dir / "src" / "cco" / "device" / "cco_device_wrapper.cpp"
+    if cco_dev_src.is_file():
+        cco_dst = jit_dir / "src" / "cco" / "device"
+        cco_dst.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cco_dev_src, cco_dst / "cco_device_wrapper.cpp")
+
     for subdir in ["spdlog/include", "msgpack-c/include"]:
         src = root_dir / "3rdparty" / subdir
         if src.is_dir():
@@ -339,6 +354,7 @@ class CMakeBuild(build_ext):
             ) from exn
         mpi_enabled = (
             os.environ.get("BUILD_EXAMPLES", "OFF").upper() == "ON"
+            or os.environ.get("BUILD_BENCHMARK", "OFF").upper() == "ON"
             or os.environ.get("MORI_WITH_MPI", "OFF").upper() == "ON"
         )
         if mpi_enabled:
@@ -348,6 +364,44 @@ class CMakeBuild(build_ext):
             self.build_extension(ext)
 
     def build_extension(self, ext: Extension) -> None:
+        if ext.sources and any(s.endswith((".pyx", ".cpp")) for s in ext.sources):
+            if self.compiler is None:
+                self.ensure_finalized()
+                from setuptools._distutils.ccompiler import new_compiler
+                from setuptools._distutils.sysconfig import customize_compiler
+
+                try:
+                    # distutils / older setuptools signature
+                    self.compiler = new_compiler(
+                        verbose=self.verbose,
+                        dry_run=self.dry_run,
+                        force=self.force,
+                    )
+                except TypeError:
+                    # setuptools >= ~80 dropped verbose/dry_run/force kwargs
+                    self.compiler = new_compiler()
+                    for _attr in ("verbose", "dry_run", "force"):
+                        setattr(self.compiler, _attr, getattr(self, _attr))
+                customize_compiler(self.compiler)
+                if self.include_dirs is not None:
+                    self.compiler.set_include_dirs(self.include_dirs)
+                if self.define is not None:
+                    for name, value in self.define:
+                        self.compiler.define_macro(name, value)
+                if self.undef is not None:
+                    for name in self.undef:
+                        self.compiler.undefine_macro(name)
+                if self.libraries is not None:
+                    self.compiler.set_libraries(self.libraries)
+                if self.library_dirs is not None:
+                    self.compiler.set_library_dirs(self.library_dirs)
+                if self.rpath is not None:
+                    self.compiler.set_runtime_library_dirs(self.rpath)
+                if self.link_objects is not None:
+                    self.compiler.set_link_objects(self.link_objects)
+            super().build_extension(ext)
+            return
+
         build_lib = Path(self.build_lib)
         build_lib.mkdir(parents=True, exist_ok=True)
 
@@ -385,6 +439,7 @@ class CMakeBuild(build_ext):
             "ON"
             if (
                 build_examples.upper() == "ON"
+                or build_benchmark.upper() == "ON"
                 or os.environ.get("MORI_WITH_MPI", "OFF").upper() == "ON"
             )
             else "OFF"
@@ -435,7 +490,23 @@ class CMakeBuild(build_ext):
             ["cmake", "--build", ".", "-j", f"{os.cpu_count()}"], cwd=str(build_dir)
         )
 
+        # When benchmarks are off, the shared libs are rebuilt without MPI but a
+        # previous BUILD_BENCHMARK=ON run may have left benchmark executables in
+        # build/benchmark/. Running those stale binaries fails with an
+        # undefined MpiBootstrapNetwork symbol. Remove them so the build dir
+        # stays self-consistent.
+        if build_benchmark.upper() != "ON":
+            bench_dir = build_dir / "benchmark"
+            if bench_dir.is_dir():
+                for exe in bench_dir.iterdir():
+                    if exe.is_file() and os.access(exe, os.X_OK):
+                        exe.unlink()
+
         files_to_copy = [
+            (
+                build_dir / "src/cco/libmori_cco.so",
+                root_dir / "python/mori/libmori_cco.so",
+            ),
             (
                 build_dir / "src/pybind/libmori_pybinds.so",
                 root_dir / "python/mori/libmori_pybinds.so",
@@ -486,6 +557,37 @@ class CMakeBuild(build_ext):
             os.chmod(umbp_master_dst, 0o700)
         elif umbp_master_dst.exists():
             umbp_master_dst.unlink()
+
+        # CCO C++ examples: ship the built binaries when BUILD_EXAMPLES=ON. They
+        # carry an $ORIGIN/../.. rpath (set in examples/CMakeLists.txt) so they
+        # resolve libmori_*.so from site-packages/mori/ once installed here.
+        cco_examples_dst = root_dir / "python/mori/examples/cco"
+        for _exe in ("cco_lsa_put", "cco_gda_put"):
+            src = build_dir / "examples" / _exe
+            dst = cco_examples_dst / _exe
+            if build_examples.upper() == "ON" and src.exists():
+                cco_examples_dst.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+                os.chmod(dst, 0o755)
+            elif dst.exists():
+                dst.unlink()
+
+        # CCO benchmarks: same pattern, gated on BUILD_BENCHMARK=ON.
+        cco_bench_dst = root_dir / "python/mori/benchmarks/cco"
+        for _exe in (
+            "cco_p2p_put_bw",
+            "cco_p2p_put_latency",
+            "cco_p2p_get_bw",
+            "cco_p2p_get_latency",
+        ):
+            src = build_dir / "benchmark" / _exe
+            dst = cco_bench_dst / _exe
+            if build_benchmark.upper() == "ON" and src.exists():
+                cco_bench_dst.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+                os.chmod(dst, 0o755)
+            elif dst.exists():
+                dst.unlink()
 
         _copy_jit_sources(root_dir)
 
@@ -572,6 +674,36 @@ class CustomBuild(_build):
         super().run()
 
 
+_root_dir = Path(__file__).parent
+
+
+def _cco_extension() -> list:
+    """Build the mori.cco.cco Cython C++ extension if Cython is available."""
+    if not _HAVE_CYTHON:
+        print(
+            "[mori] WARNING: Cython not found — skipping mori.cco.cco extension. "
+            "Install Cython to enable: pip install cython",
+            file=sys.stderr,
+        )
+        return []
+    include_dirs = [str(_root_dir / "include")]
+    library_dirs = [str(_root_dir / "python/mori")]
+    ext = Extension(
+        "mori.cco.cco",
+        sources=["python/mori/cco/cco.pyx"],
+        language="c++",
+        include_dirs=include_dirs,
+        library_dirs=library_dirs,
+        libraries=["mori_cco"],
+        runtime_library_dirs=["$ORIGIN/.."],
+        extra_compile_args=["-std=c++17"],
+    )
+    return _cythonize(
+        [ext],
+        compiler_directives={"language_level": "3"},
+    )
+
+
 extensions = [
     Extension(
         "mori",
@@ -579,9 +711,10 @@ extensions = [
         # extra_compile_args=['-ggdb', '-O0'],
         # extra_link_args=['-g'],
     ),
-]
+] + _cco_extension()
 
 mori_package_data = [
+    "libmori_cco.so",
     "libmori_pybinds.so",
     "libmori_shmem.so",
     "libmori_ops.so",
@@ -602,6 +735,8 @@ mori_package_data = [
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
     "tools/*.sh",
+    "examples/cco/*",  # CCO C++ example binaries (only present when BUILD_EXAMPLES=ON)
+    "benchmarks/cco/*",  # CCO benchmark binaries (only present when BUILD_BENCHMARK=ON)
 ]
 if _env_flag("BUILD_UMBP_SPDK", "OFF"):
     mori_package_data.append("spdk_proxy")
@@ -611,6 +746,8 @@ setup(
     package_dir={"": "python"},
     package_data={
         "mori": mori_package_data,
+        "mori.cco": ["*.pxd"],
+        "mori.cco.device": ["*.bc"],
         "mori.ir": ["*.bc"],
         "mori.tools": ["*.sh"],
     },

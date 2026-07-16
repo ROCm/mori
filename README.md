@@ -2,6 +2,7 @@
 
 ## News
 
+- **[2026/05]** 🔥 MORI powers SGLang on AMD Instinct™ MI355X achieves competitive TCO for large-scale DeepSeek disaggregated inference ([blog](https://www.lmsys.org/blog/2026-05-28-mori/)).
 - **[2026/05]** 🔥 MORI becomes the primary EP communication library for AMD platforms in Alibaba RTP-LLM ([MORI-EP PR](https://github.com/alibaba/rtp-llm/pull/977)).
 - **[2026/05]** MORI's SDMA-based AllGather collective is integrated into DeepSpeed for ZeRO-3 optimization on AMD GPUs, delivering up to 10% end-to-end training speedup by offloading AllGather traffic to dedicated SDMA copy engines ([example](https://github.com/deepspeedai/DeepSpeed/blob/master/examples/sdma_allgather/README.md), [post](https://x.com/DeepSpeedAI/status/2056401598839140384)).
 - **[2026/04]** 🔥 Tencent OpenUCL adopts the Mori ecosystem, using Mori's EP-style dispatch/combine pattern in AMD GPU deployments and leveraging MORI-SHMEM for GPU-initiated communication.
@@ -211,6 +212,14 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 > **Note**: IBGDA requires vendor-specific DV (Direct Verbs) libraries. Mellanox `libmlx5` is
 > typically pre-installed with the kernel OFED stack. For Thor2 and Pollara, install the
 > corresponding userspace library from your NIC vendor.
+
+**Recommended NIC firmware/driver versions** (check with `mori check` or `tools/env_check.sh`):
+
+| Vendor | Recommendation |
+|--------|-----------------|
+| AMD Pollara (AINIC) | `>= 1.117.5-a-45` (`1.117.1` major lacks IBGDA support) |
+| Broadcom (Thor2) | `237.1.137.x` / `235.2.86.x`; `231.x` too old for IBGDA |
+| Mellanox (ConnectX, mlx5) | No known minimum; tested on `ConnectX-7` |
 
 ### Install
 

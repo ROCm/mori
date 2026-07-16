@@ -29,6 +29,7 @@ enum class BackendType : uint32_t {
   XGMI = 1,
   RDMA = 2,
   TCP = 3,
+  FABRIC = 4,  // Cross-node scale-up fabric (UALink / super-node vPOD)
 };
 
 using BackendTypeVec = std::vector<BackendType>;

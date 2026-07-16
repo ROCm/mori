@@ -23,12 +23,17 @@
 
 #include <algorithm>
 #include <cassert>
+#include <functional>
 #include <stdexcept>
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
 
 namespace mori::umbp {
+
+// ---------------------------------------------------------------------------
+//  File-local helpers
+// ---------------------------------------------------------------------------
 
 namespace {
 
@@ -45,6 +50,10 @@ uint32_t SizeToPages(uint64_t size, uint64_t page_size) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+//  Construction
+// ---------------------------------------------------------------------------
 
 PeerDramAllocator::PeerDramAllocator(uint64_t page_size, TierConfig dram, TierConfig hbm,
                                      std::chrono::milliseconds pending_ttl,
@@ -76,6 +85,10 @@ PeerDramAllocator::PeerDramAllocator(uint64_t page_size, TierConfig dram, TierCo
 }
 
 PeerDramAllocator::~PeerDramAllocator() { StopReaper(); }
+
+// ---------------------------------------------------------------------------
+//  Allocation (reserve pages into a pending slot)
+// ---------------------------------------------------------------------------
 
 PageBitmapAllocator* PeerDramAllocator::AllocatorForLocked(TierType tier) {
   auto it = allocators_.find(tier);
@@ -157,6 +170,10 @@ std::vector<PeerDramAllocator::BatchAllocateResult> PeerDramAllocator::BatchAllo
   return out;
 }
 
+// ---------------------------------------------------------------------------
+//  Commit / abort (promote a pending slot to owned, or release it)
+// ---------------------------------------------------------------------------
+
 bool PeerDramAllocator::Commit(uint64_t slot_id, const std::string& key,
                                uint64_t& bytes_committed) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -202,7 +219,7 @@ bool PeerDramAllocator::CommitLocked(uint64_t slot_id, const std::string& key,
   owned.tier = it->second.tier;
   owned.pages = std::move(it->second.pages);
   owned.size = it->second.size;
-  pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, owned.tier, owned.size});
+  QueueEventLocked(KvEvent{KvEvent::Kind::ADD, key, owned.tier, owned.size});
   owned_[key] = std::move(owned);
   pending_.erase(it);
   bytes_committed = owned_[key].size;
@@ -246,6 +263,10 @@ std::vector<bool> PeerDramAllocator::BatchAbort(const std::vector<uint64_t>& slo
   return out;
 }
 
+// ---------------------------------------------------------------------------
+//  Resolve (read path; grants a short read lease to fence eviction)
+// ---------------------------------------------------------------------------
+
 PeerDramAllocator::ResolveResult PeerDramAllocator::Resolve(const std::string& key) {
   std::lock_guard<std::mutex> lock(mutex_);
   ResolveResult r;
@@ -263,7 +284,7 @@ PeerDramAllocator::ResolveResult PeerDramAllocator::Resolve(const std::string& k
 }
 
 std::vector<PeerDramAllocator::ResolvedEntry> PeerDramAllocator::BatchResolve(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys, bool include_descs) {
   std::vector<ResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
   std::lock_guard<std::mutex> lock(mutex_);
@@ -276,13 +297,19 @@ std::vector<PeerDramAllocator::ResolvedEntry> PeerDramAllocator::BatchResolve(
     entry.tier = it->second.tier;
     entry.pages = it->second.pages;
     entry.size = it->second.size;
-    entry.descs = BuildBufferDescsLocked(it->second.tier, it->second.pages);
+    if (include_descs) {
+      entry.descs = BuildBufferDescsLocked(it->second.tier, it->second.pages);
+    }
     // Per-key now(): matches single-key Resolve() so the last key in
     // a large batch isn't shortchanged by earlier keys' work.
     read_lease_until_[key] = std::chrono::steady_clock::now() + read_lease_ttl_;
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+//  Eviction (skips leased / copy-pinned keys; emits REMOVE)
+// ---------------------------------------------------------------------------
 
 std::vector<PeerDramAllocator::EvictResult> PeerDramAllocator::Evict(
     const std::vector<std::string>& keys) {
@@ -313,12 +340,16 @@ std::vector<PeerDramAllocator::EvictResult> PeerDramAllocator::Evict(
       alloc->Deallocate(it->second.pages);
     }
     r.bytes_freed = it->second.size;
-    pending_events_.push_back(KvEvent{KvEvent::Kind::REMOVE, key, it->second.tier, 0});
+    QueueEventLocked(KvEvent{KvEvent::Kind::REMOVE, key, it->second.tier, 0});
     owned_.erase(it);
     out.push_back(std::move(r));
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+//  DRAM copy pins (protect owned pages while the SSD copy pipeline reads them)
+// ---------------------------------------------------------------------------
 
 std::optional<PeerDramAllocator::DramCopyPin> PeerDramAllocator::AcquireDramCopyPin(
     const std::string& key) {
@@ -368,6 +399,10 @@ std::vector<std::pair<const void*, size_t>> PeerDramAllocator::BuildCopySegments
   }
   return segments;
 }
+
+// ---------------------------------------------------------------------------
+//  Clear (distributed clear; gates writes until the full-sync ack)
+// ---------------------------------------------------------------------------
 
 void PeerDramAllocator::ClearLocal() {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -428,6 +463,22 @@ void PeerDramAllocator::ClearFullSyncAcked() {
   clear_full_sync_pending_.store(false, std::memory_order_release);
 }
 
+// ---------------------------------------------------------------------------
+//  OwnedLocationSource (heartbeat events: queue / drain / snapshot)
+// ---------------------------------------------------------------------------
+
+void PeerDramAllocator::QueueEventLocked(KvEvent event) {
+  pending_events_.push_back(std::move(event));
+  // Wake the heartbeat the moment the outbox first reaches the threshold.  Events
+  // are appended one at a time, so `==` fires at most once per batch.  Called
+  // under mutex_: auto_flush_cb_ must be cheap and MUST NOT re-enter the
+  // allocator (it only signals the heartbeat thread).  Exactness isn't required —
+  // the heartbeat interval is the backstop.
+  if (pending_events_.size() == auto_flush_threshold_ && auto_flush_cb_) {
+    auto_flush_cb_();
+  }
+}
+
 std::vector<KvEvent> PeerDramAllocator::DrainPendingEvents() {
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<KvEvent> drained;
@@ -435,8 +486,13 @@ std::vector<KvEvent> PeerDramAllocator::DrainPendingEvents() {
   return drained;
 }
 
-std::vector<KvEvent> PeerDramAllocator::SnapshotOwnedKeys() const {
+void PeerDramAllocator::SetAutoFlushHook(size_t threshold, std::function<void()> cb) {
   std::lock_guard<std::mutex> lock(mutex_);
+  auto_flush_threshold_ = threshold;
+  auto_flush_cb_ = std::move(cb);
+}
+
+std::vector<KvEvent> PeerDramAllocator::SnapshotOwnedKeysLocked() const {
   std::vector<KvEvent> out;
   out.reserve(owned_.size());
   for (const auto& kv : owned_) {
@@ -444,6 +500,28 @@ std::vector<KvEvent> PeerDramAllocator::SnapshotOwnedKeys() const {
   }
   return out;
 }
+
+// Test-only: a pure read-only snapshot with no outbox side effects.  Production
+// full-sync uses SnapshotOwnedKeysForFullSync() below; tests use this to assert
+// owned state without disturbing the event outbox.  Kept to satisfy the
+// OwnedLocationSource interface and the unit tests; not on any production path.
+std::vector<KvEvent> PeerDramAllocator::SnapshotOwnedKeys() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return SnapshotOwnedKeysLocked();
+}
+
+std::vector<KvEvent> PeerDramAllocator::SnapshotOwnedKeysForFullSync() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto out = SnapshotOwnedKeysLocked();
+  // The snapshot is now authoritative: drop the queued delta (already reflected
+  // in it) so the next delta carries only new events.
+  pending_events_.clear();
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+//  Capacity & buffer-descriptor queries
+// ---------------------------------------------------------------------------
 
 std::map<TierType, uint64_t> PeerDramAllocator::OwnedKeyCountByTier() const {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -503,6 +581,10 @@ std::vector<BufferMemoryDescBytes> PeerDramAllocator::BuildBufferDescsLocked(
   return out;
 }
 
+// ---------------------------------------------------------------------------
+//  Read-lease helper
+// ---------------------------------------------------------------------------
+
 bool PeerDramAllocator::HasActiveReadLeaseLocked(const std::string& key) {
   auto it = read_lease_until_.find(key);
   if (it == read_lease_until_.end()) return false;
@@ -512,6 +594,10 @@ bool PeerDramAllocator::HasActiveReadLeaseLocked(const std::string& key) {
   }
   return true;
 }
+
+// ---------------------------------------------------------------------------
+//  Reaper (background sweep: pending TTL, expired leases, deferred frees)
+// ---------------------------------------------------------------------------
 
 void PeerDramAllocator::StartReaper() {
   bool expected = false;

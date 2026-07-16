@@ -21,6 +21,11 @@ enable_testing()
 
 include(GoogleTest)
 
+# Discover tests at ctest time: POST_BUILD runs each binary under the parallel
+# build, and the mori/HSA/grpc init blows past the 5s timeout -> empty JSON that
+# CMake 4.4's strict parser rejects.
+set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
+
 # ---------------------------------------------------------------------------
 # test_external_kv_block_index
 # ---------------------------------------------------------------------------
@@ -174,6 +179,24 @@ target_compile_features(test_peer_ssd_read_rpc PRIVATE cxx_std_17)
 gtest_discover_tests(test_peer_ssd_read_rpc)
 
 # ---------------------------------------------------------------------------
+# test_batch_resolve_codec — struct-of-arrays BatchResolveKeysResponse wire
+# codec (batch_resolve_codec.h): encode/decode round-trip, page flattening, desc
+# dedup / omit_descs, malformed-response rejection, and the payload-size win.
+# Needs the generated proto (carried by umbp_common) + protobuf.
+# ---------------------------------------------------------------------------
+add_executable(test_batch_resolve_codec test_batch_resolve_codec.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_batch_resolve_codec PRIVATE -Wl,--no-as-needed)
+endif()
+
+target_link_libraries(test_batch_resolve_codec
+                      PRIVATE umbp_common ${_PROTOBUF_LIB} GTest::gtest_main)
+
+target_compile_features(test_batch_resolve_codec PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_batch_resolve_codec)
+
+# ---------------------------------------------------------------------------
 # test_ssd_read_lease_gating — pure reader-side lease gating decision logic
 # (ssd_read_lease.h).  Header-only under test (no gRPC / RDMA deps).
 # ---------------------------------------------------------------------------
@@ -199,3 +222,9 @@ target_link_libraries(test_ssd_reliability PRIVATE umbp_common
 target_compile_features(test_ssd_reliability PRIVATE cxx_std_17)
 
 gtest_discover_tests(test_ssd_reliability)
+
+# cache_remote_fetches admission-gate unit test (hermetic; no GPU/RDMA/master)
+add_executable(test_cache_remote_admission test_cache_remote_admission.cpp)
+target_link_libraries(test_cache_remote_admission PRIVATE umbp_common
+                                                          GTest::gtest_main)
+gtest_discover_tests(test_cache_remote_admission)

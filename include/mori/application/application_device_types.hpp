@@ -66,12 +66,9 @@ static constexpr size_t ATOMIC_IBUF_SLOT_SIZE = 8;  // Each atomic ibuf slot is 
 /*                                      RDMA Types (device-safe)                                  */
 /* ---------------------------------------------------------------------------------------------- */
 
-enum class RdmaDeviceVendorId : uint32_t {
-  Unknown = 0,
-  Mellanox = 0x02c9,
-  Broadcom = 0x14E4,
-  Pensando = 0x1dd8,
-};
+// Re-export core's vendor-id enum so application transport code spells it
+// unqualified. (RdmaEndpointDevice also lives in core; backends use core:: directly.)
+using ::mori::core::RdmaDeviceVendorId;
 
 struct RdmaMemoryRegion {
   uintptr_t addr{0};

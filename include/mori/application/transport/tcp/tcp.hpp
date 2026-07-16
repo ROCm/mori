@@ -24,6 +24,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -35,8 +36,8 @@ namespace application {
 /*                                           TCPEndpoint                                          */
 /* ---------------------------------------------------------------------------------------------- */
 struct TCPEndpointHandle {
-  int fd;
-  sockaddr_in peer;
+  int fd{-1};
+  sockaddr_in peer{};
 };
 
 using TCPEndpointHandleVec = std::vector<TCPEndpointHandle>;
@@ -47,7 +48,7 @@ class TCPEndpoint {
   ~TCPEndpoint() = default;
 
   int Send(const void* buf, size_t len);
-  int Recv(void* buf, size_t len);
+  int Recv(void* buf, size_t len, size_t* consumed = nullptr);
 
  public:
   TCPEndpointHandle handle;
@@ -81,12 +82,15 @@ class TCPContext {
   TCPEndpointHandle Connect(std::string remote, uint16_t port);
   TCPEndpointHandleVec Accept();
   void CloseEndpoint(TCPEndpointHandle);
+  bool CloseEndpointNoThrow(TCPEndpointHandle) noexcept;
+  bool CloseEndpointNoThrow(int fd) noexcept;
 
  public:
   TCPContextHandle handle;
 
  private:
   int listenFd{-1};
+  mutable std::mutex endpointsMu;
   std::unordered_map<int, TCPEndpointHandle> endpoints;
 };
 

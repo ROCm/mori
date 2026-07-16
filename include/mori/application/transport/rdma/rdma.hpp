@@ -88,6 +88,8 @@ struct RdmaEndpointConfig {
                           // be large, e.g. notification)
   uint32_t maxCqeNum{128};
   uint32_t maxMsgSge{1};
+  uint32_t maxInlineData{0};  // SEND inline capacity; required by providers (e.g. bnxt_re)
+                              // for IBV_SEND_INLINE
   uint32_t alignment{PAGESIZE};
   bool onGpu{false};
   bool withCompChannel{false};
@@ -211,6 +213,13 @@ class RdmaDeviceContext {
                                                     int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabuf(void* ptr, size_t size, int dmabuf_fd,
                                                           int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  // dmabuf registration with iova=0 (CCO symmetric flat-VA path; BNXT GDA).
+  virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabufIova0(
+      void* ptr, size_t size, int dmabuf_fd, int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  // ibv_reg_mr-first registration; falls back to dmabuf. Set MORI_ENABLE_DMABUF_REG to try
+  // dmabuf first instead (falling back to ibv_reg_mr).
+  virtual RdmaMemoryRegion RegisterRdmaMemoryRegionAuto(void* ptr, size_t size,
+                                                        int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeregisterRdmaMemoryRegion(void* ptr);
 
   // TODO: query gid entry by ibv_query_gid_table
@@ -225,6 +234,7 @@ class RdmaDeviceContext {
                                uint32_t qpId = 0) {
     assert(false && "not implemented");
   }
+  virtual bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept;
 
   ibv_srq* CreateRdmaSrqIfNx(const RdmaEndpointConfig&);
 
@@ -248,6 +258,7 @@ class RdmaDeviceContext {
  private:
   RdmaDevice* device;
   std::unordered_map<void*, ibv_mr*> mrPool;
+  bool preferDmabufReg{false};
 };
 
 /* -------------------------------------------------------------------------- */

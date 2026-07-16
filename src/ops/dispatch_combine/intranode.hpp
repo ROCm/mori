@@ -255,232 +255,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 }
 
 template <typename T, bool EnableStdMoE = false>
-__device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) {
-  const EpDispatchCombineConfig& config = args.config;
-
-  int thdId = threadIdx.x;
-  int thdNum = blockDim.x;
-
-  int laneId = threadIdx.x & (warpSize - 1);
-  int warpId = thdId / warpSize;
-  int warpNum = blockDim.x / warpSize;
-
-  int globalWarpId = blockIdx.x * warpNum + warpId;
-  int globalWarpNum = gridDim.x * warpNum;
-
-  int myPe = config.rank;
-  int npes = config.worldSize;
-  size_t hiddenDim = config.HiddenDimSz();
-  const bool hasScales = args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0);
-
-  // Warp-group coordination: 2 warps per group
-  constexpr int kWarpsPerGroup = 2;
-  constexpr int kMaxWarpGroups = 8;
-
-  __shared__ uint64_t groupData[kMaxWarpGroups];  // (iteration+1, destTokId)
-  __shared__ int groupCounters[kMaxWarpGroups];   // consume counter
-
-  int warpGroupIdInBlock = warpId / kWarpsPerGroup;
-  int inGroupWarpId = warpId % kWarpsPerGroup;
-  int warpGroupId = globalWarpId / kWarpsPerGroup;
-  int warpGroupNum = globalWarpNum / kWarpsPerGroup;
-
-  // Rotate header warp selection so that headers spread evenly across all 4 SIMD units.
-  constexpr int kNumSimds = 4;
-  int headerWarpIdx;
-  if constexpr (kWarpsPerGroup >= kNumSimds) {
-    // Each group spans all SIMDs; pick directly.
-    headerWarpIdx = warpGroupIdInBlock % kNumSimds;
-  } else {
-    // Each group spans fewer SIMDs than available; stagger across groups.
-    // k=2: groups {0,1}→h=0, {2,3}→h=1 → SIMDs {0,2,1,3}.
-    headerWarpIdx = (warpGroupIdInBlock / (kNumSimds / kWarpsPerGroup)) % kWarpsPerGroup;
-  }
-  bool isHeaderWarp = (inGroupWarpId == headerWarpIdx);
-
-  // clear shared memory
-  if (warpId == 0 && laneId < kMaxWarpGroups) {
-    groupData[laneId] = 0;
-    groupCounters[laneId] = kWarpsPerGroup - 1;
-  }
-
-  __syncthreads();
-
-  // Hidden dim split for each warp in group
-  size_t dimPerWarp = (hiddenDim + kWarpsPerGroup - 1) / kWarpsPerGroup;
-  size_t warpDimOffset = (size_t)inGroupWarpId * dimPerWarp;
-  size_t warpDimChunk =
-      (warpDimOffset < hiddenDim) ? min(hiddenDim - warpDimOffset, dimPerWarp) : 0;
-  assert((warpNum % kWarpsPerGroup == 0) && (warpDimChunk > 0) &&
-         "total num of warps must be divisible by the num of warpgroups, "
-         "warpDimChunk must be > 0 for warpgroups to be useful");
-
-  IF_ENABLE_PROFILER(
-      INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SEQ(seq, profiler);
-  MORI_TRACE_NEXT(seq, Slot::DispatchSendTokens);
-
-  if (args.tokenIndices && args.inpTokenBuf) {
-    // Phase1: send token
-    // Each warp-group processes one token-expert pair
-    for (int i = warpGroupId; i < args.curRankNumToken * config.numExpertPerToken;
-         i += warpGroupNum) {
-      index_t srcTokId = i / config.numExpertPerToken;
-      index_t destExpert = args.tokenIndices[i];
-      index_t tokExpert = args.tokenIndices[srcTokId * config.numExpertPerToken +
-                                            laneId % config.numExpertPerToken];
-      index_t destPe = destExpert / config.numExpertPerRank;
-      index_t destTokId = 0;
-
-      // prefetch remote addr
-      auto dispTokOffset = args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe);
-
-      // ALL warps in warp-group do dedup independently (same input = same result)
-      assert(config.numExpertPerToken < warpSize);
-      int condition = 0;
-      if (laneId < (i % config.numExpertPerToken)) {
-        condition = destPe == (tokExpert / config.numExpertPerRank);
-      }
-      if (__any(condition)) {
-        // All 4 warps skip together, only warp 0 writes the skip marker
-        if (!isHeaderWarp && laneId == 0) {
-          args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-        }
-        continue;
-      }
-
-      T* dispatchOut = nullptr;
-
-      // Header Warp: atomic allocation + notify via shared memory
-      if (isHeaderWarp) {
-        if (laneId == 0) {
-          // Atomic allocation
-          destTokId = atomicAdd(dispTokOffset, 1);
-          assert(destTokId < config.MaxNumTokensToRecv() &&
-                 "total recv token overflow: increase maxTotalRecvTokens");
-
-          // Wait for all consumers done (counter == N-1), then set to 0
-          while (atomicCAS(&groupCounters[warpGroupIdInBlock], kWarpsPerGroup - 1, 0) !=
-                 kWarpsPerGroup - 1) {
-          }
-          // Write to shared mem: use (i+1) to avoid confusion with initial value 0
-          __hip_atomic_store((unsigned long long*)&groupData[warpGroupIdInBlock],
-                             ((uint64_t)(i + 1) << 32) | (uint32_t)destTokId, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_WORKGROUP);
-
-          atomicAdd(args.destPeTokenCounter + destPe, 1);
-          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-              FlatTokenIndex(config, myPe, srcTokId);
-        }
-        destTokId = __shfl(destTokId, 0);
-
-        // prefetch remote addr
-        dispatchOut = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe);
-
-        // Write weights and indices: only warp 0 writes
-        if (laneId < config.numExpertPerToken) {
-          if (args.weightsBuf) {
-            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-                destPe)[destTokId * config.numExpertPerToken + laneId] =
-                args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-          }
-          args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-              destPe)[destTokId * config.numExpertPerToken + laneId] =
-              args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-        }
-      } else {
-        // prefetch remote addr
-        dispatchOut = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe);
-        // normal Warps: spin wait for iteration match, then consume
-        // only lane 0 spins, then broadcast to other lanes
-        if (laneId == 0) {
-          uint64_t val;
-          do {
-            val = __hip_atomic_load(
-                reinterpret_cast<unsigned long long*>(&groupData[warpGroupIdInBlock]),
-                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-          } while ((val >> 32) != (uint32_t)(i + 1));
-          atomicAdd(&groupCounters[warpGroupIdInBlock], 1);
-          destTokId = (index_t)(val & 0xFFFFFFFF);
-        }
-
-        destTokId = __shfl(destTokId, 0);
-      }
-
-      // All warps in warpgroup: copy their portion of token data
-      size_t srcTokOffset = srcTokId * hiddenDim;
-      size_t destTokOffset = destTokId * hiddenDim;
-
-      constexpr int unroll_num = std::is_same_v<T, hip_bfloat16> ? 4 : 2;
-      core::WarpCopy<T, unroll_num>(dispatchOut + destTokOffset + warpDimOffset,
-                                    args.inpTokenBuf + srcTokOffset + warpDimOffset, warpDimChunk);
-
-      // Write scales: split across 4 warps
-      if (hasScales) {
-        size_t scaleSize = config.scaleDim * config.scaleTypeSize;
-        size_t scalePerWarp = (scaleSize + kWarpsPerGroup - 1) / kWarpsPerGroup;
-        size_t myScaleOffset = (size_t)inGroupWarpId * scalePerWarp;
-        size_t myScaleChunk =
-            (myScaleOffset < scaleSize) ? min(scaleSize - myScaleOffset, scalePerWarp) : 0;
-
-        size_t destScaleOffset = (size_t)destTokId * scaleSize;
-        size_t srcScaleOffset = (size_t)srcTokId * scaleSize;
-        core::WarpCopy(args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) +
-                           destScaleOffset + myScaleOffset,
-                       args.scalesBuf + srcScaleOffset + myScaleOffset, myScaleChunk);
-      }
-    }
-  }
-
-  __syncthreads();
-  if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
-
-  // Send token num & token to expert mapping to other ranks
-  MORI_TRACE_NEXT(seq, Slot::DispatchNotifyPeer);
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      // Wait until all tokens are sent
-      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
-      __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-
-      // Add 1 so that when token number == 0, receiver side still know the signal is sent
-      index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
-      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-      shmem::ShmemInt32WaitUntilEquals(signal, 0);
-      core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
-    }
-  }
-
-  // Phase 2: recv token
-  // Each warp wait until sender finished by waiting token number signal
-  MORI_TRACE_NEXT(seq, Slot::DispatchWaitPeerToken);
-  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      index_t* signal = recvTokenNums + destPe;
-      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      core::AtomicStoreRelaxedSystem(signal, 0);
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-
-      // reset local counter
-      args.destPeTokenCounter[destPe] = 0;
-    }
-
-    // reset counter
-    if (laneId == 0) {
-      args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
-    }
-  }
-
-#ifdef ENABLE_STANDARD_MOE_ADAPT
-  if constexpr (EnableStdMoE) {
-    InvokeConvertDispatchOutput<T>(args, myPe);
-  }
-#endif
-}
-
-template <typename T, bool EnableStdMoE = false>
 __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
 }
@@ -490,10 +264,14 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0>
+          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false>
 __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   using TokT =
       std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant, core::CombineInternalFp8, T>;
+  // UseFp4Combine reuses the FP8-blockwise staging/scale layout but transports each element as
+  // packed FP4 (E2M1, 2/byte -> half the combine bytes). It is a variant of blockwise combine.
+  static_assert(!UseFp4Combine || UseFp8BlockwiseQuant,
+                "UseFp4Combine builds on the FP8-blockwise combine path");
   static_assert(!(UseFp8DirectCast && UseFp8BlockwiseQuant),
                 "Fp8 direct cast and blockwise quant are mutually exclusive");
   static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) || std::is_same_v<T, hip_bfloat16>,
@@ -524,9 +302,12 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   const uint64_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
   // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
-  // When TokT != T (e.g. fp8 combine), staging layout uses TokT-sized tokens
+  // When TokT != T (e.g. fp8 combine), staging layout uses TokT-sized tokens. FP4 blockwise packs
+  // two E2M1 values per byte, so its token region is half the FP8 one -- keep this in sync with
+  // EpDispatchCombineConfig::CombineTokenRegionBytes() used by the host staging allocator.
   const size_t hiddenDim = config.HiddenDimSz();
-  const size_t hiddenBytes = hiddenDim * sizeof(TokT);
+  const size_t hiddenBytes =
+      UseFp4Combine ? ((hiddenDim + 1) / 2) * sizeof(TokT) : hiddenDim * sizeof(TokT);
   const size_t weightBytes =
       (UseWeights && args.weightsBuf != nullptr) ? config.numExpertPerToken * sizeof(float) : 0;
   const size_t scaleBytes =
@@ -584,7 +365,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
                                 SendBufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
       if constexpr (UseFp8BlockwiseQuant) {
-        core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8>(
+        core::WarpQuantizeToCombineBlockwise<UseFp4Combine, core::CombineInternalFp8>(
             reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
             reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
             args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
@@ -622,7 +403,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
                                 SendBufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
       if constexpr (UseFp8BlockwiseQuant) {
-        core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8>(
+        core::WarpQuantizeToCombineBlockwise<UseFp4Combine, core::CombineInternalFp8>(
             reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
             reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
             args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
@@ -763,30 +544,31 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
       if constexpr (Vec8Top8BlockElems != 0) {
         if (mwIter.warpsPerItem == 1) {
-          core::WarpAccumFp8DequantFullBlockVec8Top8<T, core::CombineInternalFp8,
-                                                     Vec8Top8BlockElems>(
+          core::WarpAccumCombineDequantFullBlockVec8Top8<UseFp4Combine, T, core::CombineInternalFp8,
+                                                         Vec8Top8BlockElems, Vec8AccumNum>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDim);
         } else if ((hiddenDimOffset & 0x7) == 0 && (hiddenDimSize & 0x7) == 0) {
-          core::WarpAccumFp8DequantSegmentBlockVec8Top8<T, core::CombineInternalFp8,
-                                                        Vec8Top8BlockElems>(
+          core::WarpAccumCombineDequantSegmentBlockVec8Top8<
+              UseFp4Combine, T, core::CombineInternalFp8, Vec8Top8BlockElems, Vec8AccumNum>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset, hiddenDimSize);
         } else {
           // Misaligned segment: vec8 helper would fault on the load. Tiny scalar fallback.
-          core::WarpAccumFp8DequantSegmentScalarTop8<T, core::CombineInternalFp8,
-                                                     Vec8Top8BlockElems>(
+          core::WarpAccumCombineDequantSegmentScalarTop8<UseFp4Combine, T, core::CombineInternalFp8,
+                                                         Vec8Top8BlockElems, Vec8AccumNum>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-              reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset, hiddenDimSize);
+              reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset, hiddenDimSize,
+              hiddenDim, args.fp8BlockwiseCombineScaleDim);
         }
       } else {
         if (mwIter.warpsPerItem == 1) {
-          core::WarpAccumFp8DequantFull<T, core::CombineInternalFp8>(
+          core::WarpAccumCombineDequantFull<UseFp4Combine, T, core::CombineInternalFp8>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDim,
               args.fp8BlockwiseCombineScaleDim);
         } else {
-          core::WarpAccumFp8DequantSegment<T, core::CombineInternalFp8>(
+          core::WarpAccumCombineDequantSegment<UseFp4Combine, T, core::CombineInternalFp8>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDimOffset,
               hiddenDimSize, hiddenDim, args.fp8BlockwiseCombineScaleDim);
@@ -816,10 +598,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0>
+          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false>
 __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast, UseFp8BlockwiseQuant,
-                                UseWeights, Vec8Top8BlockElems>(args);
+                                UseWeights, Vec8Top8BlockElems, Vec8AccumNum, UseFp4Combine>(args);
 }
 
 }  // namespace moe

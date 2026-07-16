@@ -114,7 +114,8 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
       std::lock_guard<std::mutex> lock(mu_);
       ++batch_route_get_calls_;
     }
-    for (int i = 0; i < req->keys_size(); ++i) resp->add_entries()->set_found(false);
+    // node_ref == 0 means "not found" in the columnar response; emit one per key.
+    for (int i = 0; i < req->keys_size(); ++i) resp->add_node_ref(0);
     return grpc::Status::OK;
   }
   int BatchLookupCalls() {

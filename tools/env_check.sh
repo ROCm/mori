@@ -1,6 +1,13 @@
 #!/bin/bash
 
-# TODO: adapt for MLX (Mellanox/NVIDIA) NICs.
+# NIC version recommendations for cross-node MORI (EP over RDMA / IBGDA).
+# The wrong NIC firmware/driver version is a common blocker, so `mori check`
+# validates the detected version against these known-good/known-bad ranges:
+#   - AINIC     : >= 1.117.5-a-45 is solid. The 1.117.1 major does NOT support IBGDA.
+#   - Broadcom  : solid on 237.1.137.x (official release) and 235.2.86.x
+#                 (customer-specific build); 231.x is too old for IBGDA.
+#   - Mellanox  : good backward compatibility, no known minimum version.
+# For all NICs, the userspace library must match the corresponding kernel driver.
 
 set -uo pipefail
 
@@ -12,6 +19,9 @@ LAT_THRESHOLD=10    # microseconds
 MSG_SIZE=65536      # 64K
 LAT_MSG_SIZE=2      # bytes (small message for latency)
 IB_PORT=18515       # base port for ib_write_bw / ib_write_lat
+AINIC_MIN_VER="1.117.5-a-45"       # minimum recommended AINIC firmware for IBGDA
+BNXT_MIN_VER_235="235.2.86.0"      # minimum solid version on the 235.x branch
+BNXT_MIN_VER_237="237.1.137.0"     # minimum solid version on the 237.x branch
 # Kept <= sshd MaxSessions (default 10): all remote servers multiplex over one
 # ssh master connection, so too many concurrent exec sessions would be refused.
 MESH_PARALLEL=8     # max concurrent pair probes for mesh tests
@@ -310,8 +320,53 @@ mesh_report() {
     else log_warn "$title: $ok/$total reachable, $fail unreachable (see ✗ cells)"; fi
 }
 
+# version_ge <candidate> <min>
+#   true if <candidate> >= <min>, comparing dotted/hyphenated version strings
+#   (e.g. "1.117.5-a-45", "237.1.145.0") via `sort -V`.
+version_ge() {
+    local cand="$1" min="$2"
+    [[ "$cand" == "$min" ]] && return 0
+    [[ "$(printf '%s\n%s\n' "$cand" "$min" | sort -V | head -1)" == "$min" ]]
+}
+
+# check_ainic_version_recommendation <fw_version>
+#   warns if the AINIC firmware is on the IBGDA-incapable 1.117.1 branch, or
+#   below the recommended minimum for cross-node MORI (EP over RDMA / IBGDA).
+check_ainic_version_recommendation() {
+    local ver="$1"
+    [[ -n "$ver" ]] || { log_warn "cannot verify AINIC firmware version against recommendation (empty)"; return; }
+    if [[ "$ver" =~ ^1\.117\.1([.-]|$) ]]; then
+        log_warn "AINIC firmware $ver is on the 1.117.1 branch, which does NOT support IBGDA — upgrade to >= $AINIC_MIN_VER"
+    elif version_ge "$ver" "$AINIC_MIN_VER"; then
+        log_ok "AINIC firmware $ver meets the recommended minimum (>= $AINIC_MIN_VER) for cross-node IBGDA"
+    else
+        log_warn "AINIC firmware $ver is below the recommended minimum (>= $AINIC_MIN_VER) for cross-node IBGDA"
+    fi
+}
+
+# check_bnxt_version_recommendation <fw_version>
+#   classifies Broadcom firmware by major branch against known-good/known-bad
+#   ranges for cross-node MORI (EP over RDMA / IBGDA).
+check_bnxt_version_recommendation() {
+    local ver="$1" major="${1%%.*}" min=""
+    [[ -n "$ver" ]] || { log_warn "cannot verify Broadcom firmware version against recommendation (empty)"; return; }
+    case "$major" in
+        231) log_warn "Broadcom firmware $ver is on the 231.x branch, which is too old for IBGDA — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"; return ;;
+        235) min="$BNXT_MIN_VER_235" ;;
+        237) min="$BNXT_MIN_VER_237" ;;
+        *)   log_warn "Broadcom firmware $ver is on an unverified branch ($major.x) — known-solid: $BNXT_MIN_VER_235, $BNXT_MIN_VER_237; known-bad: 231.x"; return ;;
+    esac
+    if version_ge "$ver" "$min"; then
+        log_ok "Broadcom firmware $ver is solid (>= $min on the $major.x branch)"
+    else
+        log_warn "Broadcom firmware $ver is below the solid minimum on the $major.x branch (>= $min)"
+    fi
+}
+
 # dominant_group <out_array_name> <dev...>
 #   sets the named array to the largest same-vendor-prefix subset of the inputs.
+#   Fallback for when the PCI vendor id isn't known (see devs_of_vendor below) —
+#   guesses vendor grouping from device-name prefixes instead.
 dominant_group() {
     local -n _out="$1"; shift
     local -A _pref=(); local d p best="" bc=0
@@ -321,6 +376,18 @@ dominant_group() {
         (( ${#g[@]} > bc )) && { bc=${#g[@]}; best="$p"; }
     done
     read -ra _out <<< "${_pref[$best]}"
+}
+
+# devs_of_vendor <out_array_name> <pci_vendor_id> <dev...>
+#   sets the named array to the subset of the given IB device names whose PCI
+#   vendor id (/sys/class/infiniband/<dev>/device/vendor) matches.
+devs_of_vendor() {
+    local -n _out="$1"; local vid="$2"; shift 2
+    _out=()
+    local d
+    for d in "$@"; do
+        [[ "$(cat "/sys/class/infiniband/$d/device/vendor" 2>/dev/null)" == "$vid" ]] && _out+=("$d")
+    done
 }
 
 # ======================== check functions =======================
@@ -338,8 +405,11 @@ check_versions() {
     if [[ $fw_count -ne 1 ]]; then
         log_warn "firmware versions not consistent across NICs:"
         echo "$fw_versions"
+        local v
+        while read -r v; do check_ainic_version_recommendation "$v"; done <<< "$fw_versions"
     else
         log_ok "firmware         : $fw_versions"
+        check_ainic_version_recommendation "$fw_versions"
     fi
 
     local nicctl_ver
@@ -493,8 +563,14 @@ check_intra_node_bw() {
     [[ ${#all_devs[@]} -gt 0 ]] || { log_fail "no local RDMA devices found (check ibv_devices)"; return 1; }
     log_ok "local RDMA devices (${#all_devs[@]}): ${all_devs[*]}"
 
-    # Pick the largest same-vendor group; exported via LOCAL_DEVS for inter-node tests.
-    dominant_group LOCAL_DEVS "${all_devs[@]}"
+    # Use the same dominant-vendor NICs that got firmware/QoS-checked above
+    # (falls back to name-prefix guessing if no known vendor was detected).
+    # Exported via LOCAL_DEVS for inter-node tests.
+    if [[ -n "${_dominant_vid:-}" ]]; then
+        devs_of_vendor LOCAL_DEVS "$_dominant_vid" "${all_devs[@]}"
+    else
+        dominant_group LOCAL_DEVS "${all_devs[@]}"
+    fi
     if (( ${#all_devs[@]} != ${#LOCAL_DEVS[@]} )); then
         log_warn "mixed NIC vendors detected; using ${#LOCAL_DEVS[@]} devices for tests: ${LOCAL_DEVS[*]}"
     fi
@@ -569,23 +645,14 @@ check_bnxt_versions() {
     log_ok "bnxt_re devices (${#BNXT_DEVS[@]}): ${BNXT_DEVS[*]}"
 
     # --- kernel modules ---
-    local m disk_ver load_ver
+    # Only the loaded (in-memory) driver version matters here.
+    local m load_ver
     for m in bnxt_re bnxt_en; do
-        disk_ver=$(modinfo -F version "$m" 2>/dev/null || true)
         if [[ -r "/sys/module/$m/version" ]]; then
             load_ver=$(cat "/sys/module/$m/version")
-        elif lsmod | awk '{print $1}' | grep -qx "$m"; then
-            load_ver="(loaded, no version node)"
-        else
-            load_ver="(not loaded)"
-        fi
-        if [[ "${load_ver:0:1}" != "(" ]]; then
             log_ok "$m driver : $load_ver"
-            [[ -n "$disk_ver" && "$disk_ver" != "$load_ver" ]] \
-                && log_warn "$m on-disk ($disk_ver) differs from loaded ($load_ver) — reboot needed?"
         else
-            [[ -n "$disk_ver" ]] && log_ok "$m driver (on-disk) : $disk_ver" \
-                                 || log_fail "$m : not installed"
+            log_fail "$m : not loaded"
         fi
     done
 
@@ -609,9 +676,14 @@ check_bnxt_versions() {
         log_fail "niccli not found — cannot check firmware version"; return 1
     fi
 
+    # One "niccli --list" call, reused below both for the index list and for
+    # the PCI->niccli_index map (used to be fetched twice).
+    local niccli_list
+    niccli_list=$(sudo niccli --list 2>/dev/null || true)
+
     # get list of NIC indices from niccli --list (first column, skip header)
     local nic_indices=()
-    mapfile -t nic_indices < <(sudo niccli --list 2>/dev/null | awk 'NR>1 && /^[[:space:]]*[0-9]/{gsub(/[^0-9]/,"",$1); print $1}')
+    mapfile -t nic_indices < <(awk 'NR>1 && /^[[:space:]]*[0-9]/{gsub(/[^0-9]/,"",$1); print $1}' <<< "$niccli_list")
     if [[ ${#nic_indices[@]} -eq 0 ]]; then
         log_warn "niccli --list returned no devices; defaulting to index 1"
         nic_indices=(1)
@@ -620,19 +692,34 @@ check_bnxt_versions() {
     # field <output> <label> -> value after the ':' for the line starting with <label>
     _niccli_field() { awk -F: -v k="$2" 'index($0,k)==1 {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' <<<"$1"; }
 
+    # `niccli -i <idx> show` has no "all NICs at once" form (unlike nicctl for
+    # ionic), so query every index in parallel instead of one-by-one; each call
+    # is a slow round trip to the NIC's firmware. Throttled like the mesh tests.
     local fw_versions=() roce_versions=() failed_idxs=()
-    local idx
+    local idx tmpd running=0
+    tmpd=$(mktemp -d)
     for idx in "${nic_indices[@]}"; do
-        local show_out fw_ver roce_ver
-        show_out=$(sudo niccli -i "$idx" show 2>/dev/null || true)
-        fw_ver=$(_niccli_field "$show_out" "Firmware Version")
-        roce_ver=$(_niccli_field "$show_out" "RoCE Firmware Version")
+        (
+            show_out=$(sudo niccli -i "$idx" show 2>/dev/null || true)
+            printf '%s\n%s\n' "$(_niccli_field "$show_out" "Firmware Version")" \
+                               "$(_niccli_field "$show_out" "RoCE Firmware Version")" > "$tmpd/$idx"
+        ) &
+        running=$(( running + 1 ))
+        if (( running >= MESH_PARALLEL )); then wait -n 2>/dev/null; running=$(( running - 1 )); fi
+    done
+    wait
+
+    for idx in "${nic_indices[@]}"; do
+        local fw_ver roce_ver
+        fw_ver=$(sed -n '1p' "$tmpd/$idx" 2>/dev/null)
+        roce_ver=$(sed -n '2p' "$tmpd/$idx" 2>/dev/null)
         if [[ -n "$fw_ver" ]]; then
             fw_versions+=("$fw_ver"); roce_versions+=("${roce_ver:-$fw_ver}")
         else
             failed_idxs+=("$idx")
         fi
     done
+    rm -rf "$tmpd"
 
     _report_fw() {  # <label> <versions...>
         local label="$1"; shift
@@ -644,16 +731,22 @@ check_bnxt_versions() {
             log_ok "$label : $uniq (consistent across all ${#nic_indices[@]} NICs)"
         fi
     }
-    _report_fw "firmware"      "${fw_versions[@]}"
-    _report_fw "RoCE firmware" "${roce_versions[@]}"
+    _report_fw "firmware" "${fw_versions[@]}"
     [[ ${#failed_idxs[@]} -gt 0 ]] && log_warn "could not read firmware from NIC(s): ${failed_idxs[*]}"
 
+    if [[ ${#roce_versions[@]} -gt 0 ]]; then
+        local roce_uniq; roce_uniq=$(printf '%s\n' "${roce_versions[@]}" | sort -u)
+        if [[ $(grep -c . <<<"$roce_uniq") -gt 1 ]]; then
+            log_warn "RoCE firmware inconsistent across NICs:"; printf '         %s\n' $roce_uniq
+        fi
+        local v
+        while read -r v; do check_bnxt_version_recommendation "$v"; done <<< "$roce_uniq"
+    fi
+
     # --- port state, net device, and niccli index mapping via sysfs ---
-    # Build a PCI->niccli_index map from "niccli --list" output:
+    # Build a PCI->niccli_index map from the "niccli --list" output fetched above:
     #   "  1) BCM57608  <mac>  235.2.40.0  0000:06:00.0  NIC  PCI"
     declare -A _pci2idx=()
-    local niccli_list
-    niccli_list=$(sudo niccli --list 2>/dev/null || true)
     while IFS= read -r line; do
         local idx pci
         idx=$(echo "$line" | awk '/^[[:space:]]*[0-9]+\)/{gsub(/[^0-9]/,"",$1); print $1}')
@@ -794,12 +887,14 @@ check_bnxt_dcqcn() {
 
     for dev in "${BNXT_DEVS[@]}"; do
         # Method 1: configfs (CNP_SERVICE_TYPE=0, driver-managed CC)
+        # sudo'd like the niccli/nicctl calls above: configfs/debugfs are root-only
+        # on most distros, and this script isn't required to run as root itself.
         local cc_path="/sys/kernel/config/bnxt_re/$dev/ports/1/cc"
-        if mkdir -p "/sys/kernel/config/bnxt_re/$dev" 2>/dev/null && [[ -d "$cc_path" ]]; then
+        if sudo mkdir -p "/sys/kernel/config/bnxt_re/$dev" 2>/dev/null && [[ -d "$cc_path" ]]; then
             local ecn_enable cc_mode
-            ecn_enable=$(cat "$cc_path/ecn_enable" 2>/dev/null || true)
-            cc_mode=$(cat    "$cc_path/cc_mode"    2>/dev/null || true)
-            rmdir -p "/sys/kernel/config/bnxt_re/$dev" 2>/dev/null || true
+            ecn_enable=$(sudo cat "$cc_path/ecn_enable" 2>/dev/null || true)
+            cc_mode=$(sudo cat    "$cc_path/cc_mode"    2>/dev/null || true)
+            sudo rmdir -p "/sys/kernel/config/bnxt_re/$dev" 2>/dev/null || true
 
             if [[ "$ecn_enable" == "0x1" || "$ecn_enable" == "1" ]] && \
                [[ "$cc_mode"    == "0x1" || "$cc_mode" == "1" ]]; then
@@ -812,10 +907,11 @@ check_bnxt_dcqcn() {
         fi
 
         # Method 2: debugfs (CNP_SERVICE_TYPE=1, firmware-managed CC)
-        local debug_info="/sys/kernel/debug/bnxt_re/$dev/info"
-        if [[ -r "$debug_info" ]]; then
+        local debug_info="/sys/kernel/debug/bnxt_re/$dev/info" debug_out
+        debug_out=$(sudo cat "$debug_info" 2>/dev/null || true)
+        if [[ -n "$debug_out" ]]; then
             local prof_type
-            prof_type=$(grep "fw_service_prof_type_sup" "$debug_info" 2>/dev/null | awk '{print $3}')
+            prof_type=$(echo "$debug_out" | grep "fw_service_prof_type_sup" | awk '{print $3}')
             if [[ "$prof_type" == "1" ]]; then
                 log_ok "$dev : DCQCN managed by firmware (fw_service_prof_type_sup=1) [debugfs]"
             else
@@ -864,31 +960,72 @@ check_inter_node_lat() {
 
 LOCAL_DEVS=()
 
-# detect NIC vendor and run the matching checks
-_have_ionic=false
-if command -v nicctl >/dev/null 2>&1; then
-    _nicctl_out=$(nicctl show version firmware 2>&1 || true)
-    echo "$_nicctl_out" | grep -qi "No AMD NICs" || _have_ionic=true
-    unset _nicctl_out
+# Detect NICs by PCI vendor id (stable), not IB device name (ionic cards may
+# show up as ionic_*, roceensp*, etc.). On mixed-vendor hosts, run the checks
+# for whichever vendor has the most devices ("dominant"), so e.g. one stray
+# bnxt_re management NIC can't steal the checks away from 8x mlx5 GPU NICs.
+_VENDOR_IDS=(ionic:0x1dd8 bnxt:0x14e4 mlx:0x15b3)
+
+ib_count_vendor() {   # <pci_vendor_id> -> number of matching IB devices
+    local vid="$1" d n=0
+    for d in /sys/class/infiniband/*; do
+        [[ "$(cat "$d/device/vendor" 2>/dev/null)" == "$vid" ]] && (( n++ ))
+    done
+    echo "$n"
+}
+
+declare -A _VENDOR_COUNT=()
+_dominant_vendor="none"; _dominant_count=0; _dominant_vid=""
+for _nv in "${_VENDOR_IDS[@]}"; do
+    _name="${_nv%%:*}"; _vid="${_nv#*:}"
+    _VENDOR_COUNT[$_name]=$(ib_count_vendor "$_vid")
+    if (( _VENDOR_COUNT[$_name] > _dominant_count )); then
+        _dominant_vendor="$_name"; _dominant_count=${_VENDOR_COUNT[$_name]}; _dominant_vid="$_vid"
+    fi
+done
+
+# ionic checks shell out to `sudo nicctl`; probe it can actually see a card
+# before relying on it, to skip gracefully instead of spewing driver errors.
+_nicctl_ok=false
+if (( ${_VENDOR_COUNT[ionic]} > 0 )) && command -v nicctl >/dev/null 2>&1; then
+    _nicctl_out=$(sudo nicctl show version firmware 2>&1 || true)
+    echo "$_nicctl_out" | grep -qiE 'No AMD NICs|Invalid card handle|Failed to get NIC' || _nicctl_ok=true
 fi
 
-_have_bnxt=false
-if [[ -d /sys/class/infiniband ]] && \
-   find /sys/class/infiniband -maxdepth 1 -name 'bnxt_re*' 2>/dev/null | grep -q .; then
-    _have_bnxt=true
-fi
+# warn about non-dominant vendors present but not checked above
+minority_note() {
+    local nv name
+    for nv in "${_VENDOR_IDS[@]}"; do
+        name="${nv%%:*}"
+        [[ "$name" == "$_dominant_vendor" || "${_VENDOR_COUNT[$name]}" -eq 0 ]] && continue
+        log_warn "also detected ${_VENDOR_COUNT[$name]} $name NIC(s) (not the dominant vendor) — skipping their firmware/QoS/DCQCN checks"
+    done
+}
 
-if [[ "$_have_ionic" == "true" ]]; then
-    check_versions
-    check_qos
-    check_dcqcn
-elif [[ "$_have_bnxt" == "true" ]]; then
-    check_bnxt_versions
-    check_bnxt_qos
-    check_bnxt_dcqcn
-else
-    log_warn "no ionic or bnxt_re NICs detected — skipping NIC-specific checks"
-fi
+case "$_dominant_vendor" in
+    ionic)
+        if [[ "$_nicctl_ok" == "true" ]]; then
+            check_versions
+            check_qos
+            check_dcqcn
+        else
+            log_warn "ionic NICs present but nicctl is unavailable or cannot access them — skipping nicctl-based checks (firmware / QoS / DCQCN)"
+        fi
+        ;;
+    bnxt)
+        check_bnxt_versions
+        check_bnxt_qos
+        check_bnxt_dcqcn
+        ;;
+    mlx)
+        step "check mlx5 (Mellanox) NIC"
+        log_ok "Mellanox ConnectX (mlx5) detected (${_dominant_count}) — good backward compatibility, no known minimum version for IBGDA"
+        ;;
+    *)
+        log_warn "no ionic, bnxt_re, or mlx5 NICs detected — skipping NIC-specific checks"
+        ;;
+esac
+minority_note
 
 check_intra_node_bw
 check_inter_node_bw

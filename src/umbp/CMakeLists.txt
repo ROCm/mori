@@ -383,4 +383,6 @@ endif()
 target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
 
-add_subdirectory(tests)
+if(BUILD_TESTS)
+  add_subdirectory(tests)
+endif()

@@ -9,6 +9,29 @@ if(WITH_MPI)
   endif()
 endif()
 find_package(hsa-runtime64 REQUIRED)
+
+# ROCm 7.14's hsakmt cmake config declares a link dependency on the imported
+# target `numa::numa` but never provides it (no FindNUMA / find_package(NUMA)).
+# Without it, find_package(hsakmt) fails at generate time: "The link interface
+# of target hsakmt::hsakmt contains: numa::numa but the target was not found."
+# Define it ourselves from the system libnuma before pulling in hsakmt.
+if(NOT TARGET numa::numa)
+  find_library(NUMA_LIBRARY NAMES numa)
+  find_path(NUMA_INCLUDE_DIR NAMES numa.h)
+  if(NUMA_LIBRARY)
+    add_library(numa::numa UNKNOWN IMPORTED)
+    set_target_properties(numa::numa PROPERTIES IMPORTED_LOCATION
+                                                "${NUMA_LIBRARY}")
+    if(NUMA_INCLUDE_DIR)
+      set_target_properties(numa::numa PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                                                  "${NUMA_INCLUDE_DIR}")
+    endif()
+  else()
+    message(FATAL_ERROR "libnuma not found but required by hsakmt::hsakmt. "
+                        "Install it (e.g. 'apt install libnuma-dev').")
+  endif()
+endif()
+
 find_package(hsakmt REQUIRED)
 # find_library(IONIC_LIBRARY NAMES ionic HINTS /lib/x86_64-linux-gnu REQUIRED )
 
@@ -56,27 +79,45 @@ target_compile_options(mori_ibv_shim PRIVATE -fvisibility=hidden
 set_target_properties(mori_ibv_shim PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set_source_files_properties(${MORI_APP_SOURCES} PROPERTIES LANGUAGE CXX)
-add_library(mori_application SHARED ${MORI_APP_SOURCES})
+find_library(HSA_RUNTIME_LIB hsa-runtime64 HINTS /opt/rocm/lib REQUIRED)
 
+# Application sources are compiled once (PIC) into an OBJECT library, shared by:
+#   * mori_application (SHARED)         — the usual dependency for shmem/io/ops/…
+#   * mori_application_static (STATIC)  — absorbed whole into libmori_cco.so so
+#                                         cco has no runtime dep on the .so.
+# Only the OBJECT library carries the compile-time usage requirements (includes,
+# HIP/MPI defs); the two output libraries re-declare the actual link deps.
+add_library(mori_application_objs OBJECT ${MORI_APP_SOURCES})
+target_include_directories(mori_application_objs PUBLIC ${CMAKE_SOURCE_DIR}/include
+                                                        ${CMAKE_SOURCE_DIR})
+set_target_properties(mori_application_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(mori_application_objs PUBLIC hip::host dl pci mori_logging
+                                                   ${HSA_RUNTIME_LIB} hsakmt::hsakmt)
+if(WITH_MPI)
+  target_compile_definitions(mori_application_objs PUBLIC MORI_WITH_MPI)
+  target_link_libraries(mori_application_objs PUBLIC MPI::MPI_CXX)
+endif()
+
+add_library(mori_application SHARED $<TARGET_OBJECTS:mori_application_objs>)
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR})
-find_library(ROCM_SMI_LIB rocm_smi64 HINTS /opt/rocm/lib REQUIRED)
-find_library(HSA_RUNTIME_LIB hsa-runtime64 HINTS /opt/rocm/lib REQUIRED)
-target_link_libraries(
-  mori_application
-  PUBLIC hip::host
-         dl
-         ${ROCM_SMI_LIB}
-         pci
-         mori_logging
-         ${HSA_RUNTIME_LIB}
-         hsakmt::hsakmt)
+target_link_libraries(mori_application PUBLIC hip::host dl pci mori_logging
+                                              ${HSA_RUNTIME_LIB} hsakmt::hsakmt)
 # Embed the libibverbs dlopen shim (object library, hidden visibility).
 target_link_libraries(mori_application PRIVATE mori_ibv_shim)
+
+# Static archive absorbed by mori_cco. Embeds the ibv shim objects (hidden
+# visibility) just like the shared lib. Its INTERFACE carries the external deps
+# so mori_cco resolves the absorbed code without depending on libmori_application.
+add_library(mori_application_static STATIC $<TARGET_OBJECTS:mori_application_objs>
+                                           $<TARGET_OBJECTS:mori_ibv_shim>)
+target_link_libraries(mori_application_static INTERFACE hip::host dl pci mori_logging
+                                                        ${HSA_RUNTIME_LIB} hsakmt::hsakmt)
 
 if(WITH_MPI)
   target_compile_definitions(mori_application PUBLIC MORI_WITH_MPI)
   target_link_libraries(mori_application PUBLIC MPI::MPI_CXX)
+  target_link_libraries(mori_application_static INTERFACE MPI::MPI_CXX)
 endif()
 
 set_target_properties(

@@ -16,6 +16,7 @@ MORI Documentation
 
    MORI-EP-GUIDE
    MORI-SHMEM-GUIDE
+   MORI-CCO-GUIDE
    MORI-IR-GUIDE
    MORI-IO-GUIDE
    PROFILER
@@ -52,6 +53,8 @@ Components
      - Lightweight collective communication for latency-sensitive environments (coming soon)
    * - **MORI-SHMEM**
      - OpenSHMEM-style symmetric memory APIs for GPU memory and RDMA
+   * - **MORI-CCO**
+     - Collective Communication Object: explicit-handle GPU communication (LSA / GDA / SDMA)
    * - **MORI-VIZ**
      - Warp-level kernel profiler with Perfetto integration
 

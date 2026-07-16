@@ -140,6 +140,17 @@ struct ChunkedSgeSegment {
   uint32_t length{0};
 };
 
+struct ChunkGeometry {
+  uint64_t finalCount{0};
+  uint64_t targetChunkBytes{0};
+};
+
+ChunkGeometry PlanChunkGeometry(uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                                uint64_t maxMessageSize);
+
+uint64_t CountChunksForSize(uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                            uint64_t maxMessageSize);
+
 void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector<ibv_sge>& sges,
                          uint64_t totalLength, size_t chunkBytes, int maxChunks,
                          uint64_t maxMessageSize);
@@ -197,6 +208,13 @@ class SubmissionLedger {
   std::unordered_map<uint64_t, SubmissionRecord> records_;
 };
 
+inline constexpr std::memory_order kSqAdmissionOrder = std::memory_order_seq_cst;
+
+struct SqAdmissionEvent {
+  alignas(4) std::atomic<uint32_t> epoch{0};
+  std::atomic<uint32_t> waiters{0};
+};
+
 struct EpPair {
   int weight;
   int ldevId;
@@ -210,6 +228,8 @@ struct EpPair {
   // Degraded flag — set on partial post without signaled tail.
   std::shared_ptr<std::atomic<bool>> degraded;
   std::shared_ptr<SubmissionLedger> ledger;
+  // Shared across EpPair copies that refer to the same QP.
+  std::shared_ptr<SqAdmissionEvent> sqAdmission;
 };
 
 using EndpointId = uint64_t;
@@ -242,7 +262,32 @@ struct RdmaOpRet {
   bool Failed() { return code > StatusCode::ERR_BEGIN; }
 };
 
+void NotifySqStateChanged(const EpPair& ep);
+
 RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+
+namespace detail {
+
+// Test hook for SQ admission without proceeding to ibv_post_send on a fake QP.
+bool TryReserveSqDepthForTesting(const EpPair& ep, int wrCount, std::string* errMsg = nullptr);
+
+}  // namespace detail
+
+struct RdmaTransferControl {
+  size_t chunkBytes{0};
+  int maxChunks{1};
+  bool creditByWrCount{false};
+  bool ownsTotalBatchSize{true};
+  bool disableMerge{false};
+};
+
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
+                             const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                             const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                             const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id, bool isRead, int postBatchSize,
+                             const RdmaTransferControl& control);
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                              const std::vector<application::RdmaMemoryRegion>& localMrPerEp,

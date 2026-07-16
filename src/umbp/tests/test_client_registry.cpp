@@ -133,6 +133,51 @@ TEST(ClientRegistryTest, GetAliveClientsReportsMembershipAndCapacities) {
   EXPECT_EQ(c2->tier_capacities.at(TierType::HBM).available_bytes, 32u);
 }
 
+// The lightweight peer view maps node->peer (no capacity) and reflects
+// membership changes.
+TEST(ClientRegistryTest, AlivePeerViewTracksMembership) {
+  ClientRegistry registry(ClientRegistryConfig{});
+  EXPECT_TRUE(registry.RegisterClient("c1", "host-a:8080", Caps(80, 64),
+                                      /*peer_address=*/"peer-a:9000"));
+
+  auto v1 = registry.GetAlivePeerView();
+  EXPECT_EQ(v1.size(), 1u);
+  ASSERT_EQ(v1.count("c1"), 1u);
+  EXPECT_EQ(v1.at("c1"), "peer-a:9000");
+
+  // Membership change -> reflected in a freshly built view.
+  EXPECT_TRUE(registry.RegisterClient("c2", "host-b:8080", Caps(96, 32),
+                                      /*peer_address=*/"peer-b:9000"));
+  auto v2 = registry.GetAlivePeerView();
+  EXPECT_EQ(v2.size(), 2u);
+  EXPECT_EQ(v2.at("c2"), "peer-b:9000");
+}
+
+// The peer view carries no capacity, so a capacity-only heartbeat leaves its
+// contents (node -> peer) unchanged.
+TEST(ClientRegistryTest, PeerViewIgnoresCapacity) {
+  ClientRegistry registry(ClientRegistryConfig{});
+  EXPECT_TRUE(registry.RegisterClient("c1", "addr", Caps(80, 64), /*peer_address=*/"peer-a"));
+
+  auto p1 = registry.GetAlivePeerView();
+  EXPECT_EQ(Beat(registry, "c1", Caps(80, 8)), ClientStatus::ALIVE);
+  auto p2 = registry.GetAlivePeerView();
+  EXPECT_EQ(p1, p2);
+}
+
+// AliveClientCount counts only ALIVE nodes and tracks membership changes.
+TEST(ClientRegistryTest, AliveClientCountTracksMembership) {
+  ClientRegistry registry(ClientRegistryConfig{});
+  EXPECT_EQ(registry.AliveClientCount(), 0u);
+
+  EXPECT_TRUE(registry.RegisterClient("c1", "addr-1", Caps(80, 64)));
+  EXPECT_TRUE(registry.RegisterClient("c2", "addr-2", Caps(96, 32)));
+  EXPECT_EQ(registry.AliveClientCount(), 2u);
+
+  registry.UnregisterClient("c1");
+  EXPECT_EQ(registry.AliveClientCount(), 1u);
+}
+
 TEST(ClientRegistryTest, ReRegisterAliveRejected) {
   ClientRegistry registry(ClientRegistryConfig{});
   EXPECT_TRUE(registry.RegisterClient("c1", "addr-1", Caps(80, 64)));

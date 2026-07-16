@@ -210,6 +210,11 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("host", &UMBPIoEngineConfig::host)
       .def_readwrite("port", &UMBPIoEngineConfig::port);
 
+  py::enum_<CacheRemoteAdmission>(m, "CacheRemoteAdmission")
+      .value("SIZE", CacheRemoteAdmission::SIZE)
+      .value("NEVER", CacheRemoteAdmission::NEVER)
+      .value("ALWAYS", CacheRemoteAdmission::ALWAYS);
+
   py::class_<UMBPDistributedConfig>(m, "UMBPDistributedConfig")
       .def(py::init<>())
       .def_readwrite("master_config", &UMBPDistributedConfig::master_config)
@@ -219,6 +224,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("ssd_staging_buffer_slots", &UMBPDistributedConfig::ssd_staging_buffer_slots)
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
       .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)
+      .def_readwrite("cache_remote_admission", &UMBPDistributedConfig::cache_remote_admission)
+      .def_readwrite("admission_max_block_bytes", &UMBPDistributedConfig::admission_max_block_bytes)
       .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size);
 
   py::class_<UMBPConfig>(m, "UMBPConfig")

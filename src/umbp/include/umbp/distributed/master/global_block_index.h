@@ -23,6 +23,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <memory>
 #include <optional>
 #include <set>
 #include <shared_mutex>
@@ -45,7 +47,14 @@ struct BlockEntry {
   std::atomic<uint64_t> atomic_access_count{0};
 
   void GrantLease(std::chrono::steady_clock::duration duration) {
-    auto expiry = std::chrono::steady_clock::now() + duration;
+    GrantLease(std::chrono::steady_clock::now(), duration);
+  }
+
+  // Overload taking a caller-supplied "now": lets a batch capture the clock
+  // once and reuse it across many keys instead of re-reading it per key.
+  void GrantLease(std::chrono::steady_clock::time_point now,
+                  std::chrono::steady_clock::duration duration) {
+    auto expiry = now + duration;
     lease_expiry_rep.store(expiry.time_since_epoch().count(), std::memory_order_release);
   }
 
@@ -54,9 +63,11 @@ struct BlockEntry {
     return lease_expiry_rep.load(std::memory_order_acquire) > now_rep;
   }
 
-  void RecordAccessAtomic() {
-    last_accessed_rep.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                            std::memory_order_release);
+  void RecordAccessAtomic() { RecordAccessAtomic(std::chrono::steady_clock::now()); }
+
+  // Overload taking a caller-supplied "now"; see GrantLease above.
+  void RecordAccessAtomic(std::chrono::steady_clock::time_point now) {
+    last_accessed_rep.store(now.time_since_epoch().count(), std::memory_order_release);
     atomic_access_count.fetch_add(1, std::memory_order_relaxed);
   }
 
@@ -79,7 +90,11 @@ struct EvictionCandidate {
 // master RPCs.  Routing and eviction read from here.
 class GlobalBlockIndex {
  public:
-  GlobalBlockIndex() = default;
+  // The forward + reverse index is split into `UMBP_MASTER_INDEX_SHARDS`
+  // independently-locked shards (key-hashed).  A heartbeat's event batch then
+  // only takes the exclusive lock on the shards its keys land in, so unrelated
+  // route/lookup readers on other shards never block behind a large apply.
+  GlobalBlockIndex();
   ~GlobalBlockIndex() = default;
 
   GlobalBlockIndex(const GlobalBlockIndex&) = delete;
@@ -91,8 +106,6 @@ class GlobalBlockIndex {
   // of location mutations.  ADD with a (node_id, tier) that already exists
   // for the key is an idempotent no-op on the location's size.
   // REMOVE for an unknown (key, node_id, tier) is a silent no-op.
-  // CLEAR_AT_TIER drops every key for (node_id, tier) and returns
-  // the number of locations removed.
   size_t ApplyEvents(const std::string& node_id, const std::vector<KvEvent>& events);
 
   // Replace this node's full set of locations with the ADDs carried in `adds`.
@@ -140,10 +153,25 @@ class GlobalBlockIndex {
       const std::set<NodeTierKey>& overloaded_node_tiers) const;
 
  private:
-  mutable std::shared_mutex mutex_;
-  std::unordered_map<std::string, BlockEntry> entries_;
-  // Reverse index: lets ReplaceNodeLocations skip a full entries_ scan.
-  std::unordered_map<std::string, std::unordered_set<std::string>> node_to_keys_;
+  // One independently-locked partition of the key space.  A key lives in
+  // exactly one shard (chosen by hash), so its forward entry and its
+  // reverse-index membership are always co-located under the same lock.
+  struct Shard {
+    mutable std::shared_mutex mutex;
+    std::unordered_map<std::string, BlockEntry> entries;
+    // Reverse index (shard-local): node_id -> set of this shard's keys the
+    // node owns.  Lets ReplaceNodeLocations/RemoveByNode skip a full scan.
+    std::unordered_map<std::string, std::unordered_set<std::string>> node_to_keys;
+  };
+
+  size_t shard_index(std::string_view key) const {
+    return std::hash<std::string_view>{}(key) % num_shards_;
+  }
+  Shard& shard_at(size_t i) const { return *shards_[i]; }
+  Shard& shard_for(std::string_view key) const { return shard_at(shard_index(key)); }
+
+  const size_t num_shards_;
+  std::vector<std::unique_ptr<Shard>> shards_;
 };
 
 }  // namespace mori::umbp

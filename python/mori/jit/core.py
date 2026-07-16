@@ -285,6 +285,13 @@ def _profiler_defines() -> list[str]:
     return ["-DENABLE_PROFILER"] if is_profiler_enabled() else []
 
 
+def _ocp_fp_defines(arch: str) -> list[str]:
+    """Enable the native gfx950 OCP FP4/FP8 conversion instructions (cvt_scalef32_pk_*) used by
+    the fp4_blockwise combine's E2M1 quant/dequant helpers. Without this the helpers fall back to
+    slow software bit-manipulation. Only relevant on gfx950; a no-op elsewhere."""
+    return ["-DHIP_ENABLE_GFX950_OCP_BUILTINS=1"] if "gfx950" in str(arch) else []
+
+
 def _debuginfo_flags() -> list[str]:
     """Return hipcc debug flags if MORI_DEBUG_INFO is enabled."""
     return ["-g", "-ggdb"] if is_debuginfo_enabled() else []
@@ -415,6 +422,7 @@ def _hipcc_genco(
         *_nic_defines(),
         *_ccqe_defines(),
         *_profiler_defines(),
+        *_ocp_fp_defines(cfg.arch),
     ]
 
     for d in include_dirs:
@@ -495,7 +503,7 @@ def compile_genco(
     sub_kernels = _PARALLEL_KERNEL_GROUPS.get(kernel_name)
     if sub_kernels:
         source_paths = [
-            mori_root / "src" / "ops" / "kernels",
+            mori_root / "src" / "ops",
             mori_root / "include" / "mori",
         ]
         cache_dir = get_cache_dir(
@@ -544,7 +552,11 @@ def compile_genco(
     if not source.is_file():
         raise FileNotFoundError(f"Kernel source not found: {source}")
 
-    source_paths = [source, mori_root / "include" / "mori"]
+    # The .hip translation unit #includes sibling sources from its subsystem
+    # (e.g. ops kernels pull in src/ops/dispatch_combine/*), so hash the whole
+    # subsystem source tree; hashing only the top-level .hip reuses a stale
+    # .hsaco when an included file changes.
+    source_paths = [(mori_root / source_dir).parent, mori_root / "include" / "mori"]
     cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, ccqe=ccqe)
     hsaco_path = cache_dir / f"{kernel_name}.hsaco"
 

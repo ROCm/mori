@@ -93,6 +93,10 @@ using MemoryUniqueId = uint32_t;
 
 constexpr size_t kIpcHandleSize = 64;
 
+// Fabric (UALink super-node) shareable handle size. Equals the IPC handle size
+// (hipMemFabricHandle_t is a 64-byte token, same width as hipIpcMemHandle_t).
+constexpr size_t kFabricHandleSize = kIpcHandleSize;
+
 struct MemoryDesc {
   EngineKey engineKey;
   MemoryUniqueId id{0};
@@ -108,6 +112,19 @@ struct MemoryDesc {
   // data = allocBase + ipcOffset, e.g. a per-layer view of a paged KV cache)
   // must add this offset back to the remapped base on the importing side.
   uintptr_t ipcOffset{0};
+  // Fabric backend metadata. Populated by FabricBackend::RegisterMemory when the
+  // GPU allocation is exportable over a scale-up fabric (UALink vPOD). Kept
+  // separate from ipcHandle so XGMI and Fabric backends can register the same
+  // memory without clobbering each other's handle.
+  std::array<char, kFabricHandleSize> fabricHandle{};  // 64B fabric token (empty when N/A)
+  int vpodId{-1};                                      // UALink vPOD id of deviceId (-1 = N/A)
+  std::string vpodPpodId;                              // UALink ppod_id UUID ("" = N/A)
+  // data may be a sub-allocation inside a larger fabric VMM allocation (e.g. a
+  // torch tensor carved out of a MemPool segment). fabricHandle exports the whole
+  // allocation; these locate `data` within it so the importer maps the allocation
+  // and offsets to the right address.
+  uint64_t fabricOffset{0};     // data - allocation base
+  uint64_t fabricAllocSize{0};  // full size of the exported allocation
 
   constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
@@ -116,7 +133,7 @@ struct MemoryDesc {
   }
 
   MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode,
-                 ipcOffset);
+                 ipcOffset, fabricHandle, vpodId, vpodPpodId, fabricOffset, fabricAllocSize);
 };
 
 using TransferUniqueId = uint64_t;

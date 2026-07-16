@@ -22,11 +22,16 @@
 #include "src/io/rdma/common.hpp"
 
 #include <infiniband/verbs.h>  // dereferences ibvHandle.qp (forward-declared in core)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdlib>
+#include <ctime>
 #include <limits>
 #include <numeric>
 #include <thread>
@@ -52,8 +57,15 @@ enum class PostSendOpKind : uint8_t {
 
 static int GetSqBackoffTimeoutUs() {
   static const int kBackoffTimeoutUs = []() {
-    int v = 5000000;
+    constexpr int kDefaultBackoffTimeoutUs = 5000000;
+    int v = kDefaultBackoffTimeoutUs;
     env::Override("MORI_IO_SQ_BACKOFF_TIMEOUT_US", v, mori::env::detail::ParsePositiveInt);
+    if (v < kDefaultBackoffTimeoutUs) {
+      MORI_IO_WARN(
+          "MORI_IO_SQ_BACKOFF_TIMEOUT_US={} us is below the default {} us; SQ full conditions may "
+          "timeout faster under transient CQ drain delays",
+          v, kDefaultBackoffTimeoutUs);
+    }
     return v;
   }();
   return kBackoffTimeoutUs;
@@ -184,12 +196,134 @@ uint64_t MakeNotifSendWrId(TransferUniqueId id) {
   return kNotifSendWrIdTag | id;
 }
 
-// SQ depth is an admission counter only. It does not publish data dependencies
-// across threads, so relaxed atomics are sufficient for correctness.
+namespace {
+
+int* FutexAddr(std::atomic<uint32_t>* word) {
+  static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t));
+  static_assert(alignof(std::atomic<uint32_t>) >= alignof(uint32_t));
+  static_assert(std::atomic<uint32_t>::is_always_lock_free);
+  // Linux futex ABI requires an int* uaddr. Keep this cast local and pass the
+  // returned pointer only to the syscall; do not dereference it in C++.
+  return reinterpret_cast<int*>(word);
+}
+
+timespec ToTimespec(std::chrono::steady_clock::duration d) {
+  using namespace std::chrono;
+  if (d <= steady_clock::duration::zero()) return timespec{0, 0};
+  const auto ns = duration_cast<nanoseconds>(d);
+  timespec ts{};
+  ts.tv_sec = static_cast<time_t>(ns.count() / 1000000000LL);
+  ts.tv_nsec = static_cast<long>(ns.count() % 1000000000LL);
+  return ts;
+}
+
+enum class FutexWaitResult {
+  WokenOrChanged,
+  TimedOut,
+  Unavailable,
+};
+
+FutexWaitResult FutexWaitUntil(std::atomic<uint32_t>* word, uint32_t expected,
+                               std::chrono::steady_clock::time_point deadline) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) return FutexWaitResult::TimedOut;
+
+  timespec timeout = ToTimespec(deadline - now);
+  const int rc = static_cast<int>(syscall(SYS_futex, FutexAddr(word), FUTEX_WAIT_PRIVATE,
+                                          static_cast<int>(expected), &timeout, nullptr, 0));
+  if (rc == 0) return FutexWaitResult::WokenOrChanged;
+
+  const int e = errno;
+  if (e == ETIMEDOUT) return FutexWaitResult::TimedOut;
+  if (e == EAGAIN || e == EINTR) return FutexWaitResult::WokenOrChanged;
+
+  static std::atomic<bool> loggedUnexpectedFutexWait{false};
+  if (!loggedUnexpectedFutexWait.exchange(true, std::memory_order_relaxed)) {
+    MORI_IO_WARN("FUTEX_WAIT_PRIVATE failed: errno={}", e);
+  }
+  return FutexWaitResult::Unavailable;
+}
+
+void FutexWakeAll(std::atomic<uint32_t>* word) {
+  const int rc = static_cast<int>(
+      syscall(SYS_futex, FutexAddr(word), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0));
+  if (rc < 0) {
+    MORI_IO_WARN("FUTEX_WAKE_PRIVATE failed: errno={}", errno);
+  }
+}
+
+}  // namespace
+
+void NotifySqStateChanged(const EpPair& ep) {
+  auto* event = ep.sqAdmission.get();
+  if (!event) return;
+
+  // Avoid an atomic RMW on the CQ hot path when no thread is waiting. A waiter
+  // that this load misses registers after the predicate update and re-checks
+  // sqDepth/degraded before sleeping, so it will not block on stale state.
+  if (event->waiters.load(kSqAdmissionOrder) == 0) return;
+
+  event->epoch.fetch_add(1, kSqAdmissionOrder);
+  FutexWakeAll(&event->epoch);
+}
+
+static bool TryReserveSqDepthOnce(const EpPair& ep, int wrCount) {
+  int observed = ep.sqDepth->load(kSqAdmissionOrder);
+  while (true) {
+    const int base = std::max(observed, 0);
+    if (base > ep.maxSqDepth - wrCount) return false;
+
+    const int desired = base + wrCount;
+    if (ep.sqDepth->compare_exchange_weak(observed, desired, kSqAdmissionOrder,
+                                          kSqAdmissionOrder)) {
+      return true;
+    }
+  }
+}
+
+static bool TryReserveSqDepthSpin(const EpPair& ep, int wrCount, int epId, const char* opTag,
+                                  std::string* errMsg,
+                                  SqReserveFailureKind* failureKind = nullptr) {
+  const int kBackoffTimeoutUs = GetSqBackoffTimeoutUs();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::microseconds(kBackoffTimeoutUs);
+  int backoff = 0;
+  while (true) {
+    if (ep.degraded && ep.degraded->load(kSqAdmissionOrder)) {
+      SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
+      if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
+      return false;
+    }
+
+    if (TryReserveSqDepthOnce(ep, wrCount)) return true;
+
+    if (std::chrono::steady_clock::now() >= deadline) {
+      SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Timeout);
+      const int cur = ep.sqDepth->load(kSqAdmissionOrder);
+      MORI_IO_WARN(
+          "SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us (backoff={})",
+          opTag, epId, cur, wrCount, ep.maxSqDepth, kBackoffTimeoutUs, backoff);
+      if (errMsg) {
+        *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
+                  " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
+                  " max=" + std::to_string(ep.maxSqDepth);
+      }
+      return false;
+    }
+
+    if (backoff < 16) {
+      std::this_thread::yield();
+    } else {
+      std::this_thread::sleep_for(std::chrono::microseconds(2));
+    }
+    backoff++;
+  }
+}
+
 static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const char* opTag,
                               std::string* errMsg, SqReserveFailureKind* failureKind = nullptr) {
   if (wrCount <= 0 || !ep.sqDepth) return true;
-  if (ep.degraded && ep.degraded->load(std::memory_order_relaxed)) {
+  if (ep.degraded && ep.degraded->load(kSqAdmissionOrder)) {
     SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
     if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
     return false;
@@ -205,58 +339,83 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
     }
     return false;
   }
-  const int kBackoffTimeoutUs = GetSqBackoffTimeoutUs();
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::microseconds(kBackoffTimeoutUs);
-  int backoff = 0;
-  int cur = ep.sqDepth->load(std::memory_order_relaxed);
-  if (cur < 0) cur = 0;  // defensive: clamp stale negative depth
+
+  if (TryReserveSqDepthOnce(ep, wrCount)) return true;
+
+  auto* event = ep.sqAdmission.get();
+  if (!event) {
+    return TryReserveSqDepthSpin(ep, wrCount, epId, opTag, errMsg, failureKind);
+  }
+
+  const int timeoutUs = GetSqBackoffTimeoutUs();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUs);
+  bool useFutex = true;
+  int futexFallbackBackoff = 0;
+
+  struct WaiterGuard {
+    explicit WaiterGuard(SqAdmissionEvent& ev_) : ev(ev_) {
+      ev.waiters.fetch_add(1, kSqAdmissionOrder);
+    }
+    ~WaiterGuard() { ev.waiters.fetch_sub(1, kSqAdmissionOrder); }
+    SqAdmissionEvent& ev;
+  } guard(*event);
+
   while (true) {
-    // Re-check degraded state while waiting to avoid accepting new submissions
-    // after another thread has marked this EP as degraded.
-    if (ep.degraded && ep.degraded->load(std::memory_order_relaxed)) {
+    const uint32_t observedEpoch = event->epoch.load(kSqAdmissionOrder);
+
+    if (ep.degraded && ep.degraded->load(kSqAdmissionOrder)) {
       SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
       if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
       return false;
     }
-    if (cur + wrCount > ep.maxSqDepth) {
-      if (std::chrono::steady_clock::now() >= deadline) {
-        SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Timeout);
-        MORI_IO_WARN(
-            "SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us (backoff={})",
-            opTag, epId, cur, wrCount, ep.maxSqDepth, kBackoffTimeoutUs, backoff);
-        if (errMsg) {
-          *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
-                    " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
-                    " max=" + std::to_string(ep.maxSqDepth);
-        }
-        return false;
+
+    if (TryReserveSqDepthOnce(ep, wrCount)) return true;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Timeout);
+      const int cur = ep.sqDepth->load(kSqAdmissionOrder);
+      MORI_IO_WARN("SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us", opTag,
+                   epId, cur, wrCount, ep.maxSqDepth, timeoutUs);
+      if (errMsg) {
+        *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
+                  " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
+                  " max=" + std::to_string(ep.maxSqDepth);
       }
-      // Phased backoff: short polite yields, then tiny sleeps to reduce CPU burn.
-      if (backoff < 16) {
-        std::this_thread::yield();
-      } else {
-        std::this_thread::sleep_for(std::chrono::microseconds(2));
-      }
-      backoff++;
-      cur = ep.sqDepth->load(std::memory_order_relaxed);
-      continue;
+      return false;
     }
-    if (ep.sqDepth->compare_exchange_weak(cur, cur + wrCount, std::memory_order_relaxed))
-      return true;
-    if (backoff < 16) {
+
+    if (useFutex) {
+      const FutexWaitResult waitResult = FutexWaitUntil(&event->epoch, observedEpoch, deadline);
+      if (waitResult != FutexWaitResult::Unavailable) {
+        continue;
+      }
+      useFutex = false;
+    }
+
+    if (futexFallbackBackoff < 16) {
       std::this_thread::yield();
     } else {
       std::this_thread::sleep_for(std::chrono::microseconds(2));
     }
-    backoff++;
+    futexFallbackBackoff++;
   }
 }
 
 static void ReleaseSqDepth(const EpPair& ep, int wrCount) {
   if (wrCount <= 0 || !ep.sqDepth) return;
-  ep.sqDepth->fetch_sub(wrCount, std::memory_order_relaxed);
+  ep.sqDepth->fetch_sub(wrCount, kSqAdmissionOrder);
+  NotifySqStateChanged(ep);
 }
+
+namespace detail {
+
+bool TryReserveSqDepthForTesting(const EpPair& ep, int wrCount, std::string* errMsg) {
+  SqReserveFailureKind failureKind = SqReserveFailureKind::None;
+  return TryReserveSqDepth(ep, wrCount, 0, "test", errMsg, &failureKind);
+}
+
+}  // namespace detail
 
 // Fill `plan` with (offset, len) chunks for a transfer of `total` bytes. Clears
 // `plan` first but keeps its capacity so callers can reuse a pooled buffer.
@@ -293,27 +452,52 @@ std::vector<std::pair<uint64_t, uint32_t>> PlanChunks(uint32_t total, size_t chu
   return plan;
 }
 
+static uint64_t CeilDiv(uint64_t value, uint64_t divisor) {
+  return value / divisor + ((value % divisor) != 0);
+}
+
+ChunkGeometry PlanChunkGeometry(uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                                uint64_t maxMessageSize) {
+  if (maxChunks <= 0 || maxMessageSize == 0) return {};
+
+  uint64_t softCount = 1;
+  if (chunkBytes > 0 && totalLength > chunkBytes) {
+    softCount = CeilDiv(totalLength, static_cast<uint64_t>(chunkBytes));
+    softCount = std::min<uint64_t>(softCount, static_cast<uint64_t>(maxChunks));
+  }
+
+  const uint64_t hardMinCount = std::max<uint64_t>(CeilDiv(totalLength, maxMessageSize), 1);
+  const uint64_t finalCount = std::max<uint64_t>(softCount, hardMinCount);
+  const uint64_t targetChunkBytes = std::max<uint64_t>(CeilDiv(totalLength, finalCount), 1);
+  return ChunkGeometry{finalCount, targetChunkBytes};
+}
+
+uint64_t CountChunksForSize(uint64_t totalLength, size_t chunkBytes, int maxChunks,
+                            uint64_t maxMessageSize) {
+  if (maxChunks <= 0 || maxMessageSize == 0) return 0;
+  if (totalLength == 0) return 1;
+
+  const bool splittable =
+      (chunkBytes > 0 && totalLength > chunkBytes) || (totalLength > maxMessageSize);
+  if (!splittable) return 1;
+
+  const ChunkGeometry geometry =
+      PlanChunkGeometry(totalLength, chunkBytes, maxChunks, maxMessageSize);
+  if (geometry.targetChunkBytes == 0) return 0;
+  return CeilDiv(totalLength, geometry.targetChunkBytes);
+}
+
 void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector<ibv_sge>& sges,
                          uint64_t totalLength, size_t chunkBytes, int maxChunks,
                          uint64_t maxMessageSize) {
   plan.clear();
   if (totalLength == 0 || maxChunks <= 0 || maxMessageSize == 0) return;
 
-  auto ceilDiv = [](uint64_t value, uint64_t divisor) {
-    return value / divisor + ((value % divisor) != 0);
-  };
-
-  uint64_t softCount = 1;
-  if (chunkBytes > 0 && totalLength > chunkBytes) {
-    softCount = ceilDiv(totalLength, static_cast<uint64_t>(chunkBytes));
-    softCount = std::min<uint64_t>(softCount, static_cast<uint64_t>(maxChunks));
-  }
-
-  const uint64_t hardMinCount = std::max<uint64_t>(ceilDiv(totalLength, maxMessageSize), 1);
-  const uint64_t finalCount = std::max<uint64_t>(softCount, hardMinCount);
-  const uint64_t targetChunkBytes = std::max<uint64_t>(ceilDiv(totalLength, finalCount), 1);
+  const ChunkGeometry geometry =
+      PlanChunkGeometry(totalLength, chunkBytes, maxChunks, maxMessageSize);
+  if (geometry.targetChunkBytes == 0) return;
   const uint64_t maxReserve = static_cast<uint64_t>(plan.max_size());
-  uint64_t reserveHint = finalCount;
+  uint64_t reserveHint = geometry.finalCount;
   const uint64_t sgeCount = static_cast<uint64_t>(sges.size());
   if (reserveHint <= maxReserve && sgeCount <= maxReserve - reserveHint) reserveHint += sgeCount;
   if (reserveHint <= maxReserve && plan.capacity() < reserveHint) {
@@ -321,7 +505,7 @@ void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector
   }
 
   uint64_t remoteStreamOffset = 0;
-  uint64_t targetRemaining = std::min(targetChunkBytes, totalLength);
+  uint64_t targetRemaining = std::min(geometry.targetChunkBytes, totalLength);
   for (const ibv_sge& sge : sges) {
     uint64_t sgeRemaining = sge.length;
     uint64_t sgeOffset = 0;
@@ -339,7 +523,7 @@ void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector
       targetRemaining -= len64;
       if (targetRemaining == 0 && remoteStreamOffset + sgeOffset < totalLength) {
         const uint64_t streamRemaining = totalLength - (remoteStreamOffset + sgeOffset);
-        targetRemaining = std::min(targetChunkBytes, streamRemaining);
+        targetRemaining = std::min(geometry.targetChunkBytes, streamRemaining);
       }
     }
     remoteStreamOffset += sge.length;
@@ -419,8 +603,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                              const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
                              const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                              const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
-                             TransferUniqueId id, bool isRead, int postBatchSize, size_t chunkBytes,
-                             int maxChunks, bool creditByWrCount) {
+                             TransferUniqueId id, bool isRead, int postBatchSize,
+                             const RdmaTransferControl& control) {
   MORI_IO_FUNCTION_TIMER;
 
   if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
@@ -441,13 +625,17 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     return {StatusCode::ERR_INVALID_ARGS, "memory-region vectors must align with endpoints"};
   }
 
-  if (maxChunks <= 0) {
+  if (control.maxChunks <= 0) {
     return {StatusCode::ERR_INVALID_ARGS, "maxChunks must be >= 1"};
   }
 
   const application::RdmaMemoryRegion& baseLocalMr = localMrPerEp.front();
   const application::RdmaMemoryRegion& baseRemoteMr = remoteMrPerEp.front();
   for (size_t i = 0; i < batchSize; i++) {
+    if (sizes[i] > std::numeric_limits<uint32_t>::max()) {
+      return {StatusCode::ERR_INVALID_ARGS, "single request size " + std::to_string(sizes[i]) +
+                                                " exceeds UINT32_MAX; split it before submitting"};
+    }
     if (((localOffsets[i] + sizes[i]) > baseLocalMr.length) ||
         ((remoteOffsets[i] + sizes[i]) > baseRemoteMr.length)) {
       return {StatusCode::ERR_INVALID_ARGS, "length out of range"};
@@ -508,7 +696,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   indices.resize(batchSize);
   std::iota(indices.begin(), indices.end(), 0);
 
-  if (!std::is_sorted(remoteOffsets.begin(), remoteOffsets.end())) {
+  if (!control.disableMerge && !std::is_sorted(remoteOffsets.begin(), remoteOffsets.end())) {
     std::sort(indices.begin(), indices.end(),
               [&](size_t a, size_t b) { return remoteOffsets[a] < remoteOffsets[b]; });
   }
@@ -531,9 +719,9 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     return static_cast<uint64_t>(wr.totalRemoteLength) > localMaxMessageSize;
   };
   auto hasOversizedSge = [&](const MergedWorkRequest& wr) {
-    if (chunkBytes == 0) return false;
+    if (control.chunkBytes == 0) return false;
     for (const ibv_sge& sge : wr.sges) {
-      if (sge.length > chunkBytes) return true;
+      if (sge.length > control.chunkBytes) return true;
     }
     return false;
   };
@@ -569,7 +757,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     const uint32_t currentSize32 = static_cast<uint32_t>(sizes[idx]);
 
     bool merged = false;
-    if (wrCount > 0) {
+    if (!control.disableMerge && wrCount > 0) {
       MergedWorkRequest& lastWr = mergedPool[wrCount - 1];
       const uint64_t expectedRemoteAddr = lastWr.wr.wr.rdma.remote_addr + lastWr.totalRemoteLength;
       if (expectedRemoteAddr == currentRemoteAddr) {
@@ -603,7 +791,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   // [expand-chunked-precompute] Expand oversized WRs into the pooled `chunkedPool`
   // in place (slot reuse); `chunkPlan` is reused by PlanSgeStreamChunks. Note: small
   // WRs are still copied as-is into chunkedPool when any WR needs splitting.
-  const bool canExpandChunks = creditByWrCount && chunkBytes > 0;
+  const bool canExpandChunks = control.creditByWrCount && control.chunkBytes > 0;
   if (!canExpandChunks) {
     for (size_t k = 0; k < wrCount; ++k) {
       const MergedWorkRequest& wr = mergedPool[k];
@@ -651,7 +839,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       }
       const uint64_t remoteBase = wr.wr.wr.rdma.remote_addr;
       PlanSgeStreamChunks(chunkPlan, wr.sges, static_cast<uint64_t>(wr.totalRemoteLength),
-                          chunkBytes, maxChunks, localMaxMessageSize);
+                          control.chunkBytes, control.maxChunks, localMaxMessageSize);
       if (chunkPlan.empty() && wr.totalRemoteLength != 0) {
         return {StatusCode::ERR_BAD_STATE, "failed to plan RDMA chunks for non-empty SGE stream"};
       }
@@ -664,12 +852,12 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   std::vector<MergedWorkRequest>& mergedWrs = useChunked ? chunkedPool : mergedPool;
   size_t mergedWrCount = useChunked ? chunkedCount : wrCount;
 
-  if (creditByWrCount) {
+  if (control.creditByWrCount) {
     if (mergedWrCount > static_cast<size_t>(std::numeric_limits<int>::max())) {
       return {StatusCode::ERR_INVALID_ARGS, "final WR count exceeds int range"};
     }
     for (size_t k = 0; k < mergedWrCount; ++k) mergedWrs[k].mergedRequests = 1;
-    callbackMeta->totalBatchSize = static_cast<int>(mergedWrCount);
+    if (control.ownsTotalBatchSize) callbackMeta->totalBatchSize = static_cast<int>(mergedWrCount);
   }
 
   size_t epNum = eps.size();
@@ -696,11 +884,14 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   epWrsSinceSignal.assign(epNum, 0);
   epMergedSinceSignal.assign(epNum, 0);
 
+  // Rotate the starting EP by transfer id so single-segment (single WR)
+  // transfers spread evenly across all QPs instead of always landing on eps[0].
+  int epStartOffset = static_cast<int>(id % static_cast<uint64_t>(epNum));
   for (int i = 0; i < numPostBatch; i++) {
     int st = i * postBatchSize;
     int end = std::min(static_cast<size_t>(st) + postBatchSize, mergedWrCount);
     if (end - st == 0) break;
-    int epId = i % epNum;
+    int epId = (i + epStartOffset) % static_cast<int>(epNum);
     int batchWrNum = end - st;
 
     std::string reserveErr;
@@ -788,13 +979,14 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
             "ibv_post_send partially posted {} / {} WRs without a posted signaled tail; "
             "marking EP {} as degraded until recovery",
             postedCount, batchWrNum, epId);
-        if (eps[epId].degraded) {
-          eps[epId].degraded->store(true, std::memory_order_relaxed);
-        }
         if (eps[epId].ledger) {
           eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
                                            static_cast<int>(epMergedSinceSignal[epId]));
         }
+        if (eps[epId].degraded) {
+          eps[epId].degraded->store(true, kSqAdmissionOrder);
+        }
+        NotifySqStateChanged(eps[epId]);
       }
 
       for (size_t otherEpId = 0; otherEpId < epNum; ++otherEpId) {
@@ -804,9 +996,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
             "ibv_post_send failed on ep {}: moving pending unsignaled WRs on ep {} "
             "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
             epId, otherEpId, epWrsSinceSignal[otherEpId], epMergedSinceSignal[otherEpId]);
-        if (eps[otherEpId].degraded) {
-          eps[otherEpId].degraded->store(true, std::memory_order_relaxed);
-        }
         if (eps[otherEpId].ledger) {
           eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
                                                 static_cast<int>(epMergedSinceSignal[otherEpId]));
@@ -816,6 +1005,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
               "sqDepth may remain stale until endpoint restart",
               otherEpId);
         }
+        if (eps[otherEpId].degraded) {
+          eps[otherEpId].degraded->store(true, kSqAdmissionOrder);
+        }
+        NotifySqStateChanged(eps[otherEpId]);
       }
 
       std::string message = "ibv_post_send failed with " + std::to_string(ret) + ": " +
@@ -833,6 +1026,21 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
   return {StatusCode::IN_PROGRESS, ""};
+}
+
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
+                             const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                             const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                             const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id, bool isRead, int postBatchSize, size_t chunkBytes,
+                             int maxChunks, bool creditByWrCount) {
+  RdmaTransferControl control{};
+  control.chunkBytes = chunkBytes;
+  control.maxChunks = maxChunks;
+  control.creditByWrCount = creditByWrCount;
+  return RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, localOffsets, remoteOffsets, sizes,
+                            callbackMeta, id, isRead, postBatchSize, control);
 }
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,

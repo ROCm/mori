@@ -100,6 +100,36 @@ TEST(TierPriorityRouteGetStrategyTest, RandomWithinBestTierOnly) {
   EXPECT_EQ(seen.count("ssd-x"), 0u);
 }
 
+TEST(TierPriorityRouteGetStrategyTest, PrefersRequesterLocalReplicaWithinBestTier) {
+  TierPriorityRouteGetStrategy strategy;
+  std::vector<Location> locations = {
+      MakeLoc("dram-a", TierType::DRAM),
+      MakeLoc("requester", TierType::DRAM),
+      MakeLoc("dram-c", TierType::DRAM),
+      MakeLoc("ssd-x", TierType::SSD),
+  };
+
+  for (int i = 0; i < 100; ++i) {
+    auto selected = strategy.Select(locations, "requester");
+    EXPECT_EQ(selected.tier, TierType::DRAM);
+    EXPECT_EQ(selected.node_id, "requester");
+  }
+}
+
+TEST(TierPriorityRouteGetStrategyTest, RequesterLocalLowerTierDoesNotBeatBestTier) {
+  TierPriorityRouteGetStrategy strategy;
+  std::vector<Location> locations = {
+      MakeLoc("dram-a", TierType::DRAM),
+      MakeLoc("requester", TierType::SSD),
+  };
+
+  for (int i = 0; i < 100; ++i) {
+    auto selected = strategy.Select(locations, "requester");
+    EXPECT_EQ(selected.tier, TierType::DRAM);
+    EXPECT_EQ(selected.node_id, "dram-a");
+  }
+}
+
 TEST(TierPriorityRouteGetStrategyTest, EmptyReturnsDefault) {
   TierPriorityRouteGetStrategy strategy;
   std::vector<Location> locations;

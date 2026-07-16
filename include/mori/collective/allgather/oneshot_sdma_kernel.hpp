@@ -121,5 +121,94 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes, T* input,
   OneShotAllGatherSdmaKernel_body<T>(myPe, npes, input, srcMemObj, dstMemObj, flagsMemObj,
                                      elementCount, dstBaseOffset, flagVal);
 }
+
+template <typename T>
+__device__ void OneShotAllGatherSdmaParamContiguousKernel_body(
+    int myPe, int npes, T* input, const application::SymmMemObjPtr srcMemObj,
+    const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
+    size_t elementCount, size_t dstBaseOffset, uint64_t flagVal, const size_t* splitSizes,
+    const size_t* splitOffsets, size_t splitCount) {
+  if (elementCount == 0 || npes <= 0 || splitCount == 0 || splitSizes == nullptr ||
+      splitOffsets == nullptr) {
+    return;
+  }
+
+  const size_t threadLinearId =
+      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  int warpId = threadLinearId / warpSize;
+  const int laneId = threadIdx.x % warpSize;
+  const size_t bytesPerElement = sizeof(T);
+
+  if (warpId < npes && laneId == 0) {
+    int remotePe = warpId;
+    application::SymmMemObjPtr dest = dstMemObj;
+    anvil::SdmaQueueDeviceHandle** devicehandles =
+        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
+    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
+
+    for (size_t split = 0; split < splitCount; ++split) {
+      size_t splitElems = splitSizes[split];
+      if (splitElems == 0) {
+        continue;
+      }
+      size_t inputElemOffset = splitOffsets[split];
+      if (inputElemOffset > elementCount || splitElems > elementCount - inputElemOffset) {
+        continue;
+      }
+      size_t outputElemOffset =
+          inputElemOffset * static_cast<size_t>(npes) + static_cast<size_t>(myPe) * splitElems;
+      uint8_t* srcPtr = reinterpret_cast<uint8_t*>(input) + inputElemOffset * bytesPerElement;
+      uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset +
+                        outputElemOffset * bytesPerElement;
+      core::SdmaPutThread(srcPtr, dstPtr, splitElems * bytesPerElement, devicehandles, signals,
+                          expectedSignals, dest->sdmaNumQueue, 0);
+    }
+  }
+
+  __syncthreads();
+
+  if (warpId < npes && laneId == 0) {
+    int remotePe = warpId;
+    shmem::ShmemQuietThread(remotePe, dstMemObj);
+    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+        flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flagVal, 8,
+        core::atomicType::AMO_SET, remotePe, 0);
+  }
+  __syncthreads();
+
+  for (int sender = 0; sender < npes; ++sender) {
+    if (sender == myPe) {
+      continue;
+    }
+
+    if (threadLinearId == 0) {
+      int spinCount = 0;
+      bool warned = false;
+      uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+      while (core::AtomicLoadRelaxed(flags + sender) < flagVal) {
+        ++spinCount;
+        if (!warned && spinCount > 10000000) {
+          printf("PE %d: Slow wait for param-contiguous data from peer %d (still waiting)\n", myPe,
+                 sender);
+          warned = true;
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <typename T>
+__global__ void OneShotAllGatherSdmaParamContiguousKernel(
+    int myPe, int npes, T* input, const application::SymmMemObjPtr srcMemObj,
+    const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
+    size_t elementCount, size_t dstBaseOffset = 0, uint64_t flagVal = 1,
+    const size_t* splitSizes = nullptr, const size_t* splitOffsets = nullptr,
+    size_t splitCount = 0) {
+  OneShotAllGatherSdmaParamContiguousKernel_body<T>(myPe, npes, input, srcMemObj, dstMemObj,
+                                                    flagsMemObj, elementCount, dstBaseOffset,
+                                                    flagVal, splitSizes, splitOffsets, splitCount);
+}
 }  // namespace collective
 }  // namespace mori

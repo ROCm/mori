@@ -32,6 +32,7 @@
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_metrics.h"
+#include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/peer/peer_ssd_manager.h"
 #include "umbp/distributed/peer/ssd_copy_pipeline.h"
@@ -499,22 +500,45 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                                 const ::umbp::BatchResolveKeysRequest* request,
                                 ::umbp::BatchResolveKeysResponse* response) override {
     if (dram_alloc_ == nullptr) {
-      for (int i = 0; i < request->keys_size(); ++i) {
-        response->add_entries()->set_found(false);
-      }
+      std::vector<ResolvedKeyEntry> misses(request->keys_size());
+      EncodeBatchResolveResponse(misses, /*page_size=*/0, /*descs=*/{}, response);
       return grpc::Status::OK;
     }
+    // The client can suppress descs entirely via omit_descs when it already
+    // hydrated them from GetPeerInfo — skip BuildBufferDescsLocked for the
+    // whole batch in that case rather than computing and discarding it.
+    const bool omit_descs = request->omit_descs();
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    auto resolved = dram_alloc_->BatchResolve(keys);
+    auto resolved = dram_alloc_->BatchResolve(keys, /*include_descs=*/!omit_descs);
+
+    // Project to the encoder's host shape and deduplicate the buffer
+    // descriptors once for the whole batch (their bytes are identical across
+    // keys for a given buffer_index).
+    std::vector<ResolvedKeyEntry> entries;
+    entries.reserve(resolved.size());
+    std::vector<BufferMemoryDescBytes> batch_descs;
+    std::vector<bool> desc_seen;  // indexed by buffer_index
     uint64_t total_bytes = 0;
-    for (const auto& r : resolved) {
-      auto* out = response->add_entries();
-      out->set_found(r.found);
-      if (!r.found) continue;
-      FillPagesAndDescs(out, r.pages, dram_alloc_->PageSize(), r.descs);
-      out->set_size(r.size);
-      total_bytes += r.size;
+    for (auto& r : resolved) {
+      ResolvedKeyEntry e;
+      e.found = r.found;
+      if (r.found) {
+        e.tier = r.tier;
+        e.size = r.size;
+        e.pages = std::move(r.pages);
+        total_bytes += r.size;
+        if (!omit_descs) {
+          for (const auto& d : r.descs) {
+            if (d.buffer_index >= desc_seen.size()) desc_seen.resize(d.buffer_index + 1, false);
+            if (desc_seen[d.buffer_index]) continue;
+            desc_seen[d.buffer_index] = true;
+            batch_descs.push_back(d);
+          }
+        }
+      }
+      entries.push_back(std::move(e));
     }
+    EncodeBatchResolveResponse(entries, dram_alloc_->PageSize(), batch_descs, response);
     RecordInboundGet(total_bytes, "remote");
     return grpc::Status::OK;
   }
