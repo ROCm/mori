@@ -30,7 +30,52 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 TOPK_IDX_DTYPE = torch.int32
-WARP_SIZE = 64
+
+# Threads per wavefront. gfx1250 (MI450/MI455) is wave32; gfx9xx (MI300/MI355)
+# is wave64. This MUST NOT be hard-coded: the device kernels recompute
+# warpNum = blockDim.x / warpSize at runtime, so the host block dim
+# (warpSize * warp_num_per_block) and the combine dynamic-LDS sizing must use
+# the SAME wavefront size the hardware uses. Hard-coding 64 on a wave32 device
+# doubles the device warp count and overflows combine's shared-mem pointer
+# arrays -> garbage src pointers -> the cross-device spin barrier never
+# completes -> the EP job hangs. Detected per device below.
+_DEFAULT_WAVE_SIZE = 64
+
+
+def _detect_warp_size():
+    """Return this device's wavefront size (32 or 64).
+
+    Order matches the FlyDSL v2 path (dispatch_combine_v2/intranode_kernels.py):
+    env override first, then the ARCH STRING. We deliberately do NOT trust the
+    runtime device property first: on gfx1250 get_warp_size / warp_size wrongly
+    reports 64 (see the FlyDSL _detect_wave_size note), which would silently
+    re-introduce the wave32 launch hang. Keep MORI_WAVE_SIZE in sync with v2 so
+    both paths agree.
+    """
+    v = os.environ.get("MORI_WAVE_SIZE")
+    if v:
+        try:
+            return int(v)
+        except ValueError:
+            pass
+    try:
+        from mori.jit.config import detect_gpu_arch
+
+        # gfx12xx (MI400/gfx1250) is wave32; gfx9xx (MI300/MI355) is wave64.
+        if str(detect_gpu_arch()).startswith("gfx12"):
+            return 32
+        return 64
+    except Exception:
+        pass
+    # Last resort only if arch detection is unavailable.
+    try:
+        dev = torch.cuda.current_device()
+        ws = getattr(torch.cuda.get_device_properties(dev), "warp_size", None)
+        if ws in (32, 64):
+            return int(ws)
+    except Exception:
+        pass
+    return _DEFAULT_WAVE_SIZE
 
 # Process-global CCO communicator, reused across ops (creating one per op would
 # re-run the socket bootstrap every time). Only used when MORI_EP_COMM=cco, which
@@ -297,6 +342,11 @@ def _load_hip_modules(kernel_type):
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
+        # Wavefront size of THIS device (32 on gfx1250, 64 on gfx9xx). Used for
+        # every kernel launch's block dim; keep consistent with the device-side
+        # warpNum = blockDim.x / warpSize so combine LDS sizing stays in bounds.
+        self._warp_size = _detect_warp_size()
+        logger.debug("EpDispatchCombineOp: detected warp_size=%d", self._warp_size)
         _ensure_jit_kernels(config.kernel_type)
 
         if dist.is_initialized():
@@ -751,7 +801,7 @@ class EpDispatchCombineOp:
             )
 
         grid = (actual_bn,)
-        block = (WARP_SIZE * actual_wpb,)
+        block = (self._warp_size * actual_wpb,)
         shared_mem = self._dispatch_shared_mem(actual_wpb)
         kt = self.config.kernel_type.value
 
@@ -772,7 +822,7 @@ class EpDispatchCombineOp:
                     f"EpDispatchInterNodeV1Kernel_{sfx}",
                 ],
                 [mp, actual_bn],
-                [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
                 [0, shared_mem],
                 stream,
                 args_ptr,
@@ -785,7 +835,7 @@ class EpDispatchCombineOp:
                     f"EpDispatchInterNodeV1KernelLowLatency_{sfx}",
                 ],
                 [mp, actual_bn],
-                [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
                 [0, shared_mem],
                 stream,
                 args_ptr,
@@ -811,7 +861,7 @@ class EpDispatchCombineOp:
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
-            mb_block = WARP_SIZE * 16
+            mb_block = self._warp_size * 16
             self._launch_multi(
                 [
                     f"EpDispatchLowLatencyAsyncSendCopySlotAssign_{sfx}",
@@ -819,7 +869,7 @@ class EpDispatchCombineOp:
                     f"EpDispatchLowLatencyAsyncSendTransfer_{sfx}",
                 ],
                 [mp_aligned, mp_aligned, self.config.world_size],
-                [mb_block, mb_block, WARP_SIZE * actual_wpb],
+                [mb_block, mb_block, self._warp_size * actual_wpb],
                 [0, 0, 0],
                 stream,
                 args_ptr,
@@ -916,14 +966,14 @@ class EpDispatchCombineOp:
         if kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
-            mb_block = WARP_SIZE * 16
+            mb_block = self._warp_size * 16
             self._launch_multi(
                 [
                     f"EpDispatchLowLatencyAsyncRecvTransfer_{sfx}",
                     f"EpDispatchLowLatencyAsyncRecvCopyMultiBlock_{sfx}",
                 ],
                 [self.config.world_size, mp_aligned],
-                [WARP_SIZE * actual_wpb, mb_block],
+                [self._warp_size * actual_wpb, mb_block],
                 [0, 0],
                 stream,
                 args_ptr,
@@ -1030,7 +1080,7 @@ class EpDispatchCombineOp:
             )
 
         grid = (actual_bn,)
-        block = (WARP_SIZE * actual_wpb,)
+        block = (self._warp_size * actual_wpb,)
         kt = self.config.kernel_type.value
         quant_type = _normalize_quant_type(self.config.quant_type)
         shared_mem = self._combine_shared_mem(actual_wpb)
@@ -1080,7 +1130,7 @@ class EpDispatchCombineOp:
             )
         elif kt == EpDispatchCombineKernelType.InterNodeV1.value:
             mp = self._handle_info["multi_processor_count"]
-            bsz = WARP_SIZE * actual_wpb
+            bsz = self._warp_size * actual_wpb
             self._launch_multi(
                 [
                     f"EpCombineSync_{sfx}",
@@ -1089,14 +1139,14 @@ class EpDispatchCombineOp:
                     f"EpCombineAll_{sfx}",
                 ],
                 [mp, 1, actual_bn, mp],
-                [bsz, WARP_SIZE, bsz, bsz],
+                [bsz, self._warp_size, bsz, bsz],
                 [0, 0, shared_mem, shared_mem],
                 stream,
                 args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
-            bsz = WARP_SIZE * actual_wpb
+            bsz = self._warp_size * actual_wpb
             self._launch_multi(
                 [
                     f"EpCombineSync_{sfx}",
@@ -1105,7 +1155,7 @@ class EpDispatchCombineOp:
                     f"EpCombineAll_{sfx}",
                 ],
                 [mp, 1, actual_bn, mp],
-                [bsz, WARP_SIZE, bsz, bsz],
+                [bsz, self._warp_size, bsz, bsz],
                 [0, 0, shared_mem, shared_mem],
                 stream,
                 args_ptr,
@@ -1205,7 +1255,7 @@ class EpDispatchCombineOp:
                         "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8cast",
                     ],
                     [mp_aligned, self.config.world_size],
-                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
                     [0, 0],
                     stream,
                     args_ptr,
@@ -1217,7 +1267,7 @@ class EpDispatchCombineOp:
                         "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8bwq",
                     ],
                     [mp_aligned, self.config.world_size],
-                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
                     [0, 0],
                     stream,
                     args_ptr,
@@ -1229,7 +1279,7 @@ class EpDispatchCombineOp:
                         f"EpCombineLowLatencyAsyncSendTransfer_{sfx}",
                     ],
                     [mp_aligned, self.config.world_size],
-                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
                     [0, 0],
                     stream,
                     args_ptr,
@@ -1305,7 +1355,7 @@ class EpDispatchCombineOp:
                         "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8cast",
                     ],
                     [self.config.world_size, mp_aligned],
-                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
                     [0, shared_mem],
                     stream,
                     args_ptr,
@@ -1317,7 +1367,7 @@ class EpDispatchCombineOp:
                         "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bwq",
                     ],
                     [self.config.world_size, mp_aligned],
-                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
                     [0, shared_mem],
                     stream,
                     args_ptr,
@@ -1329,7 +1379,7 @@ class EpDispatchCombineOp:
                         f"EpCombineLowLatencyAsyncRecvCopy_{sfx}",
                     ],
                     [self.config.world_size, mp_aligned],
-                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
                     [0, shared_mem],
                     stream,
                     args_ptr,
@@ -1410,7 +1460,7 @@ class EpDispatchCombineOp:
         )
 
         grid = (actual_bn,)
-        block = (WARP_SIZE * actual_wpb,)
+        block = (self._warp_size * actual_wpb,)
         shared_mem = self._dispatch_shared_mem(actual_wpb)
         kt = self.config.kernel_type.value
 
@@ -1510,7 +1560,7 @@ class EpDispatchCombineOp:
         )
 
         grid = (actual_bn,)
-        block = (WARP_SIZE * actual_wpb,)
+        block = (self._warp_size * actual_wpb,)
         shared_mem = self._combine_shared_mem(actual_wpb)
         kt = self.config.kernel_type.value
 
@@ -1518,7 +1568,7 @@ class EpDispatchCombineOp:
             mp = self._handle_info["multi_processor_count"]
             self._launch(f"EpCombineSync_{sfx}", (mp,), block, 0, stream, args_ptr)
             self._launch(
-                f"EpCombineSyncBarrier_{sfx}", (1,), (WARP_SIZE,), 0, stream, args_ptr
+                f"EpCombineSyncBarrier_{sfx}", (1,), (self._warp_size,), 0, stream, args_ptr
             )
             self._launch(
                 f"EpCombineInterNodeV1KernelLowLatency_{sfx}_stdmoe",
@@ -1607,7 +1657,7 @@ class EpDispatchCombineOp:
         )
         try:
             grid = (actual_bn,)
-            block = (WARP_SIZE * actual_wpb,)
+            block = (self._warp_size * actual_wpb,)
             self._launch(
                 "mori_ConvertDispatchOutputKernel", grid, block, 0, stream, args_ptr
             )
@@ -1660,7 +1710,7 @@ class EpDispatchCombineOp:
         )
         try:
             grid = (actual_bn,)
-            block = (WARP_SIZE * actual_wpb,)
+            block = (self._warp_size * actual_wpb,)
             self._launch(
                 f"ConvertCombineInputKernel_{sfx}", grid, block, 0, stream, args_ptr
             )
