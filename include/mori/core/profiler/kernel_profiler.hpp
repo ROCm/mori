@@ -88,7 +88,12 @@ struct TraceProfiler {
   }
 
   __device__ inline void log_with_time(SlotEnum slot, EventType type, int64_t ts) {
-    if (lane_id == 0) {
+    // warp_buffer/warp_offset were advanced by warp_id in the context macro; the
+    // backing allocation only holds PROFILER_WARPS_PER_RANK warps. Grids larger
+    // than that (e.g. 4K-token dispatch launches 768*8=6144 warps > 4096) would
+    // otherwise write out of bounds and corrupt memory -> SIGABRT / GPU wedge.
+    // Drop traces for over-capacity warps instead of writing OOB.
+    if (lane_id == 0 && warp_id < PROFILER_WARPS_PER_RANK) {
       unsigned int idx = *warp_offset;
       *warp_offset = (idx + 2) % (MaxEventsPerWarp * 2);
       int64_t meta = ((int64_t)warp_id << 16) | ((int64_t)slot << 2) | (int)type;
