@@ -184,7 +184,7 @@ static_assert(sizeof(SDMA_PKT_COPY_WITH_ATOMIC) == 64,
 //
 // MUST be called with the whole warp active (uses __shfl / __syncwarp). S must be
 // <= warpSize.
-inline __device__ void SdmaPutWarpFusedS(void* srcBase, void* dstBase, size_t sliceBytes,
+inline __device__ void SdmaPutWarpFusedS(const void* srcBase, void* dstBase, size_t sliceBytes,
                                          size_t lastSliceBytes,
                                          anvil::SdmaQueueDeviceHandle** deviceHandles,
                                          HSAuint64* signalsBase, uint32_t qId, int S,
@@ -208,11 +208,11 @@ inline __device__ void SdmaPutWarpFusedS(void* srcBase, void* dstBase, size_t sl
   // Lane 0 fills the wrap padding (rare); each lane writes its own packet slot.
   if (lane == 0 && offset) handle.fillNops(startBase, offset);
   if (lane < S) {
-    char* s = reinterpret_cast<char*>(srcBase) + lane * sliceBytes;
-    char* d = reinterpret_cast<char*>(dstBase) + lane * sliceBytes;
+    auto* s = reinterpret_cast<const char*>(srcBase) + lane * sliceBytes;
+    auto* d = reinterpret_cast<char*>(dstBase) + lane * sliceBytes;
     size_t sz = (lane == S - 1) ? lastSliceBytes : sliceBytes;
     SDMA_PKT_COPY_WITH_ATOMIC packet = {
-        .copy = anvil::CreateCopyPacket(s, d, sz),
+        .copy = anvil::CreateCopyPacket(const_cast<char*>(s), d, sz),
         .atomic = anvil::CreateAtomicAddPacket(signalsBase + lane, addVal)};
     handle.placePacketAt(packet, startBase + offset + lane * pkt);
   }

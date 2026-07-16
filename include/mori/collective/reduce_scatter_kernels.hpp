@@ -53,9 +53,7 @@ using namespace mori::collective;
 //   RS_PUSH_LDS_STAGE == 1 : lanes stage packets in LDS (bank-conflict-free,
 //        17-dword padded slots), then up to npes*S*4 threads flush them to the
 //        ring as coalesced b128 stores (one b128 per thread).
-#ifndef RS_PUSH_LDS_STAGE
-#define RS_PUSH_LDS_STAGE 0
-#endif
+#define RS_PUSH_LDS_STAGE 1
 
 // Fast-path capacity: npes <= 8 (one warp), S = 1<<logS <= 8. A fused
 // copy+atomic packet is 64B = 16 dwords; pad each LDS slot to 17 dwords so the
@@ -108,49 +106,18 @@ struct ProdOp {
   __device__ T operator()(T a, T b) { return a * b; }
 };
 
-template < int VecBytes, int NumVecs, class T >
-struct PackedVec {
-  static constexpr int VecSize = VecBytes / sizeof(T);
-  static constexpr int TotalElems = NumVecs * VecSize;
-  using Vec = TVecType<VecBytes>;
-  using AccType = typename AccumulatorType<T>::type;
-  using Data = std::array<T, VecSize>;
-  std::array<Vec, NumVecs> vec;
+template < int VecSize, template <class> class OpT, class T, 
+           class AccType = typename AccumulatorType<T>::type >
+__device__ __forceinline__ void reduceVector(AccType* __restrict__ acc, 
+                                           const T* __restrict__ vec) {
 
-  __device__ void upcastTo(AccType (&acc)[TotalElems]) {
-#pragma unroll
-      for (int i = 0; i < NumVecs; i++) {
-        Data lanes = __builtin_bit_cast(Data, vec[i]);
-#pragma unroll
-        for (int j = 0; j < VecSize; j++) {
-          acc[i * VecSize + j] = UpcastF<T>(lanes[j]);
-        }
-      }
+  if constexpr (VecSize == 1) {
+    acc[0] = OpT<T>()(acc[0], UpcastF<T>(vec[0]));
+    return;
   }
-  __device__ void downcastFrom(AccType (&acc)[TotalElems]) {
-#pragma unroll
-      for (int i = 0; i < NumVecs; i++) {
-        Data lanes;
-#pragma unroll
-        for (int j = 0; j < VecSize; j++) {
-          lanes[j] = DowncastF<T>(acc[i * VecSize + j]);
-        }
-        vec[i] = __builtin_bit_cast(Vec, lanes);
-      }
-  }
-  template < template < class > class OpT >
-  __device__ void reduce(AccType (&acc)[TotalElems], OpT<T> reduceOp) {
-#pragma unroll
-    for (int i = 0; i < NumVecs; i++) {
-      Data lanes = __builtin_bit_cast(Data, vec[i]);
-#pragma unroll
-      for (int j = 0; j < VecSize; j++) {
-        acc[i * VecSize + j] = reduceOp(acc[i * VecSize + j], UpcastF<T>(lanes[j]));
-      }
-    }
-  } 
-};
-
+  reduceVector<VecSize/2, OpT>(acc, vec) ;
+  reduceVector<VecSize/2, OpT>(acc + VecSize/2, vec + VecSize/2);
+}
 
 // Reduce one group of NV vectors (each NV-member at vector index g + i*gstride)
 // across all npes staging slots into the output. Callers guarantee every member
@@ -160,34 +127,65 @@ struct PackedVec {
 // to THIS PE's shard. Peer 0 seeds the accumulators, peers 1..npes-1 reduce in.
 // This decouples the data layout from the reduction so the same code serves the
 // staging "push" path, the "pull" path, and the per-hop 2-source ring reduction.
-template <int VecBytes, int NV, class T, template <class> class OpT, class SrcBaseFn>
+// SystemScope selects the memory scope of the streaming load/store: `true` (the
+// default) forces system-scope coherence, required when srcBase points at REMOTE
+// peer memory read over the fabric (pull path). `false` uses agent (device) scope,
+// which is correct AND sufficient when every source is LOCAL HBM (push path: peer
+// shards have already been DMA'd into this PE's staging, and the caller has done a
+// system-scope acquire fence before entering the reduce) -- it avoids re-forcing
+// system-level coherence on every 16B access.
+template <int VecBytes, int NV, class T, template <class> class OpT,
+          bool SystemScope = true, class SrcBaseFn>
 __device__ __forceinline__ void ReduceVecGroup(SrcBaseFn srcBase, T* __restrict__ output,
                                                   int npes, size_t g, size_t gstride) {
   constexpr int vecSize = VecBytes / sizeof(T);
+  using Vec = TVecType<VecBytes>;
   using AccType = typename AccumulatorType<T>::type;
-  AccType acc[NV * vecSize];
-  PackedVec<VecBytes, NV, T> packed;
+  using Data = std::array<T, vecSize>;
+  AccType acc[NV][vecSize];
+  Vec vec[NV];
+
+  // Seed accumulators from peer 0: load its NV vectors, then upcast lanes.
   const T* b0 = srcBase(0);
 #pragma unroll
   for (int i = 0; i < NV; i++) {
-    size_t idx = g + static_cast<size_t>(i) * gstride;
-    packed.vec[i] = StreamLoad<VecBytes>(b0 + idx * vecSize);
+    size_t idx = g + i * gstride;
+    vec[i] = StreamLoad<VecBytes>(b0 + idx * vecSize, SystemScope);
   }
-  packed.upcastTo(acc);
+#pragma unroll
+  for (int i = 0; i < NV; i++) {
+    Data lanes = __builtin_bit_cast(Data, vec[i]);
+#pragma unroll
+    for (int j = 0; j < vecSize; j++) acc[i][j] = UpcastF<T>(lanes[j]);
+  }
+
+  // Reduce peers 1..npes-1 in: load their NV vectors, then fold lanes into acc.
   for (int pe = 1; pe < npes; pe++) {
     const T* bp = srcBase(pe);
 #pragma unroll
     for (int i = 0; i < NV; i++) {
-      size_t idx = g + static_cast<size_t>(i) * gstride;
-      packed.vec[i] = StreamLoad<VecBytes>(bp + idx * vecSize);
+      size_t idx = g + i * gstride;
+      vec[i] = StreamLoad<VecBytes>(bp + idx * vecSize, SystemScope);
     }
-    packed.reduce(acc, OpT<T>());
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+      Data lanes = __builtin_bit_cast(Data, vec[i]);
+      reduceVector<vecSize, OpT>(acc[i], lanes.data());
+    }
   }
-  packed.downcastFrom(acc);
+
+  // Downcast the accumulators back into NV vectors and store them.
 #pragma unroll
   for (int i = 0; i < NV; i++) {
-    size_t idx = g + static_cast<size_t>(i) * gstride;
-    StreamStore<VecBytes>(output + idx * vecSize, packed.vec[i]);
+    Data lanes;
+#pragma unroll
+    for (int j = 0; j < vecSize; j++) lanes[j] = DowncastF<T>(acc[i][j]);
+    vec[i] = __builtin_bit_cast(Vec, lanes);
+  }
+#pragma unroll
+  for (int i = 0; i < NV; i++) {
+    size_t idx = g + i * gstride;
+    StreamStore<VecBytes>(output + idx * vecSize, vec[i], SystemScope);
   }
 }
 
@@ -344,9 +342,9 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
           sStart[peer] = sb;
           sOff[peer] = offset;
         }
-        const uint8_t* s =
+        auto* s =
             reinterpret_cast<const uint8_t*>(input + peer * chunkElems) + slice * sliceBytes;
-        uint8_t* d =
+        auto* d =
             reinterpret_cast<uint8_t*>(heapObj->peerPtrs[peer] + off) + slice * sliceBytes;
         size_t sz = (slice == S - 1) ? lastBytes : sliceBytes;
         // Build the fused copy+atomic packet DIRECTLY into the LDS slot (dword
@@ -382,8 +380,13 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
                           pktBuf[slotBase + 3]};
         StreamStore<16>(handle->queueBuf + baseDword + bb * 4, v, /*system_scope=*/false);
       }
-      // All flush warps must finish + be system-visible before any doorbell.
-      __threadfence_system();
+      // All flush warps must finish + their ring stores be visible to the on-die
+      // SDMA engine before any doorbell. The ring lives in local HBM and is
+      // consumed by this GPU's own SDMA agent, so an agent-scope RELEASE fence is
+      // the exact match for the "agent"-scoped b128 ring stores (the doorbell
+      // store inside submitPacket carries its own system-scope push). __syncthreads
+      // (workgroup scope) alone is one scope short of what the SDMA agent needs.
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
       __syncthreads();
 
       // -- Submit phase: each peer's leader rings one doorbell on its own queue. --
@@ -449,7 +452,7 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
         const T* src = input + destPe * chunkElems;
         uint8_t* dst = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + off);
         mori::collective::SdmaPutWarpFusedS(
-            const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(src)), dst, sliceBytes, lastBytes,
+            src, dst, sliceBytes, lastBytes,
             handles, heapObj->peerSignalPtrs[destPe], /*qId=*/0, S, /*addVal=*/(1ull << myPe));
       }
     }
@@ -487,27 +490,30 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
   };
   T* out = output + sOfs;
 
+  // Push path: every source (input + staging) is LOCAL HBM and the Phase-2
+  // __threadfence_system() already made the remote-DMA'd staging visible, so the
+  // per-access loads/stores use agent scope (SystemScope=false).
   size_t v = ltid;
-  for (; v + static_cast<size_t>(NumVecs - 1) * lstride < totalVecs; v += lstride * NumVecs) {
-    ReduceVecGroup<VecBytes, NumVecs, T, OpT>(srcBase, out, npes, v, lstride);
+  for (; v + (NumVecs - 1) * lstride < totalVecs; v += lstride * NumVecs) {
+    ReduceVecGroup<VecBytes, NumVecs, T, OpT, /*SystemScope=*/false>(srcBase, out, npes, v, lstride);
   }
   // Trailing partial group: the remaining in-bounds vectors for this thread.
   for (size_t idx = v; idx < totalVecs; idx += lstride) {
-    ReduceVecGroup<VecBytes, 1, T, OpT>(srcBase, out, npes, idx, lstride);
+    ReduceVecGroup<VecBytes, 1, T, OpT, /*SystemScope=*/false>(srcBase, out, npes, idx, lstride);
   }
 
   // Scalar tail (only the last slice can be non-vecSize-aligned).
   for (size_t i = totalVecs * vecSize + ltid; i < sCnt; i += lstride) {
     using Vec = TVecType<sizeof(T)>;
     const T* base = srcBase(0) + i;
-    AccType a = UpcastF<T>(StreamLoad<sizeof(T)>(base));
+    AccType a = UpcastF<T>(StreamLoad<sizeof(T)>(base, /*system_scope=*/false));
     base += chunkElems;
     for (int pe = 1; pe < npes; pe++, base += chunkElems) {
-      auto V = StreamLoad<sizeof(T)>(base);
+      auto V = StreamLoad<sizeof(T)>(base, /*system_scope=*/false);
       a = OpT<T>()(a, UpcastF<T>(V));
     }
     Vec V = __builtin_bit_cast(Vec, DowncastF<T>(a));
-    StreamStore<sizeof(T)>(out + i, V);
+    StreamStore<sizeof(T)>(out + i, V, /*system_scope=*/false);
   }
 
   // === Reset: the last block of group g zeroes slice g's flag + counter =========
