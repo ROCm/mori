@@ -3,6 +3,7 @@ build/
 build*/
 lib*
 dist/*
+target/
 
 # Python
 *.egg-info

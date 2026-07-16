@@ -1,0 +1,24 @@
+[package]
+name = "sglang-kv-indexer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "sglang_kv_indexer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kv-indexer-server"
+path = "src/bin/kv-indexer-server.rs"
+
+[dependencies]
+prost = "0.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tonic = { version = "0.14.6", features = ["transport"] }
+tonic-prost = "0.14.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"

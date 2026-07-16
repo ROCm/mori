@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package kv_indexer.v1;
+
+// Storage tier for externally managed KV cache blocks.
+enum TierType {
+  TIER_UNKNOWN = 0;
+  TIER_HBM = 1;
+  TIER_DRAM = 2;
+  TIER_SSD = 3;
+}
+
+message Empty {}
+
+message ReportExternalKvBlocksRequest {
+  string worker_id = 1;
+  repeated string hashes = 2;
+  TierType tier = 3;
+}
+
+message RevokeExternalKvBlocksRequest {
+  string worker_id = 1;
+  repeated string hashes = 2;
+  TierType tier = 3;
+}
+
+message RevokeAllExternalKvBlocksAtTierRequest {
+  string worker_id = 1;
+  TierType tier = 2;
+}
+
+message MatchExternalKvRequest {
+  // MVP semantics: these are block-level hashes to match against placement
+  // metadata. The indexer returns block placement matches and does not compute
+  // the longest reusable prefix.
+  repeated string hashes = 1;
+
+  // When true, only hashes that are actually matched should increase hit
+  // counters. Diagnostic callers should leave this false.
+  bool count_as_hit = 2;
+}
+
+message TierHashes {
+  TierType tier = 1;
+  repeated string hashes = 2;
+}
+
+message ExternalKvNodeMatch {
+  string worker_id = 1;
+  string address = 2;
+  repeated TierHashes hashes_by_tier = 3;
+}
+
+message MatchExternalKvResponse {
+  repeated ExternalKvNodeMatch matches = 1;
+}
+
+message HitCountEntry {
+  string hash = 1;
+  uint64 hit_count_total = 2;
+}
+
+message GetExternalKvHitCountsRequest {
+  repeated string hashes = 1;
+}
+
+message GetExternalKvHitCountsResponse {
+  repeated HitCountEntry entries = 1;
+}
+
+service KVIndexer {
+  rpc ReportExternalKvBlocks(ReportExternalKvBlocksRequest) returns (Empty);
+  rpc RevokeExternalKvBlocks(RevokeExternalKvBlocksRequest) returns (Empty);
+  rpc RevokeAllExternalKvBlocksAtTier(RevokeAllExternalKvBlocksAtTierRequest) returns (Empty);
+  rpc MatchExternalKv(MatchExternalKvRequest) returns (MatchExternalKvResponse);
+  rpc GetExternalKvHitCounts(GetExternalKvHitCountsRequest) returns (GetExternalKvHitCountsResponse);
+}
