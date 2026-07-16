@@ -32,6 +32,54 @@ logger = logging.getLogger(__name__)
 TOPK_IDX_DTYPE = torch.int32
 WARP_SIZE = 64
 
+# Process-global CCO communicator, reused across ops (creating one per op would
+# re-run the socket bootstrap every time). Only used when MORI_EP_COMM=cco, which
+# routes the C++ EP handle's symmetric buffers through a cco LSA window instead of
+# the mori-shmem heap (enables intra-node EP on archs without shmem support).
+_CCO_COMM = None
+
+
+def _maybe_get_cco_comm(config):
+    """Return a cached cco Communicator when MORI_EP_COMM=cco, else None.
+
+    Bootstraps once via a torch.distributed broadcast of the cco unique-id (the
+    same pattern the v2/FlyDSL path uses), sized for this config's symmetric
+    buffers. Reused for the lifetime of the process.
+    """
+    if os.environ.get("MORI_EP_COMM", "").strip().lower() != "cco":
+        return None
+    global _CCO_COMM
+    if _CCO_COMM is not None:
+        return _CCO_COMM
+    from mori.cco import Communicator
+
+    if not dist.is_initialized():
+        raise RuntimeError("MORI_EP_COMM=cco requires an initialized torch.distributed group")
+    # Per-rank VMM must hold every symmetric buffer this rank allocates. The
+    # dispatch/combine token buffers dominate (~world * max_tok * hidden * dtype);
+    # use generous headroom for the ~18 buffers + alignment slack.
+    big = (
+        int(config.world_size)
+        * int(config.max_num_inp_token_per_rank)
+        * int(config.hidden_dim)
+        * int(config.max_token_type_size)
+    )
+    per_rank_vmm = 6 * big + (1 << 30)
+    uid = Communicator.get_unique_id() if config.rank == 0 else None
+    objs = [uid]
+    dist.broadcast_object_list(objs, src=0)
+    uid = objs[0]
+    _CCO_COMM = Communicator.init(
+        int(config.world_size), int(config.rank), uid, per_rank_vmm=per_rank_vmm
+    )
+    logger.info(
+        "MORI_EP_COMM=cco: created cco communicator rank=%d/%d per_rank_vmm=%d",
+        config.rank,
+        config.world_size,
+        per_rank_vmm,
+    )
+    return _CCO_COMM
+
 
 class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
     def __str__(self):
@@ -276,7 +324,9 @@ class EpDispatchCombineOp:
             max_total_recv_tokens=config.max_total_recv_tokens,
         )
 
-        self._handle = handle_class(self._cpp_config)
+        self._cco_comm = _maybe_get_cco_comm(config)
+        _cco_ptr = self._cco_comm.ptr if self._cco_comm is not None else 0
+        self._handle = handle_class(self._cpp_config, cco_comm_ptr=_cco_ptr)
         self._hip_module = _load_hip_modules(config.kernel_type)
         self._handle_info = mori_cpp.get_handle_info(self._handle)
 
