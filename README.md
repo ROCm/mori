@@ -213,17 +213,13 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 > typically pre-installed with the kernel OFED stack. For Thor2 and Pollara, install the
 > corresponding userspace library from your NIC vendor.
 
-**Recommended NIC firmware/driver versions** (for cross-node MORI, i.e. EP over RDMA /
-IBGDA — the wrong version is a common blocker, check yours with `mori check` or
-`tools/env_check.sh`):
+**Recommended NIC firmware/driver versions** (check with `mori check` or `tools/env_check.sh`):
 
 | Vendor | Recommendation |
 |--------|-----------------|
-| AMD Pollara (AINIC) | `>= 1.117.5-a-45` is solid. The `1.117.1` major does **not** support IBGDA. |
-| Broadcom (Thor2) | Solid on `237.1.137.x` (official Broadcom release) and `235.2.86.x` (customer-specific build). `231.x` is too old for IBGDA. |
-| Mellanox (ConnectX, mlx5) | Good backward compatibility; no known minimum version. Internally tested on `ConnectX-7`. |
-
-> For all NICs, the userspace library must match the corresponding kernel driver version.
+| AMD Pollara (AINIC) | `>= 1.117.5-a-45` (`1.117.1` major lacks IBGDA support) |
+| Broadcom (Thor2) | `237.1.137.x` / `235.2.86.x`; `231.x` too old for IBGDA |
+| Mellanox (ConnectX, mlx5) | No known minimum; tested on `ConnectX-7` |
 
 ### Install
 
