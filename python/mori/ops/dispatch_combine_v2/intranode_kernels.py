@@ -67,7 +67,8 @@ from flydsl.expr.rocdl import (
 from flydsl.expr.typing import Int32, Int64
 
 import mori.cco.device.flydsl as cco
-import flydsl_prims as P
+
+from . import flydsl_prims as P
 
 # Wavefront size: gfx9 (MI300/MI350) = 64, gfx12 (MI400/gfx1250) = 32. Detected
 # once per process; override with MORI_WAVE_SIZE. get_warp_size(gfx1250) wrongly

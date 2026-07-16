@@ -991,12 +991,21 @@ class EpDispatchCombineOp:
                 if quant_type == EpDispatchCombineQuantType.Fp4BlockwiseQuant
                 else "fp8_blockwise"
             )
-            if kt not in (
+            # fp8 blockwise also runs on AsyncLL; fp4 blockwise is IntraNode-only.
+            allowed_kts = [
                 EpDispatchCombineKernelType.IntraNode.value,
                 EpDispatchCombineKernelType.IntraNodeLL.value,
-            ):
+            ]
+            if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+                allowed_kts.append(EpDispatchCombineKernelType.AsyncLL.value)
+            if kt not in allowed_kts:
+                supported = (
+                    "IntraNode/IntraNodeLL/AsyncLL"
+                    if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant
+                    else "IntraNode/IntraNodeLL"
+                )
                 raise ValueError(
-                    f"{label} combine currently only supports IntraNode/IntraNodeLL combine"
+                    f"{label} combine currently only supports {supported} combine"
                 )
             if sfx != "bf16":
                 raise ValueError(f"{label} combine only supports bf16, got {sfx}")
@@ -1151,6 +1160,18 @@ class EpDispatchCombineOp:
                     stream,
                     args_ptr,
                 )
+            elif quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+                self._launch_multi(
+                    [
+                        "EpCombineLowLatencyAsyncSendCopy_bf16_fp8bwq",
+                        "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8bwq",
+                    ],
+                    [mp_aligned, self.config.world_size],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, 0],
+                    stream,
+                    args_ptr,
+                )
             else:
                 self._launch_multi(
                     [
@@ -1232,6 +1253,18 @@ class EpDispatchCombineOp:
                     [
                         "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8cast",
                         "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8cast",
+                    ],
+                    [self.config.world_size, mp_aligned],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, shared_mem],
+                    stream,
+                    args_ptr,
+                )
+            elif quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+                self._launch_multi(
+                    [
+                        "EpCombineLowLatencyAsyncRecvTransfer_bf16",
+                        "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bwq",
                     ],
                     [self.config.world_size, mp_aligned],
                     [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],

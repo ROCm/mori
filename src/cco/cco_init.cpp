@@ -99,7 +99,29 @@ static hipMemAllocationType CcoWindowAllocType() {
     const char* e = getenv("CCO_UNCACHED_WINDOW");
     return e && atoi(e) == 0;
   }();
-  return cached ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
+  if (cached) return hipMemAllocationTypePinned;
+  // hipMemAllocationTypeUncached was added on 2025-09-11 (HIP_VERSION > 70051831).
+  // Guard the symbol so CCO still builds on older ROCm (e.g. 7.0.0); mirror the
+  // shmem path in symmetric_memory.cpp: use the raw value 0x40000000 on the
+  // 70051831 build where the symbol may be missing (excluding the buggy
+  // 7c9236b16 build), and fall back to Pinned on anything older.
+#if HIP_VERSION > 70051831
+  return hipMemAllocationTypeUncached;
+#elif HIP_VERSION == 70051831
+  if (strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
+    return static_cast<hipMemAllocationType>(0x40000000);  // hipMemAllocationTypeUncached
+  }
+  MORI_SHMEM_WARN(
+      "CCO uncached window requested but ROCm build {} has a known "
+      "hipMemAllocationTypeUncached issue; falling back to Pinned memory",
+      HIP_VERSION_GITHASH);
+  return hipMemAllocationTypePinned;
+#else
+  MORI_SHMEM_WARN(
+      "CCO uncached window requested but ROCm version does not support "
+      "hipMemAllocationTypeUncached; falling back to Pinned memory");
+  return hipMemAllocationTypePinned;
+#endif
 }
 
 // Local slot base = the VA where this rank's slice of the flat VA starts.

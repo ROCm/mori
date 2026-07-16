@@ -19,28 +19,18 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import importlib
-
-from .dispatch_combine import (
-    EpDispatchCombineKernelType,
+#
+# The FlyDSL-based dispatch/combine (v2) op. Importing this package pulls in
+# FlyDSL (an optional mori dependency: `pip install amd_mori[flydsl]`), so it is
+# lazily loaded from mori.ops rather than eagerly imported there.
+from .dispatch_combine_op import (
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
-)
-from .local_expert_count import (
-    launch_local_expert_count,
+    EpDispatchRoutingHandle,
 )
 
-# dispatch_combine_v2 (FlyDSL) requires the optional `flydsl` dependency, so it
-# is imported lazily: `import mori.ops` stays usable without flydsl installed,
-# and `mori.ops.dispatch_combine_v2` resolves on first access.
-_LAZY_SUBMODULES = {"dispatch_combine_v2"}
-
-
-def __getattr__(name: str):
-    if name in _LAZY_SUBMODULES:
-        return importlib.import_module(f".{name}", __name__)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def __dir__():
-    return list(globals().keys()) + sorted(_LAZY_SUBMODULES)
+__all__ = [
+    "EpDispatchCombineConfig",
+    "EpDispatchCombineOp",
+    "EpDispatchRoutingHandle",
+]

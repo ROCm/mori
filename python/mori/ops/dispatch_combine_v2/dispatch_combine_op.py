@@ -31,7 +31,7 @@ import torch
 import flydsl.expr as fx
 from mori.tensor_utils import from_gpu_ptr
 
-from intranode_kernels import (
+from .intranode_kernels import (
     make_dispatch,
     make_combine,
     make_combine_scatter,
@@ -218,7 +218,7 @@ class EpDispatchCombineConfig:
             )
         )
         if not pinned:
-            from tuning_configs import lookup
+            from .tuning_configs import lookup
 
             t = lookup(
                 self.world_size,
@@ -274,7 +274,7 @@ class EpDispatchCombineConfig:
         (unless explicitly overridden in kwargs). Kept for back-compat and to
         force per-field tuning even when some geometry is overridden; the plain
         constructor is now also tuned-by-default (see _resolve_geometry)."""
-        from tuning_configs import lookup
+        from .tuning_configs import lookup
 
         dt = kwargs.get("data_type", torch.bfloat16)
         dtype = (
