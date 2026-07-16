@@ -279,6 +279,11 @@ def main():
         def time_eager(fn, ct):
             for _ in range(WARMUP):
                 fn(ct)
+                sync()
+                comm.barrier()  # lock-step warmup: sync(device)+barrier so no
+                # rank starts call N+1 before all finish N (avoids the cco cross-
+                # device barrier flag-overwrite deadlock at small token counts).
+                # Untimed, so it does not affect the measured replay bandwidth.
             sync()
             comm.barrier()
             s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
@@ -295,6 +300,11 @@ def main():
         def time_graph(fn, ct):
             for _ in range(WARMUP):
                 fn(ct)
+                sync()
+                comm.barrier()  # lock-step warmup: sync(device)+barrier so no
+                # rank starts call N+1 before all finish N (avoids the cco cross-
+                # device barrier flag-overwrite deadlock at small token counts).
+                # Untimed, so it does not affect the measured replay bandwidth.
             sync()
             gr = torch.cuda.CUDAGraph()
             with torch.cuda.graph(gr):
