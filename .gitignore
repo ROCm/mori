@@ -2,6 +2,8 @@
 build/
 build*/
 lib*
+# Do not ignore Rust crate source files named lib.rs
+!sglang-kv-indexer/src/lib.rs
 dist/*
 target/
 
