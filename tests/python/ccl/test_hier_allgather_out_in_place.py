@@ -42,6 +42,7 @@ Single node (simulates N>=2 by splitting local GPUs into sub-groups)::
 import os
 import traceback
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -49,6 +50,10 @@ import mori.shmem as shmem
 from mori.ccl import HierAllGather
 
 from tests.python.utils import TorchDistContext, get_free_port
+
+pytestmark = pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="requires >=2 GPUs"
+)
 
 _DEFAULT_DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.int32]
 
@@ -92,20 +97,26 @@ def _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device, bench
 
     # out-in-place handle (result read from the ring buffer; no copy-OUT).
     h_oip = HierAllGather(
-        my_pe=rank, npes=world_size, ranks_per_node=ranks_per_node,
+        my_pe=rank,
+        npes=world_size,
+        ranks_per_node=ranks_per_node,
         input_buffer_size=per_rank_bytes,
         output_buffer_size=per_rank_bytes * world_size,
         out_in_place=True,
     )
     # Default staged handle (fills the user output via finish_sync copy-OUT).
     h_def = HierAllGather(
-        my_pe=rank, npes=world_size, ranks_per_node=ranks_per_node,
+        my_pe=rank,
+        npes=world_size,
+        ranks_per_node=ranks_per_node,
         input_buffer_size=per_rank_bytes,
         output_buffer_size=per_rank_bytes * world_size,
     )
     if rank == 0:
-        print(f"out-in-place: world={world_size} ranks_per_node={ranks_per_node} "
-              f"num_nodes={h_oip.num_nodes}")
+        print(
+            f"out-in-place: world={world_size} ranks_per_node={ranks_per_node} "
+            f"num_nodes={h_oip.num_nodes}"
+        )
     assert h_oip.num_nodes >= 2, "out-in-place test needs num_nodes>=2"
 
     stream = torch.cuda.current_stream()
@@ -184,8 +195,9 @@ def _spawn_worker(rank, world_size, ranks_per_node, port, numels, dtypes, bench)
         _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device, bench)
 
 
-def test_hier_allgather_out_in_place(world_size=None, ranks_per_node=None,
-                                     numels=None, dtypes=None, bench=False):
+def test_hier_allgather_out_in_place(
+    world_size=None, ranks_per_node=None, numels=None, dtypes=None, bench=False
+):
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
     os.environ.setdefault("MORI_SDMA_NUM_CHANNELS", "1")
     if world_size is None:
@@ -218,8 +230,9 @@ def _run_torchrun(numels, dtypes, bench=False):
     ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
-    dist.init_process_group(backend="cpu:gloo,cuda:nccl", rank=rank,
-                            world_size=world_size, device_id=device)
+    dist.init_process_group(
+        backend="cpu:gloo,cuda:nccl", rank=rank, world_size=world_size, device_id=device
+    )
     world_group = torch.distributed.group.WORLD
     torch._C._distributed_c10d._register_process_group("default", world_group)
     try:
@@ -233,7 +246,9 @@ def _run_torchrun(numels, dtypes, bench=False):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="out-in-place copy-OUT elimination test")
+    parser = argparse.ArgumentParser(
+        description="out-in-place copy-OUT elimination test"
+    )
     parser.add_argument("--world-size", type=int, default=None)
     parser.add_argument("--ranks-per-node", type=int, default=None)
     parser.add_argument("--numels", type=int, nargs="+", default=None)
@@ -243,18 +258,26 @@ if __name__ == "__main__":
 
     if args.dtype is not None:
         from tests.python.utils import string_to_dtype
+
         dtypes = [string_to_dtype(args.dtype)]
     else:
         dtypes = _DEFAULT_DTYPES
-    numels = args.numels if args.numels is not None else [1024, 1024 * 1024, 16 * 1024 * 1024]
+    numels = (
+        args.numels
+        if args.numels is not None
+        else [1024, 1024 * 1024, 16 * 1024 * 1024]
+    )
 
     try:
         if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
             _run_torchrun(numels, dtypes, bench=args.bench)
         else:
             test_hier_allgather_out_in_place(
-                world_size=args.world_size, ranks_per_node=args.ranks_per_node,
-                numels=numels, dtypes=dtypes, bench=args.bench,
+                world_size=args.world_size,
+                ranks_per_node=args.ranks_per_node,
+                numels=numels,
+                dtypes=dtypes,
+                bench=args.bench,
             )
     except Exception:
         traceback.print_exc()

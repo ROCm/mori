@@ -43,6 +43,7 @@ Two launch styles are supported:
 import os
 import traceback
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -50,6 +51,12 @@ import mori.shmem as shmem
 from mori.ccl import HierAllGather
 
 from tests.python.utils import TorchDistContext, get_free_port
+
+# CI-conformance: SKIP (not ERROR) when the >=2-GPU hardware precondition is
+# unmet, matching the repo convention (see test_allgather_param_contiguous.py).
+pytestmark = pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="requires >=2 GPUs"
+)
 
 
 # Sizes (elements per rank) and dtypes required by DESIGN.md correctness
@@ -79,7 +86,7 @@ def _run_dispatch_span(handle, rank, world_size, device, cap_numel):
     review ask since ; runs on the authoritative true-xnode path."""
     if not getattr(handle, "slice_inter", False) or handle.num_nodes < 2:
         return
-    small, large = 1024, 1 << 20            # fp32: 4 KiB (below) | 4 MiB (slice)
+    small, large = 1024, 1 << 20  # fp32: 4 KiB (below) | 4 MiB (slice)
     if large > cap_numel:
         return
 
@@ -90,10 +97,15 @@ def _run_dispatch_span(handle, rank, world_size, device, cap_numel):
         bc = numel * 4  # fp32
         if handle.slice_inter and bc >= handle.slice_min_bytes:
             return "slice"
-        if (getattr(handle, "pipe_band", False) and handle.slice_inter
-                and handle.slice_fused and not handle.slice_oop
-                and not handle.slice_overlap and handle.slice_pipe_chunks > 1
-                and bc >= getattr(handle, "pipe_band_min_bytes", 0)):
+        if (
+            getattr(handle, "pipe_band", False)
+            and handle.slice_inter
+            and handle.slice_fused
+            and not handle.slice_oop
+            and not handle.slice_overlap
+            and handle.slice_pipe_chunks > 1
+            and bc >= getattr(handle, "pipe_band_min_bytes", 0)
+        ):
             return "pipe"
         return None
 
@@ -101,20 +113,21 @@ def _run_dispatch_span(handle, rank, world_size, device, cap_numel):
     saved_last = handle._last_use_slice
     saved_prev = handle._prev_op_completed
     saved_band = getattr(handle, "pipe_band", False)
-    handle.slice_min_bytes = 1 << 19        # 512 KiB: small below, large above
+    handle.slice_min_bytes = 1 << 19  # 512 KiB: small below, large above
     try:
         # Cover both the pipe-band default (small->"pipe") AND the legacy
         # non-slice path (small->None) so a path SWITCH is exercised both ways
         # through the SAME handle for all three dispatch destinations.
         for band in (True, False):
             handle.pipe_band = band and saved_band
-            handle._last_use_slice = "sentinel"   # force a switch on the first op
+            handle._last_use_slice = "sentinel"  # force a switch on the first op
             for numel in (small, large, small, large):
                 want = _expected_key(numel)
                 _run_one(handle, torch.float32, numel, rank, world_size, device)
                 assert handle._last_use_slice == want, (
                     f"dispatcher routed numel={numel} (pipe_band={handle.pipe_band}) "
-                    f"to {handle._last_use_slice!r}, expected {want!r}")
+                    f"to {handle._last_use_slice!r}, expected {want!r}"
+                )
         if rank == 0:
             print("test_hier_allgather: dispatch-span PASSED")
     finally:
@@ -226,8 +239,7 @@ def _bench_phases(handle, dtype, numel, rank, world_size, device, reps=5, warmup
     return i_min, i_avg, n_min, n_avg
 
 
-def _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device,
-                 bench=False):
+def _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device, bench=False):
     shmem.shmem_torch_process_group_init("default")
     assert shmem.shmem_mype() == rank
     assert shmem.shmem_npes() == world_size
@@ -279,7 +291,8 @@ def _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device,
             bdtype = torch.float32
             for bnumel in sorted(set(numels)):
                 m_min, m_avg, r_min, r_avg = _bench_one(
-                    handle, bdtype, bnumel, rank, world_size, device)
+                    handle, bdtype, bnumel, rank, world_size, device
+                )
                 if rank == 0:
                     tot_gb = bnumel * world_size * 4 / 1e9
                     print(
@@ -301,7 +314,8 @@ def _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device,
                 and hasattr(handle, "_inter")
             ):
                 i_min, i_avg, n_min, n_avg = _bench_phases(
-                    handle, bdtype, bnumel, rank, world_size, device)
+                    handle, bdtype, bnumel, rank, world_size, device
+                )
                 if rank == 0:
                     print(
                         f"[phases] intra(SDMA gather) min={i_min:.3f}ms "
@@ -324,12 +338,14 @@ def _spawn_worker(rank, world_size, ranks_per_node, port, numels, dtypes, bench)
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(device)
-        _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device,
-                     bench=bench)
+        _worker_body(
+            rank, world_size, ranks_per_node, numels, dtypes, device, bench=bench
+        )
 
 
-def test_hier_allgather(world_size=None, ranks_per_node=None, numels=None,
-                        dtypes=None, bench=False):
+def test_hier_allgather(
+    world_size=None, ranks_per_node=None, numels=None, dtypes=None, bench=False
+):
     """Single-node pytest entry.
 
     ``ranks_per_node == world_size`` (default) is the M1 single-node path
@@ -349,7 +365,9 @@ def test_hier_allgather(world_size=None, ranks_per_node=None, numels=None,
     assert world_size >= 2, f"HierAllGather needs >=2 GPUs, got {world_size}"
     if ranks_per_node is None:
         ranks_per_node = world_size
-    assert world_size % ranks_per_node == 0, "world must be a multiple of ranks_per_node"
+    assert (
+        world_size % ranks_per_node == 0
+    ), "world must be a multiple of ranks_per_node"
     if numels is None:
         # DESIGN.md contract sizes per rank: ~4 KiB, ~4 MiB, ~64 MiB.
         # In fp32: 1024 -> 4 KiB, 1 Mi -> 4 MiB, 16 Mi -> 64 MiB.
@@ -438,7 +456,9 @@ def test_hier_allgather_slice():
                     for world, rpn in layouts:
                         if world > ngpu:
                             continue
-                        test_hier_allgather(world_size=world, ranks_per_node=rpn, numels=small)
+                        test_hier_allgather(
+                            world_size=world, ranks_per_node=rpn, numels=small
+                        )
                         ran += 1
         os.environ["MORI_HIER_SLICE_FUSE_IB"] = "1"
         # M5: lever (c) -- overlap the local node-block Phase-B gather
@@ -525,7 +545,9 @@ def test_hier_allgather_slice():
                         for world, rpn in layouts:
                             if world > ngpu:
                                 continue
-                            test_hier_allgather(world_size=world, ranks_per_node=rpn, numels=small)
+                            test_hier_allgather(
+                                world_size=world, ranks_per_node=rpn, numels=small
+                            )
                             ran += 1
         # durable coverage for the DISSEMINATION prepare
         # barrier (MORI_HIER_DISSEM_BARRIER=1). Same global all-PE semantics as
@@ -563,7 +585,12 @@ def test_hier_allgather_slice():
         # runs only on an RDMA-capable host; the shipped true-xnode bit-exact
         # test (test_hier_allgather under torchrun with --slice-direct) is the
         # primary durable coverage for this path.
-        if os.environ.get("MORI_HIER_TEST_DIRECT", "0") not in ("0", "", "false", "False"):
+        if os.environ.get("MORI_HIER_TEST_DIRECT", "0") not in (
+            "0",
+            "",
+            "false",
+            "False",
+        ):
             os.environ["MORI_HIER_STREAM_RING"] = "1"
             os.environ["MORI_HIER_STREAM_INTRA"] = "1"
             os.environ["MORI_HIER_SLICE_FUSED"] = "1"
@@ -581,7 +608,9 @@ def test_hier_allgather_slice():
                     for world, rpn in layouts:
                         if world > ngpu:
                             continue
-                        test_hier_allgather(world_size=world, ranks_per_node=rpn, numels=small)
+                        test_hier_allgather(
+                            world_size=world, ranks_per_node=rpn, numels=small
+                        )
                         ran += 1
             if prev_direct_overlap is None:
                 os.environ.pop("MORI_HIER_SLICE_DIRECT_OVERLAP", None)
@@ -661,13 +690,15 @@ def _run_torchrun(numels, dtypes, bench=False):
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     backend = "cpu:gloo,cuda:nccl"
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size,
-                            device_id=device)
+    dist.init_process_group(
+        backend=backend, rank=rank, world_size=world_size, device_id=device
+    )
     world_group = torch.distributed.group.WORLD
     torch._C._distributed_c10d._register_process_group("default", world_group)
     try:
-        _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device,
-                     bench=bench)
+        _worker_body(
+            rank, world_size, ranks_per_node, numels, dtypes, device, bench=bench
+        )
     finally:
         if dist.is_initialized():
             dist.barrier()
@@ -679,147 +710,239 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Bit-exact HierAllGather test")
     parser.add_argument("--world-size", type=int, default=None)
-    parser.add_argument("--ranks-per-node", type=int, default=None,
-                        help="GPUs per simulated node; <world-size exercises M2b")
+    parser.add_argument(
+        "--ranks-per-node",
+        type=int,
+        default=None,
+        help="GPUs per simulated node; <world-size exercises M2b",
+    )
     parser.add_argument("--numels", type=int, nargs="+", default=None)
     parser.add_argument("--dtype", type=str, default=None)
-    parser.add_argument("--bench", action="store_true",
-                        help="after correctness, run timed bench vs RCCL")
-    parser.add_argument("--slice", dest="slice_inter", action="store_true",
-                        help="this work M5 lever: SLICED 2-D AllGather. Each rank "
-                        "rings only its own shard across nodes (per-NIC inter "
-                        "bytes cut G x), then N intra SDMA gathers reassemble the "
-                        "node-blocks. Sets MORI_HIER_SLICE=1 before shmem init.")
-    parser.add_argument("--slice-fused", dest="slice_fused", action="store_true",
-                        help="this work M5 : fold the N sliced-Phase-B intra "
-                        "reassembly gathers into ONE batch (2 barriers + 1 bulk "
-                        "copy vs 2N barriers + N copies). Implies --slice. Sets "
-                        "MORI_HIER_SLICE_FUSED=1 before shmem init.")
-    parser.add_argument("--no-slice", dest="no_slice", action="store_true",
-                        help="this work: force the pre-slice baseline path "
-                        "(MORI_HIER_SLICE=0), overriding the Turn-5 default-ON. "
-                        "For A/B benchmarking the shipped default vs baseline.")
-    parser.add_argument("--slice-oop", dest="slice_oop", action="store_true",
-                        help="this work M5 : read the sliced Phase-A collection "
-                        "directly from the inter ring buffer (out_in_place) instead "
-                        "of a finish copy-OUT into scratch. Implies --slice. Sets "
-                        "MORI_HIER_SLICE_OOP=1 before shmem init.")
-    parser.add_argument("--slice-overlap", dest="slice_overlap", action="store_true",
-                        help="this work M5  lever (c): overlap the local "
-                        "node-block Phase-B gather with the inter ring on a side "
-                        "stream. Implies --slice --slice-fused. Sets "
-                        "MORI_HIER_SLICE_OVERLAP=1 before shmem init.")
-    parser.add_argument("--no-slice-fuse-ib", dest="no_slice_fuse_ib",
-                        action="store_true",
-                        help="this work M5 : RESTORE the redundant Phase-B entry "
-                        "barrier in the sliced+fused path (MORI_HIER_SLICE_FUSE_IB=0). "
-                        "Default drops it (the inter ring's finish barrier already "
-                        "synchronizes all PEs). For A/B benchmarking.")
-    parser.add_argument("--slice-pipe", dest="slice_pipe", action="store_true",
-                        help="this work M5 : chunked (strided) Phase-B "
-                        "reassembly -- split each block gather into "
-                        "--slice-pipe-chunks element ranges via the new "
-                        "gather_kernel slot-stride. Correctness enabler for the "
-                        "chunked inter/intra pipeline. Implies --slice --slice-fused. "
-                        "Sets MORI_HIER_SLICE_PIPE=1 before shmem init.")
-    parser.add_argument("--slice-pipe-chunks", type=int, default=None,
-                        help="this work M5 : number of element-range chunks for "
-                        "--slice-pipe (default 2). Sets MORI_HIER_SLICE_PIPE_CHUNKS.")
-    parser.add_argument("--slice-pipe-overlap", dest="slice_pipe_overlap",
-                        action="store_true",
-                        help="this work M5  (rule#1 payoff): chunk the INTER ring "
-                        "into --slice-pipe-chunks stages and overlap each chunk's "
-                        "Phase-B gather (side stream) with the next chunk's ring "
-                        "(main stream) to hide the serial Phase-B tail. Implies "
-                        "--slice --slice-fused. Sets MORI_HIER_SLICE_PIPE_OVERLAP=1.")
-    parser.add_argument("--stream-ring", dest="stream_ring", action="store_true",
-                        help="this work M5 : stream-ordered inter ring -- use "
-                        "the on-device ShmemBarrierOnStream prepare/finish instead "
-                        "of host hipStreamSynchronize + host ShmemBarrierAll, "
-                        "removing 2 CPU<->GPU round-trips per inter ring op. Sets "
-                        "MORI_HIER_STREAM_RING=1 before shmem init.")
-    parser.add_argument("--no-stream-ring", dest="no_stream_ring", action="store_true",
-                        help="this work M5  A/B: restore the host-synced inter "
-                        "ring (MORI_HIER_STREAM_RING=0) to measure against the "
-                        "stream-ordered default.")
-    parser.add_argument("--no-stream-intra", dest="no_stream_intra", action="store_true",
-                        help="this work M5  A/B: restore the host-synced "
-                        "Phase-B finish_batch (hipStreamSynchronize + host "
-                        "ShmemBarrierAll, MORI_HIER_STREAM_INTRA=0) to measure "
-                        "against the stream-ordered finish_batch_stream default.")
-    parser.add_argument("--no-slice-defer-fin", dest="no_slice_defer_fin",
-                        action="store_true",
-                        help="this work M5  A/B: restore the Phase-B finish "
-                        "fence (MORI_HIER_SLICE_DEFER_FIN=0) instead of deferring "
-                        "it to the next op's inter-prepare barrier, to measure "
-                        "against the deferred-fence default.")
-    parser.add_argument("--slice-defer-inter-fin", dest="slice_defer_inter_fin",
-                        action="store_true",
-                        help="this work : defer the inter ring's "
-                        "finish_stream fence (MORI_HIER_SLICE_DEFER_INTER_FIN=1) "
-                        "to the next slice op's prepare_stream barrier, dropping "
-                        "one global on-stream fence per op on the non-oop slice "
-                        "path. Now DEFAULT ON; flag is a no-op kept for "
-                        "back-compat.")
-    parser.add_argument("--no-slice-defer-inter-fin", dest="no_slice_defer_inter_fin",
-                        action="store_true",
-                        help="this work  A/B: restore the inter ring's "
-                        "finish_stream fence (MORI_HIER_SLICE_DEFER_INTER_FIN=0) "
-                        "instead of deferring it, to measure against the "
-                        "deferred-fence default.")
-    parser.add_argument("--slice-direct", dest="slice_direct", action="store_true",
-                        help="this work M5 : DIRECT-TO-OUTPUT Phase B "
-                        "(MORI_HIER_SLICE_DIRECT=1) -- SDMA-PUSH the gathered "
-                        "node-blocks straight into the registered user output, "
-                        "eliminating the full-output finish_batch copy-OUT. "
-                        ": now DEFAULT ON over RDMA (auto-probed via "
-                        "shmem_ptr_p2p to a cross-node peer); stays OFF on the "
-                        "single-node IPC sim where ShmemSymmetricRegister hard-"
-                        "aborts. This flag forces it ON; --no-slice-direct forces "
-                        "OFF. +5.4% @64MiB on true xnode (133.7->141.2 GB/s).")
-    parser.add_argument("--no-slice-direct", dest="no_slice_direct",
-                        action="store_true",
-                        help="this work  A/B: restore the full-output "
-                        "finish_batch copy-OUT (MORI_HIER_SLICE_DIRECT=0) "
-                        "instead of the direct-to-output PUSH default, to "
-                        "measure against the direct path.")
-    parser.add_argument("--slice-direct-overlap", dest="slice_direct_overlap",
-                        action="store_true",
-                        help="overlap the LOCAL node-block "
-                        "(m=node_id) reassembly gather (no ring dependency) on a "
-                        "side stream with the inter ring kernel "
-                        "(MORI_HIER_SLICE_DIRECT_OVERLAP=1). Hides ~1/N of Phase B "
-                        "under Phase A. Requires the slice_direct stream path.")
-    parser.add_argument("--no-slice-direct-overlap", dest="no_slice_direct_overlap",
-                        action="store_true",
-                        help="Force MORI_HIER_SLICE_DIRECT_OVERLAP=0 for A/B.")
-    parser.add_argument("--put-chunk-bytes", type=int, default=None,
-                        help="this work transport lever: split each fast-path RDMA "
-                        "put into WQEs of at most this many bytes (multiple "
-                        "in-flight WQEs/QP). 0/unset = single-WQE default. Set "
-                        "into MORI_RDMA_PUT_CHUNK_BYTES before shmem init so the "
-                        "C++ transport (read at GpuStateInit) picks it up.")
-    parser.add_argument("--fuse-local", dest="fuse_local", action="store_true",
-                        help="fuse the LOCAL node-block "
-                        "(m=node_id) reassembly gather INTO the inter ring "
-                        "kernel as ONE launch (ring blocks || local-gather block, "
-                        "no host wait_stream merge) -- MORI_HIER_FUSE_LOCAL=1. "
-                        "Ports this proven recv+reassemble parity lever "
-                        "(D hit 176 GB/s @64MiB). Requires the slice_direct "
-                        "stream path; N==2 only.")
-    parser.add_argument("--no-fuse-local", dest="no_fuse_local",
-                        action="store_true",
-                        help="Force MORI_HIER_FUSE_LOCAL=0 for A/B against the "
-                        "shipped slice_direct path.")
-    parser.add_argument("--dissem-barrier", dest="dissem_barrier",
-                        action="store_true",
-                        help="use the dissemination-topology "
-                        "global barrier for the inter-ring prepare rendezvous "
-                        "(MORI_HIER_DISSEM_BARRIER=1). Same global all-PE "
-                        "semantics, O(log n) parallel rounds vs the PE0 funnel.")
-    parser.add_argument("--no-dissem-barrier", dest="no_dissem_barrier",
-                        action="store_true",
-                        help="Force the funnel barrier (MORI_HIER_DISSEM_BARRIER=0) for A/B.")
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="after correctness, run timed bench vs RCCL",
+    )
+    parser.add_argument(
+        "--slice",
+        dest="slice_inter",
+        action="store_true",
+        help="this work M5 lever: SLICED 2-D AllGather. Each rank "
+        "rings only its own shard across nodes (per-NIC inter "
+        "bytes cut G x), then N intra SDMA gathers reassemble the "
+        "node-blocks. Sets MORI_HIER_SLICE=1 before shmem init.",
+    )
+    parser.add_argument(
+        "--slice-fused",
+        dest="slice_fused",
+        action="store_true",
+        help="this work M5 : fold the N sliced-Phase-B intra "
+        "reassembly gathers into ONE batch (2 barriers + 1 bulk "
+        "copy vs 2N barriers + N copies). Implies --slice. Sets "
+        "MORI_HIER_SLICE_FUSED=1 before shmem init.",
+    )
+    parser.add_argument(
+        "--no-slice",
+        dest="no_slice",
+        action="store_true",
+        help="this work: force the pre-slice baseline path "
+        "(MORI_HIER_SLICE=0), overriding the Turn-5 default-ON. "
+        "For A/B benchmarking the shipped default vs baseline.",
+    )
+    parser.add_argument(
+        "--slice-oop",
+        dest="slice_oop",
+        action="store_true",
+        help="this work M5 : read the sliced Phase-A collection "
+        "directly from the inter ring buffer (out_in_place) instead "
+        "of a finish copy-OUT into scratch. Implies --slice. Sets "
+        "MORI_HIER_SLICE_OOP=1 before shmem init.",
+    )
+    parser.add_argument(
+        "--slice-overlap",
+        dest="slice_overlap",
+        action="store_true",
+        help="this work M5  lever (c): overlap the local "
+        "node-block Phase-B gather with the inter ring on a side "
+        "stream. Implies --slice --slice-fused. Sets "
+        "MORI_HIER_SLICE_OVERLAP=1 before shmem init.",
+    )
+    parser.add_argument(
+        "--no-slice-fuse-ib",
+        dest="no_slice_fuse_ib",
+        action="store_true",
+        help="this work M5 : RESTORE the redundant Phase-B entry "
+        "barrier in the sliced+fused path (MORI_HIER_SLICE_FUSE_IB=0). "
+        "Default drops it (the inter ring's finish barrier already "
+        "synchronizes all PEs). For A/B benchmarking.",
+    )
+    parser.add_argument(
+        "--slice-pipe",
+        dest="slice_pipe",
+        action="store_true",
+        help="this work M5 : chunked (strided) Phase-B "
+        "reassembly -- split each block gather into "
+        "--slice-pipe-chunks element ranges via the new "
+        "gather_kernel slot-stride. Correctness enabler for the "
+        "chunked inter/intra pipeline. Implies --slice --slice-fused. "
+        "Sets MORI_HIER_SLICE_PIPE=1 before shmem init.",
+    )
+    parser.add_argument(
+        "--slice-pipe-chunks",
+        type=int,
+        default=None,
+        help="this work M5 : number of element-range chunks for "
+        "--slice-pipe (default 2). Sets MORI_HIER_SLICE_PIPE_CHUNKS.",
+    )
+    parser.add_argument(
+        "--slice-pipe-overlap",
+        dest="slice_pipe_overlap",
+        action="store_true",
+        help="this work M5  (rule#1 payoff): chunk the INTER ring "
+        "into --slice-pipe-chunks stages and overlap each chunk's "
+        "Phase-B gather (side stream) with the next chunk's ring "
+        "(main stream) to hide the serial Phase-B tail. Implies "
+        "--slice --slice-fused. Sets MORI_HIER_SLICE_PIPE_OVERLAP=1.",
+    )
+    parser.add_argument(
+        "--stream-ring",
+        dest="stream_ring",
+        action="store_true",
+        help="this work M5 : stream-ordered inter ring -- use "
+        "the on-device ShmemBarrierOnStream prepare/finish instead "
+        "of host hipStreamSynchronize + host ShmemBarrierAll, "
+        "removing 2 CPU<->GPU round-trips per inter ring op. Sets "
+        "MORI_HIER_STREAM_RING=1 before shmem init.",
+    )
+    parser.add_argument(
+        "--no-stream-ring",
+        dest="no_stream_ring",
+        action="store_true",
+        help="this work M5  A/B: restore the host-synced inter "
+        "ring (MORI_HIER_STREAM_RING=0) to measure against the "
+        "stream-ordered default.",
+    )
+    parser.add_argument(
+        "--no-stream-intra",
+        dest="no_stream_intra",
+        action="store_true",
+        help="this work M5  A/B: restore the host-synced "
+        "Phase-B finish_batch (hipStreamSynchronize + host "
+        "ShmemBarrierAll, MORI_HIER_STREAM_INTRA=0) to measure "
+        "against the stream-ordered finish_batch_stream default.",
+    )
+    parser.add_argument(
+        "--no-slice-defer-fin",
+        dest="no_slice_defer_fin",
+        action="store_true",
+        help="this work M5  A/B: restore the Phase-B finish "
+        "fence (MORI_HIER_SLICE_DEFER_FIN=0) instead of deferring "
+        "it to the next op's inter-prepare barrier, to measure "
+        "against the deferred-fence default.",
+    )
+    parser.add_argument(
+        "--slice-defer-inter-fin",
+        dest="slice_defer_inter_fin",
+        action="store_true",
+        help="this work : defer the inter ring's "
+        "finish_stream fence (MORI_HIER_SLICE_DEFER_INTER_FIN=1) "
+        "to the next slice op's prepare_stream barrier, dropping "
+        "one global on-stream fence per op on the non-oop slice "
+        "path. Now DEFAULT ON; flag is a no-op kept for "
+        "back-compat.",
+    )
+    parser.add_argument(
+        "--no-slice-defer-inter-fin",
+        dest="no_slice_defer_inter_fin",
+        action="store_true",
+        help="this work  A/B: restore the inter ring's "
+        "finish_stream fence (MORI_HIER_SLICE_DEFER_INTER_FIN=0) "
+        "instead of deferring it, to measure against the "
+        "deferred-fence default.",
+    )
+    parser.add_argument(
+        "--slice-direct",
+        dest="slice_direct",
+        action="store_true",
+        help="this work M5 : DIRECT-TO-OUTPUT Phase B "
+        "(MORI_HIER_SLICE_DIRECT=1) -- SDMA-PUSH the gathered "
+        "node-blocks straight into the registered user output, "
+        "eliminating the full-output finish_batch copy-OUT. "
+        ": now DEFAULT ON over RDMA (auto-probed via "
+        "shmem_ptr_p2p to a cross-node peer); stays OFF on the "
+        "single-node IPC sim where ShmemSymmetricRegister hard-"
+        "aborts. This flag forces it ON; --no-slice-direct forces "
+        "OFF. +5.4% @64MiB on true xnode (133.7->141.2 GB/s).",
+    )
+    parser.add_argument(
+        "--no-slice-direct",
+        dest="no_slice_direct",
+        action="store_true",
+        help="this work  A/B: restore the full-output "
+        "finish_batch copy-OUT (MORI_HIER_SLICE_DIRECT=0) "
+        "instead of the direct-to-output PUSH default, to "
+        "measure against the direct path.",
+    )
+    parser.add_argument(
+        "--slice-direct-overlap",
+        dest="slice_direct_overlap",
+        action="store_true",
+        help="overlap the LOCAL node-block "
+        "(m=node_id) reassembly gather (no ring dependency) on a "
+        "side stream with the inter ring kernel "
+        "(MORI_HIER_SLICE_DIRECT_OVERLAP=1). Hides ~1/N of Phase B "
+        "under Phase A. Requires the slice_direct stream path.",
+    )
+    parser.add_argument(
+        "--no-slice-direct-overlap",
+        dest="no_slice_direct_overlap",
+        action="store_true",
+        help="Force MORI_HIER_SLICE_DIRECT_OVERLAP=0 for A/B.",
+    )
+    parser.add_argument(
+        "--put-chunk-bytes",
+        type=int,
+        default=None,
+        help="this work transport lever: split each fast-path RDMA "
+        "put into WQEs of at most this many bytes (multiple "
+        "in-flight WQEs/QP). 0/unset = single-WQE default. Set "
+        "into MORI_RDMA_PUT_CHUNK_BYTES before shmem init so the "
+        "C++ transport (read at GpuStateInit) picks it up.",
+    )
+    parser.add_argument(
+        "--fuse-local",
+        dest="fuse_local",
+        action="store_true",
+        help="fuse the LOCAL node-block "
+        "(m=node_id) reassembly gather INTO the inter ring "
+        "kernel as ONE launch (ring blocks || local-gather block, "
+        "no host wait_stream merge) -- MORI_HIER_FUSE_LOCAL=1. "
+        "Ports this proven recv+reassemble parity lever "
+        "(D hit 176 GB/s @64MiB). Requires the slice_direct "
+        "stream path; N==2 only.",
+    )
+    parser.add_argument(
+        "--no-fuse-local",
+        dest="no_fuse_local",
+        action="store_true",
+        help="Force MORI_HIER_FUSE_LOCAL=0 for A/B against the "
+        "shipped slice_direct path.",
+    )
+    parser.add_argument(
+        "--dissem-barrier",
+        dest="dissem_barrier",
+        action="store_true",
+        help="use the dissemination-topology "
+        "global barrier for the inter-ring prepare rendezvous "
+        "(MORI_HIER_DISSEM_BARRIER=1). Same global all-PE "
+        "semantics, O(log n) parallel rounds vs the PE0 funnel.",
+    )
+    parser.add_argument(
+        "--no-dissem-barrier",
+        dest="no_dissem_barrier",
+        action="store_true",
+        help="Force the funnel barrier (MORI_HIER_DISSEM_BARRIER=0) for A/B.",
+    )
     args = parser.parse_args()
 
     if args.dissem_barrier:
@@ -927,8 +1050,11 @@ if __name__ == "__main__":
             _run_torchrun(numels, dtypes, bench=args.bench)
         else:
             test_hier_allgather(
-                world_size=args.world_size, ranks_per_node=args.ranks_per_node,
-                numels=numels, dtypes=dtypes, bench=args.bench,
+                world_size=args.world_size,
+                ranks_per_node=args.ranks_per_node,
+                numels=numels,
+                dtypes=dtypes,
+                bench=args.bench,
             )
     except Exception:
         traceback.print_exc()

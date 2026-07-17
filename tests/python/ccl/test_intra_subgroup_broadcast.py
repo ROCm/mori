@@ -43,6 +43,7 @@ AllGather/broadcast is a pure data move => ZERO tolerance (``torch.equal``).
 import os
 import traceback
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -51,11 +52,17 @@ from mori.ccl import IntraNodeSubGroupBroadcastSdma
 
 from tests.python.utils import TorchDistContext, get_free_port
 
+pytestmark = pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="requires >=2 GPUs"
+)
+
 
 _DEFAULT_DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.int32]
 
 
-def _make_buffer(dtype: torch.dtype, numel: int, root_rank: int, device) -> torch.Tensor:
+def _make_buffer(
+    dtype: torch.dtype, numel: int, root_rank: int, device
+) -> torch.Tensor:
     # Deterministic in the root's global rank so every member can reproduce the
     # expected broadcast payload locally -- no collective needed for the ref.
     base = (root_rank + 1) * 23
@@ -138,7 +145,9 @@ def _spawn_worker(rank, world_size, G, port, numels, dtypes):
         _worker_body(rank, world_size, G, numels, dtypes, device)
 
 
-def test_intra_subgroup_broadcast(world_size=None, ranks_per_node=2, numels=None, dtypes=None):
+def test_intra_subgroup_broadcast(
+    world_size=None, ranks_per_node=2, numels=None, dtypes=None
+):
     """Single-node pytest entry. MORI_SDMA_NUM_CHANNELS=1 sidesteps the SDMA
     multi-queue source/dest offset bug for same-node puts (see test_allgather /
     test_intra_subgroup_sdma)."""
@@ -147,7 +156,9 @@ def test_intra_subgroup_broadcast(world_size=None, ranks_per_node=2, numels=None
     if world_size is None:
         world_size = torch.cuda.device_count()
     assert world_size >= 2, f"need >=2 GPUs, got {world_size}"
-    assert world_size % ranks_per_node == 0, "world must be a multiple of ranks_per_node"
+    assert (
+        world_size % ranks_per_node == 0
+    ), "world must be a multiple of ranks_per_node"
     if numels is None:
         numels = [1024, 1024 * 1024, 16 * 1024 * 1024]
     if dtypes is None:
@@ -164,7 +175,9 @@ def test_intra_subgroup_broadcast(world_size=None, ranks_per_node=2, numels=None
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Bit-exact sub-group intra SDMA broadcast test")
+    parser = argparse.ArgumentParser(
+        description="Bit-exact sub-group intra SDMA broadcast test"
+    )
     parser.add_argument("--world-size", type=int, default=None)
     parser.add_argument("--ranks-per-node", type=int, default=2)
     parser.add_argument("--numels", type=int, nargs="+", default=None)
@@ -177,7 +190,11 @@ if __name__ == "__main__":
         dtypes = [string_to_dtype(args.dtype)]
     else:
         dtypes = _DEFAULT_DTYPES
-    numels = args.numels if args.numels is not None else [1024, 1024 * 1024, 16 * 1024 * 1024]
+    numels = (
+        args.numels
+        if args.numels is not None
+        else [1024, 1024 * 1024, 16 * 1024 * 1024]
+    )
 
     try:
         test_intra_subgroup_broadcast(

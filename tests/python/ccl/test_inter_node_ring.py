@@ -44,6 +44,7 @@ AllGather is a pure data move => ZERO numerical tolerance (``torch.equal``).
 import os
 import traceback
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -51,6 +52,10 @@ import mori.shmem as shmem
 from mori.ccl import InterNodeRingAllgather
 
 from tests.python.utils import TorchDistContext, get_free_port
+
+pytestmark = pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="requires >=2 GPUs"
+)
 
 
 _DEFAULT_DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.int32]
@@ -167,8 +172,9 @@ def _run_torchrun(numels, dtypes):
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     backend = "cpu:gloo,cuda:nccl"
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size,
-                            device_id=device)
+    dist.init_process_group(
+        backend=backend, rank=rank, world_size=world_size, device_id=device
+    )
     world_group = torch.distributed.group.WORLD
     torch._C._distributed_c10d._register_process_group("default", world_group)
     try:
@@ -195,7 +201,9 @@ if __name__ == "__main__":
     else:
         dtypes = _DEFAULT_DTYPES
     numels = (
-        args.numels if args.numels is not None else [1024, 1024 * 1024, 16 * 1024 * 1024]
+        args.numels
+        if args.numels is not None
+        else [1024, 1024 * 1024, 16 * 1024 * 1024]
     )
 
     try:
