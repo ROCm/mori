@@ -57,14 +57,13 @@ _AG_PROFILE = os.environ.get("MORI_FSDP_AG_PROFILE", "") not in (
 _ag_hist: dict[int, int] = {}
 
 # --- per-step deferred-host-sync fence timeline (MORI_FSDP_TAIL_PROFILE=1) ----
-# Director 00:20Z: DIFF the SLOW (tail) steps vs the min-steps -- find what the
-# tail steps do that fast steps don't. The deferred device-path host landing
-# fence (_DeviceDeferredHostSyncWork.wait -> stream.synchronize) is the prime
-# suspect: it BLOCKS the host at each layer's copy-out until the fused fill has
-# landed. If the tail steps spend disproportionately more wall-time inside these
-# fences, the jitter is landing-fence stall (a real, closable lever); if not,
-# it's compute/launch jitter. Accumulate per-call fence wait + count; bench.py
-# reads + resets the accumulator each measured step to correlate with wall-time.
+# Diagnostic: attribute tail-step latency to the deferred device-path host
+# landing fence (_DeviceDeferredHostSyncWork.wait -> stream.synchronize), which
+# blocks the host at each layer's copy-out until the fused fill has landed. If
+# the tail steps spend disproportionately more wall-time inside these fences,
+# the jitter is landing-fence stall; otherwise it is compute/launch jitter.
+# Accumulate per-call fence wait + count; bench.py reads + resets the
+# accumulator each measured step to correlate with wall-time.
 _TAIL_PROFILE = os.environ.get("MORI_FSDP_TAIL_PROFILE", "") not in (
     "",
     "0",
@@ -97,8 +96,9 @@ def _ag_profile_dump() -> None:
 
 
 # --- in-situ per-layer AG-output bit-exact verify (MORI_FSDP_AG_VERIFY=1) --
-# Turn 9: the UT proves the AG kernel is bit-exact + deterministic under a
-# SYNTHETIC overlap pattern, yet FSDP loss drifts (~-0.2%). This probe runs
+# The standalone UT proves the AG kernel is bit-exact + deterministic under a
+# SYNTHETIC overlap pattern; this probe catches the case where FSDP loss drifts
+# (~-0.2%) despite that. It runs
 # INSIDE a real 2-node step: right after the mori copy-out AG fills the
 # rank-major output, it SNAPSHOTS that output at the EARLIEST stream point
 # (output.clone() enqueued immediately after the AG, before any masking
@@ -297,12 +297,12 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
         super().__init__()
         self._stream = stream
         self._collective = collective
-        # T47: optional per-AG event -- when set, wait() host-blocks on THIS AG's
+        # Optional per-AG event -- when set, wait() host-blocks on THIS AG's
         # completion event instead of the whole ag_stream (avoids over-draining a
         # FWD-prefetched later AG queued on the same stream). event.synchronize()
         # is still a host fence, so it drains SDMA/RDMA HW completion (bit-exact).
         self._event = event
-        # T48 fence-group coalescing: back-ref to the MoriAllGather (holds the
+        # Fence-group coalescing: back-ref to the MoriAllGather (holds the
         # shared landing watermark), this AG's monotone issue index, and whether
         # this call is a designated GROUP-boundary fence (does the full stream.sync
         # that drains -- and publishes the watermark for -- the whole group).
@@ -313,22 +313,20 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
 
     def wait(self, timeout=None) -> bool:  # noqa: ARG002
         if not self._done:
-            # Turn41 async completion-ordering fix: if the composition ran the
-            # inter leg on an off-thread async worker (HOSTPROXY_ASYNC), JOIN it
-            # first so every chunkReadyFlag is published+landed BEFORE this fence
-            # gates the consumer. Without this the caller-stream synchronize can
-            # fire while the worker is still publishing a later AG's flags ->
-            # reassembly reads stale flags -> loss drifts (Turn40 -0.0044).
-            # Turn41: join any live async host-proxy worker so its chunkReadyFlags
-            # are published+landed before we gate the consumer (cut drift
-            # -0.0044->-0.0006). A device-wide synchronize on the composition path
-            # was tried and REGRESSED (async residual is a nondeterministic race,
-            # not a caller-stream-ordering gap), so we keep the cheaper caller-
-            # stream fence. Pure crown is unaffected (drain is a no-op).
+            # Async completion-ordering: if the composition ran the inter leg on
+            # an off-thread async worker (HOSTPROXY_ASYNC), JOIN it first so every
+            # chunkReadyFlag is published+landed BEFORE this fence gates the
+            # consumer. Without this the caller-stream synchronize can fire while
+            # the worker is still publishing a later AG's flags -> reassembly reads
+            # stale flags -> loss drifts. A device-wide synchronize on the
+            # composition path was tried and REGRESSED (the async residual is a
+            # nondeterministic race, not a caller-stream-ordering gap), so we keep
+            # the cheaper caller-stream fence. Pure crown is unaffected (drain is a
+            # no-op).
             drain = getattr(self._collective, "drain_hostproxy", None)
             if drain is not None:
                 drain()
-            # T48 fence-group coalescing (only when an ag back-ref + group>1):
+            # Fence-group coalescing (only when an ag back-ref + group>1):
             #   * a NON-boundary member whose issue index the landing watermark
             #     already covers => its bytes were drained by an earlier full
             #     stream.sync => SKIP the host fence (no-op) => the coalesced win.
@@ -353,11 +351,11 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
                 _ag._fence_watermark = _ag._issue_ctr - 1
                 self._done = True
                 return True
-            # T32 deferstream: replace the deferred HOST fence with a DEVICE
-            # inter-stream wait. T31 (BDF fix, clean GPUs 4-7) proved the UT
-            # collective is at parity (fp32 0.99-1.06x) while the E2E crown is
-            # 0.84x native -- the ~16% tax is THIS host stall (event/stream
-            # .synchronize blocks the CPU mid-pipeline), NOT the SDMA transport.
+            # Deferred-stream path: replace the deferred HOST fence with a DEVICE
+            # inter-stream wait. The standalone UT collective is at parity (fp32
+            # 0.99-1.06x) while the E2E path is 0.84x native -- the ~16% tax is
+            # THIS host stall (event/stream .synchronize blocks the CPU
+            # mid-pipeline), NOT the SDMA transport.
             # A device wait_event enqueues a stream-ordered dependency of the
             # consumer (current/compute stream) on the big-AG completion event
             # WITHOUT blocking the CPU, so the CPU keeps running ahead to
@@ -376,7 +374,7 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
                 )
                 self._done = True
                 return True
-            # T47: per-AG event fence (host-wait on this AG only) if provided,
+            # Per-AG event fence (host-wait on this AG only) if provided,
             # else the full-stream drain.
             _fence = (
                 self._event.synchronize
@@ -458,8 +456,8 @@ class MoriAllGather(AllGather):
                     _sd("MORI_HIER_DEEP_PIPE", "auto")
                     _sd("MORI_SDMA_NUM_CHANNELS", "8")
                 else:
-                    # rpn >= 8 (world>=16, 8 GPU/node) CORRECTNESS gate (Team A
-                    # Turn 2). At 8 ranks/node the zero-copy param-contiguous
+                    # rpn >= 8 (world>=16, 8 GPU/node) CORRECTNESS gate.
+                    # At 8 ranks/node the zero-copy param-contiguous
                     # scatter (enqueue_param_contiguous) produces UNIFORM-garbage
                     # output (loss stuck at ln(vocab); works at rpn==4/w8), and the
                     # copy-out __call__'s HIP-graph capture poisons the HIP context
@@ -522,7 +520,7 @@ class MoriAllGather(AllGather):
             "false",
             "False",
         )
-        # ASYNC correctness defaults (Team A Turn 9). The deferred-completion path is
+        # ASYNC correctness defaults. The deferred-completion path is
         # bit-exact + >native (269 TFLOPS = 1.07x, vs sync 232) ONLY with BOTH of:
         #   * ASYNC_DRAIN: host-drain the AG stream after _complete so step-3 (the
         #     remote-half broadcast) is landed+visible before FSDP's copy-out reads
@@ -959,7 +957,7 @@ class MoriAllGather(AllGather):
         # overlaps the caller's backward GEMM (the async-overlap dividend on the
         # FAST fused fill). Skips the inline _sync_big_bytes host stall.
         if self._defer_hostsync:
-            # Only the big embed/lm_head AGs race on this HW (Turn 17); small
+            # Only the big embed/lm_head AGs race on this HW; small
             # per-layer AGs are fenced sufficiently by the fused kernel's
             # on-stream completion + FSDP's own recorded event. A host sync on
             # EVERY small AG is wasted host stall. When MORI_FSDP_SYNC_BIG_BYTES
@@ -972,7 +970,7 @@ class MoriAllGather(AllGather):
                     # later prefetched AG is queued) so wait() drains only L.
                     _ev = torch.cuda.Event()
                     _ev.record(stream)
-                # T48: assign a monotone issue index; every K-th AG is a group
+                # Assign a monotone issue index; every K-th AG is a group
                 # fence boundary (does the full drain + advances the watermark).
                 _idx = self._issue_ctr
                 self._issue_ctr += 1
@@ -1186,7 +1184,7 @@ class TimedDefaultAllGather(AllGather):
     collective (``all_gather_into_tensor``) but brackets it with the SAME
     cuda-event per-call timer used by ``MoriAllGather`` (MORI_FSDP_AG_TIMING).
 
-    Purpose (Turn 12 disambiguation): measure native's per-AG GPU time UNDER the
+    Purpose: measure native's per-AG GPU time UNDER the
     identical FSDP overlap/prefetch schedule, apples-to-apples with the mori
     per-AG numbers. If native per-AG ~= mori per-AG -> both hidden behind compute
     (benign overlap-sharing, gap is step scheduling); if native per-AG is much
