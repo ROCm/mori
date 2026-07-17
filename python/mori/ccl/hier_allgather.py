@@ -44,7 +44,7 @@ from typing import List, Optional, Sequence
 
 import torch
 
-# HARDWARE SDMA CHANNEL CAP (T47 A, measured MI300X/115-119): the per-GPU SDMA
+# HARDWARE SDMA CHANNEL CAP (measured on MI300X): the per-GPU SDMA
 # queue-slot count caps MORI_SDMA_NUM_CHANNELS at 8 -- requesting 12 or 16
 # CRASHES at SDMA queue creation (anvil.cpp:228 hsaKmtCreateQueueExt "Failed",
 # queue-slot exhaustion, NOT an engine-id error). anvil reads this env at shmem
@@ -69,8 +69,7 @@ def _clamp_sdma_channels():
         print(
             "[hier_fill] MORI_SDMA_NUM_CHANNELS=%s exceeds the MI300X SDMA "
             "queue-slot cap (%d); clamping to %d to avoid the anvil.cpp:228 "
-            "queue-creation crash (T47 A)."
-            % (_v, MORI_SDMA_CH_HW_MAX, MORI_SDMA_CH_HW_MAX),
+            "queue-creation crash." % (_v, MORI_SDMA_CH_HW_MAX, MORI_SDMA_CH_HW_MAX),
             flush=True,
         )
 
@@ -361,7 +360,7 @@ class HierAllGather:
         # per QP" hypothesis from the SLICE direction.  tested putChunkBytes
         # (MORI_RDMA_PUT_CHUNK_BYTES splits one QP's RDMA write into K in-flight
         # WQEs) on the NON-sliced single-QP path (whole 256MiB node-block, 1 QP)
-        # and found it neutral/negative -- but that was BEFORE the Turn-17 4-QP
+        # and found it neutral/negative -- but that was before the 4-QP
         # fan-out existed, so it was never re-measured on the shipped slice path
         # where each QP already carries only peChunkSize/numQp (16MiB @64MiB/rank,
         # 4 QPs). Re-ran the combo on the shipped slice_direct path (true xnode
@@ -693,7 +692,7 @@ class HierAllGather:
         # stages changes, never the output bytes.
         sps = os.environ.get("MORI_HIER_SLICE_PIPE_SPLIT")
         self.slice_pipe_split = float(sps) if sps not in (None, "") else None
-        # M5: the rule#1 PAYOFF of the Turn-8 strided-gather enabler --
+        # Strided-gather enabler:
         # CHUNK THE INTER RING into K pipeline stages and OVERLAP each chunk's
         # Phase-B reassembly gather (on a side SDMA stream) with the NEXT chunk's
         # inter RDMA ring (on the main stream). Because the ring's prepare/finish
@@ -757,7 +756,7 @@ class HierAllGather:
         # Phase-B still ends with finish_batch = bulk copy-OUT + host
         # hipStreamSynchronize + host ShmemBarrierAll -- the LAST host CPU<->GPU
         # round-trip in the op. Replace it with finish_batch_stream
-        # (ShmemBarrierOnStream) so, paired with the Turn-10 stream_ring, the
+        # (ShmemBarrierOnStream) so, paired with the stream_ring, the
         # whole op (inter ring + Phase-B gathers + copy-OUT) is fully on-stream
         # with NO host stall. Only the default fused non-overlap, non-pipe slice
         # path uses it. Default ON; set MORI_HIER_STREAM_INTRA=0 /
@@ -801,9 +800,8 @@ class HierAllGather:
         # successor. The copy-OUT into the scratch collection stays stream-ordered
         # (Phase B reads a correct collection regardless); only the cross-PE reuse
         # fence is deferred. Mirrors slice_defer_fin (Phase-B, ). Only on
-        # the non-oop slice path (stream_ring). now DEFAULT ON
-        # after the Turn-17 A/B validated it (+0.85-1.0%, 141->142.3 GB/s, both
-        # bit-exact, 2 pairs reproduced) -- same safety class as slice_defer_fin
+        # the non-oop slice path (stream_ring). DEFAULT ON
+        # (validated +0.85-1.0%, bit-exact) -- same safety class as slice_defer_fin
         # (already default ON since ): the successor's prepare_stream fence
         # guards cross-PE ring reuse; the last op (no successor) reuses nothing and
         # its copy-OUT is stream-ordered; the size-dispatcher's path switch resets
@@ -838,7 +836,7 @@ class HierAllGather:
         # inter ring. So run it on a SIDE stream CONCURRENTLY with the ring kernel,
         # hiding ~1/N of Phase B (~1.25ms for N=2) under Phase A (~1.6ms).
         #
-        # SAFETY (distinct from the Turn-24 pairwise-barrier race): the shipped
+        # SAFETY (distinct from the pairwise-barrier race): the shipped
         # non-overlap direct path's SOLE global entry barrier is ALREADY the ring's
         # prepare_stream ShmemBarrierOnStream (its finish is deferred via
         # slice_defer_inter_fin and the direct gathers skip their entry barrier via
@@ -869,7 +867,7 @@ class HierAllGather:
         self.slice_direct_overlap = os.environ.get(
             "MORI_HIER_SLICE_DIRECT_OVERLAP", "0"
         ) not in ("0", "", "false", "False")
-        # T15 (director T94 #1 assignment) MULTI-STREAM Phase-B reassembly.
+        # MULTI-STREAM Phase-B reassembly.
         # The N disjoint slice_fused reassembly gathers currently run SERIALLY on
         # one stream, so at most one OneShotAllGatherSdmaSubGroupKernel drives the
         # SDMA copy engines at a time. Each gather writes a DISJOINT node-block
@@ -889,7 +887,7 @@ class HierAllGather:
         # (local block folded into the ring), so this lever is a NO-OP there; it
         # engages on the plain fused-direct path (all N gathers in Phase B) and at
         # N>2. Measures whether concurrent gathers beat the ~305 GB/s XGMI
-        # reassembly wall (T14 engine-fan WITHIN a gather was fabric-bound; this
+        # reassembly wall (engine-fan WITHIN a gather was fabric-bound; this
         # tests whether MULTIPLE gathers in flight lift utilization).
         try:
             self.reasm_streams = int(os.environ.get("MORI_HIER_REASM_STREAMS", "1"))
@@ -933,16 +931,14 @@ class HierAllGather:
         # so the shipped default is the serial direct path until the fused
         # kernel's ring-completion visibility to the finish readers is fixed
         # on-device. Opt back in with MORI_HIER_FUSE_LOCAL=1 for standalone A/B.
-        # UT GATE-1 RE-CONFIRMED (Turn-4 Phase-5, 2026-07-07, cross-rack
-        # n09-33+n08-29, bench_sweep world=8 N=2 G=4, reps=3, bitexact=True all
-        # points): MORI_HIER_FUSE_LOCAL=1 BEATS RCCL at every size >=32MiB in both
-        # dtypes -- fp32 1.148-1.295x (256/128/64/32MiB = 200.9/202.5/196.2/182.3
-        # GB/s vs 174.9/171.9/155.2/140.8), bf16 1.152-1.291x. The default serial
-        # path (this OFF) is 143/141 GB/s = 0.815/0.885x. So the standalone UT
+        # In the standalone benchmark (world=8 N=2 G=4, bit-exact),
+        # MORI_HIER_FUSE_LOCAL=1 beats RCCL at every size >=32MiB in both
+        # dtypes (fp32 1.148-1.295x, bf16 1.152-1.291x); the default serial
+        # path (this OFF) is ~0.815/0.885x. So the standalone UT
         # requirement (ratio>=1.0x, bit-exact) is MET by this path; the ONLY reason
         # it is not the shipped default is the E2E copy-engine-finish stale-remote
-        # race above (BANNED to chase this phase). Refuted same turn:
-        # MORI_SHMEM_HEAP_TYPE=normal (cached ring buffer) = 143 GB/s, identical to
+        # race above. Note:
+        # MORI_SHMEM_HEAP_TYPE=normal (cached ring buffer) is identical to
         # uncached => RDMA DMA is unaffected by the ring cache attribute. Also moot:
         # the "leader-only ring + XGMI broadcast" redundancy killer -- the default
         # slice path already sends 1 shard/NIC ((N-1)*count, the minimum), so no
@@ -1085,7 +1081,7 @@ class HierAllGather:
             "False",
         )
         self._chunk_ready_flags = None
-        # Cross-size carryover guard (Turn15 A): the exact DEEP_PIPE flag layout
+        # Cross-size carryover guard: the exact DEEP_PIPE flag layout
         # (slots, per-PE count, pipe depth) the persistent buffer was last sized
         # for. A layout CHANGE forces a fresh zeroed buffer so stale per-sub-chunk
         # landing state can't leak into the next distinct size (see the fuse_remote
@@ -1362,7 +1358,7 @@ class HierAllGather:
         self._sync_big_prev_event = None
         # DEFERRED host-drain state (SYNC_BIG_MODE=deferhost): the completion
         # event of the last big AG, host-drained by the harness Work.wait() at
-        # the consume point instead of at issue (director 2026-07-08T18:26Z).
+        # the consume point instead of at issue.
         self._deferred_drain_event = None
         self._deferred_drain_pending = False
         # DEFERBWD: the in-tree counterpart of the harness-only
@@ -1542,8 +1538,8 @@ class HierAllGather:
                 # n09-21+n09-29, N=2 G=4, fp32 64MiB/rank, >=3 reps, A/B same
                 # binary, both bit-exact): leader-only 29.8 GB/s vs
                 # every-rank-direct 63.8 GB/s -> 2.1x SLOWER. Reason: these MI355X
-                # nodes have ONE ionic NIC PER GPU (8/node). The Turn-18 "G x
-                # redundant NIC traffic" framing was misleading -- the per-NIC
+                # nodes have ONE ionic NIC PER GPU (8/node). The "G x
+                # redundant NIC traffic" framing is misleading -- the per-NIC
                 # byte load is IDENTICAL for both designs (each ring member, leader
                 # or not, pushes (N-1) chunks of G*count over ITS OWN NIC).
                 # every-rank-direct runs G rings on G distinct NICs in parallel
@@ -1609,7 +1605,7 @@ class HierAllGather:
             # backward AGs. The consecutive big embed/lm_head AGs alternate output
             # buffers; on the fast contiguous copy-out path they SHARE the single
             # _slice_scratch with a DEFERRED finish fence, so AG#2's ring copy-IN
-            # can clobber _slice_scratch before AG#1's copy-OUT drains it (the T28
+            # can clobber _slice_scratch before AG#1's copy-OUT drains it (the
             # scratch-reuse staleness). Two dedicated buffers, alternated per big
             # AG, break that reuse without touching the fast per-op path.
             self._big_scratch = [None, None]
@@ -1714,7 +1710,7 @@ class HierAllGather:
     def drain_hostproxy(self):
         """Join any in-flight async host-proxy inter worker so ALL chunkReadyFlags
         for the AGs issued so far are published+landed. Called by the deferred FSDP
-        consumer fence (Turn41 async completion-ordering fix). No-op unless the
+        consumer fence (async completion-ordering fix). No-op unless the
         async host-proxy producer is live."""
         hp = getattr(self, "_hp_inter", None)
         if hp is not None:
@@ -1871,7 +1867,7 @@ class HierAllGather:
         )
 
     def _get_reasm_pool(self, device):
-        # T15: lazily allocate the side-stream pool for MULTI-STREAM Phase-B
+        # Lazily allocate the side-stream pool for MULTI-STREAM Phase-B
         # reassembly (MORI_HIER_REASM_STREAMS). Pool size = reasm_streams-1 side
         # streams (the main stream is the first "lane"). Cached on the instance.
         n_side = self.reasm_streams - 1
@@ -1884,7 +1880,7 @@ class HierAllGather:
         return self._reasm_stream_pool[:n_side]
 
     def _multistream_gathers(self, gathers, main, device):
-        # T15: run a list of Phase-B reassembly gathers concurrently across the
+        # Run a list of Phase-B reassembly gathers concurrently across the
         # main stream + a side-stream pool. ``gathers`` is a list of zero-arg
         # callables, each issuing exactly one gather_kernel_direct on the stream it
         # is given (bound below). Ordering: the FIRST gather runs on ``main`` (it
