@@ -46,17 +46,17 @@ esac
 PLATFORM="${PLATFORM:-mi300x_mlx5}"
 case "$PLATFORM" in
   mi300x_mlx5)   # MI300X + Mellanox mlx5 (RoCEv2 on GID 3)
-    : "${MASTER:=useocpm2m-097-040}"; : "${WORKER:=useocpm2m-097-083}"; : "${MASTER_IP:=10.158.213.159}"
+    : "${MASTER:=<master>}"; : "${WORKER:=<worker>}"; : "${MASTER_IP:=<master-ip>}"
     : "${IFACE:=eth0}"; : "${NCCL_IB_GID_INDEX:=3}"
     : "${MORI_RDMA_DEVICES:=mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9}" ;;
   mi355x_ainic)  # MI355X + AINIC (ionic RoCEv2 on GID 1)
-    : "${MASTER:=smci355-ccs-aus-n09-33.prov.aus.ccs.cpe.ice.amd.com}"
-    : "${WORKER:=smci355-ccs-aus-n09-29.prov.aus.ccs.cpe.ice.amd.com}"; : "${MASTER_IP:=10.235.192.86}"
+    : "${MASTER:=<ionic-master>}"
+    : "${WORKER:=<ionic-worker>}"; : "${MASTER_IP:=<ionic-master-ip>}"
     : "${IFACE:=enp81s0f1}"; : "${NCCL_IB_GID_INDEX:=1}"
     : "${MORI_RDMA_DEVICES:=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7}" ;;
   *) echo "PLATFORM must be mi300x_mlx5 or mi355x_ainic"; exit 2 ;;
 esac
-CTR="${CTR:-mori-sglang-mingzhi}"
+CTR="${CTR:-<container>}"
 WT="${MORI_REPO:-$(cd "$(dirname "$0")/../../../.." && pwd)}"
 EX="$WT/examples/fsdp_sdma"
 CFG="${QWEN_CFG:-$(cd "$(dirname "$0")" && pwd)/qwen7b_vocab32000}"

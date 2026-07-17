@@ -16,8 +16,8 @@
 set -u
 GEMM_N="${1:-2048}" ; SIZE_MB="${2:-8}" ; NOPS="${3:-50}"
 
-MASTER="${MASTER:-useocpm2m-097-040}" ; MASTER_IP="${MASTER_IP:-10.158.213.159}" ; WORKER="${WORKER:-useocpm2m-097-083}"
-CTR="${CTR:-mori-sglang-mingzhi}"
+MASTER="${MASTER:-<master>}" ; MASTER_IP="${MASTER_IP:-<master-ip>}" ; WORKER="${WORKER:-<worker>}"
+CTR="${CTR:-<container>}"
 WT="${MORI_REPO:-$(cd "$(dirname "$0")/../../../.." && pwd)}"   # repo root (from bench/scripts/)
 OUT="${OUT:-$WT/examples/fsdp_sdma/bench/results/mi300x_mlx5/raw}" ; mkdir -p "$OUT"
 IFACE="${IFACE:-eth0}"

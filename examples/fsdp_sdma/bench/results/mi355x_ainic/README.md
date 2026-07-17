@@ -21,8 +21,8 @@ NIC (the sibling results elsewhere in `bench/results/` are MI300X + mlx5).
   GPU-initiated device ring's post/poll occupies CUs and loses this overlap; host-proxy
   recovers it.) Bulk AllGather bytes stay on RDMA/SDMA — no CU copy.
 
-Files: `e2e_w16_native.log`, `e2e_w16_hostproxy.log` (raw run logs),
-`e2e_w16_tflops.png`, `e2e_w16_loss.png`, `plot_mi355x_ainic.py` (regenerates the figures).
+Files: `raw/e2e_w16_RCCL.log`, `raw/e2e_w16_hp_sdma.log` (raw run logs),
+`e2e_w16_tflops.png`, `e2e_w16_loss.png`, `raw/plot_mi355x_ainic.py` (regenerates the figures).
 
 ## How to reproduce
 
@@ -37,18 +37,18 @@ No overrides needed; the defaults target the mlx5 cluster:
 cd examples/fsdp_sdma/bench/scripts
 bash run_e2e.sh                 # WORLD=w16, 500 steps, mlx5, eth0, GID 3
 ```
-(defaults: `MASTER=useocpm2m-097-040 WORKER=useocpm2m-097-083 IFACE=eth0`
+(defaults: `MASTER=<master> WORKER=<worker> IFACE=eth0`
 `MORI_RDMA_DEVICES=mlx5_0,2,3,4,5,7,8,9 NCCL_IB_GID_INDEX=3`.)
 
 ### B) MI355X + AINIC (ionic) way — this result
-Same script, override the node pair + NIC env for ionic. Containers named
-`mori-sglang-mingzhi` must be up on both nodes; `/apps/mingzliu` bind-mounted; the
+Same script, override the node pair + NIC env for ionic. The benchmark
+container must be up on both nodes with the workspace bind-mounted; the
 ionic RDMA provider installed in the container.
 ```bash
 cd examples/fsdp_sdma/bench/scripts
-MASTER=smci355-ccs-aus-n09-33.prov.aus.ccs.cpe.ice.amd.com \
-WORKER=smci355-ccs-aus-n09-29.prov.aus.ccs.cpe.ice.amd.com \
-MASTER_IP=10.235.192.86 \
+MASTER=<ionic-master> \
+WORKER=<ionic-worker> \
+MASTER_IP=<ionic-master-ip> \
 IFACE=enp81s0f1 \
 MORI_RDMA_DEVICES=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7 \
 NCCL_IB_GID_INDEX=1 \
