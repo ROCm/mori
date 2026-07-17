@@ -1,5 +1,26 @@
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
 # HOST-PROXY INTER-NODE PRODUCER for the fused-ring reassembly consumer.
 #
 # The device fused-ring giant-AG kernel (FusedRingRemoteGatherKernel_u32) splits
@@ -60,22 +81,22 @@ class HostProxyInterProducer:
     barriers, then publishes the reassembly landing flags for the received chunk.
     """
 
-    # Process-wide SHARED engine (Turn39 A fix — composition IOEngine reuse).
+    # Process-wide SHARED engine (composition IOEngine reuse).
     # FSDP builds a SEPARATE HierAllGather per param group (root embed+lm_head AND
     # every decoder layer), so with MORI_HIER_HOSTPROXY_REASM=1 a process would
     # otherwise stand up ~29 DISTINCT host ibverbs IOEngines, each with its own
     # RDMA backend + QPs + bootstrap listener, ALL coexisting with crown's device
     # IBGDA shmem stack on the same 8 mlx5 NICs. That dual-stack fan-out is the
-    # documented nondeterministic bootstrap hang (Turn36-38): create_backend
+    # documented nondeterministic bootstrap hang: create_backend
     # handshakes race, QP/NIC resources contend. Fix: ONE shared engine+backend
     # per process; each producer instance only registers ITS ring buffer as a new
     # MemoryDesc + creates a session against the partner's matching ring mem. The
     # engine + partner remote-engine registration happen exactly once. This
     # collapses ~29 coexisting engines -> 1 (director 22:26Z: "producer must REUSE
     # crown's IOEngine, not open a coexisting one").
-    _shared_engine = None          # the one process-wide IOEngine
-    _partner_registered = False     # partner's engine desc registered once
-    _pair_barriers = None           # cached rail-pair group (built once)
+    _shared_engine = None  # the one process-wide IOEngine
+    _partner_registered = False  # partner's engine desc registered once
+    _pair_barriers = None  # cached rail-pair group (built once)
     _instance_seq = 0
 
     @classmethod
@@ -92,6 +113,7 @@ class HostProxyInterProducer:
             PollCqMode,
             set_log_level,
         )
+
         if cls._shared_engine is not None:
             return
         set_log_level("error")
@@ -130,7 +152,9 @@ class HostProxyInterProducer:
                         cur_port = port + _t * npes
                         cfg = IOEngineConfig(host=my_ip, port=cur_port)
                         eng = IOEngine(key=f"hpinter-{my_pe}", config=cfg)
-                        dbglog(f"shared create_backend begin (port={cur_port} try={_t})")
+                        dbglog(
+                            f"shared create_backend begin (port={cur_port} try={_t})"
+                        )
                         eng.create_backend(BackendType.RDMA, rcfg)
                         dbglog("shared create_backend done")
                         last_exc = None
@@ -176,11 +200,16 @@ class HostProxyInterProducer:
         )
 
         self._StatusCode = StatusCode
-        self._dbg = os.environ.get("MORI_HOSTPROXY_DEBUG", "0") not in ("0", "", "false")
+        self._dbg = os.environ.get("MORI_HOSTPROXY_DEBUG", "0") not in (
+            "0",
+            "",
+            "false",
+        )
 
         def _dbg(msg):
             if self._dbg:
                 import sys as _s
+
                 _s.stderr.write(f"[hpinter pe{my_pe}] {msg}\n")
                 _s.stderr.flush()
 
@@ -200,7 +229,8 @@ class HostProxyInterProducer:
         if self.num_nodes != 2:
             raise NotImplementedError(
                 "HostProxyInterProducer supports exactly 2 nodes "
-                f"(got num_nodes={self.num_nodes})")
+                f"(got num_nodes={self.num_nodes})"
+            )
 
         other_node = 1 - self.node_id
         self._partner = other_node * ranks_per_node + self.local_rank
@@ -213,8 +243,7 @@ class HostProxyInterProducer:
         # Build the ONE shared engine + backend + partner registration (once).
         _inst = HostProxyInterProducer._instance_seq
         HostProxyInterProducer._instance_seq += 1
-        self._ensure_shared_engine(
-            my_pe, npes, ranks_per_node, self._partner, _dbg)
+        self._ensure_shared_engine(my_pe, npes, ranks_per_node, self._partner, _dbg)
         self._engine = HostProxyInterProducer._shared_engine
 
         # Per-instance: register THIS ring buffer + create a session against the
@@ -222,7 +251,8 @@ class HostProxyInterProducer:
         # producer; the engine/backend/partner-engine are shared.
         dev_id = torch.cuda.current_device()
         self._local_mem = self._engine.register_memory(
-            self._ring_ptr, self._ring_bytes, dev_id, MemoryLocationType.GPU)
+            self._ring_ptr, self._ring_bytes, dev_id, MemoryLocationType.GPU
+        )
         my_mdesc = self._local_mem.pack()
         all_mdesc = [None] * npes
         dist.all_gather_object(all_mdesc, my_mdesc)
@@ -245,8 +275,8 @@ class HostProxyInterProducer:
         # per-AG latency AND thread-safe for async fill. gen stays rank-synced
         # because E2E AGs fire in deterministic order. Default OFF => collective.
         self._inter_flag = os.environ.get(
-            "MORI_HIER_HOSTPROXY_INTER_FLAG", "0") not in (
-            "0", "", "false", "False")
+            "MORI_HIER_HOSTPROXY_INTER_FLAG", "0"
+        ) not in ("0", "", "false", "False")
         self._flag_gen = 0
         self._flag_session = None
         # async worker (MORI_HIER_HOSTPROXY_ASYNC), lazily started in fill_async.
@@ -255,9 +285,11 @@ class HostProxyInterProducer:
         self._worker_exc = None
         if self._inter_flag:
             self._flag_recv = torch.zeros(
-                1, dtype=torch.int64, device="cpu").pin_memory()
+                1, dtype=torch.int64, device="cpu"
+            ).pin_memory()
             self._flag_send = torch.zeros(
-                1, dtype=torch.int64, device="cpu").pin_memory()
+                1, dtype=torch.int64, device="cpu"
+            ).pin_memory()
             frecv_mem = self._engine.register_torch_tensor(self._flag_recv)
             fsend_mem = self._engine.register_torch_tensor(self._flag_send)
             my_fr = frecv_mem.pack()
@@ -265,14 +297,14 @@ class HostProxyInterProducer:
             dist.all_gather_object(all_fr, my_fr)
             dist.barrier()
             partner_fr = MemoryDesc.unpack(all_fr[self._partner])
-            self._flag_session = self._engine.create_session(
-                fsend_mem, partner_fr)
+            self._flag_session = self._engine.create_session(fsend_mem, partner_fr)
             dist.barrier()
             _dbg("barrier-free inter flag session ready")
         _dbg(f"ctor done (inst={_inst}, shared engine reused)")
 
-    def fill_async(self, chunk_bytes, deep_pipe, flags, src_ready_event=None,
-                   stream=None):
+    def fill_async(
+        self, chunk_bytes, deep_pipe, flags, src_ready_event=None, stream=None
+    ):
         """ASYNC overlap (MORI_HIER_HOSTPROXY_ASYNC): submit the (now
         collective-free, barrier-free-flag) inter leg to a persistent background
         worker and return IMMEDIATELY so the main Python thread keeps issuing the
@@ -288,20 +320,19 @@ class HostProxyInterProducer:
         if self._flag_session is None:
             raise RuntimeError(
                 "HOSTPROXY_ASYNC requires MORI_HIER_HOSTPROXY_INTER_FLAG=1 "
-                "(the collective barrier cannot run off the main thread)")
+                "(the collective barrier cannot run off the main thread)"
+            )
         if self._worker is None:
             self._worker_q = _queue.Queue()
             self._worker_exc = None
-            self._worker = threading.Thread(
-                target=self._worker_loop, daemon=True)
+            self._worker = threading.Thread(target=self._worker_loop, daemon=True)
             self._worker.start()
         # surface any prior async failure on the issuing thread.
         if self._worker_exc is not None:
             e = self._worker_exc
             self._worker_exc = None
             raise e
-        self._worker_q.put(
-            (chunk_bytes, deep_pipe, flags, src_ready_event, stream))
+        self._worker_q.put((chunk_bytes, deep_pipe, flags, src_ready_event, stream))
 
     def _worker_loop(self):
         while True:
@@ -409,11 +440,11 @@ class HostProxyInterProducer:
             fst = self._flag_session.write(0, 0, 8, uid)
             self._engine.wait_all([fst], self._timeout_ms)
             import time as _time
+
             deadline = _time.perf_counter() + self._timeout_ms / 1000.0
             while self._flag_recv[0].item() < gen:
                 if _time.perf_counter() > deadline:
-                    raise RuntimeError(
-                        f"HostProxyInter flag timeout gen={gen}")
+                    raise RuntimeError(f"HostProxyInter flag timeout gen={gen}")
             self._dbglog("fill p2p flag landed")
         else:
             # single rail-pair barrier: partner's writes into MY ring slot landed.

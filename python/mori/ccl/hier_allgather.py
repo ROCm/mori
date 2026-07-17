@@ -319,8 +319,8 @@ class HierAllGather:
         # neighbours; single-node sims fall back to one working block. Default 1
         # == unchanged single-block ring. Toggle via env MORI_HIER_RING_BLOCKS.
         #
-        # VALIDATED-NEGATIVE (, true xnode n09-21+n09-29, N=2 G=4 fp32
-        # 64MiB/rank, >=3 reps, A/B same binary, BOTH bit-exact vs torch
+        # Validated negative on true cross-node RDMA (N=2 G=4 fp32
+        # 64MiB/rank, both bit-exact vs torch
         # all_gather_into_tensor): the inter (RDMA ring) phase did NOT improve:
         #   num_blocks=1 (4-QP fan-out in 1 CTA): inter min ~7.25-7.35ms, ~49.9 GB/s
         #   num_blocks=4 (1 QP per CTA, 4 CTAs):  inter min ~7.71ms,       ~46.8 GB/s
@@ -341,10 +341,10 @@ class HierAllGather:
         # src/shmem/init.cpp ConfigureHeapType; the same uncached write that made
         # the copy-IN elimination neutral in -24). If the NIC read from
         # cached HBM were faster, MORI_SHMEM_HEAP_TYPE=normal would lift the ring.
-        # VALIDATED-NEGATIVE (true xnode n09-21+n09-29, N=2 G=4 fp32 64MiB/rank,
-        # >=3 reps, A/B same binary, BOTH bit-exact vs torch all_gather_into_tensor):
-        #   uncached (default): mori 8.864ms 60.6 GB/s | inter 6.93ms | rccl 141.9
-        #   normal   (cached):  mori 8.617ms 62.3 GB/s | inter 6.86ms | rccl 143.2
+        # Validated negative on true cross-node RDMA (N=2 G=4 fp32 64MiB/rank,
+        # both bit-exact vs torch all_gather_into_tensor):
+        #   uncached (default): mori ~60.6 GB/s | inter 6.93ms | rccl 141.9
+        #   normal   (cached):  mori ~62.3 GB/s | inter 6.86ms | rccl 143.2
         # => +2.8% end-to-end, within noise; the inter (RDMA ring) phase is
         # UNCHANGED (6.93 vs 6.86ms). So the NIC source-read memory type is NOT the
         # bottleneck -- this confirms the  conclusion from the other
@@ -363,9 +363,9 @@ class HierAllGather:
         # and found it neutral/negative -- but that was before the 4-QP
         # fan-out existed, so it was never re-measured on the shipped slice path
         # where each QP already carries only peChunkSize/numQp (16MiB @64MiB/rank,
-        # 4 QPs). Re-ran the combo on the shipped slice_direct path (true xnode
-        # n08-21+n08-33, N=2 G=4 fp32 64MiB/rank, reps=5 min/avg, A/B same binary,
-        # BOTH bit-exact vs torch all_gather_into_tensor):
+        # 4 QPs). Re-ran the combo on the shipped slice_direct path (true
+        # cross-node, N=2 G=4 fp32 64MiB/rank, both bit-exact vs torch
+        # all_gather_into_tensor):
         #   chunk OFF (1 WQE/QP):   mori min=3.807ms 141.0 GB/s | rccl 3.575 150.2 | 1.06x
         #   chunk 4MiB (4 WQE/QP):  mori min=3.812ms 140.8 GB/s | rccl 3.507 153.1 | 1.09x
         # => NEUTRAL (-0.1% mori-side, pure noise; rccl draw differs). Pipelining
@@ -415,8 +415,8 @@ class HierAllGather:
         # Default OFF: the proven staged path (writes the user output) stays the
         # default; out-in-place changes the result-delivery contract (read
         # ``result_tensor``), so it is opt-in only.
-        # TRUE-XNODE A/B (, n09-21+n09-29, N=2 G=4 fp32 64MiB/rank, >=3
-        # reps, BOTH bit-exact vs torch.all_gather_into_tensor):
+        # True cross-node A/B (N=2 G=4 fp32 64MiB/rank, both bit-exact vs
+        # torch.all_gather_into_tensor):
         #   default (copy-OUT)  8.366ms 64.2 GB/s
         #   out-in-place        8.152ms 65.9 GB/s   (+2.6%)
         #   rccl                3.574ms 150.2 GB/s
@@ -453,8 +453,8 @@ class HierAllGather:
         # OFF (env MORI_HIER_FUSE_BARRIER); applies only to the every-rank-direct
         # path (not leader-only).
         #
-        # TRUE-XNODE A/B (, n09-21+n09-29, RDMA over ionic, N=2 G=4 fp32,
-        # >=3 reps, A/B same binary, BOTH bit-exact vs torch.all_gather_into_tensor):
+        # True cross-node A/B (RDMA, N=2 G=4 fp32,
+        # both bit-exact vs torch.all_gather_into_tensor):
         #   size    default(min)  fuse(min)   delta
         #   4KiB    1.110ms       0.993ms     -10.5%
         #   64KiB   1.140ms       0.976ms     -14.4%
@@ -565,8 +565,8 @@ class HierAllGather:
                 "False",
             )
         self.slice_oop = bool(slice_oop)
-        # M5: per-call SIZE THRESHOLD for the sliced path. Same-binary
-        # xnode A/B (n08-21+n08-33, N=2 G=4 fp32, >=3 reps, both bit-exact) shows
+        # Per-call SIZE THRESHOLD for the sliced path. Cross-node
+        # A/B (N=2 G=4 fp32, both bit-exact) shows
         # the sliced 2-D path WINS big at 64 MiB/rank (67.8->108.7 GB/s, 2.20x->
         # 1.40x RCCL) but LOSES at small/mid where its extra kernel launches +
         # N reassembly gathers cost more than the saved inter bytes:
@@ -850,8 +850,8 @@ class HierAllGather:
         # blocks m != node_id) and the SDMA gather / ring use distinct flag
         # buffers. Default OFF; toggle MORI_HIER_SLICE_DIRECT_OVERLAP=1.
         #
-        # VALIDATED-NEUTRAL (, true xnode n08-21+n08-33, N=2 G=4 fp32
-        # 64MiB/rank, reps=5 min/avg, SAME binary, BOTH bit-exact + dispatch-span):
+        # Validated neutral on true cross-node RDMA (N=2 G=4 fp32
+        # 64MiB/rank, both bit-exact + dispatch-span):
         #   overlap ON:  mori 3.802ms 141.2 GB/s | rccl 148.2 | 1.05x
         #   overlap OFF: mori 3.768ms 142.5 GB/s | rccl 155.8 | 1.09x
         # => -0.9% mori-side (NEUTRAL/slightly worse; ratio delta is RCCL-draw
@@ -1534,9 +1534,9 @@ class HierAllGather:
                 # its G local ranks over XGMI. Cuts inter-node NIC traffic ~G x
                 # (1 node-block/node instead of G).
                 #
-                # VALIDATED-NEGATIVE on this cluster (, true xnode
-                # n09-21+n09-29, N=2 G=4, fp32 64MiB/rank, >=3 reps, A/B same
-                # binary, both bit-exact): leader-only 29.8 GB/s vs
+                # Validated negative on true cross-node RDMA
+                # (N=2 G=4, fp32 64MiB/rank,
+                # both bit-exact): leader-only 29.8 GB/s vs
                 # every-rank-direct 63.8 GB/s -> 2.1x SLOWER. Reason: these MI355X
                 # nodes have ONE ionic NIC PER GPU (8/node). The "G x
                 # redundant NIC traffic" framing is misleading -- the per-NIC
