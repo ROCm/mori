@@ -20,13 +20,15 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Plot the cross-node AllGather-perf UT (w16, MI300X) for the two switch presets.
+"""Plot the cross-node AllGather-perf UT (w16, MI300X), E2E-stable config.
 
-Parses ag_perf_results/ut_{e2e,perf}_m.log (produced by run_ut_ag_perf.sh),
-emits clean CSVs, and renders a grouped-bar GB/s chart at 64/128/512 MB:
-  RCCL  vs  mori ibgda_sdma (E2E-stable)  vs  mori ibgda_sdma (pure-perf, context).
+Lives next to the data it renders (like plot_mi355x_ainic.py). It prefers a fresh
+run log ``ut_e2e_m.log`` (written here by ``bench/scripts/run_ut_ag_perf.sh``) and
+also writes the committed ``ag_perf_e2e.csv``; with no log it falls back to that CSV
+so the figure regenerates from committed data with NO GPU. Output:
+``ag_perf_e2e_stable_w16.png`` — a RCCL-vs-mori line chart at 64/128/256/512 MB.
 
-The E2E-stable bar is the shipped/representative number: same handle construction
+The mori line is the shipped/representative number: the same handle construction
 the w16 E2E FSDP run uses (MORI_HIER_UT_FAST=0), bit-exact & proven E2E-safe.
 """
 import os
@@ -36,30 +38,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-# results live under the canonical bench-results dir, not in the tests tree
-RES = os.path.abspath(
-    os.path.join(
-        HERE,
-        "..",
-        "..",
-        "..",
-        "examples",
-        "fsdp_sdma",
-        "bench",
-        "results",
-        "mi300x_mlx5",
-    )
-)
+RES = os.path.dirname(os.path.abspath(__file__))  # this script lives in the results dir
 LINE = re.compile(
     r"\[ag-perf\]\s+(\d+)MB\s+\|\s+rccl=[\d.]+ms\s+\(([\d.]+)GB/s\)\s+"
     r"ibgda_sdma=[\d.]+ms\s+\(([\d.]+)GB/s\)\s+\|\s+bitexact=(\w+)"
 )
 
 
-def parse(preset):
-    """return {size_mb: (rccl_gbps, ibgda_gbps, bitexact)}"""
+def _parse_log(preset):
+    """{size_mb: (rccl_gbps, ibgda_gbps, bitexact)} from a fresh run log, or None."""
     path = os.path.join(RES, f"ut_{preset}_m.log")
+    if not os.path.exists(path):
+        return None
     out = {}
     with open(path) as f:
         for ln in f:
@@ -67,7 +57,23 @@ def parse(preset):
             if m:
                 sz = int(m.group(1))
                 out[sz] = (float(m.group(2)), float(m.group(3)), m.group(4) == "True")
-    return out
+    return out or None
+
+
+def _read_csv(preset):
+    """Same dict from the committed CSV (regenerate the figure with no GPU), or None."""
+    path = os.path.join(RES, f"ag_perf_{preset}.csv")
+    if not os.path.exists(path):
+        return None
+    out = {}
+    with open(path) as f:
+        next(f, None)  # header
+        for ln in f:
+            p = ln.strip().split(",")
+            if len(p) >= 3:
+                bx = p[3] == "True" if len(p) > 3 else True
+                out[int(p[0])] = (float(p[1]), float(p[2]), bx)
+    return out or None
 
 
 def write_csv(preset, data):
@@ -81,9 +87,13 @@ def write_csv(preset, data):
 
 
 def main():
-    e2e = parse("e2e")
+    from_log = _parse_log("e2e")
+    e2e = from_log if from_log is not None else _read_csv("e2e")
+    if not e2e:
+        raise SystemExit("no ut_e2e_m.log and no ag_perf_e2e.csv to plot")
     sizes = sorted(e2e)
-    write_csv("e2e", e2e)
+    if from_log is not None:  # refresh the committed CSV only from a fresh run
+        write_csv("e2e", e2e)
 
     x = list(range(len(sizes)))
     rccl = [e2e[s][0] for s in sizes]

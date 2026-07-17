@@ -90,26 +90,28 @@ throughput beats the framework default. Three mori variants (intra × inter leg)
 
 ## Reproduce
 
-Each benchmark launches the 2-node run itself (ssh into master + worker, clear
-stale procs, start `torchrun`). The node pair / NIC list is at the top of each
-script — edit it for a different cluster. Run the commands below **from the repo
-root**; results are written under `examples/fsdp_sdma/bench/results/mi300x_mlx5/`.
+All launchers live in `bench/scripts/`. Each one drives the 2-node run itself
+(ssh into master + worker, clear stale procs, start `torchrun`); the UT sources
+are in `tests/python/ccl/`. The node pair / NIC list is at the top of each script
+(env-overridable: `MASTER`/`WORKER`/`IFACE`/`MORI_RDMA_DEVICES`/…). Raw logs +
+figures land under `bench/results/mi300x_mlx5/`.
 
 ```bash
+cd examples/fsdp_sdma/bench/scripts
+
 # 1) Standalone AllGather bandwidth UT (device ibgda_sdma vs RCCL)
-#    -> reproduces ag_perf_e2e_stable_w16.png
-cd tests/python/ccl
+#    -> ../results/mi300x_mlx5/ag_perf_e2e_stable_w16.png
 bash run_ut_ag_perf.sh e2e  64 128 256 512   # E2E-stable (shipped) config
 bash run_ut_ag_perf.sh perf 64 128 256 512   # pure-perf (standalone_fast, NOT E2E-legal), for context
+python ../results/mi300x_mlx5/plot_ag_perf.py   # (re)draw the figure from the run (or committed CSV)
 
 # 2) Compute/comm overlap UT (GEMM time under 50 concurrent AGs, hp_sdma vs RCCL)
-#    -> reproduces overlap_w16_gemm_time.png   (args: gemm_n size_mb nops)
+#    -> ../results/mi300x_mlx5/overlap_w16_gemm_time.png   (args: gemm_n size_mb nops)
 bash run_ut_overlap.sh 2048  8 50
 bash run_ut_overlap.sh 4096  8 50
 bash run_ut_overlap.sh 4096 16 50
 
 # 3) End-to-end FSDP2 (Qwen-7B): RCCL baseline + one mori variant, bit-exact loss + tflops
-cd ../../../examples/fsdp_sdma/bench/scripts
 bash run_e2e.sh              # RCCL + hp_sdma (default)
 bash run_e2e.sh hp_cu
 bash run_e2e.sh ibgda_sdma

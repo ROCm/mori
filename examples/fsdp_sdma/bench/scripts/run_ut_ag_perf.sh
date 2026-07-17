@@ -18,14 +18,15 @@ set -u
 PRESET="${1:?usage: run_ut_ag_perf.sh <perf|e2e> [sizes_mb...]}"; shift || true
 SIZES="${*:-64 128 512}"
 
-MASTER=useocpm2m-097-040 ; MASTER_IP=10.158.213.159 ; WORKER=useocpm2m-097-083
-CTR=mori-sglang-mingzhi
-WT=/home/mingzliu/hp_cu_opt/deliver
-OUT=$WT/examples/fsdp_sdma/bench/results/mi300x_mlx5 ; mkdir -p "$OUT"
-IFACE=eth0
-IB=mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9
+MASTER="${MASTER:-useocpm2m-097-040}" ; MASTER_IP="${MASTER_IP:-10.158.213.159}" ; WORKER="${WORKER:-useocpm2m-097-083}"
+CTR="${CTR:-mori-sglang-mingzhi}"
+WT="${MORI_REPO:-$(cd "$(dirname "$0")/../../../.." && pwd)}"   # repo root (from bench/scripts/)
+OUT="${OUT:-$WT/examples/fsdp_sdma/bench/results/mi300x_mlx5}" ; mkdir -p "$OUT"
+IFACE="${IFACE:-eth0}"
+IB="${MORI_RDMA_DEVICES:-mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9}"
+GID="${NCCL_IB_GID_INDEX:-3}"
 FABRIC="GLOO_SOCKET_IFNAME=$IFACE NCCL_SOCKET_IFNAME=$IFACE MORI_SOCKET_IFNAME=$IFACE \
-NCCL_IB_HCA=$IB NCCL_IB_GID_INDEX=3 MORI_RDMA_DEVICES=$IB"
+NCCL_IB_HCA=$IB NCCL_IB_GID_INDEX=$GID MORI_RDMA_DEVICES=$IB"
 FUSE="MORI_HIER_FUSE_LOCAL=1 MORI_HIER_FUSE_REMOTE=1 MORI_HIER_LOCAL_PUSHONLY=1"
 
 case "$PRESET" in
@@ -48,4 +49,4 @@ wp=$!; sleep 5
 timeout 400 ssh -o BatchMode=yes "$MASTER" "docker exec $CTR bash -lc '$BASE && $TR --node_rank=0 $RUN 2>&1'" | tee "$OUT/ut_${PRESET}_m.log"
 wait "$wp" 2>/dev/null || true
 echo "[$PRESET] result lines:"; grep -E "\[ag-perf\] [0-9]+MB" "$OUT/ut_${PRESET}_m.log"
-echo "[$PRESET] -> run plot_ag_perf.py to (re)generate ag_perf_e2e.csv + ag_perf_e2e_stable_w16.png"
+echo "[$PRESET] -> python $OUT/plot_ag_perf.py  to (re)generate ag_perf_e2e.csv + ag_perf_e2e_stable_w16.png"

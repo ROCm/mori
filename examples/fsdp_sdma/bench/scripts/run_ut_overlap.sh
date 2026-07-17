@@ -16,14 +16,15 @@
 set -u
 GEMM_N="${1:-2048}" ; SIZE_MB="${2:-8}" ; NOPS="${3:-50}"
 
-MASTER=useocpm2m-097-040 ; MASTER_IP=10.158.213.159 ; WORKER=useocpm2m-097-083
-CTR=mori-sglang-mingzhi
-WT=/home/mingzliu/hp_cu_opt/deliver
-OUT=$WT/examples/fsdp_sdma/bench/results/mi300x_mlx5 ; mkdir -p "$OUT"
-IFACE=eth0
-IB=mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9
+MASTER="${MASTER:-useocpm2m-097-040}" ; MASTER_IP="${MASTER_IP:-10.158.213.159}" ; WORKER="${WORKER:-useocpm2m-097-083}"
+CTR="${CTR:-mori-sglang-mingzhi}"
+WT="${MORI_REPO:-$(cd "$(dirname "$0")/../../../.." && pwd)}"   # repo root (from bench/scripts/)
+OUT="${OUT:-$WT/examples/fsdp_sdma/bench/results/mi300x_mlx5}" ; mkdir -p "$OUT"
+IFACE="${IFACE:-eth0}"
+IB="${MORI_RDMA_DEVICES:-mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9}"
+GID="${NCCL_IB_GID_INDEX:-3}"
 FABRIC="GLOO_SOCKET_IFNAME=$IFACE NCCL_SOCKET_IFNAME=$IFACE MORI_SOCKET_IFNAME=$IFACE \
-NCCL_IB_HCA=$IB NCCL_IB_GID_INDEX=3 MORI_RDMA_DEVICES=$IB"
+NCCL_IB_HCA=$IB NCCL_IB_GID_INDEX=$GID MORI_RDMA_DEVICES=$IB"
 
 # hp_sdma overlap recipe (host-proxy async + SDMA-intra + NUMA-local), verbatim.
 ENVSET="MORI_ENABLE_SDMA=1 MORI_FSDP_ENABLE_HIER=1 MORI_FSDP_HOST_PROXY=1 \
