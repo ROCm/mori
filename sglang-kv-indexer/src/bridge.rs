@@ -5,7 +5,7 @@ use rmpv::decode::value::read_value;
 use rmpv::Value;
 use tonic::transport::Channel;
 use tracing::{debug, info, warn};
-use zeromq::{ReqSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
+use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
 use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::{
@@ -289,16 +289,18 @@ async fn replay_missing_batches(
         return Ok(());
     };
 
-    let mut socket = ReqSocket::new();
+    let mut socket = DealerSocket::new();
     socket.connect(endpoint).await?;
-    tokio::time::timeout(
-        REPLAY_REQUEST_TIMEOUT,
-        socket.send(ZmqMessage::from(bytes::Bytes::copy_from_slice(
-            &start_seq.to_be_bytes(),
-        ))),
-    )
-    .await
-    .map_err(|_| BridgeError::Timeout("SGLang replay request send timed out".to_string()))??;
+    // DEALER -> ROUTER: prepend an empty delimiter frame so the publisher's
+    // ROUTER sees [identity, b"", start_seq]. Unlike REQ, DEALER neither adds
+    // this delimiter nor enforces strict send/recv alternation, so we can read
+    // the many per-batch replies the ROUTER streams back for one request.
+    let mut request =
+        ZmqMessage::from(bytes::Bytes::copy_from_slice(&start_seq.to_be_bytes()));
+    request.push_front(bytes::Bytes::new());
+    tokio::time::timeout(REPLAY_REQUEST_TIMEOUT, socket.send(request))
+        .await
+        .map_err(|_| BridgeError::Timeout("SGLang replay request send timed out".to_string()))??;
 
     let mut replay_expected = start_seq;
     let mut recovered = 0_u64;
@@ -355,10 +357,14 @@ async fn replay_missing_batches(
 }
 
 fn parse_replay_frames(frames: &[bytes::Bytes]) -> Result<(i64, &[u8]), BridgeError> {
+    // A DEALER connected to the publisher's ROUTER receives replies with the
+    // leading empty delimiter intact: [b"", seq, payload]. Tolerate a bare
+    // [seq, payload] variant too.
     match frames.len() {
+        3 => Ok((decode_signed_seq(&frames[1])?, frames[2].as_ref())),
         2 => Ok((decode_signed_seq(&frames[0])?, frames[1].as_ref())),
         n => Err(BridgeError::Decode(format!(
-            "expected 2 replay frames, got {n}"
+            "expected 2 or 3 replay frames, got {n}"
         ))),
     }
 }
