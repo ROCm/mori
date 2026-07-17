@@ -36,5 +36,5 @@ python/mori/_jit_sources/
 # Bundled tools/*.sh files copied into the package at build time
 python/mori/tools/*.sh
 
-# root-owned crash core dumps (from forced-slice small-size A/B debugging)
+# crash core dumps
 core.*
