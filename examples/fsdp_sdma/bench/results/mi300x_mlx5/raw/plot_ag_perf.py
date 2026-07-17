@@ -38,7 +38,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-RES = os.path.dirname(os.path.abspath(__file__))  # this script lives in the results dir
+RES = os.path.dirname(os.path.abspath(__file__))  # raw/ : logs + csv live next to this script
+FIG = os.path.dirname(RES)  # platform results dir : the figure (deliverable) is written up here
 LINE = re.compile(
     r"\[ag-perf\]\s+(\d+)MB\s+\|\s+rccl=[\d.]+ms\s+\(([\d.]+)GB/s\)\s+"
     r"ibgda_sdma=[\d.]+ms\s+\(([\d.]+)GB/s\)\s+\|\s+bitexact=(\w+)"
@@ -139,7 +140,7 @@ def main():
     ax.spines["right"].set_visible(False)
     fig.tight_layout()
 
-    png = os.path.join(RES, "ag_perf_e2e_stable_w16.png")
+    png = os.path.join(FIG, "ag_perf_e2e_stable_w16.png")
     fig.savefig(png, dpi=140)
     print("wrote", png)
     for s in sizes:

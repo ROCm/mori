@@ -103,7 +103,7 @@ cd examples/fsdp_sdma/bench/scripts
 #    -> ../results/mi300x_mlx5/ag_perf_e2e_stable_w16.png
 bash run_ut_ag_perf.sh e2e  64 128 256 512   # E2E-stable (shipped) config
 bash run_ut_ag_perf.sh perf 64 128 256 512   # pure-perf (standalone_fast, NOT E2E-legal), for context
-python ../results/mi300x_mlx5/plot_ag_perf.py   # (re)draw the figure from the run (or committed CSV)
+python ../results/mi300x_mlx5/raw/plot_ag_perf.py   # (re)draw the figure from the run (or committed CSV)
 
 # 2) Compute/comm overlap UT (GEMM time under 50 concurrent AGs, hp_sdma vs RCCL)
 #    -> ../results/mi300x_mlx5/overlap_w16_gemm_time.png   (args: gemm_n size_mb nops)

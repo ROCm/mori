@@ -21,7 +21,7 @@ SIZES="${*:-64 128 512}"
 MASTER="${MASTER:-useocpm2m-097-040}" ; MASTER_IP="${MASTER_IP:-10.158.213.159}" ; WORKER="${WORKER:-useocpm2m-097-083}"
 CTR="${CTR:-mori-sglang-mingzhi}"
 WT="${MORI_REPO:-$(cd "$(dirname "$0")/../../../.." && pwd)}"   # repo root (from bench/scripts/)
-OUT="${OUT:-$WT/examples/fsdp_sdma/bench/results/mi300x_mlx5}" ; mkdir -p "$OUT"
+OUT="${OUT:-$WT/examples/fsdp_sdma/bench/results/mi300x_mlx5/raw}" ; mkdir -p "$OUT"
 IFACE="${IFACE:-eth0}"
 IB="${MORI_RDMA_DEVICES:-mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9}"
 GID="${NCCL_IB_GID_INDEX:-3}"
