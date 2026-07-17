@@ -101,7 +101,7 @@ impl From<tonic::Status> for BridgeError {
 /// A single indexer mutation, kept in the exact order it appeared in the event
 /// batch so that store/remove/clear operations on the same hash are never
 /// reordered relative to each other.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum Action {
     Report { tier: i32, hashes: Vec<String> },
     Revoke { tier: i32, hashes: Vec<String> },
@@ -590,4 +590,312 @@ async fn _probe_indexer(client: &mut KvIndexerClient<Channel>) -> Result<(), Bri
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use rmpv::Value;
+
+    fn hbm() -> i32 {
+        TierType::TierHbm as i32
+    }
+    fn dram() -> i32 {
+        TierType::TierDram as i32
+    }
+    fn ssd() -> i32 {
+        TierType::TierSsd as i32
+    }
+
+    fn encode(value: &Value) -> Vec<u8> {
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, value).unwrap();
+        buf
+    }
+
+    fn ints(values: &[i64]) -> Value {
+        Value::Array(values.iter().map(|v| Value::from(*v)).collect())
+    }
+
+    fn stored(hashes: &[i64], medium: &str) -> Value {
+        Value::Array(vec![
+            Value::String("BlockStored".into()),
+            ints(hashes),
+            Value::Nil,          // parent_block_hash
+            ints(&[1]),          // token_ids
+            Value::from(1_i64),  // block_size
+            Value::Nil,          // lora_id
+            Value::String(medium.into()),
+        ])
+    }
+
+    fn removed(hashes: &[i64], medium: &str) -> Value {
+        Value::Array(vec![
+            Value::String("BlockRemoved".into()),
+            ints(hashes),
+            Value::String(medium.into()),
+        ])
+    }
+
+    fn cleared() -> Value {
+        Value::Array(vec![Value::String("AllBlocksCleared".into())])
+    }
+
+    /// Wrap events in a 3-element batch [ts, events, attn_dp_rank].
+    fn batch(events: Vec<Value>) -> Vec<u8> {
+        encode(&Value::Array(vec![
+            Value::from(1.0_f64),
+            Value::Array(events),
+            Value::from(0_i64),
+        ]))
+    }
+
+    fn actions_of(events: Vec<Value>) -> Vec<Action> {
+        decode_event_batch(&batch(events)).unwrap().actions
+    }
+
+    #[test]
+    fn block_stored_maps_to_report_on_tier() {
+        assert_eq!(
+            actions_of(vec![stored(&[123], "GPU")]),
+            vec![Action::Report {
+                tier: hbm(),
+                hashes: vec!["123".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn mediums_map_to_expected_tiers() {
+        assert_eq!(
+            actions_of(vec![stored(&[1], "CPU_PINNED")]),
+            vec![Action::Report {
+                tier: dram(),
+                hashes: vec!["1".to_string()],
+            }]
+        );
+        assert_eq!(
+            actions_of(vec![removed(&[2], "DISK")]),
+            vec![Action::Revoke {
+                tier: ssd(),
+                hashes: vec!["2".to_string()],
+            }]
+        );
+    }
+
+    // --- ordering regressions (the whole point of the in-order rewrite) ---
+
+    #[test]
+    fn remove_then_store_same_hash_keeps_order() {
+        // Net state must be "stored"; reordering to report-then-revoke would drop it.
+        assert_eq!(
+            actions_of(vec![removed(&[9], "GPU"), stored(&[9], "GPU")]),
+            vec![
+                Action::Revoke {
+                    tier: hbm(),
+                    hashes: vec!["9".to_string()],
+                },
+                Action::Report {
+                    tier: hbm(),
+                    hashes: vec!["9".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn clear_then_store_keeps_order() {
+        assert_eq!(
+            actions_of(vec![cleared(), stored(&[7], "GPU")]),
+            vec![
+                Action::ClearAll,
+                Action::Report {
+                    tier: hbm(),
+                    hashes: vec!["7".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn store_then_clear_keeps_order() {
+        assert_eq!(
+            actions_of(vec![stored(&[7], "GPU"), cleared()]),
+            vec![
+                Action::Report {
+                    tier: hbm(),
+                    hashes: vec!["7".to_string()],
+                },
+                Action::ClearAll,
+            ]
+        );
+    }
+
+    // --- coalescing rules ---
+
+    #[test]
+    fn adjacent_same_tier_stores_coalesce() {
+        assert_eq!(
+            actions_of(vec![stored(&[1], "GPU"), stored(&[2], "GPU")]),
+            vec![Action::Report {
+                tier: hbm(),
+                hashes: vec!["1".to_string(), "2".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn different_tier_stores_do_not_coalesce() {
+        assert_eq!(
+            actions_of(vec![stored(&[1], "GPU"), stored(&[2], "CPU_PINNED")]),
+            vec![
+                Action::Report {
+                    tier: hbm(),
+                    hashes: vec!["1".to_string()],
+                },
+                Action::Report {
+                    tier: dram(),
+                    hashes: vec!["2".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn store_then_remove_same_tier_do_not_merge() {
+        assert_eq!(
+            actions_of(vec![stored(&[1], "GPU"), removed(&[1], "GPU")]),
+            vec![
+                Action::Report {
+                    tier: hbm(),
+                    hashes: vec!["1".to_string()],
+                },
+                Action::Revoke {
+                    tier: hbm(),
+                    hashes: vec!["1".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_event_tag_is_ignored() {
+        let events = vec![Value::Array(vec![Value::String("BlockUpdated".into())])];
+        assert!(actions_of(events).is_empty());
+    }
+
+    #[test]
+    fn two_element_batch_without_dp_rank_decodes() {
+        let payload = encode(&Value::Array(vec![
+            Value::from(1.0_f64),
+            Value::Array(vec![stored(&[5], "GPU")]),
+        ]));
+        assert_eq!(
+            decode_event_batch(&payload).unwrap().actions,
+            vec![Action::Report {
+                tier: hbm(),
+                hashes: vec!["5".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn negative_hashes_are_stringified() {
+        assert_eq!(
+            actions_of(vec![stored(&[-1905904552702706914], "GPU")]),
+            vec![Action::Report {
+                tier: hbm(),
+                hashes: vec!["-1905904552702706914".to_string()],
+            }]
+        );
+    }
+
+    // --- error / mapping units ---
+
+    #[test]
+    fn external_medium_is_rejected() {
+        assert!(decode_event_batch(&batch(vec![stored(&[1], "EXTERNAL")])).is_err());
+    }
+
+    #[test]
+    fn unknown_medium_is_rejected() {
+        assert!(decode_event_batch(&batch(vec![stored(&[1], "TAPE")])).is_err());
+    }
+
+    #[test]
+    fn medium_to_tier_mapping() {
+        assert_eq!(medium_to_tier(Some("GPU")).unwrap(), hbm());
+        assert_eq!(medium_to_tier(Some("CPU_PINNED")).unwrap(), dram());
+        assert_eq!(medium_to_tier(Some("DISK")).unwrap(), ssd());
+        assert!(medium_to_tier(Some("EXTERNAL")).is_err());
+        assert!(medium_to_tier(None).is_err());
+    }
+
+    #[test]
+    fn parse_clear_tiers_defaults_and_aliases() {
+        assert_eq!(parse_clear_tiers("HBM,DRAM,SSD").unwrap(), vec![hbm(), dram(), ssd()]);
+        assert_eq!(
+            parse_clear_tiers(" GPU , CPU_PINNED , DISK ").unwrap(),
+            vec![hbm(), dram(), ssd()]
+        );
+        assert!(parse_clear_tiers("HBM,NVME").is_err());
+    }
+
+    #[test]
+    fn decode_hashes_accepts_signed_and_unsigned() {
+        let value = Value::Array(vec![
+            Value::from(1_i64),
+            Value::from(-2_i64),
+            Value::from(u64::MAX),
+        ]);
+        assert_eq!(
+            decode_hashes(&value).unwrap(),
+            vec!["1".to_string(), "-2".to_string(), u64::MAX.to_string()]
+        );
+        assert!(decode_hashes(&Value::Array(vec![Value::String("x".into())])).is_err());
+    }
+
+    // --- frame / sequence parsing ---
+
+    #[test]
+    fn parse_zmq_frames_two_and_three() {
+        let seq = 42_u64;
+        let two = [Bytes::copy_from_slice(&seq.to_be_bytes()), Bytes::from_static(b"p")];
+        assert_eq!(parse_zmq_frames(&two).unwrap().0, seq);
+        let three = [
+            Bytes::from_static(b"kv-events"),
+            Bytes::copy_from_slice(&seq.to_be_bytes()),
+            Bytes::from_static(b"p"),
+        ];
+        assert_eq!(parse_zmq_frames(&three).unwrap().0, seq);
+        let one = [Bytes::from_static(b"p")];
+        assert!(parse_zmq_frames(&one).is_err());
+    }
+
+    #[test]
+    fn parse_replay_frames_dealer_three_and_bare_two() {
+        let seq = 7_i64;
+        // DEALER keeps the empty delimiter: [b"", seq, payload]
+        let three = [
+            Bytes::new(),
+            Bytes::copy_from_slice(&seq.to_be_bytes()),
+            Bytes::from_static(b"payload"),
+        ];
+        let (parsed, payload) = parse_replay_frames(&three).unwrap();
+        assert_eq!(parsed, seq);
+        assert_eq!(payload, b"payload");
+        // bare 2-frame form
+        let two = [Bytes::copy_from_slice(&seq.to_be_bytes()), Bytes::from_static(b"p")];
+        assert_eq!(parse_replay_frames(&two).unwrap().0, seq);
+        assert!(parse_replay_frames(&[Bytes::new()]).is_err());
+    }
+
+    #[test]
+    fn seq_decoders_are_big_endian() {
+        assert_eq!(decode_seq(&5_u64.to_be_bytes()).unwrap(), 5);
+        // END_SEQ sentinel: -1 as 8-byte big-endian signed
+        assert_eq!(decode_signed_seq(&(-1_i64).to_be_bytes()).unwrap(), -1);
+        assert!(decode_seq(&[0_u8; 4]).is_err());
+    }
 }
