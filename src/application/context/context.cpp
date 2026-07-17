@@ -298,7 +298,8 @@ void Context::InitializeTopologyAndTransports() {
       // (env unset) => recv CQ == send CQ and recvCqHandle mirrors cqHandle, byte-identical.
       {
         const char* eImm = std::getenv("MORI_HIER_RING_WRITE_IMM");
-        if (eImm != nullptr && eImm[0] != '\0' && eImm[0] != '0') savedEpConfig.dedicatedRecvCq = true;
+        if (eImm != nullptr && eImm[0] != '\0' && eImm[0] != '0')
+          savedEpConfig.dedicatedRecvCq = true;
       }
     }
   }

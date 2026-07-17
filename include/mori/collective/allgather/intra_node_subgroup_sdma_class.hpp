@@ -479,7 +479,8 @@ class IntraNodeSubGroupAllgatherSdma {
     size_t copy_bytes = count_u32 * sizeof(uint32_t);
     size_t slot_stride = dst_slot_stride_bytes != 0 ? dst_slot_stride_bytes : copy_bytes;
     size_t base_off = dst_block_offset_bytes;
-    size_t last_slot_end = base_off + static_cast<size_t>(groupSize_ - 1) * slot_stride + copy_bytes;
+    size_t last_slot_end =
+        base_off + static_cast<size_t>(groupSize_ - 1) * slot_stride + copy_bytes;
     if (last_slot_end > regObj->size) {
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: direct gather exceeds output");
     }
@@ -530,8 +531,9 @@ class IntraNodeSubGroupAllgatherSdma {
   int64_t prepare_sync_direct_param_contiguous(uintptr_t input, hipStream_t stream, bool barrier,
                                                uintptr_t output_ptr, size_t block_stride_u32,
                                                int num_blocks, size_t world_size,
-                                               uintptr_t split_sizes_ptr, uintptr_t split_offsets_ptr,
-                                               size_t split_count, size_t dst_block_offset_bytes = 0,
+                                               uintptr_t split_sizes_ptr,
+                                               uintptr_t split_offsets_ptr, size_t split_count,
+                                               size_t dst_block_offset_bytes = 0,
                                                int first_block = 0) {
     auto regObj = find_exact(output_ptr);
     if (!regObj.IsValid())

@@ -144,8 +144,7 @@ int ShmemBufferDeregister(void* ptr, size_t size);
 // ``rdmaRegister=false`` registers for intra-node P2P/SDMA only and skips the
 // RDMA MR (avoids the ionic single-MR limit for large SDMA-only transits). Use
 // ONLY for buffers never targeted by RDMA.
-application::SymmMemObjPtr ShmemSymmetricRegister(void* ptr, size_t size,
-                                                 bool rdmaRegister = true);
+application::SymmMemObjPtr ShmemSymmetricRegister(void* ptr, size_t size, bool rdmaRegister = true);
 int ShmemSymmetricDeregister(void* ptr, size_t size);
 
 uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, int destPe);

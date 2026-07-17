@@ -599,8 +599,7 @@ void GpuStateInit(ShmemStates* states) {
   {
     int r2 = states->rdmaStates->commContext->GetRail2QpStart();
     states->gpuStates.rail2QpStart =
-        (states->rdmaStates->commContext->DualRailEnabled() &&
-         r2 < states->gpuStates.numQpPerPe)
+        (states->rdmaStates->commContext->DualRailEnabled() && r2 < states->gpuStates.numQpPerPe)
             ? r2
             : -1;
   }
@@ -617,8 +616,7 @@ void GpuStateInit(ShmemStates* states) {
   // neutral). Only meaningful with MORI_RDMA_PUT_CHUNK_BYTES>0. 0/unset = off.
   {
     const char* bdb = std::getenv("MORI_RDMA_PUT_BATCH_DB");
-    states->gpuStates.batchPutDoorbell =
-        (bdb != nullptr) && (std::strtoul(bdb, nullptr, 10) != 0);
+    states->gpuStates.batchPutDoorbell = (bdb != nullptr) && (std::strtoul(bdb, nullptr, 10) != 0);
   }
   // this work (drain-free landing fence): mlx5 strong-ordering fence bit on the
   // fused signal ATOMIC WQE so it cannot overtake its own preceding large payload

@@ -141,8 +141,8 @@ class IntraNodeSubGroupBroadcastSdma {
     // kernel reads a stable source (and the root's own output is already filled
     // when the kernel writes peerPtrs[root] back to it -- idempotent).
     if (groupPos_ == 0 && input != 0) {
-      (void)hipMemcpyAsync(out_, reinterpret_cast<void*>(input),
-                           count_u32 * sizeof(uint32_t), hipMemcpyDeviceToDevice, stream);
+      (void)hipMemcpyAsync(out_, reinterpret_cast<void*>(input), count_u32 * sizeof(uint32_t),
+                           hipMemcpyDeviceToDevice, stream);
       (void)hipStreamSynchronize(stream);
     }
 

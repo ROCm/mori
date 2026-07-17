@@ -1,6 +1,27 @@
 #!/usr/bin/env python3
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
 # Standalone AllGather size sweep: STANDALONE AllGather size sweep, mori hier SDMA vs RCCL.
 #
 # Sweeps {4,8,16,32,64,128,256,512} MiB/rank fp32 (spot-check bf16), >=3 timed
@@ -35,8 +56,7 @@ _DEFAULT_SIZES_MB = [4, 8, 16, 32, 64, 128, 256, 512]
 
 
 def _dtype_of(name):
-    return {"fp32": torch.float32, "bf16": torch.bfloat16,
-            "fp16": torch.float16}[name]
+    return {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[name]
 
 
 def _make_input(dtype, numel, rank, device):
@@ -61,8 +81,9 @@ def _time_fn(fn, reps, warmup):
     return min(ts), sum(ts) / len(ts)
 
 
-def _bench_size(handle, dtype, numel, rank, world_size, device, reps, warmup,
-                bufs=None):
+def _bench_size(
+    handle, dtype, numel, rank, world_size, device, reps, warmup, bufs=None
+):
     # Use persistent pre-allocated buffers (narrowed per cell) instead of a fresh
     # torch.empty() every cell. Otherwise the smallest op runs last, after the
     # large fp32 allocations have churned the caching allocator, so its fresh
@@ -78,8 +99,8 @@ def _bench_size(handle, dtype, numel, rank, world_size, device, reps, warmup,
     if bufs is not None:
         inp = bufs["inp"][:numel]
         inp.copy_(_make_input(dtype, numel, rank, device))
-        out_mori = bufs["out_mori"][:numel * world_size]
-        out_ref = bufs["out_ref"][:numel * world_size]
+        out_mori = bufs["out_mori"][: numel * world_size]
+        out_ref = bufs["out_ref"][: numel * world_size]
     else:
         inp = _make_input(dtype, numel, rank, device)
         out_mori = torch.empty(numel * world_size, dtype=dtype, device=device)
@@ -95,7 +116,8 @@ def _bench_size(handle, dtype, numel, rank, world_size, device, reps, warmup,
     if not bitexact:
         diff = (out_mori != out_ref).nonzero(as_tuple=False).flatten()[:8].tolist()
         raise AssertionError(
-            f"bit-exact MISMATCH dtype={dtype} numel={numel} pos={diff}")
+            f"bit-exact MISMATCH dtype={dtype} numel={numel} pos={diff}"
+        )
 
     def mori_call():
         assert handle(inp, out_mori, numel, stream)
@@ -122,12 +144,12 @@ def _bench_size(handle, dtype, numel, rank, world_size, device, reps, warmup,
 
     m_min, m_avg = _time_fn(mori_call, reps, _eff_warmup)
     r_min, r_avg = _time_fn(
-        lambda: dist.all_gather_into_tensor(out_ref, inp), reps, _eff_warmup)
+        lambda: dist.all_gather_into_tensor(out_ref, inp), reps, _eff_warmup
+    )
     return m_min, m_avg, r_min, r_avg, bitexact
 
 
-def _worker(rank, world_size, ranks_per_node, device, sizes_mb, dtypes, reps,
-            warmup):
+def _worker(rank, world_size, ranks_per_node, device, sizes_mb, dtypes, reps, warmup):
     max_bytes = max(sizes_mb) * 1024 * 1024  # per-rank, largest size
     per_rank_bytes = max_bytes + 4096
     # Symmetric heap must hold output (per_rank x world_size) + a full-output-
@@ -138,13 +160,21 @@ def _worker(rank, world_size, ranks_per_node, device, sizes_mb, dtypes, reps,
     shmem.shmem_torch_process_group_init("default")
     assert shmem.shmem_mype() == rank
     _host_proxy = os.environ.get("MORI_HIER_HOST_PROXY", "0") not in (
-        "0", "", "false", "False")
+        "0",
+        "",
+        "false",
+        "False",
+    )
     if _host_proxy:
         # Persistent hierarchical CPU-posted transport (deep-SQ multi-NIC fan).
         from mori.ccl.host_proxy_ag import HostProxyHierAllGather
+
         handle = HostProxyHierAllGather(
-            my_pe=rank, npes=world_size, ranks_per_node=ranks_per_node,
-            output_buffer_size=per_rank_bytes * world_size, device=device,
+            my_pe=rank,
+            npes=world_size,
+            ranks_per_node=ranks_per_node,
+            output_buffer_size=per_rank_bytes * world_size,
+            device=device,
         )
     else:
         # The standalone AllGather has no FSDP back-to-back overlap, so the
@@ -156,18 +186,26 @@ def _worker(rank, world_size, ranks_per_node, device, sizes_mb, dtypes, reps,
         # via MORI_HIER_UT_FAST=0 (or the explicit MORI_HIER_FUSE_LOCAL env, which
         # still overrides).
         _ut_fast = os.environ.get("MORI_HIER_UT_FAST", "1") not in (
-            "0", "", "false", "False")
+            "0",
+            "",
+            "false",
+            "False",
+        )
         handle = HierAllGather(
-            my_pe=rank, npes=world_size, ranks_per_node=ranks_per_node,
+            my_pe=rank,
+            npes=world_size,
+            ranks_per_node=ranks_per_node,
             input_buffer_size=per_rank_bytes,
             output_buffer_size=per_rank_bytes * world_size,
             copy_output_to_user=True,
             standalone_fast=_ut_fast,
         )
     if rank == 0:
-        print(f"[sweep] world={world_size} rpn={ranks_per_node} "
-              f"num_nodes={handle.num_nodes} sizes_mb={sizes_mb} "
-              f"dtypes={dtypes} reps={reps}")
+        print(
+            f"[sweep] world={world_size} rpn={ranks_per_node} "
+            f"num_nodes={handle.num_nodes} sizes_mb={sizes_mb} "
+            f"dtypes={dtypes} reps={reps}"
+        )
 
     # T19 (A): allocate the three role buffers ONCE, biggest-first, as raw byte
     # pools reinterpreted per dtype. This removes ALL per-cell alloc/free churn so
@@ -194,26 +232,39 @@ def _worker(rank, world_size, ranks_per_node, device, sizes_mb, dtypes, reps,
             for mb in sizes_mb:
                 numel = (mb * 1024 * 1024) // itemsize
                 m_min, m_avg, r_min, r_avg, bx = _bench_size(
-                    handle, dtype, numel, rank, world_size, device, reps, warmup,
-                    bufs=bufs)
+                    handle,
+                    dtype,
+                    numel,
+                    rank,
+                    world_size,
+                    device,
+                    reps,
+                    warmup,
+                    bufs=bufs,
+                )
                 tot_gb = numel * world_size * itemsize / 1e9
                 mori_gbs = tot_gb / (m_min / 1e3)
                 rccl_gbs = tot_gb / (r_min / 1e3)
                 ratio = mori_gbs / rccl_gbs if rccl_gbs else 0.0
                 if rank == 0:
-                    print(f"[sweep] {dname} {mb}MB out={tot_gb:.3f}GB | "
-                          f"mori {m_min:.3f}ms {mori_gbs:.1f}GB/s | "
-                          f"rccl {r_min:.3f}ms {rccl_gbs:.1f}GB/s | "
-                          f"ratio={ratio:.3f} | bitexact={bx}")
-                    rows.append((mb, dname, mori_gbs, rccl_gbs, ratio,
-                                 m_min, r_min, int(bx)))
+                    print(
+                        f"[sweep] {dname} {mb}MB out={tot_gb:.3f}GB | "
+                        f"mori {m_min:.3f}ms {mori_gbs:.1f}GB/s | "
+                        f"rccl {r_min:.3f}ms {rccl_gbs:.1f}GB/s | "
+                        f"ratio={ratio:.3f} | bitexact={bx}"
+                    )
+                    rows.append(
+                        (mb, dname, mori_gbs, rccl_gbs, ratio, m_min, r_min, int(bx))
+                    )
                 dist.barrier()
         if rank == 0:
             os.makedirs(_LOGS_DIR, exist_ok=True)
             csv = os.path.join(_LOGS_DIR, "sweep_standalone.csv")
             with open(csv, "w") as f:
-                f.write("size_mb,dtype,mori_gbs,rccl_gbs,ratio,"
-                        "mori_ms,rccl_ms,bitexact\n")
+                f.write(
+                    "size_mb,dtype,mori_gbs,rccl_gbs,ratio,"
+                    "mori_ms,rccl_ms,bitexact\n"
+                )
                 for r in rows:
                     f.write("%d,%s,%.2f,%.2f,%.4f,%.4f,%.4f,%d\n" % r)
             print(f"[sweep] wrote {csv}")
@@ -256,13 +307,22 @@ def main():
     ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
-    dist.init_process_group(backend="cpu:gloo,cuda:nccl", rank=rank,
-                            world_size=world_size, device_id=device)
+    dist.init_process_group(
+        backend="cpu:gloo,cuda:nccl", rank=rank, world_size=world_size, device_id=device
+    )
     world_group = torch.distributed.group.WORLD
     torch._C._distributed_c10d._register_process_group("default", world_group)
     try:
-        _worker(rank, world_size, ranks_per_node, device, args.sizes_mb,
-                args.dtypes, args.reps, args.warmup)
+        _worker(
+            rank,
+            world_size,
+            ranks_per_node,
+            device,
+            args.sizes_mb,
+            args.dtypes,
+            args.reps,
+            args.warmup,
+        )
     finally:
         if dist.is_initialized():
             dist.barrier()

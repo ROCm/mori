@@ -87,7 +87,8 @@ int LoadShmemModule(const char* hsaco_path) {
   }
   // optional dissemination barrier kernel. Non-fatal if
   // missing (older module): ShmemBarrierOnStreamDissem falls back to the funnel.
-  err = hipModuleGetFunction(&ms.dissemBarrierFunc, ms.module, "mori_shmem_barrier_all_block_dissem");
+  err =
+      hipModuleGetFunction(&ms.dissemBarrierFunc, ms.module, "mori_shmem_barrier_all_block_dissem");
   if (err != hipSuccess) {
     ms.dissemBarrierFunc = nullptr;
     (void)hipGetLastError();
@@ -267,8 +268,8 @@ void ShmemBarrierOnStreamHier(hipStream_t stream, int ranksPerNode) {
 
   if (states->moduleStates.hierBarrierFunc != nullptr) {
     void* kernelArgs[] = {&ranksPerNode};
-    hipError_t err = hipModuleLaunchKernel(states->moduleStates.hierBarrierFunc, 1, 1, 1, 1, 1, 1, 0,
-                                           stream, kernelArgs, nullptr);
+    hipError_t err = hipModuleLaunchKernel(states->moduleStates.hierBarrierFunc, 1, 1, 1, 1, 1, 1,
+                                           0, stream, kernelArgs, nullptr);
     assert(err == hipSuccess && "ShmemBarrierOnStreamHier launch failed");
   } else {
     // No hier kernel in this module: preserve correctness via the funnel.
