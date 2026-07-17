@@ -19,7 +19,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-# Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
 # HOST-PROXY INTER-NODE PRODUCER for the fused-ring reassembly consumer.
 #
@@ -92,8 +91,8 @@ class HostProxyInterProducer:
     # per process; each producer instance only registers ITS ring buffer as a new
     # MemoryDesc + creates a session against the partner's matching ring mem. The
     # engine + partner remote-engine registration happen exactly once. This
-    # collapses ~29 coexisting engines -> 1 (director 22:26Z: "producer must REUSE
-    # crown's IOEngine, not open a coexisting one").
+    # collapses ~29 coexisting engines -> 1 (the producer reuses
+    # crown's IOEngine instead of opening a coexisting one).
     _shared_engine = None  # the one process-wide IOEngine
     _partner_registered = False  # partner's engine desc registered once
     _pair_barriers = None  # cached rail-pair group (built once)
