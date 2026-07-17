@@ -277,3 +277,69 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
 |   67108864  |     1     |     67.11      |     44.81     |     44.78     |   1497.51    |   1498.58    |
 +-------------+-----------+----------------+---------------+---------------+--------------+--------------+
 ```
+## Benchmark Tuning Guide
+
+This section is a practical starting point for maximizing **single-NIC internode
+RDMA write bandwidth** with large messages and batched transfers. Latency-bound
+or single-transfer workloads may prefer different settings.
+
+### Recommended starting config
+
+```bash
+tests/python/io/benchmark.py \
+    --op-type write \
+    --enable-sess --enable-batch-transfer --batch-contiguous \
+    --disable-chunking \
+    --num-qp-per-transfer 8 --num-worker-threads 8 \
+    --transfer-batch-size 128 --num-initiator-dev 1 --num-target-dev 1
+```
+
+On a 400G-class NIC this typically reaches ~95%+ of link rate across the
+1 MiB–32 MiB message range and removes the mid-size bandwidth dip seen with the
+defaults. Tune from here.
+
+### Parameters that help
+
+| Knob | Effect |
+|------|--------|
+| `--enable-batch-transfer --enable-sess` | Submit the whole batch through a persistent session, cutting per-transfer overhead. |
+| `--batch-contiguous` | Contiguous per-transfer offsets let consecutive transfers merge into fewer, larger RDMA work requests (WRs). This is usually the biggest single win at large sizes and flattens the message-size curve. Do **not** use it when you intend to stress the send queue / keep one WR per transfer. |
+| `--num-qp-per-transfer` | More QPs pipeline a large transfer across the NIC. Bandwidth generally scales up to ~8 QPs and then plateaus; 16+ gives no further gain. Start at 8. |
+| `--disable-chunking` | Chunking splits each transfer into `--chunk-bytes` pieces; for large messages this multiplies WRs and can saturate the send queue, collapsing bandwidth at the largest sizes. Turning it off avoids that — but read the WR-size limit below. |
+| `--num-worker-threads` | With chunking **off** + `--batch-contiguous`, use several workers (e.g., 8). Besides parallel posting, this splits a large batch across workers so each merged WR stays under the NIC message-size limit. With chunking on, this knob has no bandwidth effect (posting is single-thread inline). |
+
+### The merged-WR size limit
+
+A single RDMA WR cannot exceed the backend's `max_msg_sz` (commonly **2 GiB**).
+With `--batch-contiguous --disable-chunking` and a **single** worker, an entire
+batch can merge into one WR of `message_size × transfer_batch_size`. If that
+exceeds `max_msg_sz` the run aborts with:
+
+```
+merged RDMA WR ... exceeds local max_msg_sz ...; enable RDMA transfer chunking or reduce batch size
+```
+
+Any one of these avoids it:
+
+- Use multiple `--num-worker-threads` (splits the batch so each merged WR is smaller) — recommended.
+- Keep `message_size × transfer_batch_size ≤ max_msg_sz`.
+- Re-enable chunking (drop `--disable-chunking`) so oversized transfers are split automatically.
+
+### Parameters that usually do not help (or can hurt)
+
+- **`MORI_IO_QP_MAX_SEND_WR` / `--max-send-wr`**: no benefit once chunking is off (merged WRs are few); leave at default.
+- **`--max-msg-sge`**: raising it can *reduce* bandwidth; leave at default.
+- **`MORI_RDMA_DEVICES` (manual NIC pinning)**: the backend's automatic NIC selection is rail/NUMA-aware. Overriding it can pin traffic to a non-local or cross-rail NIC and sharply reduce bandwidth. Only override if you have verified the topology and the auto-choice is wrong.
+- **Lossless traffic class / service level (`MORI_IO_TC` / `MORI_IO_SL`)**: only helps if the fabric is actually configured for PFC on that priority. On a fabric that is not, setting these can sharply reduce bandwidth. Leave unset unless PFC is configured end-to-end.
+
+### Host (CPU) vs GPU memory
+
+- GPU device memory (registered via dmabuf) is unaffected by the notes below.
+- For **host (CPU) memory**, on NICs with a small memory-translation (PTE) cache,
+  a large 4 KiB-paged buffer used as the **RDMA-write source** can lose bandwidth
+  past a few tens of MiB per transfer, and very large regions may fail memory
+  registration outright. Back host buffers with **hugepages** (explicit hugetlb
+  or THP) in that case. The read direction and the passive (target) side are
+  less sensitive.
+- Multi-NIC striping (`MORI_IO_NUM_NICS_PER_TRANSFER`) is intended for host
+  memory; keep GPU memory on a single NIC (it is PCIe-bound).

@@ -281,6 +281,14 @@
 <li class="toctree-l3"><a class="reference internal" href="#read">Read</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="#benchmark-tuning-guide">Benchmark Tuning Guide</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#recommended-starting-config">Recommended starting config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#parameters-that-help">Parameters that help</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#the-merged-wr-size-limit">The merged-WR size limit</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#parameters-that-usually-do-not-help-or-can-hurt">Parameters that usually do not help (or can hurt)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#host-cpu-vs-gpu-memory">Host (CPU) vs GPU memory</a></li>
+</ul>
+</li>
 </ul>
 </li>
 </ul>
@@ -667,6 +675,92 @@ fails fast with a clear error.</p>
 <span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
 </pre></div>
 </div>
+</section>
+</section>
+<section id="benchmark-tuning-guide">
+<h2>Benchmark Tuning Guide<a class="headerlink" href="#benchmark-tuning-guide" title="Link to this heading"></a></h2>
+<p>This section is a practical starting point for maximizing <strong>single-NIC internode
+RDMA write bandwidth</strong> with large messages and batched transfers. Latency-bound
+or single-transfer workloads may prefer different settings.</p>
+<section id="recommended-starting-config">
+<h3>Recommended starting config<a class="headerlink" href="#recommended-starting-config" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>tests/python/io/benchmark.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--op-type<span class="w"> </span>write<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-sess<span class="w"> </span>--enable-batch-transfer<span class="w"> </span>--batch-contiguous<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-chunking<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-qp-per-transfer<span class="w"> </span><span class="m">8</span><span class="w"> </span>--num-worker-threads<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--transfer-batch-size<span class="w"> </span><span class="m">128</span><span class="w"> </span>--num-initiator-dev<span class="w"> </span><span class="m">1</span><span class="w"> </span>--num-target-dev<span class="w"> </span><span class="m">1</span>
+</pre></div>
+</div>
+<p>On a 400G-class NIC this typically reaches ~95%+ of link rate across the
+1 MiB–32 MiB message range and removes the mid-size bandwidth dip seen with the
+defaults. Tune from here.</p>
+</section>
+<section id="parameters-that-help">
+<h3>Parameters that help<a class="headerlink" href="#parameters-that-help" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Knob</p></th>
+<th class="head"><p>Effect</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-batch-transfer</span> <span class="pre">--enable-sess</span></code></p></td>
+<td><p>Submit the whole batch through a persistent session, cutting per-transfer overhead.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--batch-contiguous</span></code></p></td>
+<td><p>Contiguous per-transfer offsets let consecutive transfers merge into fewer, larger RDMA work requests (WRs). This is usually the biggest single win at large sizes and flattens the message-size curve. Do <strong>not</strong> use it when you intend to stress the send queue / keep one WR per transfer.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--num-qp-per-transfer</span></code></p></td>
+<td><p>More QPs pipeline a large transfer across the NIC. Bandwidth generally scales up to ~8 QPs and then plateaus; 16+ gives no further gain. Start at 8.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--disable-chunking</span></code></p></td>
+<td><p>Chunking splits each transfer into <code class="docutils literal notranslate"><span class="pre">--chunk-bytes</span></code> pieces; for large messages this multiplies WRs and can saturate the send queue, collapsing bandwidth at the largest sizes. Turning it off avoids that — but read the WR-size limit below.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--num-worker-threads</span></code></p></td>
+<td><p>With chunking <strong>off</strong> + <code class="docutils literal notranslate"><span class="pre">--batch-contiguous</span></code>, use several workers (e.g., 8). Besides parallel posting, this splits a large batch across workers so each merged WR stays under the NIC message-size limit. With chunking on, this knob has no bandwidth effect (posting is single-thread inline).</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="the-merged-wr-size-limit">
+<h3>The merged-WR size limit<a class="headerlink" href="#the-merged-wr-size-limit" title="Link to this heading"></a></h3>
+<p>A single RDMA WR cannot exceed the backend’s <code class="docutils literal notranslate"><span class="pre">max_msg_sz</span></code> (commonly <strong>2 GiB</strong>).
+With <code class="docutils literal notranslate"><span class="pre">--batch-contiguous</span> <span class="pre">--disable-chunking</span></code> and a <strong>single</strong> worker, an entire
+batch can merge into one WR of <code class="docutils literal notranslate"><span class="pre">message_size</span> <span class="pre">×</span> <span class="pre">transfer_batch_size</span></code>. If that
+exceeds <code class="docutils literal notranslate"><span class="pre">max_msg_sz</span></code> the run aborts with:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">merged</span> <span class="n">RDMA</span> <span class="n">WR</span> <span class="o">...</span> <span class="n">exceeds</span> <span class="n">local</span> <span class="n">max_msg_sz</span> <span class="o">...</span><span class="p">;</span> <span class="n">enable</span> <span class="n">RDMA</span> <span class="n">transfer</span> <span class="n">chunking</span> <span class="ow">or</span> <span class="n">reduce</span> <span class="n">batch</span> <span class="n">size</span>
+</pre></div>
+</div>
+<p>Any one of these avoids it:</p>
+<ul class="simple">
+<li><p>Use multiple <code class="docutils literal notranslate"><span class="pre">--num-worker-threads</span></code> (splits the batch so each merged WR is smaller) — recommended.</p></li>
+<li><p>Keep <code class="docutils literal notranslate"><span class="pre">message_size</span> <span class="pre">×</span> <span class="pre">transfer_batch_size</span> <span class="pre">≤</span> <span class="pre">max_msg_sz</span></code>.</p></li>
+<li><p>Re-enable chunking (drop <code class="docutils literal notranslate"><span class="pre">--disable-chunking</span></code>) so oversized transfers are split automatically.</p></li>
+</ul>
+</section>
+<section id="parameters-that-usually-do-not-help-or-can-hurt">
+<h3>Parameters that usually do not help (or can hurt)<a class="headerlink" href="#parameters-that-usually-do-not-help-or-can-hurt" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">MORI_IO_QP_MAX_SEND_WR</span></code> / <code class="docutils literal notranslate"><span class="pre">--max-send-wr</span></code></strong>: no benefit once chunking is off (merged WRs are few); leave at default.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">--max-msg-sge</span></code></strong>: raising it can <em>reduce</em> bandwidth; leave at default.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES</span></code> (manual NIC pinning)</strong>: the backend’s automatic NIC selection is rail/NUMA-aware. Overriding it can pin traffic to a non-local or cross-rail NIC and sharply reduce bandwidth. Only override if you have verified the topology and the auto-choice is wrong.</p></li>
+<li><p><strong>Lossless traffic class / service level (<code class="docutils literal notranslate"><span class="pre">MORI_IO_TC</span></code> / <code class="docutils literal notranslate"><span class="pre">MORI_IO_SL</span></code>)</strong>: only helps if the fabric is actually configured for PFC on that priority. On a fabric that is not, setting these can sharply reduce bandwidth. Leave unset unless PFC is configured end-to-end.</p></li>
+</ul>
+</section>
+<section id="host-cpu-vs-gpu-memory">
+<h3>Host (CPU) vs GPU memory<a class="headerlink" href="#host-cpu-vs-gpu-memory" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p>GPU device memory (registered via dmabuf) is unaffected by the notes below.</p></li>
+<li><p>For <strong>host (CPU) memory</strong>, on NICs with a small memory-translation (PTE) cache,
+a large 4 KiB-paged buffer used as the <strong>RDMA-write source</strong> can lose bandwidth
+past a few tens of MiB per transfer, and very large regions may fail memory
+registration outright. Back host buffers with <strong>hugepages</strong> (explicit hugetlb
+or THP) in that case. The read direction and the passive (target) side are
+less sensitive.</p></li>
+<li><p>Multi-NIC striping (<code class="docutils literal notranslate"><span class="pre">MORI_IO_NUM_NICS_PER_TRANSFER</span></code>) is intended for host
+memory; keep GPU memory on a single NIC (it is PCIe-bound).</p></li>
+</ul>
 </section>
 </section>
 </section>
