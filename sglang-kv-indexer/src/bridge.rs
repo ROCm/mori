@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::time::Duration;
 
 use rmpv::decode::value::read_value;
 use rmpv::Value;
@@ -12,6 +12,10 @@ use crate::pb::{
     MatchExternalKvRequest, ReportExternalKvBlocksRequest, RevokeAllExternalKvBlocksAtTierRequest,
     RevokeExternalKvBlocksRequest, TierType,
 };
+
+/// Backoff bounds for the reconnect supervisor loop.
+const RECONNECT_MIN_DELAY: Duration = Duration::from_millis(500);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
@@ -88,19 +92,65 @@ impl From<tonic::Status> for BridgeError {
     }
 }
 
+/// A single indexer mutation, kept in the exact order it appeared in the event
+/// batch so that store/remove/clear operations on the same hash are never
+/// reordered relative to each other.
+#[derive(Debug)]
+enum Action {
+    Report { tier: i32, hashes: Vec<String> },
+    Revoke { tier: i32, hashes: Vec<String> },
+    ClearAll,
+}
+
 #[derive(Debug, Default)]
 struct EventActions {
-    reports: BTreeMap<i32, Vec<String>>,
-    revokes: BTreeMap<i32, Vec<String>>,
-    clear_all: bool,
+    actions: Vec<Action>,
+}
+
+impl EventActions {
+    /// Append a store, coalescing only with an immediately-preceding store to
+    /// the same tier. Coalescing never crosses a revoke/clear, so ordering (and
+    /// therefore the final per-hash state) is preserved.
+    fn report(&mut self, tier: i32, hashes: Vec<String>) {
+        if hashes.is_empty() {
+            return;
+        }
+        if let Some(Action::Report {
+            tier: last_tier,
+            hashes: last,
+        }) = self.actions.last_mut()
+        {
+            if *last_tier == tier {
+                last.extend(hashes);
+                return;
+            }
+        }
+        self.actions.push(Action::Report { tier, hashes });
+    }
+
+    fn revoke(&mut self, tier: i32, hashes: Vec<String>) {
+        if hashes.is_empty() {
+            return;
+        }
+        if let Some(Action::Revoke {
+            tier: last_tier,
+            hashes: last,
+        }) = self.actions.last_mut()
+        {
+            if *last_tier == tier {
+                last.extend(hashes);
+                return;
+            }
+        }
+        self.actions.push(Action::Revoke { tier, hashes });
+    }
+
+    fn clear_all(&mut self) {
+        self.actions.push(Action::ClearAll);
+    }
 }
 
 pub async fn run_bridge(config: BridgeConfig) -> Result<(), BridgeError> {
-    let mut client = KvIndexerClient::connect(config.indexer_endpoint.clone()).await?;
-    let mut subscriber = SubSocket::new();
-    subscriber.subscribe(&config.event_topic).await?;
-    subscriber.connect(&config.event_endpoint).await?;
-
     info!(
         worker_id = %config.worker_id,
         event_endpoint = %config.event_endpoint,
@@ -109,11 +159,71 @@ pub async fn run_bridge(config: BridgeConfig) -> Result<(), BridgeError> {
         "starting SGLang KV event bridge"
     );
 
+    // Supervisor loop: (re)connect to both the indexer and the ZMQ publisher,
+    // run until a connection-level error, then back off and retry. Decode-level
+    // problems are handled inside the session and never tear down the bridge.
+    let mut delay = RECONNECT_MIN_DELAY;
+    loop {
+        match connect(&config).await {
+            Ok((client, subscriber)) => {
+                delay = RECONNECT_MIN_DELAY;
+                match run_session(&config, client, subscriber).await {
+                    Ok(()) => {
+                        info!("bridge shut down cleanly");
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        warn!(%error, retry_in = ?delay, "bridge session lost; reconnecting");
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(%error, retry_in = ?delay, "bridge connect failed; retrying");
+            }
+        }
+
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(RECONNECT_MAX_DELAY);
+    }
+}
+
+async fn connect(
+    config: &BridgeConfig,
+) -> Result<(KvIndexerClient<Channel>, SubSocket), BridgeError> {
+    let client = KvIndexerClient::connect(config.indexer_endpoint.clone()).await?;
+    let mut subscriber = SubSocket::new();
+    subscriber.subscribe(&config.event_topic).await?;
+    subscriber.connect(&config.event_endpoint).await?;
+    info!("bridge session established");
+    Ok((client, subscriber))
+}
+
+/// Runs a single connected session. Returns `Ok(())` only on a clean shutdown
+/// (ctrl-c); any connection-level error is propagated so the supervisor can
+/// reconnect. Malformed frames / undecodable batches are logged and skipped.
+async fn run_session(
+    config: &BridgeConfig,
+    mut client: KvIndexerClient<Channel>,
+    mut subscriber: SubSocket,
+) -> Result<(), BridgeError> {
     let mut expected_seq: Option<u64> = None;
     loop {
-        let message = subscriber.recv().await?;
+        let message = tokio::select! {
+            result = subscriber.recv() => result?,
+            _ = tokio::signal::ctrl_c() => {
+                info!("received ctrl-c; shutting down bridge");
+                return Ok(());
+            }
+        };
+
         let frames = message.into_vec();
-        let (seq, payload) = parse_zmq_frames(&frames)?;
+        let (seq, payload) = match parse_zmq_frames(&frames) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                warn!(%error, "skipping malformed ZMQ message");
+                continue;
+            }
+        };
 
         if let Some(expected) = expected_seq {
             if seq != expected {
@@ -122,8 +232,17 @@ pub async fn run_bridge(config: BridgeConfig) -> Result<(), BridgeError> {
         }
         expected_seq = seq.checked_add(1);
 
-        let actions = decode_event_batch(payload)?;
-        forward_actions(&config, &mut client, actions).await?;
+        let actions = match decode_event_batch(payload) {
+            Ok(actions) => actions,
+            Err(error) => {
+                warn!(%error, "skipping undecodable event batch");
+                continue;
+            }
+        };
+
+        // RPC/transport failures bubble up to trigger a reconnect; the batch
+        // will be re-driven from the publisher stream after reconnecting.
+        forward_actions(config, &mut client, actions).await?;
     }
 }
 
@@ -180,11 +299,7 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
                 ));
             }
             let tier = medium_to_tier(expect_optional_str(&event[6], "BlockStored.medium")?)?;
-            actions
-                .reports
-                .entry(tier)
-                .or_default()
-                .extend(decode_hashes(&event[1])?);
+            actions.report(tier, decode_hashes(&event[1])?);
         }
         "BlockRemoved" => {
             if event.len() < 3 {
@@ -193,14 +308,10 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
                 ));
             }
             let tier = medium_to_tier(expect_optional_str(&event[2], "BlockRemoved.medium")?)?;
-            actions
-                .revokes
-                .entry(tier)
-                .or_default()
-                .extend(decode_hashes(&event[1])?);
+            actions.revoke(tier, decode_hashes(&event[1])?);
         }
         "AllBlocksCleared" => {
-            actions.clear_all = true;
+            actions.clear_all();
         }
         other => {
             debug!(event_type = other, "ignoring unsupported SGLang KV event");
@@ -214,42 +325,38 @@ async fn forward_actions(
     client: &mut KvIndexerClient<Channel>,
     actions: EventActions,
 ) -> Result<(), BridgeError> {
-    for (tier, hashes) in actions.reports {
-        if hashes.is_empty() {
-            continue;
-        }
-        client
-            .report_external_kv_blocks(ReportExternalKvBlocksRequest {
-                worker_id: config.worker_id.clone(),
-                hashes,
-                tier,
-            })
-            .await?;
-    }
-
-    for (tier, hashes) in actions.revokes {
-        if hashes.is_empty() {
-            continue;
-        }
-        client
-            .revoke_external_kv_blocks(RevokeExternalKvBlocksRequest {
-                worker_id: config.worker_id.clone(),
-                hashes,
-                tier,
-            })
-            .await?;
-    }
-
-    if actions.clear_all {
-        for tier in &config.clear_tiers {
-            client
-                .revoke_all_external_kv_blocks_at_tier(
-                    RevokeAllExternalKvBlocksAtTierRequest {
+    for action in actions.actions {
+        match action {
+            Action::Report { tier, hashes } => {
+                client
+                    .report_external_kv_blocks(ReportExternalKvBlocksRequest {
                         worker_id: config.worker_id.clone(),
-                        tier: *tier,
-                    },
-                )
-                .await?;
+                        hashes,
+                        tier,
+                    })
+                    .await?;
+            }
+            Action::Revoke { tier, hashes } => {
+                client
+                    .revoke_external_kv_blocks(RevokeExternalKvBlocksRequest {
+                        worker_id: config.worker_id.clone(),
+                        hashes,
+                        tier,
+                    })
+                    .await?;
+            }
+            Action::ClearAll => {
+                for tier in &config.clear_tiers {
+                    client
+                        .revoke_all_external_kv_blocks_at_tier(
+                            RevokeAllExternalKvBlocksAtTierRequest {
+                                worker_id: config.worker_id.clone(),
+                                tier: *tier,
+                            },
+                        )
+                        .await?;
+                }
+            }
         }
     }
 
