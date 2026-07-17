@@ -144,11 +144,11 @@ def _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device, bench
             out_def = torch.empty(bnumel * world_size, dtype=bdtype, device=device)
             dummy = torch.empty(0, dtype=bdtype, device=device)
 
-            def call_def():
+            def call_def(h_def=h_def):
                 assert h_def(inp, out_def, bnumel, stream)
                 stream.synchronize()
 
-            def call_oip():
+            def call_oip(h_oip=h_oip):
                 assert h_oip(inp, dummy, bnumel, stream)
                 stream.synchronize()
 
