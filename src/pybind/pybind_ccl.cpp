@@ -26,12 +26,12 @@
 #include <pybind11/stl.h>
 
 #include "mori/collective/all2all/oneshot_all2all_sdma_class.hpp"
-#include "mori/collective/ccl_kernel_args.hpp"
 #include "mori/collective/allgather/allgather_into_tensor.hpp"
 #include "mori/collective/allgather/intra_node_subgroup_broadcast_sdma_class.hpp"
 #include "mori/collective/allgather/intra_node_subgroup_sdma_class.hpp"
 #include "mori/collective/allgather/oneshot_allgather_sdma_class.hpp"
 #include "mori/collective/allreduce/twoshot_allreduce_sdma_class.hpp"
+#include "mori/collective/ccl_kernel_args.hpp"
 #include "mori/collective/inter_node/inter_node_ring_class.hpp"
 #include "src/pybind/mori.hpp"
 
@@ -330,8 +330,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
             return self.finish_sync(output, count, reinterpret_cast<hipStream_t>(stream));
           },
           py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
-      .def(
-          "buf_ptr", [](InterNodeRing& self) -> uintptr_t { return self.buf_ptr(); })
+      .def("buf_ptr", [](InterNodeRing& self) -> uintptr_t { return self.buf_ptr(); })
       .def(
           "finish_sync_no_copy",
           [](InterNodeRing& self, int64_t stream) -> double {
@@ -359,17 +358,15 @@ void RegisterMoriCcl(pybind11::module_& m) {
             return self.finish_stream(output, count, reinterpret_cast<hipStream_t>(stream),
                                       barrier);
           },
-          py::arg("output_ptr"), py::arg("count"), py::arg("stream"),
-          py::arg("barrier") = true)
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream"), py::arg("barrier") = true)
       .def(
           "finish_stream_no_copy",
           [](InterNodeRing& self, int64_t stream) -> double {
             return self.finish_stream_no_copy(reinterpret_cast<hipStream_t>(stream));
           },
           py::arg("stream"))
-      .def(
-          "parity_counter_ptr",
-          [](InterNodeRing& self) -> uintptr_t { return self.parity_counter_ptr(); })
+      .def("parity_counter_ptr",
+           [](InterNodeRing& self) -> uintptr_t { return self.parity_counter_ptr(); })
       .def("npes", &InterNodeRing::npes)
       .def("num_blocks", &InterNodeRing::num_blocks);
 
@@ -441,8 +438,8 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def(
           "prepare_sync_direct",
           [](IntraSubGroup& self, uintptr_t input, size_t count, int64_t stream, bool barrier,
-             uintptr_t output_ptr, size_t dst_block_offset_bytes,
-             size_t dst_slot_stride_bytes, size_t flag_slot_base) -> int64_t {
+             uintptr_t output_ptr, size_t dst_block_offset_bytes, size_t dst_slot_stride_bytes,
+             size_t flag_slot_base) -> int64_t {
             return self.prepare_sync_direct(input, count, reinterpret_cast<hipStream_t>(stream),
                                             barrier, output_ptr, dst_block_offset_bytes,
                                             dst_slot_stride_bytes, flag_slot_base);
@@ -517,26 +514,23 @@ void RegisterMoriCcl(pybind11::module_& m) {
   m.def("size_of", &mori::collective::SizeOf, py::arg("dtype"),
         "Return element size in bytes for a mori_cpp.DataType value");
 
-  // merge an inter-node ring's jit_args + an intra-node
-  // sub-group gather's jit_args into one CclFusedRingLocalGatherArgs for the
-  // fused ring||local-gather kernel (the RCCL-parity lever).
-  // Takes the two int64 arg pointers the respective prepare_*
-  // calls return; returns the fused arg pointer (a static, valid until the next
-  // call). Inert until the Python fused launcher is wired.
-  m.def("build_fused_ring_local_gather_args",
-        &mori::collective::BuildFusedRingLocalGatherArgs, py::arg("ring_args_ptr"),
-        py::arg("gather_args_ptr"), py::arg("ring_blocks"),
+  // Merge an inter-node ring's jit_args + an intra-node sub-group gather's
+  // jit_args into one CclFusedRingLocalGatherArgs for the fused
+  // ring||local-gather kernel. Takes the two int64 arg pointers the respective
+  // prepare_* calls return; returns the fused arg pointer (a static, valid until
+  // the next call).
+  m.def("build_fused_ring_local_gather_args", &mori::collective::BuildFusedRingLocalGatherArgs,
+        py::arg("ring_args_ptr"), py::arg("gather_args_ptr"), py::arg("ring_blocks"),
         "Merge ring + local-gather jit_args into fused-kernel args; returns int64 ptr");
 
-  // PHASE 4: merge ring + local-gather jit_args plus the pipeline extras
-  // (chunkReadyFlags device ptr, numNodes, nodeId) into CclFusedRingRemoteGather
-  // Args for FusedRingRemoteGatherKernel_u32 (pipelines the inter-node ring with
-  // the remote-block reassembly). Inert until the Python launcher is wired.
-  m.def("build_fused_ring_remote_gather_args",
-        &mori::collective::BuildFusedRingRemoteGatherArgs, py::arg("ring_args_ptr"),
-        py::arg("gather_args_ptr"), py::arg("ring_blocks"), py::arg("chunk_ready_flags_ptr"),
-        py::arg("num_nodes"), py::arg("node_id"), py::arg("reassembly_blocks") = 0,
-        py::arg("op_gen") = 0, py::arg("reasm_deep_sq") = 0,
+  // Merge ring + local-gather jit_args plus the pipeline extras (chunkReadyFlags
+  // device ptr, numNodes, nodeId) into CclFusedRingRemoteGatherArgs for
+  // FusedRingRemoteGatherKernel_u32 (pipelines the inter-node ring with the
+  // remote-block reassembly).
+  m.def("build_fused_ring_remote_gather_args", &mori::collective::BuildFusedRingRemoteGatherArgs,
+        py::arg("ring_args_ptr"), py::arg("gather_args_ptr"), py::arg("ring_blocks"),
+        py::arg("chunk_ready_flags_ptr"), py::arg("num_nodes"), py::arg("node_id"),
+        py::arg("reassembly_blocks") = 0, py::arg("op_gen") = 0, py::arg("reasm_deep_sq") = 0,
         "Merge ring + gather jit_args + pipeline extras into fused-remote args; returns int64 ptr");
 
   // =========================================================================
