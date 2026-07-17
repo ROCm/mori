@@ -124,14 +124,6 @@ void SetUpKFD() {
   CHECK_HSAKMT_SUCCESS(hsaKmtAcquireSystemProperties(&m_SystemProperties), "Failed!");
 }
 
-// void SetUpKFD(uint32_t targetDevice) {
-// HsaNodeProperties m_node_props;
-// CHECK_HSAKMT_SUCCESS(hsaKmtGetNodeProperties(targetDevice, &m_node_props), "Failed!");
-// std::cout << "Num of PCIe SDMA Queues: " << m_node_props.NumSdmaEngines << std::endl;
-// std::cout << "Num of XGMI SDMA Queues: " << m_node_props.NumSdmaXgmiEngines << std::endl;
-// std::cout << "Device Id: " << m_node_props.DeviceId << std::endl;
-// }
-
 void CloseKFD() { (void)hsaKmtCloseKFD(); }
 
 // Convert a logical deviceId index to the NVML device minor number
@@ -210,9 +202,6 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   memFlags.ui32.NoNUMABind = 1;
   memFlags.ui32.ExecuteAccess = 1;
   memFlags.ui32.Uncached = 1;
-
-  // std::cout << "Allocating SDMA Queue Buffer for device: " << localNodeId << std::endl <<
-  // std::flush;
 
   CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(localNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
                        "Failed");
@@ -300,39 +289,15 @@ void AnvilLib::init() {
 
 bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
   std::lock_guard<std::mutex> lock(channels_mutex_);
-  // Spread the channels across the engines recommended for this peer link. On
-  // MI350 the mask typically reports 2 engines per peer; on platforms with a
-  // single recommended engine all channels share it.
-  // DISTINCT-ENGINE-PER-DESTINATION intra-gather engine mapping.
-  // ROOT CAUSE (single-node diag): the flat 8-way local gather fires G-1=7
-  // concurrent outbound SDMA copies per GPU, but each peer's channel-0 queue is
-  // bound to engines[0] = the FIRST bit of the KFD recommended_sdma_engine_id_mask
-  // for that link. If KFD recommends the SAME low engine(s) for every peer of a
-  // source, all 7 copies collapse onto ~2 physical SDMA engines (3.5:1
-  // oversubscribe -> serialize -> the 8-way intra can't saturate while 4-way w8
-  // can). The static mi300xOamMap already encodes a DISTINCT engine per (src,dst)
-  // pair (row 0 = {0,7,6,1,2,4,5,3}, all 8 unique), which would spread the 7 peer
-  // copies across 7 distinct engines = full-mesh XGMI concurrency. MORI_SDMA_ENGINE_OAM=1
-  // forces channel 0 onto that OAM engine, bypassing the possibly-collapsing KFD
-  // mask. Default (unset) => byte-identical shipped mapping.
-  // REFUTATION (w16 fp32, the [SDMAENG] diagnostic below,
-  // control run oam=0): for src=0 the 7 cross-node peers dst=1..7 bind to ch0eng =
-  // {14,2,10,6,12,8,4} -- SEVEN DISTINCT physical SDMA engines, fromKFD=1, nEng=1 each.
-  // KFD does NOT collapse the 7 peer copies onto ~2 engines: the flat 8-way local gather
-  // is ALREADY optimally engine-spread (each peer link on its own recommended engine).
-  // => the engine-collapse root cause is FALSE, ENGINE_OAM is a no-op (KFD mask
-  // already spreads), and the director's mechanistic ARGUMENT FOR the 2x4 rebuild
-  // ("4-way=3 peers fits distinct engines where 8-way's 7 oversubscribe") is disproven
-  // (8-way already has 7 distinct engines). Also retro-explains ENGINE_SPREAD's
-  // 0.701 regression (the KFD 1-engine/link map is optimal; any other engine mis-routes)
-  // and corrects the "2 saturated SDMA engines" inference (it is 7). The flat-8way
-  // gap is NOT engine-count -- it is the inter-node reasm/fill byte volume. Keep OFF.
+  // Spread the channels across the engines recommended by KFD for this peer link.
+  // On tested HW the KFD mask already assigns a distinct engine per peer link, so
+  // the optional MORI_SDMA_ENGINE_OAM=1 override (force channel 0 onto the static
+  // OAM-table engine) is a no-op. Default (unset) => byte-identical shipped mapping.
   static const int engMode = []() {
     const char* e = getenv("MORI_SDMA_ENGINE_OAM");
     return e ? atoi(e) : 0;
   }();
   std::vector<uint32_t> engines;
-  bool fromKfd = false;
   if (srcDeviceId == dstDeviceId) {
     // A loopback copy never traverses xGMI and has no self io_link, so KFD
     // reports no recommended engine. Use a general (non-xGMI) SDMA engine.
@@ -352,7 +317,6 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
     for (uint32_t b = 0; b < 32; ++b) {
       if (mask & (1u << b)) engines.push_back(b);
     }
-    fromKfd = !engines.empty();
     // Fall back to the static OAM table if KFD did not report a mask.
     if (engines.empty()) {
       int e = getSdmaEngineId(srcDeviceId, dstDeviceId);
@@ -360,24 +324,12 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
     }
   }
   int numEngines = static_cast<int>(engines.size());
-  // One-time-per-connect diagnostic: which physical SDMA engine each peer link's
-  // channel 0 binds to. Reading this across the 7 peers of a source reveals
-  // whether the flat gather spreads across distinct engines or collapses.
-  {
-    char buf[128];
-    int n = snprintf(buf, sizeof(buf), "[SDMAENG] src=%d dst=%d fromKFD=%d ch0eng=%u nEng=%d oam=%d\n",
-                     srcDeviceId, dstDeviceId, fromKfd ? 1 : 0, engines.empty() ? 999u : engines[0],
-                     numEngines, engMode);
-    (void)n;
-    fputs(buf, stderr);
-  }
 
   auto key = std::make_pair(srcDeviceId, dstDeviceId);
   for (int c = 0; c < numChannels; ++c) {
     uint32_t engineId = engines[c % numEngines];
-    sdma_channels_[key].emplace_back(
-        std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId,
-                                    gpuAgents_[gpuAgentIndexForHipDevice(srcDeviceId)], engineId));
+    sdma_channels_[key].emplace_back(std::make_unique<SdmaQueue>(
+        srcDeviceId, dstDeviceId, gpuAgents_[gpuAgentIndexForHipDevice(srcDeviceId)], engineId));
   }
   return true;
 }
