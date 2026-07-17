@@ -636,7 +636,6 @@ def make_combine(
             P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
         if bid == 0:
             fx.barrier()
-            P.fence_system_acquire()
             if tid == 0:
                 P.store_i32_system(
                     fx.Int64(addr_comb_bar), arith.constant(0), arith.constant(1)
@@ -645,7 +644,6 @@ def make_combine(
             if tid == 0:
                 P.spin_until_eq_i32(fx.Int64(addr_comb_bar), 1)
             fx.barrier()
-            P.fence_system_acquire()
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
@@ -1141,7 +1139,6 @@ def make_combine_scatter(
             P.spin_until_eq_i64(xdb_slot, xdb_cur_flag)
         if bid == 0:
             fx.barrier()
-            P.fence_system_acquire()
             if tid == 0:
                 P.store_i32_system(
                     fx.Int64(addr_comb_bar),
@@ -1152,7 +1149,6 @@ def make_combine_scatter(
             if tid == 0:
                 P.spin_until_eq_i32(fx.Int64(addr_comb_bar), block_num + 1)
             fx.barrier()
-            P.fence_system_acquire()
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
