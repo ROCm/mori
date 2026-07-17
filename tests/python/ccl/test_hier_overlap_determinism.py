@@ -40,6 +40,13 @@ Pass criteria:
     landing race makes reps differ run-to-run.
   * CORRECTNESS: the scalar equals the host-synced reference (bytes were fresh).
 
+This file deliberately gates on a weighted-sum scalar (with a small relative tol
+for legit bf16 ULP noise on a ~1e12 sum) rather than a full-tensor ``torch.equal``:
+it is an overlap-*race* detector, separating non-determinism from stable-but-wrong.
+Full bit-exactness (zero-tolerance ``torch.equal`` vs
+``torch.distributed.all_gather_into_tensor``) for this same path is enforced by
+``test_hier_allgather.py`` and ``test_hier_allgather_param_contiguous.py``.
+
 Run cross-node under torchrun (the path that matters)::
 
     torchrun --nnodes=2 --nproc_per_node=4 ... \
