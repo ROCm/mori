@@ -40,8 +40,10 @@ ag(input_tensor, output_tensor, numel, stream)   # intra=SDMA, inter=RDMA
 ## Results (MI300X, mlx5 RoCEv2 — w16 = 2 node × 8 GPU; all bit-exact vs RCCL)
 
 Raw logs, CSVs, and the plot scripts live under
-[`bench/`](bench/); every figure below is
-regenerated from that data. See **Reproduce** for the exact commands.
+[`bench/`](bench/). The standalone AllGather-bandwidth figure is regenerated
+from that data by `plot_ag_perf.py` (see **Reproduce**); the overlap and E2E
+figures below are captured artifacts from the runs whose raw logs are committed
+alongside them.
 
 ### 1. Standalone AllGather bandwidth vs RCCL (E2E-stable config)
 
@@ -87,6 +89,15 @@ throughput beats the framework default. Three mori variants (intra × inter leg)
 
 ![E2E loss](bench/results/mi300x_mlx5/e2e_all_w16_loss.png)
 ![E2E throughput](bench/results/mi300x_mlx5/e2e_all_w16_tflops.png)
+
+## Second platform (MI355X + AINIC / ionic)
+
+A parallel w16 FSDP2 E2E result set on AMD **MI355X** GPUs with the **AINIC
+(ionic)** RoCEv2 NIC is committed under
+[`bench/results/mi355x_ainic/`](bench/results/mi355x_ainic/README.md) — same
+`run_e2e.sh` script with the ionic node pair / NIC env, headline ~1.08×
+TFLOPS/GPU vs native with bit-identical loss. See that README for the numbers
+and the exact ionic overrides.
 
 ## Reproduce
 
