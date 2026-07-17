@@ -2716,20 +2716,6 @@ class HierAllGather:
             s.synchronize()
         return ret
 
-    def drain_deferred(self) -> bool:
-        """Host-block until the last DEFERRED big-AG (SYNC_BIG_MODE=deferhost) has
-        fully completed, then clear the pending marker. Called by the harness
-        _HierWork.wait() at the FSDP consume point so the proven host CQ-drain
-        lands strictly before the consumer GEMM reads the big-AG output -- with the
-        CPU stall hidden behind the FSDP prefetch distance. No-op if nothing is
-        pending (small AGs / non-deferhost modes)."""
-        ev = getattr(self, "_deferred_drain_event", None)
-        if getattr(self, "_deferred_drain_pending", False) and ev is not None:
-            ev.synchronize()
-            self._deferred_drain_pending = False
-            return True
-        return False
-
     def _graph_replay(self, input_data, output_data, count, stream) -> bool:
         """Launch-collapse: capture the op once into a HIP graph, then replay.
 
