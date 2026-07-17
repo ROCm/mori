@@ -187,10 +187,11 @@ static_assert(sizeof(SDMA_PKT_COPY_WITH_ATOMIC) == 64,
 inline __device__ void SdmaPutWarpFusedS(const void* srcBase, void* dstBase, size_t sliceBytes,
                                          size_t lastSliceBytes,
                                          anvil::SdmaQueueDeviceHandle** deviceHandles,
-                                         HSAuint64* signalsBase, uint32_t qId, int S,
+                                         HSAuint64* signalsBase, uint32_t qId, int logS,
                                          uint64_t addVal = 1) {
+  const int S = 1 << logS;
   const int lane = threadIdx.x % warpSize;
-  constexpr size_t pkt = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
+  constexpr size_t packetSize = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
   // Use the collective-augmented handle (identical layout) so we can issue the
   // b128 placePacketAt / fillNops ring writes.
   auto& handle =
@@ -198,9 +199,8 @@ inline __device__ void SdmaPutWarpFusedS(const void* srcBase, void* dstBase, siz
 
   // Single contiguous reservation for all S packets (done by lane 0). `offset` is
   // wrap-around NOP padding placed before the block so it cannot wrap internally.
-  uint64_t offset = 0;
-  uint64_t startBase = 0;
-  if (lane == 0) startBase = handle.ReserveQueueSpace(pkt * S, offset);
+  uint64_t offset = 0, startBase = 0;
+  if (lane == 0) startBase = handle.ReserveQueueSpace(packetSize << logS, offset);
   // Broadcast both startBase and offset from lane 0 (HIP provides 64-bit __shfl).
   startBase = __shfl(startBase, 0);
   offset = __shfl(offset, 0);
@@ -214,13 +214,14 @@ inline __device__ void SdmaPutWarpFusedS(const void* srcBase, void* dstBase, siz
     SDMA_PKT_COPY_WITH_ATOMIC packet = {
         .copy = anvil::CreateCopyPacket(const_cast<char*>(s), d, sz),
         .atomic = anvil::CreateAtomicAddPacket(signalsBase + lane, addVal)};
-    handle.placePacketAt(packet, startBase + offset + lane * pkt);
+    handle.placePacketAt(packet, startBase + offset + lane * packetSize);
   }
   // Reconverge so all lanes have issued their stores before lane 0 submits; the
   // s_waitcnt(0) inside submitPacket then drains the wave-shared vmcnt for them all.
   __syncwarp();
-  if (lane == 0)
-    handle.submitPacket(startBase, startBase + offset + static_cast<uint64_t>(pkt) * S);
+  if (lane == 0) {
+    handle.submitPacket(startBase, startBase + offset + (packetSize << logS));
+  }
 }
 
 // Multi-producer-safe single-thread put: copy packet + completion atomic.

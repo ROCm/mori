@@ -264,7 +264,7 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
   const int S = 1 << logS;
   // vecSize-aligned slice length; the last slice absorbs the remainder.
   const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize;
-  int tid = threadIdx.x;
+  const int tid = threadIdx.x;
 
   // === Phase 1: SDMA scatter (block 0 only) ====================================
   // Lane (peer,slice) issues an SDMA copy of slice `slice` into destPe's staging
@@ -291,8 +291,9 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
     // off is uniform across peers: my data lands in every peer's staging[myPe] slot.
     const size_t off = reinterpret_cast<uintptr_t>(dstLocal) - heapBase;
 
+    // E.g maximum npes=8 with 8 slices per peer
     if ((npes << logS) <= warpSize) {
-      constexpr size_t pkt = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
+      constexpr size_t paketSize = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
       // --- Fast path (LDS-staged): build packets into bank-conflict-free LDS ----
       // slots, then flush them to the rings with up to npes*S*4 threads (one
       // coalesced b128 store per thread). The build write uses one lane per packet
@@ -304,18 +305,16 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
       __shared__ uint64_t sStart[kRSPushMaxPeers];
       __shared__ uint64_t sOff[kRSPushMaxPeers];
 
-      // -- Build phase: one lane per packet (peer = lane/S, slice = lane%S). --
-      const int lane = tid, npesS = npes << logS;
-      const int peer = (lane < npesS) ? lane >> logS : npes;
-      const int slice = (lane < npesS) ? lane & (S - 1) : 0;
-      const bool bactive = (lane < npesS) && (peer != myPe);
+      // -- Build phase: one lane per packet (peer = tid/S, slice = tid%S). --
+      const int npesS = npes << logS, peer = tid >> logS, slice = tid & (S - 1);
+      const bool bactive = (tid < npesS) && (peer != myPe);
       if (bactive) {
         auto** handles = heapObj->deviceHandles_d + (peer % 8) * numSdmaQ;
         auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
         if (slice == 0) {
           // Leader reserves the whole S-packet block and publishes base/pad to LDS.
           uint64_t offset = 0;
-          uint64_t sb = handle->ReserveQueueSpace(pkt << logS, offset);
+          uint64_t sb = handle->ReserveQueueSpace(paketSize << logS, offset);
           if (offset) handle->fillNops(sb, offset);
           sStart[peer] = sb;
           sOff[peer] = offset;
@@ -330,7 +329,7 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
         // the reg->LDS copy. Layout: copy = dwords 0..6, atomic = dwords 7..14,
         // trailing single-dword NOP = dword 15. Per-field cross-lane stride stays
         // kRSPushSlotDwords (17, coprime to 32 banks) so the build is conflict-free.
-        uint32_t* dw = &pktBuf[lane * kRSPushSlotDwords];  // slot == peer*S + slice == lane
+        uint32_t* dw = &pktBuf[tid * kRSPushSlotDwords];  // slot == peer*S + slice == tid
         anvil::WriteCopyPacket(dw, s, d, sz);
         anvil::WriteAtomicAddPacket(dw + 7, heapObj->peerSignalPtrs[peer] + slice,
                                     (1ull << myPe));
@@ -342,20 +341,19 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
       // strided so it is robust to any blockDim (<= npes*S*4 total b128s). --
       const int totalB128 = npes << (logS + 2);
       for (int fb = tid; fb < totalB128; fb += blockDim.x) {
-        const int fpkt = fb / 4;
-        const int bb = fb % 4;
-        const int fpeer = fpkt >> logS;
-        const int fslice = fpkt & (S - 1);
+        const int fpkt = fb / 4, bb = fb % 4, 
+                 fpeer = fpkt >> logS, fslice = fpkt & (S - 1);
+
         if (fpeer == myPe) continue;  // uniform across the warp (peer-granular)
         auto** handles = heapObj->deviceHandles_d + (fpeer % 8) * numSdmaQ;
         auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
-        const uint64_t wptrIndex = sStart[fpeer] + sOff[fpeer] + fslice * pkt;
-        const uint64_t baseDword = handle->WrapIntoRing(wptrIndex) / sizeof(uint32_t);
+        const uint64_t wptrIndex = sStart[fpeer] + sOff[fpeer] + fslice * paketSize, 
+                       baseDword = handle->WrapIntoRing(wptrIndex) / sizeof(uint32_t);
         // Read the b128 from LDS as 4 dwords (stride-17 slot is 4B- but not
         // 16B-aligned, so avoid ds_read_b128), then store it coalesced to the ring.
-        const int slotBase = fpkt * kRSPushSlotDwords + bb * 4;
-        TVecType<16> v = {pktBuf[slotBase + 0], pktBuf[slotBase + 1], pktBuf[slotBase + 2],
-                          pktBuf[slotBase + 3]};
+        const int slot = fpkt * kRSPushSlotDwords + bb * 4;
+        TVecType<16> v = {pktBuf[slot + 0], pktBuf[slot + 1], pktBuf[slot + 2],
+                          pktBuf[slot + 3]};
         StreamStore<16>(handle->queueBuf + baseDword + bb * 4, v, /*system_scope=*/false);
       }
       // All flush warps must finish + their ring stores be visible to the on-die
@@ -371,7 +369,7 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
       if (bactive && slice == 0) {
         auto** handles = heapObj->deviceHandles_d + (peer % 8) * numSdmaQ;
         auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
-        handle->submitPacket(sStart[peer], sStart[peer] + sOff[peer] + (pkt << logS));
+        handle->submitPacket(sStart[peer], sStart[peer] + sOff[peer] + (paketSize << logS));
       }
     } else {
       // --- Fallback (npes*S > warpSize): warp-strided, one warp per peer. ---
@@ -384,7 +382,8 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
         uint8_t* dst = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + off);
         mori::collective::SdmaPutWarpFusedS(
             src, dst, sliceBytes, lastBytes,
-            handles, heapObj->peerSignalPtrs[destPe], /*qId=*/0, S, /*addVal=*/(1ull << myPe));
+            handles, heapObj->peerSignalPtrs[destPe], /*qId=*/0, logS, 
+            /*addVal=*/(1ull << myPe));
       }
     }
   }
