@@ -69,10 +69,13 @@ def _clamp_sdma_channels():
         return
     if _n > MORI_SDMA_CH_HW_MAX:
         os.environ["MORI_SDMA_NUM_CHANNELS"] = str(MORI_SDMA_CH_HW_MAX)
-        print("[hier_fill] MORI_SDMA_NUM_CHANNELS=%s exceeds the MI300X SDMA "
-              "queue-slot cap (%d); clamping to %d to avoid the anvil.cpp:228 "
-              "queue-creation crash (T47 A)."
-              % (_v, MORI_SDMA_CH_HW_MAX, MORI_SDMA_CH_HW_MAX), flush=True)
+        print(
+            "[hier_fill] MORI_SDMA_NUM_CHANNELS=%s exceeds the MI300X SDMA "
+            "queue-slot cap (%d); clamping to %d to avoid the anvil.cpp:228 "
+            "queue-creation crash (T47 A)."
+            % (_v, MORI_SDMA_CH_HW_MAX, MORI_SDMA_CH_HW_MAX),
+            flush=True,
+        )
 
 
 _clamp_sdma_channels()
@@ -103,7 +106,11 @@ def _auto_ranks_per_node(my_pe: int, npes: int) -> int:
     try:
         import torch.distributed as dist
 
-        if dist.is_available() and dist.is_initialized() and dist.get_world_size() == npes:
+        if (
+            dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() == npes
+        ):
             host = socket.gethostname()
             hosts = [None] * npes
             dist.all_gather_object(hosts, host)
@@ -113,6 +120,7 @@ def _auto_ranks_per_node(my_pe: int, npes: int) -> int:
     except Exception:
         pass
     return npes
+
 
 # NOTE: ``AllgatherSdma`` (and hence the compiled C++ .so) is imported lazily
 # inside ``HierAllGather.__init__`` so that the pure-Python executable specs
@@ -379,7 +387,12 @@ class HierAllGather:
         # Default every-rank-direct (proven correct since ). Toggle via
         # env MORI_HIER_LEADER_ONLY=1 or the explicit arg. See the N>=2 branch.
         if leader_only is None:
-            leader_only = os.environ.get("MORI_HIER_LEADER_ONLY", "0") not in ("0", "", "false", "False")
+            leader_only = os.environ.get("MORI_HIER_LEADER_ONLY", "0") not in (
+                "0",
+                "",
+                "false",
+                "False",
+            )
         self.leader_only = bool(leader_only)
         # M4: opt-in "gather-in-place" -- have the intra-node SDMA
         # gather write its node-block DIRECTLY into the inter-node ring slot,
@@ -388,7 +401,11 @@ class HierAllGather:
         # -> node_block -> ring slot, since ) stays the default.
         if gather_in_place is None:
             gather_in_place = os.environ.get("MORI_HIER_GATHER_IN_PLACE", "0") not in (
-                "0", "", "false", "False")
+                "0",
+                "",
+                "false",
+                "False",
+            )
         self.gather_in_place = bool(gather_in_place)
         # M4: opt-in "out-in-place" -- leave the gathered result in the
         # inter-node ring buffer and read it via ``result_tensor`` instead of
@@ -408,7 +425,7 @@ class HierAllGather:
         #   out-in-place        8.152ms 65.9 GB/s   (+2.6%)
         #   rccl                3.574ms 150.2 GB/s
         # IMPORTANT CORRECTION to the ~2.7ms projection above: removing BOTH
-        # staging copies saves only ~0.2ms end-to-end, NOT ~2.7ms. The 
+        # staging copies saves only ~0.2ms end-to-end, NOT ~2.7ms. The
         # phase attribution timed prepare/finish_sync as isolated Python calls
         # (each with its own stream-sync + ShmemBarrierAll); those D2D copies do
         # NOT serialize on the critical path the way the isolated timing implied
@@ -418,7 +435,11 @@ class HierAllGather:
         # stays opt-in (tiny positive win, but changes the read contract).
         if out_in_place is None:
             out_in_place = os.environ.get("MORI_HIER_OUT_IN_PLACE", "0") not in (
-                "0", "", "false", "False")
+                "0",
+                "",
+                "false",
+                "False",
+            )
         self.out_in_place = bool(out_in_place)
         # M4: opt-in "fuse-barrier" -- drop the intra-node SDMA gather's
         # finish ShmemBarrierAll in the every-rank-direct N>=2 path. The default
@@ -461,7 +482,11 @@ class HierAllGather:
         # for A/B benchmarking against the pre-fuse baseline).
         if fuse_barrier is None:
             fuse_barrier = os.environ.get("MORI_HIER_FUSE_BARRIER", "1") not in (
-                "0", "", "false", "False")
+                "0",
+                "",
+                "false",
+                "False",
+            )
         self.fuse_barrier = bool(fuse_barrier)
         # M5: opt-in SLICED 2-D AllGather -- the real bandwidth lever
         # ( NEXT). The default every-rank-direct path has each of the G
@@ -518,7 +543,11 @@ class HierAllGather:
         # PASS). Set MORI_HIER_SLICE_FUSED=0 for the unfused sliced path.
         if slice_fused is None:
             slice_fused = os.environ.get("MORI_HIER_SLICE_FUSED", "1") not in (
-                "0", "", "false", "False")
+                "0",
+                "",
+                "false",
+                "False",
+            )
         self.slice_fused = bool(slice_fused)
         # M5: opt-in "slice out-of-place elimination" -- run the sliced
         # Phase A inter ring in out_in_place mode and have Phase B read its input
@@ -534,7 +563,11 @@ class HierAllGather:
         # measures. Default OFF; only meaningful with slice_inter.
         if slice_oop is None:
             slice_oop = os.environ.get("MORI_HIER_SLICE_OOP", "0") not in (
-                "0", "", "false", "False")
+                "0",
+                "",
+                "false",
+                "False",
+            )
         self.slice_oop = bool(slice_oop)
         # M5: per-call SIZE THRESHOLD for the sliced path. Same-binary
         # xnode A/B (n08-21+n08-33, N=2 G=4 fp32, >=3 reps, both bit-exact) shows
@@ -551,8 +584,9 @@ class HierAllGather:
         # separates the measured 4 MiB (non-slice) from 64 MiB (slice). Set
         # MORI_HIER_SLICE_MIN_BYTES=0 to force slice at all sizes (A/B / tests).
         if slice_min_bytes is None:
-            slice_min_bytes = int(os.environ.get("MORI_HIER_SLICE_MIN_BYTES",
-                                                 str(8 * 1024 * 1024)))
+            slice_min_bytes = int(
+                os.environ.get("MORI_HIER_SLICE_MIN_BYTES", str(8 * 1024 * 1024))
+            )
         self.slice_min_bytes = max(0, slice_min_bytes)
         # MID/SMALL-SIZE BAND -> stream pipe-overlap path.
         # For per-rank payloads BELOW slice_min_bytes the non-sliced path is far
@@ -567,9 +601,14 @@ class HierAllGather:
         # slice_direct path still wins (8MiB+ measured), so this only re-routes
         # the band the dispatcher previously sent to the slow non-slice path.
         self.pipe_band = os.environ.get("MORI_HIER_PIPE_BAND", "1") not in (
-            "0", "false", "False", "")
+            "0",
+            "false",
+            "False",
+            "",
+        )
         self.pipe_band_min_bytes = int(
-            os.environ.get("MORI_HIER_PIPE_BAND_MIN_BYTES", "0"))
+            os.environ.get("MORI_HIER_PIPE_BAND_MIN_BYTES", "0")
+        )
         # M5: opt-in lever (c) -- OVERLAP Phase-A (inter RDMA ring) with
         # the LOCAL node-block's Phase-B reassembly gather. In the sliced+fused
         # path the gather for block m=node_id needs only slice_g(B_node_id) ==
@@ -585,7 +624,11 @@ class HierAllGather:
         # slice_fused. Default OFF; toggle MORI_HIER_SLICE_OVERLAP=1.
         if slice_overlap is None:
             slice_overlap = os.environ.get("MORI_HIER_SLICE_OVERLAP", "0") not in (
-                "0", "", "false", "False")
+                "0",
+                "",
+                "false",
+                "False",
+            )
         self.slice_overlap = bool(slice_overlap)
         # M5: drop the REDUNDANT Phase-B entry barrier in the sliced+fused
         # NON-overlap path. That path runs the inter ring first; its finish_sync
@@ -605,7 +648,11 @@ class HierAllGather:
         # set MORI_HIER_SLICE_FUSE_IB=0 to restore the entry barrier (A/B).
         if slice_fuse_ib is None:
             slice_fuse_ib = os.environ.get("MORI_HIER_SLICE_FUSE_IB", "1") not in (
-                "0", "", "false", "False")
+                "0",
+                "",
+                "false",
+                "False",
+            )
         self.slice_fuse_ib = bool(slice_fuse_ib)
         # M5: opt-in CHUNKED (strided) Phase-B reassembly -- the enabler
         # for the chunked inter/intra pipeline (the remaining structural lever per
@@ -623,7 +670,11 @@ class HierAllGather:
         # Default OFF; toggle MORI_HIER_SLICE_PIPE=1.
         if slice_pipe is None:
             slice_pipe = os.environ.get("MORI_HIER_SLICE_PIPE", "0") not in (
-                "0", "", "false", "False")
+                "0",
+                "",
+                "false",
+                "False",
+            )
         self.slice_pipe = bool(slice_pipe)
         if slice_pipe_chunks is None:
             slice_pipe_chunks = int(os.environ.get("MORI_HIER_SLICE_PIPE_CHUNKS", "2"))
@@ -700,7 +751,11 @@ class HierAllGather:
         # only affects the slice path, which gates the 64MiB acceptance number).
         # Set MORI_HIER_STREAM_RING=0 / --no-stream-ring to restore host-sync.
         self.stream_ring = os.environ.get("MORI_HIER_STREAM_RING", "1") not in (
-            "0", "", "false", "False")
+            "0",
+            "",
+            "false",
+            "False",
+        )
         # STREAM-ORDERED Phase-B finish_batch. The fused sliced
         # Phase-B still ends with finish_batch = bulk copy-OUT + host
         # hipStreamSynchronize + host ShmemBarrierAll -- the LAST host CPU<->GPU
@@ -711,7 +766,11 @@ class HierAllGather:
         # path uses it. Default ON; set MORI_HIER_STREAM_INTRA=0 /
         # --no-stream-intra to restore the host-synced finish_batch for A/B.
         self.stream_intra = os.environ.get("MORI_HIER_STREAM_INTRA", "1") not in (
-            "0", "", "false", "False")
+            "0",
+            "",
+            "false",
+            "False",
+        )
         # DEFER the Phase-B finish_batch_stream fence. The
         # default fused-stream slice op issues 3 on-stream global ShmemBarrierOn
         # Stream fences/op: inter prepare (#1), inter finish (#2), Phase-B finish
@@ -729,9 +788,12 @@ class HierAllGather:
         # output is already stream-correct. Only the default fused non-overlap,
         # non-pipe, non-oop slice path (which uses finish_batch_stream) defers.
         # Default ON; set MORI_HIER_SLICE_DEFER_FIN=0 to restore the fence (A/B).
-        self.slice_defer_fin = os.environ.get(
-            "MORI_HIER_SLICE_DEFER_FIN", "1"
-        ) not in ("0", "", "false", "False")
+        self.slice_defer_fin = os.environ.get("MORI_HIER_SLICE_DEFER_FIN", "1") not in (
+            "0",
+            "",
+            "false",
+            "False",
+        )
         # defer the INTER ring's finish_stream fence (the
         # stream-ordered ShmemBarrierOnStream guarding cross-PE ring-buffer reuse)
         # to the NEXT slice op's prepare_stream barrier. The ring buffer is reused
@@ -833,8 +895,7 @@ class HierAllGather:
         # reassembly wall (T14 engine-fan WITHIN a gather was fabric-bound; this
         # tests whether MULTIPLE gathers in flight lift utilization).
         try:
-            self.reasm_streams = int(
-                os.environ.get("MORI_HIER_REASM_STREAMS", "1"))
+            self.reasm_streams = int(os.environ.get("MORI_HIER_REASM_STREAMS", "1"))
         except ValueError:
             self.reasm_streams = 1
         if self.reasm_streams < 1:
@@ -983,7 +1044,8 @@ class HierAllGather:
         # MORI_HIER_STANDALONE_DEFER_FIN=0 to restore the finish barrier.
         self._standalone_defer_fin = bool(standalone_fast) and (
             os.environ.get("MORI_HIER_STANDALONE_DEFER_FIN", "1")
-            not in ("0", "", "false", "False"))
+            not in ("0", "", "false", "False")
+        )
         # PHASE 4: pipeline the inter-node RDMA ring with the REMOTE-block XGMI
         # reassembly (the 143->168 GB/s lever). When ON (and on the fuse_local
         # slice_direct path) the fused FusedRingRemoteGatherKernel runs the ring
@@ -992,9 +1054,12 @@ class HierAllGather:
         # whole-phase finish barrier, remote gather overlaps the still-in-flight
         # NIC ring. Only valid at num_nodes==2 (single ring round); default OFF
         # until the standalone bit-exact sweep gate passes.
-        self.fuse_remote = os.environ.get(
-            "MORI_HIER_FUSE_REMOTE", "0"
-        ) not in ("0", "", "false", "False")
+        self.fuse_remote = os.environ.get("MORI_HIER_FUSE_REMOTE", "0") not in (
+            "0",
+            "",
+            "false",
+            "False",
+        )
         # PERSISTENT-KERNEL PORT (director 13:44Z): fold the host hipMemcpyAsync
         # copy-IN of this PE's input into its ring slot INTO the fused kernel (each
         # ring channel stages its own send sub-range before the put). Drops one GPU
@@ -1016,9 +1081,12 @@ class HierAllGather:
         # exclusive on this fabric, so the fixed per-op floor is irreducible on the
         # bit-exact path without forfeiting the overlap that gives mori its winning
         # marginal fill.
-        self.fuse_copyin = os.environ.get(
-            "MORI_HIER_FUSE_COPYIN", "0"
-        ) not in ("0", "", "false", "False")
+        self.fuse_copyin = os.environ.get("MORI_HIER_FUSE_COPYIN", "0") not in (
+            "0",
+            "",
+            "false",
+            "False",
+        )
         # PHASE 4 E2E COHERENCE: the fuse_local win path forces the RED-LINE-safe
         # COPY-ENGINE ring finish (bulk bytes off CUs). But the copy engine is a
         # SEPARATE hw agent whose D2D read of the ring buffer is NOT ordered by the
@@ -1063,9 +1131,12 @@ class HierAllGather:
         # worker -- the same reset-free pattern the classic ring (opGen) and the
         # reassembly-completion flags (gFlagVal) already use. Default OFF
         # (op_gen=0 -> kernel writes 1 / waits <1 / host zeroes -> byte-identical).
-        self._flag_token = os.environ.get(
-            "MORI_HIER_FLAG_TOKEN", "0"
-        ) not in ("0", "", "false", "False")
+        self._flag_token = os.environ.get("MORI_HIER_FLAG_TOKEN", "0") not in (
+            "0",
+            "",
+            "false",
+            "False",
+        )
         self._flag_opgen = 0
         # Device flag-token (MORI_HIER_FLAG_TOKEN_DEV, requires GEN_RING_DBL): like
         # FLAG_TOKEN but the per-op generation is derived device-side from the
@@ -1073,9 +1144,12 @@ class HierAllGather:
         # HIP-graph replay -- the host FLAG_TOKEN counter freezes at capture. Here
         # we only skip the host flags.zero_() so the flags accumulate; the device
         # supplies the strictly-increasing token.
-        self._flag_token_dev = os.environ.get(
-            "MORI_HIER_FLAG_TOKEN_DEV", "0"
-        ) not in ("0", "", "false", "False")
+        self._flag_token_dev = os.environ.get("MORI_HIER_FLAG_TOKEN_DEV", "0") not in (
+            "0",
+            "",
+            "false",
+            "False",
+        )
         # Intra reassembly deep-SQ (MORI_HIER_REASM_DEEPSQ): submit all owned
         # reassembly channels' SDMA copies back-to-back (SQ continuously fed) then a
         # single drain covers them all plus deferred flags, instead of submit+drain
@@ -1091,7 +1165,9 @@ class HierAllGather:
         # path stays byte-identical. Env still overrides either way.
         _rdsq_env = os.environ.get("MORI_HIER_REASM_DEEPSQ")
         if _rdsq_env is not None:
-            self._reasm_deep_sq = 1 if _rdsq_env not in ("0", "", "false", "False") else 0
+            self._reasm_deep_sq = (
+                1 if _rdsq_env not in ("0", "", "false", "False") else 0
+            )
         else:
             self._reasm_deep_sq = 1 if (self.fuse_local or self.fuse_remote) else 0
         # HOST-PROXY INTER producer (MORI_HIER_HOSTPROXY_REASM): lazily built
@@ -1135,7 +1211,9 @@ class HierAllGather:
             else:
                 slice_direct = env_direct not in ("0", "", "false", "False")
         self.slice_direct = None if slice_direct is None else bool(slice_direct)
-        if self.slice_inter and (self.leader_only or self.out_in_place or self.gather_in_place):
+        if self.slice_inter and (
+            self.leader_only or self.out_in_place or self.gather_in_place
+        ):
             raise ValueError(
                 "slice_inter is incompatible with leader_only/out_in_place/"
                 "gather_in_place (it owns the inter+intra data path)"
@@ -1229,14 +1307,19 @@ class HierAllGather:
             # dependency and fewer landing flags). MORI_HIER_W16_DP1=1 forces it on
             # the dense-node gate; default OFF keeps the depth-2 signal default
             # byte-identical.
-            if (os.environ.get("MORI_HIER_W16_DP1", "0") not in
-                    ("0", "", "false", "False")
-                    and "MORI_HIER_DEEP_PIPE" not in os.environ):
+            if (
+                os.environ.get("MORI_HIER_W16_DP1", "0")
+                not in ("0", "", "false", "False")
+                and "MORI_HIER_DEEP_PIPE" not in os.environ
+            ):
                 os.environ["MORI_HIER_DEEP_PIPE"] = "1"
         self.copy_output_to_user = copy_output_to_user
         # isolation probe: force full stream completion at op return.
         self._debug_sync = os.environ.get("MORI_HIER_DEBUG_SYNC", "0") not in (
-            "0", "", "false", "False",
+            "0",
+            "",
+            "false",
+            "False",
         )
         # Dense-node device-landing drain (opt-in, default OFF -- a documented
         # negative kept as an escape hatch).
@@ -1259,7 +1342,10 @@ class HierAllGather:
         # bit-exact. The real dense-node bandwidth lever is a deferred host drain
         # (hide the CPU stall behind FSDP prefetch), not a device-fence replacement.
         self._w16_devdrain = os.environ.get("MORI_HIER_W16_DEVDRAIN", "0") not in (
-            "0", "", "false", "False",
+            "0",
+            "",
+            "false",
+            "False",
         )
         # SYNC_BIG: targeted remote-completion fence on ONLY the big cross-node
         # all-gathers. Ground-truth probing (Phase 6) showed the residual
@@ -1273,7 +1359,10 @@ class HierAllGather:
         # fix). Default OFF; threshold 8 MiB/rank cleanly separates embed/lm_head
         # from the regular transformer-block params for Qwen-class models.
         self._sync_big = os.environ.get("MORI_HIER_SYNC_BIG", "0") not in (
-            "0", "", "false", "False",
+            "0",
+            "",
+            "false",
+            "False",
         )
         self._sync_big_bytes = int(
             os.environ.get("MORI_HIER_SYNC_BIG_BYTES", str(8 * 1024 * 1024))
@@ -1358,7 +1447,10 @@ class HierAllGather:
         # the consumed buffer is a CU op (CU/L2-coherent with the GEMM) WITHOUT a
         # host stall (preserving the AG<->backward overlap). Default ON.
         self._py_cu_copyout = os.environ.get("MORI_HIER_PY_CU_COPYOUT", "1") not in (
-            "0", "", "false", "False",
+            "0",
+            "",
+            "false",
+            "False",
         )
         self._cu_copyout_scratch = None
 
@@ -1415,7 +1507,10 @@ class HierAllGather:
             # an intra-node SDMA broadcast of the full N*G output to the G local
             # ranks: it cuts NIC traffic ~Gx (1 block/node instead of G) at the
             # cost of one extra XGMI hop.
-            from .collective import IntraNodeSubGroupAllgatherSdma, InterNodeRingAllgather
+            from .collective import (
+                IntraNodeSubGroupAllgatherSdma,
+                InterNodeRingAllgather,
+            )
 
             G = self.ranks_per_node
             N = self.num_nodes
@@ -1423,8 +1518,16 @@ class HierAllGather:
             # is the node-block (G shards), so the intra transit must hold G*.
             # output_buffer_size is the full N*G-shard output, which is exactly
             # what the inter-node ring buffer must hold.
-            intra_bytes = G * input_buffer_size if input_buffer_size is not None else 512 * 1024 * 1024
-            inter_bytes = output_buffer_size if output_buffer_size is not None else 512 * 1024 * 1024
+            intra_bytes = (
+                G * input_buffer_size
+                if input_buffer_size is not None
+                else 512 * 1024 * 1024
+            )
+            inter_bytes = (
+                output_buffer_size
+                if output_buffer_size is not None
+                else 512 * 1024 * 1024
+            )
             # M5: the fused sliced Phase B stacks all N reassembly gathers
             # into ONE transit, so it must hold the full N*G-shard output (== the
             # inter ring buffer size), not just a single G-shard node-block.
@@ -1604,8 +1707,7 @@ class HierAllGather:
             # overlap logic) so two resident entries are always distinct live
             # buffers. Insertion-ordered dict = the LRU. Cap via env (default 4;
             # 0/1 restores single-entry behavior). Value = size (for bookkeeping).
-            self._reg_cache_cap = int(
-                os.environ.get("MORI_HIER_REG_CACHE", "4"))
+            self._reg_cache_cap = int(os.environ.get("MORI_HIER_REG_CACHE", "4"))
             self._direct_reg_lru = {}
 
             # resolve the deferred slice_direct default by
@@ -1627,15 +1729,19 @@ class HierAllGather:
         this PE's inter ring buffer (MORI_HIER_HOSTPROXY_REASM)."""
         if self._hp_inter is None:
             from .hostproxy_inter import HostProxyInterProducer
+
             ring_ptr = self._inter._handle.buf_ptr()
             # ring buffer holds ring_size chunks; size it generously (the handle
             # was allocated with inter_bytes >= the full output). Use the full
             # allocated region so any chunk offset is registered.
             ring_bytes = self._inter_ring_bytes
             self._hp_inter = HostProxyInterProducer(
-                my_pe=self.my_pe, npes=self.npes,
+                my_pe=self.my_pe,
+                npes=self.npes,
                 ranks_per_node=self.ranks_per_node,
-                ring_buf_ptr=ring_ptr, ring_buf_bytes=ring_bytes)
+                ring_buf_ptr=ring_ptr,
+                ring_buf_bytes=ring_bytes,
+            )
         return self._hp_inter
 
     def drain_hostproxy(self):
@@ -1699,7 +1805,9 @@ class HierAllGather:
         # for a ptr C++ has already evicted -> find_exact fails / "exceeds output"
         # at the direct gather. Bookkeeping only: C++ does the actual (symmetric)
         # deregister inside register_output_buffer.
-        for k in [k for k in lru if (k[0] < out_ptr + out_size) and (out_ptr < k[0] + k[1])]:
+        for k in [
+            k for k in lru if (k[0] < out_ptr + out_size) and (out_ptr < k[0] + k[1])
+        ]:
             lru.pop(k)
         # capacity eviction (deterministic oldest-first, lockstep collective).
         while len(lru) >= cap:
@@ -1753,7 +1861,11 @@ class HierAllGather:
             stream.synchronize()
         else:
             torch.cuda.synchronize()
-        view = flat.view(self.npes, *tensor.shape) if tensor.dim() > 0 else flat.view(self.npes)
+        view = (
+            flat.view(self.npes, *tensor.shape)
+            if tensor.dim() > 0
+            else flat.view(self.npes)
+        )
         for i in range(self.npes):
             tensor_list[i].copy_(view[i])
         return True
@@ -1787,7 +1899,9 @@ class HierAllGather:
         else:
             torch.add(transit, 0, out=out_flat)
         # Cross-PE reuse fence (no copy-OUT): reuse the direct-path stream fence.
-        self._intra.finish_direct_stream(stream=stream, barrier=not self.slice_defer_fin)
+        self._intra.finish_direct_stream(
+            stream=stream, barrier=not self.slice_defer_fin
+        )
 
     def _get_reasm_pool(self, device):
         # T15: lazily allocate the side-stream pool for MULTI-STREAM Phase-B
@@ -1796,8 +1910,7 @@ class HierAllGather:
         n_side = self.reasm_streams - 1
         if n_side < 1:
             return []
-        if (self._reasm_stream_pool is None
-                or len(self._reasm_stream_pool) < n_side):
+        if self._reasm_stream_pool is None or len(self._reasm_stream_pool) < n_side:
             self._reasm_stream_pool = [
                 torch.cuda.Stream(device=device) for _ in range(n_side)
             ]
@@ -1898,11 +2011,18 @@ class HierAllGather:
         # Skip the capture attempt entirely when a known host-op mode is active so
         # the path degrades to a clean eager fallback. Byte-identical on every
         # default/E2E path (none set HOSTPROXY_REASM); env still overrides.
-        _hp_host_ops = os.environ.get(
-            "MORI_HIER_HOSTPROXY_REASM", "0") not in ("0", "", "false", "False")
-        if os.environ.get("MORI_HIER_CUDA_GRAPH", "1").strip().lower() in (
-            "1", "true", "yes", "on"
-        ) and not self._debug_sync and not _hp_host_ops:
+        _hp_host_ops = os.environ.get("MORI_HIER_HOSTPROXY_REASM", "0") not in (
+            "0",
+            "",
+            "false",
+            "False",
+        )
+        if (
+            os.environ.get("MORI_HIER_CUDA_GRAPH", "1").strip().lower()
+            in ("1", "true", "yes", "on")
+            and not self._debug_sync
+            and not _hp_host_ops
+        ):
             _cg_max_mb = float(os.environ.get("MORI_HIER_CUDA_GRAPH_MAX_MB", "48"))
             # Path-aware gate widening. The 48MB cap exists because the multi-chunk
             # CPU-pipelined path (side-stream ring||reassembly) regresses under
@@ -1918,10 +2038,13 @@ class HierAllGather:
             # (identical kernels/order/buffers, copy on SDMA never CU). E2E
             # byte-identical (no E2E caller sets standalone_fast). Env MAX_MB
             # overrides.
-            if (self._standalone_fast and (self.fuse_remote or self.fuse_local)
-                    and not (self.slice_pipe and self.slice_pipe_chunks > 1)
-                    and not self.slice_overlap
-                    and os.environ.get("MORI_HIER_CUDA_GRAPH_MAX_MB") is None):
+            if (
+                self._standalone_fast
+                and (self.fuse_remote or self.fuse_local)
+                and not (self.slice_pipe and self.slice_pipe_chunks > 1)
+                and not self.slice_overlap
+                and os.environ.get("MORI_HIER_CUDA_GRAPH_MAX_MB") is None
+            ):
                 _cg_max_mb = 0.0  # uncapped: single-grid crown is lossless-capturable
             _cg_bytes = int(count) * int(input_data.element_size())
             if _cg_max_mb <= 0 or _cg_bytes <= _cg_max_mb * 1024 * 1024:
@@ -1939,10 +2062,12 @@ class HierAllGather:
                 # never runs. Bit-exact: the shipped default has all three OFF.
                 if self._flag_token:
                     self._flag_token = False
-                    print("[hier_graph] MORI_HIER_FLAG_TOKEN disabled on the "
-                          "graph-eligible (<=%.0fMB) band: it breaks capture and "
-                          "collapses the launch-collapse win (T22 A)." % _cg_max_mb,
-                          flush=True)
+                    print(
+                        "[hier_graph] MORI_HIER_FLAG_TOKEN disabled on the "
+                        "graph-eligible (<=%.0fMB) band: it breaks capture and "
+                        "collapses the launch-collapse win (T22 A)." % _cg_max_mb,
+                        flush=True,
+                    )
                 if self._graph_replay(input_data, output_data, count, stream):
                     return True
         do_sync = self._debug_sync
@@ -2169,8 +2294,13 @@ class HierAllGather:
             self.fuse_local = _saved_fl_ff
         if _serial_big:
             self.fuse_local, self.slice_direct_overlap = _saved_fl, _saved_sdo
-        if (_serialfast_big or _olapfast_big or _olapfast2_big or _devgate_big
-                or _devtouch_big):
+        if (
+            _serialfast_big
+            or _olapfast_big
+            or _olapfast2_big
+            or _devgate_big
+            or _devtouch_big
+        ):
             self.fuse_local, self.slice_direct_overlap = _saved_fl, _saved_sdo
             self.stream_ring, self.stream_intra = _saved_sr2, _saved_si2
         if _devgate_big:
@@ -2179,6 +2309,7 @@ class HierAllGather:
             # sync-free equivalent of the host stream.synchronize.
             from .collective import launch_device_landing_gate
             from .collective import _stream_to_int
+
             launch_device_landing_gate(_stream_to_int(stream))
             return ret
         if _devtouch_big:
@@ -2186,10 +2317,17 @@ class HierAllGather:
             # THEN the L2-coherent re-touch (cache-coherence fence). Both on the
             # caller stream (stream-ordered, no host stall). Targets the residual
             # each fence alone leaves: gate=Δ-0.0042, coretouch=Δ-0.0093.
-            from .collective import (launch_device_landing_gate,
-                                     launch_l2_coherent_retouch, _stream_to_int)
-            cs = (torch.cuda.current_stream(input_data.device)
-                  if stream is None else stream)
+            from .collective import (
+                launch_device_landing_gate,
+                launch_l2_coherent_retouch,
+                _stream_to_int,
+            )
+
+            cs = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
             si = _stream_to_int(cs)
             launch_device_landing_gate(si)
             n = count * self.ranks_per_node * self.num_nodes
@@ -2224,20 +2362,24 @@ class HierAllGather:
         _all_coherent = (
             self.num_nodes > 1
             and not self._debug_sync
-            and os.environ.get("MORI_HIER_ALL_COHERENT", "0") not in (
-                "0", "", "false", "False"
-            )
+            and os.environ.get("MORI_HIER_ALL_COHERENT", "0")
+            not in ("0", "", "false", "False")
         )
         if _all_coherent:
             from ..shmem import shmem_barrier_on_stream
             from .collective import launch_l2_coherent_retouch, _stream_to_int
-            cs = (torch.cuda.current_stream(input_data.device)
-                  if stream is None else stream)
+
+            cs = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
             shmem_barrier_on_stream(cs)
             n = count * self.ranks_per_node * self.num_nodes
             u32_count = (n * output_data.element_size() + 3) // 4
             launch_l2_coherent_retouch(
-                output_data.data_ptr(), u32_count, _stream_to_int(cs))
+                output_data.data_ptr(), u32_count, _stream_to_int(cs)
+            )
             return ret
         # W16 DEVICE-LANDING DRAIN (Team A T63): device-side equivalent of the
         # per-op host synchronize for EVERY cross-node AG -- cross-PE rendezvous +
@@ -2246,10 +2388,16 @@ class HierAllGather:
         if self._w16_devdrain and self.num_nodes > 1:
             from ..shmem import shmem_barrier_on_stream
             from .collective import launch_device_landing_gate, _stream_to_int
-            cs = (torch.cuda.current_stream(input_data.device)
-                  if stream is None else stream)
-            shmem_barrier_on_stream(cs)          # rendezvous: order peer RDMA + SDMA gather
-            launch_device_landing_gate(_stream_to_int(cs))  # drain mlx5 CQ (bytes landed)
+
+            cs = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
+            shmem_barrier_on_stream(cs)  # rendezvous: order peer RDMA + SDMA gather
+            launch_device_landing_gate(
+                _stream_to_int(cs)
+            )  # drain mlx5 CQ (bytes landed)
             return ret
         # DEBUG_SYNC always host-syncs; SYNC_BIG (barrier mode) prefers a
         # device-side cross-PE barrier on the big AGs (no host stall).
@@ -2263,14 +2411,21 @@ class HierAllGather:
             # ops on the caller stream => stream-ordered, sync-free (keeps overlap).
             from ..shmem import shmem_barrier_on_stream
             from .collective import launch_l2_coherent_retouch, _stream_to_int
-            cs = (torch.cuda.current_stream(input_data.device)
-                  if stream is None else stream)
+
+            cs = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
             shmem_barrier_on_stream(cs)
             n = count * self.ranks_per_node * self.num_nodes
             u32_count = (n * output_data.element_size() + 3) // 4
             launch_l2_coherent_retouch(
-                output_data.data_ptr(), u32_count, _stream_to_int(cs))
-        elif big_ag and not self._debug_sync and self._sync_big_mode == "barriercutouch":
+                output_data.data_ptr(), u32_count, _stream_to_int(cs)
+            )
+        elif (
+            big_ag and not self._debug_sync and self._sync_big_mode == "barriercutouch"
+        ):
             # NEW (Phase-5, new-cluster mlx5): the device barrier and the CU
             # re-touch each close a DIFFERENT half of the big-AG completion race
             # and neither alone is bit-exact on this MI300X/mlx5 pair:
@@ -2292,8 +2447,12 @@ class HierAllGather:
             # add-by-0 is bit-exact for bf16/fp16/fp32/int. Targets ONLY the big
             # embed/lm_head cross-node AGs where the residual race lives.
             from ..shmem import shmem_barrier_on_stream
-            cs = (torch.cuda.current_stream(input_data.device)
-                  if stream is None else stream)
+
+            cs = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
             shmem_barrier_on_stream(cs)
             n = count * self.ranks_per_node * self.num_nodes
             out_flat = output_data.view(-1)[:n]
@@ -2321,16 +2480,22 @@ class HierAllGather:
             # republish (retouch). All on the caller stream, no host stall.
             from ..shmem import shmem_barrier_on_stream
             from .collective import launch_device_landing_gate, _stream_to_int
-            cs = (torch.cuda.current_stream(input_data.device)
-                  if stream is None else stream)
+
+            cs = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
             shmem_barrier_on_stream(cs)
             launch_device_landing_gate(_stream_to_int(cs))
             n = count * self.ranks_per_node * self.num_nodes
             out_flat = output_data.view(-1)[:n]
             with torch.cuda.stream(cs):
                 torch.add(out_flat, 0, out=out_flat)
-        elif big_ag and not self._debug_sync and self._sync_big_mode in (
-            "gateinv", "bargateinv"
+        elif (
+            big_ag
+            and not self._debug_sync
+            and self._sync_big_mode in ("gateinv", "bargateinv")
         ):
             # Phase-5 (Team A, Turn 14 — director 2026-07-08T18:03Z sharpened lever):
             # the CONSUME-SIDE LANDING GATE = device WAIT-on-landing THEN L2 INVALIDATE,
@@ -2355,22 +2520,36 @@ class HierAllGather:
             #      stream-ordered strictly behind step 2 it invalidates a LANDED line
             #      (the director's fix), NOT an un-landed one (plain L2INV_ONLY's bug).
             # All three enqueued on the SAME caller stream => stream-ordered, sync-free.
-            from .collective import (launch_device_landing_gate,
-                                     launch_l2_inv_only, _stream_to_int)
-            cs = (torch.cuda.current_stream(input_data.device)
-                  if stream is None else stream)
+            from .collective import (
+                launch_device_landing_gate,
+                launch_l2_inv_only,
+                _stream_to_int,
+            )
+
+            cs = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
             si = _stream_to_int(cs)
             if self._sync_big_mode == "bargateinv":
                 from ..shmem import shmem_barrier_on_stream
+
                 shmem_barrier_on_stream(cs)
-            launch_device_landing_gate(si)   # WAIT: device CQ-drain (bytes landed)
-            launch_l2_inv_only(si)           # INVALIDATE: buffer_inv (drop stale L2)
+            launch_device_landing_gate(si)  # WAIT: device CQ-drain (bytes landed)
+            launch_l2_inv_only(si)  # INVALIDATE: buffer_inv (drop stale L2)
         elif big_ag and not self._debug_sync and self._sync_big_mode == "barrier":
             from ..shmem import shmem_barrier_on_stream
-            bs = (torch.cuda.current_stream(input_data.device)
-                  if stream is None else stream)
+
+            bs = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
             shmem_barrier_on_stream(bs)
-        elif big_ag and not self._debug_sync and self._sync_big_mode == "barrierthrottle":
+        elif (
+            big_ag and not self._debug_sync and self._sync_big_mode == "barrierthrottle"
+        ):
             # NEW (Phase-5, new-cluster mlx5): device barrier (NIC-landing +
             # cross-PE order) COMPOSED WITH a bounded CPU run-ahead throttle.
             # RATIONALE: on this MI300X/mlx5 pair "barrier" alone cuts the
@@ -2390,8 +2569,12 @@ class HierAllGather:
             # floor). If the last_loss drift is an ACCUMULATION of the barrier's
             # damped residual, this lands bit-exact well above 114 TFLOPS.
             from ..shmem import shmem_barrier_on_stream
-            bts = (torch.cuda.current_stream(input_data.device)
-                   if stream is None else stream)
+
+            bts = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
             shmem_barrier_on_stream(bts)
             if self._sync_big_prev_event is not None:
                 self._sync_big_prev_event.synchronize()
@@ -2414,12 +2597,17 @@ class HierAllGather:
             # is bit-exact for bf16/fp16/fp32 (x rounds to itself) and ints.
             n = count * self.ranks_per_node * self.num_nodes
             out_flat = output_data.view(-1)[:n]
-            cs = (torch.cuda.current_stream(input_data.device)
-                  if stream is None else stream)
+            cs = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
             with torch.cuda.stream(cs):
                 torch.add(out_flat, 0, out=out_flat)
-        elif big_ag and not self._debug_sync and self._sync_big_mode in (
-            "bwdbig", "bwdbigff"
+        elif (
+            big_ag
+            and not self._debug_sync
+            and self._sync_big_mode in ("bwdbig", "bwdbigff")
         ):
             # Selective host-drain, TIGHTER than SYNC_BIG=host. Ground-truth
             # bisection (fwd [FP] bit-exact, bwd [GFP] diverges) exonerates the
@@ -2433,8 +2621,11 @@ class HierAllGather:
             # bwdbigff additionally fast-fills the forward big AG via fuse_local
             # (toggled above); the backward host-drain is identical.
             if not torch.is_grad_enabled():
-                s = (torch.cuda.current_stream(input_data.device)
-                     if stream is None else stream)
+                s = (
+                    torch.cuda.current_stream(input_data.device)
+                    if stream is None
+                    else stream
+                )
                 s.synchronize()
         elif big_ag and not self._debug_sync and self._sync_big_mode == "throttle":
             # Bounded CPU run-ahead throttle: host-wait on the PREVIOUS big AG's
@@ -2442,8 +2633,11 @@ class HierAllGather:
             # big AG's completion for the next call. The current big AG still
             # overlaps with compute -- only the CPU is prevented from getting
             # more than one big-AG ahead of the GPU.
-            s = (torch.cuda.current_stream(input_data.device)
-                 if stream is None else stream)
+            s = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
             if self._sync_big_prev_event is not None:
                 self._sync_big_prev_event.synchronize()
             ev = torch.cuda.Event()
@@ -2467,8 +2661,11 @@ class HierAllGather:
             # above the 0.73x at-issue floor. The event is stashed for the harness;
             # if no harness Work waits on it, the next big AG's at-issue path (or a
             # final drain) still orders it, so correctness never depends on the Work.
-            s = (torch.cuda.current_stream(input_data.device)
-                 if stream is None else stream)
+            s = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
             ev = torch.cuda.Event()
             ev.record(s)
             self._deferred_drain_event = ev
@@ -2485,8 +2682,11 @@ class HierAllGather:
             # kernel + copy-engine/NIC work land (same guarantee as hostbwd's
             # inline s.synchronize(), just deferred + overlapped).
             if not torch.is_grad_enabled():
-                s = (torch.cuda.current_stream(input_data.device)
-                     if stream is None else stream)
+                s = (
+                    torch.cuda.current_stream(input_data.device)
+                    if stream is None
+                    else stream
+                )
                 ev = torch.cuda.Event()
                 ev.record(s)
                 self._deferbwd_event = ev
@@ -2501,12 +2701,18 @@ class HierAllGather:
             # backward), so forward big AGs stay overlapped -- same determinism if
             # the forward exoneration holds, strictly less host stall.
             if not torch.is_grad_enabled():
-                s = (torch.cuda.current_stream(input_data.device)
-                     if stream is None else stream)
+                s = (
+                    torch.cuda.current_stream(input_data.device)
+                    if stream is None
+                    else stream
+                )
                 s.synchronize()
         elif do_sync or big_ag:
-            s = (torch.cuda.current_stream(input_data.device)
-                 if stream is None else stream)
+            s = (
+                torch.cuda.current_stream(input_data.device)
+                if stream is None
+                else stream
+            )
             s.synchronize()
         return ret
 
@@ -2538,11 +2744,14 @@ class HierAllGather:
         if cache is None:
             cache = {}
             self._graph_cache = cache
-        key = (input_data.data_ptr(), output_data.data_ptr(), int(count),
-               str(input_data.dtype))
+        key = (
+            input_data.data_ptr(),
+            output_data.data_ptr(),
+            int(count),
+            str(input_data.dtype),
+        )
         entry = cache.get(key)
-        cs = (torch.cuda.current_stream(input_data.device)
-              if stream is None else stream)
+        cs = torch.cuda.current_stream(input_data.device) if stream is None else stream
         if entry is None:
             # Warm the eager op so registration / scratch alloc / completion
             # state fully settle, THEN capture one replayable graph. The warm
@@ -2563,13 +2772,17 @@ class HierAllGather:
                 # the miss (fall through to eager next time) and name the
                 # blocker -- that host op is the remaining launch-collapse gate.
                 cache[key] = False
-                print(f"[hier_graph] capture FAILED count={count} "
-                      f"dtype={input_data.dtype}: {type(e).__name__}: {e}",
-                      flush=True)
+                print(
+                    f"[hier_graph] capture FAILED count={count} "
+                    f"dtype={input_data.dtype}: {type(e).__name__}: {e}",
+                    flush=True,
+                )
                 return True  # warm runs above already produced a valid output
             cache[key] = graph
-            print(f"[hier_graph] captured count={count} "
-                  f"dtype={input_data.dtype}", flush=True)
+            print(
+                f"[hier_graph] captured count={count} " f"dtype={input_data.dtype}",
+                flush=True,
+            )
             return True
         if entry is False:
             return False  # capture impossible for this key -> eager path
@@ -2625,12 +2838,21 @@ class HierAllGather:
             print(
                 "[hier_path] bytes=%d path=%s slice_direct=%s fuse_local=%s "
                 "slice_fused=%s slice_oop=%s slice_overlap=%s pipe_chunks=%d "
-                "num_blocks=%d numQp=%d" % (
-                    byte_count, path_key, getattr(self, "slice_direct", None),
-                    getattr(self, "fuse_local", None), self.slice_fused,
-                    self.slice_oop, self.slice_overlap, self.slice_pipe_chunks,
-                    self.inter_num_blocks, self.inter_num_qp),
-                flush=True)
+                "num_blocks=%d numQp=%d"
+                % (
+                    byte_count,
+                    path_key,
+                    getattr(self, "slice_direct", None),
+                    getattr(self, "fuse_local", None),
+                    self.slice_fused,
+                    self.slice_oop,
+                    self.slice_overlap,
+                    self.slice_pipe_chunks,
+                    self.inter_num_blocks,
+                    self.inter_num_qp,
+                ),
+                flush=True,
+            )
 
         if use_slice or use_pipe_band:
             # M5: SLICED 2-D AllGather (the bandwidth lever; see __init__).
@@ -2683,7 +2905,11 @@ class HierAllGather:
                 if self._overlap_stream is None:
                     self._overlap_stream = torch.cuda.Stream(device=input_data.device)
                 side = self._overlap_stream
-                main = torch.cuda.current_stream(input_data.device) if stream is None else stream
+                main = (
+                    torch.cuda.current_stream(input_data.device)
+                    if stream is None
+                    else stream
+                )
                 # Side stream must observe the producer of input_data.
                 side.wait_stream(main)
                 off = 0
@@ -2721,11 +2947,15 @@ class HierAllGather:
                     #  - "intra"/"off": DEFER the global barrier; "intra" instead
                     #    arms the first gather with the cheap intra-node subgroup
                     #    barrier (below); "off" leaves it unfenced (drifts).
-                    _fence_global = (self.slice_pipe_fence == "global")
+                    _fence_global = self.slice_pipe_fence == "global"
                     _defer = sr and not _fence_global
                     self._inter(
-                        input_data[off : off + ck], region, ck, stream,
-                        stream_ring=sr, defer_inter_fin=_defer,
+                        input_data[off : off + ck],
+                        region,
+                        ck,
+                        stream,
+                        stream_ring=sr,
+                        defer_inter_fin=_defer,
                     )
                     # Make the side stream observe the ring's copy-OUT (+ the
                     # cross-PE finish barrier when "global") into ``region``.
@@ -2740,7 +2970,7 @@ class HierAllGather:
                     # eats the overlap. Same primitive as fuse_local's
                     # MORI_HIER_FUSE_LOCAL_INTRA_BAR (~3534). Once the first read is
                     # fenced, the remaining N-1 reads of this chunk are safe.
-                    _chunk_intra_bar = (self.slice_pipe_fence == "intra")
+                    _chunk_intra_bar = self.slice_pipe_fence == "intra"
                     for m in range(N):
                         self._intra.gather_kernel(
                             region[m * ck : (m + 1) * ck],
@@ -2774,15 +3004,22 @@ class HierAllGather:
                 side = self._overlap_stream
                 # Make the side stream observe any work already queued on the
                 # caller's stream (e.g. the producer of input_data).
-                main = torch.cuda.current_stream(input_data.device) if stream is None else stream
+                main = (
+                    torch.cuda.current_stream(input_data.device)
+                    if stream is None
+                    else stream
+                )
                 side.wait_stream(main)
                 # Local-block gather on the side stream. Keep its entry barrier
                 # (prepare_barrier=True) -- the single global ShmemBarrierAll that
                 # frees out_ before any peer pushes; host-blocking so it stays
                 # ordered ahead of the ring's barriers. Writes block node_id.
                 self._intra.gather_kernel(
-                    input_data, count, dst_base_offset=node * block_count,
-                    stream=side, prepare_barrier=True,
+                    input_data,
+                    count,
+                    dst_base_offset=node * block_count,
+                    stream=side,
+                    prepare_barrier=True,
                 )
                 # Phase A inter ring on the MAIN stream (overlaps the side gather).
                 if (
@@ -2811,7 +3048,11 @@ class HierAllGather:
                     )
                 # The bulk copy-OUT reads block node_id too, so the side gather
                 # must be visible on the main stream first.
-                main = torch.cuda.current_stream(input_data.device) if stream is None else stream
+                main = (
+                    torch.cuda.current_stream(input_data.device)
+                    if stream is None
+                    else stream
+                )
                 main.wait_stream(side)
                 self._intra.finish_batch(
                     output_data, N * block_count, stream=stream, barrier=True
@@ -2822,8 +3063,14 @@ class HierAllGather:
                 # M5: run the ring out-in-place and read the collection
                 # straight from the (persistent) ring buffer -- no finish copy-OUT
                 # into a separate scratch. ``output_data`` is ignored in this mode.
-                self._inter(input_data, input_data, count, stream, out_in_place=True,
-                            stream_ring=self.stream_ring)
+                self._inter(
+                    input_data,
+                    input_data,
+                    count,
+                    stream,
+                    out_in_place=True,
+                    stream_ring=self.stream_ring,
+                )
                 collection = self._inter.full_tensor(
                     count, input_data.dtype, input_data.device
                 )
@@ -2843,7 +3090,8 @@ class HierAllGather:
                         or buf.device != input_data.device
                     ):
                         buf = torch.empty(
-                            slice_total, dtype=input_data.dtype,
+                            slice_total,
+                            dtype=input_data.dtype,
                             device=input_data.device,
                         )
                         self._big_scratch[p] = buf
@@ -2856,7 +3104,9 @@ class HierAllGather:
                         or self._slice_scratch.device != input_data.device
                     ):
                         self._slice_scratch = torch.empty(
-                            slice_total, dtype=input_data.dtype, device=input_data.device
+                            slice_total,
+                            dtype=input_data.dtype,
+                            device=input_data.device,
                         )
                     collection = self._slice_scratch[:slice_total]
                 # when the direct-path local-block overlap is
@@ -2877,9 +3127,14 @@ class HierAllGather:
                     and not (self.slice_pipe and self.slice_pipe_chunks > 1)
                 )
                 if not overlap_active:
-                    self._inter(input_data, collection, count, stream,
-                                stream_ring=self.stream_ring,
-                                defer_inter_fin=self.slice_defer_inter_fin)
+                    self._inter(
+                        input_data,
+                        collection,
+                        count,
+                        stream,
+                        stream_ring=self.stream_ring,
+                        defer_inter_fin=self.slice_defer_inter_fin,
+                    )
             # Phase B (intra, SDMA): reassemble each node-block B_m from the G
             # local ranks' m-th slices. Gather m writes the full block into
             # output[m*block:(m+1)*block]; the SDMA gather concatenates by
@@ -2920,8 +3175,9 @@ class HierAllGather:
                             )
                             off += ck
                             first = False
-                    self._intra.finish_batch(output_data, N * block_count, stream=stream,
-                                             barrier=True)
+                    self._intra.finish_batch(
+                        output_data, N * block_count, stream=stream, barrier=True
+                    )
                 elif self.slice_direct and self.stream_intra and self.stream_ring:
                     # DIRECT-TO-OUTPUT Phase B. Register the
                     # user output once (collective, cached) then PUSH each
@@ -2937,8 +3193,12 @@ class HierAllGather:
                     # op-to-op) skips the collective entirely; a buffer change runs
                     # exactly {Dereg(old) if old; Reg(new)} uniformly on every PE.
                     self._ensure_output_registered(output_data)
-                    if (self.fuse_remote and self.num_nodes == 2
-                            and not entry_barrier and not self.slice_oop):
+                    if (
+                        self.fuse_remote
+                        and self.num_nodes == 2
+                        and not entry_barrier
+                        and not self.slice_oop
+                    ):
                         # PHASE 4 PIPELINE: one fused launch runs the ring AND,
                         # per landed sub-range, the remote-block SDMA reassembly
                         # straight from this PE's ring buffer into the registered
@@ -2946,6 +3206,7 @@ class HierAllGather:
                         # The remote gather of sub-range j overlaps ring channel
                         # j+1 still crossing the NIC -- fuses the two serial phases.
                         from .collective import launch_fused_ring_remote_gather
+
                         node = self.node_id
                         rb = self._inter.num_blocks
                         # Persistent chunk-landing flag buffer. DEEP_PIPE splits the
@@ -2974,12 +3235,16 @@ class HierAllGather:
                             # count. 16MiB beats 8MiB on the mid-buffer path and stays
                             # under the 32MB coherence window. Only reached on
                             # DEEP_PIPE=auto.
-                            _dp_sub_target = int(os.environ.get(
-                                "MORI_HIER_DEEP_PIPE_SUBBYTES",
-                                str(16 * 1024 * 1024)))
+                            _dp_sub_target = int(
+                                os.environ.get(
+                                    "MORI_HIER_DEEP_PIPE_SUBBYTES",
+                                    str(16 * 1024 * 1024),
+                                )
+                            )
                             _dp_cb = int(count) * int(input_data.element_size())
                             _deep_pipe = int(
-                                (_dp_cb + _dp_sub_target // 2) // _dp_sub_target)
+                                (_dp_cb + _dp_sub_target // 2) // _dp_sub_target
+                            )
                         else:
                             _deep_pipe = int(_dp_raw)
                         if _deep_pipe < 1:
@@ -3016,8 +3281,9 @@ class HierAllGather:
                         # (DEEP_PIPE=1) never enters this block. Note this floor helps
                         # only where the residual is sub-chunk-fill bound, not where it
                         # is fixed-cost bound.
-                        _dp_floor = int(os.environ.get(
-                            "MORI_HIER_DEEP_PIPE_MINBYTES", "0"))
+                        _dp_floor = int(
+                            os.environ.get("MORI_HIER_DEEP_PIPE_MINBYTES", "0")
+                        )
                         if _deep_pipe > 1 and _dp_floor > 0:
                             _dp_max_depth = max(1, _dp_chunk_bytes // _dp_floor)
                             if _deep_pipe > _dp_max_depth:
@@ -3043,20 +3309,29 @@ class HierAllGather:
                         # MINBYTES floor cap above, and B's per-size DP2/4/8/16 are each
                         # independently bit-exact). Default 1 => OFF => byte-identical
                         # shipped path (block already skipped at DEEP_PIPE=1).
-                        _dp_min_depth = int(os.environ.get(
-                            "MORI_HIER_DP_MIN_DEPTH", "1"))
+                        _dp_min_depth = int(
+                            os.environ.get("MORI_HIER_DP_MIN_DEPTH", "1")
+                        )
                         if _dp_min_depth > 1 and _dp_chunk_bytes >= 32:
                             _dp_split_cap = max(1, _dp_chunk_bytes // 16)
                             _dp_tgt = min(_dp_min_depth, _dp_split_cap, 16)
                             if _dp_tgt > _deep_pipe:
                                 _deep_pipe = _dp_tgt
-                        _dp_window = int(os.environ.get(
-                            "MORI_HIER_DEEP_PIPE_MAXBYTES",
-                            str(32 * 1024 * 1024)))
-                        _dp_sub_bytes = (_dp_chunk_bytes // _deep_pipe
-                                         if _deep_pipe > 1 else _dp_chunk_bytes)
-                        if (_deep_pipe > 1 and _dp_window > 0
-                                and _dp_sub_bytes >= _dp_window):
+                        _dp_window = int(
+                            os.environ.get(
+                                "MORI_HIER_DEEP_PIPE_MAXBYTES", str(32 * 1024 * 1024)
+                            )
+                        )
+                        _dp_sub_bytes = (
+                            _dp_chunk_bytes // _deep_pipe
+                            if _deep_pipe > 1
+                            else _dp_chunk_bytes
+                        )
+                        if (
+                            _deep_pipe > 1
+                            and _dp_window > 0
+                            and _dp_sub_bytes >= _dp_window
+                        ):
                             _deep_pipe = 1
                         # PER-PE TOTAL FLOOR (Turn26 A): mirror the C++
                         # HierDeepPipeMinBytes gate (MORI_HIER_DEEP_PIPE_MIN_MB,
@@ -3076,10 +3351,14 @@ class HierAllGather:
                         # CONSTRUCTION (a caged chunk takes the identical deepPipe<=1
                         # code path the kernel takes). Default 0 => no floor =>
                         # byte-identical shipped path (matches the C++ default).
-                        _dp_floor_mb = int(os.environ.get(
-                            "MORI_HIER_DEEP_PIPE_MIN_MB", "0"))
-                        if (_deep_pipe > 1 and _dp_floor_mb > 0
-                                and _dp_chunk_bytes < _dp_floor_mb * 1024 * 1024):
+                        _dp_floor_mb = int(
+                            os.environ.get("MORI_HIER_DEEP_PIPE_MIN_MB", "0")
+                        )
+                        if (
+                            _deep_pipe > 1
+                            and _dp_floor_mb > 0
+                            and _dp_chunk_bytes < _dp_floor_mb * 1024 * 1024
+                        ):
                             _deep_pipe = 1
                         # DP-DEBUG (T34): one-time-per-distinct-size print of the
                         # RESOLVED deep-pipe depth so we can confirm whether the giant
@@ -3087,28 +3366,39 @@ class HierAllGather:
                         # the crown whole-chunk fence (depth==1). Diagnostic only; env-
                         # gated, no effect on the shipped path.
                         if os.environ.get("MORI_HIER_DP_DEBUG", "") not in (
-                                "", "0", "false", "False"):
+                            "",
+                            "0",
+                            "false",
+                            "False",
+                        ):
                             _dbg = getattr(self, "_dp_dbg_seen", None)
                             if _dbg is None:
                                 _dbg = self._dp_dbg_seen = set()
                             _dbg_key = (int(_dp_chunk_bytes), int(_deep_pipe))
                             if _dbg_key not in _dbg:
                                 _dbg.add(_dbg_key)
-                                _sub = (_dp_chunk_bytes // _deep_pipe
-                                        if _deep_pipe > 1 else _dp_chunk_bytes)
+                                _sub = (
+                                    _dp_chunk_bytes // _deep_pipe
+                                    if _deep_pipe > 1
+                                    else _dp_chunk_bytes
+                                )
                                 print(
                                     f"[dp-debug] perPE_chunk_MB="
                                     f"{_dp_chunk_bytes/1048576:.2f} depth={_deep_pipe} "
                                     f"sub_MB={_sub/1048576:.2f}",
-                                    flush=True)
+                                    flush=True,
+                                )
                         _flag_slots = max(rb, _deep_pipe if rb == 1 else 1, 1)
                         # PER-QP FINE-GRAIN INTER-ARRIVAL DRAIN (MORI_HIER_SHARD_DRAIN):
                         # the producer publishes one landing flag per QP shard (sw =
                         # min(numQp, 8)), so chunkReadyFlags needs numQp slots (>2 the
                         # deep_pipe default). Bump the buffer accordingly; default OFF
                         # leaves _flag_slots byte-identical.
-                        if os.environ.get("MORI_HIER_SHARD_DRAIN", "0") not in (
-                                "", "0", "false", "False") and rb == 1:
+                        if (
+                            os.environ.get("MORI_HIER_SHARD_DRAIN", "0")
+                            not in ("", "0", "false", "False")
+                            and rb == 1
+                        ):
                             _sw = min(int(self.inter_num_qp), 8)
                             if _sw > _flag_slots:
                                 _flag_slots = _sw
@@ -3128,12 +3418,14 @@ class HierAllGather:
                         # per-call alloc, and DEEP_PIPE=1 (shipped default) never
                         # enters this block so the default path stays byte-identical.
                         _dp_layout = (_flag_slots, int(count), _deep_pipe)
-                        if (self._chunk_ready_flags is None
-                                or self._chunk_ready_flags.numel() < _flag_slots
-                                or self._chunk_ready_flags_layout != _dp_layout):
+                        if (
+                            self._chunk_ready_flags is None
+                            or self._chunk_ready_flags.numel() < _flag_slots
+                            or self._chunk_ready_flags_layout != _dp_layout
+                        ):
                             self._chunk_ready_flags = torch.zeros(
-                                _flag_slots, dtype=torch.int64,
-                                device=input_data.device)
+                                _flag_slots, dtype=torch.int64, device=input_data.device
+                            )
                             self._chunk_ready_flags_layout = _dp_layout
                         flags = self._chunk_ready_flags
                         # GEN-TOKEN (T28): in token mode advance the per-op
@@ -3158,8 +3450,8 @@ class HierAllGather:
                         # chunkReadyFlags[f] after its send-CQ drains. Build the
                         # producer lazily against THIS PE's ring buffer.
                         _hp_reasm = os.environ.get(
-                            "MORI_HIER_HOSTPROXY_REASM", "0") not in (
-                            "0", "", "false", "False")
+                            "MORI_HIER_HOSTPROXY_REASM", "0"
+                        ) not in ("0", "", "false", "False")
                         _hp_prod = None
                         if _hp_reasm:
                             _hp_prod = self._get_hostproxy_inter()
@@ -3167,19 +3459,24 @@ class HierAllGather:
                         # fuse_copyin: skip the host copy-IN; the fused kernel stages
                         # each channel's send sub-range in-kernel (single-launch collapse).
                         if self.fuse_copyin:
-                            ring_args, u32c, s_main = \
+                            ring_args, u32c, s_main = (
                                 self._inter.prepare_stream_only_no_copyin(
-                                    input_data, count, stream)
+                                    input_data, count, stream
+                                )
+                            )
                         else:
                             ring_args, u32c, s_main = self._inter.prepare_stream_only(
-                                input_data, count, stream)
+                                input_data, count, stream
+                            )
                         if _hp_prod is not None:
                             # record the copy-IN so the host RDMA read sees it.
                             if self._hp_src_ev is None:
                                 self._hp_src_ev = torch.cuda.Event()
                             self._hp_src_ev.record(
                                 torch.cuda.current_stream(input_data.device)
-                                if stream is None else stream)
+                                if stream is None
+                                else stream
+                            )
                         # Local-block direct-gather jit_args (m == node_id): reads
                         # this rank's own input, no ring dependency.
                         gather_args = self._intra.prepare_direct_only(
@@ -3209,9 +3506,12 @@ class HierAllGather:
                         # the default so the SPATIAL reassembly split (rb==1,
                         # REASSEM_BLOCKS>1) actually lands on distinct queues/engines
                         # instead of wrapping onto queue 0 (per-queue counter race).
-                        _sdma_nq = int(os.environ.get(
-                            "MORI_HIER_SDMA_NQ",
-                            os.environ.get("MORI_SDMA_NUM_CHANNELS", "2")))
+                        _sdma_nq = int(
+                            os.environ.get(
+                                "MORI_HIER_SDMA_NQ",
+                                os.environ.get("MORI_SDMA_NUM_CHANNELS", "2"),
+                            )
+                        )
                         # T12 (A) NOTE: the fused-remote reassembly worker drives
                         # SDMA queue q = (j+1) % nq_physical (kernel, ccl_kernels.hip
                         # qId=j+1) while the local-block CTA owns queue 0. nq>=2 is
@@ -3237,8 +3537,11 @@ class HierAllGather:
                         # identical at the default nq=2 (reasm still clamps to 1); the
                         # E2E giant-AG path runs nq=2 so it is unaffected. Explicit
                         # MORI_HIER_REASSEM_BLOCKS still overrides.
-                        reasm = int(os.environ.get(
-                            "MORI_HIER_REASSEM_BLOCKS", str(max(1, _sdma_nq - 1))))
+                        reasm = int(
+                            os.environ.get(
+                                "MORI_HIER_REASSEM_BLOCKS", str(max(1, _sdma_nq - 1))
+                            )
+                        )
                         if reasm > _sdma_nq - 1:
                             reasm = _sdma_nq - 1
                         if reasm < 1:
@@ -3253,11 +3556,18 @@ class HierAllGather:
                         if _pcp is not None:
                             _parity_ptr = _pcp()
                         launch_fused_ring_remote_gather(
-                            ring_args, gather_args, rb,
-                            flags.data_ptr(), N, node, s_main,
-                            reassembly_blocks=reasm, op_gen=_op_gen,
+                            ring_args,
+                            gather_args,
+                            rb,
+                            flags.data_ptr(),
+                            N,
+                            node,
+                            s_main,
+                            reassembly_blocks=reasm,
+                            op_gen=_op_gen,
                             reasm_deep_sq=self._reasm_deep_sq,
-                            parity_ptr=_parity_ptr)
+                            parity_ptr=_parity_ptr,
+                        )
                         if _hp_prod is not None:
                             # The kernel is now live: ring CTAs no-op (host owns
                             # inter), reassembly workers spin on chunkReadyFlags.
@@ -3267,21 +3577,27 @@ class HierAllGather:
                             # publishes chunkReadyFlags[f] so the reassembly runs.
                             chunk_bytes = count * input_data.element_size()
                             _hp_async = os.environ.get(
-                                "MORI_HIER_HOSTPROXY_ASYNC", "0") not in (
-                                "0", "", "false", "False")
+                                "MORI_HIER_HOSTPROXY_ASYNC", "0"
+                            ) not in ("0", "", "false", "False")
                             if _hp_async:
                                 # non-blocking: worker owns the inter round-trip
                                 # so the caller keeps issuing / computing while it
                                 # runs; the kernel + deferred fence gate consume.
                                 _hp_prod.fill_async(
-                                    chunk_bytes, _deep_pipe, flags,
+                                    chunk_bytes,
+                                    _deep_pipe,
+                                    flags,
                                     src_ready_event=self._hp_src_ev,
-                                    stream=stream)
+                                    stream=stream,
+                                )
                             else:
                                 _hp_prod.fill(
-                                    chunk_bytes, _deep_pipe, flags,
+                                    chunk_bytes,
+                                    _deep_pipe,
+                                    flags,
                                     src_ready_event=self._hp_src_ev,
-                                    stream=stream)
+                                    stream=stream,
+                                )
                         # Single completion fence (no copy-OUT: gathers already
                         # pushed straight into the user output).
                         # Standalone finish-barrier deferral: at ranks_per_node>=8 the
@@ -3306,7 +3622,8 @@ class HierAllGather:
                         if self._standalone_defer_fin:
                             _crown_fin_barrier = False
                         self._intra.finish_direct_stream(
-                            stream=stream, barrier=_crown_fin_barrier)
+                            stream=stream, barrier=_crown_fin_barrier
+                        )
                         # PHASE-5 CU-COHERENT COPY-OUT (MORI_HIER_FUSE_REMOTE_RETOUCH):
                         # the fused kernel lands every peer's SDMA push into the
                         # output (per-queue SdmaQueitThread + threadfence + flag,
@@ -3321,13 +3638,17 @@ class HierAllGather:
                         if os.environ.get(
                             "MORI_HIER_FUSE_REMOTE_RETOUCH", "0"
                         ).strip().lower() in ("1", "true", "yes", "on"):
-                            from .collective import (launch_l2_coherent_retouch,
-                                                     _stream_to_int)
-                            _u32 = (output_data.numel() *
-                                    output_data.element_size()) // 4
+                            from .collective import (
+                                launch_l2_coherent_retouch,
+                                _stream_to_int,
+                            )
+
+                            _u32 = (
+                                output_data.numel() * output_data.element_size()
+                            ) // 4
                             launch_l2_coherent_retouch(
-                                output_data.data_ptr(), _u32,
-                                _stream_to_int(stream))
+                                output_data.data_ptr(), _u32, _stream_to_int(stream)
+                            )
                     elif self.fuse_local and not entry_barrier and not self.slice_oop:
                         # FUSED ring || local-block gather in ONE
                         # kernel launch (NIC ring blocks [0,num_blocks) || XGMI
@@ -3343,9 +3664,13 @@ class HierAllGather:
                         # blocks (which DO depend on the ring) still follow as
                         # separate direct gathers after the ring copy-OUT.
                         from .collective import launch_fused_ring_local_gather
+
                         node = self.node_id
-                        main = (torch.cuda.current_stream(input_data.device)
-                                if stream is None else stream)
+                        main = (
+                            torch.cuda.current_stream(input_data.device)
+                            if stream is None
+                            else stream
+                        )
                         # Ring prepare = global entry barrier + copy-IN (no kernel
                         # launch yet); returns the ring jit_args ptr.
                         # When MORI_HIER_FUSE_COPYIN is on, skip the host copy-IN --
@@ -3355,10 +3680,13 @@ class HierAllGather:
                         if self.fuse_copyin:
                             ring_args, u32c, s_main = (
                                 self._inter.prepare_stream_only_no_copyin(
-                                    input_data, count, stream))
+                                    input_data, count, stream
+                                )
+                            )
                         else:
                             ring_args, u32c, s_main = self._inter.prepare_stream_only(
-                                input_data, count, stream)
+                                input_data, count, stream
+                            )
                         # Local-block direct-gather jit_args (no launch); writes
                         # block node_id straight into the registered output.
                         gather_args = self._intra.prepare_direct_only(
@@ -3373,7 +3701,8 @@ class HierAllGather:
                         # (1 CTA), concurrent on the same stream after the entry
                         # barrier. No host wait_stream merge.
                         launch_fused_ring_local_gather(
-                            ring_args, gather_args, self._inter.num_blocks, s_main)
+                            ring_args, gather_args, self._inter.num_blocks, s_main
+                        )
                         # Ring finish copy-OUT into the collection scratch (the
                         # ring kernel already ran inside the fused launch -- do NOT
                         # relaunch it). RED-LINE: force the COPY-ENGINE finish (not
@@ -3423,7 +3752,11 @@ class HierAllGather:
                         _fl_nocopy_env = os.environ.get("MORI_HIER_FUSE_LOCAL_NOCOPY")
                         if _fl_nocopy_env is not None:
                             _fl_nocopy = _fl_nocopy_env.strip().lower() in (
-                                "1", "true", "yes", "on")
+                                "1",
+                                "true",
+                                "yes",
+                                "on",
+                            )
                         else:
                             _fl_nocopy = bool(getattr(self, "_standalone_fast", False))
                         if _fl_nocopy:
@@ -3433,13 +3766,17 @@ class HierAllGather:
                             # ring landing before any reassembly read and complete
                             # the op, so no separate ring copy-OUT fence is needed.
                             reasm_src = self._inter.full_tensor(
-                                count, input_data.dtype, input_data.device)
+                                count, input_data.dtype, input_data.device
+                            )
                         else:
                             reasm_src = collection
                             self._inter.finish_ring_stream(
-                                collection, count, stream,
+                                collection,
+                                count,
+                                stream,
                                 barrier=not self.slice_defer_inter_fin,
-                                cu_copyout=_fl_cu)
+                                cu_copyout=_fl_cu,
+                            )
                         # Remaining (remote) blocks read the ring collection.
                         # PHASE 4 E2E-SAFETY: the remote reassembly is an INTRA-node
                         # subgroup gather -- each local rank SDMA-pushes its OWN
@@ -3470,8 +3807,12 @@ class HierAllGather:
                             # T15: MULTI-STREAM the N-1 remote reassembly gathers
                             # (disjoint output blocks; entry barrier on the first,
                             # which runs on main so side lanes observe it).
-                            main = (torch.cuda.current_stream(input_data.device)
-                                    if stream is None else stream)
+                            main = (
+                                torch.cuda.current_stream(input_data.device)
+                                if stream is None
+                                else stream
+                            )
+
                             def _mkr(m, first, lane):
                                 def _run(s):
                                     self._intra.gather_kernel_direct(
@@ -3485,10 +3826,14 @@ class HierAllGather:
                                         # so concurrent gathers never race.
                                         flag_slot_base=lane * self.ranks_per_node,
                                     )
+
                                 return _run
+
                             self._multistream_gathers(
                                 [_mkr(m, i == 0, i) for i, m in enumerate(remotes)],
-                                main, input_data.device)
+                                main,
+                                input_data.device,
+                            )
                         else:
                             _first_remote = True
                             for m in remotes:
@@ -3502,8 +3847,13 @@ class HierAllGather:
                                 )
                                 _first_remote = False
                         self._intra.finish_direct_stream(
-                            stream=stream, barrier=not self.slice_defer_fin)
-                    elif self.slice_direct_overlap and not entry_barrier and not self.slice_oop:
+                            stream=stream, barrier=not self.slice_defer_fin
+                        )
+                    elif (
+                        self.slice_direct_overlap
+                        and not entry_barrier
+                        and not self.slice_oop
+                    ):
                         # overlap the LOCAL node-block (m=node_id)
                         # reassembly gather (reads only this rank's own input, no
                         # ring dependency) on a side stream concurrently with the
@@ -3512,13 +3862,18 @@ class HierAllGather:
                         node = self.node_id
                         if self._overlap_stream is None:
                             self._overlap_stream = torch.cuda.Stream(
-                                device=input_data.device)
+                                device=input_data.device
+                            )
                         side = self._overlap_stream
-                        main = (torch.cuda.current_stream(input_data.device)
-                                if stream is None else stream)
+                        main = (
+                            torch.cuda.current_stream(input_data.device)
+                            if stream is None
+                            else stream
+                        )
                         # Ring prepare = global entry barrier + copy-IN (main).
                         args, u32c, s_main = self._inter.prepare_stream_only(
-                            input_data, count, stream)
+                            input_data, count, stream
+                        )
                         # Side stream observes the entry barrier, then runs the
                         # local-block gather barrier-free, concurrent with the ring.
                         side.wait_stream(main)
@@ -3532,8 +3887,12 @@ class HierAllGather:
                         )
                         # Ring kernel + finish on main (overlaps the side gather).
                         self._inter.launch_finish_stream(
-                            args, collection, u32c, s_main,
-                            barrier=not self.slice_defer_inter_fin)
+                            args,
+                            collection,
+                            u32c,
+                            s_main,
+                            barrier=not self.slice_defer_inter_fin,
+                        )
                         # Remaining (remote) blocks read the ring collection (main).
                         for m in range(N):
                             if m == node:
@@ -3549,11 +3908,16 @@ class HierAllGather:
                         # Merge the side local-block gather before the op fence.
                         main.wait_stream(side)
                         self._intra.finish_direct_stream(
-                            stream=stream, barrier=not self.slice_defer_fin)
+                            stream=stream, barrier=not self.slice_defer_fin
+                        )
                     elif self.reasm_streams > 1 and N > 1:
                         # T15: MULTI-STREAM the N disjoint reassembly gathers.
-                        main = (torch.cuda.current_stream(input_data.device)
-                                if stream is None else stream)
+                        main = (
+                            torch.cuda.current_stream(input_data.device)
+                            if stream is None
+                            else stream
+                        )
+
                         def _mk(m, lane):
                             def _run(s):
                                 self._intra.gather_kernel_direct(
@@ -3567,12 +3931,17 @@ class HierAllGather:
                                     # concurrent gathers never race on flag slots.
                                     flag_slot_base=lane * self.ranks_per_node,
                                 )
+
                             return _run
+
                         self._multistream_gathers(
                             [_mk(m, i) for i, m in enumerate(range(N))],
-                            main, input_data.device)
+                            main,
+                            input_data.device,
+                        )
                         self._intra.finish_direct_stream(
-                            stream=stream, barrier=not self.slice_defer_fin)
+                            stream=stream, barrier=not self.slice_defer_fin
+                        )
                     else:
                         for m in range(N):
                             self._intra.gather_kernel_direct(
@@ -3584,7 +3953,8 @@ class HierAllGather:
                                 prepare_barrier=(entry_barrier and m == 0),
                             )
                         self._intra.finish_direct_stream(
-                            stream=stream, barrier=not self.slice_defer_fin)
+                            stream=stream, barrier=not self.slice_defer_fin
+                        )
                 else:
                     for m in range(N):
                         self._intra.gather_kernel(
@@ -3604,11 +3974,15 @@ class HierAllGather:
                         self._cu_copyout_finish(output_data, N * block_count, stream)
                     elif self.stream_intra and self.stream_ring:
                         self._intra.finish_batch_stream(
-                            output_data, N * block_count, stream=stream,
-                            barrier=not self.slice_defer_fin)
+                            output_data,
+                            N * block_count,
+                            stream=stream,
+                            barrier=not self.slice_defer_fin,
+                        )
                     else:
-                        self._intra.finish_batch(output_data, N * block_count, stream=stream,
-                                                 barrier=True)
+                        self._intra.finish_batch(
+                            output_data, N * block_count, stream=stream, barrier=True
+                        )
             else:
                 for m in range(N):
                     self._intra(
@@ -3666,8 +4040,14 @@ class HierAllGather:
             # fuse_barrier: the inter ring's prepare_sync_in_place
             # ShmemBarrierAll follows immediately, covering the dropped barrier.
             #: also drop the entry barrier from the 2nd op onward.
-            self._intra(input_data, node_block, count, stream, barrier=not self.fuse_barrier,
-                        prepare_barrier=intra_prepare_barrier)
+            self._intra(
+                input_data,
+                node_block,
+                count,
+                stream,
+                barrier=not self.fuse_barrier,
+                prepare_barrier=intra_prepare_barrier,
+            )
             # Phase 2 (inter, RDMA ring): all-gather the N node-blocks across
             # nodes, laid down in node order -> the full rank-major output.
             if self.out_in_place:
@@ -3675,11 +4055,17 @@ class HierAllGather:
                 # result_tensor); skip the finish_sync copy-OUT. ZERO staging on
                 # either side (copy-IN already dropped by chunk_in_place).
                 self._inter(
-                    node_block, output_data, block_count, stream,
-                    chunk_in_place=True, out_in_place=True,
+                    node_block,
+                    output_data,
+                    block_count,
+                    stream,
+                    chunk_in_place=True,
+                    out_in_place=True,
                 )
             else:
-                self._inter(node_block, output_data, block_count, stream, chunk_in_place=True)
+                self._inter(
+                    node_block, output_data, block_count, stream, chunk_in_place=True
+                )
             self._prev_op_completed = True
             return True
 
@@ -3697,8 +4083,14 @@ class HierAllGather:
         # every-rank-direct path, where the inter ring's prepare_sync barrier
         # follows immediately. Leader-only keeps the barrier (unchanged).
         intra_barrier = not (self.fuse_barrier and not self.leader_only)
-        self._intra(input_data, node_block, count, stream, barrier=intra_barrier,
-                    prepare_barrier=intra_prepare_barrier)
+        self._intra(
+            input_data,
+            node_block,
+            count,
+            stream,
+            barrier=intra_barrier,
+            prepare_barrier=intra_prepare_barrier,
+        )
 
         if not self.leader_only:
             # Phase 2 (inter, RDMA ring): staged path (default) -- prepare_sync
@@ -3726,7 +4118,9 @@ class HierAllGather:
                 self._ring_scratch = torch.empty(
                     block_count, dtype=input_data.dtype, device=input_data.device
                 )
-            self._inter(node_block, self._ring_scratch[:block_count], block_count, stream)
+            self._inter(
+                node_block, self._ring_scratch[:block_count], block_count, stream
+            )
 
         # Phase 3 (intra, SDMA broadcast): leader (root, group_pos 0) fans its
         # full N*G output to the G local ranks over XGMI. Non-root members get
@@ -3783,7 +4177,6 @@ class HierAllGather:
             return False
 
         W = self.npes
-        G = self.ranks_per_node
         N = self.num_nodes
 
         ss = split_sizes.tolist() if torch.is_tensor(split_sizes) else list(split_sizes)
@@ -3798,8 +4191,8 @@ class HierAllGather:
         # SDMA needs 4-byte-aligned byte extents; the adapter pads params to
         # honor this, but guard here so a bad layout falls back to copy-OUT
         # rather than corrupting output.
-        for E, O in zip(ss, so):
-            if (E * elem) % 4 != 0 or (O * elem) % 4 != 0:
+        for E, off in zip(ss, so):
+            if (E * elem) % 4 != 0 or (off * elem) % 4 != 0:
                 return False
 
         slice_total = count * N
@@ -3818,8 +4211,10 @@ class HierAllGather:
         out_ptr = output_data.data_ptr()
         out_size = output_data.numel() * output_data.element_size()
         if self._reg_cache_cap <= 1:
-            _reg_changed = (out_ptr, out_size) != (self._direct_reg_ptr,
-                                                   self._direct_reg_size)
+            _reg_changed = (out_ptr, out_size) != (
+                self._direct_reg_ptr,
+                self._direct_reg_size,
+            )
         else:
             _reg_changed = (out_ptr, out_size) not in self._direct_reg_lru
         self._ensure_output_registered(output_data)
@@ -3836,8 +4231,11 @@ class HierAllGather:
                 sys.stderr.write(
                     "[MORI_HIER_REG_STATS] calls=%d reg_changes=%d (%.1f%% of calls "
                     "trigger a cross-node register collective)\n"
-                    % (self._reg_calls, getattr(self, "_reg_changes", 0),
-                       100.0 * getattr(self, "_reg_changes", 0) / self._reg_calls)
+                    % (
+                        self._reg_calls,
+                        getattr(self, "_reg_changes", 0),
+                        100.0 * getattr(self, "_reg_changes", 0) / self._reg_calls,
+                    )
                 )
                 sys.stderr.flush()
 
@@ -3852,11 +4250,13 @@ class HierAllGather:
         if getattr(self, "_pc_u32_key", None) != _u32_key:
             self._pc_u32_ss = torch.tensor(
                 [(E * elem) // u32 for E in ss],
-                dtype=torch.int64, device=input_data.device,
+                dtype=torch.int64,
+                device=input_data.device,
             )
             self._pc_u32_so = torch.tensor(
-                [(O * elem) // u32 for O in so],
-                dtype=torch.int64, device=input_data.device,
+                [(off * elem) // u32 for off in so],
+                dtype=torch.int64,
+                device=input_data.device,
             )
             self._pc_u32_key = _u32_key
         split_sizes_u32 = self._pc_u32_ss
@@ -3881,8 +4281,7 @@ class HierAllGather:
             and self.slice_direct
             and N >= 2
             and not entry_barrier
-            and os.environ.get("MORI_HIER_PC_OVERLAP", "0")
-            in ("1", "true", "True")
+            and os.environ.get("MORI_HIER_PC_OVERLAP", "0") in ("1", "true", "True")
         )
         if overlap:
             node = self.node_id
@@ -3932,7 +4331,10 @@ class HierAllGather:
             # Ring kernel + finish copy-OUT into collection (main), overlapping
             # the side local-block scatter.
             self._inter.launch_finish_stream(
-                args, collection, u32c, s_main,
+                args,
+                collection,
+                u32c,
+                s_main,
                 barrier=not self.slice_defer_inter_fin,
             )
             # Merge the side local-block scatter BEFORE issuing the remote-block
@@ -4008,7 +4410,9 @@ class HierAllGather:
         if not self.out_in_place:
             raise RuntimeError("result_tensor is only valid when out_in_place=True")
         if self.num_nodes < 2:
-            raise RuntimeError("result_tensor is only valid for the N>=2 hierarchical path")
+            raise RuntimeError(
+                "result_tensor is only valid for the N>=2 hierarchical path"
+            )
         block_count = count * self.ranks_per_node
         return self._inter.full_tensor(block_count, dtype, device)
 
