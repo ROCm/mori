@@ -123,6 +123,8 @@ get-hit-counts h1,h2,h3
 - 将 SGLang medium 映射到 Indexer tier。
 - 按 action 和 tier 批量调用 Indexer RPC。
 - 记录 sequence gap、decode error、RPC failure。
+- RPC 失败时保留未确认的 batch，重连后先重试该 batch。
+- 如果配置了 SGLang replay endpoint，检测到 sequence gap 时先 replay 缺失 batch，再处理当前 batch。
 
 事件映射：
 
@@ -141,7 +143,7 @@ AllBlocksCleared()
 
 - Bridge 可以将 store/remove/clear 事件转换为正确的 Indexer RPC。
 - 支持至少单 worker 的真实或模拟事件回放测试。
-- 出现 sequence gap 或 RPC 失败时有可观测日志。
+- 出现 sequence gap 或 RPC 失败时有可观测日志，并能在 replay buffer 覆盖范围内恢复。
 
 ## 阶段 5：端到端验证
 
