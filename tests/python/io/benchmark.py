@@ -747,6 +747,7 @@ class MoriIoBenchmark:
             post_batch_size=-1,
             num_worker_threads=self.num_worker_threads,
             poll_cq_mode=self.poll_cq_mode,
+            enable_notification=False,
             enable_transfer_chunking=self.enable_chunking,
             chunk_bytes=self.chunk_bytes,
             max_chunks_per_transfer=self.max_chunks,
