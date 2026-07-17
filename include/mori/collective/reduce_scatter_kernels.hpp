@@ -109,6 +109,15 @@ struct SumOp<BF16Pack> {
     return __builtin_bit_cast(BF16Pack, packed);
   }
 };
+
+// Maps a storage element type to the type used to INSTANTIATE the reduce kernels.
+// float reduces as float; bf16 reduces as a packed pair (BF16Pack) so vecSize stays
+// at fp32 parity and the 8x8 accumulator tile does not spill. Data buffers stay
+// physically ElemT; host code reinterpret_casts them to ComputeT and passes counts
+// in packs (kPack = sizeof(ComputeT)/sizeof(ElemT)).
+template <class T> struct ReduceComputeType { using type = T; };
+template <> struct ReduceComputeType<hip_bfloat16> { using type = BF16Pack; };
+
 template < class T>
 struct MaxOp {
   __device__ T operator()(T a, T b) { return std::max(a, b); }

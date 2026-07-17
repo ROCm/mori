@@ -58,7 +58,7 @@ export MORI_ENABLE_SDMA=1
 export MORI_SDMA_NUM_CHANNELS=1
 export MORI_SDMA_ENGINE_SPAN=2
 export RS_MODE=push
-export RS_PUSH_SLICES=4
+export RS_LOG_PUSH_SLICES=2  # logS: S = 1<<2 = 4 slices
 
 TORCH_LIBS=/usr/local/lib/python3.12/dist-packages/torch/lib
 # TORCH=$TORCH_LIBS/libtorch.so

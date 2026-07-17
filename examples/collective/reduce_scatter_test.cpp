@@ -56,39 +56,6 @@
 //               output shard is chunkElems = num_elems / num_gpus; its byte size
 //               (chunkElems * sizeof(ElemT)) must be a multiple of 16.
 
-// reduce_scatter_test: 4 PEs, 262144 bytes/shard (65536 elems), 1048576 bytes input/PE
-// reduce_scatter_test: mode=PUSH numQ=1 blocks=8 (SMs=256)
-// Rank 0: PASS | 5 warmup + 20 runs | avg 0.023 ms (45.856 GB/s) min 0.021 ms (49.180 GB/s) max 0.025 ms
-// --------------------
-// reduce_scatter_test: 4 PEs, 524288 bytes/shard (131072 elems), 2097152 bytes input/PE
-// reduce_scatter_test: mode=PUSH numQ=1 blocks=16 (SMs=256)
-// Rank 0: PASS | 5 warmup + 20 runs | avg 0.027 ms (76.369 GB/s) min 0.025 ms (83.485 GB/s) max 0.033 ms
-// --------------------
-// reduce_scatter_test: 4 PEs, 1048576 bytes/shard (262144 elems), 4194304 bytes input/PE
-// reduce_scatter_test: mode=PUSH numQ=1 blocks=32 (SMs=256)
-// Rank 0: PASS | 5 warmup + 20 runs | avg 0.039 ms (108.664 GB/s) min 0.036 ms (117.550 GB/s) max 0.045 ms
-// --------------------
-// reduce_scatter_test: 4 PEs, 2097152 bytes/shard (524288 elems), 8388608 bytes input/PE
-// reduce_scatter_test: mode=PUSH numQ=1 blocks=64 (SMs=256)
-// Rank 0: PASS | 5 warmup + 20 runs | avg 0.058 ms (145.213 GB/s) min 0.054 ms (154.310 GB/s) max 0.061 ms
-// --------------------
-// reduce_scatter_test: 4 PEs, 4194304 bytes/shard (1048576 elems), 16777216 bytes input/PE
-// reduce_scatter_test: mode=PUSH numQ=1 blocks=128 (SMs=256)
-// Rank 0: PASS | 5 warmup + 20 runs | avg 0.098 ms (171.584 GB/s) min 0.095 ms (176.971 GB/s) max 0.101 ms
-// --------------------
-// reduce_scatter_test: 4 PEs, 8388608 bytes/shard (2097152 elems), 33554432 bytes input/PE
-// reduce_scatter_test: mode=PUSH numQ=1 blocks=256 (SMs=256)
-// Rank 0: PASS | 5 warmup + 20 runs | avg 0.181 ms (185.193 GB/s) min 0.178 ms (188.164 GB/s) max 0.185 ms
-// --------------------
-// reduce_scatter_test: 4 PEs, 16777216 bytes/shard (4194304 elems), 67108864 bytes input/PE
-// reduce_scatter_test: mode=PUSH numQ=1 blocks=256 (SMs=256)
-// Rank 0: PASS | 5 warmup + 20 runs | avg 0.334 ms (200.882 GB/s) min 0.330 ms (203.182 GB/s) max 0.338 ms
-// --------------------
-// reduce_scatter_test: 4 PEs, 33554432 bytes/shard (8388608 elems), 134217728 bytes input/PE
-// reduce_scatter_test: mode=PUSH numQ=1 blocks=256 (SMs=256)
-// Rank 0: PASS | 5 warmup + 20 runs | avg 0.638 ms (210.275 GB/s) min 0.632 ms (212.216 GB/s) max 0.652 ms
-// --------------------
-
 // RCCL:
 // I0000 00:00:1781190820.849456  195820 gpu_collectives_test.cc:798] bytes: 4194304 ms: 0.034509 alg_bw: 121.542 GB/s  bus_bw: 91.1567 GB/s
 // I0000 00:00:1781190820.850156  195820 gpu_collectives_test.cc:798] bytes: 8388608 ms: 0.0528935 alg_bw: 158.594 GB/s  bus_bw: 118.946 GB/s
@@ -121,12 +88,15 @@ using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
 
-using ElemT = hip_bfloat16;  // element type used by the test instantiation
+using ElemT = float;  // element type used by the test instantiation
 #define XPUT(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
 
 // Device/template kernels (push, pull) and the shared streaming
 // load/store + reduction helpers live in this header.
 #include "mori/collective/reduce_scatter_kernels.hpp"
+
+static_assert(std::is_same<ElemT, float>::value || std::is_same<ElemT, hip_bfloat16>::value,
+              "reduce_scatter_test supports only float and hip_bfloat16");
 
 // ---------------------------------------------------------------------------
 // Fill / verify kernels
@@ -227,11 +197,13 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   const int numQ = static_cast<int>(std::max(1u, baseObj->sdmaNumQueue));
   hipDeviceProp_t prop;
   HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, info.deviceId));
-  // The reduce kernels run on a packed compute type (two bf16 per 4-byte element)
-  // so vecSize stays at fp32 parity and the accumulator tile does not spill. Data
-  // buffers are physically ElemT (bf16); counts passed to the kernels are in packs.
-  using ComputeT = BF16Pack;
-  constexpr size_t kPack = sizeof(ComputeT) / sizeof(ElemT);  // bf16 lanes per pack
+  // The reduce kernels run on a compute type derived from ElemT (see
+  // ReduceComputeType): float reduces as float, bf16 reduces as a packed pair
+  // (two bf16 per 4-byte element) so vecSize stays at fp32 parity and the
+  // accumulator tile does not spill. Data buffers are physically ElemT; counts
+  // passed to the kernels are in packs (kPack = 1 for float, 2 for bf16).
+  using ComputeT = typename ReduceComputeType<ElemT>::type;
+  constexpr size_t kPack = sizeof(ComputeT) / sizeof(ElemT);  // ElemT lanes per pack
   const size_t chunkElemsC = chunkElems / kPack;              // chunk size in packs
   constexpr int VecBytes = 16,  NumVecs = 8;
   constexpr int VecSize = VecBytes / sizeof(ComputeT);
@@ -239,25 +211,19 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
   int blocks = std::min(wantBlocks, std::max(1, prop.multiProcessorCount));
 
-  // Push slicing: RS_PUSH_SLICES (default 1) rounded DOWN to a power of two and
-  // clamped to [1,8]; also clamped so each slice has at least one vector. logS =
-  // log2(S) in [0,3]. pushBlocks is rounded to a multiple of S (>= S) so each of
-  // the S groups gets >= 1 block (G = pushBlocks/S).
-  int pushSlices = 1;
-  if (const char* s = std::getenv("RS_PUSH_SLICES")) {
-    int req = std::atoi(s);
-    if (req > 1) {
-      int p = 1;
-      while ((p << 1) <= req && p < 8) p <<= 1;
-      pushSlices = p;
-    }
+  // Push slicing: RS_LOG_PUSH_SLICES (default 0) is logS = log2(#slices), clamped
+  // to [0,3] (S = 1<<logS in [1,8]); also clamped down so each slice has at least
+  // one vector. pushBlocks is rounded to a multiple of S (>= S) so each of the S
+  // groups gets >= 1 block (G = pushBlocks/S).
+  int logS = 0;
+  if (const char* s = std::getenv("RS_LOG_PUSH_SLICES")) {
+    logS = std::min(3, std::max(0, std::atoi(s)));
   }
   {
     const size_t maxSlicesByData = std::max<size_t>(1, chunkElemsC / VecSize);
-    while (pushSlices > 1 && static_cast<size_t>(pushSlices) > maxSlicesByData) pushSlices >>= 1;
+    while (logS > 0 && (1ULL << logS) > maxSlicesByData) logS--;
   }
-  int logS = 0;
-  while ((1 << logS) < pushSlices) logS++;
+  int pushSlices = 1 << logS;
   int pushBlocks = std::max(pushSlices, (blocks / pushSlices) * pushSlices);
 
   // Local-only per-group block counters for the push reset (never peer-written).
