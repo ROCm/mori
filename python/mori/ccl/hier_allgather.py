@@ -22,17 +22,14 @@
 """
 Hierarchical cross-node AllGather.
 
-Design (see shared/DESIGN.md): within a node use the SDMA copy-engine path
-(``AllgatherSdma`` over XGMI), across nodes use the traditional RDMA ring.
-The final per-rank output matches ``torch.distributed.all_gather_into_tensor``
-(rank-major: rank0, rank1, ... rank(N*G-1)) with zero numerical tolerance.
+Within a node use the SDMA copy-engine path (``AllgatherSdma`` over XGMI);
+across nodes use the RDMA ring. The final per-rank output matches
+``torch.distributed.all_gather_into_tensor`` (rank-major: rank0, rank1, ...
+rank(N*G-1)) with zero numerical tolerance.
 
-Milestone ladder (DESIGN.md):
-  * M1 (this file, implemented): for ``num_nodes == 1`` the hierarchical
-    operation degenerates to a single intra-node SDMA AllGather over all
-    ``G`` local ranks -- bit-exact vs torch on a single node.
-  * M2 (next): add the inter-node RDMA exchange of node-blocks for
-    ``num_nodes >= 2``.
+For ``num_nodes == 1`` the hierarchical operation degenerates to a single
+intra-node SDMA AllGather over all ``G`` local ranks. For ``num_nodes >= 2``
+the node-blocks are exchanged over the inter-node RDMA ring.
 
 The SDMA AllGather moves bytes in uint32 lanes regardless of the logical
 dtype, so as long as each rank's contribution is a multiple of 4 bytes the
@@ -137,10 +134,10 @@ def hier_allgather_reference(
 
     This mirrors *exactly* the byte/element-offset arithmetic the GPU path
     must perform, so that the offset math can be validated bit-exactly on CPU
-    -- with NO GPU, NO SDMA and NO RDMA -- before the device kernels are
-    wired up (M2). It is the algorithmic contract for the real implementation.
+    -- with NO GPU, NO SDMA and NO RDMA. It is the algorithmic contract for
+    the real implementation.
 
-    Three phases (see shared/DESIGN.md):
+    Three phases:
 
       1. **Intra-node gather (SDMA on device):** for node ``n`` whose ranks are
          the contiguous block ``[n*G, n*G+G)``, every rank in the node ends up
@@ -254,7 +251,7 @@ def inter_node_ring_reference(
 
 
 class HierAllGather:
-    """Hierarchical AllGather: intra-node SDMA + (future) inter-node RDMA.
+    """Hierarchical AllGather: intra-node SDMA + inter-node RDMA ring.
 
     Parameters
     ----------
@@ -1432,7 +1429,7 @@ class HierAllGather:
         # IPC => keep OFF to avoid the hipIpcGetMemHandle hard-abort). num_nodes
         # alone is NOT a safe signal (the sim runs num_nodes>=2 over IPC).
         if self.num_nodes == 1 and self.slice_direct is None:
-            # M1 single-node path never uses the direct Phase-B gather.
+            # The single-node path never uses the direct Phase-B gather.
             self.slice_direct = False
 
         if self.num_nodes == 1:
