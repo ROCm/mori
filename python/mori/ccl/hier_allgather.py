@@ -1053,7 +1053,7 @@ class HierAllGather:
             "false",
             "False",
         )
-        # PERSISTENT-KERNEL PORT (director 13:44Z): fold the host hipMemcpyAsync
+        # PERSISTENT-KERNEL PORT: fold the host hipMemcpyAsync
         # copy-IN of this PE's input into its ring slot INTO the fused kernel (each
         # ring channel stages its own send sub-range before the put). Drops one GPU
         # op per AG; combined with MORI_HIER_GEN_RING (no entry barrier) +
@@ -1311,7 +1311,7 @@ class HierAllGather:
             "False",
         )
         # SYNC_BIG: targeted remote-completion fence on ONLY the big cross-node
-        # all-gathers. Ground-truth probing (Phase 6) showed the residual
+        # all-gathers. The residual
         # fast-path stale reads (~184/384 calls) concentrate in the LARGE
         # embed/lm_head cross-node AGs (per-rank bytes >> a regular layer); the
         # many small per-layer AGs converge fine. So instead of a full-op host
@@ -1340,12 +1340,12 @@ class HierAllGather:
         # physically landed -- the same guarantee host-sync gives, but WITHOUT a
         # host stall (keeps the ring<->gather + AG<->backward overlap). Targets
         # ONLY the big embed/lm_head cross-node AGs where the residual
-        # remote-landing race lives (Phase-6 ground truth localization).
+        # remote-landing race lives.
         self._sync_big_mode = os.environ.get("MORI_HIER_SYNC_BIG_MODE", "host")
-        # SYNC_BIG mode "throttle": a BOUNDED CPU run-ahead throttle. Phase-6
-        # ground truth localized the residual fast-path loss drift (BUG B) to a
+        # SYNC_BIG mode "throttle": a BOUNDED CPU run-ahead throttle. The
+        # residual fast-path loss drift is a
         # race that ONLY a host stream-drain masks -- yet it is numQp-independent
-        # and every device-side transport fence (13 avenues) failed, so it is NOT
+        # and every device-side transport fence failed, so it is NOT
         # an unlanded-RDMA race. That signature = the CPU running arbitrarily far
         # ahead of the GPU, so the big embed/lm_head AG's true completion drifts
         # relative to when its consumer is actually enqueued/observed. Full
@@ -2134,7 +2134,7 @@ class HierAllGather:
         # DEVICE landing gate kernel on the caller's stream after finish. The gate
         # (ShmemQuietThread<RDMA> live-drain of every mlx5 CQ/QP + threadfence_sys)
         # is the on-device equivalent of the host stream.synchronize that is the
-        # ONLY bit-exact fence on this HW (T11) -- it waits the actual RDMA
+        # ONLY bit-exact fence on this HW -- it waits the actual RDMA
         # hardware landing so the FSDP-recorded event coincides with it, WITHOUT
         # the host round-trip that costs olapfast/bwdbig ~-22%. Gated to backward
         # big AG only; every other AG unchanged.
@@ -2377,7 +2377,7 @@ class HierAllGather:
         elif (
             big_ag and not self._debug_sync and self._sync_big_mode == "barriercutouch"
         ):
-            # NEW (Phase-5, new-cluster mlx5): the device barrier and the CU
+            # On mlx5: the device barrier and the CU
             # re-touch each close a DIFFERENT half of the big-AG completion race
             # and neither alone is bit-exact on this MI300X/mlx5 pair:
             #  - "barrier" alone: cut the olapfast drift ~24x (Δ0.054 -> Δ0.0023)
@@ -2468,7 +2468,7 @@ class HierAllGather:
             #      lines AFTER the landing wait, so the stream-ordered consumer GEMM
             #      MISSES L2 and re-fetches the freshly-LANDED HBM bytes. Because it is
             #      stream-ordered strictly behind step 2 it invalidates a LANDED line
-            #      (the director's fix), NOT an un-landed one (plain L2INV_ONLY's bug).
+            #      NOT an un-landed one (plain L2INV_ONLY's bug).
             # All three enqueued on the SAME caller stream => stream-ordered, sync-free.
             from .collective import (
                 launch_device_landing_gate,
@@ -2500,7 +2500,7 @@ class HierAllGather:
         elif (
             big_ag and not self._debug_sync and self._sync_big_mode == "barrierthrottle"
         ):
-            # NEW (Phase-5, new-cluster mlx5): device barrier (NIC-landing +
+            # On mlx5: device barrier (NIC-landing +
             # cross-PE order) COMPOSED WITH a bounded CPU run-ahead throttle.
             # RATIONALE: on this MI300X/mlx5 pair "barrier" alone cuts the
             # olapfast completion-race drift ~24x (Δ0.054 -> Δ0.0023) at fast-path
@@ -2535,8 +2535,8 @@ class HierAllGather:
             # CU re-touch on the big AGs: the slice_direct direct-to-output path
             # writes ``output`` with the intra SDMA gather (copy-engine domain)
             # and has NO CU re-touch (unlike the nodirect copy-out path, which
-            # already routes through _cu_copyout_finish). Phase-6 ground truth
-            # localizes the residual stale-read race to exactly these big
+            # already routes through _cu_copyout_finish). The
+            # residual stale-read race is exactly these big
             # embed/lm_head cross-node AGs. Force the LAST writer of the consumed
             # buffer to be a CU op on the CALLER stream via an in-place
             # elementwise re-touch: it does a fenced/coherent CU READ of the
@@ -2626,7 +2626,7 @@ class HierAllGather:
             # and DO NOT sync here. The deferred consumer boundary drains it via
             # drain_deferbwd() at copy-out, so the required host round-trip
             # overlaps the backward GEMM and is paid at most once per step. The
-            # forward big AGs (T22-exonerated) and all small AGs stay fully
+            # forward big AGs (exonerated) and all small AGs stay fully
             # overlapped -- no event, no drain. Bit-exact by construction: the
             # consumer host-waits on an event that completes only after this AG's
             # kernel + copy-engine/NIC work land (same guarantee as hostbwd's
@@ -2641,8 +2641,8 @@ class HierAllGather:
                 ev.record(s)
                 self._deferbwd_event = ev
         elif big_ag and not self._debug_sync and self._sync_big_mode == "hostbwd":
-            # T6B: host-sync ONLY the BACKWARD big AGs. Phase-6 ground truth (T22,
-            # line ~1543) proved the residual landing->consume race lives on the
+            # host-sync ONLY the BACKWARD big AGs. The residual landing->consume
+            # race lives on the
             # BACKWARD re-unshard of the big embed/lm_head cross-node AG: a
             # backward-only host stream.synchronize() gave BIT-EXACT grads while
             # forward was exonerated. SYNC_BIG mode=host host-syncs EVERY big AG
@@ -2860,7 +2860,7 @@ class HierAllGather:
                 # under the main-stream ring of chunk k+1) can net positive. Safety
                 # mirrors : only ONE global on-stream fence is ever in
                 # flight (the main-stream ring prepare); the side gathers run
-                # barrier-free (prepare_barrier=False), so this is NOT the Turn-24
+                # barrier-free (prepare_barrier=False), so this is NOT the
                 # concurrent-global-barrier race. Cross-chunk ring-buffer reuse is
                 # ordered by chunk k+1's prepare_stream global fence (defer is safe
                 # exactly as in the shipped non-chunked path).
@@ -3012,11 +3012,11 @@ class HierAllGather:
                 )
             else:
                 if self._big_dbuf_active:
-                    # T29 dbufstream: dedicated double-buffered scratch for the big
+                    # dbufstream: dedicated double-buffered scratch for the big
                     # backward AG. Alternating buffers (parity toggled per big AG)
                     # ensure consecutive big embed/lm_head AGs never share the same
                     # collection, so a deferred finish fence on AG#1 cannot be
-                    # clobbered by AG#2's ring copy-IN (the T28 staleness).
+                    # clobbered by AG#2's ring copy-IN (the scratch-reuse staleness).
                     p = self._big_scratch_parity
                     buf = self._big_scratch[p]
                     if (
@@ -3224,14 +3224,14 @@ class HierAllGather:
                             _dp_max_depth = max(1, _dp_chunk_bytes // _dp_floor)
                             if _deep_pipe > _dp_max_depth:
                                 _deep_pipe = _dp_max_depth
-                        # MID-BUFFER PIPE-ENGAGE FLOOR (Turn T732 A, w16 fill lever):
+                        # MID-BUFFER PIPE-ENGAGE FLOOR (world=16):
                         # at world=16 the per-PE ring shard is total/16, so for total
                         # 32/64/128MB the per-PE chunk is only 2/4/8MB. The auto
                         # subtarget (8MB) then rounds the pipe depth to 1 => the whole
                         # DEEP_PIPE block is INERT and the inter NIC fill runs strictly
                         # SERIAL before the intra XGMI reassembly (no overlap partner),
                         # which is exactly the measured w16 mid-buffer ratio floor
-                        # (32/64/128MB = 0.75/0.79/0.81x, T731) vs 256/512MB (which DO
+                        # (32/64/128MB = 0.75/0.79/0.81x) vs 256/512MB (which DO
                         # pipeline) at ~0.88x. MORI_HIER_DP_MIN_DEPTH forces a minimum
                         # temporal depth so those mid buffers pipeline: while a
                         # sub-chunk crosses the NIC the prior sub-chunk's already-landed
@@ -3269,7 +3269,7 @@ class HierAllGather:
                             and _dp_sub_bytes >= _dp_window
                         ):
                             _deep_pipe = 1
-                        # PER-PE TOTAL FLOOR (Turn26 A): mirror the C++
+                        # PER-PE TOTAL FLOOR: mirror the C++
                         # HierDeepPipeMinBytes gate (MORI_HIER_DEEP_PIPE_MIN_MB,
                         # commit 83368b34) in the Python landing-flag selector. The
                         # kernel drops deepPipe->1 for any PER-PE chunk BELOW the
@@ -3279,7 +3279,7 @@ class HierAllGather:
                         # wins. But Python sized _flag_slots from the PRE-floor depth
                         # (auto/min_depth), so a caged small chunk still allocated the
                         # deeper sub-chunk landing budget the kernel never publishes to
-                        # -- a stale-slot layout the T15 carryover fix has to churn
+                        # -- a stale-slot layout the carryover fix has to churn
                         # over on every distinct size. Snap the Python depth to the
                         # SAME per-PE floor so _flag_slots == the kernel's gated depth
                         # exactly across the whole [MIN,MAX] window. Down-only (floor
@@ -3296,7 +3296,7 @@ class HierAllGather:
                             and _dp_chunk_bytes < _dp_floor_mb * 1024 * 1024
                         ):
                             _deep_pipe = 1
-                        # DP-DEBUG (T34): one-time-per-distinct-size print of the
+                        # DP-DEBUG: one-time-per-distinct-size print of the
                         # RESOLVED deep-pipe depth so we can confirm whether the giant
                         # root embed/lm_head AG actually pipelines (depth>1) or falls to
                         # the crown whole-chunk fence (depth==1). Diagnostic only; env-
@@ -3338,7 +3338,7 @@ class HierAllGather:
                             _sw = min(int(self.inter_num_qp), 8)
                             if _sw > _flag_slots:
                                 _flag_slots = _sw
-                        # CROSS-SIZE CARRYOVER FIX (Turn15 A, 089/119): the
+                        # CROSS-SIZE CARRYOVER FIX: the
                         # persistent chunk-landing flag buffer must be reallocated
                         # on a LAYOUT change (per-PE count / slots / pipe depth),
                         # not only when it needs to GROW. Reusing one buffer across
@@ -3364,7 +3364,7 @@ class HierAllGather:
                             )
                             self._chunk_ready_flags_layout = _dp_layout
                         flags = self._chunk_ready_flags
-                        # GEN-TOKEN (T28): in token mode advance the per-op
+                        # GEN-TOKEN: in token mode advance the per-op
                         # generation and SKIP the host reset (the higher token
                         # supersedes stale slots); a fresh re-alloc above is still
                         # zeroed so gen starts clean. Legacy mode zeroes every op.
@@ -3448,7 +3448,7 @@ class HierAllGather:
                                 os.environ.get("MORI_SDMA_NUM_CHANNELS", "2"),
                             )
                         )
-                        # T12 (A) NOTE: the fused-remote reassembly worker drives
+                        # NOTE: the fused-remote reassembly worker drives
                         # SDMA queue q = (j+1) % nq_physical (kernel, ccl_kernels.hip
                         # qId=j+1) while the local-block CTA owns queue 0. nq>=2 is
                         # REQUIRED so the reasm worker lands on queue 1, not queue 0
@@ -3560,7 +3560,7 @@ class HierAllGather:
                         self._intra.finish_direct_stream(
                             stream=stream, barrier=_crown_fin_barrier
                         )
-                        # PHASE-5 CU-COHERENT COPY-OUT (MORI_HIER_FUSE_REMOTE_RETOUCH):
+                        # CU-COHERENT COPY-OUT (MORI_HIER_FUSE_REMOTE_RETOUCH):
                         # the fused kernel lands every peer's SDMA push into the
                         # output (per-queue SdmaQueitThread + threadfence + flag,
                         # waited by the completion reader) -- fabric-coherent in HBM
@@ -3643,10 +3643,9 @@ class HierAllGather:
                         # ring kernel already ran inside the fused launch -- do NOT
                         # relaunch it). RED-LINE: force the COPY-ENGINE finish (not
                         # the CU RingFinishCopyKernel) so the fuse_local win path
-                        # never moves bulk all-gather bytes on CUs -- Turn-12
-                        # standalone proved the fused overlap ALONE beats RCCL
-                        # bit-exact with the copy-engine finish (fp32 256MiB 175.0
-                        # vs RCCL 162.9 = 1.07x), so the CU copy is pure red-line
+                        # never moves bulk all-gather bytes on CUs -- the fused
+                        # overlap ALONE beats RCCL bit-exact with the copy-engine
+                        # finish, so the CU copy is pure red-line
                         # cost with ~1% BW upside. MORI_HIER_RING_CU_COPYOUT can
                         # still force CU for an explicit A/B, but default stays SDMA.
                         _fl_cu = os.environ.get(
@@ -3654,8 +3653,8 @@ class HierAllGather:
                         ).strip().lower() in ("1", "true", "yes", "on")
                         # PHASE 4 E2E-COHERENCE lever (MORI_HIER_FUSE_LOCAL_NOCOPY):
                         # the finish_ring_stream copy-OUT is a COPY-ENGINE (SDMA)
-                        # D2D read of the ring buffer. Turn-13 pinned exactly this
-                        # copy-engine read as the fuse_local E2E stale-remote race:
+                        # D2D read of the ring buffer. This
+                        # copy-engine read is the fuse_local E2E stale-remote race:
                         # the ring CTA lands the remote half via NIC RDMA and does a
                         # CU-scope __threadfence_system, but the copy engine is a
                         # SEPARATE hw agent NOT ordered by that fence, so its D2D
@@ -3667,10 +3666,10 @@ class HierAllGather:
                         # AND a saved ~(N-1)/N copy-out (BW upside). Byte-identical by
                         # construction: ring slot m == collection[m]. Default OFF for
                         # A/B; keeps bulk bytes on SDMA (red-line safe).
-                        # T69 (A) COPY-OUT ELIMINATION on the standalone crown:
+                        # COPY-OUT ELIMINATION on the standalone crown:
                         # the finish_ring_stream copy-OUT is a copy-engine D2D of
                         # (N-1)/N of a node-block PLUS its own kernel launch --
-                        # part of the ~0.28ms FIXED per-op cost T68 pinned as the
+                        # part of the ~0.28ms FIXED per-op cost that is the
                         # SOLE remaining UT ratio residual (marginal fill already
                         # == RCCL). NOCOPY drops that copy-OUT and points the remote
                         # reassembly SDMA read straight at the ring buffer (ring slot
@@ -3740,7 +3739,7 @@ class HierAllGather:
                         ) not in ("0", "", "false", "False")
                         remotes = [m for m in range(N) if m != node]
                         if self.reasm_streams > 1 and len(remotes) > 1:
-                            # T15: MULTI-STREAM the N-1 remote reassembly gathers
+                            # MULTI-STREAM the N-1 remote reassembly gathers
                             # (disjoint output blocks; entry barrier on the first,
                             # which runs on main so side lanes observe it).
                             main = (
@@ -3758,7 +3757,7 @@ class HierAllGather:
                                         dst_block_offset=m * block_count,
                                         stream=s,
                                         prepare_barrier=(_fl_intra_bar and first),
-                                        # T22: disjoint flag-slot region per lane
+                                        # disjoint flag-slot region per lane
                                         # so concurrent gathers never race.
                                         flag_slot_base=lane * self.ranks_per_node,
                                     )
@@ -3847,7 +3846,7 @@ class HierAllGather:
                             stream=stream, barrier=not self.slice_defer_fin
                         )
                     elif self.reasm_streams > 1 and N > 1:
-                        # T15: MULTI-STREAM the N disjoint reassembly gathers.
+                        # MULTI-STREAM the N disjoint reassembly gathers.
                         main = (
                             torch.cuda.current_stream(input_data.device)
                             if stream is None
@@ -3863,7 +3862,7 @@ class HierAllGather:
                                     dst_block_offset=m * block_count,
                                     stream=s,
                                     prepare_barrier=(entry_barrier and m == 0),
-                                    # T22: disjoint flag-slot region per lane so
+                                    # disjoint flag-slot region per lane so
                                     # concurrent gathers never race on flag slots.
                                     flag_slot_base=lane * self.ranks_per_node,
                                 )
@@ -3960,11 +3959,10 @@ class HierAllGather:
             # be made cheaper by also moving the intra transit into the same
             # symmetric region, a larger change.
             #
-            # CONFIRMED-NEUTRAL ON TRUE XNODE (, n09-21+n09-29, RDMA over
-            # ionic, N=2,G=4 fp32 64MiB/rank, >=3 reps, A/B same binary, BOTH
-            # bit-exact PASS vs torch.all_gather_into_tensor): gather_in_place
-            # 8.952ms 60.0 GB/s vs staged 8.933ms 60.1 GB/s; inter phase 6.82ms
-            # either way (the ~1.4ms copy-IN saving never materializes -- same
+            # Confirmed neutral on true cross-node RDMA (N=2, G=4, fp32
+            # 64MiB/rank, both bit-exact vs torch.all_gather_into_tensor):
+            # gather_in_place and staged are within noise (~60 GB/s), inter
+            # phase identical either way (the copy-IN saving never materializes -- same
             # uncached-heap offset on the real RDMA transport, not a single-node
             # P2P artifact). So copy-IN elimination is a dead lever on this
             # topology; the remaining staging fish is the finish_sync copy-OUT
@@ -4250,8 +4248,8 @@ class HierAllGather:
                 prepare_barrier=False,
                 first_block=node,
             )
-            # INPUT/OUTPUT LIFETIME across the side stream (the loss-drift race,
-            # reviewer T78/T79): input_data and output_data are produced/freed by
+            # INPUT/OUTPUT LIFETIME across the side stream (the loss-drift race):
+            # input_data and output_data are produced/freed by
             # FSDP on the MAIN stream, but the local-block scatter above READS
             # input_data and WRITES output_data on the SIDE stream. The torch
             # caching allocator only tracks the free-stream (main); without
@@ -4278,7 +4276,7 @@ class HierAllGather:
             # gather_kernel_direct_param_contiguous, which shares one per-groupPos
             # flag slot + seq token on this handle; running them concurrently made
             # a receiver observe the other scatter's flag bump -> premature
-            # completion / spin-deadlock under FSDP (Turn 4/14 hang). Serialize the
+            # completion / spin-deadlock under FSDP (observed hang). Serialize the
             # two scatter phases here. The KEY overlap (side local scatter || the
             # inter-node RDMA ring) is PRESERVED: the ring's launch_finish_stream
             # was already enqueued on main above and runs concurrently with the
