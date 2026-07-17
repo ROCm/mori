@@ -52,6 +52,22 @@ if(NOT TARGET numa::numa)
 endif()
 
 find_package(hsakmt REQUIRED)
+
+# ROCm 7.13's hsakmt cmake package (built on a RHEL-style CI runner) bakes an
+# absolute /usr/lib64/libc.so into hsakmt::hsakmt's link interface. That path
+# doesn't exist on Debian/Ubuntu containers, so it becomes an unbuildable make
+# dependency ("No rule to make target '/usr/lib64/libc.so'"). Drop the bogus
+# full path and fall back to letting the linker resolve libc itself.
+if(TARGET hsakmt::hsakmt)
+  get_target_property(_hsakmt_iface hsakmt::hsakmt INTERFACE_LINK_LIBRARIES)
+  if(_hsakmt_iface)
+    string(REGEX REPLACE "/usr/lib[^;]*/libc\\.so" "c" _hsakmt_iface
+                         "${_hsakmt_iface}")
+    set_target_properties(hsakmt::hsakmt PROPERTIES INTERFACE_LINK_LIBRARIES
+                                                    "${_hsakmt_iface}")
+  endif()
+endif()
+
 # find_library(IONIC_LIBRARY NAMES ionic HINTS /lib/x86_64-linux-gnu REQUIRED )
 
 set(MORI_APP_SOURCES bootstrap/socket_bootstrap.cpp

@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "mori/application/transport/sdma/anvil_device.hpp"
+#include "mori/core/transport/sdma/anvil_device.hpp"
 #include "mori/core/transport/sdma/device_primitives.hpp"
 
 // ---------------------------------------------------------------------------
