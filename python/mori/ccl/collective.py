@@ -87,7 +87,10 @@ def _ring_cu_copyout_enabled() -> bool:
     residual on-device). Set MORI_HIER_RING_CU_COPYOUT=0 to A/B the copy engine.
     """
     return os.environ.get("MORI_HIER_RING_CU_COPYOUT", "1").strip().lower() not in (
-        "0", "false", "no", "off",
+        "0",
+        "false",
+        "no",
+        "off",
     )
 
 
@@ -459,13 +462,27 @@ class InterNodeRingAllgather:
         # unchanged single-block ring.
         self.num_blocks = num_blocks if num_blocks and num_blocks >= 1 else 1
         self._handle = handle_class(
-            my_pe, npes, ring_buffer_bytes, ring_size, ring_pos, pe_base, pe_stride, num_qp,
+            my_pe,
+            npes,
+            ring_buffer_bytes,
+            ring_size,
+            ring_pos,
+            pe_base,
+            pe_stride,
+            num_qp,
             self.num_blocks,
         )
 
     def __call__(
-        self, input_data, output_data, count: int, stream=None, chunk_in_place: bool = False,
-        out_in_place: bool = False, stream_ring: bool = False, defer_inter_fin: bool = False,
+        self,
+        input_data,
+        output_data,
+        count: int,
+        stream=None,
+        chunk_in_place: bool = False,
+        out_in_place: bool = False,
+        stream_ring: bool = False,
+        defer_inter_fin: bool = False,
     ) -> bool:
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
@@ -506,17 +523,23 @@ class InterNodeRingAllgather:
                 # stream-ordered so the collection is correct; only cross-PE ring
                 # reuse needs the fence, which the successor op provides.
                 if _ring_cu_copyout_enabled():
-                    self._cu_finish_copyout(output_data, u32_count, s,
-                                            barrier=not defer_inter_fin)
+                    self._cu_finish_copyout(
+                        output_data, u32_count, s, barrier=not defer_inter_fin
+                    )
                 else:
-                    self._handle.finish_stream(output_data.data_ptr(), u32_count, s,
-                                               barrier=not defer_inter_fin)
+                    self._handle.finish_stream(
+                        output_data.data_ptr(),
+                        u32_count,
+                        s,
+                        barrier=not defer_inter_fin,
+                    )
             else:
                 self._handle.finish_sync(output_data.data_ptr(), u32_count, s)
         return True
 
-    def _cu_finish_copyout(self, output_data, u32_count: int, s: int,
-                           barrier: bool = True) -> None:
+    def _cu_finish_copyout(
+        self, output_data, u32_count: int, s: int, barrier: bool = True
+    ) -> None:
         """CU-domain ring finish copy-OUT + (optional deferred) reuse barrier.
 
         Copies the gathered ring buffer (``self._handle.buf_ptr()``) into
@@ -533,8 +556,13 @@ class InterNodeRingAllgather:
         if grid > 4096:
             grid = 4096
         _get_ccl_func("RingFinishCopyKernel_u32").launch(
-            (grid,), (block,), 0, s,
-            output_data.data_ptr(), self._handle.buf_ptr(), total_u32,
+            (grid,),
+            (block,),
+            0,
+            s,
+            output_data.data_ptr(),
+            self._handle.buf_ptr(),
+            total_u32,
         )
         if barrier:
             self._handle.finish_stream_no_copy(s)
@@ -580,8 +608,9 @@ class InterNodeRingAllgather:
         args = self._handle.prepare_stream_in_place(u32_count, s)
         return args, u32_count, s
 
-    def launch_finish_stream(self, args, output_data, u32_count: int, s: int,
-                             barrier: bool = True) -> bool:
+    def launch_finish_stream(
+        self, args, output_data, u32_count: int, s: int, barrier: bool = True
+    ) -> bool:
         """launch the ring kernel for a previously-prepared op
         (``prepare_stream_only``) then run the stream-ordered finish copy-OUT into
         ``output_data``. ``barrier`` controls the finish ShmemBarrierOnStream
@@ -590,12 +619,19 @@ class InterNodeRingAllgather:
         _get_ccl_func("InterNodeRingAllGatherKernel_u32").launch_struct(
             (self.num_blocks,), (512,), 0, s, args
         )
-        self._handle.finish_stream(output_data.data_ptr(), u32_count, s,
-                                   barrier=barrier)
+        self._handle.finish_stream(
+            output_data.data_ptr(), u32_count, s, barrier=barrier
+        )
         return True
 
-    def finish_ring_stream(self, output_data, count: int, stream=None,
-                           barrier: bool = True, cu_copyout: Optional[bool] = None) -> bool:
+    def finish_ring_stream(
+        self,
+        output_data,
+        count: int,
+        stream=None,
+        barrier: bool = True,
+        cu_copyout: Optional[bool] = None,
+    ) -> bool:
         """stream-ordered ring finish copy-OUT ONLY -- the ring
         kernel was already launched ELSEWHERE (e.g. by the FUSED
         ``FusedRingLocalGatherKernel_u32`` that runs the ring concurrently with
@@ -608,10 +644,9 @@ class InterNodeRingAllgather:
         THIS call: the CU RingFinishCopyKernel_u32 moves the WHOLE ring buffer on
         COMPUTE UNITS, which burns CUs on bulk all-gather bytes -- forbidden on
         the fuse_local win path (the thesis is bulk bytes ride SDMA/RDMA only, so
-        CUs stay free for the GEMM). Standalone sweep (Turn 12, N=2 G=4) proved the
-        fused ring||local-gather overlap already beats RCCL bit-exact with the
-        COPY-ENGINE finish (fp32 256MiB 175.0 vs RCCL 162.9 = 1.07x), i.e. the win
-        is the overlap, not the CU copy. So the fuse_local caller passes
+        CUs stay free for the GEMM). The fused ring||local-gather overlap already
+        beats RCCL bit-exact with the COPY-ENGINE finish, i.e. the win is the
+        overlap, not the CU copy. So the fuse_local caller passes
         cu_copyout=False to stay red-line compliant. None = use the global env.
         """
         byte_count = count * output_data.element_size()
@@ -621,8 +656,9 @@ class InterNodeRingAllgather:
         if use_cu:
             self._cu_finish_copyout(output_data, u32_count, s, barrier=barrier)
         else:
-            self._handle.finish_stream(output_data.data_ptr(), u32_count, s,
-                                       barrier=barrier)
+            self._handle.finish_stream(
+                output_data.data_ptr(), u32_count, s, barrier=barrier
+            )
         return True
 
     def full_tensor(self, count: int, dtype, device=None):
@@ -698,8 +734,15 @@ class IntraNodeSubGroupAllgatherSdma:
             my_pe, npes, out_buffer_bytes, group_size, group_pos, pe_base, pe_stride
         )
 
-    def __call__(self, input_data, output_data, count: int, stream=None, barrier: bool = True,
-                 prepare_barrier: bool = True) -> bool:
+    def __call__(
+        self,
+        input_data,
+        output_data,
+        count: int,
+        stream=None,
+        barrier: bool = True,
+        prepare_barrier: bool = True,
+    ) -> bool:
         # M4: ``barrier=False`` skips the trailing ShmemBarrierAll in
         # finish_sync. Safe only when an immediately-following global barrier
         # synchronizes all PEs before any remote read (the PUSH gather's
@@ -713,17 +756,26 @@ class IntraNodeSubGroupAllgatherSdma:
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
         s = _stream_to_int(stream)
-        args = self._handle.prepare_sync(input_data.data_ptr(), u32_count, s, prepare_barrier)
+        args = self._handle.prepare_sync(
+            input_data.data_ptr(), u32_count, s, prepare_barrier
+        )
         _get_ccl_func("OneShotAllGatherSdmaSubGroupKernel_u32").launch_struct(
             (1,), (512,), 0, s, args
         )
         self._handle.finish_sync(output_data.data_ptr(), u32_count, s, barrier)
         return True
 
-    def call_direct(self, input_data, output_full, count: int,
-                    dst_block_offset_elems: int = 0, stream=None,
-                    barrier: bool = True, prepare_barrier: bool = True,
-                    host_sync: bool = False) -> bool:
+    def call_direct(
+        self,
+        input_data,
+        output_full,
+        count: int,
+        dst_block_offset_elems: int = 0,
+        stream=None,
+        barrier: bool = True,
+        prepare_barrier: bool = True,
+        host_sync: bool = False,
+    ) -> bool:
         """DIRECT-to-output, fully STREAM-ORDERED sub-group SDMA gather.
 
         PUSHes each member's ``count``-element shard straight into slot
@@ -752,8 +804,14 @@ class IntraNodeSubGroupAllgatherSdma:
         # Register the user output for direct PUSH (collective + cached).
         self._handle.register_output_buffer(output_full.data_ptr(), out_bytes)
         args = self._handle.prepare_sync_direct(
-            input_data.data_ptr(), u32_count, s, prepare_barrier,
-            output_full.data_ptr(), dst_off_bytes, 0)
+            input_data.data_ptr(),
+            u32_count,
+            s,
+            prepare_barrier,
+            output_full.data_ptr(),
+            dst_off_bytes,
+            0,
+        )
         _get_ccl_func("OneShotAllGatherSdmaSubGroupKernel_u32").launch_struct(
             (1,), (512,), 0, s, args
         )
@@ -767,8 +825,15 @@ class IntraNodeSubGroupAllgatherSdma:
             (torch.cuda.current_stream() if stream is None else stream).synchronize()
         return True
 
-    def gather_kernel(self, input_data, count: int, dst_base_offset: int = 0, stream=None,
-                      prepare_barrier: bool = True, dst_slot_stride: int = 0) -> bool:
+    def gather_kernel(
+        self,
+        input_data,
+        count: int,
+        dst_base_offset: int = 0,
+        stream=None,
+        prepare_barrier: bool = True,
+        dst_slot_stride: int = 0,
+    ) -> bool:
         # M5: launch ONLY the gather kernel (no copy-OUT), writing this
         # gather's groupSize-slot block into ``out_`` at element offset
         # ``dst_base_offset`` (of the input dtype). Used by the fused sliced path
@@ -784,7 +849,11 @@ class IntraNodeSubGroupAllgatherSdma:
         dst_slot_stride_bytes = dst_slot_stride * input_data.element_size()
         s = _stream_to_int(stream)
         args = self._handle.prepare_sync(
-            input_data.data_ptr(), u32_count, s, prepare_barrier, dst_base_offset_bytes,
+            input_data.data_ptr(),
+            u32_count,
+            s,
+            prepare_barrier,
+            dst_base_offset_bytes,
             dst_slot_stride_bytes,
         )
         _get_ccl_func("OneShotAllGatherSdmaSubGroupKernel_u32").launch_struct(
@@ -797,8 +866,9 @@ class IntraNodeSubGroupAllgatherSdma:
         ptr, size_bytes = self._handle.get_output_transit_buffer()
         return _ptr_to_tensor(ptr, size_bytes, dtype, device)
 
-    def finish_batch(self, output_data, total_count: int, stream=None,
-                     barrier: bool = True) -> bool:
+    def finish_batch(
+        self, output_data, total_count: int, stream=None, barrier: bool = True
+    ) -> bool:
         # M5: one bulk copy-OUT of ``total_count`` elements (the full
         # N*groupSize*chunk stacked by ``gather_kernel``) from ``out_`` to the
         # user output, then one barrier. Replaces N per-gather finish copies.
@@ -808,14 +878,15 @@ class IntraNodeSubGroupAllgatherSdma:
         self._handle.finish_batch(output_data.data_ptr(), u32_count, s, barrier)
         return True
 
-    def finish_batch_stream(self, output_data, total_count: int, stream=None,
-                            barrier: bool = True) -> bool:
+    def finish_batch_stream(
+        self, output_data, total_count: int, stream=None, barrier: bool = True
+    ) -> bool:
         # STREAM-ORDERED bulk copy-OUT. Same bytes as
         # finish_batch but the trailing global fence is an on-device
         # ShmemBarrierOnStream(stream) instead of host hipStreamSynchronize +
         # ShmemBarrierAll. Removes the last host CPU<->GPU round-trip in the
         # fused sliced Phase-B so the whole op stays enqueued on ``stream``.
-        # Pairs with the Turn-10 stream-ordered inter ring.
+        # Pairs with the stream-ordered inter ring.
         # ``barrier=False`` DEFERS the trailing fence to the
         # next op's inter-ring prepare ShmemBarrierOnStream (redundant back-to-
         # back across the op boundary). The copy-OUT stays stream-ordered so the
@@ -851,15 +922,23 @@ class IntraNodeSubGroupAllgatherSdma:
             tensor.data_ptr(), tensor.numel() * tensor.element_size()
         )
 
-    def gather_kernel_direct(self, input_data, output_data, count: int, dst_block_offset: int = 0,
-                             stream=None, prepare_barrier: bool = True,
-                             dst_slot_stride: int = 0, flag_slot_base: int = 0) -> bool:
+    def gather_kernel_direct(
+        self,
+        input_data,
+        output_data,
+        count: int,
+        dst_block_offset: int = 0,
+        stream=None,
+        prepare_barrier: bool = True,
+        dst_slot_stride: int = 0,
+        flag_slot_base: int = 0,
+    ) -> bool:
         # DIRECT gather -- SDMA-PUSH each member's slice straight
         # into the (registered) ``output_data`` at element offset
         # ``dst_block_offset`` (of the input dtype), no internal transit + no
         # copy-OUT. ``output_data`` MUST have been registered via
         # register_output_buffer. ``dst_slot_stride`` matches gather_kernel.
-        # T22: ``flag_slot_base`` gives a CONCURRENT lane a disjoint flag-slot
+        # ``flag_slot_base`` gives a CONCURRENT lane a disjoint flag-slot
         # region [flag_slot_base, +groupSize) so multi-stream reassembly gathers
         # (MORI_HIER_REASM_STREAMS) never race on the shared flag slots (0=off).
         byte_count = count * input_data.element_size()
@@ -868,8 +947,14 @@ class IntraNodeSubGroupAllgatherSdma:
         dst_slot_stride_bytes = dst_slot_stride * input_data.element_size()
         s = _stream_to_int(stream)
         args = self._handle.prepare_sync_direct(
-            input_data.data_ptr(), u32_count, s, prepare_barrier, output_data.data_ptr(),
-            dst_block_offset_bytes, dst_slot_stride_bytes, flag_slot_base,
+            input_data.data_ptr(),
+            u32_count,
+            s,
+            prepare_barrier,
+            output_data.data_ptr(),
+            dst_block_offset_bytes,
+            dst_slot_stride_bytes,
+            flag_slot_base,
         )
         _get_ccl_func("OneShotAllGatherSdmaSubGroupKernel_u32").launch_struct(
             (1,), (512,), 0, s, args
@@ -877,9 +962,18 @@ class IntraNodeSubGroupAllgatherSdma:
         return True
 
     def gather_kernel_direct_param_contiguous(
-        self, input_data, output_data, block_stride: int, num_blocks: int,
-        world_size: int, split_sizes_u32, split_offsets_u32, stream=None,
-        prepare_barrier: bool = True, first_block: int = 0) -> bool:
+        self,
+        input_data,
+        output_data,
+        block_stride: int,
+        num_blocks: int,
+        world_size: int,
+        split_sizes_u32,
+        split_offsets_u32,
+        stream=None,
+        prepare_barrier: bool = True,
+        first_block: int = 0,
+    ) -> bool:
         # FUSED param-contiguous direct gather -- ONE launch scatters ALL node
         # blocks * param splits from the Phase-A ``input_data`` collection
         # straight into the (registered) ``output_data`` in PARAM-CONTIGUOUS
@@ -889,20 +983,34 @@ class IntraNodeSubGroupAllgatherSdma:
         # u32`` are int64 DEVICE tensors (E_s / O_s per param, u32 lanes).
         s = _stream_to_int(stream)
         args = self._handle.prepare_sync_direct_param_contiguous(
-            input_data.data_ptr(), s, prepare_barrier, output_data.data_ptr(),
-            block_stride, num_blocks, world_size,
-            split_sizes_u32.data_ptr(), split_offsets_u32.data_ptr(),
-            split_sizes_u32.numel(), 0, first_block,
+            input_data.data_ptr(),
+            s,
+            prepare_barrier,
+            output_data.data_ptr(),
+            block_stride,
+            num_blocks,
+            world_size,
+            split_sizes_u32.data_ptr(),
+            split_offsets_u32.data_ptr(),
+            split_sizes_u32.numel(),
+            0,
+            first_block,
         )
-        _get_ccl_func("OneShotAllGatherSdmaSubGroupParamContiguousKernel_u32").launch_struct(
-            (1,), (512,), 0, s, args
-        )
+        _get_ccl_func(
+            "OneShotAllGatherSdmaSubGroupParamContiguousKernel_u32"
+        ).launch_struct((1,), (512,), 0, s, args)
         return True
 
-    def prepare_direct_only(self, input_data, output_data, count: int,
-                            dst_block_offset: int = 0, stream=None,
-                            prepare_barrier: bool = True,
-                            dst_slot_stride: int = 0) -> int:
+    def prepare_direct_only(
+        self,
+        input_data,
+        output_data,
+        count: int,
+        dst_block_offset: int = 0,
+        stream=None,
+        prepare_barrier: bool = True,
+        dst_slot_stride: int = 0,
+    ) -> int:
         # build the DIRECT-gather jit_args (prime the per-peer
         # flag slots + optional entry barrier + register the strided output dst)
         # and RETURN the int64 args pointer WITHOUT launching the kernel -- so the
@@ -918,8 +1026,13 @@ class IntraNodeSubGroupAllgatherSdma:
         dst_slot_stride_bytes = dst_slot_stride * input_data.element_size()
         s = _stream_to_int(stream)
         args = self._handle.prepare_sync_direct(
-            input_data.data_ptr(), u32_count, s, prepare_barrier,
-            output_data.data_ptr(), dst_block_offset_bytes, dst_slot_stride_bytes,
+            input_data.data_ptr(),
+            u32_count,
+            s,
+            prepare_barrier,
+            output_data.data_ptr(),
+            dst_block_offset_bytes,
+            dst_slot_stride_bytes,
         )
         return args
 
@@ -932,7 +1045,7 @@ class IntraNodeSubGroupAllgatherSdma:
 
 
 def launch_device_landing_gate(s: int) -> bool:
-    """PHASE 5 (Team A gate-op): launch the DeviceLandingGateKernel_u32 on stream
+    """Launch the DeviceLandingGateKernel_u32 on stream
     ``s`` -- a 1-block/1-thread device drain of every mlx5 RDMA CQ/QP
     (ShmemQuietThread<RDMA> live drain) + __threadfence_system. On-device
     equivalent of a host stream.synchronize's hardware-queue drain, with NO CPU
@@ -940,31 +1053,26 @@ def launch_device_landing_gate(s: int) -> bool:
     event coincides with the actual landing of every posted inter-node RDMA write.
     Used as the landing fence for the backward big AG (MORI_HIER_SYNC_BIG_MODE=devgate).
     """
-    _get_ccl_func("DeviceLandingGateKernel_u32").launch(
-        (1,), (64,), 0, s, 0
-    )
+    _get_ccl_func("DeviceLandingGateKernel_u32").launch((1,), (64,), 0, s, 0)
     return True
 
 
 def launch_l2_inv_only(s: int) -> bool:
-    """PHASE 5 (Team A, Turn 14 — director 2026-07-08T18:03Z WAIT-then-INV lever):
-    launch L2InvOnlyKernel_u32 UNCONDITIONALLY (no env gate) on stream ``s`` -- a
+    """Launch L2InvOnlyKernel_u32 UNCONDITIONALLY (no env gate) on stream ``s`` -- a
     tiny 512x1 fence-only grid whose system-scope ACQUIRE fence lowers to
     ``buffer_inv sc0 sc1`` on gfx942, invalidating the shared device L2 so the
     stream-ordered consumer GEMM re-fetches the fabric-landed HBM bytes. This is the
     INVALIDATE half of the consume-side landing gate; it MUST be stream-ordered
     AFTER the landing WAIT (device landing gate CQ-drain) so it drops a LANDED line,
-    not an un-landed one (the director's key correction: INV-only alone re-fetches
-    stale HBM because the peer RDMA-WRITE has not landed yet). ~0 bytes moved.
+    not an un-landed one: INV-only alone re-fetches stale HBM because the peer
+    RDMA-WRITE has not landed yet. ~0 bytes moved.
     """
-    _get_ccl_func("L2InvOnlyKernel_u32").launch(
-        (512,), (1,), 0, s, 0, 0
-    )
+    _get_ccl_func("L2InvOnlyKernel_u32").launch((512,), (1,), 0, s, 0, 0)
     return True
 
 
 def launch_l2_coherent_retouch(out_ptr: int, u32_count: int, s: int) -> bool:
-    """PHASE 5 (Team A): launch L2CoherentRetouchKernel_u32 over ``u32_count``
+    """Launch L2CoherentRetouchKernel_u32 over ``u32_count``
     uint32 words at device address ``out_ptr`` on stream ``s``. System-scope
     acquire-load + release-store re-touch that bypasses stale L2 (the residual the
     barriercutouch plain add-0 re-touch could not fix). Stream-ordered, no host
@@ -973,7 +1081,7 @@ def launch_l2_coherent_retouch(out_ptr: int, u32_count: int, s: int) -> bool:
     if u32_count <= 0:
         return True
     _truthy = ("1", "true", "yes", "on")
-    # MORI_HIER_L2INV_ONLY (Team A, director 2026-07-08T14:54Z — CHEAP variant):
+    # MORI_HIER_L2INV_ONLY (cheap variant):
     # buffer_inv is a whole-cache op (invalidates the shared device L2, not an
     # address range), so we do NOT need to touch every u32 to make the consumer GEMM
     # re-fetch from HBM. Launch a tiny grid (one wave per CU is plenty to cover every
@@ -990,7 +1098,7 @@ def launch_l2_coherent_retouch(out_ptr: int, u32_count: int, s: int) -> bool:
     blocks = (u32_count + threads - 1) // threads
     if blocks > 4096:
         blocks = 4096
-    # MORI_HIER_L2INV (Team A, director 2026-07-08T14:54Z): use the L2-INVALIDATE
+    # MORI_HIER_L2INV: use the L2-INVALIDATE
     # retouch (real system-scope acquire/release fence => buffer_inv sc0 sc1 on
     # gfx942) instead of the volatile-only kernel, which only bypasses L1 and so
     # republishes the stale L2 line the consumer GEMM cached. This is the concrete
@@ -999,14 +1107,13 @@ def launch_l2_coherent_retouch(out_ptr: int, u32_count: int, s: int) -> bool:
     _kern = "L2CoherentRetouchKernel_u32"
     if os.environ.get("MORI_HIER_L2INV", "0").strip().lower() in _truthy:
         _kern = "L2InvRetouchKernel_u32"
-    _get_ccl_func(_kern).launch(
-        (blocks,), (threads,), 0, s, out_ptr, int(u32_count)
-    )
+    _get_ccl_func(_kern).launch((blocks,), (threads,), 0, s, out_ptr, int(u32_count))
     return True
 
 
-def launch_fused_ring_local_gather(ring_args: int, gather_args: int,
-                                   ring_blocks: int, s: int) -> bool:
+def launch_fused_ring_local_gather(
+    ring_args: int, gather_args: int, ring_blocks: int, s: int
+) -> bool:
     """merge a prepared inter-node ring's jit_args with a
     prepared intra-node local-block direct-gather's jit_args (via the
     ``build_fused_ring_local_gather_args`` C++ glue) and launch the FUSED
@@ -1026,11 +1133,19 @@ def launch_fused_ring_local_gather(ring_args: int, gather_args: int,
     return True
 
 
-def launch_fused_ring_remote_gather(ring_args: int, gather_args: int, ring_blocks: int,
-                                    chunk_ready_flags_ptr: int, num_nodes: int, node_id: int,
-                                    s: int, reassembly_blocks: int = 0,
-                                    op_gen: int = 0, reasm_deep_sq: int = 0,
-                                    parity_ptr: int = 0) -> bool:
+def launch_fused_ring_remote_gather(
+    ring_args: int,
+    gather_args: int,
+    ring_blocks: int,
+    chunk_ready_flags_ptr: int,
+    num_nodes: int,
+    node_id: int,
+    s: int,
+    reassembly_blocks: int = 0,
+    op_gen: int = 0,
+    reasm_deep_sq: int = 0,
+    parity_ptr: int = 0,
+) -> bool:
     """PHASE 4: launch the FUSED, PIPELINED ``FusedRingRemoteGatherKernel_u32`` ONCE
     on stream ``s`` with ``2*ring_blocks + 1`` CTAs. Blocks ``[0, ring_blocks)`` run
     the RDMA ring (Phase A) and each publishes ``chunkReadyFlags[bid]`` on landing;
@@ -1047,8 +1162,16 @@ def launch_fused_ring_remote_gather(ring_args: int, gather_args: int, ring_block
     rb = ring_blocks if ring_blocks and ring_blocks >= 1 else 1
     reasm = reassembly_blocks if reassembly_blocks and reassembly_blocks >= 1 else rb
     fused = mori_cpp.build_fused_ring_remote_gather_args(
-        ring_args, gather_args, rb, chunk_ready_flags_ptr, num_nodes, node_id, reasm,
-        op_gen, reasm_deep_sq)
+        ring_args,
+        gather_args,
+        rb,
+        chunk_ready_flags_ptr,
+        num_nodes,
+        node_id,
+        reasm,
+        op_gen,
+        reasm_deep_sq,
+    )
     # SAME-CTA INLINE REASSEMBLY (MORI_HIER_INLINE_REASM): on the multiBlock ring
     # (rb>1) each ring channel CTA reassembles its OWN landed sub-range inline, so the
     # dedicated reassembly CTAs are redundant -- drop them (grid rb+1 instead of
@@ -1059,16 +1182,16 @@ def launch_fused_ring_remote_gather(ring_args: int, gather_args: int, ring_block
         _e = os.environ.get("MORI_HIER_INLINE_REASM", "")
         _hp = os.environ.get("MORI_HIER_HOSTPROXY_REASM", "")
         _el = os.environ.get("MORI_HIER_FUSE_REMOTE_ELASTIC", "")
-        _inline_reasm = (_e not in ("", "0")) and (_hp in ("", "0")) and (_el in ("", "0"))
+        _inline_reasm = (
+            (_e not in ("", "0")) and (_hp in ("", "0")) and (_el in ("", "0"))
+        )
     _reasm_ctas = 0 if _inline_reasm else reasm
     # Double-buffer: bump the per-op parity counter on-stream before the fused
     # kernel (captured, so it advances under graph replay; every kernel block then
     # reads one stable post-bump value to pick the active ring half). parity_ptr==0
     # => single-buffer (no bump, byte-identical).
     if parity_ptr:
-        _get_ccl_func("RingParityBumpKernel_u32").launch(
-            (1,), (1,), 0, s, parity_ptr
-        )
+        _get_ccl_func("RingParityBumpKernel_u32").launch((1,), (1,), 0, s, parity_ptr)
     _get_ccl_func("FusedRingRemoteGatherKernel_u32").launch_struct(
         (rb + 1 + _reasm_ctas,), (512,), 0, s, fused
     )
