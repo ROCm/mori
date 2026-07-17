@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
 # MIT License
 """Bit-exact test for the HSDP winning path:
 ``IntraNodeSubGroupAllgatherSdma.gather_kernel_direct_param_contiguous`` (the
@@ -24,11 +45,20 @@ Cross node (2 nodes) -- launch under torchrun::
 import os
 import traceback
 
+import pytest
 import torch
 import torch.distributed as dist
 
 import mori.shmem as shmem
 from mori.ccl import IntraNodeSubGroupAllgatherSdma
+
+# Cross-node torchrun-only harness: SKIP under a plain `pytest` collection (no
+# torchrun env) so the suite does not ERROR; runs only when torchrun sets
+# RANK/WORLD_SIZE.
+pytestmark = pytest.mark.skipif(
+    "RANK" not in os.environ or "WORLD_SIZE" not in os.environ,
+    reason="cross-node harness; launch under torchrun",
+)
 
 _DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.int32]
 
@@ -79,11 +109,16 @@ def _gather_once(handle, inp, out, ss_u32, so_u32, blk_stride_u32, G):
     (matches the adapter's register-once + repeated-call contract)."""
     stream = torch.cuda.current_stream()
     ok = handle.gather_kernel_direct_param_contiguous(
-        inp, out, blk_stride_u32,
-        1,       # num_blocks = 1 (single node block; pure intra)
-        G,       # world_size for the [param][rank] output stride
-        ss_u32, so_u32,
-        stream=stream, prepare_barrier=True, first_block=0,
+        inp,
+        out,
+        blk_stride_u32,
+        1,  # num_blocks = 1 (single node block; pure intra)
+        G,  # world_size for the [param][rank] output stride
+        ss_u32,
+        so_u32,
+        stream=stream,
+        prepare_barrier=True,
+        first_block=0,
     )
     assert ok, "gather_kernel_direct_param_contiguous returned False"
     handle.finish_direct_stream(stream=stream, barrier=True)
@@ -106,8 +141,12 @@ def _run_dtype(handle, dtype, rank, G, subgroup, device, reps):
     for e in splits:
         offsets.append(acc)
         acc += e
-    ss_u32 = torch.tensor([(e * elem) // 4 for e in splits], dtype=torch.int64, device=device)
-    so_u32 = torch.tensor([(o * elem) // 4 for o in offsets], dtype=torch.int64, device=device)
+    ss_u32 = torch.tensor(
+        [(e * elem) // 4 for e in splits], dtype=torch.int64, device=device
+    )
+    so_u32 = torch.tensor(
+        [(o * elem) // 4 for o in offsets], dtype=torch.int64, device=device
+    )
     blk_stride_u32 = (count * elem) // 4
 
     # register ONCE (collective symmetric op; barrier so every peer's IPC handles
@@ -125,8 +164,10 @@ def _run_dtype(handle, dtype, rank, G, subgroup, device, reps):
                 E0 = splits[0]
                 slotvals = [int(out[g * E0].item()) for g in range(G)]
                 bases = [int((g + 1) * 17) for g in range(G)]
-                print(f"RECVDUMP rank0 param0 slot bases got={slotvals} "
-                      f"(expect r-th slot = base {bases}) inp0={int(inp[0].item())}")
+                print(
+                    f"RECVDUMP rank0 param0 slot bases got={slotvals} "
+                    f"(expect r-th slot = base {bases}) inp0={int(inp[0].item())}"
+                )
             if not torch.equal(out, ref):
                 diff = (out != ref).nonzero(as_tuple=False).flatten()[:8].tolist()
                 raise AssertionError(
@@ -162,8 +203,10 @@ def _worker_body(rank, world_size, G, device):
         pe_stride=1,
     )
     if rank == 0:
-        print(f"intra param-contig: world={world_size} G={G} "
-              f"num_nodes={world_size // G} reps={_REPS}")
+        print(
+            f"intra param-contig: world={world_size} G={G} "
+            f"num_nodes={world_size // G} reps={_REPS}"
+        )
     try:
         for dtype in _DTYPES:
             _run_dtype(handle, dtype, rank, G, subgroup, device, _REPS)
@@ -191,7 +234,9 @@ def _run_torchrun():
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     dist.init_process_group(
-        backend="cpu:gloo,cuda:nccl", rank=rank, world_size=world_size,
+        backend="cpu:gloo,cuda:nccl",
+        rank=rank,
+        world_size=world_size,
         device_id=device,
     )
     world_group = torch.distributed.group.WORLD
@@ -202,6 +247,11 @@ def _run_torchrun():
         if dist.is_initialized():
             dist.barrier()
             dist.destroy_process_group()
+
+
+def test_intra_subgroup_param_contiguous():
+    """Pytest entry: runs only under torchrun (guarded by module pytestmark)."""
+    _run_torchrun()
 
 
 if __name__ == "__main__":

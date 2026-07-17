@@ -53,11 +53,20 @@ import os
 import sys
 import traceback
 
+import pytest
 import torch
 import torch.distributed as dist
 
 import mori.shmem as shmem
 from mori.ccl import IntraNodeSubGroupAllgatherSdma
+
+# Cross-node torchrun-only harness (reads RANK/WORLD_SIZE/LOCAL_RANK and needs 2
+# physical nodes): SKIP under a plain `pytest` collection so the suite does not
+# ERROR; runs only when torchrun sets RANK/WORLD_SIZE.
+pytestmark = pytest.mark.skipif(
+    "RANK" not in os.environ or "WORLD_SIZE" not in os.environ,
+    reason="cross-node (2-node) harness; launch under torchrun",
+)
 
 
 _DEFAULT_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
@@ -91,7 +100,9 @@ def _run_one(dtype, numel, rank, world_size, G, device):
     # Reference node-block: concat of the G local shards in local-rank order.
     out_ref = torch.empty(numel * G, dtype=dtype, device=device)
     for k in range(G):
-        out_ref[k * numel : (k + 1) * numel] = _make_input(dtype, numel, pe_base + k, device)
+        out_ref[k * numel : (k + 1) * numel] = _make_input(
+            dtype, numel, pe_base + k, device
+        )
 
     stream = torch.cuda.current_stream()
     ok = handle(inp, out_mori, numel, stream)
@@ -156,6 +167,17 @@ def main():
     # Any rank's nonzero exit fails the whole torchrun job (which is what we want:
     # pre-fix, ranks 8..15 mismatch -> the launcher reports failure).
     sys.exit(rc)
+
+
+def test_intra_subgroup_sdma_2node():
+    """Pytest entry: runs only under torchrun (guarded by module pytestmark).
+
+    ``main()`` calls ``sys.exit(rc)``; translate a nonzero rc into an assertion
+    failure so pytest reports pass/fail rather than swallowing the exit code."""
+    try:
+        main()
+    except SystemExit as e:
+        assert not e.code, f"2-node SDMA test failed with exit code {e.code}"
 
 
 if __name__ == "__main__":

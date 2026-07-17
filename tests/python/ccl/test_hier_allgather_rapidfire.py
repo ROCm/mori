@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
 # MIT License
 """Rapid-fire (inter-call) determinism probe for cross-node HierAllGather.
 
@@ -34,11 +55,20 @@ Run cross-node under torchrun::
 import os
 import traceback
 
+import pytest
 import torch
 import torch.distributed as dist
 
 import mori.shmem as shmem
 from mori.ccl import HierAllGather
+
+# Cross-node torchrun-only harness: SKIP under a plain `pytest` collection (no
+# torchrun env) so the suite does not ERROR; runs only when torchrun sets
+# RANK/WORLD_SIZE.
+pytestmark = pytest.mark.skipif(
+    "RANK" not in os.environ or "WORLD_SIZE" not in os.environ,
+    reason="cross-node harness; launch under torchrun",
+)
 
 _DTYPES = [torch.bfloat16, torch.float32]
 # Burst layout: a sequence of per-rank element counts fired back-to-back on ONE
@@ -83,7 +113,7 @@ def _run_dtype(handle, dtype, rank, world_size, device):
         return _make_input(dtype, _BURST[idx], rank, device, salt=rep * 13 + idx)
 
     golden = []  # [rep][idx]
-    truth = []   # [rep][idx]
+    truth = []  # [rep][idx]
     for rep in range(_REPS):
         g_row, t_row = [], []
         for idx, count in enumerate(_BURST):
@@ -108,7 +138,9 @@ def _run_dtype(handle, dtype, rank, world_size, device):
     # completion under GPU load" (flag-beats-data only under contention).
     contend = os.environ.get("RAPIDFIRE_CONTEND", "0") == "1"
     load_stream = torch.cuda.Stream() if contend else None
-    load_a = torch.randn(4096, 4096, dtype=torch.float32, device=device) if contend else None
+    load_a = (
+        torch.randn(4096, 4096, dtype=torch.float32, device=device) if contend else None
+    )
 
     # INPUT-LIFETIME probe (RAPIDFIRE_FREE_INPUT=1): FSDP2's
     # reshard_after_forward FREES the sharded-param INPUT storage right after
@@ -200,8 +232,11 @@ def _run_dtype(handle, dtype, rank, world_size, device):
             g = golden[rep][idx]
             t = truth[rep][idx]
             nd = (v != g) and not (v != v and g != g)
-            wr = (abs(v - t) > 1e-4 * max(abs(t), 1.0)) if (v == v and t == t) \
+            wr = (
+                (abs(v - t) > 1e-4 * max(abs(t), 1.0))
+                if (v == v and t == t)
                 else ((v != v) != (t != t))
+            )
             if nd:
                 n_nondet += 1
             if wr:
@@ -252,11 +287,16 @@ def _worker_body(rank, world_size, ranks_per_node, device):
         dist.barrier()
         if rank == 0:
             if total_nd == 0 and total_wr == 0:
-                print("test_hier_allgather_rapidfire: PASSED (deterministic+correct)",
-                      flush=True)
+                print(
+                    "test_hier_allgather_rapidfire: PASSED (deterministic+correct)",
+                    flush=True,
+                )
             else:
-                print(f"test_hier_allgather_rapidfire: FAILED "
-                      f"nondet={total_nd} wrong={total_wr}", flush=True)
+                print(
+                    f"test_hier_allgather_rapidfire: FAILED "
+                    f"nondet={total_nd} wrong={total_wr}",
+                    flush=True,
+                )
     finally:
         torch.cuda.synchronize()
         dist.barrier()
@@ -273,7 +313,9 @@ def _run_torchrun():
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     dist.init_process_group(
-        backend="cpu:gloo,cuda:nccl", rank=rank, world_size=world_size,
+        backend="cpu:gloo,cuda:nccl",
+        rank=rank,
+        world_size=world_size,
         device_id=device,
     )
     world_group = torch.distributed.group.WORLD
@@ -284,6 +326,11 @@ def _run_torchrun():
         if dist.is_initialized():
             dist.barrier()
             dist.destroy_process_group()
+
+
+def test_hier_allgather_rapidfire():
+    """Pytest entry: runs only under torchrun (guarded by module pytestmark)."""
+    _run_torchrun()
 
 
 if __name__ == "__main__":
