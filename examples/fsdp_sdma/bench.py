@@ -216,6 +216,11 @@ def _apply_fsdp2(
             for m in shards:
                 m.set_custom_all_gather(ag)
     elif os.environ.get("MORI_FSDP_ENABLE_SDMA"):
+        # NOTE: MoriSdmaAllGather ships in a local PyTorch FSDP overlay, NOT in
+        # upstream torch. This import only resolves if the runtime torch install
+        # provides the ``_mori_sdma_allgather`` module; without that overlay this
+        # branch raises ModuleNotFoundError. Prefer MORI_FSDP_ENABLE_HIER above,
+        # which uses the in-repo mori_allgather.MoriAllGather and needs no overlay.
         from torch.distributed.fsdp._fully_shard._mori_sdma_allgather import (
             MoriSdmaAllGather,
         )
