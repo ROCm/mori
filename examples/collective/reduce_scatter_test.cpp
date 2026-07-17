@@ -109,6 +109,8 @@
 #include <type_traits>
 #include <vector>
 
+#include <hip/hip_bfloat16.h>
+
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/core/transport/p2p/device_primitives.hpp"  // load<N>/store<N>
@@ -119,7 +121,7 @@ using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
 
-using ElemT = float;  // element type used by the test instantiation
+using ElemT = hip_bfloat16;  // element type used by the test instantiation
 #define XPUT(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
 
 // Device/template kernels (push, pull) and the shared streaming
@@ -136,7 +138,7 @@ using ElemT = float;  // element type used by the test instantiation
 __global__ void FillPatternKernel(ElemT* buf, size_t numElements, int myPe) {
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < numElements;
        i += (size_t)gridDim.x * blockDim.x) {
-    buf[i] = static_cast<ElemT>((myPe + 1) + static_cast<int>(i % 8));
+    buf[i] = static_cast<ElemT>(static_cast<float>((myPe + 1) + static_cast<int>(i % 8)));
   }
 }
 
@@ -225,9 +227,15 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   const int numQ = static_cast<int>(std::max(1u, baseObj->sdmaNumQueue));
   hipDeviceProp_t prop;
   HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, info.deviceId));
+  // The reduce kernels run on a packed compute type (two bf16 per 4-byte element)
+  // so vecSize stays at fp32 parity and the accumulator tile does not spill. Data
+  // buffers are physically ElemT (bf16); counts passed to the kernels are in packs.
+  using ComputeT = BF16Pack;
+  constexpr size_t kPack = sizeof(ComputeT) / sizeof(ElemT);  // bf16 lanes per pack
+  const size_t chunkElemsC = chunkElems / kPack;              // chunk size in packs
   constexpr int VecBytes = 16,  NumVecs = 8;
-  constexpr int VecSize = VecBytes / sizeof(ElemT);
-  size_t totalVecs = chunkElems / (VecSize * NumVecs);
+  constexpr int VecSize = VecBytes / sizeof(ComputeT);
+  size_t totalVecs = chunkElemsC / (VecSize * NumVecs);
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
   int blocks = std::min(wantBlocks, std::max(1, prop.multiProcessorCount));
 
@@ -245,7 +253,7 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
     }
   }
   {
-    const size_t maxSlicesByData = std::max<size_t>(1, chunkElems / VecSize);
+    const size_t maxSlicesByData = std::max<size_t>(1, chunkElemsC / VecSize);
     while (pushSlices > 1 && static_cast<size_t>(pushSlices) > maxSlicesByData) pushSlices >>= 1;
   }
   int logS = 0;
@@ -307,8 +315,9 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
       // input base. output is the local shard buffer. NPES is compile-time so the
       // all-peers register tile stays in VGPRs; dispatch on the real npes.
       auto launch = [&](auto NPES_c) {
-        ReduceScatterPullKernel<VecBytes, NumVecs, decltype(NPES_c)::value, ElemT, SumOp>
-            <<<blocks, kThreads, 0, stream>>>(myPe, baseObj, output, chunkElems);
+        ReduceScatterPullKernel<VecBytes, NumVecs, decltype(NPES_c)::value, ComputeT, SumOp>
+            <<<blocks, kThreads, 0, stream>>>(myPe, baseObj,
+                                              reinterpret_cast<ComputeT*>(output), chunkElemsC);
       };
       switch (npes) {
         case 2: launch(std::integral_constant<int, 2>{}); break;
@@ -318,8 +327,10 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
     } else {
       // Sliced push: S = 1<<logS slices, each with its own per-receiver bitmask
       // flag; the grid is partitioned into S groups, each reset by its last block.
-      ReduceScatterPushKernel<VecBytes, NumVecs, ElemT, SumOp><<<pushBlocks, kThreads, 0, stream>>>(
-          myPe, npes, logS, input, staging, output, groupCounters, chunkElems);
+      ReduceScatterPushKernel<VecBytes, NumVecs, ComputeT, SumOp><<<pushBlocks, kThreads, 0, stream>>>(
+          myPe, npes, logS, reinterpret_cast<const ComputeT*>(input),
+          reinterpret_cast<ComputeT*>(staging), reinterpret_cast<ComputeT*>(output),
+          groupCounters, chunkElemsC);
     }
     HIP_RUNTIME_CHECK(hipEventRecord(tStop, stream));
     HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));

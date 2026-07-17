@@ -40,6 +40,7 @@
 #include <cstdint>
 
 #include "mori/collective/collectives_common.hpp"  // StreamLoad/Store, SdmaPutWarpFusedS
+#include "mori/core/transport/p2p/device_primitives.hpp"  // Bf16BitsToF32
 #include "mori/shmem/shmem.hpp"
 #include "mori/shmem/internal.hpp"
 
@@ -58,17 +59,15 @@ static constexpr int kRSPushPktDwords = 16;   // sizeof(SDMA_PKT_COPY_WITH_ATOMI
 static constexpr int kRSPushSlotDwords = 17;  // padded stride (16 + 1)
 
 // ---------------------------------------------------------------------------
-// Reduction Op functors. Accumulation is done in float (lossless for the
-// small integer-valued test patterns, and avoids precision loss for fp16/bf16).
+// Reduction Op functors. The accumulator stays in the element type T (so bf16
+// reduces in bf16-width registers -- half the VGPRs of a float accumulator and
+// no spilling for the 8x8 register tile). Numerical accuracy of the add is
+// handled inside the Op functor: SumOp<hip_bfloat16> promotes each add to float
+// and rounds the result back to bf16 (per-add rounding, not a float running sum).
 // ---------------------------------------------------------------------------
 template < class T >
 struct AccumulatorType {
   using type = T;
-};
-
-template <>
-struct AccumulatorType<hip_bfloat16> {
-  using type = float;
 };
 
 // Generic up/down cast (identity for float; specialize for fp16/bf16 if needed).
@@ -85,6 +84,30 @@ __device__ __forceinline__ T DowncastF(typename AccumulatorType<T>::type v) {
 template < typename T >
 struct SumOp {
   __device__ T operator()(T a, T b) { return a + b; }
+};
+
+// A 4-byte element holding two bf16. Instantiating the reduce kernels with T =
+// BF16Pack keeps vecSize = VecBytes/4 (fp32 parity), so each accumulator lane maps
+// to a single 32-bit VGPR (the compiler will not pack two bare hip_bfloat16 into
+// one register), which avoids the VGPR-spill blowup of the 2-byte bf16 tile.
+struct alignas(4) BF16Pack {
+  hip_bfloat16 x, y;
+};
+static_assert(sizeof(BF16Pack) == 4 && alignof(BF16Pack) == 4);
+
+template <>
+struct SumOp<BF16Pack> {
+  __device__ BF16Pack operator()(BF16Pack a, BF16Pack b) {
+    const uint32_t ua = __builtin_bit_cast(uint32_t, a);
+    const uint32_t ub = __builtin_bit_cast(uint32_t, b);
+    const float x = Bf16BitsToF32(static_cast<uint16_t>(ua)) +
+                    Bf16BitsToF32(static_cast<uint16_t>(ub));
+    const float y = Bf16BitsToF32(static_cast<uint16_t>(ua >> 16)) +
+                    Bf16BitsToF32(static_cast<uint16_t>(ub >> 16));
+    const __hip_bfloat162_raw r = static_cast<__hip_bfloat162_raw>(__float22bfloat162_rn(float2{x, y}));
+    const uint32_t packed = static_cast<uint32_t>(r.x) | (static_cast<uint32_t>(r.y) << 16);
+    return __builtin_bit_cast(BF16Pack, packed);
+  }
 };
 template < class T>
 struct MaxOp {
@@ -256,136 +279,148 @@ __device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, T* __rest
 // the address-based SDMA put can translate local->peer (offset from heapBaseAddr);
 // groupCounters is a plain hipMalloc'd buffer (never peer-written).
 // ---------------------------------------------------------------------------
-template <int VecBytes, int NumVecs, class T, template <class> class OpT>
-__global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
-                                    T* __restrict__ staging, T* __restrict__ output,
-                                    uint32_t* __restrict__ groupCounters, size_t chunkElems) {
+// === Phase 1: SDMA scatter (block 0 only) ====================================
+// Lane (peer,slice) issues an SDMA copy of slice `slice` into destPe's staging
+// slot followed by an ADD64 of (1<<myPe) into destPe's per-slice flag
+// signalPtrs[slice]. The atomic targets the *receiver's* flag, so completion is
+// observed on the receive side (Phase 2) -- fire-and-forget, no local quiet, no
+// cross-PE barrier. Per-slice flags make the slice order irrelevant on the
+// receive side.
+//
+// Fast path (npes*S <= warpSize, i.e. npes<=8): a single warp issues ALL peers'
+// copies concurrently; each peer's slice-0 leader reserves the S-packet block and
+// submits once. Peers use distinct queues (peer%8), so the per-warp multi-queue
+// reserve/submit has one sole producer per queue and cannot deadlock, and the S
+// reservations + S doorbells per peer collapse into one of each. Fallback path
+// (larger npes): warp-strided one-warp-per-peer, lane 0 reserves/submits.
+//
+// Called by every block but no-ops on all but block 0, so the internal
+// __syncthreads() are still reached by all of block 0's threads.
+// ---------------------------------------------------------------------------
+template <int VecBytes, class T>
+__device__ __forceinline__ void StartSdmaScatter(
+    int myPe, int npes, int logS, const T* __restrict__ input,
+    T* __restrict__ staging, size_t chunkElems) {
+
   constexpr int vecSize = VecBytes / sizeof(T);
   const int S = 1 << logS;
   // vecSize-aligned slice length; the last slice absorbs the remainder.
   const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize;
   const int tid = threadIdx.x;
 
-  // === Phase 1: SDMA scatter (block 0 only) ====================================
-  // Lane (peer,slice) issues an SDMA copy of slice `slice` into destPe's staging
-  // slot followed by an ADD64 of (1<<myPe) into destPe's per-slice flag
-  // signalPtrs[slice]. The atomic targets the *receiver's* flag, so completion is
-  // observed on the receive side (Phase 2) -- fire-and-forget, no local quiet, no
-  // cross-PE barrier. Per-slice flags make the slice order irrelevant on the
-  // receive side.
-  //
-  // Fast path (npes*S <= warpSize, i.e. npes<=8): a single warp issues ALL peers'
-  // copies concurrently; each peer's slice-0 leader reserves the S-packet block and
-  // submits once. Peers use distinct queues (peer%8), so the per-warp multi-queue
-  // reserve/submit has one sole producer per queue and cannot deadlock, and the S
-  // reservations + S doorbells per peer collapse into one of each. Fallback path
-  // (larger npes): warp-strided one-warp-per-peer, lane 0 reserves/submits.
-  if (blockIdx.x == 0) {
-    auto* heapObj = GetGlobalGpuStatesPtr()->heapObj;
-    const int numSdmaQ = static_cast<int>(heapObj->sdmaNumQueue);
+  auto* heapObj = GetGlobalGpuStatesPtr()->heapObj;
+  const int numSdmaQ = static_cast<int>(heapObj->sdmaNumQueue);
 
-    T* dstLocal = staging + myPe * chunkElems;
-    const size_t heapBase = GetGlobalGpuStatesPtr()->heapBaseAddr;
-    const size_t sliceBytes = sliceLen * sizeof(T);
-    const size_t lastBytes = (chunkElems - (sliceLen << logS) + sliceLen) * sizeof(T);
-    // off is uniform across peers: my data lands in every peer's staging[myPe] slot.
-    const size_t off = reinterpret_cast<uintptr_t>(dstLocal) - heapBase;
+  T* dstLocal = staging + myPe * chunkElems;
+  const size_t heapBase = GetGlobalGpuStatesPtr()->heapBaseAddr;
+  const size_t sliceBytes = sliceLen * sizeof(T);
+  const size_t lastBytes = (chunkElems - (sliceLen << logS) + sliceLen) * sizeof(T);
+  // off is uniform across peers: my data lands in every peer's staging[myPe] slot.
+  const size_t off = reinterpret_cast<uintptr_t>(dstLocal) - heapBase;
 
-    // E.g maximum npes=8 with 8 slices per peer
-    if ((npes << logS) <= warpSize) {
-      constexpr size_t paketSize = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
-      // --- Fast path (LDS-staged): build packets into bank-conflict-free LDS ----
-      // slots, then flush them to the rings with up to npes*S*4 threads (one
-      // coalesced b128 store per thread). The build write uses one lane per packet
-      // at a 17-dword slot stride (coprime to the 32 LDS banks) so the 16-dword
-      // packet write is conflict-free. The flush spans multiple warps, so the ring
-      // writes need a block-wide fence + barrier before any leader rings a doorbell
-      // (the submitter's own s_waitcnt(0) only drains its own wave).
-      __shared__ uint32_t pktBuf[kRSPushMaxPeers * kRSPushMaxSlices * kRSPushSlotDwords];
-      __shared__ uint64_t sStart[kRSPushMaxPeers];
-      __shared__ uint64_t sOff[kRSPushMaxPeers];
+  // E.g maximum npes=8 with 8 slices per peer
+  if ((npes << logS) <= warpSize) {
+    constexpr size_t paketSize = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
+    // --- Fast path (LDS-staged): build packets into bank-conflict-free LDS ----
+    // slots, then flush them to the rings with up to npes*S*4 threads (one
+    // coalesced b128 store per thread). The build write uses one lane per packet
+    // at a 17-dword slot stride (coprime to the 32 LDS banks) so the 16-dword
+    // packet write is conflict-free. The flush spans multiple warps, so the ring
+    // writes need a block-wide fence + barrier before any leader rings a doorbell
+    // (the submitter's own s_waitcnt(0) only drains its own wave).
+    __shared__ uint32_t pktBuf[kRSPushMaxPeers * kRSPushMaxSlices * kRSPushSlotDwords];
+    __shared__ uint64_t sStart[kRSPushMaxPeers];
+    __shared__ uint64_t sOff[kRSPushMaxPeers];
 
-      // -- Build phase: one lane per packet (peer = tid/S, slice = tid%S). --
-      const int npesS = npes << logS, peer = tid >> logS, slice = tid & (S - 1);
-      const bool bactive = (tid < npesS) && (peer != myPe);
-      if (bactive) {
-        auto** handles = heapObj->deviceHandles_d + (peer % 8) * numSdmaQ;
-        auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
-        if (slice == 0) {
-          // Leader reserves the whole S-packet block and publishes base/pad to LDS.
-          uint64_t offset = 0;
-          uint64_t sb = handle->ReserveQueueSpace(paketSize << logS, offset);
-          if (offset) handle->fillNops(sb, offset);
-          sStart[peer] = sb;
-          sOff[peer] = offset;
-        }
-        auto* s =
-            reinterpret_cast<const uint8_t*>(input + peer * chunkElems) + slice * sliceBytes;
-        auto* d =
-            reinterpret_cast<uint8_t*>(heapObj->peerPtrs[peer] + off) + slice * sliceBytes;
-        size_t sz = (slice == S - 1) ? lastBytes : sliceBytes;
-        // Build the fused copy+atomic packet DIRECTLY into the LDS slot (dword
-        // stores via the DW_x unions), skipping the register-resident struct and
-        // the reg->LDS copy. Layout: copy = dwords 0..6, atomic = dwords 7..14,
-        // trailing single-dword NOP = dword 15. Per-field cross-lane stride stays
-        // kRSPushSlotDwords (17, coprime to 32 banks) so the build is conflict-free.
-        uint32_t* dw = &pktBuf[tid * kRSPushSlotDwords];  // slot == peer*S + slice == tid
-        anvil::WriteCopyPacket(dw, s, d, sz);
-        anvil::WriteAtomicAddPacket(dw + 7, heapObj->peerSignalPtrs[peer] + slice,
-                                    (1ull << myPe));
-        dw[15] = 0;  // trailing single-dword SDMA NOP (must be 0)
+    // -- Build phase: one lane per packet (peer = tid/S, slice = tid%S). --
+    const int npesS = npes << logS, peer = tid >> logS, slice = tid & (S - 1);
+    const bool bactive = (tid < npesS) && (peer != myPe);
+    if (bactive) {
+      auto** handles = heapObj->deviceHandles_d + (peer % 8) * numSdmaQ;
+      auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
+      if (slice == 0) {
+        // Leader reserves the whole S-packet block and publishes base/pad to LDS.
+        uint64_t offset = 0;
+        uint64_t sb = handle->ReserveQueueSpace(paketSize << logS, offset);
+        if (offset) handle->fillNops(sb, offset);
+        sStart[peer] = sb;
+        sOff[peer] = offset;
       }
-      __syncthreads();
-
-      // -- Flush phase: one thread per b128 (packet = fb/4, b128 = fb%4), block-
-      // strided so it is robust to any blockDim (<= npes*S*4 total b128s). --
-      const int totalB128 = npes << (logS + 2);
-      for (int fb = tid; fb < totalB128; fb += blockDim.x) {
-        const int fpkt = fb / 4, bb = fb % 4, 
-                 fpeer = fpkt >> logS, fslice = fpkt & (S - 1);
-
-        if (fpeer == myPe) continue;  // uniform across the warp (peer-granular)
-        auto** handles = heapObj->deviceHandles_d + (fpeer % 8) * numSdmaQ;
-        auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
-        const uint64_t wptrIndex = sStart[fpeer] + sOff[fpeer] + fslice * paketSize, 
-                       baseDword = handle->WrapIntoRing(wptrIndex) / sizeof(uint32_t);
-        // Read the b128 from LDS as 4 dwords (stride-17 slot is 4B- but not
-        // 16B-aligned, so avoid ds_read_b128), then store it coalesced to the ring.
-        const int slot = fpkt * kRSPushSlotDwords + bb * 4;
-        TVecType<16> v = {pktBuf[slot + 0], pktBuf[slot + 1], pktBuf[slot + 2],
-                          pktBuf[slot + 3]};
-        StreamStore<16>(handle->queueBuf + baseDword + bb * 4, v, /*system_scope=*/false);
-      }
-      // All flush warps must finish + their ring stores be visible to the on-die
-      // SDMA engine before any doorbell. The ring lives in local HBM and is
-      // consumed by this GPU's own SDMA agent, so an agent-scope RELEASE fence is
-      // the exact match for the "agent"-scoped b128 ring stores (the doorbell
-      // store inside submitPacket carries its own system-scope push). __syncthreads
-      // (workgroup scope) alone is one scope short of what the SDMA agent needs.
-      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-      __syncthreads();
-
-      // -- Submit phase: each peer's leader rings one doorbell on its own queue. --
-      if (bactive && slice == 0) {
-        auto** handles = heapObj->deviceHandles_d + (peer % 8) * numSdmaQ;
-        auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
-        handle->submitPacket(sStart[peer], sStart[peer] + sOff[peer] + (paketSize << logS));
-      }
-    } else {
-      // --- Fallback (npes*S > warpSize): warp-strided, one warp per peer. ---
-      const int w = tid / warpSize;
-      const int numW = blockDim.x / warpSize;
-      for (int destPe = w; destPe < npes; destPe += numW) {
-        if (destPe == myPe) continue;  // uniform across the warp
-        auto** handles = heapObj->deviceHandles_d + (destPe % 8) * numSdmaQ;
-        const auto* src = input + destPe * chunkElems;
-        auto* dst = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + off);
-        mori::collective::SdmaPutWarpFusedS(
-            src, dst, sliceBytes, lastBytes,
-            handles, heapObj->peerSignalPtrs[destPe], /*qId=*/0, logS, 
-            /*addVal=*/(1ull << myPe));
-      }
+      auto* s =
+          reinterpret_cast<const uint8_t*>(input + peer * chunkElems) + slice * sliceBytes;
+      auto* d =
+          reinterpret_cast<uint8_t*>(heapObj->peerPtrs[peer] + off) + slice * sliceBytes;
+      size_t sz = (slice == S - 1) ? lastBytes : sliceBytes;
+      // Build the fused copy+atomic packet DIRECTLY into the LDS slot (dword
+      // stores via the DW_x unions), skipping the register-resident struct and
+      // the reg->LDS copy. Layout: copy = dwords 0..6, atomic = dwords 7..14,
+      // trailing single-dword NOP = dword 15. Per-field cross-lane stride stays
+      // kRSPushSlotDwords (17, coprime to 32 banks) so the build is conflict-free.
+      uint32_t* dw = &pktBuf[tid * kRSPushSlotDwords];  // slot == peer*S + slice == tid
+      anvil::WriteCopyPacket(dw, s, d, sz);
+      anvil::WriteAtomicAddPacket(dw + 7, heapObj->peerSignalPtrs[peer] + slice,
+                                  (1ull << myPe));
+      dw[15] = 0;  // trailing single-dword SDMA NOP (must be 0)
     }
+    __syncthreads();
+
+    // -- Flush phase: one thread per b128 (packet = fb/4, b128 = fb%4), block-
+    // strided so it is robust to any blockDim (<= npes*S*4 total b128s). --
+    const int totalB128 = npes << (logS + 2);
+    for (int fb = tid; fb < totalB128; fb += blockDim.x) {
+      const int fpkt = fb / 4, bb = fb % 4, 
+               fpeer = fpkt >> logS, fslice = fpkt & (S - 1);
+
+      if (fpeer == myPe) continue;  // uniform across the warp (peer-granular)
+      auto** handles = heapObj->deviceHandles_d + (fpeer % 8) * numSdmaQ;
+      auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
+      const uint64_t wptrIndex = sStart[fpeer] + sOff[fpeer] + fslice * paketSize, 
+                     baseDword = handle->WrapIntoRing(wptrIndex) / sizeof(uint32_t);
+      // Read the b128 from LDS as 4 dwords (stride-17 slot is 4B- but not
+      // 16B-aligned, so avoid ds_read_b128), then store it coalesced to the ring.
+      const int slot = fpkt * kRSPushSlotDwords + bb * 4;
+      TVecType<16> v = {pktBuf[slot + 0], pktBuf[slot + 1], pktBuf[slot + 2],
+                        pktBuf[slot + 3]};
+      StreamStore<16>(handle->queueBuf + baseDword + bb * 4, v, /*system_scope=*/false);
+    }
+    // All flush warps must finish + their ring stores be visible to the on-die
+    // SDMA engine before any doorbell. The ring lives in local HBM and is
+    // consumed by this GPU's own SDMA agent, so an agent-scope RELEASE fence is
+    // the exact match for the "agent"-scoped b128 ring stores (the doorbell
+    // store inside submitPacket carries its own system-scope push). __syncthreads
+    // (workgroup scope) alone is one scope short of what the SDMA agent needs.
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    __syncthreads();
+
+    // -- Submit phase: each peer's leader rings one doorbell on its own queue. --
+    if (bactive && slice == 0) {
+      auto** handles = heapObj->deviceHandles_d + (peer % 8) * numSdmaQ;
+      auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
+      handle->submitPacket(sStart[peer], sStart[peer] + sOff[peer] + (paketSize << logS));
+    }
+  } else {
+    // --- Fallback (npes*S > warpSize): warp-strided, one warp per peer. ---
+    const int w = tid / warpSize;
+    const int numW = blockDim.x / warpSize;
+    for (int destPe = w; destPe < npes; destPe += numW) {
+      if (destPe == myPe) continue;  // uniform across the warp
+      auto** handles = heapObj->deviceHandles_d + (destPe % 8) * numSdmaQ;
+      const auto* src = input + destPe * chunkElems;
+      auto* dst = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + off);
+      mori::collective::SdmaPutWarpFusedS(
+          src, dst, sliceBytes, lastBytes,
+          handles, heapObj->peerSignalPtrs[destPe], /*qId=*/0, logS, 
+          /*addVal=*/(1ull << myPe));
+    }
+  }
+}
+
+template <int VecBytes, int NumVecs, class T, template <class> class OpT>
+__global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
+                                    T* __restrict__ staging, T* __restrict__ output,
+                                    uint32_t* __restrict__ groupCounters, size_t chunkElems) {
+  if (blockIdx.x == 0) {
+    StartSdmaScatter<VecBytes>(myPe, npes, logS, input, staging, chunkElems);
   }
 
   // Grouping: G blocks per slice; group g (= slice g) handles only its slice.
@@ -397,7 +432,7 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
   // Each slice's bitmask lives in my local HBM (written by remote SDMA atomics).
   // One thread per block polls signalPtrs[g]; every block does its own
   // wait+acquire (read-only -> L2 hits). npes==1 has no peers, nothing to wait for.
-  if (npes > 1 && tid == 0) {
+  if (npes > 1 && threadIdx.x == 0) {
     auto* heapObj = GetGlobalGpuStatesPtr()->heapObj;
     // Completion bitmask: bit p means "sender p's copy has landed". Self-copy is
     // skipped, so we wait for every peer bit except our own.
@@ -415,13 +450,15 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
   // is needed here (we publish nothing at this point), so drop the release/waitcnt.
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
 
-  // HACK HACK!
-  // return;
+  constexpr int vecSize = VecBytes / sizeof(T);
+  // vecSize-aligned slice length; the last slice absorbs the remainder.
+  const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize;
 
   // === Phase 3: grid-strided vectorized reduce over slice g ===================
   // Streaming reduction over slice g only, strided over the group's G blocks. Uses
   // the nontemporal load<16>/store<16> primitives (single-use data, bypass L2).
-  const size_t sOfs = g * sliceLen, sCnt = (g == S - 1) ? (chunkElems - sOfs) : sliceLen;
+  const size_t sOfs = g * sliceLen, 
+               sCnt = (g == (1 << logS) - 1) ? (chunkElems - sOfs) : sliceLen;
   const size_t ltid = static_cast<size_t>(lb) * blockDim.x + threadIdx.x;
   const size_t lstride = static_cast<size_t>(G) * blockDim.x;
   const size_t totalVecs = sCnt / vecSize;
@@ -450,11 +487,11 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
   for (size_t i = totalVecs * vecSize + ltid; i < sCnt; i += lstride) {
     using Vec = TVecType<sizeof(T)>;
     const T* base = srcBase(0) + i;
-    AccType a = UpcastF<T>(StreamLoad<sizeof(T)>(base, /*system_scope=*/false));
+    AccType a = UpcastF<T>(__builtin_bit_cast(T, StreamLoad<sizeof(T)>(base, /*system_scope=*/false)));
     base += chunkElems;
     for (int pe = 1; pe < npes; pe++, base += chunkElems) {
       auto V = StreamLoad<sizeof(T)>(base, /*system_scope=*/false);
-      a = OpT<T>()(a, UpcastF<T>(V));
+      a = OpT<T>()(a, UpcastF<T>(__builtin_bit_cast(T, V)));
     }
     Vec V = __builtin_bit_cast(Vec, DowncastF<T>(a));
     StreamStore<sizeof(T)>(out + i, V, /*system_scope=*/false);
@@ -466,7 +503,7 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
   // Phase 2 and clearing the flag cannot drop an unseen bit. Cross-iteration
   // ordering is guaranteed by the host hipStreamSynchronize + ShmemBarrierAll
   // between launches. Counters are local-only (plain hipMalloc'd buffer).
-  if (npes > 1 && tid == 0) {
+  if (npes > 1 && threadIdx.x == 0) {
     uint32_t z = atomicAdd(&groupCounters[g], 1u);
     if (z + 1 == static_cast<uint32_t>(G)) {
       auto* heapObj = GetGlobalGpuStatesPtr()->heapObj;
@@ -537,10 +574,10 @@ __global__ void ReduceScatterPullKernel(int myPe,
   // Scalar tail for elements not covered by the vectorized loop.
   for (size_t i = totalVecs * vecSize + gtid; i < chunkElems; i += gstride) {
     using Vec = TVecType<sizeof(T)>;
-    AccType a = UpcastF<T>(StreamLoad<sizeof(T)>(srcBase(0) + i));
+    AccType a = UpcastF<T>(__builtin_bit_cast(T, StreamLoad<sizeof(T)>(srcBase(0) + i)));
     for (int pe = 1; pe < NPES; pe++) {
       auto V = StreamLoad<sizeof(T)>(srcBase(pe) + i);
-      a = OpT<T>()(a, UpcastF<T>(V));
+      a = OpT<T>()(a, UpcastF<T>(__builtin_bit_cast(T, V)));
     }
     Vec V = __builtin_bit_cast(Vec, DowncastF<T>(a));
     StreamStore<sizeof(T)>(output + i, V);
