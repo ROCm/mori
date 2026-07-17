@@ -441,22 +441,6 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
   void* qpc = DEVX_ADDR_OF(init2rtr_qp_in, init2rtr_cmd_in, qpc);
   DEVX_SET(qpc, qpc, mtu, portAttr.active_mtu);
   DEVX_SET(qpc, qpc, log_msg_max, 30);
-  // packet-fill cross-val: log the ACTUAL segmentation MTU written to the
-  // DEVX qpc (host-side, one-shot). measured mori on-wire avg_pkt=2119 B
-  // (~half of RCCL 4105 B) and logged the *ibverbs* port active_mtu=enum5(4096),
-  // but never the value the DEVX provider writes here. 4 MiB msg / 2119 B ~= 1980
-  // pkts vs 4 MiB / 4096 = 1024 => hypothesis: this QP segments at 2048, not 4096.
-  // Decides the root cause of the whole w16 residual on A's own DEVX QPs.
-  {
-    static bool s_mtuLogged = false;
-    if (!s_mtuLogged) {
-      s_mtuLogged = true;
-      int mtuEnum = static_cast<int>(portAttr.active_mtu);
-      int mtuBytes = (mtuEnum >= 1 && mtuEnum <= 5) ? (256 << (mtuEnum - 1)) : -1;
-      std::cout << "[DIAG_QP_MTU] devx qpc mtu enum=" << mtuEnum << " bytes=" << mtuBytes
-                << " (portId=" << static_cast<int>(config.portId) << ")" << std::endl;
-    }
-  }
   DEVX_SET(qpc, qpc, remote_qpn, remote_handle.qpn);
   DEVX_SET(qpc, qpc, next_rcv_psn, remote_handle.psn);
   DEVX_SET(qpc, qpc, min_rnr_nak, 12);
@@ -481,15 +465,9 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
            sizeof(remote_handle.eth.mac));
     DEVX_SET(qpc, qpc, primary_address_path.hop_limit, 64);
     DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, local_handle.eth.gidIdx);
-    // UDP sport: default to a single fixed RoCEv2 sport (== 0xC000 on RoCE).
-    // MORI_MLX5_ENABLE_UDP_SPORT=1 rotates per-qpId (GetUdpSport) for ECMP spread.
-    // mori pins all QPs of a NIC to one ECMP path (default sport = lid|0xC000, so every
-    // QP hashes identically). Enabling per-qpId udp_sport rotation to spread QPs across
-    // ECMP paths is bandwidth-neutral here, so per-NIC RDMA WRITE throughput is not
-    // single-path-congestion-limited. The DEVX QP MTU written above reads enum 5 = 4096B,
-    // matching RCCL, so the low on-wire average packet size comes from small signal/flag
-    // packets interleaved with the 4096B data, not from undersized data packets. The
-    // default is the single fixed sport; the env stays for opt-in comparison.
+    // UDP sport: default to a single fixed RoCEv2 sport (== lid|0xC000 on RoCE).
+    // MORI_MLX5_ENABLE_UDP_SPORT=1 rotates per-qpId (GetUdpSport) to spread QPs
+    // across ECMP paths; the default pins all QPs of a NIC to one path.
     static const bool enableUdpSport = []() {
       const char* e = std::getenv("MORI_MLX5_ENABLE_UDP_SPORT");
       return e != nullptr && std::atoi(e) != 0;
@@ -585,8 +563,8 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   // per-wrap owner bit so PollRecvCqImm can reap one CQE per WRITE_WITH_IMM.
   Mlx5CqContainer* recvCq =
       kSepRecvCq ? new Mlx5CqContainer(context, config, /*collapsed=*/false) : nullptr;
-  Mlx5QpContainer* qp = new Mlx5QpContainer(context, config, cq->cqn, pdn, this,
-                                            recvCq ? recvCq->cqn : 0);
+  Mlx5QpContainer* qp =
+      new Mlx5QpContainer(context, config, cq->cqn, pdn, this, recvCq ? recvCq->cqn : 0);
   const ibv_device_attr_ex* deviceAttr = GetRdmaDevice()->GetDeviceAttr();
 
   RdmaEndpoint endpoint;
