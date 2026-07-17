@@ -275,13 +275,12 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
                   numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
     for (auto& peer : sdmaPeers) {
-      int dstPe = peer.first;          // global pe -> array index (kernel-facing)
-      int dstDeviceId = peer.second;   // within-node id -> anvil queue key
+      int dstPe = peer.first;         // global pe -> array index (kernel-facing)
+      int dstDeviceId = peer.second;  // within-node id -> anvil queue key
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
         auto* anvilHandle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
-        HIP_RUNTIME_CHECK(
-            hipMemcpy(&gpuMemObj->deviceHandles_d[dstPe * numOfQueuesPerDevice + q],
-                      &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
+        HIP_RUNTIME_CHECK(hipMemcpy(&gpuMemObj->deviceHandles_d[dstPe * numOfQueuesPerDevice + q],
+                                    &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
       }
     }
 
@@ -426,12 +425,14 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
   free(memObjPtr.cpu->peerPtrs);
   free(memObjPtr.cpu->p2pPeerPtrs);
   free(memObjPtr.cpu->peerRkeys);
+  free(memObjPtr.cpu->peerRkeys2);  // Dual-rail: mirror of the rail-1 free
   free(memObjPtr.cpu->ipcMemHandles);
   free(memObjPtr.cpu);
   if (haveGpuMemObjHost) {
     freeGpuMetadata(gpuMemObjHost.peerPtrs, "peerPtrs");
     freeGpuMetadata(gpuMemObjHost.p2pPeerPtrs, "p2pPeerPtrs");
     freeGpuMetadata(gpuMemObjHost.peerRkeys, "peerRkeys");
+    freeGpuMetadata(gpuMemObjHost.peerRkeys2, "peerRkeys2");  // Dual-rail
   }
   freeGpuMetadata(memObjPtr.gpu, "SymmMemObj");
 
@@ -1496,8 +1497,8 @@ void SymmMemManager::RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded, 
     }
     if (!vmmHeapObj.cpu->hasRail2) {
       vmmHeapObj.cpu->hasRail2 = true;
-      HIP_RUNTIME_CHECK(hipMemcpy(&vmmHeapObj.gpu->hasRail2, &vmmHeapObj.cpu->hasRail2, sizeof(bool),
-                                  hipMemcpyHostToDevice));
+      HIP_RUNTIME_CHECK(hipMemcpy(&vmmHeapObj.gpu->hasRail2, &vmmHeapObj.cpu->hasRail2,
+                                  sizeof(bool), hipMemcpyHostToDevice));
     }
   }
 
