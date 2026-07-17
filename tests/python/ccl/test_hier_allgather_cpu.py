@@ -105,7 +105,7 @@ def run_ring() -> int:
     """
     failures = 0
     checks = 0
-    for (N, G) in LAYOUTS:
+    for N, G in LAYOUTS:
         world = N * G
         for dtype in DTYPES:
             for count in COUNTS:
@@ -139,7 +139,7 @@ def run_ring() -> int:
 def run() -> int:
     failures = 0
     checks = 0
-    for (N, G) in LAYOUTS:
+    for N, G in LAYOUTS:
         world = N * G
         for dtype in DTYPES:
             for count in COUNTS:
@@ -190,8 +190,15 @@ class _RecordingIntra:
         self.prepare_barrier_calls = []
         self.raise_next = False
 
-    def __call__(self, input_data, output_data, count, stream=None,
-                 barrier=True, prepare_barrier=True):
+    def __call__(
+        self,
+        input_data,
+        output_data,
+        count,
+        stream=None,
+        barrier=True,
+        prepare_barrier=True,
+    ):
         self.prepare_barrier_calls.append(prepare_barrier)
         if self.raise_next:
             self.raise_next = False
@@ -217,8 +224,9 @@ def _noop_inter(*args, **kwargs):
     return True
 
 
-def _make_hier_stub(fuse_barrier: bool, leader_only: bool = False,
-                    gather_in_place: bool = False):
+def _make_hier_stub(
+    fuse_barrier: bool, leader_only: bool = False, gather_in_place: bool = False
+):
     """Build a HierAllGather with the phase ops stubbed, bypassing __init__.
 
     __init__ allocates real C++/shmem handles (collective ShmemMalloc), which
@@ -240,6 +248,12 @@ def _make_hier_stub(fuse_barrier: bool, leader_only: bool = False,
     h.fuse_barrier = fuse_barrier
     h._node_block = None
     h._prev_op_completed = False
+    h._deferbwd_event = None  # __init__ default; keeps the drain-guard a no-op
+    # size-threshold dispatcher state (_call_impl reads these before the guard);
+    # both dispatch levers OFF -> the default non-slice fuse-barrier path.
+    h.slice_inter = False
+    h.pipe_band = False
+    h._last_use_slice = None
     h._intra = _RecordingIntra()
     h._inter = _StubInter()
     # leader-only path also touches these:
@@ -273,77 +287,106 @@ def run_fuse_barrier_guard() -> int:
 
     # 1) fuse_barrier ON: first op keeps the barrier; steady-state ops skip it.
     h = _make_hier_stub(fuse_barrier=True)
-    h(inp, out, 4)
-    check(h._intra.prepare_barrier_calls[-1] is True,
-          "first op must KEEP entry barrier (no prior clean op)")
+    h._call_impl(inp, out, 4)
+    check(
+        h._intra.prepare_barrier_calls[-1] is True,
+        "first op must KEEP entry barrier (no prior clean op)",
+    )
     check(h._prev_op_completed is True, "clean op must set _prev_op_completed")
-    h(inp, out, 4)
-    check(h._intra.prepare_barrier_calls[-1] is False,
-          "2nd op after clean op must SKIP entry barrier")
-    h(inp, out, 4)
-    check(h._intra.prepare_barrier_calls[-1] is False,
-          "steady-state op must SKIP entry barrier")
+    h._call_impl(inp, out, 4)
+    check(
+        h._intra.prepare_barrier_calls[-1] is False,
+        "2nd op after clean op must SKIP entry barrier",
+    )
+    h._call_impl(inp, out, 4)
+    check(
+        h._intra.prepare_barrier_calls[-1] is False,
+        "steady-state op must SKIP entry barrier",
+    )
 
     # 2) Mid-pipeline crash: next op must KEEP the barrier (out_ may be dirty).
     h = _make_hier_stub(fuse_barrier=True)
-    h(inp, out, 4)  # clean -> _prev_op_completed True, would skip next
+    h._call_impl(inp, out, 4)  # clean -> _prev_op_completed True, would skip next
     h._intra.raise_next = True
     try:
-        h(inp, out, 4)
+        h._call_impl(inp, out, 4)
         check(False, "injected failure should have propagated")
     except RuntimeError:
         pass
-    check(h._prev_op_completed is False,
-          "crash must leave _prev_op_completed False")
-    h(inp, out, 4)
-    check(h._intra.prepare_barrier_calls[-1] is True,
-          "op after mid-pipeline crash must KEEP entry barrier")
+    check(h._prev_op_completed is False, "crash must leave _prev_op_completed False")
+    h._call_impl(inp, out, 4)
+    check(
+        h._intra.prepare_barrier_calls[-1] is True,
+        "op after mid-pipeline crash must KEEP entry barrier",
+    )
 
     # 3) fuse_barrier OFF: barrier is always kept (never skipped).
     h = _make_hier_stub(fuse_barrier=False)
     for _ in range(3):
-        h(inp, out, 4)
-    check(all(b is True for b in h._intra.prepare_barrier_calls),
-          "fuse_barrier=0 must always KEEP entry barrier")
+        h._call_impl(inp, out, 4)
+    check(
+        all(b is True for b in h._intra.prepare_barrier_calls),
+        "fuse_barrier=0 must always KEEP entry barrier",
+    )
 
     # 4) leader_only ON: guard never skips (skip requires not leader_only).
     h = _make_hier_stub(fuse_barrier=True, leader_only=True)
     for _ in range(3):
-        h(inp, out, 4)
-    check(all(b is True for b in h._intra.prepare_barrier_calls),
-          "leader_only must always KEEP entry barrier even with fuse_barrier=1")
+        h._call_impl(inp, out, 4)
+    check(
+        all(b is True for b in h._intra.prepare_barrier_calls),
+        "leader_only must always KEEP entry barrier even with fuse_barrier=1",
+    )
 
     # 5) gather_in_place ON: the in-place return site (distinct from the staged
     #    one in scenarios 1-2) must observe the SAME guard. First op keeps,
     #    steady-state skips, and a mid-pipeline crash makes the next op keep.
     h = _make_hier_stub(fuse_barrier=True, gather_in_place=True)
-    h(inp, out, 4)
-    check(h._intra.prepare_barrier_calls[-1] is True,
-          "gather_in_place first op must KEEP entry barrier")
-    check(h._prev_op_completed is True,
-          "gather_in_place clean op must set _prev_op_completed")
-    h(inp, out, 4)
-    check(h._intra.prepare_barrier_calls[-1] is False,
-          "gather_in_place 2nd op after clean op must SKIP entry barrier")
+    h._call_impl(inp, out, 4)
+    check(
+        h._intra.prepare_barrier_calls[-1] is True,
+        "gather_in_place first op must KEEP entry barrier",
+    )
+    check(
+        h._prev_op_completed is True,
+        "gather_in_place clean op must set _prev_op_completed",
+    )
+    h._call_impl(inp, out, 4)
+    check(
+        h._intra.prepare_barrier_calls[-1] is False,
+        "gather_in_place 2nd op after clean op must SKIP entry barrier",
+    )
     h._intra.raise_next = True
     try:
-        h(inp, out, 4)
+        h._call_impl(inp, out, 4)
         check(False, "injected failure should have propagated (gather_in_place)")
     except RuntimeError:
         pass
-    check(h._prev_op_completed is False,
-          "gather_in_place crash must leave _prev_op_completed False")
-    h(inp, out, 4)
-    check(h._intra.prepare_barrier_calls[-1] is True,
-          "gather_in_place op after crash must KEEP entry barrier")
+    check(
+        h._prev_op_completed is False,
+        "gather_in_place crash must leave _prev_op_completed False",
+    )
+    h._call_impl(inp, out, 4)
+    check(
+        h._intra.prepare_barrier_calls[-1] is True,
+        "gather_in_place op after crash must KEEP entry barrier",
+    )
 
     if failures:
         print(f"\n{failures} guard checks FAILED")
         return 1
-    print("PASSED fuse-barrier guard — entry barrier kept on first op + after "
-          "mid-pipeline crash, skipped only after a clean op; covers both the "
-          "staged and gather_in_place return sites (5 scenarios).")
+    print(
+        "PASSED fuse-barrier guard — entry barrier kept on first op + after "
+        "mid-pipeline crash, skipped only after a clean op; covers both the "
+        "staged and gather_in_place return sites (5 scenarios)."
+    )
     return 0
+
+
+def test_hier_allgather_cpu():
+    assert run() == 0
+    assert run_ring() == 0
+    assert run_fuse_barrier_guard() == 0
 
 
 if __name__ == "__main__":
