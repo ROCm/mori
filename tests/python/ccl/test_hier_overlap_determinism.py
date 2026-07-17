@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
 # MIT License
 """Overlap-completion determinism probe for cross-node HierAllGather.
 
@@ -28,11 +49,20 @@ Run cross-node under torchrun (the path that matters)::
 import os
 import traceback
 
+import pytest
 import torch
 import torch.distributed as dist
 
 import mori.shmem as shmem
 from mori.ccl import HierAllGather
+
+# Cross-node torchrun-only harness: SKIP under a plain `pytest` collection (no
+# torchrun env) so the suite does not ERROR; runs only when torchrun sets
+# RANK/WORLD_SIZE.
+pytestmark = pytest.mark.skipif(
+    "RANK" not in os.environ or "WORLD_SIZE" not in os.environ,
+    reason="cross-node harness; launch under torchrun",
+)
 
 _DTYPES = [torch.bfloat16, torch.float32]
 _PARAM_SPLITS = [1048576, 524288, 262144, 131072, 65536]
@@ -94,8 +124,9 @@ def _reference_out(inp, splits, mode, world_size, device):
     o = 0
     for e in splits:
         for r in range(world_size):
-            ref[o * world_size + r * e : o * world_size + r * e + e] = \
-                rank_major[r * count + o : r * count + o + e]
+            ref[o * world_size + r * e : o * world_size + r * e + e] = rank_major[
+                r * count + o : r * count + o + e
+            ]
         o += e
     return ref
 
@@ -116,7 +147,9 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits, reps):
     ss, so, count = _splits_offsets(device)
     out = torch.empty(count * world_size, dtype=dtype, device=device)
     # position weight so the consumer is layout- and value-sensitive.
-    wvec = ((torch.arange(count * world_size, device=device) % 97) + 1).to(torch.float32)
+    wvec = ((torch.arange(count * world_size, device=device) % 97) + 1).to(
+        torch.float32
+    )
 
     # Per-rep VARYING inputs: a stale byte from a prior rep now differs from the
     # expected current value, so staleness is actually detectable.
@@ -163,6 +196,7 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits, reps):
     torch.cuda.synchronize()
 
     vals = [s.item() for s in scalars]
+
     # Determinism = overlapped scalar bitwise-matches the host-synced golden.
     # NaN==NaN is deterministic (a stale-byte race would give DIFFERING run-to-
     # run values, not a stable NaN), so treat matching NaNs as equal.
@@ -170,7 +204,9 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits, reps):
         if v != v and g != g:  # both NaN
             return False
         return v != g
+
     n_wrong = sum(1 for v, g in zip(vals, golden) if _ne(v, g))
+
     # CORRECTNESS vs the independent all_gather reference. Use a relative tol on
     # the huge weighted-sum scalar (bf16 accumulation of ~1e12 has legit ULP
     # noise); a real drain-stale error shifts many elements and blows past this.
@@ -179,6 +215,7 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits, reps):
         if v_nan or t_nan:
             return v_nan != t_nan  # exactly one NaN = wrong; both NaN = ok
         return abs(v - t) > 1e-4 * max(abs(t), 1.0)
+
     n_truth = sum(1 for v, t in zip(vals, truth) if _wrong_vs_truth(v, t))
     n_gold_truth = sum(1 for g, t in zip(golden, truth) if _wrong_vs_truth(g, t))
     if rank == 0:
@@ -226,9 +263,9 @@ def _worker_body(rank, world_size, ranks_per_node, device):
         # single-split profile (Qwen has small layers that route to the
         # non-slice copy-out fallback -- the untested band).
         _SIZE_PROFILES = [
-            (_PARAM_SPLITS, _REPS),        # large multi-split (proven regime)
-            ([65536, 32768, 8192], _REPS), # small sizes (num_blocks=1 band)
-            ([524288], _REPS),             # single big split
+            (_PARAM_SPLITS, _REPS),  # large multi-split (proven regime)
+            ([65536, 32768, 8192], _REPS),  # small sizes (num_blocks=1 band)
+            ([524288], _REPS),  # single big split
             # THE FSDP culprit band: in-situ AG_VERIFY localized the entire loss
             # drift to ONE call/step at per-rank count 29,132,224 (~58MB bf16),
             # ~9592 stale elems, max|diff|~0.15. Reproduce it directly here.
@@ -245,8 +282,11 @@ def _worker_body(rank, world_size, ranks_per_node, device):
         if not supported:
             _MODES = [m for m in _MODES if m != "zerocopy"]
             if rank == 0:
-                print("NOTE: param-contiguous unsupported (STREAM_INTRA=0); "
-                      "running copy-OUT mode only", flush=True)
+                print(
+                    "NOTE: param-contiguous unsupported (STREAM_INTRA=0); "
+                    "running copy-OUT mode only",
+                    flush=True,
+                )
         if not _MODES:
             if rank == 0:
                 print("SKIP: no runnable modes", flush=True)
@@ -264,8 +304,16 @@ def _worker_body(rank, world_size, ranks_per_node, device):
             try:
                 for splits, reps in _SIZE_PROFILES:
                     for dtype in _DTYPES:
-                        nd, wr = _run_dtype(handle, dtype, rank, world_size,
-                                            device, mode, list(splits), reps)
+                        nd, wr = _run_dtype(
+                            handle,
+                            dtype,
+                            rank,
+                            world_size,
+                            device,
+                            mode,
+                            list(splits),
+                            reps,
+                        )
                         total_nd += nd
                         total_wr += wr
             finally:
@@ -277,11 +325,16 @@ def _worker_body(rank, world_size, ranks_per_node, device):
         dist.barrier()
         if rank == 0:
             if total_nd == 0 and total_wr == 0:
-                print("test_hier_overlap_determinism: PASSED (deterministic+correct)",
-                      flush=True)
+                print(
+                    "test_hier_overlap_determinism: PASSED (deterministic+correct)",
+                    flush=True,
+                )
             else:
-                print(f"test_hier_overlap_determinism: FAILED "
-                      f"nondet={total_nd} wrong={total_wr}", flush=True)
+                print(
+                    f"test_hier_overlap_determinism: FAILED "
+                    f"nondet={total_nd} wrong={total_wr}",
+                    flush=True,
+                )
     finally:
         torch.cuda.synchronize()
         dist.barrier()
@@ -297,7 +350,9 @@ def _run_torchrun():
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     dist.init_process_group(
-        backend="cpu:gloo,cuda:nccl", rank=rank, world_size=world_size,
+        backend="cpu:gloo,cuda:nccl",
+        rank=rank,
+        world_size=world_size,
         device_id=device,
     )
     world_group = torch.distributed.group.WORLD
@@ -308,6 +363,11 @@ def _run_torchrun():
         if dist.is_initialized():
             dist.barrier()
             dist.destroy_process_group()
+
+
+def test_hier_overlap_determinism():
+    """Pytest entry: runs only under torchrun (guarded by module pytestmark)."""
+    _run_torchrun()
 
 
 if __name__ == "__main__":
