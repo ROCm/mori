@@ -1,6 +1,27 @@
 #!/usr/bin/env python3
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
 # CROSS-NODE overlap UT for the hp_sdma path (this PR is cross-node, world>=16).
 #
 # THESIS. hp_sdma = host-proxy AllGather: cross-node leg CPU-posted (CU-free),
@@ -23,20 +44,40 @@ import os
 import sys
 import time
 import traceback
+import pytest
 import torch
 import torch.distributed as dist
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 import mori.shmem as shmem  # noqa: E402
 
+# Cross-node (world>=16) torchrun-only overlap bench: SKIP under a plain `pytest`
+# collection (no torchrun env) so the suite does not ERROR; runs only when
+# torchrun sets RANK/WORLD_SIZE.
+pytestmark = pytest.mark.skipif(
+    "RANK" not in os.environ or "WORLD_SIZE" not in os.environ,
+    reason="cross-node (world>=16) harness; launch under torchrun",
+)
 
-def _env_on(n, d="0"): return os.environ.get(n, d) not in ("0", "", "false", "False")
+
+def _env_on(n, d="0"):
+    return os.environ.get(n, d) not in ("0", "", "false", "False")
 
 
 def _build_handle(rank, ws, rpn, per_rank_bytes, device):
     from mori.ccl.host_proxy_ag import HostProxyHierAllGather
-    cap = max(per_rank_bytes, int(os.environ.get("MORI_FSDP_HOSTPROXY_CAP_MB", "512")) * (1 << 20))
-    return HostProxyHierAllGather(my_pe=rank, npes=ws, ranks_per_node=rpn,
-                                  output_buffer_size=cap * ws, device=device)
+
+    cap = max(
+        per_rank_bytes,
+        int(os.environ.get("MORI_FSDP_HOSTPROXY_CAP_MB", "512")) * (1 << 20),
+    )
+    return HostProxyHierAllGather(
+        my_pe=rank,
+        npes=ws,
+        ranks_per_node=rpn,
+        output_buffer_size=cap * ws,
+        device=device,
+    )
 
 
 def _wall(fn, reps, warmup):
@@ -64,9 +105,16 @@ def _worker(rank, ws, rpn, device, size_mb, nops, gemm_n, reps, warmup):
     h = _build_handle(rank, ws, rpn, per, device)
     numel = (size_mb * 1024 * 1024) // 4
     R = 4
-    inp = [(torch.arange(numel, device=device, dtype=torch.float32) + rank * 131.0 + i) for i in range(R)]
-    outm = [torch.empty(numel * ws, dtype=torch.float32, device=device) for _ in range(R)]
-    outr = [torch.empty(numel * ws, dtype=torch.float32, device=device) for _ in range(R)]
+    inp = [
+        (torch.arange(numel, device=device, dtype=torch.float32) + rank * 131.0 + i)
+        for i in range(R)
+    ]
+    outm = [
+        torch.empty(numel * ws, dtype=torch.float32, device=device) for _ in range(R)
+    ]
+    outr = [
+        torch.empty(numel * ws, dtype=torch.float32, device=device) for _ in range(R)
+    ]
     a = torch.randn(gemm_n, gemm_n, device=device, dtype=torch.bfloat16)
     b = torch.randn(gemm_n, gemm_n, device=device, dtype=torch.bfloat16)
     g = torch.empty(gemm_n, gemm_n, device=device, dtype=torch.bfloat16)
@@ -108,6 +156,7 @@ def _worker(rank, ws, rpn, device, size_mb, nops, gemm_n, reps, warmup):
             torch.cuda.synchronize()
             dist.barrier()
             return ev0.elapsed_time(ev1)
+
         for _ in range(warmup):
             once()
         return min(once() for _ in range(reps))
@@ -131,12 +180,15 @@ def _worker(rank, ws, rpn, device, size_mb, nops, gemm_n, reps, warmup):
     if rank == 0:
         speedup = g_rccl / g_mori if g_mori > 0 else 0.0
         win = "hp_sdma" if g_mori < g_rccl else "RCCL"
-        print(f"[overlap-w16] nops={nops} shard={size_mb}MB gemm_n={gemm_n} | "
-              f"GEMM time under concurrent AllGather: rccl={g_rccl:.2f}ms "
-              f"hp_sdma={g_mori:.2f}ms | hp_sdma {speedup:.2f}x faster | win={win} | bitexact={bx}")
+        print(
+            f"[overlap-w16] nops={nops} shard={size_mb}MB gemm_n={gemm_n} | "
+            f"GEMM time under concurrent AllGather: rccl={g_rccl:.2f}ms "
+            f"hp_sdma={g_mori:.2f}ms | hp_sdma {speedup:.2f}x faster | win={win} | bitexact={bx}"
+        )
         if os.environ.get("MORI_OVERLAP_ASSERT", "0") not in ("0", "", "false"):
-            assert g_mori < g_rccl, (
-                f"overlap thesis FAILED: hp_sdma GEMM {g_mori:.2f}ms >= RCCL {g_rccl:.2f}ms")
+            assert (
+                g_mori < g_rccl
+            ), f"overlap thesis FAILED: hp_sdma GEMM {g_mori:.2f}ms >= RCCL {g_rccl:.2f}ms"
             print("test_overlap_w16: PASSED")
     torch.cuda.synchronize()
     dist.barrier()
@@ -145,14 +197,14 @@ def _worker(rank, ws, rpn, device, size_mb, nops, gemm_n, reps, warmup):
     shmem.shmem_finalize()
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--size-mb", type=int, default=8)
     p.add_argument("--nops", type=int, default=50)
     p.add_argument("--gemm-n", type=int, default=2048)
     p.add_argument("--reps", type=int, default=8)
     p.add_argument("--warmup", type=int, default=5)
-    a = p.parse_args()
+    a = p.parse_args(argv)
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
     rank = int(os.environ["RANK"])
     ws = int(os.environ["WORLD_SIZE"])
@@ -160,14 +212,25 @@ def main():
     rpn = int(os.environ.get("LOCAL_WORLD_SIZE", ws))
     torch.cuda.set_device(lr)
     device = torch.device(f"cuda:{lr}")
-    dist.init_process_group(backend="cpu:gloo,cuda:nccl", rank=rank, world_size=ws, device_id=device)
-    torch._C._distributed_c10d._register_process_group("default", torch.distributed.group.WORLD)
+    dist.init_process_group(
+        backend="cpu:gloo,cuda:nccl", rank=rank, world_size=ws, device_id=device
+    )
+    torch._C._distributed_c10d._register_process_group(
+        "default", torch.distributed.group.WORLD
+    )
     try:
         _worker(rank, ws, rpn, device, a.size_mb, a.nops, a.gemm_n, a.reps, a.warmup)
     finally:
         if dist.is_initialized():
             dist.barrier()
             dist.destroy_process_group()
+
+
+def test_overlap_w16():
+    """Pytest entry: runs only under torchrun (guarded by module pytestmark).
+
+    Uses the CLI defaults (argv=[]) rather than pytest's argv."""
+    main([])
 
 
 if __name__ == "__main__":
