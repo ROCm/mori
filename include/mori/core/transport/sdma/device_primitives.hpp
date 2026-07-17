@@ -48,17 +48,12 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
   HSAuint64* signal = signals + qId;
 
-  // DESCRIPTOR PIPELINING (see HierPutNdesc, MORI_HIER_PUT_NDESC). ndesc>1 splits
-  // the single per-peer linear copy into `ndesc` contiguous sub-descriptors placed
-  // BACK-TO-BACK on the SAME queue followed by ONE trailing atomic-inc, in ONE
-  // doorbell ring. Distinct from the QSplit lever (multiple QUEUES/engines) and
-  // DEEP_PIPE (temporal sub-chunks with per-sub landing flags): here a single
-  // engine gets several descriptors queued ahead, so its descriptor-fetch latency
-  // overlaps with in-flight DMA of the previous descriptor instead of the engine
-  // idling between a giant copy and the next op. Bit-exact BY CONSTRUCTION: the
-  // sub-copies are disjoint contiguous sub-ranges of the SAME bytes, the atomic
-  // fires AFTER all of them in FIFO order, and expectedSignals bumps ONCE => the
-  // single quiet still guards the whole column. ndesc<=1 => byte-identical path.
+  // Descriptor pipelining (MORI_HIER_PUT_NDESC): ndesc>1 splits the per-peer copy
+  // into `ndesc` contiguous sub-descriptors placed back-to-back on the same queue
+  // followed by one trailing atomic-inc, in a single doorbell ring, so descriptor
+  // fetch overlaps in-flight DMA. The sub-copies tile the same bytes, the atomic
+  // fires after all of them in FIFO order, and expectedSignals bumps once, so the
+  // single quiet guards the whole column. ndesc<=1 => single-descriptor path.
   if (ndesc <= 1) {
     base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
     pendingWptr = base;
@@ -116,23 +111,14 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   expectedSignals[qId]++;
 }
 
-// COPY-ENGINE FLAG DELIVERY (queued completion, MORI_HIER_QFLAG). Place the peer
-// completion-flag WRITE as an SDMA FENCE packet on the SAME queue, immediately
-// AFTER the linear copy, in ONE doorbell ring. The engine processes queue packets
-// strictly in FIFO order and completes each packet's writes before the next, so
-// the peer observes the flag write STRICTLY AFTER the copied bytes -- exactly the
-// ordering the drain (SdmaQueitThread) + __threadfence_system + separate direct
-// P2P AMO were emulating, but delivered natively by the copy engine. This removes
-// the per-peer send-CQ drain, the system-scope fence, and the separate flag store
-// from the all-to-all completion critical path (the RCCL copy-engine completion
-// model). No local completion signal is enqueued and expectedSignals is NOT bumped
-// (nothing drains this queue for this push); the peer flag IS the completion token.
-// BIT-EXACT by construction: the flag write is FIFO-ordered after its data on one
-// engine, so no reader can see the flag ahead of the bytes; the reader's existing
-// seq-cst SYSTEM acquire + its own __threadfence_system still publish the landed
-// bytes to consumers. ``flagVal`` must fit in 32 bits (op-generation token); it is
-// written to the low word of the u64 flag slot (peer slot zero-init, high word 0),
-// matching the AMO_SET the direct path performed.
+// Copy-engine flag delivery (MORI_HIER_QFLAG): place the peer completion-flag
+// WRITE as an SDMA FENCE packet on the same queue immediately after the linear
+// copy, in one doorbell ring. The engine processes queue packets in FIFO order,
+// so the peer observes the flag write strictly after the copied bytes; the
+// reader's own seq-cst system acquire + __threadfence_system publish the landed
+// bytes to consumers. No local completion signal is enqueued and expectedSignals
+// is not bumped; the peer flag is the completion token. ``flagVal`` must fit in
+// 32 bits and is written to the low word of the u64 flag slot.
 inline __device__ void SdmaPutFencedFlagThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                                anvil::SdmaQueueDeviceHandle** deviceHandles,
                                                HSAuint64* signals, HSAuint64* expectedSignals,
@@ -155,16 +141,11 @@ inline __device__ void SdmaPutFencedFlagThread(void* srcBuf, void* dstBuf, size_
   handle.submitPacket(startBase, pendingWptr);
 }
 
-// Pipelined-ring relay copy: copy + LOCAL
-// completion-signal ONLY, NO remote flag op on the copy engine. On this MI300X/mlx5
-// SDMA microcode folding a REMOTE flag op onto the copy engine is unreliable
-// (SDMA_OP_FENCE no-ops its store, WRITE_UNTILED to a peer XGMI addr drops at late
-// FIFO hops, a remote ATOMIC stalls the engine drain), so the pipelined-ring relay
-// enqueues COPY_LINEAR + a LOCAL SDMA_PKT_ATOMIC inc of signals[qId] (so the caller
-// can drain THIS submit via SdmaQueitThread once per step) and sets the peer flag
-// the proven way (P2P AMO_SET) AFTER the drain. Distinct from
-// SdmaPutFencedFlagThread (COPY+FENCE-to-peerFlagAddr) so the qFlag path is
-// untouched. peerFlagAddr/flagVal kept for signature parity, unused here.
+// Pipelined-ring relay copy: enqueue COPY_LINEAR + a LOCAL SDMA_PKT_ATOMIC inc of
+// signals[qId] (so the caller can drain this submit via SdmaQueitThread once per
+// step); the caller sets the peer flag via P2P AMO_SET after the drain. No remote
+// flag op rides the copy engine. Distinct from SdmaPutFencedFlagThread
+// (COPY+FENCE-to-peerFlagAddr). peerFlagAddr/flagVal are unused here.
 inline __device__ void SdmaPutCopySignalThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                                anvil::SdmaQueueDeviceHandle** deviceHandles,
                                                HSAuint64* signals, HSAuint64* expectedSignals,
@@ -176,8 +157,8 @@ inline __device__ void SdmaPutCopySignalThread(void* srcBuf, void* dstBuf, size_
   uint64_t offset = 0;
   anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
   HSAuint64* signal = signals + qId;
-  uint64_t base = handle.ReserveQueueSpace(
-      sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC), offset);
+  uint64_t base =
+      handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC), offset);
   uint64_t startBase = base;
   uint64_t pendingWptr = base;
   auto copy_packet = anvil::CreateCopyPacket(reinterpret_cast<char*>(srcBuf),
@@ -189,40 +170,26 @@ inline __device__ void SdmaPutCopySignalThread(void* srcBuf, void* dstBuf, size_
   expectedSignals[qId]++;
 }
 
-// Tail-counter completion model: COPY_LINEAR + a
-// REMOTE SDMA_PKT_ATOMIC ADD64(+1) on the SAME queue, ONE doorbell. The atomic rides the
-// SQ FIFO strictly AFTER the linear copy, so the destination peer observes the counter
-// increment only after the copied bytes have landed (flag-after-bytes delivered NATIVELY
-// by the copy engine, with NO CPU send-drain and NO __threadfence_system on the critical
-// path). Distinct from SdmaPutCopySignalThread (which increments a LOCAL signal so the
-// caller can drain): here the ADD64 targets a REMOTE peer counter address (the peer's
-// flag-buffer slot, XGMI P2P engine-mapped) so the receiver's monotonic tail counter is
-// bumped by the ENGINE. This is the exact op mori uses for every cross-agent SDMA signal,
-// posted with system-scope visibility to the remote agent.
-//
-// Why the engine, not a CU atomic: a raw CU
-// atomicAdd/AtomicAddReleaseSystem on flagsMemObj->peerPtrs[nextPe] HSA-FAULTS (0x1016)
-// at G=8 (the _intra flag obj's peerPtrs are ENGINE-addressed, not CU-P2P-atomic-safe),
-// and the mori P2P AMO helper is a CAS loop that never observes success and SPINS. The
-// SDMA engine, by contrast, IS the addressing domain those peerPtrs belong to => an
-// SDMA_PKT_ATOMIC to peerPtrs[nextPe] is the correct, non-faulting publish path.
-// No local signal is enqueued and expectedSignals is NOT bumped (nothing drains this
-// queue for this push; the peer counter is the sole completion token). ``peerCounterAddr``
-// must be the ADD64 target on the destination peer (uint64_t counter, XGMI P2P mapped).
+// Tail-counter completion model: COPY_LINEAR + a REMOTE SDMA_PKT_ATOMIC ADD64(+1)
+// on the same queue, one doorbell. The atomic rides the SQ FIFO after the linear
+// copy, so the destination peer observes the counter increment only after the
+// copied bytes have landed. Distinct from SdmaPutCopySignalThread (which
+// increments a LOCAL signal): here the ADD64 targets a remote peer counter address
+// (the peer's flag-buffer slot, XGMI P2P engine-mapped), bumped by the engine with
+// system-scope visibility. The peer counter is the sole completion token, so no
+// local signal is enqueued and expectedSignals is not bumped. The ADD64 must ride
+// the SDMA engine rather than a CU atomic because those peerPtrs are engine-mapped,
+// not CU-P2P-atomic-safe. ``peerCounterAddr`` is the ADD64 target on the peer
+// (uint64_t counter, XGMI P2P mapped).
 inline __device__ void SdmaPutCopyRemoteAddThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                                   anvil::SdmaQueueDeviceHandle** deviceHandles,
                                                   uint32_t qId, void* peerCounterAddr) {
-  // A single SDMA_PKT_COPY_LINEAR whose byte count exceeds ~8 MiB faults on this
-  // CDNA3 SDMA microcode ("Write access to a read-only page"): the large single copy
-  // runs the count field off the destination allocation onto the next (read-only)
-  // page. Split the copy into <=8 MiB contiguous sub-descriptors placed back-to-back on
-  // the same queue, then one trailing ADD64 to the peer counter. The engine drains
-  // queue packets in strict FIFO order, so the +1 still lands strictly after every byte
-  // of every sub-copy (flag-after-bytes native); the accumulating ADD is unchanged (one
-  // +1 per drained ring step). At copy_size <= 8 MiB this is byte-identical to the prior
-  // single-descriptor path. Distinct from ndesc latency pipelining: this is a hard
-  // copy-size cap dictated by the microcode count limit.
-  const size_t kMaxCopy = 8u * 1024u * 1024u;  // proven-safe single COPY_LINEAR byte count
+  // A single SDMA_PKT_COPY_LINEAR whose byte count exceeds ~8 MiB faults on the
+  // CDNA3 SDMA microcode, so split the copy into <=8 MiB contiguous sub-descriptors
+  // placed back-to-back on the same queue, then one trailing ADD64 to the peer
+  // counter. The engine drains packets in FIFO order, so the +1 lands after every
+  // byte of every sub-copy. This is a hard copy-size cap, not latency pipelining.
+  const size_t kMaxCopy = 8u * 1024u * 1024u;  // max single COPY_LINEAR byte count
   size_t nCopy = (copy_size + kMaxCopy - 1) / kMaxCopy;
   if (nCopy < 1) nCopy = 1;
   uint64_t offset = 0;
