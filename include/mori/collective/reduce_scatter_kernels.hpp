@@ -378,8 +378,8 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
       for (int destPe = w; destPe < npes; destPe += numW) {
         if (destPe == myPe) continue;  // uniform across the warp
         auto** handles = heapObj->deviceHandles_d + (destPe % 8) * numSdmaQ;
-        const T* src = input + destPe * chunkElems;
-        uint8_t* dst = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + off);
+        const auto* src = input + destPe * chunkElems;
+        auto* dst = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[destPe] + off);
         mori::collective::SdmaPutWarpFusedS(
             src, dst, sliceBytes, lastBytes,
             handles, heapObj->peerSignalPtrs[destPe], /*qId=*/0, logS, 
@@ -414,6 +414,9 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
   // device's writes -- scope "" (system) is required -- but only the acquire half
   // is needed here (we publish nothing at this point), so drop the release/waitcnt.
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+
+  // HACK HACK!
+  // return;
 
   // === Phase 3: grid-strided vectorized reduce over slice g ===================
   // Streaming reduction over slice g only, strided over the group's G blocks. Uses

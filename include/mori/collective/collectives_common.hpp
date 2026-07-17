@@ -121,26 +121,25 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v, bool sys
 // data members (same layout as the base), so a base handle can be used through it
 // via a reinterpret_cast -- mirroring anvil::SdmaQueueSingleProducerDeviceHandle.
 struct SdmaCollectiveHandle : anvil::SdmaQueueDeviceHandle {
-  // Write a packet at an ABSOLUTE ring index, with no wrap-NOP padding and without
-  // mutating any write pointer. Used by warp-cooperative issue where a block of S
-  // packets is reserved once (contiguous, pre-padded past the ring end so it
-  // cannot wrap internally) and each lane writes its own slot in parallel.
-  template <typename PacketType>
-  __device__ __forceinline__ void placePacketAt(PacketType& packet, uint64_t wptrIndex) {
-    static_assert(sizeof(PacketType) / sizeof(uint32_t) <= 64);
-    constexpr size_t numDwords = sizeof(PacketType) / sizeof(uint32_t);
-    uint32_t* packetPtr = reinterpret_cast<uint32_t*>(&packet);
-    uint64_t base_index_in_dwords = WrapIntoRing(wptrIndex) / sizeof(uint32_t);
-    // b128 bulk (groups of 4 dwords) + dword tail for any remainder.
-    size_t i = 0;
+
+  // Build a fused copy+atomic packet ENTIRELY in registers and stream it to an
+  // ABSOLUTE ring index as four b128 stores. 
+  // Layout matches SDMA_PKT_COPY_WITH_ATOMIC, assembled from the two shared dword
+  // writers: copy = dwords 0..6 (WriteCopyPacket), atomic = dwords 7..14
+  // (WriteAtomicAddPacket), trailing single-dword NOP = 15.
+  // Caller must have reserved a contiguous, non-wrapping 64B slot at wptrIndex.
+  __device__ __forceinline__ void placeCopyAtomicPacketAt(const void* srcBuf, const void* dstBuf,
+                                                          size_t copyBytes, HSAuint64* signal,
+                                                          uint64_t addVal, uint64_t wptrIndex) {
+    uint32_t dw[16];
+    anvil::WriteCopyPacket(dw, srcBuf, dstBuf, copyBytes);  // copy: dw[0..6]
+    anvil::WriteAtomicAddPacket(dw + 7, signal, addVal);    // atomic: dw[7..14]
+    dw[15] = 0;                                             // trailing single-dword NOP
+    const uint64_t base = WrapIntoRing(wptrIndex) / sizeof(uint32_t);
 #pragma unroll
-    for (; i + 4 <= numDwords; i += 4) {
-      StreamStore<16>(queueBuf + base_index_in_dwords + i,
-                      *reinterpret_cast<TVecType<16>*>(packetPtr + i), false);
-    }
-#pragma unroll
-    for (; i < numDwords; i++) {
-      StreamStore<4>(queueBuf + base_index_in_dwords + i, packetPtr[i], false);
+    for (int i = 0; i < 16; i += 4) {
+      const V128 v = {dw[i], dw[i + 1], dw[i + 2], dw[i + 3]};
+      StreamStore<16>(queueBuf + base + i, v, false);
     }
   }
 
@@ -193,7 +192,7 @@ inline __device__ void SdmaPutWarpFusedS(const void* srcBase, void* dstBase, siz
   const int lane = threadIdx.x % warpSize;
   constexpr size_t packetSize = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
   // Use the collective-augmented handle (identical layout) so we can issue the
-  // b128 placePacketAt / fillNops ring writes.
+  // b128 placeCopyAtomicPacketAt / fillNops ring writes.
   auto& handle =
       *static_cast<SdmaCollectiveHandle*>(*(deviceHandles + qId));  // same queue for all lanes
 
@@ -211,10 +210,9 @@ inline __device__ void SdmaPutWarpFusedS(const void* srcBase, void* dstBase, siz
     auto* s = reinterpret_cast<const char*>(srcBase) + lane * sliceBytes;
     auto* d = reinterpret_cast<char*>(dstBase) + lane * sliceBytes;
     size_t sz = (lane == S - 1) ? lastSliceBytes : sliceBytes;
-    SDMA_PKT_COPY_WITH_ATOMIC packet = {
-        .copy = anvil::CreateCopyPacket(const_cast<char*>(s), d, sz),
-        .atomic = anvil::CreateAtomicAddPacket(signalsBase + lane, addVal)};
-    handle.placePacketAt(packet, startBase + offset + lane * packetSize);
+    // Register-resident build + b128 stores (no scratch spill); see placeCopyAtomicPacketAt.
+    handle.placeCopyAtomicPacketAt(s, d, sz, signalsBase + lane, addVal,
+                                   startBase + offset + lane * packetSize);
   }
   // Reconverge so all lanes have issued their stores before lane 0 submits; the
   // s_waitcnt(0) inside submitPacket then drains the wave-shared vmcnt for them all.
