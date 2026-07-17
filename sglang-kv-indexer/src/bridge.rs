@@ -221,6 +221,20 @@ async fn connect(
     Ok((client, subscriber))
 }
 
+/// Forwards one raw batch, marking it pending for the duration so an
+/// interrupted forward is re-driven verbatim after a reconnect.
+async fn commit_batch(
+    config: &BridgeConfig,
+    client: &mut KvIndexerClient<Channel>,
+    batch: &RawBatch,
+    pending_batch: &mut Option<RawBatch>,
+) -> Result<(), BridgeError> {
+    *pending_batch = Some(batch.clone());
+    forward_raw_batch(config, client, batch).await?;
+    *pending_batch = None;
+    Ok(())
+}
+
 /// Runs a single connected session. Returns `Ok(())` only on a clean shutdown
 /// (ctrl-c); any connection-level error is propagated so the supervisor can
 /// reconnect. Malformed frames / undecodable batches are logged and skipped.
@@ -231,13 +245,15 @@ async fn run_session(
     next_seq: &mut Option<u64>,
     pending_batch: &mut Option<RawBatch>,
 ) -> Result<(), BridgeError> {
-    loop {
-        if let Some(batch) = pending_batch.clone() {
-            forward_raw_batch(config, &mut client, &batch).await?;
-            *pending_batch = None;
-            *next_seq = batch.seq.checked_add(1);
-        }
+    // A batch left pending by the previous disconnect is re-driven once before
+    // consuming new events. It can only be set at session entry: every in-loop
+    // commit either clears it or returns an error that ends the session.
+    if let Some(batch) = pending_batch.clone() {
+        commit_batch(config, &mut client, &batch, pending_batch).await?;
+        *next_seq = batch.seq.checked_add(1);
+    }
 
+    loop {
         let message = tokio::select! {
             result = subscriber.recv() => result?,
             _ = tokio::signal::ctrl_c() => {
@@ -246,8 +262,7 @@ async fn run_session(
             }
         };
 
-        let frames = message.into_vec();
-        let (seq, payload) = match parse_zmq_frames(&frames) {
+        let (seq, payload) = match parse_zmq_frames(&message.into_vec()) {
             Ok((seq, payload)) => (seq, payload.to_vec()),
             Err(error) => {
                 warn!(%error, "skipping malformed ZMQ message");
@@ -266,10 +281,7 @@ async fn run_session(
             }
         }
 
-        let batch = RawBatch { seq, payload };
-        *pending_batch = Some(batch.clone());
-        forward_raw_batch(config, &mut client, &batch).await?;
-        *pending_batch = None;
+        commit_batch(config, &mut client, &RawBatch { seq, payload }, pending_batch).await?;
         *next_seq = seq.checked_add(1);
     }
 }
@@ -334,9 +346,7 @@ async fn replay_missing_batches(
             seq,
             payload: payload.to_vec(),
         };
-        *pending_batch = Some(batch.clone());
-        forward_raw_batch(config, client, &batch).await?;
-        *pending_batch = None;
+        commit_batch(config, client, &batch, pending_batch).await?;
         replay_expected = seq.checked_add(1).unwrap_or(seq);
         recovered += 1;
     }
