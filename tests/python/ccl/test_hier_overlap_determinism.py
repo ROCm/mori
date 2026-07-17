@@ -171,7 +171,6 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits, reps):
             return False
         return v != g
     n_wrong = sum(1 for v, g in zip(vals, golden) if _ne(v, g))
-    first_bad = next((i for i, (v, g) in enumerate(zip(vals, golden)) if _ne(v, g)), -1)
     # CORRECTNESS vs the independent all_gather reference. Use a relative tol on
     # the huge weighted-sum scalar (bf16 accumulation of ~1e12 has legit ULP
     # noise); a real drain-stale error shifts many elements and blows past this.
