@@ -2039,7 +2039,7 @@ class HierAllGather:
             # Only the big cross-node AGs get a targeted completion fence.
             if count * input_data.element_size() >= self._sync_big_bytes:
                 big_ag = True
-        # Turn-24: TARGETED RING/INTRA HOST-FINISH on the BACKWARD big AG only.
+        # TARGETED RING/INTRA HOST-FINISH on the BACKWARD big AG only.
         # The residual fast-path loss drift is in the BACKWARD re-unshard of the
         # big embed/lm_head cross-node AG: a backward-only host stream.synchronize()
         # makes grads bit-exact; forward is exonerated. Every device-side transport
@@ -2128,7 +2128,7 @@ class HierAllGather:
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # Phase-5 (Team A, director 13:48Z): "devgate" -- run the backward big AG
+        # "devgate" -- run the backward big AG
         # on the SAME sync-free on-stream olapfast overlap path (two-launch
         # side-stream ring<->local-gather, stream_ring/intra on) BUT append a
         # DEVICE landing gate kernel on the caller's stream after finish. The gate
@@ -2295,7 +2295,7 @@ class HierAllGather:
         if _ring_hostfin:
             self.stream_ring, self.stream_intra = _saved_sr, _saved_si
             return ret
-        # ALL-COHERENT (Team A T10, world=16): at 8-GPU/node the intra-node gather
+        # ALL-COHERENT (world=16): at 8-GPU/node the intra-node gather
         # spans G=8 local peers via the SDMA COPY ENGINE -- a separate hw agent whose
         # writes a per-call stream.synchronize (DEBUG_SYNC) does NOT bring into CU/L2
         # coherence with the consumer GEMM. big_ag only fences the big embed/lm_head
@@ -2332,7 +2332,7 @@ class HierAllGather:
                 output_data.data_ptr(), u32_count, _stream_to_int(cs)
             )
             return ret
-        # W16 DEVICE-LANDING DRAIN (Team A T63): device-side equivalent of the
+        # W16 DEVICE-LANDING DRAIN: device-side equivalent of the
         # per-op host synchronize for EVERY cross-node AG -- cross-PE rendezvous +
         # on-device mlx5 CQ drain, no host stall, no CU copy. Supersedes big_ag /
         # host-drain when set. See __init__ note.
@@ -2353,7 +2353,7 @@ class HierAllGather:
         # DEBUG_SYNC always host-syncs; SYNC_BIG (barrier mode) prefers a
         # device-side cross-PE barrier on the big AGs (no host stall).
         if big_ag and not self._debug_sync and self._sync_big_mode == "coretouch":
-            # Phase-5 (Team A): barrier (orders RDMA cross-PE landing + intra SDMA
+            # barrier (orders RDMA cross-PE landing + intra SDMA
             # gather) FIRST, THEN an L2-COHERENT re-touch of the consumed output.
             # This is barriercutouch's compose EXCEPT the re-touch is the
             # system-scope acquire/release L2CoherentRetouchKernel_u32 (bypasses the
@@ -2410,7 +2410,7 @@ class HierAllGather:
             with torch.cuda.stream(cs):
                 torch.add(out_flat, 0, out=out_flat)
         elif big_ag and not self._debug_sync and self._sync_big_mode == "devcutouch":
-            # Phase-5 (Team A, Turn 15): THREE fences, each closing a distinct part
+            # THREE fences, each closing a distinct part
             # of the backward big-AG residual that no single/double compose closed:
             #   1. shmem_barrier_on_stream -- CROSS-PE RENDEZVOUS: the device gate
             #      alone drains only THIS PE's outgoing send CQ (proves my writes
@@ -2448,11 +2448,10 @@ class HierAllGather:
             and not self._debug_sync
             and self._sync_big_mode in ("gateinv", "bargateinv")
         ):
-            # Phase-5 (Team A, Turn 14 — director 2026-07-08T18:03Z sharpened lever):
-            # the CONSUME-SIDE LANDING GATE = device WAIT-on-landing THEN L2 INVALIDATE,
-            # gating the big embed/lm_head AG consumer. The T12 host-drain audit proved
+            # The CONSUME-SIDE LANDING GATE = device WAIT-on-landing THEN L2 INVALIDATE,
+            # gating the big embed/lm_head AG consumer. The host-drain audit showed
             # only a HOST CQ-drain closes the fuse_remote consumer race and NO device
-            # fence alone does; the director's correction is that L2INV ALONE is the
+            # fence alone does; L2INV ALONE is the
             # WRONG HALF (it invalidates an UN-landed line so the GEMM re-fetches STALE
             # HBM => drift). The missing half is the WAIT. Compose them on-device, no
             # host stall:
@@ -2462,8 +2461,8 @@ class HierAllGather:
             #      __threadfence_system) -- the WAIT: spins the mlx5 CQ until every
             #      posted WQE has COMPLETED, i.e. every inter-node write has physically
             #      LANDED in HBM. This is the device equivalent of the host CQ-drain
-            #      that T12 proved is the ONLY bit-exact mechanism -- but with no CPU
-            #      round-trip. (devgate alone reached Δ-0.0042: it lands but the GEMM
+            #      that is the ONLY bit-exact mechanism -- but with no CPU
+            #      round-trip. (devgate alone lands but the GEMM
             #      still reads a stale L2 line for the reused FSDP output buffer.)
             #   3. L2InvOnly buffer_inv -- the INVALIDATE: drops the stale device-L2
             #      lines AFTER the landing wait, so the stream-ordered consumer GEMM
@@ -2595,8 +2594,8 @@ class HierAllGather:
             ev.record(s)
             self._sync_big_prev_event = ev
         elif big_ag and not self._debug_sync and self._sync_big_mode == "deferhost":
-            # DEFERRED host-drain (director 2026-07-08T18:26Z SOLE lever). The
-            # T12/T14 audit proved the ONLY E2E-bit-exact big-AG completion fence
+            # DEFERRED host-drain. The
+            # audit showed the ONLY E2E-bit-exact big-AG completion fence
             # on this MI300X/mlx5 pair is a HOST CQ-drain (stream.synchronize);
             # every device landing gate drifts. But draining AT ISSUE (SYNC_BIG=
             # host, line below) stalls the CPU->GPU pipeline the moment the big
