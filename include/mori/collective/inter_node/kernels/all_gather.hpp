@@ -76,16 +76,15 @@ constexpr int kHierInterPollSleep = 0;
 // a purely local flag spin, no global barrier. nullptr keeps the standalone ring
 // byte-for-byte identical.
 inline __device__ void AllGatherRingSubGroupKernelBody(
-    int ringPos, int ringSize, int peBase, int peStride,
-    const application::SymmMemObjPtr memObj, const application::SymmMemObjPtr flagsObj,
-    size_t peChunkSize, int numQp = 1, int numBlocksOverride = -1, int bidOverride = -1,
-    bool usePutSignal = false, bool useWriteImm = false, uint64_t* chunkReadyFlags = nullptr,
-    uint64_t opGen = 0, bool useRead = false, int wqeDepth = 1, int deepPipe = 1,
-    int deepPipeImm = 0, int deepPipeQuiet = 0, int dpSerialDrain = 0,
-    bool useWriteFence = false, int fifoFullWidth = 0, int dpTailPct = 0,
-    int fifoProg = 0, int shardDrain = 0, int directLand = 0,
-    application::SymmMemObjPtr gOutMemObj = application::SymmMemObjPtr{},
-    int gGroupSize = 0, int gGroupPos = 0) {
+    int ringPos, int ringSize, int peBase, int peStride, const application::SymmMemObjPtr memObj,
+    const application::SymmMemObjPtr flagsObj, size_t peChunkSize, int numQp = 1,
+    int numBlocksOverride = -1, int bidOverride = -1, bool usePutSignal = false,
+    bool useWriteImm = false, uint64_t* chunkReadyFlags = nullptr, uint64_t opGen = 0,
+    bool useRead = false, int wqeDepth = 1, int deepPipe = 1, int deepPipeImm = 0,
+    int deepPipeQuiet = 0, int dpSerialDrain = 0, bool useWriteFence = false, int fifoFullWidth = 0,
+    int dpTailPct = 0, int fifoProg = 0, int shardDrain = 0, int directLand = 0,
+    application::SymmMemObjPtr gOutMemObj = application::SymmMemObjPtr{}, int gGroupSize = 0,
+    int gGroupPos = 0) {
   int nextPos = (ringPos + 1) % ringSize;
   int nextPeer = peBase + nextPos * peStride;
   int maxRounds = ringSize - 1;
@@ -111,8 +110,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   // bit-exact and crash-free.
   const int numBlocks = (numBlocksOverride >= 0) ? numBlocksOverride : static_cast<int>(gridDim.x);
   const int bid = (bidOverride >= 0) ? bidOverride : static_cast<int>(blockIdx.x);
-  application::TransportType nextXportMb =
-      shmem::GetGlobalGpuStatesPtr()->transportTypes[nextPeer];
+  application::TransportType nextXportMb = shmem::GetGlobalGpuStatesPtr()->transportTypes[nextPeer];
   bool peerRdmaMb = (nextXportMb == application::TransportType::RDMA);
   bool multiBlock = (numBlocks > 1 && peerRdmaMb);
   if (numBlocks > 1 && !peerRdmaMb && bid != 0) {
@@ -146,8 +144,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   // simulation (P2P/SDMA) keeps the single-warp path and stays bit-exact; only a
   // true cross-node (RDMA) neighbour fans out. Gated additionally on numQp>1 so
   // the flat whole-world ring (numQp defaults to 1) is byte-for-byte unchanged.
-  application::TransportType nextXport =
-      shmem::GetGlobalGpuStatesPtr()->transportTypes[nextPeer];
+  application::TransportType nextXport = shmem::GetGlobalGpuStatesPtr()->transportTypes[nextPeer];
   bool peerIsRdma = (nextXport == application::TransportType::RDMA);
   // Multi-block and within-block multi-QP fan-out are mutually exclusive: in
   // multi-block mode each CTA already drives its own QP (qpId=bid) on its own
@@ -196,8 +193,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   }
   int prevPos = (ringPos - 1 + ringSize) % ringSize;
   int prevPeer = peBase + prevPos * peStride;
-  application::TransportType prevXport =
-      shmem::GetGlobalGpuStatesPtr()->transportTypes[prevPeer];
+  application::TransportType prevXport = shmem::GetGlobalGpuStatesPtr()->transportTypes[prevPeer];
   bool prevIsRdma = (prevXport == application::TransportType::RDMA);
   // Expected increments on our recv slot = active fan-out warps the sender (prev)
   // used, iff prev also fans out with signals; else the single +1.
@@ -328,9 +324,9 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   // full useWarps QP fan-out per sub-chunk (full inter BW), publishes P
   // chunkReadyFlags in temporal order. Self-contained: returns before the classic
   // round loop. INERT when deepPipe<=1 (byte-identical shipped path).
-  bool deepPipeEngaged = (deepPipe > 1 && peerIsRdma && prevIsRdma && maxRounds == 1 &&
-                          !multiBlock && chunkReadyFlags != nullptr && !useReadRing &&
-                          !useWriteImm && useWarps >= 1);
+  bool deepPipeEngaged =
+      (deepPipe > 1 && peerIsRdma && prevIsRdma && maxRounds == 1 && !multiBlock &&
+       chunkReadyFlags != nullptr && !useReadRing && !useWriteImm && useWarps >= 1);
   if (deepPipeEngaged) {
     // Min-sub-chunk clamp: the deep-SQ temporal FIFO splits the chunk into P sub-chunks
     // issued back-to-back on the full useWarps QP fan-out (the NCCL_STEPS full-width-per-
@@ -347,7 +343,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     int reqPmax = static_cast<int>(peChunkSize / kMinSubChunkB);
     if (reqPmax < 1) reqPmax = 1;
     const int P = (deepPipe < reqPmax) ? deepPipe : reqPmax;
-    const int sendRank = ringPos;                       // maxRounds==1: send our own chunk
+    const int sendRank = ringPos;  // maxRounds==1: send our own chunk
     const size_t chunkBaseOffsetSend = static_cast<size_t>(sendRank) * peChunkSize;
     const size_t kAlignDP = 16;
     const size_t nUnits = (peChunkSize + kAlignDP - 1) / kAlignDP;
@@ -366,7 +362,13 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       if (dpTailPct > 0 && dpTailPct < 100 && dpTailPct != 50 && P == 2) {
         size_t tailU = (nUnits * static_cast<size_t>(dpTailPct)) / 100;
         size_t bnd = nUnits - tailU;
-        if (p == 0) { sU = 0; eU = bnd; } else { sU = bnd; eU = nUnits; }
+        if (p == 0) {
+          sU = 0;
+          eU = bnd;
+        } else {
+          sU = bnd;
+          eU = nUnits;
+        }
       } else {
         sU = static_cast<size_t>(p) * unitsPerP;
         eU = sU + unitsPerP;
@@ -428,9 +430,9 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
         if (wS < nUnits) {  // non-empty shard
           shmem::ShmemQuietThread(nextPeer, warpId);
           __threadfence_system();
-          shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
-              flagsObj, (flagBase + warpId) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
-              nextPeer);
+          shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj,
+                                                         (flagBase + warpId) * sizeof(uint64_t), 1,
+                                                         core::atomicType::AMO_ADD, nextPeer);
           long long spin = 0;
           while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + warpId) <
                  static_cast<uint64_t>(1)) {
@@ -519,8 +521,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
         // BEFORE issuing p+1 (tail-per-step).
         if (pActive && threadLinearId == 0) {
           shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
-              flagsObj, (flagBase + p) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
-              nextPeer);
+              flagsObj, (flagBase + p) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer);
         }
         if (pActive && threadLinearId == warpSize) {
           long long spin = 0;
@@ -583,9 +584,9 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       if (threadLinearId == 0) {
         for (int p = 0; p < P; ++p) {
           if (activeOf(p) > 0) {
-            shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
-                flagsObj, (flagBase + p) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
-                nextPeer);
+            shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj,
+                                                           (flagBase + p) * sizeof(uint64_t), 1,
+                                                           core::atomicType::AMO_ADD, nextPeer);
           }
         }
       }
@@ -596,7 +597,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
             while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
                    static_cast<uint64_t>(1)) {
               if (++spin > 10000000000LL) __builtin_trap();
-            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
+              if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
             }
           }
           __threadfence_system();
@@ -633,7 +634,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // then some sub-chunks share a QP and the drain also covers the later one
       // (still bit-exact, just less overlap). Draining a sub-chunk's WHOLE group
       // (all g QPs) before its AMO is the landing fence.
-      const int g = (sw >= P) ? (sw / P) : 1;               // QPs per sub-chunk
+      const int g = (sw >= P) ? (sw / P) : 1;  // QPs per sub-chunk
       auto grpBase = [&](int p) -> int { return (sw >= P) ? (p * g) : (p % sw); };
       auto nonEmptyDP = [&](int p) -> bool {
         size_t sU, eU;
@@ -648,17 +649,23 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           p = warpId / g;
           wl = warpId % g;
           gg = g;
-          if (p >= P) p = -1;                                // extra warps idle
+          if (p >= P) p = -1;  // extra warps idle
         } else {
-          p = warpId;                                        // P>sw: each of first sw warps -> its own sub-chunk group start
+          p = warpId;  // P>sw: each of first sw warps -> its own sub-chunk group start
           wl = 0;
           gg = 1;
         }
         if (p >= 0) {
-          for (int pp = p; pp < P; pp += (sw >= P ? P : sw)) {  // sw<P: warp handles pp = warpId, warpId+sw, ...
+          for (int pp = p; pp < P;
+               pp += (sw >= P ? P : sw)) {  // sw<P: warp handles pp = warpId, warpId+sw, ...
             size_t sU, eU;
             dpRange(pp, sU, eU);
-            if (sU >= eU) { if (sw >= P) break; else continue; }
+            if (sU >= eU) {
+              if (sw >= P)
+                break;
+              else
+                continue;
+            }
             size_t subUnits = eU - sU;
             // Tile sub-chunk pp across gg QPs; lane wl takes its slice.
             size_t upl = (subUnits + static_cast<size_t>(gg) - 1) / static_cast<size_t>(gg);
@@ -666,14 +673,19 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
             size_t lS = sU + static_cast<size_t>(wl) * upl;
             size_t lE = lS + upl;
             if (lE > eU) lE = eU;
-            if (lS >= lE) { if (sw >= P) continue; else continue; }
+            if (lS >= lE) {
+              if (sw >= P)
+                continue;
+              else
+                continue;
+            }
             size_t so = lS * kAlignDP;
             size_t eo = lE * kAlignDP;
             if (eo > peChunkSize) eo = peChunkSize;
             size_t off = chunkBaseOffsetSend + so;
             int qp = grpBase(pp) + wl;
             shmem::ShmemPutMemNbiWarp(memObj, off, memObj, off, eo - so, nextPeer, qp);
-            if (sw >= P) break;   // sw>=P: one warp issues exactly one sub-chunk tile
+            if (sw >= P) break;  // sw>=P: one warp issues exactly one sub-chunk tile
           }
         }
       }
@@ -746,63 +758,66 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
         if (P == 1) {
           if (warpLead && myWarp < sw && nonEmptyDP(0)) {
             shmem::ShmemQuietThread(nextPeer, grpBase(0) + myWarp);  // g==sw, wl==myWarp
-            __threadfence_system();                                 // this QP's bytes visible
+            __threadfence_system();                                  // this QP's bytes visible
           }
           __syncthreads();  // all g QP drains + fences complete (uniform block join)
           if (threadLinearId == 0 && nonEmptyDP(0)) {
-            shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
-                flagsObj, (flagBase + 0) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
-                nextPeer);
+            shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj,
+                                                           (flagBase + 0) * sizeof(uint64_t), 1,
+                                                           core::atomicType::AMO_ADD, nextPeer);
             long long spin = 0;
             while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + 0) <
                    static_cast<uint64_t>(1)) {
               if (++spin > 10000000000LL) __builtin_trap();
-            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
+              if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
             }
             __threadfence_system();
-            core::AtomicStoreSeqCstSystem(chunkReadyFlags + 0, opGen ? opGen : static_cast<uint64_t>(1)); // GEN-TOKEN T28
+            core::AtomicStoreSeqCstSystem(
+                chunkReadyFlags + 0, opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
           }
           __syncthreads();  // keep the block uniform before the shared trailing logic
         } else {
-        __shared__ unsigned int dpGrpDrained[64];  // arrivals per sub-chunk group
-        for (int i = threadLinearId; i < P; i += threadsPerBlock) dpGrpDrained[i] = 0u;
-        __syncthreads();
-        // Drain warp d (d in [0,sw)) -> group p = d/g, lane wl = d%g, drains QP
-        // grpBase(p)+wl. All g lanes of a non-empty group participate (an empty
-        // per-lane tile still drains a no-op CQ, so the count always reaches g).
-        if (warpLead && myWarp < sw) {
-          int d = myWarp;
-          int p = d / g;
-          int wl = d % g;
-          if (p < P && nonEmptyDP(p)) {
-            shmem::ShmemQuietThread(nextPeer, grpBase(p) + wl);
-            __threadfence_system();                 // this QP's landed bytes visible
-            atomicAdd(&dpGrpDrained[p], 1u);         // signal group arrival
-            if (wl == 0) {
-              // Group leader: wait for all g QPs of this group to land, then AMO
-              // the remote flag + spin our own inbound flag + publish. atomicAdd(.,0)
-              // is a well-defined atomic load of the shared arrival counter.
-              long long gspin = 0;
-              while (atomicAdd(&dpGrpDrained[p], 0u) < static_cast<unsigned int>(g)) {
-                if (++gspin > 10000000000LL) __builtin_trap();
+          __shared__ unsigned int dpGrpDrained[64];  // arrivals per sub-chunk group
+          for (int i = threadLinearId; i < P; i += threadsPerBlock) dpGrpDrained[i] = 0u;
+          __syncthreads();
+          // Drain warp d (d in [0,sw)) -> group p = d/g, lane wl = d%g, drains QP
+          // grpBase(p)+wl. All g lanes of a non-empty group participate (an empty
+          // per-lane tile still drains a no-op CQ, so the count always reaches g).
+          if (warpLead && myWarp < sw) {
+            int d = myWarp;
+            int p = d / g;
+            int wl = d % g;
+            if (p < P && nonEmptyDP(p)) {
+              shmem::ShmemQuietThread(nextPeer, grpBase(p) + wl);
+              __threadfence_system();           // this QP's landed bytes visible
+              atomicAdd(&dpGrpDrained[p], 1u);  // signal group arrival
+              if (wl == 0) {
+                // Group leader: wait for all g QPs of this group to land, then AMO
+                // the remote flag + spin our own inbound flag + publish. atomicAdd(.,0)
+                // is a well-defined atomic load of the shared arrival counter.
+                long long gspin = 0;
+                while (atomicAdd(&dpGrpDrained[p], 0u) < static_cast<unsigned int>(g)) {
+                  if (++gspin > 10000000000LL) __builtin_trap();
+                }
+                shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj,
+                                                               (flagBase + p) * sizeof(uint64_t), 1,
+                                                               core::atomicType::AMO_ADD, nextPeer);
+                long long spin = 0;
+                while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
+                       static_cast<uint64_t>(1)) {
+                  // Landing fence MUST wait for the group to land; a timeout escape
+                  // that published chunkReadyFlags[p] anyway would allow a stale-read
+                  // (R188-R191). Abort loudly instead of silently corrupting bytes.
+                  if (++spin > 10000000000LL) __builtin_trap();
+                  if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
+                }
+                __threadfence_system();
+                core::AtomicStoreSeqCstSystem(
+                    chunkReadyFlags + p,
+                    opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
               }
-              shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
-                  flagsObj, (flagBase + p) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
-                  nextPeer);
-              long long spin = 0;
-              while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
-                     static_cast<uint64_t>(1)) {
-                // Landing fence MUST wait for the group to land; a timeout escape
-                // that published chunkReadyFlags[p] anyway would allow a stale-read
-                // (R188-R191). Abort loudly instead of silently corrupting bytes.
-                if (++spin > 10000000000LL) __builtin_trap();
-            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
-              }
-              __threadfence_system();
-              core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, opGen ? opGen : static_cast<uint64_t>(1)); // GEN-TOKEN T28
             }
           }
-        }
         }  // end else (P>1 per-group counter join; P==1 uses the block-barrier fast join)
       } else if (sw <= warpsPerBlock && !dpSerialDrain) {
         // WRAP PARALLEL DRAIN (T23 A): P>sw so sub-chunks share QPs (grpBase=p%sw),
@@ -827,18 +842,20 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           const int w = myWarp;
           for (int p = w; p < P; p += sw) {
             if (!nonEmptyDP(p)) continue;
-            shmem::ShmemQuietThread(nextPeer, grpBase(p));   // grpBase(p)==p%sw==w
+            shmem::ShmemQuietThread(nextPeer, grpBase(p));  // grpBase(p)==p%sw==w
             __threadfence_system();
-            shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
-                flagsObj, (flagBase + p) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer);
+            shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj,
+                                                           (flagBase + p) * sizeof(uint64_t), 1,
+                                                           core::atomicType::AMO_ADD, nextPeer);
             long long spin = 0;
             while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
                    static_cast<uint64_t>(1)) {
               if (++spin > 10000000000LL) __builtin_trap();
-            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
+              if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
             }
             __threadfence_system();
-            core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, opGen ? opGen : static_cast<uint64_t>(1)); // GEN-TOKEN T28
+            core::AtomicStoreSeqCstSystem(
+                chunkReadyFlags + p, opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
           }
         }
       } else if (threadLinearId == 0) {
@@ -857,11 +874,12 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
             while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
                    static_cast<uint64_t>(1)) {
               if (++spin > 10000000000LL) __builtin_trap();
-            if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
+              if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
             }
           }
           __threadfence_system();
-          core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, opGen ? opGen : static_cast<uint64_t>(1)); // GEN-TOKEN T28
+          core::AtomicStoreSeqCstSystem(chunkReadyFlags + p,
+                                        opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
         }
       }
       __syncthreads();
@@ -943,8 +961,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
         if (eo > peChunkSize) eo = peChunkSize;
         size_t off = chunkBaseOffsetSend + so;
         if (deepPipeImm) {
-          shmem::ShmemPutMemImmWarp(memObj, off, memObj, off, eo - so,
-                                    static_cast<uint32_t>(p + 1), nextPeer, warpId);
+          shmem::ShmemPutMemImmWarp(memObj, off, memObj, off, eo - so, static_cast<uint32_t>(p + 1),
+                                    nextPeer, warpId);
         } else if (wqeDepth <= 1 || (eo - so) <= kAlignDP) {
           shmem::ShmemPutMemNbiSignalWarp(memObj, off, memObj, off, eo - so, flagsObj,
                                           (flagBase + p) * sizeof(uint64_t), 1,
@@ -999,7 +1017,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
             shmem::ShmemPollRecvCqImm(prevPeer, w);
           }
           __threadfence_system();
-          core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, opGen ? opGen : static_cast<uint64_t>(1)); // GEN-TOKEN T28
+          core::AtomicStoreSeqCstSystem(chunkReadyFlags + p,
+                                        opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
         }
       }
     } else if (threadLinearId == 0) {
@@ -1014,7 +1033,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           }
         }
         __threadfence_system();
-        core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, opGen ? opGen : static_cast<uint64_t>(1)); // GEN-TOKEN T28
+        core::AtomicStoreSeqCstSystem(chunkReadyFlags + p,
+                                      opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
       }
     }
     __syncthreads();
@@ -1119,10 +1139,9 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // channel flag can never beat the data (bit-exact by construction).
       if (warpId == 0 && blkBytes > 0) {
         size_t subOff = chunkBaseOffset + blkOff;
-        shmem::ShmemPutMemNbiSignalWarp(
-            memObj, subOff, memObj, subOff, blkBytes, flagsObj,
-            (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer,
-            bid);
+        shmem::ShmemPutMemNbiSignalWarp(memObj, subOff, memObj, subOff, blkBytes, flagsObj,
+                                        (flagBase + sendDataRank) * sizeof(uint64_t), 1,
+                                        core::atomicType::AMO_ADD, nextPeer, bid);
       }
       __syncthreads();
       // T40b: NO explicit send-CQ quiet. The fused put-signal already carries the
@@ -1195,40 +1214,23 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // that offset is exactly where the reasm self-column push would have written
       // (bit-exact). The post-loop quiet+flag path is unchanged (drains the send =>
       // output landed remotely => flag). OFF => dest==ring (byte-identical crown).
-      // DIRECT-LAND RKEY GUARD + one-time DIAGNOSTIC (T58). T56/T57 INFERRED the
-      // cross-node RDMA WRITE to gOutMemObj drops for lack of a valid remote rkey
-      // (register printf absent + control-works-via-IPC), but never MEASURED it at
-      // the write site. Here we read the actual device SymmMemObj: if the dest is an
-      // RDMA peer but has no valid peerRkeys[nextPeer], the WRITE would land nowhere
-      // -> FALL BACK to the ring dest (byte-identical crown, no drop). The one-shot
-      // printf reports rkey/ptr/offset so we can settle the root cause definitively.
+      // DIRECT-LAND RKEY GUARD: if the dest is an RDMA peer but has no valid
+      // peerRkeys[nextPeer], the direct WRITE would land nowhere, so fall back to
+      // the ring dest (byte-identical crown, no drop).
       bool dlRkeyOk = true;
       if (directLand) {
         const application::SymmMemObj* g = gOutMemObj.gpu;
-        dlRkeyOk = (g != nullptr) && (!peerIsRdma ||
-                   (g->peerRkeys != nullptr && g->peerRkeys[nextPeer] != 0));
-        if (threadIdx.x == 0 && off == chunkBaseOffset && qp == 0) {
-          printf(
-              "[DL] pe? sendRank=%d nextPeer=%d rdma=%d gOut=%p peerRkeys=%p "
-              "rkey=%u peerPtr=%p size=%zu dBase=%zu peChunk=%zu\n",
-              sendDataRank, nextPeer, (int)peerIsRdma, (void*)g,
-              (g ? (void*)g->peerRkeys : nullptr),
-              (g && g->peerRkeys ? g->peerRkeys[nextPeer] : 0u),
-              (g && g->peerPtrs ? (void*)g->peerPtrs[nextPeer] : nullptr),
-              (g ? g->size : (size_t)0),
-              (static_cast<size_t>(sendDataRank) * static_cast<size_t>(gGroupSize) +
-               static_cast<size_t>(gGroupPos)) * peChunkSize + (off - chunkBaseOffset),
-              peChunkSize);
-        }
+        dlRkeyOk = (g != nullptr) &&
+                   (!peerIsRdma || (g->peerRkeys != nullptr && g->peerRkeys[nextPeer] != 0));
       }
       const bool doDirect = directLand && dlRkeyOk;
       const application::SymmMemObjPtr dObj = doDirect ? gOutMemObj : memObj;
       const size_t dBase =
           doDirect ? ((static_cast<size_t>(sendDataRank) * static_cast<size_t>(gGroupSize) +
-                         static_cast<size_t>(gGroupPos)) *
-                            peChunkSize +
-                        (off - chunkBaseOffset))
-                     : off;
+                       static_cast<size_t>(gGroupPos)) *
+                          peChunkSize +
+                      (off - chunkBaseOffset))
+                   : off;
       if (wqeDepth <= 1 || bytes <= 16) {
         shmem::ShmemPutMemNbiWarp(dObj, dBase, memObj, off, bytes, nextPeer, qp);
         return;
@@ -1266,10 +1268,9 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           // in-order => the sub-range lands remotely before its own +1 fires, so
           // the receiver's per-channel flag never beats the data. No separate
           // quiet, no separate AMO (skipped in the completion block below).
-          shmem::ShmemPutMemNbiSignalWarp(
-              memObj, subOff, memObj, subOff, blkBytes, flagsObj,
-              (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer,
-              bid);
+          shmem::ShmemPutMemNbiSignalWarp(memObj, subOff, memObj, subOff, blkBytes, flagsObj,
+                                          (flagBase + sendDataRank) * sizeof(uint64_t), 1,
+                                          core::atomicType::AMO_ADD, nextPeer, bid);
         } else {
           putDeep(subOff, blkBytes, bid);
         }
@@ -1311,23 +1312,22 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
             // it (bit-exact). The flag AMO still rides flagsObj (chunkReadyFlags), so
             // the landing signal path is unchanged. src stays this GPU's ring slot.
             if (directLand) {
-              size_t outOff =
-                  (static_cast<size_t>(sendDataRank) * static_cast<size_t>(gGroupSize) +
-                   static_cast<size_t>(gGroupPos)) *
-                      peChunkSize +
-                  subStart;
+              size_t outOff = (static_cast<size_t>(sendDataRank) * static_cast<size_t>(gGroupSize) +
+                               static_cast<size_t>(gGroupPos)) *
+                                  peChunkSize +
+                              subStart;
               // Signature is (dest, destOff, source, srcOff, ...): DEST is the
               // receiver's OWN output self-slot (gOutMemObj@outOff on nextPeer),
               // SOURCE is this GPU's local ring chunk (memObj@subOff).
-              shmem::ShmemPutMemNbiSignalWarp(
-                  gOutMemObj, outOff, memObj, subOff, subEnd - subStart, flagsObj,
-                  (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
-                  nextPeer, warpId);
+              shmem::ShmemPutMemNbiSignalWarp(gOutMemObj, outOff, memObj, subOff, subEnd - subStart,
+                                              flagsObj,
+                                              (flagBase + sendDataRank) * sizeof(uint64_t), 1,
+                                              core::atomicType::AMO_ADD, nextPeer, warpId);
             } else {
-              shmem::ShmemPutMemNbiSignalWarp(
-                  memObj, subOff, memObj, subOff, subEnd - subStart, flagsObj,
-                  (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
-                  nextPeer, warpId);
+              shmem::ShmemPutMemNbiSignalWarp(memObj, subOff, memObj, subOff, subEnd - subStart,
+                                              flagsObj,
+                                              (flagBase + sendDataRank) * sizeof(uint64_t), 1,
+                                              core::atomicType::AMO_ADD, nextPeer, warpId);
             }
           } else {
             putDeep(subOff, subEnd - subStart, warpId);
@@ -1401,8 +1401,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     // (ringPos-i-1), which is EXACTLY the recvDataRank received in round i, a
     // hard data dependency (you forward onward precisely what you just got).
     bool signalFused = (usePutSignal && peerIsRdma && !multiBlock && !fanOut);
-    if (threadLinearId == 0 &&
-        (signalFused || fanOutSignal || multiBlockSignal || multiBlockWriteImm || writeImm || fanOutWriteImm)) {
+    if (threadLinearId == 0 && (signalFused || fanOutSignal || multiBlockSignal ||
+                                multiBlockWriteImm || writeImm || fanOutWriteImm)) {
       // The put-with-signal path already carried the completion flag as the last
       // WQE on the data QP (RC-ordered after the data WRITE) -- no separate quiet
       // or AMO is needed. Skipping them is what removes the flag-beats-data race.
@@ -1444,9 +1444,9 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       } else {
         shmem::ShmemQuietThread(nextPeer, memObj);
       }
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
-          flagsObj, (flagBase + sendDataRank) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD,
-          nextPeer);
+      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj,
+                                                     (flagBase + sendDataRank) * sizeof(uint64_t),
+                                                     1, core::atomicType::AMO_ADD, nextPeer);
     } else if (threadLinearId == warpSize && recvFanOutWriteImm) {
       // Poll one recv-CQE per active QP: prev issued fanActive WRITE_WITH_IMMs
       // (one per QP), each CQE proving that QP's disjoint sub-range has landed
@@ -1505,14 +1505,9 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // the accumulation is uniform; fan-out/put-signal keep the classic path.
       const bool genRecv = (opGen != 0 && expectedRecvSig == 1);
       const uint64_t recvThreshold = genRecv ? opGen : (uint64_t)expectedRecvSig;
-      while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + recvDataRank) <
-             recvThreshold) {
+      while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + recvDataRank) < recvThreshold) {
         spinCount++;
         if (spinCount > 10000000) {  // Increased timeout threshold
-          printf("ringPos %d: Timeout waiting from ringPos %d (round %d, slot=%llu<%d)\n", ringPos,
-                 recvDataRank, i, (unsigned long long)core::AtomicLoadSeqCstSystem(
-                                      flagsArray + flagBase + recvDataRank),
-                 expectedRecvSig);
           break;
         }
       }
@@ -1531,7 +1526,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   // caller) so the standalone ring stays byte-for-byte identical.
   if (chunkReadyFlags != nullptr && threadLinearId == 0) {
     __threadfence_system();
-    core::AtomicStoreSeqCstSystem(chunkReadyFlags + bid, opGen ? opGen : static_cast<uint64_t>(1)); // GEN-TOKEN T28
+    core::AtomicStoreSeqCstSystem(chunkReadyFlags + bid,
+                                  opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
   }
   // On a WRITE_WITH_IMM completion path the ring flags region
   // [flagBase, flagBase+ringSize) is NEVER touched this op: the sender emits
@@ -1545,8 +1541,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   // the exact reset+fence, so the default path is unchanged.
   // multiBlockRead/useReadRing bump NO ring flag (they PULL + drain the READ CQE),
   // so the flag region stays 0 all op -> its reset+fence is dead work; skip it too.
-  bool usedWriteImm = (multiBlockWriteImm || writeImm || fanOutWriteImm || multiBlockRead ||
-                       useReadRing);
+  bool usedWriteImm =
+      (multiBlockWriteImm || writeImm || fanOutWriteImm || multiBlockRead || useReadRing);
   // GEN-RING: on the classic single-increment path the flags are intentionally
   // NOT reset -- they accumulate so slot k == opGen after opGen ops (the
   // receiver waits for >= opGen). Skipping the reset is what lets the prepare
