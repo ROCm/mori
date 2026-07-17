@@ -42,6 +42,7 @@ over RDMA). AllGather is a pure data move => ZERO tolerance (``torch.equal``).
 import os
 import traceback
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -49,6 +50,10 @@ import mori.shmem as shmem
 from mori.ccl import InterNodeRingAllgather
 
 from tests.python.utils import TorchDistContext, get_free_port
+
+pytestmark = pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="requires >=2 GPUs"
+)
 
 
 _DEFAULT_DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.int32]
@@ -68,7 +73,8 @@ def _run_one(dtype, numel, rank, world_size, G, device):
     handle = InterNodeRingAllgather(
         my_pe=rank,
         npes=world_size,
-        ring_buffer_bytes=numel * torch.tensor([], dtype=dtype).element_size() * N + 4096,
+        ring_buffer_bytes=numel * torch.tensor([], dtype=dtype).element_size() * N
+        + 4096,
         ring_size=N,
         ring_pos=node,
         pe_base=g,
@@ -84,7 +90,9 @@ def _run_one(dtype, numel, rank, world_size, G, device):
     out_ref = torch.empty(numel * N, dtype=dtype, device=device)
     for k in range(N):
         member_rank = g + k * G
-        out_ref[k * numel : (k + 1) * numel] = _make_input(dtype, numel, member_rank, device)
+        out_ref[k * numel : (k + 1) * numel] = _make_input(
+            dtype, numel, member_rank, device
+        )
 
     stream = torch.cuda.current_stream()
     ok = handle(inp, out_mori, numel, stream)
@@ -134,7 +142,9 @@ def _spawn_worker(rank, world_size, G, port, numels, dtypes):
         _worker_body(rank, world_size, G, numels, dtypes, device)
 
 
-def test_inter_node_ring_subgroup(world_size=None, ranks_per_node=2, numels=None, dtypes=None):
+def test_inter_node_ring_subgroup(
+    world_size=None, ranks_per_node=2, numels=None, dtypes=None
+):
     """Single-node pytest entry. See ``test_inter_node_ring`` for the
     MORI_SDMA_NUM_CHANNELS=1 single-node note (same-node puts route through the
     SDMA multi-queue path whose offset bug we sidestep)."""
@@ -143,7 +153,9 @@ def test_inter_node_ring_subgroup(world_size=None, ranks_per_node=2, numels=None
     if world_size is None:
         world_size = torch.cuda.device_count()
     assert world_size >= 2, f"need >=2 GPUs, got {world_size}"
-    assert world_size % ranks_per_node == 0, "world must be a multiple of ranks_per_node"
+    assert (
+        world_size % ranks_per_node == 0
+    ), "world must be a multiple of ranks_per_node"
     if numels is None:
         numels = [1024, 1024 * 1024, 16 * 1024 * 1024]
     if dtypes is None:
@@ -160,7 +172,9 @@ def test_inter_node_ring_subgroup(world_size=None, ranks_per_node=2, numels=None
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Bit-exact sub-group InterNodeRing test")
+    parser = argparse.ArgumentParser(
+        description="Bit-exact sub-group InterNodeRing test"
+    )
     parser.add_argument("--world-size", type=int, default=None)
     parser.add_argument("--ranks-per-node", type=int, default=2)
     parser.add_argument("--numels", type=int, nargs="+", default=None)
@@ -173,7 +187,11 @@ if __name__ == "__main__":
         dtypes = [string_to_dtype(args.dtype)]
     else:
         dtypes = _DEFAULT_DTYPES
-    numels = args.numels if args.numels is not None else [1024, 1024 * 1024, 16 * 1024 * 1024]
+    numels = (
+        args.numels
+        if args.numels is not None
+        else [1024, 1024 * 1024, 16 * 1024 * 1024]
+    )
 
     try:
         test_inter_node_ring_subgroup(
