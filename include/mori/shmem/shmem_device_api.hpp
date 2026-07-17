@@ -186,7 +186,7 @@ inline __device__ void ShmemPutMemImmWarp(const application::SymmMemObjPtr dest,
                                           size_t sourceOffset, size_t bytes, uint32_t imm, int pe,
                                           int qpId = 0) {
   ShmemPutMemImmWarpKernel<application::TransportType::RDMA>(dest, destOffset, source, sourceOffset,
-                                                            bytes, imm, pe, qpId);
+                                                             bytes, imm, pe, qpId);
 }
 
 // WRITE_WITH_IMM receiver scaffold (cross-node RDMA only). Pre-post recv WQEs
@@ -197,7 +197,7 @@ inline __device__ void ShmemPutMemImmWarp(const application::SymmMemObjPtr dest,
 inline __device__ void ShmemPostRecvImm(uintptr_t laddr, uint64_t lkey, size_t bytes,
                                         uint32_t count, int pe, int qpId = 0) {
   ShmemPostRecvImmThreadKernel<application::TransportType::RDMA>(laddr, lkey, bytes, count, pe,
-                                                                qpId);
+                                                                 qpId);
 }
 
 inline __device__ uint32_t ShmemPollRecvCqImm(int pe, int qpId = 0) {

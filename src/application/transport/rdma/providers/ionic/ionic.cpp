@@ -532,11 +532,11 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   // Optional dedicated recv CQ for the WRITE_WITH_IMM path (default off => shared CQ, legacy).
   // forceClassic=true: the WRITE_WITH_IMM device receiver (PollRecvCqImm) only
   // decodes classic color-bit CQEs, so the dedicated recv CQ must NOT be CCQE.
-  IonicCqContainer* recvCq =
-      config.dedicatedRecvCq ? new IonicCqContainer(context, config, pd, /*forceClassic=*/true)
-                             : nullptr;
-  IonicQpContainer* qp = new IonicQpContainer(context, config, cq->cq, pd, this,
-                                              recvCq ? recvCq->cq : nullptr);
+  IonicCqContainer* recvCq = config.dedicatedRecvCq
+                                 ? new IonicCqContainer(context, config, pd, /*forceClassic=*/true)
+                                 : nullptr;
+  IonicQpContainer* qp =
+      new IonicQpContainer(context, config, cq->cq, pd, this, recvCq ? recvCq->cq : nullptr);
 
   RdmaEndpoint endpoint;
   endpoint.handle.psn = 0;

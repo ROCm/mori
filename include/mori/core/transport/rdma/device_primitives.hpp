@@ -145,8 +145,9 @@ inline __device__ uint64_t PostRead(WorkQueueHandle& wq, uint32_t qpn, uintptr_t
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWriteImm(WorkQueueHandle& wq, uint32_t curPostIdx,
                                         uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
-                                        bool cqeSignal, uint32_t qpn, uintptr_t laddr, uint64_t lkey,
-                                        uintptr_t raddr, uint64_t rkey, uint32_t imm, size_t bytes);
+                                        bool cqeSignal, uint32_t qpn, uintptr_t laddr,
+                                        uint64_t lkey, uintptr_t raddr, uint64_t rkey, uint32_t imm,
+                                        size_t bytes);
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWriteInline(WorkQueueHandle& wq, uint32_t curPostIdx,
@@ -229,7 +230,8 @@ inline __device__ int PollCq(WorkQueueHandle& wqHandle, CompletionQueueHandle& c
 // before its payload lands remotely -- the ordering guarantee the memory-flag
 // path lacks. Receiver-side scaffold; nothing calls it yet.
 template <ProviderType PrvdType>
-inline __device__ int PollRecvCqImm(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint32_t* imm);
+inline __device__ int PollRecvCqImm(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
+                                    uint32_t* imm);
 
 template <ProviderType PrvdType>
 inline __device__ void UpdateCqDbrRecord(CompletionQueueHandle& cq, uint32_t consIdx);

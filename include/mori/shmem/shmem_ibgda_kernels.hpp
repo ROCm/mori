@@ -537,7 +537,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   // (registered on that device): lkey2 locally, peerRkeys2 remotely. The QP handle
   // (wq/cq/qpn) is already the rail-2 QP; only the keys differ. Inert by default
   // (rail2QpStart<0 or !hasRail2) so the single-rail byte path is unchanged.
-  const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) && globalGpuStates->heapObj->hasRail2 &&
+  const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) &&
+                        globalGpuStates->heapObj->hasRail2 &&
                         (localQp >= globalGpuStates->rail2QpStart);
 
   bool needsChunking = globalGpuStates->useVMMHeap;
@@ -716,8 +717,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     // Gated to num_active_lanes==1 (the warp/thread put the ring/fanOut uses) so
     // multi-lane collective posts keep ringNow==true (unchanged per-iter ring).
     const bool isLastChunk = (remaining <= transfer_size);
-    const bool ringNow = !batchDb || (num_active_lanes != 1) || isLastChunk ||
-                         (unrung + 1 >= flushThresh);
+    const bool ringNow =
+        !batchDb || (num_active_lanes != 1) || isLastChunk || (unrung + 1 >= flushThresh);
     if (is_leader) {
       uint64_t db_touched{0};
       do {
@@ -1029,15 +1030,14 @@ inline __device__ uint32_t ShmemPollRecvCqImmThreadKernelImpl(int pe, int qpId) 
       }
       if ((spin & (kDumpEvery - 1)) == 0) {
         uint32_t cqeIdx = rcq->consIdx & (rcq->cqeNum - 1);
-        volatile uint32_t* slot0 =
-            reinterpret_cast<volatile uint32_t*>(reinterpret_cast<char*>(rcq->cqAddr) +
-                                                 (size_t)cqeIdx * rcq->cqeSize);
+        volatile uint32_t* slot0 = reinterpret_cast<volatile uint32_t*>(
+            reinterpret_cast<char*>(rcq->cqAddr) + (size_t)cqeIdx * rcq->cqeSize);
         uint32_t rawBe = *slot0;
         MORI_PRINTF(
             "[RECV_CQ_DBG] pe=%d qpId=%d rc=%d spin=%llu consIdx=%u cqeNum=%u cqeIdx=%u "
             "cqeSize=%u rawBe=0x%08x\n",
-            pe, qpId, rc, (unsigned long long)spin, rcq->consIdx, rcq->cqeNum, cqeIdx,
-            rcq->cqeSize, rawBe);
+            pe, qpId, rc, (unsigned long long)spin, rcq->consIdx, rcq->cqeNum, cqeIdx, rcq->cqeSize,
+            rawBe);
       }
       if (++spin >= kMaxSpin) {
         MORI_PRINTF("[RECV_CQ_DBG] pe=%d qpId=%d GIVING UP after %llu spins (no recv-CQE)\n", pe,
@@ -1059,8 +1059,8 @@ inline __device__ void ShmemPostRecvImmThreadKernel<application::TransportType::
 }
 
 template <>
-inline __device__ uint32_t ShmemPollRecvCqImmThreadKernel<application::TransportType::RDMA>(
-    int pe, int qpId) {
+inline __device__ uint32_t
+ShmemPollRecvCqImmThreadKernel<application::TransportType::RDMA>(int pe, int qpId) {
   if constexpr (DISPATCH_BNXT == 1) {
     return ShmemPollRecvCqImmThreadKernelImpl<core::ProviderType::BNXT>(pe, qpId);
   } else if constexpr (DISPATCH_PSD == 1) {
@@ -1242,7 +1242,8 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
   // (registered on that device): lkey2 locally, peerRkeys2 remotely. The QP handle
   // (wq/cq/qpn) is already the rail-2 QP; only the keys differ. Inert by default
   // (rail2QpStart<0 or !hasRail2) so the single-rail byte path is unchanged.
-  const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) && globalGpuStates->heapObj->hasRail2 &&
+  const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) &&
+                        globalGpuStates->heapObj->hasRail2 &&
                         (localQp >= globalGpuStates->rail2QpStart);
 
   bool needsChunking = globalGpuStates->useVMMHeap;
@@ -1633,7 +1634,8 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   // second-NIC rkey (else REM_ACCESS on the responder). The local ibuf is
   // already this QP's (device-correct); only the remote rkey needs the switch.
   // Default-off (rail2QpStart<0 || !hasRail2) => single-rail byte-identical.
-  const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) && globalGpuStates->heapObj->hasRail2 &&
+  const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) &&
+                        globalGpuStates->heapObj->hasRail2 &&
                         ((qpId % globalGpuStates->numQpPerPe) >= globalGpuStates->rail2QpStart);
   if (globalGpuStates->useVMMHeap) {
     // VMM Heap: atomic data is small (≤8 bytes), won't cross chunk boundary
@@ -1837,7 +1839,8 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
     raddr = dest->peerPtrs[pe] + destOffset;
     // Dual-rail: an AMO posted on a rail-2 QP must use the target buffer's
     // second-NIC rkey (else REM_ACCESS on the responder).
-    const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) && globalGpuStates->heapObj->hasRail2 &&
+    const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) &&
+                          globalGpuStates->heapObj->hasRail2 &&
                           ((qpId % globalGpuStates->numQpPerPe) >= globalGpuStates->rail2QpStart);
     rkey = useRail2 ? dest->peerRkeys2[pe] : dest->peerRkeys[pe];
   }
@@ -3063,7 +3066,8 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
   // (registered on that device): lkey2 locally, peerRkeys2 remotely. The QP handle
   // (wq/cq/qpn) is already the rail-2 QP; only the keys differ. Inert by default
   // (rail2QpStart<0 or !hasRail2) so the single-rail byte path is unchanged.
-  const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) && globalGpuStates->heapObj->hasRail2 &&
+  const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) &&
+                        globalGpuStates->heapObj->hasRail2 &&
                         (localQp >= globalGpuStates->rail2QpStart);
 
   bool needsChunking = globalGpuStates->useVMMHeap;

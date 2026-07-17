@@ -257,7 +257,7 @@ inline __device__ uint64_t PostReadWrite<ProviderType::PSD, true>(WorkQueueHandl
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                     Write-With-Immediate APIs                                   */
+/*                                     Write-With-Immediate APIs */
 /* ---------------------------------------------------------------------------------------------- */
 // RDMA WRITE_WITH_IMM: identical WQE layout to a plain RDMA_WRITE but with the
 // IMM opcode and a 32-bit immediate placed in imm_data_key. On RC the immediate

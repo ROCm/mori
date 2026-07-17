@@ -38,8 +38,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-RES = os.path.dirname(os.path.abspath(__file__))  # raw/ : logs + csv live next to this script
-FIG = os.path.dirname(RES)  # platform results dir : the figure (deliverable) is written up here
+RES = os.path.dirname(
+    os.path.abspath(__file__)
+)  # raw/ : logs + csv live next to this script
+FIG = os.path.dirname(
+    RES
+)  # platform results dir : the figure (deliverable) is written up here
 LINE = re.compile(
     r"\[ag-perf\]\s+(\d+)MB\s+\|\s+rccl=[\d.]+ms\s+\(([\d.]+)GB/s\)\s+"
     r"ibgda_sdma=[\d.]+ms\s+\(([\d.]+)GB/s\)\s+\|\s+bitexact=(\w+)"

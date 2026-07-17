@@ -280,7 +280,8 @@ class InterNodeRingAllgather {
     }
 
     ring_ = shmem::ShmemMalloc(ringBytes_);
-    if (ring_ == nullptr) throw std::runtime_error("InterNodeRingAllgather: ring ShmemMalloc failed");
+    if (ring_ == nullptr)
+      throw std::runtime_error("InterNodeRingAllgather: ring ShmemMalloc failed");
     ringObj_ = shmem::ShmemQueryMemObjPtr(ring_);
 
     // Flags: one uint64 per ring slot PER BLOCK. Allocate numBlocks_*npes
@@ -288,7 +289,8 @@ class InterNodeRingAllgather {
     // the buffer is large enough for any sub-group on this PE set.
     size_t flagsBytes = static_cast<size_t>(numBlocks_) * npes_ * sizeof(uint64_t);
     flags_ = shmem::ShmemMalloc(flagsBytes);
-    if (flags_ == nullptr) throw std::runtime_error("InterNodeRingAllgather: flags ShmemMalloc failed");
+    if (flags_ == nullptr)
+      throw std::runtime_error("InterNodeRingAllgather: flags ShmemMalloc failed");
     (void)hipMemset(flags_, 0, flagsBytes);
     flagsObj_ = shmem::ShmemQueryMemObjPtr(flags_);
 
@@ -367,8 +369,8 @@ class InterNodeRingAllgather {
     // barrier when it is engaged.
     {
       const char* e = std::getenv("MORI_HIER_GEN_RING_DEV");
-      genRingDev_ = (e != nullptr && e[0] != '\0' && e[0] != '0') &&
-                    jit_args_.usePutSignal == 0 && jit_args_.useWriteImm == 0 && !genRing_;
+      genRingDev_ = (e != nullptr && e[0] != '\0' && e[0] != '0') && jit_args_.usePutSignal == 0 &&
+                    jit_args_.useWriteImm == 0 && !genRing_;
     }
     if (genRingDev_) {
       size_t genBytes = static_cast<size_t>(numBlocks_) * sizeof(uint64_t);
@@ -384,8 +386,8 @@ class InterNodeRingAllgather {
     {
       const char* e = std::getenv("MORI_HIER_FUSE_ENTRY_BARRIER");
       fuseEntryBarrier_ = (e != nullptr && e[0] != '\0' && e[0] != '0') &&
-                          jit_args_.usePutSignal == 0 && jit_args_.useWriteImm == 0 &&
-                          !genRing_ && !genRingDev_;
+                          jit_args_.usePutSignal == 0 && jit_args_.useWriteImm == 0 && !genRing_ &&
+                          !genRingDev_;
     }
     if (fuseEntryBarrier_) {
       if (hipMalloc(&gridArrival_, 2 * sizeof(unsigned int)) != hipSuccess ||
@@ -414,8 +416,7 @@ class InterNodeRingAllgather {
       if (ring2_ == nullptr)
         throw std::runtime_error("InterNodeRingAllgather: ring2 ShmemMalloc failed");
       ring2Obj_ = shmem::ShmemQueryMemObjPtr(ring2_);
-      if (hipMalloc(&parityCounter_, sizeof(uint64_t)) != hipSuccess ||
-          parityCounter_ == nullptr) {
+      if (hipMalloc(&parityCounter_, sizeof(uint64_t)) != hipSuccess || parityCounter_ == nullptr) {
         throw std::runtime_error("InterNodeRingAllgather: parityCounter hipMalloc failed");
       }
       (void)hipMemset(parityCounter_, 0, sizeof(uint64_t));
@@ -577,9 +578,7 @@ class InterNodeRingAllgather {
   // Device pointer of the per-op parity counter (0 unless GEN_RING_DBL on),
   // so the Python launcher can fire the captured RingParityBumpKernel_u32 on
   // the ring stream before each fused-kernel launch.
-  uintptr_t parity_counter_ptr() const {
-    return reinterpret_cast<uintptr_t>(parityCounter_);
-  }
+  uintptr_t parity_counter_ptr() const { return reinterpret_cast<uintptr_t>(parityCounter_); }
 
   // Stream-ordered counterpart of prepare_sync_in_place (chunk already in slot).
   int64_t prepare_stream_in_place(size_t count_u32, hipStream_t stream) {

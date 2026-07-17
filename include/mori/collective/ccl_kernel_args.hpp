@@ -1270,7 +1270,7 @@ struct CclFusedRingRemoteGatherArgs {
   int ringBlocks;
   int usePutSignal = 0;
   int useWriteImm = 0;
-  int useRead = 0;  // RDMA-READ (PULL) multiBlockRead landing fence (MORI_HIER_RING_READ)
+  int useRead = 0;        // RDMA-READ (PULL) multiBlockRead landing fence (MORI_HIER_RING_READ)
   int useWriteFence = 0;  // RDMA-WRITE-push SEND-CQ landing fence (MORI_HIER_RING_WRITE)
   uint64_t* chunkReadyFlags = nullptr;  // device, >= ringBlocks u64, zeroed
 
@@ -1284,9 +1284,9 @@ struct CclFusedRingRemoteGatherArgs {
   uint32_t* gInput;  // this PE's own input (local-block source, ring-independent)
   application::SymmMemObjPtr gDstMemObj;
   application::SymmMemObjPtr gFlagsObj;
-  size_t gElementCount;         // per-slice u32 lanes (== count)
-  size_t gDstBaseOffset;        // bytes: local block base (nodeId*blockCount*4)
-  size_t gDstSlotStrideBytes;   // bytes: full-slice stride (== chunkBytes)
+  size_t gElementCount;        // per-slice u32 lanes (== count)
+  size_t gDstBaseOffset;       // bytes: local block base (nodeId*blockCount*4)
+  size_t gDstSlotStrideBytes;  // bytes: full-slice stride (== chunkBytes)
   uint64_t gFlagVal;
 
   // --- remote reassembly (Phase B, m != nodeId; reads the ring buffer) ---
@@ -1470,7 +1470,8 @@ struct CclFusedRingRemoteGatherArgs {
   // 1 => on the temporal deep-pipe path (deepPipe>1) every sub-chunk uses the FULL
   // sw-QP fan-out and the P sub-chunks are issued back-to-back so each QP carries P
   // in-flight WQEs (deep SQ = NIC fill), then a single parallel per-QP drain + P
-  // flag AMOs (native the STEPS pipeline window: depth decoupled from width). 0 = OFF (byte-identical).
+  // flag AMOs (native the STEPS pipeline window: depth decoupled from width). 0 = OFF
+  // (byte-identical).
   int fifoFullWidth = 0;
   // PROGRESSIVE DEEP-PIPE PUBLISH (see HierFifoProgOn / MORI_HIER_FIFO_PROG). 1 =>
   // on the temporal deep-pipe path (deepPipe>1) issue each sub-chunk p at full sw-QP
@@ -1542,10 +1543,8 @@ struct CclFusedRingRemoteGatherArgs {
 // identical; this is pure additive glue. Inert until the Python launcher is wired.
 inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gatherArgsPtr,
                                               int ringBlocks, int64_t chunkReadyFlagsPtr,
-                                              int numNodes, int nodeId,
-                                              int reassemblyBlocks = 0,
-                                              int64_t opGen = 0,
-                                              int reasmDeepSq = 0) {
+                                              int numNodes, int nodeId, int reassemblyBlocks = 0,
+                                              int64_t opGen = 0, int reasmDeepSq = 0) {
   static CclFusedRingRemoteGatherArgs fused;
   const CclInterNodeRingArgs* r = reinterpret_cast<const CclInterNodeRingArgs*>(ringArgsPtr);
   const CclAllgatherSubGroupArgs<uint32_t>* g =
@@ -1573,7 +1572,8 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
   fused.usePutSignal = HierRingPutSignalExplicitlyOn() ? r->usePutSignal : 0;
   fused.useWriteImm = r->useWriteImm;
   fused.useRead = r->useRead;  // plumb MORI_HIER_RING_READ into the crown/deep-pipe launch
-  fused.useWriteFence = r->useWriteFence;  // plumb MORI_HIER_RING_WRITE into the crown/deep-pipe launch
+  fused.useWriteFence =
+      r->useWriteFence;  // plumb MORI_HIER_RING_WRITE into the crown/deep-pipe launch
   fused.chunkReadyFlags = reinterpret_cast<uint64_t*>(chunkReadyFlagsPtr);
 
   fused.myPe = g->myPe;
@@ -1624,8 +1624,7 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
           "ring(%p): peerRkeys=%p peerPtrs=%p lkey=%u size=%zu\n",
           (void*)dst, (dst ? (void*)dst->peerRkeys : nullptr),
           (dst ? (void*)dst->peerPtrs : nullptr), (dst ? dst->lkey : 0u),
-          (dst ? dst->size : (size_t)0), (void*)ring,
-          (ring ? (void*)ring->peerRkeys : nullptr),
+          (dst ? dst->size : (size_t)0), (void*)ring, (ring ? (void*)ring->peerRkeys : nullptr),
           (ring ? (void*)ring->peerPtrs : nullptr), (ring ? ring->lkey : 0u),
           (ring ? ring->size : (size_t)0));
       fflush(stdout);
@@ -1709,8 +1708,7 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
     // MORI_HIER_DEEP_PIPE_MAX_MB is set explicitly, so the shipped default is the
     // conservative byte-identical path. A non-zero window is an explicit opt-in for
     // fuse_remote experiments only.
-    size_t subChunk = (dp > 1) ? (fused.chunkBytes / static_cast<size_t>(dp))
-                               : fused.chunkBytes;
+    size_t subChunk = (dp > 1) ? (fused.chunkBytes / static_cast<size_t>(dp)) : fused.chunkBytes;
     // LOWER floor: gate on the per-PE total chunk so a [MIN,MAX] window can pin
     // deep-pipe to the sizes where it wins and drop the sizes that hang or regress
     // onto the plain path. 0 => no floor.
@@ -1753,8 +1751,7 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
     const char* q = std::getenv("MORI_HIER_DEEP_PIPE_QUIET");
     const bool quietForcedOff = (q != nullptr && q[0] == '0' && q[1] == '\0');
     fused.deepPipeQuiet =
-        (HierDeepPipeQuietOn() ||
-         (fused.deepPipe > 1 && fused.deepPipeImm == 0 && !quietForcedOff))
+        (HierDeepPipeQuietOn() || (fused.deepPipe > 1 && fused.deepPipeImm == 0 && !quietForcedOff))
             ? 1
             : 0;
     // Per-pair coherence ceiling. If the signal path is engaged (deepPipeQuiet==0,
@@ -1862,11 +1859,11 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
   // host-proxy inter leg (E2E path). When engaged the ring CTA reassembles its own
   // sub-range inline via A's FusedRemoteReassembleWorker, so the dedicated reassembly
   // CTAs are redundant (Python drops them). Byte-identical output by construction.
-  fused.inlineReasm = (HierInlineReasmOn() && fused.ringBlocks > 1 &&
-                       fused.hostProxyInter == 0 && fused.chunkReadyFlags != nullptr &&
-                       fused.elasticReasm == 0 && fused.reassemblyBlocks <= 0)
-                          ? 1
-                          : 0;
+  fused.inlineReasm =
+      (HierInlineReasmOn() && fused.ringBlocks > 1 && fused.hostProxyInter == 0 &&
+       fused.chunkReadyFlags != nullptr && fused.elasticReasm == 0 && fused.reassemblyBlocks <= 0)
+          ? 1
+          : 0;
 
   return reinterpret_cast<int64_t>(&fused);
 }
