@@ -132,6 +132,86 @@ def _check_system_deps() -> None:
     )
 
 
+# System packages needed only by UMBP's distributed control plane (gRPC +
+# Protobuf). These are apt/dnf packages, not pip-installable, so we detect them
+# and gracefully disable UMBP when absent instead of failing the whole build.
+_UMBP_APT_PACKAGES = [
+    "libgrpc-dev",
+    "libgrpc++-dev",
+    "libprotobuf-dev",
+    "protobuf-compiler-grpc",
+]
+
+
+def _detect_missing_umbp_deps() -> list:
+    """Return the UMBP gRPC/Protobuf build deps that appear to be missing.
+
+    Mirrors what src/umbp/CMakeLists.txt requires: the C++ gRPC/Protobuf headers
+    plus the protoc compiler and the gRPC C++ plugin.
+    """
+    missing = []
+    header_checks = [
+        (
+            [
+                "/usr/include/grpcpp/grpcpp.h",
+                "/usr/include/x86_64-linux-gnu/grpcpp/grpcpp.h",
+            ],
+            "libgrpc++-dev",
+        ),
+        (
+            [
+                "/usr/include/google/protobuf/message.h",
+                "/usr/include/x86_64-linux-gnu/google/protobuf/message.h",
+            ],
+            "libprotobuf-dev",
+        ),
+    ]
+    for paths, pkg in header_checks:
+        if not any(os.path.isfile(p) for p in paths):
+            missing.append(pkg)
+    if not shutil.which("protoc"):
+        missing.append("protobuf-compiler")
+    if not shutil.which("grpc_cpp_plugin"):
+        missing.append("protobuf-compiler-grpc")
+    return missing
+
+
+def _warn_umbp_disabled(missing: list, explicit: bool) -> None:
+    """Warn that UMBP is being disabled because gRPC/Protobuf are unavailable."""
+    pm = _detect_pkg_manager()
+    lines = [
+        "",
+        "=" * 70,
+        "[mori] UMBP needs gRPC + Protobuf, but these system packages appear "
+        "to be missing:",
+    ]
+    for pkg in missing:
+        lines.append(f"  - {pkg}")
+    lines.append("")
+    if explicit:
+        lines.append(
+            "  You requested UMBP (BUILD_UMBP / BUILD_UMBP_SPDK), but it will be "
+            "DISABLED for this build."
+        )
+    else:
+        lines.append("  UMBP will be DISABLED for this build.")
+    lines.append("  All other mori modules will still be built and installed.")
+    lines.append("")
+    lines.append("  To build UMBP, install the dependencies and rebuild:")
+    if pm in ("dnf", "yum"):
+        lines.append(
+            f"    sudo {pm} install -y grpc-devel grpc-plugins "
+            "protobuf-devel protobuf-compiler"
+        )
+    else:
+        lines.append(
+            "    sudo apt-get update && sudo apt-get install -y "
+            + " ".join(_UMBP_APT_PACKAGES)
+        )
+    lines.append("=" * 70)
+    print("\n".join(lines), file=sys.stderr)
+
+
 def _invalidate_cmake_cache_if_changed(cmake_cache: "Path", cmake_args: list) -> None:
     """Clear CMake cache if any -DKEY=VALUE arg differs from the cached value."""
     if not cmake_cache.is_file():
@@ -409,6 +489,20 @@ class CMakeBuild(build_ext):
 
         build_umbp_spdk_enabled = _env_flag("BUILD_UMBP_SPDK", "OFF")
         build_umbp_enabled = _env_flag("BUILD_UMBP", "ON") or build_umbp_spdk_enabled
+
+        # UMBP's distributed control plane requires gRPC + Protobuf, which are
+        # system packages (not pip-installable). If they are missing, warn and
+        # disable UMBP instead of letting CMake fail hard mid-configure, so the
+        # rest of mori still builds and installs.
+        if build_umbp_enabled:
+            missing_umbp_deps = _detect_missing_umbp_deps()
+            if missing_umbp_deps:
+                _warn_umbp_disabled(
+                    missing_umbp_deps,
+                    explicit=("BUILD_UMBP" in os.environ or build_umbp_spdk_enabled),
+                )
+                build_umbp_enabled = False
+                build_umbp_spdk_enabled = False
 
         _ensure_3rdparty(root_dir)
         if build_umbp_spdk_enabled:
