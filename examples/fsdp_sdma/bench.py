@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """
 Benchmark Qwen-style FSDP2 training with native torch allgather vs MORI SDMA allgather.
 
@@ -8,10 +29,8 @@ Example:
 """
 
 import argparse
-import importlib.util
 import json
 import os
-import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -19,36 +38,7 @@ from typing import Iterable
 
 import torch
 import torch.distributed as dist
-
-
-def _use_local_fsdp() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    fsdp_dir = repo_root / "fsdp"
-    spec = importlib.util.spec_from_file_location(
-        "torch.distributed.fsdp",
-        fsdp_dir / "__init__.py",
-        submodule_search_locations=[str(fsdp_dir)],
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load local FSDP package from {fsdp_dir}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["torch.distributed.fsdp"] = module
-    sys.modules["fsdp"] = module
-    spec.loader.exec_module(module)
-
-
-# Disabled for PyTorch migration validation: use installed torch + /root/wuyl/pytorch FSDP overlay.
-# _use_local_fsdp()
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-
-import torch.distributed.fsdp as _fsdp_pkg
-import torch.distributed.fsdp._fully_shard._fully_shard as _fsdp_fully_shard_mod
-import torch.distributed.fsdp._fully_shard._fsdp_param_group as _fsdp_param_group_mod
-import torch.distributed.fsdp._fully_shard._mori_sdma_allgather as _mori_sdma_mod
-print("[verify-fsdp] fsdp package:", _fsdp_pkg.__file__, flush=True)
-print("[verify-fsdp] fully_shard module:", _fsdp_fully_shard_mod.__file__, flush=True)
-print("[verify-fsdp] param_group module:", _fsdp_param_group_mod.__file__, flush=True)
-print("[verify-fsdp] mori sdma module:", _mori_sdma_mod.__file__, flush=True)
 
 
 _BENCHMARK_SEED = 1234
@@ -126,7 +116,10 @@ def _init_mori_shmem_if_needed(mode: str) -> None:
     import mori.shmem as shmem
 
     shmem.shmem_torch_process_group_init("default")
-    if shmem.shmem_mype() != dist.get_rank() or shmem.shmem_npes() != dist.get_world_size():
+    if (
+        shmem.shmem_mype() != dist.get_rank()
+        or shmem.shmem_npes() != dist.get_world_size()
+    ):
         raise RuntimeError(
             "MORI SHMEM PE mapping must match the FSDP process group for this benchmark"
         )
@@ -197,7 +190,9 @@ def _iter_decoder_layers(model: torch.nn.Module) -> Iterable[torch.nn.Module]:
     )
 
 
-def _apply_fsdp2(model: torch.nn.Module, dtype: torch.dtype, reshard_root: bool) -> None:
+def _apply_fsdp2(
+    model: torch.nn.Module, dtype: torch.dtype, reshard_root: bool
+) -> None:
     mp_policy = (
         MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
         if dtype != torch.float32
@@ -224,8 +219,12 @@ def _apply_fsdp2(model: torch.nn.Module, dtype: torch.dtype, reshard_root: bool)
         from torch.distributed.fsdp._fully_shard._mori_sdma_allgather import (
             MoriSdmaAllGather,
         )
+
         zc = os.environ.get("MORI_FSDP_ZERO_COPY_OUTPUT", "").strip().lower() in (
-            "1", "true", "yes", "on",
+            "1",
+            "true",
+            "yes",
+            "on",
         )
         ag = MoriSdmaAllGather(zero_copy_output=zc)
         if os.environ.get("MORI_FSDP_ROOT_ONLY"):
@@ -249,7 +248,11 @@ def _apply_fsdp2(model: torch.nn.Module, dtype: torch.dtype, reshard_root: bool)
     if _fwd_pf and _fwd_pf not in ("0", "false", "False"):
         depth = max(1, int(_fwd_pf))
         if depth > 1 and os.environ.get("MORI_FSDP_FWD_PREFETCH_UNSAFE", "") not in (
-            "1", "true", "True", "yes", "on",
+            "1",
+            "true",
+            "True",
+            "yes",
+            "on",
         ):
             depth = 1
         layers = list(_iter_decoder_layers(model))
@@ -270,16 +273,26 @@ def _apply_fsdp2(model: torch.nn.Module, dtype: torch.dtype, reshard_root: bool)
     if os.environ.get("MORI_FSDP_BIG_PREFETCH", "") not in ("", "0", "false", "False"):
         layers = list(_iter_decoder_layers(model))
         lm_head = getattr(model, "lm_head", None)
-        if layers and lm_head is not None and hasattr(lm_head, "set_modules_to_forward_prefetch"):
+        if (
+            layers
+            and lm_head is not None
+            and hasattr(lm_head, "set_modules_to_forward_prefetch")
+        ):
             layers[-1].set_modules_to_forward_prefetch([lm_head])
         # backward: layers[0] runs last in the backward pass before the root/embed
         # group is re-gathered -- prefetch the embed group's backward AG into it.
         embed = getattr(getattr(model, "model", model), "embed_tokens", None)
-        if layers and embed is not None and hasattr(layers[0], "set_modules_to_backward_prefetch"):
+        if (
+            layers
+            and embed is not None
+            and hasattr(layers[0], "set_modules_to_backward_prefetch")
+        ):
             layers[0].set_modules_to_backward_prefetch([embed])
 
 
-def _estimate_training_tflops(num_params: int, tokens: int, step_time_s: float) -> float:
+def _estimate_training_tflops(
+    num_params: int, tokens: int, step_time_s: float
+) -> float:
     # Dense transformer training is commonly approximated as 6 FLOPs per
     # parameter per token. This is a model-level estimate, not a profiler count.
     return 6.0 * num_params * tokens / step_time_s / 1e12
@@ -329,7 +342,9 @@ def main() -> None:
         if args.profile_start_step < 0:
             raise ValueError("--profile-start-step must be non-negative")
         if args.profile_steps <= 0:
-            raise ValueError("--profile-steps must be positive when --profile-dir is set")
+            raise ValueError(
+                "--profile-steps must be positive when --profile-dir is set"
+            )
     _configure_mode(args.mode)
     rank, local_rank, world_size, device = _init_distributed(args.backend)
     _init_mori_shmem_if_needed(args.mode)
@@ -357,7 +372,9 @@ def main() -> None:
     _apply_fsdp2(model, dtype=dtype, reshard_root=args.reshard_root)
     model.train()
     if rank == 0:
-        print("FSDP2 model is ready; starting optimizer setup and benchmark.", flush=True)
+        print(
+            "FSDP2 model is ready; starting optimizer setup and benchmark.", flush=True
+        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     dist.barrier()
@@ -388,6 +405,7 @@ def main() -> None:
     for step in range(total_steps):
         if step == args.warmup and _gc_mode in ("freeze", "1", "on", "true"):
             import gc as _gc
+
             _gc.collect()
             _gc.freeze()
             if rank == 0:
@@ -486,9 +504,7 @@ def main() -> None:
     )
     dist.all_reduce(local, op=dist.ReduceOp.SUM)
     avg_step_time = local[0].item() / local[3].item()
-    avg_tokens_per_s = (
-        args.micro_batch_size * args.seq_len * world_size / avg_step_time
-    )
+    avg_tokens_per_s = args.micro_batch_size * args.seq_len * world_size / avg_step_time
     avg_tflops = _estimate_training_tflops(
         num_params,
         args.micro_batch_size * args.seq_len * world_size,
