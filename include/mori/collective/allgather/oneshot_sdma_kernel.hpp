@@ -52,8 +52,7 @@ namespace collective {
 // single-node run and node 0 of any multi-node run are unchanged -- so the
 // device-ibgda path (MOTIVATION_RULES rule 3) cannot regress; only the
 // previously-broken peBase>=8 drain is corrected.
-__device__ __forceinline__ void SubGroupSdmaDrainPe(int pe,
-                                                    const application::SymmMemObjPtr dest) {
+__device__ __forceinline__ void SubGroupSdmaDrainPe(int pe, const application::SymmMemObjPtr dest) {
   const uint32_t nq = dest->sdmaNumQueue;
   core::SdmaQueitThread(dest->signalPtrs + static_cast<size_t>(pe) * nq,
                         dest->expectSignalsPtr + static_cast<size_t>(pe) * nq, nq);
@@ -336,15 +335,14 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
   // path (not the counter) so the G-1-writer barrier is untouched. The self slot is still
   // drained+fenced before return. Requires flatMW, mutually exclusive with fuseSelf/
   // batchSelf, needs warp (G-1) to exist.
-  const bool overlapSelf = flatMW && !fuseSelf && !batchSelf &&
-                           ((fencedFlag & 4096) != 0) && ((G - 1) < numWarps);
+  const bool overlapSelf =
+      flatMW && !fuseSelf && !batchSelf && ((fencedFlag & 4096) != 0) && ((G - 1) < numWarps);
   if (fuseSelf) {
-    const uint64_t fWant =
-        (flagVal - 1) * static_cast<uint64_t>(G) + static_cast<uint64_t>(G);
+    const uint64_t fWant = (flagVal - 1) * static_cast<uint64_t>(G) + static_cast<uint64_t>(G);
     // warp t (t in [0,G)) copies my owned slot g to PE t (t==g => local self-fill), ADD64 to
     // PE t's counter. All G distinct-engine doorbells fire together; no serial self-fill front.
     if (warpId < G && laneId == 0) {
-      const int destPe = peBase + warpId * peStride;       // t==g => myPe (local copy)
+      const int destPe = peBase + warpId * peStride;  // t==g => myPe (local copy)
       anvil::SdmaQueueDeviceHandle** dHandles = dest->deviceHandles_d + destPe * nq;
       uint8_t* dDstBase = reinterpret_cast<uint8_t*>(dest->peerPtrs[destPe]) + dstBaseOffset;
       uint64_t* destF = reinterpret_cast<uint64_t*>(flagsMemObj->peerPtrs[destPe]);
@@ -415,8 +413,8 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
     //     Each dest is a distinct engine; all G-1 doorbells fire near-simultaneously.
     if (warpId < G - 1 && laneId == 0) {
       const int t = warpId;
-      const int destPos = (t < g) ? t : (t + 1);           // skip my own position g
-      const int destPe = peBase + destPos * peStride;      // distinct dest PE = distinct engine
+      const int destPos = (t < g) ? t : (t + 1);       // skip my own position g
+      const int destPe = peBase + destPos * peStride;  // distinct dest PE = distinct engine
       anvil::SdmaQueueDeviceHandle** dHandles = dest->deviceHandles_d + destPe * nq;
       uint8_t* dDstBase = reinterpret_cast<uint8_t*>(dest->peerPtrs[destPe]) + dstBaseOffset;
       uint64_t* destF = reinterpret_cast<uint64_t*>(flagsMemObj->peerPtrs[destPe]);
@@ -458,9 +456,9 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
   const bool half2x4 = ((fencedFlag & 4) != 0) && (G % 2 == 0) && (G >= 4);
   if (half2x4) {
     const int H = G / 2;
-    const int half = g / H;                              // 0 or 1
-    const int pos = g % H;                               // 0..H-1 within my half
-    const int halfBase = peBase + half * H * peStride;   // first PE of my half
+    const int half = g / H;                             // 0 or 1
+    const int pos = g % H;                              // 0..H-1 within my half
+    const int halfBase = peBase + half * H * peStride;  // first PE of my half
     const uint64_t p1Base = (flagVal - 1) * static_cast<uint64_t>(H - 1);
     const uint64_t p1Want = p1Base + static_cast<uint64_t>(H - 1);
     const uint64_t p2Base = (flagVal - 1) * static_cast<uint64_t>(H);
@@ -649,7 +647,7 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
       HSAuint64* selfSignals = dest->signalPtrs + myPe * nq;
       HSAuint64* selfExpected = dest->expectSignalsPtr + myPe * nq;
       uint64_t* nextP1 = reinterpret_cast<uint64_t*>(flagsMemObj->peerPtrs[nextPe]);
-      const int mySlot = half * H + pos;                 // global slot this PE owns
+      const int mySlot = half * H + pos;  // global slot this PE owns
       for (int c = 0; c < C; ++c) {
         size_t off = static_cast<size_t>(c) * chunkBytes;
         if (off >= bytesPerPeer) break;
@@ -673,8 +671,8 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
           const size_t myCtr = flagBase + static_cast<size_t>(c);
           uint8_t* src = reinterpret_cast<uint8_t*>(input) + off;  // owned slot from input
           for (int t = 0; t < H; ++t) {
-            if (t == pos) continue;                                // skip self
-            const int destPe = halfBase + t * peStride;            // each = distinct engine
+            if (t == pos) continue;                      // skip self
+            const int destPe = halfBase + t * peStride;  // each = distinct engine
             anvil::SdmaQueueDeviceHandle** dHandles = dest->deviceHandles_d + destPe * nq;
             uint8_t* dDstBase = reinterpret_cast<uint8_t*>(dest->peerPtrs[destPe]) + dstBaseOffset;
             uint64_t* destP1 = reinterpret_cast<uint64_t*>(flagsMemObj->peerPtrs[destPe]);
@@ -691,8 +689,8 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
           if (off + len > bytesPerPeer) len = bytesPerPeer - off;
           const size_t myCtr = flagBase + static_cast<size_t>(c);
           for (int s = 0; s < H - 1; ++s) {
-            const int kk = (pos - s + H) % H;            // within-half slot to forward
-            const int gslot = half * H + kk;             // global slot index
+            const int kk = (pos - s + H) % H;  // within-half slot to forward
+            const int gslot = half * H + kk;   // global slot index
             uint8_t* src;
             if (s == 0) {
               src = reinterpret_cast<uint8_t*>(input) + off;
@@ -790,9 +788,9 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
           size_t len = chunkBytes;
           if (off + len > bytesPerPeer) len = bytesPerPeer - off;
           const size_t p2Ctr = flagBase + static_cast<size_t>(C) + static_cast<size_t>(c);
-          uint8_t* src = reinterpret_cast<uint8_t*>(input) + off;    // owned slot from input
+          uint8_t* src = reinterpret_cast<uint8_t*>(input) + off;  // owned slot from input
           for (int t = 0; t < H; ++t) {
-            const int destPe = otherBase + t * peStride;             // each = distinct engine
+            const int destPe = otherBase + t * peStride;  // each = distinct engine
             anvil::SdmaQueueDeviceHandle** dHandles = dest->deviceHandles_d + destPe * nq;
             uint8_t* dDstBase = reinterpret_cast<uint8_t*>(dest->peerPtrs[destPe]) + dstBaseOffset;
             uint64_t* destP2 = reinterpret_cast<uint64_t*>(flagsMemObj->peerPtrs[destPe]);
@@ -817,12 +815,12 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
           if (off + len > bytesPerPeer) len = bytesPerPeer - off;
           const size_t p2Ctr = flagBase + static_cast<size_t>(C) + static_cast<size_t>(c);
           for (int j = w; j < H; j += QP) {
-            const int gslot = half * H + j;              // my half's slots -> partner needs
+            const int gslot = half * H + j;  // my half's slots -> partner needs
             uint8_t* src = selfDstBase + static_cast<size_t>(gslot) * slotStride + off;
             uint8_t* dstPtr = pDstBase + static_cast<size_t>(gslot) * slotStride + off;
             void* peerCtr = static_cast<void*>(partnerP2 + p2Ctr);
-            core::SdmaPutCopyRemoteAddThread(src, dstPtr, len, pHandles,
-                                             static_cast<uint32_t>(w), peerCtr);
+            core::SdmaPutCopyRemoteAddThread(src, dstPtr, len, pHandles, static_cast<uint32_t>(w),
+                                             peerCtr);
           }
         }
       }
@@ -838,7 +836,7 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
         if (off + len > bytesPerPeer) len = bytesPerPeer - off;
         const size_t p2Ctr = flagBase + static_cast<size_t>(C) + static_cast<size_t>(c);
         for (int j = 0; j < H; ++j) {
-          const int gslot = half * H + j;                // my half's slots -> partner needs
+          const int gslot = half * H + j;  // my half's slots -> partner needs
           uint8_t* src = selfDstBase + static_cast<size_t>(gslot) * slotStride + off;
           uint8_t* dstPtr = pDstBase + static_cast<size_t>(gslot) * slotStride + off;
           void* peerCtr = static_cast<void*>(partnerP2 + p2Ctr);
@@ -939,8 +937,8 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
               }
             }
             if (stuck) {
-              printf("[RINGSTUCK] SEND myPe=%d g=%d s=%d c=%d ctr=%llu got=%llu want=%llu\n",
-                     myPe, g, s, c, static_cast<unsigned long long>(myCtr),
+              printf("[RINGSTUCK] SEND myPe=%d g=%d s=%d c=%d ctr=%llu got=%llu want=%llu\n", myPe,
+                     g, s, c, static_cast<unsigned long long>(myCtr),
                      static_cast<unsigned long long>(core::AtomicLoadRelaxedSystem(flags + myCtr)),
                      static_cast<unsigned long long>(want));
             }
@@ -987,8 +985,8 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
         }
       }
       if (stuck) {
-        printf("[RINGSTUCK] COMPL myPe=%d g=%d c=%d ctr=%llu got=%llu want=%llu\n",
-               myPe, g, c, static_cast<unsigned long long>(myCtr),
+        printf("[RINGSTUCK] COMPL myPe=%d g=%d c=%d ctr=%llu got=%llu want=%llu\n", myPe, g, c,
+               static_cast<unsigned long long>(myCtr),
                static_cast<unsigned long long>(core::AtomicLoadRelaxedSystem(flags + myCtr)),
                static_cast<unsigned long long>(want));
       }
@@ -1142,8 +1140,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
     if (warpId < groupSize && warpId != groupPos && laneId == 0) {
       int remotePe = peBase + warpId * peStride;
       const size_t off = static_cast<size_t>(warpId) * slotStride;
-      uint8_t* srcPtr =
-          reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + off;
+      uint8_t* srcPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + off;
       uint8_t* dstPtr = localOut + off;
       anvil::SdmaQueueDeviceHandle** dh = dest->deviceHandles_d + remotePe * nq;
       HSAuint64* sig = dest->signalPtrs + remotePe * nq;
@@ -1210,10 +1207,10 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
       // peers. Cross-half XGMI is carried only by the relay link. Each shard s reaches
       // every rank g!=owner, flags[flagBase+s] set exactly once per receiver; the shared
       // final wait below is unchanged.
-      const bool amRelay = (sgPos == 0);            // CTA-uniform (whole block = 1 rank)
-      const int myRelay = sgId * H;                 // my SG's relay slot
-      const int otherRelay = (sgId ^ 1) * H;        // the other SG's relay slot
-      uint8_t* outBuf = myLocalBuf;                 // my assembled output base
+      const bool amRelay = (sgPos == 0);      // CTA-uniform (whole block = 1 rank)
+      const int myRelay = sgId * H;           // my SG's relay slot
+      const int otherRelay = (sgId ^ 1) * H;  // the other SG's relay slot
+      uint8_t* outBuf = myLocalBuf;           // my assembled output base
       const bool contig = (slotStride == bytesPerPeer);
 
       // ---- PHASE 1: intra sub-group 4-way gather (ALL ranks) ----
@@ -1268,8 +1265,8 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
         if (warpId == 0 && laneId == 0) {
           if (contig) {
             size_t off = static_cast<size_t>(myRelay) * slotStride;
-            core::SdmaPutThread(outBuf + off, peerBase + off,
-                                static_cast<size_t>(H) * bytesPerPeer, dh, sig, esig, nq, 0);
+            core::SdmaPutThread(outBuf + off, peerBase + off, static_cast<size_t>(H) * bytesPerPeer,
+                                dh, sig, esig, nq, 0);
           } else {
             for (int k = 0; k < H; ++k) {
               size_t off = static_cast<size_t>(myRelay + k) * slotStride;
@@ -1312,8 +1309,8 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
           uint8_t* peerBase = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset;
           if (contig) {
             size_t off = static_cast<size_t>(otherRelay) * slotStride;
-            core::SdmaPutThread(outBuf + off, peerBase + off,
-                                static_cast<size_t>(H) * bytesPerPeer, dh, sig, esig, nq, 0);
+            core::SdmaPutThread(outBuf + off, peerBase + off, static_cast<size_t>(H) * bytesPerPeer,
+                                dh, sig, esig, nq, 0);
           } else {
             for (int k = 0; k < H; ++k) {
               size_t off = static_cast<size_t>(otherRelay + k) * slotStride;
@@ -1331,8 +1328,8 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
           for (int k = 0; k < H; ++k) {
             int shardPos = otherRelay + k;
             shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-                flagsMemObj, (flagBase + static_cast<size_t>(shardPos)) * sizeof(uint64_t), &flagVal,
-                8, core::atomicType::AMO_SET, remotePe, 0);
+                flagsMemObj, (flagBase + static_cast<size_t>(shardPos)) * sizeof(uint64_t),
+                &flagVal, 8, core::atomicType::AMO_SET, remotePe, 0);
           }
         }
         __syncthreads();
@@ -1349,148 +1346,148 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
         __syncthreads();
       }
     } else {
-    // Overlapped mode (h2x4==2): pipeline P2 under P1. P2 rides queue min(1,nq-1) so its
-    // forward SDMA executes on a distinct link queue from P1 (queue 0), pipelining with
-    // P1's drain instead of being FIFO-serialized behind it. The partner-wait also moves
-    // before the P1 drain so it overlaps P1 flight rather than stacking after it. Same
-    // bytes/slots/flags as the serial mode. Serial mode (h2x4==1) is unchanged (qP2==0,
-    // partner-wait after drain).
-    const bool olap = (h2x4 == 2);
-    const int qP2 = (olap && nq > 1) ? 1 : 0;
+      // Overlapped mode (h2x4==2): pipeline P2 under P1. P2 rides queue min(1,nq-1) so its
+      // forward SDMA executes on a distinct link queue from P1 (queue 0), pipelining with
+      // P1's drain instead of being FIFO-serialized behind it. The partner-wait also moves
+      // before the P1 drain so it overlaps P1 flight rather than stacking after it. Same
+      // bytes/slots/flags as the serial mode. Serial mode (h2x4==1) is unchanged (qP2==0,
+      // partner-wait after drain).
+      const bool olap = (h2x4 == 2);
+      const int qP2 = (olap && nq > 1) ? 1 : 0;
 
-    // Per-warp phase-1 target position: warp w<H-1 => w-th sub-group peer (skip self),
-    // warp H-1 => partner, warp H => self (own slot copy).
-    int p1pos = -1;
-    if (warpId < H - 1) {
-      int j = (warpId < sgPos) ? warpId : warpId + 1;
-      p1pos = sgId * H + j;
-    } else if (warpId == H - 1) {
-      p1pos = partnerPos;
-    } else if (warpId == H) {
-      p1pos = groupPos;  // self
-    }
-    // ---- PHASE 1 submit ----
-    if (warpId <= H && laneId == 0 && p1pos >= 0) {
-      int remotePe = peBase + p1pos * peStride;
-      uint8_t* dstPtr =
-          reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + myShardDstOff;
-      anvil::SdmaQueueDeviceHandle** dh = dest->deviceHandles_d + remotePe * nq;
-      HSAuint64* sig = dest->signalPtrs + remotePe * nq;
-      HSAuint64* esig = dest->expectSignalsPtr + remotePe * nq;
-      core::SdmaPutThread(myInput, dstPtr, bytesPerPeer, dh, sig, esig, nq, 0);
-    }
-    __syncthreads();
-    // ---- PHASE 2 target position (computed here; used by both schedules) ----
-    int p2pos = -1;
-    if (warpId < H - 1) {
-      int j = (warpId < sgPos) ? warpId : warpId + 1;
-      p2pos = sgId * H + j;
-    }
-    if (olap) {
-      // Deadlock-free "overlap" variant. Moving the partner-wait before the P1 signal
-      // would deadlock: rank A's partner-wait needs partner B's P1 signal, which needs B
-      // past its barrier, which needs B's own partner-wait on A's P1 signal -- a circular
-      // cross-rank wait. So the P1 signal must precede the partner-wait (partners release
-      // each other first), which is the serial ordering; the two phases are too tightly
-      // cross-coupled to overlap the drain/wait. The only residual overlap lever is
-      // routing P2 onto a distinct queue qP2 (its forward SDMA runs on a different link
-      // queue than P1's queue 0). Same bytes/slots/flags; ShmemQuietThread drains all nq
-      // queues. Note: routing the local-peer P2 onto queue 1 can stall under the known
-      // queue-1 signal-counter liveness hazard (see ccl_kernels.hip reasm qId note), so
-      // this variant is disabled by default.
+      // Per-warp phase-1 target position: warp w<H-1 => w-th sub-group peer (skip self),
+      // warp H-1 => partner, warp H => self (own slot copy).
+      int p1pos = -1;
+      if (warpId < H - 1) {
+        int j = (warpId < sgPos) ? warpId : warpId + 1;
+        p1pos = sgId * H + j;
+      } else if (warpId == H - 1) {
+        p1pos = partnerPos;
+      } else if (warpId == H) {
+        p1pos = groupPos;  // self
+      }
+      // ---- PHASE 1 submit ----
       if (warpId <= H && laneId == 0 && p1pos >= 0) {
-        SubGroupSdmaDrainPe(peBase + p1pos * peStride, dest);
-      }
-      __syncthreads();
-      if (threadLinearId == 0) __threadfence_system();
-      __syncthreads();
-      if (warpId < H && laneId == 0 && p1pos >= 0) {
-        shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-            flagsMemObj, (flagBase + static_cast<size_t>(groupPos)) * sizeof(uint64_t), &flagVal, 8,
-            core::atomicType::AMO_SET, peBase + p1pos * peStride, 0);
-      }
-      __syncthreads();
-      if (threadLinearId == 0) {
-        while (core::AtomicLoadRelaxedSystem(flags + flagBase + partnerPos) < flagVal) {
-        }
-        (void)core::AtomicLoadSeqCstSystem(flags + flagBase + partnerPos);
-      }
-      __syncthreads();
-      if (threadLinearId == 0) __threadfence_system();
-      __syncthreads();
-      if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
-        int remotePe = peBase + p2pos * peStride;
-        uint8_t* srcPtr = myLocalBuf + partnerDstOff;
+        int remotePe = peBase + p1pos * peStride;
         uint8_t* dstPtr =
-            reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + partnerDstOff;
+            reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + myShardDstOff;
         anvil::SdmaQueueDeviceHandle** dh = dest->deviceHandles_d + remotePe * nq;
         HSAuint64* sig = dest->signalPtrs + remotePe * nq;
         HSAuint64* esig = dest->expectSignalsPtr + remotePe * nq;
-        core::SdmaPutThread(srcPtr, dstPtr, bytesPerPeer, dh, sig, esig, nq, qP2);
+        core::SdmaPutThread(myInput, dstPtr, bytesPerPeer, dh, sig, esig, nq, 0);
       }
       __syncthreads();
-      if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
-        SubGroupSdmaDrainPe(peBase + p2pos * peStride, dest);
+      // ---- PHASE 2 target position (computed here; used by both schedules) ----
+      int p2pos = -1;
+      if (warpId < H - 1) {
+        int j = (warpId < sgPos) ? warpId : warpId + 1;
+        p2pos = sgId * H + j;
       }
-      __syncthreads();
-      if (threadLinearId == 0) __threadfence_system();
-      __syncthreads();
-      if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
-        shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-            flagsMemObj, (flagBase + static_cast<size_t>(partnerPos)) * sizeof(uint64_t), &flagVal, 8,
-            core::atomicType::AMO_SET, peBase + p2pos * peStride, 0);
-      }
-      __syncthreads();
-    } else {
-      // Serial (h2x4==1): drain all phase-1 queues (incl. self), CTA fence, signal the
-      // H peer targets (self carries no flag: the final wait skips groupPos), local-wait
-      // partner shard, fence, then phase 2.
-      if (warpId <= H && laneId == 0 && p1pos >= 0) {
-        SubGroupSdmaDrainPe(peBase + p1pos * peStride, dest);
-      }
-      __syncthreads();
-      if (threadLinearId == 0) __threadfence_system();
-      __syncthreads();
-      if (warpId < H && laneId == 0 && p1pos >= 0) {
-        shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-            flagsMemObj, (flagBase + static_cast<size_t>(groupPos)) * sizeof(uint64_t), &flagVal, 8,
-            core::atomicType::AMO_SET, peBase + p1pos * peStride, 0);
-      }
-      __syncthreads();
-      // ---- local wait for partner's shard ----
-      if (threadLinearId == 0) {
-        while (core::AtomicLoadRelaxedSystem(flags + flagBase + partnerPos) < flagVal) {
+      if (olap) {
+        // Deadlock-free "overlap" variant. Moving the partner-wait before the P1 signal
+        // would deadlock: rank A's partner-wait needs partner B's P1 signal, which needs B
+        // past its barrier, which needs B's own partner-wait on A's P1 signal -- a circular
+        // cross-rank wait. So the P1 signal must precede the partner-wait (partners release
+        // each other first), which is the serial ordering; the two phases are too tightly
+        // cross-coupled to overlap the drain/wait. The only residual overlap lever is
+        // routing P2 onto a distinct queue qP2 (its forward SDMA runs on a different link
+        // queue than P1's queue 0). Same bytes/slots/flags; ShmemQuietThread drains all nq
+        // queues. Note: routing the local-peer P2 onto queue 1 can stall under the known
+        // queue-1 signal-counter liveness hazard (see ccl_kernels.hip reasm qId note), so
+        // this variant is disabled by default.
+        if (warpId <= H && laneId == 0 && p1pos >= 0) {
+          SubGroupSdmaDrainPe(peBase + p1pos * peStride, dest);
         }
-        (void)core::AtomicLoadSeqCstSystem(flags + flagBase + partnerPos);
+        __syncthreads();
+        if (threadLinearId == 0) __threadfence_system();
+        __syncthreads();
+        if (warpId < H && laneId == 0 && p1pos >= 0) {
+          shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+              flagsMemObj, (flagBase + static_cast<size_t>(groupPos)) * sizeof(uint64_t), &flagVal,
+              8, core::atomicType::AMO_SET, peBase + p1pos * peStride, 0);
+        }
+        __syncthreads();
+        if (threadLinearId == 0) {
+          while (core::AtomicLoadRelaxedSystem(flags + flagBase + partnerPos) < flagVal) {
+          }
+          (void)core::AtomicLoadSeqCstSystem(flags + flagBase + partnerPos);
+        }
+        __syncthreads();
+        if (threadLinearId == 0) __threadfence_system();
+        __syncthreads();
+        if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
+          int remotePe = peBase + p2pos * peStride;
+          uint8_t* srcPtr = myLocalBuf + partnerDstOff;
+          uint8_t* dstPtr =
+              reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + partnerDstOff;
+          anvil::SdmaQueueDeviceHandle** dh = dest->deviceHandles_d + remotePe * nq;
+          HSAuint64* sig = dest->signalPtrs + remotePe * nq;
+          HSAuint64* esig = dest->expectSignalsPtr + remotePe * nq;
+          core::SdmaPutThread(srcPtr, dstPtr, bytesPerPeer, dh, sig, esig, nq, qP2);
+        }
+        __syncthreads();
+        if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
+          SubGroupSdmaDrainPe(peBase + p2pos * peStride, dest);
+        }
+        __syncthreads();
+        if (threadLinearId == 0) __threadfence_system();
+        __syncthreads();
+        if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
+          shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+              flagsMemObj, (flagBase + static_cast<size_t>(partnerPos)) * sizeof(uint64_t),
+              &flagVal, 8, core::atomicType::AMO_SET, peBase + p2pos * peStride, 0);
+        }
+        __syncthreads();
+      } else {
+        // Serial (h2x4==1): drain all phase-1 queues (incl. self), CTA fence, signal the
+        // H peer targets (self carries no flag: the final wait skips groupPos), local-wait
+        // partner shard, fence, then phase 2.
+        if (warpId <= H && laneId == 0 && p1pos >= 0) {
+          SubGroupSdmaDrainPe(peBase + p1pos * peStride, dest);
+        }
+        __syncthreads();
+        if (threadLinearId == 0) __threadfence_system();
+        __syncthreads();
+        if (warpId < H && laneId == 0 && p1pos >= 0) {
+          shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+              flagsMemObj, (flagBase + static_cast<size_t>(groupPos)) * sizeof(uint64_t), &flagVal,
+              8, core::atomicType::AMO_SET, peBase + p1pos * peStride, 0);
+        }
+        __syncthreads();
+        // ---- local wait for partner's shard ----
+        if (threadLinearId == 0) {
+          while (core::AtomicLoadRelaxedSystem(flags + flagBase + partnerPos) < flagVal) {
+          }
+          (void)core::AtomicLoadSeqCstSystem(flags + flagBase + partnerPos);
+        }
+        __syncthreads();
+        if (threadLinearId == 0) __threadfence_system();
+        __syncthreads();
+        // ---- PHASE 2: forward partner's shard to my H-1 sub-group peers ----
+        if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
+          int remotePe = peBase + p2pos * peStride;
+          uint8_t* srcPtr = myLocalBuf + partnerDstOff;
+          uint8_t* dstPtr =
+              reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + partnerDstOff;
+          anvil::SdmaQueueDeviceHandle** dh = dest->deviceHandles_d + remotePe * nq;
+          HSAuint64* sig = dest->signalPtrs + remotePe * nq;
+          HSAuint64* esig = dest->expectSignalsPtr + remotePe * nq;
+          core::SdmaPutThread(srcPtr, dstPtr, bytesPerPeer, dh, sig, esig, nq, 0);
+        }
+        __syncthreads();
+        if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
+          SubGroupSdmaDrainPe(peBase + p2pos * peStride, dest);
+        }
+        __syncthreads();
+        if (threadLinearId == 0) __threadfence_system();
+        __syncthreads();
+        if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
+          shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+              flagsMemObj, (flagBase + static_cast<size_t>(partnerPos)) * sizeof(uint64_t),
+              &flagVal, 8, core::atomicType::AMO_SET, peBase + p2pos * peStride, 0);
+        }
+        __syncthreads();
       }
-      __syncthreads();
-      if (threadLinearId == 0) __threadfence_system();
-      __syncthreads();
-      // ---- PHASE 2: forward partner's shard to my H-1 sub-group peers ----
-      if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
-        int remotePe = peBase + p2pos * peStride;
-        uint8_t* srcPtr = myLocalBuf + partnerDstOff;
-        uint8_t* dstPtr =
-            reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + partnerDstOff;
-        anvil::SdmaQueueDeviceHandle** dh = dest->deviceHandles_d + remotePe * nq;
-        HSAuint64* sig = dest->signalPtrs + remotePe * nq;
-        HSAuint64* esig = dest->expectSignalsPtr + remotePe * nq;
-        core::SdmaPutThread(srcPtr, dstPtr, bytesPerPeer, dh, sig, esig, nq, 0);
-      }
-      __syncthreads();
-      if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
-        SubGroupSdmaDrainPe(peBase + p2pos * peStride, dest);
-      }
-      __syncthreads();
-      if (threadLinearId == 0) __threadfence_system();
-      __syncthreads();
-      if (warpId < H - 1 && laneId == 0 && p2pos >= 0) {
-        shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-            flagsMemObj, (flagBase + static_cast<size_t>(partnerPos)) * sizeof(uint64_t), &flagVal, 8,
-            core::atomicType::AMO_SET, peBase + p2pos * peStride, 0);
-      }
-      __syncthreads();
-    }
     }
   } else if (ringPhasedActive) {
     // Width-W permutation issue schedule (ringPhased carries the width W). The plain
@@ -1728,7 +1725,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
 }
 
 // ---------------------------------------------------------------------------
-// PHASE 4: pipelined relay ring sub-group reassembly
+// Pipelined relay ring sub-group reassembly
 // ---------------------------------------------------------------------------
 // The push-only reassembly below is a flat G-way scatter: every rank writes its own
 // column into slot ``groupPos`` of all G members, so each receiver is written by G
@@ -1754,11 +1751,12 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
 // cluster-wedging hang). ``ringSelfSrc`` != nullptr stages the self shard from the
 // ring buffer (non-direct-land); nullptr => self slot already holds it (direct-land).
 template <typename T>
-__device__ void OneShotSubGroupPushRing_body(
-    int groupSize, int groupPos, int peBase, int peStride,
-    const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
-    size_t blockBaseBytes, size_t subOff, size_t subBytes, size_t slotStride, uint64_t flagVal,
-    size_t flagBase, int qId, const T* ringSelfSrc) {
+__device__ void OneShotSubGroupPushRing_body(int groupSize, int groupPos, int peBase, int peStride,
+                                             const application::SymmMemObjPtr dstMemObj,
+                                             const application::SymmMemObjPtr flagsMemObj,
+                                             size_t blockBaseBytes, size_t subOff, size_t subBytes,
+                                             size_t slotStride, uint64_t flagVal, size_t flagBase,
+                                             int qId, const T* ringSelfSrc) {
   if (threadIdx.x != 0 || subBytes == 0 || groupSize <= 0) return;
   const int G = groupSize;
   const int myPos = groupPos;
@@ -1806,7 +1804,7 @@ __device__ void OneShotSubGroupPushRing_body(
 }
 
 // ---------------------------------------------------------------------------
-// PHASE 4: PUSH-ONLY sub-group reassembly (deadlock-free, parallel)
+// Push-only sub-group reassembly (deadlock-free, parallel)
 // ---------------------------------------------------------------------------
 // The remote-block reassembly of the hierarchical AllGather is an intra-node
 // sub-group gather among the ``G`` local ranks: rank ``groupPos`` owns one
@@ -1832,17 +1830,14 @@ __device__ void OneShotSubGroupPushRing_body(
 // per-queue signal counter (expectedSignals[qId]) is never raced; callers clamp
 // the number of concurrent reassembly blocks to the peer's SDMA queue count.
 template <typename T>
-__device__ void OneShotSubGroupPushOnly_body(int groupSize, int groupPos, int peBase, int peStride,
-                                             T* input, const application::SymmMemObjPtr dstMemObj,
-                                             const application::SymmMemObjPtr flagsMemObj,
-                                             size_t elementCount, size_t dstBaseOffset,
-                                             size_t dstSlotStrideBytes, uint64_t flagVal,
-                                             size_t flagBase, int qId, int deepSqPhase = 0,
-                                             int qSplit = 0, int qStride = 1, int fuseFence = 0,
-                                             int ndesc = 1, int pushRotate = 0, int qFlag = 0,
-                                             int multiQueue = 0, int pushPhased = 0,
-                                             int pushPeerLo = 0, int pushPeerHi = -1,
-                                             int pushFlag = 1, int skipSelfCopy = 0) {
+__device__ void OneShotSubGroupPushOnly_body(
+    int groupSize, int groupPos, int peBase, int peStride, T* input,
+    const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
+    size_t elementCount, size_t dstBaseOffset, size_t dstSlotStrideBytes, uint64_t flagVal,
+    size_t flagBase, int qId, int deepSqPhase = 0, int qSplit = 0, int qStride = 1,
+    int fuseFence = 0, int ndesc = 1, int pushRotate = 0, int qFlag = 0, int multiQueue = 0,
+    int pushPhased = 0, int pushPeerLo = 0, int pushPeerHi = -1, int pushFlag = 1,
+    int skipSelfCopy = 0) {
   // Intra reassembly deep-SQ phase split (see HierReasmDeepSqOn). deepSqPhase==0
   // (default) = the single-shot path (submit -> drain -> fence -> flag). ==1 =
   // submit-only: push the SDMA copy + bump expectedSignals[q] but don't drain/fence/
@@ -1889,8 +1884,8 @@ __device__ void OneShotSubGroupPushOnly_body(int groupSize, int groupPos, int pe
   // completion path only. Block-uniform gate => the per-phase __syncthreads() is not
   // divergent. Bit-exact: same column bytes into slot groupPos of the same G peers
   // with the same per-peer drain+fence+flag; only issue order/overlap changes.
-  const bool phasedActive = (pushPhased != 0 && deepSqPhase == 0 && qSplit == 0 &&
-                             qFlag == 0 && fuseFence == 0 && !mqActive);
+  const bool phasedActive = (pushPhased != 0 && deepSqPhase == 0 && qSplit == 0 && qFlag == 0 &&
+                             fuseFence == 0 && !mqActive);
   if (phasedActive) {
     const int nq = dstMemObj->sdmaNumQueue > 0 ? static_cast<int>(dstMemObj->sdmaNumQueue) : 1;
     application::SymmMemObjPtr dest = dstMemObj;
@@ -2018,50 +2013,50 @@ __device__ void OneShotSubGroupPushOnly_body(int groupSize, int groupPos, int pe
       // still issues its own __threadfence_system before its flag => the flag
       // never precedes its bytes; only the drain/fence/flag ORDER across peers
       // changes, not which bytes any flag guards.
-      core::SdmaPutThread(srcPtr, dstPtr, bytesPerPeer, devicehandles, signals, expectedSignals,
-                          nq, q);
+      core::SdmaPutThread(srcPtr, dstPtr, bytesPerPeer, devicehandles, signals, expectedSignals, nq,
+                          q);
       core::SdmaQueitThread(signals + q, expectedSignals + q, 1);
       // fence + flag deferred to the post-barrier completion phase below.
     } else {
-    // DIRECT-LAND self-column skip (see skipSelfCopy): the self output slot was
-    // filled by the inter-node RDMA WRITE (data landed + fenced before this worker
-    // ran), so this warp does NO SDMA copy/drain -- it only fences + fires the self
-    // completion flag so the reader still sees source==groupPos delivered. Non-self
-    // warps copy normally (their source is now the output self-slot, same bytes).
-    const bool selfSkip = (skipSelfCopy != 0 && effWarp == groupPos);
-    // Push this rank's column on its OWN queue ``q`` (distinct per block).
-    // deepSqPhase==2 is DRAIN-only (the copy was already submitted in phase 1).
-    if (deepSqPhase != 2 && !selfSkip) {
-      // ndesc>1 (single-shot crown path only) pipelines the per-peer copy across
-      // several back-to-back descriptors on queue q (see HierPutNdesc). Safe for
-      // deepSqPhase 0/1: the accumulated signal count still equals one bump/push.
-      core::SdmaPutThread(srcPtr, dstPtr, bytesPerPeer, devicehandles, signals, expectedSignals,
-                          nq, q, ndesc);
-    }
-    // deepSqPhase==1 is SUBMIT-only: skip the drain/fence/flag so the next
-    // channel's copy is fed without a per-descriptor drain round-trip.
-    if (deepSqPhase != 1) {
-      // Drain ONLY queue ``q`` (single-queue quiet) so the copy has landed before
-      // the flag fires, WITHOUT touching other blocks' queues. In deep-SQ phase 2
-      // expectedSignals[q] already holds the accumulated count of every phase-1
-      // submit on this queue, so this single wait covers them all.
-      if (!selfSkip) core::SdmaQueitThread(signals + q, expectedSignals + q, 1);
-      // SENDER-SIDE completion fence (see collective body above): system-scope
-      // order the pushed SDMA bytes BEFORE the flag AMO becomes peer-visible, so
-      // the completion reader cannot see the flag ahead of the data. Closes the
-      // copy-engine visibility gap that previously needed a host stream sync.
-      __threadfence_system();
-      // The flag AMO is a DIRECT peer-memory CAS (P2P), not an SDMA-queue signal,
-      // so it never races the per-queue counter. Bump slot ``flagBase+groupPos``.
-      // pushFlag==0 (non-last tile of the read-coalescing tile loop) suppresses only the
-      // flag AMO -- the copy is still drained+fenced this tile, and the flag fires only on
-      // the last tile after all bytes have drained.
-      if (pushFlag) {
-        shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-            flagsMemObj, (flagBase + static_cast<size_t>(groupPos)) * sizeof(uint64_t), &flagVal, 8,
-            core::atomicType::AMO_SET, remotePe, 0);
+      // DIRECT-LAND self-column skip (see skipSelfCopy): the self output slot was
+      // filled by the inter-node RDMA WRITE (data landed + fenced before this worker
+      // ran), so this warp does NO SDMA copy/drain -- it only fences + fires the self
+      // completion flag so the reader still sees source==groupPos delivered. Non-self
+      // warps copy normally (their source is now the output self-slot, same bytes).
+      const bool selfSkip = (skipSelfCopy != 0 && effWarp == groupPos);
+      // Push this rank's column on its OWN queue ``q`` (distinct per block).
+      // deepSqPhase==2 is DRAIN-only (the copy was already submitted in phase 1).
+      if (deepSqPhase != 2 && !selfSkip) {
+        // ndesc>1 (single-shot crown path only) pipelines the per-peer copy across
+        // several back-to-back descriptors on queue q (see HierPutNdesc). Safe for
+        // deepSqPhase 0/1: the accumulated signal count still equals one bump/push.
+        core::SdmaPutThread(srcPtr, dstPtr, bytesPerPeer, devicehandles, signals, expectedSignals,
+                            nq, q, ndesc);
       }
-    }
+      // deepSqPhase==1 is SUBMIT-only: skip the drain/fence/flag so the next
+      // channel's copy is fed without a per-descriptor drain round-trip.
+      if (deepSqPhase != 1) {
+        // Drain ONLY queue ``q`` (single-queue quiet) so the copy has landed before
+        // the flag fires, WITHOUT touching other blocks' queues. In deep-SQ phase 2
+        // expectedSignals[q] already holds the accumulated count of every phase-1
+        // submit on this queue, so this single wait covers them all.
+        if (!selfSkip) core::SdmaQueitThread(signals + q, expectedSignals + q, 1);
+        // SENDER-SIDE completion fence (see collective body above): system-scope
+        // order the pushed SDMA bytes BEFORE the flag AMO becomes peer-visible, so
+        // the completion reader cannot see the flag ahead of the data. Closes the
+        // copy-engine visibility gap that previously needed a host stream sync.
+        __threadfence_system();
+        // The flag AMO is a DIRECT peer-memory CAS (P2P), not an SDMA-queue signal,
+        // so it never races the per-queue counter. Bump slot ``flagBase+groupPos``.
+        // pushFlag==0 (non-last tile of the read-coalescing tile loop) suppresses only the
+        // flag AMO -- the copy is still drained+fenced this tile, and the flag fires only on
+        // the last tile after all bytes have drained.
+        if (pushFlag) {
+          shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+              flagsMemObj, (flagBase + static_cast<size_t>(groupPos)) * sizeof(uint64_t), &flagVal,
+              8, core::atomicType::AMO_SET, remotePe, 0);
+        }
+      }
     }  // end legacy single-queue path (else of qSplit)
   }
   // BATCHED SENDER-QUIET completion phase (fuseFence): after the barrier every
@@ -2127,8 +2122,8 @@ __device__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_body(
     for (int i = 0; i < numBlocks; ++i) {
       const int m = firstBlock + i;                     // global node block
       const size_t r = static_cast<size_t>(m) * G + g;  // global rank
-      uint8_t* blkSrc =
-          reinterpret_cast<uint8_t*>(input) + static_cast<size_t>(i) * blockStrideElems * bytesPerElement;
+      uint8_t* blkSrc = reinterpret_cast<uint8_t*>(input) +
+                        static_cast<size_t>(i) * blockStrideElems * bytesPerElement;
       for (size_t s = 0; s < splitCount; ++s) {
         size_t E = splitSizes[s];
         if (E == 0) {

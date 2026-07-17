@@ -232,22 +232,16 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   // maxRounds==1 so larger rings keep the push path.
   bool multiBlockRead = (useRead && peerIsRdma && prevIsRdma && maxRounds == 1 && multiBlock);
 
-  // T40 (A): WRITE-PUSH (SEND-CQ) per-channel landing fence for the giant
-  // multiBlock AG -- the WRITE-side counterpart of T38's multiBlockRead. T38
-  // proved the READ CQE is a bit-exact device landing fence on this giant AG, but
-  // RDMA-READ underfills on mlx5 (~125 GB/s => 0.70x). This keeps the fast
-  // RDMA-WRITE PUSH (~155-170 GB/s) and makes the completion bit-exact by
-  // construction: each channel CTA ``bid`` PUSHES its OWN sub-range [blkOff,
-  // blkBytes) of my chunk to nextPeer on qpId=bid as a FUSED put-with-signal (the
-  // flag AMO rides the SAME QP strictly AFTER the data WRITE, RC in-order, so the
-  // receiver's per-channel flag can never beat the data -- the flag-beats-data
-  // race that makes the plain multiBlock push E2E-drift), then DRAINS ONLY
-  // qpId=bid's SEND CQE (per-channel quiet, no cross-CTA CQ race) so the local
-  // WQE has completed before this block publishes. The receiver spins its own
-  // per-channel inbound flag (system-acquire) + system-fences. Byte-identical to
-  // the multiBlock push receive (same slot/offset/bytes); only the completion
-  // mechanism (fused-signal + send-CQ drain vs separate put+quiet+AMO) changes.
-  // Gated maxRounds==1 (the N=2 hier AG) so larger rings keep the default path.
+  // WRITE-PUSH (SEND-CQ) per-channel landing fence for the giant multiBlock AG.
+  // Each channel CTA ``bid`` pushes its own sub-range [blkOff, blkBytes) of my
+  // chunk to nextPeer on qpId=bid as a fused put-with-signal (the flag AMO rides
+  // the same QP strictly after the data WRITE, RC in-order, so the receiver's
+  // per-channel flag can never beat the data), then drains only qpId=bid's send
+  // CQE (per-channel quiet, no cross-CTA CQ race) so the local WQE has completed
+  // before this block publishes. The receiver spins its own per-channel inbound
+  // flag (system-acquire) + system-fences. Byte-identical to the multiBlock push
+  // receive; only the completion mechanism changes. Gated maxRounds==1 (the N=2
+  // hier AG) so larger rings keep the default path.
   bool multiBlockWrite =
       (useWriteFence && peerIsRdma && prevIsRdma && maxRounds == 1 && multiBlock);
 
@@ -349,15 +343,12 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     const size_t nUnits = (peChunkSize + kAlignDP - 1) / kAlignDP;
     const size_t unitsPerP = (nUnits + static_cast<size_t>(P) - 1) / static_cast<size_t>(P);
     const int sw = useWarps;  // sender fan-out warps per sub-chunk (== numQp fan-out)
-    // SKEWED TEMPORAL SPLIT (T29 front-load + T37 head-skew): the P==2 boundary is
-    // bnd = nUnits - nUnits*dpTailPct/100, so sub-chunk 0 = (100-pct)% and sub-chunk
-    // 1 (last) = pct%. pct<50 FRONT-LOADS (small LAST => shrinks the exposed reasm
-    // tail, T29). pct>50 HEAD-SKEWS (small FIRST => the first sub-chunk lands sooner,
-    // attacking the T33 first_land latency that is 55% of wall at 32MB where the reasm
-    // tail is only 10%): the tiny head crosses the NIC fast so reassembly + the NIC
-    // pipe fill start earlier, overlapping the large tail's transfer. Producer +
-    // consumer compute this boundary identically => flag slot p guards exactly the
-    // reassembled bytes (bit-exact) at ANY pct. pct==0 or P!=2 => uniform (byte-ident).
+    // Skewed temporal split: the P==2 boundary is bnd = nUnits - nUnits*dpTailPct/100,
+    // so sub-chunk 0 = (100-pct)% and sub-chunk 1 (last) = pct%. pct<50 front-loads
+    // (small last => shrinks the exposed reasm tail); pct>50 head-skews (small first
+    // => the first sub-chunk lands sooner, overlapping the large tail's transfer).
+    // Producer and consumer compute this boundary identically, so flag slot p guards
+    // exactly the reassembled bytes at any pct. pct==0 or P!=2 => uniform split.
     auto dpRange = [&](int p, size_t& sU, size_t& eU) {
       if (dpTailPct > 0 && dpTailPct < 100 && dpTailPct != 50 && P == 2) {
         size_t tailU = (nUnits * static_cast<size_t>(dpTailPct)) / 100;
@@ -716,45 +707,27 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // (a leader warp exists for every p). Else fall back to the serial thread-0
       // drain (P>sw groups WRAP grpBase=p%sw sharing a QP; or too few warps).
       if (sw >= P && P <= warpsPerBlock && !dpSerialDrain) {
-        // T72 (A): PARALLELISE the per-sub-chunk QP-GROUP send-CQ drain. Each
-        // temporal sub-chunk p fans its data across g = sw/P QPs (grpBase(p)..
-        // +g-1). The prior parallel path still had ONE leader warp per group
-        // drain all g CQs SERIALLY (for q<g: ShmemQuietThread), so the exposed
-        // per-op ring-completion poll was g-wide serial -- and at the crown's
-        // weak sizes it is WIDEST there: DEEP_PIPE=auto(16MiB sub) gives P=1 at
-        // 32/64/128MB total (g == sw == 8, EIGHT serial CQ polls on one thread)
-        // and P=2 at 256MB (g=4). That serial poll is the inter-node ring-completion
-        // residual. Give each of the g QPs
-        // its OWN drain warp so the g completion polls RUN CONCURRENTLY, then a
-        // lock-free per-group join (shared arrival counter) lets the group leader
-        // AMO the remote flag + publish only AFTER all g QPs of THAT group have
-        // landed. Distinct groups keep firing independently (per-group counter,
-        // no global barrier) so the inter-sub-chunk pipeline the P>1 case relies
-        // on is preserved. BIT-EXACT by construction: identical set of QP drains,
-        // identical AMO/flag slots, the AMO still strictly follows ALL g landings
-        // of its group (same landing->consume order); only the ORDER of the g
-        // independent per-QP completions within a group is relaxed -- exactly the
-        // relaxation the cross-group parallel path already sanctioned (each QP has
-        // its own WQ/CQ, per-slot flags allow it). warpsPerBlock>=sw here (useWarps
-        // clamped to warpsPerBlock), so a distinct drain warp exists per QP.
+        // Parallelise the per-sub-chunk QP-group send-CQ drain. Each temporal
+        // sub-chunk p fans its data across g = sw/P QPs (grpBase(p)..+g-1). Give
+        // each of the g QPs its own drain warp so the g completion polls run
+        // concurrently, then a lock-free per-group join (shared arrival counter)
+        // lets the group leader AMO the remote flag + publish only after all g QPs
+        // of that group have landed. Distinct groups keep firing independently
+        // (per-group counter, no global barrier) so the inter-sub-chunk pipeline is
+        // preserved. Identical QP drains and AMO/flag slots as the serial path; only
+        // the order of the g independent per-QP completions within a group is relaxed
+        // (each QP has its own WQ/CQ, per-slot flags allow it). warpsPerBlock>=sw
+        // here, so a distinct drain warp exists per QP.
         const int myWarp = threadLinearId / warpSize;
         const bool warpLead = (threadLinearId % warpSize) == 0;
-        // T73 (A): SINGLE-GROUP FAST JOIN. At the crown's weak sizes DEEP_PIPE=auto
-        // collapses to P==1 (per-PE 4/8/16MB @ 32/64/128MB total => round(perPE/16MiB)
-        // == 1), so g == sw == 8 and ALL sw drain warps belong to ONE group p==0. The
-        // general per-group counter join then makes 8 warps atomicAdd the SAME shared
-        // slot dpGrpDrained[0] and the leader SPIN-loads it to g -- 8-way atomic
-        // write contention + a busy-spin where a plain block barrier already proves
-        // "all g QP CQs drained + fenced". Since P==1 has exactly one group spanning
-        // the whole block, __syncthreads is the natural (and cheaper) join: every
-        // drain warp quiets its QP + __threadfence_system BEFORE the barrier, so after
-        // it thread 0 AMOs the remote flag / spins the inbound landing flag / publishes.
-        // BIT-EXACT by construction: identical QP-drain set, identical single AMO/flag
-        // slot, the AMO still strictly follows ALL g landing fences (barrier orders
-        // every drain+fence before the AMO) -- landing->consume order unchanged; only
-        // the P==1 join primitive changes (block barrier vs atomic-counter spin). The
-        // P>1 pipeline KEEPS the per-group counter join below (a block barrier there
-        // would cross-synchronize independent groups and serialize the T72 pipeline).
+        // Single-group fast join: when P==1 all sw drain warps belong to one group,
+        // so __syncthreads is the natural (and cheaper) join instead of an
+        // atomic-counter spin. Every drain warp quiets its QP + __threadfence_system
+        // before the barrier, then thread 0 AMOs the remote flag / spins the inbound
+        // landing flag / publishes. Same QP-drain set and single AMO/flag slot as the
+        // counter join; only the P==1 join primitive changes. The P>1 pipeline keeps
+        // the per-group counter join below (a block barrier there would
+        // cross-synchronize independent groups and serialize the pipeline).
         if (P == 1) {
           if (warpLead && myWarp < sw && nonEmptyDP(0)) {
             shmem::ShmemQuietThread(nextPeer, grpBase(0) + myWarp);  // g==sw, wl==myWarp
@@ -772,8 +745,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
               if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
             }
             __threadfence_system();
-            core::AtomicStoreSeqCstSystem(
-                chunkReadyFlags + 0, opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
+            core::AtomicStoreSeqCstSystem(chunkReadyFlags + 0,
+                                          opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN
           }
           __syncthreads();  // keep the block uniform before the shared trailing logic
         } else {
@@ -814,28 +787,23 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                 __threadfence_system();
                 core::AtomicStoreSeqCstSystem(
                     chunkReadyFlags + p,
-                    opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
+                    opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN
               }
             }
           }
         }  // end else (P>1 per-group counter join; P==1 uses the block-barrier fast join)
       } else if (sw <= warpsPerBlock && !dpSerialDrain) {
-        // WRAP PARALLEL DRAIN (T23 A): P>sw so sub-chunks share QPs (grpBase=p%sw),
-        // but the sw QP GROUPS are DISJOINT. The old fallback serialized ALL P
-        // drain->AMO on thread 0 (16 CQ-drains back-to-back @256MB w16 numQp=4,P=16)
-        // and all P recv-publishes on warp 1 -- exposing the drain latency ON TOP of
-        // the raw NIC-fill wall. Give each QP group w in [0,sw) its OWN merged
-        // leader warp (thread w*warpSize): it walks ITS sub-chunks p = w, w+sw, ...
+        // Wrap parallel drain: P>sw so sub-chunks share QPs (grpBase=p%sw), but the
+        // sw QP groups are disjoint. Give each QP group w in [0,sw) its own merged
+        // leader warp (thread w*warpSize): it walks its sub-chunks p = w, w+sw, ...
         // in increasing-p order, draining QP w (in-order per QP == landing proof),
         // AMOing remote flag p, then waiting on its own incoming flag p and
-        // publishing chunkReadyFlags[p]. The sw leaders run CONCURRENTLY on disjoint
-        // QP groups (disjoint WQ/CQ => no shared-completion race). BIT-EXACT: same
-        // drains, same AMOs, same flag slots, per-QP completion order preserved;
-        // only the ORDER of independent cross-group completions is relaxed, exactly
-        // as the sw>=P parallel path above already relies on (per-slot flags allow
-        // it). Merged send-drain+recv-publish into ONE leader per group (not two) to
-        // stay within warpsPerBlock on wave64. Requires sw<=warpsPerBlock (a leader
-        // warp per QP group); else fall to the serial thread-0 drain below.
+        // publishing chunkReadyFlags[p]. The sw leaders run concurrently on disjoint
+        // QP groups (disjoint WQ/CQ => no shared-completion race); same drains, AMOs,
+        // and flag slots as the serial path with per-QP completion order preserved.
+        // Send-drain and recv-publish are merged into one leader per group to stay
+        // within warpsPerBlock on wave64. Requires sw<=warpsPerBlock (a leader warp
+        // per QP group); else fall to the serial thread-0 drain below.
         const int myWarp = threadLinearId / warpSize;
         const bool warpLead = (threadLinearId % warpSize) == 0;
         if (warpLead && myWarp < sw) {
@@ -854,8 +822,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
               if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
             }
             __threadfence_system();
-            core::AtomicStoreSeqCstSystem(
-                chunkReadyFlags + p, opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
+            core::AtomicStoreSeqCstSystem(chunkReadyFlags + p,
+                                          opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN
           }
         }
       } else if (threadLinearId == 0) {
@@ -879,26 +847,20 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           }
           __threadfence_system();
           core::AtomicStoreSeqCstSystem(chunkReadyFlags + p,
-                                        opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
+                                        opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN
         }
       }
       __syncthreads();
-      // T71 (A): SKIP the redundant trailing full-QP re-drain on the PARALLEL
-      // deepPipeQuiet paths. The two parallel branches above (sw>=P && P<=warps,
-      // and the sw<=warps WRAP path) give EVERY temporal sub-chunk its own leader
-      // that ShmemQuietThread(nextPeer, qp)-drains its QP group BEFORE that group's
-      // AMO -- and the union of the groups covers EVERY send QP this op used (the
-      // sender only issues on qp ∈ groups). So by the time all P leaders have
-      // published chunkReadyFlags, all our send WQEs have already completed =>
-      // the buffer-reuse safety this trailing ShmemQuietThread(nextPeer) provides
-      // is ALREADY satisfied. It is a serial full-numQpPerPe CQ poll on thread 0
-      // re-draining already-empty CQs -- pure fixed per-op tail latency (part of
-      // the inter-node ring-completion residual) with no effect on the byte image or
-      // the landing->consume order. Bit-exact by construction; removed on the
-      // parallel paths only. The serial-fallback branches (dpSerialDrain, or
-      // sw>warpsPerBlock) KEEP the trailing drain unchanged. Env
-      // MORI_HIER_DP_KEEP_TAIL_DRAIN restores it as an escape hatch is N/A here
-      // (no env in kernel); the guard is a pure uniform condition.
+      // Skip the redundant trailing full-QP re-drain on the parallel deepPipeQuiet
+      // paths. The two parallel branches above give every temporal sub-chunk its own
+      // leader that ShmemQuietThread(nextPeer, qp)-drains its QP group before that
+      // group's AMO, and the union of the groups covers every send QP this op used.
+      // So by the time all P leaders have published chunkReadyFlags, all our send
+      // WQEs have already completed, so the buffer-reuse safety the trailing
+      // ShmemQuietThread(nextPeer) provides is already satisfied; re-draining
+      // already-empty CQs only adds fixed per-op tail latency. Removed on the
+      // parallel paths only; the serial-fallback branches (dpSerialDrain, or
+      // sw>warpsPerBlock) keep the trailing drain unchanged.
       const bool dpParallelDrained =
           !dpSerialDrain && ((sw >= P && P <= warpsPerBlock) || (sw <= warpsPerBlock));
       if (!dpParallelDrained) {
@@ -1018,7 +980,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           }
           __threadfence_system();
           core::AtomicStoreSeqCstSystem(chunkReadyFlags + p,
-                                        opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
+                                        opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN
         }
       }
     } else if (threadLinearId == 0) {
@@ -1034,22 +996,19 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
         }
         __threadfence_system();
         core::AtomicStoreSeqCstSystem(chunkReadyFlags + p,
-                                      opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
+                                      opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN
       }
     }
     __syncthreads();
-    // T14 (A): OVERLAP the buffer-reuse send-QP drain (thread 0) with the recv
-    // flag-slot reset (threads>0) under ONE trailing block barrier, instead of the
-    // old drain-barrier-reset-barrier (3 tail joins -> 2 on the signal path). The
-    // two touch DISJOINT state: thread 0 drains only its LOCAL send CQs
-    // (ShmemQuietThread(nextPeer), buffer-reuse safety), while threads>0 zero
-    // flagsArray[flagBase+idx] which NO reader reads after the __syncthreads above
-    // (chunkReadyFlags were already published there). The entry barrier in prepare
-    // still orders every PE's reset before any peer's next-op AMO, so the reset is
-    // safe; the single trailing join guarantees BOTH the drain and the reset finish
-    // before the fence/return. Removes one block barrier on the exposed small-buffer
-    // per-op tail (the 32MB fixed-cost floor). Bit-exact by construction: identical
-    // set of QP drains + identical flag zeroing, only overlapped with one fewer join.
+    // Overlap the buffer-reuse send-QP drain (thread 0) with the recv flag-slot
+    // reset (threads>0) under one trailing block barrier. The two touch disjoint
+    // state: thread 0 drains only its local send CQs (ShmemQuietThread(nextPeer),
+    // buffer-reuse safety), while threads>0 zero flagsArray[flagBase+idx] which no
+    // reader reads after the __syncthreads above (chunkReadyFlags were already
+    // published there). The entry barrier in prepare orders every PE's reset before
+    // any peer's next-op AMO, so the reset is safe; the single trailing join
+    // guarantees both the drain and the reset finish before the fence/return. Same
+    // QP drains and flag zeroing as the separate-barrier path, with one fewer join.
     if (!deepPipeImm) {
       for (int idx = threadLinearId; idx < P; idx += threadsPerBlock) {
         flagsArray[flagBase + idx] = 0;
@@ -1347,20 +1306,17 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
         // coherent data with NO quiet, NO flag AMO, NO host sync. imm carries the
         // chunk id (sendDataRank+1) for optional validation.
         //
-        // DIRECT-LAND (T64 A): the plain-put + send-CQE-quiet direct-land (T56-T58)
-        // MISMATCHED at exactly the NIC-landed output self-slot (rank m*groupSize+
-        // groupPos) because ShmemQuietThread drains the SEND completion, which does
-        // NOT prove the WRITE's payload physically reached the REMOTE HBM before the
-        // landing flag fired -> the reasm SDMA read raced the still-draining write
-        // and consumed STALE bytes. WRITE_WITH_IMM closes that race STRUCTURALLY: the
-        // receiver's recv-CQE (polled below at threadLinearId==warpSize) is produced
-        // by the responder ONLY after the payload DMA has landed globally, and the
-        // per-chunk chunkReadyFlags publish (end of body) runs AFTER that CQE poll +
-        // __threadfence_system + __syncthreads -- so the reasm worker's landing wait
-        // now gates on a TRUE remote-landing proof, not a send drain. This is the
-        // receiver-side RDMA-completion gate (NOT the banned coherence fence-type
-        // knob). Retarget only the DEST to the receiver's output self-slot; SOURCE
-        // stays this GPU's local ring chunk. OFF => byte-identical crown.
+        // Direct-land: a plain put + send-CQE quiet does not prove the WRITE's
+        // payload physically reached remote HBM before the landing flag fired, so the
+        // reasm SDMA read could race the still-draining write and consume stale bytes.
+        // WRITE_WITH_IMM closes that race structurally: the receiver's recv-CQE
+        // (polled below at threadLinearId==warpSize) is produced by the responder only
+        // after the payload DMA has landed globally, and the per-chunk chunkReadyFlags
+        // publish (end of body) runs after that CQE poll + __threadfence_system +
+        // __syncthreads, so the reasm worker's landing wait gates on a true
+        // remote-landing proof, not a send drain. Retarget only the dest to the
+        // receiver's output self-slot; source stays this GPU's local ring chunk.
+        // OFF => byte-identical to the ring path.
         if (directLand) {
           const size_t outOff =
               (static_cast<size_t>(sendDataRank) * static_cast<size_t>(gGroupSize) +
@@ -1516,7 +1472,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     __syncthreads();
   }
 
-  // PHASE-4 per-chunk landing publish. After the round loop this block's inbound
+  // Per-chunk landing publish. After the round loop this block's inbound
   // sub-range (channel ``bid``) is fully landed AND made visible to this GPU by
   // the receiver's __threadfence_system inside the loop. Publish the ready flag so
   // a concurrent reassembly block can start pushing exactly this sub-range over
@@ -1527,7 +1483,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   if (chunkReadyFlags != nullptr && threadLinearId == 0) {
     __threadfence_system();
     core::AtomicStoreSeqCstSystem(chunkReadyFlags + bid,
-                                  opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN T28
+                                  opGen ? opGen : static_cast<uint64_t>(1));  // GEN-TOKEN
   }
   // On a WRITE_WITH_IMM completion path the ring flags region
   // [flagBase, flagBase+ringSize) is NEVER touched this op: the sender emits
