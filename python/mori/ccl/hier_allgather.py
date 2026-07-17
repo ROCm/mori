@@ -2028,7 +2028,7 @@ class HierAllGather:
                     print(
                         "[hier_graph] MORI_HIER_FLAG_TOKEN disabled on the "
                         "graph-eligible (<=%.0fMB) band: it breaks capture and "
-                        "collapses the launch-collapse win (T22 A)." % _cg_max_mb,
+                        "collapses the launch-collapse win." % _cg_max_mb,
                         flush=True,
                     )
                 if self._graph_replay(input_data, output_data, count, stream):
@@ -2040,22 +2040,20 @@ class HierAllGather:
             if count * input_data.element_size() >= self._sync_big_bytes:
                 big_ag = True
         # Turn-24: TARGETED RING/INTRA HOST-FINISH on the BACKWARD big AG only.
-        # Phase-6 ground truth pinned the residual fast-path loss drift (BUG B)
-        # to the BACKWARD re-unshard of the big embed/lm_head cross-node AG:
-        # backward-only host stream.synchronize() -> grads BIT-EXACT (T22);
-        # forward exonerated. Every DEVICE-side transport fence (22+, incl.
-        # WRITE_IMM recv-CQ landing proof) failed -> the repair mechanism is a
-        # HOST CPU RDMA-progress round-trip (STREAM_RING=0 host finish, which
-        # does hipStreamSynchronize + host ShmemBarrierAll on the ring/intra
-        # finish). Full stream.synchronize() is bit-exact but -22% because it
-        # also blocks CPU enqueue of the WHOLE rest of the step. This mode runs
-        # ONLY the backward big AG through the host-synced ring+intra finish
-        # (stream_ring/stream_intra off for that ONE call) -- draining just that
-        # op's stream, not the caller's whole compute stream -- while every
-        # other AG stays fully on-stream/overlapped. The host-sync path always
-        # issues full global ShmemBarrierAll (prepare+finish), so cross-PE buffer
-        # reuse stays correct across the mixed on-stream/host ops (T23 NEXT: the
-        # one untested cost point). Gated to autograd backward (grad disabled).
+        # The residual fast-path loss drift is in the BACKWARD re-unshard of the
+        # big embed/lm_head cross-node AG: a backward-only host stream.synchronize()
+        # makes grads bit-exact; forward is exonerated. Every device-side transport
+        # fence failed, so the repair mechanism is a HOST CPU RDMA-progress
+        # round-trip (STREAM_RING=0 host finish, which does hipStreamSynchronize +
+        # host ShmemBarrierAll on the ring/intra finish). Full stream.synchronize()
+        # is bit-exact but -22% because it also blocks CPU enqueue of the whole
+        # rest of the step. This mode runs ONLY the backward big AG through the
+        # host-synced ring+intra finish (stream_ring/stream_intra off for that ONE
+        # call) -- draining just that op's stream, not the caller's whole compute
+        # stream -- while every other AG stays fully on-stream/overlapped. The
+        # host-sync path always issues full global ShmemBarrierAll (prepare+finish),
+        # so cross-PE buffer reuse stays correct across the mixed on-stream/host
+        # ops. Gated to autograd backward (grad disabled).
         _ring_hostfin = (
             self._sync_big_mode == "ringhostfin"
             and big_ag
@@ -2067,35 +2065,26 @@ class HierAllGather:
             _saved_sr, _saved_si = self.stream_ring, self.stream_intra
             self.stream_ring = False
             self.stream_intra = False
-        # T25 device-side isolation: does the CONCURRENT fused ring||local-gather
-        # kernel (one grid, NIC ring blocks || XGMI gather block) corrupt the
-        # backward big-AG ordering? Every device landing guarantee (put-signal,
-        # write-imm, oneshot system-scope acquire + threadfence_system) is already
-        # in place and standalone bit-exact, yet FSDP grads need a host round-trip
-        # -- the last un-isolated device variable is the FUSION itself. This mode
+        # Device-side isolation of the concurrent fused ring||local-gather
+        # kernel (one grid, NIC ring blocks || XGMI gather block). This mode
         # forces the SERIAL non-fused, non-overlap slice_direct path (explicit
         # per-block gathers + a global finish_direct_stream barrier) for the
         # backward big AG, fully ON-STREAM (stream_ring/intra stay True, NO host
-        # sync). If grads go bit-exact here -> the concurrent grid was the race and
-        # the sync-free fix is "don't fuse the big backward AG"; if still 16x/0.83x
-        # -> the fusion is exonerated and the residual is genuinely host-progress-
-        # only. Gated to autograd backward big AG.
+        # sync), to isolate whether the concurrent grid is the race.
+        # Gated to autograd backward big AG.
         _serial_big = (
             self._sync_big_mode == "serial"
             and big_ag
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # T26: "serialfast" -- de-fuse the backward big AG WITHOUT flipping the
-        # global stream flags. T25 proved the concurrent FusedRingLocalGatherKernel
-        # (ring||XGMI gather in one grid) is the BUG-B corruptor: serializing that
+        # "serialfast" -- de-fuse the backward big AG WITHOUT flipping the
+        # global stream flags. The concurrent FusedRingLocalGatherKernel
+        # (ring||XGMI gather in one grid) is the corruptor: serializing that
         # ONE big backward AG onto the two-launch on-stream slice_direct direct-
         # gather path (per-block gather_kernel_direct + finish_direct_stream) gives
-        # DEVICE-SIDE, SYNC-FREE, BIT-EXACT grads. But "serial" mode only reaches
-        # that branch when stream_intra AND stream_ring are True (line ~1644), which
-        # the diagnostic SERIAL_ENV forced GLOBALLY -- flipping EVERY AG off the
-        # shipped fast stream_intra=0 path (222->146 TFLOPS, confounded). serialfast
-        # instead flips stream_intra/ring True (and fuse_local/overlap False) for
+        # device-side, sync-free, bit-exact grads. serialfast flips
+        # stream_intra/ring True (and fuse_local/overlap False) for
         # ONLY this one big backward AG, so it takes the bit-exact on-stream direct
         # path while every other AG (forward + small) keeps the shipped fast
         # stream_intra=0 baseline untouched. ~1-2 de-fused AGs/step -> the overlap
@@ -2106,16 +2095,15 @@ class HierAllGather:
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # T26: "olapfast" -- de-fuse ONLY the single-grid concurrency, keep the
+        # "olapfast" -- de-fuse ONLY the single-grid concurrency, keep the
         # side-stream ring<->local-gather OVERLAP. serialfast is bit-exact but
         # -30% (the two-launch SERIAL direct path forgoes overlap AND re-registers
-        # the output buffer per alternating embed/lm_head call). T25 pinned the
-        # corruptor to the CONCURRENT FusedRingLocalGatherKernel (ring||XGMI gather
-        # in ONE grid). Its predecessor slice_direct_overlap uses TWO SEPARATE
-        # launches (ring on main || local-block gather on a side stream, merged by
-        # main.wait_stream(side)) -- overlapped but NOT one concurrent grid. If the
-        # corruption is specifically the single-grid concurrency, this path is
-        # bit-exact AND keeps the overlap (should land far above serialfast's 142).
+        # the output buffer per alternating embed/lm_head call). The corruptor is
+        # the CONCURRENT FusedRingLocalGatherKernel (ring||XGMI gather in ONE grid);
+        # its predecessor slice_direct_overlap uses TWO SEPARATE launches (ring on
+        # main || local-block gather on a side stream, merged by
+        # main.wait_stream(side)) -- overlapped but NOT one concurrent grid, so this
+        # path is bit-exact AND keeps the overlap.
         # Gated to the backward big AG only; every other AG stays on the shipped
         # fast stream_intra=0 baseline.
         _olapfast_big = (
@@ -2156,12 +2144,12 @@ class HierAllGather:
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # Phase-5 (Team A, Turn 15): "devtouch" -- COMPOSE the two best near-miss
+        # "devtouch" -- COMPOSE the two best near-miss
         # fences, each of which closes a DIFFERENT half of the backward big-AG
         # residual and neither of which alone is bit-exact on this MI300X/mlx5:
         #   - devgate (device landing gate, ShmemQuietThread RDMA CQ live-drain +
         #     threadfence_system): the strongest TEMPORAL landing fence on-device
-        #     (Δ-0.0042, best near-miss) -- waits the actual RDMA hardware landing.
+        #     -- waits the actual RDMA hardware landing.
         #   - coretouch (L2CoherentRetouch, volatile glc L2-bypass load + CU
         #     re-publish): closes the CACHE-COHERENCE half (SDMA-copy-engine-written
         #     output not L2-coherent to the consumer GEMM under FSDP buffer reuse).
@@ -2174,7 +2162,7 @@ class HierAllGather:
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # T29: "dbufstream" -- keep the big backward AG on the FAST contiguous
+        # "dbufstream" -- keep the big backward AG on the FAST contiguous
         # copy-out STRUCTURE (gather all node-blocks into a contiguous scratch,
         # then ONE bulk finish_batch_stream copy-OUT -- the 222-TFLOPS shipped
         # path's shape), NOT the ~21%-slower direct-to-output strided writes that
@@ -2183,7 +2171,7 @@ class HierAllGather:
         # the stream-ordered ring+copy-out (stream_ring/stream_intra=True), and
         # DE-FUSE (fuse_local/slice_direct_overlap=False, no concurrent grid). The
         # copy-out branch reuses the SHARED _slice_scratch with a deferred finish
-        # fence, which is exactly the T28 scratch-reuse staleness for consecutive
+        # fence, which is exactly the scratch-reuse staleness for consecutive
         # big AGs -- so give this AG a DEDICATED double-buffered scratch (see
         # _big_dbuf_active below). Gated to autograd backward big AG only.
         _dbufstream_big = (
@@ -2192,9 +2180,9 @@ class HierAllGather:
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # Phase-5 (Team A, mlx5): "bwdbigff" -- backward big AG host-drained
-        # (bit-exact, same as bwdbig) BUT the FORWARD big AG (GT-exonerated by
-        # the T22 bisection: forward [FP] bit-exact, only backward [GFP] races)
+        # "bwdbigff" -- backward big AG host-drained
+        # (bit-exact, same as bwdbig) BUT the FORWARD big AG (forward [FP]
+        # bit-exact, only backward [GFP] races)
         # takes the FAST fused-fill kernel (fuse_local) instead of the default
         # de-fused slice overlap. Forward carries ~2 big embed/lm_head AGs/step;
         # filling them faster (fuse_local ~0.9x vs slice ~0.71x on this fabric)
