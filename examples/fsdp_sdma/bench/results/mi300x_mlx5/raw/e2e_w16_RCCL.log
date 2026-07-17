@@ -1,43 +1,43 @@
-W0715 05:08:24.020000 155260 /root/wuyl/pytorch-main/torch/distributed/run.py:874] 
-W0715 05:08:24.020000 155260 /root/wuyl/pytorch-main/torch/distributed/run.py:874] *****************************************
-W0715 05:08:24.020000 155260 /root/wuyl/pytorch-main/torch/distributed/run.py:874] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
-W0715 05:08:24.020000 155260 /root/wuyl/pytorch-main/torch/distributed/run.py:874] *****************************************
-[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
-[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
-[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
-[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
-[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
-[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
-[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
-[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
-[verify-fsdp] fsdp package:[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py 
-/root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
-[verify-fsdp] fully_shard module:[verify-fsdp] fsdp package:[verify-fsdp] fully_shard module:  /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+W0715 05:08:24.020000 155260 <torch>/torch/distributed/run.py:874]
+W0715 05:08:24.020000 155260 <torch>/torch/distributed/run.py:874] *****************************************
+W0715 05:08:24.020000 155260 <torch>/torch/distributed/run.py:874] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+W0715 05:08:24.020000 155260 <torch>/torch/distributed/run.py:874] *****************************************
+[verify-fsdp] fsdp package: <torch>/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: <torch>/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: <torch>/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: <torch>/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[verify-fsdp] fsdp package: <torch>/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: <torch>/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: <torch>/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: <torch>/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[verify-fsdp] fsdp package:[verify-fsdp] fsdp package: <torch>/torch/distributed/fsdp/__init__.py
+<torch>/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module:[verify-fsdp] fsdp package:[verify-fsdp] fully_shard module:  <torch>/torch/distributed/fsdp/_fully_shard/_fully_shard.py <torch>/torch/distributed/fsdp/_fully_shard/_fully_shard.py
 
-/root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py[verify-fsdp] param_group module:[verify-fsdp] param_group module: 
- /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+<torch>/torch/distributed/fsdp/__init__.py[verify-fsdp] param_group module:[verify-fsdp] param_group module:
+ <torch>/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py<torch>/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
 [verify-fsdp] fully_shard module:
- [verify-fsdp] mori sdma module:/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py[verify-fsdp] mori sdma module: 
- /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py/root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py[verify-fsdp] param_group module:
+ [verify-fsdp] mori sdma module:<torch>/torch/distributed/fsdp/_fully_shard/_fully_shard.py[verify-fsdp] mori sdma module:
+ <torch>/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py<torch>/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py[verify-fsdp] param_group module:
 
- /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
-[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
-[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
-[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
-[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
-[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
-[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
-[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
-[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
-[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
-[verify-fsdp] fsdp package: /root/wuyl/pytorch-main/torch/distributed/fsdp/__init__.py
-[verify-fsdp] fully_shard module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fully_shard.py
-[verify-fsdp] param_group module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
-[verify-fsdp] mori sdma module: /root/wuyl/pytorch-main/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+ <torch>/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: <torch>/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[verify-fsdp] fsdp package: <torch>/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: <torch>/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: <torch>/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: <torch>/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[verify-fsdp] fsdp package: <torch>/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: <torch>/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: <torch>/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: <torch>/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
+[verify-fsdp] fsdp package: <torch>/torch/distributed/fsdp/__init__.py
+[verify-fsdp] fully_shard module: <torch>/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+[verify-fsdp] param_group module: <torch>/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+[verify-fsdp] mori sdma module: <torch>/torch/distributed/fsdp/_fully_shard/_mori_sdma_allgather.py
 Loading Qwen model config and initializing weights...
 Applying FSDP2 layer-by-layer sharding (num_params=6,754,997,760)...
 FSDP2 model is ready; starting optimizer setup and benchmark.
-/root/wuyl/pytorch-main/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+<torch>/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
   return func(*args, **kwargs)
 [rank0]:[W715 05:09:45.008274467 ProcessGroupNCCL.cpp:5293] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
 steps=0-4 mode=native avg_time_s=0.700372 min_time_s=0.586156 max_time_s=0.874240 tokens_per_s=46786.56 tflops=1896.26 tflops_per_gpu=118.52 loss=11.104024
@@ -159,5 +159,5 @@ steps=495-499 mode=native avg_time_s=0.543388 min_time_s=0.536919 max_time_s=0.5
   "warmup": 6,
   "world_size": 16
 }
-/root/wuyl/pytorch-main/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+<torch>/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
   return func(*args, **kwargs)
