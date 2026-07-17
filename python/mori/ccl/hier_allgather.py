@@ -1087,36 +1087,6 @@ class HierAllGather:
             "false",
             "False",
         )
-        # PHASE 4 E2E COHERENCE: the fuse_local win path forces the RED-LINE-safe
-        # COPY-ENGINE ring finish (bulk bytes off CUs). But the copy engine is a
-        # SEPARATE hw agent whose D2D read of the ring buffer is NOT ordered by the
-        # ring kernel's CU-scope __threadfence_system (ccl_kernels.hip:240-248,
-        # intra out_ptr note) -> under FSDP tight overlap it drains STALE remote-half
-        # ring bytes (the documented ~48% stale-remote race that keeps fuse_local
-        # E2E-nondeterministic). The two known coherence fixes were CU-copy (violates
-        # the HARD RED LINE) and host drain (kills overlap). The THIRD, non-fence,
-        # red-line-safe fix: the inter-node ring's RDMA_WRITE_WITH_IMM completion --
-        # the receiver consumes a recv-CQE that is generated only AFTER the write DMA
-        # has landed GLOBALLY (visible to ALL agents, incl. the copy engine), so the
-        # subsequent copy-engine finish reads coherent bytes with NO host stall and
-        # bulk bytes stay on the NIC/SDMA. The N=2 big-AG multiBlock WRITE_IMM path
-        # (multiBlockWriteImm) exists but was never auto-engaged for fuse_local. Couple
-        # it here (opt-in MORI_HIER_FUSE_LOCAL_WRITE_IMM=1): couple the ring to
-        # WRITE_IMM (the lazily-constructed InterNodeRingAllgather reads
-        # MORI_HIER_RING_WRITE_IMM in its ctor, which happens AFTER this __init__).
-        # KNOWN BUG (Turn 13): with the coupling ON the FUSED ring kernel
-        # (FusedRingLocalGatherKernel) faults/hangs silently before the first AG --
-        # the multiBlockWriteImm recv-CQE pre-post/poll does not work inside the
-        # fused concurrent grid (the standalone InterNodeRingAllGatherKernel WRITE_IMM
-        # path is a separate launch with its own CQ bookkeeping). So keep this
-        # DEFAULT OFF until the recv-CQE plumbing is made fused-grid-safe; the
-        # red-line-safe copy-engine fuse_local path (1.04-1.07x bit-exact) stays
-        # the known-good A/B path in the meantime.
-        if self.fuse_local and os.environ.get(
-            "MORI_HIER_FUSE_LOCAL_WRITE_IMM", "0"
-        ) not in ("0", "", "false", "False"):
-            if os.environ.get("MORI_HIER_RING_WRITE_IMM") is None:
-                os.environ["MORI_HIER_RING_WRITE_IMM"] = "1"
         self._chunk_ready_flags = None
         # Cross-size carryover guard (Turn15 A): the exact DEEP_PIPE flag layout
         # (slots, per-PE count, pipe depth) the persistent buffer was last sized
