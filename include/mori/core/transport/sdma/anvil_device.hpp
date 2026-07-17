@@ -106,8 +106,8 @@ __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* sign
 // 8 dwords).
 
 // Emit SDMA_PKT_COPY_LINEAR into dw[0..6].
-__device__ __forceinline__ void WriteCopyPacket(uint32_t* dw, void* srcBuf, void* dstBuf,
-                                                long long int packetSize) {
+__device__ __forceinline__ void WriteCopyPacket(uint32_t* dw, 
+           const void* srcBuf, const void* dstBuf, size_t packetSize) {
   // Header depends only on constants; a scalar-replaceable local keeps the
   // bitfield layout authoritative and constant-folds (no address taken).
   decltype(SDMA_PKT_COPY_LINEAR::HEADER_UNION) hdr;

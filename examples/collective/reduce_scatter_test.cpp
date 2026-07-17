@@ -253,9 +253,9 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   int pushBlocks = std::max(pushSlices, (blocks / pushSlices) * pushSlices);
 
   // Local-only per-group block counters for the push reset (never peer-written).
-  uint64_t* groupCounters = nullptr;
-  HIP_RUNTIME_CHECK(hipMalloc(&groupCounters, 8 * sizeof(uint64_t)));
-  HIP_RUNTIME_CHECK(hipMemset(groupCounters, 0, 8 * sizeof(uint64_t)));
+  uint32_t* groupCounters = nullptr;
+  HIP_RUNTIME_CHECK(hipMalloc(&groupCounters, 8 * sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMemset(groupCounters, 0, 8 * sizeof(uint32_t)));
 
   // Mode selection: RS_MODE = push|pull (default push). RS_PULL=1 is kept as a
   // back-compat alias for pull.
