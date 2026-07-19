@@ -849,6 +849,14 @@ def _get_default_launch_config(
     zero_copy = not use_external_inp_buf
     if world_size <= 4:
         if max_num_inp_token_per_rank > 128:
+            if zero_copy:
+                # gfx1250 (MI450/MI455, wave32): use the same CU geometry as the
+                # FlyDSL v2 op (192x32 dispatch, 128x16 combine). The generic
+                # gfx942 combine geometry (72x4) is badly under-configured on
+                # gfx1250. Verified EP4 4K bf16 hidden=7168 on gfx1250 (MI450).
+                from mori.ops.dispatch_combine import _detect_warp_size
+                if _detect_warp_size() == 32:
+                    return LaunchConfig(192, 32, 128, 16)
             return (
                 LaunchConfig(768, 8, 72, 4)
                 if zero_copy
