@@ -330,13 +330,13 @@ def _ensure_jit_kernels(kernel_type):
     ensure_compiled(_KERNEL_TYPE_TO_HIP[kernel_type])
 
 
-def _load_hip_modules(kernel_type):
+def _load_hip_modules(kernel_type, init_shmem=True):
     """Load HipModule for the given kernel_type and init shmem gpu states."""
     from mori.ops._jit_loader import load_hip_module
 
     if kernel_type not in _KERNEL_TYPE_TO_HIP:
         raise ValueError(f"Unknown kernel_type: {kernel_type}")
-    return load_hip_module(_KERNEL_TYPE_TO_HIP[kernel_type], init_shmem=True)
+    return load_hip_module(_KERNEL_TYPE_TO_HIP[kernel_type], init_shmem=init_shmem)
 
 
 class EpDispatchCombineOp:
@@ -377,7 +377,12 @@ class EpDispatchCombineOp:
         self._cco_comm = _maybe_get_cco_comm(config)
         _cco_ptr = self._cco_comm.ptr if self._cco_comm is not None else 0
         self._handle = handle_class(self._cpp_config, cco_comm_ptr=_cco_ptr)
-        self._hip_module = _load_hip_modules(config.kernel_type)
+        # cco backend is shmem-free: skip shmem_module_init (asserts when mori-shmem
+        # is uninitialized; on gfx1250 shmem init can hang). Intra-node cco kernels
+        # use cco LSA peer pointers + pointer-based device waits, not the shmem heap.
+        self._hip_module = _load_hip_modules(
+            config.kernel_type, init_shmem=self._cco_comm is None
+        )
         self._handle_info = mori_cpp.get_handle_info(self._handle)
 
         self._fp8_blockwise_combine_scale_dim = self._handle_info[
