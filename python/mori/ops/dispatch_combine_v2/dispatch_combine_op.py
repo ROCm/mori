@@ -125,16 +125,18 @@ class EpDispatchCombineConfig:
     # "gather" (UseP2PRead) or "scatter" (mori _nop2p, fp8 compression home).
     combine_mode: str = "gather"
     quant_type: str = "none"  # none | fp8_direct_cast | fp8_blockwise
-    dispatch_block_num: int = 64
-    combine_block_num: int = 80
-    warp_num_per_block: int = 16
-    # Combine wants few warps (K-deep per-lane MLP already saturates); kept
-    # separate from dispatch's warp count.
-    combine_warp_num_per_block: int = 4
+    # Geometry: None => auto (pull the tuned schedule for this device/shape/dtype
+    # from tuning_configs in __post_init__). Pin any of these to opt out and use a
+    # fixed geometry instead. Combine wants few warps (K-deep per-lane MLP already
+    # saturates), kept separate from dispatch's warp count.
+    dispatch_block_num: int = None
+    combine_block_num: int = None
+    warp_num_per_block: int = None
+    combine_warp_num_per_block: int = None
     # Optional per-token plan: tuple of (max_tok_inclusive | None, disp_block,
     # disp_warp, comb_block, comb_warp) buckets. When set, the op precompiles the
     # distinct (block, warp) variants and picks one at runtime from
-    # cur_rank_num_token. None => single-shot fallback fields above.
+    # cur_rank_num_token. None => auto (from tuning_configs) or single-shot fallback.
     schedule: tuple = None
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
@@ -197,6 +199,48 @@ class EpDispatchCombineConfig:
                     f"combine per-token bytes must be 16 B aligned; combine_data_type="
                     f"{self.combine_data_type} -> {self.combine_token_nbytes}"
                 )
+        self._resolve_geometry()
+
+    def _resolve_geometry(self):
+        """Fill block/warp/schedule. Tuned-by-default: when the caller pinned
+        neither a schedule nor any block/warp, pull the tuned geometry for this
+        device/shape/dtype from tuning_configs.lookup (so the plain constructor is
+        tuned automatically — EpDispatchCombineConfig.tuned() is now just an
+        explicit alias). If any field is pinned, honor it and fill the rest with
+        the single-shot fallback (no schedule)."""
+        pinned = self.schedule is not None or any(
+            g is not None
+            for g in (
+                self.dispatch_block_num,
+                self.combine_block_num,
+                self.warp_num_per_block,
+                self.combine_warp_num_per_block,
+            )
+        )
+        if not pinned:
+            from tuning_configs import lookup
+
+            t = lookup(
+                self.world_size,
+                self.hidden_dim,
+                self.num_experts_per_token,
+                dtype=self.dtype_str,
+            )
+            self.dispatch_block_num = t["dispatch_block_num"]
+            self.combine_block_num = t["combine_block_num"]
+            self.warp_num_per_block = t["warp_num_per_block"]
+            self.combine_warp_num_per_block = t["combine_warp_num_per_block"]
+            self.schedule = t["schedule"]
+        else:
+            # explicit geometry: fill any unset field with the single-shot default
+            if self.dispatch_block_num is None:
+                self.dispatch_block_num = 64
+            if self.combine_block_num is None:
+                self.combine_block_num = 80
+            if self.warp_num_per_block is None:
+                self.warp_num_per_block = 16
+            if self.combine_warp_num_per_block is None:
+                self.combine_warp_num_per_block = 4
 
     @property
     def is_scatter(self):
@@ -227,7 +271,9 @@ class EpDispatchCombineConfig:
     @classmethod
     def tuned(cls, **kwargs):
         """Build a config with block/warp geometry pulled from tuning_configs
-        (unless explicitly overridden in kwargs)."""
+        (unless explicitly overridden in kwargs). Kept for back-compat and to
+        force per-field tuning even when some geometry is overridden; the plain
+        constructor is now also tuned-by-default (see _resolve_geometry)."""
         from tuning_configs import lookup
 
         dt = kwargs.get("data_type", torch.bfloat16)
