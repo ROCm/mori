@@ -1010,7 +1010,8 @@ def _bench_dispatch_combine(
         kernel_type=kernel_type_enum,
     )
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
-        mori.shmem.shmem_torch_process_group_init("default")
+        if os.environ.get("MORI_EP_COMM", "").strip().lower() != "cco":
+            mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
         # For fp8_blockwise, plumb the kernel-internal scale_dim into the
         # benchmark so force_scale_active sentinels and report_scale_stats
