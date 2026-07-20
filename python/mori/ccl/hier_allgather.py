@@ -475,69 +475,47 @@ class HierAllGather:
                 "MORI_HIER_SLICE_MIN_BYTES", str(8 * 1024 * 1024)
             )
         self.slice_min_bytes = max(0, slice_min_bytes)
-        # MID/SMALL-SIZE BAND -> stream pipe-overlap path.
-        # For per-rank payloads BELOW slice_min_bytes the non-sliced path is far
-        # from RCCL (4MiB ~2.1x, 1MiB ~1.8x), dominated by per-op kernel/barrier
-        # overhead. The STREAM-ordered chunked-ring pipeline overlap path
-        # (slice_pipe_overlap upgraded to on-device barriers this turn) is much
-        # faster across the whole sub-threshold band (measured +66-77% over
-        # 256KiB-6MiB; ratio 2.1x -> ~1.0-1.4x, near-parity at 1MiB) because the
-        # chunked side-stream gathers hide under the ring AND every barrier is
-        # on-device (no host round-trips). Route [pipe_band_min, slice_min) here.
-        # Default ON; disable with MORI_HIER_PIPE_BAND=0. At/above slice_min the
-        # slice_direct path still wins (8MiB+ measured), so this only re-routes
-        # the band the dispatcher previously sent to the slow non-slice path.
+        # MID/SMALL-SIZE BAND -> stream pipe-overlap path. For per-rank payloads
+        # BELOW slice_min_bytes, route [pipe_band_min, slice_min) to the
+        # stream-ordered chunked-ring pipeline overlap path (chunked side-stream
+        # gathers hide under the ring, all barriers on-device), which is faster than
+        # the non-sliced path across the sub-threshold band. Default ON; disable
+        # with MORI_HIER_PIPE_BAND=0. At/above slice_min the slice_direct path wins.
         self.pipe_band = _env_true("MORI_HIER_PIPE_BAND", "1")
         self.pipe_band_min_bytes = _env_int("MORI_HIER_PIPE_BAND_MIN_BYTES", "0")
-        # M5: opt-in lever (c) -- OVERLAP Phase-A (inter RDMA ring) with
-        # the LOCAL node-block's Phase-B reassembly gather. In the sliced+fused
-        # path the gather for block m=node_id needs only slice_g(B_node_id) ==
-        # shard[node_id*G+g] == this rank's OWN input (== collection[node_id]),
-        # which is available immediately -- it does NOT depend on the ring. So we
-        # launch that one gather on a SIDE stream concurrently with the inter
-        # ring (the ~80% bottleneck), hiding ~1/N of the intra phase under it.
-        # Deadlock-safe because every ShmemBarrierAll is HOST-blocking (issued in
-        # deterministic program order regardless of stream) and hipStreamSynchronize
-        # only targets its own stream (intra finish/inter prepare sync the MAIN
-        # stream, never the side stream). The remaining N-1 gathers still read the
-        # ring collection after it lands. Only meaningful with slice_inter +
-        # slice_fused. Default OFF; toggle MORI_HIER_SLICE_OVERLAP=1.
+        # Opt-in: OVERLAP Phase-A (inter RDMA ring) with the LOCAL node-block's
+        # Phase-B reassembly gather. The gather for block m=node_id needs only this
+        # rank's OWN input (== collection[node_id]) and does NOT depend on the ring,
+        # so it runs on a SIDE stream concurrently with the inter ring, hiding ~1/N
+        # of the intra phase. Deadlock-safe: every ShmemBarrierAll is host-blocking
+        # (deterministic program order) and hipStreamSynchronize only targets its
+        # own (main) stream. Only meaningful with slice_inter + slice_fused. Default
+        # OFF; toggle MORI_HIER_SLICE_OVERLAP=1.
         if slice_overlap is None:
             slice_overlap = _env_true("MORI_HIER_SLICE_OVERLAP", "0")
         self.slice_overlap = bool(slice_overlap)
-        # M5: drop the REDUNDANT Phase-B entry barrier in the sliced+fused
-        # NON-overlap path. That path runs the inter ring first; its finish_sync
-        # (or finish_sync_no_copy for slice_oop) issues a global ShmemBarrierAll
-        # IMMEDIATELY before the Phase-B m==0 gather, which itself issues a second
-        # entry ShmemBarrierAll (prepare_barrier=(m==0)). The two are back-to-back
-        # global all-PE barriers with no remote memory op between them, so the
-        # second is redundant: every PE has passed the inter finish barrier (this
-        # op) before any PE starts its Phase-B gather, so every peer's out_ transit
-        # from the PREVIOUS op is already free (that op ended with its own exit
-        # barrier, and this op's inter prepare+finish barriers both followed it).
-        # Dropping it removes 1 of ~4 global barriers/op with byte-identical output
-        # (pure host-sync removal; the SDMA data movement is unchanged). Does NOT
-        # apply to the overlap path (its local gather runs CONCURRENTLY with the
-        # inter ring on a side stream, so it cannot rely on the inter finish
-        # barrier and must keep its own entry barrier). Default ON (provably safe);
-        # set MORI_HIER_SLICE_FUSE_IB=0 to restore the entry barrier (A/B).
+        # Drop the REDUNDANT Phase-B entry barrier in the sliced+fused NON-overlap
+        # path. CORRECTNESS INVARIANT: that path runs the inter ring first; its
+        # finish_sync issues a global ShmemBarrierAll immediately before the
+        # Phase-B m==0 gather's own entry barrier -- two back-to-back all-PE
+        # barriers with no remote memory op between them, so the second is
+        # redundant (every PE has passed the inter finish barrier before any PE
+        # starts Phase-B, so every peer's out_ transit from the previous op is
+        # already free). Byte-identical output (pure host-sync removal). Does NOT
+        # apply to the overlap path (its local gather runs concurrently on a side
+        # stream and must keep its own entry barrier). Default ON; set
+        # MORI_HIER_SLICE_FUSE_IB=0 to restore the entry barrier for A/B.
         if slice_fuse_ib is None:
             slice_fuse_ib = _env_true("MORI_HIER_SLICE_FUSE_IB", "1")
         self.slice_fuse_ib = bool(slice_fuse_ib)
-        # M5: opt-in CHUNKED (strided) Phase-B reassembly -- the enabler
-        # for the chunked inter/intra pipeline (the remaining structural lever per
-        # profiling: overlap the remote-block gather of chunk k with
-        # the inter ring of chunk k+1 to hide the ~1.5ms serial Phase-B tail).
-        # This turn lands ONLY the strided-write correctness foundation: split
-        # each node-block's reassembly gather into ``slice_pipe_chunks`` element-
-        # range chunks, each writing ck elements per peer at slot stride = count
-        # (the full slice size) via the new gather_kernel dst_slot_stride, so
-        # chunk j of peer g lands at m*block + g*count + j*ck -- byte-identical to
-        # the unchunked gather. NO ring chunking / overlap yet (that is next turn's
-        # rule#1 perf step); this path is expected NEUTRAL-or-slightly-slower (more
-        # kernel launches) and exists to prove the strided gather is bit-exact.
-        # Only meaningful with slice_inter + slice_fused (non-overlap, non-oop).
-        # Default OFF; toggle MORI_HIER_SLICE_PIPE=1.
+        # Opt-in CHUNKED (strided) Phase-B reassembly: split each node-block's
+        # reassembly gather into ``slice_pipe_chunks`` element-range chunks, each
+        # writing ck elements per peer at slot stride = count via gather_kernel
+        # dst_slot_stride, so chunk j of peer g lands at m*block + g*count + j*ck --
+        # byte-identical to the unchunked gather (the strided-write foundation for
+        # the chunked inter/intra pipeline). Only meaningful with slice_inter +
+        # slice_fused (non-overlap, non-oop). Default OFF; toggle
+        # MORI_HIER_SLICE_PIPE=1.
         if slice_pipe is None:
             slice_pipe = _env_true("MORI_HIER_SLICE_PIPE", "0")
         self.slice_pipe = bool(slice_pipe)
