@@ -572,11 +572,23 @@ class EpDispatchCombineOp:
 
     def _dispatch_shared_mem(self, warp_per_block):
         """Shared memory for dispatch kernels (worldSize + numExpertPerRank per warp + numExpertPerRank) * sizeof(index_t)."""
-        return (
+        base = (
             self.config.world_size * warp_per_block
             + self.config.num_experts_per_rank * warp_per_block
             + self.config.num_experts_per_rank
         ) * 4  # sizeof(index_t)
+        # Experimental TDM dispatch (MORI_DISP_TDM): the IntraNode dispatch kernel
+        # stages each token's hidden-dim payload through ONE per-warp LDS tile, so it
+        # needs warp_per_block * hiddenDim * elemSize bytes of dynamic shared. Here
+        # warp_per_block is the DEVICE warp count per block (block = warpSize*wpb).
+        if os.environ.get("MORI_DISP_TDM", "").lower() in ("1", "true", "on", "yes"):
+            tile = (
+                warp_per_block
+                * int(self.config.hidden_dim)
+                * int(self.config.max_token_type_size)
+            )
+            return max(base, tile)
+        return base
 
     def _combine_shared_mem(self, warp_per_block, use_weights=True):
         """Shared memory for combine kernels."""

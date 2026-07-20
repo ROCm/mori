@@ -318,33 +318,16 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
           g1.tileDim0(_D); g1.tileDim1(1);
           gfx1250_TDM_GROUP0 g0; g0.ldsAddr((uintptr_t)_tdmTile);
           _v4i z4{0,0,0,0}; _v8i z8{0,0,0,0,0,0,0,0};
-          const T* _tdmSrcL = args.inpTokenBuf + srcTokOffset;
-          T* _tdmDst = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset;
-          // DEBUG: sentinel-fill the tile so we can tell "partial load" (stays
-          // sentinel) from "out-of-tile / zeroed" (becomes 0) after the load.
-          {
-            unsigned short* tp = (unsigned short*)_tdmTile;
-            for (int e = laneId; e < _D; e += warpSize) tp[e] = 0x5a5a;
-            __builtin_amdgcn_wave_barrier();
-          }
-          g0.globalAddr((uintptr_t)_tdmSrcL);
+          g0.globalAddr((uintptr_t)(args.inpTokenBuf + srcTokOffset));
           __builtin_amdgcn_tensor_load_to_lds(g0.m_bitfield, g1.m_bitfield, z4, z4, z8, 0);
           __builtin_amdgcn_s_wait_tensorcnt(0);
           __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
           __builtin_amdgcn_wave_barrier();
           __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
-          g0.globalAddr((uintptr_t)_tdmDst);
+          g0.globalAddr((uintptr_t)(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) +
+                                    destTokOffset));
           __builtin_amdgcn_tensor_store_from_lds(g0.m_bitfield, g1.m_bitfield, z4, z4, z8, 0);
           __builtin_amdgcn_s_wait_tensorcnt(0);
-          if (myPe == 0 && srcTokId < 2 && laneId == 0 && (i % config.numExpertPerToken) == 0) {
-            const unsigned short* sp = (const unsigned short*)_tdmSrcL;
-            const unsigned short* lp = (const unsigned short*)_tdmTile;
-            const unsigned short* dp = (const unsigned short*)_tdmDst;
-            int last = _D - 1, mid = _D / 2;
-            printf("TDMDBG r0 tok=%d destTok=%d D=%d [0] s=%04x l=%04x d=%04x [mid] s=%04x l=%04x d=%04x [last] s=%04x l=%04x d=%04x\n",
-                   (int)srcTokId, (int)destTokId, _D, sp[0], lp[0], dp[0],
-                   sp[mid], lp[mid], dp[mid], sp[last], lp[last], dp[last]);
-          }
         }
 #else
         core::WarpCopy<T, 8>(
