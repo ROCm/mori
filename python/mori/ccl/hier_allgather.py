@@ -2085,26 +2085,21 @@ class HierAllGather:
         elif (
             big_ag and not self._debug_sync and self._sync_big_mode == "barriercutouch"
         ):
-            # On mlx5: the device barrier and the CU
-            # re-touch each close a DIFFERENT half of the big-AG completion race
-            # and neither alone is bit-exact on this MI300X/mlx5 pair:
-            #  - "barrier" alone: cut the olapfast drift ~24x (Δ0.054 -> Δ0.0023)
-            #    at ~139 TFLOPS. The RDMA quiet+rendezvous orders the NIC remote
-            #    landing, but the slice_direct direct-to-output write is done by
-            #    the intra SDMA COPY ENGINE (a separate hw agent) whose bytes are
-            #    not guaranteed CU/L2-coherent to the consumer GEMM just by the
-            #    barrier -> residual Δ0.0023.
-            #  - "cutouch" alone: makes the consumed buffer's LAST writer a CU op
-            #    (CU/L2-coherent with the GEMM) but does NOT order the cross-node
-            #    RDMA landing -> a CU re-touch can read still-unlanded remote bytes.
-            # Compose them: barrier FIRST (quiet the NIC + cross-PE rendezvous so
-            # every peer's remote-half bytes have physically landed and the intra
-            # SDMA gather has run), THEN a CU re-touch (fenced CU read+rewrite of
-            # the landed bytes into the CU/L2 domain the GEMM reads). Both enqueued
-            # on the SAME caller stream => stream-ordered (barrier kernel completes
-            # before the re-touch reads), sync-free (no host stall, keeps overlap).
-            # add-by-0 is bit-exact for bf16/fp16/fp32/int. Targets ONLY the big
-            # embed/lm_head cross-node AGs where the residual race lives.
+            # EXPERIMENTAL SYNC_BIG mode (default mode is "host"; SYNC_BIG OFF by
+            # default). On mlx5 the device barrier and the CU re-touch each close a
+            # DIFFERENT half of the big-AG completion race; neither alone is bit-exact:
+            #  - barrier alone orders the NIC remote landing + cross-PE rendezvous,
+            #    but the slice_direct write is done by the intra SDMA copy engine
+            #    (a separate hw agent) whose bytes are not CU/L2-coherent to the
+            #    consumer GEMM just by the barrier.
+            #  - cutouch alone makes the consumed buffer's last writer a CU op
+            #    (CU/L2-coherent) but does NOT order the cross-node RDMA landing.
+            # Invariant: barrier FIRST (quiet NIC + rendezvous so every peer's
+            # remote-half bytes have landed and the intra SDMA gather has run), THEN
+            # a CU re-touch (fenced read+rewrite into the CU/L2 domain the GEMM reads).
+            # Both on the SAME caller stream => stream-ordered, sync-free. add-by-0 is
+            # bit-exact for bf16/fp16/fp32/int. Targets only the big embed/lm_head
+            # cross-node AGs where the residual race lives.
             from ..shmem import shmem_barrier_on_stream
 
             cs = (
