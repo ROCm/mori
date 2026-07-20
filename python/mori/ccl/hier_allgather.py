@@ -2538,16 +2538,10 @@ class HierAllGather:
                 # Side stream must observe the producer of input_data.
                 side.wait_stream(main)
                 off = 0
-                # use the STREAM-ORDERED inter ring
-                # (stream_ring, ) + deferred finish fence (defer_inter_fin,
-                # ) here.  measured this chunked-ring overlap at -13%,
-                # but that was with the HOST-blocking ShmemBarrierAll (2(K-1) CPU
-                # round-trips); those wins did not exist yet. With on-device
-                # barriers each chunk's prepare fence is ~0.03-0.05ms (not a host
-                # stall), so the per-chunk barrier cost that killed  is now
-                # small enough that the overlap (side gather of chunk k hidden
-                # under the main-stream ring of chunk k+1) can net positive. Safety
-                # mirrors : only ONE global on-stream fence is ever in
+                # Uses the STREAM-ORDERED inter ring (stream_ring) + deferred
+                # finish fence (defer_inter_fin): side gather of chunk k is hidden
+                # under the main-stream ring of chunk k+1.
+                # Correctness invariant: only ONE global on-stream fence is ever in
                 # flight (the main-stream ring prepare); the side gathers run
                 # barrier-free (prepare_barrier=False), so this is NOT the
                 # concurrent-global-barrier race. Cross-chunk ring-buffer reuse is
