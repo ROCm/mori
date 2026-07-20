@@ -77,6 +77,24 @@ def _clamp_sdma_channels():
 _clamp_sdma_channels()
 
 
+# Falsy-string set shared by every MORI_HIER_* boolean env flag. A value is
+# "true" iff it is NOT one of these. Kept as a module constant so the parse is
+# identical everywhere (the tuple is a membership test, so order is irrelevant).
+_ENV_FALSE = ("0", "", "false", "False")
+
+
+def _env_true(key: str, default: str = "0") -> bool:
+    """Behavior-identical replacement for the inline
+    ``os.environ.get(key, default) not in ("0", "", "false", "False")`` idiom."""
+    return os.environ.get(key, default) not in _ENV_FALSE
+
+
+def _env_int(key: str, default: str) -> int:
+    """Behavior-identical replacement for the inline
+    ``int(os.environ.get(key, default))`` idiom used by MORI_HIER_* int flags."""
+    return int(os.environ.get(key, default))
+
+
 def _auto_ranks_per_node(my_pe: int, npes: int) -> int:
     """Detect how many ranks are co-located on this physical node so callers can
     use the same signature as the flat ``AllgatherSdma`` (no ``ranks_per_node``).
@@ -309,7 +327,7 @@ class HierAllGather:
         # fans out for true cross-node (RDMA) neighbours, so single-node runs are
         # unaffected (stay single-warp).
         if inter_num_qp is None:
-            inter_num_qp = int(os.environ.get("MORI_NUM_QP_PER_PE", "4"))
+            inter_num_qp = _env_int("MORI_NUM_QP_PER_PE", "4")
         self.inter_num_qp = max(1, inter_num_qp)
         # M4: opt-in multi-block ("channels") inter-node ring. The
         # single-block ring (numQp warps in ONE CTA) saturated at ~63 GB/s vs
@@ -377,18 +395,13 @@ class HierAllGather:
         # N=2 ring round + the round's quiet-drain latency, which RCCL avoids via a
         # persistent fused kernel with inline flag sync (no global barriers).
         if inter_num_blocks is None:
-            inter_num_blocks = int(os.environ.get("MORI_HIER_RING_BLOCKS", "1"))
+            inter_num_blocks = _env_int("MORI_HIER_RING_BLOCKS", "1")
         self.inter_num_blocks = max(1, inter_num_blocks)
         # M4: opt-in leader-only pipeline (DESIGN's primary design).
         # Default every-rank-direct (proven correct since ). Toggle via
         # env MORI_HIER_LEADER_ONLY=1 or the explicit arg. See the N>=2 branch.
         if leader_only is None:
-            leader_only = os.environ.get("MORI_HIER_LEADER_ONLY", "0") not in (
-                "0",
-                "",
-                "false",
-                "False",
-            )
+            leader_only = _env_true("MORI_HIER_LEADER_ONLY", "0")
         self.leader_only = bool(leader_only)
         # M4: opt-in "gather-in-place" -- have the intra-node SDMA
         # gather write its node-block DIRECTLY into the inter-node ring slot,
@@ -396,12 +409,7 @@ class HierAllGather:
         # the node_block intermediate. Default OFF: the proven staged path (intra
         # -> node_block -> ring slot, since ) stays the default.
         if gather_in_place is None:
-            gather_in_place = os.environ.get("MORI_HIER_GATHER_IN_PLACE", "0") not in (
-                "0",
-                "",
-                "false",
-                "False",
-            )
+            gather_in_place = _env_true("MORI_HIER_GATHER_IN_PLACE", "0")
         self.gather_in_place = bool(gather_in_place)
         # M4: opt-in "out-in-place" -- leave the gathered result in the
         # inter-node ring buffer and read it via ``result_tensor`` instead of
@@ -430,12 +438,7 @@ class HierAllGather:
         # RCCL gap is dominated by per-NIC ring fill, not staging. out-in-place
         # stays opt-in (tiny positive win, but changes the read contract).
         if out_in_place is None:
-            out_in_place = os.environ.get("MORI_HIER_OUT_IN_PLACE", "0") not in (
-                "0",
-                "",
-                "false",
-                "False",
-            )
+            out_in_place = _env_true("MORI_HIER_OUT_IN_PLACE", "0")
         self.out_in_place = bool(out_in_place)
         # M4: opt-in "fuse-barrier" -- drop the intra-node SDMA gather's
         # finish ShmemBarrierAll in the every-rank-direct N>=2 path. The default
@@ -477,12 +480,7 @@ class HierAllGather:
         # small/mid per-op floor. Set MORI_HIER_FUSE_BARRIER=0 to disable (e.g.
         # for A/B benchmarking against the pre-fuse baseline).
         if fuse_barrier is None:
-            fuse_barrier = os.environ.get("MORI_HIER_FUSE_BARRIER", "1") not in (
-                "0",
-                "",
-                "false",
-                "False",
-            )
+            fuse_barrier = _env_true("MORI_HIER_FUSE_BARRIER", "1")
         self.fuse_barrier = bool(fuse_barrier)
         # M5: opt-in SLICED 2-D AllGather -- the real bandwidth lever
         # ( NEXT). The default every-rank-direct path has each of the G
@@ -517,9 +515,7 @@ class HierAllGather:
         # for A/B benchmarking).
         _slice_conflict = self.leader_only or self.out_in_place or self.gather_in_place
         if slice_inter is None:
-            slice_inter = os.environ.get(
-                "MORI_HIER_SLICE", "0" if _slice_conflict else "1"
-            ) not in ("0", "", "false", "False")
+            slice_inter = _env_true("MORI_HIER_SLICE", "0" if _slice_conflict else "1")
         self.slice_inter = bool(slice_inter)
         # M5: opt-in FUSED sliced Phase B -- fold the N intra reassembly
         # gathers into ONE batch. The default sliced path runs N separate
@@ -538,12 +534,7 @@ class HierAllGather:
         # far more stable avg, bit-exact 4 dtypes x 3 sizes --  review
         # PASS). Set MORI_HIER_SLICE_FUSED=0 for the unfused sliced path.
         if slice_fused is None:
-            slice_fused = os.environ.get("MORI_HIER_SLICE_FUSED", "1") not in (
-                "0",
-                "",
-                "false",
-                "False",
-            )
+            slice_fused = _env_true("MORI_HIER_SLICE_FUSED", "1")
         self.slice_fused = bool(slice_fused)
         # M5: opt-in "slice out-of-place elimination" -- run the sliced
         # Phase A inter ring in out_in_place mode and have Phase B read its input
@@ -558,12 +549,7 @@ class HierAllGather:
         # positive on the sliced (smaller, count-sized) reads is what the A/B
         # measures. Default OFF; only meaningful with slice_inter.
         if slice_oop is None:
-            slice_oop = os.environ.get("MORI_HIER_SLICE_OOP", "0") not in (
-                "0",
-                "",
-                "false",
-                "False",
-            )
+            slice_oop = _env_true("MORI_HIER_SLICE_OOP", "0")
         self.slice_oop = bool(slice_oop)
         # Per-call SIZE THRESHOLD for the sliced path. Cross-node
         # A/B (N=2 G=4 fp32, both bit-exact) shows
@@ -580,8 +566,8 @@ class HierAllGather:
         # separates the measured 4 MiB (non-slice) from 64 MiB (slice). Set
         # MORI_HIER_SLICE_MIN_BYTES=0 to force slice at all sizes (A/B / tests).
         if slice_min_bytes is None:
-            slice_min_bytes = int(
-                os.environ.get("MORI_HIER_SLICE_MIN_BYTES", str(8 * 1024 * 1024))
+            slice_min_bytes = _env_int(
+                "MORI_HIER_SLICE_MIN_BYTES", str(8 * 1024 * 1024)
             )
         self.slice_min_bytes = max(0, slice_min_bytes)
         # MID/SMALL-SIZE BAND -> stream pipe-overlap path.
@@ -596,15 +582,8 @@ class HierAllGather:
         # Default ON; disable with MORI_HIER_PIPE_BAND=0. At/above slice_min the
         # slice_direct path still wins (8MiB+ measured), so this only re-routes
         # the band the dispatcher previously sent to the slow non-slice path.
-        self.pipe_band = os.environ.get("MORI_HIER_PIPE_BAND", "1") not in (
-            "0",
-            "false",
-            "False",
-            "",
-        )
-        self.pipe_band_min_bytes = int(
-            os.environ.get("MORI_HIER_PIPE_BAND_MIN_BYTES", "0")
-        )
+        self.pipe_band = _env_true("MORI_HIER_PIPE_BAND", "1")
+        self.pipe_band_min_bytes = _env_int("MORI_HIER_PIPE_BAND_MIN_BYTES", "0")
         # M5: opt-in lever (c) -- OVERLAP Phase-A (inter RDMA ring) with
         # the LOCAL node-block's Phase-B reassembly gather. In the sliced+fused
         # path the gather for block m=node_id needs only slice_g(B_node_id) ==
@@ -619,12 +598,7 @@ class HierAllGather:
         # ring collection after it lands. Only meaningful with slice_inter +
         # slice_fused. Default OFF; toggle MORI_HIER_SLICE_OVERLAP=1.
         if slice_overlap is None:
-            slice_overlap = os.environ.get("MORI_HIER_SLICE_OVERLAP", "0") not in (
-                "0",
-                "",
-                "false",
-                "False",
-            )
+            slice_overlap = _env_true("MORI_HIER_SLICE_OVERLAP", "0")
         self.slice_overlap = bool(slice_overlap)
         # M5: drop the REDUNDANT Phase-B entry barrier in the sliced+fused
         # NON-overlap path. That path runs the inter ring first; its finish_sync
@@ -643,12 +617,7 @@ class HierAllGather:
         # barrier and must keep its own entry barrier). Default ON (provably safe);
         # set MORI_HIER_SLICE_FUSE_IB=0 to restore the entry barrier (A/B).
         if slice_fuse_ib is None:
-            slice_fuse_ib = os.environ.get("MORI_HIER_SLICE_FUSE_IB", "1") not in (
-                "0",
-                "",
-                "false",
-                "False",
-            )
+            slice_fuse_ib = _env_true("MORI_HIER_SLICE_FUSE_IB", "1")
         self.slice_fuse_ib = bool(slice_fuse_ib)
         # M5: opt-in CHUNKED (strided) Phase-B reassembly -- the enabler
         # for the chunked inter/intra pipeline (the remaining structural lever per
@@ -665,15 +634,10 @@ class HierAllGather:
         # Only meaningful with slice_inter + slice_fused (non-overlap, non-oop).
         # Default OFF; toggle MORI_HIER_SLICE_PIPE=1.
         if slice_pipe is None:
-            slice_pipe = os.environ.get("MORI_HIER_SLICE_PIPE", "0") not in (
-                "0",
-                "",
-                "false",
-                "False",
-            )
+            slice_pipe = _env_true("MORI_HIER_SLICE_PIPE", "0")
         self.slice_pipe = bool(slice_pipe)
         if slice_pipe_chunks is None:
-            slice_pipe_chunks = int(os.environ.get("MORI_HIER_SLICE_PIPE_CHUNKS", "2"))
+            slice_pipe_chunks = _env_int("MORI_HIER_SLICE_PIPE_CHUNKS", "2")
         self.slice_pipe_chunks = max(1, slice_pipe_chunks)
         # Uneven front/tail chunk split for the K==2 SLICE_PIPE_OVERLAP pipeline.
         # The exposed serial cost is
@@ -708,9 +672,7 @@ class HierAllGather:
         # (toggle MORI_HIER_SLICE_PIPE_OVERLAP=1). Cost: +2(K-1) ring barriers; net
         # win only if hidden gather tail > added barrier overhead (A/B decides).
         if slice_pipe_overlap is None:
-            slice_pipe_overlap = os.environ.get(
-                "MORI_HIER_SLICE_PIPE_OVERLAP", "0"
-            ) not in ("0", "", "false", "False")
+            slice_pipe_overlap = _env_true("MORI_HIER_SLICE_PIPE_OVERLAP", "0")
         self.slice_pipe_overlap = bool(slice_pipe_overlap)
         # Per-chunk landing fence for SLICE_PIPE_OVERLAP.
         # The deferred overlap loop (defer_inter_fin=sr + gather
@@ -746,12 +708,7 @@ class HierAllGather:
         # Default ON (: +10-12% @64MiB fp32 xnode, bit-exact, more stable;
         # only affects the slice path, which gates the 64MiB acceptance number).
         # Set MORI_HIER_STREAM_RING=0 / --no-stream-ring to restore host-sync.
-        self.stream_ring = os.environ.get("MORI_HIER_STREAM_RING", "1") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
+        self.stream_ring = _env_true("MORI_HIER_STREAM_RING", "1")
         # STREAM-ORDERED Phase-B finish_batch. The fused sliced
         # Phase-B still ends with finish_batch = bulk copy-OUT + host
         # hipStreamSynchronize + host ShmemBarrierAll -- the LAST host CPU<->GPU
@@ -761,12 +718,7 @@ class HierAllGather:
         # with NO host stall. Only the default fused non-overlap, non-pipe slice
         # path uses it. Default ON; set MORI_HIER_STREAM_INTRA=0 /
         # --no-stream-intra to restore the host-synced finish_batch for A/B.
-        self.stream_intra = os.environ.get("MORI_HIER_STREAM_INTRA", "1") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
+        self.stream_intra = _env_true("MORI_HIER_STREAM_INTRA", "1")
         # DEFER the Phase-B finish_batch_stream fence. The
         # default fused-stream slice op issues 3 on-stream global ShmemBarrierOn
         # Stream fences/op: inter prepare (#1), inter finish (#2), Phase-B finish
@@ -784,12 +736,7 @@ class HierAllGather:
         # output is already stream-correct. Only the default fused non-overlap,
         # non-pipe, non-oop slice path (which uses finish_batch_stream) defers.
         # Default ON; set MORI_HIER_SLICE_DEFER_FIN=0 to restore the fence (A/B).
-        self.slice_defer_fin = os.environ.get("MORI_HIER_SLICE_DEFER_FIN", "1") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
+        self.slice_defer_fin = _env_true("MORI_HIER_SLICE_DEFER_FIN", "1")
         # defer the INTER ring's finish_stream fence (the
         # stream-ordered ShmemBarrierOnStream guarding cross-PE ring-buffer reuse)
         # to the NEXT slice op's prepare_stream barrier. The ring buffer is reused
@@ -808,9 +755,7 @@ class HierAllGather:
         # _prev_op_completed forcing an entry barrier. Set
         # MORI_HIER_SLICE_DEFER_INTER_FIN=0 (--no-slice-defer-inter-fin) to restore
         # the fence for A/B.
-        self.slice_defer_inter_fin = os.environ.get(
-            "MORI_HIER_SLICE_DEFER_INTER_FIN", "1"
-        ) not in ("0", "", "false", "False")
+        self.slice_defer_inter_fin = _env_true("MORI_HIER_SLICE_DEFER_INTER_FIN", "1")
         # PHASE-B ENTRY BARRIER (accuracy). Force a full cross-PE
         # ShmemBarrierOnStream on the FIRST Phase-B reassembly gather even when
         # slice_fuse_ib would otherwise drop it. The Phase-B intra SDMA gathers
@@ -823,9 +768,7 @@ class HierAllGather:
         # finish BEFORE any Phase-B gather reads it, on-device (no host sync).
         # Default OFF (preserves the perf path); set MORI_HIER_PHASEB_ENTRY_BARRIER=1
         # to A/B the accuracy fix and measure its one-barrier/op perf cost.
-        self.phaseb_entry_barrier = os.environ.get(
-            "MORI_HIER_PHASEB_ENTRY_BARRIER", "0"
-        ) not in ("0", "", "false", "False")
+        self.phaseb_entry_barrier = _env_true("MORI_HIER_PHASEB_ENTRY_BARRIER", "0")
         # DIRECT-PATH LOCAL-BLOCK OVERLAP. In the shipped
         # slice_direct path the dominant cost is now Phase B (the XGMI reassembly
         # gathers ~2.5ms), not Phase A (the sliced RDMA ring ~1.6ms) -- see the
@@ -864,9 +807,7 @@ class HierAllGather:
         # Phase-B block" lever from the DIRECT-path angle (/7 closed it on the
         # old copy-OUT path). Kept opt-in so it is not re-litigated; default stays
         # the shipped serial direct path (~142 GB/s, 1.06x).
-        self.slice_direct_overlap = os.environ.get(
-            "MORI_HIER_SLICE_DIRECT_OVERLAP", "0"
-        ) not in ("0", "", "false", "False")
+        self.slice_direct_overlap = _env_true("MORI_HIER_SLICE_DIRECT_OVERLAP", "0")
         # MULTI-STREAM Phase-B reassembly.
         # The N disjoint slice_fused reassembly gathers currently run SERIALLY on
         # one stream, so at most one OneShotAllGatherSdmaSubGroupKernel drives the
@@ -890,7 +831,7 @@ class HierAllGather:
         # reassembly wall (engine-fan WITHIN a gather was fabric-bound; this
         # tests whether MULTIPLE gathers in flight lift utilization).
         try:
-            self.reasm_streams = int(os.environ.get("MORI_HIER_REASM_STREAMS", "1"))
+            self.reasm_streams = _env_int("MORI_HIER_REASM_STREAMS", "1")
         except ValueError:
             self.reasm_streams = 1
         if self.reasm_streams < 1:
@@ -954,9 +895,8 @@ class HierAllGather:
         # without touching the E2E default: the env still overrides either way,
         # and any caller that omits the flag (all FSDP/E2E paths) keeps the
         # byte-identical serial default.
-        _fl_env = os.environ.get("MORI_HIER_FUSE_LOCAL")
-        if _fl_env is not None:
-            self.fuse_local = _fl_env not in ("0", "", "false", "False")
+        if "MORI_HIER_FUSE_LOCAL" in os.environ:
+            self.fuse_local = _env_true("MORI_HIER_FUSE_LOCAL")
         else:
             self.fuse_local = bool(standalone_fast)
         # Remember the standalone gate so the standalone fast path can auto-engage
@@ -984,6 +924,117 @@ class HierAllGather:
         # crash-guard lives at module import (see _clamp_sdma_channels) because the
         # physical SDMA queue count is fixed by anvil at shmem init, before this
         # __init__ runs.
+        self._apply_standalone_fast_defaults(standalone_fast)
+        self._init_fused_ring_state()
+        # DIRECT-TO-OUTPUT Phase B. The default fused sliced
+        # path SDMA-gathers the N node-blocks into an internal symmetric transit
+        # (_intra.out_) and then a finish_batch copies the WHOLE output
+        # (N*block = full AllGather result, ~512 MiB @64 MiB/rank) D2D into the
+        # user output -- pure HBM traffic on the critical path. With slice_direct
+        # the gathers PUSH each member's slice straight into the (registered) user
+        # output, eliminating that copy entirely (the only remaining serial
+        # Phase-B cost after the stream-ordered barriers). The user output is
+        # registered once (collective ShmemSymmetricRegister, cached) on first
+        # sight; the cost amortizes across calls that reuse the same output (the
+        # benchmark + steady-state inference both do). Only engaged on the
+        # default fused, non-overlap, non-pipe, non-oop, stream-ordered slice
+        # path (the shipped path). kept OPT-IN (default OFF).
+        # The direct path registers the USER output as a symmetric buffer
+        # (ShmemSymmetricRegister); over RDMA (true xnode) this succeeds, but
+        # under single-node IPC (hipIpcGetMemHandle on an arbitrary torch
+        # allocation) it HARD-FAILS ("invalid argument") and aborts the process
+        # -- so default-ON would crash single-process multi-GPU users. It is a
+        # validated true-xnode lever (+5.4% @64 MiB, 133.7->141.2 GB/s); enable
+        # with MORI_HIER_SLICE_DIRECT=1 / --slice-direct on a real RDMA setup.
+        #
+        # now that slice_direct is robustly correct under
+        # varying output pointers ( exact-base + stale-evict fix) and the
+        # teardown crash is fixed, promote it to DEFAULT ON whenever we
+        # are on a true multi-node (RDMA) setup (num_nodes >= 2), where
+        # ShmemSymmetricRegister succeeds. It stays OFF on single-node (num_nodes
+        # == 1, IPC sim) where hipIpcGetMemHandle hard-aborts. An explicit
+        # arg or MORI_HIER_SLICE_DIRECT env override still wins. The default
+        # decision is deferred to after num_nodes is known (see below).
+        if slice_direct is None:
+            if "MORI_HIER_SLICE_DIRECT" not in os.environ:
+                # Sentinel: decide from num_nodes after it is computed.
+                slice_direct = None
+            else:
+                slice_direct = _env_true("MORI_HIER_SLICE_DIRECT")
+        self.slice_direct = None if slice_direct is None else bool(slice_direct)
+        if self.slice_inter and (
+            self.leader_only or self.out_in_place or self.gather_in_place
+        ):
+            raise ValueError(
+                "slice_inter is incompatible with leader_only/out_in_place/"
+                "gather_in_place (it owns the inter+intra data path)"
+            )
+        if self.out_in_place:
+            # out-in-place subsumes gather-in-place (no copy-IN either) and is
+            # incompatible with the leader-only broadcast pipeline (its result is
+            # produced by the SDMA broadcast, not the ring buffer).
+            if self.leader_only:
+                raise ValueError(
+                    "out_in_place is incompatible with leader_only (the leader-only "
+                    "result comes from the SDMA broadcast, not the ring buffer)"
+                )
+            self.gather_in_place = True
+        # Interface compatibility with the flat AllgatherSdma: accept a single
+        # combined transit size and split it into input/output when the caller
+        # did not size them explicitly.
+        if transit_buffer_size is not None:
+            if input_buffer_size is None:
+                input_buffer_size = transit_buffer_size
+            if output_buffer_size is None:
+                output_buffer_size = transit_buffer_size * npes
+        # Topology is auto-detected so callers use the same signature as the
+        # flat AllgatherSdma (no ranks_per_node needed). Single node -> the
+        # operation degenerates to a pure intra-node SDMA AllGather.
+        if ranks_per_node is None:
+            ranks_per_node = _auto_ranks_per_node(my_pe, npes)
+        if ranks_per_node <= 0 or npes % ranks_per_node != 0:
+            raise ValueError(
+                f"npes ({npes}) must be a positive multiple of ranks_per_node "
+                f"({ranks_per_node})"
+            )
+
+        self.my_pe = my_pe
+        self.npes = npes
+        self.ranks_per_node = ranks_per_node
+        self.num_nodes = npes // ranks_per_node
+        self.node_id = my_pe // ranks_per_node
+        self.local_rank = my_pe % ranks_per_node
+        self._apply_dense_node_defaults()
+        self.copy_output_to_user = copy_output_to_user
+        self._init_sync_drain_state()
+
+        # the deferred slice_direct default (None sentinel) is
+        # resolved LATER, after the inter-node ring is built, by probing the
+        # actual transport (shmem_ptr_p2p to a cross-node peer: 0 => RDMA =>
+        # ShmemSymmetricRegister of the user output works => default ON; non-zero
+        # => P2P/IPC, incl. the single-node spawn sim that fakes num_nodes>=2 over
+        # IPC => keep OFF to avoid the hipIpcGetMemHandle hard-abort). num_nodes
+        # alone is NOT a safe signal (the sim runs num_nodes>=2 over IPC).
+        if self.num_nodes == 1 and self.slice_direct is None:
+            # The single-node path never uses the direct Phase-B gather.
+            self.slice_direct = False
+
+        self._build_subcollectives(
+            my_pe,
+            npes,
+            input_buffer_size,
+            output_buffer_size,
+            copy_output_to_user,
+        )
+
+    def _apply_standalone_fast_defaults(self, standalone_fast):
+        """Standalone fast-path env defaults (extracted verbatim from __init__).
+
+        Reads only the ``standalone_fast`` arg + os.environ; writes
+        self._standalone_fast / self._standalone_defer_fin and (only when
+        standalone_fast is set) the MORI_SDMA_NUM_CHANNELS / FUSE_REMOTE /
+        DEEP_PIPE / DISSEM_BARRIER env defaults. No FSDP/E2E caller passes
+        standalone_fast, so the shipped path is byte-identical."""
         self._standalone_fast = bool(standalone_fast)
         if standalone_fast:
             if os.environ.get("MORI_SDMA_NUM_CHANNELS") is None:
@@ -1035,10 +1086,12 @@ class HierAllGather:
         # FSDP/E2E caller passes standalone_fast, so the w16 E2E finish fences stay
         # ON; the E2E host-drain reference loss is unchanged. Set
         # MORI_HIER_STANDALONE_DEFER_FIN=0 to restore the finish barrier.
-        self._standalone_defer_fin = bool(standalone_fast) and (
-            os.environ.get("MORI_HIER_STANDALONE_DEFER_FIN", "1")
-            not in ("0", "", "false", "False")
+        self._standalone_defer_fin = bool(standalone_fast) and _env_true(
+            "MORI_HIER_STANDALONE_DEFER_FIN", "1"
         )
+
+    def _init_fused_ring_state(self):
+        """Init fused ring / persistent-kernel / flag-token / reasm-deep-SQ / host-proxy-inter state (moved verbatim from __init__)."""
         # PHASE 4: pipeline the inter-node RDMA ring with the REMOTE-block XGMI
         # reassembly (the 143->168 GB/s lever). When ON (and on the fuse_local
         # slice_direct path) the fused FusedRingRemoteGatherKernel runs the ring
@@ -1047,12 +1100,7 @@ class HierAllGather:
         # whole-phase finish barrier, remote gather overlaps the still-in-flight
         # NIC ring. Only valid at num_nodes==2 (single ring round); default OFF
         # until the standalone bit-exact sweep gate passes.
-        self.fuse_remote = os.environ.get("MORI_HIER_FUSE_REMOTE", "0") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
+        self.fuse_remote = _env_true("MORI_HIER_FUSE_REMOTE", "0")
         # PERSISTENT-KERNEL PORT: fold the host hipMemcpyAsync
         # copy-IN of this PE's input into its ring slot INTO the fused kernel (each
         # ring channel stages its own send sub-range before the put). Drops one GPU
@@ -1074,12 +1122,7 @@ class HierAllGather:
         # exclusive on this fabric, so the fixed per-op floor is irreducible on the
         # bit-exact path without forfeiting the overlap that gives mori its winning
         # marginal fill.
-        self.fuse_copyin = os.environ.get("MORI_HIER_FUSE_COPYIN", "0") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
+        self.fuse_copyin = _env_true("MORI_HIER_FUSE_COPYIN", "0")
         self._chunk_ready_flags = None
         # Cross-size carryover guard: the exact DEEP_PIPE flag layout
         # (slots, per-PE count, pipe depth) the persistent buffer was last sized
@@ -1094,12 +1137,7 @@ class HierAllGather:
         # worker -- the same reset-free pattern the classic ring (opGen) and the
         # reassembly-completion flags (gFlagVal) already use. Default OFF
         # (op_gen=0 -> kernel writes 1 / waits <1 / host zeroes -> byte-identical).
-        self._flag_token = os.environ.get("MORI_HIER_FLAG_TOKEN", "0") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
+        self._flag_token = _env_true("MORI_HIER_FLAG_TOKEN", "0")
         self._flag_opgen = 0
         # Device flag-token (MORI_HIER_FLAG_TOKEN_DEV, requires GEN_RING_DBL): like
         # FLAG_TOKEN but the per-op generation is derived device-side from the
@@ -1107,12 +1145,7 @@ class HierAllGather:
         # HIP-graph replay -- the host FLAG_TOKEN counter freezes at capture. Here
         # we only skip the host flags.zero_() so the flags accumulate; the device
         # supplies the strictly-increasing token.
-        self._flag_token_dev = os.environ.get("MORI_HIER_FLAG_TOKEN_DEV", "0") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
+        self._flag_token_dev = _env_true("MORI_HIER_FLAG_TOKEN_DEV", "0")
         # Intra reassembly deep-SQ (MORI_HIER_REASM_DEEPSQ): submit all owned
         # reassembly channels' SDMA copies back-to-back (SQ continuously fed) then a
         # single drain covers them all plus deferred flags, instead of submit+drain
@@ -1126,164 +1159,18 @@ class HierAllGather:
         # path has a single remote reassembly gather, so this is a no-op there
         # (nPass collapses to the single-shot submit+drain) and the shipped default
         # path stays byte-identical. Env still overrides either way.
-        _rdsq_env = os.environ.get("MORI_HIER_REASM_DEEPSQ")
-        if _rdsq_env is not None:
-            self._reasm_deep_sq = (
-                1 if _rdsq_env not in ("0", "", "false", "False") else 0
-            )
+        if "MORI_HIER_REASM_DEEPSQ" in os.environ:
+            self._reasm_deep_sq = 1 if _env_true("MORI_HIER_REASM_DEEPSQ") else 0
         else:
             self._reasm_deep_sq = 1 if (self.fuse_local or self.fuse_remote) else 0
         # HOST-PROXY INTER producer (MORI_HIER_HOSTPROXY_REASM): lazily built
         # against the inter ring buffer; owns the inter leg + publishes flags.
         self._hp_inter = None
         self._hp_src_ev = None
-        # DIRECT-TO-OUTPUT Phase B. The default fused sliced
-        # path SDMA-gathers the N node-blocks into an internal symmetric transit
-        # (_intra.out_) and then a finish_batch copies the WHOLE output
-        # (N*block = full AllGather result, ~512 MiB @64 MiB/rank) D2D into the
-        # user output -- pure HBM traffic on the critical path. With slice_direct
-        # the gathers PUSH each member's slice straight into the (registered) user
-        # output, eliminating that copy entirely (the only remaining serial
-        # Phase-B cost after the stream-ordered barriers). The user output is
-        # registered once (collective ShmemSymmetricRegister, cached) on first
-        # sight; the cost amortizes across calls that reuse the same output (the
-        # benchmark + steady-state inference both do). Only engaged on the
-        # default fused, non-overlap, non-pipe, non-oop, stream-ordered slice
-        # path (the shipped path). kept OPT-IN (default OFF).
-        # The direct path registers the USER output as a symmetric buffer
-        # (ShmemSymmetricRegister); over RDMA (true xnode) this succeeds, but
-        # under single-node IPC (hipIpcGetMemHandle on an arbitrary torch
-        # allocation) it HARD-FAILS ("invalid argument") and aborts the process
-        # -- so default-ON would crash single-process multi-GPU users. It is a
-        # validated true-xnode lever (+5.4% @64 MiB, 133.7->141.2 GB/s); enable
-        # with MORI_HIER_SLICE_DIRECT=1 / --slice-direct on a real RDMA setup.
-        #
-        # now that slice_direct is robustly correct under
-        # varying output pointers ( exact-base + stale-evict fix) and the
-        # teardown crash is fixed, promote it to DEFAULT ON whenever we
-        # are on a true multi-node (RDMA) setup (num_nodes >= 2), where
-        # ShmemSymmetricRegister succeeds. It stays OFF on single-node (num_nodes
-        # == 1, IPC sim) where hipIpcGetMemHandle hard-aborts. An explicit
-        # arg or MORI_HIER_SLICE_DIRECT env override still wins. The default
-        # decision is deferred to after num_nodes is known (see below).
-        if slice_direct is None:
-            env_direct = os.environ.get("MORI_HIER_SLICE_DIRECT")
-            if env_direct is None:
-                # Sentinel: decide from num_nodes after it is computed.
-                slice_direct = None
-            else:
-                slice_direct = env_direct not in ("0", "", "false", "False")
-        self.slice_direct = None if slice_direct is None else bool(slice_direct)
-        if self.slice_inter and (
-            self.leader_only or self.out_in_place or self.gather_in_place
-        ):
-            raise ValueError(
-                "slice_inter is incompatible with leader_only/out_in_place/"
-                "gather_in_place (it owns the inter+intra data path)"
-            )
-        if self.out_in_place:
-            # out-in-place subsumes gather-in-place (no copy-IN either) and is
-            # incompatible with the leader-only broadcast pipeline (its result is
-            # produced by the SDMA broadcast, not the ring buffer).
-            if self.leader_only:
-                raise ValueError(
-                    "out_in_place is incompatible with leader_only (the leader-only "
-                    "result comes from the SDMA broadcast, not the ring buffer)"
-                )
-            self.gather_in_place = True
-        # Interface compatibility with the flat AllgatherSdma: accept a single
-        # combined transit size and split it into input/output when the caller
-        # did not size them explicitly.
-        if transit_buffer_size is not None:
-            if input_buffer_size is None:
-                input_buffer_size = transit_buffer_size
-            if output_buffer_size is None:
-                output_buffer_size = transit_buffer_size * npes
-        # Topology is auto-detected so callers use the same signature as the
-        # flat AllgatherSdma (no ranks_per_node needed). Single node -> the
-        # operation degenerates to a pure intra-node SDMA AllGather.
-        if ranks_per_node is None:
-            ranks_per_node = _auto_ranks_per_node(my_pe, npes)
-        if ranks_per_node <= 0 or npes % ranks_per_node != 0:
-            raise ValueError(
-                f"npes ({npes}) must be a positive multiple of ranks_per_node "
-                f"({ranks_per_node})"
-            )
 
-        self.my_pe = my_pe
-        self.npes = npes
-        self.ranks_per_node = ranks_per_node
-        self.num_nodes = npes // ranks_per_node
-        self.node_id = my_pe // ranks_per_node
-        self.local_rank = my_pe % ranks_per_node
-        # Dense-node (8 ranks/node) landing-fence fix.
-        # At 8 ranks/node the shipped default drops the Phase-B entry barrier
-        # (slice_fuse_ib) and defers the inter/intra finish fences, relying on the
-        # ring's own deferred finish for cross-PE visibility. The Phase-B intra
-        # SDMA gathers read peer ranks' ``collection`` (the inter-ring node-block
-        # output) over XGMI; with 8 local ranks the SDMA read can observe a peer's
-        # collection before that peer's ring finish is globally visible -- a
-        # cross-PE visibility race that a host stream.synchronize cannot fix (it is
-        # peer-side, not local completion). The race scales with local fan-out, so
-        # w8 (4 ranks/node) is unaffected while w16 (8 ranks/node) drifts. Forcing
-        # the two cross-PE finish fences ON restores bit-exactness.
-        # Fix: at ranks_per_node >= 8 default the two cross-PE finish fences ON
-        # (explicit env always wins). At ranks_per_node == 4 the gate never fires,
-        # so the w8 path is byte-identical.
-        #
-        # The Phase-B entry barrier is redundant once the two finish fences run
-        # inline (slice_defer_fin=0 restores the Phase-B finish ShmemBarrierAll
-        # immediately before the m==0 gather -- see the slice_fuse_ib comment
-        # above: two back-to-back global barriers with no remote op between make the
-        # entry one redundant). It is dropped from the gate default (one fewer
-        # global barrier/op, still bit-exact); set
-        # MORI_HIER_PHASEB_ENTRY_BARRIER=1 to restore it.
-        if self.ranks_per_node >= 8:
-            if "MORI_HIER_SLICE_DEFER_FIN" not in os.environ:
-                self.slice_defer_fin = False
-            if "MORI_HIER_SLICE_DEFER_INTER_FIN" not in os.environ:
-                self.slice_defer_inter_fin = False
-            # Dense-node signal-pipe default.
-            # At 8 ranks/node the inter-node ring's temporal DEEP_PIPE sub-chunks
-            # land via the auto-engaged DEEP_PIPE_QUIET send-CQ drain fence (quiet
-            # auto-on whenever deepPipe>1 && !deepPipeImm). That serial
-            # per-sub-chunk QP quiet-drain is the exposed per-round completion
-            # latency. The fused put-with-signal landing path (deepPipeQuiet=0)
-            # instead rides the completion AMO on the same QP as its data (RC
-            # in-order, so the flag never precedes its bytes) with no extra drain --
-            # the copy-engine completion model reimplemented natively, which is
-            # markedly faster. Bit-exact here because the 32MB DEEP_PIPE window gate
-            # (_dp_sub_bytes>=32MB => depth 1) caps engagement to sub-chunk<32MB,
-            # under the NIC->HBM coherence window where the put-signal AMO could
-            # outrun its own data. Any AG whose sub-chunk would reach >=32MB (e.g.
-            # the giant embed/lm_head E2E AG) is caged to depth 1 and never runs the
-            # signal path. Explicit MORI_HIER_DEEP_PIPE_QUIET always wins;
-            # ranks_per_node==4 never enters this gate.
-            if "MORI_HIER_DEEP_PIPE_QUIET" not in os.environ:
-                os.environ["MORI_HIER_DEEP_PIPE_QUIET"] = "0"
-            # Deep-pipe depth axis. Once the quiet-drain is gone, the temporal pipe
-            # depth (1 vs 2 vs 4) is neutral within noise -- bandwidth is
-            # depth-invariant, with a flat steady fill deficit plus a small fixed
-            # per-op cost (the ratio ramp with size is the fixed cost amortising,
-            # not depth helping). DEEP_PIPE=1 is never worse and strictly simpler
-            # (no put-signal AMO that can outrun data, so no coherence-window
-            # dependency and fewer landing flags). MORI_HIER_W16_DP1=1 forces it on
-            # the dense-node gate; default OFF keeps the depth-2 signal default
-            # byte-identical.
-            if (
-                os.environ.get("MORI_HIER_W16_DP1", "0")
-                not in ("0", "", "false", "False")
-                and "MORI_HIER_DEEP_PIPE" not in os.environ
-            ):
-                os.environ["MORI_HIER_DEEP_PIPE"] = "1"
-        self.copy_output_to_user = copy_output_to_user
+    def _init_sync_drain_state(self):
         # isolation probe: force full stream completion at op return.
-        self._debug_sync = os.environ.get("MORI_HIER_DEBUG_SYNC", "0") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
+        self._debug_sync = _env_true("MORI_HIER_DEBUG_SYNC", "0")
         # Dense-node device-landing drain (opt-in, default OFF -- a documented
         # negative kept as an escape hatch).
         # The bit-exact dense-node base needs the full per-op host drain
@@ -1304,12 +1191,7 @@ class HierAllGather:
         # fences are not sufficient and only a host CPU RDMA-progress round-trip is
         # bit-exact. The real dense-node bandwidth lever is a deferred host drain
         # (hide the CPU stall behind FSDP prefetch), not a device-fence replacement.
-        self._w16_devdrain = os.environ.get("MORI_HIER_W16_DEVDRAIN", "0") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
+        self._w16_devdrain = _env_true("MORI_HIER_W16_DEVDRAIN", "0")
         # SYNC_BIG: targeted remote-completion fence on ONLY the big cross-node
         # all-gathers. The residual
         # fast-path stale reads (~184/384 calls) concentrate in the LARGE
@@ -1321,14 +1203,9 @@ class HierAllGather:
         # gather overlap on the numerous small AGs (perf-preserving convergence
         # fix). Default OFF; threshold 8 MiB/rank cleanly separates embed/lm_head
         # from the regular transformer-block params for Qwen-class models.
-        self._sync_big = os.environ.get("MORI_HIER_SYNC_BIG", "0") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
-        self._sync_big_bytes = int(
-            os.environ.get("MORI_HIER_SYNC_BIG_BYTES", str(8 * 1024 * 1024))
+        self._sync_big = _env_true("MORI_HIER_SYNC_BIG", "0")
+        self._sync_big_bytes = _env_int(
+            "MORI_HIER_SYNC_BIG_BYTES", str(8 * 1024 * 1024)
         )
         # SYNC_BIG mode: "host" (default) = host stream.synchronize() on the big
         # AGs (proven bit-exact but stalls the CPU->GPU pipeline ~23%); "barrier"
@@ -1409,25 +1286,85 @@ class HierAllGather:
         # ELEMENTWISE (CU) kernel writes scratch -> output, so the producer of
         # the consumed buffer is a CU op (CU/L2-coherent with the GEMM) WITHOUT a
         # host stall (preserving the AG<->backward overlap). Default ON.
-        self._py_cu_copyout = os.environ.get("MORI_HIER_PY_CU_COPYOUT", "1") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
+        self._py_cu_copyout = _env_true("MORI_HIER_PY_CU_COPYOUT", "1")
         self._cu_copyout_scratch = None
 
-        # the deferred slice_direct default (None sentinel) is
-        # resolved LATER, after the inter-node ring is built, by probing the
-        # actual transport (shmem_ptr_p2p to a cross-node peer: 0 => RDMA =>
-        # ShmemSymmetricRegister of the user output works => default ON; non-zero
-        # => P2P/IPC, incl. the single-node spawn sim that fakes num_nodes>=2 over
-        # IPC => keep OFF to avoid the hipIpcGetMemHandle hard-abort). num_nodes
-        # alone is NOT a safe signal (the sim runs num_nodes>=2 over IPC).
-        if self.num_nodes == 1 and self.slice_direct is None:
-            # The single-node path never uses the direct Phase-B gather.
-            self.slice_direct = False
+    def _apply_dense_node_defaults(self):
+        # Dense-node (8 ranks/node) landing-fence fix.
+        # At 8 ranks/node the shipped default drops the Phase-B entry barrier
+        # (slice_fuse_ib) and defers the inter/intra finish fences, relying on the
+        # ring's own deferred finish for cross-PE visibility. The Phase-B intra
+        # SDMA gathers read peer ranks' ``collection`` (the inter-ring node-block
+        # output) over XGMI; with 8 local ranks the SDMA read can observe a peer's
+        # collection before that peer's ring finish is globally visible -- a
+        # cross-PE visibility race that a host stream.synchronize cannot fix (it is
+        # peer-side, not local completion). The race scales with local fan-out, so
+        # w8 (4 ranks/node) is unaffected while w16 (8 ranks/node) drifts. Forcing
+        # the two cross-PE finish fences ON restores bit-exactness.
+        # Fix: at ranks_per_node >= 8 default the two cross-PE finish fences ON
+        # (explicit env always wins). At ranks_per_node == 4 the gate never fires,
+        # so the w8 path is byte-identical.
+        #
+        # The Phase-B entry barrier is redundant once the two finish fences run
+        # inline (slice_defer_fin=0 restores the Phase-B finish ShmemBarrierAll
+        # immediately before the m==0 gather -- see the slice_fuse_ib comment
+        # above: two back-to-back global barriers with no remote op between make the
+        # entry one redundant). It is dropped from the gate default (one fewer
+        # global barrier/op, still bit-exact); set
+        # MORI_HIER_PHASEB_ENTRY_BARRIER=1 to restore it.
+        if self.ranks_per_node >= 8:
+            if "MORI_HIER_SLICE_DEFER_FIN" not in os.environ:
+                self.slice_defer_fin = False
+            if "MORI_HIER_SLICE_DEFER_INTER_FIN" not in os.environ:
+                self.slice_defer_inter_fin = False
+            # Dense-node signal-pipe default.
+            # At 8 ranks/node the inter-node ring's temporal DEEP_PIPE sub-chunks
+            # land via the auto-engaged DEEP_PIPE_QUIET send-CQ drain fence (quiet
+            # auto-on whenever deepPipe>1 && !deepPipeImm). That serial
+            # per-sub-chunk QP quiet-drain is the exposed per-round completion
+            # latency. The fused put-with-signal landing path (deepPipeQuiet=0)
+            # instead rides the completion AMO on the same QP as its data (RC
+            # in-order, so the flag never precedes its bytes) with no extra drain --
+            # the copy-engine completion model reimplemented natively, which is
+            # markedly faster. Bit-exact here because the 32MB DEEP_PIPE window gate
+            # (_dp_sub_bytes>=32MB => depth 1) caps engagement to sub-chunk<32MB,
+            # under the NIC->HBM coherence window where the put-signal AMO could
+            # outrun its own data. Any AG whose sub-chunk would reach >=32MB (e.g.
+            # the giant embed/lm_head E2E AG) is caged to depth 1 and never runs the
+            # signal path. Explicit MORI_HIER_DEEP_PIPE_QUIET always wins;
+            # ranks_per_node==4 never enters this gate.
+            if "MORI_HIER_DEEP_PIPE_QUIET" not in os.environ:
+                os.environ["MORI_HIER_DEEP_PIPE_QUIET"] = "0"
+            # Deep-pipe depth axis. Once the quiet-drain is gone, the temporal pipe
+            # depth (1 vs 2 vs 4) is neutral within noise -- bandwidth is
+            # depth-invariant, with a flat steady fill deficit plus a small fixed
+            # per-op cost (the ratio ramp with size is the fixed cost amortising,
+            # not depth helping). DEEP_PIPE=1 is never worse and strictly simpler
+            # (no put-signal AMO that can outrun data, so no coherence-window
+            # dependency and fewer landing flags). MORI_HIER_W16_DP1=1 forces it on
+            # the dense-node gate; default OFF keeps the depth-2 signal default
+            # byte-identical.
+            if (
+                _env_true("MORI_HIER_W16_DP1", "0")
+                and "MORI_HIER_DEEP_PIPE" not in os.environ
+            ):
+                os.environ["MORI_HIER_DEEP_PIPE"] = "1"
 
+    def _build_subcollectives(
+        self,
+        my_pe,
+        npes,
+        input_buffer_size,
+        output_buffer_size,
+        copy_output_to_user,
+    ):
+        """Construct the intra/inter/bcast sub-collectives for this handle.
+
+        Pure structural extraction of the sub-collective construction tail of
+        ``__init__`` (single-node AllgatherSdma vs the multi-node intra-gather
+        + inter-ring [+ leader-only broadcast] pipeline, plus the deferred
+        slice_direct transport probe). Reads only the listed ctor args and the
+        already-set ``self.*`` topology/flag attrs; writes only ``self.*``."""
         if self.num_nodes == 1:
             # M1: single node -> a plain intra-node SDMA AllGather over all
             # local ranks is exactly the full AllGather.
@@ -1670,7 +1607,7 @@ class HierAllGather:
             # overlap logic) so two resident entries are always distinct live
             # buffers. Insertion-ordered dict = the LRU. Cap via env (default 4;
             # 0/1 restores single-entry behavior). Value = size (for bookkeeping).
-            self._reg_cache_cap = int(os.environ.get("MORI_HIER_REG_CACHE", "4"))
+            self._reg_cache_cap = _env_int("MORI_HIER_REG_CACHE", "4")
             self._direct_reg_lru = {}
 
             # resolve the deferred slice_direct default by
@@ -1974,12 +1911,7 @@ class HierAllGather:
         # Skip the capture attempt entirely when a known host-op mode is active so
         # the path degrades to a clean eager fallback. Byte-identical on every
         # default/E2E path (none set HOSTPROXY_REASM); env still overrides.
-        _hp_host_ops = os.environ.get("MORI_HIER_HOSTPROXY_REASM", "0") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
+        _hp_host_ops = _env_true("MORI_HIER_HOSTPROXY_REASM", "0")
         if (
             os.environ.get("MORI_HIER_CUDA_GRAPH", "1").strip().lower()
             in ("1", "true", "yes", "on")
@@ -2313,8 +2245,7 @@ class HierAllGather:
         _all_coherent = (
             self.num_nodes > 1
             and not self._debug_sync
-            and os.environ.get("MORI_HIER_ALL_COHERENT", "0")
-            not in ("0", "", "false", "False")
+            and _env_true("MORI_HIER_ALL_COHERENT", "0")
         )
         if _all_coherent:
             from ..shmem import shmem_barrier_on_stream
@@ -2770,7 +2701,7 @@ class HierAllGather:
         # engages fuse_local, so path_key is deterministic per size (not a per-op
         # selection race), and the residual is the fixed per-op startup cost rather
         # than a per-NIC fill deficit.
-        if os.environ.get("MORI_HIER_PATH_LOG", "0") not in ("0", "", "false", "False"):
+        if _env_true("MORI_HIER_PATH_LOG", "0"):
             print(
                 "[hier_path] bytes=%d path=%s slice_direct=%s fuse_local=%s "
                 "slice_fused=%s slice_oop=%s slice_overlap=%s pipe_chunks=%d "
@@ -3301,12 +3232,7 @@ class HierAllGather:
                         # root embed/lm_head AG actually pipelines (depth>1) or falls to
                         # the crown whole-chunk fence (depth==1). Diagnostic only; env-
                         # gated, no effect on the shipped path.
-                        if os.environ.get("MORI_HIER_DP_DEBUG", "") not in (
-                            "",
-                            "0",
-                            "false",
-                            "False",
-                        ):
+                        if _env_true("MORI_HIER_DP_DEBUG", ""):
                             _dbg = getattr(self, "_dp_dbg_seen", None)
                             if _dbg is None:
                                 _dbg = self._dp_dbg_seen = set()
@@ -3330,11 +3256,7 @@ class HierAllGather:
                         # min(numQp, 8)), so chunkReadyFlags needs numQp slots (>2 the
                         # deep_pipe default). Bump the buffer accordingly; default OFF
                         # leaves _flag_slots byte-identical.
-                        if (
-                            os.environ.get("MORI_HIER_SHARD_DRAIN", "0")
-                            not in ("", "0", "false", "False")
-                            and rb == 1
-                        ):
+                        if _env_true("MORI_HIER_SHARD_DRAIN", "0") and rb == 1:
                             _sw = min(int(self.inter_num_qp), 8)
                             if _sw > _flag_slots:
                                 _flag_slots = _sw
@@ -3385,9 +3307,7 @@ class HierAllGather:
                         # CPU proxy owns the inter leg and publishes
                         # chunkReadyFlags[f] after its send-CQ drains. Build the
                         # producer lazily against THIS PE's ring buffer.
-                        _hp_reasm = os.environ.get(
-                            "MORI_HIER_HOSTPROXY_REASM", "0"
-                        ) not in ("0", "", "false", "False")
+                        _hp_reasm = _env_true("MORI_HIER_HOSTPROXY_REASM", "0")
                         _hp_prod = None
                         if _hp_reasm:
                             _hp_prod = self._get_hostproxy_inter()
@@ -3512,9 +3432,7 @@ class HierAllGather:
                             # proven landing fence), rail-pair barriers, then
                             # publishes chunkReadyFlags[f] so the reassembly runs.
                             chunk_bytes = count * input_data.element_size()
-                            _hp_async = os.environ.get(
-                                "MORI_HIER_HOSTPROXY_ASYNC", "0"
-                            ) not in ("0", "", "false", "False")
+                            _hp_async = _env_true("MORI_HIER_HOSTPROXY_ASYNC", "0")
                             if _hp_async:
                                 # non-blocking: worker owns the inter round-trip
                                 # so the caller keeps issuing / computing while it
@@ -3734,9 +3652,7 @@ class HierAllGather:
                         # the global fence, so fuse_local keeps its ~200 GB/s while
                         # becoming E2E bit-exact. Set MORI_HIER_FUSE_LOCAL_INTRA_BAR=0
                         # to A/B (restores the racy no-barrier path).
-                        _fl_intra_bar = os.environ.get(
-                            "MORI_HIER_FUSE_LOCAL_INTRA_BAR", "1"
-                        ) not in ("0", "", "false", "False")
+                        _fl_intra_bar = _env_true("MORI_HIER_FUSE_LOCAL_INTRA_BAR", "1")
                         remotes = [m for m in range(N) if m != node]
                         if self.reasm_streams > 1 and len(remotes) > 1:
                             # MULTI-STREAM the N-1 remote reassembly gathers
