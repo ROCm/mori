@@ -386,74 +386,28 @@ class HierAllGather:
         if gather_in_place is None:
             gather_in_place = _env_true("MORI_HIER_GATHER_IN_PLACE", "0")
         self.gather_in_place = bool(gather_in_place)
-        # M4: opt-in "out-in-place" -- leave the gathered result in the
-        # inter-node ring buffer and read it via ``result_tensor`` instead of
-        # copying it to a user output (the finish_sync copy-OUT, ~2.7ms @512MiB,
-        #  phase attribution = the single biggest remaining staging fish).
-        # Unlike the copy-IN elimination (validated-NEUTRAL, -24), the ring
-        # kernel ALREADY writes every chunk into the uncached symmetric ring
-        # buffer, so dropping the copy-OUT is a pure saving (no offsetting uncached
-        # write inside the timed op). Implies gather_in_place (the gather writes
-        # straight into the ring slot) so there is ZERO staging on either side.
-        # Default OFF: the proven staged path (writes the user output) stays the
-        # default; out-in-place changes the result-delivery contract (read
-        # ``result_tensor``), so it is opt-in only.
-        # True cross-node A/B (N=2 G=4 fp32 64MiB/rank, both bit-exact vs
-        # torch.all_gather_into_tensor):
-        #   default (copy-OUT)  8.366ms 64.2 GB/s
-        #   out-in-place        8.152ms 65.9 GB/s   (+2.6%)
-        #   rccl                3.574ms 150.2 GB/s
-        # IMPORTANT CORRECTION to the ~2.7ms projection above: removing BOTH
-        # staging copies saves only ~0.2ms end-to-end, NOT ~2.7ms. The
-        # phase attribution timed prepare/finish_sync as isolated Python calls
-        # (each with its own stream-sync + ShmemBarrierAll); those D2D copies do
-        # NOT serialize on the critical path the way the isolated timing implied
-        # (they overlap with the ring's own sync/barrier traffic). So the staging
-        # copies are a near-dead lever on this per-GPU-NIC topology; the ~2.4x
-        # RCCL gap is dominated by per-NIC ring fill, not staging. out-in-place
-        # stays opt-in (tiny positive win, but changes the read contract).
+        # Opt-in "out-in-place": leave the gathered result in the inter-node ring
+        # buffer and read it via ``result_tensor`` instead of copying it to a user
+        # output. Implies gather_in_place (the gather writes straight into the ring
+        # slot) so there is zero staging on either side. Default OFF: the staged
+        # path (writes the user output) stays the default -- out-in-place changes
+        # the result-delivery contract (read ``result_tensor``) and was measured a
+        # tiny (~+2.6%) win only, so it is opt-in via MORI_HIER_OUT_IN_PLACE.
         if out_in_place is None:
             out_in_place = _env_true("MORI_HIER_OUT_IN_PLACE", "0")
         self.out_in_place = bool(out_in_place)
-        # M4: opt-in "fuse-barrier" -- drop the intra-node SDMA gather's
-        # finish ShmemBarrierAll in the every-rank-direct N>=2 path. The default
-        # path runs 4 global barriers/op (intra prepare+finish, inter prepare+
-        # finish); 's BW-vs-size sweep found a ~1.1ms fixed per-op floor
-        # (3 kernel launches + collective barriers + stream syncs) that dominates
-        # small/mid sizes (18x gap @4KiB vs 2.34x @64MiB vs RCCL ~0.067ms floor).
-        # The intra finish barrier is REDUNDANT here: the PUSH gather's in-kernel
-        # flag-wait (oneshot_sdma_kernel.hpp:196) already makes this PE's node-
-        # block complete on kernel return, and the inter ring's prepare_sync
+        # "fuse-barrier": drop the intra-node SDMA gather's finish ShmemBarrierAll
+        # in the every-rank-direct N>=2 path (removes 1 of 4 global barriers/op).
+        # CORRECTNESS INVARIANT: the dropped intra finish barrier is redundant --
+        # the PUSH gather's in-kernel flag-wait already makes this PE's node-block
+        # complete on kernel return, and the inter ring's prepare_sync
         # ShmemBarrierAll immediately follows to synchronize all PEs before the
-        # ring's cross-PE atomics -- so dropping the intra finish barrier removes
-        # 1 of 4 barriers with no correctness loss. Flags are monotonic (per-call
-        # token, no reset) so there is no cross-call flag hazard either. Default
-        # OFF (env MORI_HIER_FUSE_BARRIER); applies only to the every-rank-direct
-        # path (not leader-only).
-        #
-        # True cross-node A/B (RDMA, N=2 G=4 fp32,
-        # both bit-exact vs torch.all_gather_into_tensor):
-        #   size    default(min)  fuse(min)   delta
-        #   4KiB    1.110ms       0.993ms     -10.5%
-        #   64KiB   1.140ms       0.976ms     -14.4%
-        #   4MiB    1.610ms       1.364ms     -15.3%
-        #   64MiB   8.629ms       8.364ms      -3.1%
-        # => removing 1 of 4 global ShmemBarrierAll/op cuts the FIXED per-op floor
-        # ~1.11ms -> ~0.98ms (~0.13ms = one barrier). A real win in the small/mid
-        # regime  localized (overhead-bound: ~15% at <=4MiB), shrinking to
-        # noise at 64MiB where the per-NIC RDMA transport dominates. Bit-exact
-        # holds because the PUSH gather's in-kernel flag-wait + the following inter
-        # prepare barrier together cover the dropped barrier. The remaining floor
-        # (~0.98ms vs RCCL ~0.065ms) is the other 3 barriers + 3 kernel launches +
-        # stream syncs -- further cuts need kernel/launch fusion (a larger change).
-        # DEFAULT ON since : the fuse-barrier win is proven bit-exact
-        # (true xnode N=2,G=4, 4 dtypes x 4 sizes, ) AND crash-safe (the
-        # _prev_op_completed guard keeps the entry barrier on first op / after any
-        # mid-pipeline exception, ). The dropped barriers are redundant
-        # (covered by the PUSH gather's in-kernel flag-wait + the inter ring's
-        # prepare barrier), output is byte-identical, and it removes ~40% of the
-        # small/mid per-op floor. Set MORI_HIER_FUSE_BARRIER=0 to disable (e.g.
-        # for A/B benchmarking against the pre-fuse baseline).
+        # ring's cross-PE atomics; flags are monotonic per-call (no reset) so there
+        # is no cross-call flag hazard. Crash-safe via the _prev_op_completed guard
+        # (keeps the entry barrier on first op / after any mid-pipeline exception).
+        # Default ON (bit-exact, cuts ~40% of the small/mid per-op floor); applies
+        # only to the every-rank-direct path (not leader-only). Set
+        # MORI_HIER_FUSE_BARRIER=0 to restore the pre-fuse baseline for A/B.
         if fuse_barrier is None:
             fuse_barrier = _env_true("MORI_HIER_FUSE_BARRIER", "1")
         self.fuse_barrier = bool(fuse_barrier)
