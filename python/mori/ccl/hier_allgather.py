@@ -54,7 +54,6 @@ the default path.
 
 import os
 import socket
-import sys
 from typing import List, Optional, Sequence
 
 import torch

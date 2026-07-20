@@ -1376,7 +1376,7 @@ inline __device__ void ShmemInternalBarrierHierBlock(int ranksPerNode) {
     // area. The PEER inbox spans [HIER_PEER_BASE, HIER_LOCAL_BASE) and the LOCAL
     // inbox spans [HIER_LOCAL_BASE, HIER_REL_SLOT); exceeding either would alias
     // an adjacent region and corrupt the barrier.
-    constexpr int HIER_MAX_NODES = HIER_LOCAL_BASE - HIER_PEER_BASE;         // 16
+    constexpr int HIER_MAX_NODES = HIER_LOCAL_BASE - HIER_PEER_BASE;          // 16
     constexpr int HIER_MAX_RANKS_PER_NODE = HIER_REL_SLOT - HIER_LOCAL_BASE;  // 8
 
     int numNodes = n_pes / ranksPerNode;
