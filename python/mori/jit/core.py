@@ -301,6 +301,14 @@ def _disp_notify_defines() -> list[str]:
     return ["-DMORI_DISP_NOTIFY"] if val.lower() in ("1", "true", "on", "yes") else []
 
 
+def _disp_timing_defines() -> list[str]:
+    """Diagnostic: -DMORI_DISP_TIMING enables in-kernel wall_clock64 breakdown of
+    the EP IntraNode dispatch (NOTIFY phase costs / legacy per-token remote-atomic
+    total). Gated by the MORI_DISP_TIMING env so normal builds are unperturbed."""
+    val = os.environ.get("MORI_DISP_TIMING", "")
+    return ["-DMORI_DISP_TIMING"] if val.lower() in ("1", "true", "on", "yes") else []
+
+
 def _ocp_fp_defines(arch: str) -> list[str]:
     """Enable the native gfx950 OCP FP4/FP8 conversion instructions (cvt_scalef32_pk_*) used by
     the fp4_blockwise combine's E2M1 quant/dequant helpers. Without this the helpers fall back to
@@ -441,6 +449,7 @@ def _hipcc_genco(
         *_ocp_fp_defines(cfg.arch),
         *_disp_tdm_defines(),
         *_disp_notify_defines(),
+        *_disp_timing_defines(),
     ]
 
     for d in include_dirs:

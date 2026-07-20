@@ -189,6 +189,20 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     const uint64_t xdevFlag = args.crossDeviceBarrierFlag[0];
     uint32_t barExp = 0;
 
+#if defined(MORI_DISP_TIMING)
+    // In-kernel wall_clock64 breakdown of the NOTIFY dispatch, captured by ONE
+    // representative thread (rank0/block0/thd0). Segments: [0]count+setup,
+    // [1]matrix-exchange+xdev-barrier#1, [2]prefix-sum+grid-barrier, [3]payload
+    // send (Pass B), [4]final fence+xdev-barrier#2.
+    const bool _tThd = (myPe == 0 && blockIdx.x == 0 && thdId == 0);
+    long long _tp[6];
+    int _tn = 0;
+#define TSTAMP() do { if (_tThd) _tp[_tn++] = wall_clock64(); } while (0)
+#else
+#define TSTAMP()
+#endif
+    TSTAMP();  // [0] entry
+
     // zero local per-destPe counter
     for (int d = globalThdId; d < npes; d += totalThreads) localCnt[d] = 0;
     barExp += gridDim.x;
@@ -223,6 +237,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     }
     barExp += gridDim.x;
     NotifyGridBarrier(args.dispatchGridBarrier, barExp);
+    TSTAMP();  // [1] after Pass A count + grid barrier
 
     // ---- Exchange: block 0 writes my count row to every peer's matrix[myPe][*] ----
     if (blockIdx.x == 0 && warpId == 0) {
@@ -233,6 +248,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     }
     __threadfence_system();
     CrossDeviceBarrierIntraNodeKernel(args, xdevFlag);
+    TSTAMP();  // [2] after matrix exchange + cross-device barrier #1
 
     // ---- Compute base[destPe] = sum_{s<myPe} M[s][destPe]; recvCount; reset localCnt ----
     if (globalThdId < npes) {
@@ -249,6 +265,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     }
     barExp += gridDim.x;
     NotifyGridBarrier(args.dispatchGridBarrier, barExp);
+    TSTAMP();  // [3] after prefix-sum base compute + grid barrier
 
     // ---- Pass B: send payload with LOCAL slot assignment inside the region ----
     if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
@@ -300,11 +317,25 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
     }
 
+    TSTAMP();  // [4] after Pass B payload send
+
     // Make all payload/metadata writes visible to peers, then cross-device barrier
     // so combine (next kernel) observes the dispatched data.
     __threadfence_system();
     CrossDeviceBarrierIntraNodeKernel(args, xdevFlag + 1);
     if (globalThdId == 0) *args.dispatchGridBarrier = 0;  // reset for next launch
+    TSTAMP();  // [5] after final fence + cross-device barrier #2
+#if defined(MORI_DISP_TIMING)
+    if (_tThd) {
+      long long tk = _tp[5] - _tp[0];
+      printf(
+          "[NOTIFY-TIMING] tot=%lld tk | count=%lld exch+xbar1=%lld prefix+bar=%lld "
+          "sendB=%lld fence+xbar2=%lld tk\n",
+          tk, _tp[1] - _tp[0], _tp[2] - _tp[1], _tp[3] - _tp[2], _tp[4] - _tp[3],
+          _tp[5] - _tp[4]);
+    }
+#endif
+#undef TSTAMP
 #ifdef ENABLE_STANDARD_MOE_ADAPT
     if constexpr (EnableStdMoE) {
       InvokeConvertDispatchOutput<T>(args, myPe);
@@ -319,6 +350,15 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   MORI_TRACE_SEQ(seq, profiler);
   MORI_TRACE_NEXT(seq, Slot::DispatchSendTokens);
 
+#if defined(MORI_DISP_TIMING)
+  // Accumulate, on ONE representative warp lane (rank0/globalWarp0/lane0), the
+  // total wall time spent in the per-token SYSTEM-scope remote slot atomic vs the
+  // hidden-dim payload copy, to weigh "atomics vs data movement" in the legacy path.
+  const bool _tThd = (myPe == 0 && globalWarpId == 0 && laneId == 0);
+  long long _atomAcc = 0, _copyAcc = 0, _loopT0 = 0, _loopT1 = 0;
+  int _atomCnt = 0, _copyCnt = 0;
+  if (_tThd) _loopT0 = wall_clock64();
+#endif
   if (args.tokenIndices && args.inpTokenBuf) {
     // Phase1: send token
     // Each warp compute token offset on destinition PE
@@ -381,9 +421,15 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
             // so concurrent senders can get the same destTokId -> slot collision ->
             // corrupt dispatch (map/payload disagree). Matches v2's system-scope
             // atomic_add_global.
+#if defined(MORI_DISP_TIMING)
+            long long _a0 = _tThd ? wall_clock64() : 0;
+#endif
             destTokId = __hip_atomic_fetch_add(
                 args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1,
                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#if defined(MORI_DISP_TIMING)
+            if (_tThd) { _atomAcc += wall_clock64() - _a0; _atomCnt++; }
+#endif
             assert(destTokId < config.MaxNumTokensToRecv() &&
                    "Total recv token overflow: increase maxTotalRecvTokens");
             atomicAdd(args.destPeTokenCounter + destPe, 1);
@@ -463,6 +509,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         // higher per-access latency of the CCO peer path; matches the v2/FlyDSL
         // multi-stream copy that keeps dispatch fast.
         MORI_TRACE_SPAN(profiler, Slot::DispTokenCopy);
+#if defined(MORI_DISP_TIMING)
+        long long _c0 = _tThd ? wall_clock64() : 0;
+#endif
 #if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
         // Inline TDM copy (exact tdm_ep4_dispatch pattern): build the descriptor
         // locally each token, LOAD src->tile, wait, wave barrier, STORE tile->peer, wait.
@@ -493,9 +542,22 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
             args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
             args.inpTokenBuf + srcTokOffset, hiddenDim);
 #endif
+#if defined(MORI_DISP_TIMING)
+        if (_tThd) { _copyAcc += wall_clock64() - _c0; _copyCnt++; }
+#endif
       }
     }
   }
+#if defined(MORI_DISP_TIMING)
+  if (_tThd) {
+    _loopT1 = wall_clock64();
+    printf(
+        "[ATOMIC-TIMING] warp0 loop=%lld tk | remoteAtomic: n=%d sum=%lld avg=%lld tk | "
+        "payloadCopy: n=%d sum=%lld avg=%lld tk\n",
+        _loopT1 - _loopT0, _atomCnt, _atomAcc, _atomCnt ? _atomAcc / _atomCnt : 0,
+        _copyCnt, _copyAcc, _copyCnt ? _copyAcc / _copyCnt : 0);
+  }
+#endif
   __syncthreads();
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
