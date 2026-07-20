@@ -2533,34 +2533,6 @@ class HierAllGather:
             self._prev_op_completed = False
         self._last_use_slice = path_key
 
-        # Path diagnostic (default-inert, bit-exact): prints the chosen path plus
-        # fuse/slice/pipe state per call when MORI_HIER_PATH_LOG is set; zero effect
-        # on the shipped path otherwise. An apparent "bimodal" large-buffer result
-        # (fast fan-out vs a serial floor) is just fuse_local ON vs OFF: the floor
-        # is the serial fuse_local=OFF slice_direct path. standalone_fast already
-        # engages fuse_local, so path_key is deterministic per size (not a per-op
-        # selection race), and the residual is the fixed per-op startup cost rather
-        # than a per-NIC fill deficit.
-        if _env_true("MORI_HIER_PATH_LOG", "0"):
-            print(
-                "[hier_path] bytes=%d path=%s slice_direct=%s fuse_local=%s "
-                "slice_fused=%s slice_oop=%s slice_overlap=%s pipe_chunks=%d "
-                "num_blocks=%d numQp=%d"
-                % (
-                    byte_count,
-                    path_key,
-                    getattr(self, "slice_direct", None),
-                    getattr(self, "fuse_local", None),
-                    self.slice_fused,
-                    self.slice_oop,
-                    self.slice_overlap,
-                    self.slice_pipe_chunks,
-                    self.inter_num_blocks,
-                    self.inter_num_qp,
-                ),
-                flush=True,
-            )
-
         if use_slice or use_pipe_band:
             # M5: SLICED 2-D AllGather (the bandwidth lever; see __init__).
             # Phase A (inter, RDMA ring): every rank rings ONLY its own shard
