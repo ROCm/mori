@@ -35,6 +35,21 @@ The SDMA AllGather moves bytes in uint32 lanes regardless of the logical
 dtype, so as long as each rank's contribution is a multiple of 4 bytes the
 byte layout is identical to torch's concatenation -- hence bit-exact for
 bf16/fp16/fp32/int32.
+
+Default shipped path (no ``MORI_HIER_*`` env set)
+-------------------------------------------------
+A caller that constructs ``HierAllGather`` with no env overrides gets the
+sliced 2-D path (``slice_inter``) with fused Phase-B (``slice_fused``),
+stream-ordered ring/intra barriers (``stream_ring``/``stream_intra``) and
+deferred finish fences (``slice_defer_fin``/``slice_defer_inter_fin``), the
+serial ``slice_direct`` reassembly gather, and CU-domain copy-out
+(``_py_cu_copyout``). At ``ranks_per_node >= 8`` the two cross-PE finish fences
+are forced ON for bit-exactness (see ``_apply_dense_node_defaults``). The fused
+``ring || local-gather`` kernel (``fuse_local``) is OFF by default (E2E-unstable;
+standalone-only). Every ``MORI_HIER_*`` flag is an opt-in A/B lever with an env
+override; see ``examples/fsdp_sdma/README.md`` for the shipped-vs-experimental
+table. This module docstring and that README are the single source of truth for
+the default path.
 """
 
 import os
