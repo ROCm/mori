@@ -555,10 +555,14 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   // would race/double-consume the send drainer on a shared ring. Give the QP a
   // genuinely SEPARATE recv CQ so recv-CQEs land on their own ring with an
   // independent consumer. Gated (default off) => shipped path byte-identical.
-  static const bool kSepRecvCq = [] {
+  static const bool kSepRecvCqEnv = [] {
     const char* e = getenv("MORI_MLX5_SEP_RECV_CQ");
     return e && e[0] == '1';
   }();
+  // Honor the per-endpoint request (config.dedicatedRecvCq, set e.g. by the
+  // WRITE_WITH_IMM ring path) OR'd with the global env override. Shipped path
+  // leaves both unset => recvCq == nullptr => byte-identical.
+  const bool kSepRecvCq = config.dedicatedRecvCq || kSepRecvCqEnv;
   // Non-collapsed (collapsed=false): recv-CQEs land in successive slots with a
   // per-wrap owner bit so PollRecvCqImm can reap one CQE per WRITE_WITH_IMM.
   Mlx5CqContainer* recvCq =
