@@ -333,6 +333,17 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 
     // ---- Pass B: send payload with LOCAL slot assignment inside the region ----
 #if defined(MORI_DISP_TIMING)
+    // Per-warp deltas accumulate into per-BLOCK shared counters first, and only
+    // one atomicAdd per block hits the device-global at the end -- this keeps
+    // the global atomic's contention at ~gridDim.x hits/launch instead of
+    // ~totalWarps hits/launch, which matters a lot for Pass B: its warps finish
+    // near-synchronized (right after the preceding grid barrier), so a
+    // per-warp global atomicAdd here was itself becoming a thundering-herd
+    // contention hotspot that swamped the very timing being measured.
+    __shared__ unsigned long long _sCopySum;
+    __shared__ unsigned int _sCopyCnt;
+    if (thdId == 0) { _sCopySum = 0; _sCopyCnt = 0; }
+    __syncthreads();
     long long _wCopyAcc = 0;
     int _wCopyCnt = 0;
 #endif
@@ -404,8 +415,13 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     }
 #if defined(MORI_DISP_TIMING)
     if (laneId == 0 && _wCopyCnt > 0) {
-      atomicAdd(&g_dispCopyTimeSum, (unsigned long long)_wCopyAcc);
-      atomicAdd(&g_dispCopyCount, (unsigned long long)_wCopyCnt);
+      atomicAdd(&_sCopySum, (unsigned long long)_wCopyAcc);
+      atomicAdd(&_sCopyCnt, (unsigned int)_wCopyCnt);
+    }
+    __syncthreads();
+    if (thdId == 0 && _sCopyCnt > 0) {
+      atomicAdd(&g_dispCopyTimeSum, _sCopySum);
+      atomicAdd(&g_dispCopyCount, (unsigned long long)_sCopyCnt);
     }
 #endif
 
@@ -467,6 +483,17 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   long long _atomAcc = 0, _copyAcc = 0, _loopT0 = 0, _loopT1 = 0, _pN = 0, _pR = 0;
   int _atomCnt = 0, _copyCnt = 0;
   long long _atomDs[32];  // per-atomic wall delta (critical-path latency)
+  // Whole-grid copy-time rollup: per-warp deltas land in a per-BLOCK shared
+  // counter first, one atomicAdd/block into the device-global at the end --
+  // keeps global-atomic contention at ~gridDim.x hits/launch, not
+  // ~totalWarps hits/launch (see the matching comment in the NOTIFY Pass B
+  // block for why a per-warp global atomic here would distort the timing).
+  __shared__ unsigned long long _sCopySum;
+  __shared__ unsigned int _sCopyCnt;
+  if (thdId == 0) { _sCopySum = 0; _sCopyCnt = 0; }
+  __syncthreads();
+  long long _wCopyAcc = 0;
+  int _wCopyCnt = 0;
 #endif
 #if defined(MORI_DISP_PREBARRIER)
   // BURST TEST: force ALL blocks to start the send loop simultaneously via a grid
@@ -489,11 +516,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #endif
 #if defined(MORI_DISP_TIMING)
   if (_tThd) _loopT0 = wall_clock64();
-  // Whole-grid (every warp, not just the sampled _tThd) copy-time accumulation,
-  // rolled into device-global counters once per warp after the loop so the
-  // printed mean reflects the true population instead of one sampled warp.
-  long long _wCopyAcc = 0;
-  int _wCopyCnt = 0;
 #endif
   if (args.tokenIndices && args.inpTokenBuf) {
     // Phase1: send token
@@ -689,11 +711,17 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #if defined(MORI_DISP_TIMING)
   if (_tThd) _loopT1 = wall_clock64();  // block0 send loop done (pre-syncthreads)
   if (laneId == 0 && _wCopyCnt > 0) {
-    atomicAdd(&g_dispCopyTimeSum, (unsigned long long)_wCopyAcc);
-    atomicAdd(&g_dispCopyCount, (unsigned long long)_wCopyCnt);
+    atomicAdd(&_sCopySum, (unsigned long long)_wCopyAcc);
+    atomicAdd(&_sCopyCnt, (unsigned int)_wCopyCnt);
   }
 #endif
   __syncthreads();
+#if defined(MORI_DISP_TIMING)
+  if (thdId == 0 && _sCopyCnt > 0) {
+    atomicAdd(&g_dispCopyTimeSum, _sCopySum);
+    atomicAdd(&g_dispCopyCount, (unsigned long long)_sCopyCnt);
+  }
+#endif
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
   // Send token num & token to expert mapping to other ranks
