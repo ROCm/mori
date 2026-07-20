@@ -21,6 +21,9 @@ const REPLAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
     pub worker_id: String,
+    /// The worker's KV-transfer address, forwarded on every apply batch so the
+    /// indexer can answer MatchExternalKv with an address. Empty if unset.
+    pub worker_address: String,
     pub event_endpoint: String,
     pub event_replay_endpoint: Option<String>,
     pub event_topic: String,
@@ -32,6 +35,7 @@ impl BridgeConfig {
     pub fn from_env() -> Result<Self, BridgeError> {
         let worker_id = std::env::var("KV_INDEXER_WORKER_ID")
             .map_err(|_| BridgeError::Config("KV_INDEXER_WORKER_ID is required".to_string()))?;
+        let worker_address = std::env::var("KV_INDEXER_WORKER_ADDRESS").unwrap_or_default();
         let event_endpoint = std::env::var("SGLANG_KV_EVENT_ENDPOINT")
             .unwrap_or_else(|_| "tcp://127.0.0.1:5557".to_string());
         let event_replay_endpoint = std::env::var("SGLANG_KV_EVENT_REPLAY_ENDPOINT").ok();
@@ -45,6 +49,7 @@ impl BridgeConfig {
 
         Ok(Self {
             worker_id,
+            worker_address,
             event_endpoint,
             event_replay_endpoint,
             event_topic,
@@ -472,6 +477,7 @@ fn build_apply_request(
         worker_id: config.worker_id.clone(),
         seq,
         actions,
+        worker_address: config.worker_address.clone(),
     }
 }
 
@@ -678,6 +684,7 @@ mod tests {
     fn test_config(clear_tiers: Vec<i32>) -> BridgeConfig {
         BridgeConfig {
             worker_id: "worker-1".to_string(),
+            worker_address: "127.0.0.1:9000".to_string(),
             event_endpoint: "tcp://127.0.0.1:5557".to_string(),
             event_replay_endpoint: None,
             event_topic: "kv-events".to_string(),
@@ -725,6 +732,13 @@ mod tests {
         let request = request_of(&config, 42, vec![stored(&[1], "GPU")]);
         assert_eq!(request.worker_id, "worker-1");
         assert_eq!(request.seq, 42);
+    }
+
+    #[test]
+    fn request_carries_worker_address() {
+        let config = test_config(vec![hbm()]);
+        let request = request_of(&config, 0, vec![stored(&[1], "GPU")]);
+        assert_eq!(request.worker_address, "127.0.0.1:9000");
     }
 
     #[test]

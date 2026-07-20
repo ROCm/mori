@@ -63,6 +63,10 @@ message ApplyExternalKvBatchRequest {
   // the indexer does not gate ordering on it (the bridge is the seq authority).
   uint64 seq = 2;
   repeated ExternalKvAction actions = 3;
+  // The worker's KV-transfer address, used to populate MatchExternalKvResponse.
+  // Supplied by the bridge; may be empty (e.g. legacy callers that never set it),
+  // in which case matches for this worker carry an empty address.
+  string worker_address = 4;
 }
 
 // Empty for now; reserved so an ack (e.g. last_applied_seq) can be added later
