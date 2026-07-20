@@ -1240,30 +1240,14 @@ class HierAllGather:
                     num_blocks=self.inter_num_blocks,
                 )
             else:
-                # Leader-only (M4, DESIGN's primary design): only local_rank==0
-                # (the node-leader) rings over the node-leaders {0,G,2G,...} into
-                # a staging buffer, then SDMA-broadcasts the full N*G output to
-                # its G local ranks over XGMI. Cuts inter-node NIC traffic ~G x
-                # (1 node-block/node instead of G).
-                #
-                # Validated negative on true cross-node RDMA
-                # (N=2 G=4, fp32 64MiB/rank,
-                # both bit-exact): leader-only 29.8 GB/s vs
-                # every-rank-direct 63.8 GB/s -> 2.1x SLOWER. Reason: these MI355X
-                # nodes have ONE ionic NIC PER GPU (8/node). The "G x
-                # redundant NIC traffic" framing is misleading -- the per-NIC
-                # byte load is IDENTICAL for both designs (each ring member, leader
-                # or not, pushes (N-1) chunks of G*count over ITS OWN NIC).
-                # every-rank-direct runs G rings on G distinct NICs in parallel
-                # (the extra bytes ride extra NICs, so per-NIC time is unchanged),
-                # whereas leader-only funnels everything through the leader's
-                # SINGLE NIC and then pays an extra serial XGMI broadcast hop ->
-                # strictly worse. So the bottleneck on this topology is per-NIC
-                # BW x NIC-count, not aggregate fabric bytes; leader-only helps
-                # only on topologies with fewer NICs than GPUs/node. Kept opt-in
-                # (default every-rank-direct) for those topologies; do NOT make it
-                # the default here. The ~2.4x gap vs RCCL (63.8 vs ~152) is NOT
-                # closed by leader-only.
+                # Leader-only (experimental, opt-in): only local_rank==0 (the
+                # node-leader) rings over the node-leaders {0,G,2G,...} into a
+                # staging buffer, then SDMA-broadcasts the full N*G output to its G
+                # local ranks over XGMI. Default is every-rank-direct: on this
+                # topology (one NIC per GPU) leader-only funnels all inter-node
+                # traffic through the leader's single NIC plus an extra serial XGMI
+                # hop and measures ~2x slower, so it only helps on topologies with
+                # fewer NICs than GPUs/node. Kept opt-in; do NOT make it default here.
                 #
                 # ShmemMalloc (handle ctor) and ShmemBarrierAll (prepare/finish)
                 # are COLLECTIVE over ALL PEs, so every PE must construct a ring
