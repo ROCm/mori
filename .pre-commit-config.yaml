@@ -74,3 +74,13 @@ repos:
       - id: cmakelint
         args: [--config=./tools/codestyle/.cmakelintrc]
         exclude: '.*CMakeLists\.txt$'
+  # For Rust files (sglang-kv-indexer). Runs inside the crate so the pinned
+  # toolchain in sglang-kv-indexer/rust-toolchain.toml is picked up.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt (sglang-kv-indexer)
+        entry: bash -c 'command -v cargo >/dev/null || { echo "cargo not found - commit Rust changes inside the dev container"; exit 1; }; cd sglang-kv-indexer && cargo fmt'
+        language: system
+        files: ^sglang-kv-indexer/.*\.rs$
+        pass_filenames: false
