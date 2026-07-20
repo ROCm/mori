@@ -3103,31 +3103,23 @@ class HierAllGather:
                                 os.environ.get("MORI_SDMA_NUM_CHANNELS", "2"),
                             )
                         )
-                        # NOTE: the fused-remote reassembly worker drives
-                        # SDMA queue q = (j+1) % nq_physical (kernel, ccl_kernels.hip
-                        # qId=j+1) while the local-block CTA owns queue 0. nq>=2 is
-                        # REQUIRED so the reasm worker lands on queue 1, not queue 0
-                        # (at physical nq==1 the modulo aliases onto queue 0 -> the
-                        # two share one per-queue signal counter -> an intermittent
-                        # liveness HANG, reproduced this turn via a 32MB->64MB size
-                        # transition). The physical queue count is fixed at shmem/
-                        # anvil init (BEFORE this op runs and before HierAllGather
+                        # INVARIANT (nq>=2 required): the fused-remote reassembly
+                        # worker drives SDMA queue q = (j+1) % nq_physical (kernel
+                        # ccl_kernels.hip qId=j+1) while the local-block CTA owns
+                        # queue 0. At physical nq==1 the modulo aliases onto queue 0,
+                        # so both share one per-queue signal counter -> intermittent
+                        # liveness HANG. The physical queue count is fixed at shmem/
+                        # anvil init (before this op and before HierAllGather
                         # __init__), so it can only be corrected by setting
                         # MORI_SDMA_NUM_CHANNELS>=2 up front; mori's library default
                         # (anvil::GetSdmaNumChannels) is already 2 (E2E/FSDP is safe).
-                        # bench_sweep formerly forced 1 -> fixed this turn.
-                        # T3 (A): AUTO-SCALE the reassembly tail to the available SDMA
-                        # engines. The reassembly TAIL (SDMA drain after the last inter
-                        # RDMA land, HIERPROF ~40-45% of the giant-AG wall) runs on
-                        # queues [1, reasm]; with the historical default reasm=1 it is
-                        # SINGLE-ENGINE (~50 GB/s) -- the documented 0.90x/128MB device
-                        # wall. Defaulting reasm to (nq-1) makes raising
-                        # MORI_SDMA_NUM_CHANNELS automatically fan the tail across ALL
-                        # spare engines via the existing SPATIAL split (rb==1,DP<=1,
-                        # effReasm>1), the on-thesis large-buffer BW lever. Byte-
-                        # identical at the default nq=2 (reasm still clamps to 1); the
-                        # E2E giant-AG path runs nq=2 so it is unaffected. Explicit
-                        # MORI_HIER_REASSEM_BLOCKS still overrides.
+                        # Default reasm to (nq-1) so the reassembly tail (queues
+                        # [1, reasm]) fans across the spare SDMA engines via the
+                        # existing SPATIAL split (rb==1, DP<=1, effReasm>1) when
+                        # MORI_SDMA_NUM_CHANNELS is raised. Byte-identical at the
+                        # default nq=2 (reasm clamps to 1); the E2E giant-AG path runs
+                        # nq=2 so it is unaffected. Explicit MORI_HIER_REASSEM_BLOCKS
+                        # still overrides.
                         reasm = int(
                             os.environ.get(
                                 "MORI_HIER_REASSEM_BLOCKS", str(max(1, _sdma_nq - 1))
