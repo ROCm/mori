@@ -1066,65 +1066,41 @@ class HierAllGather:
         # (hide the CPU stall behind FSDP prefetch), not a device-fence replacement.
         self._w16_devdrain = _env_true("MORI_HIER_W16_DEVDRAIN", "0")
         # SYNC_BIG: targeted remote-completion fence on ONLY the big cross-node
-        # all-gathers. The residual
-        # fast-path stale reads (~184/384 calls) concentrate in the LARGE
-        # embed/lm_head cross-node AGs (per-rank bytes >> a regular layer); the
-        # many small per-layer AGs converge fine. So instead of a full-op host
-        # sync on EVERY call (DEBUG_SYNC, which forfeits all overlap), host-sync
-        # ONLY when the per-rank payload is >= SYNC_BIG_BYTES. This closes the
-        # remote-landing race exactly where it bites while keeping the ring<->
-        # gather overlap on the numerous small AGs (perf-preserving convergence
-        # fix). Default OFF; threshold 8 MiB/rank cleanly separates embed/lm_head
-        # from the regular transformer-block params for Qwen-class models.
+        # all-gathers (per-rank payload >= SYNC_BIG_BYTES), instead of a full-op
+        # host sync on every call (DEBUG_SYNC forfeits all overlap). Closes the
+        # remote-landing race on the large embed/lm_head AGs while keeping the
+        # ring<->gather overlap on the numerous small AGs. Default OFF; the
+        # 8 MiB/rank threshold separates embed/lm_head from regular transformer
+        # blocks for Qwen-class models.
         self._sync_big = _env_true("MORI_HIER_SYNC_BIG", "0")
         self._sync_big_bytes = _env_int(
             "MORI_HIER_SYNC_BIG_BYTES", str(8 * 1024 * 1024)
         )
-        # SYNC_BIG mode: "host" (default) = host stream.synchronize() on the big
-        # AGs (proven bit-exact but stalls the CPU->GPU pipeline ~23%); "barrier"
-        # = a DEVICE-side cross-PE ShmemBarrierOnStream enqueued on the SAME
-        # stream right after the big AG. The barrier kernel quiesces every PE
-        # (drains the RDMA send-queues => RC remote landing) and system-fences
-        # before releasing, so the FSDP consumer (stream-ordered AFTER it) can
-        # only read the AG output once every peer's remote-half bytes have
-        # physically landed -- the same guarantee host-sync gives, but WITHOUT a
-        # host stall (keeps the ring<->gather + AG<->backward overlap). Targets
-        # ONLY the big embed/lm_head cross-node AGs where the residual
-        # remote-landing race lives.
+        # SYNC_BIG mode (default "host"):
+        #   "host"    = host stream.synchronize() on the big AGs (bit-exact,
+        #               stalls the CPU->GPU pipeline).
+        #   "barrier" = device-side cross-PE ShmemBarrierOnStream on the same
+        #               stream after the big AG; drains RDMA send-queues and
+        #               system-fences before releasing, so the stream-ordered FSDP
+        #               consumer reads only after every peer's remote bytes land --
+        #               same guarantee as host-sync without the host stall.
+        #   "throttle"= records an event after each big AG and host-waits on the
+        #               PREVIOUS event, bounding CPU run-ahead to ~1 step while the
+        #               current big AG still overlaps backward compute.
         self._sync_big_mode = os.environ.get("MORI_HIER_SYNC_BIG_MODE", "host")
-        # SYNC_BIG mode "throttle": a BOUNDED CPU run-ahead throttle. The
-        # residual fast-path loss drift is a
-        # race that ONLY a host stream-drain masks -- yet it is numQp-independent
-        # and every device-side transport fence failed, so it is NOT
-        # an unlanded-RDMA race. That signature = the CPU running arbitrarily far
-        # ahead of the GPU, so the big embed/lm_head AG's true completion drifts
-        # relative to when its consumer is actually enqueued/observed. Full
-        # SYNC_BIG (host-sync the CURRENT big AG) fixes it but stalls the whole
-        # CPU->GPU pipeline (~24%). "throttle" instead records an event AFTER each
-        # big AG and, on the NEXT big AG, host-waits on the PREVIOUS event. That
-        # bounds CPU run-ahead to ~1 step while the CURRENT big AG still overlaps
-        # with backward compute -- so if BUG B is pure run-ahead, this recovers
-        # ground truth at far lower cost than SYNC_BIG. Default OFF (host mode).
         self._sync_big_prev_event = None
-        # DEFERRED host-drain state (SYNC_BIG_MODE=deferhost): the completion
-        # event of the last big AG, host-drained by the harness Work.wait() at
-        # the consume point instead of at issue.
+        # SYNC_BIG_MODE=deferhost state: completion event of the last big AG,
+        # host-drained by the harness Work.wait() at the consume point.
         self._deferred_drain_event = None
         self._deferred_drain_pending = False
-        # DEFERBWD: the in-tree counterpart of the harness-only
-        # MORI_FSDP_DEFER_HOSTSYNC. On this MI300X/mlx5 pair the only reliably
-        # bit-exact landing fence is a host stream round-trip (device fences are
-        # insufficient), and only the backward re-unshard of the big embed/lm_head
-        # AG races its consumer GEMM (the forward big AGs do not). Rather than
-        # host-draining that AG inline (which stalls CPU enqueue mid-step) or
-        # per-AG in the harness (which records an event on every big AG, including
-        # the forward ones), this mode records one completion event on the backward
-        # big AG after its kernel and does not sync here -- the deferred consumer
-        # boundary calls drain_deferbwd() at copy-out, so the host wait overlaps the
-        # backward GEMM and is paid at most once per step. Landing guarantee
-        # identical to an inline host wait (it completes only after the AG kernel
-        # plus copy-engine/NIC work land), so bit-exact by construction. Default OFF
-        # (mode!="deferbwd"); reached via MORI_HIER_SYNC_BIG_MODE=deferbwd.
+        # SYNC_BIG_MODE=deferbwd: in-tree counterpart of the harness-only
+        # MORI_FSDP_DEFER_HOSTSYNC. Only the backward re-unshard of the big
+        # embed/lm_head AG races its consumer GEMM. Records one completion event on
+        # the backward big AG (no sync here); the consumer boundary calls
+        # drain_deferbwd() at copy-out, so the host wait overlaps the backward GEMM
+        # and is paid at most once per step. The event completes only after the AG
+        # kernel plus copy-engine/NIC work land, so bit-exact by construction.
+        # Default OFF (mode != "deferbwd").
         self._deferbwd_event = None
         # Auto-compose SLICE_PIPE_OVERLAP on the deferbwd correct path. Chunking
         # the giant embed/lm_head backward AG's inter ring and overlapping chunk
