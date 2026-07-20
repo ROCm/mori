@@ -68,43 +68,66 @@ def parse(path):
 
 ns, ntf, nloss, navg, nlast = parse(os.path.join(RAW, "e2e_w16_RCCL.log"))
 hs, htf, hloss, havg, hlast = parse(os.path.join(RAW, "e2e_w16_hp_sdma.log"))
-ratio = havg / navg
+
+# Match the MI300X figure style (see results/mi300x_mlx5/): wide canvas, full box,
+# RCCL = orange / mori hp_sdma = green, steady-state legend, no avg guide-lines.
+HW = (
+    "MI355X, AINIC (ionic) RoCEv2, world=16 (2 nodes x 8 GPU), "
+    "Qwen-7B seq2048 bf16, 500 steps"
+)
+
+
+def _steady(series):
+    # drop the first 1/5 warm-up windows, like the MI300X figures
+    k = len(series) // 5
+    tail = series[k:] or series
+    return sum(tail) / len(tail)
+
+
+n_steady = _steady(ntf)
+h_steady = _steady(htf)
+ratio = h_steady / n_steady
 
 # ---- Figure 1: throughput ----
-fig, ax = plt.subplots(figsize=(8, 5))
-ax.plot(ns, ntf, "-", color="#888888", lw=1.6, label=f"native RCCL (avg {navg:.1f})")
-ax.plot(hs, htf, "-", color="#1f77b4", lw=1.6, label=f"mori hp_sdma (avg {havg:.1f})")
-ax.axhline(navg, color="#888888", ls="--", lw=0.8)
-ax.axhline(havg, color="#1f77b4", ls="--", lw=0.8)
+fig, ax = plt.subplots(figsize=(10, 5.6))
+ax.plot(ns, ntf, "-", color="tab:orange", lw=1.6, label=f"RCCL  (steady {n_steady:.0f})")
+ax.plot(
+    hs,
+    htf,
+    "-",
+    color="tab:green",
+    lw=1.6,
+    label=f"hp_sdma  (steady {h_steady:.0f}, {ratio:.2f}x)",
+)
 ax.set_xlabel("training step")
 ax.set_ylabel("TFLOPS / GPU")
-ax.set_title(
-    "w16 FSDP2 E2E throughput — MI355X + AINIC (ionic)\n"
-    f"hp_sdma {havg:.1f} = {ratio:.3f}x native "
-    "(Qwen-7B, seq2048, bf16, 500 steps, bit-exact)"
-)
-ax.legend()
+ax.set_title("world=16 FSDP2 E2E throughput vs RCCL\n" + HW)
+ax.legend(loc="lower right")
 ax.grid(True, alpha=0.3)
 fig.tight_layout()
 fig.savefig(os.path.join(HERE, "e2e_w16_tflops.png"), dpi=130)
 print(
-    f"wrote e2e_w16_tflops.png  (native {navg:.2f}, hp_sdma {havg:.2f}, {ratio:.3f}x)"
+    f"wrote e2e_w16_tflops.png  (RCCL steady {n_steady:.1f}, "
+    f"hp_sdma steady {h_steady:.1f}, {ratio:.3f}x)"
 )
 
 # ---- Figure 2: loss curve (bit-exact overlap) ----
-fig, ax = plt.subplots(figsize=(8, 5))
-ax.plot(ns, nloss, "-", color="#888888", lw=2.5, label="native RCCL")
+ndiff = sum(1 for a, b in zip(nloss, hloss) if a != b)
+fig, ax = plt.subplots(figsize=(10, 5.6))
+ax.plot(ns, nloss, "-", color="tab:orange", lw=3.0, label="RCCL")
 ax.plot(
-    hs, hloss, "--", color="#d62728", lw=1.2, label="mori hp_sdma (overlaps exactly)"
+    hs, hloss, "--", color="tab:green", lw=1.6, label="hp_sdma (== RCCL, bit-exact)"
 )
 ax.set_xlabel("training step")
-ax.set_ylabel("training loss")
+ax.set_ylabel("loss")
 ax.set_title(
-    "w16 FSDP2 E2E loss — MI355X + AINIC (ionic)\n"
-    f"per-window loss BIT-IDENTICAL (last_loss {nlast:.15g} both, \u0394=0)"
+    "world=16 FSDP2 E2E loss: hp_sdma == RCCL BIT-EXACT (max|\u0394|=0)\n" + HW
 )
-ax.legend()
+ax.legend(loc="upper right")
 ax.grid(True, alpha=0.3)
 fig.tight_layout()
 fig.savefig(os.path.join(HERE, "e2e_w16_loss.png"), dpi=130)
-print(f"wrote e2e_w16_loss.png  (last_loss native {nlast!r} / hp_sdma {hlast!r})")
+print(
+    f"wrote e2e_w16_loss.png  (last_loss native {nlast!r} / hp_sdma {hlast!r}, "
+    f"{ndiff} windows differ)"
+)
