@@ -320,6 +320,13 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
           _v4i z4{0,0,0,0}; _v8i z8{0,0,0,0,0,0,0,0};
           const T* _tdmSrcL = args.inpTokenBuf + srcTokOffset;
           T* _tdmDst = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset;
+          // DEBUG: sentinel-fill the tile so we can tell "partial load" (stays
+          // sentinel) from "out-of-tile / zeroed" (becomes 0) after the load.
+          {
+            unsigned short* tp = (unsigned short*)_tdmTile;
+            for (int e = laneId; e < _D; e += warpSize) tp[e] = 0x5a5a;
+            __builtin_amdgcn_wave_barrier();
+          }
           g0.globalAddr((uintptr_t)_tdmSrcL);
           __builtin_amdgcn_tensor_load_to_lds(g0.m_bitfield, g1.m_bitfield, z4, z4, z8, 0);
           __builtin_amdgcn_s_wait_tensorcnt(0);
