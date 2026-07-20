@@ -644,44 +644,18 @@ class HierAllGather:
         # Default OFF (preserves the perf path); set MORI_HIER_PHASEB_ENTRY_BARRIER=1
         # to A/B the accuracy fix and measure its one-barrier/op perf cost.
         self.phaseb_entry_barrier = _env_true("MORI_HIER_PHASEB_ENTRY_BARRIER", "0")
-        # DIRECT-PATH LOCAL-BLOCK OVERLAP. In the shipped
-        # slice_direct path the dominant cost is now Phase B (the XGMI reassembly
-        # gathers ~2.5ms), not Phase A (the sliced RDMA ring ~1.6ms) -- see the
-        # measured phase split. The reassembly gather for the LOCAL
-        # node-block (m == node_id) builds B_{node_id} = concat_g shard[node_id*G+g]
-        # entirely from the G local ranks' OWN inputs (slice_g(B_node_id) ==
-        # this rank's input == collection[node_id]); it has ZERO dependency on the
-        # inter ring. So run it on a SIDE stream CONCURRENTLY with the ring kernel,
-        # hiding ~1/N of Phase B (~1.25ms for N=2) under Phase A (~1.6ms).
-        #
-        # SAFETY (distinct from the pairwise-barrier race): the shipped
-        # non-overlap direct path's SOLE global entry barrier is ALREADY the ring's
-        # prepare_stream ShmemBarrierOnStream (its finish is deferred via
-        # slice_defer_inter_fin and the direct gathers skip their entry barrier via
-        # slice_fuse_ib). We keep that exact barrier model: split the ring into
-        # prepare_stream_only (the global entry barrier, on main) + the kernel/
-        # finish, and launch the local-block gather barrier-free on the side stream
-        # AFTER side.wait_stream(main) (so it observes the entry barrier) and
-        # BEFORE the ring kernel. Only ONE global on-stream fence is ever in flight
-        # (no concurrent-barrier aliasing). Write targets are disjoint (side ->
-        # output block node_id; ring -> collection scratch; main gathers -> output
-        # blocks m != node_id) and the SDMA gather / ring use distinct flag
-        # buffers. Default OFF; toggle MORI_HIER_SLICE_DIRECT_OVERLAP=1.
-        #
-        # Validated neutral on true cross-node RDMA (N=2 G=4 fp32
-        # 64MiB/rank, both bit-exact + dispatch-span):
-        #   overlap ON:  mori 3.802ms 141.2 GB/s | rccl 148.2 | 1.05x
-        #   overlap OFF: mori 3.768ms 142.5 GB/s | rccl 155.8 | 1.09x
-        # => -0.9% mori-side (NEUTRAL/slightly worse; ratio delta is RCCL-draw
-        # noise). The local-block reassembly gather is ALREADY hidden in the
-        # shipped single-stream pipeline (the GPU overlaps the SDMA gather with the
-        # RDMA ring without an explicit side stream -- measurements show the
-        # serial path already overlaps ~0.32ms); forcing it onto a side stream only
-        # adds the side.wait_stream / main.wait_stream merge overhead, which offsets
-        # the recovered overlap. This CLOSES the "overlap Phase A with the local
-        # Phase-B block" lever from the DIRECT-path angle (/7 closed it on the
-        # old copy-OUT path). Kept opt-in so it is not re-litigated; default stays
-        # the shipped serial direct path (~142 GB/s, 1.06x).
+        # DIRECT-PATH LOCAL-BLOCK OVERLAP (experimental, default OFF). Runs the
+        # local node-block (m == node_id) reassembly gather on a side stream
+        # concurrently with the inter ring kernel. The local block builds entirely
+        # from this rank's own input (collection[node_id]) so it has ZERO dependency
+        # on the inter ring. Correctness invariant: keeps the shipped single-fence
+        # barrier model -- the ring's prepare_stream ShmemBarrierOnStream is the SOLE
+        # global entry barrier; the side gather does side.wait_stream(main) after it
+        # and before the ring kernel, so only one global on-stream fence is ever in
+        # flight and write targets stay disjoint (side->output block node_id,
+        # ring->collection scratch, main->output blocks m!=node_id) with distinct
+        # flag buffers. Default OFF: measured neutral (the serial pipeline already
+        # overlaps the gather) so the shipped path stays serial direct.
         self.slice_direct_overlap = _env_true("MORI_HIER_SLICE_DIRECT_OVERLAP", "0")
         # MULTI-STREAM Phase-B reassembly.
         # The N disjoint slice_fused reassembly gathers currently run SERIALLY on
