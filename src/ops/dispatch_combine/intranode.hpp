@@ -314,10 +314,16 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
         __builtin_amdgcn_wave_barrier();
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
-        TdmIssueStore<T>(
-            args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-            _tdmTile, _tdmG1);
+        T* _tdmDst = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset;
+        TdmIssueStore<T>(_tdmDst, _tdmTile, _tdmG1);
         __builtin_amdgcn_s_wait_tensorcnt(0);
+        if (myPe == 0 && srcTokId < 2 && laneId == 0 && (i % config.numExpertPerToken) == 0) {
+          const unsigned short* sp = (const unsigned short*)(args.inpTokenBuf + srcTokOffset);
+          const unsigned short* lp = (const unsigned short*)_tdmTile;
+          const unsigned short* dp = (const unsigned short*)_tdmDst;
+          printf("TDMDBG r0 tok=%d destPe=%d destTok=%d src=%04x,%04x lds=%04x,%04x dst=%04x,%04x\n",
+                 (int)srcTokId, (int)destPe, (int)destTokId, sp[0], sp[1], lp[0], lp[1], dp[0], dp[1]);
+        }
 #else
         core::WarpCopy<T, 8>(
             args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
