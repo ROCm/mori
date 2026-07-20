@@ -53,6 +53,13 @@ option(BUILD_OPS_DEVICE "AOT compile EP kernels to .hsaco(requires hipcc)" OFF)
 option(MORI_MULTITHREAD_SUPPORT
        "Enable single-process multi-thread multi-GPU support in mori_shmem" OFF)
 
+# Experimental: route the EP dispatch token payload through the gfx1250 TDM engine
+# (host launch sizes per-warp LDS tiles). Enable via `MORI_DISP_TDM=1` env at configure.
+if(DEFINED ENV{MORI_DISP_TDM})
+  add_compile_definitions(MORI_DISP_TDM)
+  message(STATUS "MORI_DISP_TDM enabled (TDM dispatch token payload)")
+endif()
+
 # ---------------------------------------------------------------------------
 # Host NIC: all vendor-specific dv libraries (mlx5, bnxt_re, ionic) are loaded
 # at runtime via dlopen. No compile-time library or header detection needed.

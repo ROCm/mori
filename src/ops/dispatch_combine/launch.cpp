@@ -440,6 +440,21 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
 
   unsigned int block_x = WARP_SIZE * wpb;
   int smem = dispatch_shared_mem(handle.config, wpb);
+#ifdef MORI_DISP_TDM
+  // TDM dispatch stages each token payload through ONE per-warp LDS tile; size the
+  // dynamic shared to warpNum * hiddenDim * elemSize (see intranode.hpp). gfx1250
+  // has 320KB LDS/CU, so a 14KB bf16 tile lets ~22 warps/CU stay resident.
+  {
+    int ws = 32;
+    (void)hipDeviceGetAttribute(&ws, hipDeviceAttributeWarpSize, 0);
+    if (ws <= 0) ws = 32;
+    int warpNum = static_cast<int>(block_x) / ws;
+    if (warpNum < 1) warpNum = 1;
+    int hd = (hidden_dim > 0) ? hidden_dim : handle.config.hiddenDim;
+    size_t elem = (dtype == HIP_R_32F) ? 4u : ((dtype == HIP_R_16BF) ? 2u : 1u);
+    smem = warpNum * hd * static_cast<int>(elem);
+  }
+#endif
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(dtype);
   auto& reg = KernelRegistry::Instance();

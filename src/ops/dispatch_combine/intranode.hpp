@@ -33,6 +33,49 @@
 #ifdef ENABLE_PROFILER
 #include "mori/profiler/profiler.hpp"
 #endif
+#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
+#include <hip/amd_detail/amd_gfx1250_TDM.h>
+// Experimental: send the dispatch token payload cross-card via the gfx1250 TDM
+// (tensor global<->LDS DMA) engine instead of core::WarpCopy. Single-buffer: one
+// LDS tile per warp. Per committed token the warp issues an async LOAD src->tile,
+// runs the remote slot atomic + metadata (overlapping the load), waits the load,
+// issues the STORE tile->peer, and waits the store (frees the tile). gfx1250 has
+// 320KB LDS/CU so a 14KB bf16 tile keeps ~22 warps/CU resident -> ~22-way TDM
+// in-flight per CU hides each warp's store drain. Wave-scoped only (no block
+// barrier). TdmShape/TdmIssueLoad/TdmIssueStore are the descriptor primitives.
+namespace mori {
+namespace moe {
+// Fill a GROUP1 (shape) descriptor for a 1D hiddenDim-element token payload.
+template <typename T>
+__device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape(int hiddenDim) {
+  gfx1250_TDM_GROUP1 g1;
+  g1.dataSize(sizeof(T) == 2 ? 1 : (sizeof(T) == 4 ? 2 : 0));
+  g1.tensorDim0(hiddenDim); g1.tensorDim1(1);
+  g1.tensorDim0Stride(hiddenDim); g1.tensorDim1Stride(1);
+  g1.tileDim0(hiddenDim); g1.tileDim1(1);
+  return g1;
+}
+// Issue an async TDM load global->LDS (does NOT wait for completion).
+template <typename T>
+__device__ __forceinline__ void TdmIssueLoad(T* ldsTile, const T* src, const gfx1250_TDM_GROUP1& g1) {
+  typedef int _tdm_v4i __attribute__((ext_vector_type(4)));
+  typedef int _tdm_v8i __attribute__((ext_vector_type(8)));
+  gfx1250_TDM_GROUP0 g0; g0.ldsAddr((uintptr_t)ldsTile); g0.globalAddr((uintptr_t)src);
+  _tdm_v4i z4{0, 0, 0, 0}; _tdm_v8i z8{0, 0, 0, 0, 0, 0, 0, 0};
+  __builtin_amdgcn_tensor_load_to_lds(g0.m_bitfield, g1.m_bitfield, z4, z4, z8, 0);
+}
+// Issue an async TDM store LDS->global (does NOT wait for completion).
+template <typename T>
+__device__ __forceinline__ void TdmIssueStore(T* dst, T* ldsTile, const gfx1250_TDM_GROUP1& g1) {
+  typedef int _tdm_v4i __attribute__((ext_vector_type(4)));
+  typedef int _tdm_v8i __attribute__((ext_vector_type(8)));
+  gfx1250_TDM_GROUP0 g0; g0.ldsAddr((uintptr_t)ldsTile); g0.globalAddr((uintptr_t)dst);
+  _tdm_v4i z4{0, 0, 0, 0}; _tdm_v8i z8{0, 0, 0, 0, 0, 0, 0, 0};
+  __builtin_amdgcn_tensor_store_from_lds(g0.m_bitfield, g1.m_bitfield, z4, z4, z8, 0);
+}
+}  // namespace moe
+}  // namespace mori
+#endif
 
 namespace mori {
 namespace moe {
@@ -98,6 +141,20 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   int npes = config.worldSize;
   size_t hiddenDim = config.HiddenDimSz();
 
+#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
+  // Single-buffer TDM token payload. Per-warp ONE LDS tile (dynamic shared, sized
+  // warpNum*hiddenDim*sizeof(T) by LaunchDispatch). gfx1250 has 320KB LDS/CU, so a
+  // 14KB bf16 tile (hidden=7168) lets ~22 warps/CU stay resident -> ~22-way TDM
+  // in-flight per CU hides the store's remote drain via warp-level parallelism.
+  // Per committed token the warp does: issue async LOAD src->tile, run the remote
+  // slot atomic + metadata (overlapping the load), wait the load, issue STORE
+  // tile->peer, wait the store (releases the tile for the next token).
+  const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
+  extern __shared__ char _tdmDispSmem[];
+  T* _tdmTile = reinterpret_cast<T*>(_tdmDispSmem) + (size_t)warpId * hiddenDim;
+  const T* _tdmSrc = nullptr;   // src of the token whose load is in flight this iter
+#endif
+
   IF_ENABLE_PROFILER(
       INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SEQ(seq, profiler);
@@ -153,13 +210,28 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
           continue;
         }
 
+#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
+        // Issue the token payload LOAD now (async) so the remote slot atomic +
+        // metadata writes below overlap the HBM->LDS load (waited at the store site).
+        _tdmSrc = args.inpTokenBuf + (size_t)srcTokId * hiddenDim;
+        TdmIssueLoad<T>(_tdmTile, _tdmSrc, _tdmG1);
+#endif
+
         {
           // Fine-grained timing: slot assignment = remote returning atomic on
           // dispTokOffset[destPe] + the two remote metadata writes.
           MORI_TRACE_SPAN(profiler, Slot::DispSlotAssign);
           if (laneId == 0) {
             // decide token id in dest pe
-            destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+            // Cross-GPU slot allocation: the offset counter lives on the destination
+            // PE, so the fetch-add MUST be SYSTEM-scoped. Plain atomicAdd is agent
+            // (device) scope and is NOT atomic across GPUs over the cco/LSA fabric,
+            // so concurrent senders can get the same destTokId -> slot collision ->
+            // corrupt dispatch (map/payload disagree). Matches v2's system-scope
+            // atomic_add_global.
+            destTokId = __hip_atomic_fetch_add(
+                args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1,
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             assert(destTokId < config.MaxNumTokensToRecv() &&
                    "Total recv token overflow: increase maxTotalRecvTokens");
             atomicAdd(args.destPeTokenCounter + destPe, 1);
@@ -182,6 +254,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         destPe = PeFromFlatTokenIndex(config, flat);
         if (destPe >= config.worldSize) continue;
         destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
+#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
+        _tdmSrc = args.inpTokenBuf + (size_t)srcTokId * hiddenDim;
+        TdmIssueLoad<T>(_tdmTile, _tdmSrc, _tdmG1);
+#endif
       }
 
       // BW diagnostic: inject N dummy remote atomicAdds per sent token onto an
@@ -223,6 +299,15 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       size_t srcTokOffset = srcTokId * hiddenDim;
       size_t destTokOffset = destTokId * hiddenDim;
 
+      if (myPe == 3 && (srcTokId == 108 || srcTokId == 0) && laneId == 0 &&
+          (i % config.numExpertPerToken) == 0) {
+        const unsigned* sp = (const unsigned*)(args.inpTokenBuf + srcTokOffset);
+        printf("SND r3 tok=%d destPe=%d destTokId=%d inpBase=%p srcOff=%llu s0=%08x s1=%08x smid=%08x\n",
+               (int)srcTokId, destPe, (int)destTokId, (void*)args.inpTokenBuf,
+               (unsigned long long)srcTokOffset, sp[0], sp[1],
+               ((const unsigned*)(args.inpTokenBuf + srcTokOffset + hiddenDim / 2))[0]);
+      }
+
       {
         // Fine-grained timing: the actual hidden-dim payload WarpCopy to the
         // destination PE (the bulk P2P write). Unroll=8 issues 8 in-flight 16B
@@ -230,9 +315,19 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         // higher per-access latency of the CCO peer path; matches the v2/FlyDSL
         // multi-stream copy that keeps dispatch fast.
         MORI_TRACE_SPAN(profiler, Slot::DispTokenCopy);
+#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
+        // Payload LOAD was issued earlier (overlapping the atomic). Wait it, then
+        // STORE tile->peer and wait the store to release the tile for the next token.
+        __builtin_amdgcn_s_wait_tensorcnt(0);  // LOAD landed in LDS
+        TdmIssueStore<T>(
+            args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
+            _tdmTile, _tdmG1);
+        __builtin_amdgcn_s_wait_tensorcnt(0);  // STORE done; tile reusable
+#else
         core::WarpCopy<T, 8>(
             args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
             args.inpTokenBuf + srcTokOffset, hiddenDim);
+#endif
       }
     }
   }
@@ -251,6 +346,12 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
+      // System release fence: make this rank's remote payload/index/weight/tis
+      // writes to destPe globally visible BEFORE the readiness signal lands, so a
+      // peer that observes the signal is guaranteed to see the data (matches v2's
+      // fence_system_release). Without it, on the cco/LSA fabric the signal can be
+      // observed before the P2P writes drain -> peer reads stale -> wrong dispatch.
+      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
   }
@@ -263,6 +364,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       index_t* signal = recvTokenNums + destPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      // System acquire fence: pair with the sender's release so that after we see
+      // the signal, this rank's subsequent reads observe the peer's P2P writes
+      // (matches v2's fence_system_acquire).
+      __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
 

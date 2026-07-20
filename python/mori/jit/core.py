@@ -285,6 +285,14 @@ def _profiler_defines() -> list[str]:
     return ["-DENABLE_PROFILER"] if is_profiler_enabled() else []
 
 
+def _disp_tdm_defines() -> list[str]:
+    """Experimental: -DMORI_DISP_TDM routes the EP dispatch token payload through
+    the gfx1250 TDM engine (see src/ops/dispatch_combine/intranode.hpp). Gated by
+    the MORI_DISP_TDM env so the JIT kernel matches the host launch build."""
+    val = os.environ.get("MORI_DISP_TDM", "")
+    return ["-DMORI_DISP_TDM"] if val.lower() in ("1", "true", "on", "yes") else []
+
+
 def _ocp_fp_defines(arch: str) -> list[str]:
     """Enable the native gfx950 OCP FP4/FP8 conversion instructions (cvt_scalef32_pk_*) used by
     the fp4_blockwise combine's E2M1 quant/dequant helpers. Without this the helpers fall back to
@@ -423,6 +431,7 @@ def _hipcc_genco(
         *_ccqe_defines(),
         *_profiler_defines(),
         *_ocp_fp_defines(cfg.arch),
+        *_disp_tdm_defines(),
     ]
 
     for d in include_dirs:
