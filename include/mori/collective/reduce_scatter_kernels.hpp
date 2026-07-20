@@ -349,8 +349,11 @@ __device__ __forceinline__ void StartSdmaScatter(
       auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
       if (slice == 0) {
         // Leader reserves the whole S-packet block and publishes base/pad to LDS.
+        // Peers map to distinct queues (peer % 8, injective for npes <= 8) and only
+        // the slice-0 lane reserves, so each queue has exactly one producer here --
+        // use the CAS-free single-producer reserve.
         uint64_t offset = 0;
-        uint64_t sb = handle->ReserveQueueSpace(paketSize << logS, offset);
+        uint64_t sb = handle->ReserveQueueSpaceSingleProducer(paketSize << logS, offset);
         if (offset) handle->fillNops(sb, offset);
         sStart[peer] = sb;
         sOff[peer] = offset;
