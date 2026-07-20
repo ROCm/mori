@@ -2223,24 +2223,18 @@ class HierAllGather:
         elif (
             big_ag and not self._debug_sync and self._sync_big_mode == "barrierthrottle"
         ):
-            # On mlx5: device barrier (NIC-landing +
-            # cross-PE order) COMPOSED WITH a bounded CPU run-ahead throttle.
-            # RATIONALE: on this MI300X/mlx5 pair "barrier" alone cuts the
-            # olapfast completion-race drift ~24x (Δ0.054 -> Δ0.0023) at fast-path
-            # speed (139 TFLOPS), but leaves a SIGN-FLIPPING residual (the
-            # threshold-8MB run gives +0.0023, threshold-1MB gives -0.018) --
-            # i.e. a NON-DETERMINISTIC residual that ACCUMULATES across steps into
-            # the last_loss drift. Composing the CU re-touch (barriercutouch) made
-            # it WORSE (the re-touch re-reads the window). Instead bound the CPU
-            # run-ahead: after the device barrier orders THIS big AG's landing,
-            # host-wait on the PREVIOUS big AG's completion event (bounds the CPU
-            # to ~1 big-AG ahead of the GPU) and record this AG's event for the
-            # next call. This does NOT re-read the current AG (no reopened window,
-            # unlike barriercutouch) -- it only prevents the tiny per-AG residual
-            # from compounding step-over-step, at far less cost than a full
-            # host-drain of the current AG (which is the 112-TFLOPS bit-exact
-            # floor). If the last_loss drift is an ACCUMULATION of the barrier's
-            # damped residual, this lands bit-exact well above 114 TFLOPS.
+            # Experimental (default mode is "host"). On mlx5: device barrier
+            # (NIC-landing + cross-PE order) COMPOSED WITH a bounded CPU
+            # run-ahead throttle. The barrier alone damps the completion-race
+            # drift but leaves a small sign-flipping residual that ACCUMULATES
+            # across steps into the last_loss drift; composing a CU re-touch
+            # (barriercutouch) reopens the window and makes it worse. Instead
+            # bound the CPU run-ahead: after the device barrier orders THIS big
+            # AG's landing, host-wait on the PREVIOUS big AG's completion event
+            # (bounds the CPU to ~1 big-AG ahead of the GPU) and record this
+            # AG's event for the next call. Invariant: this does NOT re-read the
+            # current AG (no reopened window, unlike barriercutouch); it only
+            # prevents the per-AG residual from compounding step-over-step.
             from ..shmem import shmem_barrier_on_stream
 
             bts = (
