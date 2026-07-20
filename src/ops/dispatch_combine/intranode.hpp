@@ -355,7 +355,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   // total wall time spent in the per-token SYSTEM-scope remote slot atomic vs the
   // hidden-dim payload copy, to weigh "atomics vs data movement" in the legacy path.
   const bool _tThd = (myPe == 0 && globalWarpId == 0 && laneId == 0);
-  long long _atomAcc = 0, _copyAcc = 0, _loopT0 = 0, _loopT1 = 0;
+  long long _atomAcc = 0, _copyAcc = 0, _loopT0 = 0, _loopT1 = 0, _pN = 0, _pR = 0;
   int _atomCnt = 0, _copyCnt = 0;
   long long _atomDs[32];  // per-atomic wall delta (critical-path latency)
   if (_tThd) _loopT0 = wall_clock64();
@@ -559,26 +559,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     }
   }
 #if defined(MORI_DISP_TIMING)
-  if (_tThd) {
-    _loopT1 = wall_clock64();
-    int _np = _atomCnt < 32 ? _atomCnt : 32;
-    // Per-atomic critical-path latency (each = wall after return - wall before issue).
-    printf(
-        "[ATOMIC-EACH] warp0 n=%d each_tk= %lld %lld %lld %lld %lld %lld %lld %lld "
-        "%lld %lld %lld %lld %lld %lld %lld %lld\n",
-        _atomCnt,
-        _np > 0 ? _atomDs[0] : -1, _np > 1 ? _atomDs[1] : -1, _np > 2 ? _atomDs[2] : -1,
-        _np > 3 ? _atomDs[3] : -1, _np > 4 ? _atomDs[4] : -1, _np > 5 ? _atomDs[5] : -1,
-        _np > 6 ? _atomDs[6] : -1, _np > 7 ? _atomDs[7] : -1, _np > 8 ? _atomDs[8] : -1,
-        _np > 9 ? _atomDs[9] : -1, _np > 10 ? _atomDs[10] : -1, _np > 11 ? _atomDs[11] : -1,
-        _np > 12 ? _atomDs[12] : -1, _np > 13 ? _atomDs[13] : -1, _np > 14 ? _atomDs[14] : -1,
-        _np > 15 ? _atomDs[15] : -1);
-    printf(
-        "[ATOMIC-TIMING] warp0 loop=%lld tk | remoteAtomic: n=%d sum=%lld avg=%lld tk | "
-        "payloadCopy: n=%d sum=%lld avg=%lld tk\n",
-        _loopT1 - _loopT0, _atomCnt, _atomAcc, _atomCnt ? _atomAcc / _atomCnt : 0,
-        _copyCnt, _copyAcc, _copyCnt ? _copyAcc / _copyCnt : 0);
-  }
+  if (_tThd) _loopT1 = wall_clock64();  // block0 send loop done (pre-syncthreads)
 #endif
   __syncthreads();
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
@@ -604,6 +585,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
   }
+#if defined(MORI_DISP_TIMING)
+  if (_tThd) _pN = wall_clock64();  // after grid barrier wait + notify peers
+#endif
 
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
@@ -630,6 +614,22 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     }
   }
 
+#if defined(MORI_DISP_TIMING)
+  if (_tThd) {
+    _pR = wall_clock64();
+    int _np = _atomCnt < 16 ? _atomCnt : 16;
+    printf(
+        "[ATOMIC-EACH] warp0 n=%d each_tk= %lld %lld %lld %lld %lld %lld %lld %lld\n",
+        _atomCnt, _np > 0 ? _atomDs[0] : -1, _np > 1 ? _atomDs[1] : -1,
+        _np > 2 ? _atomDs[2] : -1, _np > 3 ? _atomDs[3] : -1, _np > 4 ? _atomDs[4] : -1,
+        _np > 5 ? _atomDs[5] : -1, _np > 6 ? _atomDs[6] : -1, _np > 7 ? _atomDs[7] : -1);
+    // Grid-wide phase breakdown (block0/thd0), same measurement scope as NOTIFY.
+    printf(
+        "[LEGACY-TIMING] tot=%lld tk | sendLoop=%lld (atomicSum=%lld copySum=%lld) "
+        "gridbar+notify=%lld recvWait=%lld tk\n",
+        _pR - _loopT0, _loopT1 - _loopT0, _atomAcc, _copyAcc, _pN - _loopT1, _pR - _pN);
+  }
+#endif
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   if constexpr (EnableStdMoE) {
     InvokeConvertDispatchOutput<T>(args, myPe);
