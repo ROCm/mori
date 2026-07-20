@@ -3641,32 +3641,13 @@ class HierAllGather:
         )
 
         if not self.leader_only and self.gather_in_place:
-            # M4 (, opt-in): write the intra-gather node-block DIRECTLY
-            # into this PE's ring slot, then run the ring with chunk_in_place=True.
-            # This removes the prepare_sync copy-IN (a full node-block D2D copy)
-            # AND the node_block intermediate -- the gather's own finish_sync now
-            # lands straight in the ring buffer.
-            #
-            # VALIDATED-NEUTRAL (, single-node world=8 N=2,G=4 fp32
-            # 64MiB/rank, >=3 reps, A/B same binary): gather_in_place 84.7 GB/s
-            # vs staged (default) 83-85 GB/s -- within noise. The eliminated
-            # copy is NOT free here: the ring slot lives in the UNCACHED
-            # symmetric heap, so the gather's finish_sync now writes 256MiB into
-            # uncached memory (~slow) instead of into normal-HBM node_block
-            # (~fast) -- the saved copy is offset by the slower write. Kept
-            # opt-in; default stays the proven staged path. The copy-IN can only
-            # be made cheaper by also moving the intra transit into the same
-            # symmetric region, a larger change.
-            #
-            # Confirmed neutral on true cross-node RDMA (N=2, G=4, fp32
-            # 64MiB/rank, both bit-exact vs torch.all_gather_into_tensor):
-            # gather_in_place and staged are within noise (~60 GB/s), inter
-            # phase identical either way (the copy-IN saving never materializes -- same
-            # uncached-heap offset on the real RDMA transport, not a single-node
-            # P2P artifact). So copy-IN elimination is a dead lever on this
-            # topology; the remaining staging fish is the finish_sync copy-OUT
-            # (~2.7ms @512MiB), which needs RDMA-into-user-output (register the
-            # output as symmetric) to avoid the same uncached read penalty.
+            # gather_in_place (opt-in): write the intra-gather node-block DIRECTLY
+            # into this PE's inter-ring slot and run the ring with
+            # chunk_in_place=True, removing the prepare_sync copy-IN and the
+            # separate node_block intermediate. Perf-neutral vs the staged default
+            # (the ring slot lives in the uncached symmetric heap, so the gather's
+            # finish_sync write into it offsets the saved copy), so the default
+            # stays the staged path; correctness is identical either way.
             node_block = self._inter.slot_tensor(
                 block_count, input_data.dtype, input_data.device
             )
