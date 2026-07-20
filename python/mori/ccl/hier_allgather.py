@@ -3792,18 +3792,17 @@ class HierAllGather:
         split_offsets_u32 = self._pc_u32_so
         entry_barrier = not self.slice_fuse_ib
 
-        # OVERLAPPED param-contiguous zero-copy (the lever to beat RCCL): the
-        # LOCAL node-block (m == node_id) scatter reads only THIS rank's own input
-        # (no ring dependency) so it runs on a SIDE stream concurrently with the
-        # inter-node RDMA ring -- exactly the ring||gather overlap the copy-OUT
-        # __call__ path uses, but writing PARAM-CONTIGUOUS straight into the user
-        # output (no copy-OUT). The serial Phase-A-then-scatter path forwent this
-        # overlap and lost to RCCL (99.7 vs 127 TFLOPS); this recovers it.
-        # OPT-IN (default OFF): the overlap path is bit-exact in the standalone
-        # 2-node test but currently triggers an HSA memory-exception under FSDP's
-        # repeated-call / buffer-reuse pattern (side-stream local scatter). Ship
-        # the proven non-overlap fused scatter as the default zero-copy path;
-        # enable overlap with MORI_HIER_PC_OVERLAP=1 to iterate on the fault.
+        # OVERLAPPED param-contiguous zero-copy: the LOCAL node-block
+        # (m == node_id) scatter reads only THIS rank's own input (no ring
+        # dependency) so it runs on a SIDE stream concurrently with the
+        # inter-node RDMA ring -- the ring||gather overlap the copy-OUT __call__
+        # path uses, but writing PARAM-CONTIGUOUS straight into the user output
+        # (no copy-OUT).
+        # EXPERIMENTAL, default OFF: bit-exact in the standalone 2-node test but
+        # currently triggers an HSA memory-exception under FSDP's repeated-call /
+        # buffer-reuse pattern (side-stream local scatter). Ship the proven
+        # non-overlap fused scatter as the default zero-copy path; enable overlap
+        # with MORI_HIER_PC_OVERLAP=1 to iterate on the fault.
         overlap = (
             self.stream_intra
             and self.stream_ring
