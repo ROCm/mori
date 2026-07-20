@@ -891,36 +891,21 @@ class HierAllGather:
 
     def _init_fused_ring_state(self):
         """Init fused ring / persistent-kernel / flag-token / reasm-deep-SQ / host-proxy-inter state (moved verbatim from __init__)."""
-        # PHASE 4: pipeline the inter-node RDMA ring with the REMOTE-block XGMI
-        # reassembly (the 143->168 GB/s lever). When ON (and on the fuse_local
+        # EXPERIMENTAL (default OFF). fuse_remote: pipeline the inter-node RDMA
+        # ring with the REMOTE-block XGMI reassembly. When ON (on the fuse_local
         # slice_direct path) the fused FusedRingRemoteGatherKernel runs the ring
-        # AND, per landed sub-range, the remote-block SDMA push straight from this
-        # PE's ring buffer into the registered output -- NO ring copy-OUT, NO
+        # AND, per landed sub-range, pushes the remote-block SDMA straight from this
+        # PE's ring buffer into the registered output -- no ring copy-OUT, no
         # whole-phase finish barrier, remote gather overlaps the still-in-flight
-        # NIC ring. Only valid at num_nodes==2 (single ring round); default OFF
-        # until the standalone bit-exact sweep gate passes.
+        # NIC ring. Invariant: only valid at num_nodes==2 (single ring round).
         self.fuse_remote = _env_true("MORI_HIER_FUSE_REMOTE", "0")
-        # PERSISTENT-KERNEL PORT: fold the host hipMemcpyAsync
+        # EXPERIMENTAL (default OFF). fuse_copyin: fold the host hipMemcpyAsync
         # copy-IN of this PE's input into its ring slot INTO the fused kernel (each
-        # ring channel stages its own send sub-range before the put). Drops one GPU
-        # op per AG; combined with MORI_HIER_GEN_RING (no entry barrier) +
-        # slice_defer_fin (deferred finish) the whole AG collapses to a SINGLE host
-        # kernel launch -- the aggregate-collapse hypothesis for the fixed per-op
-        # floor. Only on the fuse_remote path (the crown UT config). Default OFF
-        # => the host copy-IN runs, byte-identical shipped path.
-        # The single-launch aggregate-collapse shares the fatal tradeoff of the
-        # HIP-graph launch-collapse (below): collapsing the per-op multi-launch to
-        # one launch forfeits the CPU-driven async ring||reassembly overlap that
-        # bulk BW depends on. Graph capture wins at small sizes but regresses bulk.
-        # The three host-op levers that would let this path collapse -- GEN_RING (no
-        # entry barrier), FLAG_TOKEN, fuse_copyin -- each regress or break: GEN_RING
-        # is E2E-racy and makes graph capture silently fall back to eager;
-        # FLAG_TOKEN regresses the eager >48MB path; the copy-IN fold is neutral on
-        # SDMA and much slower if forced onto CUs (which also violates the CU
-        # red-line). Single-launch and bulk ring||reassembly overlap are mutually
-        # exclusive on this fabric, so the fixed per-op floor is irreducible on the
-        # bit-exact path without forfeiting the overlap that gives mori its winning
-        # marginal fill.
+        # ring channel stages its own send sub-range before the put). Only on the
+        # fuse_remote path. Default OFF => the host copy-IN runs, byte-identical
+        # shipped path. Stays OFF: the single-launch collapse it enables is mutually
+        # exclusive with the CPU-driven async ring||reassembly overlap that bulk BW
+        # depends on, so it does not lift the per-op floor on the bit-exact path.
         self.fuse_copyin = _env_true("MORI_HIER_FUSE_COPYIN", "0")
         self._chunk_ready_flags = None
         # Cross-size carryover guard: the exact DEEP_PIPE flag layout
