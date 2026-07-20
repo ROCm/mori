@@ -1372,6 +1372,26 @@ inline __device__ void ShmemInternalBarrierHierBlock(int ranksPerNode) {
     constexpr int HIER_LOCAL_BASE = 112;
     constexpr int HIER_REL_SLOT = 120;
     constexpr int HIER_GEN_SLOT = 126;
+    // Capacity of each disjoint region carved out of the 128-uint64 internalSync
+    // area. The PEER inbox spans [HIER_PEER_BASE, HIER_LOCAL_BASE) and the LOCAL
+    // inbox spans [HIER_LOCAL_BASE, HIER_REL_SLOT); exceeding either would alias
+    // an adjacent region and corrupt the barrier.
+    constexpr int HIER_MAX_NODES = HIER_LOCAL_BASE - HIER_PEER_BASE;         // 16
+    constexpr int HIER_MAX_RANKS_PER_NODE = HIER_REL_SLOT - HIER_LOCAL_BASE;  // 8
+
+    int numNodes = n_pes / ranksPerNode;
+    // Fail closed on topologies this fixed slot layout cannot represent:
+    //  - non-divisible world => integer numNodes drops the remainder node and its
+    //    PEs are never released (hang);
+    //  - ranksPerNode slots overflow [HIER_LOCAL_BASE, HIER_REL_SLOT);
+    //  - numNodes slots overflow [HIER_PEER_BASE, HIER_LOCAL_BASE).
+    // Shipped w16 (rpn=8, numNodes=2, 16%8==0) is within all bounds.
+    assert(n_pes % ranksPerNode == 0 &&
+           "ShmemInternalBarrierHierBlock: worldSize not divisible by ranksPerNode");
+    assert(ranksPerNode <= HIER_MAX_RANKS_PER_NODE &&
+           "ShmemInternalBarrierHierBlock: ranksPerNode exceeds internalSync slot capacity");
+    assert(numNodes <= HIER_MAX_NODES &&
+           "ShmemInternalBarrierHierBlock: numNodes exceeds internalSync slot capacity");
 
     uint64_t gen = pSync[HIER_GEN_SLOT] + 1;
     pSync[HIER_GEN_SLOT] = gen;
@@ -1379,7 +1399,6 @@ inline __device__ void ShmemInternalBarrierHierBlock(int ranksPerNode) {
 
     int node = pe / ranksPerNode;
     int localIdx = pe % ranksPerNode;
-    int numNodes = n_pes / ranksPerNode;
     int coord = node * ranksPerNode;
 
     if (localIdx != 0) {
