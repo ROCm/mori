@@ -427,41 +427,25 @@ class HierAllGather:
         #      B_m = concat_g slice_g(B_m) into output[m*block:(m+1)*block]. The
         #      SDMA gather concatenates by group_pos=local_rank, so the result is
         #      exactly rank-major concat(B_0..B_{N-1}) == torch all_gather.
-        # The extra intra gather rides fast XGMI (~123-205 GB/s, ) while the
-        # inter phase (the ~80% bottleneck) shrinks ~G x -- the path to RCCL
-        # parity. Default OFF; toggle MORI_HIER_SLICE=1. Incompatible with
-        # leader_only / out_in_place / gather_in_place (its own data path).
-        # DEFAULT ON since : the sliced 2-D path is the proven-best
-        # bandwidth path (xnode 64MiB fp32 fp 62->111 GB/s, 2.3x->1.37x RCCL;
-        # bit-exact confirmed across 4 dtypes x {4KiB,4MiB,64MiB} by Turns 2-3
-        # reviews) AND is >= the non-sliced fuse-barrier path at EVERY tested
-        # size (small/mid floor unchanged: 4KiB 0.985 vs 0.993ms, 4MiB 1.340 vs
-        # 1.364ms, 64MiB 4.825 vs 8.364ms -- never a regression). So make it the
-        # shipped default. It owns its own inter+intra data path and is therefore
-        # incompatible with leader_only / out_in_place / gather_in_place; if any
-        # of those is explicitly enabled, slice defaults OFF so those levers
-        # still work. Set MORI_HIER_SLICE=0 to force the pre-slice baseline (e.g.
-        # for A/B benchmarking).
+        # The extra intra gather rides fast XGMI while the inter phase (the ~80%
+        # bottleneck) shrinks ~G x. Default ON (the proven-best bandwidth path,
+        # bit-exact and >= the non-sliced fuse-barrier path at every tested size).
+        # It owns its own inter+intra data path, so it is incompatible with
+        # leader_only / out_in_place / gather_in_place; if any of those is
+        # explicitly enabled, slice defaults OFF so those levers still work. Set
+        # MORI_HIER_SLICE=0 to force the pre-slice baseline for A/B.
         _slice_conflict = self.leader_only or self.out_in_place or self.gather_in_place
         if slice_inter is None:
             slice_inter = _env_true("MORI_HIER_SLICE", "0" if _slice_conflict else "1")
         self.slice_inter = bool(slice_inter)
-        # M5: opt-in FUSED sliced Phase B -- fold the N intra reassembly
-        # gathers into ONE batch. The default sliced path runs N separate
-        # IntraNodeSubGroupAllgatherSdma calls, each paying prepare(barrier) +
-        # kernel launch + finish(memcpy+streamsync+barrier) -- i.e. 2N global
-        # ShmemBarrierAll, N D2D copies and N stream syncs for N node-blocks. The
-        # fused path stacks the N gathers into DISJOINT regions of one enlarged
-        # transit (dst_base_offset = m*block), so they never overlap and the
-        # per-gather finish barrier/copy is unnecessary: it keeps only the m==0
-        # entry barrier + ONE bulk copy-OUT + ONE exit barrier (2 barriers, 1
-        # copy, 1 sync total). Flags stay monotonic per-call so there is no
-        # cross-gather race. Bit-exact identical output (same SDMA writes, same
-        # final byte layout). Only meaningful with slice_inter.
-        # DEFAULT ON since  (paired with slice default-ON): the fused
-        # Phase B is the proven-best variant (+13.5% @64MiB over unfused slice,
-        # far more stable avg, bit-exact 4 dtypes x 3 sizes --  review
-        # PASS). Set MORI_HIER_SLICE_FUSED=0 for the unfused sliced path.
+        # FUSED sliced Phase B: fold the N intra reassembly gathers into ONE batch.
+        # CORRECTNESS INVARIANT: the fused path stacks the N gathers into DISJOINT
+        # regions of one enlarged transit (dst_base_offset = m*block) so they never
+        # overlap; it keeps only the m==0 entry barrier + one bulk copy-OUT + one
+        # exit barrier, and flags stay monotonic per-call, so there is no
+        # cross-gather race and the output is byte-identical to the unfused sliced
+        # path. Default ON (proven-best variant); only meaningful with slice_inter.
+        # Set MORI_HIER_SLICE_FUSED=0 for the unfused sliced path.
         if slice_fused is None:
             slice_fused = _env_true("MORI_HIER_SLICE_FUSED", "1")
         self.slice_fused = bool(slice_fused)
@@ -480,19 +464,11 @@ class HierAllGather:
         if slice_oop is None:
             slice_oop = _env_true("MORI_HIER_SLICE_OOP", "0")
         self.slice_oop = bool(slice_oop)
-        # Per-call SIZE THRESHOLD for the sliced path. Cross-node
-        # A/B (N=2 G=4 fp32, both bit-exact) shows
-        # the sliced 2-D path WINS big at 64 MiB/rank (67.8->108.7 GB/s, 2.20x->
-        # 1.40x RCCL) but LOSES at small/mid where its extra kernel launches +
-        # N reassembly gathers cost more than the saved inter bytes:
-        #   4 KiB:  baseline 0.798ms  vs slice 1.107ms  (slice slower)
-        #   4 MiB:  baseline 0.996ms  vs slice 1.297ms  (slice slower)
-        #   64 MiB: baseline 7.921ms  vs slice 4.939ms  (slice MUCH faster)
-        # So engage slice ONLY when the per-rank payload is >= this many bytes;
-        # below it, fall through to the (faster at small/mid) non-sliced fuse-
-        # barrier path. This gives the faster path at every size -- the right thing
-        # for the "<=1.3x on all sizes" acceptance band. Default 8 MiB cleanly
-        # separates the measured 4 MiB (non-slice) from 64 MiB (slice). Set
+        # Per-call SIZE THRESHOLD for the sliced path. The sliced 2-D path wins big
+        # at large per-rank payloads but loses at small/mid (its extra kernel
+        # launches + N reassembly gathers cost more than the saved inter bytes), so
+        # engage slice ONLY when the per-rank payload is >= this many bytes; below
+        # it, fall through to the non-sliced fuse-barrier path. Default 8 MiB. Set
         # MORI_HIER_SLICE_MIN_BYTES=0 to force slice at all sizes (A/B / tests).
         if slice_min_bytes is None:
             slice_min_bytes = _env_int(
