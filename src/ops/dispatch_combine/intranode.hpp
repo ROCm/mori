@@ -190,13 +190,14 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     uint32_t barExp = 0;
 
 #if defined(MORI_DISP_TIMING)
-    // In-kernel wall_clock64 breakdown of the NOTIFY dispatch, captured by ONE
-    // representative thread (rank0/block0/thd0). Segments: [0]count+setup,
-    // [1]matrix-exchange+xdev-barrier#1, [2]prefix-sum+grid-barrier, [3]payload
-    // send (Pass B), [4]final fence+xdev-barrier#2.
+    // Fine-grained in-kernel wall_clock64 breakdown of NOTIFY dispatch (rank0/
+    // block0/thd0). Each grid barrier, cross-device barrier and threadfence is
+    // timed separately to pinpoint where the ~1ms goes.
     const bool _tThd = (myPe == 0 && blockIdx.x == 0 && thdId == 0);
-    long long _tp[6];
+    long long _tp[11];
     int _tn = 0;
+    long long _nbCopy = 0, _nbAtom = 0;  // Pass B copy / local-atomic sums (warp0)
+    int _nbCopyN = 0, _nbAtomN = 0;
 #define TSTAMP() do { if (_tThd) _tp[_tn++] = wall_clock64(); } while (0)
 #else
 #define TSTAMP()
@@ -207,6 +208,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     for (int d = globalThdId; d < npes; d += totalThreads) localCnt[d] = 0;
     barExp += gridDim.x;
     NotifyGridBarrier(args.dispatchGridBarrier, barExp);
+    TSTAMP();  // [1] after zero-counter + setup grid barrier
 
     // ---- Pass A: count committed (token -> destPe) into localCnt (agent atomic) ----
     if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
@@ -235,9 +237,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         if (laneId == 0) atomicAdd(&localCnt[destPe], 1);
       }
     }
+    TSTAMP();  // [2] after Pass A count loop (pre grid barrier)
     barExp += gridDim.x;
     NotifyGridBarrier(args.dispatchGridBarrier, barExp);
-    TSTAMP();  // [1] after Pass A count + grid barrier
+    TSTAMP();  // [3] after grid barrier #1
 
     // ---- Exchange: block 0 writes my count row to every peer's matrix[myPe][*] ----
     if (blockIdx.x == 0 && warpId == 0) {
@@ -247,8 +250,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
     }
     __threadfence_system();
+    TSTAMP();  // [4] after matrix exchange write + threadfence (pre xdev barrier)
     CrossDeviceBarrierIntraNodeKernel(args, xdevFlag);
-    TSTAMP();  // [2] after matrix exchange + cross-device barrier #1
+    TSTAMP();  // [5] after cross-device barrier #1
 
     // ---- Compute base[destPe] = sum_{s<myPe} M[s][destPe]; recvCount; reset localCnt ----
     if (globalThdId < npes) {
@@ -263,9 +267,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       for (int s = 0; s < npes; ++s) tot += matLocal[s * npes + myPe];
       *args.totalRecvTokenNum = tot;
     }
+    TSTAMP();  // [6] after prefix-sum base compute (pre grid barrier)
     barExp += gridDim.x;
     NotifyGridBarrier(args.dispatchGridBarrier, barExp);
-    TSTAMP();  // [3] after prefix-sum base compute + grid barrier
+    TSTAMP();  // [7] after grid barrier #2
 
     // ---- Pass B: send payload with LOCAL slot assignment inside the region ----
     if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
@@ -285,7 +290,14 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 
         index_t destTokId = 0;
         if (laneId == 0) {
-          destTokId = baseArr[destPe] + atomicAdd(&localCnt[destPe], 1);
+#if defined(MORI_DISP_TIMING)
+          long long _b0 = _tThd ? wall_clock64() : 0;
+#endif
+          index_t _slot = atomicAdd(&localCnt[destPe], 1);
+#if defined(MORI_DISP_TIMING)
+          if (_tThd) { asm volatile("" ::"v"(_slot)); _nbAtom += wall_clock64() - _b0; _nbAtomN++; }
+#endif
+          destTokId = baseArr[destPe] + _slot;
           args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
           args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
               FlatTokenIndex(config, myPe, srcTokId);
@@ -311,28 +323,37 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         }
         size_t srcTokOffset = srcTokId * hiddenDim;
         size_t destTokOffset = destTokId * hiddenDim;
+#if defined(MORI_DISP_TIMING)
+        long long _bc0 = _tThd ? wall_clock64() : 0;
+#endif
         core::WarpCopy<T, 8>(
             args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
             args.inpTokenBuf + srcTokOffset, hiddenDim);
+#if defined(MORI_DISP_TIMING)
+        if (_tThd) { _nbCopy += wall_clock64() - _bc0; _nbCopyN++; }
+#endif
       }
     }
 
-    TSTAMP();  // [4] after Pass B payload send
+    TSTAMP();  // [8] after Pass B payload send
 
     // Make all payload/metadata writes visible to peers, then cross-device barrier
     // so combine (next kernel) observes the dispatched data.
     __threadfence_system();
+    TSTAMP();  // [9] after threadfence_system (pre xdev barrier #2)
     CrossDeviceBarrierIntraNodeKernel(args, xdevFlag + 1);
     if (globalThdId == 0) *args.dispatchGridBarrier = 0;  // reset for next launch
-    TSTAMP();  // [5] after final fence + cross-device barrier #2
+    TSTAMP();  // [10] after cross-device barrier #2
 #if defined(MORI_DISP_TIMING)
     if (_tThd) {
-      long long tk = _tp[5] - _tp[0];
+      long long tk = _tp[10] - _tp[0];
       printf(
-          "[NOTIFY-TIMING] tot=%lld tk | count=%lld exch+xbar1=%lld prefix+bar=%lld "
-          "sendB=%lld fence+xbar2=%lld tk\n",
+          "[NOTIFY-TIMING] tot=%lld tk | setup=%lld countLoop=%lld gridbar1=%lld "
+          "exch+fence=%lld xdevbar1=%lld prefix=%lld gridbar2=%lld sendB=%lld "
+          "(copySum=%lld atomSum=%lld) fence2=%lld xdevbar2=%lld tk\n",
           tk, _tp[1] - _tp[0], _tp[2] - _tp[1], _tp[3] - _tp[2], _tp[4] - _tp[3],
-          _tp[5] - _tp[4]);
+          _tp[5] - _tp[4], _tp[6] - _tp[5], _tp[7] - _tp[6], _tp[8] - _tp[7],
+          _nbCopy, _nbAtom, _tp[9] - _tp[8], _tp[10] - _tp[9]);
     }
 #endif
 #undef TSTAMP
