@@ -3870,36 +3870,7 @@ class HierAllGather:
         collection = self._slice_scratch[:slice_total]
 
         # Register the user output for the direct SDMA push (lockstep, LRU-cached).
-        out_ptr = output_data.data_ptr()
-        out_size = output_data.numel() * output_data.element_size()
-        if self._reg_cache_cap <= 1:
-            _reg_changed = (out_ptr, out_size) != (
-                self._direct_reg_ptr,
-                self._direct_reg_size,
-            )
-        else:
-            _reg_changed = (out_ptr, out_size) not in self._direct_reg_lru
         self._ensure_output_registered(output_data)
-        # DIAGNOSTIC (MORI_HIER_REG_STATS=1): count how often the output ptr
-        # CHANGES across per-layer AG calls. Each change is a cross-node COLLECTIVE
-        # (deregister+register ShmemSymmetric*) that RCCL never pays and that cannot
-        # overlap -> a candidate for the in-FSDP per-AG inflation. If steady state
-        # shows ~0 changes/call, registration churn is NOT the bottleneck.
-        if os.environ.get("MORI_HIER_REG_STATS", "0") in ("1", "true", "True"):
-            self._reg_calls = getattr(self, "_reg_calls", 0) + 1
-            if _reg_changed:
-                self._reg_changes = getattr(self, "_reg_changes", 0) + 1
-            if self._reg_calls % 100 == 0:
-                sys.stderr.write(
-                    "[MORI_HIER_REG_STATS] calls=%d reg_changes=%d (%.1f%% of calls "
-                    "trigger a cross-node register collective)\n"
-                    % (
-                        self._reg_calls,
-                        getattr(self, "_reg_changes", 0),
-                        100.0 * getattr(self, "_reg_changes", 0) / self._reg_calls,
-                    )
-                )
-                sys.stderr.flush()
 
         # Split geometry in u32 lanes (SDMA byte move); the 4-byte alignment guard
         # above makes these conversions exact. CACHE the u32 GPU tensors keyed by
