@@ -511,8 +511,8 @@ class MoriAllGather(AllGather):
             "false",
             "False",
         )
-        # ASYNC correctness defaults. The deferred-completion path is
-        # bit-exact + >native (269 TFLOPS = 1.07x, vs sync 232) ONLY with BOTH of:
+        # ASYNC correctness defaults. The deferred-completion path is bit-exact
+        # ONLY with BOTH of:
         #   * ASYNC_DRAIN: host-drain the AG stream after _complete so step-3 (the
         #     remote-half broadcast) is landed+visible before FSDP's copy-out reads
         #     ``out`` (else a completion-visibility race -> garbage remote half ->
@@ -522,7 +522,7 @@ class MoriAllGather(AllGather):
         #     nondeterministic drift in later windows).
         # Enabling ASYNC without these is a NaN/drift footgun, so turn them on by
         # default whenever ASYNC is requested (setdefault => explicit overrides win,
-        # so a 0/1 A/B is still available). Both verified bit-exact 3 reps @50/20.
+        # so a 0/1 A/B is still available).
         if self._hostproxy_async:
             os.environ.setdefault("MORI_HOSTPROXY_ASYNC_DRAIN", "1")
             os.environ.setdefault("MORI_HOSTPROXY_ASYNC_RING", "2")
