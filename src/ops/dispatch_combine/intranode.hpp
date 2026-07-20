@@ -228,6 +228,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     NotifyGridBarrier(args.dispatchGridBarrier, barExp);
     TSTAMP();  // [1] after zero-counter + setup grid barrier
 
+#if !defined(MORI_DISP_NOTIFY_ISOB)
     // ---- Pass A: count committed (token -> destPe) into localCnt (agent atomic) ----
     if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
       for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
@@ -290,6 +291,31 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       *args.totalRecvTokenNum = tot;
     }
     TSTAMP();  // [6] after prefix-sum base compute (pre grid barrier)
+#else
+    // ===== ISOLATED PASS B PROBE (MORI_DISP_NOTIFY_ISOB) =====
+    // Skip Pass A / count-matrix exchange / cross-device barrier #1 / prefix-sum
+    // entirely: fake baseArr[d]=0 for every destPe instead of computing it from
+    // real per-rank counts. This tests whether Pass B's copySum is intrinsically
+    // ~2x the legacy path even with none of the two-pass machinery (and none of
+    // its cache/TLB-state history) in front of it -- i.e. isolates "is Pass B's
+    // WarpCopy itself slow" from "does the two-pass structure make it slow".
+    // Overlapping baseArr=0 across all source ranks means multiple ranks race to
+    // write the SAME destination slots -- wrong dispatch output, but timing-only
+    // (never enable together with --cmd bench's correctness check).
+    if (globalThdId < npes) {
+      baseArr[globalThdId] = 0;
+      localCnt[globalThdId] = 0;
+    }
+    // Emit the same 5 TSTAMP() calls (indices [2]..[6]) the non-ISOB path emits
+    // between the setup barrier and grid barrier #2, so _tp[]/printf indexing
+    // downstream (gridbar2/sendB/fence2/xdevbar2) stays aligned; only sendB
+    // (tp[8]-tp[7]) is meaningful here, the rest collapse to ~0.
+    TSTAMP();  // [2] (Pass A skipped)
+    TSTAMP();  // [3] (gridbar1 skipped)
+    TSTAMP();  // [4] (exch+fence skipped)
+    TSTAMP();  // [5] (xdevbar1 skipped)
+    TSTAMP();  // [6] after fake base fill (pre grid barrier)
+#endif  // MORI_DISP_NOTIFY_ISOB
     barExp += gridDim.x;
     NotifyGridBarrier(args.dispatchGridBarrier, barExp);
     TSTAMP();  // [7] after grid barrier #2

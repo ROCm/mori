@@ -301,6 +301,16 @@ def _disp_notify_defines() -> list[str]:
     return ["-DMORI_DISP_NOTIFY"] if val.lower() in ("1", "true", "on", "yes") else []
 
 
+def _disp_notify_isob_defines() -> list[str]:
+    """Diagnostic: -DMORI_DISP_NOTIFY_ISOB isolates NOTIFY's Pass B (payload send
+    with fake baseArr=0, skipping Pass A / count-matrix exchange / cross-device
+    barrier #1 / prefix-sum) to test whether Pass B's copySum is intrinsically
+    slow on its own, independent of the two-pass machinery in front of it.
+    Requires MORI_DISP_NOTIFY=1 too; timing-only (breaks dispatch correctness)."""
+    val = os.environ.get("MORI_DISP_NOTIFY_ISOB", "")
+    return ["-DMORI_DISP_NOTIFY_ISOB"] if val.lower() in ("1", "true", "on", "yes") else []
+
+
 def _disp_prebarrier_defines() -> list[str]:
     """Diagnostic: -DMORI_DISP_PREBARRIER inserts a grid barrier before the legacy
     dispatch send loop (forces all blocks to start sending simultaneously) to test
@@ -457,6 +467,7 @@ def _hipcc_genco(
         *_ocp_fp_defines(cfg.arch),
         *_disp_tdm_defines(),
         *_disp_notify_defines(),
+        *_disp_notify_isob_defines(),
         *_disp_timing_defines(),
         *_disp_prebarrier_defines(),
     ]

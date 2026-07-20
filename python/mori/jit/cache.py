@@ -95,6 +95,11 @@ def get_cache_dir(
         if os.environ.get("MORI_DISP_NOTIFY", "").lower() in ("1", "true", "on", "yes")
         else ""
     )
+    notify_isob_suffix = (
+        "_dispnotifyisob"
+        if os.environ.get("MORI_DISP_NOTIFY_ISOB", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
     timing_suffix = (
         "_disptiming"
         if os.environ.get("MORI_DISP_TIMING", "").lower() in ("1", "true", "on", "yes")
@@ -107,7 +112,7 @@ def get_cache_dir(
     )
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{notify_suffix}{timing_suffix}{prebarrier_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{notify_suffix}{notify_isob_suffix}{timing_suffix}{prebarrier_suffix}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)
