@@ -168,11 +168,9 @@ def _ag_verify_dump() -> None:
 
 
 # --- per-call GPU-time timing (MORI_FSDP_AG_TIMING=1) ----------------------
-# Measures the EFFECTIVE per-all-gather GPU bandwidth INSIDE the FSDP step, to
-# compare against the standalone slice_direct number (141 GB/s @ 64MiB/rank,
-# 1.06x behind native). If the FSDP per-AG bandwidth ~= standalone, the ~13% FSDP
-# gap is pure exposure/overlap; if it's much lower, per-call host/launch/finish
-# overhead is the cause. Bucketed by log2(out bytes). One cuda sync per dump.
+# Diagnostic (default OFF): measures effective per-all-gather GPU bandwidth
+# INSIDE the FSDP step, bucketed by log2(out bytes), to separate per-call
+# overlap/exposure from raw all-gather bandwidth. One cuda sync per dump.
 _AG_TIMING = os.environ.get("MORI_FSDP_AG_TIMING", "") not in (
     "",
     "0",
