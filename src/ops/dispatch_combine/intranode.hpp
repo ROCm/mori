@@ -119,6 +119,24 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   __syncthreads();
 }
 
+#if defined(MORI_DISP_NOTIFY)
+// Monotonic reusable intra-GPU grid barrier over a local uint32 counter. The
+// counter must be 0 at kernel entry and is left non-zero until reset by the
+// caller; each call advances the arrival total by gridDim.x and blocks until it
+// reaches `expected` (= barrierIndex * gridDim.x). Correct ONLY when every block
+// is co-resident (block_num <= CU) -- guaranteed by the tuned dispatch geometry
+// (192 <= 256 CU); a non-resident block would never arrive and deadlock.
+__device__ __forceinline__ void NotifyGridBarrier(uint32_t* bar, uint32_t expected) {
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __hip_atomic_fetch_add(bar, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+    while (__hip_atomic_load(bar, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < expected) {
+    }
+  }
+  __syncthreads();
+}
+#endif
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpDispatchIntraNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
@@ -154,6 +172,147 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   T* _tdmTile = reinterpret_cast<T*>(_tdmDispSmem) + (size_t)warpId * hiddenDim;
   const T* _tdmSrc = nullptr;   // src of the token whose load is in flight this iter
 #endif
+
+#if defined(MORI_DISP_NOTIFY)
+  // ===================== NOTIFY-based slot pre-assignment =====================
+  // Two passes with an intra-GPU grid barrier between them (all blocks co-resident
+  // at the tuned geometry). Eliminates the per-token cross-GPU (system-scope) slot
+  // atomic: (A) count committed tokens per dest PE locally, (B) exchange the count
+  // matrix + cross-device barrier, compute each source rank's contiguous slot base,
+  // (C) send with a LOCAL (agent-scope) slot atomic inside the pre-assigned region.
+  {
+    const int globalThdId = blockIdx.x * blockDim.x + thdId;
+    const int totalThreads = gridDim.x * blockDim.x;
+    index_t* localCnt = args.dispTokOffsetMemObj->template GetAs<index_t*>();     // [npes]
+    index_t* baseArr = args.destPeTokenCounter;                                   // [npes] (reused)
+    index_t* matLocal = args.dispCountMatrixMemObj->template GetAs<index_t*>();   // [npes*npes]
+    const uint64_t xdevFlag = args.crossDeviceBarrierFlag[0];
+    uint32_t barExp = 0;
+
+    // zero local per-destPe counter
+    for (int d = globalThdId; d < npes; d += totalThreads) localCnt[d] = 0;
+    barExp += gridDim.x;
+    NotifyGridBarrier(args.dispatchGridBarrier, barExp);
+
+    // ---- Pass A: count committed (token -> destPe) into localCnt (agent atomic) ----
+    if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
+      for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
+           i += globalWarpNum) {
+        index_t srcTokId = i / config.numExpertPerToken;
+        index_t destExpert = args.tokenIndices[i];
+        if (destExpert < 0) {
+          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+          continue;
+        }
+        index_t destPe = destExpert / config.numExpertPerRank;
+        if (destPe < 0 || destPe >= config.worldSize) {
+          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+          continue;
+        }
+        int condition = 0;
+        if (laneId < (i % config.numExpertPerToken)) {
+          index_t otherExpert = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+          condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
+        }
+        if (__any(condition)) {
+          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+          continue;
+        }
+        if (laneId == 0) atomicAdd(&localCnt[destPe], 1);
+      }
+    }
+    barExp += gridDim.x;
+    NotifyGridBarrier(args.dispatchGridBarrier, barExp);
+
+    // ---- Exchange: block 0 writes my count row to every peer's matrix[myPe][*] ----
+    if (blockIdx.x == 0 && warpId == 0) {
+      for (int p = laneId; p < npes; p += warpSize) {
+        index_t* peerMat = args.dispCountMatrixMemObj->template GetAs<index_t*>(p);
+        for (int d = 0; d < npes; ++d) peerMat[myPe * npes + d] = localCnt[d];
+      }
+    }
+    __threadfence_system();
+    CrossDeviceBarrierIntraNodeKernel(args, xdevFlag);
+
+    // ---- Compute base[destPe] = sum_{s<myPe} M[s][destPe]; recvCount; reset localCnt ----
+    if (globalThdId < npes) {
+      int d = globalThdId;
+      index_t b = 0;
+      for (int s = 0; s < myPe; ++s) b += matLocal[s * npes + d];
+      baseArr[d] = b;
+      localCnt[d] = 0;
+    }
+    if (globalThdId == 0) {
+      index_t tot = 0;
+      for (int s = 0; s < npes; ++s) tot += matLocal[s * npes + myPe];
+      *args.totalRecvTokenNum = tot;
+    }
+    barExp += gridDim.x;
+    NotifyGridBarrier(args.dispatchGridBarrier, barExp);
+
+    // ---- Pass B: send payload with LOCAL slot assignment inside the region ----
+    if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
+      for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
+           i += globalWarpNum) {
+        index_t srcTokId = i / config.numExpertPerToken;
+        index_t destExpert = args.tokenIndices[i];
+        if (destExpert < 0) continue;
+        index_t destPe = destExpert / config.numExpertPerRank;
+        if (destPe < 0 || destPe >= config.worldSize) continue;
+        int condition = 0;
+        if (laneId < (i % config.numExpertPerToken)) {
+          index_t otherExpert = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+          condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
+        }
+        if (__any(condition)) continue;
+
+        index_t destTokId = 0;
+        if (laneId == 0) {
+          destTokId = baseArr[destPe] + atomicAdd(&localCnt[destPe], 1);
+          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+              FlatTokenIndex(config, myPe, srcTokId);
+        }
+        destTokId = __shfl(destTokId, 0);
+
+        if (laneId < config.numExpertPerToken) {
+          if (args.weightsBuf) {
+            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
+                destPe)[destTokId * config.numExpertPerToken + laneId] =
+                args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+          }
+          args.shmemOutIndicesMemObj->template GetAs<index_t*>(
+              destPe)[destTokId * config.numExpertPerToken + laneId] =
+              args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+        }
+        if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+          size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
+          size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
+          core::WarpCopy(
+              args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
+              args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
+        }
+        size_t srcTokOffset = srcTokId * hiddenDim;
+        size_t destTokOffset = destTokId * hiddenDim;
+        core::WarpCopy<T, 8>(
+            args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
+            args.inpTokenBuf + srcTokOffset, hiddenDim);
+      }
+    }
+
+    // Make all payload/metadata writes visible to peers, then cross-device barrier
+    // so combine (next kernel) observes the dispatched data.
+    __threadfence_system();
+    CrossDeviceBarrierIntraNodeKernel(args, xdevFlag + 1);
+    if (globalThdId == 0) *args.dispatchGridBarrier = 0;  // reset for next launch
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+    if constexpr (EnableStdMoE) {
+      InvokeConvertDispatchOutput<T>(args, myPe);
+    }
+#endif
+    return;
+  }
+#endif  // MORI_DISP_NOTIFY
 
   IF_ENABLE_PROFILER(
       INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));

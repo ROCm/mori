@@ -441,6 +441,12 @@ class EpDispatchCombineHandle {
   // Intra-node kernel parameters
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
+  // NOTIFY-based slot pre-assignment (MORI_DISP_NOTIFY): symmetric count matrix
+  // M[src][dest] (worldSize*worldSize index_t). Each rank writes its row (counts
+  // to each dest PE) to every peer; after a barrier every rank has the full matrix
+  // and computes contiguous per-source slot regions, so payload send needs only a
+  // LOCAL atomic within its region instead of a cross-GPU remote atomic.
+  mori::application::SymmMemObjPtr dispCountMatrixMemObj;
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
@@ -511,6 +517,7 @@ struct EpDispatchCombineArgs {
   index_t* srcPeTokenIdxMap{nullptr};
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
+  mori::application::SymmMemObjPtr dispCountMatrixMemObj;
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   index_t* dispTokIdToSrcTokIdLocal{nullptr};
@@ -578,6 +585,7 @@ struct EpDispatchCombineArgsRaw {
   index_t* srcPeTokenIdxMap{nullptr};
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
+  mori::application::SymmMemObjPtr dispCountMatrixMemObj;
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   index_t* dispTokIdToSrcTokIdLocal{nullptr};

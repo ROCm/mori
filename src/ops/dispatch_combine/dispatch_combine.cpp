@@ -482,9 +482,18 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&localPeTokenCounter, config.worldSize * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(localPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
 
-  dispTokOffsetMemObj = MallocSymm(sizeof(index_t), hipDeviceMallocUncached);
+  // Sized worldSize so the NOTIFY path can reuse it as a per-destPe LOCAL slot
+  // counter (agent-scope atomic within this rank), not just the [0] remote counter
+  // the original global-atomic path used.
+  dispTokOffsetMemObj =
+      MallocSymm(static_cast<size_t>(config.worldSize) * sizeof(index_t), hipDeviceMallocUncached);
   dispTokIdToSrcTokIdMemObj =
       MallocSymm(maxNumOutToken * sizeof(index_t), hipDeviceMallocUncached);
+  // NOTIFY count matrix M[src][dest]: worldSize*worldSize index_t (symmetric; each
+  // rank writes its row to every peer, then reads the full matrix locally).
+  dispCountMatrixMemObj = MallocSymm(
+      static_cast<size_t>(config.worldSize) * config.worldSize * sizeof(index_t),
+      hipDeviceMallocUncached);
 
   HIP_RUNTIME_CHECK(hipMalloc(&dispDestTokIdMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
@@ -526,6 +535,7 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(localPeTokenCounter));
   FreeSymmByLocalPtr(dispTokOffsetMemObj->localPtr);
   FreeSymmByLocalPtr(dispTokIdToSrcTokIdMemObj->localPtr);
+  FreeSymmByLocalPtr(dispCountMatrixMemObj->localPtr);
   HIP_RUNTIME_CHECK(hipFree(dispDestTokIdMap));
   HIP_RUNTIME_CHECK(hipFree(interNodeDispDestTokIdMap));
   HIP_RUNTIME_CHECK(hipFree(blockFlagCounter));
@@ -622,6 +632,7 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   args.srcPeTokenIdxMap = handle.srcPeTokenIdxMap;
   args.dispTokOffsetMemObj = handle.dispTokOffsetMemObj;
   args.dispTokIdToSrcTokIdMemObj = handle.dispTokIdToSrcTokIdMemObj;
+  args.dispCountMatrixMemObj = handle.dispCountMatrixMemObj;
   args.dispDestTokIdMap = handle.dispDestTokIdMap;
   args.totalRecvTokenNum = handle.totalRecvTokenNum;
   args.crossDeviceBarrierMemObj = handle.crossDeviceBarrierMemObj;

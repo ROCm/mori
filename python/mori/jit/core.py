@@ -293,6 +293,14 @@ def _disp_tdm_defines() -> list[str]:
     return ["-DMORI_DISP_TDM"] if val.lower() in ("1", "true", "on", "yes") else []
 
 
+def _disp_notify_defines() -> list[str]:
+    """Experimental: -DMORI_DISP_NOTIFY switches the EP IntraNode dispatch to the
+    NOTIFY-based slot pre-assignment (2-pass count-exchange + local slot atomic,
+    no per-token cross-GPU atomic). Gated by the MORI_DISP_NOTIFY env."""
+    val = os.environ.get("MORI_DISP_NOTIFY", "")
+    return ["-DMORI_DISP_NOTIFY"] if val.lower() in ("1", "true", "on", "yes") else []
+
+
 def _ocp_fp_defines(arch: str) -> list[str]:
     """Enable the native gfx950 OCP FP4/FP8 conversion instructions (cvt_scalef32_pk_*) used by
     the fp4_blockwise combine's E2M1 quant/dequant helpers. Without this the helpers fall back to
@@ -432,6 +440,7 @@ def _hipcc_genco(
         *_profiler_defines(),
         *_ocp_fp_defines(cfg.arch),
         *_disp_tdm_defines(),
+        *_disp_notify_defines(),
     ]
 
     for d in include_dirs:
