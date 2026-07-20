@@ -361,71 +361,14 @@ class HierAllGather:
         if inter_num_qp is None:
             inter_num_qp = _env_int("MORI_NUM_QP_PER_PE", "4")
         self.inter_num_qp = max(1, inter_num_qp)
-        # M4: opt-in multi-block ("channels") inter-node ring. The
-        # single-block ring (numQp warps in ONE CTA) saturated at ~63 GB/s vs
-        # RCCL's ~150 (-18: numQp 4->8 = 0 gain). num_blocks>1 launches
+        # Opt-in multi-block ("channels") inter-node ring: num_blocks>1 launches
         # the ring as that many CTAs, each driving a disjoint chunk sub-range on
-        # its own QP -- the RCCL channel model. Engaged only for true RDMA
+        # its own QP (the RCCL channel model). Engaged only for true RDMA
         # neighbours; single-node sims fall back to one working block. Default 1
-        # == unchanged single-block ring. Toggle via env MORI_HIER_RING_BLOCKS.
-        #
-        # Validated negative on true cross-node RDMA (N=2 G=4 fp32
-        # 64MiB/rank, both bit-exact vs torch
-        # all_gather_into_tensor): the inter (RDMA ring) phase did NOT improve:
-        #   num_blocks=1 (4-QP fan-out in 1 CTA): inter min ~7.25-7.35ms, ~49.9 GB/s
-        #   num_blocks=4 (1 QP per CTA, 4 CTAs):  inter min ~7.71ms,       ~46.8 GB/s
-        # (RCCL ~143 GB/s.) 4 channels match-or-lose vs the 4-QP single block.
-        # ROOT CAUSE: the per-NIC RDMA throughput is already saturated at numQp>=4
-        # whether those QPs are driven from ONE CTA (fan-out, ) or MANY CTAs
-        # (channels) -- consistent with  (numQp 4->8 gave 0 gain,
-        # bandwidth-limited). Spreading the same QPs across CTAs only adds
-        # CTA-scheduling + concurrent per-QP quiet overhead; it does not add NIC
-        # bandwidth. So the ~2.4-2.8x gap vs RCCL is NOT a channel-count problem;
-        # RCCL's edge is in the RDMA transport efficiency itself (inflight depth /
-        # protocol), not the number of GPU CTAs feeding it. Kept opt-in (default
-        # num_blocks=1, proven path since ) so the lever isn't re-litigated.
-        #
-        # M4: tested the LAST source-side hypothesis for the per-NIC
-        # ceiling -- that the NIC's RDMA source-read is slow because the symmetric
-        # ring buffer lives in the UNCACHED heap (default HeapType::Uncached, see
-        # src/shmem/init.cpp ConfigureHeapType; the same uncached write that made
-        # the copy-IN elimination neutral in -24). If the NIC read from
-        # cached HBM were faster, MORI_SHMEM_HEAP_TYPE=normal would lift the ring.
-        # Validated negative on true cross-node RDMA (N=2 G=4 fp32 64MiB/rank,
-        # both bit-exact vs torch all_gather_into_tensor):
-        #   uncached (default): mori ~60.6 GB/s | inter 6.93ms | rccl 141.9
-        #   normal   (cached):  mori ~62.3 GB/s | inter 6.86ms | rccl 143.2
-        # => +2.8% end-to-end, within noise; the inter (RDMA ring) phase is
-        # UNCHANGED (6.93 vs 6.86ms). So the NIC source-read memory type is NOT the
-        # bottleneck -- this confirms the  conclusion from the other
-        # direction: the ~2.3x RCCL gap is in the RDMA transport protocol/inflight
-        # efficiency of ShmemPutMemNbiWarp (one WQE per QP per round; the fast path
-        # in shmem_ibgda_kernels.hpp posts the whole sub-range as a single RDMA
-        # write), not heap caching, channel count, or staging. All GPU-side and
-        # source-memory levers are now exhausted; closing the gap further needs a
-        # finer-grained transport (multiple in-flight WQEs/messages per QP), a
-        # deeper change to the shmem layer than this hierarchical op should own.
-        #
-        # M4 (, 2026-06-29): closed the "multiple in-flight WQEs/messages
-        # per QP" hypothesis from the SLICE direction.  tested putChunkBytes
-        # (MORI_RDMA_PUT_CHUNK_BYTES splits one QP's RDMA write into K in-flight
-        # WQEs) on the NON-sliced single-QP path (whole 256MiB node-block, 1 QP)
-        # and found it neutral/negative -- but that was before the 4-QP
-        # fan-out existed, so it was never re-measured on the shipped slice path
-        # where each QP already carries only peChunkSize/numQp (16MiB @64MiB/rank,
-        # 4 QPs). Re-ran the combo on the shipped slice_direct path (true
-        # cross-node, N=2 G=4 fp32 64MiB/rank, both bit-exact vs torch
-        # all_gather_into_tensor):
-        #   chunk OFF (1 WQE/QP):   mori min=3.807ms 141.0 GB/s | rccl 3.575 150.2 | 1.06x
-        #   chunk 4MiB (4 WQE/QP):  mori min=3.812ms 140.8 GB/s | rccl 3.507 153.1 | 1.09x
-        # => NEUTRAL (-0.1% mori-side, pure noise; rccl draw differs). Pipelining
-        # each 16MiB per-QP sub-range into 4 in-flight WQEs does NOT raise NIC fill
-        # -- confirming from BOTH the non-sliced AND the sliced-fan-out
-        # (this turn) directions that the per-QP RDMA write is already bandwidth-
-        # saturated. The residual ~1.06-1.09x gap is NOT WQE inflight depth; it is
-        # the 2 on-stream global ShmemBarrierOnStream fences bracketing the single
-        # N=2 ring round + the round's quiet-drain latency, which RCCL avoids via a
-        # persistent fused kernel with inline flag sync (no global barriers).
+        # (single-block ring) -- multi-block was measured neutral/negative (the
+        # per-NIC RDMA throughput is already saturated at numQp>=4, so spreading
+        # the same QPs across CTAs adds scheduling overhead without NIC bandwidth).
+        # Kept opt-in via env MORI_HIER_RING_BLOCKS for A/B.
         if inter_num_blocks is None:
             inter_num_blocks = _env_int("MORI_HIER_RING_BLOCKS", "1")
         self.inter_num_blocks = max(1, inter_num_blocks)
