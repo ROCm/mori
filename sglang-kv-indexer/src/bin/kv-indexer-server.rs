@@ -1,20 +1,19 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use sglang_kv_indexer::pb::{
-    GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse, MatchExternalKvRequest,
-    MatchExternalKvResponse, ReportExternalKvBlocksRequest, RevokeAllExternalKvBlocksAtTierRequest,
-    RevokeExternalKvBlocksRequest,
-};
 use sglang_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
-use sglang_kv_indexer::{KvIndexerBackend, KvIndexerService};
+use sglang_kv_indexer::pb::{
+    ApplyExternalKvBatchRequest, ExternalKvActionType, GetExternalKvHitCountsRequest,
+    GetExternalKvHitCountsResponse, MatchExternalKvRequest, MatchExternalKvResponse,
+};
+use sglang_kv_indexer::{KvIndexerBackend, KvIndexerService, NoopKvIndexerBackend};
 use tonic::transport::Server;
 use tonic::Status;
 use tracing::info;
 
 /// A small stateful backend for joint debugging: it keeps the live set of
-/// (tier, hash) blocks in memory and logs running totals on every RPC so the
+/// (tier, hash) blocks in memory and logs running totals on every apply, so the
 /// indexer side of the SGLang -> bridge -> indexer chain is observable.
 #[derive(Default)]
 struct LoggingKvIndexerBackend {
@@ -27,75 +26,60 @@ impl LoggingKvIndexerBackend {
     }
 }
 
+#[tonic::async_trait]
 impl KvIndexerBackend for LoggingKvIndexerBackend {
-    fn report_external_kv_blocks(
+    async fn apply_external_kv_batch(
         &self,
-        request: ReportExternalKvBlocksRequest,
+        request: ApplyExternalKvBatchRequest,
     ) -> Result<(), Status> {
+        let (mut reported, mut revoked, mut cleared) = (0usize, 0usize, 0usize);
         {
             let mut live = self.live.lock().unwrap();
-            for hash in &request.hashes {
-                live.insert((request.tier, hash.clone()));
+            for action in &request.actions {
+                match ExternalKvActionType::try_from(action.r#type) {
+                    Ok(ExternalKvActionType::ActionReport) => {
+                        for hash in &action.hashes {
+                            if live.insert((action.tier, hash.clone())) {
+                                reported += 1;
+                            }
+                        }
+                    }
+                    Ok(ExternalKvActionType::ActionRevoke) => {
+                        for hash in &action.hashes {
+                            if live.remove(&(action.tier, hash.clone())) {
+                                revoked += 1;
+                            }
+                        }
+                    }
+                    Ok(ExternalKvActionType::ActionClearAllAtTier) => {
+                        let before = live.len();
+                        live.retain(|(tier, _)| *tier != action.tier);
+                        cleared += before - live.len();
+                    }
+                    _ => {}
+                }
             }
         }
         info!(
             worker = %request.worker_id,
-            tier = request.tier,
-            added = request.hashes.len(),
+            seq = request.seq,
+            reported,
+            revoked,
+            cleared,
             live_total = self.total(),
-            "REPORT external kv blocks"
+            "APPLY external kv batch"
         );
         Ok(())
     }
 
-    fn revoke_external_kv_blocks(
-        &self,
-        request: RevokeExternalKvBlocksRequest,
-    ) -> Result<(), Status> {
-        {
-            let mut live = self.live.lock().unwrap();
-            for hash in &request.hashes {
-                live.remove(&(request.tier, hash.clone()));
-            }
-        }
-        info!(
-            worker = %request.worker_id,
-            tier = request.tier,
-            removed = request.hashes.len(),
-            live_total = self.total(),
-            "REVOKE external kv blocks"
-        );
-        Ok(())
-    }
-
-    fn revoke_all_external_kv_blocks_at_tier(
-        &self,
-        request: RevokeAllExternalKvBlocksAtTierRequest,
-    ) -> Result<(), Status> {
-        let removed = {
-            let mut live = self.live.lock().unwrap();
-            let before = live.len();
-            live.retain(|(tier, _)| *tier != request.tier);
-            before - live.len()
-        };
-        info!(
-            worker = %request.worker_id,
-            tier = request.tier,
-            removed,
-            live_total = self.total(),
-            "REVOKE_ALL external kv blocks at tier"
-        );
-        Ok(())
-    }
-
-    fn match_external_kv(
+    async fn match_external_kv(
         &self,
         _request: MatchExternalKvRequest,
     ) -> Result<MatchExternalKvResponse, Status> {
         Ok(MatchExternalKvResponse { matches: vec![] })
     }
 
-    fn get_external_kv_hit_counts(
+    async fn get_external_kv_hit_counts(
         &self,
         _request: GetExternalKvHitCountsRequest,
     ) -> Result<GetExternalKvHitCountsResponse, Status> {
@@ -104,11 +88,10 @@ impl KvIndexerBackend for LoggingKvIndexerBackend {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -116,7 +99,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "[::1]:50051".to_string())
         .parse::<SocketAddr>()?;
 
-    let service = KvIndexerServer::new(KvIndexerService::new(LoggingKvIndexerBackend::default()));
+    let backend = select_backend().await?;
+    let service = KvIndexerServer::new(KvIndexerService::new(backend));
 
     info!(%addr, "starting SGLang KV Indexer gRPC server");
     Server::builder()
@@ -125,6 +109,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
+}
+
+/// Selects the storage backend from `KV_INDEXER_BACKEND`:
+///   * `logging` (default) — in-memory, logs running totals; for joint debugging.
+///   * `noop` — discards everything.
+///   * `redis` — the Redis backend (requires the `redis-backend` cargo feature).
+///
+/// The Redis backend lives behind the feature so the default build stays light;
+/// requesting `redis` without it is a loud startup error rather than a silent
+/// fallback.
+async fn select_backend(
+) -> Result<Arc<dyn KvIndexerBackend>, Box<dyn std::error::Error + Send + Sync>> {
+    let backend = std::env::var("KV_INDEXER_BACKEND").unwrap_or_else(|_| "logging".to_string());
+    match backend.as_str() {
+        "logging" => {
+            info!("using logging backend");
+            Ok(Arc::new(LoggingKvIndexerBackend::default()))
+        }
+        "noop" => {
+            info!("using noop backend");
+            Ok(Arc::new(NoopKvIndexerBackend))
+        }
+        "redis" => {
+            #[cfg(feature = "redis-backend")]
+            {
+                info!("using redis backend");
+                let backend = sglang_kv_indexer::RedisKvIndexerBackend::from_env().await?;
+                Ok(Arc::new(backend))
+            }
+            #[cfg(not(feature = "redis-backend"))]
+            {
+                Err(
+                    "KV_INDEXER_BACKEND=redis requires building with --features redis-backend"
+                        .into(),
+                )
+            }
+        }
+        other => Err(format!("unknown KV_INDEXER_BACKEND: {other}").into()),
+    }
 }
 
 async fn shutdown_signal() {

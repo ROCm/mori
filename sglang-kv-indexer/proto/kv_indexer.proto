@@ -40,6 +40,39 @@ message MatchExternalKvRequest {
   bool count_as_hit = 2;
 }
 
+// The kind of mutation a single ExternalKvAction carries. Mirrors the three
+// legacy single-mutation RPCs so a whole SGLang KVEventBatch can be applied in
+// one call while preserving the exact per-action ordering.
+enum ExternalKvActionType {
+  ACTION_UNKNOWN = 0;
+  ACTION_REPORT = 1;             // like ReportExternalKvBlocks
+  ACTION_REVOKE = 2;             // like RevokeExternalKvBlocks
+  ACTION_CLEAR_ALL_AT_TIER = 3;  // like RevokeAllExternalKvBlocksAtTier
+}
+
+message ExternalKvAction {
+  ExternalKvActionType type = 1;
+  TierType tier = 2;
+  // Non-empty for REPORT/REVOKE; ignored for CLEAR_ALL_AT_TIER.
+  repeated string hashes = 3;
+}
+
+message ApplyExternalKvBatchRequest {
+  string worker_id = 1;
+  // The SGLang batch sequence number. Carried as metadata / idempotency key;
+  // the indexer does not gate ordering on it (the bridge is the seq authority).
+  uint64 seq = 2;
+  repeated ExternalKvAction actions = 3;
+  // The worker's KV-transfer address, used to populate MatchExternalKvResponse.
+  // Supplied by the bridge; may be empty (e.g. legacy callers that never set it),
+  // in which case matches for this worker carry an empty address.
+  string worker_address = 4;
+}
+
+// Empty for now; reserved so an ack (e.g. last_applied_seq) can be added later
+// without a breaking change.
+message ApplyExternalKvBatchResponse {}
+
 message TierHashes {
   TierType tier = 1;
   repeated string hashes = 2;
@@ -74,4 +107,8 @@ service KVIndexer {
   rpc RevokeAllExternalKvBlocksAtTier(RevokeAllExternalKvBlocksAtTierRequest) returns (Empty);
   rpc MatchExternalKv(MatchExternalKvRequest) returns (MatchExternalKvResponse);
   rpc GetExternalKvHitCounts(GetExternalKvHitCountsRequest) returns (GetExternalKvHitCountsResponse);
+
+  // Applies a whole SGLang KVEventBatch in one call. Preferred over the three
+  // single-mutation RPCs above, which are kept for backward compatibility.
+  rpc ApplyExternalKvBatch(ApplyExternalKvBatchRequest) returns (ApplyExternalKvBatchResponse);
 }

@@ -9,8 +9,8 @@ use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage
 
 use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::{
-    MatchExternalKvRequest, ReportExternalKvBlocksRequest, RevokeAllExternalKvBlocksAtTierRequest,
-    RevokeExternalKvBlocksRequest, TierType,
+    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, MatchExternalKvRequest,
+    TierType,
 };
 
 /// Backoff bounds for the reconnect supervisor loop.
@@ -21,6 +21,9 @@ const REPLAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
     pub worker_id: String,
+    /// The worker's KV-transfer address, forwarded on every apply batch so the
+    /// indexer can answer MatchExternalKv with an address. Empty if unset.
+    pub worker_address: String,
     pub event_endpoint: String,
     pub event_replay_endpoint: Option<String>,
     pub event_topic: String,
@@ -32,6 +35,7 @@ impl BridgeConfig {
     pub fn from_env() -> Result<Self, BridgeError> {
         let worker_id = std::env::var("KV_INDEXER_WORKER_ID")
             .map_err(|_| BridgeError::Config("KV_INDEXER_WORKER_ID is required".to_string()))?;
+        let worker_address = std::env::var("KV_INDEXER_WORKER_ADDRESS").unwrap_or_default();
         let event_endpoint = std::env::var("SGLANG_KV_EVENT_ENDPOINT")
             .unwrap_or_else(|_| "tcp://127.0.0.1:5557".to_string());
         let event_replay_endpoint = std::env::var("SGLANG_KV_EVENT_REPLAY_ENDPOINT").ok();
@@ -40,12 +44,12 @@ impl BridgeConfig {
         let indexer_endpoint = std::env::var("KV_INDEXER_ENDPOINT")
             .unwrap_or_else(|_| "http://[::1]:50051".to_string());
         let clear_tiers = parse_clear_tiers(
-            &std::env::var("KV_INDEXER_CLEAR_TIERS")
-                .unwrap_or_else(|_| "HBM,DRAM,SSD".to_string()),
+            &std::env::var("KV_INDEXER_CLEAR_TIERS").unwrap_or_else(|_| "HBM,DRAM,SSD".to_string()),
         )?;
 
         Ok(Self {
             worker_id,
+            worker_address,
             event_endpoint,
             event_replay_endpoint,
             event_topic,
@@ -272,7 +276,11 @@ async fn run_session(
 
         if let Some(expected) = *next_seq {
             if seq < expected {
-                warn!(expected, actual = seq, "skipping stale SGLang KV event batch");
+                warn!(
+                    expected,
+                    actual = seq,
+                    "skipping stale SGLang KV event batch"
+                );
                 continue;
             }
             if seq > expected {
@@ -281,7 +289,13 @@ async fn run_session(
             }
         }
 
-        commit_batch(config, &mut client, &RawBatch { seq, payload }, pending_batch).await?;
+        commit_batch(
+            config,
+            &mut client,
+            &RawBatch { seq, payload },
+            pending_batch,
+        )
+        .await?;
         *next_seq = seq.checked_add(1);
     }
 }
@@ -307,8 +321,7 @@ async fn replay_missing_batches(
     // ROUTER sees [identity, b"", start_seq]. Unlike REQ, DEALER neither adds
     // this delimiter nor enforces strict send/recv alternation, so we can read
     // the many per-batch replies the ROUTER streams back for one request.
-    let mut request =
-        ZmqMessage::from(bytes::Bytes::copy_from_slice(&start_seq.to_be_bytes()));
+    let mut request = ZmqMessage::from(bytes::Bytes::copy_from_slice(&start_seq.to_be_bytes()));
     request.push_front(bytes::Bytes::new());
     tokio::time::timeout(REPLAY_REQUEST_TIMEOUT, socket.send(request))
         .await
@@ -415,13 +428,62 @@ async fn forward_raw_batch(
             return Ok(());
         }
     };
-    forward_actions(config, client, actions).await
+
+    let request = build_apply_request(config, batch.seq, actions);
+    // Nothing decodable to a supported mutation (e.g. only ignored event tags):
+    // preserve the previous no-op behaviour and skip the RPC entirely.
+    if request.actions.is_empty() {
+        return Ok(());
+    }
+    client.apply_external_kv_batch(request).await?;
+    Ok(())
+}
+
+/// Maps a decoded `EventActions` into a single `ApplyExternalKvBatchRequest`,
+/// preserving the exact per-action order. A `ClearAll` is expanded, in place,
+/// into one `CLEAR_ALL_AT_TIER` action per configured clear tier so the batch
+/// carries the same semantics as the legacy per-tier revoke-all RPCs.
+fn build_apply_request(
+    config: &BridgeConfig,
+    seq: u64,
+    events: EventActions,
+) -> ApplyExternalKvBatchRequest {
+    let mut actions = Vec::with_capacity(events.actions.len());
+    for action in events.actions {
+        match action {
+            Action::Report { tier, hashes } => actions.push(ExternalKvAction {
+                r#type: ExternalKvActionType::ActionReport as i32,
+                tier,
+                hashes,
+            }),
+            Action::Revoke { tier, hashes } => actions.push(ExternalKvAction {
+                r#type: ExternalKvActionType::ActionRevoke as i32,
+                tier,
+                hashes,
+            }),
+            Action::ClearAll => {
+                for tier in &config.clear_tiers {
+                    actions.push(ExternalKvAction {
+                        r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
+                        tier: *tier,
+                        hashes: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    ApplyExternalKvBatchRequest {
+        worker_id: config.worker_id.clone(),
+        seq,
+        actions,
+        worker_address: config.worker_address.clone(),
+    }
 }
 
 fn decode_event_batch(payload: &[u8]) -> Result<EventActions, BridgeError> {
     let mut cursor = Cursor::new(payload);
-    let value =
-        read_value(&mut cursor).map_err(|error| BridgeError::Decode(error.to_string()))?;
+    let value = read_value(&mut cursor).map_err(|error| BridgeError::Decode(error.to_string()))?;
     let batch = expect_array(&value, "KVEventBatch")?;
     if batch.len() < 2 {
         return Err(BridgeError::Decode(
@@ -472,49 +534,6 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
             debug!(event_type = other, "ignoring unsupported SGLang KV event");
         }
     }
-    Ok(())
-}
-
-async fn forward_actions(
-    config: &BridgeConfig,
-    client: &mut KvIndexerClient<Channel>,
-    actions: EventActions,
-) -> Result<(), BridgeError> {
-    for action in actions.actions {
-        match action {
-            Action::Report { tier, hashes } => {
-                client
-                    .report_external_kv_blocks(ReportExternalKvBlocksRequest {
-                        worker_id: config.worker_id.clone(),
-                        hashes,
-                        tier,
-                    })
-                    .await?;
-            }
-            Action::Revoke { tier, hashes } => {
-                client
-                    .revoke_external_kv_blocks(RevokeExternalKvBlocksRequest {
-                        worker_id: config.worker_id.clone(),
-                        hashes,
-                        tier,
-                    })
-                    .await?;
-            }
-            Action::ClearAll => {
-                for tier in &config.clear_tiers {
-                    client
-                        .revoke_all_external_kv_blocks_at_tier(
-                            RevokeAllExternalKvBlocksAtTierRequest {
-                                worker_id: config.worker_id.clone(),
-                                tier: *tier,
-                            },
-                        )
-                        .await?;
-                }
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -581,10 +600,7 @@ fn expect_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, BridgeError>
         .ok_or_else(|| BridgeError::Decode(format!("{field} must be a string")))
 }
 
-fn expect_optional_str<'a>(
-    value: &'a Value,
-    field: &str,
-) -> Result<Option<&'a str>, BridgeError> {
+fn expect_optional_str<'a>(value: &'a Value, field: &str) -> Result<Option<&'a str>, BridgeError> {
     if matches!(value, Value::Nil) {
         return Ok(None);
     }
@@ -632,10 +648,10 @@ mod tests {
         Value::Array(vec![
             Value::String("BlockStored".into()),
             ints(hashes),
-            Value::Nil,          // parent_block_hash
-            ints(&[1]),          // token_ids
-            Value::from(1_i64),  // block_size
-            Value::Nil,          // lora_id
+            Value::Nil,         // parent_block_hash
+            ints(&[1]),         // token_ids
+            Value::from(1_i64), // block_size
+            Value::Nil,         // lora_id
             Value::String(medium.into()),
         ])
     }
@@ -663,6 +679,107 @@ mod tests {
 
     fn actions_of(events: Vec<Value>) -> Vec<Action> {
         decode_event_batch(&batch(events)).unwrap().actions
+    }
+
+    fn test_config(clear_tiers: Vec<i32>) -> BridgeConfig {
+        BridgeConfig {
+            worker_id: "worker-1".to_string(),
+            worker_address: "127.0.0.1:9000".to_string(),
+            event_endpoint: "tcp://127.0.0.1:5557".to_string(),
+            event_replay_endpoint: None,
+            event_topic: "kv-events".to_string(),
+            indexer_endpoint: "http://[::1]:50051".to_string(),
+            clear_tiers,
+        }
+    }
+
+    /// Build the apply-batch request the bridge would send for a set of events.
+    fn request_of(
+        config: &BridgeConfig,
+        seq: u64,
+        events: Vec<Value>,
+    ) -> ApplyExternalKvBatchRequest {
+        build_apply_request(config, seq, decode_event_batch(&batch(events)).unwrap())
+    }
+
+    fn report(tier: i32, hashes: &[&str]) -> ExternalKvAction {
+        ExternalKvAction {
+            r#type: ExternalKvActionType::ActionReport as i32,
+            tier,
+            hashes: hashes.iter().map(|h| h.to_string()).collect(),
+        }
+    }
+
+    fn revoke(tier: i32, hashes: &[&str]) -> ExternalKvAction {
+        ExternalKvAction {
+            r#type: ExternalKvActionType::ActionRevoke as i32,
+            tier,
+            hashes: hashes.iter().map(|h| h.to_string()).collect(),
+        }
+    }
+
+    fn clear_at(tier: i32) -> ExternalKvAction {
+        ExternalKvAction {
+            r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
+            tier,
+            hashes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn request_carries_worker_id_and_seq() {
+        let config = test_config(vec![hbm()]);
+        let request = request_of(&config, 42, vec![stored(&[1], "GPU")]);
+        assert_eq!(request.worker_id, "worker-1");
+        assert_eq!(request.seq, 42);
+    }
+
+    #[test]
+    fn request_carries_worker_address() {
+        let config = test_config(vec![hbm()]);
+        let request = request_of(&config, 0, vec![stored(&[1], "GPU")]);
+        assert_eq!(request.worker_address, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn report_and_revoke_map_to_actions_in_order() {
+        let config = test_config(vec![hbm()]);
+        let request = request_of(
+            &config,
+            0,
+            vec![removed(&[9], "GPU"), stored(&[9], "CPU_PINNED")],
+        );
+        assert_eq!(
+            request.actions,
+            vec![revoke(hbm(), &["9"]), report(dram(), &["9"])]
+        );
+    }
+
+    #[test]
+    fn clear_all_expands_to_one_action_per_clear_tier_in_place() {
+        let config = test_config(vec![hbm(), dram(), ssd()]);
+        let request = request_of(
+            &config,
+            7,
+            vec![stored(&[1], "GPU"), cleared(), stored(&[2], "GPU")],
+        );
+        assert_eq!(
+            request.actions,
+            vec![
+                report(hbm(), &["1"]),
+                clear_at(hbm()),
+                clear_at(dram()),
+                clear_at(ssd()),
+                report(hbm(), &["2"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_with_only_ignored_events_has_no_actions() {
+        let config = test_config(vec![hbm()]);
+        let events = vec![Value::Array(vec![Value::String("BlockUpdated".into())])];
+        assert!(request_of(&config, 0, events).actions.is_empty());
     }
 
     #[test]
@@ -844,7 +961,10 @@ mod tests {
 
     #[test]
     fn parse_clear_tiers_defaults_and_aliases() {
-        assert_eq!(parse_clear_tiers("HBM,DRAM,SSD").unwrap(), vec![hbm(), dram(), ssd()]);
+        assert_eq!(
+            parse_clear_tiers("HBM,DRAM,SSD").unwrap(),
+            vec![hbm(), dram(), ssd()]
+        );
         assert_eq!(
             parse_clear_tiers(" GPU , CPU_PINNED , DISK ").unwrap(),
             vec![hbm(), dram(), ssd()]
@@ -871,7 +991,10 @@ mod tests {
     #[test]
     fn parse_zmq_frames_two_and_three() {
         let seq = 42_u64;
-        let two = [Bytes::copy_from_slice(&seq.to_be_bytes()), Bytes::from_static(b"p")];
+        let two = [
+            Bytes::copy_from_slice(&seq.to_be_bytes()),
+            Bytes::from_static(b"p"),
+        ];
         assert_eq!(parse_zmq_frames(&two).unwrap().0, seq);
         let three = [
             Bytes::from_static(b"kv-events"),
@@ -896,7 +1019,10 @@ mod tests {
         assert_eq!(parsed, seq);
         assert_eq!(payload, b"payload");
         // bare 2-frame form
-        let two = [Bytes::copy_from_slice(&seq.to_be_bytes()), Bytes::from_static(b"p")];
+        let two = [
+            Bytes::copy_from_slice(&seq.to_be_bytes()),
+            Bytes::from_static(b"p"),
+        ];
         assert_eq!(parse_replay_frames(&two).unwrap().0, seq);
         assert!(parse_replay_frames(&[Bytes::new()]).is_err());
     }
