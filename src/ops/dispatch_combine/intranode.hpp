@@ -210,13 +210,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
           continue;
         }
 
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-        // Issue the token payload LOAD now (async) so the remote slot atomic +
-        // metadata writes below overlap the HBM->LDS load (waited at the store site).
-        _tdmSrc = args.inpTokenBuf + (size_t)srcTokId * hiddenDim;
-        TdmIssueLoad<T>(_tdmTile, _tdmSrc, _tdmG1);
-#endif
-
         {
           // Fine-grained timing: slot assignment = remote returning atomic on
           // dispTokOffset[destPe] + the two remote metadata writes.
@@ -254,10 +247,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         destPe = PeFromFlatTokenIndex(config, flat);
         if (destPe >= config.worldSize) continue;
         destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-        _tdmSrc = args.inpTokenBuf + (size_t)srcTokId * hiddenDim;
-        TdmIssueLoad<T>(_tdmTile, _tdmSrc, _tdmG1);
-#endif
       }
 
       // BW diagnostic: inject N dummy remote atomicAdds per sent token onto an
@@ -316,20 +305,19 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         // multi-stream copy that keeps dispatch fast.
         MORI_TRACE_SPAN(profiler, Slot::DispTokenCopy);
 #if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-        // Payload LOAD was issued earlier (overlapping the atomic). Wait it, then
-        // STORE tile->peer and wait the store to release the tile for the next token.
-        __builtin_amdgcn_s_wait_tensorcnt(0);  // LOAD retired
-        // Order the load's LDS write before the store's LDS read. The warp is
-        // convergent here (all lanes passed dedup + __shfl together), so a
-        // WAVE-scoped barrier + LDS fence is safe (a block __syncthreads would
-        // deadlock because sibling warps take independent grid-stride iterations).
+        // Self-contained per-token TDM copy (matches the verified standalone
+        // tdm_ep4_dispatch): LOAD src->tile, wait, wave barrier (LDS order), STORE
+        // tile->peer, wait. The warp is convergent here so a wave barrier is safe.
+        _tdmSrc = args.inpTokenBuf + srcTokOffset;
+        TdmIssueLoad<T>(_tdmTile, _tdmSrc, _tdmG1);
+        __builtin_amdgcn_s_wait_tensorcnt(0);
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
         __builtin_amdgcn_wave_barrier();
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
         TdmIssueStore<T>(
             args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
             _tdmTile, _tdmG1);
-        __builtin_amdgcn_s_wait_tensorcnt(0);  // STORE done; tile reusable
+        __builtin_amdgcn_s_wait_tensorcnt(0);
 #else
         core::WarpCopy<T, 8>(
             args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
