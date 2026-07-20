@@ -34,6 +34,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 namespace anvil {
