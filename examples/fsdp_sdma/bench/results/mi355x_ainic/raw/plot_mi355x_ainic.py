@@ -131,3 +131,63 @@ print(
     f"wrote e2e_w16_loss.png  (last_loss native {nlast!r} / hp_sdma {hlast!r}, "
     f"{ndiff} windows differ)"
 )
+
+# ---- Figure 3: GEMM-under-AllGather overlap (MI300X bar-chart style) ----
+OVL_RE = re.compile(
+    r"shard=(\d+)MB\s+gemm_n=(\d+).*?rccl=([\d.]+)ms\s+hp_sdma=([\d.]+)ms"
+    r".*?([\d.]+)x faster"
+)
+ovl = []
+with open(os.path.join(RAW, "overlap_w16.log")) as f:
+    for line in f:
+        m = OVL_RE.search(line)
+        if m:
+            ovl.append(
+                (int(m[1]), int(m[2]), float(m[3]), float(m[4]), float(m[5]))
+            )
+
+if ovl:
+    shard = [o[0] for o in ovl]
+    gemm_n = [o[1] for o in ovl]
+    rccl_ms = [o[2] for o in ovl]
+    hp_ms = [o[3] for o in ovl]
+    speed = [o[4] for o in ovl]
+    x = list(range(len(ovl)))
+    w = 0.38
+    top = max(rccl_ms)
+
+    fig, ax = plt.subplots(figsize=(10, 5.7))
+    b_rccl = ax.bar(
+        [i - w / 2 for i in x], rccl_ms, w, color="#c0392b",
+        label="under RCCL AllGather",
+    )
+    b_hp = ax.bar(
+        [i + w / 2 for i in x], hp_ms, w, color="#27ae60",
+        label="under hp_sdma AllGather (host-proxy + intra SDMA)",
+    )
+    for rect, v in list(zip(b_rccl, rccl_ms)) + list(zip(b_hp, hp_ms)):
+        ax.annotate(
+            f"{v:.2f}",
+            (rect.get_x() + rect.get_width() / 2, v),
+            textcoords="offset points", xytext=(0, 3), ha="center", fontsize=9,
+        )
+    for xi, sp in zip(x, speed):
+        ax.annotate(
+            f"{sp:.2f}x faster", (xi, top * 1.04), ha="center",
+            fontsize=9, color="#1a7a3a",
+        )
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{s}MB x50\nGEMM n={g}" for s, g in zip(shard, gemm_n)])
+    ax.set_xlabel("per-rank AllGather shard size (50 concurrent AGs)")
+    ax.set_ylabel("GEMM time under 50 concurrent AllGathers  (ms, lower=better)")
+    ax.set_ylim(0, top * 1.35)  # headroom so the legend clears the "Nx faster" labels
+    ax.set_title(
+        "Cross-node w16 overlap: compute runs FASTER under hp_sdma than under RCCL\n"
+        "50 AllGathers overlap 50 GEMMs. RCCL's CU-resident kernels steal GPU from\n"
+        "the GEMMs; hp_sdma keeps the cross-node leg on the CPU. bit-exact vs RCCL."
+    )
+    ax.legend(loc="upper left")
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(HERE, "overlap_w16_gemm_time.png"), dpi=130)
+    print(f"wrote overlap_w16_gemm_time.png  ({len(ovl)} shard sizes)")
