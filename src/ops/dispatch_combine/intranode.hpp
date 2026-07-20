@@ -357,6 +357,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const bool _tThd = (myPe == 0 && globalWarpId == 0 && laneId == 0);
   long long _atomAcc = 0, _copyAcc = 0, _loopT0 = 0, _loopT1 = 0;
   int _atomCnt = 0, _copyCnt = 0;
+  long long _atomDs[32];  // per-atomic wall delta (critical-path latency)
   if (_tThd) _loopT0 = wall_clock64();
 #endif
   if (args.tokenIndices && args.inpTokenBuf) {
@@ -428,7 +429,16 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
                 args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1,
                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 #if defined(MORI_DISP_TIMING)
-            if (_tThd) { _atomAcc += wall_clock64() - _a0; _atomCnt++; }
+            if (_tThd) {
+              // Force the atomic's return value into a register (materialize the
+              // s_wait) BEFORE the second timestamp, so we measure the true
+              // issue->return critical-path latency, not just the issue.
+              asm volatile("" ::"v"(destTokId));
+              long long _a1 = wall_clock64();
+              if (_atomCnt < 32) _atomDs[_atomCnt] = _a1 - _a0;
+              _atomAcc += _a1 - _a0;
+              _atomCnt++;
+            }
 #endif
             assert(destTokId < config.MaxNumTokensToRecv() &&
                    "Total recv token overflow: increase maxTotalRecvTokens");
@@ -551,6 +561,18 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #if defined(MORI_DISP_TIMING)
   if (_tThd) {
     _loopT1 = wall_clock64();
+    int _np = _atomCnt < 32 ? _atomCnt : 32;
+    // Per-atomic critical-path latency (each = wall after return - wall before issue).
+    printf(
+        "[ATOMIC-EACH] warp0 n=%d each_tk= %lld %lld %lld %lld %lld %lld %lld %lld "
+        "%lld %lld %lld %lld %lld %lld %lld %lld\n",
+        _atomCnt,
+        _np > 0 ? _atomDs[0] : -1, _np > 1 ? _atomDs[1] : -1, _np > 2 ? _atomDs[2] : -1,
+        _np > 3 ? _atomDs[3] : -1, _np > 4 ? _atomDs[4] : -1, _np > 5 ? _atomDs[5] : -1,
+        _np > 6 ? _atomDs[6] : -1, _np > 7 ? _atomDs[7] : -1, _np > 8 ? _atomDs[8] : -1,
+        _np > 9 ? _atomDs[9] : -1, _np > 10 ? _atomDs[10] : -1, _np > 11 ? _atomDs[11] : -1,
+        _np > 12 ? _atomDs[12] : -1, _np > 13 ? _atomDs[13] : -1, _np > 14 ? _atomDs[14] : -1,
+        _np > 15 ? _atomDs[15] : -1);
     printf(
         "[ATOMIC-TIMING] warp0 loop=%lld tk | remoteAtomic: n=%d sum=%lld avg=%lld tk | "
         "payloadCopy: n=%d sum=%lld avg=%lld tk\n",
