@@ -55,6 +55,23 @@ import torch
 # (E2E giant-AG nq=2, UT standalone_fast nq=8) is left untouched.
 MORI_SDMA_CH_HW_MAX = 8
 
+# HIERARCHICAL BARRIER SLOT CAPACITY (fail-closed topology guard bounds).
+# The shipped C++ hier barrier ``ShmemInternalBarrierHierBlock``
+# (include/mori/shmem/shmem_device_api.hpp) packs its rendezvous flags into the
+# fixed 128-uint64 internalSync region with this DISJOINT layout:
+#   HIER_PEER_BASE [96 .. 96+num_nodes)          coordinator inter-node inbox
+#   HIER_LOCAL_BASE[112 .. 112+ranks_per_node)   local PE -> coordinator inbox
+#   HIER_REL_SLOT  [120], HIER_GEN_SLOT [126]
+# So the local inbox must fit within [112, 120) => ranks_per_node <= 8, and the
+# coordinator inbox must fit within [96, 112) => num_nodes <= 16. Exceeding
+# either bound silently overwrites an adjacent slot (the REL/GEN slots or the
+# local inbox), corrupting the barrier. The Python guard fails CLOSED with an
+# actionable error before any such topology reaches the kernel. The shipped
+# config (num_nodes=2, ranks_per_node=8) sits exactly at the ranks_per_node
+# bound and well within the num_nodes bound, so the guard never trips it.
+MORI_HIER_MAX_RANKS_PER_NODE = 8
+MORI_HIER_MAX_NUM_NODES = 16
+
 
 def _clamp_sdma_channels():
     _v = os.environ.get("MORI_SDMA_NUM_CHANNELS")
@@ -992,10 +1009,29 @@ class HierAllGather:
         # operation degenerates to a pure intra-node SDMA AllGather.
         if ranks_per_node is None:
             ranks_per_node = _auto_ranks_per_node(my_pe, npes)
-        if ranks_per_node <= 0 or npes % ranks_per_node != 0:
+        if ranks_per_node < 1 or npes % ranks_per_node != 0:
             raise ValueError(
                 f"npes ({npes}) must be a positive multiple of ranks_per_node "
                 f"({ranks_per_node})"
+            )
+        # Fail-closed topology guard against the fixed hier-barrier slot layout
+        # (see MORI_HIER_MAX_* above). Exceeding either bound would silently
+        # corrupt the barrier's rendezvous slots on the device.
+        if ranks_per_node > MORI_HIER_MAX_RANKS_PER_NODE:
+            raise ValueError(
+                f"ranks_per_node ({ranks_per_node}) exceeds the supported "
+                f"maximum ({MORI_HIER_MAX_RANKS_PER_NODE}); the hier barrier's "
+                f"local-PE inbox has only {MORI_HIER_MAX_RANKS_PER_NODE} slots "
+                f"(see ShmemInternalBarrierHierBlock)."
+            )
+        _num_nodes = npes // ranks_per_node
+        if _num_nodes > MORI_HIER_MAX_NUM_NODES:
+            raise ValueError(
+                f"num_nodes ({_num_nodes} = npes {npes} / ranks_per_node "
+                f"{ranks_per_node}) exceeds the supported maximum "
+                f"({MORI_HIER_MAX_NUM_NODES}); the hier barrier's coordinator "
+                f"inter-node inbox has only {MORI_HIER_MAX_NUM_NODES} slots "
+                f"(see ShmemInternalBarrierHierBlock)."
             )
 
         self.my_pe = my_pe
