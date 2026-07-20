@@ -40,8 +40,7 @@ impl BridgeConfig {
         let indexer_endpoint = std::env::var("KV_INDEXER_ENDPOINT")
             .unwrap_or_else(|_| "http://[::1]:50051".to_string());
         let clear_tiers = parse_clear_tiers(
-            &std::env::var("KV_INDEXER_CLEAR_TIERS")
-                .unwrap_or_else(|_| "HBM,DRAM,SSD".to_string()),
+            &std::env::var("KV_INDEXER_CLEAR_TIERS").unwrap_or_else(|_| "HBM,DRAM,SSD".to_string()),
         )?;
 
         Ok(Self {
@@ -272,7 +271,11 @@ async fn run_session(
 
         if let Some(expected) = *next_seq {
             if seq < expected {
-                warn!(expected, actual = seq, "skipping stale SGLang KV event batch");
+                warn!(
+                    expected,
+                    actual = seq,
+                    "skipping stale SGLang KV event batch"
+                );
                 continue;
             }
             if seq > expected {
@@ -281,7 +284,13 @@ async fn run_session(
             }
         }
 
-        commit_batch(config, &mut client, &RawBatch { seq, payload }, pending_batch).await?;
+        commit_batch(
+            config,
+            &mut client,
+            &RawBatch { seq, payload },
+            pending_batch,
+        )
+        .await?;
         *next_seq = seq.checked_add(1);
     }
 }
@@ -307,8 +316,7 @@ async fn replay_missing_batches(
     // ROUTER sees [identity, b"", start_seq]. Unlike REQ, DEALER neither adds
     // this delimiter nor enforces strict send/recv alternation, so we can read
     // the many per-batch replies the ROUTER streams back for one request.
-    let mut request =
-        ZmqMessage::from(bytes::Bytes::copy_from_slice(&start_seq.to_be_bytes()));
+    let mut request = ZmqMessage::from(bytes::Bytes::copy_from_slice(&start_seq.to_be_bytes()));
     request.push_front(bytes::Bytes::new());
     tokio::time::timeout(REPLAY_REQUEST_TIMEOUT, socket.send(request))
         .await
@@ -469,8 +477,7 @@ fn build_apply_request(
 
 fn decode_event_batch(payload: &[u8]) -> Result<EventActions, BridgeError> {
     let mut cursor = Cursor::new(payload);
-    let value =
-        read_value(&mut cursor).map_err(|error| BridgeError::Decode(error.to_string()))?;
+    let value = read_value(&mut cursor).map_err(|error| BridgeError::Decode(error.to_string()))?;
     let batch = expect_array(&value, "KVEventBatch")?;
     if batch.len() < 2 {
         return Err(BridgeError::Decode(
@@ -587,10 +594,7 @@ fn expect_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, BridgeError>
         .ok_or_else(|| BridgeError::Decode(format!("{field} must be a string")))
 }
 
-fn expect_optional_str<'a>(
-    value: &'a Value,
-    field: &str,
-) -> Result<Option<&'a str>, BridgeError> {
+fn expect_optional_str<'a>(value: &'a Value, field: &str) -> Result<Option<&'a str>, BridgeError> {
     if matches!(value, Value::Nil) {
         return Ok(None);
     }
@@ -638,10 +642,10 @@ mod tests {
         Value::Array(vec![
             Value::String("BlockStored".into()),
             ints(hashes),
-            Value::Nil,          // parent_block_hash
-            ints(&[1]),          // token_ids
-            Value::from(1_i64),  // block_size
-            Value::Nil,          // lora_id
+            Value::Nil,         // parent_block_hash
+            ints(&[1]),         // token_ids
+            Value::from(1_i64), // block_size
+            Value::Nil,         // lora_id
             Value::String(medium.into()),
         ])
     }
@@ -683,7 +687,11 @@ mod tests {
     }
 
     /// Build the apply-batch request the bridge would send for a set of events.
-    fn request_of(config: &BridgeConfig, seq: u64, events: Vec<Value>) -> ApplyExternalKvBatchRequest {
+    fn request_of(
+        config: &BridgeConfig,
+        seq: u64,
+        events: Vec<Value>,
+    ) -> ApplyExternalKvBatchRequest {
         build_apply_request(config, seq, decode_event_batch(&batch(events)).unwrap())
     }
 
@@ -727,7 +735,10 @@ mod tests {
             0,
             vec![removed(&[9], "GPU"), stored(&[9], "CPU_PINNED")],
         );
-        assert_eq!(request.actions, vec![revoke(hbm(), &["9"]), report(dram(), &["9"])]);
+        assert_eq!(
+            request.actions,
+            vec![revoke(hbm(), &["9"]), report(dram(), &["9"])]
+        );
     }
 
     #[test]
@@ -936,7 +947,10 @@ mod tests {
 
     #[test]
     fn parse_clear_tiers_defaults_and_aliases() {
-        assert_eq!(parse_clear_tiers("HBM,DRAM,SSD").unwrap(), vec![hbm(), dram(), ssd()]);
+        assert_eq!(
+            parse_clear_tiers("HBM,DRAM,SSD").unwrap(),
+            vec![hbm(), dram(), ssd()]
+        );
         assert_eq!(
             parse_clear_tiers(" GPU , CPU_PINNED , DISK ").unwrap(),
             vec![hbm(), dram(), ssd()]
@@ -963,7 +977,10 @@ mod tests {
     #[test]
     fn parse_zmq_frames_two_and_three() {
         let seq = 42_u64;
-        let two = [Bytes::copy_from_slice(&seq.to_be_bytes()), Bytes::from_static(b"p")];
+        let two = [
+            Bytes::copy_from_slice(&seq.to_be_bytes()),
+            Bytes::from_static(b"p"),
+        ];
         assert_eq!(parse_zmq_frames(&two).unwrap().0, seq);
         let three = [
             Bytes::from_static(b"kv-events"),
@@ -988,7 +1005,10 @@ mod tests {
         assert_eq!(parsed, seq);
         assert_eq!(payload, b"payload");
         // bare 2-frame form
-        let two = [Bytes::copy_from_slice(&seq.to_be_bytes()), Bytes::from_static(b"p")];
+        let two = [
+            Bytes::copy_from_slice(&seq.to_be_bytes()),
+            Bytes::from_static(b"p"),
+        ];
         assert_eq!(parse_replay_frames(&two).unwrap().0, seq);
         assert!(parse_replay_frames(&[Bytes::new()]).is_err());
     }

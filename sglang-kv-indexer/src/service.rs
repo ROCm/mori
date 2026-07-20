@@ -37,10 +37,7 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
     /// Applies a whole SGLang KVEventBatch. The actions are pre-validated and
     /// must be applied in order. `seq` is metadata: implementations may use
     /// `(worker_id, seq)` for idempotency but must not gate ordering on it.
-    fn apply_external_kv_batch(
-        &self,
-        request: ApplyExternalKvBatchRequest,
-    ) -> Result<(), Status>;
+    fn apply_external_kv_batch(&self, request: ApplyExternalKvBatchRequest) -> Result<(), Status>;
 }
 
 #[derive(Debug, Default)]
@@ -82,10 +79,7 @@ impl KvIndexerBackend for NoopKvIndexerBackend {
         Ok(GetExternalKvHitCountsResponse { entries: vec![] })
     }
 
-    fn apply_external_kv_batch(
-        &self,
-        _request: ApplyExternalKvBatchRequest,
-    ) -> Result<(), Status> {
+    fn apply_external_kv_batch(&self, _request: ApplyExternalKvBatchRequest) -> Result<(), Status> {
         Ok(())
     }
 }
@@ -189,7 +183,9 @@ fn validate_hashes(hashes: &[String]) -> Result<(), Status> {
         return Err(Status::invalid_argument("hashes must not be empty"));
     }
     if hashes.iter().any(|hash| hash.is_empty()) {
-        return Err(Status::invalid_argument("hashes must not contain empty values"));
+        return Err(Status::invalid_argument(
+            "hashes must not contain empty values",
+        ));
     }
     Ok(())
 }
@@ -209,8 +205,7 @@ fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
     for action in actions {
         validate_tier(action.tier)?;
         match ExternalKvActionType::try_from(action.r#type) {
-            Ok(ExternalKvActionType::ActionReport)
-            | Ok(ExternalKvActionType::ActionRevoke) => {
+            Ok(ExternalKvActionType::ActionReport) | Ok(ExternalKvActionType::ActionRevoke) => {
                 validate_hashes(&action.hashes)?;
             }
             // CLEAR_ALL_AT_TIER carries only a tier; hashes are ignored.
@@ -262,13 +257,21 @@ mod tests {
 
     #[test]
     fn validate_actions_requires_hashes_for_report_and_revoke() {
-        assert!(validate_actions(&[action(ExternalKvActionType::ActionReport, hbm(), &[])]).is_err());
-        assert!(validate_actions(&[action(ExternalKvActionType::ActionRevoke, hbm(), &[])]).is_err());
+        assert!(
+            validate_actions(&[action(ExternalKvActionType::ActionReport, hbm(), &[])]).is_err()
+        );
+        assert!(
+            validate_actions(&[action(ExternalKvActionType::ActionRevoke, hbm(), &[])]).is_err()
+        );
     }
 
     #[test]
     fn validate_actions_allows_empty_hashes_for_clear_all_at_tier() {
-        let actions = [action(ExternalKvActionType::ActionClearAllAtTier, hbm(), &[])];
+        let actions = [action(
+            ExternalKvActionType::ActionClearAllAtTier,
+            hbm(),
+            &[],
+        )];
         assert!(validate_actions(&actions).is_ok());
     }
 
