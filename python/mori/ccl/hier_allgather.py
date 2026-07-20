@@ -3039,29 +3039,6 @@ class HierAllGather:
                             and _dp_chunk_bytes < _dp_floor_mb * 1024 * 1024
                         ):
                             _deep_pipe = 1
-                        # DP-DEBUG: one-time-per-distinct-size print of the
-                        # RESOLVED deep-pipe depth so we can confirm whether the giant
-                        # root embed/lm_head AG actually pipelines (depth>1) or falls to
-                        # the crown whole-chunk fence (depth==1). Diagnostic only; env-
-                        # gated, no effect on the shipped path.
-                        if _env_true("MORI_HIER_DP_DEBUG", ""):
-                            _dbg = getattr(self, "_dp_dbg_seen", None)
-                            if _dbg is None:
-                                _dbg = self._dp_dbg_seen = set()
-                            _dbg_key = (int(_dp_chunk_bytes), int(_deep_pipe))
-                            if _dbg_key not in _dbg:
-                                _dbg.add(_dbg_key)
-                                _sub = (
-                                    _dp_chunk_bytes // _deep_pipe
-                                    if _deep_pipe > 1
-                                    else _dp_chunk_bytes
-                                )
-                                print(
-                                    f"[dp-debug] perPE_chunk_MB="
-                                    f"{_dp_chunk_bytes/1048576:.2f} depth={_deep_pipe} "
-                                    f"sub_MB={_sub/1048576:.2f}",
-                                    flush=True,
-                                )
                         _flag_slots = max(rb, _deep_pipe if rb == 1 else 1, 1)
                         # PER-QP FINE-GRAIN INTER-ARRIVAL DRAIN (MORI_HIER_SHARD_DRAIN):
                         # the producer publishes one landing flag per QP shard (sw =
