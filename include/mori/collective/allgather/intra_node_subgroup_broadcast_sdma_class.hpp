@@ -108,7 +108,11 @@ class IntraNodeSubGroupBroadcastSdma {
     out_ = shmem::ShmemMalloc(outBytes_);
     if (out_ == nullptr)
       throw std::runtime_error("IntraNodeSubGroupBroadcastSdma: out ShmemMalloc failed");
-    outObj_ = shmem::ShmemSymmetricRegister(out_, outBytes_);
+    // The broadcast payload buffer is gathered/consumed ONLY via P2P/SDMA (XGMI)
+    // within the node — never an RDMA src/dst. Register P2P/SDMA-only
+    // (rdmaRegister=false) so it dodges the ionic single-MR limit at large sizes
+    // (matches IntraNodeSubGroupAllgatherSdma::out_).
+    outObj_ = shmem::ShmemSymmetricRegister(out_, outBytes_, /*rdmaRegister=*/false);
     if (!outObj_.IsValid())
       throw std::runtime_error("IntraNodeSubGroupBroadcastSdma: out register failed");
 
