@@ -351,20 +351,13 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
                 _ag._fence_watermark = _ag._issue_ctr - 1
                 self._done = True
                 return True
-            # Deferred-stream path: replace the deferred HOST fence with a DEVICE
-            # inter-stream wait. The standalone UT collective is at parity (fp32
-            # 0.99-1.06x) while the E2E path is 0.84x native -- the ~16% tax is
-            # THIS host stall (event/stream .synchronize blocks the CPU
-            # mid-pipeline), NOT the SDMA transport.
-            # A device wait_event enqueues a stream-ordered dependency of the
-            # consumer (current/compute stream) on the big-AG completion event
-            # WITHOUT blocking the CPU, so the CPU keeps running ahead to
-            # prefetch the next unshard -- exactly what native's device-side
-            # Work.wait does. Correctness rests on the event capturing landing
-            # (recorded on ag_stream AFTER the fused fill kernel, which drains
-            # its SDMA/RDMA completions); if it drifts vs GT, the host drain is a
-            # genuine CPU-observed system-scope fence and the tax is fundamental.
-            # Default OFF (host synchronize) => shipped path byte-identical.
+            # EXPERIMENTAL (MORI_FSDP_DEFER_MODE=stream, default OFF): replace the
+            # deferred HOST fence with a DEVICE inter-stream wait so the CPU keeps
+            # running ahead to prefetch the next unshard (like native's device-side
+            # Work.wait) instead of stalling on synchronize. Correctness rests on
+            # the event capturing landing (recorded on ag_stream AFTER the fused
+            # fill kernel, which drains its SDMA/RDMA completions). Default OFF =>
+            # shipped path byte-identical (host synchronize below).
             if (
                 os.environ.get("MORI_FSDP_DEFER_MODE", "") == "stream"
                 and self._event is not None
