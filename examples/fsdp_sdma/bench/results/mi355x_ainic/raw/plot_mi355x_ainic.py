@@ -90,7 +90,9 @@ ratio = h_steady / n_steady
 
 # ---- Figure 1: throughput ----
 fig, ax = plt.subplots(figsize=(10, 5.6))
-ax.plot(ns, ntf, "-", color="tab:orange", lw=1.6, label=f"RCCL  (steady {n_steady:.0f})")
+ax.plot(
+    ns, ntf, "-", color="tab:orange", lw=1.6, label=f"RCCL  (steady {n_steady:.0f})"
+)
 ax.plot(
     hs,
     htf,
@@ -142,9 +144,7 @@ with open(os.path.join(RAW, "overlap_w16.log")) as f:
     for line in f:
         m = OVL_RE.search(line)
         if m:
-            ovl.append(
-                (int(m[1]), int(m[2]), float(m[3]), float(m[4]), float(m[5]))
-            )
+            ovl.append((int(m[1]), int(m[2]), float(m[3]), float(m[4]), float(m[5])))
 
 if ovl:
     shard = [o[0] for o in ovl]
@@ -158,23 +158,35 @@ if ovl:
 
     fig, ax = plt.subplots(figsize=(10, 5.7))
     b_rccl = ax.bar(
-        [i - w / 2 for i in x], rccl_ms, w, color="#c0392b",
+        [i - w / 2 for i in x],
+        rccl_ms,
+        w,
+        color="#c0392b",
         label="under RCCL AllGather",
     )
     b_hp = ax.bar(
-        [i + w / 2 for i in x], hp_ms, w, color="#27ae60",
+        [i + w / 2 for i in x],
+        hp_ms,
+        w,
+        color="#27ae60",
         label="under hp_sdma AllGather (host-proxy + intra SDMA)",
     )
     for rect, v in list(zip(b_rccl, rccl_ms)) + list(zip(b_hp, hp_ms)):
         ax.annotate(
             f"{v:.2f}",
             (rect.get_x() + rect.get_width() / 2, v),
-            textcoords="offset points", xytext=(0, 3), ha="center", fontsize=9,
+            textcoords="offset points",
+            xytext=(0, 3),
+            ha="center",
+            fontsize=9,
         )
     for xi, sp in zip(x, speed):
         ax.annotate(
-            f"{sp:.2f}x faster", (xi, top * 1.04), ha="center",
-            fontsize=9, color="#1a7a3a",
+            f"{sp:.2f}x faster",
+            (xi, top * 1.04),
+            ha="center",
+            fontsize=9,
+            color="#1a7a3a",
         )
     ax.set_xticks(x)
     ax.set_xticklabels([f"{s}MB x50\nGEMM n={g}" for s, g in zip(shard, gemm_n)])
