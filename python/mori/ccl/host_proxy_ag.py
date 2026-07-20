@@ -196,24 +196,6 @@ class HostProxyHierAllGather:
         )
         self._flag_gen = 0
 
-        # ASYNC completion-ordering diagnostic (MORI_HOSTPROXY_ASYNC_DIAG=1,
-        # default OFF => byte-identical). Counts _post vs _complete calls. The
-        # ASYNC path (MORI_HOSTPROXY_ASYNC=1) hit 267 TFLOPS (>native) but NaN;
-        # the leading hypothesis is that FSDP never calls Work.wait() on some AGs,
-        # so their _complete (step-3 remote-half broadcast) never runs and the
-        # remote node-block of ``out`` stays garbage -> NaN. If n_complete <
-        # n_post at teardown/dump, that hypothesis is confirmed and the fix is a
-        # self-healing drain of un-waited ops before their output is consumed. If
-        # the counts stay equal, the NaN is instead a staging-heap reuse race.
-        self._async_diag = os.environ.get("MORI_HOSTPROXY_ASYNC_DIAG", "0") not in (
-            "0",
-            "",
-            "false",
-            "False",
-        )
-        self._n_post = 0
-        self._n_complete = 0
-
         # ASYNC double-buffered receive staging (MORI_HOSTPROXY_ASYNC_RING, default
         # 1 = OFF = byte-identical). The ASYNC path's NaN is a staging read/write
         # race (diag: FSDP DOES wait() every AG, so no completion is skipped): after
@@ -629,11 +611,6 @@ class HostProxyHierAllGather:
                 barrier_after=(self._sdma3 is None),
             )
 
-        if self._async_diag:
-            self._n_post += 1
-            if self._n_post % 200 == 0:
-                self._diag_dump("post")
-
         return {
             "stream": stream,
             "out": out,
@@ -648,23 +625,11 @@ class HostProxyHierAllGather:
             "gen": flag_gen,
         }
 
-    def _diag_dump(self, where):
-        import sys
-
-        sys.stderr.write(
-            f"HPASYNCDIAG pe={self.my_pe} where={where} "
-            f"n_post={self._n_post} n_complete={self._n_complete} "
-            f"inflight={self._n_post - self._n_complete}\n"
-        )
-        sys.stderr.flush()
-
     def _complete(self, h):
         """Blocking half: for each cross-node chunk, drain its host CQE
         (wait_all), rail-pair barrier (partner's write into MY sv landed), then
         run the step-3 intra broadcast into ``out``. On return every
         consumer-visible byte is in HBM (the landing fence)."""
-        if self._async_diag:
-            self._n_complete += 1
         stream = h["stream"]
         out, e, rpn, obase = h["out"], h["e"], h["rpn"], h["obase"]
         recv_slot, other_out_slots = h["recv_slot"], h["other_out_slots"]
