@@ -321,8 +321,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
           const unsigned short* sp = (const unsigned short*)(args.inpTokenBuf + srcTokOffset);
           const unsigned short* lp = (const unsigned short*)_tdmTile;
           const unsigned short* dp = (const unsigned short*)_tdmDst;
-          printf("TDMDBG r0 tok=%d destPe=%d destTok=%d src=%04x,%04x lds=%04x,%04x dst=%04x,%04x\n",
-                 (int)srcTokId, (int)destPe, (int)destTokId, sp[0], sp[1], lp[0], lp[1], dp[0], dp[1]);
+          int last = (int)hiddenDim - 1, mid = (int)hiddenDim / 2;
+          printf("TDMDBG r0 tok=%d destTok=%d [0] s=%04x l=%04x d=%04x [mid] s=%04x l=%04x d=%04x [last] s=%04x l=%04x d=%04x\n",
+                 (int)srcTokId, (int)destTokId, sp[0], lp[0], dp[0],
+                 sp[mid], lp[mid], dp[mid], sp[last], lp[last], dp[last]);
         }
 #else
         core::WarpCopy<T, 8>(
