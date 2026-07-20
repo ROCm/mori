@@ -485,9 +485,6 @@ struct EpDispatchCombineArgs {
   int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
   bool replayMode{false};
-  // BW diagnostic (MORI_BW_DUMMY_ATOMICS): extra remote atomicAdds injected per
-  // sent token in intra-node dispatch to test the remote-atomic bottleneck.
-  int bwDummyAtomics{0};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   T* inpTokenBuf{nullptr};
@@ -554,8 +551,6 @@ struct EpDispatchCombineArgsRaw {
   int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
   bool replayMode{false};
-  // BW diagnostic (MORI_BW_DUMMY_ATOMICS): keep in sync with EpDispatchCombineArgs<T>.
-  int bwDummyAtomics{0};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   void* inpTokenBuf{nullptr};

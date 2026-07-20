@@ -594,9 +594,6 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   args.config = handle.config;
   args.fp8BlockwiseCombineScaleDim = handle.fp8BlockwiseCombineScaleDim;
   args.rdmaBlockNum = rdmaBlockNum;
-  // BW diagnostic knob: 0 = off (baseline). N>0 injects N dummy remote atomics
-  // per sent token in intra-node dispatch to probe the remote-atomic bottleneck.
-  args.bwDummyAtomics = env::GetPositiveIntOr("MORI_BW_DUMMY_ATOMICS", 0);
   args.curRankNumToken = handle.curRankNumToken;
   args.tokenIndices = handle.tokenIndices;
   args.inpTokenBuf = handle.inpTokenBuf;

@@ -405,11 +405,13 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   long long _atomAcc = 0, _copyAcc = 0, _loopT0 = 0, _loopT1 = 0, _pN = 0, _pR = 0;
   int _atomCnt = 0, _copyCnt = 0;
   long long _atomDs[32];  // per-atomic wall delta (critical-path latency)
-  // BURST TEST (MORI_BW_DUMMY_ATOMICS==1000): force ALL blocks to start the send
-  // loop simultaneously via a grid barrier on combineGridBarrier (unused by legacy
-  // dispatch; reset to 0 for the later combine kernel across the kernel boundary).
-  // If this alone slows the send ~2x, "synchronized start -> congestion" is real.
-  if (args.bwDummyAtomics == 1000) {
+#endif
+#if defined(MORI_DISP_PREBARRIER)
+  // BURST TEST: force ALL blocks to start the send loop simultaneously via a grid
+  // barrier on combineGridBarrier (unused by legacy dispatch; reset to 0 for the
+  // later combine kernel across the kernel boundary). If this alone slows the send
+  // ~2x, "synchronized start -> congestion" is the cause; else it is not.
+  {
     const int _gtid = blockIdx.x * blockDim.x + thdId;
     __syncthreads();
     if (thdId == 0) __hip_atomic_fetch_add(args.combineGridBarrier, 1u, __ATOMIC_ACQ_REL,
@@ -422,6 +424,8 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     if (_gtid == 0)
       __hip_atomic_store(args.combineGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   }
+#endif
+#if defined(MORI_DISP_TIMING)
   if (_tThd) _loopT0 = wall_clock64();
 #endif
   if (args.tokenIndices && args.inpTokenBuf) {
