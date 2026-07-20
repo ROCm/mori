@@ -864,6 +864,10 @@ int ccoCommDestroy(ccoComm* comm);
 // ── Phase 1.5 (optional): VMM allocation + P2P flat-space mapping ──
 int ccoMemAlloc(ccoComm* comm, size_t size, void** ptr);
 int ccoMemFree(ccoComm* comm, void* ptr);
+// Like ccoMemAlloc, but aliases an EXTERNAL HIP VMM allocation (e.g. a
+// torch.symm_mem buffer) into the flat-VA slot instead of allocating: retains its
+// handle (hipMemRetainAllocationHandle) and maps it. Release via ccoMemFree.
+int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** ptr);
 
 // ── Phase 2: Window registration (P2P mapping + RDMA MR + SDMA signals + GPU structs) ──
 // Collective: all ranks must call in the same order with the same size.
@@ -871,6 +875,10 @@ int ccoMemFree(ccoComm* comm, void* ptr);
 int ccoWindowRegister(ccoComm* comm, size_t size, ccoWindow_t* win, void** localPtr);
 // Overload B: register pre-allocated ptr from ccoMemAlloc
 int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* win);
+// Overload C: import + register an external HIP VMM allocation (= MemImport +
+// WindowRegister(ptr)); *localPtr returns the flat-VA alias.
+int ccoWindowRegister(ccoComm* comm, void* externalPtr, size_t size, ccoWindow_t* win,
+                      void** localPtr);
 // Teardown order: WindowDeregister → MemFree (if using separate alloc)
 int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win);
 

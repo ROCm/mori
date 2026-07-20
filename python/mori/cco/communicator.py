@@ -39,6 +39,7 @@ __all__ = [
     "CCOResource",
     "AllocatedMemory",
     "RegisteredWindow",
+    "ImportedWindow",
     "DevCommHandle",
     "Communicator",
 ]
@@ -195,6 +196,66 @@ class RegisteredWindow(CCOResource):
         return f"<RegisteredWindow: handle={self._handle:#x}, size={self._size}>"
 
 
+# ── ImportedWindow ────────────────────────────────────────────────────────────
+
+
+class ImportedWindow(CCOResource):
+    """Window backed by an EXTERNAL HIP VMM allocation (e.g. a torch.symm_mem
+    tensor buffer) mapped into cco's flat LSA VA via ``ccoMemImport``.
+
+    ``ext_ptr`` must be the base of a HIP VMM allocation exportable to the comm's
+    handle type. ``local_ptr`` is the cco flat-VA alias of that buffer; peers can
+    address it through the LSA window just like a ``ccoMemAlloc`` buffer. Cleanup
+    deregisters the window and frees the imported alias (unmap + drop the retained
+    handle refcount); the external owner keeps its own mapping.
+    """
+
+    def __init__(self, comm: Communicator, ext_ptr: int, size: int) -> None:
+        super().__init__(comm)
+        self._ext_ptr = ext_ptr
+        self._size = size
+        # One call (ccoWindowRegister overload C): import the external buffer into
+        # the flat LSA space and register the window; returns (handle, flat-VA ptr).
+        self._handle, self._local_ptr = _cco.window_register_external(
+            comm._raw, ext_ptr, size
+        )
+
+    def _deallocate(self) -> None:
+        if self._handle:
+            _cco.window_deregister(self._comm._raw, self._handle)
+            self._handle = 0
+        if self._local_ptr:
+            _cco.mem_free(self._comm._raw, self._local_ptr)
+            self._local_ptr = 0
+
+    @property
+    def handle(self) -> int:
+        self._check_valid()
+        return self._handle
+
+    @property
+    def local_ptr(self) -> int:
+        """cco flat-VA alias of the external buffer (dereferenceable locally)."""
+        return self._local_ptr
+
+    @property
+    def ext_ptr(self) -> int:
+        return self._ext_ptr
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def __repr__(self) -> str:
+        if not self.is_valid:
+            return "<ImportedWindow: closed>"
+        return (
+            f"<ImportedWindow: handle={self._handle:#x}, "
+            f"local_ptr={self._local_ptr:#x}, ext_ptr={self._ext_ptr:#x}, "
+            f"size={self._size}>"
+        )
+
+
 # ── DevCommHandle ─────────────────────────────────────────────────────────────
 
 
@@ -240,6 +301,16 @@ class DevCommHandle(CCOResource):
     def lsa_rank(self) -> int:
         self._check_valid()
         return self._dev_comm.lsa_rank
+
+    @property
+    def flat_base(self) -> int:
+        self._check_valid()
+        return self._dev_comm.flat_base
+
+    @property
+    def per_rank_size(self) -> int:
+        self._check_valid()
+        return self._dev_comm.per_rank_size
 
     def __repr__(self) -> str:
         if not self.is_valid:
@@ -333,6 +404,17 @@ class Communicator:
     def register_window(self, ptr: int, size: int) -> RegisteredWindow:
         self._check_valid("register_window")
         r = RegisteredWindow(self, ptr, size)
+        self._resources.append(r)
+        return r
+
+    def register_external_window(self, ext_ptr: int, size: int) -> ImportedWindow:
+        """Register an EXTERNAL HIP VMM allocation (e.g. a torch.symm_mem tensor
+        buffer) into the flat LSA space without copying: imports its physical
+        handle into a flat-VA slot, then registers it as a P2P/LSA window.
+        Collective — all ranks call in the same order with the same size.
+        """
+        self._check_valid("register_external_window")
+        r = ImportedWindow(self, ext_ptr, size)
         self._resources.append(r)
         return r
 
