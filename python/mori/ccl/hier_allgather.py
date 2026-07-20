@@ -127,6 +127,21 @@ def _env_int(key: str, default: str) -> int:
     return int(os.environ.get(key, default))
 
 
+def _resolve_bool(arg: Optional[bool], key: str, default: str = "0") -> bool:
+    """Ctor boolean-flag resolution: use the explicit ``arg`` when the caller
+    passed one, else fall back to the ``MORI_HIER_*`` env flag. Collapses the
+    ``if arg is None: arg = _env_true(...); self.x = bool(arg)`` idiom to one
+    call -- behavior-identical (same short-circuit, same _env_true semantics)."""
+    return bool(arg) if arg is not None else _env_true(key, default)
+
+
+def _resolve_int(arg: Optional[int], key: str, default: str) -> int:
+    """Ctor int-flag resolution: explicit ``arg`` wins, else the env fallback.
+    Behavior-identical to ``arg if arg is not None else _env_int(key, default)``;
+    callers apply their own ``max(...)`` clamp on the result as before."""
+    return arg if arg is not None else _env_int(key, default)
+
+
 def _auto_ranks_per_node(my_pe: int, npes: int) -> int:
     """Detect how many ranks are co-located on this physical node so callers can
     use the same signature as the flat ``AllgatherSdma`` (no ``ranks_per_node``).
@@ -358,8 +373,7 @@ class HierAllGather:
         # provisioned count (env MORI_NUM_QP_PER_PE, default 4). The kernel only
         # fans out for true cross-node (RDMA) neighbours, so single-node runs are
         # unaffected (stay single-warp).
-        if inter_num_qp is None:
-            inter_num_qp = _env_int("MORI_NUM_QP_PER_PE", "4")
+        inter_num_qp = _resolve_int(inter_num_qp, "MORI_NUM_QP_PER_PE", "4")
         self.inter_num_qp = max(1, inter_num_qp)
         # Opt-in multi-block ("channels") inter-node ring: num_blocks>1 launches
         # the ring as that many CTAs, each driving a disjoint chunk sub-range on
@@ -369,23 +383,20 @@ class HierAllGather:
         # per-NIC RDMA throughput is already saturated at numQp>=4, so spreading
         # the same QPs across CTAs adds scheduling overhead without NIC bandwidth).
         # Kept opt-in via env MORI_HIER_RING_BLOCKS for A/B.
-        if inter_num_blocks is None:
-            inter_num_blocks = _env_int("MORI_HIER_RING_BLOCKS", "1")
+        inter_num_blocks = _resolve_int(inter_num_blocks, "MORI_HIER_RING_BLOCKS", "1")
         self.inter_num_blocks = max(1, inter_num_blocks)
         # M4: opt-in leader-only pipeline (DESIGN's primary design).
         # Default every-rank-direct (proven correct since ). Toggle via
         # env MORI_HIER_LEADER_ONLY=1 or the explicit arg. See the N>=2 branch.
-        if leader_only is None:
-            leader_only = _env_true("MORI_HIER_LEADER_ONLY", "0")
-        self.leader_only = bool(leader_only)
+        self.leader_only = _resolve_bool(leader_only, "MORI_HIER_LEADER_ONLY", "0")
         # M4: opt-in "gather-in-place" -- have the intra-node SDMA
         # gather write its node-block DIRECTLY into the inter-node ring slot,
         # eliminating the prepare_sync copy-IN (a full node-block D2D copy) and
         # the node_block intermediate. Default OFF: the proven staged path (intra
         # -> node_block -> ring slot, since ) stays the default.
-        if gather_in_place is None:
-            gather_in_place = _env_true("MORI_HIER_GATHER_IN_PLACE", "0")
-        self.gather_in_place = bool(gather_in_place)
+        self.gather_in_place = _resolve_bool(
+            gather_in_place, "MORI_HIER_GATHER_IN_PLACE", "0"
+        )
         # Opt-in "out-in-place": leave the gathered result in the inter-node ring
         # buffer and read it via ``result_tensor`` instead of copying it to a user
         # output. Implies gather_in_place (the gather writes straight into the ring
@@ -393,9 +404,7 @@ class HierAllGather:
         # path (writes the user output) stays the default -- out-in-place changes
         # the result-delivery contract (read ``result_tensor``) and was measured a
         # tiny (~+2.6%) win only, so it is opt-in via MORI_HIER_OUT_IN_PLACE.
-        if out_in_place is None:
-            out_in_place = _env_true("MORI_HIER_OUT_IN_PLACE", "0")
-        self.out_in_place = bool(out_in_place)
+        self.out_in_place = _resolve_bool(out_in_place, "MORI_HIER_OUT_IN_PLACE", "0")
         # "fuse-barrier": drop the intra-node SDMA gather's finish ShmemBarrierAll
         # in the every-rank-direct N>=2 path (removes 1 of 4 global barriers/op).
         # CORRECTNESS INVARIANT: the dropped intra finish barrier is redundant --
@@ -408,9 +417,7 @@ class HierAllGather:
         # Default ON (bit-exact, cuts ~40% of the small/mid per-op floor); applies
         # only to the every-rank-direct path (not leader-only). Set
         # MORI_HIER_FUSE_BARRIER=0 to restore the pre-fuse baseline for A/B.
-        if fuse_barrier is None:
-            fuse_barrier = _env_true("MORI_HIER_FUSE_BARRIER", "1")
-        self.fuse_barrier = bool(fuse_barrier)
+        self.fuse_barrier = _resolve_bool(fuse_barrier, "MORI_HIER_FUSE_BARRIER", "1")
         # M5: opt-in SLICED 2-D AllGather -- the real bandwidth lever
         # ( NEXT). The default every-rank-direct path has each of the G
         # local ranks push its FULL node-block (G*count) to its same-index peer,
@@ -435,9 +442,9 @@ class HierAllGather:
         # explicitly enabled, slice defaults OFF so those levers still work. Set
         # MORI_HIER_SLICE=0 to force the pre-slice baseline for A/B.
         _slice_conflict = self.leader_only or self.out_in_place or self.gather_in_place
-        if slice_inter is None:
-            slice_inter = _env_true("MORI_HIER_SLICE", "0" if _slice_conflict else "1")
-        self.slice_inter = bool(slice_inter)
+        self.slice_inter = _resolve_bool(
+            slice_inter, "MORI_HIER_SLICE", "0" if _slice_conflict else "1"
+        )
         # FUSED sliced Phase B: fold the N intra reassembly gathers into ONE batch.
         # CORRECTNESS INVARIANT: the fused path stacks the N gathers into DISJOINT
         # regions of one enlarged transit (dst_base_offset = m*block) so they never
@@ -446,9 +453,7 @@ class HierAllGather:
         # cross-gather race and the output is byte-identical to the unfused sliced
         # path. Default ON (proven-best variant); only meaningful with slice_inter.
         # Set MORI_HIER_SLICE_FUSED=0 for the unfused sliced path.
-        if slice_fused is None:
-            slice_fused = _env_true("MORI_HIER_SLICE_FUSED", "1")
-        self.slice_fused = bool(slice_fused)
+        self.slice_fused = _resolve_bool(slice_fused, "MORI_HIER_SLICE_FUSED", "1")
         # M5: opt-in "slice out-of-place elimination" -- run the sliced
         # Phase A inter ring in out_in_place mode and have Phase B read its input
         # (the collection C_g = [slice_g(B_0)..slice_g(B_{N-1})]) DIRECTLY from
@@ -461,19 +466,16 @@ class HierAllGather:
         # NEUTRAL on the non-sliced path (-24); whether it nets out
         # positive on the sliced (smaller, count-sized) reads is what the A/B
         # measures. Default OFF; only meaningful with slice_inter.
-        if slice_oop is None:
-            slice_oop = _env_true("MORI_HIER_SLICE_OOP", "0")
-        self.slice_oop = bool(slice_oop)
+        self.slice_oop = _resolve_bool(slice_oop, "MORI_HIER_SLICE_OOP", "0")
         # Per-call SIZE THRESHOLD for the sliced path. The sliced 2-D path wins big
         # at large per-rank payloads but loses at small/mid (its extra kernel
         # launches + N reassembly gathers cost more than the saved inter bytes), so
         # engage slice ONLY when the per-rank payload is >= this many bytes; below
         # it, fall through to the non-sliced fuse-barrier path. Default 8 MiB. Set
         # MORI_HIER_SLICE_MIN_BYTES=0 to force slice at all sizes (A/B / tests).
-        if slice_min_bytes is None:
-            slice_min_bytes = _env_int(
-                "MORI_HIER_SLICE_MIN_BYTES", str(8 * 1024 * 1024)
-            )
+        slice_min_bytes = _resolve_int(
+            slice_min_bytes, "MORI_HIER_SLICE_MIN_BYTES", str(8 * 1024 * 1024)
+        )
         self.slice_min_bytes = max(0, slice_min_bytes)
         # MID/SMALL-SIZE BAND -> stream pipe-overlap path. For per-rank payloads
         # BELOW slice_min_bytes, route [pipe_band_min, slice_min) to the
@@ -491,9 +493,9 @@ class HierAllGather:
         # (deterministic program order) and hipStreamSynchronize only targets its
         # own (main) stream. Only meaningful with slice_inter + slice_fused. Default
         # OFF; toggle MORI_HIER_SLICE_OVERLAP=1.
-        if slice_overlap is None:
-            slice_overlap = _env_true("MORI_HIER_SLICE_OVERLAP", "0")
-        self.slice_overlap = bool(slice_overlap)
+        self.slice_overlap = _resolve_bool(
+            slice_overlap, "MORI_HIER_SLICE_OVERLAP", "0"
+        )
         # Drop the REDUNDANT Phase-B entry barrier in the sliced+fused NON-overlap
         # path. CORRECTNESS INVARIANT: that path runs the inter ring first; its
         # finish_sync issues a global ShmemBarrierAll immediately before the
@@ -505,9 +507,9 @@ class HierAllGather:
         # apply to the overlap path (its local gather runs concurrently on a side
         # stream and must keep its own entry barrier). Default ON; set
         # MORI_HIER_SLICE_FUSE_IB=0 to restore the entry barrier for A/B.
-        if slice_fuse_ib is None:
-            slice_fuse_ib = _env_true("MORI_HIER_SLICE_FUSE_IB", "1")
-        self.slice_fuse_ib = bool(slice_fuse_ib)
+        self.slice_fuse_ib = _resolve_bool(
+            slice_fuse_ib, "MORI_HIER_SLICE_FUSE_IB", "1"
+        )
         # Opt-in CHUNKED (strided) Phase-B reassembly: split each node-block's
         # reassembly gather into ``slice_pipe_chunks`` element-range chunks, each
         # writing ck elements per peer at slot stride = count via gather_kernel
@@ -516,11 +518,10 @@ class HierAllGather:
         # the chunked inter/intra pipeline). Only meaningful with slice_inter +
         # slice_fused (non-overlap, non-oop). Default OFF; toggle
         # MORI_HIER_SLICE_PIPE=1.
-        if slice_pipe is None:
-            slice_pipe = _env_true("MORI_HIER_SLICE_PIPE", "0")
-        self.slice_pipe = bool(slice_pipe)
-        if slice_pipe_chunks is None:
-            slice_pipe_chunks = _env_int("MORI_HIER_SLICE_PIPE_CHUNKS", "2")
+        self.slice_pipe = _resolve_bool(slice_pipe, "MORI_HIER_SLICE_PIPE", "0")
+        slice_pipe_chunks = _resolve_int(
+            slice_pipe_chunks, "MORI_HIER_SLICE_PIPE_CHUNKS", "2"
+        )
         self.slice_pipe_chunks = max(1, slice_pipe_chunks)
         # Uneven front/tail chunk split for the K==2 SLICE_PIPE_OVERLAP pipeline.
         # The exposed serial cost is
@@ -554,9 +555,9 @@ class HierAllGather:
         # Requires slice_inter+slice_fused, non-oop, non-slice_overlap. Default OFF
         # (toggle MORI_HIER_SLICE_PIPE_OVERLAP=1). Cost: +2(K-1) ring barriers; net
         # win only if hidden gather tail > added barrier overhead (A/B decides).
-        if slice_pipe_overlap is None:
-            slice_pipe_overlap = _env_true("MORI_HIER_SLICE_PIPE_OVERLAP", "0")
-        self.slice_pipe_overlap = bool(slice_pipe_overlap)
+        self.slice_pipe_overlap = _resolve_bool(
+            slice_pipe_overlap, "MORI_HIER_SLICE_PIPE_OVERLAP", "0"
+        )
         # Per-chunk landing fence for SLICE_PIPE_OVERLAP.
         # The deferred overlap loop (defer_inter_fin=sr + gather
         # prepare_barrier=False) has no cross-PE fence guaranteeing a peer's
