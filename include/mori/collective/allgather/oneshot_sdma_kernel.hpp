@@ -1033,7 +1033,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
   // reader's existing seq-cst SYSTEM acquire + __threadfence_system never observes
   // the flag ahead of the data. Default 0 => byte-identical shipped crown path.
   const bool qFlagActive = (qFlag != 0 && multiQueue == 0);
-  // Staggered-permutation ring schedule (see HierRingPhasedOn / MORI_HIER_RING). The
+  // Staggered-permutation ring schedule (see HierRingWidth / MORI_HIER_RING). The
   // plain path fires all G-1 peer copies concurrently (full mesh), bursting every
   // source->dest pair into the XGMI crossbar at once. When ringPhasedActive, issue this
   // GPU's copies in G-1 rotated phases so at phase p every rank targets partner

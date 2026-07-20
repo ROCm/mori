@@ -621,18 +621,6 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     }
     MORI_PRINTF("blockIdx.x=%d, threadIdx.x=%d, remaining=%zu, transfer_size=%zu\n", blockIdx.x,
                 threadIdx.x, remaining, transfer_size);
-    // Packet-fill diagnostic: one-shot print of the actual posted RDMA WRITE
-    // message size on the first posting iteration of this put (remaining==bytes)
-    // by the leader lane, exposing the per-QP inter-node WRITE granularity at the
-    // code level. If msgBytes >> MTU(4096) the NIC segments to full-MTU packets
-    // (half-MTU is then a per-op alignment/tail effect); if msgBytes is sub-MTU
-    // the fan-out is over-splitting. diagPutSize==0 (default) => dead branch =>
-    // byte-identical shipped path. Bounded volume (per-op, fresh handle).
-    if (globalGpuStates->diagPutSize > 0 && is_leader && remaining == bytes) {
-      printf("[DIAG_PUTSIZE] rank=%d pe=%d qpId=%d localQp=%d msgBytes=%zu opBytes=%zu\n",
-             globalGpuStates->rank, pe, qpId, localQp, static_cast<size_t>(transfer_size),
-             static_cast<size_t>(bytes));
-    }
     // Post RDMA write (unified code for both fast and slow paths)
     uint32_t warp_sq_counter{0};
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
@@ -1305,17 +1293,6 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
 
     // Each thread checks if this is its last chunk
     bool my_is_last_chunk = (transfer_size == remaining);
-
-    // Packet-fill diagnostic: one-shot print of the actual posted RDMA WRITE
-    // message size on the put-with-signal path (the inter-node landing).
-    // transfer_size==remaining==bytes here (no putChunkBytes split on the signal
-    // path), so this prints the per-QP WRITE granularity the fan-out hands the
-    // NIC. diagPutSize==0 (default) => dead branch => byte-identical shipped path.
-    if (globalGpuStates->diagPutSize > 0 && is_leader && remaining == bytes) {
-      printf("[DIAG_PUTSIZE_SIG] rank=%d pe=%d qpId=%d msgBytes=%zu opBytes=%zu\n",
-             globalGpuStates->rank, pe, qpId, static_cast<size_t>(transfer_size),
-             static_cast<size_t>(bytes));
-    }
 
     // Synchronize: only send signal if ALL active threads are on their last chunk
     // This ensures warp-uniform decision on num_wqes
@@ -2450,17 +2427,6 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
 
     // Each thread checks if this is its last chunk
     bool my_is_last_chunk = (transfer_size == remaining);
-
-    // Packet-fill diagnostic: one-shot print of the actual posted RDMA WRITE
-    // message size on the put-with-signal path (the inter-node landing).
-    // transfer_size==remaining==bytes here (no putChunkBytes split on the signal
-    // path), so this prints the per-QP WRITE granularity the fan-out hands the
-    // NIC. diagPutSize==0 (default) => dead branch => byte-identical shipped path.
-    if (globalGpuStates->diagPutSize > 0 && is_leader && remaining == bytes) {
-      printf("[DIAG_PUTSIZE_SIG] rank=%d pe=%d qpId=%d msgBytes=%zu opBytes=%zu\n",
-             globalGpuStates->rank, pe, qpId, static_cast<size_t>(transfer_size),
-             static_cast<size_t>(bytes));
-    }
 
     // Synchronize: only send signal if ALL active threads are on their last chunk
     // This ensures warp-uniform decision on num_wqes

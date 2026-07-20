@@ -90,24 +90,6 @@ inline bool HierEntryBarrierDisabled() {
   return disabled;
 }
 
-// Fuse-entry-barrier (env MORI_HIER_FUSE_ENTRY_BARRIER, default OFF). Keeps the
-// full cross-PE entry rendezvous (so the result stays bit-exact) but moves it from
-// the separate host-launched ShmemBarrierOnStream (one extra graph node per op)
-// into the fused kernel's entry prologue (device-side ShmemBarrierAllBlock by
-// block 0 behind a manual grid-arrival gate), so the kernel runs as one launch per
-// op. Correctness identical to the separate barrier: same PE0-funnel rendezvous,
-// same ordering (copy-IN is stream-ordered before the kernel; the in-kernel
-// rendezvous fences all PEs before any ring atomic). Mutually exclusive with
-// genRing*/dissem (they drop the barrier). Default OFF keeps the shipped path
-// byte-identical.
-inline bool HierFuseEntryBarrier() {
-  static const bool on = []() {
-    const char* e = std::getenv("MORI_HIER_FUSE_ENTRY_BARRIER");
-    return e != nullptr && std::atoi(e) != 0;
-  }();
-  return on;
-}
-
 // Measurement-only master switch: when MORI_HIER_NO_ALL_BARRIER!=0 every cross-PE
 // barrier (entry ShmemBarrierOnStream, the deferred finish fences, and the host
 // ShmemBarrierAll rendezvous in both the inter-node ring and the intra-node

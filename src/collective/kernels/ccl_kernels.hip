@@ -470,22 +470,6 @@ extern "C" __global__ void FusedRingLocalGatherKernel_u32(CclFusedRingLocalGathe
 // tile partition mirrors the ring's multi-block tiling exactly. PUSH-ONLY (no
 // cross-rank wait) so the workers never dead-lock; each worker uses a DISTINCT
 // qId so their per-queue signal counters never race.
-// Wall-decomposition profiler landmarks (MORI_HIER_PROFILE). g_hierProf[1] is an
-// atomicMax over reassembly workers of the wall_clock64() at which each ring
-// channel's landing flag was OBSERVED (== when the last inter-node RDMA chunk
-// became reassemblable); [0] kernel-entry reference, [2] completion-reader done,
-// [3] local-gather done. All wall_clock64 (fixed-freq, GPU-uniform). Zeroed at
-// module load; the completion reader resets [1] after reading so the atomicMax
-// starts clean for the next launch.
-// [4]: atomicMin over reassembly workers of the
-// wall_clock64() at which the FIRST inter-node RDMA sub-chunk landing flag was
-// observed. With [1] (LAST land) this yields the inter-fill DURATION (t1-t4) --
-// the window during which a landed sub-chunk's XGMI reassembly CAN overlap the
-// still-in-flight later sub-chunks. Quantifies the ACHIEVABLE overlap the
-// deep-pipe is (or is not) capturing, distinct from the exposed serial tail
-// (t2-t1). Default-off (guarded by args.profile) => byte/cycle-identical ship path.
-__device__ unsigned long long g_hierProf[8] = {0, 0, 0, 0, ~0ULL, 0, 0, 0};
-
 // ``partition`` = number of disjoint 16B-aligned byte sub-ranges the chunk is
 // split into for the intra-node SDMA reassembly push. Worker ``j`` (stride
 // ``stride``) owns parts f=j, j+stride, ... . ``spatial`` selects the LANDING
@@ -571,22 +555,11 @@ __device__ inline void FusedRemoteReassembleWorker(
               // UNDER-LANDED bytes under crown DEEP_PIPE>=8 w16 contention => crown E2E
               // drift. When on, NEVER abandon: reset the counter and keep polling until
               // the flag actually lands (genuine in-kernel HW-completion fence).
-              if (args.spinDebug != 0) {
-                printf("[MORI_SPIN] site=1 cap-hit (blocking=%d)\n", args.spinBlock);
-              }
               if (args.spinBlock == 0) break;  // bounded fallback (shipped path)
               spin = 0;                          // blocking: poll until it lands
             }
           }
           __threadfence_system();
-          // PROFILE: record when THIS channel's inter-node RDMA landing flag was
-          // observed. atomicMax across all workers/channels => the LAST inter chunk
-          // land time (the inter-node RDMA-fill completion boundary).
-          if (args.profile != 0) {
-            unsigned long long now = static_cast<unsigned long long>(wall_clock64());
-            atomicMax(&g_hierProf[1], now);
-            atomicMin(&g_hierProf[4], now);  // FIRST land => inter-fill duration window
-          }
         }
         __syncthreads();
       }
@@ -1006,11 +979,6 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
     }  // end else (!everyDirectWrite): crown ring send + inline reasm
     }
   } else if (bx == static_cast<unsigned>(rb)) {
-    // PROFILE: kernel-entry reference for the wall decomposition (this single CTA
-    // is launched with all others, so its entry ~= kernel start).
-    if (args.profile != 0 && threadIdx.x == 0) {
-      g_hierProf[0] = static_cast<unsigned long long>(wall_clock64());
-    }
     // Local block (m == nodeId): ring-independent, reads this PE's own input.
     // Collective gather on flag slots [0, G) -- a SINGLE collective (never nested),
     // so it cannot dead-lock. BUT under DEEP_PIPE>=8 the concurrent ring sub-chunk
@@ -1088,11 +1056,6 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
           /*poleSqDepth=*/args.poleSqDepth, /*polePull=*/args.polePull,
           /*putCacheHint=*/args.putCacheHint, /*intra2=*/args.intra2);
     }
-    // PROFILE: local-block SDMA gather done (ring-independent leg).
-    if (args.profile != 0 && threadIdx.x == 0) {
-      __threadfence();
-      g_hierProf[3] = static_cast<unsigned long long>(wall_clock64());
-    }
     // ELASTIC REASSEMBLY: this CTA's own-shard gather (queue 0) is done, so join
     // remote reassembly as worker index==reasm (stride effReasm) on queue 0 --
     // reassemble the tail channels concurrently with the reasm dedicated blocks,
@@ -1140,71 +1103,12 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
           if (++spin > 100000000) {
             // SPIN_BLOCK (T28 A, teamB ed5cfde3): completion reader must not publish
             // on under-landed reassembly output. When on, poll until the flag lands.
-            if (args.spinDebug != 0) {
-              printf("[MORI_SPIN] site=2 cap-hit (blocking=%d)\n", args.spinBlock);
-            }
             if (args.spinBlock == 0) break;  // bounded fallback (shipped path)
             spin = 0;                          // blocking: poll until it lands
           }
         }
       }
       __threadfence_system();
-      // PROFILE: completion reader done == all intra-node SDMA reassembly pushes
-      // have landed in this PE's output. Decompose the wall: t0=entry, t1=last
-      // inter-node RDMA land, t2=reassembly drain done, t3=local-gather done.
-      if (args.profile != 0 && threadIdx.x == 0) {
-        unsigned long long t2 = static_cast<unsigned long long>(wall_clock64());
-        g_hierProf[2] = t2;
-        __threadfence();
-        unsigned long long t0 = g_hierProf[0];
-        unsigned long long t1 = g_hierProf[1];  // last inter-node land (atomicMax)
-        unsigned long long t3 = g_hierProf[3];  // local-gather done
-        unsigned long long t4 = g_hierProf[4];  // FIRST inter-node land (atomicMin, T24 A)
-        unsigned long long tot = (t2 > t0) ? (t2 - t0) : 0;
-        unsigned long long inter = (t1 > t0) ? (t1 - t0) : 0;
-        unsigned long long intraTail = (t2 > t1) ? (t2 - t1) : 0;
-        unsigned long long localLeg = (t3 > t0) ? (t3 - t0) : 0;
-        // Inter-fill window = last-land - first-land: the span over which an
-        // already-landed sub-chunk's XGMI reassembly can overlap later sub-chunks
-        // still crossing the NIC. first_land = t4-t0 (pre-overlap inter latency).
-        unsigned long long firstLand = (t4 > t0 && t4 != ~0ULL) ? (t4 - t0) : 0;
-        unsigned long long interWin = (t1 > t4 && t4 != ~0ULL) ? (t1 - t4) : 0;
-        if (args.myPe == 0 && tot > 0) {
-          double interPct = 100.0 * static_cast<double>(inter) / static_cast<double>(tot);
-          double intraPct = 100.0 * static_cast<double>(intraTail) / static_cast<double>(tot);
-          double localPct = 100.0 * static_cast<double>(localLeg) / static_cast<double>(tot);
-          // T6 (A) BOTTLENECK-BYTES: emit the byte VOLUME each phase moves so the
-          // effective per-phase bandwidth is externally computable (GB/s = bytes /
-          // (cyc / wallClockRate)), turning the % decomposition into an absolute
-          // GB/s the campaign can compare to native's per-rail RDMA / XGMI fill.
-          //  - inter_bytes: this PE receives (numNodes-1) cross-node chunks over the
-          //    RDMA ring, each chunkBytes = the single-rail inter-node RDMA fill (the
-          //    proven w16 small-size binding constraint; T6 HIERPROF = ~55% of wall
-          //    @32MB, invariant to every intra reasm/completion/queue/pipe lever).
-          //  - reasm_bytes: the intra-node XGMI reassembly SDMA-pushes (numNodes-1)
-          //    remote chunks x groupSize peer columns off the ring buffer.
-          const unsigned long long interBytes =
-              static_cast<unsigned long long>(args.chunkBytes) *
-              static_cast<unsigned long long>((args.numNodes > 1) ? (args.numNodes - 1) : 1);
-          const unsigned long long reasmBytes =
-              static_cast<unsigned long long>(args.chunkBytes) *
-              static_cast<unsigned long long>((args.numNodes > 1) ? (args.numNodes - 1) : 0) *
-              static_cast<unsigned long long>(args.groupSize);
-          double firstPct = 100.0 * static_cast<double>(firstLand) / static_cast<double>(tot);
-          double winPct = 100.0 * static_cast<double>(interWin) / static_cast<double>(tot);
-          printf(
-              "[HIERPROF] chunkBytes=%llu nodes=%d rb=%d reasm=%d | wall=%llu cyc | "
-              "inter_land=%llu (%.1f%%) intra_reasm_tail=%llu (%.1f%%) local_gather=%llu (%.1f%%) | "
-              "first_land=%llu (%.1f%%) inter_win=%llu (%.1f%%) | "
-              "inter_bytes=%llu reasm_bytes=%llu\n",
-              static_cast<unsigned long long>(args.chunkBytes), args.numNodes, rb,
-              args.reassemblyBlocks, tot, inter, interPct, intraTail, intraPct, localLeg, localPct,
-              firstLand, firstPct, interWin, winPct, interBytes, reasmBytes);
-        }
-        // Reset the atomicMax/atomicMin slots so the next launch starts clean.
-        g_hierProf[1] = 0;
-        g_hierProf[4] = ~0ULL;
-      }
     }
     // CU-COHERENT RE-TOUCH (director-mandated fused copy-out, no host stall):
     // every peer's SDMA push into THIS PE's output has now landed (all flags set
