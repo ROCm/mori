@@ -100,7 +100,7 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
     size_t s = static_cast<size_t>(d) * uPerD * unit;
     size_t e = s + uPerD * unit;
     if (e > copy_size) e = copy_size;
-    auto packet_d = anvil::CreateCopyPacket(srcPtr + s, dstPtr + s, e - s);
+    auto packet_d = anvil::CreateCopyPacket(srcPtr + s, dstPtr + s, e - s, cacheHint);
     handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, placeOffset);
     placeOffset = 0;
   }
