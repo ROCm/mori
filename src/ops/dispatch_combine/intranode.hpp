@@ -87,20 +87,31 @@ namespace moe {
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T> args,
-                                                         const uint64_t crossDeviceBarrierFlag) {
+                                                         const uint64_t crossDeviceBarrierFlag,
+                                                         long long* tLocalWait = nullptr,
+                                                         long long* tPeerWait = nullptr) {
   int thdId = threadIdx.x;
   int laneId = threadIdx.x & (warpSize - 1);
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
 
   int warpNum = blockDim.x / warpSize;
   int globalWarpNum = gridDim.x * warpNum;
+#if defined(MORI_DISP_TIMING)
+  const bool _xt = (args.config.rank == 0 && blockIdx.x == 0 && thdId == 0);
+#endif
 
   __syncthreads();
   if (thdId == 0) atomicAdd(args.combineGridBarrier, 1);
 
   if (globalThdId < args.config.worldSize) {
+#if defined(MORI_DISP_TIMING)
+    long long _w0 = (_xt && tLocalWait) ? wall_clock64() : 0;
+#endif
     // Set remote flag after all copies are done
     shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, gridDim.x);
+#if defined(MORI_DISP_TIMING)
+    if (_xt && tLocalWait) *tLocalWait = wall_clock64() - _w0;
+#endif
     __hip_atomic_store(args.combineGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
     __threadfence_system();
@@ -112,10 +123,16 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
 
   uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
+#if defined(MORI_DISP_TIMING)
+  long long _p0 = (_xt && tPeerWait) ? wall_clock64() : 0;
+#endif
   if (thdId < args.config.worldSize) {
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
     }
   }
+#if defined(MORI_DISP_TIMING)
+  if (_xt && tPeerWait) *tPeerWait = wall_clock64() - _p0;
+#endif
   __syncthreads();
 }
 
@@ -198,6 +215,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     int _tn = 0;
     long long _nbCopy = 0, _nbAtom = 0;  // Pass B copy / local-atomic sums (warp0)
     int _nbCopyN = 0, _nbAtomN = 0;
+    long long _xb1L = 0, _xb1P = 0, _xb2L = 0, _xb2P = 0;  // xdev barrier local/peer waits
 #define TSTAMP() do { if (_tThd) _tp[_tn++] = wall_clock64(); } while (0)
 #else
 #define TSTAMP()
@@ -251,7 +269,11 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     }
     __threadfence_system();
     TSTAMP();  // [4] after matrix exchange write + threadfence (pre xdev barrier)
+#if defined(MORI_DISP_TIMING)
+    CrossDeviceBarrierIntraNodeKernel(args, xdevFlag, &_xb1L, &_xb1P);
+#else
     CrossDeviceBarrierIntraNodeKernel(args, xdevFlag);
+#endif
     TSTAMP();  // [5] after cross-device barrier #1
 
     // ---- Compute base[destPe] = sum_{s<myPe} M[s][destPe]; recvCount; reset localCnt ----
@@ -341,7 +363,11 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     // so combine (next kernel) observes the dispatched data.
     __threadfence_system();
     TSTAMP();  // [9] after threadfence_system (pre xdev barrier #2)
+#if defined(MORI_DISP_TIMING)
+    CrossDeviceBarrierIntraNodeKernel(args, xdevFlag + 1, &_xb2L, &_xb2P);
+#else
     CrossDeviceBarrierIntraNodeKernel(args, xdevFlag + 1);
+#endif
     if (globalThdId == 0) *args.dispatchGridBarrier = 0;  // reset for next launch
     TSTAMP();  // [10] after cross-device barrier #2
 #if defined(MORI_DISP_TIMING)
@@ -349,11 +375,11 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       long long tk = _tp[10] - _tp[0];
       printf(
           "[NOTIFY-TIMING] tot=%lld tk | setup=%lld countLoop=%lld gridbar1=%lld "
-          "exch+fence=%lld xdevbar1=%lld prefix=%lld gridbar2=%lld sendB=%lld "
-          "(copySum=%lld atomSum=%lld) fence2=%lld xdevbar2=%lld tk\n",
+          "exch+fence=%lld xdevbar1=%lld(L=%lld P=%lld) prefix=%lld gridbar2=%lld sendB=%lld "
+          "(copySum=%lld atomSum=%lld) fence2=%lld xdevbar2=%lld(L=%lld P=%lld) tk\n",
           tk, _tp[1] - _tp[0], _tp[2] - _tp[1], _tp[3] - _tp[2], _tp[4] - _tp[3],
-          _tp[5] - _tp[4], _tp[6] - _tp[5], _tp[7] - _tp[6], _tp[8] - _tp[7],
-          _nbCopy, _nbAtom, _tp[9] - _tp[8], _tp[10] - _tp[9]);
+          _tp[5] - _tp[4], _xb1L, _xb1P, _tp[6] - _tp[5], _tp[7] - _tp[6], _tp[8] - _tp[7],
+          _nbCopy, _nbAtom, _tp[9] - _tp[8], _tp[10] - _tp[9], _xb2L, _xb2P);
     }
 #endif
 #undef TSTAMP
