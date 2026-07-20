@@ -1424,6 +1424,39 @@ class HierAllGather:
             # leader_only keeps the copy-OUT default.
             if self.slice_direct is None:
                 self.slice_direct = self._probe_rdma_transport()
+            elif self.slice_direct:
+                # Fail-closed buffer-registration-mode guard. An EXPLICIT
+                # slice_direct=True (ctor arg or MORI_HIER_SLICE_DIRECT=1)
+                # registers the user output as a symmetric buffer
+                # (ShmemSymmetricRegister) for the direct-to-output SDMA push.
+                # That registration mode is only valid over RDMA: over a
+                # P2P/IPC transport hipIpcGetMemHandle on an arbitrary torch
+                # allocation HARD-ABORTS in C++ (see _probe_rdma_transport /
+                # the slice_direct default comment above). The auto path
+                # (slice_direct=None) already probes and defaults OFF for IPC;
+                # when the caller forces it ON we validate the same
+                # precondition and raise a clear, actionable error instead of
+                # letting the opaque device abort fire. The shipped config
+                # leaves slice_direct unset (auto), so this never trips it.
+                if self.leader_only:
+                    raise ValueError(
+                        "slice_direct=True is incompatible with leader_only: "
+                        "the direct-to-output SDMA push registers the user "
+                        "output, but leader_only produces its result via the "
+                        "copy-OUT ring path. Leave slice_direct unset (auto) "
+                        "or disable leader_only."
+                    )
+                if not self._probe_rdma_transport():
+                    raise ValueError(
+                        "slice_direct=True (or MORI_HIER_SLICE_DIRECT=1) "
+                        "requires an RDMA transport: it registers the user "
+                        "output via ShmemSymmetricRegister for direct-to-"
+                        "output SDMA push, which hard-aborts "
+                        "(hipIpcGetMemHandle) over a P2P/IPC transport such as "
+                        "the single-node spawn simulation. Leave slice_direct "
+                        "unset to auto-select the safe mode, or disable it for "
+                        "IPC/single-node topologies."
+                    )
 
     def _get_hostproxy_inter(self):
         """Lazily build the persistent host-proxy inter-node producer against
