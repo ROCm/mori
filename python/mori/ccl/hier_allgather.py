@@ -786,58 +786,29 @@ class HierAllGather:
         # its bit-exact-safe fill/overlap levers below without touching any
         # FSDP/E2E caller (none pass standalone_fast).
         self._standalone_fast = bool(standalone_fast)
-        # Standalone fast-path fill. fuse_local (above) clears the serial floor but
-        # tops out at ~0.86-0.94 of RCCL (a per-NIC fill shelf). The bit-exact-safe
-        # lever is more per-peer SDMA fill: default MORI_SDMA_NUM_CHANNELS to 8 (vs
-        # the library default 2), a deterministic reassembly widening.
-        #
-        # The full fuse_remote + deep_pipe + large max-bytes config is NOT bit-exact
-        # on every fabric -- with an uncaged coherence window each temporal
-        # sub-chunk can exceed the mlx5 NIC-DMA->HBM ~32MB coherence window and
-        # expose a flag-beats-data race (the put-signal AMO landing before the WRITE
-        # DMA is globally visible) at >=128MB. So the fill knob (channels) is the
-        # only lever defaulted unconditionally; fuse_remote/deep_pipe are engaged
-        # only within the coherence window (see below).
-        #
-        # The SDMA copy-channel count is hardware-capped at 8 on MI300X: requesting
-        # 12 or 16 crashes at SDMA queue creation (per-GPU queue-slot exhaustion).
-        # 8 is the fill ceiling on the bit-exact path, not a tunable. Other fill
-        # directions regress: MORI_NUM_QP_PER_PE=8 adds per-QP quiet overhead with
-        # no fill gain, and a 1MB RDMA put chunk is already bandwidth-bound. The >8
-        # crash-guard lives at module import (see _clamp_sdma_channels) because the
-        # physical SDMA queue count is fixed by anvil at shmem init, before this
-        # __init__ runs.
+        # Standalone fast-path fill (see _apply_standalone_fast_defaults). The only
+        # unconditionally-defaulted lever is more per-peer SDMA fill (default
+        # MORI_SDMA_NUM_CHANNELS=8, a bit-exact-safe deterministic reassembly
+        # widening); fuse_remote/deep_pipe are engaged only within the mlx5
+        # NIC-DMA->HBM coherence window because an uncaged window exposes a
+        # flag-beats-data race at large sizes. The SDMA channel count is
+        # hardware-capped at 8 on MI300X (>8 crashes at SDMA queue creation); the
+        # >8 crash-guard lives at module import (_clamp_sdma_channels) because the
+        # physical queue count is fixed by anvil at shmem init, before this __init__.
         self._apply_standalone_fast_defaults(standalone_fast)
         self._init_fused_ring_state()
-        # DIRECT-TO-OUTPUT Phase B. The default fused sliced
-        # path SDMA-gathers the N node-blocks into an internal symmetric transit
-        # (_intra.out_) and then a finish_batch copies the WHOLE output
-        # (N*block = full AllGather result, ~512 MiB @64 MiB/rank) D2D into the
-        # user output -- pure HBM traffic on the critical path. With slice_direct
-        # the gathers PUSH each member's slice straight into the (registered) user
-        # output, eliminating that copy entirely (the only remaining serial
-        # Phase-B cost after the stream-ordered barriers). The user output is
-        # registered once (collective ShmemSymmetricRegister, cached) on first
-        # sight; the cost amortizes across calls that reuse the same output (the
-        # benchmark + steady-state inference both do). Only engaged on the
-        # default fused, non-overlap, non-pipe, non-oop, stream-ordered slice
-        # path (the shipped path). kept OPT-IN (default OFF).
-        # The direct path registers the USER output as a symmetric buffer
-        # (ShmemSymmetricRegister); over RDMA (true xnode) this succeeds, but
-        # under single-node IPC (hipIpcGetMemHandle on an arbitrary torch
-        # allocation) it HARD-FAILS ("invalid argument") and aborts the process
-        # -- so default-ON would crash single-process multi-GPU users. It is a
-        # validated true-xnode lever (+5.4% @64 MiB, 133.7->141.2 GB/s); enable
-        # with MORI_HIER_SLICE_DIRECT=1 / --slice-direct on a real RDMA setup.
-        #
-        # now that slice_direct is robustly correct under
-        # varying output pointers ( exact-base + stale-evict fix) and the
-        # teardown crash is fixed, promote it to DEFAULT ON whenever we
-        # are on a true multi-node (RDMA) setup (num_nodes >= 2), where
-        # ShmemSymmetricRegister succeeds. It stays OFF on single-node (num_nodes
-        # == 1, IPC sim) where hipIpcGetMemHandle hard-aborts. An explicit
-        # arg or MORI_HIER_SLICE_DIRECT env override still wins. The default
-        # decision is deferred to after num_nodes is known (see below).
+        # DIRECT-TO-OUTPUT Phase B. With slice_direct the Phase-B gathers PUSH each
+        # member's slice straight into the (registered) user output, eliminating
+        # the finish_batch D2D copy of the whole result. Only engaged on the
+        # default fused, non-overlap, non-pipe, non-oop, stream-ordered slice path.
+        # CRASH-SAFETY INVARIANT: the direct path registers the USER output as a
+        # symmetric buffer (ShmemSymmetricRegister). Over RDMA (true xnode) this
+        # succeeds, but under single-node IPC (hipIpcGetMemHandle on an arbitrary
+        # torch allocation) it HARD-ABORTS the process -- so it must stay OFF on
+        # single-node (num_nodes == 1, IPC sim). Default: ON for true multi-node
+        # (num_nodes >= 2, RDMA), OFF for single-node; an explicit arg or
+        # MORI_HIER_SLICE_DIRECT env override always wins. The default decision is
+        # deferred to after num_nodes (really: the transport probe) is known below.
         if slice_direct is None:
             if "MORI_HIER_SLICE_DIRECT" not in os.environ:
                 # Sentinel: decide from num_nodes after it is computed.
