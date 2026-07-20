@@ -582,25 +582,21 @@ class HierAllGather:
             self.slice_pipe_fence = "global"
         else:
             self.slice_pipe_fence = "intra"
-        # STREAM-ORDERED inter ring. Replaces the inter ring's
-        # host-blocking prepare/finish (hipStreamSynchronize + host bootNet
-        # ShmemBarrierAll) with the on-device ShmemBarrierOnStream prepare/finish,
-        # removing 2 CPU<->GPU round-trips per inter ring op. This is the lever
-        # this work  measured at +6-7% standalone; cross-read per COORD
-        # "combine levers". Stacks on the slice path (the 64MiB winner). Default
-        # Default ON (: +10-12% @64MiB fp32 xnode, bit-exact, more stable;
-        # only affects the slice path, which gates the 64MiB acceptance number).
-        # Set MORI_HIER_STREAM_RING=0 / --no-stream-ring to restore host-sync.
+        # STREAM-ORDERED inter ring. Replaces the inter ring's host-blocking
+        # prepare/finish (hipStreamSynchronize + host bootNet ShmemBarrierAll)
+        # with the on-device ShmemBarrierOnStream prepare/finish, removing 2
+        # CPU<->GPU round-trips per inter ring op. Only affects the slice path.
+        # Default ON; set MORI_HIER_STREAM_RING=0 / --no-stream-ring to restore
+        # host-sync.
         self.stream_ring = _env_true("MORI_HIER_STREAM_RING", "1")
-        # STREAM-ORDERED Phase-B finish_batch. The fused sliced
-        # Phase-B still ends with finish_batch = bulk copy-OUT + host
-        # hipStreamSynchronize + host ShmemBarrierAll -- the LAST host CPU<->GPU
-        # round-trip in the op. Replace it with finish_batch_stream
-        # (ShmemBarrierOnStream) so, paired with the stream_ring, the
-        # whole op (inter ring + Phase-B gathers + copy-OUT) is fully on-stream
-        # with NO host stall. Only the default fused non-overlap, non-pipe slice
-        # path uses it. Default ON; set MORI_HIER_STREAM_INTRA=0 /
-        # --no-stream-intra to restore the host-synced finish_batch for A/B.
+        # STREAM-ORDERED Phase-B finish_batch. Replaces the fused sliced Phase-B's
+        # finish_batch (bulk copy-OUT + host hipStreamSynchronize + host
+        # ShmemBarrierAll -- the last host round-trip in the op) with
+        # finish_batch_stream (ShmemBarrierOnStream) so, paired with stream_ring,
+        # the whole op (inter ring + Phase-B gathers + copy-OUT) runs fully
+        # on-stream with no host stall. Only the default fused non-overlap,
+        # non-pipe slice path uses it. Default ON; set MORI_HIER_STREAM_INTRA=0 /
+        # --no-stream-intra to restore the host-synced finish_batch.
         self.stream_intra = _env_true("MORI_HIER_STREAM_INTRA", "1")
         # DEFER the Phase-B finish_batch_stream fence. The
         # default fused-stream slice op issues 3 on-stream global ShmemBarrierOn
@@ -620,24 +616,19 @@ class HierAllGather:
         # non-pipe, non-oop slice path (which uses finish_batch_stream) defers.
         # Default ON; set MORI_HIER_SLICE_DEFER_FIN=0 to restore the fence (A/B).
         self.slice_defer_fin = _env_true("MORI_HIER_SLICE_DEFER_FIN", "1")
-        # defer the INTER ring's finish_stream fence (the
-        # stream-ordered ShmemBarrierOnStream guarding cross-PE ring-buffer reuse)
-        # to the NEXT slice op's prepare_stream barrier. The ring buffer is reused
-        # ONLY by another op through this same _inter handle, and prepare_stream
-        # ALWAYS fences (global, on-stream) before its ring kernel issues the peer
-        # RDMA puts -> the successor's prepare fence already provides the required
-        # ordering, so this finish fence is redundant for any op with a slice
-        # successor. The copy-OUT into the scratch collection stays stream-ordered
-        # (Phase B reads a correct collection regardless); only the cross-PE reuse
-        # fence is deferred. Mirrors slice_defer_fin (Phase-B, ). Only on
-        # the non-oop slice path (stream_ring). DEFAULT ON
-        # (validated +0.85-1.0%, bit-exact) -- same safety class as slice_defer_fin
-        # (already default ON since ): the successor's prepare_stream fence
-        # guards cross-PE ring reuse; the last op (no successor) reuses nothing and
-        # its copy-OUT is stream-ordered; the size-dispatcher's path switch resets
-        # _prev_op_completed forcing an entry barrier. Set
-        # MORI_HIER_SLICE_DEFER_INTER_FIN=0 (--no-slice-defer-inter-fin) to restore
-        # the fence for A/B.
+        # Defer the INTER ring's finish_stream fence (the stream-ordered
+        # ShmemBarrierOnStream guarding cross-PE ring-buffer reuse) to the NEXT
+        # slice op's prepare_stream barrier. Safe because: the ring buffer is
+        # reused ONLY by another op through this same _inter handle, and
+        # prepare_stream ALWAYS fences (global, on-stream) before its ring kernel
+        # issues the peer RDMA puts, so the successor's prepare fence already
+        # orders cross-PE reuse; the copy-OUT into the scratch collection stays
+        # stream-ordered (Phase B reads a correct collection regardless); the last
+        # op (no successor) reuses nothing; the size-dispatcher's path switch
+        # resets _prev_op_completed, forcing an entry barrier. Same safety class as
+        # slice_defer_fin (Phase-B). Only on the non-oop slice path (stream_ring).
+        # Default ON; set MORI_HIER_SLICE_DEFER_INTER_FIN=0
+        # (--no-slice-defer-inter-fin) to restore the fence.
         self.slice_defer_inter_fin = _env_true("MORI_HIER_SLICE_DEFER_INTER_FIN", "1")
         # PHASE-B ENTRY BARRIER (accuracy). Force a full cross-PE
         # ShmemBarrierOnStream on the FIRST Phase-B reassembly gather even when
