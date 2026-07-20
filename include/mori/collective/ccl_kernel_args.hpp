@@ -35,16 +35,6 @@ inline bool HierRingPutSignalExplicitlyOn() {
   const char* e = std::getenv("MORI_HIER_RING_PUT_SIGNAL");
   return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
 }
-// Fused remote-gather coherence re-touch (MORI_HIER_FUSE_REMOTE_RETOUCH, default
-// OFF). After the completion reader confirms every peer's SDMA push landed in this
-// PE's output (all flags set) plus a system threadfence, re-touch the landed local
-// output with a volatile-glc load and a normal store. This bypasses the stale L2
-// line a consumer GEMM may have cached for the reused output buffer, republishing
-// the fabric-coherent HBM value into the CU/L2 domain without a host stall.
-inline bool HierFuseRemoteRetouchOn() {
-  const char* e = std::getenv("MORI_HIER_FUSE_REMOTE_RETOUCH");
-  return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
-}
 // Elastic reassembly (MORI_HIER_FUSE_REMOTE_ELASTIC, default OFF). In the pipelined
 // FusedRingRemoteGather kernel the local-block CTA finishes its own-shard SDMA
 // gather early and then idles as the completion reader, leaving queue 0 unused
@@ -119,19 +109,6 @@ inline int HierCrownRing() {
 // fires. 0 = OFF (byte-identical shipped path).
 inline bool HierReasmMultiQueueOn() {
   const char* e = std::getenv("MORI_INTRA_MQ");
-  return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
-}
-// Staggered-permutation ring schedule (MORI_HIER_RING, default OFF). The shipped
-// crown gather is a full-mesh all-to-all: all G-1 warps fire their peer copies
-// concurrently, bursting every source->dest pair into the XGMI crossbar at once.
-// 1 => issue this GPU's G-1 peer copies in G-1 phases, phase p targeting partner
-// (groupPos+1+p) mod groupSize (a node-wide rotation, i.e. a permutation when phases
-// align), with a block barrier between phases. Across ranks each phase is a perfect
-// matching with no crossbar hot-spot. Bit-exact: identical bytes to identical slots,
-// identical per-peer completion (drain + __threadfence_system + AMO), identical tail
-// acquire -- only the issue order changes. 0 = OFF (byte-identical shipped crown).
-inline bool HierRingPhasedOn() {
-  const char* e = std::getenv("MORI_HIER_RING");
   return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
 }
 // Width-W permutation issue schedule (MORI_HIER_RING as an integer width). The
@@ -378,14 +355,6 @@ inline bool HierSpinBlock() {
   const char* e = std::getenv("MORI_HIER_SPIN_BLOCK");
   return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
 }
-// SPIN DIAGNOSTIC (MORI_HIER_SPIN_DEBUG, default OFF). When ON, each bounded landing
-// spin printf's its site id the FIRST time it would hit the bound -- so we can see
-// which site fires the under-landed fallback under the crown E2E. OFF => no printf,
-// byte-identical.
-inline bool HierSpinDebug() {
-  const char* e = std::getenv("MORI_HIER_SPIN_DEBUG");
-  return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
-}
 // Cooperative spin-backoff (MORI_HIER_SPIN_BACKOFF, default OFF). The fused ring
 // gather's flag-wait spin loops (chunkReadyFlags and the reassembly/local completion
 // reader) busy-poll system-scope L2 atomics as tight as the hardware allows. Under
@@ -411,19 +380,6 @@ inline int HierWqeDepth() {
   if (e == nullptr || e[0] == '\0') return 1;
   int v = std::atoi(e);
   return v < 1 ? 1 : v;
-}
-// Wall-decomposition profiler (MORI_HIER_PROFILE, default OFF = zero overhead).
-// Decomposes the giant AG's deferred-fence wait into inter-node-RDMA-land vs
-// intra-node-SDMA-reassembly. When on, FusedRingRemoteGatherKernel records GPU
-// wall_clock64 landmarks into a __device__ global (g_hierProf) and rank 0 printf's
-// the per-phase split for each big AG: total wall, inter-land fraction (when the last
-// RDMA chunk's landing flag was observed by a reassembly worker), and intra-reassembly
-// tail fraction (SDMA drain after the last inter land). All guarded by this flag so the
-// shipped path stays byte- and cycle-identical. Note: the profile printf itself
-// inflates the wall at small sizes, so those splits are directional only.
-inline bool HierProfileOn() {
-  const char* e = std::getenv("MORI_HIER_PROFILE");
-  return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
 }
 // Deep-SQ temporal pipeline (MORI_HIER_DEEP_PIPE=P, default 2). The giant AG wall is
 // roughly half inter-node RDMA fill and half intra-node SDMA reassembly, fully serial
@@ -1127,7 +1083,7 @@ struct CclFusedRingLocalGatherArgs {
   // unchanged). 0 = OFF (byte-identical shipped crown path).
   int qFlag = 0;
   // STAGGERED-PERMUTATION RING SCHEDULE (algorithm pivot, see
-  // HierRingPhasedOn / MORI_HIER_RING). 1 => the crown's local gather issues its
+  // HierRingWidth / MORI_HIER_RING). 1 => the crown's local gather issues its
   // G-1 peer copies in G-1 rotated PHASES (permutation schedule) instead of the
   // concurrent full-mesh burst. Bit-exact by construction (same bytes/slots/
   // completion, only issue order changes). 0 = OFF (byte-identical shipped crown).
@@ -1300,7 +1256,7 @@ struct CclFusedRingRemoteGatherArgs {
   // sub-range over XGMI. 0 => legacy behaviour (reassemblyBlocks == ringBlocks).
   int reassemblyBlocks = 0;
   // CU-coherent re-touch of the landed local output in the completion reader
-  // (see HierFuseRemoteRetouchOn). 0 = OFF (byte-identical shipped path).
+  // (MORI_HIER_FUSE_REMOTE_RETOUCH; hardcoded 0). 0 = OFF (byte-identical shipped path).
   int retouchOut = 0;
   // Elastic reassembly (see HierFuseRemoteElasticOn). 1 => the local-block CTA
   // joins remote reassembly on SDMA queue 0 after its own gather, so the tail
@@ -1310,8 +1266,6 @@ struct CclFusedRingRemoteGatherArgs {
   // 1 = single WQE per QP (byte-identical shipped path); d>1 posts d back-to-back
   // sub-puts per QP so the NIC SQ carries d in-flight WQEs per QP.
   int wqeDepth = 1;
-  // Wall-decomposition profiler (see HierProfileOn). 0 = OFF (cycle-identical).
-  int profile = 0;
   // Deep-SQ temporal pipeline depth (see HierDeepPipe). P>1 splits the chunk into
   // P temporal sub-chunks with per-sub-chunk landing flags so reassembly overlaps
   // the still-in-flight later sub-chunks. 1 = OFF (byte-identical shipped path).
@@ -1373,9 +1327,6 @@ struct CclFusedRingRemoteGatherArgs {
   // until the flag is actually set (no under-landed read/publish), removing the crown
   // E2E non-determinism. 0 = OFF (byte-identical bounded shipped path).
   int spinBlock = 0;
-  // SPIN DIAGNOSTIC (see HierSpinDebug). 1 => printf the site id the first time a
-  // bounded spin would hit the cap. 0 = OFF (byte-identical).
-  int spinDebug = 0;
   // GENERATION-TOKEN chunkReadyFlags (see HierFlagToken). 0 => legacy: the deep-pipe
   // landing flags publish the fixed value 1, are waited with `< 1`, and must be
   // host-zeroed (flags.zero_) before every op (a per-op hipMemset launch on the fixed
@@ -1630,7 +1581,6 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
       fflush(stdout);
     }
   }
-  fused.profile = HierProfileOn() ? 1 : 0;
   // FIRST-LAND idle-engine reclamation (see HierLocalOffload). Clamp K to [0, G-1]
   // so the queue-0 local CTA always retains at least one peer column (never offloads
   // the whole gather). Only meaningful on the fused remote crown (numNodes>1).
@@ -1774,7 +1724,6 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
   fused.localPushOnly = HierLocalPushOnly() ? 1 : 0;
   fused.spinBackoff = HierSpinBackoff() ? 1 : 0;
   fused.spinBlock = HierSpinBlock() ? 1 : 0;
-  fused.spinDebug = HierSpinDebug() ? 1 : 0;
   // Generation token for chunkReadyFlags: 0 (legacy fixed-1 + host reset) unless
   // the Python launcher passes a strictly-increasing per-op token (HierFlagToken).
   fused.opGen = static_cast<uint64_t>(opGen);

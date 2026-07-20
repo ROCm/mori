@@ -155,15 +155,6 @@ struct GpuStates {
   // pipeline back to ~0.88x). 0 (default) = no fence bit = byte-identical shipped
   // path. Set from env MORI_HIER_SIGNAL_FENCE in GpuStateInit (MLX5 only).
   int signalFenceMode{0};
-  // Packet-fill diagnostic: when >0, the leader lane of the inter-node RDMA put
-  // emits a one-shot device printf of the actual posted RDMA WRITE message size
-  // (transfer_size) for the first ``diagPutSize`` WQEs per QP per rank. This
-  // exposes the per-QP inter-node WRITE granularity at the code level (whether a
-  // full multi-MB WRITE is posted for the NIC to segment into full-MTU packets,
-  // or many sub-MTU writes are issued). Pure observability: no data path change,
-  // no WQE change. 0 (default) = no print = byte-identical shipped path. Set from
-  // env MORI_DIAG_PUTSIZE in GpuStateInit.
-  int diagPutSize{0};
   application::TransportType* transportTypes{nullptr};
   ShmemRdmaEndpoint* rdmaEndpoints{nullptr};
   uint32_t* endpointLock{nullptr};

@@ -631,15 +631,6 @@ void GpuStateInit(ShmemStates* states) {
     if (v >= 1 && v <= 4) v = v << 5;
     states->gpuStates.signalFenceMode = v;
   }
-  // this work (packet-fill cross-validation, A-lane): one-shot print of the actual
-  // inter-node RDMA WRITE message size (transfer_size) for the first N WQEs per QP.
-  // Pins the crown's per-QP WRITE granularity at the code level (cross-check for
-  // B's NIC-counter half-MTU finding). 0/unset = off = byte-identical shipped path.
-  {
-    const char* dps = std::getenv("MORI_DIAG_PUTSIZE");
-    states->gpuStates.diagPutSize = (dps != nullptr) ? std::atoi(dps) : 0;
-  }
-
   // Copy communication metadata to GPU
   CopyTransportTypesToGpu(states);
   CopyRdmaEndpointsToGpu(states);
