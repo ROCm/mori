@@ -83,9 +83,16 @@ def get_cache_dir(
     ccqe_suffix = "_ccqe" if ccqe else ""
     profiler_suffix = "_profiler" if profiler else ""
     cov_suffix = f"_cov{cov}" if cov is not None else ""
+    # Experimental TDM dispatch adds -DMORI_DISP_TDM to the JIT compile; cache it
+    # separately so toggling MORI_DISP_TDM never reuses the other variant's .hsaco.
+    tdm_suffix = (
+        "_disptdm"
+        if os.environ.get("MORI_DISP_TDM", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)
