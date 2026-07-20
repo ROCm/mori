@@ -22,6 +22,12 @@ path = "src/bin/kv-indexer-server.rs"
 name = "kv-indexer-bridge"
 path = "src/bin/kv-indexer-bridge.rs"
 
+# Load generator for the Redis backend. Requires the redis-backend feature.
+[[bin]]
+name = "kv-indexer-bench"
+path = "src/bin/kv-indexer-bench.rs"
+required-features = ["redis-backend"]
+
 [dependencies]
 bytes = "1"
 futures = { version = "0.3", optional = true }
