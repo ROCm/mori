@@ -318,7 +318,14 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
         // Payload LOAD was issued earlier (overlapping the atomic). Wait it, then
         // STORE tile->peer and wait the store to release the tile for the next token.
-        __builtin_amdgcn_s_wait_tensorcnt(0);  // LOAD landed in LDS
+        __builtin_amdgcn_s_wait_tensorcnt(0);  // LOAD retired
+        // Order the load's LDS write before the store's LDS read. The warp is
+        // convergent here (all lanes passed dedup + __shfl together), so a
+        // WAVE-scoped barrier + LDS fence is safe (a block __syncthreads would
+        // deadlock because sibling warps take independent grid-stride iterations).
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
         TdmIssueStore<T>(
             args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
             _tdmTile, _tdmG1);
