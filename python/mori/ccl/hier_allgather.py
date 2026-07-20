@@ -701,9 +701,7 @@ class HierAllGather:
         # NOTE at N=2 with fuse_local the Phase-B loop is only N-1=1 remote gather
         # (local block folded into the ring), so this lever is a NO-OP there; it
         # engages on the plain fused-direct path (all N gathers in Phase B) and at
-        # N>2. Measures whether concurrent gathers beat the ~305 GB/s XGMI
-        # reassembly wall (engine-fan WITHIN a gather was fabric-bound; this
-        # tests whether MULTIPLE gathers in flight lift utilization).
+        # N>2.
         try:
             self.reasm_streams = _env_int("MORI_HIER_REASM_STREAMS", "1")
         except ValueError:
@@ -711,64 +709,26 @@ class HierAllGather:
         if self.reasm_streams < 1:
             self.reasm_streams = 1
         self._reasm_stream_pool = None
-        # FUSED ring || local-block gather (the RCCL-parity
-        # lever this work proved out, ported. The slice_direct_overlap
-        # path above recovers the NIC-ring || XGMI-local-gather overlap by running
-        # the local block on a SIDE stream, but pays a side.wait_stream +
-        # main.wait_stream host merge that offsets the win (, ~neutral).
-        # This lever instead runs BOTH halves in ONE kernel launch
-        # (FusedRingLocalGatherKernel_u32: blocks [0,num_blocks) = RDMA ring, last
-        # block = local-block SDMA gather), so the overlap is intrinsic to the
-        # grid with NO host merge and one fewer kernel launch. Engaged only on the
-        # default fused stream-ordered slice_direct path (same prereqs as
-        # slice_direct_overlap). Default ON (MORI_HIER_FUSE_LOCAL=0 /
-        # --no-fuse-local to A/B the prior slice_direct path); when ON it takes
-        # precedence over slice_direct_overlap.
-        # SHIPPED default ON after a clean-window A/B at 64 MiB
-        # fp32 (5 reps, bit-exact green) showed the fused ring||local-gather
-        # kernel hits 200.8/200.3 GB/s vs RCCL 145.9/155.4 (ratio 0.73/0.78x --
-        # BEATS RCCL) vs the prior slice_direct default 142.6/142.2 (1.04x) ==
-        # +41% mori-side and parity EXCEEDED. Engages ONLY on the >=8 MiB sliced
-        # path (use_slice gate); small sizes stay on the safe non-slice path so
-        # the fused kernel's small-size constraint never triggers.
-        # CORRECTNESS: default flipped to OFF. In-situ FSDP AGVERIFY
-        # (2-node world=8, copy-out, VOCAB=32000 LAYERS=28) shows the FUSED
-        # ring||local-gather kernel produces STALE remote-half AG output on ~48%
-        # of per-layer all-gathers (184/384) under FSDP's tight back-to-back
-        # overlap -- the RDMA-ring buffer is read out (finish_ring_stream copy +
-        # remote-block direct gathers) before the concurrently-launched ring
-        # CTA's remote puts are globally visible to the subsequent readers. The
-        # SERIAL monolithic ring path (fuse_local OFF) drops this to ~2-3%
-        # (8-11/384) at the same config, and DEBUG_SYNC is 0/384 -- i.e. the
-        # fused concurrency is the dominant offender, NOT the ring flag/data QP
-        # ordering (numQp=1 and numQp=4 both still 184/384). The standalone-only
-        # fused bandwidth win (+41% @64MiB) is not worth a wrong training loss,
-        # so the shipped default is the serial direct path until the fused
-        # kernel's ring-completion visibility to the finish readers is fixed
-        # on-device. Opt back in with MORI_HIER_FUSE_LOCAL=1 for standalone A/B.
-        # In the standalone benchmark (world=8 N=2 G=4, bit-exact),
-        # MORI_HIER_FUSE_LOCAL=1 beats RCCL at every size >=32MiB in both
-        # dtypes (fp32 1.148-1.295x, bf16 1.152-1.291x); the default serial
-        # path (this OFF) is ~0.815/0.885x. So the standalone UT
-        # requirement (ratio>=1.0x, bit-exact) is MET by this path; the ONLY reason
-        # it is not the shipped default is the E2E copy-engine-finish stale-remote
-        # race above. Note:
-        # MORI_SHMEM_HEAP_TYPE=normal (cached ring buffer) is identical to
-        # uncached => RDMA DMA is unaffected by the ring cache attribute. Also moot:
-        # the "leader-only ring + XGMI broadcast" redundancy killer -- the default
-        # slice path already sends 1 shard/NIC ((N-1)*count, the minimum), so no
-        # inter-node redundancy remains for it to eliminate.
-        # The serial slice_direct path (fuse_local OFF) hits a large-buffer floor
-        # (~124 GB/s). Enabling fuse_local lifts the standalone w8 path to
-        # 0.80-0.94 of RCCL (fp32/bf16, all sizes) bit-exact -- the floor is the
-        # serial fan-out, not a fabric wall. fuse_local is not the global default
-        # because of the E2E FSDP tight-overlap stale-remote race (~48% of AGs)
-        # documented above; the standalone AllGather (no back-to-back FSDP
-        # overlap) never triggers that race and is bit-exact with fuse_local. So a
-        # standalone caller may opt into the fast fan-out via standalone_fast=True
-        # without touching the E2E default: the env still overrides either way,
-        # and any caller that omits the flag (all FSDP/E2E paths) keeps the
-        # byte-identical serial default.
+        # FUSED ring || local-block gather. Runs the RDMA ring and the local-block
+        # SDMA gather in ONE kernel launch (FusedRingLocalGatherKernel_u32: blocks
+        # [0,num_blocks) = ring, last block = local gather), so the overlap is
+        # intrinsic to the grid with no host merge. Engaged only on the default
+        # fused stream-ordered slice_direct path; when ON it takes precedence over
+        # slice_direct_overlap.
+        #
+        # CORRECTNESS: OFF by default. Under FSDP's tight back-to-back overlap the
+        # fused kernel produces STALE remote-half output -- the RDMA-ring buffer is
+        # read out (finish_ring_stream copy + remote-block direct gathers) before
+        # the concurrently-launched ring CTA's remote puts are globally visible to
+        # those readers. The serial monolithic ring path (fuse_local OFF) does not
+        # have this race, so it is the shipped default until the fused kernel's
+        # ring-completion visibility to the finish readers is fixed on-device.
+        #
+        # The standalone AllGather (no back-to-back FSDP overlap) does not trigger
+        # the race and is bit-exact with fuse_local ON, where it beats RCCL at
+        # >=32 MiB. A standalone caller opts in via standalone_fast=True without
+        # touching the E2E default; explicit env always overrides. Every FSDP/E2E
+        # caller omits the flag and keeps the byte-identical serial default.
         if "MORI_HIER_FUSE_LOCAL" in os.environ:
             self.fuse_local = _env_true("MORI_HIER_FUSE_LOCAL")
         else:
