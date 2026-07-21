@@ -37,16 +37,15 @@ target_link_libraries(
 add_test(NAME umbp_master_client_flush_heartbeat
          COMMAND test_umbp_master_client_flush_heartbeat)
 
-# Enables gtest_discover_tests() for the metadata-store / external-KV / SSD-tier
-# suite migrated below from src/umbp/tests.
-include(GoogleTest)
-
-# Discover gtest cases at ctest time, not build time. These binaries init
-# mori/HSA/gRPC, so running them for --gtest_list_tests during the build (the
-# default POST_BUILD mode) can exceed the discovery timeout or produce no list
-# on a GPU-less build host, yielding empty JSON that CMake's strict ParseTestList
-# parser rejects and fails the build. PRE_TEST defers discovery to `ctest`.
-set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
+# NOTE: the metadata-store / external-KV / SSD-tier suite below registers each
+# binary as a single ctest via add_test(NAME ... COMMAND ...) rather than
+# gtest_discover_tests(). gtest_discover_tests bakes the build-time cmake's
+# version and absolute paths into the generated ctest include files; when the
+# suite is later run by the image's (different, and for pip builds already
+# deleted) ctest, parsing/running those files fails -- which made this job
+# red/flaky. add_test needs no build-time discovery and is independent of the
+# cmake version. Per-case granularity is lost (one ctest entry per binary), but
+# a failing case still fails its binary's entry.
 
 # MasterClient lifecycle: destructor budget, heartbeat thread shutdown, etc.
 add_executable(test_umbp_master_client_lifecycle
@@ -246,8 +245,8 @@ target_link_libraries(bench_umbp_route_strategy PRIVATE umbp_common)
 # ===========================================================================
 # Metadata-store / external-KV / SSD-tier suite (migrated from src/umbp/tests).
 # These link umbp_common (pure logic) except test_peer_ssd_read_rpc, which
-# exercises the gRPC peer service and links umbp_core + protobuf/gRPC. Test
-# cases are registered individually via gtest_discover_tests.
+# exercises the gRPC peer service and links umbp_core + protobuf/gRPC. Each
+# binary is registered as a single ctest via add_test (see the NOTE above).
 # ===========================================================================
 
 # test_master_metadata_store_interface — Phase 1 compile/instantiation gate for
@@ -261,7 +260,7 @@ target_include_directories(test_master_metadata_store_interface
 target_link_libraries(test_master_metadata_store_interface
                       PRIVATE umbp_common GTest::gmock GTest::gtest_main)
 target_compile_features(test_master_metadata_store_interface PRIVATE cxx_std_17)
-gtest_discover_tests(test_master_metadata_store_interface)
+add_test(NAME test_master_metadata_store_interface COMMAND test_master_metadata_store_interface)
 
 # test_in_memory_master_metadata_store — Phase 2 behavioral suite for the
 # InMemoryMasterMetadataStore implementation of IMasterMetadataStore (§6a).
@@ -270,48 +269,48 @@ add_executable(test_in_memory_master_metadata_store
 target_link_libraries(test_in_memory_master_metadata_store
                       PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_in_memory_master_metadata_store PRIVATE cxx_std_17)
-gtest_discover_tests(test_in_memory_master_metadata_store)
+add_test(NAME test_in_memory_master_metadata_store COMMAND test_in_memory_master_metadata_store)
 
 # test_peer_dram_allocator
 add_executable(test_peer_dram_allocator test_peer_dram_allocator.cpp)
 target_link_libraries(test_peer_dram_allocator PRIVATE umbp_common
                                                        GTest::gtest_main)
 target_compile_features(test_peer_dram_allocator PRIVATE cxx_std_17)
-gtest_discover_tests(test_peer_dram_allocator)
+add_test(NAME test_peer_dram_allocator COMMAND test_peer_dram_allocator)
 
 # test_router_dedup — master-side BatchRoutePut dedup via IMasterMetadataStore
 add_executable(test_router_dedup test_router_dedup.cpp)
 target_link_libraries(test_router_dedup PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_router_dedup PRIVATE cxx_std_17)
-gtest_discover_tests(test_router_dedup)
+add_test(NAME test_router_dedup COMMAND test_router_dedup)
 
 # test_peer_ssd_manager — SSD tier ownership + owned-location source
 add_executable(test_peer_ssd_manager test_peer_ssd_manager.cpp)
 target_link_libraries(test_peer_ssd_manager PRIVATE umbp_common
                                                     GTest::gtest_main)
 target_compile_features(test_peer_ssd_manager PRIVATE cxx_std_17)
-gtest_discover_tests(test_peer_ssd_manager)
+add_test(NAME test_peer_ssd_manager COMMAND test_peer_ssd_manager)
 
 # test_peer_ssd_eviction — LRU + watermark eviction + in-flight guard
 add_executable(test_peer_ssd_eviction test_peer_ssd_eviction.cpp)
 target_link_libraries(test_peer_ssd_eviction PRIVATE umbp_common
                                                      GTest::gtest_main)
 target_compile_features(test_peer_ssd_eviction PRIVATE cxx_std_17)
-gtest_discover_tests(test_peer_ssd_eviction)
+add_test(NAME test_peer_ssd_eviction COMMAND test_peer_ssd_eviction)
 
 # test_ssd_copy_pipeline — DramCopyPin + async copy-on-commit pipeline
 add_executable(test_ssd_copy_pipeline test_ssd_copy_pipeline.cpp)
 target_link_libraries(test_ssd_copy_pipeline PRIVATE umbp_common
                                                      GTest::gtest_main)
 target_compile_features(test_ssd_copy_pipeline PRIVATE cxx_std_17)
-gtest_discover_tests(test_ssd_copy_pipeline)
+add_test(NAME test_ssd_copy_pipeline COMMAND test_ssd_copy_pipeline)
 
 # test_tier_priority_route_get — RouteGet tier-priority strategy
 add_executable(test_tier_priority_route_get test_tier_priority_route_get.cpp)
 target_link_libraries(test_tier_priority_route_get PRIVATE umbp_common
                                                            GTest::gtest_main)
 target_compile_features(test_tier_priority_route_get PRIVATE cxx_std_17)
-gtest_discover_tests(test_tier_priority_route_get)
+add_test(NAME test_tier_priority_route_get COMMAND test_tier_priority_route_get)
 
 # test_peer_ssd_read_rpc — SSD read RPC over a gRPC loopback. Needs the gRPC
 # peer service + generated stubs (umbp_core) and protobuf/gRPC.
@@ -323,7 +322,7 @@ target_link_libraries(
   test_peer_ssd_read_rpc PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
                                  ${_TEST_GRPCPP_LIB} GTest::gtest_main)
 target_compile_features(test_peer_ssd_read_rpc PRIVATE cxx_std_17)
-gtest_discover_tests(test_peer_ssd_read_rpc)
+add_test(NAME test_peer_ssd_read_rpc COMMAND test_peer_ssd_read_rpc)
 
 # test_ssd_read_lease_gating — pure reader-side lease gating decision logic
 # (ssd_read_lease.h). Header-only under test (no gRPC / RDMA deps).
@@ -331,7 +330,7 @@ add_executable(test_ssd_read_lease_gating test_ssd_read_lease_gating.cpp)
 target_link_libraries(test_ssd_read_lease_gating PRIVATE umbp_common
                                                          GTest::gtest_main)
 target_compile_features(test_ssd_read_lease_gating PRIVATE cxx_std_17)
-gtest_discover_tests(test_ssd_read_lease_gating)
+add_test(NAME test_ssd_read_lease_gating COMMAND test_ssd_read_lease_gating)
 
 # test_ssd_reliability — cross-component reliability: owned-source DRAM+SSD
 # merge, SSD evict -> REMOVE -> master index convergence, tier-priority over the
@@ -340,7 +339,7 @@ add_executable(test_ssd_reliability test_ssd_reliability.cpp)
 target_link_libraries(test_ssd_reliability PRIVATE umbp_common
                                                    GTest::gtest_main)
 target_compile_features(test_ssd_reliability PRIVATE cxx_std_17)
-gtest_discover_tests(test_ssd_reliability)
+add_test(NAME test_ssd_reliability COMMAND test_ssd_reliability)
 
 # test_cache_remote_admission — cache_remote_fetches admission-gate unit test
 # (hermetic; no GPU/RDMA/master).
@@ -348,7 +347,7 @@ add_executable(test_cache_remote_admission test_cache_remote_admission.cpp)
 target_link_libraries(test_cache_remote_admission PRIVATE umbp_common
                                                           GTest::gtest_main)
 target_compile_features(test_cache_remote_admission PRIVATE cxx_std_17)
-gtest_discover_tests(test_cache_remote_admission)
+add_test(NAME test_cache_remote_admission COMMAND test_cache_remote_admission)
 
 # test_standalone_shm_ipc — memfd-backed host allocator registry plus raw UDS
 # fd handoff used by standalone-process mode.
@@ -356,7 +355,7 @@ add_executable(test_standalone_shm_ipc test_standalone_shm_ipc.cpp)
 target_link_libraries(test_standalone_shm_ipc PRIVATE umbp_common
                                                       GTest::gtest_main)
 target_compile_features(test_standalone_shm_ipc PRIVATE cxx_std_17)
-gtest_discover_tests(test_standalone_shm_ipc)
+add_test(NAME test_standalone_shm_ipc COMMAND test_standalone_shm_ipc)
 
 # test_batch_resolve_codec — struct-of-arrays BatchResolveKeysResponse wire
 # codec (batch_resolve_codec.h): encode/decode round-trip, page flattening, desc
@@ -370,7 +369,7 @@ target_link_libraries(
   test_batch_resolve_codec PRIVATE umbp_common ${_TEST_PROTOBUF_LIB}
                                    GTest::gtest_main)
 target_compile_features(test_batch_resolve_codec PRIVATE cxx_std_17)
-gtest_discover_tests(test_batch_resolve_codec)
+add_test(NAME test_batch_resolve_codec COMMAND test_batch_resolve_codec)
 # Multi-client agent KV-event pressure bench: in-process master + N PoolClients
 # driving a put -> LLM-gap -> get schedule (--pattern broadcast|rotate),
 # comparing baseline / compressed-heartbeat / flush kv-event propagation under
@@ -416,7 +415,7 @@ if(USE_REDIS_BACKEND)
   target_link_libraries(test_redis_master_metadata_store
                         PRIVATE umbp_common GTest::gtest_main)
   target_compile_features(test_redis_master_metadata_store PRIVATE cxx_std_17)
-  gtest_discover_tests(test_redis_master_metadata_store)
+  add_test(NAME test_redis_master_metadata_store COMMAND test_redis_master_metadata_store)
 
   # test_sharded_read — pure unit tests for the block-read fan-out
   # (redis/sharded_read.h) against a fake IRespClient. No live store needed, so
@@ -425,7 +424,7 @@ if(USE_REDIS_BACKEND)
   add_executable(test_sharded_read test_sharded_read.cpp)
   target_link_libraries(test_sharded_read PRIVATE umbp_common GTest::gtest_main)
   target_compile_features(test_sharded_read PRIVATE cxx_std_17)
-  gtest_discover_tests(test_sharded_read)
+  add_test(NAME test_sharded_read COMMAND test_sharded_read)
 
   # redis-plus-plus link/build smoke test. Proves the submodule compiles with
   # this toolchain and links (static redis++ + system hiredis) before any store
@@ -438,5 +437,5 @@ if(USE_REDIS_BACKEND)
                         PRIVATE redis++_static ${HIREDIS_LIB} GTest::gtest_main)
   target_include_directories(test_redispp_smoke PRIVATE ${HIREDIS_INCLUDE_DIR})
   target_compile_features(test_redispp_smoke PRIVATE cxx_std_17)
-  gtest_discover_tests(test_redispp_smoke)
+  add_test(NAME test_redispp_smoke COMMAND test_redispp_smoke)
 endif()

@@ -4,14 +4,7 @@ requires = [
     "setuptools_scm[toml]>=6.2",
     "wheel",
     "ninja",
-    # cmake is intentionally NOT listed here. As a build-isolation requirement
-    # pip installs its own (latest) cmake into an ephemeral env; gtest_discover_tests
-    # then bakes that build cmake's version and absolute path into the generated
-    # ctest files. The CI test step later runs the suite with the image's ctest --
-    # a different install, while the build-env cmake has already been deleted --
-    # which then fails to parse/run those files. Omitting cmake makes the build use
-    # the image's cmake (on PATH), so the build cmake and the runtime ctest are the
-    # same install (setup.py errors clearly if cmake is missing).
+    "cmake",
     "pybind11",
     "Cython>=3.0",
 ]
