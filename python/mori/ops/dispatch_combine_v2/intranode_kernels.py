@@ -642,8 +642,10 @@ def make_combine(
                 )
         if bid != 0:
             if tid == 0:
-                P.spin_until_eq_i32(fx.Int64(addr_comb_bar), 1)
+                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), 0)
             fx.barrier()
+            if tid == 0:
+                P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
@@ -828,6 +830,7 @@ def make_combine(
 
         if global_warp_id == 0:
             if lane == 0:
+                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), block_num - 1)
                 buffer_store(arith.constant(0), rsrc_comb_bar, 0)
 
     @flyc.jit
@@ -1147,8 +1150,10 @@ def make_combine_scatter(
                 )
         if bid != 0:
             if tid == 0:
-                P.spin_until_eq_i32(fx.Int64(addr_comb_bar), block_num + 1)
+                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), block_num)
             fx.barrier()
+            if tid == 0:
+                P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
@@ -1283,6 +1288,7 @@ def make_combine_scatter(
 
         if global_warp_id == 0:
             if lane == 0:
+                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), 2 * block_num - 1)
                 buffer_store(arith.constant(0), rsrc_comb_bar, 0)
 
     @flyc.jit
