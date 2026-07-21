@@ -68,7 +68,7 @@ struct StagingSlot {
 // Reclaim TTL-expired leased slots, then claim a free one as Preparing (TTL not
 // yet started) and return its index, or -1 if none free.
 int ClaimStagingSlot(std::vector<StagingSlot>& slots, std::atomic<uint64_t>& next_lease_id,
-                     std::chrono::seconds lease_timeout, StagingMetrics& metrics) {
+                     std::chrono::milliseconds lease_timeout, StagingMetrics& metrics) {
   auto now = std::chrono::steady_clock::now();
   for (auto& slot : slots) {
     if (slot.state == SlotState::kLeased && now - slot.leased_at > lease_timeout) {
@@ -173,8 +173,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                       const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
                       PeerSsdManager* peer_ssd, PeerDramAllocator* dram_alloc,
                       MasterClient* master_client, StagingMetrics& metrics, int num_read_slots,
-                      int lease_timeout_s, const std::vector<uint8_t>& engine_desc_bytes,
-                      SsdCopyPipeline* copy_pipeline)
+                      std::chrono::milliseconds lease_timeout,
+                      const std::vector<uint8_t>& engine_desc_bytes, SsdCopyPipeline* copy_pipeline)
       : ssd_staging_base_(ssd_staging_base),
         ssd_staging_size_(ssd_staging_size),
         ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes),
@@ -183,7 +183,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         copy_pipeline_(copy_pipeline),
         engine_desc_bytes_(engine_desc_bytes),
         metrics_(metrics),
-        lease_timeout_(std::max(lease_timeout_s, 1)),
+        lease_timeout_(std::max(lease_timeout, std::chrono::milliseconds{1})),
         num_read_slots_(std::max(num_read_slots, 1)),
         // The whole staging buffer is the read region now: the lower half used
         // to be direct-put write staging, removed in the SSD-tier redesign and
@@ -581,7 +581,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   const std::vector<uint8_t>& engine_desc_bytes_;
   StagingMetrics& metrics_;
 
-  const std::chrono::seconds lease_timeout_;
+  const std::chrono::milliseconds lease_timeout_;
   const int num_read_slots_;
   const uint64_t read_region_base_;
   const size_t read_slot_size_;
@@ -607,7 +607,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc, PeerSsdManager* peer_ssd,
                                      void* ssd_staging_base, size_t ssd_staging_size,
                                      std::vector<uint8_t> ssd_staging_mem_desc_bytes,
-                                     int num_read_slots, int lease_timeout_s,
+                                     int num_read_slots, std::chrono::milliseconds lease_timeout,
                                      std::vector<uint8_t> engine_desc_bytes,
                                      MasterClient* master_client, SsdCopyPipeline* copy_pipeline)
     : ssd_staging_base_(ssd_staging_base),
@@ -620,8 +620,7 @@ PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc, PeerSsdManag
       engine_desc_bytes_(std::move(engine_desc_bytes)) {
   service_ = std::make_unique<UMBPPeerServiceImpl>(
       ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, peer_ssd_, dram_alloc_,
-      master_client_, metrics_, num_read_slots, lease_timeout_s, engine_desc_bytes_,
-      copy_pipeline_);
+      master_client_, metrics_, num_read_slots, lease_timeout, engine_desc_bytes_, copy_pipeline_);
 }
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }
