@@ -94,7 +94,9 @@ def lsa_gather_kernel(dev_comm: Int64, win_handle: Int64, src_rank: Int32):
 
 
 @flyc.jit
-def run_gather(dev_comm: Int64, win_handle: Int64, src_rank: Int32, stream=fx.Stream(None)):
+def run_gather(
+    dev_comm: Int64, win_handle: Int64, src_rank: Int32, stream=fx.Stream(None)
+):
     lsa_gather_kernel(dev_comm, win_handle, src_rank).launch(
         grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
     )
@@ -148,7 +150,10 @@ def main():
             peer_ptr = win.local_ptr + (pe - my_lsa) * per_rank_size
             _check(
                 hip.hipMemcpy(
-                    host_buf, ctypes.c_void_p(peer_ptr), ctypes.c_size_t(32), ctypes.c_int(2)
+                    host_buf,
+                    ctypes.c_void_p(peer_ptr),
+                    ctypes.c_size_t(32),
+                    ctypes.c_int(2),
                 ),
                 "hipMemcpy D2H",
             )
@@ -174,7 +179,9 @@ def main():
             exp = sentinel(SRC_RANK)
             for i in (0, 1, N // 2, N - 1):
                 if host[i] != exp[i]:
-                    print(f"[rank {rank}] [kernel] MISMATCH [{i}]: got {host[i]}, exp {exp[i]}")
+                    print(
+                        f"[rank {rank}] [kernel] MISMATCH [{i}]: got {host[i]}, exp {exp[i]}"
+                    )
                     errors += 1
             if errors == 0:
                 print(

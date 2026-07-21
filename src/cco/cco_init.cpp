@@ -892,15 +892,16 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
   size_t rangeSize = 0;
   err = hipMemGetAddressRange(&rangeBase, &rangeSize, externalPtr);
   if (err != hipSuccess) {
-    MORI_SHMEM_ERROR("ccoMemImport: hipMemGetAddressRange failed: {} ({})",
-                     static_cast<int>(err), hipGetErrorString(err));
+    MORI_SHMEM_ERROR("ccoMemImport: hipMemGetAddressRange failed: {} ({})", static_cast<int>(err),
+                     hipGetErrorString(err));
     (void)hipMemRelease(physHandle);
     return -1;
   }
   if (rangeBase != externalPtr) {
-    MORI_SHMEM_ERROR("ccoMemImport: externalPtr {} is not the allocation base {} "
-                     "(offset imports unsupported)",
-                     externalPtr, rangeBase);
+    MORI_SHMEM_ERROR(
+        "ccoMemImport: externalPtr {} is not the allocation base {} "
+        "(offset imports unsupported)",
+        externalPtr, rangeBase);
     (void)hipMemRelease(physHandle);
     return -1;
   }
