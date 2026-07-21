@@ -169,6 +169,15 @@ def parse_args():
         help="Maximum message size when using --all sweep (default: 2**20)",
     )
     parser.add_argument(
+        "--sweep-step",
+        type=int,
+        default=0,
+        help="Linear step (bytes) for the --all sweep: message size goes "
+        "start, start+step, start+2*step, ... up to max. Default 0 = geometric "
+        "(double each step). Example: --sweep-start-size 1048576 "
+        "--sweep-max-size 33554432 --sweep-step 1048576 sweeps 1MiB..32MiB by 1MiB.",
+    )
+    parser.add_argument(
         "--all-batch",
         action="store_true",
         help="Run batch sizes from 8 to 32768",
@@ -251,6 +260,22 @@ def parse_args():
         help="Memory type for transfer buffers: 'gpu' (cuda) or 'cpu' (host) (default: gpu)",
     )
     parser.add_argument(
+        "--initiator-mem-type",
+        type=str,
+        default=None,
+        choices=["gpu", "cpu"],
+        help="Override buffer memory type on the INITIATOR side (default: --mem-type). "
+        "Combine with --target-mem-type for a mixed CPU<->GPU transfer, e.g. "
+        "--initiator-mem-type cpu --target-mem-type gpu (RDMA backend only).",
+    )
+    parser.add_argument(
+        "--target-mem-type",
+        type=str,
+        default=None,
+        choices=["gpu", "cpu"],
+        help="Override buffer memory type on the TARGET side (default: --mem-type).",
+    )
+    parser.add_argument(
         "--iters",
         type=int,
         default=128,
@@ -312,6 +337,7 @@ class MoriIoBenchmark:
         sweep_batch: bool = False,
         sweep_start_size: int = 8,
         sweep_max_size: int = 2**20,
+        sweep_step: int = 0,
         backend_type: str = "rdma",
         host: str = "",
         port: int = 0,
@@ -330,6 +356,8 @@ class MoriIoBenchmark:
         chunk_bytes: int = 65536,
         max_chunks: int = 64,
         mem_type: str = "gpu",
+        initiator_mem_type: str = None,
+        target_mem_type: str = None,
         src_gpu: int = 0,
         dst_gpu: int = 1,
         num_streams: int = 64,
@@ -347,6 +375,7 @@ class MoriIoBenchmark:
         self.sweep_batch = sweep_batch
         self.sweep_start_size = sweep_start_size
         self.sweep_max_size = sweep_max_size
+        self.sweep_step = sweep_step
         self.backend_type = backend_type
 
         self.host = host
@@ -368,6 +397,8 @@ class MoriIoBenchmark:
         self.chunk_bytes = chunk_bytes
         self.max_chunks = max_chunks
         self.mem_type = mem_type
+        self.initiator_mem_type = initiator_mem_type or mem_type
+        self.target_mem_type = target_mem_type or mem_type
 
         self.src_gpu = src_gpu
         self.dst_gpu = dst_gpu
@@ -399,6 +430,12 @@ class MoriIoBenchmark:
         else:
             self.global_rank = self.role_rank + self.num_initiator_dev
             self.role = EngineRole.TARGET
+
+        self.mem_type = (
+            self.initiator_mem_type
+            if self.role is EngineRole.INITIATOR
+            else self.target_mem_type
+        )
 
         # When not batch_contiguous, use strided offsets so buffer must fit (buffer_size+1)*transfer_batch_size
         total_elements = (
@@ -1074,7 +1111,10 @@ class MoriIoBenchmark:
                         f"{avg_duration:.2f}",
                     ]
                 )
-                cur_size *= 2
+                if self.sweep_step > 0:
+                    cur_size += self.sweep_step
+                else:
+                    cur_size *= 2
         elif self.sweep_batch:
             cur_transfer_batch_size = 1
             max_transfer_batch_size = 32768
@@ -1200,6 +1240,7 @@ def benchmark_xgmi_worker(local_rank, node_rank, args):
         sweep_batch=args.all_batch,
         sweep_start_size=args.sweep_start_size,
         sweep_max_size=args.sweep_max_size,
+        sweep_step=args.sweep_step,
         backend_type="xgmi",
         node_rank=node_rank,
         rank_in_node=local_rank,
@@ -1234,6 +1275,7 @@ def benchmark_engine(local_rank, node_rank, args):
         sweep_batch=args.all_batch,
         sweep_start_size=args.sweep_start_size,
         sweep_max_size=args.sweep_max_size,
+        sweep_step=args.sweep_step,
         backend_type=args.backend,  # "rdma" or "fabric" (both use this driver)
         host=args.host,
         port=0,
@@ -1252,6 +1294,8 @@ def benchmark_engine(local_rank, node_rank, args):
         chunk_bytes=args.chunk_bytes,
         max_chunks=args.max_chunks,
         mem_type=args.mem_type,
+        initiator_mem_type=args.initiator_mem_type,
+        target_mem_type=args.target_mem_type,
         num_streams=args.num_streams,
         num_events=args.num_events,
     )
@@ -1305,6 +1349,7 @@ def benchmark_xgmi(args):
             sweep_batch=args.all_batch,
             sweep_start_size=args.sweep_start_size,
             sweep_max_size=args.sweep_max_size,
+            sweep_step=args.sweep_step,
             backend_type="xgmi",
             src_gpu=args.src_gpu,
             dst_gpu=args.dst_gpu,
