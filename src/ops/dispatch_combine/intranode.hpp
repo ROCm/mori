@@ -304,12 +304,20 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     // ---- Signal-based completion (replaces the symmetric cross-device barrier):
     // all local blocks arrive, warp0 RELEASE-fences its P2P writes and posts a
     // per-peer signal, then waits for every peer to signal this rank. ----
-    if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+    // Use a SEPARATE barrier word (+1) for the completion arrival counter, NOT
+    // dispatchGridBarrier[0] which the last GridBarrier (prefix) just used. Reusing
+    // [0] races the GridBarrier self-reset: with tiny inputs Pass B is near-instant,
+    // so a fast block reaches this atomicAdd and bumps [0] between the resetting
+    // block's two atomicCAS(bar,gridDim.x,0) attempts -> that block never sees
+    // gridDim.x again and spins forever -> global hang. (4K hides it: Pass B is slow
+    // enough that every block finishes the reset before any reaches here.)
+    auto* complBar = args.dispatchGridBarrier + 1;
+    if (thdId == 0) atomicAdd(complBar, 1);
     index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
     if (globalWarpId == 0) {
       for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-        shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
-        __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED,
+        shmem::ShmemUint32WaitUntilEquals(complBar, gridDim.x);
+        __hip_atomic_store(complBar, 0u, __ATOMIC_RELAXED,
                            __HIP_MEMORY_SCOPE_AGENT);
         index_t numTokenSignal = core::AtomicLoadRelaxed(&localCnt[destPe]) + 1;
         index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
