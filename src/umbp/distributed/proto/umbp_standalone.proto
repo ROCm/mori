@@ -1,0 +1,146 @@
+syntax = "proto3";
+package umbp;
+
+import "umbp.proto";
+
+service UMBPStandalone {
+  rpc Ping(Empty) returns (PingResponse);
+
+  rpc Put(PutRequest) returns (BoolResponse);
+  rpc Get(GetRequest) returns (BoolResponse);
+  rpc BatchPut(BatchDataRequest) returns (BatchBoolResponse);
+  rpc BatchPutWithDepth(BatchDataWithDepthRequest) returns (BatchBoolResponse);
+  rpc BatchGet(BatchDataRequest) returns (BatchBoolResponse);
+  rpc Exists(KeyRequest) returns (BoolResponse);
+  rpc BatchExists(BatchKeysRequest) returns (BatchBoolResponse);
+  rpc BatchExistsConsecutive(BatchKeysRequest) returns (CountResponse);
+
+  rpc Clear(Empty) returns (BoolResponse);
+  rpc Flush(Empty) returns (BoolResponse);
+  rpc RegisterMemory(RegisterMemoryRequest) returns (BoolResponse);
+  rpc DeregisterMemory(DeregisterMemoryRequest) returns (Empty);
+
+  rpc ReportExternalKvBlocks(StandaloneExternalKvMutationRequest) returns (BoolResponse);
+  rpc RevokeExternalKvBlocks(StandaloneExternalKvMutationRequest) returns (BoolResponse);
+  rpc RevokeAllExternalKvBlocksAtTier(StandaloneExternalKvTierRequest) returns (BoolResponse);
+  rpc MatchExternalKv(StandaloneMatchExternalKvRequest) returns (StandaloneMatchExternalKvResponse);
+  rpc GetExternalKvHitCounts(StandaloneExternalKvHitCountsRequest)
+      returns (StandaloneExternalKvHitCountsResponse);
+}
+
+message Empty {}
+
+message PingResponse {
+  bool ready = 1;
+  StandaloneBackendMode deployment_mode = 2;
+}
+
+message BoolResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+enum StandaloneBackendMode {
+  STANDALONE_BACKEND_UNKNOWN = 0;
+  STANDALONE_BACKEND_LOCAL = 1;
+  STANDALONE_BACKEND_DISTRIBUTED = 2;
+}
+
+message CountResponse {
+  uint64 count = 1;
+}
+
+message KeyRequest {
+  string key = 1;
+}
+
+message BatchKeysRequest {
+  repeated string keys = 1;
+}
+
+message PutRequest {
+  string key = 1;
+  string client_id = 2;
+  uint64 shm_offset = 3;
+  uint64 size = 4;
+}
+
+message GetRequest {
+  string key = 1;
+  string client_id = 2;
+  uint64 shm_offset = 3;
+  uint64 size = 4;
+}
+
+message BatchDataRequest {
+  repeated string keys = 1;
+  string client_id = 2;
+  repeated uint64 shm_offsets = 3;
+  repeated uint64 sizes = 4;
+}
+
+message BatchDataWithDepthRequest {
+  repeated string keys = 1;
+  string client_id = 2;
+  repeated uint64 shm_offsets = 3;
+  repeated uint64 sizes = 4;
+  repeated int32 depths = 5;
+}
+
+message BatchBoolResponse {
+  repeated bool ok = 1;
+}
+
+message RegisterMemoryRequest {
+  string client_id = 1;
+  uint64 worker_base = 2;
+  uint64 size = 3;
+  string worker_node_id = 4;
+  string worker_node_address = 5;
+  repeated string tags = 6;
+}
+
+message DeregisterMemoryRequest {
+  string client_id = 1;
+}
+
+message StandaloneExternalKvMutationRequest {
+  repeated string hashes = 1;
+  TierType tier = 2;
+  string client_id = 3;
+}
+
+message StandaloneExternalKvTierRequest {
+  TierType tier = 1;
+  string client_id = 2;
+}
+
+message StandaloneMatchExternalKvRequest {
+  repeated string hashes = 1;
+  bool count_as_hit = 2;
+  string client_id = 3;
+}
+
+message StandaloneExternalKvMatch {
+  string node_id = 1;
+  string peer_address = 2;
+  repeated TierHashes hashes_by_tier = 3;
+}
+
+message StandaloneMatchExternalKvResponse {
+  repeated StandaloneExternalKvMatch matches = 1;
+}
+
+message StandaloneExternalKvHitCountsRequest {
+  repeated string hashes = 1;
+  string client_id = 2;
+}
+
+message StandaloneExternalKvHitCountEntry {
+  string hash = 1;
+  uint64 hit_count_total = 2;
+}
+
+message StandaloneExternalKvHitCountsResponse {
+  repeated StandaloneExternalKvHitCountEntry entries = 1;
+}
