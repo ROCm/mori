@@ -84,7 +84,8 @@ jobs:
             mpirun --allow-run-as-root -np 2 python 01_barrier/main.py && \
             mpirun --allow-run-as-root -np 2 python 02_lsa_put/main.py && \
             mpirun --allow-run-as-root -np 2 python 04_flydsl_lsa_put/main.py && \
-            mpirun --allow-run-as-root -np 2 python 05_flydsl_lsa_allreduce/main.py"
+            mpirun --allow-run-as-root -np 2 python 05_flydsl_lsa_allreduce/main.py && \
+            mpirun --allow-run-as-root -np 2 python 07_torch_symm_import/main.py"
             # GDA (device-initiated RDMA) examples fail on the runner (cross-rail
             # RDMA); re-enable once that is fixed.
             # mpirun --allow-run-as-root -np 2 python 03_flydsl_put/main.py
