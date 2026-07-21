@@ -94,10 +94,11 @@ def _cmd_setup(rest: List[str]) -> int:
 
     ``env_setup.sh`` does two things:
 
-    1. Configures PFC / DSCP / DCQCN on the ionic NICs via ``sudo
-       nicctl``. These are system-side changes that persist beyond the
-       calling process — running the script as a normal subprocess is
-       sufficient.
+    1. Configures PFC / DSCP / DCQCN on the detected NICs (ionic via
+       ``nicctl``, bnxt via ``dcb``/configfs, mlx5 via ``mlnx_qos``/
+       ``mlxconfig``). These are system-side changes that persist beyond
+       the calling process — running the script as a normal subprocess
+       is sufficient.
     2. Exports ``MORI_RDMA_SL`` / ``MORI_RDMA_TC`` for the calling
        shell. A Python entry point cannot mutate its parent shell's
        environment, so getting these into your current shell requires
@@ -114,10 +115,10 @@ def _cmd_setup(rest: List[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="mori setup",
         description=(
-            "Run env_setup.sh to configure PFC / DSCP / DCQCN on ionic NICs. "
-            "To also pick up the exported MORI_RDMA_SL / MORI_RDMA_TC variables "
-            "in your current shell, source the script instead: "
-            "`source $(mori setup --path)`."
+            "Run env_setup.sh to configure PFC / DSCP / DCQCN on the detected "
+            "ionic/bnxt/mlx5 NICs. To also pick up the exported MORI_RDMA_SL / "
+            "MORI_RDMA_TC variables in your current shell, source the script "
+            "instead: `source $(mori setup --path)`."
         ),
         epilog=(
             "Examples:\n"

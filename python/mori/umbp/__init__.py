@@ -67,13 +67,36 @@ def _configure_packaged_umbp_master() -> None:
         os.environ["UMBP_MASTER_BIN"] = str(master_path)
 
 
+def _configure_packaged_umbp_standalone_server() -> None:
+    if os.environ.get("UMBP_STANDALONE_BIN"):
+        return
+
+    server_path = Path(__file__).resolve().parents[1] / "umbp_standalone_server"
+    if not server_path.is_file():
+        return
+
+    try:
+        mode = server_path.stat().st_mode
+        exec_bits = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+        if (mode & exec_bits) != exec_bits:
+            server_path.chmod(mode | exec_bits)
+    except OSError:
+        pass
+
+    if os.access(server_path, os.X_OK):
+        os.environ["UMBP_STANDALONE_BIN"] = str(server_path)
+
+
 _configure_packaged_spdk_proxy()
 _configure_packaged_umbp_master()
+_configure_packaged_umbp_standalone_server()
 
 from mori.cpp import (
+    CacheRemoteAdmission,
     UMBPClient,
     UMBPConfig,
     UMBPCopyPipelineConfig,
+    UMBPDeploymentMode,
     UMBPDistributedConfig,
     UMBPDramConfig,
     UMBPDurabilityMode,
@@ -83,6 +106,7 @@ from mori.cpp import (
     UMBPIoBackend,
     UMBPIoConfig,
     UMBPRole,
+    UMBPStandaloneProcessConfig,
     UMBPSsdConfig,
     UMBPEvictionConfig,
     UMBPDurabilityConfig,
@@ -92,9 +116,11 @@ from mori.cpp import (
 )
 
 __all__ = [
+    "CacheRemoteAdmission",
     "UMBPClient",
     "UMBPConfig",
     "UMBPCopyPipelineConfig",
+    "UMBPDeploymentMode",
     "UMBPDistributedConfig",
     "UMBPDramConfig",
     "UMBPDurabilityConfig",
@@ -105,6 +131,7 @@ __all__ = [
     "UMBPIoBackend",
     "UMBPIoConfig",
     "UMBPRole",
+    "UMBPStandaloneProcessConfig",
     "UMBPSsdConfig",
     "UMBPEvictionConfig",
     "UMBPTierType",

@@ -6,6 +6,7 @@ requires = [
     "ninja",
     "cmake",
     "pybind11",
+    "Cython>=3.0",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -22,6 +23,13 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = []
+
+[project.optional-dependencies]
+# FlyDSL device bindings (mori.cco.device.flydsl) are optional — only needed to
+# author/run cco GDA/LSA kernels from FlyDSL. Left unpinned so mori integrates
+# with whatever FlyDSL the host environment already provides. Install with:
+#   pip install amd_mori[flydsl]
+flydsl = ["flydsl"]
 
 [project.urls]
 Homepage = "https://github.com/ROCm/mori"

@@ -55,11 +55,9 @@ Read by the **master process** (`bin/master_main.cpp` via
 |---|---|---|---|
 | `UMBP_HEARTBEAT_TTL_SEC` | `10` | sec | Registry entry TTL; client is evicted if no heartbeat arrives within `heartbeat_ttl × max_missed_heartbeats`. |
 | `UMBP_REAPER_INTERVAL_SEC` | `5` | sec | Reaper wake-up period inside `ClientRegistry`. |
-| `UMBP_ALLOCATION_TTL_SEC` | `30` | sec | Legacy: pending allocation TTL on master. Unused on the live path (pending TTL now lives on `PeerDramAllocator`). Retained for back-compat. |
-| `UMBP_FINALIZED_RECORD_TTL_SEC` | `120` | sec | Legacy: finalized-allocation idempotency window on master. Unused on the live path. |
 | `UMBP_MAX_MISSED_HEARTBEATS` | `3` | count | Consecutive misses before a client is considered dead. |
 | `UMBP_EVICTION_CHECK_INTERVAL_SEC` | `5` | sec | `EvictionManager` loop period. |
-| `UMBP_LEASE_DURATION_SEC` | `10` | sec | Master-side read-lease length granted by `Router::RouteGet` to keep a key alive across the writer's RDMA round trip. Distinct from the peer's `read_lease_ttl_` (~500 ms by default), which protects against concurrent eviction during a single `ResolveKey`. |
+| `UMBP_LEASE_DURATION_SEC` | `2` | sec | Master-side read-lease length granted by `Router::RouteGet`: `IsLeased()` keys are skipped by the eviction scan, keeping a key alive from the moment the master returns its location until the reader connects to the owning peer. Only needs to cover the master→reader gRPC round trip + reach the peer (the actual RDMA transfer is covered peer-side by `UMBP_DRAM_READ_LEASE_MS`), so seconds is already generous; larger values pin actively-read (hot) keys against eviction. |
 | `UMBP_HEARTBEAT_INTERVAL_DIVISOR` | `2` | count | Recommended client heartbeat interval = `heartbeat_ttl / divisor`. `min_allowed=1` guards against div-by-zero. Read by the master and echoed in `RegisterClientResponse.heartbeat_interval_ms`. |
 | `UMBP_EVICTKEY_DEADLINE_MS` | `1000` | ms | Per-call gRPC deadline applied to outbound `EvictKey` RPCs from `MasterPeerStubPool`. |
 | `UMBP_HIT_INDEX_TTL_SEC` | `7200` | sec | External KV hit-count entry TTL. A hash with no counted match for longer than this is removed from the hit index. |
@@ -76,6 +74,8 @@ that has loaded `libmori_pybinds.so`).
 
 | Env var | Default | Unit | Description |
 |---|---|---|---|
+| `UMBP_DRAM_READ_LEASE_MS` | `500` | ms | Peer-side DRAM/HBM read lease: how long a single `PeerDramAllocator::Resolve` protects its key's pages from concurrent local `Evict`, covering one RDMA read of those pages. Only needs to exceed one DRAM RDMA round trip (sub-ms), so 500 ms is ~100x margin. Read once at `PoolClient::Init`; `min_allowed=1`. |
+| `UMBP_SSD_READ_LEASE_MS` | `3000` | ms | Peer-side SSD read-staging slot lease: how long a claimed staging slot is reserved before the peer reclaims it by TTL (the fallback when the reader's best-effort `ReleaseSsdLease` is lost), and, echoed back in `PrepareSsdReadResponse.lease_ttl_ms`, the reader's validity window anchored at `t_send`. Must exceed one SSD read + RDMA (slower than DRAM), but too long pins one of only ~16 slots on a lost release. Also the fallback for the `PrepareSsdRead` RPC deadline when `UMBP_SSD_PREPARE_TIMEOUT_MS` is unset. Read once at `PoolClient::Init`; `min_allowed=1`. |
 | `UMBP_RPC_SHUTDOWN_TIMEOUT_MS` | `3000` | ms | Deadline for `UnregisterClient` and the last `Heartbeat` in `~MasterClient`. Bounds `~MasterClient` worst-case at ≤ 2 × this value. |
 | `UMBP_GRPC_SHUTDOWN_DEADLINE_SEC` | `3` | sec | `server_->Shutdown(deadline)` budget, shared by master and peer service. |
 | `UMBP_METRICS_REPORT_INTERVAL_MS` | `1000` | ms | Cadence at which the pool client's `MasterClient` flushes buffered counters/gauges/histograms via `ReportMetrics`. |
@@ -83,8 +83,8 @@ that has loaded `libmori_pybinds.so`).
 | `UMBP_SSD_GET_MAX_ATTEMPTS` | `1` | count | Total remote SSD get attempts per key. `1` = no retry. Only NO_SLOT and a reader-local lease expiry retry; rpc failure / NOT_FOUND do not. Raise to absorb staging-slot contention. `min_allowed=1`. |
 | `UMBP_SSD_GET_RETRY_BACKOFF_MS` | `2` | ms | Sleep between remote SSD get retries (only applied when another attempt follows). `min_allowed=1`. |
 | `UMBP_RELEASE_LEASE_TIMEOUT_MS` | `1000` | ms | Per-attempt gRPC deadline for the best-effort `ReleaseSsdLease` RPC so a slow peer can't stall the reader. `min_allowed=1`. |
-| `UMBP_SSD_PREPARE_TIMEOUT_MS` | `0` | ms | Per-call gRPC deadline for `PrepareSsdRead` so a hung/slow peer can't stall the serial batch. `0` = fall back to `ssd_lease_timeout_s` (cluster-homogeneous). A timed-out / failed prepare is a hard not-served outcome (NOT retried, and never a miss). `min_allowed=0`. |
-| `UMBP_AUTO_FLUSH_EVENT_THRESHOLD` | `128` | count | Peer-side unshipped `KvEvent` outbox size at which a completed batch of puts auto-triggers a heartbeat flush (`FlushHeartbeat`), so the ADDs become visible at the master without waiting for the heartbeat interval or an explicit `Flush()`. Counted on `PeerDramAllocator` only (SSD events still wait for the interval). Parsed via `std::strtoull` (no WARN on bad input); unset / unparseable / `0` -> default `128`; set to a very large value to make auto-flush effectively never fire. Cached on first use in `MasterClient::SetPeerDramAllocator`. |
+| `UMBP_SSD_PREPARE_TIMEOUT_MS` | `0` | ms | Per-call gRPC deadline for `PrepareSsdRead` so a hung/slow peer can't stall the serial batch. `0` = fall back to `UMBP_SSD_READ_LEASE_MS` (cluster-homogeneous). A timed-out / failed prepare is a hard not-served outcome (NOT retried, and never a miss). `min_allowed=0`. |
+| `UMBP_AUTO_FLUSH_EVENT_THRESHOLD` | `128` | count | Peer-side unshipped `KvEvent` outbox size at which a completed batch of puts auto-triggers a heartbeat flush (`FlushHeartbeat`), so the ADDs become visible at the master without waiting for the heartbeat interval or an explicit `Flush()`. Counted on `PeerDramAllocator` only (SSD events still wait for the interval). Parsed via `std::strtoull` (no WARN on bad input); unset / unparseable -> default `128`; `0` disables size-based auto-flush entirely (ADDs then ship only on the heartbeat interval or an explicit `Flush()`); set to a very large value to keep auto-flush armed but effectively never fire on size. Cached on first use in `MasterClient::SetPeerDramAllocator`. |
 
 ## SPDK proxy
 

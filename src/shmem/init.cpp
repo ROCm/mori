@@ -177,6 +177,12 @@ void RdmaStatesInit(ShmemStates* states) {
   int rank = states->bootStates->rank;
   int worldSize = states->bootStates->worldSize;
   rdmaStates->commContext = new application::Context(*states->bootStates->bootNet);
+  // SHMEM consumes the initial RDMA endpoint set (worldSize × numQpPerPe QPs)
+  // via Context::GetRdmaEndpoints() later in CopyRdmaEndpointsToGpu(). Build &
+  // connect them now — this is a collective op (one AllToAll + per-peer RTR/RTS).
+  // CCO skips this step because it builds its own per-DevComm QP sets via
+  // ctx->CreateAdditionalEndpoints().
+  rdmaStates->commContext->BuildInitialEndpoints();
   MORI_SHMEM_TRACE("RdmaStatesInit: rank {}, worldSize {}", rank, worldSize);
 }
 
@@ -687,6 +693,10 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   states->status = ShmemStatesStatus::Initialized;
   MORI_SHMEM_INFO("Shmem initialization completed");
   return 0;
+}
+
+bool ShmemIsInitialized() {
+  return ShmemStatesSingleton::GetInstance()->status == ShmemStatesStatus::Initialized;
 }
 
 /* ---------------------------------------------------------------------------------------------- */

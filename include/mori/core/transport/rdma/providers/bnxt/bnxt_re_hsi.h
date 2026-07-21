@@ -66,8 +66,18 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* In C++ `true`/`false` are reserved keywords; redefining them as object-like
+ * macros corrupts any C++ code parsed afterwards (e.g. lambdas whose return type
+ * is deduced from `return true;`). Only define them for C, and only if the
+ * translation unit hasn't already pulled in <stdbool.h>. */
+#ifndef __cplusplus
+#ifndef true
 #define true 1
+#endif
+#ifndef false
 #define false 0
+#endif
+#endif
 
 #define BNXT_RE_SLOT_SIZE_BB 16
 #define BNXT_RE_STATIC_WQE_SIZE_SLOTS 4

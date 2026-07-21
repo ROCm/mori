@@ -31,6 +31,7 @@
 #include <functional>
 #include <limits>
 #include <msgpack.hpp>
+#include <new>
 #include <numeric>
 #include <string>
 #include <string_view>
@@ -323,6 +324,29 @@ std::chrono::milliseconds ReleaseLeaseRpcTimeout() {
   return v;
 }
 
+// Peer-side DRAM/HBM read lease: how long a single Resolve protects its key's
+// pages from concurrent local Evict, covering one RDMA read.  Only needs to
+// exceed one DRAM RDMA round trip (sub-ms), so 500 ms is already ~100x margin;
+// exposed so operators can tighten it under eviction pressure.
+std::chrono::milliseconds DramReadLeaseTtl() {
+  static const auto v = GetEnvMilliseconds("UMBP_DRAM_READ_LEASE_MS",
+                                           std::chrono::milliseconds(500), /*min_allowed=*/1);
+  return v;
+}
+
+// Peer-side SSD read-staging slot lease: how long a claimed staging slot is
+// reserved for a reader (peer reclaims by TTL if the best-effort ReleaseSsdLease
+// is lost) and, mirrored back to the reader, the validity window it anchors at
+// t_send.  Must exceed one SSD read + RDMA (slower than DRAM), but too long
+// pins one of only ~16 slots on a lost release, so 3 s balances both.  Also the
+// fallback for the PrepareSsdRead RPC deadline when UMBP_SSD_PREPARE_TIMEOUT_MS
+// is unset.
+std::chrono::milliseconds SsdReadLeaseTtl() {
+  static const auto v = GetEnvMilliseconds("UMBP_SSD_READ_LEASE_MS",
+                                           std::chrono::milliseconds(3000), /*min_allowed=*/1);
+  return v;
+}
+
 // ---------------------------------------------------------------------------
 //  Config / proto translation
 // ---------------------------------------------------------------------------
@@ -424,7 +448,8 @@ bool PoolClient::Init() {
   PeerDramAllocator::TierConfig hbm_cfg;  // HBM not currently exposed via PoolClientConfig
   peer_alloc_ =
       std::make_unique<PeerDramAllocator>(page_size, std::move(dram_cfg), std::move(hbm_cfg),
-                                          /*pending_ttl=*/std::chrono::milliseconds{30000});
+                                          /*pending_ttl=*/std::chrono::milliseconds{30000},
+                                          /*read_lease_ttl=*/DramReadLeaseTtl());
   peer_alloc_->StartReaper();
   master_client_->SetPeerDramAllocator(peer_alloc_.get());
 
@@ -476,7 +501,7 @@ bool PoolClient::Init() {
     peer_service_ = std::make_unique<PeerServiceServer>(
         peer_alloc_.get(), peer_ssd_.get(), ssd_staging_buffer_.get(),
         ssd_staging_buffer_ ? config_.ssd_staging_buffer_size : 0, ssd_staging_mem_desc_bytes_,
-        config_.ssd_staging_buffer_slots, config_.ssd_lease_timeout_s, engine_desc_bytes,
+        config_.ssd_staging_buffer_slots, SsdReadLeaseTtl(), engine_desc_bytes,
         master_client_.get(), ssd_copy_pipeline_.get());
     if (!peer_service_->Start(config_.peer_service_port)) {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
@@ -512,6 +537,16 @@ bool PoolClient::Init() {
 
   if (config_.master_config.auto_heartbeat) master_client_->StartHeartbeat();
 
+  // Start the async re-cache worker only when the feature is on and this node has
+  // an exportable local DRAM tier to install into.
+  if (config_.cache_remote_fetches && peer_alloc_) {
+    {
+      std::lock_guard<std::mutex> lk(recache_mutex_);
+      recache_stop_ = false;
+    }
+    recache_worker_ = std::thread([this] { ReCacheWorkerLoop(); });
+  }
+
   MORI_UMBP_INFO("[PoolClient] Initialized node_id='{}'", config_.master_config.node_id);
   return true;
 }
@@ -519,6 +554,17 @@ bool PoolClient::Init() {
 void PoolClient::Shutdown() {
   if (!initialized_) return;
   initialized_ = false;
+
+  // Stop the async re-cache worker first: it calls ExecuteLocalPut (which uses
+  // peer_alloc_ + master_client_), so it must be joined before those are torn
+  // down below.
+  {
+    std::lock_guard<std::mutex> lk(recache_mutex_);
+    recache_stop_ = true;
+    recache_queue_.clear();
+  }
+  recache_cv_.notify_all();
+  if (recache_worker_.joinable()) recache_worker_.join();
 
   if (master_client_) {
     master_client_->StopHeartbeat();
@@ -699,7 +745,8 @@ bool PoolClient::LocalGetPages(const std::vector<PageLocation>& pages, uint64_t 
 }
 
 PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key, const void* src,
-                                                          size_t size, TierType tier) {
+                                                          size_t size, TierType tier,
+                                                          bool enqueue_ssd_copy) {
   if (!peer_alloc_) {
     MORI_UMBP_ERROR("[PoolClient] Local Put requested but peer allocator unavailable");
     return PutAttemptOutcome::kFatal;
@@ -726,7 +773,7 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
     return PutAttemptOutcome::kFatal;
   }
   // Owner-side commit succeeded: best-effort async copy to local SSD.
-  if (ssd_copy_pipeline_) {
+  if (enqueue_ssd_copy && ssd_copy_pipeline_) {
     ssd_copy_pipeline_->Enqueue(SsdCopyTask{key, tier, size});
   }
   master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
@@ -758,6 +805,81 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
                              MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
                              {{"traffic", "local"}}, static_cast<double>(size));
   return GetAttemptOutcome::kSuccess;
+}
+
+void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src, size_t size) {
+  if (!peer_alloc_) return;  // no exportable local DRAM tier on this node
+  // Admission gate (cache_remote_fetches / size==0 / NEVER / SIZE cap): shared
+  // pure predicate, unit-tested in test_cache_remote_admission.cpp.
+  if (!ShouldAdmitReCache(config_.cache_remote_fetches, config_.cache_remote_admission,
+                          config_.admission_max_block_bytes, size)) {
+    MORI_UMBP_DEBUG("[PoolClient] MaybeReCacheAfterRemote: key='{}' size={} not admitted", key,
+                    size);
+    return;
+  }
+  // ALWAYS and SIZE both delegate DRAM-capacity enforcement to the peer
+  // allocator: Allocate returns kFailedNoSpace when the tier is full, which we
+  // treat as a best-effort miss (the remote read result is unaffected).
+
+  // Prepare the job outside the queue lock: the source buffer is valid for this
+  // call, but copying a multi-MiB block while holding recache_mutex_ would
+  // serialize unrelated Get finalizers behind this memcpy.
+  ReCacheJob job;
+  job.key = key;
+  job.bytes = std::unique_ptr<char[]>(new (std::nothrow) char[size]);
+  if (!job.bytes) {
+    MORI_UMBP_DEBUG("[PoolClient] MaybeReCacheAfterRemote: allocation failed for key='{}' size={}",
+                    key, size);
+    return;
+  }
+  job.size = size;
+  LocalCopyBlock(job.bytes.get(), src, size);
+
+  // Enqueue for asynchronous install. The actual DRAM Allocate + copy +
+  // Commit→KvEvent::ADD publish is performed by ReCacheWorkerLoop OFF the Get
+  // critical path, so it does not add latency to concurrent Gets (the tail-round
+  // TTFT blowup observed with a synchronous on-path install). Bounded queue →
+  // drop-on-full keeps best-effort semantics.
+  {
+    std::lock_guard<std::mutex> lk(recache_mutex_);
+    if (recache_stop_) return;
+    if (recache_queue_.size() >= recache_queue_max_) {
+      MORI_UMBP_DEBUG("[PoolClient] MaybeReCacheAfterRemote: queue full, dropping key='{}'", key);
+      return;
+    }
+    recache_queue_.push_back(std::move(job));
+  }
+  recache_cv_.notify_one();
+}
+
+void PoolClient::ReCacheWorkerLoop() {
+  for (;;) {
+    ReCacheJob job;
+    {
+      std::unique_lock<std::mutex> lk(recache_mutex_);
+      recache_cv_.wait(lk, [this] { return recache_stop_ || !recache_queue_.empty(); });
+      if (recache_stop_ && recache_queue_.empty()) return;
+      job = std::move(recache_queue_.front());
+      recache_queue_.pop_front();
+    }
+    // Install into local DRAM. ExecuteLocalPut allocates a slot in dram_buffers,
+    // copies the bytes, and Commit queues a KvEvent::ADD that reaches the master
+    // via heartbeat — mirroring the local Put publish path. kSuccessAlreadyExists
+    // makes this idempotent for a repeat remote read of the same key.
+    switch (ExecuteLocalPut(job.key, job.bytes.get(), job.size, TierType::DRAM,
+                            /*enqueue_ssd_copy=*/false)) {
+      case PutAttemptOutcome::kSuccess:
+        MORI_UMBP_DEBUG("[PoolClient] ReCacheWorker: re-cached key='{}' size={}", job.key,
+                        job.size);
+        break;
+      case PutAttemptOutcome::kSuccessAlreadyExists:
+        break;
+      case PutAttemptOutcome::kRetry:
+      case PutAttemptOutcome::kFatal:
+        MORI_UMBP_DEBUG("[PoolClient] ReCacheWorker: local install failed for key='{}'", job.key);
+        break;
+    }
+  }
 }
 
 PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalSsdGet(const std::string& key, void* dst,
@@ -1936,6 +2058,13 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
                                MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
                                {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
     (*results)[entry.result_index] = true;
+
+    // Re-cache the remotely-fetched block into local DRAM (best-effort): the
+    // user dst is already populated (staging copy-out and zero-copy both land
+    // before Finalize runs), so subsequent reads of this key route local.
+    if (entry.item) {
+      MaybeReCacheAfterRemote(*entry.item->key, entry.item->dst, entry.item->size);
+    }
   }
 }
 
@@ -2347,7 +2476,7 @@ PoolClient::SsdGetOutcome PoolClient::RemoteSsdReadOnce(PeerConnection& peer,
   const auto t_send = std::chrono::steady_clock::now();
   auto rpc_timeout = SsdPrepareRpcTimeoutOverride();
   if (rpc_timeout.count() == 0) {
-    rpc_timeout = std::chrono::seconds(std::max(config_.ssd_lease_timeout_s, 1));
+    rpc_timeout = SsdReadLeaseTtl();
   }
 
   ::umbp::PrepareSsdReadRequest req;

@@ -1,0 +1,112 @@
+name: CCO CI test
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: rocm/mori:ci-cco
+  BASE_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+  CONTAINER: mori_cco_ci_${{ github.run_id }}
+  CT: podman  # MI355X-AINIC runner is podman rootless (no docker daemon)
+
+jobs:
+  cco-unit-test:
+    name: CCO unit test (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+    env:
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.cco .
+
+      - name: Start container
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Build mori with tests
+        run: |
+          # BUILD_UMBP=OFF: not needed for CCO, and its gtest discovery breaks under cmake 4.4.
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON MORI_WITH_MPI=ON BUILD_UMBP=OFF pip install ."
+
+      - name: Run CCO unit tests (fork mode, 4 ranks)
+        run: |
+          # MORI_CCO_SKIP_GDA_FULL=1: the MI355X-AINIC runner has no intranode
+          # cross-rail RDMA, so GDA-FULL tests (gda_flush_async/gda_modes/
+          # multiprocess) can't form FULL connections; skip them here.
+          $CT exec -e MORI_CCO_SKIP_GDA_FULL=1 $CONTAINER bash $GITHUB_WORKSPACE/tools/run_cco_tests.sh $GITHUB_WORKSPACE/build 4 2>&1
+
+      - name: Run CCO C++ examples (2 ranks)
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_lsa_put"
+          # TEMP: cco_gda_put bypassed on the MI355X-AINIC runner (GDA put not
+          # working there yet); re-enable once GDA is supported on this runner.
+          # mpirun --allow-run-as-root -np 2 $GITHUB_WORKSPACE/build/examples/cco_gda_put
+
+      - name: Run CCO Python examples (2 ranks)
+        run: |
+          $CT exec $CONTAINER bash -c "pip install mpi4py && \
+            cd $GITHUB_WORKSPACE/examples/cco/python && \
+            mpirun --allow-run-as-root -np 2 python 01_barrier/main.py && \
+            mpirun --allow-run-as-root -np 2 python 02_lsa_put/main.py && \
+            mpirun --allow-run-as-root -np 2 python 04_flydsl_lsa_put/main.py && \
+            mpirun --allow-run-as-root -np 2 python 05_flydsl_lsa_allreduce/main.py"
+            # GDA (device-initiated RDMA) examples fail on the runner (cross-rail
+            # RDMA); re-enable once that is fixed.
+            # mpirun --allow-run-as-root -np 2 python 03_flydsl_put/main.py
+            # mpirun --allow-run-as-root -np 2 python 06_flydsl_gda_modes/main.py
+
+      - name: Run ops-v2 dispatch/combine test (EP8, 8 ranks)
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            python -m pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -v"
+
+      - name: Run ops-v2 dispatch/combine bench (EP8 smoke)
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            MODE=graph SWEEP=128,512,4096,8192 ITERS=20 WARMUP=10 \
+            torchrun --standalone --nproc_per_node=8 bench_dispatch_combine.py"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Restore workspace ownership (build ran as root in the container).
+          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          # Graceful stop so GPU ranks release HIP/KFD contexts (not SIGKILLed).
+          CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true

@@ -86,7 +86,7 @@ class PeerSsdReadRpcTest : public ::testing::Test {
     port_ = AllocPort();
     server_ = std::make_unique<PeerServiceServer>(
         /*dram_alloc=*/nullptr, peer_ssd_.get(), staging_buffer_, kStagingSize, staging_desc_,
-        kNumReadSlots, kLeaseTimeoutS);
+        kNumReadSlots, std::chrono::seconds(kLeaseTimeoutS));
     ASSERT_TRUE(server_->Start(port_));
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
 

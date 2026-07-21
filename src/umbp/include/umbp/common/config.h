@@ -184,6 +184,29 @@ struct UMBPIoEngineConfig {
   uint16_t port = 0;  // RDMA engine port; 0 = OS-assigned ephemeral port (formerly io_engine_port)
 };
 
+// Admission policy for re-caching remotely-fetched blocks locally.
+enum class CacheRemoteAdmission : int {
+  SIZE = 0,    // admit if block size <= admission_max_block_bytes AND DRAM has room
+  NEVER = 1,   // never re-cache (equivalent to cache_remote_fetches = false)
+  ALWAYS = 2,  // always attempt re-cache (skip size gate)
+};
+
+// Pure admission predicate for the remote-fetch re-cache gate: decides whether a
+// block of `size` bytes is eligible for local re-caching under the given policy,
+// independent of runtime state (DRAM-capacity enforcement is left to the
+// allocator). Extracted so the gate is unit-testable without a live PoolClient;
+// used by PoolClient::MaybeReCacheAfterRemote.
+inline bool ShouldAdmitReCache(bool cache_remote_fetches, CacheRemoteAdmission policy,
+                               size_t admission_max_block_bytes, size_t size) {
+  if (!cache_remote_fetches) return false;
+  if (size == 0) return false;
+  if (policy == CacheRemoteAdmission::NEVER) return false;
+  if (policy == CacheRemoteAdmission::SIZE) {
+    if (admission_max_block_bytes > 0 && size > admission_max_block_bytes) return false;
+  }
+  return true;  // ALWAYS, or SIZE within cap
+}
+
 // User-facing distributed configuration. Set UMBPConfig::distributed to enable
 // distributed mode. Internally translated to PoolClientConfig by DistributedClient.
 struct UMBPDistributedConfig {
@@ -204,6 +227,13 @@ struct UMBPDistributedConfig {
 
   bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
 
+  // Admission gate for re-caching. Only consulted when cache_remote_fetches is true.
+  CacheRemoteAdmission cache_remote_admission = CacheRemoteAdmission::SIZE;
+
+  // Maximum block size (bytes) eligible for local re-cache under SIZE policy.
+  // 0 means unlimited (no size gate). Default 16 MB.
+  size_t admission_max_block_bytes = 16ULL * 1024 * 1024;
+
   // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
   // tier.  Reported via RegisterClient.  Same value applies to both DRAM
   // and HBM.  Forwarded to PoolClientConfig::dram_page_size by
@@ -211,6 +241,22 @@ struct UMBPDistributedConfig {
   // 0 = delegate to Master's ClientRegistryConfig::default_dram_page_size
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
+};
+
+// User-facing same-host standalone-process configuration.  Set
+// UMBPConfig::standalone_process to make CreateUMBPClient construct a
+// StandaloneProcessClient that talks to an umbp_standalone_server over UDS.
+struct UMBPStandaloneProcessConfig {
+  std::string address;             // e.g. unix:///run/umbp/standalone/node0.grpc.sock
+  bool auto_start = false;         // opt-in fork+exec convenience path
+  int startup_timeout_ms = 30000;  // readiness wait bound for auto_start
+
+  // Optional distributed identity for external-KV reports routed through a
+  // distributed-backed standalone server. Empty means external-KV identity is
+  // not requested for this worker.
+  std::string worker_node_id;
+  std::string worker_node_address;
+  std::vector<std::string> tags;
 };
 
 struct UMBPConfig {
@@ -231,6 +277,11 @@ struct UMBPConfig {
   // that connects to the Master and sends periodic heartbeats.
   // nullopt (default) = local-only mode with no network dependencies.
   std::optional<UMBPDistributedConfig> distributed;
+
+  // Optional same-host standalone-process mode.  Mutually exclusive with
+  // distributed: this mode uses one local server process and shm fd handoff,
+  // not the cross-node master/RDMA path.
+  std::optional<UMBPStandaloneProcessConfig> standalone_process;
 
   UMBPRole ResolveRole() const {
     if (role != UMBPRole::Standalone) {
@@ -295,6 +346,22 @@ struct UMBPConfig {
       if (d.master_config.node_address.empty()) {
         if (error_message)
           *error_message = "distributed.master_config.node_address must not be empty";
+        return false;
+      }
+    }
+    if (distributed.has_value() && standalone_process.has_value()) {
+      if (error_message)
+        *error_message = "distributed and standalone_process are mutually exclusive";
+      return false;
+    }
+    if (standalone_process.has_value()) {
+      const auto& sp = standalone_process.value();
+      if (sp.address.empty()) {
+        if (error_message) *error_message = "standalone_process.address must not be empty";
+        return false;
+      }
+      if (sp.startup_timeout_ms <= 0) {
+        if (error_message) *error_message = "standalone_process.startup_timeout_ms must be > 0";
         return false;
       }
     }

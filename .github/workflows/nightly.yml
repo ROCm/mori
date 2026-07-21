@@ -2,7 +2,7 @@ name: Nightly Wheel Build
 
 on:
   schedule:
-    - cron: '0 17 * * *'  # daily 01:00 Beijing (UTC+8)
+    - cron: '0 20 * * *'  # daily 04:00 Beijing (UTC+8)
   workflow_dispatch:       # manual trigger
 
 concurrency:
@@ -58,7 +58,7 @@ jobs:
             $IMAGE bash -c "
               git config --global --add safe.directory '*'
 
-              echo '=== Building gh-pages wheel (amd_mori ${GH_VERSION}) ==='
+              echo '=== Building CI test wheel (amd_mori ${GH_VERSION}) ==='
               SETUPTOOLS_SCM_PRETEND_VERSION=${GH_VERSION} \
                 python3 -m pip wheel --no-deps -w /tmp/dist .
 
@@ -112,7 +112,7 @@ jobs:
           echo "=== PyPI wheels ==="
           ls -lh ${{ runner.temp }}/dist-pypi/
 
-      - name: Upload gh-pages wheel
+      - name: Upload CI test wheel (amd_mori)
         uses: actions/upload-artifact@v4
         with:
           name: wheel-cp${{ matrix.python }}
@@ -137,157 +137,10 @@ jobs:
                 rm -rf /runner_temp/dist
               " || true
 
-  # ── Stage 2: Deploy wheels to gh-pages (date dir only, no latest/) ─────────
-  deploy-staging:
-    name: deploy staging
-    needs: build-wheel
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      date: ${{ steps.set-date.outputs.date }}
-      wheel_url: ${{ steps.set-date.outputs.wheel_url }}
-      version: ${{ steps.set-date.outputs.version }}
-    steps:
-      - name: Download all wheels
-        uses: actions/download-artifact@v4
-        with:
-          pattern: wheel-*
-          merge-multiple: true
-          path: ./wheels
-
-      - name: Set date and version
-        id: set-date
-        run: |
-          DATE=$(date +%Y-%m-%d)
-          VERSION=$(ls ./wheels/*.whl | head -1 | sed 's/.*amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
-          echo "date=$DATE" >> $GITHUB_OUTPUT
-          echo "wheel_url=https://rocm.github.io/mori/nightly/$DATE/" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Detected version: $VERSION"
-
-      - name: List wheels
-        run: ls -lh ./wheels/
-
-      - name: Checkout gh-pages
-        uses: actions/checkout@v4
-        with:
-          ref: gh-pages
-          path: gh-pages
-
-      - name: Add wheels and prune old dirs
-        run: |
-          DATE=${{ steps.set-date.outputs.date }}
-          mkdir -p gh-pages/nightly/$DATE
-          cp ./wheels/*.whl gh-pages/nightly/$DATE/
-
-          cd gh-pages/nightly/$DATE
-          echo '<!DOCTYPE html><html><body>' > index.html
-          for f in *.whl; do
-            [ -f "$f" ] && echo "<a href=\"$f\">$f</a><br>" >> index.html
-          done
-          echo '</body></html>' >> index.html
-          cd -
-
-          CUTOFF=$(date -d '30 days ago' +%Y-%m-%d 2>/dev/null || date -v-30d +%Y-%m-%d)
-          cd gh-pages/nightly
-          for d in 20??-??-??; do
-            [ -d "$d" ] || continue
-            if [ "$d" \< "$CUTOFF" ] || [ "$d" = "$CUTOFF" ]; then
-              echo "Pruning old directory: $d"
-              rm -rf "$d"
-            fi
-          done
-          cd -
-
-      - name: Generate index.html
-        run: |
-          cd gh-pages/nightly
-          cat > index.html << 'HEADER'
-          <!DOCTYPE html>
-          <html><head>
-          <meta charset="utf-8">
-          <title>MoRI Nightly Wheels</title>
-          <style>
-            body { font-family: -apple-system, sans-serif; max-width: 960px; margin: 2em auto; padding: 0 1em; }
-            h1 { border-bottom: 1px solid #ddd; padding-bottom: 0.3em; }
-            table { border-collapse: collapse; width: 100%; }
-            th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid #eee; }
-            th { background: #f6f8fa; }
-            a { color: #0366d6; text-decoration: none; }
-            a:hover { text-decoration: underline; }
-            code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
-            .install { background: #f6f8fa; padding: 1em; border-radius: 6px; margin: 1em 0; }
-            h2.date { margin-top: 1.5em; color: #24292e; font-size: 1.1em; }
-          </style>
-          </head><body>
-          <h1>MoRI Nightly Wheels</h1>
-          <div class="install">
-          <strong>Install latest nightly:</strong><br>
-          <code>pip install --no-index --force-reinstall --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori</code>
-          </div>
-          HEADER
-
-          if [ -d "latest" ] && ls latest/amd_mori-*.whl &>/dev/null; then
-            LATEST_WHL=$(ls latest/amd_mori-*.whl | head -1 | xargs basename)
-            LATEST_VER=$(echo "$LATEST_WHL" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
-            LATEST_COMMIT=$(echo "$LATEST_VER" | sed -n 's/.*+\(.*\)/\1/p')
-            echo "<h2><a href=\"latest/\">Latest</a> (tested)</h2>" >> index.html
-            echo "<table>" >> index.html
-            echo "<tr><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>" >> index.html
-            for f in $(ls -r latest/amd_mori-*.whl 2>/dev/null); do
-              BASENAME=$(basename "$f")
-              SIZE=$(du -h "$f" | cut -f1)
-              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
-              COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
-              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp[0-9]*-.*/\1/')
-              echo "<tr><td><code>${COMMIT}</code></td><td>${VER}</td><td>${PYTAG}</td><td><a href=\"latest/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
-            done
-            echo "</table>" >> index.html
-          fi
-
-          echo "<hr>" >> index.html
-          echo "<h2>All builds</h2>" >> index.html
-
-          for d in $(ls -rd 20??-??-?? 2>/dev/null); do
-            [ -d "$d" ] || continue
-            echo "<h2 class=\"date\"><a href=\"$d/\">$d</a></h2>" >> index.html
-            echo "<table>" >> index.html
-            echo "<tr><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>" >> index.html
-            for f in $(ls -r "$d"/amd_mori-*.whl 2>/dev/null); do
-              BASENAME=$(basename "$f")
-              SIZE=$(du -h "$f" | cut -f1)
-              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
-              COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
-              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp[0-9]*-.*/\1/')
-              echo "<tr><td><code>${COMMIT}</code></td><td>${VER}</td><td>${PYTAG}</td><td><a href=\"${d}/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
-            done
-            echo "</table>" >> index.html
-          done
-
-          cat >> index.html << 'FOOTER'
-          <p style="color:#888; margin-top:2em; font-size:0.85em">
-          Auto-generated by <a href="https://github.com/ROCm/mori/actions/workflows/nightly.yml">nightly.yml</a>.
-          Wheels older than 30 days are automatically pruned. Only wheels that pass full test suite are published.
-          </p>
-          </body></html>
-          FOOTER
-
-      - name: Push to gh-pages
-        run: |
-          cd gh-pages
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add nightly/
-          git diff --cached --quiet && echo "No changes to deploy" && exit 0
-          git commit -m "nightly: stage wheels $(date +%Y-%m-%d)"
-          git push
-
-  # ── Stage 3a: Intranode tests (install from gh-pages) ──────────────────────
+  # ── Stage 2a: Intranode tests (install from build artifact) ────────────────
   test-wheel:
     name: intranode test (${{ matrix.platform }}, py${{ matrix.python }})
-    needs: deploy-staging
+    needs: build-wheel
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -307,28 +160,33 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
-          - platform: MI300X_BNXT
+          - platform: MI325X_BNXT
             python: "3.12"
-            runner: [self-hosted, MI300X-BNXT]
+            runner: [self-hosted, 325_bnxt_108]
             base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
-            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             rdma_sl: 3
             rdma_tc: 104
-            socket_ifname: enp159s0np0
+            socket_ifname: enp49s0f1np1
     env:
       IMAGE: rocm/mori:ci-py${{ matrix.python }}
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
-      WHEEL_URL: ${{ needs.deploy-staging.outputs.wheel_url }}
-      WHEEL_VERSION: ${{ needs.deploy-staging.outputs.version }}
+      NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
     timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: true
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-cp${{ matrix.python }}
+          path: ${{ github.workspace }}/_wheels
 
       - name: Build CI image
         run: $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev .
@@ -341,20 +199,17 @@ jobs:
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
+            ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
           $CT exec $CONTAINER \
             git config --global --add safe.directory $GITHUB_WORKSPACE
 
-      - name: Install from gh-pages
+      - name: Install wheel (from artifact)
         run: |
           $CT exec $CONTAINER bash -c "
-            for i in \$(seq 1 15); do
-              pip install --no-index --find-links $WHEEL_URL amd_mori==$WHEEL_VERSION && break
-              echo \"Retry \$i/15: waiting for gh-pages to propagate...\"
-              sleep 15
-            done
+            pip install $GITHUB_WORKSPACE/_wheels/amd_mori-*.whl
             pip install prettytable pytest
             python3 -c 'import mori; print(\"mori \" + mori.__version__ + \" imported OK\")'
           "
@@ -468,10 +323,10 @@ jobs:
               " || true
           $CT rm -f $CONTAINER || true
 
-  # ── Stage 3b: Internode tests (install from gh-pages) ──────────────────────
+  # ── Stage 2b: Internode tests (install from build artifact) ────────────────
   test-wheel-internode:
     name: internode test (${{ matrix.platform }}, py${{ matrix.python }})
-    needs: deploy-staging
+    needs: build-wheel
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -503,16 +358,16 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             ct: podman
-          - platform: MI300X_BNXT
+          - platform: MI325X_BNXT
             python: "3.12"
-            runner: [self-hosted, MI300X-BNXT]
+            runner: [self-hosted, 325_bnxt_108]
             base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
-            node1_host: 10.245.128.61
-            node2_host: 10.245.128.59
+            node1_host: 10.162.224.131
+            node2_host: 10.162.224.162
             node2_port: 22
-            node1_ifname: enp159s0np0
-            node2_ifname: enp159s0np0
-            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            node1_ifname: enp49s0f1np1
+            node2_ifname: enp49s0f1np1
+            rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
             rdma_sl: 3
             rdma_tc: 104
             ct: docker
@@ -529,14 +384,18 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
-      WHEEL_URL: ${{ needs.deploy-staging.outputs.wheel_url }}
-      WHEEL_VERSION: ${{ needs.deploy-staging.outputs.version }}
     timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: true
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-cp${{ matrix.python }}
+          path: ${{ github.workspace }}/_wheels
 
       - name: Build CI image
         run: $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev .
@@ -587,11 +446,7 @@ jobs:
       - name: Install wheel (node1)
         run: |
           $CT exec $CONTAINER bash -c "
-            for i in \$(seq 1 15); do
-              pip install --no-index --find-links $WHEEL_URL amd_mori==$WHEEL_VERSION && break
-              echo \"Retry \$i/15: waiting for gh-pages to propagate...\"
-              sleep 15
-            done
+            pip install $GITHUB_WORKSPACE/_wheels/amd_mori-*.whl
             pip install prettytable
           "
 
@@ -599,11 +454,7 @@ jobs:
         run: |
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c '
-              for i in \$(seq 1 15); do
-              pip install --no-index --find-links $WHEEL_URL amd_mori==$WHEEL_VERSION && break
-              echo \"Retry \$i/15: waiting for gh-pages...\"
-                sleep 15
-              done
+              pip install $GITHUB_WORKSPACE/_wheels/amd_mori-*.whl
               pip install prettytable
             '"
 
@@ -751,129 +602,10 @@ jobs:
             -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT rm -f $CONTAINER || true"
 
-  # ── Stage 4: Promote to latest/ after all tests pass ───────────────────────
-  promote-latest:
-    name: promote to latest
-    needs: [deploy-staging, test-wheel, test-wheel-internode]
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download all wheels
-        uses: actions/download-artifact@v4
-        with:
-          pattern: wheel-*
-          merge-multiple: true
-          path: ./wheels
-
-      - name: Checkout gh-pages
-        uses: actions/checkout@v4
-        with:
-          ref: gh-pages
-          path: gh-pages
-
-      - name: Update latest/
-        run: |
-          rm -rf gh-pages/nightly/latest
-          mkdir -p gh-pages/nightly/latest
-          cp ./wheels/*.whl gh-pages/nightly/latest/
-
-          cd gh-pages/nightly/latest
-          echo '<!DOCTYPE html><html><body>' > index.html
-          for f in *.whl; do
-            [ -f "$f" ] && echo "<a href=\"$f\">$f</a><br>" >> index.html
-          done
-          echo '</body></html>' >> index.html
-          cd -
-
-          echo "=== latest/ updated ==="
-          ls -lh gh-pages/nightly/latest/
-
-      - name: Regenerate index.html
-        run: |
-          cd gh-pages/nightly
-          cat > index.html << 'HEADER'
-          <!DOCTYPE html>
-          <html><head>
-          <meta charset="utf-8">
-          <title>MoRI Nightly Wheels</title>
-          <style>
-            body { font-family: -apple-system, sans-serif; max-width: 960px; margin: 2em auto; padding: 0 1em; }
-            h1 { border-bottom: 1px solid #ddd; padding-bottom: 0.3em; }
-            table { border-collapse: collapse; width: 100%; }
-            th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid #eee; }
-            th { background: #f6f8fa; }
-            a { color: #0366d6; text-decoration: none; }
-            a:hover { text-decoration: underline; }
-            code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
-            .install { background: #f6f8fa; padding: 1em; border-radius: 6px; margin: 1em 0; }
-            h2.date { margin-top: 1.5em; color: #24292e; font-size: 1.1em; }
-          </style>
-          </head><body>
-          <h1>MoRI Nightly Wheels</h1>
-          <div class="install">
-          <strong>Install latest nightly:</strong><br>
-          <code>pip install --no-index --force-reinstall --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori</code>
-          </div>
-          HEADER
-
-          if [ -d "latest" ] && ls latest/amd_mori-*.whl &>/dev/null; then
-            echo "<h2><a href=\"latest/\">Latest</a> (tested)</h2>" >> index.html
-            echo "<table>" >> index.html
-            echo "<tr><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>" >> index.html
-            for f in $(ls -r latest/amd_mori-*.whl 2>/dev/null); do
-              BASENAME=$(basename "$f")
-              SIZE=$(du -h "$f" | cut -f1)
-              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
-              COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
-              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp[0-9]*-.*/\1/')
-              echo "<tr><td><code>${COMMIT}</code></td><td>${VER}</td><td>${PYTAG}</td><td><a href=\"latest/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
-            done
-            echo "</table>" >> index.html
-          fi
-
-          echo "<hr>" >> index.html
-          echo "<h2>All builds</h2>" >> index.html
-
-          for d in $(ls -rd 20??-??-?? 2>/dev/null); do
-            [ -d "$d" ] || continue
-            echo "<h2 class=\"date\"><a href=\"$d/\">$d</a></h2>" >> index.html
-            echo "<table>" >> index.html
-            echo "<tr><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>" >> index.html
-            for f in $(ls -r "$d"/amd_mori-*.whl 2>/dev/null); do
-              BASENAME=$(basename "$f")
-              SIZE=$(du -h "$f" | cut -f1)
-              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
-              COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
-              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp[0-9]*-.*/\1/')
-              echo "<tr><td><code>${COMMIT}</code></td><td>${VER}</td><td>${PYTAG}</td><td><a href=\"${d}/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
-            done
-            echo "</table>" >> index.html
-          done
-
-          cat >> index.html << 'FOOTER'
-          <p style="color:#888; margin-top:2em; font-size:0.85em">
-          Auto-generated by <a href="https://github.com/ROCm/mori/actions/workflows/nightly.yml">nightly.yml</a>.
-          Wheels older than 30 days are automatically pruned. Only wheels that pass full test suite are published.
-          </p>
-          </body></html>
-          FOOTER
-
-      - name: Push to gh-pages
-        run: |
-          cd gh-pages
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add nightly/
-          git diff --cached --quiet && echo "No changes" && exit 0
-          git commit -m "nightly: promote tested wheels to latest $(date +%Y-%m-%d)"
-          git push
-
-  # ── Stage 5: Test PyPI wheel (install + import verification) ───────────────
+  # ── Stage 3: Test PyPI wheel (install + import verification) ────────────────
   test-pypi-wheel:
     name: test pypi wheel (py${{ matrix.python }})
-    needs: [promote-latest]
+    needs: [test-wheel, test-wheel-internode]
     if: github.event_name != 'pull_request'
     runs-on: [self-hosted, MI355X-AINIC-TW]
     strategy:
@@ -907,11 +639,12 @@ jobs:
               python3 -c 'from mori import ops; print(\"mori.ops OK\")'
             "
 
-  # ── Stage 6: Publish to PyPI ───────────────────────────────────────────────
+  # ── Stage 4: Publish to PyPI ───────────────────────────────────────────────
   publish-pypi:
     name: publish to PyPI
     needs: [test-pypi-wheel]
-    if: github.event_name != 'pull_request'
+    # Only publish from main; test runs on other branches build+test but never upload.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Download PyPI wheels

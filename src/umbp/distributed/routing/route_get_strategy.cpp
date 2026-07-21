@@ -91,7 +91,8 @@ Location PickRandomReplica(const std::vector<Location>& locations) {
   return selected;
 }
 
-Location PickTierPriorityReplica(const std::vector<Location>& locations) {
+Location PickTierPriorityReplica(const std::vector<Location>& locations,
+                                 const std::string& node_id) {
   // Find the best (lowest-rank) tier present, then collect every replica on it
   // and choose one at random so load still spreads within a tier.
   int best_rank = TierReadRank(locations[0].tier);
@@ -101,6 +102,23 @@ Location PickTierPriorityReplica(const std::vector<Location>& locations) {
   std::vector<size_t> best_tier_indices;
   for (size_t i = 0; i < locations.size(); ++i) {
     if (TierReadRank(locations[i].tier) == best_rank) best_tier_indices.push_back(i);
+  }
+
+  // Requester-local preference: if the asking node itself holds a replica in the
+  // best tier, serve it locally instead of a random peer. This is what makes
+  // cache_remote_fetches pay off — a node that re-cached a remotely-fetched block
+  // reads its own copy on the next Get (no RDMA), matching the local-first
+  // behavior of the pre-dual-scheme UMBPClient. Non-replica requesters still
+  // spread randomly. Empty node_id (unknown caller) falls through to random.
+  if (!node_id.empty()) {
+    for (size_t i : best_tier_indices) {
+      if (locations[i].node_id == node_id) {
+        MORI_UMBP_DEBUG(
+            "[TierPriorityRouteGetStrategy] requester-local hit node={} tier={} size={}",
+            locations[i].node_id, TierTypeName(locations[i].tier), locations[i].size);
+        return locations[i];
+      }
+    }
   }
 
   size_t choice = PickRandomIndex(best_tier_indices);
@@ -152,21 +170,21 @@ std::vector<Location> RandomRouteGetStrategy::BatchSelect(
 }
 
 Location TierPriorityRouteGetStrategy::Select(const std::vector<Location>& locations,
-                                              const std::string& /*node_id*/) {
+                                              const std::string& node_id) {
   if (locations.empty()) {
     MORI_UMBP_WARN(
         "[TierPriorityRouteGetStrategy] received empty location set; returning default Location");
     return {};
   }
-  return PickTierPriorityReplica(locations);
+  return PickTierPriorityReplica(locations, node_id);
 }
 
 std::vector<Location> TierPriorityRouteGetStrategy::BatchSelect(
-    const std::vector<std::vector<Location>>& per_key_locations, const std::string& /*node_id*/) {
+    const std::vector<std::vector<Location>>& per_key_locations, const std::string& node_id) {
   std::vector<Location> out(per_key_locations.size());
   for (size_t i = 0; i < per_key_locations.size(); ++i) {
     if (per_key_locations[i].empty()) continue;  // not routed; leave default
-    out[i] = PickTierPriorityReplica(per_key_locations[i]);
+    out[i] = PickTierPriorityReplica(per_key_locations[i], node_id);
   }
   return out;
 }

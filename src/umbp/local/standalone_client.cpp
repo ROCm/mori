@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "umbp/local/standalone_client.h"
 
+#include <chrono>
 #include <stdexcept>
 #include <string>
 
@@ -297,7 +298,13 @@ bool StandaloneClient::Clear() {
   return true;
 }
 
-bool StandaloneClient::Flush() { return storage_.Flush(); }
+bool StandaloneClient::Flush() {
+  bool ok = true;
+  if (copy_pipeline_) {
+    ok = copy_pipeline_->Drain(std::chrono::seconds(30));
+  }
+  return storage_.Flush() && ok;
+}
 
 void StandaloneClient::Close() {
   if (closed_) return;

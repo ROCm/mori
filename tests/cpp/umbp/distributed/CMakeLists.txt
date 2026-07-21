@@ -335,6 +335,22 @@ target_link_libraries(test_ssd_reliability PRIVATE umbp_common
 target_compile_features(test_ssd_reliability PRIVATE cxx_std_17)
 gtest_discover_tests(test_ssd_reliability)
 
+# test_cache_remote_admission — cache_remote_fetches admission-gate unit test
+# (hermetic; no GPU/RDMA/master).
+add_executable(test_cache_remote_admission test_cache_remote_admission.cpp)
+target_link_libraries(test_cache_remote_admission PRIVATE umbp_common
+                                                          GTest::gtest_main)
+target_compile_features(test_cache_remote_admission PRIVATE cxx_std_17)
+gtest_discover_tests(test_cache_remote_admission)
+
+# test_standalone_shm_ipc — memfd-backed host allocator registry plus raw UDS
+# fd handoff used by standalone-process mode.
+add_executable(test_standalone_shm_ipc test_standalone_shm_ipc.cpp)
+target_link_libraries(test_standalone_shm_ipc PRIVATE umbp_common
+                                                      GTest::gtest_main)
+target_compile_features(test_standalone_shm_ipc PRIVATE cxx_std_17)
+gtest_discover_tests(test_standalone_shm_ipc)
+
 # test_batch_resolve_codec — struct-of-arrays BatchResolveKeysResponse wire
 # codec (batch_resolve_codec.h): encode/decode round-trip, page flattening, desc
 # dedup / omit_descs, malformed-response rejection, and the payload-size win.

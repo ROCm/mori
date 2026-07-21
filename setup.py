@@ -29,6 +29,13 @@ from setuptools import Extension, find_packages, setup
 from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
+try:
+    from Cython.Build import cythonize as _cythonize
+
+    _HAVE_CYTHON = True
+except ImportError:
+    _HAVE_CYTHON = False
+
 _supported_arch_list = ["gfx942", "gfx950"]
 
 _REQUIRED_SYSTEM_DEPS: list = []
@@ -123,6 +130,86 @@ def _check_system_deps() -> None:
         f"Missing system packages: {', '.join(pkg_names)}. "
         "See messages above for install instructions."
     )
+
+
+# System packages needed only by UMBP's distributed control plane (gRPC +
+# Protobuf). These are apt/dnf packages, not pip-installable, so we detect them
+# and gracefully disable UMBP when absent instead of failing the whole build.
+_UMBP_APT_PACKAGES = [
+    "libgrpc-dev",
+    "libgrpc++-dev",
+    "libprotobuf-dev",
+    "protobuf-compiler-grpc",
+]
+
+
+def _detect_missing_umbp_deps() -> list:
+    """Return the UMBP gRPC/Protobuf build deps that appear to be missing.
+
+    Mirrors what src/umbp/CMakeLists.txt requires: the C++ gRPC/Protobuf headers
+    plus the protoc compiler and the gRPC C++ plugin.
+    """
+    missing = []
+    header_checks = [
+        (
+            [
+                "/usr/include/grpcpp/grpcpp.h",
+                "/usr/include/x86_64-linux-gnu/grpcpp/grpcpp.h",
+            ],
+            "libgrpc++-dev",
+        ),
+        (
+            [
+                "/usr/include/google/protobuf/message.h",
+                "/usr/include/x86_64-linux-gnu/google/protobuf/message.h",
+            ],
+            "libprotobuf-dev",
+        ),
+    ]
+    for paths, pkg in header_checks:
+        if not any(os.path.isfile(p) for p in paths):
+            missing.append(pkg)
+    if not shutil.which("protoc"):
+        missing.append("protobuf-compiler")
+    if not shutil.which("grpc_cpp_plugin"):
+        missing.append("protobuf-compiler-grpc")
+    return missing
+
+
+def _warn_umbp_disabled(missing: list, explicit: bool) -> None:
+    """Warn that UMBP is being disabled because gRPC/Protobuf are unavailable."""
+    pm = _detect_pkg_manager()
+    lines = [
+        "",
+        "=" * 70,
+        "[mori] UMBP needs gRPC + Protobuf, but these system packages appear "
+        "to be missing:",
+    ]
+    for pkg in missing:
+        lines.append(f"  - {pkg}")
+    lines.append("")
+    if explicit:
+        lines.append(
+            "  You requested UMBP (BUILD_UMBP / BUILD_UMBP_SPDK), but it will be "
+            "DISABLED for this build."
+        )
+    else:
+        lines.append("  UMBP will be DISABLED for this build.")
+    lines.append("  All other mori modules will still be built and installed.")
+    lines.append("")
+    lines.append("  To build UMBP, install the dependencies and rebuild:")
+    if pm in ("dnf", "yum"):
+        lines.append(
+            f"    sudo {pm} install -y grpc-devel grpc-plugins "
+            "protobuf-devel protobuf-compiler"
+        )
+    else:
+        lines.append(
+            "    sudo apt-get update && sudo apt-get install -y "
+            + " ".join(_UMBP_APT_PACKAGES)
+        )
+    lines.append("=" * 70)
+    print("\n".join(lines), file=sys.stderr)
 
 
 def _invalidate_cmake_cache_if_changed(cmake_cache: "Path", cmake_args: list) -> None:
@@ -264,6 +351,14 @@ def _copy_jit_sources(root_dir: Path) -> None:
         if src_file.is_file():
             shutil.copy2(src_file, shmem_dst / name)
 
+    # cco device-API wrapper — JIT-compiled to libmori_cco_device.bc on first use
+    # (mori.cco.device.bitcode). Headers come from the include/ copy above.
+    cco_dev_src = root_dir / "src" / "cco" / "device" / "cco_device_wrapper.cpp"
+    if cco_dev_src.is_file():
+        cco_dst = jit_dir / "src" / "cco" / "device"
+        cco_dst.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cco_dev_src, cco_dst / "cco_device_wrapper.cpp")
+
     for subdir in ["spdlog/include", "msgpack-c/include"]:
         src = root_dir / "3rdparty" / subdir
         if src.is_dir():
@@ -349,6 +444,44 @@ class CMakeBuild(build_ext):
             self.build_extension(ext)
 
     def build_extension(self, ext: Extension) -> None:
+        if ext.sources and any(s.endswith((".pyx", ".cpp")) for s in ext.sources):
+            if self.compiler is None:
+                self.ensure_finalized()
+                from setuptools._distutils.ccompiler import new_compiler
+                from setuptools._distutils.sysconfig import customize_compiler
+
+                try:
+                    # distutils / older setuptools signature
+                    self.compiler = new_compiler(
+                        verbose=self.verbose,
+                        dry_run=self.dry_run,
+                        force=self.force,
+                    )
+                except TypeError:
+                    # setuptools >= ~80 dropped verbose/dry_run/force kwargs
+                    self.compiler = new_compiler()
+                    for _attr in ("verbose", "dry_run", "force"):
+                        setattr(self.compiler, _attr, getattr(self, _attr))
+                customize_compiler(self.compiler)
+                if self.include_dirs is not None:
+                    self.compiler.set_include_dirs(self.include_dirs)
+                if self.define is not None:
+                    for name, value in self.define:
+                        self.compiler.define_macro(name, value)
+                if self.undef is not None:
+                    for name in self.undef:
+                        self.compiler.undefine_macro(name)
+                if self.libraries is not None:
+                    self.compiler.set_libraries(self.libraries)
+                if self.library_dirs is not None:
+                    self.compiler.set_library_dirs(self.library_dirs)
+                if self.rpath is not None:
+                    self.compiler.set_runtime_library_dirs(self.rpath)
+                if self.link_objects is not None:
+                    self.compiler.set_link_objects(self.link_objects)
+            super().build_extension(ext)
+            return
+
         build_lib = Path(self.build_lib)
         build_lib.mkdir(parents=True, exist_ok=True)
 
@@ -356,6 +489,20 @@ class CMakeBuild(build_ext):
 
         build_umbp_spdk_enabled = _env_flag("BUILD_UMBP_SPDK", "OFF")
         build_umbp_enabled = _env_flag("BUILD_UMBP", "ON") or build_umbp_spdk_enabled
+
+        # UMBP's distributed control plane requires gRPC + Protobuf, which are
+        # system packages (not pip-installable). If they are missing, warn and
+        # disable UMBP instead of letting CMake fail hard mid-configure, so the
+        # rest of mori still builds and installs.
+        if build_umbp_enabled:
+            missing_umbp_deps = _detect_missing_umbp_deps()
+            if missing_umbp_deps:
+                _warn_umbp_disabled(
+                    missing_umbp_deps,
+                    explicit=("BUILD_UMBP" in os.environ or build_umbp_spdk_enabled),
+                )
+                build_umbp_enabled = False
+                build_umbp_spdk_enabled = False
 
         _ensure_3rdparty(root_dir)
         if build_umbp_spdk_enabled:
@@ -439,7 +586,23 @@ class CMakeBuild(build_ext):
             ["cmake", "--build", ".", "-j", f"{os.cpu_count()}"], cwd=str(build_dir)
         )
 
+        # When benchmarks are off, the shared libs are rebuilt without MPI but a
+        # previous BUILD_BENCHMARK=ON run may have left benchmark executables in
+        # build/benchmark/. Running those stale binaries fails with an
+        # undefined MpiBootstrapNetwork symbol. Remove them so the build dir
+        # stays self-consistent.
+        if build_benchmark.upper() != "ON":
+            bench_dir = build_dir / "benchmark"
+            if bench_dir.is_dir():
+                for exe in bench_dir.iterdir():
+                    if exe.is_file() and os.access(exe, os.X_OK):
+                        exe.unlink()
+
         files_to_copy = [
+            (
+                build_dir / "src/cco/libmori_cco.so",
+                root_dir / "python/mori/libmori_cco.so",
+            ),
             (
                 build_dir / "src/pybind/libmori_pybinds.so",
                 root_dir / "python/mori/libmori_pybinds.so",
@@ -490,6 +653,45 @@ class CMakeBuild(build_ext):
             os.chmod(umbp_master_dst, 0o700)
         elif umbp_master_dst.exists():
             umbp_master_dst.unlink()
+
+        umbp_standalone_src = build_dir / "src/umbp/umbp_standalone_server"
+        umbp_standalone_dst = root_dir / "python/mori/umbp_standalone_server"
+        if umbp_standalone_src.exists():
+            shutil.copyfile(umbp_standalone_src, umbp_standalone_dst)
+            os.chmod(umbp_standalone_dst, 0o700)
+        elif umbp_standalone_dst.exists():
+            umbp_standalone_dst.unlink()
+
+        # CCO C++ examples: ship the built binaries when BUILD_EXAMPLES=ON. They
+        # carry an $ORIGIN/../.. rpath (set in examples/CMakeLists.txt) so they
+        # resolve libmori_*.so from site-packages/mori/ once installed here.
+        cco_examples_dst = root_dir / "python/mori/examples/cco"
+        for _exe in ("cco_lsa_put", "cco_gda_put"):
+            src = build_dir / "examples" / _exe
+            dst = cco_examples_dst / _exe
+            if build_examples.upper() == "ON" and src.exists():
+                cco_examples_dst.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+                os.chmod(dst, 0o755)
+            elif dst.exists():
+                dst.unlink()
+
+        # CCO benchmarks: same pattern, gated on BUILD_BENCHMARK=ON.
+        cco_bench_dst = root_dir / "python/mori/benchmarks/cco"
+        for _exe in (
+            "cco_p2p_put_bw",
+            "cco_p2p_put_latency",
+            "cco_p2p_get_bw",
+            "cco_p2p_get_latency",
+        ):
+            src = build_dir / "benchmark" / _exe
+            dst = cco_bench_dst / _exe
+            if build_benchmark.upper() == "ON" and src.exists():
+                cco_bench_dst.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+                os.chmod(dst, 0o755)
+            elif dst.exists():
+                dst.unlink()
 
         _copy_jit_sources(root_dir)
 
@@ -576,6 +778,36 @@ class CustomBuild(_build):
         super().run()
 
 
+_root_dir = Path(__file__).parent
+
+
+def _cco_extension() -> list:
+    """Build the mori.cco.cco Cython C++ extension if Cython is available."""
+    if not _HAVE_CYTHON:
+        print(
+            "[mori] WARNING: Cython not found — skipping mori.cco.cco extension. "
+            "Install Cython to enable: pip install cython",
+            file=sys.stderr,
+        )
+        return []
+    include_dirs = [str(_root_dir / "include")]
+    library_dirs = [str(_root_dir / "python/mori")]
+    ext = Extension(
+        "mori.cco.cco",
+        sources=["python/mori/cco/cco.pyx"],
+        language="c++",
+        include_dirs=include_dirs,
+        library_dirs=library_dirs,
+        libraries=["mori_cco"],
+        runtime_library_dirs=["$ORIGIN/.."],
+        extra_compile_args=["-std=c++17"],
+    )
+    return _cythonize(
+        [ext],
+        compiler_directives={"language_level": "3"},
+    )
+
+
 extensions = [
     Extension(
         "mori",
@@ -583,9 +815,10 @@ extensions = [
         # extra_compile_args=['-ggdb', '-O0'],
         # extra_link_args=['-g'],
     ),
-]
+] + _cco_extension()
 
 mori_package_data = [
+    "libmori_cco.so",
     "libmori_pybinds.so",
     "libmori_shmem.so",
     "libmori_ops.so",
@@ -594,6 +827,7 @@ mori_package_data = [
     "libmori_metrics.so",
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
     "umbp_master",
+    "umbp_standalone_server",
     "_jit-sources/include/**/*.hpp",
     "_jit-sources/include/**/*.h",
     "_jit-sources/include/**/*.cuh",
@@ -606,6 +840,8 @@ mori_package_data = [
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
     "tools/*.sh",
+    "examples/cco/*",  # CCO C++ example binaries (only present when BUILD_EXAMPLES=ON)
+    "benchmarks/cco/*",  # CCO benchmark binaries (only present when BUILD_BENCHMARK=ON)
 ]
 if _env_flag("BUILD_UMBP_SPDK", "OFF"):
     mori_package_data.append("spdk_proxy")
@@ -615,6 +851,8 @@ setup(
     package_dir={"": "python"},
     package_data={
         "mori": mori_package_data,
+        "mori.cco": ["*.pxd"],
+        "mori.cco.device": ["*.bc"],
         "mori.ir": ["*.bc"],
         "mori.tools": ["*.sh"],
     },

@@ -81,16 +81,26 @@ nic_mount_flags() {
             if [[ -n "$host_ibverbs" ]]; then
                 flags+=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
             fi
-            for lib in /usr/local/lib/libbnxt_re-rdmav*.so; do
-                if [[ -f "$lib" ]]; then
-                    flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/libibverbs/$(basename "$lib")")
+            local bnxt_dir=""
+            for dir in /usr/local/lib/x86_64-linux-gnu /usr/local/lib /usr/lib/x86_64-linux-gnu; do
+                if compgen -G "$dir/libbnxt_re-rdmav*.so" >/dev/null 2>&1; then
+                    bnxt_dir="$dir"
+                    break
                 fi
             done
-            for lib in /usr/local/lib/libbnxt_re.so; do
-                if [[ -f "$lib" ]]; then
-                    flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/$(basename "$lib")")
+            if [[ -n "$bnxt_dir" ]]; then
+                for lib in "$bnxt_dir"/libbnxt_re-rdmav*.so; do
+                    [[ -e "$lib" ]] || continue
+                    local real
+                    real=$(readlink -f "$lib")
+                    flags+=(-v "$real:/usr/lib/x86_64-linux-gnu/libibverbs/$(basename "$lib")")
+                done
+                if [[ -e "$bnxt_dir/libbnxt_re.so" ]]; then
+                    local real
+                    real=$(readlink -f "$bnxt_dir/libbnxt_re.so")
+                    flags+=(-v "$real:/usr/lib/x86_64-linux-gnu/libbnxt_re.so")
                 fi
-            done
+            fi
             if [[ -d /etc/libibverbs.d ]]; then
                 flags+=(-v /etc/libibverbs.d:/etc/libibverbs.d:ro)
             fi
@@ -159,11 +169,21 @@ echo "[ci_run] Runtime: $RUNTIME | NIC type: $NIC_TYPE"
 
 read -ra NIC_MOUNTS <<< "$(nic_mount_flags "$NIC_TYPE")"
 
+# --init (tini/catatonit as PID 1) reaps exited child processes so zombies don't
+# keep KFD contexts / VRAM alive, and forwards SIGTERM from `stop` to the group.
 EXTRA_ARGS=()
 if [[ "$RUNTIME" == "podman" ]]; then
     EXTRA_ARGS+=(--security-opt label=disable)
+    # podman's --init needs catatonit; skip it if the host lacks the binary
+    # (avoids "container-init binary not found: .../catatonit"). ci_stop.sh
+    # still pkills/reaps on teardown.
+    if [[ -x /usr/libexec/podman/catatonit ]] || command -v catatonit &>/dev/null; then
+        EXTRA_ARGS+=(--init)
+    elif command -v tini &>/dev/null; then
+        EXTRA_ARGS+=(--init --init-path "$(command -v tini)")
+    fi
 else
-    EXTRA_ARGS+=(--ulimit nproc=100000:100000 --pids-limit=-1)
+    EXTRA_ARGS+=(--ulimit nproc=100000:100000 --pids-limit=-1 --init)
 fi
 
 exec "$RUNTIME" run \
