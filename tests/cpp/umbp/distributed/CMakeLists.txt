@@ -41,6 +41,13 @@ add_test(NAME umbp_master_client_flush_heartbeat
 # suite migrated below from src/umbp/tests.
 include(GoogleTest)
 
+# Discover gtest cases at ctest time, not build time. These binaries init
+# mori/HSA/gRPC, so running them for --gtest_list_tests during the build (the
+# default POST_BUILD mode) can exceed the discovery timeout or produce no list
+# on a GPU-less build host, yielding empty JSON that CMake's strict ParseTestList
+# parser rejects and fails the build. PRE_TEST defers discovery to `ctest`.
+set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
+
 # MasterClient lifecycle: destructor budget, heartbeat thread shutdown, etc.
 add_executable(test_umbp_master_client_lifecycle
                test_master_client_lifecycle.cpp)
