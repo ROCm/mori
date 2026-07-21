@@ -24,18 +24,18 @@
 Bit-exact test for ``mori.ccl.HierAllGather`` vs
 ``torch.distributed.all_gather_into_tensor``.
 
-AllGather is a pure data move so there is ZERO numerical tolerance --
+AllGather is a pure data move, so there is zero numerical tolerance:
 results must compare equal with ``torch.equal``.
 
 Two launch styles are supported:
 
-  * Single node (M1): run as a plain script; uses ``torch.multiprocessing.spawn``
+  * Single node: run as a plain script; uses ``torch.multiprocessing.spawn``
     over the locally visible GPUs (``num_nodes == 1``)::
 
         python3 tests/python/ccl/test_hier_allgather.py --world-size 4
 
-  * Cross node (M2+): launched under ``torchrun`` (the work ``xnode``
-    harness sets RANK/WORLD_SIZE/LOCAL_RANK)::
+  * Cross node: launched under ``torchrun`` (the ``xnode`` harness sets
+    RANK/WORLD_SIZE/LOCAL_RANK)::
 
         torchrun --nnodes=2 --nproc_per_node=4 ... test_hier_allgather.py
 """
@@ -59,9 +59,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# Sizes (elements per rank) and dtypes required by DESIGN.md correctness
-# contract. Sizes kept modest by default so the test fits a dev box; sweep
-# larger via the CLI.
+# Sizes (elements per rank) and dtypes for the correctness contract. Sizes are
+# kept modest by default so the test fits a dev box; sweep larger via the CLI.
 _DEFAULT_DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.int32]
 
 
@@ -73,17 +72,15 @@ def _make_input(dtype: torch.dtype, numel: int, rank: int, device) -> torch.Tens
 
 
 def _run_dispatch_span(handle, rank, world_size, device, cap_numel):
-    """Bit-exact coverage for the Turn-5 size-threshold DISPATCHER itself.
+    """Bit-exact coverage for the size-threshold dispatcher itself.
 
-    The shipped default routes per-call: payloads >= ``slice_min_bytes`` take the
-    sliced 2-D path, smaller ones take the non-sliced fuse-barrier path, and a
-    path SWITCH clears ``_prev_op_completed`` (the two paths reuse the shared
-    _intra/_inter buffers differently). The plain test loops sizes but never
-    asserts the switch happens BOTH ways within one handle, so this drives an
-    explicit small->large->small->large interleave through the SAME handle with a
+    The default routes per-call: payloads >= ``slice_min_bytes`` take the sliced
+    2-D path, smaller ones take the non-sliced fuse-barrier path, and a path
+    switch clears ``_prev_op_completed`` (the two paths reuse the shared
+    _intra/_inter buffers differently). This drives an explicit
+    small->large->small->large interleave through the same handle with a
     threshold pinned between the two sizes, asserting (a) bit-exact vs torch each
-    call AND (b) the dispatcher actually flips path on every transition. Carried
-    review ask since ; runs on the authoritative true-xnode path."""
+    call and (b) the dispatcher flips path on every transition."""
     if not getattr(handle, "slice_inter", False) or handle.num_nodes < 2:
         return
     small, large = 1024, 1 << 20  # fp32: 4 KiB (below) | 4 MiB (slice)
@@ -115,9 +112,9 @@ def _run_dispatch_span(handle, rank, world_size, device, cap_numel):
     saved_band = getattr(handle, "pipe_band", False)
     handle.slice_min_bytes = 1 << 19  # 512 KiB: small below, large above
     try:
-        # Cover both the pipe-band default (small->"pipe") AND the legacy
-        # non-slice path (small->None) so a path SWITCH is exercised both ways
-        # through the SAME handle for all three dispatch destinations.
+        # Cover both the pipe-band default (small->"pipe") and the non-slice
+        # path (small->None) so a path switch is exercised both ways through the
+        # same handle for all three dispatch destinations.
         for band in (True, False):
             handle.pipe_band = band and saved_band
             handle._last_use_slice = "sentinel"  # force a switch on the first op
@@ -162,7 +159,7 @@ def _run_one(handle, dtype, numel, rank, world_size, device):
 
 def _bench_one(handle, dtype, numel, rank, world_size, device, reps=5, warmup=2):
     """Timed AllGather vs RCCL baseline. Returns (mori_min, mori_avg,
-    rccl_min, rccl_avg) in ms. >=3 timed reps per DESIGN perf contract."""
+    rccl_min, rccl_avg) in ms."""
     inp = _make_input(dtype, numel, rank, device)
     out_mori = torch.empty(numel * world_size, dtype=dtype, device=device)
     out_ref = torch.empty(numel * world_size, dtype=dtype, device=device)
@@ -192,7 +189,7 @@ def _bench_one(handle, dtype, numel, rank, world_size, device, reps=5, warmup=2)
 
 
 def _bench_phases(handle, dtype, numel, rank, world_size, device, reps=5, warmup=2):
-    """Attribute the hierarchical AllGather time to its two phases (rule#2).
+    """Attribute the hierarchical AllGather time to its two phases.
 
     For the every-rank-direct N>=2 path the op is exactly:
       phase1 intra-node SDMA sub-group gather  (handle._intra)  -> node-block
@@ -272,10 +269,10 @@ def _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device, bench
                     print(f"  ok dtype={dtype} numel={numel}")
         torch.cuda.synchronize()
         dist.barrier()
-        # Explicit dispatcher path-switch coverage (carried review ask, ):
-        # small<->large interleave through ONE handle exercises both threshold
-        # transitions + the _prev_op_completed reset. Skipped when the handle is
-        # too small to hold the 4 MiB probe (e.g. tiny --numels A/B runs).
+        # Explicit dispatcher path-switch coverage: a small<->large interleave
+        # through one handle exercises both threshold transitions + the
+        # _prev_op_completed reset. Skipped when the handle is too small to hold
+        # the 4 MiB probe (e.g. tiny --numels runs).
         _run_dispatch_span(handle, rank, world_size, device, max_numel)
         torch.cuda.synchronize()
         dist.barrier()
@@ -283,10 +280,8 @@ def _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device, bench
             print("test_hier_allgather: PASSED")
 
         if bench:
-            # Perf (rule#2): sweep ALL requested sizes (fp32) to characterize the
-            # bandwidth-vs-size curve, not just one point -- this localizes where
-            # the RCCL gap lives (fixed per-op overhead at small sizes vs per-NIC
-            # ring throughput at large sizes). Report min/avg over reps + the RCCL
+            # Sweep all requested sizes (fp32) to characterize the
+            # bandwidth-vs-size curve. Report min/avg over reps + the RCCL
             # baseline. Algo BW = total_out_bytes / time.
             bdtype = torch.float32
             for bnumel in sorted(set(numels)):
@@ -305,9 +300,9 @@ def _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device, bench
                     )
                 dist.barrier()
             bnumel = max(numels)
-            # Phase split (rule#2): only meaningful for the every-rank-direct
-            # N>=2 pipeline, which exposes _intra (SDMA gather) + _inter (RDMA
-            # ring). M1 (num_nodes==1) and leader-only have a different shape.
+            # Phase split: only meaningful for the every-rank-direct N>=2
+            # pipeline, which exposes _intra (SDMA gather) + _inter (RDMA ring).
+            # Single-node (num_nodes==1) and leader-only have a different shape.
             if (
                 handle.num_nodes >= 2
                 and not handle.leader_only
@@ -348,9 +343,9 @@ def test_hier_allgather(
 ):
     """Single-node pytest entry.
 
-    ``ranks_per_node == world_size`` (default) is the M1 single-node path
+    ``ranks_per_node == world_size`` (default) is the single-node path
     (num_nodes == 1, pure SDMA). ``ranks_per_node < world_size`` exercises the
-    M2b hierarchical pipeline on a single box: it splits the local GPUs into
+    hierarchical pipeline on a single box: it splits the local GPUs into
     ``world_size // ranks_per_node`` simulated nodes so the intra-node SDMA
     sub-group gather + inter-node ring run exactly as they would across nodes
     (the ring's same-local-index neighbours are same-box here, reached over the
@@ -369,7 +364,7 @@ def test_hier_allgather(
         world_size % ranks_per_node == 0
     ), "world must be a multiple of ranks_per_node"
     if numels is None:
-        # DESIGN.md contract sizes per rank: ~4 KiB, ~4 MiB, ~64 MiB.
+        # Contract sizes per rank: ~4 KiB, ~4 MiB, ~64 MiB.
         # In fp32: 1024 -> 4 KiB, 1 Mi -> 4 MiB, 16 Mi -> 64 MiB.
         numels = [1024, 1024 * 1024, 16 * 1024 * 1024]
     if dtypes is None:
@@ -386,15 +381,14 @@ def test_hier_allgather(
 def test_hier_allgather_layouts():
     """Sweep hierarchical (num_nodes>=2) decompositions for bit-exactness.
 
-     validated only N=2,G=2. This exercises the full intra-node SDMA
-    sub-group gather -> inter-node ring pipeline across several
-    (world, ranks_per_node) splits on a single box -- including the DESIGN.md
-    acceptance layout N=2,G=4 (8 ranks) and N=4,G=2 (4 simulated nodes). Each
-    split runs all 4 dtypes via the same ``torch.equal`` (zero-tolerance) path.
-    Layouts that exceed the visible GPU count are skipped.
+    Exercises the full intra-node SDMA sub-group gather -> inter-node ring
+    pipeline across several (world, ranks_per_node) splits on a single box --
+    including the acceptance layout N=2,G=4 (8 ranks) and N=4,G=2 (4 simulated
+    nodes). Each split runs all 4 dtypes via the same ``torch.equal``
+    (zero-tolerance) path. Layouts that exceed the visible GPU count are skipped.
     """
     ngpu = torch.cuda.device_count()
-    # (world, ranks_per_node): N=2,G=2 ; N=2,G=4 (DESIGN target) ; N=4,G=2.
+    # (world, ranks_per_node): N=2,G=2 ; N=2,G=4 (acceptance target) ; N=4,G=2.
     layouts = [(4, 2), (8, 4), (8, 2)]
     small = [1024, 256 * 1024]
     ran = 0
@@ -409,11 +403,11 @@ def test_hier_allgather_layouts():
 def test_hier_allgather_slice():
     """Sliced 2-D AllGather path (MORI_HIER_SLICE) bit-exact, single-node sim.
 
-    Exercises the M5 slice lever: the inter ring carries only each
-    rank's own shard and N intra SDMA gathers reassemble the node-blocks. Runs
-    the DESIGN target layout N=2,G=2 (and N=2,G=4 when 8 GPUs are visible) over
-    all 4 dtypes via the same zero-tolerance ``torch.equal`` path, so the slice
-    path has durable CI coverage independent of the env default (which is OFF)."""
+    Exercises the slice path: the inter ring carries only each rank's own shard
+    and N intra SDMA gathers reassemble the node-blocks. Runs the target layout
+    N=2,G=2 (and N=2,G=4 when 8 GPUs are visible) over all 4 dtypes via the same
+    zero-tolerance ``torch.equal`` path, so the slice path has durable CI
+    coverage independent of the env default (which is off)."""
     ngpu = torch.cuda.device_count()
     layouts = [(4, 2), (8, 4)]
     small = [1024, 256 * 1024]
@@ -432,21 +426,21 @@ def test_hier_allgather_slice():
     prev_defer_inter_fin = os.environ.get("MORI_HIER_SLICE_DEFER_INTER_FIN")
     prev_direct = os.environ.get("MORI_HIER_SLICE_DIRECT")
     os.environ["MORI_HIER_SLICE"] = "1"
-    # : force slice at ALL sizes (these test payloads are 4KiB/256KiB,
-    # below the default size threshold) so the sliced path keeps bit-exact CI
-    # coverage regardless of the dispatcher default.
+    # Force slice at all sizes (these test payloads are 4KiB/256KiB, below the
+    # default size threshold) so the sliced path keeps bit-exact CI coverage
+    # regardless of the dispatcher default.
     os.environ["MORI_HIER_SLICE_MIN_BYTES"] = "0"
     ran = 0
     try:
-        # Cover BOTH the default sliced Phase B (N separate gathers) AND the
-        # fused Phase B (M5 : N gathers folded into one batch, 2 barriers +
-        # 1 bulk copy), each with the Phase-A collection read from a scratch copy
-        # (oop=0) AND read in place from the ring buffer (M5  oop=1, drops
-        # the inter finish copy-OUT). All four combos must be bit-exact vs torch.
+        # Cover both the default sliced Phase B (N separate gathers) and the
+        # fused Phase B (N gathers folded into one batch, 2 barriers + 1 bulk
+        # copy), each with the Phase-A collection read from a scratch copy
+        # (oop=0) and read in place from the ring buffer (oop=1, drops the inter
+        # finish copy-OUT). All four combos must be bit-exact vs torch.
         os.environ["MORI_HIER_SLICE_OVERLAP"] = "0"
-        # M5: cover BOTH the dropped Phase-B entry barrier (fuse_ib=1,
-        # the default) AND the restored one (fuse_ib=0) -- the entry-barrier fusion
-        # is a host-sync change so both must stay bit-exact vs torch.
+        # Cover both the dropped Phase-B entry barrier (fuse_ib=1, the default)
+        # and the restored one (fuse_ib=0) -- the entry-barrier fusion is a
+        # host-sync change so both must stay bit-exact vs torch.
         for fuse_ib in ("1", "0"):
             os.environ["MORI_HIER_SLICE_FUSE_IB"] = fuse_ib
             for oop in ("0", "1"):
@@ -461,9 +455,9 @@ def test_hier_allgather_slice():
                         )
                         ran += 1
         os.environ["MORI_HIER_SLICE_FUSE_IB"] = "1"
-        # M5: lever (c) -- overlap the local node-block Phase-B gather
-        # with the inter ring on a side stream. Requires fused Phase B + the
-        # scratch (non-oop) collection. Cover it with the same zero-tolerance path.
+        # Overlap the local node-block Phase-B gather with the inter ring on a
+        # side stream. Requires fused Phase B + the scratch (non-oop)
+        # collection. Cover it with the same zero-tolerance path.
         os.environ["MORI_HIER_SLICE_OOP"] = "0"
         os.environ["MORI_HIER_SLICE_FUSED"] = "1"
         os.environ["MORI_HIER_SLICE_OVERLAP"] = "1"
@@ -472,12 +466,11 @@ def test_hier_allgather_slice():
                 continue
             test_hier_allgather(world_size=world, ranks_per_node=rpn, numels=small)
             ran += 1
-        # M5: chunked (strided) Phase-B reassembly -- the strided
-        # gather_kernel slot-stride enabler. Each block's gather is split into K
-        # element-range chunks each written at slot stride = count; the output
-        # MUST stay byte-identical to the unchunked gather. Cover K=2 and K=3
-        # (the latter exercises an uneven last chunk). Requires fused, non-oop,
-        # non-overlap. Zero-tolerance vs torch.
+        # Chunked (strided) Phase-B reassembly via the strided gather_kernel
+        # slot-stride. Each block's gather is split into K element-range chunks
+        # each written at slot stride = count; the output must stay
+        # byte-identical to the unchunked gather. Cover K=2 and K=3 (the latter
+        # exercises an uneven last chunk). Requires fused, non-oop, non-overlap.
         os.environ["MORI_HIER_SLICE_OVERLAP"] = "0"
         os.environ["MORI_HIER_SLICE_OOP"] = "0"
         os.environ["MORI_HIER_SLICE_FUSED"] = "1"
@@ -490,11 +483,11 @@ def test_hier_allgather_slice():
                 test_hier_allgather(world_size=world, ranks_per_node=rpn, numels=small)
                 ran += 1
         os.environ["MORI_HIER_SLICE_PIPE"] = "0"
-        # M5: CHUNKED-RING PIPELINE OVERLAP -- the rule#1 payoff of the
-        # strided gather. The inter ring is chunked into K stages and each chunk's
-        # Phase-B gather runs on a side stream overlapping the next chunk's ring.
-        # The output MUST stay byte-identical to the serial sliced+fused path.
-        # Cover K=2 and K=3. Requires fused, non-oop, non-(local)overlap.
+        # Chunked-ring pipeline overlap. The inter ring is chunked into K stages
+        # and each chunk's Phase-B gather runs on a side stream overlapping the
+        # next chunk's ring. The output must stay byte-identical to the serial
+        # sliced+fused path. Cover K=2 and K=3. Requires fused, non-oop,
+        # non-(local)overlap.
         os.environ["MORI_HIER_SLICE_OVERLAP"] = "0"
         os.environ["MORI_HIER_SLICE_OOP"] = "0"
         os.environ["MORI_HIER_SLICE_FUSED"] = "1"
@@ -507,30 +500,28 @@ def test_hier_allgather_slice():
                 test_hier_allgather(world_size=world, ranks_per_node=rpn, numels=small)
                 ran += 1
         os.environ["MORI_HIER_SLICE_PIPE_OVERLAP"] = "0"
-        # M5: STREAM-ORDERED inter ring -- the inter ring uses the
-        # on-device ShmemBarrierOnStream prepare/finish instead of host
-        # hipStreamSynchronize + host ShmemBarrierAll. This changes the host-sync
-        # mechanism (not the byte moves / global fencing), so the sliced+fused
-        # default path with stream_ring=1 MUST stay byte-identical to torch. Cover
-        # both oop=0 (scratch collection -> finish_stream copy-OUT) and oop=1
-        # (read in place -> finish_stream_no_copy).
-        # also vary stream_intra -- the stream-ordered Phase-B
-        # finish_batch (ShmemBarrierOnStream copy-OUT) used in the default fused
-        # non-overlap path when paired with stream_ring. stream_intra=1 (default)
-        # removes the last host round-trip; both ON and OFF must stay byte-exact.
-        # also vary MORI_HIER_SLICE_DEFER_FIN -- the deferred
-        # Phase-B finish fence (drop #3, rely on the next op's inter-prepare
-        # barrier). The multi-size loop runs several ops on the SAME instance, so
-        # defer_fin=1 exercises BOTH the cross-op deferral (op i's fence covered
-        # by op i+1's #1) AND the last-op case (no successor -> no fence, output
-        # must still be byte-exact). Both 1 (default) and 0 must match torch.
-        # also vary MORI_HIER_SLICE_DEFER_INTER_FIN -- the
-        # deferred INTER ring finish_stream fence (drop the ring-reuse fence, rely
-        # on the next slice op's prepare_stream barrier). Only active on the
-        # non-oop path (oop=0); harmless no-op for oop=1. The multi-size loop runs
-        # several ops on the SAME instance so defer_inter_fin=1 exercises BOTH the
-        # cross-op deferral AND the last-op case (no successor); both 1 and 0 must
-        # match torch.
+        # Stream-ordered inter ring: uses the on-device ShmemBarrierOnStream
+        # prepare/finish instead of host hipStreamSynchronize + host
+        # ShmemBarrierAll. This changes the host-sync mechanism (not the byte
+        # moves / global fencing), so the sliced+fused default path with
+        # stream_ring=1 must stay byte-identical to torch. Cover both oop=0
+        # (scratch collection -> finish_stream copy-OUT) and oop=1 (read in
+        # place -> finish_stream_no_copy).
+        # Also vary stream_intra -- the stream-ordered Phase-B finish_batch
+        # (ShmemBarrierOnStream copy-OUT) used in the default fused non-overlap
+        # path when paired with stream_ring. stream_intra=1 (default) removes
+        # the last host round-trip; both on and off must stay byte-exact.
+        # Also vary MORI_HIER_SLICE_DEFER_FIN -- the deferred Phase-B finish
+        # fence (rely on the next op's inter-prepare barrier). The multi-size
+        # loop runs several ops on the same instance, so defer_fin=1 exercises
+        # both the cross-op deferral (op i's fence covered by op i+1's entry
+        # barrier) and the last-op case (no successor -> no fence, output must
+        # still be byte-exact). Both 1 (default) and 0 must match torch.
+        # Also vary MORI_HIER_SLICE_DEFER_INTER_FIN -- the deferred inter ring
+        # finish_stream fence (rely on the next slice op's prepare_stream
+        # barrier). Only active on the non-oop path (oop=0); harmless no-op for
+        # oop=1. The multi-size loop exercises both the cross-op deferral and
+        # the last-op case (no successor); both 1 and 0 must match torch.
         os.environ["MORI_HIER_STREAM_RING"] = "1"
         os.environ["MORI_HIER_SLICE_OVERLAP"] = "0"
         os.environ["MORI_HIER_SLICE_FUSED"] = "1"
@@ -549,9 +540,9 @@ def test_hier_allgather_slice():
                                 world_size=world, ranks_per_node=rpn, numels=small
                             )
                             ran += 1
-        # durable coverage for the DISSEMINATION prepare
-        # barrier (MORI_HIER_DISSEM_BARRIER=1). Same global all-PE semantics as
-        # the funnel; the sliced stream-ordered path must stay byte-exact. Run a
+        # Coverage for the dissemination prepare barrier
+        # (MORI_HIER_DISSEM_BARRIER=1). Same global all-PE semantics as the
+        # funnel; the sliced stream-ordered path must stay byte-exact. Run a
         # representative stream config over the layouts, then restore the funnel.
         os.environ["MORI_HIER_STREAM_INTRA"] = "1"
         os.environ["MORI_HIER_SLICE_DEFER_FIN"] = "1"
@@ -569,22 +560,22 @@ def test_hier_allgather_slice():
         os.environ["MORI_HIER_SLICE_DEFER_FIN"] = "1"
         os.environ["MORI_HIER_SLICE_DEFER_INTER_FIN"] = "0"
         os.environ["MORI_HIER_SLICE_OOP"] = "0"
-        # DIRECT-TO-OUTPUT Phase B -- the gathers PUSH straight
-        # into the registered user output (no internal transit, no full-output
-        # copy-OUT). Requires the stream-ordered path (stream_ring+stream_intra).
-        # The output MUST stay byte-identical to the copy-OUT path. Cover both
-        # defer_fin settings (the direct fence is deferrable too) over the
-        # multi-size loop (exercises cross-op deferral + last-op no-fence).
+        # Direct-to-output Phase B -- the gathers push straight into the
+        # registered user output (no internal transit, no full-output copy-OUT).
+        # Requires the stream-ordered path (stream_ring+stream_intra). The output
+        # must stay byte-identical to the copy-OUT path. Cover both defer_fin
+        # settings (the direct fence is deferrable too) over the multi-size loop
+        # (exercises cross-op deferral + last-op no-fence).
         #
-        # the direct path registers the USER output via
-        # ShmemSymmetricRegister. Over RDMA (true xnode) that succeeds, but this
-        # single-process spawn sim wires peers over IPC, and hipIpcGetMemHandle
-        # on an arbitrary torch allocation HARD-FAILS ("invalid argument") and
-        # ABORTS the process (uncatchable) -- so the direct loop cannot run under
-        # the single-node IPC sim. Gate it behind MORI_HIER_TEST_DIRECT=1 so it
-        # runs only on an RDMA-capable host; the shipped true-xnode bit-exact
-        # test (test_hier_allgather under torchrun with --slice-direct) is the
-        # primary durable coverage for this path.
+        # The direct path registers the user output via ShmemSymmetricRegister.
+        # Over RDMA (true xnode) that succeeds, but this single-process spawn sim
+        # wires peers over IPC, and hipIpcGetMemHandle on an arbitrary torch
+        # allocation hard-fails ("invalid argument") and aborts the process
+        # (uncatchable) -- so the direct loop cannot run under the single-node
+        # IPC sim. Gate it behind MORI_HIER_TEST_DIRECT=1 so it runs only on an
+        # RDMA-capable host; the true-xnode bit-exact test (test_hier_allgather
+        # under torchrun with --slice-direct) is the primary durable coverage for
+        # this path.
         if os.environ.get("MORI_HIER_TEST_DIRECT", "0") not in (
             "0",
             "",
@@ -598,9 +589,9 @@ def test_hier_allgather_slice():
             os.environ["MORI_HIER_SLICE_OVERLAP"] = "0"
             os.environ["MORI_HIER_SLICE_DIRECT"] = "1"
             prev_direct_overlap = os.environ.get("MORI_HIER_SLICE_DIRECT_OVERLAP")
-            # loop the direct-path local-block overlap {0,1} so
-            # both the shipped serial direct path and the side-stream overlap path
-            # have durable bit-exact coverage.
+            # Loop the direct-path local-block overlap {0,1} so both the serial
+            # direct path and the side-stream overlap path have durable
+            # bit-exact coverage.
             for direct_overlap in ("0", "1"):
                 os.environ["MORI_HIER_SLICE_DIRECT_OVERLAP"] = direct_overlap
                 for defer_fin in ("1", "0"):
@@ -980,16 +971,15 @@ if __name__ == "__main__":
         os.environ["MORI_HIER_SLICE_DIRECT_OVERLAP"] = "0"
     if args.fuse_local:
         # Fused ring||local-gather requires the slice_direct stream path (the
-        # fused branch lives in slice_direct Phase B). Enable its prerequisites
-        # so the lever can be A/B'd through the fixed harness PYENV.
-        # NOTE: do NOT force MORI_HIER_SLICE_MIN_BYTES=0 here. The fused
+        # fused branch lives in slice_direct Phase B). Enable its prerequisites.
+        # Do NOT force MORI_HIER_SLICE_MIN_BYTES=0 here: the fused
         # ring||local-gather kernel is only bit-exact at sizes that take the
-        # sliced path under the SHIPPED size-threshold dispatch (>=8 MiB); at
+        # sliced path under the default size-threshold dispatch (>=8 MiB); at
         # small sizes the non-sliced fuse-barrier path is correct and faster.
         # Forcing the slice at all sizes makes the fused small-size case produce
-        # wrong block ordering + a HIP invalid-arg launch (validated ).
-        # Leaving the threshold at its default keeps small sizes on the safe
-        # path and engages fuse_local only where it is the parity lever.
+        # wrong block ordering + a HIP invalid-arg launch. Leaving the threshold
+        # at its default keeps small sizes on the safe path and engages
+        # fuse_local only where it applies.
         os.environ["MORI_HIER_FUSE_LOCAL"] = "1"
         os.environ["MORI_HIER_SLICE"] = "1"
         os.environ["MORI_HIER_SLICE_FUSED"] = "1"
@@ -998,7 +988,7 @@ if __name__ == "__main__":
     if args.no_fuse_local:
         os.environ["MORI_HIER_FUSE_LOCAL"] = "0"
     if args.no_slice:
-        # Force the pre-slice baseline (overrides Turn-5 default-ON) for A/B.
+        # Force the pre-slice baseline (overrides the default-on).
         os.environ["MORI_HIER_SLICE"] = "0"
         os.environ["MORI_HIER_SLICE_FUSED"] = "0"
     elif args.slice_inter or args.slice_fused or args.slice_oop:

@@ -250,14 +250,11 @@ void Context::InitializeTopologyAndTransports() {
   // actually needs them: BuildInitialEndpoints() for SHMEM, or
   // EnsureSdmaTransport() on demand for CCO.
   //
-  // Note on canSDMA: mori currently has no true hardware probe for SDMA
-  // engine presence (anvil::GetSdmaNumChannels reads MORI_SDMA_NUM_CHANNELS
-  // env or returns default 2, regardless of hardware). The honest
-  // capability statement is therefore just "intra-node peer reachable —
-  // SDMA *might* work". The actual hardware check happens implicitly in
-  // EnsureSdmaTransport() when anvil.init() / anvil.connect() is invoked.
-  // A future probe-based check would refine canSDMA without changing
-  // the API surface.
+  // canSDMA has no hardware probe: anvil::GetSdmaNumChannels reads
+  // MORI_SDMA_NUM_CHANNELS or returns the default 2 regardless of hardware.
+  // canSDMA therefore only asserts "intra-node peer reachable, SDMA may
+  // work"; the real check happens in EnsureSdmaTransport() when
+  // anvil.init() / anvil.connect() runs.
   // ──────────────────────────────────────────────────────────────────────
   peerCaps.resize(WorldSize());
   for (int i = 0; i < WorldSize(); i++) {

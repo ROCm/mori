@@ -21,21 +21,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """
-Bit-exact test for ``mori.ccl.IntraNodeSubGroupBroadcastSdma`` (this work, M4 --
-the intra-node *placement* phase of the leader-only hierarchical cross-node
-AllGather).
+Bit-exact test for ``mori.ccl.IntraNodeSubGroupBroadcastSdma`` (the intra-node
+*placement* phase of the leader-only hierarchical cross-node AllGather).
 
-The leader-only variant of the hierarchical AllGather (DESIGN.md's primary
-suggestion) gathers the full ``N*G`` output on each node's leader (local_rank 0)
-via the inter-node RDMA ring, then *broadcasts* that full buffer to the node's
-``G`` local ranks over the SDMA copy engines (XGMI) -- cutting NIC traffic ~G x
-vs the every-rank-direct ring. This test validates that broadcast building block
-in isolation: node ``n`` owns the contiguous global PEs ``{n*G, ..., n*G+G-1}``
-with root at ``n*G`` (group_pos 0); after the call every member of node ``n``
-holds the root's buffer exactly. Each node runs its own broadcast concurrently
+The leader-only variant of the hierarchical AllGather gathers the full ``N*G``
+output on each node's leader (local_rank 0) via the inter-node RDMA ring, then
+*broadcasts* that full buffer to the node's ``G`` local ranks over the SDMA copy
+engines (XGMI), cutting NIC traffic ~G x vs the every-rank-direct ring. This
+test validates that broadcast building block in isolation: node ``n`` owns the
+contiguous global PEs ``{n*G, ..., n*G+G-1}`` with root at ``n*G`` (group_pos 0);
+after the call every member of node ``n`` holds the root's buffer exactly. Each
+node runs its own broadcast concurrently
 (pe_base=n*G, pe_stride=1, group_size=G, group_pos=local_rank).
 
-AllGather/broadcast is a pure data move => ZERO tolerance (``torch.equal``).
+AllGather/broadcast is a pure data move => zero tolerance (``torch.equal``).
 
   python3 tests/python/ccl/test_intra_subgroup_broadcast.py --world-size 4 --ranks-per-node 2
 """

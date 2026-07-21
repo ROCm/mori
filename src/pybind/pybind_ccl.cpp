@@ -473,8 +473,8 @@ void RegisterMoriCcl(pybind11::module_& m) {
 
   // =========================================================================
   // IntraNodeSubGroupBroadcastSdma — intra-node SDMA broadcast over a sub-group
-  // (this work, M4: the intra-node placement phase of the leader-only hierarchical
-  // AllGather). Root (group_pos 0) fans its full buffer to all members via XGMI.
+  // (intra-node placement phase of the leader-only hierarchical AllGather).
+  // Root (group_pos 0) fans its full buffer to all members via XGMI.
   // =========================================================================
   using IntraBcast = mori::collective::IntraNodeSubGroupBroadcastSdma;
   py::class_<IntraBcast>(m, "IntraNodeSubGroupBroadcastSdmaHandle")

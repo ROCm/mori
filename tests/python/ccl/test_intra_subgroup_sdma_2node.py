@@ -21,29 +21,29 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """
-MULTI-NODE bit-exact regression test for the intra-node sub-group SDMA gather
+Multi-node bit-exact regression test for the intra-node sub-group SDMA gather
 (``mori.ccl.IntraNodeSubGroupAllgatherSdma``) at the topology that exposed the
 ``MORI_HOSTPROXY_SDMA_INTRA=1`` "Slow wait for sub-group pos" hang / torn-recv.
 
-WHY A SEPARATE 2-NODE TEST: the single-node ``test_intra_subgroup_sdma.py`` runs
-every rank with global pe < 8, so ``pe`` and ``pe % 8`` coincide everywhere and
-the bug is invisible. The defect was a PUT/DRAIN index mismatch: the gather
-PUSHes each peer's column indexing the per-PE SDMA signal arrays by GLOBAL pe
-(``remotePe * nq``) while the completion drain went through
-``shmem::ShmemQuietThread(pe, dest)`` which indexed by ``pe % 8``. On the 2nd
-node (pe_base = 8) the drain read the ZEROED slots [0, 8) instead of the armed
-slots [8, 16), returned without waiting for SDMA completion, and let the flag
-AMO fire before the pushed bytes landed -> the receiver observed the flag but
-read torn / stale data (NaN / loss-drift in E2E; the hang is the same race's
-never-see-the-flag timing case). This ONLY reproduces when a rank has a
-same-node SDMA peer with global pe >= 8, i.e. node 1 of a real 2-node job.
+A separate 2-node test is needed because the single-node
+``test_intra_subgroup_sdma.py`` runs every rank with global pe < 8, so ``pe`` and
+``pe % 8`` coincide everywhere and the bug is invisible. The defect was a
+put/drain index mismatch: the gather pushes each peer's column indexing the
+per-PE SDMA signal arrays by global pe (``remotePe * nq``) while the completion
+drain went through ``shmem::ShmemQuietThread(pe, dest)`` which indexed by
+``pe % 8``. On the 2nd node (pe_base = 8) the drain read the zeroed slots [0, 8)
+instead of the armed slots [8, 16), returned without waiting for SDMA completion,
+and let the flag AMO fire before the pushed bytes landed -> the receiver observed
+the flag but read torn / stale data (NaN / loss-drift in E2E; the hang is the
+same race's never-see-the-flag timing case). This only reproduces when a rank has
+a same-node SDMA peer with global pe >= 8, i.e. node 1 of a real 2-node job.
 
-Launch (per node, SAME worktree path), G = ranks-per-node = 8, world = 16:
+Launch (per node, same worktree path), G = ranks-per-node = 8, world = 16:
   torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 --master_addr=<ip> \
       --master_port=<p> tests/python/ccl/test_intra_subgroup_sdma_2node.py
   torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 ...  (on the worker)
 
-Pass criterion: EVERY rank's gathered node-block equals the reference
+Pass criterion: every rank's gathered node-block equals the reference
 (``torch.equal``, zero tolerance -- AllGather is a pure data move). Before the
 fix, ranks 8..15 (node 1) mismatch non-deterministically; after the fix all
 ranks pass on both nodes.

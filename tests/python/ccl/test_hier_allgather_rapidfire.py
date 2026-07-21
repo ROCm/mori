@@ -24,26 +24,23 @@
 # MIT License
 """Rapid-fire (inter-call) determinism probe for cross-node HierAllGather.
 
-The overlap-determinism UT consumes ``out`` right after EVERY AllGather, so it
-never overlaps two AllGathers on the SAME handle -- it serializes consumer-after
--AG. It PASSES. Yet FSDP diverges. The difference is FSDP's multi-layer
-rapid-fire: dozens of AllGather calls per step are issued BACK-TO-BACK on ONE
-reused handle, into DIFFERENT per-layer output buffers, with NO consume (and no
-sync) between them; the backward GEMMs consume them later. That means call k+1's
-ring/intra reuses the handle's shared transit (``_slice_scratch`` / the intra
-out_ / the inter ``collection``) while call k's output has not yet been drained.
-A single-call test can never trigger that aliasing.
+Reproduces FSDP's multi-layer regime: many AllGather calls per step issued
+back-to-back on one reused handle, into distinct per-layer output buffers, with
+no consume or sync between them (the backward GEMMs consume them later). Call
+k+1's ring/intra reuses the handle's shared transit (``_slice_scratch`` / the
+intra out_ / the inter ``collection``) while call k's output has not yet been
+drained -- aliasing a single-call test cannot trigger.
 
-This UT reproduces exactly that regime: fire N AllGathers back-to-back into N
-DISTINCT output buffers on ONE handle and ONE stream, NO consume/sync between
-calls, then consume all N and compare each to an INDEPENDENT all_gather-built
-reference. Mixed sizes per call (big embed-band + small layers, interleaved)
-mimic FSDP walking layers of different shapes through the same handle.
+Fires N AllGathers back-to-back into N distinct output buffers on one handle and
+one stream, no consume/sync between calls, then consumes all N and compares each
+to an independent all_gather-built reference. Mixed sizes per call (big
+embed-band + small layers, interleaved) mimic FSDP walking layers of different
+shapes through the same handle.
 
 Pass criteria (per rep-of-the-whole-burst):
-  * DETERMINISM: each output's consumer scalar bitwise-matches a per-call
+  * Determinism: each output's consumer scalar bitwise-matches a per-call
     host-synced golden (a stale/aliased transit gives run-to-run drift).
-  * CORRECTNESS: each equals the all_gather reference (a stable-but-wrong
+  * Correctness: each equals the all_gather reference (a stable-but-wrong
     aliased drain shows as nondet=0 but wrong_vs_truth>0).
 
 Run cross-node under torchrun::
@@ -71,11 +68,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 _DTYPES = [torch.bfloat16, torch.float32]
-# Burst layout: a sequence of per-rank element counts fired back-to-back on ONE
-# handle, no consume between. Interleave the big embed/lm_head band (~34M/rank,
-# the calls host-sync fixes) with small layers, exactly like FSDP walking Qwen's
-# layers. Distinct outputs so nothing is overwritten by a later call's OUTPUT --
-# only the handle's shared internal transit can alias.
+# Burst layout: a sequence of per-rank element counts fired back-to-back on one
+# handle, no consume between. Interleave the big embed/lm_head band (~34M/rank)
+# with small layers, like FSDP walking Qwen's layers. Distinct outputs so nothing
+# is overwritten by a later call's output -- only the handle's shared internal
+# transit can alias.
 _BURST = [34078720, 65536, 34078720, 131072, 34078720, 32768]
 _REPS = int(os.environ.get("RAPIDFIRE_REPS", "8"))
 _MAX_COUNT = max(_BURST)
@@ -129,50 +126,44 @@ def _run_dtype(handle, dtype, rank, world_size, device):
     torch.cuda.synchronize()
     dist.barrier()
 
-    # Optional CONCURRENT-COMPUTE contention: FSDP overlaps every AG with
-    # backward GEMMs on a separate stream; both standalone probes so far ran on
-    # an essentially idle GPU. RAPIDFIRE_CONTEND=1 launches heavy GEMMs on a side
-    # stream that run CONCURRENTLY with the AG burst -- copy-engine (SDMA) vs CU
-    # contention is the one dimension neither the overlap-det nor the plain
-    # rapid-fire probe exercised. This directly tests "intra SDMA gather
-    # completion under GPU load" (flag-beats-data only under contention).
+    # Optional concurrent-compute contention (RAPIDFIRE_CONTEND=1): launch heavy
+    # GEMMs on a side stream that run concurrently with the AG burst, mimicking
+    # FSDP overlapping every AG with backward GEMMs. Exercises copy-engine (SDMA)
+    # vs CU contention -- intra SDMA gather completion under GPU load
+    # (flag-beats-data only shows under contention).
     contend = os.environ.get("RAPIDFIRE_CONTEND", "0") == "1"
     load_stream = torch.cuda.Stream() if contend else None
     load_a = (
         torch.randn(4096, 4096, dtype=torch.float32, device=device) if contend else None
     )
 
-    # INPUT-LIFETIME probe (RAPIDFIRE_FREE_INPUT=1): FSDP2's
-    # reshard_after_forward FREES the sharded-param INPUT storage right after
-    # issuing the AllGather; the caching allocator then REALLOCATES that block
-    # for a later op and WRITES it. This is NOT an in-place write to the live
-    # tensor -- it is free + realloc-of-the-same-block. record_stream on the AG
-    # stream is exactly what tells the allocator to defer that reuse until the AG
-    # (which may run on a DIFFERENT stream) finishes reading. Here we drop the
-    # input ref (free) and immediately allocate a same-nbytes decoy and fill it
-    # (poison), on the poison stream, to coax the allocator into reusing the
-    # freed block. Without the AG-stream lifetime guard + a cross-stream AG
-    # (XSTREAM), the decoy write races the AG read -> divergence; the guard fixes
-    # it. Decoys are kept alive so the reuse pressure persists across the burst.
+    # Input-lifetime probe (RAPIDFIRE_FREE_INPUT=1): FSDP2's
+    # reshard_after_forward frees the sharded-param input storage right after
+    # issuing the AllGather; the caching allocator then reallocates that block for
+    # a later op and writes it (free + realloc-of-the-same-block, not an in-place
+    # write to the live tensor). record_stream on the AG stream tells the
+    # allocator to defer that reuse until the AG (which may run on a different
+    # stream) finishes reading. Drop the input ref (free) and immediately allocate
+    # a same-nbytes decoy and fill it (poison) to coax the allocator into reusing
+    # the freed block. Without the AG-stream lifetime guard + a cross-stream AG
+    # (XSTREAM), the decoy write races the AG read; the guard fixes it. Decoys are
+    # kept alive so the reuse pressure persists across the burst.
     free_input = os.environ.get("RAPIDFIRE_FREE_INPUT", "0") == "1"
     decoys: list = []
 
-    # CROSS-STREAM handoff probe (RAPIDFIRE_XSTREAM=1): mirror FSDP2 exactly.
-    # FSDP issues each AG on a dedicated COMM stream, records an event on that
-    # comm stream, and the COMPUTE stream WAITS on the event before the backward
-    # GEMM consumes the output. All prior probes consumed on the SAME stream as
-    # the AG, so the cross-stream event handoff was never exercised. If mori
-    # launches ANY AG work not fully captured by an event recorded on the comm
-    # stream (e.g. an internal side-queue the caller stream doesn't join before
-    # __call__ returns), the recorded event fires early, the compute stream
-    # proceeds, and the consumer reads STALE bytes. This is the single
-    # structural difference between the passing standalone probes and FSDP.
+    # Cross-stream handoff probe (RAPIDFIRE_XSTREAM=1): mirror FSDP2. FSDP issues
+    # each AG on a dedicated comm stream, records an event on that comm stream, and
+    # the compute stream waits on the event before the backward GEMM consumes the
+    # output. If mori launches any AG work not captured by an event recorded on
+    # the comm stream (e.g. an internal side-queue the caller stream doesn't join
+    # before __call__ returns), the recorded event fires early, the compute stream
+    # proceeds, and the consumer reads stale bytes.
     xstream = os.environ.get("RAPIDFIRE_XSTREAM", "0") == "1"
     comm_stream = torch.cuda.Stream() if xstream else None
 
-    # RAPID-FIRE: fire the whole burst back-to-back into DISTINCT outputs on ONE
-    # stream, NO consume/sync between calls -> consecutive calls reuse the
-    # handle's shared transit while prior outputs are undrained. THEN consume.
+    # Rapid-fire: fire the whole burst back-to-back into distinct outputs on one
+    # stream, no consume/sync between calls -> consecutive calls reuse the
+    # handle's shared transit while prior outputs are undrained. Then consume.
     n_nondet = 0
     n_wrong = 0
     first_bad = (-1, -1)

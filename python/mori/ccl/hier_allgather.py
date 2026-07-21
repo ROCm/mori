@@ -36,20 +36,19 @@ dtype, so as long as each rank's contribution is a multiple of 4 bytes the
 byte layout is identical to torch's concatenation -- hence bit-exact for
 bf16/fp16/fp32/int32.
 
-Default shipped path (no ``MORI_HIER_*`` env set)
--------------------------------------------------
-A caller that constructs ``HierAllGather`` with no env overrides gets the
-sliced 2-D path (``slice_inter``) with fused Phase-B (``slice_fused``),
-stream-ordered ring/intra barriers (``stream_ring``/``stream_intra``) and
-deferred finish fences (``slice_defer_fin``/``slice_defer_inter_fin``), the
-serial ``slice_direct`` reassembly gather, and CU-domain copy-out
-(``_py_cu_copyout``). At ``ranks_per_node >= 8`` the two cross-PE finish fences
-are forced ON for bit-exactness (see ``_apply_dense_node_defaults``). The fused
-``ring || local-gather`` kernel (``fuse_local``) is OFF by default (E2E-unstable;
-standalone-only). Every ``MORI_HIER_*`` flag is an opt-in A/B lever with an env
-override; see ``examples/fsdp_sdma/README.md`` for the shipped-vs-experimental
-table. This module docstring and that README are the single source of truth for
-the default path.
+Default path (no ``MORI_HIER_*`` env set)
+-----------------------------------------
+With no env overrides ``HierAllGather`` runs the sliced 2-D path
+(``slice_inter``) with fused Phase-B (``slice_fused``), stream-ordered
+ring/intra barriers (``stream_ring``/``stream_intra``), deferred finish fences
+(``slice_defer_fin``/``slice_defer_inter_fin``), the serial ``slice_direct``
+reassembly gather, and CU-domain copy-out (``_py_cu_copyout``). At
+``ranks_per_node >= 8`` the two cross-PE finish fences are forced ON for
+bit-exactness (see ``_apply_dense_node_defaults``). The fused
+``ring || local-gather`` kernel (``fuse_local``) is off by default: under
+back-to-back FSDP overlap it can read stale remote halves, so the serial path
+is the supported one. Each ``MORI_HIER_*`` flag is an opt-in override; see
+``examples/fsdp_sdma/README.md`` for the flag table.
 """
 
 import os
@@ -58,31 +57,26 @@ from typing import List, Optional, Sequence
 
 import torch
 
-# HARDWARE SDMA CHANNEL CAP (measured on MI300X): the per-GPU SDMA
-# queue-slot count caps MORI_SDMA_NUM_CHANNELS at 8 -- requesting 12 or 16
-# CRASHES at SDMA queue creation (anvil.cpp:228 hsaKmtCreateQueueExt "Failed",
-# queue-slot exhaustion, NOT an engine-id error). anvil reads this env at shmem
-# init, BEFORE any HierAllGather is constructed, so the only place a Python guard
-# can prevent the crash is at IMPORT time (this runs on `import mori.ccl...`,
-# ahead of shmem.init()). Bit-exact by construction: it only rewrites a value
-# that is >8, i.e. one that would otherwise abort the process; every real config
-# (E2E giant-AG nq=2, UT standalone_fast nq=8) is left untouched.
+# MI300X SDMA channel cap: the per-GPU SDMA queue-slot count caps
+# MORI_SDMA_NUM_CHANNELS at 8; a larger value aborts at SDMA queue creation
+# (hsaKmtCreateQueueExt, queue-slot exhaustion). anvil reads this env at shmem
+# init, before any HierAllGather is constructed, so the guard must run at import
+# time (on `import mori.ccl...`, ahead of shmem.init()). It only rewrites values
+# >8 (which would abort the process); every valid config is left untouched.
 MORI_SDMA_CH_HW_MAX = 8
 
-# HIERARCHICAL BARRIER SLOT CAPACITY (fail-closed topology guard bounds).
-# The shipped C++ hier barrier ``ShmemInternalBarrierHierBlock``
+# Hier-barrier slot capacity (fail-closed topology guard bounds).
+# The C++ hier barrier ``ShmemInternalBarrierHierBlock``
 # (include/mori/shmem/shmem_device_api.hpp) packs its rendezvous flags into the
-# fixed 128-uint64 internalSync region with this DISJOINT layout:
+# fixed 128-uint64 internalSync region with this disjoint layout:
 #   HIER_PEER_BASE [96 .. 96+num_nodes)          coordinator inter-node inbox
 #   HIER_LOCAL_BASE[112 .. 112+ranks_per_node)   local PE -> coordinator inbox
 #   HIER_REL_SLOT  [120], HIER_GEN_SLOT [126]
-# So the local inbox must fit within [112, 120) => ranks_per_node <= 8, and the
-# coordinator inbox must fit within [96, 112) => num_nodes <= 16. Exceeding
-# either bound silently overwrites an adjacent slot (the REL/GEN slots or the
-# local inbox), corrupting the barrier. The Python guard fails CLOSED with an
-# actionable error before any such topology reaches the kernel. The shipped
-# config (num_nodes=2, ranks_per_node=8) sits exactly at the ranks_per_node
-# bound and well within the num_nodes bound, so the guard never trips it.
+# The local inbox must fit within [112, 120) => ranks_per_node <= 8, and the
+# coordinator inbox within [96, 112) => num_nodes <= 16. Exceeding either bound
+# silently overwrites an adjacent slot (the REL/GEN slots or the local inbox),
+# corrupting the barrier. The guard fails closed with an actionable error before
+# such a topology reaches the kernel.
 MORI_HIER_MAX_RANKS_PER_NODE = 8
 MORI_HIER_MAX_NUM_NODES = 16
 
@@ -108,36 +102,30 @@ def _clamp_sdma_channels():
 _clamp_sdma_channels()
 
 
-# Falsy-string set shared by every MORI_HIER_* boolean env flag. A value is
-# "true" iff it is NOT one of these. Kept as a module constant so the parse is
-# identical everywhere (the tuple is a membership test, so order is irrelevant).
+# Falsy-string set for every MORI_HIER_* boolean env flag: a value is "true"
+# iff it is not one of these. A module constant so the parse is identical
+# everywhere.
 _ENV_FALSE = ("0", "", "false", "False")
 
 
 def _env_true(key: str, default: str = "0") -> bool:
-    """Behavior-identical replacement for the inline
-    ``os.environ.get(key, default) not in ("0", "", "false", "False")`` idiom."""
+    """Return True unless the env flag is one of the falsy strings in _ENV_FALSE."""
     return os.environ.get(key, default) not in _ENV_FALSE
 
 
 def _env_int(key: str, default: str) -> int:
-    """Behavior-identical replacement for the inline
-    ``int(os.environ.get(key, default))`` idiom used by MORI_HIER_* int flags."""
+    """Return the int value of a MORI_HIER_* env flag, or its default."""
     return int(os.environ.get(key, default))
 
 
 def _resolve_bool(arg: Optional[bool], key: str, default: str = "0") -> bool:
-    """Ctor boolean-flag resolution: use the explicit ``arg`` when the caller
-    passed one, else fall back to the ``MORI_HIER_*`` env flag. Collapses the
-    ``if arg is None: arg = _env_true(...); self.x = bool(arg)`` idiom to one
-    call -- behavior-identical (same short-circuit, same _env_true semantics)."""
+    """Ctor boolean-flag resolution: explicit ``arg`` wins, else the
+    ``MORI_HIER_*`` env flag."""
     return bool(arg) if arg is not None else _env_true(key, default)
 
 
 def _resolve_int(arg: Optional[int], key: str, default: str) -> int:
-    """Ctor int-flag resolution: explicit ``arg`` wins, else the env fallback.
-    Behavior-identical to ``arg if arg is not None else _env_int(key, default)``;
-    callers apply their own ``max(...)`` clamp on the result as before."""
+    """Ctor int-flag resolution: explicit ``arg`` wins, else the env fallback."""
     return arg if arg is not None else _env_int(key, default)
 
 
@@ -267,8 +255,8 @@ def inter_node_ring_reference(
 
     This mirrors *exactly* the schedule of the device kernel
     ``AllGatherRingKernel`` (``include/mori/collective/inter_node/kernels/
-    all_gather.hpp``) that the M2 inter-node phase will launch over the
-    ``N`` node-leaders. Each leader contributes one node-block (the ``G``
+    all_gather.hpp``) launched over the ``N`` node-leaders. Each leader
+    contributes one node-block (the ``G``
     local shards already gathered intra-node by the SDMA path). The kernel
     treats a contiguous ``N``-chunk buffer where chunk ``k`` lives at offset
     ``k * block_elems``; leader ``n`` starts with only its own chunk ``n``
@@ -366,33 +354,28 @@ class HierAllGather:
         slice_direct: Optional[bool] = None,
         standalone_fast: bool = False,
     ):
-        # M4: fan the inter-node RDMA ring put across this many QPs to
-        # better fill the NIC (RCCL drives many channels; the ring used 1 of the
-        # transport's MORI_NUM_QP_PER_PE provisioned QPs). Defaults to the
-        # provisioned count (env MORI_NUM_QP_PER_PE, default 4). The kernel only
-        # fans out for true cross-node (RDMA) neighbours, so single-node runs are
-        # unaffected (stay single-warp).
+        # Fan the inter-node RDMA ring put across this many QPs to fill the NIC.
+        # Defaults to the provisioned count (env MORI_NUM_QP_PER_PE, default 4).
+        # The kernel fans out only for true cross-node (RDMA) neighbours, so
+        # single-node runs stay single-warp.
         inter_num_qp = _resolve_int(inter_num_qp, "MORI_NUM_QP_PER_PE", "4")
         self.inter_num_qp = max(1, inter_num_qp)
         # Opt-in multi-block ("channels") inter-node ring: num_blocks>1 launches
         # the ring as that many CTAs, each driving a disjoint chunk sub-range on
-        # its own QP (the RCCL channel model). Engaged only for true RDMA
-        # neighbours; single-node sims fall back to one working block. Default 1
-        # (single-block ring) -- multi-block was measured neutral/negative (the
-        # per-NIC RDMA throughput is already saturated at numQp>=4, so spreading
-        # the same QPs across CTAs adds scheduling overhead without NIC bandwidth).
-        # Kept opt-in via env MORI_HIER_RING_BLOCKS for A/B.
+        # its own QP. Engaged only for true RDMA neighbours; single-node sims fall
+        # back to one working block. Default 1 (single-block ring): per-NIC RDMA
+        # throughput is already saturated at numQp>=4, so spreading the QPs across
+        # CTAs only adds scheduling overhead. Opt-in via MORI_HIER_RING_BLOCKS.
         inter_num_blocks = _resolve_int(inter_num_blocks, "MORI_HIER_RING_BLOCKS", "1")
         self.inter_num_blocks = max(1, inter_num_blocks)
-        # M4: opt-in leader-only pipeline (DESIGN's primary design).
-        # Default every-rank-direct (proven correct since ). Toggle via
-        # env MORI_HIER_LEADER_ONLY=1 or the explicit arg. See the N>=2 branch.
+        # Opt-in leader-only pipeline; default every-rank-direct. Toggle via env
+        # MORI_HIER_LEADER_ONLY=1 or the explicit arg. See the N>=2 branch.
         self.leader_only = _resolve_bool(leader_only, "MORI_HIER_LEADER_ONLY", "0")
-        # M4: opt-in "gather-in-place" -- have the intra-node SDMA
-        # gather write its node-block DIRECTLY into the inter-node ring slot,
-        # eliminating the prepare_sync copy-IN (a full node-block D2D copy) and
-        # the node_block intermediate. Default OFF: the proven staged path (intra
-        # -> node_block -> ring slot, since ) stays the default.
+        # Opt-in "gather-in-place": the intra-node SDMA gather writes its
+        # node-block directly into the inter-node ring slot, eliminating the
+        # prepare_sync copy-IN (a full node-block D2D copy) and the node_block
+        # intermediate. Default OFF: the staged path (intra -> node_block -> ring
+        # slot) stays the default.
         self.gather_in_place = _resolve_bool(
             gather_in_place, "MORI_HIER_GATHER_IN_PLACE", "0"
         )
@@ -401,77 +384,69 @@ class HierAllGather:
         # output. Implies gather_in_place (the gather writes straight into the ring
         # slot) so there is zero staging on either side. Default OFF: the staged
         # path (writes the user output) stays the default -- out-in-place changes
-        # the result-delivery contract (read ``result_tensor``) and was measured a
-        # tiny (~+2.6%) win only, so it is opt-in via MORI_HIER_OUT_IN_PLACE.
+        # the result-delivery contract (read ``result_tensor``). Opt-in via
+        # MORI_HIER_OUT_IN_PLACE.
         self.out_in_place = _resolve_bool(out_in_place, "MORI_HIER_OUT_IN_PLACE", "0")
         # "fuse-barrier": drop the intra-node SDMA gather's finish ShmemBarrierAll
         # in the every-rank-direct N>=2 path (removes 1 of 4 global barriers/op).
-        # CORRECTNESS INVARIANT: the dropped intra finish barrier is redundant --
+        # Correctness invariant: the dropped intra finish barrier is redundant --
         # the PUSH gather's in-kernel flag-wait already makes this PE's node-block
         # complete on kernel return, and the inter ring's prepare_sync
         # ShmemBarrierAll immediately follows to synchronize all PEs before the
         # ring's cross-PE atomics; flags are monotonic per-call (no reset) so there
         # is no cross-call flag hazard. Crash-safe via the _prev_op_completed guard
         # (keeps the entry barrier on first op / after any mid-pipeline exception).
-        # Default ON (bit-exact, cuts ~40% of the small/mid per-op floor); applies
-        # only to the every-rank-direct path (not leader-only). Set
-        # MORI_HIER_FUSE_BARRIER=0 to restore the pre-fuse baseline for A/B.
+        # Default ON (bit-exact); applies only to the every-rank-direct path (not
+        # leader-only). Set MORI_HIER_FUSE_BARRIER=0 to restore the entry barrier.
         self.fuse_barrier = _resolve_bool(fuse_barrier, "MORI_HIER_FUSE_BARRIER", "1")
-        # M5: opt-in SLICED 2-D AllGather -- the real bandwidth lever
-        # ( NEXT). The default every-rank-direct path has each of the G
-        # local ranks push its FULL node-block (G*count) to its same-index peer,
-        # so node n's block crosses the boundary G times => per-NIC inter bytes =
-        # G*count. RCCL pushes only ~count/NIC. We close that G x gap WITHOUT the
-        # single-NIC funnel of leader-only ( negative):
-        #   1. Inter ring over same-local-index peers {g, g+G, ...} but each rank
-        #      contributes only its OWN shard (count, NOT the G*count node-block).
+        # Sliced 2-D AllGather (the primary bandwidth path). The non-sliced
+        # every-rank-direct path has each of the G local ranks push its full
+        # node-block (G*count) to its same-index peer, so node n's block crosses
+        # the boundary G times => per-NIC inter bytes = G*count. The sliced path
+        # closes that G x gap without the single-NIC funnel of leader-only:
+        #   1. Inter ring over same-local-index peers {g, g+G, ...} where each rank
+        #      contributes only its OWN shard (count, not the G*count node-block).
         #      Because slice_g(B_n) == shard[n*G+g] == this rank's own input, the
         #      ring yields C_g = [slice_g(B_0), ..., slice_g(B_{N-1})] in node
         #      order. Per-NIC inter bytes drop to (N-1)*count -- a G x cut, spread
-        #      across ALL G NICs (no funnel).
+        #      across all G NICs (no funnel).
         #   2. N intra-node SDMA gathers (one per node-block m) reassemble full
         #      B_m = concat_g slice_g(B_m) into output[m*block:(m+1)*block]. The
         #      SDMA gather concatenates by group_pos=local_rank, so the result is
         #      exactly rank-major concat(B_0..B_{N-1}) == torch all_gather.
-        # The extra intra gather rides fast XGMI while the inter phase (the ~80%
-        # bottleneck) shrinks ~G x. Default ON (the proven-best bandwidth path,
-        # bit-exact and >= the non-sliced fuse-barrier path at every tested size).
-        # It owns its own inter+intra data path, so it is incompatible with
-        # leader_only / out_in_place / gather_in_place; if any of those is
+        # The extra intra gather rides fast XGMI while the inter phase shrinks ~G x.
+        # Default ON. It owns its own inter+intra data path, so it is incompatible
+        # with leader_only / out_in_place / gather_in_place; if any of those is
         # explicitly enabled, slice defaults OFF so those levers still work. Set
-        # MORI_HIER_SLICE=0 to force the pre-slice baseline for A/B.
+        # MORI_HIER_SLICE=0 to force the non-sliced path.
         _slice_conflict = self.leader_only or self.out_in_place or self.gather_in_place
         self.slice_inter = _resolve_bool(
             slice_inter, "MORI_HIER_SLICE", "0" if _slice_conflict else "1"
         )
-        # FUSED sliced Phase B: fold the N intra reassembly gathers into ONE batch.
-        # CORRECTNESS INVARIANT: the fused path stacks the N gathers into DISJOINT
+        # Fused sliced Phase B: fold the N intra reassembly gathers into one batch.
+        # Correctness invariant: the fused path stacks the N gathers into disjoint
         # regions of one enlarged transit (dst_base_offset = m*block) so they never
         # overlap; it keeps only the m==0 entry barrier + one bulk copy-OUT + one
         # exit barrier, and flags stay monotonic per-call, so there is no
         # cross-gather race and the output is byte-identical to the unfused sliced
-        # path. Default ON (proven-best variant); only meaningful with slice_inter.
-        # Set MORI_HIER_SLICE_FUSED=0 for the unfused sliced path.
+        # path. Default ON; only meaningful with slice_inter. Set
+        # MORI_HIER_SLICE_FUSED=0 for the unfused sliced path.
         self.slice_fused = _resolve_bool(slice_fused, "MORI_HIER_SLICE_FUSED", "1")
-        # M5: opt-in "slice out-of-place elimination" -- run the sliced
-        # Phase A inter ring in out_in_place mode and have Phase B read its input
-        # (the collection C_g = [slice_g(B_0)..slice_g(B_{N-1})]) DIRECTLY from
-        # the ring buffer (full_tensor) instead of the finish_sync copy-OUT into
-        # a separate ``_slice_scratch``. This is the sliced analog of lever (b):
-        # the inter ring's finish copy-OUT moves N*count bytes (the whole
-        # collection) every op; reading the ring buffer in place drops it. The
-        # ring buffer is symmetric/uncached so the N Phase-B gather copy-INs now
-        # read from uncached HBM -- the same offset that made gather_in_place
-        # NEUTRAL on the non-sliced path (-24); whether it nets out
-        # positive on the sliced (smaller, count-sized) reads is what the A/B
-        # measures. Default OFF; only meaningful with slice_inter.
+        # Opt-in "slice out-of-place elimination": run the sliced Phase A inter
+        # ring in out_in_place mode and have Phase B read its input (the collection
+        # C_g = [slice_g(B_0)..slice_g(B_{N-1})]) directly from the ring buffer
+        # (full_tensor) instead of the finish_sync copy-OUT into a separate
+        # ``_slice_scratch``. The inter ring's finish copy-OUT moves N*count bytes
+        # every op; reading the ring buffer in place drops it. The ring buffer is
+        # symmetric/uncached, so the N Phase-B gather copy-INs then read from
+        # uncached HBM. Default OFF; only meaningful with slice_inter.
         self.slice_oop = _resolve_bool(slice_oop, "MORI_HIER_SLICE_OOP", "0")
-        # Per-call SIZE THRESHOLD for the sliced path. The sliced 2-D path wins big
-        # at large per-rank payloads but loses at small/mid (its extra kernel
-        # launches + N reassembly gathers cost more than the saved inter bytes), so
-        # engage slice ONLY when the per-rank payload is >= this many bytes; below
-        # it, fall through to the non-sliced fuse-barrier path. Default 8 MiB. Set
-        # MORI_HIER_SLICE_MIN_BYTES=0 to force slice at all sizes (A/B / tests).
+        # Per-call size threshold for the sliced path. The sliced 2-D path wins at
+        # large per-rank payloads but loses at small/mid (its extra kernel launches
+        # + N reassembly gathers cost more than the saved inter bytes), so engage
+        # slice only when the per-rank payload is >= this many bytes; below it, fall
+        # through to the non-sliced path. Default 8 MiB. Set
+        # MORI_HIER_SLICE_MIN_BYTES=0 to force slice at all sizes.
         slice_min_bytes = _resolve_int(
             slice_min_bytes, "MORI_HIER_SLICE_MIN_BYTES", str(8 * 1024 * 1024)
         )
@@ -484,10 +459,10 @@ class HierAllGather:
         # with MORI_HIER_PIPE_BAND=0. At/above slice_min the slice_direct path wins.
         self.pipe_band = _env_true("MORI_HIER_PIPE_BAND", "1")
         self.pipe_band_min_bytes = _env_int("MORI_HIER_PIPE_BAND_MIN_BYTES", "0")
-        # Opt-in: OVERLAP Phase-A (inter RDMA ring) with the LOCAL node-block's
+        # Opt-in: overlap Phase-A (inter RDMA ring) with the local node-block's
         # Phase-B reassembly gather. The gather for block m=node_id needs only this
-        # rank's OWN input (== collection[node_id]) and does NOT depend on the ring,
-        # so it runs on a SIDE stream concurrently with the inter ring, hiding ~1/N
+        # rank's own input (== collection[node_id]) and does not depend on the ring,
+        # so it runs on a side stream concurrently with the inter ring, hiding ~1/N
         # of the intra phase. Deadlock-safe: every ShmemBarrierAll is host-blocking
         # (deterministic program order) and hipStreamSynchronize only targets its
         # own (main) stream. Only meaningful with slice_inter + slice_fused. Default
@@ -495,27 +470,27 @@ class HierAllGather:
         self.slice_overlap = _resolve_bool(
             slice_overlap, "MORI_HIER_SLICE_OVERLAP", "0"
         )
-        # Drop the REDUNDANT Phase-B entry barrier in the sliced+fused NON-overlap
-        # path. CORRECTNESS INVARIANT: that path runs the inter ring first; its
+        # Drop the redundant Phase-B entry barrier in the sliced+fused non-overlap
+        # path. Correctness invariant: that path runs the inter ring first; its
         # finish_sync issues a global ShmemBarrierAll immediately before the
         # Phase-B m==0 gather's own entry barrier -- two back-to-back all-PE
         # barriers with no remote memory op between them, so the second is
         # redundant (every PE has passed the inter finish barrier before any PE
         # starts Phase-B, so every peer's out_ transit from the previous op is
-        # already free). Byte-identical output (pure host-sync removal). Does NOT
-        # apply to the overlap path (its local gather runs concurrently on a side
-        # stream and must keep its own entry barrier). Default ON; set
-        # MORI_HIER_SLICE_FUSE_IB=0 to restore the entry barrier for A/B.
+        # already free). Byte-identical output. Does not apply to the overlap path
+        # (its local gather runs concurrently on a side stream and must keep its own
+        # entry barrier). Default ON; set MORI_HIER_SLICE_FUSE_IB=0 to restore the
+        # entry barrier.
         self.slice_fuse_ib = _resolve_bool(
             slice_fuse_ib, "MORI_HIER_SLICE_FUSE_IB", "1"
         )
-        # Opt-in CHUNKED (strided) Phase-B reassembly: split each node-block's
+        # Opt-in chunked (strided) Phase-B reassembly: split each node-block's
         # reassembly gather into ``slice_pipe_chunks`` element-range chunks, each
         # writing ck elements per peer at slot stride = count via gather_kernel
         # dst_slot_stride, so chunk j of peer g lands at m*block + g*count + j*ck --
-        # byte-identical to the unchunked gather (the strided-write foundation for
-        # the chunked inter/intra pipeline). Only meaningful with slice_inter +
-        # slice_fused (non-overlap, non-oop). Default OFF; toggle
+        # byte-identical to the unchunked gather. This is the strided-write
+        # foundation for the chunked inter/intra pipeline. Only meaningful with
+        # slice_inter + slice_fused (non-overlap, non-oop). Default OFF; toggle
         # MORI_HIER_SLICE_PIPE=1.
         self.slice_pipe = _resolve_bool(slice_pipe, "MORI_HIER_SLICE_PIPE", "0")
         slice_pipe_chunks = _resolve_int(
@@ -539,21 +514,19 @@ class HierAllGather:
         # stages changes, never the output bytes.
         sps = os.environ.get("MORI_HIER_SLICE_PIPE_SPLIT")
         self.slice_pipe_split = float(sps) if sps not in (None, "") else None
-        # Strided-gather enabler:
-        # CHUNK THE INTER RING into K pipeline stages and OVERLAP each chunk's
-        # Phase-B reassembly gather (on a side SDMA stream) with the NEXT chunk's
+        # Chunk the inter ring into K pipeline stages and overlap each chunk's
+        # Phase-B reassembly gather (on a side SDMA stream) with the next chunk's
         # inter RDMA ring (on the main stream). Because the ring's prepare/finish
         # ShmemBarrierAll are host-blocking, after self._inter(chunk k) returns
         # chunk k's N slices are physically in scratch; we launch chunk k's gather
         # on the side stream (no barrier) and immediately call self._inter(chunk
         # k+1) on the main stream -- the side SDMA gather runs concurrently with
         # the main RDMA ring (distinct engines, disjoint scratch regions). Only the
-        # LAST chunk's gather (~1/K of the data) is serial after the final ring, so
-        # the ~1.5ms serial Phase-B tail collapses to ~tail/K. Strided write
+        # last chunk's gather (~1/K of the data) is serial after the final ring, so
+        # the serial Phase-B tail collapses to ~tail/K. Strided write
         # (dst_slot_stride=count) lands each chunk in its final block slot.
-        # Requires slice_inter+slice_fused, non-oop, non-slice_overlap. Default OFF
-        # (toggle MORI_HIER_SLICE_PIPE_OVERLAP=1). Cost: +2(K-1) ring barriers; net
-        # win only if hidden gather tail > added barrier overhead (A/B decides).
+        # Requires slice_inter+slice_fused, non-oop, non-slice_overlap. Adds
+        # 2(K-1) ring barriers. Default OFF; toggle MORI_HIER_SLICE_PIPE_OVERLAP=1.
         self.slice_pipe_overlap = _resolve_bool(
             slice_pipe_overlap, "MORI_HIER_SLICE_PIPE_OVERLAP", "0"
         )
@@ -582,14 +555,14 @@ class HierAllGather:
             self.slice_pipe_fence = "global"
         else:
             self.slice_pipe_fence = "intra"
-        # STREAM-ORDERED inter ring. Replaces the inter ring's host-blocking
+        # Stream-ordered inter ring. Replaces the inter ring's host-blocking
         # prepare/finish (hipStreamSynchronize + host bootNet ShmemBarrierAll)
         # with the on-device ShmemBarrierOnStream prepare/finish, removing 2
         # CPU<->GPU round-trips per inter ring op. Only affects the slice path.
         # Default ON; set MORI_HIER_STREAM_RING=0 / --no-stream-ring to restore
         # host-sync.
         self.stream_ring = _env_true("MORI_HIER_STREAM_RING", "1")
-        # STREAM-ORDERED Phase-B finish_batch. Replaces the fused sliced Phase-B's
+        # Stream-ordered Phase-B finish_batch. Replaces the fused sliced Phase-B's
         # finish_batch (bulk copy-OUT + host hipStreamSynchronize + host
         # ShmemBarrierAll -- the last host round-trip in the op) with
         # finish_batch_stream (ShmemBarrierOnStream) so, paired with stream_ring,
@@ -598,82 +571,78 @@ class HierAllGather:
         # non-pipe slice path uses it. Default ON; set MORI_HIER_STREAM_INTRA=0 /
         # --no-stream-intra to restore the host-synced finish_batch.
         self.stream_intra = _env_true("MORI_HIER_STREAM_INTRA", "1")
-        # DEFER the Phase-B finish_batch_stream fence. The
-        # default fused-stream slice op issues 3 on-stream global ShmemBarrierOn
-        # Stream fences/op: inter prepare (#1), inter finish (#2), Phase-B finish
-        # (#3). #3 (end of op i) is back-to-back -- across the op boundary -- with
-        # the NEXT op's #1 (inter prepare), with no remote memory op between them
-        # on the stream. #1 already globally fences (all PEs) AFTER op i's
-        # copy-OUT and BEFORE any peer reuses the shared transit/ring buffers, so
-        # #3 is redundant for every op that is followed by another hier op.
-        # Dropping it removes 1 of 3 on-stream fences/op. SAFE because: (a) the
-        # copy-OUT is stream-ordered so THIS PE's output is correct without #3;
-        # (b) cross-PE buffer REUSE is covered by the successor op's #1 (slice
-        # path) or its forced intra entry barrier (non-slice path: the size-
-        # dispatcher resets _prev_op_completed on a path switch -> entry barrier
-        # fires); (c) the LAST op (no successor) needs no reuse fence and its
-        # output is already stream-correct. Only the default fused non-overlap,
-        # non-pipe, non-oop slice path (which uses finish_batch_stream) defers.
-        # Default ON; set MORI_HIER_SLICE_DEFER_FIN=0 to restore the fence (A/B).
+        # Defer the Phase-B finish_batch_stream fence. The default fused-stream
+        # slice op issues 3 on-stream global ShmemBarrierOnStream fences/op: inter
+        # prepare (#1), inter finish (#2), Phase-B finish (#3). #3 (end of op i) is
+        # back-to-back -- across the op boundary -- with the next op's #1 (inter
+        # prepare), with no remote memory op between them on the stream. #1 already
+        # globally fences (all PEs) after op i's copy-OUT and before any peer reuses
+        # the shared transit/ring buffers, so #3 is redundant for every op followed
+        # by another hier op. Safe because: (a) the copy-OUT is stream-ordered so
+        # this PE's output is correct without #3; (b) cross-PE buffer reuse is
+        # covered by the successor op's #1 (slice path) or its forced intra entry
+        # barrier (non-slice path: the size-dispatcher resets _prev_op_completed on
+        # a path switch -> entry barrier fires); (c) the last op (no successor)
+        # needs no reuse fence and its output is already stream-correct. Only the
+        # default fused non-overlap, non-pipe, non-oop slice path defers. Default
+        # ON; set MORI_HIER_SLICE_DEFER_FIN=0 to restore the fence.
         self.slice_defer_fin = _env_true("MORI_HIER_SLICE_DEFER_FIN", "1")
-        # Defer the INTER ring's finish_stream fence (the stream-ordered
-        # ShmemBarrierOnStream guarding cross-PE ring-buffer reuse) to the NEXT
+        # Defer the inter ring's finish_stream fence (the stream-ordered
+        # ShmemBarrierOnStream guarding cross-PE ring-buffer reuse) to the next
         # slice op's prepare_stream barrier. Safe because: the ring buffer is
-        # reused ONLY by another op through this same _inter handle, and
-        # prepare_stream ALWAYS fences (global, on-stream) before its ring kernel
-        # issues the peer RDMA puts, so the successor's prepare fence already
-        # orders cross-PE reuse; the copy-OUT into the scratch collection stays
+        # reused only by another op through this same _inter handle, and
+        # prepare_stream always fences (global, on-stream) before its ring kernel
+        # issues the peer RDMA puts, so the successor's prepare fence already orders
+        # cross-PE reuse; the copy-OUT into the scratch collection stays
         # stream-ordered (Phase B reads a correct collection regardless); the last
-        # op (no successor) reuses nothing; the size-dispatcher's path switch
-        # resets _prev_op_completed, forcing an entry barrier. Same safety class as
+        # op (no successor) reuses nothing; the size-dispatcher's path switch resets
+        # _prev_op_completed, forcing an entry barrier. Same safety class as
         # slice_defer_fin (Phase-B). Only on the non-oop slice path (stream_ring).
-        # Default ON; set MORI_HIER_SLICE_DEFER_INTER_FIN=0
-        # (--no-slice-defer-inter-fin) to restore the fence.
+        # Default ON; set MORI_HIER_SLICE_DEFER_INTER_FIN=0 to restore the fence.
         self.slice_defer_inter_fin = _env_true("MORI_HIER_SLICE_DEFER_INTER_FIN", "1")
-        # PHASE-B ENTRY BARRIER (accuracy). Force a full cross-PE
-        # ShmemBarrierOnStream on the FIRST Phase-B reassembly gather even when
+        # Phase-B entry barrier (accuracy). Force a full cross-PE
+        # ShmemBarrierOnStream on the first Phase-B reassembly gather even when
         # slice_fuse_ib would otherwise drop it. The Phase-B intra SDMA gathers
-        # read PEER ranks' `collection` (the inter ring's per-node-block output)
+        # read peer ranks' `collection` (the inter ring's per-node-block output)
         # over XGMI; slice_fuse_ib=1 relies on the ring's deferred/own finish for
         # cross-PE visibility, but under FSDP tight back-to-back overlap the SDMA
         # read can observe a peer's collection before that peer's ring finish is
-        # globally visible -> the residual completion race (host-sync-recoverable
-        # loss drift). A full entry barrier here strictly orders every peer's ring
-        # finish BEFORE any Phase-B gather reads it, on-device (no host sync).
-        # Default OFF (preserves the perf path); set MORI_HIER_PHASEB_ENTRY_BARRIER=1
-        # to A/B the accuracy fix and measure its one-barrier/op perf cost.
+        # globally visible -> a residual completion race (loss drift). A full entry
+        # barrier here strictly orders every peer's ring finish before any Phase-B
+        # gather reads it, on-device (no host sync). Default OFF (preserves the perf
+        # path); set MORI_HIER_PHASEB_ENTRY_BARRIER=1 to enable it.
         self.phaseb_entry_barrier = _env_true("MORI_HIER_PHASEB_ENTRY_BARRIER", "0")
-        # DIRECT-PATH LOCAL-BLOCK OVERLAP (experimental, default OFF). Runs the
+        # Direct-path local-block overlap (experimental, default OFF). Runs the
         # local node-block (m == node_id) reassembly gather on a side stream
         # concurrently with the inter ring kernel. The local block builds entirely
-        # from this rank's own input (collection[node_id]) so it has ZERO dependency
-        # on the inter ring. Correctness invariant: keeps the shipped single-fence
-        # barrier model -- the ring's prepare_stream ShmemBarrierOnStream is the SOLE
-        # global entry barrier; the side gather does side.wait_stream(main) after it
-        # and before the ring kernel, so only one global on-stream fence is ever in
+        # from this rank's own input (collection[node_id]) so it has zero dependency
+        # on the inter ring. Correctness invariant: keeps the single-fence barrier
+        # model -- the ring's prepare_stream ShmemBarrierOnStream is the sole global
+        # entry barrier; the side gather does side.wait_stream(main) after it and
+        # before the ring kernel, so only one global on-stream fence is ever in
         # flight and write targets stay disjoint (side->output block node_id,
         # ring->collection scratch, main->output blocks m!=node_id) with distinct
-        # flag buffers. Default OFF: measured neutral (the serial pipeline already
-        # overlaps the gather) so the shipped path stays serial direct.
+        # flag buffers. Default OFF: the serial pipeline already overlaps the
+        # gather, so the default path stays serial direct.
         self.slice_direct_overlap = _env_true("MORI_HIER_SLICE_DIRECT_OVERLAP", "0")
-        # MULTI-STREAM Phase-B reassembly.
-        # The N disjoint slice_fused reassembly gathers currently run SERIALLY on
+        # Multi-stream Phase-B reassembly.
+        # The N disjoint slice_fused reassembly gathers otherwise run serially on
         # one stream, so at most one OneShotAllGatherSdmaSubGroupKernel drives the
-        # SDMA copy engines at a time. Each gather writes a DISJOINT node-block
+        # SDMA copy engines at a time. Each gather writes a disjoint node-block
         # region of the (registered) user output (dst_block_offset = m*block_count)
         # and reads a disjoint source slice (collection[m] / own input), so the N
-        # gathers have NO data dependency on each other -> distributing them
+        # gathers have no data dependency on each other -> distributing them
         # round-robin across a pool of side streams lets the runtime run them
-        # CONCURRENTLY without changing any byte written. Bit-exact BY CONSTRUCTION
+        # concurrently without changing any byte written. Bit-exact by construction
         # (identical launches, identical args, disjoint outputs; only the stream
         # assignment changes). Ordering is preserved by fences: the entry barrier /
-        # ring finish stays on the MAIN stream and every side stream does
-        # side.wait_stream(main) before its gather; the MAIN stream does
+        # ring finish stays on the main stream and every side stream does
+        # side.wait_stream(main) before its gather; the main stream does
         # main.wait_stream(side) for every side before finish_direct_stream, so the
-        # completion fence still strictly follows ALL gathers. Default 1 ==
-        # single-stream shipped path byte-identical (pool never allocated).
-        # NOTE at N=2 with fuse_local the Phase-B loop is only N-1=1 remote gather
-        # (local block folded into the ring), so this lever is a NO-OP there; it
+        # completion fence still strictly follows all gathers. Default 1 ==
+        # single-stream default path, byte-identical (pool never allocated).
+        # At N=2 with fuse_local the Phase-B loop is only N-1=1 remote gather
+        # (local block folded into the ring), so this lever is a no-op there; it
         # engages on the plain fused-direct path (all N gathers in Phase B) and at
         # N>2.
         try:
@@ -683,26 +652,25 @@ class HierAllGather:
         if self.reasm_streams < 1:
             self.reasm_streams = 1
         self._reasm_stream_pool = None
-        # FUSED ring || local-block gather. Runs the RDMA ring and the local-block
-        # SDMA gather in ONE kernel launch (FusedRingLocalGatherKernel_u32: blocks
+        # Fused ring || local-block gather. Runs the RDMA ring and the local-block
+        # SDMA gather in one kernel launch (FusedRingLocalGatherKernel_u32: blocks
         # [0,num_blocks) = ring, last block = local gather), so the overlap is
         # intrinsic to the grid with no host merge. Engaged only on the default
         # fused stream-ordered slice_direct path; when ON it takes precedence over
         # slice_direct_overlap.
         #
-        # CORRECTNESS: OFF by default. Under FSDP's tight back-to-back overlap the
-        # fused kernel produces STALE remote-half output -- the RDMA-ring buffer is
-        # read out (finish_ring_stream copy + remote-block direct gathers) before
-        # the concurrently-launched ring CTA's remote puts are globally visible to
+        # OFF by default: under FSDP's tight back-to-back overlap the fused kernel
+        # produces stale remote-half output -- the RDMA-ring buffer is read out
+        # (finish_ring_stream copy + remote-block direct gathers) before the
+        # concurrently-launched ring CTA's remote puts are globally visible to
         # those readers. The serial monolithic ring path (fuse_local OFF) does not
-        # have this race, so it is the shipped default until the fused kernel's
+        # have this race, so it is the default until the fused kernel's
         # ring-completion visibility to the finish readers is fixed on-device.
         #
         # The standalone AllGather (no back-to-back FSDP overlap) does not trigger
-        # the race and is bit-exact with fuse_local ON, where it beats RCCL at
-        # >=32 MiB. A standalone caller opts in via standalone_fast=True without
-        # touching the E2E default; explicit env always overrides. Every FSDP/E2E
-        # caller omits the flag and keeps the byte-identical serial default.
+        # the race and is bit-exact with fuse_local ON. A standalone caller opts in
+        # via standalone_fast=True without touching the E2E default; explicit env
+        # always overrides.
         if "MORI_HIER_FUSE_LOCAL" in os.environ:
             self.fuse_local = _env_true("MORI_HIER_FUSE_LOCAL")
         else:
@@ -713,12 +681,11 @@ class HierAllGather:
         self._standalone_fast = bool(standalone_fast)
         # Standalone fast-path fill (see _apply_standalone_fast_defaults). The only
         # unconditionally-defaulted lever is more per-peer SDMA fill (default
-        # MORI_SDMA_NUM_CHANNELS=8, a bit-exact-safe deterministic reassembly
-        # widening); fuse_remote/deep_pipe are engaged only within the mlx5
-        # NIC-DMA->HBM coherence window because an uncaged window exposes a
-        # flag-beats-data race at large sizes. The SDMA channel count is
-        # hardware-capped at 8 on MI300X (>8 crashes at SDMA queue creation); the
-        # >8 crash-guard lives at module import (_clamp_sdma_channels) because the
+        # MORI_SDMA_NUM_CHANNELS=8, a bit-exact-safe reassembly widening);
+        # fuse_remote/deep_pipe engage only within the mlx5 NIC-DMA->HBM coherence
+        # window, because an uncaged window exposes a flag-beats-data race at large
+        # sizes. The SDMA channel count is hardware-capped at 8 on MI300X; the >8
+        # crash-guard lives at module import (_clamp_sdma_channels) because the
         # physical queue count is fixed by anvil at shmem init, before this __init__.
         self._apply_standalone_fast_defaults(standalone_fast)
         self._init_fused_ring_state()
@@ -826,13 +793,13 @@ class HierAllGather:
         )
 
     def _apply_standalone_fast_defaults(self, standalone_fast):
-        """Standalone fast-path env defaults (extracted verbatim from __init__).
+        """Apply the standalone fast-path env defaults.
 
         Reads only the ``standalone_fast`` arg + os.environ; writes
         self._standalone_fast / self._standalone_defer_fin and (only when
         standalone_fast is set) the MORI_SDMA_NUM_CHANNELS / FUSE_REMOTE /
         DEEP_PIPE / DISSEM_BARRIER env defaults. No FSDP/E2E caller passes
-        standalone_fast, so the shipped path is byte-identical."""
+        standalone_fast, so those paths are unaffected."""
         self._standalone_fast = bool(standalone_fast)
         if standalone_fast:
             if os.environ.get("MORI_SDMA_NUM_CHANNELS") is None:
@@ -843,81 +810,58 @@ class HierAllGather:
             # MORI_HIER_DEEP_PIPE_MAXBYTES -- the default 32MB window is the
             # coherence cage that keeps it bit-exact; uncaging it re-exposes the
             # flag-beats-data race.
-            #
-            # This config is the measured optimum. DEEP_PIPE depth is inert on the
-            # fill (auto/2/4 all land the same BW; a finer 8MB sub-chunk regresses
-            # via write fragmentation), and a deeper device send-queue (WQE_DEPTH>1)
-            # is neutral-to-negative on mlx5 -- per-QP RC write is already
-            # bandwidth-bound at wqeDepth=1. The residual at large sizes is a fixed
-            # per-op cost (3 landing-fence barriers + 3 kernel launches) that only
-            # amortises toward parity at 256MB, not a per-NIC fill deficit: mori's
-            # marginal per-NIC fill BW already beats RCCL, so time ~= F + bytes/B
-            # with a nonzero fixed F that RCCL does not pay. Cutting F needs a
-            # kernel fusion collapsing the 3 launches into 1 without losing the
-            # async ring||reassembly overlap; graph-capture collapses launches but
-            # serializes the pipe and regresses bulk (see the CUDA_GRAPH size-gate).
             if os.environ.get("MORI_HIER_FUSE_REMOTE") is None:
                 os.environ["MORI_HIER_FUSE_REMOTE"] = "1"
             if os.environ.get("MORI_HIER_DEEP_PIPE") is None:
                 os.environ["MORI_HIER_DEEP_PIPE"] = "auto"
             # Route the standalone path's cross-PE fences through the O(log n)
-            # dissemination barrier. It has identical global all-PE rendezvous
-            # semantics (bit-exact; byte image and NIC-landing->reassembly-consume
-            # ordering unchanged) but a ceil(log2 n) parallel critical path instead
-            # of the PE0 funnel's ~2(n-1) serial hops -- a strictly cheaper barrier
-            # topology. The gain is within noise (the barrier is a small part of the
-            # fixed cost) but it cannot regress. Default ON for the standalone_fast
-            # path only; no FSDP/E2E caller passes standalone_fast, so the E2E paths
-            # stay byte-identical (dissem default OFF there). Env overrides either
-            # way.
+            # dissemination barrier. Identical global all-PE rendezvous semantics
+            # (bit-exact; byte image and NIC-landing->reassembly-consume ordering
+            # unchanged) but a ceil(log2 n) parallel critical path instead of the
+            # PE0 funnel's ~2(n-1) serial hops. Default ON for the standalone_fast
+            # path only; E2E paths keep dissem OFF. Env overrides either way.
             if os.environ.get("MORI_HIER_DISSEM_BARRIER") is None:
                 os.environ["MORI_HIER_DISSEM_BARRIER"] = "1"
         # Standalone finish-barrier deferral: drop the per-op finish
         # ShmemBarrierOnStream, leaning on the successor op's entry barrier for
-        # cross-PE ring reuse (see the finish site). Strictly cheaper topology,
-        # identical semantics, bit-exact and non-regressing at every size, with the
-        # largest gain at small sizes where the per-op fixed barrier cost dominates.
-        # Default ON for the standalone_fast path only (same class as
-        # slice_defer_fin/dissem_barrier). The w8 path already runs
-        # slice_defer_fin=True so this is byte-identical there; only w16 (which
-        # forces slice_defer_fin=False for the E2E drift guard) newly benefits. No
-        # FSDP/E2E caller passes standalone_fast, so the w16 E2E finish fences stay
-        # ON; the E2E host-drain reference loss is unchanged. Set
+        # cross-PE ring reuse (see the finish site). Same safety class as
+        # slice_defer_fin/dissem_barrier; bit-exact. Default ON for the
+        # standalone_fast path only. The w8 path already runs slice_defer_fin=True
+        # so this is byte-identical there; only w16 (which forces
+        # slice_defer_fin=False for the E2E drift guard) newly benefits. No FSDP/E2E
+        # caller passes standalone_fast, so the w16 E2E finish fences stay ON. Set
         # MORI_HIER_STANDALONE_DEFER_FIN=0 to restore the finish barrier.
         self._standalone_defer_fin = bool(standalone_fast) and _env_true(
             "MORI_HIER_STANDALONE_DEFER_FIN", "1"
         )
 
     def _init_fused_ring_state(self):
-        """Init fused ring / persistent-kernel / flag-token / reasm-deep-SQ / host-proxy-inter state (moved verbatim from __init__)."""
-        # EXPERIMENTAL (default OFF). fuse_remote: pipeline the inter-node RDMA
-        # ring with the REMOTE-block XGMI reassembly. When ON (on the fuse_local
+        """Init fused ring / flag-token / reasm-deep-SQ / host-proxy-inter state."""
+        # Experimental (default OFF). fuse_remote: pipeline the inter-node RDMA
+        # ring with the remote-block XGMI reassembly. When ON (on the fuse_local
         # slice_direct path) the fused FusedRingRemoteGatherKernel runs the ring
-        # AND, per landed sub-range, pushes the remote-block SDMA straight from this
+        # and, per landed sub-range, pushes the remote-block SDMA straight from this
         # PE's ring buffer into the registered output -- no ring copy-OUT, no
         # whole-phase finish barrier, remote gather overlaps the still-in-flight
         # NIC ring. Invariant: only valid at num_nodes==2 (single ring round).
         self.fuse_remote = _env_true("MORI_HIER_FUSE_REMOTE", "0")
-        # EXPERIMENTAL (default OFF). fuse_copyin: fold the host hipMemcpyAsync
-        # copy-IN of this PE's input into its ring slot INTO the fused kernel (each
+        # Experimental (default OFF). fuse_copyin: fold the host hipMemcpyAsync
+        # copy-IN of this PE's input into its ring slot into the fused kernel (each
         # ring channel stages its own send sub-range before the put). Only on the
-        # fuse_remote path. Default OFF => the host copy-IN runs, byte-identical
-        # shipped path. Stays OFF: the single-launch collapse it enables is mutually
-        # exclusive with the CPU-driven async ring||reassembly overlap that bulk BW
-        # depends on, so it does not lift the per-op floor on the bit-exact path.
+        # fuse_remote path. Default OFF: the host copy-IN runs (byte-identical). The
+        # single-launch collapse it enables is mutually exclusive with the
+        # CPU-driven async ring||reassembly overlap that bulk BW depends on.
         self.fuse_copyin = _env_true("MORI_HIER_FUSE_COPYIN", "0")
         self._chunk_ready_flags = None
-        # Cross-size carryover guard: the exact DEEP_PIPE flag layout
-        # (slots, per-PE count, pipe depth) the persistent buffer was last sized
-        # for. A layout CHANGE forces a fresh zeroed buffer so stale per-sub-chunk
-        # landing state can't leak into the next distinct size (see the fuse_remote
-        # DEEP_PIPE block below).
+        # Cross-size carryover guard: the exact DEEP_PIPE flag layout (slots, per-PE
+        # count, pipe depth) the persistent buffer was last sized for. A layout
+        # change forces a fresh zeroed buffer so stale per-sub-chunk landing state
+        # can't leak into the next distinct size.
         self._chunk_ready_flags_layout = None
         # Gen-token chunkReadyFlags (MORI_HIER_FLAG_TOKEN): drop the per-op host
-        # flags.zero_() hipMemset launch (part of the fixed per-op launch floor
-        # that dominates the small-buffer gap) by publishing a strictly-increasing
-        # per-op token into chunkReadyFlags and waiting `< opGen` in the reassembly
-        # worker -- the same reset-free pattern the classic ring (opGen) and the
+        # flags.zero_() hipMemset launch by publishing a strictly-increasing per-op
+        # token into chunkReadyFlags and waiting `< opGen` in the reassembly worker
+        # -- the same reset-free pattern the classic ring (opGen) and the
         # reassembly-completion flags (gFlagVal) already use. Default OFF
         # (op_gen=0 -> kernel writes 1 / waits <1 / host zeroes -> byte-identical).
         self._flag_token = _env_true("MORI_HIER_FLAG_TOKEN", "0")
@@ -936,12 +880,10 @@ class HierAllGather:
         # before any submit; the output flag fires only after the pass-1 drain, so
         # it never precedes its bytes -- see FusedRemoteReassembleWorker). Default
         # ON only on the fused path (fuse_local/fuse_remote), where a single reasm
-        # CTA processes the deep-pipe sub-chunks serially and the per-queue
-        # drain-per-sub-chunk cap holds it below the plain default; feeding the SQ
+        # CTA processes the deep-pipe sub-chunks serially; feeding the SQ
         # continuously lifts the fused-path bandwidth. The plain (non-fused) N=2
         # path has a single remote reassembly gather, so this is a no-op there
-        # (nPass collapses to the single-shot submit+drain) and the shipped default
-        # path stays byte-identical. Env still overrides either way.
+        # (nPass collapses to the single-shot submit+drain). Env still overrides.
         if "MORI_HIER_REASM_DEEPSQ" in os.environ:
             self._reasm_deep_sq = 1 if _env_true("MORI_HIER_REASM_DEEPSQ") else 0
         else:
@@ -952,30 +894,21 @@ class HierAllGather:
         self._hp_src_ev = None
 
     def _init_sync_drain_state(self):
-        # isolation probe: force full stream completion at op return.
+        # Isolation probe: force full stream completion at op return.
         self._debug_sync = _env_true("MORI_HIER_DEBUG_SYNC", "0")
-        # Dense-node device-landing drain (opt-in, default OFF -- a documented
-        # negative kept as an escape hatch).
-        # The bit-exact dense-node base needs the full per-op host drain
-        # (MORI_HIER_DEBUG_SYNC=1 -> s.synchronize() on every AG) because at 8
-        # ranks/node the residual RDMA remote-landing race is not confined to the
-        # big embed/lm_head AGs -- every small per-layer AG also races. The host
-        # synchronize is bit-exact but its CPU stall kills cross-op run-ahead.
-        # DEVDRAIN attempts to replace the per-op host synchronize with the
-        # on-device equivalent enqueued on the same comm stream (no CPU round-trip):
-        # shmem_barrier_on_stream (cross-PE rendezvous ordering every peer's
-        # remote-half RDMA writes plus the intra SDMA gather) then
-        # launch_device_landing_gate (a live CQ-drain plus __threadfence_system
-        # spinning the CQ until every posted inter-node WQE has physically landed in
-        # HBM) -- the host drain's two jobs done device-side, with no CU payload
-        # copy. It does NOT achieve bit-exactness: the on-device CQ drain plus
-        # cross-PE barrier is insufficient, and only the host s.synchronize reaches
-        # the reference loss. This mirrors the w8 finding that device transport
-        # fences are not sufficient and only a host CPU RDMA-progress round-trip is
-        # bit-exact. The real dense-node bandwidth lever is a deferred host drain
-        # (hide the CPU stall behind FSDP prefetch), not a device-fence replacement.
+        # Dense-node device-landing drain (opt-in, default OFF -- documented
+        # negative kept as an escape hatch). At 8 ranks/node bit-exactness needs
+        # the full per-op host drain (MORI_HIER_DEBUG_SYNC=1 -> s.synchronize() on
+        # every AG): the residual RDMA remote-landing race is not confined to the
+        # big embed/lm_head AGs -- every small per-layer AG also races. DEVDRAIN
+        # attempts to replace the host synchronize with an on-device equivalent
+        # enqueued on the comm stream (shmem_barrier_on_stream +
+        # launch_device_landing_gate, a live CQ-drain plus __threadfence_system that
+        # spins the CQ until every posted inter-node WQE has landed in HBM). It does
+        # NOT achieve bit-exactness: the on-device CQ drain plus cross-PE barrier is
+        # insufficient; only the host s.synchronize reaches the reference loss.
         self._w16_devdrain = _env_true("MORI_HIER_W16_DEVDRAIN", "0")
-        # SYNC_BIG: targeted remote-completion fence on ONLY the big cross-node
+        # SYNC_BIG: targeted remote-completion fence on only the big cross-node
         # all-gathers (per-rank payload >= SYNC_BIG_BYTES), instead of a full-op
         # host sync on every call (DEBUG_SYNC forfeits all overlap). Closes the
         # remote-landing race on the large embed/lm_head AGs while keeping the
@@ -1038,8 +971,8 @@ class HierAllGather:
         # Phase-B copy-OUT is a copy-ENGINE hipMemcpyAsync (out_ -> output); the
         # FSDP consumer (backward GEMM) reads ``output`` from a COMPUTE UNIT. On
         # this GPU a copy-engine write is not made coherent with a later CU read
-        # by HIP stream-ordering alone (proven: only a host stream.synchronize
-        # gave loss==native, on-device barriers/system-scope flags did not) ->
+        # by HIP stream-ordering alone (only a host stream.synchronize makes it
+        # coherent; on-device barriers/system-scope flags do not) ->
         # occasional stale bytes -> loss drifts ~0.15% high, run-to-run jitter.
         # When set, the C++ finish copies into a persistent scratch and a torch
         # ELEMENTWISE (CU) kernel writes scratch -> output, so the producer of
@@ -1050,7 +983,7 @@ class HierAllGather:
 
     def _apply_dense_node_defaults(self):
         # Dense-node (8 ranks/node) landing-fence fix.
-        # At 8 ranks/node the shipped default drops the Phase-B entry barrier
+        # At 8 ranks/node the default drops the Phase-B entry barrier
         # (slice_fuse_ib) and defers the inter/intra finish fences, relying on the
         # ring's own deferred finish for cross-PE visibility. The Phase-B intra
         # SDMA gathers read peer ranks' ``collection`` (the inter-ring node-block
@@ -1058,11 +991,10 @@ class HierAllGather:
         # collection before that peer's ring finish is globally visible -- a
         # cross-PE visibility race that a host stream.synchronize cannot fix (it is
         # peer-side, not local completion). The race scales with local fan-out, so
-        # w8 (4 ranks/node) is unaffected while w16 (8 ranks/node) drifts. Forcing
-        # the two cross-PE finish fences ON restores bit-exactness.
-        # Fix: at ranks_per_node >= 8 default the two cross-PE finish fences ON
-        # (explicit env always wins). At ranks_per_node == 4 the gate never fires,
-        # so the w8 path is byte-identical.
+        # 4 ranks/node is unaffected while 8 ranks/node drifts. At
+        # ranks_per_node >= 8, force the two cross-PE finish fences ON to restore
+        # bit-exactness (explicit env always wins); at ranks_per_node == 4 the gate
+        # never fires, so that path is byte-identical.
         #
         # The Phase-B entry barrier is redundant once the two finish fences run
         # inline (slice_defer_fin=0 restores the Phase-B finish ShmemBarrierAll
@@ -1083,9 +1015,8 @@ class HierAllGather:
             # per-sub-chunk QP quiet-drain is the exposed per-round completion
             # latency. The fused put-with-signal landing path (deepPipeQuiet=0)
             # instead rides the completion AMO on the same QP as its data (RC
-            # in-order, so the flag never precedes its bytes) with no extra drain --
-            # the copy-engine completion model reimplemented natively, which is
-            # markedly faster. Bit-exact here because the 32MB DEEP_PIPE window gate
+            # in-order, so the flag never precedes its bytes) with no extra drain.
+            # Bit-exact here because the 32MB DEEP_PIPE window gate
             # (_dp_sub_bytes>=32MB => depth 1) caps engagement to sub-chunk<32MB,
             # under the NIC->HBM coherence window where the put-signal AMO could
             # outrun its own data. Any AG whose sub-chunk would reach >=32MB (e.g.
@@ -1095,14 +1026,11 @@ class HierAllGather:
             if "MORI_HIER_DEEP_PIPE_QUIET" not in os.environ:
                 os.environ["MORI_HIER_DEEP_PIPE_QUIET"] = "0"
             # Deep-pipe depth axis. Once the quiet-drain is gone, the temporal pipe
-            # depth (1 vs 2 vs 4) is neutral within noise -- bandwidth is
-            # depth-invariant, with a flat steady fill deficit plus a small fixed
-            # per-op cost (the ratio ramp with size is the fixed cost amortising,
-            # not depth helping). DEEP_PIPE=1 is never worse and strictly simpler
-            # (no put-signal AMO that can outrun data, so no coherence-window
-            # dependency and fewer landing flags). MORI_HIER_W16_DP1=1 forces it on
-            # the dense-node gate; default OFF keeps the depth-2 signal default
-            # byte-identical.
+            # depth (1 vs 2 vs 4) is neutral -- bandwidth is depth-invariant.
+            # DEEP_PIPE=1 is never worse and strictly simpler (no put-signal AMO
+            # that can outrun data, so no coherence-window dependency and fewer
+            # landing flags). MORI_HIER_W16_DP1=1 forces it on the dense-node gate;
+            # default OFF keeps the depth-2 signal default byte-identical.
             if (
                 _env_true("MORI_HIER_W16_DP1", "0")
                 and "MORI_HIER_DEEP_PIPE" not in os.environ
@@ -1119,14 +1047,13 @@ class HierAllGather:
     ):
         """Construct the intra/inter/bcast sub-collectives for this handle.
 
-        Pure structural extraction of the sub-collective construction tail of
-        ``__init__`` (single-node AllgatherSdma vs the multi-node intra-gather
-        + inter-ring [+ leader-only broadcast] pipeline, plus the deferred
-        slice_direct transport probe). Reads only the listed ctor args and the
-        already-set ``self.*`` topology/flag attrs; writes only ``self.*``."""
+        Single-node AllgatherSdma vs the multi-node intra-gather + inter-ring
+        [+ leader-only broadcast] pipeline, plus the deferred slice_direct
+        transport probe. Reads only the listed ctor args and the already-set
+        ``self.*`` topology/flag attrs; writes only ``self.*``."""
         if self.num_nodes == 1:
-            # M1: single node -> a plain intra-node SDMA AllGather over all
-            # local ranks is exactly the full AllGather.
+            # Single node -> a plain intra-node SDMA AllGather over all local ranks
+            # is exactly the full AllGather.
             from .collective import AllgatherSdma
 
             self._intra = AllgatherSdma(
@@ -1137,35 +1064,31 @@ class HierAllGather:
                 copy_output_to_user=copy_output_to_user,
             )
         else:
-            # M2b: hierarchical pipeline. Every rank runs two sub-group
-            # collectives and ends with the full rank-major output -- no
-            # separate broadcast phase (the "every-rank direct" decomposition):
+            # Hierarchical pipeline (every-rank-direct decomposition). Every rank
+            # runs two sub-group collectives and ends with the full rank-major
+            # output -- no separate broadcast phase:
             #
             #   1. Intra-node SDMA gather over my node's G local ranks
             #      {node*G, ..., node*G+G-1} -> my node-block (G shards in
-            #      local-rank order). DESIGN: intra-node == SDMA copy engines.
+            #      local-rank order).
             #   2. Inter-node RDMA ring over my same-local-index peers across
             #      nodes {local, local+G, ..., local+(N-1)*G} -> all N
             #      node-blocks in node order = concat(shard[0..W-1]), the
-            #      rank-major all_gather result. DESIGN: inter-node == RDMA.
+            #      rank-major all_gather result.
             #
             # Because node n owns ranks [n*G, n*G+G) and the ring lays blocks
             # down in node order, the result is bit-exact vs
             # torch.distributed.all_gather_into_tensor.
             #
-            # PERF NOTE (M4, ) -- the dominant remaining cost:
-            # This "every-rank direct" decomposition is simple (no broadcast
-            # phase) but it sends each node-block over the NIC G times. All G
-            # local ranks hold the same node-block after phase 1 and each one
-            # independently rings its same-local-index peer, so node n's block
-            # crosses the NIC once per local rank -- Gx redundant inter-node
-            # traffic. The ring is bandwidth-limited, not QP/warp-limited (raising
-            # the QP count gives no gain), so the Gx redundancy is the bottleneck.
-            # The alternative is a leader-only inter-node ring (local_rank==0 over
-            # the node-leaders {0,G,2G,...}) into a symmetric staging buffer, then
-            # an intra-node SDMA broadcast of the full N*G output to the G local
-            # ranks: it cuts NIC traffic ~Gx (1 block/node instead of G) at the
-            # cost of one extra XGMI hop.
+            # This decomposition is simple but sends each node-block over the NIC
+            # G times: all G local ranks hold the same node-block after phase 1 and
+            # each independently rings its same-local-index peer, so node n's block
+            # crosses the NIC once per local rank (Gx redundant inter-node traffic).
+            # The ring is bandwidth-limited, so that redundancy is the bottleneck;
+            # the sliced 2-D path (slice_inter) is the fix. A leader-only ring
+            # (local_rank==0 over {0,G,2G,...}) into a staging buffer + intra-node
+            # SDMA broadcast is the alternative: ~Gx less NIC traffic at the cost of
+            # one extra XGMI hop.
             from .collective import (
                 IntraNodeSubGroupAllgatherSdma,
                 InterNodeRingAllgather,
@@ -1187,9 +1110,9 @@ class HierAllGather:
                 if output_buffer_size is not None
                 else 512 * 1024 * 1024
             )
-            # M5: the fused sliced Phase B stacks all N reassembly gathers
-            # into ONE transit, so it must hold the full N*G-shard output (== the
-            # inter ring buffer size), not just a single G-shard node-block.
+            # The fused sliced Phase B stacks all N reassembly gathers into one
+            # transit, so it must hold the full N*G-shard output (== the inter ring
+            # buffer size), not just a single G-shard node-block.
             if self.slice_inter and self.slice_fused:
                 intra_bytes = max(intra_bytes, inter_bytes)
             # remember the inter ring buffer size for the host-proxy GDR
@@ -1210,8 +1133,7 @@ class HierAllGather:
             if not self.leader_only:
                 # Every-rank-direct (default): every rank rings its same-local-
                 # index peers across nodes; no broadcast phase. Sends each node-
-                # block over the NIC G times ( bottleneck) but is simple
-                # and proven bit-exact since .
+                # block over the NIC G times, but is simple and bit-exact.
                 self._inter = InterNodeRingAllgather(
                     my_pe=my_pe,
                     npes=npes,
@@ -1277,9 +1199,9 @@ class HierAllGather:
                 )
                 self._ring_scratch = None
             self._node_block = None
-            # M5: scratch for the sliced path -- holds this rank's
-            # collection C_g = [slice_g(B_0)..slice_g(B_{N-1})] (N*count) gathered
-            # by the inter ring before the N intra reassembly gathers.
+            # Scratch for the sliced path -- holds this rank's collection
+            # C_g = [slice_g(B_0)..slice_g(B_{N-1})] (N*count) gathered by the
+            # inter ring before the N intra reassembly gathers.
             self._slice_scratch = None
             # dbufstream: DEDICATED double-buffered collection scratch for the big
             # backward AGs. The consecutive big embed/lm_head AGs alternate output
@@ -1293,62 +1215,54 @@ class HierAllGather:
             # Toggle set by the dbufstream wrapper so the slice scratch selection
             # picks _big_scratch[parity] for the one big AG instead of the shared.
             self._big_dbuf_active = False
-            # M5: lazy side stream for the slice-overlap lever (c). The
-            # local node-block gather runs here concurrently with the inter ring.
+            # Lazy side stream for the slice-overlap lever. The local node-block
+            # gather runs here concurrently with the inter ring.
             self._overlap_stream = None
-            # M4 (/32): guard for the fuse-barrier entry-barrier skip. The
-            # intra-gather ENTRY barrier may be skipped only when the PRIOR op ran
-            # to COMPLETION (through its inter-finish ShmemBarrierAll, which is what
-            # guarantees every peer's out_ transit is free before the next gather).
-            # A plain call counter is NOT sufficient ( review): if a prior
-            # op raised mid-pipeline -- after the intra-gather dirtied out_ but
-            # before the inter-finish barrier -- a counter would still be >0 and the
-            # next op would wrongly skip the entry barrier with a dirty buffer. So
-            # we track explicit clean-completion: set False at entry, True only
-            # after a full successful op. First call (and any post-crash call)
-            # therefore keeps the barrier. Steady-state behavior is identical to the
-            # old counter (every op completes), so the happy path stays bit-exact.
+            # Guard for the fuse-barrier entry-barrier skip. The intra-gather entry
+            # barrier may be skipped only when the prior op ran to completion
+            # (through its inter-finish ShmemBarrierAll, which guarantees every
+            # peer's out_ transit is free before the next gather). A plain call
+            # counter is not sufficient: if a prior op raised mid-pipeline -- after
+            # the intra-gather dirtied out_ but before the inter-finish barrier --
+            # a counter would still be >0 and the next op would wrongly skip the
+            # entry barrier with a dirty buffer. So we track explicit
+            # clean-completion: set False at entry, True only after a full
+            # successful op. First call (and any post-crash call) therefore keeps
+            # the barrier.
             self._prev_op_completed = False
-            # M5: which path the PREVIOUS op took (sliced vs non-sliced),
-            # so the size-threshold dispatcher can force-keep the entry barrier on
-            # a path switch (the fuse-barrier entry-skip assumes the prior op's
-            # barriers freed the SAME buffers this path will reuse). None = no
-            # prior op.
+            # Which path the previous op took (sliced vs non-sliced), so the
+            # size-threshold dispatcher can force-keep the entry barrier on a path
+            # switch (the fuse-barrier entry-skip assumes the prior op's barriers
+            # freed the same buffers this path will reuse). None = no prior op.
             self._last_use_slice = None
-            # SINGLE-registration tracking for the DIRECT-TO-
-            # OUTPUT Phase-B path (slice_direct). The output buffer must be
-            # collectively registered (ShmemSymmetricRegister all-gathers peer
-            # pointers + opens IPC handles), so the register/deregister decision
-            # MUST be identical on every PE. The old guard
-            # (``if not is_output_registered: register``) made a PER-RANK
-            # decision that drove a COLLECTIVE: when torch's caching allocator
-            # placed a new output so that its range overlapped a prior (freed)
-            # registration DIFFERENTLY across ranks, the C++ overlap-eviction set
+            # Single-registration tracking for the direct-to-output Phase-B path
+            # (slice_direct). The output buffer must be collectively registered
+            # (ShmemSymmetricRegister all-gathers peer pointers + opens IPC
+            # handles), so the register/deregister decision must be identical on
+            # every PE. A per-rank "register if not already registered" decision
+            # would drive a divergent collective: when torch's caching allocator
+            # placed a new output whose range overlapped a prior (freed)
+            # registration differently across ranks, the C++ overlap-eviction set
             # diverged -> mismatched #collective calls -> the peer-pointer
-            # all-gather mis-aligned -> SDMA read the wrong peer's window (a
-            # bit-exact failure, reproducible with a single large --numels). Fix:
-            # track exactly ONE live registration here and, only on an EXACT
+            # all-gather mis-aligned -> SDMA read the wrong peer's window. Instead
+            # track exactly one live registration here and, only on an exact
             # (ptr,size) change, deregister the old + register the new. Exact
-            # same-size buffer reuse IS SPMD-consistent across ranks (the steady-
-            # state bench reuses one output for thousands of ops, rock-stable),
-            # so this decision is lockstep-uniform without any extra collective.
+            # same-size buffer reuse is SPMD-consistent across ranks, so this
+            # decision is lockstep-uniform without any extra collective.
             self._direct_reg_ptr = None
             self._direct_reg_size = None
-            # MULTI-ENTRY LRU registration cache. The single-entry
-            # tracker above deregisters the old buffer on EVERY (ptr,size) change,
-            # so two ALTERNATING output buffers (e.g. the embed-grad and
-            # lm_head-grad big backward AGs, which use different unsharded param
-            # buffers) each pay dereg(old)+reg(new) = TWO cross-node collectives
-            # per call -- the dominant cost of the de-fused big-AG path
-            # (serialfast/olapfast). Holding K>=2 registrations lets both stay
-            # resident so steady state pays ZERO register collectives. Keyed by
-            # exact (ptr,size); eviction is deterministic (oldest-first) and the
-            # (ptr,size) sequence is identical on every PE (FSDP issues the same
-            # AGs in the same order), so the register/deregister collectives stay
-            # lockstep-uniform -- the SPMD invariant that motivated the single-
-            # entry design is preserved. Exact-match hits only (no Python-side
-            # overlap logic) so two resident entries are always distinct live
-            # buffers. Insertion-ordered dict = the LRU. Cap via env (default 4;
+            # Multi-entry LRU registration cache. The single-entry tracker above
+            # deregisters the old buffer on every (ptr,size) change, so two
+            # alternating output buffers (e.g. the embed-grad and lm_head-grad big
+            # backward AGs, which use different unsharded param buffers) each pay
+            # dereg(old)+reg(new) = two cross-node collectives per call. Holding
+            # K>=2 registrations lets both stay resident so steady state pays zero
+            # register collectives. Keyed by exact (ptr,size); eviction is
+            # deterministic (oldest-first) and the (ptr,size) sequence is identical
+            # on every PE (FSDP issues the same AGs in the same order), so the
+            # register/deregister collectives stay lockstep-uniform. Exact-match
+            # hits only, so two resident entries are always distinct live buffers.
+            # Insertion-ordered dict = the LRU. Cap via env (default 4;
             # 0/1 restores single-entry behavior). Value = size (for bookkeeping).
             self._reg_cache_cap = _env_int("MORI_HIER_REG_CACHE", "4")
             self._direct_reg_lru = {}
@@ -1378,7 +1292,7 @@ class HierAllGather:
                 # (slice_direct=None) already probes and defaults OFF for IPC;
                 # when the caller forces it ON we validate the same
                 # precondition and raise a clear, actionable error instead of
-                # letting the opaque device abort fire. The shipped config
+                # letting the opaque device abort fire. The default config
                 # leaves slice_direct unset (auto), so this never trips it.
                 if self.leader_only:
                     raise ValueError(
@@ -1640,7 +1554,7 @@ class HierAllGather:
         # reuse the same buffer before the prior big AG's remote bytes land.
         # Draining here before issuing the next op closes that window without
         # depending on an external drain caller. When the copy-out hook already
-        # drained (the shipped path), _deferbwd_event is None so this is a no-op
+        # drained (the default path), _deferbwd_event is None so this is a no-op
         # with no host stall. Bit-exact by construction (same host wait, never
         # later than the next AG's buffer reuse).
         if self._deferbwd_event is not None:
@@ -1672,11 +1586,11 @@ class HierAllGather:
         # engine. _graph_replay returns False on any capture failure, so it falls
         # back cleanly to the normal fused path.
         # The collapse only wins while the fixed launch ramp is a large fraction of
-        # the op (small buffers). On bulk buffers the static graph replay serializes
-        # the CPU-driven inter/intra multi-launch overlap (it pays one launch but
-        # loses the async ring||reassembly pipelining), so cap graph engagement to
-        # buffers at/below MORI_HIER_CUDA_GRAPH_MAX_MB (default 48MB); bulk sizes
-        # fall through to the normal fused fast path. Default ON (gated <=48MB); set
+        # the op (small buffers). On bulk buffers static graph replay serializes the
+        # CPU-driven inter/intra multi-launch overlap (one launch, but loses the
+        # async ring||reassembly pipelining), so cap graph engagement to buffers
+        # at/below MORI_HIER_CUDA_GRAPH_MAX_MB (default 48MB); bulk sizes fall
+        # through to the normal fused fast path. Default ON (gated <=48MB); set
         # MORI_HIER_CUDA_GRAPH=0 to force the non-captured path.
         # Capture-poison guard: MORI_HIER_HOSTPROXY_REASM drives the inter leg from
         # a persistent CPU proxy (host ibverbs post + dist.barrier + flag publish)
@@ -1685,8 +1599,7 @@ class HierAllGather:
         # a clean Python-op capture miss, the failed device-side capture poisons the
         # HIP context so every subsequent eager launch dies, crashing the process.
         # Skip the capture attempt entirely when a known host-op mode is active so
-        # the path degrades to a clean eager fallback. Byte-identical on every
-        # default/E2E path (none set HOSTPROXY_REASM); env still overrides.
+        # the path degrades to a clean eager fallback. Env still overrides.
         _hp_host_ops = _env_true("MORI_HIER_HOSTPROXY_REASM", "0")
         if (
             os.environ.get("MORI_HIER_CUDA_GRAPH", "1").strip().lower()
@@ -1698,17 +1611,13 @@ class HierAllGather:
             # Path-aware gate widening. The 48MB cap exists because the multi-chunk
             # CPU-pipelined path (side-stream ring||reassembly) regresses under
             # static graph replay (the graph serializes the CPU-driven pipe). But
-            # the standalone fused crown (standalone_fast + fuse_remote/fuse_local)
+            # the standalone fused path (standalone_fast + fuse_remote/fuse_local)
             # runs ring||reassembly inside one grid (device-side pipeline, no CPU
-            # side-stream to serialize), so capture is lossless at bulk sizes: it is
-            # never worse and marginally better (the fixed cost is dominated by the
-            # device barrier executions and pipe fill/drain, not host-launch
-            # dispatch). So on this single-grid crown only, drop the size cap; every
-            # other path keeps the 48MB gate, and slice_pipe/overlap stay capped
-            # (their CPU pipe does regress under replay). Bit-exact by construction
-            # (identical kernels/order/buffers, copy on SDMA never CU). E2E
-            # byte-identical (no E2E caller sets standalone_fast). Env MAX_MB
-            # overrides.
+            # side-stream to serialize), so capture is lossless at bulk sizes. On
+            # that single-grid path only, drop the size cap; every other path keeps
+            # the 48MB gate, and slice_pipe/overlap stay capped (their CPU pipe does
+            # regress under replay). Bit-exact by construction (identical
+            # kernels/order/buffers, copy on SDMA never CU). Env MAX_MB overrides.
             if (
                 self._standalone_fast
                 and (self.fuse_remote or self.fuse_local)
@@ -1716,21 +1625,18 @@ class HierAllGather:
                 and not self.slice_overlap
                 and os.environ.get("MORI_HIER_CUDA_GRAPH_MAX_MB") is None
             ):
-                _cg_max_mb = 0.0  # uncapped: single-grid crown is lossless-capturable
+                _cg_max_mb = 0.0  # uncapped: single-grid path is lossless-capturable
             _cg_bytes = int(count) * int(input_data.element_size())
             if _cg_max_mb <= 0 or _cg_bytes <= _cg_max_mb * 1024 * 1024:
-                # Graph-vs-launch-reduction footgun guard. The small-buffer win is
-                # entirely the HIP-graph launch-collapse. The per-op host
-                # launch-reduction levers (GEN_RING, FLAG_TOKEN, NO_ENTRY_BARRIER)
-                # each add a graph-incompatible host op inside the op body, so
-                # capture silently fails (cache[key]=False -> eager forever) and the
-                # win is lost -- they do not collapse the launch ramp, they destroy
-                # the mechanism that already does (and FLAG_TOKEN additionally
-                # regresses the eager >48MB path). So on the graph-eligible band
-                # these flags are a net-negative footgun; force them off for the
-                # captured op so a stray env cannot silently forfeit the graph win.
-                # The flags remain live on the >gate eager path where the graph
-                # never runs. Bit-exact: the shipped default has all three OFF.
+                # Graph-vs-launch-reduction guard. The small-buffer win is entirely
+                # the HIP-graph launch-collapse. The per-op host launch-reduction
+                # levers (GEN_RING, FLAG_TOKEN, NO_ENTRY_BARRIER) each add a
+                # graph-incompatible host op inside the op body, so capture silently
+                # fails (cache[key]=False -> eager forever) and the win is lost. On
+                # the graph-eligible band force them off for the captured op so a
+                # stray env cannot silently forfeit the graph win; the flags remain
+                # live on the >gate eager path where the graph never runs. Bit-exact:
+                # the default has all three off.
                 if self._flag_token:
                     self._flag_token = False
                     print(
@@ -1747,21 +1653,19 @@ class HierAllGather:
             # Only the big cross-node AGs get a targeted completion fence.
             if count * input_data.element_size() >= self._sync_big_bytes:
                 big_ag = True
-        # TARGETED RING/INTRA HOST-FINISH on the BACKWARD big AG only.
-        # The residual fast-path loss drift is in the BACKWARD re-unshard of the
-        # big embed/lm_head cross-node AG: a backward-only host stream.synchronize()
-        # makes grads bit-exact; forward is exonerated. Every device-side transport
-        # fence failed, so the repair mechanism is a HOST CPU RDMA-progress
-        # round-trip (STREAM_RING=0 host finish, which does hipStreamSynchronize +
-        # host ShmemBarrierAll on the ring/intra finish). Full stream.synchronize()
-        # is bit-exact but -22% because it also blocks CPU enqueue of the whole
-        # rest of the step. This mode runs ONLY the backward big AG through the
-        # host-synced ring+intra finish (stream_ring/stream_intra off for that ONE
-        # call) -- draining just that op's stream, not the caller's whole compute
-        # stream -- while every other AG stays fully on-stream/overlapped. The
-        # host-sync path always issues full global ShmemBarrierAll (prepare+finish),
-        # so cross-PE buffer reuse stays correct across the mixed on-stream/host
-        # ops. Gated to autograd backward (grad disabled).
+        # Targeted ring/intra host-finish on the backward big AG only.
+        # The residual fast-path loss drift is in the backward re-unshard of the
+        # big embed/lm_head cross-node AG; a backward-only host stream.synchronize()
+        # makes grads bit-exact. Device-side transport fences are insufficient, so
+        # the repair is a host CPU RDMA-progress round-trip (STREAM_RING=0 host
+        # finish: hipStreamSynchronize + host ShmemBarrierAll on the ring/intra
+        # finish). A full stream.synchronize() is bit-exact but also blocks CPU
+        # enqueue of the rest of the step. This mode runs only the backward big AG
+        # through the host-synced ring+intra finish (stream_ring/stream_intra off
+        # for that one call), draining just that op's stream, while every other AG
+        # stays fully on-stream. The host-sync path always issues full global
+        # ShmemBarrierAll (prepare+finish), so cross-PE buffer reuse stays correct
+        # across the mixed on-stream/host ops. Gated to autograd backward.
         _ring_hostfin = (
             self._sync_big_mode == "ringhostfin"
             and big_ag
@@ -1773,96 +1677,87 @@ class HierAllGather:
             _saved_sr, _saved_si = self.stream_ring, self.stream_intra
             self.stream_ring = False
             self.stream_intra = False
-        # Device-side isolation of the concurrent fused ring||local-gather
-        # kernel (one grid, NIC ring blocks || XGMI gather block). This mode
-        # forces the SERIAL non-fused, non-overlap slice_direct path (explicit
-        # per-block gathers + a global finish_direct_stream barrier) for the
-        # backward big AG, fully ON-STREAM (stream_ring/intra stay True, NO host
-        # sync), to isolate whether the concurrent grid is the race.
-        # Gated to autograd backward big AG.
+        # Device-side isolation of the concurrent fused ring||local-gather kernel
+        # (one grid, NIC ring blocks || XGMI gather block). Forces the serial
+        # non-fused, non-overlap slice_direct path (explicit per-block gathers +
+        # a global finish_direct_stream barrier) for the backward big AG, fully
+        # on-stream (stream_ring/intra stay True, no host sync), to isolate whether
+        # the concurrent grid is the race. Gated to autograd backward big AG.
         _serial_big = (
             self._sync_big_mode == "serial"
             and big_ag
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # "serialfast" -- de-fuse the backward big AG WITHOUT flipping the
-        # global stream flags. The concurrent FusedRingLocalGatherKernel
-        # (ring||XGMI gather in one grid) is the corruptor: serializing that
-        # ONE big backward AG onto the two-launch on-stream slice_direct direct-
-        # gather path (per-block gather_kernel_direct + finish_direct_stream) gives
-        # device-side, sync-free, bit-exact grads. serialfast flips
-        # stream_intra/ring True (and fuse_local/overlap False) for
-        # ONLY this one big backward AG, so it takes the bit-exact on-stream direct
-        # path while every other AG (forward + small) keeps the shipped fast
-        # stream_intra=0 baseline untouched. ~1-2 de-fused AGs/step -> the overlap
-        # loss is bounded to those calls, not the whole step.
+        # "serialfast" -- de-fuse the backward big AG without flipping the global
+        # stream flags. The concurrent FusedRingLocalGatherKernel (ring||XGMI
+        # gather in one grid) is the corruptor: serializing that one big backward
+        # AG onto the two-launch on-stream slice_direct direct-gather path (per-
+        # block gather_kernel_direct + finish_direct_stream) gives device-side,
+        # sync-free, bit-exact grads. serialfast flips stream_intra/ring True (and
+        # fuse_local/overlap False) for only this one big backward AG, so it takes
+        # the bit-exact on-stream direct path while every other AG keeps the fast
+        # stream_intra=0 baseline.
         _serialfast_big = (
             self._sync_big_mode == "serialfast"
             and big_ag
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # "olapfast" -- de-fuse ONLY the single-grid concurrency, keep the
-        # side-stream ring<->local-gather OVERLAP. serialfast is bit-exact but
-        # -30% (the two-launch SERIAL direct path forgoes overlap AND re-registers
-        # the output buffer per alternating embed/lm_head call). The corruptor is
-        # the CONCURRENT FusedRingLocalGatherKernel (ring||XGMI gather in ONE grid);
-        # its predecessor slice_direct_overlap uses TWO SEPARATE launches (ring on
-        # main || local-block gather on a side stream, merged by
-        # main.wait_stream(side)) -- overlapped but NOT one concurrent grid, so this
-        # path is bit-exact AND keeps the overlap.
-        # Gated to the backward big AG only; every other AG stays on the shipped
-        # fast stream_intra=0 baseline.
+        # "olapfast" -- de-fuse only the single-grid concurrency, keep the
+        # side-stream ring<->local-gather overlap. serialfast is bit-exact but
+        # forgoes overlap and re-registers the output buffer per alternating
+        # embed/lm_head call. The corruptor is the concurrent
+        # FusedRingLocalGatherKernel (ring||XGMI gather in one grid);
+        # slice_direct_overlap uses two separate launches (ring on main ||
+        # local-block gather on a side stream, merged by main.wait_stream(side)) --
+        # overlapped but not one concurrent grid, so it is bit-exact and keeps the
+        # overlap. Gated to the backward big AG only.
         _olapfast_big = (
             self._sync_big_mode == "olapfast"
             and big_ag
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # "olapfast2": olapfast (de-fuse the single concurrent grid, keep the
-        # two-launch side-stream ring<->local-gather overlap) plus defer the
-        # de-fused big AG's inter-ring finish fence. The direct-to-output cost here
-        # is the per-op global inter-ring ShmemBarrier that the env forces
-        # (SLICE_DEFER_INTER_FIN=0) on every big AG; the direct-overlap path also
-        # ping-pongs a side stream, so the exposed global fence serializes harder.
-        # Defer it (barrier=False) for only this de-fused big AG so the successor
-        # op's prepare barrier covers ring-buffer reuse -- same safety class as
-        # slice_defer_fin, which is already deferred on this path. Gated to the
-        # autograd backward big AG.
+        # "olapfast2": olapfast plus defer the de-fused big AG's inter-ring finish
+        # fence. The direct-to-output cost here is the per-op global inter-ring
+        # ShmemBarrier the env forces (SLICE_DEFER_INTER_FIN=0) on every big AG;
+        # the direct-overlap path also ping-pongs a side stream, so the exposed
+        # global fence serializes harder. Defer it (barrier=False) for only this
+        # de-fused big AG so the successor op's prepare barrier covers ring-buffer
+        # reuse -- same safety class as slice_defer_fin, already deferred on this
+        # path. Gated to the autograd backward big AG.
         _olapfast2_big = (
             self._sync_big_mode == "olapfast2"
             and big_ag
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # "devgate" -- run the backward big AG
-        # on the SAME sync-free on-stream olapfast overlap path (two-launch
-        # side-stream ring<->local-gather, stream_ring/intra on) BUT append a
-        # DEVICE landing gate kernel on the caller's stream after finish. The gate
-        # (ShmemQuietThread<RDMA> live-drain of every mlx5 CQ/QP + threadfence_sys)
-        # is the on-device equivalent of the host stream.synchronize that is the
-        # ONLY bit-exact fence on this HW -- it waits the actual RDMA
-        # hardware landing so the FSDP-recorded event coincides with it, WITHOUT
-        # the host round-trip that costs olapfast/bwdbig ~-22%. Gated to backward
-        # big AG only; every other AG unchanged.
+        # "devgate" -- run the backward big AG on the same sync-free on-stream
+        # olapfast overlap path (two-launch side-stream ring<->local-gather,
+        # stream_ring/intra on) but append a device landing gate kernel on the
+        # caller's stream after finish. The gate (ShmemQuietThread<RDMA> live-drain
+        # of every mlx5 CQ/QP + threadfence_sys) is the on-device equivalent of the
+        # host stream.synchronize -- it waits the actual RDMA hardware landing so
+        # the FSDP-recorded event coincides with it, without the host round-trip.
+        # Gated to backward big AG only.
         _devgate_big = (
             self._sync_big_mode == "devgate"
             and big_ag
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # "devtouch" -- COMPOSE the two best near-miss
-        # fences, each of which closes a DIFFERENT half of the backward big-AG
-        # residual and neither of which alone is bit-exact on this MI300X/mlx5:
+        # "devtouch" -- compose two fences, each of which closes a different half
+        # of the backward big-AG residual (neither alone is bit-exact on
+        # MI300X/mlx5):
         #   - devgate (device landing gate, ShmemQuietThread RDMA CQ live-drain +
-        #     threadfence_system): the strongest TEMPORAL landing fence on-device
-        #     -- waits the actual RDMA hardware landing.
+        #     threadfence_system): the temporal landing fence -- waits the actual
+        #     RDMA hardware landing.
         #   - coretouch (L2CoherentRetouch, volatile glc L2-bypass load + CU
-        #     re-publish): closes the CACHE-COHERENCE half (SDMA-copy-engine-written
+        #     re-publish): closes the cache-coherence half (SDMA-copy-engine-written
         #     output not L2-coherent to the consumer GEMM under FSDP buffer reuse).
-        # Run the gate FIRST (drain RDMA landing so the bytes have physically
-        # landed) THEN the coherent re-touch (pull the freshly-landed HBM into the
+        # Run the gate first (drain RDMA landing so the bytes have physically
+        # landed) then the coherent re-touch (pull the freshly-landed HBM into the
         # CU/L2 domain the GEMM reads). Both on the caller stream, no host stall.
         _devtouch_big = (
             self._sync_big_mode == "devtouch"
@@ -1870,32 +1765,29 @@ class HierAllGather:
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # "dbufstream" -- keep the big backward AG on the FAST contiguous
-        # copy-out STRUCTURE (gather all node-blocks into a contiguous scratch,
-        # then ONE bulk finish_batch_stream copy-OUT -- the 222-TFLOPS shipped
-        # path's shape), NOT the ~21%-slower direct-to-output strided writes that
-        # serialfast/olapfast take. To do that force slice_direct=False for this
-        # ONE AG (routes it to the else copy-out branch at ~1922) while turning ON
-        # the stream-ordered ring+copy-out (stream_ring/stream_intra=True), and
-        # DE-FUSE (fuse_local/slice_direct_overlap=False, no concurrent grid). The
-        # copy-out branch reuses the SHARED _slice_scratch with a deferred finish
-        # fence, which is exactly the scratch-reuse staleness for consecutive
-        # big AGs -- so give this AG a DEDICATED double-buffered scratch (see
-        # _big_dbuf_active below). Gated to autograd backward big AG only.
+        # "dbufstream" -- keep the big backward AG on the fast contiguous copy-out
+        # structure (gather all node-blocks into a contiguous scratch, then one
+        # bulk finish_batch_stream copy-OUT), not the slower direct-to-output
+        # strided writes serialfast/olapfast take. Force slice_direct=False for
+        # this one AG (routes it to the copy-out branch) while turning on the
+        # stream-ordered ring+copy-out (stream_ring/stream_intra=True), and de-fuse
+        # (fuse_local/slice_direct_overlap=False, no concurrent grid). The copy-out
+        # branch reuses the shared _slice_scratch with a deferred finish fence,
+        # which is the scratch-reuse staleness for consecutive big AGs -- so give
+        # this AG a dedicated double-buffered scratch (see _big_dbuf_active below).
+        # Gated to autograd backward big AG only.
         _dbufstream_big = (
             self._sync_big_mode == "dbufstream"
             and big_ag
             and not self._debug_sync
             and not torch.is_grad_enabled()
         )
-        # "bwdbigff" -- backward big AG host-drained
-        # (bit-exact, same as bwdbig) BUT the FORWARD big AG (forward [FP]
-        # bit-exact, only backward [GFP] races)
-        # takes the FAST fused-fill kernel (fuse_local) instead of the default
-        # de-fused slice overlap. Forward carries ~2 big embed/lm_head AGs/step;
-        # filling them faster (fuse_local ~0.9x vs slice ~0.71x on this fabric)
-        # shaves the exposed forward comm while the backward host-drain keeps the
-        # landing->consume ordering the racy backward re-unshard requires. Every
+        # "bwdbigff" -- backward big AG host-drained (bit-exact), but the forward
+        # big AG (forward is already bit-exact; only backward races) takes the fast
+        # fused-fill kernel (fuse_local) instead of the default de-fused slice
+        # overlap. Forward carries ~2 big embed/lm_head AGs/step; filling them
+        # faster shaves the exposed forward comm while the backward host-drain keeps
+        # the landing->consume ordering the racy backward re-unshard requires. Every
         # small AG + all backward stays on the correct path unchanged.
         _bwdbigff_fwd = (
             self._sync_big_mode == "bwdbigff"
@@ -1972,10 +1864,10 @@ class HierAllGather:
             launch_device_landing_gate(_stream_to_int(stream))
             return ret
         if _devtouch_big:
-            # Compose: device RDMA landing gate (temporal landing fence) FIRST,
-            # THEN the L2-coherent re-touch (cache-coherence fence). Both on the
+            # Compose: device RDMA landing gate (temporal landing fence) first,
+            # then the L2-coherent re-touch (cache-coherence fence). Both on the
             # caller stream (stream-ordered, no host stall). Targets the residual
-            # each fence alone leaves: gate=Δ-0.0042, coretouch=Δ-0.0093.
+            # each fence alone leaves.
             from .collective import (
                 launch_device_landing_gate,
                 launch_l2_coherent_retouch,
@@ -2003,21 +1895,20 @@ class HierAllGather:
         if _ring_hostfin:
             self.stream_ring, self.stream_intra = _saved_sr, _saved_si
             return ret
-        # ALL-COHERENT (world=16): at 8-GPU/node the intra-node gather
-        # spans G=8 local peers via the SDMA COPY ENGINE -- a separate hw agent whose
-        # writes a per-call stream.synchronize (DEBUG_SYNC) does NOT bring into CU/L2
-        # coherence with the consumer GEMM. big_ag only fences the big embed/lm_head
-        # cross-node AGs (>= sync_big_bytes); every SMALL per-layer AG runs UNFENCED.
-        # At w8 (G=4) that was bit-exact; at w16 (G=8) the wider intra gather leaves
-        # the small-AG output partially-landed/stale -> E2E loss drift under BOTH the
-        # host-drain discriminator and K=1 (T9: 11.119320 / 11.124185 vs GT
-        # 11.0912446975708). Fix: apply the PROVEN big-AG fence (barriercutouch) to
-        # EVERY cross-node AG -- shmem_barrier_on_stream orders the RDMA cross-PE
-        # landing + the intra SDMA gather, THEN an L2-coherent CU re-touch makes the
-        # consumed buffer's LAST writer a CU op (CU/L2-coherent with the GEMM). Both
-        # on the caller stream => stream-ordered, NO host stall (keeps overlap). The
-        # re-touch (add-by-0 / coherent rewrite) is bit-exact for fp16/bf16/fp32/int.
-        # Default OFF; when set it supersedes the big_ag-only fence for all sizes.
+        # all-coherent: at 8 GPUs/node the intra-node gather spans G=8 local peers
+        # via the SDMA copy engine -- a separate hw agent whose writes a per-call
+        # stream.synchronize (DEBUG_SYNC) does not bring into CU/L2 coherence with
+        # the consumer GEMM. big_ag only fences the big embed/lm_head cross-node AGs
+        # (>= sync_big_bytes); every small per-layer AG runs unfenced. At 4
+        # ranks/node that was bit-exact; at 8 ranks/node the wider intra gather
+        # leaves the small-AG output partially-landed/stale -> E2E loss drift.
+        # Applies the big-AG fence (barriercutouch) to every cross-node AG:
+        # shmem_barrier_on_stream orders the RDMA cross-PE landing + the intra SDMA
+        # gather, then an L2-coherent CU re-touch makes the consumed buffer's last
+        # writer a CU op (CU/L2-coherent with the GEMM). Both on the caller stream
+        # (stream-ordered, no host stall). The re-touch (add-by-0 / coherent
+        # rewrite) is bit-exact for fp16/bf16/fp32/int. Default OFF; when set it
+        # supersedes the big_ag-only fence for all sizes.
         _all_coherent = (
             self.num_nodes > 1
             and not self._debug_sync
@@ -2039,10 +1930,10 @@ class HierAllGather:
                 output_data.data_ptr(), u32_count, _stream_to_int(cs)
             )
             return ret
-        # W16 DEVICE-LANDING DRAIN: device-side equivalent of the
-        # per-op host synchronize for EVERY cross-node AG -- cross-PE rendezvous +
-        # on-device mlx5 CQ drain, no host stall, no CU copy. Supersedes big_ag /
-        # host-drain when set. See __init__ note.
+        # Device-landing drain: device-side equivalent of the per-op host
+        # synchronize for every cross-node AG -- cross-PE rendezvous + on-device
+        # mlx5 CQ drain, no host stall, no CU copy. Supersedes big_ag / host-drain
+        # when set. See __init__ note.
         if self._w16_devdrain and self.num_nodes > 1:
             from ..shmem import shmem_barrier_on_stream
             from .collective import launch_device_landing_gate, _stream_to_int
@@ -2060,13 +1951,12 @@ class HierAllGather:
         # DEBUG_SYNC always host-syncs; SYNC_BIG (barrier mode) prefers a
         # device-side cross-PE barrier on the big AGs (no host stall).
         if big_ag and not self._debug_sync and self._sync_big_mode == "coretouch":
-            # barrier (orders RDMA cross-PE landing + intra SDMA
-            # gather) FIRST, THEN an L2-COHERENT re-touch of the consumed output.
-            # This is barriercutouch's compose EXCEPT the re-touch is the
-            # system-scope acquire/release L2CoherentRetouchKernel_u32 (bypasses the
-            # stale L2 line that barriercutouch's torch.add(out,0) read through) --
-            # the direct fix for the residual dL 0.0023 barriercutouch left. Both
-            # ops on the caller stream => stream-ordered, sync-free (keeps overlap).
+            # barrier (orders RDMA cross-PE landing + intra SDMA gather) first,
+            # then an L2-coherent re-touch of the consumed output. Same compose as
+            # barriercutouch except the re-touch is the system-scope acquire/release
+            # L2CoherentRetouchKernel_u32, which bypasses the stale L2 line that
+            # barriercutouch's torch.add(out,0) reads through. Both ops on the caller
+            # stream (stream-ordered, sync-free).
             from ..shmem import shmem_barrier_on_stream
             from .collective import launch_l2_coherent_retouch, _stream_to_int
 
@@ -2084,20 +1974,21 @@ class HierAllGather:
         elif (
             big_ag and not self._debug_sync and self._sync_big_mode == "barriercutouch"
         ):
-            # EXPERIMENTAL SYNC_BIG mode (default mode is "host"; SYNC_BIG OFF by
+            # Experimental SYNC_BIG mode (default mode is "host"; SYNC_BIG OFF by
             # default). On mlx5 the device barrier and the CU re-touch each close a
-            # DIFFERENT half of the big-AG completion race; neither alone is bit-exact:
+            # different half of the big-AG completion race; neither alone is
+            # bit-exact:
             #  - barrier alone orders the NIC remote landing + cross-PE rendezvous,
             #    but the slice_direct write is done by the intra SDMA copy engine
             #    (a separate hw agent) whose bytes are not CU/L2-coherent to the
             #    consumer GEMM just by the barrier.
             #  - cutouch alone makes the consumed buffer's last writer a CU op
-            #    (CU/L2-coherent) but does NOT order the cross-node RDMA landing.
-            # Invariant: barrier FIRST (quiet NIC + rendezvous so every peer's
-            # remote-half bytes have landed and the intra SDMA gather has run), THEN
-            # a CU re-touch (fenced read+rewrite into the CU/L2 domain the GEMM reads).
-            # Both on the SAME caller stream => stream-ordered, sync-free. add-by-0 is
-            # bit-exact for bf16/fp16/fp32/int. Targets only the big embed/lm_head
+            #    (CU/L2-coherent) but does not order the cross-node RDMA landing.
+            # Invariant: barrier first (quiet NIC + rendezvous so every peer's
+            # remote-half bytes have landed and the intra SDMA gather has run), then
+            # a CU re-touch (fenced read+rewrite into the CU/L2 domain the GEMM
+            # reads). Both on the caller stream (stream-ordered, sync-free). add-by-0
+            # is bit-exact for bf16/fp16/fp32/int. Targets only the big embed/lm_head
             # cross-node AGs where the residual race lives.
             from ..shmem import shmem_barrier_on_stream
 
@@ -2112,25 +2003,21 @@ class HierAllGather:
             with torch.cuda.stream(cs):
                 torch.add(out_flat, 0, out=out_flat)
         elif big_ag and not self._debug_sync and self._sync_big_mode == "devcutouch":
-            # THREE fences, each closing a distinct part
-            # of the backward big-AG residual that no single/double compose closed:
-            #   1. shmem_barrier_on_stream -- CROSS-PE RENDEZVOUS: the device gate
-            #      alone drains only THIS PE's outgoing send CQ (proves my writes
-            #      LEFT), it has NO guarantee the NEIGHBOR's RDMA writes have LANDED
+            # Three fences, each closing a distinct part of the backward big-AG
+            # residual:
+            #   1. shmem_barrier_on_stream -- cross-PE rendezvous: the device gate
+            #      alone drains only this PE's outgoing send CQ (proves my writes
+            #      left); it has no guarantee the neighbor's RDMA writes have landed
             #      in my output. The barrier is the cross-PE order that guarantees
             #      every peer's remote-half bytes are in flight/ordered.
             #   2. device landing gate (ShmemQuietThread RDMA CQ live-drain +
-            #      threadfence_system) -- TEMPORAL HW LANDING: spins the mlx5 CQ
-            #      until every posted WQE completed, so bytes have PHYSICALLY landed
+            #      threadfence_system) -- temporal hw landing: spins the mlx5 CQ
+            #      until every posted WQE completed, so bytes have physically landed
             #      at HBM (barrier orders but does not drain the hw send queues).
-            #   3. torch.add(out,0) CU re-touch -- L2 REPUBLISH: makes the consumed
-            #      buffer's LAST writer a CU op (CU/L2-coherent with the GEMM). The
-            #      plain add-by-0 (barriercutouch's Δ0.0023 mechanism) beat the
-            #      volatile-glc L2CoherentRetouch (coretouch Δ-0.0093), so use it.
-            # barriercutouch (barrier+retouch) reached Δ0.0023 and devgate
-            # (gate) reached Δ-0.0042; each leaves a DIFFERENT residual, so drain
-            # the hw landing (gate) BETWEEN the rendezvous (barrier) and the CU
-            # republish (retouch). All on the caller stream, no host stall.
+            #   3. torch.add(out,0) CU re-touch -- L2 republish: makes the consumed
+            #      buffer's last writer a CU op (CU/L2-coherent with the GEMM).
+            # Drain the hw landing (gate) between the rendezvous (barrier) and the
+            # CU republish (retouch). All on the caller stream, no host stall.
             from ..shmem import shmem_barrier_on_stream
             from .collective import launch_device_landing_gate, _stream_to_int
 
@@ -2150,28 +2037,25 @@ class HierAllGather:
             and not self._debug_sync
             and self._sync_big_mode in ("gateinv", "bargateinv")
         ):
-            # The CONSUME-SIDE LANDING GATE = device WAIT-on-landing THEN L2 INVALIDATE,
-            # gating the big embed/lm_head AG consumer. The host-drain audit showed
-            # only a HOST CQ-drain closes the fuse_remote consumer race and NO device
-            # fence alone does; L2INV ALONE is the
-            # WRONG HALF (it invalidates an UN-landed line so the GEMM re-fetches STALE
-            # HBM => drift). The missing half is the WAIT. Compose them on-device, no
-            # host stall:
-            #   1. (bargateinv only) shmem_barrier_on_stream -- cross-PE rendezvous so
-            #      every peer's remote-half RDMA writes are ordered/in-flight.
+            # Consume-side landing gate = device wait-on-landing then L2
+            # invalidate, gating the big embed/lm_head AG consumer. L2INV alone is
+            # the wrong half (it invalidates an un-landed line so the GEMM re-fetches
+            # stale HBM => drift); the missing half is the wait. Compose them
+            # on-device, no host stall:
+            #   1. (bargateinv only) shmem_barrier_on_stream -- cross-PE rendezvous
+            #      so every peer's remote-half RDMA writes are ordered/in-flight.
             #   2. device landing gate (ShmemQuietThread<RDMA> live CQ-drain +
-            #      __threadfence_system) -- the WAIT: spins the mlx5 CQ until every
-            #      posted WQE has COMPLETED, i.e. every inter-node write has physically
-            #      LANDED in HBM. This is the device equivalent of the host CQ-drain
-            #      that is the ONLY bit-exact mechanism -- but with no CPU
-            #      round-trip. (devgate alone lands but the GEMM
-            #      still reads a stale L2 line for the reused FSDP output buffer.)
-            #   3. L2InvOnly buffer_inv -- the INVALIDATE: drops the stale device-L2
-            #      lines AFTER the landing wait, so the stream-ordered consumer GEMM
-            #      MISSES L2 and re-fetches the freshly-LANDED HBM bytes. Because it is
-            #      stream-ordered strictly behind step 2 it invalidates a LANDED line
-            #      NOT an un-landed one (plain L2INV_ONLY's bug).
-            # All three enqueued on the SAME caller stream => stream-ordered, sync-free.
+            #      __threadfence_system) -- the wait: spins the mlx5 CQ until every
+            #      posted WQE has completed, i.e. every inter-node write has landed
+            #      in HBM. The device equivalent of the host CQ-drain, with no CPU
+            #      round-trip. (devgate alone lands but the GEMM still reads a stale
+            #      L2 line for the reused FSDP output buffer.)
+            #   3. L2InvOnly buffer_inv -- the invalidate: drops the stale device-L2
+            #      lines after the landing wait, so the stream-ordered consumer GEMM
+            #      misses L2 and re-fetches the freshly-landed HBM bytes. Because it
+            #      is stream-ordered strictly behind step 2 it invalidates a landed
+            #      line, not an un-landed one.
+            # All three enqueued on the caller stream (stream-ordered, sync-free).
             from .collective import (
                 launch_device_landing_gate,
                 launch_l2_inv_only,
@@ -2203,17 +2087,16 @@ class HierAllGather:
             big_ag and not self._debug_sync and self._sync_big_mode == "barrierthrottle"
         ):
             # Experimental (default mode is "host"). On mlx5: device barrier
-            # (NIC-landing + cross-PE order) COMPOSED WITH a bounded CPU
-            # run-ahead throttle. The barrier alone damps the completion-race
-            # drift but leaves a small sign-flipping residual that ACCUMULATES
-            # across steps into the last_loss drift; composing a CU re-touch
-            # (barriercutouch) reopens the window and makes it worse. Instead
-            # bound the CPU run-ahead: after the device barrier orders THIS big
-            # AG's landing, host-wait on the PREVIOUS big AG's completion event
-            # (bounds the CPU to ~1 big-AG ahead of the GPU) and record this
-            # AG's event for the next call. Invariant: this does NOT re-read the
-            # current AG (no reopened window, unlike barriercutouch); it only
-            # prevents the per-AG residual from compounding step-over-step.
+            # (NIC-landing + cross-PE order) composed with a bounded CPU run-ahead
+            # throttle. The barrier alone damps the completion-race drift but leaves
+            # a small residual that accumulates across steps into the last_loss
+            # drift; composing a CU re-touch (barriercutouch) reopens the window.
+            # Instead bound the CPU run-ahead: after the device barrier orders this
+            # big AG's landing, host-wait on the previous big AG's completion event
+            # (bounds the CPU to ~1 big-AG ahead of the GPU) and record this AG's
+            # event for the next call. This does not re-read the current AG (no
+            # reopened window); it only prevents the per-AG residual from compounding
+            # step-over-step.
             from ..shmem import shmem_barrier_on_stream
 
             bts = (
@@ -2229,18 +2112,16 @@ class HierAllGather:
             self._sync_big_prev_event = ev
         elif big_ag and not self._debug_sync and self._sync_big_mode == "cutouch":
             # CU re-touch on the big AGs: the slice_direct direct-to-output path
-            # writes ``output`` with the intra SDMA gather (copy-engine domain)
-            # and has NO CU re-touch (unlike the nodirect copy-out path, which
-            # already routes through _cu_copyout_finish). The
-            # residual stale-read race is exactly these big
-            # embed/lm_head cross-node AGs. Force the LAST writer of the consumed
-            # buffer to be a CU op on the CALLER stream via an in-place
-            # elementwise re-touch: it does a fenced/coherent CU READ of the
-            # SDMA-written bytes and re-writes them in the CU/L2 domain the
-            # consumer GEMM reads, stream-ordered so FSDP's recorded event
-            # captures it -- the same coherence _cu_copyout_finish gives the
-            # copy-out path, but WITHOUT a host stall (keeps overlap). add-by-0
-            # is bit-exact for bf16/fp16/fp32 (x rounds to itself) and ints.
+            # writes ``output`` with the intra SDMA gather (copy-engine domain) and
+            # has no CU re-touch (unlike the nodirect copy-out path, which routes
+            # through _cu_copyout_finish). The residual stale-read race is these big
+            # embed/lm_head cross-node AGs. Force the last writer of the consumed
+            # buffer to be a CU op on the caller stream via an in-place elementwise
+            # re-touch: a fenced/coherent CU read of the SDMA-written bytes rewritten
+            # in the CU/L2 domain the consumer GEMM reads, stream-ordered so FSDP's
+            # recorded event captures it -- the same coherence _cu_copyout_finish
+            # gives the copy-out path, without a host stall. add-by-0 is bit-exact
+            # for bf16/fp16/fp32 and ints.
             n = count * self.ranks_per_node * self.num_nodes
             out_flat = output_data.view(-1)[:n]
             cs = (
@@ -2255,17 +2136,15 @@ class HierAllGather:
             and not self._debug_sync
             and self._sync_big_mode in ("bwdbig", "bwdbigff")
         ):
-            # Selective host-drain, TIGHTER than SYNC_BIG=host. Ground-truth
-            # bisection (fwd [FP] bit-exact, bwd [GFP] diverges) exonerates the
-            # FORWARD big embed/lm_head AGs and every small per-layer AG -- only
-            # the BACKWARD re-unshard of the big AG races the consumer GEMM. So
-            # host-drain ONLY that call (FSDP runs the backward re-unshard with
-            # grad DISABLED => not is_grad_enabled()), and let the forward big AG
-            # + all small AGs keep the fast overlap. Same landing->consume
+            # Selective host-drain, tighter than SYNC_BIG=host. Only the backward
+            # re-unshard of the big embed/lm_head AG races the consumer GEMM;
+            # forward big AGs and every small per-layer AG are bit-exact without a
+            # drain. So host-drain only that call (FSDP runs the backward re-unshard
+            # with grad disabled => not is_grad_enabled()), and let the forward big
+            # AG + all small AGs keep the fast overlap. Same landing->consume
             # ordering the backward AG needs, half the big-AG host stalls of
-            # SYNC_BIG=host (drops the ~2 exonerated forward big-AG syncs/step).
-            # bwdbigff additionally fast-fills the forward big AG via fuse_local
-            # (toggled above); the backward host-drain is identical.
+            # SYNC_BIG=host. bwdbigff additionally fast-fills the forward big AG via
+            # fuse_local (toggled above); the backward host-drain is identical.
             if not torch.is_grad_enabled():
                 s = (
                     torch.cuda.current_stream(input_data.device)
@@ -2290,23 +2169,20 @@ class HierAllGather:
             ev.record(s)
             self._sync_big_prev_event = ev
         elif big_ag and not self._debug_sync and self._sync_big_mode == "deferhost":
-            # DEFERRED host-drain. The
-            # audit showed the ONLY E2E-bit-exact big-AG completion fence
-            # on this MI300X/mlx5 pair is a HOST CQ-drain (stream.synchronize);
-            # every device landing gate drifts. But draining AT ISSUE (SYNC_BIG=
-            # host, line below) stalls the CPU->GPU pipeline the moment the big
-            # embed/lm_head AG is enqueued -> the 0.71-0.73x floor. FSDP2 PREFETCHES
-            # the big AG far ahead of its consumer GEMM (it issues the all_gather on
-            # the comm stream, runs intervening compute, then calls Work.wait right
-            # before the copy-out+consume). So DEFER the one fence that works: record
-            # this big AG's completion event here (NO host stall at issue) and let the
-            # harness _HierWork.wait() host-drain that event at the natural consume
-            # point. Bit-exact BY CONSTRUCTION (the drain still completes strictly
-            # before the consumer reads the output), but the CPU stall is hidden
-            # behind the FSDP prefetch distance -> lifts the proven bit-exact base
-            # above the 0.73x at-issue floor. The event is stashed for the harness;
-            # if no harness Work waits on it, the next big AG's at-issue path (or a
-            # final drain) still orders it, so correctness never depends on the Work.
+            # Deferred host-drain. The only E2E-bit-exact big-AG completion fence on
+            # this MI300X/mlx5 pair is a host CQ-drain (stream.synchronize); every
+            # device landing gate drifts. Draining at issue (SYNC_BIG=host, below)
+            # stalls the CPU->GPU pipeline the moment the big embed/lm_head AG is
+            # enqueued. FSDP2 prefetches the big AG far ahead of its consumer GEMM
+            # (issues the all_gather on the comm stream, runs intervening compute,
+            # then calls Work.wait right before copy-out+consume). So defer the fence
+            # that works: record this big AG's completion event here (no host stall
+            # at issue) and let the harness _HierWork.wait() host-drain that event at
+            # the natural consume point. Bit-exact by construction (the drain
+            # completes strictly before the consumer reads the output), with the CPU
+            # stall hidden behind the FSDP prefetch distance. If no harness Work
+            # waits on the event, the next big AG's at-issue path (or a final drain)
+            # still orders it, so correctness never depends on the Work.
             s = (
                 torch.cuda.current_stream(input_data.device)
                 if stream is None
@@ -2317,16 +2193,15 @@ class HierAllGather:
             self._deferred_drain_event = ev
             self._deferred_drain_pending = True
         elif big_ag and not self._debug_sync and self._sync_big_mode == "deferbwd":
-            # DEFERBWD (committed-source deferhost landing fix): on the BACKWARD
-            # big AG (grad disabled), record ONE completion event AFTER the kernel
-            # and DO NOT sync here. The deferred consumer boundary drains it via
-            # drain_deferbwd() at copy-out, so the required host round-trip
-            # overlaps the backward GEMM and is paid at most once per step. The
-            # forward big AGs (exonerated) and all small AGs stay fully
-            # overlapped -- no event, no drain. Bit-exact by construction: the
-            # consumer host-waits on an event that completes only after this AG's
-            # kernel + copy-engine/NIC work land (same guarantee as hostbwd's
-            # inline s.synchronize(), just deferred + overlapped).
+            # deferbwd (committed-source deferhost landing fix): on the backward big
+            # AG (grad disabled), record one completion event after the kernel and
+            # do not sync here. The deferred consumer boundary drains it via
+            # drain_deferbwd() at copy-out, so the required host round-trip overlaps
+            # the backward GEMM and is paid at most once per step. The forward big
+            # AGs and all small AGs stay fully overlapped -- no event, no drain.
+            # Bit-exact by construction: the consumer host-waits on an event that
+            # completes only after this AG's kernel + copy-engine/NIC work land (same
+            # guarantee as hostbwd's inline s.synchronize(), just deferred).
             if not torch.is_grad_enabled():
                 s = (
                     torch.cuda.current_stream(input_data.device)
@@ -2337,15 +2212,13 @@ class HierAllGather:
                 ev.record(s)
                 self._deferbwd_event = ev
         elif big_ag and not self._debug_sync and self._sync_big_mode == "hostbwd":
-            # host-sync ONLY the BACKWARD big AGs. The residual landing->consume
-            # race lives on the
-            # BACKWARD re-unshard of the big embed/lm_head cross-node AG: a
-            # backward-only host stream.synchronize() gave BIT-EXACT grads while
-            # forward was exonerated. SYNC_BIG mode=host host-syncs EVERY big AG
-            # incl. forward, paying a host stall on forward big AGs that don't
-            # need it. This mode drains only when grad is disabled (autograd
-            # backward), so forward big AGs stay overlapped -- same determinism if
-            # the forward exoneration holds, strictly less host stall.
+            # host-sync only the backward big AGs. The residual landing->consume
+            # race lives on the backward re-unshard of the big embed/lm_head
+            # cross-node AG: a backward-only host stream.synchronize() gives
+            # bit-exact grads; forward is already bit-exact. SYNC_BIG mode=host
+            # host-syncs every big AG incl. forward, paying a host stall on forward
+            # big AGs that don't need it. This mode drains only when grad is disabled
+            # (autograd backward), so forward big AGs stay overlapped.
             if not torch.is_grad_enabled():
                 s = (
                     torch.cuda.current_stream(input_data.device)
@@ -2430,11 +2303,11 @@ class HierAllGather:
         N = self.num_nodes
         block_count = count * G
 
-        # M5: size-threshold dispatch. Engage the sliced 2-D path only
-        # for large per-rank payloads (where it wins); below the threshold the
-        # non-sliced fuse-barrier path is faster. On a path switch, conservatively
-        # keep the entry barrier (clear the clean-completion guard) since the two
-        # paths reuse the shared _intra/_inter buffers differently.
+        # Size-threshold dispatch. Engage the sliced 2-D path only for large
+        # per-rank payloads (where it wins); below the threshold the non-sliced
+        # fuse-barrier path is faster. On a path switch, conservatively keep the
+        # entry barrier (clear the clean-completion guard) since the two paths reuse
+        # the shared _intra/_inter buffers differently.
         byte_count = count * input_data.element_size()
         use_slice = self.slice_inter and (byte_count >= self.slice_min_bytes)
         # mid/small band (below slice_min) routes to the stream
@@ -2459,13 +2332,13 @@ class HierAllGather:
         self._last_use_slice = path_key
 
         if use_slice or use_pipe_band:
-            # M5: SLICED 2-D AllGather (the bandwidth lever; see __init__).
-            # Phase A (inter, RDMA ring): every rank rings ONLY its own shard
-            # (count) across its same-local-index peers {g, g+G, ...}. The ring
-            # gathers N chunks in node order into C_g; because slice_g(B_n) ==
-            # shard[n*G+g] == this rank's own input, C_g == [slice_g(B_0)..
-            # slice_g(B_{N-1})]. Per-NIC inter bytes = (N-1)*count (a G x cut vs
-            # the default G*count), spread across all G NICs (no leader funnel).
+            # Sliced 2-D AllGather (see __init__). Phase A (inter, RDMA ring):
+            # every rank rings only its own shard (count) across its
+            # same-local-index peers {g, g+G, ...}. The ring gathers N chunks in
+            # node order into C_g; because slice_g(B_n) == shard[n*G+g] == this
+            # rank's own input, C_g == [slice_g(B_0)..slice_g(B_{N-1})]. Per-NIC
+            # inter bytes = (N-1)*count (a G x cut vs the default G*count), spread
+            # across all G NICs (no leader funnel).
             slice_total = count * N
             if (
                 (self.slice_pipe_overlap or use_pipe_band)
@@ -2474,7 +2347,7 @@ class HierAllGather:
                 and not self.slice_overlap
                 and self.slice_pipe_chunks > 1
             ):
-                # M5: CHUNKED-RING PIPELINE OVERLAP (rule#1 payoff).
+                # Chunked-ring pipeline overlap.
                 # Split count into K element-range chunks. For each chunk k run the
                 # inter ring (main stream) into a DISJOINT region of the scratch,
                 # then launch chunk k's N reassembly gathers on a side SDMA stream
@@ -2525,7 +2398,7 @@ class HierAllGather:
                 # barrier-free (prepare_barrier=False), so this is NOT the
                 # concurrent-global-barrier race. Cross-chunk ring-buffer reuse is
                 # ordered by chunk k+1's prepare_stream global fence (defer is safe
-                # exactly as in the shipped non-chunked path).
+                # exactly as in the default non-chunked path).
                 sr = self.stream_ring
                 for k in range(K):
                     if chunk_sizes is not None:
@@ -2593,9 +2466,9 @@ class HierAllGather:
                 self._prev_op_completed = True
                 return True
             if self.slice_overlap and self.slice_fused and not self.slice_oop:
-                # M5: OVERLAP lever (c). Run the LOCAL node-block gather
-                # (m=node_id, reads this rank's own input == collection[node_id])
-                # on a side stream CONCURRENTLY with the inter ring (Phase A).
+                # Overlap the local node-block gather (m=node_id, reads this rank's
+                # own input == collection[node_id]) on a side stream concurrently
+                # with the inter ring (Phase A).
                 node = self.node_id
                 if self._overlap_stream is None:
                     self._overlap_stream = torch.cuda.Stream(device=input_data.device)
@@ -2658,9 +2531,9 @@ class HierAllGather:
                 self._prev_op_completed = True
                 return True
             if self.slice_oop:
-                # M5: run the ring out-in-place and read the collection
-                # straight from the (persistent) ring buffer -- no finish copy-OUT
-                # into a separate scratch. ``output_data`` is ignored in this mode.
+                # Run the ring out-in-place and read the collection straight from
+                # the (persistent) ring buffer -- no finish copy-OUT into a separate
+                # scratch. ``output_data`` is ignored in this mode.
                 self._inter(
                     input_data,
                     input_data,
@@ -2707,14 +2580,12 @@ class HierAllGather:
                             device=input_data.device,
                         )
                     collection = self._slice_scratch[:slice_total]
-                # when the direct-path local-block overlap is
-                # active, the ring is run INTERLEAVED inside Phase B (split into
-                # prepare_stream_only + kernel/finish so the local-block gather
-                # can overlap the ring kernel on a side stream). Skip the
-                # monolithic ring call here in that case.
-                # the FUSED path (fuse_local) likewise runs the
-                # ring inside Phase B (as part of the fused kernel launch), so it
-                # must ALSO skip the monolithic ring call here.
+                # When the direct-path local-block overlap is active, the ring runs
+                # interleaved inside Phase B (split into prepare_stream_only +
+                # kernel/finish so the local-block gather can overlap the ring
+                # kernel on a side stream), so skip the monolithic ring call here.
+                # The fused path (fuse_local) likewise runs the ring inside Phase B
+                # (as part of the fused kernel launch), so it must also skip it.
                 overlap_active = (
                     (self.slice_direct_overlap or self.fuse_local)
                     and self.slice_direct
@@ -2738,22 +2609,20 @@ class HierAllGather:
             # output[m*block:(m+1)*block]; the SDMA gather concatenates by
             # group_pos=local_rank => output == concat_m B_m == rank-major.
             if self.slice_fused:
-                # M5: fold the N gathers into ONE batch -- stack each into
-                # a DISJOINT region [m*block, (m+1)*block) of the enlarged transit
+                # Fold the N gathers into one batch -- stack each into a disjoint
+                # region [m*block, (m+1)*block) of the enlarged transit
                 # (dst_base_offset = m*block_count), drop the per-gather finish
-                # barrier/copy, then ONE bulk copy-OUT. Keep only the m==0 entry
-                # barrier and the final exit barrier (2 barriers vs 2N).
-                # M5: the inter ring's finish barrier (run just above)
-                # already synchronizes all PEs, so the m==0 entry barrier is
-                # redundant -- drop it when slice_fuse_ib (default). Keep it only
-                # if explicitly disabled (A/B / safety fallback).
+                # barrier/copy, then one bulk copy-OUT. Keep only the m==0 entry
+                # barrier and the final exit barrier (2 barriers vs 2N). The inter
+                # ring's finish barrier (run just above) already synchronizes all
+                # PEs, so the m==0 entry barrier is redundant -- drop it when
+                # slice_fuse_ib (default); keep it only if explicitly disabled.
                 entry_barrier = (not self.slice_fuse_ib) or self.phaseb_entry_barrier
                 if self.slice_pipe and self.slice_pipe_chunks > 1:
-                    # M5: CHUNKED (strided) Phase-B. Split each block's
-                    # reassembly gather into K element-range chunks; chunk j of
-                    # peer g lands at m*block + g*count + j*ck via slot stride =
-                    # count (the full slice). Byte-identical to the unchunked
-                    # gather (this turn: correctness only, no ring overlap yet).
+                    # Chunked (strided) Phase-B. Split each block's reassembly gather
+                    # into K element-range chunks; chunk j of peer g lands at
+                    # m*block + g*count + j*ck via slot stride = count (the full
+                    # slice). Byte-identical to the unchunked gather.
                     K = self.slice_pipe_chunks
                     base_ck = count // K
                     first = True
@@ -2777,15 +2646,14 @@ class HierAllGather:
                         output_data, N * block_count, stream=stream, barrier=True
                     )
                 elif self.slice_direct and self.stream_intra and self.stream_ring:
-                    # DIRECT-TO-OUTPUT Phase B. Register the
-                    # user output once (collective, cached) then PUSH each
-                    # node-block's slices straight into output[m*block:] -- no
-                    # internal transit, no full-output copy-OUT. Only a single
-                    # global fence completes the op (deferrable like the
-                    # copy-OUT path).
-                    # LOCKSTEP single-registration. Register the
-                    # user output collectively ONLY on an exact (ptr,size) change,
-                    # deregistering the previous one first so the C++ map holds at
+                    # Direct-to-output Phase B. Register the user output once
+                    # (collective, cached) then push each node-block's slices
+                    # straight into output[m*block:] -- no internal transit, no
+                    # full-output copy-OUT. Only a single global fence completes the
+                    # op (deferrable like the copy-OUT path).
+                    # Lockstep single-registration: register the user output
+                    # collectively only on an exact (ptr,size) change, deregistering
+                    # the previous one first so the C++ map holds at
                     # most one entry and never runs its (potentially per-rank
                     # divergent) overlap-eviction. Steady state (same output reused
                     # op-to-op) skips the collective entirely; a buffer change runs
@@ -2797,12 +2665,12 @@ class HierAllGather:
                         and not entry_barrier
                         and not self.slice_oop
                     ):
-                        # PHASE 4 PIPELINE: one fused launch runs the ring AND,
-                        # per landed sub-range, the remote-block SDMA reassembly
-                        # straight from this PE's ring buffer into the registered
-                        # output (no ring copy-OUT, no whole-phase finish barrier).
-                        # The remote gather of sub-range j overlaps ring channel
-                        # j+1 still crossing the NIC -- fuses the two serial phases.
+                        # Fused-remote pipeline: one launch runs the ring and, per
+                        # landed sub-range, the remote-block SDMA reassembly straight
+                        # from this PE's ring buffer into the registered output (no
+                        # ring copy-OUT, no whole-phase finish barrier). The remote
+                        # gather of sub-range j overlaps ring channel j+1 still
+                        # crossing the NIC, fusing the two serial phases.
                         from .collective import launch_fused_ring_remote_gather
 
                         node = self.node_id
@@ -2817,20 +2685,18 @@ class HierAllGather:
                         # ring under the intra reassembly). The optimum tracks a
                         # roughly fixed per-PE sub-chunk size, so a single fixed depth
                         # loses at one end. MORI_HIER_DEEP_PIPE=auto picks depth =
-                        # round(perPE_bytes / SUBBYTES) so every size rides its own
-                        # optimum. An explicit integer keeps the exact prior behavior.
-                        # Default depth 2 matches the C++ HierDeepPipe() default; the
-                        # 32MB per-sub-chunk gate below self-cages the giant AG to the
-                        # crown fence so depth 2 stays E2E bit-exact with no explicit
-                        # env.
+                        # round(perPE_bytes / SUBBYTES); an explicit integer keeps the
+                        # exact prior behavior. Default depth 2 matches the C++
+                        # HierDeepPipe() default; the 32MB per-sub-chunk gate below
+                        # self-cages the giant AG to the depth-1 fence so depth 2 stays
+                        # E2E bit-exact with no explicit env.
                         _dp_raw = os.environ.get("MORI_HIER_DEEP_PIPE", "2").strip()
                         if _dp_raw.lower() == "auto":
-                            # 16MiB sub-chunk target (must match the C++
-                            # HierDeepPipeSubBytes default): count*elsz is this PE's
-                            # chunk, the same per-PE quantity the kernel gates on, so
-                            # both selectors compute the identical depth and the flag
-                            # buffer sized here holds exactly the kernel's sub-chunk
-                            # count. 16MiB beats 8MiB on the mid-buffer path and stays
+                            # Sub-chunk target (must match the C++ HierDeepPipeSubBytes
+                            # default): count*elsz is this PE's chunk, the same per-PE
+                            # quantity the kernel gates on, so both selectors compute
+                            # the identical depth and the flag buffer sized here holds
+                            # exactly the kernel's sub-chunk count. The default stays
                             # under the 32MB coherence window. Only reached on
                             # DEEP_PIPE=auto.
                             _dp_sub_target = int(
@@ -2857,28 +2723,23 @@ class HierAllGather:
                         # AG. With DEEP_PIPE>1 and no explicit
                         # MORI_HIER_DEEP_PIPE_MAXBYTES, default the gate to 32MB so
                         # DEEP_PIPE=2 alone stays E2E bit-exact (giant AG falls to the
-                        # crown fence). DEEP_PIPE=1 => whole block inert.
-                        # Gate on the PER-SUB-CHUNK coherence window (chunkBytes/P),
-                        # not the total chunk: DEEP_PIPE=4 stays engaged on the
-                        # 34-67MB steady-state decoder AGs (sub-chunks 8.5-16.75MB,
-                        # under the 32MB window) while the 466MB giant AG (116MB
-                        # sub-chunk) falls to the crown fence. Strict '<' cages a
-                        # 32MB sub-chunk (64MB@P2). Mirrors the C++ HierDeepPipe gate.
+                        # depth-1 fence). DEEP_PIPE=1 => whole block inert.
+                        # Gate on the per-sub-chunk coherence window (chunkBytes/P),
+                        # not the total chunk: DEEP_PIPE stays engaged on the
+                        # steady-state decoder AGs (sub-chunks under the 32MB window)
+                        # while the giant AG falls to the depth-1 fence. Strict '<'
+                        # cages a 32MB sub-chunk. Mirrors the C++ HierDeepPipe gate.
                         _dp_chunk_bytes = int(count) * int(input_data.element_size())
                         # Sub-chunk NIC-fill floor: DEEP_PIPE>1 splits the per-PE ring
                         # shard into P temporal sub-chunks; at small per-PE sizes a
                         # deep P makes each sub-chunk too small to fill the mlx5 NIC
-                        # DMA, so the ratio tracks sub-chunk size (sub-chunks >=8MiB
-                        # win, smaller ones under-fill the NIC). Cap the effective
-                        # depth so each temporal sub-chunk stays >= MINBYTES: large
-                        # buffers keep their winning depth (sub already >= floor) while
-                        # small buffers auto-drop to the deeper-filling depth. This is
-                        # a per-QP NIC-fill lever, not a concurrency/overlap axis.
+                        # DMA. Cap the effective depth so each temporal sub-chunk stays
+                        # >= MINBYTES: large buffers keep their depth (sub already >=
+                        # floor) while small buffers drop to the deeper-filling depth.
+                        # A per-QP NIC-fill lever, not a concurrency/overlap axis.
                         # Bit-exact by construction: a smaller depth pipelines the same
-                        # bytes in the same RC order. Default 0=OFF; the shipped path
-                        # (DEEP_PIPE=1) never enters this block. Note this floor helps
-                        # only where the residual is sub-chunk-fill bound, not where it
-                        # is fixed-cost bound.
+                        # bytes in the same RC order. Default 0=OFF; the default path
+                        # (DEEP_PIPE=1) never enters this block.
                         _dp_floor = int(
                             os.environ.get("MORI_HIER_DEEP_PIPE_MINBYTES", "0")
                         )
@@ -2886,27 +2747,23 @@ class HierAllGather:
                             _dp_max_depth = max(1, _dp_chunk_bytes // _dp_floor)
                             if _deep_pipe > _dp_max_depth:
                                 _deep_pipe = _dp_max_depth
-                        # MID-BUFFER PIPE-ENGAGE FLOOR (world=16):
-                        # at world=16 the per-PE ring shard is total/16, so for total
-                        # 32/64/128MB the per-PE chunk is only 2/4/8MB. The auto
-                        # subtarget (8MB) then rounds the pipe depth to 1 => the whole
-                        # DEEP_PIPE block is INERT and the inter NIC fill runs strictly
-                        # SERIAL before the intra XGMI reassembly (no overlap partner),
-                        # which is exactly the measured w16 mid-buffer ratio floor
-                        # (32/64/128MB = 0.75/0.79/0.81x) vs 256/512MB (which DO
-                        # pipeline) at ~0.88x. MORI_HIER_DP_MIN_DEPTH forces a minimum
-                        # temporal depth so those mid buffers pipeline: while a
-                        # sub-chunk crosses the NIC the prior sub-chunk's already-landed
-                        # bytes reassemble over XGMI. Capped so each sub-chunk stays
-                        # >= 16B (aligned split) and <= the 16 clamp; the MAXBYTES
-                        # coherence gate below still fires (raising depth only SHRINKS
-                        # the sub-chunk, moving it further inside the landing window).
-                        # Bit-exact BY CONSTRUCTION: a deeper valid depth pipelines the
-                        # SAME bytes in the SAME per-peer RC order, all sub-chunks
-                        # drained before the completion flag (identical argument to the
-                        # MINBYTES floor cap above, and B's per-size DP2/4/8/16 are each
-                        # independently bit-exact). Default 1 => OFF => byte-identical
-                        # shipped path (block already skipped at DEEP_PIPE=1).
+                        # Mid-buffer pipe-engage floor. At larger world sizes the
+                        # per-PE ring shard is total/world, so mid-total buffers give
+                        # a per-PE chunk small enough that the auto subtarget rounds
+                        # the pipe depth to 1 -- the whole DEEP_PIPE block goes inert
+                        # and the inter NIC fill runs strictly serial before the intra
+                        # XGMI reassembly (no overlap partner). MORI_HIER_DP_MIN_DEPTH
+                        # forces a minimum temporal depth so those mid buffers
+                        # pipeline: while a sub-chunk crosses the NIC the prior
+                        # sub-chunk's already-landed bytes reassemble over XGMI. Capped
+                        # so each sub-chunk stays >= 16B (aligned split) and <= the 16
+                        # clamp; the MAXBYTES coherence gate below still fires (raising
+                        # depth only shrinks the sub-chunk, moving it further inside
+                        # the landing window). Bit-exact by construction: a deeper
+                        # valid depth pipelines the same bytes in the same per-peer RC
+                        # order, all sub-chunks drained before the completion flag.
+                        # Default 1 => OFF => byte-identical default path (block
+                        # already skipped at DEEP_PIPE=1).
                         _dp_min_depth = int(
                             os.environ.get("MORI_HIER_DP_MIN_DEPTH", "1")
                         )
@@ -2931,24 +2788,20 @@ class HierAllGather:
                             and _dp_sub_bytes >= _dp_window
                         ):
                             _deep_pipe = 1
-                        # PER-PE TOTAL FLOOR: mirror the C++
-                        # HierDeepPipeMinBytes gate (MORI_HIER_DEEP_PIPE_MIN_MB,
-                        # commit 83368b34) in the Python landing-flag selector. The
-                        # kernel drops deepPipe->1 for any PER-PE chunk BELOW the
-                        # floor -- that floor is the LOW edge of the w16 [MIN,MAX]
-                        # window that cages the 32/64MB small-buffer deep-pipe HANG
-                        # (T9) and pins the pipeline to the mid-buffer band where it
-                        # wins. But Python sized _flag_slots from the PRE-floor depth
-                        # (auto/min_depth), so a caged small chunk still allocated the
-                        # deeper sub-chunk landing budget the kernel never publishes to
-                        # -- a stale-slot layout the carryover fix has to churn
-                        # over on every distinct size. Snap the Python depth to the
-                        # SAME per-PE floor so _flag_slots == the kernel's gated depth
-                        # exactly across the whole [MIN,MAX] window. Down-only (floor
-                        # can only cage to depth 1, the plain path) => bit-exact BY
-                        # CONSTRUCTION (a caged chunk takes the identical deepPipe<=1
-                        # code path the kernel takes). Default 0 => no floor =>
-                        # byte-identical shipped path (matches the C++ default).
+                        # Per-PE total floor: mirror the C++ HierDeepPipeMinBytes
+                        # gate (MORI_HIER_DEEP_PIPE_MIN_MB) in the Python landing-flag
+                        # selector. The kernel drops deepPipe->1 for any per-PE chunk
+                        # below the floor; that floor is the low edge of the [MIN,MAX]
+                        # window that cages the small-buffer deep-pipe hang and pins
+                        # the pipeline to the mid-buffer band where it wins. Python
+                        # sized _flag_slots from the pre-floor depth (auto/min_depth),
+                        # so a caged small chunk would allocate a deeper sub-chunk
+                        # landing budget the kernel never publishes to -- a stale-slot
+                        # layout. Snap the Python depth to the same per-PE floor so
+                        # _flag_slots == the kernel's gated depth across the whole
+                        # [MIN,MAX] window. Down-only (floor can only cage to depth 1),
+                        # so bit-exact by construction. Default 0 => no floor =>
+                        # byte-identical default path (matches the C++ default).
                         _dp_floor_mb = int(
                             os.environ.get("MORI_HIER_DEEP_PIPE_MIN_MB", "0")
                         )
@@ -2968,21 +2821,18 @@ class HierAllGather:
                             _sw = min(int(self.inter_num_qp), 8)
                             if _sw > _flag_slots:
                                 _flag_slots = _sw
-                        # CROSS-SIZE CARRYOVER FIX: the
-                        # persistent chunk-landing flag buffer must be reallocated
-                        # on a LAYOUT change (per-PE count / slots / pipe depth),
-                        # not only when it needs to GROW. Reusing one buffer across
-                        # two DIFFERENT DEEP_PIPE sizes in a single process (the UT
-                        # sweep drives all sizes through ONE handle) left stale
-                        # per-sub-chunk landing state that made the 2nd distinct
-                        # size bit-exact MISMATCH (32MB ok -> 64MB fail) even though
-                        # every size ISOLATED is clean and DEEP_PIPE=1 sweeps clean
-                        # across sizes -- localizing the carryover to exactly this
-                        # DP flag path. A fresh zeroed buffer per distinct layout
-                        # (tiny, <=16 u64) removes it; SAME-size steady state (E2E
-                        # decoder AGs, bench reps) still reuses + zeros with no
-                        # per-call alloc, and DEEP_PIPE=1 (shipped default) never
-                        # enters this block so the default path stays byte-identical.
+                        # Cross-size carryover fix: the persistent chunk-landing flag
+                        # buffer must be reallocated on a layout change (per-PE count
+                        # / slots / pipe depth), not only when it needs to grow.
+                        # Reusing one buffer across two different DEEP_PIPE sizes in a
+                        # single process (the UT sweep drives all sizes through one
+                        # handle) leaves stale per-sub-chunk landing state that makes
+                        # the 2nd distinct size bit-exact mismatch, even though every
+                        # size isolated is clean. A fresh zeroed buffer per distinct
+                        # layout (tiny, <=16 u64) removes it; same-size steady state
+                        # still reuses + zeros with no per-call alloc, and DEEP_PIPE=1
+                        # (default) never enters this block so the default path stays
+                        # byte-identical.
                         _dp_layout = (_flag_slots, int(count), _deep_pipe)
                         if (
                             self._chunk_ready_flags is None
@@ -2999,7 +2849,7 @@ class HierAllGather:
                         # supersedes stale slots); a fresh re-alloc above is still
                         # zeroed so gen starts clean. Legacy mode zeroes every op.
                         if self._flag_token_dev:
-                            # DEVICE flag-token: the crown overrides opGen with the
+                            # Device flag-token: the kernel overrides opGen with the
                             # device parity counter (graph-safe); host only skips the
                             # reset so the flags accumulate. Pass op_gen=0 (ignored by
                             # the kernel once flagGenDev fires).
@@ -3051,11 +2901,11 @@ class HierAllGather:
                             stream=stream,
                             prepare_barrier=False,
                         )
-                        # PHASE 4 (deadlock-free push-only reassembly): the remote
-                        # blocks are now PUSH-ONLY (each rank writes its own column
-                        # into disjoint output slots, no cross-rank wait) with a
-                        # single completion reader in the local-block CTA, so
-                        # reasm>1 no longer dead-locks. Each reassembly block j uses
+                        # Deadlock-free push-only reassembly: the remote blocks are
+                        # push-only (each rank writes its own column into disjoint
+                        # output slots, no cross-rank wait) with a single completion
+                        # reader in the local-block CTA, so reasm>1 does not deadlock.
+                        # Each reassembly block j uses
                         # SDMA queue qId=j, so to avoid racing the per-queue signal
                         # counter reasm MUST be <= the peer's SDMA queue count
                         # (sdmaNumQueue, default 2). Clamp accordingly. Flags use
@@ -3129,7 +2979,7 @@ class HierAllGather:
                             # inter), reassembly workers spin on chunkReadyFlags.
                             # The host proxy RDMA-writes this PE's ring chunk into
                             # the partner's ring buffer, drains its send-CQ (the
-                            # proven landing fence), rail-pair barriers, then
+                            # landing fence), rail-pair barriers, then
                             # publishes chunkReadyFlags[f] so the reassembly runs.
                             chunk_bytes = count * input_data.element_size()
                             _hp_async = _env_true("MORI_HIER_HOSTPROXY_ASYNC", "0")
@@ -3157,20 +3007,18 @@ class HierAllGather:
                         # Standalone finish-barrier deferral: at ranks_per_node>=8 the
                         # fused path is forced slice_defer_fin=False (dense-node E2E
                         # drifts without the two finish fences), so it issues a global
-                        # cross-node ShmemBarrierOnStream every op -- one of two per-op
-                        # barriers (the other is prepare_stream_only's entry fence). The
-                        # device completion reader (the bx==rb CTA) has already spun
-                        # until every remote push landed in this PE's output plus
+                        # cross-node ShmemBarrierOnStream every op. The device
+                        # completion reader (the bx==rb CTA) has already spun until
+                        # every remote push landed in this PE's output plus
                         # __threadfence_system, so this PE's output is stream-correct
                         # without the finish barrier. The finish barrier only adds
                         # cross-PE ring-buffer reuse safety for the next op, and the
                         # successor op's prepare_stream entry barrier (always global,
                         # before any copy-IN / peer RDMA put) already provides that
-                        # ordering. The last op has no successor and reuses nothing.
-                        # So deferring this finish barrier drops the per-op barrier
-                        # count from 2 to 1 with byte-identical output. Gated on
-                        # standalone_fast only; no FSDP/E2E caller passes it, so the
-                        # dense-node E2E finish fences are untouched. Default OFF; set
+                        # ordering; the last op has no successor and reuses nothing. So
+                        # deferring drops the per-op barrier count from 2 to 1 with
+                        # byte-identical output. Gated on standalone_fast only; no
+                        # FSDP/E2E caller passes it. Default OFF; set
                         # MORI_HIER_STANDALONE_DEFER_FIN=1 to defer.
                         _crown_fin_barrier = not self.slice_defer_fin
                         if self._standalone_defer_fin:
@@ -3178,17 +3026,15 @@ class HierAllGather:
                         self._intra.finish_direct_stream(
                             stream=stream, barrier=_crown_fin_barrier
                         )
-                        # CU-COHERENT COPY-OUT (MORI_HIER_FUSE_REMOTE_RETOUCH):
-                        # the fused kernel lands every peer's SDMA push into the
-                        # output (per-queue SdmaQueitThread + threadfence + flag,
-                        # waited by the completion reader) -- fabric-coherent in HBM
-                        # but the consumer GEMM may read a STALE L2 line for the
-                        # reused FSDP output buffer (the +0.018 E2E drift). Republish
-                        # with a FULL-GRID volatile-glc re-touch (bypass stale L2,
-                        # fetch fresh HBM, store back) AFTER the completion fence, so
-                        # it is stream-ordered behind the landing and runs on all
-                        # CUs (fast, not the thread-starved in-kernel pass). No host
-                        # stall. Default OFF (byte-identical shipped path).
+                        # CU-coherent copy-out (MORI_HIER_FUSE_REMOTE_RETOUCH): the
+                        # fused kernel lands every peer's SDMA push into the output
+                        # (per-queue SdmaQuietThread + threadfence + flag, waited by
+                        # the completion reader) -- fabric-coherent in HBM, but the
+                        # consumer GEMM may read a stale L2 line for the reused FSDP
+                        # output buffer. Republish with a full-grid volatile-glc
+                        # re-touch (bypass stale L2, fetch fresh HBM, store back) after
+                        # the completion fence, stream-ordered behind the landing and
+                        # running on all CUs. No host stall. Default OFF.
                         if os.environ.get(
                             "MORI_HIER_FUSE_REMOTE_RETOUCH", "0"
                         ).strip().lower() in ("1", "true", "yes", "on"):
@@ -3204,19 +3050,17 @@ class HierAllGather:
                                 output_data.data_ptr(), _u32, _stream_to_int(stream)
                             )
                     elif self.fuse_local and not entry_barrier and not self.slice_oop:
-                        # FUSED ring || local-block gather in ONE
-                        # kernel launch (NIC ring blocks [0,num_blocks) || XGMI
-                        # local-block SDMA gather in the last block). Replaces the
-                        # slice_direct_overlap path's two launches + side-stream
-                        # wait_stream merge with a single concurrent grid -- the
-                        # RCCL-parity lever this work proved (>= RCCL @>=32MiB),
-                        # adopted. The ring's prepare_stream barrier is
-                        # the sole global entry fence; the local gather runs
-                        # barrier-free (prepare_barrier=False), reading only this
-                        # rank's own input (no ring dependency) and pushing block
-                        # node_id straight into the registered output. The REMOTE
-                        # blocks (which DO depend on the ring) still follow as
-                        # separate direct gathers after the ring copy-OUT.
+                        # Fused ring || local-block gather in one kernel launch (NIC
+                        # ring blocks [0,num_blocks) || XGMI local-block SDMA gather
+                        # in the last block). Replaces the slice_direct_overlap path's
+                        # two launches + side-stream wait_stream merge with a single
+                        # concurrent grid. The ring's prepare_stream barrier is the
+                        # sole global entry fence; the local gather runs barrier-free
+                        # (prepare_barrier=False), reading only this rank's own input
+                        # (no ring dependency) and pushing block node_id straight into
+                        # the registered output. The remote blocks (which depend on
+                        # the ring) still follow as separate direct gathers after the
+                        # ring copy-OUT.
                         from .collective import launch_fused_ring_local_gather
 
                         node = self.node_id
@@ -3257,51 +3101,33 @@ class HierAllGather:
                         launch_fused_ring_local_gather(
                             ring_args, gather_args, self._inter.num_blocks, s_main
                         )
-                        # Ring finish copy-OUT into the collection scratch (the
-                        # ring kernel already ran inside the fused launch -- do NOT
-                        # relaunch it). RED-LINE: force the COPY-ENGINE finish (not
-                        # the CU RingFinishCopyKernel) so the fuse_local win path
-                        # never moves bulk all-gather bytes on CUs -- the fused
-                        # overlap ALONE beats RCCL bit-exact with the copy-engine
-                        # finish, so the CU copy is pure red-line
-                        # cost with ~1% BW upside. MORI_HIER_RING_CU_COPYOUT can
-                        # still force CU for an explicit A/B, but default stays SDMA.
+                        # Ring finish copy-OUT into the collection scratch (the ring
+                        # kernel already ran inside the fused launch -- do not
+                        # relaunch it). Force the copy-engine finish (not the CU
+                        # RingFinishCopyKernel) so the fuse_local path never moves
+                        # bulk all-gather bytes on CUs. MORI_HIER_RING_CU_COPYOUT can
+                        # force CU, but the default stays SDMA.
                         _fl_cu = os.environ.get(
                             "MORI_HIER_RING_CU_COPYOUT", "0"
                         ).strip().lower() in ("1", "true", "yes", "on")
-                        # PHASE 4 E2E-COHERENCE lever (MORI_HIER_FUSE_LOCAL_NOCOPY):
-                        # the finish_ring_stream copy-OUT is a COPY-ENGINE (SDMA)
-                        # D2D read of the ring buffer. This
-                        # copy-engine read is the fuse_local E2E stale-remote race:
-                        # the ring CTA lands the remote half via NIC RDMA and does a
-                        # CU-scope __threadfence_system, but the copy engine is a
-                        # SEPARATE hw agent NOT ordered by that fence, so its D2D
-                        # can drain STALE remote-half ring bytes into ``collection``,
-                        # which the reassembly then propagates. This lever DROPS the
-                        # copy-OUT entirely and points the remote reassembly SDMA
-                        # read straight at the ring buffer (full_tensor view) -- one
-                        # fewer cross-agent hop, no copy-engine D2D of bulk bytes,
-                        # AND a saved ~(N-1)/N copy-out (BW upside). Byte-identical by
-                        # construction: ring slot m == collection[m]. Default OFF for
-                        # A/B; keeps bulk bytes on SDMA (red-line safe).
-                        # COPY-OUT ELIMINATION on the standalone crown:
-                        # the finish_ring_stream copy-OUT is a copy-engine D2D of
-                        # (N-1)/N of a node-block PLUS its own kernel launch --
-                        # part of the ~0.28ms FIXED per-op cost that is the
-                        # SOLE remaining UT ratio residual (marginal fill already
-                        # == RCCL). NOCOPY drops that copy-OUT and points the remote
-                        # reassembly SDMA read straight at the ring buffer (ring slot
-                        # m == collection[m], byte-identical by construction); the
-                        # trailing finish_direct_stream + the intra entry barrier on
-                        # the first remote gather (default ON) KEEP the landing fence
-                        # (same-stream ordering completes the fused ring CTA before the
-                        # remote gather reads, __threadfence_system makes the NIC half
-                        # visible). This is the mission "copy-out elimination that
-                        # KEEPS the landing fence" lever. Auto-ON for standalone_fast
-                        # ONLY (the UT gate, no cross-PE tight reuse => the E2E
-                        # stale-remote race documented above never triggers); every
-                        # FSDP/E2E caller omits standalone_fast => byte-identical,
-                        # default OFF there. Env still overrides either way.
+                        # Copy-out elimination (MORI_HIER_FUSE_LOCAL_NOCOPY): the
+                        # finish_ring_stream copy-OUT is a copy-engine (SDMA) D2D read
+                        # of the ring buffer. That copy-engine read is the fuse_local
+                        # E2E stale-remote race: the ring CTA lands the remote half via
+                        # NIC RDMA and does a CU-scope __threadfence_system, but the
+                        # copy engine is a separate hw agent not ordered by that fence,
+                        # so its D2D can drain stale remote-half ring bytes into
+                        # ``collection``, which the reassembly then propagates. This
+                        # lever drops the copy-OUT and points the remote reassembly
+                        # SDMA read straight at the ring buffer (full_tensor view) --
+                        # one fewer cross-agent hop and a saved ~(N-1)/N copy-out.
+                        # Byte-identical by construction: ring slot m == collection[m].
+                        # The trailing finish_direct_stream + the intra entry barrier
+                        # on the first remote gather (default ON) keep the landing
+                        # fence. Auto-ON for standalone_fast only (no cross-PE tight
+                        # reuse, so the stale-remote race never triggers); every
+                        # FSDP/E2E caller omits standalone_fast => default OFF there.
+                        # Env still overrides either way.
                         _fl_nocopy_env = os.environ.get("MORI_HIER_FUSE_LOCAL_NOCOPY")
                         if _fl_nocopy_env is not None:
                             _fl_nocopy = _fl_nocopy_env.strip().lower() in (
@@ -3331,33 +3157,29 @@ class HierAllGather:
                                 cu_copyout=_fl_cu,
                             )
                         # Remaining (remote) blocks read the ring collection.
-                        # PHASE 4 E2E-SAFETY: the remote reassembly is an INTRA-node
-                        # subgroup gather -- each local rank SDMA-pushes its OWN
-                        # collection[m] slice to the G local peers over XGMI. That
-                        # slice was produced by THIS rank's finish_ring_stream copy-
-                        # OUT of the ring buffer. Under FSDP tight back-to-back reuse
-                        # a peer rank's gather can read our collection over XGMI
-                        # BEFORE our copy-OUT (and the concurrently-launched fused
-                        # ring CTA's remote-half landing) is globally visible -> the
-                        # documented ~48% stale-remote-half loss race that keeps
-                        # fuse_local default-OFF. The general fix (phaseb_entry_barrier)
-                        # is a FULL global ShmemBarrierOnStream (NIC quiet-drain +
-                        # inter-node all-to-all) and is coded mutually-exclusive with
-                        # fuse_local. But the dependency here is purely INTRA-node
-                        # (Phase-B reads only same-node peers' collection), so a
-                        # single INTRA-node subgroup entry barrier on the first remote
-                        # gather strictly orders every local rank's ring copy-OUT
-                        # BEFORE any peer reads it -- on-device, XGMI-scope only, NO
-                        # NIC quiet-drain, NO inter-node barrier. Cheap (G ranks) vs
-                        # the global fence, so fuse_local keeps its ~200 GB/s while
-                        # becoming E2E bit-exact. Set MORI_HIER_FUSE_LOCAL_INTRA_BAR=0
-                        # to A/B (restores the racy no-barrier path).
+                        # The remote reassembly is an intra-node subgroup gather --
+                        # each local rank SDMA-pushes its own collection[m] slice to
+                        # the G local peers over XGMI. That slice was produced by this
+                        # rank's finish_ring_stream copy-OUT of the ring buffer. Under
+                        # FSDP tight back-to-back reuse a peer rank's gather can read
+                        # our collection over XGMI before our copy-OUT (and the
+                        # concurrently-launched fused ring CTA's remote-half landing)
+                        # is globally visible -- the stale-remote-half race that keeps
+                        # fuse_local default-OFF. phaseb_entry_barrier (a full global
+                        # ShmemBarrierOnStream) is mutually exclusive with fuse_local,
+                        # but the dependency here is purely intra-node (Phase-B reads
+                        # only same-node peers' collection), so a single intra-node
+                        # subgroup entry barrier on the first remote gather strictly
+                        # orders every local rank's ring copy-OUT before any peer reads
+                        # it -- on-device, XGMI-scope only, no NIC quiet-drain, no
+                        # inter-node barrier. Set MORI_HIER_FUSE_LOCAL_INTRA_BAR=0 to
+                        # restore the racy no-barrier path.
                         _fl_intra_bar = _env_true("MORI_HIER_FUSE_LOCAL_INTRA_BAR", "1")
                         remotes = [m for m in range(N) if m != node]
                         if self.reasm_streams > 1 and len(remotes) > 1:
-                            # MULTI-STREAM the N-1 remote reassembly gathers
-                            # (disjoint output blocks; entry barrier on the first,
-                            # which runs on main so side lanes observe it).
+                            # Multi-stream the N-1 remote reassembly gathers (disjoint
+                            # output blocks; entry barrier on the first, which runs on
+                            # main so side lanes observe it).
                             main = (
                                 torch.cuda.current_stream(input_data.device)
                                 if stream is None
@@ -3405,11 +3227,11 @@ class HierAllGather:
                         and not entry_barrier
                         and not self.slice_oop
                     ):
-                        # overlap the LOCAL node-block (m=node_id)
-                        # reassembly gather (reads only this rank's own input, no
-                        # ring dependency) on a side stream concurrently with the
-                        # inter ring kernel. The ring's prepare_stream barrier is
-                        # the sole global entry fence (see __init__).
+                        # Overlap the local node-block (m=node_id) reassembly gather
+                        # (reads only this rank's own input, no ring dependency) on a
+                        # side stream concurrently with the inter ring kernel. The
+                        # ring's prepare_stream barrier is the sole global entry fence
+                        # (see __init__).
                         node = self.node_id
                         if self._overlap_stream is None:
                             self._overlap_stream = torch.cuda.Stream(
@@ -3462,7 +3284,7 @@ class HierAllGather:
                             stream=stream, barrier=not self.slice_defer_fin
                         )
                     elif self.reasm_streams > 1 and N > 1:
-                        # MULTI-STREAM the N disjoint reassembly gathers.
+                        # Multi-stream the N disjoint reassembly gathers.
                         main = (
                             torch.cuda.current_stream(input_data.device)
                             if stream is None
@@ -3545,10 +3367,10 @@ class HierAllGather:
             self._prev_op_completed = True
             return True
 
-        # M4 (/32): fuse-barrier also drops the intra-gather ENTRY barrier
-        # on the every-rank-direct path, but ONLY when the PRIOR op completed
-        # cleanly (its inter-finish barrier freed every peer's out_). The first op,
-        # and any op following a mid-pipeline crash, keep the barrier (see __init__).
+        # fuse-barrier also drops the intra-gather entry barrier on the
+        # every-rank-direct path, but only when the prior op completed cleanly (its
+        # inter-finish barrier freed every peer's out_). The first op, and any op
+        # following a mid-pipeline crash, keep the barrier (see __init__).
         prev_op_completed = self._prev_op_completed
         # Cleared until THIS op finishes; any exception below leaves it False so the
         # next op conservatively keeps the entry barrier.
@@ -3558,7 +3380,7 @@ class HierAllGather:
         )
 
         if not self.leader_only and self.gather_in_place:
-            # gather_in_place (opt-in): write the intra-gather node-block DIRECTLY
+            # gather_in_place (opt-in): write the intra-gather node-block directly
             # into this PE's inter-ring slot and run the ring with
             # chunk_in_place=True, removing the prepare_sync copy-IN and the
             # separate node_block intermediate. Perf-neutral vs the staged default
@@ -3568,9 +3390,9 @@ class HierAllGather:
             node_block = self._inter.slot_tensor(
                 block_count, input_data.dtype, input_data.device
             )
-            # fuse_barrier: the inter ring's prepare_sync_in_place
-            # ShmemBarrierAll follows immediately, covering the dropped barrier.
-            #: also drop the entry barrier from the 2nd op onward.
+            # fuse_barrier: the inter ring's prepare_sync_in_place ShmemBarrierAll
+            # follows immediately, covering the dropped barrier; also drop the entry
+            # barrier from the 2nd op onward.
             self._intra(
                 input_data,
                 node_block,
@@ -3582,9 +3404,9 @@ class HierAllGather:
             # Phase 2 (inter, RDMA ring): all-gather the N node-blocks across
             # nodes, laid down in node order -> the full rank-major output.
             if self.out_in_place:
-                # M4: leave the result in the ring buffer (read it via
-                # result_tensor); skip the finish_sync copy-OUT. ZERO staging on
-                # either side (copy-IN already dropped by chunk_in_place).
+                # Leave the result in the ring buffer (read it via result_tensor);
+                # skip the finish_sync copy-OUT. Zero staging on either side (copy-IN
+                # already dropped by chunk_in_place).
                 self._inter(
                     node_block,
                     output_data,
@@ -3697,7 +3519,7 @@ class HierAllGather:
         Returns False (caller must fall back to copy-OUT ``__call__``) when the
         direct param-contiguous path is unavailable for this instance.
 
-        Implementation reuses the proven slice_direct primitives with NO new
+        Implementation reuses the slice_direct primitives with NO new
         C++ kernel: Phase A rings each rank's own shard into ``collection``;
         Phase B PUSHES, per (node-block m, param s), the E_s-element sub-slice
         via the existing per-slot ``gather_kernel_direct`` with
@@ -3765,17 +3587,14 @@ class HierAllGather:
         split_offsets_u32 = self._pc_u32_so
         entry_barrier = not self.slice_fuse_ib
 
-        # OVERLAPPED param-contiguous zero-copy: the LOCAL node-block
-        # (m == node_id) scatter reads only THIS rank's own input (no ring
-        # dependency) so it runs on a SIDE stream concurrently with the
-        # inter-node RDMA ring -- the ring||gather overlap the copy-OUT __call__
-        # path uses, but writing PARAM-CONTIGUOUS straight into the user output
-        # (no copy-OUT).
-        # EXPERIMENTAL, default OFF: bit-exact in the standalone 2-node test but
-        # currently triggers an HSA memory-exception under FSDP's repeated-call /
-        # buffer-reuse pattern (side-stream local scatter). Ship the proven
-        # non-overlap fused scatter as the default zero-copy path; enable overlap
-        # with MORI_HIER_PC_OVERLAP=1 to iterate on the fault.
+        # Overlapped param-contiguous zero-copy: the local node-block (m == node_id)
+        # scatter reads only this rank's own input (no ring dependency) so it runs
+        # on a side stream concurrently with the inter-node RDMA ring, writing
+        # param-contiguous straight into the user output (no copy-OUT).
+        # Experimental, default OFF: bit-exact in the standalone 2-node test but
+        # triggers an HSA memory-exception under FSDP's repeated-call / buffer-reuse
+        # pattern (side-stream local scatter). The default zero-copy path is the
+        # non-overlap fused scatter; enable overlap with MORI_HIER_PC_OVERLAP=1.
         overlap = (
             self.stream_intra
             and self.stream_ring
@@ -3815,17 +3634,15 @@ class HierAllGather:
                 prepare_barrier=False,
                 first_block=node,
             )
-            # INPUT/OUTPUT LIFETIME across the side stream (the loss-drift race):
-            # input_data and output_data are produced/freed by
-            # FSDP on the MAIN stream, but the local-block scatter above READS
-            # input_data and WRITES output_data on the SIDE stream. The torch
-            # caching allocator only tracks the free-stream (main); without
-            # record_stream it may recycle these blocks while the side kernel is
-            # still draining -> a per-call nondeterministic corruption that shows
-            # up as run-to-run loss drift (12.617/12.566). main.wait_stream(side)
-            # below orders the KERNELS but does NOT inform the allocator about the
-            # side-stream use. Record it so the block is not reused until the side
-            # scatter completes.
+            # Input/output lifetime across the side stream: input_data and
+            # output_data are produced/freed by FSDP on the main stream, but the
+            # local-block scatter above reads input_data and writes output_data on
+            # the side stream. The torch caching allocator only tracks the
+            # free-stream (main); without record_stream it may recycle these blocks
+            # while the side kernel is still draining -> nondeterministic corruption
+            # (run-to-run loss drift). main.wait_stream(side) below orders the
+            # kernels but does not inform the allocator about the side-stream use.
+            # Record it so the block is not reused until the side scatter completes.
             if hasattr(input_data, "record_stream"):
                 input_data.record_stream(side)
                 output_data.record_stream(side)
@@ -3838,16 +3655,15 @@ class HierAllGather:
                 s_main,
                 barrier=not self.slice_defer_inter_fin,
             )
-            # Merge the side local-block scatter BEFORE issuing the remote-block
-            # scatters. The local (side) and remote (main) scatters BOTH call
+            # Merge the side local-block scatter before issuing the remote-block
+            # scatters. The local (side) and remote (main) scatters both call
             # gather_kernel_direct_param_contiguous, which shares one per-groupPos
-            # flag slot + seq token on this handle; running them concurrently made
-            # a receiver observe the other scatter's flag bump -> premature
-            # completion / spin-deadlock under FSDP (observed hang). Serialize the
-            # two scatter phases here. The KEY overlap (side local scatter || the
-            # inter-node RDMA ring) is PRESERVED: the ring's launch_finish_stream
-            # was already enqueued on main above and runs concurrently with the
-            # side scatter; only the ring-DEPENDENT remote scatters wait.
+            # flag slot + seq token on this handle; running them concurrently lets a
+            # receiver observe the other scatter's flag bump -> premature completion
+            # / spin-deadlock under FSDP. Serialize the two scatter phases here. The
+            # key overlap (side local scatter || the inter-node RDMA ring) is
+            # preserved: the ring's launch_finish_stream was already enqueued on main
+            # above; only the ring-dependent remote scatters wait.
             main.wait_stream(side)
             # Remote node-blocks read the ring collection; scatter each into the
             # param-contiguous output (r = m*G+g).

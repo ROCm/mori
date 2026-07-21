@@ -53,17 +53,15 @@ constexpr bool BREAK_ON_RETRIES = true;
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 
-// (packet-primitive layer): optional COPY_LINEAR DW2 coherence hint.
-// The gfx942 SDMA_PKT_COPY_LINEAR PARAMETER_UNION (DW2) exposes ONLY src_sw/dst_sw
-// (2-bit endian SWAP -- nonzero CORRUPTS byte data) and src_ha/dst_ha (1-bit
-// host-access / coherence-routing hint). There is NO L2 cache-policy / streaming
-// field in this packet on CDNA3 (verified against ROCr amd_blit_sdma BuildCopyCommand,
-// rocshmem anvil_device, and kfdtest sdma_pkt_struct -- ALL leave DW2 == 0 for peak
-// D2D/XGMI copy BW). ``cacheHint`` bit0 -> dst_ha, bit1 -> src_ha; swap bits are
-// deliberately NOT exposed (they would break bit-exactness). cacheHint==0 =>
-// byte-identical shipped packet. This is the ONLY non-corrupting DW2 knob and lets us
-// EMPIRICALLY confirm (not just source-read) that the coherence hint is neutral/worse
-// on the XGMI-egress-bound local-gather pole.
+// Optional COPY_LINEAR DW2 coherence hint.
+// The gfx942 SDMA_PKT_COPY_LINEAR PARAMETER_UNION (DW2) exposes only src_sw/dst_sw
+// (2-bit endian swap -- nonzero corrupts byte data) and src_ha/dst_ha (1-bit
+// host-access / coherence-routing hint). CDNA3 has no L2 cache-policy / streaming
+// field in this packet (ROCr amd_blit_sdma BuildCopyCommand, rocshmem anvil_device,
+// and kfdtest sdma_pkt_struct all leave DW2 == 0 for peak D2D/XGMI copy BW).
+// cacheHint bit0 -> dst_ha, bit1 -> src_ha; swap bits are deliberately not exposed
+// (they would break bit-exactness). cacheHint==0 => the default packet, and is the
+// only non-corrupting DW2 knob.
 __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, void* dstBuf,
                                                                  long long int packetSize,
                                                                  int cacheHint = 0) {

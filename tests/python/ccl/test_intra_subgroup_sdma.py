@@ -21,8 +21,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """
-Bit-exact test for ``mori.ccl.IntraNodeSubGroupAllgatherSdma`` (this work, M2b --
-the *intra-node* phase of the hierarchical cross-node AllGather).
+Bit-exact test for ``mori.ccl.IntraNodeSubGroupAllgatherSdma`` (the *intra-node*
+phase of the hierarchical cross-node AllGather).
 
 The hierarchical AllGather first gathers, within each node, the ``G`` local
 shards over the SDMA copy engines (XGMI). This is a sub-group AllGather: node
@@ -32,7 +32,7 @@ contiguous G-shard block. Every node runs its own gather concurrently
 (pe_base=n*G, pe_stride=1, group_size=G, group_pos=local_rank).
 
 Single-node this validates the SDMA gather building block directly on device.
-AllGather is a pure data move => ZERO tolerance (``torch.equal``).
+AllGather is a pure data move => zero tolerance (``torch.equal``).
 
   python3 tests/python/ccl/test_intra_subgroup_sdma.py --world-size 4 --ranks-per-node 2
 """

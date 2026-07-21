@@ -24,30 +24,30 @@
 # MIT License
 """Overlap-completion determinism probe for cross-node HierAllGather.
 
-The bit-exact param-contiguous test host-syncs before comparing, so it CANNOT
-expose the async completion-ordering bug that shows up under FSDP (the intra
-SDMA gather / inter-node ring returns before every peer's write has REMOTELY
-landed in ``out_``; a downstream CU consumer on the SAME stream then reads a few
-stale bytes -> ~0.15% loss drift, masked only by a host ``stream.synchronize``).
+The bit-exact param-contiguous test host-syncs before comparing, so it cannot
+expose the async completion-ordering hazard under FSDP: the intra SDMA gather /
+inter-node ring can return before every peer's write has remotely landed in
+``out_``; a downstream CU consumer on the same stream then reads stale bytes,
+masked only by a host ``stream.synchronize``.
 
 This UT reproduces that hazard directly: per rep it runs the AllGather and then,
-WITH NO host sync between them, a CU consumer (matmul + reduction) that reads the
+with no host sync between them, a CU consumer (matmul + reduction) that reads the
 gathered output on the same stream -- exactly the FSDP AG->backward-GEMM
 ordering. We record the consumer scalar per rep and only sync at the very end.
 
 Pass criteria:
-  * DETERMINISM: every rep's consumer scalar is identical (bitwise) -- an async
+  * Determinism: every rep's consumer scalar is identical (bitwise) -- an async
     landing race makes reps differ run-to-run.
-  * CORRECTNESS: the scalar equals the host-synced reference (bytes were fresh).
+  * Correctness: the scalar equals the host-synced reference (bytes were fresh).
 
-This file deliberately gates on a weighted-sum scalar (with a small relative tol
-for legit bf16 ULP noise on a ~1e12 sum) rather than a full-tensor ``torch.equal``:
-it is an overlap-*race* detector, separating non-determinism from stable-but-wrong.
-Full bit-exactness (zero-tolerance ``torch.equal`` vs
+This gates on a weighted-sum scalar (with a small relative tol for legit bf16
+ULP noise on a ~1e12 sum) rather than a full-tensor ``torch.equal``: it is an
+overlap-race detector, separating non-determinism from stable-but-wrong. Full
+bit-exactness (zero-tolerance ``torch.equal`` vs
 ``torch.distributed.all_gather_into_tensor``) for this same path is enforced by
 ``test_hier_allgather.py`` and ``test_hier_allgather_param_contiguous.py``.
 
-Run cross-node under torchrun (the path that matters)::
+Run cross-node under torchrun::
 
     torchrun --nnodes=2 --nproc_per_node=4 ... \
         tests/python/ccl/test_hier_overlap_determinism.py
@@ -73,13 +73,13 @@ pytestmark = pytest.mark.skipif(
 
 _DTYPES = [torch.bfloat16, torch.float32]
 _PARAM_SPLITS = [1048576, 524288, 262144, 131072, 65536]
-# LARGE band = Qwen embed+lm_head (~68M elems/rank; gathered ~2.18GB int32,
-# crosses 2^31 bytes). The <=2M overlap UT never exercised this; if the async
-# remote-landing race is size-dependent this is where it must surface.
+# Large band = Qwen embed+lm_head (~68M elems/rank; gathered ~2.18GB int32,
+# crosses 2^31 bytes). Exercises the large-payload regime where a size-dependent
+# async remote-landing race would surface.
 _PARAM_SPLITS_LARGE = [34078720, 34078720]
 _REPS = int(os.environ.get("OVERLAP_REPS", "50"))
-# Large-band reps are cheaper to keep short (each AG moves ~2GB); still enough
-# reps to catch a run-to-run async landing race.
+# Keep large-band reps short (each AG moves ~2GB) but enough to catch a
+# run-to-run async landing race.
 _REPS_LARGE = int(os.environ.get("OVERLAP_REPS_LARGE", "12"))
 
 
@@ -100,7 +100,7 @@ def _splits_offsets(device):
 
 
 def _consume(out, wvec):
-    """Position-WEIGHTED CU consumer (detects layout scrambles AND stale bytes).
+    """Position-weighted CU consumer (detects layout scrambles and stale bytes).
 
     A plain sum is permutation-invariant, so it cannot see a wrong [param][rank]
     ordering. Multiply elementwise by a position-dependent weight vector before
@@ -113,14 +113,14 @@ def _consume(out, wvec):
 
 
 def _reference_out(inp, splits, mode, world_size, device):
-    """INDEPENDENT truth: RCCL all_gather -> the layout the mode produces.
+    """Independent truth: RCCL all_gather -> the layout the mode produces.
 
     The host-synced ``golden`` is self-referential -- if the copy-out drains the
-    transit ``out_`` before every peer's SDMA put has REMOTELY landed, golden
-    reads the SAME stale bytes as the overlapped pass, so golden==overlapped
-    (wrong=0) even though BOTH are wrong. Comparing against this all_gather-built
-    reference is what actually catches a stable-but-wrong drain (the FSDP loss
-    drift that only host stream.synchronize() removes)."""
+    transit ``out_`` before every peer's SDMA put has remotely landed, golden
+    reads the same stale bytes as the overlapped pass, so golden==overlapped
+    (wrong=0) even though both are wrong. Comparing against this all_gather-built
+    reference catches a stable-but-wrong drain (the FSDP loss drift that only
+    host stream.synchronize() removes)."""
     count = inp.numel()
     rank_major = torch.empty(count * world_size, dtype=inp.dtype, device=device)
     dist.all_gather_into_tensor(rank_major, inp)  # [r0_shard, r1_shard, ...]
@@ -142,24 +142,23 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits, reps):
     """Overlap-determinism probe for one dtype under one op ``mode``.
 
     ``mode="zerocopy"`` exercises ``enqueue_param_contiguous`` (the direct
-    param-contiguous scatter; proven clean in turn 1). ``mode="copyout"``
-    exercises the plain ``__call__`` copy-OUT path -- the path the deployed FSDP
-    perf config actually uses (MORI_FSDP_NO_ZERO_COPY=1) and the remaining
-    suspect for the ~0.15% loss drift: the intra SDMA gather stacks peers' puts
-    into the transit ``out_`` and a SEPARATE copy-OUT reader may see bytes that
-    haven't finished landing at the receiver.
+    param-contiguous scatter). ``mode="copyout"`` exercises the plain
+    ``__call__`` copy-OUT path -- the path the deployed FSDP perf config uses
+    (MORI_FSDP_NO_ZERO_COPY=1): the intra SDMA gather stacks peers' puts into the
+    transit ``out_`` and a separate copy-OUT reader may see bytes that haven't
+    finished landing at the receiver.
     """
     global _PARAM_SPLITS
     _PARAM_SPLITS = splits
     ss, so, count = _splits_offsets(device)
     out = torch.empty(count * world_size, dtype=dtype, device=device)
-    # position weight so the consumer is layout- and value-sensitive.
+    # Position weight so the consumer is layout- and value-sensitive.
     wvec = ((torch.arange(count * world_size, device=device) % 97) + 1).to(
         torch.float32
     )
 
-    # Per-rep VARYING inputs: a stale byte from a prior rep now differs from the
-    # expected current value, so staleness is actually detectable.
+    # Per-rep varying inputs: a stale byte from a prior rep now differs from the
+    # expected current value, so staleness is detectable.
     def inp_for(rep):
         return _make_input(dtype, count, rank, device) + (rep % 7)
 
@@ -173,8 +172,8 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits, reps):
     comm = torch.cuda.Stream()
     pressure = torch.randn(2048, 2048, dtype=torch.float32, device=device)
 
-    # Golden pass: per-rep host-synced (fresh bytes guaranteed) scalars, PLUS an
-    # INDEPENDENT all_gather-built reference scalar per rep (catches stable-wrong).
+    # Golden pass: per-rep host-synced (fresh bytes guaranteed) scalars, plus an
+    # independent all_gather-built reference scalar per rep (catches stable-wrong).
     golden = []
     truth = []
     for rep in range(reps):
@@ -187,7 +186,7 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits, reps):
         golden.append(_consume(out, wvec).item())
     torch.cuda.synchronize()
 
-    # Overlapped pass: cross-stream event handoff, NO host sync AG->consumer.
+    # Overlapped pass: cross-stream event handoff, no host sync AG->consumer.
     scalars = []
     for rep in range(reps):
         inp = inp_for(rep)
@@ -205,8 +204,8 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits, reps):
     vals = [s.item() for s in scalars]
 
     # Determinism = overlapped scalar bitwise-matches the host-synced golden.
-    # NaN==NaN is deterministic (a stale-byte race would give DIFFERING run-to-
-    # run values, not a stable NaN), so treat matching NaNs as equal.
+    # NaN==NaN is deterministic (a stale-byte race gives differing run-to-run
+    # values, not a stable NaN), so treat matching NaNs as equal.
     def _ne(v, g):
         if v != v and g != g:  # both NaN
             return False
@@ -214,7 +213,7 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits, reps):
 
     n_wrong = sum(1 for v, g in zip(vals, golden) if _ne(v, g))
 
-    # CORRECTNESS vs the independent all_gather reference. Use a relative tol on
+    # Correctness vs the independent all_gather reference. Use a relative tol on
     # the huge weighted-sum scalar (bf16 accumulation of ~1e12 has legit ULP
     # noise); a real drain-stale error shifts many elements and blows past this.
     def _wrong_vs_truth(v, t):
@@ -239,7 +238,7 @@ def _run_dtype(handle, dtype, rank, world_size, device, mode, splits, reps):
 
 
 def _make_handle(rank, world_size, ranks_per_node):
-    # Buffers sized for the LARGEST profile so one handle serves every size band.
+    # Buffers sized for the largest profile so one handle serves every size band.
     per_rank_bytes = sum(_PARAM_SPLITS_LARGE) * 4 + 4096
     return HierAllGather(
         my_pe=rank,
@@ -266,26 +265,25 @@ def _worker_body(rank, world_size, ranks_per_node, device):
     del handle
     try:
         total_nd, total_wr = 0, 0
-        # Size profiles: the large multi-split (turn-1 regime) + a SMALL/odd
-        # single-split profile (Qwen has small layers that route to the
-        # non-slice copy-out fallback -- the untested band).
+        # Size profiles: the large multi-split regime + small/odd single-split
+        # profiles (Qwen has small layers that route to the non-slice copy-out
+        # fallback).
         _SIZE_PROFILES = [
-            (_PARAM_SPLITS, _REPS),  # large multi-split (proven regime)
+            (_PARAM_SPLITS, _REPS),  # large multi-split
             ([65536, 32768, 8192], _REPS),  # small sizes (num_blocks=1 band)
             ([524288], _REPS),  # single big split
-            # THE FSDP culprit band: in-situ AG_VERIFY localized the entire loss
-            # drift to ONE call/step at per-rank count 29,132,224 (~58MB bf16),
-            # ~9592 stale elems, max|diff|~0.15. Reproduce it directly here.
+            # FSDP loss-drift band: a single ~58MB bf16 AG (per-rank count
+            # 29,132,224) where the async remote-landing race showed up.
             ([29132224], _REPS_LARGE),
-            # Qwen embed+lm_head band -- crosses 2^31 bytes; the untested regime
-            # where a size-dependent async landing race would surface.
+            # Qwen embed+lm_head band -- crosses 2^31 bytes; the regime where a
+            # size-dependent async landing race would surface.
             (_PARAM_SPLITS_LARGE, _REPS_LARGE),
         ]
         _MODES = os.environ.get("OVERLAP_MODES", "copyout,zerocopy").split(",")
         # copy-OUT __call__ needs no param-contiguous support; only zerocopy
         # (enqueue_param_contiguous) does. Under the deployed FSDP fast env
         # (STREAM_INTRA=0) supports=False, but the copy-OUT path -- the branch
-        # FSDP actually runs -- must still be probed. Drop only zerocopy then.
+        # FSDP runs -- must still be probed. Drop only zerocopy then.
         if not supported:
             _MODES = [m for m in _MODES if m != "zerocopy"]
             if rank == 0:
@@ -298,14 +296,12 @@ def _worker_body(rank, world_size, ranks_per_node, device):
             if rank == 0:
                 print("SKIP: no runnable modes", flush=True)
             return
-        # FRESH handle per op MODE. Mixing the copy-OUT __call__ path and the
-        # zero-copy enqueue_param_contiguous path on ONE handle contaminates the
+        # Fresh handle per op mode. Mixing the copy-OUT __call__ path and the
+        # zero-copy enqueue_param_contiguous path on one handle contaminates the
         # shared intra flag/seq + output-registration state (copy-OUT registers a
-        # transit out_, zero-copy registers the USER output), which spuriously
-        # produced a stable-NaN artifact for [zerocopy bf16 nsplit=5] when it ran
-        # right after copy-OUT ops -- NOT a kernel bug (the pure-mode bit-exact
-        # test passes bf16 at this exact config). FSDP uses one mode for a whole
-        # run, so a per-mode handle is the faithful, artifact-free harness.
+        # transit out_, zero-copy registers the user output), which produces a
+        # spurious stable-NaN artifact rather than a kernel bug. FSDP uses one
+        # mode for a whole run, so a per-mode handle is the faithful harness.
         for mode in _MODES:
             handle = _make_handle(rank, world_size, ranks_per_node)
             try:

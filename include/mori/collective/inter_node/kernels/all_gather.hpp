@@ -245,36 +245,34 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   bool multiBlockWrite =
       (useWriteFence && peerIsRdma && prevIsRdma && maxRounds == 1 && multiBlock);
 
-  // Phase-6 WRITE_WITH_IMM (single-warp, single-QP cross-node path only). The
-  // sender emits RDMA_WRITE_WITH_IMM instead of put+quiet+flag-AMO; the receiver
+  // WRITE_WITH_IMM (single-warp, single-QP cross-node path only). The sender
+  // emits RDMA_WRITE_WITH_IMM instead of put+quiet+flag-AMO; the receiver
   // consumes the recv-CQ completion instead of spinning the flag. The recv-CQE
   // cannot be observed before the write payload has landed globally, so this is
   // the transport-level completion that closes the remote-landing stale-read race
-  // (device-side ordering alone was insufficient; only a host sync worked) without the
-  // host stall. Gated to !multiBlock && !fanOut (numQp==1) so numQp>1 / multi-channel
-  // and single-node (P2P/SDMA) paths stay byte-for-byte on the proven flag path.
+  // (device-side ordering alone is insufficient) without the host stall. Gated to
+  // !multiBlock && !fanOut (numQp==1) so numQp>1 / multi-channel and single-node
+  // (P2P/SDMA) paths stay byte-for-byte on the flag path.
   bool writeImm = (useWriteImm && peerIsRdma && !multiBlock && !fanOut);
   bool recvWriteImm = (useWriteImm && prevIsRdma && !multiBlock && !fanOut);
-  // Phase-6b: WRITE_WITH_IMM on the MULTI-QP FAN-OUT path. This is the ONLY
-  // WRITE_IMM variant that engages on the big embed/lm_head AG, because under
-  // FSDP that AG runs with numQp>1 (fanOut) -- the single-warp writeImm above is
-  // gated !fanOut and so NEVER fires for it (which is why every prior numQp==1
-  // WRITE_IMM FSDP test was inconclusive: at numQp==1 the big AG hits multiBlock,
-  // also gated off). Each active fan-out warp emits its disjoint sub-range as an
-  // RDMA_WRITE_WITH_IMM on its OWN QP (qpId=warpId); the receiver consumes one
-  // recv-CQE per active QP. The recv-CQE is produced only AFTER that QP's payload
-  // has landed globally, so the receiver proceeds coherent with NO host sync and
-  // NO flag AMO -- the transport completion the 20 device/host-bounded avenues
-  // could not give on this path. Gated to fanOut so numQp==1 stays byte-identical.
+  // WRITE_WITH_IMM on the MULTI-QP FAN-OUT path. This variant engages on the big
+  // embed/lm_head AG, which under FSDP runs with numQp>1 (fanOut) -- the
+  // single-warp writeImm above is gated !fanOut and never fires for it. Each
+  // active fan-out warp emits its disjoint sub-range as an RDMA_WRITE_WITH_IMM on
+  // its OWN QP (qpId=warpId); the receiver consumes one recv-CQE per active QP.
+  // The recv-CQE is produced only AFTER that QP's payload has landed globally, so
+  // the receiver proceeds coherent with NO host sync and NO flag AMO. Gated to
+  // fanOut so numQp==1 stays byte-identical.
   bool fanOutWriteImm = (useWriteImm && peerIsRdma && !multiBlock && fanOut);
   bool recvFanOutWriteImm = (useWriteImm && prevIsRdma && !multiBlock && fanOut);
   // WRITE_WITH_IMM on the MULTI-BLOCK CHANNEL path (env MORI_HIER_RING_WRITE_IMM).
   // At N=2 the big AG runs multiBlock (numQp==1), so the single-warp writeImm
   // (gated !multiBlock) and fanOutWriteImm (gated fanOut) NEVER fire for it -- it
   // falls back to the flag-spin recv whose flag can be observed BEFORE the NIC's
-  // WRITE DMA is globally visible to the consumer's CU reads (the FSDP E2E stale-
-  // remote-half completion race; device-side reader barriers did not fix it, only a
-  // host drain did). Extend WRITE_WITH_IMM to the channel path: each CTA bid
+  // WRITE DMA is globally visible to the consumer's CU reads (the stale-remote-
+  // half completion race; device-side reader barriers do not close it, only a
+  // host drain or this transport completion does). Extend WRITE_WITH_IMM to the
+  // channel path: each CTA bid
   // emits its sub-range as RDMA_WRITE_WITH_IMM on qpId=bid; the receiver consumes
   // THIS channel's recv-CQE (generated only AFTER the write payload has landed
   // globally) instead of spinning the flag. Byte image is identical (same sub-range
@@ -317,7 +315,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   // Engaged only on the single-round (ringSize==2) all-RDMA fan-out path. Uses the
   // full useWarps QP fan-out per sub-chunk (full inter BW), publishes P
   // chunkReadyFlags in temporal order. Self-contained: returns before the classic
-  // round loop. INERT when deepPipe<=1 (byte-identical shipped path).
+  // round loop. INERT when deepPipe<=1 (byte-identical default path).
   bool deepPipeEngaged =
       (deepPipe > 1 && peerIsRdma && prevIsRdma && maxRounds == 1 && !multiBlock &&
        chunkReadyFlags != nullptr && !useReadRing && !useWriteImm && useWarps >= 1);
@@ -328,11 +326,11 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     // below a useful RDMA transfer granularity -- the tiny per-sub-chunk WQEs starve the
     // NIC and the extra flag round-trips can deadlock small transfers. Clamp P so every
     // temporal sub-chunk carries >= kMinSubChunkB
-    // (1 MiB): reqPmax = peChunkSize / kMinSubChunkB. This makes ANY requested depth
-    // (incl. RCCL-matched P=8) safe at every size, and is BIT-EXACT + byte-identical
-    // for the shipped path -- P only controls the temporal partition of the SAME
-    // contiguous bytes issued+landed in order, and the default P=2 already yields
-    // >=8 MiB sub-chunks at every UT size >=32MB (clamp is a no-op there).
+    // (1 MiB): reqPmax = peChunkSize / kMinSubChunkB. This makes any requested
+    // depth safe at every size, and is bit-exact -- P only controls the temporal
+    // partition of the SAME contiguous bytes issued+landed in order, and the
+    // default P=2 already yields >=8 MiB sub-chunks at every size >=32MB (clamp is
+    // a no-op there).
     const size_t kMinSubChunkB = static_cast<size_t>(1) << 20;
     int reqPmax = static_cast<int>(peChunkSize / kMinSubChunkB);
     if (reqPmax < 1) reqPmax = 1;
@@ -461,7 +459,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     // deepPipeQuiet already sanctions). Requires sw>=1 and P<=warpsPerBlock. Takes
     // precedence over deepPipeQuiet/deepPipeImm. Returns before the classic loop.
     // ==== PROGRESSIVE DEEP-PIPE PUBLISH (fifoProg, MORI_HIER_FIFO_PROG). ====
-    // The consume-side pincer stacked on the crown. fifoFullWidth (below) issues
+    // The consume-side pincer stacked on the deep-pipe path. fifoFullWidth (below) issues
     // all P sub-chunks deep then batch-drains + batch-publishes all P flags together
     // -- a completion BARRIER where flag[0] can't fire until sub-chunk P-1 lands, so
     // the receiver's intra XGMI reassembly of sub-chunk 0 never overlaps the inter
@@ -471,10 +469,10 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     // width), a parallel per-QP send-CQ drain proves p landed at nextPeer, thread 0
     // AMOs the receiver's inbound slot, the reader warp waits its own inbound flag[p]
     // and publishes chunkReadyFlags[p] -- so the reassembly worker reassembles p over
-    // XGMI while p+1.. are still crossing the NIC (the ~46% intra tail hidden under the
-    // ~54% inter fill). BIT-EXACT: same dpRange tiling + flag slots as the crown
+    // XGMI while p+1.. are still crossing the NIC (the intra tail hidden under the
+    // inter fill). Bit-exact: same dpRange tiling + flag slots as the batch
     // deep-pipe path, each AMO strictly follows a full drain of its own sub-chunk's
-    // landings -- only MORE ordered (strict temporal vs the batch path's relaxed
+    // landings -- only more ordered (strict temporal vs the batch path's relaxed
     // per-QP order). Takes precedence over fifoFullWidth. Requires sw>=1 &&
     // sw<=warpsPerBlock. Returns before the classic round loop.
     if (fifoProg && P > 1 && sw >= 1 && sw <= warpsPerBlock) {
@@ -930,7 +928,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                                           (flagBase + p) * sizeof(uint64_t), 1,
                                           core::atomicType::AMO_ADD, nextPeer, warpId);
         } else {
-          // Deep SQ on the crown put-with-signal send (MORI_HIER_WQE_DEPTH). The crown's
+          // Deep SQ on the deep-pipe put-with-signal send (MORI_HIER_WQE_DEPTH). The
           // deep-pipe send issues one whole-tile put-with-signal WQE per (sub-chunk p,
           // warp==QP), so each QP holds a single in-flight data WQE per sub-chunk. This
           // splits this warp's per-QP tile of sub-chunk p into up to wqeDepth back-to-back
@@ -941,7 +939,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           // tile [off,off+bytes) exactly -- only the per-QP SQ depth grows. In practice
           // extra WQEs add per-descriptor overhead that hurts the largest buffer without
           // raising wire fill, so this is kept default-off (WQE_DEPTH=1 => this branch
-          // never taken => byte-identical to the single-WQE crown).
+          // never taken => byte-identical to the single-WQE send).
           const size_t tileBytes = eo - so;
           const size_t nUw = (tileBytes + kAlignDP - 1) / kAlignDP;
           size_t uPer = (nUw + static_cast<size_t>(wqeDepth) - 1) / static_cast<size_t>(wqeDepth);
@@ -1103,14 +1101,12 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                                         core::atomicType::AMO_ADD, nextPeer, bid);
       }
       __syncthreads();
-      // T40b: NO explicit send-CQ quiet. The fused put-signal already carries the
-      // flag AMO as the last WQE on qpId=bid strictly AFTER the data WRITE (RC in-
-      // order), so the receiver observing the per-channel flag is ALREADY
+      // No explicit send-CQ quiet. The fused put-signal already carries the flag
+      // AMO as the last WQE on qpId=bid strictly AFTER the data WRITE (RC in-
+      // order), so the receiver observing the per-channel flag is already
       // guaranteed the sub-range has landed globally -- an explicit
-      // ShmemQuietThread(nextPeer,bid) here would only STALL the channel until its
-      // send CQ empties (the exact single-round latency the put-signal was built to
-      // remove; T40a measured that stall = 123 GB/s / 0.70x, the same underfill as
-      // the RDMA-READ pull). Receiver: spin THIS channel's inbound flag (peer's CTA
+      // ShmemQuietThread(nextPeer,bid) here would only stall the channel until its
+      // send CQ empties. Receiver: spin THIS channel's inbound flag (peer's CTA
       // bid bumped slot recvDataRank via its fused signal); system acquire + fence
       // makes the landed sub-range coherently visible to this GPU's CUs. The post-
       // loop chunkReadyFlags[bid] publish then releases the reassembly reader.
@@ -1124,47 +1120,32 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       __syncthreads();
       continue;
     }
-    // NOTE (M4, ): tried splitting this put across ALL 8 warps in the
-    // block (disjoint 16B-aligned sub-ranges) to parallelize the transfer.
-    // VALIDATED NEGATIVE RESULT on device (single-node ring, GPUs 0-3): it
-    // crashes with anvil "submitPacket: Retry limit exceeded" -> GPU coredump.
-    // Cause: the same-node neighbour path of ShmemPutMemNbiWarp lowers to one
-    // anvil SDMA queue per (src,dst) pair; all warps target the SAME nextPeer
-    // chunk region, so 8 warps hammer ONE SDMA queue and overflow its retry
-    // budget. Multi-warp puts only help when each warp drives a distinct queue/
-    // QP (as the intra SDMA gather does, one warp per peer). For a single-peer
-    // ring round there is one queue, so a single warp is correct. Kept as-is.
-    // NOTE (M4, ): this put is the DOMINANT cost of the xnode hier
-    // AllGather. True 2-node bench (n09-21+n09-29, fp32 64MiB/rank, world=8
-    // N=2,G=4, >=3 reps) of the  overlap commit (4a2feeb9):
-    //   mori min=13.59ms 39.5 GB/s  vs  rccl min=3.55ms 151.1 GB/s (~3.8x).
-    // Within noise of the  baseline (40.3 GB/s) => the quiet/spin
-    // overlap is a NO-OP at this size: the round is BANDWIDTH-bound, not
-    // latency-bound. ROOT CAUSE of the under-fill: this single warp issues
-    // the entire chunk on a SINGLE QP. ShmemPutMemNbiWarp<RDMA> issues from
-    // lane 0 with qpId defaulting to 0, while the transport provisions
-    // numQpPerPe (default 4, MORI_NUM_QP_PER_PE) QPs/peer -- we use 1 of 4.
-    // NEXT LEVER: fan the chunk across all numQpPerPe QPs (warp w -> disjoint
-    // 16B-aligned sub-range on qpId=w) so multiple QPs drive the NIC in
-    // parallel. CORRECTNESS GATE (must hold before landing): the flag bump
-    // below must follow a quiet that drains ALL used QPs -- ShmemQuietThread
-    // (int pe) (RDMA) loops qpId 0..numQpPerPe-1, whereas the current
-    // ShmemQuietThread(nextPeer, memObj) SDMA-typed call must be confirmed to
-    // cover every QP, else the receiver's flag fires before tail QPs land.
-    // Gate fan-out on numQp>1 only for the all-RDMA sub-group ring; the flat
-    // single-node ring (P2P, one anvil queue) must stay single-warp.
-    // IMPLEMENTED: the runtime-gated fan-out described above.
+    // Single-warp per ring round: the same-node neighbour path of
+    // ShmemPutMemNbiWarp lowers to one anvil SDMA queue per (src,dst) pair. All
+    // warps would target the same nextPeer chunk region, so splitting the put
+    // across warps hammers ONE SDMA queue and overflows its retry budget (anvil
+    // "submitPacket: Retry limit exceeded"). Multi-warp puts only help when each
+    // warp drives a distinct queue/QP (as the intra SDMA gather does, one warp per
+    // peer); a single-peer ring round has one queue, so a single warp is correct.
     //
-    // DEEP-SQ WQE-DEPTH (MORI_HIER_WQE_DEPTH, default 1). The plain quiet-drained
+    // Fan-out (numQp>1) is the alternative for the all-RDMA sub-group ring: a
+    // single warp on a single QP underfills the NIC (the transport provisions
+    // numQpPerPe QPs/peer, MORI_NUM_QP_PER_PE). Fanning the chunk across QPs
+    // (warp w -> disjoint 16B-aligned sub-range on qpId=w) drives multiple QPs in
+    // parallel. Correctness gate: the flag bump below must follow a quiet that
+    // drains ALL used QPs. Gated on numQp>1 only for the all-RDMA sub-group ring;
+    // the flat single-node ring (P2P, one anvil queue) stays single-warp.
+    //
+    // Deep-SQ WQE-depth (MORI_HIER_WQE_DEPTH, default 1). The plain quiet-drained
     // put path (below) issues ONE whole-sub-range RDMA-WRITE WQE per QP, so the SQ
     // holds a single in-flight WQE per QP -- adding QPs (numQp 4->8) was neutral,
     // so the un-probed axis is SQ DEPTH per QP. putDeep splits a sub-range into
     // `wqeDepth` back-to-back 16B-aligned non-blocking WRITEs on the SAME QP, so
     // the NIC sees `wqeDepth` queued WQEs per QP (device analogue of the host-proxy
-    // deep-SQ that reaches ~48 GB/s vs ~31 GB/s single-WQE-per-QP). The union of
-    // the d sub-puts tiles [off,off+bytes) EXACTLY and rides the QP in RC order, so
-    // the byte image AND the per-QP quiet drain are identical; only SQ depth grows.
-    // depth<=1 (or a sub-range too small to split) => single put = shipped path.
+    // deep-SQ). The union of the d sub-puts tiles [off,off+bytes) exactly and rides
+    // the QP in RC order, so the byte image and the per-QP quiet drain are
+    // identical; only SQ depth grows. depth<=1 (or a sub-range too small to split)
+    // => single put = default path.
     auto putDeep = [&](size_t off, size_t bytes, int qp) {
       // DIRECT-LAND: retarget the DATA WRITE DEST from the receiver's ring slot to
       // its OWN final output self-slot (gOutMemObj at (sendDataRank*gGroupSize+
@@ -1172,10 +1153,10 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // chunk (memObj@off). nextPeer is this GPU's same-groupPos counterpart, so
       // that offset is exactly where the reasm self-column push would have written
       // (bit-exact). The post-loop quiet+flag path is unchanged (drains the send =>
-      // output landed remotely => flag). OFF => dest==ring (byte-identical crown).
+      // output landed remotely => flag). OFF => dest==ring (byte-identical).
       // DIRECT-LAND RKEY GUARD: if the dest is an RDMA peer but has no valid
       // peerRkeys[nextPeer], the direct WRITE would land nowhere, so fall back to
-      // the ring dest (byte-identical crown, no drop).
+      // the ring dest (byte-identical, no drop).
       bool dlRkeyOk = true;
       if (directLand) {
         const application::SymmMemObj* g = gOutMemObj.gpu;
@@ -1345,7 +1326,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       }
     }
 
-    // M4: overlap the OUTBOUND drain (quiet + flag bump to nextPeer)
+    // Overlap the OUTBOUND drain (quiet + flag bump to nextPeer)
     // with the INBOUND recv-flag wait (from prevPeer). These two waits are on
     // independent network directions, but the previous code serialized them on
     // thread 0 (quiet+bump, syncthreads, then spin) so their latencies added.
@@ -1445,11 +1426,10 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       // writes. A RELAXED load establishes NO happens-before with those data
       // writes, so observing the flag does NOT make the received chunk coherently
       // visible to this GPU's subsequent forward-put / copy-OUT -> the RDMA (remote)
-      // half of the output reads STALE bytes under FSDP tight overlap (the
-      // MI355-exposed loss drift; in-situ probe showed exactly the remote half
-      // stale). A system-scope acquire + system threadfence makes the peer's prior
-      // data writes visible without a host sync -- mirrors the intra SDMA gather's
-      // proven AtomicLoadSeqCstSystem + __threadfence_system receiver pattern.
+      // half of the output reads STALE bytes under FSDP tight overlap. A
+      // system-scope acquire + system threadfence makes the peer's prior data
+      // writes visible without a host sync -- mirrors the intra SDMA gather's
+      // AtomicLoadSeqCstSystem + __threadfence_system receiver pattern.
       // On the fan-out-signal path the sender adds +1 PER active QP, so wait for
       // the slot to reach ``expectedRecvSig`` (== fanActive); the classic path
       // adds exactly 1 (expectedRecvSig==1), so this is a strict superset that
@@ -1546,8 +1526,8 @@ __global__ void AllGatherRingKernel(int myPe, int npes, const application::SymmM
 // onto the same RC QP as the data write (so the flag executes remotely strictly after
 // the payload lands in remote HBM) does not fix it, which shows the payload is already
 // in remote HBM before the flag is observed. The residual staleness is the copy
-// engine's read of the self-slot: the crown reads the ring buffer (fine-grained RDMA
-// scratch, SDMA-read-coherent with the NIC write) and is correct, whereas direct-land
+// engine's read of the self-slot: the default path reads the ring buffer (fine-grained
+// RDMA scratch, SDMA-read-coherent with the NIC write) and is correct, whereas direct-land
 // reads the coarse-grained cached output tensor, whose line the NIC write does not
 // invalidate for the copy engine. A recv-CQE (WRITE_WITH_IMM) gate would not fix this
 // either, since a recv-CQE is only a landing proof, not a copy-engine cache

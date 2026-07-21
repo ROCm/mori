@@ -55,7 +55,7 @@ def _get_ccl_func(name: str):
 
 
 # ---------------------------------------------------------------------------
-# Helpers (unchanged from original)
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -81,10 +81,10 @@ _TORCH_DTYPE_TO_NUMPY = {
 def _ring_cu_copyout_enabled() -> bool:
     """CU-domain ring finish copy-OUT gate (default ON).
 
-    Reads the ring buffer via a COMPUTE-UNIT kernel instead of the copy-engine
+    Reads the ring buffer via a compute-unit kernel instead of the copy-engine
     hipMemcpyAsync so the finish drain observes the RDMA-landed remote-half
-    bytes the ring kernel fenced (closes the receiver/copy-out completion
-    residual on-device). Set MORI_HIER_RING_CU_COPYOUT=0 to A/B the copy engine.
+    bytes the ring kernel fenced. Set MORI_HIER_RING_CU_COPYOUT=0 to use the
+    copy engine.
     """
     return os.environ.get("MORI_HIER_RING_CU_COPYOUT", "1").strip().lower() not in (
         "0",
@@ -431,15 +431,13 @@ class InterNodeRingAllgather:
         num_qp: int = 1,
         num_blocks: int = 1,
     ):
-        # NOTE: the inter-node phase deliberately uses the RDMA/P2P shmem
-        # transport (DESIGN: inter-node == RDMA), NOT the SDMA copy engines
-        # (those drive the *intra*-node phase). So MORI_ENABLE_SDMA is not
-        # required here; forcing it on would route same-node puts through the
-        # SDMA multi-queue path, which is the intra-node optimization, not what
-        # the ring needs.
+        # The inter-node phase uses the RDMA/P2P shmem transport, not the SDMA
+        # copy engines (those drive the intra-node phase), so MORI_ENABLE_SDMA is
+        # not required here; forcing it on would route same-node puts through the
+        # intra-node SDMA multi-queue path, which is not what the ring needs.
         #
-        # Sub-group ring (M2b, hierarchical inter-node phase): when ``ring_size``
-        # >= 0 the ring runs over the arithmetic sub-group of global PEs
+        # Sub-group ring: when ``ring_size`` >= 0 the ring runs over the
+        # arithmetic sub-group of global PEs
         # ``{pe_base, pe_base+pe_stride, ..., pe_base+(ring_size-1)*pe_stride}``
         # and this PE is at position ``ring_pos`` within it. The output holds the
         # ``ring_size`` chunks in ring order. The default (``ring_size=-1``) is
@@ -455,11 +453,10 @@ class InterNodeRingAllgather:
         # kernel applies it only to true cross-node neighbours; same-node P2P/SDMA
         # neighbours stay single-warp). Default 1 == unchanged single-QP put.
         self.num_qp = num_qp
-        # M4: num_blocks>1 launches the ring as that many CTAs
-        # ("channels"), each driving a disjoint chunk sub-range on its own QP
-        # (RCCL-style). The kernel engages it only for true RDMA neighbours;
-        # same-node sims fall back to a single working block. Default 1 ==
-        # unchanged single-block ring.
+        # num_blocks>1 launches the ring as that many CTAs ("channels"), each
+        # driving a disjoint chunk sub-range on its own QP. The kernel engages
+        # it only for true RDMA neighbours; same-node sims fall back to a single
+        # working block. Default 1 == single-block ring.
         self.num_blocks = num_blocks if num_blocks and num_blocks >= 1 else 1
         self._handle = handle_class(
             my_pe,
@@ -487,15 +484,14 @@ class InterNodeRingAllgather:
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
         s = _stream_to_int(stream)
-        # stream_ring=True uses the on-device
-        # ShmemBarrierOnStream prepare/finish (no host hipStreamSynchronize / host
-        # ShmemBarrierAll), keeping the whole op enqueued on the stream. Same byte
-        # moves and global fencing as the host-synced path; removes 2 CPU<->GPU
-        # round-trips per op.
+        # stream_ring=True uses the on-device ShmemBarrierOnStream prepare/finish
+        # (no host hipStreamSynchronize / host ShmemBarrierAll), keeping the whole
+        # op enqueued on the stream. Same byte moves and global fencing as the
+        # host-synced path; removes 2 CPU<->GPU round-trips per op.
         if chunk_in_place:
-            # M4: this PE's chunk is already in its ring slot (the
-            # upstream intra gather wrote there via ``slot_tensor``), so skip the
-            # prepare_sync copy-IN.
+            # This PE's chunk is already in its ring slot (the upstream intra
+            # gather wrote there via ``slot_tensor``), so skip the prepare_sync
+            # copy-IN.
             if stream_ring:
                 args = self._handle.prepare_stream_in_place(u32_count, s)
             else:
@@ -509,8 +505,8 @@ class InterNodeRingAllgather:
             (self.num_blocks,), (512,), 0, s, args
         )
         if out_in_place:
-            # M4: leave the gathered result in the ring buffer (read it
-            # via ``full_tensor``) and skip the finish_sync copy-OUT. ``output_data``
+            # Leave the gathered result in the ring buffer (read it via
+            # ``full_tensor``) and skip the finish_sync copy-OUT. ``output_data``
             # is ignored in this mode.
             if stream_ring:
                 self._handle.finish_stream_no_copy(s)
@@ -518,10 +514,10 @@ class InterNodeRingAllgather:
                 self._handle.finish_sync_no_copy(s)
         else:
             if stream_ring:
-                # defer the ring-reuse fence to the next op's
-                # prepare_stream barrier (defer_inter_fin) -- the copy-OUT stays
-                # stream-ordered so the collection is correct; only cross-PE ring
-                # reuse needs the fence, which the successor op provides.
+                # defer_inter_fin defers the ring-reuse fence to the next op's
+                # prepare_stream barrier -- the copy-OUT stays stream-ordered so
+                # the collection is correct; only cross-PE ring reuse needs the
+                # fence, which the successor op provides.
                 if _ring_cu_copyout_enabled():
                     self._cu_finish_copyout(
                         output_data, u32_count, s, barrier=not defer_inter_fin
@@ -574,10 +570,10 @@ class InterNodeRingAllgather:
         return int(self._handle.parity_counter_ptr())
 
     def prepare_stream_only(self, input_data, count: int, stream=None):
-        """issue ONLY the stream-ordered ring prepare (the
-        global on-stream ShmemBarrierOnStream entry barrier + the per-PE copy-IN
-        of ``input_data`` into the ring slot) and return ``(args, u32_count, s)``
-        WITHOUT launching the ring kernel.
+        """Issue ONLY the stream-ordered ring prepare (the global on-stream
+        ShmemBarrierOnStream entry barrier + the per-PE copy-IN of ``input_data``
+        into the ring slot) and return ``(args, u32_count, s)`` WITHOUT launching
+        the ring kernel.
 
         This splits the monolithic ``__call__`` (prepare -> kernel -> finish) so
         the caller can interleave INDEPENDENT work (e.g. the slice path's local
@@ -595,7 +591,7 @@ class InterNodeRingAllgather:
         return args, u32_count, s
 
     def prepare_stream_only_no_copyin(self, input_data, count: int, stream=None):
-        """like ``prepare_stream_only`` but SKIP the host copy-IN of ``input_data``
+        """Like ``prepare_stream_only`` but SKIP the host copy-IN of ``input_data``
         into the ring slot -- the fused kernel stages it in-kernel (fuseCopyIn).
         Runs only the entry rendezvous (or the GEN_RING generation bump) so the AG
         collapses toward a single host kernel launch. Pairs with
@@ -611,7 +607,7 @@ class InterNodeRingAllgather:
     def launch_finish_stream(
         self, args, output_data, u32_count: int, s: int, barrier: bool = True
     ) -> bool:
-        """launch the ring kernel for a previously-prepared op
+        """Launch the ring kernel for a previously-prepared op
         (``prepare_stream_only``) then run the stream-ordered finish copy-OUT into
         ``output_data``. ``barrier`` controls the finish ShmemBarrierOnStream
         (defer it like ``defer_inter_fin``). Pairs with ``prepare_stream_only``.
@@ -632,22 +628,19 @@ class InterNodeRingAllgather:
         barrier: bool = True,
         cu_copyout: Optional[bool] = None,
     ) -> bool:
-        """stream-ordered ring finish copy-OUT ONLY -- the ring
-        kernel was already launched ELSEWHERE (e.g. by the FUSED
-        ``FusedRingLocalGatherKernel_u32`` that runs the ring concurrently with
-        the local-block SDMA gather in one grid). This issues just the copy-OUT of
-        the gathered ring buffer into ``output_data`` + the (optionally deferred)
-        ShmemBarrierOnStream reuse fence. Pairs with ``prepare_stream_only`` +
-        the external fused kernel launch. ``barrier`` mirrors ``defer_inter_fin``.
+        """Stream-ordered ring finish copy-OUT ONLY -- the ring kernel was already
+        launched ELSEWHERE (e.g. by the fused ``FusedRingLocalGatherKernel_u32``
+        that runs the ring concurrently with the local-block SDMA gather in one
+        grid). Issues just the copy-OUT of the gathered ring buffer into
+        ``output_data`` + the (optionally deferred) ShmemBarrierOnStream reuse
+        fence. Pairs with ``prepare_stream_only`` + the external fused kernel
+        launch. ``barrier`` mirrors ``defer_inter_fin``.
 
         ``cu_copyout`` overrides the global MORI_HIER_RING_CU_COPYOUT choice for
-        THIS call: the CU RingFinishCopyKernel_u32 moves the WHOLE ring buffer on
-        COMPUTE UNITS, which burns CUs on bulk all-gather bytes -- forbidden on
-        the fuse_local win path (the thesis is bulk bytes ride SDMA/RDMA only, so
-        CUs stay free for the GEMM). The fused ring||local-gather overlap already
-        beats RCCL bit-exact with the COPY-ENGINE finish, i.e. the win is the
-        overlap, not the CU copy. So the fuse_local caller passes
-        cu_copyout=False to stay red-line compliant. None = use the global env.
+        THIS call: the CU RingFinishCopyKernel_u32 moves the whole ring buffer on
+        compute units, which burns CUs on bulk all-gather bytes. On the fuse_local
+        path bulk bytes must ride SDMA/RDMA only (CUs stay free for the GEMM), so
+        the fuse_local caller passes cu_copyout=False. None = use the global env.
         """
         byte_count = count * output_data.element_size()
         u32_count = (byte_count + 3) // 4
@@ -662,7 +655,7 @@ class InterNodeRingAllgather:
         return True
 
     def full_tensor(self, count: int, dtype, device=None):
-        """A torch view of the FULL ring buffer (``ring_size * count`` elements).
+        """Torch view of the FULL ring buffer (``ring_size * count`` elements).
 
         After ``__call__(..., out_in_place=True)`` the ring buffer holds the
         ``ring_size`` gathered chunks in ring order -- the full rank-major
@@ -677,7 +670,7 @@ class InterNodeRingAllgather:
         return _ptr_to_tensor(ptr, total * 4, dtype, device)[: count * self.ring_size]
 
     def slot_tensor(self, count: int, dtype, device=None):
-        """A torch view of this PE's ring slot (``count`` elements of ``dtype``).
+        """Torch view of this PE's ring slot (``count`` elements of ``dtype``).
 
         Write this PE's chunk here (e.g. as the intra gather's output) and then
         call ``__call__(..., chunk_in_place=True)`` to run the ring without the
@@ -703,9 +696,9 @@ class IntraNodeSubGroupAllgatherSdma:
     position ``group_pos``) gather their ``count``-element shards over the SDMA
     copy engines (XGMI); after the call every member holds the ``group_size``
     shards concatenated in group-position order -- its node's contiguous block.
-    This is the SDMA-side building block of the hierarchical cross-node
-    AllGather (DESIGN: intra-node == SDMA). The default (``group_size=-1``) is
-    the flat whole-world SDMA gather (group_size=npes, group_pos=my_pe).
+    The SDMA-side building block of the hierarchical cross-node AllGather
+    (intra-node phase). The default (``group_size=-1``) is the flat whole-world
+    SDMA gather (group_size=npes, group_pos=my_pe).
 
     ``shmem`` must already be initialized (e.g. via
     ``mori.shmem.shmem_torch_process_group_init``) with ``my_pe``/``npes``.
@@ -743,16 +736,16 @@ class IntraNodeSubGroupAllgatherSdma:
         barrier: bool = True,
         prepare_barrier: bool = True,
     ) -> bool:
-        # M4: ``barrier=False`` skips the trailing ShmemBarrierAll in
-        # finish_sync. Safe only when an immediately-following global barrier
-        # synchronizes all PEs before any remote read (the PUSH gather's
-        # in-kernel flag-wait already makes this PE's node-block complete on
-        # kernel return). Used by HierAllGather's fused-barrier path.
-        # M4: ``prepare_barrier=False`` additionally skips the ENTRY
-        # ShmemBarrierAll in prepare_sync. Safe only when the PREVIOUS pipeline
-        # iteration ended with a global barrier (so every peer's out_ transit is
-        # free) AND this is not the first call (out_ already registered). The
-        # caller (HierAllGather) enforces both via a first-call guard.
+        # ``barrier=False`` skips the trailing ShmemBarrierAll in finish_sync.
+        # Safe only when an immediately-following global barrier synchronizes all
+        # PEs before any remote read (the PUSH gather's in-kernel flag-wait
+        # already makes this PE's node-block complete on kernel return). Used by
+        # HierAllGather's fused-barrier path.
+        # ``prepare_barrier=False`` additionally skips the ENTRY ShmemBarrierAll
+        # in prepare_sync. Safe only when the PREVIOUS pipeline iteration ended
+        # with a global barrier (so every peer's out_ transit is free) AND this
+        # is not the first call (out_ already registered). The caller
+        # (HierAllGather) enforces both via a first-call guard.
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
         s = _stream_to_int(stream)
@@ -817,11 +810,10 @@ class IntraNodeSubGroupAllgatherSdma:
         )
         self._handle.finish_direct_stream(s, barrier)
         if host_sync:
-            # Triage variant: keep the copy-OUT eliminated (direct push) but
-            # restore a HOST completion fence (drain the stream so the SDMA
-            # pushes have globally landed before the consumer reads) -- isolates
-            # whether copy-out elimination is independently bit-exact from the
-            # stream-barrier weakening. Reintroduces a per-call host stall.
+            # Keep the copy-OUT eliminated (direct push) but restore a HOST
+            # completion fence (drain the stream so the SDMA pushes have globally
+            # landed before the consumer reads). Reintroduces a per-call host
+            # stall.
             (torch.cuda.current_stream() if stream is None else stream).synchronize()
         return True
 
@@ -834,15 +826,15 @@ class IntraNodeSubGroupAllgatherSdma:
         prepare_barrier: bool = True,
         dst_slot_stride: int = 0,
     ) -> bool:
-        # M5: launch ONLY the gather kernel (no copy-OUT), writing this
-        # gather's groupSize-slot block into ``out_`` at element offset
-        # ``dst_base_offset`` (of the input dtype). Used by the fused sliced path
-        # to stack the N reassembly gathers into disjoint regions of one enlarged
-        # transit; a single ``finish_batch`` then copies them all out at once.
-        # M5: ``dst_slot_stride`` (in elements of the input dtype, 0 ==
-        # contiguous) decouples the per-peer destination slot stride from the
-        # copy ``count``, so a CHUNK of a slice can land at its strided position
-        # inside a full-size block -- the chunked inter/intra pipeline enabler.
+        # Launch ONLY the gather kernel (no copy-OUT), writing this gather's
+        # groupSize-slot block into ``out_`` at element offset ``dst_base_offset``
+        # (of the input dtype). Used by the fused sliced path to stack the N
+        # reassembly gathers into disjoint regions of one enlarged transit; a
+        # single ``finish_batch`` then copies them all out at once.
+        # ``dst_slot_stride`` (in elements of the input dtype, 0 == contiguous)
+        # decouples the per-peer destination slot stride from the copy ``count``,
+        # so a CHUNK of a slice can land at its strided position inside a
+        # full-size block -- the chunked inter/intra pipeline enabler.
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
         dst_base_offset_bytes = dst_base_offset * input_data.element_size()
@@ -869,7 +861,7 @@ class IntraNodeSubGroupAllgatherSdma:
     def finish_batch(
         self, output_data, total_count: int, stream=None, barrier: bool = True
     ) -> bool:
-        # M5: one bulk copy-OUT of ``total_count`` elements (the full
+        # One bulk copy-OUT of ``total_count`` elements (the full
         # N*groupSize*chunk stacked by ``gather_kernel``) from ``out_`` to the
         # user output, then one barrier. Replaces N per-gather finish copies.
         byte_count = total_count * output_data.element_size()
@@ -881,16 +873,15 @@ class IntraNodeSubGroupAllgatherSdma:
     def finish_batch_stream(
         self, output_data, total_count: int, stream=None, barrier: bool = True
     ) -> bool:
-        # STREAM-ORDERED bulk copy-OUT. Same bytes as
-        # finish_batch but the trailing global fence is an on-device
-        # ShmemBarrierOnStream(stream) instead of host hipStreamSynchronize +
-        # ShmemBarrierAll. Removes the last host CPU<->GPU round-trip in the
-        # fused sliced Phase-B so the whole op stays enqueued on ``stream``.
-        # Pairs with the stream-ordered inter ring.
-        # ``barrier=False`` DEFERS the trailing fence to the
-        # next op's inter-ring prepare ShmemBarrierOnStream (redundant back-to-
-        # back across the op boundary). The copy-OUT stays stream-ordered so the
-        # output is correct regardless.
+        # STREAM-ORDERED bulk copy-OUT. Same bytes as finish_batch but the
+        # trailing global fence is an on-device ShmemBarrierOnStream(stream)
+        # instead of host hipStreamSynchronize + ShmemBarrierAll. Removes the last
+        # host CPU<->GPU round-trip in the fused sliced Phase-B so the whole op
+        # stays enqueued on ``stream``. Pairs with the stream-ordered inter ring.
+        # ``barrier=False`` DEFERS the trailing fence to the next op's inter-ring
+        # prepare ShmemBarrierOnStream (redundant back-to-back across the op
+        # boundary). The copy-OUT stays stream-ordered so the output is correct
+        # regardless.
         byte_count = total_count * output_data.element_size()
         u32_count = (byte_count + 3) // 4
         s = _stream_to_int(stream)
@@ -898,8 +889,8 @@ class IntraNodeSubGroupAllgatherSdma:
         return True
 
     def register_output_buffer(self, tensor) -> bool:
-        # register a user output tensor for DIRECT-TO-OUTPUT
-        # gathers (collective; cached). No-op if already registered.
+        # Register a user output tensor for DIRECT-TO-OUTPUT gathers (collective;
+        # cached). No-op if already registered.
         self._handle.register_output_buffer(
             tensor.data_ptr(), tensor.numel() * tensor.element_size()
         )
@@ -910,10 +901,10 @@ class IntraNodeSubGroupAllgatherSdma:
         return True
 
     def deregister_output_buffer_ptr(self, ptr: int) -> bool:
-        # deregister by raw base pointer (the live-registration
-        # tracker holds an int, not the original tensor, after the buffer was
-        # freed). Collective -- must be called in lockstep on every PE; the C++
-        # side looks up the stored extent so only the ptr is needed.
+        # Deregister by raw base pointer (the live-registration tracker holds an
+        # int, not the original tensor, after the buffer was freed). Collective --
+        # must be called in lockstep on every PE; the C++ side looks up the stored
+        # extent so only the ptr is needed.
         self._handle.deregister_output_buffer(ptr)
         return True
 
@@ -933,14 +924,14 @@ class IntraNodeSubGroupAllgatherSdma:
         dst_slot_stride: int = 0,
         flag_slot_base: int = 0,
     ) -> bool:
-        # DIRECT gather -- SDMA-PUSH each member's slice straight
-        # into the (registered) ``output_data`` at element offset
-        # ``dst_block_offset`` (of the input dtype), no internal transit + no
-        # copy-OUT. ``output_data`` MUST have been registered via
-        # register_output_buffer. ``dst_slot_stride`` matches gather_kernel.
-        # ``flag_slot_base`` gives a CONCURRENT lane a disjoint flag-slot
-        # region [flag_slot_base, +groupSize) so multi-stream reassembly gathers
-        # (MORI_HIER_REASM_STREAMS) never race on the shared flag slots (0=off).
+        # DIRECT gather -- SDMA-PUSH each member's slice straight into the
+        # (registered) ``output_data`` at element offset ``dst_block_offset`` (of
+        # the input dtype), no internal transit + no copy-OUT. ``output_data``
+        # MUST have been registered via register_output_buffer.
+        # ``dst_slot_stride`` matches gather_kernel. ``flag_slot_base`` gives a
+        # CONCURRENT lane a disjoint flag-slot region [flag_slot_base, +groupSize)
+        # so multi-stream reassembly gathers (MORI_HIER_REASM_STREAMS) never race
+        # on the shared flag slots (0=off).
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
         dst_block_offset_bytes = dst_block_offset * input_data.element_size()
@@ -977,10 +968,10 @@ class IntraNodeSubGroupAllgatherSdma:
         # FUSED param-contiguous direct gather -- ONE launch scatters ALL node
         # blocks * param splits from the Phase-A ``input_data`` collection
         # straight into the (registered) ``output_data`` in PARAM-CONTIGUOUS
-        # layout. Replaces the per-(block, param) gather_kernel_direct loop that
-        # made HierAllGather.enqueue_param_contiguous slower than RCCL. All size
-        # arguments are in u32-lane units. ``split_sizes_u32`` / ``split_offsets_
-        # u32`` are int64 DEVICE tensors (E_s / O_s per param, u32 lanes).
+        # layout. Replaces the per-(block, param) gather_kernel_direct loop. All
+        # size arguments are in u32-lane units. ``split_sizes_u32`` /
+        # ``split_offsets_u32`` are int64 DEVICE tensors (E_s / O_s per param,
+        # u32 lanes).
         s = _stream_to_int(stream)
         args = self._handle.prepare_sync_direct_param_contiguous(
             input_data.data_ptr(),
@@ -1011,10 +1002,10 @@ class IntraNodeSubGroupAllgatherSdma:
         prepare_barrier: bool = True,
         dst_slot_stride: int = 0,
     ) -> int:
-        # build the DIRECT-gather jit_args (prime the per-peer
-        # flag slots + optional entry barrier + register the strided output dst)
-        # and RETURN the int64 args pointer WITHOUT launching the kernel -- so the
-        # FUSED ``FusedRingLocalGatherKernel_u32`` can run this gather as a single
+        # Build the DIRECT-gather jit_args (prime the per-peer flag slots +
+        # optional entry barrier + register the strided output dst) and RETURN the
+        # int64 args pointer WITHOUT launching the kernel -- so the fused
+        # ``FusedRingLocalGatherKernel_u32`` can run this gather as a single
         # designated block of a larger grid (blockLocal=true) concurrently with
         # the inter-node RDMA ring. Mirrors ``gather_kernel_direct`` minus the
         # launch_struct; the returned ptr is the handle's jit_args_ member (kept
@@ -1037,57 +1028,55 @@ class IntraNodeSubGroupAllgatherSdma:
         return args
 
     def finish_direct_stream(self, stream=None, barrier: bool = True) -> bool:
-        # completion fence for the DIRECT path (no copy-OUT;
-        # gathers already pushed into the user output). On-device global fence.
+        # Completion fence for the DIRECT path (no copy-OUT; gathers already
+        # pushed into the user output). On-device global fence.
         s = _stream_to_int(stream)
         self._handle.finish_direct_stream(s, barrier)
         return True
 
 
 def launch_device_landing_gate(s: int) -> bool:
-    """Launch the DeviceLandingGateKernel_u32 on stream
-    ``s`` -- a 1-block/1-thread device drain of every mlx5 RDMA CQ/QP
-    (ShmemQuietThread<RDMA> live drain) + __threadfence_system. On-device
-    equivalent of a host stream.synchronize's hardware-queue drain, with NO CPU
-    round-trip: when it returns on the comm stream the FSDP-recorded completion
-    event coincides with the actual landing of every posted inter-node RDMA write.
-    Used as the landing fence for the backward big AG (MORI_HIER_SYNC_BIG_MODE=devgate).
+    """Launch the DeviceLandingGateKernel_u32 on stream ``s`` -- a 1-block/
+    1-thread device drain of every mlx5 RDMA CQ/QP (ShmemQuietThread<RDMA> live
+    drain) + __threadfence_system. On-device equivalent of a host
+    stream.synchronize's hardware-queue drain, with NO CPU round-trip: when it
+    returns on the comm stream the FSDP-recorded completion event coincides with
+    the actual landing of every posted inter-node RDMA write. Used as the landing
+    fence for the backward big AG (MORI_HIER_SYNC_BIG_MODE=devgate).
     """
     _get_ccl_func("DeviceLandingGateKernel_u32").launch((1,), (64,), 0, s, 0)
     return True
 
 
 def launch_l2_inv_only(s: int) -> bool:
-    """Launch L2InvOnlyKernel_u32 UNCONDITIONALLY (no env gate) on stream ``s`` -- a
-    tiny 512x1 fence-only grid whose system-scope ACQUIRE fence lowers to
+    """Launch L2InvOnlyKernel_u32 UNCONDITIONALLY (no env gate) on stream ``s`` --
+    a tiny 512x1 fence-only grid whose system-scope ACQUIRE fence lowers to
     ``buffer_inv sc0 sc1`` on gfx942, invalidating the shared device L2 so the
-    stream-ordered consumer GEMM re-fetches the fabric-landed HBM bytes. This is the
-    INVALIDATE half of the consume-side landing gate; it MUST be stream-ordered
-    AFTER the landing WAIT (device landing gate CQ-drain) so it drops a LANDED line,
-    not an un-landed one: INV-only alone re-fetches stale HBM because the peer
-    RDMA-WRITE has not landed yet. ~0 bytes moved.
+    stream-ordered consumer GEMM re-fetches the fabric-landed HBM bytes. This is
+    the INVALIDATE half of the consume-side landing gate; it MUST be
+    stream-ordered AFTER the landing WAIT (device landing gate CQ-drain) so it
+    drops a LANDED line, not an un-landed one (INV-only alone re-fetches stale HBM
+    because the peer RDMA-WRITE has not landed yet). ~0 bytes moved.
     """
     _get_ccl_func("L2InvOnlyKernel_u32").launch((512,), (1,), 0, s, 0, 0)
     return True
 
 
 def launch_l2_coherent_retouch(out_ptr: int, u32_count: int, s: int) -> bool:
-    """Launch L2CoherentRetouchKernel_u32 over ``u32_count``
-    uint32 words at device address ``out_ptr`` on stream ``s``. System-scope
-    acquire-load + release-store re-touch that bypasses stale L2 (the residual the
-    barriercutouch plain add-0 re-touch could not fix). Stream-ordered, no host
-    stall. See the kernel comment in ccl_kernels.hip.
+    """Launch L2CoherentRetouchKernel_u32 over ``u32_count`` uint32 words at
+    device address ``out_ptr`` on stream ``s``. System-scope acquire-load +
+    release-store re-touch that bypasses stale L2. Stream-ordered, no host stall.
+    See the kernel comment in ccl_kernels.hip.
     """
     if u32_count <= 0:
         return True
     _truthy = ("1", "true", "yes", "on")
-    # MORI_HIER_L2INV_ONLY (cheap variant):
-    # buffer_inv is a whole-cache op (invalidates the shared device L2, not an
-    # address range), so we do NOT need to touch every u32 to make the consumer GEMM
-    # re-fetch from HBM. Launch a tiny grid (one wave per CU is plenty to cover every
-    # per-CU L1 + the shared L2) that ONLY issues the system-scope ACQUIRE fence — ~0
-    # bytes moved vs the ~7% E2E cost of the full-buffer L2InvRetouch rewrite. Takes
-    # precedence over MORI_HIER_L2INV when both set. Default OFF.
+    # MORI_HIER_L2INV_ONLY (cheap variant): buffer_inv is a whole-cache op
+    # (invalidates the shared device L2, not an address range), so we do NOT need
+    # to touch every u32 to make the consumer GEMM re-fetch from HBM. Launch a
+    # tiny grid (one wave per CU is plenty to cover every per-CU L1 + the shared
+    # L2) that ONLY issues the system-scope ACQUIRE fence -- ~0 bytes moved.
+    # Takes precedence over MORI_HIER_L2INV when both set. Default OFF.
     if os.environ.get("MORI_HIER_L2INV_ONLY", "0").strip().lower() in _truthy:
         # MI300X gfx942 has ~304 CUs; 512 single-thread blocks covers every CU's L1.
         _get_ccl_func("L2InvOnlyKernel_u32").launch(
@@ -1098,12 +1087,11 @@ def launch_l2_coherent_retouch(out_ptr: int, u32_count: int, s: int) -> bool:
     blocks = (u32_count + threads - 1) // threads
     if blocks > 4096:
         blocks = 4096
-    # MORI_HIER_L2INV: use the L2-INVALIDATE
-    # retouch (real system-scope acquire/release fence => buffer_inv sc0 sc1 on
-    # gfx942) instead of the volatile-only kernel, which only bypasses L1 and so
-    # republishes the stale L2 line the consumer GEMM cached. This is the concrete
-    # consumer-coherence bug fix for the DEEP_PIPE device-fence drift. Default OFF
-    # (byte-identical shipped path).
+    # MORI_HIER_L2INV: use the L2-INVALIDATE retouch (real system-scope
+    # acquire/release fence => buffer_inv sc0 sc1 on gfx942) instead of the
+    # volatile-only kernel, which only bypasses L1 and so republishes the stale L2
+    # line the consumer GEMM cached. Closes the DEEP_PIPE device-fence consumer-
+    # coherence drift. Default OFF.
     _kern = "L2CoherentRetouchKernel_u32"
     if os.environ.get("MORI_HIER_L2INV", "0").strip().lower() in _truthy:
         _kern = "L2InvRetouchKernel_u32"
@@ -1114,16 +1102,15 @@ def launch_l2_coherent_retouch(out_ptr: int, u32_count: int, s: int) -> bool:
 def launch_fused_ring_local_gather(
     ring_args: int, gather_args: int, ring_blocks: int, s: int
 ) -> bool:
-    """merge a prepared inter-node ring's jit_args with a
-    prepared intra-node local-block direct-gather's jit_args (via the
-    ``build_fused_ring_local_gather_args`` C++ glue) and launch the FUSED
+    """Merge a prepared inter-node ring's jit_args with a prepared intra-node
+    local-block direct-gather's jit_args (via the
+    ``build_fused_ring_local_gather_args`` C++ glue) and launch the fused
     ``FusedRingLocalGatherKernel_u32`` ONCE on stream ``s`` with ``ring_blocks +
     1`` CTAs: blocks ``[0, ring_blocks)`` run the RDMA ring (Phase A, over the
     NIC) and the last block runs the local node-block SDMA reassembly gather
-    (Phase B, m == node_id -- the half independent of the ring) over XGMI. This
-    replaces the two serial kernel launches + host ``wait_stream`` merge of the
-    overlap path with one concurrent grid (NIC ring || XGMI gather), the
-    RCCL-parity lever this work proved out, adopted here.
+    (Phase B, m == node_id -- the half independent of the ring) over XGMI.
+    Replaces the two serial kernel launches + host ``wait_stream`` merge of the
+    overlap path with one concurrent grid (NIC ring || XGMI gather).
     """
     rb = ring_blocks if ring_blocks and ring_blocks >= 1 else 1
     fused = mori_cpp.build_fused_ring_local_gather_args(ring_args, gather_args, rb)
@@ -1146,18 +1133,19 @@ def launch_fused_ring_remote_gather(
     reasm_deep_sq: int = 0,
     parity_ptr: int = 0,
 ) -> bool:
-    """PHASE 4: launch the FUSED, PIPELINED ``FusedRingRemoteGatherKernel_u32`` ONCE
-    on stream ``s`` with ``2*ring_blocks + 1`` CTAs. Blocks ``[0, ring_blocks)`` run
-    the RDMA ring (Phase A) and each publishes ``chunkReadyFlags[bid]`` on landing;
-    block ``[ring_blocks]`` runs the ring-independent LOCAL node-block SDMA gather;
-    blocks ``(ring_blocks, 2*ring_blocks]`` each spin on ``chunkReadyFlags[j]`` and,
-    the instant sub-range ``j`` lands, SDMA-push that sub-range of every remote block
-    from this PE's ring buffer straight into the registered output -- overlapping ring
-    channel ``j+1`` still crossing the NIC (closes the two-serial-phases gap). The
-    ``gather_args`` must be the LOCAL block's prepared direct-gather jit_args
-    (dst_slot_stride == count, dst_block_offset == node_id*block_count); the remote
-    blocks derive their offsets from the ring buffer. ``chunk_ready_flags_ptr`` is a
-    device uint64 buffer of >= ring_blocks entries, ZEROED before this launch.
+    """Launch the FUSED, PIPELINED ``FusedRingRemoteGatherKernel_u32`` ONCE on
+    stream ``s`` with ``2*ring_blocks + 1`` CTAs. Blocks ``[0, ring_blocks)`` run
+    the RDMA ring (Phase A) and each publishes ``chunkReadyFlags[bid]`` on
+    landing; block ``[ring_blocks]`` runs the ring-independent LOCAL node-block
+    SDMA gather; blocks ``(ring_blocks, 2*ring_blocks]`` each spin on
+    ``chunkReadyFlags[j]`` and, the instant sub-range ``j`` lands, SDMA-push that
+    sub-range of every remote block from this PE's ring buffer straight into the
+    registered output -- overlapping ring channel ``j+1`` still crossing the NIC
+    (closes the two-serial-phases gap). The ``gather_args`` must be the LOCAL
+    block's prepared direct-gather jit_args (dst_slot_stride == count,
+    dst_block_offset == node_id*block_count); the remote blocks derive their
+    offsets from the ring buffer. ``chunk_ready_flags_ptr`` is a device uint64
+    buffer of >= ring_blocks entries, ZEROED before this launch.
     """
     rb = ring_blocks if ring_blocks and ring_blocks >= 1 else 1
     reasm = reassembly_blocks if reassembly_blocks and reassembly_blocks >= 1 else rb
@@ -1173,10 +1161,11 @@ def launch_fused_ring_remote_gather(
         reasm_deep_sq,
     )
     # SAME-CTA INLINE REASSEMBLY (MORI_HIER_INLINE_REASM): on the multiBlock ring
-    # (rb>1) each ring channel CTA reassembles its OWN landed sub-range inline, so the
-    # dedicated reassembly CTAs are redundant -- drop them (grid rb+1 instead of
-    # 2*rb+1). Mirror the C++ builder gate: rb>1, no host-proxy inter, default reasm
-    # (reassembly_blocks<=0 => reasm==rb, no elastic). deepPipe is forced 1 at rb>1.
+    # (rb>1) each ring channel CTA reassembles its OWN landed sub-range inline, so
+    # the dedicated reassembly CTAs are redundant -- drop them (grid rb+1 instead
+    # of 2*rb+1). Mirrors the C++ builder gate: rb>1, no host-proxy inter, default
+    # reasm (reassembly_blocks<=0 => reasm==rb, no elastic). deepPipe forced 1 at
+    # rb>1.
     _inline_reasm = False
     if rb > 1 and (reassembly_blocks is None or reassembly_blocks <= 0):
         _e = os.environ.get("MORI_HIER_INLINE_REASM", "")
@@ -1211,10 +1200,10 @@ class IntraNodeSubGroupBroadcastSdma:
     The ``group_size`` ranks ``{pe_base, pe_base+pe_stride, ...}`` (this PE at
     position ``group_pos``) receive the full ``count``-element buffer held by the
     root (``group_pos == 0``) over the SDMA copy engines (XGMI). After the call
-    every member's output equals the root's input. This is the placement-side
-    building block of the leader-only hierarchical cross-node AllGather (DESIGN:
-    intra-node == SDMA). The default (``group_size=-1``) broadcasts from rank 0
-    over the whole world.
+    every member's output equals the root's input. The placement-side building
+    block of the leader-only hierarchical cross-node AllGather (intra-node
+    phase). The default (``group_size=-1``) broadcasts from rank 0 over the whole
+    world.
 
     ``shmem`` must already be initialized (e.g. via
     ``mori.shmem.shmem_torch_process_group_init``) with ``my_pe``/``npes``.

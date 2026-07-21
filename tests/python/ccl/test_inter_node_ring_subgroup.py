@@ -34,7 +34,7 @@ order -- i.e. ``concat(input[g], input[g+G], ..., input[g+(N-1)*G])``.
 
 Single-node this exercises the *same* kernel code path that runs over RDMA
 across nodes (sub-group neighbours are reached via shmem put; cross-node they go
-over RDMA). AllGather is a pure data move => ZERO tolerance (``torch.equal``).
+over RDMA). AllGather is a pure data move => zero tolerance (``torch.equal``).
 
   python3 tests/python/ccl/test_inter_node_ring_subgroup.py --world-size 4 --ranks-per-node 2
 """

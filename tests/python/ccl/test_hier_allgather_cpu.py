@@ -23,10 +23,10 @@
 
 This validates ``hier_allgather_reference`` -- the executable specification of
 the 3-phase hierarchical AllGather data movement (intra-node SDMA gather ->
-inter-node RDMA gather -> placement) -- WITHOUT any GPU, SDMA or RDMA. It
+inter-node RDMA gather -> placement) -- without any GPU, SDMA or RDMA. It
 proves the byte/element offset arithmetic reproduces, bit-exactly, the
 rank-major ordering of ``torch.distributed.all_gather_into_tensor`` for the
-N>=2 (multi-node) decomposition before the device kernels (M2) are wired up.
+N>=2 (multi-node) decomposition.
 
 The torch reference for AllGather is a pure data move: the output is simply
 ``concat(shard[0], ..., shard[world-1])`` in rank order. We assert
@@ -49,11 +49,11 @@ from mori.ccl.hier_allgather import (
     inter_node_ring_reference,
 )
 
-# (num_nodes N, ranks_per_node G) layouts to exercise. Includes the DESIGN.md
-# contract case N=2,G=4 plus a few others to stress the offset math.
+# (num_nodes N, ranks_per_node G) layouts to exercise. Includes the contract
+# case N=2,G=4 plus a few others to stress the offset math.
 LAYOUTS = [
-    (1, 4),  # degenerate single-node (M1)
-    (2, 4),  # DESIGN.md contract world=8
+    (1, 4),  # degenerate single-node
+    (2, 4),  # contract world=8
     (2, 8),  # full node
     (3, 2),  # uneven N
     (4, 1),  # one rank per node (pure inter-node)
@@ -96,7 +96,7 @@ def _intra_gather(shards, N, G):
 
 
 def run_ring() -> int:
-    """Validate the inter-node ring schedule (M2 RDMA phase) bit-exactly.
+    """Validate the inter-node ring schedule (RDMA phase) bit-exactly.
 
     Composes the real phases the device path will run: intra-node gather
     (SDMA) -> inter-node ring (RDMA, AllGatherRingKernel schedule) ->
@@ -234,9 +234,9 @@ def _make_hier_stub(
     Python ``_prev_op_completed`` state machine in __call__, so we construct the
     object via ``object.__new__`` and set just the attributes that path reads.
 
-    ``gather_in_place`` selects the in-place return site (line ~624 of
-    hier_allgather.py) instead of the default staged site (~649); both share the
-    crash-recovery guard but are distinct return paths.
+    ``gather_in_place`` selects the in-place return site instead of the default
+    staged site; both share the crash-recovery guard but are distinct return
+    paths.
     """
     h = object.__new__(HierAllGather)
     h.num_nodes = 2
@@ -266,14 +266,13 @@ def _make_hier_stub(
 def run_fuse_barrier_guard() -> int:
     """Unit-test the fuse-barrier entry-barrier crash-recovery guard.
 
-    The committed ``_prev_op_completed`` guard decides whether __call__ may skip
-    the intra-gather ENTRY ShmemBarrierAll. It must be skipped ONLY when the
-    prior op ran to clean completion; the first op AND any op after a
-    mid-pipeline crash must KEEP the barrier (a dirty out_ buffer would
-    otherwise corrupt the gather). This was flagged in review (/53) as
-    having no exception-path test. CPU-only: no GPU/SDMA/RDMA.
+    The ``_prev_op_completed`` guard decides whether __call__ may skip the
+    intra-gather entry ShmemBarrierAll. It must be skipped only when the prior
+    op ran to clean completion; the first op and any op after a mid-pipeline
+    crash must keep the barrier (a dirty out_ buffer would otherwise corrupt the
+    gather). CPU-only: no GPU/SDMA/RDMA.
 
-    ``prepare_barrier=True`` means the barrier is KEPT; ``False`` means SKIPPED.
+    ``prepare_barrier=True`` means the barrier is kept; ``False`` means skipped.
     """
     failures = 0
     inp = torch.zeros(8, dtype=torch.float32)
@@ -304,7 +303,7 @@ def run_fuse_barrier_guard() -> int:
         "steady-state op must SKIP entry barrier",
     )
 
-    # 2) Mid-pipeline crash: next op must KEEP the barrier (out_ may be dirty).
+    # 2) Mid-pipeline crash: next op must keep the barrier (out_ may be dirty).
     h = _make_hier_stub(fuse_barrier=True)
     h._call_impl(inp, out, 4)  # clean -> _prev_op_completed True, would skip next
     h._intra.raise_next = True

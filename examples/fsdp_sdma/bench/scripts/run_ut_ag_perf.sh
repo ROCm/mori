@@ -2,15 +2,14 @@
 # Cross-node (w16, 2 node x 8 GPU) standalone AllGather-perf UT runner with TWO
 # switch presets for the mori device (ibgda_sdma) handle:
 #
-#   perf : "pure performance"  — standalone_fast fan-out + all tuning knobs
-#          (MORI_HIER_UT_FAST=1 + CROWN + DEEP_PIPE=auto + SDMA_NUM_CHANNELS=8 +
-#           NIC_NUMA_LOCAL, debug_sync OFF). FAST but NOT E2E-legal: the E2E FSDP
-#           adapter never constructs HierAllGather with standalone_fast.
+#   perf : standalone_fast fan-out + all tuning knobs (MORI_HIER_UT_FAST=1 +
+#          CROWN + DEEP_PIPE=auto + SDMA_NUM_CHANNELS=8 + NIC_NUMA_LOCAL,
+#          debug_sync OFF). Fast but not E2E-legal: the E2E FSDP adapter never
+#          constructs HierAllGather with standalone_fast.
 #
-#   e2e  : "E2E-stable"         — the exact construction the w16 E2E FSDP run uses
-#          (MORI_HIER_UT_FAST=0 + fuse knobs + DEBUG_SYNC=1 + CUDA_GRAPH=0). Bit-exact,
-#          proven E2E-safe (Jul-13 500-step w16 mori run == native GT, 100/100 windows).
-#          THIS is the shipped/representative UT.
+#   e2e  : the exact construction the w16 E2E FSDP run uses (MORI_HIER_UT_FAST=0 +
+#          fuse knobs + DEBUG_SYNC=1 + CUDA_GRAPH=0). Bit-exact and E2E-safe; the
+#          representative UT.
 #
 # RCCL (all_gather_into_tensor) is measured inline in both presets as the reference.
 # usage: bash run_ut_ag_perf.sh <perf|e2e> [sizes_mb...]

@@ -47,7 +47,7 @@ alongside them.
 
 ### 1. Standalone AllGather bandwidth vs RCCL (E2E-stable config)
 
-The shipped E2E construction (`MORI_HIER_UT_FAST=0`, device `ibgda_sdma`) is
+The default E2E construction (`MORI_HIER_UT_FAST=0`, device `ibgda_sdma`) is
 bit-exact and tracks RCCL closely, converging as the message grows. A single
 AllGather is **not** where the win is — the collective is network-bound and
 GPU-light, so standalone bandwidth is near-parity, not a beat:
@@ -90,9 +90,9 @@ throughput beats the framework default. Three mori variants (intra × inter leg)
 ![E2E loss](bench/results/mi300x_mlx5/e2e_all_w16_loss.png)
 ![E2E throughput](bench/results/mi300x_mlx5/e2e_all_w16_tflops.png)
 
-## Shipped default path vs experimental knobs
+## Default path vs experimental knobs
 
-The **shipped default path** — what every FSDP/E2E caller gets with no
+The **default path** — what every FSDP/E2E caller gets with no
 `MORI_HIER_*` env set — is:
 
 - **Sliced 2-D AllGather** (`MORI_HIER_SLICE=1`, the default): inter-node RDMA
@@ -104,7 +104,7 @@ The **shipped default path** — what every FSDP/E2E caller gets with no
 - **Serial `slice_direct` gather** (fused `ring || local-gather` kernel
   `MORI_HIER_FUSE_LOCAL` is **OFF** by default — see below), CU-domain copy-out
   (`MORI_HIER_PY_CU_COPYOUT=1`).
-- At `ranks_per_node >= 8` (the w16 shipped config) the two cross-PE finish
+- At `ranks_per_node >= 8` (the w16 config) the two cross-PE finish
   fences are forced ON for bit-exactness (`_apply_dense_node_defaults`).
 
 The default does **not** require setting any env var; the flags above document
@@ -112,21 +112,21 @@ the internal defaults, not a required incantation.
 
 ### Experimental / unstable knobs (OFF by default — do not enable in production)
 
-These are opt-in levers kept for A/B benchmarking. They are either unstable under
-E2E FSDP tight overlap or pure diagnostics; leaving them unset is the shipped,
+These are opt-in levers kept for benchmarking. They are either unstable under
+E2E FSDP tight overlap or pure diagnostics; leaving them unset is the default,
 bit-exact path:
 
 | flag | status | why OFF by default |
 |---|---|---|
-| `MORI_HIER_FUSE_LOCAL` | **experimental / unstable** | fused ring‖local-gather kernel produces stale remote-half output on ~48% of AGs under FSDP tight back-to-back overlap; standalone-only. Opt in via `standalone_fast=True` or the env for standalone A/B. |
+| `MORI_HIER_FUSE_LOCAL` | **experimental / unstable** | fused ring‖local-gather kernel produces stale remote-half output under FSDP tight back-to-back overlap; standalone-only. Opt in via `standalone_fast=True` or the env for standalone runs. |
 | `MORI_HIER_PC_OVERLAP` (`SLICE_PIPE_OVERLAP`) | experimental | chunked inter/intra pipeline overlap; per-chunk landing fence is fabric-sensitive. Only auto-composed in `deferbwd` mode. |
 | `MORI_HIER_DEBUG_SYNC` | **diagnostic** | forces a full host `stream.synchronize()` per op (isolation probe); kills all overlap. |
 | `MORI_FSDP_NO_ZERO_COPY` | experimental | disables the zero-copy output path. |
 | `MORI_FSDP_DEFER_HOSTSYNC` | experimental | harness-side deferred backward host-drain; in-tree counterpart is `MORI_HIER_SYNC_BIG_MODE=deferbwd`. |
 | `MORI_HOSTPROXY_ASYNC` / `_DRAIN` / `_RING` | experimental | async host-proxy inter-node paths; not the shipped device (`ibgda_sdma`) path. |
 
-Env overrides always win, so any of the shipped defaults above can be flipped for
-A/B (e.g. `MORI_HIER_SLICE=0` restores the pre-slice baseline).
+Env overrides always win, so any of the defaults above can be flipped
+(e.g. `MORI_HIER_SLICE=0` restores the pre-slice baseline).
 
 ## Second platform (MI355X + AINIC / ionic)
 
@@ -150,7 +150,7 @@ cd examples/fsdp_sdma/bench/scripts
 
 # 1) Standalone AllGather bandwidth UT (device ibgda_sdma vs RCCL)
 #    -> ../results/mi300x_mlx5/ag_perf_e2e_stable_w16.png
-bash run_ut_ag_perf.sh e2e  64 128 256 512   # E2E-stable (shipped) config
+bash run_ut_ag_perf.sh e2e  64 128 256 512   # E2E-stable (default) config
 bash run_ut_ag_perf.sh perf 64 128 256 512   # pure-perf (standalone_fast, NOT E2E-legal), for context
 python ../results/mi300x_mlx5/raw/plot_ag_perf.py   # (re)draw the figure from the run (or committed CSV)
 

@@ -103,15 +103,14 @@ namespace shmem {
     }                                                                       \
   } while (0)
 
-// DRAIN-FREE LANDING FENCE helper (MORI_HIER_SIGNAL_FENCE, MLX5 only). On RoCE RC
-// a WRITE is not ordered before a following ATOMIC on the SAME QP, so the fused
+// Drain-free landing fence helper (MORI_HIER_SIGNAL_FENCE, MLX5 only). On RoCE RC
+// a WRITE is not ordered before a following ATOMIC on the same QP, so the fused
 // put-with-signal AMO can reach the receiver's flag slot before its own large
-// payload WRITE lands (>=64MB flag-beats-data race -> stale-read, loses bit-exact).
-// OR the mlx5 strong-ordering fence bits into the just-posted atomic WQE's fm_ce_se
-// (ctrl byte 11) so the HCA holds the atomic until all prior WQEs (incl. the payload
-// write) complete. Near-free HW fence vs the send-CQ quiet-drain (which serializes
-// the DEEP_PIPE pipeline back to ~0.88x). INERT when signalFenceMode==0 (default) =>
-// byte-identical shipped path. atomicPostIdx = the WQE index passed to PostAtomic.
+// payload WRITE lands (>=64MB flag-beats-data race -> stale read). OR the mlx5
+// strong-ordering fence bits into the just-posted atomic WQE's fm_ce_se (ctrl byte
+// 11) so the HCA holds the atomic until all prior WQEs (incl. the payload write)
+// complete. HW fence in place of the send-CQ quiet-drain round-trip. Inert when
+// signalFenceMode==0 (default). atomicPostIdx = the WQE index passed to PostAtomic.
 inline __device__ void MaybeFenceSignalAtomicWqe(core::WorkQueueHandle* wq,
                                                  uint32_t atomicPostIdx) {
   int fenceMode = GetGlobalGpuStatesPtr()->signalFenceMode;
@@ -545,13 +544,13 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   size_t currentOffset = 0;
   size_t remaining = bytes;
 
-  // batched doorbell (this work): when MORI_RDMA_PUT_BATCH_DB is set together with
-  // putChunkBytes>0, ring the send doorbell once per FLUSH window instead of once
+  // Batched doorbell: when MORI_RDMA_PUT_BATCH_DB is set together with
+  // putChunkBytes>0, ring the send doorbell once per flush window instead of once
   // per chunk WQE (each ring is an MMIO store + 3 __threadfence_system). flushThresh
   // bounds the un-rung WQEs to <= sqWqeNum/4 so the free-entry backpressure below
   // always has rung (completable) WQEs to drain -> deadlock-safe regardless of the
   // chunk count. Gated to the single-active-lane put (the ring/fanOut warp put) so
-  // multi-lane collective posts keep the proven per-iteration ring.
+  // multi-lane collective posts keep the per-iteration ring.
   const bool batchDb =
       globalGpuStates->batchPutDoorbell && !needsChunking && globalGpuStates->putChunkBytes != 0;
   const uint64_t flushThresh = batchDb ? ((wq->sqWqeNum >> 2) > 0 ? (wq->sqWqeNum >> 2) : 1) : 0;
@@ -589,17 +588,15 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       lkey = useRail2 ? source->lkey2 : source->lkey;
       srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
       raddr = dest->peerPtrs[pe] + destOffset + currentOffset;
-      // Dual-rail: useRail2 gates on heapObj->hasRail2 , but a per-op
-      // dest SymmMemObj sub-object never carries rail-2 arrays => peerRkeys2 is nullptr;
-      // dereferencing it (pe=0 -> address 0x0) is the "Memory access fault on address
-      // (nil)" the arm hit. Guard the pointer: fall back to the rail-1 rkey when the
-      // object has no rail-2 array. Default-off (useRail2 false) => byte-identical.
+      // Dual-rail: useRail2 gates on heapObj->hasRail2, but a per-op dest
+      // SymmMemObj sub-object never carries rail-2 arrays => peerRkeys2 is nullptr;
+      // dereferencing it (pe=0 -> address 0x0) faults. Guard the pointer: fall back
+      // to the rail-1 rkey when the object has no rail-2 array.
       rkey = (useRail2 && dest->peerRkeys2) ? dest->peerRkeys2[pe] : dest->peerRkeys[pe];
-      // this work (transport in-flight depth): optionally split a large put into
-      // multiple WQEs of at most putChunkBytes so several stay in flight per QP
-      // (the WQ free-entry backpressure below drains as needed). 0 => single WQE
-      // (the proven default). This re-uses the same multi-iteration post loop the
-      // VMM-heap path already exercises, so it is a tested posting pattern.
+      // Transport in-flight depth: optionally split a large put into multiple WQEs
+      // of at most putChunkBytes so several stay in flight per QP (the WQ free-entry
+      // backpressure below drains as needed). 0 => single WQE. Re-uses the same
+      // multi-iteration post loop the VMM-heap path already exercises.
       {
         size_t pcb = globalGpuStates->putChunkBytes;
         transfer_size = (pcb != 0 && remaining > pcb) ? pcb : remaining;
@@ -695,8 +692,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       static_assert(false);
     }
     __threadfence_system();
-    // batched doorbell (this work): with batchDb, defer the send-doorbell ring
-    // across chunk WQEs -- flush on the LAST chunk or when the un-rung window
+    // Batched doorbell: with batchDb, defer the send-doorbell ring across chunk
+    // WQEs -- flush on the last chunk or when the un-rung window
     // reaches flushThresh (deadlock guard). The WQE is always posted (PostWrite
     // above) and the SQ bookkeeping (dbTouchIdx / needConsIdx) always advances;
     // only the dbr-record update + doorbell MMIO are batched. One final
@@ -794,15 +791,14 @@ inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::RDM
 }
 
 // -----------------------------------------------------------------------------
-// WRITE_WITH_IMM send (Phase-6 cross-node ring accuracy fix). Structurally
-// identical to ShmemPutMemNbiThreadKernelImpl's PSD posting path, but posts an
+// WRITE_WITH_IMM send (cross-node ring accuracy fix). Structurally identical to
+// ShmemPutMemNbiThreadKernelImpl's PSD posting path, but posts an
 // RDMA_WRITE_WITH_IMM WQE carrying a 32-bit immediate instead of a plain
 // RDMA_WRITE. On an RC QP the responder makes the payload globally visible
 // before generating the recv-CQE that carries the immediate, so a receiver that
 // waits on the recv-CQ (PollRecvCqImm) can only proceed after the data has
-// physically landed -- with NO host stream-drain. This is the transport
-// guarantee that flag/AMO ordering and device-side barriers cannot provide (the
-// residual FSDP loss race on the big embed/lm_head cross-node all-gathers).
+// physically landed -- with no host stream-drain. This is the transport
+// guarantee that flag/AMO ordering and device-side barriers cannot provide.
 // PSD/ionic only; the immediate value lets the receiver identify which chunk/
 // round the completion belongs to. Nothing calls this yet (send-side wiring);
 // the ring-kernel receiver switch + recv-WQE pre-post land as follow-ups.
@@ -933,7 +929,7 @@ inline __device__ void ShmemPutMemImmWarpKernel<application::TransportType::RDMA
 }
 
 // -----------------------------------------------------------------------------
-// WRITE_WITH_IMM receiver scaffold (Phase-6). A responder consuming an
+// WRITE_WITH_IMM receiver scaffold. A responder consuming an
 // RDMA_WRITE_WITH_IMM produces a recv-CQE only AFTER the write payload has
 // landed globally, so the receiver must have recv WQEs pre-posted on its RQ.
 // ShmemPostRecvImmThreadKernelImpl posts `count` recv WQEs on the RQ for
@@ -1432,7 +1428,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
                 sizeof(signalValue), core::atomicType::AMO_ADD);
             // Drain-free landing fence: strong-order this signal AMO after the
             // payload WRITE on the same QP (see MaybeFenceSignalAtomicWqe). INERT
-            // unless MORI_HIER_SIGNAL_FENCE is set (byte-identical shipped path).
+            // unless MORI_HIER_SIGNAL_FENCE is set.
             MaybeFenceSignalAtomicWqe(wq, my_sq_counter + 1);
           } else if constexpr (PrvdType == core::ProviderType::BNXT) {
             dbr_val = core::PostAtomic<PrvdType>(
@@ -2547,7 +2543,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
                 sizeof(signalValue), core::atomicType::AMO_ADD);
             // Drain-free landing fence: strong-order this signal AMO after the
             // payload WRITE on the same QP (see MaybeFenceSignalAtomicWqe). INERT
-            // unless MORI_HIER_SIGNAL_FENCE is set (byte-identical shipped path).
+            // unless MORI_HIER_SIGNAL_FENCE is set.
             MaybeFenceSignalAtomicWqe(wq, my_sq_counter + 1);
           } else if constexpr (PrvdType == core::ProviderType::BNXT) {
             dbr_val = core::PostAtomic<PrvdType>(

@@ -26,7 +26,7 @@ Files: `raw/e2e_w16_RCCL.log`, `raw/e2e_w16_hp_sdma.log` (raw run logs),
 
 ## How to reproduce
 
-Both use the SAME one-key script `examples/fsdp_sdma/bench/scripts/run_e2e.sh`. It runs
+Both use the same one-key script `examples/fsdp_sdma/bench/scripts/run_e2e.sh`. It runs
 `native` then `mori` and writes `../results/e2e_<world>_{native,mori}.log`. Compare
 `last_loss` (must be bit-identical) and `avg_tflops_per_gpu`. The `mori` path is the
 host-proxy ASYNC backend (a single env line inside the script, shown below).
@@ -69,5 +69,5 @@ MORI_SHMEM_HEAP_SIZE=17179869184 MORI_HOSTPROXY_ASYNC=1
 staging (`ASYNC_RING=2`) and the landing drain (`ASYNC_DRAIN=1`) that keep it bit-exact.
 
 Notes: figures were captured at `--warmup 30` (mori is already steady from step 0, so the
-shipped `--warmup 6` reproduces the same headline). Regenerate figures with
+default `--warmup 6` reproduces the same headline). Regenerate figures with
 `python3 plot_mi355x_ainic.py`.

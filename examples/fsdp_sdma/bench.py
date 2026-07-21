@@ -239,16 +239,13 @@ def _apply_fsdp2(
                 m.set_custom_all_gather(ag)
 
     # MORI_FSDP_FWD_PREFETCH=D (default OFF): explicit forward-prefetch depth.
-    # The residual gap is the CU-free SDMA-intra fill on the big AGs sitting on the
-    # serial all_gather_stream with too small an overlap window. Issue each decoder
-    # layer's AG D layers earlier from the CPU so the CU-free SDMA/RDMA fill overlaps
-    # more forward GEMM compute. Since the per-layer AGs
-    # (reshard_after_forward=True) free and recycle their buffer, depth is capped to
-    # what the deferred landing fence covers.
-    # Shipped-safe guard: depth>=2 races the deferred copy-out fence (two AGs in
-    # flight, so the deferred landing fence covers only one) and the loss drifts, so
-    # depth is hard-clamped to 1 unless MORI_FSDP_FWD_PREFETCH_UNSAFE=1 explicitly
-    # opts into the drifting deeper depth for measurement only (never shipped).
+    # Issue each decoder layer's AG D layers earlier from the CPU so the CU-free
+    # SDMA/RDMA fill overlaps more forward GEMM compute. Per-layer AGs
+    # (reshard_after_forward=True) free and recycle their buffer, so depth is
+    # capped to what the deferred landing fence covers: depth>=2 leaves two AGs in
+    # flight while the deferred fence covers only one, so the loss drifts. Depth is
+    # hard-clamped to 1 unless MORI_FSDP_FWD_PREFETCH_UNSAFE=1 opts into the deeper
+    # (drifting) depth for measurement only.
     _fwd_pf = os.environ.get("MORI_FSDP_FWD_PREFETCH", "").strip()
     if _fwd_pf and _fwd_pf not in ("0", "false", "False"):
         depth = max(1, int(_fwd_pf))
@@ -266,15 +263,13 @@ def _apply_fsdp2(
             if nxt:
                 layer.set_modules_to_forward_prefetch(nxt)
 
-    # LEVER (MORI_FSDP_BIG_PREFETCH=1, default OFF): target the ACTUAL long pole --
-    # the giant embed/lm_head AG (the 54/46 profile: it IS the whole step). Decoder
-    # FWD_PREFETCH above helped 7% but leaves the giant AG exposed. Requires
-    # MORI_FSDP_SPLIT_ROOT so embed_tokens + lm_head are their OWN fully_shard units;
-    # then wire the LAST decoder layer to forward-prefetch the lm_head group, issuing
-    # the giant lm_head AG from the CPU during the last transformer layer's forward
-    # GEMM -- manufacturing the compute window the transport levers cannot reach.
-    # Keeps ONE big AG in flight at a time (last-layer decoder AG has already landed
-    # + resharded before lm_head runs) so the deferred landing fence stays valid.
+    # MORI_FSDP_BIG_PREFETCH=1 (default OFF): target the giant embed/lm_head AG,
+    # which dominates the step. Requires MORI_FSDP_SPLIT_ROOT so embed_tokens +
+    # lm_head are their own fully_shard units; then wire the last decoder layer to
+    # forward-prefetch the lm_head group, issuing the giant lm_head AG from the CPU
+    # during the last transformer layer's forward GEMM. Keeps one big AG in flight
+    # at a time (the last-layer decoder AG has landed + resharded before lm_head
+    # runs) so the deferred landing fence stays valid.
     if os.environ.get("MORI_FSDP_BIG_PREFETCH", "") not in ("", "0", "false", "False"):
         layers = list(_iter_decoder_layers(model))
         lm_head = getattr(model, "lm_head", None)

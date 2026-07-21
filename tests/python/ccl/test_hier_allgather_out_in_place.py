@@ -21,17 +21,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """
-Bit-exact + A/B bench for the M4 "out-in-place" copy-OUT elimination
+Bit-exact + timing check for the "out-in-place" copy-OUT elimination
 (``HierAllGather(out_in_place=True)``).
 
 The default hierarchical path copies the gathered ring buffer to the user
-output (the finish_sync copy-OUT, ~2.7ms @512MiB per  phase
-attribution -- the single biggest remaining staging cost). out-in-place
-leaves the result in the ring buffer and the caller reads it via
-``handle.result_tensor(...)``, skipping that copy. This test asserts the
-out-in-place result is bit-exact vs ``torch.distributed.all_gather_into_tensor``
-(zero tolerance, ``torch.equal``) AND A/B-benches it against the default
-staged path so the win (or wash) is measured with >=3 reps + RCCL baseline.
+output (the finish_sync copy-OUT). out-in-place leaves the result in the ring
+buffer and the caller reads it via ``handle.result_tensor(...)``, skipping that
+copy. This test asserts the out-in-place result is bit-exact vs
+``torch.distributed.all_gather_into_tensor`` (zero tolerance, ``torch.equal``)
+and benches it against the default staged path and the RCCL baseline.
 
 Single node (simulates N>=2 by splitting local GPUs into sub-groups)::
 
