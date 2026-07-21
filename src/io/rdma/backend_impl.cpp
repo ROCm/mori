@@ -1306,6 +1306,19 @@ EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
   return interleaved;
 }
 
+bool AreEndpointsDeviceHomogeneous(const EpPairVec& eps) {
+  if (eps.empty()) return true;
+  const int localDevice = eps.front().ldevId;
+  const int remoteDevice = eps.front().rdevId;
+  return std::all_of(eps.begin() + 1, eps.end(), [&](const EpPair& ep) {
+    return ep.ldevId == localDevice && ep.rdevId == remoteDevice;
+  });
+}
+
+Executor* SelectSessionExecutor(const EpPairVec& eps, Executor* executor) {
+  return executor != nullptr && AreEndpointsDeviceHomogeneous(eps) ? executor : nullptr;
+}
+
 /* ----------------------------------------------------------------------------------------------
  */
 RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
@@ -1318,7 +1331,14 @@ RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
       remoteMrPerEp(std::move(remoteMrPerEp)),
       eps(e),
       executor(exec),
-      localLoc_(localLoc) {}
+      localLoc_(localLoc) {
+  if (!eps.empty()) {
+    minMaxMessageSize_ = std::numeric_limits<uint64_t>::max();
+    for (const EpPair& ep : eps) {
+      minMaxMessageSize_ = std::min(minMaxMessageSize_, ep.local.maxMsgSize);
+    }
+  }
+}
 
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
@@ -1350,6 +1370,20 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
 
+  if (localOffsets.size() != remoteOffsets.size() || sizes.size() != remoteOffsets.size()) {
+    status->Update(StatusCode::ERR_INVALID_ARGS,
+                   "lengths of local offsets, remote offsets or sizes mismatch");
+    return;
+  }
+  if (sizes.empty()) {
+    status->Update(StatusCode::SUCCESS, "");
+    if (config.enableNotification) {
+      RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
+      if (notifRet.Failed()) status->Update(notifRet.code, notifRet.message);
+    }
+    return;
+  }
+
   const bool chunk = config.enableTransferChunking;
   const bool canUseWorkerChunking =
       executor != nullptr && chunk && localLoc_ == MemoryLocationType::GPU;
@@ -1364,8 +1398,70 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     }
   }
 
+  const SizeVec* submittedLocalOffsets = &localOffsets;
+  const SizeVec* submittedRemoteOffsets = &remoteOffsets;
+  const SizeVec* submittedSizes = &sizes;
+  bool inputsArePreChunked = false;
+
+  int spreadParallelism = 0;
+  if (canUseWorkerChunking && sizes.size() == 1 && eps.size() > 1) {
+    const int numWorkers = executor->NumWorkers();
+    if (numWorkers > 0 && static_cast<size_t>(numWorkers) == eps.size()) {
+      spreadParallelism = numWorkers;
+    }
+  }
+  if (spreadParallelism > 0) {
+    if (localMrPerEp.empty() || remoteMrPerEp.empty()) {
+      status->Update(StatusCode::ERR_BAD_STATE,
+                     "memory-region vectors are empty for single-segment spread");
+      return;
+    }
+
+    const uint64_t requestSize = static_cast<uint64_t>(sizes.front());
+    if (requestSize > std::numeric_limits<uint32_t>::max()) {
+      status->Update(StatusCode::ERR_INVALID_ARGS,
+                     "single request size exceeds UINT32_MAX; split it before submitting");
+      return;
+    }
+
+    const uint64_t localOffset = static_cast<uint64_t>(localOffsets.front());
+    const uint64_t remoteOffset = static_cast<uint64_t>(remoteOffsets.front());
+    const uint64_t localLength = static_cast<uint64_t>(localMrPerEp.front().length);
+    const uint64_t remoteLength = static_cast<uint64_t>(remoteMrPerEp.front().length);
+    if (localOffset > localLength || requestSize > localLength - localOffset ||
+        remoteOffset > remoteLength || requestSize > remoteLength - remoteOffset) {
+      status->Update(StatusCode::ERR_INVALID_ARGS, "length out of range");
+      return;
+    }
+
+    const bool wouldChunk =
+        (config.chunkBytes > 0 && requestSize > config.chunkBytes) ||
+        requestSize > minMaxMessageSize_;
+    if (wouldChunk) {
+      thread_local SizeVec expandedLocalOffsets;
+      thread_local SizeVec expandedRemoteOffsets;
+      thread_local SizeVec expandedSizes;
+      const SpreadPlanResult planResult = PlanSingleSegmentSpreadInto(
+          localOffset, remoteOffset, requestSize, config.chunkBytes,
+          config.maxChunksPerTransfer, minMaxMessageSize_, spreadParallelism,
+          &expandedLocalOffsets, &expandedRemoteOffsets, &expandedSizes);
+      if (planResult == SpreadPlanResult::kInvalid) {
+        status->Update(StatusCode::ERR_BAD_STATE, "failed to plan single-segment spread");
+        return;
+      }
+      if (planResult == SpreadPlanResult::kPlanned) {
+        submittedLocalOffsets = &expandedLocalOffsets;
+        submittedRemoteOffsets = &expandedRemoteOffsets;
+        submittedSizes = &expandedSizes;
+        inputsArePreChunked = true;
+      }
+    }
+  }
+
   int totalCredit = 0;
-  if (canUseWorkerChunking) {
+  if (inputsArePreChunked) {
+    totalCredit = static_cast<int>(submittedSizes->size());
+  } else if (canUseWorkerChunking) {
     const uint64_t maxMessageSize = eps.front().local.maxMsgSize;
     uint64_t totalWrCount = 0;
     for (size_t size : sizes) {
@@ -1398,16 +1494,17 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   if (canUseWorkerChunking) {
     ExecutorReq req{eps,
                     localMrPerEp.front(),
-                    localOffsets,
+                    *submittedLocalOffsets,
                     remoteMrPerEp.front(),
-                    remoteOffsets,
-                    sizes,
+                    *submittedRemoteOffsets,
+                    *submittedSizes,
                     callbackMeta,
                     id,
                     config.postBatchSize,
                     isRead,
-                    config.chunkBytes,
-                    config.maxChunksPerTransfer};
+                    inputsArePreChunked ? 0 : config.chunkBytes,
+                    inputsArePreChunked ? 1 : config.maxChunksPerTransfer,
+                    inputsArePreChunked};
     ret = executor->RdmaBatchReadWrite(req);
   } else if (executor != nullptr && !chunk) {
     ExecutorReq req{eps,
@@ -1421,7 +1518,8 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
                     config.postBatchSize,
                     isRead,
                     0,
-                    1};
+                    1,
+                    false};
     ret = executor->RdmaBatchReadWrite(req);
   } else {
     RdmaTransferControl control{};
@@ -1684,8 +1782,20 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
     remoteMrPerEp.push_back(remoteMrByDev.at(ep.rdevId));
   }
 
+  Executor* sessionExecutor = SelectSessionExecutor(epSet, executor.get());
+  if (executor != nullptr && sessionExecutor == nullptr) {
+    bool expected = false;
+    if (warnedHeterogeneousExecutorFallback_.compare_exchange_strong(
+            expected, true, std::memory_order_relaxed)) {
+      MORI_IO_WARN(
+          "session endpoints span heterogeneous devices; disabling the multi-threaded "
+          "executor for this session to preserve per-endpoint memory-region selection");
+    }
+    sessionExecutor = nullptr;
+  }
+
   sess = RdmaBackendSession(config, std::move(localMrPerEp), std::move(remoteMrPerEp), epSet,
-                            executor.get(), local.loc);
+                            sessionExecutor, local.loc);
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,

@@ -67,7 +67,7 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
 | `--num-qp-per-transfer` | Number of queue pairs used (default `4`) |
 | `--op-type` | Operation type: `read` or `write` |
 | `--poll_cq_mode` | CQ polling mode: `polling` or `event` |
-| `--num-worker-threads` | Number of worker threads (default `1`; ignored when chunking/multi-NIC is on — posting is single-thread inline) |
+| `--num-worker-threads` | Number of single-NIC posting workers (default `1`; multi-NIC uses inline posting). With chunking on, use at least `--num-qp-per-transfer` so eligible single-segment batches can spread across all QPs. |
 | `--disable-chunking` | Disable single-transfer chunking (chunking is **on by default**) |
 | `--chunk-bytes` | Chunk size in bytes when chunking is on (default `65536` = 64 KB) |
 | `--max-chunks` | Max chunks per transfer (default `64`) |
@@ -306,7 +306,7 @@ defaults. Tune from here.
 | `--batch-contiguous` | Contiguous per-transfer offsets let consecutive transfers merge into fewer, larger RDMA work requests (WRs). This is usually the biggest single win at large sizes and flattens the message-size curve. Do **not** use it when you intend to stress the send queue / keep one WR per transfer. |
 | `--num-qp-per-transfer` | More QPs pipeline a large transfer across the NIC. Bandwidth generally scales up to ~8 QPs and then plateaus; 16+ gives no further gain. Start at 8. |
 | `--disable-chunking` | Chunking splits each transfer into `--chunk-bytes` pieces; for large messages this multiplies WRs and can saturate the send queue, collapsing bandwidth at the largest sizes. Turning it off avoids that — but read the WR-size limit below. |
-| `--num-worker-threads` | With chunking **off** + `--batch-contiguous`, use several workers (e.g., 8). Besides parallel posting, this splits a large batch across workers so each merged WR stays under the NIC message-size limit. With chunking on, this knob has no bandwidth effect (posting is single-thread inline). |
+| `--num-worker-threads` | With chunking **off** + `--batch-contiguous`, use several workers (e.g., 8). Besides parallel posting, this splits a large batch across workers so each merged WR stays under the NIC message-size limit. With chunking **on**, workers also parallelize an eligible one-segment batch once the worker count covers the QP count. |
 
 ### The merged-WR size limit
 

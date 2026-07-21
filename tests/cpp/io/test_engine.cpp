@@ -37,6 +37,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -171,7 +172,8 @@ int GetFreePort() {
   return port;
 }
 
-ConnectedEnginePair CreateConnectedRdmaPair(const std::string& prefix, bool enableNotification) {
+ConnectedEnginePair CreateConnectedRdmaPair(const std::string& prefix,
+                                            const RdmaBackendConfig& rdmaCfg) {
   if (!RdmaBackend::HasActiveDevices()) {
     throw TestSkip("requires at least one active RDMA device");
   }
@@ -186,8 +188,6 @@ ConnectedEnginePair CreateConnectedRdmaPair(const std::string& prefix, bool enab
   Require(cfg.port > 0, "failed to allocate free tcp port for target");
   auto target = std::make_unique<IOEngine>(prefix + "_target", cfg);
 
-  RdmaBackendConfig rdmaCfg{};
-  rdmaCfg.enableNotification = enableNotification;
   initiator->CreateBackend(BackendType::RDMA, rdmaCfg);
   target->CreateBackend(BackendType::RDMA, rdmaCfg);
 
@@ -197,6 +197,12 @@ ConnectedEnginePair CreateConnectedRdmaPair(const std::string& prefix, bool enab
   target->RegisterRemoteEngine(initiatorDesc);
 
   return ConnectedEnginePair(std::move(initiator), std::move(target));
+}
+
+ConnectedEnginePair CreateConnectedRdmaPair(const std::string& prefix, bool enableNotification) {
+  RdmaBackendConfig rdmaCfg{};
+  rdmaCfg.enableNotification = enableNotification;
+  return CreateConnectedRdmaPair(prefix, rdmaCfg);
 }
 
 RegisteredGpuMem RegisterGpuMemory(IOEngine* engine, size_t sizeBytes, int deviceId) {
@@ -368,6 +374,11 @@ void CaseRdmaBackendConfigChunkingFields() {
   Require(cfg.chunkBytes == 65536, "chunkBytes constructor field mismatch");
   Require(cfg.maxChunksPerTransfer == 32, "maxChunksPerTransfer constructor field mismatch");
   Require(cfg.numNicsPerTransfer == 2, "numNicsPerTransfer constructor field mismatch");
+
+  std::stringstream ss;
+  ss << cfg;
+  Require(ss.str().find("numNicsPerTransfer[2]") != std::string::npos,
+          "RdmaBackendConfig stream output should include numNicsPerTransfer");
 }
 
 void CaseResolveRequestedNics() {
@@ -524,6 +535,325 @@ void CaseChunkCountSplitInvariant() {
   }
 }
 
+void RequireSpreadPlanCoverage(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                               const SizeVec& sizes, size_t localStart, size_t remoteStart,
+                               size_t totalSize, size_t maxSegmentSize) {
+  Require(localOffsets.size() == sizes.size(), "spread local offset count mismatch");
+  Require(remoteOffsets.size() == sizes.size(), "spread remote offset count mismatch");
+
+  size_t expectedLocal = localStart;
+  size_t expectedRemote = remoteStart;
+  size_t total = 0;
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    Require(sizes[i] > 0, "spread plan must not emit empty segments");
+    Require(sizes[i] <= maxSegmentSize, "spread segment exceeds max message size");
+    Require(localOffsets[i] == expectedLocal, "spread local offsets must be contiguous");
+    Require(remoteOffsets[i] == expectedRemote, "spread remote offsets must be contiguous");
+    expectedLocal += sizes[i];
+    expectedRemote += sizes[i];
+    total += sizes[i];
+  }
+  Require(total == totalSize, "spread plan total size mismatch");
+}
+
+void CasePlanSingleSegmentSpread() {
+  SizeVec localOffsets{99};
+  SizeVec remoteOffsets{88};
+  SizeVec sizes{77};
+
+  SpreadPlanResult result = PlanSingleSegmentSpreadInto(
+      17, 29, 8192, 4096, 4, 1024 * 1024, 8, &localOffsets, &remoteOffsets, &sizes);
+  Require(result == SpreadPlanResult::kPlanned, "K<P spread example should be planned");
+  Require(sizes.size() == 4, "maxChunks should cap K below target parallelism");
+  RequireSpreadPlanCoverage(localOffsets, remoteOffsets, sizes, 17, 29, 8192, 2048);
+
+  result = PlanSingleSegmentSpreadInto(3, 7, 10, 4, 8, 100, 4, &localOffsets,
+                                       &remoteOffsets, &sizes);
+  Require(result == SpreadPlanResult::kPlanned, "non-divisible spread should be planned");
+  Require(sizes == SizeVec({3, 3, 2, 2}), "non-divisible spread geometry mismatch");
+  RequireSpreadPlanCoverage(localOffsets, remoteOffsets, sizes, 3, 7, 10, 3);
+
+  result = PlanSingleSegmentSpreadInto(0, 0, 10, 100, 1, 3, 2, &localOffsets,
+                                       &remoteOffsets, &sizes);
+  Require(result == SpreadPlanResult::kPlanned,
+          "hard max-message limit should override maxChunks");
+  Require(sizes.size() == 4, "hard max-message limit should require four segments");
+  RequireSpreadPlanCoverage(localOffsets, remoteOffsets, sizes, 0, 0, 10, 3);
+
+  result = PlanSingleSegmentSpreadInto(0, 0, 3, 1, 16, 16, 8, &localOffsets,
+                                       &remoteOffsets, &sizes);
+  Require(result == SpreadPlanResult::kPlanned, "size<P spread should be planned");
+  Require(sizes.size() == 3, "size<P spread must cap K at size");
+  RequireSpreadPlanCoverage(localOffsets, remoteOffsets, sizes, 0, 0, 3, 1);
+
+  result = PlanSingleSegmentSpreadInto(0, 0, 4096, 4096, 8, 8192, 4, &localOffsets,
+                                       &remoteOffsets, &sizes);
+  Require(result == SpreadPlanResult::kNotNeeded, "size==chunkBytes should not spread");
+  Require(localOffsets.empty() && remoteOffsets.empty() && sizes.empty(),
+          "kNotNeeded must clear caller-owned output buffers");
+
+  result = PlanSingleSegmentSpreadInto(0, 0, 0, 4096, 8, 8192, 4, &localOffsets,
+                                       &remoteOffsets, &sizes);
+  Require(result == SpreadPlanResult::kNotNeeded, "zero-size request should not spread");
+
+  const auto requireInvalid = [&](int maxChunks, uint64_t maxMessageSize,
+                                  int targetParallelism) {
+    localOffsets = {1};
+    remoteOffsets = {2};
+    sizes = {3};
+    SpreadPlanResult invalid = PlanSingleSegmentSpreadInto(
+        0, 0, 8192, 4096, maxChunks, maxMessageSize, targetParallelism, &localOffsets,
+        &remoteOffsets, &sizes);
+    Require(invalid == SpreadPlanResult::kInvalid, "invalid spread inputs must be rejected");
+    Require(localOffsets.empty() && remoteOffsets.empty() && sizes.empty(),
+            "invalid planning must clear caller-owned output buffers");
+  };
+  requireInvalid(0, 8192, 4);
+  requireInvalid(8, 0, 4);
+  requireInvalid(8, 8192, 0);
+
+  result = PlanSingleSegmentSpreadInto(std::numeric_limits<uint64_t>::max() - 1, 0, 2, 1, 8,
+                                       8, 2, &localOffsets, &remoteOffsets, &sizes);
+  Require(result == SpreadPlanResult::kInvalid, "local offset overflow must be rejected");
+  result = PlanSingleSegmentSpreadInto(0, std::numeric_limits<uint64_t>::max() - 1, 2, 1, 8,
+                                       8, 2, &localOffsets, &remoteOffsets, &sizes);
+  Require(result == SpreadPlanResult::kInvalid, "remote offset overflow must be rejected");
+
+  const uint64_t tooManySegments =
+      static_cast<uint64_t>(std::numeric_limits<int>::max()) + 1;
+  result = PlanSingleSegmentSpreadInto(0, 0, tooManySegments, 1,
+                                       std::numeric_limits<int>::max(), 1, 1, &localOffsets,
+                                       &remoteOffsets, &sizes);
+  Require(result == SpreadPlanResult::kInvalid, "K>INT_MAX must be rejected before allocation");
+
+  result = PlanSingleSegmentSpreadInto(0, 0, 2, 1, 8, 8, 2, nullptr, &remoteOffsets, &sizes);
+  Require(result == SpreadPlanResult::kInvalid, "null output buffer must be rejected");
+}
+
+void CaseSplitWorkExact() {
+  auto splits = MultithreadExecutor::SplitWorkExact(9, 8);
+  Require(splits.size() == 8, "(9,8) should produce exactly eight splits");
+  int expectedBegin = 0;
+  int minLength = std::numeric_limits<int>::max();
+  int maxLength = 0;
+  for (const auto& [begin, end] : splits) {
+    Require(begin == expectedBegin && end > begin, "exact splits must be contiguous and non-empty");
+    const int length = end - begin;
+    minLength = std::min(minLength, length);
+    maxLength = std::max(maxLength, length);
+    expectedBegin = end;
+  }
+  Require(expectedBegin == 9, "exact splits must cover the full input range");
+  Require(maxLength - minLength <= 1, "exact splits must be balanced");
+
+  splits = MultithreadExecutor::SplitWorkExact(1, 8);
+  Require(splits == std::vector<std::pair<int, int>>({{0, 1}}),
+          "(1,8) should produce one split");
+  Require(MultithreadExecutor::SplitWorkExact(0, 8).empty(),
+          "(0,8) should produce no splits");
+  Require(MultithreadExecutor::SplitWorkExact(8, 0).empty(),
+          "zero workers should produce no splits");
+
+  constexpr int kWorkers = 8;
+  for (int total : {4, 9}) {
+    splits = MultithreadExecutor::SplitWorkExact(total, kWorkers);
+    for (int epOffset = 0; epOffset < kWorkers; ++epOffset) {
+      std::vector<bool> usedWorkers(kWorkers, false);
+      int distinctWorkers = 0;
+      for (size_t i = 0; i < splits.size(); ++i) {
+        const int epId = (static_cast<int>(i) + epOffset) % kWorkers;
+        const int worker = epId % kWorkers;
+        if (!usedWorkers[worker]) {
+          usedWorkers[worker] = true;
+          ++distinctWorkers;
+        }
+      }
+      Require(distinctWorkers == static_cast<int>(splits.size()),
+              "exact splits must map to distinct workers when workers==eps");
+    }
+  }
+}
+
+class RecordingExecutor final : public Executor {
+ public:
+  explicit RecordingExecutor(int workers) : workers_(workers) {}
+
+  void Start() override {}
+  void Shutdown() override {}
+  int NumWorkers() const override {
+    ++numWorkerQueries;
+    return workers_;
+  }
+  RdmaOpRet RdmaBatchReadWrite(const ExecutorReq& req) override {
+    ++calls;
+    localOffsets = req.localOffsets;
+    remoteOffsets = req.remoteOffsets;
+    sizes = req.sizes;
+    chunkBytes = req.chunkBytes;
+    maxChunks = req.maxChunks;
+    inputsArePreChunked = req.inputsArePreChunked;
+    totalCredit = req.callbackMeta->totalBatchSize;
+    return {StatusCode::SUCCESS, ""};
+  }
+
+  mutable int numWorkerQueries{0};
+  int calls{0};
+  SizeVec localOffsets;
+  SizeVec remoteOffsets;
+  SizeVec sizes;
+  size_t chunkBytes{0};
+  int maxChunks{0};
+  bool inputsArePreChunked{false};
+  int totalCredit{0};
+
+ private:
+  int workers_{1};
+};
+
+StatusCode SubmitWithRecordingExecutor(RdmaBackendConfig config, int numEps,
+                                       RecordingExecutor* executor, const SizeVec& localOffsets,
+                                       const SizeVec& remoteOffsets, const SizeVec& sizes,
+                                       size_t mrLength = 1024 * 1024,
+                                       const std::vector<uint64_t>& maxMessageSizes = {}) {
+  config.enableNotification = false;
+  EpPairVec eps(static_cast<size_t>(numEps));
+  for (int i = 0; i < numEps; ++i) {
+    eps[static_cast<size_t>(i)].ldevId = 0;
+    eps[static_cast<size_t>(i)].rdevId = 0;
+    eps[static_cast<size_t>(i)].local.handle.maxSge = 8;
+    eps[static_cast<size_t>(i)].local.maxMsgSize =
+        maxMessageSizes.empty() ? 1024 * 1024 : maxMessageSizes[static_cast<size_t>(i)];
+  }
+
+  mori::application::RdmaMemoryRegion localMr{
+      .addr = 0x1000000000ull,
+      .lkey = 1,
+      .rkey = 0,
+      .length = mrLength,
+  };
+  mori::application::RdmaMemoryRegion remoteMr{
+      .addr = 0x2000000000ull,
+      .lkey = 0,
+      .rkey = 2,
+      .length = mrLength,
+  };
+  std::vector<mori::application::RdmaMemoryRegion> localMrPerEp(static_cast<size_t>(numEps),
+                                                                localMr);
+  std::vector<mori::application::RdmaMemoryRegion> remoteMrPerEp(static_cast<size_t>(numEps),
+                                                                 remoteMr);
+  RdmaBackendSession session(config, std::move(localMrPerEp), std::move(remoteMrPerEp), eps,
+                             executor, MemoryLocationType::GPU);
+  TransferStatus status;
+  session.BatchReadWrite(localOffsets, remoteOffsets, sizes, &status, 17, false);
+  return status.Code();
+}
+
+void CaseSmallBatchSpreadGateAndDispatch() {
+  RdmaBackendConfig config{};
+  config.enableTransferChunking = true;
+  config.chunkBytes = 4096;
+  config.maxChunksPerTransfer = 4;
+
+  RecordingExecutor executor(8);
+  StatusCode code =
+      SubmitWithRecordingExecutor(config, 8, &executor, {17}, {29}, {8192});
+  Require(code == StatusCode::SUCCESS, "planned spread dispatch should succeed");
+  Require(executor.calls == 1 && executor.inputsArePreChunked,
+          "eligible single segment must use pre-chunked executor input");
+  Require(executor.chunkBytes == 0 && executor.maxChunks == 1,
+          "pre-chunked executor input must disable worker re-chunking");
+  Require(executor.sizes.size() == 4 && executor.totalCredit == 4,
+          "spread dispatch must own exactly one credit per planned segment");
+  RequireSpreadPlanCoverage(executor.localOffsets, executor.remoteOffsets, executor.sizes, 17, 29,
+                            8192, 2048);
+
+  RecordingExecutor minMessageExecutor(2);
+  code = SubmitWithRecordingExecutor(config, 2, &minMessageExecutor, {0}, {0}, {8192},
+                                     1024 * 1024, {4096, 1024});
+  Require(code == StatusCode::SUCCESS, "mixed max-message planning should succeed");
+  Require(minMessageExecutor.inputsArePreChunked && minMessageExecutor.sizes.size() == 8,
+          "spread planning must use the minimum max-message size across endpoints");
+  RequireSpreadPlanCoverage(minMessageExecutor.localOffsets, minMessageExecutor.remoteOffsets,
+                            minMessageExecutor.sizes, 0, 0, 8192, 1024);
+
+  auto requireNotSpread = [&](RdmaBackendConfig cfg, int numEps, int workers,
+                              const SizeVec& requestSizes, int expectedWorkerQueries) {
+    RecordingExecutor recording(workers);
+    SizeVec offsets(requestSizes.size(), 0);
+    StatusCode result = SubmitWithRecordingExecutor(cfg, numEps, &recording, offsets, offsets,
+                                                    requestSizes);
+    Require(result == StatusCode::SUCCESS, "non-spread executor dispatch should succeed");
+    Require(recording.calls == 1 && !recording.inputsArePreChunked,
+            "ineligible request must preserve the existing executor path");
+    Require(recording.sizes == requestSizes, "ineligible request must not be expanded");
+    Require(recording.numWorkerQueries == expectedWorkerQueries,
+            "spread gate should short-circuit before unnecessary worker queries");
+  };
+
+  RdmaBackendConfig chunkingOff = config;
+  chunkingOff.enableTransferChunking = false;
+  requireNotSpread(chunkingOff, 8, 8, {8192}, 0);
+  requireNotSpread(config, 8, 8, {8192, 8192}, 0);
+  requireNotSpread(config, 1, 1, {8192}, 0);
+  requireNotSpread(config, 8, 4, {8192}, 1);
+
+  RecordingExecutor smallExecutor(8);
+  code = SubmitWithRecordingExecutor(config, 8, &smallExecutor, {0}, {0}, {4096});
+  Require(code == StatusCode::SUCCESS && !smallExecutor.inputsArePreChunked,
+          "a request that would not be chunked must not spread");
+  Require(smallExecutor.sizes == SizeVec({4096}), "small request must remain unchanged");
+  Require(smallExecutor.numWorkerQueries == 1,
+          "an otherwise eligible request should evaluate the full worker-count gate once");
+
+  RecordingExecutor belowChunkExecutor(8);
+  code = SubmitWithRecordingExecutor(config, 8, &belowChunkExecutor, {0}, {0}, {4095});
+  Require(code == StatusCode::SUCCESS && !belowChunkExecutor.inputsArePreChunked,
+          "a request smaller than chunkBytes must not spread");
+  Require(belowChunkExecutor.numWorkerQueries == 1,
+          "a request smaller than chunkBytes should evaluate the worker-count gate once");
+}
+
+void CaseSmallBatchSpreadInputValidation() {
+  RdmaBackendConfig config{};
+  config.enableTransferChunking = true;
+  config.chunkBytes = 4096;
+  config.maxChunksPerTransfer = 8;
+
+  RecordingExecutor executor(2);
+  StatusCode code = SubmitWithRecordingExecutor(config, 2, &executor, {0}, {}, {8192});
+  Require(code == StatusCode::ERR_INVALID_ARGS && executor.calls == 0,
+          "mismatched input lengths must fail before dispatch");
+
+  code = SubmitWithRecordingExecutor(config, 2, &executor, {}, {}, {});
+  Require(code == StatusCode::SUCCESS && executor.calls == 0,
+          "empty batch must complete without executor dispatch");
+
+  code = SubmitWithRecordingExecutor(config, 2, &executor, {4097}, {0}, {4096}, 8192);
+  Require(code == StatusCode::ERR_INVALID_ARGS && executor.calls == 0,
+          "out-of-range local segment must fail before planning");
+  code = SubmitWithRecordingExecutor(config, 2, &executor, {0}, {4097}, {4096}, 8192);
+  Require(code == StatusCode::ERR_INVALID_ARGS && executor.calls == 0,
+          "out-of-range remote segment must fail before planning");
+
+  const size_t maxSize = std::numeric_limits<size_t>::max();
+  code = SubmitWithRecordingExecutor(config, 2, &executor, {maxSize - 1024}, {0}, {8192}, maxSize);
+  Require(code == StatusCode::ERR_INVALID_ARGS && executor.calls == 0,
+          "overflowing offset+size must fail before planning");
+  code = SubmitWithRecordingExecutor(config, 2, &executor, {0}, {maxSize - 1024}, {8192}, maxSize);
+  Require(code == StatusCode::ERR_INVALID_ARGS && executor.calls == 0,
+          "overflowing remote offset+size must fail before planning");
+
+  const size_t tooLarge = static_cast<size_t>(std::numeric_limits<uint32_t>::max()) + 1;
+  code = SubmitWithRecordingExecutor(config, 2, &executor, {0}, {0}, {tooLarge}, maxSize);
+  Require(code == StatusCode::ERR_INVALID_ARGS && executor.calls == 0,
+          "single segment larger than UINT32_MAX must fail before planning");
+
+  config.enableTransferChunking = false;
+  code = SubmitWithRecordingExecutor(config, 2, &executor, {0}, {}, {8192});
+  Require(code == StatusCode::ERR_INVALID_ARGS && executor.calls == 0,
+          "entry length validation must not depend on chunking being enabled");
+}
+
 EpPair MakeRejectingEp(uint64_t maxMessageSize, uint32_t maxSge = 8) {
   EpPair ep{};
   ep.local.handle.maxSge = maxSge;
@@ -590,6 +920,42 @@ void CaseRdmaTransferControlDisableMergeAndOwnsTotal() {
           "worker control must not overwrite dispatcher-owned totalBatchSize");
   Require(ret.message.find("requested=3") != std::string::npos,
           "worker no-merge path should still post one WR per request; got: " + ret.message);
+}
+
+void CaseExecutorPreChunkedControl() {
+  EpPairVec eps(8);
+  for (EpPair& ep : eps) ep = MakeRejectingEp(1024 * 1024);
+  mori::application::RdmaMemoryRegion localMr{
+      .addr = 0x1000000000ull,
+      .lkey = 1,
+      .rkey = 0,
+      .length = 4608,
+  };
+  mori::application::RdmaMemoryRegion remoteMr{
+      .addr = 0x2000000000ull,
+      .lkey = 0,
+      .rkey = 2,
+      .length = 4608,
+  };
+  SizeVec offsets{0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096};
+  SizeVec sizes(9, 512);
+
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 95, 9);
+  ExecutorReq req{eps, localMr, offsets, remoteMr, offsets, sizes, meta, 95,
+                  -1,  false,   0,       1,        true};
+
+  MultithreadExecutor executor(8);
+  executor.Start();
+  RdmaOpRet ret = executor.RdmaBatchReadWrite(req);
+  executor.Shutdown();
+
+  Require(ret.Failed(), "rejecting endpoints should fail pre-chunked executor submission");
+  Require(ret.message.find("requested=2") != std::string::npos,
+          "(9,8) must use the exact split whose final worker owns two pre-chunks; got: " +
+              ret.message);
+  Require(meta->totalBatchSize == 9,
+          "pre-chunked workers must not overwrite dispatcher-owned total credit");
 }
 
 void CaseRdmaRejectsSingleRequestLargerThanUint32() {
@@ -865,6 +1231,35 @@ void CaseInterleaveEndpointsByLocalDevice() {
     Require(interleaved[0].ldevId == 1 && interleaved[1].ldevId == 0 && interleaved[2].ldevId == 0,
             "unexpected interleave order for reordered buckets");
   }
+}
+
+void CaseEndpointDeviceHomogeneity() {
+  Require(AreEndpointsDeviceHomogeneous({}), "empty endpoint set should be homogeneous");
+
+  EpPair first{};
+  first.ldevId = 3;
+  first.rdevId = 7;
+  EpPair second = first;
+  Require(AreEndpointsDeviceHomogeneous({first}), "single endpoint should be homogeneous");
+  Require(AreEndpointsDeviceHomogeneous({first, second}),
+          "matching local/remote device pairs should be homogeneous");
+  RecordingExecutor executor(2);
+  Require(SelectSessionExecutor({first, second}, &executor) == &executor,
+          "homogeneous endpoints should retain the session executor");
+  Require(SelectSessionExecutor({}, &executor) == &executor,
+          "an empty endpoint set is not a heterogeneous-device fallback");
+
+  second.ldevId = 4;
+  Require(!AreEndpointsDeviceHomogeneous({first, second}),
+          "different local devices should be heterogeneous");
+  Require(SelectSessionExecutor({first, second}, &executor) == nullptr,
+          "different local devices must disable the session executor");
+  second = first;
+  second.rdevId = 8;
+  Require(!AreEndpointsDeviceHomogeneous({first, second}),
+          "different remote devices should be heterogeneous");
+  Require(SelectSessionExecutor({first, second}, &executor) == nullptr,
+          "different remote devices must disable the session executor");
 }
 
 void CaseUsesInlineOnly() {
@@ -1258,6 +1653,112 @@ void CaseRdmaTransferBasic() {
   Require(inbound.Succeeded(),
           "rdma inbound status failed: code=" + std::to_string(inbound.CodeUint32()) + ", msg='" +
               inbound.Message() + "'");
+}
+
+void CaseRdmaSmallBatchSpreadReadWrite() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ScopedEnvVar forceQps("MORI_IO_QP_PER_TRANSFER", "4");
+  ScopedEnvVar forceWorkers("MORI_IO_NUM_WORKER_THREADS", "4");
+  ScopedEnvVar forceChunking("MORI_IO_ENABLE_CHUNKING", "1");
+  ScopedEnvVar forceChunkBytes("MORI_IO_CHUNK_BYTES", "4096");
+  ScopedEnvVar forceMaxChunks("MORI_IO_MAX_CHUNKS", "8");
+  ScopedEnvVar forceSingleNic("MORI_IO_NUM_NICS_PER_TRANSFER", "1");
+  ScopedEnvVar disableNotification("MORI_IO_ENABLE_NOTIFICATION", "0");
+  RdmaBackendConfig config{};
+  config.qpPerTransfer = 4;
+  config.numWorkerThreads = 4;
+  config.enableNotification = false;
+  config.enableTransferChunking = true;
+  config.chunkBytes = 4096;
+  config.maxChunksPerTransfer = 8;
+  config.numNicsPerTransfer = 1;
+
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_small_batch_spread", config);
+  constexpr size_t kBufferSize = 256 * 1024;
+  auto local = RegisterGpuMemory(pair.initiator.get(), kBufferSize, 0);
+  auto remote = RegisterGpuMemory(pair.target.get(), kBufferSize, 0);
+  auto session = pair.initiator->CreateSession(local.desc, remote.desc);
+  Require(session.has_value(), "failed to create RDMA session for small-batch spread");
+
+  constexpr size_t kWriteLocalOffset = 123;
+  constexpr size_t kRemoteOffset = 257;
+  constexpr size_t kReadLocalOffset = 128 * 1024 + 19;
+  const std::vector<size_t> transferSizes{65539, 8193, 8192};
+  std::vector<uint8_t> source(kBufferSize);
+  std::vector<uint8_t> observed(kBufferSize);
+
+  for (size_t iteration = 0; iteration < transferSizes.size(); ++iteration) {
+    const size_t transferSize = transferSizes[iteration];
+    uint64_t randomState = 0x9e3779b97f4a7c15ull ^ (iteration + 1);
+    for (size_t i = 0; i < source.size(); ++i) {
+      randomState ^= randomState << 13;
+      randomState ^= randomState >> 7;
+      randomState ^= randomState << 17;
+      source[i] = static_cast<uint8_t>(randomState >> 24);
+    }
+    HIP_RUNTIME_CHECK(
+        hipMemcpy(local.ptr, source.data(), source.size(), hipMemcpyHostToDevice));
+    HIP_RUNTIME_CHECK(hipMemset(remote.ptr, 0xa5, kBufferSize));
+
+    auto writeStatus = std::make_unique<TransferStatus>();
+    TransferUniqueId writeId = pair.initiator->AllocateTransferUniqueId();
+    session->BatchWrite({kWriteLocalOffset}, {kRemoteOffset}, {transferSize}, writeStatus.get(),
+                        writeId);
+    const StatusCode writeCode = writeStatus->WaitFor(5000);
+    if (writeCode == StatusCode::IN_PROGRESS) {
+      (void)writeStatus.release();
+      throw TestFailure("small-batch spread write timed out");
+    }
+    if (!writeStatus->Succeeded()) {
+      const std::string message =
+          "small-batch spread write failed: code=" +
+          std::to_string(writeStatus->CodeUint32()) + ", msg='" + writeStatus->Message() + "'";
+      (void)writeStatus.release();
+      throw TestFailure(message);
+    }
+
+    HIP_RUNTIME_CHECK(
+        hipMemcpy(observed.data(), remote.ptr, observed.size(), hipMemcpyDeviceToHost));
+    for (size_t i = 0; i < observed.size(); ++i) {
+      const uint8_t expected =
+          (i >= kRemoteOffset && i < kRemoteOffset + transferSize)
+              ? source[kWriteLocalOffset + i - kRemoteOffset]
+              : static_cast<uint8_t>(0xa5);
+      Require(observed[i] == expected,
+              "small-batch spread write data mismatch at byte " + std::to_string(i));
+    }
+
+    HIP_RUNTIME_CHECK(hipMemset(local.ptr, 0x5a, kBufferSize));
+    auto readStatus = std::make_unique<TransferStatus>();
+    TransferUniqueId readId = pair.initiator->AllocateTransferUniqueId();
+    session->BatchRead({kReadLocalOffset}, {kRemoteOffset}, {transferSize}, readStatus.get(),
+                       readId);
+    const StatusCode readCode = readStatus->WaitFor(5000);
+    if (readCode == StatusCode::IN_PROGRESS) {
+      (void)readStatus.release();
+      throw TestFailure("small-batch spread read timed out");
+    }
+    if (!readStatus->Succeeded()) {
+      const std::string message =
+          "small-batch spread read failed: code=" + std::to_string(readStatus->CodeUint32()) +
+          ", msg='" + readStatus->Message() + "'";
+      (void)readStatus.release();
+      throw TestFailure(message);
+    }
+
+    HIP_RUNTIME_CHECK(
+        hipMemcpy(observed.data(), local.ptr, observed.size(), hipMemcpyDeviceToHost));
+    for (size_t i = 0; i < observed.size(); ++i) {
+      const uint8_t expected =
+          (i >= kReadLocalOffset && i < kReadLocalOffset + transferSize)
+              ? source[kWriteLocalOffset + i - kReadLocalOffset]
+              : static_cast<uint8_t>(0x5a);
+      Require(observed[i] == expected,
+              "small-batch spread read data mismatch at byte " + std::to_string(i));
+    }
+  }
 }
 
 void CaseRdmaNotificationDisabledBehavior() {
@@ -1741,8 +2242,13 @@ int main(int argc, char* argv[]) {
        CaseChunkGeometrySingleSgeCountMatchesPlanner},
       {"chunk_geometry_properties", CaseChunkGeometryProperties},
       {"chunk_count_split_invariant", CaseChunkCountSplitInvariant},
+      {"plan_single_segment_spread", CasePlanSingleSegmentSpread},
+      {"split_work_exact", CaseSplitWorkExact},
+      {"small_batch_spread_gate_and_dispatch", CaseSmallBatchSpreadGateAndDispatch},
+      {"small_batch_spread_input_validation", CaseSmallBatchSpreadInputValidation},
       {"rdma_transfer_control_disable_merge_and_owns_total",
        CaseRdmaTransferControlDisableMergeAndOwnsTotal},
+      {"executor_pre_chunked_control", CaseExecutorPreChunkedControl},
       {"rdma_rejects_single_request_larger_than_uint32",
        CaseRdmaRejectsSingleRequestLargerThanUint32},
       {"chunking_disabled_oversized_wr_returns_error", CaseChunkingDisabledOversizedWrReturnsError},
@@ -1754,6 +2260,7 @@ int main(int argc, char* argv[]) {
       {"rdma_endpoint_carries_local_max_msg_size", CaseRdmaEndpointCarriesLocalMaxMsgSize},
       {"build_desired_qp_counts", CaseBuildDesiredQpCounts},
       {"interleave_endpoints_by_local_device", CaseInterleaveEndpointsByLocalDevice},
+      {"endpoint_device_homogeneity", CaseEndpointDeviceHomogeneity},
       {"uses_inline_only", CaseUsesInlineOnly},
       {"validate_rdma_transfer_config", CaseValidateRdmaTransferConfig},
       {"rdma_notification_rejects_zero_notif_per_qp", CaseRdmaNotificationRejectsZeroNotifPerQp},
@@ -1776,6 +2283,7 @@ int main(int argc, char* argv[]) {
       {"rdma_backend_can_handle_rejects_sentinel_port_remote",
        CaseRdmaBackendCanHandleRejectsSentinelPortRemote},
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
+      {"rdma_small_batch_spread_read_write", CaseRdmaSmallBatchSpreadReadWrite},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},

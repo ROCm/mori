@@ -85,7 +85,8 @@ inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
             << "] enableTransferChunking[" << c.enableTransferChunking << "] chunkBytes["
             << c.chunkBytes << "] maxChunksPerTransfer[" << c.maxChunksPerTransfer
             << "] numNicsPerTransfer[" << c.numNicsPerTransfer << "] maxSendWr[" << c.maxSendWr
-            << "] maxCqeNum[" << c.maxCqeNum << "] maxMsgSge[" << c.maxMsgSge << "]";
+            << "] maxCqeNum["
+            << c.maxCqeNum << "] maxMsgSge[" << c.maxMsgSge << "]";
 }
 
 struct XgmiBackendConfig : public BackendConfig {

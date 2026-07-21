@@ -43,7 +43,6 @@ import os
 import time
 from prettytable import PrettyTable
 
-
 # --- Minimal HIP memcpy helpers (fabric buffers are raw VMM allocations, not
 # --- torch tensors, so we fill/verify them directly via the HIP runtime).
 _hip_lib = None

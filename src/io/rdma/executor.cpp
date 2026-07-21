@@ -130,13 +130,14 @@ void MultithreadExecutor::Worker::MainLoop() {
                            task.req->remoteOffsets.begin() + task.end);
     SizeVec tSizes(task.req->sizes.begin() + task.begin, task.req->sizes.begin() + task.end);
 
-    const bool chunk = task.req->chunkBytes > 0;
+    const bool preChunked = task.req->inputsArePreChunked;
+    const bool chunk = task.req->chunkBytes > 0 && !preChunked;
     RdmaTransferControl control{};
-    control.chunkBytes = task.req->chunkBytes;
+    control.chunkBytes = preChunked ? 0 : task.req->chunkBytes;
     control.maxChunks = task.req->maxChunks;
-    control.creditByWrCount = chunk;
+    control.creditByWrCount = chunk || preChunked;
     control.ownsTotalBatchSize = false;
-    control.disableMerge = chunk;
+    control.disableMerge = chunk || preChunked;
 
     thread_local std::vector<application::RdmaMemoryRegion> localMrPerEp(1);
     thread_local std::vector<application::RdmaMemoryRegion> remoteMrPerEp(1);
@@ -147,9 +148,9 @@ void MultithreadExecutor::Worker::MainLoop() {
         {task.req->eps[task.epId]}, localMrPerEp, remoteMrPerEp, tLoclOffsets, tRemoteOffsets,
         tSizes, task.req->callbackMeta, task.req->id, task.req->isRead, task.req->postBatchSize,
         control);
-    task.ret.set_value(ret);
     MORI_IO_TRACE("Worker {} execute task {} begin {} end {} ret code {}", workerId, task.req->id,
                   task.begin, task.end, static_cast<uint32_t>(ret.code));
+    task.ret.set_value(ret);
   }
 }
 
@@ -200,10 +201,24 @@ std::vector<std::pair<int, int>> MultithreadExecutor::SplitWork(const ExecutorRe
   return splits;
 }
 
+std::vector<std::pair<int, int>> MultithreadExecutor::SplitWorkExact(int total, int n) {
+  const int numSplits = std::min(n, total);
+  std::vector<std::pair<int, int>> splits;
+  splits.reserve(static_cast<size_t>(std::max(numSplits, 0)));
+  for (int i = 0; i < numSplits; ++i) {
+    const int begin = static_cast<int>(static_cast<int64_t>(i) * total / numSplits);
+    const int end = static_cast<int>(static_cast<int64_t>(i + 1) * total / numSplits);
+    splits.push_back({begin, end});
+  }
+  return splits;
+}
+
 RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
   MORI_IO_FUNCTION_TIMER;
 
-  auto splits = SplitWork(req);
+  auto splits = req.inputsArePreChunked
+                    ? SplitWorkExact(static_cast<int>(req.sizes.size()), numWorker)
+                    : SplitWork(req);
   int numSplits = splits.size();
   int numEps = static_cast<int>(req.eps.size());
   // Rotate the starting EP by transfer id so single-segment transfers spread

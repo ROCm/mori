@@ -60,6 +60,8 @@ std::vector<int> BuildDesiredQpCounts(int totalQp, int numRanks);
 EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
                                            const std::vector<int>& localDevOrder,
                                            const std::vector<int>& wantPerRank);
+bool AreEndpointsDeviceHomogeneous(const EpPairVec& eps);
+Executor* SelectSessionExecutor(const EpPairVec& eps, Executor* executor);
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaManager                                          */
@@ -285,6 +287,7 @@ class RdmaBackendSession : public BackendSession {
   EpPairVec eps{};
   Executor* executor{nullptr};
   MemoryLocationType localLoc_{MemoryLocationType::CPU};
+  uint64_t minMaxMessageSize_{0};
   std::shared_ptr<std::atomic<bool>> warnedChunkedWorkerFallback_{
       std::make_shared<std::atomic<bool>>(false)};
 };
@@ -372,6 +375,7 @@ class RdmaBackend : public Backend {
   std::unique_ptr<NotifManager> notif{nullptr};
   std::unique_ptr<ControlPlaneServer> server{nullptr};
   std::unique_ptr<Executor> executor{nullptr};
+  std::atomic<bool> warnedHeterogeneousExecutorFallback_{false};
   // session cache
   std::unordered_map<SessionCacheKey, std::unique_ptr<RdmaBackendSession>, SessionCacheKeyHash>
       sessionCache;

@@ -487,6 +487,58 @@ uint64_t CountChunksForSize(uint64_t totalLength, size_t chunkBytes, int maxChun
   return CeilDiv(totalLength, geometry.targetChunkBytes);
 }
 
+SpreadPlanResult PlanSingleSegmentSpreadInto(
+    uint64_t localOffset, uint64_t remoteOffset, uint64_t size, size_t chunkBytes,
+    int maxChunks, uint64_t maxMessageSize, int targetParallelism, SizeVec* outLocalOffsets,
+    SizeVec* outRemoteOffsets, SizeVec* outSizes) {
+  if (outLocalOffsets == nullptr || outRemoteOffsets == nullptr || outSizes == nullptr) {
+    return SpreadPlanResult::kInvalid;
+  }
+
+  outLocalOffsets->clear();
+  outRemoteOffsets->clear();
+  outSizes->clear();
+
+  if (maxChunks <= 0 || maxMessageSize == 0 || targetParallelism <= 0) {
+    return SpreadPlanResult::kInvalid;
+  }
+  const uint64_t maxOffset = std::numeric_limits<uint64_t>::max() - size;
+  if (localOffset > maxOffset || remoteOffset > maxOffset) {
+    return SpreadPlanResult::kInvalid;
+  }
+
+  const uint64_t natural = CountChunksForSize(size, chunkBytes, maxChunks, maxMessageSize);
+  if (natural == 0) return SpreadPlanResult::kInvalid;
+  if (natural <= 1) return SpreadPlanResult::kNotNeeded;
+
+  uint64_t upper =
+      std::min<uint64_t>(static_cast<uint64_t>(targetParallelism), static_cast<uint64_t>(size));
+  upper = std::max(upper, natural);
+  const uint64_t cap = std::max<uint64_t>(static_cast<uint64_t>(maxChunks), natural);
+  const uint64_t count = std::min(upper, cap);
+  if (count == 0 || count > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+    return SpreadPlanResult::kInvalid;
+  }
+
+  const size_t countSize = static_cast<size_t>(count);
+  outLocalOffsets->reserve(countSize);
+  outRemoteOffsets->reserve(countSize);
+  outSizes->reserve(countSize);
+
+  const uint64_t quotient = size / count;
+  const uint64_t remainder = size % count;
+  uint64_t offset = 0;
+  for (uint64_t i = 0; i < count; ++i) {
+    const uint64_t length = quotient + (i < remainder ? 1 : 0);
+    outLocalOffsets->push_back(static_cast<size_t>(localOffset + offset));
+    outRemoteOffsets->push_back(static_cast<size_t>(remoteOffset + offset));
+    outSizes->push_back(static_cast<size_t>(length));
+    offset += length;
+  }
+
+  return SpreadPlanResult::kPlanned;
+}
+
 void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector<ibv_sge>& sges,
                          uint64_t totalLength, size_t chunkBytes, int maxChunks,
                          uint64_t maxMessageSize) {

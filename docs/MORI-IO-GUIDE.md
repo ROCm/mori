@@ -169,14 +169,20 @@ See `examples/io/example.py` for more complete examples including batch transfer
 | `RdmaBackendConfig.qp_per_transfer` | Queue pairs per transfer (default 1, increase for higher bandwidth; with multi-NIC these QPs are spread across NICs, so aim for ≥2 QP per NIC). Env: `MORI_IO_QP_PER_TRANSFER` |
 | `RdmaBackendConfig.poll_cq_mode` | CQ polling mode: `POLLING` (busy-wait, lower latency) or `EVENT` (interrupt-driven). Env: `MORI_IO_POLL_CQ_MODE` (`0`/`polling`, `1`/`event`) |
 | `RdmaBackendConfig.post_batch_size` | WRs per `ibv_post_send` chain (default `-1` = auto). Env: `MORI_IO_POST_BATCH_SIZE` |
-| `RdmaBackendConfig.num_worker_threads` | Worker threads for batch posting (default `1`; ignored when chunking / multi-NIC forces inline posting). Env: `MORI_IO_NUM_WORKER_THREADS` |
+| `RdmaBackendConfig.num_worker_threads` | Worker threads for single-NIC batch posting (default `1`; multi-NIC transfers use inline posting). Env: `MORI_IO_NUM_WORKER_THREADS` |
 | `RdmaBackendConfig.enable_notification` | Enable target-side completion notifications (default `True`). Env: `MORI_IO_ENABLE_NOTIFICATION` |
-| `RdmaBackendConfig.enable_transfer_chunking` | Split a large single transfer into `chunk_bytes` chunks pipelined across QPs (default `False`). Lifts single-transfer bandwidth from single-outstanding (~28 GB/s) to NIC line rate. Forces single-thread inline posting (ignores `num_worker_threads`). Env: `MORI_IO_ENABLE_CHUNKING` |
+| `RdmaBackendConfig.enable_transfer_chunking` | Split a large transfer into chunks of approximately `chunk_bytes` (default `False`). Messages no larger than `chunk_bytes` are unchanged. When a batch contains exactly one GPU-local segment that would already be split into multiple chunks, and enough worker threads/QPs are configured (see below), the chunks are automatically spread across worker threads and QPs. Env: `MORI_IO_ENABLE_CHUNKING` |
 | `RdmaBackendConfig.chunk_bytes` | Chunk size when chunking is on (default `65536` = 64 KB). Messages ≤ this are unchanged. Env: `MORI_IO_CHUNK_BYTES` |
-| `RdmaBackendConfig.max_chunks_per_transfer` | Cap on chunks per transfer to bound WR/SQ usage (default `64`). Env: `MORI_IO_MAX_CHUNKS` |
+| `RdmaBackendConfig.max_chunks_per_transfer` | Soft cap on chunks per transfer to bound WR/SQ usage (default `64`; the RDMA message-size limit may require more). Env: `MORI_IO_MAX_CHUNKS` |
 | `RdmaBackendConfig.num_nics_per_transfer` | Stripe a transfer across this many NICs (default `1`). Adaptive by memory type: GPU memory stays single-NIC (PCIe-bound); host memory stripes across NUMA-local NICs. Env: `MORI_IO_NUM_NICS_PER_TRANSFER` |
 | `IOEngineConfig.port = 0` | Auto-bind to a free port |
 | `LD_LIBRARY_PATH` | MORI-IO loads libibverbs dynamically at runtime (`dlopen` of `libibverbs.so` / `libibverbs.so.1`) rather than linking it. To use an out-of-tree libibverbs, put its directory on `LD_LIBRARY_PATH`. |
+
+Single-segment chunk spreading (see `enable_transfer_chunking` above) additionally requires a single
+NIC and `qp_per_transfer > 1`. Set `num_worker_threads >= qp_per_transfer` so each QP has a posting
+worker. For full QP utilization, also set `max_chunks_per_transfer >= qp_per_transfer`; a lower value
+remains correct but may use fewer worker/QP pairs. Requests with multiple segments or segments no
+larger than `chunk_bytes` keep their existing scheduling behavior.
 
 UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
 env vars for distributed master / pool client / SPDK proxy timing. Those are

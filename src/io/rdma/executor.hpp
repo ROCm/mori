@@ -50,6 +50,7 @@ struct ExecutorReq {
   bool isRead;
   size_t chunkBytes{0};
   int maxChunks{1};
+  bool inputsArePreChunked{false};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -63,6 +64,7 @@ class Executor {
   virtual void Start() = 0;
   virtual void Shutdown() = 0;
   virtual RdmaOpRet RdmaBatchReadWrite(const ExecutorReq& req) = 0;
+  virtual int NumWorkers() const = 0;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -76,6 +78,9 @@ class MultithreadExecutor : public Executor {
   RdmaOpRet RdmaBatchReadWrite(const ExecutorReq& req);
   void Start();
   void Shutdown();
+  int NumWorkers() const { return numWorker; }
+
+  static std::vector<std::pair<int, int>> SplitWorkExact(int total, int n);
 
  private:
   struct Task {

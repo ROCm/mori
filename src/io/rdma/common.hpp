@@ -151,6 +151,17 @@ ChunkGeometry PlanChunkGeometry(uint64_t totalLength, size_t chunkBytes, int max
 uint64_t CountChunksForSize(uint64_t totalLength, size_t chunkBytes, int maxChunks,
                             uint64_t maxMessageSize);
 
+enum class SpreadPlanResult {
+  kNotNeeded,
+  kPlanned,
+  kInvalid,
+};
+
+SpreadPlanResult PlanSingleSegmentSpreadInto(
+    uint64_t localOffset, uint64_t remoteOffset, uint64_t size, size_t chunkBytes,
+    int maxChunks, uint64_t maxMessageSize, int targetParallelism, SizeVec* outLocalOffsets,
+    SizeVec* outRemoteOffsets, SizeVec* outSizes);
+
 void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector<ibv_sge>& sges,
                          uint64_t totalLength, size_t chunkBytes, int maxChunks,
                          uint64_t maxMessageSize);
