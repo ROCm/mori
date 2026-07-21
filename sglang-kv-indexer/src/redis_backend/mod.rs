@@ -45,6 +45,12 @@ const DEFAULT_NAMESPACE: &str = "kvidx";
 /// Bound on how many hashes a single `CLEAR_ALL_AT_TIER` fans out concurrently.
 const CLEAR_CHUNK: usize = 256;
 
+/// Resolved connection target parsed from the environment.
+enum Target {
+    Single(String),
+    Cluster(Vec<String>),
+}
+
 pub struct RedisKvIndexerBackend {
     conn: Arc<dyn RedisConn>,
     ns: String,
@@ -72,17 +78,40 @@ impl RedisKvIndexerBackend {
         })
     }
 
+    /// Builds a single-instance backend without connecting: the connection is
+    /// established lazily on first use. Used for degraded startup so the server
+    /// can come up before Redis is reachable and self-heal once it is.
+    pub fn connect_single_deferred(url: &str, ns: impl Into<String>) -> Self {
+        Self {
+            conn: Arc::new(SingleConn::deferred(url)),
+            ns: ns.into(),
+        }
+    }
+
+    /// Cluster counterpart to [`connect_single_deferred`].
+    pub fn connect_cluster_deferred(nodes: Vec<String>, ns: impl Into<String>) -> Self {
+        Self {
+            conn: Arc::new(ClusterConn::deferred(nodes)),
+            ns: ns.into(),
+        }
+    }
+
     /// Builds the backend from the environment:
     ///   * `KV_INDEXER_REDIS_NAMESPACE` (default `kvidx`)
     ///   * `KV_INDEXER_REDIS_CLUSTER_NODES` (comma-separated) → Cluster, else
     ///   * `KV_INDEXER_REDIS_URL` → single instance (required)
-    ///   * `KV_INDEXER_REDIS_REQUIRED` (default `1`): PING on startup and fail if
-    ///     unreachable; set `0` to start degraded and rely on reconnection.
+    ///   * `KV_INDEXER_REDIS_REQUIRED` (default `1`): connect + PING on startup
+    ///     and fail fast (bounded, with a clear error) if Redis is unreachable;
+    ///     set `0` to start degraded — the server comes up immediately and the
+    ///     connection is established lazily / retried on demand.
     pub async fn from_env() -> Result<Self, BoxError> {
         let ns = std::env::var("KV_INDEXER_REDIS_NAMESPACE")
             .unwrap_or_else(|_| DEFAULT_NAMESPACE.into());
+        let required = std::env::var("KV_INDEXER_REDIS_REQUIRED")
+            .map(|v| v != "0")
+            .unwrap_or(true);
 
-        let backend = if let Ok(nodes) = std::env::var("KV_INDEXER_REDIS_CLUSTER_NODES") {
+        let target = if let Ok(nodes) = std::env::var("KV_INDEXER_REDIS_CLUSTER_NODES") {
             let nodes: Vec<String> = nodes
                 .split(',')
                 .map(str::trim)
@@ -92,25 +121,42 @@ impl RedisKvIndexerBackend {
             if nodes.is_empty() {
                 return Err("KV_INDEXER_REDIS_CLUSTER_NODES is empty".into());
             }
-            Self::connect_cluster(nodes, ns).await?
+            Target::Cluster(nodes)
         } else {
             let url = std::env::var("KV_INDEXER_REDIS_URL").map_err(|_| {
                 "KV_INDEXER_REDIS_URL (or KV_INDEXER_REDIS_CLUSTER_NODES) is required for the redis backend"
             })?;
-            Self::connect_single(&url, ns).await?
+            Target::Single(url)
         };
 
-        let required = std::env::var("KV_INDEXER_REDIS_REQUIRED")
-            .map(|v| v != "0")
-            .unwrap_or(true);
         if required {
+            // Fast, loud startup failure: the connect is bounded by a timeout /
+            // limited retries (see conn.rs), then we PING to confirm readiness.
+            let backend = match target {
+                Target::Cluster(nodes) => Self::connect_cluster(nodes, ns)
+                    .await
+                    .map_err(|e| format!("redis connect failed: {e}"))?,
+                Target::Single(url) => Self::connect_single(&url, ns)
+                    .await
+                    .map_err(|e| format!("redis connect failed: {e}"))?,
+            };
             backend
                 .ping()
                 .await
                 .map_err(|e| format!("redis readiness probe (PING) failed: {e}"))?;
+            Ok(backend)
+        } else {
+            // Degraded: do not verify Redis now; start serving immediately and
+            // connect lazily on first use (requests fail with Unavailable until
+            // Redis is reachable, then the manager reconnects automatically).
+            tracing::warn!(
+                "KV_INDEXER_REDIS_REQUIRED=0: starting degraded; Redis not verified at startup"
+            );
+            Ok(match target {
+                Target::Cluster(nodes) => Self::connect_cluster_deferred(nodes, ns),
+                Target::Single(url) => Self::connect_single_deferred(&url, ns),
+            })
         }
-
-        Ok(backend)
     }
 
     async fn ping(&self) -> redis::RedisResult<()> {

@@ -360,3 +360,67 @@ itest!(batch_action_order_is_preserved, b, {
     let resp = b.match_external_kv(match_req(&["6"], false)).await.unwrap();
     assert!(tiers_for(&resp, "w1", "6").is_empty());
 });
+
+// --- T5 regression: degraded-start / lazy-connect semantics -----------------
+
+/// A deferred backend (KV_INDEXER_REDIS_REQUIRED=0 path) does not connect at
+/// construction; it connects lazily on first use and serves correctly once the
+/// store is reachable. Requires a live store, so it skips when unset.
+#[tokio::test]
+async fn deferred_backend_connects_lazily_and_serves() {
+    let Ok(url) = std::env::var("KV_INDEXER_REDIS_URL") else {
+        eprintln!("skipping deferred_backend_connects_lazily_and_serves: set KV_INDEXER_REDIS_URL");
+        return;
+    };
+    let ns = format!(
+        "itest:deferred_serves:{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    // Construction never touches the network.
+    let b = RedisKvIndexerBackend::connect_single_deferred(&url, ns);
+    // First use lazily establishes the connection and succeeds.
+    b.apply_external_kv_batch(apply_req(
+        "wd",
+        "10.9.9.9:9000",
+        1,
+        vec![action(
+            ExternalKvActionType::ActionReport,
+            hbm(),
+            &["100", "101"],
+        )],
+    ))
+    .await
+    .expect("lazy connect + apply should succeed against a live store");
+    let resp = b
+        .match_external_kv(match_req(&["100", "101"], false))
+        .await
+        .unwrap();
+    assert!(
+        resp.matches.iter().any(|m| m.worker_id == "wd"),
+        "reported hashes must be matchable after a lazy connect"
+    );
+}
+
+/// A deferred backend pointed at an unreachable Redis must fail requests with an
+/// error within a bounded time (connect timeout), never hang. No store needed.
+#[tokio::test]
+async fn deferred_backend_unreachable_errors_within_bound() {
+    let b = RedisKvIndexerBackend::connect_single_deferred(
+        "redis://127.0.0.1:6399",
+        "itest:deferred_dead",
+    );
+    let started = std::time::Instant::now();
+    let res = b.match_external_kv(match_req(&["x"], false)).await;
+    let elapsed = started.elapsed();
+    assert!(
+        res.is_err(),
+        "match against an unreachable redis must error, got {res:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "request must be bounded by the connect timeout, took {elapsed:?}"
+    );
+}
