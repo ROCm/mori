@@ -19,6 +19,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import importlib
+
 from .dispatch_combine import (
     EpDispatchCombineKernelType,
     EpDispatchCombineConfig,
@@ -27,3 +29,18 @@ from .dispatch_combine import (
 from .local_expert_count import (
     launch_local_expert_count,
 )
+
+# dispatch_combine_v2 (FlyDSL) requires the optional `flydsl` dependency, so it
+# is imported lazily: `import mori.ops` stays usable without flydsl installed,
+# and `mori.ops.dispatch_combine_v2` resolves on first access.
+_LAZY_SUBMODULES = {"dispatch_combine_v2"}
+
+
+def __getattr__(name: str):
+    if name in _LAZY_SUBMODULES:
+        return importlib.import_module(f".{name}", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return list(globals().keys()) + sorted(_LAZY_SUBMODULES)

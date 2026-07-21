@@ -80,6 +80,13 @@ struct SdmaQueueDeviceHandle;  // ccoSdmaContext / ccoComm (pointer)
 // Opaque HIP typedef, replicated so ccoComm can name it without the ROCm header.
 struct ihipMemGenericAllocationHandle;
 typedef struct ihipMemGenericAllocationHandle* hipMemGenericAllocationHandle_t;
+// Fabric handle — 64-byte opaque token for cross-process sharing.
+// Intentionally a separate type from hipMemFabricHandle_compat_t (hip_compat.hpp)
+// so this header stays self-contained; the two are layout-compatible and
+// cco_init.cpp reinterpret_casts between them.
+struct ccoFabricHandle_t {
+  unsigned char data[64];
+};
 
 namespace mori {
 namespace cco {
@@ -781,6 +788,18 @@ struct ccoComm {
   int defaultNumQpPerPe{4};
   bool iovaZeroMode{true};
 
+  // Handle type for VMM allocations. Fabric (0x8) when the runtime supports it
+  // (probed at CommCreate); falls back to PosixFileDescriptor (0x1).
+  // Stored as int to avoid pulling hip_runtime_api.h into this header.
+  int handleType{0x1};  // hipMemHandleTypePosixFileDescriptor
+
+  // Cross-node LSA: set when the LSA team (vPOD) spans hosts, so peer windows
+  // are mapped via fabric handles into the flat VA (no intra-node peer-access).
+  // lsaSize/myNodeStart still describe the contiguous team; this only selects
+  // the cross-node mapping path in ccoWindowRegister.
+  bool fabricCrossNodeLsa{false};
+  std::vector<int> peerHipDevs;
+
   // GDA backend provider of this comm's NICs; resolved at the first
   // ccoDevCommCreate (CCO_PROVIDER_UNKNOWN until then / when GDA is off).
   // Informational host-side parameter — GDA dispatch is compile-time per-NIC.
@@ -792,7 +811,11 @@ struct ccoComm {
 
   struct AllocMeta {
     hipMemGenericAllocationHandle_t physHandle;
-    int shareFd{-1};
+    union {
+      int shareFd;
+      ccoFabricHandle_t fabricHandle;
+    };
+    bool isFabric{false};
     size_t slotOffset{0};
     size_t size{0};
   };

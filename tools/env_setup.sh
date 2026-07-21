@@ -1,28 +1,30 @@
 #!/bin/bash
 #
-# TODO: adapt for MLX (Mellanox/NVIDIA) NICs.
-#
 # env_setup.sh — setup the RDMA NIC environment for mori.
 #
-# Supports two NIC families with parallel, independent function sets selected by
-# vendor at the bottom (if vendor == bnxt ... elif vendor == ionic ...):
+# Supports three NIC families with parallel, independent function sets selected
+# by vendor at the bottom (if vendor == bnxt ... elif vendor == ionic ...):
 #
 #   ionic (AMD Pollara), via nicctl:
 #     ionic_setup_pfc / ionic_setup_dcqcn / ionic_mori_env_setup
 #   bnxt (Broadcom NetXtreme-E), via dcb + configfs:
 #     bnxt_setup_pfc  / bnxt_setup_dcqcn  / bnxt_mori_env_setup
+#   mlx5 (Mellanox/NVIDIA ConnectX), via mlnx_qos + mlxconfig:
+#     mlx5_setup_pfc  / mlx5_setup_dcqcn  / mlx5_mori_env_setup
 #
-# Both paths converge on the same RoCE QoS constants below, so MORI_RDMA_SL / TC
-# come out identical regardless of vendor.
+# All three paths converge on the same RoCE QoS constants below, so
+# MORI_RDMA_SL / TC come out identical regardless of vendor.
 #
 # Usage:  source env_setup.sh
 #
-# Requires: ionic -> nicctl, sudo; bnxt -> dcb (iproute2), ethtool, configfs, sudo
+# Requires: ionic -> nicctl, sudo; bnxt -> dcb (iproute2), ethtool, configfs,
+#           sudo; mlx5 -> mlnx_qos (mlnx-tools), mlxconfig/mst (NVIDIA MFT), sudo
 
 IONIC_VENDOR_ID="0x1dd8"
 BNXT_VENDOR_ID="0x14e4"   # Broadcom
+MLX_VENDOR_ID="0x15b3"    # Mellanox/NVIDIA
 
-# RoCE QoS constants — shared by the ionic and bnxt paths so MORI_RDMA_SL / TC
+# RoCE QoS constants — shared by the ionic/bnxt/mlx5 paths so MORI_RDMA_SL / TC
 # come out identical regardless of NIC vendor.
 #
 # NOTE: reference defaults only. PFC is hop-by-hop — the switch must use the same
@@ -50,8 +52,18 @@ query_by_vendor() {
 query_ionic_devices() { query_by_vendor "$IONIC_VENDOR_ID"; }
 query_bnxt_devices()  { query_by_vendor "$BNXT_VENDOR_ID"; }
 
+# Only Ethernet/RoCE mlx5 ports use mlnx_qos/mlxconfig (native IB has its own
+# flow control), so filter those in.
+query_mlx5_devices() {
+    local dev
+    for dev in $(query_by_vendor "$MLX_VENDOR_ID"); do
+        [[ "$(cat "/sys/class/infiniband/$dev/ports/1/link_layer" 2>/dev/null)" == "Ethernet" ]] && echo "$dev"
+    done
+}
+
 IONIC_DEVS=$(query_ionic_devices)
 BNXT_DEVS=$(query_bnxt_devices)
+MLX5_ROCE_DEVS=$(query_mlx5_devices)
 
 # Wipe all QoS configuration back to a clean "best-effort only" state.
 # Idiom adapted from the AMD Pollara 400 ops guide.
@@ -272,18 +284,94 @@ bnxt_mori_env_setup() {
     log_ok "export MORI_RDMA_TC=$MORI_RDMA_TC"
 }
 
+# ============================================================================
+# mlx5 (Mellanox/NVIDIA ConnectX) path — parallel to the ionic_*/bnxt_*
+# functions above. Only Ethernet/RoCE ports are touched (query_mlx5_devices).
+# ============================================================================
+
+# Configure trust/DSCP/PFC on every mlx5 RoCE port via `mlnx_qos`. TC
+# arbitration is left to the NIC's "vendor" algorithm (no bandwidth split);
+# only PFC no-drop on the RoCE priority is set up.
+mlx5_setup_pfc() {
+    command -v mlnx_qos &>/dev/null || { die "mlx5 devices found but mlnx_qos not available"; return 1; }
+
+    local p pfc_bits=""
+    for p in 0 1 2 3 4 5 6 7; do
+        [[ "$p" -eq "$ROCE_PRIO" ]] && pfc_bits+="1," || pfc_bits+="0,"
+    done
+    pfc_bits="${pfc_bits%,}"
+
+    local dev eth
+    for dev in $MLX5_ROCE_DEVS; do
+        eth=$(basename "$(readlink -f "/sys/class/infiniband/$dev/device/net/"* 2>/dev/null)" 2>/dev/null)
+        [[ -n "$eth" ]] || { log_warn "mlx5: no netdev for $dev, skipping"; continue; }
+
+        sudo mlnx_qos -i "$eth" --trust=dscp                              &>/dev/null \
+            || { die "mlx5: set trust dscp failed on $eth"; return 1; }
+        sudo mlnx_qos -i "$eth" --dscp2prio=set,"$ROCE_DSCP","$ROCE_PRIO"  &>/dev/null \
+            || { die "mlx5: map DSCP $ROCE_DSCP -> priority $ROCE_PRIO failed on $eth"; return 1; }
+        sudo mlnx_qos -i "$eth" --pfc="$pfc_bits"                          &>/dev/null \
+            || { die "mlx5: set PFC bitmap failed on $eth"; return 1; }
+        sudo mlnx_qos -i "$eth" --tsa=vendor,vendor,vendor,vendor,vendor,vendor,vendor,vendor &>/dev/null \
+            || log_warn "mlx5: set vendor TSA failed on $eth (continuing)"
+
+        log_ok "mlx5 PFC/DSCP on $dev ($eth): trust=dscp, DSCP $ROCE_DSCP -> priority $ROCE_PRIO (no-drop), TSA=vendor"
+    done
+}
+
+# Enable DCQCN on every mlx5 RoCE port via `mlxconfig` (NV config
+# ROCE_CC_PRIO_MASK_P1); CNP DSCP and the CC algorithm stay at firmware
+# default. NV config needs a firmware reset (mlxfwreset) or reboot to take
+# effect — we only warn, since a reset drops the link and can disrupt traffic.
+mlx5_setup_dcqcn() {
+    command -v mlxconfig &>/dev/null || { die "mlx5 devices found but mlxconfig (NVIDIA MFT) not available"; return 1; }
+    command -v mst &>/dev/null && sudo mst start &>/dev/null
+
+    local dev pci mask reset_needed=0
+    for dev in $MLX5_ROCE_DEVS; do
+        pci=$(basename "$(readlink -f "/sys/class/infiniband/$dev/device")" 2>/dev/null)
+        [[ -n "$pci" ]] || { log_warn "mlx5: cannot resolve PCI address for $dev, skipping"; continue; }
+
+        mask=$(sudo mlxconfig -d "$pci" q 2>/dev/null | grep -i "ROCE_CC_PRIO_MASK_P1" | awk '{print $NF}')
+        if [[ -n "$mask" && "$mask" != "0" ]]; then
+            log_ok "mlx5 DCQCN already enabled on $dev (pci=$pci, ROCE_CC_PRIO_MASK_P1=$mask)"
+            continue
+        fi
+
+        sudo mlxconfig -d "$pci" -y set ROCE_CC_PRIO_MASK_P1=0xff &>/dev/null \
+            || { die "mlx5: mlxconfig set ROCE_CC_PRIO_MASK_P1 failed on $dev (pci=$pci)"; return 1; }
+        log_ok "mlx5 DCQCN enabled on $dev (pci=$pci, ROCE_CC_PRIO_MASK_P1=0xff)"
+        reset_needed=1
+    done
+
+    [[ "$reset_needed" == "1" ]] && \
+        log_warn "mlx5: DCQCN NV config changed — run 'mlxfwreset -d <pci> -y reset' (or reboot) to apply"
+}
+
+# Export MORI_RDMA_SL / MORI_RDMA_TC for the mlx5 path (constants — same
+# rationale as bnxt_mori_env_setup: we just programmed these values ourselves).
+mlx5_mori_env_setup() {
+    export MORI_RDMA_SL="$ROCE_PRIO"
+    export MORI_RDMA_TC="$(( ROCE_DSCP << 2 ))"
+    log_ok "export MORI_RDMA_SL=$MORI_RDMA_SL"
+    log_ok "export MORI_RDMA_TC=$MORI_RDMA_TC"
+}
+
 # Dispatch by vendor.
 if [[ -n "$BNXT_DEVS" ]]; then
     bnxt_setup_pfc  && bnxt_setup_dcqcn  && bnxt_mori_env_setup
 elif [[ -n "$IONIC_DEVS" ]]; then
     ionic_setup_pfc && ionic_setup_dcqcn && ionic_mori_env_setup
+elif [[ -n "$MLX5_ROCE_DEVS" ]]; then
+    mlx5_setup_pfc  && mlx5_setup_dcqcn  && mlx5_mori_env_setup
 else
-    log_warn "no ionic or bnxt RDMA devices found"
+    log_warn "no ionic, bnxt, or mlx5 RoCE devices found"
 fi
 
 unset -f ionic_setup_pfc ionic_setup_dcqcn ionic_mori_env_setup \
          bnxt_setup_pfc bnxt_setup_dcqcn bnxt_mori_env_setup \
+         mlx5_setup_pfc mlx5_setup_dcqcn mlx5_mori_env_setup \
          _bnxt_cc_write _bnxt_cnp_service_type _bnxt_dcb_clear_app \
-         query_by_vendor query_ionic_devices query_bnxt_devices \
+         query_by_vendor query_ionic_devices query_bnxt_devices query_mlx5_devices \
          log_ok log_warn die
-unset IONIC_VENDOR_ID BNXT_VENDOR_ID IONIC_DEVS BNXT_DEVS GREEN RED YELLOW NC
+unset IONIC_VENDOR_ID BNXT_VENDOR_ID MLX_VENDOR_ID IONIC_DEVS BNXT_DEVS MLX5_ROCE_DEVS GREEN RED YELLOW NC

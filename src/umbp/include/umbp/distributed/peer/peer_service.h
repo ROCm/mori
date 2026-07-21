@@ -24,6 +24,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -67,7 +68,8 @@ class PeerServiceServer {
   PeerServiceServer(PeerDramAllocator* dram_alloc, PeerSsdManager* peer_ssd = nullptr,
                     void* ssd_staging_base = nullptr, size_t ssd_staging_size = 0,
                     std::vector<uint8_t> ssd_staging_mem_desc_bytes = {}, int num_read_slots = 16,
-                    int lease_timeout_s = 10, std::vector<uint8_t> engine_desc_bytes = {},
+                    std::chrono::milliseconds lease_timeout = std::chrono::milliseconds{3000},
+                    std::vector<uint8_t> engine_desc_bytes = {},
                     MasterClient* master_client = nullptr,
                     SsdCopyPipeline* copy_pipeline = nullptr);
   ~PeerServiceServer();

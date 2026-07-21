@@ -32,6 +32,14 @@ from tests.python.ops.dispatch_combine_test_utils import (
 )
 
 
+def _combine_fp4_supported():
+    # Packed-FP4 combine needs the gfx950 OCP FP4 conversion instructions.
+    try:
+        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
 def _make_intranode_config(
     rank,
     world_size,
@@ -166,7 +174,9 @@ def _test_dispatch_combine_ll(
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
 @pytest.mark.parametrize("use_external_inp_buf", (True, False))
-@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast", "fp8_blockwise"))
+@pytest.mark.parametrize(
+    "quant_type", ("none", "fp8_direct_cast", "fp8_blockwise", "fp4_blockwise")
+)
 def test_dispatch_combine(
     torch_dist_process_manager,
     world_size,
@@ -185,13 +195,18 @@ def test_dispatch_combine(
         pytest.skip("fp8_direct_cast is not supported in zero-copy mode")
     if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
         pytest.skip("fp8_direct_cast is only supported for bfloat16 data type")
-    if quant_type == "fp8_blockwise":
+    if quant_type in ("fp8_blockwise", "fp4_blockwise"):
         if data_type is not torch.bfloat16:
-            pytest.skip("fp8_blockwise only supports bfloat16 input")
+            pytest.skip(f"{quant_type} only supports bfloat16 input")
         if not use_external_inp_buf:
-            pytest.skip("fp8_blockwise requires use_external_inp_buf=True")
-        # fp8_blockwise combine ignores scale_dim/scale_type_size (driven by
-        # MORI_FP8_COMBINE_SCALE_DIM internally).
+            pytest.skip(f"{quant_type} requires use_external_inp_buf=True")
+        if quant_type == "fp4_blockwise" and not _combine_fp4_supported():
+            pytest.skip(
+                "fp4_blockwise combine requires a gfx950 GPU (OCP FP4 instructions)"
+            )
+        # blockwise combine ignores scale_dim/scale_type_size (driven by
+        # MORI_FP8_COMBINE_SCALE_DIM internally). fp4_blockwise reuses the same path
+        # but transports packed FP4 (E2M1) instead of FP8.
 
     for i in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -227,7 +242,7 @@ def test_dispatch_combine(
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8, 9))
 @pytest.mark.parametrize("use_external_inp_buf", (True,))
-@pytest.mark.parametrize("quant_type", ("fp8_blockwise",))
+@pytest.mark.parametrize("quant_type", ("fp8_blockwise", "fp4_blockwise"))
 def test_dispatch_combine_weightless_vec8(
     torch_dist_process_manager,
     world_size,
@@ -239,6 +254,10 @@ def test_dispatch_combine_weightless_vec8(
     use_external_inp_buf,
     quant_type,
 ):
+    if quant_type == "fp4_blockwise" and not _combine_fp4_supported():
+        pytest.skip(
+            "fp4_blockwise combine requires a gfx950 GPU (OCP FP4 instructions)"
+        )
     expect_combine_kernel_substr = (
         "noweight_block128_vec8_top9"
         if num_experts_per_token == 9
@@ -301,13 +320,18 @@ def test_dispatch_combine_ll(
         pytest.skip("fp8_direct_cast is not supported in zero-copy mode")
     if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
         pytest.skip("fp8_direct_cast is only supported for bfloat16 data type")
-    if quant_type == "fp8_blockwise":
+    if quant_type in ("fp8_blockwise", "fp4_blockwise"):
         if data_type is not torch.bfloat16:
-            pytest.skip("fp8_blockwise only supports bfloat16 input")
+            pytest.skip(f"{quant_type} only supports bfloat16 input")
         if not use_external_inp_buf:
-            pytest.skip("fp8_blockwise requires use_external_inp_buf=True")
-        # fp8_blockwise combine ignores scale_dim/scale_type_size (driven by
-        # MORI_FP8_COMBINE_SCALE_DIM internally).
+            pytest.skip(f"{quant_type} requires use_external_inp_buf=True")
+        if quant_type == "fp4_blockwise" and not _combine_fp4_supported():
+            pytest.skip(
+                "fp4_blockwise combine requires a gfx950 GPU (OCP FP4 instructions)"
+            )
+        # blockwise combine ignores scale_dim/scale_type_size (driven by
+        # MORI_FP8_COMBINE_SCALE_DIM internally). fp4_blockwise reuses the same path
+        # but transports packed FP4 (E2M1) instead of FP8.
 
     for i in range(world_size):
         torch_dist_process_manager.task_queue.put(

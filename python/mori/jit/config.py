@@ -28,7 +28,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-_SUPPORTED_ARCHS = ["gfx942", "gfx950"]
+_SUPPORTED_ARCHS = ["gfx942", "gfx950", "gfx1250"]
 
 
 @dataclass(frozen=True)

@@ -213,6 +213,14 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 > typically pre-installed with the kernel OFED stack. For Thor2 and Pollara, install the
 > corresponding userspace library from your NIC vendor.
 
+**Recommended NIC firmware/driver versions** (check with `mori check` or `tools/env_check.sh`):
+
+| Vendor | Recommendation |
+|--------|-----------------|
+| AMD Pollara (AINIC) | `>= 1.117.5-a-45` (`1.117.1` major lacks IBGDA support) |
+| Broadcom (Thor2) | `237.1.137.x` / `235.2.86.x`; `231.x` too old for IBGDA |
+| Mellanox (ConnectX, mlx5) | No known minimum; tested on `ConnectX-7` |
+
 ### Install
 
 MoRI can be installed in three ways: from PyPI (stable), nightly pre-built wheels (latest dev), or from source.
@@ -226,14 +234,12 @@ pip install amd_mori
 #### Nightly (pre-built, tested daily)
 
 ```bash
-# From PyPI
 pip install --pre amd-mori-nightly
-
-# Or from GitHub Pages
-pip install --no-index --force-reinstall --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori
 ```
 
-Browse all nightly builds: https://rocm.github.io/mori/nightly/
+> **Deprecated**: the GitHub Pages nightly index
+> (`https://rocm.github.io/mori/nightly/`) is being retired. Please install
+> nightly builds from PyPI (`amd-mori-nightly`) as shown above.
 
 > **Note**: `amd-mori` and `amd-mori-nightly` both provide the `mori` Python module.
 > Do not install both at the same time — uninstall one before installing the other.

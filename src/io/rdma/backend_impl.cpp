@@ -353,7 +353,7 @@ application::RdmaMemoryRegion RdmaManager::RegisterLocalMemory(int devId, const 
   std::unique_lock<std::shared_mutex> lock(mu);
   MemoryKey key{devId, desc.id};
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
-  mTable[key] = devCtx->RegisterRdmaMemoryRegion(reinterpret_cast<void*>(desc.data), desc.size);
+  mTable[key] = devCtx->RegisterRdmaMemoryRegionAuto(reinterpret_cast<void*>(desc.data), desc.size);
   return mTable[key];
 }
 
@@ -660,7 +660,7 @@ void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) 
       posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE,
                      static_cast<size_t>(config.notifPerQp) * sizeof(NotifMessage)));
   application::RdmaMemoryRegion mr =
-      devCtx->RegisterRdmaMemoryRegion(buf, config.notifPerQp * sizeof(NotifMessage));
+      devCtx->RegisterRdmaMemoryRegionAuto(buf, config.notifPerQp * sizeof(NotifMessage));
 
   notifCtxById_.insert({rt->id, {mr, buf}});
 

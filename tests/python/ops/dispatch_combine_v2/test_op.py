@@ -39,13 +39,10 @@ from mori.cco import Communicator
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
 sys.path.insert(
-    0, os.path.join(_ROOT, "python", "mori", "ops", "dispatch_combine_v2")
-)  # op + kernels
-sys.path.insert(
     0, os.path.join(_ROOT, "examples", "cco", "python")
 )  # cco_example_common
 from cco_example_common import set_device, sync  # noqa: E402
-from dispatch_combine_op import (  # noqa: E402
+from mori.ops.dispatch_combine_v2 import (  # noqa: E402
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
 )
@@ -82,10 +79,14 @@ class Dist:
 HIDDEN = int(os.environ.get("HIDDEN", 7168))
 K = int(os.environ.get("TOPK", 8))
 EPR = int(os.environ.get("EPR", 32))
-# fp8 flavor is arch-specific: OCP e4m3 on gfx950, fnuz on gfx942.
-import tuning_configs as _tc  # noqa: E402
+# fp8 flavor is arch-specific: OCP e4m3 on gfx950/gfx1250, fnuz on gfx942.
+from mori.ops.dispatch_combine_v2 import tuning_configs as _tc  # noqa: E402
 
-_FP8_DT = torch.float8_e4m3fn if _tc._topology()[1] == 90500 else torch.float8_e4m3fnuz
+_FP8_DT = (
+    torch.float8_e4m3fn
+    if _tc._topology()[1] in (90500, 120500)
+    else torch.float8_e4m3fnuz
+)
 DTYPE = {
     "bf16": torch.bfloat16,
     "f32": torch.float32,
@@ -162,7 +163,7 @@ def main():
             max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
         )
         if int(os.environ.get("TUNED", 0)):
-            from tuning_configs import lookup
+            from mori.ops.dispatch_combine_v2.tuning_configs import lookup
 
             _dt = "fp4" if _IS_FP4 else ("fp8" if _IS_FP8 else "bf16")
             cfg.schedule = lookup(npes, HIDDEN, K, dtype=_dt)["schedule"]

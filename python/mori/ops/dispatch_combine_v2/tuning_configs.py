@@ -94,34 +94,110 @@ _MI325X_TABLE = {
 _MI300X_DEFAULT = None  # None => derive from CU count (see _cu_scaled_default)
 _MI300X_TABLE = {}
 
-# ── MI355X (gfx950, 256 CU) — measured 2026-07-08, EP8, fine block x warp sweep.
-# dispatch: warp 8 throughout (warp 16 worse); block 128 (<=2048) / 192 (>=4096).
-# combine : warp 4; block 128 (>=256), 48 for <=64 tok (small blocks win at tiny
-#           batches; 256 blocks are worse — unlike MI308X's ~1 block/CU).
-# fp8-dispatch + bf16-combine schedule (also the fallback for bf16/untuned dtypes):
-_MI355X_SCHED_FP8 = (
-    (64, 128, 8, 48, 8),
-    (2048, 128, 8, 128, 4),
-    (None, 192, 8, 128, 4),
+# ── MI355X (gfx950, wave64) — re-tuned 2026-07-13 for the vec4 combine gather,
+# EP8, 8x gfx950 single-node xGMI, 2-pass block x warp sweep (tok 8..8192). vec4
+# combine wants a small block (32-48) + warp up to 16; dispatch grows block 96->160.
+# wave64 => warp <= 16 (1024-thread block). Geometry is topk-independent.
+# bf16 dispatch + bf16 combine:
+_MI355X_SCHED_BF16 = (
+    (128, 128, 8, 32, 8),
+    (256, 96, 8, 64, 8),
+    (1024, 96, 8, 32, 16),
+    (4096, 160, 8, 32, 16),
+    (None, 128, 16, 48, 16),
 )
-# fp4 dispatch + fp4 combine (data_type=fp4 does both) — measured 2026-07-09 via a
-# 2D block x warp sweep on MI355X (DTYPE=fp4). fp4 = 0.5 B/elem, so both phases are
-# less bandwidth-bound than fp8: dispatch block 128 throughout (warp 4 <=2048,
-# 8 >=4096); combine small block at small tok (64/8 <=256), 128/4 mid, 128/8 large.
+# fp8 dispatch + bf16 combine (combine geometry shared with bf16):
+_MI355X_SCHED_FP8 = (
+    (128, 128, 8, 32, 8),
+    (256, 160, 8, 64, 8),
+    (1024, 128, 8, 32, 16),
+    (4096, 160, 8, 32, 16),
+    (None, 128, 16, 48, 16),
+)
+# fp4 dispatch + fp4 combine (0.5 B/elem):
 _MI355X_SCHED_FP4 = (
-    (256, 128, 4, 64, 8),
-    (2048, 128, 4, 128, 4),
-    (None, 128, 8, 128, 8),
+    (256, 128, 4, 32, 8),
+    (2048, 144, 4, 64, 16),
+    (None, 128, 8, 64, 16),
 )
 _MI355X_DEFAULT = dict(
-    dispatch_block_num=192,
-    combine_block_num=128,
-    warp_num_per_block=8,
-    combine_warp_num_per_block=4,
-    schedule=_MI355X_SCHED_FP8,
+    dispatch_block_num=128,
+    combine_block_num=48,
+    warp_num_per_block=16,
+    combine_warp_num_per_block=16,
+    schedule=_MI355X_SCHED_BF16,
 )
 _MI355X_TABLE = {
-    (8, 7168, 8): {"fp8": _MI355X_SCHED_FP8, "fp4": _MI355X_SCHED_FP4},
+    (8, 7168, 8): {
+        "bf16": _MI355X_SCHED_BF16,
+        "fp8": _MI355X_SCHED_FP8,
+        "fp4": _MI355X_SCHED_FP4,
+    },
+    (8, 7168, 6): {
+        "bf16": _MI355X_SCHED_BF16,
+        "fp8": _MI355X_SCHED_FP8,
+        "fp4": _MI355X_SCHED_FP4,
+    },
+}
+
+# ── gfx1250 (256 CU, wave32) — RE-TUNED 2026-07-15 EP4, bf16, with the vec4 combine
+# kernel + inner-unroll load-first scheduling, FINE 2-pass block x warp sweep
+# (tok 16..16384; comb block 48..192, warp 2..16). Key lessons: (a) dispatch
+# unchanged by vec4 — warp grows to 32, block 192; peaks ~287 GB/s @16384.
+# (b) combine SHIFTED with vec4 AND is very warp-sensitive at small tok: warp 2 wins
+# <=128 (64/2: 64tok 27 vs warp4 21 vs warp16 11 — over-parallelizing the gather+xdb
+# barrier collapses it), warp 4 for mid, warp 8 for large; block grows 64->96->128.
+# The old pre-vec4 schedule (comb block->192, warp 16) is stale: comb @8192 189->242
+# (+28%), mid 512 55->102 (+84%), tiny 64 ~11->27 (2.4x). (c) GUARDRAIL: block_num
+# < CU (256); 192 safe ceiling (Phase-2 grid barrier needs co-residence). Measured
+# vec4 GB/s (disp/comb): 64=29/27 128=56/47 256=114/74 512=182/102 1024=214/132
+# 2048=248/174 4096=264/207 8192=282/242 16384=287/273.
+_GFX1250_SCHED_BF16 = (
+    (128, 128, 8, 64, 2),  # <=128:  latency-bound; combine warp 2 (fewest warps win)
+    (512, 192, 32, 64, 4),  # <=512:  disp peak; comb 64/4
+    (1536, 192, 32, 96, 4),  # <=1536: comb block 96
+    (4096, 192, 32, 128, 4),  # <=4096: comb block 128
+    (None, 192, 32, 128, 8),  # >4096:  comb warp 8 (242/273 GB/s @8192/16384)
+)
+_GFX1250_DEFAULT = dict(
+    dispatch_block_num=192,
+    combine_block_num=192,
+    warp_num_per_block=32,
+    combine_warp_num_per_block=16,
+    schedule=_GFX1250_SCHED_BF16,
+)
+# DeepSeek-V4-Pro shape (hidden 7168, topk 6, 384 experts). RE-VALIDATED 2026-07-15
+# EP4 bf16 vec4 at the topk=8 schedule geometries: geometry is topk-independent
+# (tracks token count, not topk) — per-size optimum matches topk=8, so reuse the
+# same schedule. Measured vec4 GB/s (disp/comb): 16=6/4 256=95/67 512=164/93
+# 1024=212/116 2048=252/164 4096=281/200 8192=293/238 16384=300/272.
+_GFX1250_SCHED_BF16_T6 = _GFX1250_SCHED_BF16
+# EP8 (world_size=8) RE-TUNED 2026-07-13 on gfx1250 CROSS-NODE (2 nodes x 4 GPUs
+# over the UALink fabric), bf16, with the vec4 combine-gather kernel, full 2-pass
+# block x warp sweep (tok 8..8192). dispatch unchanged by vec4: block 128, warp
+# ramps 16->32. combine SHIFTED: block 64 is now uniformly best (128 loses even at
+# 8192 with vec4's wider loads), warp ramps 4->8->16. Cross-node fabric caps disp
+# ~200 GB/s; geometry is world_size-independent so this also serves single-node EP8.
+# Measured vec4 GB/s at scheduled geom (disp/comb): 8=5/3 64=17/23 128=71/47
+# 256=127/76 512=162/105 1024=187/135 2048=198/152 4096=200/176 8192=200/200
+# (<=64 disp is launch-latency noise). vs pre-vec4 scalar tuned comb 8192=173
+# 512=63 256=42 -> +15% / +67% / +80%. topk6 (384 exp) reuses this schedule,
+# comb 8192=198 512=99 256=68 (geometry is topk-independent).
+_GFX1250_SCHED_BF16_EP8 = (
+    (256, 128, 16, 64, 4),  # <=256:  disp warp 16, comb 64/4 (latency-bound)
+    (1024, 128, 32, 64, 8),  # <=1024: disp warp 32, comb 64/8
+    (None, 128, 32, 64, 16),  # >1024 (peak): disp ~200 / comb ~200 GB/s
+)
+# bf16-tuned (EP4 + EP8). fp8/fp4 fall back to the bf16 schedule until separately tuned.
+_GFX1250_TABLE = {
+    (4, 7168, 8): {"bf16": _GFX1250_SCHED_BF16},
+    (4, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_T6},  # DeepSeek-V4-Pro
+    (8, 7168, 8): {"bf16": _GFX1250_SCHED_BF16_EP8},  # cross-node / single-node EP8
+    # V4-Pro topk=6 EP8 cross-node (measured 2026-07-12, full tok 8..8192 sweep):
+    # geometry is topk-independent (tracks token count) — per-size optimum matches
+    # topk=8, so reuse the same schedule. Measured GB/s (disp/comb): 8=4/3 64=32/16
+    # 128=65/25 256=119/39 512=163/56 1024=178/81 2048=199/113 4096=200/145 8192=206/171.
+    (8, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_EP8},
 }
 
 _DEVICES = {
@@ -129,6 +205,7 @@ _DEVICES = {
     "mi325x": (_MI325X_DEFAULT, _MI325X_TABLE),
     "mi300x": (_MI300X_DEFAULT, _MI300X_TABLE),
     "mi355x": (_MI355X_DEFAULT, _MI355X_TABLE),
+    "gfx1250": (_GFX1250_DEFAULT, _GFX1250_TABLE),
 }
 
 
@@ -182,6 +259,8 @@ def _device_key():
         return key
     if gfx == 90500:  # gfx950 (MI350 / MI355X), DID varies
         return "mi355x"
+    if gfx == 120500:  # gfx1250 (256 CU, wave32), DID varies
+        return "gfx1250"
     return None
 
 
