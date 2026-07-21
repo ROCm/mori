@@ -1,4 +1,4 @@
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+// Copyright 뿯½ Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
 //
@@ -82,47 +82,25 @@ namespace moe {
 
 #define MAX_GPUS_PER_NODE 8
 
-#if defined(MORI_DISP_TIMING)
-// Rigorous (whole-grid, not single-warp-sampled) dispatch payload-copy timing:
-// EVERY warp's WarpCopy call adds its wall_clock64 delta + a count into these
-// per-GPU device globals (device-scope atomic, single TU/JIT compile so no ODR
-// issue). Read back after the existing "all blocks on this GPU have finished
-// their send/Pass-B loop" sync point already present in each path, so the
-// printed mean covers the true population (~6144 warps), not one sampled warp.
-__device__ unsigned long long g_dispCopyTimeSum = 0;
-__device__ unsigned long long g_dispCopyCount = 0;
-#endif
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BarrierKernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T> args,
-                                                         const uint64_t crossDeviceBarrierFlag,
-                                                         long long* tLocalWait = nullptr,
-                                                         long long* tPeerWait = nullptr) {
+                                                         const uint64_t crossDeviceBarrierFlag) {
   int thdId = threadIdx.x;
   int laneId = threadIdx.x & (warpSize - 1);
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
 
   int warpNum = blockDim.x / warpSize;
   int globalWarpNum = gridDim.x * warpNum;
-#if defined(MORI_DISP_TIMING)
-  const bool _xt = (args.config.rank == 0 && blockIdx.x == 0 && thdId == 0);
-#endif
 
   __syncthreads();
   if (thdId == 0) atomicAdd(args.combineGridBarrier, 1);
 
   if (globalThdId < args.config.worldSize) {
-#if defined(MORI_DISP_TIMING)
-    long long _w0 = (_xt && tLocalWait) ? wall_clock64() : 0;
-#endif
     // Set remote flag after all copies are done
     shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, gridDim.x);
-#if defined(MORI_DISP_TIMING)
-    if (_xt && tLocalWait) *tLocalWait = wall_clock64() - _w0;
-#endif
     __hip_atomic_store(args.combineGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
     __threadfence_system();
@@ -134,36 +112,12 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
 
   uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
-#if defined(MORI_DISP_TIMING)
-  long long _p0 = (_xt && tPeerWait) ? wall_clock64() : 0;
-#endif
   if (thdId < args.config.worldSize) {
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
     }
   }
-#if defined(MORI_DISP_TIMING)
-  if (_xt && tPeerWait) *tPeerWait = wall_clock64() - _p0;
-#endif
   __syncthreads();
 }
-
-#if defined(MORI_DISP_NOTIFY)
-// Monotonic reusable intra-GPU grid barrier over a local uint32 counter. The
-// counter must be 0 at kernel entry and is left non-zero until reset by the
-// caller; each call advances the arrival total by gridDim.x and blocks until it
-// reaches `expected` (= barrierIndex * gridDim.x). Correct ONLY when every block
-// is co-resident (block_num <= CU) -- guaranteed by the tuned dispatch geometry
-// (192 <= 256 CU); a non-resident block would never arrive and deadlock.
-__device__ __forceinline__ void NotifyGridBarrier(uint32_t* bar, uint32_t expected) {
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    __hip_atomic_fetch_add(bar, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
-    while (__hip_atomic_load(bar, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < expected) {
-    }
-  }
-  __syncthreads();
-}
-#endif
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpDispatchIntraNodeKernel                                   */
@@ -202,45 +156,34 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #endif
 
 #if defined(MORI_DISP_NOTIFY)
-  // ===================== NOTIFY-based slot pre-assignment =====================
-  // Two passes with an intra-GPU grid barrier between them (all blocks co-resident
-  // at the tuned geometry). Eliminates the per-token cross-GPU (system-scope) slot
-  // atomic: (A) count committed tokens per dest PE locally, (B) exchange the count
-  // matrix + cross-device barrier, compute each source rank's contiguous slot base,
-  // (C) send with a LOCAL (agent-scope) slot atomic inside the pre-assigned region.
+  // ===================== NOTIFY slot pre-assignment (signal-based) =============
+  // Two passes with intra-GPU grid barriers, using DIRECTIONAL cross-device
+  // signals (no symmetric cross-device barrier) to keep the fixed sync overhead
+  // low (that overhead, not the per-token atomic, was the reason the earlier
+  // barrier-based NOTIFY was slow):
+  //  (A) count committed tokens per dest PE into localCnt;
+  //  (B) exchange the count matrix via parity-encoded per-cell signals, then
+  //      compute each source rank's contiguous slot base (prefix sum);
+  //  (C) send payload with a LOCAL (agent-scope) slot atomic inside the region;
+  //  (D) signal-based completion (RELEASE fence + per-destPe signal; receiver
+  //      ACQUIRE + poll) so combine observes every peer's writes.
+  // All blocks are co-resident at the tuned geometry (block_num <= CU), which the
+  // GridBarrier and the parity/signal protocols rely on.
   {
     const int globalThdId = blockIdx.x * blockDim.x + thdId;
     const int totalThreads = gridDim.x * blockDim.x;
     index_t* localCnt = args.dispTokOffsetMemObj->template GetAs<index_t*>();     // [npes]
     index_t* baseArr = args.destPeTokenCounter;                                   // [npes] (reused)
     index_t* matLocal = args.dispCountMatrixMemObj->template GetAs<index_t*>();   // [npes*npes]
-    const uint64_t xdevFlag = args.crossDeviceBarrierFlag[0];
-    uint32_t barExp = 0;
+    // parity flips every dispatch (combine advances crossDeviceBarrierFlag by 1
+    // per round) and is identical across ranks, so it distinguishes this launch's
+    // count-matrix cells from the previous launch's without any reset.
+    const index_t parity = (index_t)(args.crossDeviceBarrierFlag[0] & 1ull);
 
-#if defined(MORI_DISP_TIMING)
-    // Fine-grained in-kernel wall_clock64 breakdown of NOTIFY dispatch (rank0/
-    // block0/thd0). Each grid barrier, cross-device barrier and threadfence is
-    // timed separately to pinpoint where the ~1ms goes.
-    const bool _tThd = (myPe == 0 && blockIdx.x == 0 && thdId == 0);
-    long long _tp[11];
-    int _tn = 0;
-    long long _nbCopy = 0, _nbAtom = 0;  // Pass B copy / local-atomic sums (warp0)
-    int _nbCopyN = 0, _nbAtomN = 0;
-    long long _xb1L = 0, _xb1P = 0, _xb2L = 0, _xb2P = 0;  // xdev barrier local/peer waits
-#define TSTAMP() do { if (_tThd) _tp[_tn++] = wall_clock64(); } while (0)
-#else
-#define TSTAMP()
-#endif
-    TSTAMP();  // [0] entry
-
-    // zero local per-destPe counter
     for (int d = globalThdId; d < npes; d += totalThreads) localCnt[d] = 0;
-    barExp += gridDim.x;
-    NotifyGridBarrier(args.dispatchGridBarrier, barExp);
-    TSTAMP();  // [1] after zero-counter + setup grid barrier
+    GridBarrier(args.dispatchGridBarrier);
 
-#if !defined(MORI_DISP_NOTIFY_ISOB)
-    // ---- Pass A: count committed (token -> destPe) into localCnt (agent atomic) ----
+    // ---- Pass A: count committed (token -> destPe) ----
     if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
       for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
            i += globalWarpNum) {
@@ -267,86 +210,47 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         if (laneId == 0) atomicAdd(&localCnt[destPe], 1);
       }
     }
-    TSTAMP();  // [2] after Pass A count loop (pre grid barrier)
-    barExp += gridDim.x;
-    NotifyGridBarrier(args.dispatchGridBarrier, barExp);
-    TSTAMP();  // [3] after grid barrier #1
+    GridBarrier(args.dispatchGridBarrier);
 
-    // ---- Exchange: block 0 writes my count row to every peer's matrix[myPe][*] ----
+    // ---- Exchange: write my count row into every peer's matrix as a parity-coded
+    // signal cell = ((count+1) << 1) | parity (system-scope store). ----
     if (blockIdx.x == 0 && warpId == 0) {
       for (int p = laneId; p < npes; p += warpSize) {
         index_t* peerMat = args.dispCountMatrixMemObj->template GetAs<index_t*>(p);
-        for (int d = 0; d < npes; ++d) peerMat[myPe * npes + d] = localCnt[d];
+        for (int d = 0; d < npes; ++d)
+          core::AtomicStoreRelaxedSystem(&peerMat[myPe * npes + d],
+                                         (index_t)(((localCnt[d] + 1) << 1) | parity));
       }
     }
-    __threadfence_system();
-    TSTAMP();  // [4] after matrix exchange write + threadfence (pre xdev barrier)
-#if defined(MORI_DISP_TIMING)
-    CrossDeviceBarrierIntraNodeKernel(args, xdevFlag, &_xb1L, &_xb1P);
-#else
-    CrossDeviceBarrierIntraNodeKernel(args, xdevFlag);
-#endif
-    TSTAMP();  // [5] after cross-device barrier #1
-
-    // ---- Compute base[destPe] = sum_{s<myPe} M[s][destPe]; recvCount; reset localCnt ----
+    // ---- Prefix: base[d] = sum_{s<myPe} M[s][d]; total recv = sum_s M[s][myPe].
+    // Poll each needed cell until its parity matches this launch, then decode. ----
     if (globalThdId < npes) {
       int d = globalThdId;
       index_t b = 0;
-      for (int s = 0; s < myPe; ++s) b += matLocal[s * npes + d];
+      for (int s = 0; s < myPe; ++s) {
+        index_t v;
+        while (((v = core::AtomicLoadRelaxedSystem(&matLocal[s * npes + d])) & 1) != parity ||
+               v == 0) {
+        }
+        b += (v >> 1) - 1;
+      }
       baseArr[d] = b;
       localCnt[d] = 0;
     }
     if (globalThdId == 0) {
       index_t tot = 0;
-      for (int s = 0; s < npes; ++s) tot += matLocal[s * npes + myPe];
+      for (int s = 0; s < npes; ++s) {
+        index_t v;
+        while (((v = core::AtomicLoadRelaxedSystem(&matLocal[s * npes + myPe])) & 1) != parity ||
+               v == 0) {
+        }
+        tot += (v >> 1) - 1;
+      }
       *args.totalRecvTokenNum = tot;
     }
-    TSTAMP();  // [6] after prefix-sum base compute (pre grid barrier)
-#else
-    // ===== ISOLATED PASS B PROBE (MORI_DISP_NOTIFY_ISOB) =====
-    // Skip Pass A / count-matrix exchange / cross-device barrier #1 / prefix-sum
-    // entirely: fake baseArr[d]=0 for every destPe instead of computing it from
-    // real per-rank counts. This tests whether Pass B's copySum is intrinsically
-    // ~2x the legacy path even with none of the two-pass machinery (and none of
-    // its cache/TLB-state history) in front of it -- i.e. isolates "is Pass B's
-    // WarpCopy itself slow" from "does the two-pass structure make it slow".
-    // Overlapping baseArr=0 across all source ranks means multiple ranks race to
-    // write the SAME destination slots -- wrong dispatch output, but timing-only
-    // (never enable together with --cmd bench's correctness check).
-    if (globalThdId < npes) {
-      baseArr[globalThdId] = 0;
-      localCnt[globalThdId] = 0;
-    }
-    // Emit the same 5 TSTAMP() calls (indices [2]..[6]) the non-ISOB path emits
-    // between the setup barrier and grid barrier #2, so _tp[]/printf indexing
-    // downstream (gridbar2/sendB/fence2/xdevbar2) stays aligned; only sendB
-    // (tp[8]-tp[7]) is meaningful here, the rest collapse to ~0.
-    TSTAMP();  // [2] (Pass A skipped)
-    TSTAMP();  // [3] (gridbar1 skipped)
-    TSTAMP();  // [4] (exch+fence skipped)
-    TSTAMP();  // [5] (xdevbar1 skipped)
-    TSTAMP();  // [6] after fake base fill (pre grid barrier)
-#endif  // MORI_DISP_NOTIFY_ISOB
-    barExp += gridDim.x;
-    NotifyGridBarrier(args.dispatchGridBarrier, barExp);
-    TSTAMP();  // [7] after grid barrier #2
+    GridBarrier(args.dispatchGridBarrier);
 
-    // ---- Pass B: send payload with LOCAL slot assignment inside the region ----
-#if defined(MORI_DISP_TIMING)
-    // Per-warp deltas accumulate into per-BLOCK shared counters first, and only
-    // one atomicAdd per block hits the device-global at the end -- this keeps
-    // the global atomic's contention at ~gridDim.x hits/launch instead of
-    // ~totalWarps hits/launch, which matters a lot for Pass B: its warps finish
-    // near-synchronized (right after the preceding grid barrier), so a
-    // per-warp global atomicAdd here was itself becoming a thundering-herd
-    // contention hotspot that swamped the very timing being measured.
-    __shared__ unsigned long long _sCopySum;
-    __shared__ unsigned int _sCopyCnt;
-    if (thdId == 0) { _sCopySum = 0; _sCopyCnt = 0; }
-    __syncthreads();
-    long long _wCopyAcc = 0;
-    int _wCopyCnt = 0;
-#endif
+    // ---- Pass B: send payload; LOCAL slot atomic inside [baseArr[destPe], ...) ----
     if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
       for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
            i += globalWarpNum) {
@@ -364,14 +268,8 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 
         index_t destTokId = 0;
         if (laneId == 0) {
-#if defined(MORI_DISP_TIMING)
-          long long _b0 = _tThd ? wall_clock64() : 0;
-#endif
-          index_t _slot = atomicAdd(&localCnt[destPe], 1);
-#if defined(MORI_DISP_TIMING)
-          if (_tThd) { asm volatile("" ::"v"(_slot)); _nbAtom += wall_clock64() - _b0; _nbAtomN++; }
-#endif
-          destTokId = baseArr[destPe] + _slot;
+          index_t slot = atomicAdd(&localCnt[destPe], 1);
+          destTokId = baseArr[destPe] + slot;
           args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
           args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
               FlatTokenIndex(config, myPe, srcTokId);
@@ -397,70 +295,37 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         }
         size_t srcTokOffset = srcTokId * hiddenDim;
         size_t destTokOffset = destTokId * hiddenDim;
-#if defined(MORI_DISP_TIMING)
-        long long _bc0 = (laneId == 0) ? wall_clock64() : 0;
-#endif
         core::WarpCopy<T, 8>(
             args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
             args.inpTokenBuf + srcTokOffset, hiddenDim);
-#if defined(MORI_DISP_TIMING)
-        if (laneId == 0) {
-          long long _bcd = wall_clock64() - _bc0;
-          if (_tThd) { _nbCopy += _bcd; _nbCopyN++; }
-          _wCopyAcc += _bcd;
-          _wCopyCnt++;
-        }
-#endif
       }
     }
-#if defined(MORI_DISP_TIMING)
-    if (laneId == 0 && _wCopyCnt > 0) {
-      atomicAdd(&_sCopySum, (unsigned long long)_wCopyAcc);
-      atomicAdd(&_sCopyCnt, (unsigned int)_wCopyCnt);
-    }
-    __syncthreads();
-    if (thdId == 0 && _sCopyCnt > 0) {
-      atomicAdd(&g_dispCopyTimeSum, _sCopySum);
-      atomicAdd(&g_dispCopyCount, (unsigned long long)_sCopyCnt);
-    }
-#endif
 
-    TSTAMP();  // [8] after Pass B payload send
-
-    // Make all payload/metadata writes visible to peers, then cross-device barrier
-    // so combine (next kernel) observes the dispatched data.
-    __threadfence_system();
-    TSTAMP();  // [9] after threadfence_system (pre xdev barrier #2)
-#if defined(MORI_DISP_TIMING)
-    CrossDeviceBarrierIntraNodeKernel(args, xdevFlag + 1, &_xb2L, &_xb2P);
-#else
-    CrossDeviceBarrierIntraNodeKernel(args, xdevFlag + 1);
-#endif
-    if (globalThdId == 0) *args.dispatchGridBarrier = 0;  // reset for next launch
-    TSTAMP();  // [10] after cross-device barrier #2
-#if defined(MORI_DISP_TIMING)
-    if (_tThd) {
-      long long tk = _tp[10] - _tp[0];
-      // Safe to read+reset here: CrossDeviceBarrierIntraNodeKernel (xdevFlag+1,
-      // just completed) internally performs its own intra-GPU grid barrier
-      // BEFORE any cross-device signaling, so every local block's Pass B
-      // contribution to g_dispCopyTimeSum/g_dispCopyCount is guaranteed visible.
-      unsigned long long _gCopySum = g_dispCopyTimeSum, _gCopyCnt = g_dispCopyCount;
-      g_dispCopyTimeSum = 0;
-      g_dispCopyCount = 0;
-      printf(
-          "[NOTIFY-TIMING] tot=%lld tk | setup=%lld countLoop=%lld gridbar1=%lld "
-          "exch+fence=%lld xdevbar1=%lld(L=%lld P=%lld) prefix=%lld gridbar2=%lld sendB=%lld "
-          "(copySum=%lld atomSum=%lld) fence2=%lld xdevbar2=%lld(L=%lld P=%lld) tk\n",
-          tk, _tp[1] - _tp[0], _tp[2] - _tp[1], _tp[3] - _tp[2], _tp[4] - _tp[3],
-          _tp[5] - _tp[4], _xb1L, _xb1P, _tp[6] - _tp[5], _tp[7] - _tp[6], _tp[8] - _tp[7],
-          _nbCopy, _nbAtom, _tp[9] - _tp[8], _tp[10] - _tp[9], _xb2L, _xb2P);
-      printf(
-          "[NOTIFY-COPY-ALLWARP] sum=%llu cnt=%llu meanTk=%.2f\n",
-          _gCopySum, _gCopyCnt, _gCopyCnt ? (double)_gCopySum / (double)_gCopyCnt : 0.0);
+    // ---- Signal-based completion (replaces the symmetric cross-device barrier):
+    // all local blocks arrive, warp0 RELEASE-fences its P2P writes and posts a
+    // per-peer signal, then waits for every peer to signal this rank. ----
+    if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+    index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+    if (globalWarpId == 0) {
+      for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+        shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
+        __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+        index_t numTokenSignal = core::AtomicLoadRelaxed(&localCnt[destPe]) + 1;
+        index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
+        shmem::ShmemInt32WaitUntilEquals(signal, 0);
+        __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+        core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
+      }
     }
-#endif
-#undef TSTAMP
+    if (globalWarpId == 0) {
+      for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
+        index_t* signal = recvTokenNums + srcPe;
+        shmem::ShmemInt32WaitUntilGreaterThan(signal, 0);
+        __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
+        core::AtomicStoreRelaxedSystem(signal, 0);
+      }
+    }
 #ifdef ENABLE_STANDARD_MOE_ADAPT
     if constexpr (EnableStdMoE) {
       InvokeConvertDispatchOutput<T>(args, myPe);
@@ -475,48 +340,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   MORI_TRACE_SEQ(seq, profiler);
   MORI_TRACE_NEXT(seq, Slot::DispatchSendTokens);
 
-#if defined(MORI_DISP_TIMING)
-  // Accumulate, on ONE representative warp lane (rank0/globalWarp0/lane0), the
-  // total wall time spent in the per-token SYSTEM-scope remote slot atomic vs the
-  // hidden-dim payload copy, to weigh "atomics vs data movement" in the legacy path.
-  const bool _tThd = (myPe == 0 && globalWarpId == 0 && laneId == 0);
-  long long _atomAcc = 0, _copyAcc = 0, _loopT0 = 0, _loopT1 = 0, _pN = 0, _pR = 0;
-  int _atomCnt = 0, _copyCnt = 0;
-  long long _atomDs[32];  // per-atomic wall delta (critical-path latency)
-  // Whole-grid copy-time rollup: per-warp deltas land in a per-BLOCK shared
-  // counter first, one atomicAdd/block into the device-global at the end --
-  // keeps global-atomic contention at ~gridDim.x hits/launch, not
-  // ~totalWarps hits/launch (see the matching comment in the NOTIFY Pass B
-  // block for why a per-warp global atomic here would distort the timing).
-  __shared__ unsigned long long _sCopySum;
-  __shared__ unsigned int _sCopyCnt;
-  if (thdId == 0) { _sCopySum = 0; _sCopyCnt = 0; }
-  __syncthreads();
-  long long _wCopyAcc = 0;
-  int _wCopyCnt = 0;
-#endif
-#if defined(MORI_DISP_PREBARRIER)
-  // BURST TEST: force ALL blocks to start the send loop simultaneously via a grid
-  // barrier on combineGridBarrier (unused by legacy dispatch; reset to 0 for the
-  // later combine kernel across the kernel boundary). If this alone slows the send
-  // ~2x, "synchronized start -> congestion" is the cause; else it is not.
-  {
-    const int _gtid = blockIdx.x * blockDim.x + thdId;
-    __syncthreads();
-    if (thdId == 0) __hip_atomic_fetch_add(args.combineGridBarrier, 1u, __ATOMIC_ACQ_REL,
-                                           __HIP_MEMORY_SCOPE_AGENT);
-    if (thdId == 0)
-      while (__hip_atomic_load(args.combineGridBarrier, __ATOMIC_ACQUIRE,
-                               __HIP_MEMORY_SCOPE_AGENT) < gridDim.x) {
-      }
-    __syncthreads();
-    if (_gtid == 0)
-      __hip_atomic_store(args.combineGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  }
-#endif
-#if defined(MORI_DISP_TIMING)
-  if (_tThd) _loopT0 = wall_clock64();
-#endif
   if (args.tokenIndices && args.inpTokenBuf) {
     // Phase1: send token
     // Each warp compute token offset on destinition PE
@@ -579,24 +402,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
             // so concurrent senders can get the same destTokId -> slot collision ->
             // corrupt dispatch (map/payload disagree). Matches v2's system-scope
             // atomic_add_global.
-#if defined(MORI_DISP_TIMING)
-            long long _a0 = _tThd ? wall_clock64() : 0;
-#endif
             destTokId = __hip_atomic_fetch_add(
                 args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1,
                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-#if defined(MORI_DISP_TIMING)
-            if (_tThd) {
-              // Force the atomic's return value into a register (materialize the
-              // s_wait) BEFORE the second timestamp, so we measure the true
-              // issue->return critical-path latency, not just the issue.
-              asm volatile("" ::"v"(destTokId));
-              long long _a1 = wall_clock64();
-              if (_atomCnt < 32) _atomDs[_atomCnt] = _a1 - _a0;
-              _atomAcc += _a1 - _a0;
-              _atomCnt++;
-            }
-#endif
             assert(destTokId < config.MaxNumTokensToRecv() &&
                    "Total recv token overflow: increase maxTotalRecvTokens");
             atomicAdd(args.destPeTokenCounter + destPe, 1);
@@ -648,15 +456,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       size_t srcTokOffset = srcTokId * hiddenDim;
       size_t destTokOffset = destTokId * hiddenDim;
 
-      if (myPe == 3 && (srcTokId == 108 || srcTokId == 0) && laneId == 0 &&
-          (i % config.numExpertPerToken) == 0) {
-        const unsigned* sp = (const unsigned*)(args.inpTokenBuf + srcTokOffset);
-        printf("SND r3 tok=%d destPe=%d destTokId=%d inpBase=%p srcOff=%llu s0=%08x s1=%08x smid=%08x\n",
-               (int)srcTokId, destPe, (int)destTokId, (void*)args.inpTokenBuf,
-               (unsigned long long)srcTokOffset, sp[0], sp[1],
-               ((const unsigned*)(args.inpTokenBuf + srcTokOffset + hiddenDim / 2))[0]);
-      }
-
       {
         // Fine-grained timing: the actual hidden-dim payload WarpCopy to the
         // destination PE (the bulk P2P write). Unroll=8 issues 8 in-flight 16B
@@ -664,9 +463,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         // higher per-access latency of the CCO peer path; matches the v2/FlyDSL
         // multi-stream copy that keeps dispatch fast.
         MORI_TRACE_SPAN(profiler, Slot::DispTokenCopy);
-#if defined(MORI_DISP_TIMING)
-        long long _c0 = (laneId == 0) ? wall_clock64() : 0;
-#endif
 #if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
         // Inline TDM copy (exact tdm_ep4_dispatch pattern): build the descriptor
         // locally each token, LOAD src->tile, wait, wave barrier, STORE tile->peer, wait.
@@ -697,31 +493,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
             args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
             args.inpTokenBuf + srcTokOffset, hiddenDim);
 #endif
-#if defined(MORI_DISP_TIMING)
-        if (laneId == 0) {
-          long long _cd = wall_clock64() - _c0;
-          if (_tThd) { _copyAcc += _cd; _copyCnt++; }
-          _wCopyAcc += _cd;
-          _wCopyCnt++;
-        }
-#endif
       }
     }
   }
-#if defined(MORI_DISP_TIMING)
-  if (_tThd) _loopT1 = wall_clock64();  // block0 send loop done (pre-syncthreads)
-  if (laneId == 0 && _wCopyCnt > 0) {
-    atomicAdd(&_sCopySum, (unsigned long long)_wCopyAcc);
-    atomicAdd(&_sCopyCnt, (unsigned int)_wCopyCnt);
-  }
-#endif
   __syncthreads();
-#if defined(MORI_DISP_TIMING)
-  if (thdId == 0 && _sCopyCnt > 0) {
-    atomicAdd(&g_dispCopyTimeSum, _sCopySum);
-    atomicAdd(&g_dispCopyCount, (unsigned long long)_sCopyCnt);
-  }
-#endif
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
   // Send token num & token to expert mapping to other ranks
@@ -745,20 +520,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
   }
-#if defined(MORI_DISP_TIMING)
-  unsigned long long _gCopySum = 0, _gCopyCnt = 0;
-  if (_tThd) {
-    _pN = wall_clock64();  // after grid barrier wait + notify peers
-    // Safe to read+reset here: dispatchGridBarrier's wait (above) happens-after
-    // every block's own atomicAdd(dispatchGridBarrier,1), which happens-after
-    // that block's contribution to g_dispCopyTimeSum/g_dispCopyCount in program
-    // order, so all warps' additions are guaranteed visible by this point.
-    _gCopySum = g_dispCopyTimeSum;
-    _gCopyCnt = g_dispCopyCount;
-    g_dispCopyTimeSum = 0;
-    g_dispCopyCount = 0;
-  }
-#endif
 
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
@@ -785,25 +546,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     }
   }
 
-#if defined(MORI_DISP_TIMING)
-  if (_tThd) {
-    _pR = wall_clock64();
-    int _np = _atomCnt < 16 ? _atomCnt : 16;
-    printf(
-        "[ATOMIC-EACH] warp0 n=%d each_tk= %lld %lld %lld %lld %lld %lld %lld %lld\n",
-        _atomCnt, _np > 0 ? _atomDs[0] : -1, _np > 1 ? _atomDs[1] : -1,
-        _np > 2 ? _atomDs[2] : -1, _np > 3 ? _atomDs[3] : -1, _np > 4 ? _atomDs[4] : -1,
-        _np > 5 ? _atomDs[5] : -1, _np > 6 ? _atomDs[6] : -1, _np > 7 ? _atomDs[7] : -1);
-    // Grid-wide phase breakdown (block0/thd0), same measurement scope as NOTIFY.
-    printf(
-        "[LEGACY-TIMING] tot=%lld tk | sendLoop=%lld (atomicSum=%lld copySum=%lld) "
-        "gridbar+notify=%lld recvWait=%lld tk\n",
-        _pR - _loopT0, _loopT1 - _loopT0, _atomAcc, _copyAcc, _pN - _loopT1, _pR - _pN);
-    printf(
-        "[LEGACY-COPY-ALLWARP] sum=%llu cnt=%llu meanTk=%.2f\n",
-        _gCopySum, _gCopyCnt, _gCopyCnt ? (double)_gCopySum / (double)_gCopyCnt : 0.0);
-  }
-#endif
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   if constexpr (EnableStdMoE) {
     InvokeConvertDispatchOutput<T>(args, myPe);
