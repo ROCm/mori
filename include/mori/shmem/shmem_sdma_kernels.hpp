@@ -40,7 +40,8 @@ template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
-  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are host-populated per global pe (symmetric_memory.cpp)
+  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are
+                         // host-populated per global pe (symmetric_memory.cpp)
   uint8_t* srcPtr =
       reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
@@ -58,7 +59,8 @@ template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
-  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are host-populated per global pe (symmetric_memory.cpp)
+  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are
+                         // host-populated per global pe (symmetric_memory.cpp)
   uint8_t* srcPtr =
       reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
@@ -92,7 +94,8 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SD
     const void* dest, const void* source, size_t bytes, int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
-  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are host-populated per global pe (symmetric_memory.cpp)
+  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are
+                         // host-populated per global pe (symmetric_memory.cpp)
 
   uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
   size_t offset = destAddr - globalGpuStates->heapBaseAddr;
@@ -114,7 +117,8 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA
     const void* dest, const void* source, size_t bytes, int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
-  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are host-populated per global pe (symmetric_memory.cpp)
+  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are
+                         // host-populated per global pe (symmetric_memory.cpp)
 
   uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
   size_t offset = destAddr - globalGpuStates->heapBaseAddr;
@@ -480,7 +484,8 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::SDMA>(
 
 template <application::TransportType>
 inline __device__ void ShmemQuietThreadKernel(int pe, const application::SymmMemObjPtr dest) {
-  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are host-populated per global pe (symmetric_memory.cpp)
+  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are
+                         // host-populated per global pe (symmetric_memory.cpp)
 
   anvil::SdmaQueueDeviceHandle** devicehandles =
       dest->deviceHandles_d + intraNodePe * dest->sdmaNumQueue;
@@ -492,7 +497,8 @@ inline __device__ void ShmemQuietThreadKernel(int pe, const application::SymmMem
 
 template <application::TransportType>
 inline __device__ void ShmemQuietWarpKernel(int pe, const application::SymmMemObjPtr dest) {
-  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are host-populated per global pe (symmetric_memory.cpp)
+  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are
+                         // host-populated per global pe (symmetric_memory.cpp)
 
   anvil::SdmaQueueDeviceHandle** devicehandles =
       dest->deviceHandles_d + intraNodePe * dest->sdmaNumQueue;
