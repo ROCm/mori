@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -46,20 +47,17 @@ namespace mori {
 namespace application {
 
 namespace {
-// Total wall-clock budget (ms) for each bootstrap rendezvous step (non-root
-// connect-to-root, ring connect, and the root-side accepts). Historically these
-// were fixed at 50 retries x 200 ms ~= 10 s, which is too tight when the root
-// rank is slow to reach accept() (e.g. busy with model init in a large MoE
-// launch), producing spurious "failed to connect to root" bootstrap failures.
-// Configurable via MORI_BOOTSTRAP_TIMEOUT (seconds); defaults to 300 s to
-// tolerate slow-starting roots while still bounding the wait to prevent hangs.
+// Per-step bootstrap rendezvous budget (ms). Default 300 s (the old fixed
+// ~10 s was too tight when the root is slow to accept()); override with
+// MORI_BOOTSTRAP_TIMEOUT (seconds).
 int BootstrapTimeoutMs() {
   static const int kMs = [] {
+    constexpr int kMaxSecs = std::numeric_limits<int>::max() / 1000;
     int secs = 300;
     if (const char* s = std::getenv("MORI_BOOTSTRAP_TIMEOUT")) {
       try {
         int v = std::stoi(s);
-        if (v > 0) secs = v;
+        if (v > 0) secs = std::min(v, kMaxSecs);
       } catch (...) {
       }
     }
