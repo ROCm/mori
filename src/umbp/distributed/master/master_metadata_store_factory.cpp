@@ -194,7 +194,8 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
                            tags.size());
           } else {
             const std::size_t fallback = std::min<std::size_t>(
-                kMaxBlockShards, std::max<std::size_t>(1, 2 * std::max<std::size_t>(1, ranges.size())));
+                kMaxBlockShards,
+                std::max<std::size_t>(1, 2 * std::max<std::size_t>(1, ranges.size())));
             cfg.block_shards = fallback;
             MORI_UMBP_WARN(
                 "[MetadataStore] cluster balanced tag search matched {}/{} masters; "
@@ -207,8 +208,9 @@ std::unique_ptr<IMasterMetadataStore> MakeMasterMetadataStore() {
               e.what(), cfg.block_shards);
         }
       }
-      MORI_UMBP_INFO("[MetadataStore] backend=redis namespace={} seeds={} block_shards={} (cluster)",
-                     cfg.namespace_id, cfg.cluster_seeds.size(), cfg.block_shards);
+      MORI_UMBP_INFO(
+          "[MetadataStore] backend=redis namespace={} seeds={} block_shards={} (cluster)",
+          cfg.namespace_id, cfg.cluster_seeds.size(), cfg.block_shards);
     } else if (cfg.shard_uris.size() > 1) {
       MORI_UMBP_INFO("[MetadataStore] backend=redis namespace={} endpoints={} (multi-endpoint)",
                      cfg.namespace_id, cfg.shard_uris.size());

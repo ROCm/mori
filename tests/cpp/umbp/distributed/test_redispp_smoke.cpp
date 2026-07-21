@@ -34,11 +34,10 @@
 // a store never fails.
 
 #include <gtest/gtest.h>
+#include <sw/redis++/redis++.h>
 
 #include <cstdlib>
 #include <string>
-
-#include <sw/redis++/redis++.h>
 
 namespace {
 

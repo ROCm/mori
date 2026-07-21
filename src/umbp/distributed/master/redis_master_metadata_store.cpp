@@ -539,8 +539,8 @@ bool RedisMasterMetadataStore::RegisterExternalKvIfAlive(const std::string& node
     // (== control slot).
     std::vector<std::string> keys;
     keys.reserve(2 + hashes.size());
-    keys.push_back(keys_.Node(node_id));            // KEYS[1] alive-check
-    keys.push_back(keys_.ExtKvNode(node_id, 0));    // KEYS[2] reverse index
+    keys.push_back(keys_.Node(node_id));                          // KEYS[1] alive-check
+    keys.push_back(keys_.ExtKvNode(node_id, 0));                  // KEYS[2] reverse index
     for (const auto& h : hashes) keys.push_back(keys_.ExtKv(h));  // KEYS[3..]
     RespValue r = control().Eval(redis::kRegisterExternalKvLua, keys, {node_id, tier_str});
     if (r.is_error()) throw std::runtime_error("[RedisStore] RegisterExternalKvIfAlive: " + r.str);
@@ -613,9 +613,9 @@ void RedisMasterMetadataStore::UnregisterExternalKvByTier(const std::string& nod
   // shard. One script per shard, routed to that shard.
   const std::string tier_str = std::to_string(static_cast<int>(tier));
   for (std::size_t shard = 0; shard < keys_.NumShards(); ++shard) {
-    RespValue r = client_for_shard(shard).Eval(redis::kUnregisterExternalKvByTierLua,
-                                               {keys_.ExtKvNode(node_id, shard)},
-                                               {node_id, tier_str});
+    RespValue r =
+        client_for_shard(shard).Eval(redis::kUnregisterExternalKvByTierLua,
+                                     {keys_.ExtKvNode(node_id, shard)}, {node_id, tier_str});
     if (r.is_error()) throw std::runtime_error("[RedisStore] UnregisterExternalKvByTier: " + r.str);
   }
 }

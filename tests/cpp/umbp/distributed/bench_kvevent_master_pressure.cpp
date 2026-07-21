@@ -320,39 +320,40 @@ struct BenchOpts {
 };
 
 void Usage() {
-  std::fprintf(stderr,
-               "Usage: bench_kvevent_master_pressure [options]\n"
-               "  --mode baseline|compressed|flush   (default baseline)\n"
-               "  --pattern broadcast|rotate         (default rotate)\n"
-               "  --get-mode exists|fetch|both       (default exists)\n"
-               "  --clients N        (default 4)\n"
-               "  --rounds N         (default 100)\n"
-               "  --warmup-rounds N  (default 5)\n"
-               "  --batch N          (default 16)\n"
-               "  --page-bytes N     (default 4096)\n"
-               "  --gap-ms F         (default 250)\n"
-               "  --gap-jitter-ms F  (default 0)\n"
-               "  --round-barrier    (default off)\n"
-               "  --read-lag-rounds N(default 1; 0 needs --round-barrier)\n"
-               "  --randomize        (mix broadcast/rotate per round)\n"
-               "  --seed N           (default 1234)\n"
-               "  --with-external-kv (default off)\n"
-               "  --ext-kv-count-as-hit 0|1 (default 1; MatchExternalKv hit-count write)\n"
-               "  --ext-kv-only      (only report+match, no BatchPut/Get/RDMA; implies --with-external-kv)\n"
-               "  --key-space N      (0=unique per round; >0 recycle)\n"
-               "  --metrics-port P   (0=off; >0 enable master Prometheus + scrape)\n"
-               "  --keep-master-secs F (default 0)\n"
-               "  --put-algo most_available|random   (default most_available)\n"
-               "  --put-affinity none|same|local     (default local)\n"
-               "  --external-master host:port  (connect to a shared standalone master;\n"
-               "                                empty => spawn an in-process master)\n"
-               "  --node-id-prefix S   (default node-; client index appended)\n"
-               "  --node-address IP    (default 127.0.0.1; this process's reachable IP)\n"
-               "  --barrier-dir DIR    (cross-process end-of-run barrier dir; shared FS for multi-host)\n"
-               "  --barrier-size N     (total client processes to wait for; <=1 disables)\n"
-               "  --barrier-tag S      (unique per run; isolates the barrier subdir)\n"
-               "Heartbeat interval is env-driven (UMBP_HEARTBEAT_TTL_SEC,\n"
-               "UMBP_HEARTBEAT_INTERVAL_DIVISOR); launch one process per scenario.\n");
+  std::fprintf(
+      stderr,
+      "Usage: bench_kvevent_master_pressure [options]\n"
+      "  --mode baseline|compressed|flush   (default baseline)\n"
+      "  --pattern broadcast|rotate         (default rotate)\n"
+      "  --get-mode exists|fetch|both       (default exists)\n"
+      "  --clients N        (default 4)\n"
+      "  --rounds N         (default 100)\n"
+      "  --warmup-rounds N  (default 5)\n"
+      "  --batch N          (default 16)\n"
+      "  --page-bytes N     (default 4096)\n"
+      "  --gap-ms F         (default 250)\n"
+      "  --gap-jitter-ms F  (default 0)\n"
+      "  --round-barrier    (default off)\n"
+      "  --read-lag-rounds N(default 1; 0 needs --round-barrier)\n"
+      "  --randomize        (mix broadcast/rotate per round)\n"
+      "  --seed N           (default 1234)\n"
+      "  --with-external-kv (default off)\n"
+      "  --ext-kv-count-as-hit 0|1 (default 1; MatchExternalKv hit-count write)\n"
+      "  --ext-kv-only      (only report+match, no BatchPut/Get/RDMA; implies --with-external-kv)\n"
+      "  --key-space N      (0=unique per round; >0 recycle)\n"
+      "  --metrics-port P   (0=off; >0 enable master Prometheus + scrape)\n"
+      "  --keep-master-secs F (default 0)\n"
+      "  --put-algo most_available|random   (default most_available)\n"
+      "  --put-affinity none|same|local     (default local)\n"
+      "  --external-master host:port  (connect to a shared standalone master;\n"
+      "                                empty => spawn an in-process master)\n"
+      "  --node-id-prefix S   (default node-; client index appended)\n"
+      "  --node-address IP    (default 127.0.0.1; this process's reachable IP)\n"
+      "  --barrier-dir DIR    (cross-process end-of-run barrier dir; shared FS for multi-host)\n"
+      "  --barrier-size N     (total client processes to wait for; <=1 disables)\n"
+      "  --barrier-tag S      (unique per run; isolates the barrier subdir)\n"
+      "Heartbeat interval is env-driven (UMBP_HEARTBEAT_TTL_SEC,\n"
+      "UMBP_HEARTBEAT_INTERVAL_DIVISOR); launch one process per scenario.\n");
 }
 
 bool ParseArgs(int argc, char** argv, BenchOpts* o) {
@@ -514,7 +515,8 @@ struct Metrics {
   std::atomic<uint64_t> hit{0};
   std::atomic<uint64_t> miss{0};
   std::atomic<uint64_t> rpc_error_keys{0};
-  std::atomic<uint64_t> fetch_errors{0};  // BatchGet transport failures (peer down); excluded from hit/miss
+  std::atomic<uint64_t> fetch_errors{
+      0};  // BatchGet transport failures (peer down); excluded from hit/miss
   std::atomic<uint64_t> ext_report_calls{0};
   std::atomic<uint64_t> ext_match_calls{0};
   std::atomic<uint64_t> ext_match_hits{0};
@@ -738,13 +740,12 @@ bool FileBarrierWait(const std::string& dir, const std::string& member, size_t s
     std::ofstream f(fs::path(dir) / member);
     f << "1";
   }
-  const auto deadline =
-      Clock::now() +
-      std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(timeout_s));
+  const auto deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                                           std::chrono::duration<double>(timeout_s));
   for (;;) {
     size_t n = 0;
-    for (auto it = fs::directory_iterator(dir, ec);
-         !ec && it != fs::directory_iterator(); it.increment(ec)) {
+    for (auto it = fs::directory_iterator(dir, ec); !ec && it != fs::directory_iterator();
+         it.increment(ec)) {
       if (ec) break;
       ++n;
     }

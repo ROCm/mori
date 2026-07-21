@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """Fetch a UMBP master's Prometheus /metrics and print per-RPC p50/p95/p99.
 
 Aggregates mori_umbp_master_client_rpc_latency_seconds_bucket across ALL node
@@ -12,8 +33,8 @@ import urllib.request
 METRIC = "mori_umbp_master_client_rpc_latency_seconds_bucket"
 COUNT = "mori_umbp_master_client_rpc_latency_seconds_count"
 
-BUCKET_RE = re.compile(r'^%s\{([^}]*)\}\s+([0-9.eE+]+)\s*$' % re.escape(METRIC))
-COUNT_RE = re.compile(r'^%s\{([^}]*)\}\s+([0-9.eE+]+)\s*$' % re.escape(COUNT))
+BUCKET_RE = re.compile(r"^%s\{([^}]*)\}\s+([0-9.eE+]+)\s*$" % re.escape(METRIC))
+COUNT_RE = re.compile(r"^%s\{([^}]*)\}\s+([0-9.eE+]+)\s*$" % re.escape(COUNT))
 
 
 def labels(s):
@@ -46,7 +67,6 @@ def main():
             rpc = lab.get("rpc", "?")
             counts[rpc] = counts.get(rpc, 0.0) + float(m.group(2))
 
-
     def quantile(edges, q):
         total = edges[-1][1]  # +Inf cumulative = total
         if total <= 0:
@@ -68,8 +88,16 @@ def main():
     for rpc in sorted(buckets):
         edges = sorted(buckets[rpc].items())
         cnt = counts.get(rpc, edges[-1][1])
-        print("%s,%.0f,%.3f,%.3f,%.3f" % (
-            rpc, cnt, quantile(edges, 0.50), quantile(edges, 0.95), quantile(edges, 0.99)))
+        print(
+            "%s,%.0f,%.3f,%.3f,%.3f"
+            % (
+                rpc,
+                cnt,
+                quantile(edges, 0.50),
+                quantile(edges, 0.95),
+                quantile(edges, 0.99),
+            )
+        )
 
 
 if __name__ == "__main__":

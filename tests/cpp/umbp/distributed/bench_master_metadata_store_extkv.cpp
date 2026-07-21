@@ -78,10 +78,10 @@ struct Opts {
   // match | match_nohit | report | revoke | hitcounts | mixed
   std::string workload = "match";
   int threads = 8;
-  int nodes = 8;         // registered clients the hashes are spread across
+  int nodes = 8;  // registered clients the hashes are spread across
   double seconds = 5.0;
-  int keys = 50000;      // external-kv hash keyspace (seeded across nodes)
-  int batch = 32;        // hashes per op (real prefix match is tens)
+  int keys = 50000;        // external-kv hash keyspace (seeded across nodes)
+  int batch = 32;          // hashes per op (real prefix match is tens)
   double hit_ratio = 1.0;  // fraction of queried hashes that actually exist
   double warmup_seconds = 1.0;
 };
@@ -116,23 +116,24 @@ std::string SeededHash(int i) { return "h/" + std::to_string(i); }
 std::string MissHash(int i, int keys) { return "h/" + std::to_string(keys + i); }
 
 void Usage() {
-  std::fprintf(stderr,
-               "Usage: bench_master_metadata_store_extkv [options]\n"
-               "  --workload match|match_nohit|report|revoke|hitcounts|mixed  (default match)\n"
-               "      match       MatchExternalKv(count_as_hit=true)  -- hot read (+hit-count write)\n"
-               "      match_nohit MatchExternalKv(count_as_hit=false) -- pure read (isolates hit cost)\n"
-               "      report      RegisterExternalKvIfAlive           -- hot write (BlockStored)\n"
-               "      revoke      UnregisterExternalKv                -- write (BlockRemoved)\n"
-               "      hitcounts   GetExternalKvHitCounts              -- eviction/admin read\n"
-               "      mixed       1:1 match(count_as_hit) : report    -- read/write blend\n"
-               "  --threads N        (default 8)\n"
-               "  --nodes N          registered clients hashes spread across (default 8)\n"
-               "  --seconds F        (default 5)\n"
-               "  --warmup-seconds F (default 1)\n"
-               "  --keys N           external-kv hash keyspace (default 50000)\n"
-               "  --batch N          hashes per op (default 32)\n"
-               "  --hit-ratio F      fraction of queried hashes that exist (default 1.0)\n"
-               "Backend is chosen via UMBP_METADATA_BACKEND / UMBP_REDIS_URI.\n");
+  std::fprintf(
+      stderr,
+      "Usage: bench_master_metadata_store_extkv [options]\n"
+      "  --workload match|match_nohit|report|revoke|hitcounts|mixed  (default match)\n"
+      "      match       MatchExternalKv(count_as_hit=true)  -- hot read (+hit-count write)\n"
+      "      match_nohit MatchExternalKv(count_as_hit=false) -- pure read (isolates hit cost)\n"
+      "      report      RegisterExternalKvIfAlive           -- hot write (BlockStored)\n"
+      "      revoke      UnregisterExternalKv                -- write (BlockRemoved)\n"
+      "      hitcounts   GetExternalKvHitCounts              -- eviction/admin read\n"
+      "      mixed       1:1 match(count_as_hit) : report    -- read/write blend\n"
+      "  --threads N        (default 8)\n"
+      "  --nodes N          registered clients hashes spread across (default 8)\n"
+      "  --seconds F        (default 5)\n"
+      "  --warmup-seconds F (default 1)\n"
+      "  --keys N           external-kv hash keyspace (default 50000)\n"
+      "  --batch N          hashes per op (default 32)\n"
+      "  --hit-ratio F      fraction of queried hashes that exist (default 1.0)\n"
+      "Backend is chosen via UMBP_METADATA_BACKEND / UMBP_REDIS_URI.\n");
 }
 
 }  // namespace
@@ -329,8 +330,8 @@ int main(int argc, char** argv) {
       "lat_us_p50,lat_us_p95,lat_us_p99,lat_us_max\n");
   std::printf("%s,%s,%d,%d,%d,%d,%.2f,%.3f,%llu,%.0f,%.0f,%.2f,%.2f,%.2f,%.2f\n",
               backend_name.c_str(), o.workload.c_str(), o.threads, o.nodes, o.batch, o.keys,
-              o.hit_ratio, wall_s, static_cast<unsigned long long>(total_ops), ops_per_s, keys_per_s,
-              Percentile(all, 0.50), Percentile(all, 0.95), Percentile(all, 0.99),
+              o.hit_ratio, wall_s, static_cast<unsigned long long>(total_ops), ops_per_s,
+              keys_per_s, Percentile(all, 0.50), Percentile(all, 0.95), Percentile(all, 0.99),
               all.empty() ? 0.0 : *std::max_element(all.begin(), all.end()));
   std::fflush(stdout);
   return 0;
