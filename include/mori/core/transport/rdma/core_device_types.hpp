@@ -125,11 +125,11 @@ struct WorkQueueHandle {
   uint32_t sqWqeNum{0};
   uint32_t msntblNum{0};
   uint32_t rqWqeNum{0};
-  // Persistent RQ producer index for WRITE_WITH_IMM recv WQEs (Phase-6). The SQ
-  // side has postIdx; the RQ had no counter, so a per-launch recv pre-post would
-  // reuse slot 0 and drive the RQ doorbell record backwards on the 2nd launch.
-  // rqPostIdx survives across kernel launches so ShmemPostRecvImm advances the RQ
-  // monotonically. Default 0, untouched unless the WRITE_WITH_IMM path is engaged.
+  // Persistent RQ producer index for WRITE_WITH_IMM recv WQEs. Mirrors the SQ's
+  // postIdx: without it a per-launch recv pre-post reuses slot 0 and drives the
+  // RQ doorbell record backwards on the next launch. rqPostIdx survives across
+  // kernel launches so ShmemPostRecvImm advances the RQ monotonically. Default 0,
+  // untouched unless the WRITE_WITH_IMM path is engaged.
   uint32_t rqPostIdx{0};
   uint32_t postSendLock{0};
   bool color;

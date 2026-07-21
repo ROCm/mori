@@ -22,22 +22,22 @@
 # SOFTWARE.
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
-# CROSS-NODE overlap UT for the hp_sdma path (this PR is cross-node, world>=16).
+# Cross-node overlap UT for the hp_sdma path (this PR is cross-node, world>=16).
 #
-# THESIS. hp_sdma = host-proxy AllGather: cross-node leg CPU-posted (CU-free),
-# intra-node leg on the XGMI SDMA copy engine (CU-free). RCCL all_gather runs a
-# CU-resident ncclDevKernel that stays on the GPU for the whole (slow) cross-node
-# round-trip. So when MANY AllGathers overlap a compute stream, RCCL's resident
-# kernels squeeze the concurrent GEMMs while hp_sdma leaves the GPU to compute.
+# hp_sdma = host-proxy AllGather: cross-node leg CPU-posted (CU-free), intra-node
+# leg on the XGMI SDMA copy engine (CU-free). RCCL all_gather runs a CU-resident
+# ncclDevKernel that stays on the GPU for the whole cross-node round-trip. So when
+# many AllGathers overlap a compute stream, RCCL's resident kernels squeeze the
+# concurrent GEMMs while hp_sdma leaves the GPU to compute.
 #
-# METRIC. We report the GEMMs' OWN completion time (compute-stream CUDA events)
-# while N AllGathers run concurrently, for RCCL vs hp_sdma. LOWER = the collective
-# steals less GPU from compute. We deliberately time ONLY the GEMMs (not total
-# wall) so the AG's own host/latency cost is excluded -- the question is purely
-# "how much does the concurrent collective disturb the compute". A single
-# cross-node AG barely disturbs (RCCL cross-node AG is network-bound, GPU-light);
-# the effect emerges with MANY concurrent AGs (the E2E regime), which is why N
-# defaults to 50. HARD bit-exact gate (torch.equal vs RCCL) before timing.
+# Metric: report the GEMMs' own completion time (compute-stream CUDA events) while
+# N AllGathers run concurrently, for RCCL vs hp_sdma. Lower = the collective
+# steals less GPU from compute. Time only the GEMMs (not total wall) so the AG's
+# own host/latency cost is excluded -- the question is how much the concurrent
+# collective disturbs the compute. A single cross-node AG barely disturbs (RCCL
+# cross-node AG is network-bound, GPU-light); the effect emerges with many
+# concurrent AGs (the E2E regime), which is why N defaults to 50. Bit-exact gate
+# (torch.equal vs RCCL) before timing.
 # Set MORI_OVERLAP_ASSERT=1 to assert hp_sdma GEMM time < RCCL GEMM time.
 import argparse
 import os

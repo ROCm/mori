@@ -28,13 +28,12 @@ intra-node PARAM-CONTIGUOUS zero-copy direct scatter) vs a
 ``torch.distributed.all_gather_into_tensor`` reference over the per-node
 sub-group, reshuffled into the FSDP ``[param][rank]`` layout.
 
-Motivation: HSDP FSDP2 beats RCCL by +17.6% using the intra-only SDMA AG with
-this param-contiguous zero-copy write, but the loss varied run-to-run because
-this exact kernel path had NO standalone bit-exact test (only the plain gather
-was covered in test_intra_subgroup_sdma.py). AllGather is a pure data move =>
-ZERO tolerance (``torch.equal``). This mirrors EXACTLY the call the adapter
-``MoriIntraSubGroupAllGather.__call__`` makes: num_blocks=1, first_block=0,
-world_size=group_size, register_output_buffer + finish_direct_stream.
+This param-contiguous zero-copy kernel path has its own standalone bit-exact
+test here (the plain gather is covered in test_intra_subgroup_sdma.py). AllGather
+is a pure data move => zero tolerance (``torch.equal``). This mirrors exactly the
+call the adapter ``MoriIntraSubGroupAllGather.__call__`` makes: num_blocks=1,
+first_block=0, world_size=group_size, register_output_buffer +
+finish_direct_stream.
 
 Cross node (2 nodes) -- launch under torchrun::
 
@@ -62,23 +61,21 @@ pytestmark = pytest.mark.skipif(
 
 _DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.int32]
 
-# Per-rank per-param element counts (packed shard = concat of these). MUST be
-# LARGE ENOUGH that the fresh output allocation lands on its OWN caching-allocator
+# Per-rank per-param element counts (packed shard = concat of these). Must be
+# large enough that the fresh output allocation lands on its own caching-allocator
 # segment base (output_ptr == the registered segment base). The direct path's
-# ShmemSymmetricRegister / hipIpcGetMemHandle registers the CONTAINING allocation;
+# ShmemSymmetricRegister / hipIpcGetMemHandle registers the containing allocation;
 # the scatter writes to peerPtrs[remotePe] + dstBaseOffset assuming peerPtr == the
-# buffer base. If the output is a torch SUB-allocation (small buffer packed inside
-# a larger pool segment) the peer pointer resolves to the SEGMENT base, not the
-# buffer, and the scatter SILENTLY CORRUPTS (writes land at the wrong slots) --
-# this is the "num_blocks=1 scatter bug" that looked like a concurrent-put race
-# for many turns but is really an undersized-output IPC-registration artifact.
+# buffer base. If the output is a torch sub-allocation (small buffer packed inside
+# a larger pool segment) the peer pointer resolves to the segment base, not the
+# buffer, and the scatter silently corrupts (writes land at the wrong slots).
 # bf16 (2 bytes/elem) is the smallest tested dtype => its output (sum*G*2 bytes)
 # is the one most at risk of sub-allocation, so size for it: sum ~= 8.1M elems ->
 # bf16 output ~= 65 MB, comfortably above the pool's own-segment threshold.
 # All even -> 4-byte aligned.
 _PARAM_SPLITS = [4194304, 2097152, 1048576, 524288, 262144]
 
-_REPS = 12  # many reps to catch a flag-recycle / stale-read race (loss varied)
+_REPS = 12  # many reps to catch a flag-recycle / stale-read race
 
 
 def _make_input(dtype, count, rank, device):

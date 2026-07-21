@@ -150,7 +150,7 @@ static const std::string getBusId(int deviceId) {
 // "Memory access fault by GPU node-N". Match HIP ordinal -> HSA agent by PCI BDF
 // so the selection is correct in all cases. In the common HIP_VISIBLE_DEVICES=
 // 0..N-1 case this resolves to the identity map (BDF matches at the same index)
-// so the shipped path is behavior-identical.
+// so the default path is behavior-identical.
 static int gpuAgentIndexForHipDevice(int hipDeviceId) {
   static std::mutex mapMutex;
   static std::unordered_map<int, int> hipToAgent;
@@ -293,7 +293,7 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
   // Spread the channels across the engines recommended by KFD for this peer link.
   // On tested HW the KFD mask already assigns a distinct engine per peer link, so
   // the optional MORI_SDMA_ENGINE_OAM=1 override (force channel 0 onto the static
-  // OAM-table engine) is a no-op. Default (unset) => byte-identical shipped mapping.
+  // OAM-table engine) is a no-op. Default (unset) => byte-identical mapping.
   static const int engMode = []() {
     const char* e = getenv("MORI_SDMA_ENGINE_OAM");
     return e ? atoi(e) : 0;

@@ -20,8 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Sub-group intra-node SDMA broadcast host handle (this work, M4 leader-only
-// design).
+// Sub-group intra-node SDMA broadcast host handle (leader-only variant).
 //
 // This is the intra-node *placement* phase of the hierarchical cross-node
 // AllGather's leader-only variant: the node leader (local_rank 0) gathers the

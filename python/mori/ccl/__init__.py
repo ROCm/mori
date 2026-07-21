@@ -21,8 +21,8 @@
 # SOFTWARE.
 
 # Host-proxy hierarchical all-gather (persistent CPU-posted transport). Pure
-# Python (depends only on mori.io, imported lazily inside its ctor), so it is
-# always importable regardless of the C++ collective-binding availability below.
+# Python (depends only on mori.io, imported lazily in its ctor), so it stays
+# importable whether or not the C++ collective bindings below are available.
 from .host_proxy_ag import HostProxyHierAllGather
 
 try:
@@ -33,16 +33,13 @@ try:
     from .collective import IntraNodeSubGroupAllgatherSdma
     from .collective import IntraNodeSubGroupBroadcastSdma
 
-    # Hierarchical cross-node AllGather. Imported inside the guard
-    # because it depends on ``.collective`` (which pulls in the C++ bindings);
-    # if those are unavailable we must not break the whole ``mori.ccl`` package.
+    # Depends on ``.collective`` (the C++ bindings); imported inside the guard
+    # so a missing .so does not break the whole ``mori.ccl`` package.
     from .hier_allgather import HierAllGather, hier_allgather_reference
 
-    # NCCL/RCCL-style C++ AllGather-into-tensor dispatcher.  The class and its
-    # DataType enum are implemented entirely in C++ (see
-    # ``include/mori/collective/allgather/allgather_into_tensor.hpp`` and
-    # ``src/collective/core/allgather_into_tensor.cpp``); we only re-export the
-    # pybind11 symbols here so callers can do
+    # C++ AllGather-into-tensor dispatcher. The class and its DataType enum are
+    # implemented in C++ (allgather_into_tensor.hpp / .cpp); re-export the
+    # pybind11 symbols so callers can
     # ``from mori.ccl import AllGatherIntoTensor, DataType``.
     from mori import cpp as _mori_cpp
 
@@ -65,9 +62,9 @@ try:
         "HostProxyHierAllGather",
     ]
 except (ImportError, AttributeError):
-    # C++ bindings unavailable: only the pure-Python executable specs are
-    # importable here. The device classes are exposed via ``__getattr__`` so
-    # accessing them raises a clear ImportError rather than AttributeError.
+    # C++ bindings unavailable: only the pure-Python reference specs import.
+    # Device classes are exposed via ``__getattr__`` so accessing them raises a
+    # clear ImportError rather than AttributeError.
     from .hier_allgather import hier_allgather_reference, inter_node_ring_reference
 
     __all__ = [

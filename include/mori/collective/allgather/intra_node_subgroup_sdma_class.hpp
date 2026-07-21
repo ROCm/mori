@@ -48,10 +48,10 @@
 namespace mori {
 namespace collective {
 
-// MEASUREMENT-ONLY (mirror of inter_node_ring_class HierAllBarrierDisabled): when
-// MORI_HIER_NO_ALL_BARRIER!=0 the intra-node subgroup gather's cross-PE barriers
-// are skipped too, so the reviewer's all-barrier-removal A/B covers BOTH phases
-// (inter ring + intra gather). NOT correctness-safe.
+// Opt-in (MORI_HIER_NO_ALL_BARRIER; off by default; mirror of
+// inter_node_ring_class HierAllBarrierDisabled): skip the intra-node subgroup
+// gather's cross-PE barriers so both phases (inter ring + intra gather) run
+// barrier-free. NOT correctness-safe; benchmarking lever only.
 inline bool IntraHierAllBarrierDisabled() {
   static const bool disabled = []() {
     const char* e = std::getenv("MORI_HIER_NO_ALL_BARRIER");
@@ -60,9 +60,10 @@ inline bool IntraHierAllBarrierDisabled() {
   return disabled;
 }
 
-// T5 A (MORI_INTRA_MQ): drive ALL sdmaNumQueue SDMA queues (both recommended XGMI
-// engines per peer link) for each intra all-to-all column instead of only queue 0.
-// Default OFF => byte-identical shipped put. See oneshot_sdma_kernel.hpp body.
+// Opt-in (MORI_INTRA_MQ; off by default): drive all sdmaNumQueue SDMA queues
+// (both recommended XGMI engines per peer link) for each intra all-to-all column
+// instead of only queue 0. Default off is byte-identical. See
+// oneshot_sdma_kernel.hpp body.
 inline int IntraMultiQueue() {
   static const int mq = []() {
     const char* e = std::getenv("MORI_INTRA_MQ");
@@ -78,17 +79,14 @@ inline int IntraMultiQueue() {
 // to reach the copy-OUT, not just the SDMA copy. When set, the copy-OUT is
 // issued on a PRIVATE stream that only waits (via event) on the gather kernel,
 // then the host waits on a copy-done event -- scoping the host stall to
-// gather+copy instead of the full caller stream. DEFAULT ON (validated +14%
-// win); MORI_INTRA_EVENT_SYNC=0 restores the legacy path where the copy-OUT
-// stays on ``stream`` and the host does a full hipStreamSynchronize. See
-// finish_sync.
+// gather+copy instead of the full caller stream. Default on;
+// MORI_INTRA_EVENT_SYNC=0 restores the path where the copy-OUT stays on
+// ``stream`` and the host does a full hipStreamSynchronize. See finish_sync.
 inline bool IntraEventSync() {
   static const bool on = []() {
     const char* e = std::getenv("MORI_INTRA_EVENT_SYNC");
-    // DEFAULT ON: the event-scoped copy-OUT is a validated +14% hp_sdma win
-    // (Team B, 089/121: 500-step 175.57 vs native 148.86, bit-exact 10.408024,
-    // no regression). Set MORI_INTRA_EVENT_SYNC=0 to force the legacy
-    // full-stream-drain path.
+    // Default on: event-scoped copy-OUT. Set MORI_INTRA_EVENT_SYNC=0 to force
+    // the full-stream-drain path.
     if (e == nullptr) return true;
     return std::atoi(e) != 0;
   }();
@@ -105,12 +103,9 @@ inline bool IntraEventSync() {
 // -- it only prevents the host from racing ahead to post the next AG. Skipping it
 // (when barrier=false only) lets the host launch the next op's RDMA + gather while
 // this op's copy-OUT is still draining on the copy engine, without weakening any
-// correctness fence (device ordering is intact). DEFAULT ON: validated +4.3%
-// hp_sdma win on top of EVENT_SYNC (Team B, 089/121: 120-step 3v3 176.27 vs
-// 169.04 clean separation; 500-step 181.65 vs native 150.72, bit-exact
-// 10.408024, no regression -- hp_cu 161.15). The standalone UT (barrier=true)
-// always keeps the host wait. Set MORI_INTRA_EVENT_NOSYNC=0 to restore the
-// per-AG host event wait on the hot path.
+// correctness fence (device ordering is intact). Default on; layers on top of
+// EVENT_SYNC. The standalone UT (barrier=true) always keeps the host wait. Set
+// MORI_INTRA_EVENT_NOSYNC=0 to restore the per-AG host event wait on the hot path.
 inline bool IntraEventNoSync() {
   static const bool on = []() {
     const char* e = std::getenv("MORI_INTRA_EVENT_NOSYNC");
@@ -204,9 +199,9 @@ class IntraNodeSubGroupAllgatherSdma {
   // caching allocator: a FRESH output can be carved INSIDE the address range of
   // a previously-registered-but-since-freed segment, so a range hit returns a
   // STALE SymmMemObj (peer IPC pointers gathered for the old allocation) ->
-  // off-by-rank corruption (observed got=ref+17). Exact match + stale
-  // eviction (register_output_buffer) guarantees the only live entry for a base
-  // is the current registration.
+  // off-by-rank corruption. Exact match + stale eviction
+  // (register_output_buffer) guarantees the only live entry for a base is the
+  // current registration.
   application::SymmMemObjPtr find_exact(uintptr_t ptr) const {
     auto it = registered_outputs_.find(ptr);
     if (it == registered_outputs_.end()) return application::SymmMemObjPtr{};
@@ -253,16 +248,16 @@ class IntraNodeSubGroupAllgatherSdma {
     if (!outObj_.IsValid())
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: out register failed");
 
-    // Phase-4 parallel remote reassembly: the fused ring+remote-gather kernel
+    // Parallel remote reassembly: the fused ring+remote-gather kernel
     // (FusedRingRemoteGatherKernel) runs ``reasm`` concurrent reassembly blocks,
     // each of which launches a blockLocal subgroup gather at a DISJOINT flagBase
     // = (j*numNodes + m)*groupSize so the concurrent gathers never race on the
     // shared flag slots. The max flag slot used is reasm*numNodes*groupSize ==
     // reasm*npes. The single-block (reasm=1) path only needs ``npes`` slots, but
     // sizing the buffer for up to ``kMaxReassemblyBlocks`` reassembly blocks lets
-    // MORI_HIER_REASSEM_BLOCKS>1 parallelise the XGMI reassembly WITHOUT the OOB
-    // flag write that previously hung reasm>1. Cost is tiny (a few KiB of the
-    // symmetric heap) and identical across PEs (npes is collective), so the
+    // MORI_HIER_REASSEM_BLOCKS>1 parallelise the XGMI reassembly without an OOB
+    // flag write. Cost is a few KiB of the symmetric heap, identical across PEs
+    // (npes is collective), so the
     // symmetric layout stays consistent. flagBase=0 (the classic single gather
     // and the fused local block) still occupies [0, groupSize) unchanged.
     constexpr size_t kMaxReassemblyBlocks = 32;
@@ -288,7 +283,7 @@ class IntraNodeSubGroupAllgatherSdma {
     // been reclaimed by finalize, so skipping the free is correct (at worst a
     // benign leak in a process that is exiting anyway). This is TEARDOWN-ONLY:
     // during operation shmem is always initialized, so the free path is
-    // byte-for-byte unchanged -- no effect on any live gather or on device-ibgda.
+    // unchanged -- no effect on any live gather or on device-ibgda.
     if (copy_ev_) (void)hipEventDestroy(copy_ev_);
     if (gather_ev_) (void)hipEventDestroy(gather_ev_);
     if (copy_stream_) (void)hipStreamDestroy(copy_stream_);
@@ -300,7 +295,7 @@ class IntraNodeSubGroupAllgatherSdma {
   // Barrier so all members are primed (flags already monotonic), then build the
   // kernel args. ``input`` is this PE's shard (device ptr, count_u32 u32 lanes).
   //
-  // M4: ``barrier`` lets a caller SKIP this entry ShmemBarrierAll.
+  // ``barrier`` lets a caller skip this entry ShmemBarrierAll.
   // The barrier's only role is to ensure every member's ``out_`` transit buffer
   // is free (no peer still reading it) before any peer SDMA-pushes into it, and
   // that all members have registered ``out_``. When this gather is the FIRST
@@ -314,14 +309,14 @@ class IntraNodeSubGroupAllgatherSdma {
   // FIRST call (no prior global barrier exists post-construction to cover the
   // out_ registration / freshness). Default ``barrier=true`` keeps the
   // standalone contract byte-for-byte unchanged.
-  // M5: ``dst_base_offset_bytes`` places this gather's groupSize-slot
+  // ``dst_base_offset_bytes`` places this gather's groupSize-slot
   // block at a non-zero byte offset inside ``out_``. Used by the fused sliced
   // path: each of the N reassembly gathers writes its node-block into a DISJOINT
   // region [m*block_bytes, (m+1)*block_bytes) of an enlarged transit, so they
   // never overlap and the per-gather finish barrier + per-gather copy-OUT can be
   // dropped (replaced by ONE bulk copy in ``finish_batch``). Default 0 keeps the
   // single-block contract byte-for-byte unchanged.
-  // M5: ``dst_slot_stride_bytes`` decouples the per-peer destination
+  // ``dst_slot_stride_bytes`` decouples the per-peer destination
   // slot stride from the copy size (count_u32 u32 lanes). Default 0 packs slots
   // contiguously (stride == copy size), byte-for-byte unchanged. A non-zero
   // stride lets a chunk land at its strided position inside a full-size block --
@@ -362,7 +357,7 @@ class IntraNodeSubGroupAllgatherSdma {
     return reinterpret_cast<int64_t>(&jit_args_);
   }
 
-  // M5: bulk copy-OUT for the fused sliced path. After N gathers have
+  // Bulk copy-OUT for the fused sliced path. After N gathers have
   // each written a disjoint block into ``out_`` (via ``dst_base_offset_bytes``),
   // this copies ``total_count_u32`` contiguous u32 lanes (= N*groupSize*chunk)
   // straight to the user output in ONE memcpy + ONE stream sync, then one
@@ -389,8 +384,8 @@ class IntraNodeSubGroupAllgatherSdma {
   // copy-OUT) stays enqueued on ``stream`` with NO host stall. The device
   // barrier still globally fences (all PEs) so no peer reuses ``out_`` while a
   // peer still reads it in a subsequent op -- the same guarantee the
-  // ShmemBarrierAll provided, just stream-ordered. Pairs with the Turn-10
-  // stream-ordered inter ring. (Same lever family as InterNodeRing::finish_stream.)
+  // ShmemBarrierAll provided, just stream-ordered. Pairs with the stream-ordered
+  // inter ring. (Same lever family as InterNodeRing::finish_stream.)
   //
   // ``barrier`` lets a caller DEFER the trailing
   // ShmemBarrierOnStream. In the steady-state fused sliced op this finish fence
@@ -484,7 +479,7 @@ class IntraNodeSubGroupAllgatherSdma {
     if (last_slot_end > regObj->size) {
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: direct gather exceeds output");
     }
-    // T22: RACE-FREE concurrent direct gathers. Lane j passes a DISJOINT
+    // Race-free concurrent direct gathers. Lane j passes a disjoint
     // flag_slot_base = j*groupSize so simultaneous launches (REASM_STREAMS)
     // never collide on the shared flag slots. The flags buffer is sized for
     // npes*(kMaxReassemblyBlocks+1) slots (see ctor); guard against OOB.
@@ -499,10 +494,10 @@ class IntraNodeSubGroupAllgatherSdma {
     // round-trip) to match the rest of the direct path, which is fully
     // on-stream (stream_ring + stream_intra). ShmemBarrierOnStream globally
     // fences all PEs (same guarantee as the host ShmemBarrierAll) but enqueued
-    // on ``stream`` so it never stalls the launch thread. In the shipped config
-    // (slice_fuse_ib ON) this barrier is skipped entirely (barrier=false); it
-    // only fires in the fuse_ib-OFF A/B path, where it must stay on-stream to
-    // avoid mixing a host barrier into the stream-ordered sequence.
+    // on ``stream`` so it never stalls the launch thread. In the default config
+    // (slice_fuse_ib on) this barrier is skipped entirely (barrier=false); it
+    // only fires in the fuse_ib-off path, where it must stay on-stream to avoid
+    // mixing a host barrier into the stream-ordered sequence.
     if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
@@ -578,10 +573,10 @@ class IntraNodeSubGroupAllgatherSdma {
   // order) and synchronize, then (optionally) barrier so no peer reuses the
   // buffer early.
   //
-  // M4: ``barrier`` lets a caller SKIP the trailing ShmemBarrierAll.
+  // ``barrier`` lets a caller skip the trailing ShmemBarrierAll.
   // The PUSH gather already guarantees this PE's ``out_`` is complete when the
-  // kernel returns: every member spins in-kernel (oneshot_sdma_kernel.hpp:196)
-  // until all peers have pushed their shard AND quieted, so after the stream
+  // kernel returns: every member spins in-kernel until all peers have pushed
+  // their shard AND quieted, so after the stream
   // sync the node-block is fully populated WITHOUT a host barrier. Flags are
   // monotonic (per-call token, no reset), so there is no cross-call flag hazard
   // requiring the barrier either. The barrier is therefore redundant when this
@@ -615,7 +610,7 @@ class IntraNodeSubGroupAllgatherSdma {
       // is already device-ordered after it (hipStreamWaitEvent above), so the
       // MORI_INTRA_EVENT_NOSYNC lever lets the launch thread skip the host wait
       // and race ahead to post the next AG while this copy drains on the copy
-      // engine. DEFAULT OFF => host wait always taken (byte+timing identical).
+      // engine.
       if (barrier || !IntraEventNoSync()) {
         (void)hipEventSynchronize(copy_ev_);
       }
@@ -637,8 +632,8 @@ class IntraNodeSubGroupAllgatherSdma {
   // __threadfence_system() after acquiring each peer's completion flag, which
   // makes the gathered bytes coherently visible to a subsequent CU read -- but
   // NOT to the separate copy engine, whose read of ``out_`` is not fenced
-  // against the raw-SDMA writes (root cause of the FSDP copy-out loss drift:
-  // only a host stream.synchronize drained it). A CU copy-OUT reads ``out_`` in
+  // against the raw-SDMA writes (only a host stream.synchronize otherwise drains
+  // it). A CU copy-OUT reads ``out_`` in
   // the fenced/coherent CU domain and writes the user output in the CU/L2 domain
   // the consumer GEMM reads, closing the gap WITHOUT a host stall.
   uintptr_t out_ptr() const { return reinterpret_cast<uintptr_t>(out_); }

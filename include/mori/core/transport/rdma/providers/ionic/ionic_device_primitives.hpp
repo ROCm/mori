@@ -261,9 +261,8 @@ inline __device__ uint64_t PostReadWrite<ProviderType::PSD, true>(WorkQueueHandl
 /* ---------------------------------------------------------------------------------------------- */
 // RDMA WRITE_WITH_IMM: identical WQE layout to a plain RDMA_WRITE but with the
 // IMM opcode and a 32-bit immediate placed in imm_data_key. On RC the immediate
-// reaches the receiver's recv-CQ strictly AFTER the payload DMA lands remotely,
-// so the receiver observing the CQE proves the data is globally visible. This is
-// the Phase-5 inline-flag ring primitive; nothing calls it yet (send-side scaffold).
+// reaches the receiver's recv-CQ strictly after the payload DMA lands remotely,
+// so the receiver observing the CQE proves the data is globally visible.
 inline __device__ uint64_t IonicPostWriteImm(WorkQueueHandle& wq, uint32_t curPostIdx,
                                              bool cqeSignal, uint32_t qpn, uintptr_t laddr,
                                              uint64_t lkey, uintptr_t raddr, uint64_t rkey,
@@ -609,12 +608,12 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
 }
 #endif  // end of PollCq<ProviderType::PSD>
 
-// Receiver half of the Phase-5 inline-flag ring: poll one recv CQE produced by a
-// remote RDMA-WRITE-with-immediate. The recv CQE's color bit signals readiness
-// (same scheme as PollCq), the op field (recv.src_qpn_op) must be RDMA_IMM=3, and
-// the 32-bit immediate is carried in recv.imm_data_rkey (big-endian). Observing
-// this CQE proves the peer's payload DMA has landed remotely -- the CQ event
-// cannot precede its data. Receiver-side scaffold; nothing calls it yet.
+// Receiver half of the inline-flag ring: poll one recv CQE produced by a remote
+// RDMA-WRITE-with-immediate. The recv CQE's color bit signals readiness (same
+// scheme as PollCq), the op field (recv.src_qpn_op) must be RDMA_IMM=3, and the
+// 32-bit immediate is carried in recv.imm_data_rkey (big-endian). Observing this
+// CQE proves the peer's payload DMA has landed remotely -- the CQ event cannot
+// precede its data.
 template <>
 inline __device__ int PollRecvCqImm<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum,
                                                        uint32_t* consIdx, uint32_t* imm) {

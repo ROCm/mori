@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # ==========================================================================
 # E2E — cross-node FSDP2 training step (Qwen-7B, seq2048, bf16, world=16).
-# Always runs the RCCL baseline + ONE mori variant, writes one raw log each,
-# and prints last_loss (bit-exact vs RCCL) + avg_tflops_per_gpu. EVERY switch
-# is baked in per variant — NO env vars to set, it just runs.
+# Runs the RCCL baseline + one mori variant, writes one raw log each, and prints
+# last_loss (bit-exact vs RCCL) + avg_tflops_per_gpu. Every switch is baked in
+# per variant — no env vars to set.
 #
 # The four configs (mori variant = intra-node leg x inter-node leg):
 #   RCCL         baseline: native torch.distributed.all_gather_into_tensor.
 #   hp_sdma      host-proxy (CPU-posted RDMA inter) + intra SDMA (XGMI copy
-#                engine, CU-free). This PR's optimized path. ~1.20x, bit-exact. [default]
-#   hp_cu        host-proxy inter + intra NCCL (CU). ~1.10x, bit-exact.
+#                engine, CU-free). Bit-exact. [default]
+#   hp_cu        host-proxy inter + intra NCCL (CU). Bit-exact.
 #   ibgda_sdma   device IBGDA (GPU-posted RDMA inter, deferred fence) + intra
-#                SDMA. ~1.07x, bit-exact.
+#                SDMA. Bit-exact.
 #
 #   bash run_e2e.sh              # RCCL + hp_sdma   [default]
 #   bash run_e2e.sh hp_cu        # RCCL + hp_cu
@@ -31,7 +31,7 @@ VARIANT="${1:-hp_sdma}"
 COMMON="MORI_ENABLE_SDMA=1 MORI_FSDP_ENABLE_HIER=1 MORI_SHMEM_HEAP_SIZE=17179869184"
 case "$VARIANT" in
   # host-proxy async (CPU-posted cross-node RDMA, deferred landing fence) + intra
-  # SDMA copy engine (CU-free). The TWIN/EVENT_SYNC/NOSYNC perf levers are ON by
+  # SDMA copy engine (CU-free). The TWIN/EVENT_SYNC/NOSYNC levers are on by
   # default in code, so only the SDMA-intra switch is needed here.
   hp_sdma)     MORI_ENV="MORI_FSDP_HOST_PROXY=1 MORI_FSDP_HOSTPROXY_CAP_MB=512 MORI_HOSTPROXY_ASYNC=1 MORI_HOSTPROXY_SDMA_INTRA=1" ;;
   # host-proxy async + intra NCCL (CU).

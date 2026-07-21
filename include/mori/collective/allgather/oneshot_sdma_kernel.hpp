@@ -33,25 +33,20 @@ namespace collective {
 
 // Correctly-indexed SDMA completion drain for the sub-group SDMA gathers.
 //
-// ROOT CAUSE of the MORI_HOSTPROXY_SDMA_INTRA torn-bytes / "Slow wait for
-// sub-group pos" hang: SubGroupSdmaDrainPe(pe, dest) indexes the per-PE SDMA
-// signal / handle arrays with `pe % 8` (shmem_sdma_kernels.hpp), but those arrays
-// are allocated worldSize*sdmaNumQueue and indexed by the GLOBAL pe -- the PUT
-// side here uses `remotePe * nq` (see SdmaPutThread call sites) and
-// symmetric_memory.cpp:261 stores each peer's handles at `dstPe * numQ` where
-// dstPe is the global pe ("indexing uses pe*numQ where pe ranges 0..worldSize-1;
-// using sdmaPeers.size causes buffer overflow"). For the 2nd+ node (peBase>=8)
-// `pe % 8` drains slots [0,8) which are ZEROED (only same-node peer slots are
-// armed), so the drain returns WITHOUT waiting for the real SDMA completion and
-// the subsequent flag AMO fires before the pushed bytes have landed => the
-// receiver observes the flag but reads torn/stale data (NaN/loss-drift, or the
-// timing case where a flag is never seen = the reported hang).
+// The per-PE SDMA signal / handle arrays are allocated worldSize*sdmaNumQueue and
+// must be indexed by the global pe: the put side uses `remotePe * nq` (see
+// SdmaPutThread call sites) and symmetric_memory.cpp stores each peer's handles at
+// `dstPe * numQ` with dstPe the global pe. Indexing the drain with `pe % 8`
+// (the pattern in shmem_sdma_kernels.hpp) drains slots [0,8) for any 2nd+ node
+// (peBase>=8), which are zeroed (only same-node peer slots are armed), so the drain
+// returns without waiting for the real SDMA completion and the subsequent flag AMO
+// fires before the pushed bytes have landed -- the receiver observes the flag but
+// reads torn/stale data (the MORI_HOSTPROXY_SDMA_INTRA torn-bytes / "Slow wait for
+// sub-group pos" hang).
 //
-// This helper drains the GLOBAL-pe slots, matching the PUT side exactly. It is
-// BYTE-IDENTICAL to the old path for any pe < 8 (pe % 8 == pe), i.e. every
-// single-node run and node 0 of any multi-node run are unchanged -- so the
-// device-ibgda path (MOTIVATION_RULES rule 3) cannot regress; only the
-// previously-broken peBase>=8 drain is corrected.
+// This helper drains the global-pe slots, matching the put side exactly. It is
+// byte-identical to `pe % 8` for any pe < 8 (single-node runs and node 0 of any
+// multi-node run), so only the previously-broken peBase>=8 drain changes.
 __device__ __forceinline__ void SubGroupSdmaDrainPe(int pe, const application::SymmMemObjPtr dest) {
   const uint32_t nq = dest->sdmaNumQueue;
   core::SdmaQueitThread(dest->signalPtrs + static_cast<size_t>(pe) * nq,
@@ -190,14 +185,14 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes, T* input,
 // overlap path; see all_gather.hpp
 // override note + ccl_kernel_args.hpp CclFusedRingLocalGatherArgs). The gather
 // only ever needs ``groupSize`` warps (G<=warpsPerBlock), so one block
-// suffices. Default false keeps the historical grid-wide thread id ->
-// BYTE-FOR-BYTE identical to the shipped single-block (1,)/(512,) launch; inert
-// until a fused launcher sets it.
+// suffices. Default false keeps the grid-wide thread id -> byte-for-byte
+// identical to the single-block (1,)/(512,) launch; inert until a fused launcher
+// sets it.
 // ``flagBase`` (default 0, INERT for every existing caller) offsets the flag
 // slots this gather uses from ``[0, groupSize)`` to ``[flagBase, flagBase+
 // groupSize)``. It lets MULTIPLE independent sub-group gathers run CONCURRENTLY
-// (different blocks of one fused grid, e.g. the Phase-4 chunked remote-block
-// reassembly where sub-range j uses flagBase = j*groupSize) without racing on the
+// (different blocks of one fused grid, e.g. the chunked remote-block reassembly
+// where sub-range j uses flagBase = j*groupSize) without racing on the
 // shared flag slots. 0 keeps the historical single-region layout byte-for-byte.
 // Intra-node nearest-neighbor pipelined SDMA ring for the multi-node local block.
 // A flat G-way push makes every receiver take a G-1 concurrent-write incast that the
@@ -249,8 +244,9 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
   if (C > 16) C = 16;
   // This single-queue (Q=1) ring is fully pipelined but its single-warp serial
   // submission cannot keep one SDMA queue full as the op grows, so at the largest
-  // sizes the flat crown (which issues concurrent COPY_LINEARs and is incast-bound)
-  // can be faster. Parallel submission across ring-local queues (nq>1) is the path
+  // sizes the flat full-mesh gather (which issues concurrent COPY_LINEARs and is
+  // incast-bound) can be faster. Parallel submission across ring-local queues
+  // (nq>1) is the path
   // to close that gap.
   const size_t align = 16;
   size_t chunkBytes = (bytesPerPeer + static_cast<size_t>(C) - 1) / static_cast<size_t>(C);
@@ -276,7 +272,7 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
   int Q = nq < C ? nq : C;
   if (Q > numWarps) Q = numWarps;
   if (Q < 1) Q = 1;
-  // crownRing bit1 forces single-queue (Q=1): warp0 pipelines all C chunks on queue 0.
+  // fencedFlag bit1 forces single-queue (Q=1): warp0 pipelines all C chunks on queue 0.
   // Queue index 1 stalls its chunks under sustained load regardless of the flag
   // mechanism (the second SDMA engine/queue is the common factor, not the protocol),
   // so Q=1 gives a reliably completing ring; multi-queue fan-out is enabled once the
@@ -302,8 +298,9 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
   // Each PE self-fills its own slot g, then broadcasts g to all G-1 other PEs with one
   // submitter warp per distinct dest PE (= distinct engine, engine=f(src,dst)) so all
   // G-1 doorbells fire together, and one completion barrier -- two fewer round-trips than
-  // the 2x4. Distinct from the default flat crown, which submits the G-1 copies serially
-  // from one warp. Counter: each of the G-1 senders adds +1 to my flags[flagBase+c] =>
+  // the 2x4. Distinct from the default flat full-mesh gather, which submits the G-1
+  // copies serially from one warp. Counter: each of the G-1 senders adds +1 to my
+  // flags[flagBase+c] =>
   // want = (flagVal-1)*(G-1) + (G-1), accumulating and order-independent, so the final
   // slot bytes are identical and only the schedule differs. Default OFF (bit9 clear).
   const bool flatMW = ((fencedFlag & 512) != 0) && (G > 1);
@@ -1016,22 +1013,22 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
   // range. The completion WAIT below is UNCHANGED (full [0,G)) -- it gates on senders
   // INTO this rank (set by peers' pushes), which is independent of which targets this
   // rank pushes to. Default (pushPeerLo==0, pushPeerHi<0) => pHi==groupSize == the
-  // byte-identical shipped full-mesh push.
+  // byte-identical full-mesh push.
   const int pLo = (pushPeerLo > 0) ? pushPeerLo : 0;
   const int pHi = (pushPeerHi >= 0 && pushPeerHi < groupSize) ? pushPeerHi : groupSize;
-  // COPY-ENGINE (LL-style) INLINE-FLAG COMPLETION (see HierQFlagOn / MORI_HIER_QFLAG,
-  // ported here from the push-only body's qFlag path -- T4/T7). The shipped crown
-  // gather delivers each peer's completion flag via THREE per-peer critical-path
-  // round-trips: ShmemQuietThread (send-CQ drain) + __threadfence_system (system
-  // flush) + a SEPARATE direct P2P AMO store. When qFlagActive, instead ride the
-  // ready-flag on the SAME SDMA queue as its data copy (COPY_LINEAR + FENCE packet,
-  // FIFO-ordered) so "flag visible => bytes visible" holds with ZERO extra ops on
-  // the completion critical path -- the copy-engine completion model. Only the
-  // single-queue path is eligible (multiQueue splits across engines and keeps its
-  // own drain-before-AMO accounting). BIT-EXACT by construction: the fence packet
-  // is FIFO-ordered strictly after the peer's copied bytes on one engine, so the
-  // reader's existing seq-cst SYSTEM acquire + __threadfence_system never observes
-  // the flag ahead of the data. Default 0 => byte-identical shipped crown path.
+  // Copy-engine (LL-style) inline-flag completion (see HierQFlagOn /
+  // MORI_HIER_QFLAG). The default gather delivers each peer's completion flag via
+  // three per-peer critical-path round-trips: ShmemQuietThread (send-CQ drain) +
+  // __threadfence_system (system flush) + a SEPARATE direct P2P AMO store. When
+  // qFlagActive, instead ride the ready-flag on the SAME SDMA queue as its data
+  // copy (COPY_LINEAR + FENCE packet, FIFO-ordered) so "flag visible => bytes
+  // visible" holds with zero extra ops on the completion critical path -- the
+  // copy-engine completion model. Only the single-queue path is eligible
+  // (multiQueue splits across engines and keeps its own drain-before-AMO
+  // accounting). Bit-exact by construction: the fence packet is FIFO-ordered
+  // strictly after the peer's copied bytes on one engine, so the reader's existing
+  // seq-cst SYSTEM acquire + __threadfence_system never observes the flag ahead of
+  // the data. Default 0 => byte-identical default path.
   const bool qFlagActive = (qFlag != 0 && multiQueue == 0);
   // Staggered-permutation ring schedule (see HierRingWidth / MORI_HIER_RING). The
   // plain path fires all G-1 peer copies concurrently (full mesh), bursting every
@@ -1083,8 +1080,9 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
   const int laneId = threadIdx.x % warpSize;
 
   // ===================== Pull local gather =====================
-  // See HierPolePull. The default crown is a push all-gather (read local input, write
-  // shard into slot groupPos of all peers; XGMI-egress-heavy) and is XGMI-egress-bound.
+  // See HierPolePull. The default gather is a push all-gather (read local input,
+  // write shard into slot groupPos of all peers; XGMI-egress-heavy) and is
+  // XGMI-egress-bound.
   // This flips the direction: each rank's own copy engines read the peer shards over
   // XGMI into local output; completion is a self-drain (no per-peer cross-node data-
   // landing fence). Only a cheap staged flag (local stage of the own shard, no data
@@ -1096,7 +1094,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
   //   (5) drain own pull queues, fence, sync.
   // Bit-exact: peer j staged shard j into its output slot j; this rank pulls that exact
   // block into its own slot j -> identical final layout. Only the single-queue,
-  // no-other-lever crown local block is eligible. polePull==0 => byte-identical crown.
+  // no-other-lever local block is eligible. polePull==0 => byte-identical default.
   const bool polePullActive = (polePull != 0 && multiQueue == 0 && !qFlagActive &&
                                !ringPhasedActive && !batchFenceActive && !h2x4Active);
   if (polePullActive) {
@@ -1160,12 +1158,10 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
 
   // Each member warp pushes this PE's shard into slot ``groupPos`` of the
   // warpId-th group member's destination buffer (SDMA over XGMI / P2P).
-  // A single copy engine already saturates one XGMI link (~108 GB/s/link
-  // measured), and the G warps drive G distinct peer links in parallel, so
-  // one queue per peer is already bandwidth-bound — splitting a peer's shard
-  // across multiple SDMA queues (SdmaPutWarp) gives no speedup and is
-  // marginally slower (verified NC=1/2/4 via test_intra_subgroup_sdma --bench).
-  // Keep the proven single-queue put (multiQueue==0).
+  // A single copy engine already saturates one XGMI link, and the G warps drive G
+  // distinct peer links in parallel, so one queue per peer is already
+  // bandwidth-bound -- splitting a peer's shard across multiple SDMA queues
+  // (SdmaPutWarp) gives no speedup. Keep the single-queue put (multiQueue==0).
   //
   // Multi-engine per-link (see HierIntraMultiQueue / MORI_INTRA_MQ). anvil::connect()
   // spreads sdmaNumQueue channels across the KFD-recommended engine mask per peer link
@@ -1491,7 +1487,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
     }
   } else if (ringPhasedActive) {
     // Width-W permutation issue schedule (ringPhased carries the width W). The plain
-    // crown (the else branches below) submits all G peer copies at once, so every
+    // full-mesh gather (the else branches below) submits all G peer copies at once, so every
     // receiver takes a G-1 concurrent XGMI write incast. This issues the G copies in
     // ceil(G/W) rotated phases of W concurrent links each, with a CTA barrier between
     // phases: warp w (peer w) belongs to phase ((w-groupPos+G)%G)/W, so across all ranks
@@ -1526,8 +1522,8 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
     }
   } else if (intra2Active) {
     // ============ 2x4 stacked-flat-body intra ============
-    // See HierIntra2. The plain crown fires all G-1 peer copies concurrently (flat full
-    // mesh: per-receiver incast G-1, per-PE egress G-1), which the SDMA engines cannot
+    // See HierIntra2. The plain full-mesh gather fires all G-1 peer copies
+    // concurrently (per-receiver incast G-1, per-PE egress G-1), which the SDMA engines cannot
     // saturate (the 4-way width does). This issues the same flat push in ceil(G/W)
     // sequential waves of a W-regular rotated matching: warp w (peer w) is active in wave
     // ((w-groupPos+G)%G)/W, so across ranks each wave is a perfect W-matching (every
@@ -1955,7 +1951,7 @@ __device__ void OneShotSubGroupPushOnly_body(
     // {k in [0,nq): k % qs == base} (base = qId % qs, qs = qStride = effReasm) so
     // idle per-peer queues (nq>effReasm) join the copy. Worker-disjoint queue set
     // => no cross-worker same-queue race; ALL owned queues drained before the flag
-    // => the flag never precedes its bytes (bit-exact). qSplit==0 => shipped path.
+    // => the flag never precedes its bytes (bit-exact). qSplit==0 => default path.
     if (qFlag != 0 && deepSqPhase == 0 && qSplit == 0 && fuseFence == 0) {
       // COPY-ENGINE FLAG DELIVERY (see SdmaPutFencedFlagThread / MORI_HIER_QFLAG):
       // push this column AND its peer completion flag as one FIFO-ordered queue
@@ -2002,14 +1998,14 @@ __device__ void OneShotSubGroupPushOnly_body(
           core::atomicType::AMO_SET, remotePe, 0);
       // fall through past the legacy single-queue path below.
     } else if (fuseFence != 0 && deepSqPhase == 0) {
-      // BATCHED SENDER-QUIET (see HierFuseSenderFence): push + drain THIS warp's
+      // Batched sender-quiet (see HierFuseSenderFence): push + drain THIS warp's
       // peer copy here, but DEFER the __threadfence_system + completion flag AMO
-      // to a second phase AFTER a block barrier. The shipped path interleaves
+      // to a second phase AFTER a block barrier. The default path interleaves
       // drain->fence->flag inside each per-peer warp so the G peer copies quiet
       // in warp order with a fence between every one; batching lets all G copies
-      // drain first, then a single completion phase fences+fires every flag --
-      // the "8x7 in-flight quiet" the completion-model study named. Bit-exact BY
-      // CONSTRUCTION: every copy is drained before ANY flag fires, and each warp
+      // drain first, then a single completion phase fences+fires every flag.
+      // Bit-exact by construction: every copy is drained before ANY flag fires,
+      // and each warp
       // still issues its own __threadfence_system before its flag => the flag
       // never precedes its bytes; only the drain/fence/flag ORDER across peers
       // changes, not which bytes any flag guards.
@@ -2027,7 +2023,7 @@ __device__ void OneShotSubGroupPushOnly_body(
       // Push this rank's column on its OWN queue ``q`` (distinct per block).
       // deepSqPhase==2 is DRAIN-only (the copy was already submitted in phase 1).
       if (deepSqPhase != 2 && !selfSkip) {
-        // ndesc>1 (single-shot crown path only) pipelines the per-peer copy across
+        // ndesc>1 (single-shot full-mesh path only) pipelines the per-peer copy across
         // several back-to-back descriptors on queue q (see HierPutNdesc). Safe for
         // deepSqPhase 0/1: the accumulated signal count still equals one bump/push.
         core::SdmaPutThread(srcPtr, dstPtr, bytesPerPeer, devicehandles, signals, expectedSignals,
@@ -2139,7 +2135,7 @@ __device__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_body(
     }
   }
   // Fence all warps' SDMA puts before any warp quiets + bumps its completion
-  // flag (mirrors the proven flat OneShotAllGatherSdmaParamContiguousKernel_body).
+  // flag (mirrors the flat OneShotAllGatherSdmaParamContiguousKernel_body).
   __syncthreads();
 
   if (warpId < groupSize && laneId == 0) {
@@ -2317,10 +2313,10 @@ __device__ void OneShotAllGatherSdmaParamContiguousKernel_body(
       }
       int spinCount = 0;
       bool warned = false;
-      // LIGHT-SPIN completion (see subgroup gather): busy-wait on a RELAXED system
+      // Light-spin completion (see subgroup gather): busy-wait on a relaxed system
       // load, then ONE seq-cst SYSTEM acquire on exit. Relaxed is still cross-agent
       // visible (monotonic flags), the trailing seq-cst load reproduces the exact
-      // acquire the shipped seq-cst spin took on its last iteration, and the
+      // acquire the plain seq-cst spin took on its last iteration, and the
       // block-level __threadfence_system below still publishes it => bit-exact.
       while (core::AtomicLoadRelaxedSystem(flags + sender) < flagVal) {
         ++spinCount;

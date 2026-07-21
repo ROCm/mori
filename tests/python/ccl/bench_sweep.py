@@ -22,15 +22,15 @@
 # SOFTWARE.
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
-# Standalone AllGather size sweep: STANDALONE AllGather size sweep, mori hier SDMA vs RCCL.
+# Standalone AllGather size sweep: mori hier SDMA vs RCCL.
 #
-# Sweeps {4,8,16,32,64,128,256,512} MiB/rank fp32 (spot-check bf16), >=3 timed
+# Sweeps {4,8,16,32,64,128,256,512} MiB/rank fp32 (spot-check bf16), timed
 # reps (min/avg), true 2-node, bit-exact vs torch.distributed.all_gather_into_
-# tensor on EVERY size (zero tolerance — keeps the MOTIVATION correctness gate
-# green inside the perf harness). rank 0 emits logs/sweep_standalone.csv with
-# columns size_mb,dtype,mori_gbs,rccl_gbs,ratio,mori_ms,rccl_ms,bitexact.
+# tensor on every size (zero tolerance — keeps the correctness gate green inside
+# the perf harness). rank 0 emits logs/sweep_standalone.csv with columns
+# size_mb,dtype,mori_gbs,rccl_gbs,ratio,mori_ms,rccl_ms,bitexact.
 #
-# Launch (validated harness):
+# Launch:
 #   bash scripts/build_and_test.sh C xnode tests/python/ccl/bench_sweep.py
 # Extra args after the path are forwarded by the harness, e.g. ... --reps 5.
 import argparse
@@ -178,13 +178,12 @@ def _worker(rank, world_size, ranks_per_node, device, sizes_mb, dtypes, reps, wa
         )
     else:
         # The standalone AllGather has no FSDP back-to-back overlap, so the
-        # fuse_local fast fan-out is bit-exact here (the stale-remote race is
-        # FSDP-tight-overlap-only). The shipped global default keeps fuse_local OFF
-        # (serial floor) purely to protect E2E; measure the standalone benchmark on
-        # the achievable fast path instead. standalone_fast=True engages fuse_local
-        # for this process only (the E2E harness never constructs with it). Toggle
-        # via MORI_HIER_UT_FAST=0 (or the explicit MORI_HIER_FUSE_LOCAL env, which
-        # still overrides).
+        # fuse_local fan-out is bit-exact here (the stale-remote race is
+        # FSDP-tight-overlap-only). The global default keeps fuse_local off
+        # (serial floor) to protect E2E; measure the standalone benchmark on the
+        # fast path instead. standalone_fast=True engages fuse_local for this
+        # process only. Toggle via MORI_HIER_UT_FAST=0 (or the explicit
+        # MORI_HIER_FUSE_LOCAL env, which still overrides).
         _ut_fast = os.environ.get("MORI_HIER_UT_FAST", "1") not in (
             "0",
             "",
@@ -207,11 +206,10 @@ def _worker(rank, world_size, ranks_per_node, device, sizes_mb, dtypes, reps, wa
             f"dtypes={dtypes} reps={reps}"
         )
 
-    # T19 (A): allocate the three role buffers ONCE, biggest-first, as raw byte
-    # pools reinterpreted per dtype. This removes ALL per-cell alloc/free churn so
-    # every (dtype,size) op runs against the same clean, un-fragmented placement
-    # (fixes the bf16-32MB-runs-last fragmentation dip). Sized to the largest
-    # requested size; out pool holds world_size copies. bit-exact-neutral.
+    # Allocate the three role buffers once, biggest-first, as raw byte pools
+    # reinterpreted per dtype. This removes per-cell alloc/free churn so every
+    # (dtype,size) op runs against the same un-fragmented placement. Sized to the
+    # largest requested size; out pool holds world_size copies. Bit-exact-neutral.
     max_out_bytes = max(sizes_mb) * 1024 * 1024 * world_size
     max_inp_bytes = max(sizes_mb) * 1024 * 1024
     _pool_out_mori = torch.empty(max_out_bytes, dtype=torch.uint8, device=device)
@@ -285,19 +283,15 @@ def main():
     args = p.parse_args()
 
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
-    # T12 (A): default to 2 SDMA channels == mori's LIBRARY default
-    # (anvil::GetSdmaNumChannels) and the value the E2E/FSDP path actually
-    # ships. The prior "1" was a HARNESS-ONLY override that forced a SINGLE
-    # SDMA queue; on the fused-remote reassembly path the reasm worker picks
-    # queue q = (j+1) % nq, so at nq==1 it ALIASES queue 0 and races the
-    # local-block CTA's own-shard gather on the shared per-queue signal
-    # counter -> an intermittent liveness HANG (reproduced this turn: a
-    # 32MB-then-64MB size transition in one process dead-locks entering
-    # 64MB, both graph and eager). It also mis-measured the board: the racy
-    # single-queue path READS ~1.0-1.04x (when it does not hang) but is
-    # UNSHIPPABLE, whereas the real shipped nq>=2 path is ~0.92-0.95x. Use
-    # the shipped default so the UT reflects what E2E runs. Override
-    # explicitly (MORI_SDMA_NUM_CHANNELS=N) to A/B other channel counts.
+    # Default to 2 SDMA channels == mori's library default
+    # (anvil::GetSdmaNumChannels) and the value the E2E/FSDP path uses. A single
+    # SDMA queue (nq==1) deadlocks the fused-remote reassembly path: the reasm
+    # worker picks queue q = (j+1) % nq, so at nq==1 it aliases queue 0 and races
+    # the local-block CTA's own-shard gather on the shared per-queue signal
+    # counter, an intermittent liveness hang across a size transition in one
+    # process (both graph and eager). Use the default so the UT reflects what E2E
+    # runs. Override explicitly (MORI_SDMA_NUM_CHANNELS=N) for other channel
+    # counts.
     os.environ.setdefault("MORI_SDMA_NUM_CHANNELS", "2")
 
     assert "RANK" in os.environ, "launch under torchrun (use build_and_test.sh xnode)"

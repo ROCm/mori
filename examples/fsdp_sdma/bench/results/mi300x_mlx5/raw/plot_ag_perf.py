@@ -28,8 +28,8 @@ also writes the committed ``ag_perf_e2e.csv``; with no log it falls back to that
 so the figure regenerates from committed data with NO GPU. Output:
 ``ag_perf_e2e_stable_w16.png`` — a RCCL-vs-mori line chart at 64/128/256/512 MB.
 
-The mori line is the shipped/representative number: the same handle construction
-the w16 E2E FSDP run uses (MORI_HIER_UT_FAST=0), bit-exact & proven E2E-safe.
+The mori line is the representative number: the same handle construction the w16
+E2E FSDP run uses (MORI_HIER_UT_FAST=0), bit-exact and E2E-safe.
 """
 import os
 import re

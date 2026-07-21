@@ -65,8 +65,8 @@ inline bool HierDissemBarrierEnabled() {
 // exchange once over RDMA, then coordinators release their locals over XGMI.
 // This crosses the RDMA node boundary exactly twice (vs the funnel's serial
 // per-rank cross-node ops). Same global all-PE semantics; a monotonic generation
-// counter keeps it graph-replay-safe. Bit-exact and kept for the op-to-op
-// serialized regime (back-to-back all-gathers) where the barrier is exposed.
+// counter keeps it graph-replay-safe. Bit-exact; targets the op-to-op serialized
+// regime (back-to-back all-gathers) where the barrier is exposed.
 inline int HierBarrierHierRanksPerNode() {
   static const int rpn = []() {
     const char* e = std::getenv("MORI_HIER_BARRIER_HIER");
@@ -75,13 +75,12 @@ inline int HierBarrierHierRanksPerNode() {
   return rpn;
 }
 
-// Measurement-only: when MORI_HIER_NO_ENTRY_BARRIER!=0 the ring's prepare entry
-// rendezvous barrier is skipped. This is NOT correctness-safe (it drops the
-// cross-PE fence that orders every PE's op-end flag-reset + own-chunk staging
-// before any peer's next-op atomic increment); it exists solely to quantify the
-// exposed per-op barrier cost under back-to-back all-gathers. See the
-// generation-counter barrier-free ring (prepare_stream flag-reset invariant note)
-// for the correctness-safe alternative.
+// Opt-in (MORI_HIER_NO_ENTRY_BARRIER; off by default): skip the ring's prepare
+// entry rendezvous barrier. NOT correctness-safe (it drops the cross-PE fence
+// that orders every PE's op-end flag-reset + own-chunk staging before any peer's
+// next-op atomic increment); benchmarking lever only. See the generation-counter
+// barrier-free ring (prepare_stream flag-reset invariant note) for the
+// correctness-safe alternative.
 inline bool HierEntryBarrierDisabled() {
   static const bool disabled = []() {
     const char* e = std::getenv("MORI_HIER_NO_ENTRY_BARRIER");
@@ -90,11 +89,10 @@ inline bool HierEntryBarrierDisabled() {
   return disabled;
 }
 
-// Measurement-only master switch: when MORI_HIER_NO_ALL_BARRIER!=0 every cross-PE
-// barrier (entry ShmemBarrierOnStream, the deferred finish fences, and the host
-// ShmemBarrierAll rendezvous in both the inter-node ring and the intra-node
-// subgroup gather) is skipped. NOT correctness-safe. Used to quantify per-op
-// barrier skew (each all-gather waiting for the slowest rank).
+// Opt-in master switch (MORI_HIER_NO_ALL_BARRIER; off by default): skip every
+// cross-PE barrier (entry ShmemBarrierOnStream, the deferred finish fences, and
+// the host ShmemBarrierAll rendezvous in both the inter-node ring and the
+// intra-node subgroup gather). NOT correctness-safe; benchmarking lever only.
 inline bool HierAllBarrierDisabled() {
   static const bool disabled = []() {
     const char* e = std::getenv("MORI_HIER_NO_ALL_BARRIER");
@@ -224,7 +222,7 @@ class InterNodeRingAllgather {
   // barrier-free gen-ring's cross-PE reuse race is closed: op N+1's peer pushes
   // land in the other half than op N's still-reassembling half. parityCounter_ is a
   // device uint64 bumped once per op by the parity-bump kernel (captured on-stream,
-  // graph-safe). Default off => single-buffer shipped path.
+  // graph-safe). Default off => single-buffer path.
   bool genRingDbl_ = false;
   void* ring2_ = nullptr;
   application::SymmMemObjPtr ring2Obj_;
@@ -276,32 +274,20 @@ class InterNodeRingAllgather {
     (void)hipMemset(flags_, 0, flagsBytes);
     flagsObj_ = shmem::ShmemQueryMemObjPtr(flags_);
 
-    // Transport-level flag-can't-beat-data (env MORI_HIER_RING_PUT_SIGNAL). When
-    // ON, the single-warp RDMA ring send fuses the data WRITE and the completion-
-    // flag AMO into one ShmemPutMemNbiSignal (same QP, signal strictly AFTER data
-    // on the RC-ordered QP) so the receiver never observes the flag before the
-    // remote data lands -- this REMOVES the separate post-put ShmemQuietThread
-    // full-CQ drain that the receiver's flag-spin otherwise waits behind (the
-    // per-round quiet-drain latency that, with the 2 global barriers, is the
-    // documented residual 143->168 GB/s UT gap; the per-QP RDMA WRITE itself is
-    // already bandwidth-saturated, so the quiet-drain is the in-op lever the UT
-    // bench can actually expose since it device-syncs only BETWEEN reps).
-    //
-    // DEFAULT OFF (opt-in via MORI_HIER_RING_PUT_SIGNAL=1). Turn-8 measured this
-    // default-ON on the standalone/UT sliced ring: BIT-EXACT on all 14 pts but
-    // BW-NEUTRAL (fp32 128/256MB 144.4/143.5 GB/s == the pre-signal 143 plateau;
-    // small-size 0.6ms floor unchanged). => the removed post-put ShmemQuietThread
-    // full-CQ drain was NOT on the critical path; the residual >=64MB gap vs native
-    // (~0.80x) is per-NIC RDMA-WRITE throughput (mori ~18 vs native ~22.5 GB/s/NIC),
-    // not the quiet-drain. So keep the shipped standalone bytes byte-for-byte
-    // unchanged (default OFF); put-signal remains available for opt-in A/B and as
-    // the flag-can't-beat-data completion protocol. The FUSED FSDP builders gate it
-    // independently (HierRingPutSignalExplicitlyOn) so it never leaks into E2E.
+    // Transport-level flag-can't-beat-data completion protocol (env
+    // MORI_HIER_RING_PUT_SIGNAL; off by default). When on, the single-warp RDMA
+    // ring send fuses the data WRITE and the completion-flag AMO into one
+    // ShmemPutMemNbiSignal (same QP, signal strictly AFTER data on the RC-ordered
+    // QP) so the receiver never observes the flag before the remote data lands.
+    // This removes the separate post-put ShmemQuietThread full-CQ drain that the
+    // receiver's flag-spin otherwise waits behind. Default off keeps the
+    // standalone bytes unchanged. The fused FSDP builders gate it independently
+    // (HierRingPutSignalExplicitlyOn) so it never leaks into E2E.
     {
       const char* e = std::getenv("MORI_HIER_RING_PUT_SIGNAL");
       jit_args_.usePutSignal = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
     }
-    // Phase-6 WRITE_WITH_IMM (env MORI_HIER_RING_WRITE_IMM, default OFF). When
+    // WRITE_WITH_IMM (env MORI_HIER_RING_WRITE_IMM, default off). When
     // set, the single-warp cross-node ring send emits RDMA_WRITE_WITH_IMM and the
     // receiver consumes the recv-CQ completion instead of the flag spin -- the
     // recv-CQE cannot precede the payload landing, closing the remote-landing race
@@ -626,7 +612,7 @@ class InterNodeRingAllgather {
   // slot-stage). So for ANY op that has a successor through the same handle, the
   // successor's prepare fence ALREADY provides the required global ordering ->
   // this finish fence is redundant and can be deferred (barrier=false), exactly
-  // mirroring the deferred Phase-B finish fence (slice_defer_fin, ). The
+  // mirroring the deferred Phase-B finish fence (slice_defer_fin). The
   // copy-OUT stays stream-ordered so the result is correct regardless; only the
   // cross-PE reuse fence is deferred. Callers that have no guaranteed successor
   // (last op / path switch) must keep barrier=true.
@@ -646,11 +632,11 @@ class InterNodeRingAllgather {
     return 0.0;
   }
 
-  // M4: device pointer to THIS PE's ring slot for a given message
-  // size, so an upstream producer (the intra-node SDMA gather) can write its
-  // node-block DIRECTLY into the ring buffer, eliminating the prepare_sync
-  // copy-IN (~1.4ms @256MiB,  phase attribution). The slot lives at
-  // ringPos_*chunkBytes -- exactly where prepare_sync would otherwise stage it.
+  // Device pointer to THIS PE's ring slot for a given message size, so an
+  // upstream producer (the intra-node SDMA gather) can write its node-block
+  // DIRECTLY into the ring buffer, eliminating the prepare_sync copy-IN. The slot
+  // lives at ringPos_*chunkBytes -- exactly where prepare_sync would otherwise
+  // stage it.
   uintptr_t slot_ptr(size_t count_u32) const {
     size_t chunkBytes = count_u32 * sizeof(uint32_t);
     return reinterpret_cast<uintptr_t>(reinterpret_cast<char*>(ring_) +
@@ -703,11 +689,11 @@ class InterNodeRingAllgather {
     return 0.0;
   }
 
-  // M4: base device pointer of the full ring buffer. After the ring
-  // kernel completes, ring_ already holds the ringSize_ chunks in ring order =
-  // the full rank-major result. A consumer that reads its output DIRECTLY from
-  // here (via ``buf_ptr`` + ``finish_sync_no_copy``) avoids the finish_sync
-  // copy-OUT (a ringSize*chunk D2D copy, ~2.7ms @512MiB,  attribution).
+  // Base device pointer of the full ring buffer. After the ring kernel completes,
+  // ring_ already holds the ringSize_ chunks in ring order = the full rank-major
+  // result. A consumer that reads its output DIRECTLY from here (via ``buf_ptr``
+  // + ``finish_sync_no_copy``) avoids the finish_sync copy-OUT (a ringSize*chunk
+  // D2D copy).
   uintptr_t buf_ptr() const { return reinterpret_cast<uintptr_t>(ring_); }
 
   // Like finish_sync but WITHOUT the copy-OUT: the gathered result is left in
@@ -715,12 +701,11 @@ class InterNodeRingAllgather {
   // barriers so no PE frees/reuses the ring buffer while a peer is still
   // reading from it. Saves one full ringSize*chunk D2D copy per call.
   //
-  // ASYMMETRY vs the copy-IN elimination (-24, validated-NEUTRAL): the
-  // ring kernel already writes every received chunk into the UNCACHED symmetric
-  // ring_ buffer, so removing the copy-OUT is a pure saving -- there is no
-  // offsetting uncached write the way copy-IN incurred. The only cost shifted to
-  // the consumer is reading its result from uncached memory, which is OUTSIDE
-  // the timed AllGather. So this is expected to be a real win, not a wash.
+  // Asymmetry vs the copy-IN elimination: the ring kernel already writes every
+  // received chunk into the UNCACHED symmetric ring_ buffer, so removing the
+  // copy-OUT is a pure saving -- there is no offsetting uncached write the way
+  // copy-IN incurred. The only cost shifted to the consumer is reading its result
+  // from uncached memory, which is outside the timed AllGather.
   double finish_sync_no_copy(hipStream_t stream) {
     (void)hipStreamSynchronize(stream);
     if (!HierAllBarrierDisabled()) shmem::ShmemBarrierAll();

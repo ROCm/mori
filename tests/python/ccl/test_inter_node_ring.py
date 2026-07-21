@@ -21,8 +21,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """
-Bit-exact test for ``mori.ccl.InterNodeRingAllgather`` (this work, M2 inter-node
-RDMA ring building block) vs ``torch.distributed.all_gather_into_tensor``.
+Bit-exact test for ``mori.ccl.InterNodeRingAllgather`` (inter-node RDMA ring
+building block) vs ``torch.distributed.all_gather_into_tensor``.
 
 The ring kernel moves data over the shmem transport -- P2P within a node, RDMA
 across nodes -- using the exact ring schedule CPU-validated by
@@ -30,7 +30,7 @@ across nodes -- using the exact ring schedule CPU-validated by
 participant) exercises the *same* kernel code path that runs over RDMA across
 nodes, so this is the on-device validation of the inter-node phase.
 
-AllGather is a pure data move => ZERO numerical tolerance (``torch.equal``).
+AllGather is a pure data move => zero numerical tolerance (``torch.equal``).
 
   Single node::
 

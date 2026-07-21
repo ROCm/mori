@@ -593,7 +593,7 @@ void GpuStateInit(ShmemStates* states) {
   states->gpuStates.rank = states->bootStates->rank;
   states->gpuStates.worldSize = states->bootStates->worldSize;
   states->gpuStates.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
-  // DUAL-RAIL: split point at/after which a peer's QPs live on the second NIC.
+  // Dual-rail: split point at/after which a peer's QPs live on the second NIC.
   // Context returns numQpPerPe (no rail-2 QP) when dual-rail is off; convert that
   // to -1 so the device gate (rail2QpStart>=0) stays inert on the single-rail path.
   {
@@ -603,26 +603,25 @@ void GpuStateInit(ShmemStates* states) {
             ? r2
             : -1;
   }
-  // this work (transport in-flight depth): optional fast-path WQE chunk size. When
-  // set, a large RDMA put is split into multiple in-flight WQEs/QP (see
-  // GpuStates::putChunkBytes). 0/unset keeps the single-WQE behavior.
+  // Optional fast-path WQE chunk size. When set, a large RDMA put is split into
+  // multiple in-flight WQEs/QP (see GpuStates::putChunkBytes). 0/unset keeps the
+  // single-WQE behavior.
   {
     const char* pcb = std::getenv("MORI_RDMA_PUT_CHUNK_BYTES");
     states->gpuStates.putChunkBytes = (pcb != nullptr) ? std::strtoull(pcb, nullptr, 10) : 0;
   }
-  // this work (transport in-flight depth, batched doorbell): ring the mlx5 send
-  // doorbell ONCE per multi-WQE put instead of once per chunk WQE (removes the
-  // per-WQE MMIO + 3 threadfence_system overhead that made plain putChunkBytes
-  // neutral). Only meaningful with MORI_RDMA_PUT_CHUNK_BYTES>0. 0/unset = off.
+  // Batched doorbell: ring the mlx5 send doorbell once per multi-WQE put instead
+  // of once per chunk WQE (removes per-WQE MMIO + threadfence_system overhead).
+  // Only meaningful with MORI_RDMA_PUT_CHUNK_BYTES>0. 0/unset = off.
   {
     const char* bdb = std::getenv("MORI_RDMA_PUT_BATCH_DB");
     states->gpuStates.batchPutDoorbell = (bdb != nullptr) && (std::strtoul(bdb, nullptr, 10) != 0);
   }
-  // this work (drain-free landing fence): mlx5 strong-ordering fence bit on the
-  // fused signal ATOMIC WQE so it cannot overtake its own preceding large payload
-  // WRITE on RoCE RC (the >=64MB DEEP_PIPE flag-beats-data race). Value is OR'd
-  // into fm_ce_se; 3=STRONG_ORDERING (recommended), 2=FENCE. 0/unset = off =
-  // byte-identical shipped path. See GpuStates::signalFenceMode.
+  // Drain-free landing fence: mlx5 strong-ordering fence bit on the fused signal
+  // ATOMIC WQE so it cannot overtake its own preceding large payload WRITE on
+  // RoCE RC (the >=64MB DEEP_PIPE flag-beats-data race). Value is OR'd into
+  // fm_ce_se; 3=STRONG_ORDERING (recommended), 2=FENCE. 0/unset = off =
+  // byte-identical default path. See GpuStates::signalFenceMode.
   {
     const char* sf = std::getenv("MORI_HIER_SIGNAL_FENCE");
     int v = (sf != nullptr) ? std::atoi(sf) : 0;

@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
-# HOST-PROXY INTER-NODE PRODUCER for the fused-ring reassembly consumer.
+# Host-proxy inter-node producer for the fused-ring reassembly consumer.
 #
 # The device fused-ring giant-AG kernel (FusedRingRemoteGatherKernel_u32) splits
 # into three concurrent CTA groups: ring channels (inter-node RDMA fill), the
@@ -34,22 +34,20 @@
 # MORI_HIER_HOSTPROXY_REASM=1 the device ring-send CTAs skip the RDMA send and the
 # reassembly workers spin on host-published chunkReadyFlags[f]. A persistent CPU
 # proxy RDMA-writes each ring chunk into the partner's device ring buffer, drains
-# its send-CQ (the host-drain landing fence, bit-exact at the giant-AG size where
-# the device signal dies), rail-pair barriers so the partner's write into this
-# rank's ring buffer has landed, then publishes chunkReadyFlags[f] device-visibly.
-# The device reassembly worker then SDMA-pushes chunk f the instant its host flag
-# lands, overlapping the still-in-flight later chunks -- the same pipeline the
-# device signal could not make bit-exact.
+# its send-CQ (the host-drain landing fence), rail-pair barriers so the partner's
+# write into this rank's ring buffer has landed, then publishes chunkReadyFlags[f]
+# device-visibly. The device reassembly worker then SDMA-pushes chunk f the
+# instant its host flag lands, overlapping the still-in-flight later chunks.
 #
 # Flat crown ring (rb==1, ring_size==N==2): PE(node,L) rail-exchanges its single
-# chunk with PE(1-node,L). ring buffer slot m == node m's chunk (ring order); this
+# chunk with PE(1-node,L). Ring buffer slot m == node m's chunk (ring order); this
 # PE owns slot node_id (its own input, copied in by prepare_stream_only) and must
 # RECEIVE slot (1-node) from its partner. One landing flag (f==0) for the single
 # remote chunk.
 #
-# Bit-exact by construction: same ring-buffer bytes as the device RDMA send would
-# have produced (slot m*chunkBytes, matching all_gather.hpp ringBase[m*sliceElems]);
-# the send-CQ drain + rail-pair barrier order the landing before the flag; the flag
+# Landing order: same ring-buffer bytes as the device RDMA send would produce
+# (slot m*chunkBytes, matching all_gather.hpp ringBase[m*sliceElems]); the
+# send-CQ drain + rail-pair barrier order the landing before the flag; the flag
 # is published only after the barrier so the device reassembly reads landed bytes.
 
 import os
@@ -80,19 +78,17 @@ class HostProxyInterProducer:
     barriers, then publishes the reassembly landing flags for the received chunk.
     """
 
-    # Process-wide SHARED engine (composition IOEngine reuse).
+    # Process-wide SHARED engine (IOEngine reuse).
     # FSDP builds a SEPARATE HierAllGather per param group (root embed+lm_head AND
     # every decoder layer), so with MORI_HIER_HOSTPROXY_REASM=1 a process would
-    # otherwise stand up ~29 DISTINCT host ibverbs IOEngines, each with its own
-    # RDMA backend + QPs + bootstrap listener, ALL coexisting with crown's device
-    # IBGDA shmem stack on the same 8 mlx5 NICs. That dual-stack fan-out is the
-    # documented nondeterministic bootstrap hang: create_backend
-    # handshakes race, QP/NIC resources contend. Fix: ONE shared engine+backend
-    # per process; each producer instance only registers ITS ring buffer as a new
-    # MemoryDesc + creates a session against the partner's matching ring mem. The
-    # engine + partner remote-engine registration happen exactly once. This
-    # collapses ~29 coexisting engines -> 1 (the producer reuses
-    # crown's IOEngine instead of opening a coexisting one).
+    # otherwise stand up one DISTINCT host ibverbs IOEngine per group, each with
+    # its own RDMA backend + QPs + bootstrap listener, ALL coexisting with crown's
+    # device IBGDA shmem stack on the same mlx5 NICs. That dual-stack fan-out
+    # causes a nondeterministic bootstrap hang: create_backend handshakes race,
+    # QP/NIC resources contend. Fix: ONE shared engine+backend per process; each
+    # producer instance only registers ITS ring buffer as a new MemoryDesc +
+    # creates a session against the partner's matching ring mem. The engine +
+    # partner remote-engine registration happen exactly once.
     _shared_engine = None  # the one process-wide IOEngine
     _partner_registered = False  # partner's engine desc registered once
     _pair_barriers = None  # cached rail-pair group (built once)
@@ -179,7 +175,7 @@ class HostProxyInterProducer:
     @classmethod
     def _ensure_pair_barriers(cls, my_pe, ranks_per_node):
         """Build the rail-pair process groups ONCE (dist.new_group is collective +
-        creates a comm; building 29x per param group is wasteful)."""
+        creates a comm; building one per param group is wasteful)."""
         if cls._pair_barriers is not None:
             return cls._pair_barriers
         mine = None
@@ -266,13 +262,13 @@ class HostProxyInterProducer:
         # hot path (fires on every fuse_remote AG) that both serializes the two
         # rail peers AND, being a c10d collective, cannot run off the main Python
         # thread (blocks any async-overlap). Replace it with a generation-stamped
-        # point-to-point RDMA flag (the mechanism validated barrier-free at
-        # 256/466MB): after MY data send-CQ drains, RDMA a monotone gen stamp into
-        # the partner's pinned-host flag_recv; I spin on MY flag_recv >= gen (the
-        # partner's write of its chunk into MY ring slot has landed, since it only
-        # posts the flag AFTER draining its own data CQ). No collective => lower
-        # per-AG latency AND thread-safe for async fill. gen stays rank-synced
-        # because E2E AGs fire in deterministic order. Default OFF => collective.
+        # point-to-point RDMA flag: after MY data send-CQ drains, RDMA a monotone
+        # gen stamp into the partner's pinned-host flag_recv; I spin on MY
+        # flag_recv >= gen (the partner's write of its chunk into MY ring slot has
+        # landed, since it only posts the flag AFTER draining its own data CQ). No
+        # collective => lower per-AG latency AND thread-safe for async fill. gen
+        # stays rank-synced because E2E AGs fire in deterministic order. Default
+        # OFF => collective.
         self._inter_flag = os.environ.get(
             "MORI_HIER_HOSTPROXY_INTER_FLAG", "0"
         ) not in ("0", "", "false", "False")

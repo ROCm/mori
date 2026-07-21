@@ -2,13 +2,13 @@
 # Cross-node (w16, 2 node x 8 GPU) compute/comm OVERLAP UT launcher for
 # tests/python/ccl/test_overlap_w16.py.
 #
-# Measures the GEMMs' OWN completion time while N AllGathers run concurrently,
+# Measures the GEMMs' own completion time while N AllGathers run concurrently,
 # RCCL (CU-resident) vs hp_sdma (host-proxy: cross-node CPU-posted + intra-node
-# SDMA copy engine, both CU-free). LOWER hp_sdma GEMM time = the collective
-# steals less GPU from compute. HARD bit-exact gate (torch.equal vs RCCL).
+# SDMA copy engine, both CU-free). Lower hp_sdma GEMM time = the collective
+# steals less GPU from compute. Bit-exact gate (torch.equal vs RCCL).
 #
-# Env matches the original hp_sdma run recipe (host-proxy async + SDMA-intra +
-# NUMA-local NIC), i.e. the same construction the w16 E2E hp_sdma FSDP run uses.
+# Env is the same host-proxy async + SDMA-intra + NUMA-local NIC construction
+# the w16 E2E hp_sdma FSDP run uses.
 #
 # usage: bash run_ut_overlap.sh [gemm_n] [size_mb] [nops]
 #   e.g. bash run_ut_overlap.sh 2048        # defaults: size_mb=8 nops=50
@@ -26,7 +26,7 @@ GID="${NCCL_IB_GID_INDEX:-3}"
 FABRIC="GLOO_SOCKET_IFNAME=$IFACE NCCL_SOCKET_IFNAME=$IFACE MORI_SOCKET_IFNAME=$IFACE \
 NCCL_IB_HCA=$IB NCCL_IB_GID_INDEX=$GID MORI_RDMA_DEVICES=$IB"
 
-# hp_sdma overlap recipe (host-proxy async + SDMA-intra + NUMA-local), verbatim.
+# hp_sdma overlap recipe (host-proxy async + SDMA-intra + NUMA-local).
 ENVSET="MORI_ENABLE_SDMA=1 MORI_FSDP_ENABLE_HIER=1 MORI_FSDP_HOST_PROXY=1 \
 MORI_FSDP_HOSTPROXY_CAP_MB=512 MORI_SHMEM_HEAP_SIZE=17179869184 \
 MORI_HOSTPROXY_ASYNC=1 MORI_HOSTPROXY_SDMA_INTRA=1 MORI_HIER_NIC_NUMA_LOCAL=1"

@@ -1279,15 +1279,13 @@ inline __device__ void ShmemInternalBarrierBlock() {
   __syncthreads();
 }
 
-// DISSEMINATION barrier — a topology-cheaper drop-in for the
-// PE0-coordinator funnel ShmemInternalBarrierBlock. root-caused the
-// hier-AllGather residual to the global prepare ShmemBarrierOnStream: the funnel
-// serializes ALL 8 PEs through PE0 (PE0 does n-1 sequential inbound waits + n-1
-// sequential outbound puts, several crossing the node boundary over RDMA). The
-// dissemination algorithm replaces that O(n) serial critical path with
-// ceil(log2 n) parallel rounds (every PE does 1 put + 1 wait per round): for
-// n=8 that is 3 rounds vs ~14 serial PE0 steps. Same GLOBAL scope (all PEs),
-// same proven put/wait primitives, so it preserves the quiet-drain +
+// Dissemination barrier — a topology-cheaper drop-in for the PE0-coordinator
+// funnel ShmemInternalBarrierBlock. The funnel serializes all n PEs through PE0
+// (PE0 does n-1 sequential inbound waits + n-1 sequential outbound puts, several
+// crossing the node boundary over RDMA). The dissemination algorithm replaces
+// that O(n) serial critical path with ceil(log2 n) parallel rounds (every PE
+// does 1 put + 1 wait per round): for n=8 that is 3 rounds. Same global scope
+// (all PEs), same put/wait primitives, so it preserves the quiet-drain +
 // all-PEs-arrived semantics the prepare relies on.
 //
 // Correctness: monotonic per-PE generation counter (never reset) disambiguates
