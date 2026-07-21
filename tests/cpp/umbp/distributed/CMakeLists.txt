@@ -365,3 +365,55 @@ target_link_libraries(
   bench_umbp_kvevent_master_pressure
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
+
+# bench_master_metadata_store — store-level microbench isolating the hot-path
+# IMasterMetadataStore methods (RouteGet / Exists / Heartbeat) across backends
+# (UMBP_METADATA_BACKEND). No gRPC / RDMA; links umbp_common only. Standalone
+# executable, not a CTest target.
+add_executable(bench_umbp_master_metadata_store bench_master_metadata_store.cpp)
+target_link_libraries(bench_umbp_master_metadata_store PRIVATE umbp_common)
+target_compile_features(bench_umbp_master_metadata_store PRIVATE cxx_std_17)
+
+# bench_master_metadata_store_extkv — sibling microbench isolating the
+# EXTERNAL-KV hot-path IMasterMetadataStore methods (MatchExternalKv /
+# RegisterExternalKvIfAlive / UnregisterExternalKv / GetExternalKvHitCounts)
+# across backends (UMBP_METADATA_BACKEND). No gRPC / RDMA; links umbp_common
+# only. Standalone executable, not a CTest target.
+add_executable(bench_umbp_master_metadata_store_extkv
+               bench_master_metadata_store_extkv.cpp)
+target_link_libraries(bench_umbp_master_metadata_store_extkv PRIVATE umbp_common)
+target_compile_features(bench_umbp_master_metadata_store_extkv PRIVATE cxx_std_17)
+
+# test_redis_master_metadata_store — Phase 1 targeted tests for the RESP/Redis
+# backend. Built only when the Redis backend is compiled in; the test itself
+# skips at runtime when no RESP store is reachable at UMBP_REDIS_URI.
+if(USE_REDIS_BACKEND)
+  add_executable(test_redis_master_metadata_store
+                 test_redis_master_metadata_store.cpp)
+  target_link_libraries(test_redis_master_metadata_store
+                        PRIVATE umbp_common GTest::gtest_main)
+  target_compile_features(test_redis_master_metadata_store PRIVATE cxx_std_17)
+  gtest_discover_tests(test_redis_master_metadata_store)
+
+  # test_sharded_read — pure unit tests for the block-read fan-out
+  # (redis/sharded_read.h) against a fake IRespClient. No live store needed, so
+  # it always runs (unlike test_redis_master_metadata_store, which skips without
+  # a reachable backend).
+  add_executable(test_sharded_read test_sharded_read.cpp)
+  target_link_libraries(test_sharded_read PRIVATE umbp_common GTest::gtest_main)
+  target_compile_features(test_sharded_read PRIVATE cxx_std_17)
+  gtest_discover_tests(test_sharded_read)
+
+  # redis-plus-plus link/build smoke test. Proves the submodule compiles with
+  # this toolchain and links (static redis++ + system hiredis) before any store
+  # code depends on it; at runtime it connects to UMBP_REDIS_URI if reachable,
+  # else skips. redis++_static carries its own include dirs; hiredis must be
+  # linked explicitly (the system hiredis ships no CMake config, so redis++ does
+  # not propagate it for the static lib).
+  add_executable(test_redispp_smoke test_redispp_smoke.cpp)
+  target_link_libraries(test_redispp_smoke
+                        PRIVATE redis++_static ${HIREDIS_LIB} GTest::gtest_main)
+  target_include_directories(test_redispp_smoke PRIVATE ${HIREDIS_INCLUDE_DIR})
+  target_compile_features(test_redispp_smoke PRIVATE cxx_std_17)
+  gtest_discover_tests(test_redispp_smoke)
+endif()

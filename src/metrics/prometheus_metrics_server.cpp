@@ -179,6 +179,25 @@ void MetricsServer::observe(std::string_view name, std::string_view help,
 static std::string FormatLabels(
     const mori::metrics::MetricsServer::Labels& labels);  // forward decl
 
+void MetricsServer::observe(std::string_view name, std::string_view help, const Labels& labels,
+                            const std::vector<double>& bounds, double value) {
+  auto label_str = FormatLabels(labels);
+  std::lock_guard<std::mutex> lk(mutex_);
+  auto& family = labeled_histograms_[std::string(name)];
+  family.help = help;
+  auto& s = family.series[label_str];
+  if (s.bounds.empty()) {
+    s.bounds = bounds;
+    s.bucket_counts.assign(bounds.size(), 0u);
+  }
+  // Increment all cumulative buckets whose upper bound >= value.
+  for (std::size_t i = 0; i < s.bounds.size(); ++i) {
+    if (value <= s.bounds[i]) s.bucket_counts[i]++;
+  }
+  s.count++;
+  s.sum += value;
+}
+
 void MetricsServer::observeAggregated(std::string_view name, std::string_view help,
                                       const Labels& labels, const std::vector<double>& bounds,
                                       const std::vector<uint64_t>& bucket_counts, uint64_t count,
