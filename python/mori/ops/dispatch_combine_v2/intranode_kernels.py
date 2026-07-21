@@ -67,7 +67,8 @@ from flydsl.expr.rocdl import (
 from flydsl.expr.typing import Int32, Int64
 
 import mori.cco.device.flydsl as cco
-import flydsl_prims as P
+
+from . import flydsl_prims as P
 
 # Wavefront size: gfx9 (MI300/MI350) = 64, gfx12 (MI400/gfx1250) = 32. Detected
 # once per process; override with MORI_WAVE_SIZE. get_warp_size(gfx1250) wrongly
@@ -616,19 +617,10 @@ def make_combine(
         rsrc_out = create_buffer_resource_from_addr(addr_out)
         xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
 
-        # ── Stage 1: cross-device entry barrier (xdb, see module docstring) ──
-        # Gather reads only out_tok from the prior dispatch/expert kernel, so a
-        # cross-device barrier suffices (no Stage-1 scatter). The grid barrier
-        # (comb_bar) is REQUIRED: it guarantees every block has already read
-        # xdb_cur_flag before block 0 increments xdb_flag — otherwise a slow
-        # block reads the bumped flag and the per-peer == handshake deadlocks.
-        fx.barrier()
-        if tid == 0:
-            P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
+        # ── Stage 1: cross-device entry barrier (block 0 only) ──
+        # Block 0 handles the full xdb handshake, then signals other blocks
+        # via comb_bar. Eliminates the grid barrier and per-block xdb spin.
         if grid_thread_id < npes:
-            P.spin_until_eq_i32(fx.Int64(addr_comb_bar), block_num)
-            P.fence_system_acquire()
-            buffer_store(arith.constant(0), rsrc_comb_bar, 0)
             xdb_remote = fx.Int64(
                 window.lsa_ptr(grid_thread_id, off_xdb_mem)
             ) + fx.Int64(rank) * fx.Int64(8)
@@ -637,14 +629,21 @@ def make_combine(
             P.atomic_add_global(
                 fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64())
             )
-        if tid < npes:
+        if grid_thread_id < npes:
             xdb_peer_slot = fx.Int64(
                 window.lsa_ptr(my_lsa_rank, off_xdb_mem)
-            ) + fx.Int64(tid) * fx.Int64(8)
+            ) + fx.Int64(grid_thread_id) * fx.Int64(8)
             P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
-            P.fence_system_acquire()
-        fx.barrier()
-        P.fence_system_acquire()  # ALL threads: peers' out_tok visible
+        if bid == 0:
+            fx.barrier()
+            if tid == 0:
+                P.store_i32_system(
+                    fx.Int64(addr_comb_bar), arith.constant(0), arith.constant(1)
+                )
+        if bid != 0:
+            if tid == 0:
+                P.spin_until_eq_i32(fx.Int64(addr_comb_bar), 1)
+            fx.barrier()
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
@@ -679,18 +678,16 @@ def make_combine(
             expert_valids = []
             expert_pes = []
             expert_toks = []
+            encoded_my = buffer_load(
+                rsrc_tok_map, tok_map_base + lane, vec_width=1, dtype=T.i32()
+            )
             for k_slot in range_constexpr(experts_per_token):
-                encoded_k = buffer_load(
-                    rsrc_tok_map, tok_map_base + k_slot, vec_width=1, dtype=T.i32()
-                )
-                dest_pe_k = encoded_k // max_recv  # sentinel: dest_pe == npes
-                dest_tok_k = encoded_k % max_recv  # peer-local recv slot
+                encoded_k = readlane(T.i32(), encoded_my, k_slot)
+                dest_pe_k = encoded_k // max_recv
+                dest_tok_k = encoded_k % max_recv
                 valid_k = dest_pe_k < npes
                 safe_pe = arith.select(valid_k, dest_pe_k, arith.constant(rank))
                 safe_tok_k = arith.select(valid_k, dest_tok_k, arith.constant(0))
-                # Remote base peer[dest_pe].out_tok[dest_tok]; gather via global
-                # loads (no per-expert buffer descriptor) to keep all K loads in
-                # flight — see P.load_i32_nt.
                 slot_addr = fx.Int64(window.lsa_ptr(safe_pe, off_out_tok)) + fx.Int64(
                     safe_tok_k
                 ) * fx.Int64(nbytes)
@@ -753,25 +750,41 @@ def make_combine(
                 # Vec4 path: load 4 i32 (16B, global_load_dwordx4) per expert
                 # per iteration, reducing xGMI load count 4×.
                 VEC = 4
-                STEP_V4 = _unroll * WAVE * VEC
+                STEP_CHUNK = WAVE * VEC
+                STEP_V4 = _unroll * STEP_CHUNK
+
+                def _load_expert_vecs(off):
+                    vecs = []
+                    valids = []
+                    for k_slot in range_constexpr(experts_per_token):
+                        vecs.append(P.load_v4i32_nt(expert_bases[k_slot], off))
+                        valids.append(expert_valids[k_slot])
+                    return vecs, valids
 
                 def _accum_loop():
                     main_end = (eff // STEP_V4) * STEP_V4
                     for u in range(lane * VEC, main_end, STEP_V4):
                         base = unit_base + u
+                        # Issue all remote loads first (both unroll rounds) so stores
+                        # in the j/r nest cannot block the next load batch.
+                        pre_vecs = []
+                        pre_valids = []
                         for r in range_constexpr(_unroll):
-                            off = base + r * WAVE * VEC
-                            vecs = []
-                            for k_slot in range_constexpr(experts_per_token):
-                                vecs.append(P.load_v4i32_nt(expert_bases[k_slot], off))
-                            for j in range_constexpr(VEC):
+                            off_r = base + r * STEP_CHUNK
+                            vecs_r, valids_r = _load_expert_vecs(off_r)
+                            pre_vecs.append(vecs_r)
+                            pre_valids.append(valids_r)
+                        # Reduce+store: j outer, r inner (unroll innermost).
+                        for j in range_constexpr(VEC):
+                            for r in range_constexpr(_unroll):
+                                off = base + r * STEP_CHUNK
                                 acc = _zero_accum()
                                 for k_slot in range_constexpr(experts_per_token):
                                     elem = vector.extract(
-                                        vecs[k_slot], static_position=[j]
+                                        pre_vecs[r][k_slot], static_position=[j]
                                     )
                                     v = arith.select(
-                                        expert_valids[k_slot], elem, arith.constant(0)
+                                        pre_valids[r][k_slot], elem, arith.constant(0)
                                     )
                                     acc = acc + _to_accum2(v)
                                 buffer_store(
@@ -786,19 +799,23 @@ def make_combine(
                     main_end = (eff // STEP) * STEP
                     for u in range(lane, main_end, STEP):
                         base = unit_base + u
+                        pre_vals = []
                         for r in range_constexpr(_unroll):
-                            off = base + r * WAVE
-                            vals = []
+                            off_r = base + r * WAVE
+                            vals_r = []
                             for k_slot in range_constexpr(experts_per_token):
-                                v = P.load_i32_nt(expert_bases[k_slot], off)
-                                vals.append(
+                                v = P.load_i32_nt(expert_bases[k_slot], off_r)
+                                vals_r.append(
                                     arith.select(
                                         expert_valids[k_slot], v, arith.constant(0)
                                     )
                                 )
+                            pre_vals.append(vals_r)
+                        for r in range_constexpr(_unroll):
+                            off = base + r * WAVE
                             acc = _zero_accum()
                             for k_slot in range_constexpr(experts_per_token):
-                                acc = acc + _to_accum2(vals[k_slot])
+                                acc = acc + _to_accum2(pre_vals[r][k_slot])
                             buffer_store(
                                 _from_accum2(acc),
                                 rsrc_out,
@@ -808,6 +825,10 @@ def make_combine(
                         _one(unit_base + u)
 
             _accum_loop()
+
+        if global_warp_id == 0:
+            if lane == 0:
+                buffer_store(arith.constant(0), rsrc_comb_bar, 0)
 
     @flyc.jit
     def run(
@@ -1094,8 +1115,8 @@ def make_combine_scatter(
                     )
 
         # ── Stage 2: cross-device barrier ──
-        # release Stage-1's P2P comb_inp writes before signaling peers (else
-        # Stage-3's acquire races them -> dropped contributions)
+        # Grid sync ensures all blocks finished Stage-1 scatter writes.
+        # Block 0 then handles xdb and signals completion via comb_bar.
         P.fence_system_release()
         fx.barrier()
         if tid == 0:
@@ -1103,7 +1124,6 @@ def make_combine_scatter(
         if grid_thread_id < npes:
             P.spin_until_eq_i32(fx.Int64(addr_comb_bar), block_num)
             P.fence_system_acquire()
-            buffer_store(arith.constant(0), rsrc_comb_bar, 0)
             xdb_remote = fx.Int64(
                 window.lsa_ptr(grid_thread_id, off_xdb_mem)
             ) + fx.Int64(rank) * fx.Int64(8)
@@ -1112,14 +1132,23 @@ def make_combine_scatter(
             P.atomic_add_global(
                 fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64())
             )
-        if tid < npes:
+        if grid_thread_id < npes:
             xdb_slot = fx.Int64(window.lsa_ptr(my_lsa_rank, off_xdb_mem)) + fx.Int64(
-                tid
+                grid_thread_id
             ) * fx.Int64(8)
             P.spin_until_eq_i64(xdb_slot, xdb_cur_flag)
-            P.fence_system_acquire()
-        fx.barrier()
-        P.fence_system_acquire()
+        if bid == 0:
+            fx.barrier()
+            if tid == 0:
+                P.store_i32_system(
+                    fx.Int64(addr_comb_bar),
+                    arith.constant(0),
+                    arith.constant(block_num + 1),
+                )
+        if bid != 0:
+            if tid == 0:
+                P.spin_until_eq_i32(fx.Int64(addr_comb_bar), block_num + 1)
+            fx.barrier()
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
@@ -1251,6 +1280,10 @@ def make_combine_scatter(
                     _one(unit_base + u)
 
             _loop()
+
+        if global_warp_id == 0:
+            if lane == 0:
+                buffer_store(arith.constant(0), rsrc_comb_bar, 0)
 
     @flyc.jit
     def run(

@@ -33,10 +33,9 @@ import torch.distributed as dist
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
-sys.path.insert(0, os.path.join(_ROOT, "python", "mori", "ops", "dispatch_combine_v2"))
 sys.path.insert(0, os.path.join(_ROOT, "examples", "cco", "python"))
 from cco_example_common import set_device  # noqa: E402
-from dispatch_combine_op import (  # noqa: E402
+from mori.ops.dispatch_combine_v2 import (  # noqa: E402
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
 )

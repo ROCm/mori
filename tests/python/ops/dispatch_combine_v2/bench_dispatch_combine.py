@@ -50,13 +50,10 @@ import mori.cco.device.flydsl as cco  # noqa: F401
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
 sys.path.insert(
-    0, os.path.join(_ROOT, "python", "mori", "ops", "dispatch_combine_v2")
-)  # op + kernels
-sys.path.insert(
     0, os.path.join(_ROOT, "examples", "cco", "python")
 )  # cco_example_common
 from cco_example_common import set_device, sync  # noqa: E402
-from dispatch_combine_op import (  # noqa: E402
+from mori.ops.dispatch_combine_v2 import (  # noqa: E402
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
 )
@@ -99,6 +96,9 @@ COMB_BLOCK = int(os.environ.get("COMB_BLOCK", os.environ.get("BLOCK_NUM", 80)))
 WARP_NUM = int(os.environ.get("WARP_NUM", 16))
 # combine's K-deep per-lane MLP saturates with few warps.
 COMB_WARP = int(os.environ.get("COMB_WARP", WARP_NUM))
+# AUTO=1: build the plain config (no pinned geometry) so __post_init__ auto-pulls
+# the tuned schedule, and pick the disp/comb variant per token count via op._pick.
+AUTO = int(os.environ.get("AUTO", 0))
 WARMUP = int(os.environ.get("WARMUP", 10))
 ITERS = int(os.environ.get("ITERS", 50))
 MODE = os.environ.get("MODE", "both")  # eager | graph | both
@@ -110,7 +110,7 @@ SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = forward per-token scales
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,2048").split(",")]
 
 # fp8 flavor is arch-specific: OCP e4m3 on gfx950/gfx1250, fnuz on gfx942.
-import tuning_configs as _tc  # noqa: E402
+from mori.ops.dispatch_combine_v2 import tuning_configs as _tc  # noqa: E402
 
 _FP8_DT = (
     torch.float8_e4m3fn
@@ -205,7 +205,7 @@ def main():
         # express). schedule=None + explicit block/warp => the op precompiles
         # exactly the (DISP_BLOCK,WARP_NUM) / (COMB_BLOCK,COMB_WARP) variants we
         # sweep; we time those, reusing the op's arena + buffers.
-        cfg = EpDispatchCombineConfig(
+        _cfg_kwargs = dict(
             rank=rank,
             world_size=npes,
             hidden_dim=HIDDEN,
@@ -218,15 +218,21 @@ def main():
             combine_data_type=(COMB_DT if _ASYM else None),
             combine_mode=COMBINE,
             quant_type=QUANT,
-            dispatch_block_num=DISP_BLOCK,
-            warp_num_per_block=WARP_NUM,
-            combine_block_num=COMB_BLOCK,
-            combine_warp_num_per_block=COMB_WARP,
-            schedule=None,
             scale_dim=SCALE_DIM,
             scale_type_size=1 if SCALE_DIM else 0,
             enable_std_moe=bool(STDMOE),
         )
+        if not AUTO:
+            # pin the swept geometry (single-shot); AUTO => leave unset so the
+            # config auto-pulls the tuned schedule in __post_init__.
+            _cfg_kwargs.update(
+                dispatch_block_num=DISP_BLOCK,
+                warp_num_per_block=WARP_NUM,
+                combine_block_num=COMB_BLOCK,
+                combine_warp_num_per_block=COMB_WARP,
+                schedule=None,
+            )
+        cfg = EpDispatchCombineConfig(**_cfg_kwargs)
         op = EpDispatchCombineOp(cfg, comm)
         op.reset()
         arena = op.arena
@@ -235,8 +241,22 @@ def main():
         comb_out = op.combine_out
         comb_out_wts = op.combine_out_weights
         tok_map = op.token_dest_map
-        disp_kern = op._dispatch_variants[(DISP_BLOCK, WARP_NUM)]
-        comb_kern = op._combine_variants[(COMB_BLOCK, COMB_WARP)]
+        if AUTO:
+            _dspec, _cspec = op._pick(min(SWEEP))
+            disp_kern = op._dispatch_variants[_dspec]
+            comb_kern = op._combine_variants[_cspec]
+            if rank == 0:
+                print(
+                    f"# AUTO tuned config: schedule={cfg.schedule} "
+                    f"disp_default=({cfg.dispatch_block_num},{cfg.warp_num_per_block}) "
+                    f"comb_default=({cfg.combine_block_num},{cfg.combine_warp_num_per_block}) "
+                    f"disp_variants={sorted(op._dispatch_variants)} "
+                    f"comb_variants={sorted(op._combine_variants)}",
+                    flush=True,
+                )
+        else:
+            disp_kern = op._dispatch_variants[(DISP_BLOCK, WARP_NUM)]
+            comb_kern = op._combine_variants[(COMB_BLOCK, COMB_WARP)]
 
         # Launch on the CURRENT stream each call: under torch.cuda.graph capture
         # that resolves to the capture stream, so the kernel is actually recorded.
@@ -279,6 +299,11 @@ def main():
         def time_eager(fn, ct):
             for _ in range(WARMUP):
                 fn(ct)
+                sync()
+                comm.barrier()  # lock-step warmup: sync(device)+barrier so no
+                # rank starts call N+1 before all finish N (avoids the cco cross-
+                # device barrier flag-overwrite deadlock at small token counts).
+                # Untimed, so it does not affect the measured replay bandwidth.
             sync()
             comm.barrier()
             s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
@@ -295,6 +320,11 @@ def main():
         def time_graph(fn, ct):
             for _ in range(WARMUP):
                 fn(ct)
+                sync()
+                comm.barrier()  # lock-step warmup: sync(device)+barrier so no
+                # rank starts call N+1 before all finish N (avoids the cco cross-
+                # device barrier flag-overwrite deadlock at small token counts).
+                # Untimed, so it does not affect the measured replay bandwidth.
             sync()
             gr = torch.cuda.CUDAGraph()
             with torch.cuda.graph(gr):
@@ -478,14 +508,23 @@ def main():
         eager = MODE in ("eager", "both")
         graph = MODE in ("graph", "both")
         if rank == 0:
+            _geom = (
+                "geom=AUTO(tuned schedule)"
+                if AUTO
+                else f"block disp={DISP_BLOCK} comb={COMB_BLOCK} x{WARP_NUM}w"
+            )
             print(
                 f"# EP{npes} hidden={HIDDEN} topk={K} experts={num_experts} "
-                f"block disp={DISP_BLOCK} comb={COMB_BLOCK} x{WARP_NUM}w  iters={ITERS}",
+                f"{_geom}  iters={ITERS}",
                 flush=True,
             )
         verify(min(SWEEP))  # correctness pass during warmup
 
         for ct in SWEEP:
+            if AUTO:  # pick this bucket's tuned variant (dispatch + combine)
+                _ds, _cs = op._pick(ct)
+                disp_kern = op._dispatch_variants[_ds]
+                comb_kern = op._combine_variants[_cs]
             # clean dispatch to set total_recv (combine reads it; not reset)
             total_recv.zero_()
             sync()
@@ -512,7 +551,8 @@ def main():
                     if _ASYM
                     else f"payload {comb_payload/1e6:7.2f}MB"
                 )
-                parts = [f"tok/rank {ct:5d}  recv {recv:6d}  {pl}"]
+                _g = f"  [disp {_ds} comb {_cs}]" if AUTO else ""
+                parts = [f"tok/rank {ct:5d}  recv {recv:6d}  {pl}{_g}"]
                 if eager:
                     parts.append(
                         f"| EAGER disp {dp_e:8.2f}us/{bw(disp_payload,dp_e):6.1f}GB/s "
