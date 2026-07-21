@@ -11,8 +11,9 @@
 set -u
 
 # ---------------- config (override via env if needed) ----------------
-GPU="${GPU:-0}"                       # single id "0" or TP list "0,1,2,3,4,5,6,7"
+GPU="${GPU:-0}"                       # single id "0" or TP/DP list "0,1,2,3,4,5,6,7"
 TP="${TP:-1}"                         # tensor-parallel size (>=2 for multi-GPU)
+DP_SIZE="${DP_SIZE:-1}"               # data-parallel replicas (>=2 => multi-worker)
 MODEL="${MODEL:-/nfs/data/Qwen3-0.6B}"
 MEM_FRACTION="${MEM_FRACTION:-0.6}"   # --mem-fraction-static
 PAGE_SIZE="${PAGE_SIZE:-64}"          # --page-size
@@ -20,7 +21,9 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"          # extra sglang flags, e.g. speculative/fp8
 READY_ITERS="${READY_ITERS:-40}"      # readiness poll iterations (x8s each)
 SGLANG_PORT="${SGLANG_PORT:-30010}"
 PUB_PORT="${PUB_PORT:-5567}"
-REPLAY_PORT="${REPLAY_PORT:-5568}"
+# sglang offsets each dp-rank's event port by +rank (offset_endpoint_port),
+# so leave a wide gap between PUB and REPLAY bases to avoid cross-rank collisions.
+REPLAY_PORT="${REPLAY_PORT:-5590}"
 INDEXER_PORT="${INDEXER_PORT:-50051}"
 
 CRATE_DIR="/root/wuyl/mori/sglang-kv-indexer"
@@ -77,19 +80,20 @@ start_indexer() {
 start_sglang() {
   if _alive sglang; then c_grn "sglang already up (pid $(cat $PID_DIR/sglang.pid))"; return; fi
   local kv="{\"publisher\":\"zmq\",\"endpoint\":\"tcp://*:$PUB_PORT\",\"replay_endpoint\":\"tcp://*:$REPLAY_PORT\",\"buffer_steps\":10000}"
-  # plain nohup: launch_server's TP/detokenizer workers are children of this pid,
+  local dp_arg=""; [ "$DP_SIZE" -gt 1 ] && dp_arg="--dp-size $DP_SIZE"
+  # plain nohup: launch_server's TP/DP/detokenizer workers are children of this pid,
   # so _stop's process-tree walk reaps them without relying on process groups
   ( cd "$SGLANG_DIR" && HIP_VISIBLE_DEVICES="$GPU" \
     nohup python3 -m sglang.launch_server \
       --model-path "$MODEL" \
       --host 127.0.0.1 --port "$SGLANG_PORT" \
-      --tp-size "$TP" \
+      --tp-size "$TP" $dp_arg \
       --mem-fraction-static "$MEM_FRACTION" --page-size "$PAGE_SIZE" \
       --enable-hierarchical-cache \
       --kv-events-config "$kv" \
       $EXTRA_ARGS \
       >"$LOG_DIR/sglang.log" 2>&1 & echo $! > "$PID_DIR/sglang.pid" )
-  c_grn "sglang starting (pid $(cat $PID_DIR/sglang.pid)) GPU=$GPU TP=$TP  log:$LOG_DIR/sglang.log"
+  c_grn "sglang starting (pid $(cat $PID_DIR/sglang.pid)) GPU=$GPU TP=$TP DP=$DP_SIZE  log:$LOG_DIR/sglang.log"
   printf "waiting for sglang ready"
   for _ in $(seq 1 "$READY_ITERS"); do
     if grep -q "The server is fired up" "$LOG_DIR/sglang.log" 2>/dev/null; then
@@ -103,16 +107,23 @@ start_sglang() {
 }
 
 start_bridge() {
-  if _alive bridge; then c_grn "bridge already up (pid $(cat $PID_DIR/bridge.pid))"; return; fi
-  RUST_LOG="${RUST_LOG:-info}" \
-  KV_INDEXER_WORKER_ID="worker-0" \
-  SGLANG_KV_EVENT_ENDPOINT="tcp://127.0.0.1:$PUB_PORT" \
-  SGLANG_KV_EVENT_REPLAY_ENDPOINT="tcp://127.0.0.1:$REPLAY_PORT" \
-  SGLANG_KV_EVENT_TOPIC="" \
-  KV_INDEXER_ENDPOINT="http://127.0.0.1:$INDEXER_PORT" \
-    nohup "$BIN_BRIDGE" >"$LOG_DIR/bridge.log" 2>&1 &
-  echo $! > "$PID_DIR/bridge.pid"
-  c_grn "bridge up (pid $!) SUB:$PUB_PORT -> indexer:$INDEXER_PORT  log:$LOG_DIR/bridge.log"
+  # one bridge per dp-rank: rank r subscribes PUB_PORT+r / REPLAY_PORT+r (matching
+  # sglang's per-rank port offset) and forwards to the single shared indexer.
+  local rank name pub replay
+  for rank in $(seq 0 $((DP_SIZE - 1))); do
+    name="bridge-$rank"
+    if _alive "$name"; then c_grn "$name already up (pid $(cat $PID_DIR/$name.pid))"; continue; fi
+    pub=$((PUB_PORT + rank)); replay=$((REPLAY_PORT + rank))
+    RUST_LOG="${RUST_LOG:-info}" \
+    KV_INDEXER_WORKER_ID="worker-$rank" \
+    SGLANG_KV_EVENT_ENDPOINT="tcp://127.0.0.1:$pub" \
+    SGLANG_KV_EVENT_REPLAY_ENDPOINT="tcp://127.0.0.1:$replay" \
+    SGLANG_KV_EVENT_TOPIC="" \
+    KV_INDEXER_ENDPOINT="http://127.0.0.1:$INDEXER_PORT" \
+      nohup "$BIN_BRIDGE" >"$LOG_DIR/$name.log" 2>&1 &
+    echo $! > "$PID_DIR/$name.pid"
+    c_grn "$name up (pid $!) SUB:$pub replay:$replay -> indexer:$INDEXER_PORT  log:$LOG_DIR/$name.log"
+  done
 }
 
 # ---------------- subcommands ----------------
@@ -125,6 +136,11 @@ cmd_up() {
 }
 
 cmd_down() {
+  # stop every bridge instance we may have started (any DP_SIZE) + legacy name
+  local pf name
+  for pf in "$PID_DIR"/bridge-*.pid; do
+    [ -e "$pf" ] || continue; name=$(basename "$pf" .pid); _stop "$name"
+  done
   _stop bridge
   _stop sglang
   _stop indexer
@@ -132,7 +148,12 @@ cmd_down() {
 }
 
 cmd_status() {
-  for n in indexer sglang bridge; do
+  local pf names="indexer sglang"
+  for pf in "$PID_DIR"/bridge-*.pid; do
+    [ -e "$pf" ] || continue; names="$names $(basename "$pf" .pid)"
+  done
+  [ -e "$PID_DIR/bridge.pid" ] && names="$names bridge"
+  for n in $names; do
     if _alive "$n"; then c_grn "$n: UP (pid $(cat $PID_DIR/$n.pid))"; else c_red "$n: down"; fi
   done
   echo "ports:"; (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) \
@@ -142,7 +163,7 @@ cmd_status() {
 cmd_logs() {
   trap 'kill 0' EXIT INT TERM
   tail -n 5 -F "$LOG_DIR/indexer.log" 2>/dev/null | sed -u 's/^/\x1b[36m[IDX]\x1b[0m /' &
-  tail -n 5 -F "$LOG_DIR/bridge.log"  2>/dev/null | sed -u 's/^/\x1b[35m[BRG]\x1b[0m /' &
+  tail -n 5 -F "$LOG_DIR"/bridge*.log 2>/dev/null | sed -u 's/^/\x1b[35m[BRG]\x1b[0m /' &
   tail -n 5 -F "$LOG_DIR/sglang.log"  2>/dev/null | sed -u 's/^/\x1b[90m[SGL]\x1b[0m /' &
   wait
 }
@@ -159,7 +180,8 @@ cmd_test() {
 }
 
 cmd_replay_test() {
-  c_yel "[replay-test] stopping bridge to create a sequence gap..."
+  c_yel "[replay-test] stopping bridge(s) to create a sequence gap..."
+  local rank; for rank in $(seq 0 $((DP_SIZE - 1))); do _stop "bridge-$rank"; done
   _stop bridge
   c_yel "[replay-test] sending traffic while bridge is down..."
   cmd_test "${1:-4}" >/dev/null
@@ -195,11 +217,16 @@ lab.sh - SGLang <-> KV-indexer 联调一键控制脚本
   docker exec kv-indexer-lab2 $CRATE_DIR/lab.sh up
 
 可用环境变量覆盖默认配置:
-  GPU=$GPU  TP=$TP  MODEL=$MODEL
+  GPU=$GPU  TP=$TP  DP_SIZE=$DP_SIZE  MODEL=$MODEL
   MEM_FRACTION=$MEM_FRACTION  PAGE_SIZE=$PAGE_SIZE  READY_ITERS=$READY_ITERS
   EXTRA_ARGS=... (透传额外 sglang 参数,如投机解码/FP8 选项)
   SGLANG_PORT=$SGLANG_PORT  PUB_PORT=$PUB_PORT  REPLAY_PORT=$REPLAY_PORT  INDEXER_PORT=$INDEXER_PORT
   RUST_LOG=info|debug   (bridge/indexer 日志级别; debug 可看每批转发明细)
+
+多 worker 示例 (2 个 DP 副本, 各占 1 卡, 各起一个 bridge):
+  GPU=0,1 TP=1 DP_SIZE=2 ./lab.sh up
+  # sglang rank0 PUB=$PUB_PORT replay=$REPLAY_PORT; rank1 PUB=+1 replay=+1
+  # bridge-0 -> worker-0, bridge-1 -> worker-1, 共享同一 indexer
 
 多卡示例 (DeepSeek-V4, 8 卡 TP + 更长就绪等待):
   GPU=0,1,2,3,4,5,6,7 TP=8 MODEL=/path/to/DeepSeek-V4-Flash-FP8 \\
