@@ -448,7 +448,6 @@ class InterNodeRingAllgather:
         count: int,
         stream=None,
         chunk_in_place: bool = False,
-        out_in_place: bool = False,
         stream_ring: bool = False,
         defer_inter_fin: bool = False,
     ) -> bool:
@@ -475,25 +474,16 @@ class InterNodeRingAllgather:
         _get_ccl_func("InterNodeRingAllGatherKernel_u32").launch_struct(
             (self.num_blocks,), (512,), 0, s, args
         )
-        if out_in_place:
-            # Leave the gathered result in the ring buffer (read it via
-            # ``full_tensor``) and skip the finish_sync copy-OUT. ``output_data``
-            # is ignored in this mode.
-            if stream_ring:
-                self._handle.finish_stream_no_copy(s)
-            else:
-                self._handle.finish_sync_no_copy(s)
+        if stream_ring:
+            # defer_inter_fin defers the ring-reuse fence to the next op's
+            # prepare_stream barrier -- the copy-OUT stays stream-ordered so
+            # the collection is correct; only cross-PE ring reuse needs the
+            # fence, which the successor op provides.
+            self._cu_finish_copyout(
+                output_data, u32_count, s, barrier=not defer_inter_fin
+            )
         else:
-            if stream_ring:
-                # defer_inter_fin defers the ring-reuse fence to the next op's
-                # prepare_stream barrier -- the copy-OUT stays stream-ordered so
-                # the collection is correct; only cross-PE ring reuse needs the
-                # fence, which the successor op provides.
-                self._cu_finish_copyout(
-                    output_data, u32_count, s, barrier=not defer_inter_fin
-                )
-            else:
-                self._handle.finish_sync(output_data.data_ptr(), u32_count, s)
+            self._handle.finish_sync(output_data.data_ptr(), u32_count, s)
         return True
 
     def _cu_finish_copyout(
@@ -584,11 +574,10 @@ class InterNodeRingAllgather:
     def full_tensor(self, count: int, dtype, device=None):
         """Torch view of the FULL ring buffer (``ring_size * count`` elements).
 
-        After ``__call__(..., out_in_place=True)`` the ring buffer holds the
-        ``ring_size`` gathered chunks in ring order -- the full rank-major
-        result for this sub-group. Reading from here avoids the finish_sync
-        copy-OUT. ``count`` is the per-chunk element count (of ``dtype``);
-        ``count*element_size`` must be a multiple of 4 (the u32 lane size).
+        The ring buffer holds the ``ring_size`` gathered chunks in ring order --
+        the full rank-major result for this sub-group. ``count`` is the per-chunk
+        element count (of ``dtype``); ``count*element_size`` must be a multiple of
+        4 (the u32 lane size).
         """
         byte_count = count * torch.tensor([], dtype=dtype).element_size()
         u32_count = (byte_count + 3) // 4
