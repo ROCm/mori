@@ -72,29 +72,17 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
 inline __device__ void SdmaPutCopyRemoteAddThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                                   anvil::SdmaQueueDeviceHandle** deviceHandles,
                                                   uint32_t qId, void* peerCounterAddr) {
-  // A single COPY_LINEAR over ~8 MiB faults on CDNA3 SDMA microcode, so split
-  // into <=8 MiB contiguous sub-descriptors + one trailing ADD64. Hard copy-size
-  // cap, not latency pipelining.
-  const size_t kMaxCopy = 8u * 1024u * 1024u;  // max single COPY_LINEAR byte count
-  size_t nCopy = (copy_size + kMaxCopy - 1) / kMaxCopy;
-  if (nCopy < 1) nCopy = 1;
+  // Single COPY_LINEAR + one trailing ADD64 in one doorbell.
   uint64_t offset = 0;
   anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
   uint64_t base = handle.ReserveQueueSpace(
-      nCopy * sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC), offset);
+      sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC), offset);
   uint64_t startBase = base;
   uint64_t pendingWptr = base;
   char* srcC = reinterpret_cast<char*>(srcBuf);
   char* dstC = reinterpret_cast<char*>(dstBuf);
-  uint64_t placeOffset = offset;
-  for (size_t i = 0; i < nCopy; ++i) {
-    size_t o = i * kMaxCopy;
-    size_t len = copy_size - o;
-    if (len > kMaxCopy) len = kMaxCopy;
-    auto copy_packet = anvil::CreateCopyPacket(srcC + o, dstC + o, len);
-    handle.template placePacket<SDMA_PKT_COPY_LINEAR>(copy_packet, pendingWptr, placeOffset);
-    placeOffset = 0;  // wrap padding applies only to the first placement
-  }
+  auto copy_packet = anvil::CreateCopyPacket(srcC, dstC, copy_size);
+  handle.template placePacket<SDMA_PKT_COPY_LINEAR>(copy_packet, pendingWptr, offset);
   // ADD64(+1) targeting the REMOTE peer tail counter (+1 per drained step).
   auto add_packet = anvil::CreateAtomicIncPacket(reinterpret_cast<HSAuint64*>(peerCounterAddr));
   handle.template placePacket<SDMA_PKT_ATOMIC>(add_packet, pendingWptr, 0);
