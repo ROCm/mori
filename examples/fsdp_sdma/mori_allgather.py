@@ -34,7 +34,6 @@ keeps the rank-major copy-out there.
 
 import importlib
 import os
-import time as _time
 from collections.abc import Sequence
 from typing import Any
 
@@ -42,169 +41,6 @@ import torch
 import torch.distributed as dist
 
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
-
-
-# --- lightweight per-call size histogram (MORI_FSDP_AG_PROFILE=1) ---------
-# No CUDA sync -> zero perturbation; sizes are model-determined so they are
-# identical for the native and SDMA runs. Buckets by log2(per-rank bytes) to see
-# which size regime FSDP's all-gathers land in.
-_AG_PROFILE = os.environ.get("MORI_FSDP_AG_PROFILE", "") not in (
-    "",
-    "0",
-    "false",
-    "False",
-)
-_ag_hist: dict[int, int] = {}
-
-# --- per-step deferred-host-sync fence timeline (MORI_FSDP_TAIL_PROFILE=1) ----
-# Diagnostic: attribute tail-step latency to the deferred device-path host
-# landing fence (_DeviceDeferredHostSyncWork.wait -> stream.synchronize), which
-# blocks the host at each layer's copy-out until the fused fill has landed.
-# Accumulate per-call fence wait + count; bench.py reads + resets the
-# accumulator each measured step to correlate with wall-time.
-_TAIL_PROFILE = os.environ.get("MORI_FSDP_TAIL_PROFILE", "") not in (
-    "",
-    "0",
-    "false",
-    "False",
-)
-TAIL_PROF = {"fence_wait_s": 0.0, "fence_count": 0}
-_ag_calls = 0
-
-
-def _ag_profile_record(nbytes: int) -> None:
-    global _ag_calls
-    _ag_calls += 1
-    b = nbytes.bit_length() - 1 if nbytes > 0 else 0  # floor(log2)
-    _ag_hist[b] = _ag_hist.get(b, 0) + 1
-    if _ag_calls % 100 == 0:
-        _ag_profile_dump()
-
-
-def _ag_profile_dump() -> None:
-    import sys
-
-    total = sum(_ag_hist.values())
-    lines = [f"AGHIST calls={total}"]
-    for b in sorted(_ag_hist):
-        lo = 1 << b
-        lines.append(f"  [{lo/1e6:8.3f}MB..{2*lo/1e6:8.3f}MB) : {_ag_hist[b]:5d}")
-    sys.stderr.write("\n".join(lines) + "\n")
-    sys.stderr.flush()
-
-
-# --- in-situ per-layer AG-output bit-exact verify (MORI_FSDP_AG_VERIFY=1) --
-# Diagnostic: runs inside a real 2-node step. Right after the mori copy-out AG
-# fills the rank-major output, it snapshots that output at the earliest stream
-# point (output.clone() enqueued immediately after the AG), computes the native
-# truth (all_gather_into_tensor of the same input), and counts bit-exact
-# mismatches. Nonzero in-situ mismatches point to a completion-ordering exposure
-# (reshard buffer reuse / tight back-to-back scheduling); zero means any drift is
-# downstream of the AG (reduce/accum). One host sync per dump.
-_AG_VERIFY = os.environ.get("MORI_FSDP_AG_VERIFY", "") not in (
-    "",
-    "0",
-    "false",
-    "False",
-)
-_verify_calls = 0
-_verify_mismatch_calls = 0
-_verify_total_mismatch_elems = 0
-_verify_max_abs_diff = 0.0
-_verify_first_bad = None  # (call_idx, per_rank_numel, mismatch_elems, max_abs)
-_verify_pending: list = []  # (snap, ref, call_idx, per_rank_numel, out_ptr)
-_verify_ptr_prev: int = 0  # data_ptr of the immediately-preceding AG output
-_verify_recycle_calls = 0  # #calls whose output reuses the prior call's addr
-_verify_recycle_bad = 0  # #of those recycling calls that ALSO mismatched
-
-
-def _ag_verify_flush() -> None:
-    global _verify_mismatch_calls, _verify_total_mismatch_elems
-    global _verify_max_abs_diff, _verify_first_bad
-    global _verify_ptr_prev, _verify_recycle_calls, _verify_recycle_bad
-    if not _verify_pending:
-        return
-    import torch
-
-    torch.cuda.synchronize()
-    for snap, ref, idx, prn, out_ptr in _verify_pending:
-        recycled = out_ptr != 0 and out_ptr == _verify_ptr_prev
-        if recycled:
-            _verify_recycle_calls += 1
-        _verify_ptr_prev = out_ptr
-        ne = torch.ne(snap, ref)
-        n_bad = int(ne.sum().item())
-        if n_bad:
-            d = (snap.to(torch.float32) - ref.to(torch.float32)).abs()
-            mx = float(d.max().item())
-            _verify_mismatch_calls += 1
-            _verify_total_mismatch_elems += n_bad
-            if recycled:
-                _verify_recycle_bad += 1
-            if mx > _verify_max_abs_diff:
-                _verify_max_abs_diff = mx
-            if _verify_first_bad is None:
-                _verify_first_bad = (idx, prn, n_bad, mx, hex(out_ptr))
-    _verify_pending.clear()
-
-
-def _ag_verify_dump() -> None:
-    import sys
-
-    _ag_verify_flush()
-    sys.stderr.write(
-        f"AGVERIFY calls={_verify_calls} mismatch_calls={_verify_mismatch_calls} "
-        f"total_mismatch_elems={_verify_total_mismatch_elems} "
-        f"max_abs_diff={_verify_max_abs_diff:.6g} first_bad={_verify_first_bad} "
-        f"recycle_calls={_verify_recycle_calls} recycle_bad={_verify_recycle_bad}\n"
-    )
-    sys.stderr.flush()
-
-
-# --- per-call GPU-time timing (MORI_FSDP_AG_TIMING=1) ----------------------
-# Diagnostic (default OFF): measures effective per-all-gather GPU bandwidth
-# INSIDE the FSDP step, bucketed by log2(out bytes), to separate per-call
-# overlap/exposure from raw all-gather bandwidth. One cuda sync per dump.
-_AG_TIMING = os.environ.get("MORI_FSDP_AG_TIMING", "") not in (
-    "",
-    "0",
-    "false",
-    "False",
-)
-_ag_time_pending: list = []  # (start_event, end_event, out_bytes, bucket)
-_ag_time_acc: dict = {}  # bucket -> [sum_ms, sum_out_bytes, n]
-
-
-def _ag_timing_flush() -> None:
-    import torch
-
-    if not _ag_time_pending:
-        return
-    torch.cuda.synchronize()
-    for s, e, ob, b in _ag_time_pending:
-        ms = s.elapsed_time(e)
-        acc = _ag_time_acc.setdefault(b, [0.0, 0, 0])
-        acc[0] += ms
-        acc[1] += ob
-        acc[2] += 1
-    _ag_time_pending.clear()
-
-
-def _ag_timing_dump() -> None:
-    import sys
-
-    _ag_timing_flush()
-    lines = ["AGTIME (effective per-AG GPU bandwidth = out_bytes/elapsed)"]
-    for b in sorted(_ag_time_acc):
-        sms, sob, n = _ag_time_acc[b]
-        lo = 1 << b
-        gbps = (sob / 1e9) / (sms / 1e3) if sms > 0 else 0.0
-        lines.append(
-            f"  [{lo/1e6:8.3f}MB..{2*lo/1e6:8.3f}MB) out: n={n:5d} "
-            f"avg={sms/max(n,1):7.3f}ms  {gbps:7.1f} GB/s"
-        )
-    sys.stderr.write("\n".join(lines) + "\n")
-    sys.stderr.flush()
 
 
 class _HierWork:
@@ -280,9 +116,6 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
         stream: "torch.cuda.Stream",
         collective=None,
         event=None,
-        ag=None,
-        issue_idx=-1,
-        is_group_fence=False,
     ) -> None:
         super().__init__()
         self._stream = stream
@@ -292,13 +125,6 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
         # FWD-prefetched later AG queued on the same stream). event.synchronize()
         # is still a host fence, so it drains SDMA/RDMA HW completion (bit-exact).
         self._event = event
-        # Fence-group coalescing: back-ref to the MoriAllGather (holds the
-        # shared landing watermark), this AG's monotone issue index, and whether
-        # this call is a designated GROUP-boundary fence (does the full stream.sync
-        # that drains -- and publishes the watermark for -- the whole group).
-        self._ag = ag
-        self._issue_idx = issue_idx
-        self._is_group_fence = is_group_fence
         self._done = False
 
     def wait(self, timeout=None) -> bool:  # noqa: ARG002
@@ -312,47 +138,6 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
             drain = getattr(self._collective, "drain_hostproxy", None)
             if drain is not None:
                 drain()
-            # Fence-group coalescing (only when an ag back-ref + group>1):
-            #   * a NON-boundary member whose issue index the landing watermark
-            #     already covers => its bytes were drained by an earlier full
-            #     stream.sync => SKIP the host fence (no-op) => the coalesced win.
-            #   * otherwise (group boundary, OR not provably covered) => do the
-            #     full stream.synchronize() and PUBLISH the watermark = the highest
-            #     issue index seen so far (everything on ag_stream is now drained).
-            _ag = self._ag
-            if _ag is not None and _ag._fence_group > 1:
-                if not self._is_group_fence and self._issue_idx <= _ag._fence_watermark:
-                    # already landed by a prior boundary drain -> coalesced skip
-                    self._done = True
-                    return True
-                # boundary drain (or uncovered fallback): full stream fence, then
-                # advance the watermark to cover all AGs issued up to now.
-                if _TAIL_PROFILE:
-                    _t0 = _time.perf_counter()
-                    self._stream.synchronize()
-                    TAIL_PROF["fence_wait_s"] += _time.perf_counter() - _t0
-                    TAIL_PROF["fence_count"] += 1
-                else:
-                    self._stream.synchronize()
-                _ag._fence_watermark = _ag._issue_ctr - 1
-                self._done = True
-                return True
-            # MORI_FSDP_DEFER_MODE=stream (opt-in, default OFF): replace the
-            # deferred host fence with a device inter-stream wait so the CPU keeps
-            # running ahead to prefetch the next unshard (like native's device-side
-            # Work.wait) instead of stalling on synchronize. Correctness rests on
-            # the event capturing landing (recorded on ag_stream after the fused
-            # fill kernel, which drains its SDMA/RDMA completions). Default OFF =>
-            # byte-identical (host synchronize below).
-            if (
-                os.environ.get("MORI_FSDP_DEFER_MODE", "") == "stream"
-                and self._event is not None
-            ):
-                torch.cuda.current_stream(torch.cuda.current_device()).wait_event(
-                    self._event
-                )
-                self._done = True
-                return True
             # Per-AG event fence (host-wait on this AG only) if provided,
             # else the full-stream drain.
             _fence = (
@@ -360,13 +145,7 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
                 if self._event is not None
                 else self._stream.synchronize
             )
-            if _TAIL_PROFILE:
-                _t0 = _time.perf_counter()
-                _fence()
-                TAIL_PROF["fence_wait_s"] += _time.perf_counter() - _t0
-                TAIL_PROF["fence_count"] += 1
-            else:
-                _fence()
+            _fence()
             self._done = True
         return True
 
@@ -545,63 +324,6 @@ class MoriAllGather(AllGather):
             "false",
             "False",
         )
-        # MORI_FSDP_FENCE_GROUP=K (default 1=off). Coalescing K per-layer
-        # fully_shard units into one comm group gives K-fold fewer host landing
-        # fences and a K-larger per-AG NIC fill, but the flat-param grouping also
-        # changes the native reduce-scatter message size, shifting the fp reduction
-        # order (the loss no longer matches the reference). To keep the fewer-fences
-        # half of that without the reduce-scatter reorder, keep per-layer
-        # fully_shard (so the reduce-scatter stays per-layer and the loss stays
-        # exact) but coalesce the deferred host landing fences: a full
-        # stream.synchronize() at a group boundary drains every AG already issued on
-        # the ag_stream (forward-prefetch issues L..L+D ahead of consuming L), so
-        # the K-1 subsequent group members already covered by that drain can skip
-        # their own host fence. Correct by construction: a landing watermark (the
-        # highest issue-index drained by the last full stream.sync) gates the skip;
-        # any member not provably covered falls back to its own per-AG event fence.
-        # K=1 => byte-identical. Composes with DEFER_HOSTSYNC + FWD_PREFETCH; keeps
-        # per-layer reduce-scatter.
-        self._fence_group = int(os.environ.get("MORI_FSDP_FENCE_GROUP", "1") or "1")
-        if self._fence_group < 1:
-            self._fence_group = 1
-        # issue counter (incremented per deferred __call__) + landing watermark
-        # (highest issue-index whose HW completion a full stream.sync has drained).
-        self._issue_ctr = 0
-        self._fence_watermark = -1
-        # Targeted completion sync for the large-band all-gathers only
-        # (MORI_FSDP_SYNC_BIG_BYTES). The residual cross-node completion race is at
-        # the ~29M-elem embed/lm_head AG: the inter-node ring's remote RDMA puts
-        # are not globally visible to the copy-out drain by the time the recorded
-        # event fires, but only at that largest size (per-layer AGs are clean).
-        # Host-syncs the caller stream only when per-rank bytes >= threshold, so
-        # just the ~2 offender AGs/step are forced to complete while all calls
-        # still ride SDMA cross-node. 0 = off.
-        self._sync_big_bytes = int(
-            os.environ.get("MORI_FSDP_SYNC_BIG_BYTES", "0") or "0"
-        )
-        # Restrict the big-AG host-sync to only the forward or only the backward
-        # all-gather phase, to localize whether the forward loss-stall and the
-        # backward grad collapse are separable. FSDP's backward re-unshard runs
-        # inside the autograd engine with grad disabled; the forward unshard runs
-        # grad-enabled, so torch.is_grad_enabled() tells the phase apart. Values:
-        # "both" (default), "fwd", "bwd".
-        self._sync_phase = (
-            os.environ.get("MORI_FSDP_SYNC_PHASE", "both").strip().lower()
-        )
-        # Chunking (MORI_FSDP_CHUNK_BIG_BYTES). The cross-node completion race and
-        # the sync cost localize to a single giant all-gather (the tied
-        # embed/lm_head, per-rank size in (40,80]MB); per-layer AGs (<40MB
-        # per-rank) are race-free. Splitting that one giant AG into K sub-all-gathers,
-        # each landing in the race-free per-layer band, avoids the timing race
-        # without any host drain -- bit-exact. Each sub-AG is a copy-out into a temp
-        # rank-major buffer, then a strided 2D scatter into the user output
-        # (out[:, j*c:(j+1)*c] = tmp[:, :]). Only the big AG is chunked; small AGs
-        # take the normal single-call path (chunk_bytes=0 disables entirely).
-        self._chunk_big_bytes = int(
-            os.environ.get("MORI_FSDP_CHUNK_BIG_BYTES", "0") or "0"
-        )
-        self._chunk_k = int(os.environ.get("MORI_FSDP_CHUNK_K", "4") or "4")
-        self._chunk_tmp: torch.Tensor | None = None
 
     def allocate(
         self,
@@ -792,8 +514,6 @@ class MoriAllGather(AllGather):
         self._validate(output_tensor, input_tensor, group)
         count = input_tensor.numel()
         per_rank_bytes = count * input_tensor.element_size()
-        if _AG_PROFILE:
-            _ag_profile_record(per_rank_bytes)
         collective = self._get_collective(group, per_rank_bytes)
         device = input_tensor.device
         stream = torch.cuda.current_stream(device)
@@ -834,10 +554,6 @@ class MoriAllGather(AllGather):
             collective._pending = work
             return work
 
-        _t_start = None
-        if _AG_TIMING:
-            _t_start = torch.cuda.Event(enable_timing=True)
-            _t_start.record(stream)
         if self._can_call_param_contiguous(input_tensor):
             ok = collective.enqueue_param_contiguous(
                 input_tensor,
@@ -855,115 +571,22 @@ class MoriAllGather(AllGather):
                     "MORI HierAllGather param-contiguous path unavailable "
                     "(slice_direct/RDMA required); refusing rank-major fallback"
                 )
-        elif (
-            self._chunk_big_bytes
-            and per_rank_bytes >= self._chunk_big_bytes
-            and self._chunk_k >= 2
-            and count % (self._chunk_k * max(1, 4 // input_tensor.element_size())) == 0
-        ):
-            # Chunked copy-out: split the one giant AG into K sub-AGs each in the
-            # race-free size band, then strided-scatter into the user output.
-            # Mathematically identical to a single rank-major AG (each sub-AG is
-            # bit-exact; the scatter is exact) but each transfer is small enough
-            # to physically land before the consumer reads -> no host sync needed.
-            world = group.size()
-            K = self._chunk_k
-            c = count // K
-            csz = c * input_tensor.element_size()
-            sub = self._get_collective(group, max(csz, self._cap_bytes))
-            need = world * c
-            if (
-                self._chunk_tmp is None
-                or self._chunk_tmp.dtype != input_tensor.dtype
-                or self._chunk_tmp.device != input_tensor.device
-                or self._chunk_tmp.numel() < need
-            ):
-                self._chunk_tmp = torch.empty(
-                    need, dtype=input_tensor.dtype, device=input_tensor.device
-                )
-            out2d = output_tensor.view(world, count)
-            for j in range(K):
-                o = j * c
-                in_sub = input_tensor.narrow(0, o, c)
-                tmp = self._chunk_tmp.narrow(0, 0, need)
-                ok = sub(in_sub, tmp, c, stream=stream)
-                if not ok:
-                    raise RuntimeError("MORI HierAllGather chunk call failed")
-                out2d[:, o : o + c].copy_(tmp.view(world, c))
         else:
             ok = collective(input_tensor, output_tensor, count, stream=stream)
             if not ok:
                 raise RuntimeError("MORI HierAllGather call failed")
-            if _AG_VERIFY:
-                global _verify_calls
-                _verify_calls += 1
-                # Snapshot the mori output at the earliest stream point (right
-                # after the AG kernel) to capture any early-completion stale bytes
-                # before a later op masks them.
-                snap = output_tensor.clone()
-                ref = torch.empty_like(output_tensor)
-                work = dist.all_gather_into_tensor(
-                    ref, input_tensor, group=group, async_op=True
-                )
-                work.wait()  # current stream waits on the native truth
-                _verify_pending.append(
-                    (snap, ref.clone(), _verify_calls, count, output_tensor.data_ptr())
-                )
-                if len(_verify_pending) >= 64:
-                    _ag_verify_dump()
-        if _AG_TIMING and _t_start is not None:
-            _t_end = torch.cuda.Event(enable_timing=True)
-            _t_end.record(stream)
-            ob = output_tensor.numel() * output_tensor.element_size()
-            b = ob.bit_length() - 1 if ob > 0 else 0
-            _ag_time_pending.append((_t_start, _t_end, ob, b))
-            if len(_ag_time_pending) >= 50:
-                _ag_timing_dump()
         # Deferred device-path host landing fence: the fused/zero-copy device AG
         # was issued non-blocking above; return a c10d Work whose wait() runs the
         # host stream.synchronize() at copy-out so the reliable landing fence
-        # overlaps the caller's backward GEMM on the fast fused fill. Skips the
-        # inline _sync_big_bytes host stall.
+        # overlaps the caller's backward GEMM on the fast fused fill.
         if self._defer_hostsync:
-            # Only the big embed/lm_head AGs race on this HW; small
-            # per-layer AGs are fenced sufficiently by the fused kernel's
-            # on-stream completion + FSDP's own recorded event. A host sync on
-            # EVERY small AG is wasted host stall. When MORI_FSDP_SYNC_BIG_BYTES
-            # is set, defer the host fence ONLY on big AGs; small AGs return None
-            # (device-event path) so they overlap freely. Threshold 0 = fence all.
-            if not self._sync_big_bytes or per_rank_bytes >= self._sync_big_bytes:
-                _ev = None
-                if self._event_fence:
-                    # Record L's completion on the ag_stream NOW (before any
-                    # later prefetched AG is queued) so wait() drains only L.
-                    _ev = torch.cuda.Event()
-                    _ev.record(stream)
-                # Assign a monotone issue index; every K-th AG is a group
-                # fence boundary (does the full drain + advances the watermark).
-                _idx = self._issue_ctr
-                self._issue_ctr += 1
-                _grp_fence = (self._fence_group <= 1) or (_idx % self._fence_group == 0)
-                return _DeviceDeferredHostSyncWork(
-                    stream,
-                    collective,
-                    _ev,
-                    ag=self,
-                    issue_idx=_idx,
-                    is_group_fence=_grp_fence,
-                )
-            return None
-        # Targeted large-band completion sync (see __init__): force the biggest
-        # cross-node AGs (the localized race band) to fully land before returning,
-        # so a consumer/next-op cannot read stale remote-half bytes. Only ~2
-        # calls/step exceed the threshold, so perf impact is small.
-        if self._sync_big_bytes and per_rank_bytes >= self._sync_big_bytes:
-            _phase_ok = True
-            if self._sync_phase == "fwd":
-                _phase_ok = torch.is_grad_enabled()
-            elif self._sync_phase == "bwd":
-                _phase_ok = not torch.is_grad_enabled()
-            if _phase_ok:
-                stream.synchronize()
+            _ev = None
+            if self._event_fence:
+                # Record L's completion on the ag_stream NOW (before any
+                # later prefetched AG is queued) so wait() drains only L.
+                _ev = torch.cuda.Event()
+                _ev.record(stream)
+            return _DeviceDeferredHostSyncWork(stream, collective, _ev)
         if async_op:
             event = torch.cuda.Event()
             event.record(stream)
@@ -1142,54 +765,6 @@ class MoriIntraSubGroupAllGather(AllGather):
             event = torch.cuda.Event()
             event.record(stream)
             return _HierWork(event, device)
-        return None
-
-
-class TimedDefaultAllGather(AllGather):
-    """Diagnostic backend: performs the all-gather with torch's default (native)
-    collective (``all_gather_into_tensor``) but brackets it with the SAME
-    cuda-event per-call timer used by ``MoriAllGather`` (MORI_FSDP_AG_TIMING).
-
-    Purpose: measure native's per-AG GPU time under the identical FSDP
-    overlap/prefetch schedule, apples-to-apples with the mori per-AG numbers. If
-    native per-AG ~= mori per-AG -> both hidden behind compute (gap is step
-    scheduling); if native per-AG is much smaller -> mori's AG is exposed under
-    FSDP.
-    """
-
-    def allocate(self, size, *, dtype, device):
-        numel = 1
-        for d in size:
-            numel *= int(d)
-        return torch.empty(numel, dtype=dtype, device=device)
-
-    def __call__(self, output_tensor, input_tensor, group, async_op=False):
-        device = input_tensor.device
-        stream = torch.cuda.current_stream(device)
-        _t_start = None
-        if _AG_TIMING:
-            _t_start = torch.cuda.Event(enable_timing=True)
-            _t_start.record(stream)
-        work = dist.all_gather_into_tensor(
-            output_tensor, input_tensor, group=group, async_op=True
-        )
-        if _AG_TIMING and _t_start is not None:
-            # native runs on the PG's own stream; make the current stream wait on
-            # the collective before recording the end event, so the [start,end]
-            # interval on `stream` actually brackets the AG completion (as the
-            # current stream perceives it) -- apples-to-apples exposure vs mori.
-            work.wait()
-            _t_end = torch.cuda.Event(enable_timing=True)
-            _t_end.record(stream)
-            ob = output_tensor.numel() * output_tensor.element_size()
-            b = ob.bit_length() - 1 if ob > 0 else 0
-            _ag_time_pending.append((_t_start, _t_end, ob, b))
-            if len(_ag_time_pending) >= 50:
-                _ag_timing_dump()
-            return None
-        if async_op:
-            return work
-        work.wait()
         return None
 
 

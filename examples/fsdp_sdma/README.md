@@ -90,25 +90,22 @@ throughput beats the framework default. Three mori variants (intra × inter leg)
 ![E2E loss](bench/results/mi300x_mlx5/e2e_all_w16_loss.png)
 ![E2E throughput](bench/results/mi300x_mlx5/e2e_all_w16_tflops.png)
 
-## Default path vs experimental knobs
+## Default path
 
-The **default path** — what every FSDP/E2E caller gets with no
-`MORI_HIER_*` env set — is:
+The **default path** — what every FSDP/E2E caller gets with no `MORI_HIER_*`
+env set — is:
 
-- **Sliced 2-D AllGather** (`MORI_HIER_SLICE=1`, the default): inter-node RDMA
-  ring over same-local-index peers exchanging one shard/NIC, then N intra-node
-  SDMA reassembly gathers. This is the bit-exact bandwidth path.
-- **Fused Phase-B** (`MORI_HIER_SLICE_FUSED=1`) + **stream-ordered** ring/intra
-  barriers (`MORI_HIER_STREAM_RING=1`, `MORI_HIER_STREAM_INTRA=1`) with deferred
-  finish fences (`MORI_HIER_SLICE_DEFER_FIN`/`_INTER_FIN=1`).
-- **Serial `slice_direct` gather** (fused `ring || local-gather` kernel
-  `MORI_HIER_FUSE_LOCAL` is **OFF** by default — see below), CU-domain copy-out
-  (`MORI_HIER_PY_CU_COPYOUT=1`).
-- At `ranks_per_node >= 8` (the w16 config) the two cross-PE finish
-  fences are forced ON for bit-exactness (`_apply_dense_node_defaults`).
+- **Sliced 2-D AllGather**: inter-node RDMA ring over same-local-index peers
+  exchanging one shard/NIC, then N intra-node SDMA reassembly gathers. The
+  bit-exact bandwidth path.
+- **Fused Phase-B** with stream-ordered ring/intra barriers and deferred finish
+  fences.
+- **Serial `slice_direct` gather** (the fused `ring || local-gather` kernel is
+  OFF by default), CU-domain copy-out.
+- At `ranks_per_node >= 8` (the w16 config) the two cross-PE finish fences are
+  forced ON for bit-exactness.
 
-The default does **not** require setting any env var; the flags above document
-the internal defaults, not a required incantation.
+No env var is required; the above is the internal default, not an incantation.
 
 ### Experimental / unstable knobs (OFF by default — do not enable in production)
 
@@ -119,14 +116,12 @@ bit-exact path:
 | flag | status | why OFF by default |
 |---|---|---|
 | `MORI_HIER_FUSE_LOCAL` | **experimental / unstable** | fused ring‖local-gather kernel produces stale remote-half output under FSDP tight back-to-back overlap; standalone-only. Opt in via `standalone_fast=True` or the env for standalone runs. |
-| `MORI_HIER_PC_OVERLAP` (`SLICE_PIPE_OVERLAP`) | experimental | chunked inter/intra pipeline overlap; per-chunk landing fence is fabric-sensitive. Only auto-composed in `deferbwd` mode. |
 | `MORI_HIER_DEBUG_SYNC` | **diagnostic** | forces a full host `stream.synchronize()` per op (isolation probe); kills all overlap. |
 | `MORI_FSDP_NO_ZERO_COPY` | experimental | disables the zero-copy output path. |
-| `MORI_FSDP_DEFER_HOSTSYNC` | experimental | harness-side deferred backward host-drain; in-tree counterpart is `MORI_HIER_SYNC_BIG_MODE=deferbwd`. |
+| `MORI_FSDP_DEFER_HOSTSYNC` | experimental | harness-side deferred backward host-drain. |
 | `MORI_HOSTPROXY_ASYNC` / `_DRAIN` / `_RING` | experimental | async host-proxy inter-node paths; not the shipped device (`ibgda_sdma`) path. |
 
-Env overrides always win, so any of the defaults above can be flipped
-(e.g. `MORI_HIER_SLICE=0` restores the pre-slice baseline).
+Env overrides always win, so any of the defaults above can be flipped.
 
 ## Second platform (MI355X + AINIC / ionic)
 

@@ -88,14 +88,8 @@ enum class HeapType {
 };
 
 struct VMMChunkKey {
-  uint32_t key;         // RDMA lkey or rkey (primary rail / rail-1)
+  uint32_t key;         // RDMA lkey or rkey
   uintptr_t next_addr;  // Address of next chunk boundary (for calculating chunk_size)
-  // Dual-rail: when the VMM chunk is also registered on a second (idle) NIC,
-  // key2 carries that MR's lkey/rkey. VmmQueryLocalKey/VmmQueryRemoteAddr return
-  // key2 for QP ids on rail 2 (useRail2). Default 0 => single-rail, never read.
-  // A rail-2 QP must use its own MR's key; using rail-1's key faults with a
-  // protection error.
-  uint32_t key2{0};
 
   VMMChunkKey() : key(0), next_addr(0) {}
   VMMChunkKey(uint32_t k, uintptr_t addr) : key(k), next_addr(addr) {}
@@ -109,14 +103,6 @@ struct SymmMemObj {
   // For Rdma
   uint32_t lkey{0};
   uint32_t* peerRkeys{nullptr};
-  // Dual-rail (idle-NIC fan-out): when this symmetric buffer is ALSO registered
-  // on a second RDMA device (an otherwise-idle NIC), lkey2/peerRkeys2 carry that
-  // second MR's local/remote keys. The device put selects these for QP ids that
-  // live on rail 2 (see ShmemPutMemNbiThreadKernelImpl). hasRail2==false (default)
-  // => single-rail, these are never read and the byte path is unchanged.
-  bool hasRail2{false};
-  uint32_t lkey2{0};
-  uint32_t* peerRkeys2{nullptr};
 
   // For VMM allocations: chunk key information (nvshmem-style)
   // vmmLkeyInfo[i] contains lkey and next_addr for chunk i

@@ -419,8 +419,6 @@ static void CopyRdmaEndpointsToGpu(ShmemStates* states) {
       shmemEndpoints[i].qpn = hostEndpoints[i].handle.qpn;
       shmemEndpoints[i].wqHandle = hostEndpoints[i].wqHandle;
       shmemEndpoints[i].cqHandle = hostEndpoints[i].cqHandle;
-      // WRITE_WITH_IMM receiver CQ (mirrors cqHandle unless dedicatedRecvCq).
-      shmemEndpoints[i].recvCqHandle = hostEndpoints[i].recvCqHandle;
       shmemEndpoints[i].atomicIbuf = hostEndpoints[i].atomicIbuf;
     }
     HIP_RUNTIME_CHECK(hipMemcpy(gpuStates->rdmaEndpoints, shmemEndpoints.data(),
@@ -593,43 +591,6 @@ void GpuStateInit(ShmemStates* states) {
   states->gpuStates.rank = states->bootStates->rank;
   states->gpuStates.worldSize = states->bootStates->worldSize;
   states->gpuStates.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
-  // Dual-rail: split point at/after which a peer's QPs live on the second NIC.
-  // Context returns numQpPerPe (no rail-2 QP) when dual-rail is off; convert that
-  // to -1 so the device gate (rail2QpStart>=0) stays inert on the single-rail path.
-  {
-    int r2 = states->rdmaStates->commContext->GetRail2QpStart();
-    states->gpuStates.rail2QpStart =
-        (states->rdmaStates->commContext->DualRailEnabled() && r2 < states->gpuStates.numQpPerPe)
-            ? r2
-            : -1;
-  }
-  // Optional fast-path WQE chunk size. When set, a large RDMA put is split into
-  // multiple in-flight WQEs/QP (see GpuStates::putChunkBytes). 0/unset keeps the
-  // single-WQE behavior.
-  {
-    const char* pcb = std::getenv("MORI_RDMA_PUT_CHUNK_BYTES");
-    states->gpuStates.putChunkBytes = (pcb != nullptr) ? std::strtoull(pcb, nullptr, 10) : 0;
-  }
-  // Batched doorbell: ring the mlx5 send doorbell once per multi-WQE put instead
-  // of once per chunk WQE (removes per-WQE MMIO + threadfence_system overhead).
-  // Only meaningful with MORI_RDMA_PUT_CHUNK_BYTES>0. 0/unset = off.
-  {
-    const char* bdb = std::getenv("MORI_RDMA_PUT_BATCH_DB");
-    states->gpuStates.batchPutDoorbell = (bdb != nullptr) && (std::strtoul(bdb, nullptr, 10) != 0);
-  }
-  // Drain-free landing fence: mlx5 strong-ordering fence bit on the fused signal
-  // ATOMIC WQE so it cannot overtake its own preceding large payload WRITE on
-  // RoCE RC (the >=64MB DEEP_PIPE flag-beats-data race). Value is OR'd into
-  // fm_ce_se; 3=STRONG_ORDERING (recommended), 2=FENCE. 0/unset = off =
-  // byte-identical default path. See GpuStates::signalFenceMode.
-  {
-    const char* sf = std::getenv("MORI_HIER_SIGNAL_FENCE");
-    int v = (sf != nullptr) ? std::atoi(sf) : 0;
-    // Encode the raw fence bits (shift into fm_ce_se[7:5]); accept 0..4 as the
-    // fence-mode selector, or a preshifted value. 1..4 => v<<5.
-    if (v >= 1 && v <= 4) v = v << 5;
-    states->gpuStates.signalFenceMode = v;
-  }
   // Copy communication metadata to GPU
   CopyTransportTypesToGpu(states);
   CopyRdmaEndpointsToGpu(states);

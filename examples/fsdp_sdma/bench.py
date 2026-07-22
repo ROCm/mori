@@ -210,33 +210,8 @@ def _apply_fsdp2(
         from mori_allgather import MoriAllGather
 
         ag = MoriAllGather()
-        if os.environ.get("MORI_FSDP_ROOT_ONLY"):
-            model.set_custom_all_gather(ag)
-        else:
-            for m in shards:
-                m.set_custom_all_gather(ag)
-    elif os.environ.get("MORI_FSDP_ENABLE_SDMA"):
-        # NOTE: MoriSdmaAllGather ships in a local PyTorch FSDP overlay, NOT in
-        # upstream torch. This import only resolves if the runtime torch install
-        # provides the ``_mori_sdma_allgather`` module; without that overlay this
-        # branch raises ModuleNotFoundError. Prefer MORI_FSDP_ENABLE_HIER above,
-        # which uses the in-repo mori_allgather.MoriAllGather and needs no overlay.
-        from torch.distributed.fsdp._fully_shard._mori_sdma_allgather import (
-            MoriSdmaAllGather,
-        )
-
-        zc = os.environ.get("MORI_FSDP_ZERO_COPY_OUTPUT", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        ag = MoriSdmaAllGather(zero_copy_output=zc)
-        if os.environ.get("MORI_FSDP_ROOT_ONLY"):
-            model.set_custom_all_gather(ag)
-        else:
-            for m in shards:
-                m.set_custom_all_gather(ag)
+        for m in shards:
+            m.set_custom_all_gather(ag)
 
     # MORI_FSDP_FWD_PREFETCH=D (default OFF): explicit forward-prefetch depth.
     # Issue each decoder layer's AG D layers earlier from the CPU so the CU-free
@@ -262,32 +237,6 @@ def _apply_fsdp2(
             nxt = layers[i + 1 : i + 1 + depth]
             if nxt:
                 layer.set_modules_to_forward_prefetch(nxt)
-
-    # MORI_FSDP_BIG_PREFETCH=1 (default OFF): target the giant embed/lm_head AG,
-    # which dominates the step. Requires MORI_FSDP_SPLIT_ROOT so embed_tokens +
-    # lm_head are their own fully_shard units; then wire the last decoder layer to
-    # forward-prefetch the lm_head group, issuing the giant lm_head AG from the CPU
-    # during the last transformer layer's forward GEMM. Keeps one big AG in flight
-    # at a time (the last-layer decoder AG has landed + resharded before lm_head
-    # runs) so the deferred landing fence stays valid.
-    if os.environ.get("MORI_FSDP_BIG_PREFETCH", "") not in ("", "0", "false", "False"):
-        layers = list(_iter_decoder_layers(model))
-        lm_head = getattr(model, "lm_head", None)
-        if (
-            layers
-            and lm_head is not None
-            and hasattr(lm_head, "set_modules_to_forward_prefetch")
-        ):
-            layers[-1].set_modules_to_forward_prefetch([lm_head])
-        # backward: layers[0] runs last in the backward pass before the root/embed
-        # group is re-gathered -- prefetch the embed group's backward AG into it.
-        embed = getattr(getattr(model, "model", model), "embed_tokens", None)
-        if (
-            layers
-            and embed is not None
-            and hasattr(layers[0], "set_modules_to_backward_prefetch")
-        ):
-            layers[0].set_modules_to_backward_prefetch([embed])
 
 
 def _estimate_training_tflops(
@@ -528,7 +477,6 @@ def main() -> None:
             "avg_tflops_per_gpu": avg_tflops / world_size,
             "last_loss": measured_losses[-1] if measured_losses else None,
             "mori_fsdp_enable_sdma": os.environ.get("MORI_FSDP_ENABLE_SDMA"),
-            "mori_fsdp_zero_copy_output": os.environ.get("MORI_FSDP_ZERO_COPY_OUTPUT"),
             "mori_enable_sdma": os.environ.get("MORI_ENABLE_SDMA"),
         }
         print(json.dumps(summary, indent=2, sort_keys=True), flush=True)

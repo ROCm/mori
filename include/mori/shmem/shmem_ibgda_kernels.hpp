@@ -103,25 +103,6 @@ namespace shmem {
     }                                                                       \
   } while (0)
 
-// Drain-free landing fence helper (MORI_HIER_SIGNAL_FENCE, MLX5 only). On RoCE RC
-// a WRITE is not ordered before a following ATOMIC on the same QP, so the fused
-// put-with-signal AMO can reach the receiver's flag slot before its own large
-// payload WRITE lands (>=64MB flag-beats-data race -> stale read). OR the mlx5
-// strong-ordering fence bits into the just-posted atomic WQE's fm_ce_se (ctrl byte
-// 11) so the HCA holds the atomic until all prior WQEs (incl. the payload write)
-// complete. HW fence in place of the send-CQ quiet-drain round-trip. Inert when
-// signalFenceMode==0 (default). atomicPostIdx = the WQE index passed to PostAtomic.
-inline __device__ void MaybeFenceSignalAtomicWqe(core::WorkQueueHandle* wq,
-                                                 uint32_t atomicPostIdx) {
-  int fenceMode = GetGlobalGpuStatesPtr()->signalFenceMode;
-  if (fenceMode == 0) return;
-  uint32_t wqeIdx = atomicPostIdx & (wq->sqWqeNum - 1);
-  uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(wq->sqAddr) +
-                      (static_cast<uintptr_t>(wqeIdx) << core::MORI_MLX5_SEND_WQE_SHIFT);
-  core::Mlx5WqeCtrlSeg* atomicCtrl = reinterpret_cast<core::Mlx5WqeCtrlSeg*>(wqeAddr);
-  atomicCtrl->fm_ce_se |= static_cast<uint8_t>(fenceMode);
-}
-
 // Exclusive prefix sum of per-lane psnCnt over active lanes; warp-wide total via
 // outTotal. Used for bnxt PSN accounting when lanes transfer different sizes.
 inline __device__ uint32_t WarpActivePsnPrefix(uint32_t psnCnt, uint64_t activemask,
@@ -145,7 +126,7 @@ inline __device__ uint32_t WarpActivePsnPrefix(uint32_t psnCnt, uint64_t activem
 /* ---------------------------------------------------------------------------------------------- */
 // Query VMM local key with chunk boundary calculation
 inline __device__ void VmmQueryLocalKey(uintptr_t addr, size_t max_size, uint32_t& out_lkey,
-                                        size_t& out_chunk_size, bool useRail2 = false) {
+                                        size_t& out_chunk_size) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
   uintptr_t heapBase = globalGpuStates->heapBaseAddr;
@@ -155,10 +136,7 @@ inline __device__ void VmmQueryLocalKey(uintptr_t addr, size_t max_size, uint32_
 
   application::VMMChunkKey chunkKey = heapObj->vmmLkeyInfo[chunkIdx];
 
-  // Dual-rail: rail-2 QPs live on the second (idle) NIC whose MR has its
-  // own lkey (chunkKey.key2). Selecting key2 here is what makes rail-2 posts
-  // valid; single-rail (useRail2==false) keeps chunkKey.key byte-identical.
-  out_lkey = useRail2 ? chunkKey.key2 : chunkKey.key;
+  out_lkey = chunkKey.key;
   size_t chunk_remaining = chunkKey.next_addr - addr;
   out_chunk_size = chunk_remaining < max_size ? chunk_remaining : max_size;
   MORI_PRINTF(
@@ -170,7 +148,7 @@ inline __device__ void VmmQueryLocalKey(uintptr_t addr, size_t max_size, uint32_
 // Query VMM remote address and key with chunk boundary calculation
 inline __device__ void VmmQueryRemoteAddr(uintptr_t addr, int pe, size_t max_size,
                                           uintptr_t& out_raddr, uint32_t& out_rkey,
-                                          size_t& out_chunk_size, bool useRail2 = false) {
+                                          size_t& out_chunk_size) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
   uintptr_t heapBase = globalGpuStates->heapBaseAddr;
@@ -182,10 +160,7 @@ inline __device__ void VmmQueryRemoteAddr(uintptr_t addr, int pe, size_t max_siz
 
   application::VMMChunkKey chunkKey = heapObj->vmmRkeyInfo[chunkIdx * heapObj->worldSize + pe];
 
-  // Dual-rail: the remote peer registered this chunk on ITS second NIC
-  // too; key2 is that MR's rkey. rail-2 QPs must present the rail-2 rkey or the
-  // responder rejects the write (RESP_ERR). Single-rail keeps chunkKey.key.
-  out_rkey = useRail2 ? chunkKey.key2 : chunkKey.key;
+  out_rkey = chunkKey.key;
   size_t chunk_remaining = chunkKey.next_addr - addr;
   out_chunk_size = chunk_remaining < max_size ? chunk_remaining : max_size;
   MORI_PRINTF(
@@ -197,7 +172,7 @@ inline __device__ void VmmQueryRemoteAddr(uintptr_t addr, int pe, size_t max_siz
 
 // Lookup VMM remote address and key (for small fixed-size transfers)
 inline __device__ void VmmLookupRemote(uintptr_t addr, int pe, uintptr_t& out_raddr,
-                                       uint32_t& out_rkey, bool useRail2 = false) {
+                                       uint32_t& out_rkey) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
   uintptr_t heapBase = globalGpuStates->heapBaseAddr;
@@ -207,14 +182,8 @@ inline __device__ void VmmLookupRemote(uintptr_t addr, int pe, uintptr_t& out_ra
 
   out_raddr = heapObj->peerPtrs[pe] + offsetFromHeapBase;
 
-  // Dual-rail: a signal/atomic posted on a rail-2 QP over the VMM heap
-  // must present the flag chunk's SECOND-NIC rkey (chunkKey.key2), exactly like
-  // the VMM data write (VmmQueryRemoteAddr). VmmLookupRemote previously always
-  // returned .key (rail-1) => a rail-2 QP posted a rail-1 rkey, which the
-  // responder rejects (REM_ACCESS/RESP_ERR) -> the downstream fault. Select
-  // key2 under useRail2; default false keeps every single-rail callsite byte-identical.
   application::VMMChunkKey chunkKey = heapObj->vmmRkeyInfo[chunkIdx * heapObj->worldSize + pe];
-  out_rkey = useRail2 ? chunkKey.key2 : chunkKey.key;
+  out_rkey = chunkKey.key;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -321,8 +290,8 @@ inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
       const int opcode = core::PollCq<core::ProviderType::PSD>(cqHandle.cqAddr, cqHandle.cqeNum,
                                                                &myCqPos, &wqeCounter);
       if (opcode > 0) {
-        printf("[QUIET-ERR] rank %d dest pe %d qpId %d rail2QpStart %d consIdx %d wcStatus %d\n",
-               globalGpuStates->rank, pe, qpId, globalGpuStates->rail2QpStart, myCqPos, opcode);
+        printf("[QUIET-ERR] rank %d dest pe %d qpId %d consIdx %d wcStatus %d\n",
+               globalGpuStates->rank, pe, qpId, myCqPos, opcode);
         assert(false);
       }
       asm volatile("" ::: "memory");
@@ -531,30 +500,10 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
   uint32_t qpn = ep[epIndex].qpn;
-  // Dual-rail: this QP lives on the SECOND RDMA device iff its local index is at
-  // or beyond rail2QpStart. Its send WQEs must reference the buffer's SECOND MR
-  // (registered on that device): lkey2 locally, peerRkeys2 remotely. The QP handle
-  // (wq/cq/qpn) is already the rail-2 QP; only the keys differ. Inert by default
-  // (rail2QpStart<0 or !hasRail2) so the single-rail byte path is unchanged.
-  const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) &&
-                        globalGpuStates->heapObj->hasRail2 &&
-                        (localQp >= globalGpuStates->rail2QpStart);
 
   bool needsChunking = globalGpuStates->useVMMHeap;
   size_t currentOffset = 0;
   size_t remaining = bytes;
-
-  // Batched doorbell: when MORI_RDMA_PUT_BATCH_DB is set together with
-  // putChunkBytes>0, ring the send doorbell once per flush window instead of once
-  // per chunk WQE (each ring is an MMIO store + 3 __threadfence_system). flushThresh
-  // bounds the un-rung WQEs to <= sqWqeNum/4 so the free-entry backpressure below
-  // always has rung (completable) WQEs to drain -> deadlock-safe regardless of the
-  // chunk count. Gated to the single-active-lane put (the ring/fanOut warp put) so
-  // multi-lane collective posts keep the per-iteration ring.
-  const bool batchDb =
-      globalGpuStates->batchPutDoorbell && !needsChunking && globalGpuStates->putChunkBytes != 0;
-  const uint64_t flushThresh = batchDb ? ((wq->sqWqeNum >> 2) > 0 ? (wq->sqWqeNum >> 2) : 1) : 0;
-  uint64_t unrung = 0;
 
   while (true) {
     // Check if current thread still has data to transfer
@@ -585,31 +534,20 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     if (!needsChunking) {
       // Isolation or Static Heap - direct access
       // Keys are uniform, transfer entire remaining bytes in one shot
-      lkey = useRail2 ? source->lkey2 : source->lkey;
+      lkey = source->lkey;
       srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
       raddr = dest->peerPtrs[pe] + destOffset + currentOffset;
-      // Dual-rail: useRail2 gates on heapObj->hasRail2, but a per-op dest
-      // SymmMemObj sub-object never carries rail-2 arrays => peerRkeys2 is nullptr;
-      // dereferencing it (pe=0 -> address 0x0) faults. Guard the pointer: fall back
-      // to the rail-1 rkey when the object has no rail-2 array.
-      rkey = (useRail2 && dest->peerRkeys2) ? dest->peerRkeys2[pe] : dest->peerRkeys[pe];
-      // Transport in-flight depth: optionally split a large put into multiple WQEs
-      // of at most putChunkBytes so several stay in flight per QP (the WQ free-entry
-      // backpressure below drains as needed). 0 => single WQE. Re-uses the same
-      // multi-iteration post loop the VMM-heap path already exercises.
-      {
-        size_t pcb = globalGpuStates->putChunkBytes;
-        transfer_size = (pcb != 0 && remaining > pcb) ? pcb : remaining;
-      }
+      rkey = dest->peerRkeys[pe];
+      transfer_size = remaining;
     } else {
       // Slow path: VMM Heap - query keys for current chunk
       srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
       size_t src_chunk_size;
-      VmmQueryLocalKey(srcAddr, remaining, lkey, src_chunk_size, useRail2);
+      VmmQueryLocalKey(srcAddr, remaining, lkey, src_chunk_size);
 
       uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset + currentOffset;
       size_t dst_chunk_size;
-      VmmQueryRemoteAddr(dstAddr, pe, remaining, raddr, rkey, dst_chunk_size, useRail2);
+      VmmQueryRemoteAddr(dstAddr, pe, remaining, raddr, rkey, dst_chunk_size);
 
       transfer_size = src_chunk_size < dst_chunk_size ? src_chunk_size : dst_chunk_size;
       // MORI_PRINTF("blockId %d, threadId %d VMM Heap: single transfer,srcAddr: %p, dstAddr: %p,
@@ -692,36 +630,21 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       static_assert(false);
     }
     __threadfence_system();
-    // Batched doorbell: with batchDb, defer the send-doorbell ring across chunk
-    // WQEs -- flush on the last chunk or when the un-rung window
-    // reaches flushThresh (deadlock guard). The WQE is always posted (PostWrite
-    // above) and the SQ bookkeeping (dbTouchIdx / needConsIdx) always advances;
-    // only the dbr-record update + doorbell MMIO are batched. One final
-    // RingDoorbell submits every posted WQE (the NIC reads the dbr producer
-    // index), so the K writes stay in flight per QP for the cost of one doorbell.
-    // Gated to num_active_lanes==1 (the warp/thread put the ring/fanOut uses) so
-    // multi-lane collective posts keep ringNow==true (unchanged per-iter ring).
-    const bool isLastChunk = (remaining <= transfer_size);
-    const bool ringNow =
-        !batchDb || (num_active_lanes != 1) || isLastChunk || (unrung + 1 >= flushThresh);
     if (is_leader) {
       uint64_t db_touched{0};
       do {
         db_touched = __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       } while (db_touched != warp_sq_counter);
 
-      if (ringNow) {
-        core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-        __threadfence_system();
-        core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
-        __threadfence_system();
-      }
+      core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
+      __threadfence_system();
+      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+      __threadfence_system();
 
       __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_AGENT);
     }
-    unrung = ringNow ? 0 : (unrung + 1);
     __threadfence_system();
 
     // Move to next chunk (for VMM heap) or exit loop (for Isolation/Static heap)
@@ -788,270 +711,6 @@ inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::RDM
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemPutMemNbiBlockKernelImpl, dest, destOffset, source,
                                       sourceOffset, bytes, pe, qpId);
-}
-
-// -----------------------------------------------------------------------------
-// WRITE_WITH_IMM send (cross-node ring accuracy fix). Structurally identical to
-// ShmemPutMemNbiThreadKernelImpl's PSD posting path, but posts an
-// RDMA_WRITE_WITH_IMM WQE carrying a 32-bit immediate instead of a plain
-// RDMA_WRITE. On an RC QP the responder makes the payload globally visible
-// before generating the recv-CQE that carries the immediate, so a receiver that
-// waits on the recv-CQ (PollRecvCqImm) can only proceed after the data has
-// physically landed -- with no host stream-drain. This is the transport
-// guarantee that flag/AMO ordering and device-side barriers cannot provide.
-// PSD/ionic only; the immediate value lets the receiver identify which chunk/
-// round the completion belongs to. Nothing calls this yet (send-side wiring);
-// the ring-kernel receiver switch + recv-WQE pre-post land as follow-ups.
-template <core::ProviderType PrvdType>
-inline __device__ void ShmemPutMemImmThreadKernelImpl(const application::SymmMemObjPtr dest,
-                                                      size_t destOffset,
-                                                      const application::SymmMemObjPtr source,
-                                                      size_t sourceOffset, size_t bytes,
-                                                      uint32_t imm, int pe, int qpId) {
-  if constexpr (PrvdType != core::ProviderType::PSD && PrvdType != core::ProviderType::MLX5) {
-    assert(false && "WRITE_WITH_IMM only supported on the PSD/ionic/MLX5 provider");
-    return;
-  } else {
-    if (bytes == 0) return;
-
-    GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-    ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-    int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
-    core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
-    core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-    uint32_t qpn = ep[epIndex].qpn;
-
-    bool needsChunking = globalGpuStates->useVMMHeap;
-    size_t currentOffset = 0;
-    size_t remaining = bytes;
-
-    while (true) {
-      bool has_remaining = (remaining > 0);
-      uint64_t activemask = __ballot(has_remaining);
-      if (activemask == 0) break;
-
-      uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
-      uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
-      bool is_leader{my_logical_lane_id == num_active_lanes - 1};
-      const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
-      if (!has_remaining) continue;
-
-      uint32_t lkey, rkey;
-      uintptr_t srcAddr, raddr;
-      size_t transfer_size;
-      if (!needsChunking) {
-        lkey = source->lkey;
-        srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
-        raddr = dest->peerPtrs[pe] + destOffset + currentOffset;
-        rkey = dest->peerRkeys[pe];
-        size_t pcb = globalGpuStates->putChunkBytes;
-        transfer_size = (pcb != 0 && remaining > pcb) ? pcb : remaining;
-      } else {
-        srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
-        size_t src_chunk_size;
-        VmmQueryLocalKey(srcAddr, remaining, lkey, src_chunk_size);
-        uintptr_t dstAddr =
-            reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset + currentOffset;
-        size_t dst_chunk_size;
-        VmmQueryRemoteAddr(dstAddr, pe, remaining, raddr, rkey, dst_chunk_size);
-        transfer_size = src_chunk_size < dst_chunk_size ? src_chunk_size : dst_chunk_size;
-      }
-
-      uint32_t warp_sq_counter{0}, my_sq_counter{0};
-      if (is_leader) {
-        warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
-                                                 __HIP_MEMORY_SCOPE_AGENT);
-      }
-      warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
-      my_sq_counter = warp_sq_counter + my_logical_lane_id;
-
-      while (true) {
-        uint64_t db_touched =
-            __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-        uint64_t db_done =
-            __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-        uint64_t num_active_sq_entries = db_touched - db_done;
-        uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-        uint64_t num_entries_until_warp_last_entry =
-            warp_sq_counter + num_active_lanes - db_touched;
-        if (num_free_entries > num_entries_until_warp_last_entry) break;
-        ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
-      }
-
-      uint64_t dbr_val =
-          core::PostWriteImm<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
-                                       qpn, srcAddr, lkey, raddr, rkey, imm, transfer_size);
-      __threadfence_system();
-      if (is_leader) {
-        uint64_t db_touched{0};
-        do {
-          db_touched =
-              __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-        } while (db_touched != warp_sq_counter);
-
-        core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-        __threadfence_system();
-        core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
-        __threadfence_system();
-
-        __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-        __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_AGENT);
-      }
-      __threadfence_system();
-
-      currentOffset += transfer_size;
-      remaining -= transfer_size;
-    }
-  }
-}
-
-template <core::ProviderType PrvdType>
-inline __device__ void ShmemPutMemImmWarpKernelImpl(const application::SymmMemObjPtr dest,
-                                                    size_t destOffset,
-                                                    const application::SymmMemObjPtr source,
-                                                    size_t sourceOffset, size_t bytes, uint32_t imm,
-                                                    int pe, int qpId) {
-  int laneId = threadIdx.x & (warpSize - 1);
-  if (laneId == 0) {
-    ShmemPutMemImmThreadKernelImpl<PrvdType>(dest, destOffset, source, sourceOffset, bytes, imm, pe,
-                                             qpId);
-  }
-}
-
-template <>
-inline __device__ void ShmemPutMemImmWarpKernel<application::TransportType::RDMA>(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, uint32_t imm,
-    int pe, int qpId) {
-  DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemPutMemImmWarpKernelImpl, dest, destOffset, source,
-                                      sourceOffset, bytes, imm, pe, qpId);
-}
-
-// -----------------------------------------------------------------------------
-// WRITE_WITH_IMM receiver scaffold. A responder consuming an
-// RDMA_WRITE_WITH_IMM produces a recv-CQE only AFTER the write payload has
-// landed globally, so the receiver must have recv WQEs pre-posted on its RQ.
-// ShmemPostRecvImmThreadKernelImpl posts `count` recv WQEs on the RQ for
-// (pe, qpId) starting at recvPostIdx and rings the RQ doorbell. For a pure
-// WRITE_WITH_IMM the SGL is only used to satisfy the verb; callers may pass a
-// zero-length scratch buffer. Caller owns recvPostIdx (there is no RQ post
-// counter in WorkQueueHandle). PSD/ionic only. Nothing calls this yet.
-template <core::ProviderType PrvdType>
-inline __device__ void ShmemPostRecvImmThreadKernelImpl(uintptr_t laddr, uint64_t lkey,
-                                                        size_t bytes, uint32_t count, int pe,
-                                                        int qpId) {
-  if constexpr (PrvdType != core::ProviderType::PSD && PrvdType != core::ProviderType::MLX5) {
-    assert(false && "WRITE_WITH_IMM recv only supported on the PSD/ionic/MLX5 provider");
-    return;
-  } else {
-    if (count == 0) return;
-    GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-    ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-    int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
-    core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
-    uint32_t qpn = ep[epIndex].qpn;
-
-    // Persist the RQ producer index across kernel launches so recv WQEs advance
-    // monotonically (no dedicated RQ counter existed; a per-launch reset to 0
-    // would drive the RQ doorbell record backwards on the 2nd launch and stall).
-    uint32_t recvPostIdx = wq->rqPostIdx;
-    uint64_t dbrVal = 0;
-    for (uint32_t k = 0; k < count; ++k) {
-      dbrVal = core::PostRecv<PrvdType>(*wq, recvPostIdx + k, /*cqeSignal=*/false, qpn, laddr, lkey,
-                                        bytes);
-    }
-    __threadfence_system();
-    core::UpdateRecvDbrRecord<PrvdType>(wq->rqdbrAddr, recvPostIdx + count);
-    __threadfence_system();
-    // MLX5 arms recv WQEs via the RQ DBR record ONLY (no UAR BlueFlame ring for
-    // the RQ, unlike the ionic/bnxt gpu_db_rq path); ringing here would clobber
-    // the DBR page with Mlx5PostRecv's raw-WQE return. Other providers ring.
-    if constexpr (PrvdType != core::ProviderType::MLX5) {
-      core::RingDoorbell<PrvdType>(wq->rqdbrAddr, dbrVal);
-      __threadfence_system();
-    }
-    wq->rqPostIdx = recvPostIdx + count;
-  }
-}
-
-// Spin-poll the recv CQ for (pe, qpId) until a WRITE_WITH_IMM completion is
-// observed, returning its 32-bit immediate. Observing the CQE proves the peer's
-// payload has landed remotely -- the transport guarantee no device barrier gives.
-// PSD/ionic only. Nothing calls this yet.
-template <core::ProviderType PrvdType>
-inline __device__ uint32_t ShmemPollRecvCqImmThreadKernelImpl(int pe, int qpId) {
-  if constexpr (PrvdType != core::ProviderType::PSD && PrvdType != core::ProviderType::MLX5) {
-    assert(false && "WRITE_WITH_IMM recv only supported on the PSD/ionic/MLX5 provider");
-    return 0;
-  } else {
-    GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-    ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-    int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
-    core::CompletionQueueHandle* rcq = &ep[epIndex].recvCqHandle;
-    uint32_t imm = 0;
-    // Bounded spin + diagnostics: the standalone WRITE_WITH_IMM recv-CQ poll has
-    // historically deadlocked (no CQE ever observed). Spin a bounded number of
-    // times, periodically dumping the consumer index and the RAW first CQE dword
-    // (qid_type_flags, big-endian) at the slot we poll so a run reveals whether a
-    // CQE is ever produced or the color/owner bit never flips -- instead of
-    // hanging forever and burning reaper time. Provider-agnostic (reads only the
-    // handle fields); the poll itself stays provider-specific via PollRecvCqImm.
-    const uint64_t kMaxSpin = (uint64_t)1 << 30;
-    const uint64_t kDumpEvery = (uint64_t)1 << 24;
-    uint64_t spin = 0;
-    while (true) {
-      int rc = core::PollRecvCqImm<PrvdType>(rcq->cqAddr, rcq->cqeNum, &rcq->consIdx, &imm);
-      if (rc == 0) {
-        // One-shot engagement confirmation: prove the WRITE_WITH_IMM recv-CQE
-        // actually fired (spin==0 means it was ready on the first poll). Only the
-        // first consumed CQE per (pe,qpId) prints to avoid flooding.
-        if (rcq->consIdx <= 1) {
-          MORI_PRINTF("[RECV_CQ_OK] pe=%d qpId=%d imm=%u spin=%llu consIdx=%u\n", pe, qpId, imm,
-                      (unsigned long long)spin, rcq->consIdx);
-        }
-        break;
-      }
-      if ((spin & (kDumpEvery - 1)) == 0) {
-        uint32_t cqeIdx = rcq->consIdx & (rcq->cqeNum - 1);
-        volatile uint32_t* slot0 = reinterpret_cast<volatile uint32_t*>(
-            reinterpret_cast<char*>(rcq->cqAddr) + (size_t)cqeIdx * rcq->cqeSize);
-        uint32_t rawBe = *slot0;
-        MORI_PRINTF(
-            "[RECV_CQ_DBG] pe=%d qpId=%d rc=%d spin=%llu consIdx=%u cqeNum=%u cqeIdx=%u "
-            "cqeSize=%u rawBe=0x%08x\n",
-            pe, qpId, rc, (unsigned long long)spin, rcq->consIdx, rcq->cqeNum, cqeIdx, rcq->cqeSize,
-            rawBe);
-      }
-      if (++spin >= kMaxSpin) {
-        MORI_PRINTF("[RECV_CQ_DBG] pe=%d qpId=%d GIVING UP after %llu spins (no recv-CQE)\n", pe,
-                    qpId, (unsigned long long)spin);
-        break;
-      }
-    }
-    core::UpdateCqDbrRecord<PrvdType>(*rcq, rcq->consIdx);
-    __threadfence_system();
-    return imm;
-  }
-}
-
-template <>
-inline __device__ void ShmemPostRecvImmThreadKernel<application::TransportType::RDMA>(
-    uintptr_t laddr, uint64_t lkey, size_t bytes, uint32_t count, int pe, int qpId) {
-  DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemPostRecvImmThreadKernelImpl, laddr, lkey, bytes, count,
-                                      pe, qpId);
-}
-
-template <>
-inline __device__ uint32_t
-ShmemPollRecvCqImmThreadKernel<application::TransportType::RDMA>(int pe, int qpId) {
-  if constexpr (DISPATCH_BNXT == 1) {
-    return ShmemPollRecvCqImmThreadKernelImpl<core::ProviderType::BNXT>(pe, qpId);
-  } else if constexpr (DISPATCH_PSD == 1) {
-    return ShmemPollRecvCqImmThreadKernelImpl<core::ProviderType::PSD>(pe, qpId);
-  } else {
-    return ShmemPollRecvCqImmThreadKernelImpl<core::ProviderType::MLX5>(pe, qpId);
-  }
 }
 
 // TODO: deal with bytes count limit
@@ -1221,14 +880,6 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
   uint32_t qpn = ep[epIndex].qpn;
-  // Dual-rail: this QP lives on the SECOND RDMA device iff its local index is at
-  // or beyond rail2QpStart. Its send WQEs must reference the buffer's SECOND MR
-  // (registered on that device): lkey2 locally, peerRkeys2 remotely. The QP handle
-  // (wq/cq/qpn) is already the rail-2 QP; only the keys differ. Inert by default
-  // (rail2QpStart<0 or !hasRail2) so the single-rail byte path is unchanged.
-  const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) &&
-                        globalGpuStates->heapObj->hasRail2 &&
-                        (localQp >= globalGpuStates->rail2QpStart);
 
   bool needsChunking = globalGpuStates->useVMMHeap;
   size_t currentOffset = 0;
@@ -1262,27 +913,22 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
 
     if (!needsChunking) {
       // Fast path: Isolation or Static Heap
-      lkey = useRail2 ? source->lkey2 : source->lkey;
+      lkey = source->lkey;
       laddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
       raddr = dest->peerPtrs[pe] + destOffset + currentOffset;
-      // Dual-rail: useRail2 gates on heapObj->hasRail2 , but a per-op
-      // dest SymmMemObj sub-object never carries rail-2 arrays => peerRkeys2 is nullptr;
-      // dereferencing it (pe=0 -> address 0x0) is the "Memory access fault on address
-      // (nil)" the arm hit. Guard the pointer: fall back to the rail-1 rkey when the
-      // object has no rail-2 array. Default-off (useRail2 false) => byte-identical.
-      rkey = (useRail2 && dest->peerRkeys2) ? dest->peerRkeys2[pe] : dest->peerRkeys[pe];
+      rkey = dest->peerRkeys[pe];
       transfer_size = remaining;
     } else {
       // Slow path: VMM Heap - query keys for current chunk
       uintptr_t srcAddr =
           reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
       size_t src_chunk_size;
-      VmmQueryLocalKey(srcAddr, remaining, lkey, src_chunk_size, useRail2);
+      VmmQueryLocalKey(srcAddr, remaining, lkey, src_chunk_size);
       laddr = srcAddr;
 
       uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset + currentOffset;
       size_t dst_chunk_size;
-      VmmQueryRemoteAddr(dstAddr, pe, remaining, raddr, rkey, dst_chunk_size, useRail2);
+      VmmQueryRemoteAddr(dstAddr, pe, remaining, raddr, rkey, dst_chunk_size);
 
       transfer_size = src_chunk_size < dst_chunk_size ? src_chunk_size : dst_chunk_size;
     }
@@ -1385,18 +1031,10 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
       uint32_t signalRkey;
       if (!needsChunking) {
         signalRaddr = signalDest->peerPtrs[pe] + signalDestOffset;
-        // Dual-rail: the completion signal rides the SAME QP as the data write
-        // above; on a rail-2 QP its remote flag AMO/inline-write must reference
-        // the flag buffer's SECOND-NIC rkey, else the responder rejects it
-        // (REM_ACCESS) -> error CQE -> drain assert + ring timeout. Mirror the
-        // data path's useRail2 decision (same localQp).
-        signalRkey = (useRail2 && signalDest->hasRail2) ? signalDest->peerRkeys2[pe]
-                                                        : signalDest->peerRkeys[pe];
+        signalRkey = signalDest->peerRkeys[pe];
       } else {
         uintptr_t signalAddr = reinterpret_cast<uintptr_t>(signalDest->localPtr) + signalDestOffset;
-        // Dual-rail: mirror the data write's useRail2 (same localQp) so the
-        // fused completion signal over the VMM heap presents the rail-2 flag rkey.
-        VmmLookupRemote(signalAddr, pe, signalRaddr, signalRkey, useRail2);
+        VmmLookupRemote(signalAddr, pe, signalRaddr, signalRkey);
       }
       if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
         // TODO: not support masked atomic yet, use write inline for now
@@ -1426,10 +1064,6 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
                 *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
                 ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
                 sizeof(signalValue), core::atomicType::AMO_ADD);
-            // Drain-free landing fence: strong-order this signal AMO after the
-            // payload WRITE on the same QP (see MaybeFenceSignalAtomicWqe). INERT
-            // unless MORI_HIER_SIGNAL_FENCE is set.
-            MaybeFenceSignalAtomicWqe(wq, my_sq_counter + 1);
           } else if constexpr (PrvdType == core::ProviderType::BNXT) {
             dbr_val = core::PostAtomic<PrvdType>(
                 *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader,
@@ -1603,22 +1237,14 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   // Get correct rkey for VMM heap or use direct rkey for Isolation/Static Heap
   uintptr_t raddr;
   uint32_t rkey;
-  // Dual-rail: an AMO posted on a rail-2 QP must use the target buffer's
-  // second-NIC rkey (else REM_ACCESS on the responder). The local ibuf is
-  // already this QP's (device-correct); only the remote rkey needs the switch.
-  // Default-off (rail2QpStart<0 || !hasRail2) => single-rail byte-identical.
-  const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) &&
-                        globalGpuStates->heapObj->hasRail2 &&
-                        ((qpId % globalGpuStates->numQpPerPe) >= globalGpuStates->rail2QpStart);
   if (globalGpuStates->useVMMHeap) {
     // VMM Heap: atomic data is small (≤8 bytes), won't cross chunk boundary
     uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset;
-    // Dual-rail: VMM atomic remote rkey must be rail-2 aware too.
-    VmmLookupRemote(dstAddr, pe, raddr, rkey, useRail2);
+    VmmLookupRemote(dstAddr, pe, raddr, rkey);
   } else {
     // Isolation or Static Heap: direct access
     raddr = dest->peerPtrs[pe] + destOffset;
-    rkey = useRail2 ? dest->peerRkeys2[pe] : dest->peerRkeys[pe];
+    rkey = dest->peerRkeys[pe];
   }
 
   uintptr_t laddr = ibuf->addr;
@@ -1810,12 +1436,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
   } else {
     // Isolation or Static Heap: direct access
     raddr = dest->peerPtrs[pe] + destOffset;
-    // Dual-rail: an AMO posted on a rail-2 QP must use the target buffer's
-    // second-NIC rkey (else REM_ACCESS on the responder).
-    const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) &&
-                          globalGpuStates->heapObj->hasRail2 &&
-                          ((qpId % globalGpuStates->numQpPerPe) >= globalGpuStates->rail2QpStart);
-    rkey = useRail2 ? dest->peerRkeys2[pe] : dest->peerRkeys[pe];
+    rkey = dest->peerRkeys[pe];
   }
 
   uint32_t warp_sq_counter = 0;
@@ -2541,10 +2162,6 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
                 *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
                 ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
                 sizeof(signalValue), core::atomicType::AMO_ADD);
-            // Drain-free landing fence: strong-order this signal AMO after the
-            // payload WRITE on the same QP (see MaybeFenceSignalAtomicWqe). INERT
-            // unless MORI_HIER_SIGNAL_FENCE is set.
-            MaybeFenceSignalAtomicWqe(wq, my_sq_counter + 1);
           } else if constexpr (PrvdType == core::ProviderType::BNXT) {
             dbr_val = core::PostAtomic<PrvdType>(
                 *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader,
@@ -3023,14 +2640,6 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
   uint32_t qpn = ep[epIndex].qpn;
-  // Dual-rail: this QP lives on the SECOND RDMA device iff its local index is at
-  // or beyond rail2QpStart. Its send WQEs must reference the buffer's SECOND MR
-  // (registered on that device): lkey2 locally, peerRkeys2 remotely. The QP handle
-  // (wq/cq/qpn) is already the rail-2 QP; only the keys differ. Inert by default
-  // (rail2QpStart<0 or !hasRail2) so the single-rail byte path is unchanged.
-  const bool useRail2 = (globalGpuStates->rail2QpStart >= 0) &&
-                        globalGpuStates->heapObj->hasRail2 &&
-                        (localQp >= globalGpuStates->rail2QpStart);
 
   bool needsChunking = globalGpuStates->useVMMHeap;
   size_t currentOffset = 0;
@@ -3066,12 +2675,12 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
     } else {
       destAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset + currentOffset;
       size_t dst_chunk_size;
-      VmmQueryLocalKey(destAddr, remaining, lkey, dst_chunk_size, useRail2);
+      VmmQueryLocalKey(destAddr, remaining, lkey, dst_chunk_size);
 
       uintptr_t srcAddr =
           reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
       size_t src_chunk_size;
-      VmmQueryRemoteAddr(srcAddr, pe, remaining, raddr, rkey, src_chunk_size, useRail2);
+      VmmQueryRemoteAddr(srcAddr, pe, remaining, raddr, rkey, src_chunk_size);
 
       transfer_size = dst_chunk_size < src_chunk_size ? dst_chunk_size : src_chunk_size;
     }

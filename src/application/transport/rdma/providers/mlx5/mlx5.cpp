@@ -131,10 +131,7 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
   DEVX_SET(cqc, cq_context, dbr_umem_id, cqDbrUmem->umem_id);
   // Collapsed CQ: cc=1 collapses all completions into CQE slot 0, oi=1 ignores
   // overrun (no CQ consumer doorbell); progress is tracked via CQE[0].wqe_counter.
-  // cqe_sz=0 selects 64B CQEs. A NON-collapsed CQ (collapsed=false) instead lays
-  // each completion in its own successive slot with an owner bit that flips per
-  // wrap -- required for the WRITE_WITH_IMM recv path, which polls slot
-  // consIdx%cqeNum per message (PollRecvCqImm) rather than reading CQE[0].wqe_counter.
+  // cqe_sz=0 selects 64B CQEs.
   DEVX_SET(cqc, cq_context, cqe_sz, 0x0);
   DEVX_SET(cqc, cq_context, cc, collapsed ? 0x1 : 0x0);
   DEVX_SET(cqc, cq_context, oi, collapsed ? 0x1 : 0x0);
@@ -188,11 +185,10 @@ Mlx5CqContainer::~Mlx5CqContainer() {
 /*                                         Mlx5QpContainer                                        */
 /* ---------------------------------------------------------------------------------------------- */
 Mlx5QpContainer::Mlx5QpContainer(ibv_context* context, const RdmaEndpointConfig& config,
-                                 uint32_t cqn, uint32_t pdn, Mlx5DeviceContext* device_context,
-                                 uint32_t cqnRcv)
+                                 uint32_t cqn, uint32_t pdn, Mlx5DeviceContext* device_context)
     : context(context), config(config), device_context(device_context) {
   ComputeQueueAttrs(config);
-  CreateQueuePair(cqn, pdn, cqnRcv ? cqnRcv : cqn);
+  CreateQueuePair(cqn, pdn);
 }
 
 Mlx5QpContainer::~Mlx5QpContainer() { DestroyQueuePair(); }
@@ -226,7 +222,7 @@ void Mlx5QpContainer::ComputeQueueAttrs(const RdmaEndpointConfig& config) {
       sqAttrs.wqSize, sqAttrs.wqeNum, sqAttrs.offset, qpTotalSize);
 }
 
-void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn, uint32_t cqnRcv) {
+void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   int status = 0;
   uint8_t cmd_in[DEVX_ST_SZ_BYTES(create_qp_in)] = {
       0,
@@ -319,7 +315,7 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn, uint32_t cqnRc
   DEVX_SET(qpc, qp_context, pd, pdn);
   DEVX_SET(qpc, qp_context, uar_page, qpUar->page_id);  // BF register
   DEVX_SET(qpc, qp_context, cqn_snd, cqn);
-  DEVX_SET(qpc, qp_context, cqn_rcv, cqnRcv);
+  DEVX_SET(qpc, qp_context, cqn_rcv, cqn);
   DEVX_SET(qpc, qp_context, log_sq_size, logSqSize);
   DEVX_SET(qpc, qp_context, log_rq_size, logRqSize);
   DEVX_SET(qpc, qp_context, log_rq_stride, logRqStride);
@@ -550,25 +546,7 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   ibv_context* context = GetIbvContext();
 
   Mlx5CqContainer* cq = new Mlx5CqContainer(context, config);
-  // WRITE_WITH_IMM recv path: mlx5 normally shares ONE CQ for send+recv, but the
-  // device-side recv-CQE poll (PollRecvCqImm) keeps its own consumer index that
-  // would race/double-consume the send drainer on a shared ring. Give the QP a
-  // genuinely SEPARATE recv CQ so recv-CQEs land on their own ring with an
-  // independent consumer. Gated (default off) => default path byte-identical.
-  static const bool kSepRecvCqEnv = [] {
-    const char* e = getenv("MORI_MLX5_SEP_RECV_CQ");
-    return e && e[0] == '1';
-  }();
-  // Honor the per-endpoint request (config.dedicatedRecvCq, set e.g. by the
-  // WRITE_WITH_IMM ring path) OR'd with the global env override. Default path
-  // leaves both unset => recvCq == nullptr => byte-identical.
-  const bool kSepRecvCq = config.dedicatedRecvCq || kSepRecvCqEnv;
-  // Non-collapsed (collapsed=false): recv-CQEs land in successive slots with a
-  // per-wrap owner bit so PollRecvCqImm can reap one CQE per WRITE_WITH_IMM.
-  Mlx5CqContainer* recvCq =
-      kSepRecvCq ? new Mlx5CqContainer(context, config, /*collapsed=*/false) : nullptr;
-  Mlx5QpContainer* qp =
-      new Mlx5QpContainer(context, config, cq->cqn, pdn, this, recvCq ? recvCq->cqn : 0);
+  Mlx5QpContainer* qp = new Mlx5QpContainer(context, config, cq->cqn, pdn, this);
   const ibv_device_attr_ex* deviceAttr = GetRdmaDevice()->GetDeviceAttr();
 
   RdmaEndpoint endpoint;
@@ -627,8 +605,7 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.wqHandle.sqWqeNum = qp->sqAttrs.wqeNum;
   endpoint.wqHandle.rqWqeNum = qp->rqAttrs.wqeNum;
   // RQ doorbell record lives in the same QP DBR page as the SQ (mlx5 uses the
-  // uint32 at index MORI_MLX5_RCV_DBR=0; SQ uses index 1). The WRITE_WITH_IMM
-  // recv scaffold rings this to arm recv WQEs.
+  // uint32 at index MORI_MLX5_RCV_DBR=0; SQ uses index 1).
   endpoint.wqHandle.rqdbrAddr = qp->qpDbrUmemAddr;
 
   endpoint.cqHandle.cqAddr = cq->cqUmemAddr;
@@ -637,20 +614,6 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.cqHandle.cqeSize = GetMlx5CqeSize();
   endpoint.cqHandle.dbrRecAddr = cq->cqDbrUmemAddr;
 
-  // With a separate recv CQ, WRITE_WITH_IMM recv-CQEs land on their own ring with
-  // an independent consumer index (no shared-CQ race with the send drainer). When
-  // the separate CQ is disabled (default), fall back to the shared CQ so device
-  // readers can still read recvCqHandle uniformly.
-  if (recvCq) {
-    endpoint.recvCqHandle.cqAddr = recvCq->cqUmemAddr;
-    endpoint.recvCqHandle.consIdx = 0;
-    endpoint.recvCqHandle.cqeNum = recvCq->cqeNum;
-    endpoint.recvCqHandle.cqeSize = GetMlx5CqeSize();
-    endpoint.recvCqHandle.dbrRecAddr = recvCq->cqDbrUmemAddr;
-  } else {
-    endpoint.recvCqHandle = endpoint.cqHandle;
-  }
-
   // Set atomic internal buffer information
   endpoint.atomicIbuf.addr = reinterpret_cast<uintptr_t>(qp->atomicIbufAddr);
   endpoint.atomicIbuf.lkey = qp->atomicIbufMr->lkey;
@@ -658,9 +621,6 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.atomicIbuf.nslots = RoundUpPowOfTwo(config.atomicIbufSlots);
 
   cqPool.insert({cq->cqn, std::move(std::unique_ptr<Mlx5CqContainer>(cq))});
-  if (recvCq) {
-    cqPool.insert({recvCq->cqn, std::move(std::unique_ptr<Mlx5CqContainer>(recvCq))});
-  }
   qpPool.insert({qp->qpn, std::move(std::unique_ptr<Mlx5QpContainer>(qp))});
 
   MORI_APP_TRACE(

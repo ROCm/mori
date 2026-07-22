@@ -109,9 +109,7 @@ struct MemoryStates {
 // device POD over core's WQ/CQ/Ibuf handles, the device-visible projection of
 // application::RdmaEndpoint — so RDMA-driving backends (shmem, cco, ...) depend
 // DOWN on core rather than on each other. This alias preserves the historical
-// shmem::ShmemRdmaEndpoint spelling for existing shmem code. The recvCqHandle
-// field used by the hierarchical AllGather's WRITE_WITH_IMM receiver now lives on
-// core::RdmaEndpointDevice itself (see core_device_types.hpp).
+// shmem::ShmemRdmaEndpoint spelling for existing shmem code.
 using ShmemRdmaEndpoint = core::RdmaEndpointDevice;
 
 // GpuStates must be declared before ModuleStates and ShmemStates which embed it.
@@ -119,37 +117,6 @@ struct GpuStates {
   int rank{-1};
   int worldSize{-1};
   int numQpPerPe{4};  // Default to 4 QPs per peer, consistent with Context default
-  // Dual-rail (idle-NIC fan-out): index within a peer's [0,numQpPerPe) QP block
-  // at/after which QPs live on the SECOND RDMA device (an otherwise-idle NIC).
-  // -1 (default) => single-rail, no QP is on rail 2 and the device put path is
-  // byte-for-byte unchanged. Set from Context by GpuStateInit when dual-rail is on.
-  int rail2QpStart{-1};
-  // Transport in-flight depth: when >0, the fast-path (non-VMM) RDMA put in
-  // ShmemPutMemNbiThreadKernelImpl splits a large transfer into multiple WQEs of
-  // at most this many bytes, so several writes stay in flight per QP per put (the
-  // WQ free-entry backpressure already supports many outstanding WQEs).
-  // 0 (default) = one WQE for the whole transfer. Set from env
-  // MORI_RDMA_PUT_CHUNK_BYTES in GpuStateInit.
-  size_t putChunkBytes{0};
-  // Batched doorbell: when true AND putChunkBytes>0, the multi-WQE fast-path put
-  // rings the mlx5 send doorbell exactly once (after posting every chunk WQE)
-  // instead of once per chunk. Each RingDoorbell is an MMIO write + 3
-  // __threadfence_system; batching keeps K writes in flight per QP at the cost of
-  // a single doorbell. Deadlock-safe: deferral engages only when the whole put's
-  // WQE count fits comfortably in the SQ (<= sqWqeNum/4) so the free-entry
-  // backpressure never needs a mid-put drain (which would require a prior ring).
-  // 0 (default) = ring per WQE. Set from env MORI_RDMA_PUT_BATCH_DB in
-  // GpuStateInit.
-  bool batchPutDoorbell{false};
-  // Drain-free landing fence: mlx5 ctrl-segment fence-mode value OR'd into
-  // fm_ce_se on the fused signal ATOMIC WQE. On RoCE RC a WRITE is NOT ordered
-  // before a following ATOMIC on the same QP, so the DEEP_PIPE put-with-signal AMO
-  // can be executed by the responder before its own large payload WRITE lands
-  // (>=64MB flag-beats-data race). A strong-ordering fence on the atomic WQE makes
-  // it wait for all prior WQEs (incl. the payload write) => the flag never precedes
-  // the landing, without the send-CQ quiet-drain round-trip. 0 (default) = no
-  // fence bit. Set from env MORI_HIER_SIGNAL_FENCE in GpuStateInit (MLX5 only).
-  int signalFenceMode{0};
   application::TransportType* transportTypes{nullptr};
   ShmemRdmaEndpoint* rdmaEndpoints{nullptr};
   uint32_t* endpointLock{nullptr};

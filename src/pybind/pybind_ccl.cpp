@@ -365,8 +365,6 @@ void RegisterMoriCcl(pybind11::module_& m) {
             return self.finish_stream_no_copy(reinterpret_cast<hipStream_t>(stream));
           },
           py::arg("stream"))
-      .def("parity_counter_ptr",
-           [](InterNodeRing& self) -> uintptr_t { return self.parity_counter_ptr(); })
       .def("npes", &InterNodeRing::npes)
       .def("num_blocks", &InterNodeRing::num_blocks);
 
@@ -530,7 +528,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
   m.def("build_fused_ring_remote_gather_args", &mori::collective::BuildFusedRingRemoteGatherArgs,
         py::arg("ring_args_ptr"), py::arg("gather_args_ptr"), py::arg("ring_blocks"),
         py::arg("chunk_ready_flags_ptr"), py::arg("num_nodes"), py::arg("node_id"),
-        py::arg("reassembly_blocks") = 0, py::arg("op_gen") = 0, py::arg("reasm_deep_sq") = 0,
+        py::arg("reassembly_blocks") = 0, py::arg("reasm_deep_sq") = 0,
         "Merge ring + gather jit_args + pipeline extras into fused-remote args; returns int64 ptr");
 
   // =========================================================================
