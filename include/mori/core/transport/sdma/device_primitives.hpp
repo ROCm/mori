@@ -36,7 +36,7 @@ namespace core {
 inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                      anvil::SdmaQueueDeviceHandle** deviceHandles,
                                      HSAuint64* signals, HSAuint64* expectedSignals,
-                                     uint32_t queNum, uint32_t qId, int ndesc = 1) {
+                                     uint32_t queNum, uint32_t qId) {
   uint64_t base = 0;
   uint64_t pendingWptr = 0;
   uint64_t startBase = 0;
@@ -47,62 +47,19 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
   HSAuint64* signal = signals + qId;
 
-  // ndesc>1: split the copy into contiguous sub-descriptors + one trailing
-  // atomic-inc in a single doorbell; the atomic fires after all sub-copies in
-  // FIFO order and expectedSignals bumps once. ndesc<=1 => single descriptor.
-  if (ndesc <= 1) {
-    base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
-    pendingWptr = base;
-    startBase = base;
-
-    auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size);
-    handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, offset);
-
-    base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
-    pendingWptr = base;
-    auto packet_s = anvil::CreateAtomicIncPacket(signal);
-    handle.template placePacket<SDMA_PKT_ATOMIC>(packet_s, pendingWptr, offset);
-
-    handle.submitPacket(startBase, pendingWptr);
-    expectedSignals[qId]++;
-    return;
-  }
-
-  // Split into equal sub-ranges on the 16B SDMA_PKT_COPY_LINEAR granularity
-  // (CDNA3 quad-word aligned); the concatenation is byte-identical to one copy.
-  const size_t unit = 16;
-  const size_t nU = (copy_size + unit - 1) / unit;
-  size_t n = static_cast<size_t>(ndesc);
-  if (n > nU) n = nU < 1 ? 1 : nU;
-  const size_t uPerD = (nU + n - 1) / n;
-  // Count descriptors that carry nonzero bytes.
-  int nReal = 0;
-  for (size_t d = 0; d < n; ++d) {
-    size_t s = d * uPerD * unit;
-    if (s >= copy_size) break;
-    ++nReal;
-  }
-  if (nReal < 1) nReal = 1;
-
-  const size_t reserveBytes =
-      static_cast<size_t>(nReal) * sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC);
-  base = handle.ReserveQueueSpace(reserveBytes, offset);
+  // Single COPY_LINEAR + trailing atomic-inc in one doorbell; the atomic fires
+  // after the copy in FIFO order and expectedSignals bumps once.
+  base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
   pendingWptr = base;
   startBase = base;
 
-  // Wrap padding (offset) applies only to the first placement; later packets
-  // are contiguous (offset 0).
-  uint64_t placeOffset = offset;
-  for (int d = 0; d < nReal; ++d) {
-    size_t s = static_cast<size_t>(d) * uPerD * unit;
-    size_t e = s + uPerD * unit;
-    if (e > copy_size) e = copy_size;
-    auto packet_d = anvil::CreateCopyPacket(srcPtr + s, dstPtr + s, e - s);
-    handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, placeOffset);
-    placeOffset = 0;
-  }
+  auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size);
+  handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, offset);
+
+  base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
+  pendingWptr = base;
   auto packet_s = anvil::CreateAtomicIncPacket(signal);
-  handle.template placePacket<SDMA_PKT_ATOMIC>(packet_s, pendingWptr, placeOffset);
+  handle.template placePacket<SDMA_PKT_ATOMIC>(packet_s, pendingWptr, offset);
 
   handle.submitPacket(startBase, pendingWptr);
   expectedSignals[qId]++;
