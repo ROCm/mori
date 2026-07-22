@@ -258,7 +258,6 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
     return;
   }
   if (flatMW) {
-    const uint64_t kk8MB = 8u * 1024u * 1024u;
     const uint64_t fWant =
         (flagVal - 1) * static_cast<uint64_t>(G - 1) + static_cast<uint64_t>(G - 1);
     // (1) self-fill my own slot g from input (drained), one fence.
@@ -274,11 +273,9 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
         if (off >= bytesPerPeer) break;
         size_t len = chunkBytes;
         if (off + len > bytesPerPeer) len = bytesPerPeer - off;
-        int sN = static_cast<int>((len + (kk8MB - 1)) / kk8MB);
-        if (sN < 1) sN = 1;
         uint8_t* selfSlotP = selfDstBase + static_cast<size_t>(g) * slotStride + off;
         core::SdmaPutThread(reinterpret_cast<uint8_t*>(input) + off, selfSlotP, len, selfHandles,
-                            selfSignals, selfExpected, nq, 0, sN);
+                            selfSignals, selfExpected, nq, 0);
         // batchSelf and overlapSelf both defer the drain; the plain path drains per chunk.
         if (!batchSelf && !overlapSelf) core::SdmaQueitThread(selfSignals + 0, selfExpected + 0, 1);
       }
@@ -346,7 +343,6 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
     const uint64_t p1Want = p1Base + static_cast<uint64_t>(H - 1);
     const uint64_t p2Base = (flagVal - 1) * static_cast<uint64_t>(H);
     const uint64_t p2Want = p2Base + static_cast<uint64_t>(H);
-    const uint64_t k8MB = 8u * 1024u * 1024u;
 
     // Fused phase1/phase2 overlap (fencedFlag bit3): interleave ring-forward (phase1)
     // and cross-half send (phase2) on one queue so phase2 fills phase1's bubbles. Q=1.
@@ -374,11 +370,9 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
           if (off >= bytesPerPeer) break;
           size_t len = chunkBytes;
           if (off + len > bytesPerPeer) len = bytesPerPeer - off;
-          int sN = static_cast<int>((len + (k8MB - 1)) / k8MB);
-          if (sN < 1) sN = 1;
           uint8_t* selfSlotP = selfDstBase + static_cast<size_t>(mySlot) * slotStride + off;
           core::SdmaPutThread(reinterpret_cast<uint8_t*>(input) + off, selfSlotP, len, selfHandles,
-                              selfSignals, selfExpected, nq, 0, sN);
+                              selfSignals, selfExpected, nq, 0);
           core::SdmaQueitThread(selfSignals + 0, selfExpected + 0, 1);
         }
         __threadfence_system();
@@ -468,11 +462,9 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
           if (off >= bytesPerPeer) break;
           size_t len = chunkBytes;
           if (off + len > bytesPerPeer) len = bytesPerPeer - off;
-          int sN = static_cast<int>((len + (k8MB - 1)) / k8MB);
-          if (sN < 1) sN = 1;
           uint8_t* selfSlotP = selfDstBase + static_cast<size_t>(mySlotP1mw) * slotStride + off;
           core::SdmaPutThread(reinterpret_cast<uint8_t*>(input) + off, selfSlotP, len, selfHandles,
-                              selfSignals, selfExpected, nq, 0, sN);
+                              selfSignals, selfExpected, nq, 0);
           core::SdmaQueitThread(selfSignals + 0, selfExpected + 0, 1);
         }
         __threadfence_system();
@@ -512,11 +504,9 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
         if (off >= bytesPerPeer) break;
         size_t len = chunkBytes;
         if (off + len > bytesPerPeer) len = bytesPerPeer - off;
-        int sN = static_cast<int>((len + (k8MB - 1)) / k8MB);
-        if (sN < 1) sN = 1;
         uint8_t* selfSlotP = selfDstBase + static_cast<size_t>(mySlot) * slotStride + off;
         core::SdmaPutThread(reinterpret_cast<uint8_t*>(input) + off, selfSlotP, len, selfHandles,
-                            selfSignals, selfExpected, nq, 0, sN);
+                            selfSignals, selfExpected, nq, 0);
         core::SdmaQueitThread(selfSignals + 0, selfExpected + 0, 1);
       }
       __threadfence_system();
@@ -736,12 +726,8 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
       if (off >= bytesPerPeer) break;
       size_t len = chunkBytes;
       if (off + len > bytesPerPeer) len = bytesPerPeer - off;
-      // Cap each SDMA copy descriptor at <=8 MiB (CDNA3 microcode faults on a single
-      // >8MB COPY_LINEAR); split len>8MB into ceil(len/8MB) sub-descriptors on this queue.
-      int selfNdesc = static_cast<int>((len + (8u * 1024u * 1024u - 1)) / (8u * 1024u * 1024u));
-      if (selfNdesc < 1) selfNdesc = 1;
       core::SdmaPutThread(reinterpret_cast<uint8_t*>(input) + off, selfSlot + off, len, selfHandles,
-                          selfSignals, selfExpected, nq, static_cast<uint32_t>(q), selfNdesc);
+                          selfSignals, selfExpected, nq, static_cast<uint32_t>(q));
       core::SdmaQueitThread(selfSignals + q, selfExpected + q, 1);
     }
     __threadfence_system();
