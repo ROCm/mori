@@ -35,6 +35,10 @@
 namespace mori {
 namespace core {
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                        WQE/CQE structs */
+/* ---------------------------------------------------------------------------------------------- */
+
 // ::mlx5_wqe_ctrl_seg (16 B)
 struct Mlx5WqeCtrlSeg {
   uint32_t opmod_idx_opcode;
@@ -101,6 +105,10 @@ struct Mlx5Cqe64 {
   uint8_t op_own;
 };
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                           Constants */
+/* ---------------------------------------------------------------------------------------------- */
+
 enum {
   MORI_MLX5_SEND_WQE_BB = 64,
   MORI_MLX5_SEND_WQE_SHIFT = 6,
@@ -113,10 +121,7 @@ enum {
 
   MORI_MLX5_WQE_CTRL_CQ_UPDATE = 2 << 2,
 
-  // Fence-mode field lives in fm_ce_se[7:5] (mlx5 ctrl segment). STRONG_ORDERING
-  // makes this WQE execute only after ALL prior WQEs on the QP (incl. RDMA WRITE)
-  // have landed -- the drain-free cure for a fused signal ATOMIC overtaking its
-  // own preceding large payload WRITE (>=64MB) on RoCE RC.
+  // Fence mode in fm_ce_se[7:5]; STRONG_ORDERING runs this WQE only after all prior QP WQEs land.
   MORI_MLX5_FENCE_MODE_INITIATOR_SMALL = 1 << 5,
   MORI_MLX5_FENCE_MODE_FENCE = 2 << 5,
   MORI_MLX5_FENCE_MODE_STRONG_ORDERING = 3 << 5,

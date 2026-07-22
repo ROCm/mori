@@ -45,13 +45,14 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
         assert my_pe == rank, f"PE mismatch: {my_pe} != {rank}"
         assert npes == world_size, f"npes mismatch: {npes} != {world_size}"
 
-        elems_per_pe = elems
+        # Match C++ naming and logic
+        elems_per_pe = elems  # Elements each PE contributes (like C++ elemsPerPe)
         bytes_per_pe = (
             elems_per_pe * 4
-        )
+        )  # Bytes per PE contribution (like C++ bytesPerPe)
         total_bytes = (
             bytes_per_pe * npes
-        )
+        )  # Total bytes after gathering from all PEs (like C++ totalBytes)
 
         if rank == 0:
             print(f"\n{'='*60}")
@@ -69,7 +70,9 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
 
         print(f"PE {rank}/{world_size}: SHMEM initialized, myPe={my_pe}, npes={npes}")
 
-        copy_output_to_user = True  # False -> read output_transit_buffer directly
+        # Create Allgather object with sufficient buffer size
+        # Use copy_output_to_user=False to test direct use of output_transit_buffer
+        copy_output_to_user = True  # Set to False to use output_transit_buffer directly
         allgather = AllgatherSdma(
             my_pe,
             npes,
@@ -81,16 +84,19 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
             f"PE {rank}: Created AllgatherSdma object (copy_output_to_user={copy_output_to_user})"
         )
 
-        # uint32 to match C++ AllgatherSdma<uint32_t>
+        # Allocate GPU memory
+        # Note: Using torch.uint32 to match C++ AllgatherSdma<uint32_t>
         device = torch.device(f"cuda:{rank}")
         input_tensor = torch.zeros(elems_per_pe, dtype=torch.uint32, device=device)
         output_tensor = torch.zeros(
             elems_per_pe * npes, dtype=torch.uint32, device=device
         )
 
+        # Prepare data: Each PE has unique value = (myPe + 1) * 1000
         value = (my_pe + 1) * 1000
         input_data_cpu = np.full(elems_per_pe, value, dtype=np.uint32)
 
+        # Copy to GPU
         input_tensor.copy_(torch.from_numpy(input_data_cpu))
 
         if rank == 0:
@@ -107,21 +113,25 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
 
         print(f"PE {rank}: Prepared input data with value: {value}")
 
+        # Create CUDA stream for allgather operations (similar to test_allgather_overlap.py)
         stream = torch.cuda.Stream(device=device)
 
         torch.cuda.synchronize()
         dist.barrier()
 
+        # Execute Allgather multiple times
         exec_times = []
         total_iters = warmup + iterations
-        use_async = True
+        use_async = True  # Use async mode to match C++ test
 
         if not use_async:
-            # Synchronous mode: single SDMA queue.
+            # Synchronous mode (single SDMA queue) - add timing
+            # Create CUDA events for timing
             allgather_start = torch.cuda.Event(enable_timing=True)
             allgather_end = torch.cuda.Event(enable_timing=True)
 
             for iter_idx in range(total_iters):
+                # Record start time
                 allgather_start.record(stream)
 
                 with torch.cuda.stream(stream):
@@ -129,8 +139,10 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                         input_tensor, output_tensor, elems_per_pe, stream
                     )
 
+                # Record end time
                 allgather_end.record(stream)
 
+                # Synchronize to ensure all operations complete
                 stream.synchronize()
 
                 if not success:
@@ -139,9 +151,10 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                     )
                     break
 
+                # Calculate execution time
                 allgather_time = (
                     allgather_start.elapsed_time(allgather_end) / 1000.0
-                )
+                )  # Convert ms to seconds
 
                 if iter_idx >= warmup:
                     exec_times.append(allgather_time)
@@ -154,7 +167,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                         f"Warmup iteration {iter_idx + 1}/{warmup}: {allgather_time:.6f}s"
                     )
         else:
-            # Async mode: multiple SDMA queues.
+            # Asynchronous mode (multiple SDMA queues, matches C++ test)
             if rank == 0:
                 print("Using ASYNC mode (start_async + wait_async) to match C++ test")
                 if warmup > 0:
@@ -169,6 +182,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
 
                 dist.barrier()
 
+                # Start async operation using context manager style (like test_allgather_overlap.py)
                 with torch.cuda.stream(stream):
                     started = allgather.start_async(
                         input_tensor, output_tensor, elems_per_pe, stream
@@ -177,6 +191,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                     print(f"PE {rank}: Failed to start async operation")
                     break
 
+                # Wait for completion (using the same stream)
                 with torch.cuda.stream(stream):
                     exec_time = allgather.wait_async(stream)
 
@@ -184,8 +199,10 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                     print(f"PE {rank}: Async operation failed")
                     break
 
+                # Synchronize stream to ensure completion (like test_allgather_overlap.py)
                 stream.synchronize()
 
+                # Collect times after warmup
                 if iter_idx >= warmup:
                     exec_times.append(exec_time)
                     if rank == 0 and len(exec_times) == 1:
@@ -195,6 +212,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
 
                 dist.barrier()
 
+        # Calculate statistics from post-warmup iterations
         if len(exec_times) > 0:
             avg_time = np.mean(exec_times)
             min_time = np.min(exec_times)
@@ -208,7 +226,8 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
             print(f"  Max time: {max_time:.6f}s")
             print(f"  Avg time: {avg_time:.6f}s")
 
-        # device= ensures the transit buffer lands on output_tensor's device
+        # Get output transit buffer and verify
+        # Pass the output_tensor to ensure the buffer is on the correct device
         output_transit_buffer = allgather.get_output_transit_buffer(
             device=output_tensor
         )
@@ -222,10 +241,12 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                 f"PE {rank}: Output transit buffer first 10 values: {output_transit_buffer_cpu[:10]}"
             )
 
+        # Verify results based on copy_output_to_user mode
         success = True
         expected_elements = total_bytes // 4
 
         if copy_output_to_user:
+            # In COPY mode: verify output_tensor (user buffer)
             output_data_cpu = output_tensor.cpu().numpy()
 
             for src_pe in range(npes):
@@ -245,6 +266,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                         f"PE {rank}: Chunk from PE {src_pe} verified (all values = {expected_value})"
                     )
 
+            # Verify output transit buffer contains the same data as output_tensor
             if output_transit_buffer_cpu.size >= expected_elements:
                 transit_chunk = output_transit_buffer_cpu[:expected_elements]
                 if np.array_equal(transit_chunk, output_data_cpu):
@@ -260,7 +282,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                     print(f"  First 10 values in output_tensor: {output_data_cpu[:10]}")
                     success = False
         else:
-            # non-COPY: output_tensor may be unfilled, verify transit buffer directly
+            # In non-COPY mode: verify output_transit_buffer directly (output_tensor may not be filled)
             if rank == 0:
                 print(
                     f"PE {rank}: Verifying output_transit_buffer directly (copy_output_to_user=False)"
@@ -293,10 +315,12 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                     )
                 success = False
 
+        # Synchronize stream before verification (like test_allgather_overlap.py)
         stream.synchronize()
         torch.cuda.synchronize()
         dist.barrier()
 
+        # Gather global statistics
         min_time_tensor = torch.tensor([min_time], dtype=torch.float64)
         max_time_tensor = torch.tensor([max_time], dtype=torch.float64)
         avg_time_tensor = torch.tensor([avg_time], dtype=torch.float64)
@@ -328,13 +352,12 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
             else:
                 print("\n=== Test FAILED ===\n")
 
-        # Ordered teardown (avoids SHMEM free races): sync, barrier, drop buffers,
-        # barrier, then finalize SDMA/HSA.
-        torch.cuda.synchronize()
-        dist.barrier()
-        del allgather
-        dist.barrier()
-        shmem.shmem_finalize()
+        # Proper cleanup order to avoid race conditions
+        torch.cuda.synchronize()  # 1. Ensure all GPU operations complete
+        dist.barrier()  # 2. Synchronize all processes
+        del allgather  # 3. Delete object (releases SHMEM buffers)
+        dist.barrier()  # 4. Wait for all processes to finish cleanup
+        shmem.shmem_finalize()  # 5. Finalize SHMEM (closes SDMA/HSA resources)
 
         if not success:
             raise AssertionError(f"PE {rank}: Allgather verification failed")

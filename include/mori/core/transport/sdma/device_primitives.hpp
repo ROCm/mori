@@ -29,6 +29,10 @@
 namespace mori {
 namespace core {
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                           Post Tasks                                           */
+/* ---------------------------------------------------------------------------------------------- */
+
 inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                      anvil::SdmaQueueDeviceHandle** deviceHandles,
                                      HSAuint64* signals, HSAuint64* expectedSignals,
@@ -43,10 +47,9 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
   HSAuint64* signal = signals + qId;
 
-  // MORI_HIER_PUT_NDESC: ndesc>1 tiles the copy into contiguous sub-descriptors +
-  // one trailing atomic-inc, single doorbell. Atomic fires after all sub-copies in
-  // FIFO order and expectedSignals bumps once, so one quiet guards the column;
-  // byte-identical to the single-descriptor path. ndesc<=1 => single descriptor.
+  // ndesc>1: split the copy into contiguous sub-descriptors + one trailing
+  // atomic-inc in a single doorbell; the atomic fires after all sub-copies in
+  // FIFO order and expectedSignals bumps once. ndesc<=1 => single descriptor.
   if (ndesc <= 1) {
     base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
     pendingWptr = base;
@@ -65,13 +68,14 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
     return;
   }
 
-  // Split into equal sub-ranges tiled on the 16B SDMA_PKT_COPY_LINEAR granularity
-  // (CDNA3 quad-word alignment); keeps every sub-descriptor legal and byte-identical.
+  // Split into equal sub-ranges on the 16B SDMA_PKT_COPY_LINEAR granularity
+  // (CDNA3 quad-word aligned); the concatenation is byte-identical to one copy.
   const size_t unit = 16;
   const size_t nU = (copy_size + unit - 1) / unit;
   size_t n = static_cast<size_t>(ndesc);
   if (n > nU) n = nU < 1 ? 1 : nU;
   const size_t uPerD = (nU + n - 1) / n;
+  // Count descriptors that carry nonzero bytes.
   int nReal = 0;
   for (size_t d = 0; d < n; ++d) {
     size_t s = d * uPerD * unit;
@@ -86,7 +90,8 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   pendingWptr = base;
   startBase = base;
 
-  // Wrap padding (offset) applies only to the first placement; rest contiguous.
+  // Wrap padding (offset) applies only to the first placement; later packets
+  // are contiguous (offset 0).
   uint64_t placeOffset = offset;
   for (int d = 0; d < nReal; ++d) {
     size_t s = static_cast<size_t>(d) * uPerD * unit;
@@ -103,12 +108,10 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   expectedSignals[qId]++;
 }
 
-// MORI_HIER_QFLAG: COPY_LINEAR + peer-flag WRITE as an SDMA FENCE packet on the
-// same queue, one doorbell. FIFO order => peer sees the flag strictly after the
-// copied bytes (landing fence); the reader's seq-cst system acquire +
-// __threadfence_system publish the landed bytes to consumers. Peer flag is the
-// completion token; no local signal, expectedSignals not bumped. flagVal must fit
-// 32 bits (written to the low word of the u64 flag slot).
+// COPY_LINEAR + SDMA FENCE flag-write on the same queue, one doorbell. FIFO
+// order => the peer observes the flag strictly after the copied bytes. No local
+// signal; expectedSignals not bumped; the peer flag is the completion token.
+// flagVal must fit 32 bits (written to the low word of the u64 flag slot).
 inline __device__ void SdmaPutFencedFlagThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                                anvil::SdmaQueueDeviceHandle** deviceHandles,
                                                HSAuint64* signals, HSAuint64* expectedSignals,
@@ -131,10 +134,9 @@ inline __device__ void SdmaPutFencedFlagThread(void* srcBuf, void* dstBuf, size_
   handle.submitPacket(startBase, pendingWptr);
 }
 
-// COPY_LINEAR + a LOCAL atomic-inc of signals[qId] so the caller drains this
-// submit (SdmaQueitThread) then sets the peer flag via P2P AMO_SET; no remote flag
-// rides the copy engine. Distinct from SdmaPutFencedFlagThread (COPY+FENCE to
-// peerFlagAddr). peerFlagAddr/flagVal unused here.
+// COPY_LINEAR + LOCAL atomic-inc of signals[qId] so the caller can drain via
+// SdmaQueitThread; the caller sets the peer flag via P2P AMO_SET after the
+// drain. peerFlagAddr/flagVal unused here.
 inline __device__ void SdmaPutCopySignalThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                                anvil::SdmaQueueDeviceHandle** deviceHandles,
                                                HSAuint64* signals, HSAuint64* expectedSignals,
@@ -159,18 +161,17 @@ inline __device__ void SdmaPutCopySignalThread(void* srcBuf, void* dstBuf, size_
   expectedSignals[qId]++;
 }
 
-// Tail-counter completion: COPY_LINEAR + a REMOTE ADD64(+1) on the same queue, one
-// doorbell. SQ FIFO => peer sees the +1 only after the bytes land (landing fence).
-// The ADD64 must ride the SDMA engine, not a CU atomic: peerPtrs are engine-mapped
-// (XGMI P2P), not CU-P2P-atomic-safe. Peer counter is the sole completion token; no
-// local signal, expectedSignals not bumped. peerCounterAddr = peer uint64 counter.
+// COPY_LINEAR + REMOTE ADD64(+1) on the same queue, one doorbell. FIFO order
+// => the peer sees the counter increment only after the copied bytes land. The
+// ADD64 must ride the SDMA engine (peerCounterAddr is XGMI P2P engine-mapped,
+// not CU-atomic-safe). No local signal; expectedSignals not bumped.
 inline __device__ void SdmaPutCopyRemoteAddThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                                   anvil::SdmaQueueDeviceHandle** deviceHandles,
                                                   uint32_t qId, void* peerCounterAddr) {
-  // A single COPY_LINEAR >8 MiB faults on the CDNA3 SDMA microcode: split into
-  // <=8 MiB contiguous sub-descriptors, then the trailing ADD64. Hard copy-size
+  // A single COPY_LINEAR over ~8 MiB faults on CDNA3 SDMA microcode, so split
+  // into <=8 MiB contiguous sub-descriptors + one trailing ADD64. Hard copy-size
   // cap, not latency pipelining.
-  const size_t kMaxCopy = 8u * 1024u * 1024u;
+  const size_t kMaxCopy = 8u * 1024u * 1024u;  // max single COPY_LINEAR byte count
   size_t nCopy = (copy_size + kMaxCopy - 1) / kMaxCopy;
   if (nCopy < 1) nCopy = 1;
   uint64_t offset = 0;
@@ -190,6 +191,7 @@ inline __device__ void SdmaPutCopyRemoteAddThread(void* srcBuf, void* dstBuf, si
     handle.template placePacket<SDMA_PKT_COPY_LINEAR>(copy_packet, pendingWptr, placeOffset);
     placeOffset = 0;  // wrap padding applies only to the first placement
   }
+  // ADD64(+1) targeting the REMOTE peer tail counter (+1 per drained step).
   auto add_packet = anvil::CreateAtomicIncPacket(reinterpret_cast<HSAuint64*>(peerCounterAddr));
   handle.template placePacket<SDMA_PKT_ATOMIC>(add_packet, pendingWptr, 0);
   handle.submitPacket(startBase, pendingWptr);
@@ -207,14 +209,13 @@ inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
 
   if (laneId >= queNum) return;
   int queueId = laneId;
-  const size_t rand_size = copy_size / queNum;
+  const size_t rand_size = copy_size / queNum;  // per queue rand data
 
   char* srcPtr = reinterpret_cast<char*>(srcBuf);
   char* dstPtr = reinterpret_cast<char*>(dstBuf);
 
-  // Each queue owns a disjoint chunk (last absorbs the remainder). src/dst MUST be
-  // advanced to this queue's chunk start, else all queues copy from offset 0
-  // (overlapping front, tail never copied).
+  // Each queue copies a disjoint chunk [q*rand_size, (q+1)*rand_size), last
+  // queue takes the remainder; advance src/dst to this queue's chunk start.
   srcPtr += static_cast<size_t>(queueId) * rand_size;
   dstPtr += static_cast<size_t>(queueId) * rand_size;
 
@@ -241,6 +242,9 @@ inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
   expectedSignals[laneId]++;
 }
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                         Completion Queue                                       */
+/* ---------------------------------------------------------------------------------------------- */
 inline __device__ void SdmaQueitThread(HSAuint64* signals, HSAuint64* expectedSignals,
                                        uint32_t queNum) {
   for (int q = 0; q < queNum; q++) {
