@@ -30,6 +30,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -248,13 +249,18 @@ void StandaloneProcessClient::MaybeAutoStart() {
       address_);
 }
 
-bool StandaloneProcessClient::OffsetFor(uintptr_t ptr, size_t size, uint64_t* offset) const {
+bool StandaloneProcessClient::OffsetFor(uintptr_t ptr, size_t size, uint64_t* offset,
+                                        uint64_t* region_base) const {
   std::lock_guard<std::mutex> lock(registration_mu_);
-  if (!registered_ || ptr < registered_base_) return false;
-  uintptr_t rel = ptr - registered_base_;
-  if (rel > registered_size_ || size > registered_size_ - rel) return false;
-  *offset = static_cast<uint64_t>(rel);
-  return true;
+  for (const auto& region : regions_) {
+    if (ptr < region.base) continue;
+    uintptr_t rel = ptr - region.base;
+    if (rel > region.size || size > region.size - rel) continue;
+    *offset = static_cast<uint64_t>(rel);
+    *region_base = static_cast<uint64_t>(region.base);
+    return true;
+  }
+  return false;
 }
 
 bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t size) {
@@ -262,13 +268,15 @@ bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t 
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
   uint64_t offset = 0;
-  if (!OffsetFor(src, size, &offset)) return false;
+  uint64_t region_base = 0;
+  if (!OffsetFor(src, size, &offset, &region_base)) return false;
   grpc::ClientContext ctx;
   ::umbp::PutRequest req;
   req.set_key(key);
   req.set_client_id(ClientId());
   req.set_shm_offset(offset);
   req.set_size(size);
+  req.set_region_base(region_base);
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Put(&ctx, req, &resp);
   return status.ok() && resp.ok();
@@ -279,13 +287,15 @@ bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t 
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
   uint64_t offset = 0;
-  if (!OffsetFor(dst, size, &offset)) return false;
+  uint64_t region_base = 0;
+  if (!OffsetFor(dst, size, &offset, &region_base)) return false;
   grpc::ClientContext ctx;
   ::umbp::GetRequest req;
   req.set_key(key);
   req.set_client_id(ClientId());
   req.set_shm_offset(offset);
   req.set_size(size);
+  req.set_region_base(region_base);
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Get(&ctx, req, &resp);
   return status.ok() && resp.ok();
@@ -315,9 +325,13 @@ std::vector<bool> StandaloneProcessClient::BatchPut(const std::vector<std::strin
   req.set_client_id(ClientId());
   for (size_t i = 0; i < keys.size(); ++i) {
     uint64_t offset = 0;
-    if (!OffsetFor(srcs[i], sizes[i], &offset)) return std::vector<bool>(keys.size(), false);
+    uint64_t region_base = 0;
+    if (!OffsetFor(srcs[i], sizes[i], &offset, &region_base)) {
+      return std::vector<bool>(keys.size(), false);
+    }
     req.add_keys(keys[i]);
     req.add_shm_offsets(offset);
+    req.add_region_bases(region_base);
     req.add_sizes(sizes[i]);
   }
   grpc::ClientContext ctx;
@@ -342,9 +356,13 @@ std::vector<bool> StandaloneProcessClient::BatchPutWithDepth(const std::vector<s
   req.set_client_id(ClientId());
   for (size_t i = 0; i < keys.size(); ++i) {
     uint64_t offset = 0;
-    if (!OffsetFor(srcs[i], sizes[i], &offset)) return std::vector<bool>(keys.size(), false);
+    uint64_t region_base = 0;
+    if (!OffsetFor(srcs[i], sizes[i], &offset, &region_base)) {
+      return std::vector<bool>(keys.size(), false);
+    }
     req.add_keys(keys[i]);
     req.add_shm_offsets(offset);
+    req.add_region_bases(region_base);
     req.add_sizes(sizes[i]);
     req.add_depths(i < depths.size() ? depths[i] : -1);
   }
@@ -369,9 +387,13 @@ std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::strin
   req.set_client_id(ClientId());
   for (size_t i = 0; i < keys.size(); ++i) {
     uint64_t offset = 0;
-    if (!OffsetFor(dsts[i], sizes[i], &offset)) return std::vector<bool>(keys.size(), false);
+    uint64_t region_base = 0;
+    if (!OffsetFor(dsts[i], sizes[i], &offset, &region_base)) {
+      return std::vector<bool>(keys.size(), false);
+    }
     req.add_keys(keys[i]);
     req.add_shm_offsets(offset);
+    req.add_region_bases(region_base);
     req.add_sizes(sizes[i]);
   }
   grpc::ClientContext ctx;
@@ -482,11 +504,18 @@ bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size) {
                                (rpc_status.ok() ? resp.error() : rpc_status.error_message()));
     }
 
+    const uintptr_t base = reinterpret_cast<uintptr_t>(allocation->base);
     std::lock_guard<std::mutex> lock(registration_mu_);
-    if (registered_) HostMemAllocator::ReleaseShmAllocation(registered_base_);
-    registered_base_ = reinterpret_cast<uintptr_t>(allocation->base);
-    registered_size_ = allocation->mapped_size;
-    registered_ = true;
+    auto existing = std::find_if(regions_.begin(), regions_.end(),
+                                 [&](const RegisteredRegion& r) { return r.base == base; });
+    if (existing != regions_.end()) {
+      // Same region re-registered: keep the existing entry and drop the freshly
+      // acquired duplicate allocation (its refcount is balanced by the Release).
+      existing->size = allocation->mapped_size;
+      HostMemAllocator::ReleaseShmAllocation(base);
+    } else {
+      regions_.push_back({base, allocation->mapped_size});
+    }
     acquired_kept = true;
   } catch (...) {
     if (!acquired_kept) {
@@ -499,23 +528,22 @@ bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size) {
 
 void StandaloneProcessClient::DeregisterMemoryLocked() {
   std::string client_id;
-  uintptr_t base = 0;
+  std::vector<RegisteredRegion> regions;
   {
     std::lock_guard<std::mutex> lock(registration_mu_);
-    if (!registered_) return;
+    if (regions_.empty()) return;
     client_id = client_id_;
-    base = registered_base_;
-    registered_ = false;
-    registered_base_ = 0;
-    registered_size_ = 0;
+    regions.swap(regions_);
   }
 
+  // One RPC tears down all of this client's regions server-side (UnmapClient),
+  // so a single DeregisterMemory call covers every region.
   grpc::ClientContext ctx;
   ::umbp::DeregisterMemoryRequest req;
   req.set_client_id(client_id);
   ::umbp::Empty resp;
   if (stub_) stub_->DeregisterMemory(&ctx, req, &resp);
-  HostMemAllocator::ReleaseShmAllocation(base);
+  for (const auto& region : regions) HostMemAllocator::ReleaseShmAllocation(region.base);
 }
 
 void StandaloneProcessClient::DeregisterMemory(uintptr_t /*ptr*/) {

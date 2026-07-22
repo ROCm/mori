@@ -80,7 +80,9 @@ class StandaloneProcessClient : public IUMBPClient {
       const std::vector<std::string>& hashes) override;
 
  private:
-  bool OffsetFor(uintptr_t ptr, size_t size, uint64_t* offset) const;
+  // Resolves `ptr` against the registered host regions. On success writes the
+  // region-relative `offset` and the matched region's worker VA `region_base`.
+  bool OffsetFor(uintptr_t ptr, size_t size, uint64_t* offset, uint64_t* region_base) const;
   bool WaitReady(int timeout_ms) const;
   void MaybeAutoStart();
   std::string ClientId();
@@ -97,11 +99,19 @@ class StandaloneProcessClient : public IUMBPClient {
   std::atomic<bool> closing_{false};
   bool closed_ = false;
 
+  // One registered host shared-memory region. A hybrid HiCache worker (e.g.
+  // DeepSeek-V4) registers several non-contiguous host pools per rank, so the
+  // client tracks N regions and resolves each data op to the one that owns its
+  // pointer. `base` is the worker VA base (== allocation->base), `size` its
+  // mapped size.
+  struct RegisteredRegion {
+    uintptr_t base = 0;
+    size_t size = 0;
+  };
+
   mutable std::mutex registration_mu_;
   std::string client_id_;
-  uintptr_t registered_base_ = 0;
-  size_t registered_size_ = 0;
-  bool registered_ = false;
+  std::vector<RegisteredRegion> regions_;
 };
 
 }  // namespace mori::umbp::standalone
