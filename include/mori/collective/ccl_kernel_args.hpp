@@ -58,15 +58,6 @@ inline int HierDeepPipe() {
   return v;
 }
 
-// Quiet-fence per-sub-chunk landing for DEEP_PIPE (MORI_HIER_DEEP_PIPE_QUIET, default OFF).
-// Each temporal sub-chunk rides its own QP with a plain put; drain that QP's send-CQ
-// (ShmemQuietThread == sub-chunk landed remotely, RC in-order) before the flag AMO, so the
-// flag never precedes the data (bit-exact at scale). Only when deepPipe>1; takes precedence
-// over the put-signal path.
-inline bool HierDeepPipeQuietOn() {
-  const char* e = std::getenv("MORI_HIER_DEEP_PIPE_QUIET");
-  return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
-}
 }  // namespace collective
 }  // namespace mori
 
@@ -337,7 +328,7 @@ struct CclFusedRingRemoteGatherArgs {
   // Deep-SQ temporal pipeline depth (see HierDeepPipe). P>1 splits the chunk into P temporal
   // sub-chunks with per-sub-chunk landing flags; 1 = OFF (byte-identical path).
   int deepPipe = 1;
-  // Deep-SQ QUIET landing fence (see HierDeepPipeQuietOn). 1 => each sub-chunk rides its own
+  // Deep-SQ QUIET landing fence (MORI_HIER_DEEP_PIPE_QUIET). 1 => each sub-chunk rides its own
   // QP; drain its send-CQ (ShmemQuietThread = sub-chunk landed remotely) before the flag AMO
   // so the flag never precedes the data (bit-exact at scale). 0 = OFF. Only when deepPipe>1.
   int deepPipeQuiet = 0;
@@ -419,10 +410,7 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
   {
     const char* q = std::getenv("MORI_HIER_DEEP_PIPE_QUIET");
     const bool quietForcedOff = (q != nullptr && q[0] == '0' && q[1] == '\0');
-    fused.deepPipeQuiet =
-        (HierDeepPipeQuietOn() || (fused.deepPipe > 1 && !quietForcedOff))
-            ? 1
-            : 0;
+    fused.deepPipeQuiet = (fused.deepPipe > 1 && !quietForcedOff) ? 1 : 0;
   }
   fused.localPushOnly = HierLocalPushOnly() ? 1 : 0;
   // Intra reassembly deep-SQ: feed all reassembly channels then drain once.
