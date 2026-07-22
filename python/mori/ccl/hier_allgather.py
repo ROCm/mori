@@ -230,7 +230,6 @@ class HierAllGather:
         inter_num_qp: Optional[int] = None,
         leader_only: Optional[bool] = None,
         gather_in_place: Optional[bool] = None,
-        out_in_place: Optional[bool] = None,
         inter_num_blocks: Optional[int] = None,
         fuse_barrier: Optional[bool] = None,
         slice_inter: Optional[bool] = None,
@@ -255,9 +254,6 @@ class HierAllGather:
         self.gather_in_place = (
             False if gather_in_place is None else bool(gather_in_place)
         )
-        # Opt-in out-in-place: leave the result in the ring buffer (read via
-        # result_tensor). Implies gather_in_place. Default OFF.
-        self.out_in_place = False if out_in_place is None else bool(out_in_place)
         # fuse-barrier: drop the intra gather's finish barrier on the every-rank-
         # direct N>=2 path. Bit-exact: the PUSH gather's flag-wait completes the
         # node-block on return and the ring's prepare_sync barrier follows; flags
@@ -266,8 +262,8 @@ class HierAllGather:
         # Sliced 2-D AllGather (primary bandwidth path): inter ring contributes only
         # each rank's own shard (per-NIC inter (N-1)*count vs non-sliced G*count),
         # then N intra SDMA gathers reassemble rank-major. Default ON; owns its own
-        # data path -> incompatible with leader_only/out_in_place/gather_in_place.
-        _slice_conflict = self.leader_only or self.out_in_place or self.gather_in_place
+        # data path -> incompatible with leader_only/gather_in_place.
+        _slice_conflict = self.leader_only or self.gather_in_place
         self.slice_inter = (
             bool(slice_inter)
             if slice_inter is not None
@@ -321,22 +317,11 @@ class HierAllGather:
         # RDMA (single-node IPC hard-aborts), so default ON for multi-node, OFF for
         # single-node; None defers to the transport probe below.
         self.slice_direct = None if slice_direct is None else bool(slice_direct)
-        if self.slice_inter and (
-            self.leader_only or self.out_in_place or self.gather_in_place
-        ):
+        if self.slice_inter and (self.leader_only or self.gather_in_place):
             raise ValueError(
-                "slice_inter is incompatible with leader_only/out_in_place/"
-                "gather_in_place (it owns the inter+intra data path)"
+                "slice_inter is incompatible with leader_only/gather_in_place "
+                "(it owns the inter+intra data path)"
             )
-        if self.out_in_place:
-            # out-in-place subsumes gather-in-place; incompatible with leader-only
-            # (whose result comes from the SDMA broadcast, not the ring buffer).
-            if self.leader_only:
-                raise ValueError(
-                    "out_in_place is incompatible with leader_only (the leader-only "
-                    "result comes from the SDMA broadcast, not the ring buffer)"
-                )
-            self.gather_in_place = True
         # Flat AllgatherSdma compatibility: split a combined transit size into
         # input/output when not sized explicitly.
         if transit_buffer_size is not None:
@@ -1249,21 +1234,9 @@ class HierAllGather:
                 prepare_barrier=intra_prepare_barrier,
             )
             # Phase 2 (inter ring): all-gather the N node-blocks in node order.
-            if self.out_in_place:
-                # Leave the result in the ring buffer (read via result_tensor); skip
-                # the finish_sync copy-OUT.
-                self._inter(
-                    node_block,
-                    output_data,
-                    block_count,
-                    stream,
-                    chunk_in_place=True,
-                    out_in_place=True,
-                )
-            else:
-                self._inter(
-                    node_block, output_data, block_count, stream, chunk_in_place=True
-                )
+            self._inter(
+                node_block, output_data, block_count, stream, chunk_in_place=True
+            )
             self._prev_op_completed = True
             return True
 
