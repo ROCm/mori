@@ -327,8 +327,6 @@ class InterNodeRingAllgather {
     return 0.0;
   }
 
-  int npes() const { return npes_; }
-  int num_blocks() const { return numBlocks_; }
 };
 
 }  // namespace collective

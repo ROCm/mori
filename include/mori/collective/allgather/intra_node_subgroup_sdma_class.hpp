@@ -440,8 +440,6 @@ class IntraNodeSubGroupAllgatherSdma {
     return 0.0;
   }
 
-  int npes() const { return npes_; }
-
   // Expose out_ so a caller can do the Phase-B copy-OUT with a COMPUTE-UNIT
   // kernel (torch elementwise) instead of the copy engine. The SDMA receiver's
   // __threadfence_system() after acquiring each peer's flag makes the gathered
