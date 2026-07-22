@@ -31,6 +31,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -228,7 +229,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status Put(grpc::ServerContext*, const ::umbp::PutRequest* request,
                    ::umbp::BoolResponse* response) override {
     uintptr_t ptr = 0;
-    if (!ResolveRange(request->client_id(), request->shm_offset(), request->size(), &ptr)) {
+    if (!ResolveRange(request->client_id(), request->region_base(), request->shm_offset(),
+                      request->size(), &ptr)) {
       SetBool(response, false, "unregistered or out-of-range shm buffer");
       return grpc::Status::OK;
     }
@@ -244,7 +246,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status Get(grpc::ServerContext*, const ::umbp::GetRequest* request,
                    ::umbp::BoolResponse* response) override {
     uintptr_t ptr = 0;
-    if (!ResolveRange(request->client_id(), request->shm_offset(), request->size(), &ptr)) {
+    if (!ResolveRange(request->client_id(), request->region_base(), request->shm_offset(),
+                      request->size(), &ptr)) {
       SetBool(response, false, "unregistered or out-of-range shm buffer");
       return grpc::Status::OK;
     }
@@ -278,8 +281,13 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status BatchPutWithDepth(grpc::ServerContext*,
                                  const ::umbp::BatchDataWithDepthRequest* request,
                                  ::umbp::BatchBoolResponse* response) override {
+    // region_bases is optional for legacy single-region callers; when present it
+    // must be parallel to keys (BatchPutWithDepth resolves inline, not through
+    // ResolveBatch).
+    const bool has_region_bases = request->region_bases_size() > 0;
     if (request->keys_size() != request->shm_offsets_size() ||
-        request->keys_size() != request->sizes_size()) {
+        request->keys_size() != request->sizes_size() ||
+        (has_region_bases && request->keys_size() != request->region_bases_size())) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
@@ -287,7 +295,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     ptrs.reserve(request->keys_size());
     for (int i = 0; i < request->keys_size(); ++i) {
       uintptr_t ptr = 0;
-      if (!ResolveRange(request->client_id(), request->shm_offsets(i), request->sizes(i), &ptr)) {
+      uint64_t region_base = has_region_bases ? request->region_bases(i) : 0;
+      if (!ResolveRange(request->client_id(), region_base, request->shm_offsets(i),
+                        request->sizes(i), &ptr)) {
         FillFalse(request->keys_size(), response);
         return grpc::Status::OK;
       }
@@ -393,8 +403,11 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     {
       std::lock_guard<std::mutex> lock(memory_mu_);
       auto it = memory_.find(request->client_id());
-      ok = it != memory_.end() && it->second.worker_base == request->worker_base() &&
-           it->second.size >= request->size();
+      if (it != memory_.end()) {
+        ok = std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& mem) {
+          return mem.worker_base == request->worker_base() && mem.size >= request->size();
+        });
+      }
     }
     if (!ok) {
       SetBool(response, false, "fd handoff registration was not found");
@@ -689,14 +702,25 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
 
     std::string client_id(msg.client_id);
+    RegisteredMemory entry{mapped, static_cast<uint64_t>(msg.worker_base), msg.size};
     std::optional<RegisteredMemory> old_mem;
     {
       std::lock_guard<std::mutex> lock(memory_mu_);
-      auto old = memory_.find(client_id);
-      if (old != memory_.end()) old_mem = old->second;
-      memory_[client_id] =
-          RegisteredMemory{mapped, static_cast<uint64_t>(msg.worker_base), msg.size};
+      auto& regions = memory_[client_id];
+      auto existing = std::find_if(
+          regions.begin(), regions.end(),
+          [&](const RegisteredMemory& mem) { return mem.worker_base == entry.worker_base; });
+      if (existing != regions.end()) {
+        // Same region re-registered: replace the mapping, release the old one.
+        old_mem = *existing;
+        *existing = entry;
+      } else {
+        regions.push_back(entry);
+      }
     }
+    // Release outside the lock, and via ReleaseRegisteredMemory so the backend
+    // deregisters the region before its mapping is munmap'd (required by the
+    // distributed backend; see design-standalone-process-mode.md §5.3/§6.3).
     if (old_mem.has_value()) ReleaseRegisteredMemory(*old_mem);
     MORI_UMBP_INFO("[StandaloneServer] registered shm client_id={} worker_base=0x{:x} size={}MB",
                    client_id, msg.worker_base, msg.size / (1024 * 1024));
@@ -704,22 +728,24 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
   void UnmapClient(const std::string& client_id) {
-    std::optional<RegisteredMemory> mem;
+    std::vector<RegisteredMemory> mems;
     {
       std::lock_guard<std::mutex> lock(memory_mu_);
       auto it = memory_.find(client_id);
       if (it == memory_.end()) return;
-      mem = it->second;
+      mems.swap(it->second);
       memory_.erase(it);
     }
-    ReleaseRegisteredMemory(*mem);
+    for (const auto& mem : mems) ReleaseRegisteredMemory(mem);
   }
 
   void UnmapAll() {
     std::vector<RegisteredMemory> entries;
     {
       std::lock_guard<std::mutex> lock(memory_mu_);
-      for (auto& kv : memory_) entries.push_back(kv.second);
+      for (auto& kv : memory_) {
+        for (const auto& mem : kv.second) entries.push_back(mem);
+      }
       memory_.clear();
     }
     for (const auto& mem : entries) ReleaseRegisteredMemory(mem);
@@ -740,28 +766,43 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     munmap(mem.base, static_cast<size_t>(mem.size));
   }
 
-  bool ResolveRange(const std::string& client_id, uint64_t offset, uint64_t size,
-                    uintptr_t* out_ptr) {
+  // Resolves (client_id, region_base, offset) to a server-local pointer.
+  // region_base selects which of the client's regions the offset is relative to;
+  // 0 means legacy/single-region and falls back to the first region that fits.
+  bool ResolveRange(const std::string& client_id, uint64_t region_base, uint64_t offset,
+                    uint64_t size, uintptr_t* out_ptr) {
     if (!out_ptr || size == 0) return false;
     std::lock_guard<std::mutex> lock(memory_mu_);
     auto it = memory_.find(client_id);
     if (it == memory_.end()) return false;
-    const RegisteredMemory& mem = it->second;
-    if (offset > mem.size || size > mem.size - offset) return false;
-    *out_ptr = reinterpret_cast<uintptr_t>(mem.base) + static_cast<uintptr_t>(offset);
-    return true;
+    for (const auto& mem : it->second) {
+      if (region_base != 0 && mem.worker_base != region_base) continue;
+      if (offset > mem.size || size > mem.size - offset) {
+        if (region_base != 0) return false;
+        continue;
+      }
+      *out_ptr = reinterpret_cast<uintptr_t>(mem.base) + static_cast<uintptr_t>(offset);
+      return true;
+    }
+    return false;
   }
 
   bool ResolveBatch(const ::umbp::BatchDataRequest& request, std::vector<uintptr_t>* ptrs) {
+    // region_bases is optional for legacy single-region callers; when present it
+    // must be parallel to keys.
+    const bool has_region_bases = request.region_bases_size() > 0;
     if (!ptrs || request.keys_size() != request.shm_offsets_size() ||
-        request.keys_size() != request.sizes_size()) {
+        request.keys_size() != request.sizes_size() ||
+        (has_region_bases && request.keys_size() != request.region_bases_size())) {
       return false;
     }
     ptrs->clear();
     ptrs->reserve(request.keys_size());
     for (int i = 0; i < request.keys_size(); ++i) {
       uintptr_t ptr = 0;
-      if (!ResolveRange(request.client_id(), request.shm_offsets(i), request.sizes(i), &ptr)) {
+      uint64_t region_base = has_region_bases ? request.region_bases(i) : 0;
+      if (!ResolveRange(request.client_id(), region_base, request.shm_offsets(i), request.sizes(i),
+                        &ptr)) {
         return false;
       }
       ptrs->push_back(ptr);
@@ -819,7 +860,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   std::mutex client_mu_;
   std::mutex memory_mu_;
-  std::map<std::string, RegisteredMemory> memory_;
+  // A worker registers N non-contiguous host regions (e.g. DeepSeek-V4's KV
+  // side pools), so each client_id maps to a list of regions, resolved by
+  // worker_base at data-op time.
+  std::map<std::string, std::vector<RegisteredMemory>> memory_;
   std::mutex external_identity_lifecycle_mu_;
   std::mutex external_identity_mu_;
   std::map<std::string, std::shared_ptr<ExternalKvIdentityClient>> external_identities_;

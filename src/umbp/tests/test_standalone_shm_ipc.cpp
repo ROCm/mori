@@ -236,6 +236,102 @@ TEST(StandaloneShmIpcTest, StandaloneClientUsesNonZeroOffsetsAndCanReregister) {
   unlink(fd_path.c_str());
 }
 
+TEST(StandaloneShmIpcTest, StandaloneClientResolvesAcrossMultipleRegions) {
+  const std::string address =
+      "unix:///tmp/umbp_standalone_multiregion_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig server_cfg;
+  server_cfg.dram.capacity_bytes = 1 << 20;
+  server_cfg.ssd.enabled = false;
+  UMBPStandaloneProcessConfig sp_cfg;
+  sp_cfg.address = address;
+  sp_cfg.startup_timeout_ms = 5000;
+  server_cfg.standalone_process = sp_cfg;
+
+  standalone::StandaloneServer server(server_cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  UMBPConfig client_cfg = server_cfg;
+  auto client = CreateUMBPClient(client_cfg);
+  ASSERT_EQ(client->GetDeploymentMode(), UMBPDeploymentMode::StandaloneProcess);
+
+  // Two distinct, non-contiguous host shm regions from one client, mirroring a
+  // hybrid HiCache worker registering several host KV pools per rank.
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousShm;
+  opts.prefault = false;
+  HostBufferHandle region_a = allocator.Alloc(4096, opts);
+  HostBufferHandle region_b = allocator.Alloc(8192, opts);
+  ASSERT_TRUE(region_a.valid());
+  ASSERT_TRUE(region_b.valid());
+  auto* bytes_a = static_cast<unsigned char*>(region_a.ptr);
+  auto* bytes_b = static_cast<unsigned char*>(region_b.ptr);
+
+  ASSERT_TRUE(
+      client->RegisterMemory(reinterpret_cast<uintptr_t>(region_a.ptr), region_a.mapped_size));
+  // Registering region B must NOT drop region A (the single-region bug).
+  ASSERT_TRUE(
+      client->RegisterMemory(reinterpret_cast<uintptr_t>(region_b.ptr), region_b.mapped_size));
+
+  // Put/Get resolve correctly in region A.
+  for (int i = 0; i < 16; ++i) bytes_a[32 + i] = static_cast<unsigned char>(i + 1);
+  ASSERT_TRUE(client->Put("key-a", reinterpret_cast<uintptr_t>(bytes_a + 32), 16));
+  std::memset(bytes_a + 96, 0, 16);
+  ASSERT_TRUE(client->Get("key-a", reinterpret_cast<uintptr_t>(bytes_a + 96), 16));
+  for (int i = 0; i < 16; ++i) EXPECT_EQ(bytes_a[96 + i], static_cast<unsigned char>(i + 1));
+
+  // Put/Get resolve correctly in region B.
+  for (int i = 0; i < 24; ++i) bytes_b[64 + i] = static_cast<unsigned char>(0x40 + i);
+  ASSERT_TRUE(client->Put("key-b", reinterpret_cast<uintptr_t>(bytes_b + 64), 24));
+  std::memset(bytes_b + 4096, 0, 24);
+  ASSERT_TRUE(client->Get("key-b", reinterpret_cast<uintptr_t>(bytes_b + 4096), 24));
+  for (int i = 0; i < 24; ++i) EXPECT_EQ(bytes_b[4096 + i], static_cast<unsigned char>(0x40 + i));
+
+  // A batch spanning both regions resolves per-element via region_bases.
+  for (int i = 0; i < 8; ++i) bytes_a[200 + i] = static_cast<unsigned char>(0xa0 + i);
+  for (int i = 0; i < 8; ++i) bytes_b[200 + i] = static_cast<unsigned char>(0xb0 + i);
+  std::vector<std::string> keys{"batch-a", "batch-b"};
+  std::vector<uintptr_t> srcs{reinterpret_cast<uintptr_t>(bytes_a + 200),
+                              reinterpret_cast<uintptr_t>(bytes_b + 200)};
+  std::vector<size_t> sizes{8, 8};
+  std::vector<bool> put_ok = client->BatchPut(keys, srcs, sizes);
+  ASSERT_EQ(put_ok.size(), 2u);
+  EXPECT_TRUE(put_ok[0]);
+  EXPECT_TRUE(put_ok[1]);
+  std::memset(bytes_a + 300, 0, 8);
+  std::memset(bytes_b + 300, 0, 8);
+  std::vector<uintptr_t> dsts{reinterpret_cast<uintptr_t>(bytes_a + 300),
+                              reinterpret_cast<uintptr_t>(bytes_b + 300)};
+  std::vector<bool> get_ok = client->BatchGet(keys, dsts, sizes);
+  ASSERT_EQ(get_ok.size(), 2u);
+  EXPECT_TRUE(get_ok[0]);
+  EXPECT_TRUE(get_ok[1]);
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(bytes_a[300 + i], static_cast<unsigned char>(0xa0 + i));
+  for (int i = 0; i < 8; ++i) EXPECT_EQ(bytes_b[300 + i], static_cast<unsigned char>(0xb0 + i));
+
+  // A pointer outside every registered region fails cleanly (no crash, no hit).
+  HostBufferHandle unregistered = allocator.Alloc(4096, opts);
+  ASSERT_TRUE(unregistered.valid());
+  EXPECT_FALSE(client->Put("key-oob", reinterpret_cast<uintptr_t>(unregistered.ptr), 16));
+  EXPECT_FALSE(client->Get("key-oob", reinterpret_cast<uintptr_t>(unregistered.ptr), 16));
+
+  client->DeregisterMemory(reinterpret_cast<uintptr_t>(region_a.ptr));
+  client->Close();
+  allocator.Free(region_a);
+  allocator.Free(region_b);
+  allocator.Free(unregistered);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
 TEST(StandaloneShmIpcTest, ShutdownDoesNotHangOnHalfOpenFdConnection) {
   const std::string address =
       "unix:///tmp/umbp_standalone_halfopen_" + std::to_string(getpid()) + ".grpc.sock";

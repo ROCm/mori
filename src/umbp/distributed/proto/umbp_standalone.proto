@@ -63,6 +63,9 @@ message PutRequest {
   string client_id = 2;
   uint64 shm_offset = 3;
   uint64 size = 4;
+  // Worker VA base of the region shm_offset is relative to (== the worker_base
+  // sent at RegisterMemory). 0 means single-region / legacy first-fit.
+  uint64 region_base = 5;
 }
 
 message GetRequest {
@@ -70,6 +73,7 @@ message GetRequest {
   string client_id = 2;
   uint64 shm_offset = 3;
   uint64 size = 4;
+  uint64 region_base = 5;
 }
 
 message BatchDataRequest {
@@ -77,6 +81,9 @@ message BatchDataRequest {
   string client_id = 2;
   repeated uint64 shm_offsets = 3;
   repeated uint64 sizes = 4;
+  // Parallel to shm_offsets: region_bases[i] is the worker VA base of the
+  // region shm_offsets[i] is relative to. Empty means single-region / legacy.
+  repeated uint64 region_bases = 5;
 }
 
 message BatchDataWithDepthRequest {
@@ -85,6 +92,7 @@ message BatchDataWithDepthRequest {
   repeated uint64 shm_offsets = 3;
   repeated uint64 sizes = 4;
   repeated int32 depths = 5;
+  repeated uint64 region_bases = 6;
 }
 
 message BatchBoolResponse {
