@@ -682,33 +682,6 @@ class HierAllGather:
         except Exception:
             return False
 
-    def all_gather(self, tensor_list, tensor, stream=None) -> bool:
-        """List-based AllGather (matches ``torch.distributed.all_gather``): gather
-        ``tensor`` from every rank into the ``npes``-entry ``tensor_list`` via the
-        contiguous ``__call__`` path, then scatter rank-major into the list.
-        """
-        if len(tensor_list) != self.npes:
-            raise ValueError(
-                f"tensor_list must have npes={self.npes} entries, got {len(tensor_list)}"
-            )
-        count = tensor.numel()
-        flat = torch.empty(count * self.npes, dtype=tensor.dtype, device=tensor.device)
-        if not self.__call__(tensor, flat, count, stream):
-            return False
-        # Scatter reads ``flat``; make the gather visible first.
-        if stream is not None and hasattr(stream, "synchronize"):
-            stream.synchronize()
-        else:
-            torch.cuda.synchronize()
-        view = (
-            flat.view(self.npes, *tensor.shape)
-            if tensor.dim() > 0
-            else flat.view(self.npes)
-        )
-        for i in range(self.npes):
-            tensor_list[i].copy_(view[i])
-        return True
-
     def _cu_copyout_finish(self, output_data, total_count_elems, stream):
         """CU-domain copy-OUT for the nodirect Phase-B.
 
