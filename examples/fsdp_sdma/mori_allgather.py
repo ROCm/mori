@@ -114,13 +114,6 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
 
     def wait(self, timeout=None) -> bool:  # noqa: ARG002
         if not self._done:
-            # HOSTPROXY_ASYNC: if the inter leg ran on an off-thread worker, join
-            # it first so every chunkReadyFlag is published+landed before this
-            # fence gates the consumer (else reassembly reads stale flags). No-op
-            # on the non-async path.
-            drain = getattr(self._collective, "drain_hostproxy", None)
-            if drain is not None:
-                drain()
             # Per-AG event fence (host-wait on this AG only) if provided,
             # else the full-stream drain.
             _fence = (
