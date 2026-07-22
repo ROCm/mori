@@ -30,6 +30,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
@@ -248,8 +249,9 @@ static CqeFailureAdvice DescribeCqeFailure(ibv_wc_status status, CqeFailureOrigi
 /*                                           RdmaManager                                          */
 /* ---------------------------------------------------------------------------------------------- */
 
-RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* ctx)
-    : config(cfg), ctx(ctx) {
+RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* ctx,
+                         TelemetryRegistry* telemetry)
+    : config(cfg), ctx(ctx), telemetry_(telemetry) {
   application::RdmaDeviceList devices = ctx->GetRdmaDeviceList();
   availDevices = GetActiveDevicePortList(devices);
   if (availDevices.empty()) {
@@ -572,9 +574,12 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
             std::make_shared<std::atomic<bool>>(false),
             std::make_shared<SubmissionLedger>(config.notifPerQp),
             std::make_shared<SqAdmissionEvent>()};
-  meta.rTable[topoKey].push_back(ep);
-
   EndpointId id = nextEndpointId_.fetch_add(1);
+  if (TelemetryConfig::Enabled() && telemetry_) {
+    ep.telem = telemetry_->CreateEpTelemetry(id, ep.sqDepth, ep.maxSqDepth);
+  }
+
+  meta.rTable[topoKey].push_back(ep);
   auto rt = std::make_shared<EndpointRuntime>(id, ep);
   endpointsById_[id] = rt;
   return id;
@@ -626,8 +631,9 @@ application::RdmaDeviceContext* RdmaManager::GetOrCreateDeviceContext(int devId)
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Notification Manager                                      */
 /* ---------------------------------------------------------------------------------------------- */
-NotifManager::NotifManager(RdmaManager* rdmaMgr, const RdmaBackendConfig& cfg)
-    : rdma(rdmaMgr), config(cfg) {}
+NotifManager::NotifManager(RdmaManager* rdmaMgr, const RdmaBackendConfig& cfg,
+                           TelemetryRegistry* telemetry)
+    : rdma(rdmaMgr), config(cfg), telemetry_(telemetry) {}
 
 NotifManager::~NotifManager() { Shutdown(); }
 
@@ -638,6 +644,10 @@ void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) 
     ev.data.u64 = rt->id;
     assert(rt->ep.local.ibvHandle.compCh);
     SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, rt->ep.local.ibvHandle.compCh->fd, &ev));
+  }
+
+  if (rt->ep.telem && rt->ep.ledger) {
+    rt->ep.ledger->EnableTimestamping();
   }
 
   // Skip notification setup if disabled
@@ -699,9 +709,15 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
 
   const int batchSize = 32;
   struct ibv_wc wc[batchSize];
-  int n = 0;
 
-  while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
+  int n = ibv_poll_cq(cq, batchSize, wc);
+
+  if (MORI_IO_TELEM_UNLIKELY(ep.telem)) {
+    ep.telem->counters.cq_poll_count.fetch_add(1, std::memory_order_relaxed);
+    if (n == 0) ep.telem->counters.cq_empty_poll_count.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  while (n > 0) {
     for (int i = 0; i < n; ++i) {
       if (wc[i].status != IBV_WC_SUCCESS) {
         const bool isFlush = (wc[i].status == IBV_WC_WR_FLUSH_ERR);
@@ -730,6 +746,10 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
                 wc[i].wr_id, static_cast<uint32_t>(wc[i].status), failureAdvice.statusText,
                 wc[i].qp_num, wc[i].vendor_err);
           }
+        }
+
+        if (MORI_IO_TELEM_UNLIKELY(ep.telem)) {
+          ep.telem->counters.cqe_errors.fetch_add(1, std::memory_order_relaxed);
         }
 
         int mergedBatchSize = 0;
@@ -837,15 +857,51 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         // Batch path: wr_id carries a recordId from the SubmissionLedger.
         uint64_t recordId = wc[i].wr_id;
         int mergedBatchSize = 0;
-        auto meta = ep.ledger
-                        ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &mergedBatchSize)
-                        : nullptr;
+        uint64_t recordBytes = 0;
+        uint64_t post_tsc = 0;
+        auto meta = ep.ledger ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(),
+                                                        &mergedBatchSize, &recordBytes, &post_tsc)
+                              : nullptr;
         if (meta) {
           NotifySqStateChanged(ep);
+
+          if (MORI_IO_TELEM_UNLIKELY(ep.telem)) {
+            ep.telem->counters.ops_completed.fetch_add(mergedBatchSize, std::memory_order_relaxed);
+            ep.telem->counters.bytes_completed.fetch_add(recordBytes, std::memory_order_relaxed);
+
+            if (post_tsc != 0) {
+              uint64_t delta = __rdtsc() - post_tsc;
+              ep.telem->stats.Update(delta);
+            }
+          }
+
           uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
           TransferStatus* statusPtr = meta->status;
-          if (statusPtr != nullptr && (finishedBefore + mergedBatchSize) == meta->totalBatchSize) {
+          if (statusPtr != nullptr &&
+              (finishedBefore + mergedBatchSize) == static_cast<uint32_t>(meta->totalBatchSize)) {
             statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+
+            if (MORI_IO_TELEM_UNLIKELY(meta->telem) && meta->telem->api_start_tsc != 0) {
+              uint64_t now = __rdtsc();
+              uint64_t first_post = meta->telem->first_post_tsc.load(std::memory_order_relaxed);
+              uint64_t jct = now - meta->telem->api_start_tsc;
+              uint64_t rdma_wall =
+                  (first_post != UINT64_MAX && first_post <= now) ? (now - first_post) : 0;
+              uint64_t sw_overhead =
+                  (first_post != UINT64_MAX && first_post >= meta->telem->api_start_tsc)
+                      ? (first_post - meta->telem->api_start_tsc)
+                      : 0;
+              if (telemetry_) telemetry_->RecordJct(jct, rdma_wall, sw_overhead);
+
+              if (meta->telem->api_counters) {
+                if (meta->telem->is_read)
+                  meta->telem->api_counters->total_bytes_read.fetch_add(meta->telem->total_bytes,
+                                                                        std::memory_order_relaxed);
+                else
+                  meta->telem->api_counters->total_bytes_written.fetch_add(
+                      meta->telem->total_bytes, std::memory_order_relaxed);
+              }
+            }
           }
           MORI_IO_TRACE("ProcessOneCqe: batch CQE for task {} total={} finished={} cur={}",
                         meta->id, meta->totalBatchSize, finishedBefore, mergedBatchSize);
@@ -856,6 +912,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         }
       }
     }
+    n = ibv_poll_cq(cq, batchSize, wc);
   }
 
   if (!flushDrain.Empty()) {
@@ -1312,13 +1369,14 @@ RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
                                        std::vector<application::RdmaMemoryRegion> localMrPerEp,
                                        std::vector<application::RdmaMemoryRegion> remoteMrPerEp,
                                        const EpPairVec& e, Executor* exec,
-                                       MemoryLocationType localLoc)
+                                       MemoryLocationType localLoc, TelemetryRegistry* telemetry)
     : config(config),
       localMrPerEp(std::move(localMrPerEp)),
       remoteMrPerEp(std::move(remoteMrPerEp)),
       eps(e),
       executor(exec),
-      localLoc_(localLoc) {}
+      localLoc_(localLoc),
+      telemetry_(telemetry) {}
 
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
@@ -1326,6 +1384,21 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
   status->SetCode(StatusCode::IN_PROGRESS);
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
+
+  if (MORI_IO_TELEM_UNLIKELY(telemetry_)) {
+    auto tm = std::make_unique<TelemetryMeta>();
+    tm->api_start_tsc = __rdtsc();
+    tm->total_bytes = size;
+    tm->is_read = isRead;
+    tm->api_counters = &telemetry_->ApiCounters();
+    callbackMeta->telem = std::move(tm);
+
+    auto& api = telemetry_->ApiCounters();
+    if (isRead)
+      api.read_calls.fetch_add(1, std::memory_order_relaxed);
+    else
+      api.write_calls.fetch_add(1, std::memory_order_relaxed);
+  }
 
   RdmaOpRet ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, {localOffset},
                                      {remoteOffset}, {size}, callbackMeta, id, isRead, 1,
@@ -1335,6 +1408,10 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
     status->Update(ret.code, ret.message);
+  }
+
+  if (MORI_IO_TELEM_UNLIKELY(callbackMeta->telem) && ret.code == StatusCode::ERR_INVALID_ARGS) {
+    callbackMeta->telem->api_counters->rejected_calls.fetch_add(1, std::memory_order_relaxed);
   }
   if (!ret.Failed() && config.enableNotification) {
     RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
@@ -1394,6 +1471,22 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, totalCredit);
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
+
+  if (MORI_IO_TELEM_UNLIKELY(telemetry_)) {
+    auto tm = std::make_unique<TelemetryMeta>();
+    tm->api_start_tsc = __rdtsc();
+    tm->total_bytes = std::accumulate(sizes.begin(), sizes.end(), uint64_t{0});
+    tm->is_read = isRead;
+    tm->api_counters = &telemetry_->ApiCounters();
+    callbackMeta->telem = std::move(tm);
+
+    auto& api = telemetry_->ApiCounters();
+    if (isRead)
+      api.batch_read_calls.fetch_add(1, std::memory_order_relaxed);
+    else
+      api.batch_write_calls.fetch_add(1, std::memory_order_relaxed);
+  }
+
   RdmaOpRet ret;
   if (canUseWorkerChunking) {
     ExecutorReq req{eps,
@@ -1435,6 +1528,11 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   if (ret.Failed() || ret.Succeeded()) {
     status->Update(ret.code, ret.message);
   }
+
+  if (MORI_IO_TELEM_UNLIKELY(callbackMeta->telem) && ret.code == StatusCode::ERR_INVALID_ARGS) {
+    callbackMeta->telem->api_counters->rejected_calls.fetch_add(1, std::memory_order_relaxed);
+  }
+
   if (!ret.Failed() && config.enableNotification) {
     RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
     if (notifRet.Failed()) {
@@ -1479,11 +1577,17 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
   ValidateRdmaNotificationConfig(config);
   ValidateRdmaTransferConfig(config);
 
+  TelemetryConfig::Init();
+  if (TelemetryConfig::Enabled()) {
+    telemetry_ = std::make_unique<TelemetryRegistry>();
+    telemetry_->SetPollMode(config.pollCqMode);
+  }
+
   auto rdmaCtx = std::make_unique<application::RdmaContext>(application::RdmaBackendType::IBVerbs);
-  rdma.reset(new mori::io::RdmaManager(config, rdmaCtx.get()));
+  rdma.reset(new mori::io::RdmaManager(config, rdmaCtx.get(), telemetry_.get()));
   (void)rdmaCtx.release();
 
-  notif.reset(new NotifManager(rdma.get(), config));
+  notif.reset(new NotifManager(rdma.get(), config, telemetry_.get()));
   notif->Start();
 
   server.reset(new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, config, rdma.get(),
@@ -1685,12 +1789,17 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   }
 
   sess = RdmaBackendSession(config, std::move(localMrPerEp), std::move(remoteMrPerEp), epSet,
-                            executor.get(), local.loc);
+                            executor.get(), local.loc, telemetry_.get());
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                            TransferStatus* status) {
   return notif->PopInboundTransferStatus(remote, id, status);
+}
+
+TelemetrySnapshot RdmaBackend::GetTelemetrySnapshot() const {
+  if (!telemetry_) return {};
+  return telemetry_->Snapshot();
 }
 
 RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,

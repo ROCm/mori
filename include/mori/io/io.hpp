@@ -25,3 +25,4 @@
 #include "mori/io/engine.hpp"
 #include "mori/io/enum.hpp"
 #include "mori/io/logging.hpp"
+#include "mori/io/telemetry.hpp"
