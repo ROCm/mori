@@ -22,19 +22,9 @@
 # SOFTWARE.
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 # MIT License
-"""Bit-exact test for ``HierAllGather.enqueue_param_contiguous`` (param-
-contiguous zero-copy) vs a ``torch.distributed.all_gather_into_tensor``
-reference reshuffled into the FSDP ``[param][rank]`` layout.
-
-The zero-copy path pushes straight into the ``[param][rank]`` output instead of
-gathering rank-major and reshuffling; it must be byte-identical (AllGather is a
-pure data move).
-
-Cross node -- launch under torchrun::
-
-    torchrun --nnodes=2 --nproc_per_node=4 ... \
-        tests/python/ccl/test_hier_allgather_param_contiguous.py
-"""
+"""Bit-exact test: ``HierAllGather.enqueue_param_contiguous`` (zero-copy into
+``[param][rank]``) vs all_gather_into_tensor reshuffled to the same layout.
+Must be byte-identical (AllGather is a pure data move). Launch under torchrun."""
 
 import os
 import traceback
@@ -46,9 +36,7 @@ import torch.distributed as dist
 import mori.shmem as shmem
 from mori.ccl import HierAllGather
 
-# Cross-node torchrun-only harness: SKIP under a plain `pytest` collection (no
-# torchrun env) so the suite does not ERROR; runs only when torchrun sets
-# RANK/WORLD_SIZE.
+# torchrun-only: SKIP (not ERROR) under plain pytest collection.
 pytestmark = pytest.mark.skipif(
     "RANK" not in os.environ or "WORLD_SIZE" not in os.environ,
     reason="cross-node harness; launch under torchrun",
@@ -56,19 +44,14 @@ pytestmark = pytest.mark.skipif(
 
 _DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.int32]
 
-# Per-rank per-param element counts (packed shard = concat of these). Sizes are
-# LARGE (multi-MiB total) so the fresh output allocation lands on its own caching-
-# allocator segment base -- required for the direct path's ShmemSymmetricRegister
-# / hipIpcGetMemHandle of the intra-node IPC peers (a sub-allocation aborts). All
-# even -> 4-byte aligned byte extents for bf16/fp16.
+# Per-param element counts (packed shard = concat). Multi-MiB so the output lands
+# on its own caching-allocator segment base -- the direct path's IPC register
+# (hipIpcGetMemHandle) aborts on a sub-allocation. Even -> 4B-aligned bf16/fp16.
 _PARAM_SPLITS = [1048576, 524288, 262144, 131072, 65536]
 
-# Large profile: matches Qwen-7B's biggest FSDP all-gathers (embed + lm_head,
-# ~544M elems gathered = ~1.09GB/rank bf16). Per-rank shard ~= 544M/8 = 68M.
-# Two ~34M splits so the gathered total per param crosses the u32 byte-offset
-# regime: int32 gathered = 8*68M*4 ~= 2.14GB ~= 2^31 bytes -> probes u32
-# byte-index overflow in the scatter/ring kernels. bf16 gathered ~= 1.07GB/rank.
-_PARAM_SPLITS_LARGE = [34078720, 34078720]  # 2 * ~2^25.02; sum = 68157440/rank
+# Large profile: int32 gathered crosses 2^31 bytes -> probes u32 byte-index
+# overflow in the scatter/ring kernels.
+_PARAM_SPLITS_LARGE = [34078720, 34078720]
 
 
 def _make_input(dtype, count, rank, device):
@@ -78,7 +61,7 @@ def _make_input(dtype, count, rank, device):
 
 
 def _expected_param_contiguous(inp, splits, world_size, rank, device):
-    """Reference: RCCL rank-major gather -> reshuffle to [param][rank]."""
+    """Reference: rank-major gather -> reshuffle to [param][rank]."""
     count = inp.numel()
     rank_major = torch.empty(count * world_size, dtype=inp.dtype, device=device)
     dist.all_gather_into_tensor(rank_major, inp)  # [r0_shard, r1_shard, ...]
@@ -174,9 +157,7 @@ def _worker_body(rank, world_size, ranks_per_node, device):
         _run_profile(
             "small", _PARAM_SPLITS, _DTYPES, 3, rank, world_size, ranks_per_node, device
         )
-        # Large profile: the Qwen embed+lm_head band. bf16/fp32 (FSDP dtypes) +
-        # int32 (probes 2^31 byte-offset overflow in the scatter/ring). Fewer
-        # reps -- each is ~2GB buffers.
+        # Large profile: bf16/fp32 + int32 (2^31 byte-offset overflow probe).
         _run_profile(
             "large",
             _PARAM_SPLITS_LARGE,

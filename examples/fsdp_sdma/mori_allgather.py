@@ -21,15 +21,11 @@
 # SOFTWARE.
 """Cross-node FSDP2 all-gather backend backed by mori.ccl.HierAllGather.
 
-Intra-node traffic rides the SDMA copy engines (XGMI); inter-node traffic goes
-over RDMA (NIC). Wired into FSDP2 via ``FSDPModule.set_custom_all_gather``.
-
-``HierAllGather`` exposes a param-contiguous zero-copy path
-(``enqueue_param_contiguous``) for the cross-node (num_nodes>=2, slice_direct
-over RDMA) case: the gathered result is pushed straight into FSDP's
-``[param][rank]`` output, eliminating the rank-major -> param copy-out. On
-single-node (num_nodes==1) the direct path is unavailable, so this backend
-keeps the rank-major copy-out there.
+Intra-node traffic rides SDMA copy engines (XGMI); inter-node goes over RDMA.
+Wired in via ``FSDPModule.set_custom_all_gather``. The param-contiguous
+zero-copy path (``enqueue_param_contiguous``) is available cross-node only
+(num_nodes>=2, slice_direct over RDMA): the result lands straight in FSDP's
+``[param][rank]`` output. Single-node keeps the rank-major copy-out.
 """
 
 import importlib
@@ -57,16 +53,13 @@ class _HierWork:
 
 
 class _HostProxyDeferredWork(dist.distributed_c10d.Work):
-    """c10d Work that defers the host-blocking landing fence of the host-proxy AG.
+    """c10d Work deferring the host-blocking landing fence of the host-proxy AG.
 
-    The all-gather's ``_post`` (RDMA write + step-1 intra gather) already ran
-    non-blocking; this Work's ``wait()`` runs ``_complete`` (wait_all + rail-pair
-    barrier + step-3 intra gather). FSDP invokes ``.wait()`` at copy-out -- after
-    it has issued the current layer's compute and prefetched the next unshard --
-    so the cross-node RDMA round trip + the intra gather overlap the caller's
-    backward GEMM instead of stalling the host mid-all-gather. Must subclass c10d
-    Work: FSDP's foreach_all_gather_copy_out calls ``.wait()`` iff the returned
-    object is a ``dist.distributed_c10d.Work``.
+    ``_post`` (RDMA write + step-1 intra gather) already ran non-blocking;
+    ``wait()`` runs ``_complete`` (wait_all + rail-pair barrier + step-3) at
+    copy-out so the cross-node round trip overlaps the caller's backward GEMM.
+    Must subclass c10d Work: FSDP calls ``.wait()`` only on a
+    ``dist.distributed_c10d.Work``.
     """
 
     def __init__(self, collective, handle, drain=False) -> None:
@@ -79,12 +72,10 @@ class _HostProxyDeferredWork(dist.distributed_c10d.Work):
     def wait(self, timeout=None) -> bool:  # noqa: ARG002
         if not self._done:
             self._collective._complete(self._handle)
-            # MORI_HOSTPROXY_ASYNC_DRAIN=1: host-drain the AG stream after
-            # _complete so step-3 (the remote-half broadcast) is landed+visible
-            # before FSDP's copy-out reads ``out``. _complete only enqueues step-3
-            # on the captured AG stream; if the consumer stream is not ordered
-            # after it, copy-out races the still-pending step-3 -> the remote half
-            # stays garbage -> NaN.
+            # ASYNC_DRAIN=1: host-drain the AG stream after _complete so step-3
+            # (the remote-half broadcast) is landed+visible before copy-out reads
+            # ``out``; else copy-out races the still-pending step-3 -> garbage
+            # remote half -> NaN.
             if self._drain:
                 self._handle["stream"].synchronize()
             self._collective._pending = None
@@ -96,19 +87,14 @@ class _HostProxyDeferredWork(dist.distributed_c10d.Work):
 
 
 class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
-    """c10d Work that DEFERS the device-path host landing fence to copy-out.
+    """c10d Work deferring the device-path host landing fence to copy-out.
 
-    The device HierAllGather (fused fill, FUSE_LOCAL/FUSE_REMOTE) is issued
-    non-blocking on the dedicated all_gather_stream; the only reliably bit-exact
-    landing fence on this MI300X/mlx5 is a host ``stream.synchronize()`` (it drains
-    both SDMA copy-engine HSA signals and RDMA CQEs, which on-device/on-stream
-    fences do not). Doing that sync inline at issue time stalls the host
-    mid-all-gather and caps throughput. Deferring it to ``wait()`` lets FSDP issue
-    this layer's compute and prefetch the next unshard between the AG issue and the
-    copy-out wait(), so the host sync overlaps the backward GEMM. FSDP's
-    foreach_all_gather_copy_out calls ``.wait()`` iff the returned object subclasses
-    ``dist.distributed_c10d.Work``. Bit-exact: the sync drains before the consumer
-    reads.
+    The device HierAllGather (fused fill) is issued non-blocking on
+    all_gather_stream; the only bit-exact landing fence on MI300X/mlx5 is a host
+    ``stream.synchronize()`` (drains both SDMA copy-engine HSA signals and RDMA
+    CQEs, which on-device/on-stream fences do not). Deferred to ``wait()`` so it
+    overlaps the backward GEMM. Must subclass c10d Work (FSDP calls ``.wait()``
+    only on one). Bit-exact: the sync drains before the consumer reads.
     """
 
     def __init__(
@@ -120,21 +106,18 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
         super().__init__()
         self._stream = stream
         self._collective = collective
-        # Optional per-AG event -- when set, wait() host-blocks on THIS AG's
-        # completion event instead of the whole ag_stream (avoids over-draining a
-        # FWD-prefetched later AG queued on the same stream). event.synchronize()
-        # is still a host fence, so it drains SDMA/RDMA HW completion (bit-exact).
+        # Optional per-AG event: wait() host-blocks on THIS AG's completion event
+        # instead of the whole ag_stream (avoids over-draining a FWD-prefetched
+        # later AG on the same stream). Still a host fence -> bit-exact.
         self._event = event
         self._done = False
 
     def wait(self, timeout=None) -> bool:  # noqa: ARG002
         if not self._done:
-            # Async completion-ordering: if the composition ran the inter leg on
-            # an off-thread async worker (HOSTPROXY_ASYNC), join it first so every
-            # chunkReadyFlag is published+landed before this fence gates the
-            # consumer. Without this the caller-stream synchronize can fire while
-            # the worker is still publishing a later AG's flags -> reassembly reads
-            # stale flags -> loss drifts. On the non-async path drain is a no-op.
+            # HOSTPROXY_ASYNC: if the inter leg ran on an off-thread worker, join
+            # it first so every chunkReadyFlag is published+landed before this
+            # fence gates the consumer (else reassembly reads stale flags). No-op
+            # on the non-async path.
             drain = getattr(self._collective, "drain_hostproxy", None)
             if drain is not None:
                 drain()
@@ -154,10 +137,9 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
 
 
 class MoriAllGather(AllGather):
-    """Unified MORI all-gather backend for FSDP2 — the same class for single-node
-    and cross-node. Internally routes intra-node traffic over SDMA (XGMI) and, when
-    the process group spans multiple nodes, inter-node traffic over RDMA. User code
-    is identical in both cases: ``model.set_custom_all_gather(MoriAllGather())``.
+    """Unified MORI all-gather backend for FSDP2 (single-node and cross-node).
+    Routes intra-node over SDMA (XGMI) and, when the PG spans nodes, inter-node
+    over RDMA. Usage: ``model.set_custom_all_gather(MoriAllGather())``.
     """
 
     supports_param_contiguous_output = False
@@ -172,79 +154,58 @@ class MoriAllGather(AllGather):
         self._pc_split_sizes: list[int] | None = None
         self._pc_split_offsets: list[int] | None = None
         self._pc_input_numel: int | None = None
-        # Param-contiguous zero-copy is only available cross-node (num_nodes>=2,
-        # slice_direct over RDMA). FSDP reads this attribute before the collective
-        # exists, so derive num_nodes from the launch env (torchrun sets both).
+        # Param-contiguous zero-copy is cross-node only (num_nodes>=2,
+        # slice_direct over RDMA). FSDP reads this before the collective exists,
+        # so derive num_nodes from the launch env.
         world = int(os.environ.get("WORLD_SIZE", "0") or "0")
         if world > 0:
             rpn = self._ranks_per_node_value(world)
             num_nodes = world // rpn if rpn else 1
             self.supports_param_contiguous_output = num_nodes >= 2
-            # Zero-tuning defaults (MORI_FSDP_AUTO=1, on by default): make
-            # `model.set_custom_all_gather(MoriAllGather())` bit-exact and faster
-            # than the framework default with no env tuning. Cross-node, turn on
-            # the fused SDMA-intra + RDMA-inter overlap path and its deferred
-            # (bit-exact) host landing fence, and pick the pipe depth from the
-            # topology. Everything is applied with setdefault(), so any MORI_*
-            # variable set explicitly still wins; MORI_FSDP_AUTO=0 restores the
-            # fully-manual (all-off) behavior.
+            # Zero-tuning defaults (MORI_FSDP_AUTO=1): bit-exact, faster than the
+            # framework default with no env tuning. Applied via setdefault() so any
+            # explicit MORI_* wins; MORI_FSDP_AUTO=0 restores fully-manual behavior.
             if num_nodes >= 2 and os.environ.get("MORI_FSDP_AUTO", "1") not in (
                 "0",
                 "false",
                 "False",
             ):
                 _sd = os.environ.setdefault
-                # fused hierarchical fill: SDMA intra-node reassembly + RDMA inter
-                # ring (the CU-free path that frees compute units for the GEMMs).
+                # fused hierarchical fill: SDMA intra reassembly + RDMA inter ring
+                # (CU-free path, frees compute units for the GEMMs).
                 _sd("MORI_HIER_FUSE_LOCAL", "1")
                 _sd("MORI_HIER_FUSE_REMOTE", "1")
                 _sd("MORI_HIER_LOCAL_PUSHONLY", "1")
-                # Pipe depth is topology-aware. On 8-GPU/node x >=2 nodes
-                # (world>=16) the fused plain path already saturates the fabric and
-                # temporal deep-pipelining adds no bandwidth while risking an init
-                # fault on the giant embed/lm_head AG, so leave the deep pipe off
-                # and rely on the fused host-drain path (bit-exact). Smaller
-                # topologies (<=4 GPU/node) benefit, and use the per-size adaptive
-                # depth. <=4 GPU/node also fans the reassembly across more SDMA
-                # queues (spare engines exist); at 8 GPU/node every engine is
-                # already committed, so raising the channel count over-subscribes
-                # and is left at the library default.
+                # Pipe depth is topology-aware: at 8 GPU/node every SDMA engine is
+                # already committed, so the deep pipe / extra channels add no
+                # bandwidth and risk an init fault on the giant embed/lm_head AG;
+                # <=4 GPU/node has spare engines and benefits.
                 if rpn < 8:
                     _sd("MORI_HIER_DEEP_PIPE", "auto")
                     _sd("MORI_SDMA_NUM_CHANNELS", "8")
                 else:
-                    # rpn >= 8 (world>=16, 8 GPU/node) correctness gate.
-                    # At 8 ranks/node the zero-copy param-contiguous scatter
-                    # (enqueue_param_contiguous) produces uniform-garbage output
-                    # (loss stuck at ln(vocab); works at rpn==4/w8), and the
-                    # copy-out __call__'s HIP-graph capture poisons the HIP context
-                    # -> a "Shmem state is not initialized" SIGABRT at the first
-                    # cross-node AG. The bit-exact dense-node base is the copy-out
-                    # path with the full per-op host-drain landing fence:
-                    #   * MORI_FSDP_NO_ZERO_COPY=1 routes off the broken zero-copy
-                    #     scatter to the rank-major copy-out __call__ path;
-                    #   * MORI_HIER_DEBUG_SYNC=1 is the host stream.synchronize()
-                    #     landing fence that drains the cross-PE RDMA/SDMA
-                    #     completions (the only bit-exact fence at 8 ranks/node) and
-                    #     disables the poison-prone HIP-graph capture (the __call__
-                    #     graph path is gated `and not self._debug_sync`).
-                    #   * MORI_HIER_CUDA_GRAPH=0 belt-and-suspenders (redundant once
-                    #     DEBUG_SYNC is on, but explicit for anyone toggling sync).
-                    # w8 (rpn==4) never enters this branch -> unchanged.
+                    # rpn>=8 (8 GPU/node) correctness gate: the zero-copy
+                    # param-contiguous scatter produces garbage output and the
+                    # copy-out HIP-graph capture poisons the HIP context (SIGABRT).
+                    # Bit-exact base = rank-major copy-out with the host-drain
+                    # landing fence:
+                    #   * NO_ZERO_COPY routes off the broken zero-copy scatter;
+                    #   * DEBUG_SYNC is the host stream.synchronize() fence draining
+                    #     cross-PE RDMA/SDMA completions (only bit-exact fence here)
+                    #     and disables the poison-prone HIP-graph capture;
+                    #   * CUDA_GRAPH=0 belt-and-suspenders.
                     _sd("MORI_FSDP_NO_ZERO_COPY", "1")
                     _sd("MORI_HIER_DEBUG_SYNC", "1")
                     _sd("MORI_HIER_CUDA_GRAPH", "0")
-                # Deferred host landing fence: issue the AG non-blocking and drain
-                # the one reliable host fence at copy-out so it overlaps the
-                # backward GEMM / forward prefetch instead of stalling inline.
-                # Bit-exact by construction (drains before the consumer reads).
+                # Deferred host landing fence: issue non-blocking, drain the one
+                # reliable host fence at copy-out so it overlaps the backward GEMM.
+                # Bit-exact (drains before the consumer reads).
                 _sd("MORI_FSDP_DEFER_HOSTSYNC", "1")
                 _sd("MORI_FSDP_EVENT_FENCE", "1")
                 _sd("MORI_FSDP_FWD_PREFETCH", "1")
                 _sd("MORI_FSDP_FWD_PREFETCH_ROOT", "1")
-        # MORI_FSDP_NO_ZERO_COPY=1 forces the copy-out __call__ path (which keeps
-        # the fuse_local/slice_direct_overlap inter-ring overlap) instead of the
-        # zero-copy scatter.
+        # NO_ZERO_COPY=1 forces the copy-out __call__ path (keeps the inter-ring
+        # overlap) instead of the zero-copy scatter.
         if os.environ.get("MORI_FSDP_NO_ZERO_COPY", "") not in (
             "",
             "0",
@@ -252,10 +213,9 @@ class MoriAllGather(AllGather):
             "False",
         ):
             self.supports_param_contiguous_output = False
-        # Host-proxy path (MORI_FSDP_HOST_PROXY=1): the CPU-posted collective has
-        # no enqueue_param_contiguous method, so it must go through the rank-major
-        # copy-out __call__ branch. Force param-contiguous off so FSDP allocates a
-        # plain rank-major output and never calls the zero-copy scatter.
+        # Host-proxy path: the CPU-posted collective has no
+        # enqueue_param_contiguous, so force param-contiguous off (rank-major
+        # copy-out only).
         self._host_proxy = os.environ.get("MORI_FSDP_HOST_PROXY", "") not in (
             "",
             "0",
@@ -265,28 +225,22 @@ class MoriAllGather(AllGather):
         if self._host_proxy:
             self.supports_param_contiguous_output = False
         # Deferred-completion overlap for the host-proxy path
-        # (MORI_HOSTPROXY_ASYNC=1, default OFF). When set, the host-proxy AG posts
-        # the cross-node RDMA write + step-1 intra gather now (non-blocking) and
-        # returns a c10d Work whose wait() runs the host-blocking landing fence
-        # (wait_all + rail-pair barrier + step-3), so the cross-node round trip
-        # overlaps the caller's compute instead of stalling the host mid-AG.
+        # (MORI_HOSTPROXY_ASYNC=1, default OFF): post RDMA write + step-1 now
+        # (non-blocking), return a c10d Work whose wait() runs the landing fence
+        # (wait_all + rail-pair barrier + step-3) -> round trip overlaps compute.
         self._hostproxy_async = os.environ.get("MORI_HOSTPROXY_ASYNC", "") not in (
             "",
             "0",
             "false",
             "False",
         )
-        # Async correctness defaults. The deferred-completion path is bit-exact
-        # only with both of:
-        #   * ASYNC_DRAIN: host-drain the AG stream after _complete so step-3 (the
-        #     remote-half broadcast) is landed+visible before FSDP's copy-out reads
-        #     ``out`` (else a completion-visibility race -> garbage remote half ->
-        #     total NaN);
-        #   * ASYNC_RING=2: double-buffer the recv staging so the partner's next-op
-        #     RDMA write cannot overtake this op's step-3 read (else a residual
-        #     nondeterministic drift in later windows).
-        # Enabling ASYNC without these races, so turn them on by default whenever
-        # ASYNC is requested (setdefault => explicit overrides still win).
+        # Async correctness defaults (bit-exact only with both):
+        #   * ASYNC_DRAIN: host-drain the AG stream after _complete so step-3 is
+        #     landed+visible before copy-out reads ``out`` (else garbage remote
+        #     half -> NaN);
+        #   * ASYNC_RING=2: double-buffer recv staging so the partner's next-op
+        #     write cannot overtake this op's step-3 read.
+        # setdefault => explicit overrides still win.
         if self._hostproxy_async:
             os.environ.setdefault("MORI_HOSTPROXY_ASYNC_DRAIN", "1")
             os.environ.setdefault("MORI_HOSTPROXY_ASYNC_RING", "2")
@@ -294,29 +248,20 @@ class MoriAllGather(AllGather):
             "MORI_HOSTPROXY_ASYNC_DRAIN", ""
         ) not in ("", "0", "false", "False")
         # Deferred device-path host landing fence (MORI_FSDP_DEFER_HOSTSYNC=1,
-        # default OFF). For the device HierAllGather (fused fill), issue the AG
-        # non-blocking and return a c10d Work whose wait() does the host
-        # stream.synchronize() landing fence at copy-out -- so the reliable host
-        # fence overlaps the backward GEMM instead of stalling inline. This is the
-        # fused-fill counterpart of the host-proxy async path. Composes with
-        # FUSE_LOCAL/FUSE_REMOTE (fast device fill).
+        # default OFF): issue the fused device AG non-blocking, host
+        # stream.synchronize() at copy-out so the reliable fence overlaps the
+        # backward GEMM. Composes with FUSE_LOCAL/FUSE_REMOTE.
         self._defer_hostsync = os.environ.get("MORI_FSDP_DEFER_HOSTSYNC", "") not in (
             "",
             "0",
             "false",
             "False",
         )
-        # MORI_FSDP_EVENT_FENCE=1 (default OFF). The deferred landing fence
-        # normally does a full ``stream.synchronize()`` on the shared
-        # all_gather_stream. Under FWD_PREFETCH=1 the next layer's AG is already
-        # issued on that same stream by the time this layer's copy-out wait() fires,
-        # so ``stream.synchronize()`` over-drains: layer L's fence blocks on L+1's
-        # RDMA landing too, serializing tails that should overlap. Instead record a
-        # per-AG CUDA event right after L's AG kernel and host-wait on that event
-        # (event.synchronize()) -- a host-blocking landing fence that drains only up
-        # to L's completion, letting L+1's landing overlap L's compute/consume.
-        # Still a host fence (bit-exact, unlike on-device event.wait ordering);
-        # does not reorder landing->consume for L. Default OFF => byte-identical
+        # MORI_FSDP_EVENT_FENCE=1 (default OFF): under FWD_PREFETCH the next
+        # layer's AG is already on the shared ag_stream at copy-out, so
+        # ``stream.synchronize()`` over-drains (L's fence blocks on L+1's landing,
+        # serializing tails). Instead host-wait on a per-AG event draining only up
+        # to L. Still a host fence (bit-exact). Default OFF => byte-identical
         # stream fence.
         self._event_fence = os.environ.get("MORI_FSDP_EVENT_FENCE", "") not in (
             "",
@@ -363,13 +308,11 @@ class MoriAllGather(AllGather):
         ):
             return self._collective
 
-        # Host-proxy E2E path (MORI_FSDP_HOST_PROXY=1, default OFF). Route the
-        # FSDP all-gather through the persistent CPU-posted hierarchical transport
-        # (mori.ccl.HostProxyHierAllGather) instead of the device IBGDA
-        # HierAllGather. Same handle(inp, out, numel, stream) contract, so the
-        # __call__ ``else`` branch drives it unchanged. The host completion
-        # (wait_all) + rail-pair barrier is the landing fence. Built once with a
-        # generous per-rank cap (no mid-run rebuild -> no engine/port churn).
+        # Host-proxy E2E path (default OFF): route the AG through the CPU-posted
+        # HostProxyHierAllGather instead of the device IBGDA HierAllGather. Same
+        # handle(inp, out, numel, stream) contract; host wait_all + rail-pair
+        # barrier is the landing fence. Built once with a generous cap (no mid-run
+        # rebuild).
         if os.environ.get("MORI_FSDP_HOST_PROXY", "") not in (
             "",
             "0",
@@ -451,10 +394,9 @@ class MoriAllGather(AllGather):
         device: torch.device,
     ) -> object | None:
         """Build per-param split metadata (in DTYPE elements) for the direct
-        param-contiguous scatter. ``HierAllGather.enqueue_param_contiguous``
-        writes param ``s`` (per-rank numel ``E_s`` at cumulative input offset
-        ``O_s``) so global rank ``r``'s slice lands at ``O_s*W + r*E_s`` == the
-        exact ``[param][rank]`` layout FSDP views in place.
+        param-contiguous scatter. ``enqueue_param_contiguous`` writes param ``s``
+        (per-rank numel ``E_s`` at input offset ``O_s``) so global rank ``r``'s
+        slice lands at ``O_s*W + r*E_s`` == FSDP's ``[param][rank]`` layout.
         """
         self.clear_param_contiguous_output()
         if not self.supports_param_contiguous_output:
@@ -479,11 +421,9 @@ class MoriAllGather(AllGather):
             sizes.append(e)
             offsets.append(offset)
             offset += e
-        # Store Python lists (not GPU tensors): passing GPU tensors into
-        # enqueue_param_contiguous forces a .tolist() D2H sync on every per-layer
-        # all-gather, draining the async pipeline and destroying the AG<->backward
-        # overlap. Lists are consumed sync-free; enqueue_param_contiguous caches
-        # the u32 GPU tensors internally.
+        # Store Python lists, not GPU tensors: passing GPU tensors forces a
+        # .tolist() D2H sync per all-gather, killing AG<->backward overlap.
+        # enqueue_param_contiguous caches the u32 GPU tensors internally.
         self._pc_split_sizes = sizes
         self._pc_split_offsets = offsets
         self._pc_input_numel = all_gather_input_numel
@@ -497,8 +437,7 @@ class MoriAllGather(AllGather):
     def _can_call_param_contiguous(self, input_tensor: torch.Tensor) -> bool:
         if self._pc_split_sizes is None or self._pc_split_offsets is None:
             return False
-        # Compare against the cached python-int numel -- no .item()/.sum() D2H
-        # sync (that would fire on every call and serialize the whole step).
+        # Compare against the cached python-int numel -- no .item()/.sum() D2H sync.
         if self._pc_input_numel != input_tensor.numel():
             self.clear_param_contiguous_output()
             return False
@@ -517,28 +456,20 @@ class MoriAllGather(AllGather):
         collective = self._get_collective(group, per_rank_bytes)
         device = input_tensor.device
         stream = torch.cuda.current_stream(device)
-        # Cross-stream lifetime guard: FSDP2 issues this all-gather on a dedicated
-        # comm stream, but the sharded-param input was produced on -- and is
-        # freed/recycled by reshard_after_forward on -- the compute stream. The
-        # caching allocator only tracks the input's original (compute) stream, so
-        # it may hand the input's storage to a later compute-stream op while mori
-        # is still reading it on the comm stream -> the big embed/lm_head AGs read a
-        # partially-overwritten input and diverge. record_stream tells the
-        # allocator the input is in use on the AG stream, deferring reuse until this
-        # AG completes. Same for the output (FSDP may recycle it too). Sync-free (no
-        # host stall) and the standard non-default-stream collective safety
-        # contract.
+        # Cross-stream lifetime guard: FSDP issues this AG on a dedicated comm
+        # stream, but the input was produced on / freed by reshard on the compute
+        # stream. The allocator tracks only the input's compute stream, so it may
+        # hand the storage to a later compute op while mori still reads it on the
+        # comm stream -> corruption. record_stream defers reuse until this AG
+        # completes (same for output). Sync-free; standard non-default-stream
+        # collective safety contract.
         input_tensor.record_stream(stream)
         output_tensor.record_stream(stream)
 
-        # Deferred-completion host-proxy path (MORI_FSDP_HOST_PROXY=1 +
-        # MORI_HOSTPROXY_ASYNC=1): post the cross-node RDMA write + step-1 intra
-        # gather now (non-blocking) and return a c10d Work whose wait() runs the
-        # landing fence at copy-out. FSDP issues this layer's compute + the next
-        # unshard prefetch between the post and the wait, so the cross-node round
-        # trip overlaps the backward GEMM. The staging heap holds one in-flight op;
-        # FSDP's schedule guarantees copy-out(N) (which wait()s) precedes
-        # all-gather(N+1). A still-pending op is defensively drained.
+        # Deferred-completion host-proxy path (HOST_PROXY + HOSTPROXY_ASYNC): post
+        # RDMA write + step-1 now (non-blocking), return a c10d Work whose wait()
+        # runs the landing fence at copy-out so the round trip overlaps compute.
+        # One in-flight op; a still-pending op is defensively drained.
         if self._host_proxy and self._hostproxy_async:
             pend = getattr(collective, "_pending", None)
             if pend is not None:
@@ -564,9 +495,8 @@ class MoriAllGather(AllGather):
                 stream=stream,
             )
             if not ok:
-                # FSDP already committed to the [param][rank] layout; a rank-major
-                # fallback would corrupt it. Fail loudly instead (the cross-node
-                # slice_direct path is expected to be available on the target run).
+                # FSDP already committed to [param][rank]; a rank-major fallback
+                # would corrupt it. Fail loudly (slice_direct expected available).
                 raise RuntimeError(
                     "MORI HierAllGather param-contiguous path unavailable "
                     "(slice_direct/RDMA required); refusing rank-major fallback"
@@ -575,15 +505,14 @@ class MoriAllGather(AllGather):
             ok = collective(input_tensor, output_tensor, count, stream=stream)
             if not ok:
                 raise RuntimeError("MORI HierAllGather call failed")
-        # Deferred device-path host landing fence: the fused/zero-copy device AG
-        # was issued non-blocking above; return a c10d Work whose wait() runs the
-        # host stream.synchronize() at copy-out so the reliable landing fence
-        # overlaps the caller's backward GEMM on the fast fused fill.
+        # Deferred device-path host landing fence: the device AG was issued
+        # non-blocking above; return a c10d Work whose wait() runs the host
+        # stream.synchronize() at copy-out so the fence overlaps the backward GEMM.
         if self._defer_hostsync:
             _ev = None
             if self._event_fence:
-                # Record L's completion on the ag_stream NOW (before any
-                # later prefetched AG is queued) so wait() drains only L.
+                # Record L's completion on the ag_stream now (before any later
+                # prefetched AG is queued) so wait() drains only L.
                 _ev = torch.cuda.Event()
                 _ev.record(stream)
             return _DeviceDeferredHostSyncWork(stream, collective, _ev)
@@ -595,14 +524,12 @@ class MoriAllGather(AllGather):
 
 
 class MoriIntraSubGroupAllGather(AllGather):
-    """MORI all-gather for HSDP / hybrid-shard, where the FSDP shard group is a
-    single node's ranks (4 GPU). The all-gather then rides pure intra-node SDMA
-    (XGMI copy engines) with no inter-node RDMA ring. The inter-node grad
-    all-reduce (the replicate dim) stays on native for both native and mori modes.
+    """MORI all-gather for HSDP / hybrid-shard where the FSDP shard group is one
+    node (4 GPU): pure intra-node SDMA (XGMI), no inter-node RDMA ring. The
+    inter-node grad all-reduce (replicate dim) stays on native.
 
-    SHMEM is initialized globally (all PEs, over the "default" PG). This backend
-    drives ``IntraNodeSubGroupAllgatherSdma`` over the arithmetic sub-group
-    ``{pe_base .. pe_base+group_size-1}`` of global PEs (pe_base = (my_pe //
+    SHMEM is initialized globally; this drives ``IntraNodeSubGroupAllgatherSdma``
+    over the sub-group ``{pe_base .. pe_base+group_size-1}`` (pe_base = (my_pe //
     group_size) * group_size), so no per-subgroup SHMEM re-init is needed.
     """
 

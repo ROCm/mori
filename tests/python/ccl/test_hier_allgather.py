@@ -20,24 +20,10 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""
-Bit-exact test for ``mori.ccl.HierAllGather`` vs
-``torch.distributed.all_gather_into_tensor``.
-
-AllGather is a pure data move, so there is zero numerical tolerance:
-results must compare equal with ``torch.equal``.
-
-Two launch styles are supported:
-
-  * Single node: run as a plain script; uses ``torch.multiprocessing.spawn``
-    over the locally visible GPUs (``num_nodes == 1``)::
-
-        python3 tests/python/ccl/test_hier_allgather.py --world-size 4
-
-  * Cross node: launched under ``torchrun`` (the ``xnode`` harness sets
-    RANK/WORLD_SIZE/LOCAL_RANK)::
-
-        torchrun --nnodes=2 --nproc_per_node=4 ... test_hier_allgather.py
+"""Bit-exact test for ``mori.ccl.HierAllGather`` vs
+``torch.distributed.all_gather_into_tensor``: pure data move, so zero
+tolerance (``torch.equal``). Single-node runs via mp.spawn; cross-node runs
+under torchrun (xnode harness sets RANK/WORLD_SIZE/LOCAL_RANK).
 """
 
 import os
@@ -58,8 +44,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# Sizes (elements per rank) and dtypes for the correctness contract. Sizes are
-# kept modest by default so the test fits a dev box; sweep larger via the CLI.
 _DEFAULT_DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.int32]
 
 
@@ -149,15 +133,10 @@ def _spawn_worker(rank, world_size, ranks_per_node, port, numels, dtypes):
 def test_hier_allgather(
     world_size=None, ranks_per_node=None, numels=None, dtypes=None
 ):
-    """Single-node pytest entry.
-
-    ``ranks_per_node == world_size`` (default) is the single-node path
-    (num_nodes == 1, pure SDMA). ``ranks_per_node < world_size`` exercises the
-    hierarchical pipeline on a single box: it splits the local GPUs into
-    ``world_size // ranks_per_node`` simulated nodes so the intra-node SDMA
-    sub-group gather + inter-node ring run exactly as they would across nodes
-    (the ring's same-local-index neighbours are same-box here, reached over the
-    shmem P2P/SDMA transport instead of RDMA -- same kernel code path)."""
+    """Single-node pytest entry. ``ranks_per_node == world_size`` is the pure-SDMA
+    path (num_nodes == 1); ``ranks_per_node < world_size`` splits local GPUs into
+    simulated nodes to drive the hierarchical pipeline -- same kernel path, ring
+    neighbours reached over shmem P2P/SDMA instead of RDMA."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
     # Single channel: multi-queue warp put has a source/dest offset bug here.
     os.environ.setdefault("MORI_SDMA_NUM_CHANNELS", "1")
@@ -170,8 +149,6 @@ def test_hier_allgather(
         world_size % ranks_per_node == 0
     ), "world must be a multiple of ranks_per_node"
     if numels is None:
-        # Contract sizes per rank: ~4 KiB, ~4 MiB, ~64 MiB.
-        # In fp32: 1024 -> 4 KiB, 1 Mi -> 4 MiB, 16 Mi -> 64 MiB.
         numels = [1024, 1024 * 1024, 16 * 1024 * 1024]
     if dtypes is None:
         dtypes = _DEFAULT_DTYPES
@@ -185,16 +162,10 @@ def test_hier_allgather(
 
 
 def test_hier_allgather_layouts():
-    """Sweep hierarchical (num_nodes>=2) decompositions for bit-exactness.
-
-    Exercises the full intra-node SDMA sub-group gather -> inter-node ring
-    pipeline across several (world, ranks_per_node) splits on a single box --
-    including the acceptance layout N=2,G=4 (8 ranks) and N=4,G=2 (4 simulated
-    nodes). Each split runs all 4 dtypes via the same ``torch.equal``
-    (zero-tolerance) path. Layouts that exceed the visible GPU count are skipped.
-    """
+    """Sweep hierarchical (num_nodes>=2) decompositions for bit-exactness;
+    layouts exceeding the visible GPU count are skipped."""
     ngpu = torch.cuda.device_count()
-    # (world, ranks_per_node): N=2,G=2 ; N=2,G=4 (acceptance target) ; N=4,G=2.
+    # (world, ranks_per_node); (8,4) is the acceptance target.
     layouts = [(4, 2), (8, 4), (8, 2)]
     small = [1024, 256 * 1024]
     ran = 0

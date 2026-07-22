@@ -22,10 +22,9 @@
 # SOFTWARE.
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
-# Standalone cross-node AllGather performance (no compute): per message size,
-# time a single AllGather and report ms + algorithmic GB/s, for RCCL vs one mori
-# handle (--handle hostproxy=hp_sdma | device=ibgda_sdma). Run it twice (once per
-# handle) and combine RCCL + hp_sdma + ibgda_sdma into one figure. Bit-exact gate.
+# Standalone cross-node AllGather perf (no compute): per size, time one AllGather,
+# report ms + algorithmic GB/s for RCCL vs one mori handle
+# (--handle hostproxy=hp_sdma | device=ibgda_sdma). Bit-exact gate.
 import argparse
 import os
 import sys
@@ -45,8 +44,7 @@ _LOGS = os.path.abspath(
 
 def _build(mode, rank, ws, rpn, per, device):
     if mode == "device":
-        # standalone_fast engages the fuse_local fast path; without it
-        # HierAllGather runs the non-fused path.
+        # standalone_fast engages the fuse_local fast path (else non-fused).
         uf = os.environ.get("MORI_HIER_UT_FAST", "1") not in ("0", "", "false", "False")
         return HierAllGather(
             my_pe=rank,
