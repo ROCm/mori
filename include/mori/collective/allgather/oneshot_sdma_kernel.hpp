@@ -739,7 +739,6 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
       // order so the count suffices and ADD cannot be lost. Per-op base (flagVal-1)*(G-1);
       // step s waits counter >= base+s.
       const uint64_t ringBase = (flagVal - 1) * static_cast<uint64_t>(G - 1);
-      uint64_t oneAdd = 1;
       // Each chunk is a self-contained pipeline over the ring's G-1 steps, on queue q.
       for (int c = q; c < C; c += Q) {
         size_t off = static_cast<size_t>(c) * chunkBytes;
@@ -756,18 +755,8 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
             // Wait until my predecessor has delivered >= s slots to me on this link.
             const uint64_t want = ringBase + static_cast<uint64_t>(s);
             long spin = 0;
-            bool stuck = false;
             while (core::AtomicLoadRelaxedSystem(flags + myCtr) < want) {
-              if (++spin > 20000000L) {
-                stuck = true;
-                break;
-              }
-            }
-            if (stuck) {
-              printf("[RINGSTUCK] SEND myPe=%d g=%d s=%d c=%d ctr=%llu got=%llu want=%llu\n", myPe,
-                     g, s, c, static_cast<unsigned long long>(myCtr),
-                     static_cast<unsigned long long>(core::AtomicLoadRelaxedSystem(flags + myCtr)),
-                     static_cast<unsigned long long>(want));
+              if (++spin > 20000000L) break;
             }
             (void)core::AtomicLoadSeqCstSystem(flags + myCtr);
             src = selfDstBase + static_cast<size_t>(k) * slotStride + off;
@@ -780,7 +769,6 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
           // flagsMemObj->peerPtrs[nextPe] + myCtr.
           uint64_t* nextCtrBase = reinterpret_cast<uint64_t*>(flagsMemObj->peerPtrs[nextPe]);
           void* peerCtr = static_cast<void*>(nextCtrBase + myCtr);
-          (void)oneAdd;
           core::SdmaPutCopyRemoteAddThread(src, dstPtr, len, nextHandles, static_cast<uint32_t>(q),
                                            peerCtr);
         }
@@ -798,18 +786,8 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
       if (static_cast<size_t>(c) * chunkBytes >= bytesPerPeer) continue;
       const size_t myCtr = flagBase + static_cast<size_t>(c);
       long spin = 0;
-      bool stuck = false;
       while (core::AtomicLoadRelaxedSystem(flags + myCtr) < want) {
-        if (++spin > 20000000L) {
-          stuck = true;
-          break;
-        }
-      }
-      if (stuck) {
-        printf("[RINGSTUCK] COMPL myPe=%d g=%d c=%d ctr=%llu got=%llu want=%llu\n", myPe, g, c,
-               static_cast<unsigned long long>(myCtr),
-               static_cast<unsigned long long>(core::AtomicLoadRelaxedSystem(flags + myCtr)),
-               static_cast<unsigned long long>(want));
+        if (++spin > 20000000L) break;
       }
       (void)core::AtomicLoadSeqCstSystem(flags + myCtr);
     }
