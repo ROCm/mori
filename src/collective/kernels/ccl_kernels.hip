@@ -48,14 +48,19 @@ __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 
 using namespace mori::collective;
 
-// Wrapper macros: expand a kernel body into an extern "C" __global__ entry per dtype.
+// ============================================================================
+// Wrapper macros
+// ============================================================================
 
+// All2all: (myPe, npes, input, inputTransitMemObj, outputTransitMemObj,
+//           flagsMemObj, elementCount)
 #define CCL_WRAP_ALL2ALL(kernel, suffix, T)                                  \
   extern "C" __global__ void kernel##_##suffix(CclAll2allArgs<T> args) {    \
     kernel##_body<T>(args.myPe, args.npes, args.input, args.inputTransitMemObj, \
                      args.outputTransitMemObj, args.flagsMemObj, args.elementCount); \
   }
 
+// AllGather sync: all fields including dstBaseOffset and flagVal
 #define CCL_WRAP_ALLGATHER(kernel, suffix, T)                                \
   extern "C" __global__ void kernel##_##suffix(CclAllgatherArgs<T> args) {  \
     kernel##_body<T>(args.myPe, args.npes, args.input, args.srcMemObj,      \
@@ -63,6 +68,7 @@ using namespace mori::collective;
                      args.dstBaseOffset, args.flagVal);                     \
   }
 
+// AllGather async put: no flagVal parameter
 #define CCL_WRAP_ALLGATHER_ASYNC_PUT(kernel, suffix, T)                      \
   extern "C" __global__ void kernel##_##suffix(CclAllgatherArgs<T> args) {  \
     kernel##_body<T>(args.myPe, args.npes, args.input, args.srcMemObj,      \
@@ -86,37 +92,45 @@ using namespace mori::collective;
                      args.splitCount);                                      \
   }
 
+// AllReduce reduce-scatter / fused: (myPe, npes, input, dstMemObj,
+//                                    flagsMemObj, barrier, elementCount)
 #define CCL_WRAP_ALLREDUCE_RS(kernel, suffix, T)                              \
   extern "C" __global__ void kernel##_##suffix(CclAllreduceArgs<T> args) {   \
     kernel##_body<T>(args.myPe, args.npes, args.input, args.dstMemObj,       \
                      args.flagsMemObj, args.barrier, args.elementCount);     \
   }
 
+// AllReduce allgather / async-put: (myPe, npes, dstMemObj, flagsMemObj,
+//                                   barrier, elementCount)
 #define CCL_WRAP_ALLREDUCE_AG(kernel, suffix, T)                              \
   extern "C" __global__ void kernel##_##suffix(CclAllreduceArgs<T> args) {   \
     kernel##_body<T>(args.myPe, args.npes, args.dstMemObj, args.flagsMemObj, \
                      args.barrier, args.elementCount);                       \
   }
 
-// Non-template body (dtype-agnostic wait).
+// AllReduce async wait (non-template): (myPe, npes, flagsMemObj, barrier,
+//                                       elementCount)
 #define CCL_WRAP_ALLREDUCE_AG_WAIT(kernel, suffix, T)                         \
   extern "C" __global__ void kernel##_##suffix(CclAllreduceArgs<T> args) {   \
     kernel##_body(args.myPe, args.npes, args.flagsMemObj, args.barrier,      \
                   args.elementCount);                                        \
   }
 
+// Async RS SDMA put: (myPe, npes, input, dstMemObj, elementCount)
 #define CCL_WRAP_ALLREDUCE_RS_PUT(kernel, suffix, T)                          \
   extern "C" __global__ void kernel##_##suffix(CclAllreduceArgs<T> args) {   \
     kernel##_body<T>(args.myPe, args.npes, const_cast<T*>(args.input),       \
                      args.dstMemObj, args.elementCount);                     \
   }
 
+// Async RS local reduce: (gathered, input, elementCount, myPe, npes)
 #define CCL_WRAP_ALLREDUCE_LOCAL_REDUCE(kernel, suffix, T)                    \
   extern "C" __global__ void kernel##_##suffix(CclAllreduceArgs<T> args) {   \
     kernel##_body<T>(reinterpret_cast<T*>(args.dstMemObj->localPtr),          \
                      args.input, args.elementCount, args.myPe, args.npes);  \
   }
 
+// Async AG reduced SDMA put: (myPe, npes, dstMemObj, elementCount)
 #define CCL_WRAP_ALLREDUCE_AG_REDUCED_PUT(kernel, suffix, T)                  \
   extern "C" __global__ void kernel##_##suffix(CclAllreduceArgs<T> args) {   \
     kernel##_body<T>(args.myPe, args.npes, args.dstMemObj, args.elementCount); \
@@ -130,7 +144,10 @@ using namespace mori::collective;
   WRAP_MACRO(kernel, f16, __half)                   \
   WRAP_MACRO(kernel, bf16, hip_bfloat16)
 
+// ============================================================================
 // All2all instantiations (uint32_t)
+// ============================================================================
+
 CCL_WRAP_ALL2ALL(OneShotAll2allSdmaKernel, u32, uint32_t)
 CCL_WRAP_ALL2ALL(OneShotAll2allSdmaAsyncPutKernel, u32, uint32_t)
 
@@ -140,14 +157,17 @@ extern "C" __global__ void OneShotAll2allSdmaAsyncWaitKernel_u32(
                                          args.outputTransitMemObj, args.flagsMemObj);
 }
 
+// ============================================================================
 // AllGather instantiations (uint32_t)
+// ============================================================================
+
 CCL_WRAP_ALLGATHER(OneShotAllGatherSdmaKernel, u32, uint32_t)
 CCL_WRAP_ALLGATHER_ASYNC_PUT(OneShotAllGatherSdmaAsyncPutKernel, u32, uint32_t)
 CCL_WRAP_ALLGATHER_PARAM_CONTIGUOUS(OneShotAllGatherSdmaParamContiguousKernel, u32, uint32_t)
 CCL_WRAP_ALLGATHER_PARAM_CONTIGUOUS_ASYNC_PUT(OneShotAllGatherSdmaParamContiguousAsyncPutKernel,
                                               u32, uint32_t)
 
-// Sub-group intra-node SDMA AllGather. Type-agnostic byte move on u32 lanes.
+// Sub-group intra-node SDMA AllGather (type-agnostic byte move on u32 lanes).
 extern "C" __global__ void OneShotAllGatherSdmaSubGroupKernel_u32(
     CclAllgatherSubGroupArgs<uint32_t> args) {
   OneShotAllGatherSdmaSubGroupKernel_body<uint32_t>(
@@ -156,8 +176,8 @@ extern "C" __global__ void OneShotAllGatherSdmaSubGroupKernel_u32(
       args.dstSlotStrideBytes, args.flagVal, /*blockLocal=*/false, args.flagBase);
 }
 
-// Fused param-contiguous SubGroup gather: one launch loops node blocks + param
-// splits internally (vs N_nodes*N_params separate launches).
+// Fused hierarchical param-contiguous SubGroup gather: one launch loops node
+// blocks + param splits internally (vs N_nodes*N_params launches).
 extern "C" __global__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_u32(
     CclAllgatherSubGroupParamContiguousArgs<uint32_t> args) {
   OneShotAllGatherSdmaSubGroupParamContiguousKernel_body<uint32_t>(
@@ -173,8 +193,8 @@ extern "C" __global__ void OneShotAllGatherSdmaAsyncWaitKernel_u32(
                                            args.flagsMemObj, args.flagVal);
 }
 
-// Sub-group intra-node SDMA broadcast: root (group pos 0) fans the full buffer to
-// all members. Type-agnostic byte move on u32 lanes.
+// Sub-group intra-node SDMA broadcast: root (group pos 0) fans the full buffer
+// to all members (type-agnostic byte move on u32 lanes).
 extern "C" __global__ void OneShotBroadcastSdmaSubGroupKernel_u32(
     CclBroadcastSubGroupArgs<uint32_t> args) {
   OneShotBroadcastSdmaSubGroupKernel_body<uint32_t>(
@@ -182,23 +202,41 @@ extern "C" __global__ void OneShotBroadcastSdmaSubGroupKernel_u32(
       args.dstMemObj, args.flagsMemObj, args.elementCount, args.dstBaseOffset, args.flagVal);
 }
 
+// ============================================================================
 // AllReduce instantiations (uint32_t, int32_t, float, __half, hip_bfloat16)
+// ============================================================================
+
+// --- SdmaReduceScatterKernel ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_RS, SdmaReduceScatterKernel)
+
+// --- AllGatherSdmaKernel ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG, AllGatherSdmaKernel)
+
+// --- ReduceScatterSdmaPutKernel (async scatter, no wait/reduce) ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_RS_PUT, ReduceScatterSdmaPutKernel)
+
+// --- ReduceScatterLocalReduceKernel (local reduce after async scatter) ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_LOCAL_REDUCE, ReduceScatterLocalReduceKernel)
+
+// --- AllGatherReducedSdmaPutKernel (SDMA put of reduced shard) ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG_REDUCED_PUT, AllGatherReducedSdmaPutKernel)
+
+// --- AllGatherAsyncPutKernel ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG, AllGatherAsyncPutKernel)
+
+// --- AllGatherAsyncWaitKernel (non-template) ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG_WAIT, AllGatherAsyncWaitKernel)
 
-// Inter-node RDMA ring AllGather: byte-move ring, chunkBytes per PE, npes-1
-// rounds over the shmem transport; type-agnostic (raw bytes).
-//
-// RingFinishCopyKernel copies the gathered ring buffer OUT from the CU coherence
-// domain, not via a copy-engine D2D: the ring's system-scope acquire + __threadfence_
-// system order the RDMA-landed bytes only for the CUs, so a copy-engine read (separate
-// hardware agent) can see stale remote-half bytes under tight overlap. A CU copy reads
-// the same coherent HBM the ring fenced -- no host sync, overlap preserved.
+// ============================================================================
+// Inter-node RDMA ring AllGather
+// ============================================================================
+// Byte-move ring: chunkBytes per PE, npes-1 rounds over the shmem transport
+// (raw bytes, one u32 entry serves all dtypes).
+// CU-domain ring finish copy-OUT: copy the gathered ring buffer to user output
+// from the CU coherence domain. The ring kernel's system-scope acquire +
+// __threadfence_system order the RDMA-landed bytes for CUs, but NOT for a
+// copy-engine D2D (separate agent) which can read stale ring bytes; a CU copy
+// reads the same fenced HBM, closing the gap on-device without host sync.
 extern "C" __global__ void RingFinishCopyKernel_u32(
     uint32_t* __restrict__ dst, const uint32_t* __restrict__ src, uint64_t n) {
   uint64_t idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -209,8 +247,8 @@ extern "C" __global__ void RingFinishCopyKernel_u32(
 }
 
 extern "C" __global__ void InterNodeRingAllGatherKernel_u32(CclInterNodeRingArgs args) {
-  // Sub-group ring over {peBase, peBase+peStride, ...}; flat whole-world ring is
-  // the special case peBase=0, peStride=1, ringSize=npes, ringPos=myPe.
+  // Sub-group ring over {peBase, peBase+peStride, ...}; the flat whole-world
+  // ring is the special case peBase=0, peStride=1, ringSize=npes, ringPos=myPe.
   AllGatherRingSubGroupKernelBody(args.ringPos, args.ringSize, args.peBase, args.peStride,
                                   args.memObj, args.flagsObj, args.chunkBytes, args.numQp,
                                   /*numBlocksOverride=*/-1, /*bidOverride=*/-1,
@@ -220,12 +258,14 @@ extern "C" __global__ void InterNodeRingAllGatherKernel_u32(CclInterNodeRingArgs
                                   /*useWriteFence=*/args.useWriteFence != 0);
 }
 
-// Fused inter-node ring + intra-node LOCAL-block SDMA gather. One launch overlaps
-// the RDMA ring (blocks [0,ringBlocks)) with the ring-independent local-block gather
-// (last block, blockLocal=true) -- the local shard is present from the start. Ring
-// and gather touch disjoint symm objects / flag regions, so the union is byte-
-// identical to two serial kernels. Remote-block gather (ring-dependent) still
-// follows in a separate launch.
+// ============================================================================
+// Fused inter-node ring + intra-node LOCAL-block SDMA gather
+// ============================================================================
+// One launch overlaps the RDMA ring (NIC) with the local-block SDMA gather
+// (XGMI, ring-independent). Blocks [0, ringBlocks) run the ring; the last block
+// runs the local gather (blockLocal=true). Ring and gather touch disjoint symm
+// objects + flag regions => byte-identical to running them serially. Remote-block
+// gather (ring-dependent) still follows as a separate launch.
 extern "C" __global__ void FusedRingLocalGatherKernel_u32(CclFusedRingLocalGatherArgs args) {
   if (blockIdx.x < static_cast<unsigned>(args.ringBlocks)) {
     AllGatherRingSubGroupKernelBody(args.ringPos, args.ringSize, args.ringPeBase, args.ringPeStride,
@@ -241,12 +281,14 @@ extern "C" __global__ void FusedRingLocalGatherKernel_u32(CclFusedRingLocalGathe
   }
 }
 
-// Remote reassembly worker. Worker j (stride total) owns parts f=j, j+stride,...;
-// each part waits its landing flag then SDMA-pushes that part's 16B-aligned tile of
-// every remote block into the output on queue qId, overlapping ring channels still on
-// the NIC. PUSH-ONLY => no dead-lock; distinct qId => per-queue counters never race;
-// per-part flagBase => concurrent parts never race a slot. spatial=false: part f waits
-// chunkReadyFlags[f]; spatial=true (single-channel split): all wait chunkReadyFlags[0].
+// Remote reassembly worker j (of stride workers) owns parts f=j, j+stride, ...
+// of the chunk's `partition` 16B-aligned sub-ranges. Per part it waits its
+// landing flag then SDMA-pushes that tile of every remote block into the output.
+// PUSH-ONLY (no cross-rank wait) => deadlock-free; distinct qId per worker so
+// signal counters never race; per-part flagBase (uses f) so parts never share a
+// slot. spatial=false: part f waits chunkReadyFlags[f] (temporal deep-pipe).
+// spatial=true (single-channel ring): every part waits chunkReadyFlags[0], so
+// multiple SDMA engines reassemble the one landed chunk concurrently.
 __device__ inline void FusedRemoteReassembleWorker(
     const CclFusedRingRemoteGatherArgs& args, int partition, int j, int stride, int qId,
     bool spatial) {
@@ -257,12 +299,12 @@ __device__ inline void FusedRemoteReassembleWorker(
   const size_t sliceElems = args.chunkBytes / sizeof(uint32_t);
   const int numRemote = args.numNodes - 1;
   uint32_t* ringBase = reinterpret_cast<uint32_t*>(args.ringMemObj->localPtr);
-  // Deep-SQ (reasmDeepSq!=0): two passes over queue qId. Pass 0 waits each channel's
-  // landing flag then submits with no drain (deepSqPhase=1), keeping the SQ fed; pass 1
-  // replays drain+flag only (deepSqPhase=2), one quiet to the accumulated count covering
-  // every submit (SQ FIFO, signal monotonic). Wait stays in pass 0 (never submit before
-  // bytes land); output flag fires only after the pass-1 drain => never precedes its
-  // bytes (bit-exact). nPass==1 => deepSqPhase=0, byte-identical single-shot path.
+  // Intra reassembly deep-SQ (reasmDeepSq!=0): two passes over queue qId. Pass 0
+  // waits each channel's landing flag then submits with no drain (deepSqPhase=1);
+  // pass 1 drains+flags only (deepSqPhase=2), one quiet covering all back-to-back
+  // submits (SQ FIFO, signal monotonic). Landing wait stays in pass 0; output flag
+  // fires only after the pass-1 drain => never precedes its bytes (bit-exact).
+  // nPass==1 => deepSqPhase=0, byte-identical single-shot path.
   const int nPass = (args.reasmDeepSq != 0) ? 2 : 1;
   for (int pass = 0; pass < nPass; ++pass) {
     const int deepSqPhase = (nPass == 1) ? 0 : (pass == 0 ? 1 : 2);
@@ -274,7 +316,8 @@ __device__ inline void FusedRemoteReassembleWorker(
       size_t subEnd = endUnit * kAlign;
       if (subEnd > args.chunkBytes) subEnd = args.chunkBytes;
       const size_t subBytes = (subOff < subEnd) ? (subEnd - subOff) : 0;
-      // Landing-flag wait guards only the SUBMIT; the drain pass already waited.
+      // Landing wait guards only the SUBMIT (pass 0 / single-shot); the drain pass
+      // (deepSqPhase==2) already waited in pass 0.
       if (deepSqPhase != 2) {
         if (threadIdx.x == 0) {
           int spin = 0;
@@ -314,28 +357,30 @@ __device__ inline void FusedRemoteReassembleWorker(
 }
 
 // Pipelined ring + remote-block reassembly. Grid = 2*ringBlocks + 1:
-//   [0,rb)         ring channels, each publishes chunkReadyFlags[bid] on landing;
-//   [rb]           ring-independent LOCAL block gather (this PE's own input);
-//   (rb, 2*rb]     remote reassembly block j spins chunkReadyFlags[j] then SDMA-
-//                  pushes sub-range j of every remote block, overlapping ring
-//                  channel j+1 still on the NIC.
-// The sub-range partition mirrors the ring's 16B-aligned tiling, so chunkReadyFlags[j]
-// guards exactly the bytes reassembled here; disjoint flagBase per (j, remote m) =>
-// concurrent reassembly blocks never race a subgroup flag slot.
+//   [0,ringBlocks)          ring channels, publish chunkReadyFlags[bid] on landing
+//   [ringBlocks]            ring-independent local-block gather
+//   (ringBlocks,2*ringBlocks]  reassembly block j spins chunkReadyFlags[j] then
+//                           SDMA-pushes sub-range j of every remote block.
+// Sub-range partition mirrors the ring's 16B-aligned tiling so chunkReadyFlags[j]
+// guards exactly the reassembled bytes; disjoint flagBase per (j, remote m).
 extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGatherArgs args) {
   const int rb = args.ringBlocks;
-  // deepPipe>1 (rb==1 only): the single channel splits the chunk into `pipe` temporal
-  // sub-chunks each with its own landing flag. deepPipe<=1 => pipe==rb (byte-identical).
+  // Deep-SQ temporal pipeline (deepPipe>1, rb==1 only): the single ring channel
+  // splits the chunk into `pipe` temporal sub-chunks, each with its own landing
+  // flag, so reassembly + completion iterate over pipe flags. deepPipe<=1 =>
+  // pipe==rb (byte-identical default).
   const int pipe = args.deepPipe > 1 ? args.deepPipe : rb;
   const int reasm = args.reassemblyBlocks > 0 ? args.reassemblyBlocks : rb;
   const int effReasm = reasm;
-  // Spatial split (rb==1, no deep-pipe, effReasm>1): split the one landed chunk into
-  // effReasm disjoint byte sub-ranges for concurrent SDMA reassembly, no new inter race.
-  // Each part waits chunkReadyFlags[0]. reasm>1 requires sdmaNumQueue>=reasm+1 (Python).
+  // Spatial reassembly split (rb==1, no deep-pipe): split the one landed chunk
+  // into effReasm disjoint sub-ranges reassembled concurrently; each part waits
+  // chunkReadyFlags[0]. reasm>1 requires sdmaNumQueue>=reasm+1 (Python clamp).
   const bool spatialSplit = (rb == 1 && args.deepPipe <= 1 && effReasm > 1);
+  // Partition = temporal pipe channels, or spatial effReasm sub-ranges.
   const int partition = spatialSplit ? effReasm : pipe;
   const unsigned bx = blockIdx.x;
   if (bx < static_cast<unsigned>(rb)) {
+    // Ring channel bx: publishes chunkReadyFlags[bx] on landing.
     AllGatherRingSubGroupKernelBody(args.ringPos, args.ringSize, args.ringPeBase, args.ringPeStride,
                                     args.ringMemObj, args.ringFlagsObj, args.chunkBytes, args.numQp,
                                     /*numBlocksOverride=*/rb, /*bidOverride=*/static_cast<int>(bx),
@@ -344,11 +389,12 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
                                     /*deepPipeQuiet=*/args.deepPipeQuiet,
                                     /*useWriteFence=*/args.useWriteFence != 0);
   } else if (bx == static_cast<unsigned>(rb)) {
-    // Local block (m == nodeId): ring-independent, gathers this PE's own input on
-    // flag slots [0, G). localPushOnly: push with NO coupled wait (queue 0, distinct
-    // from reasm workers' 1..reasm) and let the completion reader below drain [0,G) too
-    // -- avoids the coupled per-slot wait starving under deep pipe; same pushes + flags
-    // => byte-identical, deadlock-free at any depth.
+    // Local block (m == nodeId): ring-independent, reads this PE's own input.
+    // Default: collective gather on flag slots [0, G). LOCAL-BLOCK PUSH-ONLY
+    // (localPushOnly): push this rank's column with NO coupled wait (queue 0,
+    // distinct from reasm queues 1..reasm) and let the completion reader drain
+    // slots [0,G) -- same pushes + flags => byte-identical, deadlock-free at any
+    // deep-pipe depth (avoids the coupled per-slot AMO stall under DEEP_PIPE>=8).
     if (args.localPushOnly != 0) {
       OneShotSubGroupPushOnly_body<uint32_t>(
           args.groupSize, args.groupPos, args.gPeBase, args.gPeStride, args.gInput,
@@ -358,11 +404,11 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
           /*pushPeerLo=*/0,
           /*pushPeerHi=*/-1);
     } else if (args.crownRing != 0) {
-      // Route the local-block gather through the intra-node nearest-neighbor ring
-      // instead of the flat G-way push (avoids the G-1 concurrent-write incast). Self-
-      // completes on its own high-base flag region [G+reasmTotal+G, ...) so it never
-      // collides with the reassembly flags [G, G+reasmTotal) or local flags [0, G).
-      // Same bytes, different schedule; crownRing default 0 => byte-identical.
+      // crownRing: route the local-block gather through the intra-node
+      // nearest-neighbor pipelined ring (one flow per link) instead of the flat
+      // G-way push (G-1 incast). Ring self-completes on its own high-base flag
+      // region [G+reasmTotal+G, ...), disjoint from reasm flags [G, G+reasmTotal)
+      // and local flags [0, G). crownRing default 0 => byte-identical to flat push.
       const int _cr_numRemote = args.numNodes - 1;
       const size_t _cr_reasmTotal = static_cast<size_t>(partition) *
                                     static_cast<size_t>(_cr_numRemote > 0 ? _cr_numRemote : 0) *
@@ -374,8 +420,14 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
           args.gInput, args.gDstMemObj, args.gFlagsObj, args.gElementCount, args.gDstBaseOffset,
           args.gDstSlotStrideBytes, args.gFlagVal, /*blockLocal=*/true, /*flagBase=*/_cr_flagBase,
           /*fencedFlag=*/(args.crownRing & 8191));
-      // fencedFlag bit meanings: see oneshot_sdma_kernel.hpp.
+      // fencedFlag bit meanings (see oneshot_sdma_kernel.hpp for details):
+      //   bit2=2x4 half-ring; bit3=fused overlap; bit4=parallel phase2;
+      //   bit5=dest-spread phase2; bit6=dest-spread phase1;
+      //   bit7=multi-warp dest-spread submission; bit8=concurrent phase1/phase2;
+      //   bit9=flat multi-warp broadcast; bit10=fused self-fill;
+      //   bit11=batch self-fill; bit12=overlap self-fill.
     } else {
+      // Default local-block flat crown gather (localPushOnly OFF).
       OneShotAllGatherSdmaSubGroupKernel_body<uint32_t>(
           args.myPe, args.npes, args.groupSize, args.groupPos, args.gPeBase, args.gPeStride,
           args.gInput, args.gDstMemObj, args.gFlagsObj, args.gElementCount, args.gDstBaseOffset,
@@ -383,21 +435,25 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
           /*pushPeerLo=*/0,
           /*pushPeerHi=*/-1);
     }
-    // Completion reader: reassembly blocks are PUSH-ONLY (never wait a peer), so this
-    // CTA does the single cross-rank completion wait for the whole remote reassembly --
-    // guaranteed to finish (no circular dependency). Slot (j, mIdx, senderG) ==
-    // G + (j*numRemote + mIdx)*G + senderG, disjoint from local block's [0, G).
+    // COMPLETION READER: reassembly blocks are PUSH-ONLY, so this CTA does the
+    // single cross-rank completion wait for the whole remote reassembly, spinning
+    // until every (j, remote m, sender g) flag is published. Flag slot
+    // (j, mIdx, senderG) == G + (j*numRemote + mIdx)*G + senderG, disjoint from
+    // the local block's [0, G).
     const int numRemote = args.numNodes - 1;
     if ((numRemote > 0 || args.localPushOnly != 0) && args.chunkReadyFlags != nullptr) {
       uint64_t* rflags = reinterpret_cast<uint64_t*>(args.gFlagsObj->localPtr);
       const int G = args.groupSize;
-      // Completion wait fanned across the CTA's threads (each polls a strided subset).
-      // Bit-exact: same slots + threshold, just concurrent; the fence + barrier below
-      // still order every landed byte before the finish.
+      // Parallel completion reader: flag slots (f, mi, sg) fill [G, G+rb*numRemote*G)
+      // densely (idx = G + (f*numRemote + mi)*G + sg). Fan the wait across the CTA's
+      // threads (strided subsets) instead of a serial thread-0 spin. Bit-exact:
+      // same slots + threshold, and a CTA-wide fence + barrier still orders every
+      // landed byte before the finish.
       const size_t reasmTotal = static_cast<size_t>(partition) * static_cast<size_t>(numRemote) *
                                 static_cast<size_t>(G);
-      // localPushOnly folds the local block's slots [0,G) into this wait (startIdx=0);
-      // when OFF the local block did its own coupled wait so we start at G.
+      // Reassembly flags live in [G, G+reasmTotal). localPushOnly folds the local
+      // block's slots [0,G) into this wait (startIdx=0); else it did its own coupled
+      // wait and this reader starts at G.
       const size_t startIdx = (args.localPushOnly != 0) ? 0 : static_cast<size_t>(G);
       const size_t endIdx = static_cast<size_t>(G) + reasmTotal;
       for (size_t idx = startIdx + threadIdx.x; idx < endIdx; idx += blockDim.x) {
@@ -410,13 +466,16 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
     }
     __syncthreads();
   } else {
-    // Remote reassembly block j in [0, reasm), pipelined over ring channels: owns
-    // channels f with (f % reasm == j), waits chunkReadyFlags[f] then SDMA-pushes that
-    // channel's 16B tile of every remote block, overlapping channels f+reasm,... still
-    // on the NIC (the NIC<->XGMI pipeline; waiting all ring flags first collapses it).
-    // PUSH-ONLY => no dead-lock; queue qId=j+1 (local CTA uses 0), reused serially.
+    // Remote reassembly block j in [0, reasm): pipelined over ring channels f with
+    // (f % reasm == j). Per channel it waits chunkReadyFlags[f] then SDMA-pushes
+    // that 16B-aligned tile of every remote block into the output, so channel f's
+    // XGMI reassembly overlaps channels f+reasm, ... still on the NIC (two-phase
+    // NIC<->XGMI pipeline). Tile partition mirrors the ring's multiBlock tiling
+    // (numBlocks==rb) so chunkReadyFlags[f] guards exactly the pushed bytes.
+    // PUSH-ONLY => deadlock-free; qId=j+1 (local CTA uses queue 0), reused serially.
     const int j = static_cast<int>(bx) - rb - 1;
     if (j < 0 || j >= reasm) return;
+    // Worker j of effReasm workers (stride effReasm); qId=j+1 distinct from queue 0.
     FusedRemoteReassembleWorker(args, partition, /*j=*/j, /*stride=*/effReasm, /*qId=*/j + 1,
                                 spatialSplit);
   }

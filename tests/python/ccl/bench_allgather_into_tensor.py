@@ -20,11 +20,25 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Benchmark mori SDMA all_gather_into_tensor vs RCCL.
+"""DeepSpeed-style benchmark for mori SDMA all_gather_into_tensor.
 
-Contiguous-output pattern (single ``torch.empty`` of world_size*per_rank_numel)
-as ZeRO-3 prefetch buckets use it: AllGatherIntoTensor (1 SDMA kernel + 1 D2D)
-vs dist.all_gather_into_tensor vs dist.all_gather (list form, N D2D copies).
+Measures end-to-end per-call latency and throughput for three variants
+of the same allgather, using the contiguous-output pattern that ZeRO-3
+prefetch buckets actually use (i.e. a single ``torch.empty`` of size
+``world_size * per_rank_numel``):
+
+  1. ``mori_cpp.AllGatherIntoTensor``  - 1 SDMA kernel + 1 D2D memcpy
+  2. ``dist.all_gather_into_tensor``   - RCCL into a single contig tensor
+  3. ``dist.all_gather``               - RCCL into a list of N separate tensors
+                                        (forces N D2D copies internally)
+
+Run with the same shapes DeepSpeed uses for ZeRO-3 fetch buckets
+(``stage3_prefetch_bucket_size`` ranges 1MB..100MB in practice).
+
+Example:
+    python3 -m tests.python.ccl.bench_allgather_into_tensor \\
+        --world-size 8 --dtype bfloat16 --iters 200 \\
+        --sizes-mb 0.5,1,4,10,40,100
 """
 
 import argparse
@@ -48,7 +62,12 @@ _TORCH_TO_MORI = {
 
 
 def _bench_loop(launch_fn, *, warmup: int, iters: int):
-    """Time launch_fn with per-iter CUDA events (GPU exec, not host queue latency)."""
+    """Time ``launch_fn`` ``iters`` times on the current CUDA stream.
+
+    Uses CUDA events on each iteration so the timer captures actual
+    GPU-side execution (kernel + memcpy + RCCL collective), not host
+    queue latency.
+    """
     for _ in range(warmup):
         launch_fn()
     torch.cuda.synchronize()
@@ -85,8 +104,8 @@ def _worker(
         torch.cuda.set_device(device)
 
         max_bytes = max(sizes_bytes)
-        max_per_rank_bytes = max_bytes // world_size
-        # 4B-align: SDMA kernel walks uint32 lanes
+        max_per_rank_bytes = max_bytes // world_size  # per-rank shard
+        # round up to 4-byte alignment (SDMA kernel walks uint32 lanes)
         max_per_rank_bytes = (max_per_rank_bytes + 3) & ~0x3
         ag_mori = AllGatherIntoTensor(
             my_pe=rank,
@@ -111,6 +130,8 @@ def _worker(
             print("-" * 72)
 
         for total_bytes in sizes_bytes:
+            # Free any cached PyTorch tensors from the previous iteration
+            # so big sizes don't compound the caching-allocator footprint.
             torch.cuda.empty_cache()
             per_rank_bytes = (
                 (total_bytes // world_size) // dtype.itemsize * dtype.itemsize
@@ -122,13 +143,14 @@ def _worker(
 
             inp = torch.randn(per_rank_numel, device=device).to(dtype).contiguous()
             out_flat = torch.empty(total_numel, dtype=dtype, device=device)
-            # list form: N independent allocations -> N D2D copies
+            # list-form: N independent allocations (the case that costs N memcpys)
             out_list = [
                 torch.empty(per_rank_numel, dtype=dtype, device=device)
                 for _ in range(world_size)
             ]
 
             def call_mori_into():
+                # AllGatherIntoTensor: 1 SDMA kernel + 1 D2D memcpy total.
                 ag_mori(
                     inp.data_ptr(),
                     out_flat.data_ptr(),
@@ -138,8 +160,12 @@ def _worker(
                 )
 
             def call_mori_list():
-                # Emulate all_gather (list) API: SDMA kernel, then scatter the
-                # flat transit buffer into N user tensors via N hipMemcpyAsync.
+                # Same SDMA kernel, but emulate the all_gather (list) API:
+                # after the kernel writes the gathered shards into the flat
+                # transit/staging buffer, scatter them out into N separately
+                # allocated user tensors with N hipMemcpyAsync copies — this
+                # is the cost a hypothetical mori ``AllGather`` (list form)
+                # wrapper would have to pay every call.
                 ag_mori(
                     inp.data_ptr(),
                     out_flat.data_ptr(),
@@ -153,7 +179,10 @@ def _worker(
                         non_blocking=True,
                     )
 
-            # list form + consumer wanting contiguous: N scatter copies + final torch.cat
+            # End-to-end equivalent of "list-form allgather + the consumer
+            # actually wanting a contiguous tensor" — i.e. what DS / GEMM
+            # would need.  Pays N scatter copies + one final torch.cat
+            # (another ~world_size_bytes worth of D2D copy traffic).
             cat_target = torch.empty(total_numel, dtype=dtype, device=device)
 
             def call_mori_list_then_cat():
@@ -177,13 +206,16 @@ def _worker(
             def call_rccl_list():
                 dist.all_gather(out_list, inp)
 
-            # bit-exact gate: every mori variant must match the RCCL reference
+            # Sanity check: every mori variant must agree byte-for-byte
+            # with the RCCL reference on the very first call.
             torch.cuda.synchronize()
             dist.barrier()
             call_rccl_into()
             torch.cuda.synchronize()
             ref = out_flat.clone()
 
+            # Correctness checks: every variant must reproduce the
+            # full contiguous result byte-for-byte.
             out_flat.zero_()
             call_mori_into()
             torch.cuda.synchronize()
