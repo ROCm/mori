@@ -45,10 +45,6 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   char* dstPtr = reinterpret_cast<char*>(dstBuf);
 
   anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
-  HSAuint64* signal = signals + qId;
-
-  // Single COPY_LINEAR + trailing atomic-inc in one doorbell; the atomic fires
-  // after the copy in FIFO order and expectedSignals bumps once.
   base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
   pendingWptr = base;
   startBase = base;
@@ -58,6 +54,7 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
 
   base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
   pendingWptr = base;
+  HSAuint64* signal = signals + qId;
   auto packet_s = anvil::CreateAtomicIncPacket(signal);
   handle.template placePacket<SDMA_PKT_ATOMIC>(packet_s, pendingWptr, offset);
 
