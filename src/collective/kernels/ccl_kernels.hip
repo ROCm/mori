@@ -254,8 +254,7 @@ extern "C" __global__ void InterNodeRingAllGatherKernel_u32(CclInterNodeRingArgs
                                   /*numBlocksOverride=*/-1, /*bidOverride=*/-1,
                                   /*chunkReadyFlags=*/nullptr,
                                   /*deepPipe=*/1,
-                                  /*deepPipeQuiet=*/0,
-                                  /*useWriteFence=*/args.useWriteFence != 0);
+                                  /*deepPipeQuiet=*/0);
 }
 
 // ============================================================================
@@ -386,8 +385,7 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
                                     /*numBlocksOverride=*/rb, /*bidOverride=*/static_cast<int>(bx),
                                     args.chunkReadyFlags,
                                     /*deepPipe=*/args.deepPipe,
-                                    /*deepPipeQuiet=*/args.deepPipeQuiet,
-                                    /*useWriteFence=*/args.useWriteFence != 0);
+                                    /*deepPipeQuiet=*/args.deepPipeQuiet);
   } else if (bx == static_cast<unsigned>(rb)) {
     // Local block (m == nodeId): ring-independent, reads this PE's own input.
     // Default: collective gather on flag slots [0, G). LOCAL-BLOCK PUSH-ONLY

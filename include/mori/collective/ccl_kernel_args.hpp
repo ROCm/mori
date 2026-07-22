@@ -212,10 +212,6 @@ struct CclInterNodeRingArgs {
   // (also forced for same-node P2P/SDMA). >1 splits the chunk across warps 0..numQp-1
   // (qpId=warpId), only when the neighbour is reached over RDMA (runtime transport check).
   int numQp;
-  // WRITE-PUSH (SEND-CQ) per-channel landing fence (MORI_HIER_RING_WRITE, default 0). Each
-  // channel CTA pushes its sub-range as a put-with-signal on qpId=bid then drains that QP's
-  // SEND CQE; receiver spins its per-channel flag. 0 = push path unchanged.
-  int useWriteFence = 0;
 };
 
 // FUSED inter-node ring + intra-node LOCAL-block SDMA gather in one grid: RDMA ring
@@ -314,7 +310,6 @@ struct CclFusedRingRemoteGatherArgs {
   size_t chunkBytes;
   int numQp;
   int ringBlocks;
-  int useWriteFence = 0;  // RDMA-WRITE-push SEND-CQ landing fence (MORI_HIER_RING_WRITE)
   uint64_t* chunkReadyFlags = nullptr;  // device, >= ringBlocks u64, zeroed
 
   // --- intra-node local-block SDMA gather (Phase B, m == nodeId) ---
@@ -381,8 +376,6 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
   fused.chunkBytes = r->chunkBytes;
   fused.numQp = r->numQp;
   fused.ringBlocks = ringBlocks < 1 ? 1 : ringBlocks;
-  fused.useWriteFence =
-      r->useWriteFence;  // plumb MORI_HIER_RING_WRITE into the crown/deep-pipe launch
   fused.chunkReadyFlags = reinterpret_cast<uint64_t*>(chunkReadyFlagsPtr);
 
   fused.myPe = g->myPe;
