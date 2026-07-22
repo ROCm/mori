@@ -582,6 +582,9 @@ class EpDispatchCombineOp:
         # needs warp_per_block * hiddenDim * elemSize bytes of dynamic shared. Here
         # warp_per_block is the DEVICE warp count per block (block = warpSize*wpb).
         if os.environ.get("MORI_DISP_TDM", "").lower() in ("1", "true", "on", "yes"):
+            # TDM double-buffer: per warp holds a FULL token (2 chunk tiles for ping-pong
+            # overlap of chunk load vs prev chunk store) = hidden*elemSize bytes. wpb<=16
+            # so 16*14KB=224KB <= 320KB LDS.
             tile = (
                 warp_per_block
                 * int(self.config.hidden_dim)
