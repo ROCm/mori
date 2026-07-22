@@ -120,7 +120,6 @@ class IonicQpContainer {
   uint64_t cq_dbval{0};
   uint64_t cq_mask{0};
   struct ionic_v1_cqe* ionic_cq_buf{nullptr};
-
   ionic_dv_qp dvqp;
   uint64_t* sq_dbreg{nullptr};
   uint64_t sq_dbval{0};
