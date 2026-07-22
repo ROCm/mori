@@ -58,60 +58,10 @@ inline bool HierDissemBarrierEnabled() {
   return enabled;
 }
 
-// Hierarchical 2-level entry barrier (env MORI_HIER_BARRIER_HIER=<rpn>, default
-// 0=OFF). Value = ranks_per_node. When >0 the kernel's entry rendezvous routes
-// through ShmemBarrierOnStreamHier instead of the flat funnel/dissem barrier:
-// local PEs signal their node coordinator over XGMI, the per-node coordinators
-// exchange once over RDMA, then coordinators release their locals over XGMI.
-// This crosses the RDMA node boundary exactly twice (vs the funnel's serial
-// per-rank cross-node ops). Same global all-PE semantics; a monotonic generation
-// counter keeps it graph-replay-safe. Bit-exact; targets the op-to-op serialized
-// regime (back-to-back all-gathers) where the barrier is exposed.
-inline int HierBarrierHierRanksPerNode() {
-  static const int rpn = []() {
-    const char* e = std::getenv("MORI_HIER_BARRIER_HIER");
-    return e != nullptr ? std::atoi(e) : 0;
-  }();
-  return rpn;
-}
-
-// Opt-in (MORI_HIER_NO_ENTRY_BARRIER; off by default): skip the ring's prepare
-// entry rendezvous barrier. NOT correctness-safe (it drops the cross-PE fence
-// that orders every PE's op-end flag-reset + own-chunk staging before any peer's
-// next-op atomic increment); benchmarking lever only. See the generation-counter
-// barrier-free ring (prepare_stream flag-reset invariant note) for the
-// correctness-safe alternative.
-inline bool HierEntryBarrierDisabled() {
-  static const bool disabled = []() {
-    const char* e = std::getenv("MORI_HIER_NO_ENTRY_BARRIER");
-    return e != nullptr && std::atoi(e) != 0;
-  }();
-  return disabled;
-}
-
-// Opt-in master switch (MORI_HIER_NO_ALL_BARRIER; off by default): skip every
-// cross-PE barrier (entry ShmemBarrierOnStream, the deferred finish fences, and
-// the host ShmemBarrierAll rendezvous in both the inter-node ring and the
-// intra-node subgroup gather). NOT correctness-safe; benchmarking lever only.
-inline bool HierAllBarrierDisabled() {
-  static const bool disabled = []() {
-    const char* e = std::getenv("MORI_HIER_NO_ALL_BARRIER");
-    return e != nullptr && std::atoi(e) != 0;
-  }();
-  return disabled;
-}
-
+// Ring entry rendezvous. Default funnel (ShmemBarrierOnStream); the dissem barrier
+// (MORI_HIER_DISSEM_BARRIER) has identical global all-PE ordering. Byte-identical default.
 inline void HierPrepareBarrierOnStream(hipStream_t stream) {
-  if (HierEntryBarrierDisabled() || HierAllBarrierDisabled()) {
-    return;
-  }
-  const int hierRpn = HierBarrierHierRanksPerNode();
-  if (hierRpn > 0) {
-    // Topology-aware 2-level barrier (crosses the node boundary only via per-node
-    // coordinators). Falls back to the funnel inside the launcher if the loaded
-    // module lacks the hier kernel.
-    shmem::ShmemBarrierOnStreamHier(stream, hierRpn);
-  } else if (HierDissemBarrierEnabled()) {
+  if (HierDissemBarrierEnabled()) {
     shmem::ShmemBarrierOnStreamDissem(stream);
   } else {
     shmem::ShmemBarrierOnStream(stream);
@@ -127,9 +77,6 @@ inline void HierPrepareBarrierOnStream(hipStream_t stream) {
 // funnel critical path with a parallel log-depth one. Gated on the same
 // MORI_HIER_DISSEM_BARRIER env so the default path stays byte-for-byte identical.
 inline void HierFinishBarrierOnStream(hipStream_t stream) {
-  if (HierAllBarrierDisabled()) {
-    return;
-  }
   if (HierDissemBarrierEnabled()) {
     shmem::ShmemBarrierOnStreamDissem(stream);
   } else {
@@ -174,59 +121,6 @@ class InterNodeRingAllgather {
 
   // Kept alive between prepare and the Python-side kernel launch.
   CclInterNodeRingArgs jit_args_;
-
-  // GEN-RING (env MORI_HIER_GEN_RING): monotonic per-op generation counter and
-  // the enable flag. When on, prepare skips the entry barrier + flag reset and
-  // stamps jit_args_.opGen = ++ringOpGen_ so the kernel waits for the flag to
-  // reach this generation (flags accumulate; never reset). Default off.
-  bool genRing_ = false;
-  uint64_t ringOpGen_ = 0;
-
-  // Device-side gen-ring (env MORI_HIER_GEN_RING_DEV). The host gen-ring above is
-  // graph-incompatible: prepare_stream runs once at capture so opGen freezes while
-  // the accumulating flags advance every replay, desyncing the receiver's gate.
-  // This variant instead exposes a device counter (one uint64 per ring
-  // block/channel, numBlocks_ entries) that the ring kernel increments itself each
-  // execution (eager or graph replay), so the per-op generation stays in lockstep
-  // with the sender's per-op flag AMO_ADD(1) under graph replay. When on,
-  // prepare_stream drops the entry barrier and publishes opGenCounter into
-  // jit_args_ (kernel picks up the gen device-side). Default off.
-  bool genRingDev_ = false;
-  void* opGenCounter_ = nullptr;
-
-  // Fuse-entry-barrier (env MORI_HIER_FUSE_ENTRY_BARRIER, requires the default
-  // single-increment path; mutually exclusive with genRing*). When on,
-  // prepare_stream skips the separate host-launched entry ShmemBarrierOnStream and
-  // instead the fused kernel performs the same cross-PE rendezvous device-side at
-  // its entry prologue (block 0 -> ShmemBarrierAllBlock), gated by a manual
-  // grid-arrival barrier over this 2-word device scratch: gridArrival_[0] = arrival
-  // counter (returns to 0 each op), gridArrival_[1] = monotonic release generation
-  // (never reset -> graph-replay-safe). Per-PE local (never remote), plain HBM.
-  bool fuseEntryBarrier_ = false;
-  void* gridArrival_ = nullptr;
-
-  // Cheap-correct reuse rendezvous (env MORI_HIER_GEN_RING_DISSEM, requires
-  // genRingDev_). The barrier-free device gen-ring has a residual single-buffer
-  // ring-reuse slip at op boundaries (op N+1's peer push overwrites a slot op N's
-  // reassembly still reads) because the entry barrier was dropped. This restores a
-  // true cross-PE rendezvous -- immune to graph-replay desync by construction --
-  // routed through the O(log n) dissem barrier (ShmemBarrierOnStreamDissem) instead
-  // of the PE0 funnel: a correct all-PE entry rendezvous that orders every PE's
-  // op-N reassembly-read before any peer's op-N+1 push, at log-depth latency.
-  // Composes with the accumulating-flag / device-gen graph-safety (genRingDev_).
-  // Default off.
-  bool genRingDissem_ = false;
-
-  // Device double-buffered ring (env MORI_HIER_GEN_RING_DBL, requires genRingDev_).
-  // A second symmetric ring buffer alternated with ring_ by op parity so the
-  // barrier-free gen-ring's cross-PE reuse race is closed: op N+1's peer pushes
-  // land in the other half than op N's still-reassembling half. parityCounter_ is a
-  // device uint64 bumped once per op by the parity-bump kernel (captured on-stream,
-  // graph-safe). Default off => single-buffer path.
-  bool genRingDbl_ = false;
-  void* ring2_ = nullptr;
-  application::SymmMemObjPtr ring2Obj_;
-  void* parityCounter_ = nullptr;
 
   InterNodeRingAllgather(const InterNodeRingAllgather&) = delete;
   InterNodeRingAllgather& operator=(const InterNodeRingAllgather&) = delete;
@@ -274,130 +168,19 @@ class InterNodeRingAllgather {
     (void)hipMemset(flags_, 0, flagsBytes);
     flagsObj_ = shmem::ShmemQueryMemObjPtr(flags_);
 
-    // Transport-level flag-can't-beat-data completion protocol (env
-    // MORI_HIER_RING_PUT_SIGNAL; off by default). When on, the single-warp RDMA
-    // ring send fuses the data WRITE and the completion-flag AMO into one
-    // ShmemPutMemNbiSignal (same QP, signal strictly AFTER data on the RC-ordered
-    // QP) so the receiver never observes the flag before the remote data lands.
-    // This removes the separate post-put ShmemQuietThread full-CQ drain that the
-    // receiver's flag-spin otherwise waits behind. Default off keeps the
-    // standalone bytes unchanged. The fused FSDP builders gate it independently
-    // (HierRingPutSignalExplicitlyOn) so it never leaks into E2E.
-    {
-      const char* e = std::getenv("MORI_HIER_RING_PUT_SIGNAL");
-      jit_args_.usePutSignal = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
-    }
-    // WRITE_WITH_IMM (env MORI_HIER_RING_WRITE_IMM, default off). When
-    // set, the single-warp cross-node ring send emits RDMA_WRITE_WITH_IMM and the
-    // receiver consumes the recv-CQ completion instead of the flag spin -- the
-    // recv-CQE cannot precede the payload landing, closing the remote-landing race
-    // with no host stall. Set once here; persists across calls like usePutSignal.
-    {
-      const char* e = std::getenv("MORI_HIER_RING_WRITE_IMM");
-      jit_args_.useWriteImm = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
-    }
-    // RDMA-READ (PULL) ring (env MORI_HIER_RING_READ, default OFF). When set, the
-    // single-round (ringSize==2) all-RDMA inter-node phase PULLS the peer's own
-    // chunk with an RDMA READ instead of the peer PUSHing it -- the READ
-    // completion (our own quiet) is the consumer-side landing fence, no flag AMO
-    // / receiver spin / remote-landing race. Set once here; persists across calls.
-    {
-      const char* e = std::getenv("MORI_HIER_RING_READ");
-      jit_args_.useRead = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
-    }
     // WRITE-PUSH (SEND-CQ) landing fence (env MORI_HIER_RING_WRITE, default OFF).
-    // The WRITE-side counterpart of MORI_HIER_RING_READ. On the giant
-    // multiBlock AG each channel pushes its sub-range as a fused put-with-signal
-    // then drains its own SEND CQE; keeps RDMA-WRITE fill where READ underfilled.
-    // Set once here; persists across calls like usePutSignal / useRead.
+    // On the giant multiBlock AG each channel pushes its sub-range as a fused
+    // put-with-signal then drains its own SEND CQE. Set once here; persists
+    // across calls.
     {
       const char* e = std::getenv("MORI_HIER_RING_WRITE");
       jit_args_.useWriteFence = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
-    }
-    // GENERATION-COUNTER barrier-free ring (env MORI_HIER_GEN_RING, default OFF).
-    // When set, prepare_stream stops resetting the flags (the kernel accumulates
-    // the +1 per op) and DROPS the entry ShmemBarrierOnStream -- one of the two
-    // global barriers per ring round the plateau pays. Only engages on the
-    // classic single-increment path (no put-signal / write-imm), so it is
-    // mutually exclusive with those; if either is also set, gen-ring stays off.
-    {
-      const char* e = std::getenv("MORI_HIER_GEN_RING");
-      genRing_ = (e != nullptr && e[0] != '\0' && e[0] != '0') && jit_args_.usePutSignal == 0 &&
-                 jit_args_.useWriteImm == 0;
-    }
-    // Device-side gen-ring (env MORI_HIER_GEN_RING_DEV, default OFF). The
-    // graph-compatible variant of GEN_RING: the DEVICE increments the per-op
-    // generation so it advances under HIP-graph replay (host GEN_RING freezes at
-    // capture). Same mutual-exclusion as GEN_RING (classic single-increment flag
-    // path only). Allocate one device uint64 per ring block/channel, zeroed once;
-    // the kernel does opGenCounter[bx] += 1 at entry. Uses plain HBM (hipMalloc):
-    // the counter is per-PE local (never remotely accessed), so it need not be
-    // symmetric. Publish the pointer into jit_args_ so BuildFusedRingLocalGatherArgs
-    // (and the plain ring kernel) can pick it up; prepare_stream drops the entry
-    // barrier when it is engaged.
-    {
-      const char* e = std::getenv("MORI_HIER_GEN_RING_DEV");
-      genRingDev_ = (e != nullptr && e[0] != '\0' && e[0] != '0') && jit_args_.usePutSignal == 0 &&
-                    jit_args_.useWriteImm == 0 && !genRing_;
-    }
-    if (genRingDev_) {
-      size_t genBytes = static_cast<size_t>(numBlocks_) * sizeof(uint64_t);
-      if (hipMalloc(&opGenCounter_, genBytes) != hipSuccess || opGenCounter_ == nullptr) {
-        throw std::runtime_error("InterNodeRingAllgather: opGenCounter hipMalloc failed");
-      }
-      (void)hipMemset(opGenCounter_, 0, genBytes);
-    }
-    // Fuse-entry-barrier: engage only on the default single-increment path
-    // (no put-signal / write-imm) and never together with the barrier-DROP gen-ring
-    // variants (those already remove the entry rendezvous). Allocate the 2-word grid
-    // arrival scratch (zeroed once; release generation accumulates across ops).
-    {
-      const char* e = std::getenv("MORI_HIER_FUSE_ENTRY_BARRIER");
-      fuseEntryBarrier_ = (e != nullptr && e[0] != '\0' && e[0] != '0') &&
-                          jit_args_.usePutSignal == 0 && jit_args_.useWriteImm == 0 && !genRing_ &&
-                          !genRingDev_;
-    }
-    if (fuseEntryBarrier_) {
-      if (hipMalloc(&gridArrival_, 2 * sizeof(unsigned int)) != hipSuccess ||
-          gridArrival_ == nullptr) {
-        throw std::runtime_error("InterNodeRingAllgather: gridArrival hipMalloc failed");
-      }
-      (void)hipMemset(gridArrival_, 0, 2 * sizeof(unsigned int));
-    }
-    // Cheap-correct reuse rendezvous (env MORI_HIER_GEN_RING_DISSEM, requires
-    // genRingDev_). Restores a true cross-PE entry rendezvous on the barrier-free
-    // gen-ring via the O(log n) dissem barrier (not the funnel), closing the
-    // DEV-alone ring-reuse E2E drift without the double-buffer.
-    {
-      const char* e = std::getenv("MORI_HIER_GEN_RING_DISSEM");
-      genRingDissem_ = (e != nullptr && e[0] != '\0' && e[0] != '0') && genRingDev_;
-    }
-    // Device double-buffered ring (env MORI_HIER_GEN_RING_DBL, requires
-    // genRingDev_): allocate the SECOND symmetric ring buffer (same size, so it
-    // has its own cross-node rkeys/peer pointers) + the device parity counter.
-    {
-      const char* e = std::getenv("MORI_HIER_GEN_RING_DBL");
-      genRingDbl_ = (e != nullptr && e[0] != '\0' && e[0] != '0') && genRingDev_;
-    }
-    if (genRingDbl_) {
-      ring2_ = shmem::ShmemMalloc(ringBytes_);
-      if (ring2_ == nullptr)
-        throw std::runtime_error("InterNodeRingAllgather: ring2 ShmemMalloc failed");
-      ring2Obj_ = shmem::ShmemQueryMemObjPtr(ring2_);
-      if (hipMalloc(&parityCounter_, sizeof(uint64_t)) != hipSuccess || parityCounter_ == nullptr) {
-        throw std::runtime_error("InterNodeRingAllgather: parityCounter hipMalloc failed");
-      }
-      (void)hipMemset(parityCounter_, 0, sizeof(uint64_t));
     }
   }
 
   ~InterNodeRingAllgather() {
     if (ring_) shmem::ShmemFree(ring_);
     if (flags_) shmem::ShmemFree(flags_);
-    if (opGenCounter_) (void)hipFree(opGenCounter_);
-    if (gridArrival_) (void)hipFree(gridArrival_);
-    if (ring2_) shmem::ShmemFree(ring2_);
-    if (parityCounter_) (void)hipFree(parityCounter_);
   }
 
   // Place this PE's input chunk into its ring slot, clear the flags, barrier so
@@ -420,7 +203,7 @@ class InterNodeRingAllgather {
     // Global barrier: all PEs have cleared flags + staged their own chunk
     // before the ring (with its cross-PE atomic increments) begins. (All PEs
     // call this op -- each participates in exactly one sub-group.)
-    if (!HierAllBarrierDisabled()) shmem::ShmemBarrierAll();
+    shmem::ShmemBarrierAll();
 
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
@@ -464,58 +247,11 @@ class InterNodeRingAllgather {
     char* myChunk = reinterpret_cast<char*>(ring_) + static_cast<size_t>(ringPos_) * chunkBytes;
     (void)hipMemcpyAsync(myChunk, reinterpret_cast<void*>(input), chunkBytes,
                          hipMemcpyDeviceToDevice, stream);
-    // Double-buffer: stage this PE's own chunk into both ring halves each op.
-    // The host copy-IN address is FROZEN under HIP-graph capture, so we cannot pick
-    // the parity-selected half on the host; staging into both (two fixed copy-engine
-    // memcpys, graph-safe) guarantees the kernel's device-parity-selected half always
-    // holds this PE's chunk to send. The extra memcpy is one per-PE shard (cheap vs
-    // the whole AG); the kernel reads/receives from exactly one half via parity.
-    if (genRingDbl_ && ring2_ != nullptr) {
-      char* myChunk2 = reinterpret_cast<char*>(ring2_) + static_cast<size_t>(ringPos_) * chunkBytes;
-      (void)hipMemcpyAsync(myChunk2, reinterpret_cast<void*>(input), chunkBytes,
-                           hipMemcpyDeviceToDevice, stream);
-    }
     // On-device global barrier (no host sync): all PEs have cleared flags +
     // staged their own chunk (stream-ordered before this barrier) before the
     // ring's cross-PE atomic increments begin. dissemination
     // topology when MORI_HIER_DISSEM_BARRIER=1 (same global semantics).
-    // GEN-RING: with accumulating (never-reset) flags there is no reset for a
-    // peer's next-op increment to race, so this entry barrier is redundant and
-    // is skipped. The copy-IN above is stream-ordered before this op's ring
-    // kernel on the same stream, and the trailing finish reuse barrier still
-    // orders ring-buffer reuse -- so dropping ONLY the entry fence is safe.
-    if (genRing_) {
-      jit_args_.opGen = ++ringOpGen_;
-    } else if (genRingDev_) {
-      // DEVICE gen-ring: publish the device counter; the kernel bumps it per
-      // execution (so it advances under graph replay). Entry barrier dropped:
-      // the accumulating (never-reset) flags mean there is no per-op flag reset
-      // for a peer's next-op increment to race, so the entry rendezvous is
-      // redundant (same argument as host GEN_RING) -- and made graph-safe by the
-      // device-side generation.
-      jit_args_.opGen = 0;
-      jit_args_.opGenCounter = reinterpret_cast<uint64_t*>(opGenCounter_);
-      // Optional cheap-correct reuse rendezvous. A true all-PE dissem barrier orders
-      // every PE's op-N reassembly-read before any peer's op-N+1 push -- immune to the
-      // graph-replay parity desync seen with the double-buffer -- at O(log n) latency
-      // instead of the funnel.
-      if (genRingDissem_) shmem::ShmemBarrierOnStreamDissem(stream);
-    } else if (fuseEntryBarrier_) {
-      // Fuse-entry-barrier: do not launch the separate entry barrier kernel.
-      // The fused kernel performs the identical cross-PE rendezvous device-side at
-      // its entry prologue (block 0 -> ShmemBarrierAllBlock), gated by the grid
-      // arrival scratch. Publish the flag + scratch so the kernel engages it. The
-      // copy-IN memcpy above is stream-ordered before the kernel, so this PE's chunk
-      // is staged before the in-kernel rendezvous releases the ring push -- same
-      // ordering the separate barrier gave, so the byte image is unchanged.
-      jit_args_.fuseEntryBarrier = 1;
-      jit_args_.gridArrival = reinterpret_cast<unsigned int*>(gridArrival_);
-    } else {
-      HierPrepareBarrierOnStream(stream);
-    }
-    // Double-buffer: publish the second ring + parity counter and bump the parity
-    // on-stream before the fused kernel (captured => advances per replay).
-    PublishDoubleBuffer(stream);
+    HierPrepareBarrierOnStream(stream);
 
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
@@ -530,24 +266,7 @@ class InterNodeRingAllgather {
     return reinterpret_cast<int64_t>(&jit_args_);
   }
 
-  // Double-buffer helper: publish ringMemObjB + parityCounter into jit_args_.
-  // The per-op parity BUMP is a JIT kernel (RingParityBumpKernel_u32) launched from
-  // Python on the launch stream BEFORE the fused kernel each op (captured => advances
-  // under graph replay, every kernel block reads one stable post-bump value). This TU
-  // (pybind) is HOST-compiled, so it cannot launch a device kernel here. No-op unless
-  // MORI_HIER_GEN_RING_DBL is engaged (single-buffer path byte-identical).
-  void PublishDoubleBuffer(hipStream_t /*stream*/) {
-    if (!genRingDbl_ || parityCounter_ == nullptr) return;
-    jit_args_.ringMemObjB = ring2Obj_;
-    jit_args_.parityCounter = reinterpret_cast<uint64_t*>(parityCounter_);
-  }
-
  public:
-  // Device pointer of the per-op parity counter (0 unless GEN_RING_DBL on),
-  // so the Python launcher can fire the captured RingParityBumpKernel_u32 on
-  // the ring stream before each fused-kernel launch.
-  uintptr_t parity_counter_ptr() const { return reinterpret_cast<uintptr_t>(parityCounter_); }
-
   // Stream-ordered counterpart of prepare_sync_in_place (chunk already in slot).
   int64_t prepare_stream_in_place(size_t count_u32, hipStream_t stream) {
     size_t chunkBytes = count_u32 * sizeof(uint32_t);
@@ -560,31 +279,7 @@ class InterNodeRingAllgather {
     // zeroes once, so flags are always 0 on entry. The barrier still orders the
     // cross-PE reset-vs-next-op-increment. dissemination
     // topology when MORI_HIER_DISSEM_BARRIER=1 (same global semantics).
-    // GEN-RING: accumulating flags -> no reset to order -> entry barrier dropped
-    // (see prepare_stream); the in-place chunk is already staged by the caller.
-    if (genRing_) {
-      jit_args_.opGen = ++ringOpGen_;
-    } else if (genRingDev_) {
-      jit_args_.opGen = 0;
-      jit_args_.opGenCounter = reinterpret_cast<uint64_t*>(opGenCounter_);
-      // Cheap-correct reuse rendezvous (see prepare_stream).
-      if (genRingDissem_) shmem::ShmemBarrierOnStreamDissem(stream);
-    } else if (fuseEntryBarrier_) {
-      // Fuse-entry-barrier: do not launch the separate entry barrier kernel.
-      // The fused kernel performs the identical cross-PE rendezvous device-side at
-      // its entry prologue (block 0 -> ShmemBarrierAllBlock), gated by the grid
-      // arrival scratch. Publish the flag + scratch so the kernel engages it. The
-      // copy-IN memcpy above is stream-ordered before the kernel, so this PE's chunk
-      // is staged before the in-kernel rendezvous releases the ring push -- same
-      // ordering the separate barrier gave, so the byte image is unchanged.
-      jit_args_.fuseEntryBarrier = 1;
-      jit_args_.gridArrival = reinterpret_cast<unsigned int*>(gridArrival_);
-    } else {
-      HierPrepareBarrierOnStream(stream);
-    }
-    // Double-buffer: in the fuse_copyin path the in-kernel stage already targets the
-    // parity-selected half, so only publish + bump is needed here.
-    PublishDoubleBuffer(stream);
+    HierPrepareBarrierOnStream(stream);
 
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
@@ -660,7 +355,7 @@ class InterNodeRingAllgather {
 
     // Global barrier: all PEs have cleared flags + staged their own chunk (the
     // upstream gather already wrote into slot_ptr) before the ring begins.
-    if (!HierAllBarrierDisabled()) shmem::ShmemBarrierAll();
+    shmem::ShmemBarrierAll();
 
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
@@ -685,7 +380,7 @@ class InterNodeRingAllgather {
     (void)hipStreamSynchronize(stream);
     // Barrier so no PE frees/reuses the ring buffer while a peer is still
     // reading from it in a subsequent op.
-    if (!HierAllBarrierDisabled()) shmem::ShmemBarrierAll();
+    shmem::ShmemBarrierAll();
     return 0.0;
   }
 
@@ -708,7 +403,7 @@ class InterNodeRingAllgather {
   // from uncached memory, which is outside the timed AllGather.
   double finish_sync_no_copy(hipStream_t stream) {
     (void)hipStreamSynchronize(stream);
-    if (!HierAllBarrierDisabled()) shmem::ShmemBarrierAll();
+    shmem::ShmemBarrierAll();
     return 0.0;
   }
 

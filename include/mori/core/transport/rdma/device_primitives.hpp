@@ -136,19 +136,6 @@ inline __device__ uint64_t PostRead(WorkQueueHandle& wq, uint32_t qpn, uintptr_t
   return PostReadWrite<PrvdType, true>(wq, qpn, laddr, lkey, raddr, rkey, bytes);
 }
 
-// RDMA WRITE_WITH_IMM: like PostWrite but carries a 32-bit immediate that is
-// delivered to the receiver's completion queue when (and only when) the payload
-// DMA has landed remotely. This is the transport primitive for the inline-flag
-// ring protocol (Phase 5): completion becomes a CQ event that cannot be observed
-// before its data, unlike a separate GPU-memory flag AMO. Send-side only; the
-// receiver consumes the immediate via a recv-CQ poll (see PollRecvCqImm).
-template <ProviderType PrvdType>
-inline __device__ uint64_t PostWriteImm(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                        uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
-                                        bool cqeSignal, uint32_t qpn, uintptr_t laddr,
-                                        uint64_t lkey, uintptr_t raddr, uint64_t rkey, uint32_t imm,
-                                        size_t bytes);
-
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWriteInline(WorkQueueHandle& wq, uint32_t curPostIdx,
                                            uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
@@ -220,17 +207,6 @@ template <ProviderType PrvdType>
 inline __device__ int PollCq(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
                              void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
                              uint16_t* wqeCounter);
-
-// Receiver half of the inline-flag ring protocol. Polls a recv CQ for a single
-// RDMA-WRITE-with-immediate completion. Returns 0 when a fresh RDMA_IMM CQE for
-// slot *consIdx is ready (its payload DMA is globally visible), -1 if not ready
-// yet, or a positive error code; on success *imm is set to the decoded 32-bit
-// immediate and *consIdx is advanced. Because the immediate rides the transport
-// CQ (not a separate GPU-memory flag), it can never be observed before its
-// payload lands remotely -- the ordering guarantee the memory-flag path lacks.
-template <ProviderType PrvdType>
-inline __device__ int PollRecvCqImm(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
-                                    uint32_t* imm);
 
 template <ProviderType PrvdType>
 inline __device__ void UpdateCqDbrRecord(CompletionQueueHandle& cq, uint32_t consIdx);

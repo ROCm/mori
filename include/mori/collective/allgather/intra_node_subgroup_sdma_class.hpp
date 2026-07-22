@@ -48,30 +48,6 @@
 namespace mori {
 namespace collective {
 
-// Opt-in (MORI_HIER_NO_ALL_BARRIER; off by default; mirror of
-// inter_node_ring_class HierAllBarrierDisabled): skip the intra-node subgroup
-// gather's cross-PE barriers so both phases (inter ring + intra gather) run
-// barrier-free. NOT correctness-safe; benchmarking lever only.
-inline bool IntraHierAllBarrierDisabled() {
-  static const bool disabled = []() {
-    const char* e = std::getenv("MORI_HIER_NO_ALL_BARRIER");
-    return e != nullptr && std::atoi(e) != 0;
-  }();
-  return disabled;
-}
-
-// Opt-in (MORI_INTRA_MQ; off by default): drive all sdmaNumQueue SDMA queues
-// (both recommended XGMI engines per peer link) for each intra all-to-all column
-// instead of only queue 0. Default off is byte-identical. See
-// oneshot_sdma_kernel.hpp body.
-inline int IntraMultiQueue() {
-  static const int mq = []() {
-    const char* e = std::getenv("MORI_INTRA_MQ");
-    return (e != nullptr) ? std::atoi(e) : 0;
-  }();
-  return mq;
-}
-
 // EVENT-SCOPED finish_sync copy-OUT (MORI_INTRA_EVENT_SYNC). The default
 // finish_sync host-blocks on hipStreamSynchronize(stream) -- but ``stream`` is
 // the CALLER's compute stream (host_proxy_ag runs the whole AG inside
@@ -87,28 +63,6 @@ inline bool IntraEventSync() {
     const char* e = std::getenv("MORI_INTRA_EVENT_SYNC");
     // Default on: event-scoped copy-OUT. Set MORI_INTRA_EVENT_SYNC=0 to force
     // the full-stream-drain path.
-    if (e == nullptr) return true;
-    return std::atoi(e) != 0;
-  }();
-  return on;
-}
-
-// EVENT-SCOPED finish_sync WITHOUT the host event wait (MORI_INTRA_EVENT_NOSYNC).
-// The EVENT_SYNC path already GPU-orders the caller stream after the copy-OUT via
-// hipStreamWaitEvent(stream, copy_ev_): every downstream consumer AND the deferred
-// node-local dist.barrier(intra_group) (enqueued on the caller stream) are gated on
-// the landed copy-OUT on the DEVICE. On the hot path (barrier=false) no host-side
-// ShmemBarrierAll follows finish_sync, so the trailing host hipEventSynchronize
-// blocks the LAUNCH thread for a completion that nothing on the host actually needs
-// -- it only prevents the host from racing ahead to post the next AG. Skipping it
-// (when barrier=false only) lets the host launch the next op's RDMA + gather while
-// this op's copy-OUT is still draining on the copy engine, without weakening any
-// correctness fence (device ordering is intact). Default on; layers on top of
-// EVENT_SYNC. The standalone UT (barrier=true) always keeps the host wait. Set
-// MORI_INTRA_EVENT_NOSYNC=0 to restore the per-AG host event wait on the hot path.
-inline bool IntraEventNoSync() {
-  static const bool on = []() {
-    const char* e = std::getenv("MORI_INTRA_EVENT_NOSYNC");
     if (e == nullptr) return true;
     return std::atoi(e) != 0;
   }();
@@ -255,7 +209,7 @@ class IntraNodeSubGroupAllgatherSdma {
     // shared flag slots. The max flag slot used is reasm*numNodes*groupSize ==
     // reasm*npes. The single-block (reasm=1) path only needs ``npes`` slots, but
     // sizing the buffer for up to ``kMaxReassemblyBlocks`` reassembly blocks lets
-    // MORI_HIER_REASSEM_BLOCKS>1 parallelise the XGMI reassembly without an OOB
+    // reasm>1 parallelise the XGMI reassembly without an OOB
     // flag write. Cost is a few KiB of the symmetric heap, identical across PEs
     // (npes is collective), so the
     // symmetric layout stays consistent. flagBase=0 (the classic single gather
@@ -336,7 +290,7 @@ class IntraNodeSubGroupAllgatherSdma {
 
     // All members enter the gather together (flags are monotonic; the token
     // distinguishes this call from the previous one without a reset).
-    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierAll();
+    if (barrier) shmem::ShmemBarrierAll();
 
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
@@ -353,7 +307,6 @@ class IntraNodeSubGroupAllgatherSdma {
     jit_args_.flagVal = flag_token;
     // classic prepare_sync (transit path): always base 0 (single gather).
     jit_args_.flagBase = 0;
-    jit_args_.multiQueue = IntraMultiQueue();
     return reinterpret_cast<int64_t>(&jit_args_);
   }
 
@@ -371,7 +324,7 @@ class IntraNodeSubGroupAllgatherSdma {
     (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
                          stream);
     (void)hipStreamSynchronize(stream);
-    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierAll();
+    if (barrier) shmem::ShmemBarrierAll();
     return 0.0;
   }
 
@@ -405,7 +358,7 @@ class IntraNodeSubGroupAllgatherSdma {
     size_t total = total_count_u32 * sizeof(uint32_t);
     (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
                          stream);
-    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
+    if (barrier) shmem::ShmemBarrierOnStream(stream);
     return 0.0;
   }
 
@@ -480,8 +433,8 @@ class IntraNodeSubGroupAllgatherSdma {
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: direct gather exceeds output");
     }
     // Race-free concurrent direct gathers. Lane j passes a disjoint
-    // flag_slot_base = j*groupSize so simultaneous launches (REASM_STREAMS)
-    // never collide on the shared flag slots. The flags buffer is sized for
+    // flag_slot_base = j*groupSize so simultaneous launches never collide on
+    // the shared flag slots. The flags buffer is sized for
     // npes*(kMaxReassemblyBlocks+1) slots (see ctor); guard against OOB.
     constexpr size_t kMaxReassemblyBlocks = 32;
     size_t flags_slot_cap = static_cast<size_t>(npes_) * (kMaxReassemblyBlocks + 1);
@@ -498,7 +451,7 @@ class IntraNodeSubGroupAllgatherSdma {
     // (slice_fuse_ib on) this barrier is skipped entirely (barrier=false); it
     // only fires in the fuse_ib-off path, where it must stay on-stream to avoid
     // mixing a host barrier into the stream-ordered sequence.
-    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
+    if (barrier) shmem::ShmemBarrierOnStream(stream);
     jit_args_.myPe = myPe_;
     jit_args_.npes = npes_;
     jit_args_.groupSize = groupSize_;
@@ -535,7 +488,7 @@ class IntraNodeSubGroupAllgatherSdma {
       throw std::runtime_error(
           "IntraNodeSubGroupAllgatherSdma: output not registered for direct param-contiguous");
     uint64_t flag_token = ++seq_;
-    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
+    if (barrier) shmem::ShmemBarrierOnStream(stream);
     jit_args_pc_.myPe = myPe_;
     jit_args_pc_.npes = npes_;
     jit_args_pc_.groupSize = groupSize_;
@@ -565,7 +518,7 @@ class IntraNodeSubGroupAllgatherSdma {
   // defers the fence to the next op's inter-prepare barrier (same rationale as
   // finish_batch_stream's deferral).
   double finish_direct_stream(hipStream_t stream, bool barrier = true) {
-    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierOnStream(stream);
+    if (barrier) shmem::ShmemBarrierOnStream(stream);
     return 0.0;
   }
 
@@ -603,24 +556,21 @@ class IntraNodeSubGroupAllgatherSdma {
       // Make the caller stream observe the copy-OUT (downstream consumers gate on
       // it) without a host drain of the caller stream.
       (void)hipStreamWaitEvent(stream, copy_ev_, 0);
-      // Host-wait on the copy-OUT ONLY when a host-side ShmemBarrierAll follows
-      // (barrier=true, the standalone contract) -- there the host must know the
-      // copy landed before entering the cross-PE rendezvous. On the hot path
-      // (barrier=false) nothing on the host consumes the copy: the caller stream
-      // is already device-ordered after it (hipStreamWaitEvent above), so the
-      // MORI_INTRA_EVENT_NOSYNC lever lets the launch thread skip the host wait
-      // and race ahead to post the next AG while this copy drains on the copy
-      // engine.
-      if (barrier || !IntraEventNoSync()) {
+      // Host-wait on the copy-OUT only when a host-side ShmemBarrierAll follows
+      // (barrier=true): the host must know the copy landed before the cross-PE
+      // rendezvous. On the hot path (barrier=false) the caller stream is already
+      // device-ordered after the copy (hipStreamWaitEvent above), so the launch
+      // thread skips the host wait and races ahead to post the next AG.
+      if (barrier) {
         (void)hipEventSynchronize(copy_ev_);
       }
-      if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierAll();
+      if (barrier) shmem::ShmemBarrierAll();
       return 0.0;
     }
     (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
                          stream);
     (void)hipStreamSynchronize(stream);
-    if (barrier && !IntraHierAllBarrierDisabled()) shmem::ShmemBarrierAll();
+    if (barrier) shmem::ShmemBarrierAll();
     return 0.0;
   }
 

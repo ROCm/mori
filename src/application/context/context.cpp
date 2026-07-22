@@ -287,17 +287,6 @@ void Context::InitializeTopologyAndTransports() {
           (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
       savedEpConfig.alignment = 4096;
       savedEpConfig.onGpu = true;
-      // WRITE_WITH_IMM (hierarchical AllGather cross-node ring, MORI_HIER_RING_WRITE_IMM):
-      // the receiver polls recvCqHandle for RDMA_WRITE_WITH_IMM completions with its OWN
-      // consumer index. Without a dedicated recv CQ the recv buffer mirrors the send CQ, so
-      // recvCqHandle.consIdx=0 aliases already-consumed send CQEs and the recv poll spins
-      // forever. Give WRITE_IMM its own recv CQ so only recv CQEs land there. Default OFF
-      // (env unset) => recv CQ == send CQ and recvCqHandle mirrors cqHandle, byte-identical.
-      {
-        const char* eImm = std::getenv("MORI_HIER_RING_WRITE_IMM");
-        if (eImm != nullptr && eImm[0] != '\0' && eImm[0] != '0')
-          savedEpConfig.dedicatedRecvCq = true;
-      }
     }
   }
 

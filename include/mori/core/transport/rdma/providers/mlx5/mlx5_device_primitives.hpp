@@ -243,54 +243,6 @@ inline __device__ uint64_t PostReadWrite<ProviderType::MLX5, true>(WorkQueueHand
   return Mlx5PostReadWriteImpl<true>(wq, curPostIdx, true, qpn, laddr, lkey, raddr, rkey, bytes);
 }
 
-// RDMA_WRITE_WITH_IMM (mlx5). Same WQE layout as a plain RDMA_WRITE (ctrl+raddr+
-// data segs) but the opcode is RDMA_WRITE_IMM and the 32-bit immediate rides the
-// ctrl segment's imm field (BE). On the responder this yields a recv-CQE (bearing
-// imm_inval_pkey) ONLY after the write payload has landed globally -- a
-// transport-level per-message landing proof that lets the receiver overlap
-// receive-side consumption with ongoing network arrival. Mirrors Mlx5PostReadWriteImpl exactly.
-inline __device__ uint64_t Mlx5PostWriteImmImpl(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                                bool cqeSignal, uint32_t qpn, uintptr_t laddr,
-                                                uint64_t lkey, uintptr_t raddr, uint64_t rkey,
-                                                uint32_t imm, size_t bytes) {
-  constexpr uint32_t opcode = MORI_MLX5_OPCODE_RDMA_WRITE_IMM;
-  uint8_t signalFlag = cqeSignal ? MORI_MLX5_WQE_CTRL_CQ_UPDATE : 0x00;
-  void* queueBuffAddr = wq.sqAddr;
-  uint32_t wqeNum = wq.sqWqeNum;
-
-  uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
-  uintptr_t wqeAddr =
-      reinterpret_cast<uintptr_t>(queueBuffAddr) + (wqeIdx << MORI_MLX5_SEND_WQE_SHIFT);
-
-  Mlx5WqeCtrlSeg* wqeCtrlSeg = reinterpret_cast<Mlx5WqeCtrlSeg*>(wqeAddr);
-  wqeCtrlSeg->opmod_idx_opcode = HTOBE32(((curPostIdx & 0xffff) << 8) | opcode);
-  wqeCtrlSeg->qpn_ds = HTOBE32((qpn << 8) | SendWqeNumOctoWords);
-  wqeCtrlSeg->fm_ce_se = signalFlag;
-  // The immediate rides the ctrl segment (BE, mlx5 wire order).
-  wqeCtrlSeg->imm = HTOBE32(imm);
-
-  Mlx5WqeRaddrSeg* wqeRaddrSeg =
-      reinterpret_cast<Mlx5WqeRaddrSeg*>(wqeAddr + sizeof(Mlx5WqeCtrlSeg));
-  wqeRaddrSeg->raddr = HTOBE64(raddr);
-  wqeRaddrSeg->rkey = HTOBE32(rkey);
-
-  Mlx5WqeDataSeg* wqeDataSeg =
-      reinterpret_cast<Mlx5WqeDataSeg*>(wqeAddr + sizeof(Mlx5WqeCtrlSeg) + sizeof(Mlx5WqeRaddrSeg));
-  wqeDataSeg->byte_count = HTOBE32(bytes);
-  wqeDataSeg->addr = HTOBE64(laddr);
-  wqeDataSeg->lkey = HTOBE32(lkey);
-
-  return reinterpret_cast<uint64_t*>(wqeCtrlSeg)[0];
-}
-
-template <>
-inline __device__ uint64_t PostWriteImm<ProviderType::MLX5>(
-    WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
-    bool cqeSignal, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,
-    uint32_t imm, size_t bytes) {
-  return Mlx5PostWriteImmImpl(wq, curPostIdx, cqeSignal, qpn, laddr, lkey, raddr, rkey, imm, bytes);
-}
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        WriteInline APIs                                        */
 /* ---------------------------------------------------------------------------------------------- */
@@ -819,57 +771,6 @@ inline __device__ int PollCqOnce<ProviderType::MLX5>(void* cqeAddr, uint32_t cqe
 
   *lastBytePtr = (MORI_MLX5_CQE_INVALID << 4) | (cq_owner_flip & 1);
   return opcode;
-}
-
-// RDMA_WRITE_WITH_IMM recv-CQ poll (mlx5). Non-blocking single check of the CQE
-// at slot *consIdx: returns -1 if not yet produced (owner bit not flipped / slot
-// empty), a positive error opcode on a bad CQE, or 0 on a landed WRITE_WITH_IMM
-// completion -- in which case *imm holds the decoded 32-bit immediate (from the
-// CQE's imm_inval_pkey field, BE on the wire) and *consIdx is advanced. The CQE
-// is produced ONLY after the peer's write payload has landed globally, so this is
-// a definitive per-message remote-landing proof (RC in-order per QP). Mirrors
-// PollCqOnce<MLX5>'s owner/empty gating exactly; only the imm extraction differs.
-template <>
-inline __device__ int PollRecvCqImm<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum,
-                                                        uint32_t* consIdx, uint32_t* imm) {
-  const uint32_t curConsIdx = *consIdx;
-  const uint32_t cqeIdx = curConsIdx % cqeNum;
-  void* cqeAddr = reinterpret_cast<char*>(cqAddr) + cqeIdx * sizeof(Mlx5Cqe64);
-
-  uint64_t* cqeQwords = reinterpret_cast<uint64_t*>(cqeAddr);
-  auto* lastBytePtr = reinterpret_cast<uint8_t*>(cqeQwords + 7) + 7;
-  uint8_t opOwn = *reinterpret_cast<volatile uint8_t*>(lastBytePtr);
-  uint8_t opcode = opOwn >> 4;
-  uint8_t owner = opOwn & MORI_MLX5_CQE_OWNER_MASK;
-
-  bool is_empty = true;
-  for (int i = 0; i < (sizeof(Mlx5Cqe64) / sizeof(uint64_t)); i++) {
-    if (atomicAdd(&reinterpret_cast<uint64_t*>(cqeAddr)[i], 0) != 0) {
-      is_empty = false;
-      break;
-    }
-  }
-
-  int cq_owner_flip = !!(curConsIdx & cqeNum);
-  if ((opcode == MORI_MLX5_CQE_INVALID) || (owner ^ cq_owner_flip) || is_empty) {
-    return -1;  // CQE not produced yet
-  }
-
-  if (opcode == MORI_MLX5_CQE_RESP_ERR || opcode == MORI_MLX5_CQE_REQ_ERR) {
-    auto error = Mlx5HandleErrorCqe(reinterpret_cast<Mlx5ErrCqe*>(cqeAddr));
-    *reinterpret_cast<volatile uint8_t*>(lastBytePtr) =
-        (MORI_MLX5_CQE_INVALID << 4) | (cq_owner_flip & 1);
-    return opcode ? opcode : 1;
-  }
-
-  // A responder RDMA_WRITE_WITH_IMM completion carries its immediate in
-  // imm_inval_pkey (BE on the wire).
-  *imm = BE32TOH(reinterpret_cast<Mlx5Cqe64*>(cqeAddr)->imm_inval_pkey);
-  // Reclaim the slot for the next owner phase (matches PollCqOnce).
-  *reinterpret_cast<volatile uint8_t*>(lastBytePtr) =
-      (MORI_MLX5_CQE_INVALID << 4) | (cq_owner_flip & 1);
-  *consIdx = curConsIdx + 1;
-  return 0;
 }
 
 template <>

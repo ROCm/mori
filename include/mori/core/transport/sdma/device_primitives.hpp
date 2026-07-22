@@ -36,8 +36,7 @@ namespace core {
 inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                      anvil::SdmaQueueDeviceHandle** deviceHandles,
                                      HSAuint64* signals, HSAuint64* expectedSignals,
-                                     uint32_t queNum, uint32_t qId, int ndesc = 1,
-                                     int cacheHint = 0) {
+                                     uint32_t queNum, uint32_t qId, int ndesc = 1) {
   uint64_t base = 0;
   uint64_t pendingWptr = 0;
   uint64_t startBase = 0;
@@ -59,7 +58,7 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
     pendingWptr = base;
     startBase = base;
 
-    auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size, cacheHint);
+    auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size);
     handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, offset);
 
     base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
@@ -72,7 +71,10 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
     return;
   }
 
-  // Multi-descriptor path: split into equal 16B-aligned sub-ranges.
+  // Multi-descriptor path: split into equal sub-ranges. The 16B unit is the
+  // SDMA_PKT_COPY_LINEAR granularity on CDNA3 (linear-copy byte count / base
+  // address are quad-word aligned); tiling on 16B keeps every sub-descriptor
+  // legal and the concatenation byte-identical to the single-descriptor copy.
   const size_t unit = 16;
   const size_t nU = (copy_size + unit - 1) / unit;
   size_t n = static_cast<size_t>(ndesc);
@@ -100,7 +102,7 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
     size_t s = static_cast<size_t>(d) * uPerD * unit;
     size_t e = s + uPerD * unit;
     if (e > copy_size) e = copy_size;
-    auto packet_d = anvil::CreateCopyPacket(srcPtr + s, dstPtr + s, e - s, cacheHint);
+    auto packet_d = anvil::CreateCopyPacket(srcPtr + s, dstPtr + s, e - s);
     handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, placeOffset);
     placeOffset = 0;
   }
@@ -235,9 +237,8 @@ inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
 
   // Each queue copies a disjoint contiguous chunk. Queue q owns bytes
   // [q*rand_size, (q+1)*rand_size); the last queue absorbs the remainder.
-  // The src/dst pointers MUST be advanced to this queue's chunk start, else
-  // every queue copies from offset 0 (overlapping front, tail never copied) —
-  // which is why multi-queue runs were previously broken (NUM_CHANNELS forced 1).
+  // src/dst pointers MUST be advanced to this queue's chunk start, else every
+  // queue copies from offset 0 (overlapping front, tail never copied).
   srcPtr += static_cast<size_t>(queueId) * rand_size;
   dstPtr += static_cast<size_t>(queueId) * rand_size;
 
