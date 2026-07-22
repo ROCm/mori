@@ -421,8 +421,6 @@ class HierAllGather:
     def _init_sync_drain_state(self):
         # Isolation probe: force full stream completion at op return.
         self._debug_sync = _env_true("MORI_HIER_DEBUG_SYNC", "0")
-        # Deferred backward big-AG landing event (unset on the shipped path).
-        self._deferbwd_event = None
         # CU-domain copy-out scratch: a copy-engine write to ``output`` is not
         # coherent with the FSDP backward GEMM's later CU read, so a torch
         # elementwise (CU) kernel does scratch -> output.
@@ -619,14 +617,6 @@ class HierAllGather:
         fence). No-op on the shipped path (no async inter producer)."""
         return False
 
-    def drain_deferbwd(self):
-        """Host-wait on the pending backward big-AG landing event, if any (one-shot).
-        No-op on the shipped path (no event recorded)."""
-        ev = self._deferbwd_event
-        if ev is not None:
-            ev.synchronize()
-            self._deferbwd_event = None
-
     def _ensure_output_registered(self, output_data):
         """Register output_data for the direct-to-output SDMA push, LRU-cached.
         Lockstep across PEs, exact-match only; a hit issues no collective.
@@ -709,10 +699,6 @@ class HierAllGather:
         Thin wrapper over ``_call_impl``. ``MORI_HIER_DEBUG_SYNC=1`` host-blocks on
         the caller's stream at op return (FSDP nondeterminism isolation probe).
         """
-        # Safety-net drain before buffer reuse if a deferred landing event survived
-        # into the next call. No-op on the shipped path.
-        if self._deferbwd_event is not None:
-            self.drain_deferbwd()
         # Cross-stream lifetime guard: on a comm stream (FSDP2) the input may be
         # freed/recycled by reshard on the compute stream, so record_stream defers
         # reuse until this AG completes (else it reads a partially-overwritten input).
