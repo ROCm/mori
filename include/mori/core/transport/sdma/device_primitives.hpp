@@ -108,59 +108,6 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   expectedSignals[qId]++;
 }
 
-// COPY_LINEAR + SDMA FENCE flag-write on the same queue, one doorbell. FIFO
-// order => the peer observes the flag strictly after the copied bytes. No local
-// signal; expectedSignals not bumped; the peer flag is the completion token.
-// flagVal must fit 32 bits (written to the low word of the u64 flag slot).
-inline __device__ void SdmaPutFencedFlagThread(void* srcBuf, void* dstBuf, size_t copy_size,
-                                               anvil::SdmaQueueDeviceHandle** deviceHandles,
-                                               HSAuint64* signals, HSAuint64* expectedSignals,
-                                               uint32_t queNum, uint32_t qId, void* peerFlagAddr,
-                                               uint32_t flagVal) {
-  (void)signals;
-  (void)expectedSignals;
-  (void)queNum;
-  uint64_t offset = 0;
-  anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
-  uint64_t base =
-      handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_FENCE), offset);
-  uint64_t startBase = base;
-  uint64_t pendingWptr = base;
-  auto copy_packet = anvil::CreateCopyPacket(reinterpret_cast<char*>(srcBuf),
-                                             reinterpret_cast<char*>(dstBuf), copy_size);
-  handle.template placePacket<SDMA_PKT_COPY_LINEAR>(copy_packet, pendingWptr, offset);
-  auto fence_packet = anvil::CreateFencePacket(reinterpret_cast<HSAuint64*>(peerFlagAddr), flagVal);
-  handle.template placePacket<SDMA_PKT_FENCE>(fence_packet, pendingWptr, 0);
-  handle.submitPacket(startBase, pendingWptr);
-}
-
-// COPY_LINEAR + LOCAL atomic-inc of signals[qId] so the caller can drain via
-// SdmaQueitThread; the caller sets the peer flag via P2P AMO_SET after the
-// drain. peerFlagAddr/flagVal unused here.
-inline __device__ void SdmaPutCopySignalThread(void* srcBuf, void* dstBuf, size_t copy_size,
-                                               anvil::SdmaQueueDeviceHandle** deviceHandles,
-                                               HSAuint64* signals, HSAuint64* expectedSignals,
-                                               uint32_t queNum, uint32_t qId, void* peerFlagAddr,
-                                               uint32_t flagVal) {
-  (void)queNum;
-  (void)flagVal;
-  (void)peerFlagAddr;
-  uint64_t offset = 0;
-  anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
-  HSAuint64* signal = signals + qId;
-  uint64_t base =
-      handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC), offset);
-  uint64_t startBase = base;
-  uint64_t pendingWptr = base;
-  auto copy_packet = anvil::CreateCopyPacket(reinterpret_cast<char*>(srcBuf),
-                                             reinterpret_cast<char*>(dstBuf), copy_size);
-  handle.template placePacket<SDMA_PKT_COPY_LINEAR>(copy_packet, pendingWptr, offset);
-  auto sig_packet = anvil::CreateAtomicIncPacket(signal);
-  handle.template placePacket<SDMA_PKT_ATOMIC>(sig_packet, pendingWptr, 0);
-  handle.submitPacket(startBase, pendingWptr);
-  expectedSignals[qId]++;
-}
-
 // COPY_LINEAR + REMOTE ADD64(+1) on the same queue, one doorbell. FIFO order
 // => the peer sees the counter increment only after the copied bytes land. The
 // ADD64 must ride the SDMA engine (peerCounterAddr is XGMI P2P engine-mapped,
