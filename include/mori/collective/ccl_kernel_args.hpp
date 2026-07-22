@@ -27,41 +27,29 @@
 
 namespace mori {
 namespace collective {
-// Crown local-block flag (MORI_HIER_CROWN). Set => the named size-adaptive crown
-// (flatMW bit9=512 + batchSelf bit11=2048 = 2560); unset/0 => byte-identical flat crown.
+// Crown local-block flag (MORI_HIER_CROWN). !=0 => size-adaptive crown (2560);
+// 0 => byte-identical flat crown.
 inline int HierCrownRing() {
   const char* c = std::getenv("MORI_HIER_CROWN");
   if (c != nullptr && c[0] != '\0' && !(c[0] == '0' && c[1] == '\0')) return 2560;
   return 0;
 }
-// Local-block push-only (MORI_HIER_LOCAL_PUSHONLY, default OFF). The local node-block
-// gather (bx==rb) normally uses the coupled push+wait
-// OneShotAllGatherSdmaSubGroupKernel_body; under deep pipelining the concurrent ring
-// sub-chunk CTAs and reassembly workers can starve the cross-rank flag AMO the coupled
-// per-slot wait spins on, causing a circular stall. This lever decouples the local
-// block like the remote reassembly already is: the bx==rb CTA pushes its own column
-// (no wait), and the completion reader (same CTA) is extended to also drain the local
-// flag slots [0,G). Byte-identical output (same pushes, same flags); only the wait
-// moves off the coupled path, so it is bit-exact and deadlock-free at any depth.
-// Default OFF keeps the coupled path byte-identical.
+// Local-block push-only (MORI_HIER_LOCAL_PUSHONLY, default OFF). Decouples the
+// bx==rb local gather to push-only (completion reader drains flag slots [0,G)),
+// dodging the deep-pipe stall where ring/reassembly CTAs starve the coupled
+// per-slot wait's flag AMO. Byte-identical; 0 => coupled push+wait unchanged.
 inline bool HierLocalPushOnly() {
   const char* e = std::getenv("MORI_HIER_LOCAL_PUSHONLY");
   return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
 }
-// Deep-SQ temporal pipeline (MORI_HIER_DEEP_PIPE=P, default 2). The giant AG wall is
-// roughly half inter-node RDMA fill and half intra-node SDMA reassembly, fully serial
-// at rb=1. Spatial ring-block split is a wash (it grows inter fill by exactly what it
-// hides). This lever instead splits the chunk into P temporal sub-chunks issued
-// back-to-back on the same full numQp fan-out (deep SQ, full inter BW) with a
-// per-sub-chunk put-with-signal, so sub-chunk p's landing flag fires (RC in-order,
-// after its data) before p+1's -- a reassembly worker pushes sub-chunk p over XGMI
-// while p+1.. still cross the NIC, hiding the intra leg under the inter with no
-// inter-fill growth. Returns -1 for "auto" (size-adaptive: caller derives depth from
-// chunkBytes), else the clamped explicit depth [1,16]. depth<=1 => path.
+// Deep-SQ temporal pipeline depth (MORI_HIER_DEEP_PIPE=P, default 2). Splits the
+// chunk into P sub-chunks issued back-to-back on the full numQp fan-out with a
+// per-sub-chunk put-with-signal (RC in-order: sub-chunk p's flag fires after its
+// data, before p+1's), overlapping XGMI reassembly under the NIC. Returns -1 for
+// "auto" (caller derives depth from chunkBytes), else clamped [1,16]; <=1 => OFF.
 inline int HierDeepPipe() {
   const char* e = std::getenv("MORI_HIER_DEEP_PIPE");
-  // Default depth 2. The E2E landing is anchored by the crown DEFER_HOSTSYNC host
-  // fence, so the pipeline stays bit-exact with no explicit env.
+  // Default 2; E2E landing anchored by the crown DEFER_HOSTSYNC host fence.
   if (e == nullptr || e[0] == '\0') return 2;
   if (e[0] == 'a' || e[0] == 'A') return -1;  // "auto"
   int v = std::atoi(e);
@@ -70,15 +58,11 @@ inline int HierDeepPipe() {
   return v;
 }
 
-// Quiet-fence per-sub-chunk landing for DEEP_PIPE (MORI_HIER_DEEP_PIPE_QUIET, default
-// OFF). The put-with-signal AMO fails bit-exact for large chunks because the AMO can
-// beat its own data landing. This is the scale-robust option: dedicate one
-// QP per temporal sub-chunk, issue a plain put, and drain that QP's send-CQ with
-// ShmemQuietThread(pe, qpId) (== the sub-chunk's data has landed remotely, RC in-order)
-// before the separate flag AMO. So chunkReadyFlags[p] is published only after sub-chunk
-// p physically landed -- bit-exact at scale -- while preserving the temporal pipeline
-// (p's flag fires before p+1's data finishes, since each sub-chunk drains its own QP in
-// order). Only meaningful when deepPipe>1; takes precedence over the put-signal path.
+// Per-sub-chunk quiet-fence landing for DEEP_PIPE (MORI_HIER_DEEP_PIPE_QUIET,
+// default OFF). One QP per sub-chunk + plain put; drain that QP's send-CQ
+// (ShmemQuietThread(pe,qpId) == data landed remotely, RC in-order) before the flag
+// AMO, so chunkReadyFlags[p] publishes only after sub-chunk p landed -- bit-exact
+// at scale, where the put-signal AMO can beat its own data. Only when deepPipe>1.
 inline bool HierDeepPipeQuietOn() {
   const char* e = std::getenv("MORI_HIER_DEEP_PIPE_QUIET");
   return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
@@ -120,13 +104,10 @@ struct CclAllgatherArgs {
   size_t splitCount;
 };
 
-// Sub-group intra-node SDMA AllGather. The ``G`` local ranks of a
-// node ({peBase, peBase+peStride, ..., peBase+(groupSize-1)*peStride}) gather
-// their shards over the SDMA copy engines; this PE is at position ``groupPos``.
-// The destination buffer holds ``groupSize`` contiguous slots; member at
-// position ``p`` writes its shard into slot ``p`` of every member. The flat
-// whole-world gather is the special case groupSize=npes, groupPos=myPe,
-// peBase=0, peStride=1.
+// Sub-group intra-node SDMA AllGather. G local ranks {peBase + i*peStride} gather
+// their shards over SDMA; member at position p writes its shard into slot p of
+// every member (groupSize contiguous slots). Flat whole-world gather ==
+// groupSize=npes, groupPos=myPe, peBase=0, peStride=1.
 template <typename T>
 struct CclAllgatherSubGroupArgs {
   int myPe;
@@ -140,38 +121,26 @@ struct CclAllgatherSubGroupArgs {
   application::SymmMemObjPtr flagsMemObj;
   size_t elementCount;
   size_t dstBaseOffset;
-  // Per-peer destination slot stride in bytes. The kernel writes
-  // member ``p``'s shard into slot ``p`` of the destination; by default the
-  // slots are packed contiguously (stride == elementCount*sizeof(T) == the copy
-  // size). A non-zero ``dstSlotStrideBytes`` decouples the slot stride from the
-  // copy size, so a sub-range (chunk) of a slice can be written into its final
-  // strided position within a full-size block. This is the enabler for the
-  // chunked inter/intra reassembly pipeline (overlap the remote-block gather of
-  // chunk k with the inter ring of chunk k+1): each chunk copies elementCount
-  // (= chunk) bytes per peer but lands at slot stride = full slice size. 0 keeps
-  // the contiguous-slot contract byte-for-byte unchanged.
+  // Per-peer destination slot stride in bytes; 0 packs slots contiguously
+  // (stride == copy size). Non-zero decouples slot stride from copy size so a
+  // chunk of a slice lands at its final strided position within a full-size block
+  // (chunked inter/intra reassembly pipeline). 0 keeps the contiguous-slot
+  // contract byte-for-byte.
   size_t dstSlotStrideBytes;
   uint64_t flagVal;
-  // Disjoint flag-slot base for race-free concurrent direct gathers.
-  // The device _body uses flag slots [flagBase, flagBase+groupSize). Default 0
-  // keeps every classic single-gather caller on [0, groupSize) byte-for-byte.
-  // A concurrent Phase-B reassembly lane j sets flagBase = j*groupSize so N
-  // simultaneous gather_kernel_direct launches never race on the shared flag
-  // slots -- the same mechanism the FUSED reassembly kernel already uses.
+  // Disjoint flag-slot base for race-free concurrent direct gathers: _body uses
+  // slots [flagBase, flagBase+groupSize). Lane j sets flagBase = j*groupSize so
+  // concurrent launches never race. 0 keeps single-gather callers on [0,groupSize).
   size_t flagBase;
 };
 
-// Fused hierarchical param-contiguous SubGroup gather. One launch performs the
-// full per-(node-block, param) gather. Each of ``G`` group members
-// pushes this PE's shard (groupPos == local rank g) directly into the
-// registered user output in param-contiguous layout:
-// for node block ``m`` (in [0,numBlocks)) and param split ``s`` with per-rank
-// element count ``splitSizes[s]`` (== E_s, u32 lanes) at input element offset
-// ``splitOffsets[s]`` (== O_s within a block of ``blockStrideElems`` u32 lanes),
-// global rank ``r = m*groupSize + g`` lands at output element offset
-// ``O_s*worldSize + r*E_s``. ``input`` is the Phase-A collection buffer
-// (numBlocks contiguous blocks of blockStrideElems u32 lanes). Split arrays are
-// device pointers (size_t / u32-lane units), shared across all blocks.
+// Fused hierarchical param-contiguous SubGroup gather. One launch does the full
+// per-(node-block, param) gather: member g pushes this PE's shard into the
+// registered output in param-contiguous layout. For block m and param split s
+// (per-rank count splitSizes[s]=E_s at input offset splitOffsets[s]=O_s), global
+// rank r = m*groupSize + g lands at output element offset O_s*worldSize + r*E_s.
+// input is the Phase-A collection (numBlocks blocks of blockStrideElems u32 lanes);
+// split arrays are device pointers (u32-lane units), shared across all blocks.
 template <typename T>
 struct CclAllgatherSubGroupParamContiguousArgs {
   int myPe;
@@ -194,15 +163,9 @@ struct CclAllgatherSubGroupParamContiguousArgs {
   size_t splitCount;
 };
 
-// Sub-group intra-node SDMA broadcast. The root
-// (group position 0 == global PE ``peBase``) holds a full buffer of
-// ``elementCount`` u32 lanes in ``input`` and SDMA-copies it into the
-// ``dstMemObj`` of every member of {peBase, peBase+peStride, ...,
-// peBase+(groupSize-1)*peStride}, including itself. This is the intra-node
-// placement phase of the hierarchical AllGather's leader-only variant: leader
-// rings the inter-node RDMA exchange into a staging buffer, then broadcasts the
-// full N*G output to its G local ranks over XGMI (~G x less NIC traffic than
-// the every-rank-direct ring).
+// Sub-group intra-node SDMA broadcast. Root (group position 0 == PE peBase) holds
+// a full elementCount-lane buffer and SDMA-copies it into every member's dstMemObj
+// (incl. itself). Intra-node placement phase of the leader-only hierarchical AG.
 template <typename T>
 struct CclBroadcastSubGroupArgs {
   int myPe;
@@ -229,20 +192,13 @@ struct CclAllreduceArgs {
   size_t elementCount;
 };
 
-// Inter-node RDMA ring AllGather. The ring buffer ``memObj`` holds
-// ``ringSize`` contiguous chunks of ``chunkBytes`` each (chunk ``k`` at offset
-// ``k * chunkBytes``); on entry only this PE's own chunk (slot ``ringPos``) is
-// filled. After ``ringSize-1`` rounds every member holds all ``ringSize`` chunks
-// in ring order. The per-element type is irrelevant to the byte-move ring, so
-// this struct is not templated -- the kernel moves raw bytes (chunkBytes) over
-// shmem (P2P within a node, RDMA across nodes).
-//
-// Sub-group support: the ring runs over an arithmetic sub-group of global
-// PEs ``{peBase, peBase+peStride, ..., peBase+(ringSize-1)*peStride}``; this
-// PE's position within that sub-group is ``ringPos``. The flat whole-world ring
-// is just ``peBase=0, peStride=1, ringSize=npes, ringPos=myPe``. The sub-group
-// form is what the hierarchical AllGather uses for the inter-node phase
-// (ring over node-leaders / same-local-index ranks across nodes).
+// Inter-node RDMA ring AllGather. Ring buffer memObj holds ringSize contiguous
+// chunkBytes chunks (chunk k at k*chunkBytes); on entry only this PE's chunk
+// (slot ringPos) is filled, after ringSize-1 rounds every member holds all in
+// ring order. Byte-move ring => not templated (raw bytes over shmem: P2P intra,
+// RDMA inter). Runs over the arithmetic sub-group {peBase + i*peStride}, this PE
+// at ringPos. Flat whole-world ring == peBase=0, peStride=1, ringSize=npes,
+// ringPos=myPe (hierarchical AG uses the sub-group form for the inter-node phase).
 struct CclInterNodeRingArgs {
   int myPe;
   int npes;
@@ -253,31 +209,24 @@ struct CclInterNodeRingArgs {
   application::SymmMemObjPtr memObj;
   application::SymmMemObjPtr flagsObj;
   size_t chunkBytes;
-  // Number of RDMA QPs to fan the per-round ring put across.
-  // 1 (default) = the original single-warp / single-QP put (also forced for any
-  // same-node P2P/SDMA neighbour). >1 splits the chunk across warps 0..numQp-1,
-  // each driving qpId=warpId, but only when the neighbour is reached over RDMA
-  // (the kernel checks transportTypes[nextPeer] at runtime so single-node
-  // simulation stays single-warp -- see all_gather.hpp).
+  // RDMA QPs to fan the per-round put across. 1 (default) = single-warp/single-QP
+  // (also forced for same-node P2P/SDMA neighbours); >1 splits the chunk across
+  // warps 0..numQp-1 (qpId=warpId) only when the neighbour is over RDMA (runtime
+  // transportTypes[nextPeer] check -- see all_gather.hpp).
   int numQp;
-  // WRITE-PUSH (SEND-CQ) per-channel landing fence (env MORI_HIER_RING_WRITE,
-  // default 0). On the giant multiBlock AG each channel CTA pushes its sub-range
-  // as a fused put-with-signal on qpId=bid then drains that QP's SEND CQE; the
-  // receiver spins its per-channel inbound flag. Default 0 = push path unchanged.
+  // WRITE-PUSH (SEND-CQ) per-channel landing fence (MORI_HIER_RING_WRITE, default
+  // 0). Each channel CTA pushes its sub-range as a put-with-signal on qpId=bid then
+  // drains that QP's SEND CQE; receiver spins its per-channel flag. 0 = unchanged.
   int useWriteFence = 0;
 };
 
-// FUSED inter-node ring + intra-node LOCAL-block SDMA gather.
-// A single grid runs the RDMA ring (Phase A, over the NIC) in blocks
-// [0, ringBlocks) and the intra-node SDMA gather of THIS node's own block
-// (Phase B for m == node_id -- the half that is INDEPENDENT of the ring, since
-// every local rank's own shard is already present) in the remaining block, so
-// the XGMI reassembly overlaps the NIC ring in ONE launch with NO host-side
-// wait_stream merge. The ring fields mirror CclInterNodeRingArgs; the ``g*``
-// fields mirror CclAllgatherSubGroupArgs<uint32_t> (the gather is a type-
-// agnostic u32 byte move). ``ringBlocks`` partitions the grid. Inert until the Python
-// fused launcher is wired; this struct + glue only enable the fused __global__ to
-// compile and be exercised.
+// FUSED inter-node ring + intra-node LOCAL-block SDMA gather. One grid runs the
+// RDMA ring (Phase A) in blocks [0,ringBlocks) and the SDMA gather of THIS node's
+// own block (Phase B, m==node_id -- ring-independent, every local shard already
+// present) in the rest, overlapping XGMI reassembly with the NIC ring in one
+// launch with no host wait_stream merge. Ring fields mirror CclInterNodeRingArgs;
+// g* fields mirror CclAllgatherSubGroupArgs<uint32_t> (type-agnostic u32 move).
+// ringBlocks partitions the grid. Inert until the fused launcher is wired.
 struct CclFusedRingLocalGatherArgs {
   // --- inter-node ring (Phase A) ---
   int ringPos;
@@ -306,27 +255,12 @@ struct CclFusedRingLocalGatherArgs {
   uint64_t gFlagVal;
 };
 
-// Cross-handle builder for CclFusedRingLocalGatherArgs. The
-// fused __global__ needs one args struct that sees both the inter-node ring
-// handle's ring memObj/flags AND the intra-node gather handle's
-// dst(output)/flags/input -- but those live in two separate C++ classes, each of
-// which already builds its own jit_args in prepare_*. Rather than reach into
-// either class's privates, this takes the two already-built arg structs (the
-// int64_t pointers their prepare_* calls return) and MERGES them, so the existing
-// prepare paths stay byte-identical and this is pure additive glue.
-//
-// The fused launcher (Python, gated MORI_HIER_FUSE_LOCAL, default OFF) will call
-// both handles' prepare_* (priming the ring slot + gather flags exactly as the
-// serial path does), pass the two returned pointers here, then launch
-// FusedRingLocalGatherKernel_u32 once -- replacing the two separate kernel
-// launches with one concurrent launch (NIC ring || XGMI local gather), with NO
-// host wait_stream merge. ``ringBlocks`` partitions the grid: blocks
-// [0,ringBlocks) run the ring, the rest run the local-block SDMA gather.
-//
-// The returned pointer is a function-local static (the Python launch path is
-// single-threaded / single-stream per op, matching how each handle keeps its own
-// jit_args_ member alive between prepare and launch). Inert until the launcher is
-// wired; default path is untouched.
+// Merge already-built ring (CclInterNodeRingArgs) + gather
+// (CclAllgatherSubGroupArgs<uint32_t>) arg structs into one, so the existing
+// prepare_* paths stay byte-identical (pure additive glue). ringBlocks partitions
+// the grid: [0,ringBlocks) ring, the rest the local-block SDMA gather. Returned
+// pointer is a function-local static (launch path is single-stream per op). Inert
+// until the launcher is wired.
 inline int64_t BuildFusedRingLocalGatherArgs(int64_t ringArgsPtr, int64_t gatherArgsPtr,
                                              int ringBlocks) {
   static CclFusedRingLocalGatherArgs fused;
@@ -363,26 +297,17 @@ inline int64_t BuildFusedRingLocalGatherArgs(int64_t ringArgsPtr, int64_t gather
   return reinterpret_cast<int64_t>(&fused);
 }
 
-// ============================================================================
-// Fused inter-node ring + intra-node remote-block reassembly (pipelined)
-// ============================================================================
-// The FusedRingLocalGatherKernel_u32 fuses the ring with only the local node-block
-// gather (the ring-independent half); the remote-block reassembly otherwise runs as a
-// separate launch after the whole ring + its global finish barrier (two serial phases:
-// the NIC sits idle during the XGMI reassembly and vice-versa). This kernel closes that
-// by pipelining: the ring runs as ``ringBlocks`` channels, each publishing
-// ``chunkReadyFlags[bid]`` the instant its sub-range lands; a matching set of
-// ``ringBlocks`` reassembly blocks each spin on chunkReadyFlags[j] and, the
-// instant sub-range j is ready, SDMA-push that sub-range of EVERY remote block
-// straight into the registered output over XGMI -- so sub-range j's reassembly
-// overlaps ring channel j+1 still crossing the NIC. Because each PE reassembles
-// a remote block by pushing from its own ring buffer (slot m holds node m's chunk
-// in ring order, see AllgatherInterNodeRing.full_tensor), the only dependency is
-// this PE's own ring landing -- a purely local flag spin, NO global finish
-// barrier and NO copy-OUT scratch. Grid = 2*ringBlocks + 1: [0,ringBlocks) ring,
-// [ringBlocks] the local-block gather, (ringBlocks, 2*ringBlocks] the remote
-// reassembly (block j = blockIdx.x - ringBlocks - 1). Default OFF (env
-// MORI_HIER_FUSE_REMOTE); the serial path is untouched.
+// Fused inter-node ring + intra-node remote-block reassembly (pipelined). Unlike
+// FusedRingLocalGatherKernel_u32 (local block only), this pipelines the remote-block
+// reassembly with the ring: the ring runs as ringBlocks channels, each publishing
+// chunkReadyFlags[bid] the instant its sub-range lands; ringBlocks reassembly blocks
+// each spin on chunkReadyFlags[j] and SDMA-push sub-range j of every remote block
+// into the registered output over XGMI, so reassembly of j overlaps ring channel
+// j+1 still on the NIC. Each PE reassembles from its own ring buffer (slot m holds
+// node m's chunk), so the only dependency is this PE's own ring landing -- a local
+// flag spin, NO global finish barrier, NO copy-OUT. Grid = 2*ringBlocks+1:
+// [0,ringBlocks) ring, [ringBlocks] local gather, (ringBlocks,2*ringBlocks] remote
+// reassembly (block j = blockIdx.x - ringBlocks - 1). Default OFF (MORI_HIER_FUSE_REMOTE).
 struct CclFusedRingRemoteGatherArgs {
   // --- inter-node ring (Phase A) ---
   int ringPos;
@@ -414,47 +339,36 @@ struct CclFusedRingRemoteGatherArgs {
 
   // --- remote reassembly (Phase B, m != nodeId; reads the ring buffer) ---
   int numNodes;  // N == ringSize
-  int nodeId;    // this node's block index (skipped by the remote reassembly)
-  // Number of reassembly blocks, DECOUPLED from ringBlocks so the XGMI
-  // reassembly can be parallelised (like the multi-block copy-OUT) even when the
-  // ring runs as a single channel (ringBlocks==1). Each reassembly block owns a
-  // disjoint 16B-aligned byte sub-range of the chunk and waits until all ring
-  // channels have landed (spin over the ringBlocks flags) before pushing its
-  // sub-range over XGMI. 0 => legacy behaviour (reassemblyBlocks == ringBlocks).
+  int nodeId;    // this node's block index (skipped by remote reassembly)
+  // Reassembly block count, decoupled from ringBlocks so XGMI reassembly can be
+  // parallelised even when the ring is single-channel. Each block owns a disjoint
+  // 16B-aligned byte sub-range and waits until all ring channels land (spin over
+  // ringBlocks flags) before pushing. 0 => reassemblyBlocks == ringBlocks.
   int reassemblyBlocks = 0;
   // Deep-SQ temporal pipeline depth (see HierDeepPipe). P>1 splits the chunk into
-  // P temporal sub-chunks with per-sub-chunk landing flags so reassembly overlaps
-  // the still-in-flight later sub-chunks. 1 = OFF (byte-identical path).
+  // P sub-chunks with per-sub-chunk landing flags. 1 = OFF (byte-identical).
   int deepPipe = 1;
-  // Deep-SQ temporal pipeline QUIET landing fence (see HierDeepPipeQuietOn). 1 =>
-  // each temporal sub-chunk rides its own QP with a plain put; thread drains that
-  // QP's send-CQ (ShmemQuietThread(pe,qpId) = sub-chunk landed remotely) BEFORE the
-  // separate flag AMO, so the flag never fires ahead of the data landing (bit-exact
-  // at scale, unlike the racy fused put-signal). 0 = OFF. Only when deepPipe>1.
+  // Deep-SQ QUIET landing fence (see HierDeepPipeQuietOn). 1 => per-sub-chunk QP +
+  // plain put, drain send-CQ before the flag AMO so the flag never beats the data
+  // (bit-exact at scale). 0 = OFF. Only when deepPipe>1.
   int deepPipeQuiet = 0;
-  // Local-block push-only (see HierLocalPushOnly). 1 => the bx==rb local node-block
-  // gather is push-only (no coupled per-slot wait) and its completion is folded
-  // into the completion reader (which then also drains flag slots [0,G)); this
-  // removes the DEEP_PIPE>=8 "Slow wait for sub-group pos" deadlock. Byte-identical
-  // output. 0 = OFF (coupled push+wait, byte-identical path).
+  // Local-block push-only (see HierLocalPushOnly). 1 => bx==rb gather is push-only,
+  // completion folded into the reader (drains flag slots [0,G)); removes the
+  // DEEP_PIPE>=8 wait deadlock. Byte-identical. 0 = OFF (coupled push+wait).
   int localPushOnly = 0;
-  // Intra reassembly deep-SQ (see HierReasmDeepSqOn).
-  // 1 => a reassembly worker submits all its owned channels' copy descriptors
-  // back-to-back (each after its landing flag) keeping the SDMA SQ continuously
-  // fed, then a SINGLE drain covers them all before firing the deferred output
-  // flags -- instead of submit+drain per channel. 0 = OFF (byte-identical
-  // path). Bit-exact by construction (flag never precedes its bytes).
+  // Intra reassembly deep-SQ (see HierReasmDeepSqOn). 1 => a worker submits all its
+  // channels' copy descriptors back-to-back (each after its landing flag), then a
+  // SINGLE drain before firing the deferred output flags. 0 = OFF (byte-identical).
+  // Bit-exact by construction (flag never precedes its bytes).
   int reasmDeepSq = 0;
-  // Crown local-block flag (see HierCrownRing / MORI_HIER_CROWN). 0 = OFF
-  // (byte-identical flat crown).
+  // Crown local-block flag (see HierCrownRing). 0 = OFF (byte-identical flat crown).
   int crownRing = 0;
 };
 
-// Builder: merge an already-built ring args (CclInterNodeRingArgs) and gather
-// args (CclAllgatherSubGroupArgs<uint32_t>, primed for the LOCAL block) plus the
-// pipeline extras into one CclFusedRingRemoteGatherArgs. Mirrors
-// BuildFusedRingLocalGatherArgs so the existing prepare_* paths stay byte-
-// identical; this is pure additive glue. Inert until the Python launcher is wired.
+// Merge already-built ring (CclInterNodeRingArgs) + gather
+// (CclAllgatherSubGroupArgs<uint32_t>, primed for the LOCAL block) args + pipeline
+// extras into one. Mirrors BuildFusedRingLocalGatherArgs; prepare_* paths stay
+// byte-identical (pure additive glue). Inert until the launcher is wired.
 inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gatherArgsPtr,
                                               int ringBlocks, int64_t chunkReadyFlagsPtr,
                                               int numNodes, int nodeId, int reassemblyBlocks = 0,
@@ -474,7 +388,7 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
   fused.numQp = r->numQp;
   fused.ringBlocks = ringBlocks < 1 ? 1 : ringBlocks;
   fused.useWriteFence =
-      r->useWriteFence;  // plumb MORI_HIER_RING_WRITE into the crown/deep-pipe launch
+      r->useWriteFence;
   fused.chunkReadyFlags = reinterpret_cast<uint64_t*>(chunkReadyFlagsPtr);
 
   fused.myPe = g->myPe;
@@ -494,31 +408,27 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
   fused.numNodes = numNodes;
   fused.nodeId = nodeId;
   fused.reassemblyBlocks = reassemblyBlocks > 0 ? reassemblyBlocks : fused.ringBlocks;
-  // Deep-SQ temporal pipeline only engages on the single-channel ring (rb==1, the
-  // giant-AG fan-out path); RING_BLOCKS>1 (multiBlock) keeps its spatial split.
+  // Deep-SQ temporal pipeline only on the single-channel ring (rb==1); RING_BLOCKS>1
+  // keeps its spatial split.
   {
     int dp = (fused.ringBlocks == 1) ? HierDeepPipe() : 1;
-    if (dp < 0) {  // "auto": depth = round(perPE chunkBytes / subBytes), clamp[1,16]
-      // 16MiB sub-chunk: fills mlx5 NIC DMA while staying under the coherence window.
+    if (dp < 0) {  // "auto": depth ~ chunkBytes / 16MiB sub-chunk, clamp[1,16]
+      // 16MiB sub-chunk fills the mlx5 NIC DMA under the coherence window.
       const size_t sub = 16ull * 1024ull * 1024ull;
       size_t d = (fused.chunkBytes + sub / 2) / sub;
       dp = (d < 1) ? 1 : (d > 16 ? 16 : static_cast<int>(d));
     }
-    // Snap dp down to the largest divisor of chunkBytes <= dp so every sub-chunk is
-    // equal (no ragged remainder tail). Down-only => sub-chunk count never exceeds the
-    // Python-sized flag budget; no-op when dp already divides chunkBytes.
+    // Snap dp down to the largest divisor of chunkBytes so sub-chunks are equal (no
+    // ragged tail); no-op when dp already divides chunkBytes.
     if (dp > 1 && fused.chunkBytes > 0) {
       while (dp > 1 && (fused.chunkBytes % static_cast<size_t>(dp)) != 0) --dp;
     }
     fused.deepPipe = dp;
   }
-  // Scale-robust landing fence default. The deep-pipe put-with-signal AMO is not
-  // scale-robust -- for large sub-chunks the AMO can beat its own data landing, so the
-  // reassembly reader can consume un-landed bytes on the giant AG. Auto-engage the
-  // quiet-drain landing fence whenever deep-pipe runs, unless explicitly forced off
-  // (MORI_HIER_DEEP_PIPE_QUIET=0). Bit-exact (same drains/AMOs/slots, only
-  // independent-completion order relaxed). deepPipe<=1 (the default) never enters this
-  // path => byte-identical path.
+  // Scale-robust landing fence default. The put-with-signal AMO can beat its own
+  // data for large sub-chunks, so auto-engage the quiet-drain fence whenever
+  // deep-pipe runs unless forced off (MORI_HIER_DEEP_PIPE_QUIET=0). Bit-exact;
+  // deepPipe<=1 never enters => byte-identical path.
   {
     const char* q = std::getenv("MORI_HIER_DEEP_PIPE_QUIET");
     const bool quietForcedOff = (q != nullptr && q[0] == '0' && q[1] == '\0');
@@ -528,10 +438,7 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
             : 0;
   }
   fused.localPushOnly = HierLocalPushOnly() ? 1 : 0;
-  // Intra reassembly deep-SQ: feed all reassembly channels then drain once.
   fused.reasmDeepSq = reasmDeepSq;
-  // Crown local-block flag (MORI_HIER_CROWN). Default 0 => OFF (byte-identical
-  // flat crown). See HierCrownRing.
   fused.crownRing = HierCrownRing();
   return reinterpret_cast<int64_t>(&fused);
 }

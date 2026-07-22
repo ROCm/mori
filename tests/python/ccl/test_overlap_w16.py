@@ -22,23 +22,13 @@
 # SOFTWARE.
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
-# Cross-node overlap UT for the hp_sdma path (this PR is cross-node, world>=16).
+# Cross-node overlap UT for the hp_sdma path (world>=16, torchrun-only).
 #
-# hp_sdma = host-proxy AllGather: cross-node leg CPU-posted (CU-free), intra-node
-# leg on the XGMI SDMA copy engine (CU-free). RCCL all_gather runs a CU-resident
-# ncclDevKernel that stays on the GPU for the whole cross-node round-trip. So when
-# many AllGathers overlap a compute stream, RCCL's resident kernels squeeze the
-# concurrent GEMMs while hp_sdma leaves the GPU to compute.
-#
-# Metric: report the GEMMs' own completion time (compute-stream CUDA events) while
-# N AllGathers run concurrently, for RCCL vs hp_sdma. Lower = the collective
-# steals less GPU from compute. Time only the GEMMs (not total wall) so the AG's
-# own host/latency cost is excluded -- the question is how much the concurrent
-# collective disturbs the compute. A single cross-node AG barely disturbs (RCCL
-# cross-node AG is network-bound, GPU-light); the effect emerges with many
-# concurrent AGs (the E2E regime), which is why N defaults to 50. Bit-exact gate
-# (torch.equal vs RCCL) before timing.
-# Set MORI_OVERLAP_ASSERT=1 to assert hp_sdma GEMM time < RCCL GEMM time.
+# hp_sdma leaves the GPU free (cross-node leg CPU-posted, intra-node leg on the
+# XGMI SDMA engine); RCCL all_gather runs a CU-resident kernel that steals GPU from
+# concurrent GEMMs. Metric: GEMM-only completion time (compute-stream events) under
+# N concurrent AllGathers; lower = less compute disturbance. Bit-exact gate
+# (torch.equal vs RCCL) before timing. MORI_OVERLAP_ASSERT=1 asserts hp_sdma < RCCL.
 import argparse
 import os
 import sys
@@ -133,10 +123,9 @@ def _worker(rank, ws, rpn, device, size_mb, nops, gemm_n, reps, warmup):
     ev0 = torch.cuda.Event(enable_timing=True)
     ev1 = torch.cuda.Event(enable_timing=True)
 
-    # Measure the GEMMs' OWN completion time (compute-stream events) while the AGs
-    # run concurrently. ag_pre: launch AGs on the comm stream BEFORE timing (RCCL,
-    # GPU kernels). ag_mid: run the host-proxy AG loop AFTER the GEMMs are queued
-    # (mori, CPU-driven, overlaps the GPU GEMMs). disturbance = under/solo - 1.
+    # GEMM-only completion time (compute-stream events) while AGs run concurrently.
+    # ag_pre: RCCL AGs on the comm stream before timing. ag_mid: host-proxy AG loop
+    # after the GEMMs are queued (CPU-driven, overlaps the GPU GEMMs).
     def timed_gemm(ag_pre=None, ag_mid=None):
         def once():
             comm.wait_stream(main)
@@ -227,9 +216,7 @@ def main(argv=None):
 
 
 def test_overlap_w16():
-    """Pytest entry: runs only under torchrun (guarded by module pytestmark).
-
-    Uses the CLI defaults (argv=[]) rather than pytest's argv."""
+    """Pytest entry: torchrun-only (module pytestmark); uses CLI defaults."""
     main([])
 
 

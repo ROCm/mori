@@ -21,16 +21,15 @@
 // SOFTWARE.
 #pragma once
 
-// Device-safe includes: no STL, no ibverbs, safe for HIP/CUDA device compilation.
-#include <cassert>  // assert — used in device code below, needed in both host/device compiles
+// Device-safe: no STL/ibverbs, safe for HIP/CUDA device compilation.
+#include <cassert>
 
 #include "mori/application/application_device_types.hpp"
 #include "mori/core/utils/utils.hpp"
 #include "mori/hip_compat.hpp"
 #include "mori/utils/limits.hpp"
 
-// Host-only includes: STL, ibverbs, application management classes.
-// Guarded so device compilation units (.hip files) do not pull them in.
+// Host-only (STL/ibverbs); guarded out of device (.hip) compilation.
 #if !defined(__HIPCC__) && !defined(__CUDACC__)
 #include <array>
 #include <iostream>
@@ -45,22 +44,19 @@
 namespace mori {
 namespace shmem {
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                               Host-only shmem state structures                                 */
-/* ---------------------------------------------------------------------------------------------- */
+// Host-only shmem state structures
 
 #if !defined(__HIPCC__) && !defined(__CUDACC__)
 
-// Shmem operation mode
 enum class ShmemMode {
-  Isolation,   // Original mode: each allocation gets its own SymmMemObj
-  StaticHeap,  // single static heap with unified memory space
-  VMHeap       // TODO: implement virtual memory heap
+  Isolation,   // per-allocation SymmMemObj
+  StaticHeap,  // single unified heap
+  VMHeap       // virtual memory heap (unimplemented)
 };
 
-constexpr size_t DEFAULT_STATIC_SYMMETRIC_HEAP_SIZE = 4ULL * 1024 * 1024 * 1024;  // 4GB default
-constexpr size_t DEFAULT_VMM_SYMMETRIC_HEAP_SIZE = 16ULL * 1024 * 1024 * 1024;    // 16GB default
-constexpr size_t DEFAULT_VMM_MIN_CHUNK_SIZE = 64ULL * 1024 * 1024;                // 64MB default
+constexpr size_t DEFAULT_STATIC_SYMMETRIC_HEAP_SIZE = 4ULL * 1024 * 1024 * 1024;
+constexpr size_t DEFAULT_VMM_SYMMETRIC_HEAP_SIZE = 16ULL * 1024 * 1024 * 1024;
+constexpr size_t DEFAULT_VMM_MIN_CHUNK_SIZE = 64ULL * 1024 * 1024;
 
 struct BootStates {
   int rank{0};
@@ -79,117 +75,96 @@ struct MemoryStates {
   application::SymmMemManager* symmMemMgr{nullptr};
   application::RdmaMemoryRegionManager* mrMgr{nullptr};
 
-  // Static heap mode fields (only used when mode == StaticHeap)
-  std::mutex heapLock;  // Lock for thread-safe allocation
+  // StaticHeap-mode fields
+  std::mutex heapLock;
   application::HeapType heapType{
-      application::HeapType::Uncached};  // Type of heap memory (default: uncached)
+      application::HeapType::Uncached};
 
-  // Static heap
-  void* staticHeapBasePtr{nullptr};          // Base address of the static symmetric heap
-  size_t staticHeapSize{0};                  // Total size of the static heap
-  size_t staticHeapUsed{0};                  // Currently used bytes
-  application::SymmMemObjPtr staticHeapObj;  // SymmMemObj for the entire heap
+  void* staticHeapBasePtr{nullptr};
+  size_t staticHeapSize{0};
+  size_t staticHeapUsed{0};
+  application::SymmMemObjPtr staticHeapObj;
 
-  // VMM-based dynamic heap
-  bool useVMMHeap{false};                 // Whether to use VMM-based heap
-  bool vmmHeapInitialized{false};         // VMM heap initialization status
-  void* vmmHeapBaseAddr{nullptr};         // Base address of VMM heap
-  size_t vmmHeapVirtualSize{0};           // Total virtual address space size
-  size_t vmmHeapChunkSize{0};             // Size of each chunk
-  application::SymmMemObjPtr vmmHeapObj;  // SymmMemObj for the entire heap
+  bool useVMMHeap{false};
+  bool vmmHeapInitialized{false};
+  void* vmmHeapBaseAddr{nullptr};
+  size_t vmmHeapVirtualSize{0};
+  size_t vmmHeapChunkSize{0};
+  application::SymmMemObjPtr vmmHeapObj;
 };
 
 #endif  // !defined(__HIPCC__) && !defined(__CUDACC__)
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                          Device-safe GPU-side structures                                      */
-/* ---------------------------------------------------------------------------------------------- */
+// Device-safe GPU-side structures
 
-// GPU-side RDMA endpoint. The type lives in core (core::RdmaEndpointDevice) — a
-// device POD over core's WQ/CQ/Ibuf handles, the device-visible projection of
-// application::RdmaEndpoint — so RDMA-driving backends (shmem, cco, ...) depend
-// DOWN on core rather than on each other. This alias preserves the historical
-// shmem::ShmemRdmaEndpoint spelling for existing shmem code.
+// Device POD projection of application::RdmaEndpoint (core's WQ/CQ/Ibuf handles).
 using ShmemRdmaEndpoint = core::RdmaEndpointDevice;
 
 // GpuStates must be declared before ModuleStates and ShmemStates which embed it.
 struct GpuStates {
   int rank{-1};
   int worldSize{-1};
-  int numQpPerPe{4};  // Default to 4 QPs per peer, consistent with Context default
+  int numQpPerPe{4};  // must match Context default
   application::TransportType* transportTypes{nullptr};
   ShmemRdmaEndpoint* rdmaEndpoints{nullptr};
   uint32_t* endpointLock{nullptr};
 
-  // Heap information (supports both static and VMM modes)
-  bool useVMMHeap{false};                     // Whether using VMM-based heap
-  uint8_t vmmChunkSizeShift{0};               // log2(chunkSize) for VMM heap, 0 for static heap
-  uintptr_t heapBaseAddr{0};                  // Base address of symmetric heap
-  uintptr_t heapEndAddr{0};                   // End address of symmetric heap (base + size)
-  application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
-  uint64_t* internalSyncPtr{nullptr};         // Pointer to the internal synchronization object
+  bool useVMMHeap{false};
+  uint8_t vmmChunkSizeShift{0};               // log2(chunkSize); 0 for static heap
+  uintptr_t heapBaseAddr{0};
+  uintptr_t heapEndAddr{0};                   // base + size
+  application::SymmMemObj* heapObj{nullptr};
+  uint64_t* internalSyncPtr{nullptr};
 };
 
-// Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
+// __device__ (not __constant__) so hipMemcpyToSymbol can update it.
 // Default visibility so JIT EP (MORI_DEFINE_GPU_STATES) matches this declaration.
 extern __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 
 static __device__ GpuStates* GetGlobalGpuStatesPtr() { return &globalGpuStates; }
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                                Address to Remote Address Translation                           */
-/* ---------------------------------------------------------------------------------------------- */
+// Address → remote address translation
 struct RemoteAddrInfo {
-  uintptr_t raddr;  // Remote address
-  uintptr_t rkey;   // Remote key for RDMA
+  uintptr_t raddr;
+  uintptr_t rkey;
   bool valid;
 
   __device__ RemoteAddrInfo() : raddr(0), rkey(0), valid(false) {}
   __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k) : raddr(r), rkey(k), valid(true) {}
 };
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                               Host-only internal functions                                     */
-/* ---------------------------------------------------------------------------------------------- */
+// Host-only internal functions
 
 #if !defined(__HIPCC__) && !defined(__CUDACC__)
 
 enum ShmemStatesStatus {
   New = 0,
   Initialized = 1,
-  // Finalized: reserved. ShmemFinalize currently resets the slot to `New`
-  // so the same GPU can be re-initialized later (needed by SPMT test suites
-  // that run multiple init/finalize cycles). Keep this value for the case
-  // where future finalize semantics need to mark the slot as terminally done.
+  // Reserved: Finalize currently resets the slot to New so the GPU can be
+  // re-initialized (SPMT multi-cycle test suites).
   Finalized = 2,
 };
 
-// Per-GPU JIT module state (HIP module handle + device symbol pointers)
+// Per-GPU JIT module state (HIP module handle + device symbol pointers).
 struct ModuleStates {
   hipModule_t module{nullptr};
-  GpuStates* gpuStatesPtr{nullptr};  // device-side globalGpuStates address in JIT module
+  GpuStates* gpuStatesPtr{nullptr};  // device globalGpuStates address in JIT module
   hipFunction_t barrierFunc{nullptr};
-  // dissemination-topology barrier kernel (optional; nullptr
-  // if the loaded module predates it, in which case the dissem launcher falls
-  // back to the funnel barrier).
+  // nullptr if the loaded module predates it => launcher falls back to funnel barrier.
   hipFunction_t dissemBarrierFunc{nullptr};
-  // hierarchical 2-level barrier kernel (optional; nullptr if the loaded
-  // module predates it, in which case the hier launcher falls back to the funnel).
   hipFunction_t hierBarrierFunc{nullptr};
 };
 
 struct ShmemStates {
   ShmemStatesStatus status{ShmemStatesStatus::New};
-  ShmemMode mode{ShmemMode::StaticHeap};  // Default to static heap mode
+  ShmemMode mode{ShmemMode::StaticHeap};
   BootStates* bootStates{nullptr};
   RdmaStates* rdmaStates{nullptr};
   MemoryStates* memoryStates{nullptr};
-  ModuleStates moduleStates;  // JIT module state for this GPU
-  GpuStates gpuStates;        // host-side copy of device GpuStates for this GPU
+  ModuleStates moduleStates;
+  GpuStates gpuStates;        // host-side copy of device GpuStates
 
-  // Asserts that ShmemInit has been called and the slot is currently usable.
-  // Used by APIs that touch GPU state (allocation, barrier, module init)
-  // which need a fully constructed slot.
+  // Asserts the slot is initialized and not finalized (usable).
   void CheckStatusValid() {
     if (status == ShmemStatesStatus::New) {
       std::cout << "Shmem state is not initialized, call ShmemInit*/shmem_init_attr first."
@@ -214,26 +189,17 @@ class ShmemStatesSingleton {
   static ShmemStates* GetInstance();
 
 #ifdef MORI_MULTITHREAD_SUPPORT
-  // SPMT: rank → HIP device id mapping, populated at ShmemInit.
-  //
-  // Needed by FFI/custom-call handlers (e.g. XLA) that run on framework worker
-  // threads where hipGetDevice does not return the rank's device. The handler
-  // can look up the device for a given rank and hipSetDevice to it before
-  // touching MORI state.
-  //
-  // Returns -1 if no rank-to-device mapping has been recorded yet (caller
-  // should fall back to hipGetDevice-based lookup or fail loudly).
+  // SPMT rank → HIP device id map (populated at ShmemInit): lets FFI/XLA worker
+  // threads hipSetDevice to a rank's device before touching MORI state.
+  // GetDeviceByRank returns -1 if unmapped (caller falls back to hipGetDevice).
   static void RegisterRankDevice(int rank, int deviceId);
   static int GetDeviceByRank(int rank);
 #endif
 
  private:
 #ifdef MORI_MULTITHREAD_SUPPORT
-  // One ShmemStates slot per GPU, indexed by hipGetDevice.
-  // std::array gives stable addresses (no realloc unlike deque/vector).
-  // No lock needed: SPMT contract is one thread per GPU, so each slot is
-  // accessed serially by its owning thread; the rank → device map below is
-  // the only structure that needs cross-thread synchronization.
+  // One slot per GPU, indexed by hipGetDevice. No lock: SPMT contract is one
+  // thread per GPU, so each slot is accessed serially by its owner.
   std::array<ShmemStates, mori::kMaxGpusPerNode> states_{};
   ShmemStatesSingleton() = default;
 #endif

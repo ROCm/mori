@@ -22,25 +22,16 @@
 #
 # Hierarchical host-proxy all-gather (persistent, reusable collective).
 #
-# The GPU-initiated device RDMA-WRITE inter-node leg is limited by the per-QP
-# posting wall: a single CTA cannot keep a deep enough send queue in flight. A
-# persistent CPU proxy posts a deep multi-WQE SQ pipeline instead, and fans the
-# one cross-node node-block across every data NIC concurrently (rail-paired, no
-# G x redundancy).
+# A persistent CPU proxy posts the deep-SQ RDMA-WRITE inter-node leg (a single
+# CTA cannot keep a deep enough send queue in flight); intra-node legs ride XGMI.
+# Same callable contract as device HierAllGather: handle(inp,out,numel,stream)->bool.
 #
-# Exposes the same callable contract as the device HierAllGather --
-# handle(inp, out, numel, stream) -> bool -- so it backs both the standalone
-# sweep and the FSDP custom all-gather. Only the node-block exchange rides the
-# CPU-posted host-ibverbs transport; the intra-node legs ride XGMI (NCCL).
+# Layout (node-major ranks): pe p -> node p//ranks_per_node, local p%ranks_per_node.
+# Rail partner = same local index on the other node. 2 nodes only; num_nodes==1
+# degenerates to a pure intra-node all-gather.
 #
-# Layout assumption (matches HierAllGather / torchrun node-major ranks):
-#   pe p -> node p // ranks_per_node, local index p % ranks_per_node.
-# Rail partner of pe p = same local index on the other node. Two nodes only;
-# num_nodes==1 degenerates to a pure intra-node all-gather.
-#
-# Landing fence: the host completion (wait_all) plus the post-exchange barrier
-# guarantee the received remote shard is physically in HBM before any consumer
-# (the step-3 intra gather / copy-out) reads it.
+# Landing fence: host wait_all + post-exchange barrier guarantee the remote shard
+# is in HBM before any consumer (step-3 gather / copy-out) reads it.
 
 import os
 import socket
@@ -108,34 +99,23 @@ class HostProxyHierAllGather:
         wt = num_worker_threads or 1
         chunk = chunk_bytes or (64 * 1024)
         self._timeout_ms = 60000
-        # When set, the two intra all-gather legs ride the SDMA copy engine over
-        # XGMI (mori's IntraNodeSubGroupAllgatherSdma, a PUSH gather) instead of
-        # dist.all_gather (NCCL, which drives bytes on CU/SM), keeping the CUs
-        # free for the backward GEMM. Default OFF keeps the NCCL legs.
+        # When set, intra legs ride SDMA/XGMI (PUSH gather) instead of dist.all_gather
+        # (native all-gather on CU/SM), freeing CUs for the backward GEMM. Default OFF = native legs.
         self._sdma_intra = os.environ.get("MORI_HOSTPROXY_SDMA_INTRA", "0") not in (
             "0",
             "",
             "false",
             "False",
         )
-        # Twin transit: step-3 (in _complete) drives its OWN
-        # IntraNodeSubGroupAllgatherSdma handle (disjoint out_) so it never
-        # contends step-1's transit -> no intra-AG WAR, a single node-local
-        # barrier per AG frees both transits. Costs one extra one-node-block
-        # ShmemMalloc; only the 2-node SDMA-intra path builds it.
+        # Twin transit: step-3 drives its OWN SDMA handle (disjoint out_) so it never
+        # contends step-1's transit -> no intra-AG WAR; one node-local barrier frees both.
 
-        # ASYNC double-buffered receive staging (MORI_HOSTPROXY_ASYNC_RING,
-        # default 1 = OFF = byte-identical). With a single staging slot the async
-        # path has a read/write race: after the rail-pair barrier, _complete(N)'s
-        # step-3 GPU gather READS my recv staging slot, but the partner is then
-        # free to run op(N+1)'s _post which RDMA-WRITES the SAME staging bytes;
-        # under deferral the read can be overtaken -> torn recv -> NaN. RING>=2
-        # lands op N and op N+1 in DISJOINT byte regions so the partner's next
-        # write cannot clobber this op's read. The heap (cap*world bytes) already
-        # dwarfs the 2 shards an op uses, so the ring regions are carved from the
-        # existing allocation (no extra memory, no host fence, bulk bytes stay on
-        # RDMA/SDMA). Both ranks derive the slot from the same monotone op counter
-        # (FSDP issues AGs in identical order per rank).
+        # ASYNC double-buffered recv staging (MORI_HOSTPROXY_ASYNC_RING, default 1 =
+        # OFF = byte-identical). Single-slot async path races: _complete(N) step-3 reads
+        # my recv slot while the partner's op(N+1) _post RDMA-WRITES the same bytes ->
+        # torn recv. RING>=2 lands op N and N+1 in DISJOINT regions (carved from the
+        # existing heap, no extra memory). Both ranks derive the slot from the same
+        # monotone op counter (FSDP issues AGs in identical order per rank).
         self._async_ring = int(os.environ.get("MORI_HOSTPROXY_ASYNC_RING", "1") or "1")
         if self._async_ring < 1:
             self._async_ring = 1
@@ -151,7 +131,7 @@ class HostProxyHierAllGather:
         # Persistent byte-addressable staging heap (registered on the NIC once).
         self._stage = torch.zeros(self._max_bytes, dtype=torch.uint8, device=device)
 
-        # Intra-node NCCL subgroups (XGMI). Every rank must build every group.
+        # Intra-node subgroups (XGMI). Every rank must build every group.
         self._node_locals = [
             list(range(n * ranks_per_node, (n + 1) * ranks_per_node))
             for n in range(self.num_nodes)
@@ -161,13 +141,10 @@ class HostProxyHierAllGather:
         ]
         self._intra_group = self._intra_groups[self.node_id]
 
-        # SDMA (XGMI copy-engine) intra all-gather over THIS node's local
-        # sub-group -- the on-thesis replacement for the NCCL intra legs. One
-        # persistent handle drives both step-1 (own shard) and step-3 (received
-        # remote shard) gathers: the sub-group + group-position are identical
-        # (same local ranks, gathered in local-index order), only the input and
-        # the destination node-block region differ per call. Requires
-        # MORI_ENABLE_SDMA=1 (the harness sets it) + shmem initialized.
+        # SDMA (XGMI copy-engine) intra all-gather over this node's sub-group. One
+        # persistent handle drives both step-1 and step-3 gathers (same sub-group +
+        # group-position; only input and dest node-block differ). Requires
+        # MORI_ENABLE_SDMA=1 + shmem initialized.
         self._sdma = None
         self._sdma3 = None  # twin transit for step-3
         if self._sdma_intra:
@@ -182,11 +159,8 @@ class HostProxyHierAllGather:
                 pe_base=self.node_id * self.ranks_per_node,
                 pe_stride=1,
             )
-            # Twin transit: a SECOND handle (disjoint out_) drives step-3 so it
-            # never contends step-1's transit. Every rank builds it in lockstep
-            # (ShmemMalloc is collective-symmetric). Sized to exactly one node-block
-            # (_max_bytes // num_nodes) so the 2nd malloc fits the heap alongside the
-            # first handle (which over-allocates full output).
+            # Twin transit for step-3 (disjoint out_). Every rank builds it in lockstep
+            # (ShmemMalloc is collective-symmetric); sized to one node-block.
             if self.num_nodes == 2:
                 twin_bytes = self._max_bytes // self.num_nodes
                 self._sdma3 = IntraNodeSubGroupAllgatherSdma(
@@ -275,22 +249,17 @@ class HostProxyHierAllGather:
     ):
         """Gather ``count``-element shards over this node's local sub-group.
 
-        SDMA path (on-thesis): PUSH-gather over XGMI straight into the
-        contiguous node-block ``out_block_1d`` -- bulk bytes ride the copy
-        engine, CUs stay free. NCCL fallback: dist.all_gather into the per-slot
-        views ``out_slots``. Both leave the node-block laid out in local-index
-        order, bit-exact.
+        SDMA path: PUSH-gather over XGMI into the contiguous node-block
+        ``out_block_1d``. Native fallback: dist.all_gather into the per-slot views
+        ``out_slots``. Both leave the node-block in local-index order, bit-exact.
         """
         hnd = sdma_handle if sdma_handle is not None else self._sdma
         if hnd is not None:
-            # The sub-group gather's default prepare_sync/finish_sync each issue a
-            # WORLD host ShmemBarrierAll (the socket-bootstrap TCP barrier). On
-            # this per-AG hot path that world barrier is slow and fragile, and its
-            # only job is inter-op ordering on the shared transit ``out_`` for THIS
-            # node's sub-group. Replace it 1:1 with a NODE-LOCAL barrier on the
-            # torch PG (self._intra_group): the exit barrier ensures all peers
-            # finished pushing before the next op reuses out_. Node-local
-            # invariant, so the data path is byte-for-byte unchanged.
+            # The sub-group gather's default sync issues a WORLD host ShmemBarrierAll;
+            # its only job is inter-op ordering on the shared transit out_ for THIS
+            # node's sub-group. Replace 1:1 with a node-local barrier (self._intra_group):
+            # the exit barrier ensures all peers finished pushing before the next op
+            # reuses out_. Node-local invariant, data path byte-for-byte unchanged.
             hnd(
                 inp_1d,
                 out_block_1d,
@@ -308,9 +277,8 @@ class HostProxyHierAllGather:
     def __call__(self, inp, out, numel, stream=None):
         """Blocking all-gather. Returns True when ``out`` is fully landed.
 
-        The host thread blocks on wait_all + rail-pair barrier before step 3, so
-        on return every consumer-visible byte is in HBM (the bit-exact base).
-        Equivalent to ``_post`` immediately followed by ``_complete``.
+        Equivalent to ``_post`` immediately followed by ``_complete``; on return
+        every consumer-visible byte is in HBM (the landing fence).
         """
         h = self._post(inp, out, numel, stream)
         if h is None:
@@ -320,16 +288,11 @@ class HostProxyHierAllGather:
 
     def call_async(self, inp, out, numel, stream=None):
         """Non-blocking all-gather. Returns a handle whose ``_complete`` runs the
-        host-blocking landing fence (wait_all + rail-pair barrier + step 3).
+        landing fence (wait_all + rail-pair barrier + step 3).
 
-        Splitting the op lets the cross-node CPU-posted RDMA round trip + the
-        intra XGMI/SDMA gather overlap the CALLER's compute: the host thread is
-        free between post() and complete() instead of stalling mid-AG. The caller
-        MUST run ``_complete(handle)`` before reading ``out`` and before the NEXT
-        all-gather (the staging heap holds a single in-flight op). This is the
-        overlap window native RCCL gets by returning a Work; the sync ``__call__``
-        path forfeits it. Returns None for the single-node degenerate path
-        (already blocking, nothing to defer).
+        Caller MUST run ``_complete(handle)`` before reading ``out`` and before the
+        NEXT all-gather (staging heap holds a single in-flight op). Returns None for
+        the single-node degenerate path.
         """
         return self._post(inp, out, numel, stream)
 
@@ -349,11 +312,9 @@ class HostProxyHierAllGather:
 
         base = self.node_id * rpn
 
-        # Run every GPU op (stage copy, intra all_gathers, pair barrier) on the
-        # CALLER's stream, not the default stream: a cross-node consumer (FSDP)
-        # records its completion event on this stream and gates downstream compute
-        # on it, so ops on the default stream would be untracked and could race
-        # the gather. No-op when stream == default (standalone UT).
+        # Run every GPU op on the CALLER's stream, not the default: a consumer (FSDP)
+        # records its completion event on this stream to gate downstream compute; ops on
+        # the default stream would be untracked and could race the gather.
         if stream is None:
             stream = torch.cuda.current_stream(self.device)
 
@@ -372,17 +333,11 @@ class HostProxyHierAllGather:
                 )
                 return None
 
-            # Staging layout for the cross-node shard exchange.
-            #   send_local_off : byte offset of MY shard I read for the RDMA write.
-            #   write_remote_off: byte offset in the PARTNER's heap I write to (==
-            #     where the partner reads its recv), so both sides must agree.
-            #   recv_slot      : local view where the PARTNER's shard lands (== the
-            #     partner's write_remote_off into MY heap, so it matches by symmetry).
-            # Default (ring==1): pe-indexed slots (send from sv[my_pe], the partner
-            # writes into MY sv[my_pe] and I read sv[partner]) -- byte-identical.
-            # RING>1: send region [0,cap), recv region cap*(1+slot) with slot cycled
-            # per op, so op N and op N+1 land in DISJOINT bytes (breaks the async
-            # read/write race). K forced to 1 (single-chunk ring math).
+            # Staging layout for the cross-node shard exchange. write_remote_off must
+            # match the partner's recv offset (symmetric), recv_slot the partner's write
+            # into MY heap. Default (ring==1): pe-indexed slots, byte-identical. RING>1:
+            # send [0,cap), recv cap*(1+slot) cycled per op so op N and N+1 land in
+            # DISJOINT bytes. K forced to 1 (single-chunk ring math).
             if self._async_ring > 1:
                 self._op_ctr += 1
                 slot = self._op_ctr % self._async_ring
@@ -397,9 +352,8 @@ class HostProxyHierAllGather:
                     write_remote_off : write_remote_off + shard_bytes
                 ].view(inp.dtype)
             else:
-                # The staging heap only carries single shards (send from sv[my_pe],
-                # receive into sv[partner]); the intra gathers write STRAIGHT into
-                # the user's ``out`` so there is no full-output copy-out.
+                # Staging heap carries single shards; intra gathers write straight into
+                # out (no full-output copy-out).
                 sv = self._stage_view(inp.dtype, e * world)
                 # Stage my shard for the NIC and make it device-visible (GDR read).
                 sv[self.my_pe * e : (self.my_pe + 1) * e].copy_(inp)
@@ -415,9 +369,8 @@ class HostProxyHierAllGather:
                 out[(obase + i) * e : (obase + i + 1) * e] for i in range(rpn)
             ]
 
-            # Whole-shard cross-node exchange: one write, one landing barrier, one
-            # step-3 gather (SDMA packs slots contiguously and cannot chunk-with-
-            # stride; the ring layout carves single-shard recv regions).
+            # Whole-shard exchange: one write, one landing barrier, one step-3 gather
+            # (SDMA cannot chunk-with-stride; K forced to 1).
             K = 1
             bounds = [(k * e) // K for k in range(K + 1)]
 
@@ -435,11 +388,9 @@ class HostProxyHierAllGather:
                 uid = self._engine.allocate_transfer_uid()
                 sts.append(self._session.write(b0_local, b0_remote, nb, uid))
 
-            # step 1 (intra XGMI, overlapped): gather my node's block into out
-            # while the fabric writes are in flight. TWIN: skip the step-1 exit
-            # barrier -- step-3 uses a disjoint transit (self._sdma3) so there is
-            # no intra-AG WAR, and _complete's single end barrier frees step-1's
-            # transit for the next op.
+            # step 1 (intra XGMI, overlapped): gather my node's block into out while the
+            # fabric writes are in flight. TWIN: skip step-1's exit barrier (step-3 uses a
+            # disjoint transit, no intra-AG WAR; _complete's end barrier frees it).
             self._intra_ag(
                 inp,
                 my_out_slots,
@@ -476,9 +427,8 @@ class HostProxyHierAllGather:
             o0, o1 = bounds[k], bounds[k + 1]
             recv_k = recv_slot[o0:o1]
             slots_k = [s[o0:o1] for s in other_out_slots]
-            # TWIN: drive step-3 on the disjoint transit (self._sdma3) so it never
-            # contends step-1's out_. The trailing barrier stays here -- it now
-            # frees BOTH transits for the next op.
+            # TWIN: drive step-3 on the disjoint transit (self._sdma3); the trailing
+            # barrier frees BOTH transits for the next op.
             self._intra_ag(
                 recv_k,
                 slots_k,
@@ -489,18 +439,15 @@ class HostProxyHierAllGather:
             )
 
         with torch.cuda.stream(stream):
-            # step 3 (intra XGMI), pipelined: as each cross-node chunk lands,
-            # broadcast it into out. The GPU runs step-3 chunk k while the host
-            # workers still push chunks >k, hiding the exposed cross-node tail.
+            # step 3 (intra XGMI): as each cross-node chunk lands, broadcast it into out.
             for k in range(K):
                 if sts[k] is None:
                     continue
                 rc = self._engine.wait_all([sts[k]], self._timeout_ms)
                 if rc != self._StatusCode.SUCCESS:
                     raise RuntimeError(f"HostProxy inter-node write rc={rc}")
-                # rail-pair barrier: partner's write of chunk k into MY sv[partner]
-                # has landed (partner's own wait_all on chunk k returned before it
-                # entered this barrier => the bytes are in my HBM).
+                # rail-pair barrier: partner's write of chunk k into MY sv[partner] has
+                # landed (partner's wait_all returned before it entered this barrier).
                 dist.barrier(group=self._pair_barrier)
                 _bcast_k(k)
         return True

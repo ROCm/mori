@@ -20,16 +20,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Inter-node RDMA ring AllGather host handle.
-//
-// This is the inter-node phase of the hierarchical cross-node AllGather: it
-// moves one chunk per PE over the shmem transport (P2P within a node, RDMA
-// across nodes) using the ring schedule in
-// ``inter_node/kernels/all_gather.hpp`` (validated bit-exactly on CPU by
-// ``inter_node_ring_reference`` in the Python layer). The host handle owns a
-// fixed-size symmetric ring buffer + flags, builds the JIT kernel args, and is
-// driven from Python exactly like ``AllgatherSdma`` (prepare -> launch kernel
-// -> finish).
+// Inter-node RDMA ring AllGather host handle: one chunk per PE over the shmem
+// transport (P2P intra-node, RDMA inter-node) using the ring schedule in
+// inter_node/kernels/all_gather.hpp. Owns the symmetric ring buffer + flags and
+// builds the JIT kernel args; driven from Python (prepare -> kernel -> finish).
 
 #ifndef INTER_NODE_RING_CLASS_HPP
 #define INTER_NODE_RING_CLASS_HPP
@@ -46,10 +40,7 @@
 namespace mori {
 namespace collective {
 
-// Select the dissemination barrier for the inter-ring prepare rendezvous when
-// MORI_HIER_DISSEM_BARRIER!=0. Read once (env is fixed for the process). The
-// dissem barrier has identical global all-PE semantics but an O(log n) parallel
-// critical path instead of the PE0 funnel.
+// MORI_HIER_DISSEM_BARRIER!=0 selects the dissemination barrier (read once).
 inline bool HierDissemBarrierEnabled() {
   static const bool enabled = []() {
     const char* e = std::getenv("MORI_HIER_DISSEM_BARRIER");
@@ -58,8 +49,8 @@ inline bool HierDissemBarrierEnabled() {
   return enabled;
 }
 
-// Ring entry rendezvous. Default funnel (ShmemBarrierOnStream); the dissem barrier
-// (MORI_HIER_DISSEM_BARRIER) has identical global all-PE ordering. Byte-identical default.
+// Ring entry rendezvous. Funnel by default; dissem variant has identical global
+// all-PE ordering, so the default path is byte-identical.
 inline void HierPrepareBarrierOnStream(hipStream_t stream) {
   if (HierDissemBarrierEnabled()) {
     shmem::ShmemBarrierOnStreamDissem(stream);
@@ -68,14 +59,9 @@ inline void HierPrepareBarrierOnStream(hipStream_t stream) {
   }
 }
 
-// The ring finish / cross-PE reuse fence. By default the plain
-// ShmemBarrierOnStream (PE0-funnel rendezvous). The dissemination barrier has
-// identical global all-PE ordering semantics (a full rendezvous: every PE waits
-// for every other PE), so routing the finish fence through it does not reorder the
-// NIC-landing -> reassembly-consume dependency the correct path relies on -- the
-// byte image and the completion ordering are unchanged. It only replaces the PE0
-// funnel critical path with a parallel log-depth one. Gated on the same
-// MORI_HIER_DISSEM_BARRIER env so the default path stays byte-for-byte identical.
+// Ring finish / cross-PE reuse fence. Same full-rendezvous semantics as the
+// prepare barrier: the dissem variant preserves the NIC-landing -> consume
+// ordering, so the default path stays byte-for-byte identical.
 inline void HierFinishBarrierOnStream(hipStream_t stream) {
   if (HierDissemBarrierEnabled()) {
     shmem::ShmemBarrierOnStreamDissem(stream);
@@ -89,28 +75,23 @@ class InterNodeRingAllgather {
   int myPe_;
   int npes_;
 
-  // Sub-group descriptor. The ring runs over the arithmetic sub-group of
-  // global PEs {peBase_, peBase_+peStride_, ..., peBase_+(ringSize_-1)*peStride_};
-  // this PE is at position ringPos_. The whole-world ring is the flat default
-  // peBase_=0, peStride_=1, ringSize_=npes_, ringPos_=myPe_.
+  // Sub-group descriptor: the ring runs over PEs {peBase_ + i*peStride_ :
+  // i<ringSize_}, this PE at ringPos_. Flat default = 0/1/npes_/myPe_.
   int ringPos_;
   int ringSize_;
   int peBase_;
   int peStride_;
-  // RDMA QP fan-out degree for the per-round ring put. 1 keeps the single-QP put;
-  // >1 fans the chunk across QPs (RDMA neighbours only, gated at runtime in the
-  // kernel). The hierarchical inter-node ring passes >1.
+  // RDMA QP fan-out for the per-round put (>1 fans across QPs, RDMA neighbours
+  // only, gated in the kernel).
   int numQp_;
 
-  // Number of CTAs ("channels") the ring kernel is launched with. 1 keeps the
-  // single-block ring. >1 partitions each chunk into numBlocks_ disjoint
-  // sub-ranges, one CTA each (qpId=bid). Used only to size the per-block flag
-  // regions (numBlocks_*ringSize slots); the kernel reads the actual block count
-  // from gridDim.x at launch.
+  // CTA ("channel") count. >1 partitions each chunk into numBlocks_ disjoint
+  // sub-ranges, one CTA each (qpId=bid). Only sizes the per-block flag regions
+  // (numBlocks_*ringSize slots); the kernel reads the block count from gridDim.x.
   int numBlocks_;
 
-  // Symmetric ring buffer: holds ringSize_ contiguous chunks. Sized once for the
-  // largest message; the kernel only touches the first ringSize_*chunkBytes.
+  // Symmetric ring buffer of ringSize_ contiguous chunks. Sized for the largest
+  // message; the kernel only touches the first ringSize_*chunkBytes.
   void* ring_;
   size_t ringBytes_;
   application::SymmMemObjPtr ringObj_;
@@ -158,9 +139,8 @@ class InterNodeRingAllgather {
       throw std::runtime_error("InterNodeRingAllgather: ring ShmemMalloc failed");
     ringObj_ = shmem::ShmemQueryMemObjPtr(ring_);
 
-    // Flags: one uint64 per ring slot PER BLOCK. Allocate numBlocks_*npes
-    // (>= numBlocks_*ringSize_) so each CTA channel gets its own flag region and
-    // the buffer is large enough for any sub-group on this PE set.
+    // One uint64 per ring slot per block: numBlocks_*npes (>= numBlocks_*ringSize_)
+    // gives each CTA channel its own flag region, sized for any sub-group here.
     size_t flagsBytes = static_cast<size_t>(numBlocks_) * npes_ * sizeof(uint64_t);
     flags_ = shmem::ShmemMalloc(flagsBytes);
     if (flags_ == nullptr)
@@ -168,10 +148,8 @@ class InterNodeRingAllgather {
     (void)hipMemset(flags_, 0, flagsBytes);
     flagsObj_ = shmem::ShmemQueryMemObjPtr(flags_);
 
-    // WRITE-PUSH (SEND-CQ) landing fence (env MORI_HIER_RING_WRITE, default OFF).
-    // On the giant multiBlock AG each channel pushes its sub-range as a fused
-    // put-with-signal then drains its own SEND CQE. Set once here; persists
-    // across calls.
+    // WRITE-PUSH (SEND-CQ) landing fence: each channel drains its own SEND CQE
+    // after a fused put-with-signal (env MORI_HIER_RING_WRITE, default OFF).
     {
       const char* e = std::getenv("MORI_HIER_RING_WRITE");
       jit_args_.useWriteFence = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
@@ -183,9 +161,8 @@ class InterNodeRingAllgather {
     if (flags_) shmem::ShmemFree(flags_);
   }
 
-  // Place this PE's input chunk into its ring slot, clear the flags, barrier so
-  // every PE is primed before any remote put/atomic lands, then return a host
-  // pointer to the kernel args (consumed by the Python launch_struct call).
+  // Stage this PE's chunk, clear flags, barrier so every PE is primed before any
+  // remote put/atomic lands, then return the host pointer to the kernel args.
   int64_t prepare_sync(uintptr_t input, size_t count_u32, hipStream_t stream) {
     size_t chunkBytes = count_u32 * sizeof(uint32_t);
     if (static_cast<size_t>(ringSize_) * chunkBytes > ringBytes_) {
@@ -194,15 +171,12 @@ class InterNodeRingAllgather {
     size_t flagsBytes = static_cast<size_t>(numBlocks_) * npes_ * sizeof(uint64_t);
 
     (void)hipMemsetAsync(flags_, 0, flagsBytes, stream);
-    // Stage this PE's chunk into its ring-position slot (not its global PE).
+    // Stage into ring-position slot (not global PE).
     char* myChunk = reinterpret_cast<char*>(ring_) + static_cast<size_t>(ringPos_) * chunkBytes;
     (void)hipMemcpyAsync(myChunk, reinterpret_cast<void*>(input), chunkBytes,
                          hipMemcpyDeviceToDevice, stream);
     (void)hipStreamSynchronize(stream);
 
-    // Global barrier: all PEs have cleared flags + staged their own chunk
-    // before the ring (with its cross-PE atomic increments) begins. (All PEs
-    // call this op -- each participates in exactly one sub-group.)
     shmem::ShmemBarrierAll();
 
     jit_args_.myPe = myPe_;
@@ -218,39 +192,22 @@ class InterNodeRingAllgather {
     return reinterpret_cast<int64_t>(&jit_args_);
   }
 
-  // STREAM-ORDERED prepare. Identical byte moves to
-  // prepare_sync, but the cross-PE rendezvous uses the on-device
-  // ShmemBarrierOnStream(stream) instead of a host-blocking
-  // hipStreamSynchronize(stream) + host bootNet ShmemBarrierAll(). This keeps
-  // the whole op enqueued on ``stream`` (no host round-trip), so consecutive
-  // hier-AllGather phases pipeline without two CPU<->GPU stalls per op. The
-  // device barrier still globally fences (all PEs) before any remote put/atomic
-  // lands, so correctness is preserved.
+  // Stream-ordered prepare_sync: rendezvous via on-device ShmemBarrierOnStream
+  // (no host sync) so the op stays on ``stream``. Still globally fences all PEs
+  // before any remote put/atomic lands.
   int64_t prepare_stream(uintptr_t input, size_t count_u32, hipStream_t stream) {
     size_t chunkBytes = count_u32 * sizeof(uint32_t);
     if (static_cast<size_t>(ringSize_) * chunkBytes > ringBytes_) {
       throw std::runtime_error("InterNodeRingAllgather: message exceeds ring buffer capacity");
     }
 
-    // NO flag memset here. The ring kernel
-    // (AllGatherRingSubGroupKernelBody) resets every USED flag slot to 0 at the
-    // END of each op (the `for idx<ringSize ... flagsArray[flagBase+idx]=0` loop
-    // + a trailing __threadfence_system), and the constructor zeroes the whole
-    // buffer once at init. So the flags buffer is ALWAYS 0 on entry to prepare,
-    // making this hipMemsetAsync redundant -- it only re-clears already-zero
-    // memory while adding one async op (and a tail-RAW dependency the receiver's
-    // predecessor would observe) on the critical stream right before the
-    // rendezvous barrier. The ShmemBarrierOnStream below still provides the
-    // cross-PE ordering (every PE's op-end reset is globally visible before any
-    // peer's next-op atomic increment). This documents the kernel-reset invariant
-    // the flag-gated (generation-counter, barrier-free) ring lever will build on.
+    // No flag memset: the ring kernel resets every used slot to 0 at op end
+    // (+ trailing __threadfence_system) and the constructor zeroes once, so the
+    // buffer is always 0 on entry. The barrier below still orders each PE's
+    // op-end reset before any peer's next-op atomic increment.
     char* myChunk = reinterpret_cast<char*>(ring_) + static_cast<size_t>(ringPos_) * chunkBytes;
     (void)hipMemcpyAsync(myChunk, reinterpret_cast<void*>(input), chunkBytes,
                          hipMemcpyDeviceToDevice, stream);
-    // On-device global barrier (no host sync): all PEs have cleared flags +
-    // staged their own chunk (stream-ordered before this barrier) before the
-    // ring's cross-PE atomic increments begin. dissemination
-    // topology when MORI_HIER_DISSEM_BARRIER=1 (same global semantics).
     HierPrepareBarrierOnStream(stream);
 
     jit_args_.myPe = myPe_;
@@ -274,11 +231,7 @@ class InterNodeRingAllgather {
       throw std::runtime_error("InterNodeRingAllgather: message exceeds ring buffer capacity");
     }
 
-    // redundant flag memset removed (see prepare_stream): the
-    // ring kernel resets all used flag slots to 0 at op end + the constructor
-    // zeroes once, so flags are always 0 on entry. The barrier still orders the
-    // cross-PE reset-vs-next-op-increment. dissemination
-    // topology when MORI_HIER_DISSEM_BARRIER=1 (same global semantics).
+    // No flag memset (see prepare_stream): flags are always 0 on entry.
     HierPrepareBarrierOnStream(stream);
 
     jit_args_.myPe = myPe_;
@@ -294,23 +247,10 @@ class InterNodeRingAllgather {
     return reinterpret_cast<int64_t>(&jit_args_);
   }
 
-  // Stream-ordered counterpart of finish_sync: copy-OUT enqueued on the stream,
-  // then an on-device ShmemBarrierOnStream (no host sync / host barrier) so no
-  // PE reuses the ring buffer while a peer still reads it. Stays on-stream.
-  //
-  // ``barrier`` (default true) gates that trailing fence. The
-  // fence's ONLY job is cross-PE ring-buffer reuse: it ensures every PE has
-  // finished its copy-OUT (reading its LOCAL ring_) before any peer's NEXT-op
-  // RDMA put overwrites that ring_. Those peer puts happen inside the next op's
-  // ring kernel, which is itself preceded by that op's prepare_stream
-  // ShmemBarrierOnStream (a global on-stream fence after every PE's flag-clear +
-  // slot-stage). So for ANY op that has a successor through the same handle, the
-  // successor's prepare fence ALREADY provides the required global ordering ->
-  // this finish fence is redundant and can be deferred (barrier=false), exactly
-  // mirroring the deferred Phase-B finish fence (slice_defer_fin). The
-  // copy-OUT stays stream-ordered so the result is correct regardless; only the
-  // cross-PE reuse fence is deferred. Callers that have no guaranteed successor
-  // (last op / path switch) must keep barrier=true.
+  // Stream-ordered finish_sync. ``barrier`` (default true) gates the trailing
+  // fence whose only job is cross-PE ring reuse; it may be deferred (false) when
+  // a successor op's prepare barrier already provides that ordering. Last op /
+  // path switch must keep barrier=true.
   double finish_stream(uintptr_t output, size_t count_u32, hipStream_t stream,
                        bool barrier = true) {
     size_t chunkBytes = count_u32 * sizeof(uint32_t);
@@ -327,22 +267,16 @@ class InterNodeRingAllgather {
     return 0.0;
   }
 
-  // Device pointer to THIS PE's ring slot for a given message size, so an
-  // upstream producer (the intra-node SDMA gather) can write its node-block
-  // DIRECTLY into the ring buffer, eliminating the prepare_sync copy-IN. The slot
-  // lives at ringPos_*chunkBytes -- exactly where prepare_sync would otherwise
-  // stage it.
+  // Device pointer to this PE's ring slot (at ringPos_*chunkBytes), so an
+  // upstream producer can write directly into the ring, eliminating the copy-IN.
   uintptr_t slot_ptr(size_t count_u32) const {
     size_t chunkBytes = count_u32 * sizeof(uint32_t);
     return reinterpret_cast<uintptr_t>(reinterpret_cast<char*>(ring_) +
                                        static_cast<size_t>(ringPos_) * chunkBytes);
   }
 
-  // Like prepare_sync but WITHOUT the copy-IN: the caller has already written
-  // this PE's chunk into slot_ptr(count_u32) (e.g. the intra gather targeted the
-  // ring slot). We only clear the flags, barrier so every PE is primed before
-  // any remote put/atomic lands, and build the kernel args. Saves one full
-  // chunk D2D copy per call.
+  // prepare_sync without the copy-IN: caller already wrote its chunk into
+  // slot_ptr(count_u32). Clear flags, barrier, build args.
   int64_t prepare_sync_in_place(size_t count_u32, hipStream_t stream) {
     size_t chunkBytes = count_u32 * sizeof(uint32_t);
     if (static_cast<size_t>(ringSize_) * chunkBytes > ringBytes_) {
@@ -353,8 +287,6 @@ class InterNodeRingAllgather {
     (void)hipMemsetAsync(flags_, 0, flagsBytes, stream);
     (void)hipStreamSynchronize(stream);
 
-    // Global barrier: all PEs have cleared flags + staged their own chunk (the
-    // upstream gather already wrote into slot_ptr) before the ring begins.
     shmem::ShmemBarrierAll();
 
     jit_args_.myPe = myPe_;
@@ -370,37 +302,25 @@ class InterNodeRingAllgather {
     return reinterpret_cast<int64_t>(&jit_args_);
   }
 
-  // After the ring kernel completes, copy the full ringSize*chunk result out to
-  // the user output buffer (ring order) and synchronize.
+  // Copy the full ringSize*chunk result (ring order) out to the user buffer.
   double finish_sync(uintptr_t output, size_t count_u32, hipStream_t stream) {
     size_t chunkBytes = count_u32 * sizeof(uint32_t);
     size_t total = static_cast<size_t>(ringSize_) * chunkBytes;
     (void)hipMemcpyAsync(reinterpret_cast<void*>(output), ring_, total, hipMemcpyDeviceToDevice,
                          stream);
     (void)hipStreamSynchronize(stream);
-    // Barrier so no PE frees/reuses the ring buffer while a peer is still
-    // reading from it in a subsequent op.
+    // Barrier so no PE reuses the ring buffer while a peer still reads it.
     shmem::ShmemBarrierAll();
     return 0.0;
   }
 
-  // Base device pointer of the full ring buffer. After the ring kernel completes,
-  // ring_ already holds the ringSize_ chunks in ring order = the full rank-major
-  // result. A consumer that reads its output DIRECTLY from here (via ``buf_ptr``
-  // + ``finish_sync_no_copy``) avoids the finish_sync copy-OUT (a ringSize*chunk
-  // D2D copy).
+  // Base pointer of the ring buffer, which after the kernel holds the ringSize_
+  // chunks in ring order (the rank-major result). Read via buf_ptr +
+  // finish_sync_no_copy to avoid the finish_sync copy-OUT.
   uintptr_t buf_ptr() const { return reinterpret_cast<uintptr_t>(ring_); }
 
-  // Like finish_sync but WITHOUT the copy-OUT: the gathered result is left in
-  // the ring buffer (read it via ``buf_ptr``). Only synchronizes the stream and
-  // barriers so no PE frees/reuses the ring buffer while a peer is still
-  // reading from it. Saves one full ringSize*chunk D2D copy per call.
-  //
-  // Asymmetry vs the copy-IN elimination: the ring kernel already writes every
-  // received chunk into the UNCACHED symmetric ring_ buffer, so removing the
-  // copy-OUT is a pure saving -- there is no offsetting uncached write the way
-  // copy-IN incurred. The only cost shifted to the consumer is reading its result
-  // from uncached memory, which is outside the timed AllGather.
+  // finish_sync without the copy-OUT: result left in the ring buffer (read via
+  // buf_ptr). Only syncs the stream and barriers against cross-PE reuse.
   double finish_sync_no_copy(hipStream_t stream) {
     (void)hipStreamSynchronize(stream);
     shmem::ShmemBarrierAll();

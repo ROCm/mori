@@ -20,19 +20,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Sub-group intra-node SDMA broadcast host handle (leader-only variant).
-//
-// This is the intra-node *placement* phase of the hierarchical cross-node
-// AllGather's leader-only variant: the node leader (local_rank 0) gathers the
-// full N*G output into a staging buffer (inter-node RDMA ring), then this
-// broadcast SDMA-copies that whole buffer over the XGMI copy engines into every
-// local rank's output. It is the dual of ``IntraNodeSubGroupAllgatherSdma``
-// (one source -> all members, instead of all members -> all members) and is
-// driven from Python with the same prepare -> launch kernel -> finish pattern.
-//
-// Compared to the "every-rank-direct" decomposition (every local rank rings its
-// node-block over the NIC => G x redundant inter-node traffic), leader-only ring
-// + this broadcast crosses the NIC only once per node-block.
+// Sub-group intra-node SDMA broadcast host handle (leader-only variant): after the
+// node leader (local_rank 0) RDMA-gathers the full N*G output, SDMA-copies it over
+// the XGMI copy engines into every local rank's output (one source -> all members).
+// Driven from Python as prepare -> launch kernel -> finish.
 
 #ifndef INTRA_NODE_SUBGROUP_BROADCAST_SDMA_CLASS_HPP
 #define INTRA_NODE_SUBGROUP_BROADCAST_SDMA_CLASS_HPP
@@ -53,22 +44,21 @@ class IntraNodeSubGroupBroadcastSdma {
   int myPe_;
   int npes_;
 
-  // Sub-group descriptor. The broadcast runs over the arithmetic sub-group of
-  // global PEs {peBase_, peBase_+peStride_, ..., peBase_+(groupSize_-1)*peStride_};
-  // this PE is at position groupPos_. The root (source) is groupPos_==0.
+  // Broadcast runs over the arithmetic sub-group {peBase_ + i*peStride_ : i<groupSize_};
+  // this PE is at groupPos_, root (source) is groupPos_==0.
   int groupSize_;
   int groupPos_;
   int peBase_;
   int peStride_;
 
-  // Symmetric output buffer: holds the full broadcast payload (elementCount u32
-  // lanes). Registered (not just malloc'd) so the SDMA queue handles populate.
+  // Symmetric output buffer holding the full payload. Registered (not malloc'd) so
+  // the SDMA queues can populate it.
   void* out_;
   size_t outBytes_;
   application::SymmMemObjPtr outObj_;
 
-  // Single arrival flag slot (one source). npes_ slots allocated for uniformity
-  // with the gather handle. Monotonic generation token avoids a per-call reset.
+  // Arrival flags (npes_ slots for uniformity with the gather handle). Monotonic
+  // generation token avoids a per-call reset.
   void* flags_;
   application::SymmMemObjPtr flagsObj_;
   uint64_t seq_;
@@ -107,10 +97,9 @@ class IntraNodeSubGroupBroadcastSdma {
     out_ = shmem::ShmemMalloc(outBytes_);
     if (out_ == nullptr)
       throw std::runtime_error("IntraNodeSubGroupBroadcastSdma: out ShmemMalloc failed");
-    // The broadcast payload buffer is gathered/consumed ONLY via P2P/SDMA (XGMI)
-    // within the node — never an RDMA src/dst. Register P2P/SDMA-only
-    // (rdmaRegister=false) so it dodges the ionic single-MR limit at large sizes
-    // (matches IntraNodeSubGroupAllgatherSdma::out_).
+    // Payload buffer is only ever P2P/SDMA (XGMI) within the node, never an RDMA
+    // src/dst; register P2P/SDMA-only (rdmaRegister=false) to dodge the ionic
+    // single-MR limit at large sizes.
     outObj_ = shmem::ShmemSymmetricRegister(out_, outBytes_, /*rdmaRegister=*/false);
     if (!outObj_.IsValid())
       throw std::runtime_error("IntraNodeSubGroupBroadcastSdma: out register failed");
@@ -130,27 +119,23 @@ class IntraNodeSubGroupBroadcastSdma {
     if (flags_) shmem::ShmemFree(flags_);
   }
 
-  // Barrier so all members are primed (flags already monotonic), stage the
-  // root's payload into the symmetric buffer, then build the kernel args. On the
-  // root ``input`` is the full payload to broadcast (device ptr, count_u32 u32
-  // lanes); on non-root members ``input`` is ignored.
+  // Barrier all members in, stage the root's payload into the symmetric buffer, build
+  // kernel args. On the root ``input`` is the payload (device ptr, count_u32 lanes);
+  // ignored on non-root members.
   int64_t prepare_sync(uintptr_t input, size_t count_u32, hipStream_t stream) {
     if (count_u32 * sizeof(uint32_t) > outBytes_) {
       throw std::runtime_error("IntraNodeSubGroupBroadcastSdma: message exceeds out capacity");
     }
     uint64_t flag_token = ++seq_;
 
-    // The root stages its payload into its own symmetric out buffer so the
-    // kernel reads a stable source (and the root's own output is already filled
-    // when the kernel writes peerPtrs[root] back to it -- idempotent).
+    // Root stages into its own symmetric out buffer so the kernel reads a stable
+    // source (writing peerPtrs[root] back is then idempotent).
     if (groupPos_ == 0 && input != 0) {
       (void)hipMemcpyAsync(out_, reinterpret_cast<void*>(input), count_u32 * sizeof(uint32_t),
                            hipMemcpyDeviceToDevice, stream);
       (void)hipStreamSynchronize(stream);
     }
 
-    // All members enter the broadcast together (flags are monotonic; the token
-    // distinguishes this call from the previous one without a reset).
     shmem::ShmemBarrierAll();
 
     jit_args_.myPe = myPe_;
@@ -167,8 +152,8 @@ class IntraNodeSubGroupBroadcastSdma {
     return reinterpret_cast<int64_t>(&jit_args_);
   }
 
-  // Copy the full broadcast payload out to the user buffer and synchronize, then
-  // barrier so no peer reuses the buffer early.
+  // Copy the full payload out to the user buffer, sync, then barrier so no peer
+  // reuses the buffer early.
   double finish_sync(uintptr_t output, size_t count_u32, hipStream_t stream) {
     size_t total = count_u32 * sizeof(uint32_t);
     (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,

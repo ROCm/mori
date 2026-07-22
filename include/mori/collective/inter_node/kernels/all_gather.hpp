@@ -24,57 +24,28 @@
 namespace mori {
 namespace collective {
 
-// CU-yield backoff for the inter-node RDMA landing spins. The inter leg of the
-// hierarchical AllGather is CU-driven: warp leaders busy-spin on a system-scope
-// atomic landing flag while the cross-node RDMA write (~1.5ms round trip) is in
-// flight. Under a concurrent backward GEMM those spinning wavefronts contend with
-// the GEMM for CU issue slots, so the AllGather cannot hide behind compute. A
-// short s_sleep between polls parks the polling wavefront for ~64*N cycles,
-// handing its SIMD issue quanta back to the co-resident GEMM without changing any
-// memory ordering (the post-loop __threadfence_system still gates visibility, so
-// the result is bit-identical to the pure busy-spin -- this is a timing-only
-// lever). 0 => OFF: the guarded call compiles out, byte-identical baseline.
-// Rebuild to change (device track). Applied only to the long REMOTE-landing spins,
-// never the fast intra-block counter joins.
+// s_sleep backoff between inter-node landing-spin polls. Timing-only, memory order
+// unchanged (post-loop __threadfence_system still gates visibility, bit-exact); 0 => OFF.
 constexpr int kHierInterPollSleep = 0;
 
-// Ring AllGather data movement over an arithmetic sub-group of global PEs:
-// ``{peBase, peBase+peStride, ..., peBase+(ringSize-1)*peStride}``. This PE is
-// at position ``ringPos`` within that sub-group. The chunk size is passed
-// explicitly (``peChunkSize``) so a single fixed-size symmetric ring buffer can
-// serve variable message sizes. The ring buffer holds ``ringSize`` chunks; on
-// entry only slot ``ringPos`` is filled. After ``ringSize-1`` rounds every
-// member holds all ``ringSize`` chunks in ring order. Equal per-PE chunks => no
-// last-chunk special case is needed. The whole-world ring is the special case
-// ``peBase=0, peStride=1``.
+// Ring AllGather over an arithmetic PE sub-group {peBase + k*peStride : k in
+// [0,ringSize)}; this PE is at ringPos. peChunkSize is explicit so one fixed-size
+// symmetric ring buffer serves variable sizes. On entry only slot ringPos is
+// filled; after ringSize-1 rounds every member holds all chunks in ring order.
+// Equal per-PE chunks => no last-chunk special case. Whole-world ring is the
+// special case peBase=0, peStride=1. Inter-node phase of the hierarchical
+// AllGather: the ring runs over cross-node leaders (RDMA neighbours), same-node P2P.
 //
-// This is the inter-node phase of the hierarchical AllGather: the ring runs
-// over node-leaders (or same-local-index ranks across nodes), so neighbours are
-// reached over RDMA while same-node members go P2P.
+// numBlocksOverride/bidOverride replace the grid-derived gridDim.x/blockIdx.x so
+// the ring can occupy a sub-range of blocks in a fused grid while other blocks run
+// the intra-node SDMA gather (NIC + XGMI in one kernel). Both -1 => grid-derived
+// geometry, inert until a fused launcher passes them.
 //
-// ``numBlocksOverride`` / ``bidOverride`` let this body run as a sub-range of a
-// larger fused grid. When >=0 they replace the grid-derived ``gridDim.x`` /
-// ``blockIdx.x`` so the ring can occupy blocks [0, ringBlocks) of a fused launch
-// while other blocks of the same grid run the intra-node SDMA local-block gather
-// concurrently (NIC and XGMI in one kernel, no host-side wait_stream merge).
-// Both default to -1, preserving the grid-derived geometry -- inert until a
-// fused launcher passes them.
-//
-// ``chunkReadyFlags`` (default nullptr, inert for every existing caller) is the
-// per-chunk landing signal that pipelines the inter-node RDMA ring with the
-// intra-node SDMA remote-block reassembly. When non-null it is a device array of
-// at least ``numBlocks`` uint64_t in ordinary (cached) HBM, zeroed by the caller
-// before launch. As soon as this block's (channel ``bid``'s) inbound sub-range
-// has fully landed in this PE's ring buffer -- i.e. after the receiver's
-// system-scope acquire + __threadfence_system that make those bytes coherently
-// visible to this GPU's CUs -- block ``bid`` publishes ``chunkReadyFlags[bid]``.
-// A concurrent reassembly block in the same fused grid spins on that flag and,
-// the instant sub-range ``bid`` is ready, SDMA-pushes exactly that sub-range
-// over XGMI while ring channel ``bid+1`` is still crossing the NIC, overlapping
-// the two hierarchy legs. Because each PE reassembles a remote block by pushing
-// from its own ring buffer, the only dependency is this PE's own ring landing --
-// a purely local flag spin, no global barrier. nullptr keeps the standalone ring
-// byte-for-byte identical.
+// chunkReadyFlags (default nullptr, inert): per-channel landing signal pipelining the
+// inter-node ring with intra-node SDMA reassembly. Device array of >=numBlocks uint64_t in
+// cached HBM, zeroed before launch. Block bid publishes chunkReadyFlags[bid] only after its
+// inbound sub-range has landed AND been made visible via the receiver's system acquire +
+// __threadfence_system. nullptr => byte-for-byte identical standalone ring.
 inline __device__ void AllGatherRingSubGroupKernelBody(
     int ringPos, int ringSize, int peBase, int peStride, const application::SymmMemObjPtr memObj,
     const application::SymmMemObjPtr flagsObj, size_t peChunkSize, int numQp = 1,
@@ -93,18 +64,11 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   int warpId = threadLinearId / warpSize;
   const int warpsPerBlock = threadsPerBlock / warpSize;
 
-  // Multi-block ring ("channels", RCCL-style). A single-block ring (numQp warps
-  // in one CTA, each on its own QP) under-fills the NIC; driving many CTAs
-  // (channels) concurrently fills it. Each block ``bid`` of ``gridDim.x`` handles
-  // a disjoint 16B-aligned sub-range of every chunk and uses its own flag region
-  // [bid*ringSize, (bid+1)*ringSize), so blocks never alias data or flags. Block
-  // bid issues its put on qpId=bid so each channel drives a distinct QP -- the
-  // union still tiles each chunk exactly => byte-identical result. Only engaged
-  // for true RDMA neighbours: same-node P2P/SDMA lowers to one anvil queue per
-  // (src,dst), and multiple CTAs hammering it overflow the retry budget and
-  // crash. For a non-RDMA neighbour (single-node simulation) only block 0 runs
-  // the single-block path and the other blocks return, keeping single-node
-  // bit-exact and crash-free.
+  // Multi-block ring ("channels", RCCL-style): each block bid drives a disjoint
+  // 16B-aligned sub-range on its own QP (qpId=bid) and flag region
+  // [bid*ringSize,(bid+1)*ringSize) (no data/flag aliasing, union byte-identical).
+  // Only for RDMA neighbours: same-node P2P/SDMA has one anvil queue per (src,dst) that
+  // multiple CTAs would crash, so a non-RDMA neighbour runs only block 0 (bit-exact).
   const int numBlocks = (numBlocksOverride >= 0) ? numBlocksOverride : static_cast<int>(gridDim.x);
   const int bid = (bidOverride >= 0) ? bidOverride : static_cast<int>(blockIdx.x);
   application::TransportType nextXportMb = shmem::GetGlobalGpuStatesPtr()->transportTypes[nextPeer];
@@ -114,7 +78,6 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     // Single-node simulation with a multi-block launch: only block 0 works.
     return;
   }
-  // Per-block 16B-aligned sub-range of the chunk (full chunk when single-block).
   size_t blkOff = 0;
   size_t blkBytes = peChunkSize;
   int flagBase = 0;
@@ -132,20 +95,13 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     flagBase = bid * ringSize;
   }
 
-  // Multi-QP fan-out gate. A single warp on a single QP under-fills the NIC, so
-  // we fan the per-round put across ``numQp`` QPs (warp w -> qpId=w, disjoint
-  // 16B-aligned sub-range) -- but only when the neighbour is reached over RDMA.
-  // For a same-node neighbour ShmemPutMemNbiWarp lowers to a single anvil SDMA
-  // queue per (src,dst); multiple warps hammering it overflow the retry budget
-  // and crash. So we read the neighbour's transport at runtime: single-node
-  // simulation (P2P/SDMA) keeps the single-warp path and stays bit-exact; only a
-  // true cross-node (RDMA) neighbour fans out. Gated additionally on numQp>1 so
-  // the flat whole-world ring (numQp defaults to 1) is byte-for-byte unchanged.
+  // Multi-QP fan-out gate: a single warp/QP under-fills the NIC, so fan the per-round put
+  // across numQp QPs (warp w -> qpId=w, disjoint 16B sub-range) -- only for an RDMA
+  // neighbour (same-node anvil single-queue would crash) and only when numQp>1 (flat
+  // whole-world ring stays byte-for-byte unchanged).
   application::TransportType nextXport = shmem::GetGlobalGpuStatesPtr()->transportTypes[nextPeer];
   bool peerIsRdma = (nextXport == application::TransportType::RDMA);
-  // Multi-block and within-block multi-QP fan-out are mutually exclusive: in
-  // multi-block mode each CTA already drives its own QP (qpId=bid) on its own
-  // sub-range, so a single warp per block is correct.
+  // Mutually exclusive with multi-block (there each CTA already drives qpId=bid).
   int useWarps = (!multiBlock && numQp > 1 && peerIsRdma) ? numQp : 1;
   if (useWarps > warpsPerBlock) useWarps = warpsPerBlock;
   bool fanOut = (useWarps > 1);
@@ -155,45 +111,25 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   application::TransportType prevXport = shmem::GetGlobalGpuStatesPtr()->transportTypes[prevPeer];
   bool prevIsRdma = (prevXport == application::TransportType::RDMA);
 
-  // WRITE-PUSH (SEND-CQ) per-channel landing fence for the giant multiBlock AG.
-  // Each channel CTA ``bid`` pushes its own sub-range [blkOff, blkBytes) of my
-  // chunk to nextPeer on qpId=bid as a fused put-with-signal (the flag AMO rides
-  // the same QP strictly after the data WRITE, RC in-order, so the receiver's
-  // per-channel flag can never beat the data), then drains only qpId=bid's send
-  // CQE (per-channel quiet, no cross-CTA CQ race) so the local WQE has completed
-  // before this block publishes. The receiver spins its own per-channel inbound
-  // flag (system-acquire) + system-fences. Byte-identical to the multiBlock push
-  // receive; only the completion mechanism changes. Gated maxRounds==1 (the N=2
-  // hier AG) so larger rings keep the default path.
+  // WRITE-PUSH (SEND-CQ) per-channel landing fence for the multiBlock AG: channel bid
+  // pushes its sub-range as a fused put-with-signal (flag AMO after the WRITE, same QP,
+  // RC in-order => flag can't beat data), draining only qpId=bid's CQE. Gated maxRounds==1.
   bool multiBlockWrite =
       (useWriteFence && peerIsRdma && prevIsRdma && maxRounds == 1 && multiBlock);
 
   __syncthreads();
 
-  // ==========================================================================
-  // DEEP-SQ TEMPORAL PIPELINE (MORI_HIER_DEEP_PIPE=P). Split the chunk into P
-  // temporal sub-chunks issued back-to-back on the SAME full numQp fan-out with a
-  // per-sub-chunk put-with-signal; sub-chunk p's landing flag fires (RC in-order)
-  // before p+1's, so a reassembly worker pushes p over XGMI while p+1.. still
-  // cross the NIC, overlapping intra reassembly with inter fill. Engaged only on
-  // the single-round (ringSize==2) all-RDMA fan-out path; full useWarps QP fan-out
-  // per sub-chunk, publishes P chunkReadyFlags in temporal order. Self-contained:
-  // returns before the classic round loop. INERT when deepPipe<=1 (byte-identical).
+  // DEEP-SQ TEMPORAL PIPELINE (MORI_HIER_DEEP_PIPE=P): split the chunk into P temporal
+  // sub-chunks with per-sub-chunk put-with-signal; p's flag fires (RC in-order) before
+  // p+1's, so a reassembly worker pushes p over XGMI while p+1.. still cross the NIC.
+  // Single-round all-RDMA fan-out only; self-contained. INERT when deepPipe<=1 (byte-identical).
   bool deepPipeEngaged =
       (deepPipe > 1 && peerIsRdma && prevIsRdma && maxRounds == 1 && !multiBlock &&
        chunkReadyFlags != nullptr && useWarps >= 1);
   if (deepPipeEngaged) {
-    // Min-sub-chunk clamp: the deep-SQ temporal FIFO splits the chunk into P sub-chunks
-    // issued back-to-back on the full useWarps QP fan-out (the NCCL_STEPS full-width-per-
-    // step model). But an unclamped large P at a small total size shrinks each sub-chunk
-    // below a useful RDMA transfer granularity -- the tiny per-sub-chunk WQEs starve the
-    // NIC and the extra flag round-trips can deadlock small transfers. Clamp P so every
-    // temporal sub-chunk carries >= kMinSubChunkB
-    // (1 MiB): reqPmax = peChunkSize / kMinSubChunkB. This makes any requested
-    // depth safe at every size, and is bit-exact -- P only controls the temporal
-    // partition of the SAME contiguous bytes issued+landed in order, and the
-    // default P=2 already yields >=8 MiB sub-chunks at every size >=32MB (clamp is
-    // a no-op there).
+    // Clamp P so every sub-chunk carries >= kMinSubChunkB (1 MiB): tiny per-sub-chunk
+    // WQEs starve the NIC and the extra flag round-trips can deadlock small transfers.
+    // Bit-exact -- P only partitions the same contiguous bytes, issued+landed in order.
     const size_t kMinSubChunkB = static_cast<size_t>(1) << 20;
     int reqPmax = static_cast<int>(peChunkSize / kMinSubChunkB);
     if (reqPmax < 1) reqPmax = 1;
@@ -204,7 +140,6 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     const size_t nUnits = (peChunkSize + kAlignDP - 1) / kAlignDP;
     const size_t unitsPerP = (nUnits + static_cast<size_t>(P) - 1) / static_cast<size_t>(P);
     const int sw = useWarps;  // sender fan-out warps per sub-chunk (== numQp fan-out)
-    // Uniform temporal split: sub-chunk p = [p*unitsPerP, (p+1)*unitsPerP), clamped.
     auto dpRange = [&](int p, size_t& sU, size_t& eU) {
       sU = static_cast<size_t>(p) * unitsPerP;
       eU = sU + unitsPerP;
@@ -212,7 +147,6 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       if (sU > eU) sU = eU;
     };
     // Per-sub-chunk active-warp count, computed identically to the sender tiling.
-    // active(p) = # of warps that actually get a non-empty tile of sub-chunk p.
     auto activeOf = [&](int p) -> int {
       size_t sU, eU;
       dpRange(p, sU, eU);
@@ -225,27 +159,14 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       if (a < 1) a = 1;
       return a;
     };
-    // DEEP_PIPE_QUIET: scale-robust per-sub-chunk landing fence via QP quiet-drain.
-    // The put-signal AMO can beat its own data >=64MB and WRITE_WITH_IMM is HW-
-    // unavailable here, but a SEND-CQ drain of the sub-chunk's QP is a definitive
-    // remote-landing proof (the teamC ring's >=32MiB-parity mechanism). Give each
-    // temporal sub-chunk p its OWN QP (qpId = p % sw), issue a PLAIN put (no fused
-    // AMO), then in temporal order drain qpId=(p%sw) with ShmemQuietThread(nextPeer,
-    // qp) (== sub-chunk p landed at nextPeer, RC in-order per QP) and only THEN AMO
-    // the receiver's flag slot p. Because distinct sub-chunks ride distinct QPs, the
-    // temporal pipeline is preserved (p's flag fires before p+1's data finishes),
-    // yet the flag NEVER precedes the landing => bit-exact even at 64-256MB. Self-
-    // contained: returns before the IMM/signal branches. Requires chunkReadyFlags.
+    // DEEP_PIPE_QUIET: scale-robust per-sub-chunk landing fence. The put-signal AMO can
+    // beat its own data at large sizes and WRITE_WITH_IMM is HW-unavailable, so each sub-chunk
+    // p rides its OWN QP (plain put) drained via SEND-CQ before its flag => flag never precedes
+    // landing. Requires chunkReadyFlags.
     if (deepPipeQuiet) {
-      // Disjoint QP GROUP per temporal sub-chunk so distinct sub-chunks stay on
-      // distinct QPs (temporal landing order preserved => p's flag can fire while
-      // p+1.. still cross the NIC) AND each sub-chunk still fans across g = sw/P
-      // QPs for full per-sub-chunk BW. group(p) = QPs [p*g, p*g+g); warp within the
-      // group tiles the sub-chunk in 16B units. When sw < P (P>sw) groups wrap
-      // (g==1, p%sw) --
-      // then some sub-chunks share a QP and the drain also covers the later one
-      // (still bit-exact, just less overlap). Draining a sub-chunk's WHOLE group
-      // (all g QPs) before its AMO is the landing fence.
+      // Disjoint QP GROUP per sub-chunk: group(p) = QPs [p*g, p*g+g), g = sw/P; each
+      // fans across g QPs for BW. When P>sw groups wrap (g=1, p%sw) and share a QP.
+      // Draining a sub-chunk's whole group before its AMO is the landing fence.
       const int g = (sw >= P) ? (sw / P) : 1;  // QPs per sub-chunk
       auto grpBase = [&](int p) -> int { return (sw >= P) ? (p * g) : (p % sw); };
       auto nonEmptyDP = [&](int p) -> bool {
@@ -253,8 +174,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
         dpRange(p, sU, eU);
         return sU < eU;
       };
-      // SENDER: warp w belongs to sub-chunk p = w / g (when sw>=P), lane role wl =
-      // w % g drives qpId = grpBase(p)+wl on its disjoint 16B tile of sub-chunk p.
+      // SENDER: warp w -> sub-chunk p=w/g (sw>=P), lane wl=w%g on qpId=grpBase(p)+wl.
       if (warpId < sw) {
         int p, wl, gg;
         if (sw >= P) {
@@ -279,7 +199,6 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                 continue;
             }
             size_t subUnits = eU - sU;
-            // Tile sub-chunk pp across gg QPs; lane wl takes its slice.
             size_t upl = (subUnits + static_cast<size_t>(gg) - 1) / static_cast<size_t>(gg);
             if (upl == 0) upl = 1;
             size_t lS = sU + static_cast<size_t>(wl) * upl;
@@ -302,49 +221,16 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
         }
       }
       __syncthreads();
-      // PARALLEL SEND-DRAIN + RECV-PUBLISH: each sub-chunk p gets its OWN drain
-      // warp-leader (thread p*warpSize) so a landed group fires its flag the INSTANT
-      // its own QP group drains -- concurrently with the other groups still crossing
-      // the NIC.
-      // Distinct sub-chunks ride DISJOINT QP groups => distinct ep[]/CQ state, so
-      // concurrent ShmemQuietThread(nextPeer, qp) calls never share a WQ/CQ =>
-      // bit-exact (same drains, same AMOs, same flag slots; only the ORDER of
-      // independent completions is relaxed, which the per-slot flags already allow).
-      // ONE warp-leader per sub-chunk (thread p*warpSize): it drains its OWN QP
-      // group, AMOs the remote landing flag p, THEN waits for its OWN incoming flag
-      // p and publishes chunkReadyFlags[p]. A SINGLE leader per p (not a separate
-      // send-drain and recv-publish leader) is required on wave64 HW: block=512 =>
-      // warpsPerBlock = 8, so P<=warpsPerBlock holds and a leader warp exists for
-      // every p (a 2*P-warp split would leave P=8 recv leaders without a warp =>
-      // chunkReadyFlags never published => hang). All P leaders still run CONCURRENTLY
-      // across sub-chunks (each on its DISJOINT QP group => disjoint WQ/CQ => no
-      // shared-completion race, bit-exact); the per-p drain->recv sequence is the
-      // natural inter->intra dependency for that sub-chunk, not a cross-p serialize.
-      // ONLY safe when sw>=P (disjoint QP group per sub-chunk) AND P<=warpsPerBlock
-      // (a leader warp exists for every p). Else fall back to the serial thread-0
-      // drain (P>sw groups WRAP grpBase=p%sw sharing a QP; or too few warps).
+      // PARALLEL SEND-DRAIN + RECV-PUBLISH: one warp-leader per sub-chunk drains its OWN
+      // disjoint QP group (=> disjoint WQ/CQ, no shared-completion race, bit-exact), AMOs
+      // the remote flag p, waits its inbound flag p, publishes chunkReadyFlags[p]. Safe
+      // only when sw>=P AND P<=warpsPerBlock (a leader warp per p); else serial thread-0.
       if (sw >= P && P <= warpsPerBlock) {
-        // Parallelise the per-sub-chunk QP-group send-CQ drain. Each temporal
-        // sub-chunk p fans its data across g = sw/P QPs (grpBase(p)..+g-1). Give
-        // each of the g QPs its own drain warp so the g completion polls run
-        // concurrently, then a lock-free per-group join (shared arrival counter)
-        // lets the group leader AMO the remote flag + publish only after all g QPs
-        // of that group have landed. Distinct groups keep firing independently
-        // (per-group counter, no global barrier) so the inter-sub-chunk pipeline is
-        // preserved. Identical QP drains and AMO/flag slots as the serial path; only
-        // the order of the g independent per-QP completions within a group is relaxed
-        // (each QP has its own WQ/CQ, per-slot flags allow it). warpsPerBlock>=sw
-        // here, so a distinct drain warp exists per QP.
+        // Per-group lock-free join (shared arrival counter); groups fire independently.
         const int myWarp = threadLinearId / warpSize;
         const bool warpLead = (threadLinearId % warpSize) == 0;
-        // Single-group fast join: when P==1 all sw drain warps belong to one group,
-        // so __syncthreads is the natural (and cheaper) join instead of an
-        // atomic-counter spin. Every drain warp quiets its QP + __threadfence_system
-        // before the barrier, then thread 0 AMOs the remote flag / spins the inbound
-        // landing flag / publishes. Same QP-drain set and single AMO/flag slot as the
-        // counter join; only the P==1 join primitive changes. The P>1 pipeline keeps
-        // the per-group counter join below (a block barrier there would
-        // cross-synchronize independent groups and serialize the pipeline).
+        // P==1: all sw drain warps are one group, so __syncthreads is the natural join
+        // (the P>1 atomic-counter spin would serialize independent groups).
         if (P == 1) {
           if (warpLead && myWarp < sw && nonEmptyDP(0)) {
             shmem::ShmemQuietThread(nextPeer, grpBase(0) + myWarp);  // g==sw, wl==myWarp
@@ -370,9 +256,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           __shared__ unsigned int dpGrpDrained[64];  // arrivals per sub-chunk group
           for (int i = threadLinearId; i < P; i += threadsPerBlock) dpGrpDrained[i] = 0u;
           __syncthreads();
-          // Drain warp d (d in [0,sw)) -> group p = d/g, lane wl = d%g, drains QP
-          // grpBase(p)+wl. All g lanes of a non-empty group participate (an empty
-          // per-lane tile still drains a no-op CQ, so the count always reaches g).
+          // Drain warp d in [0,sw) -> group p=d/g, lane wl=d%g, drains QP grpBase(p)+wl.
           if (warpLead && myWarp < sw) {
             int d = myWarp;
             int p = d / g;
@@ -382,9 +266,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
               __threadfence_system();           // this QP's landed bytes visible
               atomicAdd(&dpGrpDrained[p], 1u);  // signal group arrival
               if (wl == 0) {
-                // Group leader: wait for all g QPs of this group to land, then AMO
-                // the remote flag + spin our own inbound flag + publish. atomicAdd(.,0)
-                // is a well-defined atomic load of the shared arrival counter.
+                // Group leader: wait for all g QPs to land (atomicAdd(.,0) is an atomic
+                // load), then AMO the remote flag + spin our own inbound flag + publish.
                 long long gspin = 0;
                 while (atomicAdd(&dpGrpDrained[p], 0u) < static_cast<unsigned int>(g)) {
                   if (++gspin > 10000000000LL) __builtin_trap();
@@ -395,9 +278,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                 long long spin = 0;
                 while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + p) <
                        static_cast<uint64_t>(1)) {
-                  // Landing fence MUST wait for the group to land; a timeout escape
-                  // that published chunkReadyFlags[p] anyway would allow a stale-read
-                  // (R188-R191). Abort loudly instead of silently corrupting bytes.
+                  // Landing fence MUST wait for the group to land; publishing on a
+                  // timeout would allow a stale read. Abort loudly instead.
                   if (++spin > 10000000000LL) __builtin_trap();
                   if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
                 }
@@ -408,19 +290,11 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
               }
             }
           }
-        }  // end else (P>1 per-group counter join; P==1 uses the block-barrier fast join)
+        }  // end P>1 per-group counter join
       } else if (sw <= warpsPerBlock) {
-        // Wrap parallel drain: P>sw so sub-chunks share QPs (grpBase=p%sw), but the
-        // sw QP groups are disjoint. Give each QP group w in [0,sw) its own merged
-        // leader warp (thread w*warpSize): it walks its sub-chunks p = w, w+sw, ...
-        // in increasing-p order, draining QP w (in-order per QP == landing proof),
-        // AMOing remote flag p, then waiting on its own incoming flag p and
-        // publishing chunkReadyFlags[p]. The sw leaders run concurrently on disjoint
-        // QP groups (disjoint WQ/CQ => no shared-completion race); same drains, AMOs,
-        // and flag slots as the serial path with per-QP completion order preserved.
-        // Send-drain and recv-publish are merged into one leader per group to stay
-        // within warpsPerBlock on wave64. Requires sw<=warpsPerBlock (a leader warp
-        // per QP group); else fall to the serial thread-0 drain below.
+        // Wrap parallel drain (P>sw, sub-chunks share QPs via grpBase=p%sw): each of the sw
+        // disjoint QP groups gets a merged leader walking p=w,w+sw,... in order (in-order
+        // per QP == landing proof). Requires sw<=warpsPerBlock.
         const int myWarp = threadLinearId / warpSize;
         const bool warpLead = (threadLinearId % warpSize) == 0;
         if (warpLead && myWarp < sw) {
@@ -468,16 +342,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
         }
       }
       __syncthreads();
-      // Skip the redundant trailing full-QP re-drain on the parallel deepPipeQuiet
-      // paths. The two parallel branches above give every temporal sub-chunk its own
-      // leader that ShmemQuietThread(nextPeer, qp)-drains its QP group before that
-      // group's AMO, and the union of the groups covers every send QP this op used.
-      // So by the time all P leaders have published chunkReadyFlags, all our send
-      // WQEs have already completed, so the buffer-reuse safety the trailing
-      // ShmemQuietThread(nextPeer) provides is already satisfied; re-draining
-      // already-empty CQs only adds fixed per-op tail latency. Removed on the
-      // parallel paths only; the serial-fallback branch (sw>warpsPerBlock) keeps
-      // the trailing drain unchanged.
+      // Parallel paths already drained every send QP; only the serial fallback needs the
+      // trailing full-QP re-drain for buffer reuse.
       const bool dpParallelDrained =
           (sw >= P && P <= warpsPerBlock) || (sw <= warpsPerBlock);
       if (!dpParallelDrained) {
@@ -493,9 +359,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       if (threadLinearId == 0) __threadfence_system();
       return;
     }
-    // SENDER: warps [0,sw). For each temporal sub-chunk p, warp w sends its
-    // 16B-aligned tile on qpId=w. All P sub-chunks ride qpId=w back-to-back (deep
-    // SQ) so p's data lands before p+1's -- temporal landing order preserved.
+    // SENDER: warp w sends its 16B tile of each sub-chunk p on qpId=w; all P ride
+    // qpId=w back-to-back (deep SQ) so p lands before p+1 -- temporal order preserved.
     if (warpId < sw) {
       for (int p = 0; p < P; ++p) {
         size_t sU, eU;
@@ -517,9 +382,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                                         core::atomicType::AMO_ADD, nextPeer, warpId);
       }
     }
-    // RECEIVER: republish chunkReadyFlags[p] in temporal order so the reassembly
-    // worker can push sub-chunk p while later sub-chunks still cross the NIC.
-    // Spin the flag sum per sub-chunk, then publish.
+    // RECEIVER: publish chunkReadyFlags[p] in temporal order (reassembly can push p while
+    // later sub-chunks still cross the NIC).
     if (threadLinearId == 0) {
       for (int p = 0; p < P; ++p) {
         int active = activeOf(p);
@@ -537,15 +401,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       }
     }
     __syncthreads();
-    // Overlap the buffer-reuse send-QP drain (thread 0) with the recv flag-slot
-    // reset (threads>0) under one trailing block barrier. The two touch disjoint
-    // state: thread 0 drains only its local send CQs (ShmemQuietThread(nextPeer),
-    // buffer-reuse safety), while threads>0 zero flagsArray[flagBase+idx] which no
-    // reader reads after the __syncthreads above (chunkReadyFlags were already
-    // published there). The entry barrier in prepare orders every PE's reset before
-    // any peer's next-op AMO, so the reset is safe; the single trailing join
-    // guarantees both the drain and the reset finish before the fence/return. Same
-    // QP drains and flag zeroing as the separate-barrier path, with one fewer join.
+    // Trailing barrier: the recv flag-slot reset (threads>0) is ordered before any peer's
+    // next-op AMO by the entry barrier in prepare.
     for (int idx = threadLinearId; idx < P; idx += threadsPerBlock) {
       flagsArray[flagBase + idx] = 0;
     }
@@ -556,7 +413,6 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     if (threadLinearId == 0) __threadfence_system();
     return;
   }
-  // ==========================================================================
 
   for (int i = 0; i < maxRounds; i++) {
     // Chunk slots are indexed by ring position, not global PE.
@@ -566,12 +422,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     size_t chunkBaseOffset = static_cast<size_t>(sendDataRank) * peChunkSize;
 
     if (multiBlockWrite) {
-      // MULTI-BLOCK WRITE-PUSH + SEND-CQ landing fence. Warp 0 pushes THIS
-      // channel's sub-range [blkOff,blkBytes) of my chunk (chunkBaseOffset) to
-      // nextPeer on qpId=bid as ONE fused put-with-signal: the data WRITE and the
-      // flag AMO_ADD(1) ride the SAME QP, RC-ordered, so on the responder the sub-
-      // range is globally visible BEFORE its own +1 fires -- the receiver's per-
-      // channel flag can never beat the data (bit-exact by construction).
+      // Warp 0 pushes this channel's sub-range as ONE fused put-with-signal (see the
+      // multiBlockWrite landing fence above).
       if (warpId == 0 && blkBytes > 0) {
         size_t subOff = chunkBaseOffset + blkOff;
         shmem::ShmemPutMemNbiSignalWarp(memObj, subOff, memObj, subOff, blkBytes, flagsObj,
@@ -579,15 +431,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                                         core::atomicType::AMO_ADD, nextPeer, bid);
       }
       __syncthreads();
-      // No explicit send-CQ quiet. The fused put-signal already carries the flag
-      // AMO as the last WQE on qpId=bid strictly AFTER the data WRITE (RC in-
-      // order), so the receiver observing the per-channel flag is already
-      // guaranteed the sub-range has landed globally -- an explicit
-      // ShmemQuietThread(nextPeer,bid) here would only stall the channel until its
-      // send CQ empties. Receiver: spin THIS channel's inbound flag (peer's CTA
-      // bid bumped slot recvDataRank via its fused signal); system acquire + fence
-      // makes the landed sub-range coherently visible to this GPU's CUs. The post-
-      // loop chunkReadyFlags[bid] publish then releases the reassembly reader.
+      // No explicit send-CQ quiet needed (fused signal's flag implies landing). Receiver
+      // spins this channel's inbound flag; system acquire + fence make it visible.
       if (threadLinearId == warpSize && blkBytes > 0) {
         int spinCount = 0;
         while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + recvDataRank) < 1) {
@@ -598,38 +443,21 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
       __syncthreads();
       continue;
     }
-    // Single-warp per ring round: the same-node neighbour path of
-    // ShmemPutMemNbiWarp lowers to one anvil SDMA queue per (src,dst) pair. All
-    // warps would target the same nextPeer chunk region, so splitting the put
-    // across warps hammers ONE SDMA queue and overflows its retry budget (anvil
-    // "submitPacket: Retry limit exceeded"). Multi-warp puts only help when each
-    // warp drives a distinct queue/QP (as the intra SDMA gather does, one warp per
-    // peer); a single-peer ring round has one queue, so a single warp is correct.
-    //
-    // Fan-out (numQp>1) is the alternative for the all-RDMA sub-group ring: a
-    // single warp on a single QP underfills the NIC (the transport provisions
-    // numQpPerPe QPs/peer). Fanning the chunk across QPs
-    // (warp w -> disjoint 16B-aligned sub-range on qpId=w) drives multiple QPs in
-    // parallel. Correctness gate: the flag bump below must follow a quiet that
-    // drains ALL used QPs. Gated on numQp>1 only for the all-RDMA sub-group ring;
-    // the flat single-node ring (P2P, one anvil queue) stays single-warp.
+    // Same-node round stays single-warp (one anvil queue per (src,dst)); an RDMA
+    // neighbour fans across QPs (warp w -> qpId=w), the flag bump gated on a quiet
+    // draining ALL used QPs.
     auto putDeep = [&](size_t off, size_t bytes, int qp) {
       shmem::ShmemPutMemNbiWarp(memObj, off, memObj, off, bytes, nextPeer, qp);
     };
     if (multiBlock) {
-      // RCCL-style channel: this CTA puts only its sub-range [blkOff, blkOff+
-      // blkBytes) of the chunk, on qpId=bid (a distinct QP per channel). Warp 0
-      // issues; the union of all CTAs' sub-ranges tiles the chunk exactly =>
-      // byte-identical result.
+      // RCCL-style channel: this CTA puts only its sub-range on qpId=bid.
       if (warpId == 0 && blkBytes > 0) {
         size_t subOff = chunkBaseOffset + blkOff;
         putDeep(subOff, blkBytes, bid);
       }
     } else if (fanOut) {
-      // Split the chunk into ``useWarps`` disjoint 16B-aligned sub-ranges; warp
-      // w drives its sub-range on qpId=w. The union tiles the chunk exactly (the
-      // last warp absorbs the unaligned tail), so the byte image is identical to
-      // a single whole-chunk put -- only the QP fan-out differs.
+      // Split the chunk into useWarps disjoint 16B-aligned sub-ranges (last warp absorbs
+      // the tail), warp w on qpId=w.
       if (warpId < useWarps) {
         const size_t kAlign = 16;
         size_t nUnits = (peChunkSize + kAlign - 1) / kAlign;  // # of 16B units
@@ -645,48 +473,28 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           putDeep(subOff, subEnd - subStart, warpId);
         }
       }
-      // All fan-out warps must finish ISSUING their puts before thread 0 drains
-      // the QPs and bumps the flag, else the receiver's flag could fire before a
-      // tail QP's data lands. (Only added on the fan-out path -- the single-warp
-      // path keeps the  thread schedule unchanged.)
+      // All fan-out warps must finish issuing before thread 0 drains the QPs and bumps
+      // the flag, else the receiver's flag could fire before a tail QP's data lands.
       __syncthreads();
     } else if (warpId == 0) {
       putDeep(chunkBaseOffset, peChunkSize, 0);
     }
 
-    // Outbound drain (quiet + flag bump to nextPeer) and inbound recv-flag wait
-    // (from prevPeer) are on independent network directions; run them on two
-    // threads so their latencies overlap, closed by a single trailing __syncthreads.
-    // Round-level pipelining is impossible: round i+1 sends sendDataRank =
-    // (ringPos-i-1) == the recvDataRank of round i (you forward exactly what you
-    // just got), a hard data dependency.
+    // Round-level pipelining is impossible: round i+1 forwards exactly what round i
+    // received (hard data dependency).
     if (threadLinearId == 0) {
-      // Drain the outbound put before bumping the receiver's flag. On the
-      // fan-out path the put used numQp RDMA QPs, so we must quiet ALL of them:
-      // ShmemQuietThread(pe) (RDMA) loops qpId 0..numQpPerPe-1. The single-warp
-      // path keeps the original SDMA/P2P-typed quiet (memObj overload).
+      // Drain the outbound put before bumping the receiver's flag.
       if (multiBlock) {
-        // This CTA put on exactly qpId=bid; drain ONLY that QP. Draining ALL QPs
-        // (ShmemQuietThread(pe)) from every block would poll the same completion
-        // queues concurrently across CTAs and race. Per-QP quiet keeps each
-        // channel independent (RCCL-style), and this block bumps only its own
-        // flag region, so the receiver's per-block flag fires only after THIS
-        // block's data has landed.
+        // Drain ONLY qpId=bid: draining all QPs from every block would poll the same CQs
+        // concurrently across CTAs and race (per-QP quiet keeps channels independent).
         shmem::ShmemQuietThread(nextPeer, bid);
       } else if (fanOut) {
-        // Fan-out issued from numQp QPs within ONE block; ShmemQuietThread(pe)
-        // drains ALL QPs so the receiver's flag never fires before a tail QP's
-        // data lands.
+        // Fan-out used numQp QPs; drain ALL so the flag never fires before a tail lands.
         shmem::ShmemQuietThread(nextPeer);
       } else if (peerIsRdma) {
-        // CORRECTNESS (flag-beats-data): a cross-node (RDMA) neighbour's put
-        // rode an RDMA QP, but the SDMA-typed memObj quiet drains only the
-        // P2P/SDMA path, not the RDMA send-queue completion -- the flag AMO
-        // below could land (RC-ordered on its own QP) before the data PUT has
-        // drained, letting the receiver read stale remote-half bytes. Use the
-        // transport-aware quiet (RDMA -> all numQpPerPe QPs) so the put fully
-        // drains before the flag fires; on-device, no host sync. Mirrors the
-        // fan-out path's RDMA quiet.
+        // CORRECTNESS (flag-beats-data): the SDMA-typed memObj quiet drains only the
+        // P2P/SDMA path, so an RDMA neighbour's flag AMO could land before its data PUT
+        // drains => stale bytes. Use the transport-aware quiet (RDMA -> all QPs).
         shmem::ShmemQuietThread(nextPeer);
       } else {
         shmem::ShmemQuietThread(nextPeer, memObj);
@@ -695,24 +503,14 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                                                      (flagBase + sendDataRank) * sizeof(uint64_t),
                                                      1, core::atomicType::AMO_ADD, nextPeer);
     } else if (threadLinearId == warpSize) {
-      // Each round the sender increments a DISTINCT flag slot (index
-      // recvDataRank = sendDataRank on the receiver), so every slot is
-      // incremented exactly once over the ringSize-1 rounds -- 0 -> 1.
-      // Wait for THIS round's slot to become nonzero (per-slot, not a cumulative count).
       int spinCount = 0;
-      // SYSTEM-scope acquire: the flag is bumped by a REMOTE peer's RDMA AMO and
-      // the chunk it guards is landed by that peer's RDMA put -- both cross-agent
-      // writes. A RELAXED load establishes NO happens-before with those data
-      // writes, so observing the flag does NOT make the received chunk coherently
-      // visible to this GPU's subsequent forward-put / copy-OUT -> the RDMA (remote)
-      // half of the output reads STALE bytes under FSDP tight overlap. A
-      // system-scope acquire + system threadfence makes the peer's prior data
-      // writes visible without a host sync -- mirrors the intra SDMA gather's
-      // AtomicLoadSeqCstSystem + __threadfence_system receiver pattern.
-      // The sender adds exactly +1 to this round's slot.
+      // SYSTEM-scope acquire: flag and chunk are both written by a REMOTE peer's RDMA; a
+      // relaxed load establishes no happens-before, so the chunk would not be coherently
+      // visible to this GPU's forward-put/copy-OUT (stale bytes under FSDP overlap).
+      // Acquire + system fence make the peer's data visible without a host sync.
       while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + recvDataRank) < 1) {
         spinCount++;
-        if (spinCount > 10000000) {  // Increased timeout threshold
+        if (spinCount > 10000000) {
           break;
         }
       }
@@ -721,21 +519,15 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     __syncthreads();
   }
 
-  // Per-chunk landing publish. After the round loop this block's inbound
-  // sub-range (channel ``bid``) is fully landed AND made visible to this GPU by
-  // the receiver's __threadfence_system inside the loop. Publish the ready flag so
-  // a concurrent reassembly block can start pushing exactly this sub-range over
-  // XGMI without waiting for the whole ring / a global finish barrier. The store
-  // is system-scoped and preceded by a fence so the reassembly reader observes the
-  // landed bytes coherently. INERT when chunkReadyFlags==nullptr (every existing
-  // caller) so the standalone ring stays byte-for-byte identical.
+  // Per-chunk landing publish: fenced system-scoped store so a concurrent reassembly block
+  // can push this landed sub-range over XGMI without a global finish barrier. INERT when
+  // chunkReadyFlags==nullptr (standalone ring byte-for-byte identical).
   if (chunkReadyFlags != nullptr && threadLinearId == 0) {
     __threadfence_system();
     core::AtomicStoreSeqCstSystem(chunkReadyFlags + bid,
                                   static_cast<uint64_t>(1));
   }
-  // Each block resets ONLY its own flag region [flagBase, flagBase+ringSize) so
-  // concurrent channels never race (single-block: flagBase=0, ringSize slots).
+  // Each block resets ONLY its own flag region so concurrent channels never race.
   for (int idx = threadLinearId; idx < ringSize; idx += threadsPerBlock) {
     flagsArray[flagBase + idx] = 0;
   }
@@ -757,23 +549,15 @@ inline __device__ void AllGatherRingKernelBody(int myPe, int npes,
 template <typename T>
 __global__ void AllGatherRingKernel(int myPe, int npes, const application::SymmMemObjPtr memObj,
                                     const application::SymmMemObjPtr flagsObj) {
-  // Existing executor path: chunk size derived from the (exactly npes*chunk)
-  // buffer. Equal-sized chunks, so size/npes is exact.
+  // Executor path: equal-sized chunks, so size/npes is exact.
   AllGatherRingKernelBody(myPe, npes, memObj, flagsObj, memObj->size / npes);
 }
 
 }  // namespace collective
 }  // namespace mori
-// ============================================================================
-// Direct-land coherence note. Direct-land (the NIC writing straight into the output
-// tensor) can leave the SDMA reassembly read stale: the blocker is SDMA-read coherence
-// of the NIC-written output tensor, not a landing/ordering race. Fusing the flag AMO
-// onto the same RC QP as the data write (so the flag executes remotely strictly after
-// the payload lands in remote HBM) does not fix it, which shows the payload is already
-// in remote HBM before the flag is observed. The residual staleness is the copy
-// engine's read of the self-slot: the default path reads the ring buffer (fine-grained
-// RDMA scratch, SDMA-read-coherent with the NIC write) and is correct, whereas direct-land
-// reads the coarse-grained cached output tensor, whose line the NIC write does not
-// invalidate for the copy engine. A fix would land the RDMA into fine-grained coherent
-// staging that the SDMA reassembly read snoops.
-// ============================================================================
+// Direct-land coherence note: the NIC writing straight into the output tensor leaves the
+// SDMA reassembly read stale -- not a landing/ordering race (fusing the flag onto the data
+// QP does not fix it) but SDMA-read coherence of the coarse-grained cached output tensor,
+// whose line the NIC write does not invalidate for the copy engine. The default path reads
+// the fine-grained RDMA ring buffer (SDMA-read-coherent) and is correct; a fix would land
+// RDMA into fine-grained coherent staging.

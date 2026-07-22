@@ -32,38 +32,13 @@
 namespace mori {
 namespace application {
 
-/* ---------------------------------------------------------------------------
- *  PeerCapabilities — per-peer transport capability discovery
- *
- *  Describes WHICH transports are physically available to reach a given peer,
- *  taking into account hardware topology + env-var snapshots. Decoupled from
- *  the policy "which one do we actually use" (`transportTypes` below applies
- *  a default policy to derive a single TransportType from these caps).
- *
- *  - `transportTypes[i]` (legacy single-value field) is the historical
- *    "Context picked one for you" interface, kept for SHMEM compatibility.
- *  - `peerCaps[i]` is the new capability set, intended for CCO and other
- *    consumers that want to make their own policy decisions (e.g. CCO's
- *    gdaConnectionType chooses whether intra-node peers also get NIC QPs).
- * --------------------------------------------------------------------------- */
+// PeerCapabilities — transports physically available to reach a peer.
+// Capability only, no policy: transportTypes[] below applies the default policy
+// to pick one; peerCaps[] lets CCO apply its own (e.g. NIC QPs to intra-node
+// peers).
 struct PeerCapabilities {
-  // Objective hardware/topology facts only. NO policy / env-var influence.
-  // Env vars MORI_DISABLE_P2P / MORI_ENABLE_SDMA flip *policy* (which
-  // transport gets picked); they do not change capability — the hardware can
-  // still do P2P even if env var disables it. Use the policy layer
-  // (DefaultPolicyResolve or CCO's resolver) to combine cap + env intent.
-  //
-  // CURRENT LIMITATIONS:
-  //  * canP2P/canSDMA are conservative — both default to `sameHost`. mori
-  //    has no real hardware probe for either (we assume HIP peer access is
-  //    always enabled, and anvil has no IsSupported() API). True capability
-  //    is determined when anvil queues / hipDeviceEnablePeerAccess actually
-  //    get invoked, which happens later in EnsureSdmaTransport() / window
-  //    registration. A future probe-based check would refine these bits
-  //    without changing the public API.
-  //  * canRDMA is true whenever a NIC was selected for this Context, even
-  //    for same-host peers. This lets future FULL-style policies allocate
-  //    NIC QPs to intra-node peers (NIC loopback for uniform addressing).
+  // canP2P/canSDMA are conservative (default sameHost, no hardware probe).
+  // canRDMA is set whenever a NIC was selected, even same-host (NIC loopback).
   bool sameHost{false};     // peer is on the same physical node
   bool sameProcess{false};  // peer is in the same OS process (loopback IPC ok)
   bool canP2P{false};       // intra-node GPU peer access *likely* reachable
@@ -81,17 +56,13 @@ class Context {
   int LocalRankInNode() const { return rankInNode; }
   const std::string& HostName() const { return myHostname; }
 
-  // Single-value transport selection driven by Context's default policy
-  // (intra-node P2P > SDMA > cross-node RDMA). Kept stable so SHMEM's
-  // device-side DISPATCH_TRANSPORT_TYPE macro continues to work unchanged.
+  // Single-value selection via default policy (P2P > SDMA > RDMA). Stable for
+  // SHMEM's device-side DISPATCH_TRANSPORT_TYPE macro.
   TransportType GetTransportType(int destRank) const { return transportTypes[destRank]; }
   const std::vector<TransportType>& GetTransportTypes() const { return transportTypes; }
   int GetNumQpPerPe() const { return numQpPerPe; }
 
-  // Capability-level query: reveals all transports physically available to
-  // reach the peer, without baking any policy choice. Use this when you need
-  // to apply a custom policy (e.g. CCO's gdaConnectionType FULL forces NIC
-  // QPs to intra-node peers even though canP2P is also true).
+  // All transports physically available to the peer, no policy baked in.
   const PeerCapabilities& GetPeerCapabilities(int destRank) const { return peerCaps[destRank]; }
   const std::vector<PeerCapabilities>& GetAllPeerCapabilities() const { return peerCaps; }
 
@@ -99,55 +70,32 @@ class Context {
   RdmaDeviceContext* GetRdmaDeviceContext() const { return rdmaDeviceContext.get(); }
   bool RdmaTransportEnabled() const { return GetRdmaDeviceContext() != nullptr; }
 
-  // Check if P2P connection is possible with a peer (same node)
   bool CanUseP2P(int destRank) const;
-  // Check if peer is in the same OS process (enables direct pointer access, skip IPC handle)
+  // Same OS process: enables direct pointer access, skips IPC handle.
   bool SameProcessP2P(int destRank) const;
 
-  // Cached env-var snapshot taken at construction time. All later code MUST
-  // consult these (not getenv) so that env-var changes after Context init
-  // cannot create an inconsistent state -- e.g. transport selected one way
-  // at init but SymmMemManager::Malloc later switching to uncached
-  // hipExtMallocWithFlags allocations because someone set MORI_ENABLE_SDMA
-  // in a test function after the workers had already been spawned.
+  // Env-var snapshot taken at construction; all later code MUST consult these
+  // (not getenv) so post-init env changes can't create an inconsistent state.
   bool IsSdmaEnabled() const { return sdmaEnabled; }
   bool IsP2PDisabled() const { return p2pDisabled; }
 
-  // Returns the initial RDMA endpoint set. Empty until BuildInitialEndpoints()
-  // has been called. SHMEM consumes this set; CCO does not (it creates its own
-  // per-DevComm sets via CreateAdditionalEndpoints).
+  // Initial RDMA endpoint set; empty until BuildInitialEndpoints(). Consumed by
+  // SHMEM; CCO builds its own via CreateAdditionalEndpoints.
   const std::vector<RdmaEndpoint>& GetRdmaEndpoints() const { return rdmaEps; }
 
-  // Build and connect the initial RDMA endpoint set sized worldSize×numQpPerPe.
-  // Idempotent: safe to call multiple times, second+ calls are no-ops.
-  //
-  // This is a collective operation: all ranks must call it together. It runs
-  // one AllToAll to exchange QP handles plus per-peer RTR/RTS transitions, so
-  // it's heavy. Modules that don't need the initial set (e.g. CCO) can skip
-  // this entirely and only use CreateAdditionalEndpoints later.
-  //
-  // Side effects: also applies Context's default policy to populate the
-  // transportTypes[] vector (consumed by GetTransportType[s]) and lazily
-  // initializes the SDMA queues if any peer was resolved to SDMA.
+  // Build+connect the initial worldSize×numQpPerPe endpoint set. Idempotent.
+  // Collective: all ranks must call together (one AllToAll + per-peer RTR/RTS).
+  // Side effect: applies the default policy to populate transportTypes[] and
+  // lazily inits SDMA queues for any SDMA-resolved peer.
   void BuildInitialEndpoints();
 
-  // Idempotent setup of anvil SDMA queues for all canSDMA peers. Useful when
-  // SHMEM-style "BuildInitialEndpoints does it for me" is not in play — e.g.
-  // CCO chooses SDMA per-DevComm and needs the queues materialized on demand.
-  // No-op if already set up, or if no peer has canSDMA capability.
+  // Idempotent setup of anvil SDMA queues for all canSDMA peers (on-demand path
+  // for CCO). No-op if already done or no peer has canSDMA.
   void EnsureSdmaTransport();
 
-  // Create a new independent set of QP endpoints. `peerMask[i] == true` means
-  // peer i gets `numQpPerPe` real QPs; `false` peers get empty stub slots so
-  // the returned vector is always worldSize×numQpPerPe long. peerMask is the
-  // single source of truth for "which peers do I want to talk to over RDMA":
-  // callers (CCO) compute it based on their connection policy
-  // (CROSSNODE / FULL / RAIL / …).
-  //
-  // Defaults to "no peers" if peerMask is empty — but this rarely makes sense;
-  // pass it explicitly. Self-peer (i == LocalRank()) and peers with
-  // peerCaps[i].canRDMA == false are silently skipped even when mask[i] is true,
-  // so callers don't have to repeat those checks.
+  // New independent QP set. peerMask[i] selects which peers get numQpPerPe real
+  // QPs; others get empty stubs so the vector is always worldSize×numQpPerPe.
+  // Self and peers with canRDMA==false are silently skipped even when masked.
   std::vector<RdmaEndpoint> CreateAdditionalEndpoints(int numQpPerPe,
                                                       const std::vector<bool>& peerMask);
 
@@ -162,15 +110,13 @@ class Context {
                                            // + SDMA queues
   void BuildAndConnectInitialEndpoints();  // heavyweight: build initial QP set + AllToAll + connect
 
-  // Apply Context's built-in policy to derive a single TransportType from a
-  // PeerCapabilities entry. Preference: P2P > SDMA > RDMA. Self always P2P.
-  // Aborts (assert) if no transport is available, matching legacy behavior
-  // expected by SHMEM init.
+  // Derive a single TransportType from caps: P2P > SDMA > RDMA; self always P2P.
+  // Aborts if none available (legacy SHMEM-init behavior).
   TransportType DefaultPolicyResolve(const PeerCapabilities& cap, bool isSelf) const;
 
   struct PeerInfo {
-    // True if peer is on this rank's physical node. Keyed on node identity, not
-    // raw hostname, so it holds even when all machines share one hostname.
+    // True if peer is on this rank's physical node; keyed on node identity, not
+    // raw hostname, so it holds when machines share a hostname.
     bool sameHost{false};
     bool sameProcess{false};  // in the same OS process (same pid + same host)
   };
@@ -179,12 +125,11 @@ class Context {
   BootstrapNetwork& bootNet;
   int rankInNode{-1};
   int numQpPerPe{4};
-  // Snapshotted at construction; see IsSdmaEnabled() / IsP2PDisabled() above.
   bool sdmaEnabled{false};
   bool p2pDisabled{false};
   std::string myHostname;
   std::vector<PeerInfo> peerInfos;
-  std::vector<PeerCapabilities> peerCaps;     // raw capability discovery
+  std::vector<PeerCapabilities> peerCaps;
   std::vector<TransportType> transportTypes;  // derived via DefaultPolicyResolve
 
   std::unique_ptr<RdmaContext> rdmaContext{nullptr};
