@@ -58,7 +58,7 @@ HcaCapability QueryHcaCap(ibv_context* context);
 // TODO: refactor Mlx5CqContainer so its structure is similar to Mlx5QpContainer
 class Mlx5CqContainer {
  public:
-  Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig& config, bool collapsed = true);
+  Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig& config);
   ~Mlx5CqContainer();
 
  public:
