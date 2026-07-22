@@ -189,32 +189,19 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
   chunkBytes = ((chunkBytes + align - 1) / align) * align;
   if (chunkBytes == 0) chunkBytes = bytesPerPeer;
 
-  const int numWarps =
-      static_cast<int>((static_cast<size_t>(blockDim.x) + warpSize - 1) / warpSize);
   // Flat multi-warp broadcast (fencedFlag bit9, small-message regime): each PE self-
   // fills slot g then broadcasts to all G-1 peers, one submitter warp per dest engine.
   // Counter: G-1 senders +1 => want=(flagVal-1)*(G-1)+(G-1). Default OFF.
   const bool flatMW = ((fencedFlag & 512) != 0) && (G > 1);
-  // Fused self-fill (fencedFlag bit10): fold the self-copy into the broadcast doorbell
-  // fan -- warp t copies slot g to PE t (t==g => local) and ADD64s +1. G writers =>
-  // want=(flagVal-1)*G+G. Requires flatMW. Default OFF.
-  const bool fuseSelf = flatMW && ((fencedFlag & 1024) != 0);
   // Batch self-fill (fencedFlag bit11): submit all C self-chunks then one trailing quiet
-  // (still drained+fenced before return). Requires flatMW, excl. fuseSelf. Default OFF.
-  const bool batchSelf = flatMW && !fuseSelf && ((fencedFlag & 2048) != 0);
-  // Overlap self-fill (fencedFlag bit12): run the self-fill on the free warp (G-1)
-  // concurrently with the broadcast, drain+fence deferred to after the broadcast barrier.
-  // Requires flatMW, excl. fuseSelf/batchSelf, needs warp (G-1). Default OFF.
-  const bool overlapSelf =
-      flatMW && !fuseSelf && !batchSelf && ((fencedFlag & 4096) != 0) && ((G - 1) < numWarps);
+  // (still drained+fenced before return). Requires flatMW. Default OFF.
+  const bool batchSelf = flatMW && ((fencedFlag & 2048) != 0);
   if (flatMW) {
     const uint64_t fWant =
         (flagVal - 1) * static_cast<uint64_t>(G - 1) + static_cast<uint64_t>(G - 1);
-    // (1) self-fill my own slot g from input (drained), one fence.
-    //     overlapSelf: run on the free warp (G-1), submit only (drain+fence deferred to step 3a)
-    //     so it overlaps the broadcast; else run on warp0 as a serial front (batchSelf/plain).
-    const int selfWarp = overlapSelf ? (G - 1) : 0;
-    if (warpId == selfWarp && laneId == 0) {
+    // (1) self-fill my own slot g from input on warp0 as a serial front, then batch-drain
+    //     after all C chunks (one trailing quiet + fence before return).
+    if (warpId == 0 && laneId == 0) {
       anvil::SdmaQueueDeviceHandle** selfHandles = dest->deviceHandles_d + myPe * nq;
       HSAuint64* selfSignals = dest->signalPtrs + myPe * nq;
       HSAuint64* selfExpected = dest->expectSignalsPtr + myPe * nq;
@@ -226,19 +213,13 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
         uint8_t* selfSlotP = selfDstBase + static_cast<size_t>(g) * slotStride + off;
         core::SdmaPutThread(reinterpret_cast<uint8_t*>(input) + off, selfSlotP, len, selfHandles,
                             selfSignals, selfExpected, nq, 0);
-        // batchSelf and overlapSelf both defer the drain; the plain path drains per chunk.
-        if (!batchSelf && !overlapSelf) core::SdmaQueitThread(selfSignals + 0, selfExpected + 0, 1);
       }
-      if (batchSelf) {
-        core::SdmaQueitThread(selfSignals + 0, selfExpected + 0, 1);
-        __threadfence_system();
-      } else if (!overlapSelf) {
-        __threadfence_system();
-      }
-      // overlapSelf: NO drain/fence here -- deferred to step (3a) so self overlaps the broadcast.
+      // batchSelf: all C self-chunks submitted; one trailing quiet + fence before return.
+      core::SdmaQueitThread(selfSignals + 0, selfExpected + 0, 1);
+      __threadfence_system();
     }
-    // Only the serial-front paths gate the broadcast on self-fill; overlapSelf does not.
-    if (!overlapSelf) __syncthreads();
+    // Gate the broadcast on the self-fill completing.
+    __syncthreads();
     // (2) warp t (t in [0,G-1)) broadcasts my owned slot to the t-th OTHER PE (skip self g).
     //     Each dest is a distinct engine; all G-1 doorbells fire near-simultaneously.
     if (warpId < G - 1 && laneId == 0) {
@@ -261,13 +242,6 @@ __device__ void OneShotAllGatherSdmaSubGroupRingKernel_body(
       }
     }
     __syncthreads();
-    // (3a) overlapSelf: drain the deferred self-fill now -- it ran concurrently with the
-    //      broadcast on the free warp; wait it here so the self slot is landed before the fence.
-    if (overlapSelf && warpId == selfWarp && laneId == 0) {
-      HSAuint64* selfSignals = dest->signalPtrs + myPe * nq;
-      HSAuint64* selfExpected = dest->expectSignalsPtr + myPe * nq;
-      core::SdmaQueitThread(selfSignals + 0, selfExpected + 0, 1);
-    }
     // (3) single completion barrier: my slot region filled by all G-1 senders.
     for (int c = static_cast<int>(threadIdx.x); c < C; c += static_cast<int>(blockDim.x)) {
       if (static_cast<size_t>(c) * chunkBytes >= bytesPerPeer) continue;
