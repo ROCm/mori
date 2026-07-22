@@ -10,25 +10,6 @@ enum TierType {
   TIER_SSD = 3;
 }
 
-message Empty {}
-
-message ReportExternalKvBlocksRequest {
-  string worker_id = 1;
-  repeated string hashes = 2;
-  TierType tier = 3;
-}
-
-message RevokeExternalKvBlocksRequest {
-  string worker_id = 1;
-  repeated string hashes = 2;
-  TierType tier = 3;
-}
-
-message RevokeAllExternalKvBlocksAtTierRequest {
-  string worker_id = 1;
-  TierType tier = 2;
-}
-
 message MatchExternalKvRequest {
   // MVP semantics: these are block-level hashes to match against placement
   // metadata. The indexer returns block placement matches and does not compute
@@ -40,14 +21,13 @@ message MatchExternalKvRequest {
   bool count_as_hit = 2;
 }
 
-// The kind of mutation a single ExternalKvAction carries. Mirrors the three
-// legacy single-mutation RPCs so a whole SGLang KVEventBatch can be applied in
-// one call while preserving the exact per-action ordering.
+// The kind of mutation a single ExternalKvAction carries. A whole SGLang
+// KVEventBatch is applied in one call while preserving exact action order.
 enum ExternalKvActionType {
   ACTION_UNKNOWN = 0;
-  ACTION_REPORT = 1;             // like ReportExternalKvBlocks
-  ACTION_REVOKE = 2;             // like RevokeExternalKvBlocks
-  ACTION_CLEAR_ALL_AT_TIER = 3;  // like RevokeAllExternalKvBlocksAtTier
+  ACTION_REPORT = 1;
+  ACTION_REVOKE = 2;
+  ACTION_CLEAR_ALL_AT_TIER = 3;
 }
 
 message ExternalKvAction {
@@ -64,8 +44,8 @@ message ApplyExternalKvBatchRequest {
   uint64 seq = 2;
   repeated ExternalKvAction actions = 3;
   // The worker's KV-transfer address, used to populate MatchExternalKvResponse.
-  // Supplied by the bridge; may be empty (e.g. legacy callers that never set it),
-  // in which case matches for this worker carry an empty address.
+  // Supplied by the bridge; may be empty, in which case matches for this worker
+  // carry an empty address.
   string worker_address = 4;
 }
 
@@ -102,13 +82,9 @@ message GetExternalKvHitCountsResponse {
 }
 
 service KVIndexer {
-  rpc ReportExternalKvBlocks(ReportExternalKvBlocksRequest) returns (Empty);
-  rpc RevokeExternalKvBlocks(RevokeExternalKvBlocksRequest) returns (Empty);
-  rpc RevokeAllExternalKvBlocksAtTier(RevokeAllExternalKvBlocksAtTierRequest) returns (Empty);
+  // The sole mutation API: applies an ordered SGLang KVEventBatch.
+  rpc ApplyExternalKvBatch(ApplyExternalKvBatchRequest) returns (ApplyExternalKvBatchResponse);
+
   rpc MatchExternalKv(MatchExternalKvRequest) returns (MatchExternalKvResponse);
   rpc GetExternalKvHitCounts(GetExternalKvHitCountsRequest) returns (GetExternalKvHitCountsResponse);
-
-  // Applies a whole SGLang KVEventBatch in one call. Preferred over the three
-  // single-mutation RPCs above, which are kept for backward compatibility.
-  rpc ApplyExternalKvBatch(ApplyExternalKvBatchRequest) returns (ApplyExternalKvBatchResponse);
 }

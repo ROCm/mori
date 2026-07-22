@@ -1,4 +1,4 @@
-//! gRPC contract tests: exercise every RPC of the `KVIndexer` service
+//! gRPC contract tests: exercise all three RPCs of the `KVIndexer` service
 //! over the wire (real tonic server + client), not just the backend trait.
 //!
 //! Like the backend integration tests these require a live store and are
@@ -17,8 +17,7 @@ use sglang_kv_indexer::pb::kv_indexer_client::KvIndexerClient;
 use sglang_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
 use sglang_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
-    GetExternalKvHitCountsRequest, MatchExternalKvRequest, ReportExternalKvBlocksRequest,
-    RevokeAllExternalKvBlocksAtTierRequest, RevokeExternalKvBlocksRequest, TierType,
+    GetExternalKvHitCountsRequest, MatchExternalKvRequest, TierType,
 };
 use sglang_kv_indexer::{KvIndexerService, RedisKvIndexerBackend};
 
@@ -30,6 +29,12 @@ fn dram() -> i32 {
 }
 fn report() -> i32 {
     ExternalKvActionType::ActionReport as i32
+}
+fn revoke() -> i32 {
+    ExternalKvActionType::ActionRevoke as i32
+}
+fn clear_all_at_tier() -> i32 {
+    ExternalKvActionType::ActionClearAllAtTier as i32
 }
 
 fn nanos() -> u128 {
@@ -81,22 +86,41 @@ async fn start(test: &str) -> Option<KvIndexerClient<tonic::transport::Channel>>
     panic!("client failed to connect to {endpoint}");
 }
 
-fn apply_report(worker: &str, addr: &str, seq: u64, tier: i32, hashes: &[&str]) -> ApplyExternalKvBatchRequest {
+fn apply(
+    worker: &str,
+    addr: &str,
+    seq: u64,
+    action_type: i32,
+    tier: i32,
+    hashes: &[&str],
+) -> ApplyExternalKvBatchRequest {
     ApplyExternalKvBatchRequest {
         worker_id: worker.to_string(),
         seq,
         worker_address: addr.to_string(),
         actions: vec![ExternalKvAction {
-            r#type: report(),
+            r#type: action_type,
             tier,
             hashes: hashes.iter().map(|s| s.to_string()).collect(),
         }],
     }
 }
 
+fn apply_report(
+    worker: &str,
+    addr: &str,
+    seq: u64,
+    tier: i32,
+    hashes: &[&str],
+) -> ApplyExternalKvBatchRequest {
+    apply(worker, addr, seq, report(), tier, hashes)
+}
+
 #[tokio::test]
 async fn apply_match_and_hit_counts_over_grpc() {
-    let Some(mut c) = start("apply_match").await else { return };
+    let Some(mut c) = start("apply_match").await else {
+        return;
+    };
     let w = format!("w-{}", nanos());
     let (h1, h2, miss) = ("am-h1", "am-h2", "am-miss");
 
@@ -149,7 +173,9 @@ async fn apply_match_and_hit_counts_over_grpc() {
 
 #[tokio::test]
 async fn diagnostic_match_does_not_count_hits_over_grpc() {
-    let Some(mut c) = start("diag_match").await else { return };
+    let Some(mut c) = start("diag_match").await else {
+        return;
+    };
     let w = format!("w-{}", nanos());
     let h = "diag-h1";
     c.apply_external_kv_batch(apply_report(&w, "10.0.0.2:9000", 1, hbm(), &[h]))
@@ -171,70 +197,98 @@ async fn diagnostic_match_does_not_count_hits_over_grpc() {
         .await
         .expect("hit counts ok")
         .into_inner();
-    let count = hc.entries.iter().find(|e| e.hash == h).map(|e| e.hit_count_total).unwrap_or(0);
+    let count = hc
+        .entries
+        .iter()
+        .find(|e| e.hash == h)
+        .map(|e| e.hit_count_total)
+        .unwrap_or(0);
     assert_eq!(count, 0, "diagnostic match must not increase hit count");
 }
 
 #[tokio::test]
-async fn legacy_report_then_revoke_over_grpc() {
-    let Some(mut c) = start("legacy_rr").await else { return };
+async fn apply_report_then_revoke_over_grpc() {
+    let Some(mut c) = start("apply_rr").await else {
+        return;
+    };
     let w = format!("w-{}", nanos());
-    let h = "legacy-h1";
+    let h = "apply-rr-h1";
 
-    c.report_external_kv_blocks(ReportExternalKvBlocksRequest {
-        worker_id: w.clone(),
-        hashes: vec![h.into()],
-        tier: hbm(),
-    })
-    .await
-    .expect("report ok");
+    c.apply_external_kv_batch(apply_report(&w, "10.0.0.3:9000", 1, hbm(), &[h]))
+        .await
+        .expect("report apply ok");
 
     let before = c
-        .match_external_kv(MatchExternalKvRequest { hashes: vec![h.into()], count_as_hit: false })
+        .match_external_kv(MatchExternalKvRequest {
+            hashes: vec![h.into()],
+            count_as_hit: false,
+        })
         .await
         .expect("match ok")
         .into_inner();
-    assert!(before.matches.iter().any(|m| m.worker_id == w), "reported hash should match");
+    assert!(
+        before.matches.iter().any(|m| m.worker_id == w),
+        "reported hash should match"
+    );
 
-    c.revoke_external_kv_blocks(RevokeExternalKvBlocksRequest {
-        worker_id: w.clone(),
-        hashes: vec![h.into()],
-        tier: hbm(),
-    })
-    .await
-    .expect("revoke ok");
+    c.apply_external_kv_batch(apply(&w, "10.0.0.3:9000", 2, revoke(), hbm(), &[h]))
+        .await
+        .expect("revoke apply ok");
 
     let after = c
-        .match_external_kv(MatchExternalKvRequest { hashes: vec![h.into()], count_as_hit: false })
+        .match_external_kv(MatchExternalKvRequest {
+            hashes: vec![h.into()],
+            count_as_hit: false,
+        })
         .await
         .expect("match ok")
         .into_inner();
-    assert!(!after.matches.iter().any(|m| m.worker_id == w), "revoked hash must not match");
+    assert!(
+        !after.matches.iter().any(|m| m.worker_id == w),
+        "revoked hash must not match"
+    );
 }
 
 #[tokio::test]
 async fn revoke_all_at_tier_over_grpc() {
-    let Some(mut c) = start("revoke_all").await else { return };
+    let Some(mut c) = start("revoke_all").await else {
+        return;
+    };
     let w = format!("w-{}", nanos());
     let h = "ra-h1";
 
     // same hash present in both HBM and DRAM
-    c.apply_external_kv_batch(apply_report(&w, "10.0.0.3:9000", 1, hbm(), &[h])).await.expect("apply hbm");
-    c.apply_external_kv_batch(apply_report(&w, "10.0.0.3:9000", 2, dram(), &[h])).await.expect("apply dram");
+    c.apply_external_kv_batch(apply_report(&w, "10.0.0.3:9000", 1, hbm(), &[h]))
+        .await
+        .expect("apply hbm");
+    c.apply_external_kv_batch(apply_report(&w, "10.0.0.3:9000", 2, dram(), &[h]))
+        .await
+        .expect("apply dram");
 
-    c.revoke_all_external_kv_blocks_at_tier(RevokeAllExternalKvBlocksAtTierRequest {
-        worker_id: w.clone(),
-        tier: hbm(),
-    })
+    c.apply_external_kv_batch(apply(
+        &w,
+        "10.0.0.3:9000",
+        3,
+        clear_all_at_tier(),
+        hbm(),
+        &[],
+    ))
     .await
-    .expect("revoke-all ok");
+    .expect("clear-all apply ok");
 
     let resp = c
-        .match_external_kv(MatchExternalKvRequest { hashes: vec![h.into()], count_as_hit: false })
+        .match_external_kv(MatchExternalKvRequest {
+            hashes: vec![h.into()],
+            count_as_hit: false,
+        })
         .await
         .expect("match ok")
         .into_inner();
-    let m = resp.matches.iter().find(|m| m.worker_id == w).expect("worker still present via DRAM");
+    let m = resp
+        .matches
+        .iter()
+        .find(|m| m.worker_id == w)
+        .expect("worker still present via DRAM");
     let tiers: Vec<i32> = m.hashes_by_tier.iter().map(|t| t.tier).collect();
     assert!(tiers.contains(&dram()), "DRAM tier must remain");
     assert!(!tiers.contains(&hbm()), "HBM tier must be cleared");
@@ -242,7 +296,9 @@ async fn revoke_all_at_tier_over_grpc() {
 
 #[tokio::test]
 async fn match_miss_returns_empty_over_grpc() {
-    let Some(mut c) = start("match_miss").await else { return };
+    let Some(mut c) = start("match_miss").await else {
+        return;
+    };
     let resp = c
         .match_external_kv(MatchExternalKvRequest {
             hashes: vec![format!("never-reported-{}", nanos())],
@@ -256,44 +312,61 @@ async fn match_miss_returns_empty_over_grpc() {
 
 #[tokio::test]
 async fn validation_errors_map_to_invalid_argument_over_grpc() {
-    let Some(mut c) = start("validation").await else { return };
+    let Some(mut c) = start("validation").await else {
+        return;
+    };
 
     // empty worker_id
     let err = c
         .apply_external_kv_batch(apply_report("", "addr", 1, hbm(), &["h"]))
         .await
         .expect_err("empty worker_id must be rejected");
-    assert_eq!(err.code(), Code::InvalidArgument, "empty worker_id -> InvalidArgument");
+    assert_eq!(
+        err.code(),
+        Code::InvalidArgument,
+        "empty worker_id -> InvalidArgument"
+    );
 
-    // REPORT with no hashes
+    // REPORT action with no hashes
     let err = c
-        .report_external_kv_blocks(ReportExternalKvBlocksRequest {
-            worker_id: "w".into(),
-            hashes: vec![],
-            tier: hbm(),
-        })
+        .apply_external_kv_batch(apply("w", "addr", 1, report(), hbm(), &[]))
         .await
         .expect_err("empty hashes must be rejected");
-    assert_eq!(err.code(), Code::InvalidArgument, "empty hashes -> InvalidArgument");
+    assert_eq!(
+        err.code(),
+        Code::InvalidArgument,
+        "empty hashes -> InvalidArgument"
+    );
 
     // unknown action type
     let bad = ApplyExternalKvBatchRequest {
         worker_id: "w".into(),
         seq: 1,
         worker_address: String::new(),
-        actions: vec![ExternalKvAction { r#type: 999, tier: hbm(), hashes: vec!["h".into()] }],
-    };
-    let err = c.apply_external_kv_batch(bad).await.expect_err("unknown action type rejected");
-    assert_eq!(err.code(), Code::InvalidArgument, "unknown action type -> InvalidArgument");
-
-    // invalid tier
-    let err = c
-        .report_external_kv_blocks(ReportExternalKvBlocksRequest {
-            worker_id: "w".into(),
+        actions: vec![ExternalKvAction {
+            r#type: 999,
+            tier: hbm(),
             hashes: vec!["h".into()],
-            tier: 999,
-        })
+        }],
+    };
+    let err = c
+        .apply_external_kv_batch(bad)
+        .await
+        .expect_err("unknown action type rejected");
+    assert_eq!(
+        err.code(),
+        Code::InvalidArgument,
+        "unknown action type -> InvalidArgument"
+    );
+
+    // invalid tier in an ApplyBatch action
+    let err = c
+        .apply_external_kv_batch(apply("w", "addr", 1, report(), 999, &["h"]))
         .await
         .expect_err("bad tier rejected");
-    assert_eq!(err.code(), Code::InvalidArgument, "bad tier -> InvalidArgument");
+    assert_eq!(
+        err.code(),
+        Code::InvalidArgument,
+        "bad tier -> InvalidArgument"
+    );
 }

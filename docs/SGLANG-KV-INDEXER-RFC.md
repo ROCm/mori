@@ -87,11 +87,11 @@ Event mapping:
 
 | SGLang event | Indexer operation |
 | --- | --- |
-| `BlockStored(block_hashes, medium)` | `ReportExternalKvBlocks(hashes, tier)` |
-| `BlockRemoved(block_hashes, medium)` | `RevokeExternalKvBlocks(hashes, tier)` |
-| `AllBlocksCleared()` | `RevokeAllExternalKvBlocksAtTier(tier)` for configured tiers |
+| `BlockStored(block_hashes, medium)` | `ACTION_REPORT(hashes, tier)` in `ApplyExternalKvBatch` |
+| `BlockRemoved(block_hashes, medium)` | `ACTION_REVOKE(hashes, tier)` in `ApplyExternalKvBatch` |
+| `AllBlocksCleared()` | `ACTION_CLEAR_ALL_AT_TIER(tier)` in `ApplyExternalKvBatch` for configured tiers |
 
-For multi-worker or DP-rank deployments, the bridge can manage multiple event sources. Each source has its own worker ID, endpoint, topic, and sequence tracking.
+For multi-worker or DP-rank deployments, run one bridge per event source. Each source has its own worker ID, endpoint, topic, and sequence tracking; all bridges share one indexer.
 
 ## Metadata Store
 
@@ -114,9 +114,7 @@ The indexer exposes a small set of metadata update and query APIs. The API opera
 
 | RPC | Purpose |
 | --- | --- |
-| `ReportExternalKvBlocks` | Report that a worker holds hashes at a tier. |
-| `RevokeExternalKvBlocks` | Remove hashes from a worker at a tier. |
-| `RevokeAllExternalKvBlocksAtTier` | Remove all hashes for a worker at a tier. |
+| `ApplyExternalKvBatch` | Apply an ordered batch of report, revoke, and clear-at-tier actions. This is the sole mutation API. |
 | `MatchExternalKv` | Query which workers and tiers hold requested hashes. |
 | `GetExternalKvHitCounts` | Query accumulated hit counts for hashes. |
 
@@ -131,9 +129,7 @@ enum TierType {
 }
 
 service KVIndexer {
-  rpc ReportExternalKvBlocks(worker_id, hashes, tier) returns (Empty);
-  rpc RevokeExternalKvBlocks(worker_id, hashes, tier) returns (Empty);
-  rpc RevokeAllExternalKvBlocksAtTier(worker_id, tier) returns (Empty);
+  rpc ApplyExternalKvBatch(worker_id, seq, actions, worker_address) returns (Empty);
   rpc MatchExternalKv(hashes, count_as_hit) returns (matches);
   rpc GetExternalKvHitCounts(hashes) returns (hit_counts);
 }
