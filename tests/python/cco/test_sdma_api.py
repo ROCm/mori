@@ -285,6 +285,304 @@ def _worker_put_quiet_queue(rank, world_size, uid_path, coop_name, results_path)
         f.write(err or "")
 
 
+def _worker_put_block(rank, world_size, uid_path, coop_name, results_path):
+    """All-to-all via BLOCK-coop SDMA put: the whole block drives the queues.
+
+    Uses a 128-thread (2-warp) block so the block path is genuinely exercised
+    (multi-warp, threadIdx.x-indexed queues) rather than degenerating to a single
+    warp. Every thread must enter put/quiet together; threads beyond the queue
+    count return internally."""
+    err = None
+    try:
+        mods = _worker_imports()
+        flyc, fx, Int64, cco = mods["flyc"], mods["fx"], mods["Int64"], mods["cco"]
+        sync, fill, zero, read = mods["sync"], mods["fill"], mods["zero"], mods["read"]
+        u32 = mods["ctypes"].c_uint32
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+
+        comm = _init_comm(rank, world_size, uid_path)
+        send_off = 0
+        recv_off = NBYTES
+        win_bytes = recv_off + world_size * NBYTES
+
+        mem = comm.alloc_mem(win_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        zero(win.local_ptr, win_bytes)
+        fill(win.local_ptr + send_off, [rank * 1000 + i for i in range(NUM_ELEMS)], u32)
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 8
+        dc = comm.create_dev_comm(reqs)
+
+        my_rank = rank
+        block_threads = 128  # 2 warps, > warpSize, to exercise the block path
+
+        @flyc.kernel(known_block_size=[block_threads, 1, 1])
+        def put_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            # BLOCK coop: all threads participate (no gating); each put/quiet is
+            # a block-collective op internally distributing across the queues.
+            for p in range(world_size):
+                if p != my_rank:
+                    sdma.put(
+                        p,
+                        w,
+                        recv_off + my_rank * NBYTES,
+                        w,
+                        send_off,
+                        NBYTES,
+                        0,
+                        coop=cco.CoopScope.BLOCK,
+                    )
+            for p in range(world_size):
+                if p != my_rank:
+                    sdma.quiet(p, coop=cco.CoopScope.BLOCK)
+
+        @flyc.jit
+        def run(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            put_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[block_threads, 1, 1], stream=stream
+            )
+
+        comm.barrier()
+        run(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+
+        for s in range(world_size):
+            if s == my_rank:
+                continue
+            got = read(win.local_ptr + recv_off + s * NBYTES, NUM_ELEMS, u32)
+            for i in (0, NUM_ELEMS // 2, NUM_ELEMS - 1):
+                exp = s * 1000 + i
+                if got[i] != exp:
+                    raise AssertionError(
+                        f"rank {my_rank} recv[{s}][{i}]={got[i]} expected {exp}"
+                    )
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
+def _worker_put_nosignal(rank, world_size, uid_path, coop_name, results_path):
+    """No-signal (fire-and-forget) put, drained via a trailing signaled put.
+
+    Each transfer is sent in two halves on the SAME queue 0: the first half with
+    signal=False (no completion atomic), the second with signal=True. Because the
+    queue is in-order, draining the second half with quiet_queue(peer, 0) also
+    guarantees the first (no-signal) half has landed. This both validates the
+    no-signal path and demonstrates its intended batching use."""
+    err = None
+    try:
+        mods = _worker_imports()
+        flyc, fx, Int64, cco = mods["flyc"], mods["fx"], mods["Int64"], mods["cco"]
+        sync, fill, zero, read = mods["sync"], mods["fill"], mods["zero"], mods["read"]
+        u32 = mods["ctypes"].c_uint32
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+
+        comm = _init_comm(rank, world_size, uid_path)
+        send_off = 0
+        recv_off = NBYTES
+        win_bytes = recv_off + world_size * NBYTES
+        half_bytes = NBYTES // 2  # split point between the no-signal / signaled halves
+
+        mem = comm.alloc_mem(win_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        zero(win.local_ptr, win_bytes)
+        fill(win.local_ptr + send_off, [rank * 1000 + i for i in range(NUM_ELEMS)], u32)
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 8
+        dc = comm.create_dev_comm(reqs)
+
+        my_rank = rank
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def put_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            if fx.thread_idx.x == 0:
+                for p in range(world_size):
+                    if p != my_rank:
+                        dst = recv_off + my_rank * NBYTES
+                        # first half: fire-and-forget (no completion atomic)
+                        sdma.put(
+                            p,
+                            w,
+                            dst,
+                            w,
+                            send_off,
+                            half_bytes,
+                            0,
+                            coop=cco.CoopScope.THREAD,
+                            signal=False,
+                        )
+                        # second half: signaled; same queue 0 drains both in-order
+                        sdma.put(
+                            p,
+                            w,
+                            dst + half_bytes,
+                            w,
+                            send_off + half_bytes,
+                            half_bytes,
+                            0,
+                            coop=cco.CoopScope.THREAD,
+                            signal=True,
+                        )
+                for p in range(world_size):
+                    if p != my_rank:
+                        sdma.quiet_queue(p, 0)
+
+        @flyc.jit
+        def run(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            put_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        comm.barrier()
+        run(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+
+        # Check the whole payload — the no-signal first half must have landed too.
+        for s in range(world_size):
+            if s == my_rank:
+                continue
+            got = read(win.local_ptr + recv_off + s * NBYTES, NUM_ELEMS, u32)
+            for i in (0, NUM_ELEMS // 2, NUM_ELEMS - 1):
+                exp = s * 1000 + i
+                if got[i] != exp:
+                    raise AssertionError(
+                        f"rank {my_rank} recv[{s}][{i}]={got[i]} expected {exp}"
+                    )
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
+def _worker_put_aggregate(rank, world_size, uid_path, coop_name, results_path):
+    """Aggregate puts: 3 chunks/peer on queue 0 with aggregate=True (no doorbell),
+    then one commit(peer, 0) rings the batch and quiet_queue drains it."""
+    err = None
+    try:
+        mods = _worker_imports()
+        flyc, fx, Int64, cco = mods["flyc"], mods["fx"], mods["Int64"], mods["cco"]
+        sync, fill, zero, read = mods["sync"], mods["fill"], mods["zero"], mods["read"]
+        u32 = mods["ctypes"].c_uint32
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+
+        comm = _init_comm(rank, world_size, uid_path)
+        send_off = 0
+        recv_off = NBYTES
+        win_bytes = recv_off + world_size * NBYTES
+        chunk = NBYTES // 3  # three chunks; the last absorbs the remainder
+
+        mem = comm.alloc_mem(win_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        zero(win.local_ptr, win_bytes)
+        fill(win.local_ptr + send_off, [rank * 1000 + i for i in range(NUM_ELEMS)], u32)
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 8
+        dc = comm.create_dev_comm(reqs)
+
+        my_rank = rank
+        c0, c1 = chunk, 2 * chunk
+        last = NBYTES - c1  # remainder for the third chunk
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def put_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            if fx.thread_idx.x == 0:
+                for p in range(world_size):
+                    if p != my_rank:
+                        dst = recv_off + my_rank * NBYTES
+                        # aggregate: placed in the SQ, doorbell suppressed
+                        sdma.put(
+                            p,
+                            w,
+                            dst,
+                            w,
+                            send_off,
+                            c0,
+                            0,
+                            coop=cco.CoopScope.THREAD,
+                            signal=True,
+                            aggregate=True,
+                        )
+                        sdma.put(
+                            p,
+                            w,
+                            dst + c0,
+                            w,
+                            send_off + c0,
+                            chunk,
+                            0,
+                            coop=cco.CoopScope.THREAD,
+                            signal=True,
+                            aggregate=True,
+                        )
+                        sdma.put(
+                            p,
+                            w,
+                            dst + c1,
+                            w,
+                            send_off + c1,
+                            last,
+                            0,
+                            coop=cco.CoopScope.THREAD,
+                            signal=True,
+                            aggregate=True,
+                        )
+                        # one doorbell rings the whole batch
+                        sdma.commit(p, 0, coop=cco.CoopScope.THREAD)
+                for p in range(world_size):
+                    if p != my_rank:
+                        sdma.quiet_queue(p, 0)
+
+        @flyc.jit
+        def run(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            put_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        comm.barrier()
+        run(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+
+        for s in range(world_size):
+            if s == my_rank:
+                continue
+            got = read(win.local_ptr + recv_off + s * NBYTES, NUM_ELEMS, u32)
+            for i in (0, NUM_ELEMS // 3, 2 * NUM_ELEMS // 3, NUM_ELEMS - 1):
+                exp = s * 1000 + i
+                if got[i] != exp:
+                    raise AssertionError(
+                        f"rank {my_rank} recv[{s}][{i}]={got[i]} expected {exp}"
+                    )
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
 # ── spawn harness ──────────────────────────────────────────────────────────
 
 
@@ -345,3 +643,19 @@ def test_sdma_put_alltoall(coop_name, world_size):
 def test_sdma_quiet_queue():
     """Single-queue completion (quiet_queue) drains a thread-coop put correctly."""
     _run(_worker_put_quiet_queue, world_size=2, coop_name="THREAD")
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_sdma_put_alltoall_block(world_size):
+    """BLOCK-coop put/quiet: a multi-warp block drives the queues correctly."""
+    _run(_worker_put_block, world_size=world_size, coop_name="BLOCK")
+
+
+def test_sdma_put_nosignal():
+    """No-signal put lands too, drained by a trailing signaled put on the same queue."""
+    _run(_worker_put_nosignal, world_size=2, coop_name="THREAD")
+
+
+def test_sdma_put_aggregate():
+    """Aggregate puts batch into the SQ; one commit rings the doorbell for all."""
+    _run(_worker_put_aggregate, world_size=2, coop_name="THREAD")

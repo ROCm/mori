@@ -54,6 +54,10 @@ void PrintUsage(const char* program) {
                "  -T threads     threads per block\n"
                "  -s scope       thread | warp | block | thread_agg (default block)\n"
                "                 thread_agg = thread scope + ThreadAggregate (bw only)\n"
+               "  -a             SDMA: aggregate doorbell — post the per-iter batch\n"
+               "                 without ringing, then one commit() (bw only)\n"
+               "  -A depth       SDMA: sub-copies per queue per iter (default 1);\n"
+               "                 baseline rings each, -a rings once for all\n"
                "  -h             this help\n",
                program != nullptr ? program : "program");
 }
@@ -85,10 +89,16 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
   };
 
   int opt = 0;
-  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:")) != -1) {
+  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:")) != -1) {
     switch (opt) {
       case 'h':
         return 2;
+      case 'a':
+        out_args->aggregate = true;
+        break;
+      case 'A':
+        out_args->agg_depth = std::atoi(optarg);
+        break;
       case 'b':
         out_args->min_size = parse_size(optarg);
         break;
@@ -248,10 +258,11 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
   }
 
   if (args.min_size > args.max_size || args.step_factor < 2 || args.iters < 1 || args.nblocks < 1 ||
-      args.threads_per_block < 1) {
+      args.threads_per_block < 1 || args.agg_depth < 1) {
     if (ctx->world_rank == 0) {
       std::fprintf(stderr,
-                   "Invalid arguments (need iters >= 1, nblocks/threads >= 1, step >= 2).\n");
+                   "Invalid arguments (need iters >= 1, nblocks/threads >= 1, step >= 2, "
+                   "agg_depth >= 1).\n");
     }
     MPI_Finalize();
     return 1;
@@ -421,8 +432,9 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     if (args.transport == Transport::kSdma) {
       std::printf(
           "[cco-bench] transport = SDMA (intra-node copy engine via ccoSdma; lsaSize=%d, "
-          "numQueue=%u)\n",
-          ctx->devComm.lsaSize, ctx->devComm.sdma.sdmaNumQueue);
+          "numQueue=%u; aggregate=%s depth=%d)\n",
+          ctx->devComm.lsaSize, ctx->devComm.sdma.sdmaNumQueue, args.aggregate ? "on" : "off",
+          args.agg_depth);
     } else if (args.transport == Transport::kLsa) {
       std::printf("[cco-bench] transport = LSA  (intra-node P2P, flat-VA load/store; lsaSize=%d)\n",
                   ctx->devComm.lsaSize);

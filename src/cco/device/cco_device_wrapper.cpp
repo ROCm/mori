@@ -97,18 +97,29 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
   return reinterpret_cast<uint64_t>(w->winBase) + static_cast<uint64_t>(peer) * stride + offset;
 }
 
-// Expose SDMA C API
-#define CCO_DEF_SDMA_XFER(OP, TAG, COOP)                                               \
-  CCO_DEV void cco_sdma_##OP##__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO, \
-                                      uint64_t sW, uint64_t sO, uint64_t n, int qid) { \
-    Sdma sdma{*AsDevComm(dc)};                                                         \
-    sdma.OP<COOP>(peer, AsWindow(dW), dO, AsWindow(sW), sO, n, qid);                   \
+// Expose SDMA C API. Symbol tags kept in sync with _bindings.py:
+//   put/get carry a coop tag (thread/warp/block); a "_ns" suffix selects the
+//   no-signal (fire-and-forget) variant, which quiet/quiet_queue cannot drain.
+#define CCO_DEF_SDMA_XFER(OP, TAG, COOP, SIG)                                                     \
+  CCO_DEV void cco_sdma_##OP##__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO,            \
+                                      uint64_t sW, uint64_t sO, uint64_t n, int qid, int flags) { \
+    Sdma sdma{*AsDevComm(dc)};                                                                    \
+    sdma.OP<COOP, SIG>(peer, AsWindow(dW), dO, AsWindow(sW), sO, n, qid,                          \
+                       static_cast<uint32_t>(flags));                                             \
   }
 
-CCO_DEF_SDMA_XFER(put, thread, ccoCoopThread)
-CCO_DEF_SDMA_XFER(put, warp, ccoCoopWarp)
-CCO_DEF_SDMA_XFER(get, thread, ccoCoopThread)
-CCO_DEF_SDMA_XFER(get, warp, ccoCoopWarp)
+CCO_DEF_SDMA_XFER(put, thread, ccoCoopThread, true)
+CCO_DEF_SDMA_XFER(put, warp, ccoCoopWarp, true)
+CCO_DEF_SDMA_XFER(put, block, ccoCoopBlock, true)
+CCO_DEF_SDMA_XFER(put, thread_ns, ccoCoopThread, false)
+CCO_DEF_SDMA_XFER(put, warp_ns, ccoCoopWarp, false)
+CCO_DEF_SDMA_XFER(put, block_ns, ccoCoopBlock, false)
+CCO_DEF_SDMA_XFER(get, thread, ccoCoopThread, true)
+CCO_DEF_SDMA_XFER(get, warp, ccoCoopWarp, true)
+CCO_DEF_SDMA_XFER(get, block, ccoCoopBlock, true)
+CCO_DEF_SDMA_XFER(get, thread_ns, ccoCoopThread, false)
+CCO_DEF_SDMA_XFER(get, warp_ns, ccoCoopWarp, false)
+CCO_DEF_SDMA_XFER(get, block_ns, ccoCoopBlock, false)
 
 #undef CCO_DEF_SDMA_XFER
 
@@ -120,6 +131,7 @@ CCO_DEF_SDMA_XFER(get, warp, ccoCoopWarp)
   }
 CCO_DEF_SDMA_QUIET(thread, ccoCoopThread)
 CCO_DEF_SDMA_QUIET(warp, ccoCoopWarp)
+CCO_DEF_SDMA_QUIET(block, ccoCoopBlock)
 #undef CCO_DEF_SDMA_QUIET
 
 // quiet a single (peer, queueId) queue only.
@@ -127,6 +139,17 @@ CCO_DEV void cco_sdma_quiet_queue(uint64_t dc, int peer, int qid) {
   Sdma sdma{*AsDevComm(dc)};
   sdma.quietQueue(peer, qid);
 }
+
+// ── SDMA commit: ring the doorbell for packets posted with the Aggregate flag ──
+#define CCO_DEF_SDMA_COMMIT(TAG, COOP)                                  \
+  CCO_DEV void cco_sdma_commit__##TAG(uint64_t dc, int peer, int qid) { \
+    Sdma sdma{*AsDevComm(dc)};                                          \
+    sdma.commit<COOP>(peer, qid);                                       \
+  }
+CCO_DEF_SDMA_COMMIT(thread, ccoCoopThread)
+CCO_DEF_SDMA_COMMIT(warp, ccoCoopWarp)
+CCO_DEF_SDMA_COMMIT(block, ccoCoopBlock)
+#undef CCO_DEF_SDMA_COMMIT
 
 // ── ccoDevComm field accessors ──
 CCO_DEV int cco_devcomm_rank(uint64_t dc) { return AsDevComm(dc)->rank; }

@@ -99,9 +99,10 @@ __global__ void ibgda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 }
 
 // SDMA thread scope: one thread per SDMA queue pulls its slice each iteration;
-// quiet drains completion at the end.
+// quiet drains completion at the end. Each slice is issued as `depth` sub-copies:
+// with agg the doorbell is suppressed and one commit() rings the batch.
 __global__ void sdma_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
-                            ccoDevComm devComm, int peerLsa, int iter) {
+                            ccoDevComm devComm, int peerLsa, int iter, int depth, bool agg) {
   ccoSdma sdma{devComm};
   const int nq = devComm.sdma.sdmaNumQueue;
   const int q = threadIdx.x;
@@ -110,34 +111,54 @@ __global__ void sdma_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, 
   const size_t per = total / static_cast<size_t>(nq);
   const size_t off = static_cast<size_t>(q) * per;
   const size_t bytes = (q == nq - 1) ? (total - off) : per;
-  for (int i = 0; i < iter; i++)
-    sdma.get(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), off,
-             reinterpret_cast<ccoWindow_t>(sendWin), off, bytes, q);
+  const uint32_t flags = agg ? ccoSdmaOptFlagsAggregate : ccoSdmaOptFlagsDefault;
+  const size_t sub = bytes / static_cast<size_t>(depth);
+  for (int i = 0; i < iter; i++) {
+    for (int j = 0; j < depth; j++) {
+      const size_t so = static_cast<size_t>(j) * sub;
+      const size_t sb = (j == depth - 1) ? (bytes - so) : sub;
+      if (sb == 0) continue;  // bytes < depth: skip empty sub-copies (no 0-byte packet)
+      sdma.get(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), off + so,
+               reinterpret_cast<ccoWindow_t>(sendWin), off + so, sb, q, flags);
+    }
+    if (agg) sdma.commit(peerLsa, q);
+  }
   sdma.quietQueue(peerLsa, q);
 }
 
-// SDMA warp scope: one warp drives all SDMA queues via a single warp-scope get
-// that splits the transfer across the queue set internally (one lane per queue).
+// SDMA warp scope: one warp drives all SDMA queues via warp-scope gets that split
+// the transfer across the queue set (one lane per queue). `depth` sub-copies per
+// iteration; with agg one commit() rings all queues, else each warp get rings.
 __global__ void sdma_get_bw_warp(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
-                                 size_t len_doubles, ccoDevComm devComm, int peerLsa, int iter) {
+                                 size_t len_doubles, ccoDevComm devComm, int peerLsa, int iter,
+                                 int depth, bool agg) {
   ccoSdma sdma{devComm};
   const size_t total = len_doubles * sizeof(double);
-  for (int i = 0; i < iter; i++)
-    sdma.get<ccoCoopWarp>(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), 0,
-                          reinterpret_cast<ccoWindow_t>(sendWin), 0, total);
+  const uint32_t flags = agg ? ccoSdmaOptFlagsAggregate : ccoSdmaOptFlagsDefault;
+  const size_t sub = total / static_cast<size_t>(depth);
+  for (int i = 0; i < iter; i++) {
+    for (int j = 0; j < depth; j++) {
+      const size_t so = static_cast<size_t>(j) * sub;
+      const size_t sb = (j == depth - 1) ? (total - so) : sub;
+      if (sb == 0) continue;  // total < depth: skip empty sub-copies (no 0-byte packet)
+      sdma.get<ccoCoopWarp>(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), so,
+                            reinterpret_cast<ccoWindow_t>(sendWin), so, sb, 0, flags);
+    }
+    if (agg) sdma.commit<ccoCoopWarp>(peerLsa);
+  }
   sdma.quiet<ccoCoopWarp>(peerLsa);
 }
 
 static void launch_sdma(PutScope scope, ccoWindow_t sendWin, ccoWindow_t recvWin,
                         size_t len_doubles, ccoDevComm devComm, int peerLsa, int count,
-                        int warp_size) {
+                        int warp_size, int depth, bool agg) {
   const int nq = devComm.sdma.sdmaNumQueue;
   if (scope == PutScope::kWarp) {
     hipLaunchKernelGGL(sdma_get_bw_warp, dim3(1), dim3(warp_size), 0, 0, sendWin, recvWin,
-                       len_doubles, devComm, peerLsa, count);
+                       len_doubles, devComm, peerLsa, count, depth, agg);
   } else {
     hipLaunchKernelGGL(sdma_get_bw, dim3(1), dim3(nq), 0, 0, sendWin, recvWin, len_doubles, devComm,
-                       peerLsa, count);
+                       peerLsa, count, depth, agg);
   }
 }
 
@@ -221,7 +242,8 @@ int main(int argc, char** argv) {
       const float ms = RunWarmupAndTimed(res, args.warmup, args.iters, [&](int count) {
         if (args.transport == Transport::kSdma) {
           launch_sdma(args.put_scope, ctx.send_win, ctx.recv_win, len_doubles, ctx.devComm,
-                      ctx.peer_lsa_rank, count, ctx.device_warp_size);
+                      ctx.peer_lsa_rank, count, ctx.device_warp_size, args.agg_depth,
+                      args.aggregate);
         } else if (args.transport == Transport::kLsa) {
           launch_lsa(args.put_scope, grid, block, ctx.send_win, ctx.recv_win, res.counter_d,
                      len_doubles, ctx.peer_lsa_rank, count, ctx.device_warp_size);

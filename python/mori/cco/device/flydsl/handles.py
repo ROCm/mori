@@ -279,6 +279,38 @@ class Gda:
 class Sdma:
     dev_comm: fx.Int64
 
+    def _xfer(
+        self,
+        op,
+        peer,
+        dst_win,
+        dst_off,
+        src_win,
+        src_off,
+        nbytes,
+        qid,
+        coop,
+        signal,
+        aggregate,
+    ):
+        # coop/signal are compile-time; "_ns" (no-signal) is fire-and-forget and
+        # cannot be drained by quiet. aggregate skips the doorbell — call commit().
+        tag = _COOP_TAG[_const(coop, "coop")]
+        if not signal:
+            tag += "_ns"
+        flags = 1 if aggregate else 0
+        raw.SDMA_XFER[f"{op}__{tag}"](
+            self.dev_comm,
+            peer,
+            _win(dst_win),
+            dst_off,
+            _win(src_win),
+            src_off,
+            nbytes,
+            qid,
+            flags,
+        )
+
     def put(
         self,
         peer,
@@ -290,18 +322,21 @@ class Sdma:
         qid,
         *,
         coop=CoopScope.THREAD,
+        signal=True,
+        aggregate=False,
     ):
-        if _const(coop, "coop") == CoopScope.BLOCK:
-            raise ValueError("cco: SDMA put has no block-level API yet")
-        raw.SDMA_XFER[f"put__{_COOP_TAG[coop]}"](
-            self.dev_comm,
+        self._xfer(
+            "put",
             peer,
-            _win(dst_win),
+            dst_win,
             dst_off,
-            _win(src_win),
+            src_win,
             src_off,
             nbytes,
             qid,
+            coop,
+            signal,
+            aggregate,
         )
 
     def get(
@@ -315,25 +350,30 @@ class Sdma:
         qid,
         *,
         coop=CoopScope.THREAD,
+        signal=True,
+        aggregate=False,
     ):
-        if _const(coop, "coop") == CoopScope.BLOCK:
-            raise ValueError("cco: SDMA get has no block-level API yet")
-        raw.SDMA_XFER[f"get__{_COOP_TAG[coop]}"](
-            self.dev_comm,
+        self._xfer(
+            "get",
             peer,
-            _win(dst_win),
+            dst_win,
             dst_off,
-            _win(src_win),
+            src_win,
             src_off,
             nbytes,
             qid,
+            coop,
+            signal,
+            aggregate,
         )
+
+    def commit(self, peer, qid=0, *, coop=CoopScope.THREAD):
+        """Ring the doorbell for aggregate=True ops (thread: queue `qid`; warp/block: all)."""
+        raw.SDMA_COMMIT[_COOP_TAG[_const(coop, "coop")]](self.dev_comm, peer, qid)
 
     def quiet(self, peer, *, coop=CoopScope.THREAD):
         """Wait for all outstanding SDMA ops to `peer` across every queue."""
-        if _const(coop, "coop") == CoopScope.BLOCK:
-            raise ValueError("cco: SDMA quiet has no block-level API yet")
-        raw.SDMA_QUIET[_COOP_TAG[coop]](self.dev_comm, peer)
+        raw.SDMA_QUIET[_COOP_TAG[_const(coop, "coop")]](self.dev_comm, peer)
 
     def quiet_queue(self, peer, qid):
         """Wait on a single (peer, queueId) queue only."""

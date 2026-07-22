@@ -86,6 +86,12 @@ struct PerfArgs {
   // Set when -t explicitly picks a transport: PerfInit then exports the matching
   // env (MORI_ENABLE_SDMA / MORI_DISABLE_P2P) instead of auto-detecting.
   bool transport_explicit = false;
+  // SDMA doorbell batching (bw kernels only). Each queue's per-iteration slice is
+  // posted as `agg_depth` sub-copies; without -a each rings (agg_depth doorbells),
+  // with -a they post via the Aggregate flag + one commit() (1 doorbell). Same
+  // bytes/iter either way, so the two runs isolate the doorbell cost.
+  bool aggregate = false;
+  int agg_depth = 1;
 };
 
 // Holds MPI + CCO state for the lifetime of a benchmark run. PerfInit registers

@@ -909,69 +909,118 @@ int ccoBarrierAll(ccoComm* comm);
 namespace mori {
 namespace cco {
 
+// Aggregate: post without ringing the doorbell; commit() rings once (like GDA).
+enum ccoSdmaOptFlags : uint32_t {
+  ccoSdmaOptFlagsDefault = 0,
+  ccoSdmaOptFlagsAggregate = (1u << 0),
+};
+
 struct ccoSdma {
   ccoDevComm const& comm;
 
   __device__ inline ccoSdma(ccoDevComm const& c) : comm(c) {}
 
-  // put: local src -> peer dst. Thread scope = one queue (queueId); warp scope =
-  // split across all queues (queueId ignored).
-  template <typename Coop = ccoCoopThread>
+  // put: local src -> peer dst.
+  //   Coop:    thread = one queue (queueId); warp/block = split across all queues
+  //            (queueId ignored), one lane/thread per queue.
+  //   Signal:  when false, skip the completion atomic — fire-and-forget, cannot
+  //            be drained by quiet/quietQueue (caller must sync itself).
+  //   optFlags: Aggregate posts without ringing; call commit() to ring the batch.
+  // Single-issuer per (peer, queue) (see device_primitives.hpp).
+  template <typename Coop = ccoCoopThread, bool Signal = true>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
-                             size_t srcOffset, size_t bytes, int queueId = 0) {
-    static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp>,
-                  "ccoSdma::put supports ccoCoopThread or ccoCoopWarp");
+                             size_t srcOffset, size_t bytes, int queueId = 0,
+                             uint32_t optFlags = ccoSdmaOptFlagsDefault) {
+    static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
+                      std::is_same_v<Coop, ccoCoopBlock>,
+                  "ccoSdma::put supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
+    const bool ring = !(optFlags & ccoSdmaOptFlagsAggregate);
     void* dst = ccoGetLsaPeerPtr(dstWin, peer, dstOffset);
     void* src = ccoGetLocalPtr(srcWin, srcOffset);
     if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
-      core::SdmaPutThread(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
-                          s.expectSignals + peer * n, n, queueId);
+      core::SdmaPutThread<Signal>(src, dst, bytes, s.deviceHandles + peer * n,
+                                  s.signalBuf + peer * n, s.expectSignals + peer * n, n, queueId,
+                                  ring);
+    } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
+      core::SdmaPutWarp<Signal>(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
+                                s.expectSignals + peer * n, n, ring);
     } else {
-      core::SdmaPutWarp(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
-                        s.expectSignals + peer * n, n);
+      core::SdmaPutBlock<Signal>(src, dst, bytes, s.deviceHandles + peer * n,
+                                 s.signalBuf + peer * n, s.expectSignals + peer * n, n, ring);
     }
   }
 
-  // get: peer src -> local dst. Same scope rules as put().
-  template <typename Coop = ccoCoopThread>
+  // get: peer src -> local dst. Same Coop / Signal / optFlags rules as put().
+  template <typename Coop = ccoCoopThread, bool Signal = true>
   __device__ inline void get(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
-                             size_t srcOffset, size_t bytes, int queueId = 0) {
-    static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp>,
-                  "ccoSdma::get supports ccoCoopThread or ccoCoopWarp");
+                             size_t srcOffset, size_t bytes, int queueId = 0,
+                             uint32_t optFlags = ccoSdmaOptFlagsDefault) {
+    static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
+                      std::is_same_v<Coop, ccoCoopBlock>,
+                  "ccoSdma::get supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
+    const bool ring = !(optFlags & ccoSdmaOptFlagsAggregate);
     void* dst = ccoGetLocalPtr(dstWin, dstOffset);
     void* src = ccoGetLsaPeerPtr(srcWin, peer, srcOffset);
     if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
-      core::SdmaPutThread(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
-                          s.expectSignals + peer * n, n, queueId);
+      core::SdmaPutThread<Signal>(src, dst, bytes, s.deviceHandles + peer * n,
+                                  s.signalBuf + peer * n, s.expectSignals + peer * n, n, queueId,
+                                  ring);
+    } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
+      core::SdmaPutWarp<Signal>(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
+                                s.expectSignals + peer * n, n, ring);
     } else {
-      core::SdmaPutWarp(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
-                        s.expectSignals + peer * n, n);
+      core::SdmaPutBlock<Signal>(src, dst, bytes, s.deviceHandles + peer * n,
+                                 s.signalBuf + peer * n, s.expectSignals + peer * n, n, ring);
     }
   }
 
   // quiet: wait for all outstanding ops to `peer` across every queue.
   template <typename Coop = ccoCoopThread>
   __device__ inline void quiet(int peer) {
-    static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp>,
-                  "ccoSdma::quiet supports ccoCoopThread or ccoCoopWarp");
+    static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
+                      std::is_same_v<Coop, ccoCoopBlock>,
+                  "ccoSdma::quiet supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
-      core::SdmaQueitThread(s.signalBuf + peer * n, s.expectSignals + peer * n, n);
+      core::SdmaQuietThread(s.signalBuf + peer * n, s.expectSignals + peer * n, n);
+    } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
+      core::SdmaQuietWarp(s.signalBuf + peer * n, s.expectSignals + peer * n, n);
     } else {
-      core::SdmaQueitWarp(s.signalBuf + peer * n, s.expectSignals + peer * n, n);
+      core::SdmaQuietBlock(s.signalBuf + peer * n, s.expectSignals + peer * n, n);
     }
   }
 
-  // quietQueue: wait on a single (peer, queueId) queue only
+  // quietQueue: wait on a single (peer, queueId) queue only.
+  // NOTE: only valid to drain a thread-scope single-queue put/get. A warp/block
+  // put spreads the transfer across all queues, so a single quietQueue would
+  // observe only 1/n of it (false completion) — use quiet() for those.
   __device__ inline void quietQueue(int peer, int queueId) {
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     anvil::waitForSignal(s.signalBuf + peer * n + queueId, s.expectSignals[peer * n + queueId]);
+  }
+
+  // commit: ring the doorbell for Aggregate-posted ops.
+  //   thread → queue `queueId`; warp/block → every queue. Then drain with quiet().
+  template <typename Coop = ccoCoopThread>
+  __device__ inline void commit(int peer, int queueId = 0) {
+    static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
+                      std::is_same_v<Coop, ccoCoopBlock>,
+                  "ccoSdma::commit supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
+    const ccoSdmaContext& s = comm.sdma;
+    const uint32_t n = s.sdmaNumQueue;
+    if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
+      core::SdmaCommitThread(s.deviceHandles + peer * n, n, queueId);
+    } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
+      core::SdmaCommitWarp(s.deviceHandles + peer * n, n);
+    } else {
+      core::SdmaCommitBlock(s.deviceHandles + peer * n, n);
+    }
   }
 };
 
