@@ -212,8 +212,7 @@ impl RedisKvIndexerBackend {
     }
 
     async fn report_one(&self, worker: &str, hash: &str, bit: i64) -> Result<(), Status> {
-        let v = self
-            .conn
+        self.conn
             .invoke(
                 &PLACEMENT_SET,
                 vec![placement_key(&self.ns, hash)],
@@ -221,12 +220,13 @@ impl RedisKvIndexerBackend {
             )
             .await
             .map_err(to_status)?;
-        let was_absent: i64 = i64::from_redis_value(&v).map_err(to_status)?;
-        if was_absent == 1 {
-            let mut cmd = redis::cmd("SADD");
-            cmd.arg(worker_blocks_key(&self.ns, worker)).arg(hash);
-            self.conn.query(cmd).await.map_err(to_status)?;
-        }
+
+        // Always enforce the reverse-index postcondition. SADD is idempotent,
+        // so replay repairs a prior failure after PLACEMENT_SET even when the
+        // placement bit was already set by the first attempt.
+        let mut cmd = redis::cmd("SADD");
+        cmd.arg(worker_blocks_key(&self.ns, worker)).arg(hash);
+        self.conn.query(cmd).await.map_err(to_status)?;
         Ok(())
     }
 
@@ -418,6 +418,9 @@ fn now_ms() -> i64 {
 fn to_status(err: redis::RedisError) -> Status {
     Status::unavailable(format!("redis backend error: {err}"))
 }
+
+#[cfg(test)]
+mod fault_tests;
 
 #[cfg(test)]
 mod tests {

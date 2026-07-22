@@ -12,8 +12,9 @@ use redis::Script;
 ///
 /// KEYS: `[placement_key]`
 /// ARGV: `[worker_id, bit]`
-/// Returns `1` if the worker was newly added (its mask was previously 0, so the
-/// caller should add the hash to the worker's reverse index), else `0`.
+/// Returns `1` if the placement changed, else `0`. The caller always performs
+/// the idempotent reverse-index `SADD`, even when this script returns `0`, so a
+/// replay repairs a prior failure between the two index updates.
 pub static PLACEMENT_SET: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -22,10 +23,8 @@ local bit = tonumber(ARGV[2])
 if math.floor(cur / bit) % 2 == 1 then
   return 0
 end
-local was_absent = 0
-if cur == 0 then was_absent = 1 end
 redis.call('HSET', KEYS[1], ARGV[1], cur + bit)
-return was_absent
+return 1
 "#,
     )
 });
@@ -48,7 +47,11 @@ pub static PLACEMENT_CLEAR: LazyLock<Script> = LazyLock::new(|| {
 local cur = tonumber(redis.call('HGET', KEYS[1], ARGV[1]))
 local bit = tonumber(ARGV[2])
 local worker_gone = 0
-if cur ~= nil then
+if cur == nil then
+  -- Placement already reached the target state, but a previous SREM may have
+  -- failed. Ask the caller to retry the idempotent reverse-index removal.
+  worker_gone = 1
+else
   local new = cur
   if math.floor(cur / bit) % 2 == 1 then new = cur - bit end
   if new == 0 then
