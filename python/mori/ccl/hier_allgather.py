@@ -612,11 +612,6 @@ class HierAllGather:
                         "IPC/single-node topologies."
                     )
 
-    def drain_hostproxy(self):
-        """Join any in-flight async host-proxy inter worker (deferred FSDP consumer
-        fence). No-op on the shipped path (no async inter producer)."""
-        return False
-
     def _ensure_output_registered(self, output_data):
         """Register output_data for the direct-to-output SDMA push, LRU-cached.
         Lockstep across PEs, exact-match only; a hit issues no collective.
