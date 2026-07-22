@@ -47,7 +47,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
     int numBlocksOverride = -1, int bidOverride = -1,
     uint64_t* chunkReadyFlags = nullptr,
     int deepPipe = 1,
-    int deepPipeQuiet = 0, bool useWriteFence = false) {
+    int deepPipeQuiet = 0) {
   int nextPos = (ringPos + 1) % ringSize;
   int nextPeer = peBase + nextPos * peStride;
   int maxRounds = ringSize - 1;
@@ -106,12 +106,6 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   int prevPeer = peBase + prevPos * peStride;
   application::TransportType prevXport = shmem::GetGlobalGpuStatesPtr()->transportTypes[prevPeer];
   bool prevIsRdma = (prevXport == application::TransportType::RDMA);
-
-  // Per-channel WRITE-PUSH landing fence (maxRounds==1 only): fused put-with-signal
-  // on qpId=bid (flag AMO after data WRITE, RC in-order => flag can't beat data),
-  // per-channel send-CQ drain, receiver spins its own inbound flag (system acquire).
-  bool multiBlockWrite =
-      (useWriteFence && peerIsRdma && prevIsRdma && maxRounds == 1 && multiBlock);
 
   __syncthreads();
 
@@ -437,30 +431,6 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
 
     size_t chunkBaseOffset = static_cast<size_t>(sendDataRank) * peChunkSize;
 
-    if (multiBlockWrite) {
-      // Multi-block write-push: warp 0 pushes this channel's sub-range on qpId=bid as
-      // one fused put-with-signal (data WRITE + flag AMO on the same RC QP), so the
-      // flag can never beat the data (bit-exact).
-      if (warpId == 0 && blkBytes > 0) {
-        size_t subOff = chunkBaseOffset + blkOff;
-        shmem::ShmemPutMemNbiSignalWarp(memObj, subOff, memObj, subOff, blkBytes, flagsObj,
-                                        (flagBase + sendDataRank) * sizeof(uint64_t), 1,
-                                        core::atomicType::AMO_ADD, nextPeer, bid);
-      }
-      __syncthreads();
-      // No explicit send-CQ quiet: the fused signal already lands after the data
-      // (RC in-order). Receiver spins this channel's inbound flag (system acquire +
-      // fence) to make the sub-range coherently visible.
-      if (threadLinearId == warpSize && blkBytes > 0) {
-        int spinCount = 0;
-        while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + recvDataRank) < 1) {
-          if (++spinCount > 10000000) break;
-        }
-        __threadfence_system();
-      }
-      __syncthreads();
-      continue;
-    }
     // Same-node ring round is single-warp: ShmemPutMemNbiWarp lowers to one anvil
     // SDMA queue per (src,dst), so splitting across warps overflows its retry budget.
     // For the all-RDMA sub-group ring (numQp>1) fan the chunk across QPs (warp w ->

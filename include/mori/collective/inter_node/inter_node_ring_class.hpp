@@ -147,13 +147,6 @@ class InterNodeRingAllgather {
       throw std::runtime_error("InterNodeRingAllgather: flags ShmemMalloc failed");
     (void)hipMemset(flags_, 0, flagsBytes);
     flagsObj_ = shmem::ShmemQueryMemObjPtr(flags_);
-
-    // WRITE-PUSH (SEND-CQ) landing fence: each channel drains its own SEND CQE
-    // after a fused put-with-signal (env MORI_HIER_RING_WRITE, default OFF).
-    {
-      const char* e = std::getenv("MORI_HIER_RING_WRITE");
-      jit_args_.useWriteFence = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
-    }
   }
 
   ~InterNodeRingAllgather() {
