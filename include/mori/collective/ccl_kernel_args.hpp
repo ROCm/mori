@@ -336,7 +336,7 @@ struct CclFusedRingRemoteGatherArgs {
   // push-only, completion folded into the reader (drains flag slots [0,G)); byte-identical
   // output. 0 = OFF (coupled push+wait, byte-identical path).
   int localPushOnly = 0;
-  // Intra reassembly deep-SQ (see HierReasmDeepSqOn). 1 => a worker submits all its channels'
+  // Intra reassembly deep-SQ (reasmDeepSq, from python reasm_deep_sq). 1 => a worker submits all its channels'
   // copy descriptors back-to-back then a single drain before firing the deferred output
   // flags. 0 = OFF (byte-identical). Bit-exact by construction (flag never precedes its bytes).
   int reasmDeepSq = 0;

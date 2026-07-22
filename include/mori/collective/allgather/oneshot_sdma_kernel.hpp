@@ -363,7 +363,7 @@ __device__ void OneShotSubGroupPushOnly_body(
     size_t elementCount, size_t dstBaseOffset, size_t dstSlotStrideBytes, uint64_t flagVal,
     size_t flagBase, int qId, int deepSqPhase = 0,
     int pushPeerLo = 0, int pushPeerHi = -1, int pushFlag = 1) {
-  // Deep-SQ phase split (see HierReasmDeepSqOn). 0 = single-shot (submit->drain->fence->
+  // Deep-SQ phase split (reasmDeepSq, from python reasm_deep_sq). 0 = single-shot (submit->drain->fence->
   // flag). 1 = submit-only (copy + bump expectedSignals[q], no drain/fence/flag) to feed
   // the engine back-to-back. 2 = drain+flag-only (one quiet covers all phase-1 submits on
   // this queue, then fence + flag).
