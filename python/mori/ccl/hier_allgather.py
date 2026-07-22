@@ -1439,20 +1439,6 @@ class HierAllGather:
         self._prev_op_completed = True
         return True
 
-    def result_tensor(self, count: int, dtype, device=None):
-        """View of the gathered result left in the ring buffer under
-        ``out_in_place`` (no user copy-OUT). ``count`` is per-rank; the view has
-        ``count * npes`` elements. Only valid for the every-rank-direct N>=2 path.
-        """
-        if not self.out_in_place:
-            raise RuntimeError("result_tensor is only valid when out_in_place=True")
-        if self.num_nodes < 2:
-            raise RuntimeError(
-                "result_tensor is only valid for the N>=2 hierarchical path"
-            )
-        block_count = count * self.ranks_per_node
-        return self._inter.full_tensor(block_count, dtype, device)
-
     def get_output_transit_buffer(self, dtype=None, device=None):
         if self.num_nodes == 1:
             return self._intra.get_output_transit_buffer(dtype=dtype, device=device)
