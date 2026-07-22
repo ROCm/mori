@@ -277,6 +277,36 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             warp_per_block=dispatch_warp_per_block,
             call_local_expert_count=call_local_expert_count,
         )
+        # DEBUG: isolate the dispatch kernel from combine. When set, run dispatch
+        # only and return, so combine never waits on completion signals -> lets us
+        # tell whether the CNT2 hang is inside dispatch itself. self.sync() forces
+        # the device sync, so a kernel hang manifests here (timeout) rather than
+        # being masked. check_dispatch_result is skipped because progressive
+        # early-return (MORI_CNT_STEP stop-stage) leaves dispatch output partial.
+        if os.environ.get("MORI_SKIP_COMBINE") == "1":
+            self.sync()
+            if self.config.rank == 0:
+                print(
+                    f"[SKIP_COMBINE] dispatch returned, recv={dispatch_recv_num_token[0].item()}",
+                    flush=True,
+                )
+            # Optionally validate the dispatch result (count/mapping correctness)
+            # without running combine. Use with a FULL dispatch (no early-return)
+            # to tell whether CNT2 produces correct output.
+            if os.environ.get("MORI_CHECK_DISP") == "1" and check:
+                self.check_dispatch_result(
+                    op,
+                    test_data,
+                    dispatch_output,
+                    dispatch_weights,
+                    dispatch_scales,
+                    dispatch_indices,
+                    dispatch_recv_num_token,
+                )
+                if self.config.rank == 0:
+                    print("[SKIP_COMBINE] check_dispatch_result PASSED", flush=True)
+            return dispatch_recv_num_token[0].item()
+
         if check:
             self.check_dispatch_result(
                 op,
@@ -493,6 +523,21 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 combine_warp_per_block,
                 call_local_expert_count=call_local_expert_count,
             )
+
+        # DEBUG: dispatch-only isolation -> skip the timed bench (which also runs
+        # combine via CUDA graphs) so the whole run is dispatch-only.
+        if os.environ.get("MORI_SKIP_COMBINE") == "1":
+            if self.config.rank == 0:
+                print("[SKIP_COMBINE] warmup dispatch-only done, skipping bench", flush=True)
+            return
+
+        # DEBUG: run only the warmup (eager dispatch+combine+checks), skip the timed
+        # bench loop that re-runs everything via CUDA graphs. Isolates whether the
+        # hang is in the combine kernel itself vs CUDA-graph capture/replay.
+        if os.environ.get("MORI_SKIP_BENCH") == "1":
+            if self.config.rank == 0:
+                print("[SKIP_BENCH] warmup dispatch+combine done, skipping timed bench", flush=True)
+            return
 
         disp_duration_us_list = []
         disp_bandwidth_GB_list = []

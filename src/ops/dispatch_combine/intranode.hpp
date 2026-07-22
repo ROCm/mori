@@ -108,14 +108,43 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
         args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(globalThdId) + args.config.rank,
         crossDeviceBarrierFlag);
   }
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 13)
+  // DBG: return after WAIT A (all local combine blocks arrived) + peer signal,
+  // BEFORE WAIT B (cross-device peer wait). All ranks do this symmetrically, so
+  // no rank waits on a peer. Hang here => WAIT A (local grid barrier) is the
+  // culprit; clean here => hang is in WAIT B (cross-device).
+  return;
+#endif
 
   if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
 
   uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 14)
+  // DBG: bounded WAIT B. If it can't complete, print which peer's flag is missing
+  // (rank, waited-peer, value seen vs wanted) and BREAK -> no permanent hang, so
+  // the printf flushes. Direct evidence of WAIT B being the hang + the reason.
   if (thdId < args.config.worldSize) {
+    unsigned long long _spin = 0;
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
+      if (++_spin > 40000000ull) {
+        printf("[WAITB-STUCK] rank=%d waitPeer=%d saw=%llu want=%llu\n", args.config.rank, thdId,
+               (unsigned long long)core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId),
+               (unsigned long long)crossDeviceBarrierFlag);
+        break;
+      }
     }
   }
+#else
+  if (thdId < args.config.worldSize) {
+    // Backoff in the cross-device wait: the empty tight spin livelocks the cco/xGMI
+    // fabric under CNT2's timing and never re-observes the peer's flag write ->
+    // combine hangs (plain's slower timing happens to dodge it). s_sleep throttles
+    // the poll (matches GridBarrier's spin) and lets the peer flag become visible.
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+#endif
   __syncthreads();
 }
 
@@ -180,10 +209,77 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     // count-matrix cells from the previous launch's without any reset.
     const index_t parity = (index_t)(args.crossDeviceBarrierFlag[0] & 1ull);
 
+    // Each of the 3 consecutive intra-GPU GridBarriers below uses a DISTINCT word
+    // in dispatchGridBarrier[] (+0 here, +2 after Pass A, +3 after prefix; +1 is
+    // the completion counter). GridBarrier self-resets its word via a winner CAS
+    // (bar==gridDim.x ? 0), which is NOT safe to reuse back-to-back: with tiny
+    // inputs each pass is near-instant, so a fast block laps into the next barrier
+    // and atomicAdd's the SAME word between the resetting block's two CAS attempts
+    // -> that block never sees gridDim.x again -> spins forever -> global hang
+    // (same root cause as the completion fix in commit 521e11b6; 4K hides it
+    // because the passes are slow enough that no block laps). Separate words break
+    // the lap. (worldSize>=4 gives >=4 words; intra-node EP4 is the target.)
+    unsigned long long _pt[9]; const bool _pw = (blockIdx.x == 0 && thdId == 0);
+    if (_pw) _pt[0] = clock64();
     for (int d = globalThdId; d < npes; d += totalThreads) localCnt[d] = 0;
-    GridBarrier(args.dispatchGridBarrier);
+    GridBarrier(args.dispatchGridBarrier + 0);
+    if (_pw) _pt[1] = clock64();
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 1)
+    return;  // DBG stop-stage 1: after barrier1 (dispatch-only bisect)
+#endif
 
     // ---- Pass A: count committed (token -> destPe) ----
+#if defined(MORI_DISP_NOTIFY_CNT2)
+    // Warp-per-TOKEN count with BLOCK-LEVEL LDS aggregation (validated standalone in
+    // tools/count_repro.cc KIND=3). Per warp handles ONE token: lane l reads expert
+    // slot l, computes destPe; dedup per (token,destPe) via ONE __match_any_sync
+    // instead of the topk-iteration __shfl loop. The match_any MUST be called
+    // UNIFORMLY by all lanes (divergent warp-sync builtins fault gfx1250 with HSA
+    // 0x1016), so inactive lanes pass a sentinel that can't equal any real destPe.
+    // Kept lanes bump a per-BLOCK LDS histogram; each block then flushes only `npes`
+    // atomics into the uncached symmetric localCnt (was O(committed tokens)).
+    {
+      constexpr int kCnt2MaxNpes = 64;  // intra-node world size fits easily
+      __shared__ index_t smemCnt[kCnt2MaxNpes];
+      for (int p = thdId; p < npes; p += blockDim.x) smemCnt[p] = 0;
+      __syncthreads();
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 2)
+      return;  // DBG stop-stage 2: after smemCnt zero + __syncthreads A (pre count loop)
+#endif
+      if (args.tokenIndices && args.inpTokenBuf && !args.replayMode && npes <= kCnt2MaxNpes) {
+        const int _topk = config.numExpertPerToken;
+        for (int tok = globalWarpId; tok < args.curRankNumToken; tok += globalWarpNum) {
+          int base = tok * _topk;
+          index_t expert = (laneId < _topk) ? args.tokenIndices[base + laneId] : (index_t)-1;
+          int destPe = -1;
+          if (expert >= 0) {
+            index_t dp = expert / config.numExpertPerRank;
+            if (dp >= 0 && dp < config.worldSize) destPe = static_cast<int>(dp);
+          }
+          // Uniform (non-divergent) match_any dedup: ALL lanes call it; inactive
+          // lanes use a sentinel (0xFFFFFFFF) distinct from any real destPe. Lowest
+          // lane in each destPe group keeps; dropped/dup slots get the null sentinel.
+          unsigned mv = (destPe >= 0) ? static_cast<unsigned>(destPe) : 0xFFFFFFFFu;
+          unsigned long long grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
+          int keep = (destPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
+          if (laneId < _topk && !keep)
+            args.dispDestTokIdMap[base + laneId] = FlatTokenIndex(config, config.worldSize, 0);
+          if (keep) atomicAdd(&smemCnt[destPe], 1);
+        }
+      }
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 3)
+      return;  // DBG stop-stage 3: after count loop (match_any+smemCnt), pre __syncthreads B
+#endif
+      __syncthreads();
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 4)
+      return;  // DBG stop-stage 4: after __syncthreads B, before localCnt flush
+#endif
+      for (int p = thdId; p < npes; p += blockDim.x) {
+        index_t v = smemCnt[p];
+        if (v) atomicAdd(&localCnt[p], v);
+      }
+    }
+#else
     if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
       for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
            i += globalWarpNum) {
@@ -210,18 +306,33 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         if (laneId == 0) atomicAdd(&localCnt[destPe], 1);
       }
     }
-    GridBarrier(args.dispatchGridBarrier);
+#endif
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 5)
+    return;  // DBG stop-stage 5: after full Pass A (incl localCnt flush)
+#endif
+    if (_pw) _pt[2] = clock64();
+    GridBarrier(args.dispatchGridBarrier + 2);
+    if (_pw) _pt[3] = clock64();
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 6)
+    return;  // DBG stop-stage 6: after barrier2
+#endif
 
     // ---- Exchange: write my count row into every peer's matrix as a parity-coded
     // signal cell = ((count+1) << 1) | parity (system-scope store). ----
-    if (blockIdx.x == 0 && warpId == 0) {
-      for (int p = laneId; p < npes; p += warpSize) {
+    if (blockIdx.x == 0) {
+      // ONE-SHOT, block-wide: map each thread of block0 to a distinct (peer,d)
+      // cell so all npes*npes cross-device stores ISSUE in parallel (1 RTT),
+      // instead of npes serial stores per lane. Scales to EP64: EP4 = 16 cells
+      // (1 round, 16 threads), EP64 = 4096 cells (few rounds across blockDim).
+      // block0-only => exactly one writer per cell (no duplicate stores).
+      for (int c = thdId; c < npes * npes; c += blockDim.x) {
+        int p = c / npes, d = c - p * npes;
         index_t* peerMat = args.dispCountMatrixMemObj->template GetAs<index_t*>(p);
-        for (int d = 0; d < npes; ++d)
-          core::AtomicStoreRelaxedSystem(&peerMat[myPe * npes + d],
-                                         (index_t)(((localCnt[d] + 1) << 1) | parity));
+        core::AtomicStoreRelaxedSystem(&peerMat[myPe * npes + d],
+                                       (index_t)(((localCnt[d] + 1) << 1) | parity));
       }
     }
+    if (_pw) _pt[8] = clock64();
     // ---- Prefix: base[d] = sum_{s<myPe} M[s][d]; total recv = sum_s M[s][myPe].
     // Poll each needed cell until its parity matches this launch, then decode. ----
     if (globalThdId < npes) {
@@ -248,7 +359,15 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
       *args.totalRecvTokenNum = tot;
     }
-    GridBarrier(args.dispatchGridBarrier);
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 7)
+    return;  // DBG stop-stage 7: after exchange+prefix
+#endif
+    if (_pw) _pt[4] = clock64();
+    GridBarrier(args.dispatchGridBarrier + 3);
+    if (_pw) _pt[5] = clock64();
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 8)
+    return;  // DBG stop-stage 8: after barrier3
+#endif
 
     // ---- Pass B: send payload; LOCAL slot atomic inside [baseArr[destPe], ...) ----
     if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
@@ -301,6 +420,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
     }
 
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 9)
+    return;  // DBG stop-stage 9: after Pass B
+#endif
     // ---- Signal-based completion (replaces the symmetric cross-device barrier):
     // all local blocks arrive, warp0 RELEASE-fences its P2P writes and posts a
     // per-peer signal, then waits for every peer to signal this rank. ----
@@ -311,6 +433,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     // block's two atomicCAS(bar,gridDim.x,0) attempts -> that block never sees
     // gridDim.x again and spins forever -> global hang. (4K hides it: Pass B is slow
     // enough that every block finishes the reset before any reaches here.)
+    if (_pw) _pt[6] = clock64();
     auto* complBar = args.dispatchGridBarrier + 1;
     if (thdId == 0) atomicAdd(complBar, 1);
     index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
@@ -334,9 +457,51 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         core::AtomicStoreRelaxedSystem(signal, 0);
       }
     }
+    if (_pw) _pt[7] = clock64();
+#if defined(MORI_CNT_STEP)
+    // DBG phase breakdown (gated; dead-code eliminated when MORI_CNT_STEP unset).
+    if (_pw && myPe == 0) {
+      const double c2u = 1.0 / 2400.0;  // gfx1250 ~2.4GHz: cycles -> us
+      printf("[PHASE] bar0=%.1f passA=%.1f bar2=%.1f exch=%.1f prefix=%.1f bar3=%.1f passB=%.1f compl=%.1f tot=%.1f (us)\n",
+             (_pt[1] - _pt[0]) * c2u, (_pt[2] - _pt[1]) * c2u, (_pt[3] - _pt[2]) * c2u,
+             (_pt[8] - _pt[3]) * c2u, (_pt[4] - _pt[8]) * c2u, (_pt[5] - _pt[4]) * c2u,
+             (_pt[6] - _pt[5]) * c2u, (_pt[7] - _pt[6]) * c2u, (_pt[7] - _pt[0]) * c2u);
+    }
+#endif
 #ifdef ENABLE_STANDARD_MOE_ADAPT
     if constexpr (EnableStdMoE) {
       InvokeConvertDispatchOutput<T>(args, myPe);
+    }
+#endif
+#if defined(MORI_CNT_STEP)
+    // DBG: dump a per-rank signature of dispDestTokIdMap (the SEND-side map combine
+    // reads in its accumulate loop; check_dispatch_result does NOT cover it). Run
+    // CNT2 vs plain dispatch-only and diff: differing cksum => Pass A produced a
+    // different map; oob>0 => a destLocalTokId >= recv capacity => combine would OOB.
+    // Only rank 0 prints so the 4-process stdout does not interleave -> the single
+    // line is directly comparable across runs. _sumLoc is an order-independent
+    // invariant (unaffected by Pass B atomic race ordering); _ck is order-sensitive.
+    if (blockIdx.x == 0 && thdId == 0 && myPe == 0) {
+      const int _n = args.curRankNumToken * config.numExpertPerToken;
+      const index_t _cap = (index_t)config.MaxNumTokensToRecv();
+      unsigned long long _ck = 1469598103934665603ull;
+      long long _sumLoc = 0;
+      int _valid = 0, _oob = 0;
+      index_t _maxLoc = -1;
+      for (int _i = 0; _i < _n; ++_i) {
+        index_t _dt = args.dispDestTokIdMap[_i];
+        _ck = (_ck ^ (unsigned long long)(unsigned)_dt) * 1099511628211ull;
+        index_t _pe = PeFromFlatTokenIndex(config, _dt);
+        if (_pe >= 0 && _pe < config.worldSize) {
+          index_t _lt = LocalTokIdFromFlatTokenIndex(config, _dt);
+          _valid++;
+          _sumLoc += (long long)_lt;
+          if (_lt > _maxLoc) _maxLoc = _lt;
+          if (_lt >= _cap) _oob++;
+        }
+      }
+      printf("[DDT] rank0 n=%d valid=%d sumLoc=%lld maxLocalTok=%d recvCap=%d oob=%d cksum=%llu\n",
+             _n, _valid, _sumLoc, (int)_maxLoc, (int)_cap, _oob, _ck);
     }
 #endif
     return;
@@ -410,16 +575,31 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
             // so concurrent senders can get the same destTokId -> slot collision ->
             // corrupt dispatch (map/payload disagree). Matches v2's system-scope
             // atomic_add_global.
+#if defined(MORI_CNT_STEP)
+            // DBG: time each remote SYSTEM-scope slot atomic on global warp 0 (real
+            // EP4 concurrency: all other warps hammer their dest counters too).
+            unsigned long long _al0 = (globalWarpId == 0) ? clock64() : 0ull;
+#endif
             destTokId = __hip_atomic_fetch_add(
                 args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1,
                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            // NATURAL data-dependency timing (no asm/volatile): this REAL map store
+            // reads destTokId, so for correctness the compiler MUST s_waitcnt for the
+            // atomic's return before it -> the end-clock right after captures the true
+            // round-trip completion. Only extra vs the bare atomic = FlatTokenIndex +
+            // one LOCAL store (~tens of ns). If this ~matches the asm-barrier number,
+            // it proves the ~3.5us completion latency without any asm trick.
+            args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
+#if defined(MORI_CNT_STEP)
+            if (globalWarpId == 0) {
+              unsigned long long _al1 = clock64();
+              printf("[ATOMLAT-NAT] warp0 pair_i=%d destPe=%d cyc=%llu ~%.0fns\n", i, (int)destPe,
+                     _al1 - _al0, (double)(_al1 - _al0) / 2.4);
+            }
+#endif
             assert(destTokId < config.MaxNumTokensToRecv() &&
                    "Total recv token overflow: increase maxTotalRecvTokens");
             atomicAdd(args.destPeTokenCounter + destPe, 1);
-            // In dispDestTokIdMap, record the destination slot for this token-expert pair (flat
-            // index into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE,
-            // record which global source token occupies this slot (for combine-phase routing)
-            args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
             args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
                 FlatTokenIndex(config, myPe, srcTokId);
           }
@@ -609,6 +789,11 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   const uint64_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
   // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
+#if defined(MORI_CNT_STEP)
+  if (blockIdx.x == 0 && thdId == 0)
+    printf("[CMB C0] rank=%d recv=%d xdevFlag=%llu enter\n", myPe, (int)totalRecvTokenNum,
+           (unsigned long long)crossDeviceBarrierFlag);
+#endif
   // When TokT != T (e.g. fp8 combine), staging layout uses TokT-sized tokens. FP4 blockwise packs
   // two E2M1 values per byte, so its token region is half the FP8 one -- keep this in sync with
   // EpDispatchCombineConfig::CombineTokenRegionBytes() used by the host staging allocator.
@@ -736,7 +921,20 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
   // Make sure copy on all GPUs are finished
   MORI_TRACE_NEXT(seq, Slot::CombineBarrier);
+#if defined(MORI_CNT_STEP)
+  if (blockIdx.x == 0 && thdId == 0) printf("[CMB C1] rank=%d pre-xdevbar\n", myPe);
+#endif
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 11)
+  return;  // DBG combine stop-stage 11: after staging, BEFORE CrossDeviceBarrier
+           // (all ranks return symmetrically -> no one waits -> clean if staging ok)
+#endif
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
+#if defined(MORI_CNT_STEP) && (MORI_CNT_STEP == 12)
+  return;  // DBG combine stop-stage 12: after CrossDeviceBarrier
+#endif
+#if defined(MORI_CNT_STEP)
+  if (blockIdx.x == 0 && thdId == 0) printf("[CMB C2] rank=%d post-xdevbar\n", myPe);
+#endif
   // With a routing handle, the caller owns this tensor (it may still be alive in autograd ctx),
   // so we skip the reset. The next dispatch will allocate or replay its own.
   if (args.dispTokIdToSrcTokIdLocal == nullptr) {
@@ -763,6 +961,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   }
 
   MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
+#if defined(MORI_CNT_STEP)
+  if (blockIdx.x == 0 && thdId == 0)
+    printf("[CMB C2b] rank=%d pre-accum curTok=%d\n", myPe, (int)args.curRankNumToken);
+#endif
 
   assert(config.numExpertPerToken < warpSize);
   for (int i = globalWarpId; i < (args.curRankNumToken * mwIter.warpsPerItem); i += globalWarpNum) {
@@ -903,6 +1105,9 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
     }
   }
+#if defined(MORI_CNT_STEP)
+  if (blockIdx.x == 0 && thdId == 0) printf("[CMB C3] rank=%d combine done\n", myPe);
+#endif
 }
 
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,

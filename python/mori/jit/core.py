@@ -449,6 +449,12 @@ def _hipcc_genco(
         *_ocp_fp_defines(cfg.arch),
         *_disp_tdm_defines(),
         *_disp_notify_defines(),
+        *(["-DMORI_DISP_NOTIFY_CNT2"]
+          if os.environ.get("MORI_DISP_NOTIFY_CNT2", "").lower() in ("1", "true", "on", "yes")
+          else []),
+        *([f"-DMORI_CNT_STEP={os.environ['MORI_CNT_STEP']}"]
+          if os.environ.get("MORI_CNT_STEP", "").strip().isdigit()
+          else []),
         *_disp_timing_defines(),
     ]
 
