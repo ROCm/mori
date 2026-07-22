@@ -514,7 +514,3 @@ class MoriAllGather(AllGather):
             event.record(stream)
             return _HierWork(event, device)
         return None
-
-
-# Backward-compatible alias (old name).
-MoriHierAllGather = MoriAllGather
