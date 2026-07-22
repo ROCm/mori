@@ -3,7 +3,9 @@
 //! Data model (see [`schema`]): placement is a per-block-hash HASH of
 //! `worker -> tier bitmask`; a per-worker SET is the reverse index; a per-worker
 //! HASH holds the registry (address + last_seen); hit counts live in a per-hash
-//! HASH co-located with placement. All writes flow through
+//! HASH co-located with placement (and are deleted together with the placement
+//! when a block is fully revoked, so they never outlive the block). All writes
+//! flow through
 //! [`RedisKvIndexerBackend::apply`], which is naturally idempotent (bit set/clear,
 //! SADD/SREM), so a verbatim batch replay (same `seq`) is a no-op and never
 //! double-counts hits (hits are only bumped on match).
@@ -229,11 +231,15 @@ impl RedisKvIndexerBackend {
     }
 
     async fn revoke_one(&self, worker: &str, hash: &str, bit: i64) -> Result<(), Status> {
+        // Pass both the placement and the co-located hit key: when the placement
+        // empties, PLACEMENT_CLEAR drops the hit key too (same `{hash}` slot) so a
+        // matched-then-evicted block cannot leak its `:h` key. Keys share the hash
+        // tag, so this stays a single-slot atomic op on Cluster.
         let v = self
             .conn
             .invoke(
                 &PLACEMENT_CLEAR,
-                vec![placement_key(&self.ns, hash)],
+                vec![placement_key(&self.ns, hash), hit_key(&self.ns, hash)],
                 vec![worker.to_string(), bit.to_string()],
             )
             .await

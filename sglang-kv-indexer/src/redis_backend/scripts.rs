@@ -32,11 +32,16 @@ return was_absent
 
 /// Clears a tier bit for a worker in a placement hash.
 ///
-/// KEYS: `[placement_key]`
+/// KEYS: `[placement_key, hit_key]`
 /// ARGV: `[worker_id, bit]`
 /// Returns `{worker_gone, key_empty}`: `worker_gone=1` when the worker no longer
 /// holds the hash at any tier (caller should remove it from the reverse index);
 /// `key_empty=1` when the placement hash became empty and was deleted.
+///
+/// When the placement hash becomes empty the block no longer exists anywhere, so
+/// the co-located hit key (same `{hash}` slot) is deleted in the same script.
+/// Otherwise a matched-then-evicted block would leak its `:h` key forever, since
+/// the hit key is created lazily on match and nothing else ever removes it.
 pub static PLACEMENT_CLEAR: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
@@ -56,6 +61,7 @@ end
 local empty = 0
 if redis.call('HLEN', KEYS[1]) == 0 then
   redis.call('DEL', KEYS[1])
+  redis.call('DEL', KEYS[2])
   empty = 1
 end
 return {worker_gone, empty}

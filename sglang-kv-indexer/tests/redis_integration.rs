@@ -329,6 +329,94 @@ itest!(
     }
 );
 
+itest!(full_revoke_drops_hit_key, b, {
+    // Report a block, count a hit (creates the co-located :h key), then fully
+    // revoke it. The hit key must be removed together with placement; otherwise a
+    // matched-then-evicted block leaks its :h key forever (slow Redis memory growth).
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "a",
+        1,
+        vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
+    ))
+    .await
+    .unwrap();
+
+    // Counting match creates the hit key with c=1.
+    b.match_external_kv(match_req(&["1"], true)).await.unwrap();
+    let counts = b
+        .get_external_kv_hit_counts(GetExternalKvHitCountsRequest {
+            hashes: hashes(&["1"]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(counts.entries.len(), 1);
+    assert_eq!(counts.entries[0].hit_count_total, 1);
+
+    // Fully revoke the block: placement empties, so the hit key must go too.
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "a",
+        2,
+        vec![action(ExternalKvActionType::ActionRevoke, hbm(), &["1"])],
+    ))
+    .await
+    .unwrap();
+
+    // Placement is gone.
+    let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
+    assert!(resp.matches.is_empty());
+
+    // Hit key is gone too: a leaked :h would still report a count here.
+    let counts = b
+        .get_external_kv_hit_counts(GetExternalKvHitCountsRequest {
+            hashes: hashes(&["1"]),
+        })
+        .await
+        .unwrap();
+    assert!(
+        counts.entries.is_empty(),
+        "hit key leaked after full revoke: {:?}",
+        counts.entries
+    );
+});
+
+itest!(partial_revoke_keeps_hit_key, b, {
+    // Block present at two tiers; count a hit, then revoke only one tier. Placement
+    // is still non-empty, so the hit key must survive (guard against over-deletion).
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "a",
+        1,
+        vec![
+            action(ExternalKvActionType::ActionReport, hbm(), &["1"]),
+            action(ExternalKvActionType::ActionReport, dram(), &["1"]),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    b.match_external_kv(match_req(&["1"], true)).await.unwrap();
+
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "a",
+        2,
+        vec![action(ExternalKvActionType::ActionRevoke, hbm(), &["1"])],
+    ))
+    .await
+    .unwrap();
+
+    let counts = b
+        .get_external_kv_hit_counts(GetExternalKvHitCountsRequest {
+            hashes: hashes(&["1"]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(counts.entries.len(), 1);
+    assert_eq!(counts.entries[0].hit_count_total, 1);
+});
+
 itest!(batch_action_order_is_preserved, b, {
     // revoke-then-report on the same hash within one batch must net to "stored".
     b.apply_external_kv_batch(apply_req(
