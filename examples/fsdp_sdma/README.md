@@ -126,11 +126,10 @@ Env overrides always win, so any of the defaults above can be flipped.
 ## Second platform (MI355X + AINIC / ionic)
 
 A parallel w16 FSDP2 E2E result set on AMD **MI355X** GPUs with the **AINIC
-(ionic)** RoCEv2 NIC is committed under
-[`bench/results/mi355x_ainic/`](bench/results/mi355x_ainic/README.md) — same
-`run_e2e.sh` script with the ionic node pair / NIC env, headline ~1.08×
-TFLOPS/GPU vs native with bit-identical loss. See that README for the numbers
-and the exact ionic overrides.
+(ionic)** RoCEv2 NIC is under
+[`bench/results/mi355x_ainic/`](bench/results/mi355x_ainic/) — same `run_e2e.sh`
+script with the ionic node pair / NIC env, headline ~1.08× TFLOPS/GPU vs native
+with bit-identical loss. See the figures there.
 
 ## Reproduce
 
