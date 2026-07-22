@@ -96,7 +96,7 @@ bool IsCcqeSupported(ibv_context* context) {
 /*                                          IonicCqContainer                            */
 /* ---------------------------------------------------------------------------------------------- */
 IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfig& config,
-                                   ibv_pd* pd, bool forceClassic)
+                                   ibv_pd* pd)
     : config(config) {
   int status;
   struct ibv_cq_init_attr_ex cq_attr;
@@ -104,9 +104,7 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
 
   cqeNum = config.maxCqeNum;
 
-  // forceClassic: create this CQ in the classic per-CQE color-bit format even
-  // when CCQE (compact msn-counter completions) is supported. No-op when CCQE is off.
-  const bool ccqe_enabled = IsCcqeSupported(context) && !forceClassic;
+  const bool ccqe_enabled = IsCcqeSupported(context);
 
   memset(&cq_attr, 0, sizeof(struct ibv_cq_init_attr_ex));
   cq_attr.cq_context = nullptr;

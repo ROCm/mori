@@ -71,8 +71,7 @@ HcaCapability QueryHcaCap(ibv_context* context) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          Mlx5CqContainer */
 /* ---------------------------------------------------------------------------------------------- */
-Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig& config,
-                                 bool collapsed)
+Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig& config)
     : config(config) {
   int status;
   uint8_t cmd_in[DEVX_ST_SZ_BYTES(create_cq_in)] = {
@@ -133,8 +132,8 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
   // overrun (no CQ consumer doorbell); progress is tracked via CQE[0].wqe_counter.
   // cqe_sz=0 selects 64B CQEs.
   DEVX_SET(cqc, cq_context, cqe_sz, 0x0);
-  DEVX_SET(cqc, cq_context, cc, collapsed ? 0x1 : 0x0);
-  DEVX_SET(cqc, cq_context, oi, collapsed ? 0x1 : 0x0);
+  DEVX_SET(cqc, cq_context, cc, 0x1);
+  DEVX_SET(cqc, cq_context, oi, 0x1);
   DEVX_SET(cqc, cq_context, log_cq_size, LogCeil2(cqeNum));
   DEVX_SET(cqc, cq_context, uar_page, uar->page_id);
 
