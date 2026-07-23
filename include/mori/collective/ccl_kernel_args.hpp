@@ -27,13 +27,6 @@
 
 namespace mori {
 namespace collective {
-// Crown local-block flag (MORI_HIER_CROWN). Set => the named size-adaptive crown
-// (flatMW bit9=512 + batchSelf bit11=2048 = 2560); unset/0 => byte-identical flat crown.
-inline int HierCrownRing() {
-  const char* c = std::getenv("MORI_HIER_CROWN");
-  if (c != nullptr && c[0] != '\0' && !(c[0] == '0' && c[1] == '\0')) return 2560;
-  return 0;
-}
 // Local-block push-only (MORI_HIER_LOCAL_PUSHONLY, default OFF). Decouples the bx==rb
 // local-block gather from the coupled push+wait: CTA pushes its column (no wait), the
 // completion reader also drains local flag slots [0,G). Byte-identical output, deadlock-free
@@ -49,7 +42,7 @@ inline bool HierLocalPushOnly() {
 // depth<=1 => path off.
 inline int HierDeepPipe() {
   const char* e = std::getenv("MORI_HIER_DEEP_PIPE");
-  // Default depth 2; landing anchored by the crown host fence (bit-exact, no explicit env).
+  // Default depth 2; landing anchored by the host fence (bit-exact, no explicit env).
   if (e == nullptr || e[0] == '\0') return 2;
   if (e[0] == 'a' || e[0] == 'A') return -1;  // "auto"
   int v = std::atoi(e);
@@ -340,9 +333,6 @@ struct CclFusedRingRemoteGatherArgs {
   // copy descriptors back-to-back then a single drain before firing the deferred output
   // flags. 0 = OFF (byte-identical). Bit-exact by construction (flag never precedes its bytes).
   int reasmDeepSq = 0;
-  // Crown local-block flag (see HierCrownRing / MORI_HIER_CROWN). 0 = OFF
-  // (byte-identical flat crown).
-  int crownRing = 0;
 };
 
 // Builder: merge already-built ring args (CclInterNodeRingArgs) and gather args
@@ -415,8 +405,6 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
   fused.localPushOnly = HierLocalPushOnly() ? 1 : 0;
   // Intra reassembly deep-SQ: feed all reassembly channels then drain once.
   fused.reasmDeepSq = reasmDeepSq;
-  // Crown local-block flag (MORI_HIER_CROWN); default 0 => OFF. See HierCrownRing.
-  fused.crownRing = HierCrownRing();
   return reinterpret_cast<int64_t>(&fused);
 }
 

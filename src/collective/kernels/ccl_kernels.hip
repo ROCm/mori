@@ -401,27 +401,8 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
           /*deepSqPhase=*/0,
           /*pushPeerLo=*/0,
           /*pushPeerHi=*/-1);
-    } else if (args.crownRing != 0) {
-      // crownRing: route the local-block gather through the intra-node
-      // nearest-neighbor pipelined ring (one flow per link) instead of the flat
-      // G-way push (G-1 incast). Ring self-completes on its own high-base flag
-      // region [G+reasmTotal+G, ...), disjoint from reasm flags [G, G+reasmTotal)
-      // and local flags [0, G). crownRing default 0 => byte-identical to flat push.
-      const int _cr_numRemote = args.numNodes - 1;
-      const size_t _cr_reasmTotal = static_cast<size_t>(partition) *
-                                    static_cast<size_t>(_cr_numRemote > 0 ? _cr_numRemote : 0) *
-                                    static_cast<size_t>(args.groupSize);
-      const size_t _cr_flagBase =
-          static_cast<size_t>(args.groupSize) + _cr_reasmTotal + static_cast<size_t>(args.groupSize);
-      OneShotAllGatherSdmaSubGroupRingKernel_body<uint32_t>(
-          args.myPe, args.npes, args.groupSize, args.groupPos, args.gPeBase, args.gPeStride,
-          args.gInput, args.gDstMemObj, args.gFlagsObj, args.gElementCount, args.gDstBaseOffset,
-          args.gDstSlotStrideBytes, args.gFlagVal, /*blockLocal=*/true, /*flagBase=*/_cr_flagBase,
-          /*fencedFlag=*/(args.crownRing & 8191));
-      // fencedFlag bit meanings (see oneshot_sdma_kernel.hpp for details):
-      //   bit9=flat multi-warp broadcast; bit11=batch self-fill.
     } else {
-      // Default local-block flat crown gather (localPushOnly OFF).
+      // Default local-block flat gather (localPushOnly OFF).
       OneShotAllGatherSdmaSubGroupKernel_body<uint32_t>(
           args.myPe, args.npes, args.groupSize, args.groupPos, args.gPeBase, args.gPeStride,
           args.gInput, args.gDstMemObj, args.gFlagsObj, args.gElementCount, args.gDstBaseOffset,
