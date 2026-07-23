@@ -39,7 +39,6 @@
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/memory/va_manager.hpp"  // HeapVAManager
 #include "mori/application/transport/rdma/rdma.hpp"
-// #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/cco/cco.hpp"  // public, self-contained (opaque ccoComm fwd-decl)
 #include "mori/utils/hip_compat.hpp"
