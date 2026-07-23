@@ -117,9 +117,7 @@ bit-exact path:
 |---|---|---|
 | `MORI_HIER_FUSE_LOCAL` | **experimental / unstable** | fused ring‖local-gather kernel produces stale remote-half output under FSDP tight back-to-back overlap; standalone-only. Opt in via `standalone_fast=True` or the env for standalone runs. |
 | `MORI_HIER_DEBUG_SYNC` | **diagnostic** | forces a full host `stream.synchronize()` per op (isolation probe); kills all overlap. |
-| `MORI_FSDP_NO_ZERO_COPY` | experimental | disables the zero-copy output path. |
-| `MORI_FSDP_DEFER_HOSTSYNC` | experimental | harness-side deferred backward host-drain. |
-| `MORI_HOSTPROXY_ASYNC` / `_DRAIN` / `_RING` | experimental | async host-proxy inter-node paths; not the shipped device (`ibgda_sdma`) path. |
+| `MORI_HOSTPROXY_ASYNC` / `_RING` | experimental | async host-proxy inter-node paths; not the shipped device (`ibgda_sdma`) path. |
 
 Env overrides always win, so any of the defaults above can be flipped.
 
