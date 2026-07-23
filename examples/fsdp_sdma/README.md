@@ -100,26 +100,33 @@ env set — is:
   bit-exact bandwidth path.
 - **Fused Phase-B** with stream-ordered ring/intra barriers and deferred finish
   fences.
-- **Serial `slice_direct` gather** (the fused `ring || local-gather` kernel is
-  OFF by default), CU-domain copy-out.
-- At `ranks_per_node >= 8` (the w16 config) the two cross-PE finish fences are
-  forced ON for bit-exactness.
+- CU-domain copy-out, with the two cross-PE finish fences forced ON at
+  `ranks_per_node >= 8` (the w16 config) for bit-exactness.
 
-No env var is required; the above is the internal default, not an incantation.
+This raw library default needs no env var. On top of it the FSDP adapter
+(`mori_allgather.py`) applies **zero-tuning defaults** for cross-node
+(`num_nodes >= 8` layouts) — enabled via `setdefault`, so any explicit `MORI_*`
+still wins.
 
-### Experimental / unstable knobs (OFF by default — do not enable in production)
+### Shipped env (what the `bench/scripts/run_*.sh` three-state configs set)
 
-These are opt-in levers kept for benchmarking. They are either unstable under
-E2E FSDP tight overlap or pure diagnostics; leaving them unset is the default,
-bit-exact path:
+The reproduce scripts are the source of truth; each knob below is part of a
+bit-exact shipped path (verified against RCCL), not a diagnostic. Per E2E variant
+(`run_e2e.sh`, on top of `MORI_ENABLE_SDMA=1 MORI_FSDP_ENABLE_HIER=1`):
 
-| flag | status | why OFF by default |
-|---|---|---|
-| `MORI_HIER_FUSE_LOCAL` | **experimental / unstable** | fused ring‖local-gather kernel produces stale remote-half output under FSDP tight back-to-back overlap; standalone-only. Opt in via `standalone_fast=True` or the env for standalone runs. |
-| `MORI_HIER_DEBUG_SYNC` | **diagnostic** | forces a full host `stream.synchronize()` per op (isolation probe); kills all overlap. |
-| `MORI_HOSTPROXY_ASYNC` / `_RING` | experimental | async host-proxy inter-node paths; not the shipped device (`ibgda_sdma`) path. |
+| variant | env it sets |
+|---|---|
+| `hp_sdma` | `MORI_FSDP_HOST_PROXY=1 MORI_FSDP_HOSTPROXY_CAP_MB=512 MORI_HOSTPROXY_ASYNC=1 MORI_HOSTPROXY_SDMA_INTRA=1` |
+| `hp_cu`   | `MORI_FSDP_HOST_PROXY=1 MORI_FSDP_HOSTPROXY_CAP_MB=512 MORI_HOSTPROXY_ASYNC=1` |
+| `ibgda_sdma` | `MORI_HIER_DEBUG_SYNC=0` (device IBGDA leg; no host proxy) |
 
-Env overrides always win, so any of the defaults above can be flipped.
+The FSDP adapter additionally turns on the CU-free fused fill for cross-node —
+`MORI_HIER_FUSE_LOCAL=1 MORI_HIER_FUSE_REMOTE=1 MORI_HIER_LOCAL_PUSHONLY=1`, plus
+`MORI_HIER_DEBUG_SYNC=1 MORI_HIER_CUDA_GRAPH=0` at `ranks_per_node >= 8` as the
+bit-exact landing fence (`ibgda_sdma` overrides it back to `0`). This is exactly
+the `run_ut_ag_perf.sh e2e` construction, which is bit-exact and E2E-safe.
+
+Env overrides always win, so any default above can be flipped.
 
 ## Second platform (MI355X + AINIC / ionic)
 
@@ -143,7 +150,6 @@ cd examples/fsdp_sdma/bench/scripts
 # 1) Standalone AllGather bandwidth UT (device ibgda_sdma vs RCCL)
 #    -> ../results/mi300x_mlx5/ag_perf_e2e_stable_w16.png
 bash run_ut_ag_perf.sh e2e  64 128 256 512   # E2E-stable (default) config
-bash run_ut_ag_perf.sh perf 64 128 256 512   # pure-perf (standalone_fast, NOT E2E-legal), for context
 python ../results/mi300x_mlx5/raw/plot_ag_perf.py   # (re)draw the figure from the run (or committed CSV)
 
 # 2) Compute/comm overlap UT (GEMM time under 50 concurrent AGs, hp_sdma vs RCCL)
