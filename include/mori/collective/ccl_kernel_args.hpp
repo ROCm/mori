@@ -58,15 +58,6 @@ inline int HierDeepPipe() {
   return v;
 }
 
-// Quiet-fence per-sub-chunk landing for DEEP_PIPE (MORI_HIER_DEEP_PIPE_QUIET, default OFF).
-// Each temporal sub-chunk rides its own QP with a plain put; drain that QP's send-CQ
-// (ShmemQuietThread == sub-chunk landed remotely, RC in-order) before the flag AMO, so the
-// flag never precedes the data (bit-exact at scale). Only when deepPipe>1; takes precedence
-// over the put-signal path.
-inline bool HierDeepPipeQuietOn() {
-  const char* e = std::getenv("MORI_HIER_DEEP_PIPE_QUIET");
-  return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
-}
 }  // namespace collective
 }  // namespace mori
 
@@ -212,10 +203,6 @@ struct CclInterNodeRingArgs {
   // (also forced for same-node P2P/SDMA). >1 splits the chunk across warps 0..numQp-1
   // (qpId=warpId), only when the neighbour is reached over RDMA (runtime transport check).
   int numQp;
-  // WRITE-PUSH (SEND-CQ) per-channel landing fence (MORI_HIER_RING_WRITE, default 0). Each
-  // channel CTA pushes its sub-range as a put-with-signal on qpId=bid then drains that QP's
-  // SEND CQE; receiver spins its per-channel flag. 0 = push path unchanged.
-  int useWriteFence = 0;
 };
 
 // FUSED inter-node ring + intra-node LOCAL-block SDMA gather in one grid: RDMA ring
@@ -314,7 +301,6 @@ struct CclFusedRingRemoteGatherArgs {
   size_t chunkBytes;
   int numQp;
   int ringBlocks;
-  int useWriteFence = 0;  // RDMA-WRITE-push SEND-CQ landing fence (MORI_HIER_RING_WRITE)
   uint64_t* chunkReadyFlags = nullptr;  // device, >= ringBlocks u64, zeroed
 
   // --- intra-node local-block SDMA gather (Phase B, m == nodeId) ---
@@ -342,7 +328,7 @@ struct CclFusedRingRemoteGatherArgs {
   // Deep-SQ temporal pipeline depth (see HierDeepPipe). P>1 splits the chunk into P temporal
   // sub-chunks with per-sub-chunk landing flags; 1 = OFF (byte-identical path).
   int deepPipe = 1;
-  // Deep-SQ QUIET landing fence (see HierDeepPipeQuietOn). 1 => each sub-chunk rides its own
+  // Deep-SQ QUIET landing fence (MORI_HIER_DEEP_PIPE_QUIET). 1 => each sub-chunk rides its own
   // QP; drain its send-CQ (ShmemQuietThread = sub-chunk landed remotely) before the flag AMO
   // so the flag never precedes the data (bit-exact at scale). 0 = OFF. Only when deepPipe>1.
   int deepPipeQuiet = 0;
@@ -350,7 +336,7 @@ struct CclFusedRingRemoteGatherArgs {
   // push-only, completion folded into the reader (drains flag slots [0,G)); byte-identical
   // output. 0 = OFF (coupled push+wait, byte-identical path).
   int localPushOnly = 0;
-  // Intra reassembly deep-SQ (see HierReasmDeepSqOn). 1 => a worker submits all its channels'
+  // Intra reassembly deep-SQ (reasmDeepSq, from python reasm_deep_sq). 1 => a worker submits all its channels'
   // copy descriptors back-to-back then a single drain before firing the deferred output
   // flags. 0 = OFF (byte-identical). Bit-exact by construction (flag never precedes its bytes).
   int reasmDeepSq = 0;
@@ -381,8 +367,6 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
   fused.chunkBytes = r->chunkBytes;
   fused.numQp = r->numQp;
   fused.ringBlocks = ringBlocks < 1 ? 1 : ringBlocks;
-  fused.useWriteFence =
-      r->useWriteFence;  // plumb MORI_HIER_RING_WRITE into the crown/deep-pipe launch
   fused.chunkReadyFlags = reinterpret_cast<uint64_t*>(chunkReadyFlagsPtr);
 
   fused.myPe = g->myPe;
@@ -426,10 +410,7 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
   {
     const char* q = std::getenv("MORI_HIER_DEEP_PIPE_QUIET");
     const bool quietForcedOff = (q != nullptr && q[0] == '0' && q[1] == '\0');
-    fused.deepPipeQuiet =
-        (HierDeepPipeQuietOn() || (fused.deepPipe > 1 && !quietForcedOff))
-            ? 1
-            : 0;
+    fused.deepPipeQuiet = (fused.deepPipe > 1 && !quietForcedOff) ? 1 : 0;
   }
   fused.localPushOnly = HierLocalPushOnly() ? 1 : 0;
   // Intra reassembly deep-SQ: feed all reassembly channels then drain once.

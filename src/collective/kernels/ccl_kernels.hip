@@ -254,8 +254,7 @@ extern "C" __global__ void InterNodeRingAllGatherKernel_u32(CclInterNodeRingArgs
                                   /*numBlocksOverride=*/-1, /*bidOverride=*/-1,
                                   /*chunkReadyFlags=*/nullptr,
                                   /*deepPipe=*/1,
-                                  /*deepPipeQuiet=*/0,
-                                  /*useWriteFence=*/args.useWriteFence != 0);
+                                  /*deepPipeQuiet=*/0);
 }
 
 // ============================================================================
@@ -386,8 +385,7 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
                                     /*numBlocksOverride=*/rb, /*bidOverride=*/static_cast<int>(bx),
                                     args.chunkReadyFlags,
                                     /*deepPipe=*/args.deepPipe,
-                                    /*deepPipeQuiet=*/args.deepPipeQuiet,
-                                    /*useWriteFence=*/args.useWriteFence != 0);
+                                    /*deepPipeQuiet=*/args.deepPipeQuiet);
   } else if (bx == static_cast<unsigned>(rb)) {
     // Local block (m == nodeId): ring-independent, reads this PE's own input.
     // Default: collective gather on flag slots [0, G). LOCAL-BLOCK PUSH-ONLY
@@ -421,11 +419,7 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
           args.gDstSlotStrideBytes, args.gFlagVal, /*blockLocal=*/true, /*flagBase=*/_cr_flagBase,
           /*fencedFlag=*/(args.crownRing & 8191));
       // fencedFlag bit meanings (see oneshot_sdma_kernel.hpp for details):
-      //   bit2=2x4 half-ring; bit3=fused overlap; bit4=parallel phase2;
-      //   bit5=dest-spread phase2; bit6=dest-spread phase1;
-      //   bit7=multi-warp dest-spread submission; bit8=concurrent phase1/phase2;
-      //   bit9=flat multi-warp broadcast; bit10=fused self-fill;
-      //   bit11=batch self-fill; bit12=overlap self-fill.
+      //   bit9=flat multi-warp broadcast; bit11=batch self-fill.
     } else {
       // Default local-block flat crown gather (localPushOnly OFF).
       OneShotAllGatherSdmaSubGroupKernel_body<uint32_t>(

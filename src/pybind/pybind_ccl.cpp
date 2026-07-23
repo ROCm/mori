@@ -364,9 +364,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
           [](InterNodeRing& self, int64_t stream) -> double {
             return self.finish_stream_no_copy(reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("stream"))
-      .def("npes", &InterNodeRing::npes)
-      .def("num_blocks", &InterNodeRing::num_blocks);
+          py::arg("stream"));
 
   // =========================================================================
   // IntraNodeSubGroupAllgatherSdma — intra-node SDMA gather over a sub-group
@@ -466,8 +464,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
           [](IntraSubGroup& self, int64_t stream, bool barrier) -> double {
             return self.finish_direct_stream(reinterpret_cast<hipStream_t>(stream), barrier);
           },
-          py::arg("stream"), py::arg("barrier") = true)
-      .def("npes", &IntraSubGroup::npes);
+          py::arg("stream"), py::arg("barrier") = true);
 
   // =========================================================================
   // IntraNodeSubGroupBroadcastSdma — intra-node SDMA broadcast over a sub-group
@@ -490,8 +487,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
           [](IntraBcast& self, uintptr_t output, size_t count, int64_t stream) -> double {
             return self.finish_sync(output, count, reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
-      .def("npes", &IntraBcast::npes);
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream"));
 
   // =========================================================================
   // DataType enum and size_of
