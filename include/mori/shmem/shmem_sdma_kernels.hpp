@@ -487,7 +487,7 @@ inline __device__ void ShmemQuietThreadKernel(int pe, const application::SymmMem
   HSAuint64* signals = dest->signalPtrs + intraNodePe * dest->sdmaNumQueue;
   HSAuint64* expectedSignals = dest->expectSignalsPtr + intraNodePe * dest->sdmaNumQueue;
 
-  core::SdmaQuietThread(signals, expectedSignals, dest->sdmaNumQueue);
+  core::SdmaQueitThread(signals, expectedSignals, dest->sdmaNumQueue);
 }
 
 template <application::TransportType>
@@ -499,7 +499,7 @@ inline __device__ void ShmemQuietWarpKernel(int pe, const application::SymmMemOb
   HSAuint64* signals = dest->signalPtrs + intraNodePe * dest->sdmaNumQueue;
   HSAuint64* expectedSignals = dest->expectSignalsPtr + intraNodePe * dest->sdmaNumQueue;
 
-  core::SdmaQuietWarp(signals, expectedSignals, dest->sdmaNumQueue);
+  core::SdmaQueitWarp(signals, expectedSignals, dest->sdmaNumQueue);
 }
 
 }  // namespace shmem

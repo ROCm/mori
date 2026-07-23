@@ -39,7 +39,7 @@
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/memory/va_manager.hpp"  // HeapVAManager
 #include "mori/application/transport/rdma/rdma.hpp"
-#include "mori/application/transport/sdma/anvil.hpp"
+// #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/cco/cco.hpp"  // public, self-contained (opaque ccoComm fwd-decl)
 #include "mori/utils/hip_compat.hpp"
@@ -627,9 +627,9 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
     int srcDeviceId = comm->hipDev;
     size_t numSlots = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue;
     HIP_RUNTIME_CHECK(
-        hipMalloc(&comm->sdmaDevHandles, numSlots * sizeof(anvil::SdmaQueueDeviceHandle*)));
+        hipMalloc(&comm->sdmaDevHandles, numSlots * sizeof(ccoSdmaQueueDeviceHandle*)));
     HIP_RUNTIME_CHECK(
-        hipMemset(comm->sdmaDevHandles, 0, numSlots * sizeof(anvil::SdmaQueueDeviceHandle*)));
+        hipMemset(comm->sdmaDevHandles, 0, numSlots * sizeof(ccoSdmaQueueDeviceHandle*)));
 
     for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
       int pe = comm->myNodeStart + lsa;
