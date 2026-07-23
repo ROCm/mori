@@ -85,22 +85,6 @@ int LoadShmemModule(const char* hsaco_path) {
                      hipGetErrorString(err));
     return -1;
   }
-  // optional dissemination barrier kernel. Non-fatal if
-  // missing (older module): ShmemBarrierOnStreamDissem falls back to the funnel.
-  err =
-      hipModuleGetFunction(&ms.dissemBarrierFunc, ms.module, "mori_shmem_barrier_all_block_dissem");
-  if (err != hipSuccess) {
-    ms.dissemBarrierFunc = nullptr;
-    (void)hipGetLastError();
-    MORI_SHMEM_TRACE("mori_shmem_barrier_all_block_dissem not in module; using funnel fallback");
-  }
-  // optional hierarchical 2-level barrier kernel. Non-fatal if missing.
-  err = hipModuleGetFunction(&ms.hierBarrierFunc, ms.module, "mori_shmem_barrier_all_block_hier");
-  if (err != hipSuccess) {
-    ms.hierBarrierFunc = nullptr;
-    (void)hipGetLastError();
-    MORI_SHMEM_TRACE("mori_shmem_barrier_all_block_hier not in module; using funnel fallback");
-  }
   MORI_SHMEM_TRACE("Loaded shmem JIT module: globalGpuStates={:p}, barrier={:p}",
                    (void*)ms.gpuStatesPtr, (void*)ms.barrierFunc);
   return 0;
@@ -136,8 +120,6 @@ void FinalizeRuntime(ShmemStates* states) {
     ms.module = nullptr;
     ms.gpuStatesPtr = nullptr;
     ms.barrierFunc = nullptr;
-    ms.dissemBarrierFunc = nullptr;
-    ms.hierBarrierFunc = nullptr;
   }
   states->gpuStates = {};
 }
@@ -237,43 +219,6 @@ void ShmemBarrierOnStream(hipStream_t stream) {
         "ShmemBarrierOnStream: no barrier kernel available. "
         "Load JIT shmem module (Python) or include shmem.hpp (C++ hipcc).");
     assert(false);
-  }
-}
-
-// dissemination-topology global barrier on a stream. Same
-// all-PE semantics as ShmemBarrierOnStream but O(log n) parallel rounds instead
-// of the PE0 funnel. Falls back to the funnel barrier if the module lacks the
-// dissem kernel (older module / static-launcher path).
-void ShmemBarrierOnStreamDissem(hipStream_t stream) {
-  ShmemStates* states = ShmemStatesSingleton::GetInstance();
-  states->CheckStatusValid();
-
-  if (states->moduleStates.dissemBarrierFunc != nullptr) {
-    hipError_t err = hipModuleLaunchKernel(states->moduleStates.dissemBarrierFunc, 1, 1, 1, 1, 1, 1,
-                                           0, stream, nullptr, nullptr);
-    assert(err == hipSuccess && "ShmemBarrierOnStreamDissem launch failed");
-  } else {
-    // No dissem kernel in this module: preserve correctness via the funnel.
-    ShmemBarrierOnStream(stream);
-  }
-}
-
-// hierarchical 2-level global barrier on a stream. Same all-PE semantics as
-// ShmemBarrierOnStream but crosses the RDMA node boundary only through per-node
-// coordinators (intra-node XGMI gather/release + 1 cross-node coordinator
-// exchange). Falls back to the funnel barrier if the module lacks the hier kernel.
-void ShmemBarrierOnStreamHier(hipStream_t stream, int ranksPerNode) {
-  ShmemStates* states = ShmemStatesSingleton::GetInstance();
-  states->CheckStatusValid();
-
-  if (states->moduleStates.hierBarrierFunc != nullptr) {
-    void* kernelArgs[] = {&ranksPerNode};
-    hipError_t err = hipModuleLaunchKernel(states->moduleStates.hierBarrierFunc, 1, 1, 1, 1, 1, 1,
-                                           0, stream, kernelArgs, nullptr);
-    assert(err == hipSuccess && "ShmemBarrierOnStreamHier launch failed");
-  } else {
-    // No hier kernel in this module: preserve correctness via the funnel.
-    ShmemBarrierOnStream(stream);
   }
 }
 

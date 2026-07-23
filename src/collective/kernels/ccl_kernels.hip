@@ -171,7 +171,7 @@ CCL_WRAP_ALLGATHER_PARAM_CONTIGUOUS_ASYNC_PUT(OneShotAllGatherSdmaParamContiguou
 extern "C" __global__ void OneShotAllGatherSdmaSubGroupKernel_u32(
     CclAllgatherSubGroupArgs<uint32_t> args) {
   OneShotAllGatherSdmaSubGroupKernel_body<uint32_t>(
-      args.myPe, args.npes, args.groupSize, args.groupPos, args.peBase, args.peStride, args.input,
+      args.myPe, args.groupSize, args.groupPos, args.peBase, args.peStride, args.input,
       args.dstMemObj, args.flagsMemObj, args.elementCount, args.dstBaseOffset,
       args.dstSlotStrideBytes, args.flagVal, /*blockLocal=*/false, args.flagBase);
 }
@@ -181,7 +181,7 @@ extern "C" __global__ void OneShotAllGatherSdmaSubGroupKernel_u32(
 extern "C" __global__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_u32(
     CclAllgatherSubGroupParamContiguousArgs<uint32_t> args) {
   OneShotAllGatherSdmaSubGroupParamContiguousKernel_body<uint32_t>(
-      args.myPe, args.npes, args.groupSize, args.groupPos, args.peBase, args.peStride,
+      args.myPe, args.groupSize, args.groupPos, args.peBase, args.peStride,
       args.numBlocks, args.firstBlock, args.input, args.dstMemObj, args.flagsMemObj,
       args.blockStrideElems, args.worldSize, args.dstBaseOffset, args.flagVal, args.splitSizes,
       args.splitOffsets, args.splitCount);
@@ -274,7 +274,7 @@ extern "C" __global__ void FusedRingLocalGatherKernel_u32(CclFusedRingLocalGathe
                                     /*chunkReadyFlags=*/nullptr);
   } else {
     OneShotAllGatherSdmaSubGroupKernel_body<uint32_t>(
-        args.myPe, args.npes, args.groupSize, args.groupPos, args.gPeBase, args.gPeStride,
+        args.myPe, args.groupSize, args.groupPos, args.gPeBase, args.gPeStride,
         args.gInput, args.gDstMemObj, args.gFlagsObj, args.gElementCount, args.gDstBaseOffset,
         args.gDstSlotStrideBytes, args.gFlagVal, /*blockLocal=*/true, /*flagBase=*/0);
   }
@@ -404,7 +404,7 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
     } else {
       // Default local-block flat gather (localPushOnly OFF).
       OneShotAllGatherSdmaSubGroupKernel_body<uint32_t>(
-          args.myPe, args.npes, args.groupSize, args.groupPos, args.gPeBase, args.gPeStride,
+          args.myPe, args.groupSize, args.groupPos, args.gPeBase, args.gPeStride,
           args.gInput, args.gDstMemObj, args.gFlagsObj, args.gElementCount, args.gDstBaseOffset,
           args.gDstSlotStrideBytes, args.gFlagVal, /*blockLocal=*/true, /*flagBase=*/0,
           /*pushPeerLo=*/0,

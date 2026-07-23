@@ -62,50 +62,6 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   expectedSignals[qId]++;
 }
 
-// COPY_LINEAR + REMOTE ADD64(+1) on the same queue, one doorbell. FIFO order
-// => the peer sees the counter increment only after the copied bytes land. The
-// ADD64 must ride the SDMA engine (peerCounterAddr is XGMI P2P engine-mapped,
-// not CU-atomic-safe). No local signal; expectedSignals not bumped.
-inline __device__ void SdmaPutCopyRemoteAddThread(void* srcBuf, void* dstBuf, size_t copy_size,
-                                                  anvil::SdmaQueueDeviceHandle** deviceHandles,
-                                                  uint32_t qId, void* peerCounterAddr) {
-  // A single SDMA_PKT_COPY_LINEAR whose byte count exceeds ~8 MiB faults on this
-  // CDNA3 SDMA microcode ("Write access to a read-only page"): the large single copy
-  // runs the count field off the destination allocation onto the next (read-only)
-  // page. Split the copy into <=8 MiB contiguous sub-descriptors placed back-to-back on
-  // the same queue, then one trailing ADD64 to the peer counter. The engine drains
-  // queue packets in strict FIFO order, so the +1 still lands strictly after every byte
-  // of every sub-copy (flag-after-bytes native); the accumulating ADD is unchanged (one
-  // +1 per drained ring step). At copy_size <= 8 MiB this is byte-identical to the prior
-  // single-descriptor path. Distinct from ndesc latency pipelining: this is a hard
-  // copy-size cap dictated by the microcode count limit.
-  const size_t kMaxCopy = 8u * 1024u * 1024u;  // proven-safe single COPY_LINEAR byte count
-  size_t nCopy = (copy_size + kMaxCopy - 1) / kMaxCopy;
-  if (nCopy < 1) nCopy = 1;
-  uint64_t offset = 0;
-  anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
-  uint64_t base = handle.ReserveQueueSpace(
-      nCopy * sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC), offset);
-  uint64_t startBase = base;
-  uint64_t pendingWptr = base;
-  char* srcC = reinterpret_cast<char*>(srcBuf);
-  char* dstC = reinterpret_cast<char*>(dstBuf);
-  uint64_t placeOffset = offset;
-  for (size_t i = 0; i < nCopy; ++i) {
-    size_t o = i * kMaxCopy;
-    size_t len = copy_size - o;
-    if (len > kMaxCopy) len = kMaxCopy;
-    auto copy_packet = anvil::CreateCopyPacket(srcC + o, dstC + o, len);
-    handle.template placePacket<SDMA_PKT_COPY_LINEAR>(copy_packet, pendingWptr, placeOffset);
-    placeOffset = 0;  // wrap padding applies only to the first placement
-  }
-  // CreateAtomicIncPacket = SDMA_OP_ATOMIC / ADD64 with SRC_DATA=+1, targeting the given
-  // address. Point it at the REMOTE peer's tail counter to accumulate +1 per drained step.
-  auto add_packet = anvil::CreateAtomicIncPacket(reinterpret_cast<HSAuint64*>(peerCounterAddr));
-  handle.template placePacket<SDMA_PKT_ATOMIC>(add_packet, pendingWptr, 0);
-  handle.submitPacket(startBase, pendingWptr);
-}
-
 inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
                                    anvil::SdmaQueueDeviceHandle** deviceHandles, HSAuint64* signals,
                                    HSAuint64* expectedSignals, uint32_t queNum) {

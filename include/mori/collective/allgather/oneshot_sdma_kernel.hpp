@@ -150,12 +150,11 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes, T* input,
 // so independent sub-group gathers run concurrently without racing shared slots.
 template <typename T>
 __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
-    int myPe, int npes, int groupSize, int groupPos, int peBase, int peStride, T* input,
+    int myPe, int groupSize, int groupPos, int peBase, int peStride, T* input,
     const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
     size_t elementCount, size_t dstBaseOffset = 0, size_t dstSlotStrideBytes = 0,
-    uint64_t flagVal = 1, bool blockLocal = false, size_t flagBase = 0,
-    int pushPeerLo = 0, int pushPeerHi = -1) {
-  (void)npes;
+    uint64_t flagVal = 1, bool blockLocal = false, size_t flagBase = 0, int pushPeerLo = 0,
+    int pushPeerHi = -1) {
   if (elementCount == 0 || groupSize <= 0) {
     return;
   }
@@ -197,8 +196,7 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
   }
 
   // Per-peer completion tail: each warp drains its peer's queue then bumps its flag.
-  if (warpId >= pLo &&
-      warpId < pHi && laneId == 0) {
+  if (warpId >= pLo && warpId < pHi && laneId == 0) {
     int remotePe = peBase + warpId * peStride;
     SubGroupSdmaDrainPe(remotePe, dstMemObj);
     // Sender-side completion fence: system-scope order the pushed bytes before the flag
@@ -246,16 +244,18 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
 // reader waits every flag afterward. ``qId`` MUST be distinct across blocks targeting the
 // same peer (per-queue signal counter expectedSignals[qId] must not be raced).
 template <typename T>
-__device__ void OneShotSubGroupPushOnly_body(
-    int groupSize, int groupPos, int peBase, int peStride, T* input,
-    const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
-    size_t elementCount, size_t dstBaseOffset, size_t dstSlotStrideBytes, uint64_t flagVal,
-    size_t flagBase, int qId, int deepSqPhase = 0,
-    int pushPeerLo = 0, int pushPeerHi = -1, int pushFlag = 1) {
-  // Deep-SQ phase split (reasmDeepSq, from python reasm_deep_sq). 0 = single-shot (submit->drain->fence->
-  // flag). 1 = submit-only (copy + bump expectedSignals[q], no drain/fence/flag) to feed
-  // the engine back-to-back. 2 = drain+flag-only (one quiet covers all phase-1 submits on
-  // this queue, then fence + flag).
+__device__ void OneShotSubGroupPushOnly_body(int groupSize, int groupPos, int peBase, int peStride,
+                                             T* input, const application::SymmMemObjPtr dstMemObj,
+                                             const application::SymmMemObjPtr flagsMemObj,
+                                             size_t elementCount, size_t dstBaseOffset,
+                                             size_t dstSlotStrideBytes, uint64_t flagVal,
+                                             size_t flagBase, int qId, int deepSqPhase = 0,
+                                             int pushPeerLo = 0, int pushPeerHi = -1,
+                                             int pushFlag = 1) {
+  // Deep-SQ phase split (reasmDeepSq, from python reasm_deep_sq). 0 = single-shot
+  // (submit->drain->fence-> flag). 1 = submit-only (copy + bump expectedSignals[q], no
+  // drain/fence/flag) to feed the engine back-to-back. 2 = drain+flag-only (one quiet covers all
+  // phase-1 submits on this queue, then fence + flag).
   if (elementCount == 0 || groupSize <= 0) {
     return;
   }
@@ -284,8 +284,8 @@ __device__ void OneShotSubGroupPushOnly_body(
     HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * nq;
     // Push this rank's column on its OWN queue ``q``. Phase 2 skips the submit.
     if (deepSqPhase != 2) {
-      core::SdmaPutThread(srcPtr, dstPtr, bytesPerPeer, devicehandles, signals, expectedSignals,
-                          nq, q);
+      core::SdmaPutThread(srcPtr, dstPtr, bytesPerPeer, devicehandles, signals, expectedSignals, nq,
+                          q);
     }
     // Phase 1 skips drain/fence/flag to feed the next copy without a drain round-trip.
     if (deepSqPhase != 1) {
@@ -297,8 +297,8 @@ __device__ void OneShotSubGroupPushOnly_body(
       // (non-last tile) suppresses only the flag; the copy is still drained+fenced.
       if (pushFlag) {
         shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-            flagsMemObj, (flagBase + static_cast<size_t>(groupPos)) * sizeof(uint64_t), &flagVal,
-            8, core::atomicType::AMO_SET, remotePe, 0);
+            flagsMemObj, (flagBase + static_cast<size_t>(groupPos)) * sizeof(uint64_t), &flagVal, 8,
+            core::atomicType::AMO_SET, remotePe, 0);
       }
     }
   }
@@ -314,12 +314,11 @@ __device__ void OneShotSubGroupPushOnly_body(
 // ``O_s*W + (m*G+g)*E_s``. Same subgroup flags: bump slot ``g`` once, wait all G members.
 template <typename T>
 __device__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_body(
-    int myPe, int npes, int groupSize, int groupPos, int peBase, int peStride, int numBlocks,
-    int firstBlock, T* input, const application::SymmMemObjPtr dstMemObj,
+    int myPe, int groupSize, int groupPos, int peBase, int peStride, int numBlocks, int firstBlock,
+    T* input, const application::SymmMemObjPtr dstMemObj,
     const application::SymmMemObjPtr flagsMemObj, size_t blockStrideElems, size_t worldSize,
     size_t dstBaseOffset, uint64_t flagVal, const size_t* splitSizes, const size_t* splitOffsets,
     size_t splitCount) {
-  (void)npes;
   if (groupSize <= 0 || numBlocks <= 0 || splitCount == 0 || splitSizes == nullptr ||
       splitOffsets == nullptr) {
     return;

@@ -291,28 +291,12 @@ void AnvilLib::init() {
 bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
   std::lock_guard<std::mutex> lock(channels_mutex_);
   // Spread the channels across the engines recommended by KFD for this peer link.
-  // On tested HW the KFD mask already assigns a distinct engine per peer link, so
-  // the optional MORI_SDMA_ENGINE_OAM=1 override (force channel 0 onto the static
-  // OAM-table engine) is a no-op. Default (unset) => byte-identical mapping.
-  static const int engMode = []() {
-    const char* e = getenv("MORI_SDMA_ENGINE_OAM");
-    return e ? atoi(e) : 0;
-  }();
+  // On tested HW the KFD mask already assigns a distinct engine per peer link.
   std::vector<uint32_t> engines;
   if (srcDeviceId == dstDeviceId) {
     // A loopback copy never traverses xGMI and has no self io_link, so KFD
     // reports no recommended engine. Use a general (non-xGMI) SDMA engine.
     engines.push_back(0);
-  } else if (engMode != 0) {
-    // Force the distinct-per-destination OAM engine on channel 0 (the flat-gather
-    // queue). Higher channels append the KFD-recommended engines (if any) so the
-    // multi-queue path still has spread; channel 0 is what the local gather drives.
-    int base = getSdmaEngineId(srcDeviceId, dstDeviceId);
-    engines.push_back(static_cast<uint32_t>(base));
-    uint32_t mask = getRecommendedEngineMask(srcDeviceId, dstDeviceId);
-    for (uint32_t b = 0; b < 32; ++b) {
-      if ((mask & (1u << b)) && b != static_cast<uint32_t>(base)) engines.push_back(b);
-    }
   } else {
     uint32_t mask = getRecommendedEngineMask(srcDeviceId, dstDeviceId);
     for (uint32_t b = 0; b < 32; ++b) {
