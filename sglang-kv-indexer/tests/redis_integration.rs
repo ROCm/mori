@@ -200,6 +200,136 @@ itest!(same_seq_batch_replay_is_idempotent, b, {
     assert_eq!(tiers_for(&second, "w1", "9"), vec![hbm()]);
 });
 
+itest!(recomputed_full_node_restores_hbm_placement, b, {
+    // HiRadixCache lifecycle for an exact-match recomputation:
+    // BlockStored(GPU) -> BlockRemoved(GPU) -> BlockStored(GPU).
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "a",
+        1,
+        vec![action(ExternalKvActionType::ActionReport, hbm(), &["full"])],
+    ))
+    .await
+    .unwrap();
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "a",
+        2,
+        vec![action(ExternalKvActionType::ActionRevoke, hbm(), &["full"])],
+    ))
+    .await
+    .unwrap();
+    let evicted = b
+        .match_external_kv(match_req(&["full"], false))
+        .await
+        .unwrap();
+    assert!(tiers_for(&evicted, "w1", "full").is_empty());
+
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "a",
+        3,
+        vec![action(ExternalKvActionType::ActionReport, hbm(), &["full"])],
+    ))
+    .await
+    .unwrap();
+    let restored = b
+        .match_external_kv(match_req(&["full"], false))
+        .await
+        .unwrap();
+    assert_eq!(tiers_for(&restored, "w1", "full"), vec![hbm()]);
+});
+
+itest!(recomputed_split_reports_only_materialized_hashes, b, {
+    // An evicted [prefix -> old suffix] is partially recomputed as
+    // [prefix -> new suffix]. The old suffix must remain absent.
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "a",
+        1,
+        vec![action(
+            ExternalKvActionType::ActionReport,
+            hbm(),
+            &["prefix", "old-suffix"],
+        )],
+    ))
+    .await
+    .unwrap();
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "a",
+        2,
+        vec![action(
+            ExternalKvActionType::ActionRevoke,
+            hbm(),
+            &["prefix", "old-suffix"],
+        )],
+    ))
+    .await
+    .unwrap();
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "a",
+        3,
+        vec![
+            action(ExternalKvActionType::ActionReport, hbm(), &["prefix"]),
+            action(ExternalKvActionType::ActionReport, hbm(), &["new-suffix"]),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    let result = b
+        .match_external_kv(match_req(&["prefix", "old-suffix", "new-suffix"], false))
+        .await
+        .unwrap();
+    assert_eq!(tiers_for(&result, "w1", "prefix"), vec![hbm()]);
+    assert!(tiers_for(&result, "w1", "old-suffix").is_empty());
+    assert_eq!(tiers_for(&result, "w1", "new-suffix"), vec![hbm()]);
+});
+
+itest!(
+    recomputed_batch_replay_is_idempotent_and_keeps_cpu_copy,
+    b,
+    {
+        // Re-materializing on GPU must not revoke the existing host backup. If the
+        // bridge replays the same sequence, the durable sequence gate rejects the
+        // duplicate without changing either tier.
+        b.apply_external_kv_batch(apply_req(
+            "w1",
+            "a",
+            1,
+            vec![action(
+                ExternalKvActionType::ActionReport,
+                dram(),
+                &["tiered"],
+            )],
+        ))
+        .await
+        .unwrap();
+        let recomputed = apply_req(
+            "w1",
+            "a",
+            2,
+            vec![action(
+                ExternalKvActionType::ActionReport,
+                hbm(),
+                &["tiered"],
+            )],
+        );
+        let first = b.apply_external_kv_batch(recomputed.clone()).await.unwrap();
+        let replay = b.apply_external_kv_batch(recomputed).await.unwrap();
+        assert!(!first.duplicate);
+        assert!(replay.duplicate);
+
+        let result = b
+            .match_external_kv(match_req(&["tiered"], false))
+            .await
+            .unwrap();
+        assert_eq!(tiers_for(&result, "w1", "tiered"), vec![hbm(), dram()]);
+    }
+);
+
 itest!(revoke_partial_tier_keeps_other_tier, b, {
     b.apply_external_kv_batch(apply_req(
         "w1",
