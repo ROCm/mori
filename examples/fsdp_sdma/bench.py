@@ -283,7 +283,7 @@ def main() -> None:
                 "--profile-steps must be positive when --profile-dir is set"
             )
     _configure_mode(args.mode)
-    rank, local_rank, world_size, device = _init_distributed(args.backend)
+    rank, _local_rank, world_size, device = _init_distributed(args.backend)
     _init_mori_shmem_if_needed(args.mode)
 
     dtype = _get_torch_dtype(args.dtype)

@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
-# Cross-node (w16, 2 node x 8 GPU) standalone AllGather-perf UT runner with TWO
-# switch presets for the mori device (ibgda_sdma) handle:
-#
-#   perf : standalone_fast fan-out + all tuning knobs (MORI_HIER_UT_FAST=1 +
-#          DEEP_PIPE=auto + SDMA_NUM_CHANNELS=8 + NIC_NUMA_LOCAL,
-#          debug_sync OFF). Fast but not E2E-legal: the E2E FSDP adapter never
-#          constructs HierAllGather with standalone_fast.
+# Cross-node (w16, 2 node x 8 GPU) standalone AllGather-perf UT runner for the
+# mori device (ibgda_sdma) handle:
 #
 #   e2e  : the exact construction the w16 E2E FSDP run uses (MORI_HIER_UT_FAST=0 +
 #          fuse knobs + DEBUG_SYNC=1 + CUDA_GRAPH=0). Bit-exact and E2E-safe; the
 #          representative UT.
 #
-# RCCL (all_gather_into_tensor) is measured inline in both presets as the reference.
-# usage: bash run_ut_ag_perf.sh <perf|e2e> [sizes_mb...]
+# RCCL (all_gather_into_tensor) is measured inline as the reference.
+# usage: bash run_ut_ag_perf.sh <e2e> [sizes_mb...]
 set -u
-PRESET="${1:?usage: run_ut_ag_perf.sh <perf|e2e> [sizes_mb...]}"; shift || true
+PRESET="${1:?usage: run_ut_ag_perf.sh <e2e> [sizes_mb...]}"; shift || true
 SIZES="${*:-64 128 512}"
 
 MASTER="${MASTER:-<master>}" ; MASTER_IP="${MASTER_IP:-<master-ip>}" ; WORKER="${WORKER:-<worker>}"
@@ -29,10 +24,8 @@ NCCL_IB_HCA=$IB NCCL_IB_GID_INDEX=$GID MORI_RDMA_DEVICES=$IB"
 FUSE="MORI_HIER_FUSE_LOCAL=1 MORI_HIER_FUSE_REMOTE=1 MORI_HIER_LOCAL_PUSHONLY=1"
 
 case "$PRESET" in
-  perf) ENVSET="MORI_ENABLE_SDMA=1 $FUSE MORI_HIER_UT_FAST=1 MORI_HIER_DEBUG_SYNC=0 \
-MORI_HIER_DEEP_PIPE=auto MORI_SDMA_NUM_CHANNELS=8 MORI_HIER_NIC_NUMA_LOCAL=1" ;;
   e2e)  ENVSET="MORI_ENABLE_SDMA=1 $FUSE MORI_HIER_UT_FAST=0 MORI_HIER_DEBUG_SYNC=1 MORI_HIER_CUDA_GRAPH=0" ;;
-  *) echo "preset must be perf|e2e"; exit 2 ;;
+  *) echo "preset must be e2e"; exit 2 ;;
 esac
 
 PORT=$(( 29500 + RANDOM % 400 ))

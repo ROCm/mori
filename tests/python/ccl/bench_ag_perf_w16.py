@@ -44,8 +44,6 @@ _LOGS = os.path.abspath(
 
 def _build(mode, rank, ws, rpn, per, device):
     if mode == "device":
-        # standalone_fast engages the fuse_local fast path (else non-fused).
-        uf = os.environ.get("MORI_HIER_UT_FAST", "1") not in ("0", "", "false", "False")
         return HierAllGather(
             my_pe=rank,
             npes=ws,
@@ -53,7 +51,6 @@ def _build(mode, rank, ws, rpn, per, device):
             input_buffer_size=per,
             output_buffer_size=per * ws,
             copy_output_to_user=True,
-            standalone_fast=uf,
         )
     from mori.ccl.host_proxy_ag import HostProxyHierAllGather
 

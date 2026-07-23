@@ -48,13 +48,6 @@ import torch
 # import time, ahead of shmem.init().
 MORI_SDMA_CH_HW_MAX = 8
 
-# Fail-closed topology bounds for the C++ hier barrier
-# ``ShmemInternalBarrierHierBlock``, whose fixed 128-uint64 internalSync region
-# gives coordinator inbox [96,112) => num_nodes<=16 and local-PE inbox [112,120)
-# => ranks_per_node<=8. Exceeding either overwrites an adjacent slot.
-MORI_HIER_MAX_RANKS_PER_NODE = 8
-MORI_HIER_MAX_NUM_NODES = 16
-
 
 def _clamp_sdma_channels():
     _v = os.environ.get("MORI_SDMA_NUM_CHANNELS")
@@ -238,7 +231,6 @@ class HierAllGather:
         slice_fuse_ib: Optional[bool] = None,
         slice_pipe_chunks: Optional[int] = None,
         slice_direct: Optional[bool] = None,
-        standalone_fast: bool = False,
     ):
         # Fan the inter-node RDMA ring put across this many QPs to fill the NIC
         # (default 4 = provisioned). Fans out only for true cross-node neighbours.
@@ -265,9 +257,7 @@ class HierAllGather:
         # data path -> incompatible with leader_only/gather_in_place.
         _slice_conflict = self.leader_only or self.gather_in_place
         self.slice_inter = (
-            bool(slice_inter)
-            if slice_inter is not None
-            else not _slice_conflict
+            bool(slice_inter) if slice_inter is not None else not _slice_conflict
         )
         # Fused sliced Phase B: fold the N reassembly gathers into one batch stacked
         # into disjoint transit regions (dst_base_offset=m*block), keeping only the
@@ -303,14 +293,11 @@ class HierAllGather:
         self.slice_defer_inter_fin = True
         # Fused ring || local-block gather in one launch. OFF by default: under FSDP
         # tight back-to-back overlap the ring buffer is read out before the ring
-        # CTA's remote puts are globally visible -> stale remote-half. Standalone is
-        # bit-exact with it ON via standalone_fast=True; env overrides.
+        # CTA's remote puts are globally visible -> stale remote-half. Env overrides.
         if "MORI_HIER_FUSE_LOCAL" in os.environ:
             self.fuse_local = _env_true("MORI_HIER_FUSE_LOCAL")
         else:
-            self.fuse_local = bool(standalone_fast)
-        self._standalone_fast = bool(standalone_fast)
-        self._apply_standalone_fast_defaults(standalone_fast)
+            self.fuse_local = False
         self._init_fused_ring_state()
         # Direct-to-output Phase B: gathers PUSH each slice into the registered user
         # output, dropping the finish_batch D2D copy. Registration is safe only over
@@ -337,23 +324,6 @@ class HierAllGather:
                 f"npes ({npes}) must be a positive multiple of ranks_per_node "
                 f"({ranks_per_node})"
             )
-        # Fail-closed hier-barrier slot-layout guard (see MORI_HIER_MAX_* above).
-        if ranks_per_node > MORI_HIER_MAX_RANKS_PER_NODE:
-            raise ValueError(
-                f"ranks_per_node ({ranks_per_node}) exceeds the supported "
-                f"maximum ({MORI_HIER_MAX_RANKS_PER_NODE}); the hier barrier's "
-                f"local-PE inbox has only {MORI_HIER_MAX_RANKS_PER_NODE} slots "
-                f"(see ShmemInternalBarrierHierBlock)."
-            )
-        _num_nodes = npes // ranks_per_node
-        if _num_nodes > MORI_HIER_MAX_NUM_NODES:
-            raise ValueError(
-                f"num_nodes ({_num_nodes} = npes {npes} / ranks_per_node "
-                f"{ranks_per_node}) exceeds the supported maximum "
-                f"({MORI_HIER_MAX_NUM_NODES}); the hier barrier's coordinator "
-                f"inter-node inbox has only {MORI_HIER_MAX_NUM_NODES} slots "
-                f"(see ShmemInternalBarrierHierBlock)."
-            )
 
         self.my_pe = my_pe
         self.npes = npes
@@ -378,29 +348,6 @@ class HierAllGather:
             output_buffer_size,
             copy_output_to_user,
         )
-
-    def _apply_standalone_fast_defaults(self, standalone_fast):
-        """Apply the standalone fast-path env defaults (MORI_SDMA_NUM_CHANNELS /
-        FUSE_REMOTE / DEEP_PIPE / DISSEM_BARRIER). No FSDP/E2E caller passes
-        standalone_fast, so those paths are unaffected."""
-        self._standalone_fast = bool(standalone_fast)
-        if standalone_fast:
-            if os.environ.get("MORI_SDMA_NUM_CHANNELS") is None:
-                os.environ["MORI_SDMA_NUM_CHANNELS"] = str(MORI_SDMA_CH_HW_MAX)
-            # fuse_remote + DEEP_PIPE=auto: fused ring||reassembly with the
-            # auto-quiet send-CQ landing fence, caged bit-exact by the 32MB window.
-            if os.environ.get("MORI_HIER_FUSE_REMOTE") is None:
-                os.environ["MORI_HIER_FUSE_REMOTE"] = "1"
-            if os.environ.get("MORI_HIER_DEEP_PIPE") is None:
-                os.environ["MORI_HIER_DEEP_PIPE"] = "auto"
-            # O(log n) dissemination barrier: same global rendezvous semantics
-            # (bit-exact) at ceil(log2 n) hops vs the PE0 funnel's ~2(n-1).
-            # standalone_fast only; E2E keeps dissem OFF. Env overrides.
-            if os.environ.get("MORI_HIER_DISSEM_BARRIER") is None:
-                os.environ["MORI_HIER_DISSEM_BARRIER"] = "1"
-        # Standalone finish-barrier deferral: drop the per-op finish barrier,
-        # leaning on the successor's entry barrier for reuse (bit-exact).
-        self._standalone_defer_fin = bool(standalone_fast)
 
     def _init_fused_ring_state(self):
         """Init fused ring / flag-token / reasm-deep-SQ / host-proxy-inter state."""
@@ -712,11 +659,6 @@ class HierAllGather:
             and not self._debug_sync
         ):
             _cg_max_mb = 48.0
-            # The standalone fused path runs ring||reassembly in one grid (no CPU
-            # side-stream to serialize under replay), so capture is lossless at bulk
-            # sizes -> drop the cap; other paths keep the 48MB gate.
-            if self._standalone_fast and (self.fuse_remote or self.fuse_local):
-                _cg_max_mb = 0.0  # uncapped: single-grid path is lossless-capturable
             _cg_bytes = int(count) * int(input_data.element_size())
             if _cg_max_mb <= 0 or _cg_bytes <= _cg_max_mb * 1024 * 1024:
                 if self._graph_replay(input_data, output_data, count, stream):
@@ -816,11 +758,7 @@ class HierAllGather:
             # Sliced 2-D AllGather (see __init__). Phase A (inter ring): each rank
             # rings only its own shard into C_g in node order.
             slice_total = count * N
-            if (
-                use_pipe_band
-                and self.slice_fused
-                and self.slice_pipe_chunks > 1
-            ):
+            if use_pipe_band and self.slice_fused and self.slice_pipe_chunks > 1:
                 # Chunked-ring pipeline overlap: per element-range chunk, run the
                 # inter ring (main stream) into a disjoint scratch region then launch
                 # its N reassembly gathers on a side SDMA stream, so chunk k's gather
@@ -941,11 +879,7 @@ class HierAllGather:
                     # one deferrable global fence completes the op. See
                     # _ensure_output_registered for the lockstep registration.
                     self._ensure_output_registered(output_data)
-                    if (
-                        self.fuse_remote
-                        and self.num_nodes == 2
-                        and not entry_barrier
-                    ):
+                    if self.fuse_remote and self.num_nodes == 2 and not entry_barrier:
                         # Fused-remote pipeline: one launch runs the ring and, per
                         # landed sub-range, pushes the remote-block SDMA from the ring
                         # buffer into the output (no ring copy-OUT / finish barrier).
@@ -1004,7 +938,7 @@ class HierAllGather:
                         flags = self._chunk_ready_flags
                         flags.zero_()
                         # Ring prepare = global entry barrier + copy-IN (no launch).
-                        ring_args, u32c, s_main = self._inter.prepare_stream_only(
+                        ring_args, _u32c, s_main = self._inter.prepare_stream_only(
                             input_data, count, stream
                         )
                         # Local-block direct-gather jit_args (own input, no ring dep).
@@ -1042,8 +976,6 @@ class HierAllGather:
                         # every remote push landed + threadfence, so output is stream-
                         # correct without it; reuse covered by the successor's prepare.
                         _fin_barrier = not self.slice_defer_fin
-                        if self._standalone_defer_fin:
-                            _fin_barrier = False
                         self._intra.finish_direct_stream(
                             stream=stream, barrier=_fin_barrier
                         )
@@ -1061,7 +993,7 @@ class HierAllGather:
                             else stream
                         )
                         # Ring prepare = global entry barrier + copy-IN (no launch).
-                        ring_args, u32c, s_main = self._inter.prepare_stream_only(
+                        ring_args, _u32c, s_main = self._inter.prepare_stream_only(
                             input_data, count, stream
                         )
                         # Local-block direct-gather jit_args (no launch).
@@ -1080,27 +1012,15 @@ class HierAllGather:
                         )
                         # Ring finish copy-OUT (ring kernel already ran in the fused
                         # launch); copy-engine finish so fuse_local never moves bulk
-                        # bytes on CUs. standalone_fast eliminates this copy-OUT: the
-                        # copy-engine D2D is the stale-remote race (not ordered by the
-                        # ring CTA's __threadfence_system), so read the ring buffer
-                        # directly (byte-identical). standalone_fast only.
-                        _fl_nocopy = bool(getattr(self, "_standalone_fast", False))
-                        if _fl_nocopy:
-                            # Read the ring buffer directly; the trailing
-                            # finish_direct_stream + the first remote gather's intra
-                            # entry barrier order the ring landing before any read.
-                            reasm_src = self._inter.full_tensor(
-                                count, input_data.dtype, input_data.device
-                            )
-                        else:
-                            reasm_src = collection
-                            self._inter.finish_ring_stream(
-                                collection,
-                                count,
-                                stream,
-                                barrier=not self.slice_defer_inter_fin,
-                                cu_copyout=False,
-                            )
+                        # bytes on CUs.
+                        reasm_src = collection
+                        self._inter.finish_ring_stream(
+                            collection,
+                            count,
+                            stream,
+                            barrier=not self.slice_defer_inter_fin,
+                            cu_copyout=False,
+                        )
                         # Remote blocks read the ring collection via an intra-node
                         # subgroup gather. A single intra entry barrier on the first
                         # remote gather orders every rank's ring copy-OUT before any
