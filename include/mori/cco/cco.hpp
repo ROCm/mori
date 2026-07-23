@@ -908,42 +908,31 @@ int ccoBarrierAll(ccoComm* comm);
 // queues; peers by LSA rank; completion awaited by quiet. Device-only.
 #if defined(__HIPCC__) || defined(__CUDACC__)
 
-// SDMA device layer, inlined from sdma_pkt_struct.h, anvil_device.hpp and
-// device_primitives.hpp so cco.hpp alone suffices.
-// No external headers: uses AMDGCN builtins + __hip_atomic_* directly, shims
-// HSAuint64/__forceinline__, and traps instead of device assert().
-//
-// MAINTENANCE: this is a deliberate FORK, not a live mirror. The copies below do
-// NOT auto-track the originals — they intentionally diverge (CCO_ prefixes,
-// __builtin_trap instead of assert, trimmed to the two packet types cco posts).
-// Do not "sync" them wholesale. The one contract that MUST hold is the on-wire
-// layout of ccoSdmaQueueDeviceHandle vs anvil::SdmaQueueDeviceHandle, because
-// cco_init.cpp byte-copies handle pointers between them; that is enforced by
-// static_asserts in src/cco/device/cco_device_wrapper.cpp, so a layout drift on
-// either side fails the build rather than corrupting queues at runtime.
+// SDMA device layer — a deliberate FORK of sdma_pkt_struct.h / anvil_device.hpp
+// / device_primitives.hpp, inlined so cco.hpp is self-contained. Uses AMDGCN
+// builtins + __hip_atomic_* directly (no HIP runtime header) and diverges on
+// purpose (CCO_ prefixes, __builtin_trap over assert, only the packets cco
+// posts), so don't blindly re-sync it. The one contract that must hold is
+// ccoSdmaQueueDeviceHandle staying layout-compatible with
+// anvil::SdmaQueueDeviceHandle (cco_init.cpp byte-copies handle pointers between
+// them) — enforced by static_asserts in src/cco/device/cco_device_wrapper.cpp.
 
-// HSAuint64: guarded on hsakmt's own include guard to avoid a redefinition when
-// a TU also pulls in hsakmt/hsakmttypes.h.
+// Guarded on hsakmt's / HIP's own include guards to avoid redefinition when a TU
+// also pulls in hsakmt/hsakmttypes.h or <hip/hip_runtime.h>.
 #ifndef _HSAKMTTYPES_H_
 typedef uint64_t HSAuint64;
 #endif
-
-// __forceinline__: no-op when <hip/hip_runtime.h> already defined it. (No
-// warpSize macro — HIP has a `warpSize` member; use the builtin at call sites.)
 #ifndef __forceinline__
 #define __forceinline__ inline __attribute__((always_inline))
 #endif
 
-// All the inlined SDMA code below is cco-private and lives entirely in this
-// header, so it all sits in namespace mori::cco alongside ccoSdma — no separate
-// anvil / mori::core namespaces (those only made sense in the original headers).
+// The inlined SDMA code is cco-private, so it all sits in namespace mori::cco
+// alongside ccoSdma (no separate anvil / mori::core namespaces).
 namespace mori {
 namespace cco {
 
-// ── from mori/core/transport/sdma/sdma_pkt_struct.h ──
-// Trimmed to the two packet types the ccoSdma path posts (linear copy + atomic
-// increment) and the op/sub-op constants they set. The other SDMA packet structs
-// (write/fence/fill/trap/poll/timestamp/nop) are unused here and omitted.
+// ── from sdma_pkt_struct.h — only the two packets cco posts (linear copy +
+//    atomic increment) and their op/sub-op constants. ──
 const unsigned int CCO_SDMA_OP_COPY = 1;
 const unsigned int CCO_SDMA_OP_ATOMIC = 10;
 
@@ -1079,13 +1068,10 @@ typedef struct CCO_SDMA_PKT_ATOMIC_TAG {
   } LOOP_UNION;
 } CCO_SDMA_PKT_ATOMIC;
 
-// ── from mori/core/transport/sdma/anvil_device.hpp ──
+// ── from anvil_device.hpp (device path only; host queue-setup constants omitted) ──
 constexpr uint32_t CCO_SDMA_QUEUE_SIZE = 256 * 1024;  // 256KB
 constexpr int CCO_SDMA_MAX_RETRIES = 1 << 30;
 constexpr bool CCO_SDMA_BREAK_ON_RETRIES = true;
-// Host queue-setup constants from anvil_device.hpp (DEFAULT_PRIORITY,
-// DEFAULT_QUEUE_PERCENTAGE) are omitted — the device SDMA path never uses them
-// (dropping DEFAULT_PRIORITY also avoids pulling in the HSA_QUEUE_PRIORITY enum).
 
 __device__ __forceinline__ CCO_SDMA_PKT_COPY_LINEAR ccoCreateCopyPacket(void* srcBuf, void* dstBuf,
                                                                         long long int packetSize) {
@@ -1323,8 +1309,7 @@ inline __device__ void ccoSdmaPutMultiQueue(void* srcBuf, void* dstBuf, size_t c
   if (rank >= static_cast<int>(queNum)) return;
   const int queueId = rank;
   const size_t rand_size = copy_size / queNum;  // per queue slice size
-  // Too small to split (copy_size < queNum): queue 0 sends the whole thing on a
-  // single queue, the rest stay idle — avoids posting 0-byte copies.
+  // Too small to split: queue 0 sends the whole thing, the rest stay idle.
   if (rand_size == 0) {
     if (rank == 0 && copy_size > 0) {
       ccoSdmaPostCopy<Signal>(deviceHandles, signals, expectedSignals, srcBuf, dstBuf, copy_size, 0,
@@ -1433,13 +1418,10 @@ struct ccoSdma {
 
   __device__ inline ccoSdma(ccoDevComm const& c) : comm(c) {}
 
-  // put: local src -> peer dst.
-  //   Coop:    thread = one queue (queueId); warp/block = split across all queues
-  //            (queueId ignored), one lane/thread per queue.
-  //   Signal:  when false, skip the completion atomic — fire-and-forget, cannot
-  //            be drained by quiet/quietQueue (caller must sync itself).
+  // put: local src -> peer dst. Single-issuer per (peer, queue).
+  //   Coop:    thread = one queue (queueId); warp/block = split across all queues.
+  //   Signal:  false = fire-and-forget, can't be drained by quiet (caller syncs).
   //   optFlags: Aggregate posts without ringing; call commit() to ring the batch.
-  // Single-issuer per (peer, queue) (see device_primitives.hpp).
   template <typename Coop = ccoCoopThread, bool Signal = true>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes, int queueId = 0,
@@ -1506,10 +1488,9 @@ struct ccoSdma {
     }
   }
 
-  // quietQueue: wait on a single (peer, queueId) queue only.
-  // NOTE: only valid to drain a thread-scope single-queue put/get. A warp/block
-  // put spreads the transfer across all queues, so a single quietQueue would
-  // observe only 1/n of it (false completion) — use quiet() for those.
+  // quietQueue: wait on a single (peer, queueId) queue. Only valid for a
+  // thread-scope single-queue put/get — warp/block spread across all queues, so
+  // use quiet() for those (a single queue would report false completion).
   __device__ inline void quietQueue(int peer, int queueId) {
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
