@@ -213,25 +213,16 @@ def _apply_fsdp2(
         for m in shards:
             m.set_custom_all_gather(ag)
 
-    # MORI_FSDP_FWD_PREFETCH=D (default OFF): explicit forward-prefetch depth.
-    # Issue each decoder layer's AG D layers earlier from the CPU so the CU-free
+    # MORI_FSDP_FWD_PREFETCH (default OFF): opt into explicit forward-prefetch.
+    # Issue each decoder layer's AG one layer earlier from the CPU so the CU-free
     # SDMA/RDMA fill overlaps more forward GEMM compute. Per-layer AGs
     # (reshard_after_forward=True) free and recycle their buffer, so depth is
-    # capped to what the deferred landing fence covers: depth>=2 leaves two AGs in
-    # flight while the deferred fence covers only one, so the loss drifts. Depth is
-    # hard-clamped to 1 unless MORI_FSDP_FWD_PREFETCH_UNSAFE=1 opts into the deeper
-    # (drifting) depth for measurement only.
+    # capped to what the deferred landing fence covers (one AG in flight): depth
+    # is clamped to 1 (depth>=2 leaves two AGs in flight while the deferred fence
+    # covers only one, so the loss drifts).
     _fwd_pf = os.environ.get("MORI_FSDP_FWD_PREFETCH", "").strip()
     if _fwd_pf and _fwd_pf not in ("0", "false", "False"):
-        depth = max(1, int(_fwd_pf))
-        if depth > 1 and os.environ.get("MORI_FSDP_FWD_PREFETCH_UNSAFE", "") not in (
-            "1",
-            "true",
-            "True",
-            "yes",
-            "on",
-        ):
-            depth = 1
+        depth = 1
         layers = list(_iter_decoder_layers(model))
         for i, layer in enumerate(layers):
             nxt = layers[i + 1 : i + 1 + depth]
