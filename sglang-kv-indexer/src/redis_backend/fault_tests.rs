@@ -71,38 +71,38 @@ impl RedisConn for FailOnceConn {
 }
 
 async fn backend(test: &str, command: &'static [u8]) -> Option<RedisKvIndexerBackend> {
-    let Ok(url) = std::env::var("KV_INDEXER_REDIS_URL") else {
-        eprintln!("skipping {test}: set KV_INDEXER_REDIS_URL");
-        return None;
-    };
-    let inner = SingleConn::connect(&url).await.expect("connect redis");
-    Some(RedisKvIndexerBackend {
-        conn: Arc::new(FailOnceConn {
+    let inner = test_connection(test).await?;
+    Some(test_backend(
+        test,
+        FailOnceConn {
             inner,
             command,
             failed: AtomicBool::new(false),
-        }),
-        ns: format!("fault:{test}:{}", now_ms()),
-        worker_locks: Mutex::new(HashMap::new()),
-        worker_ttl: None,
-    })
+        },
+    ))
 }
 
 async fn generation_race_backend(test: &str) -> Option<RedisKvIndexerBackend> {
+    let inner = test_connection(test).await?;
+    Some(test_backend(
+        test,
+        ChangeGenerationBeforeCommitConn {
+            inner,
+            invokes: AtomicUsize::new(0),
+        },
+    ))
+}
+
+async fn test_connection(test: &str) -> Option<SingleConn> {
     let Ok(url) = std::env::var("KV_INDEXER_REDIS_URL") else {
         eprintln!("skipping {test}: set KV_INDEXER_REDIS_URL");
         return None;
     };
-    let inner = SingleConn::connect(&url).await.expect("connect redis");
-    Some(RedisKvIndexerBackend {
-        conn: Arc::new(ChangeGenerationBeforeCommitConn {
-            inner,
-            invokes: AtomicUsize::new(0),
-        }),
-        ns: format!("fault:{test}:{}", now_ms()),
-        worker_locks: Mutex::new(HashMap::new()),
-        worker_ttl: None,
-    })
+    Some(SingleConn::connect(&url).await.expect("connect redis"))
+}
+
+fn test_backend(test: &str, conn: impl RedisConn) -> RedisKvIndexerBackend {
+    RedisKvIndexerBackend::new(Arc::new(conn), format!("fault:{test}:{}", now_ms()))
 }
 
 fn batch(worker: &str, seq: u64, kind: ExternalKvActionType) -> ApplyExternalKvBatchRequest {
@@ -129,6 +129,10 @@ fn batch_inc(
         incarnation: incarnation.to_string(),
         ..batch(worker, seq, kind)
     }
+}
+
+fn report(worker: &str, seq: u64, incarnation: &str) -> ApplyExternalKvBatchRequest {
+    batch_inc(worker, seq, incarnation, ExternalKvActionType::ActionReport)
 }
 
 fn heartbeat(worker: &str, incarnation: &str) -> ApplyExternalKvBatchRequest {
@@ -173,28 +177,50 @@ async fn meta_field(backend: &RedisKvIndexerBackend, worker: &str, field: &str) 
     Option::<String>::from_redis_value(&value).expect("decode meta field")
 }
 
+async fn assert_meta(
+    backend: &RedisKvIndexerBackend,
+    worker: &str,
+    field: &str,
+    expected: Option<&str>,
+) {
+    assert_eq!(
+        meta_field(backend, worker, field).await.as_deref(),
+        expected
+    );
+}
+
+async fn assert_reverse(backend: &RedisKvIndexerBackend, worker: &str, expected: &[&str]) {
+    let actual = reverse_hashes(backend, worker).await;
+    assert_eq!(
+        actual.iter().map(String::as_str).collect::<Vec<_>>(),
+        expected
+    );
+}
+
+async fn apply_ok(backend: &RedisKvIndexerBackend, request: ApplyExternalKvBatchRequest) {
+    backend.apply(request).await.expect("apply");
+}
+
 #[tokio::test]
 async fn report_replay_repairs_missing_reverse_index_after_sadd_failure() {
     let Some(backend) = backend("report_repair", b"SADD").await else {
         return;
     };
-    let request = batch("worker-0", 1, ExternalKvActionType::ActionReport);
+    let request = report("worker-0", 1, "");
 
     // PLACEMENT_SET commits, then SADD fails.
     assert!(backend.apply(request.clone()).await.is_err());
-    assert!(reverse_hashes(&backend, "worker-0").await.is_empty());
+    assert_reverse(&backend, "worker-0", &[]).await;
 
     // Replay must run SADD although placement is already set.
-    backend.apply(request).await.expect("report replay");
-    assert_eq!(
-        reverse_hashes(&backend, "worker-0").await,
-        vec!["hash-a".to_string()]
-    );
+    apply_ok(&backend, request).await;
+    assert_reverse(&backend, "worker-0", &["hash-a"]).await;
 
-    backend
-        .apply(batch("worker-0", 2, ExternalKvActionType::ActionRevoke))
-        .await
-        .expect("cleanup");
+    apply_ok(
+        &backend,
+        batch("worker-0", 2, ExternalKvActionType::ActionRevoke),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -205,29 +231,15 @@ async fn incarnation_reset_hides_orphan_placement_missing_from_reverse_index() {
     let worker = "worker-orphan";
 
     // Generation A writes placement, then the injected reverse SADD fails.
-    assert!(backend
-        .apply(batch_inc(
-            worker,
-            1,
-            "inc-a",
-            ExternalKvActionType::ActionReport,
-        ))
-        .await
-        .is_err());
-    assert!(reverse_hashes(&backend, worker).await.is_empty());
+    assert!(backend.apply(report(worker, 1, "inc-a")).await.is_err());
+    assert_reverse(&backend, worker, &[]).await;
 
     // Simulate losing the bridge's volatile pending batch. Generation B reset
     // cannot discover the orphan through reverse, but generation filtering must
     // still make it permanently unroutable.
-    backend
-        .apply(heartbeat(worker, "inc-b"))
-        .await
-        .expect("new incarnation heartbeat");
+    apply_ok(&backend, heartbeat(worker, "inc-b")).await;
     assert!(matched_workers(&backend, "hash-a").await.is_empty());
-    assert_eq!(
-        meta_field(&backend, worker, "generation").await.as_deref(),
-        Some("1")
-    );
+    assert_meta(&backend, worker, "generation", Some("1")).await;
 }
 
 #[tokio::test]
@@ -236,34 +248,15 @@ async fn retired_incarnation_cannot_roll_current_generation_back() {
         return;
     };
     let worker = "worker-fenced";
-    backend
-        .apply(batch_inc(
-            worker,
-            1,
-            "inc-a",
-            ExternalKvActionType::ActionReport,
-        ))
-        .await
-        .expect("generation A");
-    backend
-        .apply(heartbeat(worker, "inc-b"))
-        .await
-        .expect("generation B");
+    apply_ok(&backend, report(worker, 1, "inc-a")).await;
+    apply_ok(&backend, heartbeat(worker, "inc-b")).await;
 
     let error = backend
-        .apply(batch_inc(
-            worker,
-            2,
-            "inc-a",
-            ExternalKvActionType::ActionReport,
-        ))
+        .apply(report(worker, 2, "inc-a"))
         .await
         .expect_err("retired incarnation must be fenced");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(
-        meta_field(&backend, worker, "incarnation").await.as_deref(),
-        Some("inc-b")
-    );
+    assert_meta(&backend, worker, "incarnation", Some("inc-b")).await;
 }
 
 #[tokio::test]
@@ -272,16 +265,10 @@ async fn empty_incarnation_uses_retirable_legacy_token() {
         return;
     };
     let worker = "worker-legacy";
-    backend
-        .apply(batch(worker, 1, ExternalKvActionType::ActionReport))
-        .await
-        .expect("legacy generation");
-    backend
-        .apply(heartbeat(worker, "inc-b"))
-        .await
-        .expect("new generation");
+    apply_ok(&backend, report(worker, 1, "")).await;
+    apply_ok(&backend, heartbeat(worker, "inc-b")).await;
     let error = backend
-        .apply(batch(worker, 2, ExternalKvActionType::ActionReport))
+        .apply(report(worker, 2, ""))
         .await
         .expect_err("legacy token must be retired");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
@@ -294,16 +281,11 @@ async fn in_flight_old_generation_cannot_commit_sequence_after_restart() {
     };
     let worker = "worker-race";
     let error = backend
-        .apply(batch_inc(
-            worker,
-            99,
-            "inc-a",
-            ExternalKvActionType::ActionReport,
-        ))
+        .apply(report(worker, 99, "inc-a"))
         .await
         .expect_err("generation change before commit must fence old batch");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(meta_field(&backend, worker, "seq").await, None);
+    assert_meta(&backend, worker, "seq", None).await;
     assert!(
         matched_workers(&backend, "hash-a").await.is_empty(),
         "old-generation placement written by the in-flight batch must be filtered"
@@ -316,15 +298,7 @@ async fn late_concurrent_reset_cannot_delete_current_generation_state() {
         return;
     };
     let worker = "worker-reset-race";
-    backend
-        .apply(batch_inc(
-            worker,
-            9,
-            "inc-a",
-            ExternalKvActionType::ActionReport,
-        ))
-        .await
-        .expect("generation A");
+    apply_ok(&backend, report(worker, 9, "inc-a")).await;
     let meta = worker_meta_key(&backend.ns, worker);
     let touch = backend
         .touch_meta(&meta, worker, "", "inc-b")
@@ -335,15 +309,7 @@ async fn late_concurrent_reset_cannot_delete_current_generation_state() {
         .reset_worker(worker, &meta, touch.generation)
         .await
         .expect("first reset");
-    backend
-        .apply(batch_inc(
-            worker,
-            1,
-            "inc-b",
-            ExternalKvActionType::ActionReport,
-        ))
-        .await
-        .expect("current generation report");
+    apply_ok(&backend, report(worker, 1, "inc-b")).await;
 
     // Simulate another resetter that started before the first one finished but
     // reaches cleanup after current-generation data has already committed.
@@ -352,10 +318,7 @@ async fn late_concurrent_reset_cannot_delete_current_generation_state() {
         .await
         .expect("late reset");
     assert_eq!(matched_workers(&backend, "hash-a").await, vec![worker]);
-    assert_eq!(
-        meta_field(&backend, worker, "seq").await.as_deref(),
-        Some("1")
-    );
+    assert_meta(&backend, worker, "seq", Some("1")).await;
 }
 
 #[tokio::test]
@@ -364,28 +327,9 @@ async fn in_flight_old_placement_mutation_cannot_clobber_new_generation() {
         return;
     };
     let worker = "worker-placement-race";
-    backend
-        .apply(batch_inc(
-            worker,
-            9,
-            "inc-a",
-            ExternalKvActionType::ActionReport,
-        ))
-        .await
-        .expect("generation A");
-    backend
-        .apply(heartbeat(worker, "inc-b"))
-        .await
-        .expect("generation B reset");
-    backend
-        .apply(batch_inc(
-            worker,
-            1,
-            "inc-b",
-            ExternalKvActionType::ActionReport,
-        ))
-        .await
-        .expect("generation B report");
+    apply_ok(&backend, report(worker, 9, "inc-a")).await;
+    apply_ok(&backend, heartbeat(worker, "inc-b")).await;
+    apply_ok(&backend, report(worker, 1, "inc-b")).await;
 
     assert!(backend
         .report_one(
@@ -413,23 +357,17 @@ async fn revoke_replay_repairs_stale_reverse_index_after_srem_failure() {
     let Some(backend) = backend("revoke_repair", b"SREM").await else {
         return;
     };
-    backend
-        .apply(batch("worker-0", 1, ExternalKvActionType::ActionReport))
-        .await
-        .expect("initial report");
+    apply_ok(&backend, report("worker-0", 1, "")).await;
 
     let request = batch("worker-0", 2, ExternalKvActionType::ActionRevoke);
 
     // PLACEMENT_CLEAR commits, then SREM fails.
     assert!(backend.apply(request.clone()).await.is_err());
-    assert_eq!(
-        reverse_hashes(&backend, "worker-0").await,
-        vec!["hash-a".to_string()]
-    );
+    assert_reverse(&backend, "worker-0", &["hash-a"]).await;
 
     // Replay sees placement already absent but must retry SREM.
-    backend.apply(request).await.expect("revoke replay");
-    assert!(reverse_hashes(&backend, "worker-0").await.is_empty());
+    apply_ok(&backend, request).await;
+    assert_reverse(&backend, "worker-0", &[]).await;
 }
 
 #[tokio::test]
@@ -443,45 +381,20 @@ async fn restart_reset_retried_after_mid_reset_failure() {
     };
 
     // Incarnation "A" reports hash-a.
-    backend
-        .apply(batch_inc(
-            "worker-0",
-            1,
-            "A",
-            ExternalKvActionType::ActionReport,
-        ))
-        .await
-        .expect("initial report");
-    assert_eq!(
-        reverse_hashes(&backend, "worker-0").await,
-        vec!["hash-a".to_string()]
-    );
+    apply_ok(&backend, report("worker-0", 1, "A")).await;
+    assert_reverse(&backend, "worker-0", &["hash-a"]).await;
 
     // Incarnation "B" (a restart): reset_pending is set, but the reverse-index
     // SREM inside reset_worker fails once, aborting the reset mid-flight.
-    let restart = batch_inc("worker-0", 1, "B", ExternalKvActionType::ActionReport);
+    let restart = report("worker-0", 1, "B");
     assert!(backend.apply(restart.clone()).await.is_err());
-    assert_eq!(
-        meta_field(&backend, "worker-0", "reset_pending")
-            .await
-            .as_deref(),
-        Some("1"),
-        "reset_pending must persist after a failed reset so it can be retried",
-    );
+    assert_meta(&backend, "worker-0", "reset_pending", Some("1")).await;
 
     // Retry: incarnation is already "B" (unchanged), yet the lingering
     // reset_pending must still drive an idempotent reset to completion.
-    backend.apply(restart).await.expect("restart reset retry");
-    assert_eq!(
-        meta_field(&backend, "worker-0", "reset_pending").await,
-        None,
-        "reset_pending must be cleared once the reset fully succeeds",
-    );
-    assert_eq!(
-        reverse_hashes(&backend, "worker-0").await,
-        vec!["hash-a".to_string()],
-        "restarted incarnation's fresh report must be indexed after the reset",
-    );
+    apply_ok(&backend, restart).await;
+    assert_meta(&backend, "worker-0", "reset_pending", None).await;
+    assert_reverse(&backend, "worker-0", &["hash-a"]).await;
 }
 
 #[tokio::test]
@@ -496,61 +409,23 @@ async fn reset_window_hides_worker_from_match_until_reset_completes() {
     };
 
     // Incarnation "A" reports hash-a: matchable while healthy.
-    backend
-        .apply(batch_inc(
-            "worker-0",
-            1,
-            "A",
-            ExternalKvActionType::ActionReport,
-        ))
-        .await
-        .expect("initial report");
-    let hit = backend
-        .do_match(MatchExternalKvRequest {
-            hashes: vec!["hash-a".to_string()],
-            count_as_hit: false,
-        })
-        .await
-        .expect("match healthy");
-    assert!(hit.matches.iter().any(|m| m.worker_id == "worker-0"));
+    apply_ok(&backend, report("worker-0", 1, "A")).await;
+    assert_eq!(matched_workers(&backend, "hash-a").await, vec!["worker-0"]);
 
     // Incarnation "B": reset_pending is set, but SMEMBERS fails so the reset never
     // clears the stale placement. The worker must now be hidden from match.
-    let restart = batch_inc("worker-0", 1, "B", ExternalKvActionType::ActionReport);
+    let restart = report("worker-0", 1, "B");
     assert!(backend.apply(restart.clone()).await.is_err());
-    assert_eq!(
-        meta_field(&backend, "worker-0", "reset_pending")
-            .await
-            .as_deref(),
-        Some("1"),
-    );
-    let during = backend
-        .do_match(MatchExternalKvRequest {
-            hashes: vec!["hash-a".to_string()],
-            count_as_hit: false,
-        })
-        .await
-        .expect("match during pending");
+    assert_meta(&backend, "worker-0", "reset_pending", Some("1")).await;
     assert!(
-        during.matches.is_empty(),
-        "worker with reset_pending must be dropped from match, got {:?}",
-        during.matches
+        matched_workers(&backend, "hash-a").await.is_empty(),
+        "worker with reset_pending must be dropped from match"
     );
 
     // Retry completes the reset and re-indexes the fresh report; routable again.
-    backend.apply(restart).await.expect("reset retry");
-    assert_eq!(
-        meta_field(&backend, "worker-0", "reset_pending").await,
-        None
-    );
-    let after = backend
-        .do_match(MatchExternalKvRequest {
-            hashes: vec!["hash-a".to_string()],
-            count_as_hit: false,
-        })
-        .await
-        .expect("match after reset");
-    assert!(after.matches.iter().any(|m| m.worker_id == "worker-0"));
+    apply_ok(&backend, restart).await;
+    assert_meta(&backend, "worker-0", "reset_pending", None).await;
+    assert_eq!(matched_workers(&backend, "hash-a").await, vec!["worker-0"]);
 }
 
 #[tokio::test]
@@ -577,15 +452,7 @@ async fn touch_meta_persists_meta_left_with_ttl_by_old_build() {
     backend.conn.query(pexpire).await.expect("seed ttl");
 
     // Any apply from the same incarnation (no reset) must persist the key.
-    backend
-        .apply(batch_inc(
-            worker,
-            4,
-            "A",
-            ExternalKvActionType::ActionReport,
-        ))
-        .await
-        .expect("apply");
+    apply_ok(&backend, report(worker, 4, "A")).await;
 
     let mut pttl = redis::cmd("PTTL");
     pttl.arg(&meta);
@@ -595,9 +462,5 @@ async fn touch_meta_persists_meta_left_with_ttl_by_old_build() {
         ttl, -1,
         "meta key must be persisted (no TTL) after touch_meta"
     );
-    assert_eq!(
-        meta_field(&backend, worker, "incarnation").await.as_deref(),
-        Some("A"),
-        "persisting must not disturb the durable incarnation",
-    );
+    assert_meta(&backend, worker, "incarnation", Some("A")).await;
 }

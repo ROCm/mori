@@ -429,18 +429,28 @@ async fn probe_publisher(config: &BridgeConfig) -> Result<(), BridgeError> {
             "publisher liveness probe requires SGLANG_KV_EVENT_REPLAY_ENDPOINT".to_string(),
         )
     })?;
+    let mut socket = request_replay(endpoint, u64::MAX).await?;
+    let frames = receive_replay(&mut socket).await?;
+    parse_probe_response(&frames)
+}
+
+async fn request_replay(endpoint: &str, start_seq: u64) -> Result<DealerSocket, BridgeError> {
     let mut socket = DealerSocket::new();
     socket.connect(endpoint).await?;
-    let mut request = ZmqMessage::from(bytes::Bytes::copy_from_slice(&u64::MAX.to_be_bytes()));
+    // DEALER supplies no REQ delimiter, so add one for the ROUTER protocol.
+    let mut request = ZmqMessage::from(bytes::Bytes::copy_from_slice(&start_seq.to_be_bytes()));
     request.push_front(bytes::Bytes::new());
     tokio::time::timeout(REPLAY_REQUEST_TIMEOUT, socket.send(request))
         .await
-        .map_err(|_| BridgeError::Timeout("SGLang liveness probe send timed out".to_string()))??;
-    let frames = tokio::time::timeout(REPLAY_REQUEST_TIMEOUT, socket.recv())
+        .map_err(|_| BridgeError::Timeout("SGLang replay request timed out".to_string()))??;
+    Ok(socket)
+}
+
+async fn receive_replay(socket: &mut DealerSocket) -> Result<Vec<bytes::Bytes>, BridgeError> {
+    Ok(tokio::time::timeout(REPLAY_REQUEST_TIMEOUT, socket.recv())
         .await
-        .map_err(|_| BridgeError::Timeout("SGLang liveness probe timed out".to_string()))??
-        .into_vec();
-    parse_probe_response(&frames)
+        .map_err(|_| BridgeError::Timeout("SGLang replay response timed out".to_string()))??
+        .into_vec())
 }
 
 async fn replay_missing_batches(
@@ -459,25 +469,11 @@ async fn replay_missing_batches(
         return Ok(());
     };
 
-    let mut socket = DealerSocket::new();
-    socket.connect(endpoint).await?;
-    // DEALER -> ROUTER: prepend an empty delimiter frame so the publisher's
-    // ROUTER sees [identity, b"", start_seq]. Unlike REQ, DEALER neither adds
-    // this delimiter nor enforces strict send/recv alternation, so we can read
-    // the many per-batch replies the ROUTER streams back for one request.
-    let mut request = ZmqMessage::from(bytes::Bytes::copy_from_slice(&start_seq.to_be_bytes()));
-    request.push_front(bytes::Bytes::new());
-    tokio::time::timeout(REPLAY_REQUEST_TIMEOUT, socket.send(request))
-        .await
-        .map_err(|_| BridgeError::Timeout("SGLang replay request send timed out".to_string()))??;
-
+    let mut socket = request_replay(endpoint, start_seq).await?;
     let mut replay_expected = start_seq;
     let mut recovered = 0_u64;
     loop {
-        let frames = tokio::time::timeout(REPLAY_REQUEST_TIMEOUT, socket.recv())
-            .await
-            .map_err(|_| BridgeError::Timeout("SGLang replay response timed out".to_string()))??
-            .into_vec();
+        let frames = receive_replay(&mut socket).await?;
         let (seq, payload) = parse_replay_frames(&frames)?;
         if seq < 0 {
             break;

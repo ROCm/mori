@@ -223,7 +223,9 @@ done
 
 - **bridge 作为 sglang 的 sidecar**:与某个 rank 同 Pod,走 `localhost` 通信;rank
   扩缩容时 bridge 随 Pod 一起伸缩。
-- **indexer 独立 Deployment + Service**:无状态,可多副本做 HA(后端指向同一 Redis)。
+- **indexer 独立 Deployment + Service**:当前必须运行 **1 个写副本**。进程重启后可
+  从 Redis 恢复,但 per-worker apply 串行锁是进程内锁;多个 indexer 副本并发写同一
+  Redis 可能打乱 mutation 顺序,因此暂不支持多副本写 HA。
 - **Redis 独立 StatefulSet**(或托管 Redis/Dragonfly/Cluster)。
 
 ```
