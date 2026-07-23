@@ -18,6 +18,10 @@ The initial project will be implemented out of tree as an independent Rust servi
 
    Schedulers or query clients can ask the indexer where a list of KV block hashes may be found. The response includes worker IDs and storage tiers, and can optionally update hit-count statistics for scheduling policies.
 
+3. Converge after common process and network failures.
+
+   Metadata updates are ordered per worker, idempotent under replay, and recoverable after bridge, indexer, Redis, or worker restarts. Dead or partially reset workers must not be returned as routing candidates.
+
 ## Architecture
 
 ```text
@@ -40,11 +44,7 @@ The initial project will be implemented out of tree as an independent Rust servi
 | worker -> tier         |  | hit-count index            |
 | hit counts             |  | query API                  |
 |------------------------|  |                            |
-| possible backends:     |  |                            |
-| - in-memory            |  |                            |
-| - Redis                |  |                            |
-| - MySQL / PostgreSQL   |  |                            |
-| - RocksDB              |  |                            |
+| Redis / Redis Cluster  |  | gRPC health/readiness      |
 +------------------------+  +----------------------------+
 ```
 
@@ -60,7 +60,7 @@ The indexer is a standalone metadata service. Its core responsibility is to main
 | Location revoke | Remove specific hashes, or remove all hashes from a worker at a specific tier. |
 | Location lookup | Return workers and tiers that may hold requested KV block hashes. |
 | Hit counting | Optionally count real lookup hits for scheduling or monitoring. |
-| Store abstraction | Persist metadata in memory, Redis, SQL, RocksDB, or another backend. |
+| Store abstraction | Keep persistence behind a narrow backend interface; the initial durable implementation uses Redis or Redis Cluster. |
 
 The primary data model is:
 
@@ -93,18 +93,118 @@ Event mapping:
 
 For multi-worker or DP-rank deployments, run one bridge per event source. Each source has its own worker ID, endpoint, topic, and sequence tracking; all bridges share one indexer.
 
+## Fault Tolerance and Consistency Model
+
+### Scope and invariant
+
+The index is best-effort routing metadata, not authoritative model state. A false negative reduces cache reuse; a false positive must be handled by the normal cache-miss fallback and must not corrupt inference. The design therefore favors a small replay-convergent state machine over distributed transactions or consensus.
+
+Correctness requires **one active bridge writer per `worker_id`**. Sequence checks and mutation commit are separate phases, so two concurrent writers for the same worker are not fenced from both starting an update. Different workers are independent and may update concurrently.
+
+### Durable per-worker sequence
+
+Every SGLang event batch carries a monotonically increasing sequence number. Redis stores the durable `last_applied_seq` in the worker metadata hash.
+
+For each non-heartbeat apply:
+
+1. Read the worker's durable sequence.
+2. If the request sequence is less than or equal to it, skip the batch and return `duplicate = true`.
+3. Apply all actions in their original order. Placement and reverse-index mutations are idempotent.
+4. Advance the durable sequence only after all mutations complete.
+
+If the process fails between mutation and sequence commit, the durable sequence remains behind. The bridge retries the same batch; idempotent `HSET`/`HDEL`/`SADD`/`SREM` semantics repair any partial state before the sequence is committed. The system provides replay convergence rather than globally atomic or exactly-once batch execution.
+
+The response returns `last_applied_seq`, allowing a bridge that re-observes an already applied batch to resynchronize its expected sequence with the backend's durable position.
+
+### Bridge reconnect and replay
+
+The bridge retains an unacknowledged batch across gRPC reconnects and sends it again before consuming newer events. It also tracks the next expected SGLang sequence:
+
+- a lower sequence is stale and is ignored;
+- an equal sequence is processed;
+- a higher sequence is a gap, and the bridge requests the missing range from SGLang's replay endpoint before processing the live batch.
+
+Replay uses the same apply API and sequence gate as live traffic. When replay is not configured or the requested history is unavailable, the current best-effort policy logs the gap and continues with newer events. This can create false negatives and should be observable, but it does not block inference.
+
+### Worker liveness
+
+Durable worker metadata and liveness are stored separately:
+
+- `{worker}:meta` holds address, sequence, incarnation, and reset state and never expires;
+- `{worker}:live` is refreshed by every apply and by periodic empty-action heartbeats and carries the liveness TTL.
+
+`MatchExternalKv` excludes workers whose live key has expired. Placement and reverse-index data are retained, so a transiently disconnected worker can become routable again after a heartbeat without rebuilding the entire index. Keeping metadata durable is essential: expiring it would lose the sequence and incarnation needed to reject stale state.
+
+### Worker restart and incarnation reset
+
+Each worker lifetime has an opaque `incarnation` token. On a token change, the indexer must assume the worker's cache was lost:
+
+1. Atomically record the new incarnation and set durable `reset_pending = 1`.
+2. While reset is pending, exclude the worker from all match responses.
+3. Walk the worker reverse index and remove the worker from every placement entry.
+4. Clear the reverse index and old sequence.
+5. Clear `reset_pending` only after the reset fully succeeds.
+
+Reset operations are idempotent. If Redis or the indexer fails midway, the next apply or heartbeat observes `reset_pending` and retries. This prevents both stale placement resurrection and routing to a partially reset worker.
+
+The default bridge-generated token identifies the bridge process. Deployments that can restart the bridge independently from the worker should provide a token tied to the actual worker lifetime; a bridge-only token change is safe but causes conservative cache misses.
+
+### Redis failure and partial writes
+
+Redis is the durable coordination point. When it is unavailable, mutation and query RPCs return `UNAVAILABLE`. The standard `grpc.health.v1.Health` service reports `NOT_SERVING` until Redis answers readiness probes again.
+
+Redis Cluster cannot atomically update placement keys in multiple hash slots as one batch. Instead:
+
+- each placement/hit mutation is atomic within its block-hash slot using Lua;
+- worker metadata and the worker reverse index share a worker hash slot;
+- forward and reverse index updates are individually idempotent;
+- replay always reasserts both postconditions, repairing a failure between them.
+
+Requests have protocol-level hash/action limits, and Redis fan-out is processed in bounded chunks so recovery traffic cannot create unbounded concurrent work.
+
+### Failure behavior summary
+
+| Failure | Behavior |
+| --- | --- |
+| Duplicate or stale batch | Sequence gate skips it and returns the durable position. |
+| Bridge-to-indexer disconnect | Pending batch is retained, connection is retried, and the batch is replayed. |
+| Bridge process restart | Volatile pending/expected-sequence state is lost. The default new incarnation conservatively wipes that worker's old placements; subsequent events rebuild them. |
+| Missing event sequence | Bridge requests the missing range; without replay it logs degradation and continues. |
+| Indexer crash | Redis state survives; bridge reconnects and resumes from the durable sequence. |
+| Redis outage | Data RPCs fail with `UNAVAILABLE`; health reports `NOT_SERVING`; reconnect is automatic. |
+| Partial forward/reverse update | Replaying the idempotent batch repairs the missing postcondition. |
+| Worker or bridge stops heartbeating | Liveness TTL expires and the worker is excluded from matches. |
+| Worker restarts | Incarnation change fences routing, retries stale-state cleanup, and resets sequence state. |
+
+### Explicit non-goals
+
+The initial design does not provide:
+
+- multi-writer fencing for the same worker ID;
+- global atomicity across all hashes in an apply batch;
+- consensus or cross-region linearizability;
+- exactly-once event delivery;
+- a durable bridge checkpoint across bridge process crashes;
+- immediate garbage collection for workers that never return;
+- recovery of an event gap that is absent from the SGLang replay buffer.
+
+These boundaries should remain explicit. If stronger guarantees become necessary, they should be justified by routing correctness requirements rather than added preemptively.
+
 ## Metadata Store
 
-The metadata store is the persistence layer behind the indexer. It stores location metadata and optional hit-count data. The indexer should keep the store behind an interface so deployments can choose a backend based on latency, durability, and operational requirements.
+The metadata store is the persistence layer behind the indexer. The initial implementation uses Redis, Dragonfly, Valkey, or Redis Cluster through a topology-independent backend interface.
 
-| Store backend | Suitable use case |
-| --- | --- |
-| in-memory | Prototype, single indexer, fastest lookup, no persistence. |
-| Redis | Shared low-latency metadata service. |
-| MySQL / PostgreSQL | Durable state, operational visibility, SQL queries. |
-| RocksDB | Embedded persistent KV store for a single indexer node. |
+The Redis data model maintains both directions required by the serving and recovery paths:
 
-The initial implementation can use an in-memory store and keep the backend abstraction stable. Redis, SQL, or RocksDB can be added later without changing the gRPC API.
+```text
+placement: hash -> worker_id -> tier bitmask
+reverse:   worker_id -> set<hash>
+meta:      worker_id -> {address, seq, incarnation, reset_pending}
+live:      worker_id -> expiring heartbeat key
+hits:      hash -> aggregate count
+```
+
+Placement and hit keys share a block-hash cluster tag; reverse, metadata, and liveness keys share a worker cluster tag. This permits every Lua script to declare keys from a single Redis Cluster slot.
 
 ## gRPC API
 
@@ -129,9 +229,25 @@ enum TierType {
 }
 
 service KVIndexer {
-  rpc ApplyExternalKvBatch(worker_id, seq, actions, worker_address) returns (Empty);
-  rpc MatchExternalKv(hashes, count_as_hit) returns (matches);
-  rpc GetExternalKvHitCounts(hashes) returns (hit_counts);
+  rpc ApplyExternalKvBatch(ApplyExternalKvBatchRequest)
+      returns (ApplyExternalKvBatchResponse);
+  rpc MatchExternalKv(MatchExternalKvRequest)
+      returns (MatchExternalKvResponse);
+  rpc GetExternalKvHitCounts(GetExternalKvHitCountsRequest)
+      returns (GetExternalKvHitCountsResponse);
+}
+
+message ApplyExternalKvBatchRequest {
+  string worker_id = 1;
+  uint64 seq = 2;
+  repeated ExternalKvAction actions = 3;
+  string worker_address = 4;
+  string incarnation = 5;
+}
+
+message ApplyExternalKvBatchResponse {
+  uint64 last_applied_seq = 1;
+  bool duplicate = 2;
 }
 ```
 
@@ -143,11 +259,12 @@ service KVIndexer {
 
 The indexer service will be implemented in Rust. Rust provides near-C++ performance, strong memory and thread-safety guarantees, and a mature async / gRPC ecosystem. This is a good fit for a high-QPS metadata service with concurrent location updates and lookups.
 
-The first implementation can use `tonic` for gRPC, `tokio` for async runtime, and an in-memory metadata store. The project should remain out of tree from SGLang and keep the store interface stable so Redis, SQL, or RocksDB backends can be added later without changing the gRPC API.
+The implementation uses `tonic` for gRPC, `tokio` for the async runtime, ZeroMQ for SGLang event transport, and Redis for durable metadata. The project remains out of tree from SGLang and keeps the backend interface narrow without committing to unused storage implementations.
 
 ## Open Questions
 
 - Should the out-of-tree bridge remain a sidecar long term, or should parts of it be upstreamed into SGLang after the API stabilizes?
 - Should the indexer store only block-level hashes initially, or also accept prefix-chain information for future prefix-aware routing?
-- What consistency guarantees are required between SGLang KV events and indexer metadata?
-- Which metadata store backend should be recommended for production deployment?
+- Should an unrecoverable replay gap continue best-effort, as today, or fail closed and mark the worker unavailable until a full resynchronization?
+- When should stale worker metadata and reverse indexes be garbage-collected after a worker permanently leaves?
+- Is the single-writer-per-worker deployment invariant sufficient long term, or will multi-writer fencing be required?
