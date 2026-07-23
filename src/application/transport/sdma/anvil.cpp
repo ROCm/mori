@@ -125,6 +125,14 @@ void SetUpKFD() {
   CHECK_HSAKMT_SUCCESS(hsaKmtAcquireSystemProperties(&m_SystemProperties), "Failed!");
 }
 
+// void SetUpKFD(uint32_t targetDevice) {
+//     HsaNodeProperties m_node_props;
+//     CHECK_HSAKMT_SUCCESS(hsaKmtGetNodeProperties(targetDevice, &m_node_props), "Failed!");
+//     std::cout << "Num of PCIe SDMA Queues: " << m_node_props.NumSdmaEngines << std::endl;
+//     std::cout << "Num of XGMI SDMA Queues: " << m_node_props.NumSdmaXgmiEngines << std::endl;
+//     std::cout << "Device Id: " << m_node_props.DeviceId << std::endl;
+// }
+
 void CloseKFD() { (void)hsaKmtCloseKFD(); }
 
 // Convert a logical deviceId index to the NVML device minor number
@@ -182,8 +190,8 @@ static int gpuAgentIndexForHipDevice(int hipDeviceId) {
 SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAgent,
                      uint32_t engineId)
     : remoteDeviceId_(remoteDeviceId) {
-  // cachedWptr_(detail::gpuCallocUncachedShared<uint64_t>),
-  // committedWptr_(detail::gpuCallocUncachedShared<uint64_t>) {
+  // cachedWptr_(detail::gpuCallocUncachedShared<uint64_t>()),
+  // committedWptr_(detail::gpuCallocUncachedShared<uint64_t>()) {
   int originalDeviceId;
 
   CHECK_HIP_ERROR(hipGetDevice(&originalDeviceId));  // Save the current device
@@ -203,6 +211,9 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   memFlags.ui32.NoNUMABind = 1;
   memFlags.ui32.ExecuteAccess = 1;
   memFlags.ui32.Uncached = 1;
+
+  // std::cout << "Allocating SDMA Queue Buffer for device: " << localNodeId << std::endl <<
+  // std::flush;
 
   CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(localNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
                        "Failed");
@@ -265,7 +276,7 @@ AnvilLib::~AnvilLib() {
 
 void AnvilLib::init() {
   std::call_once(init_flag, []() {
-    // std::atexit(CloseKFD); // Register cleanup
+    //   std::atexit(CloseKFD); // Register cleanup
 
     // HSA
     hsa_status_t status{hsa_init()};
@@ -290,8 +301,9 @@ void AnvilLib::init() {
 
 bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
   std::lock_guard<std::mutex> lock(channels_mutex_);
-  // Spread the channels across the engines recommended by KFD for this peer link.
-  // On tested HW the KFD mask already assigns a distinct engine per peer link.
+  // Spread the channels across the engines recommended for this peer link. On
+  // MI350 the mask typically reports 2 engines per peer; on platforms with a
+  // single recommended engine all channels share it.
   std::vector<uint32_t> engines;
   if (srcDeviceId == dstDeviceId) {
     // A loopback copy never traverses xGMI and has no self io_link, so KFD

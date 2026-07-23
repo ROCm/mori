@@ -75,7 +75,7 @@ void SymmMemManager::HostFree(void* localPtr) {
 
 SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
   void* ptr = nullptr;
-  // Use the Context-cached snapshot rather than getenv so this stays
+  // Use the Context-cached snapshot rather than getenv() so this stays
   // consistent with the transport selection that was made when the Context
   // was constructed. Without this, late env mutations (e.g. a test setting
   // MORI_ENABLE_SDMA after worker init) flip allocations to uncached
@@ -123,9 +123,9 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
 
   // P2P context: exchange ipc mem handles and open them for all same-node peers
   // p2pPeerPtrs layout:
-  // - [rank]: local pointer (self)
-  // - [same-node peers]: P2P pointers from hipIpcOpenMemHandle
-  // - [different-node peers]: 0
+  //   - [rank]: local pointer (self)
+  //   - [same-node peers]: P2P pointers from hipIpcOpenMemHandle
+  //   - [different-node peers]: 0
   cpuMemObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   cpuMemObj->p2pPeerPtrs[rank] = reinterpret_cast<uintptr_t>(localPtr);  // Set self pointer
 
