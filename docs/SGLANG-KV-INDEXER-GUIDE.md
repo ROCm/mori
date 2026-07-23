@@ -88,7 +88,7 @@ cargo build --release --features redis-backend
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `KV_INDEXER_LISTEN_ADDR` | `[::1]:50051` | gRPC 监听地址。容器里通常设 `0.0.0.0:50051` |
-| `KV_INDEXER_BACKEND`     | (必填) | 必须显式设为 `redis`、`logging` 或 `noop`;生产使用 `redis`,避免配置遗漏后静默使用调试后端 |
+| `KV_INDEXER_BACKEND`     | (必填) | 必须显式设为 `redis` 或 `logging`;生产使用 `redis`,避免配置遗漏后静默使用调试后端 |
 | `RUST_LOG`               | `info` | 日志级别;`debug` 可看每 RPC 明细 |
 
 Redis 后端(`KV_INDEXER_BACKEND=redis`)追加:
@@ -101,6 +101,11 @@ Redis 后端(`KV_INDEXER_BACKEND=redis`)追加:
 | `KV_INDEXER_REDIS_REQUIRED`      | `1` | `1`=启动即连接并 PING,连不上快速失败;`0`=降级启动,首次使用时惰性连接(见 §7) |
 | `KV_INDEXER_WORKER_TTL_SECS`     | `120` | worker 存活 TTL:超过该时长未 apply/心跳的 worker 会从 `match` 结果中剔除(避免路由到死节点);`0`=关闭存活判定 |
 
+> 升级注意: generation fencing 将 placement/reverse 值升级为代际格式。
+> 新版本可读取旧格式,但旧 binary 不能读取新格式;不要让新旧 indexer 对同一
+> namespace 做滚动混写。首次部署应停写升级,或切换新的
+> `KV_INDEXER_REDIS_NAMESPACE`。
+
 ### 3.2 bridge(`kv-indexer-bridge`)
 
 | 变量 | 默认 | 说明 |
@@ -108,12 +113,12 @@ Redis 后端(`KV_INDEXER_BACKEND=redis`)追加:
 | `KV_INDEXER_WORKER_ID`             | (必填) | 该 worker 的唯一标识,如 `worker-0` |
 | `SGLANG_KV_EVENT_ENDPOINT`         | (必填) | 订阅的 SGLang PUB 地址,如 `tcp://127.0.0.1:5567` |
 | `KV_INDEXER_ENDPOINT`              | (必填) | indexer gRPC 地址,如 `http://127.0.0.1:50051` |
-| `SGLANG_KV_EVENT_REPLAY_ENDPOINT`  | (无) | SGLang 重放 ROUTER 地址;设了才能做缺口重放 |
-| `SGLANG_KV_EVENT_TOPIC`            | `kv-events` | ZMQ 订阅 topic,需与 SGLang 侧一致 |
+| `SGLANG_KV_EVENT_REPLAY_ENDPOINT`  | (无) | SGLang 重放 ROUTER 地址;缺口重放和可信 worker 心跳都依赖它,生产环境应配置 |
+| `SGLANG_KV_EVENT_TOPIC`            | (空) | ZMQ 订阅 topic,与 SGLang upstream 默认一致;非空时须在两侧设置相同值 |
 | `KV_INDEXER_WORKER_ADDRESS`        | (空) | 可选,worker 反查地址 |
 | `KV_INDEXER_CLEAR_TIERS`           | `HBM,DRAM,SSD` | `AllBlocksCleared` 时清空哪些 tier |
-| `KV_INDEXER_HEARTBEAT_SECS`        | `30` | 无 KV 事件时仍定期发空 batch 心跳,为 worker 续期 TTL;须远小于 `KV_INDEXER_WORKER_TTL_SECS`;`0`=关闭心跳 |
-| `KV_INDEXER_WORKER_INCARNATION`    | (自动) | worker 世代号,随 apply 上报;变化即视为 worker 重启,indexer 会清掉该 worker 的旧索引并重置 seq。默认每次 bridge 进程启动生成一个;若能拿到 worker 真实生命周期 id(如与 worker 同起停的 token),显式设置可避免 bridge 单独重启时误清 |
+| `KV_INDEXER_HEARTBEAT_SECS`        | `30` | 先严格校验 SGLang replay ROUTER 的 END 响应,成功后才续 worker TTL;探测失败仅抑制本次心跳,不重建 SUB;无 replay endpoint 时周期心跳禁用;`0`=关闭 |
+| `KV_INDEXER_WORKER_INCARNATION`    | (自动) | 可选的世代号可观测前缀;bridge 会追加进程内唯一后缀,不会在重启后复用已退休 token。服务端退休旧 token 并拒绝迟到请求;确认 seq 回退后自动生成新世代 |
 
 ---
 
@@ -230,13 +235,14 @@ done
 多机时:sglang 的 `endpoint` 用 `tcp://*:5567` 绑全网卡,bridge 从对端 IP
 `connect`(端口同样 `base+rank`)。
 
-indexer 的 readiness/liveness 直接用内置的 gRPC 健康服务(和业务同端口):
+内置 gRPC 健康状态反映 Redis readiness。它不应直接用作 liveness,
+否则 Redis 故障会导致健康的 indexer 进程被反复重启:
 
 ```yaml
 readinessProbe:
   grpc: { port: 50051 }          # 查整体 ""; Redis 不可达时 NOT_SERVING → 不接流量
 livenessProbe:
-  grpc: { port: 50051, service: "kv_indexer.v1.KVIndexer" }
+  tcpSocket: { port: 50051 }     # 仅检查进程/监听端口,不绑定 Redis readiness
 ```
 
 ---
@@ -244,12 +250,13 @@ livenessProbe:
 ## 6. replay / 缺口恢复
 
 - SGLang 每条事件带单调 `seq`;发布端保留最近 `buffer_steps` 条到内存重放缓冲。
-- bridge 若发现收到的 `seq` 不连续(如 `...,1,4`),会通过 DEALER 向 SGLang 的
-  `replay_endpoint`(ROUTER)请求 `start_seq`,把缺失批次拉回、**按序补齐后再 apply**,
-  保证 indexer 侧不漏不乱序。
-- 因此**强烈建议在多 worker/生产环境配置 `replay_endpoint`**;不配则 bridge 重启或
-  丢包后无法自愈。
-- `lab.sh replay-test` 可复现:停 bridge → 发流量造缺口 → 重启 bridge,观察重放恢复。
+- bridge 在同一进程生命周期内发现 `seq` 不连续(如 `...,1,4`)时,会通过 DEALER
+  请求缺失区间,按序补齐后再 apply。历史已从 replay buffer 淘汰时仍会降级为
+  best-effort。
+- replay endpoint 还被用作 worker 存活证明:只有 ROUTER 响应后 bridge 才续 TTL,
+  避免 SGLang 已死而 sidecar 仍把旧 placement 保活。
+- bridge **进程重启**会丢失本地 `next_seq`;当前没有全量 cache dump,因此不能保证
+  重建 SGLang 中已存在但不再产生事件的 block。这仍是显式非目标。
 
 ---
 

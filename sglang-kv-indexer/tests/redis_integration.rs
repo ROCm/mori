@@ -586,6 +586,18 @@ itest!(
             "stale worker must be dropped from match, got {:?}",
             resp.matches
         );
+        let resp = b.match_external_kv(match_req(&["1"], true)).await.unwrap();
+        assert!(resp.matches.is_empty());
+        let counts = b
+            .get_external_kv_hit_counts(GetExternalKvHitCountsRequest {
+                hashes: hashes(&["1"]),
+            })
+            .await
+            .unwrap();
+        assert!(
+            counts.entries.is_empty(),
+            "a placement held only by dead workers must not count as a returned hit"
+        );
 
         // A heartbeat (empty-actions apply) refreshes liveness; the placement was
         // never deleted, so the old block is instantly routable again.

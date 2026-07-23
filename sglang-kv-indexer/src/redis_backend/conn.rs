@@ -33,6 +33,10 @@ fn manager_config() -> redis::aio::ConnectionManagerConfig {
         .set_max_delay(1000)
 }
 
+fn response_timeout_error() -> RedisError {
+    RedisError::from((ErrorKind::IoError, "redis response timed out"))
+}
+
 #[tonic::async_trait]
 pub(crate) trait RedisConn: Send + Sync + 'static {
     /// Runs a single command, routed by its key on Cluster.
@@ -147,6 +151,10 @@ impl ClusterConn {
         self.conn.lock().unwrap().clone()
     }
 
+    fn invalidate(&self) {
+        *self.conn.lock().unwrap() = None;
+    }
+
     async fn connection(&self) -> RedisResult<redis::cluster_async::ClusterConnection> {
         if let Some(c) = self.cached() {
             return Ok(c);
@@ -179,7 +187,13 @@ impl ClusterConn {
 impl RedisConn for ClusterConn {
     async fn query(&self, cmd: Cmd) -> RedisResult<Value> {
         let mut c = self.connection().await?;
-        cmd.query_async(&mut c).await
+        match tokio::time::timeout(RESPONSE_TIMEOUT, cmd.query_async(&mut c)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.invalidate();
+                Err(response_timeout_error())
+            }
+        }
     }
 
     async fn invoke(
@@ -196,7 +210,12 @@ impl RedisConn for ClusterConn {
         for a in &args {
             inv.arg(a.as_str());
         }
-        let v: Value = inv.invoke_async(&mut c).await?;
-        Ok(v)
+        match tokio::time::timeout(RESPONSE_TIMEOUT, inv.invoke_async(&mut c)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.invalidate();
+                Err(response_timeout_error())
+            }
+        }
     }
 }

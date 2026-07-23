@@ -1,9 +1,11 @@
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rmpv::decode::value::read_value;
 use rmpv::Value;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
+use tonic::{Code, Status};
 use tracing::{debug, info, warn};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
@@ -14,6 +16,9 @@ use crate::pb::{ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionT
 const RECONNECT_MIN_DELAY: Duration = Duration::from_millis(500);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(10);
 const REPLAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+static INCARNATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
@@ -44,17 +49,19 @@ impl BridgeConfig {
         let event_endpoint = std::env::var("SGLANG_KV_EVENT_ENDPOINT")
             .unwrap_or_else(|_| "tcp://127.0.0.1:5557".to_string());
         let event_replay_endpoint = std::env::var("SGLANG_KV_EVENT_REPLAY_ENDPOINT").ok();
-        let event_topic =
-            std::env::var("SGLANG_KV_EVENT_TOPIC").unwrap_or_else(|_| "kv-events".to_string());
+        // Match SGLang's upstream ZMQ publisher default. Deployments that use a
+        // non-empty topic must configure the same value on both sides.
+        let event_topic = std::env::var("SGLANG_KV_EVENT_TOPIC").unwrap_or_default();
         let indexer_endpoint = std::env::var("KV_INDEXER_ENDPOINT")
             .unwrap_or_else(|_| "http://[::1]:50051".to_string());
         let clear_tiers = parse_clear_tiers(
             &std::env::var("KV_INDEXER_CLEAR_TIERS").unwrap_or_else(|_| "HBM,DRAM,SSD".to_string()),
         )?;
         let heartbeat_interval = parse_heartbeat_interval()?;
-        // A worker-tied id is best (survives bridge-only restarts); fall back to
-        // a fresh per-process token so each (re)start is a distinct incarnation.
+        // Treat an operator value as an observable prefix, not a reusable token:
+        // retired tokens must never be presented by a later bridge process.
         let incarnation = std::env::var("KV_INDEXER_WORKER_INCARNATION")
+            .map(|prefix| format!("{prefix}:{}", generate_incarnation()))
             .unwrap_or_else(|_| generate_incarnation());
 
         Ok(Self {
@@ -76,6 +83,7 @@ pub enum BridgeError {
     Config(String),
     Decode(String),
     Rpc(tonic::Status),
+    PermanentRpc(tonic::Status),
     Timeout(String),
     Transport(tonic::transport::Error),
     Zmq(zeromq::ZmqError),
@@ -87,6 +95,9 @@ impl std::fmt::Display for BridgeError {
             BridgeError::Config(message) => write!(f, "bridge config error: {message}"),
             BridgeError::Decode(message) => write!(f, "bridge decode error: {message}"),
             BridgeError::Rpc(status) => write!(f, "indexer rpc error: {status}"),
+            BridgeError::PermanentRpc(status) => {
+                write!(f, "permanent indexer rpc error: {status}")
+            }
             BridgeError::Timeout(message) => write!(f, "bridge timeout: {message}"),
             BridgeError::Transport(error) => write!(f, "indexer transport error: {error}"),
             BridgeError::Zmq(error) => write!(f, "zmq error: {error}"),
@@ -95,6 +106,12 @@ impl std::fmt::Display for BridgeError {
 }
 
 impl std::error::Error for BridgeError {}
+
+impl BridgeError {
+    fn is_permanent(&self) -> bool {
+        matches!(self, BridgeError::Config(_) | BridgeError::PermanentRpc(_))
+    }
+}
 
 impl From<zeromq::ZmqError> for BridgeError {
     fn from(error: zeromq::ZmqError) -> Self {
@@ -108,9 +125,19 @@ impl From<tonic::transport::Error> for BridgeError {
     }
 }
 
-impl From<tonic::Status> for BridgeError {
-    fn from(status: tonic::Status) -> Self {
-        BridgeError::Rpc(status)
+fn classify_rpc(status: Status) -> BridgeError {
+    match status.code() {
+        Code::InvalidArgument
+        | Code::FailedPrecondition
+        | Code::NotFound
+        | Code::AlreadyExists
+        | Code::OutOfRange
+        | Code::ResourceExhausted
+        | Code::Unauthenticated
+        | Code::PermissionDenied
+        | Code::Unimplemented
+        | Code::DataLoss => BridgeError::PermanentRpc(status),
+        _ => BridgeError::Rpc(status),
     }
 }
 
@@ -194,6 +221,13 @@ pub async fn run_bridge(config: BridgeConfig) -> Result<(), BridgeError> {
     let mut delay = RECONNECT_MIN_DELAY;
     let mut next_seq: Option<u64> = None;
     let mut pending_batch: Option<RawBatch> = None;
+    let mut incarnation = config.incarnation.clone();
+    if config.heartbeat_interval.is_some() && config.event_replay_endpoint.is_none() {
+        warn!(
+            "periodic liveness heartbeat disabled: configure \
+             SGLANG_KV_EVENT_REPLAY_ENDPOINT so the bridge can prove the worker publisher is alive"
+        );
+    }
     loop {
         match connect(&config).await {
             Ok((client, subscriber)) => {
@@ -204,6 +238,7 @@ pub async fn run_bridge(config: BridgeConfig) -> Result<(), BridgeError> {
                     subscriber,
                     &mut next_seq,
                     &mut pending_batch,
+                    &mut incarnation,
                 )
                 .await
                 {
@@ -212,11 +247,17 @@ pub async fn run_bridge(config: BridgeConfig) -> Result<(), BridgeError> {
                         return Ok(());
                     }
                     Err(error) => {
+                        if error.is_permanent() {
+                            return Err(error);
+                        }
                         warn!(%error, retry_in = ?delay, "bridge session lost; reconnecting");
                     }
                 }
             }
             Err(error) => {
+                if error.is_permanent() {
+                    return Err(error);
+                }
                 warn!(%error, retry_in = ?delay, "bridge connect failed; retrying");
             }
         }
@@ -229,7 +270,12 @@ pub async fn run_bridge(config: BridgeConfig) -> Result<(), BridgeError> {
 async fn connect(
     config: &BridgeConfig,
 ) -> Result<(KvIndexerClient<Channel>, SubSocket), BridgeError> {
-    let client = KvIndexerClient::connect(config.indexer_endpoint.clone()).await?;
+    let channel = Endpoint::from_shared(config.indexer_endpoint.clone())?
+        .connect_timeout(GRPC_CONNECT_TIMEOUT)
+        .timeout(GRPC_REQUEST_TIMEOUT)
+        .connect()
+        .await?;
+    let client = KvIndexerClient::new(channel);
     let mut subscriber = SubSocket::new();
     subscriber.subscribe(&config.event_topic).await?;
     subscriber.connect(&config.event_endpoint).await?;
@@ -243,12 +289,13 @@ async fn connect(
 /// from the authoritative position rather than the locally observed seq.
 async fn commit_batch(
     config: &BridgeConfig,
+    incarnation: &str,
     client: &mut KvIndexerClient<Channel>,
     batch: &RawBatch,
     pending_batch: &mut Option<RawBatch>,
 ) -> Result<u64, BridgeError> {
     *pending_batch = Some(batch.clone());
-    let last_applied_seq = forward_raw_batch(config, client, batch).await?;
+    let last_applied_seq = forward_raw_batch(config, incarnation, client, batch).await?;
     *pending_batch = None;
     Ok(last_applied_seq)
 }
@@ -262,12 +309,25 @@ async fn run_session(
     mut subscriber: SubSocket,
     next_seq: &mut Option<u64>,
     pending_batch: &mut Option<RawBatch>,
+    incarnation: &mut String,
 ) -> Result<(), BridgeError> {
+    // Only a response from the worker-owned replay endpoint proves that SGLang
+    // is alive. Announce/refresh the incarnation immediately after that proof.
+    if config.event_replay_endpoint.is_some() {
+        match probe_publisher(config).await {
+            Ok(()) => send_heartbeat(config, incarnation, &mut client).await?,
+            Err(error) => {
+                warn!(%error, "publisher startup probe failed; not refreshing worker liveness");
+            }
+        }
+    }
+
     // A batch left pending by the previous disconnect is re-driven once before
     // consuming new events. It can only be set at session entry: every in-loop
     // commit either clears it or returns an error that ends the session.
     if let Some(batch) = pending_batch.clone() {
-        let last_applied_seq = commit_batch(config, &mut client, &batch, pending_batch).await?;
+        let last_applied_seq =
+            commit_batch(config, incarnation, &mut client, &batch, pending_batch).await?;
         *next_seq = last_applied_seq.checked_add(1);
     }
 
@@ -286,8 +346,16 @@ async fn run_session(
     loop {
         let message = tokio::select! {
             result = subscriber.recv() => result?,
-            _ = heartbeat.tick(), if config.heartbeat_interval.is_some() => {
-                send_heartbeat(config, &mut client).await?;
+            _ = heartbeat.tick(),
+                if config.heartbeat_interval.is_some()
+                    && config.event_replay_endpoint.is_some() =>
+            {
+                match probe_publisher(config).await {
+                    Ok(()) => send_heartbeat(config, incarnation, &mut client).await?,
+                    Err(error) => {
+                        warn!(%error, "publisher liveness probe failed; heartbeat suppressed");
+                    }
+                }
                 continue;
             }
             _ = tokio::signal::ctrl_c() => {
@@ -303,24 +371,44 @@ async fn run_session(
                 continue;
             }
         };
+        if let Err(error) = decode_event_batch_impl(&payload, false) {
+            warn!(
+                seq,
+                %error,
+                "skipping malformed event batch before sequence-state changes"
+            );
+            continue;
+        }
 
         if let Some(expected) = *next_seq {
             if seq < expected {
                 warn!(
                     expected,
                     actual = seq,
-                    "skipping stale SGLang KV event batch"
+                    "SGLang KV event sequence moved backwards; treating publisher as restarted"
                 );
-                continue;
+                *incarnation = generate_incarnation();
+                *next_seq = None;
+                *pending_batch = None;
+                send_heartbeat(config, incarnation, &mut client).await?;
             }
             if seq > expected {
                 warn!(expected, actual = seq, "SGLang KV event sequence gap");
-                replay_missing_batches(config, &mut client, expected, seq, pending_batch).await?;
+                replay_missing_batches(
+                    config,
+                    incarnation,
+                    &mut client,
+                    expected,
+                    seq,
+                    pending_batch,
+                )
+                .await?;
             }
         }
 
         let last_applied_seq = commit_batch(
             config,
+            incarnation,
             &mut client,
             &RawBatch { seq, payload },
             pending_batch,
@@ -333,8 +421,31 @@ async fn run_session(
     }
 }
 
+/// Proves the SGLang publisher is alive without replaying data. Upstream treats
+/// the requested sequence as a lower bound, so `u64::MAX` yields only END_SEQ.
+async fn probe_publisher(config: &BridgeConfig) -> Result<(), BridgeError> {
+    let endpoint = config.event_replay_endpoint.as_ref().ok_or_else(|| {
+        BridgeError::Config(
+            "publisher liveness probe requires SGLANG_KV_EVENT_REPLAY_ENDPOINT".to_string(),
+        )
+    })?;
+    let mut socket = DealerSocket::new();
+    socket.connect(endpoint).await?;
+    let mut request = ZmqMessage::from(bytes::Bytes::copy_from_slice(&u64::MAX.to_be_bytes()));
+    request.push_front(bytes::Bytes::new());
+    tokio::time::timeout(REPLAY_REQUEST_TIMEOUT, socket.send(request))
+        .await
+        .map_err(|_| BridgeError::Timeout("SGLang liveness probe send timed out".to_string()))??;
+    let frames = tokio::time::timeout(REPLAY_REQUEST_TIMEOUT, socket.recv())
+        .await
+        .map_err(|_| BridgeError::Timeout("SGLang liveness probe timed out".to_string()))??
+        .into_vec();
+    parse_probe_response(&frames)
+}
+
 async fn replay_missing_batches(
     config: &BridgeConfig,
+    incarnation: &str,
     client: &mut KvIndexerClient<Channel>,
     start_seq: u64,
     stop_before_seq: u64,
@@ -392,7 +503,7 @@ async fn replay_missing_batches(
             seq,
             payload: payload.to_vec(),
         };
-        commit_batch(config, client, &batch, pending_batch).await?;
+        commit_batch(config, incarnation, client, &batch, pending_batch).await?;
         replay_expected = seq.checked_add(1).unwrap_or(seq);
         recovered += 1;
     }
@@ -425,6 +536,32 @@ fn parse_replay_frames(frames: &[bytes::Bytes]) -> Result<(i64, &[u8]), BridgeEr
     }
 }
 
+fn parse_probe_response(frames: &[bytes::Bytes]) -> Result<(), BridgeError> {
+    if frames.len() != 3 {
+        return Err(BridgeError::Decode(format!(
+            "liveness probe expected 3 frames, got {}",
+            frames.len()
+        )));
+    }
+    if !frames[0].is_empty() {
+        return Err(BridgeError::Decode(
+            "liveness probe delimiter must be empty".to_string(),
+        ));
+    }
+    let seq = decode_signed_seq(&frames[1])?;
+    if seq != -1 {
+        return Err(BridgeError::Decode(format!(
+            "liveness probe expected END_SEQ -1, got {seq}"
+        )));
+    }
+    if !frames[2].is_empty() {
+        return Err(BridgeError::Decode(
+            "liveness probe END payload must be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn decode_signed_seq(bytes: &[u8]) -> Result<i64, BridgeError> {
     let seq_bytes: [u8; 8] = bytes
         .try_into()
@@ -451,6 +588,7 @@ fn decode_seq(bytes: &[u8]) -> Result<u64, BridgeError> {
 
 async fn forward_raw_batch(
     config: &BridgeConfig,
+    incarnation: &str,
     client: &mut KvIndexerClient<Channel>,
     batch: &RawBatch,
 ) -> Result<u64, BridgeError> {
@@ -462,14 +600,18 @@ async fn forward_raw_batch(
         }
     };
 
-    let request = build_apply_request(config, batch.seq, actions);
+    let request = build_apply_request(config, incarnation, batch.seq, actions);
     // Nothing decodable to a supported mutation (e.g. only ignored event tags):
     // preserve the previous no-op behaviour and skip the RPC entirely. The batch
     // still counts as consumed, so report its seq as the applied position.
     if request.actions.is_empty() {
         return Ok(batch.seq);
     }
-    let response = client.apply_external_kv_batch(request).await?.into_inner();
+    let response = client
+        .apply_external_kv_batch(request)
+        .await
+        .map_err(classify_rpc)?
+        .into_inner();
     Ok(response.last_applied_seq)
 }
 
@@ -479,6 +621,7 @@ async fn forward_raw_batch(
 /// propagated so a broken connection ends the session and triggers reconnect.
 async fn send_heartbeat(
     config: &BridgeConfig,
+    incarnation: &str,
     client: &mut KvIndexerClient<Channel>,
 ) -> Result<(), BridgeError> {
     let request = ApplyExternalKvBatchRequest {
@@ -486,9 +629,12 @@ async fn send_heartbeat(
         seq: 0,
         actions: Vec::new(),
         worker_address: config.worker_address.clone(),
-        incarnation: config.incarnation.clone(),
+        incarnation: incarnation.to_string(),
     };
-    client.apply_external_kv_batch(request).await?;
+    client
+        .apply_external_kv_batch(request)
+        .await
+        .map_err(classify_rpc)?;
     debug!(worker_id = %config.worker_id, "sent liveness heartbeat");
     Ok(())
 }
@@ -499,6 +645,7 @@ async fn send_heartbeat(
 /// carries the same semantics as the legacy per-tier revoke-all RPCs.
 fn build_apply_request(
     config: &BridgeConfig,
+    incarnation: &str,
     seq: u64,
     events: EventActions,
 ) -> ApplyExternalKvBatchRequest {
@@ -532,11 +679,18 @@ fn build_apply_request(
         seq,
         actions,
         worker_address: config.worker_address.clone(),
-        incarnation: config.incarnation.clone(),
+        incarnation: incarnation.to_string(),
     }
 }
 
 fn decode_event_batch(payload: &[u8]) -> Result<EventActions, BridgeError> {
+    decode_event_batch_impl(payload, true)
+}
+
+fn decode_event_batch_impl(
+    payload: &[u8],
+    log_event_errors: bool,
+) -> Result<EventActions, BridgeError> {
     let mut cursor = Cursor::new(payload);
     let value = read_value(&mut cursor).map_err(|error| BridgeError::Decode(error.to_string()))?;
     let batch = expect_array(&value, "KVEventBatch")?;
@@ -548,8 +702,16 @@ fn decode_event_batch(payload: &[u8]) -> Result<EventActions, BridgeError> {
 
     let events = expect_array(&batch[1], "KVEventBatch.events")?;
     let mut actions = EventActions::default();
-    for event in events {
-        decode_event(event, &mut actions)?;
+    for (event_index, event) in events.iter().enumerate() {
+        if let Err(error) = decode_event(event, &mut actions) {
+            if log_event_errors {
+                warn!(
+                    event_index,
+                    %error,
+                    "skipping one undecodable SGLang KV event; preserving valid siblings"
+                );
+            }
+        }
     }
     Ok(actions)
 }
@@ -642,14 +804,15 @@ fn parse_clear_tiers(value: &str) -> Result<Vec<i32>, BridgeError> {
         .collect()
 }
 
-/// Generates a fresh per-process incarnation token: nanoseconds since the epoch
-/// combined with the PID, unique enough to distinguish worker (re)starts.
+/// Generates a fresh incarnation token. The atomic suffix guarantees uniqueness
+/// across multiple publisher restarts observed within this bridge process.
 fn generate_incarnation() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{nanos}-{}", std::process::id())
+    let counter = INCARNATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos}-{}-{counter}", std::process::id())
 }
 
 /// Parses `KV_INDEXER_HEARTBEAT_SECS` (default `30`; `0` disables heartbeats).
@@ -770,7 +933,12 @@ mod tests {
         seq: u64,
         events: Vec<Value>,
     ) -> ApplyExternalKvBatchRequest {
-        build_apply_request(config, seq, decode_event_batch(&batch(events)).unwrap())
+        build_apply_request(
+            config,
+            &config.incarnation,
+            seq,
+            decode_event_batch(&batch(events)).unwrap(),
+        )
     }
 
     fn report(tier: i32, hashes: &[&str]) -> ExternalKvAction {
@@ -887,6 +1055,41 @@ mod tests {
                 hashes: vec!["2".to_string()],
             }]
         );
+    }
+
+    #[test]
+    fn bad_event_does_not_drop_valid_siblings() {
+        assert_eq!(
+            actions_of(vec![
+                stored(&[1], "GPU"),
+                stored(&[2], "EXTERNAL"),
+                removed(&[3], "DISK"),
+            ]),
+            vec![
+                Action::Report {
+                    tier: hbm(),
+                    hashes: vec!["1".to_string()],
+                },
+                Action::Revoke {
+                    tier: ssd(),
+                    hashes: vec!["3".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn permanent_rpc_codes_are_not_retried() {
+        for code in [
+            Code::InvalidArgument,
+            Code::FailedPrecondition,
+            Code::ResourceExhausted,
+            Code::PermissionDenied,
+        ] {
+            assert!(classify_rpc(Status::new(code, "bad batch")).is_permanent());
+        }
+        assert!(!classify_rpc(Status::unavailable("retry")).is_permanent());
+        assert!(!classify_rpc(Status::deadline_exceeded("retry")).is_permanent());
     }
 
     // --- ordering regressions (the whole point of the in-order rewrite) ---
@@ -1019,13 +1222,19 @@ mod tests {
     // --- error / mapping units ---
 
     #[test]
-    fn external_medium_is_rejected() {
-        assert!(decode_event_batch(&batch(vec![stored(&[1], "EXTERNAL")])).is_err());
+    fn external_medium_event_is_skipped() {
+        assert!(decode_event_batch(&batch(vec![stored(&[1], "EXTERNAL")]))
+            .unwrap()
+            .actions
+            .is_empty());
     }
 
     #[test]
-    fn unknown_medium_is_rejected() {
-        assert!(decode_event_batch(&batch(vec![stored(&[1], "TAPE")])).is_err());
+    fn unknown_medium_event_is_skipped() {
+        assert!(decode_event_batch(&batch(vec![stored(&[1], "TAPE")]))
+            .unwrap()
+            .actions
+            .is_empty());
     }
 
     #[test]
@@ -1103,6 +1312,29 @@ mod tests {
         ];
         assert_eq!(parse_replay_frames(&two).unwrap().0, seq);
         assert!(parse_replay_frames(&[Bytes::new()]).is_err());
+    }
+
+    #[test]
+    fn probe_response_requires_exact_end_frame() {
+        let valid = [
+            Bytes::new(),
+            Bytes::copy_from_slice(&(-1_i64).to_be_bytes()),
+            Bytes::new(),
+        ];
+        assert!(parse_probe_response(&valid).is_ok());
+        assert!(parse_probe_response(&valid[1..]).is_err());
+
+        let mut bad_delimiter = valid.clone();
+        bad_delimiter[0] = Bytes::from_static(b"not-empty");
+        assert!(parse_probe_response(&bad_delimiter).is_err());
+
+        let mut bad_seq = valid.clone();
+        bad_seq[1] = Bytes::copy_from_slice(&(-2_i64).to_be_bytes());
+        assert!(parse_probe_response(&bad_seq).is_err());
+
+        let mut bad_payload = valid;
+        bad_payload[2] = Bytes::from_static(b"unexpected");
+        assert!(parse_probe_response(&bad_payload).is_err());
     }
 
     #[test]

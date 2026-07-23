@@ -33,6 +33,7 @@ use test_net::free_addr;
 #[derive(Clone, Default)]
 struct CapturingBackend {
     seqs: Arc<Mutex<Vec<u64>>>,
+    incarnations: Arc<Mutex<Vec<String>>>,
 }
 
 #[tonic::async_trait]
@@ -41,7 +42,13 @@ impl KvIndexerBackend for CapturingBackend {
         &self,
         request: ApplyExternalKvBatchRequest,
     ) -> Result<ApplyExternalKvBatchResponse, Status> {
-        self.seqs.lock().unwrap().push(request.seq);
+        if !request.actions.is_empty() {
+            self.seqs.lock().unwrap().push(request.seq);
+            self.incarnations
+                .lock()
+                .unwrap()
+                .push(request.incarnation.clone());
+        }
         Ok(ApplyExternalKvBatchResponse {
             last_applied_seq: request.seq,
             duplicate: false,
@@ -106,6 +113,7 @@ async fn bridge_recovers_seq_gap_via_replay() {
     // --- capturing gRPC indexer ---
     let backend = CapturingBackend::default();
     let seqs = backend.seqs.clone();
+    let incarnations = backend.incarnations.clone();
     let grpc_addr = free_addr();
     let svc = KvIndexerServer::new(KvIndexerService::new(backend));
     tokio::spawn(async move {
@@ -122,26 +130,39 @@ async fn bridge_recovers_seq_gap_via_replay() {
     let mut router = RouterSocket::new();
     let router_ep = router.bind("tcp://127.0.0.1:0").await.expect("bind router");
 
-    // ROUTER responder: on a replay request [peer, b"", start_seq], stream the
-    // buffered missing batches (2, 3) then a negative-seq terminator.
+    // ROUTER responder: first answer the bridge's liveness probe (u64::MAX),
+    // then stream buffered missing batches (2, 3) for the real gap request.
     tokio::spawn(async move {
-        let req = router.recv().await.expect("router recv").into_vec();
-        let peer = req[0].clone();
-        for seq in [2i64, 3i64] {
+        loop {
+            let req = router.recv().await.expect("router recv").into_vec();
+            let peer = req[0].clone();
+            let start = u64::from_be_bytes(req[2].as_ref().try_into().unwrap());
+            if start == u64::MAX {
+                router
+                    .send(reply_frame(peer, -1, Vec::new()))
+                    .await
+                    .expect("router send probe terminator");
+                continue;
+            }
+            let replay_seqs: &[i64] = match start {
+                2 => &[2, 3],
+                other => panic!("unexpected replay start {other}"),
+            };
+            for &seq in replay_seqs {
+                router
+                    .send(reply_frame(
+                        peer.clone(),
+                        seq,
+                        stored_payload(1000 + seq, "GPU"),
+                    ))
+                    .await
+                    .expect("router send batch");
+            }
             router
-                .send(reply_frame(
-                    peer.clone(),
-                    seq,
-                    stored_payload(1000 + seq, "GPU"),
-                ))
+                .send(reply_frame(peer, -1, Vec::new()))
                 .await
-                .expect("router send batch");
+                .expect("router send terminator");
         }
-        // terminator: seq < 0 tells the bridge the replay stream is done
-        router
-            .send(reply_frame(peer, -1, Vec::new()))
-            .await
-            .expect("router send terminator");
     });
 
     // --- bridge under test ---
@@ -203,5 +224,41 @@ async fn bridge_recovers_seq_gap_via_replay() {
         got,
         vec![0, 1, 2, 3, 4],
         "bridge must apply every batch exactly once in monotonic order (gap 2,3 recovered via replay)"
+    );
+
+    publisher
+        .send(pub_frame(0, vec![0xc1]))
+        .await
+        .expect("pub malformed rollback");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        seqs.lock().unwrap().len(),
+        5,
+        "malformed rollback must not reset sequence/incarnation state"
+    );
+
+    // A worker-owned publisher restart resets SGLang's sequence generator. The
+    // still-running bridge must rotate incarnation instead of discarding the
+    // new stream forever as stale.
+    publisher
+        .send(pub_frame(0, stored_payload(2000, "GPU")))
+        .await
+        .expect("pub restarted seq 0");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while seqs.lock().unwrap().len() < 6 {
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "timed out waiting for restarted publisher batch"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(seqs.lock().unwrap().as_slice(), &[0, 1, 2, 3, 4, 0]);
+    let incarnations = incarnations.lock().unwrap();
+    assert!(incarnations[..5]
+        .iter()
+        .all(|incarnation| incarnation == "replay-test"));
+    assert_ne!(
+        incarnations[5], "replay-test",
+        "publisher restart must rotate the worker incarnation"
     );
 }

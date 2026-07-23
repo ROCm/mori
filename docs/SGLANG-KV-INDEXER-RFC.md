@@ -20,7 +20,7 @@ The initial project will be implemented out of tree as an independent Rust servi
 
 3. Converge after common process and network failures.
 
-   Metadata updates are ordered per worker, idempotent under replay, and recoverable after bridge, indexer, Redis, or worker restarts. Dead or partially reset workers must not be returned as routing candidates.
+   Metadata updates are ordered per worker, idempotent under replay, and recoverable after transient bridge/indexer/Redis failures and worker restarts. A bridge process restart without a full SGLang state dump may conservatively lose reuse metadata, but must not resurrect stale routing state.
 
 ## Architecture
 
@@ -99,7 +99,11 @@ For multi-worker or DP-rank deployments, run one bridge per event source. Each s
 
 The index is best-effort routing metadata, not authoritative model state. A false negative reduces cache reuse; a false positive must be handled by the normal cache-miss fallback and must not corrupt inference. The design therefore favors a small replay-convergent state machine over distributed transactions or consensus.
 
-Correctness requires **one active bridge writer per `worker_id`**. Sequence checks and mutation commit are separate phases, so two concurrent writers for the same worker are not fenced from both starting an update. Different workers are independent and may update concurrently.
+Correctness requires **one active bridge writer per `worker_id`**. One indexer
+process serializes apply requests per worker, including timeout/retry overlap;
+different workers remain concurrent. Multiple indexer replicas do not implement
+a distributed per-worker mutation lock, so independent active writers carrying
+different sequences for the same worker ID remain unsupported.
 
 ### Durable per-worker sequence
 
@@ -120,34 +124,58 @@ The response returns `last_applied_seq`, allowing a bridge that re-observes an a
 
 The bridge retains an unacknowledged batch across gRPC reconnects and sends it again before consuming newer events. It also tracks the next expected SGLang sequence:
 
-- a lower sequence is stale and is ignored;
+- a lower live sequence violates SGLang's per-publisher monotonic stream contract and is treated conservatively as a publisher restart; the bridge rotates incarnation and resets stale routing state;
 - an equal sequence is processed;
 - a higher sequence is a gap, and the bridge requests the missing range from SGLang's replay endpoint before processing the live batch.
 
 Replay uses the same apply API and sequence gate as live traffic. When replay is not configured or the requested history is unavailable, the current best-effort policy logs the gap and continues with newer events. This can create false negatives and should be observable, but it does not block inference.
 
+Bridge gRPC connect and request operations have deadlines. Transport failures
+are retried with the pending batch intact; permanent protocol responses such as
+`INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, or `FAILED_PRECONDITION` terminate the
+bridge loudly instead of retrying a poison batch forever. Within a decoded
+SGLang batch, one malformed/unsupported event is logged and skipped without
+discarding valid sibling mutations.
+
 ### Worker liveness
 
 Durable worker metadata and liveness are stored separately:
 
-- `{worker}:meta` holds address, sequence, incarnation, and reset state and never expires;
-- `{worker}:live` is refreshed by every apply and by periodic empty-action heartbeats and carries the liveness TTL.
+- `{worker}:meta` holds address, sequence, incarnation, generation, and reset state and never expires;
+- `{worker}:live` is refreshed by applies and by periodic empty-action heartbeats and carries the liveness TTL.
 
-`MatchExternalKv` excludes workers whose live key has expired. Placement and reverse-index data are retained, so a transiently disconnected worker can become routable again after a heartbeat without rebuilding the entire index. Keeping metadata durable is essential: expiring it would lose the sequence and incarnation needed to reject stale state.
+Before a periodic heartbeat, the bridge probes the worker-owned SGLang replay
+endpoint and strictly requires the three-frame empty-delimiter, `END_SEQ=-1`,
+empty-payload response. A failed probe suppresses that heartbeat without
+tearing down the live SUB session. Thus a surviving sidecar cannot keep a dead
+worker routable. Without a replay endpoint periodic heartbeat is disabled and
+idle workers may conservatively expire. `MatchExternalKv` excludes workers
+whose live key has expired.
 
 ### Worker restart and incarnation reset
 
 Each worker lifetime has an opaque `incarnation` token. On a token change, the indexer must assume the worker's cache was lost:
 
-1. Atomically record the new incarnation and set durable `reset_pending = 1`.
-2. While reset is pending, exclude the worker from all match responses.
-3. Walk the worker reverse index and remove the worker from every placement entry.
-4. Clear the reverse index and old sequence.
-5. Clear `reset_pending` only after the reset fully succeeds.
+1. Reject an incarnation token that has previously been retired.
+2. Retire the old token, increment a durable generation, record the new token, and set `reset_pending = 1`.
+3. While reset is pending, exclude the worker from all match responses.
+4. Walk the worker reverse index and remove the worker from every placement entry.
+5. Clear the reverse index and old sequence.
+6. Clear `reset_pending` only after the reset fully succeeds.
 
-Reset operations are idempotent. If Redis or the indexer fails midway, the next apply or heartbeat observes `reset_pending` and retries. This prevents both stale placement resurrection and routing to a partially reset worker.
+Every placement value carries the worker generation. Match returns it only when it equals the current metadata generation. Therefore a placement orphaned by a failure before reverse-index `SADD` becomes invisible immediately after an incarnation change even though reset cannot discover it. Reset remains idempotent and retries while `reset_pending` is set.
 
-The default bridge-generated token identifies the bridge process. Deployments that can restart the bridge independently from the worker should provide a token tied to the actual worker lifetime; a bridge-only token change is safe but causes conservative cache misses.
+Sequence check and sequence commit both revalidate the generation returned by
+the initial metadata touch. An old request that was already in flight when a
+new incarnation won may leave only an invisible old-generation placement; it
+cannot advance the new incarnation's sequence checkpoint.
+
+The environment-provided incarnation value is an observability prefix; the
+bridge appends a unique process suffix so a later process never reuses a token
+the server may have retired. A bridge-only token change is safe but can cause
+conservative cache misses. A future worker-issued monotonic generation could
+avoid those misses, but an operator-supplied reusable opaque token cannot safely
+distinguish bridge and publisher restarts.
 
 ### Redis failure and partial writes
 
@@ -161,6 +189,9 @@ Redis Cluster cannot atomically update placement keys in multiple hash slots as 
 - replay always reasserts both postconditions, repairing a failure between them.
 
 Requests have protocol-level hash/action limits, and Redis fan-out is processed in bounded chunks so recovery traffic cannot create unbounded concurrent work.
+Single-node Redis uses connection-manager response deadlines; Redis Cluster
+commands and scripts are additionally wrapped in explicit response timeouts and
+the cached connection is discarded after a timeout.
 
 ### Failure behavior summary
 
@@ -168,13 +199,13 @@ Requests have protocol-level hash/action limits, and Redis fan-out is processed 
 | --- | --- |
 | Duplicate or stale batch | Sequence gate skips it and returns the durable position. |
 | Bridge-to-indexer disconnect | Pending batch is retained, connection is retried, and the batch is replayed. |
-| Bridge process restart | Volatile pending/expected-sequence state is lost. The default new incarnation conservatively wipes that worker's old placements; subsequent events rebuild them. |
+| Bridge process restart | Volatile pending/expected-sequence state is lost. Immediate publisher probe/heartbeat announces a new default incarnation and fences old placement; only subsequent events rebuild metadata. |
 | Missing event sequence | Bridge requests the missing range; without replay it logs degradation and continues. |
 | Indexer crash | Redis state survives; bridge reconnects and resumes from the durable sequence. |
 | Redis outage | Data RPCs fail with `UNAVAILABLE`; health reports `NOT_SERVING`; reconnect is automatic. |
-| Partial forward/reverse update | Replaying the idempotent batch repairs the missing postcondition. |
-| Worker or bridge stops heartbeating | Liveness TTL expires and the worker is excluded from matches. |
-| Worker restarts | Incarnation change fences routing, retries stale-state cleanup, and resets sequence state. |
+| Partial forward/reverse update | Replay repairs the missing postcondition; after a generation change, any undiscoverable old-generation placement is filtered from match. |
+| Worker stops | Replay probe fails, bridge stops refreshing liveness, and TTL excludes the worker. |
+| Worker publisher restarts | Live sequence rollback rotates incarnation, fences old placement, and accepts the new stream. |
 
 ### Explicit non-goals
 
@@ -197,12 +228,18 @@ The metadata store is the persistence layer behind the indexer. The initial impl
 The Redis data model maintains both directions required by the serving and recovery paths:
 
 ```text
-placement: hash -> worker_id -> tier bitmask
-reverse:   worker_id -> set<hash>
-meta:      worker_id -> {address, seq, incarnation, reset_pending}
+placement: hash -> worker_id -> generation:tier_bitmask
+reverse:   worker_id -> set<generation:hash>
+meta:      worker_id -> {address, seq, incarnation, generation, reset_pending}
+retired:   worker_id -> set<superseded incarnation>
 live:      worker_id -> expiring heartbeat key
 hits:      hash -> aggregate count
 ```
+
+The generation-tagged format is backward-readable by the new implementation,
+but old binaries cannot parse values written by it. Deployment must therefore
+use a coordinated stop-the-world upgrade or a fresh Redis namespace; mixed
+old/new writers on one namespace are unsupported.
 
 Placement and hit keys share a block-hash cluster tag; reverse, metadata, and liveness keys share a worker cluster tag. This permits every Lua script to declare keys from a single Redis Cluster slot.
 

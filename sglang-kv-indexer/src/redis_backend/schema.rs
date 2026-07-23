@@ -10,7 +10,8 @@
 //! (TierType HBM=1, DRAM=2, SSD=3). The bitmask is manipulated with plain integer
 //! arithmetic in Lua so the scripts run unchanged on Redis, Dragonfly and Valkey.
 
-/// Placement key for a block hash: HASH of `worker_id -> tier bitmask`.
+/// Placement key for a block hash: HASH of
+/// `worker_id -> "<generation>:<tier bitmask>"`.
 pub fn placement_key(ns: &str, hash: &str) -> String {
     format!("{ns}:{{{hash}}}:p")
 }
@@ -20,15 +21,14 @@ pub fn hit_key(ns: &str, hash: &str) -> String {
     format!("{ns}:{{{hash}}}:h")
 }
 
-/// Reverse index for a worker: SET of hashes the worker currently holds (any tier).
+/// Reverse index for a worker: SET of `"<generation>:<hash>"` members. Legacy
+/// plain hash members are generation zero.
 pub fn worker_blocks_key(ns: &str, worker_id: &str) -> String {
     format!("{ns}:{{w:{worker_id}}}:blocks")
 }
 
 /// Durable registry for a worker: HASH with fields `addr`, `seq`,
-/// `incarnation`, `reset_pending`. Never expires — losing `seq`/`incarnation`
-/// would silently resurrect a restarted worker's stale placements. Liveness is
-/// tracked separately in [`worker_live_key`].
+/// `incarnation`, `generation`, `reset_pending`. Never expires.
 pub fn worker_meta_key(ns: &str, worker_id: &str) -> String {
     format!("{ns}:{{w:{worker_id}}}:meta")
 }
@@ -40,6 +40,13 @@ pub fn worker_meta_key(ns: &str, worker_id: &str) -> String {
 /// per-worker keys so it stays in the same cluster slot.
 pub fn worker_live_key(ns: &str, worker_id: &str) -> String {
     format!("{ns}:{{w:{worker_id}}}:live")
+}
+
+/// Durable set of superseded incarnation tokens. A delayed request carrying a
+/// retired token is rejected instead of being allowed to roll the current
+/// incarnation backwards.
+pub fn worker_retired_incarnations_key(ns: &str, worker_id: &str) -> String {
+    format!("{ns}:{{w:{worker_id}}}:retired")
 }
 
 /// The bit representing a tier in a placement bitmask.
@@ -68,6 +75,10 @@ mod tests {
         assert_eq!(worker_blocks_key("kvidx", "w1"), "kvidx:{w:w1}:blocks");
         assert_eq!(worker_meta_key("kvidx", "w1"), "kvidx:{w:w1}:meta");
         assert_eq!(worker_live_key("kvidx", "w1"), "kvidx:{w:w1}:live");
+        assert_eq!(
+            worker_retired_incarnations_key("kvidx", "w1"),
+            "kvidx:{w:w1}:retired"
+        );
     }
 
     #[test]

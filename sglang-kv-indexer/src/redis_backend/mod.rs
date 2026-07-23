@@ -30,7 +30,7 @@ mod schema;
 mod scripts;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::try_join_all;
@@ -47,11 +47,11 @@ use crate::service::KvIndexerBackend;
 use conn::{ClusterConn, RedisConn, SingleConn};
 use schema::{
     hit_key, placement_key, tier_bit, tiers_from_mask, worker_blocks_key, worker_live_key,
-    worker_meta_key,
+    worker_meta_key, worker_retired_incarnations_key,
 };
 use scripts::{
-    MATCH_HASH, PLACEMENT_CLEAR, PLACEMENT_CLEAR_WORKER, PLACEMENT_SET, SEQ_CHECK, SEQ_COMMIT,
-    TOUCH_META, WORKER_VIEW,
+    HIT_BUMP, MATCH_HASH, PLACEMENT_CLEAR, PLACEMENT_CLEAR_WORKER, PLACEMENT_SET, RESET_FINISH,
+    SEQ_CHECK, SEQ_COMMIT, TOUCH_META, WORKER_VIEW,
 };
 
 /// Boxed error for construction paths (env parsing / connect / ping).
@@ -70,9 +70,15 @@ enum Target {
     Cluster(Vec<String>),
 }
 
+struct WorkerTouch {
+    reset_needed: bool,
+    generation: i64,
+}
+
 pub struct RedisKvIndexerBackend {
     conn: Arc<dyn RedisConn>,
     ns: String,
+    worker_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     /// When set, every apply refreshes a separate per-worker liveness key with
     /// this TTL, and `match` ignores workers whose liveness key has expired.
     /// The durable meta key never expires. `None` disables liveness filtering.
@@ -86,6 +92,7 @@ impl RedisKvIndexerBackend {
         Ok(Self {
             conn: Arc::new(conn),
             ns: ns.into(),
+            worker_locks: Mutex::new(HashMap::new()),
             worker_ttl: None,
         })
     }
@@ -99,6 +106,7 @@ impl RedisKvIndexerBackend {
         Ok(Self {
             conn: Arc::new(conn),
             ns: ns.into(),
+            worker_locks: Mutex::new(HashMap::new()),
             worker_ttl: None,
         })
     }
@@ -110,6 +118,7 @@ impl RedisKvIndexerBackend {
         Self {
             conn: Arc::new(SingleConn::deferred(url)),
             ns: ns.into(),
+            worker_locks: Mutex::new(HashMap::new()),
             worker_ttl: None,
         }
     }
@@ -119,6 +128,7 @@ impl RedisKvIndexerBackend {
         Self {
             conn: Arc::new(ClusterConn::deferred(nodes)),
             ns: ns.into(),
+            worker_locks: Mutex::new(HashMap::new()),
             worker_ttl: None,
         }
     }
@@ -202,6 +212,19 @@ impl RedisKvIndexerBackend {
         Ok(())
     }
 
+    fn worker_lock(&self, worker: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.worker_locks.lock().unwrap();
+        if let Some(lock) = locks.get(worker).and_then(Weak::upgrade) {
+            return lock;
+        }
+        if locks.len() >= 1024 {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(worker.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
     // --- write path ---------------------------------------------------------
 
     async fn apply(
@@ -209,6 +232,11 @@ impl RedisKvIndexerBackend {
         req: ApplyExternalKvBatchRequest,
     ) -> Result<ApplyExternalKvBatchResponse, Status> {
         let worker = req.worker_id.as_str();
+        // The bridge is sequential, but request timeout/retry overlap and other
+        // callers can still reach one server concurrently. Serialize a worker's
+        // gate/mutations/commit within this backend process.
+        let worker_lock = self.worker_lock(worker);
+        let _worker_guard = worker_lock.lock().await;
         let meta_key = worker_meta_key(&self.ns, worker);
 
         // Every apply is proof of life: refresh the worker's liveness (a separate
@@ -216,17 +244,18 @@ impl RedisKvIndexerBackend {
         // heartbeat keeps the worker routable. This also tracks the worker's
         // incarnation in the durable meta and reports whether a restart reset is
         // owed (either just detected, or a prior reset that did not finish).
-        let reset_needed = self
+        let touch = self
             .touch_meta(&meta_key, worker, &req.worker_address, &req.incarnation)
             .await?;
-        if reset_needed {
+        if touch.reset_needed {
             // The worker restarted: its cache is empty and its sequence counter
             // reset. Wipe the stale placement/reverse entries from the previous
             // incarnation and drop the durable seq so the fresh sequence is
             // accepted instead of being skipped as a duplicate. The reset is
             // idempotent and only clears the durable `reset_pending` flag once it
             // fully succeeds, so a mid-reset failure is retried on the next apply.
-            self.reset_worker(worker, &meta_key).await?;
+            self.reset_worker(worker, &meta_key, touch.generation)
+                .await?;
         }
 
         // An empty-actions batch is a pure heartbeat: liveness was just
@@ -246,12 +275,18 @@ impl RedisKvIndexerBackend {
             .invoke(
                 &SEQ_CHECK,
                 vec![meta_key.clone()],
-                vec![req.seq.to_string()],
+                vec![req.seq.to_string(), touch.generation.to_string()],
             )
             .await
             .map_err(to_status)?;
         let gate: Vec<i64> = Vec::<i64>::from_redis_value(&gate).map_err(to_status)?;
-        let proceed = gate.first().copied().unwrap_or(1) == 1;
+        let gate_status = gate.first().copied().unwrap_or(1);
+        if gate_status < 0 {
+            return Err(Status::failed_precondition(
+                "worker incarnation changed while applying batch",
+            ));
+        }
+        let proceed = gate_status == 1;
         let last = gate.get(1).copied().unwrap_or(-1);
         if !proceed {
             return Ok(ApplyExternalKvBatchResponse {
@@ -265,16 +300,27 @@ impl RedisKvIndexerBackend {
             match ExternalKvActionType::try_from(action.r#type) {
                 Ok(ExternalKvActionType::ActionReport) => {
                     for chunk in action.hashes.chunks(REDIS_FANOUT_CHUNK) {
-                        try_join_all(chunk.iter().map(|h| self.report_one(worker, h, bit))).await?;
+                        try_join_all(
+                            chunk
+                                .iter()
+                                .map(|h| self.report_one(worker, h, bit, touch.generation)),
+                        )
+                        .await?;
                     }
                 }
                 Ok(ExternalKvActionType::ActionRevoke) => {
                     for chunk in action.hashes.chunks(REDIS_FANOUT_CHUNK) {
-                        try_join_all(chunk.iter().map(|h| self.revoke_one(worker, h, bit))).await?;
+                        try_join_all(
+                            chunk
+                                .iter()
+                                .map(|h| self.revoke_one(worker, h, bit, touch.generation)),
+                        )
+                        .await?;
                     }
                 }
                 Ok(ExternalKvActionType::ActionClearAllAtTier) => {
-                    self.clear_all_at_tier(worker, bit).await?;
+                    self.clear_all_at_tier(worker, bit, touch.generation)
+                        .await?;
                 }
                 _ => return Err(Status::invalid_argument("unsupported action type")),
             }
@@ -285,10 +331,20 @@ impl RedisKvIndexerBackend {
         // repairs it rather than being skipped as a duplicate.
         let committed = self
             .conn
-            .invoke(&SEQ_COMMIT, vec![meta_key], vec![req.seq.to_string()])
+            .invoke(
+                &SEQ_COMMIT,
+                vec![meta_key],
+                vec![req.seq.to_string(), touch.generation.to_string()],
+            )
             .await
             .map_err(to_status)?;
-        let committed: i64 = i64::from_redis_value(&committed).map_err(to_status)?;
+        let committed: Vec<i64> = Vec::<i64>::from_redis_value(&committed).map_err(to_status)?;
+        if committed.first().copied().unwrap_or(1) < 0 {
+            return Err(Status::failed_precondition(
+                "worker incarnation changed while applying batch",
+            ));
+        }
+        let committed = committed.get(1).copied().unwrap_or(-1);
         Ok(ApplyExternalKvBatchResponse {
             last_applied_seq: committed.max(0) as u64,
             duplicate: false,
@@ -306,13 +362,24 @@ impl RedisKvIndexerBackend {
         worker: &str,
         addr: &str,
         incarnation: &str,
-    ) -> Result<bool, Status> {
+    ) -> Result<WorkerTouch, Status> {
         let ttl_ms = self.worker_ttl.map(|d| d.as_millis() as u64).unwrap_or(0);
+        // Empty incarnation is retained for wire compatibility but participates
+        // in fencing as one stable legacy token.
+        let incarnation = if incarnation.is_empty() {
+            "__legacy__"
+        } else {
+            incarnation
+        };
         let v = self
             .conn
             .invoke(
                 &TOUCH_META,
-                vec![meta_key.to_string(), worker_live_key(&self.ns, worker)],
+                vec![
+                    meta_key.to_string(),
+                    worker_live_key(&self.ns, worker),
+                    worker_retired_incarnations_key(&self.ns, worker),
+                ],
                 vec![
                     now_ms().to_string(),
                     ttl_ms.to_string(),
@@ -322,7 +389,18 @@ impl RedisKvIndexerBackend {
             )
             .await
             .map_err(to_status)?;
-        Ok(i64::from_redis_value(&v).map_err(to_status)? == 1)
+        let result: Vec<i64> = Vec::<i64>::from_redis_value(&v).map_err(to_status)?;
+        let status = result.first().copied().unwrap_or(0);
+        let generation = result.get(1).copied().unwrap_or(0);
+        if status < 0 {
+            return Err(Status::failed_precondition(format!(
+                "worker incarnation has been retired: {incarnation}"
+            )));
+        }
+        Ok(WorkerTouch {
+            reset_needed: status == 1,
+            generation,
+        })
     }
 
     /// Wipes all placement/reverse-index state for a worker and resets its
@@ -331,40 +409,74 @@ impl RedisKvIndexerBackend {
     /// so its index entries are stale. Every step is idempotent and the flag is
     /// cleared only after everything else succeeds, so a failure partway through
     /// leaves `reset_pending` set and the next apply retries the whole reset.
-    async fn reset_worker(&self, worker: &str, meta_key: &str) -> Result<(), Status> {
+    async fn reset_worker(
+        &self,
+        worker: &str,
+        meta_key: &str,
+        generation: i64,
+    ) -> Result<(), Status> {
         let mut cmd = redis::cmd("SMEMBERS");
         cmd.arg(worker_blocks_key(&self.ns, worker));
         let v = self.conn.query(cmd).await.map_err(to_status)?;
-        let hashes: Vec<String> = Vec::<String>::from_redis_value(&v).map_err(to_status)?;
-        for chunk in hashes.chunks(REDIS_FANOUT_CHUNK) {
-            try_join_all(chunk.iter().map(|h| self.clear_worker_from_hash(worker, h))).await?;
+        let members: Vec<String> = Vec::<String>::from_redis_value(&v).map_err(to_status)?;
+        let stale: Vec<(String, String)> = members
+            .into_iter()
+            .filter_map(|member| {
+                let (member_generation, hash) = parse_reverse_member(&member);
+                if member_generation < generation {
+                    let hash = hash.to_string();
+                    Some((member, hash))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for chunk in stale.chunks(REDIS_FANOUT_CHUNK) {
+            try_join_all(chunk.iter().map(|(member, hash)| {
+                self.clear_old_reverse_member(worker, member, hash, generation)
+            }))
+            .await?;
         }
-        // Drop the now-empty reverse index and the stale durable seq. A missing
-        // seq makes the next SEQ_CHECK accept the restarted sequence.
-        let mut del = redis::cmd("DEL");
-        del.arg(worker_blocks_key(&self.ns, worker));
-        self.conn.query(del).await.map_err(to_status)?;
-        let mut hdel = redis::cmd("HDEL");
-        hdel.arg(meta_key).arg("seq");
-        self.conn.query(hdel).await.map_err(to_status)?;
-        // Clear the flag last: if any step above failed we never reach here, so
-        // the reset is retried on the next apply.
-        let mut clear = redis::cmd("HDEL");
-        clear.arg(meta_key).arg("reset_pending");
-        self.conn.query(clear).await.map_err(to_status)?;
-        Ok(())
-    }
 
-    /// Removes a worker from a single hash's placement entirely (all tiers).
-    async fn clear_worker_from_hash(&self, worker: &str, hash: &str) -> Result<(), Status> {
-        self.conn
+        // Finish exactly once. A concurrent resetter arriving after another
+        // request has already opened the generation must not delete its seq.
+        let v = self
+            .conn
             .invoke(
-                &PLACEMENT_CLEAR_WORKER,
-                vec![placement_key(&self.ns, hash), hit_key(&self.ns, hash)],
-                vec![worker.to_string()],
+                &RESET_FINISH,
+                vec![meta_key.to_string()],
+                vec![generation.to_string()],
             )
             .await
             .map_err(to_status)?;
+        if i64::from_redis_value(&v).map_err(to_status)? < 0 {
+            return Err(Status::failed_precondition(
+                "worker generation changed while resetting",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn clear_old_reverse_member(
+        &self,
+        worker: &str,
+        member: &str,
+        hash: &str,
+        generation: i64,
+    ) -> Result<(), Status> {
+        let v = self
+            .conn
+            .invoke(
+                &PLACEMENT_CLEAR_WORKER,
+                vec![placement_key(&self.ns, hash), hit_key(&self.ns, hash)],
+                vec![worker.to_string(), generation.to_string()],
+            )
+            .await
+            .map_err(to_status)?;
+        let _: i64 = i64::from_redis_value(&v).map_err(to_status)?;
+        let mut srem = redis::cmd("SREM");
+        srem.arg(worker_blocks_key(&self.ns, worker)).arg(member);
+        self.conn.query(srem).await.map_err(to_status)?;
         Ok(())
     }
 
@@ -378,26 +490,45 @@ impl RedisKvIndexerBackend {
             .unwrap_or(-1))
     }
 
-    async fn report_one(&self, worker: &str, hash: &str, bit: i64) -> Result<(), Status> {
-        self.conn
+    async fn report_one(
+        &self,
+        worker: &str,
+        hash: &str,
+        bit: i64,
+        generation: i64,
+    ) -> Result<(), Status> {
+        let v = self
+            .conn
             .invoke(
                 &PLACEMENT_SET,
                 vec![placement_key(&self.ns, hash)],
-                vec![worker.to_string(), bit.to_string()],
+                vec![worker.to_string(), bit.to_string(), generation.to_string()],
             )
             .await
             .map_err(to_status)?;
+        if i64::from_redis_value(&v).map_err(to_status)? < 0 {
+            return Err(Status::failed_precondition(
+                "newer worker generation already owns placement",
+            ));
+        }
 
         // Always enforce the reverse-index postcondition. SADD is idempotent,
         // so replay repairs a prior failure after PLACEMENT_SET even when the
         // placement bit was already set by the first attempt.
         let mut cmd = redis::cmd("SADD");
-        cmd.arg(worker_blocks_key(&self.ns, worker)).arg(hash);
+        cmd.arg(worker_blocks_key(&self.ns, worker))
+            .arg(reverse_member(generation, hash));
         self.conn.query(cmd).await.map_err(to_status)?;
         Ok(())
     }
 
-    async fn revoke_one(&self, worker: &str, hash: &str, bit: i64) -> Result<(), Status> {
+    async fn revoke_one(
+        &self,
+        worker: &str,
+        hash: &str,
+        bit: i64,
+        generation: i64,
+    ) -> Result<(), Status> {
         // Pass both the placement and the co-located hit key: when the placement
         // empties, PLACEMENT_CLEAR drops the hit key too (same `{hash}` slot) so a
         // matched-then-evicted block cannot leak its `:h` key. Keys share the hash
@@ -407,27 +538,56 @@ impl RedisKvIndexerBackend {
             .invoke(
                 &PLACEMENT_CLEAR,
                 vec![placement_key(&self.ns, hash), hit_key(&self.ns, hash)],
-                vec![worker.to_string(), bit.to_string()],
+                vec![worker.to_string(), bit.to_string(), generation.to_string()],
             )
             .await
             .map_err(to_status)?;
         let flags: Vec<i64> = Vec::<i64>::from_redis_value(&v).map_err(to_status)?;
-        let worker_gone = flags.first().copied().unwrap_or(0) == 1;
+        let status = flags.first().copied().unwrap_or(0);
+        if status < 0 {
+            return Err(Status::failed_precondition(
+                "newer worker generation already owns placement",
+            ));
+        }
+        let worker_gone = status == 1;
         if worker_gone {
             let mut cmd = redis::cmd("SREM");
-            cmd.arg(worker_blocks_key(&self.ns, worker)).arg(hash);
+            cmd.arg(worker_blocks_key(&self.ns, worker))
+                .arg(reverse_member(generation, hash));
+            if generation == 0 {
+                cmd.arg(hash);
+            }
             self.conn.query(cmd).await.map_err(to_status)?;
         }
         Ok(())
     }
 
-    async fn clear_all_at_tier(&self, worker: &str, bit: i64) -> Result<(), Status> {
+    async fn clear_all_at_tier(
+        &self,
+        worker: &str,
+        bit: i64,
+        generation: i64,
+    ) -> Result<(), Status> {
         let mut cmd = redis::cmd("SMEMBERS");
         cmd.arg(worker_blocks_key(&self.ns, worker));
         let v = self.conn.query(cmd).await.map_err(to_status)?;
-        let hashes: Vec<String> = Vec::<String>::from_redis_value(&v).map_err(to_status)?;
+        let members: Vec<String> = Vec::<String>::from_redis_value(&v).map_err(to_status)?;
+        let hashes: Vec<String> = members
+            .iter()
+            .filter_map(|member| {
+                let (member_generation, hash) = parse_reverse_member(member);
+                (member_generation == generation).then(|| hash.to_string())
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         for chunk in hashes.chunks(REDIS_FANOUT_CHUNK) {
-            try_join_all(chunk.iter().map(|h| self.revoke_one(worker, h, bit))).await?;
+            try_join_all(
+                chunk
+                    .iter()
+                    .map(|h| self.revoke_one(worker, h, bit, generation)),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -439,49 +599,40 @@ impl RedisKvIndexerBackend {
         req: MatchExternalKvRequest,
     ) -> Result<MatchExternalKvResponse, Status> {
         let hashes = dedup_preserve_order(&req.hashes);
-        let count_flag = if req.count_as_hit { "1" } else { "0" };
-        let now = now_ms().to_string();
 
-        // Per-hash placement read (+ optional hit bump), preserving hash order.
+        // Per-hash placement read, preserving hash order. Hit counting happens
+        // after worker liveness and generation have been validated.
         let mut per_hash = Vec::with_capacity(hashes.len());
         for chunk in hashes.chunks(REDIS_FANOUT_CHUNK) {
-            let values = try_join_all(chunk.iter().map(|hash| {
-                let now = now.clone();
-                async move {
-                    let v = self
-                        .conn
-                        .invoke(
-                            &MATCH_HASH,
-                            vec![placement_key(&self.ns, hash), hit_key(&self.ns, hash)],
-                            vec![count_flag.to_string(), now],
-                        )
-                        .await?;
-                    let flat: Vec<String> = Vec::<String>::from_redis_value(&v)?;
-                    Ok::<_, redis::RedisError>(flat)
-                }
+            let values = try_join_all(chunk.iter().map(|hash| async move {
+                let v = self
+                    .conn
+                    .invoke(&MATCH_HASH, vec![placement_key(&self.ns, hash)], Vec::new())
+                    .await?;
+                let flat: Vec<String> = Vec::<String>::from_redis_value(&v)?;
+                Ok::<_, redis::RedisError>(flat)
             }))
             .await
             .map_err(to_status)?;
             per_hash.extend(values);
         }
 
-        // Aggregate into worker -> tier -> [hash], preserving worker first-seen order.
+        // Keep the placement generation alongside each candidate. Legacy
+        // numeric values are generation zero.
         let mut worker_order: Vec<String> = Vec::new();
-        let mut by_worker: HashMap<String, BTreeMap<i32, Vec<String>>> = HashMap::new();
+        let mut by_worker: HashMap<String, Vec<(String, i64, i64)>> = HashMap::new();
         for (hash, flat) in hashes.iter().zip(per_hash) {
             for pair in flat.chunks(2) {
                 if pair.len() != 2 {
                     continue;
                 }
                 let worker = &pair[0];
-                let mask: i64 = pair[1].parse().unwrap_or(0);
+                let (generation, mask) = parse_placement_value(&pair[1]);
                 let entry = by_worker.entry(worker.clone()).or_insert_with(|| {
                     worker_order.push(worker.clone());
-                    BTreeMap::new()
+                    Vec::new()
                 });
-                for tier in tiers_from_mask(mask) {
-                    entry.entry(tier).or_default().push(hash.clone());
-                }
+                entry.push((hash.clone(), generation, mask));
             }
         }
 
@@ -506,32 +657,69 @@ impl RedisKvIndexerBackend {
                         vec![ttl_flag.to_string()],
                     )
                     .await?;
-                let (addr, alive): (String, i64) = <(String, i64)>::from_redis_value(&v)?;
-                Ok::<_, redis::RedisError>((addr, alive == 1))
+                let (addr, alive, generation): (String, i64, i64) =
+                    <(String, i64, i64)>::from_redis_value(&v)?;
+                Ok::<_, redis::RedisError>((addr, alive == 1, generation))
             }))
             .await
             .map_err(to_status)?;
             metas.extend(values);
         }
 
-        let matches = worker_order
-            .into_iter()
-            .zip(metas)
-            .filter(|(_, (_, alive))| *alive)
-            .map(|(worker, (address, _))| {
-                let hashes_by_tier = by_worker
-                    .remove(&worker)
-                    .unwrap_or_default()
+        let mut matches = Vec::new();
+        let mut matched_hashes: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+        for (worker, (address, alive, current_generation)) in worker_order.into_iter().zip(metas) {
+            if !alive {
+                continue;
+            }
+            let mut by_tier: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+            for (hash, generation, mask) in by_worker.remove(&worker).unwrap_or_default() {
+                if generation != current_generation {
+                    continue;
+                }
+                for tier in tiers_from_mask(mask) {
+                    by_tier.entry(tier).or_default().push(hash.clone());
+                }
+                matched_hashes
+                    .entry(hash)
+                    .or_default()
+                    .push((worker.clone(), current_generation));
+            }
+            if by_tier.is_empty() {
+                continue;
+            }
+            matches.push(ExternalKvNodeMatch {
+                worker_id: worker,
+                address,
+                hashes_by_tier: by_tier
                     .into_iter()
                     .map(|(tier, hashes)| TierHashes { tier, hashes })
-                    .collect();
-                ExternalKvNodeMatch {
-                    worker_id: worker,
-                    address,
-                    hashes_by_tier,
-                }
-            })
-            .collect();
+                    .collect(),
+            });
+        }
+
+        if req.count_as_hit {
+            let matched_hashes: Vec<(String, Vec<(String, i64)>)> =
+                matched_hashes.into_iter().collect();
+            let now = now_ms().to_string();
+            for chunk in matched_hashes.chunks(REDIS_FANOUT_CHUNK) {
+                try_join_all(chunk.iter().map(|(hash, owners)| {
+                    let mut args = Vec::with_capacity(1 + owners.len() * 2);
+                    args.push(now.clone());
+                    for (worker, generation) in owners {
+                        args.push(worker.clone());
+                        args.push(generation.to_string());
+                    }
+                    self.conn.invoke(
+                        &HIT_BUMP,
+                        vec![placement_key(&self.ns, hash), hit_key(&self.ns, hash)],
+                        args,
+                    )
+                }))
+                .await
+                .map_err(to_status)?;
+            }
+        }
 
         Ok(MatchExternalKvResponse { matches })
     }
@@ -608,6 +796,27 @@ fn dedup_preserve_order(hashes: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn parse_placement_value(value: &str) -> (i64, i64) {
+    match value.split_once(':') {
+        Some((generation, mask)) => (generation.parse().unwrap_or(0), mask.parse().unwrap_or(0)),
+        None => (0, value.parse().unwrap_or(0)),
+    }
+}
+
+fn reverse_member(generation: i64, hash: &str) -> String {
+    format!("{generation}:{hash}")
+}
+
+fn parse_reverse_member(member: &str) -> (i64, &str) {
+    match member.split_once(':') {
+        Some((generation, hash)) => match generation.parse() {
+            Ok(generation) => (generation, hash),
+            Err(_) => (0, member),
+        },
+        None => (0, member),
+    }
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -648,5 +857,35 @@ mod tests {
             "b".to_string(),
         ];
         assert_eq!(dedup_preserve_order(&input), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn placement_value_parser_is_backward_compatible() {
+        assert_eq!(parse_placement_value("6"), (0, 6));
+        assert_eq!(parse_placement_value("3:10"), (3, 10));
+        assert_eq!(parse_placement_value("bad"), (0, 0));
+    }
+
+    #[test]
+    fn reverse_member_parser_is_backward_compatible() {
+        assert_eq!(parse_reverse_member("hash-a"), (0, "hash-a"));
+        assert_eq!(parse_reverse_member("legacy:hash"), (0, "legacy:hash"));
+        assert_eq!(parse_reverse_member("3:hash-a"), (3, "hash-a"));
+        assert_eq!(reverse_member(3, "hash-a"), "3:hash-a");
+    }
+
+    #[test]
+    fn worker_lock_is_shared_while_active_and_prunes_inactive_entries() {
+        let backend = RedisKvIndexerBackend::connect_single_deferred("redis://127.0.0.1:1", "test");
+        let first = backend.worker_lock("worker-a");
+        let same = backend.worker_lock("worker-a");
+        assert!(Arc::ptr_eq(&first, &same));
+        drop(first);
+        drop(same);
+
+        for index in 0..1100 {
+            drop(backend.worker_lock(&format!("worker-{index}")));
+        }
+        assert!(backend.worker_locks.lock().unwrap().len() < 1024);
     }
 }
