@@ -162,7 +162,6 @@ class IntraNodeSubGroupBroadcastSdma {
     shmem::ShmemBarrierAll();
     return 0.0;
   }
-
 };
 
 }  // namespace collective
