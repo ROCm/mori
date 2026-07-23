@@ -571,20 +571,6 @@ class InterNodeRingAllgather:
             )
         return True
 
-    def full_tensor(self, count: int, dtype, device=None):
-        """Torch view of the FULL ring buffer (``ring_size * count`` elements).
-
-        The ring buffer holds the ``ring_size`` gathered chunks in ring order --
-        the full rank-major result for this sub-group. ``count`` is the per-chunk
-        element count (of ``dtype``); ``count*element_size`` must be a multiple of
-        4 (the u32 lane size).
-        """
-        byte_count = count * torch.tensor([], dtype=dtype).element_size()
-        u32_count = (byte_count + 3) // 4
-        total = u32_count * self.ring_size
-        ptr = self._handle.buf_ptr()
-        return _ptr_to_tensor(ptr, total * 4, dtype, device)[: count * self.ring_size]
-
     def slot_tensor(self, count: int, dtype, device=None):
         """Torch view of this PE's ring slot (``count`` elements of ``dtype``).
 

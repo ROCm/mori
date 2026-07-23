@@ -22,10 +22,8 @@
 """Cross-node FSDP2 all-gather backend backed by mori.ccl.HierAllGather.
 
 Intra-node traffic rides SDMA copy engines (XGMI); inter-node goes over RDMA.
-Wired in via ``FSDPModule.set_custom_all_gather``. The param-contiguous
-zero-copy path (``enqueue_param_contiguous``) is available cross-node only
-(num_nodes>=2, slice_direct over RDMA): the result lands straight in FSDP's
-``[param][rank]`` output. Single-node keeps the rank-major copy-out.
+Wired in via ``FSDPModule.set_custom_all_gather``. The all-gather result is
+copied out rank-major into FSDP's output tensor.
 """
 
 import importlib
@@ -135,8 +133,6 @@ class MoriAllGather(AllGather):
     over RDMA. Usage: ``model.set_custom_all_gather(MoriAllGather())``.
     """
 
-    supports_param_contiguous_output = False
-
     def __init__(self, ranks_per_node: int | None = None) -> None:
         self._ranks_per_node = ranks_per_node
         self._collective: Any | None = None
@@ -144,25 +140,16 @@ class MoriAllGather(AllGather):
         self._world_size: int | None = None
         self._cap_bytes = 0
         self._output_buffer: torch.Tensor | None = None
-        self._pc_split_sizes: list[int] | None = None
-        self._pc_split_offsets: list[int] | None = None
-        self._pc_input_numel: int | None = None
-        # Param-contiguous zero-copy is cross-node only (num_nodes>=2,
-        # slice_direct over RDMA). FSDP reads this before the collective exists,
-        # so derive num_nodes from the launch env.
+        # The auto-tuning defaults below are cross-node only (num_nodes>=2), so
+        # derive num_nodes from the launch env (set before the collective exists).
         world = int(os.environ.get("WORLD_SIZE", "0") or "0")
         if world > 0:
             rpn = self._ranks_per_node_value(world)
             num_nodes = world // rpn if rpn else 1
-            self.supports_param_contiguous_output = num_nodes >= 2
-            # Zero-tuning defaults (MORI_FSDP_AUTO=1): bit-exact, faster than the
-            # framework default with no env tuning. Applied via setdefault() so any
-            # explicit MORI_* wins; MORI_FSDP_AUTO=0 restores fully-manual behavior.
-            if num_nodes >= 2 and os.environ.get("MORI_FSDP_AUTO", "1") not in (
-                "0",
-                "false",
-                "False",
-            ):
+            # Zero-tuning defaults: bit-exact, faster than the framework default
+            # with no env tuning. Applied via setdefault() so any explicit MORI_*
+            # still wins. Cross-node only (num_nodes>=2).
+            if num_nodes >= 2:
                 _sd = os.environ.setdefault
                 # fused hierarchical fill: SDMA intra reassembly + RDMA inter ring
                 # (CU-free path, frees compute units for the GEMMs).
@@ -177,17 +164,12 @@ class MoriAllGather(AllGather):
                     _sd("MORI_HIER_DEEP_PIPE", "auto")
                     _sd("MORI_SDMA_NUM_CHANNELS", "8")
                 else:
-                    # rpn>=8 (8 GPU/node) correctness gate: the zero-copy
-                    # param-contiguous scatter produces garbage output and the
-                    # copy-out HIP-graph capture poisons the HIP context (SIGABRT).
-                    # Bit-exact base = rank-major copy-out with the host-drain
-                    # landing fence:
-                    #   * NO_ZERO_COPY routes off the broken zero-copy scatter;
+                    # rpn>=8 (8 GPU/node) correctness gate; bit-exact base =
+                    # rank-major copy-out with the host-drain landing fence:
                     #   * DEBUG_SYNC is the host stream.synchronize() fence draining
                     #     cross-PE RDMA/SDMA completions (only bit-exact fence here)
                     #     and disables the poison-prone HIP-graph capture;
                     #   * CUDA_GRAPH=0 belt-and-suspenders.
-                    _sd("MORI_FSDP_NO_ZERO_COPY", "1")
                     _sd("MORI_HIER_DEBUG_SYNC", "1")
                     _sd("MORI_HIER_CUDA_GRAPH", "0")
                 # Deferred host landing fence: issue non-blocking, drain the one
@@ -196,26 +178,12 @@ class MoriAllGather(AllGather):
                 _sd("MORI_FSDP_DEFER_HOSTSYNC", "1")
                 _sd("MORI_FSDP_EVENT_FENCE", "1")
                 _sd("MORI_FSDP_FWD_PREFETCH", "1")
-        # NO_ZERO_COPY=1 forces the copy-out __call__ path (keeps the inter-ring
-        # overlap) instead of the zero-copy scatter.
-        if os.environ.get("MORI_FSDP_NO_ZERO_COPY", "") not in (
-            "",
-            "0",
-            "false",
-            "False",
-        ):
-            self.supports_param_contiguous_output = False
-        # Host-proxy path: the CPU-posted collective has no
-        # enqueue_param_contiguous, so force param-contiguous off (rank-major
-        # copy-out only).
         self._host_proxy = os.environ.get("MORI_FSDP_HOST_PROXY", "") not in (
             "",
             "0",
             "false",
             "False",
         )
-        if self._host_proxy:
-            self.supports_param_contiguous_output = False
         # Deferred-completion overlap for the host-proxy path
         # (MORI_HOSTPROXY_ASYNC=1, default OFF): post RDMA write + step-1 now
         # (non-blocking), return a c10d Work whose wait() runs the landing fence
@@ -377,64 +345,6 @@ class MoriAllGather(AllGather):
                 "MORI FSDP Hier allgather requires 4-byte-aligned input bytes"
             )
 
-    def prepare_param_contiguous_output(
-        self,
-        all_gather_input_split_sizes: list[int],
-        all_gather_input_numel: int,
-        world_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> object | None:
-        """Build per-param split metadata (in DTYPE elements) for the direct
-        param-contiguous scatter. ``enqueue_param_contiguous`` writes param ``s``
-        (per-rank numel ``E_s`` at input offset ``O_s``) so global rank ``r``'s
-        slice lands at ``O_s*W + r*E_s`` == FSDP's ``[param][rank]`` layout.
-        """
-        self.clear_param_contiguous_output()
-        if not self.supports_param_contiguous_output:
-            return None
-        if not all_gather_input_split_sizes:
-            raise RuntimeError("MORI zero-copy allgather requires non-empty splits")
-        if sum(all_gather_input_split_sizes) != all_gather_input_numel:
-            raise RuntimeError(
-                "MORI zero-copy allgather split sizes do not match input numel"
-            )
-        element_size = torch.empty((), dtype=dtype).element_size()
-        sizes: list[int] = []
-        offsets: list[int] = []
-        offset = 0
-        for split_size in all_gather_input_split_sizes:
-            e = int(split_size)
-            # SDMA byte extents must be 4-byte aligned (both size and offset).
-            if (e * element_size) % 4 != 0 or (offset * element_size) % 4 != 0:
-                raise RuntimeError(
-                    "MORI zero-copy allgather requires 4-byte-aligned splits"
-                )
-            sizes.append(e)
-            offsets.append(offset)
-            offset += e
-        # Store Python lists, not GPU tensors: passing GPU tensors forces a
-        # .tolist() D2H sync per all-gather, killing AG<->backward overlap.
-        # enqueue_param_contiguous caches the u32 GPU tensors internally.
-        self._pc_split_sizes = sizes
-        self._pc_split_offsets = offsets
-        self._pc_input_numel = all_gather_input_numel
-        return (self._pc_split_sizes, self._pc_split_offsets)
-
-    def clear_param_contiguous_output(self) -> None:
-        self._pc_split_sizes = None
-        self._pc_split_offsets = None
-        self._pc_input_numel = None
-
-    def _can_call_param_contiguous(self, input_tensor: torch.Tensor) -> bool:
-        if self._pc_split_sizes is None or self._pc_split_offsets is None:
-            return False
-        # Compare against the cached python-int numel -- no .item()/.sum() D2H sync.
-        if self._pc_input_numel != input_tensor.numel():
-            self.clear_param_contiguous_output()
-            return False
-        return True
-
     def __call__(
         self,
         output_tensor: torch.Tensor,
@@ -477,26 +387,9 @@ class MoriAllGather(AllGather):
             collective._pending = work
             return work
 
-        if self._can_call_param_contiguous(input_tensor):
-            ok = collective.enqueue_param_contiguous(
-                input_tensor,
-                output_tensor,
-                count,
-                self._pc_split_sizes,
-                self._pc_split_offsets,
-                stream=stream,
-            )
-            if not ok:
-                # FSDP already committed to [param][rank]; a rank-major fallback
-                # would corrupt it. Fail loudly (slice_direct expected available).
-                raise RuntimeError(
-                    "MORI HierAllGather param-contiguous path unavailable "
-                    "(slice_direct/RDMA required); refusing rank-major fallback"
-                )
-        else:
-            ok = collective(input_tensor, output_tensor, count, stream=stream)
-            if not ok:
-                raise RuntimeError("MORI HierAllGather call failed")
+        ok = collective(input_tensor, output_tensor, count, stream=stream)
+        if not ok:
+            raise RuntimeError("MORI HierAllGather call failed")
         # Deferred device-path host landing fence: the device AG was issued
         # non-blocking above; return a c10d Work whose wait() runs the host
         # stream.synchronize() at copy-out so the fence overlaps the backward GEMM.
