@@ -188,6 +188,7 @@ async fn main() -> Result<(), BoxError> {
                     seq,
                     actions: vec![report_action(hbm, hashes)],
                     worker_address: addr.clone(),
+                    incarnation: String::new(),
                 };
                 backend.apply_external_kv_batch(req).await.unwrap();
             }
@@ -228,6 +229,7 @@ async fn main() -> Result<(), BoxError> {
                     seq,
                     actions: vec![report_action(hbm, hashes)],
                     worker_address: addr.clone(),
+                    incarnation: String::new(),
                 };
                 let t0 = Instant::now();
                 backend.apply_external_kv_batch(req).await.unwrap();

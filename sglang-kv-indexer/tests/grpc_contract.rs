@@ -103,6 +103,7 @@ fn apply(
             tier,
             hashes: hashes.iter().map(|s| s.to_string()).collect(),
         }],
+        incarnation: String::new(),
     }
 }
 
@@ -382,6 +383,7 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
             tier: hbm(),
             hashes: vec!["h".into()],
         }],
+        incarnation: String::new(),
     };
     let err = c
         .apply_external_kv_batch(bad)

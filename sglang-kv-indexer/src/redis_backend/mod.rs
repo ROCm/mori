@@ -2,7 +2,8 @@
 //!
 //! Data model (see [`schema`]): placement is a per-block-hash HASH of
 //! `worker -> tier bitmask`; a per-worker SET is the reverse index; a per-worker
-//! HASH holds the registry (address + last_seen); hit counts live in a per-hash
+//! durable HASH holds the registry (address, seq, incarnation, reset_pending)
+//! while a separate per-worker key carries the liveness TTL; hit counts live in a per-hash
 //! HASH co-located with placement (and are deleted together with the placement
 //! when a block is fully revoked, so they never outlive the block). All writes
 //! flow through
@@ -30,7 +31,7 @@ mod scripts;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::try_join_all;
 use redis::FromRedisValue;
@@ -45,9 +46,13 @@ use crate::service::KvIndexerBackend;
 
 use conn::{ClusterConn, RedisConn, SingleConn};
 use schema::{
-    hit_key, placement_key, tier_bit, tiers_from_mask, worker_blocks_key, worker_meta_key,
+    hit_key, placement_key, tier_bit, tiers_from_mask, worker_blocks_key, worker_live_key,
+    worker_meta_key,
 };
-use scripts::{MATCH_HASH, PLACEMENT_CLEAR, PLACEMENT_SET, SEQ_CHECK, SEQ_COMMIT};
+use scripts::{
+    MATCH_HASH, PLACEMENT_CLEAR, PLACEMENT_CLEAR_WORKER, PLACEMENT_SET, SEQ_CHECK, SEQ_COMMIT,
+    TOUCH_META, WORKER_VIEW,
+};
 
 /// Boxed error for construction paths (env parsing / connect / ping).
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -65,6 +70,10 @@ enum Target {
 pub struct RedisKvIndexerBackend {
     conn: Arc<dyn RedisConn>,
     ns: String,
+    /// When set, every apply refreshes a separate per-worker liveness key with
+    /// this TTL, and `match` ignores workers whose liveness key has expired.
+    /// The durable meta key never expires. `None` disables liveness filtering.
+    worker_ttl: Option<Duration>,
 }
 
 impl RedisKvIndexerBackend {
@@ -74,6 +83,7 @@ impl RedisKvIndexerBackend {
         Ok(Self {
             conn: Arc::new(conn),
             ns: ns.into(),
+            worker_ttl: None,
         })
     }
 
@@ -86,6 +96,7 @@ impl RedisKvIndexerBackend {
         Ok(Self {
             conn: Arc::new(conn),
             ns: ns.into(),
+            worker_ttl: None,
         })
     }
 
@@ -96,6 +107,7 @@ impl RedisKvIndexerBackend {
         Self {
             conn: Arc::new(SingleConn::deferred(url)),
             ns: ns.into(),
+            worker_ttl: None,
         }
     }
 
@@ -104,7 +116,14 @@ impl RedisKvIndexerBackend {
         Self {
             conn: Arc::new(ClusterConn::deferred(nodes)),
             ns: ns.into(),
+            worker_ttl: None,
         }
+    }
+
+    /// Sets the per-worker liveness TTL (0 / `None` disables it).
+    pub fn with_worker_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.worker_ttl = ttl;
+        self
     }
 
     /// Builds the backend from the environment:
@@ -115,12 +134,16 @@ impl RedisKvIndexerBackend {
     ///     and fail fast (bounded, with a clear error) if Redis is unreachable;
     ///     set `0` to start degraded — the server comes up immediately and the
     ///     connection is established lazily / retried on demand.
+    ///   * `KV_INDEXER_WORKER_TTL_SECS` (default `120`): per-worker liveness TTL;
+    ///     a worker that stops applying/heartbeating for this long is dropped
+    ///     from `match`. `0` disables liveness (keys never expire).
     pub async fn from_env() -> Result<Self, BoxError> {
         let ns = std::env::var("KV_INDEXER_REDIS_NAMESPACE")
             .unwrap_or_else(|_| DEFAULT_NAMESPACE.into());
         let required = std::env::var("KV_INDEXER_REDIS_REQUIRED")
             .map(|v| v != "0")
             .unwrap_or(true);
+        let worker_ttl = parse_worker_ttl()?;
 
         let target = if let Ok(nodes) = std::env::var("KV_INDEXER_REDIS_CLUSTER_NODES") {
             let nodes: Vec<String> = nodes
@@ -155,7 +178,7 @@ impl RedisKvIndexerBackend {
                 .ping()
                 .await
                 .map_err(|e| format!("redis readiness probe (PING) failed: {e}"))?;
-            Ok(backend)
+            Ok(backend.with_worker_ttl(worker_ttl))
         } else {
             // Degraded: do not verify Redis now; start serving immediately and
             // connect lazily on first use (requests fail with Unavailable until
@@ -166,7 +189,8 @@ impl RedisKvIndexerBackend {
             Ok(match target {
                 Target::Cluster(nodes) => Self::connect_cluster_deferred(nodes, ns),
                 Target::Single(url) => Self::connect_single_deferred(&url, ns),
-            })
+            }
+            .with_worker_ttl(worker_ttl))
         }
     }
 
@@ -183,6 +207,34 @@ impl RedisKvIndexerBackend {
     ) -> Result<ApplyExternalKvBatchResponse, Status> {
         let worker = req.worker_id.as_str();
         let meta_key = worker_meta_key(&self.ns, worker);
+
+        // Every apply is proof of life: refresh the worker's liveness (a separate
+        // TTL key) before anything else, so even a duplicate or an empty-actions
+        // heartbeat keeps the worker routable. This also tracks the worker's
+        // incarnation in the durable meta and reports whether a restart reset is
+        // owed (either just detected, or a prior reset that did not finish).
+        let reset_needed = self
+            .touch_meta(&meta_key, worker, &req.worker_address, &req.incarnation)
+            .await?;
+        if reset_needed {
+            // The worker restarted: its cache is empty and its sequence counter
+            // reset. Wipe the stale placement/reverse entries from the previous
+            // incarnation and drop the durable seq so the fresh sequence is
+            // accepted instead of being skipped as a duplicate. The reset is
+            // idempotent and only clears the durable `reset_pending` flag once it
+            // fully succeeds, so a mid-reset failure is retried on the next apply.
+            self.reset_worker(worker, &meta_key).await?;
+        }
+
+        // An empty-actions batch is a pure heartbeat: liveness was just
+        // refreshed; report the current durable seq and return.
+        if req.actions.is_empty() {
+            let stored = self.read_worker_seq(&meta_key).await?;
+            return Ok(ApplyExternalKvBatchResponse {
+                last_applied_seq: stored.max(0) as u64,
+                duplicate: false,
+            });
+        }
 
         // Durable idempotency gate: skip a batch whose seq was already applied.
         // `last == -1` means the worker has no stored seq yet (accept any start).
@@ -203,16 +255,6 @@ impl RedisKvIndexerBackend {
                 last_applied_seq: last.max(0) as u64,
                 duplicate: true,
             });
-        }
-
-        if !req.worker_address.is_empty() {
-            let mut cmd = redis::cmd("HSET");
-            cmd.arg(&meta_key)
-                .arg("addr")
-                .arg(&req.worker_address)
-                .arg("last_seen")
-                .arg(now_ms());
-            self.conn.query(cmd).await.map_err(to_status)?;
         }
 
         for action in &req.actions {
@@ -256,6 +298,89 @@ impl RedisKvIndexerBackend {
             last_applied_seq: committed.max(0) as u64,
             duplicate: false,
         })
+    }
+
+    /// Refreshes a worker's liveness key (with TTL, when enabled) and records its
+    /// address/incarnation in the durable meta. Runs on every apply — including
+    /// heartbeats and duplicates — so an active worker never expires out of
+    /// `match`. Returns `true` when a restart reset is owed: the incarnation just
+    /// changed, or a previously flagged reset has not finished yet.
+    async fn touch_meta(
+        &self,
+        meta_key: &str,
+        worker: &str,
+        addr: &str,
+        incarnation: &str,
+    ) -> Result<bool, Status> {
+        let ttl_ms = self.worker_ttl.map(|d| d.as_millis() as u64).unwrap_or(0);
+        let v = self
+            .conn
+            .invoke(
+                &TOUCH_META,
+                vec![meta_key.to_string(), worker_live_key(&self.ns, worker)],
+                vec![
+                    now_ms().to_string(),
+                    ttl_ms.to_string(),
+                    addr.to_string(),
+                    incarnation.to_string(),
+                ],
+            )
+            .await
+            .map_err(to_status)?;
+        Ok(i64::from_redis_value(&v).map_err(to_status)? == 1)
+    }
+
+    /// Wipes all placement/reverse-index state for a worker and resets its
+    /// durable seq, then clears the `reset_pending` flag. Used when a worker's
+    /// incarnation changes (a restart): the previous incarnation's cache is gone,
+    /// so its index entries are stale. Every step is idempotent and the flag is
+    /// cleared only after everything else succeeds, so a failure partway through
+    /// leaves `reset_pending` set and the next apply retries the whole reset.
+    async fn reset_worker(&self, worker: &str, meta_key: &str) -> Result<(), Status> {
+        let mut cmd = redis::cmd("SMEMBERS");
+        cmd.arg(worker_blocks_key(&self.ns, worker));
+        let v = self.conn.query(cmd).await.map_err(to_status)?;
+        let hashes: Vec<String> = Vec::<String>::from_redis_value(&v).map_err(to_status)?;
+        for chunk in hashes.chunks(CLEAR_CHUNK) {
+            try_join_all(chunk.iter().map(|h| self.clear_worker_from_hash(worker, h))).await?;
+        }
+        // Drop the now-empty reverse index and the stale durable seq. A missing
+        // seq makes the next SEQ_CHECK accept the restarted sequence.
+        let mut del = redis::cmd("DEL");
+        del.arg(worker_blocks_key(&self.ns, worker));
+        self.conn.query(del).await.map_err(to_status)?;
+        let mut hdel = redis::cmd("HDEL");
+        hdel.arg(meta_key).arg("seq");
+        self.conn.query(hdel).await.map_err(to_status)?;
+        // Clear the flag last: if any step above failed we never reach here, so
+        // the reset is retried on the next apply.
+        let mut clear = redis::cmd("HDEL");
+        clear.arg(meta_key).arg("reset_pending");
+        self.conn.query(clear).await.map_err(to_status)?;
+        Ok(())
+    }
+
+    /// Removes a worker from a single hash's placement entirely (all tiers).
+    async fn clear_worker_from_hash(&self, worker: &str, hash: &str) -> Result<(), Status> {
+        self.conn
+            .invoke(
+                &PLACEMENT_CLEAR_WORKER,
+                vec![placement_key(&self.ns, hash), hit_key(&self.ns, hash)],
+                vec![worker.to_string()],
+            )
+            .await
+            .map_err(to_status)?;
+        Ok(())
+    }
+
+    /// Reads the worker's durable seq (`-1` when none has been stored yet).
+    async fn read_worker_seq(&self, meta_key: &str) -> Result<i64, Status> {
+        let mut cmd = redis::cmd("HGET");
+        cmd.arg(meta_key).arg("seq");
+        let v = self.conn.query(cmd).await.map_err(to_status)?;
+        Ok(Option::<i64>::from_redis_value(&v)
+            .map_err(to_status)?
+            .unwrap_or(-1))
     }
 
     async fn report_one(&self, worker: &str, hash: &str, bit: i64) -> Result<(), Status> {
@@ -361,21 +486,33 @@ impl RedisKvIndexerBackend {
             }
         }
 
-        // Fill each matched worker's address from its registry.
-        let addrs = try_join_all(worker_order.iter().map(|worker| async move {
-            let mut cmd = redis::cmd("HGET");
-            cmd.arg(worker_meta_key(&self.ns, worker)).arg("addr");
-            let v = self.conn.query(cmd).await?;
-            let addr: Option<String> = Option::<String>::from_redis_value(&v)?;
-            Ok::<_, redis::RedisError>(addr.unwrap_or_default())
+        // Fetch each matched worker's `addr` (for routing) and liveness. When a
+        // TTL is configured, liveness is the presence of the separate
+        // `worker_live_key`, which expires once a worker stops applying /
+        // heartbeating; such stale workers are dropped so `match` never routes to
+        // a dead node while its placement/reverse entries linger. The durable
+        // meta itself never expires, so a revived worker keeps its seq/incarnation.
+        let ttl_flag = if self.worker_ttl.is_some() { "1" } else { "0" };
+        let metas = try_join_all(worker_order.iter().map(|worker| async move {
+            let v = self
+                .conn
+                .invoke(
+                    &WORKER_VIEW,
+                    vec![worker_meta_key(&self.ns, worker), worker_live_key(&self.ns, worker)],
+                    vec![ttl_flag.to_string()],
+                )
+                .await?;
+            let (addr, alive): (String, i64) = <(String, i64)>::from_redis_value(&v)?;
+            Ok::<_, redis::RedisError>((addr, alive == 1))
         }))
         .await
         .map_err(to_status)?;
 
         let matches = worker_order
             .into_iter()
-            .zip(addrs)
-            .map(|(worker, address)| {
+            .zip(metas)
+            .filter(|(_, (_, alive))| *alive)
+            .map(|(worker, (address, _))| {
                 let hashes_by_tier = by_worker
                     .remove(&worker)
                     .unwrap_or_default()
@@ -464,6 +601,18 @@ fn now_ms() -> i64 {
 
 fn to_status(err: redis::RedisError) -> Status {
     Status::unavailable(format!("redis backend error: {err}"))
+}
+
+/// Parses `KV_INDEXER_WORKER_TTL_SECS` (default `120`; `0` disables liveness).
+fn parse_worker_ttl() -> Result<Option<Duration>, BoxError> {
+    const DEFAULT_WORKER_TTL_SECS: u64 = 120;
+    let secs = match std::env::var("KV_INDEXER_WORKER_TTL_SECS") {
+        Ok(v) => v.trim().parse::<u64>().map_err(|_| {
+            format!("KV_INDEXER_WORKER_TTL_SECS must be a non-negative integer, got {v:?}")
+        })?,
+        Err(_) => DEFAULT_WORKER_TTL_SECS,
+    };
+    Ok((secs > 0).then(|| Duration::from_secs(secs)))
 }
 
 #[cfg(test)]

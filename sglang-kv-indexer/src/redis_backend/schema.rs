@@ -25,9 +25,21 @@ pub fn worker_blocks_key(ns: &str, worker_id: &str) -> String {
     format!("{ns}:{{w:{worker_id}}}:blocks")
 }
 
-/// Registry for a worker: HASH with fields `addr` and `last_seen` (ms).
+/// Durable registry for a worker: HASH with fields `addr`, `seq`,
+/// `incarnation`, `reset_pending`. Never expires — losing `seq`/`incarnation`
+/// would silently resurrect a restarted worker's stale placements. Liveness is
+/// tracked separately in [`worker_live_key`].
 pub fn worker_meta_key(ns: &str, worker_id: &str) -> String {
     format!("{ns}:{{w:{worker_id}}}:meta")
+}
+
+/// Liveness marker for a worker: a short key refreshed with a TTL on every apply
+/// / heartbeat. Its presence (not the durable meta) is what `match` uses to
+/// decide a worker is still alive, so an expired-and-revived worker keeps its
+/// durable seq/incarnation. Shares the `{w:<worker>}` tag with the other
+/// per-worker keys so it stays in the same cluster slot.
+pub fn worker_live_key(ns: &str, worker_id: &str) -> String {
+    format!("{ns}:{{w:{worker_id}}}:live")
 }
 
 /// The bit representing a tier in a placement bitmask.
@@ -55,6 +67,7 @@ mod tests {
     fn worker_keys_share_worker_tag() {
         assert_eq!(worker_blocks_key("kvidx", "w1"), "kvidx:{w:w1}:blocks");
         assert_eq!(worker_meta_key("kvidx", "w1"), "kvidx:{w:w1}:meta");
+        assert_eq!(worker_live_key("kvidx", "w1"), "kvidx:{w:w1}:live");
     }
 
     #[test]

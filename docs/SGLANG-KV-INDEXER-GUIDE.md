@@ -93,6 +93,7 @@ Redis 后端(`KV_INDEXER_BACKEND=redis`)追加:
 | `KV_INDEXER_REDIS_CLUSTER_NODES` | (无) | 逗号分隔的 cluster 节点;设了则走 Cluster,优先于 `URL` |
 | `KV_INDEXER_REDIS_NAMESPACE`     | `kvidx` | key 前缀,多租户/多环境隔离 |
 | `KV_INDEXER_REDIS_REQUIRED`      | `1` | `1`=启动即连接并 PING,连不上快速失败;`0`=降级启动,首次使用时惰性连接(见 §7) |
+| `KV_INDEXER_WORKER_TTL_SECS`     | `120` | worker 存活 TTL:超过该时长未 apply/心跳的 worker 会从 `match` 结果中剔除(避免路由到死节点);`0`=关闭存活判定 |
 
 ### 3.2 bridge(`kv-indexer-bridge`)
 
@@ -105,6 +106,8 @@ Redis 后端(`KV_INDEXER_BACKEND=redis`)追加:
 | `SGLANG_KV_EVENT_TOPIC`            | `kv-events` | ZMQ 订阅 topic,需与 SGLang 侧一致 |
 | `KV_INDEXER_WORKER_ADDRESS`        | (空) | 可选,worker 反查地址 |
 | `KV_INDEXER_CLEAR_TIERS`           | `HBM,DRAM,SSD` | `AllBlocksCleared` 时清空哪些 tier |
+| `KV_INDEXER_HEARTBEAT_SECS`        | `30` | 无 KV 事件时仍定期发空 batch 心跳,为 worker 续期 TTL;须远小于 `KV_INDEXER_WORKER_TTL_SECS`;`0`=关闭心跳 |
+| `KV_INDEXER_WORKER_INCARNATION`    | (自动) | worker 世代号,随 apply 上报;变化即视为 worker 重启,indexer 会清掉该 worker 的旧索引并重置 seq。默认每次 bridge 进程启动生成一个;若能拿到 worker 真实生命周期 id(如与 worker 同起停的 token),显式设置可避免 bridge 单独重启时误清 |
 
 ---
 

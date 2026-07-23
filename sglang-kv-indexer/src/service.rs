@@ -172,9 +172,9 @@ fn validate_tier(tier: i32) -> Result<(), Status> {
 }
 
 fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
-    if actions.is_empty() {
-        return Err(Status::invalid_argument("actions must not be empty"));
-    }
+    // An empty actions list is a valid heartbeat: it carries no mutation and
+    // simply refreshes the worker's liveness on the server. Non-empty batches
+    // still have every action validated below.
     for action in actions {
         validate_tier(action.tier)?;
         match ExternalKvActionType::try_from(action.r#type) {
@@ -212,8 +212,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_actions_rejects_empty() {
-        assert!(validate_actions(&[]).is_err());
+    fn validate_actions_allows_empty_as_heartbeat() {
+        // An empty batch is a liveness heartbeat, not an error.
+        assert!(validate_actions(&[]).is_ok());
     }
 
     #[test]
@@ -258,6 +259,19 @@ mod tests {
                 action(ExternalKvActionType::ActionClearAllAtTier, hbm(), &[]),
             ],
             worker_address: "127.0.0.1:9000".to_string(),
+            incarnation: String::new(),
+        });
+        assert!(service().apply_external_kv_batch(request).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn apply_batch_accepts_empty_actions_as_heartbeat() {
+        let request = Request::new(ApplyExternalKvBatchRequest {
+            worker_id: "worker-1".to_string(),
+            seq: 0,
+            actions: vec![],
+            worker_address: "127.0.0.1:9000".to_string(),
+            incarnation: String::new(),
         });
         assert!(service().apply_external_kv_batch(request).await.is_ok());
     }
@@ -269,6 +283,7 @@ mod tests {
             seq: 0,
             actions: vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
             worker_address: String::new(),
+            incarnation: String::new(),
         });
         assert!(service().apply_external_kv_batch(request).await.is_err());
     }

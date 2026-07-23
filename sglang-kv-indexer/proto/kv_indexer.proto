@@ -48,6 +48,13 @@ message ApplyExternalKvBatchRequest {
   // Supplied by the bridge; may be empty, in which case matches for this worker
   // carry an empty address.
   string worker_address = 4;
+  // Opaque per-lifetime token identifying the worker's current incarnation
+  // (e.g. bridge process start id). When it changes for a worker, the indexer
+  // treats it as a restart: it wipes that worker's stale placement/reverse
+  // entries and resets its durable seq, so the fresh (restarted-from-zero)
+  // sequence is accepted instead of being skipped as a duplicate. Empty
+  // disables the behavior (backward compatible).
+  string incarnation = 5;
 }
 
 message ApplyExternalKvBatchResponse {

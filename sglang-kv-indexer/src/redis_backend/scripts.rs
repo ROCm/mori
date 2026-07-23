@@ -8,6 +8,97 @@ use std::sync::LazyLock;
 
 use redis::Script;
 
+/// Refreshes a worker's liveness, records its address/incarnation in the durable
+/// meta hash, and reports whether a restart reset is owed.
+///
+/// KEYS: `[worker_meta_key, worker_live_key]`
+/// ARGV: `[now_ms, ttl_ms, addr, incarnation]`
+///
+/// The durable meta hash (`seq`, `incarnation`, `addr`, `reset_pending`) never
+/// expires; liveness lives in the separate `worker_live_key`, which is (re)armed
+/// with a `ttl_ms` TTL only when `ttl_ms > 0`. Writes `addr` only when non-empty.
+/// `PERSIST`s the meta key so that a meta left with a TTL by an older build (which
+/// used to expire the whole hash) is made durable on first contact — otherwise it
+/// could still expire and lose `incarnation`, resurrecting a restarted worker's
+/// stale placements. When `incarnation` is non-empty and *differs* from the
+/// stored one (a restart), the new value is stored and a durable `reset_pending`
+/// flag is set so the caller wipes the previous incarnation's state. Returns `1`
+/// whenever `reset_pending` is set — including on later calls after a partial
+/// reset — so the caller keeps retrying the (idempotent) reset until it clears
+/// the flag. A first-ever incarnation (no prior value) does not set the flag.
+pub static TOUCH_META: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r#"
+redis.call('PERSIST', KEYS[1])
+if ARGV[3] ~= '' then
+  redis.call('HSET', KEYS[1], 'addr', ARGV[3])
+end
+if tonumber(ARGV[2]) > 0 then
+  redis.call('SET', KEYS[2], ARGV[1], 'PX', tonumber(ARGV[2]))
+end
+if ARGV[4] ~= '' then
+  local prev = redis.call('HGET', KEYS[1], 'incarnation')
+  if not prev then
+    redis.call('HSET', KEYS[1], 'incarnation', ARGV[4])
+  elseif prev ~= ARGV[4] then
+    redis.call('HSET', KEYS[1], 'incarnation', ARGV[4])
+    redis.call('HSET', KEYS[1], 'reset_pending', '1')
+  end
+end
+if redis.call('HGET', KEYS[1], 'reset_pending') == '1' then
+  return 1
+end
+return 0
+"#,
+    )
+});
+
+/// Reads a worker's routing address and liveness for `match`.
+///
+/// KEYS: `[worker_meta_key, worker_live_key]`
+/// ARGV: `[ttl_enabled ("0"|"1")]`
+/// Returns `{addr, alive}`: `addr` is the stored address (empty when unset).
+/// `alive` is `0` when a restart reset is still pending (`reset_pending=1`) — the
+/// worker's placement is being wiped and must not be routed to, regardless of the
+/// TTL setting — or, when liveness is enabled, when the `worker_live_key` has
+/// expired (the worker stopped applying/heartbeating). Otherwise `1`.
+pub static WORKER_VIEW: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r#"
+local addr = redis.call('HGET', KEYS[1], 'addr')
+if not addr then addr = '' end
+if redis.call('HGET', KEYS[1], 'reset_pending') == '1' then
+  return {addr, 0}
+end
+local alive = 1
+if ARGV[1] == '1' and redis.call('EXISTS', KEYS[2]) == 0 then
+  alive = 0
+end
+return {addr, alive}
+"#,
+    )
+});
+
+/// Removes a worker from a placement hash entirely, regardless of which tier
+/// bits it held (used when wiping a restarted worker's previous incarnation).
+///
+/// KEYS: `[placement_key, hit_key]`
+/// ARGV: `[worker_id]`
+/// Deletes the co-located hit key when the placement hash becomes empty, mirror-
+/// ing [`PLACEMENT_CLEAR`] so an evicted block cannot leak its `:h` key.
+pub static PLACEMENT_CLEAR_WORKER: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r#"
+redis.call('HDEL', KEYS[1], ARGV[1])
+if redis.call('HLEN', KEYS[1]) == 0 then
+  redis.call('DEL', KEYS[1])
+  redis.call('DEL', KEYS[2])
+end
+return 1
+"#,
+    )
+});
+
 /// Idempotency gate for a worker's apply batch, keyed on the monotonic per-worker
 /// seq stored in the worker meta hash (`{w:worker}:meta` field `seq`).
 ///

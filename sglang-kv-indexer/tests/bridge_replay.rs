@@ -156,6 +156,8 @@ async fn bridge_recovers_seq_gap_via_replay() {
         event_topic: String::new(),
         indexer_endpoint: format!("http://{grpc_addr}"),
         clear_tiers: vec![],
+        heartbeat_interval: None,
+        incarnation: "replay-test".to_string(),
     };
     tokio::spawn(async move {
         let _ = run_bridge(config).await;

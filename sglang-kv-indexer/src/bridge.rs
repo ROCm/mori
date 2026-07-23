@@ -29,6 +29,14 @@ pub struct BridgeConfig {
     pub event_topic: String,
     pub indexer_endpoint: String,
     pub clear_tiers: Vec<i32>,
+    /// How often to send an empty-actions heartbeat that refreshes the worker's
+    /// liveness on the indexer, independent of KV-event traffic. Must be well
+    /// below the server's `KV_INDEXER_WORKER_TTL_SECS`. `None` disables it.
+    pub heartbeat_interval: Option<Duration>,
+    /// Opaque token identifying this worker lifetime, sent on every apply so the
+    /// indexer can detect a restart (new incarnation) and wipe the worker's
+    /// stale state + reset its seq. Defaults to a fresh per-process value.
+    pub incarnation: String,
 }
 
 impl BridgeConfig {
@@ -46,6 +54,11 @@ impl BridgeConfig {
         let clear_tiers = parse_clear_tiers(
             &std::env::var("KV_INDEXER_CLEAR_TIERS").unwrap_or_else(|_| "HBM,DRAM,SSD".to_string()),
         )?;
+        let heartbeat_interval = parse_heartbeat_interval()?;
+        // A worker-tied id is best (survives bridge-only restarts); fall back to
+        // a fresh per-process token so each (re)start is a distinct incarnation.
+        let incarnation = std::env::var("KV_INDEXER_WORKER_INCARNATION")
+            .unwrap_or_else(|_| generate_incarnation());
 
         Ok(Self {
             worker_id,
@@ -55,6 +68,8 @@ impl BridgeConfig {
             event_topic,
             indexer_endpoint,
             clear_tiers,
+            heartbeat_interval,
+            incarnation,
         })
     }
 }
@@ -259,9 +274,25 @@ async fn run_session(
         *next_seq = last_applied_seq.checked_add(1);
     }
 
+    // Liveness heartbeat: an empty-actions apply that refreshes the worker's
+    // TTL on the indexer even when no KV events are flowing. When disabled, a
+    // far-future interval is used so the branch never fires.
+    let mut heartbeat = tokio::time::interval(
+        config
+            .heartbeat_interval
+            .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2)),
+    );
+    // The first tick resolves immediately; skip it so we don't heartbeat before
+    // any real work and so a disabled heartbeat never fires at startup.
+    heartbeat.tick().await;
+
     loop {
         let message = tokio::select! {
             result = subscriber.recv() => result?,
+            _ = heartbeat.tick(), if config.heartbeat_interval.is_some() => {
+                send_heartbeat(config, &mut client).await?;
+                continue;
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("received ctrl-c; shutting down bridge");
                 return Ok(());
@@ -445,6 +476,26 @@ async fn forward_raw_batch(
     Ok(response.last_applied_seq)
 }
 
+/// Sends an empty-actions apply as a liveness heartbeat. It mutates nothing on
+/// the indexer beyond refreshing the worker's TTL, so `seq` is irrelevant and
+/// the returned position is ignored (never advances `next_seq`). Errors are
+/// propagated so a broken connection ends the session and triggers reconnect.
+async fn send_heartbeat(
+    config: &BridgeConfig,
+    client: &mut KvIndexerClient<Channel>,
+) -> Result<(), BridgeError> {
+    let request = ApplyExternalKvBatchRequest {
+        worker_id: config.worker_id.clone(),
+        seq: 0,
+        actions: Vec::new(),
+        worker_address: config.worker_address.clone(),
+        incarnation: config.incarnation.clone(),
+    };
+    client.apply_external_kv_batch(request).await?;
+    debug!(worker_id = %config.worker_id, "sent liveness heartbeat");
+    Ok(())
+}
+
 /// Maps a decoded `EventActions` into a single `ApplyExternalKvBatchRequest`,
 /// preserving the exact per-action order. A `ClearAll` is expanded, in place,
 /// into one `CLEAR_ALL_AT_TIER` action per configured clear tier so the batch
@@ -484,6 +535,7 @@ fn build_apply_request(
         seq,
         actions,
         worker_address: config.worker_address.clone(),
+        incarnation: config.incarnation.clone(),
     }
 }
 
@@ -593,6 +645,31 @@ fn parse_clear_tiers(value: &str) -> Result<Vec<i32>, BridgeError> {
         .collect()
 }
 
+/// Generates a fresh per-process incarnation token: nanoseconds since the epoch
+/// combined with the PID, unique enough to distinguish worker (re)starts.
+fn generate_incarnation() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos}-{}", std::process::id())
+}
+
+/// Parses `KV_INDEXER_HEARTBEAT_SECS` (default `30`; `0` disables heartbeats).
+/// Keep this comfortably below the server's `KV_INDEXER_WORKER_TTL_SECS`.
+fn parse_heartbeat_interval() -> Result<Option<Duration>, BridgeError> {
+    const DEFAULT_HEARTBEAT_SECS: u64 = 30;
+    let secs = match std::env::var("KV_INDEXER_HEARTBEAT_SECS") {
+        Ok(v) => v.trim().parse::<u64>().map_err(|_| {
+            BridgeError::Config(format!(
+                "KV_INDEXER_HEARTBEAT_SECS must be a non-negative integer, got {v:?}"
+            ))
+        })?,
+        Err(_) => DEFAULT_HEARTBEAT_SECS,
+    };
+    Ok((secs > 0).then(|| Duration::from_secs(secs)))
+}
+
 fn expect_array<'a>(value: &'a Value, field: &str) -> Result<&'a [Value], BridgeError> {
     value
         .as_array()
@@ -696,6 +773,8 @@ mod tests {
             event_topic: "kv-events".to_string(),
             indexer_endpoint: "http://[::1]:50051".to_string(),
             clear_tiers,
+            heartbeat_interval: None,
+            incarnation: "test-incarnation".to_string(),
         }
     }
 
@@ -745,6 +824,13 @@ mod tests {
         let config = test_config(vec![hbm()]);
         let request = request_of(&config, 0, vec![stored(&[1], "GPU")]);
         assert_eq!(request.worker_address, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn request_carries_incarnation() {
+        let config = test_config(vec![hbm()]);
+        let request = request_of(&config, 0, vec![stored(&[1], "GPU")]);
+        assert_eq!(request.incarnation, "test-incarnation");
     }
 
     #[test]

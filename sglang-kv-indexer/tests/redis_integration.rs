@@ -80,6 +80,22 @@ fn apply_req(
         seq,
         actions,
         worker_address: addr.to_string(),
+        incarnation: String::new(),
+    }
+}
+
+/// Like [`apply_req`] but tags the batch with a worker incarnation, so a change
+/// across calls simulates a worker restart.
+fn apply_req_inc(
+    worker: &str,
+    addr: &str,
+    incarnation: &str,
+    seq: u64,
+    actions: Vec<ExternalKvAction>,
+) -> ApplyExternalKvBatchRequest {
+    ApplyExternalKvBatchRequest {
+        incarnation: incarnation.to_string(),
+        ..apply_req(worker, addr, seq, actions)
     }
 }
 
@@ -537,6 +553,179 @@ itest!(seq_is_per_worker_independent, b, {
     let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
     assert_eq!(resp.matches.len(), 2);
 });
+
+// --- worker liveness / stale-entry cleanup ----------------------------------
+
+itest!(
+    stale_worker_is_dropped_from_match_then_revived_by_heartbeat,
+    b,
+    {
+        // Arm a short per-worker TTL so a worker that stops talking expires quickly.
+        let b = b.with_worker_ttl(Some(std::time::Duration::from_secs(1)));
+
+        // Report a block: immediately matchable while the worker is live.
+        b.apply_external_kv_batch(apply_req(
+            "w1",
+            "10.0.0.1:9000",
+            1,
+            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
+        ))
+        .await
+        .unwrap();
+        let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
+        assert_eq!(resp.matches.len(), 1, "live worker must be matchable");
+
+        // Let the worker go silent past its TTL: match must drop it so the router
+        // never targets a dead node, even though placement/reverse entries linger.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
+        assert!(
+            resp.matches.is_empty(),
+            "stale worker must be dropped from match, got {:?}",
+            resp.matches
+        );
+
+        // A heartbeat (empty-actions apply) refreshes liveness; the placement was
+        // never deleted, so the old block is instantly routable again.
+        b.apply_external_kv_batch(apply_req("w1", "10.0.0.1:9000", 0, vec![]))
+            .await
+            .unwrap();
+        let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
+        assert_eq!(
+            tiers_for(&resp, "w1", "1"),
+            vec![hbm()],
+            "heartbeat must revive the worker with its existing placement intact"
+        );
+    }
+);
+
+// --- worker restart / incarnation reset -------------------------------------
+
+itest!(
+    worker_restart_new_incarnation_wipes_stale_state_and_resets_seq,
+    b,
+    {
+        // Incarnation "A": report h1 at seq 5, so the durable seq climbs to 5.
+        b.apply_external_kv_batch(apply_req_inc(
+            "w1",
+            "10.0.0.1:9000",
+            "A",
+            5,
+            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
+        ))
+        .await
+        .unwrap();
+        let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
+        assert_eq!(tiers_for(&resp, "w1", "1"), vec![hbm()]);
+
+        // Same incarnation, a stale/replayed low seq is still skipped as duplicate.
+        let dup = b
+            .apply_external_kv_batch(apply_req_inc(
+                "w1",
+                "10.0.0.1:9000",
+                "A",
+                2,
+                vec![action(ExternalKvActionType::ActionReport, hbm(), &["2"])],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            dup.duplicate,
+            "low seq within same incarnation is a duplicate"
+        );
+
+        // Incarnation "B" (a restart) with a reset sequence (seq 1) reporting a new
+        // block. The restart must: (a) wipe the old placement for h1, (b) reset the
+        // durable seq so seq=1 is accepted (not skipped), (c) index the new block.
+        let after = b
+            .apply_external_kv_batch(apply_req_inc(
+                "w1",
+                "10.0.0.1:9000",
+                "B",
+                1,
+                vec![action(ExternalKvActionType::ActionReport, hbm(), &["9"])],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !after.duplicate,
+            "restarted worker's reset sequence must be accepted, not skipped"
+        );
+
+        let resp = b
+            .match_external_kv(match_req(&["1", "9"], false))
+            .await
+            .unwrap();
+        assert!(
+            tiers_for(&resp, "w1", "1").is_empty(),
+            "stale block from the previous incarnation must be wiped, got {:?}",
+            resp.matches
+        );
+        assert_eq!(
+            tiers_for(&resp, "w1", "9"),
+            vec![hbm()],
+            "new block from the restarted incarnation must be indexed"
+        );
+    }
+);
+
+itest!(
+    // P1 regression: a worker that expired out of `match` (its liveness TTL
+    // lapsed) and then slow-restarts with a NEW incarnation must still be reset.
+    // The durable meta (and thus the previous incarnation) must survive the TTL
+    // so the restart is detected and the stale placement is wiped — otherwise the
+    // dead incarnation's blocks would resurrect on the heartbeat that revives it.
+    expired_worker_new_incarnation_still_wipes_stale_state,
+    b,
+    {
+        let b = b.with_worker_ttl(Some(std::time::Duration::from_secs(1)));
+
+        // Incarnation "A" reports h1.
+        b.apply_external_kv_batch(apply_req_inc(
+            "w1",
+            "10.0.0.1:9000",
+            "A",
+            5,
+            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            tiers_for(&b.match_external_kv(match_req(&["1"], false)).await.unwrap(), "w1", "1"),
+            vec![hbm()],
+        );
+
+        // The worker goes silent long enough for its liveness key to expire.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            b.match_external_kv(match_req(&["1"], false)).await.unwrap().matches.is_empty(),
+            "expired worker must be dropped from match",
+        );
+
+        // It slow-restarts as incarnation "B" (seq reset to 1) reporting h9. Even
+        // though the liveness key had expired, the durable incarnation "A" is
+        // still recorded, so the restart is detected: h1 is wiped, seq accepted.
+        let after = b
+            .apply_external_kv_batch(apply_req_inc(
+                "w1",
+                "10.0.0.1:9000",
+                "B",
+                1,
+                vec![action(ExternalKvActionType::ActionReport, hbm(), &["9"])],
+            ))
+            .await
+            .unwrap();
+        assert!(!after.duplicate, "restarted worker's reset seq must be accepted");
+
+        let resp = b.match_external_kv(match_req(&["1", "9"], false)).await.unwrap();
+        assert!(
+            tiers_for(&resp, "w1", "1").is_empty(),
+            "stale block from expired-then-restarted incarnation must be wiped, got {:?}",
+            resp.matches
+        );
+        assert_eq!(tiers_for(&resp, "w1", "9"), vec![hbm()]);
+    }
+);
 
 // --- T5 regression: degraded-start / lazy-connect semantics -----------------
 

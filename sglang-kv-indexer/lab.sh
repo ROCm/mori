@@ -31,6 +31,11 @@ INDEXER_PORT="${INDEXER_PORT:-50051}"
 BACKEND="${KV_INDEXER_BACKEND:-redis}"
 REDIS_URL="${KV_INDEXER_REDIS_URL:-redis://127.0.0.1:6379}"
 REDIS_NAMESPACE="${KV_INDEXER_REDIS_NAMESPACE:-kvidx}"
+# worker liveness: the indexer drops a worker from match if it stops applying
+# or heartbeating for WORKER_TTL_SECS; the bridge heartbeats every HEARTBEAT_SECS
+# (keep it well below the TTL). Set WORKER_TTL_SECS=0 to disable liveness.
+WORKER_TTL_SECS="${KV_INDEXER_WORKER_TTL_SECS:-120}"
+HEARTBEAT_SECS="${KV_INDEXER_HEARTBEAT_SECS:-30}"
 
 CRATE_DIR="/root/wuyl/mori/sglang-kv-indexer"
 SGLANG_DIR="/sgl-workspace/sglang"
@@ -81,6 +86,7 @@ start_indexer() {
   KV_INDEXER_BACKEND="$BACKEND" \
   KV_INDEXER_REDIS_URL="$REDIS_URL" \
   KV_INDEXER_REDIS_NAMESPACE="$REDIS_NAMESPACE" \
+  KV_INDEXER_WORKER_TTL_SECS="$WORKER_TTL_SECS" \
     nohup "$BIN_SERVER" >"$LOG_DIR/indexer.log" 2>&1 &
   echo $! > "$PID_DIR/indexer.pid"
   c_grn "indexer up (pid $!) backend=$BACKEND -> 127.0.0.1:$INDEXER_PORT  log:$LOG_DIR/indexer.log"
@@ -129,6 +135,7 @@ start_bridge() {
     SGLANG_KV_EVENT_REPLAY_ENDPOINT="tcp://127.0.0.1:$replay" \
     SGLANG_KV_EVENT_TOPIC="" \
     KV_INDEXER_ENDPOINT="http://127.0.0.1:$INDEXER_PORT" \
+    KV_INDEXER_HEARTBEAT_SECS="$HEARTBEAT_SECS" \
       nohup "$BIN_BRIDGE" >"$LOG_DIR/$name.log" 2>&1 &
     echo $! > "$PID_DIR/$name.pid"
     c_grn "$name up (pid $!) SUB:$pub replay:$replay -> indexer:$INDEXER_PORT  log:$LOG_DIR/$name.log"
