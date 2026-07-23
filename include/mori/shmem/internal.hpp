@@ -169,10 +169,6 @@ struct ModuleStates {
   hipModule_t module{nullptr};
   GpuStates* gpuStatesPtr{nullptr};  // device-side globalGpuStates address in JIT module
   hipFunction_t barrierFunc{nullptr};
-  // Optional barrier kernels; nullptr if the loaded module predates them
-  // (launcher falls back to the funnel barrier).
-  hipFunction_t dissemBarrierFunc{nullptr};
-  hipFunction_t hierBarrierFunc{nullptr};
 };
 
 struct ShmemStates {

@@ -40,35 +40,12 @@
 namespace mori {
 namespace collective {
 
-// MORI_HIER_DISSEM_BARRIER!=0 selects the dissemination barrier (read once).
-inline bool HierDissemBarrierEnabled() {
-  static const bool enabled = []() {
-    const char* e = std::getenv("MORI_HIER_DISSEM_BARRIER");
-    return e != nullptr && std::atoi(e) != 0;
-  }();
-  return enabled;
-}
+// Ring entry rendezvous: global all-PE funnel barrier.
+inline void HierPrepareBarrierOnStream(hipStream_t stream) { shmem::ShmemBarrierOnStream(stream); }
 
-// Ring entry rendezvous. Funnel by default; dissem variant has identical global
-// all-PE ordering, so the default path is byte-identical.
-inline void HierPrepareBarrierOnStream(hipStream_t stream) {
-  if (HierDissemBarrierEnabled()) {
-    shmem::ShmemBarrierOnStreamDissem(stream);
-  } else {
-    shmem::ShmemBarrierOnStream(stream);
-  }
-}
-
-// Ring finish / cross-PE reuse fence. Same full-rendezvous semantics as the
-// prepare barrier: the dissem variant preserves the NIC-landing -> consume
-// ordering, so the default path stays byte-for-byte identical.
-inline void HierFinishBarrierOnStream(hipStream_t stream) {
-  if (HierDissemBarrierEnabled()) {
-    shmem::ShmemBarrierOnStreamDissem(stream);
-  } else {
-    shmem::ShmemBarrierOnStream(stream);
-  }
-}
+// Ring finish / cross-PE reuse fence: same full-rendezvous funnel barrier,
+// preserving the NIC-landing -> consume ordering.
+inline void HierFinishBarrierOnStream(hipStream_t stream) { shmem::ShmemBarrierOnStream(stream); }
 
 class InterNodeRingAllgather {
  private:
@@ -311,7 +288,6 @@ class InterNodeRingAllgather {
   // chunks in ring order (the rank-major result). Read via buf_ptr to avoid the
   // finish_sync copy-OUT.
   uintptr_t buf_ptr() const { return reinterpret_cast<uintptr_t>(ring_); }
-
 };
 
 }  // namespace collective
