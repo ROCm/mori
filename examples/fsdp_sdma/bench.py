@@ -94,9 +94,6 @@ def _parse_args() -> argparse.Namespace:
 def _configure_mode(mode: str) -> None:
     if mode == "mori":
         os.environ.setdefault("MORI_ENABLE_SDMA", "1")
-        os.environ["MORI_FSDP_ENABLE_SDMA"] = "1"
-    else:
-        os.environ.pop("MORI_FSDP_ENABLE_SDMA", None)
 
 
 def _init_distributed(backend: str) -> tuple[int, int, int, torch.device]:
@@ -467,7 +464,6 @@ def main() -> None:
             "avg_tflops": avg_tflops,
             "avg_tflops_per_gpu": avg_tflops / world_size,
             "last_loss": measured_losses[-1] if measured_losses else None,
-            "mori_fsdp_enable_sdma": os.environ.get("MORI_FSDP_ENABLE_SDMA"),
             "mori_enable_sdma": os.environ.get("MORI_ENABLE_SDMA"),
         }
         print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
