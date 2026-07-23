@@ -162,6 +162,41 @@ itest!(report_then_match_returns_worker_and_address, b, {
     assert!(tiers_for(&resp, "w1", "3").is_empty());
 });
 
+itest!(large_request_crosses_redis_fanout_chunks, b, {
+    // The backend fan-out chunk is 256. Exercise more than one chunk on both
+    // write and read paths while preserving complete, ordered results.
+    let hashes: Vec<String> = (0..300).map(|i| format!("chunk-{i}")).collect();
+    let hash_refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
+    b.apply_external_kv_batch(apply_req(
+        "w1",
+        "a",
+        1,
+        vec![action(
+            ExternalKvActionType::ActionReport,
+            hbm(),
+            &hash_refs,
+        )],
+    ))
+    .await
+    .unwrap();
+
+    let resp = b
+        .match_external_kv(match_req(&hash_refs, false))
+        .await
+        .unwrap();
+    let worker = resp
+        .matches
+        .iter()
+        .find(|m| m.worker_id == "w1")
+        .expect("worker must match");
+    let tier = worker
+        .hashes_by_tier
+        .iter()
+        .find(|t| t.tier == hbm())
+        .expect("HBM tier must match");
+    assert_eq!(tier.hashes, hashes);
+});
+
 itest!(duplicate_report_is_idempotent, b, {
     for _ in 0..3 {
         b.apply_external_kv_batch(apply_req(
@@ -691,14 +726,22 @@ itest!(
         .await
         .unwrap();
         assert_eq!(
-            tiers_for(&b.match_external_kv(match_req(&["1"], false)).await.unwrap(), "w1", "1"),
+            tiers_for(
+                &b.match_external_kv(match_req(&["1"], false)).await.unwrap(),
+                "w1",
+                "1"
+            ),
             vec![hbm()],
         );
 
         // The worker goes silent long enough for its liveness key to expire.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         assert!(
-            b.match_external_kv(match_req(&["1"], false)).await.unwrap().matches.is_empty(),
+            b.match_external_kv(match_req(&["1"], false))
+                .await
+                .unwrap()
+                .matches
+                .is_empty(),
             "expired worker must be dropped from match",
         );
 
@@ -715,9 +758,15 @@ itest!(
             ))
             .await
             .unwrap();
-        assert!(!after.duplicate, "restarted worker's reset seq must be accepted");
+        assert!(
+            !after.duplicate,
+            "restarted worker's reset seq must be accepted"
+        );
 
-        let resp = b.match_external_kv(match_req(&["1", "9"], false)).await.unwrap();
+        let resp = b
+            .match_external_kv(match_req(&["1", "9"], false))
+            .await
+            .unwrap();
         assert!(
             tiers_for(&resp, "w1", "1").is_empty(),
             "stale block from expired-then-restarted incarnation must be wiped, got {:?}",

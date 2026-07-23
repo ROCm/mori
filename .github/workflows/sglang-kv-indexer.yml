@@ -1,0 +1,66 @@
+name: SGLang KV Indexer CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "sglang-kv-indexer/**"
+      - "docs/SGLANG-KV-INDEXER-*.md"
+      - ".github/workflows/sglang-kv-indexer.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "sglang-kv-indexer/**"
+      - "docs/SGLANG-KV-INDEXER-*.md"
+      - ".github/workflows/sglang-kv-indexer.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: fmt, clippy, and Redis tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+
+    defaults:
+      run:
+        working-directory: sglang-kv-indexer
+
+    env:
+      KV_INDEXER_REDIS_URL: redis://127.0.0.1:6379
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sglang-kv-indexer -> target
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --features redis-backend --locked -- -D warnings
+
+      - name: Run Redis-enabled tests
+        run: cargo test --features redis-backend --locked

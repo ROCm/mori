@@ -158,17 +158,27 @@ async fn restart_reset_retried_after_mid_reset_failure() {
 
     // Incarnation "A" reports hash-a.
     backend
-        .apply(batch_inc("worker-0", 1, "A", ExternalKvActionType::ActionReport))
+        .apply(batch_inc(
+            "worker-0",
+            1,
+            "A",
+            ExternalKvActionType::ActionReport,
+        ))
         .await
         .expect("initial report");
-    assert_eq!(reverse_hashes(&backend, "worker-0").await, vec!["hash-a".to_string()]);
+    assert_eq!(
+        reverse_hashes(&backend, "worker-0").await,
+        vec!["hash-a".to_string()]
+    );
 
     // Incarnation "B" (a restart): reset_pending is set, but the reverse-index
     // DEL inside reset_worker fails once, aborting the reset mid-flight.
     let restart = batch_inc("worker-0", 1, "B", ExternalKvActionType::ActionReport);
     assert!(backend.apply(restart.clone()).await.is_err());
     assert_eq!(
-        meta_field(&backend, "worker-0", "reset_pending").await.as_deref(),
+        meta_field(&backend, "worker-0", "reset_pending")
+            .await
+            .as_deref(),
         Some("1"),
         "reset_pending must persist after a failed reset so it can be retried",
     );
@@ -201,7 +211,12 @@ async fn reset_window_hides_worker_from_match_until_reset_completes() {
 
     // Incarnation "A" reports hash-a: matchable while healthy.
     backend
-        .apply(batch_inc("worker-0", 1, "A", ExternalKvActionType::ActionReport))
+        .apply(batch_inc(
+            "worker-0",
+            1,
+            "A",
+            ExternalKvActionType::ActionReport,
+        ))
         .await
         .expect("initial report");
     let hit = backend
@@ -218,7 +233,9 @@ async fn reset_window_hides_worker_from_match_until_reset_completes() {
     let restart = batch_inc("worker-0", 1, "B", ExternalKvActionType::ActionReport);
     assert!(backend.apply(restart.clone()).await.is_err());
     assert_eq!(
-        meta_field(&backend, "worker-0", "reset_pending").await.as_deref(),
+        meta_field(&backend, "worker-0", "reset_pending")
+            .await
+            .as_deref(),
         Some("1"),
     );
     let during = backend
@@ -236,7 +253,10 @@ async fn reset_window_hides_worker_from_match_until_reset_completes() {
 
     // Retry completes the reset and re-indexes the fresh report; routable again.
     backend.apply(restart).await.expect("reset retry");
-    assert_eq!(meta_field(&backend, "worker-0", "reset_pending").await, None);
+    assert_eq!(
+        meta_field(&backend, "worker-0", "reset_pending").await,
+        None
+    );
     let after = backend
         .do_match(MatchExternalKvRequest {
             hashes: vec!["hash-a".to_string()],
@@ -260,7 +280,11 @@ async fn touch_meta_persists_meta_left_with_ttl_by_old_build() {
 
     // Simulate the legacy meta hash: incarnation + seq, with a TTL on the key.
     let mut hset = redis::cmd("HSET");
-    hset.arg(&meta).arg("incarnation").arg("A").arg("seq").arg("3");
+    hset.arg(&meta)
+        .arg("incarnation")
+        .arg("A")
+        .arg("seq")
+        .arg("3");
     backend.conn.query(hset).await.expect("seed legacy meta");
     let mut pexpire = redis::cmd("PEXPIRE");
     pexpire.arg(&meta).arg(60_000);
@@ -268,7 +292,12 @@ async fn touch_meta_persists_meta_left_with_ttl_by_old_build() {
 
     // Any apply from the same incarnation (no reset) must persist the key.
     backend
-        .apply(batch_inc(worker, 4, "A", ExternalKvActionType::ActionReport))
+        .apply(batch_inc(
+            worker,
+            4,
+            "A",
+            ExternalKvActionType::ActionReport,
+        ))
         .await
         .expect("apply");
 
@@ -276,7 +305,10 @@ async fn touch_meta_persists_meta_left_with_ttl_by_old_build() {
     pttl.arg(&meta);
     let v = backend.conn.query(pttl).await.expect("pttl");
     let ttl = i64::from_redis_value(&v).expect("decode pttl");
-    assert_eq!(ttl, -1, "meta key must be persisted (no TTL) after touch_meta");
+    assert_eq!(
+        ttl, -1,
+        "meta key must be persisted (no TTL) after touch_meta"
+    );
     assert_eq!(
         meta_field(&backend, worker, "incarnation").await.as_deref(),
         Some("A"),

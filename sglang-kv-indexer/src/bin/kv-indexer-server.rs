@@ -132,7 +132,10 @@ const HEALTH_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Periodically reflects backend readiness into the gRPC health service, for
 /// both the named `KvIndexer` service and the overall (empty-name) status that
 /// k8s' built-in gRPC probe checks by default.
-async fn health_prober(reporter: tonic_health::server::HealthReporter, backend: Arc<dyn KvIndexerBackend>) {
+async fn health_prober(
+    reporter: tonic_health::server::HealthReporter,
+    backend: Arc<dyn KvIndexerBackend>,
+) {
     use tonic_health::ServingStatus::{NotServing, Serving};
     let mut tick = tokio::time::interval(HEALTH_PROBE_INTERVAL);
     let mut last: Option<bool> = None;
@@ -155,16 +158,26 @@ async fn health_prober(reporter: tonic_health::server::HealthReporter, backend: 
 }
 
 /// Selects the storage backend from `KV_INDEXER_BACKEND`:
-///   * `logging` (default) — in-memory, logs running totals; for joint debugging.
+///   * `logging` — in-memory, logs running totals; for joint debugging.
 ///   * `noop` — discards everything.
 ///   * `redis` — the Redis backend (requires the `redis-backend` cargo feature).
 ///
+/// The variable is required: silently defaulting to a fake backend makes a
+/// misconfigured production process look healthy while returning no real matches.
 /// The Redis backend lives behind the feature so the default build stays light;
 /// requesting `redis` without it is a loud startup error rather than a silent
 /// fallback.
 async fn select_backend(
 ) -> Result<Arc<dyn KvIndexerBackend>, Box<dyn std::error::Error + Send + Sync>> {
-    let backend = std::env::var("KV_INDEXER_BACKEND").unwrap_or_else(|_| "logging".to_string());
+    let backend = match std::env::var("KV_INDEXER_BACKEND") {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(
+                "KV_INDEXER_BACKEND is required; set it explicitly to redis, logging, or noop"
+                    .into(),
+            )
+        }
+    };
     match backend.as_str() {
         "logging" => {
             info!("using logging backend");

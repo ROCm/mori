@@ -7,6 +7,12 @@ use crate::pb::{
     MatchExternalKvRequest, MatchExternalKvResponse,
 };
 
+/// Protocol-level resource bounds. The Redis backend additionally chunks its
+/// fan-out, but rejecting oversized requests here prevents any backend from
+/// allocating or scheduling work proportional to an unbounded repeated field.
+const MAX_HASHES_PER_REQUEST: usize = 16_384;
+const MAX_ACTIONS_PER_BATCH: usize = 256;
+
 /// Storage backend for the indexer. Deliberately narrow: every mutation flows
 /// through `apply_external_kv_batch`, preserving one ordered write path.
 ///
@@ -166,6 +172,12 @@ fn validate_hashes(hashes: &[String]) -> Result<(), Status> {
     if hashes.is_empty() {
         return Err(Status::invalid_argument("hashes must not be empty"));
     }
+    if hashes.len() > MAX_HASHES_PER_REQUEST {
+        return Err(Status::resource_exhausted(format!(
+            "request contains {} hashes; maximum is {MAX_HASHES_PER_REQUEST}",
+            hashes.len()
+        )));
+    }
     if hashes.iter().any(|hash| hash.is_empty()) {
         return Err(Status::invalid_argument(
             "hashes must not contain empty values",
@@ -186,6 +198,18 @@ fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
     // An empty actions list is a valid heartbeat: it carries no mutation and
     // simply refreshes the worker's liveness on the server. Non-empty batches
     // still have every action validated below.
+    if actions.len() > MAX_ACTIONS_PER_BATCH {
+        return Err(Status::resource_exhausted(format!(
+            "batch contains {} actions; maximum is {MAX_ACTIONS_PER_BATCH}",
+            actions.len()
+        )));
+    }
+    let total_hashes: usize = actions.iter().map(|action| action.hashes.len()).sum();
+    if total_hashes > MAX_HASHES_PER_REQUEST {
+        return Err(Status::resource_exhausted(format!(
+            "batch contains {total_hashes} hashes; maximum is {MAX_HASHES_PER_REQUEST}"
+        )));
+    }
     for action in actions {
         validate_tier(action.tier)?;
         match ExternalKvActionType::try_from(action.r#type) {
@@ -258,6 +282,32 @@ mod tests {
             &[],
         )];
         assert!(validate_actions(&actions).is_ok());
+    }
+
+    #[test]
+    fn validate_hashes_rejects_oversized_query() {
+        let hashes = vec!["1".to_string(); MAX_HASHES_PER_REQUEST + 1];
+        let error = validate_hashes(&hashes).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn validate_actions_rejects_oversized_batch() {
+        let hashes = vec!["1"; MAX_HASHES_PER_REQUEST / 2 + 1];
+        let actions = [
+            action(ExternalKvActionType::ActionReport, hbm(), &hashes),
+            action(ExternalKvActionType::ActionReport, hbm(), &hashes),
+        ];
+        let error = validate_actions(&actions).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn validate_actions_rejects_too_many_actions() {
+        let clear = action(ExternalKvActionType::ActionClearAllAtTier, hbm(), &[]);
+        let actions = vec![clear; MAX_ACTIONS_PER_BATCH + 1];
+        let error = validate_actions(&actions).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     }
 
     #[tokio::test]

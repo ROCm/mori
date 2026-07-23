@@ -58,8 +58,11 @@ use scripts::{
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const DEFAULT_NAMESPACE: &str = "kvidx";
-/// Bound on how many hashes a single `CLEAR_ALL_AT_TIER` fans out concurrently.
-const CLEAR_CHUNK: usize = 256;
+/// Per-request bound on concurrent Redis operations. Requests may contain more
+/// hashes (up to the service-layer protocol limit), but every read/write path
+/// processes them in sequential chunks so one request cannot create unbounded
+/// in-flight work against Redis.
+const REDIS_FANOUT_CHUNK: usize = 256;
 
 /// Resolved connection target parsed from the environment.
 enum Target {
@@ -261,22 +264,14 @@ impl RedisKvIndexerBackend {
             let bit = tier_bit(action.tier);
             match ExternalKvActionType::try_from(action.r#type) {
                 Ok(ExternalKvActionType::ActionReport) => {
-                    try_join_all(
-                        action
-                            .hashes
-                            .iter()
-                            .map(|h| self.report_one(worker, h, bit)),
-                    )
-                    .await?;
+                    for chunk in action.hashes.chunks(REDIS_FANOUT_CHUNK) {
+                        try_join_all(chunk.iter().map(|h| self.report_one(worker, h, bit))).await?;
+                    }
                 }
                 Ok(ExternalKvActionType::ActionRevoke) => {
-                    try_join_all(
-                        action
-                            .hashes
-                            .iter()
-                            .map(|h| self.revoke_one(worker, h, bit)),
-                    )
-                    .await?;
+                    for chunk in action.hashes.chunks(REDIS_FANOUT_CHUNK) {
+                        try_join_all(chunk.iter().map(|h| self.revoke_one(worker, h, bit))).await?;
+                    }
                 }
                 Ok(ExternalKvActionType::ActionClearAllAtTier) => {
                     self.clear_all_at_tier(worker, bit).await?;
@@ -341,7 +336,7 @@ impl RedisKvIndexerBackend {
         cmd.arg(worker_blocks_key(&self.ns, worker));
         let v = self.conn.query(cmd).await.map_err(to_status)?;
         let hashes: Vec<String> = Vec::<String>::from_redis_value(&v).map_err(to_status)?;
-        for chunk in hashes.chunks(CLEAR_CHUNK) {
+        for chunk in hashes.chunks(REDIS_FANOUT_CHUNK) {
             try_join_all(chunk.iter().map(|h| self.clear_worker_from_hash(worker, h))).await?;
         }
         // Drop the now-empty reverse index and the stale durable seq. A missing
@@ -431,7 +426,7 @@ impl RedisKvIndexerBackend {
         cmd.arg(worker_blocks_key(&self.ns, worker));
         let v = self.conn.query(cmd).await.map_err(to_status)?;
         let hashes: Vec<String> = Vec::<String>::from_redis_value(&v).map_err(to_status)?;
-        for chunk in hashes.chunks(CLEAR_CHUNK) {
+        for chunk in hashes.chunks(REDIS_FANOUT_CHUNK) {
             try_join_all(chunk.iter().map(|h| self.revoke_one(worker, h, bit))).await?;
         }
         Ok(())
@@ -448,23 +443,27 @@ impl RedisKvIndexerBackend {
         let now = now_ms().to_string();
 
         // Per-hash placement read (+ optional hit bump), preserving hash order.
-        let per_hash = try_join_all(hashes.iter().map(|hash| {
-            let now = now.clone();
-            async move {
-                let v = self
-                    .conn
-                    .invoke(
-                        &MATCH_HASH,
-                        vec![placement_key(&self.ns, hash), hit_key(&self.ns, hash)],
-                        vec![count_flag.to_string(), now],
-                    )
-                    .await?;
-                let flat: Vec<String> = Vec::<String>::from_redis_value(&v)?;
-                Ok::<_, redis::RedisError>(flat)
-            }
-        }))
-        .await
-        .map_err(to_status)?;
+        let mut per_hash = Vec::with_capacity(hashes.len());
+        for chunk in hashes.chunks(REDIS_FANOUT_CHUNK) {
+            let values = try_join_all(chunk.iter().map(|hash| {
+                let now = now.clone();
+                async move {
+                    let v = self
+                        .conn
+                        .invoke(
+                            &MATCH_HASH,
+                            vec![placement_key(&self.ns, hash), hit_key(&self.ns, hash)],
+                            vec![count_flag.to_string(), now],
+                        )
+                        .await?;
+                    let flat: Vec<String> = Vec::<String>::from_redis_value(&v)?;
+                    Ok::<_, redis::RedisError>(flat)
+                }
+            }))
+            .await
+            .map_err(to_status)?;
+            per_hash.extend(values);
+        }
 
         // Aggregate into worker -> tier -> [hash], preserving worker first-seen order.
         let mut worker_order: Vec<String> = Vec::new();
@@ -493,20 +492,27 @@ impl RedisKvIndexerBackend {
         // a dead node while its placement/reverse entries linger. The durable
         // meta itself never expires, so a revived worker keeps its seq/incarnation.
         let ttl_flag = if self.worker_ttl.is_some() { "1" } else { "0" };
-        let metas = try_join_all(worker_order.iter().map(|worker| async move {
-            let v = self
-                .conn
-                .invoke(
-                    &WORKER_VIEW,
-                    vec![worker_meta_key(&self.ns, worker), worker_live_key(&self.ns, worker)],
-                    vec![ttl_flag.to_string()],
-                )
-                .await?;
-            let (addr, alive): (String, i64) = <(String, i64)>::from_redis_value(&v)?;
-            Ok::<_, redis::RedisError>((addr, alive == 1))
-        }))
-        .await
-        .map_err(to_status)?;
+        let mut metas = Vec::with_capacity(worker_order.len());
+        for chunk in worker_order.chunks(REDIS_FANOUT_CHUNK) {
+            let values = try_join_all(chunk.iter().map(|worker| async move {
+                let v = self
+                    .conn
+                    .invoke(
+                        &WORKER_VIEW,
+                        vec![
+                            worker_meta_key(&self.ns, worker),
+                            worker_live_key(&self.ns, worker),
+                        ],
+                        vec![ttl_flag.to_string()],
+                    )
+                    .await?;
+                let (addr, alive): (String, i64) = <(String, i64)>::from_redis_value(&v)?;
+                Ok::<_, redis::RedisError>((addr, alive == 1))
+            }))
+            .await
+            .map_err(to_status)?;
+            metas.extend(values);
+        }
 
         let matches = worker_order
             .into_iter()
@@ -535,15 +541,19 @@ impl RedisKvIndexerBackend {
         req: GetExternalKvHitCountsRequest,
     ) -> Result<GetExternalKvHitCountsResponse, Status> {
         let hashes = dedup_preserve_order(&req.hashes);
-        let counts = try_join_all(hashes.iter().map(|hash| async move {
-            let mut cmd = redis::cmd("HGET");
-            cmd.arg(hit_key(&self.ns, hash)).arg("c");
-            let v = self.conn.query(cmd).await?;
-            let count: Option<i64> = Option::<i64>::from_redis_value(&v)?;
-            Ok::<_, redis::RedisError>(count)
-        }))
-        .await
-        .map_err(to_status)?;
+        let mut counts = Vec::with_capacity(hashes.len());
+        for chunk in hashes.chunks(REDIS_FANOUT_CHUNK) {
+            let values = try_join_all(chunk.iter().map(|hash| async move {
+                let mut cmd = redis::cmd("HGET");
+                cmd.arg(hit_key(&self.ns, hash)).arg("c");
+                let v = self.conn.query(cmd).await?;
+                let count: Option<i64> = Option::<i64>::from_redis_value(&v)?;
+                Ok::<_, redis::RedisError>(count)
+            }))
+            .await
+            .map_err(to_status)?;
+            counts.extend(values);
+        }
 
         let entries = hashes
             .into_iter()
