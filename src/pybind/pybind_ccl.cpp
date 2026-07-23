@@ -331,12 +331,6 @@ void RegisterMoriCcl(pybind11::module_& m) {
           },
           py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
       .def("buf_ptr", [](InterNodeRing& self) -> uintptr_t { return self.buf_ptr(); })
-      .def(
-          "finish_sync_no_copy",
-          [](InterNodeRing& self, int64_t stream) -> double {
-            return self.finish_sync_no_copy(reinterpret_cast<hipStream_t>(stream));
-          },
-          py::arg("stream"))
       // stream-ordered prepare/finish (ShmemBarrierOnStream
       // instead of host hipStreamSynchronize + host ShmemBarrierAll).
       .def(
