@@ -254,7 +254,7 @@ class InterNodeRingAllgather {
     return 0.0;
   }
 
-  // Stream-ordered counterpart of finish_sync_no_copy (result left in ring buf).
+  // Stream-ordered no-copy finish (result left in the ring buf, read via buf_ptr).
   double finish_stream_no_copy(hipStream_t stream) {
     HierFinishBarrierOnStream(stream);
     return 0.0;
@@ -308,17 +308,9 @@ class InterNodeRingAllgather {
   }
 
   // Base pointer of the ring buffer, which after the kernel holds the ringSize_
-  // chunks in ring order (the rank-major result). Read via buf_ptr +
-  // finish_sync_no_copy to avoid the finish_sync copy-OUT.
+  // chunks in ring order (the rank-major result). Read via buf_ptr to avoid the
+  // finish_sync copy-OUT.
   uintptr_t buf_ptr() const { return reinterpret_cast<uintptr_t>(ring_); }
-
-  // finish_sync without the copy-OUT: result left in the ring buffer (read via
-  // buf_ptr). Only syncs the stream and barriers against cross-PE reuse.
-  double finish_sync_no_copy(hipStream_t stream) {
-    (void)hipStreamSynchronize(stream);
-    shmem::ShmemBarrierAll();
-    return 0.0;
-  }
 
 };
 
