@@ -196,7 +196,6 @@ class MoriAllGather(AllGather):
                 _sd("MORI_FSDP_DEFER_HOSTSYNC", "1")
                 _sd("MORI_FSDP_EVENT_FENCE", "1")
                 _sd("MORI_FSDP_FWD_PREFETCH", "1")
-                _sd("MORI_FSDP_FWD_PREFETCH_ROOT", "1")
         # NO_ZERO_COPY=1 forces the copy-out __call__ path (keeps the inter-ring
         # overlap) instead of the zero-copy scatter.
         if os.environ.get("MORI_FSDP_NO_ZERO_COPY", "") not in (
