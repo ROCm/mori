@@ -581,6 +581,12 @@ impl KvIndexerBackend for RedisKvIndexerBackend {
     ) -> Result<GetExternalKvHitCountsResponse, Status> {
         self.do_hit_counts(request).await
     }
+
+    /// Ready only when Redis answers a PING (covers degraded/lazy-connect starts
+    /// and transient store outages).
+    async fn health(&self) -> bool {
+        self.ping().await.is_ok()
+    }
 }
 
 fn dedup_preserve_order(hashes: &[String]) -> Vec<String> {

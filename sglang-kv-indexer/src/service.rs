@@ -34,6 +34,13 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
         &self,
         request: GetExternalKvHitCountsRequest,
     ) -> Result<GetExternalKvHitCountsResponse, Status>;
+
+    /// Readiness probe: `true` when the backend can serve requests. Stateless
+    /// backends are always ready; a durable backend (Redis) overrides this to
+    /// reflect store connectivity so the gRPC health service can report it.
+    async fn health(&self) -> bool {
+        true
+    }
 }
 
 /// Blanket impl so the server can hold the selected backend as
@@ -59,6 +66,10 @@ impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
         request: GetExternalKvHitCountsRequest,
     ) -> Result<GetExternalKvHitCountsResponse, Status> {
         (**self).get_external_kv_hit_counts(request).await
+    }
+
+    async fn health(&self) -> bool {
+        (**self).health().await
     }
 }
 

@@ -104,15 +104,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .parse::<SocketAddr>()?;
 
     let backend = select_backend().await?;
+
+    // Standard gRPC health service (grpc.health.v1). A background prober flips
+    // the status to reflect backend readiness (e.g. Redis connectivity), so
+    // k8s / the router can tell whether this indexer can actually serve.
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    tokio::spawn(health_prober(health_reporter, backend.clone()));
+
     let service = KvIndexerServer::new(KvIndexerService::new(backend));
 
     info!(%addr, "starting SGLang KV Indexer gRPC server");
     Server::builder()
+        .add_service(health_service)
         .add_service(service)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 
     Ok(())
+}
+
+/// The concrete gRPC service type, used to name it in the health registry.
+type GrpcService = KvIndexerServer<KvIndexerService<Arc<dyn KvIndexerBackend>>>;
+
+/// How often readiness is re-probed against the backend.
+const HEALTH_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Periodically reflects backend readiness into the gRPC health service, for
+/// both the named `KvIndexer` service and the overall (empty-name) status that
+/// k8s' built-in gRPC probe checks by default.
+async fn health_prober(reporter: tonic_health::server::HealthReporter, backend: Arc<dyn KvIndexerBackend>) {
+    use tonic_health::ServingStatus::{NotServing, Serving};
+    let mut tick = tokio::time::interval(HEALTH_PROBE_INTERVAL);
+    let mut last: Option<bool> = None;
+    loop {
+        tick.tick().await;
+        let ok = backend.health().await;
+        if last == Some(ok) {
+            continue;
+        }
+        last = Some(ok);
+        let status = if ok { Serving } else { NotServing };
+        reporter.set_service_status("", status).await;
+        reporter
+            .set_service_status(<GrpcService as tonic::server::NamedService>::NAME, status)
+            .await;
+        if !ok {
+            tracing::warn!("backend not ready: reporting NOT_SERVING");
+        }
+    }
 }
 
 /// Selects the storage backend from `KV_INDEXER_BACKEND`:
