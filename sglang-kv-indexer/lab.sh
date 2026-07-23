@@ -25,6 +25,12 @@ PUB_PORT="${PUB_PORT:-5567}"
 # so leave a wide gap between PUB and REPLAY bases to avoid cross-rank collisions.
 REPLAY_PORT="${REPLAY_PORT:-5590}"
 INDEXER_PORT="${INDEXER_PORT:-50051}"
+# indexer storage backend: default to redis so the lab exercises the real
+# durable path (per-worker seq gate + dual index). Override BACKEND=logging for
+# a store-free smoke run.
+BACKEND="${KV_INDEXER_BACKEND:-redis}"
+REDIS_URL="${KV_INDEXER_REDIS_URL:-redis://127.0.0.1:6379}"
+REDIS_NAMESPACE="${KV_INDEXER_REDIS_NAMESPACE:-kvidx}"
 
 CRATE_DIR="/root/wuyl/mori/sglang-kv-indexer"
 SGLANG_DIR="/sgl-workspace/sglang"
@@ -72,9 +78,12 @@ _stop() { # name -> TERM then KILL the whole process tree rooted at the recorded
 start_indexer() {
   if _alive indexer; then c_grn "indexer already up (pid $(cat $PID_DIR/indexer.pid))"; return; fi
   RUST_LOG="${RUST_LOG:-info}" KV_INDEXER_LISTEN_ADDR="127.0.0.1:$INDEXER_PORT" \
+  KV_INDEXER_BACKEND="$BACKEND" \
+  KV_INDEXER_REDIS_URL="$REDIS_URL" \
+  KV_INDEXER_REDIS_NAMESPACE="$REDIS_NAMESPACE" \
     nohup "$BIN_SERVER" >"$LOG_DIR/indexer.log" 2>&1 &
   echo $! > "$PID_DIR/indexer.pid"
-  c_grn "indexer up (pid $!) -> 127.0.0.1:$INDEXER_PORT  log:$LOG_DIR/indexer.log"
+  c_grn "indexer up (pid $!) backend=$BACKEND -> 127.0.0.1:$INDEXER_PORT  log:$LOG_DIR/indexer.log"
 }
 
 start_sglang() {

@@ -117,6 +117,40 @@ fn apply_report(
 }
 
 #[tokio::test]
+async fn apply_ack_reports_seq_and_duplicate_over_grpc() {
+    let Some(mut c) = start("apply_ack").await else {
+        return;
+    };
+    let w = format!("w-{}", nanos());
+    let h = "ack-h1";
+
+    let first = c
+        .apply_external_kv_batch(apply_report(&w, "10.0.0.9:9000", 1, hbm(), &[h]))
+        .await
+        .expect("apply ok")
+        .into_inner();
+    assert_eq!(first.last_applied_seq, 1);
+    assert!(!first.duplicate);
+
+    // Re-sending the same seq is acked as a duplicate at the same position.
+    let dup = c
+        .apply_external_kv_batch(apply_report(&w, "10.0.0.9:9000", 1, hbm(), &[h]))
+        .await
+        .expect("apply ok")
+        .into_inner();
+    assert!(dup.duplicate);
+    assert_eq!(dup.last_applied_seq, 1);
+
+    let second = c
+        .apply_external_kv_batch(apply_report(&w, "10.0.0.9:9000", 2, hbm(), &[h]))
+        .await
+        .expect("apply ok")
+        .into_inner();
+    assert_eq!(second.last_applied_seq, 2);
+    assert!(!second.duplicate);
+}
+
+#[tokio::test]
 async fn apply_match_and_hit_counts_over_grpc() {
     let Some(mut c) = start("apply_match").await else {
         return;

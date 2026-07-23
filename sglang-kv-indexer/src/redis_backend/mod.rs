@@ -10,6 +10,15 @@
 //! SADD/SREM), so a verbatim batch replay (same `seq`) is a no-op and never
 //! double-counts hits (hits are only bumped on match).
 //!
+//! Ordering / idempotency is anchored by a durable per-worker seq stored in the
+//! worker meta hash (`{w:worker}:meta` field `seq`). Each apply first runs a
+//! seq gate: a batch whose seq is `<= last_applied` is skipped as a duplicate;
+//! otherwise the batch is applied and the stored seq is advanced to
+//! `max(last, seq)` *after* the mutations commit. The response carries
+//! `last_applied_seq` so the bridge can resume from the durable position after a
+//! restart. Crash between mutations and the seq advance is safe: the stored seq
+//! stays behind, so the next (idempotent) replay re-applies rather than skips.
+//!
 //! On Cluster an apply batch spans many slots and is therefore not globally
 //! atomic; each block-hash mutation is atomic on its own slot and the batch is
 //! idempotent, so a partial failure is corrected by the bridge replaying the
@@ -28,9 +37,9 @@ use redis::FromRedisValue;
 use tonic::Status;
 
 use crate::pb::{
-    ApplyExternalKvBatchRequest, ExternalKvActionType, ExternalKvNodeMatch,
-    GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse, HitCountEntry,
-    MatchExternalKvRequest, MatchExternalKvResponse, TierHashes,
+    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
+    ExternalKvNodeMatch, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
+    HitCountEntry, MatchExternalKvRequest, MatchExternalKvResponse, TierHashes,
 };
 use crate::service::KvIndexerBackend;
 
@@ -38,7 +47,7 @@ use conn::{ClusterConn, RedisConn, SingleConn};
 use schema::{
     hit_key, placement_key, tier_bit, tiers_from_mask, worker_blocks_key, worker_meta_key,
 };
-use scripts::{MATCH_HASH, PLACEMENT_CLEAR, PLACEMENT_SET};
+use scripts::{MATCH_HASH, PLACEMENT_CLEAR, PLACEMENT_SET, SEQ_CHECK, SEQ_COMMIT};
 
 /// Boxed error for construction paths (env parsing / connect / ping).
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -168,12 +177,37 @@ impl RedisKvIndexerBackend {
 
     // --- write path ---------------------------------------------------------
 
-    async fn apply(&self, req: ApplyExternalKvBatchRequest) -> Result<(), Status> {
+    async fn apply(
+        &self,
+        req: ApplyExternalKvBatchRequest,
+    ) -> Result<ApplyExternalKvBatchResponse, Status> {
         let worker = req.worker_id.as_str();
+        let meta_key = worker_meta_key(&self.ns, worker);
+
+        // Durable idempotency gate: skip a batch whose seq was already applied.
+        // `last == -1` means the worker has no stored seq yet (accept any start).
+        let gate = self
+            .conn
+            .invoke(
+                &SEQ_CHECK,
+                vec![meta_key.clone()],
+                vec![req.seq.to_string()],
+            )
+            .await
+            .map_err(to_status)?;
+        let gate: Vec<i64> = Vec::<i64>::from_redis_value(&gate).map_err(to_status)?;
+        let proceed = gate.first().copied().unwrap_or(1) == 1;
+        let last = gate.get(1).copied().unwrap_or(-1);
+        if !proceed {
+            return Ok(ApplyExternalKvBatchResponse {
+                last_applied_seq: last.max(0) as u64,
+                duplicate: true,
+            });
+        }
 
         if !req.worker_address.is_empty() {
             let mut cmd = redis::cmd("HSET");
-            cmd.arg(worker_meta_key(&self.ns, worker))
+            cmd.arg(&meta_key)
                 .arg("addr")
                 .arg(&req.worker_address)
                 .arg("last_seen")
@@ -208,7 +242,20 @@ impl RedisKvIndexerBackend {
                 _ => return Err(Status::invalid_argument("unsupported action type")),
             }
         }
-        Ok(())
+
+        // Advance the durable position only after the mutations committed, so a
+        // crash mid-batch leaves seq behind and the next replay (idempotent)
+        // repairs it rather than being skipped as a duplicate.
+        let committed = self
+            .conn
+            .invoke(&SEQ_COMMIT, vec![meta_key], vec![req.seq.to_string()])
+            .await
+            .map_err(to_status)?;
+        let committed: i64 = i64::from_redis_value(&committed).map_err(to_status)?;
+        Ok(ApplyExternalKvBatchResponse {
+            last_applied_seq: committed.max(0) as u64,
+            duplicate: false,
+        })
     }
 
     async fn report_one(&self, worker: &str, hash: &str, bit: i64) -> Result<(), Status> {
@@ -380,7 +427,7 @@ impl KvIndexerBackend for RedisKvIndexerBackend {
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
-    ) -> Result<(), Status> {
+    ) -> Result<ApplyExternalKvBatchResponse, Status> {
         self.apply(request).await
     }
 

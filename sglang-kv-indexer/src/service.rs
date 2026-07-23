@@ -16,13 +16,14 @@ use crate::pb::{
 #[tonic::async_trait]
 pub trait KvIndexerBackend: Send + Sync + 'static {
     /// Applies a whole SGLang KVEventBatch. The actions are pre-validated and
-    /// must be applied in order. `seq` is metadata: the batch is expected to be
-    /// naturally idempotent so a verbatim replay (same `seq`) is a no-op; the
-    /// backend must not gate ordering on `seq`.
+    /// must be applied in order. `seq` is a per-worker monotonic idempotency
+    /// key: a durable backend stores the last applied seq per worker, skips a
+    /// batch whose seq was already applied (a duplicate), and reports its
+    /// durable position back in [`ApplyExternalKvBatchResponse::last_applied_seq`].
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
-    ) -> Result<(), Status>;
+    ) -> Result<ApplyExternalKvBatchResponse, Status>;
 
     async fn match_external_kv(
         &self,
@@ -42,7 +43,7 @@ impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
-    ) -> Result<(), Status> {
+    ) -> Result<ApplyExternalKvBatchResponse, Status> {
         (**self).apply_external_kv_batch(request).await
     }
 
@@ -68,9 +69,13 @@ pub struct NoopKvIndexerBackend;
 impl KvIndexerBackend for NoopKvIndexerBackend {
     async fn apply_external_kv_batch(
         &self,
-        _request: ApplyExternalKvBatchRequest,
-    ) -> Result<(), Status> {
-        Ok(())
+        request: ApplyExternalKvBatchRequest,
+    ) -> Result<ApplyExternalKvBatchResponse, Status> {
+        // Stateless backend: echo the request seq as the applied position.
+        Ok(ApplyExternalKvBatchResponse {
+            last_applied_seq: request.seq,
+            duplicate: false,
+        })
     }
 
     async fn match_external_kv(
@@ -134,8 +139,8 @@ where
         let request = request.into_inner();
         validate_worker_id(&request.worker_id)?;
         validate_actions(&request.actions)?;
-        self.backend.apply_external_kv_batch(request).await?;
-        Ok(Response::new(ApplyExternalKvBatchResponse {}))
+        let response = self.backend.apply_external_kv_batch(request).await?;
+        Ok(Response::new(response))
     }
 }
 

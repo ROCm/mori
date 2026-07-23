@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use sglang_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
 use sglang_kv_indexer::pb::{
-    ApplyExternalKvBatchRequest, ExternalKvActionType, GetExternalKvHitCountsRequest,
-    GetExternalKvHitCountsResponse, MatchExternalKvRequest, MatchExternalKvResponse,
+    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
+    GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse, MatchExternalKvRequest,
+    MatchExternalKvResponse,
 };
 use sglang_kv_indexer::{KvIndexerBackend, KvIndexerService, NoopKvIndexerBackend};
 use tonic::transport::Server;
@@ -31,7 +32,7 @@ impl KvIndexerBackend for LoggingKvIndexerBackend {
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
-    ) -> Result<(), Status> {
+    ) -> Result<ApplyExternalKvBatchResponse, Status> {
         let (mut reported, mut revoked, mut cleared) = (0usize, 0usize, 0usize);
         {
             let mut live = self.live.lock().unwrap();
@@ -69,7 +70,10 @@ impl KvIndexerBackend for LoggingKvIndexerBackend {
             live_total = self.total(),
             "APPLY external kv batch"
         );
-        Ok(())
+        Ok(ApplyExternalKvBatchResponse {
+            last_applied_seq: request.seq,
+            duplicate: false,
+        })
     }
 
     async fn match_external_kv(

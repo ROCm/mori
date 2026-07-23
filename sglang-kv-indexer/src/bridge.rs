@@ -226,17 +226,19 @@ async fn connect(
 }
 
 /// Forwards one raw batch, marking it pending for the duration so an
-/// interrupted forward is re-driven verbatim after a reconnect.
+/// interrupted forward is re-driven verbatim after a reconnect. Returns the
+/// indexer's durable `last_applied_seq` so the caller can advance `next_seq`
+/// from the authoritative position rather than the locally observed seq.
 async fn commit_batch(
     config: &BridgeConfig,
     client: &mut KvIndexerClient<Channel>,
     batch: &RawBatch,
     pending_batch: &mut Option<RawBatch>,
-) -> Result<(), BridgeError> {
+) -> Result<u64, BridgeError> {
     *pending_batch = Some(batch.clone());
-    forward_raw_batch(config, client, batch).await?;
+    let last_applied_seq = forward_raw_batch(config, client, batch).await?;
     *pending_batch = None;
-    Ok(())
+    Ok(last_applied_seq)
 }
 
 /// Runs a single connected session. Returns `Ok(())` only on a clean shutdown
@@ -253,8 +255,8 @@ async fn run_session(
     // consuming new events. It can only be set at session entry: every in-loop
     // commit either clears it or returns an error that ends the session.
     if let Some(batch) = pending_batch.clone() {
-        commit_batch(config, &mut client, &batch, pending_batch).await?;
-        *next_seq = batch.seq.checked_add(1);
+        let last_applied_seq = commit_batch(config, &mut client, &batch, pending_batch).await?;
+        *next_seq = last_applied_seq.checked_add(1);
     }
 
     loop {
@@ -289,14 +291,17 @@ async fn run_session(
             }
         }
 
-        commit_batch(
+        let last_applied_seq = commit_batch(
             config,
             &mut client,
             &RawBatch { seq, payload },
             pending_batch,
         )
         .await?;
-        *next_seq = seq.checked_add(1);
+        // Advance from the indexer's durable position: on a duplicate this is
+        // >= seq, so a restart that re-observes already-applied batches resyncs
+        // without reprocessing them.
+        *next_seq = last_applied_seq.max(seq).checked_add(1);
     }
 }
 
@@ -420,23 +425,24 @@ async fn forward_raw_batch(
     config: &BridgeConfig,
     client: &mut KvIndexerClient<Channel>,
     batch: &RawBatch,
-) -> Result<(), BridgeError> {
+) -> Result<u64, BridgeError> {
     let actions = match decode_event_batch(&batch.payload) {
         Ok(actions) => actions,
         Err(error) => {
             warn!(seq = batch.seq, %error, "skipping undecodable event batch");
-            return Ok(());
+            return Ok(batch.seq);
         }
     };
 
     let request = build_apply_request(config, batch.seq, actions);
     // Nothing decodable to a supported mutation (e.g. only ignored event tags):
-    // preserve the previous no-op behaviour and skip the RPC entirely.
+    // preserve the previous no-op behaviour and skip the RPC entirely. The batch
+    // still counts as consumed, so report its seq as the applied position.
     if request.actions.is_empty() {
-        return Ok(());
+        return Ok(batch.seq);
     }
-    client.apply_external_kv_batch(request).await?;
-    Ok(())
+    let response = client.apply_external_kv_batch(request).await?.into_inner();
+    Ok(response.last_applied_seq)
 }
 
 /// Maps a decoded `EventActions` into a single `ApplyExternalKvBatchRequest`,

@@ -84,7 +84,8 @@ impl SingleConn {
             return Ok(c);
         }
         let client = redis::Client::open(self.url.as_str())?;
-        let built = redis::aio::ConnectionManager::new_with_config(client, manager_config()).await?;
+        let built =
+            redis::aio::ConnectionManager::new_with_config(client, manager_config()).await?;
         let mut guard = self.conn.lock().unwrap();
         if let Some(existing) = guard.clone() {
             return Ok(existing);
@@ -151,8 +152,11 @@ impl ClusterConn {
             return Ok(c);
         }
         let client = redis::cluster::ClusterClient::new(self.nodes.clone())?;
-        let built = match tokio::time::timeout(CLUSTER_CONNECT_TIMEOUT, client.get_async_connection())
-            .await
+        let built = match tokio::time::timeout(
+            CLUSTER_CONNECT_TIMEOUT,
+            client.get_async_connection(),
+        )
+        .await
         {
             Ok(res) => res?,
             Err(_) => {

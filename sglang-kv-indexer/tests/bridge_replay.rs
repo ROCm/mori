@@ -20,8 +20,8 @@ use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage
 use sglang_kv_indexer::bridge::{run_bridge, BridgeConfig};
 use sglang_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
 use sglang_kv_indexer::pb::{
-    ApplyExternalKvBatchRequest, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
-    MatchExternalKvRequest, MatchExternalKvResponse,
+    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, GetExternalKvHitCountsRequest,
+    GetExternalKvHitCountsResponse, MatchExternalKvRequest, MatchExternalKvResponse,
 };
 use sglang_kv_indexer::{KvIndexerBackend, KvIndexerService};
 
@@ -36,9 +36,12 @@ impl KvIndexerBackend for CapturingBackend {
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
-    ) -> Result<(), Status> {
+    ) -> Result<ApplyExternalKvBatchResponse, Status> {
         self.seqs.lock().unwrap().push(request.seq);
-        Ok(())
+        Ok(ApplyExternalKvBatchResponse {
+            last_applied_seq: request.seq,
+            duplicate: false,
+        })
     }
 
     async fn match_external_kv(
@@ -188,7 +191,10 @@ async fn bridge_recovers_seq_gap_via_replay() {
             }
         }
         if std::time::Instant::now() > deadline {
-            panic!("timed out; applied seqs so far: {:?}", *seqs.lock().unwrap());
+            panic!(
+                "timed out; applied seqs so far: {:?}",
+                *seqs.lock().unwrap()
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

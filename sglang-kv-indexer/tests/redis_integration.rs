@@ -449,6 +449,95 @@ itest!(batch_action_order_is_preserved, b, {
     assert!(tiers_for(&resp, "w1", "6").is_empty());
 });
 
+// --- server-side seq gate (durable idempotency) -----------------------------
+
+itest!(duplicate_seq_batch_is_skipped_not_reapplied, b, {
+    // Apply a report at seq=1, then re-send seq=1 carrying a *different*
+    // mutation (a revoke). Because seq=1 was already applied, the whole batch
+    // is a duplicate and must be skipped, so the revoke has no effect.
+    let applied = b
+        .apply_external_kv_batch(apply_req(
+            "w1",
+            "a",
+            1,
+            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(applied.last_applied_seq, 1);
+    assert!(!applied.duplicate);
+
+    let dup = b
+        .apply_external_kv_batch(apply_req(
+            "w1",
+            "a",
+            1,
+            vec![action(ExternalKvActionType::ActionRevoke, hbm(), &["1"])],
+        ))
+        .await
+        .unwrap();
+    assert!(dup.duplicate, "re-sent seq must be reported as a duplicate");
+    assert_eq!(dup.last_applied_seq, 1);
+
+    // The revoke was skipped: the hash is still present.
+    let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
+    assert_eq!(tiers_for(&resp, "w1", "1"), vec![hbm()]);
+});
+
+itest!(lower_seq_batch_is_skipped_as_stale, b, {
+    // Advance to seq=5, then a late/out-of-order seq=3 arrives. It must be
+    // treated as stale (<= last) and skipped, leaving the ack at 5.
+    for seq in [1u64, 5] {
+        b.apply_external_kv_batch(apply_req(
+            "w1",
+            "a",
+            seq,
+            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
+        ))
+        .await
+        .unwrap();
+    }
+    let stale = b
+        .apply_external_kv_batch(apply_req(
+            "w1",
+            "a",
+            3,
+            vec![action(ExternalKvActionType::ActionRevoke, hbm(), &["1"])],
+        ))
+        .await
+        .unwrap();
+    assert!(stale.duplicate);
+    assert_eq!(stale.last_applied_seq, 5);
+    let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
+    assert_eq!(tiers_for(&resp, "w1", "1"), vec![hbm()]);
+});
+
+itest!(seq_is_per_worker_independent, b, {
+    // seq counters are independent per worker: the same seq value applied to a
+    // different worker is not a duplicate.
+    let a = b
+        .apply_external_kv_batch(apply_req(
+            "w1",
+            "a",
+            1,
+            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
+        ))
+        .await
+        .unwrap();
+    let c = b
+        .apply_external_kv_batch(apply_req(
+            "w2",
+            "a",
+            1,
+            vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
+        ))
+        .await
+        .unwrap();
+    assert!(!a.duplicate && !c.duplicate);
+    let resp = b.match_external_kv(match_req(&["1"], false)).await.unwrap();
+    assert_eq!(resp.matches.len(), 2);
+});
+
 // --- T5 regression: degraded-start / lazy-connect semantics -----------------
 
 /// A deferred backend (KV_INDEXER_REDIS_REQUIRED=0 path) does not connect at

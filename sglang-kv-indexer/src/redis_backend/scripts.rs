@@ -8,6 +8,52 @@ use std::sync::LazyLock;
 
 use redis::Script;
 
+/// Idempotency gate for a worker's apply batch, keyed on the monotonic per-worker
+/// seq stored in the worker meta hash (`{w:worker}:meta` field `seq`).
+///
+/// KEYS: `[worker_meta_key]`
+/// ARGV: `[seq]`
+/// Returns `{proceed, last}`: `proceed=0` when `seq <= last` (a duplicate that
+/// the caller must skip); `proceed=1` otherwise. `last` is the currently stored
+/// seq, or `-1` when the worker has no stored seq yet. This only reads state; the
+/// caller advances the stored seq with [`SEQ_COMMIT`] after the mutations succeed
+/// so the durable position never moves ahead of applied data.
+pub static SEQ_CHECK: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r#"
+local last = redis.call('HGET', KEYS[1], 'seq')
+if last ~= false and tonumber(ARGV[1]) <= tonumber(last) then
+  return {0, last}
+end
+if last == false then
+  return {1, '-1'}
+end
+return {1, last}
+"#,
+    )
+});
+
+/// Monotonically advances a worker's stored seq after its batch is applied.
+///
+/// KEYS: `[worker_meta_key]`
+/// ARGV: `[seq]`
+/// Sets `seq` to `max(stored, seq)` and returns the resulting value. Run only on
+/// the apply path (never for a duplicate), and only after the batch mutations
+/// have committed, so a crash between mutations and this call simply leaves the
+/// stored seq behind and the next (idempotent) replay repairs it.
+pub static SEQ_COMMIT: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r#"
+local last = redis.call('HGET', KEYS[1], 'seq')
+if last == false or tonumber(ARGV[1]) > tonumber(last) then
+  redis.call('HSET', KEYS[1], 'seq', ARGV[1])
+  return ARGV[1]
+end
+return last
+"#,
+    )
+});
+
 /// Sets a tier bit for a worker in a placement hash.
 ///
 /// KEYS: `[placement_key]`
