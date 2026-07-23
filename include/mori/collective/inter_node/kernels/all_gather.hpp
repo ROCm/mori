@@ -44,10 +44,8 @@ constexpr int kHierInterPollSleep = 0;
 inline __device__ void AllGatherRingSubGroupKernelBody(
     int ringPos, int ringSize, int peBase, int peStride, const application::SymmMemObjPtr memObj,
     const application::SymmMemObjPtr flagsObj, size_t peChunkSize, int numQp = 1,
-    int numBlocksOverride = -1, int bidOverride = -1,
-    uint64_t* chunkReadyFlags = nullptr,
-    int deepPipe = 1,
-    int deepPipeQuiet = 0) {
+    int numBlocksOverride = -1, int bidOverride = -1, uint64_t* chunkReadyFlags = nullptr,
+    int deepPipe = 1, int deepPipeQuiet = 0) {
   int nextPos = (ringPos + 1) % ringSize;
   int nextPeer = peBase + nextPos * peStride;
   int maxRounds = ringSize - 1;
@@ -116,9 +114,8 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   // XGMI while later sub-chunks cross the NIC. Single-round (ringSize==2) all-RDMA
   // path only; publishes P chunkReadyFlags in temporal order and returns before the
   // round loop. INERT when deepPipe<=1 (byte-identical).
-  bool deepPipeEngaged =
-      (deepPipe > 1 && peerIsRdma && prevIsRdma && maxRounds == 1 && !multiBlock &&
-       chunkReadyFlags != nullptr && useWarps >= 1);
+  bool deepPipeEngaged = (deepPipe > 1 && peerIsRdma && prevIsRdma && maxRounds == 1 &&
+                          !multiBlock && chunkReadyFlags != nullptr && useWarps >= 1);
   if (deepPipeEngaged) {
     // Clamp P so each sub-chunk carries >= kMinSubChunkB (1 MiB): tiny per-sub-chunk
     // WQEs starve the NIC and can deadlock. Bit-exact (P only partitions the same
@@ -253,8 +250,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
               if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
             }
             __threadfence_system();
-            core::AtomicStoreSeqCstSystem(chunkReadyFlags + 0,
-                                          static_cast<uint64_t>(1));
+            core::AtomicStoreSeqCstSystem(chunkReadyFlags + 0, static_cast<uint64_t>(1));
           }
           __syncthreads();  // keep the block uniform before the shared trailing logic
         } else {
@@ -290,9 +286,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                   if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
                 }
                 __threadfence_system();
-                core::AtomicStoreSeqCstSystem(
-                    chunkReadyFlags + p,
-                    static_cast<uint64_t>(1));
+                core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, static_cast<uint64_t>(1));
               }
             }
           }
@@ -320,8 +314,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
               if (kHierInterPollSleep) __builtin_amdgcn_s_sleep(kHierInterPollSleep);
             }
             __threadfence_system();
-            core::AtomicStoreSeqCstSystem(chunkReadyFlags + p,
-                                          static_cast<uint64_t>(1));
+            core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, static_cast<uint64_t>(1));
           }
         }
       } else if (threadLinearId == 0) {
@@ -344,16 +337,14 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
             }
           }
           __threadfence_system();
-          core::AtomicStoreSeqCstSystem(chunkReadyFlags + p,
-                                        static_cast<uint64_t>(1));
+          core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, static_cast<uint64_t>(1));
         }
       }
       __syncthreads();
       // Parallel paths already drained every send QP group per sub-chunk, so the
       // trailing full-QP re-drain is redundant there (buffer-reuse safety already met);
       // keep it only on the serial fallback.
-      const bool dpParallelDrained =
-          (sw >= P && P <= warpsPerBlock) || (sw <= warpsPerBlock);
+      const bool dpParallelDrained = (sw >= P && P <= warpsPerBlock) || (sw <= warpsPerBlock);
       if (!dpParallelDrained) {
         if (threadLinearId == 0) {
           shmem::ShmemQuietThread(nextPeer);
@@ -404,8 +395,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
           }
         }
         __threadfence_system();
-        core::AtomicStoreSeqCstSystem(chunkReadyFlags + p,
-                                      static_cast<uint64_t>(1));
+        core::AtomicStoreSeqCstSystem(chunkReadyFlags + p, static_cast<uint64_t>(1));
       }
     }
     __syncthreads();
@@ -517,8 +507,7 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   // INERT when chunkReadyFlags==nullptr (standalone ring byte-identical).
   if (chunkReadyFlags != nullptr && threadLinearId == 0) {
     __threadfence_system();
-    core::AtomicStoreSeqCstSystem(chunkReadyFlags + bid,
-                                  static_cast<uint64_t>(1));
+    core::AtomicStoreSeqCstSystem(chunkReadyFlags + bid, static_cast<uint64_t>(1));
   }
   // Each block resets only its own flag region so concurrent channels never race.
   for (int idx = threadLinearId; idx < ringSize; idx += threadsPerBlock) {

@@ -77,8 +77,6 @@ def _run_one(handle, dtype, numel, rank, world_size, device):
         )
 
 
-
-
 def _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device):
     shmem.shmem_torch_process_group_init("default")
     assert shmem.shmem_mype() == rank
@@ -130,9 +128,7 @@ def _spawn_worker(rank, world_size, ranks_per_node, port, numels, dtypes):
         _worker_body(rank, world_size, ranks_per_node, numels, dtypes, device)
 
 
-def test_hier_allgather(
-    world_size=None, ranks_per_node=None, numels=None, dtypes=None
-):
+def test_hier_allgather(world_size=None, ranks_per_node=None, numels=None, dtypes=None):
     """Single-node pytest entry. ``ranks_per_node == world_size`` is the pure-SDMA
     path (num_nodes == 1); ``ranks_per_node < world_size`` splits local GPUs into
     simulated nodes to drive the hierarchical pipeline -- same kernel path, ring
@@ -175,4 +171,3 @@ def test_hier_allgather_layouts():
         test_hier_allgather(world_size=world, ranks_per_node=rpn, numels=small)
         ran += 1
     assert ran > 0, "no hierarchical layout fit the visible GPU count"
-
