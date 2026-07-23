@@ -7,8 +7,14 @@
 //! unique worker/hash ids so a shared store never causes collisions.
 #![cfg(feature = "redis-backend")]
 
-use std::net::SocketAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[path = "common/id.rs"]
+mod test_id;
+#[path = "common/kv.rs"]
+mod test_kv;
+#[path = "common/net.rs"]
+mod test_net;
+
+use std::time::Duration;
 
 use tonic::transport::Server;
 use tonic::Code;
@@ -17,40 +23,12 @@ use sglang_kv_indexer::pb::kv_indexer_client::KvIndexerClient;
 use sglang_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
 use sglang_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
-    GetExternalKvHitCountsRequest, MatchExternalKvRequest, TierType,
+    GetExternalKvHitCountsRequest, MatchExternalKvRequest,
 };
 use sglang_kv_indexer::{KvIndexerService, RedisKvIndexerBackend};
-
-fn hbm() -> i32 {
-    TierType::TierHbm as i32
-}
-fn dram() -> i32 {
-    TierType::TierDram as i32
-}
-fn report() -> i32 {
-    ExternalKvActionType::ActionReport as i32
-}
-fn revoke() -> i32 {
-    ExternalKvActionType::ActionRevoke as i32
-}
-fn clear_all_at_tier() -> i32 {
-    ExternalKvActionType::ActionClearAllAtTier as i32
-}
-
-fn nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-}
-
-/// Reserves an ephemeral loopback port. The listener is dropped immediately;
-/// the tiny window before the server rebinds is covered by the client's
-/// connect-retry loop below.
-fn free_addr() -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap()
-}
+use test_id::nanos;
+use test_kv::{action, apply_request, dram, hbm};
+use test_net::free_addr;
 
 /// Starts a real gRPC server backed by Redis on a unique namespace and returns
 /// a connected client, or `None` (skip) when no store env is configured.
@@ -90,21 +68,11 @@ fn apply(
     worker: &str,
     addr: &str,
     seq: u64,
-    action_type: i32,
+    action_type: ExternalKvActionType,
     tier: i32,
     hashes: &[&str],
 ) -> ApplyExternalKvBatchRequest {
-    ApplyExternalKvBatchRequest {
-        worker_id: worker.to_string(),
-        seq,
-        worker_address: addr.to_string(),
-        actions: vec![ExternalKvAction {
-            r#type: action_type,
-            tier,
-            hashes: hashes.iter().map(|s| s.to_string()).collect(),
-        }],
-        incarnation: String::new(),
-    }
+    apply_request(worker, addr, seq, vec![action(action_type, tier, hashes)])
 }
 
 fn apply_report(
@@ -114,7 +82,14 @@ fn apply_report(
     tier: i32,
     hashes: &[&str],
 ) -> ApplyExternalKvBatchRequest {
-    apply(worker, addr, seq, report(), tier, hashes)
+    apply(
+        worker,
+        addr,
+        seq,
+        ExternalKvActionType::ActionReport,
+        tier,
+        hashes,
+    )
 }
 
 #[tokio::test]
@@ -266,9 +241,16 @@ async fn apply_report_then_revoke_over_grpc() {
         "reported hash should match"
     );
 
-    c.apply_external_kv_batch(apply(&w, "10.0.0.3:9000", 2, revoke(), hbm(), &[h]))
-        .await
-        .expect("revoke apply ok");
+    c.apply_external_kv_batch(apply(
+        &w,
+        "10.0.0.3:9000",
+        2,
+        ExternalKvActionType::ActionRevoke,
+        hbm(),
+        &[h],
+    ))
+    .await
+    .expect("revoke apply ok");
 
     let after = c
         .match_external_kv(MatchExternalKvRequest {
@@ -304,7 +286,7 @@ async fn revoke_all_at_tier_over_grpc() {
         &w,
         "10.0.0.3:9000",
         3,
-        clear_all_at_tier(),
+        ExternalKvActionType::ActionClearAllAtTier,
         hbm(),
         &[],
     ))
@@ -364,7 +346,14 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
 
     // REPORT action with no hashes
     let err = c
-        .apply_external_kv_batch(apply("w", "addr", 1, report(), hbm(), &[]))
+        .apply_external_kv_batch(apply(
+            "w",
+            "addr",
+            1,
+            ExternalKvActionType::ActionReport,
+            hbm(),
+            &[],
+        ))
         .await
         .expect_err("empty hashes must be rejected");
     assert_eq!(
@@ -397,7 +386,14 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
 
     // invalid tier in an ApplyBatch action
     let err = c
-        .apply_external_kv_batch(apply("w", "addr", 1, report(), 999, &["h"]))
+        .apply_external_kv_batch(apply(
+            "w",
+            "addr",
+            1,
+            ExternalKvActionType::ActionReport,
+            999,
+            &["h"],
+        ))
         .await
         .expect_err("bad tier rejected");
     assert_eq!(

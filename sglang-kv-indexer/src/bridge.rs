@@ -8,10 +8,7 @@ use tracing::{debug, info, warn};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
 use crate::pb::kv_indexer_client::KvIndexerClient;
-use crate::pb::{
-    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, MatchExternalKvRequest,
-    TierType,
-};
+use crate::pb::{ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType};
 
 /// Backoff bounds for the reconnect supervisor loop.
 const RECONNECT_MIN_DELAY: Duration = Duration::from_millis(500);
@@ -688,17 +685,6 @@ fn expect_optional_str<'a>(value: &'a Value, field: &str) -> Result<Option<&'a s
         return Ok(None);
     }
     expect_str(value, field).map(Some)
-}
-
-#[allow(dead_code)]
-async fn _probe_indexer(client: &mut KvIndexerClient<Channel>) -> Result<(), BridgeError> {
-    client
-        .match_external_kv(MatchExternalKvRequest {
-            hashes: vec!["__bridge_probe__".to_string()],
-            count_as_hit: false,
-        })
-        .await?;
-    Ok(())
 }
 
 #[cfg(test)]

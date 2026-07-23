@@ -13,7 +13,7 @@ mod service;
 #[cfg(feature = "redis-backend")]
 pub mod redis_backend;
 
-pub use service::{KvIndexerBackend, KvIndexerService, NoopKvIndexerBackend};
+pub use service::{KvIndexerBackend, KvIndexerService};
 
 #[cfg(feature = "redis-backend")]
 pub use redis_backend::RedisKvIndexerBackend;

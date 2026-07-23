@@ -79,37 +79,6 @@ impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct NoopKvIndexerBackend;
-
-#[tonic::async_trait]
-impl KvIndexerBackend for NoopKvIndexerBackend {
-    async fn apply_external_kv_batch(
-        &self,
-        request: ApplyExternalKvBatchRequest,
-    ) -> Result<ApplyExternalKvBatchResponse, Status> {
-        // Stateless backend: echo the request seq as the applied position.
-        Ok(ApplyExternalKvBatchResponse {
-            last_applied_seq: request.seq,
-            duplicate: false,
-        })
-    }
-
-    async fn match_external_kv(
-        &self,
-        _request: MatchExternalKvRequest,
-    ) -> Result<MatchExternalKvResponse, Status> {
-        Ok(MatchExternalKvResponse { matches: vec![] })
-    }
-
-    async fn get_external_kv_hit_counts(
-        &self,
-        _request: GetExternalKvHitCountsRequest,
-    ) -> Result<GetExternalKvHitCountsResponse, Status> {
-        Ok(GetExternalKvHitCountsResponse { entries: vec![] })
-    }
-}
-
 #[derive(Debug)]
 pub struct KvIndexerService<B> {
     backend: B,
@@ -242,10 +211,6 @@ mod tests {
         }
     }
 
-    fn service() -> KvIndexerService<NoopKvIndexerBackend> {
-        KvIndexerService::new(NoopKvIndexerBackend)
-    }
-
     #[test]
     fn validate_actions_allows_empty_as_heartbeat() {
         // An empty batch is a liveness heartbeat, not an error.
@@ -310,42 +275,9 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     }
 
-    #[tokio::test]
-    async fn apply_batch_accepts_valid_request() {
-        let request = Request::new(ApplyExternalKvBatchRequest {
-            worker_id: "worker-1".to_string(),
-            seq: 3,
-            actions: vec![
-                action(ExternalKvActionType::ActionReport, hbm(), &["1", "2"]),
-                action(ExternalKvActionType::ActionClearAllAtTier, hbm(), &[]),
-            ],
-            worker_address: "127.0.0.1:9000".to_string(),
-            incarnation: String::new(),
-        });
-        assert!(service().apply_external_kv_batch(request).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn apply_batch_accepts_empty_actions_as_heartbeat() {
-        let request = Request::new(ApplyExternalKvBatchRequest {
-            worker_id: "worker-1".to_string(),
-            seq: 0,
-            actions: vec![],
-            worker_address: "127.0.0.1:9000".to_string(),
-            incarnation: String::new(),
-        });
-        assert!(service().apply_external_kv_batch(request).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn apply_batch_rejects_empty_worker_id() {
-        let request = Request::new(ApplyExternalKvBatchRequest {
-            worker_id: String::new(),
-            seq: 0,
-            actions: vec![action(ExternalKvActionType::ActionReport, hbm(), &["1"])],
-            worker_address: String::new(),
-            incarnation: String::new(),
-        });
-        assert!(service().apply_external_kv_batch(request).await.is_err());
+    #[test]
+    fn validate_worker_id_rejects_empty_value() {
+        assert!(validate_worker_id("").is_err());
+        assert!(validate_worker_id("worker-1").is_ok());
     }
 }

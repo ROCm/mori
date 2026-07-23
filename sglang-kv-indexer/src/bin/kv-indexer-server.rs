@@ -8,7 +8,7 @@ use sglang_kv_indexer::pb::{
     GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse, MatchExternalKvRequest,
     MatchExternalKvResponse,
 };
-use sglang_kv_indexer::{KvIndexerBackend, KvIndexerService, NoopKvIndexerBackend};
+use sglang_kv_indexer::{KvIndexerBackend, KvIndexerService};
 use tonic::transport::Server;
 use tonic::Status;
 use tracing::info;
@@ -159,7 +159,6 @@ async fn health_prober(
 
 /// Selects the storage backend from `KV_INDEXER_BACKEND`:
 ///   * `logging` — in-memory, logs running totals; for joint debugging.
-///   * `noop` — discards everything.
 ///   * `redis` — the Redis backend (requires the `redis-backend` cargo feature).
 ///
 /// The variable is required: silently defaulting to a fake backend makes a
@@ -173,8 +172,7 @@ async fn select_backend(
         Ok(value) => value,
         Err(_) => {
             return Err(
-                "KV_INDEXER_BACKEND is required; set it explicitly to redis, logging, or noop"
-                    .into(),
+                "KV_INDEXER_BACKEND is required; set it explicitly to redis or logging".into(),
             )
         }
     };
@@ -182,10 +180,6 @@ async fn select_backend(
         "logging" => {
             info!("using logging backend");
             Ok(Arc::new(LoggingKvIndexerBackend::default()))
-        }
-        "noop" => {
-            info!("using noop backend");
-            Ok(Arc::new(NoopKvIndexerBackend))
         }
         "redis" => {
             #[cfg(feature = "redis-backend")]

@@ -10,29 +10,23 @@
 //! Each test uses a unique namespace so a shared store never causes collisions.
 #![cfg(feature = "redis-backend")]
 
-use std::time::{SystemTime, UNIX_EPOCH};
+#[path = "common/id.rs"]
+mod test_id;
+#[path = "common/kv.rs"]
+mod test_kv;
 
 use sglang_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
-    GetExternalKvHitCountsRequest, MatchExternalKvRequest, MatchExternalKvResponse, TierType,
+    GetExternalKvHitCountsRequest, MatchExternalKvRequest, MatchExternalKvResponse,
 };
 use sglang_kv_indexer::{KvIndexerBackend, RedisKvIndexerBackend};
-
-fn hbm() -> i32 {
-    TierType::TierHbm as i32
-}
-fn dram() -> i32 {
-    TierType::TierDram as i32
-}
+use test_id::nanos;
+use test_kv::{action, apply_request as apply_req, dram, hashes, hbm};
 
 /// Builds a backend against the configured store with a unique namespace, or
 /// returns `None` (skip) when no store env is set.
 async fn backend(test: &str) -> Option<RedisKvIndexerBackend> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let ns = format!("itest:{test}:{nanos}");
+    let ns = format!("itest:{test}:{}", nanos());
     if let Ok(nodes) = std::env::var("KV_INDEXER_REDIS_CLUSTER_NODES") {
         let nodes: Vec<String> = nodes
             .split(',')
@@ -54,33 +48,6 @@ async fn backend(test: &str) -> Option<RedisKvIndexerBackend> {
     } else {
         eprintln!("skipping {test}: set KV_INDEXER_REDIS_URL or KV_INDEXER_REDIS_CLUSTER_NODES");
         None
-    }
-}
-
-fn hashes(hs: &[&str]) -> Vec<String> {
-    hs.iter().map(|h| h.to_string()).collect()
-}
-
-fn action(kind: ExternalKvActionType, tier: i32, hs: &[&str]) -> ExternalKvAction {
-    ExternalKvAction {
-        r#type: kind as i32,
-        tier,
-        hashes: hashes(hs),
-    }
-}
-
-fn apply_req(
-    worker: &str,
-    addr: &str,
-    seq: u64,
-    actions: Vec<ExternalKvAction>,
-) -> ApplyExternalKvBatchRequest {
-    ApplyExternalKvBatchRequest {
-        worker_id: worker.to_string(),
-        seq,
-        actions,
-        worker_address: addr.to_string(),
-        incarnation: String::new(),
     }
 }
 
@@ -787,13 +754,7 @@ async fn deferred_backend_connects_lazily_and_serves() {
         eprintln!("skipping deferred_backend_connects_lazily_and_serves: set KV_INDEXER_REDIS_URL");
         return;
     };
-    let ns = format!(
-        "itest:deferred_serves:{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let ns = format!("itest:deferred_serves:{}", nanos());
     // Construction never touches the network.
     let b = RedisKvIndexerBackend::connect_single_deferred(&url, ns);
     // First use lazily establishes the connection and succeeds.

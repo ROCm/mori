@@ -9,6 +9,9 @@
 //! No Redis required: the capturing backend implements `KvIndexerBackend`
 //! directly, so this runs in the default `cargo test`.
 
+#[path = "common/net.rs"]
+mod test_net;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +27,7 @@ use sglang_kv_indexer::pb::{
     GetExternalKvHitCountsResponse, MatchExternalKvRequest, MatchExternalKvResponse,
 };
 use sglang_kv_indexer::{KvIndexerBackend, KvIndexerService};
+use test_net::free_addr;
 
 /// gRPC backend that just records the seq of every applied batch, in order.
 #[derive(Clone, Default)]
@@ -95,13 +99,6 @@ fn reply_frame(peer: Bytes, seq: i64, payload: Vec<u8>) -> ZmqMessage {
     m.push_back(Bytes::copy_from_slice(&seq.to_be_bytes()));
     m.push_back(Bytes::from(payload));
     m
-}
-
-fn free_addr() -> std::net::SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
 }
 
 #[tokio::test]
