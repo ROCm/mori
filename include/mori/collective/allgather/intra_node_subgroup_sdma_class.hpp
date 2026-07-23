@@ -43,18 +43,6 @@
 namespace mori {
 namespace collective {
 
-// EVENT-SCOPED finish_sync copy-OUT (MORI_INTRA_EVENT_SYNC, default on): scopes
-// the host stall to the SDMA copy (private stream + copy-done event) instead of
-// draining the whole caller stream. =0 restores the full-stream drain.
-inline bool IntraEventSync() {
-  static const bool on = []() {
-    const char* e = std::getenv("MORI_INTRA_EVENT_SYNC");
-    if (e == nullptr) return true;
-    return std::atoi(e) != 0;
-  }();
-  return on;
-}
-
 class IntraNodeSubGroupAllgatherSdma {
  private:
   int myPe_;
@@ -83,7 +71,7 @@ class IntraNodeSubGroupAllgatherSdma {
   CclAllgatherSubGroupArgs<uint32_t> jit_args_;
   CclAllgatherSubGroupParamContiguousArgs<uint32_t> jit_args_pc_;
 
-  // MORI_INTRA_EVENT_SYNC scratch (lazily created, null in the default path):
+  // Event-scoped copy-OUT scratch (lazily created on first finish_sync):
   // copy_stream_ carries the copy-OUT, gather_ev_ orders it after the gather,
   // copy_ev_ is what the host waits on.
   hipStream_t copy_stream_ = nullptr;
@@ -414,33 +402,24 @@ class IntraNodeSubGroupAllgatherSdma {
   // deferrable to the next inter-ring prepare_sync barrier. Default true.
   double finish_sync(uintptr_t output, size_t count_u32, hipStream_t stream, bool barrier = true) {
     size_t total = static_cast<size_t>(groupSize_) * count_u32 * sizeof(uint32_t);
-    if (IntraEventSync()) {
-      // EVENT-SCOPED path: copy-OUT on a private stream ordered after the gather
-      // (gather_ev_); host waits only on the copy-done event, scoping the stall to
-      // gather+copy, not the whole caller stream.
-      ensure_event_sync_scratch();
-      (void)hipEventRecord(gather_ev_, stream);
-      (void)hipStreamWaitEvent(copy_stream_, gather_ev_, 0);
-      (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
-                           copy_stream_);
-      (void)hipEventRecord(copy_ev_, copy_stream_);
-      (void)hipStreamWaitEvent(stream, copy_ev_, 0);
-      // Host-wait only when a host ShmemBarrierAll follows (barrier=true): the
-      // copy must land before the cross-PE rendezvous. Hot path skips it.
-      if (barrier) {
-        (void)hipEventSynchronize(copy_ev_);
-      }
-      if (barrier) shmem::ShmemBarrierAll();
-      return 0.0;
-    }
+    // EVENT-SCOPED path: copy-OUT on a private stream ordered after the gather
+    // (gather_ev_); host waits only on the copy-done event, scoping the stall to
+    // gather+copy, not the whole caller stream.
+    ensure_event_sync_scratch();
+    (void)hipEventRecord(gather_ev_, stream);
+    (void)hipStreamWaitEvent(copy_stream_, gather_ev_, 0);
     (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
-                         stream);
-    (void)hipStreamSynchronize(stream);
+                         copy_stream_);
+    (void)hipEventRecord(copy_ev_, copy_stream_);
+    (void)hipStreamWaitEvent(stream, copy_ev_, 0);
+    // Host-wait only when a host ShmemBarrierAll follows (barrier=true): the
+    // copy must land before the cross-PE rendezvous. Hot path skips it.
+    if (barrier) {
+      (void)hipEventSynchronize(copy_ev_);
+    }
     if (barrier) shmem::ShmemBarrierAll();
     return 0.0;
   }
-
-  int npes() const { return npes_; }
 
   // Expose out_ so a caller can do the Phase-B copy-OUT with a COMPUTE-UNIT
   // kernel (torch elementwise) instead of the copy engine. The SDMA receiver's

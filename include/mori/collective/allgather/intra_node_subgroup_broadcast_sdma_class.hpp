@@ -163,7 +163,6 @@ class IntraNodeSubGroupBroadcastSdma {
     return 0.0;
   }
 
-  int npes() const { return npes_; }
 };
 
 }  // namespace collective
