@@ -1041,11 +1041,11 @@ class HierAllGather:
                         # Standalone deferral: the device completion reader spins until
                         # every remote push landed + threadfence, so output is stream-
                         # correct without it; reuse covered by the successor's prepare.
-                        _crown_fin_barrier = not self.slice_defer_fin
+                        _fin_barrier = not self.slice_defer_fin
                         if self._standalone_defer_fin:
-                            _crown_fin_barrier = False
+                            _fin_barrier = False
                         self._intra.finish_direct_stream(
-                            stream=stream, barrier=_crown_fin_barrier
+                            stream=stream, barrier=_fin_barrier
                         )
                     elif self.fuse_local and not entry_barrier:
                         # Fused ring || local-block gather in one launch. The ring's

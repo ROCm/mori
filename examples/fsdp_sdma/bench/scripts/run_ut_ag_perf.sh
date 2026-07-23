@@ -3,7 +3,7 @@
 # switch presets for the mori device (ibgda_sdma) handle:
 #
 #   perf : standalone_fast fan-out + all tuning knobs (MORI_HIER_UT_FAST=1 +
-#          CROWN + DEEP_PIPE=auto + SDMA_NUM_CHANNELS=8 + NIC_NUMA_LOCAL,
+#          DEEP_PIPE=auto + SDMA_NUM_CHANNELS=8 + NIC_NUMA_LOCAL,
 #          debug_sync OFF). Fast but not E2E-legal: the E2E FSDP adapter never
 #          constructs HierAllGather with standalone_fast.
 #
@@ -30,7 +30,7 @@ FUSE="MORI_HIER_FUSE_LOCAL=1 MORI_HIER_FUSE_REMOTE=1 MORI_HIER_LOCAL_PUSHONLY=1"
 
 case "$PRESET" in
   perf) ENVSET="MORI_ENABLE_SDMA=1 $FUSE MORI_HIER_UT_FAST=1 MORI_HIER_DEBUG_SYNC=0 \
-MORI_HIER_CROWN=1 MORI_HIER_DEEP_PIPE=auto MORI_SDMA_NUM_CHANNELS=8 MORI_HIER_NIC_NUMA_LOCAL=1" ;;
+MORI_HIER_DEEP_PIPE=auto MORI_SDMA_NUM_CHANNELS=8 MORI_HIER_NIC_NUMA_LOCAL=1" ;;
   e2e)  ENVSET="MORI_ENABLE_SDMA=1 $FUSE MORI_HIER_UT_FAST=0 MORI_HIER_DEBUG_SYNC=1 MORI_HIER_CUDA_GRAPH=0" ;;
   *) echo "preset must be perf|e2e"; exit 2 ;;
 esac
