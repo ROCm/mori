@@ -593,6 +593,24 @@ class EpDispatchCombineOp:
             return max(base, tile)
         return base
 
+    def _intranode_dispatch_kernel(self, sfx, stdmoe=False):
+        """Runtime selection between the NOTIFY/CNT2 and LEGACY IntraNode dispatch
+        kernels. Both symbols are always compiled into the module; the MORI_DISP_NOTIFY
+        env picks which one to launch (default: legacy). Geometry/shared-mem are the
+        same for both (see _dispatch_shared_mem)."""
+        batch = os.environ.get("MORI_DISP_BATCH", "").lower() in ("1", "true", "on", "yes")
+        notify = os.environ.get("MORI_DISP_NOTIFY", "").lower() in ("1", "true", "on", "yes")
+        if batch:
+            base = "EpDispatchIntraNodeBatchKernel"
+        elif notify:
+            base = "EpDispatchIntraNodeNotifyKernel"
+        else:
+            base = "EpDispatchIntraNodeKernel"
+        name = f"{base}_{sfx}"
+        if stdmoe:
+            name += "_stdmoe"
+        return name
+
     def _combine_shared_mem(self, warp_per_block, use_weights=True):
         """Shared memory for combine kernels."""
         quant_type = _normalize_quant_type(self.config.quant_type)
@@ -862,7 +880,7 @@ class EpDispatchCombineOp:
             )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
             self._launch(
-                f"EpDispatchIntraNodeKernel_{sfx}",
+                self._intranode_dispatch_kernel(sfx),
                 grid,
                 block,
                 shared_mem,
@@ -1499,7 +1517,7 @@ class EpDispatchCombineOp:
             )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
             self._launch(
-                f"EpDispatchIntraNodeKernel_{sfx}_stdmoe",
+                self._intranode_dispatch_kernel(sfx, stdmoe=True),
                 grid,
                 block,
                 shared_mem,

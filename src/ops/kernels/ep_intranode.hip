@@ -2,9 +2,19 @@
 #include "src/ops/kernels/ep_common.hip"
 MORI_DEFINE_GPU_STATES
 
-// Dispatch
+// Dispatch (LEGACY: cross-GPU returning atomic slot assignment)
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeKernel, , false)
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeKernel, _stdmoe, true)
+
+// Dispatch (NOTIFY/CNT2: count + parity-signal exchange/prefix + local slot atomic).
+// Selected at runtime by the host launcher; both symbols are always compiled.
+WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeNotifyKernel, , false)
+WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeNotifyKernel, _stdmoe, true)
+
+// Dispatch (BATCH: block-local exact count + one remote fetch_add(N) per destPe + local
+// slot distribution + clean 1D TDM). Runtime-selected via MORI_DISP_BATCH.
+WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeBatchKernel, , false)
+WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeBatchKernel, _stdmoe, true)
 
 // Dispatch Low Lantency (SMALL TOKEN)
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeLLKernel, , false)

@@ -293,14 +293,6 @@ def _disp_tdm_defines() -> list[str]:
     return ["-DMORI_DISP_TDM"] if val.lower() in ("1", "true", "on", "yes") else []
 
 
-def _disp_notify_defines() -> list[str]:
-    """Experimental: -DMORI_DISP_NOTIFY switches the EP IntraNode dispatch to the
-    NOTIFY-based slot pre-assignment (2-pass count-exchange + local slot atomic,
-    no per-token cross-GPU atomic). Gated by the MORI_DISP_NOTIFY env."""
-    val = os.environ.get("MORI_DISP_NOTIFY", "")
-    return ["-DMORI_DISP_NOTIFY"] if val.lower() in ("1", "true", "on", "yes") else []
-
-
 def _disp_timing_defines() -> list[str]:
     """Diagnostic: -DMORI_DISP_TIMING enables in-kernel wall_clock64 breakdown of
     the EP IntraNode dispatch (NOTIFY phase costs / legacy per-token remote-atomic
@@ -448,14 +440,17 @@ def _hipcc_genco(
         *_profiler_defines(),
         *_ocp_fp_defines(cfg.arch),
         *_disp_tdm_defines(),
-        *_disp_notify_defines(),
-        *(["-DMORI_DISP_NOTIFY_CNT2"]
-          if os.environ.get("MORI_DISP_NOTIFY_CNT2", "").lower() in ("1", "true", "on", "yes")
-          else []),
-        *([f"-DMORI_CNT_STEP={os.environ['MORI_CNT_STEP']}"]
-          if os.environ.get("MORI_CNT_STEP", "").strip().isdigit()
-          else []),
+        # NOTE: MORI_DISP_NOTIFY / MORI_DISP_NOTIFY_CNT2 are no longer compile-time
+        # defines. Both the NOTIFY/CNT2 and LEGACY IntraNode dispatch kernels are now
+        # always compiled; the host launcher selects between them at runtime via the
+        # MORI_DISP_NOTIFY env (see dispatch_combine.py / launch.cpp).
         *_disp_timing_defines(),
+        # Experimental: -DMORI_DISP_PERTOK switches the BATCH dispatch Phase1/Phase3 to
+        # a PER-TOKEN warp doing 1 load : N store (load token once, store to each distinct
+        # destPe) -- amortizes the load like all-to-all. Gated by MORI_DISP_PERTOK env.
+        *(["-DMORI_DISP_PERTOK"]
+          if os.environ.get("MORI_DISP_PERTOK", "").lower() in ("1", "true", "on", "yes")
+          else []),
     ]
 
     for d in include_dirs:
