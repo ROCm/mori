@@ -460,9 +460,8 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
            sizeof(remote_handle.eth.mac));
     DEVX_SET(qpc, qpc, primary_address_path.hop_limit, 64);
     DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, local_handle.eth.gidIdx);
-    // UDP sport: default to a single fixed RoCEv2 sport (== lid|0xC000 on RoCE).
-    // MORI_MLX5_ENABLE_UDP_SPORT=1 rotates per-qpId (GetUdpSport) to spread QPs
-    // across ECMP paths; the default pins all QPs of a NIC to one path.
+    // UDP sport: default to a single fixed RoCEv2 sport (== 0xC000 on RoCE).
+    // MORI_MLX5_ENABLE_UDP_SPORT=1 rotates per-qpId (GetUdpSport) for ECMP spread.
     static const bool enableUdpSport = []() {
       const char* e = std::getenv("MORI_MLX5_ENABLE_UDP_SPORT");
       return e != nullptr && std::atoi(e) != 0;

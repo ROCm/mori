@@ -182,8 +182,7 @@ inline __device__ void VmmLookupRemote(uintptr_t addr, int pe, uintptr_t& out_ra
 
   out_raddr = heapObj->peerPtrs[pe] + offsetFromHeapBase;
 
-  application::VMMChunkKey chunkKey = heapObj->vmmRkeyInfo[chunkIdx * heapObj->worldSize + pe];
-  out_rkey = chunkKey.key;
+  out_rkey = heapObj->vmmRkeyInfo[chunkIdx * heapObj->worldSize + pe].key;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -290,8 +289,8 @@ inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
       const int opcode = core::PollCq<core::ProviderType::PSD>(cqHandle.cqAddr, cqHandle.cqeNum,
                                                                &myCqPos, &wqeCounter);
       if (opcode > 0) {
-        printf("[QUIET-ERR] rank %d dest pe %d qpId %d consIdx %d wcStatus %d\n",
-               globalGpuStates->rank, pe, qpId, myCqPos, opcode);
+        MORI_PRINTF("rank %d dest pe %d consIdx %d opcode %d\n", globalGpuStates->rank, pe, myCqPos,
+                    opcode);
         assert(false);
       }
       asm volatile("" ::: "memory");
@@ -361,14 +360,6 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
         (reinterpret_cast<volatile uint8_t*>(cq.cqAddr)[sizeof(core::Mlx5Cqe64) - 1]) >> 4;
     if (opcode == core::MORI_MLX5_CQE_REQ_ERR || opcode == core::MORI_MLX5_CQE_RESP_ERR) {
       auto error = core::Mlx5HandleErrorCqe(reinterpret_cast<core::Mlx5ErrCqe*>(cq.cqAddr));
-      // Dual-rail DIAG: unconditional (not MORI_PRINTF) so the rail-2
-      // transport error status is visible without a debug rebuild. This pins the
-      // remaining dual-rail layer: "remote access"/"local prot" => key/addr
-      // (VMM MR fix incomplete); "retry exceeded" => rail-2 QP connection/GID
-      // reachability (context.cpp ConnectEndpoint on device2). Fires only on an
-      // actual error CQE, which never happens on the single-rail default path.
-      printf("[RAIL-ERR] rank %d opcode %d wcStatus %s\n", GetGlobalGpuStatesPtr()->rank,
-             (int)opcode, core::WcStatusString(error));
       MORI_PRINTF("(%s:%d) collapsed CQE error: %s\n", __FILE__, __LINE__,
                   core::WcStatusString(error));
       assert(false);
@@ -495,8 +486,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  int localQp = qpId % globalGpuStates->numQpPerPe;
-  int epIndex = pe * globalGpuStates->numQpPerPe + localQp;
+  int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
   uint32_t qpn = ep[epIndex].qpn;
@@ -875,8 +865,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  int localQp = qpId % globalGpuStates->numQpPerPe;
-  int epIndex = pe * globalGpuStates->numQpPerPe + localQp;
+  int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
   uint32_t qpn = ep[epIndex].qpn;
@@ -1929,9 +1918,9 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelAddrImpl(const void* dest, 
     } while (db_touched != warp_sq_counter);
 
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-    // __threadfence_system;
+    // __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
-    // __threadfence_system;
+    // __threadfence_system();
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
@@ -2635,8 +2624,7 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  int localQp = qpId % globalGpuStates->numQpPerPe;
-  int epIndex = pe * globalGpuStates->numQpPerPe + localQp;
+  int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
   uint32_t qpn = ep[epIndex].qpn;
@@ -2850,8 +2838,7 @@ inline __device__ void ShmemGetMemNbiThreadKernelAddrImpl(void* dest, const void
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  int localQp = qpId % globalGpuStates->numQpPerPe;
-  int epIndex = pe * globalGpuStates->numQpPerPe + localQp;
+  int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
   uint32_t qpn = ep[epIndex].qpn;

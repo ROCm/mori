@@ -591,6 +591,7 @@ void GpuStateInit(ShmemStates* states) {
   states->gpuStates.rank = states->bootStates->rank;
   states->gpuStates.worldSize = states->bootStates->worldSize;
   states->gpuStates.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
+
   // Copy communication metadata to GPU
   CopyTransportTypesToGpu(states);
   CopyRdmaEndpointsToGpu(states);
