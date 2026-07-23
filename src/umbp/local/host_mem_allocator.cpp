@@ -208,9 +208,9 @@ void ApplyPostMappingPolicies(HostBufferHandle& handle, const HostBufferOptions&
   }
 
   if (opts.prefault) {
-    const size_t stride = handle.actual_backing == HostBufferBacking::kAnonymousHugetlb
-                              ? handle.actual_alignment
-                              : GetPageSize();
+    const bool is_hugetlb = handle.actual_backing == HostBufferBacking::kAnonymousHugetlb ||
+                            handle.actual_backing == HostBufferBacking::kAnonymousShmHugetlb;
+    const size_t stride = is_hugetlb ? handle.actual_alignment : GetPageSize();
     PrefaultPages(handle.ptr, handle.mapped_size, stride);
   }
 }
@@ -297,6 +297,90 @@ HostBufferHandle AllocAnonymousShm(size_t size, const HostBufferOptions& opts) {
   return handle;
 }
 
+// MFD_HUGE_*/MAP_HUGE_* share the same bit-shift encoding, so
+// TryBuildHugepageFlags() covers both calls below. Falls back to
+// AllocAnonymousShm, not AllocAnonymousHugetlb's AllocAnonymous, so
+// fd-handoff still works if hugepages are unavailable.
+HostBufferHandle AllocAnonymousShmHugetlb(size_t size, const HostBufferOptions& opts) {
+  HostBufferHandle handle;
+  if (size == 0) return handle;
+  if (!IsPowerOfTwo(opts.hugepage_size)) {
+    MORI_UMBP_WARN(
+        "HostMemAllocator: invalid hugepage_size={}; falling back to AnonymousShm (4 KiB pages)",
+        opts.hugepage_size);
+    HostBufferOptions fallback = opts;
+    fallback.backing = HostBufferBacking::kAnonymousShm;
+    return AllocAnonymousShm(size, fallback);
+  }
+
+  const std::optional<size_t> mapped_size = AlignUpChecked(size, opts.hugepage_size);
+  if (!mapped_size.has_value()) return handle;
+
+#if !defined(MFD_HUGETLB) || !defined(MAP_HUGETLB)
+  LogHugepageFallbackOnce(size, opts.hugepage_size, ENOTSUP);
+  HostBufferOptions fallback = opts;
+  fallback.backing = HostBufferBacking::kAnonymousShm;
+  return AllocAnonymousShm(size, fallback);
+#else
+  int hugepage_flags = 0;
+  if (!TryBuildHugepageFlags(opts.hugepage_size, &hugepage_flags)) {
+    MORI_UMBP_WARN(
+        "HostMemAllocator: cannot encode hugepage_size={} with this libc/kernel header set; "
+        "falling back to AnonymousShm (4 KiB pages)",
+        opts.hugepage_size);
+    HostBufferOptions fallback = opts;
+    fallback.backing = HostBufferBacking::kAnonymousShm;
+    return AllocAnonymousShm(size, fallback);
+  }
+
+  const int fd =
+      MemfdCreate("umbp_host_buffer_hugetlb", MFD_CLOEXEC | MFD_HUGETLB | hugepage_flags);
+  if (fd < 0) {
+    LogHugepageFallbackOnce(size, opts.hugepage_size, errno);
+    HostBufferOptions fallback = opts;
+    fallback.backing = HostBufferBacking::kAnonymousShm;
+    return AllocAnonymousShm(size, fallback);
+  }
+
+  if (ftruncate(fd, static_cast<off_t>(*mapped_size)) != 0) {
+    const int err = errno;
+    MORI_UMBP_WARN("HostMemAllocator: ftruncate(hugetlb memfd, {}) failed ({}: {})", *mapped_size,
+                   err, std::strerror(err));
+    close(fd);
+    HostBufferOptions fallback = opts;
+    fallback.backing = HostBufferBacking::kAnonymousShm;
+    return AllocAnonymousShm(size, fallback);
+  }
+
+  void* ptr = mmap(nullptr, *mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_HUGETLB, fd, 0);
+  if (ptr == MAP_FAILED) {
+    LogHugepageFallbackOnce(size, opts.hugepage_size, errno);
+    close(fd);
+    HostBufferOptions fallback = opts;
+    fallback.backing = HostBufferBacking::kAnonymousShm;
+    return AllocAnonymousShm(size, fallback);
+  }
+
+  handle.ptr = ptr;
+  handle.requested_size = size;
+  handle.mapped_size = *mapped_size;
+  handle.actual_backing = HostBufferBacking::kAnonymousShmHugetlb;
+  handle.actual_alignment = opts.hugepage_size;
+
+  {
+    std::lock_guard<std::mutex> lock(ShmRegistryMutex());
+    ShmAllocRecord record;
+    record.fd = fd;
+    record.size = *mapped_size;
+    record.active_registrations = 0;
+    ShmRegistry()[ptr] = record;
+  }
+
+  ApplyPostMappingPolicies(handle, opts);
+  return handle;
+#endif
+}
+
 HostBufferHandle AllocAnonymousHugetlb(size_t size, const HostBufferOptions& opts) {
   HostBufferHandle handle;
   if (size == 0) return handle;
@@ -357,6 +441,8 @@ HostBufferHandle HostMemAllocator::Alloc(size_t size, const HostBufferOptions& o
       return AllocAnonymousHugetlb(size, opts);
     case HostBufferBacking::kAnonymousShm:
       return AllocAnonymousShm(size, opts);
+    case HostBufferBacking::kAnonymousShmHugetlb:
+      return AllocAnonymousShmHugetlb(size, opts);
     default:
       return {};
   }
@@ -369,7 +455,8 @@ void HostMemAllocator::Free(HostBufferHandle& handle) {
   size_t size_to_unmap = handle.mapped_size;
   bool defer_unmap = false;
   int fd_to_close = -1;
-  if (handle.actual_backing == HostBufferBacking::kAnonymousShm) {
+  if (handle.actual_backing == HostBufferBacking::kAnonymousShm ||
+      handle.actual_backing == HostBufferBacking::kAnonymousShmHugetlb) {
     std::lock_guard<std::mutex> lock(ShmRegistryMutex());
     auto it = ShmRegistry().find(handle.ptr);
     if (it != ShmRegistry().end()) {

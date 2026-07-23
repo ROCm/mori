@@ -43,6 +43,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .value("Anonymous", HostBufferBacking::kAnonymous)
       .value("AnonymousHugetlb", HostBufferBacking::kAnonymousHugetlb)
       .value("AnonymousShm", HostBufferBacking::kAnonymousShm)
+      .value("AnonymousShmHugetlb", HostBufferBacking::kAnonymousShmHugetlb)
       .export_values();
 
   py::class_<HostBufferHandle>(m, "UMBPHostBufferHandle")
