@@ -228,3 +228,13 @@ add_executable(test_cache_remote_admission test_cache_remote_admission.cpp)
 target_link_libraries(test_cache_remote_admission PRIVATE umbp_common
                                                           GTest::gtest_main)
 gtest_discover_tests(test_cache_remote_admission)
+
+# ---------------------------------------------------------------------------
+# test_standalone_shm_ipc — memfd-backed host allocator registry plus raw UDS
+# fd handoff used by standalone-process mode.
+# ---------------------------------------------------------------------------
+add_executable(test_standalone_shm_ipc test_standalone_shm_ipc.cpp)
+target_link_libraries(test_standalone_shm_ipc PRIVATE umbp_common
+                                                      GTest::gtest_main)
+target_compile_features(test_standalone_shm_ipc PRIVATE cxx_std_17)
+gtest_discover_tests(test_standalone_shm_ipc)

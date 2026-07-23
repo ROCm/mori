@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "umbp/local/host_mem_allocator.h"
 
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -33,6 +34,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -44,6 +46,47 @@ namespace mori::umbp {
 namespace {
 
 constexpr size_t kDefaultPageSize = 4096;
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
+struct ShmAllocRecord {
+  int fd = -1;
+  size_t size = 0;
+  size_t active_registrations = 0;
+  bool pending_free = false;
+};
+
+std::mutex& ShmRegistryMutex() {
+  static std::mutex mu;
+  return mu;
+}
+
+std::map<void*, ShmAllocRecord>& ShmRegistry() {
+  static std::map<void*, ShmAllocRecord> registry;
+  return registry;
+}
+
+#ifdef __linux__
+int MemfdCreate(const char* name, unsigned int flags) {
+#if defined(__NR_memfd_create)
+  return static_cast<int>(syscall(__NR_memfd_create, name, flags));
+#else
+  (void)name;
+  (void)flags;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+#else
+int MemfdCreate(const char* name, unsigned int flags) {
+  (void)name;
+  (void)flags;
+  errno = ENOSYS;
+  return -1;
+}
+#endif
 
 size_t GetPageSize() {
   const long page = sysconf(_SC_PAGESIZE);
@@ -203,6 +246,57 @@ HostBufferHandle AllocAnonymous(size_t size, const HostBufferOptions& opts) {
   return handle;
 }
 
+HostBufferHandle AllocAnonymousShm(size_t size, const HostBufferOptions& opts) {
+  HostBufferHandle handle;
+  if (size == 0) return handle;
+
+  const size_t page_size = GetPageSize();
+  const std::optional<size_t> mapped_size = AlignUpChecked(size, page_size);
+  if (!mapped_size.has_value()) return handle;
+
+  const int fd = MemfdCreate("umbp_host_buffer", MFD_CLOEXEC);
+  if (fd < 0) {
+    const int err = errno;
+    MORI_UMBP_WARN("HostMemAllocator: memfd_create failed ({}: {})", err, std::strerror(err));
+    return handle;
+  }
+
+  if (ftruncate(fd, static_cast<off_t>(*mapped_size)) != 0) {
+    const int err = errno;
+    MORI_UMBP_WARN("HostMemAllocator: ftruncate(memfd, {}) failed ({}: {})", *mapped_size, err,
+                   std::strerror(err));
+    close(fd);
+    return handle;
+  }
+
+  void* ptr = mmap(nullptr, *mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (ptr == MAP_FAILED) {
+    const int err = errno;
+    MORI_UMBP_WARN("HostMemAllocator: mmap(memfd, {}) failed ({}: {})", *mapped_size, err,
+                   std::strerror(err));
+    close(fd);
+    return handle;
+  }
+
+  handle.ptr = ptr;
+  handle.requested_size = size;
+  handle.mapped_size = *mapped_size;
+  handle.actual_backing = HostBufferBacking::kAnonymousShm;
+  handle.actual_alignment = page_size;
+
+  {
+    std::lock_guard<std::mutex> lock(ShmRegistryMutex());
+    ShmAllocRecord record;
+    record.fd = fd;
+    record.size = *mapped_size;
+    record.active_registrations = 0;
+    ShmRegistry()[ptr] = record;
+  }
+
+  ApplyPostMappingPolicies(handle, opts);
+  return handle;
+}
+
 HostBufferHandle AllocAnonymousHugetlb(size_t size, const HostBufferOptions& opts) {
   HostBufferHandle handle;
   if (size == 0) return handle;
@@ -261,6 +355,8 @@ HostBufferHandle HostMemAllocator::Alloc(size_t size, const HostBufferOptions& o
       return AllocAnonymous(size, opts);
     case HostBufferBacking::kAnonymousHugetlb:
       return AllocAnonymousHugetlb(size, opts);
+    case HostBufferBacking::kAnonymousShm:
+      return AllocAnonymousShm(size, opts);
     default:
       return {};
   }
@@ -269,21 +365,122 @@ HostBufferHandle HostMemAllocator::Alloc(size_t size, const HostBufferOptions& o
 void HostMemAllocator::Free(HostBufferHandle& handle) {
   if (!handle.valid()) return;
 
-  if (munmap(handle.ptr, handle.mapped_size) != 0) {
-    const int err = errno;
-    MORI_UMBP_WARN(
-        "HostMemAllocator: munmap failed ({}: {}); invalidating handle anyway "
-        "to prevent a possible double-free of a reused VA range",
-        err, std::strerror(err));
-    // Fall through to invalidation below: keeping a stale-but-valid handle
-    // would let the next Free() munmap an address the kernel may have
-    // already handed back to a later mmap().  Accepting a small leak on
-    // the (already-rare) munmap-failure path is the lesser evil.
+  void* ptr_to_unmap = handle.ptr;
+  size_t size_to_unmap = handle.mapped_size;
+  bool defer_unmap = false;
+  int fd_to_close = -1;
+  if (handle.actual_backing == HostBufferBacking::kAnonymousShm) {
+    std::lock_guard<std::mutex> lock(ShmRegistryMutex());
+    auto it = ShmRegistry().find(handle.ptr);
+    if (it != ShmRegistry().end()) {
+      if (it->second.active_registrations > 0) {
+        MORI_UMBP_WARN(
+            "HostMemAllocator: freeing AnonymousShm buffer ptr={} while {} active registration(s) "
+            "still reference it; deferring munmap/close until deregistration",
+            handle.ptr, it->second.active_registrations);
+        it->second.pending_free = true;
+        defer_unmap = true;
+      } else {
+        fd_to_close = it->second.fd;
+        ShmRegistry().erase(it);
+      }
+    }
   }
 
   handle.ptr = nullptr;
   handle.requested_size = 0;
   handle.mapped_size = 0;
+
+  if (defer_unmap) return;
+
+  if (munmap(ptr_to_unmap, size_to_unmap) != 0) {
+    const int err = errno;
+    MORI_UMBP_WARN(
+        "HostMemAllocator: munmap failed ({}: {}); invalidating handle anyway "
+        "to prevent a possible double-free of a reused VA range",
+        err, std::strerror(err));
+    // Keeping a stale-but-valid handle would let the next Free() munmap an
+    // address the kernel may have already handed back to a later mmap().
+  }
+
+  if (fd_to_close >= 0) close(fd_to_close);
+}
+
+std::optional<HostMemAllocator::ShmAllocation> HostMemAllocator::LookupShmAllocation(uintptr_t ptr,
+                                                                                     size_t size) {
+  if (ptr == 0 || size == 0) return std::nullopt;
+  if (ptr > std::numeric_limits<uintptr_t>::max() - (size - 1)) return std::nullopt;
+
+  std::lock_guard<std::mutex> lock(ShmRegistryMutex());
+  auto& registry = ShmRegistry();
+  auto it = registry.upper_bound(reinterpret_cast<void*>(ptr));
+  if (it == registry.begin()) return std::nullopt;
+  --it;
+
+  uintptr_t base = reinterpret_cast<uintptr_t>(it->first);
+  uintptr_t end = base + it->second.size;
+  uintptr_t req_end = ptr + size;
+  if (ptr < base || req_end > end || it->second.fd < 0 || it->second.pending_free) {
+    return std::nullopt;
+  }
+
+  ShmAllocation allocation;
+  allocation.base = it->first;
+  allocation.mapped_size = it->second.size;
+  allocation.fd = it->second.fd;
+  return allocation;
+}
+
+std::optional<HostMemAllocator::ShmAllocation> HostMemAllocator::AcquireShmAllocation(uintptr_t ptr,
+                                                                                      size_t size) {
+  if (ptr == 0 || size == 0) return std::nullopt;
+  if (ptr > std::numeric_limits<uintptr_t>::max() - (size - 1)) return std::nullopt;
+
+  std::lock_guard<std::mutex> lock(ShmRegistryMutex());
+  auto& registry = ShmRegistry();
+  auto it = registry.upper_bound(reinterpret_cast<void*>(ptr));
+  if (it == registry.begin()) return std::nullopt;
+  --it;
+
+  uintptr_t base = reinterpret_cast<uintptr_t>(it->first);
+  uintptr_t end = base + it->second.size;
+  uintptr_t req_end = ptr + size;
+  if (ptr < base || req_end > end || it->second.fd < 0 || it->second.pending_free) {
+    return std::nullopt;
+  }
+
+  ++it->second.active_registrations;
+  ShmAllocation allocation;
+  allocation.base = it->first;
+  allocation.mapped_size = it->second.size;
+  allocation.fd = it->second.fd;
+  return allocation;
+}
+
+void HostMemAllocator::ReleaseShmAllocation(uintptr_t base_ptr) {
+  void* ptr_to_unmap = nullptr;
+  size_t size_to_unmap = 0;
+  int fd_to_close = -1;
+  {
+    std::lock_guard<std::mutex> lock(ShmRegistryMutex());
+    auto it = ShmRegistry().find(reinterpret_cast<void*>(base_ptr));
+    if (it == ShmRegistry().end()) return;
+    if (it->second.active_registrations > 0) --it->second.active_registrations;
+    if (it->second.active_registrations == 0 && it->second.pending_free) {
+      ptr_to_unmap = it->first;
+      size_to_unmap = it->second.size;
+      fd_to_close = it->second.fd;
+      ShmRegistry().erase(it);
+    }
+  }
+
+  if (ptr_to_unmap) {
+    if (munmap(ptr_to_unmap, size_to_unmap) != 0) {
+      const int err = errno;
+      MORI_UMBP_WARN("HostMemAllocator: deferred munmap failed ({}: {})", err, std::strerror(err));
+    }
+    if (fd_to_close >= 0) close(fd_to_close);
+  }
 }
 
 }  // namespace mori::umbp

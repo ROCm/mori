@@ -652,6 +652,14 @@ class CMakeBuild(build_ext):
         elif umbp_master_dst.exists():
             umbp_master_dst.unlink()
 
+        umbp_standalone_src = build_dir / "src/umbp/umbp_standalone_server"
+        umbp_standalone_dst = root_dir / "python/mori/umbp_standalone_server"
+        if umbp_standalone_src.exists():
+            shutil.copyfile(umbp_standalone_src, umbp_standalone_dst)
+            os.chmod(umbp_standalone_dst, 0o700)
+        elif umbp_standalone_dst.exists():
+            umbp_standalone_dst.unlink()
+
         # CCO C++ examples: ship the built binaries when BUILD_EXAMPLES=ON. They
         # carry an $ORIGIN/../.. rpath (set in examples/CMakeLists.txt) so they
         # resolve libmori_*.so from site-packages/mori/ once installed here.
@@ -817,6 +825,7 @@ mori_package_data = [
     "libmori_metrics.so",
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
     "umbp_master",
+    "umbp_standalone_server",
     "_jit-sources/include/**/*.hpp",
     "_jit-sources/include/**/*.h",
     "_jit-sources/include/**/*.cuh",

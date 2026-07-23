@@ -42,6 +42,7 @@ void RegisterMoriUmbp(py::module_& m) {
   py::enum_<HostBufferBacking>(m, "UMBPHostBufferBacking")
       .value("Anonymous", HostBufferBacking::kAnonymous)
       .value("AnonymousHugetlb", HostBufferBacking::kAnonymousHugetlb)
+      .value("AnonymousShm", HostBufferBacking::kAnonymousShm)
       .export_values();
 
   py::class_<HostBufferHandle>(m, "UMBPHostBufferHandle")
@@ -113,6 +114,12 @@ void RegisterMoriUmbp(py::module_& m) {
       .value("Standalone", UMBPRole::Standalone)
       .value("SharedSSDLeader", UMBPRole::SharedSSDLeader)
       .value("SharedSSDFollower", UMBPRole::SharedSSDFollower)
+      .export_values();
+
+  py::enum_<UMBPDeploymentMode>(m, "UMBPDeploymentMode")
+      .value("Local", UMBPDeploymentMode::Local)
+      .value("StandaloneProcess", UMBPDeploymentMode::StandaloneProcess)
+      .value("Distributed", UMBPDeploymentMode::Distributed)
       .export_values();
 
   py::enum_<UMBPSsdLayoutMode>(m, "UMBPSsdLayoutMode")
@@ -228,6 +235,15 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("admission_max_block_bytes", &UMBPDistributedConfig::admission_max_block_bytes)
       .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size);
 
+  py::class_<UMBPStandaloneProcessConfig>(m, "UMBPStandaloneProcessConfig")
+      .def(py::init<>())
+      .def_readwrite("address", &UMBPStandaloneProcessConfig::address)
+      .def_readwrite("auto_start", &UMBPStandaloneProcessConfig::auto_start)
+      .def_readwrite("startup_timeout_ms", &UMBPStandaloneProcessConfig::startup_timeout_ms)
+      .def_readwrite("worker_node_id", &UMBPStandaloneProcessConfig::worker_node_id)
+      .def_readwrite("worker_node_address", &UMBPStandaloneProcessConfig::worker_node_address)
+      .def_readwrite("tags", &UMBPStandaloneProcessConfig::tags);
+
   py::class_<UMBPConfig>(m, "UMBPConfig")
       .def(py::init<>())
       .def_static("from_environment", &UMBPConfig::FromEnvironment)
@@ -238,7 +254,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("role", &UMBPConfig::role)
       .def_readwrite("follower_mode", &UMBPConfig::follower_mode)
       .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write)
-      .def_readwrite("distributed", &UMBPConfig::distributed);
+      .def_readwrite("distributed", &UMBPConfig::distributed)
+      .def_readwrite("standalone_process", &UMBPConfig::standalone_process);
 
   py::class_<IUMBPClient, std::unique_ptr<IUMBPClient>>(m, "UMBPClient")
       .def(py::init([](const UMBPConfig& cfg) { return CreateUMBPClient(cfg); }),
@@ -263,7 +280,8 @@ void RegisterMoriUmbp(py::module_& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())
-      .def("is_distributed", &IUMBPClient::IsDistributed)  // pure getter, no I/O
+      .def("is_distributed", &IUMBPClient::IsDistributed)           // pure getter, no I/O
+      .def("get_deployment_mode", &IUMBPClient::GetDeploymentMode)  // pure getter, no I/O
       .def("register_memory", &IUMBPClient::RegisterMemory, py::arg("ptr"), py::arg("size"),
            py::call_guard<py::gil_scoped_release>())
       .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"),

@@ -155,6 +155,9 @@ if(HAVE_SPDK)
   # SPDK Proxy daemon (owns SPDK, serves ranks via SHM IPC)
   add_executable(spdk_proxy storage/spdk/proxy/spdk_proxy_daemon.cpp)
   target_link_libraries(spdk_proxy PRIVATE umbp_core)
+  set_target_properties(spdk_proxy PROPERTIES BUILD_RPATH "$ORIGIN"
+                                             INSTALL_RPATH "$ORIGIN"
+                                             BUILD_WITH_INSTALL_RPATH TRUE)
 endif()
 
 # Python bindings are registered in src/pybind/pybind_umbp.cpp (compiled into
@@ -260,6 +263,7 @@ message(
 set(UMBP_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/distributed/proto")
 set(UMBP_PROTO_FILE "${UMBP_PROTO_DIR}/umbp.proto")
 set(UMBP_PEER_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_peer.proto")
+set(UMBP_STANDALONE_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_standalone.proto")
 set(UMBP_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto_gen")
 file(MAKE_DIRECTORY ${UMBP_PROTO_GEN_DIR})
 
@@ -272,6 +276,11 @@ set(UMBP_PEER_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_peer.pb.cc")
 set(UMBP_PEER_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_peer.pb.h")
 set(UMBP_PEER_GRPC_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_peer.grpc.pb.cc")
 set(UMBP_PEER_GRPC_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_peer.grpc.pb.h")
+
+set(UMBP_STANDALONE_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.pb.cc")
+set(UMBP_STANDALONE_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.pb.h")
+set(UMBP_STANDALONE_GRPC_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.cc")
+set(UMBP_STANDALONE_GRPC_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.h")
 
 add_custom_command(
   OUTPUT ${UMBP_PROTO_SRCS} ${UMBP_PROTO_HDRS} ${UMBP_GRPC_SRCS}
@@ -299,6 +308,17 @@ add_custom_command(
   COMMENT "Generating UMBP Peer protobuf/gRPC C++ sources"
   VERBATIM)
 
+add_custom_command(
+  OUTPUT ${UMBP_STANDALONE_PROTO_SRCS} ${UMBP_STANDALONE_PROTO_HDRS}
+         ${UMBP_STANDALONE_GRPC_SRCS} ${UMBP_STANDALONE_GRPC_HDRS}
+  COMMAND
+    ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
+    --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_STANDALONE_PROTO_FILE}
+  DEPENDS ${UMBP_STANDALONE_PROTO_FILE} ${UMBP_PROTO_FILE} ${UMBP_PROTO_HDRS}
+  COMMENT "Generating UMBP Standalone protobuf/gRPC C++ sources"
+  VERBATIM)
+
 # ---------- Static library: umbp_common ---------------------------------------
 # Shared between PoolClient integration and standalone control-plane tools.
 
@@ -308,6 +328,8 @@ add_library(
   ${UMBP_GRPC_SRCS}
   ${UMBP_PEER_PROTO_SRCS}
   ${UMBP_PEER_GRPC_SRCS}
+  ${UMBP_STANDALONE_PROTO_SRCS}
+  ${UMBP_STANDALONE_GRPC_SRCS}
   distributed/master/global_block_index.cpp
   distributed/master/external_kv_block_index.cpp
   distributed/master/client_registry.cpp
@@ -325,7 +347,11 @@ add_library(
   distributed/peer/ssd_copy_pipeline.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
-  distributed/distributed_client.cpp)
+  distributed/distributed_client.cpp
+  standalone/external_kv_identity_client.cpp
+  standalone/ipc.cpp
+  standalone/standalone_process_client.cpp
+  standalone/standalone_server.cpp)
 
 target_include_directories(
   umbp_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${UMBP_PROTO_GEN_DIR}
@@ -373,6 +399,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(umbp_master PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
+set_target_properties(umbp_master PROPERTIES BUILD_RPATH "$ORIGIN"
+                                             INSTALL_RPATH "$ORIGIN"
+                                             BUILD_WITH_INSTALL_RPATH TRUE)
 
 # ---------- Client executable -------------------------------------------------
 
@@ -382,6 +411,21 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
+set_target_properties(umbp_client PROPERTIES BUILD_RPATH "$ORIGIN"
+                                             INSTALL_RPATH "$ORIGIN"
+                                             BUILD_WITH_INSTALL_RPATH TRUE)
+
+# ---------- Standalone-process executable ------------------------------------
+
+add_executable(umbp_standalone_server standalone/bin/standalone_server_main.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(umbp_standalone_server PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(umbp_standalone_server PRIVATE umbp_common ${_PROTOBUF_LIBS}
+                                                     ${_GRPCPP_LIB})
+set_target_properties(umbp_standalone_server PROPERTIES BUILD_RPATH "$ORIGIN"
+                                                        INSTALL_RPATH "$ORIGIN"
+                                                        BUILD_WITH_INSTALL_RPATH TRUE)
 
 if(BUILD_TESTS)
   add_subdirectory(tests)

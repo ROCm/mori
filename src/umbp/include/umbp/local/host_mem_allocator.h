@@ -23,12 +23,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 namespace mori::umbp {
 
 enum class HostBufferBacking : int {
   kAnonymous = 0,
   kAnonymousHugetlb = 1,
+  kAnonymousShm = 2,
 };
 
 struct HostBufferOptions {
@@ -50,6 +52,12 @@ struct HostBufferHandle {
 
 class HostMemAllocator {
  public:
+  struct ShmAllocation {
+    void* base = nullptr;
+    size_t mapped_size = 0;
+    int fd = -1;
+  };
+
   HostMemAllocator() = default;
   ~HostMemAllocator() = default;
 
@@ -66,6 +74,18 @@ class HostMemAllocator {
   // fails (a WARN is logged), to prevent a subsequent Free from munmap'ing
   // an address the kernel may have reused for a later mmap().
   void Free(HostBufferHandle& handle);
+
+  // Look up a live kAnonymousShm allocation containing [ptr, ptr + size).
+  // The returned fd is owned by the allocator registry; callers may pass it
+  // through SCM_RIGHTS but must not close it.
+  static std::optional<ShmAllocation> LookupShmAllocation(uintptr_t ptr, size_t size);
+
+  // Acquire/Release a live shm allocation while its fd is being handed to, or
+  // remains registered with, another process.  Acquire increments the registry's
+  // active reference count before returning the fd, closing the lookup/use
+  // race with Free().
+  static std::optional<ShmAllocation> AcquireShmAllocation(uintptr_t ptr, size_t size);
+  static void ReleaseShmAllocation(uintptr_t base);
 };
 
 }  // namespace mori::umbp

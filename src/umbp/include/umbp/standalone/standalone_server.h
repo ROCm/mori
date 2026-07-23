@@ -19,21 +19,35 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/distributed/distributed_client.h"
-#include "umbp/local/standalone_client.h"
-#include "umbp/standalone/standalone_process_client.h"
-#include "umbp/umbp_client.h"
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+#pragma once
 
-namespace mori::umbp {
+#include <memory>
+#include <string>
 
-std::unique_ptr<IUMBPClient> CreateUMBPClient(const UMBPConfig& config) {
-  if (config.distributed.has_value()) {
-    return std::make_unique<DistributedClient>(config);
-  }
-  if (config.standalone_process.has_value()) {
-    return std::make_unique<standalone::StandaloneProcessClient>(config);
-  }
-  return std::make_unique<StandaloneClient>(config);
-}
+#include "umbp/common/config.h"
 
-}  // namespace mori::umbp
+namespace mori::umbp::standalone {
+
+class StandaloneServer {
+ public:
+  StandaloneServer(UMBPConfig config, std::string address);
+  ~StandaloneServer();
+
+  bool Start();
+  void Run();
+  void Shutdown();
+
+  const std::string& address() const { return address_; }
+
+ private:
+  class Impl;
+
+  UMBPConfig config_;
+  std::string address_;
+  std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace mori::umbp::standalone
