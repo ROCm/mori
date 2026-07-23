@@ -909,9 +909,18 @@ int ccoBarrierAll(ccoComm* comm);
 #if defined(__HIPCC__) || defined(__CUDACC__)
 
 // SDMA device layer, inlined from sdma_pkt_struct.h, anvil_device.hpp and
-// device_primitives.hpp so cco.hpp alone suffices (keep in sync with those).
+// device_primitives.hpp so cco.hpp alone suffices.
 // No external headers: uses AMDGCN builtins + __hip_atomic_* directly, shims
 // HSAuint64/__forceinline__, and traps instead of device assert().
+//
+// MAINTENANCE: this is a deliberate FORK, not a live mirror. The copies below do
+// NOT auto-track the originals — they intentionally diverge (CCO_ prefixes,
+// __builtin_trap instead of assert, trimmed to the two packet types cco posts).
+// Do not "sync" them wholesale. The one contract that MUST hold is the on-wire
+// layout of ccoSdmaQueueDeviceHandle vs anvil::SdmaQueueDeviceHandle, because
+// cco_init.cpp byte-copies handle pointers between them; that is enforced by
+// static_asserts in src/cco/device/cco_device_wrapper.cpp, so a layout drift on
+// either side fails the build rather than corrupting queues at runtime.
 
 // HSAuint64: guarded on hsakmt's own include guard to avoid a redefinition when
 // a TU also pulls in hsakmt/hsakmttypes.h.
@@ -1004,7 +1013,8 @@ typedef struct CCO_SDMA_PKT_COPY_LINEAR_TAG {
     unsigned int DW_6_DATA;
   } DST_ADDR_HI_UNION;
 } CCO_SDMA_PKT_COPY_LINEAR, *PCCO_SDMA_PKT_COPY_LINEAR;
-static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR) != 7, "SDMA PKT Linear does n't have 7 dwords");
+static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR) == 7 * sizeof(uint32_t),
+              "SDMA copy-linear packet must be exactly 7 dwords");
 
 typedef struct CCO_SDMA_PKT_ATOMIC_TAG {
   union {
@@ -1262,6 +1272,8 @@ template <bool Signal = true>
 inline __device__ void ccoSdmaPostCopy(ccoSdmaQueueDeviceHandle** deviceHandles, HSAuint64* signals,
                                        HSAuint64* expectedSignals, void* srcPtr, void* dstPtr,
                                        size_t size, int qId, bool ring = true) {
+  if (size == 0) return;
+
   uint64_t offset = 0;
   ccoSdmaQueueDeviceHandle handle = **(deviceHandles + qId);
 
