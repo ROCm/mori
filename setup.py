@@ -544,6 +544,8 @@ class CMakeBuild(build_ext):
             else os.environ.get("BUILD_OPS_DEVICE", "OFF")
         )
 
+        BUILD_CCO_SDMA = os.environ.get("BUILD_CCO_SDMA", "OFF")
+
         cmake_args = [
             "cmake",
             "-DUSE_ROCM=ON",
@@ -563,6 +565,7 @@ class CMakeBuild(build_ext):
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
             f"-DBUILD_XLA_FFI_OPS={build_xla_ffi_ops}",
             f"-DBUILD_OPS_DEVICE={build_ops_device}",
+            f"-DBUILD_CCO_SDMA={BUILD_CCO_SDMA}",
             f"-DMORI_MULTITHREAD_SUPPORT={multithread_support}",
             "-B",
             str(build_dir),

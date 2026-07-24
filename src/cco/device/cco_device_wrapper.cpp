@@ -53,7 +53,9 @@
 namespace {
 using namespace mori::cco;
 using Gda = ccoGda<CCO_GDA_BUILD_PROVIDER>;
+#if BUILD_CCO_SDMA
 using Sdma = ccoSdma;
+#endif
 
 inline __device__ const ccoDevComm* AsDevComm(uint64_t h) {
   return reinterpret_cast<const ccoDevComm*>(h);
@@ -100,6 +102,9 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
 // Expose SDMA C API. Symbol tags kept in sync with _bindings.py:
 //   put/get carry a coop tag (thread/warp/block); a "_ns" suffix selects the
 //   no-signal (fire-and-forget) variant, which quiet/quiet_queue cannot drain.
+// Entire block compile-gated on BUILD_CCO_SDMA — when off, no cco_sdma_* symbols
+// are emitted (matches the host lib, which builds no SDMA queues).
+#if BUILD_CCO_SDMA
 #define CCO_DEF_SDMA_XFER(OP, TAG, COOP, SIG)                                                     \
   CCO_DEV void cco_sdma_##OP##__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO,            \
                                       uint64_t sW, uint64_t sO, uint64_t n, int qid, int flags) { \
@@ -150,6 +155,7 @@ CCO_DEF_SDMA_COMMIT(thread, ccoCoopThread)
 CCO_DEF_SDMA_COMMIT(warp, ccoCoopWarp)
 CCO_DEF_SDMA_COMMIT(block, ccoCoopBlock)
 #undef CCO_DEF_SDMA_COMMIT
+#endif  // BUILD_CCO_SDMA
 
 // ── ccoDevComm field accessors ──
 CCO_DEV int cco_devcomm_rank(uint64_t dc) { return AsDevComm(dc)->rank; }

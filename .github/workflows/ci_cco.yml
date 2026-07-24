@@ -60,7 +60,7 @@ jobs:
         run: |
           # BUILD_UMBP=OFF: not needed for CCO, and its gtest discovery breaks under cmake 4.4.
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON MORI_WITH_MPI=ON BUILD_UMBP=OFF pip install ."
+            "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON MORI_WITH_MPI=ON BUILD_UMBP=OFF BUILD_CCO_SDMA=ON pip install ."
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         run: |
@@ -68,6 +68,15 @@ jobs:
           # cross-rail RDMA, so GDA-FULL tests (gda_flush_async/gda_modes/
           # multiprocess) can't form FULL connections; skip them here.
           $CT exec -e MORI_CCO_SKIP_GDA_FULL=1 $CONTAINER bash $GITHUB_WORKSPACE/tools/run_cco_tests.sh $GITHUB_WORKSPACE/build 4 2>&1
+
+      - name: Run CCO SDMA C++ tests (fork mode, 8 ranks)
+        run: |
+          $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            for t in test_sdma_put test_sdma_get test_sdma_put_mt test_sdma_block test_sdma_edge; do \
+              echo \"=== \$t ===\" && \
+              timeout 240 ./build/tests/cpp/cco/\$t 8 || exit 1; \
+            done"
 
       - name: Run CCO C++ examples (2 ranks)
         run: |

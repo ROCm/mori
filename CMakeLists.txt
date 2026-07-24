@@ -38,6 +38,7 @@ option(WITH_MPI
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
 option(BUILD_CCO "Whether to build cco library" ON)
+option(BUILD_CCO_SDMA "Compile the cco SDMA intra-node copy-engine path" OFF)
 option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_IO "Whether to build mori io library" ON)
 option(BUILD_COLLECTIVE "Whether to build mori collective library" ON)

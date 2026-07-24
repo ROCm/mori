@@ -85,6 +85,10 @@ struct ccoFabricHandle_t {
   unsigned char data[64];
 };
 
+#ifndef BUILD_CCO_SDMA
+#define BUILD_CCO_SDMA 0
+#endif
+
 namespace mori {
 namespace cco {
 
@@ -905,8 +909,9 @@ int ccoBarrierAll(ccoComm* comm);
 }  // namespace mori
 
 // SDMA (intra-node copy-engine) session. Non-blocking put/get over the SDMA
-// queues; peers by LSA rank; completion awaited by quiet. Device-only.
-#if defined(__HIPCC__) || defined(__CUDACC__)
+// queues; peers by LSA rank; completion awaited by quiet. Device-only, and only
+// emitted when BUILD_CCO_SDMA — the enclosing struct layout above is unaffected.
+#if (defined(__HIPCC__) || defined(__CUDACC__)) && BUILD_CCO_SDMA
 
 // SDMA device layer — a deliberate FORK of sdma_pkt_struct.h / anvil_device.hpp
 // / device_primitives.hpp, inlined so cco.hpp is self-contained. Uses AMDGCN

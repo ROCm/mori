@@ -103,6 +103,7 @@ def _hipcc_device_bc(
     output: Path,
     *,
     cov: int = 5,
+    extra_defines: "list[str] | None" = None,
 ) -> None:
     """Compile a single source file to device-only bitcode."""
     cmd = [
@@ -120,6 +121,7 @@ def _hipcc_device_bc(
         *_nic_defines(),
         *_ccqe_defines(),
         *_profiler_defines(),
+        *(extra_defines or []),
     ]
     for d in include_dirs:
         cmd.extend(["-I", str(d)])

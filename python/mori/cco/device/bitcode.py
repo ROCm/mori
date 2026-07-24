@@ -82,16 +82,29 @@ def _jit_compile(cov: int) -> str | None:
 
         cfg = detect_build_config()
         nic = detect_nic_type()
+        # SDMA path is compile-gated (BUILD_CCO_SDMA). Must match the value the
+        # host libmori_cco.so was built with (BUILD_CCO_SDMA); default OFF. Folded
+        # into the cache dir so on/off bitcode never aliases.
+        sdma_on = os.environ.get("BUILD_CCO_SDMA", "OFF").strip().upper() in {
+            "1",
+            "ON",
+            "TRUE",
+            "YES",
+        }
         source_paths = [
             wrapper,
             mori_root / "include" / "mori" / "cco",
             mori_root / "include" / "mori" / "core",
         ]
         cache_dir = get_cache_dir(cfg.arch, source_paths, nic, cov=cov)
+        if sdma_on:
+            cache_dir = cache_dir / "sdma"
+            cache_dir.mkdir(parents=True, exist_ok=True)
         bc_path = cache_dir / _BC_FILENAME
         if bc_path.is_file():
             return str(bc_path)
 
+        sdma_define = [f"-DBUILD_CCO_SDMA={1 if sdma_on else 0}"]
         lock_path = cache_dir / f".{_BC_FILENAME}.lock"
         with FileBaton(lock_path, wait_for=str(bc_path)) as baton:
             if baton.skipped or bc_path.is_file():
@@ -101,7 +114,9 @@ def _jit_compile(cov: int) -> str | None:
             include_dirs = _collect_include_dirs(mori_root)
             with tempfile.TemporaryDirectory() as td:
                 raw = Path(td) / "cco_wrapper.bc"
-                _hipcc_device_bc(cfg, wrapper, include_dirs, raw, cov=cov)
+                _hipcc_device_bc(
+                    cfg, wrapper, include_dirs, raw, cov=cov, extra_defines=sdma_define
+                )
                 _strip_lifetime_intrinsics(cfg, raw, bc_path)
         return str(bc_path)
     except Exception:
