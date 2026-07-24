@@ -485,6 +485,8 @@ mlx5_mori_env_setup() {
 if [[ -n "$BNXT_DEVS" ]]; then
     bnxt_setup_pfc  && bnxt_setup_dcqcn  && bnxt_mori_env_setup
 elif [[ -n "$IONIC_DEVS" ]]; then
+    log_warn "resetting existing Ionic QoS before applying $MORI_CONFIG_PATH"
+    ionic_reset_qos || { die "Ionic QoS reset failed"; return 1 2>/dev/null || exit 1; }
     ionic_setup_pfc && ionic_setup_dcqcn && ionic_mori_env_setup
 elif [[ -n "$MLX5_ROCE_DEVS" ]]; then
     mlx5_setup_pfc  && mlx5_setup_dcqcn  && mlx5_mori_env_setup
