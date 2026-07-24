@@ -54,7 +54,7 @@ class StreamPool {
 
 class EventPool {
  public:
-  explicit EventPool(int numEventsPerDevice = 64);
+  explicit EventPool(int numEventsPerDevice = 64, int maxEventsPerDevice = 0);
   ~EventPool();
 
   EventPool(const EventPool&) = delete;
@@ -71,6 +71,10 @@ class EventPool {
   bool InitializeEventsForDevice(int deviceId);
 
   int numEventsPerDevice_;
+  // Hard cap on the number of cached (free-list) events retained per device.
+  // Bounds the per-process HSA signal / KFD event footprint so a transient
+  // burst of concurrent transfers cannot permanently inflate the pool.
+  int maxEventsPerDevice_;
   std::mutex mutex_;
   std::unordered_map<int, std::queue<hipEvent_t>> eventPools_;
 };

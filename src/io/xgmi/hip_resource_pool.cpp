@@ -108,9 +108,24 @@ bool StreamPool::InitializeStreamsForDevice(int deviceId) {
 /*                                            EventPool                                           */
 /* ---------------------------------------------------------------------------------------------- */
 
-EventPool::EventPool(int numEventsPerDevice) : numEventsPerDevice_(numEventsPerDevice) {
+EventPool::EventPool(int numEventsPerDevice, int maxEventsPerDevice)
+    : numEventsPerDevice_(numEventsPerDevice), maxEventsPerDevice_(maxEventsPerDevice) {
   if (numEventsPerDevice_ <= 0) {
     numEventsPerDevice_ = 64;
+  }
+  // Bound the cached free-list so a bursty workload (e.g. PD KV-transfer under
+  // sustained load) cannot permanently inflate the pool and exhaust the
+  // per-process HSA signal / KFD event budget. That exhaustion surfaces as
+  // HSA_STATUS_ERROR_OUT_OF_RESOURCES on an unrelated queue op even though GPU
+  // memory is free. Events returned above this cap are destroyed, not retained.
+  if (maxEventsPerDevice_ <= 0) {
+    maxEventsPerDevice_ = numEventsPerDevice_ * 8;
+    if (maxEventsPerDevice_ < 512) {
+      maxEventsPerDevice_ = 512;
+    }
+  }
+  if (maxEventsPerDevice_ < numEventsPerDevice_) {
+    maxEventsPerDevice_ = numEventsPerDevice_;
   }
 }
 
@@ -155,8 +170,21 @@ void EventPool::PutEvent(hipEvent_t event, int deviceId) {
     return;
   }
 
-  std::lock_guard<std::mutex> lock(mutex_);
-  eventPools_[deviceId].push(event);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& pool = eventPools_[deviceId];
+    if (static_cast<int>(pool.size()) < maxEventsPerDevice_) {
+      pool.push(event);
+      return;
+    }
+  }
+
+  // Free-list already at capacity: destroy the surplus event rather than
+  // caching it, so the retained HSA signal count stays bounded across bursts.
+  hipError_t err = hipEventDestroy(event);
+  if (err != hipSuccess) {
+    MORI_IO_ERROR("EventPool: Failed to destroy surplus event: {}", hipGetErrorString(err));
+  }
 }
 
 hipEvent_t EventPool::CreateEvent() {
