@@ -12,10 +12,13 @@
 #   mlx5 (Mellanox/NVIDIA ConnectX), via mlnx_qos + mlxconfig:
 #     mlx5_setup_pfc  / mlx5_setup_dcqcn  / mlx5_mori_env_setup
 #
-# All three paths converge on the same RoCE QoS constants below, so
-# MORI_RDMA_SL / TC come out identical regardless of vendor.
+# Ionic reads its QoS/DCQCN settings from ~/.mori.conf. The bnxt and mlx5
+# paths retain their existing constants for now.
 #
-# Usage:  source env_setup.sh
+# Usage:
+#   mori setup                         # uses ~/.mori.conf
+#   mori setup --config /path/to/conf  # explicit config
+#   source env_setup.sh                # also exports MORI_RDMA_SL / MORI_RDMA_TC
 #
 # Requires: ionic -> nicctl, sudo; bnxt -> dcb (iproute2), ethtool, configfs,
 #           sudo; mlx5 -> mlnx_qos (mlnx-tools), mlxconfig/mst (NVIDIA MFT), sudo
@@ -42,6 +45,112 @@ log_ok()   { echo -e "${GREEN}[OK]${NC}   $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 die()      { echo -e "${RED}[FAIL]${NC} $*"; return 1; }
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+DEFAULT_CONFIG="$SCRIPT_DIR/.mori.conf"
+MORI_CONFIG_PATH="${MORI_QOS_CONFIG:-${HOME:-}/.mori.conf}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --config)
+            [[ $# -ge 2 ]] || { die "--config requires a path"; return 1 2>/dev/null || exit 1; }
+            MORI_CONFIG_PATH="$2"
+            shift 2
+            ;;
+        *)
+            die "unknown argument: $1"
+            return 1 2>/dev/null || exit 1
+            ;;
+    esac
+done
+
+_validate_uint_range() {
+    local name="$1" min="$2" max="$3" value="${!1}"
+    [[ "$value" =~ ^[0-9]+$ ]] || { die "$name must be an integer (got '$value')"; return 1; }
+    (( value >= min && value <= max )) || {
+        die "$name must be in [$min, $max] (got '$value')"
+        return 1
+    }
+}
+
+_load_ionic_config() {
+    local path="$1" line key value required
+    local -A seen=()
+
+    if [[ -z "$path" ]]; then
+        die "HOME is unset; pass --config PATH or set MORI_QOS_CONFIG"
+        return 1
+    fi
+    if [[ ! -f "$path" ]]; then
+        [[ -f "$DEFAULT_CONFIG" ]] || {
+            die "default config not found: $DEFAULT_CONFIG"
+            return 1
+        }
+        mkdir -p "$(dirname "$path")" || return 1
+        cp "$DEFAULT_CONFIG" "$path" || {
+            die "failed to create config: $path"
+            return 1
+        }
+        log_ok "created editable config: $path"
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ ! "$line" =~ ^[[:space:]]*([A-Z][A-Z0-9_]*)[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*(#.*)?$ ]]; then
+            die "invalid config line in $path: $line"
+            return 1
+        fi
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        case "$key" in
+            IONIC_ROCE_PRIO|IONIC_ROCE_DSCP|IONIC_CNP_PRIO|IONIC_CNP_DSCP|\
+            IONIC_ROCE_BW|IONIC_CNP_RATE_LIMIT|IONIC_DCQCN_INDEX|\
+            IONIC_DCQCN_TOKEN_BUCKET_SIZE|IONIC_DCQCN_AI_RATE|\
+            IONIC_DCQCN_ALPHA_UPDATE_INTERVAL|IONIC_DCQCN_ALPHA_UPDATE_G|\
+            IONIC_DCQCN_INITIAL_ALPHA_VALUE|IONIC_DCQCN_RATE_INCREASE_BYTE_COUNT|\
+            IONIC_DCQCN_HAI_RATE|IONIC_DCQCN_RATE_REDUCE_MONITOR_PERIOD|\
+            IONIC_DCQCN_RATE_INCREASE_THRESHOLD|IONIC_DCQCN_RATE_INCREASE_INTERVAL)
+                printf -v "$key" '%s' "$value"
+                seen["$key"]=1
+                ;;
+            *)
+                die "unknown config key in $path: $key"
+                return 1
+                ;;
+        esac
+    done < "$path"
+
+    for required in \
+        IONIC_ROCE_PRIO IONIC_ROCE_DSCP IONIC_CNP_PRIO IONIC_CNP_DSCP \
+        IONIC_ROCE_BW IONIC_CNP_RATE_LIMIT IONIC_DCQCN_INDEX \
+        IONIC_DCQCN_TOKEN_BUCKET_SIZE IONIC_DCQCN_AI_RATE \
+        IONIC_DCQCN_ALPHA_UPDATE_INTERVAL IONIC_DCQCN_ALPHA_UPDATE_G \
+        IONIC_DCQCN_INITIAL_ALPHA_VALUE IONIC_DCQCN_RATE_INCREASE_BYTE_COUNT \
+        IONIC_DCQCN_HAI_RATE IONIC_DCQCN_RATE_REDUCE_MONITOR_PERIOD \
+        IONIC_DCQCN_RATE_INCREASE_THRESHOLD IONIC_DCQCN_RATE_INCREASE_INTERVAL; do
+        [[ -n "${seen[$required]:-}" ]] || {
+            die "missing required config key in $path: $required"
+            return 1
+        }
+    done
+
+    _validate_uint_range IONIC_ROCE_PRIO 1 7 &&
+    _validate_uint_range IONIC_ROCE_DSCP 0 63 &&
+    _validate_uint_range IONIC_CNP_PRIO 1 7 &&
+    _validate_uint_range IONIC_CNP_DSCP 0 63 &&
+    _validate_uint_range IONIC_ROCE_BW 1 99 &&
+    _validate_uint_range IONIC_CNP_RATE_LIMIT 1 100 &&
+    [[ "$IONIC_ROCE_PRIO" != "$IONIC_CNP_PRIO" ]] || {
+        die "IONIC_ROCE_PRIO and IONIC_CNP_PRIO must be different"
+        return 1
+    }
+}
+
+if (( EUID == 0 )); then
+    SUDO=()
+else
+    SUDO=(sudo)
+fi
+
 query_by_vendor() {
     local vid="$1" dev vendor
     for dev in $(ibv_devices 2>/dev/null | awk 'NR>2 && NF {print $1}'); do
@@ -65,25 +174,33 @@ IONIC_DEVS=$(query_ionic_devices)
 BNXT_DEVS=$(query_bnxt_devices)
 MLX5_ROCE_DEVS=$(query_mlx5_devices)
 
+if [[ -z "$BNXT_DEVS" && -n "$IONIC_DEVS" ]]; then
+    _load_ionic_config "$MORI_CONFIG_PATH" || { return 1 2>/dev/null || exit 1; }
+    IONIC_NON_RDMA_BW=$((100 - IONIC_ROCE_BW))
+    log_ok "using Ionic QoS config: $MORI_CONFIG_PATH"
+fi
+
 # Wipe all QoS configuration back to a clean "best-effort only" state.
 # Idiom adapted from the AMD Pollara 400 ops guide.
 # Self-contained — safe to call after `source env_setup.sh` has unset its helpers.
 ionic_reset_qos() {
     local p
+    local -a sudo_cmd=()
+    (( EUID != 0 )) && sudo_cmd=(sudo)
     # 1) disable PFC no-drop on all 8 priorities (silently — some are already off)
     for p in 0 1 2 3 4 5 6 7; do
-        sudo nicctl update qos pfc --priority "$p" --no-drop disable &>/dev/null
+        "${sudo_cmd[@]}" nicctl update qos pfc --priority "$p" --no-drop disable &>/dev/null
     done
     # 2) toggle classification type pcp <-> dscp to flush stale DSCP state
-    sudo nicctl update qos --classification-type pcp  &>/dev/null
-    sudo nicctl update qos --classification-type dscp &>/dev/null
+    "${sudo_cmd[@]}" nicctl update qos --classification-type pcp  &>/dev/null
+    "${sudo_cmd[@]}" nicctl update qos --classification-type dscp &>/dev/null
     # 3) collapse every DSCP back to priority 0 in a single call (range syntax)
-    if ! sudo nicctl update qos dscp-to-priority --dscp 0-63 --priority 0; then
+    if ! "${sudo_cmd[@]}" nicctl update qos dscp-to-priority --dscp 0-63 --priority 0; then
         echo -e "\033[0;31m[FAIL]\033[0m reset DSCP 0-63 -> priority 0 failed" >&2
         return 1
     fi
     # 4) collapse scheduling so priority 0 owns the link
-    sudo nicctl update qos scheduling --priority 0,1,2,3,4,5,6,7 \
+    "${sudo_cmd[@]}" nicctl update qos scheduling --priority 0,1,2,3,4,5,6,7 \
         --dwrr 100,0,0,0,0,0,0,0 --rate-limit 0,0,0,0,0,0,0,0 &>/dev/null \
         || echo -e "\033[0;33m[WARN]\033[0m reset scheduling failed (continuing)" >&2
     echo -e "\033[0;32m[OK]\033[0m   QoS reset: all DSCPs -> priority 0, PFC no-drop disabled, scheduling collapsed"
@@ -91,37 +208,44 @@ ionic_reset_qos() {
 
 ionic_setup_pfc() {
     command -v nicctl &>/dev/null || { die "ionic devices found but nicctl not available"; return 1; }
-    sudo nicctl update qos --classification-type dscp                          || { die "set classification-type failed"; return 1; }
-    sudo nicctl update port --all --pause-type pfc --rx-pause enable --tx-pause enable || { die "set pause failed"; return 1; }
+    "${SUDO[@]}" nicctl update qos --classification-type dscp                          || { die "set classification-type failed"; return 1; }
+    "${SUDO[@]}" nicctl update port --all --pause-type pfc --rx-pause enable --tx-pause enable || { die "set pause failed"; return 1; }
     # DSCP-to-priority mapping MUST be done before scheduling — the firmware
     # rejects scheduling updates for priorities that have no DSCP entries yet
     # (nicctl returns "Invalid input" for priority N if N has no DSCP mapping).
-    sudo nicctl update qos dscp-to-priority --dscp 26 --priority 3             || { die "map DSCP 26 -> priority 3 failed"; return 1; }
-    sudo nicctl update qos dscp-to-priority --dscp 48 --priority 6             || { die "map DSCP 48 -> priority 6 failed"; return 1; }
-    # Priority 6 = control/CNP lane: DWRR=0 + 10Gbps strict rate-limit
+    "${SUDO[@]}" nicctl update qos dscp-to-priority --dscp "$IONIC_ROCE_DSCP" --priority "$IONIC_ROCE_PRIO" \
+        || { die "map DSCP $IONIC_ROCE_DSCP -> priority $IONIC_ROCE_PRIO failed"; return 1; }
+    "${SUDO[@]}" nicctl update qos dscp-to-priority --dscp "$IONIC_CNP_DSCP" --priority "$IONIC_CNP_PRIO" \
+        || { die "map DSCP $IONIC_CNP_DSCP -> priority $IONIC_CNP_PRIO failed"; return 1; }
+    # The CNP lane uses strict scheduling with a configured rate limit.
     # (matches the AMD Pollara reference recipe; bare dwrr=0/rate-limit=0
     # is rejected as "Invalid input").
-    sudo nicctl update qos scheduling --priority 0,3,6 --dwrr 10,90,0 --rate-limit 0,0,10 || { die "set scheduling failed"; return 1; }
-    sudo nicctl update qos pfc --priority 3 --no-drop enable                   || { die "enable PFC no-drop on priority 3 failed"; return 1; }
-    sudo nicctl update port --all --admin-state up                             || { die "set admin-state up failed"; return 1; }
+    "${SUDO[@]}" nicctl update qos scheduling \
+        --priority "0,$IONIC_ROCE_PRIO,$IONIC_CNP_PRIO" \
+        --dwrr "$IONIC_NON_RDMA_BW,$IONIC_ROCE_BW,0" \
+        --rate-limit "0,0,$IONIC_CNP_RATE_LIMIT" \
+        || { die "set scheduling failed"; return 1; }
+    "${SUDO[@]}" nicctl update qos pfc --priority "$IONIC_ROCE_PRIO" --no-drop enable \
+        || { die "enable PFC no-drop on priority $IONIC_ROCE_PRIO failed"; return 1; }
+    "${SUDO[@]}" nicctl update port --all --admin-state up                     || { die "set admin-state up failed"; return 1; }
     log_ok "PFC / DSCP / scheduling configured"
 }
 
 ionic_setup_dcqcn() {
     local dev
     for dev in $IONIC_DEVS; do
-        sudo nicctl update dcqcn -r "$dev" -i 1 \
-            --token-bucket-size 800000 \
-            --ai-rate 160 \
-            --alpha-update-interval 1 \
-            --alpha-update-g 512 \
-            --initial-alpha-value 64 \
-            --rate-increase-byte-count 431068 \
-            --hai-rate 300 \
-            --rate-reduce-monitor-period 1 \
-            --rate-increase-threshold 1 \
-            --rate-increase-interval 1 \
-            --cnp-dscp 46 \
+        "${SUDO[@]}" nicctl update dcqcn -r "$dev" -i "$IONIC_DCQCN_INDEX" \
+            --token-bucket-size "$IONIC_DCQCN_TOKEN_BUCKET_SIZE" \
+            --ai-rate "$IONIC_DCQCN_AI_RATE" \
+            --alpha-update-interval "$IONIC_DCQCN_ALPHA_UPDATE_INTERVAL" \
+            --alpha-update-g "$IONIC_DCQCN_ALPHA_UPDATE_G" \
+            --initial-alpha-value "$IONIC_DCQCN_INITIAL_ALPHA_VALUE" \
+            --rate-increase-byte-count "$IONIC_DCQCN_RATE_INCREASE_BYTE_COUNT" \
+            --hai-rate "$IONIC_DCQCN_HAI_RATE" \
+            --rate-reduce-monitor-period "$IONIC_DCQCN_RATE_REDUCE_MONITOR_PERIOD" \
+            --rate-increase-threshold "$IONIC_DCQCN_RATE_INCREASE_THRESHOLD" \
+            --rate-increase-interval "$IONIC_DCQCN_RATE_INCREASE_INTERVAL" \
+            --cnp-dscp "$IONIC_CNP_DSCP" \
             || { die "DCQCN setup failed for $dev"; return 1; }
         log_ok "DCQCN configured on $dev"
     done
@@ -129,7 +253,7 @@ ionic_setup_dcqcn() {
 
 ionic_mori_env_setup() {
     local qos
-    qos=$(sudo nicctl show qos) || die "nicctl show qos failed"
+    qos=$("${SUDO[@]}" nicctl show qos) || die "nicctl show qos failed"
 
     local class_type
     class_type=$(echo "$qos" | grep "Classification type" | head -1 | awk '{print $NF}')
@@ -372,6 +496,15 @@ unset -f ionic_setup_pfc ionic_setup_dcqcn ionic_mori_env_setup \
          bnxt_setup_pfc bnxt_setup_dcqcn bnxt_mori_env_setup \
          mlx5_setup_pfc mlx5_setup_dcqcn mlx5_mori_env_setup \
          _bnxt_cc_write _bnxt_cnp_service_type _bnxt_dcb_clear_app \
+         _validate_uint_range _load_ionic_config \
          query_by_vendor query_ionic_devices query_bnxt_devices query_mlx5_devices \
          log_ok log_warn die
-unset IONIC_VENDOR_ID BNXT_VENDOR_ID MLX_VENDOR_ID IONIC_DEVS BNXT_DEVS MLX5_ROCE_DEVS GREEN RED YELLOW NC
+unset IONIC_VENDOR_ID BNXT_VENDOR_ID MLX_VENDOR_ID IONIC_DEVS BNXT_DEVS MLX5_ROCE_DEVS \
+      IONIC_ROCE_PRIO IONIC_ROCE_DSCP IONIC_CNP_PRIO IONIC_CNP_DSCP \
+      IONIC_ROCE_BW IONIC_NON_RDMA_BW IONIC_CNP_RATE_LIMIT IONIC_DCQCN_INDEX \
+      IONIC_DCQCN_TOKEN_BUCKET_SIZE IONIC_DCQCN_AI_RATE IONIC_DCQCN_ALPHA_UPDATE_INTERVAL \
+      IONIC_DCQCN_ALPHA_UPDATE_G IONIC_DCQCN_INITIAL_ALPHA_VALUE \
+      IONIC_DCQCN_RATE_INCREASE_BYTE_COUNT IONIC_DCQCN_HAI_RATE \
+      IONIC_DCQCN_RATE_REDUCE_MONITOR_PERIOD IONIC_DCQCN_RATE_INCREASE_THRESHOLD \
+      IONIC_DCQCN_RATE_INCREASE_INTERVAL \
+      SCRIPT_DIR DEFAULT_CONFIG MORI_CONFIG_PATH SUDO GREEN RED YELLOW NC

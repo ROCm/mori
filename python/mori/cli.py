@@ -111,6 +111,10 @@ def _cmd_setup(rest: List[str]) -> int:
 
     ``mori setup --path``: print only the absolute path, suitable for
     shell substitution: ``source $(mori setup --path)``.
+
+    Ionic/Pollara QoS parameters are read from ``~/.mori.conf``. On the
+    first setup of an Ionic host, the bundled template is copied there.
+    ``--config`` selects another path.
     """
     parser = argparse.ArgumentParser(
         prog="mori setup",
@@ -123,6 +127,7 @@ def _cmd_setup(rest: List[str]) -> int:
         epilog=(
             "Examples:\n"
             "    mori setup                   # apply NIC config (env vars do NOT persist)\n"
+            "    mori setup --config FILE     # use an explicit Ionic QoS config\n"
             "    source $(mori setup --path)  # apply NIC config AND export MORI_RDMA_SL/TC\n"
             "    mori setup --path            # print only the absolute script path\n"
         ),
@@ -134,6 +139,14 @@ def _cmd_setup(rest: List[str]) -> int:
         help=(
             "print only the absolute path of env_setup.sh and exit "
             "(use with `source $(mori setup --path)` to export env vars)"
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        metavar="FILE",
+        help=(
+            "Ionic QoS configuration path (default: ~/.mori.conf; "
+            "created from the bundled template on first use)"
         ),
     )
     ns = parser.parse_args(rest)
@@ -152,7 +165,10 @@ def _cmd_setup(rest: List[str]) -> int:
         "source $(mori setup --path))",
         file=sys.stderr,
     )
-    return _run_script("setup", [])
+    script_args = []
+    if ns.config:
+        script_args.extend(["--config", str(Path(ns.config).expanduser())])
+    return _run_script("setup", script_args)
 
 
 def _cmd_path(rest: List[str]) -> int:

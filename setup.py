@@ -775,11 +775,11 @@ def _try_precompile(root_dir: Path) -> None:
         print(f"[mori] Precompilation skipped: {e}")
 
 
-_BUNDLED_SCRIPTS = ("env_check.sh", "env_setup.sh", "diagnose_env.sh")
+_BUNDLED_TOOL_FILES = ("env_check.sh", "env_setup.sh", "diagnose_env.sh", ".mori.conf")
 
 
 def _sync_bundled_scripts() -> None:
-    """Copy ``tools/*.sh`` into ``python/mori/scripts/`` so they ship in the wheel.
+    """Copy bundled tools into ``python/mori/tools/`` so they ship in the wheel.
 
     Keeps a single source of truth (``tools/``) while still letting the
     installed package expose them via the ``mori`` console script.
@@ -788,7 +788,7 @@ def _sync_bundled_scripts() -> None:
     src_dir = here / "tools"
     dst_dir = here / "python" / "mori" / "tools"
     dst_dir.mkdir(parents=True, exist_ok=True)
-    for name in _BUNDLED_SCRIPTS:
+    for name in _BUNDLED_TOOL_FILES:
         src = src_dir / name
         if not src.is_file():
             continue
@@ -796,7 +796,8 @@ def _sync_bundled_scripts() -> None:
         try:
             if not dst.is_file() or dst.read_bytes() != src.read_bytes():
                 shutil.copy2(src, dst)
-            os.chmod(dst, os.stat(dst).st_mode | 0o111)
+            if src.suffix == ".sh":
+                os.chmod(dst, os.stat(dst).st_mode | 0o111)
         except OSError as exc:
             print(f"[mori] WARN: failed to bundle {name}: {exc}")
 
@@ -873,6 +874,7 @@ mori_package_data = [
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
     "tools/*.sh",
+    "tools/.mori.conf",
     "examples/cco/*",  # CCO C++ example binaries (only present when BUILD_EXAMPLES=ON)
     "benchmarks/cco/*",  # CCO benchmark binaries (only present when BUILD_BENCHMARK=ON)
 ]
