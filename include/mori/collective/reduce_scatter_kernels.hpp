@@ -62,6 +62,12 @@ static constexpr int kRSPushSlotDwords = 17;  // padded stride (16 + 1)
 #define RS_ENABLE_FALLBACK 0
 #endif
 
+// Push Phase-3 reduce path: 1 = range-checked raw-buffer loads/stores (no scalar
+// tail), 0 = original global b128 load/store + partial-group + scalar tail.
+#ifndef RS_USE_BUFFER_REDUCE
+#define RS_USE_BUFFER_REDUCE 0
+#endif
+
 // ---------------------------------------------------------------------------
 // Reduction Op functors. The accumulator stays in the element type T (so bf16
 // reduces in bf16-width registers -- half the VGPRs of a float accumulator and
@@ -90,10 +96,6 @@ struct SumOp {
   __device__ T operator()(T a, T b) { return a + b; }
 };
 
-// A 4-byte element holding two bf16. Instantiating the reduce kernels with T =
-// BF16Pack keeps vecSize = VecBytes/4 (fp32 parity), so each accumulator lane maps
-// to a single 32-bit VGPR (the compiler will not pack two bare hip_bfloat16 into
-// one register), which avoids the VGPR-spill blowup of the 2-byte bf16 tile.
 struct alignas(4) BF16Pack {
   hip_bfloat16 x, y;
 };
@@ -108,8 +110,8 @@ struct SumOp<BF16Pack> {
                     Bf16BitsToF32(static_cast<uint16_t>(ub));
     const float y = Bf16BitsToF32(static_cast<uint16_t>(ua >> 16)) +
                     Bf16BitsToF32(static_cast<uint16_t>(ub >> 16));
-    const __hip_bfloat162_raw r = static_cast<__hip_bfloat162_raw>(__float22bfloat162_rn(float2{x, y}));
-    const uint32_t packed = static_cast<uint32_t>(r.x) | (static_cast<uint32_t>(r.y) << 16);
+    const auto r = static_cast<__hip_bfloat162_raw>(__float22bfloat162_rn(float2{x, y}));
+    const auto packed = static_cast<uint32_t>(r.x) | (static_cast<uint32_t>(r.y) << 16);
     return __builtin_bit_cast(BF16Pack, packed);
   }
 };
@@ -195,7 +197,6 @@ __device__ __forceinline__ void ReduceVecGroup(SrcBaseFn srcBase, T* __restrict_
       }
     }
   }
-
   // Downcast the accumulators back into NV vectors and store them.
 #pragma unroll
   for (int i = 0; i < NV; i++) {
@@ -208,6 +209,74 @@ __device__ __forceinline__ void ReduceVecGroup(SrcBaseFn srcBase, T* __restrict_
   for (int i = 0; i < NV; i++) {
     size_t idx = g + i * gstride;
     StreamStore<VecBytes>(output + idx * vecSize, vec[i], SystemScope);
+  }
+}
+
+// Buffered variant of ReduceVecGroup for the push path: same NV-grouped reduce,
+// but every access goes through a range-checked RAW buffer resource (V#) instead
+// of a raw pointer. srcRsrc(pe) returns peer pe's slice descriptor and outR is the
+// output slice descriptor; each descriptor's num_records is the valid slice byte
+// extent, so the hardware per-component range check (CDNA4 ISA 9.1.5 note 4)
+// handles the final partial vector -- OOB reads return 0 and OOB stores are
+// dropped -- with NO per-lane guard and NO scalar tail, for ANY reduction op.
+// The byte offset of vector index k is k * VecBytes (uint32; slice < 4 GiB).
+// Cache policy / non-temporal hint rides RS_BUF_AUX inside BufferLoad/Store128.
+template <int VecBytes, int NV, class T, template <class> class OpT, class SrcRsrcFn>
+__device__ __forceinline__ void ReduceVecGroupBuffered(SrcRsrcFn srcRsrc, BufRsrc outR,
+                                                       int npes, size_t g, size_t gstride) {
+  static_assert(VecBytes == 16, "ReduceVecGroupBuffered uses b128 buffer ops");
+  constexpr int vecSize = VecBytes / sizeof(T);
+  using Vec = TVecType<VecBytes>;
+  using AccType = typename AccumulatorType<T>::type;
+  using Data = std::array<T, vecSize>;
+
+  AccType acc[NV][vecSize];
+  Vec vec[NV];
+
+  // Seed accumulators from peer 0.
+  BufRsrc r0 = srcRsrc(0);
+#pragma unroll
+  for (int i = 0; i < NV; i++) {
+    uint32_t voff = static_cast<uint32_t>((g + i * gstride) * VecBytes);
+    vec[i] = BufferLoad128(r0, voff);
+  }
+#pragma unroll
+  for (int i = 0; i < NV; i++) {
+    Data lanes = __builtin_bit_cast(Data, vec[i]);
+#pragma unroll
+    for (int j = 0; j < vecSize; j++) acc[i][j] = UpcastF<T>(lanes[j]);
+  }
+
+  // Reduce peers 1..npes-1 in.
+  for (int pe = 1; pe < npes; pe++) {
+    BufRsrc rp = srcRsrc(pe);
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+      uint32_t voff = static_cast<uint32_t>((g + i * gstride) * VecBytes);
+      vec[i] = BufferLoad128(rp, voff);
+    }
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+      Data lanes = __builtin_bit_cast(Data, vec[i]);
+#pragma unroll
+      for (int j = 0; j < vecSize; j++) {
+        acc[i][j] = OpT<T>()(acc[i][j], UpcastF<T>(lanes[j]));
+      }
+    }
+  }
+
+  // Downcast and store; OOB output components are dropped by the range check.
+#pragma unroll
+  for (int i = 0; i < NV; i++) {
+    Data lanes;
+#pragma unroll
+    for (int j = 0; j < vecSize; j++) lanes[j] = DowncastF<T>(acc[i][j]);
+    vec[i] = __builtin_bit_cast(Vec, lanes);
+  }
+#pragma unroll
+  for (int i = 0; i < NV; i++) {
+    uint32_t voff = static_cast<uint32_t>((g + i * gstride) * VecBytes);
+    BufferStore128(outR, vec[i], voff);
   }
 }
 
@@ -480,19 +549,44 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
                sCnt = (g == (1 << logS) - 1) ? (chunkElems - sOfs) : sliceLen;
   const size_t ltid = static_cast<size_t>(lb) * blockDim.x + threadIdx.x;
   const size_t lstride = static_cast<size_t>(G) * blockDim.x;
-  const size_t totalVecs = sCnt / vecSize;
-  using AccType = typename AccumulatorType<T>::type;
 
-  // Pass the RUNTIME npes to ReduceVecGroup so its per-peer reduce loop stays
-  // rolled (constant-folding it raises VGPR pressure and lowers occupancy).
+  // Pass the RUNTIME npes to the reduce core so its per-peer loop stays rolled
+  // (constant-folding it raises VGPR pressure and lowers occupancy).
   auto srcBase = [staging, input, chunkElems, sOfs, myPe](int pe) -> const T* {
     return (pe == myPe ? input : staging) + pe * chunkElems + sOfs;
   };
   T* out = output + sOfs;
 
+#if RS_USE_BUFFER_REDUCE
+  // Range-checked raw-buffer path. Each descriptor's num_records is the valid
+  // slice byte extent (sCnt elements), so the hardware per-component range check
+  // covers the final partial vector: OOB reads return 0 and OOB stores are
+  // dropped. No partial-group loop, no scalar tail -- correct for any op. We only
+  // iterate to the vector ceiling; groups whose members run past the end are
+  // no-ops (bounded by NumVecs-1 extra chunks per thread).
+  const uint32_t sliceBytes32 = static_cast<uint32_t>(sCnt * sizeof(T));
+  auto srcRsrc = [srcBase, sliceBytes32](int pe) -> BufRsrc {
+    return MakeRawRsrc(srcBase(pe), sliceBytes32);
+  };
+  const BufRsrc outR = MakeRawRsrc(out, sliceBytes32);
+  const size_t totalVecs = sCnt / vecSize;
+  const size_t totalVecsCeil = (sCnt + vecSize - 1) / vecSize;
+  // Full NumVecs groups only while every member is in-bounds (no wasted OOB
+  // chunks), then NV=1 buffered groups to the ceiling so only the genuine final
+  // sub-vector element(s) hit the hardware range check.
+  size_t v = ltid;
+  for (; v + (NumVecs - 1) * lstride < totalVecs; v += lstride * NumVecs) {
+    ReduceVecGroupBuffered<VecBytes, NumVecs, T, OpT>(srcRsrc, outR, npes, v, lstride);
+  }
+  for (; v < totalVecsCeil; v += lstride) {
+    ReduceVecGroupBuffered<VecBytes, 1, T, OpT>(srcRsrc, outR, npes, v, lstride);
+  }
+#else
   // Push path: every source (input + staging) is LOCAL HBM and the Phase-2
   // __threadfence_system() already made the remote-DMA'd staging visible, so the
   // per-access loads/stores use agent scope (SystemScope=false).
+  const size_t totalVecs = sCnt / vecSize;
+  using AccType = typename AccumulatorType<T>::type;
   size_t v = ltid;
   for (; v + (NumVecs - 1) * lstride < totalVecs; v += lstride * NumVecs) {
     ReduceVecGroup<VecBytes, NumVecs, T, OpT, /*SystemScope=*/false>(srcBase, out, npes, v, lstride);
@@ -501,7 +595,6 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
   for (size_t idx = v; idx < totalVecs; idx += lstride) {
     ReduceVecGroup<VecBytes, 1, T, OpT, /*SystemScope=*/false>(srcBase, out, npes, idx, lstride);
   }
-
   // Scalar tail (only the last slice can be non-vecSize-aligned).
   for (size_t i = totalVecs * vecSize + ltid; i < sCnt; i += lstride) {
     using Vec = TVecType<sizeof(T)>;
@@ -515,6 +608,7 @@ __global__ void ReduceScatterPushKernel(int myPe, int npes, int logS, const T* _
     Vec V = __builtin_bit_cast(Vec, DowncastF<T>(a));
     StreamStore<sizeof(T)>(out + i, V, /*system_scope=*/false);
   }
+#endif
 
   // === Reset: the last block of group g zeroes slice g's flag + counter =========
   // A block only reaches here after passing Phase 2 (it has observed the full mask

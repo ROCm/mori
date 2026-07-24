@@ -110,6 +110,64 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v, bool sys
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Range-checked raw-buffer 128-bit load/store.
+//
+// A buffer resource (V#) is built by hand as a uniform int32x4: word0..1 = 64-bit
+// base, word2 = num_records (valid byte extent, stride 0 => bytes), word3 = the
+// raw-buffer config. Building the descriptor explicitly (rather than via
+// __builtin_amdgcn_make_buffer_rsrc) keeps it a scalar/uniform value in SGPRs and
+// avoids the compiler emitting a per-lane "waterfall" around the buffer op.
+//
+// Out-of-range accesses are hardware range-checked: buffer_load/store_dwordx4
+// check PER 32-bit COMPONENT (CDNA4 ISA 9.1.5 note 4) -- OOB reads return 0, OOB
+// writes write nothing. That lets a reduce loop cover the final partial vector
+// with no scalar tail: the store's per-component check drops any OOB output dword
+// regardless of the reduction op.
+//
+// RS_BUF_AUX is the cache-policy immediate (the intrinsic's last operand),
+// separate from word3 and from memory scope; it carries the non-temporal /
+// streaming hint. Verified on gfx950: bit0 (0x1) -> `sc0`, bit1 (0x2) -> `nt`.
+// Default 0x2 = non-temporal streaming, CU-scope caching (no sc bits): correct
+// for the push reduce, whose local-HBM sources are already made visible by the
+// caller's system-scope acquire fence before Phase 3.
+// ---------------------------------------------------------------------------
+#ifndef RS_BUF_AUX
+#define RS_BUF_AUX 2
+#endif
+
+// word3 config for a plain (non-format) raw buffer on gfx9xx / CDNA. make_buffer_rsrc
+// packs its `flags` arg straight into word3 without auto-setting DATA_FORMAT, so on
+// gfx9 flags=0 => BUF_DATA_FORMAT_INVALID and buffer_load_dwordx4 returns garbage;
+// the descriptor MUST carry this (DATA_FORMAT=32) constant.
+#define RS_BUF_RSRC_WORD3 0x00020000
+using BufRsrc = int32_t __attribute__((ext_vector_type(4)));
+
+__device__ BufRsrc llvm_amdgcn_raw_buffer_load_v4i32(BufRsrc rsrc, int voffset, int soffset,
+                                                     int aux) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
+__device__ void llvm_amdgcn_raw_buffer_store_v4i32(BufRsrc vdata, BufRsrc rsrc, int voffset,
+                                                   int soffset, int aux) __asm("llvm.amdgcn.raw.buffer.store.v4i32");
+
+__device__ __forceinline__ BufRsrc MakeRawRsrc(const void* base, uint32_t numBytes) {
+  const uint64_t b = reinterpret_cast<uintptr_t>(base);
+  BufRsrc r;
+  r.x = __builtin_amdgcn_readfirstlane(static_cast<int32_t>(b & 0xFFFFFFFFu));  // word0: base low 32b
+  r.y = __builtin_amdgcn_readfirstlane(static_cast<int32_t>(b >> 32));          // word1: base high (stride 0)
+  r.z = __builtin_amdgcn_readfirstlane(static_cast<int32_t>(numBytes));         // word2: num_records (bytes)
+  r.w = RS_BUF_RSRC_WORD3;                                                      // word3: raw-buffer config
+  return r;
+}
+
+__device__ __forceinline__ V128 BufferLoad128(BufRsrc r, uint32_t voff) {
+  BufRsrc v = llvm_amdgcn_raw_buffer_load_v4i32(r, static_cast<int>(voff), /*soffset=*/0, RS_BUF_AUX);
+  return __builtin_bit_cast(V128, v);
+}
+
+__device__ __forceinline__ void BufferStore128(BufRsrc r, V128 v, uint32_t voff) {
+  llvm_amdgcn_raw_buffer_store_v4i32(__builtin_bit_cast(BufRsrc, v), r, static_cast<int>(voff),
+                                     /*soffset=*/0, RS_BUF_AUX);
+}
+
 // SDMA queue handle augmented with collective-specific ring writers. It adds no
 // data members (same layout as the base), so a base handle can be used through it
 // via a reinterpret_cast -- mirroring anvil::SdmaQueueSingleProducerDeviceHandle.
