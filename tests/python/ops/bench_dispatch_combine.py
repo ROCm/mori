@@ -52,8 +52,10 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         force_scale_active=False,
         report_scale_stats=False,
         combine_scale_dim=None,
+        routing="random",
     ):
         super().__init__(config)
+        self.routing = routing
         self.combine_data_type = (
             combine_data_type if combine_data_type is not None else config.data_type
         )
@@ -83,6 +85,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         self.config.hidden_dim = self.dispatch_hidden_dim
         result = super().gen_test_data(
             use_max_token_num=True,
+            routing=self.routing,
             input_dist=self.input_dist,
             input_scale=self.input_scale,
             input_shift=self.input_shift,
@@ -481,6 +484,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         graph_replay_iters=10,
         skip_e2e=False,
         call_local_expert_count=False,
+        verify=True,
     ):
         test_data = self.gen_test_data()
         for _ in range(warmup):
@@ -491,6 +495,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 dispatch_warp_per_block,
                 combine_block_num,
                 combine_warp_per_block,
+                check=verify,
                 call_local_expert_count=call_local_expert_count,
             )
 
@@ -841,6 +846,29 @@ LaunchConfig = namedtuple(
 )
 
 
+def _optional_kwargs(**kwargs):
+    """Drop keys whose value is None, so the callee's own default applies."""
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+
+KERNEL_TYPE_CHOICES = {
+    "IntraNode": mori.ops.EpDispatchCombineKernelType.IntraNode,
+    "IntraNodeLL": mori.ops.EpDispatchCombineKernelType.IntraNodeLL,
+    "InterNode": mori.ops.EpDispatchCombineKernelType.InterNode,
+    "InterNodeV1": mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+    "InterNodeV1LL": mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+    "AsyncLL": mori.ops.EpDispatchCombineKernelType.AsyncLL,
+}
+
+
+def _resolve_bench_kernel_type(name):
+    if name not in KERNEL_TYPE_CHOICES:
+        raise ValueError(
+            f"Unknown kernel_type={name!r}; choose from {sorted(KERNEL_TYPE_CHOICES)}"
+        )
+    return KERNEL_TYPE_CHOICES[name]
+
+
 def _get_default_launch_config(
     world_size,
     max_num_inp_token_per_rank,
@@ -898,6 +926,12 @@ def _bench_dispatch_combine(
     input_shift=0.0,
     force_scale_active=False,
     report_scale_stats=False,
+    warmup=None,
+    iters=None,
+    verify=True,
+    routing="random",
+    kernel_type="IntraNode",
+    graph_replay_iters=None,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -940,6 +974,7 @@ def _bench_dispatch_combine(
         use_external_inp_buf=not zero_copy,  # zero-copy mode requires use_external_inp_buf=False
         gpu_per_node=world_size,
         quant_type=quant_type,
+        kernel_type=_resolve_bench_kernel_type(kernel_type),
     )
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
@@ -963,6 +998,7 @@ def _bench_dispatch_combine(
             force_scale_active=force_scale_active,
             report_scale_stats=report_scale_stats,
             combine_scale_dim=bench_combine_scale_dim,
+            routing=routing,
         )
 
         (
@@ -1000,6 +1036,10 @@ def _bench_dispatch_combine(
                 combine_block_num=combine_block_num,
                 combine_warp_per_block=combine_warp_per_block,
                 call_local_expert_count=call_local_expert_count,
+                verify=verify,
+                **_optional_kwargs(
+                    warmup=warmup, iters=iters, graph_replay_iters=graph_replay_iters
+                ),
             )
 
         elif cmd == "stress":
@@ -1033,6 +1073,7 @@ def _bench_dispatch_combine(
                 combine_block_num=combine_block_num,
                 combine_warp_per_block=combine_warp_per_block,
                 call_local_expert_count=call_local_expert_count,
+                **_optional_kwargs(warmup=warmup, capture_iters=iters),
             )
 
         elif cmd == "tuning":
@@ -1236,6 +1277,12 @@ def bench_dispatch_combine(
     input_shift=0.0,
     force_scale_active=False,
     report_scale_stats=False,
+    warmup=None,
+    iters=None,
+    verify=True,
+    routing="random",
+    kernel_type="IntraNode",
+    graph_replay_iters=None,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -1268,6 +1315,12 @@ def bench_dispatch_combine(
             input_shift,
             force_scale_active,
             report_scale_stats,
+            warmup,
+            iters,
+            verify,
+            routing,
+            kernel_type,
+            graph_replay_iters,
         ),
         nprocs=world_size,
         join=True,
@@ -1468,6 +1521,66 @@ if __name__ == "__main__":
             "p50/p90/p99/max) for the generated input."
         ),
     )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        help=(
+            "Number of warmup iterations before timing. Applies to --cmd bench "
+            "(default: 1) and --cmd profile (default: 5);"
+        ),
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=None,
+        help=(
+            "Number of timed/captured iterations. Applies to --cmd bench "
+            "(default: 10) and --cmd profile (default: 3) "
+        ),
+    )
+    parser.add_argument(
+        "--graph-replay-iters",
+        type=int,
+        default=None,
+        help=(
+            "Number of times each captured CUDA graph is replayed per "
+            "timed --iters sample (default: 10). --cmd bench only"
+        ),
+    )
+    parser.add_argument(
+        "--routing",
+        type=str,
+        default="random",
+        choices=[
+            "random",
+            "round_robin",
+            "remote_round_robin",
+            "spread",
+            "all_to_one",
+        ],
+        help=(
+            "Token-to-expert routing pattern used to generate test data "
+            "(default: random)"
+        ),
+    )
+    parser.add_argument(
+        "--verify",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help=(
+            "When 1 (default), verify dispatch/combine correctness during "
+            "warmup. --cmd bench only"
+        ),
+    )
+    parser.add_argument(
+        "--kernel-type",
+        type=str,
+        default="IntraNode",
+        choices=sorted(KERNEL_TYPE_CHOICES),
+        help="Dispatch/combine kernel implementation to benchmark (default: IntraNode)",
+    )
     args = parser.parse_args()
 
     if args.num_experts_per_rank is None:
@@ -1510,7 +1623,9 @@ if __name__ == "__main__":
         f"dispatch_block_num: {args.dispatch_block_num}, "
         f"dispatch_warp_per_block: {args.dispatch_warp_per_block}, "
         f"combine_block_num: {args.combine_block_num}, "
-        f"combine_warp_per_block: {args.combine_warp_per_block}"
+        f"combine_warp_per_block: {args.combine_warp_per_block}, "
+        f"kernel_type: {args.kernel_type}, "
+        f"graph_replay_iters: {args.graph_replay_iters}"
     )
     print("-" * 60)
     bench_dispatch_combine(
@@ -1537,4 +1652,10 @@ if __name__ == "__main__":
         input_shift=args.input_shift,
         force_scale_active=bool(args.force_scale_active),
         report_scale_stats=bool(args.report_scale_stats),
+        warmup=args.warmup,
+        iters=args.iters,
+        verify=bool(args.verify),
+        routing=args.routing,
+        kernel_type=args.kernel_type,
+        graph_replay_iters=args.graph_replay_iters,
     )
