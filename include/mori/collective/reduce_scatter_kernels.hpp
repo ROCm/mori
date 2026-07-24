@@ -135,19 +135,6 @@ struct ProdOp {
   __device__ T operator()(T a, T b) { return a * b; }
 };
 
-template < int VecSize, template <class> class OpT, class T, 
-           class AccType = typename AccumulatorType<T>::type >
-__device__ __forceinline__ void reduceVector(AccType* __restrict__ acc, 
-                                           const T* __restrict__ vec) {
-
-  if constexpr (VecSize == 1) {
-    acc[0] = OpT<T>()(acc[0], UpcastF<T>(vec[0]));
-    return;
-  }
-  reduceVector<VecSize/2, OpT>(acc, vec) ;
-  reduceVector<VecSize/2, OpT>(acc + VecSize/2, vec + VecSize/2);
-}
-
 // Reduce one group of NV vectors (each NV-member at vector index g + i*gstride)
 // across all npes staging slots into the output. Callers guarantee every member
 // index is in-bounds, so there are NO per-lane guards here. Used with NV=NumVecs
@@ -171,6 +158,9 @@ __device__ __forceinline__ void ReduceVecGroup(SrcBaseFn srcBase, T* __restrict_
   using Vec = TVecType<VecBytes>;
   using AccType = typename AccumulatorType<T>::type;
   using Data = std::array<T, vecSize>;
+
+  // VecBytes = 16 => vecSize = 4
+  // NV = 8 => vec is 32 VGPRS and so is acc
   AccType acc[NV][vecSize];
   Vec vec[NV];
 
@@ -199,7 +189,10 @@ __device__ __forceinline__ void ReduceVecGroup(SrcBaseFn srcBase, T* __restrict_
 #pragma unroll
     for (int i = 0; i < NV; i++) {
       Data lanes = __builtin_bit_cast(Data, vec[i]);
-      reduceVector<vecSize, OpT>(acc[i], lanes.data());
+#pragma unroll
+      for (int j = 0; j < vecSize; j++) {
+        acc[i][j] = OpT<T>()(acc[i][j], UpcastF<T>(lanes[j]));
+      }
     }
   }
 
@@ -251,7 +244,9 @@ __device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, T* __rest
     for (int pe = 1; pe < NPES; pe++) {
       Data l = __builtin_bit_cast(Data, regs[m][pe]);
 #pragma unroll
-      for (int j = 0; j < vecSize; j++) acc[j] = OpT<T>()(acc[j], UpcastF<T>(l[j]));
+      for (int j = 0; j < vecSize; j++) {
+        acc[j] = OpT<T>()(acc[j], UpcastF<T>(l[j]));
+      }
     }
     Data o;
 #pragma unroll
@@ -352,6 +347,8 @@ __device__ __forceinline__ void StartSdmaScatter(
     const int npesS = npes << logS, peer = tid >> logS, slice = tid & (S - 1);
     const bool bactive = (tid < npesS) && (peer != myPe);
     if (bactive) {
+      // NOTE NOTE if npes > 8 => CAS-free reserve is not valid since different 
+      // peers would map to same handles!
       auto** handles = heapObj->deviceHandles_d + (peer % 8) * numSdmaQ;
       auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
       if (slice == 0) {
@@ -570,13 +567,6 @@ __global__ void ReduceScatterPullKernel(int myPe,
   const size_t totalVecs = chunkElems / vecSize;
   using AccType = typename AccumulatorType<T>::type;
   
-  // Add poison to disable promotion to global memory space
-#if USE_FLAT_MEMORY
-  if (blockIdx.x + myPe == 1777) {
-    output = reinterpret_cast<T*>(srcObj->peerPtrs[777]);
-  }
-#endif
-
   // Peer pe's contribution to my shard: base of peer pe's input + myPe*chunkElems.
   const size_t myOfs = static_cast<size_t>(myPe) * chunkElems;
   auto srcBase = [srcObj, myOfs](int pe) -> const T* {

@@ -205,9 +205,9 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   using ComputeT = typename ReduceComputeType<ElemT>::type;
   constexpr size_t kPack = sizeof(ComputeT) / sizeof(ElemT);  // ElemT lanes per pack
   const size_t chunkElemsC = chunkElems / kPack;              // chunk size in packs
-  constexpr int VecBytes = 16,  NumVecs = 8;
-  constexpr int VecSize = VecBytes / sizeof(ComputeT);
-  size_t totalVecs = chunkElemsC / (VecSize * NumVecs);
+  constexpr int VecBytes = 16,  NumPushVecs = 8, NumPullVecs = 8;
+  constexpr int VecSize = VecBytes / sizeof(ComputeT); 
+  size_t totalVecs = chunkElemsC / (VecSize * NumPushVecs);
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
   int blocks = std::min(wantBlocks, std::max(1, prop.multiProcessorCount));
 
@@ -281,7 +281,7 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
       // input base. output is the local shard buffer. NPES is compile-time so the
       // all-peers register tile stays in VGPRs; dispatch on the real npes.
       auto launch = [&](auto NPES_c) {
-        ReduceScatterPullKernel<VecBytes, NumVecs, decltype(NPES_c)::value, ComputeT, SumOp>
+        ReduceScatterPullKernel<VecBytes, NumPullVecs, decltype(NPES_c)::value, ComputeT, SumOp>
             <<<blocks, kThreads, 0, stream>>>(myPe, baseObj,
                                               reinterpret_cast<ComputeT*>(output), chunkElemsC);
       };
@@ -293,7 +293,7 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
     } else {
       // Sliced push: S = 1<<logS slices, each with its own per-receiver bitmask
       // flag; the grid is partitioned into S groups, each reset by its last block.
-      ReduceScatterPushKernel<VecBytes, NumVecs, ComputeT, SumOp><<<pushBlocks, kThreads, 0, stream>>>(
+      ReduceScatterPushKernel<VecBytes, NumPushVecs, ComputeT, SumOp><<<pushBlocks, kThreads, 0, stream>>>(
           myPe, npes, logS, reinterpret_cast<const ComputeT*>(input),
           reinterpret_cast<ComputeT*>(staging), reinterpret_cast<ComputeT*>(output),
           groupCounters, chunkElemsC);

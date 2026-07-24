@@ -33,14 +33,7 @@
 // warp-cooperative fused copy+atomic SDMA put used by the push collectives.
 // ---------------------------------------------------------------------------
 
-#define USE_FLAT_MEMORY 0
 #define USE_NONTEMPORAL_LOAD 0
-
-#if USE_FLAT_MEMORY
-#define MEM_SPACE __attribute__((address_space(0)))
-#else
-#define MEM_SPACE __attribute__((address_space(1)))
-#endif
 #define GLOBAL_SPACE __attribute__((address_space(1)))
 
 // Streaming (cache-bypassing) 16-byte load/store.
@@ -70,9 +63,9 @@ __device__ __host__ inline static T* Tglobal(T* ptr) {
 }
 
 template <typename T>
-__device__ __host__ inline static MEM_SPACE T* MemSpace(T* ptr) {
+__device__ __host__ inline static GLOBAL_SPACE T* MemSpace(T* ptr) {
   uintptr_t u = reinterpret_cast<uintptr_t>(ptr);
-  return reinterpret_cast<MEM_SPACE T*>(u);
+  return reinterpret_cast<GLOBAL_SPACE T*>(u);
 }
 
 template <int Bytes>
