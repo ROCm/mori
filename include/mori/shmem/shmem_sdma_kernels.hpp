@@ -358,30 +358,54 @@ template <>
 inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::SDMA, true>(
     const void* dest, const void* source, size_t bytes, const void* signalDest,
     uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
-  // TODO: add SDMA PutMemNbiSignal (address-based)
-  (void)dest;
-  (void)source;
-  (void)bytes;
-  (void)signalDest;
-  (void)signalValue;
-  (void)signalOp;
-  (void)pe;
-  (void)qpId;
+  // SDMA push + signal: COPY_LINEAR(source -> peer dest) then an ATOMIC on the
+  // PEER flag, enqueued on the SAME SDMA queue so the DMA engine executes the
+  // flag update strictly after the copy completes (in-order queue) -- a CU-free
+  // per-tile signal. NOTE: uses atomic INCREMENT (monotonic-generation
+  // semantics); consumers should wait `flag >= gen`. signalValue/signalOp are
+  // accepted for API parity but the SDMA path only wraps inc today.
+  if (bytes == 0) return;
+  if (core::FlatBlockThreadId() == 0) {
+    GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+    application::SymmMemObj* heapObj = globalGpuStates->heapObj;
+    int intraNodePe = pe % 8;
+
+    size_t offset = reinterpret_cast<uintptr_t>(dest) - globalGpuStates->heapBaseAddr;
+    size_t sigOffset = reinterpret_cast<uintptr_t>(signalDest) - globalGpuStates->heapBaseAddr;
+
+    uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
+    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[pe] + offset);
+    HSAuint64* sigPtr = reinterpret_cast<HSAuint64*>(heapObj->peerPtrs[pe] + sigOffset);
+
+    anvil::SdmaQueueDeviceHandle** devicehandles =
+        heapObj->deviceHandles_d + intraNodePe * heapObj->sdmaNumQueue;
+    HSAuint64* signalAddr = heapObj->signalPtrs + intraNodePe * heapObj->sdmaNumQueue;
+    HSAuint64* expectedSignals = heapObj->expectSignalsPtr + intraNodePe * heapObj->sdmaNumQueue;
+
+    // 1) COPY + queue completion atomic (for quiet), thread-scoped.
+    core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, signalAddr, expectedSignals,
+                        heapObj->sdmaNumQueue, qpId);
+    // 2) Peer-flag atomic on the SAME queue -> ordered after the copy.
+    anvil::SdmaQueueDeviceHandle handle = **(devicehandles + qpId);
+    uint64_t off = 0;
+    uint64_t base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), off);
+    uint64_t wptr = base;
+    auto pkt = anvil::CreateAtomicIncPacket(sigPtr);
+    handle.template placePacket<SDMA_PKT_ATOMIC>(pkt, wptr, off);
+    handle.submitPacket(base, wptr);
+    (void)signalValue;
+    (void)signalOp;
+  }
+  __syncthreads();
 }
 
 template <>
 inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::SDMA, false>(
     const void* dest, const void* source, size_t bytes, const void* signalDest,
     uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
-  // TODO: add SDMA PutMemNbiSignal (address-based)
-  (void)dest;
-  (void)source;
-  (void)bytes;
-  (void)signalDest;
-  (void)signalValue;
-  (void)signalOp;
-  (void)pe;
-  (void)qpId;
+  // Same as the onlyOneSignal=true SDMA path (see above).
+  ShmemPutMemNbiSignalBlockKernel<application::TransportType::SDMA, true>(
+      dest, source, bytes, signalDest, signalValue, signalOp, pe, qpId);
 }
 
 template <>
