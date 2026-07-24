@@ -575,7 +575,7 @@ def make_combine(
     fp4=False,
     reset_total_recv=True,
     _s3_cache=2,
-    _unroll=2,
+    _unroll=4,
 ):
     # Transport dtype = external dtype, except fp8_direct_cast wires fp8 while
     # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit). fp4: i32 = 8 fp4.
