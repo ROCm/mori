@@ -720,8 +720,12 @@ class MoriIoBenchmark:
                 dtype=torch.uint8,
             )
             dist.recv(recv_tensor, src=self.num_initiator_dev + self.role_rank)
-            if not self.batch_contiguous:
-                # Received data is packed (contiguous); compare to packed view of self.tensor
+            if not self.batch_contiguous and self.enable_batch_transfer:
+                # Received data is packed (contiguous); compare to packed view of self.tensor.
+                # Only run_batch_once() actually honors batch_contiguous (via
+                # _get_transfer_offsets); run_single_once() always uses contiguous
+                # offsets (buffer_size * i) regardless of the flag, so validation must
+                # match that when enable_batch_transfer is False.
                 stride = self.buffer_size + 1
                 expected = torch.empty(
                     self.buffer_size * self.transfer_batch_size,
@@ -735,13 +739,23 @@ class MoriIoBenchmark:
                         self.tensor[beg:end].view(torch.uint8)
                     )
                 assert torch.equal(recv_tensor, expected)
+            elif not self.batch_contiguous:
+                # run_single_once() (enable_batch_transfer=False) always issues
+                # transfers at contiguous offsets (buffer_size * i), ignoring
+                # batch_contiguous entirely, even though self.tensor was allocated
+                # oversized ((buffer_size+1)*batch) for the strided layout. Compare
+                # against the contiguous prefix that was actually transferred.
+                expected = self.tensor[
+                    : self.buffer_size * self.transfer_batch_size
+                ].view(torch.uint8)
+                assert torch.equal(recv_tensor, expected)
             else:
                 expected = self.tensor.view(torch.uint8)
                 assert torch.equal(recv_tensor, expected)
         else:
             # Without batch_contiguous, tensor has (buffer_size+1)*transfer_batch_size
             # elements; Gloo send size must match initiator recv (buffer_size*transfer_batch_size).
-            if not self.batch_contiguous:
+            if not self.batch_contiguous and self.enable_batch_transfer:
                 stride = self.buffer_size + 1
                 packed = torch.empty(
                     self.buffer_size * self.transfer_batch_size,
@@ -754,6 +768,11 @@ class MoriIoBenchmark:
                     packed[i * self.buffer_size : (i + 1) * self.buffer_size].copy_(
                         self.tensor[beg:end].view(torch.uint8)
                     )
+                dist.send(packed, dst=self.role_rank)
+            elif not self.batch_contiguous:
+                packed = self.tensor[
+                    : self.buffer_size * self.transfer_batch_size
+                ].view(torch.uint8)
                 dist.send(packed, dst=self.role_rank)
             else:
                 int8_view = self.tensor.view(torch.uint8)
@@ -958,6 +977,7 @@ class MoriIoBenchmark:
                     "create_session returned None for fabric: peers likely not in the "
                     "same vPOD, or remote memory is not fabric-exportable"
                 )
+
     def _wait_status(self, status):
         # Busy-poll spins on the completion flag (no cross-thread cv wakeup);
         # otherwise block on the condition variable.
@@ -1175,7 +1195,9 @@ class MoriIoBenchmark:
                     max_bw,
                     avg_launch,
                     avg_transfer,
-                ) = self._run_and_compute(cur_size, self.transfer_batch_size, self.iters)
+                ) = self._run_and_compute(
+                    cur_size, self.transfer_batch_size, self.iters
+                )
                 table.add_row(
                     [
                         cur_size,
@@ -1444,7 +1466,7 @@ def benchmark_xgmi(args):
             batch_contiguous=args.batch_contiguous,
             enable_sess=args.enable_sess,
             iters=args.iters,
-        warmup_iters=args.warmup_iters,
+            warmup_iters=args.warmup_iters,
             sweep=args.all,
             sweep_batch=args.all_batch,
             sweep_start_size=args.sweep_start_size,
