@@ -153,6 +153,10 @@ inline void EnablePeerAccess(int const deviceId, int const peerDeviceId) {
               << " (" << hipGetErrorString(error) << ")\n";
   }
 }
+// Hardware cap on SDMA channels per GPU pair on CDNA (4 queues/engine ×
+// 2 recommended engines). Requests above this are clamped, not failed.
+inline constexpr int kMaxSdmaChannelsPerPair = 8;
+
 inline int GetSdmaNumChannels(int defaultVal = 2) {
   const char* env = std::getenv("MORI_SDMA_NUM_CHANNELS");
   if (env != nullptr) {

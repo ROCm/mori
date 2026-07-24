@@ -334,7 +334,7 @@ TransportType Context::DefaultPolicyResolve(const PeerCapabilities& cap, bool is
 /*  SDMA queues materialized but did not go through BuildInitialEndpoints.  */
 /* ------------------------------------------------------------------------ */
 
-void Context::EnsureSdmaTransport() {
+void Context::EnsureSdmaTransport(int requestedChannels) {
   if (sdmaSetupDone) return;
 
   // anvil global init: do it lazily here rather than at Context construction
@@ -343,10 +343,13 @@ void Context::EnsureSdmaTransport() {
   // SDMA engines — see PeerCapabilities doc for context.
   anvil::anvil.init();
 
-  // GetSdmaNumChannels is a configuration knob (env or default 2), not a
-  // hardware probe. The real check is whether the loop body below succeeds
-  // for every canSDMA peer.
-  int sdmaNumChannels = anvil::GetSdmaNumChannels();
+  // Explicit request (CCO's reqs.sdmaQueueCount) wins; else env default.
+  int sdmaNumChannels = requestedChannels > 0 ? requestedChannels : anvil::GetSdmaNumChannels();
+  if (sdmaNumChannels > anvil::kMaxSdmaChannelsPerPair) {
+    MORI_APP_WARN("SDMA channels {} exceeds hardware max, clamping to {}", sdmaNumChannels,
+                  anvil::kMaxSdmaChannelsPerPair);
+    sdmaNumChannels = anvil::kMaxSdmaChannelsPerPair;
+  }
   MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
 
   for (int i = 0; i < WorldSize(); i++) {
@@ -354,6 +357,7 @@ void Context::EnsureSdmaTransport() {
     if (i != LocalRank()) anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
     anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
   }
+  sdmaChannels_ = sdmaNumChannels;
   sdmaSetupDone = true;
 }
 
