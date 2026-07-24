@@ -631,6 +631,11 @@ def make_combine(
             P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
         fx.barrier()
         P.fence_system_acquire()
+        if bid == 0:
+            if tid == 0:
+                P.atomic_add_global(
+                    fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64())
+                )
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
