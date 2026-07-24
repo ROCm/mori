@@ -630,7 +630,6 @@ def make_combine(
             ) + fx.Int64(tid) * fx.Int64(8)
             P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
         fx.barrier()
-        P.fence_system_acquire()
         if bid == 0:
             if tid == 0:
                 P.atomic_add_global(
