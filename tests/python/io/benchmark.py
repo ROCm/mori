@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 from tests.python.utils import TorchDistContext
+import numpy as np
 import torch
 import torch.distributed as dist
 from mori.io import (
@@ -230,10 +231,23 @@ def parse_args():
         help="Number of QPs for a single transfer (default: 4)",
     )
     parser.add_argument(
+        "--post-batch-size",
+        type=int,
+        default=-1,
+        help="Number of WRs posted per ibv_post_send batch; -1 = auto (default: -1)",
+    )
+    parser.add_argument(
         "--num-worker-threads",
         type=int,
         default=1,
         help="Number of threads used for transfer",
+    )
+    parser.add_argument(
+        "--busy-wait",
+        action="store_true",
+        help="Busy-poll (spin) on the transfer status instead of blocking on the "
+        "condition variable. Avoids the cross-thread cv-wakeup latency (~5-10us) "
+        "per completion at the cost of burning a core while waiting.",
     )
     parser.add_argument(
         "--disable-chunking",
@@ -280,6 +294,12 @@ def parse_args():
         type=int,
         default=128,
         help="Number of iterations running test",
+    )
+    parser.add_argument(
+        "--warmup-iters",
+        type=int,
+        default=10,
+        help="Number of untimed warmup iterations before each measured run (default: 10)",
     )
     parser.add_argument(
         "--poll_cq_mode",
@@ -333,6 +353,7 @@ class MoriIoBenchmark:
         batch_contiguous: bool = False,
         enable_sess: bool = False,
         iters: int = 128,
+        warmup_iters: int = 10,
         sweep: bool = False,
         sweep_batch: bool = False,
         sweep_start_size: int = 8,
@@ -347,7 +368,9 @@ class MoriIoBenchmark:
         num_target_dev: int = 1,
         target_dev_offset: int = 0,
         num_qp_per_transfer: int = 4,
+        post_batch_size: int = -1,
         num_worker_threads: int = 1,
+        busy_wait: bool = False,
         poll_cq_mode: str = "polling",
         max_send_wr: int = 0,
         max_cqe_num: int = 0,
@@ -371,6 +394,7 @@ class MoriIoBenchmark:
         self.batch_contiguous = batch_contiguous
         self.enable_sess = enable_sess
         self.iters = iters
+        self.warmup_iters = warmup_iters
         self.sweep = sweep
         self.sweep_batch = sweep_batch
         self.sweep_start_size = sweep_start_size
@@ -386,7 +410,9 @@ class MoriIoBenchmark:
         self.num_target_dev = num_target_dev
         self.target_dev_offset = target_dev_offset
         self.num_qp_per_transfer = num_qp_per_transfer
+        self.post_batch_size = post_batch_size
         self.num_worker_threads = num_worker_threads
+        self.busy_wait = busy_wait
         self.poll_cq_mode = (
             PollCqMode.POLLING if poll_cq_mode == "polling" else PollCqMode.EVENT
         )
@@ -564,7 +590,9 @@ class MoriIoBenchmark:
             print(f"  target_dev_offset: {self.target_dev_offset}")
             print(f"  mem_type: {self.mem_type}")
             print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
+            print(f"  post_batch_size: {self.post_batch_size}")
             print(f"  num_worker_threads: {self.num_worker_threads}")
+            print(f"  busy_wait: {self.busy_wait}")
             print(f"  enable_chunking: {self.enable_chunking}")
             if self.enable_chunking:
                 print(f"  chunk_bytes: {self.chunk_bytes}")
@@ -581,13 +609,17 @@ class MoriIoBenchmark:
         print(f"  batch_contiguous: {self.batch_contiguous}")
         print(f"  enable_sess: {self.enable_sess}")
         print(f"  iters: {self.iters}")
+        print(f"  warmup_iters: {self.warmup_iters}")
         print()
 
     def _get_transfer_offsets(self, buffer_size, transfer_batch_size, batched):
+        # np.uint64 matches the C++ `size_t` used by the batch APIs, so passing
+        # these arrays straight into mori's batch_read/batch_write is a zero-copy
+        # transfer instead of the per-element Python-list conversion.
         if batched and not self.batch_contiguous:
             stride = buffer_size + 1
-            return [i * stride for i in range(transfer_batch_size)]
-        return [i * buffer_size for i in range(transfer_batch_size)]
+            return np.arange(transfer_batch_size, dtype=np.uint64) * stride
+        return np.arange(transfer_batch_size, dtype=np.uint64) * buffer_size
 
     def _pack_tensor_segments(self, tensor, buffer_size, transfer_batch_size, batched):
         offsets = self._get_transfer_offsets(
@@ -688,8 +720,12 @@ class MoriIoBenchmark:
                 dtype=torch.uint8,
             )
             dist.recv(recv_tensor, src=self.num_initiator_dev + self.role_rank)
-            if not self.batch_contiguous:
-                # Received data is packed (contiguous); compare to packed view of self.tensor
+            if not self.batch_contiguous and self.enable_batch_transfer:
+                # Received data is packed (contiguous); compare to packed view of self.tensor.
+                # Only run_batch_once() actually honors batch_contiguous (via
+                # _get_transfer_offsets); run_single_once() always uses contiguous
+                # offsets (buffer_size * i) regardless of the flag, so validation must
+                # match that when enable_batch_transfer is False.
                 stride = self.buffer_size + 1
                 expected = torch.empty(
                     self.buffer_size * self.transfer_batch_size,
@@ -703,13 +739,23 @@ class MoriIoBenchmark:
                         self.tensor[beg:end].view(torch.uint8)
                     )
                 assert torch.equal(recv_tensor, expected)
+            elif not self.batch_contiguous:
+                # run_single_once() (enable_batch_transfer=False) always issues
+                # transfers at contiguous offsets (buffer_size * i), ignoring
+                # batch_contiguous entirely, even though self.tensor was allocated
+                # oversized ((buffer_size+1)*batch) for the strided layout. Compare
+                # against the contiguous prefix that was actually transferred.
+                expected = self.tensor[
+                    : self.buffer_size * self.transfer_batch_size
+                ].view(torch.uint8)
+                assert torch.equal(recv_tensor, expected)
             else:
                 expected = self.tensor.view(torch.uint8)
                 assert torch.equal(recv_tensor, expected)
         else:
             # Without batch_contiguous, tensor has (buffer_size+1)*transfer_batch_size
             # elements; Gloo send size must match initiator recv (buffer_size*transfer_batch_size).
-            if not self.batch_contiguous:
+            if not self.batch_contiguous and self.enable_batch_transfer:
                 stride = self.buffer_size + 1
                 packed = torch.empty(
                     self.buffer_size * self.transfer_batch_size,
@@ -722,6 +768,11 @@ class MoriIoBenchmark:
                     packed[i * self.buffer_size : (i + 1) * self.buffer_size].copy_(
                         self.tensor[beg:end].view(torch.uint8)
                     )
+                dist.send(packed, dst=self.role_rank)
+            elif not self.batch_contiguous:
+                packed = self.tensor[
+                    : self.buffer_size * self.transfer_batch_size
+                ].view(torch.uint8)
                 dist.send(packed, dst=self.role_rank)
             else:
                 int8_view = self.tensor.view(torch.uint8)
@@ -781,7 +832,7 @@ class MoriIoBenchmark:
         self.engine = IOEngine(key=f"{self.role.name}-{self.role_rank}", config=config)
         config = RdmaBackendConfig(
             qp_per_transfer=self.num_qp_per_transfer,
-            post_batch_size=-1,
+            post_batch_size=self.post_batch_size,
             num_worker_threads=self.num_worker_threads,
             poll_cq_mode=self.poll_cq_mode,
             enable_notification=False,
@@ -927,13 +978,21 @@ class MoriIoBenchmark:
                     "same vPOD, or remote memory is not fabric-exportable"
                 )
 
+    def _wait_status(self, status):
+        # Busy-poll spins on the completion flag (no cross-thread cv wakeup);
+        # otherwise block on the condition variable.
+        if self.busy_wait:
+            status.WaitBusy()
+        else:
+            status.Wait()
+
     def run_single_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
         if (
             self.backend_type in ("rdma", "fabric")
             or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
         ) and self.role is EngineRole.TARGET:
-            return 0
+            return 0, 0
 
         status_list = []
         transfer_uids = []
@@ -971,13 +1030,17 @@ class MoriIoBenchmark:
         for i in range(transfer_batch_size):
             status = func(*arg_list[i])
             status_list.append(status)
+        launched = time.time()
         for status in status_list:
-            status.Wait()
-        duration = time.time() - st
+            self._wait_status(status)
+        done = time.time()
+
+        launch_duration = launched - st
+        transfer_duration = done - launched
 
         for status in status_list:
             assert status.Succeeded(), f"Transfer failed: {status.Message()}"
-        return duration
+        return launch_duration, transfer_duration
 
     def run_batch_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
@@ -985,13 +1048,13 @@ class MoriIoBenchmark:
             self.backend_type in ("rdma", "fabric")
             or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
         ) and self.role is EngineRole.TARGET:
-            return 0
+            return 0, 0
 
         # Strided offsets prevent merging: each transfer becomes a separate WR (to stress SQ / reproduce notify ENOMEM)
         offsets = self._get_transfer_offsets(
             buffer_size, transfer_batch_size, batched=True
         )
-        sizes = [buffer_size for _ in range(transfer_batch_size)]
+        sizes = np.full(transfer_batch_size, buffer_size, dtype=np.uint64)
         transfer_uid = self.engine.allocate_transfer_uid()
 
         if self.enable_sess:
@@ -1025,12 +1088,17 @@ class MoriIoBenchmark:
             st = time.time()
             transfer_status = func(*args)[0]
 
-        transfer_status.Wait()
-        duration = time.time() - st
+        launched = time.time()
+        self._wait_status(transfer_status)
+        done = time.time()
+
+        launch_duration = launched - st
+        transfer_duration = done - launched
+
         assert (
             transfer_status.Succeeded()
         ), f"Batch transfer failed: {transfer_status.Message()}"
-        return duration
+        return launch_duration, transfer_duration
 
     def run_once(self, buffer_size, transfer_batch_size):
         if self.enable_batch_transfer:
@@ -1039,26 +1107,48 @@ class MoriIoBenchmark:
             return self.run_single_once(buffer_size, transfer_batch_size)
 
     def _run_and_compute(self, buffer_size, transfer_batch_size, iters):
-        latency = []
+        for _ in range(self.warmup_iters):
+            self.run_once(buffer_size, transfer_batch_size)
+
+        launch_latency = []
+        transfer_latency = []
         for _ in range(iters):
-            duration = self.run_once(buffer_size, transfer_batch_size)
-            latency.append(duration)
+            launch_duration, transfer_duration = self.run_once(
+                buffer_size, transfer_batch_size
+            )
+            launch_latency.append(launch_duration)
+            transfer_latency.append(transfer_duration)
 
         if self.role is EngineRole.TARGET and (
             self.backend_type in ("rdma", "fabric")
             or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
         ):
-            return 0, 0, 0, 0, 0
+            return 0, 0, 0, 0, 0, 0, 0
 
+        total_latency = [
+            launch + transfer
+            for launch, transfer in zip(launch_latency, transfer_latency)
+        ]
         total_mem_mb = buffer_size * transfer_batch_size / (10**6)
-        avg_duration = sum(latency) / len(latency)
-        min_duration = min(latency)
+        avg_duration = sum(total_latency) / len(total_latency)
+        min_duration = min(total_latency)
         avg_duration_us = avg_duration * (10**6)
         min_duration_us = min_duration * (10**6)
         avg_bw = total_mem_mb / (10**3) / avg_duration
         max_bw = total_mem_mb / (10**3) / min_duration
 
-        return total_mem_mb, avg_duration_us, min_duration_us, avg_bw, max_bw
+        avg_launch_us = sum(launch_latency) / len(launch_latency) * (10**6)
+        avg_transfer_us = sum(transfer_latency) / len(transfer_latency) * (10**6)
+
+        return (
+            total_mem_mb,
+            avg_duration_us,
+            min_duration_us,
+            avg_bw,
+            max_bw,
+            avg_launch_us,
+            avg_transfer_us,
+        )
 
     def _get_table_title(self):
         if self.backend_type == "xgmi":
@@ -1083,6 +1173,8 @@ class MoriIoBenchmark:
                 "Avg BW (GB/s)",
                 "Min Lat (us)",
                 "Avg Lat (us)",
+                "Avg Launch (us)",
+                "Avg Transfer (us)",
             ],
             title=self._get_table_title(),
         )
@@ -1095,10 +1187,16 @@ class MoriIoBenchmark:
                     self.backend_type == "xgmi" and self.xgmi_multiprocess
                 ):
                     dist.barrier()
-                total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                    self._run_and_compute(
-                        cur_size, self.transfer_batch_size, self.iters
-                    )
+                (
+                    total_mem_mb,
+                    avg_duration,
+                    min_duration,
+                    avg_bw,
+                    max_bw,
+                    avg_launch,
+                    avg_transfer,
+                ) = self._run_and_compute(
+                    cur_size, self.transfer_batch_size, self.iters
                 )
                 table.add_row(
                     [
@@ -1109,6 +1207,8 @@ class MoriIoBenchmark:
                         f"{avg_bw:.2f}",
                         f"{min_duration:.2f}",
                         f"{avg_duration:.2f}",
+                        f"{avg_launch:.2f}",
+                        f"{avg_transfer:.2f}",
                     ]
                 )
                 if self.sweep_step > 0:
@@ -1123,10 +1223,16 @@ class MoriIoBenchmark:
                     self.backend_type == "xgmi" and self.xgmi_multiprocess
                 ):
                     dist.barrier()
-                total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                    self._run_and_compute(
-                        self.buffer_size, cur_transfer_batch_size, self.iters
-                    )
+                (
+                    total_mem_mb,
+                    avg_duration,
+                    min_duration,
+                    avg_bw,
+                    max_bw,
+                    avg_launch,
+                    avg_transfer,
+                ) = self._run_and_compute(
+                    self.buffer_size, cur_transfer_batch_size, self.iters
                 )
                 table.add_row(
                     [
@@ -1137,14 +1243,22 @@ class MoriIoBenchmark:
                         f"{avg_bw:.2f}",
                         f"{min_duration:.2f}",
                         f"{avg_duration:.2f}",
+                        f"{avg_launch:.2f}",
+                        f"{avg_transfer:.2f}",
                     ]
                 )
                 cur_transfer_batch_size *= 2
         else:
-            total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                self._run_and_compute(
-                    self.buffer_size, self.transfer_batch_size, self.iters
-                )
+            (
+                total_mem_mb,
+                avg_duration,
+                min_duration,
+                avg_bw,
+                max_bw,
+                avg_launch,
+                avg_transfer,
+            ) = self._run_and_compute(
+                self.buffer_size, self.transfer_batch_size, self.iters
             )
             table.add_row(
                 [
@@ -1155,6 +1269,8 @@ class MoriIoBenchmark:
                     f"{avg_bw:.2f}",
                     f"{min_duration:.2f}",
                     f"{avg_duration:.2f}",
+                    f"{avg_launch:.2f}",
+                    f"{avg_transfer:.2f}",
                 ]
             )
 
@@ -1236,6 +1352,7 @@ def benchmark_xgmi_worker(local_rank, node_rank, args):
         batch_contiguous=args.batch_contiguous,
         enable_sess=args.enable_sess,
         iters=args.iters,
+        warmup_iters=args.warmup_iters,
         sweep=args.all,
         sweep_batch=args.all_batch,
         sweep_start_size=args.sweep_start_size,
@@ -1248,6 +1365,7 @@ def benchmark_xgmi_worker(local_rank, node_rank, args):
         dst_gpu=args.dst_gpu,
         num_streams=args.num_streams,
         num_events=args.num_events,
+        busy_wait=args.busy_wait,
         xgmi_multiprocess=True,
     )
     bench.print_config()
@@ -1271,6 +1389,7 @@ def benchmark_engine(local_rank, node_rank, args):
         batch_contiguous=args.batch_contiguous,
         enable_sess=args.enable_sess,
         iters=args.iters,
+        warmup_iters=args.warmup_iters,
         sweep=args.all,
         sweep_batch=args.all_batch,
         sweep_start_size=args.sweep_start_size,
@@ -1285,7 +1404,9 @@ def benchmark_engine(local_rank, node_rank, args):
         num_target_dev=args.num_target_dev,
         target_dev_offset=args.target_dev_offset,
         num_qp_per_transfer=args.num_qp_per_transfer,
+        post_batch_size=args.post_batch_size,
         num_worker_threads=args.num_worker_threads,
+        busy_wait=args.busy_wait,
         poll_cq_mode=args.poll_cq_mode,
         max_send_wr=args.max_send_wr,
         max_cqe_num=args.max_cqe_num,
@@ -1345,6 +1466,7 @@ def benchmark_xgmi(args):
             batch_contiguous=args.batch_contiguous,
             enable_sess=args.enable_sess,
             iters=args.iters,
+            warmup_iters=args.warmup_iters,
             sweep=args.all,
             sweep_batch=args.all_batch,
             sweep_start_size=args.sweep_start_size,
@@ -1355,6 +1477,7 @@ def benchmark_xgmi(args):
             dst_gpu=args.dst_gpu,
             num_streams=args.num_streams,
             num_events=args.num_events,
+            busy_wait=args.busy_wait,
             xgmi_multiprocess=False,
         )
         bench.print_config()
