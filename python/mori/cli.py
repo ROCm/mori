@@ -112,7 +112,7 @@ def _cmd_setup(rest: List[str]) -> int:
     ``mori setup --path``: print only the absolute path, suitable for
     shell substitution: ``source $(mori setup --path)``.
 
-    Ionic/Pollara QoS parameters are read from ``~/.mori.conf``. On the
+    Ionic/Pollara QoS parameters are read from ``~/.mori/mori.conf``. On the
     first setup of an Ionic host, the bundled template is copied there.
     ``--config`` selects another path.
     """
@@ -145,7 +145,7 @@ def _cmd_setup(rest: List[str]) -> int:
         "--config",
         metavar="FILE",
         help=(
-            "Ionic QoS configuration path (default: ~/.mori.conf; "
+            "Ionic QoS configuration path (default: ~/.mori/mori.conf; "
             "created from the bundled template on first use)"
         ),
     )

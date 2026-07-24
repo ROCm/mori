@@ -12,11 +12,11 @@
 #   mlx5 (Mellanox/NVIDIA ConnectX), via mlnx_qos + mlxconfig:
 #     mlx5_setup_pfc  / mlx5_setup_dcqcn  / mlx5_mori_env_setup
 #
-# Ionic reads its QoS/DCQCN settings from ~/.mori.conf. The bnxt and mlx5
+# Ionic reads its QoS/DCQCN settings from ~/.mori/mori.conf. The bnxt and mlx5
 # paths retain their existing constants for now.
 #
 # Usage:
-#   mori setup                         # uses ~/.mori.conf
+#   mori setup                         # uses ~/.mori/mori.conf
 #   mori setup --config /path/to/conf  # explicit config
 #   source env_setup.sh                # also exports MORI_RDMA_SL / MORI_RDMA_TC
 #
@@ -46,8 +46,8 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 die()      { echo -e "${RED}[FAIL]${NC} $*"; return 1; }
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-DEFAULT_CONFIG="$SCRIPT_DIR/.mori.conf"
-MORI_CONFIG_PATH="${MORI_QOS_CONFIG:-${HOME:-}/.mori.conf}"
+DEFAULT_CONFIG="$SCRIPT_DIR/mori.conf"
+MORI_CONFIG_PATH="${MORI_QOS_CONFIG:-${HOME:-}/.mori/mori.conf}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

@@ -775,7 +775,7 @@ def _try_precompile(root_dir: Path) -> None:
         print(f"[mori] Precompilation skipped: {e}")
 
 
-_BUNDLED_TOOL_FILES = ("env_check.sh", "env_setup.sh", "diagnose_env.sh", ".mori.conf")
+_BUNDLED_TOOL_FILES = ("env_check.sh", "env_setup.sh", "diagnose_env.sh", "mori.conf")
 
 
 def _sync_bundled_scripts() -> None:
@@ -874,7 +874,7 @@ mori_package_data = [
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
     "tools/*.sh",
-    "tools/.mori.conf",
+    "tools/mori.conf",
     "examples/cco/*",  # CCO C++ example binaries (only present when BUILD_EXAMPLES=ON)
     "benchmarks/cco/*",  # CCO benchmark binaries (only present when BUILD_BENCHMARK=ON)
 ]

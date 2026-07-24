@@ -21,6 +21,7 @@ python/mori/spdk_proxy
 python/mori/examples/*
 python/mori/benchmarks/*
 python/mori/cco/cco.cpp
+python/mori/cco/device/
 
 
 # local cco experiments (not for commit)
@@ -38,4 +39,4 @@ python/mori/_jit_sources/
 
 # Bundled tool resources copied into the package at build time
 python/mori/tools/*.sh
-python/mori/tools/.mori.conf
+python/mori/tools/mori.conf
