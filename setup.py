@@ -543,8 +543,16 @@ class CMakeBuild(build_ext):
             if build_xla_ffi_ops.upper() == "ON"
             else os.environ.get("BUILD_OPS_DEVICE", "OFF")
         )
-
-        BUILD_CCO_SDMA = os.environ.get("BUILD_CCO_SDMA", "OFF")
+        BUILD_CCO_SDMA = os.environ.get(
+            "BUILD_CCO_SDMA", "ON" if build_benchmark.upper() == "ON" else "OFF"
+        )
+        if build_benchmark.upper() == "ON" and BUILD_CCO_SDMA.upper() != "ON":
+            print(
+                "[mori] BUILD_BENCHMARK=ON requires BUILD_CCO_SDMA=ON "
+                "(cco benchmarks use ccoSdma); forcing BUILD_CCO_SDMA=ON.",
+                file=sys.stderr,
+            )
+            BUILD_CCO_SDMA = "ON"
 
         cmake_args = [
             "cmake",
