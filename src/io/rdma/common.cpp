@@ -71,6 +71,15 @@ static int GetSqBackoffTimeoutUs() {
   return kBackoffTimeoutUs;
 }
 
+static int GetSignalIntervalWr() {
+  static const int kSignalIntervalWr = []() {
+    int v = 0;
+    env::Override("MORI_IO_SIGNAL_INTERVAL_WR", v, mori::env::detail::ParseNonNegativeInt);
+    return v;
+  }();
+  return kSignalIntervalWr;
+}
+
 static void SetSqReserveFailureKind(SqReserveFailureKind* out, SqReserveFailureKind kind) {
   if (out != nullptr) *out = kind;
 }
@@ -884,6 +893,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   epWrsSinceSignal.assign(epNum, 0);
   epMergedSinceSignal.assign(epNum, 0);
 
+  const int signalIntervalWr = GetSignalIntervalWr();
+
   // Rotate the starting EP by transfer id so single-segment (single WR)
   // transfers spread evenly across all QPs instead of always landing on eps[0].
   int epStartOffset = static_cast<int>(id % static_cast<uint64_t>(epNum));
@@ -922,7 +933,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
 
     bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
     bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
-    bool needSignal = isLastBatchForEp || sqNearFull;
+    bool periodicSignal = signalIntervalWr > 0 && epWrsSinceSignal[epId] >= signalIntervalWr;
+    bool needSignal = isLastBatchForEp || sqNearFull || periodicSignal;
 
     struct ibv_send_wr& last = mergedWrs[end - 1].wr;
     uint64_t recordId = 0;
