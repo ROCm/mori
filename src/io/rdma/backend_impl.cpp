@@ -261,9 +261,7 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
   topo.reset(new application::TopoSystem());
 
   bool enableAsyncEvents = true;
-  if (const char* val = std::getenv("MORI_IO_ENABLE_ASYNC_EVENTS");
-      val != nullptr && val[0] != '\0')
-    enableAsyncEvents = mori::env::detail::ParseBool(val).value_or(true);
+  env::Override("MORI_IO_ENABLE_ASYNC_EVENTS", enableAsyncEvents, mori::env::detail::ParseBool);
   if (enableAsyncEvents) {
     auto logger = mori::ModuleLogger::GetInstance().GetLogger(mori::modules::IO);
     asyncEventMonitor_ = RdmaAsyncEventMonitor::Create(devices, logger);

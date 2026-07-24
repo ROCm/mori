@@ -79,9 +79,22 @@ class RdmaAsyncEventMonitor {
   GetResult ProcessOneEvent(Watch& watch) noexcept;
   void DescribeAndLog(const Watch& watch, const EventInfo& info) noexcept;
   void RemoveWatch(Watch& watch) noexcept;
+  void RestoreWatchFd(Watch& watch) noexcept;
   void DrainWake() noexcept;
   void RestoreFdFlags() noexcept;
   void Shutdown() noexcept;
+
+  // Logging on the monitor thread runs inside noexcept boundaries; swallow any
+  // spdlog exception so a formatting/sink failure can never call std::terminate.
+  template <typename FormatString, typename... Args>
+  void SafeLog(spdlog::level::level_enum level, const FormatString& fmt,
+               const Args&... args) noexcept {
+    if (!logger_) return;
+    try {
+      logger_->log(level, fmt, args...);
+    } catch (...) {
+    }
+  }
 
   std::shared_ptr<spdlog::logger> logger_;
   std::vector<Watch> watches_;

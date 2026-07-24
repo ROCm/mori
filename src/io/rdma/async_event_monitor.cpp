@@ -115,9 +115,16 @@ class AsyncEventAckGuard {
 
 std::unique_ptr<RdmaAsyncEventMonitor> RdmaAsyncEventMonitor::Create(
     const application::RdmaDeviceList& devices, std::shared_ptr<spdlog::logger> logger) {
-  std::unique_ptr<RdmaAsyncEventMonitor> monitor(new RdmaAsyncEventMonitor(std::move(logger)));
-  if (!monitor->Start(devices)) return nullptr;
-  return monitor;
+  // Thread creation and allocations can throw; a failed monitor must degrade to
+  // "no observability", never abort RDMA backend construction. On any throw the
+  // in-scope unique_ptr unwinds through Shutdown() and releases monitor fds.
+  try {
+    std::unique_ptr<RdmaAsyncEventMonitor> monitor(new RdmaAsyncEventMonitor(std::move(logger)));
+    if (!monitor->Start(devices)) return nullptr;
+    return monitor;
+  } catch (...) {
+    return nullptr;
+  }
 }
 
 RdmaAsyncEventMonitor::RdmaAsyncEventMonitor(std::shared_ptr<spdlog::logger> logger)
@@ -138,16 +145,14 @@ bool RdmaAsyncEventMonitor::Start(const application::RdmaDeviceList& devices) {
   for (Watch& watch : watches_) {
     int flags = fcntl(watch.asyncFd, F_GETFL);
     if (flags < 0) {
-      if (logger_)
-        logger_->error("RDMA async monitor: F_GETFL failed on {}: {}", watch.deviceName,
-                       std::strerror(errno));
+      SafeLog(spdlog::level::err, "RDMA async monitor: F_GETFL failed on {}: {}", watch.deviceName,
+              std::strerror(errno));
       return false;
     }
     watch.originalFdFlags = flags;
     if (!(flags & O_NONBLOCK) && fcntl(watch.asyncFd, F_SETFL, flags | O_NONBLOCK) < 0) {
-      if (logger_)
-        logger_->error("RDMA async monitor: F_SETFL O_NONBLOCK failed on {}: {}", watch.deviceName,
-                       std::strerror(errno));
+      SafeLog(spdlog::level::err, "RDMA async monitor: F_SETFL O_NONBLOCK failed on {}: {}",
+              watch.deviceName, std::strerror(errno));
       return false;
     }
     watch.changedFdFlags = !(flags & O_NONBLOCK);
@@ -155,14 +160,14 @@ bool RdmaAsyncEventMonitor::Start(const application::RdmaDeviceList& devices) {
 
   epollFd_ = epoll_create1(EPOLL_CLOEXEC);
   if (epollFd_ < 0) {
-    if (logger_)
-      logger_->error("RDMA async monitor: epoll_create1 failed: {}", std::strerror(errno));
+    SafeLog(spdlog::level::err, "RDMA async monitor: epoll_create1 failed: {}",
+            std::strerror(errno));
     return false;
   }
 
   wakeFd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (wakeFd_ < 0) {
-    if (logger_) logger_->error("RDMA async monitor: eventfd failed: {}", std::strerror(errno));
+    SafeLog(spdlog::level::err, "RDMA async monitor: eventfd failed: {}", std::strerror(errno));
     return false;
   }
 
@@ -170,8 +175,8 @@ bool RdmaAsyncEventMonitor::Start(const application::RdmaDeviceList& devices) {
   wake.events = EPOLLIN;
   wake.data.u64 = 0;
   if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, wakeFd_, &wake) < 0) {
-    if (logger_)
-      logger_->error("RDMA async monitor: epoll_ctl(wake) failed: {}", std::strerror(errno));
+    SafeLog(spdlog::level::err, "RDMA async monitor: epoll_ctl(wake) failed: {}",
+            std::strerror(errno));
     return false;
   }
 
@@ -180,9 +185,8 @@ bool RdmaAsyncEventMonitor::Start(const application::RdmaDeviceList& devices) {
     ev.events = EPOLLIN;
     ev.data.u64 = i + 1;
     if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, watches_[i].asyncFd, &ev) < 0) {
-      if (logger_)
-        logger_->error("RDMA async monitor: epoll_ctl({}) failed: {}", watches_[i].deviceName,
-                       std::strerror(errno));
+      SafeLog(spdlog::level::err, "RDMA async monitor: epoll_ctl({}) failed: {}",
+              watches_[i].deviceName, std::strerror(errno));
       return false;
     }
     watches_[i].registered = true;
@@ -199,8 +203,8 @@ void RdmaAsyncEventMonitor::MainLoop() noexcept {
     int n = epoll_wait(epollFd_, events, kMaxEvents, -1);
     if (n < 0) {
       if (errno == EINTR) continue;
-      if (logger_)
-        logger_->error("RDMA async monitor: epoll_wait failed: {}; stopping", std::strerror(errno));
+      SafeLog(spdlog::level::err, "RDMA async monitor: epoll_wait failed: {}; stopping",
+              std::strerror(errno));
       return;
     }
 
@@ -238,7 +242,7 @@ void RdmaAsyncEventMonitor::MainLoop() noexcept {
       }
     }
     if (!anyRegistered) {
-      if (logger_) logger_->error("RDMA async monitor: all async fds removed; stopping");
+      SafeLog(spdlog::level::err, "RDMA async monitor: all async fds removed; stopping");
       return;
     }
   }
@@ -249,9 +253,8 @@ RdmaAsyncEventMonitor::GetResult RdmaAsyncEventMonitor::ProcessOneEvent(Watch& w
   if (ibv_get_async_event(watch.context, &event) != 0) {
     if (errno == EINTR) return GetResult::kEvent;
     if (errno == EAGAIN || errno == EWOULDBLOCK) return GetResult::kDrained;
-    if (logger_)
-      logger_->error("RDMA async monitor: ibv_get_async_event failed on {}: {}", watch.deviceName,
-                     std::strerror(errno));
+    SafeLog(spdlog::level::err, "RDMA async monitor: ibv_get_async_event failed on {}: {}",
+            watch.deviceName, std::strerror(errno));
     return GetResult::kError;
   }
 
@@ -299,7 +302,8 @@ void RdmaAsyncEventMonitor::DescribeAndLog(const Watch& watch, const EventInfo& 
         int off = std::snprintf(detail, sizeof(detail), " port=%d", info.portNum);
         if (desc.queryPort && off > 0) {
           ibv_port_attr attr{};
-          if (ibv_query_port(watch.context, static_cast<uint8_t>(info.portNum), &attr) == 0) {
+          int qret = ibv_query_port(watch.context, static_cast<uint8_t>(info.portNum), &attr);
+          if (qret == 0) {
             std::snprintf(detail + off, sizeof(detail) - off,
                           " state=%d phys_state=%d link_layer=%d lid=%u active_speed=%u"
                           " active_width=%u",
@@ -308,7 +312,8 @@ void RdmaAsyncEventMonitor::DescribeAndLog(const Watch& watch, const EventInfo& 
                           static_cast<unsigned>(attr.active_speed),
                           static_cast<unsigned>(attr.active_width));
           } else {
-            std::snprintf(detail + off, sizeof(detail) - off, " query_port_failed errno=%d", errno);
+            std::snprintf(detail + off, sizeof(detail) - off, " query_port_failed ret=%d errno=%d",
+                          qret, errno);
           }
         }
       } else {
@@ -333,21 +338,30 @@ void RdmaAsyncEventMonitor::DescribeAndLog(const Watch& watch, const EventInfo& 
   spdlog::level::level_enum level = desc.severity == Severity::kError  ? spdlog::level::err
                                     : desc.severity == Severity::kWarn ? spdlog::level::warn
                                                                        : spdlog::level::info;
-  if (logger_) {
-    logger_->log(level, "RDMA async event {}{} (type={}) dev={} ctx={} async_fd={}{}", name,
-                 recovery, static_cast<int>(info.type), watch.deviceName,
-                 static_cast<const void*>(watch.context), watch.asyncFd, detail);
+  SafeLog(level, "RDMA async event {}{} (type={}) dev={} ctx={} async_fd={}{}", name, recovery,
+          static_cast<int>(info.type), watch.deviceName, static_cast<const void*>(watch.context),
+          watch.asyncFd, detail);
+}
+
+void RdmaAsyncEventMonitor::RestoreWatchFd(Watch& watch) noexcept {
+  if (!watch.changedFdFlags) return;
+  int ret;
+  do {
+    ret = fcntl(watch.asyncFd, F_SETFL, watch.originalFdFlags);
+  } while (ret < 0 && errno == EINTR);
+  if (ret < 0) {
+    SafeLog(spdlog::level::warn, "RDMA async monitor: failed to restore fd flags on {}: {}",
+            watch.deviceName, std::strerror(errno));
+    return;  // leave changedFdFlags set so a later restore attempt retries
   }
+  watch.changedFdFlags = false;
 }
 
 void RdmaAsyncEventMonitor::RemoveWatch(Watch& watch) noexcept {
   if (!watch.registered) return;
   epoll_ctl(epollFd_, EPOLL_CTL_DEL, watch.asyncFd, nullptr);
   watch.registered = false;
-  if (watch.changedFdFlags) {
-    fcntl(watch.asyncFd, F_SETFL, watch.originalFdFlags);
-    watch.changedFdFlags = false;
-  }
+  RestoreWatchFd(watch);
 }
 
 void RdmaAsyncEventMonitor::DrainWake() noexcept {
@@ -357,12 +371,7 @@ void RdmaAsyncEventMonitor::DrainWake() noexcept {
 }
 
 void RdmaAsyncEventMonitor::RestoreFdFlags() noexcept {
-  for (Watch& watch : watches_) {
-    if (watch.changedFdFlags) {
-      fcntl(watch.asyncFd, F_SETFL, watch.originalFdFlags);
-      watch.changedFdFlags = false;
-    }
-  }
+  for (Watch& watch : watches_) RestoreWatchFd(watch);
 }
 
 void RdmaAsyncEventMonitor::Shutdown() noexcept {
