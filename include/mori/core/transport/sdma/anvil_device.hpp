@@ -223,35 +223,6 @@ struct SdmaQueueDeviceHandle {
     return cur_index;
   }
 
-  // Sole-producer reservation: no CAS. Valid only when this queue has exactly
-  // one producing thread for the lifetime of the reservation (e.g. one leader
-  // lane per distinct queue). Keeps the wrap-pad + back-pressure (CanWriteUpto)
-  // logic, drops the compare-exchange arbitration.
-  __device__ __forceinline__ uint64_t ReserveQueueSpaceSingleProducer(
-      const size_t size_in_bytes, uint64_t& offset) {
-    const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
-    uint64_t cur_index =
-        __hip_atomic_load(cachedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    offset = 0;
-    if (WrapIntoRing(cur_index) + size_in_bytes > queue_size_in_bytes) {
-      offset = (queue_size_in_bytes - WrapIntoRing(cur_index));
-    }
-    const uint64_t new_index = cur_index + size_in_bytes + offset;
-    // Back-pressure only (not CAS): spin until the ring has room. CanWriteUpto
-    // refreshes cachedHwReadIndex from the hardware rptr.
-    int retries = 0;
-    while (!CanWriteUpto(new_index)) {
-      if constexpr (BREAK_ON_RETRIES) {
-        if (retries++ == MAX_RETRIES) {
-          assert(false && "Retry limit exceed on reserve queue space (single producer)");
-          break;
-        }
-      }
-    }
-    __hip_atomic_store(cachedWptr, new_index, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    return cur_index;
-  }
-
   template <typename PacketType>
   __device__ __forceinline__ void placePacket(PacketType& packet, uint64_t& pendingWptr,
                                               uint64_t offset) {

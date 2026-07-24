@@ -58,6 +58,10 @@ static constexpr int kRSPushMaxSlices = 8;
 static constexpr int kRSPushPktDwords = 16;   // sizeof(SDMA_PKT_COPY_WITH_ATOMIC)/4
 static constexpr int kRSPushSlotDwords = 17;  // padded stride (16 + 1)
 
+#ifndef RS_ENABLE_FALLBACK
+#define RS_ENABLE_FALLBACK 0
+#endif
+
 // ---------------------------------------------------------------------------
 // Reduction Op functors. The accumulator stays in the element type T (so bf16
 // reduces in bf16-width registers -- half the VGPRs of a float accumulator and
@@ -328,7 +332,10 @@ __device__ __forceinline__ void StartSdmaScatter(
   const size_t off = reinterpret_cast<uintptr_t>(dstLocal) - heapBase;
 
   // E.g maximum npes=8 with 8 slices per peer
-  if ((npes << logS) <= warpSize) {
+#if RS_ENABLE_FALLBACK
+  if ((npes << logS) <= warpSize) 
+#endif
+  {
     constexpr size_t paketSize = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
     // --- Fast path (LDS-staged): build packets into bank-conflict-free LDS ----
     // slots, then flush them to the rings with up to npes*S*4 threads (one
@@ -353,7 +360,7 @@ __device__ __forceinline__ void StartSdmaScatter(
         // the slice-0 lane reserves, so each queue has exactly one producer here --
         // use the CAS-free single-producer reserve.
         uint64_t offset = 0;
-        uint64_t sb = handle->ReserveQueueSpaceSingleProducer(paketSize << logS, offset);
+        uint64_t sb = handle->ReserveQueueSpaceCASFree(paketSize << logS, offset);
         if (offset) handle->fillNops(sb, offset);
         sStart[peer] = sb;
         sOff[peer] = offset;
@@ -410,7 +417,9 @@ __device__ __forceinline__ void StartSdmaScatter(
       auto* handle = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
       handle->submitPacket(sStart[peer], sStart[peer] + sOff[peer] + (paketSize << logS));
     }
-  } else {
+  } 
+#if RS_ENABLE_FALLBACK
+  else {
     // --- Fallback (npes*S > warpSize): warp-strided, one warp per peer. ---
     const int w = tid / warpSize;
     const int numW = blockDim.x / warpSize;
@@ -425,6 +434,7 @@ __device__ __forceinline__ void StartSdmaScatter(
           /*addVal=*/(1ull << myPe));
     }
   }
+#endif
 }
 
 template <int VecBytes, int NumVecs, class T, template <class> class OpT>
