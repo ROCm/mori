@@ -21,7 +21,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """
-CCO Example 07 — Import a torch.symm_mem tensor into the flat LSA space
+CCO Example 08 — Import a torch.symm_mem tensor into the flat LSA space
 ======================================================================
 
 A tensor allocated by ``torch.distributed._symmetric_memory`` is HIP-VMM
