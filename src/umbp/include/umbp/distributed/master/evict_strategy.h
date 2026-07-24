@@ -27,8 +27,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "umbp/distributed/master/global_block_index.h"  // EvictionCandidate
-#include "umbp/distributed/types.h"                      // TierType
+#include "umbp/distributed/types.h"  // EvictionCandidate, TierType
 
 namespace mori::umbp {
 

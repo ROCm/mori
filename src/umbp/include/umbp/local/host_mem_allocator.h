@@ -31,6 +31,10 @@ enum class HostBufferBacking : int {
   kAnonymous = 0,
   kAnonymousHugetlb = 1,
   kAnonymousShm = 2,
+  // Like kAnonymousShm (fd-shareable via memfd+SCM_RIGHTS) but hugetlbfs-
+  // backed (MFD_HUGETLB+MAP_HUGETLB): some RDMA NICs have a small MTT table
+  // and cannot register a large 4 KiB-paged region.
+  kAnonymousShmHugetlb = 3,
 };
 
 struct HostBufferOptions {

@@ -330,10 +330,8 @@ add_library(
   ${UMBP_PEER_GRPC_SRCS}
   ${UMBP_STANDALONE_PROTO_SRCS}
   ${UMBP_STANDALONE_GRPC_SRCS}
-  distributed/master/global_block_index.cpp
-  distributed/master/external_kv_block_index.cpp
-  distributed/master/client_registry.cpp
-  distributed/master/external_kv_hit_index.cpp
+  distributed/master/in_memory_master_metadata_store.cpp
+  distributed/master/master_metadata_store_factory.cpp
   distributed/master/master_server.cpp
   distributed/master/master_client.cpp
   distributed/master/rpc_latency_timer.cpp
@@ -375,6 +373,53 @@ target_link_libraries(
                      ${_PROTOBUF_LIBS} ${_GRPCPP_LIB})
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
+
+# ---------- Optional Redis / RESP master metadata backend --------------------
+# Makes the master stateless by storing all metadata in an external RESP store
+# (Redis / Dragonfly / Valkey). OFF by default so existing builds are
+# unaffected; enable with -DUSE_REDIS_BACKEND=ON. The RESP client seam is built
+# on hiredis (RespClient isolates the client library from the store).
+option(USE_REDIS_BACKEND
+       "Build the RESP-compatible Redis master metadata backend" OFF)
+if(USE_REDIS_BACKEND)
+  find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h REQUIRED)
+  find_library(HIREDIS_LIB NAMES hiredis REQUIRED)
+  message(
+    STATUS
+      "UMBP Redis backend ENABLED (hiredis lib: ${HIREDIS_LIB}, include: ${HIREDIS_INCLUDE_DIR})"
+  )
+
+  # redis-plus-plus (3rdparty submodule) — the cluster/sentinel/pooling-capable
+  # client the Redis backend standardizes on. Built from source so any build
+  # image works without an extra system package; only the client library needs
+  # a submodule (hiredis stays the system lib). Static + PIC (umbp_common is
+  # linked into the shared pybind module), C++17, tests off. The store code does
+  # not depend on it yet (that migration is a later step); building it here
+  # de-risks the dependency (toolchain, -Werror, link) before the seam rebase.
+  set(_REDISPP_DIR "${CMAKE_SOURCE_DIR}/3rdparty/redis-plus-plus")
+  if(NOT EXISTS "${_REDISPP_DIR}/CMakeLists.txt")
+    message(
+      FATAL_ERROR
+        "USE_REDIS_BACKEND=ON but 3rdparty/redis-plus-plus is empty; run "
+        "'git submodule update --init --recursive 3rdparty/redis-plus-plus'")
+  endif()
+  set(REDIS_PLUS_PLUS_BUILD_TEST OFF CACHE BOOL "" FORCE)
+  set(REDIS_PLUS_PLUS_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+  set(REDIS_PLUS_PLUS_BUILD_STATIC ON CACHE BOOL "" FORCE)
+  set(REDIS_PLUS_PLUS_CXX_STANDARD 17 CACHE STRING "" FORCE)
+  add_subdirectory("${_REDISPP_DIR}"
+                   "${CMAKE_BINARY_DIR}/3rdparty/redis-plus-plus")
+
+  target_sources(
+    umbp_common PRIVATE distributed/master/redis/resp_client.cpp
+                        distributed/master/redis/resp_cluster_client.cpp
+                        distributed/master/redis_master_metadata_store.cpp)
+  target_include_directories(umbp_common PRIVATE ${HIREDIS_INCLUDE_DIR})
+  # redis++_static carries its own (and hiredis') include dirs; link it before
+  # hiredis so the static archive's hiredis symbols resolve.
+  target_link_libraries(umbp_common PUBLIC redis++_static ${HIREDIS_LIB})
+  target_compile_definitions(umbp_common PUBLIC USE_REDIS_BACKEND)
+endif()
 
 if(MORI_UMBP_TESTING)
   target_compile_definitions(umbp_common PUBLIC MORI_UMBP_TESTING)
@@ -427,6 +472,6 @@ set_target_properties(umbp_standalone_server PROPERTIES BUILD_RPATH "$ORIGIN"
                                                         INSTALL_RPATH "$ORIGIN"
                                                         BUILD_WITH_INSTALL_RPATH TRUE)
 
-if(BUILD_TESTS)
-  add_subdirectory(tests)
-endif()
+# UMBP unit tests live under tests/cpp/umbp (built when BUILD_TESTS=ON); they
+# were previously duplicated here under src/umbp/tests with a second GoogleTest
+# fetch.

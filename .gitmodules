@@ -9,3 +9,6 @@
 	path = 3rdparty/spdk
 	url = https://github.com/spdk/spdk.git
 	shallow = true
+[submodule "3rdparty/redis-plus-plus"]
+	path = 3rdparty/redis-plus-plus
+	url = https://github.com/sewenew/redis-plus-plus.git

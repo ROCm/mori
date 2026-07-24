@@ -99,6 +99,11 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // This demo drives MasterClient directly (it does not go through PoolClient,
+  // which is what normally honors config.auto_heartbeat on Init). Start the
+  // heartbeat thread so the master's reaper does not expire us.
+  client.StartHeartbeat();
+
   constexpr auto kOperationInterval = std::chrono::seconds(3);
   uint64_t iteration = 0;
 
