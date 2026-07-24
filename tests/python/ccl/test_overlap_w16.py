@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# Cross-node overlap UT for the hp_sdma path (world>=16, torchrun-only).
+#
+# hp_sdma leaves the GPU free (cross-node leg CPU-posted, intra-node leg on the
+# XGMI SDMA engine); RCCL all_gather runs a CU-resident kernel that steals GPU from
+# concurrent GEMMs. Metric: GEMM-only completion time (compute-stream events) under
+# N concurrent AllGathers; lower = less compute disturbance. Bit-exact gate
+# (torch.equal vs RCCL) before timing. MORI_OVERLAP_ASSERT=1 asserts hp_sdma < RCCL.
+import argparse
+import os
+import sys
+import time
+import traceback
+import pytest
+import torch
+import torch.distributed as dist
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+import mori.shmem as shmem  # noqa: E402
+
+# Cross-node (world>=16) torchrun-only overlap bench: SKIP under a plain `pytest`
+# collection (no torchrun env) so the suite does not ERROR; runs only when
+# torchrun sets RANK/WORLD_SIZE.
+pytestmark = pytest.mark.skipif(
+    "RANK" not in os.environ or "WORLD_SIZE" not in os.environ,
+    reason="cross-node (world>=16) harness; launch under torchrun",
+)
+
+
+def _env_on(n, d="0"):
+    return os.environ.get(n, d) not in ("0", "", "false", "False")
+
+
+def _build_handle(rank, ws, rpn, per_rank_bytes, device):
+    from mori.ccl.host_proxy_ag import HostProxyHierAllGather
+
+    cap = max(
+        per_rank_bytes,
+        int(os.environ.get("MORI_FSDP_HOSTPROXY_CAP_MB", "512")) * (1 << 20),
+    )
+    return HostProxyHierAllGather(
+        my_pe=rank,
+        npes=ws,
+        ranks_per_node=rpn,
+        output_buffer_size=cap * ws,
+        device=device,
+    )
+
+
+def _wall(fn, reps, warmup):
+    for _ in range(warmup):
+        fn()
+        torch.cuda.synchronize()
+    ts = []
+    for _ in range(reps):
+        torch.cuda.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        ts.append((time.perf_counter() - t0) * 1e3)
+    return min(ts)
+
+
+def _worker(rank, ws, rpn, device, size_mb, nops, gemm_n, reps, warmup):
+    per = size_mb * 1024 * 1024 + 4096
+    os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", str(per * ws * 3 + (1 << 28)))
+    shmem.shmem_torch_process_group_init("default")
+    async_hp = _env_on("MORI_HOSTPROXY_ASYNC", "0")
+    if async_hp:
+        os.environ.setdefault("MORI_HOSTPROXY_ASYNC_RING", "2")
+    h = _build_handle(rank, ws, rpn, per, device)
+    numel = (size_mb * 1024 * 1024) // 4
+    R = 4
+    inp = [
+        (torch.arange(numel, device=device, dtype=torch.float32) + rank * 131.0 + i)
+        for i in range(R)
+    ]
+    outm = [
+        torch.empty(numel * ws, dtype=torch.float32, device=device) for _ in range(R)
+    ]
+    outr = [
+        torch.empty(numel * ws, dtype=torch.float32, device=device) for _ in range(R)
+    ]
+    a = torch.randn(gemm_n, gemm_n, device=device, dtype=torch.bfloat16)
+    b = torch.randn(gemm_n, gemm_n, device=device, dtype=torch.bfloat16)
+    g = torch.empty(gemm_n, gemm_n, device=device, dtype=torch.bfloat16)
+    main = torch.cuda.current_stream()
+    comm = torch.cuda.Stream()
+    comp = torch.cuda.Stream()
+    # bit-exact gate
+    dist.all_gather_into_tensor(outr[0], inp[0])
+    assert h(inp[0], outm[0], numel, main)
+    main.synchronize()
+    torch.cuda.synchronize()
+    bx = bool(torch.equal(outm[0], outr[0]))
+    assert bx, "bitexact MISMATCH"
+
+    gi = int(os.environ.get("MORI_MANYOP_GEMM_ITERS", "1"))
+    ev0 = torch.cuda.Event(enable_timing=True)
+    ev1 = torch.cuda.Event(enable_timing=True)
+
+    # GEMM-only completion time (compute-stream events) while AGs run concurrently.
+    # ag_pre: RCCL AGs on the comm stream before timing. ag_mid: host-proxy AG loop
+    # after the GEMMs are queued (CPU-driven, overlaps the GPU GEMMs).
+    def timed_gemm(ag_pre=None, ag_mid=None):
+        def once():
+            comm.wait_stream(main)
+            comp.wait_stream(main)
+            if ag_pre is not None:
+                ag_pre()
+            ev0.record(comp)
+            with torch.cuda.stream(comp):
+                for _ in range(nops):
+                    for _ in range(gi):
+                        torch.matmul(a, b, out=g)
+            ev1.record(comp)
+            if ag_mid is not None:
+                ag_mid()
+            main.wait_stream(comm)
+            main.wait_stream(comp)
+            torch.cuda.synchronize()
+            dist.barrier()
+            return ev0.elapsed_time(ev1)
+
+        for _ in range(warmup):
+            once()
+        return min(once() for _ in range(reps))
+
+    def rccl_pre():
+        with torch.cuda.stream(comm):
+            for i in range(nops):
+                dist.all_gather_into_tensor(outr[i % R], inp[i % R])
+
+    def mori_mid(h=h):
+        if async_hp:
+            for i in range(nops):
+                hh = h.call_async(inp[i % R], outm[i % R], numel, main)
+                h._complete(hh)
+        else:
+            for i in range(nops):
+                assert h(inp[i % R], outm[i % R], numel, main)
+
+    g_rccl = timed_gemm(ag_pre=rccl_pre)
+    g_mori = timed_gemm(ag_mid=mori_mid)
+    if rank == 0:
+        speedup = g_rccl / g_mori if g_mori > 0 else 0.0
+        win = "hp_sdma" if g_mori < g_rccl else "RCCL"
+        print(
+            f"[overlap-w16] nops={nops} shard={size_mb}MB gemm_n={gemm_n} | "
+            f"GEMM time under concurrent AllGather: rccl={g_rccl:.2f}ms "
+            f"hp_sdma={g_mori:.2f}ms | hp_sdma {speedup:.2f}x faster | win={win} | bitexact={bx}"
+        )
+        if os.environ.get("MORI_OVERLAP_ASSERT", "0") not in ("0", "", "false"):
+            assert (
+                g_mori < g_rccl
+            ), f"overlap thesis FAILED: hp_sdma GEMM {g_mori:.2f}ms >= RCCL {g_rccl:.2f}ms"
+            print("test_overlap_w16: PASSED")
+    torch.cuda.synchronize()
+    dist.barrier()
+    del h
+    dist.barrier()
+    shmem.shmem_finalize()
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument("--size-mb", type=int, default=8)
+    p.add_argument("--nops", type=int, default=50)
+    p.add_argument("--gemm-n", type=int, default=2048)
+    p.add_argument("--reps", type=int, default=8)
+    p.add_argument("--warmup", type=int, default=5)
+    a = p.parse_args(argv)
+    os.environ.setdefault("MORI_ENABLE_SDMA", "1")
+    rank = int(os.environ["RANK"])
+    ws = int(os.environ["WORLD_SIZE"])
+    lr = int(os.environ.get("LOCAL_RANK", rank))
+    rpn = int(os.environ.get("LOCAL_WORLD_SIZE", ws))
+    torch.cuda.set_device(lr)
+    device = torch.device(f"cuda:{lr}")
+    dist.init_process_group(
+        backend="cpu:gloo,cuda:nccl", rank=rank, world_size=ws, device_id=device
+    )
+    torch._C._distributed_c10d._register_process_group(
+        "default", torch.distributed.group.WORLD
+    )
+    try:
+        _worker(rank, ws, rpn, device, a.size_mb, a.nops, a.gemm_n, a.reps, a.warmup)
+    finally:
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+
+
+def test_overlap_w16():
+    """Pytest entry: torchrun-only (module pytestmark); uses CLI defaults."""
+    main([])
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        raise SystemExit(1)

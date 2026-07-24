@@ -349,10 +349,19 @@ void Context::EnsureSdmaTransport() {
   int sdmaNumChannels = anvil::GetSdmaNumChannels();
   MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
 
+  // Within-node HIP device id = count of same-host peers before the rank
+  // (not globalRank % 8, which faults under sliced HIP_VISIBLE_DEVICES).
+  int localDevId = 0;
+  for (int j = 0; j < LocalRank(); j++)
+    if (peerInfos[j].sameHost) localDevId++;
   for (int i = 0; i < WorldSize(); i++) {
     if (!peerCaps[i].canSDMA) continue;
-    if (i != LocalRank()) anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
-    anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
+    // Peer within-node device id: count of same-host peers before it.
+    int peerDevId = 0;
+    for (int j = 0; j < i; j++)
+      if (peerInfos[j].sameHost) peerDevId++;
+    if (i != LocalRank()) anvil::EnablePeerAccess(localDevId, peerDevId);
+    anvil::anvil.connect(localDevId, peerDevId, sdmaNumChannels);
   }
   sdmaSetupDone = true;
 }

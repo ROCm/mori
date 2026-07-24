@@ -272,10 +272,11 @@ int ShmemBufferDeregister(void* ptr, size_t size) {
   return 0;
 }
 
-application::SymmMemObjPtr ShmemSymmetricRegister(void* ptr, size_t size) {
+application::SymmMemObjPtr ShmemSymmetricRegister(void* ptr, size_t size, bool rdmaRegister) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
-  return states->memoryStates->symmMemMgr->RegisterSymmMemObj(ptr, size);
+  return states->memoryStates->symmMemMgr->RegisterSymmMemObj(ptr, size, /*heap_begin=*/false,
+                                                              rdmaRegister);
 }
 
 int ShmemSymmetricDeregister(void* ptr, size_t size) {

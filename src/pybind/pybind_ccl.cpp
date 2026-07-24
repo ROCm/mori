@@ -27,8 +27,12 @@
 
 #include "mori/collective/all2all/oneshot_all2all_sdma_class.hpp"
 #include "mori/collective/allgather/allgather_into_tensor.hpp"
+#include "mori/collective/allgather/intra_node_subgroup_broadcast_sdma_class.hpp"
+#include "mori/collective/allgather/intra_node_subgroup_sdma_class.hpp"
 #include "mori/collective/allgather/oneshot_allgather_sdma_class.hpp"
 #include "mori/collective/allreduce/twoshot_allreduce_sdma_class.hpp"
+#include "mori/collective/ccl_kernel_args.hpp"
+#include "mori/collective/inter_node/inter_node_ring_class.hpp"
 #include "src/pybind/mori.hpp"
 
 namespace py = pybind11;
@@ -296,6 +300,190 @@ void RegisterMoriCcl(pybind11::module_& m) {
           py::arg("ptr"), "Check whether an output buffer is registered for direct SDMA writes");
 
   // =========================================================================
+  // InterNodeRingAllgather — inter-node RDMA ring, JIT launch path
+  // =========================================================================
+  using InterNodeRing = mori::collective::InterNodeRingAllgather;
+  py::class_<InterNodeRing>(m, "InterNodeRingAllgatherHandle")
+      .def(py::init<int, int, size_t, int, int, int, int, int, int>(), py::arg("my_pe"),
+           py::arg("npes"), py::arg("ring_buffer_bytes") = 512 * 1024 * 1024,
+           py::arg("ring_size") = -1, py::arg("ring_pos") = -1, py::arg("pe_base") = 0,
+           py::arg("pe_stride") = 1, py::arg("num_qp") = 1, py::arg("num_blocks") = 1)
+      .def(
+          "prepare_sync",
+          [](InterNodeRing& self, uintptr_t input, size_t count, int64_t stream) -> int64_t {
+            return self.prepare_sync(input, count, reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("input_ptr"), py::arg("count"), py::arg("stream"))
+      .def(
+          "slot_ptr",
+          [](InterNodeRing& self, size_t count) -> uintptr_t { return self.slot_ptr(count); },
+          py::arg("count"))
+      .def(
+          "prepare_sync_in_place",
+          [](InterNodeRing& self, size_t count, int64_t stream) -> int64_t {
+            return self.prepare_sync_in_place(count, reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("count"), py::arg("stream"))
+      .def(
+          "finish_sync",
+          [](InterNodeRing& self, uintptr_t output, size_t count, int64_t stream) -> double {
+            return self.finish_sync(output, count, reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
+      .def("buf_ptr", [](InterNodeRing& self) -> uintptr_t { return self.buf_ptr(); })
+      // stream-ordered prepare/finish (ShmemBarrierOnStream
+      // instead of host hipStreamSynchronize + host ShmemBarrierAll).
+      .def(
+          "prepare_stream",
+          [](InterNodeRing& self, uintptr_t input, size_t count, int64_t stream) -> int64_t {
+            return self.prepare_stream(input, count, reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("input_ptr"), py::arg("count"), py::arg("stream"))
+      .def(
+          "prepare_stream_in_place",
+          [](InterNodeRing& self, size_t count, int64_t stream) -> int64_t {
+            return self.prepare_stream_in_place(count, reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("count"), py::arg("stream"))
+      .def(
+          "finish_stream",
+          [](InterNodeRing& self, uintptr_t output, size_t count, int64_t stream,
+             bool barrier) -> double {
+            return self.finish_stream(output, count, reinterpret_cast<hipStream_t>(stream),
+                                      barrier);
+          },
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream"), py::arg("barrier") = true)
+      .def(
+          "finish_stream_no_copy",
+          [](InterNodeRing& self, int64_t stream) -> double {
+            return self.finish_stream_no_copy(reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("stream"));
+
+  // =========================================================================
+  // IntraNodeSubGroupAllgatherSdma — intra-node SDMA gather over a sub-group
+  //
+  // =========================================================================
+  using IntraSubGroup = mori::collective::IntraNodeSubGroupAllgatherSdma;
+  py::class_<IntraSubGroup>(m, "IntraNodeSubGroupAllgatherSdmaHandle")
+      .def(py::init<int, int, size_t, int, int, int, int>(), py::arg("my_pe"), py::arg("npes"),
+           py::arg("out_buffer_bytes") = 512 * 1024 * 1024, py::arg("group_size") = -1,
+           py::arg("group_pos") = -1, py::arg("pe_base") = 0, py::arg("pe_stride") = 1)
+      .def(
+          "prepare_sync",
+          [](IntraSubGroup& self, uintptr_t input, size_t count, int64_t stream, bool barrier,
+             size_t dst_base_offset_bytes, size_t dst_slot_stride_bytes) -> int64_t {
+            return self.prepare_sync(input, count, reinterpret_cast<hipStream_t>(stream), barrier,
+                                     dst_base_offset_bytes, dst_slot_stride_bytes);
+          },
+          py::arg("input_ptr"), py::arg("count"), py::arg("stream"), py::arg("barrier") = true,
+          py::arg("dst_base_offset_bytes") = 0, py::arg("dst_slot_stride_bytes") = 0)
+      .def(
+          "finish_sync",
+          [](IntraSubGroup& self, uintptr_t output, size_t count, int64_t stream,
+             bool barrier) -> double {
+            return self.finish_sync(output, count, reinterpret_cast<hipStream_t>(stream), barrier);
+          },
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream"), py::arg("barrier") = true)
+      .def(
+          "finish_batch",
+          [](IntraSubGroup& self, uintptr_t output, size_t total_count, int64_t stream,
+             bool barrier) -> double {
+            return self.finish_batch(output, total_count, reinterpret_cast<hipStream_t>(stream),
+                                     barrier);
+          },
+          py::arg("output_ptr"), py::arg("total_count"), py::arg("stream"),
+          py::arg("barrier") = true)
+      .def(
+          "finish_batch_stream",
+          [](IntraSubGroup& self, uintptr_t output, size_t total_count, int64_t stream,
+             bool barrier) -> double {
+            return self.finish_batch_stream(output, total_count,
+                                            reinterpret_cast<hipStream_t>(stream), barrier);
+          },
+          py::arg("output_ptr"), py::arg("total_count"), py::arg("stream"),
+          py::arg("barrier") = true)
+      .def(
+          "get_output_transit_buffer",
+          [](IntraSubGroup& self) -> py::tuple {
+            return py::make_tuple(self.out_ptr(), self.out_bytes());
+          },
+          "Return (ptr, size_bytes) of the internal transit out_ buffer")
+      .def(
+          "register_output_buffer",
+          [](IntraSubGroup& self, uintptr_t ptr, size_t size) {
+            self.register_output_buffer(ptr, size);
+          },
+          py::arg("output_ptr"), py::arg("size"))
+      .def(
+          "deregister_output_buffer",
+          [](IntraSubGroup& self, uintptr_t ptr) { self.deregister_output_buffer(ptr); },
+          py::arg("output_ptr"))
+      .def(
+          "is_output_registered",
+          [](IntraSubGroup& self, uintptr_t ptr, size_t size) {
+            return self.is_output_registered(ptr, size);
+          },
+          py::arg("output_ptr"), py::arg("size"))
+      .def(
+          "prepare_sync_direct",
+          [](IntraSubGroup& self, uintptr_t input, size_t count, int64_t stream, bool barrier,
+             uintptr_t output_ptr, size_t dst_block_offset_bytes, size_t dst_slot_stride_bytes,
+             size_t flag_slot_base) -> int64_t {
+            return self.prepare_sync_direct(input, count, reinterpret_cast<hipStream_t>(stream),
+                                            barrier, output_ptr, dst_block_offset_bytes,
+                                            dst_slot_stride_bytes, flag_slot_base);
+          },
+          py::arg("input_ptr"), py::arg("count"), py::arg("stream"), py::arg("barrier") = true,
+          py::arg("output_ptr") = 0, py::arg("dst_block_offset_bytes") = 0,
+          py::arg("dst_slot_stride_bytes") = 0, py::arg("flag_slot_base") = 0)
+      .def(
+          "prepare_sync_direct_param_contiguous",
+          [](IntraSubGroup& self, uintptr_t input, int64_t stream, bool barrier,
+             uintptr_t output_ptr, size_t block_stride_u32, int num_blocks, size_t world_size,
+             uintptr_t split_sizes_ptr, uintptr_t split_offsets_ptr, size_t split_count,
+             size_t dst_block_offset_bytes, int first_block) -> int64_t {
+            return self.prepare_sync_direct_param_contiguous(
+                input, reinterpret_cast<hipStream_t>(stream), barrier, output_ptr, block_stride_u32,
+                num_blocks, world_size, split_sizes_ptr, split_offsets_ptr, split_count,
+                dst_block_offset_bytes, first_block);
+          },
+          py::arg("input_ptr"), py::arg("stream"), py::arg("barrier") = true,
+          py::arg("output_ptr") = 0, py::arg("block_stride_u32") = 0, py::arg("num_blocks") = 1,
+          py::arg("world_size") = 0, py::arg("split_sizes_ptr") = 0,
+          py::arg("split_offsets_ptr") = 0, py::arg("split_count") = 0,
+          py::arg("dst_block_offset_bytes") = 0, py::arg("first_block") = 0)
+      .def(
+          "finish_direct_stream",
+          [](IntraSubGroup& self, int64_t stream, bool barrier) -> double {
+            return self.finish_direct_stream(reinterpret_cast<hipStream_t>(stream), barrier);
+          },
+          py::arg("stream"), py::arg("barrier") = true);
+
+  // =========================================================================
+  // IntraNodeSubGroupBroadcastSdma — intra-node SDMA broadcast over a sub-group
+  // (intra-node placement phase of the leader-only hierarchical AllGather).
+  // Root (group_pos 0) fans its full buffer to all members via XGMI.
+  // =========================================================================
+  using IntraBcast = mori::collective::IntraNodeSubGroupBroadcastSdma;
+  py::class_<IntraBcast>(m, "IntraNodeSubGroupBroadcastSdmaHandle")
+      .def(py::init<int, int, size_t, int, int, int, int>(), py::arg("my_pe"), py::arg("npes"),
+           py::arg("out_buffer_bytes") = 512 * 1024 * 1024, py::arg("group_size") = -1,
+           py::arg("group_pos") = -1, py::arg("pe_base") = 0, py::arg("pe_stride") = 1)
+      .def(
+          "prepare_sync",
+          [](IntraBcast& self, uintptr_t input, size_t count, int64_t stream) -> int64_t {
+            return self.prepare_sync(input, count, reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("input_ptr"), py::arg("count"), py::arg("stream"))
+      .def(
+          "finish_sync",
+          [](IntraBcast& self, uintptr_t output, size_t count, int64_t stream) -> double {
+            return self.finish_sync(output, count, reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream"));
+
+  // =========================================================================
   // DataType enum and size_of
   // =========================================================================
   py::enum_<mori::collective::DataType>(m, "DataType")
@@ -313,6 +501,25 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .value("Float64", mori::collective::DataType::kFloat64);
   m.def("size_of", &mori::collective::SizeOf, py::arg("dtype"),
         "Return element size in bytes for a mori_cpp.DataType value");
+
+  // Merge an inter-node ring's jit_args + an intra-node sub-group gather's
+  // jit_args into one CclFusedRingLocalGatherArgs for the fused
+  // ring||local-gather kernel. Takes the two int64 arg pointers the respective
+  // prepare_* calls return; returns the fused arg pointer (a static, valid until
+  // the next call).
+  m.def("build_fused_ring_local_gather_args", &mori::collective::BuildFusedRingLocalGatherArgs,
+        py::arg("ring_args_ptr"), py::arg("gather_args_ptr"), py::arg("ring_blocks"),
+        "Merge ring + local-gather jit_args into fused-kernel args; returns int64 ptr");
+
+  // Merge ring + local-gather jit_args plus the pipeline extras (chunkReadyFlags
+  // device ptr, numNodes, nodeId) into CclFusedRingRemoteGatherArgs for
+  // FusedRingRemoteGatherKernel_u32 (pipelines the inter-node ring with the
+  // remote-block reassembly).
+  m.def("build_fused_ring_remote_gather_args", &mori::collective::BuildFusedRingRemoteGatherArgs,
+        py::arg("ring_args_ptr"), py::arg("gather_args_ptr"), py::arg("ring_blocks"),
+        py::arg("chunk_ready_flags_ptr"), py::arg("num_nodes"), py::arg("node_id"),
+        py::arg("reassembly_blocks") = 0, py::arg("reasm_deep_sq") = 0,
+        "Merge ring + gather jit_args + pipeline extras into fused-remote args; returns int64 ptr");
 
   // =========================================================================
   // AllGatherIntoTensor — REMOVED

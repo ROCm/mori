@@ -106,7 +106,8 @@ void SymmMemManager::Free(void* localPtr) {
 /*                                    SymmMemObj Registration                                    */
 /* ---------------------------------------------------------------------------------------------- */
 
-SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bool heap_begin) {
+SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bool heap_begin,
+                                                 bool rdmaRegister) {
   int worldSize = bootNet.GetWorldSize();
   int rank = bootNet.GetLocalRank();
 
@@ -194,7 +195,12 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       break;
     }
   }
-  if (rdmaDeviceContext && anyRdmaPeer) {
+  // SDMA/P2P-only transits pass rdmaRegister=false to skip ibv_reg_mr (the
+  // buffer is never an RDMA src/dst). This dodges the ionic single-MR limit
+  // (ibv_reg_mr fails at >=~2 GiB) for the hierarchical AllGather's intra
+  // node-block. The rkey stays 0 and the Allgather below still runs, so the
+  // collective register stays in lockstep.
+  if (rdmaDeviceContext && anyRdmaPeer && rdmaRegister) {
     application::RdmaMemoryRegion mr =
         rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
     cpuMemObj->lkey = mr.lkey;
@@ -219,16 +225,26 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
-  std::vector<int> dstDeviceIds;
-  for (int i = 0; i < worldSize; i++) {
-    if (context.GetTransportType(i) != TransportType::SDMA) continue;
-    dstDeviceIds.push_back(i % 8);  // should be intra devices count
+  // SDMA peers (same-host). Each peer needs its within-node HIP device id
+  // (0-based) for the anvil queue key, but the device-handle array is addressed
+  // by GLOBAL pe in the kernels (deviceHandles_d + pe * numQueues). Keep the two
+  // separate: (pe % 8) is wrong for multi-node / sliced HIP_VISIBLE_DEVICES runs
+  // where global ranks 4..7 on node 1 map to local HIP devices 0..3.
+  std::vector<std::pair<int, int>> sdmaPeers;  // (globalPe, withinNodeDevId)
+  {
+    int within = 0;
+    for (int i = 0; i < worldSize; i++) {
+      if (context.GetTransportType(i) != TransportType::SDMA) continue;
+      sdmaPeers.emplace_back(i, within++);
+    }
   }
-  if (dstDeviceIds.size() != 0) {
-    int srcDeviceId = rank % 8;
+  if (!sdmaPeers.empty()) {
+    int srcDeviceId = 0;  // within-node id of self
+    for (int j = 0; j < rank; j++)
+      if (context.GetTransportType(j) == TransportType::SDMA) srcDeviceId++;
     int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
-    // Allocate based on worldSize (not dstDeviceIds.size()) because indexing uses pe * numQ
-    // where pe ranges 0..worldSize-1. Using dstDeviceIds.size() causes buffer overflow.
+    // Allocate based on worldSize because indexing uses pe * numQ where pe ranges
+    // 0..worldSize-1. Using sdmaPeers.size causes buffer overflow.
     size_t numDevices = static_cast<size_t>(worldSize);
     HIP_RUNTIME_CHECK(
         hipMalloc(&gpuMemObj->deviceHandles_d,
@@ -237,13 +253,13 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
         hipMemset(gpuMemObj->deviceHandles_d, 0,
                   numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
-    for (auto& dstDeviceId : dstDeviceIds) {
+    for (auto& peer : sdmaPeers) {
+      int dstPe = peer.first;         // global pe -> array index (kernel-facing)
+      int dstDeviceId = peer.second;  // within-node id -> anvil queue key
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
         auto* anvilHandle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
-        HIP_RUNTIME_CHECK(hipMemcpy(
-            &gpuMemObj
-                 ->deviceHandles_d[static_cast<size_t>(dstDeviceId) * numOfQueuesPerDevice + q],
-            &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
+        HIP_RUNTIME_CHECK(hipMemcpy(&gpuMemObj->deviceHandles_d[dstPe * numOfQueuesPerDevice + q],
+                                    &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
       }
     }
 
@@ -455,7 +471,7 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
     std::vector<int> dstDeviceIds;
     for (int i = 0; i < worldSize; i++) {
       if (context.GetTransportType(i) != TransportType::SDMA) continue;
-      dstDeviceIds.push_back(i % 8);  // should be intra devices count
+      dstDeviceIds.push_back(i);  // only the count is used below
     }
 
     if (dstDeviceIds.size() != 0) {

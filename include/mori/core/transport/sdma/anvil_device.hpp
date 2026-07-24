@@ -53,6 +53,7 @@ constexpr bool BREAK_ON_RETRIES = true;
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 
+// SDMA_PKT_COPY_LINEAR DW2 (PARAMETER_UNION) stays 0: peak D2D/XGMI copy BW.
 __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, void* dstBuf,
                                                                  long long int packetSize) {
   SDMA_PKT_COPY_LINEAR copy_packet = {};

@@ -602,6 +602,9 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.wqHandle.dbrAddr = qp->qpUarPtr;
   endpoint.wqHandle.sqWqeNum = qp->sqAttrs.wqeNum;
   endpoint.wqHandle.rqWqeNum = qp->rqAttrs.wqeNum;
+  // RQ doorbell record lives in the same QP DBR page as the SQ (mlx5 uses the
+  // uint32 at index MORI_MLX5_RCV_DBR=0; SQ uses index 1).
+  endpoint.wqHandle.rqdbrAddr = qp->qpDbrUmemAddr;
 
   endpoint.cqHandle.cqAddr = cq->cqUmemAddr;
   endpoint.cqHandle.consIdx = 0;

@@ -38,3 +38,6 @@ python/mori/_jit_sources/
 
 # Bundled tools/*.sh files copied into the package at build time
 python/mori/tools/*.sh
+
+# crash core dumps
+core.*
