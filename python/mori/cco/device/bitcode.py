@@ -45,6 +45,24 @@ _FLYDSL_COV = 6  # FlyDSL ROCm backend uses ABI 600 -> code object version 6
 _cached_paths: dict[int, str] = {}
 
 
+def _sdma_enabled() -> bool:
+    """JIT the device wrapper with SDMA? env > baked _build_flags.py > OFF.
+
+    The baked flag (written by setup.py) records what the host lib was built
+    with, so `BUILD_CCO_SDMA=ON pip install .` works at runtime without re-setting
+    the env; the env still overrides it.
+    """
+    env = os.environ.get("BUILD_CCO_SDMA")
+    if env is not None:
+        return env.strip().upper() in {"1", "ON", "TRUE", "YES"}
+    try:
+        from mori.cco.device._build_flags import BUILD_CCO_SDMA as _baked
+
+        return bool(_baked)
+    except Exception:
+        return False
+
+
 def _prebuilt_candidates() -> list[Path]:
     here = Path(__file__).resolve().parent
     mori_root = here.parents[3]  # python/mori/cco/device/ -> repo root
@@ -82,15 +100,10 @@ def _jit_compile(cov: int) -> str | None:
 
         cfg = detect_build_config()
         nic = detect_nic_type()
-        # SDMA path is compile-gated (BUILD_CCO_SDMA). Must match the value the
-        # host libmori_cco.so was built with (BUILD_CCO_SDMA); default OFF. Folded
-        # into the cache dir so on/off bitcode never aliases.
-        sdma_on = os.environ.get("BUILD_CCO_SDMA", "OFF").strip().upper() in {
-            "1",
-            "ON",
-            "TRUE",
-            "YES",
-        }
+        # SDMA path is compile-gated (BUILD_CCO_SDMA). Resolved from env or the
+        # baked-in build flag so it matches the host libmori_cco.so. Folded into
+        # the cache dir below so on/off bitcode never aliases.
+        sdma_on = _sdma_enabled()
         source_paths = [
             wrapper,
             mori_root / "include" / "mori" / "cco",
