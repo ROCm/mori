@@ -1338,7 +1338,8 @@ template <bool Signal = true>
 inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                         ccoSdmaQueueDeviceHandle** deviceHandles,
                                         HSAuint64* signals, HSAuint64* expectedSignals,
-                                        uint32_t /*queNum*/, uint32_t qId, bool ring = true) {
+                                        uint32_t queNum, uint32_t qId, bool ring = true) {
+  if (qId >= queNum) return;  // out-of-range queue: no-op, not OOB
   ccoSdmaPostCopy<Signal>(deviceHandles, signals, expectedSignals, srcBuf, dstBuf, copy_size,
                           static_cast<int>(qId), ring);
 }
@@ -1367,7 +1368,8 @@ inline __device__ void ccoSdmaPutBlock(void* srcBuf, void* dstBuf, size_t copy_s
 
 // Commit (ring pending packets) per coop scope.
 inline __device__ void ccoSdmaCommitThread(ccoSdmaQueueDeviceHandle** deviceHandles,
-                                           uint32_t /*queNum*/, uint32_t qId) {
+                                           uint32_t queNum, uint32_t qId) {
+  if (qId >= queNum) return;  // out-of-range queue: no-op, not OOB
   ccoSdmaQueueDeviceHandle handle = **(deviceHandles + qId);
   ccoSdmaRingQueueDbr(handle);
 }
@@ -1499,6 +1501,7 @@ struct ccoSdma {
   __device__ inline void quietQueue(int peer, int queueId) {
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
+    if (queueId < 0 || static_cast<uint32_t>(queueId) >= n) return;
     ccoWaitForSignal(s.signalBuf + peer * n + queueId, s.expectSignals[peer * n + queueId]);
   }
 
