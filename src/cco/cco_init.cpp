@@ -865,6 +865,160 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
 }
 
 /* ========================================================================== */
+/*                              ccoMemImport                               */
+/* ========================================================================== */
+
+// Map an EXTERNAL HIP VMM allocation into this rank's flat-VA slot without
+// allocating new physical memory. Mirrors ccoMemAlloc, except the physical
+// handle comes from hipMemRetainAllocationHandle(externalPtr) instead of
+// hipMemCreate. The retained handle is refcounted: ccoMemFree's hipMemRelease
+// balances this retain; the external owner (e.g. torch.symm_mem) keeps its own
+// mapping and refcount alive independently.
+int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
+  if (outPtr == nullptr) {
+    MORI_SHMEM_ERROR("ccoMemImport: outPtr is NULL");
+    return -1;
+  }
+  if (externalPtr == nullptr || size == 0) {
+    MORI_SHMEM_ERROR("ccoMemImport: externalPtr is NULL or size is 0");
+    return -1;
+  }
+
+  // Recover the physical handle from the external mapping. Fails (e.g. for a
+  // plain hipMalloc pointer, which is not VMM-backed).
+  hipMemGenericAllocationHandle_t physHandle = 0;
+  hipError_t err = hipSuccess;
+  {
+    vmmProcessLock vmmLock;
+    err = hipMemRetainAllocationHandle(&physHandle, externalPtr);
+  }
+  if (err != hipSuccess) {
+    MORI_SHMEM_ERROR(
+        "ccoMemImport: hipMemRetainAllocationHandle failed: {} ({}) — externalPtr "
+        "must be the base of a HIP VMM allocation",
+        static_cast<int>(err), hipGetErrorString(err));
+    return -1;
+  }
+
+  // Validate: externalPtr is the allocation base and the range covers `size`.
+  // Our flat-VA map starts at offset 0 of the handle, so offset imports are
+  // unsupported (would need a per-handle base+offset scheme).
+  void* rangeBase = nullptr;
+  size_t rangeSize = 0;
+  err = hipMemGetAddressRange(&rangeBase, &rangeSize, externalPtr);
+  if (err != hipSuccess) {
+    MORI_SHMEM_ERROR("ccoMemImport: hipMemGetAddressRange failed: {} ({})", static_cast<int>(err),
+                     hipGetErrorString(err));
+    (void)hipMemRelease(physHandle);
+    return -1;
+  }
+  if (rangeBase != externalPtr) {
+    MORI_SHMEM_ERROR(
+        "ccoMemImport: externalPtr {} is not the allocation base {} "
+        "(offset imports unsupported)",
+        externalPtr, rangeBase);
+    (void)hipMemRelease(physHandle);
+    return -1;
+  }
+
+  size_t alignedSize = AlignUp(size, comm->vmmGranularity);
+  if (alignedSize > rangeSize) {
+    MORI_SHMEM_ERROR("ccoMemImport: aligned size {} exceeds external allocation {}", alignedSize,
+                     rangeSize);
+    (void)hipMemRelease(physHandle);
+    return -1;
+  }
+
+  uintptr_t slotAddr = comm->vaManager->Allocate(alignedSize, comm->vmmGranularity);
+  if (slotAddr == 0) {
+    MORI_SHMEM_ERROR("ccoMemImport: slot exhausted (need {} bytes, perRankSize={})", alignedSize,
+                     comm->perRankSize);
+    (void)hipMemRelease(physHandle);
+    return -1;
+  }
+  size_t slotOffset = static_cast<size_t>(slotAddr - LocalSlotBase(comm));
+  void* localVa = reinterpret_cast<void*>(slotAddr);
+  auto rollbackSlot = [&]() { (void)comm->vaManager->Free(slotAddr); };
+
+  const bool useFabric = (comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat));
+
+  {
+    vmmProcessLock vmmLock;
+    err = hipMemMap(localVa, alignedSize, 0, physHandle, 0);
+  }
+  if (err != hipSuccess) {
+    MORI_SHMEM_ERROR("ccoMemImport: hipMemMap failed: {} ({})", static_cast<int>(err),
+                     hipGetErrorString(err));
+    (void)hipMemRelease(physHandle);
+    rollbackSlot();
+    return -1;
+  }
+
+  hipMemAccessDesc accessDesc = {};
+  accessDesc.location.type = hipMemLocationTypeDevice;
+  accessDesc.location.id = comm->hipDev;
+  accessDesc.flags = hipMemAccessFlagsProtReadWrite;
+  for (int retry = 0; retry < 5; retry++) {
+    {
+      vmmProcessLock vmmLock;
+      err = hipMemSetAccess(localVa, alignedSize, &accessDesc, 1);
+    }
+    if (err == hipSuccess) break;
+    usleep(1000 * (1 << retry));
+  }
+  if (err != hipSuccess) {
+    MORI_SHMEM_ERROR("ccoMemImport: hipMemSetAccess failed after retries: {} ({})",
+                     static_cast<int>(err), hipGetErrorString(err));
+    {
+      vmmProcessLock vmmLock;
+      (void)hipMemUnmap(localVa, alignedSize);
+      (void)hipMemRelease(physHandle);
+    }
+    rollbackSlot();
+    return -1;
+  }
+
+  // Export a shareable handle for WindowRegister (P2P mapping + RDMA MR), same as
+  // ccoMemAlloc. The retained handle is exportable iff the external allocation was
+  // created with a compatible requestedHandleType (torch.symm_mem uses POSIX FD).
+  ccoComm::AllocMeta meta;
+  meta.physHandle = physHandle;
+  meta.isFabric = useFabric;
+  meta.slotOffset = slotOffset;
+  meta.size = alignedSize;
+  if (useFabric) {
+    err = hipMemExportToShareableHandle(&meta.fabricHandle, physHandle,
+                                        hipMemHandleTypeFabricCompat, 0);
+  } else {
+    meta.shareFd = -1;
+    err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&meta.shareFd), physHandle,
+                                        hipMemHandleTypePosixFileDescriptor, 0);
+  }
+  if (err != hipSuccess) {
+    MORI_SHMEM_ERROR(
+        "ccoMemImport: hipMemExportToShareableHandle failed: {} ({}) — external "
+        "allocation may not support the comm's handle type",
+        static_cast<int>(err), hipGetErrorString(err));
+    {
+      vmmProcessLock vmmLock;
+      (void)hipMemUnmap(localVa, alignedSize);
+      (void)hipMemRelease(physHandle);
+    }
+    rollbackSlot();
+    return -1;
+  }
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    comm->allocTable[localVa] = meta;
+  }
+
+  *outPtr = localVa;
+  MORI_SHMEM_TRACE("ccoMemImport: done, externalPtr={} localPtr={} size={}", externalPtr, localVa,
+                   alignedSize);
+  return 0;
+}
+
+/* ========================================================================== */
 /*                              ccoMemFree                                 */
 /* ========================================================================== */
 
@@ -1253,6 +1407,26 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
 int ccoWindowRegister(ccoComm* comm, size_t size, ccoWindow_t* outWin, void** localPtr) {
   void* ptr = nullptr;
   int ret = ccoMemAlloc(comm, size, &ptr);
+  if (ret != 0) return ret;
+
+  ret = ccoWindowRegister(comm, ptr, size, outWin);
+  if (ret != 0) {
+    ccoMemFree(comm, ptr);
+    return ret;
+  }
+
+  *localPtr = ptr;
+  return 0;
+}
+
+// Overload C: import an external HIP VMM allocation + register it as a window in
+// one call. Mirror of Overload A, but the physical memory is imported (aliased)
+// from externalPtr via ccoMemImport rather than freshly allocated. Teardown is
+// the same as Overload A: WindowDeregister → MemFree(localPtr).
+int ccoWindowRegister(ccoComm* comm, void* externalPtr, size_t size, ccoWindow_t* outWin,
+                      void** localPtr) {
+  void* ptr = nullptr;
+  int ret = ccoMemImport(comm, externalPtr, size, &ptr);
   if (ret != 0) return ret;
 
   ret = ccoWindowRegister(comm, ptr, size, outWin);

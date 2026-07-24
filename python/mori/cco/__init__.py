@@ -61,5 +61,6 @@ from .communicator import (
     CCOResource,
     AllocatedMemory,
     RegisteredWindow,
+    ImportedWindow,
     DevCommHandle,
 )
