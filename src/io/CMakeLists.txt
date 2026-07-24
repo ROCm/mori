@@ -2,6 +2,7 @@ set(MORI_IO_SOURCES
     engine.cpp
     rdma/protocol.cpp
     rdma/backend_impl.cpp
+    rdma/async_event_monitor.cpp
     rdma/executor.cpp
     rdma/common.cpp
     rdma/ledger.cpp

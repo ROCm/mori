@@ -37,6 +37,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "src/io/rdma/async_event_monitor.hpp"
 #include "src/io/rdma/protocol.hpp"
 namespace mori {
 namespace io {
@@ -258,6 +259,18 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
 
   deviceCtxs.resize(availDevices.size(), nullptr);
   topo.reset(new application::TopoSystem());
+
+  bool enableAsyncEvents = true;
+  if (const char* val = std::getenv("MORI_IO_ENABLE_ASYNC_EVENTS");
+      val != nullptr && val[0] != '\0')
+    enableAsyncEvents = mori::env::detail::ParseBool(val).value_or(true);
+  if (enableAsyncEvents) {
+    auto logger = mori::ModuleLogger::GetInstance().GetLogger(mori::modules::IO);
+    asyncEventMonitor_ = RdmaAsyncEventMonitor::Create(devices, logger);
+    if (!asyncEventMonitor_ && logger) {
+      logger->error("Failed to start RDMA async event monitor; continuing without it");
+    }
+  }
 }
 
 RdmaManager::~RdmaManager() {
@@ -267,6 +280,8 @@ RdmaManager::~RdmaManager() {
     }
   }
   deviceCtxs.clear();
+
+  asyncEventMonitor_.reset();
 
   if (ctx != nullptr) {
     delete ctx;
