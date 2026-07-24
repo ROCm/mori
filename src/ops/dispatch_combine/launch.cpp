@@ -461,19 +461,11 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
 
   switch (handle.config.kernelType) {
     case KernelType::IntraNode: {
-      // Runtime selection: NOTIFY/CNT2 vs LEGACY IntraNode dispatch. Both symbols are
-      // always compiled into the module; MORI_DISP_NOTIFY (env) picks which to launch
-      // (default: legacy). Geometry/shared-mem are identical for both.
-      static const bool useNotify = [] {
-        const char* e = std::getenv("MORI_DISP_NOTIFY");
-        if (!e) return false;
-        std::string v(e);
-        for (auto& c : v) c = static_cast<char>(std::tolower(c));
-        return v == "1" || v == "true" || v == "on" || v == "yes";
-      }();
-      const char* kname =
-          useNotify ? "EpDispatchIntraNodeNotifyKernel_" : "EpDispatchIntraNodeKernel_";
-      reg.Launch(std::string(kname) + sfx, bn, block_x, smem, stream, &args, args_size);
+      // Intra-node dispatch: only the BATCH kernel is kept (block-local exact count +
+      // batched remote reservation + 1D TDM payload, ~980 GB/s EP4-4K). The legacy and
+      // NOTIFY/CNT2 kernels were removed.
+      reg.Launch(std::string("EpDispatchIntraNodeBatchKernel_") + sfx, bn, block_x, smem, stream,
+                 &args, args_size);
       break;
     }
     case KernelType::InterNode:

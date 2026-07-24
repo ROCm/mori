@@ -82,6 +82,25 @@ namespace moe {
 
 #define MAX_GPUS_PER_NODE 8
 
+#if defined(MORI_DISP_TIMING)
+// One-shot guard so the BATCH [BPHASE] timing prints ONCE (first launch), not on every
+// dispatch launch -- per-launch printf (esp. under CUDA-graph replay) floods stdout and
+// blows the run timeout. Device global persists across launches within a rank/process.
+__device__ unsigned _bphase_oneshot = 0;
+// Cross-block Part-B accounting. A single-thread (block0) probe is biased: block0 copies
+// a light share then spins at the grid barrier, so its "compl" swallows other blocks' copy.
+// Instead every block's thd0 atomically min/max its Part-B start/end clock -> the WALL span
+// of the concurrent copy phase (_pb_hi-_pb_lo). Dividing by the whole-kernel wall span
+// (blk0 end - global min start) gives a dimensionless fraction (no clock-freq needed):
+//   PartB algo-BW = dispatch algo-BW / frac   (same 'algorithm BW' basis as the a2a bench).
+// clock64() shares one counter domain across all CUs on a GPU, so cross-block compare is valid.
+// Max per-block Part-B DURATION (each block's own clock64 end-start diff). Blocks copy
+// concurrently, so the busiest block's duration ~= the copy-phase wall time. Using per-block
+// DIFFS (not absolute clocks) avoids clock-domain / cross-launch / launch-interleave races.
+// Cross-launch max is safe: replay launches skip the copy so their tiny dur never wins.
+__device__ unsigned long long _pb_maxdur = 0ull;
+#endif
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BarrierKernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
@@ -125,758 +144,6 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                    EpDispatchIntraNodeKernel                                   */
-/* ---------------------------------------------------------------------------------------------- */
-
-/* ====================== NOTIFY (CNT2) dispatch kernel ======================
- * Signal-based two-pass slot pre-assignment (NO symmetric cross-device barrier;
- * that barrier, not the per-token atomic, was why the old NOTIFY was slow):
- *   (A) CNT2 count committed tokens per dest PE into localCnt (LDS histogram);
- *   (B) exchange the count matrix via parity-encoded per-cell signals + prefix sum;
- *   (C) send payload with a LOCAL (agent-scope) slot atomic inside the region;
- *   (D) signal-based completion (RELEASE fence + per-destPe signal; ACQUIRE poll).
- * All blocks are co-resident at the tuned geometry (block_num <= CU), which the
- * GridBarrier and the parity/signal protocols rely on. Payload copy uses TDM when
- * MORI_DISP_TDM is compiled in (gfx1250), else WarpCopy.
- * ========================================================================== */
-template <typename T, bool EnableStdMoE = false>
-__device__ void EpDispatchIntraNodeNotifyKernel_body(EpDispatchCombineArgs<T> args) {
-  const EpDispatchCombineConfig& config = args.config;
-
-  int thdId = threadIdx.x;
-  int thdNum = blockDim.x;
-
-  int laneId = threadIdx.x & (warpSize - 1);
-  int warpId = thdId / warpSize;
-  int warpNum = blockDim.x / warpSize;
-
-  int globalWarpId = blockIdx.x * warpNum + warpId;
-  int globalWarpNum = gridDim.x * warpNum;
-
-  int myPe = config.rank;
-  int npes = config.worldSize;
-  size_t hiddenDim = config.HiddenDimSz();
-
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-  // Per-warp LDS tile for TDM payload staging (dynamic shared, sized
-  // warpNum*hiddenDim*sizeof(T) by the launcher). gfx1250 has 320KB LDS/CU, so a
-  // 14KB bf16 tile (hidden=7168) lets ~22 warps/CU stay resident.
-  extern __shared__ char _tdmDispSmem[];
-#endif
-
-  {
-    const int globalThdId = blockIdx.x * blockDim.x + thdId;
-    const int totalThreads = gridDim.x * blockDim.x;
-    index_t* localCnt = args.dispTokOffsetMemObj->template GetAs<index_t*>();     // [npes]
-    index_t* baseArr = args.destPeTokenCounter;                                   // [npes] (reused)
-    index_t* matLocal = args.dispCountMatrixMemObj->template GetAs<index_t*>();   // [npes*npes]
-    // parity flips every dispatch (combine advances crossDeviceBarrierFlag by 1
-    // per round) and is identical across ranks, so it distinguishes this launch's
-    // count-matrix cells from the previous launch's without any reset.
-    const index_t parity = (index_t)(args.crossDeviceBarrierFlag[0] & 1ull);
-
-    // Each of the 3 consecutive intra-GPU GridBarriers below uses a DISTINCT word
-    // in dispatchGridBarrier[] (+0 here, +2 after Pass A, +3 after prefix; +1 is
-    // the completion counter). GridBarrier self-resets its word via a winner CAS
-    // (bar==gridDim.x ? 0), which is NOT safe to reuse back-to-back: with tiny
-    // inputs each pass is near-instant, so a fast block laps into the next barrier
-    // and atomicAdd's the SAME word between the resetting block's two CAS attempts
-    // -> that block never sees gridDim.x again -> spins forever -> global hang
-    // (same root cause as the completion fix in commit 521e11b6; 4K hides it
-    // because the passes are slow enough that no block laps). Separate words break
-    // the lap. (worldSize>=4 gives >=4 words; intra-node EP4 is the target.)
-#if defined(MORI_DISP_TIMING)
-    // Diagnostic phase breakdown (block0/warp0 only, single-CU timeline; ratios are
-    // clock-frequency independent). Answers "where does dispatch time go" -> whether
-    // the count phase (Pass A / CNT2 target) is worth optimizing. See count-opt §8.13.
-    long long _pt[9];
-    // rank0 only: avoid 4 ranks interleaving printf into garbled lines.
-    const bool _ptOn = (myPe == 0 && blockIdx.x == 0 && thdId == 0);
-#define _PTS(i) do { if (_ptOn) _pt[i] = clock64(); } while (0)
-#else
-#define _PTS(i) do {} while (0)
-#endif
-    for (int d = globalThdId; d < npes; d += totalThreads) localCnt[d] = 0;
-    _PTS(0);
-    GridBarrier(args.dispatchGridBarrier + 0);
-    _PTS(1);  // <- bar0 (zero localCnt + GridBarrier)
-
-    // ---- Pass A (CNT2): count committed (token -> destPe) ----
-    // Warp-per-TOKEN count with BLOCK-LEVEL LDS aggregation (validated standalone in
-    // tools/count_repro.cc KIND=3). Per warp handles ONE token: lane l reads expert
-    // slot l, computes destPe; dedup per (token,destPe) via ONE __match_any_sync
-    // instead of the topk-iteration __shfl loop. The match_any MUST be called
-    // UNIFORMLY by all lanes (divergent warp-sync builtins fault gfx1250 with HSA
-    // 0x1016), so inactive lanes pass a sentinel that can't equal any real destPe.
-    // Kept lanes bump a per-BLOCK LDS histogram; each block then flushes only `npes`
-    // atomics into the uncached symmetric localCnt (was O(committed tokens)).
-    {
-      constexpr int kCnt2MaxNpes = 64;  // intra-node world size fits easily
-      __shared__ index_t smemCnt[kCnt2MaxNpes];
-      for (int p = thdId; p < npes; p += blockDim.x) smemCnt[p] = 0;
-      __syncthreads();
-      if (args.tokenIndices && args.inpTokenBuf && !args.replayMode && npes <= kCnt2MaxNpes) {
-        const int _topk = config.numExpertPerToken;
-        for (int tok = globalWarpId; tok < args.curRankNumToken; tok += globalWarpNum) {
-          int base = tok * _topk;
-          index_t expert = (laneId < _topk) ? args.tokenIndices[base + laneId] : (index_t)-1;
-          int destPe = -1;
-          if (expert >= 0) {
-            index_t dp = expert / config.numExpertPerRank;
-            if (dp >= 0 && dp < config.worldSize) destPe = static_cast<int>(dp);
-          }
-          // Uniform (non-divergent) match_any dedup: ALL lanes call it; inactive
-          // lanes use a sentinel (0xFFFFFFFF) distinct from any real destPe. Lowest
-          // lane in each destPe group keeps; dropped/dup slots get the null sentinel.
-          unsigned mv = (destPe >= 0) ? static_cast<unsigned>(destPe) : 0xFFFFFFFFu;
-          unsigned long long grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
-          int keep = (destPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
-          if (laneId < _topk && !keep)
-            args.dispDestTokIdMap[base + laneId] = FlatTokenIndex(config, config.worldSize, 0);
-          if (keep) atomicAdd(&smemCnt[destPe], 1);
-        }
-      }
-      __syncthreads();
-      for (int p = thdId; p < npes; p += blockDim.x) {
-        index_t v = smemCnt[p];
-        if (v) atomicAdd(&localCnt[p], v);
-      }
-    }
-    _PTS(2);  // <- passA (count committed tokens; CNT2 optimizes THIS phase)
-    GridBarrier(args.dispatchGridBarrier + 2);
-    _PTS(3);  // <- bar2 (GridBarrier)
-
-    // ---- Exchange: write my count row into every peer's matrix as a parity-coded
-    // signal cell = ((count+1) << 1) | parity (system-scope store). ----
-    if (blockIdx.x == 0) {
-      // ONE-SHOT, block-wide: map each thread of block0 to a distinct (peer,d)
-      // cell so all npes*npes cross-device stores ISSUE in parallel (1 RTT),
-      // instead of npes serial stores per lane. Scales to EP64: EP4 = 16 cells
-      // (1 round, 16 threads), EP64 = 4096 cells (few rounds across blockDim).
-      // block0-only => exactly one writer per cell (no duplicate stores).
-      for (int c = thdId; c < npes * npes; c += blockDim.x) {
-        int p = c / npes, d = c - p * npes;
-        index_t* peerMat = args.dispCountMatrixMemObj->template GetAs<index_t*>(p);
-        core::AtomicStoreRelaxedSystem(&peerMat[myPe * npes + d],
-                                       (index_t)(((localCnt[d] + 1) << 1) | parity));
-      }
-    }
-    _PTS(4);  // <- exch (block0 issues all npes*npes cross-device count stores)
-    // ---- Prefix: base[d] = sum_{s<myPe} M[s][d]; total recv = sum_s M[s][myPe].
-    // Poll each needed cell until its parity matches this launch, then decode.
-    // block0-only, one thread per dest column d (d<npes fits in block0's blockDim
-    // for all intra-node world sizes, npes<=64). The total (sum over all sources
-    // to me) is computed IN PARALLEL across those npes threads via an LDS reduce,
-    // instead of a single thread serially polling npes cells (that serial poll was
-    // the EP64 bottleneck: 1 thread doing npes cross-device reads back-to-back). ----
-    if (blockIdx.x == 0) {
-      // A __syncthreads is REQUIRED here: Exchange (above) reads localCnt[d] to
-      // build its cross-device store value, but different block0 threads read
-      // localCnt than the ones that zero it below. For npes*npes <= warpSize (EP4)
-      // warp reconvergence masks this, but for EP>4 the exchange loop spans several
-      // warps and a fast warp could zero localCnt before another warp reads it.
-      __syncthreads();
-      __shared__ index_t s_tot;
-      if (thdId == 0) s_tot = 0;
-      __syncthreads();
-      if (thdId < npes) {
-        int d = thdId;
-        index_t b = 0;
-        for (int s = 0; s < myPe; ++s) {
-          index_t v;
-          while (((v = core::AtomicLoadRelaxedSystem(&matLocal[s * npes + d])) & 1) != parity ||
-                 v == 0) {
-            __builtin_amdgcn_s_sleep(1);  // backoff: tight system-scope spin is slow
-          }                               // to re-observe peer stores on gfx1250 (see
-          b += (v >> 1) - 1;              // combine WAIT B fix, count-opt §8.2)
-        }
-        baseArr[d] = b;
-        localCnt[d] = 0;
-        // Parallel total: thread d contributes source d's count destined to me
-        // (cell M[d][myPe]); the LDS atomicAdd reduces across all npes threads.
-        index_t vt;
-        while (((vt = core::AtomicLoadRelaxedSystem(&matLocal[d * npes + myPe])) & 1) != parity ||
-               vt == 0) {
-          __builtin_amdgcn_s_sleep(1);
-        }
-        atomicAdd(&s_tot, (vt >> 1) - 1);
-      }
-      __syncthreads();
-      if (thdId == 0) *args.totalRecvTokenNum = s_tot;
-    }
-    _PTS(5);  // <- prefix (poll parity cells, prefix sum + parallel total)
-    GridBarrier(args.dispatchGridBarrier + 3);
-    _PTS(6);  // <- bar3 (GridBarrier)
-
-    // ---- Pass B: send payload; LOCAL slot atomic inside [baseArr[destPe], ...) ----
-    if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-#ifndef MORI_DISP_TDM_NCHUNK
-#define MORI_DISP_TDM_NCHUNK 2   // chunks/token: NCHUNK=2 => 7KB tile => wpb32 fits LDS
-#endif
-      const int _topk = config.numExpertPerToken;
-      const int _Npair = args.curRankNumToken * _topk;
-      const int _nInt = (int)(hiddenDim * sizeof(T) / 4);
-      const int _NCH = MORI_DISP_TDM_NCHUNK;
-      if ((_nInt % (64 * _NCH)) == 0) {
-        // ===== CONTINUOUS CROSS-TOKEN TDM PIPELINE =====
-        // Flatten every committed token's payload into one stream of chunks and run a
-        // single load/store pipeline across the WHOLE stream (not per-token). Each
-        // iteration issues load(C_t) + store(C_{t-1}) BEFORE one s_wait_tensorcnt(0),
-        // so the two drain together (overlap) -- and the overlap now spans token
-        // boundaries, removing the per-token drain bubble the old code had. Uses the
-        // safe wait(0) discipline (never relies on tensorcnt op ordering): C_{t-1} was
-        // loaded and fully drained in the previous iteration before its store here.
-        // Routing + metadata (atomic slot, weights/indices/scales) is done inside the
-        // producer when a token's first chunk is emitted -- warp-collective, called
-        // uniformly by all lanes.
-        // Chunk tile = 1D (dim1=1) contiguous burst. On XGMI a 2D tile (dim0=28) is
-        // fragmented into tiny per-row descriptors -> ~3x slower cross-card (measured
-        // standalone: 1D 1x3584 = 1355 GB/s vs 2D 56x64 = 424 GB/s dev0->dev1). Local
-        // HBM hides it (both ~4 TB/s), but dispatch is cross-card, so use 1D.
-        const int _ci = _nInt / _NCH;            // int words per chunk
-        const int _D1 = 1, _D0 = _ci;            // 1D contiguous burst per chunk (xGMI-efficient)
-        int* _bbase = reinterpret_cast<int*>(_tdmDispSmem) + (size_t)warpId * _nInt;
-        int* _buf[2] = {_bbase, _bbase + _ci};   // ping-pong of chunk-sized tiles
-        typedef int _v4 __attribute__((ext_vector_type(4)));
-        typedef int _v8 __attribute__((ext_vector_type(8)));
-        gfx1250_TDM_GROUP1 _g1; _g1.dataSize(2);
-        _g1.tensorDim0(_D0); _g1.tensorDim1(_D1);
-        _g1.tensorDim0Stride(_D0); _g1.tensorDim1Stride(_D1);
-        _g1.tileDim0(_D0); _g1.tileDim1(_D1);
-        gfx1250_TDM_GROUP0 _g0;
-        _v4 _z4{0, 0, 0, 0}; _v8 _z8{0, 0, 0, 0, 0, 0, 0, 0};
-
-        // producer state (all lanes hold identical scalars; control flow warp-uniform)
-        int _i = globalWarpId, _chunk = 0; bool _have = false;
-        const int* _sInt = nullptr; int* _dInt = nullptr;
-        auto produce = [&](const int*& cs, int*& cd) -> bool {
-          if (_have && _chunk < _NCH) {          // still emitting current token's chunks
-            cs = _sInt + _chunk * _ci; cd = _dInt + _chunk * _ci; ++_chunk; return true;
-          }
-          for (; _i < _Npair; _i += globalWarpNum) {
-            index_t destExpert = args.tokenIndices[_i];
-            if (destExpert < 0) continue;
-            index_t destPe = destExpert / config.numExpertPerRank;
-            if (destPe < 0 || destPe >= config.worldSize) continue;
-            index_t srcTokId = _i / _topk;
-            int condition = 0;
-            if (laneId < (_i % _topk)) {
-              index_t otherExpert = args.tokenIndices[srcTokId * _topk + laneId];
-              condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
-            }
-            if (__any(condition)) continue;      // dedup: earlier slot already hit this destPe
-
-            index_t destTokId = 0;
-            if (laneId == 0) {
-              index_t slot = atomicAdd(&localCnt[destPe], 1);
-              destTokId = baseArr[destPe] + slot;
-              args.dispDestTokIdMap[_i] = FlatTokenIndex(config, destPe, destTokId);
-              args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-                  FlatTokenIndex(config, myPe, srcTokId);
-            }
-            destTokId = __shfl(destTokId, 0);
-            if (laneId < config.numExpertPerToken) {
-              if (args.weightsBuf) {
-                args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-                    destPe)[destTokId * config.numExpertPerToken + laneId] =
-                    args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-              }
-              args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-                  destPe)[destTokId * config.numExpertPerToken + laneId] =
-                  args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-            }
-            if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-              size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
-              size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
-              core::WarpCopy(
-                  args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
-                  args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
-            }
-            _sInt = reinterpret_cast<const int*>(args.inpTokenBuf + (size_t)srcTokId * hiddenDim);
-            _dInt = reinterpret_cast<int*>(
-                args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) +
-                (size_t)destTokId * hiddenDim);
-            _have = true; _chunk = 1;            // emit chunk 0 now; next call emits chunk 1..
-            _i += globalWarpNum;                 // step cursor past this token
-            cs = _sInt; cd = _dInt; return true;
-          }
-          _have = false; return false;
-        };
-
-        const int* _cs; int* _cd;
-        if (produce(_cs, _cd)) {
-          _g0.ldsAddr((uintptr_t)_buf[0]); _g0.globalAddr((uintptr_t)_cs);
-          __builtin_amdgcn_tensor_load_to_lds(_g0.m_bitfield, _g1.m_bitfield, _z4, _z4, _z8, 0);
-          __builtin_amdgcn_s_wait_tensorcnt(0);  // prologue: C_0 resident (only bubble)
-          __builtin_amdgcn_wave_barrier();
-          int _pb = 0; int* _pd = _cd;           // pending chunk: buffer + dest
-          for (;;) {
-            const int* _ns; int* _nd;
-            bool _more = produce(_ns, _nd);
-            if (_more) {                          // load C_t into the other buffer
-              _g0.ldsAddr((uintptr_t)_buf[_pb ^ 1]); _g0.globalAddr((uintptr_t)_ns);
-              __builtin_amdgcn_tensor_load_to_lds(_g0.m_bitfield, _g1.m_bitfield, _z4, _z4, _z8, 0);
-            }
-            _g0.ldsAddr((uintptr_t)_buf[_pb]); _g0.globalAddr((uintptr_t)_pd);  // store C_{t-1}
-            __builtin_amdgcn_tensor_store_from_lds(_g0.m_bitfield, _g1.m_bitfield, _z4, _z4, _z8, 0);
-            __builtin_amdgcn_s_wait_tensorcnt(0); // load(C_t) + store(C_{t-1}) drain together
-            __builtin_amdgcn_wave_barrier();
-            if (!_more) break;
-            _pb ^= 1; _pd = _nd;
-          }
-        }
-      } else {
-        // geometry not TDM-friendly (int-word count not a multiple of 64*NCHUNK):
-        // fall back to the per-token WarpCopy loop.
-        for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
-             i += globalWarpNum) {
-          index_t srcTokId = i / config.numExpertPerToken;
-          index_t destExpert = args.tokenIndices[i];
-          if (destExpert < 0) continue;
-          index_t destPe = destExpert / config.numExpertPerRank;
-          if (destPe < 0 || destPe >= config.worldSize) continue;
-          int condition = 0;
-          if (laneId < (i % config.numExpertPerToken)) {
-            index_t otherExpert = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-            condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
-          }
-          if (__any(condition)) continue;
-          index_t destTokId = 0;
-          if (laneId == 0) {
-            index_t slot = atomicAdd(&localCnt[destPe], 1);
-            destTokId = baseArr[destPe] + slot;
-            args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-                FlatTokenIndex(config, myPe, srcTokId);
-          }
-          destTokId = __shfl(destTokId, 0);
-          if (laneId < config.numExpertPerToken) {
-            if (args.weightsBuf) {
-              args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-                  destPe)[destTokId * config.numExpertPerToken + laneId] =
-                  args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-            }
-            args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-                destPe)[destTokId * config.numExpertPerToken + laneId] =
-                args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-          }
-          if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-            size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
-            size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
-            core::WarpCopy(
-                args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
-                args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
-          }
-          core::WarpCopy<T, 8>(
-              args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) +
-                  (size_t)destTokId * hiddenDim,
-              args.inpTokenBuf + (size_t)srcTokId * hiddenDim, hiddenDim);
-        }
-      }
-#else
-      for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
-           i += globalWarpNum) {
-        index_t srcTokId = i / config.numExpertPerToken;
-        index_t destExpert = args.tokenIndices[i];
-        if (destExpert < 0) continue;
-        index_t destPe = destExpert / config.numExpertPerRank;
-        if (destPe < 0 || destPe >= config.worldSize) continue;
-        int condition = 0;
-        if (laneId < (i % config.numExpertPerToken)) {
-          index_t otherExpert = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-          condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
-        }
-        if (__any(condition)) continue;
-        index_t destTokId = 0;
-        if (laneId == 0) {
-          index_t slot = atomicAdd(&localCnt[destPe], 1);
-          destTokId = baseArr[destPe] + slot;
-          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-              FlatTokenIndex(config, myPe, srcTokId);
-        }
-        destTokId = __shfl(destTokId, 0);
-        if (laneId < config.numExpertPerToken) {
-          if (args.weightsBuf) {
-            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-                destPe)[destTokId * config.numExpertPerToken + laneId] =
-                args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-          }
-          args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-              destPe)[destTokId * config.numExpertPerToken + laneId] =
-              args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-        }
-        if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-          size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
-          size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
-          core::WarpCopy(
-              args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
-              args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
-        }
-        core::WarpCopy<T, 8>(
-            args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) +
-                (size_t)destTokId * hiddenDim,
-            args.inpTokenBuf + (size_t)srcTokId * hiddenDim, hiddenDim);
-      }
-#endif
-    }
-    _PTS(7);  // <- passB (payload copy: WarpCopy/TDM + per-token local slot atomic)
-
-    // ---- Signal-based completion (replaces the symmetric cross-device barrier):
-    // all local blocks arrive, warp0 RELEASE-fences its P2P writes and posts a
-    // per-peer signal, then waits for every peer to signal this rank. ----
-    // Use a SEPARATE barrier word (+1) for the completion arrival counter, NOT
-    // dispatchGridBarrier[0] which the last GridBarrier (prefix) just used. Reusing
-    // [0] races the GridBarrier self-reset: with tiny inputs Pass B is near-instant,
-    // so a fast block reaches this atomicAdd and bumps [0] between the resetting
-    // block's two atomicCAS(bar,gridDim.x,0) attempts -> that block never sees
-    // gridDim.x again and spins forever -> global hang. (4K hides it: Pass B is slow
-    // enough that every block finishes the reset before any reaches here.)
-    auto* complBar = args.dispatchGridBarrier + 1;
-    if (thdId == 0) atomicAdd(complBar, 1);
-    index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
-    if (globalWarpId == 0) {
-      for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-        shmem::ShmemUint32WaitUntilEquals(complBar, gridDim.x);
-        __hip_atomic_store(complBar, 0u, __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_AGENT);
-        index_t numTokenSignal = core::AtomicLoadRelaxed(&localCnt[destPe]) + 1;
-        index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-        shmem::ShmemInt32WaitUntilEquals(signal, 0);
-        __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
-        core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
-      }
-    }
-    if (globalWarpId == 0) {
-      for (int srcPe = laneId; srcPe < npes; srcPe += warpSize) {
-        index_t* signal = recvTokenNums + srcPe;
-        shmem::ShmemInt32WaitUntilGreaterThan(signal, 0);
-        __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
-        core::AtomicStoreRelaxedSystem(signal, 0);
-      }
-    }
-#if defined(MORI_DISP_TIMING)
-    _PTS(8);  // <- compl (cross-device signal send + recv)
-    if (_ptOn) {
-      long long bar0 = _pt[1] - _pt[0], passA = _pt[2] - _pt[1];
-      long long bar2 = _pt[3] - _pt[2], exch = _pt[4] - _pt[3];
-      long long prefix = _pt[5] - _pt[4], bar3 = _pt[6] - _pt[5];
-      long long passB = _pt[7] - _pt[6], cmpl = _pt[8] - _pt[7];
-      long long tot = _pt[8] - _pt[0];
-      double t = (double)(tot ? tot : 1);
-      printf("[PHASE] cyc: bar0=%lld passA=%lld bar2=%lld exch=%lld prefix=%lld "
-             "bar3=%lld passB=%lld compl=%lld tot=%lld\n",
-             bar0, passA, bar2, exch, prefix, bar3, passB, cmpl, tot);
-      printf("[PHASE] pct: bar0=%.2f passA(CNT2)=%.2f bar2=%.2f exch=%.2f "
-             "prefix=%.2f bar3=%.2f passB=%.2f compl=%.2f\n",
-             100.0 * bar0 / t, 100.0 * passA / t, 100.0 * bar2 / t,
-             100.0 * exch / t, 100.0 * prefix / t, 100.0 * bar3 / t,
-             100.0 * passB / t, 100.0 * cmpl / t);
-    }
-#endif
-#undef _PTS
-#ifdef ENABLE_STANDARD_MOE_ADAPT
-    if constexpr (EnableStdMoE) {
-      InvokeConvertDispatchOutput<T>(args, myPe);
-    }
-#endif
-    return;
-  }
-}
-
-/* ======================== LEGACY dispatch kernel ==========================
- * Cross-GPU returning atomic slot assignment: each committed (token, expert) does
- * a SYSTEM-scope fetch_add on the destination PE's dispTokOffset to claim its slot
- * inline during the send (no separate count pass). Payload copy is ALWAYS WarpCopy
- * -- this kernel is the baseline used only to compare against NOTIFY; it never uses
- * TDM (the TDM payload path lives in EpDispatchIntraNodeNotifyKernel_body).
- * ========================================================================== */
-template <typename T, bool EnableStdMoE = false>
-__device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
-  const EpDispatchCombineConfig& config = args.config;
-
-  int thdId = threadIdx.x;
-  int thdNum = blockDim.x;
-
-  int laneId = threadIdx.x & (warpSize - 1);
-  int warpId = thdId / warpSize;
-  int warpNum = blockDim.x / warpSize;
-
-  int globalWarpId = blockIdx.x * warpNum + warpId;
-  int globalWarpNum = gridDim.x * warpNum;
-
-  int myPe = config.rank;
-  int npes = config.worldSize;
-  size_t hiddenDim = config.HiddenDimSz();
-
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-  // TDM (1D whole-token burst) payload for the LEGACY remote-atomic path. Per-warp LDS
-  // tile (launcher sizes >= warpNum*hiddenDim*sizeof(T)). Order per token: issue async
-  // LOAD src->tile, run the REMOTE fetch_add slot atomic (its ~us cross-GPU round-trip
-  // overlaps the local HBM load), wait the load, then STORE tile->peer. Hides the
-  // atomic latency under the load; 1D avoids the xGMI fragmentation of a 2D tile.
-  extern __shared__ char _tdmLegacySmem[];
-  T* _tdmTile = reinterpret_cast<T*>(_tdmLegacySmem) + (size_t)warpId * hiddenDim;
-  const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
-#endif
-
-#if defined(MORI_DISP_TIMING)
-  // LEGACY phase breakdown (block0/warp0/rank0), same clock64 basis as the NOTIFY
-  // kernel so the two are directly comparable. sendloop = remote-atomic slot assign +
-  // payload WarpCopy (fused; the NOTIFY analogue is passA(count)+passB(copy) with a
-  // LOCAL atomic). atomClk = warp0's cumulative REMOTE fetch_add completion time -- if
-  // atomClk << sendloop the cross-GPU atomic is overlapped behind the copy, so NOTIFY
-  // swapping it for a local atomic cannot buy wall-clock (see count-opt §8.4/§8.7).
-  long long _lpt[4];
-  long long _atomClk = 0;
-  const bool _lptOn = (myPe == 0 && blockIdx.x == 0 && thdId == 0);
-#define _LPTS(i) do { if (_lptOn) _lpt[i] = clock64(); } while (0)
-#else
-#define _LPTS(i) do {} while (0)
-#endif
-
-  IF_ENABLE_PROFILER(
-      INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SEQ(seq, profiler);
-  MORI_TRACE_NEXT(seq, Slot::DispatchSendTokens);
-
-  _LPTS(0);  // <- start of Phase1 send loop
-  if (args.tokenIndices && args.inpTokenBuf) {
-    // Phase1: send token
-    // Each warp compute token offset on destinition PE
-    for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
-         i += globalWarpNum) {
-      index_t srcTokId = i / config.numExpertPerToken;
-      index_t destPe;
-      index_t destTokId = 0;
-
-      if (!args.replayMode) {
-        // Cache routing: decide where this (token, top-k) pair goes via
-        // atomicAdd-based slot assignment. Records the routing into dispDestTokIdMap
-        // (and the symmetric local view via dispTokIdToSrcTokIdMemObj on the
-        // destination PE) so a later replay-routing dispatch / combine can reuse
-        // the same layout deterministically.
-        index_t destExpert = args.tokenIndices[i];
-        // Routing sentinel: a negative expert id means "drop this top-k slot".
-        // Skip the dispatch entirely and write the existing combine-side null sentinel
-        // (PE == worldSize) into dispDestTokIdMap so combine treats this slot as nullptr.
-        if (destExpert < 0) {
-          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-          continue;
-        }
-        destPe = destExpert / config.numExpertPerRank;
-        // Out-of-range expert id guard: destPe is warp-uniform here (one
-        // token-expert per warp) and indexes GetAs(destPe) / destPeTokenCounter
-        // below. An out-of-range id (e.g. an EPLB physical id
-        // >= worldSize*numExpertPerRank) would index those out of bounds (the
-        // assert at dispatch is stripped under NDEBUG) -> HSA page fault. Drop it
-        // via the same overflow sentinel the dedup path uses; the whole warp
-        // skips coherently.
-        if (destPe < 0 || destPe >= config.worldSize) {
-          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-          continue;
-        }
-
-        // Deduplicate
-        assert(config.numExpertPerToken < warpSize);
-        int condition = 0;
-        if (laneId < (i % config.numExpertPerToken)) {
-          index_t otherExpert = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-          condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
-        }
-        if (__any(condition)) {
-          // Indicate that this token is already sent to the destination PE by setting an overflow
-          // token index
-          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-          continue;
-        }
-
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-        // LOAD first: prefetch this token's payload into the per-warp LDS tile BEFORE the
-        // remote fetch_add below, so the atomic's cross-GPU round-trip overlaps the load.
-        TdmIssueLoad<T>(_tdmTile, args.inpTokenBuf + (size_t)srcTokId * hiddenDim, _tdmG1);
-#endif
-
-        {
-          // Fine-grained timing: slot assignment = remote returning atomic on
-          // dispTokOffset[destPe] + the two remote metadata writes.
-          MORI_TRACE_SPAN(profiler, Slot::DispSlotAssign);
-          if (laneId == 0) {
-#if defined(MORI_DISP_TIMING)
-            long long _a0 = _lptOn ? clock64() : 0;  // warp0-lane0: measure the atomic
-#endif
-            // decide token id in dest pe
-            // Cross-GPU slot allocation: the offset counter lives on the destination
-            // PE, so the fetch-add MUST be SYSTEM-scoped. Plain atomicAdd is agent
-            // (device) scope and is NOT atomic across GPUs over the cco/LSA fabric,
-            // so concurrent senders can get the same destTokId -> slot collision ->
-            // corrupt dispatch (map/payload disagree). Matches v2's system-scope
-            // atomic_add_global.
-            destTokId = __hip_atomic_fetch_add(
-                args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1,
-                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-            // NATURAL data-dependency timing (no asm/volatile): this REAL map store
-            // reads destTokId, so for correctness the compiler MUST s_waitcnt for the
-            // atomic's return before it -> the end-clock right after captures the true
-            // round-trip completion. Only extra vs the bare atomic = FlatTokenIndex +
-            // one LOCAL store (~tens of ns). If this ~matches the asm-barrier number,
-            // it proves the ~3.5us completion latency without any asm trick.
-            args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-            assert(destTokId < config.MaxNumTokensToRecv() &&
-                   "Total recv token overflow: increase maxTotalRecvTokens");
-            atomicAdd(args.destPeTokenCounter + destPe, 1);
-            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-                FlatTokenIndex(config, myPe, srcTokId);
-#if defined(MORI_DISP_TIMING)
-            // End clock AFTER the destTokId-dependent stores -> captures the remote
-            // fetch_add's true round-trip completion (natural data dependency).
-            if (_lptOn) _atomClk += clock64() - _a0;
-#endif
-          }
-          destTokId = __shfl(destTokId, 0);
-        }
-      } else {
-        // Replay routing: caller already supplied a populated dispDestTokIdMap
-        // from a matching cache-routing dispatch. Recover (destPe, destTokId) directly
-        // and skip CAS / dedup / cross-rank src-id writes. The sentinel slot
-        // (destPe == worldSize) means the original cache-routing dispatch dropped or deduped
-        // this top-k slot, so we skip transmitting payload as well.
-        index_t flat = args.dispDestTokIdMap[i];
-        destPe = PeFromFlatTokenIndex(config, flat);
-        if (destPe >= config.worldSize) continue;
-        destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-        TdmIssueLoad<T>(_tdmTile, args.inpTokenBuf + (size_t)srcTokId * hiddenDim, _tdmG1);
-#endif
-      }
-
-      // Write weights and indices
-      {
-        MORI_TRACE_SPAN(profiler, Slot::DispWriteMeta);
-        if (laneId < config.numExpertPerToken) {
-          if (args.weightsBuf) {
-            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-                destPe)[destTokId * config.numExpertPerToken + laneId] =
-                args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-          }
-          args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-              destPe)[destTokId * config.numExpertPerToken + laneId] =
-              args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-        }
-      }
-
-      // Write scales
-      if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-        size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
-        size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
-        core::WarpCopy(
-            args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
-            args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
-      }
-
-      size_t srcTokOffset = srcTokId * hiddenDim;
-      size_t destTokOffset = destTokId * hiddenDim;
-
-      {
-        // Fine-grained timing: the actual hidden-dim payload WarpCopy to the
-        // destination PE (the bulk P2P write). Unroll=8 issues 8 in-flight 16B
-        // loads before the stores (memory-level parallelism) to hide the
-        // higher per-access latency of the CCO peer path; matches the v2/FlyDSL
-        // multi-stream copy that keeps dispatch fast.
-        MORI_TRACE_SPAN(profiler, Slot::DispTokenCopy);
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-        // STORE last: the LOAD was issued before the remote atomic (overlapping its
-        // round-trip). Wait the load, then issue the 1D burst store tile->peer.
-        __builtin_amdgcn_s_wait_tensorcnt(0);
-        __builtin_amdgcn_wave_barrier();
-        TdmIssueStore<T>(
-            args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-            _tdmTile, _tdmG1);
-        __builtin_amdgcn_s_wait_tensorcnt(0);
-#else
-        // LEGACY WarpCopy baseline (used to compare against NOTIFY).
-        core::WarpCopy<T, 8>(
-            args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-            args.inpTokenBuf + srcTokOffset, hiddenDim);
-#endif
-      }
-    }
-  }
-  __syncthreads();
-  _LPTS(1);  // <- sendloop done (remote-atomic slot assign + payload copy + meta)
-  if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
-
-  // Send token num & token to expert mapping to other ranks
-  MORI_TRACE_NEXT(seq, Slot::DispatchNotifyPeer);
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      // Wait until all tokens are sent
-      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
-      __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-
-      // Add 1 so that when token number == 0, receiver side still know the signal is sent
-      index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
-      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-      shmem::ShmemInt32WaitUntilEquals(signal, 0);
-      // System release fence: make this rank's remote payload/index/weight/tis
-      // writes to destPe globally visible BEFORE the readiness signal lands, so a
-      // peer that observes the signal is guaranteed to see the data (matches v2's
-      // fence_system_release). Without it, on the cco/LSA fabric the signal can be
-      // observed before the P2P writes drain -> peer reads stale -> wrong dispatch.
-      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
-      core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
-    }
-  }
-  _LPTS(2);  // <- grid barrier wait + per-peer release-signal (sigsend)
-
-  // Phase 2: recv token
-  // Each warp wait until sender finished by waiting token number signal
-  MORI_TRACE_NEXT(seq, Slot::DispatchWaitPeerToken);
-  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      index_t* signal = recvTokenNums + destPe;
-      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      // System acquire fence: pair with the sender's release so that after we see
-      // the signal, this rank's subsequent reads observe the peer's P2P writes
-      // (matches v2's fence_system_acquire).
-      __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
-      core::AtomicStoreRelaxedSystem(signal, 0);
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-
-      // reset local counter
-      args.destPeTokenCounter[destPe] = 0;
-    }
-
-    // reset counter
-    if (laneId == 0) {
-      args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
-    }
-  }
-#if defined(MORI_DISP_TIMING)
-  _LPTS(3);  // <- Phase2 recv (wait peer signals + acquire)
-  if (_lptOn) {
-    long long sendloop = _lpt[1] - _lpt[0], sigsend = _lpt[2] - _lpt[1];
-    long long sigrecv = _lpt[3] - _lpt[2], tot = _lpt[3] - _lpt[0];
-    double t = (double)(tot ? tot : 1);
-    printf("[LPHASE] cyc: sendloop=%lld sigsend=%lld sigrecv=%lld tot=%lld atomClk(warp0)=%lld\n",
-           sendloop, sigsend, sigrecv, tot, _atomClk);
-    printf("[LPHASE] pct: sendloop=%.2f sigsend=%.2f sigrecv=%.2f | atomClk/sendloop=%.2f%%\n",
-           100.0 * sendloop / t, 100.0 * sigsend / t, 100.0 * sigrecv / t,
-           sendloop ? 100.0 * (double)_atomClk / (double)sendloop : 0.0);
-  }
-#endif
-#undef _LPTS
-
-#ifdef ENABLE_STANDARD_MOE_ADAPT
-  if constexpr (EnableStdMoE) {
-    InvokeConvertDispatchOutput<T>(args, myPe);
-  }
-#endif
-}
-
-/* ---------------------------------------------------------------------------------------------- */
 /*                     EpDispatchIntraNodeBatchKernel (block-local batched slot)                   */
 /* ---------------------------------------------------------------------------------------------- */
 // Block-local exact-count + batched remote reservation. Avoids BOTH:
@@ -915,6 +182,7 @@ __device__ void EpDispatchIntraNodeBatchKernel_body(EpDispatchCombineArgs<T> arg
 
 #if defined(MORI_DISP_TIMING)
   long long _pt[6];
+  long long _pbStart = 0;  // thd0 Part-B start clock (per-block register, for duration diff)
   const bool _ptOn = (myPe == 0 && blockIdx.x == 0 && thdId == 0);
 #define _BPTS(i) do { if (_ptOn) _pt[i] = clock64(); } while (0)
 #else
@@ -926,7 +194,7 @@ __device__ void EpDispatchIntraNodeBatchKernel_body(EpDispatchCombineArgs<T> arg
   for (int p = thdId; p < npes; p += blockDim.x) { s_N[p] = 0; s_run[p] = 0; }
   __syncthreads();
   if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
-#if defined(MORI_DISP_PERTOK) && defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
+#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))  // PER-TOKEN 1-load:N-store is now the DEFAULT batch path (gfx125x+TDM)
     // PER-TOKEN count: one warp per token. Lanes 0..topk-1 read the token's experts;
     // dedup to distinct destPe via ONE __match_any_sync (CNT2 rule, lowest lane kept);
     // count each kept lane's destPe; write drop-sentinels for the non-kept slots. Same
@@ -984,9 +252,12 @@ __device__ void EpDispatchIntraNodeBatchKernel_body(EpDispatchCombineArgs<T> arg
   __syncthreads();
 
   _BPTS(2);  // <- phase2 reserve (npes remote atomicAdd(N))
+#if defined(MORI_DISP_TIMING)
+  if (thdId == 0) _pbStart = clock64();  // per-block Part-B start (register)
+#endif
   // ---- Phase 3: distribute LOCAL slots + send payload (clean 1D TDM, no remote atomic) ----
   if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
-#if defined(MORI_DISP_PERTOK) && defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
+#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))  // PER-TOKEN 1-load:N-store is now the DEFAULT batch path (gfx125x+TDM)
     // PER-TOKEN 1 load : N store. One warp per token: LOAD the token ONCE into the LDS
     // tile, then STORE it to each DISTINCT destPe from that same tile (stores back-to-back,
     // load amortized -> higher store duty, like all-to-all's 1-load:N-store). Slot is a
@@ -1039,6 +310,7 @@ __device__ void EpDispatchIntraNodeBatchKernel_body(EpDispatchCombineArgs<T> arg
       __builtin_amdgcn_s_wait_tensorcnt(0);   // drain all N stores before reusing tile next token
     }
 #else
+    // Fallback ONLY for non-TDM / non-gfx125x builds: per-pair N-load:N-store WarpCopy.
     for (int i = globalWarpId; i < Npair; i += globalWarpNum) {
       index_t destExpert = args.tokenIndices[i];
       if (destExpert < 0) continue;
@@ -1052,10 +324,6 @@ __device__ void EpDispatchIntraNodeBatchKernel_body(EpDispatchCombineArgs<T> arg
       }
       if (__any(condition)) continue;
 
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-      // LOAD first (overlaps the local LDS slot atomic + metadata below).
-      TdmIssueLoad<T>(_tdmTile, args.inpTokenBuf + (size_t)srcTokId * hiddenDim, _tdmG1);
-#endif
       index_t destTokId = 0;
       if (laneId == 0) {
         index_t j = atomicAdd(&s_run[destPe], 1);       // fast LDS slot (was remote)
@@ -1084,23 +352,17 @@ __device__ void EpDispatchIntraNodeBatchKernel_body(EpDispatchCombineArgs<T> arg
             args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
       }
       size_t destTokOffset = (size_t)destTokId * hiddenDim;
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-      __builtin_amdgcn_s_wait_tensorcnt(0);
-      __builtin_amdgcn_wave_barrier();
-      TdmIssueStore<T>(
-          args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-          _tdmTile, _tdmG1);
-      __builtin_amdgcn_s_wait_tensorcnt(0);
-#else
       core::WarpCopy<T, 8>(
           args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
           args.inpTokenBuf + (size_t)srcTokId * hiddenDim, hiddenDim);
-#endif
     }
-#endif  // MORI_DISP_PERTOK
+#endif  // TDM+gfx125x PER-TOKEN default vs WarpCopy fallback
   }
   __syncthreads();
   _BPTS(3);  // <- phase3 payload copy (Part B: 1D TDM)
+#if defined(MORI_DISP_TIMING)
+  if (thdId == 0) atomicMax(&_pb_maxdur, (unsigned long long)(clock64() - _pbStart));  // per-block Part-B duration
+#endif
 
   // ---- Completion (identical to legacy): all blocks arrive, then per-peer release-signal ----
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
@@ -1131,14 +393,23 @@ __device__ void EpDispatchIntraNodeBatchKernel_body(EpDispatchCombineArgs<T> arg
   }
 #if defined(MORI_DISP_TIMING)
   _BPTS(4);  // <- completion (cross-device signal send + recv)
-  if (_ptOn) {
-    long long p1 = _pt[1] - _pt[0], p2 = _pt[2] - _pt[1];
-    long long pB = _pt[3] - _pt[2], pc = _pt[4] - _pt[3];
-    long long tot = _pt[4] - _pt[0];
-    double t = (double)(tot ? tot : 1);
-    printf("[BPHASE] cyc: count=%lld reserve=%lld partB=%lld compl=%lld tot=%lld\n", p1, p2, pB, pc, tot);
-    printf("[BPHASE] pct: count=%.2f reserve=%.2f partB=%.2f compl=%.2f\n",
-           100.0 * p1 / t, 100.0 * p2 / t, 100.0 * pB / t, 100.0 * pc / t);
+  if (_ptOn && !args.replayMode) {  // print ONCE, on a REAL (non-replay) launch that actually copied
+    __threadfence();  // see all blocks' atomicMax(_pb_maxdur) before reading it
+    if (atomicAdd(&_bphase_oneshot, 1u) == 0u) {
+      long long p1 = _pt[1] - _pt[0], p2 = _pt[2] - _pt[1];
+      long long pB = _pt[3] - _pt[2], pc = _pt[4] - _pt[3];
+      long long tot = _pt[4] - _pt[0];  // blk0 finishes last (does the x-card signal) => whole-kernel wall
+      double t = (double)(tot ? tot : 1);
+      // block0-local view (BIASED: blk0 copies few tokens then spins at the barrier).
+      printf("[BPHASE] blk0 cyc: count=%lld reserve=%lld partB=%lld compl=%lld tot=%lld\n", p1, p2, pB, pc, tot);
+      printf("[BPHASE] blk0 pct: count=%.2f reserve=%.2f partB=%.2f compl=%.2f\n",
+             100.0 * p1 / t, 100.0 * p2 / t, 100.0 * pB / t, 100.0 * pc / t);
+      // ACCURATE Part-B: busiest-block copy DURATION / whole-kernel wall (both same clock64 domain,
+      // both DIFFS). frac dimensionless -> PartB algo-BW = dispatch algo-BW / frac (a2a-aligned).
+      double frac = (double)_pb_maxdur / t;
+      printf("[BPHASE] PARTB(xblk): partB_maxdur=%llu kernel=%lld frac=%.4f  =>  PartB_algoBW = dispatch_algoBW / %.4f\n",
+             _pb_maxdur, tot, frac, frac);
+    }
   }
 #endif
 #undef _BPTS
@@ -1147,16 +418,6 @@ __device__ void EpDispatchIntraNodeBatchKernel_body(EpDispatchCombineArgs<T> arg
     InvokeConvertDispatchOutput<T>(args, myPe);
   }
 #endif
-}
-
-template <typename T, bool EnableStdMoE = false>
-__global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
-  EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
-}
-
-template <typename T, bool EnableStdMoE = false>
-__global__ void EpDispatchIntraNodeNotifyKernel(EpDispatchCombineArgs<T> args) {
-  EpDispatchIntraNodeNotifyKernel_body<T, EnableStdMoE>(args);
 }
 
 template <typename T, bool EnableStdMoE = false>

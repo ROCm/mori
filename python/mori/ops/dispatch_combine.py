@@ -594,19 +594,10 @@ class EpDispatchCombineOp:
         return base
 
     def _intranode_dispatch_kernel(self, sfx, stdmoe=False):
-        """Runtime selection between the NOTIFY/CNT2 and LEGACY IntraNode dispatch
-        kernels. Both symbols are always compiled into the module; the MORI_DISP_NOTIFY
-        env picks which one to launch (default: legacy). Geometry/shared-mem are the
-        same for both (see _dispatch_shared_mem)."""
-        batch = os.environ.get("MORI_DISP_BATCH", "").lower() in ("1", "true", "on", "yes")
-        notify = os.environ.get("MORI_DISP_NOTIFY", "").lower() in ("1", "true", "on", "yes")
-        if batch:
-            base = "EpDispatchIntraNodeBatchKernel"
-        elif notify:
-            base = "EpDispatchIntraNodeNotifyKernel"
-        else:
-            base = "EpDispatchIntraNodeKernel"
-        name = f"{base}_{sfx}"
+        """Intra-node dispatch: only the BATCH kernel is kept (block-local exact count +
+        one batched remote fetch_add(N) per destPe + local slot distribution + 1D TDM
+        payload; ~980 GB/s EP4-4K). The legacy and NOTIFY/CNT2 kernels were removed."""
+        name = f"EpDispatchIntraNodeBatchKernel_{sfx}"
         if stdmoe:
             name += "_stdmoe"
         return name
