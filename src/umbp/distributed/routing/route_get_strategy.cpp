@@ -31,7 +31,7 @@ namespace mori::umbp {
 
 namespace {
 
-std::string SummarizeLocations(const std::vector<Location>& locations) {
+[[maybe_unused]] std::string SummarizeLocations(const std::vector<Location>& locations) {
   if (locations.empty()) return "<empty>";
   std::ostringstream oss;
   bool first = true;
@@ -67,19 +67,15 @@ size_t PickRandomIndex(const std::vector<size_t>& indices) {
   return indices[dist(rng)];
 }
 
-}  // namespace
-
-Location RandomRouteGetStrategy::Select(const std::vector<Location>& locations,
-                                        const std::string& /*node_id*/) {
-  if (locations.empty()) {
-    MORI_UMBP_WARN("[RouteGetStrategy] received empty location set; returning default Location");
-    return {};
-  }
-
+// Core selection cores shared by the single-key Select and the batched
+// BatchSelect.  Precondition: `locations` is non-empty (callers guarantee it).
+Location PickRandomReplica(const std::vector<Location>& locations) {
   if (locations.size() == 1) {
     const auto& single = locations[0];
-    MORI_UMBP_DEBUG("[RouteGetStrategy] single candidate selected node={} tier={} size={}",
-                    single.node_id, TierTypeName(single.tier), single.size);
+    // NOTE: temporarily disabled — the macro args are evaluated even when the
+    // log level suppresses output; SummarizeLocations() dominated the hot path.
+    // MORI_UMBP_DEBUG("[RouteGetStrategy] single candidate selected node={} tier={} size={}",
+    //                 single.node_id, TierTypeName(single.tier), single.size);
     return single;
   }
 
@@ -87,21 +83,16 @@ Location RandomRouteGetStrategy::Select(const std::vector<Location>& locations,
   std::uniform_int_distribution<size_t> dist(0, locations.size() - 1);
   size_t choice = dist(rng);
   const auto& selected = locations[choice];
-  MORI_UMBP_DEBUG(
-      "[RouteGetStrategy] {} candidates -> choice={} node={} tier={} size={}, candidates=[{}]",
-      locations.size(), choice, selected.node_id, TierTypeName(selected.tier), selected.size,
-      SummarizeLocations(locations));
+  // NOTE: temporarily disabled — see above; SummarizeLocations() ran on every call.
+  // MORI_UMBP_DEBUG(
+  //     "[RouteGetStrategy] {} candidates -> choice={} node={} tier={} size={}, candidates=[{}]",
+  //     locations.size(), choice, selected.node_id, TierTypeName(selected.tier), selected.size,
+  //     SummarizeLocations(locations));
   return selected;
 }
 
-Location TierPriorityRouteGetStrategy::Select(const std::vector<Location>& locations,
-                                              const std::string& node_id) {
-  if (locations.empty()) {
-    MORI_UMBP_WARN(
-        "[TierPriorityRouteGetStrategy] received empty location set; returning default Location");
-    return {};
-  }
-
+Location PickTierPriorityReplica(const std::vector<Location>& locations,
+                                 const std::string& node_id) {
   // Find the best (lowest-rank) tier present, then collect every replica on it
   // and choose one at random so load still spreads within a tier.
   int best_rank = TierReadRank(locations[0].tier);
@@ -132,12 +123,70 @@ Location TierPriorityRouteGetStrategy::Select(const std::vector<Location>& locat
 
   size_t choice = PickRandomIndex(best_tier_indices);
   const auto& selected = locations[choice];
-  MORI_UMBP_DEBUG(
-      "[TierPriorityRouteGetStrategy] {} candidates -> best_tier={} ({} replicas) choice node={} "
-      "tier={} size={}, candidates=[{}]",
-      locations.size(), TierTypeName(selected.tier), best_tier_indices.size(), selected.node_id,
-      TierTypeName(selected.tier), selected.size, SummarizeLocations(locations));
+  // NOTE: temporarily disabled — the macro args are evaluated even when the log
+  // level suppresses output; SummarizeLocations() dominated the hot path.
+  // MORI_UMBP_DEBUG(
+  //     "[TierPriorityRouteGetStrategy] {} candidates -> best_tier={} ({} replicas) choice node={}
+  //     " "tier={} size={}, candidates=[{}]", locations.size(), TierTypeName(selected.tier),
+  //     best_tier_indices.size(), selected.node_id, TierTypeName(selected.tier), selected.size,
+  //     SummarizeLocations(locations));
   return selected;
+}
+
+}  // namespace
+
+// Base default: one virtual dispatch per key.  Kept so custom strategies that
+// only override Select() get a working BatchSelect for free.  An empty
+// candidate list is left as a default Location (the caller treats it as "not
+// routed") and Select() is not invoked — mirroring the router's pre-batch
+// skip and avoiding a spurious empty-set WARN.
+std::vector<Location> RouteGetStrategy::BatchSelect(
+    const std::vector<std::vector<Location>>& per_key_locations, const std::string& node_id) {
+  std::vector<Location> out(per_key_locations.size());
+  for (size_t i = 0; i < per_key_locations.size(); ++i) {
+    if (per_key_locations[i].empty()) continue;
+    out[i] = Select(per_key_locations[i], node_id);
+  }
+  return out;
+}
+
+Location RandomRouteGetStrategy::Select(const std::vector<Location>& locations,
+                                        const std::string& /*node_id*/) {
+  if (locations.empty()) {
+    MORI_UMBP_WARN("[RouteGetStrategy] received empty location set; returning default Location");
+    return {};
+  }
+  return PickRandomReplica(locations);
+}
+
+std::vector<Location> RandomRouteGetStrategy::BatchSelect(
+    const std::vector<std::vector<Location>>& per_key_locations, const std::string& /*node_id*/) {
+  std::vector<Location> out(per_key_locations.size());
+  for (size_t i = 0; i < per_key_locations.size(); ++i) {
+    if (per_key_locations[i].empty()) continue;  // not routed; leave default
+    out[i] = PickRandomReplica(per_key_locations[i]);
+  }
+  return out;
+}
+
+Location TierPriorityRouteGetStrategy::Select(const std::vector<Location>& locations,
+                                              const std::string& node_id) {
+  if (locations.empty()) {
+    MORI_UMBP_WARN(
+        "[TierPriorityRouteGetStrategy] received empty location set; returning default Location");
+    return {};
+  }
+  return PickTierPriorityReplica(locations, node_id);
+}
+
+std::vector<Location> TierPriorityRouteGetStrategy::BatchSelect(
+    const std::vector<std::vector<Location>>& per_key_locations, const std::string& node_id) {
+  std::vector<Location> out(per_key_locations.size());
+  for (size_t i = 0; i < per_key_locations.size(); ++i) {
+    if (per_key_locations[i].empty()) continue;  // not routed; leave default
+    out[i] = PickTierPriorityReplica(per_key_locations[i], node_id);
+  }
+  return out;
 }
 
 }  // namespace mori::umbp

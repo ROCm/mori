@@ -39,9 +39,13 @@
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/memory/va_manager.hpp"  // HeapVAManager
 #include "mori/application/transport/rdma/rdma.hpp"
-#include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
-#include "mori/cco/cco.hpp"  // public, self-contained (opaque ccoComm fwd-decl)
+#include "mori/cco/cco.hpp"  // public, self-contained (opaque ccoComm fwd-decl); defines BUILD_CCO_SDMA
+#if BUILD_CCO_SDMA
+// The anvil (copy-engine) dependency is confined to this TU — pulled in only when
+// SDMA is compiled, so cco.hpp stays self-contained and anvil-free.
+#include "mori/application/transport/sdma/anvil.hpp"
+#endif
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
 
@@ -59,6 +63,48 @@ std::recursive_mutex& vmmProcessMutex() {
 struct vmmProcessLock {
   std::lock_guard<std::recursive_mutex> guard{vmmProcessMutex()};
 };
+
+void ccoSdmaSetupCommQueues(ccoComm* comm) {
+#if BUILD_CCO_SDMA
+  bool anySdmaCapable = false;
+  for (int pe = 0; pe < comm->worldSize; pe++) {
+    if (comm->ctx->GetPeerCapabilities(pe).canSDMA) {
+      anySdmaCapable = true;
+      break;
+    }
+  }
+  if (!(comm->ctx->IsSdmaEnabled() && anySdmaCapable)) {
+    comm->sdmaNumQueue = 0;
+    return;
+  }
+
+  comm->sdmaNumQueue = anvil::GetSdmaNumChannels();
+  comm->ctx->EnsureSdmaTransport();
+
+  // sdmaDevHandles is lsaSize × sdmaNumQueue, indexed by lsaRank. Assumes ranks
+  // bind 1:1 to GPUs within a node (rank lsa ⇒ GPU lsa).
+  int srcDeviceId = comm->hipDev;
+  size_t numSlots = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue;
+  HIP_RUNTIME_CHECK(hipMalloc(&comm->sdmaDevHandles, numSlots * sizeof(ccoSdmaQueueDeviceHandle*)));
+  HIP_RUNTIME_CHECK(
+      hipMemset(comm->sdmaDevHandles, 0, numSlots * sizeof(ccoSdmaQueueDeviceHandle*)));
+
+  for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
+    int pe = comm->myNodeStart + lsa;
+    if (!comm->ctx->GetPeerCapabilities(pe).canSDMA) continue;
+    int dstDeviceId = lsa;
+    for (int q = 0; q < comm->sdmaNumQueue; q++) {
+      // anvil returns its own SdmaQueueDeviceHandle*; cco stores it as an opaque
+      // ccoSdmaQueueDeviceHandle* (layout-compatible, byte-copied by sizeof).
+      auto* handle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+      HIP_RUNTIME_CHECK(hipMemcpy(&comm->sdmaDevHandles[lsa * comm->sdmaNumQueue + q], &handle,
+                                  sizeof(handle), hipMemcpyHostToDevice));
+    }
+  }
+#else
+  comm->sdmaNumQueue = 0;
+#endif  // BUILD_CCO_SDMA
+}
 }  // namespace
 
 // ccoProviderType is cco's self-contained copy of core::ProviderType; the cast
@@ -609,41 +655,10 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // HeapVAManager's invariants.
   comm->vaManager.reset(new application::HeapVAManager(LocalSlotBase(comm), perRankVmmSize, 0));
 
-  // Step 4: SDMA queue setup. Materialize only if the user opted in
-  // (MORI_ENABLE_SDMA) AND at least one peer has SDMA-capable hardware.
-  bool anySdmaCapable = false;
-  for (int pe = 0; pe < comm->worldSize; pe++) {
-    if (comm->ctx->GetPeerCapabilities(pe).canSDMA) {
-      anySdmaCapable = true;
-      break;
-    }
-  }
-  if (comm->ctx->IsSdmaEnabled() && anySdmaCapable) {
-    comm->sdmaNumQueue = anvil::GetSdmaNumChannels();
-    comm->ctx->EnsureSdmaTransport();
-
-    // sdmaDevHandles is lsaSize × sdmaNumQueue, indexed by lsaRank. Assumes
-    // ranks bind 1:1 to GPUs within a node (rank lsa ⇒ GPU lsa).
-    int srcDeviceId = comm->hipDev;
-    size_t numSlots = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue;
-    HIP_RUNTIME_CHECK(
-        hipMalloc(&comm->sdmaDevHandles, numSlots * sizeof(anvil::SdmaQueueDeviceHandle*)));
-    HIP_RUNTIME_CHECK(
-        hipMemset(comm->sdmaDevHandles, 0, numSlots * sizeof(anvil::SdmaQueueDeviceHandle*)));
-
-    for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
-      int pe = comm->myNodeStart + lsa;
-      if (!comm->ctx->GetPeerCapabilities(pe).canSDMA) continue;
-      int dstDeviceId = lsa;
-      for (int q = 0; q < comm->sdmaNumQueue; q++) {
-        auto* handle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
-        HIP_RUNTIME_CHECK(hipMemcpy(&comm->sdmaDevHandles[lsa * comm->sdmaNumQueue + q], &handle,
-                                    sizeof(handle), hipMemcpyHostToDevice));
-      }
-    }
-  } else {
-    comm->sdmaNumQueue = 0;
-  }
+  // Step 4: SDMA queue setup (intra-node copy engine). Delegated to the local
+  // ccoSdmaSetupCommQueues helper above, which confines the anvil dependency to
+  // this TU under BUILD_CCO_SDMA. Leaves sdmaNumQueue=0 when SDMA isn't used.
+  ccoSdmaSetupCommQueues(comm);
 
   // RDMA QP endpoints are NOT pre-allocated here. ccoDevCommCreate builds
   // a fresh QP set per DevComm via ctx->CreateAdditionalEndpoints, sized by
@@ -1794,7 +1809,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   ccoSdmaContext& sdma = hostShadow.sdma;
   sdma.sdmaNumQueue = static_cast<uint32_t>(comm->sdmaNumQueue);
   if (comm->sdmaNumQueue > 0) {
-    size_t poolBytes = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue * sizeof(HSAuint64);
+    size_t poolBytes = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue * sizeof(uint64_t);
     HIP_RUNTIME_CHECK(hipMalloc(&sdma.signalBuf, poolBytes));
     HIP_RUNTIME_CHECK(hipMemset(sdma.signalBuf, 0, poolBytes));
     HIP_RUNTIME_CHECK(hipMalloc(&sdma.expectSignals, poolBytes));
@@ -1808,11 +1823,11 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     comm->bootNet->Allgather(&myHandle, handles.data(), sizeof(hipIpcMemHandle_t));
 
     // Also Allgather raw VAs — used for same-process peers where IPC fails.
-    HSAuint64* myRawVa = sdma.signalBuf;
-    std::vector<HSAuint64*> rawVas(comm->worldSize, nullptr);
-    comm->bootNet->Allgather(&myRawVa, rawVas.data(), sizeof(HSAuint64*));
+    uint64_t* myRawVa = sdma.signalBuf;
+    std::vector<uint64_t*> rawVas(comm->worldSize, nullptr);
+    comm->bootNet->Allgather(&myRawVa, rawVas.data(), sizeof(uint64_t*));
 
-    std::vector<HSAuint64*> peerPtrs_host(comm->lsaSize, nullptr);
+    std::vector<uint64_t*> peerPtrs_host(comm->lsaSize, nullptr);
     peerPtrs_host[comm->lsaRank] = sdma.signalBuf;
     for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
       if (lsa == comm->lsaRank) continue;
@@ -1842,12 +1857,12 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
         // Cross-process: standard IPC open.
         void* mapped = nullptr;
         HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(&mapped, handles[pe], hipIpcMemLazyEnablePeerAccess));
-        peerPtrs_host[lsa] = reinterpret_cast<HSAuint64*>(mapped);
+        peerPtrs_host[lsa] = reinterpret_cast<uint64_t*>(mapped);
       }
     }
-    HIP_RUNTIME_CHECK(hipMalloc(&sdma.peerSignalPtrs, sizeof(HSAuint64*) * comm->lsaSize));
+    HIP_RUNTIME_CHECK(hipMalloc(&sdma.peerSignalPtrs, sizeof(uint64_t*) * comm->lsaSize));
     HIP_RUNTIME_CHECK(hipMemcpy(sdma.peerSignalPtrs, peerPtrs_host.data(),
-                                sizeof(HSAuint64*) * comm->lsaSize, hipMemcpyHostToDevice));
+                                sizeof(uint64_t*) * comm->lsaSize, hipMemcpyHostToDevice));
 
     sdma.deviceHandles = comm->sdmaDevHandles;
     MORI_SHMEM_TRACE(
@@ -1985,9 +2000,9 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
   // thread's signalBuf and must NOT be passed to hipIpcCloseMemHandle.
   auto& sdma = hostShadow.sdma;
   if (sdma.peerSignalPtrs) {
-    std::vector<HSAuint64*> peerPtrs_host(hostShadow.lsaSize, nullptr);
+    std::vector<uint64_t*> peerPtrs_host(hostShadow.lsaSize, nullptr);
     HIP_RUNTIME_CHECK(hipMemcpy(peerPtrs_host.data(), sdma.peerSignalPtrs,
-                                sizeof(HSAuint64*) * hostShadow.lsaSize, hipMemcpyDeviceToHost));
+                                sizeof(uint64_t*) * hostShadow.lsaSize, hipMemcpyDeviceToHost));
     for (int lsa = 0; lsa < hostShadow.lsaSize; lsa++) {
       if (lsa == hostShadow.lsaRank) continue;
       if (!peerPtrs_host[lsa]) continue;

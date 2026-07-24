@@ -155,6 +155,9 @@ if(HAVE_SPDK)
   # SPDK Proxy daemon (owns SPDK, serves ranks via SHM IPC)
   add_executable(spdk_proxy storage/spdk/proxy/spdk_proxy_daemon.cpp)
   target_link_libraries(spdk_proxy PRIVATE umbp_core)
+  set_target_properties(spdk_proxy PROPERTIES BUILD_RPATH "$ORIGIN"
+                                             INSTALL_RPATH "$ORIGIN"
+                                             BUILD_WITH_INSTALL_RPATH TRUE)
 endif()
 
 # Python bindings are registered in src/pybind/pybind_umbp.cpp (compiled into
@@ -260,6 +263,7 @@ message(
 set(UMBP_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/distributed/proto")
 set(UMBP_PROTO_FILE "${UMBP_PROTO_DIR}/umbp.proto")
 set(UMBP_PEER_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_peer.proto")
+set(UMBP_STANDALONE_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_standalone.proto")
 set(UMBP_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto_gen")
 file(MAKE_DIRECTORY ${UMBP_PROTO_GEN_DIR})
 
@@ -272,6 +276,11 @@ set(UMBP_PEER_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_peer.pb.cc")
 set(UMBP_PEER_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_peer.pb.h")
 set(UMBP_PEER_GRPC_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_peer.grpc.pb.cc")
 set(UMBP_PEER_GRPC_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_peer.grpc.pb.h")
+
+set(UMBP_STANDALONE_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.pb.cc")
+set(UMBP_STANDALONE_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.pb.h")
+set(UMBP_STANDALONE_GRPC_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.cc")
+set(UMBP_STANDALONE_GRPC_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.h")
 
 add_custom_command(
   OUTPUT ${UMBP_PROTO_SRCS} ${UMBP_PROTO_HDRS} ${UMBP_GRPC_SRCS}
@@ -299,6 +308,17 @@ add_custom_command(
   COMMENT "Generating UMBP Peer protobuf/gRPC C++ sources"
   VERBATIM)
 
+add_custom_command(
+  OUTPUT ${UMBP_STANDALONE_PROTO_SRCS} ${UMBP_STANDALONE_PROTO_HDRS}
+         ${UMBP_STANDALONE_GRPC_SRCS} ${UMBP_STANDALONE_GRPC_HDRS}
+  COMMAND
+    ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
+    --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_STANDALONE_PROTO_FILE}
+  DEPENDS ${UMBP_STANDALONE_PROTO_FILE} ${UMBP_PROTO_FILE} ${UMBP_PROTO_HDRS}
+  COMMENT "Generating UMBP Standalone protobuf/gRPC C++ sources"
+  VERBATIM)
+
 # ---------- Static library: umbp_common ---------------------------------------
 # Shared between PoolClient integration and standalone control-plane tools.
 
@@ -308,10 +328,10 @@ add_library(
   ${UMBP_GRPC_SRCS}
   ${UMBP_PEER_PROTO_SRCS}
   ${UMBP_PEER_GRPC_SRCS}
-  distributed/master/global_block_index.cpp
-  distributed/master/external_kv_block_index.cpp
-  distributed/master/client_registry.cpp
-  distributed/master/external_kv_hit_index.cpp
+  ${UMBP_STANDALONE_PROTO_SRCS}
+  ${UMBP_STANDALONE_GRPC_SRCS}
+  distributed/master/in_memory_master_metadata_store.cpp
+  distributed/master/master_metadata_store_factory.cpp
   distributed/master/master_server.cpp
   distributed/master/master_client.cpp
   distributed/master/rpc_latency_timer.cpp
@@ -325,7 +345,11 @@ add_library(
   distributed/peer/ssd_copy_pipeline.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
-  distributed/distributed_client.cpp)
+  distributed/distributed_client.cpp
+  standalone/external_kv_identity_client.cpp
+  standalone/ipc.cpp
+  standalone/standalone_process_client.cpp
+  standalone/standalone_server.cpp)
 
 target_include_directories(
   umbp_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${UMBP_PROTO_GEN_DIR}
@@ -350,6 +374,53 @@ target_link_libraries(
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
 
+# ---------- Optional Redis / RESP master metadata backend --------------------
+# Makes the master stateless by storing all metadata in an external RESP store
+# (Redis / Dragonfly / Valkey). OFF by default so existing builds are
+# unaffected; enable with -DUSE_REDIS_BACKEND=ON. The RESP client seam is built
+# on hiredis (RespClient isolates the client library from the store).
+option(USE_REDIS_BACKEND
+       "Build the RESP-compatible Redis master metadata backend" OFF)
+if(USE_REDIS_BACKEND)
+  find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h REQUIRED)
+  find_library(HIREDIS_LIB NAMES hiredis REQUIRED)
+  message(
+    STATUS
+      "UMBP Redis backend ENABLED (hiredis lib: ${HIREDIS_LIB}, include: ${HIREDIS_INCLUDE_DIR})"
+  )
+
+  # redis-plus-plus (3rdparty submodule) — the cluster/sentinel/pooling-capable
+  # client the Redis backend standardizes on. Built from source so any build
+  # image works without an extra system package; only the client library needs
+  # a submodule (hiredis stays the system lib). Static + PIC (umbp_common is
+  # linked into the shared pybind module), C++17, tests off. The store code does
+  # not depend on it yet (that migration is a later step); building it here
+  # de-risks the dependency (toolchain, -Werror, link) before the seam rebase.
+  set(_REDISPP_DIR "${CMAKE_SOURCE_DIR}/3rdparty/redis-plus-plus")
+  if(NOT EXISTS "${_REDISPP_DIR}/CMakeLists.txt")
+    message(
+      FATAL_ERROR
+        "USE_REDIS_BACKEND=ON but 3rdparty/redis-plus-plus is empty; run "
+        "'git submodule update --init --recursive 3rdparty/redis-plus-plus'")
+  endif()
+  set(REDIS_PLUS_PLUS_BUILD_TEST OFF CACHE BOOL "" FORCE)
+  set(REDIS_PLUS_PLUS_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+  set(REDIS_PLUS_PLUS_BUILD_STATIC ON CACHE BOOL "" FORCE)
+  set(REDIS_PLUS_PLUS_CXX_STANDARD 17 CACHE STRING "" FORCE)
+  add_subdirectory("${_REDISPP_DIR}"
+                   "${CMAKE_BINARY_DIR}/3rdparty/redis-plus-plus")
+
+  target_sources(
+    umbp_common PRIVATE distributed/master/redis/resp_client.cpp
+                        distributed/master/redis/resp_cluster_client.cpp
+                        distributed/master/redis_master_metadata_store.cpp)
+  target_include_directories(umbp_common PRIVATE ${HIREDIS_INCLUDE_DIR})
+  # redis++_static carries its own (and hiredis') include dirs; link it before
+  # hiredis so the static archive's hiredis symbols resolve.
+  target_link_libraries(umbp_common PUBLIC redis++_static ${HIREDIS_LIB})
+  target_compile_definitions(umbp_common PUBLIC USE_REDIS_BACKEND)
+endif()
+
 if(MORI_UMBP_TESTING)
   target_compile_definitions(umbp_common PUBLIC MORI_UMBP_TESTING)
 endif()
@@ -373,6 +444,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(umbp_master PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
+set_target_properties(umbp_master PROPERTIES BUILD_RPATH "$ORIGIN"
+                                             INSTALL_RPATH "$ORIGIN"
+                                             BUILD_WITH_INSTALL_RPATH TRUE)
 
 # ---------- Client executable -------------------------------------------------
 
@@ -382,7 +456,22 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
+set_target_properties(umbp_client PROPERTIES BUILD_RPATH "$ORIGIN"
+                                             INSTALL_RPATH "$ORIGIN"
+                                             BUILD_WITH_INSTALL_RPATH TRUE)
 
-if(BUILD_TESTS)
-  add_subdirectory(tests)
+# ---------- Standalone-process executable ------------------------------------
+
+add_executable(umbp_standalone_server standalone/bin/standalone_server_main.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(umbp_standalone_server PRIVATE -Wl,--no-as-needed)
 endif()
+target_link_libraries(umbp_standalone_server PRIVATE umbp_common ${_PROTOBUF_LIBS}
+                                                     ${_GRPCPP_LIB})
+set_target_properties(umbp_standalone_server PROPERTIES BUILD_RPATH "$ORIGIN"
+                                                        INSTALL_RPATH "$ORIGIN"
+                                                        BUILD_WITH_INSTALL_RPATH TRUE)
+
+# UMBP unit tests live under tests/cpp/umbp (built when BUILD_TESTS=ON); they
+# were previously duplicated here under src/umbp/tests with a second GoogleTest
+# fetch.

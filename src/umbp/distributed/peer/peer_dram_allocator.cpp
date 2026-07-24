@@ -473,8 +473,10 @@ void PeerDramAllocator::QueueEventLocked(KvEvent event) {
   // are appended one at a time, so `==` fires at most once per batch.  Called
   // under mutex_: auto_flush_cb_ must be cheap and MUST NOT re-enter the
   // allocator (it only signals the heartbeat thread).  Exactness isn't required —
-  // the heartbeat interval is the backstop.
-  if (pending_events_.size() == auto_flush_threshold_ && auto_flush_cb_) {
+  // the heartbeat interval is the backstop.  threshold_ == 0 disables size-based
+  // auto-flush entirely (ADDs then ship only on the interval / explicit Flush).
+  if (auto_flush_threshold_ > 0 && pending_events_.size() == auto_flush_threshold_ &&
+      auto_flush_cb_) {
     auto_flush_cb_();
   }
 }

@@ -44,8 +44,6 @@ class MasterEvictStrategy;
 struct ClientRegistryConfig {
   std::chrono::seconds heartbeat_ttl{10};
   std::chrono::seconds reaper_interval{5};
-  std::chrono::seconds allocation_ttl{30};
-  std::chrono::seconds finalized_record_ttl{120};
   uint32_t max_missed_heartbeats = 3;
 
   // Overlay UMBP_* env vars on top of the defaults.  Fields are left
@@ -56,10 +54,6 @@ struct ClientRegistryConfig {
         GetEnvSeconds("UMBP_HEARTBEAT_TTL_SEC", cfg.heartbeat_ttl, /*min_allowed=*/1);
     cfg.reaper_interval =
         GetEnvSeconds("UMBP_REAPER_INTERVAL_SEC", cfg.reaper_interval, /*min_allowed=*/1);
-    cfg.allocation_ttl =
-        GetEnvSeconds("UMBP_ALLOCATION_TTL_SEC", cfg.allocation_ttl, /*min_allowed=*/1);
-    cfg.finalized_record_ttl =
-        GetEnvSeconds("UMBP_FINALIZED_RECORD_TTL_SEC", cfg.finalized_record_ttl, /*min_allowed=*/1);
     cfg.max_missed_heartbeats =
         GetEnvUint32("UMBP_MAX_MISSED_HEARTBEATS", cfg.max_missed_heartbeats, /*min_allowed=*/1);
     return cfg;
@@ -78,7 +72,7 @@ struct EvictionConfig {
   double high_watermark = 0.9;
   double low_watermark = 0.7;
   std::chrono::seconds check_interval{5};
-  std::chrono::seconds lease_duration{10};
+  std::chrono::seconds lease_duration{2};
   size_t evict_batch_size = 32;
 
   // Only timing fields are env-overridable here; watermarks and batch size
@@ -124,6 +118,17 @@ struct MasterServerConfig {
   // ~MasterServerConfig to be instantiated in every TU that includes this
   // header, where those types are incomplete.
   static MasterServerConfig FromEnvironment();
+
+  // Special members are user-declared and defined out-of-line in
+  // master_server.cpp.  This struct owns unique_ptrs to forward-declared
+  // strategy types (RouteGetStrategy / RoutePutStrategy / MasterEvictStrategy),
+  // so the destructor and move operations must be emitted in a TU where those
+  // types are complete — not implicitly instantiated in every includer of this
+  // header (which would require each to include all three strategy headers).
+  MasterServerConfig();
+  ~MasterServerConfig();
+  MasterServerConfig(MasterServerConfig&&) noexcept;
+  MasterServerConfig& operator=(MasterServerConfig&&) noexcept;
 };
 
 struct ExportableDram {
@@ -150,11 +155,10 @@ struct PoolClientConfig {
 
   // SSD read-staging tuning (peer side).  More slots reduce NO_SLOT under large
   // concurrent prefetch batches, but shrink per-slot size (= staging_buffer_size
-  // / slots), which must stay >= the largest single SSD block.  The lease TTL
-  // is the primary slot-reclaim mechanism (ReleaseSsdLease is best-effort), so
-  // it should comfortably exceed one SSD read's latency.
+  // / slots), which must stay >= the largest single SSD block.  The slot lease
+  // TTL (the primary slot-reclaim mechanism; ReleaseSsdLease is best-effort) is
+  // resolved from UMBP_SSD_READ_LEASE_MS at PeerService construction, not here.
   int ssd_staging_buffer_slots = 16;
-  int ssd_lease_timeout_s = 10;
 
   // Backs ssd_staging_buffer_, allocated only when ssd.enabled. A remote SSD
   // read fits one whole key value in a slot, so this / ssd_staging_buffer_slots

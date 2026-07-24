@@ -114,6 +114,12 @@ class MetricsServer {
   void observe(std::string_view name, std::string_view help, const std::vector<double>& bounds,
                double value);
 
+  // Record one histogram observation into a LABELED series (e.g.
+  // {op=...,backend=...}). Same first-write-wins bucket layout as the unlabeled
+  // observe(); reuses the labeled-histogram storage that observeAggregated uses.
+  void observe(std::string_view name, std::string_view help, const Labels& labels,
+               const std::vector<double>& bounds, double value);
+
   // Merge a pre-aggregated histogram batch into a labeled series.
   // `bucket_counts` is CUMULATIVE (bucket_counts[i] = #obs with value <=
   // bounds[i]) and is added per-bucket into the stored series; `count` and
