@@ -608,44 +608,29 @@ def make_combine(
         warp = tid >> LOG2_WAVE
         global_warp_id = bid * warp_num_per_block + warp
         global_warp_num = block_num * warp_num_per_block
-        grid_thread_id = bid * (warp_num_per_block * WAVE) + tid
 
         window = cco.Window(arena)
         rsrc_tok_map = create_buffer_resource_from_addr(addr_tok_map)
-        rsrc_comb_bar = create_buffer_resource_from_addr(addr_comb_bar)
         rsrc_total_recv = create_buffer_resource_from_addr(addr_total_recv)
         rsrc_out = create_buffer_resource_from_addr(addr_out)
         xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
 
-        # ── Stage 1: cross-device entry barrier (block 0 only) ──
-        # Block 0 handles the full xdb handshake, then signals other blocks
-        # via comb_bar. Eliminates the grid barrier and per-block xdb spin.
-        if grid_thread_id < npes:
-            xdb_remote = fx.Int64(
-                window.lsa_ptr(grid_thread_id, off_xdb_mem)
-            ) + fx.Int64(rank) * fx.Int64(8)
-            P.store_i64_system(xdb_remote, arith.constant(0), xdb_cur_flag)
-        if grid_thread_id == 0:
-            P.atomic_add_global(
-                fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64())
-            )
-        if grid_thread_id < npes:
+        # ── Stage 1: cross-device entry barrier ──
+        # Block 0 writes xdb flags to all peers; all blocks spin on local
+        # xdb_mem directly (no comb_bar inter-block signaling needed).
+        if bid == 0:
+            if tid < npes:
+                xdb_remote = fx.Int64(
+                    window.lsa_ptr(tid, off_xdb_mem)
+                ) + fx.Int64(rank) * fx.Int64(8)
+                P.store_i64_system(xdb_remote, arith.constant(0), xdb_cur_flag)
+        if tid < npes:
             xdb_peer_slot = fx.Int64(
                 window.lsa_ptr(my_lsa_rank, off_xdb_mem)
-            ) + fx.Int64(grid_thread_id) * fx.Int64(8)
+            ) + fx.Int64(tid) * fx.Int64(8)
             P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
-        if bid == 0:
-            fx.barrier()
-            if tid == 0:
-                P.store_i32_system(
-                    fx.Int64(addr_comb_bar), arith.constant(0), arith.constant(1)
-                )
-        if bid != 0:
-            if tid == 0:
-                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), 0)
-            fx.barrier()
-            if tid == 0:
-                P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
+        fx.barrier()
+        P.fence_system_acquire()
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
@@ -827,11 +812,6 @@ def make_combine(
                         _one(unit_base + u)
 
             _accum_loop()
-
-        if global_warp_id == 0:
-            if lane == 0:
-                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), block_num - 1)
-                buffer_store(arith.constant(0), rsrc_comb_bar, 0)
 
     @flyc.jit
     def run(
