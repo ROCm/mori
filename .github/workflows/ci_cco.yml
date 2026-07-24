@@ -102,7 +102,11 @@ jobs:
 
       - name: Run CCO SDMA Python API tests (spawn, up to 8 GPUs)
         run: |
-          $CT exec $CONTAINER bash -c "\
+          # BUILD_CCO_SDMA=1: the device wrapper is JIT-compiled at runtime, so it
+          # needs the same SDMA compile flag the host lib was built with (build
+          # step above) — otherwise the JIT bitcode has no cco_sdma_* symbols.
+          # (MORI_ENABLE_SDMA is set by the test itself to build the queues.)
+          $CT exec -e BUILD_CCO_SDMA=1 $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
 
@@ -121,7 +125,7 @@ jobs:
 
       - name: Run CCO SDMA Python API tests (spawn, up to 8 GPUs)
         run: |
-          $CT exec $CONTAINER bash -c "\
+          $CT exec -e BUILD_CCO_SDMA=1 $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
 
