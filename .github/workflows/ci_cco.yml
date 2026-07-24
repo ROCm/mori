@@ -60,7 +60,7 @@ jobs:
         run: |
           # BUILD_UMBP=OFF: not needed for CCO, and its gtest discovery breaks under cmake 4.4.
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON MORI_WITH_MPI=ON BUILD_UMBP=OFF pip install ."
+            "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON MORI_WITH_MPI=ON BUILD_UMBP=OFF BUILD_CCO_SDMA=ON pip install ."
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         run: |
@@ -68,6 +68,15 @@ jobs:
           # cross-rail RDMA, so GDA-FULL tests (gda_flush_async/gda_modes/
           # multiprocess) can't form FULL connections; skip them here.
           $CT exec -e MORI_CCO_SKIP_GDA_FULL=1 $CONTAINER bash $GITHUB_WORKSPACE/tools/run_cco_tests.sh $GITHUB_WORKSPACE/build 4 2>&1
+
+      - name: Run CCO SDMA C++ tests (fork mode, 8 ranks)
+        run: |
+          $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            for t in test_sdma_put test_sdma_get test_sdma_put_mt test_sdma_block test_sdma_edge; do \
+              echo \"=== \$t ===\" && \
+              timeout 240 ./build/tests/cpp/cco/\$t 8 || exit 1; \
+            done"
 
       - name: Run CCO C++ examples (2 ranks)
         run: |
@@ -90,6 +99,16 @@ jobs:
             # mpirun --allow-run-as-root -np 2 python 03_flydsl_put/main.py
             # mpirun --allow-run-as-root -np 2 python 06_flydsl_gda_modes/main.py
 
+
+      - name: Run CCO SDMA Python API tests (spawn, up to 8 GPUs)
+        run: |
+          # The build step built with BUILD_CCO_SDMA=ON, which setup.py bakes into
+          # the package, so the runtime JIT device wrapper picks up SDMA
+          # automatically. (MORI_ENABLE_SDMA is set by the test to build queues.)
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
+
       - name: Run ops-v2 dispatch/combine test (EP8, 8 ranks)
         run: |
           $CT exec $CONTAINER bash -c "\
@@ -102,6 +121,13 @@ jobs:
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             MODE=graph SWEEP=128,512,4096,8192 ITERS=20 WARMUP=10 \
             torchrun --standalone --nproc_per_node=8 bench_dispatch_combine.py"
+
+      - name: Run CCO SDMA Python API tests (spawn, up to 8 GPUs)
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
+
 
       - name: Cleanup
         if: always()

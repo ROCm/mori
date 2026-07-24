@@ -36,18 +36,28 @@ namespace mori::cco::benchmark {
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [options]\n"
-               "  transport is selected by env MORI_DISABLE_P2P:\n"
-               "    unset / on / 1  -> ibgda (RDMA)   [default]\n"
-               "    off / 0 / false -> lsa   (intra-node P2P)\n"
+               "  -t transport   lsa | sdma | ibgda (default ibgda)\n"
+               "                 sets the required env internally:\n"
+               "                   sdma  -> MORI_ENABLE_SDMA=1\n"
+               "                   ibgda -> MORI_DISABLE_P2P=1\n"
+               "                   lsa   -> MORI_DISABLE_P2P=0\n"
+               "                 when -t is omitted the transport falls back to env:\n"
+               "                   MORI_ENABLE_SDMA=1 -> sdma  [highest priority]\n"
+               "                   MORI_DISABLE_P2P unset / on / 1  -> ibgda   [default]\n"
+               "                   MORI_DISABLE_P2P off / 0 / false -> lsa\n"
                "  -b min_bytes   minimum message size\n"
                "  -e max_bytes   maximum message size\n"
                "  -f step        multiply size by this factor each step\n"
                "  -n iters       timed iterations\n"
                "  -w warmup      warmup iterations\n"
                "  -c grid_x      HIP grid x (blocks)\n"
-               "  -t threads     threads per block\n"
+               "  -T threads     threads per block\n"
                "  -s scope       thread | warp | block | thread_agg (default block)\n"
                "                 thread_agg = thread scope + ThreadAggregate (bw only)\n"
+               "  -a             SDMA: aggregate doorbell — post the per-iter batch\n"
+               "                 without ringing, then one commit() (bw only)\n"
+               "  -A depth       SDMA: sub-copies per queue per iter (default 1);\n"
+               "                 baseline rings each, -a rings once for all\n"
                "  -h             this help\n",
                program != nullptr ? program : "program");
 }
@@ -79,10 +89,16 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
   };
 
   int opt = 0;
-  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:t:s:")) != -1) {
+  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:")) != -1) {
     switch (opt) {
       case 'h':
         return 2;
+      case 'a':
+        out_args->aggregate = true;
+        break;
+      case 'A':
+        out_args->agg_depth = std::atoi(optarg);
+        break;
       case 'b':
         out_args->min_size = parse_size(optarg);
         break;
@@ -101,8 +117,20 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
       case 'c':
         out_args->nblocks = std::atoi(optarg);
         break;
-      case 't':
+      case 'T':
         out_args->threads_per_block = std::atoi(optarg);
+        break;
+      case 't':
+        if (std::strcmp(optarg, "lsa") == 0) {
+          out_args->transport = Transport::kLsa;
+        } else if (std::strcmp(optarg, "sdma") == 0) {
+          out_args->transport = Transport::kSdma;
+        } else if (std::strcmp(optarg, "ibgda") == 0) {
+          out_args->transport = Transport::kIbgda;
+        } else {
+          return 1;
+        }
+        out_args->transport_explicit = true;
         break;
       case 's':
         if (std::strcmp(optarg, "thread") == 0) {
@@ -230,10 +258,11 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
   }
 
   if (args.min_size > args.max_size || args.step_factor < 2 || args.iters < 1 || args.nblocks < 1 ||
-      args.threads_per_block < 1) {
+      args.threads_per_block < 1 || args.agg_depth < 1) {
     if (ctx->world_rank == 0) {
       std::fprintf(stderr,
-                   "Invalid arguments (need iters >= 1, nblocks/threads >= 1, step >= 2).\n");
+                   "Invalid arguments (need iters >= 1, nblocks/threads >= 1, step >= 2, "
+                   "agg_depth >= 1).\n");
     }
     MPI_Finalize();
     return 1;
@@ -242,16 +271,40 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     args.min_size = (args.min_size + sizeof(double) - 1) / sizeof(double) * sizeof(double);
   }
 
-  // Transport from MORI_DISABLE_P2P. Default (unset) is IBGDA (P2P disabled);
-  // an explicit false value ("0"/"false"/"off"/"no") selects LSA. This mirrors
-  // mori::env::IsEnvVarEnabled's parsing but defaults to enabled when unset.
-  {
-    const char* v = std::getenv("MORI_DISABLE_P2P");
-    bool p2p_disabled = true;  // default: IBGDA
-    if (v != nullptr && v[0] != '\0') {
-      p2p_disabled = env::detail::ParseBool(v).value_or(true);
+  // Transport selection. When -t is given it wins and we export the env the CCO
+  // comm keys off (MORI_ENABLE_SDMA gates SDMA-queue build in ccoCommCreate;
+  // MORI_DISABLE_P2P chooses IBGDA vs LSA) before ccoCommCreate runs below.
+  // Without -t we fall back to those same env vars: MORI_ENABLE_SDMA takes
+  // precedence, else MORI_DISABLE_P2P picks IBGDA (default) vs LSA.
+  if (args.transport_explicit) {
+    switch (args.transport) {
+      case Transport::kSdma:
+        setenv("MORI_ENABLE_SDMA", "1", 1);
+        break;
+      case Transport::kIbgda:
+        setenv("MORI_ENABLE_SDMA", "0", 1);
+        setenv("MORI_DISABLE_P2P", "1", 1);
+        break;
+      case Transport::kLsa:
+        setenv("MORI_ENABLE_SDMA", "0", 1);
+        setenv("MORI_DISABLE_P2P", "0", 1);
+        break;
     }
-    args.transport = p2p_disabled ? Transport::kIbgda : Transport::kLsa;
+  } else {
+    bool sdma_enabled = false;
+    if (const char* sv = std::getenv("MORI_ENABLE_SDMA")) {
+      if (sv[0] != '\0') sdma_enabled = env::detail::ParseBool(sv).value_or(false);
+    }
+    if (sdma_enabled) {
+      args.transport = Transport::kSdma;
+    } else {
+      const char* v = std::getenv("MORI_DISABLE_P2P");
+      bool p2p_disabled = true;  // default: IBGDA
+      if (v != nullptr && v[0] != '\0') {
+        p2p_disabled = env::detail::ParseBool(v).value_or(true);
+      }
+      args.transport = p2p_disabled ? Transport::kIbgda : Transport::kLsa;
+    }
   }
 
   // Local communicator → local rank → device binding. CCO pins the device at
@@ -313,7 +366,10 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
 
   // DevComm tuned to the chosen transport.
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
-  if (args.transport == Transport::kLsa) {
+  if (args.transport == Transport::kLsa || args.transport == Transport::kSdma) {
+    // Both intra-node backends need no GDA connectivity. The SDMA signal pool is
+    // materialized by ccoDevCommCreate whenever the comm has SDMA queues (built
+    // in ccoCommCreate when MORI_ENABLE_SDMA is on and peers are canSDMA).
     reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
     reqs.gdaSignalCount = 0;
     reqs.gdaCounterCount = 0;
@@ -338,13 +394,20 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
   }
 
   // Transport feasibility checks.
-  if (args.transport == Transport::kLsa) {
+  if (args.transport == Transport::kLsa || args.transport == Transport::kSdma) {
     if (ctx->devComm.lsaSize < 2) {
       if (ctx->my_pe == 0) {
+        std::fprintf(stderr, "%s transport requires both PEs on the same node (lsaSize=%d).\n",
+                     TransportToChar(args.transport), ctx->devComm.lsaSize);
+      }
+      PerfFinalize(ctx);
+      return 1;
+    }
+    if (args.transport == Transport::kSdma && ctx->devComm.sdma.sdmaNumQueue == 0) {
+      if (ctx->my_pe == 0) {
         std::fprintf(stderr,
-                     "LSA transport requires both PEs on the same node (lsaSize=%d). "
-                     "Run -T ibgda for cross-node.\n",
-                     ctx->devComm.lsaSize);
+                     "SDMA transport has no queues — set MORI_ENABLE_SDMA=1 and ensure peers are "
+                     "SDMA-capable.\n");
       }
       PerfFinalize(ctx);
       return 1;
@@ -366,7 +429,13 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
   // Announce the resolved transport up front (PE 0 only) so the run is
   // self-identifying without parsing the table header.
   if (ctx->my_pe == 0) {
-    if (args.transport == Transport::kLsa) {
+    if (args.transport == Transport::kSdma) {
+      std::printf(
+          "[cco-bench] transport = SDMA (intra-node copy engine via ccoSdma; lsaSize=%d, "
+          "numQueue=%u; aggregate=%s depth=%d)\n",
+          ctx->devComm.lsaSize, ctx->devComm.sdma.sdmaNumQueue, args.aggregate ? "on" : "off",
+          args.agg_depth);
+    } else if (args.transport == Transport::kLsa) {
       std::printf("[cco-bench] transport = LSA  (intra-node P2P, flat-VA load/store; lsaSize=%d)\n",
                   ctx->devComm.lsaSize);
     } else {
@@ -377,6 +446,13 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     }
     std::fflush(stdout);
   }
+
+  // CCO setup (window P2P import / DevComm creation) may call
+  // hipDeviceEnablePeerAccess on links already enabled, returning the benign
+  // hipErrorPeerAccessAlreadyEnabled and leaving it as the sticky last error.
+  // Clear it so the first HIP_RUNTIME_CHECK(hipGetLastError()) after a kernel
+  // launch doesn't misfire on a leftover setup error.
+  (void)hipGetLastError();
 
   return 0;
 }
