@@ -105,44 +105,6 @@ def get_cache_dir(
         if os.environ.get("MORI_DISP_BAREB", "").lower() in ("1", "true", "on", "yes")
         else ""
     )
-    # -DMORI_DISP_TILE2D reshapes the TDM payload tile to a 2D rectangle; cache it
-    # separately so toggling it never reuses the 1xN-tile .hsaco.
-    tile2d_suffix = (
-        "_disptile2d"
-        if os.environ.get("MORI_DISP_TILE2D", "").lower() in ("1", "true", "on", "yes")
-        else ""
-    )
-    splitmeta_suffix = (
-        "_dispsplitmeta"
-        if os.environ.get("MORI_DISP_SPLITMETA", "").lower() in ("1", "true", "on", "yes")
-        else ""
-    )
-    nometa_suffix = (
-        "_dispnometa"
-        if os.environ.get("MORI_DISP_NOMETA", "").lower() in ("1", "true", "on", "yes")
-        else ""
-    )
-    metaphase_suffix = (
-        "_dispmetaphase"
-        if os.environ.get("MORI_DISP_METAPHASE", "").lower() in ("1", "true", "on", "yes")
-        else ""
-    )
-    _comp = "".join(
-        s
-        for v, s in (
-            ("MORI_DISP_NOSCALES", "_noscales"),
-            ("MORI_DISP_NOIDXW", "_noidxw"),
-            ("MORI_DISP_NOSRCMAP", "_nosrcmap"),
-            ("MORI_DISP_METAONLY", "_metaonly"),
-            ("MORI_DISP_METAWIDE", "_metawide"),
-        )
-        if os.environ.get(v, "").lower() in ("1", "true", "on", "yes")
-    )
-    if os.environ.get("MORI_DISP_CUSPLIT", "").lower() in ("1", "true", "on", "yes"):
-        _comp += "_cusplit"
-        _pb = os.environ.get("MORI_DISP_PAYLOAD_BLOCKS", "").strip()
-        if _pb.isdigit():
-            _comp += f"pb{int(_pb)}"
     cntstep_suffix = (
         f"_cntstep{os.environ['MORI_CNT_STEP'].strip()}"
         if os.environ.get("MORI_CNT_STEP", "").strip().isdigit()
@@ -150,7 +112,7 @@ def get_cache_dir(
     )
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{bareb_suffix}{tile2d_suffix}{splitmeta_suffix}{nometa_suffix}{metaphase_suffix}{_comp}{cntstep_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{bareb_suffix}{cntstep_suffix}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)

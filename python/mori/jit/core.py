@@ -302,42 +302,6 @@ def _disp_bareb_defines() -> list[str]:
     out = ["-DMORI_DISP_BAREB"] if val.lower() in ("1", "true", "on", "yes") else []
     if os.environ.get("MORI_DBG_LOCAL_ONLY", "").lower() in ("1", "true", "on", "yes"):
         out.append("-DMORI_DBG_LOCAL_ONLY")
-    # Diagnostic: -DMORI_DISP_TILE2D reshapes the TDM payload tile from the 1xN
-    # degenerate shape to a regular 2D WxH rectangle (see TdmShape2D). A/B toggle to
-    # test whether the 1xN tile is what caps Part-B below the a2a ceiling.
-    if os.environ.get("MORI_DISP_TILE2D", "").lower() in ("1", "true", "on", "yes"):
-        out.append("-DMORI_DISP_TILE2D")
-    # -DMORI_DISP_SPLITMETA restructures the clean BATCH Phase-3 into two passes
-    # (payload TDM stores first, remote metadata scatter after) so the async stores
-    # stream uninterrupted instead of stalling behind per-peer metadata.
-    if os.environ.get("MORI_DISP_SPLITMETA", "").lower() in ("1", "true", "on", "yes"):
-        out.append("-DMORI_DISP_SPLITMETA")
-    # Diagnostic: -DMORI_DISP_NOMETA skips the remote metadata scatter (indices/weights/
-    # scales/dispTokIdToSrcTokId) in clean Phase-3 to isolate its cost vs the TDM copy.
-    if os.environ.get("MORI_DISP_NOMETA", "").lower() in ("1", "true", "on", "yes"):
-        out.append("-DMORI_DISP_NOMETA")
-    # -DMORI_DISP_METAPHASE moves the remote metadata scatter out of the payload loop
-    # into a separate post-copy sweep so the TDM payload streams uninterrupted (fix for
-    # the dispatch Part-B <-> a2a bandwidth gap).
-    if os.environ.get("MORI_DISP_METAPHASE", "").lower() in ("1", "true", "on", "yes"):
-        out.append("-DMORI_DISP_METAPHASE")
-    # Diagnostic component gates to bisect which metadata scatter dominates Part-B cost.
-    for _v, _d in (
-        ("MORI_DISP_NOSCALES", "-DMORI_DISP_NOSCALES"),
-        ("MORI_DISP_NOIDXW", "-DMORI_DISP_NOIDXW"),
-        ("MORI_DISP_NOSRCMAP", "-DMORI_DISP_NOSRCMAP"),
-        ("MORI_DISP_METAONLY", "-DMORI_DISP_METAONLY"),
-        ("MORI_DISP_METAWIDE", "-DMORI_DISP_METAWIDE"),
-    ):
-        if os.environ.get(_v, "").lower() in ("1", "true", "on", "yes"):
-            out.append(_d)
-    # CU-split: dedicate blocks [0,PAYLOAD_BLOCKS) to the TDM payload copy and the rest to
-    # the metadata scatter, running concurrently on separate CUs (fix for the Part-B gap).
-    if os.environ.get("MORI_DISP_CUSPLIT", "").lower() in ("1", "true", "on", "yes"):
-        out.append("-DMORI_DISP_CUSPLIT")
-    _pb = os.environ.get("MORI_DISP_PAYLOAD_BLOCKS", "").strip()
-    if _pb.isdigit():
-        out.append(f"-DMORI_DISP_PAYLOAD_BLOCKS={int(_pb)}")
     return out
 
 
