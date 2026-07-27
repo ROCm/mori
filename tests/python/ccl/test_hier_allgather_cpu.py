@@ -222,13 +222,6 @@ def _make_hier_stub(fuse_barrier: bool):
     h.num_nodes = 2
     h.ranks_per_node = 2
     h.npes = 4
-    # TEMP -- delete these 2 lines together with this comment once the
-    # leader_only / gather_in_place removal lands (COORD 2026-07-27T04:25Z).
-    # They are not coverage: _call_impl still reads both before any branch, and
-    # this stub bypasses __init__, so they cannot be dropped ahead of it.
-    h.leader_only = False
-    h.gather_in_place = False
-    h.out_in_place = False
     h.fuse_barrier = fuse_barrier
     h._node_block = None
     h._prev_op_completed = False
