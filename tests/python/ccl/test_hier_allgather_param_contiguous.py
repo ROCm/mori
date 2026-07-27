@@ -20,8 +20,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-# Copyright © Advanced Micro Devices, Inc. All rights reserved.
-# MIT License
 """Bit-exact test: ``HierAllGather.enqueue_param_contiguous`` (zero-copy into
 ``[param][rank]``) vs all_gather_into_tensor reshuffled to the same layout.
 Must be byte-identical (AllGather is a pure data move). Launch under torchrun."""
