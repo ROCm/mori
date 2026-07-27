@@ -40,6 +40,12 @@ pytestmark = pytest.mark.skipif(
     reason="cross-node harness; launch under torchrun",
 )
 
+# The other precondition, which pytestmark cannot express because it is only
+# known after the handle is built: the direct path needs num_nodes >= 2 over an
+# RDMA transport (supports_param_contiguous_output). Launched on one node, or
+# on the single-node IPC spawn simulation, there is nothing here to validate.
+_SKIP_REASON = "direct param-contiguous path unavailable (needs cross-node RDMA)"
+
 _DTYPES = [torch.bfloat16, torch.float16, torch.float32, torch.int32]
 
 # Per-param element counts (packed shard = concat). Multi-MiB so the output lands
@@ -107,7 +113,11 @@ def _run_one(handle, dtype, rank, world_size, device, splits):
 
 
 def _run_profile(name, splits, dtypes, reps, rank, world_size, ranks_per_node, device):
-    """Build a fresh handle for this size profile and validate bit-exact."""
+    """Build a fresh handle for this size profile and validate bit-exact.
+
+    Returns True if the profile actually validated, False if it was skipped for
+    lack of the direct path. A False must never be reported as a pass.
+    """
     count = sum(splits)
     per_rank_bytes = count * 4 + 4096
     handle = HierAllGather(
@@ -128,8 +138,8 @@ def _run_profile(name, splits, dtypes, reps, rank, world_size, ranks_per_node, d
     try:
         if not handle.supports_param_contiguous_output():
             if rank == 0:
-                print(f"[{name}] SKIP: direct param-contiguous path unavailable")
-            return True
+                print(f"[{name}] SKIP: {_SKIP_REASON}")
+            return False
         for _rep in range(reps):
             for dtype in dtypes:
                 _run_one(handle, dtype, rank, world_size, device, splits)
@@ -148,15 +158,20 @@ def _run_profile(name, splits, dtypes, reps, rank, world_size, ranks_per_node, d
 
 
 def _worker_body(rank, world_size, ranks_per_node, device):
+    """Run both size profiles. True only if every profile actually validated.
+
+    Both profiles are run unconditionally (no short-circuit) so that every rank
+    issues the same sequence of collectives regardless of the verdict.
+    """
     shmem.shmem_torch_process_group_init("default")
     assert shmem.shmem_mype() == rank
     try:
         # Small profile: all dtypes, 3 reps (flag-recycle coverage).
-        _run_profile(
+        small = _run_profile(
             "small", _PARAM_SPLITS, _DTYPES, 3, rank, world_size, ranks_per_node, device
         )
         # Large profile: bf16/fp32 + int32 (2^31 byte-offset overflow probe).
-        _run_profile(
+        large = _run_profile(
             "large",
             _PARAM_SPLITS_LARGE,
             [torch.bfloat16, torch.float32, torch.int32],
@@ -166,8 +181,11 @@ def _worker_body(rank, world_size, ranks_per_node, device):
             ranks_per_node,
             device,
         )
+        validated = small and large
         if rank == 0:
-            print("test_hier_allgather_param_contiguous: PASSED")
+            verdict = "PASSED" if validated else f"SKIPPED: {_SKIP_REASON}"
+            print(f"test_hier_allgather_param_contiguous: {verdict}")
+        return validated
     finally:
         torch.cuda.synchronize()
         dist.barrier()
@@ -191,7 +209,7 @@ def _run_torchrun():
     world_group = torch.distributed.group.WORLD
     torch._C._distributed_c10d._register_process_group("default", world_group)
     try:
-        _worker_body(rank, world_size, ranks_per_node, device)
+        return _worker_body(rank, world_size, ranks_per_node, device)
     finally:
         if dist.is_initialized():
             dist.barrier()
@@ -200,7 +218,12 @@ def _run_torchrun():
 
 def test_hier_allgather_param_contiguous():
     """Pytest entry: runs only under torchrun (guarded by module pytestmark)."""
-    _run_torchrun()
+    if not _run_torchrun():
+        # Safe to raise Skipped here and only here: _run_torchrun has returned,
+        # so every collective is already issued and the process group is torn
+        # down. Skipping deeper would unwind through a `finally` that barriers
+        # and would hang any peer rank that did not take the same branch.
+        pytest.skip(_SKIP_REASON)
 
 
 if __name__ == "__main__":
