@@ -1279,10 +1279,10 @@ struct ccoSdmaQueueDeviceHandle {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Post Tasks                                           */
 /* ---------------------------------------------------------------------------------------------- */
-template <bool Signal = true>
+template <bool Signal = true, bool Ring = true>
 inline __device__ void ccoSdmaPostCopy(ccoSdmaQueueDeviceHandle** deviceHandles, HSAuint64* signals,
                                        HSAuint64* expectedSignals, void* srcPtr, void* dstPtr,
-                                       size_t size, int qId, bool ring = true) {
+                                       size_t size, int qId) {
   if (size == 0) return;
 
   ccoSdmaQueueDeviceHandle handle = **(deviceHandles + qId);
@@ -1311,7 +1311,7 @@ inline __device__ void ccoSdmaPostCopy(ccoSdmaQueueDeviceHandle** deviceHandles,
     for (int i = 7; i < 16; i++) q[i] = 0;  // NOPs
   }
 
-  if (ring) handle.submitPacket(base, base + kSlot);
+  if constexpr (Ring) handle.submitPacket(base, base + kSlot);
 }
 
 // Ring the doorbell for everything placed-but-not-rung on this queue.
@@ -1333,66 +1333,40 @@ inline __device__ int ccoSdmaBlockQueueId(uint32_t queNum) {
   return tid < static_cast<int>(queNum) ? tid : -1;
 }
 
-// Multi-queue split: the caller's rank in the coop group selects the queue; the
-// last active queue absorbs the remainder so uneven sizes are fully covered.
-template <bool Signal = true>
-inline __device__ void ccoSdmaPutMultiQueue(void* srcBuf, void* dstBuf, size_t copy_size,
-                                            ccoSdmaQueueDeviceHandle** deviceHandles,
-                                            HSAuint64* signals, HSAuint64* expectedSignals,
-                                            uint32_t queNum, int rank, bool ring = true) {
-  if (rank >= static_cast<int>(queNum)) return;
-  const int queueId = rank;
-  const size_t rand_size = copy_size / queNum;  // per queue slice size
-  // Too small to split: queue 0 sends the whole thing, the rest stay idle.
-  if (rand_size == 0) {
-    if (rank == 0 && copy_size > 0) {
-      ccoSdmaPostCopy<Signal>(deviceHandles, signals, expectedSignals, srcBuf, dstBuf, copy_size, 0,
-                              ring);
-    }
-    return;
-  }
-  const size_t perq_send_size =
-      (queueId < static_cast<int>(queNum - 1)) ? rand_size : (copy_size - (queNum - 1) * rand_size);
-  const size_t byteOffset = static_cast<size_t>(queueId) * rand_size;
-
-  char* srcPtr = reinterpret_cast<char*>(srcBuf) + byteOffset;
-  char* dstPtr = reinterpret_cast<char*>(dstBuf) + byteOffset;
-
-  ccoSdmaPostCopy<Signal>(deviceHandles, signals, expectedSignals, srcPtr, dstPtr, perq_send_size,
-                          queueId, ring);
-}
-
 // Thread scope: one thread drives a single queue `qId` with the full copy.
-template <bool Signal = true>
+template <bool Signal = true, bool Ring = true>
 inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                         ccoSdmaQueueDeviceHandle** deviceHandles,
                                         HSAuint64* signals, HSAuint64* expectedSignals,
-                                        uint32_t queNum, uint32_t qId, bool ring = true) {
+                                        uint32_t queNum, uint32_t qId) {
   if (qId >= queNum) return;  // out-of-range queue: no-op, not OOB
-  ccoSdmaPostCopy<Signal>(deviceHandles, signals, expectedSignals, srcBuf, dstBuf, copy_size,
-                          static_cast<int>(qId), ring);
+  ccoSdmaPostCopy<Signal, Ring>(deviceHandles, signals, expectedSignals, srcBuf, dstBuf, copy_size,
+                                static_cast<int>(qId));
 }
 
-// Warp scope: one lane per queue (queueId == laneId), split across all queues.
-template <bool Signal = true>
+// Warp scope: the warp's leader lane drives `queueId` with the full copy (honors
+// queueId, no scatter). Single writer — cooperative fill measured slower for a
+// 64B WQE; other lanes no-op.
+template <bool Signal = true, bool Ring = true>
 inline __device__ void ccoSdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
                                       ccoSdmaQueueDeviceHandle** deviceHandles, HSAuint64* signals,
                                       HSAuint64* expectedSignals, uint32_t queNum,
-                                      bool ring = true) {
-  const int laneId = (__builtin_amdgcn_workitem_id_x() % __builtin_amdgcn_wavefrontsize());
-  ccoSdmaPutMultiQueue<Signal>(srcBuf, dstBuf, copy_size, deviceHandles, signals, expectedSignals,
-                               queNum, laneId, ring);
+                                      uint32_t queueId) {
+  if (ccoCoopWarp{}.thread_rank() != 0) return;
+  ccoSdmaPutThread<Signal, Ring>(srcBuf, dstBuf, copy_size, deviceHandles, signals, expectedSignals,
+                                 queNum, queueId);
 }
 
-// Block scope: one thread per queue (queueId == threadIdx.x), split across all
-// queues. Lets a transfer use up to blockDim.x queues (i.e. > warpSize).
-template <bool Signal = true>
+// Block scope: the block's leader thread drives `queueId` with the full copy
+// (honors queueId, no scatter). Single writer; other threads no-op.
+template <bool Signal = true, bool Ring = true>
 inline __device__ void ccoSdmaPutBlock(void* srcBuf, void* dstBuf, size_t copy_size,
                                        ccoSdmaQueueDeviceHandle** deviceHandles, HSAuint64* signals,
                                        HSAuint64* expectedSignals, uint32_t queNum,
-                                       bool ring = true) {
-  ccoSdmaPutMultiQueue<Signal>(srcBuf, dstBuf, copy_size, deviceHandles, signals, expectedSignals,
-                               queNum, static_cast<int>(__builtin_amdgcn_workitem_id_x()), ring);
+                                       uint32_t queueId) {
+  if (ccoCoopBlock{}.thread_rank() != 0) return;
+  ccoSdmaPutThread<Signal, Ring>(srcBuf, dstBuf, copy_size, deviceHandles, signals, expectedSignals,
+                                 queNum, queueId);
 }
 
 // Commit (ring pending packets) per coop scope.
@@ -1449,13 +1423,32 @@ enum ccoSdmaOptFlags : uint32_t {
   ccoSdmaOptFlagsAggregate = (1u << 0),
 };
 
+// Dispatch a copy (src -> dst) to the right coop-scope post, with Ring as a
+// compile-time argument. thread = single queueId; warp/block = cooperative fill
+// of one WQE on queueId.
+template <typename Coop, bool Signal, bool Ring>
+__device__ inline void ccoSdmaDispatchPut(const ccoSdmaContext& s, int peer, uint32_t n, void* dst,
+                                          void* src, size_t bytes, int queueId) {
+  if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
+    ccoSdmaPutThread<Signal, Ring>(src, dst, bytes, s.deviceHandles + peer * n,
+                                   s.signalBuf + peer * n, s.expectSignals + peer * n, n, queueId);
+  } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
+    ccoSdmaPutWarp<Signal, Ring>(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
+                                 s.expectSignals + peer * n, n, queueId);
+  } else {
+    ccoSdmaPutBlock<Signal, Ring>(src, dst, bytes, s.deviceHandles + peer * n,
+                                  s.signalBuf + peer * n, s.expectSignals + peer * n, n, queueId);
+  }
+}
+
 struct ccoSdma {
   ccoDevComm const& comm;
 
   __device__ inline ccoSdma(ccoDevComm const& c) : comm(c) {}
 
   // put: local src -> peer dst. Single-issuer per (peer, queue).
-  //   Coop:    thread = one queue (queueId); warp/block = split across all queues.
+  //   Coop:    thread = one thread drives queueId; warp/block = the group
+  //            cooperatively fills one WQE on queueId (no scatter).
   //   Signal:  false = fire-and-forget, can't be drained by quiet (caller syncs).
   //   optFlags: Aggregate posts without ringing; call commit() to ring the batch.
   template <typename Coop = ccoCoopThread, bool Signal = true>
@@ -1470,15 +1463,10 @@ struct ccoSdma {
     const bool ring = !(optFlags & ccoSdmaOptFlagsAggregate);
     void* dst = ccoGetLsaPeerPtr(dstWin, peer, dstOffset);
     void* src = ccoGetLocalPtr(srcWin, srcOffset);
-    if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
-      ccoSdmaPutThread<Signal>(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
-                               s.expectSignals + peer * n, n, queueId, ring);
-    } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
-      ccoSdmaPutWarp<Signal>(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
-                             s.expectSignals + peer * n, n, ring);
+    if (ring) {
+      ccoSdmaDispatchPut<Coop, Signal, true>(s, peer, n, dst, src, bytes, queueId);
     } else {
-      ccoSdmaPutBlock<Signal>(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
-                              s.expectSignals + peer * n, n, ring);
+      ccoSdmaDispatchPut<Coop, Signal, false>(s, peer, n, dst, src, bytes, queueId);
     }
   }
 
@@ -1495,15 +1483,10 @@ struct ccoSdma {
     const bool ring = !(optFlags & ccoSdmaOptFlagsAggregate);
     void* dst = ccoGetLocalPtr(dstWin, dstOffset);
     void* src = ccoGetLsaPeerPtr(srcWin, peer, srcOffset);
-    if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
-      ccoSdmaPutThread<Signal>(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
-                               s.expectSignals + peer * n, n, queueId, ring);
-    } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
-      ccoSdmaPutWarp<Signal>(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
-                             s.expectSignals + peer * n, n, ring);
+    if (ring) {
+      ccoSdmaDispatchPut<Coop, Signal, true>(s, peer, n, dst, src, bytes, queueId);
     } else {
-      ccoSdmaPutBlock<Signal>(src, dst, bytes, s.deviceHandles + peer * n, s.signalBuf + peer * n,
-                              s.expectSignals + peer * n, n, ring);
+      ccoSdmaDispatchPut<Coop, Signal, false>(s, peer, n, dst, src, bytes, queueId);
     }
   }
 
