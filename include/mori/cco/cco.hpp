@@ -1084,7 +1084,14 @@ typedef struct CCO_SDMA_PKT_ATOMIC_TAG {
 // ── from anvil_device.hpp (device path only; host queue-setup constants omitted) ──
 constexpr uint32_t CCO_SDMA_QUEUE_SIZE = 256 * 1024;  // 256KB
 constexpr int CCO_SDMA_MAX_RETRIES = 1 << 30;
+// Debug-only: bound the SDMA spin loops and trap on a suspected deadlock. Off
+// by default (including under JIT, which does not define NDEBUG) so release
+// device code stays lean on SGPRs; define MORI_CCO_SDMA_DEBUG to enable.
+#ifdef MORI_CCO_SDMA_DEBUG
 constexpr bool CCO_SDMA_BREAK_ON_RETRIES = true;
+#else
+constexpr bool CCO_SDMA_BREAK_ON_RETRIES = false;
+#endif
 
 __device__ __forceinline__ CCO_SDMA_PKT_COPY_LINEAR ccoCreateCopyPacket(void* srcBuf, void* dstBuf,
                                                                         long long int packetSize) {
@@ -1119,7 +1126,7 @@ __device__ __forceinline__ CCO_SDMA_PKT_ATOMIC ccoCreateAtomicIncPacket(HSAuint6
 
 // Assumes signal is allocated in device memory
 __device__ __forceinline__ bool ccoWaitForSignal(HSAuint64* addr, uint64_t expected) {
-  int retries = 0;
+  [[maybe_unused]] int retries = 0;
   while (true) {
     uint64_t value = __hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     if (value == expected) {
@@ -1156,7 +1163,7 @@ struct ccoSdmaQueueDeviceHandle {
     const uint64_t queue_size_in_bytes = CCO_SDMA_QUEUE_SIZE;
 
     uint64_t cur_index;
-    int retries = 0;
+    [[maybe_unused]] int retries = 0;
 
     while (true) {
       cur_index = __hip_atomic_load(cachedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -1191,8 +1198,15 @@ struct ccoSdmaQueueDeviceHandle {
     uint64_t base =
         __hip_atomic_fetch_add(cachedWptr, slotBytes, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     if ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE) {
+      [[maybe_unused]] int retries = 0;
       do {
         cachedHwReadIndex = __hip_atomic_load(rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
+          if (retries++ == CCO_SDMA_MAX_RETRIES) {
+            __builtin_trap();
+            break;
+          }
+        }
       } while ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE);
     }
     return base;
@@ -1230,7 +1244,7 @@ struct ccoSdmaQueueDeviceHandle {
     // doorbell ring; the spin/stores stay RELAXED (visibility is via the
     // s_waitcnt, not fences) to avoid an acquire/release coherence storm when
     // many issuers wait on the same committedWptr line.
-    int retries = 0;
+    [[maybe_unused]] int retries = 0;
     while (__hip_atomic_load(committedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != base) {
       __builtin_amdgcn_s_sleep(1);
       if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
