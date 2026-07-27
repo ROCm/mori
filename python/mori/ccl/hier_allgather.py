@@ -653,346 +653,338 @@ class HierAllGather:
         entry.replay()
         return True
 
-    def _call_impl(self, input_data, output_data, count: int, stream=None) -> bool:
-        if self.num_nodes == 1:
-            return self._intra(input_data, output_data, count, stream)
+    def _call_pipe_band(self, input_data, output_data, count, stream, block_count):
+        """Mid/small-band chunked-ring pipe overlap (sliced fused, K>1).
 
-        # Phase 1 (intra, SDMA): gather the G local shards into my node-block.
-        G = self.ranks_per_node
+        Per element-range chunk: run the inter ring (main stream) into a disjoint
+        scratch region, then launch its N reassembly gathers on a side SDMA stream,
+        so chunk k's gather overlaps chunk k+1's ring (only the last is serial);
+        one final copy-OUT.
+        """
         N = self.num_nodes
-        block_count = count * G
-
-        # Size-threshold dispatch: sliced 2-D only for large payloads; below the
-        # threshold the non-sliced fuse-barrier path is faster.
-        byte_count = count * input_data.element_size()
-        use_slice = self.slice_inter and (byte_count >= self.slice_min_bytes)
-        # Mid/small band -> chunked-ring pipe-overlap path (sliced fused, K>1).
-        use_pipe_band = (
-            (not use_slice)
-            and self.slice_inter
-            and self.slice_fused
-            and self.slice_pipe_chunks > 1
-        )
-        # 3-way path key; a switch clears the clean-completion guard (entry fence).
-        path_key = "slice" if use_slice else ("pipe" if use_pipe_band else None)
-        if path_key != self._last_use_slice:
-            self._prev_op_completed = False
-        self._last_use_slice = path_key
-
-        if use_slice or use_pipe_band:
-            # Sliced 2-D AllGather (see __init__). Phase A (inter ring): each rank
-            # rings only its own shard into C_g in node order.
-            slice_total = count * N
-            if use_pipe_band and self.slice_fused and self.slice_pipe_chunks > 1:
-                # Chunked-ring pipeline overlap: per element-range chunk, run the
-                # inter ring (main stream) into a disjoint scratch region then launch
-                # its N reassembly gathers on a side SDMA stream, so chunk k's gather
-                # overlaps chunk k+1's ring (only the last serial); one final copy-OUT.
-                K = self.slice_pipe_chunks
-                base_ck = count // K
-                if (
-                    self._slice_scratch is None
-                    or self._slice_scratch.numel() < slice_total
-                    or self._slice_scratch.dtype != input_data.dtype
-                    or self._slice_scratch.device != input_data.device
-                ):
-                    self._slice_scratch = torch.empty(
-                        slice_total, dtype=input_data.dtype, device=input_data.device
-                    )
-                collection = self._slice_scratch[:slice_total]
-                if self._overlap_stream is None:
-                    self._overlap_stream = torch.cuda.Stream(device=input_data.device)
-                side = self._overlap_stream
-                main = (
-                    torch.cuda.current_stream(input_data.device)
-                    if stream is None
-                    else stream
-                )
-                side.wait_stream(main)
-                off = 0
-                # Invariant: only ONE global on-stream fence in flight (the ring
-                # prepare); side gathers are barrier-free, so no concurrent-global-
-                # barrier race. Cross-chunk ring reuse is ordered by chunk k+1's
-                # prepare_stream fence.
-                for k in range(K):
-                    ck = base_ck if k < K - 1 else count - base_ck * (K - 1)
-                    if ck == 0:
-                        continue
-                    region = collection[N * off : N * off + N * ck]
-                    # Inter ring of chunk k on the main stream (stream-ordered
-                    # copy-OUT into ``region``); its finish is deferred because the
-                    # peer's chunk-k landing is fenced by the intra subgroup barrier
-                    # on the first Phase-B gather below.
-                    self._inter(
-                        input_data[off : off + ck],
-                        region,
-                        ck,
-                        stream,
-                        stream_ring=True,
-                        defer_inter_fin=True,
-                    )
-                    side.wait_stream(main)
-                    # Cheap intra landing fence: arm only the first gather with the
-                    # intra subgroup entry barrier (G ranks, XGMI-scope), ordering all
-                    # G peers past their chunk-k ring copy-OUT before any peer read.
-                    for m in range(N):
-                        self._intra.gather_kernel(
-                            region[m * ck : (m + 1) * ck],
-                            ck,
-                            dst_base_offset=m * block_count + off,
-                            stream=side,
-                            prepare_barrier=(m == 0),
-                            dst_slot_stride=count,
-                        )
-                    off += ck
-                # All gathers must land before the bulk copy-OUT reads them.
-                main.wait_stream(side)
-                self._intra.finish_batch_stream(
-                    output_data, N * block_count, stream=stream, barrier=True
-                )
-                self._prev_op_completed = True
-                return True
-            if (
-                self._slice_scratch is None
-                or self._slice_scratch.numel() < slice_total
-                or self._slice_scratch.dtype != input_data.dtype
-                or self._slice_scratch.device != input_data.device
-            ):
-                self._slice_scratch = torch.empty(
-                    slice_total,
-                    dtype=input_data.dtype,
-                    device=input_data.device,
-                )
-            collection = self._slice_scratch[:slice_total]
-            # The direct-path overlap and the fused path both run the ring inside
-            # Phase B, so skip the monolithic ring call here.
-            overlap_active = (
-                self.fuse_local
-                and self.slice_direct
-                and self.slice_fused
-                and self.slice_fuse_ib
+        slice_total = count * N
+        K = self.slice_pipe_chunks
+        base_ck = count // K
+        if (
+            self._slice_scratch is None
+            or self._slice_scratch.numel() < slice_total
+            or self._slice_scratch.dtype != input_data.dtype
+            or self._slice_scratch.device != input_data.device
+        ):
+            self._slice_scratch = torch.empty(
+                slice_total, dtype=input_data.dtype, device=input_data.device
             )
-            if not overlap_active:
-                self._inter(
-                    input_data,
-                    collection,
-                    count,
-                    stream,
-                    stream_ring=True,
-                    defer_inter_fin=self.slice_defer_inter_fin,
+        collection = self._slice_scratch[:slice_total]
+        if self._overlap_stream is None:
+            self._overlap_stream = torch.cuda.Stream(device=input_data.device)
+        side = self._overlap_stream
+        main = (
+            torch.cuda.current_stream(input_data.device) if stream is None else stream
+        )
+        side.wait_stream(main)
+        off = 0
+        # Invariant: only ONE global on-stream fence in flight (the ring prepare);
+        # side gathers are barrier-free, so no concurrent-global-barrier race.
+        # Cross-chunk ring reuse is ordered by chunk k+1's prepare_stream fence.
+        for k in range(K):
+            ck = base_ck if k < K - 1 else count - base_ck * (K - 1)
+            if ck == 0:
+                continue
+            region = collection[N * off : N * off + N * ck]
+            # Inter ring of chunk k on the main stream (stream-ordered copy-OUT into
+            # ``region``); its finish is deferred because the peer's chunk-k landing
+            # is fenced by the intra subgroup barrier on the first Phase-B gather
+            # below.
+            self._inter(
+                input_data[off : off + ck],
+                region,
+                ck,
+                stream,
+                stream_ring=True,
+                defer_inter_fin=True,
+            )
+            side.wait_stream(main)
+            # Cheap intra landing fence: arm only the first gather with the intra
+            # subgroup entry barrier (G ranks, XGMI-scope), ordering all G peers past
+            # their chunk-k ring copy-OUT before any peer read.
+            for m in range(N):
+                self._intra.gather_kernel(
+                    region[m * ck : (m + 1) * ck],
+                    ck,
+                    dst_base_offset=m * block_count + off,
+                    stream=side,
+                    prepare_barrier=(m == 0),
+                    dst_slot_stride=count,
                 )
-            # Phase B (intra SDMA): reassemble each B_m into output[m*block:]
-            # (concatenated by group_pos=local_rank => rank-major).
-            if self.slice_fused:
-                # Fold the N gathers into one batch stacked into disjoint transit
-                # regions + one bulk copy-OUT, keeping only entry+exit barriers. The
-                # inter ring's finish barrier makes the m==0 entry redundant -> drop
-                # under slice_fuse_ib (default).
-                entry_barrier = not self.slice_fuse_ib
-                if self.slice_direct:
-                    # Direct-to-output Phase B: push each node-block's slices straight
-                    # into output[m*block:] -- no transit, no full-output copy-OUT;
-                    # one deferrable global fence completes the op. See
-                    # _ensure_output_registered for the lockstep registration.
-                    self._ensure_output_registered(output_data)
-                    if self.fuse_remote and self.num_nodes == 2 and not entry_barrier:
-                        # Fused-remote pipeline: one launch runs the ring and, per
-                        # landed sub-range, pushes the remote-block SDMA from the ring
-                        # buffer into the output (no ring copy-OUT / finish barrier).
-                        from .collective import launch_fused_ring_remote_gather
+            off += ck
+        # All gathers must land before the bulk copy-OUT reads them.
+        main.wait_stream(side)
+        self._intra.finish_batch_stream(
+            output_data, N * block_count, stream=stream, barrier=True
+        )
+        self._prev_op_completed = True
+        return True
 
-                        node = self.node_id
-                        rb = self._inter.num_blocks
-                        # Chunk-landing flag buffer: >= P slots when DEEP_PIPE splits
-                        # the ring channel into P sub-chunks (rb==1), else ring_blocks
-                        # u64. Depth: auto=round(perPE_bytes/SUBBYTES) else explicit;
-                        # default 2, caged to depth 1 by the 32MB gate below (bit-exact).
-                        _dp_raw = os.environ.get("MORI_HIER_DEEP_PIPE", "2").strip()
-                        if _dp_raw.lower() == "auto":
-                            # 16MiB sub-chunk target, matching the C++ auto selector.
-                            _dp_sub_target = 16 * 1024 * 1024
-                            _dp_cb = int(count) * int(input_data.element_size())
-                            _deep_pipe = int(
-                                (_dp_cb + _dp_sub_target // 2) // _dp_sub_target
-                            )
-                        else:
-                            _deep_pipe = int(_dp_raw)
-                        if _deep_pipe < 1:
-                            _deep_pipe = 1
-                        if _deep_pipe > 16:
-                            _deep_pipe = 16
-                        # Coherence gate: landing signal is bit-exact only while each
-                        # sub-chunk stays inside the 32MB NIC-DMA->HBM window; larger
-                        # falls to depth 1. Mirrors the C++ HierDeepPipe gate.
-                        _dp_chunk_bytes = int(count) * int(input_data.element_size())
-                        _dp_window = 32 * 1024 * 1024
-                        _dp_sub_bytes = (
-                            _dp_chunk_bytes // _deep_pipe
-                            if _deep_pipe > 1
-                            else _dp_chunk_bytes
-                        )
-                        if (
-                            _deep_pipe > 1
-                            and _dp_window > 0
-                            and _dp_sub_bytes >= _dp_window
-                        ):
-                            _deep_pipe = 1
-                        _flag_slots = max(rb, _deep_pipe if rb == 1 else 1, 1)
-                        # Reallocate the flag buffer on any layout change (not only to
-                        # grow): reusing it across two DEEP_PIPE sizes leaves stale
-                        # landing state -> mismatch. DEEP_PIPE=1 never enters here.
-                        _dp_layout = (_flag_slots, int(count), _deep_pipe)
-                        if (
-                            self._chunk_ready_flags is None
-                            or self._chunk_ready_flags.numel() < _flag_slots
-                            or self._chunk_ready_flags_layout != _dp_layout
-                        ):
-                            self._chunk_ready_flags = torch.zeros(
-                                _flag_slots, dtype=torch.int64, device=input_data.device
-                            )
-                            self._chunk_ready_flags_layout = _dp_layout
-                        flags = self._chunk_ready_flags
-                        flags.zero_()
-                        # Ring prepare = global entry barrier + copy-IN (no launch).
-                        ring_args, _u32c, s_main = self._inter.prepare_stream_only(
-                            input_data, count, stream
-                        )
-                        # Local-block direct-gather jit_args (own input, no ring dep).
-                        gather_args = self._intra.prepare_direct_only(
-                            input_data,
-                            output_data,
-                            count,
-                            dst_block_offset=node * block_count,
-                            stream=stream,
-                            prepare_barrier=False,
-                        )
-                        # Reassembly block j drives SDMA queue (j+1)%nq (local-block
-                        # CTA owns queue 0); nq>=2 REQUIRED, else the modulo aliases
-                        # onto queue 0 -> shared signal counter -> liveness HANG. nq
-                        # fixed at anvil init (default 2, E2E-safe); reasm=nq-1.
-                        _sdma_nq = int(os.environ.get("MORI_SDMA_NUM_CHANNELS", "2"))
-                        reasm = max(1, _sdma_nq - 1)
-                        if reasm > _sdma_nq - 1:
-                            reasm = _sdma_nq - 1
-                        if reasm < 1:
-                            reasm = 1
-                        launch_fused_ring_remote_gather(
-                            ring_args,
-                            gather_args,
-                            rb,
-                            flags.data_ptr(),
-                            N,
-                            node,
-                            s_main,
-                            reassembly_blocks=reasm,
-                            reasm_deep_sq=self._reasm_deep_sq,
-                        )
-                        # Single completion fence (gathers already pushed to output).
-                        # Standalone deferral: the device completion reader spins until
-                        # every remote push landed + threadfence, so output is stream-
-                        # correct without it; reuse covered by the successor's prepare.
-                        _fin_barrier = not self.slice_defer_fin
-                        self._intra.finish_direct_stream(
-                            stream=stream, barrier=_fin_barrier
-                        )
-                    elif self.fuse_local and not entry_barrier:
-                        # Fused ring || local-block gather in one launch. The ring's
-                        # prepare_stream barrier is the sole entry fence; the local
-                        # gather runs barrier-free (own input) and pushes block node_id
-                        # into the output. Remote blocks follow after the copy-OUT.
-                        from .collective import launch_fused_ring_local_gather
+    def _call_sliced(self, input_data, output_data, count, stream, block_count):
+        """Sliced 2-D AllGather (see __init__), the large-payload path.
 
-                        node = self.node_id
-                        main = (
-                            torch.cuda.current_stream(input_data.device)
-                            if stream is None
-                            else stream
-                        )
-                        # Ring prepare = global entry barrier + copy-IN (no launch).
-                        ring_args, _u32c, s_main = self._inter.prepare_stream_only(
-                            input_data, count, stream
-                        )
-                        # Local-block direct-gather jit_args (no launch).
-                        gather_args = self._intra.prepare_direct_only(
-                            input_data,
-                            output_data,
-                            count,
-                            dst_block_offset=node * block_count,
-                            stream=stream,
-                            prepare_barrier=False,
-                        )
-                        # One fused launch: ring || local gather, concurrent after the
-                        # entry barrier (no host wait_stream merge).
-                        launch_fused_ring_local_gather(
-                            ring_args, gather_args, self._inter.num_blocks, s_main
-                        )
-                        # Ring finish copy-OUT (ring kernel already ran in the fused
-                        # launch); copy-engine finish so fuse_local never moves bulk
-                        # bytes on CUs.
-                        reasm_src = collection
-                        self._inter.finish_ring_stream(
-                            collection,
-                            count,
-                            stream,
-                            barrier=not self.slice_defer_inter_fin,
-                            cu_copyout=False,
-                        )
-                        # Remote blocks read the ring collection via an intra-node
-                        # subgroup gather. A single intra entry barrier on the first
-                        # remote gather orders every rank's ring copy-OUT before any
-                        # peer read (XGMI-scope) -- avoids the stale-remote-half race
-                        # without a global barrier (dependency is purely intra-node).
-                        remotes = [m for m in range(N) if m != node]
-                        _first_remote = True
-                        for m in remotes:
-                            self._intra.gather_kernel_direct(
-                                reasm_src[m * count : (m + 1) * count],
-                                output_data,
-                                count,
-                                dst_block_offset=m * block_count,
-                                stream=stream,
-                                prepare_barrier=_first_remote,
-                            )
-                            _first_remote = False
-                        self._intra.finish_direct_stream(
-                            stream=stream, barrier=not self.slice_defer_fin
-                        )
-                    else:
-                        for m in range(N):
-                            self._intra.gather_kernel_direct(
-                                collection[m * count : (m + 1) * count],
-                                output_data,
-                                count,
-                                dst_block_offset=m * block_count,
-                                stream=stream,
-                                prepare_barrier=(entry_barrier and m == 0),
-                            )
-                        self._intra.finish_direct_stream(
-                            stream=stream, barrier=not self.slice_defer_fin
-                        )
+        Phase A (inter ring): each rank rings only its own shard into C_g in node
+        order. Phase B (intra SDMA): reassemble each B_m into output[m*block:]
+        (concatenated by group_pos=local_rank => rank-major).
+        """
+        N = self.num_nodes
+        slice_total = count * N
+        if (
+            self._slice_scratch is None
+            or self._slice_scratch.numel() < slice_total
+            or self._slice_scratch.dtype != input_data.dtype
+            or self._slice_scratch.device != input_data.device
+        ):
+            self._slice_scratch = torch.empty(
+                slice_total,
+                dtype=input_data.dtype,
+                device=input_data.device,
+            )
+        collection = self._slice_scratch[:slice_total]
+        # The direct-path overlap and the fused path both run the ring inside
+        # Phase B, so skip the monolithic ring call here.
+        overlap_active = (
+            self.fuse_local
+            and self.slice_direct
+            and self.slice_fused
+            and self.slice_fuse_ib
+        )
+        if not overlap_active:
+            self._inter(
+                input_data,
+                collection,
+                count,
+                stream,
+                stream_ring=True,
+                defer_inter_fin=self.slice_defer_inter_fin,
+            )
+        if self.slice_fused:
+            # Fold the N gathers into one batch stacked into disjoint transit
+            # regions + one bulk copy-OUT, keeping only entry+exit barriers. The
+            # inter ring's finish barrier makes the m==0 entry redundant -> drop
+            # under slice_fuse_ib (default).
+            entry_barrier = not self.slice_fuse_ib
+            if self.slice_direct:
+                # Direct-to-output Phase B: push each node-block's slices straight
+                # into output[m*block:] -- no transit, no full-output copy-OUT;
+                # one deferrable global fence completes the op. See
+                # _ensure_output_registered for the lockstep registration.
+                self._ensure_output_registered(output_data)
+                if self.fuse_remote and self.num_nodes == 2 and not entry_barrier:
+                    self._call_sliced_fused_remote(
+                        input_data, output_data, count, stream, block_count
+                    )
+                elif self.fuse_local and not entry_barrier:
+                    self._call_sliced_fused_local(
+                        input_data,
+                        output_data,
+                        count,
+                        stream,
+                        block_count,
+                        collection,
+                    )
                 else:
                     for m in range(N):
-                        self._intra.gather_kernel(
+                        self._intra.gather_kernel_direct(
                             collection[m * count : (m + 1) * count],
+                            output_data,
                             count,
-                            dst_base_offset=m * block_count,
+                            dst_block_offset=m * block_count,
                             stream=stream,
                             prepare_barrier=(entry_barrier and m == 0),
                         )
-                    # Stream-ordered copy-OUT; its fence is deferrable
-                    # (slice_defer_fin) since only cross-PE reuse needs it.
-                    self._cu_copyout_finish(output_data, N * block_count, stream)
+                    self._intra.finish_direct_stream(
+                        stream=stream, barrier=not self.slice_defer_fin
+                    )
             else:
                 for m in range(N):
-                    self._intra(
+                    self._intra.gather_kernel(
                         collection[m * count : (m + 1) * count],
-                        output_data[m * block_count : (m + 1) * block_count],
                         count,
-                        stream,
+                        dst_base_offset=m * block_count,
+                        stream=stream,
+                        prepare_barrier=(entry_barrier and m == 0),
                     )
-            self._prev_op_completed = True
-            return True
+                # Stream-ordered copy-OUT; its fence is deferrable
+                # (slice_defer_fin) since only cross-PE reuse needs it.
+                self._cu_copyout_finish(output_data, N * block_count, stream)
+        else:
+            for m in range(N):
+                self._intra(
+                    collection[m * count : (m + 1) * count],
+                    output_data[m * block_count : (m + 1) * block_count],
+                    count,
+                    stream,
+                )
+        self._prev_op_completed = True
+        return True
 
+    def _call_sliced_fused_remote(
+        self, input_data, output_data, count, stream, block_count
+    ):
+        """Fused-remote Phase B (N==2, slice_direct): one launch runs the ring and,
+        per landed sub-range, pushes the remote-block SDMA from the ring buffer into
+        the output (no ring copy-OUT / finish barrier).
+        """
+        from .collective import launch_fused_ring_remote_gather
+
+        N = self.num_nodes
+        node = self.node_id
+        rb = self._inter.num_blocks
+        # Chunk-landing flag buffer: >= P slots when DEEP_PIPE splits the ring
+        # channel into P sub-chunks (rb==1), else ring_blocks u64. Depth:
+        # auto=round(perPE_bytes/SUBBYTES) else explicit; default 2, caged to depth 1
+        # by the 32MB gate below (bit-exact).
+        _dp_raw = os.environ.get("MORI_HIER_DEEP_PIPE", "2").strip()
+        if _dp_raw.lower() == "auto":
+            # 16MiB sub-chunk target, matching the C++ auto selector.
+            _dp_sub_target = 16 * 1024 * 1024
+            _dp_cb = int(count) * int(input_data.element_size())
+            _deep_pipe = int((_dp_cb + _dp_sub_target // 2) // _dp_sub_target)
+        else:
+            _deep_pipe = int(_dp_raw)
+        if _deep_pipe < 1:
+            _deep_pipe = 1
+        if _deep_pipe > 16:
+            _deep_pipe = 16
+        # Coherence gate: landing signal is bit-exact only while each sub-chunk stays
+        # inside the 32MB NIC-DMA->HBM window; larger falls to depth 1. Mirrors the
+        # C++ HierDeepPipe gate.
+        _dp_chunk_bytes = int(count) * int(input_data.element_size())
+        _dp_window = 32 * 1024 * 1024
+        _dp_sub_bytes = (
+            _dp_chunk_bytes // _deep_pipe if _deep_pipe > 1 else _dp_chunk_bytes
+        )
+        if _deep_pipe > 1 and _dp_window > 0 and _dp_sub_bytes >= _dp_window:
+            _deep_pipe = 1
+        _flag_slots = max(rb, _deep_pipe if rb == 1 else 1, 1)
+        # Reallocate the flag buffer on any layout change (not only to grow): reusing
+        # it across two DEEP_PIPE sizes leaves stale landing state -> mismatch.
+        # DEEP_PIPE=1 never enters here.
+        _dp_layout = (_flag_slots, int(count), _deep_pipe)
+        if (
+            self._chunk_ready_flags is None
+            or self._chunk_ready_flags.numel() < _flag_slots
+            or self._chunk_ready_flags_layout != _dp_layout
+        ):
+            self._chunk_ready_flags = torch.zeros(
+                _flag_slots, dtype=torch.int64, device=input_data.device
+            )
+            self._chunk_ready_flags_layout = _dp_layout
+        flags = self._chunk_ready_flags
+        flags.zero_()
+        # Ring prepare = global entry barrier + copy-IN (no launch).
+        ring_args, _u32c, s_main = self._inter.prepare_stream_only(
+            input_data, count, stream
+        )
+        # Local-block direct-gather jit_args (own input, no ring dep).
+        gather_args = self._intra.prepare_direct_only(
+            input_data,
+            output_data,
+            count,
+            dst_block_offset=node * block_count,
+            stream=stream,
+            prepare_barrier=False,
+        )
+        # Reassembly block j drives SDMA queue (j+1)%nq (local-block CTA owns queue
+        # 0); nq>=2 REQUIRED, else the modulo aliases onto queue 0 -> shared signal
+        # counter -> liveness HANG. nq fixed at anvil init (default 2, E2E-safe);
+        # reasm=nq-1.
+        _sdma_nq = int(os.environ.get("MORI_SDMA_NUM_CHANNELS", "2"))
+        reasm = max(1, _sdma_nq - 1)
+        if reasm > _sdma_nq - 1:
+            reasm = _sdma_nq - 1
+        if reasm < 1:
+            reasm = 1
+        launch_fused_ring_remote_gather(
+            ring_args,
+            gather_args,
+            rb,
+            flags.data_ptr(),
+            N,
+            node,
+            s_main,
+            reassembly_blocks=reasm,
+            reasm_deep_sq=self._reasm_deep_sq,
+        )
+        # Single completion fence (gathers already pushed to output). Standalone
+        # deferral: the device completion reader spins until every remote push landed
+        # + threadfence, so output is stream-correct without it; reuse covered by the
+        # successor's prepare.
+        _fin_barrier = not self.slice_defer_fin
+        self._intra.finish_direct_stream(stream=stream, barrier=_fin_barrier)
+
+    def _call_sliced_fused_local(
+        self, input_data, output_data, count, stream, block_count, collection
+    ):
+        """Fused-local Phase B (slice_direct): ring || local-block gather in one
+        launch. The ring's prepare_stream barrier is the sole entry fence; the local
+        gather runs barrier-free (own input) and pushes block node_id into the
+        output. Remote blocks follow after the ring copy-OUT.
+        """
+        from .collective import launch_fused_ring_local_gather
+
+        N = self.num_nodes
+        node = self.node_id
+        # Ring prepare = global entry barrier + copy-IN (no launch).
+        ring_args, _u32c, s_main = self._inter.prepare_stream_only(
+            input_data, count, stream
+        )
+        # Local-block direct-gather jit_args (no launch).
+        gather_args = self._intra.prepare_direct_only(
+            input_data,
+            output_data,
+            count,
+            dst_block_offset=node * block_count,
+            stream=stream,
+            prepare_barrier=False,
+        )
+        # One fused launch: ring || local gather, concurrent after the entry barrier
+        # (no host wait_stream merge).
+        launch_fused_ring_local_gather(
+            ring_args, gather_args, self._inter.num_blocks, s_main
+        )
+        # Ring finish copy-OUT (ring kernel already ran in the fused launch);
+        # copy-engine finish so fuse_local never moves bulk bytes on CUs.
+        reasm_src = collection
+        self._inter.finish_ring_stream(
+            collection,
+            count,
+            stream,
+            barrier=not self.slice_defer_inter_fin,
+            cu_copyout=False,
+        )
+        # Remote blocks read the ring collection via an intra-node subgroup gather. A
+        # single intra entry barrier on the first remote gather orders every rank's
+        # ring copy-OUT before any peer read (XGMI-scope) -- avoids the
+        # stale-remote-half race without a global barrier (dependency is purely
+        # intra-node).
+        remotes = [m for m in range(N) if m != node]
+        _first_remote = True
+        for m in remotes:
+            self._intra.gather_kernel_direct(
+                reasm_src[m * count : (m + 1) * count],
+                output_data,
+                count,
+                dst_block_offset=m * block_count,
+                stream=stream,
+                prepare_barrier=_first_remote,
+            )
+            _first_remote = False
+        self._intra.finish_direct_stream(
+            stream=stream, barrier=not self.slice_defer_fin
+        )
+
+    def _call_nonsliced(self, input_data, output_data, count, stream, block_count):
+        """Staged path (below slice_min_bytes): Phase 1 gathers the G local shards
+        into a transit node-block, then Phase 2 rings the N node-blocks in node
+        order into the full rank-major output.
+        """
         # fuse-barrier also drops the intra-gather entry barrier, but only when the
         # prior op completed cleanly (its inter-finish barrier freed every peer's
         # out_). The first op, and any op following a mid-pipeline crash, keep the
@@ -1025,11 +1017,45 @@ class HierAllGather:
             prepare_barrier=intra_prepare_barrier,
         )
 
-        # Phase 2 (inter ring, staged default): all-gather the N node-blocks in
-        # node order -> full rank-major output.
         self._inter(node_block, output_data, block_count, stream)
         self._prev_op_completed = True
         return True
+
+    def _call_impl(self, input_data, output_data, count: int, stream=None) -> bool:
+        if self.num_nodes == 1:
+            return self._intra(input_data, output_data, count, stream)
+
+        # Phase 1 (intra, SDMA): gather the G local shards into my node-block.
+        G = self.ranks_per_node
+        block_count = count * G
+
+        # Size-threshold dispatch: sliced 2-D only for large payloads; below the
+        # threshold the non-sliced fuse-barrier path is faster.
+        byte_count = count * input_data.element_size()
+        use_slice = self.slice_inter and (byte_count >= self.slice_min_bytes)
+        # Mid/small band -> chunked-ring pipe-overlap path (sliced fused, K>1).
+        use_pipe_band = (
+            (not use_slice)
+            and self.slice_inter
+            and self.slice_fused
+            and self.slice_pipe_chunks > 1
+        )
+        # 3-way path key; a switch clears the clean-completion guard (entry fence).
+        path_key = "slice" if use_slice else ("pipe" if use_pipe_band else None)
+        if path_key != self._last_use_slice:
+            self._prev_op_completed = False
+        self._last_use_slice = path_key
+
+        if use_slice or use_pipe_band:
+            if use_pipe_band and self.slice_fused and self.slice_pipe_chunks > 1:
+                return self._call_pipe_band(
+                    input_data, output_data, count, stream, block_count
+                )
+            return self._call_sliced(
+                input_data, output_data, count, stream, block_count
+            )
+
+        return self._call_nonsliced(input_data, output_data, count, stream, block_count)
 
     def supports_param_contiguous_output(self) -> bool:
         """True when the direct-to-output param-contiguous zero-copy path is
