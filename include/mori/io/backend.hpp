@@ -101,6 +101,19 @@ inline std::ostream& operator<<(std::ostream& os, const XgmiBackendConfig& c) {
   return os << "numStreams[" << c.numStreams << "] numEvents[" << c.numEvents << "]";
 }
 
+struct FabricBackendConfig : public BackendConfig {
+  FabricBackendConfig() : BackendConfig(BackendType::FABRIC) {}
+  FabricBackendConfig(int numStreams_, int numEvents_)
+      : BackendConfig(BackendType::FABRIC), numStreams(numStreams_), numEvents(numEvents_) {}
+
+  int numStreams{64};
+  int numEvents{64};
+};
+
+inline std::ostream& operator<<(std::ostream& os, const FabricBackendConfig& c) {
+  return os << "numStreams[" << c.numStreams << "] numEvents[" << c.numEvents << "]";
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         BackendSession                                         */
 /* ---------------------------------------------------------------------------------------------- */

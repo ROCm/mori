@@ -73,6 +73,20 @@ __global__ void ibgda_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin
   }
 }
 
+// SDMA: one thread issues a single whole-buffer put on queue 0 + quiet per
+// iteration, so the per-op time tracks the SDMA dispatch + completion round trip.
+__global__ void sdma_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
+                             ccoDevComm devComm, int peerLsa, int iter) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  ccoSdma sdma{devComm};
+  const size_t bytes = len_doubles * sizeof(double);
+  for (int i = 0; i < iter; i++) {
+    sdma.put(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), 0,
+             reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, 0);
+    sdma.quietQueue(peerLsa, 0);
+  }
+}
+
 }  // namespace mori::cco::benchmark
 
 int main(int argc, char** argv) {
@@ -117,7 +131,10 @@ int main(int argc, char** argv) {
 
     if (run_kernels) {
       const float ms = RunWarmupAndTimed(res, args.warmup, args.iters, [&](int count) {
-        if (args.transport == Transport::kLsa) {
+        if (args.transport == Transport::kSdma) {
+          hipLaunchKernelGGL(sdma_put_lat, dim3(1), dim3(1), 0, 0, ctx.send_win, ctx.recv_win,
+                             len_doubles, ctx.devComm, ctx.peer_lsa_rank, count);
+        } else if (args.transport == Transport::kLsa) {
           hipLaunchKernelGGL(lsa_put_lat, grid, block, 0, 0, ctx.send_win, ctx.recv_win,
                              len_doubles, ctx.peer_lsa_rank, count);
         } else {
@@ -137,9 +154,16 @@ int main(int argc, char** argv) {
 
   ccoBarrierAll(ctx.comm);
   if (my_pe == 0) {
-    PrintPerfTable("p2p_put_latency unidirection", TransportToChar(args.transport),
-                   ScopeToChar(args.put_scope), 1, block_threads, ctx.device_warp_size, args.iters,
-                   args.warmup, PerfTableMetric::kLatencyUs, table);
+    // SDMA latency uses a single queue / single thread.
+    int print_block = block_threads;
+    const char* print_scope = ScopeToChar(args.put_scope);
+    if (args.transport == Transport::kSdma) {
+      print_block = 1;
+      print_scope = "thread";
+    }
+    PrintPerfTable("p2p_put_latency unidirection", TransportToChar(args.transport), print_scope, 1,
+                   print_block, ctx.device_warp_size, args.iters, args.warmup,
+                   PerfTableMetric::kLatencyUs, table);
   }
 
   if (run_kernels) {

@@ -21,8 +21,9 @@
 // SOFTWARE.
 #include "umbp/distributed/master/eviction_manager.h"
 
+#include <chrono>
 #include <cstdint>
-#include <set>
+#include <map>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -30,17 +31,16 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
-#include "umbp/distributed/master/client_registry.h"
 #include "umbp/distributed/master/evict_strategy.h"
-#include "umbp/distributed/master/global_block_index.h"
+#include "umbp/distributed/master/master_metadata_store.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
-EvictionManager::EvictionManager(GlobalBlockIndex& index, ClientRegistry& registry,
-                                 const EvictionConfig& config, EvictKeyDispatcher* dispatcher,
+EvictionManager::EvictionManager(IMasterMetadataStore& store, const EvictionConfig& config,
+                                 EvictKeyDispatcher* dispatcher,
                                  std::unique_ptr<MasterEvictStrategy> strategy)
-    : index_(index),
-      registry_(registry),
+    : store_(store),
       config_(config),
       dispatcher_(dispatcher),
       strategy_(strategy ? std::move(strategy) : std::make_unique<LruMasterEvictStrategy>()) {}
@@ -71,7 +71,13 @@ void EvictionManager::EvictionLoop() {
                    [this] { return !running_.load(std::memory_order_relaxed); });
     }
     if (!running_.load(std::memory_order_relaxed)) break;
-    RunOnce();
+    // A metadata-store hiccup (e.g. RESP transport error) must not kill the
+    // eviction thread; log and retry on the next tick.
+    try {
+      RunOnce();
+    } catch (const std::exception& e) {
+      MORI_UMBP_ERROR("[EvictionManager] metadata-store error: {}", e.what());
+    }
   }
 }
 
@@ -80,11 +86,13 @@ void EvictionManager::EvictionLoop() {
 // This function picks victims and dispatches EvictKey to each peer via the
 // dispatcher; master state itself is left untouched here.
 void EvictionManager::RunOnce() {
-  auto clients = registry_.GetAliveClients();
+  auto clients = store_.ListAliveClients();
 
-  using NodeTierKey = GlobalBlockIndex::NodeTierKey;
-  std::set<NodeTierKey> overloaded_node_tiers;
-  std::unordered_map<std::string, std::map<TierType, int64_t>> bytes_to_free;
+  // Per-(node, tier) byte budget down to the LOW watermark.  The budget map's
+  // keys double as the set of overloaded buckets to enumerate; the byte values
+  // are handed to the strategy (never to the store) for the actual victim
+  // decision.
+  std::map<NodeTierKey, uint64_t> bytes_to_free;
 
   for (const auto& client : clients) {
     for (const auto& [tier, cap] : client.tier_capacities) {
@@ -99,31 +107,50 @@ void EvictionManager::RunOnce() {
       if (usage >= config_.high_watermark) {
         auto target_used =
             static_cast<uint64_t>(static_cast<double>(cap.total_bytes) * config_.low_watermark);
-        auto to_free = static_cast<int64_t>(used) - static_cast<int64_t>(target_used);
-        if (to_free > 0) {
-          overloaded_node_tiers.insert({client.node_id, tier});
-          bytes_to_free[client.node_id][tier] += to_free;
+        if (used > target_used) {
+          bytes_to_free[{client.node_id, tier}] += used - target_used;
         }
       }
     }
   }
 
-  if (overloaded_node_tiers.empty()) return;
-  MORI_UMBP_INFO("[EvictionManager] {} overloaded node-tiers detected",
-                 overloaded_node_tiers.size());
+  if (bytes_to_free.empty()) return;
+  MORI_UMBP_INFO("[EvictionManager] {} overloaded node-tiers detected", bytes_to_free.size());
 
-  auto candidates = index_.FindEvictionCandidates(overloaded_node_tiers);
-  if (candidates.empty()) {
+  // Ask the store for eviction-eligible candidates in the overloaded buckets.
+  // The store is policy-neutral: it returns rows ordered by the hint (LRU here,
+  // so an indexed backend can push the ordering down) but makes no eviction
+  // decision and never sees the byte budget.  max_per_bucket=0 → no cap, so the
+  // strategy gets full candidate visibility.
+  std::vector<NodeTierKey> buckets;
+  buckets.reserve(bytes_to_free.size());
+  for (const auto& [ntk, _bytes] : bytes_to_free) buckets.push_back(ntk);
+
+  auto candidates_by_bucket =
+      store_.EnumerateEvictionCandidates(buckets, EvictionOrder::kLeastRecentlyAccessed,
+                                         /*max_per_bucket=*/0, std::chrono::system_clock::now());
+  if (candidates_by_bucket.empty()) {
     MORI_UMBP_DEBUG("[EvictionManager] No eviction candidates found");
     return;
   }
 
-  // Policy ranks candidates and picks victims within budget, grouped by node so
-  // each peer gets a single EvictKey keys[].
-  auto per_node_keys = strategy_->SelectVictims(std::move(candidates), std::move(bytes_to_free));
+  // Flatten the candidates and translate the per-(node, tier) byte budget into
+  // the strategy's shape, then let the strategy pick victims (default LRU),
+  // grouped by node so each peer gets a single EvictKey keys[].
+  std::vector<EvictionCandidate> candidates;
+  for (auto& [bucket, rows] : candidates_by_bucket) {
+    for (auto& c : rows) candidates.push_back(std::move(c));
+  }
+  std::unordered_map<std::string, std::map<TierType, int64_t>> strategy_budget;
+  for (const auto& [ntk, bytes] : bytes_to_free) {
+    strategy_budget[ntk.node_id][ntk.tier] = static_cast<int64_t>(bytes);
+  }
+
+  auto per_node_keys = strategy_->SelectVictims(std::move(candidates), std::move(strategy_budget));
 
   size_t selected = 0;
   for (const auto& [node_id, keys] : per_node_keys) selected += keys.size();
+
   if (selected == 0) return;
 
   MORI_UMBP_INFO("[EvictionManager] Selected {} victims across {} nodes", selected,

@@ -1,6 +1,7 @@
 # Keep build outputs, VCS data, and caches out of the docker build context.
 build/
 .git/
+.rocprofv3/
 **/__pycache__/
 **/*.egg-info/
 **/*.pyc

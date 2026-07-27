@@ -44,6 +44,8 @@
 namespace mori {
 namespace io {
 
+class RdmaAsyncEventMonitor;
+
 namespace internal {
 
 // Placeholder written into engine_desc.port when an RDMA backend request is
@@ -120,6 +122,8 @@ class RdmaManager {
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};
+
+  std::unique_ptr<RdmaAsyncEventMonitor> asyncEventMonitor_;
 };
 
 /* ---------------------------------------------------------------------------------------------- */

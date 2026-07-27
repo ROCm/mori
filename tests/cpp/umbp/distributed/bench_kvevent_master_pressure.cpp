@@ -70,6 +70,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -282,6 +284,17 @@ struct BenchOpts {
   bool randomize = false;  // mix broadcast/rotate per round
   uint64_t seed = 1234;
   bool with_external_kv = false;
+  // MatchExternalKv hit-count mode. The real hot path (route/prefix lookup)
+  // counts hits — the increment + last_seen stamp is part of the cost. Default
+  // true so --with-external-kv measures the true hot-path Match; set false to
+  // isolate the pure read.
+  bool ext_kv_count_as_hit = true;
+  // Isolate the external-KV path at the gRPC+backend layer: skip BatchPut /
+  // BatchLookup / BatchGet (and thus all RDMA) and exercise ONLY
+  // ReportExternalKvBlocks (producer) + MatchExternalKv (consumer). Implies
+  // --with-external-kv. Lets the proxy compare backends on the external-KV hot
+  // path without the block data plane in the way.
+  bool ext_kv_only = false;
   size_t key_space = 0;         // 0 = unique keys per round; >0 = recycle per producer
   int metrics_port = 0;         // 0 = no Prometheus scrape
   double keep_master_secs = 0;  // keep master alive at the end for Grafana
@@ -289,33 +302,58 @@ struct BenchOpts {
   // Put placement (injected directly into the master, NOT via env).
   std::string put_algo = "most_available";  // most_available | random
   std::string put_affinity = "local";       // none | same | local
+  // Multi-process / multi-host: if --external-master is set, do NOT spawn an
+  // in-process MasterServer; connect this process's clients to a standalone
+  // umbp_master shared by every process/host. node_id_prefix / node_address let
+  // each process advertise a globally-unique node id + its own reachable IP.
+  std::string external_master = "";      // "host:port"; empty => in-process master
+  std::string node_id_prefix = "node-";  // per-process unique prefix; client idx appended
+  std::string node_address = "127.0.0.1";
+  // Cross-process end-of-run barrier (fetch/both only): every client process
+  // reaches it before any tears down, so peer RDMA endpoints stay alive until all
+  // readers are done -- eliminating the teardown reset that otherwise aborts a
+  // straggler. Coordinated via files in a shared directory (shared FS for
+  // multi-host). Empty dir or size<=1 disables it (falls back to BENCH_DRAIN_MS).
+  std::string barrier_dir = "";
+  size_t barrier_size = 0;       // total client processes across all hosts
+  std::string barrier_tag = "";  // unique per run; isolates the barrier subdir
 };
 
 void Usage() {
-  std::fprintf(stderr,
-               "Usage: bench_kvevent_master_pressure [options]\n"
-               "  --mode baseline|compressed|flush   (default baseline)\n"
-               "  --pattern broadcast|rotate         (default rotate)\n"
-               "  --get-mode exists|fetch|both       (default exists)\n"
-               "  --clients N        (default 4)\n"
-               "  --rounds N         (default 100)\n"
-               "  --warmup-rounds N  (default 5)\n"
-               "  --batch N          (default 16)\n"
-               "  --page-bytes N     (default 4096)\n"
-               "  --gap-ms F         (default 250)\n"
-               "  --gap-jitter-ms F  (default 0)\n"
-               "  --round-barrier    (default off)\n"
-               "  --read-lag-rounds N(default 1; 0 needs --round-barrier)\n"
-               "  --randomize        (mix broadcast/rotate per round)\n"
-               "  --seed N           (default 1234)\n"
-               "  --with-external-kv (default off)\n"
-               "  --key-space N      (0=unique per round; >0 recycle)\n"
-               "  --metrics-port P   (0=off; >0 enable master Prometheus + scrape)\n"
-               "  --keep-master-secs F (default 0)\n"
-               "  --put-algo most_available|random   (default most_available)\n"
-               "  --put-affinity none|same|local     (default local)\n"
-               "Heartbeat interval is env-driven (UMBP_HEARTBEAT_TTL_SEC,\n"
-               "UMBP_HEARTBEAT_INTERVAL_DIVISOR); launch one process per scenario.\n");
+  std::fprintf(
+      stderr,
+      "Usage: bench_kvevent_master_pressure [options]\n"
+      "  --mode baseline|compressed|flush   (default baseline)\n"
+      "  --pattern broadcast|rotate         (default rotate)\n"
+      "  --get-mode exists|fetch|both       (default exists)\n"
+      "  --clients N        (default 4)\n"
+      "  --rounds N         (default 100)\n"
+      "  --warmup-rounds N  (default 5)\n"
+      "  --batch N          (default 16)\n"
+      "  --page-bytes N     (default 4096)\n"
+      "  --gap-ms F         (default 250)\n"
+      "  --gap-jitter-ms F  (default 0)\n"
+      "  --round-barrier    (default off)\n"
+      "  --read-lag-rounds N(default 1; 0 needs --round-barrier)\n"
+      "  --randomize        (mix broadcast/rotate per round)\n"
+      "  --seed N           (default 1234)\n"
+      "  --with-external-kv (default off)\n"
+      "  --ext-kv-count-as-hit 0|1 (default 1; MatchExternalKv hit-count write)\n"
+      "  --ext-kv-only      (only report+match, no BatchPut/Get/RDMA; implies --with-external-kv)\n"
+      "  --key-space N      (0=unique per round; >0 recycle)\n"
+      "  --metrics-port P   (0=off; >0 enable master Prometheus + scrape)\n"
+      "  --keep-master-secs F (default 0)\n"
+      "  --put-algo most_available|random   (default most_available)\n"
+      "  --put-affinity none|same|local     (default local)\n"
+      "  --external-master host:port  (connect to a shared standalone master;\n"
+      "                                empty => spawn an in-process master)\n"
+      "  --node-id-prefix S   (default node-; client index appended)\n"
+      "  --node-address IP    (default 127.0.0.1; this process's reachable IP)\n"
+      "  --barrier-dir DIR    (cross-process end-of-run barrier dir; shared FS for multi-host)\n"
+      "  --barrier-size N     (total client processes to wait for; <=1 disables)\n"
+      "  --barrier-tag S      (unique per run; isolates the barrier subdir)\n"
+      "Heartbeat interval is env-driven (UMBP_HEARTBEAT_TTL_SEC,\n"
+      "UMBP_HEARTBEAT_INTERVAL_DIVISOR); launch one process per scenario.\n");
 }
 
 bool ParseArgs(int argc, char** argv, BenchOpts* o) {
@@ -376,6 +414,11 @@ bool ParseArgs(int argc, char** argv, BenchOpts* o) {
       o->seed = std::strtoull(need("--seed"), nullptr, 10);
     } else if (a == "--with-external-kv") {
       o->with_external_kv = true;
+    } else if (a == "--ext-kv-count-as-hit") {
+      o->ext_kv_count_as_hit = std::strtol(need("--ext-kv-count-as-hit"), nullptr, 10) != 0;
+    } else if (a == "--ext-kv-only") {
+      o->ext_kv_only = true;
+      o->with_external_kv = true;
     } else if (a == "--key-space") {
       o->key_space = std::strtoull(need("--key-space"), nullptr, 10);
     } else if (a == "--metrics-port") {
@@ -388,6 +431,18 @@ bool ParseArgs(int argc, char** argv, BenchOpts* o) {
       o->put_algo = need("--put-algo");
     } else if (a == "--put-affinity") {
       o->put_affinity = need("--put-affinity");
+    } else if (a == "--external-master") {
+      o->external_master = need("--external-master");
+    } else if (a == "--node-id-prefix") {
+      o->node_id_prefix = need("--node-id-prefix");
+    } else if (a == "--node-address") {
+      o->node_address = need("--node-address");
+    } else if (a == "--barrier-dir") {
+      o->barrier_dir = need("--barrier-dir");
+    } else if (a == "--barrier-size") {
+      o->barrier_size = std::strtoull(need("--barrier-size"), nullptr, 10);
+    } else if (a == "--barrier-tag") {
+      o->barrier_tag = need("--barrier-tag");
     } else if (a == "-h" || a == "--help") {
       Usage();
       std::exit(0);
@@ -460,6 +515,8 @@ struct Metrics {
   std::atomic<uint64_t> hit{0};
   std::atomic<uint64_t> miss{0};
   std::atomic<uint64_t> rpc_error_keys{0};
+  std::atomic<uint64_t> fetch_errors{
+      0};  // BatchGet transport failures (peer down); excluded from hit/miss
   std::atomic<uint64_t> ext_report_calls{0};
   std::atomic<uint64_t> ext_match_calls{0};
   std::atomic<uint64_t> ext_match_hits{0};
@@ -543,19 +600,23 @@ void Worker(size_t id, size_t round_begin, size_t round_end, bool measure, Ctx c
     if (IsProducer(pat, id)) {
       std::vector<std::string> keys(batch);
       for (size_t b = 0; b < batch; ++b) keys[b] = MakeKey(id, r, b, o);
-      const auto t0 = Clock::now();
-      auto res = cli->BatchPut(keys, srcs, sizes);
-      const auto t1 = Clock::now();
-      if (measure) {
-        put_ms.push_back(DurMs(t1 - t0));
-        ctx.m->put_calls.fetch_add(1, std::memory_order_relaxed);
-        ctx.m->put_keys.fetch_add(batch, std::memory_order_relaxed);
-        size_t fails = 0;
-        for (bool ok : res)
-          if (!ok) ++fails;
-        if (fails) ctx.m->put_fail_keys.fetch_add(fails, std::memory_order_relaxed);
+      // --ext-kv-only skips the block data plane (BatchPut + RDMA) so the proxy
+      // measures only the external-KV control path (report + match) end to end.
+      if (!o.ext_kv_only) {
+        const auto t0 = Clock::now();
+        auto res = cli->BatchPut(keys, srcs, sizes);
+        const auto t1 = Clock::now();
+        if (measure) {
+          put_ms.push_back(DurMs(t1 - t0));
+          ctx.m->put_calls.fetch_add(1, std::memory_order_relaxed);
+          ctx.m->put_keys.fetch_add(batch, std::memory_order_relaxed);
+          size_t fails = 0;
+          for (bool ok : res)
+            if (!ok) ++fails;
+          if (fails) ctx.m->put_fail_keys.fetch_add(fails, std::memory_order_relaxed);
+        }
+        if (o.mode == "flush") cli->Master().FlushHeartbeat();
       }
-      if (o.mode == "flush") cli->Master().FlushHeartbeat();
       if (o.with_external_kv) {
         const bool ok = cli->ReportExternalKvBlocks(keys, TierType::DRAM);
         if (measure && ok) ctx.m->ext_report_calls.fetch_add(1, std::memory_order_relaxed);
@@ -580,7 +641,7 @@ void Worker(size_t id, size_t round_begin, size_t round_end, bool measure, Ctx c
     std::vector<std::string> rkeys(batch);
     for (size_t b = 0; b < batch; ++b) rkeys[b] = MakeKey(producer, static_cast<size_t>(rr), b, o);
 
-    if (o.get_mode == GetMode::kExists || o.get_mode == GetMode::kBoth) {
+    if (!o.ext_kv_only && (o.get_mode == GetMode::kExists || o.get_mode == GetMode::kBoth)) {
       std::vector<bool> found;
       const auto t0 = Clock::now();
       grpc::Status st = cli->Master().BatchLookup(rkeys, &found);
@@ -601,29 +662,50 @@ void Worker(size_t id, size_t round_begin, size_t round_end, bool measure, Ctx c
         }
       }
     }
-    if (o.get_mode == GetMode::kFetch || o.get_mode == GetMode::kBoth) {
+    if (!o.ext_kv_only && (o.get_mode == GetMode::kFetch || o.get_mode == GetMode::kBoth)) {
       const auto t0 = Clock::now();
-      auto bg = cli->BatchGet(rkeys, dsts, sizes);
+      // A faster process can tear down its peer service at end-of-run while this
+      // one is still fetching; the RDMA control-plane read then throws a transport
+      // error on this worker thread. Record it as a distinct transport-error --
+      // NOT a miss, and with no latency sample -- so hit/miss + p50 stay clean, and
+      // keep going so a straggler does not abort the whole (multi-process) run. The
+      // cross-process barrier normally makes this never fire.
+      std::vector<bool> bg;
+      bool bg_ok = true;
+      try {
+        bg = cli->BatchGet(rkeys, dsts, sizes);
+      } catch (const std::exception& e) {
+        bg_ok = false;
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+          std::fprintf(stderr, "warning: BatchGet transport error (peer down?): %s\n", e.what());
+      } catch (...) {
+        bg_ok = false;
+      }
       const auto t1 = Clock::now();
       if (measure) {
-        fetch_ms.push_back(DurMs(t1 - t0));
-        ctx.m->fetch_calls.fetch_add(1, std::memory_order_relaxed);
-        if (o.get_mode == GetMode::kFetch) {
-          // fetch-only classification is coarse: BatchGet cannot split RPC error from
-          // not-found.  BatchRouteGet RPC errors are visible separately in
-          // mori_umbp_master_client_rpc_errors_total{rpc="BatchRouteGet"}.
-          ctx.m->get_keys.fetch_add(batch, std::memory_order_relaxed);
-          size_t h = 0;
-          for (bool f : bg)
-            if (f) ++h;
-          ctx.m->hit.fetch_add(h, std::memory_order_relaxed);
-          ctx.m->miss.fetch_add(batch - h, std::memory_order_relaxed);
+        if (!bg_ok) {
+          ctx.m->fetch_errors.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          fetch_ms.push_back(DurMs(t1 - t0));
+          ctx.m->fetch_calls.fetch_add(1, std::memory_order_relaxed);
+          if (o.get_mode == GetMode::kFetch) {
+            // fetch-only classification is coarse: BatchGet cannot split RPC error
+            // from not-found.  BatchRouteGet RPC errors are visible separately in
+            // mori_umbp_master_client_rpc_errors_total{rpc="BatchRouteGet"}.
+            ctx.m->get_keys.fetch_add(batch, std::memory_order_relaxed);
+            size_t h = 0;
+            for (bool f : bg)
+              if (f) ++h;
+            ctx.m->hit.fetch_add(h, std::memory_order_relaxed);
+            ctx.m->miss.fetch_add(batch - h, std::memory_order_relaxed);
+          }
         }
       }
     }
     if (o.with_external_kv) {
       std::vector<MasterClient::ExternalKvNodeMatch> matches;
-      const bool ok = cli->MatchExternalKv(rkeys, &matches, /*count_as_hit=*/false);
+      const bool ok = cli->MatchExternalKv(rkeys, &matches, o.ext_kv_count_as_hit);
       if (measure && ok) {
         ctx.m->ext_match_calls.fetch_add(1, std::memory_order_relaxed);
         size_t matched = 0;
@@ -645,6 +727,37 @@ void RunPhase(Ctx ctx, size_t begin, size_t end, bool measure) {
   for (auto& t : threads) t.join();
 }
 
+// Cross-process end-of-measurement barrier over a shared directory: each process
+// announces itself with a file, then waits until `size` files exist (or timeout).
+// Ensures no process tears down its peer service (RDMA endpoints) while another is
+// still fetching -- the fetch/both teardown race that otherwise resets peers.
+bool FileBarrierWait(const std::string& dir, const std::string& member, size_t size,
+                     double timeout_s) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  {
+    std::ofstream f(fs::path(dir) / member);
+    f << "1";
+  }
+  const auto deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                                           std::chrono::duration<double>(timeout_s));
+  for (;;) {
+    size_t n = 0;
+    for (auto it = fs::directory_iterator(dir, ec); !ec && it != fs::directory_iterator();
+         it.increment(ec)) {
+      if (ec) break;
+      ++n;
+    }
+    if (n >= size) return true;
+    if (Clock::now() >= deadline) {
+      std::fprintf(stderr, "warning: barrier timeout (%zu/%zu present); proceeding\n", n, size);
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+
 constexpr const char* kRpcLatencyMetric = "mori_umbp_master_client_rpc_latency_seconds";
 
 }  // namespace
@@ -654,25 +767,36 @@ int main(int argc, char** argv) {
   if (!ParseArgs(argc, argv, &o)) return 2;
   const size_t N = o.clients;
 
-  // ---- master (put strategy injected directly; NOT via env) ----
-  MasterServerConfig mcfg;
-  mcfg.listen_address = "0.0.0.0:0";
-  mcfg.metrics_port = o.metrics_port;
-  mcfg.registry_config = ClientRegistryConfig::FromEnvironment();
-  mcfg.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(ParseAlgo(o.put_algo),
-                                                                     ParseAffinity(o.put_affinity));
-  mcfg.route_put_algo = o.put_algo;
-  mcfg.route_put_affinity = o.put_affinity;
-  auto master = std::make_unique<MasterServer>(std::move(mcfg));
-  std::thread server_thread([&] { master->Run(); });
-  for (int i = 0; i < 500 && master->GetBoundPort() == 0; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  // ---- master: spawn in-process (default), unless --external-master points at
+  //      a standalone umbp_master shared by many processes/hosts. ----
+  std::unique_ptr<MasterServer> master;
+  std::thread server_thread;
+  std::string master_addr;
+  if (o.external_master.empty()) {
+    MasterServerConfig mcfg;
+    mcfg.listen_address = "0.0.0.0:0";
+    mcfg.metrics_port = o.metrics_port;
+    mcfg.registry_config = ClientRegistryConfig::FromEnvironment();
+    mcfg.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(
+        ParseAlgo(o.put_algo), ParseAffinity(o.put_affinity));
+    mcfg.route_put_algo = o.put_algo;
+    mcfg.route_put_affinity = o.put_affinity;
+    master = std::make_unique<MasterServer>(std::move(mcfg));
+    server_thread = std::thread([&] { master->Run(); });
+    for (int i = 0; i < 500 && master->GetBoundPort() == 0; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (master->GetBoundPort() == 0) {
+      std::fprintf(stderr, "master failed to start\n");
+      return 2;
+    }
+    master_addr = "localhost:" + std::to_string(master->GetBoundPort());
+  } else {
+    // Standalone master owns put strategy / index shards via its own env; this
+    // process only drives clients. --metrics-port should be 0 here (scrape the
+    // shared master's own endpoint externally, e.g. via parse_master_hist.py).
+    master_addr = o.external_master;
   }
-  if (master->GetBoundPort() == 0) {
-    std::fprintf(stderr, "master failed to start\n");
-    return 2;
-  }
-  const std::string master_addr = "localhost:" + std::to_string(master->GetBoundPort());
 
   // ---- buffer sizing ----
   const size_t total_rounds = o.warmup_rounds + o.rounds;
@@ -694,10 +818,13 @@ int main(int argc, char** argv) {
     if (need_dst) dst_bufs[id].assign(io_bytes, 0);
 
     PoolClientConfig cfg;
-    cfg.master_config.node_id = "node-" + std::to_string(id);
-    cfg.master_config.node_address = "127.0.0.1";
+    cfg.master_config.node_id = o.node_id_prefix + std::to_string(id);
+    cfg.master_config.node_address = o.node_address;
     cfg.master_config.master_address = master_addr;
-    cfg.io_engine.host = "0.0.0.0";
+    // Advertise the routable node address for the RDMA engine so cross-machine
+    // peers can reach it. "0.0.0.0" makes the published EngineDesc non-routable
+    // (resolves to loopback), which only works when all peers are on one host.
+    cfg.io_engine.host = o.node_address;
     cfg.io_engine.port = 0;
     cfg.peer_service_port = NextPeerServicePort();
     cfg.dram_page_size = o.page_bytes;
@@ -761,8 +888,31 @@ int main(int argc, char** argv) {
   const double rpc_err_rate =
       get_total > 0 ? double(m.rpc_error_keys.load()) / double(get_total) : 0.0;
 
+  // ---- end-of-measurement sync so teardown never overlaps peer fetches ----
+  // fetch/both read block data over RDMA from peer processes; if a faster process
+  // tears down first, a straggler's read resets. A cross-process barrier (when the
+  // harness supplies --barrier-*) is deterministic; otherwise fall back to a fixed
+  // drain (heuristic: safe only while the finish-time spread < BENCH_DRAIN_MS).
+  if (o.get_mode != GetMode::kExists) {
+    if (!o.barrier_dir.empty() && o.barrier_size > 1) {
+      const std::string tag = o.barrier_tag.empty() ? "barrier" : o.barrier_tag;
+      const std::string member = o.node_id_prefix + std::to_string(getpid());
+      FileBarrierWait(o.barrier_dir + "/" + tag, member, o.barrier_size, /*timeout_s=*/60.0);
+    } else {
+      const char* drain_env = std::getenv("BENCH_DRAIN_MS");
+      const long drain_ms = drain_env ? std::strtol(drain_env, nullptr, 10) : 3000;
+      if (drain_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
+    }
+  }
+
   // ---- shutdown clients (flushes their buffered metrics to the master) ----
   for (size_t id = 0; id < N; ++id) clients[id]->Shutdown();
+  if (m.fetch_errors.load() > 0) {
+    std::fprintf(stderr,
+                 "NOTE: %llu fetch transport-errors excluded from hit/miss/latency "
+                 "(peer teardown; raise BENCH_DRAIN_MS or use --barrier-*)\n",
+                 static_cast<unsigned long long>(m.fetch_errors.load()));
+  }
 
   // ---- final Prometheus snapshot + delta ----
   std::map<std::string, RpcHist> rpc_delta;
@@ -815,7 +965,7 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(
         std::chrono::milliseconds(static_cast<int64_t>(o.keep_master_secs * 1000.0)));
   }
-  master->Shutdown();
+  if (master) master->Shutdown();
   if (server_thread.joinable()) server_thread.join();
   return 0;
 }

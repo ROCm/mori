@@ -63,3 +63,24 @@ inline hipError_t hipMemImportFromShareableHandleCompat(hipMemGenericAllocationH
   return hipMemImportFromShareableHandle(handle, (void*)&fd, handleType);
 #endif
 }
+
+// Fabric handle compat — mirrors RCCL's mem_manager.h shim.
+// When HIP exposes hipMemFabricHandle_t natively, use it; otherwise define a
+// 64-byte opaque struct and the handle-type sentinel (0x8).
+#ifdef HIP_FABRIC_API
+typedef hipMemFabricHandle_t hipMemFabricHandle_compat_t;
+#define MORI_MEM_HANDLE_TYPE_FABRIC hipMemHandleTypeFabric
+#else
+#ifndef MORI_FABRIC_HANDLE_DEFINED
+#define MORI_FABRIC_HANDLE_DEFINED
+typedef struct {
+  unsigned char data[64];
+} hipMemFabricHandle_compat_t;
+#endif
+#define MORI_MEM_HANDLE_TYPE_FABRIC ((hipMemAllocationHandleType)0x8)
+#endif
+
+inline hipMemAllocationHandleType hipMemHandleTypeFabricCompat_value() {
+  return MORI_MEM_HANDLE_TYPE_FABRIC;
+}
+static const hipMemAllocationHandleType hipMemHandleTypeFabricCompat = MORI_MEM_HANDLE_TYPE_FABRIC;

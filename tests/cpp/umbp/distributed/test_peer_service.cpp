@@ -110,7 +110,7 @@ class PeerServiceSlotTest : public ::testing::Test {
 
     server_ = std::make_unique<PeerServiceServer>(
         dram_alloc_.get(), peer_ssd_.get(), staging_buffer_, kStagingSize, ssd_staging_mem_desc_,
-        kNumReadSlots, kLeaseTimeoutS, std::vector<uint8_t>{},
+        kNumReadSlots, std::chrono::seconds(kLeaseTimeoutS), std::vector<uint8_t>{},
         /*master_client=*/nullptr);
     server_->Start(port_);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));

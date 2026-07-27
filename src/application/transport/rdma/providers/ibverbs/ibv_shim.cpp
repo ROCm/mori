@@ -249,6 +249,20 @@ int _ibv_query_gid_ex(struct ibv_context* context, uint32_t port_num, uint32_t g
   return fn ? fn(context, port_num, gid_index, entry, flags, entry_size) : IbvUnavailable(-1);
 }
 
+// ---- async events -----------------------------------------------------------
+// get and ack must stay paired: retrieving an event that can never be acked
+// would wedge later ibv_destroy_*/ibv_close_device, so fail get when either
+// symbol is missing rather than hand back an unacknowledgeable event.
+int ibv_get_async_event(struct ibv_context* context, struct ibv_async_event* event) {
+  MORI_IBV_RESOLVE(ibv_get_async_event, "IBVERBS_1.1");
+  static void* ack = IbvSym("ibv_ack_async_event", "IBVERBS_1.1");
+  return (fn && ack) ? fn(context, event) : IbvUnavailable(-1);
+}
+void ibv_ack_async_event(struct ibv_async_event* event) {
+  MORI_IBV_RESOLVE(ibv_ack_async_event, "IBVERBS_1.1");
+  if (fn) fn(event);
+}
+
 // ---- misc -------------------------------------------------------------------
 const char* ibv_wc_status_str(enum ibv_wc_status status) {
   MORI_IBV_RESOLVE(ibv_wc_status_str, "IBVERBS_1.1");

@@ -243,6 +243,22 @@ struct UMBPDistributedConfig {
   uint64_t dram_page_size = 0;
 };
 
+// User-facing same-host standalone-process configuration.  Set
+// UMBPConfig::standalone_process to make CreateUMBPClient construct a
+// StandaloneProcessClient that talks to an umbp_standalone_server over UDS.
+struct UMBPStandaloneProcessConfig {
+  std::string address;             // e.g. unix:///run/umbp/standalone/node0.grpc.sock
+  bool auto_start = false;         // opt-in fork+exec convenience path
+  int startup_timeout_ms = 30000;  // readiness wait bound for auto_start
+
+  // Optional distributed identity for external-KV reports routed through a
+  // distributed-backed standalone server. Empty means external-KV identity is
+  // not requested for this worker.
+  std::string worker_node_id;
+  std::string worker_node_address;
+  std::vector<std::string> tags;
+};
+
 struct UMBPConfig {
   UMBPDramConfig dram;
   UMBPSsdConfig ssd;
@@ -261,6 +277,11 @@ struct UMBPConfig {
   // that connects to the Master and sends periodic heartbeats.
   // nullopt (default) = local-only mode with no network dependencies.
   std::optional<UMBPDistributedConfig> distributed;
+
+  // Optional same-host standalone-process mode.  Mutually exclusive with
+  // distributed: this mode uses one local server process and shm fd handoff,
+  // not the cross-node master/RDMA path.
+  std::optional<UMBPStandaloneProcessConfig> standalone_process;
 
   UMBPRole ResolveRole() const {
     if (role != UMBPRole::Standalone) {
@@ -325,6 +346,22 @@ struct UMBPConfig {
       if (d.master_config.node_address.empty()) {
         if (error_message)
           *error_message = "distributed.master_config.node_address must not be empty";
+        return false;
+      }
+    }
+    if (distributed.has_value() && standalone_process.has_value()) {
+      if (error_message)
+        *error_message = "distributed and standalone_process are mutually exclusive";
+      return false;
+    }
+    if (standalone_process.has_value()) {
+      const auto& sp = standalone_process.value();
+      if (sp.address.empty()) {
+        if (error_message) *error_message = "standalone_process.address must not be empty";
+        return false;
+      }
+      if (sp.startup_timeout_ms <= 0) {
+        if (error_message) *error_message = "standalone_process.startup_timeout_ms must be > 0";
         return false;
       }
     }

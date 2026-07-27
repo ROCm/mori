@@ -34,12 +34,9 @@
 
 #include "mori/metrics/prometheus_metrics_server.hpp"
 #include "umbp/distributed/config.h"
-#include "umbp/distributed/master/client_registry.h"
-#include "umbp/distributed/master/evict_strategy.h"
 #include "umbp/distributed/master/eviction_manager.h"
-#include "umbp/distributed/master/external_kv_block_index.h"
-#include "umbp/distributed/master/external_kv_hit_index.h"
-#include "umbp/distributed/master/global_block_index.h"
+#include "umbp/distributed/master/in_memory_master_metadata_store.h"
+#include "umbp/distributed/master/master_metadata_store.h"
 #include "umbp/distributed/routing/route_get_strategy.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
 #include "umbp/distributed/routing/router.h"
@@ -64,10 +61,10 @@ class MasterServer {
 
  private:
   MasterServerConfig config_;
-  GlobalBlockIndex index_;
-  ExternalKvBlockIndex external_kv_index_;
-  ExternalKvHitIndex external_kv_hit_index_;
-  ClientRegistry registry_;
+  // Single owner of all master metadata state (block locations, client
+  // records, external-KV locations, hit counts).  Declared before router_ and
+  // service_ so it outlives the references they hold.
+  std::unique_ptr<IMasterMetadataStore> store_;
   Router router_;
 
   std::unique_ptr<mori::metrics::MetricsServer> metrics_server_;
@@ -94,6 +91,19 @@ class MasterServer {
   std::atomic<bool> hit_index_gc_running_{false};
   std::mutex hit_index_gc_cv_mutex_;
   std::condition_variable hit_index_gc_cv_;
+
+  // Client-expiry reaper.  Formerly owned by ClientRegistry; the schedule
+  // (timer + cv) lives here now and the per-tick action is a single
+  // store_->ExpireStaleClients(cutoff) call, where cutoff is on the
+  // system_clock basis so it's comparable to the records' last_heartbeat.
+  void StartReaper();
+  void StopReaper();
+  void ReaperLoop();
+
+  std::thread reaper_thread_;
+  std::atomic<bool> reaper_running_{false};
+  std::mutex reaper_cv_mutex_;
+  std::condition_variable reaper_cv_;
 };
 
 }  // namespace mori::umbp

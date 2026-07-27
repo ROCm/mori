@@ -92,5 +92,10 @@ endfunction()
 file(GLOB CCO_TEST_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/test_*.cpp")
 foreach(_src ${CCO_TEST_SOURCES})
+  # SDMA tests use ccoSdma, which only exists when BUILD_CCO_SDMA=ON; skip them
+  # otherwise (the header compiles them out, so the binaries would be empty).
+  if(NOT BUILD_CCO_SDMA AND _src MATCHES "test_sdma_")
+    continue()
+  endif()
   add_cco_test("${_src}")
 endforeach()

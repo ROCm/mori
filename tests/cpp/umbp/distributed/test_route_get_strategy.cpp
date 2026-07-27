@@ -130,5 +130,67 @@ TEST(CustomRouteGetStrategyTest, FallsBackToFirstWhenNoLocalReplica) {
   EXPECT_EQ(selected.node_id, "node-a");
 }
 
+// ---- BatchSelect tests ----
+
+TEST(RouteGetBatchSelectTest, ReturnsOneResultPerKeyInOrder) {
+  TierPriorityRouteGetStrategy strategy;
+  std::vector<std::vector<Location>> per_key = {
+      {MakeLoc("node-a", "loc-1")},
+      {MakeLoc("node-b", "loc-2")},
+      {MakeLoc("node-c", "loc-3")},
+  };
+
+  auto out = strategy.BatchSelect(per_key, "requester");
+  ASSERT_EQ(out.size(), 3u);
+  EXPECT_EQ(out[0].node_id, "node-a");
+  EXPECT_EQ(out[1].node_id, "node-b");
+  EXPECT_EQ(out[2].node_id, "node-c");
+}
+
+TEST(RouteGetBatchSelectTest, EmptyCandidateListLeftAsDefault) {
+  RandomRouteGetStrategy strategy;
+  std::vector<std::vector<Location>> per_key = {
+      {MakeLoc("node-a", "loc-1")},
+      {},  // not routed
+      {MakeLoc("node-c", "loc-3")},
+  };
+
+  auto out = strategy.BatchSelect(per_key, "requester");
+  ASSERT_EQ(out.size(), 3u);
+  EXPECT_EQ(out[0].node_id, "node-a");
+  EXPECT_TRUE(out[1].node_id.empty());  // default Location => caller skips
+  EXPECT_EQ(out[2].node_id, "node-c");
+}
+
+TEST(RouteGetBatchSelectTest, TierPriorityPicksFastestTierPerKey) {
+  TierPriorityRouteGetStrategy strategy;
+  Location hbm = MakeLoc("node-a", "loc-1");  // HBM by default in MakeLoc
+  Location ssd = MakeLoc("node-b", "loc-2");
+  ssd.tier = TierType::SSD;
+
+  std::vector<std::vector<Location>> per_key = {{ssd, hbm}};
+  auto out = strategy.BatchSelect(per_key, "requester");
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_EQ(out[0].tier, TierType::HBM);
+  EXPECT_EQ(out[0].node_id, "node-a");
+}
+
+TEST(RouteGetBatchSelectTest, CustomStrategyUsesBaseDefaultLoop) {
+  // LocalityAwareGetStrategy overrides only Select(); BatchSelect must still
+  // work via the base-class default that loops Select().
+  LocalityAwareGetStrategy strategy;
+  std::vector<std::vector<Location>> per_key = {
+      {MakeLoc("node-a", "loc-1"), MakeLoc("node-b", "loc-2")},
+      {},
+      {MakeLoc("node-a", "loc-3"), MakeLoc("node-c", "loc-4")},
+  };
+
+  auto out = strategy.BatchSelect(per_key, "node-c");
+  ASSERT_EQ(out.size(), 3u);
+  EXPECT_EQ(out[0].node_id, "node-a");  // no local replica -> first
+  EXPECT_TRUE(out[1].node_id.empty());  // empty -> Select not invoked
+  EXPECT_EQ(out[2].node_id, "node-c");  // local replica preferred
+}
+
 }  // namespace
 }  // namespace mori::umbp

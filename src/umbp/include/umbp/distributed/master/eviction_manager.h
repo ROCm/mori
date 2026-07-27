@@ -33,8 +33,7 @@
 
 namespace mori::umbp {
 
-class GlobalBlockIndex;
-class ClientRegistry;
+class IMasterMetadataStore;
 class MasterEvictStrategy;
 
 // Fire-and-forget callback for shipping EvictKey RPCs to a peer.  The
@@ -62,7 +61,7 @@ class EvictionManager {
   //
   // `strategy` is the victim-selection policy; null installs the default
   // LruMasterEvictStrategy (the single default-fallback site).
-  EvictionManager(GlobalBlockIndex& index, ClientRegistry& registry, const EvictionConfig& config,
+  EvictionManager(IMasterMetadataStore& store, const EvictionConfig& config,
                   EvictKeyDispatcher* dispatcher = nullptr,
                   std::unique_ptr<MasterEvictStrategy> strategy = nullptr);
   ~EvictionManager();
@@ -81,8 +80,7 @@ class EvictionManager {
   // background timer loop.
   void RunOnce();
 
-  GlobalBlockIndex& index_;
-  ClientRegistry& registry_;
+  IMasterMetadataStore& store_;
   EvictionConfig config_;
   EvictKeyDispatcher* dispatcher_;
   std::unique_ptr<MasterEvictStrategy> strategy_;

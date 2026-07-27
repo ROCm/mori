@@ -26,6 +26,8 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace mori::umbp {
@@ -61,6 +63,38 @@ struct Location {
   }
 };
 
+// Identifies one (node, tier) capacity bucket — the granularity at which
+// eviction budgets and overload are tracked.  Hoisted from
+// GlobalBlockIndex because it is part of the master metadata store contract.
+struct NodeTierKey {
+  std::string node_id;
+  TierType tier;
+  bool operator<(const NodeTierKey& o) const {
+    if (node_id != o.node_id) return node_id < o.node_id;
+    return tier < o.tier;
+  }
+  bool operator==(const NodeTierKey& o) const { return node_id == o.node_id && tier == o.tier; }
+};
+
+// One node's external-KV match result, grouped by tier.  A single hash may
+// appear in MORE THAN ONE tier bucket when a node holds multiple physical
+// copies (e.g. HBM + DRAM mirror).  std::map iterates in sorted TierType
+// order, so the first non-empty bucket is the fastest available tier.
+// Hoisted from ExternalKvBlockIndex because it is part of the master
+// metadata store contract.
+struct NodeMatch {
+  std::string node_id;
+  std::map<TierType, std::vector<std::string>> hashes_by_tier;
+
+  size_t MatchedHashCount() const {
+    std::unordered_set<std::string_view> seen;
+    for (const auto& [tier, hashes] : hashes_by_tier) {
+      for (const auto& h : hashes) seen.insert(h);
+    }
+    return seen.size();
+  }
+};
+
 enum class ClientStatus : int {
   UNKNOWN = 0,
   ALIVE = 1,
@@ -68,9 +102,30 @@ enum class ClientStatus : int {
 };
 
 struct BlockMetrics {
-  std::chrono::steady_clock::time_point created_at;
-  std::chrono::steady_clock::time_point last_accessed_at;
+  std::chrono::system_clock::time_point created_at;
+  std::chrono::system_clock::time_point last_accessed_at;
   uint64_t access_count = 0;
+};
+
+// One eviction-eligible (key, location) row returned by the master metadata
+// store's candidate enumeration.  Hoisted from GlobalBlockIndex because it is
+// part of the IMasterMetadataStore contract (EnumerateEvictionCandidates
+// returns these; MasterEvictStrategy consumes them).
+struct EvictionCandidate {
+  std::string key;
+  Location location;
+  std::chrono::system_clock::time_point last_accessed_at;
+  uint64_t size;
+};
+
+// Ordering hint for IMasterMetadataStore::EnumerateEvictionCandidates.  This is
+// a performance affordance, NOT eviction policy: it only tells the store what
+// order to return rows in so a backend with an index (e.g. a Redis ZSET keyed
+// by last_accessed_at) can serve the cheapest top-N rows instead of shipping
+// every candidate.  The actual victim decision belongs to MasterEvictStrategy.
+enum class EvictionOrder : int {
+  kNone = 0,                   // no ordering guarantee; store returns in any order
+  kLeastRecentlyAccessed = 1,  // oldest last_accessed_at first
 };
 
 // Structured form of one (buffer_index, page_index) slot.  Used by the
@@ -127,8 +182,8 @@ struct ClientRecord {
   std::string node_id;
   std::string node_address;
   ClientStatus status = ClientStatus::UNKNOWN;
-  std::chrono::steady_clock::time_point last_heartbeat;
-  std::chrono::steady_clock::time_point registered_at;
+  std::chrono::system_clock::time_point last_heartbeat;
+  std::chrono::system_clock::time_point registered_at;
   std::map<TierType, TierCapacity> tier_capacities;
 
   std::string peer_address;
@@ -140,6 +195,31 @@ struct ClientRecord {
   // Attached to all metrics reported by this node so Prometheus queries can
   // filter/group by role or other client attributes.
   std::vector<std::string> tags;
+};
+
+// Input to IMasterMetadataStore::RegisterClient. Deliberately omits
+// last_heartbeat / registered_at / status / last_applied_seq: those are owned
+// by the store and derived from the `now` argument the caller passes alongside
+// this struct. Keeping them off the input removes the "did the caller bother to
+// set these?" ambiguity.
+struct ClientRegistration {
+  std::string node_id;
+  std::string node_address;
+  std::map<TierType, TierCapacity> tier_capacities;
+  std::string peer_address;
+  std::vector<uint8_t> engine_desc_bytes;
+  std::vector<std::string> tags;
+};
+
+// Result of IMasterMetadataStore::ApplyHeartbeat. APPLIED = events accepted,
+// registry updated, acked_seq advanced to the request's seq. SEQ_GAP = peer's
+// seq is not last_applied_seq + 1; caller responds with a full-sync request and
+// acked_seq echoes the previously applied seq so the peer reships. UNKNOWN = no
+// record for node_id (peer must re-register).
+struct HeartbeatResult {
+  enum Status { APPLIED, SEQ_GAP, UNKNOWN };
+  Status status;
+  uint64_t acked_seq;  // meaningful for APPLIED and SEQ_GAP
 };
 
 // Helpers for logging

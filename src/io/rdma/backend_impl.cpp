@@ -37,6 +37,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "src/io/rdma/async_event_monitor.hpp"
 #include "src/io/rdma/protocol.hpp"
 namespace mori {
 namespace io {
@@ -258,6 +259,16 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
 
   deviceCtxs.resize(availDevices.size(), nullptr);
   topo.reset(new application::TopoSystem());
+
+  bool enableAsyncEvents = true;
+  env::Override("MORI_IO_ENABLE_ASYNC_EVENTS", enableAsyncEvents, mori::env::detail::ParseBool);
+  if (enableAsyncEvents) {
+    auto logger = mori::ModuleLogger::GetInstance().GetLogger(mori::modules::IO);
+    asyncEventMonitor_ = RdmaAsyncEventMonitor::Create(devices, logger);
+    if (!asyncEventMonitor_ && logger) {
+      logger->error("Failed to start RDMA async event monitor; continuing without it");
+    }
+  }
 }
 
 RdmaManager::~RdmaManager() {
@@ -267,6 +278,8 @@ RdmaManager::~RdmaManager() {
     }
   }
   deviceCtxs.clear();
+
+  asyncEventMonitor_.reset();
 
   if (ctx != nullptr) {
     delete ctx;
@@ -353,7 +366,7 @@ application::RdmaMemoryRegion RdmaManager::RegisterLocalMemory(int devId, const 
   std::unique_lock<std::shared_mutex> lock(mu);
   MemoryKey key{devId, desc.id};
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
-  mTable[key] = devCtx->RegisterRdmaMemoryRegion(reinterpret_cast<void*>(desc.data), desc.size);
+  mTable[key] = devCtx->RegisterRdmaMemoryRegionAuto(reinterpret_cast<void*>(desc.data), desc.size);
   return mTable[key];
 }
 
@@ -660,7 +673,7 @@ void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) 
       posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE,
                      static_cast<size_t>(config.notifPerQp) * sizeof(NotifMessage)));
   application::RdmaMemoryRegion mr =
-      devCtx->RegisterRdmaMemoryRegion(buf, config.notifPerQp * sizeof(NotifMessage));
+      devCtx->RegisterRdmaMemoryRegionAuto(buf, config.notifPerQp * sizeof(NotifMessage));
 
   notifCtxById_.insert({rt->id, {mr, buf}});
 

@@ -33,8 +33,10 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -43,6 +45,27 @@
 
 namespace mori {
 namespace application {
+
+namespace {
+// Per-step bootstrap rendezvous budget (ms). Default 300 s (the old fixed
+// ~10 s was too tight when the root is slow to accept()); override with
+// MORI_BOOTSTRAP_TIMEOUT (seconds).
+int BootstrapTimeoutMs() {
+  static const int kMs = [] {
+    constexpr int kMaxSecs = std::numeric_limits<int>::max() / 1000;
+    int secs = 300;
+    if (const char* s = std::getenv("MORI_BOOTSTRAP_TIMEOUT")) {
+      try {
+        int v = std::stoi(s);
+        if (v > 0) secs = std::min(v, kMaxSecs);
+      } catch (...) {
+      }
+    }
+    return secs * 1000;
+  }();
+  return kMs;
+}
+}  // namespace
 
 SocketBootstrapNetwork::SocketBootstrapNetwork(const UniqueId& unique_id, int rank, int world_size)
     : unique_id_(unique_id), initialized_(false), unexpected_connections_(nullptr) {
@@ -662,10 +685,10 @@ bool SocketBootstrapNetwork::SetupCommunicationRing() {
   // Setup ring connections
   int next_rank = (localRank + 1) % worldSize;
 
-  // Allow up to 30 s total for the ring connect (50 retries × 200 ms back-off
-  // after the first immediate attempt).
-  constexpr int kRingMaxRetries = 50;
-  constexpr int kRingRetryDelayMs = 200;
+  // Retry the ring connect until BootstrapTimeoutMs() elapses (200 ms back-off
+  // after the first immediate attempt). Configurable via MORI_BOOTSTRAP_TIMEOUT.
+  const int kRingRetryDelayMs = 200;
+  const int kRingMaxRetries = std::max(1, BootstrapTimeoutMs() / kRingRetryDelayMs);
 
   // Connect to next rank in ring (with retries)
   bool ring_connected = false;
@@ -695,9 +718,10 @@ bool SocketBootstrapNetwork::SetupCommunicationRing() {
     return false;
   }
 
-  // Accept connection from previous rank. Use a 30 s timeout so that if the
-  // previous rank's connect loop exhausts its retries we don't hang forever.
-  constexpr int kRingAcceptTimeoutMs = 30000;
+  // Accept connection from previous rank. Bounded by the same bootstrap budget
+  // so that if the previous rank's connect loop exhausts its retries we don't
+  // hang forever.
+  const int kRingAcceptTimeoutMs = BootstrapTimeoutMs();
   if (!AcceptSocket(listen_socket_, ring_recv_socket_, kRingAcceptTimeoutMs)) {
     int prev_rank = (localRank - 1 + worldSize) % worldSize;
     MORI_APP_ERROR("Rank {}: failed to accept ring connection from rank {} (errno={})", localRank,
@@ -741,10 +765,10 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
     // Keep client sockets open to avoid race condition
     std::vector<Socket> client_sockets(worldSize);
 
-    // 30 s per-rank accept timeout: non-root ranks may start connecting after
-    // up to kConnectMaxRetries × kConnectRetryDelayMs = ~10 s, so 30 s gives
-    // plenty of headroom while still preventing an infinite hang.
-    constexpr int kPhoneHomeAcceptTimeoutMs = 30000;
+    // Per-rank accept timeout bounded by the shared bootstrap budget: non-root
+    // ranks retry their connect over the same window, so this gives them the
+    // full budget to arrive while still preventing an infinite hang.
+    const int kPhoneHomeAcceptTimeoutMs = BootstrapTimeoutMs();
 
     // Collect from other ranks - keep sockets open
     for (int i = 1; i < worldSize; i++) {
@@ -816,11 +840,12 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
     SocketAddress root_addr;
     ExtractAddressFromUniqueId(unique_id_, root_addr);
 
-    // Allow up to 30 s total: 50 retries × 200 ms back-off after the first
-    // immediate attempt.  The very first attempt is made without any sleep so
-    // that a fast-starting root is reached immediately.
-    constexpr int kConnectMaxRetries = 50;
-    constexpr int kConnectRetryDelayMs = 200;
+    // Retry until BootstrapTimeoutMs() elapses (200 ms back-off after the first
+    // immediate attempt). The very first attempt is made without any sleep so
+    // that a fast-starting root is reached immediately. Configurable via
+    // MORI_BOOTSTRAP_TIMEOUT to tolerate a root that is slow to reach accept().
+    const int kConnectRetryDelayMs = 200;
+    const int kConnectMaxRetries = std::max(1, BootstrapTimeoutMs() / kConnectRetryDelayMs);
 
     Socket sock;
     bool connected = false;

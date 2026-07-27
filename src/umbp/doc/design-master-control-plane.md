@@ -95,9 +95,7 @@ SGLang or vLLM worker). Each peer owns:
    events arrive on the next heartbeat and that's when the index
    shrinks.
 5. **One TTL.** Pending allocator slots TTL out at the peer
-   (`pending_ttl`). Master no longer maintains an allocation TTL —
-   `UMBP_ALLOCATION_TTL_SEC` is retained as a config knob for legacy
-   compatibility but is unused by the live path.
+   (`pending_ttl`). Master no longer maintains an allocation TTL.
 6. **SSD is a peer-owned, best-effort, eventually-consistent cold
    tier.** An SSD copy is an asynchronous replica filled by
    copy-on-commit on the owner peer after the DRAM/HBM commit succeeds;
@@ -310,8 +308,6 @@ Membership ledger + heartbeat ingestion.
 |---|---|
 | `heartbeat_ttl` | 10 s |
 | `reaper_interval` | 5 s |
-| `allocation_ttl` | 30 s (legacy; unused by live path) |
-| `finalized_record_ttl` | 120 s (legacy; unused by live path) |
 | `max_missed_heartbeats` | 3 |
 | `default_dram_page_size` | 2 MiB |
 
@@ -1130,7 +1126,7 @@ been removed or repurposed since the master-led era:
 | `Register` / `Unregister` / `BatchRegister` / `BatchUnregister` / `Lookup` RPCs | Removed. Use heartbeat events for membership; `RouteGet` for read-side existence. |
 | `Location.location_id` (opaque allocator handle minted on master) | Removed. `Location` is `(node_id, size, tier)`; pages live on the peer. |
 | `ClientRegistry::TrackKey` / `UntrackKey` (per-key ownership reverse index on master) | Removed. Per-key ownership is implicit in `GlobalBlockIndex`'s `Location.node_id`. |
-| Allocation TTL reaper on master | Removed. Pending TTL lives on `PeerDramAllocator`. `UMBP_ALLOCATION_TTL_SEC` is retained as a config knob for legacy compatibility but is not consumed on the live path. |
+| Allocation TTL reaper on master | Removed. Pending TTL lives on `PeerDramAllocator`. |
 | `client_id` / `MasterClientConfig::client_id` | Renamed to `node_id` everywhere. |
 
 Consult `runtime-env-vars.md` for the up-to-date `UMBP_*` knob list and

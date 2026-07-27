@@ -109,6 +109,7 @@ class IOEngine {
 
   std::optional<IOEngineSession> CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   void LoadScatterGatherModule(const std::string& hsacoPath);
+  void LoadFabricCopyModule(const std::string& hsacoPath);
 
  private:
   struct RouteCacheKey {
@@ -117,11 +118,17 @@ class IOEngine {
     MemoryLocationType remoteLoc;
     int localDeviceId;
     int remoteDeviceId;
+    // Per-memory ids: routing can differ for the same engine/device pair when a
+    // buffer is fabric-exportable (FABRIC) vs not (RDMA), and RdmaBackend
+    // CanHandle is memory-agnostic, so the key must distinguish memories.
+    MemoryUniqueId localId;
+    MemoryUniqueId remoteId;
 
     bool operator==(const RouteCacheKey& rhs) const noexcept {
       return remoteEngineKey == rhs.remoteEngineKey && localLoc == rhs.localLoc &&
              remoteLoc == rhs.remoteLoc && localDeviceId == rhs.localDeviceId &&
-             remoteDeviceId == rhs.remoteDeviceId;
+             remoteDeviceId == rhs.remoteDeviceId && localId == rhs.localId &&
+             remoteId == rhs.remoteId;
     }
   };
 
@@ -136,6 +143,8 @@ class IOEngine {
       hashCombine(seed, std::hash<int>{}(static_cast<int>(key.remoteLoc)));
       hashCombine(seed, std::hash<int>{}(key.localDeviceId));
       hashCombine(seed, std::hash<int>{}(key.remoteDeviceId));
+      hashCombine(seed, std::hash<MemoryUniqueId>{}(key.localId));
+      hashCombine(seed, std::hash<MemoryUniqueId>{}(key.remoteId));
       return seed;
     }
   };

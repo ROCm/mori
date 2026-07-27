@@ -45,6 +45,24 @@ _FLYDSL_COV = 6  # FlyDSL ROCm backend uses ABI 600 -> code object version 6
 _cached_paths: dict[int, str] = {}
 
 
+def _sdma_enabled() -> bool:
+    """JIT the device wrapper with SDMA? env > baked _build_flags.py > OFF.
+
+    The baked flag (written by setup.py) records what the host lib was built
+    with, so `BUILD_CCO_SDMA=ON pip install .` works at runtime without re-setting
+    the env; the env still overrides it.
+    """
+    env = os.environ.get("BUILD_CCO_SDMA")
+    if env is not None:
+        return env.strip().upper() in {"1", "ON", "TRUE", "YES"}
+    try:
+        from mori.cco.device._build_flags import BUILD_CCO_SDMA as _baked
+
+        return bool(_baked)
+    except Exception:
+        return False
+
+
 def _prebuilt_candidates() -> list[Path]:
     here = Path(__file__).resolve().parent
     mori_root = here.parents[3]  # python/mori/cco/device/ -> repo root
@@ -82,16 +100,24 @@ def _jit_compile(cov: int) -> str | None:
 
         cfg = detect_build_config()
         nic = detect_nic_type()
+        # SDMA path is compile-gated (BUILD_CCO_SDMA). Resolved from env or the
+        # baked-in build flag so it matches the host libmori_cco.so. Folded into
+        # the cache dir below so on/off bitcode never aliases.
+        sdma_on = _sdma_enabled()
         source_paths = [
             wrapper,
             mori_root / "include" / "mori" / "cco",
             mori_root / "include" / "mori" / "core",
         ]
         cache_dir = get_cache_dir(cfg.arch, source_paths, nic, cov=cov)
+        if sdma_on:
+            cache_dir = cache_dir / "sdma"
+            cache_dir.mkdir(parents=True, exist_ok=True)
         bc_path = cache_dir / _BC_FILENAME
         if bc_path.is_file():
             return str(bc_path)
 
+        sdma_define = [f"-DBUILD_CCO_SDMA={1 if sdma_on else 0}"]
         lock_path = cache_dir / f".{_BC_FILENAME}.lock"
         with FileBaton(lock_path, wait_for=str(bc_path)) as baton:
             if baton.skipped or bc_path.is_file():
@@ -101,7 +127,9 @@ def _jit_compile(cov: int) -> str | None:
             include_dirs = _collect_include_dirs(mori_root)
             with tempfile.TemporaryDirectory() as td:
                 raw = Path(td) / "cco_wrapper.bc"
-                _hipcc_device_bc(cfg, wrapper, include_dirs, raw, cov=cov)
+                _hipcc_device_bc(
+                    cfg, wrapper, include_dirs, raw, cov=cov, extra_defines=sdma_define
+                )
                 _strip_lifetime_intrinsics(cfg, raw, bc_path)
         return str(bc_path)
     except Exception:

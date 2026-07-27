@@ -170,25 +170,32 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   // TODO: we need to add more options in config, include min cqe num for ib_create_cq
   endpoint.ibvHandle.compCh = config.withCompChannel ? ibv_create_comp_channel(context) : nullptr;
   if (config.withCompChannel && !endpoint.ibvHandle.compCh) {
-    MORI_APP_ERROR("ibv_create_comp_channel failed: errno={} ({}); dev={}", errno, strerror(errno),
+    // Capture errno immediately: any intervening libc call before we read it
+    // (e.g. isatty() inside the logging sink when stderr is not a tty, which
+    // sets ENOTTY) would otherwise overwrite the real failure code.
+    const int err = errno;
+    MORI_APP_ERROR("ibv_create_comp_channel failed: errno={} ({}); dev={}", err, strerror(err),
                    GetRdmaDevice()->Name());
-    throw std::runtime_error("ibv_create_comp_channel failed: " + std::string(strerror(errno)));
+    throw std::runtime_error("ibv_create_comp_channel failed: " + std::string(strerror(err)));
   }
 
   endpoint.ibvHandle.cq =
       ibv_create_cq(context, config.maxCqeNum, NULL, endpoint.ibvHandle.compCh, 0);
   if (!endpoint.ibvHandle.cq) {
+    // Capture errno before the lock/log path can overwrite it (see the note at
+    // the comp-channel site).
+    const int err = errno;
     size_t cqPoolSize = 0;
     {
       std::lock_guard<std::mutex> lock(poolMu);
       cqPoolSize = cqPool.size();
     }
     MORI_APP_ERROR(
-        "ibv_create_cq failed: errno={} ({}); dev={} max_cqe={} dev_max_cqe={} cqs_in_pool={}",
-        errno, strerror(errno), GetRdmaDevice()->Name(), config.maxCqeNum,
-        deviceAttr->orig_attr.max_cqe, cqPoolSize);
+        "ibv_create_cq failed: errno={} ({}); dev={} max_cqe={} dev_max_cqe={} cqs_in_pool={}", err,
+        strerror(err), GetRdmaDevice()->Name(), config.maxCqeNum, deviceAttr->orig_attr.max_cqe,
+        cqPoolSize);
     if (endpoint.ibvHandle.compCh) ibv_destroy_comp_channel(endpoint.ibvHandle.compCh);
-    throw std::runtime_error("ibv_create_cq failed: " + std::string(strerror(errno)));
+    throw std::runtime_error("ibv_create_cq failed: " + std::string(strerror(err)));
   }
 
   // TODO: should also manage the lifecycle of completion channel && srq
@@ -216,6 +223,12 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
                              .qp_type = IBV_QPT_RC};
   endpoint.ibvHandle.qp = ibv_create_qp(pd, &qpAttr);
   if (!endpoint.ibvHandle.qp) {
+    // Capture errno immediately. Otherwise the lock/log path below overwrites
+    // it before we read it: spdlog's console sink calls isatty(stderr), which
+    // sets errno=ENOTTY when stderr is not a terminal, masking the real error
+    // (commonly EINVAL when the requested QP capacity — max_send_wr x per-WQE
+    // size from sge+inline — exceeds the device's per-QP work-queue budget).
+    const int err = errno;
     size_t qpPoolSize = 0;
     {
       std::lock_guard<std::mutex> lock(poolMu);
@@ -224,13 +237,13 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
     MORI_APP_ERROR(
         "ibv_create_qp failed: errno={} ({}); dev={} port={} max_send_wr={} max_recv_wr={} "
         "max_send_sge={} max_cqe={} dev_caps(max_qp_wr={} max_qp={} max_cqe={}) qps_in_pool={}",
-        errno, strerror(errno), GetRdmaDevice()->Name(), config.portId, qpAttr.cap.max_send_wr,
+        err, strerror(err), GetRdmaDevice()->Name(), config.portId, qpAttr.cap.max_send_wr,
         qpAttr.cap.max_recv_wr, qpAttr.cap.max_send_sge, config.maxCqeNum,
         deviceAttr->orig_attr.max_qp_wr, deviceAttr->orig_attr.max_qp,
         deviceAttr->orig_attr.max_cqe, qpPoolSize);
     ibv_destroy_cq(endpoint.ibvHandle.cq);
     if (endpoint.ibvHandle.compCh) ibv_destroy_comp_channel(endpoint.ibvHandle.compCh);
-    throw std::runtime_error("ibv_create_qp failed: " + std::string(strerror(errno)));
+    throw std::runtime_error("ibv_create_qp failed: " + std::string(strerror(err)));
   }
   endpoint.handle.qpn = endpoint.ibvHandle.qp->qp_num;
 

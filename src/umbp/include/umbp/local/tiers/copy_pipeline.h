@@ -22,6 +22,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -42,6 +43,7 @@ class CopyPipeline {
 
   bool MaybeCopyToSharedSSD(const std::string& key);
   void MaybeBatchCopyToSharedSSD(const std::vector<std::string>& keys);
+  bool Drain(std::chrono::milliseconds timeout);
 
  private:
   struct CopyTask {
@@ -60,7 +62,9 @@ class CopyPipeline {
   std::vector<std::thread> copy_workers_;
   std::mutex copy_mu_;
   std::condition_variable copy_cv_;
+  std::condition_variable drain_cv_;
   std::deque<CopyTask> copy_queue_;
+  size_t in_flight_copies_ = 0;
 };
 
 }  // namespace mori::umbp

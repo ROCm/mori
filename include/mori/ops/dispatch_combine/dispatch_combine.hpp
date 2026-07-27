@@ -61,7 +61,14 @@ enum KernelType {
   AsyncLL = 4,
   IntraNodeLL = 5
 };
-enum class QuantType { None = 0, Fp8DirectCast = 1, Fp8BlockwiseQuant = 2 };
+enum class QuantType { None = 0, Fp8DirectCast = 1, Fp8BlockwiseQuant = 2, Fp4BlockwiseQuant = 3 };
+
+// Blockwise combine quant types share the same staging/scale layout (per-block float scales);
+// they differ only in the transported element codec: FP8 = 1 byte/elem, FP4 (E2M1) = 0.5 byte/elem
+// (2 values packed per byte), so an FP4 token region is half the size of an FP8 one.
+inline __host__ __device__ bool IsBlockwiseCombineQuant(QuantType q) {
+  return q == QuantType::Fp8BlockwiseQuant || q == QuantType::Fp4BlockwiseQuant;
+}
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
   switch (dtype) {
@@ -168,6 +175,15 @@ struct EpDispatchCombineConfig {
     return tokenTypeSize * hiddenDim;
   }
   inline __host__ __device__ size_t MaxHiddenBytes() const { return HiddenBytes(maxTokenTypeSize); }
+
+  // Per-token combine token-region bytes (the quantized payload, excluding scales/weights/index).
+  // FP4 blockwise packs two E2M1 values per byte, so its slot is half the FP8 (1 byte/elem) size;
+  // FP8 blockwise and other paths keep the existing element sizing. Used by both the host staging
+  // allocator and the intra-node kernel so the slot stride stays consistent.
+  inline __host__ __device__ size_t CombineTokenRegionBytes() const {
+    if (quantType == QuantType::Fp4BlockwiseQuant) return (static_cast<size_t>(hiddenDim) + 1) / 2;
+    return HiddenBytes(maxTokenTypeSize);
+  }
 
   inline __host__ __device__ size_t IndexBytes() const {
     return numExpertPerToken * sizeof(index_t);

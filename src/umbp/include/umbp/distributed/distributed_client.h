@@ -65,6 +65,7 @@ class DistributedClient : public IUMBPClient {
   bool Flush() override;
   void Close() override;
   bool IsDistributed() const override;
+  UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Distributed; }
 
   bool RegisterMemory(uintptr_t ptr, size_t size) override;
   void DeregisterMemory(uintptr_t ptr) override;

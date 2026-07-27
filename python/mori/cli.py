@@ -94,10 +94,11 @@ def _cmd_setup(rest: List[str]) -> int:
 
     ``env_setup.sh`` does two things:
 
-    1. Configures PFC / DSCP / DCQCN on the ionic NICs via ``sudo
-       nicctl``. These are system-side changes that persist beyond the
-       calling process — running the script as a normal subprocess is
-       sufficient.
+    1. Configures PFC / DSCP / DCQCN on the detected NICs (ionic via
+       ``nicctl``, bnxt via ``dcb``/configfs, mlx5 via ``mlnx_qos``/
+       ``mlxconfig``). These are system-side changes that persist beyond
+       the calling process — running the script as a normal subprocess
+       is sufficient.
     2. Exports ``MORI_RDMA_SL`` / ``MORI_RDMA_TC`` for the calling
        shell. A Python entry point cannot mutate its parent shell's
        environment, so getting these into your current shell requires
@@ -110,18 +111,23 @@ def _cmd_setup(rest: List[str]) -> int:
 
     ``mori setup --path``: print only the absolute path, suitable for
     shell substitution: ``source $(mori setup --path)``.
+
+    Ionic/Pollara QoS parameters are read from ``~/.mori/mori.conf``. On the
+    first setup of an Ionic host, the bundled template is copied there.
+    ``--config`` selects another path.
     """
     parser = argparse.ArgumentParser(
         prog="mori setup",
         description=(
-            "Run env_setup.sh to configure PFC / DSCP / DCQCN on ionic NICs. "
-            "To also pick up the exported MORI_RDMA_SL / MORI_RDMA_TC variables "
-            "in your current shell, source the script instead: "
-            "`source $(mori setup --path)`."
+            "Run env_setup.sh to configure PFC / DSCP / DCQCN on the detected "
+            "ionic/bnxt/mlx5 NICs. To also pick up the exported MORI_RDMA_SL / "
+            "MORI_RDMA_TC variables in your current shell, source the script "
+            "instead: `source $(mori setup --path)`."
         ),
         epilog=(
             "Examples:\n"
             "    mori setup                   # apply NIC config (env vars do NOT persist)\n"
+            "    mori setup --config FILE     # use an explicit Ionic QoS config\n"
             "    source $(mori setup --path)  # apply NIC config AND export MORI_RDMA_SL/TC\n"
             "    mori setup --path            # print only the absolute script path\n"
         ),
@@ -133,6 +139,14 @@ def _cmd_setup(rest: List[str]) -> int:
         help=(
             "print only the absolute path of env_setup.sh and exit "
             "(use with `source $(mori setup --path)` to export env vars)"
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        metavar="FILE",
+        help=(
+            "Ionic QoS configuration path (default: ~/.mori/mori.conf; "
+            "created from the bundled template on first use)"
         ),
     )
     ns = parser.parse_args(rest)
@@ -151,7 +165,10 @@ def _cmd_setup(rest: List[str]) -> int:
         "source $(mori setup --path))",
         file=sys.stderr,
     )
-    return _run_script("setup", [])
+    script_args = []
+    if ns.config:
+        script_args.extend(["--config", str(Path(ns.config).expanduser())])
+    return _run_script("setup", script_args)
 
 
 def _cmd_path(rest: List[str]) -> int:

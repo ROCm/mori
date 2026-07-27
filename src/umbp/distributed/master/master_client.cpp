@@ -382,15 +382,17 @@ namespace {
 // Auto-flush the heartbeat once this many KvEvents accumulate at the peer, so a
 // completed batch of puts becomes visible at the master without the application
 // calling FlushHeartbeat().  Defaults to one typical put batch (128 keys).  An
-// unset / unparseable / zero value falls back to the default; to make auto-flush
-// effectively never trigger, set it to a very large number.
+// unset / unparseable value falls back to the default.  An explicit `0`
+// disables auto-flush entirely (ADDs then only ship on the heartbeat interval
+// or an explicit Flush()); to keep auto-flush enabled but effectively never
+// trigger on size, set it to a very large number instead.
 size_t AutoFlushEventThreshold() {
   static const size_t v = [] {
     const char* e = std::getenv("UMBP_AUTO_FLUSH_EVENT_THRESHOLD");
     if (e == nullptr) return size_t{128};
     char* end = nullptr;
     unsigned long long n = std::strtoull(e, &end, 10);
-    if (end == e || n == 0) return size_t{128};
+    if (end == e) return size_t{128};  // unparseable -> default; 0 passes through as "disabled"
     return static_cast<size_t>(n);
   }();
   return v;

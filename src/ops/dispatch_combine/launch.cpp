@@ -514,57 +514,54 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
   unsigned int block_x = WARP_SIZE * wpb;
   const bool hasWeights = (weights != nullptr);
   int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
-                                handle.config.quantType == QuantType::Fp8BlockwiseQuant,
+                                IsBlockwiseCombineQuant(handle.config.quantType),
                                 /*use_weight_ptrs=*/true);
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(dtype);
   auto& reg = KernelRegistry::Instance();
   int mp = handle.multiProcessorCount;
 
-  if (args.config.quantType == QuantType::Fp8BlockwiseQuant &&
+  if (IsBlockwiseCombineQuant(args.config.quantType) &&
       handle.config.kernelType != KernelType::IntraNode) {
-    throw std::runtime_error("Fp8BlockwiseQuant currently only supports IntraNode combine");
+    throw std::runtime_error("Blockwise combine quant currently only supports IntraNode combine");
   }
 
   switch (handle.config.kernelType) {
     case KernelType::IntraNode:
-      if (args.config.quantType == QuantType::Fp8BlockwiseQuant) {
+      if (IsBlockwiseCombineQuant(args.config.quantType)) {
+        const bool isFp4 = (args.config.quantType == QuantType::Fp4BlockwiseQuant);
         if (dtype != HIP_R_16BF) {
-          throw std::runtime_error("Fp8BlockwiseQuant currently only supports bf16 input");
+          throw std::runtime_error("Blockwise combine quant currently only supports bf16 input");
         }
         if (!args.config.useExternalInpBuffer) {
           throw std::runtime_error(
-              "Fp8BlockwiseQuant currently requires --zero-copy 0 "
+              "Blockwise combine quant currently requires --zero-copy 0 "
               "(useExternalInpBuffer=true)");
         }
         const int fp8ScaleDim = args.fp8BlockwiseCombineScaleDim;
         if (fp8ScaleDim <= 0) {
-          throw std::runtime_error("Fp8BlockwiseQuant requires internal combine scaleDim > 0");
+          throw std::runtime_error(
+              "Blockwise combine quant requires internal combine scaleDim > 0");
         }
         // Pick the AccumNum=8/9 + VecBytes=8 specialization when (no weights, hidden_dim % 512 ==
         // 0, top-k in {8,9}, EP > 4) and block_elems matches a registered symbol. top-k==9 covers
-        // shared-expert fusion (8 routed + 1 fused shared). Keep in sync with the Python launch
-        // path in dispatch_combine.py.
+        // shared-expert fusion (8 routed + 1 fused shared). The FP4 variants ("fp4bwq") share the
+        // exact launch config as FP8 ("fp8bwq"); only the in-kernel codec differs. Keep in sync
+        // with the Python launch path in dispatch_combine.py.
         const int block_elems = (args.config.hiddenDim + fp8ScaleDim - 1) / fp8ScaleDim;
         const bool baseVec8Top8Eligible =
             !hasWeights && (args.config.hiddenDim % 512 == 0) &&
             (args.config.numExpertPerToken == 8 || args.config.numExpertPerToken == 9) &&
             args.config.worldSize > 4;
         const bool top9 = (args.config.numExpertPerToken == 9);
-        const char* kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq";
+        const std::string bwq = isFp4 ? "fp4bwq" : "fp8bwq";
+        const std::string prefix = "EpCombineIntraNodeKernel_bf16_nop2p_";
+        std::string kernel_name = prefix + bwq;
         bool useVec8Top8 = false;
-        if (baseVec8Top8Eligible) {
-          if (block_elems == 128) {
-            kernel_name =
-                top9 ? "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8_top9"
-                     : "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8";
-            useVec8Top8 = true;
-          } else if (block_elems == 256) {
-            kernel_name =
-                top9 ? "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8_top9"
-                     : "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8";
-            useVec8Top8 = true;
-          }
+        if (baseVec8Top8Eligible && (block_elems == 128 || block_elems == 256)) {
+          kernel_name = prefix + bwq + "_noweight_block" + std::to_string(block_elems) + "_vec8" +
+                        (top9 ? "_top9" : "");
+          useVec8Top8 = true;
         }
         int fp8bwq_smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
                                              /*use_scale_ptrs=*/true,
@@ -660,7 +657,7 @@ void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num, int warp_
 
   unsigned int block_x = WARP_SIZE * wpb;
   int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
-                                handle.config.quantType == QuantType::Fp8BlockwiseQuant);
+                                IsBlockwiseCombineQuant(handle.config.quantType));
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(handle.inputType);
 

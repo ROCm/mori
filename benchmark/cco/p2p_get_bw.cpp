@@ -98,6 +98,70 @@ __global__ void ibgda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   gda.flush(ccoCoopBlock{});
 }
 
+// SDMA thread scope: one thread per SDMA queue pulls its slice each iteration;
+// quiet drains completion at the end. Each slice is issued as `depth` sub-copies:
+// with agg the doorbell is suppressed and one commit() rings the batch.
+__global__ void sdma_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
+                            ccoDevComm devComm, int peerLsa, int iter, int depth, bool agg) {
+  ccoSdma sdma{devComm};
+  const int nq = devComm.sdma.sdmaNumQueue;
+  const int q = threadIdx.x;
+  if (q >= nq) return;
+  const size_t total = len_doubles * sizeof(double);
+  const size_t per = total / static_cast<size_t>(nq);
+  const size_t off = static_cast<size_t>(q) * per;
+  const size_t bytes = (q == nq - 1) ? (total - off) : per;
+  const uint32_t flags = agg ? ccoSdmaOptFlagsAggregate : ccoSdmaOptFlagsDefault;
+  const size_t sub = bytes / static_cast<size_t>(depth);
+  for (int i = 0; i < iter; i++) {
+    for (int j = 0; j < depth; j++) {
+      const size_t so = static_cast<size_t>(j) * sub;
+      const size_t sb = (j == depth - 1) ? (bytes - so) : sub;
+      if (sb == 0) continue;  // bytes < depth: skip empty sub-copies (no 0-byte packet)
+      sdma.get(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), off + so,
+               reinterpret_cast<ccoWindow_t>(sendWin), off + so, sb, q, flags);
+    }
+    if (agg) sdma.commit(peerLsa, q);
+  }
+  sdma.quietQueue(peerLsa, q);
+}
+
+// SDMA warp scope: one warp drives all SDMA queues via warp-scope gets that split
+// the transfer across the queue set (one lane per queue). `depth` sub-copies per
+// iteration; with agg one commit() rings all queues, else each warp get rings.
+__global__ void sdma_get_bw_warp(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
+                                 size_t len_doubles, ccoDevComm devComm, int peerLsa, int iter,
+                                 int depth, bool agg) {
+  ccoSdma sdma{devComm};
+  const size_t total = len_doubles * sizeof(double);
+  const uint32_t flags = agg ? ccoSdmaOptFlagsAggregate : ccoSdmaOptFlagsDefault;
+  const size_t sub = total / static_cast<size_t>(depth);
+  for (int i = 0; i < iter; i++) {
+    for (int j = 0; j < depth; j++) {
+      const size_t so = static_cast<size_t>(j) * sub;
+      const size_t sb = (j == depth - 1) ? (total - so) : sub;
+      if (sb == 0) continue;  // total < depth: skip empty sub-copies (no 0-byte packet)
+      sdma.get<ccoCoopWarp>(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), so,
+                            reinterpret_cast<ccoWindow_t>(sendWin), so, sb, 0, flags);
+    }
+    if (agg) sdma.commit<ccoCoopWarp>(peerLsa);
+  }
+  sdma.quiet<ccoCoopWarp>(peerLsa);
+}
+
+static void launch_sdma(PutScope scope, ccoWindow_t sendWin, ccoWindow_t recvWin,
+                        size_t len_doubles, ccoDevComm devComm, int peerLsa, int count,
+                        int warp_size, int depth, bool agg) {
+  const int nq = devComm.sdma.sdmaNumQueue;
+  if (scope == PutScope::kWarp) {
+    hipLaunchKernelGGL(sdma_get_bw_warp, dim3(1), dim3(warp_size), 0, 0, sendWin, recvWin,
+                       len_doubles, devComm, peerLsa, count, depth, agg);
+  } else {
+    hipLaunchKernelGGL(sdma_get_bw, dim3(1), dim3(nq), 0, 0, sendWin, recvWin, len_doubles, devComm,
+                       peerLsa, count, depth, agg);
+  }
+}
+
 static void launch_lsa(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,
                        ccoWindow_t recvWin, unsigned int* counter_d, size_t len_doubles,
                        int peerLsa, int count, int warp_size) {
@@ -165,7 +229,9 @@ int main(int argc, char** argv) {
     if (size_bytes % sizeof(double) != 0) continue;
     const size_t len_doubles = size_bytes / sizeof(double);
 
-    if (!size_ok(args.put_scope, size_bytes, args.nblocks, args.threads_per_block,
+    // SDMA splits by queue count and handles uneven tails in-kernel (see put_bw).
+    if (args.transport != Transport::kSdma &&
+        !size_ok(args.put_scope, size_bytes, args.nblocks, args.threads_per_block,
                  ctx.device_warp_size)) {
       if (my_pe == 0) table.push_back(PerfTableRow{size_bytes, true, 0.0});
       ccoBarrierAll(ctx.comm);
@@ -174,7 +240,11 @@ int main(int argc, char** argv) {
 
     if (run_kernels) {
       const float ms = RunWarmupAndTimed(res, args.warmup, args.iters, [&](int count) {
-        if (args.transport == Transport::kLsa) {
+        if (args.transport == Transport::kSdma) {
+          launch_sdma(args.put_scope, ctx.send_win, ctx.recv_win, len_doubles, ctx.devComm,
+                      ctx.peer_lsa_rank, count, ctx.device_warp_size, args.agg_depth,
+                      args.aggregate);
+        } else if (args.transport == Transport::kLsa) {
           launch_lsa(args.put_scope, grid, block, ctx.send_win, ctx.recv_win, res.counter_d,
                      len_doubles, ctx.peer_lsa_rank, count, ctx.device_warp_size);
         } else {
@@ -194,10 +264,25 @@ int main(int argc, char** argv) {
 
   ccoBarrierAll(ctx.comm);
   if (my_pe == 0) {
-    PrintPerfTable("p2p_get_bw unidirection", TransportToChar(args.transport),
-                   ScopeToChar(args.put_scope), args.nblocks, args.threads_per_block,
-                   ctx.device_warp_size, args.iters, args.warmup, PerfTableMetric::kBandwidthGbps,
-                   table);
+    // SDMA parallelism is the queue count; see put_bw. thread scope → 1×nq
+    // threads (one message per queue); warp scope → a single warp fanning the
+    // whole transfer across the queues.
+    int print_grid = args.nblocks;
+    int print_block = args.threads_per_block;
+    const char* print_scope = ScopeToChar(args.put_scope);
+    if (args.transport == Transport::kSdma) {
+      print_grid = 1;
+      if (args.put_scope == PutScope::kWarp) {
+        print_block = ctx.device_warp_size;
+        print_scope = "warp";
+      } else {
+        print_block = static_cast<int>(ctx.devComm.sdma.sdmaNumQueue);
+        print_scope = "thread";
+      }
+    }
+    PrintPerfTable("p2p_get_bw unidirection", TransportToChar(args.transport), print_scope,
+                   print_grid, print_block, ctx.device_warp_size, args.iters, args.warmup,
+                   PerfTableMetric::kBandwidthGbps, table);
   }
 
   if (run_kernels) {

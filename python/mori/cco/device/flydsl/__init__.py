@@ -42,7 +42,7 @@ Example (inside ``@flyc.kernel``)::
 """
 
 from mori.cco.device.bitcode import find_cco_bitcode, get_bitcode_path
-from .handles import DevComm, Window, Gda, CoopScope, SignalOp, ThreadMode
+from .handles import DevComm, Window, Gda, CoopScope, SignalOp, ThreadMode, Sdma
 from . import _bindings
 
 __all__ = [
@@ -55,4 +55,5 @@ __all__ = [
     "find_cco_bitcode",
     "get_bitcode_path",
     "_bindings",
+    "Sdma",
 ]

@@ -276,6 +276,111 @@ class Gda:
 
 
 @cco_struct
+class Sdma:
+    dev_comm: fx.Int64
+
+    def _xfer(
+        self,
+        op,
+        peer,
+        dst_win,
+        dst_off,
+        src_win,
+        src_off,
+        nbytes,
+        qid,
+        coop,
+        signal,
+        aggregate,
+    ):
+        # coop/signal are compile-time; "_ns" (no-signal) is fire-and-forget and
+        # cannot be drained by quiet. aggregate skips the doorbell — call commit().
+        tag = _COOP_TAG[_const(coop, "coop")]
+        if not signal:
+            tag += "_ns"
+        flags = 1 if aggregate else 0
+        raw.SDMA_XFER[f"{op}__{tag}"](
+            self.dev_comm,
+            peer,
+            _win(dst_win),
+            dst_off,
+            _win(src_win),
+            src_off,
+            nbytes,
+            qid,
+            flags,
+        )
+
+    def put(
+        self,
+        peer,
+        dst_win,
+        dst_off,
+        src_win,
+        src_off,
+        nbytes,
+        qid,
+        *,
+        coop=CoopScope.THREAD,
+        signal=True,
+        aggregate=False,
+    ):
+        self._xfer(
+            "put",
+            peer,
+            dst_win,
+            dst_off,
+            src_win,
+            src_off,
+            nbytes,
+            qid,
+            coop,
+            signal,
+            aggregate,
+        )
+
+    def get(
+        self,
+        peer,
+        dst_win,
+        dst_off,
+        src_win,
+        src_off,
+        nbytes,
+        qid,
+        *,
+        coop=CoopScope.THREAD,
+        signal=True,
+        aggregate=False,
+    ):
+        self._xfer(
+            "get",
+            peer,
+            dst_win,
+            dst_off,
+            src_win,
+            src_off,
+            nbytes,
+            qid,
+            coop,
+            signal,
+            aggregate,
+        )
+
+    def commit(self, peer, qid=0, *, coop=CoopScope.THREAD):
+        """Ring the doorbell for aggregate=True ops (thread: queue `qid`; warp/block: all)."""
+        raw.SDMA_COMMIT[_COOP_TAG[_const(coop, "coop")]](self.dev_comm, peer, qid)
+
+    def quiet(self, peer, *, coop=CoopScope.THREAD):
+        """Wait for all outstanding SDMA ops to `peer` across every queue."""
+        raw.SDMA_QUIET[_COOP_TAG[_const(coop, "coop")]](self.dev_comm, peer)
+
+    def quiet_queue(self, peer, qid):
+        """Wait on a single (peer, queueId) queue only."""
+        raw.cco_sdma_quiet_queue(self.dev_comm, peer, qid)
+
+
+@cco_struct
 class DevComm:
     """Handle for a device-resident ``ccoDevComm``."""
 
@@ -300,3 +405,7 @@ class DevComm:
     def gda(self, ctx=0) -> Gda:
         """Build a GDA handle on this devComm for the given (compile-time) context index."""
         return Gda(dev_comm=self.ptr, ctx=ctx)
+
+    def sdma(self) -> Sdma:
+        """Build an SDMA handle on this devComm (LSA copy-engine put/get)."""
+        return Sdma(dev_comm=self.ptr)

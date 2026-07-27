@@ -14,7 +14,7 @@ from .cco cimport (
     CCO_GDA_CONNECTION_NONE, CCO_GDA_CONNECTION_FULL,
     CCO_GDA_CONNECTION_CROSSNODE, CCO_GDA_CONNECTION_RAIL,
     ccoGetUniqueId, ccoCommCreate, ccoCommDestroy,
-    ccoMemAlloc, ccoMemFree,
+    ccoMemAlloc, ccoMemImport, ccoMemFree,
     ccoWindowDeregister, ccoDevCommCreate, ccoDevCommDestroy,
     ccoDevCommCopyToDevice, ccoDevCommFreeDeviceCopy,
     ccoBarrierAll, ccoWindowRegister,
@@ -303,6 +303,22 @@ def mem_alloc(Comm comm, size_t size):
     return <intptr_t>ptr
 
 
+def mem_import(Comm comm, intptr_t external_ptr, size_t size):
+    """
+    Import an external HIP VMM allocation (e.g. a torch.symm_mem tensor buffer)
+    into this rank's flat-VA slot without allocating new physical memory. Returns
+    the local (flat-VA) pointer as intptr_t; it aliases the external buffer and can
+    be passed to window_register_ptr() and freed with mem_free().
+    """
+    cdef void* ptr = NULL
+    cdef int ret
+    with nogil:
+        ret = ccoMemImport(comm._ptr, <void*>external_ptr, size, &ptr)
+    if ret != 0:
+        raise RuntimeError(f"ccoMemImport failed: {ret}")
+    return <intptr_t>ptr
+
+
 def mem_free(Comm comm, intptr_t ptr):
     """Free symmetric GPU memory previously allocated by mem_alloc()."""
     cdef int ret
@@ -343,6 +359,25 @@ def window_register_ptr(Comm comm, intptr_t ptr, size_t size):
     if ret != 0:
         raise RuntimeError(f"ccoWindowRegister (ptr) failed: {ret}")
     return <intptr_t>win
+
+
+def window_register_external(Comm comm, intptr_t external_ptr, size_t size):
+    """
+    Overload C: import an EXTERNAL HIP VMM allocation (e.g. a torch.symm_mem
+    tensor buffer) into the flat LSA space and register it as a window in one call.
+    Collective — all ranks call in the same order with the same size.
+
+    Returns (win: intptr_t, local_ptr: intptr_t), where local_ptr is the flat-VA
+    alias of the external buffer.
+    """
+    cdef ccoWindow_t win = NULL
+    cdef void* local_ptr = NULL
+    cdef int ret
+    with nogil:
+        ret = ccoWindowRegister(comm._ptr, <void*>external_ptr, size, &win, &local_ptr)
+    if ret != 0:
+        raise RuntimeError(f"ccoWindowRegister (external) failed: {ret}")
+    return (<intptr_t>win, <intptr_t>local_ptr)
 
 
 def window_deregister(Comm comm, intptr_t win):

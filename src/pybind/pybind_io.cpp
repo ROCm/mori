@@ -29,6 +29,13 @@
 namespace py = pybind11;
 
 namespace mori {
+namespace io {
+// Fabric allocation helpers (defined in src/io/fabric/backend_impl.cpp).
+// Forward-declared here to avoid pulling internal backend headers into pybind.
+void* FabricMalloc(size_t size, int device);
+void FabricFree(void* ptr);
+}  // namespace io
+
 void RegisterMoriIo(pybind11::module_& m) {
   m.def("set_log_level", &mori::io::SetLogLevel);
 
@@ -37,6 +44,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .value("XGMI", mori::io::BackendType::XGMI)
       .value("RDMA", mori::io::BackendType::RDMA)
       .value("TCP", mori::io::BackendType::TCP)
+      .value("FABRIC", mori::io::BackendType::FABRIC)
       .export_values();
 
   py::enum_<mori::io::MemoryLocationType>(m, "MemoryLocationType")
@@ -89,6 +97,23 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def(py::init<int, int>(), py::arg("num_streams") = 64, py::arg("num_events") = 64)
       .def_readwrite("num_streams", &mori::io::XgmiBackendConfig::numStreams)
       .def_readwrite("num_events", &mori::io::XgmiBackendConfig::numEvents);
+
+  py::class_<mori::io::FabricBackendConfig, mori::io::BackendConfig>(m, "FabricBackendConfig")
+      .def(py::init<int, int>(), py::arg("num_streams") = 64, py::arg("num_events") = 64)
+      .def_readwrite("num_streams", &mori::io::FabricBackendConfig::numStreams)
+      .def_readwrite("num_events", &mori::io::FabricBackendConfig::numEvents);
+
+  // Allocate/free GPU memory that is exportable over a UALink super-node fabric.
+  // Returns the device pointer as an integer, suitable for register_memory().
+  m.def(
+      "fabric_alloc",
+      [](size_t size, int device) -> uintptr_t {
+        return reinterpret_cast<uintptr_t>(mori::io::FabricMalloc(size, device));
+      },
+      py::arg("size"), py::arg("device"));
+  m.def(
+      "fabric_free", [](uintptr_t ptr) { mori::io::FabricFree(reinterpret_cast<void*>(ptr)); },
+      py::arg("ptr"));
 
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
       .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)
@@ -193,7 +218,8 @@ void RegisterMoriIo(pybind11::module_& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("WaitAll", &mori::io::IOEngine::WaitAll, py::arg("statuses"), py::arg("timeout_ms") = -1,
            py::call_guard<py::gil_scoped_release>())
-      .def("LoadScatterGatherModule", &mori::io::IOEngine::LoadScatterGatherModule);
+      .def("LoadScatterGatherModule", &mori::io::IOEngine::LoadScatterGatherModule)
+      .def("LoadFabricCopyModule", &mori::io::IOEngine::LoadFabricCopyModule);
 }
 
 }  // namespace mori

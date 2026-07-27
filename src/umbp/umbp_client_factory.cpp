@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "umbp/distributed/distributed_client.h"
 #include "umbp/local/standalone_client.h"
+#include "umbp/standalone/standalone_process_client.h"
 #include "umbp/umbp_client.h"
 
 namespace mori::umbp {
@@ -28,6 +29,9 @@ namespace mori::umbp {
 std::unique_ptr<IUMBPClient> CreateUMBPClient(const UMBPConfig& config) {
   if (config.distributed.has_value()) {
     return std::make_unique<DistributedClient>(config);
+  }
+  if (config.standalone_process.has_value()) {
+    return std::make_unique<standalone::StandaloneProcessClient>(config);
   }
   return std::make_unique<StandaloneClient>(config);
 }

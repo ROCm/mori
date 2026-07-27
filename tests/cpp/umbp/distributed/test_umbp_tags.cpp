@@ -21,9 +21,9 @@
 // SOFTWARE.
 // Tests for the client-tag feature:
 //
-//  Suite 1 — ClientRegistryTagsTest
-//    Unit tests directly on ClientRegistry: verify tags are stored on
-//    RegisterClient and returned verbatim by GetClientTags.
+//  Suite 1 — ClientTagsTest
+//    Unit tests directly on InMemoryMasterMetadataStore: verify tags are stored
+//    on RegisterClient and returned verbatim by GetClientTags.
 //
 //  Suite 2 — MasterClientTagsE2ETest
 //    Integration test: MasterClient registers with tags via gRPC, the real
@@ -53,7 +53,7 @@
 
 #include "umbp.grpc.pb.h"
 #include "umbp/distributed/config.h"
-#include "umbp/distributed/master/client_registry.h"
+#include "umbp/distributed/master/in_memory_master_metadata_store.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_server.h"
 #include "umbp/distributed/types.h"
@@ -94,54 +94,77 @@ static bool WaitFor(std::function<bool()> pred, std::chrono::milliseconds timeou
 }
 
 // ---------------------------------------------------------------------------
-//  Suite 1: ClientRegistry unit tests (no gRPC)
+//  Suite 1: InMemoryMasterMetadataStore unit tests (no gRPC)
 // ---------------------------------------------------------------------------
 
-TEST(ClientRegistryTagsTest, TagsStoredOnRegister) {
-  ClientRegistry reg(ClientRegistryConfig{});
+// Build a registration for `node_id` carrying `tags`.  The merged store creates
+// client records through RegisterClient(ClientRegistration, now, stale_after),
+// replacing the old ClientRegistry::RegisterClient(node, addr, caps, ...) form.
+ClientRegistration MakeReg(const std::string& node_id, const std::string& node_address,
+                           std::vector<std::string> tags = {}) {
+  ClientRegistration reg;
+  reg.node_id = node_id;
+  reg.node_address = node_address;
+  reg.tags = std::move(tags);
+  return reg;
+}
+
+TEST(ClientTagsTest, TagsStoredOnRegister) {
+  InMemoryMasterMetadataStore store;
+  const auto now = std::chrono::system_clock::now();
   const std::vector<std::string> tags = {"sgl_role=prefill", "env=test"};
-  ASSERT_TRUE(reg.RegisterClient("n1", "127.0.0.1:9001", {}, /*peer=*/"",
-                                 /*engine=*/{}, tags));
-  EXPECT_EQ(reg.GetClientTags("n1"), tags);
+  ASSERT_TRUE(
+      store.RegisterClient(MakeReg("n1", "127.0.0.1:9001", tags), now, std::chrono::seconds{30}));
+  EXPECT_EQ(store.GetClientTags("n1"), tags);
 }
 
-TEST(ClientRegistryTagsTest, EmptyTagsReturnedForUnknownNode) {
-  ClientRegistry reg(ClientRegistryConfig{});
-  EXPECT_TRUE(reg.GetClientTags("ghost").empty());
+TEST(ClientTagsTest, EmptyTagsReturnedForUnknownNode) {
+  InMemoryMasterMetadataStore store;
+  EXPECT_TRUE(store.GetClientTags("ghost").empty());
 }
 
-TEST(ClientRegistryTagsTest, EmptyTagsWhenNoneProvided) {
-  ClientRegistry reg(ClientRegistryConfig{});
-  ASSERT_TRUE(reg.RegisterClient("n1", "127.0.0.1:9002", {}));
-  EXPECT_TRUE(reg.GetClientTags("n1").empty());
+TEST(ClientTagsTest, EmptyTagsWhenNoneProvided) {
+  InMemoryMasterMetadataStore store;
+  const auto now = std::chrono::system_clock::now();
+  ASSERT_TRUE(store.RegisterClient(MakeReg("n1", "127.0.0.1:9002"), now, std::chrono::seconds{30}));
+  EXPECT_TRUE(store.GetClientTags("n1").empty());
 }
 
-TEST(ClientRegistryTagsTest, TagsUnchangedByHeartbeat) {
-  ClientRegistry reg(ClientRegistryConfig{});
+TEST(ClientTagsTest, TagsUnchangedByHeartbeat) {
+  InMemoryMasterMetadataStore store;
+  const auto now = std::chrono::system_clock::now();
   const std::vector<std::string> tags = {"sgl_role=decode"};
-  ASSERT_TRUE(reg.RegisterClient("n1", "127.0.0.1:9003", {}, "", {}, tags));
+  ASSERT_TRUE(
+      store.RegisterClient(MakeReg("n1", "127.0.0.1:9003", tags), now, std::chrono::seconds{30}));
 
-  uint64_t acked = 0;
-  bool request_full_sync = false;
-  reg.Heartbeat("n1", {}, {}, /*is_full_sync=*/false, 0, &acked, &request_full_sync);
+  ASSERT_EQ(store
+                .ApplyHeartbeat("n1", /*seq=*/1, now, /*caps=*/{}, /*events=*/{},
+                                /*is_full_sync=*/false)
+                .status,
+            HeartbeatResult::APPLIED);
 
-  EXPECT_EQ(reg.GetClientTags("n1"), tags);
+  EXPECT_EQ(store.GetClientTags("n1"), tags);
 }
 
-TEST(ClientRegistryTagsTest, TagsClearedAfterUnregister) {
-  ClientRegistry reg(ClientRegistryConfig{});
-  ASSERT_TRUE(reg.RegisterClient("n1", "127.0.0.1:9004", {}, "", {}, {"sgl_role=prefill"}));
-  reg.UnregisterClient("n1");
-  EXPECT_TRUE(reg.GetClientTags("n1").empty());
+TEST(ClientTagsTest, TagsClearedAfterUnregister) {
+  InMemoryMasterMetadataStore store;
+  const auto now = std::chrono::system_clock::now();
+  ASSERT_TRUE(store.RegisterClient(MakeReg("n1", "127.0.0.1:9004", {"sgl_role=prefill"}), now,
+                                   std::chrono::seconds{30}));
+  store.UnregisterClient("n1");
+  EXPECT_TRUE(store.GetClientTags("n1").empty());
 }
 
-TEST(ClientRegistryTagsTest, MultipleNodesHaveIndependentTags) {
-  ClientRegistry reg(ClientRegistryConfig{});
-  ASSERT_TRUE(reg.RegisterClient("p", "127.0.0.1:9005", {}, "", {}, {"sgl_role=prefill"}));
-  ASSERT_TRUE(reg.RegisterClient("d", "127.0.0.1:9006", {}, "", {}, {"sgl_role=decode"}));
+TEST(ClientTagsTest, MultipleNodesHaveIndependentTags) {
+  InMemoryMasterMetadataStore store;
+  const auto now = std::chrono::system_clock::now();
+  ASSERT_TRUE(store.RegisterClient(MakeReg("p", "127.0.0.1:9005", {"sgl_role=prefill"}), now,
+                                   std::chrono::seconds{30}));
+  ASSERT_TRUE(store.RegisterClient(MakeReg("d", "127.0.0.1:9006", {"sgl_role=decode"}), now,
+                                   std::chrono::seconds{30}));
 
-  EXPECT_EQ(reg.GetClientTags("p"), std::vector<std::string>{"sgl_role=prefill"});
-  EXPECT_EQ(reg.GetClientTags("d"), std::vector<std::string>{"sgl_role=decode"});
+  EXPECT_EQ(store.GetClientTags("p"), std::vector<std::string>{"sgl_role=prefill"});
+  EXPECT_EQ(store.GetClientTags("d"), std::vector<std::string>{"sgl_role=decode"});
 }
 
 // ---------------------------------------------------------------------------
@@ -282,7 +305,7 @@ TEST_F(MasterClientTagsE2ETest, EmptyTagsSentWhenNoneConfigured) {
 // Verify that MasterClient::AddCounter forwards labels to the server and
 // that a capturing server would see the node label.  The real tag-injection
 // into ReportMetrics base labels is exercised in the real-MasterServer suite
-// below because CapturingMasterService doesn't run ClientRegistry.
+// below because CapturingMasterService doesn't run the master metadata store.
 TEST_F(MasterClientTagsE2ETest, ReportMetricsCarriesNodeId) {
   setenv("UMBP_METRICS_REPORT_INTERVAL_MS", "50", 1);
   client_ = std::make_unique<MasterClient>(MakeConfig({"sgl_role=decode"}));

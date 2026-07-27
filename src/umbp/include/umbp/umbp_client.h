@@ -35,6 +35,12 @@
 
 namespace mori::umbp {
 
+enum class UMBPDeploymentMode : int {
+  Local = 0,
+  StandaloneProcess = 1,
+  Distributed = 2,
+};
+
 /// Abstract interface for UMBP storage clients.
 ///
 /// Two implementations exist behind this interface:
@@ -106,6 +112,11 @@ class IUMBPClient {
 
   /// Returns true when the client operates in distributed (master-led) mode.
   virtual bool IsDistributed() const = 0;
+
+  /// Returns the concrete deployment mode behind this client.
+  virtual UMBPDeploymentMode GetDeploymentMode() const {
+    return IsDistributed() ? UMBPDeploymentMode::Distributed : UMBPDeploymentMode::Local;
+  }
 
   // ---- Optional zero-copy hooks ----
   //

@@ -121,11 +121,14 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
                       size_t perRankVmmSize, ccoComm** outComm) nogil
     int ccoCommDestroy(ccoComm* comm) nogil
     int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) nogil
+    int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) nogil
     int ccoMemFree(ccoComm* comm, void* ptr) nogil
     int ccoWindowRegister(ccoComm* comm, size_t size,
                           ccoWindow_t* outWin, void** outLocalPtr) nogil
     int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size,
                           ccoWindow_t* outWin) nogil
+    int ccoWindowRegister(ccoComm* comm, void* externalPtr, size_t size,
+                          ccoWindow_t* outWin, void** outLocalPtr) nogil
     int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) nogil
     int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs,
                          ccoDevComm* outDevComm) nogil

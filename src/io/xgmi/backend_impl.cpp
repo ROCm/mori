@@ -792,8 +792,25 @@ void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
     return;
   }
 
+  // hipIpcGetMemHandle is keyed to the *base* of the underlying allocation, not
+  // to an interior pointer. When `data` is a sub-region (e.g. a per-layer view
+  // of one paged KV-cache allocation), resolve the allocation base and record
+  // the offset so the importing side can reconstruct the exact remote address.
+  void* allocBase = reinterpret_cast<void*>(desc.data);
+  size_t allocSize = 0;
+  hipError_t rangeErr =
+      hipMemGetAddressRange(reinterpret_cast<hipDeviceptr_t*>(&allocBase), &allocSize,
+                            reinterpret_cast<hipDeviceptr_t>(desc.data));
+  if (rangeErr == hipSuccess && allocBase != nullptr) {
+    desc.ipcOffset = desc.data - reinterpret_cast<uintptr_t>(allocBase);
+  } else {
+    (void)hipGetLastError();
+    allocBase = reinterpret_cast<void*>(desc.data);
+    desc.ipcOffset = 0;
+  }
+
   hipIpcMemHandle_t handle;
-  hipError_t err = hipIpcGetMemHandle(&handle, reinterpret_cast<void*>(desc.data));
+  hipError_t err = hipIpcGetMemHandle(&handle, allocBase);
   if (err != hipSuccess) {
     MORI_IO_WARN("XGMI: Failed to get IPC handle for memory id={}: {}", desc.id,
                  hipGetErrorString(err));
@@ -805,7 +822,8 @@ void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
 
   std::unique_lock<std::shared_mutex> lock(ipcMutex);
   localIpcHandles[desc.id] = handle;
-  MORI_IO_TRACE("XGMI: Registered memory id={}, addr={}, size={}", desc.id, desc.data, desc.size);
+  MORI_IO_TRACE("XGMI: Registered memory id={}, addr={}, size={}, ipcOffset={}", desc.id, desc.data,
+                desc.size, desc.ipcOffset);
 }
 
 void XgmiBackend::DeregisterMemory(const MemoryDesc& desc) {
@@ -817,15 +835,19 @@ void XgmiBackend::DeregisterMemory(const MemoryDesc& desc) {
 
 void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId) {
   if (desc.engineKey == myEngKey) {
+    // Same process: desc.data is already a valid local VA (offset baked in).
     return reinterpret_cast<void*>(desc.data);
   }
 
+  // hipIpcOpenMemHandle remaps the *allocation base*; reconstruct the exact
+  // remote address by adding the registered sub-region's offset within that
+  // allocation (desc.ipcOffset, 0 for whole-allocation registrations).
   IpcCacheKey cacheKey{desc.engineKey, desc.id, localDeviceId};
   {
     std::shared_lock<std::shared_mutex> rlock(ipcMutex);
     auto it = remoteIpcHandles.find(cacheKey);
     if (it != remoteIpcHandles.end() && it->second.remappedAddr != nullptr) {
-      return it->second.remappedAddr;
+      return static_cast<char*>(it->second.remappedAddr) + desc.ipcOffset;
     }
   }
 
@@ -841,8 +863,8 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
     return nullptr;
   }
 
-  void* remappedAddr = nullptr;
-  err = hipIpcOpenMemHandle(&remappedAddr, handle, hipIpcMemLazyEnablePeerAccess);
+  void* remappedBase = nullptr;
+  err = hipIpcOpenMemHandle(&remappedBase, handle, hipIpcMemLazyEnablePeerAccess);
   if (err != hipSuccess) {
     hipError_t clearErr = hipGetLastError();
     if (clearErr != hipSuccess) {
@@ -860,10 +882,10 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
   }
 
   std::unique_lock<std::shared_mutex> wlock(ipcMutex);
-  remoteIpcHandles[cacheKey] = {handle, remappedAddr, desc.size};
-  MORI_IO_TRACE("XGMI: Opened IPC handle for id={} on device {}, remapped={}", desc.id,
-                localDeviceId, reinterpret_cast<uintptr_t>(remappedAddr));
-  return remappedAddr;
+  remoteIpcHandles[cacheKey] = {handle, remappedBase, desc.size};
+  MORI_IO_TRACE("XGMI: Opened IPC handle for id={} on device {}, base={}, ipcOffset={}", desc.id,
+                localDeviceId, reinterpret_cast<uintptr_t>(remappedBase), desc.ipcOffset);
+  return static_cast<char*>(remappedBase) + desc.ipcOffset;
 }
 
 void XgmiBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,

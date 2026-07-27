@@ -39,6 +39,21 @@ class RouteGetStrategy {
   /// @param node_id    The requesting client's node_id (for locality-aware strategies).
   /// @return           The chosen Location to read from.
   virtual Location Select(const std::vector<Location>& locations, const std::string& node_id) = 0;
+
+  /// Batched form of Select: choose one replica per key in a single virtual
+  /// call.  The router uses this on the BatchRouteGet hot path so a batch of N
+  /// keys costs one virtual dispatch instead of N — the shipped strategies
+  /// override it with a tight internal loop that avoids per-key dispatch.
+  /// @param per_key_locations  One candidate list per key, in request order.
+  ///        An empty list means the key has no routable replica: Select is NOT
+  ///        invoked for it and the corresponding output is a default-constructed
+  ///        Location the caller must treat as "not routed".
+  /// @param node_id            The requesting client's node_id.
+  /// @return  One Location per input entry (same size and order as input).
+  /// The default implementation loops over Select(); subclasses that only
+  /// implement Select() keep working unchanged.
+  virtual std::vector<Location> BatchSelect(
+      const std::vector<std::vector<Location>>& per_key_locations, const std::string& node_id);
 };
 
 /// Default strategy: uniform random selection among replicas.
@@ -46,6 +61,8 @@ class RouteGetStrategy {
 class RandomRouteGetStrategy : public RouteGetStrategy {
  public:
   Location Select(const std::vector<Location>& locations, const std::string& node_id) override;
+  std::vector<Location> BatchSelect(const std::vector<std::vector<Location>>& per_key_locations,
+                                    const std::string& node_id) override;
 };
 
 /// Tier-priority strategy: prefer the fastest tier present (HBM > DRAM > SSD),
@@ -55,6 +72,8 @@ class RandomRouteGetStrategy : public RouteGetStrategy {
 class TierPriorityRouteGetStrategy : public RouteGetStrategy {
  public:
   Location Select(const std::vector<Location>& locations, const std::string& node_id) override;
+  std::vector<Location> BatchSelect(const std::vector<std::vector<Location>>& per_key_locations,
+                                    const std::string& node_id) override;
 };
 
 }  // namespace mori::umbp

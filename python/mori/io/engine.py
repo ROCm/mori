@@ -22,6 +22,7 @@
 from mori import cpp as mori_cpp
 import torch
 import ctypes
+import warnings
 
 _PyCapsule_New = ctypes.pythonapi.PyCapsule_New
 _PyCapsule_New.restype = ctypes.py_object
@@ -95,11 +96,15 @@ class IOEngine:
                 config = mori_cpp.RdmaBackendConfig()
             elif type is mori_cpp.BackendType.XGMI:
                 config = mori_cpp.XgmiBackendConfig()
+            elif type is mori_cpp.BackendType.FABRIC:
+                config = mori_cpp.FabricBackendConfig()
             else:
                 raise NotImplementedError("backend not implemented yet")
         result = self._engine.CreateBackend(type, config)
         if type is mori_cpp.BackendType.XGMI:
             self._load_scatter_gather_kernel()
+        elif type is mori_cpp.BackendType.FABRIC:
+            self._load_fabric_copy_kernel()
         return result
 
     def _load_scatter_gather_kernel(self):
@@ -110,6 +115,22 @@ class IOEngine:
             self._engine.LoadScatterGatherModule(hsaco_path)
         except Exception:
             pass
+
+    def _load_fabric_copy_kernel(self):
+        try:
+            from mori.io.fabric_copy_jit import ensure_fabric_copy_kernel
+
+            hsaco_path = ensure_fabric_copy_kernel()
+            self._engine.LoadFabricCopyModule(hsaco_path)
+        except Exception as e:
+            # Without this kernel, large FABRIC transfers fail (no memcpy fallback).
+            warnings.warn(
+                f"Failed to load fabric_copy kernel ({e}); FABRIC transfers "
+                "have no accelerated copy path and large transfers may fail. "
+                "Check that the fabric_copy kernel can be JIT-compiled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def remove_backend(self, type: mori_cpp.BackendType):
         return self._engine.RemoveBackend(type)

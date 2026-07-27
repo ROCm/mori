@@ -369,6 +369,7 @@ void RegisterMoriOps(py::module_& m) {
       .value("None_", mori::moe::QuantType::None)
       .value("Fp8DirectCast", mori::moe::QuantType::Fp8DirectCast)
       .value("Fp8BlockwiseQuant", mori::moe::QuantType::Fp8BlockwiseQuant)
+      .value("Fp4BlockwiseQuant", mori::moe::QuantType::Fp4BlockwiseQuant)
       .export_values();
 
   mori::pybind::RegisterAllProfilerSlots(m);

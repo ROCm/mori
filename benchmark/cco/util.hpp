@@ -27,6 +27,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -50,7 +51,8 @@ enum class PutScope { kThread, kWarp, kBlock, kThreadAgg };
 // disabled, use RDMA); explicitly disabled (0/false/off/no) → kLsa.
 //   kLsa   — intra-node flat-VA load/store (no NIC), requires same-node peer.
 //   kIbgda — cross-node one-sided RDMA via ccoGda<PrvdType>.
-enum class Transport { kLsa, kIbgda };
+//   kSdma  — intra-node SDMA copy-engine via ccoSdma; selected by MORI_ENABLE_SDMA.
+enum class Transport { kLsa, kIbgda, kSdma };
 
 inline constexpr std::size_t kDefaultMinSize = 8;
 inline constexpr std::size_t kDefaultMaxSize = 64ULL * 1024ULL * 1024ULL;
@@ -78,8 +80,18 @@ struct PerfArgs {
   int nblocks = kDefaultNumBlocks;
   int threads_per_block = kDefaultThreadsPerBlock;
   PutScope put_scope = PutScope::kBlock;
-  // Default IBGDA; overridden in PerfInit from MORI_DISABLE_P2P.
+  // Default IBGDA; overridden by the -t flag or, when -t is absent, in PerfInit
+  // from MORI_ENABLE_SDMA / MORI_DISABLE_P2P.
   Transport transport = Transport::kIbgda;
+  // Set when -t explicitly picks a transport: PerfInit then exports the matching
+  // env (MORI_ENABLE_SDMA / MORI_DISABLE_P2P) instead of auto-detecting.
+  bool transport_explicit = false;
+  // SDMA doorbell batching (bw kernels only). Each queue's per-iteration slice is
+  // posted as `agg_depth` sub-copies; without -a each rings (agg_depth doorbells),
+  // with -a they post via the Aggregate flag + one commit() (1 doorbell). Same
+  // bytes/iter either way, so the two runs isolate the doorbell cost.
+  bool aggregate = false;
+  int agg_depth = 1;
 };
 
 // Holds MPI + CCO state for the lifetime of a benchmark run. PerfInit registers
@@ -163,6 +175,8 @@ inline const char* TransportToChar(Transport t) {
       return "lsa";
     case Transport::kIbgda:
       return "ibgda";
+    case Transport::kSdma:
+      return "sdma";
   }
   return "none";
 }
