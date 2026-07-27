@@ -95,15 +95,9 @@ class _DeviceDeferredHostSyncWork(dist.distributed_c10d.Work):
     only on one). Bit-exact: the sync drains before the consumer reads.
     """
 
-    def __init__(
-        self,
-        stream: "torch.cuda.Stream",
-        collective=None,
-        event=None,
-    ) -> None:
+    def __init__(self, stream: "torch.cuda.Stream", event=None) -> None:
         super().__init__()
         self._stream = stream
-        self._collective = collective
         # Optional per-AG event: wait() host-blocks on THIS AG's completion event
         # instead of the whole ag_stream (avoids over-draining a FWD-prefetched
         # later AG on the same stream). Still a host fence -> bit-exact.
@@ -400,7 +394,7 @@ class MoriAllGather(AllGather):
                 # prefetched AG is queued) so wait() drains only L.
                 _ev = torch.cuda.Event()
                 _ev.record(stream)
-            return _DeviceDeferredHostSyncWork(stream, collective, _ev)
+            return _DeviceDeferredHostSyncWork(stream, _ev)
         if async_op:
             event = torch.cuda.Event()
             event.record(stream)
