@@ -1185,6 +1185,19 @@ struct ccoSdmaQueueDeviceHandle {
     return cur_index;
   }
 
+  // Fixed-size slot via a single atomic_fetch_add: no CAS retry, no wrap-pad
+  // branch, 16B-aligned. slotBytes must divide CCO_SDMA_QUEUE_SIZE.
+  __device__ __forceinline__ uint64_t ReserveSlot(uint64_t slotBytes) {
+    uint64_t base =
+        __hip_atomic_fetch_add(cachedWptr, slotBytes, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE) {
+      do {
+        cachedHwReadIndex = __hip_atomic_load(rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      } while ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE);
+    }
+    return base;
+  }
+
   template <typename PacketType>
   __device__ __forceinline__ void placePacket(PacketType& packet, uint64_t& pendingWptr,
                                               uint64_t offset) {
@@ -1212,15 +1225,14 @@ struct ccoSdmaQueueDeviceHandle {
   }
 
   __device__ __forceinline__ void submitPacket(uint64_t base, uint64_t pendingWptr) {
+    // In-order commit chain (free when uncontended: one matching load). A single
+    // s_waitcnt(0) publishes the packet dwords to SYSTEM scope before the
+    // doorbell ring; the spin/stores stay RELAXED (visibility is via the
+    // s_waitcnt, not fences) to avoid an acquire/release coherence storm when
+    // many issuers wait on the same committedWptr line.
     int retries = 0;
-    while (true) {
-      uint64_t val = __hip_atomic_load(committedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      __atomic_signal_fence(__ATOMIC_SEQ_CST);
-      if (val == base) {
-        break;
-      }
+    while (__hip_atomic_load(committedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != base) {
       __builtin_amdgcn_s_sleep(1);
-
       if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
         if (retries++ == CCO_SDMA_MAX_RETRIES) {
           __builtin_trap();  // submitPacket: retry limit exceeded
@@ -1229,25 +1241,11 @@ struct ccoSdmaQueueDeviceHandle {
       }
     }
     __builtin_amdgcn_s_waitcnt(0);
-    __builtin_amdgcn_wave_barrier();
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
-
     __hip_atomic_store(wptr, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-
-    __builtin_amdgcn_s_waitcnt(0);
-    __builtin_amdgcn_wave_barrier();
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-
     __hip_atomic_store(doorbell, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-
-    __builtin_amdgcn_s_waitcnt(0);
-    __builtin_amdgcn_wave_barrier();
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     __hip_atomic_store(committedWptr, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-
-    __builtin_amdgcn_s_waitcnt(0);
-    __builtin_amdgcn_wave_barrier();
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
   }
 
   // Queue resources
@@ -1273,24 +1271,33 @@ inline __device__ void ccoSdmaPostCopy(ccoSdmaQueueDeviceHandle** deviceHandles,
                                        size_t size, int qId, bool ring = true) {
   if (size == 0) return;
 
-  uint64_t offset = 0;
   ccoSdmaQueueDeviceHandle handle = **(deviceHandles + qId);
 
-  uint64_t startBase = handle.ReserveQueueSpace(sizeof(CCO_SDMA_PKT_COPY_LINEAR), offset);
-  uint64_t pendingWptr = startBase;
+  // One fixed 64B slot holds COPY (28B) + ATOMIC (32B) + a 4B NOP filler.
+  // Reserving it as a single unit keeps concurrent same-queue issuers from
+  // interleaving their packets (which would break submitPacket's chain), and
+  // the 16B-aligned slot (256KB queue is a multiple of 64) never straddles the
+  // wrap. Packet dwords are plain stores, published by submitPacket's
+  // s_waitcnt(0).
+  constexpr uint64_t kSlot = 64;
+  static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR) + sizeof(CCO_SDMA_PKT_ATOMIC) <= kSlot);
+  const uint64_t base = handle.ReserveSlot(kSlot);
+  uint32_t* q = handle.queueBuf + (handle.WrapIntoRing(base) / sizeof(uint32_t));
 
   auto packet_d = ccoCreateCopyPacket(srcPtr, dstPtr, size);
-  handle.template placePacket<CCO_SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, offset);
-
+  const uint32_t* pd = reinterpret_cast<const uint32_t*>(&packet_d);
+  for (int i = 0; i < 7; i++) q[i] = pd[i];
   if constexpr (Signal) {
-    pendingWptr = handle.ReserveQueueSpace(sizeof(CCO_SDMA_PKT_ATOMIC), offset);
-    HSAuint64* signal = signals + qId;
-    auto packet_s = ccoCreateAtomicIncPacket(signal);
-    handle.template placePacket<CCO_SDMA_PKT_ATOMIC>(packet_s, pendingWptr, offset);
-    expectedSignals[qId]++;
+    auto packet_s = ccoCreateAtomicIncPacket(signals + qId);
+    const uint32_t* ps = reinterpret_cast<const uint32_t*>(&packet_s);
+    for (int i = 0; i < 8; i++) q[7 + i] = ps[i];
+    q[15] = 0;  // NOP (op=0), engine skips
+    __hip_atomic_fetch_add(expectedSignals + qId, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  } else {
+    for (int i = 7; i < 16; i++) q[i] = 0;  // NOPs
   }
 
-  if (ring) handle.submitPacket(startBase, pendingWptr);
+  if (ring) handle.submitPacket(base, base + kSlot);
 }
 
 // Ring the doorbell for everything placed-but-not-rung on this queue.
