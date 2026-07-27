@@ -276,12 +276,6 @@ class HierAllGather:
         # K element-range chunks for the chunked-ring pipe-band path (byte-identical).
         slice_pipe_chunks = slice_pipe_chunks if slice_pipe_chunks is not None else 2
         self.slice_pipe_chunks = max(1, slice_pipe_chunks)
-        # Stream-ordered inter ring: on-device ShmemBarrierOnStream prepare/finish
-        # instead of host-blocking sync (removes 2 CPU<->GPU round-trips/op).
-        self.stream_ring = True
-        # Stream-ordered Phase-B finish_batch: paired with stream_ring the whole op
-        # runs on-stream with no host stall.
-        self.stream_intra = True
         # Defer the Phase-B finish fence to the next op's inter-prepare barrier.
         # Safe: copy-OUT is stream-ordered (output correct); cross-PE reuse is
         # covered by the successor's prepare/entry barrier; the last op reuses
@@ -789,7 +783,6 @@ class HierAllGather:
                 # prepare); side gathers are barrier-free, so no concurrent-global-
                 # barrier race. Cross-chunk ring reuse is ordered by chunk k+1's
                 # prepare_stream fence.
-                sr = self.stream_ring
                 for k in range(K):
                     ck = base_ck if k < K - 1 else count - base_ck * (K - 1)
                     if ck == 0:
@@ -799,14 +792,13 @@ class HierAllGather:
                     # copy-OUT into ``region``); its finish is deferred because the
                     # peer's chunk-k landing is fenced by the intra subgroup barrier
                     # on the first Phase-B gather below.
-                    _defer = sr
                     self._inter(
                         input_data[off : off + ck],
                         region,
                         ck,
                         stream,
-                        stream_ring=sr,
-                        defer_inter_fin=_defer,
+                        stream_ring=True,
+                        defer_inter_fin=True,
                     )
                     side.wait_stream(main)
                     # Cheap intra landing fence: arm only the first gather with the
@@ -824,14 +816,9 @@ class HierAllGather:
                     off += ck
                 # All gathers must land before the bulk copy-OUT reads them.
                 main.wait_stream(side)
-                if sr and self.stream_intra:
-                    self._intra.finish_batch_stream(
-                        output_data, N * block_count, stream=stream, barrier=True
-                    )
-                else:
-                    self._intra.finish_batch(
-                        output_data, N * block_count, stream=stream, barrier=True
-                    )
+                self._intra.finish_batch_stream(
+                    output_data, N * block_count, stream=stream, barrier=True
+                )
                 self._prev_op_completed = True
                 return True
             if (
@@ -852,8 +839,6 @@ class HierAllGather:
                 self.fuse_local
                 and self.slice_direct
                 and self.slice_fused
-                and self.stream_intra
-                and self.stream_ring
                 and self.slice_fuse_ib
             )
             if not overlap_active:
@@ -862,7 +847,7 @@ class HierAllGather:
                     collection,
                     count,
                     stream,
-                    stream_ring=self.stream_ring,
+                    stream_ring=True,
                     defer_inter_fin=self.slice_defer_inter_fin,
                 )
             # Phase B (intra SDMA): reassemble each B_m into output[m*block:]
@@ -873,7 +858,7 @@ class HierAllGather:
                 # inter ring's finish barrier makes the m==0 entry redundant -> drop
                 # under slice_fuse_ib (default).
                 entry_barrier = not self.slice_fuse_ib
-                if self.slice_direct and self.stream_intra and self.stream_ring:
+                if self.slice_direct:
                     # Direct-to-output Phase B: push each node-block's slices straight
                     # into output[m*block:] -- no transit, no full-output copy-OUT;
                     # one deferrable global fence completes the op. See
@@ -1175,13 +1160,7 @@ class HierAllGather:
         available (cross-node, slice_direct over RDMA); the FSDP adapter probes it
         to decide whether to skip its copy-OUT.
         """
-        return bool(
-            self.num_nodes >= 2
-            and self.slice_inter
-            and self.slice_direct
-            and self.stream_intra
-            and self.stream_ring
-        )
+        return bool(self.num_nodes >= 2 and self.slice_inter and self.slice_direct)
 
     def enqueue_param_contiguous(
         self,
@@ -1266,7 +1245,7 @@ class HierAllGather:
             collection,
             count,
             stream,
-            stream_ring=self.stream_ring,
+            stream_ring=True,
             defer_inter_fin=self.slice_defer_inter_fin,
         )
         self._intra.gather_kernel_direct_param_contiguous(
