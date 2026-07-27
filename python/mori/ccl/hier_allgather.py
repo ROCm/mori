@@ -221,8 +221,6 @@ class HierAllGather:
         *,
         ranks_per_node: Optional[int] = None,
         inter_num_qp: Optional[int] = None,
-        leader_only: Optional[bool] = None,
-        gather_in_place: Optional[bool] = None,
         inter_num_blocks: Optional[int] = None,
         fuse_barrier: Optional[bool] = None,
         slice_inter: Optional[bool] = None,
@@ -239,26 +237,15 @@ class HierAllGather:
         # One working block per RDMA neighbour: per-NIC throughput saturates at numQp>=4.
         inter_num_blocks = inter_num_blocks if inter_num_blocks is not None else 1
         self.inter_num_blocks = max(1, inter_num_blocks)
-        # Opt-in leader-only pipeline; default every-rank-direct (see the N>=2 branch).
-        self.leader_only = False if leader_only is None else bool(leader_only)
-        # Opt-in gather-in-place: intra gather writes into the ring slot, dropping
-        # the prepare_sync copy-IN. Default OFF (staged).
-        self.gather_in_place = (
-            False if gather_in_place is None else bool(gather_in_place)
-        )
-        # fuse-barrier: drop the intra gather's finish barrier on the every-rank-
-        # direct N>=2 path. Bit-exact: the PUSH gather's flag-wait completes the
-        # node-block on return and the ring's prepare_sync barrier follows; flags
-        # monotonic per-call. Crash-safe via _prev_op_completed. Not for leader-only.
+        # fuse-barrier: drop the intra gather's finish barrier on the N>=2 path.
+        # Bit-exact: the PUSH gather's flag-wait completes the node-block on return
+        # and the ring's prepare_sync barrier follows; flags monotonic per-call.
+        # Crash-safe via _prev_op_completed.
         self.fuse_barrier = True if fuse_barrier is None else bool(fuse_barrier)
         # Sliced 2-D AllGather (primary bandwidth path): inter ring contributes only
         # each rank's own shard (per-NIC inter (N-1)*count vs non-sliced G*count),
-        # then N intra SDMA gathers reassemble rank-major. Default ON; owns its own
-        # data path -> incompatible with leader_only/gather_in_place.
-        _slice_conflict = self.leader_only or self.gather_in_place
-        self.slice_inter = (
-            bool(slice_inter) if slice_inter is not None else not _slice_conflict
-        )
+        # then N intra SDMA gathers reassemble rank-major. Default ON.
+        self.slice_inter = bool(slice_inter) if slice_inter is not None else True
         # Fused sliced Phase B: fold the N reassembly gathers into one batch stacked
         # into disjoint transit regions (dst_base_offset=m*block), keeping only the
         # m==0 entry + exit barriers. Bit-exact. Only with slice_inter.
@@ -298,11 +285,6 @@ class HierAllGather:
         # RDMA (single-node IPC hard-aborts), so default ON for multi-node, OFF for
         # single-node; None defers to the transport probe below.
         self.slice_direct = None if slice_direct is None else bool(slice_direct)
-        if self.slice_inter and (self.leader_only or self.gather_in_place):
-            raise ValueError(
-                "slice_inter is incompatible with leader_only/gather_in_place "
-                "(it owns the inter+intra data path)"
-            )
         # Flat AllgatherSdma compatibility: split a combined transit size into
         # input/output when not sized explicitly.
         if transit_buffer_size is not None:
@@ -389,9 +371,9 @@ class HierAllGather:
         output_buffer_size,
         copy_output_to_user,
     ):
-        """Construct the intra/inter/bcast sub-collectives (single-node
-        AllgatherSdma vs the multi-node intra-gather + inter-ring [+ leader-only
-        broadcast] pipeline) and run the deferred slice_direct transport probe."""
+        """Construct the intra/inter sub-collectives (single-node AllgatherSdma vs
+        the multi-node intra-gather + inter-ring pipeline) and run the deferred
+        slice_direct transport probe."""
         if self.num_nodes == 1:
             # Single node -> a plain intra-node SDMA AllGather is the full AllGather.
             from .collective import AllgatherSdma
@@ -404,7 +386,7 @@ class HierAllGather:
                 copy_output_to_user=copy_output_to_user,
             )
         else:
-            # Hierarchical every-rank-direct pipeline (no broadcast phase):
+            # Hierarchical pipeline:
             #   1. Intra-node SDMA gather over my node's G ranks -> node-block.
             #   2. Inter-node RDMA ring over same-local-index peers across nodes ->
             #      all N node-blocks in node order = rank-major all_gather result.
@@ -445,62 +427,19 @@ class HierAllGather:
                 pe_stride=1,
             )
 
-            if not self.leader_only:
-                # Every-rank-direct (default): rings same-local-index peers; no
-                # broadcast. Sends each node-block G times but is simple/bit-exact.
-                self._inter = InterNodeRingAllgather(
-                    my_pe=my_pe,
-                    npes=npes,
-                    ring_buffer_bytes=inter_bytes,
-                    ring_size=N,
-                    ring_pos=self.node_id,
-                    pe_base=self.local_rank,
-                    pe_stride=G,
-                    num_qp=self.inter_num_qp,
-                    num_blocks=self.inter_num_blocks,
-                )
-            else:
-                # Leader-only (opt-in): local_rank==0 rings over node-leaders then
-                # SDMA-broadcasts the full N*G output to its G local ranks (funnels
-                # inter-node traffic through the leader's single NIC). ShmemMalloc/
-                # ShmemBarrierAll are COLLECTIVE over ALL PEs, so non-leaders build a
-                # degenerate singleton ring (ringSize=1, no launch) solely to keep
-                # those barriers balanced.
-                from .collective import IntraNodeSubGroupBroadcastSdma
-
-                if self.local_rank == 0:
-                    self._inter = InterNodeRingAllgather(
-                        my_pe=my_pe,
-                        npes=npes,
-                        ring_buffer_bytes=inter_bytes,
-                        ring_size=N,
-                        ring_pos=self.node_id,
-                        pe_base=0,
-                        pe_stride=G,
-                        num_qp=self.inter_num_qp,
-                    )
-                else:
-                    self._inter = InterNodeRingAllgather(
-                        my_pe=my_pe,
-                        npes=npes,
-                        ring_buffer_bytes=inter_bytes,
-                        ring_size=1,
-                        ring_pos=0,
-                        pe_base=my_pe,
-                        pe_stride=1,
-                        num_qp=1,
-                    )
-                # Phase 3: SDMA broadcast root=local_rank 0 -> the G local ranks.
-                self._bcast = IntraNodeSubGroupBroadcastSdma(
-                    my_pe=my_pe,
-                    npes=npes,
-                    out_buffer_bytes=inter_bytes,
-                    group_size=G,
-                    group_pos=self.local_rank,
-                    pe_base=self.node_id * G,
-                    pe_stride=1,
-                )
-                self._ring_scratch = None
+            # Phase 2: rings same-local-index peers. Sends each node-block G times
+            # but is simple/bit-exact.
+            self._inter = InterNodeRingAllgather(
+                my_pe=my_pe,
+                npes=npes,
+                ring_buffer_bytes=inter_bytes,
+                ring_size=N,
+                ring_pos=self.node_id,
+                pe_base=self.local_rank,
+                pe_stride=G,
+                num_qp=self.inter_num_qp,
+                num_blocks=self.inter_num_blocks,
+            )
             self._node_block = None
             # Sliced-path scratch: this rank's collection C_g (N*count) from the
             # inter ring, consumed by the N intra reassembly gathers.
@@ -526,21 +465,13 @@ class HierAllGather:
 
             # Resolve deferred slice_direct by probing the transport: p2p==0 => RDMA
             # (register safe) => ON; non-zero => P2P/IPC => OFF (see
-            # _probe_rdma_transport). Every-rank-direct slice only.
+            # _probe_rdma_transport).
             if self.slice_direct is None:
                 self.slice_direct = self._probe_rdma_transport()
             elif self.slice_direct:
                 # Fail-closed guard: explicit slice_direct=True is valid only over
                 # RDMA (P2P/IPC register hard-aborts); raise instead of the opaque
                 # device abort.
-                if self.leader_only:
-                    raise ValueError(
-                        "slice_direct=True is incompatible with leader_only: "
-                        "the direct-to-output SDMA push registers the user "
-                        "output, but leader_only produces its result via the "
-                        "copy-OUT ring path. Leave slice_direct unset (auto) "
-                        "or disable leader_only."
-                    )
                 if not self._probe_rdma_transport():
                     raise ValueError(
                         "slice_direct=True requires an RDMA transport: it "
@@ -594,7 +525,7 @@ class HierAllGather:
         """True iff a cross-node ring peer is reached over RDMA (not IPC), where
         ShmemSymmetricRegister is safe. Conservative: any error/IPC peer -> False.
         """
-        if self.leader_only or self.num_nodes < 2:
+        if self.num_nodes < 2:
             return False
         try:
             from ..shmem import shmem_ptr_p2p
@@ -1062,42 +993,15 @@ class HierAllGather:
             self._prev_op_completed = True
             return True
 
-        # fuse-barrier also drops the intra-gather entry barrier on the
-        # every-rank-direct path, but only when the prior op completed cleanly (its
-        # inter-finish barrier freed every peer's out_). The first op, and any op
-        # following a mid-pipeline crash, keep the barrier (see __init__).
+        # fuse-barrier also drops the intra-gather entry barrier, but only when the
+        # prior op completed cleanly (its inter-finish barrier freed every peer's
+        # out_). The first op, and any op following a mid-pipeline crash, keep the
+        # barrier (see __init__).
         prev_op_completed = self._prev_op_completed
         # Cleared until THIS op finishes; any exception below leaves it False so the
         # next op conservatively keeps the entry barrier.
         self._prev_op_completed = False
-        intra_prepare_barrier = not (
-            self.fuse_barrier and not self.leader_only and prev_op_completed
-        )
-
-        if not self.leader_only and self.gather_in_place:
-            # gather_in_place (opt-in): intra gather writes its node-block straight
-            # into this PE's ring slot (chunk_in_place=True), dropping the
-            # prepare_sync copy-IN. Perf-neutral vs the staged default (correctness
-            # identical).
-            node_block = self._inter.slot_tensor(
-                block_count, input_data.dtype, input_data.device
-            )
-            # fuse_barrier: the ring's prepare_sync_in_place barrier follows
-            # immediately, covering the dropped barrier.
-            self._intra(
-                input_data,
-                node_block,
-                count,
-                stream,
-                barrier=not self.fuse_barrier,
-                prepare_barrier=intra_prepare_barrier,
-            )
-            # Phase 2 (inter ring): all-gather the N node-blocks in node order.
-            self._inter(
-                node_block, output_data, block_count, stream, chunk_in_place=True
-            )
-            self._prev_op_completed = True
-            return True
+        intra_prepare_barrier = not (self.fuse_barrier and prev_op_completed)
 
         if (
             self._node_block is None
@@ -1109,10 +1013,9 @@ class HierAllGather:
                 block_count, dtype=input_data.dtype, device=input_data.device
             )
         node_block = self._node_block[:block_count]
-        # fuse_barrier: drop the intra finish barrier on the every-rank-direct path
-        # (the inter ring's prepare_sync barrier follows immediately); leader-only
-        # keeps it.
-        intra_barrier = not (self.fuse_barrier and not self.leader_only)
+        # fuse_barrier: drop the intra finish barrier (the inter ring's prepare_sync
+        # barrier follows immediately).
+        intra_barrier = not self.fuse_barrier
         self._intra(
             input_data,
             node_block,
@@ -1122,36 +1025,9 @@ class HierAllGather:
             prepare_barrier=intra_prepare_barrier,
         )
 
-        if not self.leader_only:
-            # Phase 2 (inter ring, staged default): all-gather the N node-blocks in
-            # node order -> full rank-major output.
-            self._inter(node_block, output_data, block_count, stream)
-            self._prev_op_completed = True
-            return True
-
-        # Leader-only: phase 2 ring (leaders only) -> phase 3 SDMA broadcast.
-        full_count = count * self.npes
-        if self.local_rank == 0:
-            self._inter(node_block, output_data, block_count, stream)
-        else:
-            # Non-leader: degenerate singleton ring on scratch, only to join the two
-            # collective ShmemBarrierAll calls (no data move).
-            if (
-                self._ring_scratch is None
-                or self._ring_scratch.numel() < block_count
-                or self._ring_scratch.dtype != input_data.dtype
-                or self._ring_scratch.device != input_data.device
-            ):
-                self._ring_scratch = torch.empty(
-                    block_count, dtype=input_data.dtype, device=input_data.device
-                )
-            self._inter(
-                node_block, self._ring_scratch[:block_count], block_count, stream
-            )
-
-        # Phase 3 (intra SDMA broadcast): leader (root) fans its full N*G output to
-        # the G local ranks over XGMI.
-        self._bcast(output_data, output_data, full_count, stream)
+        # Phase 2 (inter ring, staged default): all-gather the N node-blocks in
+        # node order -> full rank-major output.
+        self._inter(node_block, output_data, block_count, stream)
         self._prev_op_completed = True
         return True
 
