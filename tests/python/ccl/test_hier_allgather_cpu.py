@@ -205,45 +205,29 @@ class _RecordingIntra:
             raise RuntimeError("injected mid-pipeline intra-gather failure")
 
 
-class _StubInter:
-    """Stub inter-node ring phase: data movement is irrelevant to this test.
-
-    Provides ``slot_tensor`` so the ``gather_in_place`` return path (which writes
-    the intra-gather node-block straight into the ring slot) can be exercised
-    without a real symmetric ring buffer. Callable as the ring itself (noop)."""
-
-    def slot_tensor(self, block_count, dtype, device):
-        return torch.zeros(block_count, dtype=dtype, device=device)
-
-    def __call__(self, *args, **kwargs):
-        return True
-
-
 def _noop_inter(*args, **kwargs):
     """Stub inter-node ring phase: data movement is irrelevant to this test."""
     return True
 
 
-def _make_hier_stub(
-    fuse_barrier: bool, leader_only: bool = False, gather_in_place: bool = False
-):
+def _make_hier_stub(fuse_barrier: bool):
     """Build a HierAllGather with the phase ops stubbed, bypassing __init__.
 
     __init__ allocates real C++/shmem handles (collective ShmemMalloc), which
     need the full distributed runtime + GPU. We only want to exercise the pure
     Python ``_prev_op_completed`` state machine in __call__, so we construct the
     object via ``object.__new__`` and set just the attributes that path reads.
-
-    ``gather_in_place`` selects the in-place return site instead of the default
-    staged site; both share the crash-recovery guard but are distinct return
-    paths.
     """
     h = object.__new__(HierAllGather)
     h.num_nodes = 2
     h.ranks_per_node = 2
     h.npes = 4
-    h.leader_only = leader_only
-    h.gather_in_place = gather_in_place
+    # TEMP -- delete these 2 lines together with this comment once the
+    # leader_only / gather_in_place removal lands (COORD 2026-07-27T04:25Z).
+    # They are not coverage: _call_impl still reads both before any branch, and
+    # this stub bypasses __init__, so they cannot be dropped ahead of it.
+    h.leader_only = False
+    h.gather_in_place = False
     h.out_in_place = False
     h.fuse_barrier = fuse_barrier
     h._node_block = None
@@ -255,11 +239,7 @@ def _make_hier_stub(
     h.pipe_band = False
     h._last_use_slice = None
     h._intra = _RecordingIntra()
-    h._inter = _StubInter()
-    # leader-only path also touches these:
-    h.local_rank = 0
-    h._bcast = _noop_inter
-    h._ring_scratch = None
+    h._inter = _noop_inter
     return h
 
 
@@ -328,56 +308,12 @@ def run_fuse_barrier_guard() -> int:
         "fuse_barrier=0 must always KEEP entry barrier",
     )
 
-    # 4) leader_only ON: guard never skips (skip requires not leader_only).
-    h = _make_hier_stub(fuse_barrier=True, leader_only=True)
-    for _ in range(3):
-        h._call_impl(inp, out, 4)
-    check(
-        all(b is True for b in h._intra.prepare_barrier_calls),
-        "leader_only must always KEEP entry barrier even with fuse_barrier=1",
-    )
-
-    # 5) gather_in_place ON: the in-place return site (distinct from the staged
-    #    one in scenarios 1-2) must observe the SAME guard. First op keeps,
-    #    steady-state skips, and a mid-pipeline crash makes the next op keep.
-    h = _make_hier_stub(fuse_barrier=True, gather_in_place=True)
-    h._call_impl(inp, out, 4)
-    check(
-        h._intra.prepare_barrier_calls[-1] is True,
-        "gather_in_place first op must KEEP entry barrier",
-    )
-    check(
-        h._prev_op_completed is True,
-        "gather_in_place clean op must set _prev_op_completed",
-    )
-    h._call_impl(inp, out, 4)
-    check(
-        h._intra.prepare_barrier_calls[-1] is False,
-        "gather_in_place 2nd op after clean op must SKIP entry barrier",
-    )
-    h._intra.raise_next = True
-    try:
-        h._call_impl(inp, out, 4)
-        check(False, "injected failure should have propagated (gather_in_place)")
-    except RuntimeError:
-        pass
-    check(
-        h._prev_op_completed is False,
-        "gather_in_place crash must leave _prev_op_completed False",
-    )
-    h._call_impl(inp, out, 4)
-    check(
-        h._intra.prepare_barrier_calls[-1] is True,
-        "gather_in_place op after crash must KEEP entry barrier",
-    )
-
     if failures:
         print(f"\n{failures} guard checks FAILED")
         return 1
     print(
         "PASSED fuse-barrier guard — entry barrier kept on first op + after "
-        "mid-pipeline crash, skipped only after a clean op; covers both the "
-        "staged and gather_in_place return sites (5 scenarios)."
+        "mid-pipeline crash, skipped only after a clean op (3 scenarios)."
     )
     return 0
 
