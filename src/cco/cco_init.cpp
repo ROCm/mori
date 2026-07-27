@@ -64,8 +64,18 @@ struct vmmProcessLock {
   std::lock_guard<std::recursive_mutex> guard{vmmProcessMutex()};
 };
 
-void ccoSdmaSetupCommQueues(ccoComm* comm) {
+void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
 #if BUILD_CCO_SDMA
+  // Idempotent: first DevComm fixes the channel count; later ones reuse it.
+  if (comm->sdmaDevHandles != nullptr) {
+    int want = std::min(requestedChannels, anvil::kMaxSdmaChannelsPerPair);
+    if (want > 0 && want != comm->sdmaNumQueue) {
+      MORI_SHMEM_WARN("sdmaQueueCount {} ignored; comm already has {}", requestedChannels,
+                      comm->sdmaNumQueue);
+    }
+    return;
+  }
+
   bool anySdmaCapable = false;
   for (int pe = 0; pe < comm->worldSize; pe++) {
     if (comm->ctx->GetPeerCapabilities(pe).canSDMA) {
@@ -78,8 +88,10 @@ void ccoSdmaSetupCommQueues(ccoComm* comm) {
     return;
   }
 
-  comm->sdmaNumQueue = anvil::GetSdmaNumChannels();
-  comm->ctx->EnsureSdmaTransport();
+  // requestedChannels: reqs.sdmaQueueCount, 0 = env default. Adopt the count
+  // actually connected so device-side indexing stays in bounds.
+  comm->ctx->EnsureSdmaTransport(requestedChannels);
+  comm->sdmaNumQueue = comm->ctx->SdmaChannels();
 
   // sdmaDevHandles is lsaSize × sdmaNumQueue, indexed by lsaRank. Assumes ranks
   // bind 1:1 to GPUs within a node (rank lsa ⇒ GPU lsa).
@@ -102,6 +114,7 @@ void ccoSdmaSetupCommQueues(ccoComm* comm) {
     }
   }
 #else
+  (void)requestedChannels;
   comm->sdmaNumQueue = 0;
 #endif  // BUILD_CCO_SDMA
 }
@@ -655,10 +668,8 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // HeapVAManager's invariants.
   comm->vaManager.reset(new application::HeapVAManager(LocalSlotBase(comm), perRankVmmSize, 0));
 
-  // Step 4: SDMA queue setup (intra-node copy engine). Delegated to the local
-  // ccoSdmaSetupCommQueues helper above, which confines the anvil dependency to
-  // this TU under BUILD_CCO_SDMA. Leaves sdmaNumQueue=0 when SDMA isn't used.
-  ccoSdmaSetupCommQueues(comm);
+  // SDMA queues are set up in ccoDevCommCreate, where reqs.sdmaQueueCount is
+  // known; sdmaNumQueue stays 0 until then.
 
   // RDMA QP endpoints are NOT pre-allocated here. ccoDevCommCreate builds
   // a fresh QP set per DevComm via ctx->CreateAdditionalEndpoints, sized by
@@ -667,10 +678,9 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
 
   MORI_SHMEM_INFO(
       "ccoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
-      "granularity={} defaultNumQpPerPe={} sdmaNumQueue={} rdma={} fabric={}",
+      "granularity={} defaultNumQpPerPe={} rdma={} fabric={}",
       comm->rank, comm->worldSize, comm->groupId, comm->flatBase, comm->perRankSize,
-      comm->vmmGranularity, comm->defaultNumQpPerPe, comm->sdmaNumQueue,
-      comm->ctx->RdmaTransportEnabled(),
+      comm->vmmGranularity, comm->defaultNumQpPerPe, comm->ctx->RdmaTransportEnabled(),
       comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat));
   return 0;
 }
@@ -1806,6 +1816,9 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   // handle was exported by the same process, so for SPMT we Allgather raw
   // VAs alongside IPC handles and pick per-peer based on SameProcessP2P.
   // (See shmem's SymmMemManager::Register for the same pattern.)
+  // Set up comm SDMA queues from reqs.sdmaQueueCount (0 = env default).
+  ccoSdmaSetupCommQueues(comm, reqs != nullptr ? reqs->sdmaQueueCount : 0);
+
   ccoSdmaContext& sdma = hostShadow.sdma;
   sdma.sdmaNumQueue = static_cast<uint32_t>(comm->sdmaNumQueue);
   if (comm->sdmaNumQueue > 0) {
