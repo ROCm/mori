@@ -41,6 +41,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -48,6 +49,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <hip/hip_runtime.h>
@@ -158,10 +160,17 @@ struct Args {
   std::string self_ip;           // this rank's own reachable IP (advertised in EngineDesc)
   uint16_t port = 18515;
   int gpu = 0;
+  int target_dev_offset = 0;     // --target-dev-offset (target GPU = (gpu+offset)%ndev)
   std::string op = "write";      // write|read
-  size_t sweep_start = 1u << 20; // 1 MiB
-  size_t sweep_max = 32u << 20;  // 32 MiB
-  size_t sweep_step = 1u << 20;  // 1 MiB
+
+  // Sweep control (Python parity). --all sweeps message size; --all-batch sweeps
+  // batch size. Neither set => single run at (buffer_size, batch).
+  bool sweep_all = false;        // --all
+  bool sweep_batch = false;      // --all-batch
+  size_t buffer_size = 32768;    // --buffer-size (single message size when not sweeping)
+  size_t sweep_start = 8;        // --sweep-start-size (Python default 8)
+  size_t sweep_max = 1u << 20;   // --sweep-max-size (Python default 2^20)
+  size_t sweep_step = 0;         // --sweep-step (0 = geometric x2; >0 = linear +step)
   int iters = 500;
   int warmup = 50;               // --warmup-iters
   int inflight = 1;              // == nixl pipeline_depth (transfers/requests in flight)
@@ -187,6 +196,10 @@ struct Args {
   bool busy_wait = false;        // --busy-wait (WaitBusy spin); Python default: off
 
   std::string mem_type = "gpu";  // --mem-type gpu|cpu
+  std::string init_mem_type;     // --initiator-mem-type (empty => mem_type)
+  std::string target_mem_type;   // --target-mem-type   (empty => mem_type)
+
+  std::string log_level = "info";  // --log-level trace|debug|info|warning|error|critical
 };
 
 static Args ParseArgs(int argc, char** argv) {
@@ -199,7 +212,11 @@ static Args ParseArgs(int argc, char** argv) {
     else if (k == "--self-ip") a.self_ip = next();
     else if (k == "--port") a.port = static_cast<uint16_t>(std::stoi(next()));
     else if (k == "--gpu") a.gpu = std::stoi(next());
+    else if (k == "--target-dev-offset") a.target_dev_offset = std::stoi(next());
     else if (k == "--op" || k == "--op-type") a.op = next();
+    else if (k == "--all") a.sweep_all = true;
+    else if (k == "--all-batch") a.sweep_batch = true;
+    else if (k == "--buffer-size") a.buffer_size = std::stoull(next());
     else if (k == "--sweep-start" || k == "--sweep-start-size") a.sweep_start = std::stoull(next());
     else if (k == "--sweep-max" || k == "--sweep-max-size") a.sweep_max = std::stoull(next());
     else if (k == "--sweep-step") a.sweep_step = std::stoull(next());
@@ -224,6 +241,9 @@ static Args ParseArgs(int argc, char** argv) {
     else if (k == "--busy-wait") a.busy_wait = true;
     else if (k == "--no-busy-wait") a.busy_wait = false;
     else if (k == "--mem-type") a.mem_type = next();
+    else if (k == "--initiator-mem-type") a.init_mem_type = next();
+    else if (k == "--target-mem-type") a.target_mem_type = next();
+    else if (k == "--log-level") a.log_level = next();
     else { std::cerr << "unknown arg " << k << std::endl; std::exit(1); }
   }
   return a;
@@ -232,16 +252,55 @@ static Args ParseArgs(int argc, char** argv) {
 // ------------------------------ main ---------------------------------------
 int main(int argc, char** argv) {
   Args a = ParseArgs(argc, argv);
-  HIP_CHECK(hipSetDevice(a.gpu));
+  SetLogLevel(a.log_level);
 
-  // Buffer must hold the largest single REQUEST. Strided batch (default) needs
-  // (msg+1)*batch to keep slots non-adjacent; contiguous needs msg*batch. Round
-  // the strided case up to (sweep_max+1)*batch.
-  const bool batched = a.enable_batch_transfer && a.batch > 1;
-  const size_t slotStride = a.batch_contiguous ? a.sweep_max : (a.sweep_max + 1);
-  const size_t bufBytes = batched ? slotStride * static_cast<size_t>(a.batch) : a.sweep_max;
-  const bool cpuMem = (a.mem_type == "cpu");
+  // Per-role memory type: initiator (rank 0) / target (rank 1) may override the
+  // shared --mem-type, enabling mixed CPU<->GPU transfers. Each process only
+  // allocates its own side, so no cross-node coupling is needed.
+  const std::string myMem = (a.rank == 0)
+      ? (!a.init_mem_type.empty() ? a.init_mem_type : a.mem_type)
+      : (!a.target_mem_type.empty() ? a.target_mem_type : a.mem_type);
+  const bool cpuMem = (myMem == "cpu");
   const MemoryLocationType memLoc = cpuMem ? MemoryLocationType::CPU : MemoryLocationType::GPU;
+
+  // Target GPU shift for cross-rail pairing (GPU memory only, matches Python).
+  int gpu = a.gpu;
+  if (a.rank == 1 && !cpuMem && a.target_dev_offset != 0) {
+    int ndev = 0;
+    HIP_CHECK(hipGetDeviceCount(&ndev));
+    if (ndev > 0) gpu = (a.gpu + a.target_dev_offset) % ndev;
+  }
+  HIP_CHECK(hipSetDevice(gpu));  // valid device context needed even for host mem
+
+  // Build the run plan: a list of (msgSize, batch) points.
+  //   --all       => sweep message size (geometric x2, or linear when --sweep-step>0),
+  //                  batch fixed at --transfer-batch-size.
+  //   --all-batch => msg fixed at --buffer-size, batch = 1,2,4,...,32768.
+  //   neither     => single point (--buffer-size, --transfer-batch-size).
+  std::vector<std::pair<size_t, int>> plan;
+  if (a.sweep_all) {
+    for (size_t msg = a.sweep_start; msg <= a.sweep_max;
+         msg = (a.sweep_step > 0) ? msg + a.sweep_step : msg * 2) {
+      plan.emplace_back(msg, a.batch);
+    }
+  } else if (a.sweep_batch) {
+    for (int b = 1; b <= 32768; b *= 2) plan.emplace_back(a.buffer_size, b);
+  } else {
+    plan.emplace_back(a.buffer_size, a.batch);
+  }
+
+  // Buffer must hold the largest single REQUEST across the whole plan. Strided
+  // batch (default) needs (msg+1)*batch to keep slots non-adjacent; contiguous
+  // needs msg*batch.
+  size_t bufBytes = 0;
+  for (auto& planEntry : plan) {
+    const size_t msg = planEntry.first;
+    const int b = planEntry.second;
+    const bool pBatched = a.enable_batch_transfer && b > 1;
+    const size_t slotStride = a.batch_contiguous ? msg : (msg + 1);
+    const size_t need = pBatched ? slotStride * static_cast<size_t>(b) : msg;
+    bufBytes = std::max(bufBytes, need);
+  }
 
   void* buf = nullptr;
   if (cpuMem) {
@@ -274,7 +333,7 @@ int main(int argc, char** argv) {
   if (a.max_msg_sge > 0) rdmaCfg.maxMsgSge = a.max_msg_sge;
   engine.CreateBackend(BackendType::RDMA, rdmaCfg);
 
-  MemoryDesc localMem = engine.RegisterMemory(buf, bufBytes, a.gpu, memLoc);
+  MemoryDesc localMem = engine.RegisterMemory(buf, bufBytes, gpu, memLoc);
 
   // --- rendezvous over a side TCP socket -----------------------------------
   int sock = (a.rank == 0) ? TcpListenAccept(a.port) : TcpConnect(a.master_ip, a.port);
@@ -322,7 +381,10 @@ int main(int argc, char** argv) {
 
   std::cout << "MsgSize(B)  Batch  Iters  AvgBW(GB/s)  AvgLat(us)  TotalDur(us)" << std::endl;
 
-  for (size_t msg = a.sweep_start; msg <= a.sweep_max; msg += a.sweep_step) {
+  for (auto& planEntry : plan) {
+    const size_t msg = planEntry.first;
+    const int curBatch = planEntry.second;
+    const bool batched = a.enable_batch_transfer && curBatch > 1;
     const int depth = std::min(a.inflight, a.iters);
     std::vector<TransferStatus> st(depth);
     std::vector<TransferUniqueId> uid(depth);
@@ -333,8 +395,8 @@ int main(int argc, char** argv) {
     // merge them into one big WR (fast but not really batching, and hits the
     // 1 GiB max_msg_sz without chunking).
     const size_t stride = a.batch_contiguous ? msg : (msg + 1);
-    SizeVec offsets(a.batch), sizes(a.batch);
-    for (int i = 0; i < a.batch; ++i) {
+    SizeVec offsets(curBatch), sizes(curBatch);
+    for (int i = 0; i < curBatch; ++i) {
       offsets[i] = static_cast<size_t>(i) * stride;
       sizes[i] = msg;
     }
@@ -399,7 +461,7 @@ int main(int argc, char** argv) {
         std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(t1 - t0).count();
     // Each of the `iters` requests moves msg*batch bytes when batching (nixl
     // counts block_size*batch_size*num_iter). avg_lat is per REQUEST.
-    const int effBatch = batched ? a.batch : 1;
+    const int effBatch = batched ? curBatch : 1;
     double total_bytes = static_cast<double>(msg) * effBatch * a.iters;
     double avg_bw = (total_bytes / 1e9) / (total_us / 1e6);   // GB/s, GB=10^9
     double avg_lat = total_us / a.iters;                       // us per request
