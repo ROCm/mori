@@ -14,8 +14,12 @@
 //
 //   2. INLINE SPIN-POLL COMPLETION in the benchmark thread.
 //      nixlbench polls agent->getXferStatus() in a tight spin (NIXL_IN_PROG ->
-//      continue) directly in the bench thread. MORI's WaitBusy() spins on the
-//      completion flag (no cv wakeup) -> we use WaitBusy(), the closest analog.
+//      continue) directly in the bench thread. We mirror that exactly: the timed
+//      loop spins on the transfer status flag (stored by MORI's CQ worker
+//      thread). Completion is ALWAYS spin here -- never a cv-block Wait() -- so
+//      the measured latency matches nixl (a cv wakeup would add ~5-10us and make
+//      numbers non-comparable). MORI's blocking Wait() path is exercised only by
+//      the Python benchmark, not this nixl-parity tool.
 //
 //   3. PIPELINE DEPTH.
 //      nixlbench keeps `pipeline_depth` transfers in flight (default 1). We
@@ -25,7 +29,10 @@
 //   4. WARMUP excluded from timing (nixl: --warmup_iter, default 100).
 //
 //   5. throughput_gb = total_bytes / 1e9 / (total_duration_us / 1e6), GB=10^9,
-//      identical unit to nixl. avg_latency = total_duration / num_iter.
+//      identical unit to nixl. total_bytes = msg * batch * num_iter, and
+//      avg_latency = total_duration / (num_iter * batch) -- i.e. PER SINGLE
+//      TRANSFER, matching nixl's total_duration/(per_thread_iter*batch_size)
+//      (nixl counts block_size*batch_size descriptors per request).
 //
 // Rendezvous: 2 processes (one per node), TCP socket exchange of EngineDesc and
 // MemoryDesc (msgpack, same as MORI's pybind pack()/unpack()). Rank 0 =
@@ -189,11 +196,9 @@ struct Args {
 
   // batch / session
   int batch = 1;                 // --transfer-batch-size (transfers per request)
-  bool enable_batch_transfer = false;  // --enable-batch-transfer (use BatchWrite)
   bool batch_contiguous = false; // --batch-contiguous (adjacent offsets → merged WR);
                                  // default strided (each transfer a separate WR)
   bool enable_sess = false;      // --enable-sess (session fast-path); Python default: off
-  bool busy_wait = false;        // --busy-wait (WaitBusy spin); Python default: off
 
   std::string mem_type = "gpu";  // --mem-type gpu|cpu
   std::string init_mem_type;     // --initiator-mem-type (empty => mem_type)
@@ -234,12 +239,9 @@ static Args ParseArgs(int argc, char** argv) {
     else if (k == "--max-cqe-num") a.max_cqe_num = std::stoi(next());
     else if (k == "--max-msg-sge") a.max_msg_sge = std::stoi(next());
     else if (k == "--batch" || k == "--transfer-batch-size") a.batch = std::stoi(next());
-    else if (k == "--enable-batch-transfer") a.enable_batch_transfer = true;
     else if (k == "--batch-contiguous") a.batch_contiguous = true;
     else if (k == "--enable-sess") a.enable_sess = true;
     else if (k == "--disable-sess") a.enable_sess = false;
-    else if (k == "--busy-wait") a.busy_wait = true;
-    else if (k == "--no-busy-wait") a.busy_wait = false;
     else if (k == "--mem-type") a.mem_type = next();
     else if (k == "--initiator-mem-type") a.init_mem_type = next();
     else if (k == "--target-mem-type") a.target_mem_type = next();
@@ -296,7 +298,7 @@ int main(int argc, char** argv) {
   for (auto& planEntry : plan) {
     const size_t msg = planEntry.first;
     const int b = planEntry.second;
-    const bool pBatched = a.enable_batch_transfer && b > 1;
+    const bool pBatched = b > 1;
     const size_t slotStride = a.batch_contiguous ? msg : (msg + 1);
     const size_t need = pBatched ? slotStride * static_cast<size_t>(b) : msg;
     bufBytes = std::max(bufBytes, need);
@@ -311,10 +313,11 @@ int main(int argc, char** argv) {
   HIP_CHECK(hipMemset(buf, 0, bufBytes));
 
   // Out-of-band control endpoint for the MORI engine. host MUST be an IP the
-  // peer can reach (advertised via EngineDesc for RDMA QP setup); self_ip
-  // defaults to master_ip on rank 0.
+  // peer can reach (advertised via EngineDesc for RDMA QP setup). Defaults to
+  // master_ip: correct for rank 0 (it IS the master); rank 1 should pass
+  // --self-ip when its reachable IP differs from the master's.
   IOEngineConfig cfg;
-  cfg.host = !a.self_ip.empty() ? a.self_ip : (a.rank == 0 ? a.master_ip : a.master_ip);
+  cfg.host = !a.self_ip.empty() ? a.self_ip : a.master_ip;
   cfg.port = static_cast<uint16_t>(a.port + 1 + a.rank);  // distinct per rank
   std::string key = a.rank == 0 ? "initiator" : "target";
   IOEngine engine(key, cfg);
@@ -374,9 +377,15 @@ int main(int argc, char** argv) {
   }
   const bool isRead = (a.op == "read");
 
-  auto waitDone = [&](TransferStatus& s) {
-    if (a.busy_wait) { s.WaitBusy(); }              // spin on completion flag
-    else { s.Wait(); }                              // block on condition variable
+  // Spin to completion, same mechanism as the timed loop (status flag stored by
+  // MORI's CQ worker thread). Used for warmup; keeps warmup identical to the
+  // measured path so caches/QP state are primed the same way.
+  auto spinDone = [&](TransferStatus& s) {
+    while (s.InProgress() || s.Init()) { /* spin: CQ worker thread stores status */ }
+    if (s.Failed()) {
+      std::cerr << "warmup transfer failed: " << s.Message() << std::endl;
+      std::exit(1);
+    }
   };
 
   std::cout << "MsgSize(B)  Batch  Iters  AvgBW(GB/s)  AvgLat(us)  TotalDur(us)" << std::endl;
@@ -384,7 +393,9 @@ int main(int argc, char** argv) {
   for (auto& planEntry : plan) {
     const size_t msg = planEntry.first;
     const int curBatch = planEntry.second;
-    const bool batched = a.enable_batch_transfer && curBatch > 1;
+    // nixl-style: batch>1 always issues one N-descriptor batch request (no
+    // separate enable flag). batch==1 is the degenerate single-transfer case.
+    const bool batched = curBatch > 1;
     const int depth = std::min(a.inflight, a.iters);
     std::vector<TransferStatus> st(depth);
     std::vector<TransferUniqueId> uid(depth);
@@ -431,20 +442,24 @@ int main(int argc, char** argv) {
     // ---- warmup (excluded from timing) ----
     for (int w = 0; w < a.warmup; ++w) {
       post(0);
-      waitDone(st[0]);
+      spinDone(st[0]);
     }
 
     // ---- timed region: ONE whole-loop timer, nixl-style ----
     int completed = 0, issued = 0;
     auto t0 = Clock::now();
 
-    // prime the pipeline
+    // prime the pipeline. NOTE: all `depth` in-flight slots reuse the same buffer
+    // window (non-batched posts all target offset 0; batched slots share the same
+    // offsets vector), so with --inflight > 1 concurrent transfers overlap the
+    // same bytes. That's fine for a throughput/latency benchmark (data is not
+    // validated), matching nixl which likewise reuses its IOV across slots.
     for (int s = 0; s < depth; ++s) { post(s); ++issued; }
 
     while (completed < a.iters) {
       for (int s = 0; s < depth; ++s) {
-        // spin-poll this slot (WaitBusy with a single poll would also work, but
-        // we mirror nixl's "check status, if IN_PROG continue" scan)
+        // spin-poll this slot, mirroring nixl's "check status, if IN_PROG
+        // continue" scan (status flag is stored by MORI's CQ worker thread)
         if (st[s].InProgress() || st[s].Init()) continue;
         if (st[s].Failed()) {
           std::cerr << "transfer failed: " << st[s].Message() << std::endl;
@@ -459,12 +474,17 @@ int main(int argc, char** argv) {
 
     double total_us =
         std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(t1 - t0).count();
-    // Each of the `iters` requests moves msg*batch bytes when batching (nixl
-    // counts block_size*batch_size*num_iter). avg_lat is per REQUEST.
+    // nixl parity (nixl_worker/utils.cpp): count block_size*batch_size*num_iter
+    // bytes over ONE whole-loop timer, and report latency PER SINGLE TRANSFER:
+    //   total_bytes  = msg * batch * iters
+    //   avg_bw       = total_bytes/1e9 / (total_us/1e6)                 [GB/s, GB=10^9]
+    //   avg_latency  = total_us / (iters * batch)                       [us per transfer]
+    // matching nixl's avg_latency = total_duration/(per_thread_iter*batch_size).
     const int effBatch = batched ? curBatch : 1;
-    double total_bytes = static_cast<double>(msg) * effBatch * a.iters;
+    const double numXfers = static_cast<double>(a.iters) * effBatch;
+    double total_bytes = static_cast<double>(msg) * numXfers;
     double avg_bw = (total_bytes / 1e9) / (total_us / 1e6);   // GB/s, GB=10^9
-    double avg_lat = total_us / a.iters;                       // us per request
+    double avg_lat = total_us / numXfers;                      // us per single transfer
 
     std::printf("%-11zu %-6d %-6d %-12.2f %-11.2f %-.1f\n", msg, effBatch, a.iters, avg_bw, avg_lat,
                 total_us);
