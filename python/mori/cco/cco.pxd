@@ -78,7 +78,6 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
         uint32_t sdmaNumQueue
         SdmaQueueDeviceHandle** deviceHandles
         uint64_t* signalBuf
-        uint64_t* expectSignals
         uint64_t** peerSignalPtrs
 
     cdef struct ccoDevCommRequirements:
