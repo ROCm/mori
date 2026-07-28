@@ -22,16 +22,21 @@
 //
 // test: cco sdma edge cases — three behaviors not covered by the put/get tests:
 //
-//   1. Ring-buffer wraparound. Post WRAP_ITERS puts on a single queue so the
-//      cumulative command bytes far exceed CCO_SDMA_QUEUE_SIZE (256KB), forcing
-//      ReserveQueueSpace to wrap and pad NOPs at the tail, plus the hw-read-index
+//   1. Ring-buffer wraparound, uniform slot size. Post WRAP_ITERS puts on a
+//      single queue so the cumulative command bytes far exceed
+//      CCO_SDMA_QUEUE_SIZE (256KB), driving the wrap and the hw-read-index
 //      backpressure path. All iterations write the same slice, so the result is
 //      deterministic.
 //   2. Zero-byte transfer. put(bytes=0) then quiet must NOT hang and must write
-//      nothing (validates the size==0 guard in ccoSdmaPostCopy: it returns before
-//      posting and leaves expectedSignals untouched, so quiet drains instantly).
-//   3. copy_size < queNum. A warp-coop put smaller than the queue count drives
-//      the rand_size==0 branch (queue 0 sends the whole thing, the rest idle).
+//      nothing (validates the size==0 guard in ccoSdmaPostCopy: it returns
+//      before posting, so quiet drains instantly).
+//   3. copy_size < queNum. A warp-coop put smaller than the queue count — the
+//      leader drives the whole copy on the requested queue.
+//   4. Ring-buffer wraparound, MIXED slot sizes. ccoSdmaPostCopy sizes its slot
+//      by signal count, so interleaving no-signal / one-signal / two-signal puts
+//      leaves the write pointer on offsets that are not a multiple of the largest
+//      slot — the case where a slot can reach past the ring end. Phase 1 cannot
+//      catch it: same-size puts keep the offset slot-aligned forever.
 //
 // Requires MORI_ENABLE_SDMA=1; otherwise the comm has no SDMA queues and SKIPs.
 
@@ -40,6 +45,10 @@
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 static const size_t COUNT = 64;      // elements per rank-pair (small; wrap is about packet count)
 static const int WRAP_ITERS = 8192;  // ~60B/put*8192 ≈ 480KB > 256KB queue → wraps ~1.9x
+// A round (none+none+one+two signals) advances the pointer by a non-multiple of
+// the largest slot, so that slot walks every alignment; 8192 rounds is several
+// laps, enough to land one on the last slot before the ring end.
+static const int MIXWRAP_ROUNDS = 8192;
 static const float ZERO_MARKER = 7.0f;  // recv preset; must survive a 0-byte put untouched
 
 // 1. wraparound: thread p issues WRAP_ITERS identical puts on peer p's queue 0,
@@ -59,6 +68,36 @@ __global__ void SdmaWrapKernel(mori::cco::ccoWindowDevice* sendWin,
   for (int it = 0; it < iters; it++) {
     sdma.put(p, reinterpret_cast<ccoWindow_t>(recvWin), myRank * perPair,
              reinterpret_cast<ccoWindow_t>(sendWin), p * perPair, perPair);
+  }
+  sdma.quiet(p);
+}
+
+// 4. mixed-size wraparound: thread p drives peer p's queue 0 with a repeating
+//    round of no-signal / no-signal / one-signal / two-signal puts. Every put
+//    writes the same slice, so the expected result matches phase 1. Signals are
+//    fired but not waited on — the point is the slot geometry.
+__global__ void SdmaMixWrapKernel(mori::cco::ccoWindowDevice* sendWin,
+                                  mori::cco::ccoWindowDevice* recvWin, size_t count, int rounds,
+                                  mori::cco::ccoDevComm devComm) {
+  using namespace mori::cco;
+  ccoSdma sdma{devComm};
+  int myRank = devComm.rank;
+  int nRanks = devComm.lsaSize;
+  size_t perPair = count * sizeof(float);
+
+  int p = threadIdx.x;
+  if (p >= nRanks || p == myRank) return;
+
+  const ccoWindow_t dst = reinterpret_cast<ccoWindow_t>(recvWin);
+  const ccoWindow_t src = reinterpret_cast<ccoWindow_t>(sendWin);
+  const size_t dstOff = myRank * perPair;
+  const size_t srcOff = p * perPair;
+
+  for (int it = 0; it < rounds; it++) {
+    sdma.put<ccoCoopThread, false, false>(p, dst, dstOff, src, srcOff, perPair, 0);
+    sdma.put<ccoCoopThread, false, false>(p, dst, dstOff, src, srcOff, perPair, 0);
+    sdma.put<ccoCoopThread, true, false>(p, dst, dstOff, src, srcOff, perPair, 0);
+    sdma.put<ccoCoopThread, true, true>(p, dst, dstOff, src, srcOff, perPair, 0);
   }
   sdma.quiet(p);
 }
@@ -245,10 +284,37 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
       printf("[rank %d] TINY skipped (queNum=%u < 2)\n", rank, queNum);
     }
 
-    ok = ok_wrap && ok_zero && ok_tiny;
+    // ── phase 4: wraparound with MIXED slot sizes ────────────────────────────
+    HIP_CHECK(hipMemcpy(sendBuf, hostSend.data(), bufSize, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemset(recvBuf, 0xff, bufSize));
+    mori::cco::ccoBarrierAll(comm);
+    SdmaMixWrapKernel<<<1, 64, 0, stream>>>(sendWin, recvWin, COUNT, MIXWRAP_ROUNDS, devComm);
+    HIP_CHECK(hipStreamSynchronize(stream));
+    mori::cco::ccoBarrierAll(comm);
+    bool ok_mixwrap = true;
+    {
+      std::vector<float> host(COUNT * nranks);
+      HIP_CHECK(hipMemcpy(host.data(), recvBuf, bufSize, hipMemcpyDeviceToHost));
+      for (int s = 0; s < nranks && ok_mixwrap; s++) {
+        if (s == rank) continue;
+        for (size_t i = 0; i < COUNT; i++) {
+          float expected = static_cast<float>(s * 1000 + rank * 100 + i);
+          if (host[s * COUNT + i] != expected) {
+            fprintf(stderr, "[rank %d] MIXWRAP mismatch [src=%d][%zu]: got %.0f expected %.0f\n",
+                    rank, s, i, host[s * COUNT + i], expected);
+            ok_mixwrap = false;
+            break;
+          }
+        }
+      }
+    }
+
+    ok = ok_wrap && ok_zero && ok_tiny && ok_mixwrap;
     HIP_CHECK(hipStreamDestroy(stream));
-    printf("[rank %d] wrap=%s zero=%s tiny=%s %s\n", rank, ok_wrap ? "PASS" : "FAIL",
-           ok_zero ? "PASS" : "FAIL", ok_tiny ? "PASS" : "FAIL", ok ? "PASSED" : "FAILED");
+    printf("[rank %d] wrap=%s zero=%s tiny=%s mixwrap=%s %s\n", rank, ok_wrap ? "PASS" : "FAIL",
+           ok_zero ? "PASS" : "FAIL", ok_tiny ? "PASS" : "FAIL", ok_mixwrap ? "PASS" : "FAIL",
+           ok ? "PASSED" : "FAILED");
+    fflush(stdout);
   }
 
   mori::cco::ccoDevCommDestroy(comm, &devComm);
