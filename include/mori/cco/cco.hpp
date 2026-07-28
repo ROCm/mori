@@ -1135,7 +1135,15 @@ struct ccoSdmaQueueDeviceHandle {
 
   // Reserve slotBytes with one atomic_fetch_add (no CAS retry). Returns the
   // monotonic base; keeping packets off the ring end is the caller's job.
-  __device__ __forceinline__ uint64_t ReserveSlot(uint64_t slotBytes) {
+  //
+  // `shared` is the handle this one was copied from. cachedHwReadIndex is a
+  // by-value field, so a refreshed read index has to be published back there or
+  // every caller keeps re-reading rptr — an uncached SYSTEM load worth ~2600
+  // cycles, paid on every put once the monotonic wptr passes the ring size. The
+  // hint only ever moves forward to a value rptr actually had, so racing writers
+  // are harmless.
+  __device__ __forceinline__ uint64_t ReserveSlot(uint64_t slotBytes,
+                                                  ccoSdmaQueueDeviceHandle* shared) {
     uint64_t base =
         __hip_atomic_fetch_add(cachedWptr, slotBytes, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     if ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE) {
@@ -1149,6 +1157,8 @@ struct ccoSdmaQueueDeviceHandle {
           }
         }
       } while ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE);
+      __hip_atomic_store(&shared->cachedHwReadIndex, cachedHwReadIndex, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
     }
     return base;
   }
@@ -1221,7 +1231,8 @@ inline __device__ void ccoSdmaPostCopy(ccoSdmaQueueDeviceHandle** deviceHandles,
                                        void* srcPtr, void* dstPtr, size_t size) {
   if (size == 0) return;
 
-  ccoSdmaQueueDeviceHandle handle = **(deviceHandles + qId);
+  ccoSdmaQueueDeviceHandle* shared = *(deviceHandles + qId);
+  ccoSdmaQueueDeviceHandle handle = *shared;
 
   constexpr int kNumAtomic = (localSignal ? 1 : 0) + (remoteSignal ? 1 : 0);
   constexpr uint64_t kUnit = 32;
@@ -1233,7 +1244,7 @@ inline __device__ void ccoSdmaPostCopy(ccoSdmaQueueDeviceHandle** deviceHandles,
   static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR) <= kUnit, "COPY must fit one unit");
   static_assert(sizeof(CCO_SDMA_PKT_ATOMIC) == kUnit, "ATOMIC must be exactly one unit");
 
-  const uint64_t base = handle.ReserveSlot(kSlot);
+  const uint64_t base = handle.ReserveSlot(kSlot, shared);
   const uint64_t baseDw = handle.WrapIntoRing(base) / sizeof(uint32_t);
 
   // Store a unit whole: lets the compiler use 16B stores instead of splitting on
