@@ -55,7 +55,7 @@ __global__ void SdmaMatrixKernel(mori::cco::ccoWindowDevice* sendWin,
                                  int agg, mori::cco::ccoDevComm devComm) {
   using namespace mori::cco;
   ccoSdma sdma{devComm};
-  const int peer = (devComm.rank + 1) % devComm.lsaSize;
+  const int peer = (devComm.lsaRank + 1) % devComm.lsaSize;
   const uint32_t flags = agg ? ccoSdmaOptFlagsAggregate : ccoSdmaOptFlagsDefault;
 
   sdma.put<Coop>(peer, reinterpret_cast<ccoWindow_t>(recvWin), 0,
@@ -70,7 +70,7 @@ __global__ void SdmaMatrixKernel(mori::cco::ccoWindowDevice* sendWin,
 struct SignalResult {
   uint32_t dataOk;      // in-kernel verify of the received chunks
   uint32_t badIdx;      // first mismatching word (valid when dataOk == 0)
-  uint64_t localSlot;   // signalBuf[myRank*n + q] observed after the waits
+  uint64_t localSlot;   // signalBuf[myLsaRank*n + q] observed after the waits
   uint64_t remoteSlot;  // signalBuf[src*n    + q] observed after the waits
 };
 
@@ -85,15 +85,16 @@ __global__ void SdmaSignalKernel(mori::cco::ccoWindowDevice* sendWin,
   using namespace mori::cco;
   ccoSdma sdma{devComm};
   const int n = devComm.lsaSize;
-  const int peer = (devComm.rank + 1) % n;
-  const int src = (devComm.rank - 1 + n) % n;
+  // Ring over LSA ranks: signal slots and put()'s peer are both LSA-indexed.
+  const int peer = (devComm.lsaRank + 1) % n;
+  const int src = (devComm.lsaRank - 1 + n) % n;
 
   for (int i = 0; i < NPUT; i++) {
     sdma.put<ccoCoopThread, LocalSig, RemoteSig>(peer, reinterpret_cast<ccoWindow_t>(recvWin),
                                                  i * bytes, reinterpret_cast<ccoWindow_t>(sendWin),
                                                  i * bytes, bytes, qid);
   }
-  if constexpr (LocalSig) sdma.waitSignal(devComm.rank, qid, expLocal);
+  if constexpr (LocalSig) sdma.waitSignal(devComm.lsaRank, qid, expLocal);
   if constexpr (RemoteSig) sdma.waitSignal(src, qid, expRemote);
 
   // No barrier here: for RemoteSig the incoming waitSignal above is the only
@@ -115,7 +116,7 @@ __global__ void SdmaSignalKernel(mori::cco::ccoWindowDevice* sendWin,
   }
 
   const uint32_t nq = devComm.sdma.sdmaNumQueue;
-  out->localSlot = devComm.sdma.signalBuf[devComm.rank * nq + qid];
+  out->localSlot = devComm.sdma.signalBuf[devComm.lsaRank * nq + qid];
   out->remoteSlot = devComm.sdma.signalBuf[src * nq + qid];
 
   // The point of the rework: quiet() drains via rptr, so it returns even when
@@ -166,6 +167,14 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
   mori::cco::ccoDevComm devComm{};
   if (mori::cco::ccoDevCommCreate(comm, &reqs, &devComm) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate failed\n", rank);
+    return 1;
+  }
+
+  // Host patterns are keyed on `rank`, the device side on lsaRank; cco SDMA is
+  // intra-node so they coincide. Fail loudly if that ever stops holding.
+  if (devComm.lsaRank != rank || devComm.lsaSize != nranks) {
+    fprintf(stderr, "[rank %d] unexpected LSA mapping: lsaRank=%d lsaSize=%d\n", rank,
+            devComm.lsaRank, devComm.lsaSize);
     return 1;
   }
 

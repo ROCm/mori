@@ -108,11 +108,12 @@ __global__ void sdma_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
         reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, 0);
     if constexpr (SignalComp) {
       sdma.waitSignal(devComm.lsaRank, 0, ++expected);
+      Coop{}.sync();  // pin the iteration boundary for the whole group
     } else {
-      // Every lane spins on the same rptr, so the drain is group-wide on its own.
-      sdma.quietQueue(peerLsa, 0);
+      // Scope-aware: leader-only drain + sync. Letting every lane poll the
+      // uncached rptr costs ~0.4us at block scope and drains no sooner.
+      sdma.quietQueue<Coop>(peerLsa, 0);  // syncs internally
     }
-    Coop{}.sync();  // pin the iteration boundary for the whole group
   }
 }
 
