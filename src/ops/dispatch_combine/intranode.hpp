@@ -223,23 +223,6 @@ __device__ unsigned long long _pb_maxdur = 0ull;
 __device__ unsigned long long _meta_blk_maxdur = 0ull;
 #endif
 
-// ---- OOB detectors (MORI_DISP_DIAG_OOB, opt-in, OFF by default) --------------------------------
-// These are single-address device-scope atomics. _cusplit_max_desttokid in particular fires once
-// per (token, deduped destPe) -- ~14.7k times per launch at 4K tokens / topk 8 / npes 4, every one
-// of them serialized on the SAME L2 address. While they were compiled in under MORI_DISP_TIMING
-// they dominated the measured FINALIZE (assign) phase, so every timed run was reporting an assign
-// cost that the production build never pays. They are now opt-in: turn MORI_DISP_DIAG_OOB on only
-// when actually hunting an out-of-bounds slot / completion deadlock.
-//   _cusplit_max_desttokid: max destTokId seen in FINALIZE. Exceeding CUSPLIT_MAX_SLOTS_PER_PEER
-//     (16384) means reservation is handing out OOB slots (e.g. dispTokOffset never reset ->
-//     accumulates), which corrupts payload/meta stores and can fault into a completion deadlock.
-//   _meta_maxabs / _meta_overflow: peer write extent and count of meta ranges skipped for OOB.
-#if defined(MORI_DISP_DIAG_OOB)
-__device__ unsigned _cusplit_max_desttokid = 0;
-__device__ unsigned long long _meta_overflow = 0ull;
-__device__ unsigned _meta_maxabs = 0u;
-#endif
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BarrierKernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
@@ -585,14 +568,10 @@ __device__ void EpDispatchIntraNodeKernel_clean_body(EpDispatchCombineArgs<T> ar
 //       instead of interleaving scattered per-token metadata stores with the payload, and
 //   (2) sends metadata BEFORE the payload so the payload phase drains meta's cross-GPU writes
 //       before the completion signal has to cross the fabric.
-// Every block is self-contained: it counts, reserves, finalizes, then sends the metadata and
-// payload for exactly the tokens it owns, so phase transitions are plain __syncthreads and no
-// device-wide grid barrier is needed anywhere before completion.
-#ifndef MORI_DISP_PAYLOAD_BLOCKS
-// Blocks [0, KP) own all token work (count/reserve/finalize/meta/payload); blocks [KP, gridDim)
-// only reach completion. KP = min(this, gridDim), so at the default 64-block grid KP == gridDim.
-#define MORI_DISP_PAYLOAD_BLOCKS 64
-#endif
+// Every block is self-contained and every block does the same thing: it counts, reserves,
+// finalizes, then sends the metadata and payload for exactly the tokens it owns, so phase
+// transitions are plain __syncthreads and no device-wide grid barrier is needed anywhere before
+// completion. Token work is strided over the whole grid (gridDim.x * warpNum warps).
 
 // ---- Metadata staging scratch (JIT-side __device__ globals -> NO C++ lib rebuild). Sizes are
 // fixed for the EP4/4096-token config. destTokId < worldSize*maxInpTokenPerRank =
@@ -620,7 +599,8 @@ __device__ uint8_t _cusplit_stgSc[MAX_GPUS_PER_NODE * CUSPLIT_MAX_SLOTS_PER_PEER
 __device__ index_t _cusplit_stgSrc[MAX_GPUS_PER_NODE * CUSPLIT_MAX_SLOTS_PER_PEER];
 // Per-(srcBlock, peer) contiguous remote slot range, written in Phase 2 (per-block RESERVE) and
 // read by the meta phase: _cusplit_blkBase[block*npes+peer] = this block's remote base on the
-// peer, _cusplit_blkCount = its token count (0 if none). grid <= CUSPLIT_MAX_BLOCKS.
+// peer, _cusplit_blkCount = its token count (0 if none). Every block indexes its own row, so this
+// caps the launch: gridDim.x must be <= CUSPLIT_MAX_BLOCKS (512, i.e. 2x the 256 CUs on gfx1250).
 __device__ index_t _cusplit_blkBase[CUSPLIT_MAX_BLOCKS * MAX_GPUS_PER_NODE];
 __device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * MAX_GPUS_PER_NODE];
 // The four staged fields moved per (block, peer) run: idx, weights, scale, srcmap.
@@ -665,7 +645,11 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   int npes = config.worldSize;
   size_t hiddenDim = config.HiddenDimSz();
   const int topk = config.numExpertPerToken;
-  int KP = (MORI_DISP_PAYLOAD_BLOCKS < (int)gridDim.x) ? MORI_DISP_PAYLOAD_BLOCKS : (int)gridDim.x;
+  // ALL data-parallel work (count / reserve / finalize / meta / payload) runs on EVERY block, and
+  // each token is counted, reserved, finalized and sent by the SAME owning block, so nothing is
+  // dropped. One partition, shared by all three token loops: warp aWarp of aWarps.
+  int aWarp = globalWarpId;
+  int aWarps = (int)gridDim.x * warpNum;
 
   // Tokens processed per warp iteration. warpSize/topk lets COUNT's tokenIndices read use all
   // warpSize lanes (a full 128B coalesced burst) instead of only topk of them (8/32 here => a 32B
@@ -710,15 +694,8 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   for (int p = thdId; p < npes; p += blockDim.x) { s_N[p] = 0; s_run[p] = 0; }
   __syncthreads();
 
-  // ALL data-parallel work (count / reserve / finalize / meta / payload) is confined to blocks
-  // [0,KP): each token is counted, reserved, finalized and sent by the SAME owning block, so
-  // nothing is dropped. Token striding is over KP*warpNum. At the default 64-block grid KP ==
-  // gridDim, so every block participates; any blocks past KP only reach completion.
-  int aWarp = blockIdx.x * warpNum + warpId;
-  int aWarps = KP * warpNum;
-
-  // ---- Phase 1: block-local count (LDS atomic -- no cross-block contention), payload blocks only ----
-  if ((int)blockIdx.x < KP && args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
+  // ---- Phase 1: block-local count (LDS atomic -- no cross-block contention) ----
+  if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
     for (int tokBase = aWarp * _tpi; tokBase < args.curRankNumToken; tokBase += aWarps * _tpi) {
       int tok = tokBase + _sLane;
       bool act = _laneAct && (tok < args.curRankNumToken);
@@ -748,18 +725,16 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   // recv-count report at completion, and (b) record this (block,peer) range in the global
   // _cusplit_blkBase/_cusplit_blkCount so the metadata group can iterate per-(block,peer) spans
   // (per-block reserve => this rank's slots on a peer are one contiguous run PER BLOCK, not one
-  // run for the whole rank). Only the KP payload blocks reserve; blkCount is written even when 0
-  // to overwrite stale prior-launch values. The meta group reads rows [0,KP) only.
-  if ((int)blockIdx.x < KP) {
-    for (int p = thdId; p < npes; p += blockDim.x) {
-      index_t n = s_N[p];
-      _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
-      if (n > 0) {
-        s_base[p] = __hip_atomic_fetch_add(args.dispTokOffsetMemObj->template GetAs<index_t*>(p), n,
-                                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
-        atomicAdd(&args.destPeTokenCounter[p], n);
-      }
+  // run for the whole rank). blkCount is written even when 0 to overwrite stale prior-launch
+  // values, and each block only ever touches its own row.
+  for (int p = thdId; p < npes; p += blockDim.x) {
+    index_t n = s_N[p];
+    _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
+    if (n > 0) {
+      s_base[p] = __hip_atomic_fetch_add(args.dispTokOffsetMemObj->template GetAs<index_t*>(p), n,
+                                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
+      atomicAdd(&args.destPeTokenCounter[p], n);
     }
   }
   __syncthreads();  // s_base visible to all threads in this block
@@ -770,7 +745,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   // owns a disjoint [s_base, s_base+s_N) range carved out by its own remote atomic above. ----
   const int sBytesF = config.scaleDim * config.scaleTypeSize;
   const bool doScaleF = (args.scalesBuf && config.scaleDim > 0 && config.scaleTypeSize > 0);
-  if ((int)blockIdx.x < KP && args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
+  if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
     // Same _tpi partition as COUNT (see there). FINALIZE still handles ONE token per inner
     // iteration -- the whole warp cooperates on that token's staging copy -- so _tpi only changes
     // WHICH tokens this warp owns, not the body.
@@ -790,9 +765,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         int d = myDestPe;
         index_t j = atomicAdd(&s_run[d], 1);
         myDestTokId = s_base[d] + j;
-#if defined(MORI_DISP_DIAG_OOB)
-        atomicMax(&_cusplit_max_desttokid, (unsigned)myDestTokId);  // [DIAG] OOB detector
-#endif
         args.dispDestTokIdMap[(size_t)tok * topk + laneId] = FlatTokenIndex(config, d, myDestTokId);
         // srcmap goes to local staging (4th meta field) rather than a cross-GPU scattered 4B store.
         if (myDestTokId < CUSPLIT_MAX_SLOTS_PER_PEER)
@@ -834,7 +806,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   _BPTS(7);  // <- finalize done (all blocks), right before payload/meta grid barrier
   // ---- No grid barrier here: each block is self-contained -- it routes its own tokens (FINALIZE)
   // then sends only those tokens' meta+payload, reading only its OWN dispDestTokIdMap / staging /
-  // blkBase / blkCount (same KP*warpNum stride). So a block-level __syncthreads (make this block's
+  // blkBase / blkCount (same aWarps stride). So a block-level __syncthreads (make this block's
   // FINALIZE cross-warp writes visible to its meta/payload warps) suffices -- no cross-block
   // dependency, no grid-barrier cost, no all-blocks-co-resident requirement. ----
   __syncthreads();
@@ -852,7 +824,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   // and it cost ~40us of pure structural overhead per launch for no distribution benefit.
   //
   // Geometry at DBN=64/wpb=8, CONFIRMED by the [GEOM] print (MORI_DISP_TIMING): gridDim=64
-  // blockDim=256 warpSize=32 warpNum=8 KP=64 aWarps=512 numToken=4096 topk=8 npes=4, i.e. 8 tokens
+  // blockDim=256 warpSize=32 warpNum=8 aWarps=512 numToken=4096 topk=8 npes=4, i.e. 8 tokens
   // per warp. Do NOT re-derive this from launch.cpp's `block_x = WARP_SIZE(64) * wpb`: that is the
   // C++ LaunchDispatch path, which the python benchmarks never take. The python JIT path launches
   // dispatch_combine.py `block = (self._warp_size * actual_wpb,)` with the DEVICE warp size
@@ -864,7 +836,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #if defined(MORI_DISP_TIMING)
   long long _mt0b = clock64();
 #endif
-  if (args.tokenIndices && args.inpTokenBuf && !args.replayMode && (int)blockIdx.x < KP) {
+  if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
     const int tkM = config.numExpertPerToken;
     const int sBytesM = config.scaleDim * config.scaleTypeSize;
     const int sVecM = sBytesM >> 4;
@@ -897,15 +869,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         for (index_t cs = 0; cs < myCnt; cs += tokCapM) {
           int cc = (int)((cs + tokCapM <= myCnt) ? tokCapM : (myCnt - cs));
           index_t ab = baseAll + myBeg + cs;
-#if defined(MORI_DISP_DIAG_OOB)
-          if (laneId == 0) atomicMax(&_meta_maxabs, (unsigned)(ab + cc));
-#endif
-          if (ab + cc > recvCapM) {           // OOB guard (peer slot capacity)
-#if defined(MORI_DISP_DIAG_OOB)
-            if (laneId == 0) atomicAdd(&_meta_overflow, 1ull);
-#endif
-            continue;
-          }
+          if (ab + cc > recvCapM) continue;  // OOB guard (peer slot capacity)
           const int nIdxB = cc * tkM, nScIB = cc * sVecM * 4, nWtB = cc * tkM;
           index_t* sI = _cusplit_stgIdx +
                         (size_t)peer * CUSPLIT_MAX_SLOTS_PER_PEER * CUSPLIT_MAX_TOPK + (size_t)ab * tkM;
@@ -1036,16 +1000,14 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #endif
 
 #if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-  // ---- Phase 3b: payload copy [0,KP), driven by the slot map (dispDestTokIdMap, own-block). ----
-  if (args.tokenIndices && args.inpTokenBuf && !args.replayMode && (int)blockIdx.x < KP) {
-    int pGlobalWarpId = blockIdx.x * warpNum + warpId;
-    int pGlobalWarpNum = KP * warpNum;
-    // MUST use the same _tpi partition as FINALIZE (pGlobalWarpId/pGlobalWarpNum are aWarp/aWarps).
-    // The block-level __syncthreads() above stands in for a grid barrier ONLY because a block reads
-    // back exactly the dispDestTokIdMap entries it wrote itself; if this loop walked a different
-    // token set it would race on slot ids written by other blocks and land payloads in wrong slots.
-    for (int tokBase = pGlobalWarpId * _tpi; tokBase < args.curRankNumToken;
-         tokBase += pGlobalWarpNum * _tpi) {
+  // ---- Phase 3b: payload copy, driven by the slot map (dispDestTokIdMap, own-block). ----
+  if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
+    // Reuses aWarp/aWarps rather than recomputing them: the block-level __syncthreads() above
+    // stands in for a grid barrier ONLY because a block reads back exactly the dispDestTokIdMap
+    // entries it wrote itself, so this loop must walk the same token set COUNT and FINALIZE did.
+    // A different partition here races on slot ids written by other blocks and lands payloads in
+    // the wrong slots (it silently did, until acc_check caught it).
+    for (int tokBase = aWarp * _tpi; tokBase < args.curRankNumToken; tokBase += aWarps * _tpi) {
      for (int _sub = 0; _sub < _tpi; ++_sub) {
       int tok = tokBase + _sub;
       if (tok >= args.curRankNumToken) break;
@@ -1139,24 +1101,17 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     __threadfence();
     long long tot = _pt[6] - _pt[0];
     unsigned long long _callIdx = atomicAdd(&_cusplit_timing_call_idx, 1ull);
-    // -1 means the OOB detectors are compiled out (MORI_DISP_DIAG_OOB off) -- NOT "zero overflows".
-#if defined(MORI_DISP_DIAG_OOB)
-    const long long _ovfShow = (long long)_meta_overflow;
-    const long long _maxabsShow = (long long)_meta_maxabs;
-#else
-    const long long _ovfShow = -1, _maxabsShow = -1;
-#endif
     if (_callIdx == 2ull)  // launch geometry, once -- settles warpNum/_tpi/tokens-per-warp questions
-      printf("[GEOM] rank=%d gridDim=%d blockDim=%d warpSize=%d warpNum=%d KP=%d aWarps=%d numToken=%d topk=%d npes=%d eprk=%d tpi=%d tokPerWarp=%.2f\n",
-             myPe, (int)gridDim.x, (int)blockDim.x, (int)warpSize, warpNum, KP, KP * warpNum,
+      printf("[GEOM] rank=%d gridDim=%d blockDim=%d warpSize=%d warpNum=%d aWarps=%d numToken=%d topk=%d npes=%d eprk=%d tpi=%d tokPerWarp=%.2f\n",
+             myPe, (int)gridDim.x, (int)blockDim.x, (int)warpSize, warpNum, aWarps,
              (int)args.curRankNumToken, topk, npes, config.numExpertPerRank, _tpi,
-             (double)args.curRankNumToken / (double)(KP * warpNum));
+             (double)args.curRankNumToken / (double)aWarps);
     if (_callIdx >= 2ull && _callIdx < 13ull)  // [DIAG] print regardless of tot (completion may be slow)
-      printf("[DIAG] rank=%d call=%llu partB=%.1fus metablk=%.1fus cbar=%.1fus csig=%.1fus cwait=%.1fus tot=%.1fus ovf=%lld maxabs=%lld cap=%d\n",
+      printf("[DIAG] rank=%d call=%llu partB=%.1fus metablk=%.1fus cbar=%.1fus csig=%.1fus cwait=%.1fus tot=%.1fus cap=%d\n",
              myPe, _callIdx, _pb_maxdur / 2270.0,
              _meta_blk_maxdur / 2270.0, (_pt[4] - _pt[3]) / 2270.0,
              (_pt[5] - _pt[4]) / 2270.0, (_pt[6] - _pt[5]) / 2270.0, tot / 2270.0,
-             _ovfShow, _maxabsShow, config.MaxNumTokensToRecv());
+             config.MaxNumTokensToRecv());
     if (tot > 0 && tot < 20000000LL && _callIdx >= 3ull && _callIdx < 13ull) {
       long long p1 = _pt[1] - _pt[0], p2 = _pt[2] - _pt[1];
       long long cpl = _pt[6] - _pt[3];
@@ -1172,15 +1127,11 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
              myPe, p1, p2, p3assign, p3meta, p3own, _pb_maxdur, cpl, tot, frac, frac,
              cbar, csig, cwait, _meta_blk_maxdur);
     }
-#if defined(MORI_DISP_DIAG_OOB)
-    _meta_maxabs = 0u;      // reset -> next call's maxabs is PER-CALL peer-write coverage
-    _meta_overflow = 0ull;
-    _cusplit_max_desttokid = 0u;
-#endif
     // Without these resets the atomicMax globals are running maxima over EVERY launch since
     // module load, so one cold launch pins them forever and no per-call value can be read out.
-    // Safe here: every block's atomicMax happens before its dispatchGridBarrier arrival, and
-    // this thread only gets here after all gridDim.x arrivals.
+    // There is no grid barrier in this body, so a straggler block can still atomicMax after this
+    // reset and have its duration attributed to the next call -- accepted, since these two are
+    // MORI_DISP_TIMING-only reporting and the printed value is a max over many calls anyway.
     _pb_maxdur = 0ull;
     _meta_blk_maxdur = 0ull;
   }

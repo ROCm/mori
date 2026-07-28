@@ -109,27 +109,14 @@ def get_cache_dir(
         if os.environ.get("MORI_DISP_CLEAN", "").lower() in ("1", "true", "on", "yes")
         else ""
     )
-    payloadblocks_suffix = (
-        f"_pblk{os.environ['MORI_DISP_PAYLOAD_BLOCKS'].strip()}"
-        if os.environ.get("MORI_DISP_PAYLOAD_BLOCKS", "").strip().isdigit()
-        else ""
-    )
     complbackoff_suffix = (
         f"_cbo{os.environ['MORI_DISP_COMPL_BACKOFF'].strip()}"
         if os.environ.get("MORI_DISP_COMPL_BACKOFF", "").strip().isdigit()
         else ""
     )
-    # Defaults OFF, so the key marks the ENABLED build. diagoob in particular must be keyed: it
-    # used to ride along with MORI_DISP_TIMING, so a timed build with and without the OOB atomics
-    # is two different binaries with very different `assign` costs.
-    diagoob_suffix = (
-        "_diagoob"
-        if os.environ.get("MORI_DISP_DIAG_OOB", "").lower() in ("1", "true", "on", "yes")
-        else ""
-    )
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{payloadblocks_suffix}{complbackoff_suffix}{cntstep_suffix}{diagoob_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{complbackoff_suffix}{cntstep_suffix}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)

@@ -304,17 +304,6 @@ def _disp_clean_defines() -> list[str]:
     )
 
 
-def _disp_payloadblocks_defines() -> list[str]:
-    """Tuning (default body only): -DMORI_DISP_PAYLOAD_BLOCKS=N overrides how many blocks own token
-    work (blocks [0,N) count/reserve/finalize/send, [N,gridDim) only reach completion; default 64,
-    see intranode.hpp). At the default 64-block grid this is a no-op since KP = min(N, gridDim).
-    Gated by MORI_DISP_PAYLOAD_BLOCKS env (integer); default OFF (in-source default)."""
-    val = os.environ.get("MORI_DISP_PAYLOAD_BLOCKS", "")
-    if not val:
-        return []
-    return [f"-DMORI_DISP_PAYLOAD_BLOCKS={int(val)}"]
-
-
 def _disp_complbackoff_defines() -> list[str]:
     """Diagnostic: -DMORI_DISP_COMPL_BACKOFF=N throttles dispatch's completion spins with
     s_sleep(N) instead of the backoff-free tight spin the shmem WaitUntil* primitives use
@@ -334,20 +323,6 @@ def _disp_timing_defines() -> list[str]:
     Gated by the MORI_DISP_TIMING env so normal builds are unperturbed."""
     val = os.environ.get("MORI_DISP_TIMING", "")
     return ["-DMORI_DISP_TIMING"] if val.lower() in ("1", "true", "on", "yes") else []
-
-
-def _disp_diagoob_defines() -> list[str]:
-    """Diagnostic: -DMORI_DISP_DIAG_OOB compiles in the out-of-bounds slot detectors
-    (_cusplit_max_desttokid, _meta_maxabs, _meta_overflow). These are single-address device-scope
-    atomics; _cusplit_max_desttokid alone fires once per (token, destPe) -- ~14.7k serialized L2
-    atomics per launch on EP4-4K -- so while it lived under MORI_DISP_TIMING it dominated the
-    measured FINALIZE (assign) phase and depressed every timed bandwidth number. DEFAULT OFF; turn
-    on only when hunting an OOB slot / completion deadlock. When off the [DIAG] line prints -1."""
-    return (
-        ["-DMORI_DISP_DIAG_OOB"]
-        if os.environ.get("MORI_DISP_DIAG_OOB", "").lower() in ("1", "true", "on", "yes")
-        else []
-    )
 
 
 def _ocp_fp_defines(arch: str) -> list[str]:
@@ -490,9 +465,7 @@ def _hipcc_genco(
         *_ocp_fp_defines(cfg.arch),
         *_disp_tdm_defines(),
         *_disp_timing_defines(),
-        *_disp_diagoob_defines(),
         *_disp_clean_defines(),
-        *_disp_payloadblocks_defines(),
         *_disp_complbackoff_defines(),
     ]
 
