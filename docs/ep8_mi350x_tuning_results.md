@@ -173,5 +173,3 @@ Combine: +0-9% gains. Largest at none/nP2P/64 tokens (+8.7%) where bn=128→224 
 - [x] EP2 IntraNode
 - [x] IntraNodeLL
 - [x] Profiler analysis (static occupancy — see `mi350x_profiler_analysis.md`; trace profiling needs `ENABLE_PROFILER=ON` rebuild)
-
-
