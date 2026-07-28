@@ -221,6 +221,24 @@ __device__ unsigned long long _pb_maxdur = 0ull;
 // warp contributes (not just globalWarpId 0) -- a single-warp probe cannot see a slow warp
 // elsewhere in the grid, which is exactly the question this global exists to answer.
 __device__ unsigned long long _meta_blk_maxdur = 0ull;
+// [MSPLIT] Where the meta phase's ~21us actually goes, and where FINALIZE's does. Both phases are
+// coupled through the HBM staging arrays (_cusplit_stg*): FINALIZE gathers into them, the meta
+// phase TDM-reads them straight back. Moving that staging to LDS can only ever remove the read
+// half (mld) plus FINALIZE's staging stores (fstg), so these buckets decide whether that is worth
+// doing at all. Each warp accumulates its own cycles and atomicMaxes at the end, same convention
+// as _meta_blk_maxdur -- so these are maxima over warps, NOT a decomposition of one warp: they are
+// only additive if the warps are homogeneous (check their sum against _meta_blk_maxdur).
+//   mIssue = issuing the 4 TdmIssueLoad; mHT = the head/tail regular global->peer copies (issued
+//   before the wait, so they overlap the loads); mLd = residual wait for those loads;
+//   mSt = issue the 4 TDM stores + wait for them.
+__device__ unsigned long long _meta_issue_maxdur = 0ull;
+__device__ unsigned long long _meta_ht_maxdur = 0ull;
+__device__ unsigned long long _meta_ld_maxdur = 0ull;
+__device__ unsigned long long _meta_st_maxdur = 0ull;
+//   fRoute = FINALIZE's routing (re-read tokenIndices, dedup, s_run atomic, dispDestTokIdMap store);
+//   fStg   = FINALIZE's warp-cooperative gather into the HBM staging arrays.
+__device__ unsigned long long _fin_route_maxdur = 0ull;
+__device__ unsigned long long _fin_stg_maxdur = 0ull;
 #endif
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -745,7 +763,117 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   // owns a disjoint [s_base, s_base+s_N) range carved out by its own remote atomic above. ----
   const int sBytesF = config.scaleDim * config.scaleTypeSize;
   const bool doScaleF = (args.scalesBuf && config.scaleDim > 0 && config.scaleTypeSize > 0);
+#if defined(MORI_DISP_TIMING)
+  unsigned long long _fRoute = 0ull, _fStg = 0ull;
+#endif
   if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
+#if defined(MORI_DISP_FINLANE)
+    // ---- Lane-parallel FINALIZE (-DMORI_DISP_FINLANE). The TOKEN PARTITION is untouched: this
+    // walks exactly the tokens the #else form does, so COUNT and the payload loop stay as they are
+    // and the "each block reads back only its own dispDestTokIdMap" invariant still holds. Only the
+    // INTRA-WARP lane assignment changes, in two places:
+    //
+    // (1) Routing runs in COUNT's layout -- lane -> (token tokBase+_sLane, expert _eLane) -- so the
+    //     tokenIndices read is one full-warp 128B burst per _tpi tokens instead of _tpi separate
+    //     topk-lane 32B reads, and the serial chain (dependent load -> dedup -> s_run LDS atomic)
+    //     is walked once per _tpi tokens instead of once per token. The #else form walks it 8 times
+    //     per warp at DBN=64/wpb=8 (8 tokens/warp) with nothing overlapping across iterations.
+    // (2) The staging gather uses LANE GROUPS: gsz lanes serve ONE (token, peer) destination, so
+    //     ngrp destinations are gathered per pass with all warpSize lanes busy. The #else form has
+    //     the whole warp cooperate on one destination at a time with only topk (or nSvF) lanes
+    //     active -- 8 of 32 here -- and walks the ~3.6 kept destinations of each token serially.
+    //
+    // The KEPT LANE SET is provably identical to both COUNT's and the #else form's: within one
+    // token the composite match key groups the same experts, and the group's lowest lane is the
+    // lowest expert index routed to that peer, which is exactly the laneId the #else form keeps. So
+    // the dispDestTokIdMap entries written are the same ones; only which slot id each lands on can
+    // differ, and that was already nondeterministic (the s_run atomics race).
+    const int nSvF = sBytesF >> 4;
+    // gsz = lanes per destination, rounded up to a power of two so laneId splits by shift/mask.
+    // Capped at warpSize, which degenerates to "whole warp on one destination" (the #else form's
+    // lane usage) for topk or nSvF wider than a warp.
+    int _gszReq = (topk > nSvF) ? topk : nSvF;
+    if (_gszReq < 1) _gszReq = 1;
+    int _gszP2 = 1;
+    while (_gszP2 < _gszReq) _gszP2 <<= 1;
+    const int gsz = (_gszP2 <= warpSize) ? _gszP2 : warpSize;
+    const int ngrp = warpSize / gsz;
+    const int myGrp = laneId / gsz;
+    const int myE = laneId - myGrp * gsz;
+    for (int tokBase = aWarp * _tpi; tokBase < args.curRankNumToken; tokBase += aWarps * _tpi) {
+#if defined(MORI_DISP_TIMING)
+      long long _f0 = clock64();
+#endif
+      int tok = tokBase + _sLane;
+      bool act = _laneAct && (tok < args.curRankNumToken);
+      index_t myExpert = act ? args.tokenIndices[(size_t)tok * topk + _eLane] : (index_t)-1;
+      int myDestPe = -1;
+      if (myExpert >= 0) { int d = (int)(myExpert / config.numExpertPerRank);
+                           if (d >= 0 && d < config.worldSize) myDestPe = d; }
+      // Composite key, identical to COUNT's: without the _sLane term lanes of DIFFERENT tokens that
+      // share a destPe collapse into one group and only one of them gets a slot.
+      unsigned mv = (myDestPe >= 0) ? (((unsigned)_sLane << 8) | (unsigned)myDestPe) : 0xFFFFFFFFu;
+      unsigned long long grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
+      int keep = (act && myDestPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
+      index_t myDestTokId = -1;
+      if (keep) {
+        index_t j = atomicAdd(&s_run[myDestPe], 1);
+        myDestTokId = s_base[myDestPe] + j;
+        args.dispDestTokIdMap[(size_t)tok * topk + _eLane] =
+            FlatTokenIndex(config, myDestPe, myDestTokId);
+        // srcmap goes to local staging (4th meta field) rather than a cross-GPU scattered 4B store.
+        if (myDestTokId < CUSPLIT_MAX_SLOTS_PER_PEER)
+          _cusplit_stgSrc[(size_t)myDestPe * CUSPLIT_MAX_SLOTS_PER_PEER + myDestTokId] =
+              FlatTokenIndex(config, myPe, tok);
+      }
+#if defined(MORI_DISP_TIMING)
+      long long _f1 = clock64();
+      _fRoute += (unsigned long long)(_f1 - _f0);
+#endif
+      // Hand out the kept destinations ngrp at a time. keepMask is warp-uniform, so the loop trip
+      // count is uniform and the per-group `continue` below only masks lanes -- it cannot diverge
+      // the loop itself.
+      unsigned long long keepMask = __ballot(keep);
+      while (keepMask) {
+        int srcLane = -1;
+        unsigned long long t = keepMask;
+        for (int g = 0; g < ngrp; ++g) {
+          if (!t) break;
+          int l = __ffsll((long long)t) - 1;
+          t &= t - 1;
+          if (g == myGrp) srcLane = l;
+        }
+        keepMask = t;  // consumed exactly the (up to ngrp) lanes handed out above
+        // __shfl is warp-wide: groups that got no destination this pass must still execute it, so
+        // read lane 0 and drop the result below rather than skipping the shuffle.
+        int sl = (srcLane < 0) ? 0 : srcLane;
+        int d = __shfl(myDestPe, sl);
+        index_t dt = __shfl(myDestTokId, sl);
+        int gTok = __shfl(tok, sl);
+        if (srcLane < 0) continue;
+        if (dt < 0 || dt >= CUSPLIT_MAX_SLOTS_PER_PEER) continue;
+        index_t* sIdx = _cusplit_stgIdx +
+                        (size_t)d * CUSPLIT_MAX_SLOTS_PER_PEER * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
+        float* sWt = _cusplit_stgWt +
+                     (size_t)d * CUSPLIT_MAX_SLOTS_PER_PEER * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
+        uint8_t* sSc = _cusplit_stgSc +
+                       (size_t)d * CUSPLIT_MAX_SLOTS_PER_PEER * CUSPLIT_MAX_SCALE_BYTES +
+                       (size_t)dt * sBytesF;
+        for (int e = myE; e < topk; e += gsz) sIdx[e] = args.tokenIndices[(size_t)gTok * topk + e];
+        if (args.weightsBuf) {
+          for (int e = myE; e < topk; e += gsz) sWt[e] = args.weightsBuf[(size_t)gTok * topk + e];
+        }
+        if (doScaleF) {
+          const uint8_t* srcSc = args.scalesBuf + (size_t)gTok * sBytesF;
+          for (int c = myE; c < nSvF; c += gsz)
+            reinterpret_cast<uint4*>(sSc)[c] = reinterpret_cast<const uint4*>(srcSc)[c];
+        }
+      }
+#if defined(MORI_DISP_TIMING)
+      _fStg += (unsigned long long)(clock64() - _f1);
+#endif
+    }
+#else
     // Same _tpi partition as COUNT (see there). FINALIZE still handles ONE token per inner
     // iteration -- the whole warp cooperates on that token's staging copy -- so _tpi only changes
     // WHICH tokens this warp owns, not the body.
@@ -753,6 +881,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
      for (int _sub = 0; _sub < _tpi; ++_sub) {
       int tok = tokBase + _sub;
       if (tok >= args.curRankNumToken) break;
+#if defined(MORI_DISP_TIMING)
+      long long _f0 = clock64();
+#endif
       index_t myExpert = (laneId < topk) ? args.tokenIndices[(size_t)tok * topk + laneId] : (index_t)-1;
       int myDestPe = -1;
       if (myExpert >= 0) { int d = (int)(myExpert / config.numExpertPerRank);
@@ -775,6 +906,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       // idx/wt/scale into that peer's destTokId-ordered staging (coalesced bursts); the meta phase
       // then does a pure TDM copy staging -> peer. Peer stride uses the compile-time MAX so runtime
       // tk/sBytes stay in bounds. ----
+#if defined(MORI_DISP_TIMING)
+      long long _f1 = clock64();
+      _fRoute += (unsigned long long)(_f1 - _f0);
+#endif
       const int nSvF = sBytesF >> 4;
       unsigned long long keepMask = __ballot(laneId < topk && keep);
       while (keepMask) {
@@ -800,9 +935,19 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
             reinterpret_cast<uint4*>(sSc)[c] = reinterpret_cast<const uint4*>(srcSc)[c];
         }
       }
+#if defined(MORI_DISP_TIMING)
+      _fStg += (unsigned long long)(clock64() - _f1);
+#endif
      }
     }
+#endif  // MORI_DISP_FINLANE
   }
+#if defined(MORI_DISP_TIMING)
+  if (laneId == 0) {
+    atomicMax(&_fin_route_maxdur, _fRoute);
+    atomicMax(&_fin_stg_maxdur, _fStg);
+  }
+#endif
   _BPTS(7);  // <- finalize done (all blocks), right before payload/meta grid barrier
   // ---- No grid barrier here: each block is self-contained -- it routes its own tokens (FINALIZE)
   // then sends only those tokens' meta+payload, reading only its OWN dispDestTokIdMap / staging /
@@ -851,11 +996,23 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     const int perTokM = tkM * 4 + tkM * 4 + sBytesM + 4;
     // 512B of slack covers rounding each of the 4 field regions up to a 128B LDS boundary.
     const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 512) / perTokM) : 0;
+#if defined(MORI_DISP_TIMING)
+    unsigned long long _mIssue = 0ull, _mHT = 0ull, _mLd = 0ull, _mSt = 0ull;
+#endif
     if (tokCapM > 0) {
       uint8_t* _m4 = reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * mtileBytesM;
       // Only npes runs exist per block but there are warpNum warps, so cut each peer's run into
       // warpNum/npes contiguous sub-ranges -- every warp keeps exactly one run, one round trip.
+      // -DMORI_DISP_METASPLIT=N overrides the cut. Splitting buys warp parallelism but every extra
+      // sub-range brings its OWN 128B head/tail remainder, and those remainders do not go through
+      // TDM at all -- they are per-lane remote 4B stores, measured at mHT ~32.6k cyc vs mSt ~9.2k
+      // for the TDM bodies. So a coarser cut trades parallelism for fewer scalar fragments and more
+      // bytes per TDM op; N=1 is one warp per peer, the fewest fragments possible.
+#if defined(MORI_DISP_METASPLIT)
+      const int split = (MORI_DISP_METASPLIT) > 0 ? (MORI_DISP_METASPLIT) : 1;
+#else
       const int split = (npes > 0 && warpNum >= npes) ? (warpNum / npes) : 1;
+#endif
       const int nRuns = npes * split;
       for (int r = warpId; r < nRuns; r += warpNum) {
         int peer = r / split;
@@ -899,6 +1056,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
           int* tS = tW + ((spW.body + 31) & ~31);
           int* tR = tS + ((spS.body + 31) & ~31);
           gfx1250_TDM_GROUP1 gI{}, gW{}, gS{}, gR{};
+#if defined(MORI_DISP_TIMING)
+          long long _m0 = clock64();
+#endif
           if (spI.body) {
             gI = TdmShape2D(32, spI.rows);
             TdmIssueLoad<int>(tI, reinterpret_cast<int*>(sI + spI.head), gI);
@@ -917,6 +1077,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
           }
           // Unaligned head/tail (and any field too small for 2 rows) go straight global->global,
           // issued here so they overlap the TDM loads already in flight instead of serializing.
+#if defined(MORI_DISP_TIMING)
+          long long _m1 = clock64();
+          _mIssue += (unsigned long long)(_m1 - _m0);
+#endif
           {
             int* dIi = reinterpret_cast<int*>(dI);
             int* sIi = reinterpret_cast<int*>(sI);
@@ -937,16 +1101,35 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
           }
           for (int i = laneId; i < spR.head; i += warpSize) dR[i] = sR[i];
           for (int i = spR.head + spR.body + laneId; i < cc; i += warpSize) dR[i] = sR[i];
+#if defined(MORI_DISP_TIMING)
+          long long _m2 = clock64();
+          _mHT += (unsigned long long)(_m2 - _m1);
+#endif
           if (spI.body || spW.body || spS.body || spR.body) {
             __builtin_amdgcn_s_wait_tensorcnt(0);
+#if defined(MORI_DISP_TIMING)
+            long long _m3 = clock64();
+            _mLd += (unsigned long long)(_m3 - _m2);
+#endif
             if (spI.body) TdmIssueStore<int>(reinterpret_cast<int*>(dI + spI.head), tI, gI);
             if (spW.body) TdmIssueStore<int>(reinterpret_cast<int*>(dW + spW.head), tW, gW);
             if (spS.body) TdmIssueStore<int>(reinterpret_cast<int*>(dS) + spS.head, tS, gS);
             if (spR.body) TdmIssueStore<int>(reinterpret_cast<int*>(dR + spR.head), tR, gR);
             __builtin_amdgcn_s_wait_tensorcnt(0);
+#if defined(MORI_DISP_TIMING)
+            _mSt += (unsigned long long)(clock64() - _m3);
+#endif
           }
         }
       }
+#if defined(MORI_DISP_TIMING)
+      if (laneId == 0) {
+        atomicMax(&_meta_issue_maxdur, _mIssue);
+        atomicMax(&_meta_ht_maxdur, _mHT);
+        atomicMax(&_meta_ld_maxdur, _mLd);
+        atomicMax(&_meta_st_maxdur, _mSt);
+      }
+#endif
     } else {
       // Degenerate LDS budget: hiddenDim * sizeof(T) cannot hold even one token's four fields, so
       // there is no tile to bounce through. Copy global->global instead, one (peer, field) item per
@@ -1126,6 +1309,12 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       printf("[CUSPLIT] rank=%d count=%lld reserve=%lld assign=%lld metasend=%lld own3b=%lld partB_maxdur=%llu compl=%lld kernel=%lld frac=%.4f => PARTB_BW=dispatch_BW/%.4f | compl(barrier=%lld sigsend=%lld waitpeer=%lld) | meta(send_maxdur=%llu)\n",
              myPe, p1, p2, p3assign, p3meta, p3own, _pb_maxdur, cpl, tot, frac, frac,
              cbar, csig, cwait, _meta_blk_maxdur);
+      // Maxima over warps of each sub-bucket -- see the _meta_issue_maxdur comment: additive only
+      // if the warps are homogeneous, so mIssue+mHT+mLd+mSt is printed against send_maxdur above
+      // and fRoute+fStg against the assign bucket, as the homogeneity check.
+      printf("[MSPLIT] rank=%d mIssue=%llu mHT=%llu mLd=%llu mSt=%llu | fRoute=%llu fStg=%llu\n",
+             myPe, _meta_issue_maxdur, _meta_ht_maxdur, _meta_ld_maxdur, _meta_st_maxdur,
+             _fin_route_maxdur, _fin_stg_maxdur);
     }
     // Without these resets the atomicMax globals are running maxima over EVERY launch since
     // module load, so one cold launch pins them forever and no per-call value can be read out.
@@ -1134,6 +1323,12 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     // MORI_DISP_TIMING-only reporting and the printed value is a max over many calls anyway.
     _pb_maxdur = 0ull;
     _meta_blk_maxdur = 0ull;
+    _meta_issue_maxdur = 0ull;
+    _meta_ht_maxdur = 0ull;
+    _meta_ld_maxdur = 0ull;
+    _meta_st_maxdur = 0ull;
+    _fin_route_maxdur = 0ull;
+    _fin_stg_maxdur = 0ull;
   }
 #endif
 #undef _BPTS

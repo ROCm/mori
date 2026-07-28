@@ -317,6 +317,30 @@ def _disp_complbackoff_defines() -> list[str]:
     return [f"-DMORI_DISP_COMPL_BACKOFF={int(val)}"]
 
 
+def _disp_finlane_defines() -> list[str]:
+    """Experiment: -DMORI_DISP_FINLANE runs the default dispatch body's FINALIZE phase with a
+    lane-parallel layout -- routing in COUNT's (token, expert) lane layout (one full-warp 128B
+    tokenIndices read per _tpi tokens instead of _tpi topk-lane 32B reads), and the metadata staging
+    gather in lane groups (gsz lanes per destination, all warpSize lanes busy) instead of the whole
+    warp cooperating on one destination at a time. The token partition is unchanged, so COUNT and
+    the payload loop are untouched. Gated by MORI_DISP_FINLANE env; default OFF."""
+    return (
+        ["-DMORI_DISP_FINLANE"]
+        if os.environ.get("MORI_DISP_FINLANE", "").lower() in ("1", "true", "on", "yes")
+        else []
+    )
+
+
+def _disp_metasplit_defines() -> list[str]:
+    """-DMORI_DISP_METASPLIT=N sets how many sub-ranges each (block,peer) metadata run is cut into
+    (default warpNum/npes). Every sub-range carries its own 128B head/tail remainder, and those go
+    out as per-lane remote 4B stores instead of TDM. Integer env; default OFF (unchanged)."""
+    val = os.environ.get("MORI_DISP_METASPLIT", "").strip()
+    if not val.isdigit() or int(val) < 1:
+        return []
+    return [f"-DMORI_DISP_METASPLIT={int(val)}"]
+
+
 def _disp_timing_defines() -> list[str]:
     """Diagnostic: -DMORI_DISP_TIMING enables the in-kernel wall_clock64 phase breakdown of the EP
     IntraNode dispatch ([CUSPLIT]/[GEOM]/[DIAG] for the default body, [BPHASE] for the clean one).
@@ -467,6 +491,8 @@ def _hipcc_genco(
         *_disp_timing_defines(),
         *_disp_clean_defines(),
         *_disp_complbackoff_defines(),
+        *_disp_finlane_defines(),
+        *_disp_metasplit_defines(),
     ]
 
     for d in include_dirs:

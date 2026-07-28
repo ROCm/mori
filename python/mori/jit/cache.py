@@ -114,9 +114,18 @@ def get_cache_dir(
         if os.environ.get("MORI_DISP_COMPL_BACKOFF", "").strip().isdigit()
         else ""
     )
+    # -DMORI_DISP_FINLANE swaps the default body's FINALIZE for the lane-parallel form. Same source
+    # tree, different binary, so it MUST be part of the key or an A/B silently reuses one .hsaco.
+    finlane_suffix = (
+        "_finlane"
+        if os.environ.get("MORI_DISP_FINLANE", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
+    _msp = os.environ.get("MORI_DISP_METASPLIT", "").strip()
+    metasplit_suffix = f"_ms{int(_msp)}" if _msp.isdigit() and int(_msp) >= 1 else ""
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{complbackoff_suffix}{cntstep_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{complbackoff_suffix}{finlane_suffix}{metasplit_suffix}{cntstep_suffix}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)
