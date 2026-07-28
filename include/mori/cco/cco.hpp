@@ -1300,8 +1300,8 @@ inline __device__ unsigned ccoSdmaLanesBelow(uint64_t mask) {
                                    __builtin_amdgcn_mbcnt_lo(static_cast<uint32_t>(mask), 0));
 }
 
-// Lanes of this wave whose key matches mine. No match_any on this target, but the
-// key is small (peer * n + queueId), so one ballot per key bit resolves it.
+// Lanes of this wave whose key matches mine — match_any emulated with one ballot
+// per key bit, which is cheap because the key is small (peer * n + queueId).
 inline __device__ uint64_t ccoSdmaMatchQueue(uint32_t key, uint32_t keyBits) {
   uint64_t m = ccoSdmaBallot(true);
   for (uint32_t b = 0; b < keyBits; b++) {
@@ -1312,9 +1312,7 @@ inline __device__ uint64_t ccoSdmaMatchQueue(uint32_t key, uint32_t keyBits) {
   return m;
 }
 
-// Broadcast from a named lane. readfirstlane would be cheaper but reads whatever
-// exec happens to be, which the compiler is free to hoist out of a loop whose
-// only varying input is exec itself; naming the lane keeps it honest.
+// Broadcast from a named lane — safe inside a loop, unlike readfirstlane.
 inline __device__ uint32_t ccoSdmaBcastLane32(uint32_t v, int lane) {
   return __builtin_amdgcn_ds_bpermute(lane << 2, v);
 }
@@ -1324,9 +1322,8 @@ inline __device__ uint64_t ccoSdmaBcastLane(uint64_t v, int lane) {
   return (static_cast<uint64_t>(hi) << 32) | lo;
 }
 
-// Broadcast from the lowest active lane. SALU, unlike the crossbar the named-lane
-// form goes through — but it reads exec, so only use it where exec is not the
-// only thing varying (i.e. never as a loop's probe).
+// Broadcast from the lowest active lane. SALU, so cheaper than the named-lane
+// form, but it reads exec: never use it as a loop's probe.
 inline __device__ uint64_t ccoSdmaBcastFirstLane(uint64_t v) {
   const uint32_t lo = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(v));
   const uint32_t hi = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(v >> 32));
@@ -1355,13 +1352,13 @@ inline __device__ int ccoSdmaBlockQueueId(uint32_t queNum) {
   return tid < static_cast<int>(queNum) ? tid : -1;
 }
 
-// Post the lanes that share a queue, one group per pass.
+// One group per pass. The loop is uniform and the probe lane is named, so nothing
+// here reads exec — a broadcast that did could be hoisted out and never
+// re-evaluated, leaving the walk stuck on one key.
 template <bool localSignal, bool remoteSignal, bool kRing, uint64_t kSlot>
 inline __device__ void ccoSdmaPutGrouped(ccoSdmaQueueDeviceHandle* shared, void* srcBuf,
                                          void* dstBuf, size_t copy_size, HSAuint64* localTarget,
                                          HSAuint64* remoteTarget, uint32_t queueKey) {
-  // The loop stays uniform and the probe lane is named, so nothing depends on
-  // exec; a broadcast that did could be hoisted out and never re-evaluated.
   const unsigned myLane = ccoSdmaLaneId();
   uint64_t rem = ccoSdmaBallot(true);
   while (rem) {
@@ -1392,25 +1389,19 @@ inline __device__ void ccoSdmaPutGrouped(ccoSdmaQueueDeviceHandle* shared, void*
   }
 }
 
-// Thread scope: every calling lane posts its own copy on its own `qId`.
+// Thread scope: every calling lane posts its own copy on its own `qId`. Lanes on
+// distinct queues post independently; lanes sharing one are grouped, with the
+// leader making a single reservation and doing the doorbell for all of them.
 //
-// Lanes that target different queues post independently and in parallel, which is
-// the common shape (one lane per peer). Lanes that share a queue are grouped and
-// post as a unit: the group leader makes one reservation for all of them, every
-// lane writes its own slot, and only the leader touches the in-order commit chain
-// and the doorbell. Grouping is what makes sharing safe at all — with every lane
-// running submitPacket, lanes of one warp on one queue deadlock, because the lane
-// that has to publish committedWptr cannot leave the spin loop until the lane
-// waiting on it does, and lock-step will not let it.
+// Grouping is what makes sharing safe: if every lane ran submitPacket, lanes of
+// one warp on one queue would deadlock — the lane that must publish
+// committedWptr cannot leave the spin loop until the lane waiting on it does,
+// and lock-step will not allow that. Groups also go one at a time, so a warp
+// never holds two un-published reservations for two warps to deadlock over.
 //
-// Groups are posted one at a time, so a warp never holds two un-published
-// reservations; two warps holding reservations on each other's queues would
-// otherwise be able to deadlock.
-//
-// ccoSdmaThreadSameQueue is a promise that every lane reaching this call targets
-// the same (peer, queueId); it drops the matching ballots and the group walk.
-// Breaking the promise makes lanes write slots reserved on another lane's queue,
-// so it is checked under MORI_CCO_SDMA_DEBUG.
+// ccoSdmaThreadSameQueue skips the matching and the group walk. Breaking that
+// promise makes lanes write slots reserved on another queue — checked under
+// MORI_CCO_SDMA_DEBUG.
 template <bool localSignal = false, bool remoteSignal = false,
           uint32_t optFlags = ccoSdmaOptFlagsDefault,
           ccoSdmaThreadMode threadMode = ccoSdmaThreadIndependent>
@@ -1592,15 +1583,14 @@ struct ccoSdma {
 
   __device__ inline ccoSdma(ccoDevComm const& c) : comm(c) {}
 
-  // put: local src -> peer dst. Single-issuer per (peer, queue).
-  //   Coop:        thread = one thread drives queueId; warp/block = leader drives it.
-  //   localSignal:  also fire a trailing ATOMIC into our OWN signalBuf[myLsaRank*n+q].
-  //   remoteSignal: also fire a trailing ATOMIC into the PEER's signalBuf[myLsaRank*n+q]
-  //                 (peer polls it via waitSignal). Both may be set.
-  //   Completion is via quiet() (rptr/wptr), independent of signals.
-  //   optFlags: Aggregate posts without ringing; call commit() to ring the batch.
-  //             Compile-time: a runtime flag would emit both the ringing and the
-  //             aggregate path (94 -> 157 instructions for an 8B put on gfx950).
+  // put: local src -> peer dst. `peer` is an LSA rank.
+  //   Coop:         thread = every calling lane posts; warp/block = leader posts.
+  //   localSignal:  trailing ATOMIC into our own signalBuf[myLsaRank*n+q].
+  //   remoteSignal: trailing ATOMIC into the peer's slot at the same index, which
+  //                 it polls with waitSignal. Both may be set.
+  //   optFlags:     Aggregate posts without ringing; commit() rings the batch.
+  //   threadMode:   SameQueue promises all active lanes share (peer, queueId).
+  // Completion is quiet()/quietQueue(), independent of the signals.
   template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,
             uint32_t optFlags = ccoSdmaOptFlagsDefault,
             ccoSdmaThreadMode threadMode = ccoSdmaThreadIndependent>
@@ -1622,7 +1612,7 @@ struct ccoSdma {
         s, peer, n, dst, src, bytes, queueId, myLsaRank, static_cast<uint32_t>(comm.lsaSize));
   }
 
-  // get: peer src -> local dst. Same Coop / signal / optFlags rules as put().
+  // get: peer src -> local dst. Same template arguments as put().
   template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,
             uint32_t optFlags = ccoSdmaOptFlagsDefault,
             ccoSdmaThreadMode threadMode = ccoSdmaThreadIndependent>
@@ -1644,12 +1634,8 @@ struct ccoSdma {
         s, peer, n, dst, src, bytes, queueId, myLsaRank, static_cast<uint32_t>(comm.lsaSize));
   }
 
-  // quiet: wait for all outstanding ops to `peer` across every queue.
-  // One queue per lane, strided so a group smaller than the queue count still
-  // covers all of them. Even an idle queue costs one uncached rptr read, so
-  // spreading them over lanes issues those together rather than back to back
-  // (~20% off when only one queue has traffic). Thread scope falls back to the
-  // sequential loop.
+  // quiet: wait until every queue toward `peer` has drained. One queue per lane
+  // at warp/block scope, so their reads overlap; thread scope walks them.
   template <typename Coop = ccoCoopThread>
   __device__ inline void quiet(int peer) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
@@ -1666,10 +1652,9 @@ struct ccoSdma {
     coop.sync();  // completion visible to the whole group before returning
   }
 
-  // quietQueue: drain one (peer, queueId) queue via rptr. warp/block poll from
-  // the leader only — every thread polling multiplies the uncached rptr reads by
-  // the group size and drains no sooner (~0.4us at block scope). An out-of-range
-  // queueId still joins the sync, keeping the barrier uniform.
+  // quietQueue: drain one (peer, queueId). Cheaper than quiet() when you used a
+  // single queue. warp/block poll from the leader; an out-of-range queueId still
+  // joins the sync so the barrier stays uniform.
   template <typename Coop = ccoCoopThread>
   __device__ inline void quietQueue(int peer, int queueId) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
@@ -1685,15 +1670,13 @@ struct ccoSdma {
     coop.sync();
   }
 
-  // waitSignal: poll the local signal counter for (srcRank, queueId) until it
-  // reaches `expected` (>=). The slot is written by a put with localSignal
-  // (src = self) or by a peer's put with remoteSignal (src = that peer). `expected`
-  // is maintained by the caller (monotonic; the slot is not auto-reset) and is
-  // per (srcRank, queueId) — one running total per pair.
-  // srcRank is an LSA rank, like put()'s `peer`: to wait on your own localSignal
-  // pass comm.lsaRank, not comm.rank (they coincide only on a single node). A bad
-  // srcRank traps under MORI_CCO_SDMA_DEBUG rather than returning, since silently
-  // skipping a wait breaks the caller's synchronization.
+  // waitSignal: poll our signalBuf[srcRank*n+queueId] until it reaches `expected`
+  // (>=). Written by our own localSignal (srcRank = comm.lsaRank, NOT comm.rank)
+  // or by srcRank's remoteSignal.
+  // `expected` is the caller's to keep: monotonic, never reset, and one running
+  // total per (srcRank, queueId) — a counter shared across queues never fires.
+  // A bad srcRank traps under MORI_CCO_SDMA_DEBUG; skipping a wait silently would
+  // break the caller's synchronization.
   __device__ inline void waitSignal(int srcRank, int queueId, uint64_t expected) {
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
@@ -1708,8 +1691,8 @@ struct ccoSdma {
     }
   }
 
-  // commit: ring the doorbell for Aggregate-posted ops.
-  //   thread → queue `queueId`; warp/block → every queue. Then drain with quiet().
+  // commit: ring the doorbell for Aggregate-posted ops, then drain with quiet().
+  // thread rings `queueId`; warp/block ring every queue.
   template <typename Coop = ccoCoopThread>
   __device__ inline void commit(int peer, int queueId = 0) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
