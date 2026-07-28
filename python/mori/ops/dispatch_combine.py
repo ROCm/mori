@@ -538,6 +538,18 @@ class EpDispatchCombineOp:
     # ------------------------------------------------------------------
     # Kernel launch helpers
     # ------------------------------------------------------------------
+    def _intranode_dispatch_default_launch(self):
+        """Per-body default (block_num, warp_per_block) for the IntraNode dispatch kernel.
+
+        The default body (EpDispatchIntraNodeKernel_body) batches metadata into one TDM copy per
+        (block, peer) run, so it wants a narrow grid where each block owns a large contiguous run.
+        The legacy clean body (-DMORI_DISP_CLEAN) interleaves scattered per-token metadata with the
+        payload instead and needs the wide grid to hide it.
+        """
+        if os.environ.get("MORI_DISP_CLEAN", "").lower() in ("1", "true", "on", "yes"):
+            return 256, 16
+        return 64, 8
+
     def _resolve_launch_params(
         self,
         block_num,
@@ -550,6 +562,7 @@ class EpDispatchCombineOp:
         tuning_rules=None,
         zero_copy=None,
         quant_type=None,
+        is_intranode_dispatch=False,
     ):
         if tuning_rules and dtype is not None:
             from mori.ops.tuning_config import TuningConfigManager
@@ -562,9 +575,15 @@ class EpDispatchCombineOp:
         bn = self.auto_block_num if self.auto_block_num else block_num
         rbn = self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num
         wpb = self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block
-        actual_bn = self.config.block_num if bn <= 0 else bn
+        def_bn, def_wpb = (
+            self._intranode_dispatch_default_launch()
+            if is_intranode_dispatch
+            and self.config.kernel_type == EpDispatchCombineKernelType.IntraNode
+            else (0, 0)
+        )
+        actual_bn = (def_bn or self.config.block_num) if bn <= 0 else bn
         actual_rbn = self.config.rdma_block_num if rbn <= 0 else rbn
-        actual_wpb = self.config.warp_num_per_block if wpb <= 0 else wpb
+        actual_wpb = (def_wpb or self.config.warp_num_per_block) if wpb <= 0 else wpb
         return actual_bn, actual_rbn, actual_wpb
 
     def _get_func(self, name):
@@ -585,6 +604,8 @@ class EpDispatchCombineOp:
             # TDM double-buffer: per warp holds a FULL token (2 chunk tiles for ping-pong
             # overlap of chunk load vs prev chunk store) = hidden*elemSize bytes. wpb<=16
             # so 16*14KB=224KB <= 320KB LDS.
+            # The default dispatch body reuses this same per-warp tile for its batched metadata
+            # send (see the tokCapM computation in intranode.hpp), so no extra budget is needed.
             tile = (
                 warp_per_block
                 * int(self.config.hidden_dim)
@@ -594,9 +615,9 @@ class EpDispatchCombineOp:
         return base
 
     def _intranode_dispatch_kernel(self, sfx, stdmoe=False):
-        """Intra-node dispatch: only the BATCH kernel is kept (block-local exact count +
-        one batched remote fetch_add(N) per destPe + local slot distribution + 1D TDM
-        payload; ~980 GB/s EP4-4K). The legacy and NOTIFY/CNT2 kernels were removed."""
+        """Intra-node dispatch. One launch symbol, two bodies selected at JIT compile time in
+        intranode.hpp: EpDispatchIntraNodeKernel_body by default, or the legacy
+        EpDispatchIntraNodeKernel_clean_body under MORI_DISP_CLEAN."""
         name = f"EpDispatchIntraNodeBatchKernel_{sfx}"
         if stdmoe:
             name += "_stdmoe"
@@ -800,6 +821,7 @@ class EpDispatchCombineOp:
             hidden_dim=hidden_dim,
             dtype=input.dtype,
             tuning_rules=self._dispatch_rules,
+            is_intranode_dispatch=True,
         )
         self._cached_dispatch_launch = (actual_bn, actual_rbn, actual_wpb)
         stream = _current_stream()

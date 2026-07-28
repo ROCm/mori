@@ -2,21 +2,19 @@
 #include "src/ops/kernels/ep_common.hip"
 MORI_DEFINE_GPU_STATES
 
-// Dispatch (BATCH: block-local exact count + one remote fetch_add(N) per destPe + local
-// slot distribution + clean 1D TDM). Runtime-selected via MORI_DISP_BATCH.
+// Dispatch (block-local exact count + one remote fetch_add(N) per destPe + local slot
+// distribution + 1D TDM). The body behind this symbol is picked in intranode.hpp: the default
+// EpDispatchIntraNodeKernel_body, or the legacy clean body under -DMORI_DISP_CLEAN.
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeBatchKernel, , false)
-#ifndef MORI_DISP_BAREB
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeBatchKernel, _stdmoe, true)
 
 // Dispatch Low Lantency (SMALL TOKEN)
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeLLKernel, , false)
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeLLKernel, _stdmoe, true)
-#endif
 
 // Combine
 WRAP_ALL_TYPES_BOOL3(EpCombineIntraNodeKernel, _p2p, true, false, false)
 WRAP_ALL_TYPES_BOOL3(EpCombineIntraNodeKernel, _nop2p, false, false, false)
-#ifndef MORI_DISP_BAREB
 WRAP_ALL_TYPES_BOOL3(EpCombineIntraNodeKernel, _p2p_stdmoe, true, true, false)
 WRAP_BOOL3(EpCombineIntraNodeKernel, bf16_nop2p_fp8cast, hip_bfloat16, false, false, true)
 MORI_FP8_ANY(WRAP_BOOL4(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq, hip_bfloat16, false, false,
@@ -44,7 +42,6 @@ MORI_FP8_ANY(WRAP_BOOL8(EpCombineIntraNodeKernel, bf16_nop2p_fp4bwq_noweight_blo
                         hip_bfloat16, false, false, false, true, false, 128, 9, true))
 MORI_FP8_ANY(WRAP_BOOL8(EpCombineIntraNodeKernel, bf16_nop2p_fp4bwq_noweight_block256_vec8_top9,
                         hip_bfloat16, false, false, false, true, false, 256, 9, true))
-#endif  // !MORI_DISP_BAREB (shrink the --genco TU to test if the big multi-kernel TU pessimizes the batch copy)
 
 // Convert (used with ENABLE_STANDARD_MOE_ADAPT)
 extern "C" __global__ void mori_ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {

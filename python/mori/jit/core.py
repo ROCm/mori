@@ -293,24 +293,61 @@ def _disp_tdm_defines() -> list[str]:
     return ["-DMORI_DISP_TDM"] if val.lower() in ("1", "true", "on", "yes") else []
 
 
-def _disp_bareb_defines() -> list[str]:
-    """Diagnostic: -DMORI_DISP_BAREB strips the BATCH+TDM Part-B inner loop to the raw
-    1-load:N-store payload copy (no slot atomic / no metadata), to isolate whether the
-    dispatch<->a2a bandwidth gap is the copy itself vs metadata/dedup. Bench-only:
-    breaks recv correctness. Gated by MORI_DISP_BAREB env."""
-    val = os.environ.get("MORI_DISP_BAREB", "")
-    out = ["-DMORI_DISP_BAREB"] if val.lower() in ("1", "true", "on", "yes") else []
-    if os.environ.get("MORI_DBG_LOCAL_ONLY", "").lower() in ("1", "true", "on", "yes"):
-        out.append("-DMORI_DBG_LOCAL_ONLY")
-    return out
+def _disp_clean_defines() -> list[str]:
+    """Kernel body selector: -DMORI_DISP_CLEAN builds the legacy clean IntraNode dispatch body
+    (EpDispatchIntraNodeKernel_clean_body, default geometry 256 blocks x 16 warps) instead of the
+    default EpDispatchIntraNodeKernel_body (64 x 8). Gated by MORI_DISP_CLEAN env; default OFF."""
+    return (
+        ["-DMORI_DISP_CLEAN"]
+        if os.environ.get("MORI_DISP_CLEAN", "").lower() in ("1", "true", "on", "yes")
+        else []
+    )
+
+
+def _disp_payloadblocks_defines() -> list[str]:
+    """Tuning (default body only): -DMORI_DISP_PAYLOAD_BLOCKS=N overrides how many blocks own token
+    work (blocks [0,N) count/reserve/finalize/send, [N,gridDim) only reach completion; default 64,
+    see intranode.hpp). At the default 64-block grid this is a no-op since KP = min(N, gridDim).
+    Gated by MORI_DISP_PAYLOAD_BLOCKS env (integer); default OFF (in-source default)."""
+    val = os.environ.get("MORI_DISP_PAYLOAD_BLOCKS", "")
+    if not val:
+        return []
+    return [f"-DMORI_DISP_PAYLOAD_BLOCKS={int(val)}"]
+
+
+def _disp_complbackoff_defines() -> list[str]:
+    """Diagnostic: -DMORI_DISP_COMPL_BACKOFF=N throttles dispatch's completion spins with
+    s_sleep(N) instead of the backoff-free tight spin the shmem WaitUntil* primitives use
+    (shmem_device_api.hpp). CrossDeviceBarrierIntraNodeKernel already documents that the
+    unthrottled form livelocks the cco/xGMI fabric so a peer's flag write is never re-observed,
+    and fixes it with s_sleep -- dispatch's completion never got that fix. Gated by
+    MORI_DISP_COMPL_BACKOFF env (integer sleep arg); default OFF (tight spin, unchanged)."""
+    val = os.environ.get("MORI_DISP_COMPL_BACKOFF", "").strip()
+    if not val.isdigit():
+        return []
+    return [f"-DMORI_DISP_COMPL_BACKOFF={int(val)}"]
 
 
 def _disp_timing_defines() -> list[str]:
-    """Diagnostic: -DMORI_DISP_TIMING enables in-kernel wall_clock64 breakdown of
-    the EP IntraNode dispatch (NOTIFY phase costs / legacy per-token remote-atomic
-    total). Gated by the MORI_DISP_TIMING env so normal builds are unperturbed."""
+    """Diagnostic: -DMORI_DISP_TIMING enables the in-kernel wall_clock64 phase breakdown of the EP
+    IntraNode dispatch ([CUSPLIT]/[GEOM]/[DIAG] for the default body, [BPHASE] for the clean one).
+    Gated by the MORI_DISP_TIMING env so normal builds are unperturbed."""
     val = os.environ.get("MORI_DISP_TIMING", "")
     return ["-DMORI_DISP_TIMING"] if val.lower() in ("1", "true", "on", "yes") else []
+
+
+def _disp_diagoob_defines() -> list[str]:
+    """Diagnostic: -DMORI_DISP_DIAG_OOB compiles in the out-of-bounds slot detectors
+    (_cusplit_max_desttokid, _meta_maxabs, _meta_overflow). These are single-address device-scope
+    atomics; _cusplit_max_desttokid alone fires once per (token, destPe) -- ~14.7k serialized L2
+    atomics per launch on EP4-4K -- so while it lived under MORI_DISP_TIMING it dominated the
+    measured FINALIZE (assign) phase and depressed every timed bandwidth number. DEFAULT OFF; turn
+    on only when hunting an OOB slot / completion deadlock. When off the [DIAG] line prints -1."""
+    return (
+        ["-DMORI_DISP_DIAG_OOB"]
+        if os.environ.get("MORI_DISP_DIAG_OOB", "").lower() in ("1", "true", "on", "yes")
+        else []
+    )
 
 
 def _ocp_fp_defines(arch: str) -> list[str]:
@@ -443,9 +480,7 @@ def _hipcc_genco(
         "--genco",
         f"--offload-arch={cfg.arch}",
         "-std=c++17",
-        # BAREB debug sandbox: test whether -O3 (vs the default -O2) recovers the a2a
-        # TDM-copy bandwidth (the standalone a2a microbench compiles at -O3).
-        ("-O3" if os.environ.get("MORI_DISP_BAREB", "").lower() in ("1", "true", "on", "yes") else "-O2"),
+        "-O2",
         *_debuginfo_flags(),
         "-D__HIP_PLATFORM_AMD__",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
@@ -454,18 +489,11 @@ def _hipcc_genco(
         *_profiler_defines(),
         *_ocp_fp_defines(cfg.arch),
         *_disp_tdm_defines(),
-        # NOTE: MORI_DISP_NOTIFY / MORI_DISP_NOTIFY_CNT2 are no longer compile-time
-        # defines. Both the NOTIFY/CNT2 and LEGACY IntraNode dispatch kernels are now
-        # always compiled; the host launcher selects between them at runtime via the
-        # MORI_DISP_NOTIFY env (see dispatch_combine.py / launch.cpp).
         *_disp_timing_defines(),
-        *_disp_bareb_defines(),
-        # Experimental: -DMORI_DISP_PERTOK switches the BATCH dispatch Phase1/Phase3 to
-        # a PER-TOKEN warp doing 1 load : N store (load token once, store to each distinct
-        # destPe) -- amortizes the load like all-to-all. Gated by MORI_DISP_PERTOK env.
-        *(["-DMORI_DISP_PERTOK"]
-          if os.environ.get("MORI_DISP_PERTOK", "").lower() in ("1", "true", "on", "yes")
-          else []),
+        *_disp_diagoob_defines(),
+        *_disp_clean_defines(),
+        *_disp_payloadblocks_defines(),
+        *_disp_complbackoff_defines(),
     ]
 
     for d in include_dirs:
