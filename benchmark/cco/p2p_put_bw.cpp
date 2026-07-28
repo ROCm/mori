@@ -108,8 +108,9 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 // quiet drains completion at the end. Parallelism is the queue count. Each slice
 // is issued as `depth` sub-copies: with agg the doorbell is suppressed and one
 // commit() rings the batch, otherwise each sub-copy rings.
+template <uint32_t Flags>
 __global__ void sdma_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
-                            ccoDevComm devComm, int peerLsa, int iter, int depth, bool agg) {
+                            ccoDevComm devComm, int peerLsa, int iter, int depth) {
   ccoSdma sdma{devComm};
   const int nq = devComm.sdma.sdmaNumQueue;
   const int q = threadIdx.x;
@@ -118,17 +119,18 @@ __global__ void sdma_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, 
   const size_t per = total / static_cast<size_t>(nq);
   const size_t off = static_cast<size_t>(q) * per;
   const size_t bytes = (q == nq - 1) ? (total - off) : per;
-  const uint32_t flags = agg ? ccoSdmaOptFlagsAggregate : ccoSdmaOptFlagsDefault;
+  constexpr bool agg = (Flags & ccoSdmaOptFlagsAggregate) != 0;
   const size_t sub = bytes / static_cast<size_t>(depth);
   for (int i = 0; i < iter; i++) {
     for (int j = 0; j < depth; j++) {
       const size_t so = static_cast<size_t>(j) * sub;
       const size_t sb = (j == depth - 1) ? (bytes - so) : sub;
       if (sb == 0) continue;  // bytes < depth: skip empty sub-copies (no 0-byte packet)
-      sdma.put(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), off + so,
-               reinterpret_cast<ccoWindow_t>(sendWin), off + so, sb, q, flags);
+      sdma.put<ccoCoopThread, false, false, Flags>(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin),
+                                                   off + so, reinterpret_cast<ccoWindow_t>(sendWin),
+                                                   off + so, sb, q);
     }
-    if (agg) sdma.commit(peerLsa, q);
+    if constexpr (agg) sdma.commit(peerLsa, q);
   }
   sdma.quietQueue(peerLsa, q);
 }
@@ -136,22 +138,24 @@ __global__ void sdma_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, 
 // SDMA warp scope: one warp drives all SDMA queues via warp-scope puts that split
 // the transfer across the queue set (one lane per queue). `depth` sub-copies per
 // iteration; with agg one commit() rings all queues, else each warp put rings.
+template <uint32_t Flags>
 __global__ void sdma_put_bw_warp(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
                                  size_t len_doubles, ccoDevComm devComm, int peerLsa, int iter,
-                                 int depth, bool agg) {
+                                 int depth) {
   ccoSdma sdma{devComm};
   const size_t total = len_doubles * sizeof(double);
-  const uint32_t flags = agg ? ccoSdmaOptFlagsAggregate : ccoSdmaOptFlagsDefault;
+  constexpr bool agg = (Flags & ccoSdmaOptFlagsAggregate) != 0;
   const size_t sub = total / static_cast<size_t>(depth);
   for (int i = 0; i < iter; i++) {
     for (int j = 0; j < depth; j++) {
       const size_t so = static_cast<size_t>(j) * sub;
       const size_t sb = (j == depth - 1) ? (total - so) : sub;
       if (sb == 0) continue;  // total < depth: skip empty sub-copies (no 0-byte packet)
-      sdma.put<ccoCoopWarp>(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), so,
-                            reinterpret_cast<ccoWindow_t>(sendWin), so, sb, 0, flags);
+      sdma.put<ccoCoopWarp, false, false, Flags>(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin),
+                                                 so, reinterpret_cast<ccoWindow_t>(sendWin), so, sb,
+                                                 0);
     }
-    if (agg) sdma.commit<ccoCoopWarp>(peerLsa);
+    if constexpr (agg) sdma.commit<ccoCoopWarp>(peerLsa);
   }
   sdma.quiet<ccoCoopWarp>(peerLsa);
 }
@@ -160,13 +164,21 @@ static void launch_sdma(PutScope scope, ccoWindow_t sendWin, ccoWindow_t recvWin
                         size_t len_doubles, ccoDevComm devComm, int peerLsa, int count,
                         int warp_size, int depth, bool agg) {
   const int nq = devComm.sdma.sdmaNumQueue;
-  if (scope == PutScope::kWarp) {
-    hipLaunchKernelGGL(sdma_put_bw_warp, dim3(1), dim3(warp_size), 0, 0, sendWin, recvWin,
-                       len_doubles, devComm, peerLsa, count, depth, agg);
-  } else {
-    hipLaunchKernelGGL(sdma_put_bw, dim3(1), dim3(nq), 0, 0, sendWin, recvWin, len_doubles, devComm,
-                       peerLsa, count, depth, agg);
-  }
+  const dim3 grid(1), block(scope == PutScope::kWarp ? warp_size : nq);
+#define LAUNCH(FLAGS)                                                                            \
+  do {                                                                                           \
+    if (scope == PutScope::kWarp)                                                                \
+      hipLaunchKernelGGL((sdma_put_bw_warp<FLAGS>), grid, block, 0, 0, sendWin, recvWin,         \
+                         len_doubles, devComm, peerLsa, count, depth);                           \
+    else                                                                                         \
+      hipLaunchKernelGGL((sdma_put_bw<FLAGS>), grid, block, 0, 0, sendWin, recvWin, len_doubles, \
+                         devComm, peerLsa, count, depth);                                        \
+  } while (0)
+  if (agg)
+    LAUNCH(ccoSdmaOptFlagsAggregate);
+  else
+    LAUNCH(ccoSdmaOptFlagsDefault);
+#undef LAUNCH
 }
 
 static void launch_lsa(PutScope scope, dim3 grid, dim3 block, ccoWindow_t sendWin,

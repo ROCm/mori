@@ -104,8 +104,8 @@ __global__ void sdma_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 
   for (int i = 0; i < iter; i++) {
     sdma.put<Coop, SignalComp, /*remoteSignal=*/false>(
-        peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), 0,
-        reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, 0);
+        peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), 0, reinterpret_cast<ccoWindow_t>(sendWin),
+        0, bytes, 0);
     if constexpr (SignalComp) {
       sdma.waitSignal(devComm.lsaRank, 0, ++expected);
       Coop{}.sync();  // pin the iteration boundary for the whole group

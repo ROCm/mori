@@ -49,18 +49,17 @@ __host__ __device__ static inline uint32_t Pattern(int owner, size_t idx) {
 
 /* ------------------------------- part A: matrix ------------------------------ */
 
-template <typename Coop>
+template <typename Coop, uint32_t Flags>
 __global__ void SdmaMatrixKernel(mori::cco::ccoWindowDevice* sendWin,
                                  mori::cco::ccoWindowDevice* recvWin, size_t bytes, int qid,
-                                 int agg, mori::cco::ccoDevComm devComm) {
+                                 mori::cco::ccoDevComm devComm) {
   using namespace mori::cco;
   ccoSdma sdma{devComm};
   const int peer = (devComm.lsaRank + 1) % devComm.lsaSize;
-  const uint32_t flags = agg ? ccoSdmaOptFlagsAggregate : ccoSdmaOptFlagsDefault;
 
-  sdma.put<Coop>(peer, reinterpret_cast<ccoWindow_t>(recvWin), 0,
-                 reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, qid, flags);
-  if (agg) sdma.commit<Coop>(peer, qid);
+  sdma.put<Coop, false, false, Flags>(peer, reinterpret_cast<ccoWindow_t>(recvWin), 0,
+                                      reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, qid);
+  if constexpr (Flags & ccoSdmaOptFlagsAggregate) sdma.commit<Coop>(peer, qid);
   sdma.quiet<Coop>(peer);
 }
 
@@ -221,15 +220,23 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
             if (verbose) printf("[rank %d] %s\n", rank, what), fflush(stdout);
             HIP_CHECK(hipMemset(recvBuf, 0xff, BUF_BYTES));
             mori::cco::ccoBarrierAll(comm);
-            if (scope == 0)
-              SdmaMatrixKernel<mori::cco::ccoCoopThread>
-                  <<<1, 1, 0, stream>>>(sendWin, recvWin, bytes, q, agg, devComm);
-            else if (scope == 1)
-              SdmaMatrixKernel<mori::cco::ccoCoopWarp>
-                  <<<1, 64, 0, stream>>>(sendWin, recvWin, bytes, q, agg, devComm);
+#define MATRIX_LAUNCH(FLAGS)                                            \
+  do {                                                                  \
+    if (scope == 0)                                                     \
+      SdmaMatrixKernel<mori::cco::ccoCoopThread, FLAGS>                 \
+          <<<1, 1, 0, stream>>>(sendWin, recvWin, bytes, q, devComm);   \
+    else if (scope == 1)                                                \
+      SdmaMatrixKernel<mori::cco::ccoCoopWarp, FLAGS>                   \
+          <<<1, 64, 0, stream>>>(sendWin, recvWin, bytes, q, devComm);  \
+    else                                                                \
+      SdmaMatrixKernel<mori::cco::ccoCoopBlock, FLAGS>                  \
+          <<<1, 256, 0, stream>>>(sendWin, recvWin, bytes, q, devComm); \
+  } while (0)
+            if (agg)
+              MATRIX_LAUNCH(mori::cco::ccoSdmaOptFlagsAggregate);
             else
-              SdmaMatrixKernel<mori::cco::ccoCoopBlock>
-                  <<<1, 256, 0, stream>>>(sendWin, recvWin, bytes, q, agg, devComm);
+              MATRIX_LAUNCH(mori::cco::ccoSdmaOptFlagsDefault);
+#undef MATRIX_LAUNCH
             HIP_CHECK(hipStreamSynchronize(stream));
             mori::cco::ccoBarrierAll(comm);
             aTotal++;
@@ -264,20 +271,17 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
       HIP_CHECK(hipMemset(devRes, 0, sizeof(SignalResult)));
       mori::cco::ccoBarrierAll(comm);  // before the puts, not before the verify
       if (mode == 0)
-        SdmaSignalKernel<false, true><<<1, 1, 0, stream>>>(sendWin, recvWin,
-                                                           static_cast<uint32_t*>(recvBuf), bytes,
-                                                           q, expLocal[q], expRemote[q],
-                                                           verifyInKernel, devRes, devComm);
+        SdmaSignalKernel<false, true>
+            <<<1, 1, 0, stream>>>(sendWin, recvWin, static_cast<uint32_t*>(recvBuf), bytes, q,
+                                  expLocal[q], expRemote[q], verifyInKernel, devRes, devComm);
       else if (mode == 1)
-        SdmaSignalKernel<true, false><<<1, 1, 0, stream>>>(sendWin, recvWin,
-                                                           static_cast<uint32_t*>(recvBuf), bytes,
-                                                           q, expLocal[q], expRemote[q],
-                                                           verifyInKernel, devRes, devComm);
+        SdmaSignalKernel<true, false>
+            <<<1, 1, 0, stream>>>(sendWin, recvWin, static_cast<uint32_t*>(recvBuf), bytes, q,
+                                  expLocal[q], expRemote[q], verifyInKernel, devRes, devComm);
       else
-        SdmaSignalKernel<true, true><<<1, 1, 0, stream>>>(sendWin, recvWin,
-                                                          static_cast<uint32_t*>(recvBuf), bytes, q,
-                                                          expLocal[q], expRemote[q], verifyInKernel,
-                                                          devRes, devComm);
+        SdmaSignalKernel<true, true>
+            <<<1, 1, 0, stream>>>(sendWin, recvWin, static_cast<uint32_t*>(recvBuf), bytes, q,
+                                  expLocal[q], expRemote[q], verifyInKernel, devRes, devComm);
       HIP_CHECK(hipStreamSynchronize(stream));
       HIP_CHECK(hipMemcpy(&res, devRes, sizeof(res), hipMemcpyDeviceToHost));
 

@@ -1194,6 +1194,12 @@ struct ccoSdmaQueueDeviceHandle {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Post Tasks                                           */
 /* ---------------------------------------------------------------------------------------------- */
+// Aggregate: post without ringing the doorbell; commit() rings once (like GDA).
+enum ccoSdmaOptFlags : uint32_t {
+  ccoSdmaOptFlagsDefault = 0,
+  ccoSdmaOptFlagsAggregate = (1u << 0),
+};
+
 // Post one COPY on queue `qId`, plus 0/1/2 trailing ATOMIC signal packets.
 // localTarget/remoteTarget are precomputed signalBuf slot addresses, each filled
 // only when its template flag is set.
@@ -1208,7 +1214,8 @@ struct ccoSdmaQueueDeviceHandle {
 //
 // Reserving the slot in one go keeps concurrent same-queue issuers from
 // interleaving. Plain stores, published by submitPacket's s_waitcnt(0).
-template <bool localSignal = false, bool remoteSignal = false, bool Ring = true>
+template <bool localSignal = false, bool remoteSignal = false,
+          uint32_t optFlags = ccoSdmaOptFlagsDefault>
 inline __device__ void ccoSdmaPostCopy(ccoSdmaQueueDeviceHandle** deviceHandles, uint32_t qId,
                                        HSAuint64* localTarget, HSAuint64* remoteTarget,
                                        void* srcPtr, void* dstPtr, size_t size) {
@@ -1267,7 +1274,7 @@ inline __device__ void ccoSdmaPostCopy(ccoSdmaQueueDeviceHandle** deviceHandles,
     emit([&](int u) { return handle.queueBuf + ((baseDw + u * kUnitDwords) & (kRingDwords - 1)); });
   }
 
-  if constexpr (Ring) handle.submitPacket(base, base + kSlot);
+  if constexpr (!(optFlags & ccoSdmaOptFlagsAggregate)) handle.submitPacket(base, base + kSlot);
 }
 
 // Ring the doorbell for everything placed-but-not-rung on this queue.
@@ -1290,39 +1297,42 @@ inline __device__ int ccoSdmaBlockQueueId(uint32_t queNum) {
 }
 
 // Thread scope: one thread drives a single queue `qId` with the full copy.
-template <bool localSignal = false, bool remoteSignal = false, bool Ring = true>
+template <bool localSignal = false, bool remoteSignal = false,
+          uint32_t optFlags = ccoSdmaOptFlagsDefault>
 inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                         ccoSdmaQueueDeviceHandle** deviceHandles,
                                         HSAuint64* localTarget, HSAuint64* remoteTarget,
                                         uint32_t queNum, uint32_t qId) {
   if (qId >= queNum) return;  // out-of-range queue: no-op, not OOB
-  ccoSdmaPostCopy<localSignal, remoteSignal, Ring>(deviceHandles, qId, localTarget, remoteTarget,
-                                                   srcBuf, dstBuf, copy_size);
+  ccoSdmaPostCopy<localSignal, remoteSignal, optFlags>(deviceHandles, qId, localTarget,
+                                                       remoteTarget, srcBuf, dstBuf, copy_size);
 }
 
 // Warp scope: the warp's leader lane drives `queueId` with the full copy (honors
 // queueId, no scatter). Single writer — cooperative fill measured slower for a
 // 64B WQE; other lanes no-op.
-template <bool localSignal = false, bool remoteSignal = false, bool Ring = true>
+template <bool localSignal = false, bool remoteSignal = false,
+          uint32_t optFlags = ccoSdmaOptFlagsDefault>
 inline __device__ void ccoSdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
                                       ccoSdmaQueueDeviceHandle** deviceHandles,
                                       HSAuint64* localTarget, HSAuint64* remoteTarget,
                                       uint32_t queNum, uint32_t queueId) {
   if (ccoCoopWarp{}.thread_rank() != 0) return;
-  ccoSdmaPutThread<localSignal, remoteSignal, Ring>(srcBuf, dstBuf, copy_size, deviceHandles,
-                                                    localTarget, remoteTarget, queNum, queueId);
+  ccoSdmaPutThread<localSignal, remoteSignal, optFlags>(srcBuf, dstBuf, copy_size, deviceHandles,
+                                                        localTarget, remoteTarget, queNum, queueId);
 }
 
 // Block scope: the block's leader thread drives `queueId` with the full copy
 // (honors queueId, no scatter). Single writer; other threads no-op.
-template <bool localSignal = false, bool remoteSignal = false, bool Ring = true>
+template <bool localSignal = false, bool remoteSignal = false,
+          uint32_t optFlags = ccoSdmaOptFlagsDefault>
 inline __device__ void ccoSdmaPutBlock(void* srcBuf, void* dstBuf, size_t copy_size,
                                        ccoSdmaQueueDeviceHandle** deviceHandles,
                                        HSAuint64* localTarget, HSAuint64* remoteTarget,
                                        uint32_t queNum, uint32_t queueId) {
   if (ccoCoopBlock{}.thread_rank() != 0) return;
-  ccoSdmaPutThread<localSignal, remoteSignal, Ring>(srcBuf, dstBuf, copy_size, deviceHandles,
-                                                    localTarget, remoteTarget, queNum, queueId);
+  ccoSdmaPutThread<localSignal, remoteSignal, optFlags>(srcBuf, dstBuf, copy_size, deviceHandles,
+                                                        localTarget, remoteTarget, queNum, queueId);
 }
 
 // Commit (ring pending packets) per coop scope.
@@ -1370,16 +1380,9 @@ inline __device__ void ccoSdmaDrainQueue(ccoSdmaQueueDeviceHandle& handle) {
   }
 }
 
-// Aggregate: post without ringing the doorbell; commit() rings once (like GDA).
-enum ccoSdmaOptFlags : uint32_t {
-  ccoSdmaOptFlagsDefault = 0,
-  ccoSdmaOptFlagsAggregate = (1u << 0),
-};
-
 // Dispatch a copy (src -> dst) to the right coop-scope post. thread = one thread
-// drives queueId; warp/block = leader thread drives queueId. localSignal/
-// remoteSignal/Ring are compile-time.
-template <typename Coop, bool localSignal, bool remoteSignal, bool Ring>
+// drives queueId; warp/block = leader thread drives queueId.
+template <typename Coop, bool localSignal, bool remoteSignal, uint32_t optFlags>
 __device__ inline void ccoSdmaDispatchPut(const ccoSdmaContext& s, int peer, uint32_t n, void* dst,
                                           void* src, size_t bytes, int queueId,
                                           uint32_t myLsaRank) {
@@ -1391,14 +1394,14 @@ __device__ inline void ccoSdmaDispatchPut(const ccoSdmaContext& s, int peer, uin
   if constexpr (localSignal) localTarget = s.signalBuf + slot;
   if constexpr (remoteSignal) remoteTarget = s.peerSignalPtrs[peer] + slot;
   if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
-    ccoSdmaPutThread<localSignal, remoteSignal, Ring>(src, dst, bytes, s.deviceHandles + peer * n,
-                                                      localTarget, remoteTarget, n, queueId);
+    ccoSdmaPutThread<localSignal, remoteSignal, optFlags>(
+        src, dst, bytes, s.deviceHandles + peer * n, localTarget, remoteTarget, n, queueId);
   } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
-    ccoSdmaPutWarp<localSignal, remoteSignal, Ring>(src, dst, bytes, s.deviceHandles + peer * n,
-                                                    localTarget, remoteTarget, n, queueId);
+    ccoSdmaPutWarp<localSignal, remoteSignal, optFlags>(src, dst, bytes, s.deviceHandles + peer * n,
+                                                        localTarget, remoteTarget, n, queueId);
   } else {
-    ccoSdmaPutBlock<localSignal, remoteSignal, Ring>(src, dst, bytes, s.deviceHandles + peer * n,
-                                                     localTarget, remoteTarget, n, queueId);
+    ccoSdmaPutBlock<localSignal, remoteSignal, optFlags>(
+        src, dst, bytes, s.deviceHandles + peer * n, localTarget, remoteTarget, n, queueId);
   }
 }
 
@@ -1414,49 +1417,43 @@ struct ccoSdma {
   //                 (peer polls it via waitSignal). Both may be set.
   //   Completion is via quiet() (rptr/wptr), independent of signals.
   //   optFlags: Aggregate posts without ringing; call commit() to ring the batch.
-  template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false>
+  //             Compile-time: a runtime flag would emit both the ringing and the
+  //             aggregate path (94 -> 157 instructions for an 8B put on gfx950).
+  template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,
+            uint32_t optFlags = ccoSdmaOptFlagsDefault>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
-                             size_t srcOffset, size_t bytes, int queueId = 0,
-                             uint32_t optFlags = ccoSdmaOptFlagsDefault) {
+                             size_t srcOffset, size_t bytes, int queueId = 0) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
                       std::is_same_v<Coop, ccoCoopBlock>,
                   "ccoSdma::put supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
+    static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate)) == 0,
+                  "ccoSdma::put: unknown ccoSdmaOptFlags bit");
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     const uint32_t myLsaRank = static_cast<uint32_t>(comm.lsaRank);
-    const bool ring = !(optFlags & ccoSdmaOptFlagsAggregate);
     void* dst = ccoGetLsaPeerPtr(dstWin, peer, dstOffset);
     void* src = ccoGetLocalPtr(srcWin, srcOffset);
-    if (ring) {
-      ccoSdmaDispatchPut<Coop, localSignal, remoteSignal, true>(s, peer, n, dst, src, bytes, queueId,
-                                                                myLsaRank);
-    } else {
-      ccoSdmaDispatchPut<Coop, localSignal, remoteSignal, false>(s, peer, n, dst, src, bytes,
-                                                                 queueId, myLsaRank);
-    }
+    ccoSdmaDispatchPut<Coop, localSignal, remoteSignal, optFlags>(s, peer, n, dst, src, bytes,
+                                                                  queueId, myLsaRank);
   }
 
   // get: peer src -> local dst. Same Coop / signal / optFlags rules as put().
-  template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false>
+  template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,
+            uint32_t optFlags = ccoSdmaOptFlagsDefault>
   __device__ inline void get(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
-                             size_t srcOffset, size_t bytes, int queueId = 0,
-                             uint32_t optFlags = ccoSdmaOptFlagsDefault) {
+                             size_t srcOffset, size_t bytes, int queueId = 0) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
                       std::is_same_v<Coop, ccoCoopBlock>,
                   "ccoSdma::get supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
+    static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate)) == 0,
+                  "ccoSdma::get: unknown ccoSdmaOptFlags bit");
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     const uint32_t myLsaRank = static_cast<uint32_t>(comm.lsaRank);
-    const bool ring = !(optFlags & ccoSdmaOptFlagsAggregate);
     void* dst = ccoGetLocalPtr(dstWin, dstOffset);
     void* src = ccoGetLsaPeerPtr(srcWin, peer, srcOffset);
-    if (ring) {
-      ccoSdmaDispatchPut<Coop, localSignal, remoteSignal, true>(s, peer, n, dst, src, bytes, queueId,
-                                                                myLsaRank);
-    } else {
-      ccoSdmaDispatchPut<Coop, localSignal, remoteSignal, false>(s, peer, n, dst, src, bytes,
-                                                                 queueId, myLsaRank);
-    }
+    ccoSdmaDispatchPut<Coop, localSignal, remoteSignal, optFlags>(s, peer, n, dst, src, bytes,
+                                                                  queueId, myLsaRank);
   }
 
   // quiet: wait for all outstanding ops to `peer` across every queue.
