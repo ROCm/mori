@@ -19,7 +19,7 @@ RUN apt-get update && \
     cmake && \
     rm -rf /var/lib/apt/lists/*
 
-# ── Optional: install a standalone ROCm 7.14 dev toolchain (gfx950 / MI355X) ──
+# ── Optional: install a standalone ROCm 7.14 dev toolchain ──
 #
 # Only needed when the base image lacks a full ROCm *dev* stack — e.g. a plain
 # image where PyTorch's ROCm comes from the pip `rocm-sdk-core` wheel, which
@@ -54,6 +54,5 @@ RUN if [ "${INSTALL_ROCM714}" = "1" ]; then set -ex && \
       ln -sf /usr/lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so ; \
     fi
 
-ENV HIP_PATH=/opt/rocm
 
 RUN pip install --no-cache-dir flydsl
