@@ -1061,10 +1061,9 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     }
 
     if (EpTelemetryState* telem = eps[epId].telem.get(); needSignal && telem) {
+      eps[epId].ledger->RecordPostTimestamp(recordId, __rdtsc());
       telem->counters.bytes_posted.fetch_add(epBytesSinceSignal[epId], std::memory_order_relaxed);
       telem->counters.ops_posted.fetch_add(epMergedSinceSignal[epId], std::memory_order_relaxed);
-
-      eps[epId].ledger->RecordPostTimestamp(recordId, __rdtsc());
 
       if (eps[epId].sqDepth) {
         int depth = eps[epId].sqDepth->load(std::memory_order_relaxed);

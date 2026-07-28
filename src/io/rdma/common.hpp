@@ -199,7 +199,11 @@ struct SubmissionRecord {
 
 class SubmissionLedger {
  public:
-  explicit SubmissionLedger(uint32_t notifPerQp) : nextId_{notifPerQp} {}
+  // maxSqDepth bounds the number of live records (admission control keeps the
+  // sum of in-flight postedWr <= maxSqDepth, and every record has postedWr >= 1),
+  // so a ring of capacity > maxSqDepth can be indexed by recordId with no
+  // aliasing of a live slot. See ledger.cpp for the correctness argument.
+  explicit SubmissionLedger(uint32_t notifPerQp, int maxSqDepth = 4096);
 
   void EnableTimestamping() { timestamping_ = true; }
 
@@ -207,13 +211,13 @@ class SubmissionLedger {
   uint64_t Insert(int postedWr, bool hasSignaledTail, std::shared_ptr<CqCallbackMeta> meta,
                   int batchSize, uint64_t totalBytes = 0);
 
+  // Stamp the post timestamp into an existing record (looked up by recordId).
+  // No-op if timestamping is disabled or the record is no longer live.
+  void RecordPostTimestamp(uint64_t recordId, uint64_t postTsc);
+
   // Insert an Orphaned record (partial post, no signaled tail).
   void InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta, int batchSize,
                       uint64_t totalBytes = 0);
-
-  // Record post timestamp AFTER successful ibv_post_send.
-  // If the record has already been consumed by ReleaseByCqe, this is a no-op.
-  void RecordPostTimestamp(uint64_t recordId, uint64_t tsc);
 
   // CQE path: find record by recordId, release sqDepth, return CqCallbackMeta.
   // Returns nullptr if record not found.
@@ -227,9 +231,16 @@ class SubmissionLedger {
   bool HasOrphaned() const;
 
  private:
+  // Fixed, allocation-free ring keyed by recordId. A slot is empty iff its
+  // stored recordId is 0 (valid ledger ids start at notifPerQp > 0). Sized to a
+  // power of two so indexing is (recordId & capMask_). Memory footprint is
+  // capacity * sizeof(SubmissionRecord) per QP; sized from maxSqDepth, so very
+  // large maxSqDepth combined with many QPs increases per-QP memory.
+
   mutable std::mutex mu_;
   uint64_t nextId_;
-  std::unordered_map<uint64_t, SubmissionRecord> records_;
+  uint64_t capMask_{0};
+  std::vector<SubmissionRecord> ring_;
   bool timestamping_{false};
 };
 
@@ -266,6 +277,11 @@ struct EndpointRuntime {
 
   EndpointId id{0};
   EpPair ep;
+  // Cached pointer to this endpoint's NotifManager::QpNotifContext, published once
+  // at registration. Lets the hot CQ poller resolve the notif context without
+  // locking NotifManager::mu on every poll. Type-erased (void*) to avoid a header
+  // dependency on the NotifManager-private struct; nullptr until registered.
+  std::atomic<void*> notifCtx{nullptr};
 };
 
 using EpPairVec = std::vector<EpPair>;

@@ -9,6 +9,14 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(googletest)
 
+# Core logging is header-only (spdlog); test its thread-safety independently of
+# BUILD_IO. Run under ThreadSanitizer to actually prove the maps are safe.
+add_executable(test_logging utils/test_logging.cpp)
+target_include_directories(test_logging PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(test_logging PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_logging PRIVATE mori_logging gtest_main)
+add_test(NAME logging_concurrency COMMAND test_logging)
+
 add_executable(test_transport_tcp application/test_transport_tcp.cpp)
 
 target_include_directories(test_transport_tcp
