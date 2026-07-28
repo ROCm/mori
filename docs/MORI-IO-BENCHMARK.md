@@ -3,6 +3,7 @@
 ## Table of Contents
 
 - [Benchmark Commands](#benchmark-commands)
+- [C++ Benchmark (nixlbench-matching)](#c-benchmark-nixlbench-matching)
 - [Benchmark Arguments](#benchmark-arguments)
 - [Results: Thor2 RDMA Read](#results-thor2-rdma-read)
 - [Results: Thor2 RDMA Write](#results-thor2-rdma-write)
@@ -47,6 +48,108 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
 > Requires ROCm ≥ 7.15 (HIP fabric VMM APIs). Only GPU memory is supported
 > (`--mem-type gpu`). If the two nodes are not in the same vPOD, session creation
 > fails fast with a clear error.
+
+## C++ Benchmark (nixlbench-matching)
+
+The commands above use the **Python** benchmark (`tests/python/io/benchmark.py`).
+There is also a native **C++** benchmark, `tests/cpp/io/bench_engine.cpp`, whose
+measurement loop is written to **match [nixlbench](https://github.com/ai-dynamo/nixl)**
+(NVIDIA NIXL's `xferbench`) exactly, so MORI-IO and NIXL RDMA numbers are
+apples-to-apples on the same fabric. Use it when you want a head-to-head
+comparison against NIXL, or a benchmark with zero Python-interpreter overhead
+(which biases the Python numbers by ~2 µs/iter at small message sizes).
+
+What "nixl-matching" means here:
+
+- **One whole-loop timer** around the entire iteration loop (not a per-iteration
+  sum), identical to nixlbench's `total_timer`.
+- **Latency is reported per single transfer**: `total_us / (iters × batch)`,
+  matching nixl's `avg_latency = total_duration / (per_thread_iter × batch_size)`.
+- **Bandwidth** `= msg × batch × iters / 1e9 / (total_us / 1e6)` (GB = 10⁹), same
+  units as nixl.
+- **Completion is always an inline spin-poll** in the benchmark thread (mirroring
+  nixl's `getXferStatus` scan); there is no cv-blocking wait that would add wakeup
+  latency and make numbers non-comparable.
+- **Strict stop-and-wait** (one request outstanding at a time, == nixl
+  `--pipeline_depth 1`): post one request, spin until it completes, then post the
+  next.
+- **Warmup** iterations are excluded from timing (`--warmup-iters`, nixl
+  `--warmup_iter`).
+
+### Build
+
+`bench_engine` builds with the C++ tests (both options default `ON`):
+
+```bash
+cd /path/to/mori
+cmake -B build -DBUILD_IO=ON -DBUILD_TESTS=ON
+cmake --build build --target bench_engine -j
+# binary: build/tests/cpp/bench_engine
+```
+
+The MORI shared libraries must be discoverable at runtime. After an editable
+install they live in `python/mori`:
+
+```bash
+export LD_LIBRARY_PATH=/path/to/mori/python/mori:$LD_LIBRARY_PATH
+```
+
+### Run (two nodes)
+
+Unlike the Python benchmark (which uses `torchrun` for the out-of-band
+rendezvous), the C++ benchmark does its own TCP rendezvous between two
+processes: **rank 1 is the target and must be started first**, then **rank 0 is
+the initiator** and drives all transfers. `--master-ip` is rank 0's IP; each
+process passes its own peer-reachable data-plane IP via `--self-ip`.
+
+```bash
+# On the TARGET node (rank 1) — start this FIRST:
+MORI_DISABLE_AUTO_XGMI=1 build/tests/cpp/bench_engine \
+    --rank 1 --master-ip 10.190.162.0 --self-ip 10.190.162.1 --port 18515 \
+    --op write --all --sweep-start 1048576 --sweep-max 33554432 --sweep-step 1048576 \
+    --iters 500 --warmup-iters 50 --num-qp-per-transfer 4 --enable-sess
+
+# On the INITIATOR node (rank 0) — start this SECOND (prints the results table):
+MORI_DISABLE_AUTO_XGMI=1 build/tests/cpp/bench_engine \
+    --rank 0 --master-ip 10.190.162.0 --self-ip 10.190.162.0 --port 18515 \
+    --op write --all --sweep-start 1048576 --sweep-max 33554432 --sweep-step 1048576 \
+    --iters 500 --warmup-iters 50 --num-qp-per-transfer 4 --enable-sess
+```
+
+Both ranks must be given the **same** benchmark args (op, sweep, batch, etc.).
+Only rank 0 (initiator) prints the results table:
+
+```
+MsgSize(B)  Batch  Iters  AvgBW(GB/s)  AvgLat(us)  TotalDur(us)
+```
+
+### Sweep modes
+
+- `--all` — sweep message size. Geometric ×2 by default, or linear when
+  `--sweep-step > 0`, from `--sweep-start` to `--sweep-max`; batch stays at
+  `--transfer-batch-size`.
+- `--all-batch` — fix message size at `--buffer-size` and sweep batch
+  `1,2,4,…,32768`.
+- neither — a single `(--buffer-size, --transfer-batch-size)` point.
+
+### Differences from the Python flags
+
+Most flags share names with the Python benchmark (`--op-type`/`--op`,
+`--num-qp-per-transfer`, `--num-worker-threads`, `--transfer-batch-size`,
+`--enable-sess`, `--batch-contiguous`, `--disable-chunking`, `--chunk-bytes`,
+`--poll_cq_mode`, `--mem-type`, `--all`, `--all-batch`), but note:
+
+| Python | C++ (nixl-style) | Notes |
+|--------|------------------|-------|
+| `torchrun ... --node_rank` | `--rank 0` / `--rank 1` | C++ uses its own TCP rendezvous; **start rank 1 first**. |
+| `--host` | `--master-ip` + `--self-ip` | `--master-ip` = rank 0's IP; `--self-ip` = each node's peer-reachable IP. |
+| `--enable-batch-transfer` (default OFF) | `--enable-batch-transfer` / `--disable-batch-transfer` (C++ default **ON**) | Same meaning as Python: **ON** = one N-descriptor batch request (the nixl-equivalent; nixl always batches); **OFF** = `--transfer-batch-size` N *individual* single-transfer submissions per iteration (Python `run_single_once`). The C++ tool defaults **ON** so the out-of-the-box run and `--all-batch` sweep are nixl-comparable; pass `--disable-batch-transfer` for the Python single-submission path. |
+| *(n/a)* | `--warmup-iters` / `--iters` | Explicit warmup (untimed) and timed iteration counts. |
+| `--sweep-start-size` / `--sweep-max-size` | `--sweep-start` / `--sweep-max` (aliases accepted) | Plus `--sweep-step` for a linear (vs geometric) sweep. |
+
+> Keep the process on the RDMA path with `MORI_DISABLE_AUTO_XGMI=1`. Use
+> `--self-ip` equal to the data-plane IP each node advertises for QP setup;
+> `0.0.0.0` will fail with `connect(...): Connection refused`.
 
 ## Benchmark Arguments
 

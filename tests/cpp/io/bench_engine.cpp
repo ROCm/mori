@@ -21,14 +21,9 @@
 //      numbers non-comparable). MORI's blocking Wait() path is exercised only by
 //      the Python benchmark, not this nixl-parity tool.
 //
-//   3. PIPELINE DEPTH.
-//      nixlbench keeps `pipeline_depth` transfers in flight (default 1). We
-//      expose --inflight to match: default 1 = strict stop-and-wait, matching
-//      nixl --pipeline_depth 1.
+//   3. WARMUP excluded from timing (nixl: --warmup_iter, default 100).
 //
-//   4. WARMUP excluded from timing (nixl: --warmup_iter, default 100).
-//
-//   5. throughput_gb = total_bytes / 1e9 / (total_duration_us / 1e6), GB=10^9,
+//   4. throughput_gb = total_bytes / 1e9 / (total_duration_us / 1e6), GB=10^9,
 //      identical unit to nixl. total_bytes = msg * batch * num_iter, and
 //      avg_latency = total_duration / (num_iter * batch) -- i.e. PER SINGLE
 //      TRANSFER, matching nixl's total_duration/(per_thread_iter*batch_size)
@@ -180,7 +175,6 @@ struct Args {
   size_t sweep_step = 0;         // --sweep-step (0 = geometric x2; >0 = linear +step)
   int iters = 500;
   int warmup = 50;               // --warmup-iters
-  int inflight = 1;              // == nixl pipeline_depth (transfers/requests in flight)
 
   // RdmaBackendConfig knobs
   int qp_per_transfer = 4;       // --num-qp-per-transfer
@@ -196,6 +190,10 @@ struct Args {
 
   // batch / session
   int batch = 1;                 // --transfer-batch-size (transfers per request)
+  bool enable_batch_transfer = true;  // --enable-batch-transfer / --disable-batch-transfer.
+                                 // ON (default): batch>1 => ONE N-descriptor batch request
+                                 // (nixl-equivalent). OFF: batch>1 => N individual single
+                                 // transfers per iteration (Python run_single_once path).
   bool batch_contiguous = false; // --batch-contiguous (adjacent offsets → merged WR);
                                  // default strided (each transfer a separate WR)
   bool enable_sess = false;      // --enable-sess (session fast-path); Python default: off
@@ -227,7 +225,6 @@ static Args ParseArgs(int argc, char** argv) {
     else if (k == "--sweep-step") a.sweep_step = std::stoull(next());
     else if (k == "--iters") a.iters = std::stoi(next());
     else if (k == "--warmup" || k == "--warmup-iters") a.warmup = std::stoi(next());
-    else if (k == "--inflight") a.inflight = std::stoi(next());
     else if (k == "--qp-per-transfer" || k == "--num-qp-per-transfer") a.qp_per_transfer = std::stoi(next());
     else if (k == "--worker-threads" || k == "--num-worker-threads") a.worker_threads = std::stoi(next());
     else if (k == "--post-batch-size") a.post_batch_size = std::stoi(next());
@@ -239,6 +236,8 @@ static Args ParseArgs(int argc, char** argv) {
     else if (k == "--max-cqe-num") a.max_cqe_num = std::stoi(next());
     else if (k == "--max-msg-sge") a.max_msg_sge = std::stoi(next());
     else if (k == "--batch" || k == "--transfer-batch-size") a.batch = std::stoi(next());
+    else if (k == "--enable-batch-transfer") a.enable_batch_transfer = true;
+    else if (k == "--disable-batch-transfer") a.enable_batch_transfer = false;
     else if (k == "--batch-contiguous") a.batch_contiguous = true;
     else if (k == "--enable-sess") a.enable_sess = true;
     else if (k == "--disable-sess") a.enable_sess = false;
@@ -377,34 +376,29 @@ int main(int argc, char** argv) {
   }
   const bool isRead = (a.op == "read");
 
-  // Spin to completion, same mechanism as the timed loop (status flag stored by
-  // MORI's CQ worker thread). Used for warmup; keeps warmup identical to the
-  // measured path so caches/QP state are primed the same way.
-  auto spinDone = [&](TransferStatus& s) {
-    while (s.InProgress() || s.Init()) { /* spin: CQ worker thread stores status */ }
-    if (s.Failed()) {
-      std::cerr << "warmup transfer failed: " << s.Message() << std::endl;
-      std::exit(1);
-    }
-  };
-
   std::cout << "MsgSize(B)  Batch  Iters  AvgBW(GB/s)  AvgLat(us)  TotalDur(us)" << std::endl;
 
   for (auto& planEntry : plan) {
     const size_t msg = planEntry.first;
     const int curBatch = planEntry.second;
-    // nixl-style: batch>1 always issues one N-descriptor batch request (no
-    // separate enable flag). batch==1 is the degenerate single-transfer case.
-    const bool batched = curBatch > 1;
-    const int depth = std::min(a.inflight, a.iters);
-    std::vector<TransferStatus> st(depth);
-    std::vector<TransferUniqueId> uid(depth);
+    // Two ways to move curBatch transfers per iteration, mirroring the Python bench:
+    //   --enable-batch-transfer (default, batched): ONE N-descriptor batch request
+    //     (BatchWrite/BatchRead) -- the nixl-equivalent (nixl always batches).
+    //   --disable-batch-transfer (singles): curBatch INDIVIDUAL single-transfer
+    //     submissions per iteration (Python run_single_once), each its own status.
+    // batch==1 is a single transfer either way.
+    const bool batched = a.enable_batch_transfer && curBatch > 1;
+    const int perSlot = batched ? 1 : curBatch;    // statuses per request
+    // Strict stop-and-wait: one request outstanding at a time (nixl
+    // --pipeline_depth 1). [perSlot] status array (TransferStatus is
+    // non-copyable, so a flat vector rather than nested).
+    std::vector<TransferStatus> st(static_cast<size_t>(perSlot));
 
-    // Batch layout. Strided (default): slot i at (msg+1)*i so the N transfers
-    // stay SEPARATE WRs (stresses SQ, real batching) — matches Python default.
-    // Contiguous (--batch-contiguous): slot i at msg*i, adjacent, so MORI may
-    // merge them into one big WR (fast but not really batching, and hits the
-    // 1 GiB max_msg_sz without chunking).
+    // Batch layout for the batched path. Strided (default): transfer i at
+    // (msg+1)*i so the N transfers stay SEPARATE WRs (stresses SQ, real batching)
+    // -- matches Python default. Contiguous (--batch-contiguous): transfer i at
+    // msg*i, adjacent, so MORI may merge them into one big WR (fast but not really
+    // batching, and hits the 1 GiB max_msg_sz without chunking).
     const size_t stride = a.batch_contiguous ? msg : (msg + 1);
     SizeVec offsets(curBatch), sizes(curBatch);
     for (int i = 0; i < curBatch; ++i) {
@@ -415,59 +409,80 @@ int main(int argc, char** argv) {
     MemDescVec locVec{localMem}, remVec{peerMem};
     BatchSizeVec offVec{offsets}, sizeVec{sizes};
 
-    auto post = [&](int slot) {
-      st[slot].SetCode(StatusCode::INIT);
-      uid[slot] = useSess ? sessPtr->AllocateTransferUniqueId() : engine.AllocateTransferUniqueId();
+    auto post = [&]() {
+      TransferStatus* base = &st[0];
+      for (int i = 0; i < perSlot; ++i) base[i].SetCode(StatusCode::INIT);
       if (batched) {
+        // ONE N-descriptor batch request (nixl / Python --enable-batch-transfer).
+        TransferUniqueId id =
+            useSess ? sessPtr->AllocateTransferUniqueId() : engine.AllocateTransferUniqueId();
         if (useSess) {
-          if (isRead) sessPtr->BatchRead(offsets, offsets, sizes, &st[slot], uid[slot]);
-          else        sessPtr->BatchWrite(offsets, offsets, sizes, &st[slot], uid[slot]);
+          if (isRead) sessPtr->BatchRead(offsets, offsets, sizes, &base[0], id);
+          else        sessPtr->BatchWrite(offsets, offsets, sizes, &base[0], id);
         } else {
-          TransferStatusPtrVec sp{&st[slot]};
-          TransferUniqueIdVec ids{uid[slot]};
+          TransferStatusPtrVec sp{&base[0]};
+          TransferUniqueIdVec ids{id};
           if (isRead) engine.BatchRead(locVec, offVec, remVec, offVec, sizeVec, sp, ids);
           else        engine.BatchWrite(locVec, offVec, remVec, offVec, sizeVec, sp, ids);
         }
       } else {
-        if (useSess) {
-          if (isRead) sessPtr->Read(0, 0, msg, &st[slot], uid[slot]);
-          else        sessPtr->Write(0, 0, msg, &st[slot], uid[slot]);
-        } else {
-          if (isRead) engine.Read(localMem, 0, peerMem, 0, msg, &st[slot], uid[slot]);
-          else        engine.Write(localMem, 0, peerMem, 0, msg, &st[slot], uid[slot]);
+        // curBatch individual single-transfer submissions (Python run_single_once);
+        // contiguous offsets i*msg, matching Python's single path. curBatch==1 is a
+        // single transfer at offset 0.
+        for (int i = 0; i < curBatch; ++i) {
+          const size_t off = static_cast<size_t>(i) * msg;
+          TransferUniqueId id =
+              useSess ? sessPtr->AllocateTransferUniqueId() : engine.AllocateTransferUniqueId();
+          if (useSess) {
+            if (isRead) sessPtr->Read(off, off, msg, &base[i], id);
+            else        sessPtr->Write(off, off, msg, &base[i], id);
+          } else {
+            if (isRead) engine.Read(localMem, off, peerMem, off, msg, &base[i], id);
+            else        engine.Write(localMem, off, peerMem, off, msg, &base[i], id);
+          }
         }
       }
     };
 
+    // The request is complete only when ALL perSlot sub-transfers have left
+    // INIT/IN_PROGRESS (mirrors Python waiting on the whole status_list). Spin,
+    // like the timed loop. reqFailed returns the first failed status, or nullptr.
+    auto reqDone = [&]() {
+      TransferStatus* base = &st[0];
+      for (int i = 0; i < perSlot; ++i)
+        if (base[i].InProgress() || base[i].Init()) return false;
+      return true;
+    };
+    auto reqFailed = [&]() -> TransferStatus* {
+      TransferStatus* base = &st[0];
+      for (int i = 0; i < perSlot; ++i)
+        if (base[i].Failed()) return &base[i];
+      return nullptr;
+    };
+
     // ---- warmup (excluded from timing) ----
     for (int w = 0; w < a.warmup; ++w) {
-      post(0);
-      spinDone(st[0]);
+      post();
+      while (!reqDone()) { /* spin: CQ worker thread stores status */ }
+      if (TransferStatus* f = reqFailed()) {
+        std::cerr << "warmup transfer failed: " << f->Message() << std::endl;
+        std::exit(1);
+      }
     }
 
     // ---- timed region: ONE whole-loop timer, nixl-style ----
-    int completed = 0, issued = 0;
+    // Strict stop-and-wait (nixl --pipeline_depth 1): post one request, spin
+    // until it completes, then post the next.
     auto t0 = Clock::now();
 
-    // prime the pipeline. NOTE: all `depth` in-flight slots reuse the same buffer
-    // window (non-batched posts all target offset 0; batched slots share the same
-    // offsets vector), so with --inflight > 1 concurrent transfers overlap the
-    // same bytes. That's fine for a throughput/latency benchmark (data is not
-    // validated), matching nixl which likewise reuses its IOV across slots.
-    for (int s = 0; s < depth; ++s) { post(s); ++issued; }
-
-    while (completed < a.iters) {
-      for (int s = 0; s < depth; ++s) {
-        // spin-poll this slot, mirroring nixl's "check status, if IN_PROG
-        // continue" scan (status flag is stored by MORI's CQ worker thread)
-        if (st[s].InProgress() || st[s].Init()) continue;
-        if (st[s].Failed()) {
-          std::cerr << "transfer failed: " << st[s].Message() << std::endl;
-          std::exit(1);
-        }
-        // completed one
-        ++completed;
-        if (issued < a.iters) { post(s); ++issued; }
+    for (int completed = 0; completed < a.iters; ++completed) {
+      post();
+      // spin-poll, mirroring nixl's "check status, if IN_PROG continue" scan
+      // (status flags stored by MORI's CQ worker thread)
+      while (!reqDone()) { /* spin */ }
+      if (TransferStatus* f = reqFailed()) {
+        std::cerr << "transfer failed: " << f->Message() << std::endl;
+        std::exit(1);
       }
     }
     auto t1 = Clock::now();
@@ -475,12 +490,13 @@ int main(int argc, char** argv) {
     double total_us =
         std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(t1 - t0).count();
     // nixl parity (nixl_worker/utils.cpp): count block_size*batch_size*num_iter
-    // bytes over ONE whole-loop timer, and report latency PER SINGLE TRANSFER:
-    //   total_bytes  = msg * batch * iters
+    // bytes over ONE whole-loop timer, and report latency PER SINGLE TRANSFER.
+    // Both batched and singles modes move curBatch transfers of `msg` per iter:
+    //   total_bytes  = msg * curBatch * iters
     //   avg_bw       = total_bytes/1e9 / (total_us/1e6)                 [GB/s, GB=10^9]
-    //   avg_latency  = total_us / (iters * batch)                       [us per transfer]
+    //   avg_latency  = total_us / (iters * curBatch)                    [us per transfer]
     // matching nixl's avg_latency = total_duration/(per_thread_iter*batch_size).
-    const int effBatch = batched ? curBatch : 1;
+    const int effBatch = curBatch;
     const double numXfers = static_cast<double>(a.iters) * effBatch;
     double total_bytes = static_cast<double>(msg) * numXfers;
     double avg_bw = (total_bytes / 1e9) / (total_us / 1e6);   // GB/s, GB=10^9
