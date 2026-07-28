@@ -1133,53 +1133,8 @@ struct ccoSdmaQueueDeviceHandle {
     return index % queue_size_in_bytes;
   }
 
-  __device__ __forceinline__ bool CanWriteUpto(uint64_t uptoIndex) {
-    const uint64_t queue_size_in_bytes = CCO_SDMA_QUEUE_SIZE;
-    if ((uptoIndex - cachedHwReadIndex) < queue_size_in_bytes) {
-      return true;
-    }
-    // Only read hardware register if the queue is full based on cached index
-    cachedHwReadIndex = __hip_atomic_load(rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    return (uptoIndex - cachedHwReadIndex) < queue_size_in_bytes;
-  }
-
-  __device__ __forceinline__ uint64_t ReserveQueueSpace(const size_t size_in_bytes,
-                                                        uint64_t& offset) {
-    const uint64_t queue_size_in_bytes = CCO_SDMA_QUEUE_SIZE;
-
-    uint64_t cur_index;
-    [[maybe_unused]] int retries = 0;
-
-    while (true) {
-      cur_index = __hip_atomic_load(cachedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      offset = 0;
-
-      // Wraparound and Pad NOPs on remaining bytes
-      if (WrapIntoRing(cur_index) + size_in_bytes > queue_size_in_bytes) {
-        offset = (queue_size_in_bytes - WrapIntoRing(cur_index));
-      }
-      uint64_t new_index = cur_index + size_in_bytes + offset;
-
-      if (CanWriteUpto(new_index)) {
-        if (__hip_atomic_compare_exchange_strong(cachedWptr, &cur_index, new_index,
-                                                 __ATOMIC_RELAXED, __ATOMIC_RELAXED,
-                                                 __HIP_MEMORY_SCOPE_AGENT)) {
-          break;
-        }
-      }
-      if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
-        if (retries++ == CCO_SDMA_MAX_RETRIES) {
-          __builtin_trap();  // Retry limit exceeded on reserve queue space
-          break;
-        }
-      }
-    }
-    return cur_index;
-  }
-
-  // Fixed-size slot via a single atomic_fetch_add: no CAS retry, no wrap-pad
-  // branch, 16B-aligned. slotBytes must divide CCO_SDMA_QUEUE_SIZE.
+  // Reserve slotBytes with one atomic_fetch_add (no CAS retry). Returns the
+  // monotonic base; keeping packets off the ring end is the caller's job.
   __device__ __forceinline__ uint64_t ReserveSlot(uint64_t slotBytes) {
     uint64_t base =
         __hip_atomic_fetch_add(cachedWptr, slotBytes, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -1196,32 +1151,6 @@ struct ccoSdmaQueueDeviceHandle {
       } while ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE);
     }
     return base;
-  }
-
-  template <typename PacketType>
-  __device__ __forceinline__ void placePacket(PacketType& packet, uint64_t& pendingWptr,
-                                              uint64_t offset) {
-    // Ensure that one warp can write the whole packet
-    static_assert(sizeof(PacketType) / sizeof(uint32_t) <= 64);
-
-    const uint32_t numOffsetDwords = offset / sizeof(uint32_t);
-    const uint32_t numDwords = sizeof(PacketType) / sizeof(uint32_t);
-    uint32_t* packetPtr = reinterpret_cast<uint32_t*>(&packet);
-
-    uint64_t base_index_in_dwords = WrapIntoRing(pendingWptr) / sizeof(uint32_t);
-
-    for (int i = 0; i < numOffsetDwords; i++) {
-      __hip_atomic_store(queueBuf + base_index_in_dwords + i, 0, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
-    }
-    pendingWptr += offset;
-    base_index_in_dwords = WrapIntoRing(pendingWptr) / sizeof(uint32_t);
-
-    for (int i = 0; i < numDwords; i++) {
-      __hip_atomic_store(queueBuf + base_index_in_dwords + i, packetPtr[i], __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
-    }
-    pendingWptr += sizeof(PacketType);
   }
 
   __device__ __forceinline__ void submitPacket(uint64_t base, uint64_t pendingWptr) {
@@ -1265,13 +1194,20 @@ struct ccoSdmaQueueDeviceHandle {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Post Tasks                                           */
 /* ---------------------------------------------------------------------------------------------- */
-// Post one COPY slot on queue `qId`, plus 0/1/2 trailing ATOMIC signal packets.
-// localTarget/remoteTarget are absolute signalBuf slot addresses precomputed by
-// the caller (src-dimension: signalBuf[myLsaRank*n+q]); each is filled only when
-// its template flag is set. Slot is 64B for <=1 atomic, 128B for 2 (both divide
-// the 256KB ring, never straddle wrap). Reserving one slot keeps concurrent
-// same-queue issuers from interleaving. Plain stores, published by
-// submitPacket's s_waitcnt(0).
+// Post one COPY on queue `qId`, plus 0/1/2 trailing ATOMIC signal packets.
+// localTarget/remoteTarget are precomputed signalBuf slot addresses, each filled
+// only when its template flag is set.
+//
+// A slot is a whole number of 32B units, one packet per unit: COPY (28B) padded
+// with a NOP dword, then a unit per ATOMIC (32B exactly) — 32/64/96B for 0/1/2
+// signals. Every reservation is a multiple of 32B and so is the ring, so a unit
+// is always 32B-aligned within it and only the unit start needs wrapping; a
+// packet is never split, which is what the engine requires. Note this survives a
+// queue carrying mixed slot sizes, whereas "slot size divides the ring" would
+// not — that only keeps the offset aligned while every slot is the same size.
+//
+// Reserving the slot in one go keeps concurrent same-queue issuers from
+// interleaving. Plain stores, published by submitPacket's s_waitcnt(0).
 template <bool localSignal = false, bool remoteSignal = false, bool Ring = true>
 inline __device__ void ccoSdmaPostCopy(ccoSdmaQueueDeviceHandle** deviceHandles, uint32_t qId,
                                        HSAuint64* localTarget, HSAuint64* remoteTarget,
@@ -1281,31 +1217,55 @@ inline __device__ void ccoSdmaPostCopy(ccoSdmaQueueDeviceHandle** deviceHandles,
   ccoSdmaQueueDeviceHandle handle = **(deviceHandles + qId);
 
   constexpr int kNumAtomic = (localSignal ? 1 : 0) + (remoteSignal ? 1 : 0);
-  constexpr uint64_t kSlot = (kNumAtomic <= 1) ? 64 : 128;
-  constexpr int kSlotDwords = kSlot / sizeof(uint32_t);
-  static_assert(CCO_SDMA_QUEUE_SIZE % kSlot == 0);
-  static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR) + kNumAtomic * sizeof(CCO_SDMA_PKT_ATOMIC) <= kSlot);
+  constexpr uint64_t kUnit = 32;
+  constexpr int kUnitDwords = kUnit / sizeof(uint32_t);
+  constexpr uint64_t kSlot = kUnit * (1 + kNumAtomic);
+  constexpr uint64_t kRingDwords = CCO_SDMA_QUEUE_SIZE / sizeof(uint32_t);
+  static_assert(CCO_SDMA_QUEUE_SIZE % kUnit == 0, "ring must be a whole number of units");
+  static_assert((kRingDwords & (kRingDwords - 1)) == 0, "ring must be a power of two to mask");
+  static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR) <= kUnit, "COPY must fit one unit");
+  static_assert(sizeof(CCO_SDMA_PKT_ATOMIC) == kUnit, "ATOMIC must be exactly one unit");
 
   const uint64_t base = handle.ReserveSlot(kSlot);
-  uint32_t* q = handle.queueBuf + (handle.WrapIntoRing(base) / sizeof(uint32_t));
+  const uint64_t baseDw = handle.WrapIntoRing(base) / sizeof(uint32_t);
 
-  auto packet_d = ccoCreateCopyPacket(srcPtr, dstPtr, size);
-  const uint32_t* pd = reinterpret_cast<const uint32_t*>(&packet_d);
-  for (int i = 0; i < 7; i++) q[i] = pd[i];
-  int off = 7;
-  if constexpr (localSignal) {
-    auto pa = ccoCreateAtomicIncPacket(localTarget);
-    const uint32_t* p = reinterpret_cast<const uint32_t*>(&pa);
-    for (int i = 0; i < 8; i++) q[off + i] = p[i];
-    off += 8;
+  // Store a unit whole: lets the compiler use 16B stores instead of splitting on
+  // the COPY packet's odd dword count.
+  struct alignas(16) Unit {
+    uint32_t dw[kUnitDwords];
+  };
+  static_assert(sizeof(Unit) == kUnit);
+
+  auto emit = [&](auto unitPtr) {
+    Unit img;
+    auto packet_d = ccoCreateCopyPacket(srcPtr, dstPtr, size);
+    const uint32_t* pd = reinterpret_cast<const uint32_t*>(&packet_d);
+    for (int i = 0; i < 7; i++) img.dw[i] = pd[i];
+    img.dw[7] = 0;  // NOP (op=0), pads COPY out to the unit; engine skips it
+    *reinterpret_cast<Unit*>(unitPtr(0)) = img;
+
+    if constexpr (localSignal) {
+      auto pa = ccoCreateAtomicIncPacket(localTarget);
+      const uint32_t* p = reinterpret_cast<const uint32_t*>(&pa);
+      for (int i = 0; i < 8; i++) img.dw[i] = p[i];
+      *reinterpret_cast<Unit*>(unitPtr(1)) = img;
+    }
+    if constexpr (remoteSignal) {
+      auto pa = ccoCreateAtomicIncPacket(remoteTarget);
+      const uint32_t* p = reinterpret_cast<const uint32_t*>(&pa);
+      for (int i = 0; i < 8; i++) img.dw[i] = p[i];
+      *reinterpret_cast<Unit*>(unitPtr(localSignal ? 2 : 1)) = img;
+    }
+  };
+
+  // Contiguous unless the queue has carried mixed slot sizes; the fast path keeps
+  // the units adjacent so the stores merge (~2-3% of trigger with one signal).
+  if (__builtin_expect(baseDw + kSlot / sizeof(uint32_t) <= kRingDwords, 1)) {
+    uint32_t* q = handle.queueBuf + baseDw;
+    emit([&](int u) { return q + u * kUnitDwords; });
+  } else {
+    emit([&](int u) { return handle.queueBuf + ((baseDw + u * kUnitDwords) & (kRingDwords - 1)); });
   }
-  if constexpr (remoteSignal) {
-    auto pa = ccoCreateAtomicIncPacket(remoteTarget);
-    const uint32_t* p = reinterpret_cast<const uint32_t*>(&pa);
-    for (int i = 0; i < 8; i++) q[off + i] = p[i];
-    off += 8;
-  }
-  for (int i = off; i < kSlotDwords; i++) q[i] = 0;  // NOP (op=0), engine skips
 
   if constexpr (Ring) handle.submitPacket(base, base + kSlot);
 }
@@ -1398,6 +1358,13 @@ inline __device__ void ccoSdmaCommitBlock(ccoSdmaQueueDeviceHandle** deviceHandl
 inline __device__ void ccoSdmaDrainQueue(ccoSdmaQueueDeviceHandle& handle) {
   uint64_t target =
       __hip_atomic_load(handle.committedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  // Aggregate puts that were never commit()ed sit past committedWptr, so this
+  // would return without them having been rung.
+  if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
+    if (__hip_atomic_load(handle.cachedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) > target) {
+      __builtin_trap();  // un-committed Aggregate puts: call commit() first
+    }
+  }
   while (__hip_atomic_load(handle.rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < target) {
     __builtin_amdgcn_s_sleep(1);
   }
@@ -1493,6 +1460,11 @@ struct ccoSdma {
   }
 
   // quiet: wait for all outstanding ops to `peer` across every queue.
+  // One queue per lane, strided so a group smaller than the queue count still
+  // covers all of them. Even an idle queue costs one uncached rptr read, so
+  // spreading them over lanes issues those together rather than back to back
+  // (~20% off when only one queue has traffic). Thread scope falls back to the
+  // sequential loop.
   template <typename Coop = ccoCoopThread>
   __device__ inline void quiet(int peer) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
@@ -1501,32 +1473,49 @@ struct ccoSdma {
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     Coop coop{};
-    if (coop.thread_rank() == 0) {
-      for (uint32_t q = 0; q < n; q++) {
-        ccoSdmaQueueDeviceHandle handle = **(s.deviceHandles + peer * n + q);
-        ccoSdmaDrainQueue(handle);
-      }
+    for (uint32_t q = static_cast<uint32_t>(coop.thread_rank()); q < n;
+         q += static_cast<uint32_t>(coop.size())) {
+      ccoSdmaQueueDeviceHandle handle = **(s.deviceHandles + peer * n + q);
+      ccoSdmaDrainQueue(handle);
     }
     coop.sync();  // completion visible to the whole group before returning
   }
 
-  // quietQueue: drain one (peer, queueId) queue via rptr (the calling thread waits).
+  // quietQueue: drain one (peer, queueId) queue via rptr. warp/block poll from
+  // the leader only — every thread polling multiplies the uncached rptr reads by
+  // the group size and drains no sooner (~0.4us at block scope). An out-of-range
+  // queueId still joins the sync, keeping the barrier uniform.
+  template <typename Coop = ccoCoopThread>
   __device__ inline void quietQueue(int peer, int queueId) {
+    static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
+                      std::is_same_v<Coop, ccoCoopBlock>,
+                  "ccoSdma::quietQueue supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
-    if (queueId < 0 || static_cast<uint32_t>(queueId) >= n) return;
-    ccoSdmaQueueDeviceHandle handle = **(s.deviceHandles + peer * n + queueId);
-    ccoSdmaDrainQueue(handle);
+    Coop coop{};
+    if (queueId >= 0 && static_cast<uint32_t>(queueId) < n && coop.thread_rank() == 0) {
+      ccoSdmaQueueDeviceHandle handle = **(s.deviceHandles + peer * n + queueId);
+      ccoSdmaDrainQueue(handle);
+    }
+    coop.sync();
   }
 
   // waitSignal: poll the local signal counter for (srcRank, queueId) until it
   // reaches `expected` (>=). The slot is written by a put with localSignal
   // (src = self) or by a peer's put with remoteSignal (src = that peer). `expected`
-  // is maintained by the caller (monotonic; the slot is not auto-reset).
+  // is maintained by the caller (monotonic; the slot is not auto-reset) and is
+  // per (srcRank, queueId) — one running total per pair.
+  // srcRank is an LSA rank, like put()'s `peer`: to wait on your own localSignal
+  // pass comm.lsaRank, not comm.rank (they coincide only on a single node). A bad
+  // srcRank traps under MORI_CCO_SDMA_DEBUG rather than returning, since silently
+  // skipping a wait breaks the caller's synchronization.
   __device__ inline void waitSignal(int srcRank, int queueId, uint64_t expected) {
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     if (queueId < 0 || static_cast<uint32_t>(queueId) >= n) return;
+    if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
+      if (srcRank < 0 || srcRank >= comm.lsaSize) __builtin_trap();  // bad srcRank
+    }
     HSAuint64* slot =
         s.signalBuf + (static_cast<uint32_t>(srcRank) * n + static_cast<uint32_t>(queueId));
     while (__hip_atomic_load(slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < expected) {
