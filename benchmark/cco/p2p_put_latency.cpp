@@ -73,17 +73,44 @@ __global__ void ibgda_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin
   }
 }
 
-// SDMA: one thread issues a single whole-buffer put on queue 0 + quiet per
-// iteration, so the per-op time tracks the SDMA dispatch + completion round trip.
+// SDMA: a single whole-buffer put on queue 0 + quiet per iteration, so the
+// per-op time tracks the SDMA dispatch + completion round trip. Coop selects the
+// issue granularity only — the copy is never split, so all three scopes move the
+// same bytes over the same queue and the delta is pure issue overhead:
+//   thread — the calling thread fills the WQE and rings the doorbell.
+//   warp / block — the group's leader does it (leader-only single writer).
+// Completion waits on queue 0 only. quiet<Coop>() would drain every queue, and
+// the extra uncached rptr read on an idle queue costs ~1.3us here — real, but an
+// artifact of quiet's all-queue semantics rather than of the issue scope.
+template <typename Coop>
 __global__ void sdma_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int peerLsa, int iter) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  if (blockIdx.x != 0) return;
   ccoSdma sdma{devComm};
   const size_t bytes = len_doubles * sizeof(double);
   for (int i = 0; i < iter; i++) {
-    sdma.put(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), 0,
-             reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, 0);
+    sdma.put<Coop>(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), 0,
+                   reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, 0);
+    // Every lane spins on the same rptr, so the drain is group-wide on its own;
+    // sync() only pins the iteration boundary for the whole group.
     sdma.quietQueue(peerLsa, 0);
+    Coop{}.sync();
+  }
+}
+
+static void launch_sdma_lat(PutScope scope, ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
+                            size_t len_doubles, ccoDevComm devComm, int peerLsa, int iter,
+                            int block_threads) {
+  if (scope == PutScope::kWarp) {
+    hipLaunchKernelGGL((sdma_put_lat<ccoCoopWarp>), dim3(1), dim3(block_threads), 0, 0, sendWin,
+                       recvWin, len_doubles, devComm, peerLsa, iter);
+  } else if (scope == PutScope::kBlock) {
+    hipLaunchKernelGGL((sdma_put_lat<ccoCoopBlock>), dim3(1), dim3(block_threads), 0, 0, sendWin,
+                       recvWin, len_doubles, devComm, peerLsa, iter);
+  } else {
+    // thread / thread_agg: SDMA has no ThreadAggregate mode, so both run one thread.
+    hipLaunchKernelGGL((sdma_put_lat<ccoCoopThread>), dim3(1), dim3(1), 0, 0, sendWin, recvWin,
+                       len_doubles, devComm, peerLsa, iter);
   }
 }
 
@@ -102,6 +129,11 @@ int main(int argc, char** argv) {
   PerfArgs& args = ctx.args;
   const int my_pe = ctx.my_pe;
   const bool run_kernels = (my_pe == 0);
+
+  // SDMA keeps its historical thread-scope default; -s selects warp/block.
+  if (args.transport == Transport::kSdma && !args.put_scope_explicit) {
+    args.put_scope = PutScope::kThread;
+  }
 
   const int block_threads =
       LatencyBlockThreads(args.put_scope, args.threads_per_block, ctx.device_warp_size);
@@ -132,8 +164,8 @@ int main(int argc, char** argv) {
     if (run_kernels) {
       const float ms = RunWarmupAndTimed(res, args.warmup, args.iters, [&](int count) {
         if (args.transport == Transport::kSdma) {
-          hipLaunchKernelGGL(sdma_put_lat, dim3(1), dim3(1), 0, 0, ctx.send_win, ctx.recv_win,
-                             len_doubles, ctx.devComm, ctx.peer_lsa_rank, count);
+          launch_sdma_lat(args.put_scope, ctx.send_win, ctx.recv_win, len_doubles, ctx.devComm,
+                          ctx.peer_lsa_rank, count, block_threads);
         } else if (args.transport == Transport::kLsa) {
           hipLaunchKernelGGL(lsa_put_lat, grid, block, 0, 0, ctx.send_win, ctx.recv_win,
                              len_doubles, ctx.peer_lsa_rank, count);
@@ -154,10 +186,11 @@ int main(int argc, char** argv) {
 
   ccoBarrierAll(ctx.comm);
   if (my_pe == 0) {
-    // SDMA latency uses a single queue / single thread.
+    // SDMA latency always uses a single queue; thread_agg has no SDMA analogue.
     int print_block = block_threads;
     const char* print_scope = ScopeToChar(args.put_scope);
-    if (args.transport == Transport::kSdma) {
+    if (args.transport == Transport::kSdma &&
+        (args.put_scope == PutScope::kThread || args.put_scope == PutScope::kThreadAgg)) {
       print_block = 1;
       print_scope = "thread";
     }

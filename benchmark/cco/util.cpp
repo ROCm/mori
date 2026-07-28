@@ -144,6 +144,7 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
         } else {
           return 1;
         }
+        out_args->put_scope_explicit = true;
         break;
       default:
         return 1;

@@ -80,6 +80,7 @@ struct PerfArgs {
   int nblocks = kDefaultNumBlocks;
   int threads_per_block = kDefaultThreadsPerBlock;
   PutScope put_scope = PutScope::kBlock;
+  bool put_scope_explicit = false;
   // Default IBGDA; overridden by the -t flag or, when -t is absent, in PerfInit
   // from MORI_ENABLE_SDMA / MORI_DISABLE_P2P.
   Transport transport = Transport::kIbgda;
