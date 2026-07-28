@@ -46,6 +46,17 @@ namespace mori::cco::benchmark {
 // batch instead of per-peer grouping). Bandwidth kernels only; latency uses thread.
 enum class PutScope { kThread, kWarp, kBlock, kThreadAgg };
 
+// How an SDMA op waits for local completion (latency kernels). Named after the
+// API the kernel calls; both give the same sender-side guarantee at different cost.
+//   kQuiet  — quietQueue(): wait for the engine's read pointer to pass our wptr.
+//   kSignal — put carries a trailing ATOMIC into our own signalBuf slot, then
+//             waitSignal() polls it.
+enum class SdmaComp { kQuiet, kSignal };
+
+inline const char* SdmaCompToChar(SdmaComp comp) {
+  return comp == SdmaComp::kSignal ? "signal" : "quiet";
+}
+
 // Which CCO p2p transport to exercise. Selected by the MORI_DISABLE_P2P env
 // var (consistent with the rest of mori): unset or enabled → kIbgda (P2P
 // disabled, use RDMA); explicitly disabled (0/false/off/no) → kLsa.
@@ -81,6 +92,7 @@ struct PerfArgs {
   int threads_per_block = kDefaultThreadsPerBlock;
   PutScope put_scope = PutScope::kBlock;
   bool put_scope_explicit = false;
+  SdmaComp sdma_comp = SdmaComp::kQuiet;
   // Default IBGDA; overridden by the -t flag or, when -t is absent, in PerfInit
   // from MORI_ENABLE_SDMA / MORI_DISABLE_P2P.
   Transport transport = Transport::kIbgda;
