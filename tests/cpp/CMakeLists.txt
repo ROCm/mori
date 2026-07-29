@@ -34,6 +34,20 @@ if(BUILD_IO)
   target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_protocol mori_application mori_io)
 
+  add_executable(test_tcp_protocol io/test_tcp_protocol.cpp)
+  target_include_directories(test_tcp_protocol PUBLIC ${CMAKE_SOURCE_DIR}/include
+                                                     ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_tcp_protocol GTest::gtest_main mori_application mori_io)
+  add_test(NAME test_tcp_protocol COMMAND test_tcp_protocol)
+  set_tests_properties(test_tcp_protocol PROPERTIES TIMEOUT 30)
+
+  add_executable(test_tcp_transport io/test_tcp_transport.cpp)
+  target_include_directories(test_tcp_transport PUBLIC ${CMAKE_SOURCE_DIR}/include
+                                                      ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_tcp_transport GTest::gtest_main mori_application mori_io)
+  add_test(NAME test_tcp_transport COMMAND test_tcp_transport)
+  set_tests_properties(test_tcp_transport PROPERTIES TIMEOUT 30)
+
   add_executable(test_rail_affinity io/test_rail_affinity.cpp)
 
   target_include_directories(test_rail_affinity

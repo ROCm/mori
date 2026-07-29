@@ -43,12 +43,14 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
@@ -56,6 +58,7 @@
 #include "mori/io/common.hpp"
 #include "mori/io/engine.hpp"
 #include "mori/io/logging.hpp"
+#include "src/io/tcp/protocol.hpp"
 #include "src/io/xgmi/hip_resource_pool.hpp"
 
 namespace mori {
@@ -123,213 +126,12 @@ inline uint16_t GetBoundPort(int fd) {
 }
 
 // ---------------------------------------------------------------------------
-// Wire protocol constants and helpers
-// ---------------------------------------------------------------------------
-namespace tcp {
-
-constexpr uint32_t kCtrlMagic = 0x4D544330;  // "MTC0"
-constexpr uint32_t kDataMagic = 0x4D544430;  // "MTD0"
-constexpr uint16_t kProtoVersion = 2;
-
-enum class Channel : uint8_t { CTRL = 1, DATA = 2 };
-
-enum class CtrlMsgType : uint8_t {
-  HELLO = 1,
-  WRITE_REQ = 2,
-  READ_REQ = 3,
-  BATCH_WRITE_REQ = 4,
-  BATCH_READ_REQ = 5,
-  COMPLETION = 6,
-};
-
-constexpr size_t kCtrlHeaderSize = 12;
-constexpr size_t kDataHeaderSize = 24;
-
-struct CtrlHeaderView {
-  CtrlMsgType type{CtrlMsgType::HELLO};
-  uint32_t bodyLen{0};
-};
-struct DataHeaderView {
-  uint16_t flags{0};
-  uint64_t opId{0};
-  uint64_t payloadLen{0};
-};
-
-// Compact wire writer (appends big-endian values)
-struct WireWriter {
-  std::vector<uint8_t> buf;
-  void reserve(size_t n) { buf.reserve(n); }
-  void u8(uint8_t v) { buf.push_back(v); }
-  void u16(uint16_t v) {
-    v = htons(v);
-    auto* p = reinterpret_cast<uint8_t*>(&v);
-    buf.insert(buf.end(), p, p + 2);
-  }
-  void u32(uint32_t v) {
-    v = htonl(v);
-    auto* p = reinterpret_cast<uint8_t*>(&v);
-    buf.insert(buf.end(), p, p + 4);
-  }
-  void u64(uint64_t v) {
-    v = htobe64(v);
-    auto* p = reinterpret_cast<uint8_t*>(&v);
-    buf.insert(buf.end(), p, p + 8);
-  }
-  void bytes(const void* d, size_t n) {
-    auto* p = static_cast<const uint8_t*>(d);
-    buf.insert(buf.end(), p, p + n);
-  }
-};
-
-// Compact wire reader (reads big-endian values from buffer)
-struct WireReader {
-  const uint8_t* data;
-  size_t len;
-  size_t off{0};
-  bool u8(uint8_t* o) {
-    if (off + 1 > len) return false;
-    *o = data[off++];
-    return true;
-  }
-  bool u16(uint16_t* o) {
-    if (off + 2 > len) return false;
-    uint16_t v;
-    memcpy(&v, data + off, 2);
-    *o = ntohs(v);
-    off += 2;
-    return true;
-  }
-  bool u32(uint32_t* o) {
-    if (off + 4 > len) return false;
-    uint32_t v;
-    memcpy(&v, data + off, 4);
-    *o = ntohl(v);
-    off += 4;
-    return true;
-  }
-  bool u64(uint64_t* o) {
-    if (off + 8 > len) return false;
-    uint64_t v;
-    memcpy(&v, data + off, 8);
-    *o = be64toh(v);
-    off += 8;
-    return true;
-  }
-};
-
-inline bool TryParseCtrlHeader(const uint8_t* buf, size_t len, CtrlHeaderView* h) {
-  if (len < kCtrlHeaderSize) return false;
-  WireReader r{buf, len};
-  uint32_t magic;
-  uint16_t ver;
-  uint8_t type, reserved;
-  if (!r.u32(&magic) || !r.u16(&ver) || !r.u8(&type) || !r.u8(&reserved) || !r.u32(&h->bodyLen))
-    return false;
-  if (magic != kCtrlMagic || ver != kProtoVersion) return false;
-  h->type = static_cast<CtrlMsgType>(type);
-  return true;
-}
-
-inline bool TryParseDataHeader(const uint8_t* buf, size_t len, DataHeaderView* h) {
-  if (len < kDataHeaderSize) return false;
-  WireReader r{buf, len};
-  uint32_t magic;
-  uint16_t ver;
-  if (!r.u32(&magic) || !r.u16(&ver) || !r.u16(&h->flags) || !r.u64(&h->opId) ||
-      !r.u64(&h->payloadLen))
-    return false;
-  return (magic == kDataMagic && ver == kProtoVersion);
-}
-
-// Build a ctrl frame: header(12B) + body
-inline std::vector<uint8_t> BuildCtrlFrame(CtrlMsgType type,
-                                           const std::function<void(WireWriter&)>& writeBody) {
-  WireWriter body;
-  writeBody(body);
-  WireWriter frame;
-  frame.reserve(kCtrlHeaderSize + body.buf.size());
-  frame.u32(kCtrlMagic);
-  frame.u16(kProtoVersion);
-  frame.u8(static_cast<uint8_t>(type));
-  frame.u8(0);
-  frame.u32(static_cast<uint32_t>(body.buf.size()));
-  frame.bytes(body.buf.data(), body.buf.size());
-  return std::move(frame.buf);
-}
-
-inline std::vector<uint8_t> BuildHello(Channel ch, const EngineKey& key) {
-  return BuildCtrlFrame(CtrlMsgType::HELLO, [&](WireWriter& w) {
-    w.u8(static_cast<uint8_t>(ch));
-    w.u32(static_cast<uint32_t>(key.size()));
-    w.bytes(key.data(), key.size());
-  });
-}
-
-// Unified request builder for WRITE_REQ, READ_REQ (single segment)
-inline std::vector<uint8_t> BuildLinearReq(CtrlMsgType type, uint64_t opId, uint32_t memId,
-                                           uint64_t off, uint64_t size, uint8_t lanes) {
-  return BuildCtrlFrame(type, [&](WireWriter& w) {
-    w.u64(opId);
-    w.u32(memId);
-    w.u64(off);
-    w.u64(size);
-    w.u8(lanes);
-  });
-}
-
-// Unified request builder for BATCH_WRITE_REQ, BATCH_READ_REQ
-inline std::vector<uint8_t> BuildBatchReq(CtrlMsgType type, uint64_t opId, uint32_t memId,
-                                          const std::vector<uint64_t>& offs,
-                                          const std::vector<uint64_t>& sizes, uint8_t lanes) {
-  return BuildCtrlFrame(type, [&](WireWriter& w) {
-    w.u64(opId);
-    w.u32(memId);
-    w.u32(static_cast<uint32_t>(offs.size()));
-    for (size_t i = 0; i < offs.size(); ++i) {
-      w.u64(offs[i]);
-      w.u64(sizes[i]);
-    }
-    w.u8(lanes);
-  });
-}
-
-inline std::vector<uint8_t> BuildCompletion(uint64_t opId, uint32_t code, const std::string& msg) {
-  return BuildCtrlFrame(CtrlMsgType::COMPLETION, [&](WireWriter& w) {
-    w.u64(opId);
-    w.u32(code);
-    w.u32(static_cast<uint32_t>(msg.size()));
-    w.bytes(msg.data(), msg.size());
-  });
-}
-
-inline std::vector<uint8_t> BuildDataHeader(uint64_t opId, uint64_t payloadLen, uint16_t flags) {
-  WireWriter w;
-  w.reserve(kDataHeaderSize);
-  w.u32(kDataMagic);
-  w.u16(kProtoVersion);
-  w.u16(flags);
-  w.u64(opId);
-  w.u64(payloadLen);
-  return std::move(w.buf);
-}
-
-}  // namespace tcp
-
-// ---------------------------------------------------------------------------
 // Segment and lane helpers
 // ---------------------------------------------------------------------------
 struct Segment {
   uint64_t off{0};
   uint64_t len{0};
 };
-
-constexpr uint8_t kLaneBits = 4;
-constexpr uint64_t kLaneMask = (1ULL << kLaneBits) - 1ULL;
-
-inline uint64_t ToWireOpId(uint64_t userOpId, uint8_t lane) {
-  return (userOpId << kLaneBits) | lane;
-}
-inline uint64_t ToUserOpId(uint64_t wireOpId) { return wireOpId >> kLaneBits; }
 
 struct LaneSpan {
   uint64_t off{0};
@@ -342,17 +144,20 @@ inline LaneSpan ComputeLaneSpan(uint64_t total, uint8_t lanes, uint8_t lane) {
   return {uint64_t(lane) * base + std::min<uint64_t>(lane, rem), base + (lane < rem ? 1 : 0)};
 }
 
-inline uint16_t LanesAllMask(uint8_t n) {
-  return (n >= (1U << kLaneBits)) ? 0xFFFF : uint16_t((1U << n) - 1);
-}
-inline uint8_t ClampLanesTotal(uint8_t n) {
-  return n == 0 ? 1 : std::min<uint8_t>(n, 1U << kLaneBits);
-}
-
 inline uint64_t SumLens(const std::vector<Segment>& segs) {
   uint64_t t = 0;
   for (auto& s : segs) t += s.len;
   return t;
+}
+
+inline bool TrySumLens(const std::vector<Segment>& segs, uint64_t* out) {
+  uint64_t total = 0;
+  for (const auto& seg : segs) {
+    if (seg.len > std::numeric_limits<uint64_t>::max() - total) return false;
+    total += seg.len;
+  }
+  *out = total;
+  return true;
 }
 
 inline std::vector<Segment> SliceSegments(const std::vector<Segment>& segs, uint64_t start,
@@ -389,8 +194,17 @@ inline bool IsSingleContiguousSpan(const std::vector<Segment>& segs, uint64_t* o
 
 inline bool SegmentsInRange(const std::vector<Segment>& segs, uint64_t memSize) {
   for (auto& s : segs)
-    if (s.off + s.len > memSize) return false;
+    if (s.off > memSize || s.len > memSize - s.off) return false;
   return true;
+}
+
+inline bool SegmentsOverlap(const std::vector<Segment>& segs) {
+  std::vector<Segment> sorted = segs;
+  std::sort(sorted.begin(), sorted.end(),
+            [](const Segment& a, const Segment& b) { return a.off < b.off; });
+  for (size_t i = 1; i < sorted.size(); ++i)
+    if (sorted[i - 1].off + sorted[i - 1].len > sorted[i].off) return true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +229,10 @@ class PinnedStagingPool {
   void Release(PinnedBuf* b);
   static size_t RoundUp(size_t v) {
     size_t p = 1;
-    while (p < v) p <<= 1;
+    while (p < v) {
+      if (p > std::numeric_limits<size_t>::max() / 2) return v;
+      p <<= 1;
+    }
     return p;
   }
 
@@ -442,6 +259,7 @@ struct SendItem {
 struct Connection {
   int fd{-1};
   bool isOutgoing{false}, connecting{false}, helloSent{false}, helloReceived{false};
+  bool assigned{false}, handedOff{false};
   tcp::Channel ch{tcp::Channel::CTRL};
   EngineKey peerKey;
   std::vector<uint8_t> inbuf;
@@ -450,58 +268,22 @@ struct Connection {
 
 class DataConnectionWorker;
 
-struct PeerLinks {
-  int ctrlFd{-1};
-  std::vector<int> dataFds;
-  std::vector<DataConnectionWorker*> workers;
-  int ctrlPending{0}, dataPending{0};
-  bool CtrlUp() const { return ctrlFd >= 0; }
-  bool DataUp() const { return !dataFds.empty(); }
+struct RecvTargetKey {
+  tcp::DataKind kind{tcp::DataKind::WRITE_PAYLOAD};
+  TransferUniqueId opId{0};
+  bool operator==(const RecvTargetKey& other) const {
+    return kind == other.kind && opId == other.opId;
+  }
 };
 
-struct InboundStatusEntry {
-  StatusCode code{StatusCode::INIT};
-  std::string msg;
+struct RecvTargetKeyHash {
+  size_t operator()(const RecvTargetKey& key) const {
+    size_t seed = std::hash<TransferUniqueId>{}(key.opId);
+    return seed ^ (std::hash<uint8_t>{}(static_cast<uint8_t>(key.kind)) + 0x9e3779b9 + (seed << 6) +
+                   (seed >> 2));
+  }
 };
 
-struct OutboundOpState {
-  EngineKey peer;
-  TransferUniqueId id{0};
-  bool isRead{false};
-  TransferStatus* status{nullptr};
-  MemoryDesc local{}, remote{};
-  std::vector<Segment> localSegs, remoteSegs;
-  uint64_t expectedRxBytes{0}, rxBytes{0};
-  bool completionReceived{false}, gpuCopyPending{false};
-  uint8_t lanesTotal{1};
-  uint16_t lanesDoneMask{0};
-  StatusCode completionCode{StatusCode::SUCCESS};
-  std::string completionMsg;
-  std::shared_ptr<PinnedBuf> pinned;
-  Clock::time_point startTs{Clock::now()};
-};
-
-struct InboundWriteState {
-  EngineKey peer;
-  TransferUniqueId id{0};
-  MemoryDesc dst{};
-  std::vector<Segment> dstSegs;
-  bool discard{false};
-  uint8_t lanesTotal{1};
-  uint16_t lanesDoneMask{0};
-  std::shared_ptr<PinnedBuf> pinned;
-};
-
-struct EarlyWriteLaneState {
-  uint64_t payloadLen{0};
-  std::shared_ptr<PinnedBuf> pinned;
-  bool complete{false};
-};
-struct EarlyWriteState {
-  std::unordered_map<uint8_t, EarlyWriteLaneState> lanes;
-};
-
-// Worker ←→ IO thread communication
 struct WorkerRecvTarget {
   uint8_t lanesTotal{1};
   uint64_t totalLen{0};
@@ -511,9 +293,87 @@ struct WorkerRecvTarget {
   std::shared_ptr<PinnedBuf> pinned;
 };
 
+struct PeerRecvTargets {
+  std::mutex mu;
+  std::unordered_map<RecvTargetKey, WorkerRecvTarget, RecvTargetKeyHash> entries;
+};
+
+struct PeerLinks {
+  int ctrlFd{-1};
+  std::vector<int> dataFds;
+  std::vector<DataConnectionWorker*> workers;
+  std::shared_ptr<PeerRecvTargets> recvTargets{std::make_shared<PeerRecvTargets>()};
+  size_t nextWorker{0};
+  Clock::time_point connectNotBefore{Clock::time_point::max()};
+  int ctrlPending{0}, dataPending{0};
+  bool CtrlUp() const { return ctrlFd >= 0; }
+  bool DataUp() const { return !dataFds.empty(); }
+};
+
+struct InboundStatusEntry {
+  StatusCode code{StatusCode::INIT};
+  std::string msg;
+  Clock::time_point created{Clock::now()};
+};
+
+struct OpKey {
+  EngineKey peer;
+  TransferUniqueId id{0};
+  bool operator==(const OpKey& other) const { return peer == other.peer && id == other.id; }
+  bool operator!=(const OpKey& other) const { return !(*this == other); }
+};
+
+struct OpKeyHash {
+  size_t operator()(const OpKey& key) const {
+    size_t seed = std::hash<EngineKey>{}(key.peer);
+    return seed ^ (std::hash<TransferUniqueId>{}(key.id) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
+  }
+};
+
+struct OutboundOpState {
+  OpKey key;
+  bool isRead{false};
+  bool finished{false};
+  TransferStatus* status{nullptr};
+  MemoryDesc local{}, remote{};
+  std::vector<Segment> localSegs, remoteSegs;
+  uint64_t expectedRxBytes{0}, rxBytes{0};
+  bool completionReceived{false}, gpuCopyPending{false};
+  uint8_t lanesTotal{1};
+  uint16_t lanesDoneMask{0};
+  uint16_t lanesSentMask{0};
+  StatusCode completionCode{StatusCode::SUCCESS};
+  std::string completionMsg;
+  std::shared_ptr<PinnedBuf> pinned;
+  Clock::time_point deadline{Clock::time_point::max()};
+};
+
+struct InboundWriteState {
+  EngineKey peer;
+  TransferUniqueId id{0};
+  MemoryDesc dst{};
+  std::vector<Segment> dstSegs;
+  bool discard{false};
+  bool completionSent{false};
+  uint8_t lanesTotal{1};
+  uint16_t lanesDoneMask{0};
+  std::shared_ptr<PinnedBuf> pinned;
+  Clock::time_point deadline{Clock::time_point::max()};
+};
+
+struct InboundReadState {
+  EngineKey peer;
+  TransferUniqueId id{0};
+  MemoryDesc src{};
+  std::vector<Segment> srcSegs;
+  uint8_t lanesTotal{1};
+  Clock::time_point deadline{Clock::time_point::max()};
+};
+
+// Worker ←→ IO thread communication
 enum class WorkerEventType : uint8_t {
   RECV_DONE = 0,
-  EARLY_DATA = 1,
+  AWAIT_TARGET = 1,
   SEND_CALLBACK = 2,
   CONN_ERROR = 3
 };
@@ -521,19 +381,39 @@ enum class WorkerEventType : uint8_t {
 struct WorkerEvent {
   WorkerEventType type{WorkerEventType::RECV_DONE};
   EngineKey peerKey;
+  tcp::DataKind dataKind{tcp::DataKind::WRITE_PAYLOAD};
   TransferUniqueId opId{0};
   uint8_t lane{0};
   uint64_t laneLen{0};
   bool discarded{false};
-  std::shared_ptr<PinnedBuf> earlyBuf;
   std::function<void()> callback;
   std::string errorMsg;
 };
 
 struct GpuTask {
+  EngineKey peer;
+  TransferUniqueId opId{0};
   int deviceId{-1};
   hipEvent_t ev{nullptr};
+  std::shared_ptr<PinnedBuf> staging;
   std::function<void()> onReady;
+};
+
+enum class RecvState : uint8_t { ReadHeader, AwaitTarget, RecvPayload, DiscardPayload };
+
+struct RecvCursor {
+  RecvState state{RecvState::ReadHeader};
+  std::array<uint8_t, tcp::kDataHeaderSize> hdr{};
+  size_t hdrGot{0};
+  tcp::ParsedDataHeader parsed{};
+  WorkerRecvTarget activeTarget{};
+  std::vector<Segment> laneSegs;
+  uint64_t laneOffset{0};
+  uint64_t payloadOff{0};
+  uint64_t payloadRemaining{0};
+  bool awaitNotified{false};
+  size_t segIndex{0};
+  uint64_t segOffset{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -541,7 +421,8 @@ struct GpuTask {
 // ---------------------------------------------------------------------------
 class DataConnectionWorker {
  public:
-  DataConnectionWorker(int fd, EngineKey peer, PinnedStagingPool* staging);
+  DataConnectionWorker(int fd, EngineKey peer, std::shared_ptr<PeerRecvTargets> recvTable,
+                       std::vector<uint8_t> initialBytes = {});
   ~DataConnectionWorker();
   DataConnectionWorker(const DataConnectionWorker&) = delete;
   DataConnectionWorker& operator=(const DataConnectionWorker&) = delete;
@@ -552,24 +433,23 @@ class DataConnectionWorker {
   int Fd() const { return fd_; }
 
   void SubmitSend(SendItem item);
-  void RegisterRecvTarget(TransferUniqueId opId, const WorkerRecvTarget& target);
-  void RemoveRecvTarget(TransferUniqueId opId);
+  void WakeWorker();
   void DrainEvents(std::deque<WorkerEvent>& out);
 
  private:
-  void WakeWorker();
   void NotifyMain();
   void PostEvent(WorkerEvent ev);
   void Run();
   bool ProcessSend();
   bool ProcessRecv();
-  bool RecvExact(uint8_t* dst, uint64_t len);
-  bool RecvIntoSegments(uint8_t* base, const std::vector<Segment>& segs, uint64_t totalLen);
-  bool DiscardPayload(uint64_t len);
+  ssize_t RecvSome(void* dst, size_t len);
+  bool BeginPayload();
+  bool ProcessPayload();
+  void FinishPayload();
 
   int fd_;
   EngineKey peerKey_;
-  PinnedStagingPool* staging_;
+  std::shared_ptr<PeerRecvTargets> recvTable_;
   std::atomic<bool> running_{false};
   std::thread thread_;
   int notifyFd_{-1}, wakeFd_{-1};
@@ -577,14 +457,11 @@ class DataConnectionWorker {
   std::mutex sendMu_;
   std::deque<SendItem> sendQ_;
 
-  std::mutex targetMu_;
-  std::unordered_map<TransferUniqueId, WorkerRecvTarget> recvTargets_;
-
   std::mutex eventMu_;
   std::deque<WorkerEvent> eventQ_;
-
-  uint8_t hdrBuf_[tcp::kDataHeaderSize]{};
-  size_t hdrGot_{0};
+  std::vector<uint8_t> initialBytes_;
+  size_t initialOffset_{0};
+  RecvCursor recv_;
 };
 
 // ---------------------------------------------------------------------------
@@ -628,32 +505,37 @@ class TcpTransport {
   void CloseConnInternal(Connection* c);
 
   // Connection management
-  void AssignConnToPeer(Connection* c);
+  enum class ConnResult : uint8_t { Alive, Gone };
+  ConnResult AssignConnToPeer(Connection* c);
   void MaybeDispatchQueuedOps(const EngineKey& peer);
   void EnsurePeerChannels(const EngineKey& peer);
-  void ConnectChannel(const EngineKey& peer, tcp::Channel ch);
+  bool ConnectChannel(const EngineKey& peer, tcp::Channel ch);
   void QueueHello(int fd);
   void AcceptNew();
   void DrainWakeFd();
   bool IsPeerReady(const EngineKey& peer);
 
   // Worker coordination
-  void RegisterRecvTargetWithWorkers(const EngineKey& peer, TransferUniqueId opId,
-                                     const WorkerRecvTarget& target);
-  void RemoveRecvTargetFromWorkers(const EngineKey& peer, TransferUniqueId opId);
+  bool RegisterRecvTarget(const EngineKey& peer, const RecvTargetKey& key,
+                          const WorkerRecvTarget& target);
+  void RemoveRecvTarget(const EngineKey& peer, const RecvTargetKey& key);
+  bool HasRecvTarget(const EngineKey& peer, const RecvTargetKey& key);
+  std::vector<DataConnectionWorker*> SelectWorkers(PeerLinks& links, uint8_t lanesTotal);
 
   // Data transfer
   void DispatchOp(std::unique_ptr<OutboundOpState> op);
   void QueueSend(int fd, std::vector<uint8_t> bytes, std::function<void()> onDone = nullptr);
-  void QueueDataSend(const std::vector<DataConnectionWorker*>& workers, const MemoryDesc& src,
-                     const std::vector<Segment>& srcSegs, uint64_t opId, uint8_t lanesTotal,
-                     std::function<void()> onLaneDone = nullptr);
+  bool QueueDataSend(const EngineKey& peer, const std::vector<DataConnectionWorker*>& workers,
+                     const MemoryDesc& src, const std::vector<Segment>& srcSegs, tcp::DataKind kind,
+                     uint64_t opId, uint8_t lanesTotal, std::function<void()> onLaneDone = nullptr);
 
   // GPU memory transfers
   bool ScheduleGpuCopy(int deviceId, bool toDevice, const MemoryDesc& mem,
                        const std::vector<Segment>& segs, std::shared_ptr<PinnedBuf> pinned,
+                       const EngineKey& peer, TransferUniqueId opId,
                        std::function<void()> onComplete);
   void PollGpuTasks();
+  void DrainGpuTasksForPeer(const EngineKey& peer);
 
   // Ctrl-connection I/O
   void UpdateWriteInterest(int fd);
@@ -664,13 +546,13 @@ class TcpTransport {
   void CloseAndRemoveFd(int fd);
   EngineKey FindPeerByFd(int fd);
   void ClosePeerByFd(int fd);
-  void ClosePeerByKey(const EngineKey& peer, const std::string& reason);
-  void FailPendingOpsForPeer(const EngineKey& peer, const std::string& msg);
+  void AbortPeer(EngineKey peer, StatusCode code, std::string reason);
+  void FinalizeOutbound(OpKey key, StatusCode code, std::string msg);
 
   // Ctrl message handling
-  void HandleCtrlReadable(Connection* c);
-  void HandleCtrlFrame(Connection* c, tcp::CtrlMsgType type, const uint8_t* body, size_t len);
-  void HandleHello(Connection* c, const uint8_t* body, size_t len);
+  ConnResult HandleCtrlReadable(Connection* c);
+  ConnResult HandleCtrlFrame(Connection* c, tcp::CtrlMsgType type, const uint8_t* body, size_t len);
+  ConnResult HandleHello(Connection* c, const uint8_t* body, size_t len);
   void HandleRequest(const EngineKey& peer, tcp::CtrlMsgType type, const uint8_t* body, size_t len);
   void HandleCompletion(const EngineKey& peer, const uint8_t* body, size_t len);
 
@@ -685,15 +567,23 @@ class TcpTransport {
   void FinalizeInboundWriteSetup(const EngineKey& peer, TransferUniqueId opId,
                                  InboundWriteState& ws);
   void MaybeFinalizeInboundWrite(const EngineKey& peer, TransferUniqueId opId);
-  void TryConsumeEarlyWriteLanes(const EngineKey& peer, TransferUniqueId opId);
+  void DispatchInboundRead(InboundReadState read);
+  void MaybeDispatchInboundReads(const EngineKey& peer);
   void MaybeCompleteOutbound(OutboundOpState& st);
 
   // Worker event processing
   void ProcessEventsFrom(DataConnectionWorker* worker);
   void ProcessWorkerEvents();
   void HandleWorkerRecvDone(const WorkerEvent& ev);
-  void HandleWorkerEarlyData(const WorkerEvent& ev);
+  void DrainSubmissions();
+  void RetryWaitingConnections();
+  void NoteAuxDeadline(Clock::time_point deadline);
+  void RecomputeAuxDeadline();
+  int ComputeEpollTimeoutMs();
+  bool IsLiveDeadline(const OpKey& key, Clock::time_point deadline) const;
   void ScanTimeouts();
+  void PruneInboundStatuses();
+  void ShutdownDrain();
 
   void IoLoop();
 
@@ -724,10 +614,14 @@ class TcpTransport {
   std::unordered_map<int, std::unique_ptr<Connection>> conns_;
   std::unordered_map<EngineKey, PeerLinks> peers_;
   std::unordered_map<EngineKey, std::vector<std::unique_ptr<OutboundOpState>>> waitingOps_;
-  std::unordered_map<TransferUniqueId, std::unique_ptr<OutboundOpState>> pendingOutbound_;
+  std::unordered_map<OpKey, std::unique_ptr<OutboundOpState>, OpKeyHash> pendingOutbound_;
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, InboundWriteState>>
       inboundWrites_;
-  std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, EarlyWriteState>> earlyWrites_;
+  std::unordered_map<EngineKey, std::vector<InboundReadState>> pendingInboundReads_;
+  std::unordered_map<EngineKey,
+                     std::unordered_map<RecvTargetKey, Clock::time_point, RecvTargetKeyHash>>
+      awaitingTargets_;
+  std::deque<std::pair<Clock::time_point, OpKey>> deadlineDeque_;
 
   std::unordered_map<int, std::unique_ptr<DataConnectionWorker>> dataWorkers_;
   std::unordered_map<int, DataConnectionWorker*> workerNotifyMap_;
@@ -736,6 +630,9 @@ class TcpTransport {
   StreamPool streamPool_{8};
   EventPool eventPool_{64};
   std::deque<GpuTask> gpuTasks_;
+  Clock::time_point nextAuxDeadline_{Clock::time_point::max()};
+  Clock::time_point nextStatusPrune_{Clock::time_point::max()};
+  std::unordered_set<int>* closedThisBatch_{nullptr};
 };
 
 }  // namespace io

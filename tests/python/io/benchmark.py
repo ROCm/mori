@@ -309,6 +309,18 @@ def parse_args():
         help="RDMA max SGEs per send WR; 0 = use backend default (default: 0)",
     )
     parser.add_argument(
+        "--tcp-num-data-conns",
+        type=int,
+        default=8,
+        help="Parallel DATA connections per TCP peer (default: 8)",
+    )
+    parser.add_argument(
+        "--tcp-striping-threshold-bytes",
+        type=int,
+        default=64 * 1024,
+        help="Minimum TCP transfer size to stripe across DATA connections (default: 65536)",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="info",
@@ -354,6 +366,8 @@ class MoriIoBenchmark:
         max_send_wr: int = 0,
         max_cqe_num: int = 0,
         max_msg_sge: int = 0,
+        tcp_num_data_conns: int = 8,
+        tcp_striping_threshold_bytes: int = 64 * 1024,
         enable_chunking: bool = True,
         chunk_bytes: int = 65536,
         max_chunks: int = 64,
@@ -395,6 +409,8 @@ class MoriIoBenchmark:
         self.max_send_wr = max_send_wr
         self.max_cqe_num = max_cqe_num
         self.max_msg_sge = max_msg_sge
+        self.tcp_num_data_conns = tcp_num_data_conns
+        self.tcp_striping_threshold_bytes = tcp_striping_threshold_bytes
         self.enable_chunking = enable_chunking
         self.chunk_bytes = chunk_bytes
         self.max_chunks = max_chunks
@@ -782,7 +798,13 @@ class MoriIoBenchmark:
         )
         self.engine = IOEngine(key=f"{self.role.name}-{self.role_rank}", config=config)
         if self.backend_type == "tcp":
-            self.engine.create_backend(BackendType.TCP)
+            self.engine.create_backend(
+                BackendType.TCP,
+                TcpBackendConfig(
+                    num_data_conns=self.tcp_num_data_conns,
+                    striping_threshold_bytes=self.tcp_striping_threshold_bytes,
+                ),
+            )
         else:
             config = RdmaBackendConfig(
                 qp_per_transfer=self.num_qp_per_transfer,
@@ -1297,6 +1319,8 @@ def benchmark_engine(local_rank, node_rank, args):
         max_send_wr=args.max_send_wr,
         max_cqe_num=args.max_cqe_num,
         max_msg_sge=args.max_msg_sge,
+        tcp_num_data_conns=args.tcp_num_data_conns,
+        tcp_striping_threshold_bytes=args.tcp_striping_threshold_bytes,
         enable_chunking=not args.disable_chunking,
         chunk_bytes=args.chunk_bytes,
         max_chunks=args.max_chunks,

@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <ostream>
+#include <stdexcept>
 
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
@@ -131,7 +132,10 @@ struct TcpBackendConfig : public BackendConfig {
         keepaliveCnt(keepaliveCnt_),
         enableCtrlNodelay(enableCtrlNodelay_),
         numDataConns(numDataConns_),
-        stripingThresholdBytes(stripingThresholdBytes_) {}
+        stripingThresholdBytes(stripingThresholdBytes_) {
+    if (numDataConns < 1 || numDataConns > 16)
+      throw std::invalid_argument("TCP numDataConns must be in [1, 16]");
+  }
 
   int sockSndbufBytes{32 * 1024 * 1024};
   int sockRcvbufBytes{32 * 1024 * 1024};

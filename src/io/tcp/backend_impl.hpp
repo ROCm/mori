@@ -79,6 +79,7 @@ class TcpBackend : public Backend {
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote) override;
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
+  bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
  private:
   EngineKey myEngKey;

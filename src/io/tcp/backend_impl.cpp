@@ -89,5 +89,9 @@ bool TcpBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
   return transport->PopInboundTransferStatus(remote, id, status);
 }
 
+bool TcpBackend::CanHandle(const MemoryDesc&, const MemoryDesc& remote) const {
+  return !remote.engineKey.empty();
+}
+
 }  // namespace io
 }  // namespace mori

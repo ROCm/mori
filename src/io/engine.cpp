@@ -456,6 +456,12 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
     return rdmaIt->second.get();
   }
 
+  auto tcpIt = backends.find(BackendType::TCP);
+  if (tcpIt != backends.end() && tcpIt->second->CanHandle(local, remote)) {
+    UpdateRouteCache(routeKey, BackendType::TCP);
+    return tcpIt->second.get();
+  }
+
   // No backend can handle this pair (e.g. cross-node under XGMI-only fallback).
   return nullptr;
 }

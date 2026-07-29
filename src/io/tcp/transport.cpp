@@ -22,7 +22,9 @@
 
 #include "src/io/tcp/transport.hpp"
 
+#include <climits>
 #include <limits>
+#include <stdexcept>
 
 namespace mori {
 namespace io {
@@ -90,8 +92,13 @@ void SendItem::Advance(size_t n) {
 // ===========================================================================
 // DataConnectionWorker
 // ===========================================================================
-DataConnectionWorker::DataConnectionWorker(int fd, EngineKey peer, PinnedStagingPool* staging)
-    : fd_(fd), peerKey_(std::move(peer)), staging_(staging) {
+DataConnectionWorker::DataConnectionWorker(int fd, EngineKey peer,
+                                           std::shared_ptr<PeerRecvTargets> recvTable,
+                                           std::vector<uint8_t> initialBytes)
+    : fd_(fd),
+      peerKey_(std::move(peer)),
+      recvTable_(std::move(recvTable)),
+      initialBytes_(std::move(initialBytes)) {
   notifyFd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
   wakeFd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 }
@@ -109,8 +116,8 @@ void DataConnectionWorker::Start() {
 }
 
 void DataConnectionWorker::Stop() {
-  if (!running_.exchange(false)) return;
-  WakeWorker();
+  bool wasRunning = running_.exchange(false);
+  if (wasRunning) WakeWorker();
   if (thread_.joinable()) thread_.join();
 }
 
@@ -120,17 +127,6 @@ void DataConnectionWorker::SubmitSend(SendItem item) {
     sendQ_.push_back(std::move(item));
   }
   WakeWorker();
-}
-
-void DataConnectionWorker::RegisterRecvTarget(TransferUniqueId opId,
-                                              const WorkerRecvTarget& target) {
-  std::lock_guard<std::mutex> lk(targetMu_);
-  recvTargets_[opId] = target;
-}
-
-void DataConnectionWorker::RemoveRecvTarget(TransferUniqueId opId) {
-  std::lock_guard<std::mutex> lk(targetMu_);
-  recvTargets_.erase(opId);
 }
 
 void DataConnectionWorker::DrainEvents(std::deque<WorkerEvent>& out) {
@@ -170,20 +166,28 @@ void DataConnectionWorker::Run() {
   pfds[1].events = POLLIN;
 
   while (running_.load()) {
+    if (initialOffset_ < initialBytes_.size() && recv_.state != RecvState::AwaitTarget) {
+      if (!ProcessRecv()) break;
+      if (!running_.load()) break;
+    }
     bool hasSend;
     {
       std::lock_guard<std::mutex> lk(sendMu_);
       hasSend = !sendQ_.empty();
     }
 
-    pfds[0].events = POLLIN | (hasSend ? POLLOUT : 0);
+    const bool awaitingTarget = recv_.state == RecvState::AwaitTarget;
+    pfds[0].events = (awaitingTarget ? 0 : POLLIN) | (hasSend ? POLLOUT : 0);
     pfds[0].revents = pfds[1].revents = 0;
 
-    int n = ::poll(pfds, 2, hasSend ? 0 : 1);
+    int n = ::poll(pfds, 2, -1);
     if (n < 0) {
       if (errno == EINTR) continue;
-      PostEvent({WorkerEventType::CONN_ERROR, peerKey_, 0, 0, 0, false, nullptr, nullptr,
-                 std::string("poll failed: ") + strerror(errno)});
+      WorkerEvent ev;
+      ev.type = WorkerEventType::CONN_ERROR;
+      ev.peerKey = peerKey_;
+      ev.errorMsg = std::string("poll failed: ") + strerror(errno);
+      PostEvent(std::move(ev));
       break;
     }
 
@@ -191,10 +195,14 @@ void DataConnectionWorker::Run() {
       uint64_t v;
       while (::read(wakeFd_, &v, sizeof(v)) > 0) {
       }
+      if (recv_.state == RecvState::AwaitTarget && !ProcessRecv()) break;
     }
     if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-      PostEvent({WorkerEventType::CONN_ERROR, peerKey_, 0, 0, 0, false, nullptr, nullptr,
-                 "data connection error/hangup"});
+      WorkerEvent ev;
+      ev.type = WorkerEventType::CONN_ERROR;
+      ev.peerKey = peerKey_;
+      ev.errorMsg = "data connection error/hangup";
+      PostEvent(std::move(ev));
       break;
     }
     if ((pfds[0].revents & POLLOUT) && !ProcessSend()) break;
@@ -229,8 +237,11 @@ bool DataConnectionWorker::ProcessSend() {
       ssize_t n = ::sendmsg(fd_, &msg, MSG_NOSIGNAL | item.flags);
       if (n < 0) {
         if (IsWouldBlock(errno)) goto requeue;
-        PostEvent({WorkerEventType::CONN_ERROR, peerKey_, 0, 0, 0, false, nullptr, nullptr,
-                   std::string("sendmsg failed: ") + strerror(errno)});
+        WorkerEvent ev;
+        ev.type = WorkerEventType::CONN_ERROR;
+        ev.peerKey = peerKey_;
+        ev.errorMsg = std::string("sendmsg failed: ") + strerror(errno);
+        PostEvent(std::move(ev));
         return false;
       }
       if (n == 0) goto requeue;
@@ -255,188 +266,194 @@ requeue: {
 
 bool DataConnectionWorker::ProcessRecv() {
   while (true) {
-    // Read data header
-    while (hdrGot_ < tcp::kDataHeaderSize) {
-      ssize_t n = ::recv(fd_, hdrBuf_ + hdrGot_, tcp::kDataHeaderSize - hdrGot_, 0);
+    if (recv_.state == RecvState::ReadHeader) {
+      ssize_t n = RecvSome(recv_.hdr.data() + recv_.hdrGot, tcp::kDataHeaderSize - recv_.hdrGot);
       if (n < 0) {
         if (IsWouldBlock(errno)) return true;
-        PostEvent({WorkerEventType::CONN_ERROR, peerKey_, 0, 0, 0, false, nullptr, nullptr,
-                   std::string("recv header failed: ") + strerror(errno)});
+        WorkerEvent ev;
+        ev.type = WorkerEventType::CONN_ERROR;
+        ev.peerKey = peerKey_;
+        ev.errorMsg = std::string("recv header failed: ") + strerror(errno);
+        PostEvent(std::move(ev));
         return false;
       }
       if (n == 0) {
-        PostEvent({WorkerEventType::CONN_ERROR, peerKey_, 0, 0, 0, false, nullptr, nullptr,
-                   "data connection closed by peer"});
+        WorkerEvent ev;
+        ev.type = WorkerEventType::CONN_ERROR;
+        ev.peerKey = peerKey_;
+        ev.errorMsg = "data connection closed by peer";
+        PostEvent(std::move(ev));
         return false;
       }
-      hdrGot_ += static_cast<size_t>(n);
-    }
-    hdrGot_ = 0;
-
-    tcp::DataHeaderView hv;
-    if (!tcp::TryParseDataHeader(hdrBuf_, tcp::kDataHeaderSize, &hv)) {
-      PostEvent({WorkerEventType::CONN_ERROR, peerKey_, 0, 0, 0, false, nullptr, nullptr,
-                 "bad data header"});
-      return false;
-    }
-
-    const uint8_t lane = static_cast<uint8_t>(hv.opId & kLaneMask);
-    const TransferUniqueId userOpId = static_cast<TransferUniqueId>(ToUserOpId(hv.opId));
-    const uint64_t payloadLen = hv.payloadLen;
-
-    // Look up recv target
-    WorkerRecvTarget target;
-    bool hasTarget = false;
-    {
-      std::lock_guard<std::mutex> lk(targetMu_);
-      auto it = recvTargets_.find(userOpId);
-      if (it != recvTargets_.end()) {
-        target = it->second;
-        hasTarget = true;
-      }
-    }
-
-    auto postRecvDone = [&](bool discarded = false) {
-      WorkerEvent ev;
-      ev.type = WorkerEventType::RECV_DONE;
-      ev.peerKey = peerKey_;
-      ev.opId = userOpId;
-      ev.lane = lane;
-      ev.laneLen = payloadLen;
-      ev.discarded = discarded;
-      PostEvent(std::move(ev));
-    };
-
-    if (hasTarget && !target.discard) {
-      const LaneSpan span = ComputeLaneSpan(target.totalLen, target.lanesTotal, lane);
-      if (span.len != payloadLen) {
-        MORI_IO_WARN("TCP: worker recv op {} lane {} len mismatch expected={} got={}", userOpId,
-                     (uint32_t)lane, span.len, payloadLen);
-        if (!DiscardPayload(payloadLen)) return false;
-        postRecvDone(true);
-      } else if (target.toGpu) {
-        if (!RecvExact(reinterpret_cast<uint8_t*>(target.pinned->ptr) + span.off, payloadLen))
-          return false;
-        postRecvDone();
-      } else {
-        if (!RecvIntoSegments(reinterpret_cast<uint8_t*>(target.cpuBase),
-                              SliceSegments(target.segs, span.off, span.len), payloadLen))
-          return false;
-        postRecvDone();
-      }
-    } else if (hasTarget) {
-      if (!DiscardPayload(payloadLen)) return false;
-      postRecvDone(true);
-    } else {
-      // Early data: no target registered yet
-      if (payloadLen == 0) {
+      recv_.hdrGot += static_cast<size_t>(n);
+      if (recv_.hdrGot < tcp::kDataHeaderSize) return true;
+      recv_.hdrGot = 0;
+      if (tcp::TryParseDataHeader(recv_.hdr.data(), recv_.hdr.size(), &recv_.parsed) !=
+          tcp::ParseError::Ok) {
         WorkerEvent ev;
-        ev.type = WorkerEventType::EARLY_DATA;
+        ev.type = WorkerEventType::CONN_ERROR;
         ev.peerKey = peerKey_;
-        ev.opId = userOpId;
-        ev.lane = lane;
-        ev.laneLen = 0;
+        ev.errorMsg = "bad data header";
         PostEvent(std::move(ev));
+        return false;
+      }
+      recv_.state = RecvState::AwaitTarget;
+    }
+
+    if (recv_.state == RecvState::AwaitTarget && !BeginPayload()) return true;
+    if ((recv_.state == RecvState::RecvPayload || recv_.state == RecvState::DiscardPayload) &&
+        !ProcessPayload())
+      return false;
+    if (recv_.state != RecvState::ReadHeader) return true;
+  }
+}
+
+ssize_t DataConnectionWorker::RecvSome(void* dst, size_t len) {
+  if (initialOffset_ < initialBytes_.size()) {
+    size_t n = std::min(len, initialBytes_.size() - initialOffset_);
+    std::memcpy(dst, initialBytes_.data() + initialOffset_, n);
+    initialOffset_ += n;
+    if (initialOffset_ == initialBytes_.size()) {
+      initialBytes_.clear();
+      initialOffset_ = 0;
+    }
+    return static_cast<ssize_t>(n);
+  }
+  return ::recv(fd_, dst, len, 0);
+}
+
+bool DataConnectionWorker::BeginPayload() {
+  const RecvTargetKey key{recv_.parsed.kind, recv_.parsed.opId};
+  {
+    std::lock_guard<std::mutex> lk(recvTable_->mu);
+    auto it = recvTable_->entries.find(key);
+    if (it == recvTable_->entries.end()) {
+      if (!recv_.awaitNotified) {
+        WorkerEvent ev;
+        ev.type = WorkerEventType::AWAIT_TARGET;
+        ev.peerKey = peerKey_;
+        ev.dataKind = recv_.parsed.kind;
+        ev.opId = recv_.parsed.opId;
+        ev.lane = recv_.parsed.lane;
+        PostEvent(std::move(ev));
+        recv_.awaitNotified = true;
+      }
+      return false;
+    }
+    recv_.activeTarget = it->second;
+  }
+
+  if (recv_.parsed.lane >= recv_.activeTarget.lanesTotal) {
+    WorkerEvent ev;
+    ev.type = WorkerEventType::CONN_ERROR;
+    ev.peerKey = peerKey_;
+    ev.errorMsg = "DATA lane exceeds request lanesTotal";
+    PostEvent(std::move(ev));
+    running_.store(false);
+    return false;
+  }
+
+  const LaneSpan span = ComputeLaneSpan(recv_.activeTarget.totalLen, recv_.activeTarget.lanesTotal,
+                                        recv_.parsed.lane);
+  recv_.laneOffset = span.off;
+  recv_.payloadOff = 0;
+  recv_.payloadRemaining = recv_.parsed.payloadLen;
+  recv_.segIndex = 0;
+  recv_.segOffset = 0;
+  recv_.laneSegs = SliceSegments(recv_.activeTarget.segs, span.off, span.len);
+  const bool badLength = span.len != recv_.parsed.payloadLen;
+  recv_.state = (recv_.activeTarget.discard || badLength) ? RecvState::DiscardPayload
+                                                          : RecvState::RecvPayload;
+  if (recv_.payloadRemaining == 0) FinishPayload();
+  return true;
+}
+
+bool DataConnectionWorker::ProcessPayload() {
+  while (recv_.payloadRemaining > 0) {
+    ssize_t n = -1;
+    if (recv_.state == RecvState::DiscardPayload) {
+      uint8_t discard[65536];
+      size_t want =
+          static_cast<size_t>(std::min<uint64_t>(recv_.payloadRemaining, sizeof(discard)));
+      n = RecvSome(discard, want);
+    } else {
+      assert(recv_.state == RecvState::RecvPayload);
+      constexpr uint64_t kMaxDirectRecvBytes = 16ULL << 20;
+      size_t want =
+          static_cast<size_t>(std::min<uint64_t>(recv_.payloadRemaining, kMaxDirectRecvBytes));
+      void* dst = nullptr;
+      if (recv_.activeTarget.toGpu) {
+        dst = static_cast<uint8_t*>(recv_.activeTarget.pinned->ptr) + recv_.laneOffset +
+              recv_.payloadOff;
       } else {
-        auto buf = staging_->Acquire(static_cast<size_t>(payloadLen));
-        if (!buf) {
-          if (!DiscardPayload(payloadLen)) return false;
-          postRecvDone(true);
-        } else {
-          if (!RecvExact(reinterpret_cast<uint8_t*>(buf->ptr), payloadLen)) return false;
-          WorkerEvent ev;
-          ev.type = WorkerEventType::EARLY_DATA;
-          ev.peerKey = peerKey_;
-          ev.opId = userOpId;
-          ev.lane = lane;
-          ev.laneLen = payloadLen;
-          ev.earlyBuf = std::move(buf);
-          PostEvent(std::move(ev));
+        if (recv_.segIndex >= recv_.laneSegs.size()) {
+          recv_.state = RecvState::DiscardPayload;
+          continue;
         }
+        const Segment& seg = recv_.laneSegs[recv_.segIndex];
+        want = static_cast<size_t>(std::min<uint64_t>(want, seg.len - recv_.segOffset));
+        dst = static_cast<uint8_t*>(recv_.activeTarget.cpuBase) + seg.off + recv_.segOffset;
+      }
+      n = RecvSome(dst, want);
+    }
+
+    if (n < 0) {
+      if (IsWouldBlock(errno)) return true;
+      WorkerEvent ev;
+      ev.type = WorkerEventType::CONN_ERROR;
+      ev.peerKey = peerKey_;
+      ev.errorMsg = std::string("recv payload failed: ") + strerror(errno);
+      PostEvent(std::move(ev));
+      return false;
+    }
+    if (n == 0) {
+      WorkerEvent ev;
+      ev.type = WorkerEventType::CONN_ERROR;
+      ev.peerKey = peerKey_;
+      ev.errorMsg = "data connection closed during payload";
+      PostEvent(std::move(ev));
+      return false;
+    }
+    recv_.payloadRemaining -= static_cast<uint64_t>(n);
+    recv_.payloadOff += static_cast<uint64_t>(n);
+    if (recv_.state == RecvState::RecvPayload && !recv_.activeTarget.toGpu) {
+      recv_.segOffset += static_cast<uint64_t>(n);
+      if (recv_.segOffset == recv_.laneSegs[recv_.segIndex].len) {
+        ++recv_.segIndex;
+        recv_.segOffset = 0;
       }
     }
   }
+  FinishPayload();
   return true;
 }
 
-bool DataConnectionWorker::RecvExact(uint8_t* dst, uint64_t len) {
-  uint64_t got = 0;
-  while (got < len) {
-    ssize_t n =
-        ::recv(fd_, dst + got, static_cast<size_t>(std::min<uint64_t>(len - got, 16ULL << 20)), 0);
-    if (n < 0) {
-      if (IsWouldBlock(errno)) continue;
-      PostEvent({WorkerEventType::CONN_ERROR, peerKey_, 0, 0, 0, false, nullptr, nullptr,
-                 std::string("recv payload failed: ") + strerror(errno)});
-      return false;
-    }
-    if (n == 0) {
-      PostEvent({WorkerEventType::CONN_ERROR, peerKey_, 0, 0, 0, false, nullptr, nullptr,
-                 "data connection closed during recv"});
-      return false;
-    }
-    got += static_cast<uint64_t>(n);
-  }
-  return true;
-}
-
-bool DataConnectionWorker::RecvIntoSegments(uint8_t* base, const std::vector<Segment>& segs,
-                                            uint64_t totalLen) {
-  uint64_t remaining = totalLen;
-  size_t segIdx = 0;
-  uint64_t segOff = 0;
-  while (remaining > 0 && segIdx < segs.size()) {
-    const Segment& seg = segs[segIdx];
-    size_t want = static_cast<size_t>(
-        std::min<uint64_t>(remaining, std::min<uint64_t>(seg.len - segOff, 16ULL << 20)));
-    ssize_t n = ::recv(fd_, base + seg.off + segOff, want, 0);
-    if (n < 0) {
-      if (IsWouldBlock(errno)) continue;
-      PostEvent({WorkerEventType::CONN_ERROR, peerKey_, 0, 0, 0, false, nullptr, nullptr,
-                 std::string("recv seg failed: ") + strerror(errno)});
-      return false;
-    }
-    if (n == 0) {
-      PostEvent({WorkerEventType::CONN_ERROR, peerKey_, 0, 0, 0, false, nullptr, nullptr,
-                 "data connection closed during seg recv"});
-      return false;
-    }
-    remaining -= static_cast<uint64_t>(n);
-    segOff += static_cast<uint64_t>(n);
-    if (segOff >= seg.len) {
-      segIdx++;
-      segOff = 0;
-    }
-  }
-  return (remaining == 0);
-}
-
-bool DataConnectionWorker::DiscardPayload(uint64_t len) {
-  uint8_t tmp[65536];
-  uint64_t remaining = len;
-  while (remaining > 0) {
-    ssize_t n =
-        ::recv(fd_, tmp, static_cast<size_t>(std::min<uint64_t>(remaining, sizeof(tmp))), 0);
-    if (n < 0) {
-      if (IsWouldBlock(errno)) continue;
-      PostEvent({WorkerEventType::CONN_ERROR, peerKey_, 0, 0, 0, false, nullptr, nullptr,
-                 std::string("recv discard failed: ") + strerror(errno)});
-      return false;
-    }
-    if (n == 0) {
-      PostEvent({WorkerEventType::CONN_ERROR, peerKey_, 0, 0, 0, false, nullptr, nullptr,
-                 "data connection closed during discard"});
-      return false;
-    }
-    remaining -= static_cast<uint64_t>(n);
-  }
-  return true;
+void DataConnectionWorker::FinishPayload() {
+  WorkerEvent ev;
+  ev.type = WorkerEventType::RECV_DONE;
+  ev.peerKey = peerKey_;
+  ev.dataKind = recv_.parsed.kind;
+  ev.opId = recv_.parsed.opId;
+  ev.lane = recv_.parsed.lane;
+  ev.laneLen = recv_.parsed.payloadLen;
+  ev.discarded = recv_.state == RecvState::DiscardPayload;
+  PostEvent(std::move(ev));
+  recv_ = RecvCursor{};
 }
 
 // ===========================================================================
 // Request parsing helpers (anonymous namespace)
 // ===========================================================================
 namespace {
+
+constexpr size_t kMaxInboundWireOpsPerPeer = 1024;
+constexpr size_t kMaxInboundStatusesPerPeer = 4096;
+// GPU copies generally complete much faster than a network round trip. A
+// coarse poll interval is paid once for D2H and again for H2D, directly adding
+// twice that interval to every GPU transfer. Busy-poll only while GPU work is
+// active to avoid adding scheduler-granularity latency; the reactor still
+// blocks indefinitely when gpuTasks_ is empty.
+constexpr int kGpuPollIntervalMs = 0;
 
 struct RequestView {
   uint64_t opId{0};
@@ -455,6 +472,7 @@ bool ParseRequest(tcp::CtrlMsgType type, const uint8_t* body, size_t len, Reques
   if (isBatch) {
     uint32_t n = 0;
     if (!r.u32(&n)) return false;
+    if (n == 0 || n > (r.len - r.off) / 16) return false;
     out->segs.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
       uint64_t off, sz;
@@ -466,12 +484,8 @@ bool ParseRequest(tcp::CtrlMsgType type, const uint8_t* body, size_t len, Reques
     if (!r.u64(&off) || !r.u64(&sz)) return false;
     out->segs.push_back({off, sz});
   }
-  if (r.off < r.len) {
-    uint8_t lt;
-    if (r.u8(&lt)) out->lanesTotal = lt;
-  }
-  out->lanesTotal = ClampLanesTotal(out->lanesTotal);
-  return true;
+  if (!r.u8(&out->lanesTotal) || r.off != r.len) return false;
+  return out->lanesTotal >= 1 && out->lanesTotal <= tcp::kMaxLanes;
 }
 
 struct CompletionView {
@@ -484,9 +498,23 @@ bool ParseCompletion(const uint8_t* body, size_t len, CompletionView* out) {
   tcp::WireReader r{body, len};
   uint32_t msgLen = 0;
   if (!r.u64(&out->opId) || !r.u32(&out->statusCode) || !r.u32(&msgLen)) return false;
-  if (r.off + msgLen > r.len) return false;
+  if (msgLen > r.len - r.off || r.off + msgLen != r.len) return false;
   out->msg.assign(reinterpret_cast<const char*>(body + r.off), msgLen);
   return true;
+}
+
+bool IsTerminalStatusCode(uint32_t code) {
+  switch (static_cast<StatusCode>(code)) {
+    case StatusCode::SUCCESS:
+    case StatusCode::ERR_INVALID_ARGS:
+    case StatusCode::ERR_NOT_FOUND:
+    case StatusCode::ERR_RDMA_OP:
+    case StatusCode::ERR_BAD_STATE:
+    case StatusCode::ERR_GPU_OP:
+      return true;
+    default:
+      return false;
+  }
 }
 
 }  // namespace
@@ -496,7 +524,10 @@ bool ParseCompletion(const uint8_t* body, size_t len, CompletionView* out) {
 // ===========================================================================
 TcpTransport::TcpTransport(EngineKey myKey, const IOEngineConfig& engCfg,
                            const TcpBackendConfig& cfg)
-    : myEngKey_(std::move(myKey)), engConfig_(engCfg), config_(cfg) {}
+    : myEngKey_(std::move(myKey)), engConfig_(engCfg), config_(cfg) {
+  if (config_.numDataConns < 1 || config_.numDataConns > tcp::kMaxLanes)
+    throw std::invalid_argument("TCP numDataConns must be in [1, 16]");
+}
 
 TcpTransport::~TcpTransport() { Shutdown(); }
 
@@ -504,30 +535,41 @@ void TcpTransport::Start() {
   if (running_.load()) return;
 
   epfd_ = epoll_create1(EPOLL_CLOEXEC);
-  assert(epfd_ >= 0);
+  if (epfd_ < 0)
+    throw std::runtime_error(std::string("TCP: epoll_create1 failed: ") + strerror(errno));
+
+  auto failStart = [this](const std::string& message) {
+    if (listenFd_ >= 0) close(listenFd_);
+    if (wakeFd_ >= 0) close(wakeFd_);
+    if (epfd_ >= 0) close(epfd_);
+    listenFd_ = wakeFd_ = epfd_ = -1;
+    listenPort_ = 0;
+    throw std::runtime_error(message);
+  };
 
   listenFd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-  assert(listenFd_ >= 0);
+  if (listenFd_ < 0) failStart(std::string("TCP: socket failed: ") + strerror(errno));
 
   int one = 1;
   SetSockOpt(listenFd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one), "SO_REUSEADDR");
 
   auto addrOpt = ParseIpv4(engConfig_.host.empty() ? "0.0.0.0" : engConfig_.host, engConfig_.port);
-  assert(addrOpt.has_value());
+  if (!addrOpt) failStart("TCP: invalid listen IPv4 address: " + engConfig_.host);
   sockaddr_in addr = *addrOpt;
   if (bind(listenFd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    MORI_IO_ERROR("TCP: bind {}:{} failed: {}", engConfig_.host, engConfig_.port, strerror(errno));
-    assert(false && "bind failed");
+    std::string error = strerror(errno);
+    failStart("TCP: bind " + engConfig_.host + ":" + std::to_string(engConfig_.port) +
+              " failed: " + error);
   }
   if (listen(listenFd_, 256) != 0) {
-    MORI_IO_ERROR("TCP: listen failed: {}", strerror(errno));
-    assert(false && "listen failed");
+    std::string error = strerror(errno);
+    failStart("TCP: listen failed: " + error);
   }
   listenPort_ = GetBoundPort(listenFd_);
   MORI_IO_INFO("TCP: listen on {}:{} (port={})", engConfig_.host, engConfig_.port, listenPort_);
 
   wakeFd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-  assert(wakeFd_ >= 0);
+  if (wakeFd_ < 0) failStart(std::string("TCP: eventfd failed: ") + strerror(errno));
 
   AddEpoll(listenFd_, true, false);
   AddEpoll(wakeFd_, true, false);
@@ -543,14 +585,6 @@ void TcpTransport::Shutdown() {
     ::write(wakeFd_, &one, sizeof(one));
   }
   if (ioThread_.joinable()) ioThread_.join();
-
-  for (auto& kv : dataWorkers_) kv.second->Stop();
-  dataWorkers_.clear();
-  workerNotifyMap_.clear();
-
-  for (auto& kv : conns_) CloseConnInternal(kv.second.get());
-  conns_.clear();
-  peers_.clear();
 
   auto closeFd = [](int& fd) {
     if (fd >= 0) {
@@ -593,6 +627,7 @@ bool TcpTransport::PopInboundTransferStatus(const EngineKey& remote, TransferUni
   if (it2 == it->second.end()) return false;
   status->Update(it2->second.code, it2->second.msg);
   it->second.erase(it2);
+  if (it->second.empty()) inboundStatus_.erase(it);
   return true;
 }
 
@@ -607,14 +642,14 @@ void TcpTransport::SubmitReadWrite(const MemoryDesc& local, size_t localOffset,
     status->SetCode(StatusCode::SUCCESS);
     return;
   }
-  if (localOffset + size > local.size || remoteOffset + size > remote.size) {
+  if (localOffset > local.size || size > local.size - localOffset || remoteOffset > remote.size ||
+      size > remote.size - remoteOffset) {
     status->Update(StatusCode::ERR_INVALID_ARGS, "TCP: offset+size out of range");
     return;
   }
 
   auto op = std::make_unique<OutboundOpState>();
-  op->peer = remote.engineKey;
-  op->id = id;
+  op->key = {remote.engineKey, id};
   op->isRead = isRead;
   op->status = status;
   op->local = local;
@@ -647,13 +682,19 @@ void TcpTransport::SubmitBatchReadWrite(const MemoryDesc& local, const SizeVec& 
   uint64_t total = 0;
   for (size_t i = 0; i < n; ++i) {
     if (sizes[i] == 0) continue;
-    if (localOffsets[i] + sizes[i] > local.size || remoteOffsets[i] + sizes[i] > remote.size) {
+    if (localOffsets[i] > local.size || sizes[i] > local.size - localOffsets[i] ||
+        remoteOffsets[i] > remote.size || sizes[i] > remote.size - remoteOffsets[i] ||
+        sizes[i] > std::numeric_limits<uint64_t>::max() - total) {
       status->Update(StatusCode::ERR_INVALID_ARGS, "TCP: batch offset+size out of range");
       return;
     }
     lSegs.push_back({uint64_t(localOffsets[i]), uint64_t(sizes[i])});
     rSegs.push_back({uint64_t(remoteOffsets[i]), uint64_t(sizes[i])});
     total += sizes[i];
+  }
+  if (total == 0) {
+    status->SetCode(StatusCode::SUCCESS);
+    return;
   }
 
   // Merge adjacent contiguous segments
@@ -681,8 +722,7 @@ void TcpTransport::SubmitBatchReadWrite(const MemoryDesc& local, const SizeVec& 
   }
 
   auto op = std::make_unique<OutboundOpState>();
-  op->peer = remote.engineKey;
-  op->id = id;
+  op->key = {remote.engineKey, id};
   op->isRead = isRead;
   op->status = status;
   op->local = local;
@@ -724,6 +764,7 @@ void TcpTransport::DelEpoll(int fd) { epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullpt
 
 void TcpTransport::CloseConnInternal(Connection* c) {
   if (!c || c->fd < 0) return;
+  if (closedThisBatch_) closedThisBatch_->insert(c->fd);
   DelEpoll(c->fd);
   shutdown(c->fd, SHUT_RDWR);
   close(c->fd);
@@ -733,10 +774,39 @@ void TcpTransport::CloseConnInternal(Connection* c) {
 // ---------------------------------------------------------------------------
 // Connection management
 // ---------------------------------------------------------------------------
-void TcpTransport::AssignConnToPeer(Connection* c) {
+TcpTransport::ConnResult TcpTransport::AssignConnToPeer(Connection* c) {
   assert(c && c->helloReceived);
   PeerLinks& link = peers_[c->peerKey];
-  const bool preferOut = myEngKey_ < c->peerKey;
+
+  auto handoffData = [&]() -> ConnResult {
+    if (c->handedOff || !c->sendq.empty()) return ConnResult::Alive;
+    const int dataFd = c->fd;
+    const EngineKey peer = c->peerKey;
+    c->handedOff = true;
+    link.dataFds.push_back(dataFd);
+    MORI_IO_TRACE("TCP: peer {} DATA conn up {}/{}", peer, link.dataFds.size(),
+                  config_.numDataConns);
+    DelEpoll(dataFd);
+    SetNonBlocking(dataFd);
+    ConfigureDataSocket(dataFd, config_);
+    auto worker =
+        std::make_unique<DataConnectionWorker>(dataFd, peer, link.recvTargets, std::move(c->inbuf));
+    worker->Start();
+    AddEpoll(worker->NotifyFd(), true, false);
+    workerNotifyMap_[worker->NotifyFd()] = worker.get();
+    link.workers.push_back(worker.get());
+    dataWorkers_[dataFd] = std::move(worker);
+    // DATA fd ownership is now exclusively held by dataWorkers_. Keeping a
+    // Connection alias would let reactor teardown close a live worker fd.
+    conns_.erase(dataFd);
+    MaybeDispatchInboundReads(peer);
+    MaybeDispatchQueuedOps(peer);
+    return ConnResult::Gone;
+  };
+
+  if (c->assigned) {
+    return c->ch == tcp::Channel::DATA ? handoffData() : ConnResult::Alive;
+  }
 
   if (c->isOutgoing) {
     if (c->ch == tcp::Channel::CTRL) {
@@ -747,64 +817,38 @@ void TcpTransport::AssignConnToPeer(Connection* c) {
   }
 
   if (c->ch == tcp::Channel::CTRL) {
-    // Replace ctrl connection if needed
+    // The first completed CTRL connection remains primary. Staggered dialing
+    // below makes both peers converge on the same physical connection.
     if (link.ctrlFd < 0) {
       link.ctrlFd = c->fd;
-      return;
+      c->assigned = true;
+      return ConnResult::Alive;
     }
     int existFd = link.ctrlFd;
     auto eIt = conns_.find(existFd);
     if (eIt == conns_.end()) {
       link.ctrlFd = c->fd;
-      return;
+      c->assigned = true;
+      return ConnResult::Alive;
     }
-    bool keepNew = (preferOut && c->isOutgoing) || (!preferOut && !c->isOutgoing);
-    if (keepNew) {
-      MORI_IO_WARN("TCP: peer {} CTRL replacing fd {} with {}", c->peerKey, existFd, c->fd);
-      CloseConnInternal(eIt->second.get());
-      conns_.erase(existFd);
-      link.ctrlFd = c->fd;
-    } else {
-      MORI_IO_WARN("TCP: peer {} CTRL dropping duplicate fd {}", c->peerKey, c->fd);
-      int fd = c->fd;
-      CloseConnInternal(c);
-      conns_.erase(fd);
-    }
-    return;
-  }
-
-  // DATA channel
-  bool keepPref = (preferOut && c->isOutgoing) || (!preferOut && !c->isOutgoing);
-  if (!keepPref) {
-    MORI_IO_TRACE("TCP: peer {} dropping non-preferred DATA fd {}", c->peerKey, c->fd);
+    MORI_IO_TRACE("TCP: peer {} CTRL dropping duplicate fd {}", c->peerKey, c->fd);
     int fd = c->fd;
     CloseConnInternal(c);
     conns_.erase(fd);
-    return;
+    return ConnResult::Gone;
   }
-  size_t want = static_cast<size_t>(std::max(1, config_.numDataConns));
+
+  // DATA channel
+  size_t want = static_cast<size_t>(config_.numDataConns);
   if (link.dataFds.size() >= want) {
     MORI_IO_TRACE("TCP: peer {} dropping extra DATA fd {}", c->peerKey, c->fd);
     int fd = c->fd;
     CloseConnInternal(c);
     conns_.erase(fd);
-    return;
+    return ConnResult::Gone;
   }
-
-  int dataFd = c->fd;
-  link.dataFds.push_back(dataFd);
-  MORI_IO_TRACE("TCP: peer {} DATA conn up {}/{}", c->peerKey, link.dataFds.size(), want);
-
-  DelEpoll(dataFd);
-  SetNonBlocking(dataFd);
-  ConfigureDataSocket(dataFd, config_);
-
-  auto worker = std::make_unique<DataConnectionWorker>(dataFd, c->peerKey, &staging_);
-  worker->Start();
-  AddEpoll(worker->NotifyFd(), true, false);
-  workerNotifyMap_[worker->NotifyFd()] = worker.get();
-  link.workers.push_back(worker.get());
-  dataWorkers_[dataFd] = std::move(worker);
+  c->assigned = true;
+  return handoffData();
 }
 
 void TcpTransport::MaybeDispatchQueuedOps(const EngineKey& peer) {
@@ -823,20 +867,28 @@ void TcpTransport::MaybeDispatchQueuedOps(const EngineKey& peer) {
 
 void TcpTransport::EnsurePeerChannels(const EngineKey& peer) {
   PeerLinks& link = peers_[peer];
+  if (myEngKey_ > peer && !IsPeerReady(peer)) {
+    auto now = Clock::now();
+    if (link.connectNotBefore == Clock::time_point::max())
+      link.connectNotBefore = now + std::chrono::milliseconds(20);
+    NoteAuxDeadline(link.connectNotBefore);
+    if (now < link.connectNotBefore) return;
+  }
+  link.connectNotBefore = Clock::time_point::max();
   if (!link.CtrlUp() && link.ctrlPending == 0) ConnectChannel(peer, tcp::Channel::CTRL);
-  int want = std::max(1, config_.numDataConns);
+  int want = config_.numDataConns;
   while (int(link.dataFds.size()) + link.dataPending < want)
-    ConnectChannel(peer, tcp::Channel::DATA);
+    if (!ConnectChannel(peer, tcp::Channel::DATA)) break;
 }
 
-void TcpTransport::ConnectChannel(const EngineKey& peer, tcp::Channel ch) {
+bool TcpTransport::ConnectChannel(const EngineKey& peer, tcp::Channel ch) {
   EngineDesc desc;
   {
     std::lock_guard<std::mutex> lk(remoteMu_);
     auto it = remoteEngines_.find(peer);
     if (it == remoteEngines_.end()) {
       MORI_IO_ERROR("TCP: remote engine {} not registered", peer);
-      return;
+      return false;
     }
     desc = it->second;
   }
@@ -844,13 +896,13 @@ void TcpTransport::ConnectChannel(const EngineKey& peer, tcp::Channel ch) {
   auto peerAddr = ParseIpv4(desc.host, static_cast<uint16_t>(desc.port));
   if (!peerAddr) {
     MORI_IO_ERROR("TCP: invalid remote host {}:{}", desc.host, desc.port);
-    return;
+    return false;
   }
 
   int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     MORI_IO_ERROR("TCP: socket() failed: {}", strerror(errno));
-    return;
+    return false;
   }
   MORI_IO_TRACE("TCP: connect start peer={} ch={} fd={}", peer, int(ch), fd);
 
@@ -872,7 +924,7 @@ void TcpTransport::ConnectChannel(const EngineKey& peer, tcp::Channel ch) {
     else {
       MORI_IO_ERROR("TCP: connect failed: {}", strerror(errno));
       close(fd);
-      return;
+      return false;
     }
   }
 
@@ -896,6 +948,7 @@ void TcpTransport::ConnectChannel(const EngineKey& peer, tcp::Channel ch) {
     QueueHello(fd);
     ModEpoll(fd, true, true);
   }
+  return true;
 }
 
 void TcpTransport::QueueHello(int fd) {
@@ -935,18 +988,7 @@ void TcpTransport::DrainWakeFd() {
   uint64_t v;
   while (::read(wakeFd_, &v, sizeof(v)) > 0) {
   }
-  std::deque<std::unique_ptr<OutboundOpState>> ops;
-  {
-    std::lock_guard<std::mutex> lk(submitMu_);
-    ops.swap(submitQ_);
-  }
-  for (auto& op : ops) {
-    EnsurePeerChannels(op->peer);
-    if (IsPeerReady(op->peer))
-      DispatchOp(std::move(op));
-    else
-      waitingOps_[op->peer].push_back(std::move(op));
-  }
+  DrainSubmissions();
 }
 
 bool TcpTransport::IsPeerReady(const EngineKey& peer) {
@@ -957,17 +999,47 @@ bool TcpTransport::IsPeerReady(const EngineKey& peer) {
   return !it->second.workers.empty();
 }
 
-void TcpTransport::RegisterRecvTargetWithWorkers(const EngineKey& peer, TransferUniqueId opId,
-                                                 const WorkerRecvTarget& target) {
+bool TcpTransport::RegisterRecvTarget(const EngineKey& peer, const RecvTargetKey& key,
+                                      const WorkerRecvTarget& target) {
   auto pit = peers_.find(peer);
-  if (pit == peers_.end()) return;
-  for (auto* w : pit->second.workers) w->RegisterRecvTarget(opId, target);
+  if (pit == peers_.end()) return false;
+  {
+    std::lock_guard<std::mutex> lk(pit->second.recvTargets->mu);
+    if (!pit->second.recvTargets->entries.emplace(key, target).second) return false;
+  }
+  auto awaitingPeer = awaitingTargets_.find(peer);
+  if (awaitingPeer != awaitingTargets_.end()) {
+    awaitingPeer->second.erase(key);
+    if (awaitingPeer->second.empty()) awaitingTargets_.erase(awaitingPeer);
+  }
+  for (auto* worker : pit->second.workers) worker->WakeWorker();
+  return true;
 }
 
-void TcpTransport::RemoveRecvTargetFromWorkers(const EngineKey& peer, TransferUniqueId opId) {
+void TcpTransport::RemoveRecvTarget(const EngineKey& peer, const RecvTargetKey& key) {
   auto pit = peers_.find(peer);
   if (pit == peers_.end()) return;
-  for (auto* w : pit->second.workers) w->RemoveRecvTarget(opId);
+  std::lock_guard<std::mutex> lk(pit->second.recvTargets->mu);
+  pit->second.recvTargets->entries.erase(key);
+}
+
+bool TcpTransport::HasRecvTarget(const EngineKey& peer, const RecvTargetKey& key) {
+  auto pit = peers_.find(peer);
+  if (pit == peers_.end()) return false;
+  std::lock_guard<std::mutex> lk(pit->second.recvTargets->mu);
+  return pit->second.recvTargets->entries.count(key) != 0;
+}
+
+std::vector<DataConnectionWorker*> TcpTransport::SelectWorkers(PeerLinks& links,
+                                                               uint8_t lanesTotal) {
+  std::vector<DataConnectionWorker*> selected;
+  if (links.workers.empty()) return selected;
+  lanesTotal = std::min<uint8_t>(lanesTotal, static_cast<uint8_t>(links.workers.size()));
+  selected.reserve(lanesTotal);
+  for (uint8_t lane = 0; lane < lanesTotal; ++lane)
+    selected.push_back(links.workers[(links.nextWorker + lane) % links.workers.size()]);
+  links.nextWorker = (links.nextWorker + lanesTotal) % links.workers.size();
+  return selected;
 }
 
 // ---------------------------------------------------------------------------
@@ -978,7 +1050,7 @@ void TcpTransport::DispatchOp(std::unique_ptr<OutboundOpState> op) {
     MORI_IO_ERROR("TCP: DispatchOp got null op");
     return;
   }
-  const EngineKey peerKey = op->peer;
+  const EngineKey peerKey = op->key.peer;
   auto pit = peers_.find(peerKey);
   if (pit == peers_.end() || !pit->second.CtrlUp() || !pit->second.DataUp()) {
     op->status->Update(StatusCode::ERR_BAD_STATE, "TCP: peer not connected");
@@ -995,24 +1067,30 @@ void TcpTransport::DispatchOp(std::unique_ptr<OutboundOpState> op) {
     return;
   }
 
-  const TransferUniqueId opId = op->id;
-  auto [itIns, inserted] = pendingOutbound_.emplace(opId, std::move(op));
-  if (!inserted) {
-    MORI_IO_ERROR("TCP: duplicate op id={}", opId);
-    itIns->second->status->Update(StatusCode::ERR_BAD_STATE, "TCP: duplicate op id");
-    pendingOutbound_.erase(itIns);
+  const OpKey key = op->key;
+  const TransferUniqueId opId = key.id;
+  if (pendingOutbound_.count(key)) {
+    MORI_IO_ERROR("TCP: duplicate op peer={} id={}", peerKey, opId);
+    op->status->Update(StatusCode::ERR_BAD_STATE, "TCP: duplicate peer/op id");
     return;
   }
+  auto [itIns, inserted] = pendingOutbound_.emplace(key, std::move(op));
+  assert(inserted);
   OutboundOpState* st = itIns->second.get();
 
   // Decide lane count for striping
   const uint64_t totalBytes = SumLens(st->localSegs);
-  int wantLanes = std::min<int>(std::max(1, config_.numDataConns), 1U << kLaneBits);
+  int wantLanes = std::min<int>(config_.numDataConns, workerList.size());
   uint8_t lanesTotal = 1;
   if (wantLanes > 1 && config_.stripingThresholdBytes > 0 &&
-      totalBytes >= uint64_t(config_.stripingThresholdBytes) && st->localSegs.size() == 1 &&
-      st->remoteSegs.size() == 1 && workerList.size() >= 2) {
-    lanesTotal = uint8_t(std::min<size_t>(wantLanes, workerList.size()));
+      totalBytes >= uint64_t(config_.stripingThresholdBytes)) {
+    lanesTotal = static_cast<uint8_t>(wantLanes);
+  }
+  const auto& destinationSegs = st->isRead ? st->localSegs : st->remoteSegs;
+  if (lanesTotal > 1 && SegmentsOverlap(destinationSegs)) {
+    FinalizeOutbound(key, StatusCode::ERR_INVALID_ARGS,
+                     "TCP: overlapping destination segments cannot be striped");
+    return;
   }
   st->lanesTotal = lanesTotal;
 
@@ -1020,8 +1098,7 @@ void TcpTransport::DispatchOp(std::unique_ptr<OutboundOpState> op) {
   if (st->isRead && st->local.loc == MemoryLocationType::GPU) {
     st->pinned = staging_.Acquire(static_cast<size_t>(totalBytes));
     if (!st->pinned) {
-      st->status->Update(StatusCode::ERR_BAD_STATE, "TCP: staging alloc failed");
-      pendingOutbound_.erase(opId);
+      FinalizeOutbound(key, StatusCode::ERR_BAD_STATE, "TCP: staging alloc failed");
       return;
     }
   }
@@ -1038,14 +1115,17 @@ void TcpTransport::DispatchOp(std::unique_ptr<OutboundOpState> op) {
       target.cpuBase = reinterpret_cast<void*>(st->local.data);
       target.segs = st->localSegs;
     }
-    RegisterRecvTargetWithWorkers(peerKey, opId, target);
+    if (!RegisterRecvTarget(peerKey, {tcp::DataKind::READ_RESPONSE, opId}, target)) {
+      FinalizeOutbound(key, StatusCode::ERR_BAD_STATE, "TCP: duplicate receive target");
+      return;
+    }
   }
 
   // Build and send ctrl frame
   std::vector<uint8_t> ctrlFrame;
   if (st->localSegs.size() == 1) {
     auto type = st->isRead ? tcp::CtrlMsgType::READ_REQ : tcp::CtrlMsgType::WRITE_REQ;
-    ctrlFrame = tcp::BuildLinearReq(type, st->id, st->remote.id, st->remoteSegs[0].off,
+    ctrlFrame = tcp::BuildLinearReq(type, st->key.id, st->remote.id, st->remoteSegs[0].off,
                                     st->remoteSegs[0].len, lanesTotal);
   } else {
     auto type = st->isRead ? tcp::CtrlMsgType::BATCH_READ_REQ : tcp::CtrlMsgType::BATCH_WRITE_REQ;
@@ -1056,11 +1136,26 @@ void TcpTransport::DispatchOp(std::unique_ptr<OutboundOpState> op) {
       roffs.push_back(s.off);
       szs.push_back(s.len);
     }
-    ctrlFrame = tcp::BuildBatchReq(type, st->id, st->remote.id, roffs, szs, lanesTotal);
+    ctrlFrame = tcp::BuildBatchReq(type, st->key.id, st->remote.id, roffs, szs, lanesTotal);
   }
   QueueSend(ctrl->fd, std::move(ctrlFrame));
 
-  if (!st->isRead) QueueDataSend(workerList, st->local, st->localSegs, st->id, lanesTotal);
+  if (!st->isRead) {
+    auto selected = SelectWorkers(pit->second, lanesTotal);
+    auto sent = std::make_shared<uint8_t>(0);
+    if (!QueueDataSend(peerKey, selected, st->local, st->localSegs, tcp::DataKind::WRITE_PAYLOAD,
+                       st->key.id, lanesTotal, [this, key, sent]() {
+                         auto it = pendingOutbound_.find(key);
+                         if (it == pendingOutbound_.end()) return;
+                         uint8_t completed = (*sent)++;
+                         if (completed < tcp::kMaxLanes)
+                           it->second->lanesSentMask |= uint16_t(1U << completed);
+                         MaybeCompleteOutbound(*it->second);
+                       })) {
+      AbortPeer(peerKey, StatusCode::ERR_GPU_OP, "TCP: failed to prepare GPU payload");
+      return;
+    }
+  }
   UpdateWriteInterest(ctrl->fd);
 }
 
@@ -1077,35 +1172,30 @@ void TcpTransport::QueueSend(int fd, std::vector<uint8_t> bytes, std::function<v
 // ---------------------------------------------------------------------------
 // Data send (unified for write-send and read-response)
 // ---------------------------------------------------------------------------
-void TcpTransport::QueueDataSend(const std::vector<DataConnectionWorker*>& workers,
+bool TcpTransport::QueueDataSend(const EngineKey& peer,
+                                 const std::vector<DataConnectionWorker*>& workers,
                                  const MemoryDesc& src, const std::vector<Segment>& srcSegs,
-                                 uint64_t opId, uint8_t lanesTotal,
+                                 tcp::DataKind kind, uint64_t opId, uint8_t lanesTotal,
                                  std::function<void()> onLaneDone) {
-  if (workers.empty()) return;
+  if (workers.empty() || lanesTotal == 0 || lanesTotal > tcp::kMaxLanes) return false;
   const uint64_t total = SumLens(srcSegs);
-  lanesTotal = ClampLanesTotal(lanesTotal);
-  lanesTotal = std::min<uint8_t>(lanesTotal, static_cast<uint8_t>(workers.size()));
-  if (lanesTotal > 1 && srcSegs.size() != 1) {
-    MORI_IO_WARN("TCP: striping requires 1 segment, fallback to 1 lane");
-    lanesTotal = 1;
-  }
 
   if (src.loc == MemoryLocationType::GPU) {
     // GPU path: DtoH copy, then send from pinned buffer
     auto pinned = staging_.Acquire(static_cast<size_t>(total));
     if (!pinned) {
       MORI_IO_ERROR("TCP: staging alloc failed for GPU send");
-      return;
+      return false;
     }
 
-    auto workersCopy =
-        std::vector<DataConnectionWorker*>(workers.begin(), workers.begin() + lanesTotal);
-    auto sendCb = [workersCopy, pinned, opId, lanesTotal, total,
+    auto workersCopy = workers;
+    auto sendCb = [workersCopy, pinned, kind, opId, lanesTotal, total,
                    onLaneDone = std::move(onLaneDone)]() {
       for (uint8_t lane = 0; lane < lanesTotal; ++lane) {
         LaneSpan span = ComputeLaneSpan(total, lanesTotal, lane);
         SendItem item;
-        item.header = tcp::BuildDataHeader(ToWireOpId(opId, lane), span.len, 0);
+        auto header = tcp::BuildDataHeader(kind, lane, opId, span.len);
+        item.header.assign(header.begin(), header.end());
         item.iov = {{item.header.data(), item.header.size()},
                     {static_cast<uint8_t*>(pinned->ptr) + span.off, size_t(span.len)}};
         item.keepalive = pinned;
@@ -1113,32 +1203,25 @@ void TcpTransport::QueueDataSend(const std::vector<DataConnectionWorker*>& worke
         workersCopy[lane % workersCopy.size()]->SubmitSend(std::move(item));
       }
     };
-    ScheduleGpuCopy(src.deviceId, false, src, srcSegs, pinned, std::move(sendCb));
-    return;
+    return ScheduleGpuCopy(src.deviceId, false, src, srcSegs, pinned, peer, opId,
+                           std::move(sendCb));
   }
 
   // CPU path
   uint8_t* base = reinterpret_cast<uint8_t*>(src.data);
-  if (lanesTotal == 1) {
+  for (uint8_t lane = 0; lane < lanesTotal; ++lane) {
+    LaneSpan span = ComputeLaneSpan(total, lanesTotal, lane);
+    auto laneSegs = SliceSegments(srcSegs, span.off, span.len);
     SendItem item;
-    item.header = tcp::BuildDataHeader(ToWireOpId(opId, 0), total, 0);
-    item.iov.reserve(1 + srcSegs.size());
+    auto header = tcp::BuildDataHeader(kind, lane, opId, span.len);
+    item.header.assign(header.begin(), header.end());
+    item.iov.reserve(1 + laneSegs.size());
     item.iov.push_back({item.header.data(), item.header.size()});
-    for (auto& s : srcSegs) item.iov.push_back({base + s.off, size_t(s.len)});
-    item.onDone = std::move(onLaneDone);
-    workers[0]->SubmitSend(std::move(item));
-  } else {
-    // Multi-lane striping (contiguous single-segment)
-    for (uint8_t lane = 0; lane < lanesTotal; ++lane) {
-      LaneSpan span = ComputeLaneSpan(total, lanesTotal, lane);
-      SendItem item;
-      item.header = tcp::BuildDataHeader(ToWireOpId(opId, lane), span.len, 0);
-      item.iov = {{item.header.data(), item.header.size()},
-                  {base + srcSegs[0].off + span.off, size_t(span.len)}};
-      item.onDone = onLaneDone;
-      workers[lane % workers.size()]->SubmitSend(std::move(item));
-    }
+    for (auto& seg : laneSegs) item.iov.push_back({base + seg.off, size_t(seg.len)});
+    item.onDone = onLaneDone;
+    workers[lane % workers.size()]->SubmitSend(std::move(item));
   }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,8 +1229,8 @@ void TcpTransport::QueueDataSend(const std::vector<DataConnectionWorker*>& worke
 // ---------------------------------------------------------------------------
 bool TcpTransport::ScheduleGpuCopy(int deviceId, bool toDevice, const MemoryDesc& mem,
                                    const std::vector<Segment>& segs,
-                                   std::shared_ptr<PinnedBuf> pinned,
-                                   std::function<void()> onComplete) {
+                                   std::shared_ptr<PinnedBuf> pinned, const EngineKey& peer,
+                                   TransferUniqueId opId, std::function<void()> onComplete) {
   const uint64_t total = SumLens(segs);
   hipStream_t stream = streamPool_.GetNextStream(deviceId);
   hipEvent_t ev = eventPool_.GetEvent(deviceId);
@@ -1157,50 +1240,130 @@ bool TcpTransport::ScheduleGpuCopy(int deviceId, bool toDevice, const MemoryDesc
     return false;
   }
 
-  HIP_RUNTIME_CHECK(hipSetDevice(deviceId));
+  hipError_t hipStatus = hipSetDevice(deviceId);
+  if (hipStatus != hipSuccess) {
+    MORI_IO_ERROR("TCP: hipSetDevice({}) failed: {}", deviceId, hipGetErrorString(hipStatus));
+    eventPool_.PutEvent(ev, deviceId);
+    return false;
+  }
   uint8_t* hostPtr = reinterpret_cast<uint8_t*>(pinned->ptr);
+  bool copySubmitted = false;
+  auto submitCopy = [&](hipError_t result, const char* operation) {
+    if (result == hipSuccess) {
+      copySubmitted = true;
+      return true;
+    }
+    MORI_IO_ERROR("TCP: {} failed: {}", operation, hipGetErrorString(result));
+    if (copySubmitted) {
+      hipError_t syncStatus = hipStreamSynchronize(stream);
+      if (syncStatus != hipSuccess)
+        MORI_IO_WARN("TCP: hipStreamSynchronize after copy failure failed: {}",
+                     hipGetErrorString(syncStatus));
+    }
+    eventPool_.PutEvent(ev, deviceId);
+    return false;
+  };
 
   uint64_t spanOff = 0, spanLen = 0;
   if (IsSingleContiguousSpan(segs, &spanOff, &spanLen) && spanLen == total) {
     if (toDevice) {
       void* gpu = reinterpret_cast<void*>(mem.data + spanOff);
-      HIP_RUNTIME_CHECK(hipMemcpyHtoDAsync(gpu, hostPtr, size_t(total), stream));
+      if (!submitCopy(hipMemcpyHtoDAsync(gpu, hostPtr, size_t(total), stream),
+                      "hipMemcpyHtoDAsync"))
+        return false;
     } else {
       hipDeviceptr_t gpu = reinterpret_cast<hipDeviceptr_t>(mem.data + spanOff);
-      HIP_RUNTIME_CHECK(hipMemcpyDtoHAsync(hostPtr, gpu, size_t(total), stream));
+      if (!submitCopy(hipMemcpyDtoHAsync(hostPtr, gpu, size_t(total), stream),
+                      "hipMemcpyDtoHAsync"))
+        return false;
     }
   } else {
     uint64_t off = 0;
     for (auto& s : segs) {
       if (toDevice) {
         void* gpu = reinterpret_cast<void*>(mem.data + s.off);
-        HIP_RUNTIME_CHECK(hipMemcpyHtoDAsync(gpu, hostPtr + off, size_t(s.len), stream));
+        if (!submitCopy(hipMemcpyHtoDAsync(gpu, hostPtr + off, size_t(s.len), stream),
+                        "hipMemcpyHtoDAsync"))
+          return false;
       } else {
         hipDeviceptr_t gpu = reinterpret_cast<hipDeviceptr_t>(mem.data + s.off);
-        HIP_RUNTIME_CHECK(hipMemcpyDtoHAsync(hostPtr + off, gpu, size_t(s.len), stream));
+        if (!submitCopy(hipMemcpyDtoHAsync(hostPtr + off, gpu, size_t(s.len), stream),
+                        "hipMemcpyDtoHAsync"))
+          return false;
       }
       off += s.len;
     }
   }
-  HIP_RUNTIME_CHECK(hipEventRecord(ev, stream));
-  gpuTasks_.push_back({deviceId, ev, std::move(onComplete)});
+  hipStatus = hipEventRecord(ev, stream);
+  if (hipStatus != hipSuccess) {
+    MORI_IO_ERROR("TCP: hipEventRecord failed: {}", hipGetErrorString(hipStatus));
+    hipError_t syncStatus = hipStreamSynchronize(stream);
+    if (syncStatus != hipSuccess)
+      MORI_IO_WARN("TCP: hipStreamSynchronize after event failure failed: {}",
+                   hipGetErrorString(syncStatus));
+    eventPool_.PutEvent(ev, deviceId);
+    return false;
+  }
+  gpuTasks_.push_back({peer, opId, deviceId, ev, std::move(pinned), std::move(onComplete)});
   return true;
 }
 
 void TcpTransport::PollGpuTasks() {
   for (auto it = gpuTasks_.begin(); it != gpuTasks_.end();) {
+    hipError_t setStatus = hipSetDevice(it->deviceId);
+    if (setStatus != hipSuccess) {
+      EngineKey peer = it->peer;
+      MORI_IO_ERROR("TCP: hipSetDevice({}) failed while polling: {}", it->deviceId,
+                    hipGetErrorString(setStatus));
+      eventPool_.PutEvent(it->ev, it->deviceId);
+      it = gpuTasks_.erase(it);
+      if (!peer.empty()) {
+        AbortPeer(std::move(peer), StatusCode::ERR_GPU_OP, "TCP: HIP device selection failed");
+        it = gpuTasks_.begin();
+      }
+      continue;
+    }
     hipError_t st = hipEventQuery(it->ev);
     if (st == hipSuccess) {
-      eventPool_.PutEvent(it->ev, it->deviceId);
-      if (it->onReady) it->onReady();
+      // Remove the task before invoking user-visible transport callbacks. A
+      // callback may synchronously AbortPeer() and mutate gpuTasks_; keeping
+      // the current element in the deque would invalidate `it` and return the
+      // same event to eventPool_ twice.
+      GpuTask task = std::move(*it);
       it = gpuTasks_.erase(it);
+      eventPool_.PutEvent(task.ev, task.deviceId);
+      if (task.onReady) task.onReady();
+      it = gpuTasks_.begin();
     } else if (st == hipErrorNotReady) {
       ++it;
     } else {
       MORI_IO_ERROR("TCP: hipEventQuery failed: {}", hipGetErrorString(st));
+      EngineKey peer = it->peer;
       eventPool_.PutEvent(it->ev, it->deviceId);
       it = gpuTasks_.erase(it);
+      if (!peer.empty()) {
+        AbortPeer(peer, StatusCode::ERR_BAD_STATE, "TCP: HIP event query failed");
+        it = gpuTasks_.begin();
+      }
     }
+  }
+}
+
+void TcpTransport::DrainGpuTasksForPeer(const EngineKey& peer) {
+  for (auto it = gpuTasks_.begin(); it != gpuTasks_.end();) {
+    if (it->peer != peer) {
+      ++it;
+      continue;
+    }
+    hipError_t setStatus = hipSetDevice(it->deviceId);
+    if (setStatus != hipSuccess)
+      MORI_IO_WARN("TCP: hipSetDevice({}) during abort failed: {}", it->deviceId,
+                   hipGetErrorString(setStatus));
+    hipError_t status = hipEventSynchronize(it->ev);
+    if (status != hipSuccess)
+      MORI_IO_WARN("TCP: hipEventSynchronize during abort failed: {}", hipGetErrorString(status));
+    eventPool_.PutEvent(it->ev, it->deviceId);
+    it = gpuTasks_.erase(it);
   }
 }
 
@@ -1223,6 +1386,7 @@ void TcpTransport::UpdateWriteInterest(int fd) {
 }
 
 void TcpTransport::HandleConnWritable(Connection* c) {
+  const int fd = c->fd;
   if (c->connecting) {
     int err = 0;
     socklen_t len = sizeof(err);
@@ -1234,7 +1398,11 @@ void TcpTransport::HandleConnWritable(Connection* c) {
     c->connecting = false;
     QueueHello(c->fd);
   }
-  UpdateWriteInterest(c->fd);
+  UpdateWriteInterest(fd);
+  auto it = conns_.find(fd);
+  if (it != conns_.end() && it->second->helloReceived && it->second->ch == tcp::Channel::DATA &&
+      it->second->sendq.empty())
+    AssignConnToPeer(it->second.get());
 }
 
 void TcpTransport::FlushSend(Connection* c) {
@@ -1283,6 +1451,9 @@ void TcpTransport::CloseAndRemoveFd(int fd) {
     DelEpoll(nfd);
     workerNotifyMap_.erase(nfd);
     dataWorkers_.erase(wit);
+    if (closedThisBatch_) closedThisBatch_->insert(fd);
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
   }
   auto cit = conns_.find(fd);
   if (cit != conns_.end()) {
@@ -1302,39 +1473,98 @@ EngineKey TcpTransport::FindPeerByFd(int fd) {
 
 void TcpTransport::ClosePeerByFd(int fd) {
   EngineKey peer = FindPeerByFd(fd);
+  if (peer.empty()) {
+    auto it = conns_.find(fd);
+    if (it != conns_.end()) peer = it->second->peerKey;
+  }
   if (!peer.empty())
-    ClosePeerByKey(peer, "TCP: connection lost");
+    AbortPeer(peer, StatusCode::ERR_BAD_STATE, "TCP: connection lost");
   else
     CloseAndRemoveFd(fd);
 }
 
-void TcpTransport::ClosePeerByKey(const EngineKey& peer, const std::string& reason) {
+void TcpTransport::AbortPeer(EngineKey peer, StatusCode code, std::string reason) {
+  MORI_IO_WARN("TCP: abort peer={} code={} reason={}", peer, static_cast<uint32_t>(code), reason);
   auto pit = peers_.find(peer);
-  if (pit == peers_.end()) return;
-  auto link = pit->second;
-  CloseAndRemoveFd(link.ctrlFd);
-  for (int dfd : link.dataFds) CloseAndRemoveFd(dfd);
-  peers_.erase(peer);
-  FailPendingOpsForPeer(peer, reason);
-}
+  std::vector<int> peerFds;
+  if (pit != peers_.end()) {
+    if (pit->second.ctrlFd >= 0) peerFds.push_back(pit->second.ctrlFd);
+    peerFds.insert(peerFds.end(), pit->second.dataFds.begin(), pit->second.dataFds.end());
+  }
+  for (auto& [fd, conn] : conns_)
+    if (conn->peerKey == peer && std::find(peerFds.begin(), peerFds.end(), fd) == peerFds.end())
+      peerFds.push_back(fd);
 
-void TcpTransport::FailPendingOpsForPeer(const EngineKey& peer, const std::string& msg) {
+  // shutdown() wakes worker poll/recv without releasing the fd number. close()
+  // happens only after the worker has joined, so it cannot hit a reused fd.
+  for (int fd : peerFds) {
+    if (closedThisBatch_) closedThisBatch_->insert(fd);
+    auto cit = conns_.find(fd);
+    if (cit != conns_.end()) DelEpoll(fd);
+    shutdown(fd, SHUT_RDWR);
+  }
+  // Then join every worker before publishing any caller-visible terminal status.
+  for (int fd : peerFds) {
+    auto wit = dataWorkers_.find(fd);
+    if (wit == dataWorkers_.end()) continue;
+    int notifyFd = wit->second->NotifyFd();
+    wit->second->Stop();
+    DelEpoll(notifyFd);
+    workerNotifyMap_.erase(notifyFd);
+    dataWorkers_.erase(wit);
+    close(fd);
+  }
+  DrainGpuTasksForPeer(peer);
+  for (int fd : peerFds) {
+    auto cit = conns_.find(fd);
+    if (cit == conns_.end()) continue;
+    close(fd);
+    cit->second->fd = -1;
+    conns_.erase(cit);
+  }
+
+  if (pit != peers_.end()) {
+    std::lock_guard<std::mutex> lk(pit->second.recvTargets->mu);
+    pit->second.recvTargets->entries.clear();
+  }
+  peers_.erase(peer);
+  inboundWrites_.erase(peer);
+  pendingInboundReads_.erase(peer);
+  awaitingTargets_.erase(peer);
+
+  std::vector<TransferStatus*> statuses;
   for (auto it = pendingOutbound_.begin(); it != pendingOutbound_.end();) {
-    if (it->second->peer == peer) {
-      it->second->status->Update(StatusCode::ERR_BAD_STATE, msg);
+    if (it->first.peer == peer) {
+      statuses.push_back(it->second->status);
       it = pendingOutbound_.erase(it);
     } else
       ++it;
   }
-  waitingOps_.erase(peer);
-  inboundWrites_.erase(peer);
-  earlyWrites_.erase(peer);
+  auto waiting = waitingOps_.find(peer);
+  if (waiting != waitingOps_.end()) {
+    for (auto& op : waiting->second) statuses.push_back(op->status);
+    waitingOps_.erase(waiting);
+  }
+  for (TransferStatus* status : statuses) status->Update(code, reason);
+}
+
+void TcpTransport::FinalizeOutbound(OpKey key, StatusCode code, std::string msg) {
+  auto it = pendingOutbound_.find(key);
+  if (it == pendingOutbound_.end()) return;
+  OutboundOpState& op = *it->second;
+  if (op.finished) return;
+  op.finished = true;
+  if (op.isRead) RemoveRecvTarget(key.peer, {tcp::DataKind::READ_RESPONSE, key.id});
+  TransferStatus* status = op.status;
+  pendingOutbound_.erase(it);
+  status->Update(code, msg);
 }
 
 // ---------------------------------------------------------------------------
 // Ctrl message handling
 // ---------------------------------------------------------------------------
-void TcpTransport::HandleCtrlReadable(Connection* c) {
+TcpTransport::ConnResult TcpTransport::HandleCtrlReadable(Connection* c) {
+  const int fd = c->fd;
   while (true) {
     uint8_t tmp[65536];
     ssize_t n = ::recv(c->fd, tmp, sizeof(tmp), 0);
@@ -1342,86 +1572,116 @@ void TcpTransport::HandleCtrlReadable(Connection* c) {
       if (IsWouldBlock(errno)) break;
       MORI_IO_ERROR("TCP: recv(ctrl) fd {} failed: {}", c->fd, strerror(errno));
       ClosePeerByFd(c->fd);
-      return;
+      return ConnResult::Gone;
     }
     if (n == 0) {
       ClosePeerByFd(c->fd);
-      return;
+      return ConnResult::Gone;
     }
     c->inbuf.insert(c->inbuf.end(), tmp, tmp + n);
   }
 
   while (true) {
     tcp::CtrlHeaderView hv;
-    if (!tcp::TryParseCtrlHeader(c->inbuf.data(), c->inbuf.size(), &hv)) {
-      if (c->inbuf.size() >= tcp::kCtrlHeaderSize) {
+    tcp::ParseError parse = tcp::TryParseCtrlHeader(c->inbuf.data(), c->inbuf.size(), &hv);
+    if (parse != tcp::ParseError::Ok) {
+      if (parse != tcp::ParseError::Truncated || c->inbuf.size() >= tcp::kCtrlHeaderSize) {
         MORI_IO_ERROR("TCP: bad ctrl header fd {}", c->fd);
         ClosePeerByFd(c->fd);
+        return ConnResult::Gone;
       }
       break;
     }
     if (c->inbuf.size() < tcp::kCtrlHeaderSize + hv.bodyLen) break;
 
-    const uint8_t* body = c->inbuf.data() + tcp::kCtrlHeaderSize;
-    HandleCtrlFrame(c, hv.type, body, hv.bodyLen);
+    std::vector<uint8_t> body(c->inbuf.begin() + tcp::kCtrlHeaderSize,
+                              c->inbuf.begin() + tcp::kCtrlHeaderSize + hv.bodyLen);
     c->inbuf.erase(c->inbuf.begin(), c->inbuf.begin() + tcp::kCtrlHeaderSize + hv.bodyLen);
-    if (c->helloReceived && c->ch == tcp::Channel::DATA) return;
+    if (HandleCtrlFrame(c, hv.type, body.data(), body.size()) == ConnResult::Gone)
+      return ConnResult::Gone;
+    auto it = conns_.find(fd);
+    if (it == conns_.end()) return ConnResult::Gone;
+    c = it->second.get();
+    if (c->handedOff) return ConnResult::Alive;
   }
+  return ConnResult::Alive;
 }
 
-void TcpTransport::HandleCtrlFrame(Connection* c, tcp::CtrlMsgType type, const uint8_t* body,
-                                   size_t len) {
+TcpTransport::ConnResult TcpTransport::HandleCtrlFrame(Connection* c, tcp::CtrlMsgType type,
+                                                       const uint8_t* body, size_t len) {
   if (type == tcp::CtrlMsgType::HELLO) {
-    HandleHello(c, body, len);
-    return;
+    return HandleHello(c, body, len);
   }
   if (!c->helloReceived) {
-    MORI_IO_WARN("TCP: ctrl message before HELLO, dropping");
-    return;
+    ClosePeerByFd(c->fd);
+    return ConnResult::Gone;
   }
+  const EngineKey peer = c->peerKey;
 
   switch (type) {
     case tcp::CtrlMsgType::WRITE_REQ:
     case tcp::CtrlMsgType::READ_REQ:
     case tcp::CtrlMsgType::BATCH_WRITE_REQ:
     case tcp::CtrlMsgType::BATCH_READ_REQ:
-      HandleRequest(c->peerKey, type, body, len);
+      HandleRequest(peer, type, body, len);
       break;
     case tcp::CtrlMsgType::COMPLETION:
-      HandleCompletion(c->peerKey, body, len);
+      HandleCompletion(peer, body, len);
       break;
     default:
-      MORI_IO_WARN("TCP: unknown ctrl msg type {}", uint32_t(type));
+      AbortPeer(peer, StatusCode::ERR_INVALID_ARGS, "TCP: unknown ctrl message");
+      return ConnResult::Gone;
   }
+  return peers_.count(peer) ? ConnResult::Alive : ConnResult::Gone;
 }
 
-void TcpTransport::HandleHello(Connection* c, const uint8_t* body, size_t len) {
+TcpTransport::ConnResult TcpTransport::HandleHello(Connection* c, const uint8_t* body, size_t len) {
+  if (c->helloReceived) {
+    EngineKey peer = c->peerKey;
+    if (peer.empty())
+      CloseAndRemoveFd(c->fd);
+    else
+      AbortPeer(std::move(peer), StatusCode::ERR_INVALID_ARGS, "TCP: duplicate HELLO");
+    return ConnResult::Gone;
+  }
   if (len < 5) {
     MORI_IO_WARN("TCP: bad HELLO len {}", len);
     ClosePeerByFd(c->fd);
-    return;
+    return ConnResult::Gone;
   }
   tcp::WireReader r{body, len};
   uint8_t chRaw;
   uint32_t keyLen;
-  if (!r.u8(&chRaw) || !r.u32(&keyLen) || r.off + keyLen > len) {
+  if (!r.u8(&chRaw) || !r.u32(&keyLen) || keyLen == 0 || r.off + keyLen != len ||
+      (chRaw != uint8_t(tcp::Channel::CTRL) && chRaw != uint8_t(tcp::Channel::DATA))) {
     ClosePeerByFd(c->fd);
-    return;
+    return ConnResult::Gone;
   }
 
-  c->peerKey.assign(reinterpret_cast<const char*>(body + r.off), keyLen);
-  c->ch = (chRaw == uint8_t(tcp::Channel::DATA)) ? tcp::Channel::DATA : tcp::Channel::CTRL;
+  EngineKey helloPeer(reinterpret_cast<const char*>(body + r.off), keyLen);
+  if (c->isOutgoing && !c->peerKey.empty() && c->peerKey != helloPeer) {
+    AbortPeer(c->peerKey, StatusCode::ERR_INVALID_ARGS, "TCP: HELLO peer mismatch");
+    return ConnResult::Gone;
+  }
+  c->peerKey = std::move(helloPeer);
+  c->ch = static_cast<tcp::Channel>(chRaw);
   c->helloReceived = true;
   MORI_IO_TRACE("TCP: recv HELLO fd={} peer={} ch={} out={}", c->fd, c->peerKey, int(c->ch),
                 c->isOutgoing);
 
+  const int fd = c->fd;
+  const EngineKey peer = c->peerKey;
   if (!c->helloSent) {
-    QueueHello(c->fd);
-    UpdateWriteInterest(c->fd);
+    QueueHello(fd);
+    UpdateWriteInterest(fd);
   }
+  auto it = conns_.find(fd);
+  if (it == conns_.end()) return ConnResult::Gone;
+  c = it->second.get();
   if (c->ch == tcp::Channel::CTRL) ConfigureCtrlSocket(c->fd, config_);
-  AssignConnToPeer(c);
-  MaybeDispatchQueuedOps(c->peerKey);
+  if (AssignConnToPeer(c) == ConnResult::Gone) return ConnResult::Gone;
+  MaybeDispatchQueuedOps(peer);
+  return ConnResult::Alive;
 }
 
 // Unified handler for WRITE_REQ, READ_REQ, BATCH_WRITE_REQ, BATCH_READ_REQ
@@ -1430,6 +1690,7 @@ void TcpTransport::HandleRequest(const EngineKey& peer, tcp::CtrlMsgType type, c
   RequestView req;
   if (!ParseRequest(type, body, len, &req)) {
     MORI_IO_WARN("TCP: malformed request type={}", uint8_t(type));
+    AbortPeer(peer, StatusCode::ERR_INVALID_ARGS, "TCP: malformed request");
     return;
   }
 
@@ -1437,9 +1698,22 @@ void TcpTransport::HandleRequest(const EngineKey& peer, tcp::CtrlMsgType type, c
   bool isBatch =
       (type == tcp::CtrlMsgType::BATCH_WRITE_REQ || type == tcp::CtrlMsgType::BATCH_READ_REQ);
 
+  uint64_t requestBytes = 0;
+  if (!TrySumLens(req.segs, &requestBytes)) {
+    AbortPeer(peer, StatusCode::ERR_INVALID_ARGS, "TCP: request length overflow");
+    return;
+  }
+
   auto memOpt = LookupLocalMem(req.memId);
 
   if (isWrite) {
+    RecvTargetKey targetKey{tcp::DataKind::WRITE_PAYLOAD, req.opId};
+    auto peerWrites = inboundWrites_.find(peer);
+    if (HasRecvTarget(peer, targetKey) ||
+        (peerWrites != inboundWrites_.end() && peerWrites->second.count(req.opId))) {
+      AbortPeer(peer, StatusCode::ERR_BAD_STATE, "TCP: duplicate inbound write op id");
+      return;
+    }
     // Inbound write: remote is sending data to us
     InboundWriteState ws;
     ws.peer = peer;
@@ -1452,6 +1726,15 @@ void TcpTransport::HandleRequest(const EngineKey& peer, tcp::CtrlMsgType type, c
       ws.discard = false;
     }
     FinalizeInboundWriteSetup(peer, req.opId, ws);
+    if (ws.discard && peers_.count(peer)) {
+      auto iw = inboundWrites_.find(peer);
+      if (iw != inboundWrites_.end()) {
+        auto state = iw->second.find(req.opId);
+        if (state != iw->second.end()) state->second.completionSent = true;
+      }
+      SendCompletionAndRecord(peer, req.opId, StatusCode::ERR_INVALID_ARGS,
+                              "TCP: invalid write request");
+    }
   } else {
     // Inbound read: remote wants data from us
     if (!memOpt) {
@@ -1468,28 +1751,26 @@ void TcpTransport::HandleRequest(const EngineKey& peer, tcp::CtrlMsgType type, c
       return;
     }
 
-    // Send data back to requester
-    auto pit = peers_.find(peer);
-    if (pit == peers_.end() || pit->second.workers.empty()) return;
-    auto& workerList = pit->second.workers;
-    uint8_t useLanes = std::min<uint8_t>(ClampLanesTotal(req.lanesTotal),
-                                         uint8_t(std::max<size_t>(1, workerList.size())));
-    if (useLanes > 1 && req.segs.size() != 1) useLanes = 1;
+    InboundReadState read;
+    read.peer = peer;
+    read.id = req.opId;
+    read.src = *memOpt;
+    read.srcSegs = std::move(req.segs);
+    read.lanesTotal = req.lanesTotal;
+    if (config_.opTimeoutMs > 0)
+      read.deadline = Clock::now() + std::chrono::milliseconds(config_.opTimeoutMs);
 
-    struct DoneState {
-      EngineKey peer;
-      uint64_t opId;
-      std::atomic<int> remaining{0};
-    };
-    auto done = std::make_shared<DoneState>();
-    done->peer = peer;
-    done->opId = req.opId;
-    done->remaining.store(useLanes);
-    auto laneDone = [this, done]() {
-      if (done->remaining.fetch_sub(1) > 1) return;
-      SendCompletionAndRecord(done->peer, done->opId, StatusCode::SUCCESS, "");
-    };
-    QueueDataSend(workerList, *memOpt, req.segs, req.opId, useLanes, std::move(laneDone));
+    auto pit = peers_.find(peer);
+    if (pit == peers_.end() || pit->second.workers.empty()) {
+      if (pendingInboundReads_[peer].size() >= kMaxInboundWireOpsPerPeer) {
+        AbortPeer(peer, StatusCode::ERR_BAD_STATE, "TCP: inbound read quota exceeded");
+        return;
+      }
+      NoteAuxDeadline(read.deadline);
+      pendingInboundReads_[peer].push_back(std::move(read));
+      return;
+    }
+    DispatchInboundRead(std::move(read));
   }
 }
 
@@ -1497,19 +1778,29 @@ void TcpTransport::HandleCompletion(const EngineKey& peer, const uint8_t* body, 
   CompletionView msg;
   if (!ParseCompletion(body, len, &msg)) {
     MORI_IO_WARN("TCP: malformed COMPLETION");
+    AbortPeer(peer, StatusCode::ERR_INVALID_ARGS, "TCP: malformed completion");
+    return;
+  }
+  if (!IsTerminalStatusCode(msg.statusCode)) {
+    AbortPeer(peer, StatusCode::ERR_INVALID_ARGS, "TCP: invalid completion status code");
     return;
   }
 
-  auto it = pendingOutbound_.find(msg.opId);
+  OpKey key{peer, msg.opId};
+  auto it = pendingOutbound_.find(key);
   if (it == pendingOutbound_.end()) return;
   OutboundOpState& st = *it->second;
   st.completionReceived = true;
   st.completionCode = static_cast<StatusCode>(msg.statusCode);
   st.completionMsg = std::move(msg.msg);
   if (st.completionCode != StatusCode::SUCCESS) {
-    RemoveRecvTargetFromWorkers(st.peer, msg.opId);
-    st.status->Update(st.completionCode, st.completionMsg);
-    pendingOutbound_.erase(it);
+    uint16_t all = tcp::LanesAllMask(st.lanesTotal);
+    if ((st.isRead && (st.lanesDoneMask & all) != all) ||
+        (!st.isRead && (st.lanesSentMask & all) != all)) {
+      AbortPeer(peer, st.completionCode, st.completionMsg);
+      return;
+    }
+    FinalizeOutbound(key, st.completionCode, st.completionMsg);
     return;
   }
   MaybeCompleteOutbound(st);
@@ -1526,8 +1817,13 @@ std::optional<MemoryDesc> TcpTransport::LookupLocalMem(MemoryUniqueId id) {
 
 void TcpTransport::RecordInboundStatus(const EngineKey& peer, TransferUniqueId id, StatusCode code,
                                        const std::string& msg) {
+  auto now = Clock::now();
   std::lock_guard<std::mutex> lk(inboundMu_);
-  inboundStatus_[peer][id] = {code, msg};
+  auto& statuses = inboundStatus_[peer];
+  statuses[id] = {code, msg};
+  Clock::time_point pruneAt =
+      statuses.size() > kMaxInboundStatusesPerPeer ? now : now + std::chrono::seconds(1);
+  nextStatusPrune_ = std::min(nextStatusPrune_, pruneAt);
 }
 
 void TcpTransport::SendCompletionAndRecord(const EngineKey& peer, TransferUniqueId opId,
@@ -1547,18 +1843,69 @@ Connection* TcpTransport::PeerCtrl(const EngineKey& peer) {
   return (cit != conns_.end()) ? cit->second.get() : nullptr;
 }
 
+void TcpTransport::DispatchInboundRead(InboundReadState read) {
+  auto pit = peers_.find(read.peer);
+  if (pit == peers_.end() || pit->second.workers.empty()) {
+    if (pendingInboundReads_[read.peer].size() >= kMaxInboundWireOpsPerPeer) {
+      AbortPeer(std::move(read.peer), StatusCode::ERR_BAD_STATE,
+                "TCP: inbound read quota exceeded");
+      return;
+    }
+    NoteAuxDeadline(read.deadline);
+    pendingInboundReads_[read.peer].push_back(std::move(read));
+    return;
+  }
+
+  auto selected = SelectWorkers(pit->second, read.lanesTotal);
+  struct DoneState {
+    EngineKey peer;
+    TransferUniqueId opId{0};
+    std::atomic<int> remaining{0};
+  };
+  auto done = std::make_shared<DoneState>();
+  done->peer = read.peer;
+  done->opId = read.id;
+  done->remaining.store(read.lanesTotal);
+  auto laneDone = [this, done]() {
+    if (done->remaining.fetch_sub(1) > 1) return;
+    SendCompletionAndRecord(done->peer, done->opId, StatusCode::SUCCESS, "");
+  };
+  if (!QueueDataSend(read.peer, selected, read.src, read.srcSegs, tcp::DataKind::READ_RESPONSE,
+                     read.id, read.lanesTotal, std::move(laneDone)))
+    AbortPeer(std::move(read.peer), StatusCode::ERR_GPU_OP, "TCP: failed to prepare read response");
+}
+
+void TcpTransport::MaybeDispatchInboundReads(const EngineKey& peer) {
+  auto it = pendingInboundReads_.find(peer);
+  if (it == pendingInboundReads_.end()) return;
+  auto reads = std::move(it->second);
+  pendingInboundReads_.erase(it);
+  for (auto& read : reads) {
+    if (!peers_.count(peer)) return;
+    DispatchInboundRead(std::move(read));
+  }
+}
+
 void TcpTransport::FinalizeInboundWriteSetup(const EngineKey& peer, TransferUniqueId opId,
                                              InboundWriteState& ws) {
   if (!ws.discard && ws.dst.loc == MemoryLocationType::GPU) {
     ws.pinned = staging_.Acquire(static_cast<size_t>(SumLens(ws.dstSegs)));
     if (!ws.pinned) ws.discard = true;
   }
-  inboundWrites_[peer][opId] = ws;
+  if (config_.opTimeoutMs > 0)
+    ws.deadline = Clock::now() + std::chrono::milliseconds(config_.opTimeoutMs);
+  NoteAuxDeadline(ws.deadline);
+  auto& writes = inboundWrites_[peer];
+  writes[opId] = ws;
+  if (writes.size() > kMaxInboundWireOpsPerPeer) {
+    AbortPeer(peer, StatusCode::ERR_BAD_STATE, "TCP: inbound write quota exceeded");
+    return;
+  }
 
   // Set up worker recv targets
   WorkerRecvTarget target;
   target.lanesTotal = ws.lanesTotal;
-  target.totalLen = SumLens(ws.dstSegs);
+  target.totalLen = ws.discard ? 0 : SumLens(ws.dstSegs);
   target.discard = ws.discard;
   if (!ws.discard && ws.dst.loc == MemoryLocationType::GPU) {
     target.toGpu = true;
@@ -1567,9 +1914,8 @@ void TcpTransport::FinalizeInboundWriteSetup(const EngineKey& peer, TransferUniq
     target.cpuBase = reinterpret_cast<void*>(ws.dst.data);
     target.segs = ws.dstSegs;
   }
-  RegisterRecvTargetWithWorkers(peer, opId, target);
-
-  TryConsumeEarlyWriteLanes(peer, opId);
+  if (!RegisterRecvTarget(peer, {tcp::DataKind::WRITE_PAYLOAD, opId}, target))
+    AbortPeer(peer, StatusCode::ERR_BAD_STATE, "TCP: duplicate inbound receive target");
 }
 
 void TcpTransport::MaybeFinalizeInboundWrite(const EngineKey& peer, TransferUniqueId opId) {
@@ -1579,20 +1925,21 @@ void TcpTransport::MaybeFinalizeInboundWrite(const EngineKey& peer, TransferUniq
   if (wsIt == iwIt->second.end()) return;
 
   InboundWriteState& ws = wsIt->second;
-  ws.lanesTotal = ClampLanesTotal(ws.lanesTotal);
-  if ((ws.lanesDoneMask & LanesAllMask(ws.lanesTotal)) != LanesAllMask(ws.lanesTotal)) return;
+  if ((ws.lanesDoneMask & tcp::LanesAllMask(ws.lanesTotal)) != tcp::LanesAllMask(ws.lanesTotal))
+    return;
 
-  RemoveRecvTargetFromWorkers(peer, opId);
+  RemoveRecvTarget(peer, {tcp::DataKind::WRITE_PAYLOAD, opId});
 
   if (ws.discard) {
-    SendCompletionAndRecord(peer, opId, StatusCode::ERR_INVALID_ARGS, "TCP: write discarded");
+    if (!ws.completionSent)
+      SendCompletionAndRecord(peer, opId, StatusCode::ERR_INVALID_ARGS, "TCP: write discarded");
   } else if (ws.dst.loc == MemoryLocationType::GPU) {
     if (!ws.pinned) {
       SendCompletionAndRecord(peer, opId, StatusCode::ERR_BAD_STATE,
                               "TCP: missing staging (write)");
     } else {
       auto pinnedRef = ws.pinned;
-      bool ok = ScheduleGpuCopy(ws.dst.deviceId, true, ws.dst, ws.dstSegs, pinnedRef,
+      bool ok = ScheduleGpuCopy(ws.dst.deviceId, true, ws.dst, ws.dstSegs, pinnedRef, peer, opId,
                                 [this, peer, opId, pinnedRef]() {
                                   SendCompletionAndRecord(peer, opId, StatusCode::SUCCESS, "");
                                 });
@@ -1605,81 +1952,19 @@ void TcpTransport::MaybeFinalizeInboundWrite(const EngineKey& peer, TransferUniq
 
   iwIt->second.erase(wsIt);
   if (iwIt->second.empty()) inboundWrites_.erase(iwIt);
-  auto ewIt = earlyWrites_.find(peer);
-  if (ewIt != earlyWrites_.end()) {
-    ewIt->second.erase(opId);
-    if (ewIt->second.empty()) earlyWrites_.erase(ewIt);
-  }
-}
-
-void TcpTransport::TryConsumeEarlyWriteLanes(const EngineKey& peer, TransferUniqueId opId) {
-  auto iwIt = inboundWrites_.find(peer);
-  if (iwIt == inboundWrites_.end()) return;
-  auto wsIt = iwIt->second.find(opId);
-  if (wsIt == iwIt->second.end()) return;
-  InboundWriteState& ws = wsIt->second;
-  ws.lanesTotal = ClampLanesTotal(ws.lanesTotal);
-
-  auto ewIt = earlyWrites_.find(peer);
-  if (ewIt == earlyWrites_.end()) return;
-  auto elIt = ewIt->second.find(opId);
-  if (elIt == ewIt->second.end()) return;
-
-  EarlyWriteState& early = elIt->second;
-  const uint64_t total = SumLens(ws.dstSegs);
-  uint8_t* dstBase = reinterpret_cast<uint8_t*>(ws.dst.data);
-
-  for (auto it = early.lanes.begin(); it != early.lanes.end();) {
-    uint8_t lane = it->first;
-    EarlyWriteLaneState& ls = it->second;
-    if (!ls.complete) {
-      ++it;
-      continue;
-    }
-
-    if (lane >= ws.lanesTotal) ws.discard = true;
-    LaneSpan span = ComputeLaneSpan(total, ws.lanesTotal, lane);
-    if (span.len != ls.payloadLen) ws.discard = true;
-
-    if (!ws.discard && ls.pinned) {
-      uint8_t* src = reinterpret_cast<uint8_t*>(ls.pinned->ptr);
-      if (ws.dst.loc == MemoryLocationType::GPU) {
-        if (!ws.pinned) {
-          ws.pinned = staging_.Acquire(size_t(total));
-          if (!ws.pinned) ws.discard = true;
-        }
-        if (!ws.discard && ws.pinned)
-          std::memcpy(reinterpret_cast<uint8_t*>(ws.pinned->ptr) + span.off, src, size_t(span.len));
-      } else {
-        auto segs = SliceSegments(ws.dstSegs, span.off, span.len);
-        uint64_t copied = 0;
-        for (auto& s : segs) {
-          std::memcpy(dstBase + s.off, src + copied, size_t(s.len));
-          copied += s.len;
-        }
-      }
-    }
-    if (lane < 8) ws.lanesDoneMask |= uint8_t(1U << lane);
-    it = early.lanes.erase(it);
-  }
-
-  if (early.lanes.empty()) {
-    ewIt->second.erase(elIt);
-    if (ewIt->second.empty()) earlyWrites_.erase(ewIt);
-  }
-  MaybeFinalizeInboundWrite(peer, opId);
 }
 
 void TcpTransport::MaybeCompleteOutbound(OutboundOpState& st) {
   if (!st.completionReceived) return;
+  uint16_t allMask = tcp::LanesAllMask(st.lanesTotal);
   if (st.isRead) {
-    uint16_t allMask = LanesAllMask(st.lanesTotal);
-    if (st.lanesDoneMask != allMask || st.rxBytes != st.expectedRxBytes || st.gpuCopyPending)
+    if ((st.lanesDoneMask & allMask) != allMask || st.rxBytes != st.expectedRxBytes ||
+        st.gpuCopyPending)
       return;
+  } else if ((st.lanesSentMask & allMask) != allMask) {
+    return;
   }
-  RemoveRecvTargetFromWorkers(st.peer, st.id);
-  st.status->Update(StatusCode::SUCCESS, "");
-  pendingOutbound_.erase(st.id);
+  FinalizeOutbound(st.key, st.completionCode, st.completionMsg);
 }
 
 // ---------------------------------------------------------------------------
@@ -1693,16 +1978,28 @@ void TcpTransport::ProcessEventsFrom(DataConnectionWorker* worker) {
       case WorkerEventType::RECV_DONE:
         HandleWorkerRecvDone(ev);
         break;
-      case WorkerEventType::EARLY_DATA:
-        HandleWorkerEarlyData(ev);
+      case WorkerEventType::AWAIT_TARGET:
+        if (!HasRecvTarget(ev.peerKey, {ev.dataKind, ev.opId})) {
+          auto& targets = awaitingTargets_[ev.peerKey];
+          RecvTargetKey targetKey{ev.dataKind, ev.opId};
+          if (!targets.count(targetKey) && targets.size() >= kMaxInboundWireOpsPerPeer) {
+            AbortPeer(ev.peerKey, StatusCode::ERR_BAD_STATE, "TCP: awaiting target quota exceeded");
+            return;
+          }
+          auto deadline = config_.opTimeoutMs > 0
+                              ? Clock::now() + std::chrono::milliseconds(config_.opTimeoutMs)
+                              : Clock::time_point::max();
+          targets[targetKey] = deadline;
+          NoteAuxDeadline(deadline);
+        }
         break;
       case WorkerEventType::SEND_CALLBACK:
         if (ev.callback) ev.callback();
         break;
       case WorkerEventType::CONN_ERROR:
         MORI_IO_WARN("TCP: worker error peer {}: {}", ev.peerKey, ev.errorMsg);
-        ClosePeerByKey(ev.peerKey, ev.errorMsg);
-        break;
+        AbortPeer(ev.peerKey, StatusCode::ERR_BAD_STATE, ev.errorMsg);
+        return;
     }
   }
 }
@@ -1721,86 +2018,291 @@ void TcpTransport::ProcessWorkerEvents() {
 void TcpTransport::HandleWorkerRecvDone(const WorkerEvent& ev) {
   const EngineKey& peer = ev.peerKey;
   const TransferUniqueId opId = ev.opId;
+  auto awaitingPeer = awaitingTargets_.find(peer);
+  if (awaitingPeer != awaitingTargets_.end()) {
+    awaitingPeer->second.erase({ev.dataKind, opId});
+    if (awaitingPeer->second.empty()) awaitingTargets_.erase(awaitingPeer);
+  }
 
-  // Check inbound writes first
-  auto iwIt = inboundWrites_.find(peer);
-  if (iwIt != inboundWrites_.end()) {
-    auto wsIt = iwIt->second.find(opId);
-    if (wsIt != iwIt->second.end()) {
-      wsIt->second.lanesTotal = ClampLanesTotal(wsIt->second.lanesTotal);
-      if (ev.lane < 8) wsIt->second.lanesDoneMask |= uint8_t(1U << ev.lane);
-      MaybeFinalizeInboundWrite(peer, opId);
+  if (ev.dataKind == tcp::DataKind::WRITE_PAYLOAD) {
+    auto iwIt = inboundWrites_.find(peer);
+    if (iwIt == inboundWrites_.end() || !iwIt->second.count(opId)) {
+      AbortPeer(peer, StatusCode::ERR_BAD_STATE, "TCP: unknown inbound write payload");
       return;
     }
+    InboundWriteState& state = iwIt->second.at(opId);
+    if (ev.lane >= state.lanesTotal || (state.lanesDoneMask & uint16_t(1U << ev.lane))) {
+      AbortPeer(peer, StatusCode::ERR_BAD_STATE, "TCP: duplicate or invalid write lane");
+      return;
+    }
+    if (ev.discarded && !state.discard) {
+      AbortPeer(peer, StatusCode::ERR_INVALID_ARGS, "TCP: invalid write payload length");
+      return;
+    }
+    state.lanesDoneMask |= uint16_t(1U << ev.lane);
+    MaybeFinalizeInboundWrite(peer, opId);
+    return;
   }
 
-  // Check outbound reads
-  auto obIt = pendingOutbound_.find(opId);
+  OpKey key{peer, opId};
+  auto obIt = pendingOutbound_.find(key);
   if (obIt == pendingOutbound_.end()) return;
   OutboundOpState& st = *obIt->second;
-  st.lanesTotal = ClampLanesTotal(st.lanesTotal);
-  uint8_t bit = uint8_t(1U << ev.lane);
-  if (!(st.lanesDoneMask & bit)) {
-    st.lanesDoneMask |= bit;
-    st.rxBytes += ev.laneLen;
+  if (!st.isRead || ev.lane >= st.lanesTotal || (st.lanesDoneMask & uint16_t(1U << ev.lane)) ||
+      ev.discarded) {
+    AbortPeer(peer, StatusCode::ERR_INVALID_ARGS, "TCP: invalid read response lane");
+    return;
   }
+  st.lanesDoneMask |= uint16_t(1U << ev.lane);
+  st.rxBytes += ev.laneLen;
 
   if (st.local.loc == MemoryLocationType::GPU) {
-    uint16_t allMask = LanesAllMask(st.lanesTotal);
+    uint16_t allMask = tcp::LanesAllMask(st.lanesTotal);
     if ((st.lanesDoneMask & allMask) != allMask) {
       MaybeCompleteOutbound(st);
       return;
     }
     if (st.gpuCopyPending) return;
     if (!st.pinned) {
-      st.status->Update(StatusCode::ERR_BAD_STATE, "TCP: missing staging (read)");
-      RemoveRecvTargetFromWorkers(st.peer, opId);
-      pendingOutbound_.erase(obIt);
+      AbortPeer(peer, StatusCode::ERR_BAD_STATE, "TCP: missing staging (read)");
       return;
     }
     st.gpuCopyPending = true;
     auto pinnedRef = st.pinned;
-    bool ok = ScheduleGpuCopy(st.local.deviceId, true, st.local, st.localSegs, pinnedRef,
-                              [this, opId, pinnedRef]() {
-                                auto it2 = pendingOutbound_.find(opId);
+    bool ok = ScheduleGpuCopy(st.local.deviceId, true, st.local, st.localSegs, pinnedRef, peer,
+                              opId, [this, key, pinnedRef]() {
+                                auto it2 = pendingOutbound_.find(key);
                                 if (it2 == pendingOutbound_.end()) return;
                                 it2->second->gpuCopyPending = false;
                                 MaybeCompleteOutbound(*it2->second);
                               });
     if (!ok) {
-      st.status->Update(StatusCode::ERR_BAD_STATE, "TCP: HIP copy failed (read)");
-      RemoveRecvTargetFromWorkers(st.peer, opId);
-      pendingOutbound_.erase(obIt);
+      AbortPeer(peer, StatusCode::ERR_BAD_STATE, "TCP: HIP copy failed (read)");
     }
     return;
   }
   MaybeCompleteOutbound(st);
 }
 
-void TcpTransport::HandleWorkerEarlyData(const WorkerEvent& ev) {
-  auto& perPeer = earlyWrites_[ev.peerKey];
-  auto& early = perPeer[ev.opId];
-  if (early.lanes.count(ev.lane)) {
-    MORI_IO_WARN("TCP: duplicate early data op {} lane {} peer {}", ev.opId, uint32_t(ev.lane),
-                 ev.peerKey);
-    return;
+void TcpTransport::DrainSubmissions() {
+  std::deque<std::unique_ptr<OutboundOpState>> ops;
+  {
+    std::lock_guard<std::mutex> lk(submitMu_);
+    ops.swap(submitQ_);
   }
-  early.lanes.emplace(ev.lane, EarlyWriteLaneState{ev.laneLen, ev.earlyBuf, true});
-  TryConsumeEarlyWriteLanes(ev.peerKey, ev.opId);
+  for (auto& op : ops) {
+    bool duplicate = pendingOutbound_.count(op->key) != 0;
+    auto waiting = waitingOps_.find(op->key.peer);
+    if (!duplicate && waiting != waitingOps_.end()) {
+      duplicate = std::any_of(waiting->second.begin(), waiting->second.end(),
+                              [&](const auto& old) { return old->key == op->key; });
+    }
+    if (duplicate) {
+      op->status->Update(StatusCode::ERR_BAD_STATE, "TCP: duplicate peer/op id");
+      continue;
+    }
+    if (config_.opTimeoutMs > 0) {
+      op->deadline = Clock::now() + std::chrono::milliseconds(config_.opTimeoutMs);
+      deadlineDeque_.push_back({op->deadline, op->key});
+    }
+    const EngineKey peer = op->key.peer;
+    EnsurePeerChannels(peer);
+    if (IsPeerReady(peer))
+      DispatchOp(std::move(op));
+    else
+      waitingOps_[peer].push_back(std::move(op));
+  }
+}
+
+void TcpTransport::RetryWaitingConnections() {
+  if (Clock::now() < nextAuxDeadline_) return;
+  std::vector<EngineKey> peers;
+  peers.reserve(waitingOps_.size());
+  for (const auto& [peer, ops] : waitingOps_) peers.push_back(peer);
+  for (const auto& peer : peers)
+    if (!IsPeerReady(peer)) EnsurePeerChannels(peer);
+}
+
+void TcpTransport::NoteAuxDeadline(Clock::time_point deadline) {
+  nextAuxDeadline_ = std::min(nextAuxDeadline_, deadline);
+}
+
+void TcpTransport::RecomputeAuxDeadline() {
+  nextAuxDeadline_ = Clock::time_point::max();
+  for (const auto& [peer, writes] : inboundWrites_)
+    for (const auto& [id, state] : writes) NoteAuxDeadline(state.deadline);
+  for (const auto& [peer, reads] : pendingInboundReads_)
+    for (const auto& read : reads) NoteAuxDeadline(read.deadline);
+  for (const auto& [peer, targets] : awaitingTargets_)
+    for (const auto& [key, deadline] : targets) NoteAuxDeadline(deadline);
+  for (const auto& [peer, links] : peers_) NoteAuxDeadline(links.connectNotBefore);
+}
+
+bool TcpTransport::IsLiveDeadline(const OpKey& key, Clock::time_point deadline) const {
+  auto pending = pendingOutbound_.find(key);
+  if (pending != pendingOutbound_.end()) return pending->second->deadline == deadline;
+  auto waiting = waitingOps_.find(key.peer);
+  if (waiting == waitingOps_.end()) return false;
+  for (const auto& op : waiting->second)
+    if (op->key == key && op->deadline == deadline) return true;
+  return false;
+}
+
+int TcpTransport::ComputeEpollTimeoutMs() {
+  while (!deadlineDeque_.empty() &&
+         !IsLiveDeadline(deadlineDeque_.front().second, deadlineDeque_.front().first))
+    deadlineDeque_.pop_front();
+  int timeout = -1;
+  if (!deadlineDeque_.empty()) {
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         deadlineDeque_.front().first - Clock::now())
+                         .count();
+    timeout = remaining <= 0 ? 0 : static_cast<int>(std::min<int64_t>(remaining, INT_MAX));
+  }
+  for (Clock::time_point deadline : {nextAuxDeadline_, nextStatusPrune_}) {
+    if (deadline == Clock::time_point::max()) continue;
+    auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+    int auxiliaryTimeout =
+        remaining <= 0 ? 0 : static_cast<int>(std::min<int64_t>(remaining, INT_MAX));
+    timeout = timeout < 0 ? auxiliaryTimeout : std::min(timeout, auxiliaryTimeout);
+  }
+  if (!gpuTasks_.empty())
+    timeout = timeout < 0 ? kGpuPollIntervalMs : std::min(timeout, kGpuPollIntervalMs);
+  return timeout;
+}
+
+void TcpTransport::PruneInboundStatuses() {
+  const auto now = Clock::now();
+  if (now < nextStatusPrune_) return;
+  const auto maxAge = std::chrono::milliseconds(std::max(config_.opTimeoutMs * 4, 60000));
+  std::lock_guard<std::mutex> lk(inboundMu_);
+  for (auto peerIt = inboundStatus_.begin(); peerIt != inboundStatus_.end();) {
+    auto& entries = peerIt->second;
+    for (auto it = entries.begin(); it != entries.end();) {
+      if (now - it->second.created > maxAge) {
+        MORI_IO_WARN("TCP: evicting stale inbound status peer={} op={}", peerIt->first, it->first);
+        it = entries.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (entries.size() > kMaxInboundStatusesPerPeer) {
+      std::vector<std::pair<Clock::time_point, TransferUniqueId>> byAge;
+      byAge.reserve(entries.size());
+      for (const auto& [id, entry] : entries) byAge.push_back({entry.created, id});
+      std::sort(byAge.begin(), byAge.end());
+      size_t excess = entries.size() - kMaxInboundStatusesPerPeer;
+      for (size_t i = 0; i < excess; ++i) {
+        MORI_IO_WARN("TCP: evicting excess inbound status peer={} op={}", peerIt->first,
+                     byAge[i].second);
+        entries.erase(byAge[i].second);
+      }
+    }
+    if (entries.empty())
+      peerIt = inboundStatus_.erase(peerIt);
+    else
+      ++peerIt;
+  }
+  nextStatusPrune_ =
+      inboundStatus_.empty() ? Clock::time_point::max() : now + std::chrono::seconds(1);
 }
 
 void TcpTransport::ScanTimeouts() {
-  if (config_.opTimeoutMs <= 0) return;
-  auto now = Clock::now();
-  auto timeout = std::chrono::milliseconds(config_.opTimeoutMs);
-  for (auto it = pendingOutbound_.begin(); it != pendingOutbound_.end();) {
-    if ((now - it->second->startTs) > timeout) {
-      RemoveRecvTargetFromWorkers(it->second->peer, it->first);
-      it->second->status->Update(StatusCode::ERR_BAD_STATE, "TCP: op timeout");
-      it = pendingOutbound_.erase(it);
-    } else
-      ++it;
+  const auto now = Clock::now();
+  while (!deadlineDeque_.empty() && deadlineDeque_.front().first <= now) {
+    auto [deadline, key] = deadlineDeque_.front();
+    deadlineDeque_.pop_front();
+    if (!IsLiveDeadline(key, deadline)) continue;
+    if (pendingOutbound_.count(key)) {
+      AbortPeer(key.peer, StatusCode::ERR_BAD_STATE, "TCP: operation timeout");
+      continue;
+    }
+    auto waiting = waitingOps_.find(key.peer);
+    if (waiting == waitingOps_.end()) continue;
+    if (!IsPeerReady(key.peer)) {
+      AbortPeer(key.peer, StatusCode::ERR_BAD_STATE, "TCP: connection timeout");
+      continue;
+    }
+    for (auto it = waiting->second.begin(); it != waiting->second.end(); ++it) {
+      if ((*it)->key != key) continue;
+      TransferStatus* status = (*it)->status;
+      waiting->second.erase(it);
+      status->Update(StatusCode::ERR_BAD_STATE, "TCP: no DATA lane available");
+      break;
+    }
+    if (waiting->second.empty()) waitingOps_.erase(waiting);
   }
+
+  std::vector<EngineKey> abortPeers;
+  const bool scanAuxiliary = now >= nextAuxDeadline_;
+  if (scanAuxiliary) {
+    for (const auto& [peer, writes] : inboundWrites_) {
+      bool expired = false;
+      for (const auto& [id, state] : writes)
+        expired = expired || (state.deadline != Clock::time_point::max() && state.deadline <= now);
+      if (expired) abortPeers.push_back(peer);
+    }
+    for (const auto& [peer, reads] : pendingInboundReads_) {
+      bool expired = false;
+      for (const auto& read : reads)
+        expired = expired || (read.deadline != Clock::time_point::max() && read.deadline <= now);
+      if (expired && std::find(abortPeers.begin(), abortPeers.end(), peer) == abortPeers.end())
+        abortPeers.push_back(peer);
+    }
+    for (const auto& [peer, targets] : awaitingTargets_) {
+      bool expired = false;
+      for (const auto& [key, deadline] : targets)
+        expired = expired || (deadline != Clock::time_point::max() && deadline <= now);
+      if (expired && std::find(abortPeers.begin(), abortPeers.end(), peer) == abortPeers.end())
+        abortPeers.push_back(peer);
+    }
+  }
+  for (const auto& peer : abortPeers)
+    AbortPeer(peer, StatusCode::ERR_BAD_STATE, "TCP: inbound wire timeout or quota exceeded");
+  if (scanAuxiliary) RecomputeAuxDeadline();
+  PruneInboundStatuses();
+}
+
+void TcpTransport::ShutdownDrain() {
+  std::unordered_set<EngineKey> peerKeys;
+  for (const auto& [peer, links] : peers_) peerKeys.insert(peer);
+  for (const auto& [peer, ops] : waitingOps_) peerKeys.insert(peer);
+  for (const auto& [key, op] : pendingOutbound_) peerKeys.insert(key.peer);
+  for (const auto& peer : peerKeys)
+    AbortPeer(peer, StatusCode::ERR_BAD_STATE, "TCP: transport shutdown");
+
+  std::deque<std::unique_ptr<OutboundOpState>> submitted;
+  {
+    std::lock_guard<std::mutex> lk(submitMu_);
+    submitted.swap(submitQ_);
+  }
+  for (auto& op : submitted)
+    op->status->Update(StatusCode::ERR_BAD_STATE, "TCP: transport shutdown");
+
+  for (auto& [fd, worker] : dataWorkers_) shutdown(fd, SHUT_RDWR);
+  for (auto& [fd, worker] : dataWorkers_) {
+    worker->Stop();
+    close(fd);
+  }
+  dataWorkers_.clear();
+  workerNotifyMap_.clear();
+  for (auto& [fd, conn] : conns_) CloseConnInternal(conn.get());
+  conns_.clear();
+  peers_.clear();
+
+  for (auto& task : gpuTasks_) {
+    hipError_t setStatus = hipSetDevice(task.deviceId);
+    if (setStatus != hipSuccess)
+      MORI_IO_WARN("TCP: hipSetDevice({}) during shutdown failed: {}", task.deviceId,
+                   hipGetErrorString(setStatus));
+    hipError_t status = hipEventSynchronize(task.ev);
+    if (status != hipSuccess)
+      MORI_IO_WARN("TCP: hipEventSynchronize during shutdown failed: {}",
+                   hipGetErrorString(status));
+    eventPool_.PutEvent(task.ev, task.deviceId);
+  }
+  gpuTasks_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -1811,21 +2313,25 @@ void TcpTransport::IoLoop() {
   epoll_event events[kMaxEvents];
 
   while (running_.load()) {
+    DrainSubmissions();
+    RetryWaitingConnections();
     PollGpuTasks();
     ProcessWorkerEvents();
     ScanTimeouts();
 
-    bool hasActive = !gpuTasks_.empty() || !pendingOutbound_.empty() || !workerNotifyMap_.empty();
-    int nfds = epoll_wait(epfd_, events, kMaxEvents, hasActive ? 0 : 2);
+    int nfds = epoll_wait(epfd_, events, kMaxEvents, ComputeEpollTimeoutMs());
     if (nfds < 0) {
       if (errno == EINTR) continue;
       MORI_IO_ERROR("TCP: epoll_wait: {}", strerror(errno));
       break;
     }
 
+    std::unordered_set<int> closedThisBatch;
+    closedThisBatch_ = &closedThisBatch;
     for (int i = 0; i < nfds; ++i) {
       int fd = events[i].data.fd;
       uint32_t ev = events[i].events;
+      if (closedThisBatch.count(fd)) continue;
 
       if (fd == listenFd_) {
         AcceptNew();
@@ -1852,15 +2358,22 @@ void TcpTransport::IoLoop() {
         continue;
       }
       if (ev & EPOLLIN) {
-        HandleCtrlReadable(c);
+        if (HandleCtrlReadable(c) == ConnResult::Gone) continue;
         cit = conns_.find(fd);
         if (cit == conns_.end()) continue;
         c = cit->second.get();
         if (!c) continue;
+        if (c->handedOff) continue;
       }
-      if (ev & EPOLLOUT) HandleConnWritable(c);
+      if (ev & EPOLLOUT) {
+        cit = conns_.find(fd);
+        if (cit != conns_.end()) HandleConnWritable(cit->second.get());
+      }
     }
+    closedThisBatch_ = nullptr;
   }
+  closedThisBatch_ = nullptr;
+  ShutdownDrain();
 }
 
 }  // namespace io
