@@ -41,7 +41,19 @@ PREFILL_TOKENS = 128
 DECODE_TOKENS = 8
 
 
-def _make_config(rank, world_size, max_num_inp_token_per_rank):
+# Kernel types reachable with a single node of 8 GPUs. The InterNode* paths
+# need real multi-node RDMA and AsyncLL needs MORI_ENABLE_SDMA set before shmem
+# init, so both are left to their own coverage (see backlog in RESULTS_M.md).
+_KERNEL_TYPES = ("IntraNode", "IntraNodeLL")
+
+
+def _make_config(
+    rank,
+    world_size,
+    max_num_inp_token_per_rank,
+    kernel_type="IntraNode",
+    quant_type="none",
+):
     return mori.ops.EpDispatchCombineConfig(
         data_type=torch.bfloat16,
         rank=rank,
@@ -56,7 +68,8 @@ def _make_config(rank, world_size, max_num_inp_token_per_rank):
         block_num=64,
         warp_num_per_block=4,
         use_external_inp_buf=True,
-        kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
+        kernel_type=getattr(mori.ops.EpDispatchCombineKernelType, kernel_type),
+        quant_type=quant_type,
     )
 
 
@@ -79,9 +92,10 @@ def _assert_capacity(op, expected_tokens):
 # ---------------------------------------------------------------------------
 # workers (run one per rank via the torch-dist process manager)
 # ---------------------------------------------------------------------------
-def _worker_flip_and_flip_back(rank, world_size):
+def _worker_flip_and_flip_back(rank, world_size, kernel_type="IntraNode",
+                               quant_type="none"):
     """P -> D -> P: correct numerics at every capacity, buffers really resized."""
-    config = _make_config(rank, world_size, PREFILL_TOKENS)
+    config = _make_config(rank, world_size, PREFILL_TOKENS, kernel_type, quant_type)
     op = mori.ops.EpDispatchCombineOp(config)
 
     _assert_capacity(op, PREFILL_TOKENS)
@@ -180,10 +194,27 @@ def _worker_reconfigure_noop_and_finalize(rank, world_size):
 # tests
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("world_size", (8,))
-def test_reconfigure_flip_and_flip_back(torch_dist_process_manager, world_size):
+@pytest.mark.parametrize("kernel_type", _KERNEL_TYPES)
+def test_reconfigure_flip_and_flip_back(
+    torch_dist_process_manager, world_size, kernel_type
+):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
-            (_worker_flip_and_flip_back, [world_size])
+            (_worker_flip_and_flip_back, [world_size, kernel_type])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+# fp8 paths allocate extra scale buffers off the same capacity fields, so the
+# rebuild has to resize those too.
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("quant_type", ("fp8_direct_cast", "fp8_blockwise"))
+def test_reconfigure_flip_and_flip_back_quant(
+    torch_dist_process_manager, world_size, quant_type
+):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_flip_and_flip_back, [world_size, "IntraNode", quant_type])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
