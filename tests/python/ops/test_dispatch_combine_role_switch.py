@@ -900,6 +900,79 @@ def _worker_rank_asymmetric_giveback_fails(rank, world_size):
     _run_once(op, config)
 
 
+def _worker_rank_asymmetric_reject(rank, world_size):
+    """Rank 0 is handed an INVALID capacity; ranks 1-7 are handed a valid one.
+
+    The fourth asymmetry, and until 24b4379e it was a seven-rank DEADLOCK
+    rather than a wrong message. The reject fast-path raised AFTER the entry
+    `_shmem_barrier` and BEFORE `_agree_on_severity`, so:
+
+      * all 8 ranks vote need_resize=1 and clear the entry barrier;
+      * rank 0's config is refused by C++ ValidateReconfigurable and it raised
+        out of reconfigure() there and then;
+      * ranks 1-7 resized fine, voted SEVERITY_OK, and blocked in
+        `_agree_on_severity`'s all_reduce with 7 of 8 participants -- forever.
+
+    One rank raises, seven hang: exactly the group split the severity code was
+    introduced to prevent, reintroduced one layer above it. The rationale in
+    the code was that making the rejection collective would hang a divergent
+    config; the opposite is true, and this test is the demonstration -- a
+    divergent config is the ONLY way to reach the branch, and it now completes.
+
+    The test's primary assertion is therefore not a string but the fact that it
+    RETURNS: every rank must put a result on the queue inside
+    MORI_TEST_RESULT_TIMEOUT rather than the harness reporting silent ranks.
+
+    Also asserted, because a rejection is still not an OOM:
+      1. every rank raises;
+      2. NO rank's message says "could not grow" (sglang aborts-and-retries on
+         that) or "GROUP is not usable" (sglang escalates on that). A config
+         that is refused as invalid will be refused identically forever, so
+         both of those verdicts send sglang somewhere wrong;
+      3. rank 0 gets the C++ detail ("must be > 0"); its peers are told a group
+         member refused, since on this bug the peers are the ones that look
+         healthy;
+      4. every rank is back at the OLD capacity with correct numerics -- the
+         peers did resize before learning of the rejection, so the give-back
+         has to have run, and the divergent alloc/free histories must not have
+         moved a peer VA offset;
+      5. a legitimate group-wide flip afterwards still works.
+    """
+    config = _make_config(rank, world_size, DECODE_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+    _run_once(op, config)
+
+    # The divergence: rank 0 alone asks for something C++ refuses (> 0 required).
+    target = 0 if rank == 0 else PREFILL_TOKENS
+
+    with pytest.raises(RuntimeError) as excinfo:
+        op.reconfigure(max_num_inp_token_per_rank=target)
+
+    message = str(excinfo.value)
+    assert (
+        "could not grow" not in message
+    ), f"rank {rank}: a rejection must not wear the OOM wording: {message}"
+    assert (
+        "GROUP is not usable" not in message
+    ), f"rank {rank}: nothing was freed anywhere; do not tell sglang to stop: {message}"
+
+    if rank == 0:
+        assert "must be > 0" in message, f"rank 0: {message}"
+    else:
+        assert "refused the requested config" in message, f"rank {rank}: {message}"
+
+    # Every rank is unchanged, including the seven that DID resize and then gave
+    # the capacity back.
+    assert op.is_initialized is True, f"rank {rank} lost its buffers"
+    _assert_capacity(op, DECODE_TOKENS)
+    _run_once(op, config)
+
+    # And a legitimate flip, agreed by the whole group, still works afterwards.
+    op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
+    _assert_capacity(op, PREFILL_TOKENS)
+    _run_once(op, config)
+
+
 def _worker_reconfigure_rejects_immutable_fields(rank, world_size):
     """numQpPerPe / useExternalInpBuffer are peer-visible; they must be frozen.
 
@@ -1251,6 +1324,15 @@ def test_finalized_getters_raise(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_finalized_getters_raise, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+def test_rank_asymmetric_reject(torch_dist_process_manager, world_size):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_rank_asymmetric_reject, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
