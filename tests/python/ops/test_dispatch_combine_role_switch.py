@@ -284,9 +284,15 @@ def _worker_finalized_getters_raise(rank, world_size):
     from mori import cpp as mori_cpp
 
     probes = [
-        (lambda: mori_cpp.get_dispatch_output_ptrs(op._handle), "get_dispatch_output_ptrs"),
-        (lambda: mori_cpp.get_combine_output_ptrs(op._handle), "get_combine_output_ptrs"),
-        (lambda: mori_cpp.build_args(op._handle), "build_args"),
+        (
+            lambda: mori_cpp.get_dispatch_output_ptrs(op._handle, True),
+            "get_dispatch_output_ptrs",
+        ),
+        (
+            lambda: mori_cpp.get_combine_output_ptrs(op._handle, True),
+            "get_combine_output_ptrs",
+        ),
+        (lambda: mori_cpp.build_args(op._handle, rdma_block_num=0), "build_args"),
         (
             lambda: mori_cpp.get_dispatch_sender_token_idx_map(op._handle),
             "get_dispatch_sender_token_idx_map",
