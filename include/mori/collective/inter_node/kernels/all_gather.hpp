@@ -19,6 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include "mori/collective/ccl_kernel_args.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {
@@ -27,6 +28,30 @@ namespace collective {
 // s_sleep cycles between polls on the long REMOTE-landing spins (timing-only;
 // memory order unchanged). 0 => OFF, guarded call compiles out (byte-identical).
 constexpr int kHierInterPollSleep = 0;
+
+// SINGLE SOURCE of the deep-pipe engage decision and the effective depth P. The ring
+// sender and the reassembly/completion CTAs must call this with the same arguments: any
+// divergence makes reassembly wait on a landing flag nobody ever sets. Returns 0 when the
+// deep-pipe path is not taken (caller falls back to the plain round loop / rb channels).
+inline __device__ int HierDeepPipeEffectiveDepth(int ringPos, int ringSize, int peBase,
+                                                 int peStride, size_t peChunkSize, int numBlocks,
+                                                 const uint64_t* chunkReadyFlags, int deepPipe) {
+  // Single-round all-RDMA single-channel ring only.
+  if (deepPipe <= 1 || chunkReadyFlags == nullptr || ringSize != 2 || numBlocks != 1) return 0;
+  const int nextPeer = peBase + ((ringPos + 1) % ringSize) * peStride;
+  const int prevPeer = peBase + ((ringPos - 1 + ringSize) % ringSize) * peStride;
+  const auto* states = shmem::GetGlobalGpuStatesPtr();
+  if (states->transportTypes[nextPeer] != application::TransportType::RDMA) return 0;
+  if (states->transportTypes[prevPeer] != application::TransportType::RDMA) return 0;
+  // Clamp P so each sub-chunk carries >= 1 MiB: tiny per-sub-chunk WQEs starve the NIC
+  // and can deadlock. Bit-exact (P only partitions the same contiguous bytes).
+  const size_t kMinSubChunkB = static_cast<size_t>(1) << 20;
+  int reqPmax = static_cast<int>(peChunkSize / kMinSubChunkB);
+  if (reqPmax < 1) reqPmax = 1;
+  int P = (deepPipe < reqPmax) ? deepPipe : reqPmax;
+  if (P > kHierMaxDeepPipe) P = kHierMaxDeepPipe;
+  return (P > 1) ? P : 0;
+}
 
 // Ring AllGather over the arithmetic sub-group {peBase + k*peStride : k<ringSize};
 // this PE at ``ringPos``. Ring buffer holds ``ringSize`` chunks of ``peChunkSize``,
@@ -114,16 +139,9 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
   // XGMI while later sub-chunks cross the NIC. Single-round (ringSize==2) all-RDMA
   // path only; publishes P chunkReadyFlags in temporal order and returns before the
   // round loop. INERT when deepPipe<=1 (byte-identical).
-  bool deepPipeEngaged = (deepPipe > 1 && peerIsRdma && prevIsRdma && maxRounds == 1 &&
-                          !multiBlock && chunkReadyFlags != nullptr && useWarps >= 1);
-  if (deepPipeEngaged) {
-    // Clamp P so each sub-chunk carries >= kMinSubChunkB (1 MiB): tiny per-sub-chunk
-    // WQEs starve the NIC and can deadlock. Bit-exact (P only partitions the same
-    // contiguous bytes issued+landed in order).
-    const size_t kMinSubChunkB = static_cast<size_t>(1) << 20;
-    int reqPmax = static_cast<int>(peChunkSize / kMinSubChunkB);
-    if (reqPmax < 1) reqPmax = 1;
-    const int P = (deepPipe < reqPmax) ? deepPipe : reqPmax;
+  const int P = HierDeepPipeEffectiveDepth(ringPos, ringSize, peBase, peStride, peChunkSize,
+                                           numBlocks, chunkReadyFlags, deepPipe);
+  if (P > 0) {
     const int sendRank = ringPos;  // maxRounds==1: send our own chunk
     const size_t chunkBaseOffsetSend = static_cast<size_t>(sendRank) * peChunkSize;
     const size_t kAlignDP = 16;

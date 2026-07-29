@@ -37,38 +37,17 @@ back-to-back FSDP overlap it can read stale remote halves. Each ``MORI_HIER_*``
 flag is an opt-in override; flag table in ``examples/fsdp_sdma/README.md``.
 """
 
+import logging
 import os
 import socket
 from typing import List, Optional, Sequence
 
 import torch
 
-# MI300X SDMA queue-slot cap: MORI_SDMA_NUM_CHANNELS>8 aborts at queue creation.
-# anvil reads this env at shmem init (before any HierAllGather), so clamp at
-# import time, ahead of shmem.init().
+logger = logging.getLogger(__name__)
+
+# SDMA queue-slot cap, mirrors anvil::kSdmaMaxNumChannels (C++ clamps the env).
 MORI_SDMA_CH_HW_MAX = 8
-
-
-def _clamp_sdma_channels():
-    _v = os.environ.get("MORI_SDMA_NUM_CHANNELS")
-    if _v is None:
-        return
-    try:
-        _n = int(_v)
-    except ValueError:
-        return
-    if _n > MORI_SDMA_CH_HW_MAX:
-        os.environ["MORI_SDMA_NUM_CHANNELS"] = str(MORI_SDMA_CH_HW_MAX)
-        print(
-            "[hier_fill] MORI_SDMA_NUM_CHANNELS=%s exceeds the MI300X SDMA "
-            "queue-slot cap (%d); clamping to %d to avoid the anvil.cpp:228 "
-            "queue-creation crash." % (_v, MORI_SDMA_CH_HW_MAX, MORI_SDMA_CH_HW_MAX),
-            flush=True,
-        )
-
-
-_clamp_sdma_channels()
-
 
 # Falsy strings for every MORI_HIER_* boolean env flag (true iff not in this set).
 _ENV_FALSE = ("0", "", "false", "False")
@@ -340,6 +319,34 @@ class HierAllGather:
         # Intra reassembly deep-SQ: feed all reassembly SDMA copies back-to-back
         # then drain once. Bit-exact; fused path only.
         self._reasm_deep_sq = 1 if (self.fuse_local or self.fuse_remote) else 0
+        # Deep-pipe landing fence: drain the sub-chunk's send-CQ before its flag AMO.
+        # Explicit env wins; see _apply_dense_node_defaults.
+        self._deep_pipe_quiet = _env_true("MORI_HIER_DEEP_PIPE_QUIET", "1")
+
+    _DEEP_PIPE_MAX = 16
+
+    def _deep_pipe_depth(self, ring_blocks, chunk_bytes):
+        """Requested deep-SQ pipeline depth. Sole source: C++ only bounds it and
+        decides whether the path engages (HierDeepPipeEffectiveDepth)."""
+        if ring_blocks != 1:
+            return 1
+        raw = os.environ.get("MORI_HIER_DEEP_PIPE", "2").strip()
+        if raw.lower() == "auto":
+            # 16MiB sub-chunk: fills the NIC DMA while staying under the coherence window.
+            sub = 16 * 1024 * 1024
+            depth = int((chunk_bytes + sub // 2) // sub)
+        else:
+            depth = int(raw)
+        depth = max(1, min(self._DEEP_PIPE_MAX, depth))
+        # Coherence gate: the landing signal is bit-exact only while each sub-chunk
+        # stays inside the 32MB NIC-DMA->HBM window.
+        window = 32 * 1024 * 1024
+        if depth > 1 and chunk_bytes // depth >= window:
+            depth = 1
+        # Snap down to a divisor of chunk_bytes so sub-chunks are equal (no ragged tail).
+        while depth > 1 and chunk_bytes % depth != 0:
+            depth -= 1
+        return depth
 
     def _init_sync_drain_state(self):
         # Isolation probe: force full stream completion at op return.
@@ -357,11 +364,10 @@ class HierAllGather:
         if self.ranks_per_node >= 8:
             self.slice_defer_fin = False
             self.slice_defer_inter_fin = False
-            # DEEP_PIPE_QUIET=0: land each sub-chunk via the completion AMO on the
-            # data QP (RC in-order, flag never precedes bytes) instead of a send-CQ
-            # quiet drain. Bit-exact. Explicit env wins.
+            # Land each sub-chunk via the completion AMO on the data QP (RC in-order,
+            # flag never precedes bytes) instead of a send-CQ quiet drain. Bit-exact.
             if "MORI_HIER_DEEP_PIPE_QUIET" not in os.environ:
-                os.environ["MORI_HIER_DEEP_PIPE_QUIET"] = "0"
+                self._deep_pipe_quiet = False
 
     def _build_subcollectives(
         self,
@@ -636,17 +642,16 @@ class HierAllGather:
                 # Capture blocked by a host-side op inside the op body; record the
                 # miss (eager next time) and name the blocker.
                 cache[key] = False
-                print(
-                    f"[hier_graph] capture FAILED count={count} "
-                    f"dtype={input_data.dtype}: {type(e).__name__}: {e}",
-                    flush=True,
+                logger.warning(
+                    "graph capture failed count=%s dtype=%s: %s: %s",
+                    count,
+                    input_data.dtype,
+                    type(e).__name__,
+                    e,
                 )
                 return True  # warm runs above already produced a valid output
             cache[key] = graph
-            print(
-                f"[hier_graph] captured count={count} " f"dtype={input_data.dtype}",
-                flush=True,
-            )
+            logger.debug("graph captured count=%s dtype=%s", count, input_data.dtype)
             return True
         if entry is False:
             return False  # capture impossible for this key -> eager path
@@ -836,33 +841,12 @@ class HierAllGather:
         N = self.num_nodes
         node = self.node_id
         rb = self._inter.num_blocks
-        # Chunk-landing flag buffer: >= P slots when DEEP_PIPE splits the ring
-        # channel into P sub-chunks (rb==1), else ring_blocks u64. Depth:
-        # auto=round(perPE_bytes/SUBBYTES) else explicit; default 2, caged to depth 1
-        # by the 32MB gate below (bit-exact).
-        _dp_raw = os.environ.get("MORI_HIER_DEEP_PIPE", "2").strip()
-        if _dp_raw.lower() == "auto":
-            # 16MiB sub-chunk target, matching the C++ auto selector.
-            _dp_sub_target = 16 * 1024 * 1024
-            _dp_cb = int(count) * int(input_data.element_size())
-            _deep_pipe = int((_dp_cb + _dp_sub_target // 2) // _dp_sub_target)
-        else:
-            _deep_pipe = int(_dp_raw)
-        if _deep_pipe < 1:
-            _deep_pipe = 1
-        if _deep_pipe > 16:
-            _deep_pipe = 16
-        # Coherence gate: landing signal is bit-exact only while each sub-chunk stays
-        # inside the 32MB NIC-DMA->HBM window; larger falls to depth 1. Mirrors the
-        # C++ HierDeepPipe gate.
-        _dp_chunk_bytes = int(count) * int(input_data.element_size())
-        _dp_window = 32 * 1024 * 1024
-        _dp_sub_bytes = (
-            _dp_chunk_bytes // _deep_pipe if _deep_pipe > 1 else _dp_chunk_bytes
+        # Deep-pipe depth is single-sourced here: C++ only bounds it and derives the
+        # engage decision. The landing-flag buffer is sized for exactly this depth.
+        _deep_pipe = self._deep_pipe_depth(
+            rb, int(count) * int(input_data.element_size())
         )
-        if _deep_pipe > 1 and _dp_window > 0 and _dp_sub_bytes >= _dp_window:
-            _deep_pipe = 1
-        _flag_slots = max(rb, _deep_pipe if rb == 1 else 1, 1)
+        _flag_slots = max(rb, _deep_pipe, 1)
         # Reallocate the flag buffer on any layout change (not only to grow): reusing
         # it across two DEEP_PIPE sizes leaves stale landing state -> mismatch.
         # DEEP_PIPE=1 never enters here.
@@ -895,7 +879,10 @@ class HierAllGather:
         # 0); nq>=2 REQUIRED, else the modulo aliases onto queue 0 -> shared signal
         # counter -> liveness HANG. nq fixed at anvil init (default 2, E2E-safe);
         # reasm=nq-1.
-        _sdma_nq = int(os.environ.get("MORI_SDMA_NUM_CHANNELS", "2"))
+        # Same clamp anvil::GetSdmaNumChannels applies, or reasm overshoots nq.
+        _sdma_nq = min(
+            int(os.environ.get("MORI_SDMA_NUM_CHANNELS", "2")), MORI_SDMA_CH_HW_MAX
+        )
         reasm = max(1, _sdma_nq - 1)
         if reasm > _sdma_nq - 1:
             reasm = _sdma_nq - 1
@@ -911,6 +898,8 @@ class HierAllGather:
             s_main,
             reassembly_blocks=reasm,
             reasm_deep_sq=self._reasm_deep_sq,
+            deep_pipe=_deep_pipe,
+            deep_pipe_quiet=1 if self._deep_pipe_quiet else 0,
         )
         # Single completion fence (gathers already pushed to output). Standalone
         # deferral: the device completion reader spins until every remote push landed

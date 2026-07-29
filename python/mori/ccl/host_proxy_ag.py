@@ -67,6 +67,7 @@ class HostProxyHierAllGather:
         qp_per_transfer=None,
         num_worker_threads=None,
         chunk_bytes=None,
+        timeout_ms=None,
     ):
         from mori.io import (
             IOEngine,
@@ -98,7 +99,7 @@ class HostProxyHierAllGather:
         qp = qp_per_transfer or 4
         wt = num_worker_threads or 1
         chunk = chunk_bytes or (64 * 1024)
-        self._timeout_ms = 60000
+        self._timeout_ms = int(timeout_ms or 60000)
         # When set, intra legs ride SDMA/XGMI (PUSH gather) instead of dist.all_gather
         # (native all-gather on CU/SM), freeing CUs for the backward GEMM. Default OFF = native legs.
         self._sdma_intra = os.environ.get("MORI_HOSTPROXY_SDMA_INTRA", "0") not in (
@@ -444,10 +445,11 @@ class HostProxyHierAllGather:
                 if sts[k] is None:
                     continue
                 rc = self._engine.wait_all([sts[k]], self._timeout_ms)
-                if rc != self._StatusCode.SUCCESS:
-                    raise RuntimeError(f"HostProxy inter-node write rc={rc}")
                 # rail-pair barrier: partner's write of chunk k into MY sv[partner] has
                 # landed (partner's wait_all returned before it entered this barrier).
+                # Entered before raising: the partner is blocked here and would hang.
                 dist.barrier(group=self._pair_barrier)
+                if rc != self._StatusCode.SUCCESS:
+                    raise RuntimeError(f"HostProxy inter-node write rc={rc}")
                 _bcast_k(k)
         return True

@@ -319,12 +319,12 @@ __device__ inline void FusedRemoteReassembleWorker(
       // (deepSqPhase==2) already waited in pass 0.
       if (deepSqPhase != 2) {
         if (threadIdx.x == 0) {
-          int spin = 0;
+          long long spin = 0;
           const int flagIdx = spatial ? 0 : f;
           // Landing flags publish 1 and are host-zeroed each op.
           while (mori::core::AtomicLoadSeqCstSystem(args.chunkReadyFlags + flagIdx) <
                  static_cast<uint64_t>(1)) {
-            if (++spin > 100000000) break;  // bounded fallback
+            if (++spin > 10000000000LL) __builtin_trap();
           }
           __threadfence_system();
         }
@@ -364,17 +364,19 @@ __device__ inline void FusedRemoteReassembleWorker(
 // guards exactly the reassembled bytes; disjoint flagBase per (j, remote m).
 extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGatherArgs args) {
   const int rb = args.ringBlocks;
-  // Deep-SQ temporal pipeline (deepPipe>1, rb==1 only): the single ring channel
-  // splits the chunk into `pipe` temporal sub-chunks, each with its own landing
-  // flag, so reassembly + completion iterate over pipe flags. deepPipe<=1 =>
-  // pipe==rb (byte-identical default).
-  const int pipe = args.deepPipe > 1 ? args.deepPipe : rb;
+  // Deep-SQ temporal pipeline: same engage decision + clamped depth the ring itself
+  // uses (single source), so reassembly never waits on a flag the ring won't set.
+  // 0 => ring took the plain path; pipe==rb (byte-identical default).
+  const int dpEff = HierDeepPipeEffectiveDepth(args.ringPos, args.ringSize, args.ringPeBase,
+                                               args.ringPeStride, args.chunkBytes, rb,
+                                               args.chunkReadyFlags, args.deepPipe);
+  const int pipe = dpEff > 0 ? dpEff : rb;
   const int reasm = args.reassemblyBlocks > 0 ? args.reassemblyBlocks : rb;
   const int effReasm = reasm;
   // Spatial reassembly split (rb==1, no deep-pipe): split the one landed chunk
   // into effReasm disjoint sub-ranges reassembled concurrently; each part waits
   // chunkReadyFlags[0]. reasm>1 requires sdmaNumQueue>=reasm+1 (Python clamp).
-  const bool spatialSplit = (rb == 1 && args.deepPipe <= 1 && effReasm > 1);
+  const bool spatialSplit = (rb == 1 && dpEff == 0 && effReasm > 1);
   // Partition = temporal pipe channels, or spatial effReasm sub-ranges.
   const int partition = spatialSplit ? effReasm : pipe;
   const unsigned bx = blockIdx.x;
@@ -432,9 +434,9 @@ extern "C" __global__ void FusedRingRemoteGatherKernel_u32(CclFusedRingRemoteGat
       const size_t startIdx = (args.localPushOnly != 0) ? 0 : static_cast<size_t>(G);
       const size_t endIdx = static_cast<size_t>(G) + reasmTotal;
       for (size_t idx = startIdx + threadIdx.x; idx < endIdx; idx += blockDim.x) {
-        int spin = 0;
+        long long spin = 0;
         while (mori::core::AtomicLoadSeqCstSystem(rflags + idx) < args.gFlagVal) {
-          if (++spin > 100000000) break;  // bounded fallback
+          if (++spin > 10000000000LL) __builtin_trap();
         }
       }
       __threadfence_system();

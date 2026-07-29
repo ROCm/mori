@@ -909,6 +909,8 @@ def launch_fused_ring_remote_gather(
     s: int,
     reassembly_blocks: int = 0,
     reasm_deep_sq: int = 0,
+    deep_pipe: int = 1,
+    deep_pipe_quiet: int = 0,
 ) -> bool:
     """Launch the FUSED, PIPELINED ``FusedRingRemoteGatherKernel_u32`` ONCE on
     stream ``s`` with ``2*ring_blocks + 1`` CTAs. Blocks ``[0, ring_blocks)`` run
@@ -935,6 +937,8 @@ def launch_fused_ring_remote_gather(
         node_id,
         reasm,
         reasm_deep_sq,
+        deep_pipe,
+        deep_pipe_quiet,
     )
     _reasm_ctas = reasm
     _get_ccl_func("FusedRingRemoteGatherKernel_u32").launch_struct(

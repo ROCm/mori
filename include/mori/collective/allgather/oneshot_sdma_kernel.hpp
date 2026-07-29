@@ -33,10 +33,13 @@ namespace collective {
 
 // SDMA completion drain for sub-group gathers. Index by GLOBAL pe (`pe*nq`) to
 // match the put side; `pe%8` under-indexes for peBase>=8 and drains unarmed slots.
+// Every caller follows this with the completion-flag AMO, so the drain owns the
+// sender-side system fence: the pushed bytes must be peer-visible before the flag.
 __device__ __forceinline__ void SubGroupSdmaDrainPe(int pe, const application::SymmMemObjPtr dest) {
   const uint32_t nq = dest->sdmaNumQueue;
   core::SdmaQueitThread(dest->signalPtrs + static_cast<size_t>(pe) * nq,
                         dest->expectSignalsPtr + static_cast<size_t>(pe) * nq, nq);
+  __threadfence_system();
 }
 
 template <typename T>
@@ -199,9 +202,6 @@ __device__ void OneShotAllGatherSdmaSubGroupKernel_body(
   if (warpId >= pLo && warpId < pHi && laneId == 0) {
     int remotePe = peBase + warpId * peStride;
     SubGroupSdmaDrainPe(remotePe, dstMemObj);
-    // Sender-side completion fence: system-scope order the pushed bytes before the flag
-    // AMO becomes peer-visible, else the receiver can observe the flag ahead of the data.
-    __threadfence_system();
     shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
         flagsMemObj, (flagBase + static_cast<size_t>(groupPos)) * sizeof(uint64_t), &flagVal, 8,
         core::atomicType::AMO_SET, remotePe, 0);

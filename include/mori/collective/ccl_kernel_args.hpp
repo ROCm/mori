@@ -35,21 +35,10 @@ inline bool HierLocalPushOnly() {
   const char* e = std::getenv("MORI_HIER_LOCAL_PUSHONLY");
   return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
 }
-// Deep-SQ temporal pipeline (MORI_HIER_DEEP_PIPE=P, default 2). Splits the chunk into P
-// temporal sub-chunks issued back-to-back on the full numQp fan-out with per-sub-chunk
-// landing flags, so reassembly of sub-chunk p overlaps p+1.. still crossing the NIC.
-// Returns -1 for "auto" (caller derives depth from chunkBytes), else clamped [1,16];
-// depth<=1 => path off.
-inline int HierDeepPipe() {
-  const char* e = std::getenv("MORI_HIER_DEEP_PIPE");
-  // Default depth 2; landing anchored by the host fence (bit-exact, no explicit env).
-  if (e == nullptr || e[0] == '\0') return 2;
-  if (e[0] == 'a' || e[0] == 'A') return -1;  // "auto"
-  int v = std::atoi(e);
-  if (v < 1) return 1;
-  if (v > 16) return 16;
-  return v;
-}
+// Deep-SQ temporal pipeline depth cap. The requested depth is single-sourced in Python
+// (MORI_HIER_DEEP_PIPE + the coherence gate) and passed down; this bounds the ring flag
+// array and the C++ clamps.
+constexpr int kHierMaxDeepPipe = 16;
 
 }  // namespace collective
 }  // namespace mori
@@ -343,7 +332,8 @@ struct CclFusedRingRemoteGatherArgs {
 inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gatherArgsPtr,
                                               int ringBlocks, int64_t chunkReadyFlagsPtr,
                                               int numNodes, int nodeId, int reassemblyBlocks = 0,
-                                              int reasmDeepSq = 0) {
+                                              int reasmDeepSq = 0, int deepPipe = 1,
+                                              int deepPipeQuiet = 0) {
   static CclFusedRingRemoteGatherArgs fused;
   const CclInterNodeRingArgs* r = reinterpret_cast<const CclInterNodeRingArgs*>(ringArgsPtr);
   const CclAllgatherSubGroupArgs<uint32_t>* g =
@@ -377,32 +367,14 @@ inline int64_t BuildFusedRingRemoteGatherArgs(int64_t ringArgsPtr, int64_t gathe
   fused.numNodes = numNodes;
   fused.nodeId = nodeId;
   fused.reassemblyBlocks = reassemblyBlocks > 0 ? reassemblyBlocks : fused.ringBlocks;
-  // Deep-SQ temporal pipeline only engages on the single-channel ring (rb==1);
-  // ringBlocks>1 keeps its spatial split.
+  // Requested deep-pipe depth is single-sourced in Python (it also sizes the landing-flag
+  // buffer); here only the hard bounds. The engage decision + final clamp live in
+  // HierDeepPipeEffectiveDepth, shared by the ring and the reassembly.
   {
-    int dp = (fused.ringBlocks == 1) ? HierDeepPipe() : 1;
-    if (dp < 0) {  // "auto": depth = round(perPE chunkBytes / subBytes), clamp[1,16]
-      // 16MiB sub-chunk: fills mlx5 NIC DMA while staying under the coherence window.
-      const size_t sub = 16ull * 1024ull * 1024ull;
-      size_t d = (fused.chunkBytes + sub / 2) / sub;
-      dp = (d < 1) ? 1 : (d > 16 ? 16 : static_cast<int>(d));
-    }
-    // Snap dp down to the largest divisor of chunkBytes so sub-chunks are equal (no ragged
-    // tail) and the count never exceeds the Python-sized flag budget.
-    if (dp > 1 && fused.chunkBytes > 0) {
-      while (dp > 1 && (fused.chunkBytes % static_cast<size_t>(dp)) != 0) --dp;
-    }
+    int dp = deepPipe < 1 ? 1 : (deepPipe > kHierMaxDeepPipe ? kHierMaxDeepPipe : deepPipe);
     fused.deepPipe = dp;
   }
-  // Scale-robust landing fence default: the deep-pipe put-with-signal AMO can beat its own
-  // data landing for large sub-chunks, so auto-engage the quiet-drain fence whenever
-  // deep-pipe runs unless forced off (MORI_HIER_DEEP_PIPE_QUIET=0). Bit-exact; deepPipe<=1
-  // never enters this path.
-  {
-    const char* q = std::getenv("MORI_HIER_DEEP_PIPE_QUIET");
-    const bool quietForcedOff = (q != nullptr && q[0] == '0' && q[1] == '\0');
-    fused.deepPipeQuiet = (fused.deepPipe > 1 && !quietForcedOff) ? 1 : 0;
-  }
+  fused.deepPipeQuiet = (fused.deepPipe > 1 && deepPipeQuiet != 0) ? 1 : 0;
   fused.localPushOnly = HierLocalPushOnly() ? 1 : 0;
   // Intra reassembly deep-SQ: feed all reassembly channels then drain once.
   fused.reasmDeepSq = reasmDeepSq;

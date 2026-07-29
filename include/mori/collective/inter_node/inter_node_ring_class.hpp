@@ -80,6 +80,16 @@ class InterNodeRingAllgather {
   // Kept alive between prepare and the Python-side kernel launch.
   CclInterNodeRingArgs jit_args_;
 
+  // Flag slots per CTA channel: ringSize slots for the round loop, but the
+  // single-channel deep-pipe path uses one slot per sub-chunk (up to
+  // kHierMaxDeepPipe), which can exceed npes_.
+  size_t flagsBytes() const {
+    size_t perBlock = static_cast<size_t>(npes_);
+    if (perBlock < static_cast<size_t>(kHierMaxDeepPipe))
+      perBlock = static_cast<size_t>(kHierMaxDeepPipe);
+    return static_cast<size_t>(numBlocks_) * perBlock * sizeof(uint64_t);
+  }
+
   InterNodeRingAllgather(const InterNodeRingAllgather&) = delete;
   InterNodeRingAllgather& operator=(const InterNodeRingAllgather&) = delete;
 
@@ -116,13 +126,10 @@ class InterNodeRingAllgather {
       throw std::runtime_error("InterNodeRingAllgather: ring ShmemMalloc failed");
     ringObj_ = shmem::ShmemQueryMemObjPtr(ring_);
 
-    // One uint64 per ring slot per block: numBlocks_*npes (>= numBlocks_*ringSize_)
-    // gives each CTA channel its own flag region, sized for any sub-group here.
-    size_t flagsBytes = static_cast<size_t>(numBlocks_) * npes_ * sizeof(uint64_t);
-    flags_ = shmem::ShmemMalloc(flagsBytes);
+    flags_ = shmem::ShmemMalloc(flagsBytes());
     if (flags_ == nullptr)
       throw std::runtime_error("InterNodeRingAllgather: flags ShmemMalloc failed");
-    (void)hipMemset(flags_, 0, flagsBytes);
+    (void)hipMemset(flags_, 0, flagsBytes());
     flagsObj_ = shmem::ShmemQueryMemObjPtr(flags_);
   }
 
@@ -138,9 +145,7 @@ class InterNodeRingAllgather {
     if (static_cast<size_t>(ringSize_) * chunkBytes > ringBytes_) {
       throw std::runtime_error("InterNodeRingAllgather: message exceeds ring buffer capacity");
     }
-    size_t flagsBytes = static_cast<size_t>(numBlocks_) * npes_ * sizeof(uint64_t);
-
-    (void)hipMemsetAsync(flags_, 0, flagsBytes, stream);
+    (void)hipMemsetAsync(flags_, 0, flagsBytes(), stream);
     // Stage into ring-position slot (not global PE).
     char* myChunk = reinterpret_cast<char*>(ring_) + static_cast<size_t>(ringPos_) * chunkBytes;
     (void)hipMemcpyAsync(myChunk, reinterpret_cast<void*>(input), chunkBytes,
@@ -252,9 +257,7 @@ class InterNodeRingAllgather {
     if (static_cast<size_t>(ringSize_) * chunkBytes > ringBytes_) {
       throw std::runtime_error("InterNodeRingAllgather: message exceeds ring buffer capacity");
     }
-    size_t flagsBytes = static_cast<size_t>(numBlocks_) * npes_ * sizeof(uint64_t);
-
-    (void)hipMemsetAsync(flags_, 0, flagsBytes, stream);
+    (void)hipMemsetAsync(flags_, 0, flagsBytes(), stream);
     (void)hipStreamSynchronize(stream);
 
     shmem::ShmemBarrierAll();
