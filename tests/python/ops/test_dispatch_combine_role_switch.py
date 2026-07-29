@@ -92,6 +92,13 @@ def _make_config(
         block_num=64,
         warp_num_per_block=4,
         use_external_inp_buf=True,
+        # Defaults to 8, and NormalizeConfig asserts
+        # `IsPowerOf2(gpuPerNode) && worldSize % gpuPerNode == 0`
+        # (dispatch_combine.cpp:136). At world_size=4 that assert ABORTS the
+        # rank -- SIGABRT, no python traceback, nothing on the result queue --
+        # so a sub-8 run has to say how many GPUs it is really using. Every
+        # config here is single-node by construction, so it is the world size.
+        gpu_per_node=min(world_size, 8),
         kernel_type=getattr(mori.ops.EpDispatchCombineKernelType, kernel_type),
         quant_type=quant_type,
     )
