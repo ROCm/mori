@@ -57,9 +57,30 @@ hipDataType IntToHipDataType(int dtype) {
   }
 }
 
+
+// Every buffer pointer below lives inside a SymmMemObj that Finalize() releases,
+// and ShmemFreeAndInvalidate() leaves the owning SymmMemObjPtr as
+// {cpu=nullptr, gpu=nullptr}. SymmMemObjPtr::operator->() hands that nullptr
+// straight back, so `obj->Get()` on a finalized handle dereferences null and
+// SIGSEGVs the rank -- taking the process down before any error can cross into
+// python. That is reachable in production, not just from tests: if a D->P flip
+// fails to grow AND its rollback also fails, Reconfigure() finalizes the handle
+// and raises "must be rebuilt", and sglang's except path re-reads these
+// pointers while unwinding. The rank died there instead of reporting.
+static void RequireInitialized(const mori::moe::EpDispatchCombineHandle& handle,
+                               const char* what) {
+  if (!handle.IsInitialized()) {
+    throw std::runtime_error(
+        std::string(what) +
+        ": the EpDispatchCombineOp holds no buffers (it was finalized, or a resize failed and "
+        "could not roll back). It must be rebuilt before its buffers can be used.");
+  }
+}
+
 void PrepareInferenceArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t input_ptr,
                           int input_dtype, int64_t num_tokens, int64_t weight_ptr,
                           int64_t scale_ptr, int64_t indices_ptr) {
+  RequireInitialized(handle, "prepare_inference_args");
   handle.PrepareInference(IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr),
                           nullptr, weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
                           scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
@@ -68,6 +89,7 @@ void PrepareInferenceArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t in
 
 int64_t BuildArgs(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum, int hiddenDim,
                   int useExternalInpBuf) {
+  RequireInitialized(handle, "build_args");
   thread_local mori::moe::EpDispatchCombineArgsRaw args;
   args = mori::moe::GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum);
   // Runtime hidden_dim: dispatch/combine (send) calls pass hiddenDim from input tensor,
@@ -92,25 +114,6 @@ int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t 
   PrepareInferenceArgs(handle, input_ptr, input_dtype, num_tokens, weight_ptr, scale_ptr,
                        indices_ptr);
   return BuildArgs(handle, rdmaBlockNum, hiddenDim, useExternalInpBuf);
-}
-
-// Every buffer pointer below lives inside a SymmMemObj that Finalize() releases,
-// and ShmemFreeAndInvalidate() leaves the owning SymmMemObjPtr as
-// {cpu=nullptr, gpu=nullptr}. SymmMemObjPtr::operator->() hands that nullptr
-// straight back, so `obj->Get()` on a finalized handle dereferences null and
-// SIGSEGVs the rank -- taking the process down before any error can cross into
-// python. That is reachable in production, not just from tests: if a D->P flip
-// fails to grow AND its rollback also fails, Reconfigure() finalizes the handle
-// and raises "must be rebuilt", and sglang's except path re-reads these
-// pointers while unwinding. The rank died there instead of reporting.
-static void RequireInitialized(const mori::moe::EpDispatchCombineHandle& handle,
-                               const char* what) {
-  if (!handle.IsInitialized()) {
-    throw std::runtime_error(
-        std::string(what) +
-        ": the EpDispatchCombineOp holds no buffers (it was finalized, or a resize failed and "
-        "could not roll back). It must be rebuilt before its buffers can be used.");
-  }
 }
 
 py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_scales) {
@@ -170,6 +173,7 @@ int64_t BuildConvertDispatchOutputArgs(mori::moe::EpDispatchCombineHandle& handl
                                        int64_t dispatchOutX_ptr, int64_t dispatchOutTopkIdx_ptr,
                                        int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr,
                                        int hiddenDim) {
+  RequireInitialized(handle, "build_convert_dispatch_output_args");
   auto* args = new mori::moe::ConvertDispatchOutputArgs{};
   args->config = handle.config;
   if (hiddenDim > 0) args->config.hiddenDim = hiddenDim;
@@ -190,6 +194,7 @@ int64_t BuildConvertDispatchOutputArgs(mori::moe::EpDispatchCombineHandle& handl
 int64_t BuildConvertCombineInputArgs(mori::moe::EpDispatchCombineHandle& handle,
                                      int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr,
                                      int hiddenDim) {
+  RequireInitialized(handle, "build_convert_combine_input_args");
   auto* args = new mori::moe::ConvertCombineInputArgs{};
   args->config = handle.config;
   if (hiddenDim > 0) args->config.hiddenDim = hiddenDim;
@@ -214,6 +219,7 @@ int64_t GetStandardMoePackedRecvCountPtr(mori::moe::EpDispatchCombineHandle& han
 }
 
 int64_t GetCombineInputPtr(mori::moe::EpDispatchCombineHandle& handle) {
+  RequireInitialized(handle, "get_combine_input_ptr");
   return reinterpret_cast<int64_t>(handle.GetShmemCombineInpTokMemObj()->Get());
 }
 #endif
@@ -233,6 +239,7 @@ void PyLaunchLocalExpertCount(const mori::moe::EpDispatchCombineConfig& config, 
 }
 
 py::tuple GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
+  RequireInitialized(handle, "get_dispatch_src_token_pos");
   mori::moe::index_t recvNum = 0;
   HIP_RUNTIME_CHECK(
       hipMemcpy(&recvNum, handle.totalRecvTokenNum, sizeof(recvNum), hipMemcpyDeviceToHost));
@@ -249,6 +256,7 @@ py::tuple GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handl
 }
 
 py::tuple GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
+  RequireInitialized(handle, "get_dispatch_receiver_token_idx_map");
   mori::moe::index_t counter = 0;
   HIP_RUNTIME_CHECK(
       hipMemcpy(&counter, handle.localPeTokenCounter, sizeof(counter), hipMemcpyDeviceToHost));
@@ -258,6 +266,7 @@ py::tuple GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle& han
 
 py::tuple GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
                                           int hidden_dim = -1) {
+  RequireInitialized(handle, "get_registered_combine_input_buffer");
   const int actual = (hidden_dim > 0) ? hidden_dim : static_cast<int>(handle.config.hiddenDim);
   return py::make_tuple(reinterpret_cast<int64_t>(handle.GetShmemCombineInpTokMemObj()->Get()),
                         static_cast<int64_t>(handle.config.MaxNumTokensToRecv()),
