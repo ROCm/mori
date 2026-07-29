@@ -242,6 +242,31 @@ class EpDispatchCombineHandle {
 
   void LaunchReset(hipStream_t = 0);
 
+  // Release every buffer the constructor allocated (shmem symmetric buffers,
+  // plain hipMalloc scratch, barriers). Idempotent: a second call is a no-op,
+  // and the destructor will not double-free after an explicit Finalize().
+  //
+  // Collective: the symmetric heap is allocated in lockstep across the PE
+  // group, so every rank must call this the same number of times, in the same
+  // order, with the op idle (no in-flight dispatch/combine).
+  void Finalize();
+
+  // Free all buffers and re-allocate them for `newConfig`. Used to resize the
+  // all-to-all dispatch/combine buffers in place when the owning process
+  // changes role (e.g. an sglang PD prefill<->decode role switch changes
+  // max_num_inp_token_per_rank) without tearing down the shmem context.
+  //
+  // Only capacity-like fields may change; anything that would alter the
+  // symmetric layout agreed with peers (rank/worldSize/gpuPerNode/kernelType/
+  // hiddenDim/numExpertPerRank/numExpertPerToken/quantType/scale geometry/
+  // maxTokenTypeSize) must be identical or this throws std::runtime_error.
+  //
+  // Collective: same ordering requirement as Finalize(); all ranks must call
+  // Reconfigure with configs that agree on the invariant fields.
+  void Reconfigure(const EpDispatchCombineConfig& newConfig);
+
+  bool IsInitialized() const { return buffersInitialized; }
+
   index_t GetCurRankNumToken() const { return curRankNumToken; }
   int Fp8BlockwiseCombineScaleDim() const { return fp8BlockwiseCombineScaleDim; }
   int Fp8BlockwiseCombineScaleTypeSize() const { return fp8BlockwiseCombineScaleTypeSize; }
@@ -272,6 +297,19 @@ class EpDispatchCombineHandle {
   }
 
  private:
+  // Allocate/free every buffer group; Initialize/FinalizeAll are the shared
+  // bodies used by the ctor, dtor, Finalize() and Reconfigure().
+  void InitializeAll();
+  void FinalizeAll();
+  // Normalize config-derived fields (numQpPerPe clamp, SDMA flag,
+  // maxTotalRecvTokens clamp, fp8 blockwise scale dim) before allocating.
+  void NormalizeConfig();
+  // Throw if `newConfig` changes a field that the symmetric layout / peers
+  // depend on. Called by Reconfigure() before any buffer is freed.
+  void ValidateReconfigurable(const EpDispatchCombineConfig& newConfig) const;
+
+  bool buffersInitialized{false};
+
   void InitializeShmemBuf();
   void FinalizeShmemBuf();
 

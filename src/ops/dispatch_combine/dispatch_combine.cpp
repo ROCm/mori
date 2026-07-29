@@ -109,6 +109,16 @@ EpDispatchCombineConfig EpDispatchCombineConfig::FromPackedI32Array(const int32_
 /* ---------------------------------------------------------------------------------------------- */
 EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_)
     : config(config_) {
+  NormalizeConfig();
+  InitializeAll();
+
+  this->multiProcessorCount = GetCurDeviceMultiProcessorCount();
+  this->maxThreads = std::min(GetCurDeviceMaxThreads(), 1024);
+  MORI_OPS_INFO("Device capability: multiProcessorCount={}, maxThreads={}",
+                static_cast<int>(this->multiProcessorCount), static_cast<int>(this->maxThreads));
+}
+
+void EpDispatchCombineHandle::NormalizeConfig() {
   assert(IsPowerOf2(config.gpuPerNode) && (config.worldSize % config.gpuPerNode == 0));
   int shmemNumQpPerPe = ShmemNumQpPerPe();
   if (config.numQpPerPe > shmemNumQpPerPe) {
@@ -155,28 +165,114 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
         config.maxTotalRecvTokens, config.MaxNumTokensToRecvPerRank(), config.MaxNumTokensToRecv(),
         worstCase);
   }
+}
+
+void EpDispatchCombineHandle::InitializeAll() {
   InitializeShmemBuf();
   InitializeTokenNumSignalBuf();
   InitializeOrderMapBuf();
   InitializeBarrier();
+  buffersInitialized = true;
+}
 
-  this->multiProcessorCount = GetCurDeviceMultiProcessorCount();
-  this->maxThreads = std::min(GetCurDeviceMaxThreads(), 1024);
-  MORI_OPS_INFO("Device capability: multiProcessorCount={}, maxThreads={}",
-                static_cast<int>(this->multiProcessorCount), static_cast<int>(this->maxThreads));
+void EpDispatchCombineHandle::FinalizeAll() {
+  if (!buffersInitialized) return;
+  FinalizeShmemBuf();
+  FinalizeTokenNumSignalBuf();
+  FinalizeOrderMapBuf();
+  FinalizeBarrier();
+  // Every Finalize*() above nulls / invalidates what it released, so a second
+  // pass is a no-op rather than a double free.
+  buffersInitialized = false;
+}
+
+void EpDispatchCombineHandle::Finalize() {
+  if (!buffersInitialized) return;
+  auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
+  if (states->status != mori::shmem::ShmemStatesStatus::Initialized) {
+    // The shmem context is already gone; the symmetric heap went with it. Mark
+    // the buffers dead so we do not later call ShmemFree on a dead context.
+    buffersInitialized = false;
+    return;
+  }
+  // The op must be idle. Drain any in-flight kernel before releasing buffers
+  // the kernels may still be writing to.
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  FinalizeAll();
+}
+
+void EpDispatchCombineHandle::ValidateReconfigurable(
+    const EpDispatchCombineConfig& newConfig) const {
+  auto require = [](const char* field, long long oldV, long long newV) {
+    if (oldV != newV) {
+      throw std::runtime_error(std::string("EpDispatchCombineHandle::Reconfigure: field '") +
+                               field + "' must not change (" + std::to_string(oldV) + " -> " +
+                               std::to_string(newV) + ")");
+    }
+  };
+  // Peer-visible / layout-defining fields: changing any of them would make this
+  // rank's symmetric buffers disagree with its peers'.
+  require("rank", config.rank, newConfig.rank);
+  require("worldSize", config.worldSize, newConfig.worldSize);
+  require("gpuPerNode", config.gpuPerNode, newConfig.gpuPerNode);
+  require("kernelType", static_cast<long long>(config.kernelType),
+          static_cast<long long>(newConfig.kernelType));
+  require("hiddenDim", config.hiddenDim, newConfig.hiddenDim);
+  require("numExpertPerRank", config.numExpertPerRank, newConfig.numExpertPerRank);
+  require("numExpertPerToken", config.numExpertPerToken, newConfig.numExpertPerToken);
+  require("quantType", static_cast<long long>(config.quantType),
+          static_cast<long long>(newConfig.quantType));
+  require("scaleDim", config.scaleDim, newConfig.scaleDim);
+  require("scaleTypeSize", config.scaleTypeSize, newConfig.scaleTypeSize);
+  require("maxTokenTypeSize", config.maxTokenTypeSize, newConfig.maxTokenTypeSize);
+  if (newConfig.maxNumInpTokenPerRank <= 0) {
+    throw std::runtime_error(
+        "EpDispatchCombineHandle::Reconfigure: maxNumInpTokenPerRank must be > 0");
+  }
+}
+
+void EpDispatchCombineHandle::Reconfigure(const EpDispatchCombineConfig& newConfig) {
+  ValidateReconfigurable(newConfig);
+
+  auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
+  if (states->status != mori::shmem::ShmemStatesStatus::Initialized) {
+    throw std::runtime_error(
+        "EpDispatchCombineHandle::Reconfigure: shmem context is not initialized");
+  }
+
+  MORI_OPS_INFO("Reconfigure: maxNumInpTokenPerRank {} -> {}, maxTotalRecvTokens {} -> {}",
+                config.maxNumInpTokenPerRank, newConfig.maxNumInpTokenPerRank,
+                config.maxTotalRecvTokens, newConfig.maxTotalRecvTokens);
+
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  FinalizeAll();
+
+  config = newConfig;
+  // Per-inference state refers to the buffers we just freed; drop it so a stale
+  // pointer cannot be handed to a kernel before the next PrepareInference.
+  curRankNumToken = 0;
+  curHiddenDim = -1;
+  inpTokenBuf = nullptr;
+  outTokenBuf = nullptr;
+  weightsBuf = nullptr;
+  scalesBuf = nullptr;
+  tokenIndices = nullptr;
+
+  NormalizeConfig();
+  InitializeAll();
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
+  if (!buffersInitialized) {
+    return;
+  }
   auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
   if (states->status != mori::shmem::ShmemStatesStatus::Initialized) {
     return;
   }
   hipDeviceSynchronize();
   (void)hipGetLastError();
-  FinalizeShmemBuf();
-  FinalizeTokenNumSignalBuf();
-  FinalizeOrderMapBuf();
-  FinalizeBarrier();
+  FinalizeAll();
 }
 
 mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsigned int flags) {
@@ -281,39 +377,56 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
 #endif
 }
 
+// Free a symmetric buffer and invalidate the handle so a repeated Finalize
+// (or a use-after-free from a stale kernel arg) is caught rather than silently
+// double-freeing. Safe on an already-invalid / never-allocated obj.
+static void ShmemFreeAndInvalidate(mori::application::SymmMemObjPtr& obj) {
+  if (!obj.IsValid()) return;
+  ShmemFree(obj->localPtr);
+  obj = mori::application::SymmMemObjPtr{nullptr, nullptr};
+}
+
+// hipFree + null, so FinalizeAll() is idempotent for plain device scratch too.
+template <typename T>
+static void HipFreeAndNull(T*& ptr) {
+  if (ptr == nullptr) return;
+  HIP_RUNTIME_CHECK(hipFree(ptr));
+  ptr = nullptr;
+}
+
 void EpDispatchCombineHandle::FinalizeShmemBuf() {
   if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL) {
     auto& bufs = std::get<ShmemBufsIntraNode>(shmemTokBufs);
-    ShmemFree(bufs.dispatchOut->localPtr);
-    ShmemFree(bufs.combineInp->localPtr);
-    ShmemFree(bufs.combineOut->localPtr);
+    ShmemFreeAndInvalidate(bufs.dispatchOut);
+    ShmemFreeAndInvalidate(bufs.combineInp);
+    ShmemFreeAndInvalidate(bufs.combineOut);
   } else if (config.kernelType == KernelType::InterNodeV1 ||
              config.kernelType == KernelType::InterNodeV1LL) {
     auto& bufs = std::get<ShmemBufsInterNodeV1>(shmemTokBufs);
-    ShmemFree(bufs.dispatchInp->localPtr);
-    ShmemFree(bufs.combineInp->localPtr);
-    ShmemFree(bufs.dispatchOut->localPtr);
-    ShmemFree(bufs.combineOut->localPtr);
-    ShmemFree(bufs.staging->localPtr);
-    ShmemFree(bufs.dispatchStaging->localPtr);
+    ShmemFreeAndInvalidate(bufs.dispatchInp);
+    ShmemFreeAndInvalidate(bufs.combineInp);
+    ShmemFreeAndInvalidate(bufs.dispatchOut);
+    ShmemFreeAndInvalidate(bufs.combineOut);
+    ShmemFreeAndInvalidate(bufs.staging);
+    ShmemFreeAndInvalidate(bufs.dispatchStaging);
   } else {
     auto& bufs = std::get<ShmemBufsInterNode>(shmemTokBufs);
-    ShmemFree(bufs.dispatchInp->localPtr);
-    ShmemFree(bufs.combineInp->localPtr);
-    ShmemFree(bufs.dispatchOut->localPtr);
-    ShmemFree(bufs.combineOut->localPtr);
-    ShmemFree(bufs.staging->localPtr);
+    ShmemFreeAndInvalidate(bufs.dispatchInp);
+    ShmemFreeAndInvalidate(bufs.combineInp);
+    ShmemFreeAndInvalidate(bufs.dispatchOut);
+    ShmemFreeAndInvalidate(bufs.combineOut);
+    ShmemFreeAndInvalidate(bufs.staging);
   }
-  ShmemFree(shmemInpWeightsMemObj->localPtr);
-  ShmemFree(shmemDispatchOutWeightsMemObj->localPtr);
-  ShmemFree(shmemCombineOutWeightsMemObj->localPtr);
-  if (shmemInpScalesMemObj.IsValid()) ShmemFree(shmemInpScalesMemObj->localPtr);
-  if (shmemOutScalesMemObj.IsValid()) ShmemFree(shmemOutScalesMemObj->localPtr);
-  ShmemFree(shmemInpIndicesMemObj->localPtr);
-  ShmemFree(shmemOutIndicesMemObj->localPtr);
+  ShmemFreeAndInvalidate(shmemInpWeightsMemObj);
+  ShmemFreeAndInvalidate(shmemDispatchOutWeightsMemObj);
+  ShmemFreeAndInvalidate(shmemCombineOutWeightsMemObj);
+  ShmemFreeAndInvalidate(shmemInpScalesMemObj);
+  ShmemFreeAndInvalidate(shmemOutScalesMemObj);
+  ShmemFreeAndInvalidate(shmemInpIndicesMemObj);
+  ShmemFreeAndInvalidate(shmemOutIndicesMemObj);
 #ifdef ENABLE_PROFILER
-  HIP_RUNTIME_CHECK(hipFree(profilerConfig.debugTimeBuf));
-  HIP_RUNTIME_CHECK(hipFree(profilerConfig.debugTimeOffset));
+  HipFreeAndNull(profilerConfig.debugTimeBuf);
+  HipFreeAndNull(profilerConfig.debugTimeOffset);
 #endif
 }
 
@@ -333,11 +446,11 @@ void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
 }
 
 void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
-  ShmemFree(recvTokenNumMemObj->localPtr);
-  ShmemFree(sendTokenNumMemObj->localPtr);
-  ShmemFree(sendAtomicSignalMemObj->localPtr);
-  ShmemFree(nodeRecvTokenNumMemObj->localPtr);
-  HIP_RUNTIME_CHECK(hipFree(totalRecvTokenNum));
+  ShmemFreeAndInvalidate(recvTokenNumMemObj);
+  ShmemFreeAndInvalidate(sendTokenNumMemObj);
+  ShmemFreeAndInvalidate(sendAtomicSignalMemObj);
+  ShmemFreeAndInvalidate(nodeRecvTokenNumMemObj);
+  HipFreeAndNull(totalRecvTokenNum);
 }
 
 void EpDispatchCombineHandle::InitializeOrderMapBuf() {
@@ -400,22 +513,22 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
 }
 
 void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
-  HIP_RUNTIME_CHECK(hipFree(dispReceiverIdxMap));
-  HIP_RUNTIME_CHECK(hipFree(dispSenderIdxMap));
-  HIP_RUNTIME_CHECK(hipFree(destPeTokenIdxMap));
-  HIP_RUNTIME_CHECK(hipFree(srcPeTokenIdxMap));
-  HIP_RUNTIME_CHECK(hipFree(destPeTokenCounter));
-  HIP_RUNTIME_CHECK(hipFree(destNodeTokenCounter));
-  HIP_RUNTIME_CHECK(hipFree(localPeTokenCounter));
-  ShmemFree(dispTokOffsetMemObj->localPtr);
-  ShmemFree(dispTokIdToSrcTokIdMemObj->localPtr);
-  HIP_RUNTIME_CHECK(hipFree(dispDestTokIdMap));
-  HIP_RUNTIME_CHECK(hipFree(interNodeDispDestTokIdMap));
-  HIP_RUNTIME_CHECK(hipFree(blockFlagCounter));
-  HIP_RUNTIME_CHECK(hipFree(interNodeDispSendMap));
+  HipFreeAndNull(dispReceiverIdxMap);
+  HipFreeAndNull(dispSenderIdxMap);
+  HipFreeAndNull(destPeTokenIdxMap);
+  HipFreeAndNull(srcPeTokenIdxMap);
+  HipFreeAndNull(destPeTokenCounter);
+  HipFreeAndNull(destNodeTokenCounter);
+  HipFreeAndNull(localPeTokenCounter);
+  ShmemFreeAndInvalidate(dispTokOffsetMemObj);
+  ShmemFreeAndInvalidate(dispTokIdToSrcTokIdMemObj);
+  HipFreeAndNull(dispDestTokIdMap);
+  HipFreeAndNull(interNodeDispDestTokIdMap);
+  HipFreeAndNull(blockFlagCounter);
+  HipFreeAndNull(interNodeDispSendMap);
 #ifdef ENABLE_STANDARD_MOE_ADAPT
-  HIP_RUNTIME_CHECK(hipFree(dispTokToEpSlotMap));
-  HIP_RUNTIME_CHECK(hipFree(standardPackedRecvCount));
+  HipFreeAndNull(dispTokToEpSlotMap);
+  HipFreeAndNull(standardPackedRecvCount);
 #endif
 }
 
@@ -447,13 +560,13 @@ void EpDispatchCombineHandle::InitializeBarrier() {
 }
 
 void EpDispatchCombineHandle::FinalizeBarrier() {
-  HIP_RUNTIME_CHECK(hipFree(dispatchGridBarrier));
-  HIP_RUNTIME_CHECK(hipFree(combineGridBarrier));
-  HIP_RUNTIME_CHECK(hipFree(crossDeviceBarrierFlag));
-  HIP_RUNTIME_CHECK(hipFree(interNodeChunkFlagCombine));
-  HIP_RUNTIME_CHECK(hipFree(interNodeBlocksBarrier));
-  ShmemFree(crossDeviceBarrierMemObj->localPtr);
-  ShmemFree(interNodeChunkFlagMemObj->localPtr);
+  HipFreeAndNull(dispatchGridBarrier);
+  HipFreeAndNull(combineGridBarrier);
+  HipFreeAndNull(crossDeviceBarrierFlag);
+  HipFreeAndNull(interNodeChunkFlagCombine);
+  HipFreeAndNull(interNodeBlocksBarrier);
+  ShmemFreeAndInvalidate(crossDeviceBarrierMemObj);
+  ShmemFreeAndInvalidate(interNodeChunkFlagMemObj);
 }
 
 void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {}
