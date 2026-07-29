@@ -63,6 +63,13 @@ REAL_DECODE_TOKENS = int(os.environ.get("MORI_TEST_REAL_DECODE_TOKENS", "128"))
 # init, so both are left to their own coverage (see backlog in RESULTS_M.md).
 _KERNEL_TYPES = ("IntraNode", "IntraNodeLL")
 
+# The world size the shared worker pool was started at (conftest reads the same
+# env var). Every test parametrizes on this rather than a literal 8 so that a
+# run confined to the free GPUs of a contended node -- HIP_VISIBLE_DEVICES=1,2,4,5
+# MORI_TEST_WORLD_SIZE=4 -- actually exercises the tests instead of asking a
+# 4-rank pool for 8 workers and hanging on the missing four.
+_WORLD_SIZES = (int(os.environ.get("MORI_TEST_WORLD_SIZE", "8")),)
+
 
 def _make_config(
     rank,
@@ -1180,7 +1187,7 @@ def _worker_reconfigure_noop_and_finalize(rank, world_size):
 # ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 @pytest.mark.parametrize("kernel_type", _KERNEL_TYPES)
 def test_reconfigure_flip_and_flip_back(
     torch_dist_process_manager, world_size, kernel_type
@@ -1194,7 +1201,7 @@ def test_reconfigure_flip_and_flip_back(
 
 # fp8 paths allocate extra scale buffers off the same capacity fields, so the
 # rebuild has to resize those too.
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 @pytest.mark.parametrize("quant_type", ("fp8_direct_cast", "fp8_blockwise"))
 def test_reconfigure_flip_and_flip_back_quant(
     torch_dist_process_manager, world_size, quant_type
@@ -1206,7 +1213,7 @@ def test_reconfigure_flip_and_flip_back_quant(
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 @pytest.mark.parametrize("cycles", (5,))
 def test_reconfigure_leak_stress(torch_dist_process_manager, world_size, cycles):
     for _ in range(world_size):
@@ -1216,7 +1223,7 @@ def test_reconfigure_leak_stress(torch_dist_process_manager, world_size, cycles)
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_finalize_returns_everything(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1225,7 +1232,7 @@ def test_finalize_returns_everything(torch_dist_process_manager, world_size):
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_reconfigure_public_reject_restores_mirror(
     torch_dist_process_manager, world_size
 ):
@@ -1236,7 +1243,7 @@ def test_reconfigure_public_reject_restores_mirror(
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_reconfigure_max_total_recv_tokens(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1245,7 +1252,7 @@ def test_reconfigure_max_total_recv_tokens(torch_dist_process_manager, world_siz
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_reconfigure_rejects_layout_change(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1254,7 +1261,7 @@ def test_reconfigure_rejects_layout_change(torch_dist_process_manager, world_siz
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_reconfigure_noop_and_finalize(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1263,7 +1270,7 @@ def test_reconfigure_noop_and_finalize(torch_dist_process_manager, world_size):
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_reconfigure_oom_rolls_back(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1272,7 +1279,7 @@ def test_reconfigure_oom_rolls_back(torch_dist_process_manager, world_size):
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_plain_device_oom_raises(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1281,7 +1288,7 @@ def test_plain_device_oom_raises(torch_dist_process_manager, world_size):
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_repeated_failed_flips_do_not_accumulate(
     torch_dist_process_manager, world_size
 ):
@@ -1292,7 +1299,7 @@ def test_repeated_failed_flips_do_not_accumulate(
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_rank_asymmetric_failure(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1301,7 +1308,7 @@ def test_rank_asymmetric_failure(torch_dist_process_manager, world_size):
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_rank_asymmetric_unrecoverable(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1310,7 +1317,7 @@ def test_rank_asymmetric_unrecoverable(torch_dist_process_manager, world_size):
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_flip_at_real_capacities(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1319,7 +1326,7 @@ def test_flip_at_real_capacities(torch_dist_process_manager, world_size):
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_finalized_getters_raise(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1328,7 +1335,7 @@ def test_finalized_getters_raise(torch_dist_process_manager, world_size):
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_rank_asymmetric_reject(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1337,7 +1344,7 @@ def test_rank_asymmetric_reject(torch_dist_process_manager, world_size):
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_rank_asymmetric_giveback_fails(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1346,7 +1353,7 @@ def test_rank_asymmetric_giveback_fails(torch_dist_process_manager, world_size):
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_reconfigure_rejects_immutable_fields(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -1355,7 +1362,7 @@ def test_reconfigure_rejects_immutable_fields(torch_dist_process_manager, world_
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
-@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
 @pytest.mark.parametrize("cycles", (20,))
 def test_reconfigure_heap_fragmentation(
     torch_dist_process_manager, world_size, cycles
