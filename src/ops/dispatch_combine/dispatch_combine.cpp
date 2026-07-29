@@ -24,6 +24,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
+#include <new>
 #include <stdexcept>
 
 #include "mori/core/core.hpp"
@@ -190,9 +191,13 @@ void EpDispatchCombineHandle::Finalize() {
   if (!buffersInitialized) return;
   auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
   if (states->status != mori::shmem::ShmemStatesStatus::Initialized) {
-    // The shmem context is already gone; the symmetric heap went with it. Mark
-    // the buffers dead so we do not later call ShmemFree on a dead context.
-    buffersInitialized = false;
+    // The shmem context is already gone; the symmetric heap went with it, so
+    // the symmetric buffers cannot (and need not) be handed back. The plain
+    // hipMalloc scratch (order maps, barriers, totalRecvTokenNum) is NOT owned
+    // by shmem though -- returning early here would leak it while
+    // IsInitialized() started reporting false. Run the normal teardown;
+    // ShmemFreeAndInvalidate skips the ShmemFree on a dead context.
+    FinalizeAll();
     return;
   }
   // The op must be idle. Drain any in-flight kernel before releasing buffers
@@ -225,6 +230,19 @@ void EpDispatchCombineHandle::ValidateReconfigurable(
   require("scaleDim", config.scaleDim, newConfig.scaleDim);
   require("scaleTypeSize", config.scaleTypeSize, newConfig.scaleTypeSize);
   require("maxTokenTypeSize", config.maxTokenTypeSize, newConfig.maxTokenTypeSize);
+  // numQpPerPe is owned by the shmem context (NormalizeConfig only clamps it to
+  // ShmemNumQpPerPe) and Reconfigure does NOT rebuild that context, so it is as
+  // peer-visible as kernelType. useExternalInpBuffer decides whether the
+  // dispatch input token buffer is allocated at all -- changing it across a
+  // reconfigure would silently change which symmetric buffers exist.
+  // Compare the CLAMPED form: `config` has already been through NormalizeConfig
+  // (which caps numQpPerPe at ShmemNumQpPerPe()) but `newConfig` has not, so a
+  // raw compare would spuriously reject a caller that just passed its original
+  // config back in.
+  require("numQpPerPe", std::min(config.numQpPerPe, ShmemNumQpPerPe()),
+          std::min(newConfig.numQpPerPe, ShmemNumQpPerPe()));
+  require("useExternalInpBuffer", static_cast<long long>(config.useExternalInpBuffer),
+          static_cast<long long>(newConfig.useExternalInpBuffer));
   if (newConfig.maxNumInpTokenPerRank <= 0) {
     throw std::runtime_error(
         "EpDispatchCombineHandle::Reconfigure: maxNumInpTokenPerRank must be > 0");
@@ -245,6 +263,9 @@ void EpDispatchCombineHandle::Reconfigure(const EpDispatchCombineConfig& newConf
                 config.maxTotalRecvTokens, newConfig.maxTotalRecvTokens);
 
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  // Keep the normalized old config so a failed re-allocation can roll back to a
+  // capacity we know fits.
+  const EpDispatchCombineConfig oldConfig = config;
   FinalizeAll();
 
   config = newConfig;
@@ -259,7 +280,38 @@ void EpDispatchCombineHandle::Reconfigure(const EpDispatchCombineConfig& newConf
   tokenIndices = nullptr;
 
   NormalizeConfig();
-  InitializeAll();
+  try {
+    InitializeAll();
+  } catch (const std::exception& e) {
+    // The new (larger) capacity did not fit. Without this the op would be left
+    // holding half-built buffers with buffersInitialized=false -- strictly worse
+    // than before the flip, and unrecoverable. Roll back to the previous
+    // capacity so the caller can keep serving in its old role and surface the
+    // failure. Every Finalize*() nulls what it released, so tearing down the
+    // partial allocation is safe.
+    MORI_OPS_WARN("Reconfigure to maxNumInpTokenPerRank={} failed ({}); rolling back to {}",
+                  newConfig.maxNumInpTokenPerRank, e.what(), oldConfig.maxNumInpTokenPerRank);
+    FinalizeAll();
+    config = oldConfig;
+    try {
+      InitializeAll();
+    } catch (const std::exception& e2) {
+      // The rollback itself failed: the heap is in a state we cannot reason
+      // about, so do not pretend the op is usable.
+      FinalizeAll();
+      throw std::runtime_error(
+          std::string("EpDispatchCombineHandle::Reconfigure: allocation for the new capacity "
+                      "failed (") +
+          e.what() + ") AND the rollback to the previous capacity also failed (" + e2.what() +
+          "); the op is now finalized and must be rebuilt");
+    }
+    throw std::runtime_error(
+        std::string("EpDispatchCombineHandle::Reconfigure: could not grow the a2a buffers to "
+                    "maxNumInpTokenPerRank=") +
+        std::to_string(newConfig.maxNumInpTokenPerRank) + " (" + e.what() +
+        "); rolled back to " + std::to_string(oldConfig.maxNumInpTokenPerRank) +
+        ", the op is still usable at the old capacity");
+  }
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
@@ -277,9 +329,22 @@ EpDispatchCombineHandle::~EpDispatchCombineHandle() {
 
 mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsigned int flags) {
   void* buf = ShmemExtMallocWithFlags(size, flags);
+  if (buf == nullptr) {
+    // Symmetric heap exhausted. This is a REACHABLE path now that buffers get
+    // re-allocated at a larger capacity on a role switch (sglang D->P grows
+    // maxNumInpTokenPerRank), so it must be a recoverable exception rather than
+    // the hipMemset-on-null / assert it used to be. Reconfigure() catches this
+    // and rolls back to the previous capacity.
+    throw std::bad_alloc();
+  }
   HIP_RUNTIME_CHECK(hipMemset(buf, 0, size));
   mori::application::SymmMemObjPtr obj = ShmemQueryMemObjPtr(buf);
-  assert(obj.IsValid());
+  if (!obj.IsValid()) {
+    ShmemFree(buf);
+    throw std::runtime_error(
+        "EpDispatchCombine: symmetric allocation of " + std::to_string(size) +
+        " bytes is not registered in the SymmMemObj pool");
+  }
   return obj;
 }
 
@@ -380,9 +445,17 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
 // Free a symmetric buffer and invalidate the handle so a repeated Finalize
 // (or a use-after-free from a stale kernel arg) is caught rather than silently
 // double-freeing. Safe on an already-invalid / never-allocated obj.
+//
+// If the shmem context has already been torn down the symmetric heap went with
+// it, so there is nothing to give back: just invalidate. This lets the plain
+// hipMalloc scratch in the same Finalize*() body still be released instead of
+// leaking (which is what an early return from Finalize() used to do).
 static void ShmemFreeAndInvalidate(mori::application::SymmMemObjPtr& obj) {
   if (!obj.IsValid()) return;
-  ShmemFree(obj->localPtr);
+  auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
+  if (states->status == mori::shmem::ShmemStatesStatus::Initialized) {
+    ShmemFree(obj->localPtr);
+  }
   obj = mori::application::SymmMemObjPtr{nullptr, nullptr};
 }
 
