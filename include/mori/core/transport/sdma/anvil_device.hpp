@@ -99,11 +99,12 @@ __device__ __forceinline__ SDMA_PKT_FENCE CreateFencePacket(HSAuint64* address, 
 
 // Assumes signal is allocated in device memory. The signal is written by the SDMA
 // engine, so the poll must be SYSTEM scope. Returns only once the signal lands.
-__device__ __forceinline__ void waitForSignal(HSAuint64* addr, uint64_t expected) {
+__device__ __forceinline__ bool waitForSignal(HSAuint64* addr, uint64_t expected) {
   long long retries = 0;
   while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) != expected) {
     if (++retries > MAX_RETRIES) __builtin_trap();
   }
+  return true;
 }
 
 #endif  // __HIPCC__ || __CUDACC__
