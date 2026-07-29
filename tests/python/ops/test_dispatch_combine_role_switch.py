@@ -303,6 +303,132 @@ def _worker_reconfigure_oom_rolls_back(rank, world_size):
     _run_once(op, config)
 
 
+def _worker_plain_device_oom_raises(rank, world_size):
+    """A flip that cannot grow PLAIN-DEVICE scratch must raise, not kill us.
+
+    The symmetric-heap OOM above is only half the story, and the less likely
+    half. The order maps / barriers / counters are raw `hipMalloc`, sized by
+    `maxNumOutToken = MaxNumTokensToSend() * numExpertPerRank`, so they grow
+    with the very capacity a role switch changes -- and plain device memory is
+    exactly what sglang's KV cache has already eaten. Under HIP_RUNTIME_CHECK
+    a failure there called `exit(-1)`, i.e. a D->P flip that ran out of device
+    memory SIGKILLed the whole inference server instead of returning an error.
+
+    Those call sites now throw. But "it raises instead of exiting" cannot be
+    established by reading the code -- if it were wrong, the process would
+    vanish and the test would look like a hang. It also cannot be provoked by
+    asking for a huge capacity: that trips the symmetric heap first, which was
+    already covered. Hence MORI_TEST_FAIL_HIPMALLOC, which fails one named
+    plain-device allocation.
+
+    The assertion that matters most here is the boring one at the end: this
+    worker still reaches its return statement.
+    """
+    import os
+
+    config = _make_config(rank, world_size, DECODE_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+    _run_once(op, config)
+
+    before = _heap_stats()
+
+    # `dispSenderIdxMap` is the SECOND plain-device allocation in
+    # InitializeOrderMapBuf, and InitializeShmemBuf/TokenNumSignalBuf have both
+    # already run by then. So the failure lands mid-InitializeAll with real
+    # symmetric-heap allocations outstanding -- which is precisely the state
+    # the rollback used to leak, because FinalizeAll() early-returned on a
+    # handle whose buffersInitialized flag was not yet set.
+    os.environ["MORI_TEST_FAIL_HIPMALLOC"] = "dispSenderIdxMap"
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
+    finally:
+        del os.environ["MORI_TEST_FAIL_HIPMALLOC"]
+
+    # It must be the rollback's error, not the "rollback also failed" one --
+    # the op has to still be usable.
+    message = str(excinfo.value)
+    assert "could not grow" in message, message
+    assert "must be rebuilt" not in message, message
+
+    # THE POINT: the process is still alive and serving at the old capacity.
+    _assert_capacity(op, DECODE_TOKENS)
+    _run_once(op, config)
+
+    # And the failed attempt gave everything back. Without the fix the catch
+    # path called FinalizeAll() on a handle with buffersInitialized=False, so
+    # it freed nothing and the rollback then overwrote every pointer: the
+    # symmetric-heap bites taken by the failed InitializeShmemBuf/
+    # TokenNumSignalBuf would be leaked permanently, making each failed D->P
+    # flip likelier to fail than the last. Exact equality, because the heap is
+    # a deterministic first-fit VA manager and not a caching allocator.
+    after = _heap_stats()
+    if before is not None and after is not None:
+        assert after["total_free_space"] == before["total_free_space"], (
+            f"rank {rank}: a FAILED flip leaked symmetric heap: "
+            f"total_free_space {before['total_free_space']} -> "
+            f"{after['total_free_space']} "
+            f"(lost {before['total_free_space'] - after['total_free_space']} bytes)"
+        )
+        assert after["num_mem_objs"] == before["num_mem_objs"], (
+            f"rank {rank}: a FAILED flip leaked symmetric objects: "
+            f"num_mem_objs {before['num_mem_objs']} -> {after['num_mem_objs']}"
+        )
+
+    # A later legitimate flip must still succeed: a failed flip is retryable,
+    # which is the contract sglang's role switch relies on to keep serving.
+    op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
+    _assert_capacity(op, PREFILL_TOKENS)
+    _run_once(op, config)
+
+
+def _worker_repeated_failed_flips_do_not_accumulate(rank, world_size):
+    """N failed D->P flips in a row must cost nothing cumulatively.
+
+    The leak the previous test catches is per-failure and permanent, so its
+    real-world signature is progressive: an sglang instance whose flips keep
+    failing slowly loses symmetric heap until even the flips that used to
+    succeed cannot. One failed flip barely moves the number; ten make it
+    obvious. This is the test that would have caught the bug from a distance.
+    """
+    import os
+
+    config = _make_config(rank, world_size, DECODE_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+    _run_once(op, config)
+
+    baseline = _heap_stats()
+    if baseline is None:
+        return
+
+    cycles = 10
+    trace = []
+    for _ in range(cycles):
+        os.environ["MORI_TEST_FAIL_HIPMALLOC"] = "dispSenderIdxMap"
+        try:
+            with pytest.raises(RuntimeError):
+                op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
+        finally:
+            del os.environ["MORI_TEST_FAIL_HIPMALLOC"]
+        trace.append(_heap_stats()["total_free_space"])
+
+    summary = (
+        f"rank {rank}: baseline={baseline['total_free_space']} "
+        f"after_each_failed_flip={trace}"
+    )
+    if rank == 0:
+        print("[failed-flip-accumulation] " + summary, flush=True)
+
+    assert trace[-1] == baseline["total_free_space"], (
+        f"{cycles} failed flips leaked symmetric heap cumulatively -- an "
+        f"instance that keeps failing to flip eventually cannot flip at all. "
+        f"{summary}"
+    )
+    # Still fully functional after 10 failures.
+    _assert_capacity(op, DECODE_TOKENS)
+    _run_once(op, config)
+
+
 def _worker_reconfigure_rejects_immutable_fields(rank, world_size):
     """numQpPerPe / useExternalInpBuffer are peer-visible; they must be frozen.
 
@@ -598,6 +724,26 @@ def test_reconfigure_oom_rolls_back(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_reconfigure_oom_rolls_back, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+def test_plain_device_oom_raises(torch_dist_process_manager, world_size):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_plain_device_oom_raises, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+def test_repeated_failed_flips_do_not_accumulate(
+    torch_dist_process_manager, world_size
+):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_repeated_failed_flips_do_not_accumulate, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
