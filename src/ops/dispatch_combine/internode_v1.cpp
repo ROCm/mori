@@ -760,6 +760,18 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
           args.weightsBuf + tokenId * config.numExpertPerToken, config.numExpertPerToken);
     }
   }
+  // [DBG CombineSync] 打印 combineInp 写入结果（只让 globalWarpId==0 lane0 打印，避免输出爆炸）
+  if (globalWarpId == 0 && laneId == 0) {
+    printf("[DBG][rank=%d][CombineSync] totalRecvTokenNum=%d → combineInp 写入完成\n",
+           config.rank, (int)args.totalRecvTokenNum[0]);
+    T* ci = args.interNodeV1TokBufs.combineInp->template GetAs<T*>();
+    for (int t = 0; t < (int)args.totalRecvTokenNum[0]; ++t) {
+      printf("[DBG][rank=%d][CombineSync]   combineInp[tok%d]: [", config.rank, t);
+      for (int d = 0; d < (int)hiddenDim; ++d)
+        printf("%s%.1f", d ? "," : "", (float)ci[t * hiddenDim + d]);
+      printf("]\n");
+    }
+  }
 }
 
 namespace combine_impl {
@@ -869,8 +881,9 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.MaxNumTokensToSendPerRank(), warpSize);
 
-  uint64_t* chunkFlag = args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>();
-  index_t* nodeRecvTokenNum = args.nodeRecvTokenNumMemObj->template GetAs<index_t*>();
+  uint64_t* chunkFlag =
+      args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>();  // dispatch写入 token数 + 1
+  index_t* nodeRecvTokenNum = args.nodeRecvTokenNumMemObj->template GetAs<index_t*>(); // 总token数
 
   extern __shared__ char sharedMem[];
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
@@ -921,6 +934,15 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
           }
           thisChunkTokenNum = __shfl(thisChunkTokenNum, 0);
 
+          // [DBG CombineInterNode] 打印 flag 轮询结果（bid 维度，只 warpId=0 lane=0）
+          if (warpId == 0 && laneId == 0 && thisChunkTokenNum > 0) {
+            printf("[DBG][rank=%d][CombineInterNode] bid=%d k=%d node=%d: "
+                   "chunkFlag=%llu → %llu token(s) 就绪\n",
+                   config.rank, blockId, k, node,
+                   (unsigned long long)thisChunkTokenNum,
+                   (unsigned long long)(thisChunkTokenNum - 1));
+          }
+
           if (thisChunkTokenNum > 0) {
             thisChunkTokenNum -= 1;
             int endTokenIdx = startTokenIdx + thisChunkTokenNum;
@@ -944,11 +966,23 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
                   srcWeightsPtr[laneId] =
                       args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                       destLocalTokId * config.numExpertPerToken;
+                  // [DBG CombineInterNode] 找到 expert 输出位置
+                  printf("[DBG][rank=%d][CombineInterNode] tokIdx=%d expertSlot=%d: "
+                         "destTokId=%d destPe=%d destLocalTok=%d → srcPtr=%p\n",
+                         config.rank, tokIdx, (int)laneId, (int)destTokId, (int)destPe,
+                         (int)destLocalTokId, (void*)srcPtrs[laneId]);
                 }
                 // routing-handle callers own this tensor, hence no need to reset.
                 if (args.dispTokIdToSrcTokIdLocal == nullptr) {
                   args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
                 }
+              }
+
+              // [DBG CombineInterNode] WarpAccum 前：打印 staging 写入目标 offset
+              if (laneId == 0) {
+                printf("[DBG][rank=%d][CombineInterNode] WarpAccum → staging offset=%zu "
+                       "(tokIdx=%d, tokCombXferBytes=%zu)\n",
+                       config.rank, (size_t)(tokIdx * tokCombXferBytes), tokIdx, tokCombXferBytes);
               }
 
               core::WarpAccum<TokT, 4>(
@@ -975,6 +1009,21 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
                     uint64_t{0});
                 core::AtomicStoreRelaxedSystem(
                     args.interNodeChunkFlagCombine + node * maxChunkNum + k, index_t{0});
+                // [DBG CombineInterNode] 最后一个 warp 到达，触发 RDMA 发回源节点
+                // src: staging[node][startTokenIdx]     ← 刚写入的 WarpAccum 结果
+                // dst: proxyPe 的 staging[myNode+nNodes][startTokenIdx]  ← 源节点的接收区
+                int proxyPe_dbg = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
+                printf("[DBG][rank=%d][CombineInterNode] 最后一个warp(finished=%d) 触发 RDMA PUT:\n"
+                       "  src staging[node=%d][startTok=%d] offset=%zu\n"
+                       "  dst proxyPe=%d staging[myNode+nNodes=%d][startTok=%d] offset=%zu\n"
+                       "  size=%zu B (%llu tok * %zu B/tok)\n",
+                       config.rank, (int)finished,
+                       node, startTokenIdx,
+                       (size_t)SendBufSlotOffset(config, node, startTokenIdx) * tokCombXferBytes,
+                       proxyPe_dbg, myNode + nNodes, startTokenIdx,
+                       (size_t)SendBufSlotOffset(config, myNode + nNodes, startTokenIdx) * tokCombXferBytes,
+                       thisChunkTokenNum * tokCombXferBytes,
+                       (unsigned long long)thisChunkTokenNum, tokCombXferBytes);
               }
               int proxyPe = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
               int qpId = k % config.numQpPerPe;
@@ -1360,11 +1409,30 @@ __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs<T>& ar
         uint8_t* base = stagingPtr + SendBufSlotOffset(config, n, mappedId) * combXferBytes;
         srcPtrs[n] = reinterpret_cast<T*>(base) + hiddenDimOffset;
         srcWeightsPtrs[n] = reinterpret_cast<float*>(base + hiddenBytes);
+        // [DBG EpCombineAll] 打印每个节点贡献的 staging 读取位置
+        // stagingPtr 起点 = staging + SendBufSlotOffset(nNodes, 0)*combXferBytes
+        // 即已跳过 nNodes 段的头，直接从 staging[nNodes][0] 开始
+        // 其中 n==myNode  → staging[nNodes + myNode][mappedId=tokenId]  (intra expert 贡献)
+        //      n!=myNode  → staging[nNodes + n     ][mappedId]          (RDMA 回程区)
+        printf("[DBG][rank=%d][EpCombineAll] tok%d node%d: "
+               "mappedId=%d staging区段=%d offset=%zu srcPtr=%p\n",
+               config.rank, tokenId, n, mappedId,
+               nNodes + n,
+               (size_t)SendBufSlotOffset(config, n, mappedId) * combXferBytes,
+               (void*)srcPtrs[n]);
       }
     }
+    // [DBG EpCombineAll] WarpAccum 后把 combineOut 打印出来（只 globalWarpId==0 lane0）
     core::WarpAccum<T, 4>(args.interNodeV1TokBufs.combineOut->template GetAs<T*>() +
                               tokenId * hiddenDim + hiddenDimOffset,
                           srcPtrs, nullptr, nNodes, hiddenDimSize);
+    if (globalWarpId == 0 && laneId == 0 && inTokenPartId == 0) {
+      T* out = args.interNodeV1TokBufs.combineOut->template GetAs<T*>() + tokenId * hiddenDim;
+      printf("[DBG][rank=%d][EpCombineAll] → combineOut[tok%d]: [", config.rank, tokenId);
+      for (int d = 0; d < (int)hiddenDim; ++d)
+        printf("%s%.1f", d ? "," : "", (float)out[d]);
+      printf("]\n");
+    }
     if (args.weightsBuf && (inTokenPartId == mwIter.warpsPerItem - 1)) {
       core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
                                     tokenId * config.numExpertPerToken,

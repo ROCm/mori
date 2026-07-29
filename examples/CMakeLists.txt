@@ -193,3 +193,7 @@ target_link_libraries(
 add_executable(async_ll_dispatch_example async_ll_dispatch_example.cpp)
 target_link_libraries(async_ll_dispatch_example mori_ops mori_application MPI::MPI_CXX hip::host hip::device)
 target_include_directories(async_ll_dispatch_example PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+add_executable(internode_v1_dispatch_example internode_v1_dispatch_example.cpp)
+target_link_libraries(internode_v1_dispatch_example mori_ops mori_application MPI::MPI_CXX hip::host hip::device)
+target_include_directories(internode_v1_dispatch_example PRIVATE ${CMAKE_SOURCE_DIR}/include)
