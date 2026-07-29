@@ -260,7 +260,15 @@ int GetCurDeviceWallClockFreqMhz() { return mori::GetCurDeviceWallClockFreqMhz()
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, "EpDispatchCombineHandle")
       .def(pybind11::init<mori::moe::EpDispatchCombineConfig>(),
-           py::arg("config") = mori::moe::EpDispatchCombineConfig{});
+           py::arg("config") = mori::moe::EpDispatchCombineConfig{})
+      // Collective: every rank must call these the same number of times, in
+      // the same order, with the op idle. See dispatch_combine.hpp.
+      .def("finalize", &mori::moe::EpDispatchCombineHandle::Finalize,
+           py::call_guard<py::gil_scoped_release>())
+      .def("reconfigure", &mori::moe::EpDispatchCombineHandle::Reconfigure, py::arg("config"),
+           py::call_guard<py::gil_scoped_release>())
+      .def_property_readonly("is_initialized",
+                             &mori::moe::EpDispatchCombineHandle::IsInitialized);
 
   m.def("get_dispatch_output_ptrs", &GetDispatchOutputPtrs);
   m.def("get_combine_output_ptrs", &GetCombineOutputPtrs);

@@ -229,21 +229,7 @@ class EpDispatchCombineOp:
 
         self._handle = handle_class(self._cpp_config)
         self._hip_module = _load_hip_modules(config.kernel_type)
-        self._handle_info = mori_cpp.get_handle_info(self._handle)
-
-        self._fp8_blockwise_combine_scale_dim = self._handle_info[
-            "fp8_blockwise_combine_scale_dim"
-        ]
-        self._fp8_blockwise_combine_scale_type_size = self._handle_info[
-            "fp8_blockwise_combine_scale_type_size"
-        ]
-
-        self._dispatch_out_ptrs = mori_cpp.get_dispatch_output_ptrs(self._handle, True)
-        self._combine_out_ptrs = mori_cpp.get_combine_output_ptrs(self._handle, True)
-
-        self.local_expert_count = torch.zeros(
-            config.num_experts_per_rank, dtype=torch.int32, device="cuda"
-        )
+        self._refresh_handle_state()
 
         self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
@@ -361,6 +347,85 @@ class EpDispatchCombineOp:
             raise ValueError(
                 f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
             )
+
+    # ------------------------------------------------------------------
+    # Buffer lifecycle (teardown / rebuild)
+    # ------------------------------------------------------------------
+    def _refresh_handle_state(self):
+        """Re-read everything cached from the C++ handle's buffers.
+
+        Every cached pointer here is owned by a buffer the handle allocated, so
+        it must be re-read after any teardown/rebuild of those buffers.
+        """
+        self._handle_info = mori_cpp.get_handle_info(self._handle)
+
+        self._fp8_blockwise_combine_scale_dim = self._handle_info[
+            "fp8_blockwise_combine_scale_dim"
+        ]
+        self._fp8_blockwise_combine_scale_type_size = self._handle_info[
+            "fp8_blockwise_combine_scale_type_size"
+        ]
+
+        self._dispatch_out_ptrs = mori_cpp.get_dispatch_output_ptrs(self._handle, True)
+        self._combine_out_ptrs = mori_cpp.get_combine_output_ptrs(self._handle, True)
+
+        self.local_expert_count = torch.zeros(
+            self.config.num_experts_per_rank, dtype=torch.int32, device="cuda"
+        )
+
+    def finalize(self):
+        """Release the all-to-all buffers held by this op.
+
+        Collective across the EP group: every rank must call it, the same
+        number of times and in the same order, with no dispatch/combine in
+        flight. Idempotent. The op is unusable afterwards until it is rebuilt.
+        """
+        self._handle.finalize()
+
+    @property
+    def is_initialized(self):
+        return self._handle.is_initialized
+
+    def reconfigure(self, *, max_num_inp_token_per_rank=None, max_total_recv_tokens=None):
+        """Resize the a2a buffers in place for a new per-rank token capacity.
+
+        This is the mori side of an sglang PD role switch: a prefill role sizes
+        its dispatch buffer for a large chunked-prefill token count, a decode
+        role for a small per-step batch. Rather than rebuilding the op (which
+        would re-run JIT and re-init shmem) we free and re-allocate just the
+        buffers.
+
+        Only capacity fields may change; the C++ side raises on any change to a
+        peer-visible / layout-defining field. Collective, same rules as
+        :meth:`finalize`.
+        """
+        if max_num_inp_token_per_rank is None:
+            max_num_inp_token_per_rank = self.config.max_num_inp_token_per_rank
+        if max_total_recv_tokens is None:
+            max_total_recv_tokens = self.config.max_total_recv_tokens
+
+        if (
+            max_num_inp_token_per_rank == self.config.max_num_inp_token_per_rank
+            and max_total_recv_tokens == self.config.max_total_recv_tokens
+            and self.is_initialized
+        ):
+            return  # nothing to do; avoid a pointless collective free/alloc
+
+        if dist.is_initialized():
+            # The symmetric heap is allocated in lockstep, so no rank may start
+            # freeing while another is still using the old buffers.
+            dist.barrier()
+
+        self._cpp_config.max_num_inp_token_per_rank = max_num_inp_token_per_rank
+        self._cpp_config.max_total_recv_tokens = max_total_recv_tokens
+        self._handle.reconfigure(self._cpp_config)
+
+        self.config.max_num_inp_token_per_rank = max_num_inp_token_per_rank
+        self.config.max_total_recv_tokens = max_total_recv_tokens
+        self._refresh_handle_state()
+
+        if dist.is_initialized():
+            dist.barrier()
 
     # ------------------------------------------------------------------
     # Kernel launch helpers
