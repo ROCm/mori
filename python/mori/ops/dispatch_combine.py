@@ -480,8 +480,31 @@ class EpDispatchCombineOp:
                 shmem was initialized with (see :meth:`_shmem_barrier`).
         """
         self._shmem_barrier(group)
-        self._handle.finalize()
-        self._shmem_barrier(group)
+        try:
+            self._handle.finalize()
+        finally:
+            # The trailing barrier is not optional on the error path. If one
+            # rank's finalize() throws and skips it, that rank returns (or
+            # unwinds) while its peers block here with N-1 of N participants,
+            # and the flip hangs -- the same shape as the reject deadlock fixed
+            # in reconfigure(), 80 lines below. It matters more here than it
+            # looks: finalize() is published COLLECTIVE (COORD v6.1) and sglang
+            # calls it on the destroy+recreate fallback that multi-node EP
+            # always takes, so this is the teardown path of the configuration
+            # that has the least other coverage.
+            #
+            # `finally`, not `except`: the exception still propagates, because a
+            # rank that could not release its buffers must not report success.
+            # This makes the group's barriers balanced, not the failure silent.
+            #
+            # Deliberately NOT wrapped in a severity agreement like
+            # reconfigure(). Finalize is destructive by intent -- there is no
+            # "give the capacity back" to negotiate, and the C++ FinalizeAll()
+            # is idempotent and frees what it can, so the useful contract is
+            # "the barriers stay balanced and the raiser is named" rather than
+            # a group verdict. Callers that need the group's state after a
+            # partial finalize should rebuild rather than inspect.
+            self._shmem_barrier(group)
 
     @property
     def is_initialized(self):
