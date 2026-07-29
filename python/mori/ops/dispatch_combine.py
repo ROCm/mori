@@ -416,8 +416,13 @@ class EpDispatchCombineOp:
     # Resize outcome severities, MAX-reduced across the EP group. Ordered so
     # that the numerically largest is the worst, because MAX is the reduction.
     SEVERITY_OK = 0
-    SEVERITY_ROLLED_BACK = 1  # resize failed, op still usable at old capacity
-    SEVERITY_UNRECOVERABLE = 2  # rollback failed too; op holds no buffers
+    # The config was refused before anything was freed (ValidateReconfigurable).
+    # Milder than ROLLED_BACK: no rank attempted an allocation, so nothing can
+    # be in a partial state. It is still a group outcome, not a local one --
+    # see the comment on the rejection branch in reconfigure().
+    SEVERITY_REJECTED = 1
+    SEVERITY_ROLLED_BACK = 2  # resize failed, op still usable at old capacity
+    SEVERITY_UNRECOVERABLE = 3  # rollback failed too; op holds no buffers
 
     @staticmethod
     def _group_max(group, value):
@@ -555,30 +560,39 @@ class EpDispatchCombineOp:
         self._cpp_config.max_num_inp_token_per_rank = max_num_inp_token_per_rank
         self._cpp_config.max_total_recv_tokens = max_total_recv_tokens
         local_err = None
+        reject_detail = None
         try:
             self._handle.reconfigure(self._cpp_config)
         except Exception as exc:  # OOM on the growing (decode->prefill) flip
             if self._REJECTED_TAG in str(exc):
                 # A REJECTION, not a failure: ValidateReconfigurable raised
                 # before anything was freed, so this op is bit-for-bit
-                # untouched and no peer is in a partial state either -- the
-                # check is deterministic on the config, so every rank that was
-                # handed the same config rejected it identically.
+                # untouched. It must not be relabelled as the group's worst OOM
+                # outcome ("could not grow ... every rank rolled back"), which
+                # is false in both halves and sends sglang down a retry path for
+                # a caller bug that will fail identically forever. Hence its own
+                # severity rung rather than ROLLED_BACK.
                 #
-                # It must therefore NOT go through the severity agreement, for
-                # two reasons. It would be relabelled as the group's worst
-                # OOM outcome ("could not grow ... every rank rolled back"),
-                # which is false in both halves and sends sglang down a retry
-                # path for a caller bug that will fail identically forever.
-                # And a rank whose config differs (a real caller bug) would
-                # reject while its peers proceed, so making the rejection
-                # collective would hang the flip on top of it.
+                # But it MUST still go through the agreement. An earlier version
+                # raised here, straight after the entry _shmem_barrier and before
+                # _agree_on_severity, on the theory that a rank whose config
+                # differs would otherwise reject while its peers proceed. That
+                # reasoning is backwards, and what it shipped was a deadlock:
+                # hand rank 0 an invalid capacity and ranks 1-7 a valid one, all
+                # 8 agree need_resize and clear the entry barrier, then rank 0
+                # raises while ranks 1-7 block in _agree_on_severity's all_reduce
+                # with 7 of 8 participants -- forever. One rank raises, seven
+                # hang: the exact group split the severity code exists to
+                # prevent. Staying collective is what makes divergent configs
+                # SAFE: the rejecter also reaches _group_max, so every rank sees
+                # the rejection, the peers that did resize give the capacity
+                # back, both barriers stay balanced, and nothing hangs.
+                reject_detail = str(exc).replace(self._REJECTED_TAG, "", 1).strip()
+                local_err = exc
                 _restore_mirror()
-                raise RuntimeError(
-                    str(exc).replace(self._REJECTED_TAG, "", 1).strip()
-                ) from exc
-            local_err = exc
-            _restore_mirror()
+            else:
+                local_err = exc
+                _restore_mirror()
         else:
             self.config.max_num_inp_token_per_rank = max_num_inp_token_per_rank
             self.config.max_total_recv_tokens = max_total_recv_tokens
@@ -590,6 +604,9 @@ class EpDispatchCombineOp:
         # failed, the ranks that succeeded give the capacity back.
         if local_err is None:
             local_severity = self.SEVERITY_OK
+        elif reject_detail is not None:
+            # Nothing was freed and nothing was allocated on this rank.
+            local_severity = self.SEVERITY_REJECTED
         elif self.is_initialized:
             local_severity = self.SEVERITY_ROLLED_BACK
         else:
@@ -668,6 +685,29 @@ class EpDispatchCombineOp:
             # give-back raised the raw C++ shrink error, which contains neither
             # of the two strings sglang keys on, so its classifier fell through
             # to its default on a rank that may hold nothing.
+            if worst == self.SEVERITY_REJECTED:
+                # Nowhere in the group was anything freed or allocated, so the
+                # op is bit-for-bit what it was before the call on every rank.
+                # Deliberately carries NEITHER "could not grow" nor "GROUP is
+                # not usable": sglang keys its abort-and-retry on the former and
+                # its escalate-and-stop on the latter, and neither is right for
+                # a caller bug that will be refused identically forever.
+                #
+                # The rank that rejected reports the C++ detail; its peers say
+                # which group member refused, because on a divergent-config bug
+                # the peers are the ones that look healthy and the operator
+                # needs pointing at the rank that is not.
+                if reject_detail is not None:
+                    raise RuntimeError(reject_detail) from local_err
+                raise RuntimeError(
+                    "EpDispatchCombineOp.reconfigure: at least one rank of the EP group "
+                    f"refused the requested config (max_num_inp_token_per_rank="
+                    f"{max_num_inp_token_per_rank}, max_total_recv_tokens="
+                    f"{max_total_recv_tokens}) as invalid; nothing was freed or allocated "
+                    f"anywhere, every rank is unchanged at {prev_inp}. This is a caller "
+                    "error, not a resource shortage -- retrying the same values will be "
+                    "refused identically."
+                )
             if worst == self.SEVERITY_UNRECOVERABLE:
                 if not self.is_initialized:
                     raise RuntimeError(
