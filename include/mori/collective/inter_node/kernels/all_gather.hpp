@@ -505,15 +505,13 @@ inline __device__ void AllGatherRingSubGroupKernelBody(
                                                      1, core::atomicType::AMO_ADD, nextPeer);
     } else if (threadLinearId == warpSize) {
       // Each round bumps a distinct flag slot exactly once (0 -> 1); wait per-slot.
-      int spinCount = 0;
+      long long spinCount = 0;
       // System-scope acquire + threadfence: the flag and its chunk are written by a
       // remote peer's RDMA AMO/put, so a relaxed load would leave the chunk stale for
       // this GPU's forward-put/copy-OUT. Mirrors the intra SDMA gather receiver.
       while (core::AtomicLoadSeqCstSystem(flagsArray + flagBase + recvDataRank) < 1) {
-        spinCount++;
-        if (spinCount > 10000000) {  // Increased timeout threshold
-          break;
-        }
+        // Never fall through: the next round forward-puts this chunk.
+        if (++spinCount > 10000000000LL) __builtin_trap();
       }
       __threadfence_system();
     }

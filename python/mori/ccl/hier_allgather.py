@@ -37,6 +37,7 @@ back-to-back FSDP overlap it can read stale remote halves. Each ``MORI_HIER_*``
 flag is an opt-in override; flag table in ``examples/fsdp_sdma/README.md``.
 """
 
+import contextlib
 import logging
 import os
 import socket
@@ -851,17 +852,26 @@ class HierAllGather:
         # it across two DEEP_PIPE sizes leaves stale landing state -> mismatch.
         # DEEP_PIPE=1 never enters here.
         _dp_layout = (_flag_slots, int(count), _deep_pipe)
-        if (
-            self._chunk_ready_flags is None
-            or self._chunk_ready_flags.numel() < _flag_slots
-            or self._chunk_ready_flags_layout != _dp_layout
-        ):
-            self._chunk_ready_flags = torch.zeros(
-                _flag_slots, dtype=torch.int64, device=input_data.device
-            )
-            self._chunk_ready_flags_layout = _dp_layout
-        flags = self._chunk_ready_flags
-        flags.zero_()
+        # Alloc + zero must be ordered on the SAME stream the kernel runs on: on a
+        # side comm stream (FSDP2) a current-stream zero_() can land after the ring
+        # publishes, wiping the flag -> reassembly hangs.
+        _fctx = (
+            torch.cuda.stream(stream)
+            if stream is not None
+            else contextlib.nullcontext()
+        )
+        with _fctx:
+            if (
+                self._chunk_ready_flags is None
+                or self._chunk_ready_flags.numel() < _flag_slots
+                or self._chunk_ready_flags_layout != _dp_layout
+            ):
+                self._chunk_ready_flags = torch.zeros(
+                    _flag_slots, dtype=torch.int64, device=input_data.device
+                )
+                self._chunk_ready_flags_layout = _dp_layout
+            flags = self._chunk_ready_flags
+            flags.zero_()
         # Ring prepare = global entry barrier + copy-IN (no launch).
         ring_args, _u32c, s_main = self._inter.prepare_stream_only(
             input_data, count, stream

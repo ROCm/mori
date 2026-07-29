@@ -309,7 +309,6 @@ class HostProxyHierAllGather:
         rpn = self.ranks_per_node
         elsize = inp.element_size()
         shard_bytes = e * elsize
-        inp = inp.contiguous()
 
         base = self.node_id * rpn
 
@@ -320,6 +319,10 @@ class HostProxyHierAllGather:
             stream = torch.cuda.current_stream(self.device)
 
         with torch.cuda.stream(stream):
+            # Must be inside the stream scope: a non-contiguous input's copy would
+            # otherwise run on the CURRENT stream while every reader below runs on
+            # ``stream``, with nothing ordering the two. No-op when already contiguous.
+            inp = inp.contiguous()
             my_out_slots = [
                 out[(base + i) * e : (base + i + 1) * e] for i in range(rpn)
             ]

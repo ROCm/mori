@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <stdexcept>
 
+#include "mori/application/utils/check.hpp"
 #include "mori/collective/ccl_kernel_args.hpp"
 #include "mori/shmem/shmem.hpp"
 
@@ -108,13 +109,16 @@ class IntraNodeSubGroupBroadcastSdma {
     flags_ = shmem::ShmemMalloc(flagsBytes);
     if (flags_ == nullptr)
       throw std::runtime_error("IntraNodeSubGroupBroadcastSdma: flags ShmemMalloc failed");
-    (void)hipMemset(flags_, 0, flagsBytes);
+    HIP_RUNTIME_CHECK(hipMemset(flags_, 0, flagsBytes));
     flagsObj_ = shmem::ShmemQueryMemObjPtr(flags_);
     if (!flagsObj_.IsValid())
       throw std::runtime_error("IntraNodeSubGroupBroadcastSdma: flags query failed");
   }
 
   ~IntraNodeSubGroupBroadcastSdma() {
+    // See IntraNodeSubGroupAllgatherSdma: Python GC may run after
+    // shmem_finalize(), where every ShmemFree hits a finalized heap.
+    if (!shmem::ShmemIsInitialized()) return;
     if (out_) shmem::ShmemFree(out_);
     if (flags_) shmem::ShmemFree(flags_);
   }
@@ -131,9 +135,10 @@ class IntraNodeSubGroupBroadcastSdma {
     // Root stages into its own symmetric out buffer so the kernel reads a stable
     // source (writing peerPtrs[root] back is then idempotent).
     if (groupPos_ == 0 && input != 0) {
-      (void)hipMemcpyAsync(out_, reinterpret_cast<void*>(input), count_u32 * sizeof(uint32_t),
-                           hipMemcpyDeviceToDevice, stream);
-      (void)hipStreamSynchronize(stream);
+      HIP_RUNTIME_CHECK(hipMemcpyAsync(out_, reinterpret_cast<void*>(input),
+                                       count_u32 * sizeof(uint32_t), hipMemcpyDeviceToDevice,
+                                       stream));
+      HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
     }
 
     shmem::ShmemBarrierAll();
@@ -156,9 +161,9 @@ class IntraNodeSubGroupBroadcastSdma {
   // reuses the buffer early.
   double finish_sync(uintptr_t output, size_t count_u32, hipStream_t stream) {
     size_t total = count_u32 * sizeof(uint32_t);
-    (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
-                         stream);
-    (void)hipStreamSynchronize(stream);
+    HIP_RUNTIME_CHECK(hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total,
+                                     hipMemcpyDeviceToDevice, stream));
+    HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
     shmem::ShmemBarrierAll();
     return 0.0;
   }

@@ -37,6 +37,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "mori/application/utils/check.hpp"
 #include "mori/collective/ccl_kernel_args.hpp"
 #include "mori/shmem/shmem.hpp"
 
@@ -80,9 +81,9 @@ class IntraNodeSubGroupAllgatherSdma {
 
   void ensure_event_sync_scratch() {
     if (copy_stream_ == nullptr) {
-      (void)hipStreamCreateWithFlags(&copy_stream_, hipStreamNonBlocking);
-      (void)hipEventCreateWithFlags(&gather_ev_, hipEventDisableTiming);
-      (void)hipEventCreateWithFlags(&copy_ev_, hipEventDisableTiming);
+      HIP_RUNTIME_CHECK(hipStreamCreateWithFlags(&copy_stream_, hipStreamNonBlocking));
+      HIP_RUNTIME_CHECK(hipEventCreateWithFlags(&gather_ev_, hipEventDisableTiming));
+      HIP_RUNTIME_CHECK(hipEventCreateWithFlags(&copy_ev_, hipEventDisableTiming));
     }
   }
 
@@ -167,7 +168,7 @@ class IntraNodeSubGroupAllgatherSdma {
     flags_ = shmem::ShmemMalloc(flagsBytes);
     if (flags_ == nullptr)
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: flags ShmemMalloc failed");
-    (void)hipMemset(flags_, 0, flagsBytes);
+    HIP_RUNTIME_CHECK(hipMemset(flags_, 0, flagsBytes));
     flagsObj_ = shmem::ShmemQueryMemObjPtr(flags_);
     if (!flagsObj_.IsValid())
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: flags query failed");
@@ -236,9 +237,9 @@ class IntraNodeSubGroupAllgatherSdma {
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: batch exceeds out capacity");
     }
     size_t total = total_count_u32 * sizeof(uint32_t);
-    (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
-                         stream);
-    (void)hipStreamSynchronize(stream);
+    HIP_RUNTIME_CHECK(hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total,
+                                     hipMemcpyDeviceToDevice, stream));
+    HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
     if (barrier) shmem::ShmemBarrierAll();
     return 0.0;
   }
@@ -255,8 +256,8 @@ class IntraNodeSubGroupAllgatherSdma {
       throw std::runtime_error("IntraNodeSubGroupAllgatherSdma: batch exceeds out capacity");
     }
     size_t total = total_count_u32 * sizeof(uint32_t);
-    (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
-                         stream);
+    HIP_RUNTIME_CHECK(hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total,
+                                     hipMemcpyDeviceToDevice, stream));
     if (barrier) shmem::ShmemBarrierOnStream(stream);
     return 0.0;
   }
@@ -406,16 +407,16 @@ class IntraNodeSubGroupAllgatherSdma {
     // (gather_ev_); host waits only on the copy-done event, scoping the stall to
     // gather+copy, not the whole caller stream.
     ensure_event_sync_scratch();
-    (void)hipEventRecord(gather_ev_, stream);
-    (void)hipStreamWaitEvent(copy_stream_, gather_ev_, 0);
-    (void)hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total, hipMemcpyDeviceToDevice,
-                         copy_stream_);
-    (void)hipEventRecord(copy_ev_, copy_stream_);
-    (void)hipStreamWaitEvent(stream, copy_ev_, 0);
+    HIP_RUNTIME_CHECK(hipEventRecord(gather_ev_, stream));
+    HIP_RUNTIME_CHECK(hipStreamWaitEvent(copy_stream_, gather_ev_, 0));
+    HIP_RUNTIME_CHECK(hipMemcpyAsync(reinterpret_cast<void*>(output), out_, total,
+                                     hipMemcpyDeviceToDevice, copy_stream_));
+    HIP_RUNTIME_CHECK(hipEventRecord(copy_ev_, copy_stream_));
+    HIP_RUNTIME_CHECK(hipStreamWaitEvent(stream, copy_ev_, 0));
     // Host-wait only when a host ShmemBarrierAll follows (barrier=true): the
     // copy must land before the cross-PE rendezvous. Hot path skips it.
     if (barrier) {
-      (void)hipEventSynchronize(copy_ev_);
+      HIP_RUNTIME_CHECK(hipEventSynchronize(copy_ev_));
     }
     if (barrier) shmem::ShmemBarrierAll();
     return 0.0;

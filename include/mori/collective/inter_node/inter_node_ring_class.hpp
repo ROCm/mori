@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <stdexcept>
 
+#include "mori/application/utils/check.hpp"
 #include "mori/collective/ccl_kernel_args.hpp"
 #include "mori/shmem/shmem.hpp"
 
@@ -129,11 +130,15 @@ class InterNodeRingAllgather {
     flags_ = shmem::ShmemMalloc(flagsBytes());
     if (flags_ == nullptr)
       throw std::runtime_error("InterNodeRingAllgather: flags ShmemMalloc failed");
-    (void)hipMemset(flags_, 0, flagsBytes());
+    HIP_RUNTIME_CHECK(hipMemset(flags_, 0, flagsBytes()));
     flagsObj_ = shmem::ShmemQueryMemObjPtr(flags_);
   }
 
   ~InterNodeRingAllgather() {
+    // Python GC may destroy this handle AFTER shmem_finalize(); ShmemFree then
+    // hits a finalized state (assert, compiled out in Release -> free on a
+    // reclaimed heap). Skipping is safe: the heap is already gone.
+    if (!shmem::ShmemIsInitialized()) return;
     if (ring_) shmem::ShmemFree(ring_);
     if (flags_) shmem::ShmemFree(flags_);
   }
@@ -145,12 +150,12 @@ class InterNodeRingAllgather {
     if (static_cast<size_t>(ringSize_) * chunkBytes > ringBytes_) {
       throw std::runtime_error("InterNodeRingAllgather: message exceeds ring buffer capacity");
     }
-    (void)hipMemsetAsync(flags_, 0, flagsBytes(), stream);
+    HIP_RUNTIME_CHECK(hipMemsetAsync(flags_, 0, flagsBytes(), stream));
     // Stage into ring-position slot (not global PE).
     char* myChunk = reinterpret_cast<char*>(ring_) + static_cast<size_t>(ringPos_) * chunkBytes;
-    (void)hipMemcpyAsync(myChunk, reinterpret_cast<void*>(input), chunkBytes,
-                         hipMemcpyDeviceToDevice, stream);
-    (void)hipStreamSynchronize(stream);
+    HIP_RUNTIME_CHECK(hipMemcpyAsync(myChunk, reinterpret_cast<void*>(input), chunkBytes,
+                                     hipMemcpyDeviceToDevice, stream));
+    HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
 
     shmem::ShmemBarrierAll();
 
@@ -181,8 +186,8 @@ class InterNodeRingAllgather {
     // buffer is always 0 on entry. The barrier below still orders each PE's
     // op-end reset before any peer's next-op atomic increment.
     char* myChunk = reinterpret_cast<char*>(ring_) + static_cast<size_t>(ringPos_) * chunkBytes;
-    (void)hipMemcpyAsync(myChunk, reinterpret_cast<void*>(input), chunkBytes,
-                         hipMemcpyDeviceToDevice, stream);
+    HIP_RUNTIME_CHECK(hipMemcpyAsync(myChunk, reinterpret_cast<void*>(input), chunkBytes,
+                                     hipMemcpyDeviceToDevice, stream));
     HierPrepareBarrierOnStream(stream);
 
     jit_args_.myPe = myPe_;
@@ -230,8 +235,8 @@ class InterNodeRingAllgather {
                        bool barrier = true) {
     size_t chunkBytes = count_u32 * sizeof(uint32_t);
     size_t total = static_cast<size_t>(ringSize_) * chunkBytes;
-    (void)hipMemcpyAsync(reinterpret_cast<void*>(output), ring_, total, hipMemcpyDeviceToDevice,
-                         stream);
+    HIP_RUNTIME_CHECK(hipMemcpyAsync(reinterpret_cast<void*>(output), ring_, total,
+                                     hipMemcpyDeviceToDevice, stream));
     if (barrier) HierFinishBarrierOnStream(stream);
     return 0.0;
   }
@@ -257,8 +262,8 @@ class InterNodeRingAllgather {
     if (static_cast<size_t>(ringSize_) * chunkBytes > ringBytes_) {
       throw std::runtime_error("InterNodeRingAllgather: message exceeds ring buffer capacity");
     }
-    (void)hipMemsetAsync(flags_, 0, flagsBytes(), stream);
-    (void)hipStreamSynchronize(stream);
+    HIP_RUNTIME_CHECK(hipMemsetAsync(flags_, 0, flagsBytes(), stream));
+    HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
 
     shmem::ShmemBarrierAll();
 
@@ -279,9 +284,9 @@ class InterNodeRingAllgather {
   double finish_sync(uintptr_t output, size_t count_u32, hipStream_t stream) {
     size_t chunkBytes = count_u32 * sizeof(uint32_t);
     size_t total = static_cast<size_t>(ringSize_) * chunkBytes;
-    (void)hipMemcpyAsync(reinterpret_cast<void*>(output), ring_, total, hipMemcpyDeviceToDevice,
-                         stream);
-    (void)hipStreamSynchronize(stream);
+    HIP_RUNTIME_CHECK(hipMemcpyAsync(reinterpret_cast<void*>(output), ring_, total,
+                                     hipMemcpyDeviceToDevice, stream));
+    HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
     // Barrier so no PE reuses the ring buffer while a peer still reads it.
     shmem::ShmemBarrierAll();
     return 0.0;
