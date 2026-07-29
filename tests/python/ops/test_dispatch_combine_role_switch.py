@@ -292,6 +292,14 @@ def _worker_flip_at_real_capacities(rank, world_size):
         op = mori.ops.EpDispatchCombineOp(config)
     except Exception as exc:  # heap too small for the real capacity on this node
         if "heap" in str(exc).lower() or "memory" in str(exc).lower():
+            # Say so. A silent early return is indistinguishable in the log from
+            # a full green run, and "the test passed" would then mean nothing --
+            # the exact vacuity that made T1/T2's leak claim worthless.
+            print(
+                f"[real-capacities] rank {rank}: SKIPPED, cannot build at "
+                f"{REAL_PREFILL_TOKENS} on this node: {exc}",
+                flush=True,
+            )
             return
         raise
 
@@ -319,6 +327,14 @@ def _worker_flip_at_real_capacities(rank, world_size):
         assert after_cycle["num_mem_objs"] == after_build["num_mem_objs"], (
             f"rank {rank}: symmetric object count moved across a closed flip "
             f"loop: {after_build} -> {after_cycle}"
+        )
+
+    if rank == 0:
+        print(
+            f"[real-capacities] rank 0: RAN {REAL_PREFILL_TOKENS} -> "
+            f"{REAL_DECODE_TOKENS} -> {REAL_PREFILL_TOKENS}, heap "
+            f"after_build={after_build} after_cycle={after_cycle}",
+            flush=True,
         )
 
     # And the teardown returns everything, at the real size.
