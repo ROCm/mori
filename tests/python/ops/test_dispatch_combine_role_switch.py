@@ -306,6 +306,17 @@ def _worker_reconfigure_oom_rolls_back(rank, world_size):
 def _worker_plain_device_oom_raises(rank, world_size):
     """A flip that cannot grow PLAIN-DEVICE scratch must raise, not kill us.
 
+    STATUS 2026-07-29: THIS TEST CURRENTLY FAILS -- SIGSEGV on all 8 ranks
+    (exitcode -11), on an idle node in a fresh container. See RESULTS_M.md T5d.
+    It is left in the tree, failing, rather than skipped or deleted, because it
+    is reporting something real: the control in T5e (same HEAD) shows the
+    SYMMETRIC-heap OOM rollback passes, so the crash is specific to a throw
+    that lands DEEPER in InitializeAll -- group 3 (InitializeOrderMapBuf) with
+    groups 1-2 already allocated -- rather than in group 1. Prime suspect is a
+    Finalize*() body running over members the failed pass never assigned.
+    Do not cite this test as evidence for the plain-device OOM contract until
+    it is green; that contract is by-construction today, not measured.
+
     The symmetric-heap OOM above is only half the story, and the less likely
     half. The order maps / barriers / counters are raw `hipMalloc`, sized by
     `maxNumOutToken = MaxNumTokensToSend() * numExpertPerRank`, so they grow
@@ -384,6 +395,10 @@ def _worker_plain_device_oom_raises(rank, world_size):
 
 def _worker_repeated_failed_flips_do_not_accumulate(rank, world_size):
     """N failed D->P flips in a row must cost nothing cumulatively.
+
+    STATUS 2026-07-29: FAILS for the same reason as
+    `_worker_plain_device_oom_raises` above (SIGSEGV on all 8 ranks) -- it uses
+    the same injection point. See that docstring and RESULTS_M.md T5d/T5e.
 
     The leak the previous test catches is per-failure and permanent, so its
     real-world signature is progressive: an sglang instance whose flips keep
