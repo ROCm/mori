@@ -407,14 +407,31 @@ class EpDispatchCombineOp:
         # (MPI / raw UniqueId), in which case world IS the shmem group.
         dist.barrier(group=group)
 
+    # Resize outcome severities, MAX-reduced across the EP group. Ordered so
+    # that the numerically largest is the worst, because MAX is the reduction.
+    SEVERITY_OK = 0
+    SEVERITY_ROLLED_BACK = 1  # resize failed, op still usable at old capacity
+    SEVERITY_UNRECOVERABLE = 2  # rollback failed too; op holds no buffers
+
     @staticmethod
-    def _agree_on_failure(group, failed):
-        """All-reduce a local failure flag over the shmem group.
+    def _agree_on_severity(group, severity):
+        """MAX-reduce the resize outcome over the shmem group.
 
-        Returns True if ANY rank reports failure. Used so that a partial resize
-        (some ranks grew, some OOMed) never becomes the group's steady state.
+        Returns the WORST severity any rank saw, so every rank raises an error
+        describing the group's actual state rather than its own. Used so that a
+        partial resize (some ranks grew, some OOMed) never becomes the group's
+        steady state.
 
-        The flag is a CPU tensor on purpose. The shmem group is whatever
+        This reduces a severity code, not a bool. With a bool, a rank that ended
+        UNRECOVERABLE (its rollback failed, so it holds no buffers at all) was
+        indistinguishable from one that merely rolled back, and its peers -- who
+        did roll back cleanly -- raised "the whole group is still usable at the
+        old capacity". That is false when one rank holds nothing, and sglang
+        keys its unrecoverable escalation on that wording, so it would escalate
+        on the one dying rank and keep serving on the others. A group whose
+        symmetric buffers exist on 7 of 8 ranks is corrupt, not degraded.
+
+        The tensor is on CPU on purpose. The shmem group is whatever
         `shmem_torch_process_group_init()` was handed, and in sglang that is
         `group.cpu_group` (moriep.py) -- a gloo-only group. A CUDA tensor
         all-reduced over a gloo group either fails or depends on gloo being
@@ -424,14 +441,14 @@ class EpDispatchCombineOp:
         than a device round trip on a path that is already synchronous.
         """
         if not dist.is_initialized():
-            return failed
+            return severity
         if group is None:
             from mori.shmem import shmem_get_process_group
 
             group = shmem_get_process_group()
-        flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device="cpu")
+        flag = torch.tensor([severity], dtype=torch.int32, device="cpu")
         dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
-        return bool(flag.item())
+        return int(flag.item())
 
     def finalize(self, *, group=None):
         """Release the all-to-all buffers held by this op.
@@ -520,15 +537,50 @@ class EpDispatchCombineOp:
         # symmetric, so a group where some ranks grew and others did not is
         # corrupt, not merely degraded. Agree on the outcome, and if any rank
         # failed, the ranks that succeeded give the capacity back.
-        if self._agree_on_failure(group, local_err is not None):
+        if local_err is None:
+            local_severity = self.SEVERITY_OK
+        elif self.is_initialized:
+            local_severity = self.SEVERITY_ROLLED_BACK
+        else:
+            # The C++ rollback failed too, so this rank holds no buffers.
+            local_severity = self.SEVERITY_UNRECOVERABLE
+        worst = self._agree_on_severity(group, local_severity)
+
+        if worst != self.SEVERITY_OK:
             if local_err is None:
-                self._cpp_config.max_num_inp_token_per_rank = prev_inp
-                self._cpp_config.max_total_recv_tokens = prev_recv
-                self._handle.reconfigure(self._cpp_config)
-                _restore_mirror()
+                # This rank grew but the group did not, so give the capacity
+                # back. Guarded: an unguarded throw here would skip the trailing
+                # barrier and strand every other rank in the group -- turning a
+                # recoverable resize failure into a hung flip, which is strictly
+                # worse. A give-back is a SHRINK back to a capacity that fit a
+                # moment ago, so it should not fail; if it does, this rank is
+                # unrecoverable and the barrier below still has to run.
+                try:
+                    self._cpp_config.max_num_inp_token_per_rank = prev_inp
+                    self._cpp_config.max_total_recv_tokens = prev_recv
+                    self._handle.reconfigure(self._cpp_config)
+                    _restore_mirror()
+                except Exception as giveback_err:
+                    local_err = giveback_err
+                    _restore_mirror()
+                    if not self.is_initialized:
+                        worst = self.SEVERITY_UNRECOVERABLE
             self._shmem_barrier(group)
             if local_err is not None:
                 raise local_err
+            # This rank is fine; it raises so the caller aborts the flip. The
+            # message must describe the GROUP's worst outcome, not this rank's:
+            # sglang decides between "keep serving in the old role" and "this
+            # instance is done" from it, and that decision has to be the same on
+            # every rank or the group splits.
+            if worst == self.SEVERITY_UNRECOVERABLE:
+                raise RuntimeError(
+                    "EpDispatchCombineOp.reconfigure: another rank in the EP group could "
+                    f"not resize its a2a buffers to max_num_inp_token_per_rank="
+                    f"{max_num_inp_token_per_rank} AND could not roll back, so that rank "
+                    "holds no a2a buffers; the op must be rebuilt group-wide. This rank "
+                    f"rolled back to {prev_inp} but the GROUP is not usable."
+                )
             raise RuntimeError(
                 "EpDispatchCombineOp.reconfigure: another rank in the EP group could "
                 f"not resize its a2a buffers to max_num_inp_token_per_rank="
