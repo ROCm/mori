@@ -164,6 +164,8 @@ py::dict GetHandleInfo(mori::moe::EpDispatchCombineHandle& handle) {
 #ifdef ENABLE_STANDARD_MOE_ADAPT
 void SetStandardMoeOutputBuffers(mori::moe::EpDispatchCombineHandle& handle,
                                  int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr) {
+  // Reads handle.standardPackedRecvCount, which FinalizeOrderMapBuf HipFreeAndNulls.
+  RequireInitialized(handle, "set_standard_moe_output_buffers");
   handle.SetStandardMoeOutputBuffers(reinterpret_cast<void*>(packedRecvX_ptr),
                                      handle.standardPackedRecvCount,
                                      reinterpret_cast<int*>(packedRecvSrcInfo_ptr), nullptr);
@@ -215,6 +217,7 @@ int64_t BuildConvertCombineInputArgs(mori::moe::EpDispatchCombineHandle& handle,
 void FreeConvertArgs(int64_t ptr) { ::operator delete(reinterpret_cast<void*>(ptr)); }
 
 int64_t GetStandardMoePackedRecvCountPtr(mori::moe::EpDispatchCombineHandle& handle) {
+  RequireInitialized(handle, "get_standard_moe_packed_recv_count_ptr");
   return reinterpret_cast<int64_t>(handle.standardPackedRecvCount);
 }
 
@@ -250,6 +253,7 @@ py::tuple GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
 }
 
 py::tuple GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
+  RequireInitialized(handle, "get_dispatch_sender_token_idx_map");
   return py::make_tuple(
       reinterpret_cast<int64_t>(handle.dispSenderIdxMap),
       static_cast<int64_t>(handle.curRankNumToken * handle.config.numExpertPerToken));

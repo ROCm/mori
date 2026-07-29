@@ -245,6 +245,81 @@ def _worker_finalize_returns_everything(rank, world_size):
     )
 
 
+def _worker_finalized_getters_raise(rank, world_size):
+    """EVERY pybind buffer getter must raise on a finalized handle, not hand
+    back a freed or null pointer.
+
+    Two distinct failure modes live behind these entry points, and both end at a
+    kernel launch:
+
+      * the SymmMemObjPtr getters (`get_dispatch_output_ptrs`, ...) dereference
+        a `{cpu=nullptr, gpu=nullptr}` pointer that `ShmemFreeAndInvalidate` left
+        behind -- an immediate SIGSEGV inside pybind, which is how a reportable
+        "must be rebuilt" became a dead rank in T5d;
+      * the plain-device getters (`get_standard_moe_packed_recv_count_ptr`,
+        `get_dispatch_sender_token_idx_map`, `set_standard_moe_output_buffers`)
+        read members `HipFreeAndNull`'d at teardown, so they return **0** and
+        the crash is deferred to whatever kernel is handed that address. That is
+        one severity WORSE than the segfault, not better: it is silent.
+
+    Neither is hypothetical. A D->P flip whose grow AND rollback both fail
+    finalizes the handle in place, and sglang's `except` unwinds through code
+    that re-reads these pointers. `758d97e2` claimed to guard "every pybind
+    buffer deref" and guarded 8 of 11; this test is what makes that claim
+    checkable instead of a commit message.
+
+    Iterated over a table rather than asserted one by one so that a getter added
+    later without a guard shows up here rather than in an inference server.
+    """
+    config = _make_config(rank, world_size, DECODE_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+    _run_once(op, config)
+
+    op.finalize()
+    assert op.is_initialized is False
+
+    # (callable, name). Each is invoked with only the handle plus whatever
+    # scalars it needs; none of them may touch the freed buffers before the
+    # guard runs.
+    from mori import mori_cpp
+
+    probes = [
+        (lambda: mori_cpp.get_dispatch_output_ptrs(op._handle), "get_dispatch_output_ptrs"),
+        (lambda: mori_cpp.get_combine_output_ptrs(op._handle), "get_combine_output_ptrs"),
+        (lambda: mori_cpp.build_args(op._handle), "build_args"),
+        (
+            lambda: mori_cpp.get_dispatch_sender_token_idx_map(op._handle),
+            "get_dispatch_sender_token_idx_map",
+        ),
+        (
+            lambda: mori_cpp.get_dispatch_receiver_token_idx_map(op._handle),
+            "get_dispatch_receiver_token_idx_map",
+        ),
+        (lambda: mori_cpp.get_dispatch_src_token_pos(op._handle), "get_dispatch_src_token_pos"),
+    ]
+    for name in ("get_standard_moe_packed_recv_count_ptr", "get_combine_input_ptr"):
+        # Compiled only under ENABLE_STANDARD_MOE_ADAPT.
+        fn = getattr(mori_cpp, name, None)
+        if fn is not None:
+            probes.append((lambda fn=fn: fn(op._handle), name))
+
+    for probe, name in probes:
+        with pytest.raises(RuntimeError) as excinfo:
+            probe()
+        message = str(excinfo.value)
+        assert "holds no buffers" in message, f"rank {rank}: {name} -> {message}"
+        assert name in message, (
+            f"rank {rank}: {name} raised without naming itself, which is what an "
+            f"operator greps for: {message}"
+        )
+
+    # And the op is genuinely rebuildable afterwards -- the guards must reject
+    # the reads, not poison the handle.
+    op.reconfigure(max_num_inp_token_per_rank=DECODE_TOKENS)
+    _assert_capacity(op, DECODE_TOKENS)
+    _run_once(op, config)
+
+
 def _worker_reconfigure_rejects_layout_change(rank, world_size):
     """Fields the peers' symmetric layout depends on must not be changeable."""
     config = _make_config(rank, world_size, PREFILL_TOKENS)
@@ -1050,6 +1125,15 @@ def test_rank_asymmetric_unrecoverable(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_rank_asymmetric_unrecoverable, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+def test_finalized_getters_raise(torch_dist_process_manager, world_size):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_finalized_getters_raise, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
