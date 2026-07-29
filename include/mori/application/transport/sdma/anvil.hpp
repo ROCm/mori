@@ -153,14 +153,15 @@ inline void EnablePeerAccess(int const deviceId, int const peerDeviceId) {
               << " (" << hipGetErrorString(error) << ")\n";
   }
 }
-// SDMA queue-slot cap: more than this aborts at queue creation (anvil.cpp).
-constexpr int kSdmaMaxNumChannels = 8;
+// Hardware cap on SDMA channels per GPU pair on CDNA (4 queues/engine ×
+// 2 recommended engines). Requests above this are clamped, not failed.
+inline constexpr int kMaxSdmaChannelsPerPair = 8;
 
 inline int GetSdmaNumChannels(int defaultVal = 2) {
   const char* env = std::getenv("MORI_SDMA_NUM_CHANNELS");
   if (env != nullptr) {
     int val = std::atoi(env);
-    if (val >= 1) return val < kSdmaMaxNumChannels ? val : kSdmaMaxNumChannels;
+    if (val >= 1) return val < kMaxSdmaChannelsPerPair ? val : kMaxSdmaChannelsPerPair;
   }
   return defaultVal;
 }

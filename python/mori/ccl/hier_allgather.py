@@ -47,7 +47,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# SDMA queue-slot cap, mirrors anvil::kSdmaMaxNumChannels (C++ clamps the env).
+# SDMA queue-slot cap, mirrors anvil::kMaxSdmaChannelsPerPair (C++ clamps the env).
 MORI_SDMA_CH_HW_MAX = 8
 
 # Falsy strings for every MORI_HIER_* boolean env flag (true iff not in this set).
