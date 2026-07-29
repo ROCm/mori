@@ -141,7 +141,17 @@ __device__ void EpDispatchLowLatencyAsyncSendCopySlotAssign_body(EpDispatchCombi
   for (int warpTokBase = globalWarpId * tokensPerWarp; warpTokBase < args.curRankNumToken;
        warpTokBase += globalWarpNum * tokensPerWarp) {
     int tokenId = warpTokBase + inWarpTokIdx;
-    if (tokenId >= args.curRankNumToken) continue;
+    // warpSize is not necessarily a multiple of numEpt (e.g. 64 % 6 == 4 for DSV4 topk=6).
+    // The trailing lanes then form an incomplete group with inWarpTokIdx == tokensPerWarp,
+    // which aliases the *next* warp's first token: warp g's lanes [tokensPerWarp*numEpt,
+    // warpSize) and warp g+1's lanes [0, warpSize % numEpt) resolve to the same entry i.
+    // Both would take the atomicAdd branch below, allocating two slots for one entry while
+    // dispDestTokIdMap[i] keeps only one -- inflating destPeTokenCounter and leaving an
+    // orphan slot that SendCopyMultiBlock never writes. The receiver then reads that
+    // never-written slot as token data. Mask the stragglers off. Note active lanes only ever
+    // __shfl from baseLane + j < tokensPerWarp * numEpt, so skipping these lanes cannot
+    // disturb the dedup shuffle above.
+    if ((inWarpTokIdx >= tokensPerWarp) || (tokenId >= args.curRankNumToken)) continue;
 
     int i = tokenId * numEpt + expertIdx;
     index_t destExpert = args.tokenIndices[i];
