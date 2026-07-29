@@ -24,6 +24,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <stdexcept>
@@ -403,11 +404,22 @@ static constexpr int kNoMemset = -1000;
 // the contract sglang's role switch depends on. Untested error paths are how the
 // exit(-1) survived this long.
 //
-// Unset => never fires. Read fresh each call so a test can arm and disarm it.
+// Unset => never fires. ONE-SHOT: the variable is cleared as soon as it fires.
+//
+// It used to re-read the env on every call, which sabotaged the very path it
+// exists to test. Reconfigure()'s rollback re-runs InitializeAll() at the OLD
+// config, so a still-armed hook failed the rollback too -- turning every
+// injected "grow failed, rolled back, still usable" into "rollback also failed,
+// the op is finalized". A test cannot disarm between the two: they are both
+// inside the single reconfigure() call. Firing once models the real failure
+// (transient device-memory pressure at the larger size, which the smaller
+// rollback allocation then fits under) and leaves the rollback honest.
 static bool ShouldInjectAllocFailure(const char* what) {
   const char* target = env::Get("MORI_TEST_FAIL_HIPMALLOC");
   if ((target == nullptr) || (target[0] == '\0') || (what == nullptr)) return false;
-  return std::strcmp(target, what) == 0;
+  if (std::strcmp(target, what) != 0) return false;
+  ::unsetenv("MORI_TEST_FAIL_HIPMALLOC");
+  return true;
 }
 
 static void HipMallocOrThrow(void** ptr, size_t size, const char* what, int memsetValue = 0) {

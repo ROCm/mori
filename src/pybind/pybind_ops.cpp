@@ -94,7 +94,27 @@ int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t 
   return BuildArgs(handle, rdmaBlockNum, hiddenDim, useExternalInpBuf);
 }
 
+// Every buffer pointer below lives inside a SymmMemObj that Finalize() releases,
+// and ShmemFreeAndInvalidate() leaves the owning SymmMemObjPtr as
+// {cpu=nullptr, gpu=nullptr}. SymmMemObjPtr::operator->() hands that nullptr
+// straight back, so `obj->Get()` on a finalized handle dereferences null and
+// SIGSEGVs the rank -- taking the process down before any error can cross into
+// python. That is reachable in production, not just from tests: if a D->P flip
+// fails to grow AND its rollback also fails, Reconfigure() finalizes the handle
+// and raises "must be rebuilt", and sglang's except path re-reads these
+// pointers while unwinding. The rank died there instead of reporting.
+static void RequireInitialized(const mori::moe::EpDispatchCombineHandle& handle,
+                               const char* what) {
+  if (!handle.IsInitialized()) {
+    throw std::runtime_error(
+        std::string(what) +
+        ": the EpDispatchCombineOp holds no buffers (it was finalized, or a resize failed and "
+        "could not roll back). It must be rebuilt before its buffers can be used.");
+  }
+}
+
 py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_scales) {
+  RequireInitialized(handle, "get_dispatch_output_ptrs");
   int64_t out_ptr = reinterpret_cast<int64_t>(handle.GetShmemDispatchOutTokMemObj()->Get());
   int64_t outW_ptr = reinterpret_cast<int64_t>(handle.shmemDispatchOutWeightsMemObj->Get());
   int64_t outS_ptr =
@@ -107,6 +127,7 @@ py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool
 }
 
 py::tuple GetCombineOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_weights) {
+  RequireInitialized(handle, "get_combine_output_ptrs");
   int64_t out_ptr = reinterpret_cast<int64_t>(handle.GetShmemCombineOutTokMemObj()->Get());
   int64_t outW_ptr =
       has_weights ? reinterpret_cast<int64_t>(handle.shmemCombineOutWeightsMemObj->Get()) : 0;

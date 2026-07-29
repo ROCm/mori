@@ -356,7 +356,20 @@ class EpDispatchCombineOp:
 
         Every cached pointer here is owned by a buffer the handle allocated, so
         it must be re-read after any teardown/rebuild of those buffers.
+
+        No-op when the handle holds no buffers. There is nothing to re-read
+        then, and asking anyway used to be fatal: `get_dispatch_output_ptrs`
+        dereferences SymmMemObjPtrs that Finalize() set to {nullptr, nullptr}.
+        The caller that lands here is the error path -- a resize that failed
+        AND could not roll back leaves the handle finalized, and the `except`
+        restores the mirror config on the way out. Crashing there turned a
+        reportable "must be rebuilt" into a dead rank, which is the exact
+        failure class this error contract exists to prevent. Leaving the stale
+        pointers in place is safe: the op is unusable until it is rebuilt, and
+        the C++ getters now raise rather than hand out freed memory.
         """
+        if not self._handle.is_initialized:
+            return
         self._handle_info = mori_cpp.get_handle_info(self._handle)
 
         self._fp8_blockwise_combine_scale_dim = self._handle_info[
