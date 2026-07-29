@@ -124,15 +124,20 @@ several lanes of one wave call `put` at once.
 | `ccoSdmaThreadIndependent` (default) | lanes target different peers, or you do not know | detects the shape at runtime; +14 SGPR |
 
 **Reach for `SameQueue` first.** Lanes sharing a queue post as one group — one
-reservation, one doorbell — so a whole wave's worth of packets costs about what
-one costs. Measured with one warp, one packet per lane:
+reservation, one doorbell — so the issue cost grows very slowly with the number
+of lanes. Trigger cycles for one warp, one packet per lane:
 
-| lanes | spread over 8 queues | one queue, `SameQueue` |
-|---|---|---|
-| 1 | 2330 | 2315 |
-| 2 | 3009 | **2592** |
-| 4 | 3379 | **2629** |
-| 8 | 3377 | **2612** |
+| lanes | one queue, `SameQueue` | per packet | spread over 8 queues |
+|---|---|---|---|
+| 1 | 2244 | 2244 | 2330 |
+| 2 | 2508 | 1254 | 3009 |
+| 4 | 2624 | 656 | 3379 |
+| 8 | 2652 | 332 | 3377 |
+| 16 | 2796 | 175 | — |
+| 32 | 2916 | 91 | — |
+| 64 | **3220** | **50** | — |
+
+64 packets cost 43% more to issue than one, so per packet it is 45x cheaper.
 
 Spreading lanes over queues is *worse*, not better: distinct queues avoid the
 commit chain but each lane still issues its own uncached reservation and
@@ -148,14 +153,23 @@ lane's queue. Silent corruption in release; traps under `MORI_CCO_SDMA_DEBUG`.
 
 ### optFlags
 
-`ccoSdmaOptFlagsDefault` rings the doorbell per put.
-`ccoSdmaOptFlagsAggregate` posts without ringing — issue N puts, then one
-`commit(peer, queueId)` rings the batch. Amortises the doorbell; sweet spot
-around N = 8–16.
+A bitmask, and a template argument. Two bits:
 
-Must be a template argument (it is one). Note the two unrelated "aggregate"
-names: `ccoSdmaOptFlagsAggregate` batches doorbells, `ccoSdmaThreadSameQueue`
-groups lanes.
+`ccoSdmaOptFlagsAggregate` posts without ringing the doorbell — issue N puts,
+then one `commit(peer, queueId)` rings the batch. Amortises the doorbell; sweet
+spot around N = 8–16.
+
+`ccoSdmaOptFlagsSignalPerCopy` gives every copy its own signal packet. **You
+rarely want this.** By default a group of lanes signals once, after all of its
+copies, so `expected` advances by one per `put()` call whatever the scope and
+however many lanes joined. Per-copy signals make it advance by the lane count
+instead, and cost a packet each — an ATOMIC costs the engine about what a COPY
+does, so 64 signalled copies take 248 µs instead of 132 µs. Set it only if a
+receiver has to observe copies landing one at a time. No effect at warp or block
+scope, which post a single copy either way.
+
+Note the two unrelated "aggregate" names: `ccoSdmaOptFlagsAggregate` batches
+doorbells, `ccoSdmaThreadSameQueue` groups lanes.
 
 ## Completion
 
@@ -222,6 +236,8 @@ signal means the data is there.
 - `expected` is **yours to maintain**, monotonic, per `(srcRank, queueId)` pair.
   Slots are never reset. One running total per pair — a single counter across
   queues will wait forever.
+- One `put()` call advances the counter by **one**, no matter how many lanes
+  joined the group, unless the sender set `ccoSdmaOptFlagsSignalPerCopy`.
 - `srcRank` is an LSA rank. To wait on your own `localSignal`, pass
   `comm.lsaRank`, **not** `comm.rank`.
 - The comparison is `>=`, so you cannot miss an increment.
@@ -273,13 +289,31 @@ largest contiguous copy you have and let one engine drain it.
 Below ~256 KB you are latency-bound, not bandwidth-bound; that is the regime
 where warp aggregation and `SameQueue` matter and transfer size does not.
 
+### Many small copies
+
+The engine costs about **2 µs per packet**, near enough the same for 64 B as for
+4 KB. Two consequences.
+
+Issuing is not the bottleneck: 64 packets take 1.3 µs to issue and 128 µs for the
+engine to run, so `SameQueue` aggregation buys latency and CU time, not
+throughput.
+
+Scattering is expensive: 64 x 4 KB costs 138 µs, where the same 256 KB in one
+copy costs about 11 µs.
+
+So if the data is non-contiguous, packing it first is usually faster: a local
+gather runs at ~7 TB/s, adding only a couple of percent to the transfer. Scatter
+directly when the chunks are large (≳1 MB, where the 2 µs is noise), when the CU
+must stay free for compute, or when you want the data to land in place with no
+unpack on the receiver.
+
 ## Failure modes
 
 | symptom | cause |
 |---|---|
 | every call silently does nothing | `MORI_ENABLE_SDMA` not set, or `sdmaNumQueue == 0` |
 | `ccoSdma` undeclared | kernel TU missing `-DBUILD_CCO_SDMA=1` |
-| `waitSignal` never returns | `expected` shared across queues, or `comm.rank` passed where `comm.lsaRank` was meant |
+| `waitSignal` never returns | `expected` shared across queues, `comm.rank` passed where `comm.lsaRank` was meant, or `expected` counted per lane when the sender signals once per group |
 | `quiet` returns but data is stale | aggregate puts never `commit`ed — `quiet` drains to the last *rung* packet. Traps under `MORI_CCO_SDMA_DEBUG` |
 | wrong data with several lanes per wave | `ccoSdmaThreadSameQueue` set while lanes target different queues |
 | receiver sees a signal but stale data | signal fired on a different queue than the copy |
