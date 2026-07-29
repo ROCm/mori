@@ -108,17 +108,17 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
 // Entire block compile-gated on BUILD_CCO_SDMA — when off, no cco_sdma_* symbols
 // are emitted (matches the host lib, which builds no SDMA queues).
 #if BUILD_CCO_SDMA
-#define CCO_DEF_SDMA_XFER(OP, TAG, COOP, SIG)                                                      \
-  CCO_DEV void cco_sdma_##OP##__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO,             \
-                                      uint64_t sW, uint64_t sO, uint64_t n, int qid, int flags) {  \
-    Sdma sdma{*AsDevComm(dc)};                                                                     \
-    if (static_cast<uint32_t>(flags) & ccoSdmaOptFlagsAggregate) {                                 \
-      sdma.OP<COOP, SIG, false, ccoSdmaOptFlagsAggregate>(peer, AsWindow(dW), dO, AsWindow(sW), sO,\
-                                                          n, qid);                                 \
-    } else {                                                                                       \
-      sdma.OP<COOP, SIG, false, ccoSdmaOptFlagsDefault>(peer, AsWindow(dW), dO, AsWindow(sW), sO,  \
-                                                        n, qid);                                   \
-    }                                                                                              \
+#define CCO_DEF_SDMA_XFER(OP, TAG, COOP, SIG)                                                     \
+  CCO_DEV void cco_sdma_##OP##__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO,            \
+                                      uint64_t sW, uint64_t sO, uint64_t n, int qid, int flags) { \
+    Sdma sdma{*AsDevComm(dc)};                                                                    \
+    if (static_cast<uint32_t>(flags) & ccoSdmaOptFlagsAggregate) {                                \
+      sdma.OP<COOP, SIG, false, ccoSdmaOptFlagsAggregate>(peer, AsWindow(dW), dO, AsWindow(sW),   \
+                                                          sO, n, qid);                            \
+    } else {                                                                                      \
+      sdma.OP<COOP, SIG, false, ccoSdmaOptFlagsDefault>(peer, AsWindow(dW), dO, AsWindow(sW), sO, \
+                                                        n, qid);                                  \
+    }                                                                                             \
   }
 
 CCO_DEF_SDMA_XFER(put, thread, ccoCoopThread, true)
