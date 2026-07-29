@@ -78,6 +78,10 @@ class SymmMemManager {
   // Common Utilities
   SymmMemObjPtr Get(void* localPtr) const;
   HeapVAManager* GetHeapVAManager() const { return heapVAManager.get(); }
+  // Number of live SymmMemObj registrations. Static-heap sub-regions land here
+  // too, so this is a second (independent of the VA manager) way to see a
+  // symmetric allocation that was never freed.
+  size_t GetNumMemObjs() const { return memObjPool.size(); }
   void InitHeapVAManager(uintptr_t baseAddr, size_t size, size_t granularity = 0) {
     heapVAManager = std::make_unique<HeapVAManager>(baseAddr, size, granularity);
   }

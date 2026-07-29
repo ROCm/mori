@@ -110,6 +110,24 @@ uint64_t ShmemPtrP2p(uint64_t destPtr, int myPe, int destPe) {
 
 int64_t ShmemNumQpPerPe() { return mori::shmem::ShmemNumQpPerPe(); }
 
+// Symmetric-heap accounting as a plain dict, so tests can diff it across a
+// buffer rebuild without needing a bound struct type.
+py::object ShmemGetHeapStats() {
+  mori::shmem::mori_shmem_heap_stats_t s;
+  if (mori::shmem::ShmemGetHeapStats(&s) != 0) {
+    return py::none();
+  }
+  py::dict d;
+  d["total_blocks"] = s.totalBlocks;
+  d["free_blocks"] = s.freeBlocks;
+  d["allocated_blocks"] = s.allocatedBlocks;
+  d["total_free_space"] = s.totalFreeSpace;
+  d["largest_free_block"] = s.largestFreeBlock;
+  d["heap_size"] = s.heapSize;
+  d["num_mem_objs"] = s.numMemObjs;
+  return std::move(d);
+}
+
 }  // namespace
 
 namespace mori {
@@ -187,6 +205,13 @@ void RegisterMoriShmem(py::module_& m) {
         "Returns 0 if connection uses RDMA or if pointer is invalid. "
         "Returns P2P accessible address if connection uses P2P transport.");
   m.def("shmem_num_qp_per_pe", &ShmemNumQpPerPe);
+
+  m.def("shmem_get_heap_stats", &ShmemGetHeapStats,
+        "Symmetric static-heap accounting (dict), or None if shmem is not in "
+        "static-heap mode. Keys: total_blocks, free_blocks, allocated_blocks, "
+        "total_free_space, largest_free_block, heap_size, num_mem_objs. Unlike "
+        "torch.cuda.mem_get_info these DO move when a symmetric allocation "
+        "leaks -- the whole static heap is hipMalloc'd once at shmem init.");
 }
 
 }  // namespace mori

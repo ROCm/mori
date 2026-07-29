@@ -371,3 +371,27 @@ def shmem_num_qp_per_pe():
         Number of QPs per PE
     """
     return mori_cpp.shmem_num_qp_per_pe()
+
+
+def shmem_get_heap_stats():
+    """Accounting for the symmetric static heap, or None if not in that mode.
+
+    Returns a dict with ``total_blocks``, ``free_blocks``, ``allocated_blocks``,
+    ``total_free_space``, ``largest_free_block``, ``heap_size`` and
+    ``num_mem_objs``.
+
+    Use this -- not ``torch.cuda.mem_get_info`` -- to check that a symmetric
+    allocation was really released. mori hipMallocs the whole static heap ONCE
+    at shmem init and then only carves virtual address ranges out of it, so
+    device-level free bytes do not move when ``shmem_free`` is called (or when
+    it is skipped). These counters come from the heap's own VA manager, so they
+    do:
+
+      - a leaked symmetric buffer shows up as ``allocated_blocks`` /
+        ``num_mem_objs`` above baseline and ``total_free_space`` below it;
+      - fragmentation shows up as ``largest_free_block`` shrinking while
+        ``total_free_space`` stays put.
+
+    Local to the calling rank; every rank has its own identically-sized heap.
+    """
+    return mori_cpp.shmem_get_heap_stats()

@@ -254,6 +254,29 @@ application::SymmMemObjPtr ShmemQueryMemObjPtr(void* localPtr) {
   return states->memoryStates->symmMemMgr->Get(localPtr);
 }
 
+int ShmemGetHeapStats(mori_shmem_heap_stats_t* out) {
+  if (out == nullptr) return -1;
+  *out = mori_shmem_heap_stats_t{};
+
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+
+  if (states->mode != ShmemMode::StaticHeap) {
+    // Only static-heap mode routes every symmetric allocation through one
+    // HeapVAManager; the other modes have nothing single to report.
+    return -1;
+  }
+
+  application::HeapVAManager* va = states->memoryStates->symmMemMgr->GetHeapVAManager();
+  if (va == nullptr) return -1;
+
+  va->GetStats(out->totalBlocks, out->freeBlocks, out->allocatedBlocks, out->totalFreeSpace,
+               out->largestFreeBlock);
+  out->heapSize = states->memoryStates->staticHeapSize;
+  out->numMemObjs = states->memoryStates->symmMemMgr->GetNumMemObjs();
+  return 0;
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    Buffer Registration APIs                                   */
 /* ---------------------------------------------------------------------------------------------- */

@@ -114,6 +114,28 @@ void ShmemFree(void*);
 // Note: temporary API for testing
 application::SymmMemObjPtr ShmemQueryMemObjPtr(void*);
 
+// Symmetric-heap accounting, for leak / fragmentation checks.
+//
+// The static heap is hipMalloc'd once at ShmemInit, so device-level free-byte
+// counters (hipMemGetInfo / torch.cuda.mem_get_info) are constant by
+// construction and cannot observe a ShmemFree that never happened. These
+// counters come from the heap's own VA manager and the SymmMemObj pool, so
+// they DO move when a symmetric allocation leaks. Used by the role-switch
+// buffer rebuild tests to prove reconfigure() returns every byte it took.
+struct mori_shmem_heap_stats_t {
+  size_t totalBlocks;        // VA blocks tracked by the heap (free + allocated)
+  size_t freeBlocks;         // free VA blocks; grows without bound if fragmenting
+  size_t allocatedBlocks;    // live symmetric allocations; must return to baseline
+  size_t totalFreeSpace;     // bytes reclaimable; must return to baseline
+  size_t largestFreeBlock;   // biggest contiguous run; the fragmentation signal
+  size_t heapSize;           // total static heap bytes (MORI_SHMEM_HEAP_SIZE)
+  size_t numMemObjs;         // SymmMemObj registrations; a second leak channel
+};
+
+// Fills *out. Returns 0 on success, -1 if shmem is not in static-heap mode
+// (VMM / Isolation modes do not have a single VA-managed heap to report on).
+int ShmemGetHeapStats(mori_shmem_heap_stats_t* out);
+
 int ShmemBufferRegister(void* ptr, size_t size);
 int ShmemBufferDeregister(void* ptr, size_t size);
 
