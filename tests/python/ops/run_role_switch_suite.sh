@@ -40,9 +40,16 @@ case "$mode" in
     else
       target="tests/python/ops/test_dispatch_combine_role_switch.py"
     fi
+    # tee to a full log, THEN tail. Piping straight into `tail` buffers the
+    # whole run, so a suite that hangs shows nothing at all until it exits --
+    # which is precisely when a live progress read is worth most. The T6
+    # regression run sat 18 min with two defunct workers and a 91-byte log for
+    # exactly this reason.
+    full="${MORI_TEST_FULL_LOG:-/tmp/mori_suite_full.log}"
     PYTHONPATH="$REPO/python" python -m pytest -q -s -p no:cacheprovider \
-      "$target" "$@" 2>&1 | tail -60
+      "$target" "$@" 2>&1 | tee "$full" | tail -60
     rc=${PIPESTATUS[0]}
+    echo "FULL_LOG=$full ($(wc -l < "$full") lines)"
     echo "PYTEST_RC=$rc"   # real pytest rc: set -o pipefail + PIPESTATUS[0]
     ;;
   *)
