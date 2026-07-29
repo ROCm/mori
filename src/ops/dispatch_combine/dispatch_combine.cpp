@@ -28,6 +28,7 @@
 #include <cstring>
 #include <new>
 #include <stdexcept>
+#include <string>
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/internal.hpp"
@@ -404,21 +405,53 @@ static constexpr int kNoMemset = -1000;
 // the contract sglang's role switch depends on. Untested error paths are how the
 // exit(-1) survived this long.
 //
-// Unset => never fires. ONE-SHOT: the variable is cleared as soon as it fires.
+// Unset => never fires. Fires MORI_TEST_FAIL_HIPMALLOC_TIMES times (default 1),
+// then disarms itself.
 //
-// It used to re-read the env on every call, which sabotaged the very path it
-// exists to test. Reconfigure()'s rollback re-runs InitializeAll() at the OLD
-// config, so a still-armed hook failed the rollback too -- turning every
-// injected "grow failed, rolled back, still usable" into "rollback also failed,
-// the op is finalized". A test cannot disarm between the two: they are both
-// inside the single reconfigure() call. Firing once models the real failure
-// (transient device-memory pressure at the larger size, which the smaller
-// rollback allocation then fits under) and leaves the rollback honest.
+// It used to re-read the env on every call with no limit, which sabotaged the
+// very path it exists to test. Reconfigure()'s rollback re-runs InitializeAll()
+// at the OLD config, so a permanently-armed hook failed the rollback too --
+// turning every injected "grow failed, rolled back, still usable" into "rollback
+// also failed, the op is finalized". A test cannot disarm between the two: they
+// are both inside the single reconfigure() call.
+//
+// So the count is the knob, and it selects which of the two contracts is under
+// test:
+//   TIMES=1 (default) -- the grow fails, the smaller rollback allocation fits.
+//     Models transient device-memory pressure at the larger size. Yields
+//     "could not grow ... still usable at the old capacity" (SEVERITY_ROLLED_BACK).
+//   TIMES=2 -- the rollback fails too, so the handle ends finalized. Yields
+//     "the op is now finalized and must be rebuilt" (SEVERITY_UNRECOVERABLE).
+//     That is the state RequireInitialized() in the pybind layer exists to
+//     protect, and the state sglang's MoriA2AResizeUnrecoverable escalation
+//     keys on; with a hard one-shot it was unreachable from any test, i.e. the
+//     SIGSEGV fixed in 85c34c18 could not be proven gone.
 static bool ShouldInjectAllocFailure(const char* what) {
   const char* target = env::Get("MORI_TEST_FAIL_HIPMALLOC");
   if ((target == nullptr) || (target[0] == '\0') || (what == nullptr)) return false;
   if (std::strcmp(target, what) != 0) return false;
-  ::unsetenv("MORI_TEST_FAIL_HIPMALLOC");
+
+  // Re-arming (a new test setting the var again, possibly to a different site)
+  // resets the count. Keyed on the target string so consecutive tests in one
+  // worker process do not inherit each other's remaining fires.
+  static std::string armedFor;
+  static int firesLeft = 0;
+  if (armedFor != target) {
+    armedFor = target;
+    const char* timesStr = env::Get("MORI_TEST_FAIL_HIPMALLOC_TIMES");
+    firesLeft = 1;
+    if ((timesStr != nullptr) && (timesStr[0] != '\0')) {
+      firesLeft = std::atoi(timesStr);
+    }
+    if (firesLeft < 1) firesLeft = 1;
+  }
+
+  firesLeft--;
+  if (firesLeft <= 0) {
+    // Disarm, and forget the target so a later re-arm at the same site works.
+    ::unsetenv("MORI_TEST_FAIL_HIPMALLOC");
+    armedFor.clear();
+  }
   return true;
 }
 
