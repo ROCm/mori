@@ -400,6 +400,15 @@ class EpDispatchCombineOp:
 
         Returns True if ANY rank reports failure. Used so that a partial resize
         (some ranks grew, some OOMed) never becomes the group's steady state.
+
+        The flag is a CPU tensor on purpose. The shmem group is whatever
+        `shmem_torch_process_group_init()` was handed, and in sglang that is
+        `group.cpu_group` (moriep.py) -- a gloo-only group. A CUDA tensor
+        all-reduced over a gloo group either fails or depends on gloo being
+        built with CUDA support, and this collective is the ONE thing standing
+        between a partial resize and corrupt peer pointers, so it must not be
+        the part that depends on the backend. One int over CPU is also cheaper
+        than a device round trip on a path that is already synchronous.
         """
         if not dist.is_initialized():
             return failed
@@ -407,7 +416,7 @@ class EpDispatchCombineOp:
             from mori.shmem import shmem_get_process_group
 
             group = shmem_get_process_group()
-        flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device="cuda")
+        flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device="cpu")
         dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
         return bool(flag.item())
 
