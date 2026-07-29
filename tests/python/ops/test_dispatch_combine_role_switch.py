@@ -444,6 +444,93 @@ def _worker_repeated_failed_flips_do_not_accumulate(rank, world_size):
     _run_once(op, config)
 
 
+def _worker_rank_asymmetric_failure(rank, world_size):
+    """ONE rank fails to grow while the other seven succeed.
+
+    This is the path REVIEW_M has called the riskiest untested one in the
+    feature since review #4, and it is the only one where the ranks do NOT run
+    identical allocation sequences. That matters concretely:
+    `RegisterStaticHeapSubRegion` computes each peer's address as
+    `heapObj->peerPtrs[i] + offset` -- it ASSUMES every rank landed at the same
+    VA offset in the symmetric heap, and there is no allgather that would catch
+    it if they did not. A first-fit VA manager only guarantees that while every
+    rank has performed the same alloc/free history. Here rank 0 does
+    Finalize -> Init(new, partial, throws) -> Finalize -> Init(old), while its
+    peers do Finalize -> Init(new) -> [agree] -> Finalize -> Init(old). If those
+    two histories can land at different offsets, every peer pointer on the
+    surviving ranks is silently wrong -- corruption, not a hang, and no
+    assertion about capacity would notice.
+
+    So the load-bearing assertion here is the LAST one: after the group has
+    given the capacity back, a real dispatch+combine still produces correct
+    numerics on every rank. `_run_once(check_results=True)` compares against a
+    CPU reference, and it is checked on all 8 ranks, so a peer pointer that
+    drifted on any rank shows up as a numeric mismatch.
+
+    Also covers the severity agreement: rank 0's failure must roll back cleanly
+    (SEVERITY_ROLLED_BACK, not UNRECOVERABLE), so every rank must raise, every
+    rank must end at the OLD capacity, and no rank may be left holding the new
+    one. A group where some ranks grew and others did not is corrupt.
+    """
+    import os
+
+    config = _make_config(rank, world_size, DECODE_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+    _run_once(op, config)
+
+    before = _heap_stats()
+
+    # Arm the injection on rank 0 ONLY. The hook is one-shot (it unsets the
+    # variable as it fires), so rank 0's rollback to DECODE_TOKENS is NOT
+    # sabotaged -- it must succeed, leaving rank 0 usable at the old capacity
+    # and the group's worst severity at ROLLED_BACK.
+    if rank == 0:
+        os.environ["MORI_TEST_FAIL_HIPMALLOC"] = "dispSenderIdxMap"
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
+    finally:
+        os.environ.pop("MORI_TEST_FAIL_HIPMALLOC", None)
+
+    message = str(excinfo.value)
+    # Every rank raises: the seven that succeeded must not silently keep the
+    # capacity they grew to, because their peers do not have it.
+    if rank == 0:
+        assert "could not grow" in message, f"rank 0: {message}"
+    else:
+        assert "another rank in the EP group" in message, f"rank {rank}: {message}"
+    # Nobody may report the group as unusable -- rank 0's rollback succeeded.
+    assert "must be rebuilt" not in message, f"rank {rank}: {message}"
+    assert "GROUP is not usable" not in message, f"rank {rank}: {message}"
+
+    # All 8 ranks are back at the OLD capacity, including the 7 that grew fine.
+    _assert_capacity(op, DECODE_TOKENS)
+
+    # THE ASSERTION THAT MATTERS: correct numerics after the divergence. If the
+    # differing alloc/free histories desynchronized peer VA offsets, this is
+    # where it surfaces.
+    _run_once(op, config)
+
+    # And the divergence cost the heap nothing on any rank.
+    after = _heap_stats()
+    if before is not None and after is not None:
+        assert after["total_free_space"] == before["total_free_space"], (
+            f"rank {rank}: rank-asymmetric failed flip leaked symmetric heap: "
+            f"{before['total_free_space']} -> {after['total_free_space']}"
+        )
+        assert after["num_mem_objs"] == before["num_mem_objs"], (
+            f"rank {rank}: rank-asymmetric failed flip leaked symmetric objects: "
+            f"{before['num_mem_objs']} -> {after['num_mem_objs']}"
+        )
+
+    # The group is still flippable: a subsequent real flip must work on all
+    # ranks and still compute correctly. This is what sglang relies on to keep
+    # serving after an aborted role switch.
+    op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
+    _assert_capacity(op, PREFILL_TOKENS)
+    _run_once(op, config)
+
+
 def _worker_reconfigure_rejects_immutable_fields(rank, world_size):
     """numQpPerPe / useExternalInpBuffer are peer-visible; they must be frozen.
 
@@ -759,6 +846,15 @@ def test_repeated_failed_flips_do_not_accumulate(
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_repeated_failed_flips_do_not_accumulate, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+def test_rank_asymmetric_failure(torch_dist_process_manager, world_size):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_rank_asymmetric_failure, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
