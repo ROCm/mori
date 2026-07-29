@@ -27,6 +27,8 @@ role for a small per-step batch. On a flip the buffers must be freed and
 re-allocated for the new capacity, in place, with the shmem context intact --
 and dispatch/combine must still be numerically correct afterwards.
 """
+import os
+
 import pytest
 import torch
 
@@ -37,8 +39,23 @@ from tests.python.ops.dispatch_combine_test_utils import (
 )
 
 # "prefill" (large chunked-prefill token count) vs "decode" (per-step batch).
+# Small on purpose: 19 tests share these, several of them 10-20 cycle stress
+# loops, and the injection tests need headroom in the symmetric heap. A 16x flip
+# exercises every code path a 32x one does.
 PREFILL_TOKENS = 128
 DECODE_TOKENS = 8
+
+# The capacities sglang ACTUALLY issues, measured by Team E on a live
+# DeepSeek EP+a2a server (COORD [E, turn 3]; worktrees/teamE/results/
+# buffer_gap_v2.txt): prefill 4096, decode 128. Two orders of magnitude more
+# memory than the values above and a 32x rather than 16x ratio, so the paths
+# that only fail at scale -- a grow that does not fit, a shrink that fragments --
+# are not reachable from the defaults. Used by the real-capacity test below,
+# which is separate rather than a re-parametrization of the whole suite: at
+# 4096 the leak-stress and injection tests would spend minutes and risk failing
+# for heap-size reasons that say nothing about the code under test.
+REAL_PREFILL_TOKENS = int(os.environ.get("MORI_TEST_REAL_PREFILL_TOKENS", "4096"))
+REAL_DECODE_TOKENS = int(os.environ.get("MORI_TEST_REAL_DECODE_TOKENS", "128"))
 
 
 # Kernel types reachable with a single node of 8 GPUs. The InterNode* paths
@@ -243,6 +260,75 @@ def _worker_finalize_returns_everything(rank, world_size):
         f"{after['num_mem_objs'] - before['num_mem_objs']} SymmMemObj "
         f"registrations (before={before} after={after})"
     )
+
+
+def _worker_flip_at_real_capacities(rank, world_size):
+    """The flip sglang ACTUALLY issues: 4096 <-> 128, not 128 <-> 8.
+
+    Every other test in this module runs a 16x flip at two orders of magnitude
+    less memory. REVIEW_M has carried that gap since review #7 for a concrete
+    reason: the D->P grow is the OOM direction sglang sizes on, and "128 -> 4096
+    works" is not evidence for it. At these capacities the symmetric buffers are
+    real -- MaxNumTokensToSend scales with maxNumInpTokenPerRank and the order
+    maps scale with it times numExpertPerRank -- so a grow that does not fit or
+    a free that fragments has somewhere to show.
+
+    P -> D -> P with numerics checked at every capacity, plus the heap
+    accounting: the closed loop must return the symmetric heap EXACTLY to its
+    starting numbers. Exact, not approximate, because mori's static heap is a
+    deterministic first-fit VA manager and not a caching allocator, so a closed
+    P->D->P loop that does not land on identical counters has leaked or
+    fragmented.
+
+    Skips itself rather than failing when the heap cannot hold the large
+    capacity: a run that dies because MORI_SHMEM_HEAP_SIZE is too small on a
+    busy node says nothing about the code under test, and three turns of this
+    campaign were lost to not distinguishing those two.
+    """
+    config = _make_config(rank, world_size, REAL_PREFILL_TOKENS)
+    before = _heap_stats()
+
+    try:
+        op = mori.ops.EpDispatchCombineOp(config)
+    except Exception as exc:  # heap too small for the real capacity on this node
+        if "heap" in str(exc).lower() or "memory" in str(exc).lower():
+            return
+        raise
+
+    _run_once(op, config)
+    _assert_capacity(op, REAL_PREFILL_TOKENS)
+    after_build = _heap_stats()
+
+    # D: the shrink sglang performs on a P->D flip.
+    op.reconfigure(max_num_inp_token_per_rank=REAL_DECODE_TOKENS)
+    _assert_capacity(op, REAL_DECODE_TOKENS)
+    _run_once(op, _make_config(rank, world_size, REAL_DECODE_TOKENS))
+
+    # P again: the GROW, which is the direction that can OOM.
+    op.reconfigure(max_num_inp_token_per_rank=REAL_PREFILL_TOKENS)
+    _assert_capacity(op, REAL_PREFILL_TOKENS)
+    _run_once(op, config)
+
+    after_cycle = _heap_stats()
+    if after_build is not None and after_cycle is not None:
+        assert after_cycle["total_free_space"] == after_build["total_free_space"], (
+            f"rank {rank}: a {REAL_PREFILL_TOKENS}->{REAL_DECODE_TOKENS}->"
+            f"{REAL_PREFILL_TOKENS} flip did not return the heap to its starting "
+            f"state: {after_build} -> {after_cycle}"
+        )
+        assert after_cycle["num_mem_objs"] == after_build["num_mem_objs"], (
+            f"rank {rank}: symmetric object count moved across a closed flip "
+            f"loop: {after_build} -> {after_cycle}"
+        )
+
+    # And the teardown returns everything, at the real size.
+    op.finalize()
+    after_final = _heap_stats()
+    if before is not None and after_final is not None:
+        assert after_final["total_free_space"] == before["total_free_space"], (
+            f"rank {rank}: finalize() at the real capacity leaked "
+            f"{before['total_free_space'] - after_final['total_free_space']} bytes"
+        )
 
 
 def _worker_finalized_getters_raise(rank, world_size):
@@ -1131,6 +1217,15 @@ def test_rank_asymmetric_unrecoverable(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_rank_asymmetric_unrecoverable, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+def test_flip_at_real_capacities(torch_dist_process_manager, world_size):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_flip_at_real_capacities, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
