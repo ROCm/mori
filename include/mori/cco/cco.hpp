@@ -1406,7 +1406,14 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
     const uint64_t base = handle.ReserveSlot(kSlot, shared);
     ccoSdmaFillSlot<localSignal, remoteSignal>(handle, base, localTarget, remoteTarget, srcBuf,
                                                dstBuf, copy_size);
-    if constexpr (kRing) handle.submitPacket(base, base + kSlot);
+    if constexpr (kRing) {
+      handle.submitPacket(base, base + kSlot);
+    } else {
+      // Aggregate: nobody rings here, and the commit() that eventually does may
+      // be another wave, whose s_waitcnt cannot cover our stores. Publish now or
+      // it can ring over a half-written packet.
+      __builtin_amdgcn_s_waitcnt(0);
+    }
   };
 
   const uint64_t active = ccoSdmaBallot(true);
