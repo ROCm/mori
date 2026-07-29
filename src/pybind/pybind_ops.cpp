@@ -358,6 +358,11 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("gpu_per_node", &mori::moe::EpDispatchCombineConfig::gpuPerNode)
       .def_readwrite("rdma_block_num", &mori::moe::EpDispatchCombineConfig::rdmaBlockNum)
       .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe)
+      // Readable/writable so the role-switch tests can prove Reconfigure()
+      // rejects a change to it; it is a ctor kwarg but was not exposed as an
+      // attribute.
+      .def_readwrite("use_external_inp_buf",
+                     &mori::moe::EpDispatchCombineConfig::useExternalInpBuffer)
       .def_readwrite("quant_type", &mori::moe::EpDispatchCombineConfig::quantType)
       .def("to_packed_array", &mori::moe::EpDispatchCombineConfig::ToPackedI32Array)
       .def("max_num_tokens_to_recv", &mori::moe::EpDispatchCombineConfig::MaxNumTokensToRecv)

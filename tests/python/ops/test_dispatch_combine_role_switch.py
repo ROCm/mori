@@ -173,6 +173,92 @@ def _worker_reconfigure_rejects_layout_change(rank, world_size):
     _run_once(op, config)
 
 
+def _worker_reconfigure_oom_rolls_back(rank, world_size):
+    """A resize that does not fit must leave the op usable at the OLD capacity.
+
+    This is the D->P (decode -> prefill) direction, where the buffers GROW: per
+    the E2E team's measurement the decode role runs with the larger
+    chunked_prefill_size, so a flip into prefill is the one that can exhaust the
+    symmetric heap. Before the rollback existed, a failure here left the handle
+    with buffersInitialized=False and half-built buffers -- worse than not
+    having flipped at all.
+    """
+    config = _make_config(rank, world_size, PREFILL_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+    _run_once(op, config)
+
+    # Far past the default 2 GiB MORI_SHMEM_HEAP_SIZE: the dispatch-out buffer
+    # alone would be 2**24 * 8 * 4096 * 4 B. Every rank fails identically, so
+    # this exercises the C++ per-rank rollback rather than the cross-rank
+    # disagreement path.
+    with pytest.raises(RuntimeError) as excinfo:
+        op.reconfigure(max_num_inp_token_per_rank=1 << 24)
+    assert "could not grow" in str(excinfo.value)
+
+    # The whole point: still alive, still at the old size, still correct.
+    _assert_capacity(op, PREFILL_TOKENS)
+    _run_once(op, config)
+
+    # ...and a subsequent legitimate flip still works, i.e. the failed attempt
+    # did not poison the heap.
+    op.reconfigure(max_num_inp_token_per_rank=DECODE_TOKENS)
+    _assert_capacity(op, DECODE_TOKENS)
+    _run_once(op, config)
+
+
+def _worker_reconfigure_rejects_immutable_fields(rank, world_size):
+    """numQpPerPe / useExternalInpBuffer are peer-visible; they must be frozen.
+
+    Reconfigure does NOT rebuild the shmem context that owns numQpPerPe, and
+    use_external_inp_buf decides whether the dispatch input buffer is allocated
+    at all -- letting either change would desynchronize the symmetric layout.
+    """
+    config = _make_config(rank, world_size, PREFILL_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+
+    for field, bad_value in (
+        ("use_external_inp_buf", not config.use_external_inp_buf),
+        ("num_qp_per_pe", op._cpp_config.num_qp_per_pe + 1),
+    ):
+        good = getattr(op._cpp_config, field)
+        setattr(op._cpp_config, field, bad_value)
+        try:
+            with pytest.raises(RuntimeError, match="must not change"):
+                op._handle.reconfigure(op._cpp_config)
+        finally:
+            setattr(op._cpp_config, field, good)
+
+    _assert_capacity(op, PREFILL_TOKENS)
+    _run_once(op, config)
+
+
+def _worker_heap_fragmentation(rank, world_size, cycles):
+    """After N grow/shrink cycles the heap must still admit the LARGE size.
+
+    mori's static heap is a first-fit VA manager with coalescing
+    (`HeapVAManager`). Repeated free-then-realloc-at-a-different-size is
+    exactly the pattern that fragments a first-fit allocator, and a role switch
+    does it once per flip. If cycle N could allocate prefill capacity but cycle
+    N+1 cannot, the feature has a hard lifetime limit -- that would be a real
+    negative result worth reporting, so assert it explicitly rather than
+    trusting coalescing.
+    """
+    config = _make_config(rank, world_size, PREFILL_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+
+    # Vary the requested capacity so successive allocations are NOT the same
+    # size -- same-size realloc trivially reuses the just-freed block and would
+    # not exercise fragmentation at all.
+    for i in range(cycles):
+        op.reconfigure(max_num_inp_token_per_rank=DECODE_TOKENS + i)
+        op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS + i)
+
+    # The real assertion: the largest size still fits after all that churn.
+    op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
+    _assert_capacity(op, PREFILL_TOKENS)
+    _run_once(op, config)
+
+
 def _worker_reconfigure_noop_and_finalize(rank, world_size):
     """Same-capacity reconfigure is a no-op; finalize is idempotent."""
     config = _make_config(rank, world_size, PREFILL_TOKENS)
@@ -243,5 +329,35 @@ def test_reconfigure_noop_and_finalize(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_reconfigure_noop_and_finalize, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+def test_reconfigure_oom_rolls_back(torch_dist_process_manager, world_size):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_reconfigure_oom_rolls_back, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+def test_reconfigure_rejects_immutable_fields(torch_dist_process_manager, world_size):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_reconfigure_rejects_immutable_fields, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("cycles", (20,))
+def test_reconfigure_heap_fragmentation(
+    torch_dist_process_manager, world_size, cycles
+):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_heap_fragmentation, [world_size, cycles])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
