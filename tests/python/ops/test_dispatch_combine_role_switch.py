@@ -145,7 +145,10 @@ def _worker_leak_stress(rank, world_size, cycles):
 
     baseline = _heap_stats()
     if baseline is None:
-        pytest.skip("shmem is not in static-heap mode; no heap accounting to check")
+        # Return, do NOT pytest.skip(): this runs in a worker process, and
+        # `Skipped` is a BaseException, so the worker's `except Exception`
+        # would miss it and leave the parent blocked on result_queue.get().
+        return
 
     # Baseline is taken AFTER the first dispatch/combine so that any buffer
     # allocated lazily on first use is already counted; from here every cycle
@@ -205,7 +208,8 @@ def _worker_finalize_returns_everything(rank, world_size):
     """
     before = _heap_stats()
     if before is None:
-        pytest.skip("shmem is not in static-heap mode; no heap accounting to check")
+        # Return, not pytest.skip() -- see _worker_leak_stress.
+        return
 
     config = _make_config(rank, world_size, PREFILL_TOKENS)
     op = mori.ops.EpDispatchCombineOp(config)

@@ -138,7 +138,11 @@ class TorchDistProcessManager:
                 try:
                     result = func(rank, *args)
                     result_queue.put((rank, result))
-                except Exception:
+                except BaseException:
+                    # BaseException, not Exception: pytest's Skipped/Failed and
+                    # SystemExit derive from BaseException, and letting one
+                    # escape here exits the loop without ever reporting, which
+                    # blocks the parent's collective get() forever.
                     result_queue.put((rank, traceback.format_exc()))
 
     def start_workers(self, world_size):

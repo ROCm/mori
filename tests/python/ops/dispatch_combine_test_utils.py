@@ -19,6 +19,10 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import os
+import queue
+import time
+
 import pytest
 from tests.python.utils import TorchDistProcessManager, data_type_supported
 import mori
@@ -340,10 +344,35 @@ def start_torch_dist_process_manager(world_size=8, disable_p2p=False):
     return manager
 
 
-def assert_worker_results(manager, world_size):
+# A worker that dies without putting anything on the queue (hipMalloc failure ->
+# HIP_RUNTIME_CHECK -> exit(-1), a segfault, or an OOM kill) used to block this
+# collective get() forever, turning any crash into an unkillable test run. Bound
+# it: a timeout must surface as a test FAILURE naming the silent ranks.
+RESULT_TIMEOUT_S = float(os.environ.get("MORI_TEST_RESULT_TIMEOUT", "600"))
+
+
+def assert_worker_results(manager, world_size, timeout=None):
+    timeout = RESULT_TIMEOUT_S if timeout is None else timeout
+    deadline = time.monotonic() + timeout
     results = []
     for _ in range(world_size):
-        rank, result = manager.result_queue.get()
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            rank, result = manager.result_queue.get(timeout=remaining)
+        except queue.Empty:
+            reported = sorted(r for r, _ in results)
+            silent = [r for r in range(world_size) if r not in reported]
+            exits = [
+                (i, p.exitcode) for i, p in enumerate(getattr(manager, "processes", []))
+            ]
+            pytest.fail(
+                f"timed out after {timeout:.0f}s waiting for worker results: "
+                f"{len(results)}/{world_size} reported, ranks {silent} silent. "
+                f"A silent rank exited without reporting -- look for an exit(-1) "
+                f"from HIP_RUNTIME_CHECK, a segfault, or an OOM kill in the "
+                f"captured stderr (run with -s). worker exitcodes: {exits}",
+                pytrace=False,
+            )
         results.append((rank, result))
 
     for _, result in sorted(results, key=lambda item: item[0]):
