@@ -35,6 +35,23 @@ _shmem_module_loaded_gpus: set = set()
 # Cached hsaco path (compilation is arch-specific, not instance-specific).
 _shmem_hsaco: str = ""
 
+# The torch process group shmem was bootstrapped from, if it was bootstrapped
+# from one. The symmetric heap is per-group, so any collective that mutates it
+# (notably EpDispatchCombineOp.finalize/reconfigure, which free and re-allocate
+# symmetric buffers) must run over THIS group and not the world group -- a
+# caller such as sglang can have an EP group that is a strict subset of the
+# world (attention-DP), where a world barrier would simply hang.
+_shmem_process_group = None
+
+
+def shmem_get_process_group():
+    """Return the torch process group shmem was initialized from, or None.
+
+    None means shmem was bootstrapped some other way (MPI / raw UniqueId) and
+    the caller must supply its own group for shmem-heap collectives.
+    """
+    return _shmem_process_group
+
 
 def _current_hip_device() -> int:
     """Return the calling thread's current HIP device id.
@@ -106,7 +123,9 @@ def shmem_torch_process_group_init(group_name: str):
 
     _ensure_shmem_module()
 
+    global _shmem_process_group
     group = dist.distributed_c10d._resolve_process_group(group_name)
+    _shmem_process_group = group
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
 
@@ -164,6 +183,8 @@ def shmem_finalize():
         Status code (0 for success)
     """
     ret = mori_cpp.shmem_finalize()
+    global _shmem_process_group
+    _shmem_process_group = None
     # Clear this GPU's module-loaded flag so a subsequent shmem_init_attr
     # call (e.g. in the next test round) will reload the JIT module.
     try:

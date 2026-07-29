@@ -373,20 +373,70 @@ class EpDispatchCombineOp:
             self.config.num_experts_per_rank, dtype=torch.int32, device="cuda"
         )
 
-    def finalize(self):
+    @staticmethod
+    def _shmem_barrier(group):
+        """Barrier over the group that owns the symmetric heap.
+
+        NOT the world group: mori's heap belongs to whatever process group
+        shmem_torch_process_group_init() was called with, and a caller such as
+        sglang can have an EP group that is a strict subset of the world (with
+        attention-DP). Barriering on the world group while only the EP ranks
+        are reconciling deadlocks the flip -- exactly the failure mode this
+        work exists to prevent.
+        """
+        if not dist.is_initialized():
+            return
+        if group is None:
+            from mori.shmem import shmem_get_process_group
+
+            group = shmem_get_process_group()
+        # group=None here means shmem was not bootstrapped from a torch group
+        # (MPI / raw UniqueId), in which case world IS the shmem group.
+        dist.barrier(group=group)
+
+    @staticmethod
+    def _agree_on_failure(group, failed):
+        """All-reduce a local failure flag over the shmem group.
+
+        Returns True if ANY rank reports failure. Used so that a partial resize
+        (some ranks grew, some OOMed) never becomes the group's steady state.
+        """
+        if not dist.is_initialized():
+            return failed
+        if group is None:
+            from mori.shmem import shmem_get_process_group
+
+            group = shmem_get_process_group()
+        flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device="cuda")
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
+        return bool(flag.item())
+
+    def finalize(self, *, group=None):
         """Release the all-to-all buffers held by this op.
 
         Collective across the EP group: every rank must call it, the same
         number of times and in the same order, with no dispatch/combine in
         flight. Idempotent. The op is unusable afterwards until it is rebuilt.
+
+        Args:
+            group: process group to synchronize over. Defaults to the group
+                shmem was initialized with (see :meth:`_shmem_barrier`).
         """
+        self._shmem_barrier(group)
         self._handle.finalize()
+        self._shmem_barrier(group)
 
     @property
     def is_initialized(self):
         return self._handle.is_initialized
 
-    def reconfigure(self, *, max_num_inp_token_per_rank=None, max_total_recv_tokens=None):
+    def reconfigure(
+        self,
+        *,
+        max_num_inp_token_per_rank=None,
+        max_total_recv_tokens=None,
+        group=None,
+    ):
         """Resize the a2a buffers in place for a new per-rank token capacity.
 
         This is the mori side of an sglang PD role switch: a prefill role sizes
@@ -411,21 +461,60 @@ class EpDispatchCombineOp:
         ):
             return  # nothing to do; avoid a pointless collective free/alloc
 
-        if dist.is_initialized():
-            # The symmetric heap is allocated in lockstep, so no rank may start
-            # freeing while another is still using the old buffers.
-            dist.barrier()
+        # The symmetric heap is allocated in lockstep, so no rank may start
+        # freeing while another is still using the old buffers.
+        self._shmem_barrier(group)
+
+        prev_inp = self._cpp_config.max_num_inp_token_per_rank
+        prev_recv = self._cpp_config.max_total_recv_tokens
+
+        def _restore_mirror():
+            # Point the python mirror configs back at what the buffers ACTUALLY
+            # are. The C++ side either rejected the change before freeing
+            # anything (ValidateReconfigurable) or rolled back to the old
+            # capacity, so in both cases the live buffers are the old ones.
+            # Leaving _cpp_config lying would make max_num_tokens_to_recv()
+            # over-report against smaller buffers -- a silent overrun.
+            self._cpp_config.max_num_inp_token_per_rank = prev_inp
+            self._cpp_config.max_total_recv_tokens = prev_recv
+            self.config.max_num_inp_token_per_rank = prev_inp
+            self.config.max_total_recv_tokens = prev_recv
+            self._refresh_handle_state()
 
         self._cpp_config.max_num_inp_token_per_rank = max_num_inp_token_per_rank
         self._cpp_config.max_total_recv_tokens = max_total_recv_tokens
-        self._handle.reconfigure(self._cpp_config)
+        local_err = None
+        try:
+            self._handle.reconfigure(self._cpp_config)
+        except Exception as exc:  # OOM on the growing (decode->prefill) flip
+            local_err = exc
+            _restore_mirror()
+        else:
+            self.config.max_num_inp_token_per_rank = max_num_inp_token_per_rank
+            self.config.max_total_recv_tokens = max_total_recv_tokens
+            self._refresh_handle_state()
 
-        self.config.max_num_inp_token_per_rank = max_num_inp_token_per_rank
-        self.config.max_total_recv_tokens = max_total_recv_tokens
-        self._refresh_handle_state()
+        # A resize is only meaningful if EVERY rank did it: the buffers are
+        # symmetric, so a group where some ranks grew and others did not is
+        # corrupt, not merely degraded. Agree on the outcome, and if any rank
+        # failed, the ranks that succeeded give the capacity back.
+        if self._agree_on_failure(group, local_err is not None):
+            if local_err is None:
+                self._cpp_config.max_num_inp_token_per_rank = prev_inp
+                self._cpp_config.max_total_recv_tokens = prev_recv
+                self._handle.reconfigure(self._cpp_config)
+                _restore_mirror()
+            self._shmem_barrier(group)
+            if local_err is not None:
+                raise local_err
+            raise RuntimeError(
+                "EpDispatchCombineOp.reconfigure: another rank in the EP group could "
+                f"not resize its a2a buffers to max_num_inp_token_per_rank="
+                f"{max_num_inp_token_per_rank}; this rank rolled back to {prev_inp}. "
+                "The whole group is still usable at the old capacity."
+            )
 
-        if dist.is_initialized():
-            dist.barrier()
+        self._shmem_barrier(group)
 
     # ------------------------------------------------------------------
     # Kernel launch helpers
