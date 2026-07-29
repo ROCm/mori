@@ -172,17 +172,25 @@ static int gpuAgentIndexForHipDevice(int hipDeviceId) {
   std::sscanf(busId.c_str(), "%x:%x:%x.%x", &domain, &bus, &dev, &func);
   uint32_t hipBdf = ((bus & 0xFF) << 8) | ((dev & 0x1F) << 3) | (func & 0x7);
 
-  int match = hipDeviceId;  // safe fallback: identity (also correct when aligned)
+  // HSA_AMD_AGENT_INFO_BDFID exposes only the 16-bit bus/device/function, not the
+  // PCI domain, so on a multi-segment machine two GPUs can share the same 16-bit
+  // BDF. Only trust the match when it is UNIQUE; otherwise keep the identity
+  // fallback rather than risk selecting the wrong agent. domain is parsed but
+  // cannot be matched against the HSA side.
+  (void)domain;
+  int match = hipDeviceId;  // identity fallback (also correct when HIP and HSA order align)
+  int nMatch = 0, firstMatch = -1;
   for (size_t a = 0; a < gpuAgents_.size(); ++a) {
     uint32_t bdfid = 0;
     if (hsa_agent_get_info(gpuAgents_[a], (hsa_agent_info_t)HSA_AMD_AGENT_INFO_BDFID, &bdfid) !=
         HSA_STATUS_SUCCESS)
       continue;
     if ((bdfid & 0xFFFF) == (hipBdf & 0xFFFF)) {
-      match = static_cast<int>(a);
-      break;
+      ++nMatch;
+      if (firstMatch < 0) firstMatch = static_cast<int>(a);
     }
   }
+  if (nMatch == 1) match = firstMatch;
   hipToAgent[hipDeviceId] = match;
   return match;
 }

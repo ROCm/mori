@@ -172,6 +172,13 @@ void Context::CollectHostNames() {
 // / Context::IsP2PDisabled() instead of getenv anywhere outside the
 // constructor.
 
+int Context::SameHostPeersBefore(int rank) const {
+  int n = 0;
+  for (int j = 0; j < rank; j++)
+    if (peerInfos[j].sameHost) n++;
+  return n;
+}
+
 void Context::InitializeTopologyAndTransports() {
   // Find my rank in node
   for (int i = 0; i <= LocalRank(); i++) {
@@ -351,15 +358,11 @@ void Context::EnsureSdmaTransport() {
 
   // Within-node HIP device id = count of same-host peers before the rank
   // (not globalRank % 8, which faults under sliced HIP_VISIBLE_DEVICES).
-  int localDevId = 0;
-  for (int j = 0; j < LocalRank(); j++)
-    if (peerInfos[j].sameHost) localDevId++;
+  int localDevId = SameHostPeersBefore(LocalRank());
   for (int i = 0; i < WorldSize(); i++) {
     if (!peerCaps[i].canSDMA) continue;
     // Peer within-node device id: count of same-host peers before it.
-    int peerDevId = 0;
-    for (int j = 0; j < i; j++)
-      if (peerInfos[j].sameHost) peerDevId++;
+    int peerDevId = SameHostPeersBefore(i);
     if (i != LocalRank()) anvil::EnablePeerAccess(localDevId, peerDevId);
     anvil::anvil.connect(localDevId, peerDevId, sdmaNumChannels);
   }

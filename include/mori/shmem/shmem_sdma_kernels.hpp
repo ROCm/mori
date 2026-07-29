@@ -40,16 +40,17 @@ template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
-  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are
-                         // host-populated per global pe (symmetric_memory.cpp)
+  // deviceHandles_d/signalPtrs/expectSignalsPtr are host-populated per GLOBAL pe
+  // (symmetric_memory.cpp), so index them by the global pe.
+  int peSlot = pe;
   uint8_t* srcPtr =
       reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
 
   anvil::SdmaQueueDeviceHandle** devicehandles =
-      dest->deviceHandles_d + intraNodePe * dest->sdmaNumQueue;
-  HSAuint64* signalAddr = dest->signalPtrs + intraNodePe * dest->sdmaNumQueue;
-  HSAuint64* expectedSignals = dest->expectSignalsPtr + intraNodePe * dest->sdmaNumQueue;
+      dest->deviceHandles_d + peSlot * dest->sdmaNumQueue;
+  HSAuint64* signalAddr = dest->signalPtrs + peSlot * dest->sdmaNumQueue;
+  HSAuint64* expectedSignals = dest->expectSignalsPtr + peSlot * dest->sdmaNumQueue;
 
   core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, signalAddr, expectedSignals,
                       dest->sdmaNumQueue, qpId);
@@ -59,16 +60,17 @@ template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
-  int intraNodePe = pe;  // index by GLOBAL pe: deviceHandles_d/signalPtrs/expectSignalsPtr are
-                         // host-populated per global pe (symmetric_memory.cpp)
+  // deviceHandles_d/signalPtrs/expectSignalsPtr are host-populated per GLOBAL pe
+  // (symmetric_memory.cpp), so index them by the global pe.
+  int peSlot = pe;
   uint8_t* srcPtr =
       reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
 
   anvil::SdmaQueueDeviceHandle** devicehandles =
-      dest->deviceHandles_d + intraNodePe * dest->sdmaNumQueue;
-  HSAuint64* signalAddr = dest->signalPtrs + intraNodePe * dest->sdmaNumQueue;
-  HSAuint64* expectedSignals = dest->expectSignalsPtr + intraNodePe * dest->sdmaNumQueue;
+      dest->deviceHandles_d + peSlot * dest->sdmaNumQueue;
+  HSAuint64* signalAddr = dest->signalPtrs + peSlot * dest->sdmaNumQueue;
+  HSAuint64* expectedSignals = dest->expectSignalsPtr + peSlot * dest->sdmaNumQueue;
 
   core::SdmaPutWarp(srcPtr, dstPtr, bytes, devicehandles, signalAddr, expectedSignals,
                     dest->sdmaNumQueue);

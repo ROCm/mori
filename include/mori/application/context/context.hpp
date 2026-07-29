@@ -176,6 +176,9 @@ class Context {
   };
 
  private:
+  // Number of same-host peers with rank < `rank` (a peer's within-node device id).
+  int SameHostPeersBefore(int rank) const;
+
   BootstrapNetwork& bootNet;
   int rankInNode{-1};
   int numQpPerPe{4};
