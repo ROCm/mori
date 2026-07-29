@@ -281,7 +281,7 @@ def _worker_finalized_getters_raise(rank, world_size):
     # (callable, name). Each is invoked with only the handle plus whatever
     # scalars it needs; none of them may touch the freed buffers before the
     # guard runs.
-    from mori import mori_cpp
+    from mori import cpp as mori_cpp
 
     probes = [
         (lambda: mori_cpp.get_dispatch_output_ptrs(op._handle), "get_dispatch_output_ptrs"),
