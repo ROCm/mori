@@ -17,6 +17,9 @@ peer-to-peer copies that do not occupy CUs. It is a device-side API in
 
 Only for peers on the same node (LSA). Cross-node goes through `ccoGda`.
 
+Every number quoted below was measured on MI355X (gfx950), two ranks over
+intra-node xGMI. Treat them as shape, not as a spec.
+
 ## Turning it on
 
 Build: SDMA is compiled out unless both are set.
@@ -122,7 +125,7 @@ several lanes of one wave call `put` at once.
 
 **Reach for `SameQueue` first.** Lanes sharing a queue post as one group — one
 reservation, one doorbell — so a whole wave's worth of packets costs about what
-one costs. Measured on gfx950, one warp, one packet per lane:
+one costs. Measured with one warp, one packet per lane:
 
 | lanes | spread over 8 queues | one queue, `SameQueue` |
 |---|---|---|
@@ -175,7 +178,7 @@ call syncs the group before returning, so the completion is visible to everyone.
 | `localSignal` + `waitSignal` | you want the last ~0.1–0.6 µs, or partial completion | you maintain `expected` |
 
 `waitSignal` is slightly faster than `quiet` at every size (0.24 µs at 8B, 0.62
-at 64KB on gfx950) because the signal slot is ordinary device memory while the
+at 64KB) because the signal slot is ordinary device memory while the
 queue read pointer is not. `quiet` needs no bookkeeping — prefer it unless the
 difference matters.
 
@@ -240,6 +243,35 @@ and each warp owns a queue.
 Queues do not make a single transfer faster: one peer is one xGMI link, so
 splitting a copy across queues gains nothing. They exist to let independent
 issuers proceed in parallel.
+
+## Transfer size
+
+Bandwidth is a function of **bytes per op** and nothing else. Scope, direction
+and queue count do not enter into it:
+
+| bytes per op | GB/s |
+|---|---|
+| 64 KB | 17 |
+| 128 KB | 26 |
+| 256 KB | 36 |
+| 512 KB | 46 |
+| 1 MB | 52 |
+| 2 MB | 56 |
+| 4 MB | 59 |
+| 8 MB | 60 |
+
+`put` and `get` land within 1% of each other, and `thread`/`warp`/`block` are
+indistinguishable at equal bytes per op. Half of the achievable bandwidth is
+already gone at 512 KB, and below ~256 KB the fixed ~6 µs dispatch cost
+dominates whatever the copy itself does.
+
+So the only lever for bandwidth is **not splitting the transfer**. Two ops of
+4 MB reach 57 GB/s where one op of 8 MB reaches 60, even on separate queues —
+splitting always costs, in proportion to how small the pieces get. Issue the
+largest contiguous copy you have and let one engine drain it.
+
+Below ~256 KB you are latency-bound, not bandwidth-bound; that is the regime
+where warp aggregation and `SameQueue` matter and transfer size does not.
 
 ## Failure modes
 
