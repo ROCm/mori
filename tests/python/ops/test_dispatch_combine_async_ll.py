@@ -470,3 +470,131 @@ def test_dispatch_local_expert_count(
         )
 
     assert_worker_results(torch_dist_process_manager, world_size)
+
+
+# ---------------------------------------------------------------------------
+# Slot-assignment lane-tiling regression (AsyncLL)
+#
+# When top-k does not divide warpSize, SlotAssign's trailing lanes alias the next
+# warp's first token, so one entry gets two slots and the orphan is never written
+# by SendCopyMultiBlock -- the receiver reads untouched memory as a token.
+#
+# check_dispatch_result cannot run at non-multiple-of-8 top-k, which is why this
+# went unnoticed. The invariants below are top-k agnostic; an orphan slot breaks
+# all three.
+# ---------------------------------------------------------------------------
+
+
+class _AsyncLLRecvCountTestCase(AsyncLLDispatchCombineTestCase):
+    def check_dispatch_result(
+        self,
+        op,
+        test_data,
+        dispatch_output,
+        dispatch_weights,
+        dispatch_scales,
+        dispatch_indices,
+        dispatch_recv_num_token,
+    ):
+        self.sync()
+        all_rank_num_token, all_rank_indices = test_data[0], test_data[1]
+        my_pe = self.config.rank
+        world_size = self.config.world_size
+
+        # Each source token routing to any expert of mine must arrive exactly once.
+        expected = 0
+        for src_rank in range(world_size):
+            for t in range(int(all_rank_num_token[src_rank])):
+                pes = {
+                    int(idx) // self.config.num_experts_per_rank
+                    for idx in all_rank_indices[src_rank][t].cpu().tolist()
+                    if idx >= 0
+                }
+                expected += my_pe in pes
+
+        got = int(dispatch_recv_num_token[0])
+        assert got == expected, (
+            f"Rank[{my_pe}] received {got} dispatched tokens, expected {expected} "
+            f"(top-k={self.config.num_experts_per_token}, warpSize%top-k="
+            f"{64 % self.config.num_experts_per_token}). A surplus means slot "
+            "assignment allocated more slots than entries, leaving orphan slots "
+            "that were never written by SendCopyMultiBlock."
+        )
+
+        # An orphan slot's recorded source position is garbage: out of range or a collision.
+        src_token_pos = op.get_dispatch_src_token_pos()
+        assert len(torch.unique(src_token_pos)) == len(
+            src_token_pos
+        ), f"Rank[{my_pe}] duplicate source token positions in dispatch output"
+        for pos in src_token_pos.cpu().tolist():
+            src_rank, src_id = op.decode_send_flat_idx(pos)
+            assert 0 <= src_rank < world_size, (
+                f"Rank[{my_pe}] dispatched token decodes to source rank "
+                f"{src_rank} (flat idx {pos}) -- slot was never written"
+            )
+            assert 0 <= src_id < int(all_rank_num_token[src_rank]), (
+                f"Rank[{my_pe}] dispatched token decodes to token {src_id} of "
+                f"rank {src_rank}, which only sent {int(all_rank_num_token[src_rank])} "
+                "-- slot was never written"
+            )
+
+
+def _test_dispatch_slot_assign_lane_tiling(
+    rank,
+    world_size,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+):
+    config = _make_asyncll_config(
+        rank=rank,
+        world_size=world_size,
+        data_type=data_type,
+        hidden_dim=hidden_dim,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=num_experts_per_token,
+    )
+    run_ep_dispatch_combine_test(
+        config,
+        _AsyncLLRecvCountTestCase,
+        use_max_token_num=True,
+    )
+
+
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("data_type", (torch.bfloat16,))
+@pytest.mark.parametrize("hidden_dim", (4096,))
+@pytest.mark.parametrize("num_experts_per_rank", (48,))
+# 8 is the clean-tiling control; 6 is DeepSeek-V4's and exposed this; 9/10/12
+# cover other remainders.
+@pytest.mark.parametrize("num_experts_per_token", (8, 6, 9, 10, 12))
+# Must exceed tokensPerWarp (10 at top-k 6) so adjacent warps actually collide.
+@pytest.mark.parametrize("max_num_inp_token_per_rank", (128,))
+def test_dispatch_slot_assign_lane_tiling(
+    torch_dist_process_manager,
+    world_size,
+    data_type,
+    hidden_dim,
+    num_experts_per_rank,
+    num_experts_per_token,
+    max_num_inp_token_per_rank,
+):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_slot_assign_lane_tiling,
+                [
+                    world_size,
+                    data_type,
+                    hidden_dim,
+                    max_num_inp_token_per_rank,
+                    num_experts_per_rank,
+                    num_experts_per_token,
+                ],
+            )
+        )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
