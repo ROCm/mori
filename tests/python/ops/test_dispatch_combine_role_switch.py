@@ -616,6 +616,107 @@ def _worker_rank_asymmetric_unrecoverable(rank, world_size):
     _run_once(op, config)
 
 
+def _worker_rank_asymmetric_giveback_fails(rank, world_size):
+    """Rank 0 cannot grow; rank 1 grows but then cannot GIVE THE CAPACITY BACK.
+
+    The third asymmetry, and the one the severity code most nearly got wrong.
+    In the other two the failing rank is the one the injection hits directly.
+    Here the injection hits a rank whose resize SUCCEEDED, on the shrink that
+    the group agreement asks it to perform afterwards -- so rank 1 ends holding
+    the LARGE buffers while its seven peers hold the small ones. Its symmetric
+    heap is a different shape from everyone else's, which is exactly the
+    peer-VA class `RegisterStaticHeapSubRegion` cannot detect (it derives peer
+    addresses from a shared offset, with no allgather to check).
+
+    Before the fix this reported HEALTHY. The give-back `except` bumped severity
+    only `if not self.is_initialized`, and rank 1 IS initialized: C++
+    Reconfigure() rolls back to the config it was ENTERED with, and rank 1
+    entered the give-back already grown, so the shrink's own rollback restores
+    the LARGE buffers. Rank 1 therefore voted SEVERITY_OK, the second
+    `_agree_on_severity` saw ROLLED_BACK, and all 8 ranks raised "every rank
+    rolled back ... the whole group is still usable at the old capacity" --
+    which sglang keys `_MORI_STILL_USABLE_PHRASE` on and treats as recoverable,
+    i.e. keep serving on a group with mismatched symmetric buffers. On top of
+    that `_restore_mirror()` rewrote rank 1's python mirror to the SMALL
+    capacity, so `max_num_tokens_to_recv()` under-reported against buffers that
+    were actually large -- a second lie, in the opposite direction.
+
+    Asserted:
+      1. all 8 ranks raise the GROUP verdict "GROUP is not usable", and NO rank
+         says "still usable at the old capacity" (the split-decision bug);
+      2. rank 1's message names BOTH capacities (an operator sizes the retry on
+         that number, and "rolled back to 8" would be false here);
+      3. rank 1's mirror reports the capacity its buffers ACTUALLY have;
+      4. the group still RECOVERS: a retry at the old capacity re-shrinks rank 1
+         and all 8 compute correctly afterwards -- which is also the only way to
+         show the divergent alloc/free histories did not desynchronize peer VA.
+    """
+    import os
+
+    config = _make_config(rank, world_size, DECODE_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+    _run_once(op, config)
+
+    if rank == 0:
+        # Rank 0 simply cannot grow. TIMES=1 => its own rollback succeeds, so
+        # rank 0 alone would be merely ROLLED_BACK; the group's verdict has to
+        # come from rank 1.
+        os.environ["MORI_TEST_FAIL_HIPMALLOC"] = "dispSenderIdxMap"
+    elif rank == 1:
+        # AFTER=1 skips rank 1's grow (allocation 1 of this buffer in this
+        # reconfigure) and fires on the give-back shrink (allocation 2). The
+        # shrink's own C++ rollback (allocation 3) is past the single fire, so
+        # it succeeds -- which is the whole point: rank 1 survives, initialized,
+        # at the GROWN capacity.
+        os.environ["MORI_TEST_FAIL_HIPMALLOC"] = "dispSenderIdxMap"
+        os.environ["MORI_TEST_FAIL_HIPMALLOC_AFTER"] = "1"
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
+    finally:
+        os.environ.pop("MORI_TEST_FAIL_HIPMALLOC", None)
+        os.environ.pop("MORI_TEST_FAIL_HIPMALLOC_AFTER", None)
+
+    message = str(excinfo.value)
+    # (1) One verdict, on every rank, and it is the honest one.
+    assert "GROUP is not usable" in message, f"rank {rank}: {message}"
+    assert (
+        "still usable at the old capacity" not in message
+    ), f"rank {rank} reported the group usable while rank 1 is stranded: {message}"
+
+    if rank == 1:
+        # (2) The stranded rank names both capacities rather than claiming a
+        # rollback that did not happen.
+        assert "stranded at" in message, f"rank 1: {message}"
+        assert str(PREFILL_TOKENS) in message and str(DECODE_TOKENS) in message, (
+            f"rank 1 must name both capacities: {message}"
+        )
+        # (3) is_initialized is True (its buffers survived) and the mirror
+        # reports the LARGE capacity they actually are, not the small one the
+        # give-back intended. A mirror under-reporting here is a silent overrun
+        # waiting for the next caller that sizes a tensor off it.
+        assert op.is_initialized is True, "rank 1's buffers should have survived"
+        _assert_capacity(op, PREFILL_TOKENS)
+    else:
+        assert op.is_initialized is True, f"rank {rank} lost its buffers"
+        _assert_capacity(op, DECODE_TOKENS)
+
+    # (4) The retry at the old capacity must re-shrink rank 1 and leave all 8
+    # ranks symmetric and numerically correct. This is the load-bearing
+    # assertion: three ranks ran three different alloc/free histories through
+    # this resize (rank 0 grow-fail+rollback, rank 1 grow+failed-shrink+rollback,
+    # ranks 2-7 grow+shrink), so if that can move a peer VA offset, the
+    # check_results=True comparison against the CPU reference is where it shows.
+    op.reconfigure(max_num_inp_token_per_rank=DECODE_TOKENS)
+    _assert_capacity(op, DECODE_TOKENS)
+    _run_once(op, config)
+
+    # And the recovered group is still flippable for real.
+    op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
+    _assert_capacity(op, PREFILL_TOKENS)
+    _run_once(op, config)
+
+
 def _worker_reconfigure_rejects_immutable_fields(rank, world_size):
     """numQpPerPe / useExternalInpBuffer are peer-visible; they must be frozen.
 
@@ -949,6 +1050,15 @@ def test_rank_asymmetric_unrecoverable(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_rank_asymmetric_unrecoverable, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+def test_rank_asymmetric_giveback_fails(torch_dist_process_manager, world_size):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_rank_asymmetric_giveback_fails, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
