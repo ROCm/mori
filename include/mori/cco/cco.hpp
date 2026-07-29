@@ -111,6 +111,70 @@ namespace impl {
 __device__ inline unsigned threadIdxX() { return __builtin_amdgcn_workitem_id_x(); }
 __device__ inline unsigned blockDimX() { return __builtin_amdgcn_workgroup_size_x(); }
 __device__ inline int warpSize() { return __builtin_amdgcn_wavefrontsize(); }
+
+/* ── Wavefront primitives ─────────────────────────────────────────────────────
+ * Every arch mori targets is wave64 except gfx1250. The ballot builtin is not
+ * interchangeable — ballot_w64 compiles on a wave32 target but reads the wrong
+ * width — so add any further wave32 arch to CCO_WAVE32 below. Masks are uint64_t
+ * either way; on wave32 only the low half is populated.
+ * ──────────────────────────────────────────────────────────────────────────── */
+#if defined(__gfx1250__)
+#define CCO_WAVE32 1
+#endif
+#ifdef CCO_WAVE32
+inline constexpr int kWaveSize = 32;
+#else
+inline constexpr int kWaveSize = 64;
+#endif
+inline constexpr uint64_t kWaveFullMask = (kWaveSize == 64) ? ~0ull : 0xffffffffull;
+
+// Active lanes of this wave that satisfy `pred`.
+__device__ inline uint64_t waveBallot(bool pred) {
+#ifdef CCO_WAVE32
+  return __builtin_amdgcn_ballot_w32(pred);
+#else
+  return __builtin_amdgcn_ballot_w64(pred);
+#endif
+}
+
+// How many lanes of `mask` are below this one. mbcnt_hi is the identity when the
+// high half is empty, so one form serves both widths.
+__device__ inline unsigned waveLanesBelow(uint64_t mask) {
+  return __builtin_amdgcn_mbcnt_hi(static_cast<uint32_t>(mask >> 32),
+                                   __builtin_amdgcn_mbcnt_lo(static_cast<uint32_t>(mask), 0));
+}
+
+__device__ inline unsigned waveLaneId() { return waveLanesBelow(kWaveFullMask); }
+
+// Broadcast from a named lane — safe inside a loop, unlike readfirstlane.
+__device__ inline uint32_t waveBcastLane32(uint32_t v, int lane) {
+  return __builtin_amdgcn_ds_bpermute(lane << 2, v);
+}
+__device__ inline uint64_t waveBcastLane(uint64_t v, int lane) {
+  const uint32_t lo = waveBcastLane32(static_cast<uint32_t>(v), lane);
+  const uint32_t hi = waveBcastLane32(static_cast<uint32_t>(v >> 32), lane);
+  return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
+// Broadcast from the lowest active lane. SALU, so cheaper than the named-lane
+// form, but it reads exec: never use it as a loop's probe.
+__device__ inline uint64_t waveBcastFirstLane(uint64_t v) {
+  const uint32_t lo = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(v));
+  const uint32_t hi = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(v >> 32));
+  return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
+// Lanes of this wave whose key matches mine — match_any emulated with one ballot
+// per key bit, which is cheap while the key is small.
+__device__ inline uint64_t waveMatchAny(uint32_t key, uint32_t keyBits) {
+  uint64_t m = waveBallot(true);
+  for (uint32_t b = 0; b < keyBits; b++) {
+    const bool bit = (key >> b) & 1u;
+    const uint64_t bm = waveBallot(bit);
+    m &= bit ? bm : ~bm;
+  }
+  return m;
+}
 // HIP __syncwarp (amd_warp_sync_functions.h)
 __device__ inline void syncWarp() {
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
@@ -1278,47 +1342,6 @@ inline __device__ void ccoSdmaFillSlot(ccoSdmaQueueDeviceHandle& handle, uint64_
   }
 }
 
-// Active lanes of this wave that satisfy `pred`.
-inline __device__ uint64_t ccoSdmaBallot(bool pred) { return __builtin_amdgcn_ballot_w64(pred); }
-
-// How many lanes of `mask` are below this one.
-inline __device__ unsigned ccoSdmaLanesBelow(uint64_t mask) {
-  return __builtin_amdgcn_mbcnt_hi(static_cast<uint32_t>(mask >> 32),
-                                   __builtin_amdgcn_mbcnt_lo(static_cast<uint32_t>(mask), 0));
-}
-
-// Lanes of this wave whose key matches mine — match_any emulated with one ballot
-// per key bit, which is cheap because the key is small (peer * n + queueId).
-inline __device__ uint64_t ccoSdmaMatchQueue(uint32_t key, uint32_t keyBits) {
-  uint64_t m = ccoSdmaBallot(true);
-  for (uint32_t b = 0; b < keyBits; b++) {
-    const bool bit = (key >> b) & 1u;
-    const uint64_t bm = ccoSdmaBallot(bit);
-    m &= bit ? bm : ~bm;
-  }
-  return m;
-}
-
-// Broadcast from a named lane — safe inside a loop, unlike readfirstlane.
-inline __device__ uint32_t ccoSdmaBcastLane32(uint32_t v, int lane) {
-  return __builtin_amdgcn_ds_bpermute(lane << 2, v);
-}
-inline __device__ uint64_t ccoSdmaBcastLane(uint64_t v, int lane) {
-  const uint32_t lo = ccoSdmaBcastLane32(static_cast<uint32_t>(v), lane);
-  const uint32_t hi = ccoSdmaBcastLane32(static_cast<uint32_t>(v >> 32), lane);
-  return (static_cast<uint64_t>(hi) << 32) | lo;
-}
-
-// Broadcast from the lowest active lane. SALU, so cheaper than the named-lane
-// form, but it reads exec: never use it as a loop's probe.
-inline __device__ uint64_t ccoSdmaBcastFirstLane(uint64_t v) {
-  const uint32_t lo = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(v));
-  const uint32_t hi = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(v >> 32));
-  return (static_cast<uint64_t>(hi) << 32) | lo;
-}
-
-inline __device__ unsigned ccoSdmaLaneId() { return ccoSdmaLanesBelow(~0ull); }
-
 // Ring the doorbell for everything placed-but-not-rung on this queue.
 inline __device__ void ccoSdmaRingQueueDbr(ccoSdmaQueueDeviceHandle& handle) {
   uint64_t base =
@@ -1330,7 +1353,7 @@ inline __device__ void ccoSdmaRingQueueDbr(ccoSdmaQueueDeviceHandle& handle) {
 
 // Queue this lane/thread drives for warp/block scope, or -1 when beyond queNum.
 inline __device__ int ccoSdmaWarpQueueId(uint32_t queNum) {
-  const int laneId = (__builtin_amdgcn_workitem_id_x() % __builtin_amdgcn_wavefrontsize());
+  const int laneId = static_cast<int>(impl::waveLaneId());
   return laneId < static_cast<int>(queNum) ? laneId : -1;
 }
 inline __device__ int ccoSdmaBlockQueueId(uint32_t queNum) {
@@ -1345,21 +1368,21 @@ template <bool localSignal, bool remoteSignal, bool kRing, uint64_t kSlot>
 inline __device__ void ccoSdmaPutGrouped(ccoSdmaQueueDeviceHandle* shared, void* srcBuf,
                                          void* dstBuf, size_t copy_size, HSAuint64* localTarget,
                                          HSAuint64* remoteTarget, uint32_t queueKey) {
-  const unsigned myLane = ccoSdmaLaneId();
-  uint64_t rem = ccoSdmaBallot(true);
+  const unsigned myLane = impl::waveLaneId();
+  uint64_t rem = impl::waveBallot(true);
   while (rem) {
     const int probe = __builtin_ctzll(rem);  // lowest lane still to post
-    const uint32_t k = ccoSdmaBcastLane32(queueKey, probe);
+    const uint32_t k = impl::waveBcastLane32(queueKey, probe);
     const bool inGroup = ((rem >> myLane) & 1ull) && (queueKey == k);
-    const uint64_t group = ccoSdmaBallot(inGroup);
+    const uint64_t group = impl::waveBallot(inGroup);
     if (inGroup) {
       const unsigned cnt = __builtin_popcountll(group);
-      const unsigned myIdx = ccoSdmaLanesBelow(group);
+      const unsigned myIdx = impl::waveLanesBelow(group);
       const int leaderLane = probe;  // lowest lane of the group by construction
 
       ccoSdmaQueueDeviceHandle handle = *shared;
       uint64_t base = (myIdx == 0) ? handle.ReserveSlot(kSlot * cnt, shared) : 0;
-      base = ccoSdmaBcastLane(base, leaderLane);
+      base = impl::waveBcastLane(base, leaderLane);
 
       ccoSdmaFillSlot<localSignal, remoteSignal>(handle, base + myIdx * kSlot, localTarget,
                                                  remoteTarget, srcBuf, dstBuf, copy_size);
@@ -1415,7 +1438,7 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
     }
   };
 
-  const uint64_t active = ccoSdmaBallot(true);
+  const uint64_t active = impl::waveBallot(true);
   const unsigned nActive = __builtin_popcountll(active);
 
   // Sole issuer: no group to form and no chain to share, on either path.
@@ -1428,13 +1451,13 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
     // One group, known statically: reserve once, fill in parallel, ring once.
     if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
       // Broken promise: lanes would write slots reserved on another queue.
-      if (ccoSdmaMatchQueue(queueKey, keyBits) != active) __builtin_trap();
+      if (impl::waveMatchAny(queueKey, keyBits) != active) __builtin_trap();
     }
-    const unsigned myIdx = ccoSdmaLanesBelow(active);
+    const unsigned myIdx = impl::waveLanesBelow(active);
 
     ccoSdmaQueueDeviceHandle handle = *shared;
     uint64_t base = (myIdx == 0) ? handle.ReserveSlot(kSlot * nActive, shared) : 0;
-    base = ccoSdmaBcastFirstLane(base);  // leader is the lowest active lane
+    base = impl::waveBcastFirstLane(base);  // leader is the lowest active lane
 
     ccoSdmaFillSlot<localSignal, remoteSignal>(handle, base + myIdx * kSlot, localTarget,
                                                remoteTarget, srcBuf, dstBuf, copy_size);
@@ -1448,8 +1471,8 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
 
   // Every lane on its own queue: no chain to share, so post independently. One
   // postSolo site, so the function carries a single copy of the commit spin.
-  const uint64_t mine = ccoSdmaMatchQueue(queueKey, keyBits);
-  if (!ccoSdmaBallot(__builtin_popcountll(mine) > 1)) {
+  const uint64_t mine = impl::waveMatchAny(queueKey, keyBits);
+  if (!impl::waveBallot(__builtin_popcountll(mine) > 1)) {
     postSolo();
     return;
   }
