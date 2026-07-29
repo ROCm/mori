@@ -536,18 +536,21 @@ class EpDispatchCombineOp:
         prev_inp = self._cpp_config.max_num_inp_token_per_rank
         prev_recv = self._cpp_config.max_total_recv_tokens
 
-        def _restore_mirror():
-            # Point the python mirror configs back at what the buffers ACTUALLY
-            # are. The C++ side either rejected the change before freeing
-            # anything (ValidateReconfigurable) or rolled back to the old
-            # capacity, so in both cases the live buffers are the old ones.
-            # Leaving _cpp_config lying would make max_num_tokens_to_recv()
-            # over-report against smaller buffers -- a silent overrun.
-            self._cpp_config.max_num_inp_token_per_rank = prev_inp
-            self._cpp_config.max_total_recv_tokens = prev_recv
-            self.config.max_num_inp_token_per_rank = prev_inp
-            self.config.max_total_recv_tokens = prev_recv
+        def _set_mirror(inp, recv):
+            # Point the python mirror configs at what the buffers ACTUALLY are.
+            # A mirror that disagrees with the live buffers is a silent overrun:
+            # max_num_tokens_to_recv() sizes callers' tensors off it.
+            self._cpp_config.max_num_inp_token_per_rank = inp
+            self._cpp_config.max_total_recv_tokens = recv
+            self.config.max_num_inp_token_per_rank = inp
+            self.config.max_total_recv_tokens = recv
             self._refresh_handle_state()
+
+        def _restore_mirror():
+            # The C++ side either rejected the change before freeing anything
+            # (ValidateReconfigurable) or rolled back to the old capacity, so in
+            # both cases the live buffers are the old ones.
+            _set_mirror(prev_inp, prev_recv)
 
         self._cpp_config.max_num_inp_token_per_rank = max_num_inp_token_per_rank
         self._cpp_config.max_total_recv_tokens = max_total_recv_tokens
@@ -594,6 +597,7 @@ class EpDispatchCombineOp:
             local_severity = self.SEVERITY_UNRECOVERABLE
         worst = self._agree_on_severity(group, local_severity)
 
+        stuck_at_new_capacity = False
         if worst != self.SEVERITY_OK:
             if local_err is None:
                 # This rank grew but the group did not, so give the capacity
@@ -610,9 +614,33 @@ class EpDispatchCombineOp:
                     _restore_mirror()
                 except Exception as giveback_err:
                     local_err = giveback_err
-                    _restore_mirror()
-                    if not self.is_initialized:
-                        local_severity = self.SEVERITY_UNRECOVERABLE
+                    # ANY give-back failure is UNRECOVERABLE, not just one that
+                    # left the handle finalized. This used to be gated on
+                    # `if not self.is_initialized`, which reads the wrong state:
+                    # C++ Reconfigure() rolls back to the config it was ENTERED
+                    # with, and this rank entered the give-back already GROWN,
+                    # so a give-back whose C++ rollback succeeds leaves it
+                    # holding the NEW, larger buffers with is_initialized True.
+                    # It then voted SEVERITY_OK and the group raised "every rank
+                    # rolled back ... still usable at the old capacity" -- while
+                    # one rank sits at a different symmetric capacity from its
+                    # seven peers. That is the peer-VA/silent-overrun corruption
+                    # class announced as healthy, and sglang is told to retry.
+                    #
+                    # There is no third severity for it: the group cannot be
+                    # made symmetric from here (the shrink that would fix it is
+                    # the one that just failed), so it is exactly as unusable as
+                    # a rank holding nothing, and must be reported as such.
+                    local_severity = self.SEVERITY_UNRECOVERABLE
+                    # Mirror the capacity the buffers are ACTUALLY at. When the
+                    # C++ rollback held, that is the GROWN one -- restoring to
+                    # prev_inp here would under-report and hand callers tensors
+                    # smaller than the buffers, on top of the asymmetry.
+                    if self.is_initialized:
+                        stuck_at_new_capacity = True
+                        _set_mirror(max_num_inp_token_per_rank, max_total_recv_tokens)
+                    else:
+                        _restore_mirror()
 
             # Re-agree AFTER the give-back. A give-back that fails leaves this
             # rank holding nothing, but _agree_on_severity has already returned,
@@ -647,6 +675,19 @@ class EpDispatchCombineOp:
                         f"a2a buffers to max_num_inp_token_per_rank={max_num_inp_token_per_rank} "
                         "and could not roll back either, so it holds no a2a buffers; the op "
                         "is finalized and must be rebuilt group-wide. The GROUP is not usable."
+                    ) from local_err
+                if stuck_at_new_capacity:
+                    # This rank GREW, the group did not, and the shrink back
+                    # failed -- so it is stranded at a capacity none of its peers
+                    # share. Do not let it say "rolled back": the number in the
+                    # message is what an operator sizes the retry on, and the
+                    # symmetric buffers here are the large ones.
+                    raise RuntimeError(
+                        "EpDispatchCombineOp.reconfigure: the EP group could not resize its "
+                        f"a2a buffers to max_num_inp_token_per_rank={max_num_inp_token_per_rank}, "
+                        "and this rank then failed to give the capacity back, so it is stranded "
+                        f"at {max_num_inp_token_per_rank} while its peers are at {prev_inp}; the "
+                        "op must be rebuilt group-wide. The GROUP is not usable."
                     ) from local_err
                 raise RuntimeError(
                     "EpDispatchCombineOp.reconfigure: another rank in the EP group could "
