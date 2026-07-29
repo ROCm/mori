@@ -24,6 +24,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
+#include <cstring>
 #include <new>
 #include <stdexcept>
 
@@ -111,7 +112,17 @@ EpDispatchCombineConfig EpDispatchCombineConfig::FromPackedI32Array(const int32_
 EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_)
     : config(config_) {
   NormalizeConfig();
-  InitializeAll();
+  try {
+    InitializeAll();
+  } catch (...) {
+    // A throw out of a constructor skips the destructor, so nothing would ever
+    // release what InitializeAll() managed to allocate before it failed. Now
+    // that a failed allocation raises instead of exit(-1)ing, that is a
+    // reachable leak of symmetric-heap space that no later call can reclaim
+    // (the handle never becomes an object). Tear the partial build down here.
+    FinalizeAll();
+    throw;
+  }
 
   this->multiProcessorCount = GetCurDeviceMultiProcessorCount();
   this->maxThreads = std::min(GetCurDeviceMaxThreads(), 1024);
@@ -169,11 +180,19 @@ void EpDispatchCombineHandle::NormalizeConfig() {
 }
 
 void EpDispatchCombineHandle::InitializeAll() {
+  // Set the flag BEFORE allocating, not after. FinalizeAll() early-returns on
+  // !buffersInitialized, so if this were set last a throw partway through would
+  // leave a partially-built handle that FinalizeAll() refuses to touch: the
+  // rollback in Reconfigure() would free nothing and then overwrite every
+  // pointer, leaking whatever the failed attempt had already taken from the
+  // symmetric heap. That leak is permanent and cumulative -- each failed D->P
+  // flip would make the next one likelier to fail. Every Finalize*() body is
+  // null/invalidate based, so tearing down a half-built handle is safe.
+  buffersInitialized = true;
   InitializeShmemBuf();
   InitializeTokenNumSignalBuf();
   InitializeOrderMapBuf();
   InitializeBarrier();
-  buffersInitialized = true;
 }
 
 void EpDispatchCombineHandle::FinalizeAll() {
@@ -372,8 +391,32 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
 // prevent. Call sites must match the original init exactly.
 static constexpr int kNoMemset = -1000;
 
+// Fault injection, test-only. Set MORI_TEST_FAIL_HIPMALLOC to the `what` name of
+// a plain-device buffer (e.g. "dispSenderIdxMap") and the next allocation of it
+// fails as if the device were out of memory.
+//
+// This exists because the failure it simulates cannot otherwise be provoked on
+// demand: the symmetric heap can be exhausted by asking for a capacity larger
+// than MORI_SHMEM_HEAP_SIZE, but plain device memory is whatever the GPU has
+// free, so "a D->P flip that cannot grow the order maps" is untestable without a
+// hook -- and that path (raise + roll back, rather than exit(-1)) is precisely
+// the contract sglang's role switch depends on. Untested error paths are how the
+// exit(-1) survived this long.
+//
+// Unset => never fires. Read fresh each call so a test can arm and disarm it.
+static bool ShouldInjectAllocFailure(const char* what) {
+  const char* target = env::Get("MORI_TEST_FAIL_HIPMALLOC");
+  if ((target == nullptr) || (target[0] == '\0') || (what == nullptr)) return false;
+  return std::strcmp(target, what) == 0;
+}
+
 static void HipMallocOrThrow(void** ptr, size_t size, const char* what, int memsetValue = 0) {
   *ptr = nullptr;
+  if (ShouldInjectAllocFailure(what)) {
+    MORI_OPS_WARN("MORI_TEST_FAIL_HIPMALLOC: failing allocation of '{}' ({} bytes) on purpose",
+                  what, size);
+    throw std::bad_alloc();
+  }
   hipError_t err = hipMalloc(ptr, size);
   if (err != hipSuccess || *ptr == nullptr) {
     // Clear the sticky error so a later HIP_RUNTIME_CHECK on the rollback path
