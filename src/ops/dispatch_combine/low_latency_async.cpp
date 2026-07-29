@@ -303,6 +303,12 @@ __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs
 /*                         EpDispatchLowLatencyAsyncRecvCopyMultiBlock                            */
 /* ---------------------------------------------------------------------------------------------- */
 
+// TEMPORARY DIAGNOSTIC (see the out-of-range-pe dump below). Process-wide throttle so a
+// pervasive failure cannot flood the server log. Never reset: we only care about the first
+// records, and the kernel aborts shortly after anyway.
+static __device__ int gAsyncRecvCopyDiagCount = 0;
+static constexpr int kAsyncRecvCopyMaxDiagPrints = 64;
+
 // Prefix-sum variant: eliminates atomicAdd on totalRecvTokenNum by computing
 // per-PE offsets via warp-shuffle prefix sum and per-warp offsets arithmetically.
 template <typename T>
@@ -368,10 +374,37 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
     // First sub-warp handles metadata and validation
     if (inTokenPartId == 0) {
       if (laneId < config.numExpertPerToken) {
-        index_t id =
-            reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes)[laneId];
+        const index_t* idxArr =
+            reinterpret_cast<const index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes);
+        index_t id = idxArr[laneId];
         index_t pe = id / config.numExpertPerRank;
         if (!((pe >= 0) && (pe < config.worldSize))) {
+          // TEMPORARY DIAGNOSTIC: pe is derived only from the received index payload and is
+          // not used for indexing here, so dumping before the abort is safe. Goal is to tell
+          // apart (a) a genuinely out-of-range routing id -- |id| near numExpertPerRank *
+          // worldSize, srcTokId plausible -- from (b) a staging slot that was never written,
+          // which shows wild/uniform garbage. tokenId vs recvTokenNum says whether the damage
+          // is tail-biased (a chunk that never landed) or scattered.
+          if (atomicAdd(&gAsyncRecvCopyDiagCount, 1) < kAsyncRecvCopyMaxDiagPrints) {
+            const index_t* srcTokIdPtr =
+                reinterpret_cast<const index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes +
+                                                 indexBytes + weightBytes + scaleBytes);
+            printf(
+                "[mori-diag] RecvCopy bad pe | myPe=%d srcPe=%d block=%d lane=%d :: id=%d pe=%d "
+                "|| tokenId=%d recvTokenNum=%llu peOffset=%llu destTokId=%d totalTokens=%llu "
+                "|| numExpertPerRank=%d worldSize=%d numExpertPerToken=%d "
+                "|| xferBytes=%llu hiddenBytes=%llu indexBytes=%llu scaleBytes=%llu "
+                "|| srcTokId=%d idx[0..3]=%d,%d,%d,%d\n",
+                myPe, destPe, blockId, laneId, (int)id, (int)pe, (int)tokenId,
+                (unsigned long long)recvTokenNum, (unsigned long long)peOffset, (int)destTokId,
+                (unsigned long long)totalTokens, config.numExpertPerRank, config.worldSize,
+                config.numExpertPerToken, (unsigned long long)xferBytes,
+                (unsigned long long)hiddenBytes, (unsigned long long)indexBytes,
+                (unsigned long long)scaleBytes, (int)srcTokIdPtr[0], (int)idxArr[0],
+                (int)(config.numExpertPerToken > 1 ? idxArr[1] : -1),
+                (int)(config.numExpertPerToken > 2 ? idxArr[2] : -1),
+                (int)(config.numExpertPerToken > 3 ? idxArr[3] : -1));
+          }
           assert((pe >= 0) && (pe < config.worldSize));
         }
       }
