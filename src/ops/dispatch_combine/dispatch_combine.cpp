@@ -445,16 +445,28 @@ static constexpr int kNoMemset = -1000;
 //     protect, and the state sglang's MoriA2AResizeUnrecoverable escalation
 //     keys on; with a hard one-shot it was unreachable from any test, i.e. the
 //     SIGSEGV fixed in 85c34c18 could not be proven gone.
+//
+// MORI_TEST_FAIL_HIPMALLOC_AFTER (default 0) lets that many matching
+// allocations SUCCEED first, and only then starts failing. That reaches a state
+// the count alone cannot: a rank whose GROW succeeded and whose GIVE-BACK then
+// failed. On a healthy peer during a group resize that one rank could not make,
+// the named buffer is allocated (1) by the grow, (2) by the give-back shrink,
+// (3) by the give-back's own C++ rollback. AFTER=1 with TIMES=1 therefore fires
+// on exactly (2), leaving that rank stranded at the GROWN capacity with its
+// buffers intact while its seven peers sit at the old one -- an asymmetric
+// symmetric heap, which is the corruption class the severity agreement exists
+// to report rather than hide.
 static bool ShouldInjectAllocFailure(const char* what) {
   const char* target = env::Get("MORI_TEST_FAIL_HIPMALLOC");
   if ((target == nullptr) || (target[0] == '\0') || (what == nullptr)) return false;
   if (std::strcmp(target, what) != 0) return false;
 
   // Re-arming (a new test setting the var again, possibly to a different site)
-  // resets the count. Keyed on the target string so consecutive tests in one
+  // resets the counts. Keyed on the target string so consecutive tests in one
   // worker process do not inherit each other's remaining fires.
   static std::string armedFor;
   static int firesLeft = 0;
+  static int skipsLeft = 0;
   if (armedFor != target) {
     armedFor = target;
     const char* timesStr = env::Get("MORI_TEST_FAIL_HIPMALLOC_TIMES");
@@ -463,6 +475,17 @@ static bool ShouldInjectAllocFailure(const char* what) {
       firesLeft = std::atoi(timesStr);
     }
     if (firesLeft < 1) firesLeft = 1;
+    const char* afterStr = env::Get("MORI_TEST_FAIL_HIPMALLOC_AFTER");
+    skipsLeft = 0;
+    if ((afterStr != nullptr) && (afterStr[0] != '\0')) {
+      skipsLeft = std::atoi(afterStr);
+    }
+    if (skipsLeft < 0) skipsLeft = 0;
+  }
+
+  if (skipsLeft > 0) {
+    skipsLeft--;
+    return false;
   }
 
   firesLeft--;
