@@ -493,12 +493,17 @@ def _worker_rank_asymmetric_failure(rank, world_size):
         os.environ.pop("MORI_TEST_FAIL_HIPMALLOC", None)
 
     message = str(excinfo.value)
-    # Every rank raises: the seven that succeeded must not silently keep the
-    # capacity they grew to, because their peers do not have it.
-    if rank == 0:
-        assert "could not grow" in message, f"rank 0: {message}"
-    else:
-        assert "another rank in the EP group" in message, f"rank {rank}: {message}"
+    # Every rank raises the SAME message: the seven that succeeded must not
+    # silently keep the capacity they grew to, because their peers do not have
+    # it, and sglang branches on this string per rank -- so if the wording
+    # differed by rank, so would sglang's keep-serving/escalate decision.
+    # (Before 45470024 rank 0 raised its own C++ error and the peers raised a
+    # "another rank in the EP group ..." variant; the group verdict is now
+    # unconditional, so both ranks see the identical rolled-back text.)
+    assert "could not grow" in message, f"rank {rank}: {message}"
+    assert (
+        "still usable at the old capacity" in message
+    ), f"rank {rank}: {message}"
     # Nobody may report the group as unusable -- rank 0's rollback succeeded.
     assert "must be rebuilt" not in message, f"rank {rank}: {message}"
     assert "GROUP is not usable" not in message, f"rank {rank}: {message}"
