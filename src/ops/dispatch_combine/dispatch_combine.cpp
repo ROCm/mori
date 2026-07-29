@@ -361,6 +361,17 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
 // capacity, so raising keeps the all-or-nothing contract that sglang relies on.
 //
 // `what` names the buffer so the rollback message can say which one ran out.
+//
+// kNoMemset leaves the allocation uninitialized. That is NOT a micro-
+// optimization: hipMemset is asynchronous with respect to the host for device
+// memory, so for a buffer the host initializes itself on the next line (only
+// crossDeviceBarrierFlag does) an added memset can land AFTER the host store
+// and silently clobber it. Doing that turned the barrier flag into 0 for the
+// IntraNode kernels and produced partial peer contributions in combine -- the
+// same "some peers' data missing" corruption the correctness bar exists to
+// prevent. Call sites must match the original init exactly.
+static constexpr int kNoMemset = -1000;
+
 static void HipMallocOrThrow(void** ptr, size_t size, const char* what, int memsetValue = 0) {
   *ptr = nullptr;
   hipError_t err = hipMalloc(ptr, size);
@@ -371,6 +382,7 @@ static void HipMallocOrThrow(void** ptr, size_t size, const char* what, int mems
     *ptr = nullptr;
     throw std::bad_alloc();
   }
+  if (memsetValue == kNoMemset) return;
   err = hipMemset(*ptr, memsetValue, size);
   if (err != hipSuccess) {
     (void)hipGetLastError();
@@ -627,7 +639,9 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   size_t barrierSize = config.worldSize * sizeof(uint32_t);
   HipMallocOrThrow(&dispatchGridBarrier, barrierSize, "dispatchGridBarrier");
   HipMallocOrThrow(&combineGridBarrier, barrierSize, "combineGridBarrier");
-  HipMallocOrThrow(&crossDeviceBarrierFlag, sizeof(uint64_t), "crossDeviceBarrierFlag");
+  // No memset: the host writes this flag on the very next line, and an async
+  // hipMemset can land after that store and clobber it. See kNoMemset.
+  HipMallocOrThrow(&crossDeviceBarrierFlag, sizeof(uint64_t), "crossDeviceBarrierFlag", kNoMemset);
   crossDeviceBarrierFlag[0] = ((config.kernelType == KernelType::InterNodeV1) ||
                                (config.kernelType == KernelType::InterNodeV1LL) ||
                                (config.kernelType == KernelType::AsyncLL))
