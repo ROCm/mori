@@ -24,6 +24,16 @@ import os
 import pytest
 
 
+def ops_test_world_size():
+    """World size for the shared ops worker pool.
+
+    8 by default; overridable via MORI_TEST_WORLD_SIZE so the suite can run on
+    a node where only a subset of the GPUs is free (pair it with
+    HIP_VISIBLE_DEVICES to select which ones).
+    """
+    return int(os.environ.get("MORI_TEST_WORLD_SIZE", "8"))
+
+
 @pytest.fixture(scope="session")
 def torch_dist_process_manager():
     """Single shared worker pool for all ops tests."""
@@ -31,7 +41,7 @@ def torch_dist_process_manager():
         start_torch_dist_process_manager,
     )
 
-    manager = start_torch_dist_process_manager(world_size=8)
+    manager = start_torch_dist_process_manager(world_size=ops_test_world_size())
     yield manager
     manager.shutdown()
 
@@ -44,8 +54,16 @@ def set_shmem_heap_size():
     # pytest_configure) so the override is scoped to ops/ tests only and
     # does not bleed into other test directories (e.g. shmem/) when the
     # full suite is collected together.
+    #
+    # This fixture used to overwrite MORI_SHMEM_HEAP_SIZE unconditionally,
+    # which silently clobbered a smaller value set by the caller -- so on a
+    # contended node, a run explicitly asking for a heap that FITS still tried
+    # 32G/rank and died in shmem init with "hip failed with out of memory",
+    # looking like a failure of the code under test. An explicit caller value
+    # now wins; the 32G default only applies when nothing was set.
     prev = os.environ.get("MORI_SHMEM_HEAP_SIZE")
-    os.environ["MORI_SHMEM_HEAP_SIZE"] = "32G"
+    if prev is None:
+        os.environ["MORI_SHMEM_HEAP_SIZE"] = "32G"
     yield
     if prev is None:
         os.environ.pop("MORI_SHMEM_HEAP_SIZE", None)
