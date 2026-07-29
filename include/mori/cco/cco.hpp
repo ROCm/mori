@@ -1158,9 +1158,8 @@ struct ccoSdmaQueueDeviceHandle {
 
   __device__ __forceinline__ void submitPacket(uint64_t base, uint64_t pendingWptr) {
     // In-order commit chain (free when uncontended: one matching load). The
-    // s_waitcnt(0) publishes the packet dwords before the doorbell; the
-    // spin/stores stay RELAXED because visibility comes from it, not from
-    // fences, which would cause a coherence storm on the committedWptr line.
+    // s_waitcnt(0) publishes the packet dwords before the doorbell; the three
+    // stores below rely on landing in order, unlike upstream anvil_device.hpp.
     [[maybe_unused]] int retries = 0;
     while (__hip_atomic_load(committedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != base) {
       __builtin_amdgcn_s_sleep(1);
