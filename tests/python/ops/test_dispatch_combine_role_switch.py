@@ -531,6 +531,86 @@ def _worker_rank_asymmetric_failure(rank, world_size):
     _run_once(op, config)
 
 
+def _worker_rank_asymmetric_unrecoverable(rank, world_size):
+    """ONE rank ends UNRECOVERABLE while the other seven roll back cleanly.
+
+    This is the asymmetry `_worker_rank_asymmetric_failure` does NOT cover: there
+    rank 0's rollback succeeds, so the group's worst severity is ROLLED_BACK and
+    every rank really is usable at the old capacity. Here rank 0's rollback
+    fails too (MORI_TEST_FAIL_HIPMALLOC_TIMES=2 fails both the grow and the
+    rollback), so rank 0 holds NO a2a buffers while its seven peers hold intact
+    ones. That is the state SEVERITY_UNRECOVERABLE, the C++ "must be rebuilt"
+    message and pybind's RequireInitialized() guard all exist for, and until the
+    fire-count knob landed no test could reach it -- so the SIGSEGV fixed in
+    85c34c18 could not be proven gone, and sglang's MoriA2AResizeUnrecoverable,
+    which keys on "must be rebuilt", had nothing establishing that string is
+    ever emitted.
+
+    Three things are asserted, and each was a real bug:
+
+    1. EVERY rank reports the GROUP's outcome. The seven healthy ranks must NOT
+       raise "still usable at the old capacity" -- a group whose symmetric
+       buffers exist on 7 of 8 ranks is corrupt, not degraded, and sglang makes
+       a per-rank keep-serving/escalate decision off this string. Before
+       review #21 item 2's fix `raise local_err` ran first, so co-failing ranks
+       raised their own C++ message and the group SPLIT.
+    2. Rank 0's own message must survive to python as "must be rebuilt" ACROSS
+       PYBIND. Reaching it at all exercises `_restore_mirror` /
+       `_refresh_handle_state` over a finalized handle -- the null SymmMemObjPtr
+       deref that used to SIGSEGV all 8 ranks (T5d).
+    3. The group RECOVERS. sglang is told a resize failure leaves it able to
+       keep serving, so a retry at the old capacity must rebuild rank 0's
+       buffers and leave all 8 computing correctly. That retry is also the
+       deadlock review #21 item 4 found: the healthy ranks see "same capacity,
+       already initialized" and would have returned early -- skipping two
+       barriers -- while rank 0 (is_initialized False) fell through into them.
+    """
+    import os
+
+    config = _make_config(rank, world_size, DECODE_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+    _run_once(op, config)
+
+    if rank == 0:
+        os.environ["MORI_TEST_FAIL_HIPMALLOC"] = "dispSenderIdxMap"
+        # 2 => the rollback's InitializeAll() re-hits the same site and throws
+        # too, so the handle is finalized on purpose.
+        os.environ["MORI_TEST_FAIL_HIPMALLOC_TIMES"] = "2"
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
+    finally:
+        os.environ.pop("MORI_TEST_FAIL_HIPMALLOC", None)
+        os.environ.pop("MORI_TEST_FAIL_HIPMALLOC_TIMES", None)
+
+    message = str(excinfo.value)
+    # (1) + (2): the group verdict is unanimous, on every rank.
+    assert "GROUP is not usable" in message, f"rank {rank}: {message}"
+    assert (
+        "still usable at the old capacity" not in message
+    ), f"rank {rank} reported the group usable while a peer holds nothing: {message}"
+    if rank == 0:
+        assert "must be rebuilt" in message, f"rank 0: {message}"
+        assert op.is_initialized is False, "rank 0 should hold no buffers"
+    else:
+        # A healthy peer is locally fine -- is_initialized is LOCAL state, which
+        # is exactly why the group verdict cannot be derived from it.
+        assert op.is_initialized is True, f"rank {rank} lost its buffers"
+
+    # (3) The retry at the OLD capacity recovers the group. On the seven healthy
+    # ranks this is a same-size free+realloc; on rank 0 it is a full rebuild.
+    # Before the no-op agreement this hung: 7 ranks returned early, 1 did not.
+    op.reconfigure(max_num_inp_token_per_rank=DECODE_TOKENS)
+    assert op.is_initialized is True, f"rank {rank} did not recover"
+    _assert_capacity(op, DECODE_TOKENS)
+    _run_once(op, config)
+
+    # And the recovered group is still flippable for real.
+    op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
+    _assert_capacity(op, PREFILL_TOKENS)
+    _run_once(op, config)
+
+
 def _worker_reconfigure_rejects_immutable_fields(rank, world_size):
     """numQpPerPe / useExternalInpBuffer are peer-visible; they must be frozen.
 
@@ -855,6 +935,15 @@ def test_rank_asymmetric_failure(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_rank_asymmetric_failure, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+def test_rank_asymmetric_unrecoverable(torch_dist_process_manager, world_size):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_rank_asymmetric_unrecoverable, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
