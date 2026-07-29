@@ -135,11 +135,12 @@ __global__ void sdma_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, 
   sdma.quietQueue(peerLsa, q);
 }
 
-// SDMA warp scope: one warp drives all SDMA queues via warp-scope puts that split
-// the transfer across the queue set (one lane per queue). `depth` sub-copies per
-// iteration; with agg one commit() rings all queues, else each warp put rings.
-template <uint32_t Flags>
-__global__ void sdma_put_bw_warp(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
+// SDMA warp/block scope: leader-only, so one lane issues the whole transfer on one
+// queue — the group does not split it. `depth` sub-copies per iteration; with agg
+// one commit() rings them, else each put rings. Contrast with the thread kernel,
+// which puts one issuer on every queue and so uses a smaller op each.
+template <typename Coop, uint32_t Flags>
+__global__ void sdma_put_bw_coop(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
                                  size_t len_doubles, ccoDevComm devComm, int peerLsa, int iter,
                                  int depth) {
   ccoSdma sdma{devComm};
@@ -151,25 +152,28 @@ __global__ void sdma_put_bw_warp(ccoWindowDevice* sendWin, ccoWindowDevice* recv
       const size_t so = static_cast<size_t>(j) * sub;
       const size_t sb = (j == depth - 1) ? (total - so) : sub;
       if (sb == 0) continue;  // total < depth: skip empty sub-copies (no 0-byte packet)
-      sdma.put<ccoCoopWarp, false, false, Flags>(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin),
-                                                 so, reinterpret_cast<ccoWindow_t>(sendWin), so, sb,
-                                                 0);
+      sdma.put<Coop, false, false, Flags>(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), so,
+                                          reinterpret_cast<ccoWindow_t>(sendWin), so, sb, 0);
     }
-    if constexpr (agg) sdma.commit<ccoCoopWarp>(peerLsa);
+    if constexpr (agg) sdma.commit<Coop>(peerLsa);
   }
-  sdma.quiet<ccoCoopWarp>(peerLsa);
+  sdma.quiet<Coop>(peerLsa);
 }
 
 static void launch_sdma(PutScope scope, ccoWindow_t sendWin, ccoWindow_t recvWin,
                         size_t len_doubles, ccoDevComm devComm, int peerLsa, int count,
                         int warp_size, int depth, bool agg) {
   const int nq = devComm.sdma.sdmaNumQueue;
-  const dim3 grid(1), block(scope == PutScope::kWarp ? warp_size : nq);
+  const int thr = scope == PutScope::kWarp ? warp_size : (scope == PutScope::kBlock ? 256 : nq);
+  const dim3 grid(1), block(thr);
 #define LAUNCH(FLAGS)                                                                            \
   do {                                                                                           \
     if (scope == PutScope::kWarp)                                                                \
-      hipLaunchKernelGGL((sdma_put_bw_warp<FLAGS>), grid, block, 0, 0, sendWin, recvWin,         \
-                         len_doubles, devComm, peerLsa, count, depth);                           \
+      hipLaunchKernelGGL((sdma_put_bw_coop<ccoCoopWarp, FLAGS>), grid, block, 0, 0, sendWin,     \
+                         recvWin, len_doubles, devComm, peerLsa, count, depth);                  \
+    else if (scope == PutScope::kBlock)                                                          \
+      hipLaunchKernelGGL((sdma_put_bw_coop<ccoCoopBlock, FLAGS>), grid, block, 0, 0, sendWin,    \
+                         recvWin, len_doubles, devComm, peerLsa, count, depth);                  \
     else                                                                                         \
       hipLaunchKernelGGL((sdma_put_bw<FLAGS>), grid, block, 0, 0, sendWin, recvWin, len_doubles, \
                          devComm, peerLsa, count, depth);                                        \
@@ -286,9 +290,9 @@ int main(int argc, char** argv) {
 
   ccoBarrierAll(ctx.comm);
   if (my_pe == 0) {
-    // SDMA parallelism is the queue count. thread scope launches 1 block × nq
-    // threads (one message per queue → units=nq); warp scope launches a single
-    // warp that fans the whole transfer across the queues (one logical op).
+    // SDMA thread scope launches 1 block × nq threads, one message per queue, so
+    // units=nq and each op is total/nq. warp and block are leader-only: a single
+    // op for the whole transfer, units=1.
     int print_grid = args.nblocks;
     int print_block = args.threads_per_block;
     const char* print_scope = ScopeToChar(args.put_scope);
@@ -297,6 +301,9 @@ int main(int argc, char** argv) {
       if (args.put_scope == PutScope::kWarp) {
         print_block = ctx.device_warp_size;
         print_scope = "warp";
+      } else if (args.put_scope == PutScope::kBlock) {
+        print_block = 256;
+        print_scope = "block";
       } else {
         print_block = static_cast<int>(ctx.devComm.sdma.sdmaNumQueue);
         print_scope = "thread";
