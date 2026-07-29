@@ -227,12 +227,30 @@ void EpDispatchCombineHandle::Finalize() {
   FinalizeAll();
 }
 
+// Stable marker on every ValidateReconfigurable rejection.
+//
+// A rejection is categorically different from a resize FAILURE: it is raised
+// before anything is freed, so the op is bit-for-bit untouched and the group is
+// not in a partial state at all. The python wrapper reduces a severity across
+// the EP group and rewrites the message to the group's worst outcome, and
+// without this marker a rejection was indistinguishable from an OOM -- asking
+// for max_num_inp_token_per_rank=0 reported "could not grow the a2a buffers ...
+// every rank rolled back", which is false in both halves and would send sglang
+// down its retry path for a caller bug that will fail identically forever.
+//
+// A marker rather than a distinct exception type because the public contract is
+// already "reconfigure raises RuntimeError" and sglang matches on the message;
+// changing the type would break callers for a diagnostic improvement. The tag
+// is stripped before the message reaches the user.
+static constexpr const char* kReconfigureRejectedTag = "[reconfigure-rejected]";
+
 void EpDispatchCombineHandle::ValidateReconfigurable(
     const EpDispatchCombineConfig& newConfig) const {
   auto require = [](const char* field, long long oldV, long long newV) {
     if (oldV != newV) {
-      throw std::runtime_error(std::string("EpDispatchCombineHandle::Reconfigure: field '") +
-                               field + "' must not change (" + std::to_string(oldV) + " -> " +
+      throw std::runtime_error(std::string(kReconfigureRejectedTag) +
+                               " EpDispatchCombineHandle::Reconfigure: field '" + field +
+                               "' must not change (" + std::to_string(oldV) + " -> " +
                                std::to_string(newV) + ")");
     }
   };
@@ -266,7 +284,8 @@ void EpDispatchCombineHandle::ValidateReconfigurable(
           static_cast<long long>(newConfig.useExternalInpBuffer));
   if (newConfig.maxNumInpTokenPerRank <= 0) {
     throw std::runtime_error(
-        "EpDispatchCombineHandle::Reconfigure: maxNumInpTokenPerRank must be > 0");
+        std::string(kReconfigureRejectedTag) +
+        " EpDispatchCombineHandle::Reconfigure: maxNumInpTokenPerRank must be > 0");
   }
 }
 

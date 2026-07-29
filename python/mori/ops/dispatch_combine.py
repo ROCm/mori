@@ -407,6 +407,12 @@ class EpDispatchCombineOp:
         # (MPI / raw UniqueId), in which case world IS the shmem group.
         dist.barrier(group=group)
 
+    # Marker the C++ ValidateReconfigurable puts on a rejection (an invalid or
+    # immutable-field config), as opposed to a resize that was attempted and
+    # failed. Stripped before the message reaches the caller; see the comment at
+    # kReconfigureRejectedTag in dispatch_combine.cpp.
+    _REJECTED_TAG = "[reconfigure-rejected]"
+
     # Resize outcome severities, MAX-reduced across the EP group. Ordered so
     # that the numerically largest is the worst, because MAX is the reduction.
     SEVERITY_OK = 0
@@ -549,6 +555,25 @@ class EpDispatchCombineOp:
         try:
             self._handle.reconfigure(self._cpp_config)
         except Exception as exc:  # OOM on the growing (decode->prefill) flip
+            if self._REJECTED_TAG in str(exc):
+                # A REJECTION, not a failure: ValidateReconfigurable raised
+                # before anything was freed, so this op is bit-for-bit
+                # untouched and no peer is in a partial state either -- the
+                # check is deterministic on the config, so every rank that was
+                # handed the same config rejected it identically.
+                #
+                # It must therefore NOT go through the severity agreement, for
+                # two reasons. It would be relabelled as the group's worst
+                # OOM outcome ("could not grow ... every rank rolled back"),
+                # which is false in both halves and sends sglang down a retry
+                # path for a caller bug that will fail identically forever.
+                # And a rank whose config differs (a real caller bug) would
+                # reject while its peers proceed, so making the rejection
+                # collective would hang the flip on top of it.
+                _restore_mirror()
+                raise RuntimeError(
+                    str(exc).replace(self._REJECTED_TAG, "", 1).strip()
+                ) from exc
             local_err = exc
             _restore_mirror()
         else:
