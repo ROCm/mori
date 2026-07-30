@@ -264,7 +264,21 @@ class SubmissionLedger {
   std::unordered_map<uint64_t, SubmissionRecord> records_;
 };
 
+using EndpointId = uint64_t;
+
 struct EpPair {
+  // The identity of the QP this pair wraps, assigned by ConnectEndpoint and
+  // copied along with the pair into the route table, the EndpointRuntime and
+  // every cached session. RetireEndpoint used to match on `local.handle.qpn`
+  // instead, which OVER-MATCHES: QP numbers are unique within a device
+  // context, not across NICs, and a node with more than one HCA (this one has
+  // bnxt + mlx5) can hand the same qpn to two live QPs on different devices.
+  // The route-table walk then erased a HEALTHY endpoint on the other NIC
+  // without setting its qpFatal, so it was orphaned rather than retired — a
+  // silently missing route that also feeds the un-reaped-runtime leak.
+  // 0 means "not from ConnectEndpoint" (default-constructed, e.g. in unit
+  // tests) and must never match a retirement.
+  EndpointId id{0};
   int weight;
   int ldevId;
   int rdevId;
@@ -291,8 +305,6 @@ struct EpPair {
     return qpFatal && qpFatal->load(std::memory_order_relaxed);
   }
 };
-
-using EndpointId = uint64_t;
 
 struct EndpointRuntime {
   EndpointRuntime() = default;

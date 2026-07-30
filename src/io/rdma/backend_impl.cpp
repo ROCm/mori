@@ -476,17 +476,23 @@ std::size_t RdmaManager::RetireEndpoint(EndpointId id) {
   std::unique_lock<std::shared_mutex> lock(mu);
   auto rtIt = endpointsById_.find(id);
   if (rtIt == endpointsById_.end() || !rtIt->second) return 0;
-  // Match on the QP number, not on the EndpointId: the route table stores
-  // EpPair VALUES, copied at ConnectEndpoint time, and carries no id. The QP
-  // number is the one field that is unique per endpoint and stable across
-  // those copies.
-  const uint32_t deadQpn = rtIt->second->ep.local.handle.qpn;
+  // Match on the EndpointId, which EpPair now carries (see common.hpp). The
+  // previous version matched on `local.handle.qpn` alone and OVER-MATCHED:
+  // a qpn is unique within one device context, not across NICs, and this walk
+  // visits every remote engine and every topo key. On a multi-NIC node a
+  // healthy QP on another device that happened to share the number was erased
+  // from rTable without its qpFatal being set — so CreateSession's IsQpFatal
+  // filter could not see it, it was simply a route that vanished, and its
+  // EndpointRuntime stayed in endpointsById_ being polled forever.
+  // Defence in depth: id 0 is the default-constructed sentinel and must never
+  // match, or a single retirement would wipe every hand-built pair.
+  const EndpointId deadId = rtIt->second->ep.id;
   std::size_t removed = 0;
+  if (deadId == 0) return 0;
   for (auto& [ekey, meta] : remotes) {
     for (auto& [topo, eps] : meta.rTable) {
-      auto newEnd = std::remove_if(eps.begin(), eps.end(), [&](const EpPair& ep) {
-        return ep.local.handle.qpn == deadQpn;
-      });
+      auto newEnd = std::remove_if(eps.begin(), eps.end(),
+                                   [&](const EpPair& ep) { return ep.id == deadId; });
       removed += static_cast<std::size_t>(std::distance(newEnd, eps.end()));
       eps.erase(newEnd, eps.end());
     }
@@ -593,7 +599,12 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
   auto epConfig = GetRdmaEndpointConfig(devId);
-  EpPair ep{weight,
+  // The id is allocated BEFORE the pair is built, not after, so that the copy
+  // pushed into the route table carries it too. RetireEndpoint matches on this
+  // field; a route-table copy with id 0 would be unretirable.
+  EndpointId id = nextEndpointId_.fetch_add(1);
+  EpPair ep{id,
+            weight,
             devId,
             rdevId,
             remoteKey,
@@ -606,7 +617,6 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
             std::make_shared<std::atomic<bool>>(false)};
   meta.rTable[topoKey].push_back(ep);
 
-  EndpointId id = nextEndpointId_.fetch_add(1);
   auto rt = std::make_shared<EndpointRuntime>(id, ep);
   endpointsById_[id] = rt;
   return id;
@@ -1799,6 +1809,14 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
     EpPairVec existing = rdma->GetAllEndpoint(ekey, kp);
     std::vector<int> haveByRank(effectiveNumNics, 0);
     for (const auto& ep : existing) {
+      // Skip retired QPs, exactly as the single-NIC branch does via
+      // CountUsableEndpoint. Counting a dead QP as "already have one" means
+      // BuildRdmaConn is never called for that rank, and then the final
+      // IsQpFatal filter below drops it anyway — so the session comes up one
+      // endpoint short and throws "insufficient RDMA endpoints" forever
+      // instead of rebuilding. Multi-NIC is the sglang path whenever
+      // MORI_IO_NUM_NICS_PER_TRANSFER > 1.
+      if (ep.IsQpFatal()) continue;
       auto it = rankByDev.find(ep.ldevId);
       if (it != rankByDev.end()) haveByRank[it->second] += 1;
     }
