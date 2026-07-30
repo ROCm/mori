@@ -905,7 +905,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
 
         int relativeIdx = bidIdx - batchStart;
         if (!((processedMask >> relativeIdx) & 1)) {
-          int k = bid / (numRecvBlock * (nNodes - 1));
+          int k = bid / (numRecvBlock * (nNodes - 1));  // 处理的chunk索引
           int i = (bid / numRecvBlock) % (nNodes - 1);
           int node = (myNode + 1 + i) % nNodes;
 
@@ -931,6 +931,10 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
                  j += numRecvBlock * warpNum) {
               int tokIdx = SendBufSlotOffset(config, node, j);
 
+              if (laneId == 0 && warpId == 0 && bid == 0) {
+                printf("[PE%d] node %d k %d j %d tokIdx: %d\n", myPe, node, k, j, tokIdx);
+              }
+
               if (laneId < config.numExpertPerToken) {
                 srcPtrs[laneId] = nullptr;
                 srcWeightsPtr[laneId] = nullptr;
@@ -938,6 +942,12 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
                     args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId];
                 index_t destPe = PeFromFlatTokenIndex(config, destTokId);
                 index_t destNode = destPe / config.gpuPerNode;
+
+                if (myPe == 0) {
+                  printf("[PE%d] destTokId: %d destPe %d destNode %d\n", myPe, destTokId, destPe,
+                         destNode);
+                }
+
                 if (destNode == myNode) {
                   index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
                   srcPtrs[laneId] =

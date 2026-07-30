@@ -431,17 +431,19 @@ class EpDispatchCombineOp:
         ) * 4  # sizeof(index_t)
 
     def _combine_shared_mem(self, warp_per_block, use_weights=True):
-        """Shared memory for combine kernels."""
+        """Shared memory for combine kernels.
+
+        Most combine kernels index their per-warp pointer arrays by expert, but
+        EpCombineAll indexes them by node, so reserve whichever needs more slots.
+        Keep in sync with combine_shared_mem() in src/ops/dispatch_combine/launch.cpp.
+        """
         quant_type = _normalize_quant_type(self.config.quant_type)
         num_ptr_arrays = 1 + int(bool(use_weights))
         if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
             num_ptr_arrays += 1
-        return (
-            warp_per_block
-            * self.config.num_experts_per_token
-            * num_ptr_arrays
-            * _PTR_SIZE
-        )
+        num_nodes = max(1, self.config.world_size // self.config.gpu_per_node)
+        ptr_slots = max(self.config.num_experts_per_token, num_nodes)
+        return warp_per_block * ptr_slots * num_ptr_arrays * _PTR_SIZE
 
     def _launch(self, func_name, grid, block, shared_mem, stream, args_ptr):
         func = self._get_func(func_name)

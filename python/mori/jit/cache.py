@@ -39,10 +39,16 @@ def get_cache_root() -> Path:
     return Path.home() / ".mori" / "jit"
 
 
+_HASHED_SUFFIXES = (".hpp", ".h", ".cpp", ".hip")
+
+
 def _hash_tree(paths: list[Path]) -> str:
     """Compute a short content hash over files and directories.
 
-    For directories, all ``.hpp``, ``.h``, and ``.cpp`` files are included.
+    For directories, all ``.hpp``, ``.h``, ``.cpp``, and ``.hip`` files are
+    included. ``.hip`` matters because the kernel entry points themselves are
+    ``.hip`` and some of them ``#include`` each other; omitting the suffix let
+    edits to a kernel source silently reuse a stale .hsaco.
     """
     h = hashlib.sha256()
     for p in sorted(paths):
@@ -50,7 +56,7 @@ def _hash_tree(paths: list[Path]) -> str:
             h.update(p.read_bytes())
         elif p.is_dir():
             for f in sorted(p.rglob("*")):
-                if f.suffix in (".hpp", ".h", ".cpp"):
+                if f.suffix in _HASHED_SUFFIXES:
                     h.update(f.read_bytes())
     return h.hexdigest()[:12]
 

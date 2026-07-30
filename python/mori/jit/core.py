@@ -494,8 +494,11 @@ def compile_genco(
 
     sub_kernels = _PARALLEL_KERNEL_GROUPS.get(kernel_name)
     if sub_kernels:
+        # Hash all of src/ops, not just src/ops/kernels: the .hip entry points
+        # #include the implementations under src/ops/dispatch_combine, so hashing
+        # only the kernels dir let edits there reuse a stale .hsaco.
         source_paths = [
-            mori_root / "src" / "ops" / "kernels",
+            mori_root / "src" / "ops",
             mori_root / "include" / "mori",
         ]
         cache_dir = get_cache_dir(
@@ -544,7 +547,13 @@ def compile_genco(
     if not source.is_file():
         raise FileNotFoundError(f"Kernel source not found: {source}")
 
-    source_paths = [source, mori_root / "include" / "mori"]
+    # Include the tree holding the sibling implementation sources that the .hip
+    # pulls in (e.g. src/ops for src/ops/kernels), so edits there invalidate.
+    source_paths = [
+        source,
+        (mori_root / source_dir).parent,
+        mori_root / "include" / "mori",
+    ]
     cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, ccqe=ccqe)
     hsaco_path = cache_dir / f"{kernel_name}.hsaco"
 

@@ -317,14 +317,39 @@ void KernelRegistry::AutoLoad() {
     }
   }
 
-  // 3. JIT cache: ~/.mori/jit/<arch>_<nic>/latest/
+  // 3. JIT cache: ~/.mori/jit/<arch>_<nic>[_ccqe]/latest/
+  //
+  // The Python JIT appends _ccqe to the directory name when it compiles with
+  // -DIONIC_CCQE, so the cache directory is not always plain <arch>_<nic>. Probe
+  // the CCQE variant first: the JIT only creates it when it decided CCQE is
+  // enabled on this host, so its presence is the signal. Honour
+  // MORI_DISABLE_IONIC_CCQE, which is what makes the JIT fall back to the plain
+  // name.
+  //
+  // Only these exact names are tried on purpose. A loose <arch>_* scan would
+  // happily pick up a _profiler or _cov<N> tree, and those are built with a
+  // different EpDispatchCombineArgsRaw layout, which corrupts kernel arguments.
   const char* home = std::getenv("HOME");
   if (home) {
-    auto jit_latest = fs::path(home) / ".mori" / "jit" / arch_nic / "latest";
-    if (fs::is_directory(jit_latest)) {
-      MORI_OPS_INFO("AutoLoad: found JIT cache at {}", jit_latest.string());
-      LoadFromDirectory(jit_latest.string());
-      return;
+    auto jit_root = fs::path(home) / ".mori" / "jit";
+    const char* disable_ccqe = std::getenv("MORI_DISABLE_IONIC_CCQE");
+    std::string disable_val = disable_ccqe ? disable_ccqe : "";
+    std::transform(disable_val.begin(), disable_val.end(), disable_val.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    const bool ccqe_disabled = (disable_val == "1" || disable_val == "true" ||
+                                disable_val == "on" || disable_val == "yes");
+
+    std::vector<std::string> candidates;
+    if (!ccqe_disabled) candidates.push_back(arch_nic + "_ccqe");
+    candidates.push_back(arch_nic);
+
+    for (const auto& name : candidates) {
+      auto jit_latest = jit_root / name / "latest";
+      if (fs::is_directory(jit_latest)) {
+        MORI_OPS_INFO("AutoLoad: found JIT cache at {}", jit_latest.string());
+        LoadFromDirectory(jit_latest.string());
+        return;
+      }
     }
   }
 }
@@ -396,10 +421,13 @@ static int dispatch_shared_mem(const EpDispatchCombineConfig& cfg, int wpb) {
          static_cast<int>(sizeof(index_t));
 }
 
-static int combine_shared_mem(int wpb, int num_experts_per_token, bool use_scale_ptrs = false,
+// `ptr_slots` is the per-warp length of each shared-memory pointer array. Combine
+// kernels index those arrays either by expert (numExpertPerToken slots) or, in
+// EpCombineAll, by node (nNodes slots), so callers must pass whichever is larger.
+static int combine_shared_mem(int wpb, int ptr_slots, bool use_scale_ptrs = false,
                               bool use_weight_ptrs = true) {
   int num_ptr_arrays = 1 + (use_weight_ptrs ? 1 : 0) + (use_scale_ptrs ? 1 : 0);
-  return wpb * num_experts_per_token * num_ptr_arrays * 8;
+  return wpb * ptr_slots * num_ptr_arrays * 8;
 }
 
 static void ensure_loaded() {
@@ -513,7 +541,11 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
 
   unsigned int block_x = WARP_SIZE * wpb;
   const bool hasWeights = (weights != nullptr);
-  int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
+  // The InterNodeV1 sequence ends with EpCombineAll, whose pointer arrays are
+  // node-indexed; a top-1 config on multiple nodes needs more slots than experts.
+  const int nNodes = std::max(1, handle.config.worldSize / handle.config.gpuPerNode);
+  const int combinePtrSlots = std::max(handle.config.numExpertPerToken, nNodes);
+  int smem = combine_shared_mem(wpb, combinePtrSlots,
                                 handle.config.quantType == QuantType::Fp8BlockwiseQuant,
                                 /*use_weight_ptrs=*/true);
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
