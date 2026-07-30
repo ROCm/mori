@@ -309,9 +309,21 @@ void TestTruncatedPayloadThrows() {
   CHECK(threw,
         "a payload that ends early must be REPORTED. Returning here means the "
         "short read was treated as success and msgpack parsed a half-filled "
-        "buffer -- the 99768347 bug. And it must throw, not exit(-1): the "
-        "3c6bc1a1 contract is that one bad connection costs that connection.");
-  printf("truncated payload reported: %s\n", what.c_str());
+        "buffer. And it must throw, not exit(-1): the 3c6bc1a1 contract is that "
+        "one bad connection costs that connection, not the engine.");
+
+  // BE PRECISE ABOUT WHAT THIS PROVES, because the observed errno says it is
+  // less than it looks. The listener is created SOCK_NONBLOCK (tcp.cpp:95), so
+  // in practice `recv` returns -1/EAGAIN before the peer's FIN is observed, and
+  // the message reads "Resource temporarily unavailable (errno=11)". So this
+  // case exercises the `n < 0` branch (tcp.cpp:68-70) and the 3c6bc1a1
+  // throw-instead-of-exit contract -- NOT the `n == 0` mid-message-EOF branch
+  // (tcp.cpp:77) that is the actual 99768347 fix. `test_transport_tcp` does
+  // cover `n == 0` directly ("mid-message EOF correctly reported as -1"), so
+  // the branch is not uncovered; it is just not covered HERE, and this test
+  // should not claim otherwise. Making the EOF deterministic through a
+  // nonblocking socket needs a readiness wait, which is a separate change.
+  printf("truncated payload reported (via the n<0 branch, see comment): %s\n", what.c_str());
 }
 
 }  // namespace
