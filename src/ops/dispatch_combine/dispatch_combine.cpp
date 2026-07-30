@@ -862,9 +862,16 @@ EpDispatchCombineHandle::BarrierProbe EpDispatchCombineHandle::ProbeBarrierState
     // Host-visible (hipMalloc'd and written by the host in InitializeBarrier).
     p.generation = crossDeviceBarrierFlag[0];
   }
-  if (!crossDeviceBarrierMemObj.IsValid()) return p;
+  // Open-coded IsValid(): that accessor is not const-qualified
+  // (application_device_types.hpp:146) and this probe is const on purpose --
+  // a diagnostic must not be able to mutate the state it reports. Checking the
+  // two members directly is exactly what IsValid() does, and it keeps the fix
+  // local instead of re-qualifying a header that every dispatch path includes.
+  if (crossDeviceBarrierMemObj.cpu == nullptr || crossDeviceBarrierMemObj.gpu == nullptr) {
+    return p;
+  }
 
-  void* localPtr = crossDeviceBarrierMemObj->Get();
+  const void* localPtr = crossDeviceBarrierMemObj->Get();
   p.localPtr = reinterpret_cast<uintptr_t>(localPtr);
   p.size = crossDeviceBarrierMemObj->size;
 

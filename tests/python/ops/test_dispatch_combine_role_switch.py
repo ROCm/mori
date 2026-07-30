@@ -1211,12 +1211,18 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size):
     op = mori.ops.EpDispatchCombineOp(config)
     _run_once(op, config)
 
-    if op.probe_barrier_state() is None:
-        # mori extension predates the binding (possible: sglang loads mori off
-        # PYTHONPATH). Return rather than pytest.skip() -- Skipped is a
-        # BaseException and escaping it here leaves the parent's collective
-        # get() waiting forever (be825794).
-        return
+    # FAIL, do not return, when the binding is missing. An early return here is
+    # indistinguishable from a real green, and that is not hypothetical: T13's
+    # first run of this test reported "1 passed" against a .so whose build had
+    # failed (BUILD_RC=1), because the wrapper tolerates an older extension.
+    # A diagnostic that silently reports success when it measured nothing is
+    # worse than no diagnostic. (raise, not pytest.skip: Skipped derives from
+    # BaseException and escaping it strands the parent's get() -- be825794.)
+    assert op.probe_barrier_state() is not None, (
+        f"rank {rank}: this mori extension has no probe_barrier_state binding, "
+        f"so NOTHING was measured. The .so is older than the python. Rebuild "
+        f"and check BUILD_RC before reading this test's result."
+    )
 
     # The divergence: rank 0 alone asks for something C++ refuses (> 0 required).
     target = 0 if rank == 0 else PREFILL_TOKENS
