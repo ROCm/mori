@@ -71,10 +71,37 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   }
 
   // TODO: we need to add more options in config, include min cqe num for ib_create_cq
+  //
+  // Each resource is registered with the pools THE MOMENT it is created, before
+  // anything that can throw. ~IBVerbsDeviceContext destroys exactly what the
+  // pools hold, so registering at the end (as this did) means every failure
+  // between creation and the end of this function permanently leaks the
+  // resources already taken. That was harmless while the failure was an
+  // assert() -- the process aborted -- but the ibv_create_qp failure below now
+  // unwinds, and its own message tells the caller to RETRY with fewer QPs. A
+  // retry that burns a CQ per attempt makes the exhaustion it reports worse
+  // each time round.
   endpoint.ibvHandle.compCh = config.withCompChannel ? ibv_create_comp_channel(context) : nullptr;
+  if (endpoint.ibvHandle.compCh) {
+    compChPool.push_back(endpoint.ibvHandle.compCh);
+  }
   endpoint.ibvHandle.cq =
       ibv_create_cq(context, config.maxCqeNum, NULL, endpoint.ibvHandle.compCh, 0);
-  assert(endpoint.ibvHandle.cq);
+  if (endpoint.ibvHandle.cq == nullptr) {
+    // Same defect the ibv_create_qp assert below had, one line up: CQ
+    // exhaustion is as likely as QP exhaustion on a busy HCA (mori asks for one
+    // CQ per endpoint), and this assert is compiled out under NDEBUG, where
+    // ibv_create_qp is then handed a null send_cq.
+    const int err = errno;
+    throw std::runtime_error(
+        "mori: ibv_create_cq failed: " + std::string(std::strerror(err)) +
+        " (errno=" + std::to_string(err) + "). Requested cqe=" + std::to_string(config.maxCqeNum) +
+        ", with_comp_channel=" + (config.withCompChannel ? "true" : "false") +
+        ". ENOMEM usually means the device's CQ resources are exhausted (reduce "
+        "numQpPerPe or the EP world size); EINVAL usually means the requested "
+        "cqe count exceeds the device attributes.");
+  }
+  cqPool.insert({endpoint.ibvHandle.cq, endpoint.ibvHandle.cq});
 
   // TODO: should also manage the lifecycle of completion channel && srq
   if (config.withCompChannel)
@@ -123,11 +150,9 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   if (config.enableSrq)
     assert(endpoint.ibvHandle.srq && (endpoint.ibvHandle.qp->srq == endpoint.ibvHandle.srq));
 
-  cqPool.insert({endpoint.ibvHandle.cq, endpoint.ibvHandle.cq});
+  // cq and compCh were registered at creation, above. Only the QP is left, and
+  // nothing between its creation and here can throw.
   qpPool.insert({endpoint.ibvHandle.qp->qp_num, endpoint.ibvHandle.qp});
-  if (endpoint.ibvHandle.compCh) {
-    compChPool.push_back(endpoint.ibvHandle.compCh);
-  }
   return endpoint;
 }
 
