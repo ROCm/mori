@@ -19,6 +19,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import os
+
 import pytest
 from tests.python.utils import TorchDistProcessManager, data_type_supported
 import mori
@@ -592,6 +594,25 @@ class EpDispatchCombineTestCase:
             combine_data_type = self.config.data_type
 
         if _is_fp4x2_dtype(combine_data_type):
+            return
+
+        # MORI_COMB_NOREDUCE builds a combine that folds one source instead of topk, so it is WRONG
+        # BY CONSTRUCTION -- its whole purpose is to price the fold against the transport that stays
+        # intact. Without this escape the bench asserts before it ever reaches the timing loop, so
+        # the diagnostic cannot be measured at all. Deliberately loud, and deliberately keyed on the
+        # same env var the compile gate reads, so a stale export can never silently disarm the check.
+        if os.environ.get("MORI_COMB_NOREDUCE", "").strip().lower() in (
+            "1",
+            "true",
+            "on",
+            "yes",
+        ):
+            if self.config.rank == 0:
+                print(
+                    "[SKIPCHECK] MORI_COMB_NOREDUCE is set: combine output is wrong on purpose, "
+                    "value check skipped. Bandwidth from this run is a transport ceiling, NOT a "
+                    "shippable number."
+                )
             return
 
         for i in range(all_rank_num_token[self.config.rank]):

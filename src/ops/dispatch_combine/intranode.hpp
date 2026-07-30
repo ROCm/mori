@@ -310,6 +310,27 @@ __device__ unsigned long long _fin_route_maxdur = 0ull;
 __device__ unsigned long long _fin_stg_maxdur = 0ull;
 #endif
 
+#if defined(MORI_COMB_TIMING)
+// [CSPLIT] Is combine transport-bound or reduce-bound? Its whole cost has only ever been one number,
+// so there is no way to tell whether making the transport faster can still help. Same convention as
+// the [MSPLIT] buckets above: each warp sums its own cycles across the token loop and atomicMaxes
+// once at the end, so these are maxima over warps and are additive only if the warps are
+// homogeneous -- which is what cKern is printed for. Divide by 2270 for us.
+//   cSetup = per-token routing, i.e. reading dispDestTokIdMap and building the topk srcPtrs;
+//   cIssue = issuing the topk TDM loads (pull) and nothing else;
+//   cWait  = s_wait_tensorcnt for those loads, i.e. the exposed cross-card transport;
+//   cRed   = folding the tiles out of LDS in fp32 and storing the token out;
+//   cKern  = each warp's whole span inside the token loop.
+// cWait against cRed is the whole point: it says which side a faster transport would even touch.
+// MORI_COMB_NOREDUCE attacks the same question from the other end by deleting the fold.
+__device__ unsigned long long _comb_setup_maxdur = 0ull;
+__device__ unsigned long long _comb_issue_maxdur = 0ull;
+__device__ unsigned long long _comb_wait_maxdur = 0ull;
+__device__ unsigned long long _comb_red_maxdur = 0ull;
+__device__ unsigned long long _comb_kern_maxdur = 0ull;
+__device__ unsigned long long _comb_timing_call_idx = 0ull;
+#endif
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BarrierKernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
@@ -1879,6 +1900,19 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                   (size_t)warpId * config.numExpertPerToken * _cPullTileElems;
   }
 #endif
+#if defined(MORI_COMB_TIMING)
+  unsigned long long _cSetup = 0ull, _cIssue = 0ull, _cWait = 0ull, _cRed = 0ull;
+  const unsigned long long _cKern0 = clock64();
+  unsigned long long _cMark = _cKern0;
+#define _CSTAMP(acc)                     \
+  do {                                   \
+    unsigned long long _n = clock64();   \
+    (acc) += _n - _cMark;                \
+    _cMark = _n;                         \
+  } while (0)
+#else
+#define _CSTAMP(acc) do { } while (0)
+#endif
   for (int i = globalWarpId; i < (args.curRankNumToken * mwIter.warpsPerItem); i += globalWarpNum) {
     int tokenId, inTokenPartId;
     size_t hiddenDimOffset, hiddenDimSize;
@@ -1960,6 +1994,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         }
       }
     }
+    _CSTAMP(_cSetup);
 
     if constexpr (UseFp8BlockwiseQuant) {
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
@@ -2033,7 +2068,20 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             if (srcPtrs[_j] == nullptr) continue;
             TdmIssueLoad<TokT>(_cPullTiles + (size_t)_j * _cPullTileElems, srcPtrs[_j] + _off, _pg1);
           }
+          _CSTAMP(_cIssue);
           __builtin_amdgcn_s_wait_tensorcnt(0);
+          _CSTAMP(_cWait);
+#if defined(MORI_COMB_NOREDUCE)
+          // WRONG RESULTS ON PURPOSE, same family as MORI_DISP_NOMETA/NOPAY: every peer load above is
+          // still issued and still waited on, so the cross-card traffic is byte-for-byte what the real
+          // kernel moves, but the lanes below fold ONE tile instead of validAccumCount. The gap
+          // against a full build is therefore the fp32 fold out of LDS and nothing else, which is the
+          // transport ceiling this kernel could reach if the fold were free. Only the >=128B TDM body
+          // is capped: the sub-row tail is left whole, being under 1% of a token and its own transport.
+          const int _nRed = 1;
+#else
+          const int _nRed = _nSrc;
+#endif
           // Unlike the dispatch payload loop, where the TDM engine both writes and re-reads the tile,
           // here the LANES read what the engine wrote. Fence so neither the compiler nor LDS ordering
           // lets those reads float above the wait. TDM_USAGE.md §4 advises __syncthreads() for this,
@@ -2055,7 +2103,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             float _a[_cV];
 #pragma unroll
             for (int _k = 0; _k < _cV; ++_k) _a[_k] = 0.0f;
-            for (int _j = 0; _j < _nSrc; ++_j) {
+            for (int _j = 0; _j < _nRed; ++_j) {
               if (srcPtrs[_j] == nullptr) continue;
               // Dereferenced directly rather than through core::load<16>: that takes a const void*,
               // which addrspacecasts the LDS pointer to generic and leaves it to InferAddressSpaces
@@ -2079,12 +2127,13 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
           }
           for (int _e = _nv + laneId; _e < _n; _e += warpSize) {
             float _acc = 0.0f;
-            for (int _j = 0; _j < _nSrc; ++_j) {
+            for (int _j = 0; _j < _nRed; ++_j) {
               if (srcPtrs[_j] == nullptr) continue;
               _acc += (float)(_cPullTiles[(size_t)_j * _cPullTileElems + _e]);
             }
             outPtr[_off + _e] = T(_acc);
           }
+          _CSTAMP(_cRed);
         }
           _pullDone = true;
         }
@@ -2094,6 +2143,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         // 16B vec load + load-first/unroll gather (v2-style): keep AccumNum*Unroll
         // remote peer reads in flight to hide CCO/xGMI latency (gfx1250 combine).
         core::WarpAccumLF<T, 16>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
+      // Charged to cRed so a gate-off run stays comparable, but on this path the peer reads ARE the
+      // transport, so cRed here is transport+fold together and cWait stays empty. That is the whole
+      // reason the TDM path can be decomposed at all and this one cannot.
+      _CSTAMP(_cRed);
     }
 
     if constexpr (UseWeights) {
@@ -2106,6 +2159,44 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
     }
   }
+#if defined(MORI_COMB_TIMING)
+  {
+    const unsigned long long _cKern = clock64() - _cKern0;
+    if (laneId == 0) {
+      atomicMax(&_comb_setup_maxdur, _cSetup);
+      atomicMax(&_comb_issue_maxdur, _cIssue);
+      atomicMax(&_comb_wait_maxdur, _cWait);
+      atomicMax(&_comb_red_maxdur, _cRed);
+      atomicMax(&_comb_kern_maxdur, _cKern);
+    }
+    __syncthreads();
+    // Reported from block 0 with no grid barrier in between, so a straggler block can still
+    // atomicMax after the reset below and be charged to the next call -- the same race [MSPLIT]
+    // accepts, and harmless because every value here is already a max over many launches. Replays
+    // are skipped because a graph replay's launch is not the one worth attributing this to.
+    if (blockIdx.x == 0 && threadIdx.x == 0 && !args.replayMode) {
+      __threadfence();
+      const unsigned long long _ci = atomicAdd(&_comb_timing_call_idx, 1ull);
+      // Every early call, not [CUSPLIT]'s warm window: the ACC gate this is read from launches
+      // combine ~once per iter, so a window starting at 3 printed nothing at all. Printing the
+      // series and resetting each time also shows the cold first launch instead of hiding it.
+      if (_ci < 12ull)
+        printf(
+            "[CSPLIT] rank=%d call=%llu cSetup=%.1f cIssue=%.1f cWait=%.1f cRed=%.1f cKern=%.1f "
+            "sum=%.1f us\n",
+            myPe, _ci, _comb_setup_maxdur / 2270.0, _comb_issue_maxdur / 2270.0,
+            _comb_wait_maxdur / 2270.0, _comb_red_maxdur / 2270.0, _comb_kern_maxdur / 2270.0,
+            (_comb_setup_maxdur + _comb_issue_maxdur + _comb_wait_maxdur + _comb_red_maxdur) /
+                2270.0);
+      _comb_setup_maxdur = 0ull;
+      _comb_issue_maxdur = 0ull;
+      _comb_wait_maxdur = 0ull;
+      _comb_red_maxdur = 0ull;
+      _comb_kern_maxdur = 0ull;
+    }
+  }
+#endif
+#undef _CSTAMP
 }
 
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,

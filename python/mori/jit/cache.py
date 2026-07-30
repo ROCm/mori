@@ -123,6 +123,12 @@ def get_cache_dir(
         if _comb_tdm not in ("", "0", "false", "off", "no")
         else ""
     )
+    # Combine's [CSPLIT] bucket print, and its deletion diagnostic (NOREDUCE is wrong on purpose).
+    comb_diag_suffix = "".join(
+        f"_{n.lower()}"
+        for n in ("TIMING", "NOREDUCE")
+        if os.environ.get(f"MORI_COMB_{n}", "").lower() in ("1", "true", "on", "yes")
+    )
     # Deletion diagnostics (wrong results on purpose) and the meta shape histogram.
     diag_suffix = "".join(
         f"_{n.lower()}"
@@ -131,7 +137,7 @@ def get_cache_dir(
     )
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{fastdedup_suffix}{combtdm_suffix}{diag_suffix}{cntstep_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{fastdedup_suffix}{combtdm_suffix}{comb_diag_suffix}{diag_suffix}{cntstep_suffix}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)

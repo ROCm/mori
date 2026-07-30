@@ -322,6 +322,27 @@ def _comb_tdm_defines() -> list[str]:
     return [f"-DMORI_COMB_TDM={chunks}"]
 
 
+def _comb_diag_defines() -> list[str]:
+    """Two combine diagnostics, both compile gates, both default OFF.
+
+    MORI_COMB_TIMING adds the [CSPLIT] print splitting the combine token loop into per-token routing,
+    TDM load issue, the wait on those loads, and the fp32 fold out of LDS. Combine has only ever been
+    one number, so there was no way to tell whether a faster transport could still help it. The
+    kernel skips args.replayMode launches, so this prints from an eager run -- read it off
+    tools/ep4_acc_check.py, not the CUDA-graph bench, which only ever replays.
+
+    MORI_COMB_NOREDUCE gives WRONG RESULTS ON PURPOSE, the same family as MORI_DISP_NOMETA/NOPAY: the
+    TDM pull path still issues and waits on every peer load, so the cross-card traffic is byte-for-byte
+    unchanged, but the lanes fold one tile instead of topk. The bandwidth gap against a full build is
+    therefore the fold alone, i.e. what combine would reach if the reduction were free. Never gate
+    correctness on it."""
+    return [
+        f"-D{name}"
+        for name in ("MORI_COMB_TIMING", "MORI_COMB_NOREDUCE")
+        if os.environ.get(name, "").strip().lower() in ("1", "true", "on", "yes")
+    ]
+
+
 def _disp_clean_defines() -> list[str]:
     """Kernel body selector: -DMORI_DISP_CLEAN builds the legacy clean IntraNode dispatch body
     (EpDispatchIntraNodeKernel_clean_body, default geometry 256 blocks x 16 warps) instead of the
@@ -537,6 +558,7 @@ def _hipcc_genco(
         *_ocp_fp_defines(cfg.arch),
         *_disp_tdm_defines(),
         *_comb_tdm_defines(),
+        *_comb_diag_defines(),
         *_disp_timing_defines(),
         *_disp_clean_defines(),
         *_disp_nophase_defines(),
