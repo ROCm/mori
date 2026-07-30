@@ -188,7 +188,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             )
         self.sync()
 
-        return dispatch_graph, combine_graph
+        return dispatch_graph, combine_graph, dispatch_recv_num_token
 
     def _capture_e2e_graph(
         self,
@@ -393,7 +393,11 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         # Split dispatch/combine into two graphs so we can time each replay
         # separately with host-side events.
-        dispatch_graph, combine_graph = self._capture_split_graphs(
+        (
+            dispatch_graph,
+            combine_graph,
+            dispatch_recv_num_token,
+        ) = self._capture_split_graphs(
             op,
             test_data,
             dispatch_block_num,
@@ -402,6 +406,53 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             combine_warp_per_block,
             call_local_expert_count=call_local_expert_count,
         )
+
+        # Dispatch timed the way EPV2 does it, i.e. time_graph() in
+        # dispatch_combine_v2/bench_dispatch_combine.py:323-346: one op captured, replayed N times
+        # back-to-back inside a SINGLE event pair, divided by N. The alternating loop below instead
+        # puts one event pair around each replay, which charges every sample the full cost of the
+        # four ranks being de-aligned on entry -- a lone timed dispatch ranges 166-201us, so that
+        # number drifts 6-7us with nothing changing but the combine geometry ahead of it. N
+        # back-to-back replays let the ranks lock into step: on gfx1250 (4 ranks, 64x8, 4096 tok,
+        # h7168) 169.1-170.1us / 1249-1256 GB/s here versus 175-181us / 1174-1214 there.
+        # This is kernel cost plus exactly one graph-launch boundary per dispatch. Chaining N
+        # dispatches into one graph the way tools/ep4_disp_bw.py does reads 167.0us / 1271.8 GB/s
+        # instead, and the difference is a per-launch cost rather than a one-off: holding
+        # depth*replays at 40 while sweeping the split (tools/ep4_disp_depth.py) the per-dispatch
+        # excess tracked 2.05us/depth -- 2.05, 0.89, 0.58, 0.58, 0 at depth 1, 2, 4, 10, 40 -- where
+        # a one-off entry cost would have stayed flat, that product being pinned. So the two numbers
+        # differ by a constant and either serves for A/B; which one a deployment sees depends on
+        # whether it launches a graph per dispatch or captures a whole step in one.
+        # Replaying dispatch alone leaves totalRecvTokenNum at N x recv and combine sizes its loops
+        # off that counter (intranode.hpp:1587,1816-1818), which is why the two otherwise alternate
+        # 1:1. It is reset here through dispatch's 5th return value, a view of that same counter
+        # (dispatch_combine.py:1035-1039); LaunchReset() cannot, being an empty no-op.
+        steady_start = torch.cuda.Event(enable_timing=True)
+        steady_end = torch.cuda.Event(enable_timing=True)
+        # EPV2 warms up eagerly with a barrier per call and amortises its entry cost over ITERS=50;
+        # this bench replays 10, so absorb that cost in an untimed replay instead of in the sample.
+        self.sync()
+        for _ in range(graph_replay_iters):
+            dispatch_graph.replay()
+        self.sync()
+        steady_start.record()
+        for _ in range(graph_replay_iters):
+            dispatch_graph.replay()
+        steady_end.record()
+        torch.cuda.synchronize()
+        steady_us = steady_start.elapsed_time(steady_end) * 1000.0 / graph_replay_iters
+        steady_bytes = (
+            total_recv_num_token
+            * self.dispatch_hidden_dim
+            * all_rank_input[self.config.rank].element_size()
+        )
+        if not hasattr(self, "_steady_rounds"):
+            self._steady_rounds = []
+        self._steady_rounds.append(
+            (steady_us, steady_bytes / (1000**3) / (steady_us / 1e6))
+        )
+        dispatch_recv_num_token.zero_()
+        self.sync()
 
         is_cross_type = self.combine_data_type != self.config.data_type
 
@@ -546,6 +597,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         e2e_duration_us_list = []
         disp_avg_bytes_MB_list = []
         comb_avg_bytes_MB_list = []
+        self._steady_rounds = []
 
         for i in range(iters):
             self.sync()
@@ -617,6 +669,17 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             min_comb_latency_us = min(min_comb_latency_us, comb_avg_lat)
 
         if self.config.rank == 0:
+            steady = getattr(self, "_steady_rounds", [])
+            if steady:
+                su = [u for u, _ in steady]
+                sb = [b for _, b in steady]
+                print(
+                    f"Dispatch rank0 EPV2-timing ({graph_replay_iters} back-to-back replays per "
+                    f"event pair, cf. dispatch_combine_v2 time_graph): "
+                    f"best {min(su):.1f}us {max(sb):.1f} GB/s  "
+                    f"mean {sum(su) / len(su):.1f}us {sum(sb) / len(sb):.1f} GB/s  "
+                    f"(n={len(su)} rounds)"
+                )
             print("Dispatch result:")
             for i, duration_us in enumerate(disp_duration_us_list):
                 algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
