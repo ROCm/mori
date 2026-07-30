@@ -30,6 +30,11 @@ case "$mode" in
     python setup.py build_ext --inplace 2>&1 | tail -30
     rc=${PIPESTATUS[0]}
     echo "BUILD_RC=$rc"
+    # Same reason as PYTEST_RC below: a printed rc is not a returned rc, and a
+    # caller that runs the suite only `if build succeeded` was never actually
+    # gated -- it would have tested a stale .so against a failed build and
+    # attributed the result to HEAD.
+    exit "$rc"
     ;;
   test|regress|asyncll)
     # ABORT, do not merely report, when the node cannot hold the run.
@@ -111,6 +116,14 @@ PYVRAM
     rc=${PIPESTATUS[0]}
     echo "FULL_LOG=$full ($(wc -l < "$full") lines)"
     echo "PYTEST_RC=$rc"   # real pytest rc: set -o pipefail + PIPESTATUS[0]
+    # And EXIT with it. Printing the rc was not the same as returning it: the
+    # last command in this branch was the `echo`, so the script exited 0 no
+    # matter what pytest did, and every caller's `RC=$?` measured the echo.
+    # T42 published `ASYNCLL_SMALL_RC=0` on a run whose own log says
+    # "4 failed in 1202.34s" (logs/mori_t42.log:220-227). That is the same
+    # defect class as the T5a `tail` rc this file's header warns about -- a
+    # number that is true of the wrong command -- reintroduced one line lower.
+    exit "$rc"
     ;;
   *)
     echo "unknown mode: $mode" >&2
