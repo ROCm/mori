@@ -95,6 +95,27 @@ struct Pair {
 // the trap here: `RdmaEndpointHandle` value-initialises psn/qpn/portId to 0 and
 // `gidIdx` to -1, so a convert() that dropped a field entirely would still
 // compare equal against a mostly-default fixture.
+//
+// AND THAT IS EXACTLY WHAT IT CAUGHT, on this file's first ever execution.
+// `RdmaEndpointHandle`'s adaptor packs FIVE fields -- psn, qpn, portId, ib, eth
+// -- and `EthernetEndpointHandle`'s packs TWO, gid and mac. So `maxSge` and
+// `eth.gidIdx` never cross the wire and arrive as their defaults (0 and -1).
+//
+// That is CORRECT, and this test does not ask for it to change: `gidIdx` is
+// read only from the LOCAL handle (`ah_attr.grh.sgid_index = local.eth.gidIdx`
+// in every provider -- ibverbs:299, mlx5:462, bnxt:397, ionic:389), and the
+// remote's is never consumed. `maxSge` is likewise read as
+// `ep.local.handle.maxSge` (common.cpp:155,440). Both are local-only by design,
+// and changing the wire format would break ABI with the image this campaign's
+// GPU runs use.
+//
+// The real defect is the MISMATCH: `EthernetEndpointHandle::operator==`
+// (rdma.hpp:118-122) compares `gidIdx`, a field that structurally cannot
+// survive the wire. So `local == received` is guaranteed FALSE forever. No
+// production code makes that comparison today -- this test was the first
+// caller, which is why it went unnoticed -- but it is a live trap for the next
+// person who reaches for `==` to decide whether a peer's handle changed across
+// a PD flip. Recorded here and in COORD rather than silently worked around.
 RdmaEndpointHandle MakeHandle() {
   RdmaEndpointHandle eph{};
   eph.psn = 22;
@@ -134,19 +155,39 @@ void TestRegEndpointRoundTrip() {
   CHECK(recv.topo == msg.topo, "topo did not round-trip");
   CHECK(recv.devId == msg.devId, "devId did not round-trip");
   CHECK(recv.nicRank == msg.nicRank, "nicRank did not round-trip");
-  CHECK(recv.eph == msg.eph, "the endpoint handle did not round-trip");
 
-  // RdmaEndpointHandle::operator== compares psn/qpn/portId/ib/eth and NOT
-  // maxSge, and EthernetEndpointHandle::operator== does compare gid/mac/gidIdx
-  // -- but check the byte arrays field by field anyway. A `==` that silently
-  // omits a member is exactly the kind of thing this test should not inherit
-  // its verdict from.
+  // Assert the WIRE CONTRACT field by field, never via `operator==`. Two
+  // reasons, and the second is why this test exists in this shape:
+  //  - a `==` that silently omits a member cannot be the source of a verdict;
+  //  - `EthernetEndpointHandle::operator==` includes `gidIdx`, which is not on
+  //    the wire, so `recv.eph == msg.eph` is unconditionally FALSE. Asserting
+  //    it would mean asserting a bug is present. See MakeHandle().
+  CHECK(recv.eph.psn == msg.eph.psn, "psn did not round-trip");
+  CHECK(recv.eph.qpn == msg.eph.qpn, "qpn did not round-trip");
+  CHECK(recv.eph.portId == msg.eph.portId, "portId did not round-trip");
+  CHECK(recv.eph.ib.lid == msg.eph.ib.lid, "ib.lid did not round-trip");
   for (size_t i = 0; i < sizeof(msg.eph.eth.gid); i++)
     CHECK(recv.eph.eth.gid[i] == static_cast<uint8_t>(i), "a gid byte did not round-trip");
   for (size_t i = 0; i < sizeof(msg.eph.eth.mac); i++)
     CHECK(recv.eph.eth.mac[i] == static_cast<uint8_t>(0xA0 + i), "a mac byte did not round-trip");
-  CHECK(recv.eph.eth.gidIdx == 3, "gidIdx did not round-trip");
-  printf("RegEndpoint round-tripped (%u payload bytes)\n", hdr.len);
+
+  // Pin the local-only fields as local-only, so that if someone later adds
+  // them to the adaptor they must come here and reconcile the `==` mismatch
+  // deliberately instead of discovering it in a QP that will not connect.
+  CHECK(recv.eph.eth.gidIdx == -1,
+        "gidIdx arrived non-default -- it is now on the wire. That is a wire-format "
+        "change (ABI vs the running image) AND it makes the operator== mismatch in "
+        "rdma.hpp:118-122 live. Reconcile both, then update this check.");
+  CHECK(recv.eph.maxSge == 1,
+        "maxSge arrived non-default -- see the gidIdx note above; it is read as "
+        "ep.local.handle.maxSge (common.cpp:155,440), i.e. local-only by design.");
+  CHECK(!(recv.eph == msg.eph),
+        "recv.eph == msg.eph now HOLDS. If the adaptor was fixed to carry gidIdx, "
+        "or the == was fixed to drop it, that is good news -- replace this negative "
+        "check with the positive one. It is asserted negatively today so the "
+        "mismatch cannot be forgotten.");
+  printf("RegEndpoint round-tripped (%u payload bytes); gidIdx/maxSge confirmed local-only\n",
+         hdr.len);
 }
 
 void TestAskMemoryRegionRoundTrip() {
