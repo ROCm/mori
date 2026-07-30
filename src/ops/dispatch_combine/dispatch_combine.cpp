@@ -867,6 +867,70 @@ EpDispatchCombineHandle::BarrierProbe EpDispatchCombineHandle::ProbeBarrierState
   // a diagnostic must not be able to mutate the state it reports. Checking the
   // two members directly is exactly what IsValid() does, and it keeps the fix
   // local instead of re-qualifying a header that every dispatch path includes.
+  // Record one symmetric object into p.objects. Every object is recorded, even
+  // an invalid/unallocated one (as {0,0} with no peers) -- a caller diffing two
+  // probes must be able to see an object APPEAR or VANISH across a resize, and
+  // a silently-omitted entry would shift every later name in the list and make
+  // a positional diff compare unrelated buffers.
+  auto record = [&](const char* name, const mori::application::SymmMemObjPtr& obj) {
+    BarrierProbe::SymmObjProbe e;
+    e.name = name;
+    // Open-coded IsValid(): that accessor is not const-qualified
+    // (application_device_types.hpp:146) and this probe is const on purpose --
+    // a diagnostic must not be able to mutate the state it reports.
+    if (obj.cpu != nullptr && obj.gpu != nullptr) {
+      e.localPtr = reinterpret_cast<uintptr_t>(obj->Get());
+      e.size = obj->size;
+      if (obj.cpu->peerPtrs != nullptr && config.worldSize > 0) {
+        e.peerPtrs.assign(obj.cpu->peerPtrs, obj.cpu->peerPtrs + config.worldSize);
+      }
+    }
+    p.objects.push_back(std::move(e));
+  };
+
+  // The token buffers, per kernel type. These are the ones sized by
+  // maxNumInpTokenPerRank, i.e. the ones a role switch actually resizes.
+  if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL) {
+    const auto& bufs = std::get<ShmemBufsIntraNode>(shmemTokBufs);
+    record("tok.combineInp", bufs.combineInp);
+    record("tok.dispatchOut", bufs.dispatchOut);
+    record("tok.combineOut", bufs.combineOut);
+  } else if (config.kernelType == KernelType::InterNodeV1 ||
+             config.kernelType == KernelType::InterNodeV1LL) {
+    const auto& bufs = std::get<ShmemBufsInterNodeV1>(shmemTokBufs);
+    record("tok.dispatchInp", bufs.dispatchInp);
+    record("tok.combineInp", bufs.combineInp);
+    record("tok.staging", bufs.staging);
+    record("tok.dispatchOut", bufs.dispatchOut);
+    record("tok.combineOut", bufs.combineOut);
+    record("tok.dispatchStaging", bufs.dispatchStaging);
+  } else {
+    const auto& bufs = std::get<ShmemBufsInterNode>(shmemTokBufs);
+    record("tok.dispatchInp", bufs.dispatchInp);
+    record("tok.combineInp", bufs.combineInp);
+    record("tok.staging", bufs.staging);
+    record("tok.dispatchOut", bufs.dispatchOut);
+    record("tok.combineOut", bufs.combineOut);
+  }
+  record("inpWeights", shmemInpWeightsMemObj);
+  record("dispatchOutWeights", shmemDispatchOutWeightsMemObj);
+  record("combineOutWeights", shmemCombineOutWeightsMemObj);
+  record("inpScales", shmemInpScalesMemObj);
+  record("outScales", shmemOutScalesMemObj);
+  record("inpIndices", shmemInpIndicesMemObj);
+  record("outIndices", shmemOutIndicesMemObj);
+  // recvTokenNum is the one the intranode dispatch protocol stores into on a
+  // PEER (intranode.hpp:183-186) after waiting on a signal -- a stale peer
+  // address here is a write that lands nowhere and a spin that never exits.
+  record("recvTokenNum", recvTokenNumMemObj);
+  record("sendTokenNum", sendTokenNumMemObj);
+  record("sendAtomicSignal", sendAtomicSignalMemObj);
+  record("dispTokOffset", dispTokOffsetMemObj);
+  record("dispTokIdToSrcTokId", dispTokIdToSrcTokIdMemObj);
+  record("interNodeChunkFlag", interNodeChunkFlagMemObj);
+  record("nodeRecvTokenNum", nodeRecvTokenNumMemObj);
+  record("crossDeviceBarrier", crossDeviceBarrierMemObj);
+
   if (crossDeviceBarrierMemObj.cpu == nullptr || crossDeviceBarrierMemObj.gpu == nullptr) {
     return p;
   }

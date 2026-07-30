@@ -323,6 +323,19 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
         d["size"] = p.size;
         d["peer_ptrs"] = p.peerPtrs;
         d["slots"] = p.slots;
+        // Every symmetric object, keyed by name so a caller can diff two probes
+        // per object. A dict rather than a bare list because the set of objects
+        // is not fixed (kernel type, optional scale buffers), and a positional
+        // diff would then silently pair up different buffers.
+        py::dict objs;
+        for (const auto& o : p.objects) {
+          py::dict e;
+          e["local_ptr"] = o.localPtr;
+          e["size"] = o.size;
+          e["peer_ptrs"] = o.peerPtrs;
+          objs[py::str(o.name)] = e;
+        }
+        d["objects"] = objs;
         return d;
       });
 

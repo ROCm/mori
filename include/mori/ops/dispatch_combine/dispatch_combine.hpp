@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <sstream>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -330,6 +331,29 @@ class EpDispatchCombineHandle {
     std::vector<uintptr_t> peerPtrs;
     // Current contents of the local barrier slots (what a spin reads).
     std::vector<uint64_t> slots;
+    // EVERY symmetric object the handle owns, not just the barrier.
+    //
+    // The barrier buffer alone is worldSize*2*sizeof(uint32_t)*sizeof(uint64_t)
+    // -- 512 B at world 8 and CAPACITY-INDEPENDENT -- and it is allocated LAST
+    // (InitializeAll: Shmem -> TokenNumSignal -> OrderMap -> Barrier), so under
+    // a first-fit VA manager it is the object most likely to land back exactly
+    // where it started across a resize. Probing only it is why the earlier
+    // revision of this diagnostic came back green: it cannot move, so it cannot
+    // show a stale peer mapping either.
+    //
+    // The objects that DO resize with maxNumInpTokenPerRank -- dispatchOut /
+    // combineInp / combineOut / staging, recvTokenNumMemObj, dispTokOffsetMemObj,
+    // dispTokIdToSrcTokIdMemObj, the weight/scale/index buffers -- are the ones
+    // a non-participating rank derives stale peer addresses for, and the
+    // intranode dispatch protocol spins on exactly those (intranode.hpp:183-186
+    // waits on a signal then stores into the peer's recvTokenNumMemObj).
+    struct SymmObjProbe {
+      std::string name;
+      uintptr_t localPtr{0};
+      size_t size{0};
+      std::vector<uintptr_t> peerPtrs;
+    };
+    std::vector<SymmObjProbe> objects;
   };
   BarrierProbe ProbeBarrierState() const;
 
