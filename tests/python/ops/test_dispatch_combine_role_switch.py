@@ -27,6 +27,7 @@ role for a small per-step batch. On a flip the buffers must be freed and
 re-allocated for the new capacity, in place, with the shmem context intact --
 and dispatch/combine must still be numerically correct afterwards.
 """
+import copy
 import gc
 import os
 
@@ -2673,5 +2674,96 @@ def test_construct_fails_on_one_rank(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_construct_fails_on_one_rank, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+def _worker_construct_fails_before_the_barrier(rank, world_size):
+    """ONE rank's construct fails in the ctor's PRE-BARRIER prologue.
+
+    `_worker_construct_fails_on_one_rank` above injects at the C++ hipMalloc,
+    which is deep inside the ctor's `try` -- so it can only ever prove that the
+    guarded region is guarded. Everything the ctor does BEFORE entering the try
+    was untested, and until 85e986c5 there was something there:
+    `_ensure_jit_kernels(config.kernel_type)` was statement one of __init__,
+    ahead of `self._shmem_barrier(group)` AND ahead of `construct_failed = 1`.
+
+    A rank raising in that prologue enters neither the barrier nor the finally's
+    all-reduce, so its peers block in `_shmem_barrier` forever -- the same
+    reject-deadlock 24b4379e closed for reconfigure() and 27874e2d closed for
+    construct, sitting one line in front of both of them. The bug was pure
+    POSITION: `_load_hip_modules` raises for the identical input, from the
+    identical `kernel_type not in _KERNEL_TYPE_TO_HIP` test, and was always
+    covered because it happens to sit inside the try.
+
+    The injection is the cheapest thing that reaches the prologue and nothing
+    else: a kernel_type that is not a key of `_KERNEL_TYPE_TO_HIP`. It raises in
+    `_ensure_jit_kernels` (dispatch_combine.py:187) on the way to the JIT and
+    nowhere else, needs no env hook, and allocates nothing -- so if this test
+    hangs, the prologue is unguarded, and if it passes, every rank agreed.
+
+    Note what is NOT asserted: the peers' verdict string. Rank 0 fails before
+    allocating anything, so on a correctly-guarded ctor the peers raise the
+    "failed on at least one peer" RuntimeError exactly as in the hipMalloc case
+    -- but what this test exists to measure is the LIVENESS of the collective,
+    and over-specifying it would turn a deadlock regression into a message
+    diff. The heap check IS exact: a prologue failure must cost nothing.
+    """
+    config = _make_config(rank, world_size, DECODE_TOKENS)
+    warmup = mori.ops.EpDispatchCombineOp(config)
+    _run_once(warmup, config)
+    warmup.finalize()
+    del warmup
+
+    before = _heap_stats_required(rank, "pre-barrier-failure baseline")
+
+    if rank == 0:
+        # A kernel_type that is not a key of _KERNEL_TYPE_TO_HIP. A sentinel
+        # rather than a real enum member on purpose: every real member IS a
+        # key, so no valid value reaches the raise. copy so the good `config`
+        # below is untouched -- the retry has to use the real one.
+        bad = copy.copy(config)
+        bad.kernel_type = "NotAKernelType"
+        with pytest.raises(Exception) as excinfo:
+            mori.ops.EpDispatchCombineOp(bad)
+        assert "NotAKernelType" in str(excinfo.value) or "kernel_type" in str(
+            excinfo.value
+        ), f"rank 0: expected the kernel_type rejection, got: {excinfo.value}"
+    else:
+        # THE ASSERTION: reaching this line at all is the test. Before 85e986c5
+        # the peers hung in _shmem_barrier and the harness reported a timeout on
+        # every rank except the one that actually failed -- the exact
+        # cause-hiding signature b7b67940 was written for.
+        with pytest.raises(Exception):
+            mori.ops.EpDispatchCombineOp(config)
+
+    after = _heap_stats_required(rank, "after the pre-barrier failure")
+    assert after["total_free_space"] == before["total_free_space"], (
+        f"rank {rank}: a construct that failed in the ctor PROLOGUE leaked "
+        f"symmetric heap: {before['total_free_space']} -> "
+        f"{after['total_free_space']}"
+    )
+    assert after["num_mem_objs"] == before["num_mem_objs"], (
+        f"rank {rank}: prologue failure leaked symmetric objects: "
+        f"{before['num_mem_objs']} -> {after['num_mem_objs']}"
+    )
+
+    # The group survives it and still computes -- the same recovery property
+    # the hipMalloc test asserts, on the other side of the barrier.
+    op = mori.ops.EpDispatchCombineOp(config)
+    _assert_capacity(op, DECODE_TOKENS)
+    _assert_heap_offsets_symmetric(
+        op, rank, world_size, "a prologue construct failure + rebuild"
+    )
+    _run_once(op, config)
+    op.finalize()
+
+
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+def test_construct_fails_before_the_barrier(torch_dist_process_manager, world_size):
+    """A ctor failure AHEAD of the entry barrier must not wedge. See the worker."""
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_construct_fails_before_the_barrier, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
