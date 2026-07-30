@@ -84,11 +84,16 @@ class RdmaManager {
   // ibv_dereg_mr destroys the lkey those posts carry. See MemoryInflightGate.
   std::shared_ptr<MemoryInflightGate> GetOrCreateLocalMemoryGate(MemoryUniqueId);
   // Close the gate to new posts and wait for outstanding ones to complete.
-  // Returns true if it drained. Removes the gate either way: a gate left in
-  // the map would be re-handed to a session built after the id is
-  // re-registered, and it is permanently `retiring_`, so every later post
-  // against the reused id would be refused.
+  // Returns true if it drained. KEEPS the retired gate in the map as a
+  // tombstone (creating one if the id had none) so that a session built during
+  // the dereg is REFUSED rather than handed a fresh live gate -- see the
+  // definition for the exact interleaving that erasing here left open
+  // (REVIEW_M #73-1/#74-1/#75-1). `ClearLocalMemoryGate` lifts the tombstone.
   bool QuiesceLocalMemory(MemoryUniqueId, int timeoutMs);
+  // Lift the tombstone: the id has been re-registered, so posting against it is
+  // safe again. Returns true if a RETIRED gate was cleared (i.e. the tombstone
+  // was doing work), false if there was nothing or it was still live.
+  bool ClearLocalMemoryGate(MemoryUniqueId);
 
   // Remote memory management APIs
   std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int remRdmaDevId,

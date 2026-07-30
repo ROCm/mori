@@ -348,23 +348,62 @@ std::shared_ptr<MemoryInflightGate> RdmaManager::GetOrCreateLocalMemoryGate(Memo
   return gate;
 }
 
+// REVIEW_M #73-1/#74-1/#75-1. This used to erase the gate BEFORE draining it,
+// and the erase was the hole. `InvalidateSessionsForMemory` runs one line
+// earlier, so a transfer thread misses the session cache and rebuilds:
+// `CreateSession` -> `GetOrCreateLocalMemoryGate(local.id)` -> with the entry
+// gone it MINTS A FRESH, NON-RETIRING gate -> `Acquire` succeeds -> it posts a
+// work request carrying the lkey, while this function drains the OLD gate,
+// sees 0, returns true, and `ibv_dereg_mr` runs underneath that live WR. The
+// same `CreateSession` also lazily re-`RegisterLocalMemory`s the id at :1996,
+// mid-dereg. Erasing was precisely what let the reentry escape the barrier the
+// barrier exists to be.
+//
+// So the gate is now a TOMBSTONE: it stays in the map, retiring, and every
+// later `GetOrCreateLocalMemoryGate` for the id hands back that same closed
+// gate, so the racing post is REFUSED (ERR_BAD_STATE, "re-register and retry")
+// instead of admitted. `RdmaBackend::RegisterMemory` clears it -- the id is
+// live again only once the caller has actually re-registered it. That is the
+// "until the id is re-registered" condition; it is deliberately NOT cleared by
+// `RegisterLocalMemory`, because CreateSession's lazy fill calls that and
+// clearing there would reopen this window verbatim.
+//
+// BEHAVIOUR CHANGE, called out for S/E rather than buried: before this, a
+// transfer issued with a STALE MemoryDesc after its dereg would silently
+// resurrect the region via that lazy fill and succeed. It now fails
+// ERR_BAD_STATE until RegisterMemory runs. Silently resurrecting a
+// deregistered buffer is the hazard, not the service.
 bool RdmaManager::QuiesceLocalMemory(MemoryUniqueId id, int timeoutMs) {
   std::shared_ptr<MemoryInflightGate> gate;
   {
     std::unique_lock<std::shared_mutex> lock(mu);
-    auto it = memGates_.find(id);
-    if (it == memGates_.end()) return true;  // nothing ever posted against it
-    gate = it->second;
-    // Erase while still holding the lock, BEFORE draining: a session built
-    // after this point must get a fresh gate, not this permanently-retiring
-    // one. Sessions already holding it keep it alive through their shared_ptr,
-    // which is what makes the drain below meaningful.
-    memGates_.erase(it);
+    auto& slot = memGates_[id];
+    // Insert-and-retire even when nothing ever posted against the id. The old
+    // early-return-true here was the same hole in its emptiest form: with no
+    // entry, a session built during the dereg mints a live gate and posts.
+    if (!slot) slot = std::make_shared<MemoryInflightGate>();
+    gate = slot;
   }
   // Dropped the lock on purpose. Quiesce blocks on the CQ poll thread, and
   // that thread takes `mu` on other paths -- holding it here would deadlock the
-  // very drain we are waiting for.
+  // very drain we are waiting for. Safe to drop precisely BECAUSE the entry is
+  // still there: whoever races in behind us finds the retiring gate.
   return gate->Quiesce(timeoutMs);
+}
+
+// The other half of the tombstone above. Called when the id is legitimately
+// re-registered (a PD flip re-registers every kv/aux/state buffer), which is
+// the only event that makes posting against it safe again. Erasing rather than
+// un-retiring: `MemoryInflightGate` is deliberately one-shot, and a token from
+// the old generation must not be able to keep the new gate's count off zero.
+// Returns whether a retired gate was actually cleared, for the log.
+bool RdmaManager::ClearLocalMemoryGate(MemoryUniqueId id) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  auto it = memGates_.find(id);
+  if (it == memGates_.end()) return false;
+  const bool wasRetiring = it->second && it->second->Retiring();
+  memGates_.erase(it);
+  return wasRetiring;
 }
 
 void RdmaManager::DeregisterLocalMemory(const MemoryDesc& desc) {
@@ -1814,7 +1853,20 @@ void RdmaBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
                rdesc.key, dropped);
 }
 
-void RdmaBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc); }
+// Lifting the tombstone QuiesceLocalMemory leaves is the SECOND half of the
+// dereg barrier, and it belongs here rather than in `RegisterLocalMemory`:
+// this is the explicit, caller-driven re-registration (a PD flip re-registers
+// every kv/aux/state buffer after teardown), whereas `RegisterLocalMemory` is
+// also reached by CreateSession's lazy per-device fill -- which is exactly the
+// racing path the tombstone must refuse.
+void RdmaBackend::RegisterMemory(MemoryDesc& desc) {
+  if (rdma && rdma->ClearLocalMemoryGate(desc.id)) {
+    MORI_IO_INFO("RegisterMemory: memory id {} was retired by a previous deregister; the gate is "
+                 "reopened and transfers against it are admitted again",
+                 desc.id);
+  }
+  server->RegisterMemory(desc);
+}
 
 // Order is load-bearing and each step closes a DIFFERENT window; REVIEW_M #70-1
 // is right that no permutation of the old three steps was sufficient.
