@@ -1,7 +1,26 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
-// MIT License (see repository LICENSE).
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 // ============================================================================
-// ADDITIVE, env-gated roctx markers for the MORI-IO HOST RDMA send path.
+// ADDITIVE, env-gated roctx markers for the MORI-IO host RDMA I/O path.
 //
 // TWO independent, additive instrumentations (each its own env gate; default OFF):
 //
@@ -9,16 +28,20 @@
 //       loop (IOEngine[Session]::BatchWrite + RdmaBatchReadWrite). These measure
 //       only the HOST POST cost (building WRs + ringing the NIC doorbell). They
 //       are stack/same-thread ranges (MoriRoctxRange RAII) and CANNOT span the
-//       async post->completion window. Marker names: mori.io.engine_batch_write,
-//       mori.rdma.batch_post.{write,read}.
+//       asynchronous post-to-completion interval. Marker names:
+//       mori.io.engine_batch_write, mori.rdma.batch_post.{write,read}.
 //
-//   (2) MORI_ROCTX_TRANSFER=1  -> ASYNCHRONOUS post->CQ ranges that measure the
-//       REAL KV transfer/wire duration: started when a *signaled* WR is posted
-//       (RdmaBatchReadWrite, needSignal branch) and stopped when its completion
-//       is reaped on the CQ (NotifManager::ProcessOneCqe -> ledger->ReleaseByCqe).
+//   (2) MORI_ROCTX_TRANSFER=1  -> ASYNCHRONOUS post-to-completion ranges. A range
+//       starts immediately before ibv_post_send for a *signaled* WR
+//       (RdmaBatchReadWrite, needSignal branch) and stops after its completion is
+//       reaped and its ledger record is processed
+//       (NotifManager::ProcessOneCqe -> ledger->ReleaseByCqe). This is
+//       post-to-completion latency, not wire-only time: it includes submission and
+//       ibv_post_send, NIC/SQ queueing, transfer, CQ availability/polling, and
+//       software processing through marker stop.
 //       Uses the PROCESS-WIDE async roctx API roctxRangeStartA/roctxRangeStop
 //       (start on the posting thread, stop on the CQ-poll thread). Marker name:
-//       mori.rdma.kv_transfer (its own dedicated trace lane).
+//       mori.rdma.io_transfer (reads use mori.rdma.io_transfer.read).
 //
 //       RDMA uses SELECTIVE SIGNALING: only the tail WR of each post batch sets
 //       IBV_SEND_SIGNALED and receives a SubmissionLedger recordId (== wr_id).
@@ -70,7 +93,7 @@ inline bool GateOn(const char* name) {
 
 struct RoctxApi {
   bool enabled = false;           // MORI_ROCTX: push/pop host-post anchors
-  bool transfer_enabled = false;  // MORI_ROCTX_TRANSFER: async post->cq ranges
+  bool transfer_enabled = false;  // MORI_ROCTX_TRANSFER: post-to-completion ranges
   roctx_range_push_t push = nullptr;
   roctx_range_pop_t pop = nullptr;
   roctx_mark_t mark = nullptr;
@@ -121,6 +144,11 @@ inline TransferRanges& transfer_ranges() {
 
 }  // namespace roctx_detail
 
+// Cheap, once-initialized gates for hot-path callers. When both environment
+// gates are off, api() reads them once and does not attempt to load ROCTx.
+inline bool MoriRoctxPostEnabled() noexcept { return roctx_detail::api().enabled; }
+inline bool MoriRoctxTransferEnabled() noexcept { return roctx_detail::api().transfer_enabled; }
+
 // RAII range: pushes on construction, pops on destruction (handles every return
 // path + exception). No-op when MORI_ROCTX is off. (HOST-POST anchor only.)
 class MoriRoctxRange {
@@ -145,8 +173,8 @@ class MoriRoctxRange {
   MoriRoctxRange(const char* name, uint64_t id, uint64_t bytes) {
     auto& a = roctx_detail::api();
     if (a.enabled) {
-      std::string s = std::string(name) + " bytes=" + std::to_string(bytes) +
-                      " id=" + std::to_string(id);
+      std::string s =
+          std::string(name) + " bytes=" + std::to_string(bytes) + " id=" + std::to_string(id);
       a.push(s.c_str());
       active_ = true;
     }
@@ -169,17 +197,16 @@ inline void MoriRoctxMark(const std::string& msg) {
   if (a.enabled && a.mark != nullptr) a.mark(msg.c_str());
 }
 
-// --- ASYNC post->cq KV-transfer ranges (MORI_ROCTX_TRANSFER) ------------------
-// Start an async range for a SIGNALED WR at post time. Keyed by (ledger,recordId).
+// --- ASYNC I/O post-to-completion ranges (MORI_ROCTX_TRANSFER) ---------------
+// Start an async range for a SIGNALED WR immediately before ibv_post_send.
+// Keyed by (ledger,recordId).
 inline void MoriRoctxTransferStart(const void* ledger, std::uint64_t recordId,
-                                   std::uint64_t transferId, bool isRead,
-                                   std::uint64_t bytes = 0) {
+                                   std::uint64_t transferId, bool isRead, std::uint64_t bytes = 0) {
   auto& a = roctx_detail::api();
   if (!a.transfer_enabled || a.range_start == nullptr || ledger == nullptr) return;
   // bytes= placed BEFORE id= so the end-anchored id= parsers keep matching.
-  std::string s =
-      std::string(isRead ? "mori.rdma.kv_transfer.read" : "mori.rdma.kv_transfer") +
-      " bytes=" + std::to_string(bytes) + " id=" + std::to_string(transferId);
+  std::string s = std::string(isRead ? "mori.rdma.io_transfer.read" : "mori.rdma.io_transfer") +
+                  " bytes=" + std::to_string(bytes) + " id=" + std::to_string(transferId);
   roctx_detail::roctx_range_id_t rid = a.range_start(s.c_str());
   auto& t = roctx_detail::transfer_ranges();
   std::lock_guard<std::mutex> lk(t.mu);

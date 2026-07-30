@@ -39,7 +39,7 @@
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/async_event_monitor.hpp"
 #include "src/io/rdma/protocol.hpp"
-#include "src/io/roctx_mori.hpp"  // ADDITIVE: MORI_ROCTX_TRANSFER async post->cq range stop
+#include "src/io/roctx_mori.hpp"  // ADDITIVE: async post-to-completion range stop
 namespace mori {
 namespace io {
 
@@ -750,7 +750,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         auto meta = ep.ledger
                         ? ep.ledger->ReleaseByCqe(wc[i].wr_id, ep.sqDepth.get(), &mergedBatchSize)
                         : nullptr;
-        // ADDITIVE (MORI_ROCTX_TRANSFER=1): stop the async post->cq range for this
+        // ADDITIVE (MORI_ROCTX_TRANSFER=1): stop the post-to-completion range for this
         // signaled WR on a FAILED/flush CQE (no-op if none was started for it).
         mori::io::MoriRoctxTransferStop(ep.ledger ? ep.ledger.get() : nullptr, wc[i].wr_id);
         if (meta) {
@@ -857,8 +857,8 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         auto meta = ep.ledger
                         ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &mergedBatchSize)
                         : nullptr;
-        // ADDITIVE (MORI_ROCTX_TRANSFER=1): stop the async post->cq range for this
-        // signaled WR on its SUCCESS CQE -> this is the real KV transfer duration.
+        // ADDITIVE (MORI_ROCTX_TRANSFER=1): stop the post-to-completion range after
+        // processing the signaled WR's successful CQE.
         mori::io::MoriRoctxTransferStop(ep.ledger ? ep.ledger.get() : nullptr, recordId);
         if (meta) {
           NotifySqStateChanged(ep);
