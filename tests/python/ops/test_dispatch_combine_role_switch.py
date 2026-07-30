@@ -177,6 +177,59 @@ def _heap_stats_required(rank, what):
     return stats
 
 
+def _assert_heap_offsets_symmetric(op, rank, world_size, after_what):
+    """Every rank's symmetric allocation must sit at the SAME OFFSET from its
+    own heap base. Returns the per-rank offsets it checked.
+
+    This is the cross-rank instrument T14 built (702e2f38's `heap_base`), and it
+    is the only one that can catch the corruption class review #4 item 2 warned
+    about: `RegisterStaticHeapSubRegion`
+    (application/memory/symmetric_memory.cpp:392) derives EVERY peer address as
+    `peerPtrs[i] + offset` using the LOCAL rank's offset for all i, with no
+    allgather to check it. Unequal offsets therefore mean each rank reads and
+    writes its peers at the wrong address -- silent corruption, not a hang.
+
+    Heap ACCOUNTING (total_free_space / num_mem_objs) does NOT imply this and so
+    cannot substitute for it: a deterministic first-fit VA manager can return
+    byte-identical totals for two different layouts. Every leak assertion in
+    this module checks accounting only, which is why this needs its own call.
+
+    NOT comparable, and asserting on it is a known false positive (T13): the raw
+    `local_ptr`, or `peer_ptrs[i]` against peer i's `local_ptr`. Each rank
+    hipMallocs its own heap wherever its allocator lands it, and for non-RDMA
+    peers `symmetric_memory.cpp:169-177` overwrites `peerPtrs[i]` with the
+    VIEWER-local address `hipIpcOpenMemHandle` returned. Offsets are the
+    comparable form; see the long note in `_worker_rank_asymmetric_heap_symmetry`.
+    """
+    if not dist.is_initialized():
+        return None
+    from mori.shmem import shmem_get_process_group
+
+    probe = op.probe_barrier_state()
+    assert probe is not None, (
+        f"rank {rank}: probe_barrier_state() unavailable -- the extension "
+        f"predates the probe binding and this offset check would silently "
+        f"measure nothing."
+    )
+    hs = _heap_stats_required(rank, f"heap base for the offset invariant ({after_what})")
+    mine = torch.tensor(
+        [int(probe["local_ptr"]) - int(hs["heap_base"])], dtype=torch.int64, device="cpu"
+    )
+    gathered = [torch.zeros_like(mine) for _ in range(world_size)]
+    dist.all_gather(gathered, mine, group=shmem_get_process_group())
+    offsets = [int(g.item()) for g in gathered]
+    assert len(set(offsets)) == 1, (
+        f"rank {rank}: symmetric HEAP OFFSETS DIVERGED after {after_what} -- "
+        f"per-rank offset of the barrier buffer from its own heap base = "
+        f"{offsets}. RegisterStaticHeapSubRegion (symmetric_memory.cpp:392) "
+        f"derives every peer address as peerPtrs[i] + offset using the LOCAL "
+        f"offset for all i, with no allgather to check, so unequal offsets "
+        f"mean every rank is reading and writing its peers at the wrong "
+        f"address. Heap accounting can be byte-identical while this is broken."
+    )
+    return offsets
+
+
 def _assert_capacity(op, expected_tokens):
     """The rebuilt buffers must actually be sized for the new role."""
     assert op.config.max_num_inp_token_per_rank == expected_tokens
@@ -2595,6 +2648,21 @@ def _worker_construct_fails_on_one_rank(rank, world_size):
     # what sglang's reconcile needs in order to retry or to fall back.
     op = mori.ops.EpDispatchCombineOp(config)
     _assert_capacity(op, DECODE_TOKENS)
+
+    # 4. The rebuilt group is SYMMETRIC, not merely balanced by byte count.
+    #    Review #58 item 4. The heap assertions above are accounting-only, and
+    #    this failure now runs TWO different free sequences in the same group:
+    #    3aab3b80 has the healthy ranks release LOCALLY inside __init__ with no
+    #    barrier, while rank 0 is freed by the C++ ctor's own error path
+    #    (dispatch_combine.cpp:118-127) -- two orderings, unsynchronized, which
+    #    is precisely the divergent-alloc-history setup that COORD v2's
+    #    "freeing is COLLECTIVE" rule exists to prevent. A first-fit VA manager
+    #    can hand back byte-identical totals for two different layouts, so the
+    #    offset invariant is the only thing that can see it.
+    _assert_heap_offsets_symmetric(
+        op, rank, world_size, "a failed construct + rebuild"
+    )
+
     _run_once(op, config)
     op.finalize()
 
