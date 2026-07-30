@@ -1636,6 +1636,85 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=Tru
         f"be vacuous."
     )
 
+    # (6) THE SPIN PREDICATES, BY VALUE. Everything above is an address.
+    #
+    # Five host-visible ADDRESS mechanisms have now each been measured across
+    # this exact asymmetry and none diverges (generation T11/T12b, heap
+    # accounting T10/T10d, instantaneous peer addressing T14b, barrier-object
+    # staleness T15e, all-object staleness/size/offset T16c) -- while
+    # `test_rank_asymmetric_reject`, which is this test plus a dispatch, still
+    # wedges. So the thing that differs is not an address.
+    #
+    # The one axis a reconfigure treats asymmetrically without moving anything:
+    # a rank that REBUILDS gets every buffer freshly allocated and zeroed
+    # (ShmemMallocAndReturnMemObjPtr:412 memsets; HipMallocOrThrow memsets),
+    # while a rank refused inside ValidateReconfigurable is refused BEFORE
+    # FinalizeAll and keeps whatever the last kernel left behind. The kernels
+    # spin on exactly those values:
+    #   intranode.hpp:181  WaitUntilEquals(dispatchGridBarrier, gridDim.x)
+    #   intranode.hpp:60   WaitUntilEquals(combineGridBarrier,  gridDim.x)
+    #   intranode.hpp:187  WaitUntilEquals(recvTokenNum[peer's copy], 0)
+    # The last is the sharpest: the SENDER spins on the RECEIVER's copy, so a
+    # nonzero residue on the non-rebuilding rank R wedges every PEER of R while
+    # R itself looks perfectly healthy.
+    #
+    # NOTE ON WHAT IS AND IS NOT ASSERTED. The invariant is NOT "all ranks are
+    # equal" -- that was the shape of both assertions this probe has already
+    # got wrong (T13's cross-rank VA equality, T15d's "nothing moved"), and
+    # both were caught by the control arm rather than by reasoning. The
+    # invariant asserted here is the one the protocol genuinely requires:
+    # entering a dispatch, every spin predicate must be at its RESTING value,
+    # which is 0 for all of them (each kernel clears what it consumed --
+    # dispatchGridBarrier at :182, recvTokenNum at :200). A quiesced op that is
+    # about to dispatch and holds a nonzero predicate cannot make progress,
+    # whatever its peers hold. The CONTROL arm is what makes a red here mean
+    # "the reject did this" rather than "a resize does this".
+    ctr = probe.get("counters")
+    assert ctr, (
+        f"rank {rank} [{arm}]: probe_barrier_state() returned no `counters` "
+        f"map, so the device-resident spin predicates -- the only axis of this "
+        f"op's state that is not an address -- were NOT measured. The .so is "
+        f"older than the python; rebuild and check BUILD_RC."
+    )
+    # Non-vacuity: the three plain-device scalars must all be present, or a
+    # green below is a green over an empty loop.
+    for required in ("dispatchGridBarrier", "combineGridBarrier", "totalRecvTokenNum"):
+        assert required in ctr, (
+            f"rank {rank} [{arm}]: counter {required!r} missing from the probe "
+            f"(got {sorted(ctr)}). This test would pass vacuously."
+        )
+    assert any(k.startswith("recvTokenNum[") for k in ctr), (
+        f"rank {rank} [{arm}]: no per-peer recvTokenNum counters in the probe "
+        f"(got {sorted(ctr)}) -- the symmetric spin predicate, and the sharpest "
+        f"case, was not measured."
+    )
+
+    nonzero = {k: int(v) for k, v in ctr.items() if int(v) != 0}
+    # Gather so a failure prints the whole group, not just the rank that
+    # happened to assert first: which ranks are dirty is the entire diagnosis
+    # (all of them => a resize does this and it is benign or a product bug in
+    # both arms; only the rejecting rank => the mechanism, proven).
+    dirty = torch.tensor([1 if nonzero else 0], dtype=torch.int64, device="cpu")
+    gathered_dirty = [torch.zeros_like(dirty) for _ in range(world_size)]
+    dist.all_gather(gathered_dirty, dirty, group=group)
+    dirty_rows = [int(g.item()) for g in gathered_dirty]
+
+    assert not nonzero, (
+        f"rank {rank} [{arm}]: DEVICE-RESIDENT SPIN PREDICATES ARE NONZERO "
+        f"entering the next dispatch: {nonzero}. Per-rank dirty flags across "
+        f"the group = {dirty_rows} (1 = holds a nonzero predicate). Each of "
+        f"these is spun on with WaitUntilEquals against a resting value of 0 "
+        f"(dispatchGridBarrier intranode.hpp:181 cleared at :182; "
+        f"combineGridBarrier :60 cleared at :61; recvTokenNum :187 cleared at "
+        f":200), so a nonzero residue makes the next spin unsatisfiable. Note "
+        f"recvTokenNum is spun on by the SENDER against the RECEIVER's copy, "
+        f"so a dirty rank wedges its PEERS, not itself. A rank that rebuilt got "
+        f"these zeroed by the allocator; a rank refused inside "
+        f"ValidateReconfigurable is refused BEFORE FinalizeAll and keeps the "
+        f"last kernel's residue. If the dirty set is exactly the rejecting "
+        f"rank AND the control arm is green, this is the wedge, measured."
+    )
+
 
 def _worker_reconfigure_rejects_immutable_fields(rank, world_size):
     """numQpPerPe / useExternalInpBuffer are peer-visible; they must be frozen.
