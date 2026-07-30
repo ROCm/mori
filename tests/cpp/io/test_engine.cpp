@@ -1112,8 +1112,9 @@ void CaseRdmaTransferSurvivesConcurrentDeregister() {
           "instrument check: expected " + std::to_string(kCycles) +
               " deregisters, got " + std::to_string(deregsDone.load()));
 
-  // The engine must still be USABLE afterwards -- a wedged or corrupted engine
-  // would otherwise let the case pass by simply not crashing.
+  // The engine must still be USABLE afterwards. THIS IS THE ARM THAT FAILS, and
+  // it found a defect BIGGER than the one the case was written for -- see the
+  // T36 note below. Kept RED on purpose: it is the honest state of the code.
   auto dst = RegisterGpuMemory(pair.target.get(), 4096, 0);
   TransferStatus good;
   TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
@@ -1126,6 +1127,44 @@ void CaseRdmaTransferSurvivesConcurrentDeregister() {
   std::printf("[dereg-race] %d transfers across %d deregister cycles, engine still serving\n",
               transfersIssued.load(), deregsDone.load());
 }
+
+// T36 MEASURED RESULT of the case above, recorded AT the code so nobody has to
+// find the log: it FAILS, and NOT from the use-after-free.
+//
+//   [FAIL] rdma_transfer_survives_concurrent_deregister (1421 ms):
+//          post-race transfer failed: Work Request Flushed Error
+//   ProcessOneCqe: [ROOT CAUSE] CQE error: wr_id=1025 status=10(remote access
+//          error) qp_num=42863 vendor_err=136
+//   ... then ~700 identical "1 flush errors ... representative eid=1
+//          qp_num=42863" rounds, the SAME qp_num, forever.
+//
+// The mechanism, and why it matters far more than a leak:
+//  1. A transfer is in flight against a memory region; DeregisterMemory
+//     destroys its MR on the TARGET side.
+//  2. The in-flight RDMA read lands on a dead rkey -> CQE status 10
+//     IBV_WC_REM_ACCESS_ERR. On a **Reliable Connected** QP that transitions
+//     the QP to ERROR state -- an RC QP does not fail one work request, it
+//     fails the CONNECTION.
+//  3. Every subsequent WR on that QP completes IBV_WC_WR_FLUSH_ERR. mori has
+//     NO recovery: `grep ibv_modify_qp src/io` is EMPTY (all matches are in
+//     src/application/transport), so nothing ever brings the QP back through
+//     RESET->INIT->RTR->RTS.
+//  4. `CreateSession` (backend_impl.cpp:1621) reuses whatever endpoints
+//     already exist -- `CountEndpoint` >= qpPerTransfer means BuildRdmaConn is
+//     skipped -- so even a brand-new session for a brand-new memory id is
+//     handed the SAME dead QP. That is why the final transfer, on a freshly
+//     registered descriptor, still fails.
+//
+// Consequence for the campaign: sglang's flip teardown deregisters every
+// kv/aux/state desc while the peer may still have reads outstanding. If that
+// race is hit, the SURVIVING peer's QP to that engine is dead for the lifetime
+// of the process and every later transfer fails -- not slow, not leaky: down.
+// That is a flip-robustness blocker, and it is the next thing to fix.
+//
+// NOT YET MEASURED: whether sglang actually leaves reads in flight across its
+// teardown (it drains first, in which case this needs the drain to be proven,
+// not assumed). Also unmeasured: ASAN RED/GREEN for the use-after-free, which
+// this failure now MASKS -- the case aborts before the sanitizer arm matters.
 
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
