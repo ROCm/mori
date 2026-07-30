@@ -85,6 +85,11 @@ class RdmaManager {
   void RegisterRemoteMemory(EngineKey, int remRdmaDevId, MemoryUniqueId,
                             application::RdmaMemoryRegion);
   void DeregisterRemoteMemory(EngineKey, int remRdmaDevId, MemoryUniqueId);
+  // Drops EVERY cached remote MR for one engine. Needed on a PD role flip: the
+  // peer tears down and re-registers its buffers, so every rkey we cached for
+  // it is dead. Returns how many entries were dropped (0 == we had nothing
+  // cached for that engine), so the caller can log it.
+  std::size_t InvalidateRemoteMemoryForEngine(const EngineKey&);
 
   // Endpoint management APIs
   int CountEndpoint(EngineKey, TopoKeyPair);
@@ -363,6 +368,12 @@ class RdmaBackend : public Backend {
                                                       const MemoryDesc& remote,
                                                       TransferStatus* status);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
+  // Engine-scoped counterpart of the above, for a peer that flipped role. The
+  // sessionCache is keyed {engineKey, localId, remoteId} and holds MRs/endpoint
+  // sets captured at CreateSession time, so without this a post-flip transfer
+  // to the same {local,remote} id pair reuses the peer's PRE-flip rkeys and
+  // never calls CreateSession at all.
+  void InvalidateSessionsForEngine(const EngineKey& ekey);
   std::shared_ptr<std::mutex> GetConnBuildLock(const EngineKey& remoteEngineKey,
                                                const TopoKeyPair& topo);
 

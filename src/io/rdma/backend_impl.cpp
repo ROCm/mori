@@ -373,6 +373,19 @@ void RdmaManager::DeregisterRemoteMemory(EngineKey ekey, int remRdmaDevId, Memor
   }
 }
 
+std::size_t RdmaManager::InvalidateRemoteMemoryForEngine(const EngineKey& ekey) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  auto it = remotes.find(ekey);
+  if (it == remotes.end()) return 0;
+  // Only the MEMORY table is dropped, deliberately. rTable/endpoints are the
+  // QP-level state; tearing those down here would race the transfer threads
+  // that hold endpoint handles. The rkeys are what a flip actually
+  // invalidates, and AskRemoteMemoryRegion re-fetches them on the next miss.
+  std::size_t dropped = it->second.mTable.size();
+  it->second.mTable.clear();
+  return dropped;
+}
+
 /* ------------------------------------- Endpoint Management ------------------------------------ */
 int RdmaManager::CountEndpoint(EngineKey engine, TopoKeyPair key) {
   std::shared_lock<std::shared_mutex> lock(mu);
@@ -1422,7 +1435,15 @@ void RdmaBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
 }
 
 void RdmaBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
+  // Order matters: stop NEW sessions from being built against the dead engine
+  // first (BuildRdmaConn throws once `engines` no longer has it), then drop the
+  // state a session would have been built FROM. The reverse order leaves a
+  // window in which a transfer thread re-populates what we just cleared.
   server->DeregisterRemoteEngine(rdesc);
+  InvalidateSessionsForEngine(rdesc.key);
+  std::size_t dropped = rdma->InvalidateRemoteMemoryForEngine(rdesc.key);
+  MORI_IO_INFO("Deregistered remote engine {}: dropped {} cached remote memory region(s)",
+               rdesc.key, dropped);
 }
 
 void RdmaBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc); }
@@ -1664,6 +1685,17 @@ RdmaBackendSession* RdmaBackend::GetOrCreateSessionCachedNoThrow(const MemoryDes
                      std::string("Failed to establish RDMA session: ") + e.what());
     }
     return nullptr;
+  }
+}
+
+void RdmaBackend::InvalidateSessionsForEngine(const EngineKey& ekey) {
+  std::lock_guard<std::mutex> lock(sessionCacheMu);
+  for (auto it = sessionCache.begin(); it != sessionCache.end();) {
+    if (it->first.remoteEngineKey == ekey) {
+      it = sessionCache.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 
