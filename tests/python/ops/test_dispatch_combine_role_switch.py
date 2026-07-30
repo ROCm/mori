@@ -1715,6 +1715,69 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=Tru
         f"rank AND the control arm is green, this is the wedge, measured."
     )
 
+    # (7) THE PUBLISHED BARRIER SLOTS, BY VALUE.
+    #
+    # `probe["slots"]` is the second device-resident quantity this probe
+    # collects (dispatch_combine.cpp hipMemcpy's the worldSize uint64s at the
+    # base of crossDeviceBarrierMemObj) and until now nothing read it. It is
+    # NOT redundant with (1)'s generation check or with (6): the generation is
+    # this rank's own PRIVATE counter (`crossDeviceBarrierFlag`, plain
+    # hipMalloc, host-visible), while the slots are what this rank's PEERS
+    # published into its symmetric buffer. The barrier at intranode.hpp:71-73
+    # reads the LOCAL buffer's slots and spins until slot[i] equals the
+    # generation the kernel latched at :467 -- so a slot's value relative to
+    # the generation, not the generation alone, is what decides progress.
+    #
+    # Two distinct failure modes, and the assertion has to distinguish them:
+    #   slot > gen  -> the spin at :73 is UNSATISFIABLE for that peer; the
+    #                  comparison is `!=` and the slot is only ever stored, not
+    #                  incremented, so no future barrier of this generation can
+    #                  ever match. A hang.
+    #   slot < gen  -> merely a peer that has not arrived yet; normal in flight,
+    #                  and 0 is exactly what a fresh allocation gives.
+    # ResetBarrierGeneration (dispatch_combine.cpp:842-850) memsets this buffer
+    # to 0 and re-seeds the generation to BarrierGenerationSeed() precisely so
+    # a rank that did NOT rebuild cannot keep slots its peers wrote at a
+    # generation nobody will reach again. A rejected rank is the one that skips
+    # FinalizeAll, so it is the one whose slots could survive -- which makes
+    # this a direct test of whether that reset actually reaches the reject path.
+    #
+    # Asserted as a rank-LOCAL invariant against this rank's own generation,
+    # deliberately not as a cross-rank equality: both cross-rank equalities
+    # this probe has carried (T13, T15d) were wrong in the safe direction and
+    # were caught by the control arm rather than by reasoning.
+    slots = probe.get("slots")
+    assert slots is not None and len(slots) == world_size, (
+        f"rank {rank} [{arm}]: probe_barrier_state() returned "
+        f"{0 if slots is None else len(slots)} barrier slots, expected "
+        f"{world_size}. The published side of the cross-device barrier was NOT "
+        f"measured and a green here would be vacuous."
+    )
+    my_gen = int(probe["generation"])
+    unsatisfiable = {
+        i: int(s) for i, s in enumerate(slots) if int(s) > my_gen
+    }
+    slot_rows_t = torch.tensor([int(s) for s in slots], dtype=torch.int64, device="cpu")
+    gathered_slots = [torch.zeros_like(slot_rows_t) for _ in range(world_size)]
+    dist.all_gather(gathered_slots, slot_rows_t, group=group)
+    all_slots = [[int(v) for v in g.tolist()] for g in gathered_slots]
+
+    assert not unsatisfiable, (
+        f"rank {rank} [{arm}]: PUBLISHED BARRIER SLOTS ARE AHEAD OF THIS "
+        f"RANK'S GENERATION. This rank's generation is {my_gen}; peer slots "
+        f"{unsatisfiable} exceed it. The barrier spin at intranode.hpp:73 is "
+        f"`while (slot[i] != generation)`, and slots are STORED (:65-66), "
+        f"never incremented past by waiting -- so a slot already beyond the "
+        f"generation this kernel latched at :467 can never match and that "
+        f"barrier hangs. Slots as seen by every rank = {all_slots}. A rank "
+        f"refused inside ValidateReconfigurable never reaches FinalizeAll, so "
+        f"it is the one that can keep slots its peers wrote at a generation "
+        f"nobody will publish again; ResetBarrierGeneration "
+        f"(dispatch_combine.cpp:842-850) exists to memset exactly this buffer "
+        f"and re-seed the generation. If only the rejecting rank is listed and "
+        f"the control arm is green, that reset is not reaching the reject path."
+    )
+
 
 def _worker_reconfigure_rejects_immutable_fields(rank, world_size):
     """numQpPerPe / useExternalInpBuffer are peer-visible; they must be frozen.
