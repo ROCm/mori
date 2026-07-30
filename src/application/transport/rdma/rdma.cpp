@@ -33,6 +33,10 @@
 #include <unordered_set>
 
 #include "infiniband/verbs.h"
+
+#include <hsa/hsa.h>
+#include <hsa/hsa_ext_amd.h>
+
 #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
 #include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
@@ -437,15 +441,33 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufI
   return handle;
 }
 
-// Export a dmabuf fd for the GPU buffer at `ptr`. Returns -1 if unsupported.
-static int TryExportDmabufFd(void* ptr, size_t size) {
+// Export a dmabuf fd for the GPU buffer at `ptr`, and report the offset of `ptr`
+// within the exported dmabuf via `*offset`. Returns -1 if unsupported.
+//
+// hipMemGetHandleForAddressRange exports an fd for the *backing* allocation but
+// does not report where `ptr` sits inside it; callers previously assumed offset
+// 0. That is wrong when `ptr` is a sub-region of a larger allocation (e.g. a
+// pooled KV buffer): the dmabuf covers the whole backing block, so registering
+// with offset 0 produces an MR whose lkey/rkey resolve to the base of the pool
+// instead of `ptr`. On the wire this surfaces as IBV_WC_LOC_PROT_ERR (or, worse,
+// silent writes to the wrong address). hsa_amd_portable_export_dmabuf reports the
+// true byte offset, so prefer it and fall back to the hip path (offset 0, correct
+// only for whole-allocation exports) when HSA export is unavailable.
+static int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
   int fd = -1;
+  uint64_t off = 0;
+  hsa_status_t hs = hsa_amd_portable_export_dmabuf(ptr, size, &fd, &off);
+  if (hs == HSA_STATUS_SUCCESS && fd >= 0) {
+    *offset = off;
+    return fd;
+  }
   hipError_t err = hipMemGetHandleForAddressRange(&fd, reinterpret_cast<hipDeviceptr_t>(ptr), size,
                                                   hipMemRangeHandleTypeDmaBufFd, 0);
   if (err != hipSuccess) {
     (void)hipGetLastError();
     return -1;
   }
+  *offset = 0;
   return fd;
 }
 
@@ -465,9 +487,10 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(vo
   };
   auto tryPlain = [&]() -> ibv_mr* { return ibv_reg_mr(pd, ptr, size, effectiveAccessFlag); };
   auto tryDmabuf = [&]() -> ibv_mr* {
-    int dmabufFd = TryExportDmabufFd(ptr, size);
+    uint64_t dmabufOffset = 0;
+    int dmabufFd = TryExportDmabufFd(ptr, size, &dmabufOffset);
     if (dmabufFd < 0) return nullptr;
-    ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabufFd,
+    ibv_mr* mr = ibv_reg_dmabuf_mr(pd, dmabufOffset, size, reinterpret_cast<uint64_t>(ptr), dmabufFd,
                                    effectiveAccessFlag);
     close(dmabufFd);
     return mr;
