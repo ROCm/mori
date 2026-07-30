@@ -21,6 +21,11 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 
+#include <cerrno>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/mori_log.hpp"
 namespace mori {
@@ -92,7 +97,27 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
                                  },
                              .qp_type = IBV_QPT_RC};
   endpoint.ibvHandle.qp = ibv_create_qp(pd, &qpAttr);
-  assert(endpoint.ibvHandle.qp);
+  if (endpoint.ibvHandle.qp == nullptr) {
+    // Not an assert(). This is the most common RDMA bring-up failure and an
+    // assert discards the one thing that distinguishes its causes -- errno --
+    // AND is compiled out entirely under NDEBUG, where the very next line then
+    // dereferences nullptr and the process dies with no diagnostic at all.
+    // ENOMEM means the HCA's QP/CQ budget is exhausted (too many ranks x
+    // numQpPerPe for this device); EINVAL means the requested caps exceed the
+    // device attributes, i.e. a config error. Those need opposite fixes and a
+    // bare abort cannot tell a caller which one it hit.
+    const int err = errno;
+    throw std::runtime_error(
+        "mori: ibv_create_qp failed: " + std::string(std::strerror(err)) +
+        " (errno=" + std::to_string(err) +
+        "). Requested max_send_wr=" + std::to_string(config.maxMsgsNum) +
+        ", max_recv_wr=" + std::to_string(maxRecvWr) +
+        ", max_send_sge=" + std::to_string(config.maxMsgSge) +
+        ", cq_size=" + std::to_string(config.maxCqeNum) +
+        ". ENOMEM usually means the device's QP/CQ resources are exhausted "
+        "(reduce numQpPerPe or the EP world size); EINVAL usually means these "
+        "caps exceed the device attributes.");
+  }
   endpoint.handle.qpn = endpoint.ibvHandle.qp->qp_num;
 
   if (config.enableSrq)
