@@ -96,7 +96,17 @@ PYVRAM
     # regression run sat 18 min with two defunct workers and a 91-byte log for
     # exactly this reason.
     full="${MORI_TEST_FULL_LOG:-/tmp/mori_suite_full.log}"
-    PYTHONPATH="$REPO/python" python -m pytest -q -s -p no:cacheprovider \
+    # `-v`, not `-q`. Under -q the run prints `....` and a bare
+    # "4 passed, 24 deselected" -- which does not say WHICH four. T28a shipped
+    # "27 passed, 1 deselected" as "the first unqualified full-suite green"
+    # when the ONE deselected test was `test_rank_asymmetric_reject`, the only
+    # one that had ever wedged (review #62 item 4); and T30a's "4 passed" could
+    # not be cited for that test without a separate --collect-only run to prove
+    # it was in the selection. A green whose scope has to be reconstructed
+    # afterwards is the same defect class as a vacuous assertion: the number is
+    # true and it does not mean what it appears to mean. -v prints one
+    # `nodeid PASSED/FAILED` line per test, so the log states its own scope.
+    PYTHONPATH="$REPO/python" python -m pytest -v -s -p no:cacheprovider \
       "$target" "$@" 2>&1 | tee "$full" | tail -60
     rc=${PIPESTATUS[0]}
     echo "FULL_LOG=$full ($(wc -l < "$full") lines)"

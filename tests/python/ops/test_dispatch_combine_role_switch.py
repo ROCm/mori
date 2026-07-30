@@ -2628,6 +2628,32 @@ def _worker_construct_fails_on_one_rank(rank, world_size):
             "construction failed on at least one peer" in message
         ), f"rank {rank}: expected the group verdict, got: {message}"
 
+        # AND the peer actually RELEASED. Review #62 item 3 (second ask):
+        # `7f9815d1` gated that release on `_local_free_is_safe()`, and until
+        # now nothing anywhere referenced it (`grep -rc _local_free_is_safe
+        # tests/` was 0). The gate is correct -- under vmm_heap `VMMFreeChunk`
+        # is an unconditional `bootNet.Allgather` (symmetric_memory.cpp:1544)
+        # and releasing would deadlock against the rank that just died -- but a
+        # gate that returned False *always*, e.g. if the mode probe it rests on
+        # were renamed or started throwing, would read as a clean pass here:
+        # the peers would keep their full buffers, and the heap assertions
+        # below would... also still pass, because they are taken AFTER the
+        # release and would simply compare a not-freed heap against itself.
+        # That is the exact vacuity this campaign keeps finding.
+        #
+        # This suite runs in StaticHeap mode (conftest sets MORI_SHMEM_HEAP_SIZE
+        # and nothing sets MORI_SHMEM_MODE), so `_local_free_is_safe()` MUST be
+        # True here and the message MUST NOT carry the not-released suffix.
+        # Asserted on the string rather than on the heap precisely because the
+        # heap cannot tell the two apart at this point.
+        assert "were NOT released" not in message, (
+            f"rank {rank}: the peer did NOT release its symmetric buffers in "
+            f"StaticHeap mode. `_local_free_is_safe()` must be True here -- if "
+            f"it has become unconditionally False, every peer of a failed "
+            f"construct now leaks its full buffers and the heap checks below "
+            f"cannot see it. Message: {message}"
+        )
+
     # THE ASSERTION THIS TEST EXISTS FOR: a failed construct costs the heap
     # nothing, on every rank. Exact equality, per _worker_leak_stress's
     # reasoning -- the symmetric heap is a deterministic first-fit VA manager,
