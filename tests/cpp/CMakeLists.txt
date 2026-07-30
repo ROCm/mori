@@ -24,6 +24,17 @@ target_include_directories(test_transport_ibverbs PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_transport_ibverbs mori_application)
 
 if(BUILD_IO)
+  # Executed coverage for 19b718f3's hdr.len bound + type validation. Registered
+  # with add_test so `ctest` runs it: the reason `tests/cpp/io/test_protocol.cpp`
+  # rotted into non-compiling (it still calls MessageRegEngine, removed from the
+  # header) is that it was never in this file, so nothing ever built it.
+  add_executable(test_protocol_header io/test_protocol_header.cpp)
+  target_include_directories(test_protocol_header
+                             PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_protocol_header PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_protocol_header mori_application mori_io)
+  add_test(NAME test_protocol_header COMMAND test_protocol_header)
+
   add_executable(test_engine io/test_engine.cpp)
 
   target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR}/include)
