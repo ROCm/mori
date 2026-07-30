@@ -336,6 +336,15 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
           objs[py::str(o.name)] = e;
         }
         d["objects"] = objs;
+        // Device-resident CONTENTS of the spin predicates, name-keyed. Every
+        // other field of this probe is an address; these are values, and they
+        // are the only axis of the op's state that a reconfigure treats
+        // asymmetrically without any address changing. See BarrierProbe.
+        py::dict ctrs;
+        for (const auto& c : p.counters) {
+          ctrs[py::str(c.first)] = c.second;
+        }
+        d["counters"] = ctrs;
         return d;
       });
 

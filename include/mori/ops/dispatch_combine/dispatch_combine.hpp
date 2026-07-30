@@ -354,6 +354,33 @@ class EpDispatchCombineHandle {
       std::vector<uintptr_t> peerPtrs;
     };
     std::vector<SymmObjProbe> objects;
+    // DEVICE-RESIDENT CONTENTS of the plain-device scalars a kernel spins on.
+    //
+    // Everything else in this struct is an ADDRESS. Five host-visible
+    // mechanisms have now each been measured across an asymmetric reject and
+    // none diverges (generation, heap accounting, instantaneous peer
+    // addressing, barrier-object staleness, all-object staleness/size/offset),
+    // so the address space is exhausted and the remaining suspect is state
+    // that lives in device memory and is not an address.
+    //
+    // These three are the spin predicates:
+    //   dispatchGridBarrier -- intranode.hpp:181 `WaitUntilEquals(.., gridDim.x)`
+    //   combineGridBarrier  -- intranode.hpp:60   same
+    //   totalRecvTokenNum   -- accumulated at :201, read by the host after
+    // and they are the ONLY buffers in the op that a reconfigure treats
+    // asymmetrically in a way no address check can see: a rank that rebuilds
+    // gets them freshly hipMalloc'd and memset to 0, while a rank refused
+    // inside ValidateReconfigurable keeps whatever the last kernel left in
+    // them. If that residue is ever nonzero, the non-rebuilding rank enters
+    // its next dispatch with a grid-barrier count that is already offset, so
+    // `WaitUntilEquals(gridDim.x)` is unsatisfiable -- an in-kernel spin, on
+    // one rank, with every address on every rank perfectly symmetric. That is
+    // the exact signature of the wedge.
+    //
+    // Recorded as a name-keyed map for the same reason `objects` is: the set
+    // is not fixed across kernel types and a positional diff would pair up
+    // unrelated counters.
+    std::vector<std::pair<std::string, uint64_t>> counters;
   };
   BarrierProbe ProbeBarrierState() const;
 

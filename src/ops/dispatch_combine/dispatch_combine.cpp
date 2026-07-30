@@ -931,6 +931,57 @@ EpDispatchCombineHandle::BarrierProbe EpDispatchCombineHandle::ProbeBarrierState
   record("nodeRecvTokenNum", nodeRecvTokenNumMemObj);
   record("crossDeviceBarrier", crossDeviceBarrierMemObj);
 
+  // The plain-device spin predicates, by VALUE. See BarrierProbe::counters:
+  // these are the only buffers a reconfigure treats asymmetrically in a way no
+  // address comparison can observe -- a rebuilding rank gets them zeroed, a
+  // rank refused before FinalizeAll keeps the last kernel's residue.
+  //
+  // Tolerate a failed copy rather than aborting: this is a diagnostic and it
+  // must never be the thing that kills the run it is diagnosing.
+  auto readScalar = [&](const char* name, const void* ptr, size_t width) {
+    if (ptr == nullptr) return;
+    uint64_t v = 0;
+    if (hipMemcpy(&v, ptr, width, hipMemcpyDeviceToHost) != hipSuccess) {
+      (void)hipGetLastError();
+      return;
+    }
+    p.counters.emplace_back(name, v);
+  };
+  // barrierSize = worldSize*sizeof(uint32_t), so element 0 is the one
+  // intranode.hpp:174 atomicAdds and :181 spins on.
+  readScalar("dispatchGridBarrier", dispatchGridBarrier, sizeof(uint32_t));
+  readScalar("combineGridBarrier", combineGridBarrier, sizeof(uint32_t));
+  readScalar("totalRecvTokenNum", totalRecvTokenNum, sizeof(index_t));
+
+  // recvTokenNum is SYMMETRIC and it is the sharpest case of the same class.
+  // The intranode dispatch protocol has the SENDER spin on the RECEIVER's copy
+  // -- `signal = recvTokenNumMemObj->GetAs<index_t*>(destPe) + myPe;
+  //    ShmemInt32WaitUntilEquals(signal, 0)` (intranode.hpp:186-188) -- i.e. it
+  // waits for the peer to have drained the previous round before publishing.
+  // The receiver clears it at :200. So a nonzero residue in rank R's copy makes
+  // every peer of R spin forever at :187, and R itself looks perfectly healthy:
+  // the wedge is on the ranks that did nothing wrong. A rank that rebuilds gets
+  // this buffer freshly allocated and memset to 0
+  // (ShmemMallocAndReturnMemObjPtr:412); a rank refused inside
+  // ValidateReconfigurable never re-allocates it. Record the worldSize entries
+  // a peer would spin on, one per source rank.
+  if (recvTokenNumMemObj.cpu != nullptr && recvTokenNumMemObj.gpu != nullptr &&
+      config.worldSize > 0) {
+    const void* base = recvTokenNumMemObj->Get();
+    size_t want = static_cast<size_t>(config.worldSize) * sizeof(index_t);
+    if (base != nullptr && recvTokenNumMemObj->size >= want) {
+      std::vector<index_t> vals(config.worldSize);
+      if (hipMemcpy(vals.data(), base, want, hipMemcpyDeviceToHost) == hipSuccess) {
+        for (int i = 0; i < config.worldSize; ++i) {
+          p.counters.emplace_back("recvTokenNum[" + std::to_string(i) + "]",
+                                  static_cast<uint64_t>(vals[i]));
+        }
+      } else {
+        (void)hipGetLastError();
+      }
+    }
+  }
+
   if (crossDeviceBarrierMemObj.cpu == nullptr || crossDeviceBarrierMemObj.gpu == nullptr) {
     return p;
   }
