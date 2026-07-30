@@ -959,8 +959,15 @@ void ControlPlaneServer::AcceptRemoteEngineConn() {
 }
 
 void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
-  assert(eps.find(fd) != eps.end());
-  application::TCPEndpointHandle tcph = eps[fd];
+  // Not an assert: under -O3 -DNDEBUG (build/CMakeCache.txt:97) it is compiled
+  // out, and `eps[fd]` on a missing key would then default-CONSTRUCT a handle
+  // with an indeterminate fd and Recv on it.
+  auto epIt = eps.find(fd);
+  if (epIt == eps.end()) {
+    MORI_IO_WARN("ControlPlaneServer: event for unknown fd {}, ignoring", fd);
+    return;
+  }
+  application::TCPEndpointHandle tcph = epIt->second;
 
   // Detect remote close: Recv returns 0 for both success and EOF, so
   // SYSCALL_RETURN_ZERO can't distinguish them — peek before reading to avoid
@@ -969,8 +976,7 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
     char probe;
     if (::recv(fd, &probe, 1, MSG_PEEK) == 0) {
       MORI_IO_DEBUG("ControlPlaneServer: peer closed connection on fd {}", fd);
-      ctx->CloseEndpoint(tcph);
-      eps.erase(fd);
+      DropControlPlaneConn(fd);
       return;
     }
   }
@@ -1036,9 +1042,37 @@ void ControlPlaneServer::MainLoop() {
         continue;
       }
 
-      HandleControlPlaneProtocol(fd);
+      // A throw out of here used to propagate to the top of this std::thread,
+      // where C++ calls std::terminate -- the whole process dies, and the only
+      // trace is `_Unwind_RaiseException` in a thread with no Python frame.
+      // The reachable throws are real, not hypothetical: `msgpack::unpack` on a
+      // truncated/garbage control message (protocol.cpp:49,64) raises
+      // msgpack::unpack_error, and the `std::vector<char> buf(len)` on the line
+      // before it raises std::length_error for an absurd `hdr.len`.
+      // One malformed message from one peer must cost that CONNECTION, not the
+      // engine: drop the fd the same way the peer-closed branch does and keep
+      // serving everyone else.
+      try {
+        HandleControlPlaneProtocol(fd);
+      } catch (const std::exception& e) {
+        MORI_IO_ERROR("ControlPlaneServer: dropping fd {} after exception: {}", fd, e.what());
+        DropControlPlaneConn(fd);
+      } catch (...) {
+        MORI_IO_ERROR("ControlPlaneServer: dropping fd {} after unknown exception", fd);
+        DropControlPlaneConn(fd);
+      }
     }
   }
+}
+
+void ControlPlaneServer::DropControlPlaneConn(int fd) {
+  auto it = eps.find(fd);
+  if (it == eps.end()) return;
+  // close() removes the fd from the epoll set implicitly, so no epoll_ctl(DEL)
+  // here -- and an explicit DEL after close would fail EBADF, which
+  // SYSCALL_RETURN_ZERO turns into exit(-1).
+  ctx->CloseEndpoint(it->second);
+  eps.erase(it);
 }
 
 void ControlPlaneServer::Start() {

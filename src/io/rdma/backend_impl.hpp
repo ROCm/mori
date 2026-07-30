@@ -233,6 +233,10 @@ class ControlPlaneServer {
  private:
   void AcceptRemoteEngineConn();
   void HandleControlPlaneProtocol(int fd);
+  // Close and forget one control-plane fd. Called both on peer-close and when
+  // HandleControlPlaneProtocol throws, so a bad message costs the connection
+  // rather than std::terminate-ing the engine from MainLoop's thread.
+  void DropControlPlaneConn(int fd);
 
  private:
   EngineKey myEngKey;
