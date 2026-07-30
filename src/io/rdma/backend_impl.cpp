@@ -1062,6 +1062,21 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       // server one second after a successful role flip. A message type this
       // build does not handle must cost that CONNECTION, not the process:
       // MainLoop's catch drops the fd and keeps serving every other peer.
+      //
+      // REACHABILITY, and it matters for how E's crash is read. As of
+      // `19b718f3` this arm is DEAD by construction on the server path:
+      // MessageType has exactly two enumerators, both have `case` arms above,
+      // and `ReadMessageHeader()` throws on anything else BEFORE the switch is
+      // reached. E's abort was on a server launched 08:23Z, ~1.5 h BEFORE
+      // 19b718f3 landed at 10:01Z, when nothing validated the type -- so that
+      // crash is already fixed by 19b718f3, and this throw is the belt to its
+      // braces. It is still worth having and NOT dead code to the compiler: a
+      // future enumerator added to MessageType, or a `hdr.type` that acquires a
+      // third legal value, lands here, and the difference between an abort and
+      // a dropped connection is the difference between a dead serving instance
+      // and one bad peer. Do not read a passing test of this arm as a
+      // reproduction of E's crash -- it is not, and the repro requires reverting
+      // 19b718f3's validation.
       throw std::runtime_error(
           "mori::io control-plane: unhandled message type " +
           std::to_string(static_cast<unsigned>(hdr.type)) + " (len " + std::to_string(hdr.len) +
