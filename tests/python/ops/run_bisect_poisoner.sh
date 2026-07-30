@@ -88,6 +88,15 @@ case "$MODE" in
   *) echo "unknown mode: $MODE" >&2; exit 98 ;;
 esac
 
-export MORI_TEST_FULL_LOG="/home/mingzliu/pdrs_ext_team/logs/mori_test_M_${NAME}_full.log"
+# The full-log path carries a run-unique stamp. Deriving it from the MODE alone
+# meant re-running a mode silently OVERWROTE the previous run's full log, and
+# that is not a hypothetical: the post-fix verification of `t20repro` destroyed
+# the very artifact holding T21f's device-side assertion and HSA abort -- the
+# only archived evidence of the RED being fixed. Same class as the T6 91-byte
+# log and the T5a PYTEST_RC-measures-tail defects: the harness eating its own
+# evidence, which in a no-fabrication campaign is the most expensive kind of bug.
+STAMP="$(date -u +%H%M%S)"
+export MORI_TEST_FULL_LOG="/home/mingzliu/pdrs_ext_team/logs/mori_test_M_${NAME}_${STAMP}_full.log"
+echo "=== FULL_LOG: $MORI_TEST_FULL_LOG ==="
 bash tests/python/ops/run_role_switch_suite.sh test -k "$KEXPR"
 echo "RUNNER_RC=$?"
