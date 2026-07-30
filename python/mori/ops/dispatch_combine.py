@@ -542,7 +542,39 @@ class EpDispatchCombineOp:
         """Per-body default (block_num, warp_per_block) for the IntraNode dispatch kernel.
 
         The default body (EpDispatchIntraNodeKernel_body) batches metadata into one TDM copy per
-        (block, peer) run, so it wants a narrow grid where each block owns a large contiguous run.
+        (block, peer) run. That argues for a narrow grid where each block owns a large contiguous
+        run, and 64 blocks came from that reasoning -- correctly, as it turns out, but the 8 warps
+        that came with it left the payload phase starved of concurrent TDM.
+
+        Device facts (measured, torch.cuda.get_device_properties on gfx1250): CU=256,
+        LDS=327680B per CU AND per block, max 2048 threads/CU, warpSize=32. At wpb=8 the tile is
+        8 * 7168 * 2 = 114KB, so TWO THIRDS of a block's LDS budget sat unused.
+
+        wpb sweep at DBN=64, EP4-4K bf16 hidden 7168, noTIMING mean_algo_bw, one bw run per point:
+
+            wpb    8      12     16     20     22
+            GB/s  1278   1218   1365   1255   1239
+
+        16 is a sharp peak, not a plateau, and the reason is the token partition rather than
+        occupancy: _tpi = warpSize/topk = 4 tokens per warp-iteration, so one round consumes
+        DBN * wpb * 4 tokens. At wpb=16 that is exactly 4096 -- one round, 4 tokens per warp, no
+        remainder. wpb=8 needs two rounds; wpb=12 leaves a second round holding only 1024 tokens
+        (three quarters of the warps idle in it); wpb=20/22 finish in one round but hand a large
+        share of warps no tokens at all while still costing their LDS. So this default is tied to
+        max_num_inp_token_per_rank=4096: the rule is wpb such that DBN * wpb * (warpSize/topk)
+        divides the token count.
+
+        Widening the GRID reaches the same ceiling: DBN=128/wpb=8 measures 1366 GB/s, identical to
+        DBN=64/wpb=16, but spends 128 CUs instead of 64. Both put 1024 warps in flight, which is what
+        actually bounds the payload phase -- concurrent TDM operations, not compute. (DBN sweep at
+        wpb=8: 32:882 48:1073 64:1278 96:1239 112:1160 128:1354 160:1356 256:1352.)
+
+        DEFAULT DELIBERATELY STAYS AT 64/8. Both 1366 GB/s points buy their gain with more physical
+        resource -- wpb=16 doubles blockDim to 512 and the LDS reservation to 229KB, DBN=128 doubles
+        the CUs -- so neither is a kernel improvement, and the mandate here is to reach 1.3TB/s
+        without changing the footprint. They are recorded because they bound what the payload phase
+        can do when TDM concurrency is not the constraint.
+
         The legacy clean body (-DMORI_DISP_CLEAN) interleaves scattered per-token metadata with the
         payload instead and needs the wide grid to hide it.
         """

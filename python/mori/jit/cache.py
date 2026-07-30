@@ -114,18 +114,77 @@ def get_cache_dir(
         if os.environ.get("MORI_DISP_COMPL_BACKOFF", "").strip().isdigit()
         else ""
     )
-    # -DMORI_DISP_FINLANE swaps the default body's FINALIZE for the lane-parallel form. Same source
-    # tree, different binary, so it MUST be part of the key or an A/B silently reuses one .hsaco.
-    finlane_suffix = (
-        "_finlane"
-        if os.environ.get("MORI_DISP_FINLANE", "").lower() in ("1", "true", "on", "yes")
-        else ""
-    )
     _msp = os.environ.get("MORI_DISP_METASPLIT", "").strip()
     metasplit_suffix = f"_ms{int(_msp)}" if _msp.isdigit() and int(_msp) >= 1 else ""
+    # The remaining metadata-phase gates each change the meta send's code. Same source tree,
+    # different binary -> each MUST be part of the key or an A/B silently reuses one .hsaco.
+    # The lane-parallel FINALIZE and the whole-run meta tile are now unconditional, so they no longer
+    # need a suffix; content_hash separates them from the pre-flip binaries that used the old keys.
+    metavec_suffix = (
+        "_metavec"
+        if os.environ.get("MORI_DISP_METAVEC", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
+    metafield_suffix = (
+        "_metafield"
+        if os.environ.get("MORI_DISP_METAFIELD", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
+    paydyn_suffix = (
+        "_paydyn"
+        if os.environ.get("MORI_DISP_PAYDYN", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
+    dbl_suffix = "".join(
+        f"_{n.lower()}"
+        for n in ("DBLCOUNT", "DBLRESERVE")
+        if os.environ.get(f"MORI_DISP_{n}", "").lower() in ("1", "true", "on", "yes")
+    )
+    gridflag_suffix = (
+        "_gflag"
+        if os.environ.get("MORI_DISP_GRIDFLAG", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
+    _ps = os.environ.get("MORI_DISP_PAYSPLIT", "").strip()
+    paysplit_suffix = f"_ps{int(_ps)}" if _ps.isdigit() and int(_ps) > 1 else ""
+    srcvec_suffix = (
+        "_srcvec"
+        if os.environ.get("MORI_DISP_SRCVEC", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
+    metalds_suffix = (
+        "_metalds"
+        if os.environ.get("MORI_DISP_METALDS", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
+    metafuse_suffix = (
+        "_metafuse"
+        if os.environ.get("MORI_DISP_METAFUSE", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
+    nostg_suffix = (
+        "_nostg"
+        if os.environ.get("MORI_DISP_NOSTG", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
+    nometa_suffix = (
+        "_nometa"
+        if os.environ.get("MORI_DISP_NOMETA", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
+    nopay_suffix = (
+        "_nopay"
+        if os.environ.get("MORI_DISP_NOPAY", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
+    metadiag_suffix = (
+        "_metadiag"
+        if os.environ.get("MORI_DISP_METADIAG", "").lower() in ("1", "true", "on", "yes")
+        else ""
+    )
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{complbackoff_suffix}{finlane_suffix}{metasplit_suffix}{cntstep_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{complbackoff_suffix}{metasplit_suffix}{metavec_suffix}{metafield_suffix}{paydyn_suffix}{dbl_suffix}{gridflag_suffix}{paysplit_suffix}{srcvec_suffix}{metalds_suffix}{metafuse_suffix}{nostg_suffix}{nometa_suffix}{nopay_suffix}{metadiag_suffix}{cntstep_suffix}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)
