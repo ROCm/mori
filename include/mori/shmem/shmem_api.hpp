@@ -130,6 +130,14 @@ struct mori_shmem_heap_stats_t {
   size_t largestFreeBlock;   // biggest contiguous run; the fragmentation signal
   size_t heapSize;           // total static heap bytes (MORI_SHMEM_HEAP_SIZE)
   size_t numMemObjs;         // SymmMemObj registrations; a second leak channel
+  // Base VA of THIS rank's static heap. Raw symmetric addresses are not
+  // comparable across ranks -- each rank's heap lands wherever its own
+  // allocator put it -- so the only cross-rank-meaningful form of a symmetric
+  // address is its OFFSET from this base. That offset is exactly what
+  // RegisterStaticHeapSubRegion (application/memory/symmetric_memory.cpp:392)
+  // assumes is identical on every rank when it derives peers as
+  // peerPtrs[i] + offset with no allgather to check.
+  uintptr_t heapBase;
 };
 
 // Fills *out. Returns 0 on success, -1 if shmem is not in static-heap mode

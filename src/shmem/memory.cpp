@@ -274,6 +274,7 @@ int ShmemGetHeapStats(mori_shmem_heap_stats_t* out) {
                out->largestFreeBlock);
   out->heapSize = states->memoryStates->staticHeapSize;
   out->numMemObjs = states->memoryStates->symmMemMgr->GetNumMemObjs();
+  out->heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
   return 0;
 }
 

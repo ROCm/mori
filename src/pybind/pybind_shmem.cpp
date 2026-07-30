@@ -125,6 +125,7 @@ py::object ShmemGetHeapStats() {
   d["largest_free_block"] = s.largestFreeBlock;
   d["heap_size"] = s.heapSize;
   d["num_mem_objs"] = s.numMemObjs;
+  d["heap_base"] = s.heapBase;
   return std::move(d);
 }
 
@@ -209,7 +210,8 @@ void RegisterMoriShmem(py::module_& m) {
   m.def("shmem_get_heap_stats", &ShmemGetHeapStats,
         "Symmetric static-heap accounting (dict), or None if shmem is not in "
         "static-heap mode. Keys: total_blocks, free_blocks, allocated_blocks, "
-        "total_free_space, largest_free_block, heap_size, num_mem_objs. Unlike "
+        "total_free_space, largest_free_block, heap_size, num_mem_objs, "
+        "heap_base. Unlike "
         "torch.cuda.mem_get_info these DO move when a symmetric allocation "
         "leaks -- the whole static heap is hipMalloc'd once at shmem init.");
 }

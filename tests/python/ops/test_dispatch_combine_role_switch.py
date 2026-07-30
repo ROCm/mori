@@ -1191,11 +1191,17 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size):
     (3) is the one nothing has ever checked, and it is not implied by (and
     therefore not refuted by) the heap-symmetry probe: that compares heap
     ACCOUNTING (total_free_space, block counts), and a deterministic first-fit
-    VA manager can return identical totals for different addresses. The
-    symmetric-heap contract is stronger than "same free space" -- it is
-    `peer_ptrs[i]` as seen by ANY rank == `local_ptr` as seen by rank i, which
-    `RegisterStaticHeapSubRegion` (symmetric_memory.cpp:392) assumes when it
-    derives peers as `peerPtrs[i] + offset` with no allgather to check.
+    VA manager can return identical totals for different OFFSETS.
+
+    The symmetric-heap contract is stronger than "same free space", but it is
+    NOT "peer_ptrs[i] as seen by any rank == local_ptr as seen by rank i" --
+    that was this test's first formulation and it is wrong (see the long note
+    at the assertion; peerPtrs holds viewer-local IPC mappings, so it fails on
+    a healthy group). The real contract is that a symmetric allocation lands at
+    the SAME OFFSET from the heap base on every rank, because
+    `RegisterStaticHeapSubRegion` (application/memory/symmetric_memory.cpp:392)
+    derives every peer address as `peerPtrs[i] + offset` using the local rank's
+    offset for all i, with no allgather to check it.
 
     Deliberately does NOT dispatch: `_worker_rank_asymmetric_reject` wedges in
     the post-combine sync, and a wedge yields no diagnostic at all -- just a
@@ -1238,13 +1244,21 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size):
 
     group = shmem_get_process_group()
 
-    # Gather (generation, seed, local_ptr, size) + the peer_ptrs vector from
-    # every rank. CPU tensors: the shmem group can be gloo-only (bf9757e9).
+    # The cross-rank-comparable form of a symmetric address is its OFFSET from
+    # this rank's static-heap base, NOT the raw pointer: each rank's heap is
+    # hipMalloc'd wherever its own allocator lands it (shmem/init.cpp:226), so
+    # raw local_ptr values differ on a perfectly healthy group. heap_base comes
+    # from shmem_get_heap_stats() and is None outside static-heap mode.
+    _hs = mori.shmem.shmem_get_heap_stats()
+    heap_base = int(_hs["heap_base"]) if _hs else 0
+
+    # Gather (generation, seed, heap-relative offset, size) from every rank.
+    # CPU tensors: the shmem group can be gloo-only (bf9757e9).
     mine = torch.tensor(
         [
             int(probe["generation"]),
             int(probe["seed"]),
-            int(probe["local_ptr"]),
+            int(probe["local_ptr"]) - heap_base,
             int(probe["size"]),
         ],
         dtype=torch.int64,
@@ -1254,8 +1268,11 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size):
     dist.all_gather(gathered, mine, group=group)
     rows = [tuple(int(v) for v in g.tolist()) for g in gathered]
     gens = [r[0] for r in rows]
-    local_ptrs = [r[2] for r in rows]
+    local_offsets = [r[2] for r in rows]
 
+    # peer_ptrs are likewise only comparable as heap-relative offsets, and only
+    # against the VIEWER's own peer-heap base -- see the assertion below for why
+    # comparing them to local_ptrs is wrong.
     peers = torch.tensor(
         [int(p) for p in probe["peer_ptrs"]] or [0] * world_size,
         dtype=torch.int64,
@@ -1276,21 +1293,55 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size):
         f"ValidateReconfigurable BEFORE FinalizeAll, so it never re-seeds."
     )
 
-    # (2)+(3) ADDRESSES. The symmetric contract: what rank j thinks rank i's
-    #     buffer is at must equal what rank i says its buffer is at. This is
-    #     the invariant the heap-accounting probe cannot see.
+    # (2)+(3) ADDRESSES -- as OFFSETS, which is the only comparable form.
+    #
+    # An earlier revision of this test asserted `peer_rows[viewer] ==
+    # local_ptrs`, i.e. that what rank j believes rank i's buffer is at equals
+    # the raw pointer rank i reports. **That assertion is invalid and it fired
+    # a false positive** (T13, logged in RESULTS_M): it fails on a perfectly
+    # healthy group, for two independent reasons read out of the source rather
+    # than inferred:
+    #
+    #   * For every non-RDMA peer, symmetric_memory.cpp:169-177 OVERWRITES
+    #     peerPtrs[i] with p2pPeerPtrs[i], the address hipIpcOpenMemHandle
+    #     returned *in the viewer's own address space*. So peerPtrs is by
+    #     construction a viewer-local mapping, never the peer's local VA.
+    #   * Even the pre-overwrite allgathered values (:120) would not match,
+    #     because each rank's static heap is hipMalloc'd wherever its own
+    #     allocator lands it.
+    #
+    # The measured data said the same thing: rank 0's peer_ptrs were uniformly
+    # strided by exactly the 8 GiB heap size (8 consecutive IPC mappings in one
+    # VA space) with peer_ptrs[0] == its own local_ptr, while the true
+    # local_ptrs were scattered. That is a healthy P2P mapping table.
+    #
+    # The invariant RegisterStaticHeapSubRegion (:392) actually assumes -- and
+    # the one a resize could really break -- is that the sub-region's OFFSET
+    # from the heap base is identical on every rank, since it derives peers as
+    # `heapObj->peerPtrs[i] + offset` using the LOCAL rank's offset for all i.
+    assert len(set(local_offsets)) == 1, (
+        f"rank {rank}: symmetric HEAP OFFSET diverged after a REJECT -- "
+        f"per-rank offset of the barrier buffer from its own heap base = "
+        f"{local_offsets}. RegisterStaticHeapSubRegion "
+        f"(application/memory/symmetric_memory.cpp:392) derives every peer "
+        f"address as peerPtrs[i] + offset using the LOCAL offset for all i, "
+        f"with no allgather to check, so unequal offsets mean each rank is "
+        f"reading and writing its peers at the wrong address. A REJECT is the "
+        f"one outcome where a rank does zero heap work while its peers do two "
+        f"full free/alloc round trips."
+    )
+
+    # Self-consistency of the mapping table: every rank's view of ITSELF must
+    # be its own local pointer. This is the one peerPtrs entry that IS directly
+    # comparable (symmetric_memory.cpp:127 sets p2pPeerPtrs[rank] = localPtr),
+    # and it is cheap insurance that the table was rebuilt at all.
     for viewer, seen in enumerate(peer_rows):
         if not seen or all(v == 0 for v in seen):
             continue  # no peerPtrs on this rank (non-static-heap mode)
-        assert seen == local_ptrs, (
-            f"rank {rank}: PEER POINTERS diverged after a REJECT -- rank "
-            f"{viewer} believes the peers' barrier buffers are at {seen}, but "
-            f"the ranks themselves report {local_ptrs}. A combine will spin on "
-            f"an address nobody writes. RegisterStaticHeapSubRegion "
-            f"(symmetric_memory.cpp:392) derives peers as peerPtrs[i]+offset "
-            f"with no allgather, and a REJECT is the one outcome where a rank "
-            f"does zero heap work while its peers do two full free/alloc "
-            f"round trips."
+        assert len(set(seen)) == len(seen), (
+            f"rank {rank}: rank {viewer}'s peer mapping table has DUPLICATE "
+            f"addresses after a REJECT: {seen}. Two peers mapped to one "
+            f"address means writes to one silently land on the other."
         )
 
     # Every rank agrees on the buffer size too -- a size mismatch would make
