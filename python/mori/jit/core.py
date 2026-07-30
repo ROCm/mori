@@ -304,29 +304,6 @@ def _disp_clean_defines() -> list[str]:
     )
 
 
-def _disp_complbackoff_defines() -> list[str]:
-    """Diagnostic: -DMORI_DISP_COMPL_BACKOFF=N throttles dispatch's completion spins with
-    s_sleep(N) instead of the backoff-free tight spin the shmem WaitUntil* primitives use
-    (shmem_device_api.hpp). CrossDeviceBarrierIntraNodeKernel already documents that the
-    unthrottled form livelocks the cco/xGMI fabric so a peer's flag write is never re-observed,
-    and fixes it with s_sleep -- dispatch's completion never got that fix. Gated by
-    MORI_DISP_COMPL_BACKOFF env (integer sleep arg); default OFF (tight spin, unchanged)."""
-    val = os.environ.get("MORI_DISP_COMPL_BACKOFF", "").strip()
-    if not val.isdigit():
-        return []
-    return [f"-DMORI_DISP_COMPL_BACKOFF={int(val)}"]
-
-
-def _disp_metasplit_defines() -> list[str]:
-    """-DMORI_DISP_METASPLIT=N sets how many sub-ranges each (block,peer) metadata run is cut into
-    (default warpNum/npes). Every sub-range carries its own 128B head/tail remainder, and those go
-    out as per-lane remote 4B stores instead of TDM. Integer env; default OFF (unchanged)."""
-    val = os.environ.get("MORI_DISP_METASPLIT", "").strip()
-    if not val.isdigit() or int(val) < 1:
-        return []
-    return [f"-DMORI_DISP_METASPLIT={int(val)}"]
-
-
 def _disp_metadiag_defines() -> list[str]:
     """Diagnostic: -DMORI_DISP_METADIAG prints a [METASHAPE] histogram of the metadata idx run's
     length (cc), tile kind and 128B start phase. Not folded into MORI_DISP_TIMING because these are
@@ -340,250 +317,47 @@ def _disp_metadiag_defines() -> list[str]:
     )
 
 
-def _disp_metavec_defines() -> list[str]:
-    """Experiment: -DMORI_DISP_METAVEC sends the metadata staging straight to the peer as a coalesced
-    load-batched vector copy instead of bouncing it through an LDS tile with TDM. Meta is ~196B per
-    token, so the TDM path spends the engine on 32 small ops per block (8 warps x 4 fields) and then
-    has to s_wait_tensorcnt(0) to hand the LDS tile back to the payload phase. Plain stores own no
-    tile and no engine slot, so nothing waits for them here and they drain across the payload phase,
-    made visible by a __threadfence_system() after it.
+# Emitters for gates whose kernel bodies were removed from src/ops/dispatch_combine/intranode.hpp are
+# deleted along with them: a -D that no #if reads is silently accepted and does nothing, and it is not
+# in cache.py's key either, so setting one would quietly land on another config's cached .hsaco.
+#
+# What each of them measured is recorded next to the code it would have replaced -- the ALREADY
+# REJECTED table in intranode.hpp (METAFUSE, METAVEC, METALDS, GRIDFLAG, PAYSPLIT, METAFIELD,
+# METASPLIT, SRCVEC, PAYBUF), with the full reasoning in tools/HANDOFF-F01-2.md §8. Deliberately not
+# repeated here; two copies of the same numbers drift.
+#
+# Three that table does not mention, because they were diagnostics rather than candidates:
+#   DBLCOUNT / DBLRESERVE  isolate a phase's cost by DOUBLING it instead of deleting it, so ACC stays
+#                          PASS and the measurement is known to have run on a working kernel. This is
+#                          how gather = 5.45us and meta = 6.95us were derived.
+#   COMPL_BACKOFF          s_sleep(N) in the completion spin instead of the tight spin.
+#   PAYDYN                 warps claim payload work on demand (LDS atomic) rather than statically.
+#                          Built and run with ACC=1, but no number for it survives anywhere in the
+#                          repo, so it is the one whose result is unknown rather than negative.
 
-    MEASURED A BIG LOSS, kept only so nobody retries it: EP4-4K metasend 44.4 -> 475.7us and
-    dispatch 1055.7 -> 317.2 GB/s (acc still PASS). Cross-GPU plain vector stores move meta at
-    ~6 GB/s against TDM's ~97, so the TDM engine was never the problem -- the same conclusion the
-    payload path already reached. Gated by MORI_DISP_METAVEC env; default OFF."""
-    return (
-        ["-DMORI_DISP_METAVEC"]
-        if os.environ.get("MORI_DISP_METAVEC", "").lower() in ("1", "true", "on", "yes")
-        else []
-    )
-
-
-
-def _disp_paydyn_defines() -> list[str]:
-    """-DMORI_DISP_PAYDYN lets a block's warps claim payload work on demand instead of statically.
-
-    The kernel ends when the slowest block ends, and a block ends when its slowest warp ends. Warps get
-    equal token COUNTS, but a token goes to 1..4 destinations depending on routing, so equal counts are
-    not equal bytes and the unluckiest of the 8 warps holds its block back while the other 7 sit
-    drained.
-
-    This does not violate the COUNT/FINALIZE/payload partition rule: what that rule protects is which
-    BLOCK owns which tokens (a block reads back the dispDestTokIdMap entries it wrote itself, which is
-    why a plain __syncthreads() can stand in for a grid barrier). Which warp inside the block takes a
-    token is free -- the map is indexed by token. The block's token set is unchanged; only unit->warp
-    assignment inside the block becomes dynamic, through an LDS atomic claimed 16 times per block at
-    DBN=64/wpb=8.
-
-    Aimed at the largest remaining item at DBN=64/wpb=8: payload is 125.0us of the 166.0us kernel, and
-    load imbalance inside it is not addressable by any of the geometry-preserving changes tried so far
-    (PAYSPLIT, GRIDFLAG, SRCVEC all measured negative).
-    """
-    return (
-        ["-DMORI_DISP_PAYDYN"]
-        if os.environ.get("MORI_DISP_PAYDYN", "").lower() in ("1", "true", "on", "yes")
-        else []
-    )
-
-
-def _disp_double_defines() -> list[str]:
-    """Cost isolation by DOUBLING a phase: kernel(2x) - kernel(1x) is that phase's real cost.
-
-    The deletion gates (MORI_DISP_NOMETA / NOPAY / NOSTG) cannot reach COUNT, RESERVE or COMPLETION:
-    deleting COUNT feeds RESERVE a garbage s_N and lets the payload store outside its reserved slots
-    (corruption, not just a wrong answer), and skipping the grid barrier or the peer wait breaks the
-    signal-clearing invariant, so the next replay waits forever. Doubling has neither problem and,
-    unlike deletion, keeps the result CORRECT -- ACC must still PASS, which is what proves the
-    measurement ran on a working kernel rather than a broken one.
-
-    MORI_DISP_DBLCOUNT   -- COUNT runs twice, second pass' atomicAdd redirected to a scratch LDS
-                            histogram (its other store writes the same sentinel, already idempotent).
-    MORI_DISP_DBLRESERVE -- RESERVE does a second remote atomic on the same counter adding 0: same
-                            cross-GPU latency and same all-blocks-on-one-counter contention, no effect
-                            on slot allocation.
-
-    COMPLETION cannot be doubled (it is a protocol, not work), so it comes out by subtraction from the
-    41.0us non-payload total once COUNT, RESERVE, meta (6.95) and gather (5.45) are known.
-    """
-    out = []
-    for name in ("DBLCOUNT", "DBLRESERVE"):
-        if os.environ.get(f"MORI_DISP_{name}", "").lower() in ("1", "true", "on", "yes"):
-            out.append(f"-DMORI_DISP_{name}")
-    return out
-
-
-def _disp_gridflag_defines() -> list[str]:
-    """-DMORI_DISP_GRIDFLAG makes the dispatch grid barrier gridDim.x flags instead of one counter.
-
-    The counter form has every block's thread 0 atomicAdd one shared address while block 0's warp
-    spins reading that same cacheline, so the increments serialize and reader and writers ping-pong
-    the line. GRIDFLAG gives each block its own 128B-separated flag and polls gridDim.x of them with
-    32 lanes at a time (2 rounds at DBN=64).
-
-    Aimed at the completion bucket, the largest un-dissected part of the 41.0us non-payload cost at
-    DBN=64/wpb=8 (kernel 166.0us, payload marginal 125.0us, of which meta 6.95 and gather 5.45 are
-    already proven incompressible).
-    """
-    return (
-        ["-DMORI_DISP_GRIDFLAG"]
-        if os.environ.get("MORI_DISP_GRIDFLAG", "").lower() in ("1", "true", "on", "yes")
-        else []
-    )
-
-
-def _disp_paysplit_defines() -> list[str]:
-    """-DMORI_DISP_PAYSPLIT=N issues each token's payload as N TDM segments of the SAME LDS tile.
-
-    The payload phase is bounded by in-flight TDM operations, not bytes. Geometry sweep evidence:
-    64x8 (512 warps) = 1278 GB/s, while 64x16 and 128x8 both land on 1366 -- identical ceiling from
-    an identical 1024-warp in-flight count, one bought with LDS (blockDim 512, 229KB) and the other
-    with CUs (128 blocks). Both spend more physical resource, which is exactly what is not allowed
-    here, so this buys the same in-flight count in code instead: per warp, N loads and N x ~3.6
-    stores in flight rather than 1 and ~3.6, with the tile still hiddenDim elements (14336B per warp,
-    114KB per block, 64 blocks -- unchanged).
-
-    Cost is N x the TDM operations for the same bytes, so it only pays while a segment stays far
-    above the 128B minimum row: at N=2 a segment is 7168B, at N=4 it is 3584B. Falls back to the
-    single-segment form when hiddenDim does not divide evenly or a segment would drop under 128B.
-
-    Set MORI_DISP_PAYSPLIT to the segment count (2, 4, ...); unset or 1 disables.
-    """
-    v = os.environ.get("MORI_DISP_PAYSPLIT", "").strip()
-    if not v.isdigit() or int(v) <= 1:
-        return []
-    return [f"-DMORI_DISP_PAYSPLIT={int(v)}"]
-
-
-def _disp_srcvec_defines() -> list[str]:
-    """-DMORI_DISP_SRCVEC copies srcmap's cross-GPU run 16B at a time instead of 4B at a time.
-
-    srcmap is the only meta field that never gets a TDM body: 1 element per slot means a (block,peer)
-    run is cc ~= 58 elements at DBN=64/wpb=8, below the 64 a legal tile needs (TdmCheapDim1's 32x2),
-    and TdmAlignSplit128's aligned remainder reaches 1 row where 2 are required. So the whole run
-    goes through the scalar peel as cc separate 4B stores to the peer. Cross-GPU writes are priced
-    per transaction (~54 GB/s for plain stores, see MORI_DISP_METAVEC), so that is 4x the
-    transactions needed. Measured before: htSrc = 20.1us of a 36.7us metasend, with htIdx/htWt/htSc
-    at 0.0/0.0/0.1 (TIMING build, DBN=64/wpb=8).
-
-    Gated by MORI_DISP_SRCVEC env; default OFF. Falls back per run when the two bases do not share a
-    16B phase.
-    """
-    return (
-        ["-DMORI_DISP_SRCVEC"]
-        if os.environ.get("MORI_DISP_SRCVEC", "").lower() in ("1", "true", "on", "yes")
-        else []
-    )
-
-
-def _disp_metalds_defines() -> list[str]:
-    """-DMORI_DISP_METALDS has FINALIZE gather the four metadata fields straight into the LDS tile the
-    meta TDM store sends from, instead of into the global staging arrays that store then has to TDM
-    load back. Same 2.9MB, one HBM round trip fewer.
-
-    Measured cost of what this removes, by差分 (kernel time from [DISPBW], noTIMING):
-      full 166.0us | MORI_DISP_NOSTG (no gather) 160.55us | MORI_DISP_NOMETA (no meta phase) 159.05us
-    i.e. the gather is 5.45us and the meta phase 6.95us, against ~1.8us of engine time for 2.9MB.
-
-    Cross-GPU vector stores are not an alternative: MORI_DISP_METAVEC measures 995.5 GB/s (213.4us,
-    ~54 GB/s of effective fabric write bandwidth) and per-destination stores fused into the payload
-    loop (MORI_DISP_METAFUSE) measure 462.6 GB/s. Meta must stay on TDM, and TDM sources LDS only.
-
-    The LDS region is shared by the whole block, so this drains the meta stores just BEFORE the
-    barrier that hands the tile to the payload phase; the default deferral of that drain past that
-    barrier is only valid for the per-warp-private tile and is bypassed here.
-
-    MEASURED A LOSS and kept only so nobody retries it: 1253.8 GB/s against a 1279.4 baseline at
-    DBN=64 (-2.0%), ACC PASS. Splitting the LDS and global paths so neither pointer loses its address
-    space (the first form let them share one variable and degrade to flat accesses) recovered only
-    +0.15%, which rules that out as the cause. What the 5.45us of MORI_DISP_NOSTG actually measures is
-    mostly the gather READING the original input from HBM, and that read is unchanged here -- so the
-    savings are just the staging write plus the TDM load, and they do not cover the LDS bank conflicts
-    on the gather, the extra thread-0 layout pass and barrier, or the loss of the deferred meta drain
-    (this path has to drain before the barrier, being block-shared rather than per-warp).
-
-    Gated by MORI_DISP_METALDS env; default OFF. Falls back to staging per block, at runtime, when
-    the block's own s_N does not fit the tile (s_mOk).
-    """
-    return (
-        ["-DMORI_DISP_METALDS"]
-        if os.environ.get("MORI_DISP_METALDS", "").lower() in ("1", "true", "on", "yes")
-        else []
-    )
-
-
-def _disp_metafuse_defines() -> list[str]:
-    """-DMORI_DISP_METAFUSE folds the metadata send into the payload loop and deletes the separate
-    meta phase. Each (token, destination) pair the payload loop already visits carries its own 196B
-    of meta (indices, weights, scale, srcmap) as plain cross-GPU stores, issued right after that
-    token's payload TDM store -- cycles the warp otherwise spends spinning in s_wait_tensorcnt.
-
-    Why: the diagnostic gates below measured the meta phase at 6.95us of kernel time (166.0 ->
-    159.05us with MORI_DISP_NOMETA) for 2.9MB, i.e. ~1.8us of engine time and ~5us of pure staging
-    round trip / LDS bounce / TDM latency. Fusing removes the latency AND the staging buffers: the
-    payload loop's destPe/destTokId are exactly what the staging gather keyed on, and the source is
-    the original input, so -DMORI_DISP_NOSTG then drops FINALIZE's gather as dead work.
-
-    MEASURED A LOSS, badly, and kept only so nobody retries it: 462.6 GB/s against a 1279.4 baseline
-    (kernel 166.0 -> 459us), ACC PASS. Cross-GPU meta cannot leave TDM. Per destination this issues
-    four short bursts (32B/32B/128B/4B) whose addresses depend on each other, so a warp serialises
-    ~116 fabric write round trips over its ~29 destinations, and every other warp is simultaneously
-    stalled in s_wait_tensorcnt with nothing to hide them behind. MORI_DISP_METAVEC bounds the batched
-    version of the same idea at 995.5 GB/s (~54 GB/s of fabric write bandwidth), so the fine-grained
-    form was never going to reach TDM's ~1600.
-
-    Gated by MORI_DISP_METAFUSE / MORI_DISP_NOSTG env; default OFF. NOSTG is only correct together
-    with METAFUSE (nothing else feeds the peer's meta buffers once staging is gone).
-    """
-    out: list[str] = []
-    if os.environ.get("MORI_DISP_METAFUSE", "").lower() in ("1", "true", "on", "yes"):
-        out.append("-DMORI_DISP_METAFUSE")
-    if os.environ.get("MORI_DISP_NOSTG", "").lower() in ("1", "true", "on", "yes"):
-        out.append("-DMORI_DISP_NOSTG")
-    return out
 
 
 def _disp_nophase_defines() -> list[str]:
-    """DIAGNOSTIC, WRONG RESULTS ON PURPOSE. -DMORI_DISP_NOMETA / -DMORI_DISP_NOPAY compile away the
-    meta send / the payload send while leaving launch geometry, LDS reservation and occupancy alone,
-    so kernel(full) - kernel(NOX) gives phase X's real cost. This exists because MORI_DISP_TIMING's
-    clock64() probes sit inside the per-token loops and inflate the phases they measure (the timed
-    build reports ~87us of non-payload against a ~33us noTIMING budget), which made the timed split
-    useless for deciding where the last 3us to 1.3TB/s should come from.
+    """DIAGNOSTIC, WRONG RESULTS ON PURPOSE. -DMORI_DISP_NOMETA / -DMORI_DISP_NOPAY /
+    -DMORI_DISP_NOSTG compile away the meta send / the payload send / FINALIZE's staging gather while
+    leaving launch geometry, LDS reservation and occupancy alone, so kernel(full) - kernel(NOX) gives
+    phase X's real cost. This exists because MORI_DISP_TIMING's clock64() probes sit inside the
+    per-token loops and inflate the phases they measure (the timed build reports ~87us of non-payload
+    against a ~33us noTIMING budget), which made the timed split useless for deciding where the last
+    3us to 1.3TB/s should come from. Against a full 166.0us kernel: NOSTG 160.55us and NOMETA
+    159.05us, i.e. the gather is 5.45us and the meta phase 6.95us for 2.9MB.
+
+    NOSTG was originally only correct alongside METAFUSE, which took over feeding the peer's meta
+    buffers once staging was gone. METAFUSE measured 462.6 GB/s and its body has been removed, so
+    NOSTG now leaves nothing feeding them and is diagnostic-only like the other two.
 
     Never enable with ACC=1; the dispatch output is deliberately incomplete.
     """
     out: list[str] = []
-    if os.environ.get("MORI_DISP_NOMETA", "").lower() in ("1", "true", "on", "yes"):
-        out.append("-DMORI_DISP_NOMETA")
-    if os.environ.get("MORI_DISP_NOPAY", "").lower() in ("1", "true", "on", "yes"):
-        out.append("-DMORI_DISP_NOPAY")
+    for name in ("NOMETA", "NOPAY", "NOSTG"):
+        if os.environ.get(f"MORI_DISP_{name}", "").lower() in ("1", "true", "on", "yes"):
+            out.append(f"-DMORI_DISP_{name}")
     return out
-
-
-def _disp_metafield_defines() -> list[str]:
-    """Experiment: -DMORI_DISP_METAFIELD gives each warp one (peer, field) item instead of one
-    (peer, sub-range) run carrying all four fields. That halves the block's meta TDM op count
-    (npes*4 = 16 items over 8 warps, 2 stores per warp instead of 4) without idling any warp, and
-    each item covers the peer's whole run, so it carries the fewest possible 128B remainders.
-
-    The premise was that op count is the lever: with the deferred meta drain, mSt is 21.4us of store ISSUE
-    alone (mDrain 0.0), so the meta phase looked like it was queueing on the TDM engine.
-
-    MEASURED A LOSS, kept only so nobody retries it: EP4-4K 1276.8 -> 1222.2 GB/s (-4.3%), acc still
-    PASS. Together with METASPLIT=1 (also halves the op count, also lost: -1.5%) this says the meta
-    TDM cost tracks BYTES, not op count -- so the premise was wrong and there is nothing to win by
-    regrouping the same bytes into fewer, larger ops. Two costs this form adds outweigh the halved op
-    count: srcmap is the only field with no TDM body (its run is cc 4B elements, under the 128B row
-    floor), so per-field assignment concentrates ALL of its per-lane remote stores into npes warps
-    while the other warps go idle -- and the __syncthreads() before the payload phase waits for those
-    stragglers; and a warp's two items share one tile, so the second pays a drain the per-run form
-    never had. The shipping per-run form keeps all 8 warps carrying an equal mix of every field.
-    Gated by MORI_DISP_METAFIELD env; default OFF."""
-    return (
-        ["-DMORI_DISP_METAFIELD"]
-        if os.environ.get("MORI_DISP_METAFIELD", "").lower() in ("1", "true", "on", "yes")
-        else []
-    )
 
 
 def _disp_timing_defines() -> list[str]:
@@ -735,17 +509,6 @@ def _hipcc_genco(
         *_disp_tdm_defines(),
         *_disp_timing_defines(),
         *_disp_clean_defines(),
-        *_disp_complbackoff_defines(),
-        *_disp_metasplit_defines(),
-        *_disp_metavec_defines(),
-        *_disp_metafield_defines(),
-        *_disp_paydyn_defines(),
-        *_disp_double_defines(),
-        *_disp_gridflag_defines(),
-        *_disp_paysplit_defines(),
-        *_disp_srcvec_defines(),
-        *_disp_metalds_defines(),
-        *_disp_metafuse_defines(),
         *_disp_nophase_defines(),
         *_disp_metadiag_defines(),
     ]

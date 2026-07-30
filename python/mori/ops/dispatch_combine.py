@@ -633,9 +633,10 @@ class EpDispatchCombineOp:
         # needs warp_per_block * hiddenDim * elemSize bytes of dynamic shared. Here
         # warp_per_block is the DEVICE warp count per block (block = warpSize*wpb).
         if os.environ.get("MORI_DISP_TDM", "").lower() in ("1", "true", "on", "yes"):
-            # TDM double-buffer: per warp holds a FULL token (2 chunk tiles for ping-pong
-            # overlap of chunk load vs prev chunk store) = hidden*elemSize bytes. wpb<=16
-            # so 16*14KB=224KB <= 320KB LDS.
+            # One FULL token tile per warp = hidden*elemSize bytes (14KB at hidden 7168 bf16), so
+            # wpb<=16 stays inside the 320KB gfx1250 LDS budget. A second tile per warp for payload
+            # double-buffering is not worth its 229KB (measured 1280.8 vs 1280.7 GB/s, see the drain
+            # comment in intranode.hpp's payload loop).
             # The default dispatch body reuses this same per-warp tile for its batched metadata
             # send (see the tokCapM computation in intranode.hpp), so no extra budget is needed.
             tile = (
