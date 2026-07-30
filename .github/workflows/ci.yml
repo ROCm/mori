@@ -814,7 +814,7 @@ jobs:
               -e MORI_RDMA_SL=$MORI_RDMA_SL -e MORI_RDMA_TC=$MORI_RDMA_TC
               $CONTAINER bash $SCRIPT
               --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-              --ifname $NODE2_IFNAME --handle $HANDLE --sizes-mb "8 64"
+              --ifname $NODE2_IFNAME --handle $HANDLE --sizes-mb 8,64
             )
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
             $CT exec \
@@ -824,7 +824,7 @@ jobs:
               -e MORI_RDMA_SL=$MORI_RDMA_SL -e MORI_RDMA_TC=$MORI_RDMA_TC \
               $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-              --ifname $NODE1_IFNAME --handle $HANDLE --sizes-mb "8 64"
+              --ifname $NODE1_IFNAME --handle $HANDLE --sizes-mb 8,64
             wait
             sleep 1
             PORT=$((PORT + 1))

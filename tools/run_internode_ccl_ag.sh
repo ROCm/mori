@@ -7,7 +7,11 @@
 # Usage:
 #   run_internode_ccl_ag.sh --rank <0|1> --master-addr <ip> --ifname <nic> \
 #                           --handle <device|hostproxy> [--master-port <port>] \
-#                           [--sizes-mb "8 64"] [--reps N] [--warmup N]
+#                           [--sizes-mb 8,64] [--reps N] [--warmup N]
+#
+# --sizes-mb is COMMA-separated (no spaces): the caller ships this argv through a
+# second round of word-splitting (ssh "${NODE2_CMD[*]}"), so a space-separated
+# list would be torn apart. Commas survive; we convert them back below.
 #
 # GLOO/NCCL/MORI socket ifname are derived from --ifname. RDMA env
 # (MORI_RDMA_DEVICES/SL/TC, NCCL_IB_*) is passed by the caller via docker exec -e.
@@ -19,7 +23,7 @@ MASTER_ADDR=""
 MASTER_PORT=1234
 IFNAME=""
 HANDLE="device"
-SIZES_MB="8 64"
+SIZES_MB="8,64"
 REPS=3
 WARMUP=2
 
@@ -56,6 +60,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT/python:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
+# Comma-separated -> space-separated argv for bench_ag_perf_w16.py's nargs='+'.
+read -r -a SIZES_ARR <<< "${SIZES_MB//,/ }"
+
 exec timeout "${MORI_INTERNODE_TIMEOUT:-300}" torchrun \
   --nnodes=2 \
   --node_rank="$RANK" \
@@ -64,6 +71,6 @@ exec timeout "${MORI_INTERNODE_TIMEOUT:-300}" torchrun \
   --master_port="$MASTER_PORT" \
   tests/python/ccl/bench_ag_perf_w16.py \
   --handle "$HANDLE" \
-  --sizes-mb $SIZES_MB \
+  --sizes-mb "${SIZES_ARR[@]}" \
   --reps "$REPS" \
   --warmup "$WARMUP"
