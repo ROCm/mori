@@ -183,6 +183,16 @@ class MemoryInflightGate : public std::enable_shared_from_this<MemoryInflightGat
   // the endpoint-retirement counters exist for.
   int InflightAtQuiesce() const { return inflightAtQuiesce_.load(std::memory_order_acquire); }
 
+  // REVIEW_M #76-1. Returns true EXACTLY ONCE over this gate's lifetime, to the
+  // first caller. The retention count is now maintained incrementally instead
+  // of by scanning memGates_, so it needs the "is this call the one that
+  // retired the id?" answer to be exact: a second dereg of the same id finds
+  // the gate already retiring and Quiesce() no-ops, and reading Retiring()
+  // before and after would let two concurrent deregs both count it. A
+  // test-and-set on the gate itself cannot.
+  bool MarkTombstoneCountedOnce() { return !counted_.exchange(true, std::memory_order_acq_rel); }
+  bool TombstoneCounted() const { return counted_.load(std::memory_order_acquire); }
+
  private:
   void Release();
 
@@ -191,6 +201,10 @@ class MemoryInflightGate : public std::enable_shared_from_this<MemoryInflightGat
   std::atomic<int> inflight_{0};
   std::atomic<int> inflightAtQuiesce_{0};
   std::atomic<bool> retiring_{false};
+  // Whether this gate has already been added to RdmaManager's retention count.
+  // Lives on the gate rather than in the manager's map so that the count and
+  // the thing being counted cannot drift apart across an erase.
+  std::atomic<bool> counted_{false};
 };
 
 // Process-wide census of what the barrier actually did, so a test can assert on

@@ -389,25 +389,104 @@ bool RdmaManager::QuiesceLocalMemory(MemoryUniqueId id, int timeoutMs) {
   // very drain we are waiting for. Safe to drop precisely BECAUSE the entry is
   // still there: whoever races in behind us finds the retiring gate.
   const bool drained = gate->Quiesce(timeoutMs);
-  // Published AFTER the drain, since Quiesce() is what sets retiring_ and the
-  // id we just touched would not be counted before it. Recounted rather than
-  // incremented so a second dereg of the same id cannot double-count a
-  // tombstone that is already resident.
+  // Counted AFTER the drain, since Quiesce() is what sets retiring_. Guarded on
+  // the gate's own retiring_ flag so a second dereg of the same id cannot
+  // double-count a tombstone that is already resident -- that idempotence was
+  // the reason the old code recounted by scanning, and it is cheaper to ask the
+  // gate than to walk the map (REVIEW_M #76-1).
+  {
+    std::unique_lock<std::shared_mutex> lock(mu);
+    auto it = memGates_.find(id);
+    if (it != memGates_.end() && it->second == gate && gate->Retiring() &&
+        gate->MarkTombstoneCountedOnce()) {
+      retiredGateCount_ += 1;
+      retiredOrder_.push_back(id);
+    }
+  }
+  // Bound the retention BEFORE publishing, so the census reports the number a
+  // caller will actually observe rather than a pre-reap peak (REVIEW_M #76-1).
+  ReapMemoryGates();
   PublishGateTombstoneCount();
   return drained;
 }
 
-// Recount the retired residents of memGates_ and publish to the census. Takes
-// `mu` itself; must NOT be called with it already held.
+// Publish the incrementally-maintained retention. Takes `mu` itself; must NOT
+// be called with it already held.
+//
+// REVIEW_M #76-1. This used to walk ALL of memGates_ under the lock on every
+// QuiesceLocalMemory and every lift, so a dereg cost O(descriptors x retired
+// ids) with the second factor unbounded -- the same monotone-growth defect
+// turns 44-45 removed from endpointsById_/registeredRuntimes_, re-added in the
+// fix for a different bug, and an ACCEPTANCE *Performance* cost rather than
+// only a *Robustness* one. The count is now maintained at the two sites where
+// a gate can start or stop retiring, so this is O(1).
 void RdmaManager::PublishGateTombstoneCount() {
   std::size_t retired = 0;
   {
     std::shared_lock<std::shared_mutex> lock(mu);
-    for (const auto& [_, g] : memGates_) {
-      if (g && g->Retiring()) ++retired;
-    }
+    retired = retiredGateCount_;
   }
   RecordGateTombstones(retired);
+}
+
+// How many retired gates to keep. The tombstone's job is to refuse a post whose
+// session was built before the dereg and is racing it; that window is bounded by
+// the quiesce timeout, not by the number of buffers, so a handful of the most
+// recent retirements covers it. sglang deregisters a handful of descriptors per
+// flip, so this holds several flips' worth. Override with
+// MORI_IO_MAX_MEM_GATE_TOMBSTONES; 0 disables the reap (unbounded, the old
+// behaviour) for anyone who needs to debug a stale-descriptor report.
+static constexpr std::size_t kDefaultMaxMemGateTombstones = 64;
+
+static std::size_t GetMaxMemGateTombstones() {
+  static const std::size_t v = [] {
+    // ParseInt, not ParsePositiveInt: 0 must be accepted, since 0 is the
+    // documented "disable the reap" value and a positive-only parser would
+    // silently fall back to the default for it.
+    int n = static_cast<int>(kDefaultMaxMemGateTombstones);
+    if (auto v = env::GetInt("MORI_IO_MAX_MEM_GATE_TOMBSTONES")) n = *v;
+    return static_cast<std::size_t>(n < 0 ? 0 : n);
+  }();
+  return v;
+}
+
+// REVIEW_M #76-1. Without this the map grows one retired entry per deregistered
+// id forever: `ClearLocalMemoryGate` is the only lift and it fires only from
+// `RdmaBackend::RegisterMemory`, while `IOEngine::RegisterMemory` mints a FRESH
+// id on every call -- so in production a tombstone is NEVER lifted and naming
+// that as a limitation does not bound it.
+//
+// Evicts OLDEST first: the youngest tombstone is the one a racing post is most
+// likely to still reach. An id that was lifted in the meantime is simply absent
+// from the map and skipped, which is why the deque holds ids and not iterators.
+// Caller must NOT hold `mu`.
+std::size_t RdmaManager::ReapMemoryGates() {
+  const std::size_t bound = GetMaxMemGateTombstones();
+  if (bound == 0) return 0;
+  std::size_t reaped = 0;
+  {
+    std::unique_lock<std::shared_mutex> lock(mu);
+    while (retiredGateCount_ > bound && !retiredOrder_.empty()) {
+      const MemoryUniqueId oldest = retiredOrder_.front();
+      retiredOrder_.pop_front();
+      auto it = memGates_.find(oldest);
+      // Absent, replaced by a newer gate for a reused id, or no longer counted:
+      // all mean this deque entry is stale and owns no retention to release.
+      if (it == memGates_.end() || !it->second || !it->second->TombstoneCounted()) continue;
+      // Never evict a gate that is still holding posts. Retiring() is set by
+      // Quiesce, but a timed-out quiesce leaves inflight > 0, and dropping the
+      // gate there would let a rebuilt session mint a fresh LIVE one and post
+      // against the very lkey the barrier failed to drain.
+      if (it->second->Inflight() > 0) continue;
+      memGates_.erase(it);
+      if (retiredGateCount_ > 0) retiredGateCount_ -= 1;
+      ++reaped;
+    }
+  }
+  if (reaped > 0) {
+    MORI_IO_TRACE("Reaped {} retired memory gate tombstone(s); bound is {}", reaped, bound);
+  }
+  return reaped;
 }
 
 // The other half of the tombstone above. Called when the id is legitimately
@@ -423,6 +502,13 @@ bool RdmaManager::ClearLocalMemoryGate(MemoryUniqueId id) {
     auto it = memGates_.find(id);
     if (it == memGates_.end()) return false;
     wasRetiring = it->second && it->second->Retiring();
+    // The decrement side of REVIEW_M #76-1's incremental count. Keyed on
+    // whether the gate was ever COUNTED, not on whether it is retiring: those
+    // differ for a gate that is erased while live (never counted, must not
+    // decrement) and the pair has to balance exactly or the census drifts.
+    if (it->second && it->second->TombstoneCounted() && retiredGateCount_ > 0) {
+      retiredGateCount_ -= 1;
+    }
     memGates_.erase(it);
   }
   // So the census can watch the retention curve come back DOWN, which is the

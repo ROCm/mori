@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -94,11 +95,22 @@ class RdmaManager {
   // safe again. Returns true if a RETIRED gate was cleared (i.e. the tombstone
   // was doing work), false if there was nothing or it was still live.
   bool ClearLocalMemoryGate(MemoryUniqueId);
-  // Recount the retired gates resident in memGates_ and publish to the dereg
-  // census, so the tombstone's retention is a NUMBER a test can watch rise and
-  // fall rather than a reassurance in a comment. Takes `mu`; do not call with
-  // it held.
+  // Publish the retention to the dereg census, so the tombstone is a NUMBER a
+  // test can watch rise and fall rather than a reassurance in a comment. Reads
+  // the incrementally-maintained `retiredGateCount_`; it does NOT scan
+  // memGates_ (REVIEW_M #76-1 -- the scan made every dereg O(N)). Takes `mu`;
+  // do not call with it held.
   void PublishGateTombstoneCount();
+  // Evict retired gates in excess of a bound, oldest first, and return how many
+  // went (REVIEW_M #76-1). The tombstone exists to refuse a post built from a
+  // session that was already in flight when the dereg started; once that post
+  // has been refused, or the drain window has long closed, the entry is dead
+  // weight. `IOEngine::RegisterMemory` mints a FRESH id per call, so in
+  // production no tombstone is ever LIFTED and the map would otherwise grow one
+  // entry per deregistered id for the life of the process -- a curve across a
+  // flip stress, which is what turns 44-45 removed from two other registries.
+  // Bounded rather than time-based: a bound is what a test can assert FLAT.
+  std::size_t ReapMemoryGates();
 
   // Remote memory management APIs
   std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int remRdmaDevId,
@@ -199,6 +211,19 @@ class RdmaManager {
   // barrier has to cover the id as a whole or a multi-NIC session would drain
   // one device and dereg the other out from under itself.
   std::unordered_map<MemoryUniqueId, std::shared_ptr<MemoryInflightGate>> memGates_;
+  // REVIEW_M #76-1. The tombstone's retention, maintained INCREMENTALLY under
+  // `mu` at the two places a gate can start or stop retiring, rather than
+  // recounted by walking memGates_. The walk made every dereg O(N) in the
+  // number of retired ids, and N is unbounded on sglang's path -- an O(flips^2)
+  // cost on the *Performance* clause, not merely a leak. An entry can only
+  // become retiring in QuiesceLocalMemory and can only stop by being erased in
+  // ClearLocalMemoryGate/ReapMemoryGate, so an exact count needs no scan.
+  std::size_t retiredGateCount_{0};
+  // Retirement order, so ReapMemoryGates can evict OLDEST first: the youngest
+  // tombstone is the one a racing post is most likely to still hit. Holds ids,
+  // not iterators/pointers, so an entry lifted by ClearLocalMemoryGate in the
+  // meantime is simply not found at reap time and skipped.
+  std::deque<MemoryUniqueId> retiredOrder_;
   std::unordered_map<EngineKey, RemoteEngineMeta> remotes;
   std::atomic<EndpointId> nextEndpointId_{1};
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> endpointsById_;
