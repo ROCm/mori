@@ -31,10 +31,51 @@ case "$mode" in
     echo "BUILD_RC=$rc"
     ;;
   test|regress)
-    # Free VRAM up front: a run that dies in shmem init because the node is
-    # busy is not evidence about the code under test, and three turns of this
-    # campaign were lost to not recording it (RESULTS_M T3).
-    python -c 'import torch;f,t=torch.cuda.mem_get_info(0);print(f"VRAM free {f/2**30:.1f} GiB of {t/2**30:.1f} GiB")' 2>&1
+    # ABORT, do not merely report, when the node cannot hold the run.
+    #
+    # Printing was not enough: T10a and T10b both bannered "VRAM free 6.3 GiB"
+    # and ran anyway, and T9c sampled an idle node 28 s before a vLLM job
+    # filled it. A run that dies in shmem init because the node is busy is not
+    # evidence about the code under test in EITHER direction, but it costs a
+    # full timeout to find that out and it reads like a product failure. Four
+    # turns of this campaign went to uninterpretable REDs of exactly this shape.
+    #
+    # Sample EVERY visible device, not just device 0: the ranks are spread over
+    # all of them and one full card is enough to hang the group.
+    echo "=== containers on this node ==="
+    docker ps --format '{{.Names}}' 2>/dev/null || echo "(docker not visible from inside)"
+    heap_need_gib="${MORI_TEST_MIN_FREE_GIB:-}"
+    if [ -z "$heap_need_gib" ]; then
+      # MORI_SHMEM_HEAP_SIZE is like "32G"/"512M"/bytes; default matches conftest.
+      hs="${MORI_SHMEM_HEAP_SIZE:-32G}"
+      heap_need_gib=$(python -c "
+import re,sys
+s=str('''$hs''').strip()
+m=re.match(r'^(\d+)\s*([GgMmKk]?)[Bb]?$', s)
+if not m: print(36); sys.exit()
+n=int(m.group(1)); u=m.group(2).upper()
+b=n*(1024**3 if u=='G' else 1024**2 if u=='M' else 1024 if u=='K' else 1)
+print(f'{b/2**30+4:.1f}')" 2>/dev/null || echo 36)
+    fi
+    python - "$heap_need_gib" <<'PYVRAM'
+import sys, torch
+need = float(sys.argv[1])
+worst = None
+for i in range(torch.cuda.device_count()):
+    f, t = torch.cuda.mem_get_info(i)
+    g = f / 2**30
+    print(f"VRAM dev{i}: free {g:.1f} GiB of {t/2**30:.1f} GiB")
+    worst = g if worst is None else min(worst, g)
+print(f"VRAM worst-case free {worst:.1f} GiB, need >= {need:.1f} GiB")
+sys.exit(0 if worst is None or worst >= need else 97)
+PYVRAM
+    vrc=$?
+    if [ "$vrc" -eq 97 ] && [ "${MORI_TEST_IGNORE_VRAM:-0}" != "1" ]; then
+      echo "ABORT: not enough free VRAM on at least one visible device."
+      echo "  This run was NOT started, so it is not a result in either direction."
+      echo "  Override with MORI_TEST_IGNORE_VRAM=1 or lower MORI_SHMEM_HEAP_SIZE."
+      exit 97
+    fi
     if [ "$mode" = "regress" ]; then
       target="tests/python/ops/test_dispatch_combine_intranode.py"
     else
