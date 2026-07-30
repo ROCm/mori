@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include <cassert>
+#include <cerrno>
 
 #include "mori/application/utils/check.hpp"
 
@@ -37,13 +38,25 @@ namespace application {
 /*                                           TCPEndpoint                                          */
 /* ---------------------------------------------------------------------------------------------- */
 
+// `n` MUST be ssize_t. It used to be size_t, which made the error test
+// unreachable: send/recv return -1 on error, that converts to SIZE_MAX, and
+// `n < 0` is then always false for an unsigned type (gcc warns -Wtype-limits,
+// but this builds with neither -Wall nor -Werror -- see build/CMakeCache.txt).
+// The loop therefore did `p += SIZE_MAX; len -= SIZE_MAX`, i.e. advanced the
+// cursor by a wild offset and wrapped `len` back up to a huge value, and kept
+// writing. A single ECONNRESET or EINTR on the control-plane socket turns into
+// an out-of-bounds write, not an error return.
 int TCPEndpoint::Send(const void* buf, size_t len) {
   const char* p = static_cast<const char*>(buf);
   while (len > 0) {
-    size_t n = send(handle.fd, p, len, 0);
-    if (n < 0) return n;
+    ssize_t n = send(handle.fd, p, len, 0);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    if (n == 0) return -1;
     p += n;
-    len -= n;
+    len -= static_cast<size_t>(n);
   }
   return 0;
 }
@@ -51,10 +64,19 @@ int TCPEndpoint::Send(const void* buf, size_t len) {
 int TCPEndpoint::Recv(void* buf, size_t len) {
   char* p = static_cast<char*>(buf);
   while (len > 0) {
-    size_t n = ::recv(handle.fd, p, len, 0);
-    if (n <= 0) return n;
+    ssize_t n = ::recv(handle.fd, p, len, 0);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    // EOF *mid-message*. The old code returned n==0 here, and SYSCALL_RETURN_ZERO
+    // reads 0 as success, so the caller went on to use a partially-filled struct
+    // -- exactly the uninitialized-header hazard HandleControlPlaneProtocol's
+    // MSG_PEEK probe (backend_impl.cpp:965) guards against, except the probe can
+    // only see a peer that closed BEFORE the read, not one that closes during it.
+    if (n == 0) return -1;
     p += n;
-    len -= n;
+    len -= static_cast<size_t>(n);
   }
   return 0;
 }
