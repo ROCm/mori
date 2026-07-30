@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import os
+import time
 import torch
 import torch.distributed as dist
 import socket
@@ -111,9 +112,35 @@ class TorchDistContext:
         torch._C._distributed_c10d._register_process_group("default", world_group)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if dist.is_initialized():
+        if not dist.is_initialized():
+            return
+        # This barrier is teardown convenience only -- every test already
+        # reports its own result through the manager's result queue before we
+        # get here, so nothing observable depends on it. Left unguarded it is
+        # actively harmful: the worker loop calls mori.shmem.shmem_finalize()
+        # just before this, and on some ranks the following device barrier
+        # then raises `HIP error: invalid argument`. That rank leaves __exit__
+        # by exception, never reaching destroy_process_group(), while its
+        # peers block in the same barrier forever -- so the parent's join()
+        # never returns and pytest never prints its summary. Every run then
+        # looks like a hang in the code under test. Swallow it, and always
+        # destroy the group.
+        try:
             dist.barrier()
+        except BaseException as exc:  # noqa: BLE001 - teardown must not strand peers
+            print(
+                f"[rank {self.rank}] teardown barrier failed, continuing to "
+                f"destroy_process_group: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        try:
             dist.destroy_process_group()
+        except BaseException as exc:  # noqa: BLE001
+            print(
+                f"[rank {self.rank}] destroy_process_group failed: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
 
 class TorchDistProcessManager:
@@ -165,7 +192,28 @@ class TorchDistProcessManager:
             p.start()
 
     def shutdown(self):
+        # Bounded, because this is session teardown: an unbounded join() on a
+        # rank wedged in a collective (a peer already dead, a device barrier
+        # that raised) hangs pytest AFTER every test has passed, so the run
+        # produces no summary line and reads as a failure of the code under
+        # test. Terminate the stragglers and name them instead.
+        timeout = float(os.environ.get("MORI_TEST_SHUTDOWN_TIMEOUT", "60"))
         for _ in range(len(self.processes)):
             self.task_queue.put("STOP")
+        deadline = time.monotonic() + timeout
         for p in self.processes:
-            p.join()
+            p.join(timeout=max(0.0, deadline - time.monotonic()))
+        straggling = [i for i, p in enumerate(self.processes) if p.is_alive()]
+        if straggling:
+            print(
+                f"[manager] shutdown: ranks {straggling} did not exit within "
+                f"{timeout:.0f}s; terminating. This does NOT invalidate results "
+                f"already reported -- they were queued before teardown.",
+                flush=True,
+            )
+            for i in straggling:
+                self.processes[i].terminate()
+            for i in straggling:
+                self.processes[i].join(timeout=10)
+                if self.processes[i].is_alive():
+                    self.processes[i].kill()
