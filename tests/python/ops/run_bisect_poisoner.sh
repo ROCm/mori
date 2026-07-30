@@ -67,6 +67,24 @@ case "$MODE" in
     NAME=t21bearly
     KEXPR="flip_and_flip_back or leak_stress or finalize_returns or public_reject or max_total_recv or rejects_layout or noop_and_finalize or oom_rolls_back or real_capacities or finalized_getters"
     ;;
+  union)
+    # `inj` (5 passed) and `early` (13 passed) are each green ALONE, so no
+    # single group is the poisoner. This is their union in ONE session: green
+    # here means the effect is cumulative beyond 15 tests or needs a member of
+    # the tail; red here localizes it to a cross-group pair.
+    NAME=t21bunion
+    KEXPR="plain_device_oom or repeated_failed_flips or rank_asymmetric_failure or rank_asymmetric_unrecoverable or flip_and_flip_back or leak_stress or finalize_returns or public_reject or max_total_recv or rejects_layout or noop_and_finalize or oom_rolls_back or real_capacities or finalized_getters"
+    ;;
+  t20repro)
+    # T20's EXACT selection (full suite minus only the known-wedging
+    # `test_rank_asymmetric_reject`). `union` above ran all 14 predecessors of
+    # `finalized_getters` plus the test itself and was GREEN, so if this is RED
+    # the fault is INTERMITTENT rather than caused by any predecessor -- and if
+    # it is GREEN twice running, T20's abort was a one-off that must not be
+    # reported as a reproducible defect.
+    NAME=t21t20repro
+    KEXPR="not (rank_asymmetric_reject and not heap_symmetry and not barrier_state)"
+    ;;
   *) echo "unknown mode: $MODE" >&2; exit 98 ;;
 esac
 
