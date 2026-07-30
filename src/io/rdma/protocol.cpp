@@ -121,6 +121,23 @@ MessageHeader Protocol::ReadMessageHeader() {
   return hdr;
 }
 
+MessageHeader Protocol::ReadMessageHeader(MessageType expected) {
+  // Read + validate as usual (unknown type, oversized len), THEN pin the type.
+  // Ordering matters: an unknown type must still report as unknown rather than
+  // as a mismatch, because the two mean different things to whoever reads the
+  // log -- unknown is a garbage/desynchronized stream, mismatch is a peer that
+  // is talking a protocol we understand at the wrong moment.
+  MessageHeader hdr = ReadMessageHeader();
+  if (hdr.type != expected) {
+    throw std::runtime_error(
+        "mori::io control-plane: expected message type " +
+        std::to_string(static_cast<unsigned>(expected)) + " but the peer sent " +
+        std::to_string(static_cast<unsigned>(hdr.type)) +
+        "; refusing to unpack one message as another, dropping this connection");
+  }
+  return hdr;
+}
+
 void Protocol::WriteMessageHeader(const MessageHeader& hdr) {
   CheckSyscall(ep.Send(&hdr.type, sizeof(hdr.type)), "send");
   uint32_t len = htonl(hdr.len);

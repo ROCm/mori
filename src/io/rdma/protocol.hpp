@@ -72,7 +72,19 @@ class Protocol {
   Protocol(application::TCPEndpointHandle);
   ~Protocol();
 
+  // `expected`, when given, requires the header to carry exactly that type and
+  // throws otherwise. The server loop, which legitimately accepts either type
+  // and dispatches on it, omits it; the two CLIENT call sites are replying to
+  // a request they just wrote and know precisely what must come back, so they
+  // pass it. Those sites used to check with `assert(hdr.type == ...)`, which
+  // this project compiles out under -DNDEBUG -- so in a release build a client
+  // handed the WRONG-but-valid message type msgpack-unpacked one struct as
+  // another. That is exactly the case `19b718f3` motivated itself with (a peer
+  // that flipped role mid-message has both kinds in flight on one channel) and
+  // only half-discharged: it made an UNDEFINED type throw and left a
+  // WELL-DEFINED but wrong one passing. Review #62 item 5.
   MessageHeader ReadMessageHeader();
+  MessageHeader ReadMessageHeader(MessageType expected);
   void WriteMessageHeader(const MessageHeader&);
 
   MessageRegEndpoint ReadMessageRegEndpoint(size_t len);

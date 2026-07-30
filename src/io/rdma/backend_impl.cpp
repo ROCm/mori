@@ -932,8 +932,8 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
 
   Protocol p(tcph);
   p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle, rank});
-  MessageHeader hdr = p.ReadMessageHeader();
-  assert(hdr.type == MessageType::RegEndpoint);
+  // Was `assert(hdr.type == ...)`, compiled out under -DNDEBUG. Review #62-5.
+  MessageHeader hdr = p.ReadMessageHeader(MessageType::RegEndpoint);
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
 
   EndpointId eid = rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
@@ -972,8 +972,8 @@ application::RdmaMemoryRegion ControlPlaneServer::AskRemoteMemoryRegion(EngineKe
 
   Protocol p(tcph);
   p.WriteMessageAskMemoryRegion({ekey, rdevId, id, {}});
-  MessageHeader hdr = p.ReadMessageHeader();
-  assert(hdr.type == MessageType::AskMemoryRegion);
+  // Was `assert(hdr.type == ...)`, compiled out under -DNDEBUG. Review #62-5.
+  MessageHeader hdr = p.ReadMessageHeader(MessageType::AskMemoryRegion);
   MessageAskMemoryRegion msg = p.ReadMessageAskMemoryRegion(hdr.len);
 
   return msg.mr;

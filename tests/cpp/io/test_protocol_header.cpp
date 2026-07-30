@@ -189,6 +189,68 @@ void TestUnknownTypeIsRefused() {
   printf("unknown type refused: %s\n", what.c_str());
 }
 
+// The type-PIN guard, which is a different hazard from the one above.
+// `19b718f3` made an UNDEFINED type throw and left a WELL-DEFINED but WRONG one
+// passing: `ReadMessageHeader()` accepts either RegEndpoint or AskMemoryRegion,
+// while the two CLIENT call sites (backend_impl.cpp:936 BuildRdmaConn, :976
+// AskRemoteMemoryRegion) each know exactly which reply is due and pinned it
+// with `assert(hdr.type == ...)` -- compiled out under the -DNDEBUG this
+// project ships. So a client handed the other valid type passed validation and
+// then msgpack-unpacked one struct as another. Review #62 item 5.
+//
+// This is the case `19b718f3`'s own message motivates itself with: a peer that
+// flipped role mid-message has both kinds in flight on one channel, which is
+// the ordinary situation on a PD role switch.
+//
+// Both directions are checked. The negative alone would pass against a pin
+// that rejected everything, which is the same vacuity the boundary test above
+// guards against.
+void TestWrongButValidTypeIsRefused() {
+  {
+    Pair p;
+    Protocol cli(p.cliHandle);
+    Protocol srv(p.srvHandle);
+
+    // A perfectly well-formed AskMemoryRegion header arriving where the client
+    // is waiting for its RegEndpoint reply.
+    MessageHeader out{};
+    out.type = MessageType::AskMemoryRegion;
+    out.len = 32;
+    cli.WriteMessageHeader(out);
+
+    bool threw = false;
+    std::string what;
+    try {
+      srv.ReadMessageHeader(MessageType::RegEndpoint);
+    } catch (const std::exception& e) {
+      threw = true;
+      what = e.what();
+    }
+    CHECK(threw, "a valid-but-wrong message type must be refused when pinned");
+    CHECK(what.find("expected message type") != std::string::npos,
+          "the throw must say it is a MISMATCH, not an unknown type -- the two "
+          "mean different things to whoever reads the log");
+    printf("valid-but-wrong type refused: %s\n", what.c_str());
+  }
+  {
+    // ...and the pinned overload must still ACCEPT the type it asked for,
+    // otherwise the check above is satisfied by a function that always throws.
+    Pair p;
+    Protocol cli(p.cliHandle);
+    Protocol srv(p.srvHandle);
+
+    MessageHeader out{};
+    out.type = MessageType::AskMemoryRegion;
+    out.len = 77;
+    cli.WriteMessageHeader(out);
+
+    MessageHeader in = srv.ReadMessageHeader(MessageType::AskMemoryRegion);
+    CHECK(in.type == MessageType::AskMemoryRegion, "pinned read mangled the type");
+    CHECK(in.len == 77, "pinned read mangled the length");
+    printf("pinned read accepts the matching type (len=%u)\n", in.len);
+  }
+}
+
 // A well-formed header must still round-trip. Without this, a bound that
 // rejected EVERYTHING would pass all three tests above -- the mirror image of
 // the vacuity problem, and the reason the boundary test above checks the
@@ -217,6 +279,7 @@ int main() {
   TestOversizedLengthIsRefused();
   TestBoundaryIsExact();
   TestUnknownTypeIsRefused();
+  TestWrongButValidTypeIsRefused();
   printf("test_protocol_header: ALL PASSED\n");
   return 0;
 }
