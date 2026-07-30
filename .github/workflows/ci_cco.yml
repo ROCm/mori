@@ -71,12 +71,17 @@ jobs:
 
       - name: Run CCO SDMA C++ tests (fork mode, 8 ranks)
         run: |
+          # Every one of these SKIPs and exits 0 when the comm has no SDMA queues,
+          # so a build or runner that quietly loses SDMA would turn the whole
+          # suite green. Treat a SKIP as a failure.
           $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             for t in test_sdma_put test_sdma_get test_sdma_put_mt test_sdma_block test_sdma_edge \
                      test_sdma_signal test_sdma_warp_issue; do \
               echo \"=== \$t ===\" && \
-              timeout 240 ./build/tests/cpp/cco/\$t 8 || exit 1; \
+              out=\$(timeout 240 ./build/tests/cpp/cco/\$t 8 2>&1) || { echo \"\$out\"; exit 1; }; \
+              echo \"\$out\"; \
+              case \"\$out\" in *SKIP*) echo \"\$t SKIPped: SDMA is not active\"; exit 1;; esac; \
             done"
 
       - name: Run CCO SDMA benchmarks (2 ranks, smoke)

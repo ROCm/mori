@@ -125,6 +125,30 @@ __global__ void SdmaSignalKernel(mori::cco::ccoWindowDevice* sendWin,
 
 /* ---------------------------------- driver ----------------------------------- */
 
+/* ---------------------- part E: one signal per group ------------------------- */
+
+// Several lanes of one wavefront signalling together. By default the group emits
+// one signal after all of its copies, so the counter advances by one per put()
+// call whatever the lane count; ccoSdmaOptFlagsSignalPerCopy gives every copy its
+// own and it advances by the lane count. Nothing else in this file posts from
+// more than one lane, so this is the only cover for that layout.
+template <uint32_t Flags>
+__global__ void SdmaGroupSignalKernel(mori::cco::ccoWindowDevice* sendWin,
+                                      mori::cco::ccoWindowDevice* recvWin, int lanes, size_t bytes,
+                                      int qid, mori::cco::ccoDevComm devComm) {
+  using namespace mori::cco;
+  ccoSdma sdma{devComm};
+  const int peer = (devComm.lsaRank + 1) % devComm.lsaSize;
+  const int lane = threadIdx.x;
+  if (lane < lanes) {
+    sdma.put<ccoCoopThread, /*localSignal=*/true, /*remoteSignal=*/false, Flags,
+             ccoSdmaThreadSameQueue>(peer, reinterpret_cast<ccoWindow_t>(recvWin), lane * bytes,
+                                     reinterpret_cast<ccoWindow_t>(sendWin), lane * bytes, bytes,
+                                     qid);
+  }
+  sdma.quiet<ccoCoopBlock>(peer);
+}
+
 int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
   g_rank = rank;
 
@@ -206,7 +230,7 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
 
     /* ---- part A: queueId x scope x aggregate x size, quiet via rptr ---- */
     const char* partsEnv = getenv("CCO_TEST_PARTS");
-    const char* parts = partsEnv ? partsEnv : "ABCD";
+    const char* parts = partsEnv ? partsEnv : "ABCDE";
     const bool verbose = getenv("CCO_TEST_VERBOSE") != nullptr;
 
     const size_t kSizes[] = {8, 64, 1024, 4096, 65536, 262144, MAX_CHUNK};
@@ -322,10 +346,57 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
       }
     }
 
-    ok = okA && okB && okC && okD;
-    printf("[rank %d] A=%s B(remote)=%s C(local)=%s D(both)=%s %s\n", rank, okA ? "PASS" : "FAIL",
-           okB ? "PASS" : "FAIL", okC ? "PASS" : "FAIL", okD ? "PASS" : "FAIL",
-           ok ? "PASSED" : "FAILED");
+    /* ---- part E: a group of lanes signals once, or once per copy ---- */
+    // Read the slot before and after rather than resetting it: parts B-D keep a
+    // running total in the same slot.
+    bool okE = true;
+    if (strchr(parts, 'E')) {
+      const size_t kChunk = 256;
+      HSAuint64* slot = devComm.sdma.signalBuf + devComm.lsaRank * nq;  // queue 0
+      for (int lanes : {1, 2, 8, 64}) {
+        for (int perCopy = 0; perCopy < 2; perCopy++) {
+          uint64_t before = 0, after = 0;
+          HIP_CHECK(hipMemcpy(&before, slot, sizeof(before), hipMemcpyDeviceToHost));
+          HIP_CHECK(hipMemset(recvBuf, 0xff, BUF_BYTES));
+          mori::cco::ccoBarrierAll(comm);
+          if (perCopy)
+            SdmaGroupSignalKernel<mori::cco::ccoSdmaOptFlagsSignalPerCopy>
+                <<<1, 64, 0, stream>>>(sendWin, recvWin, lanes, kChunk, 0, devComm);
+          else
+            SdmaGroupSignalKernel<mori::cco::ccoSdmaOptFlagsDefault>
+                <<<1, 64, 0, stream>>>(sendWin, recvWin, lanes, kChunk, 0, devComm);
+          HIP_CHECK(hipStreamSynchronize(stream));
+          mori::cco::ccoBarrierAll(comm);
+          HIP_CHECK(hipMemcpy(&after, slot, sizeof(after), hipMemcpyDeviceToHost));
+
+          const uint64_t want = perCopy ? static_cast<uint64_t>(lanes) : 1;
+          if (after - before != want) {
+            fprintf(stderr, "[rank %d] E[%s lanes=%d] signal advanced by %lu, want %lu\n", rank,
+                    perCopy ? "per-copy" : "group", lanes, after - before, want);
+            okE = false;
+          }
+          // Every lane must still have delivered its own chunk.
+          HIP_CHECK(hipMemcpy(host.data(), recvBuf, BUF_BYTES, hipMemcpyDeviceToHost));
+          for (int c = 0; c < lanes && okE; c++) {
+            for (size_t i = 0; i < kChunk / sizeof(uint32_t); i++) {
+              const size_t idx = c * (kChunk / sizeof(uint32_t)) + i;
+              if (host[idx] != Pattern(src, idx)) {
+                fprintf(stderr, "[rank %d] E[%s lanes=%d] chunk %d word %zu: got %08x want %08x\n",
+                        rank, perCopy ? "per-copy" : "group", lanes, c, i, host[idx],
+                        Pattern(src, idx));
+                okE = false;
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    ok = okA && okB && okC && okD && okE;
+    printf("[rank %d] A=%s B(remote)=%s C(local)=%s D(both)=%s E(group)=%s %s\n", rank,
+           okA ? "PASS" : "FAIL", okB ? "PASS" : "FAIL", okC ? "PASS" : "FAIL",
+           okD ? "PASS" : "FAIL", okE ? "PASS" : "FAIL", ok ? "PASSED" : "FAILED");
     fflush(stdout);
 
     HIP_CHECK(hipFree(devRes));
