@@ -352,6 +352,9 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
     bool okE = true;
     if (strchr(parts, 'E')) {
       const size_t kChunk = 256;
+      hipDeviceProp_t props{};
+      HIP_CHECK(hipGetDeviceProperties(&props, rank % numDevices));
+      const int waveSize = props.warpSize;
       HSAuint64* slot = devComm.sdma.signalBuf + devComm.lsaRank * nq;  // queue 0
       for (int lanes : {1, 2, 8, 64}) {
         for (int perCopy = 0; perCopy < 2; perCopy++) {
@@ -369,7 +372,10 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
           mori::cco::ccoBarrierAll(comm);
           HIP_CHECK(hipMemcpy(&after, slot, sizeof(after), hipMemcpyDeviceToHost));
 
-          const uint64_t want = perCopy ? static_cast<uint64_t>(lanes) : 1;
+          // One signal per wavefront, so a lane count above the wave width is
+          // several groups. wave64 folds this back to 1.
+          const uint64_t waves = (lanes + waveSize - 1) / waveSize;
+          const uint64_t want = perCopy ? static_cast<uint64_t>(lanes) : waves;
           if (after - before != want) {
             fprintf(stderr, "[rank %d] E[%s lanes=%d] signal advanced by %lu, want %lu\n", rank,
                     perCopy ? "per-copy" : "group", lanes, after - before, want);
