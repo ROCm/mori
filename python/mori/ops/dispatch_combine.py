@@ -477,6 +477,45 @@ class EpDispatchCombineOp:
                 # This rank built fine; a peer did not. Raise rather than return
                 # a usable-looking op: its buffers are symmetric with a rank
                 # that has none.
+                #
+                # But RELEASE FIRST. Raising while still holding the buffers
+                # leaks them for the lifetime of the process: __init__ raised,
+                # so no `self` is bound in the caller's scope and there is
+                # nothing left to call finalize() on. On a D->P construct those
+                # are the LARGE (prefill-sized) symmetric buffers, carved out of
+                # the static shmem heap -- so the retry sglang's reconcile is
+                # supposed to be able to attempt hits an OOM that the first
+                # attempt manufactured. Each failed construct would shrink the
+                # heap by one buffer set, and it is exactly the rank-local-OOM
+                # scenario that makes a peer fail in the first place, so the
+                # compounding is not hypothetical.
+                #
+                # This is a LOCAL free, deliberately not finalize(): we are
+                # inside the ctor's own collective, the all-reduce above is the
+                # only synchronization this path gets, and finalize()'s two
+                # barriers would deadlock against the failing rank -- which is
+                # NOT here, it is unwinding out of its own `except`. Calling the
+                # C++ FinalizeAll() directly keeps the group's collective count
+                # balanced at exactly one all-reduce for every rank.
+                #
+                # The outcome is group-uniform, which is the property that makes
+                # it safe: the FAILING rank was already left holding nothing by
+                # the C++ ctor's own FinalizeAll() on its error path
+                # (dispatch_combine.cpp:118-127), and now every healthy rank
+                # ends holding nothing too. No rank is left symmetric with a
+                # rank that has none -- the condition this whole branch exists
+                # to prevent -- and the heap is back at its pre-construct
+                # baseline for whatever the caller decides to do next.
+                #
+                # Guarded and swallowing: a handle that never got as far as
+                # allocating has is_initialized False and needs no release, and
+                # a release that itself fails must not mask the peer-failure
+                # RuntimeError below, which is the diagnosis the caller needs.
+                try:
+                    if self._handle.is_initialized:
+                        self._handle.finalize()
+                except Exception:
+                    pass
                 raise RuntimeError(
                     "EpDispatchCombineOp construction failed on at least one peer "
                     "rank; this rank's buffers are unusable because the group's "
