@@ -334,6 +334,12 @@ void IOEngine::RemoveBackend(BackendType type) {
   InvalidateRouteCache();
 }
 
+Backend* IOEngine::GetBackend(BackendType type) const {
+  auto it = backends.find(type);
+  if (it == backends.end()) return nullptr;
+  return it->second.get();
+}
+
 void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
   for (auto& it : backends) {
     it.second->RegisterRemoteEngine(remote);

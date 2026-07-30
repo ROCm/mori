@@ -80,6 +80,11 @@ class IOEngine {
 
   void CreateBackend(BackendType, const BackendConfig&);
   void RemoveBackend(BackendType);
+  // Borrowed, non-owning; nullptr if that backend was never created. Exists so
+  // a test can read a backend's diagnostic counters (e.g.
+  // RdmaBackend::GetRemoteRetentionStats) without the engine re-exporting each
+  // one. The engine keeps ownership; do not hold it across RemoveBackend().
+  Backend* GetBackend(BackendType) const;
 
   EngineDesc GetEngineDesc() const { return desc; }
 

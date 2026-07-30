@@ -908,6 +908,124 @@ void CaseRdmaDeregisteredEngineFailsTransferThenRecovers() {
               std::to_string(afterReReg.CodeUint32()) + ", msg='" + afterReReg.Message() + "'");
 }
 
+// The REAL PD flip, modelled as sglang actually performs it -- and the first
+// test in this campaign to do so. Every prior flip test deregistered and then
+// re-registered the SAME engine key, which is a shape sglang never produces:
+//
+//   * `deregister_remote_engine` has ZERO callers in all of sglang (measured
+//     2026-07-30T11:55Z @38ad45fe; the control grep for the register variant
+//     returns 1). Nothing tells the survivor that the old peer died.
+//   * A flip destroys the whole IOEngine (`MoriKVManager.teardown()` ->
+//     `self.engine = None`) and builds a NEW one whose key embeds a fresh
+//     `uuid4().hex[:8]`. The peer comes back under a DIFFERENT key.
+//
+// So the survivor's per-engine state is not stale-and-reused (that was my
+// turn-39 reading, retracted in 2a7e61eb) -- it is ORPHANED and unreachable,
+// and nothing ever collects it. This test asserts on the numbers rather than
+// on a source reading, because T3 taught this team what a leak assertion is
+// worth when the instrument cannot move: it re-registers a peer under a new
+// key N times, exactly as N flips would, and reports the growth in each
+// retained structure.
+//
+// It is deliberately written to PASS while the leak exists, and to say so: the
+// point of this turn is to produce the NUMBER, honestly, not to assert a fix I
+// have not written. The measured per-flip deltas are printed and the only hard
+// assertion is the one that cannot be vacuous -- that the counters moved at
+// all, i.e. that the instrument works.
+void CaseRdmaPerFlipRetentionIsMeasured() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_flip_retention", true);
+  auto src = RegisterGpuMemory(pair.initiator.get(), 4096, 0);
+  auto dst = RegisterGpuMemory(pair.target.get(), 4096, 0);
+
+  auto* backend = dynamic_cast<RdmaBackend*>(pair.initiator->GetBackend(BackendType::RDMA));
+  Require(backend != nullptr, "initiator must have an RDMA backend to read retention stats from");
+
+  // One real transfer so the caches are WARM before the first measurement --
+  // otherwise the baseline is empty and every later number is trivially larger.
+  std::string err;
+  {
+    TransferStatus warm;
+    TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+    pair.initiator->Read(src.desc, 0, dst.desc, 0, 64, &warm, uid);
+    Require(WaitTransferDone(&warm, 5000, &err), "warm-up transfer timed out: " + err);
+    Require(warm.Succeeded(), "warm-up transfer failed: " + warm.Message());
+  }
+
+  RdmaBackend::RemoteRetentionStats base = backend->GetRemoteRetentionStats();
+  std::printf(
+      "[retention] baseline: engines=%zu metas=%zu endpoints=%zu sessions=%zu notifQps=%zu "
+      "notifBytes=%zu\n",
+      base.numRemoteEngines, base.numRemoteMetas, base.numEndpointRuntimes, base.numSessions,
+      base.numNotifContexts, base.notifBufferBytes);
+
+  // NON-VACUITY: the warm transfer must have built something, or "it did not
+  // grow" later would be a statement about an instrument that reads zero.
+  Require(base.numRemoteEngines > 0,
+          "instrument check: a connected+warmed pair must retain at least one remote engine");
+  Require(base.numEndpointRuntimes > 0,
+          "instrument check: a warmed transfer must have built at least one endpoint");
+
+  // N flips. Each one gives the peer a brand-new engine key, exactly as
+  // `_init_engine`'s uuid4 does, and drives a real transfer against it so the
+  // survivor builds the same per-engine state a real flip would make it build.
+  constexpr int kFlips = 5;
+  EngineDesc realTarget = pair.target->GetEngineDesc();
+  for (int i = 0; i < kFlips; ++i) {
+    EngineDesc flipped = realTarget;
+    flipped.key = realTarget.key + "_flip" + std::to_string(i);
+    // NOTE: no DeregisterRemoteEngine here, and that is the whole point --
+    // sglang never calls it. The survivor simply learns a new key.
+    pair.initiator->RegisterRemoteEngine(flipped);
+
+    MemoryDesc remoteUnderNewKey = dst.desc;
+    remoteUnderNewKey.engineKey = flipped.key;
+
+    TransferStatus st;
+    TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+    pair.initiator->Read(src.desc, 0, remoteUnderNewKey, 0, 64, &st, uid);
+    // Whether this SUCCEEDS is not the assertion -- the peer is the same
+    // process, so it may well serve it. What matters is the state left behind.
+    WaitTransferDone(&st, 5000, &err);
+  }
+
+  RdmaBackend::RemoteRetentionStats after = backend->GetRemoteRetentionStats();
+  std::printf(
+      "[retention] after %d flips: engines=%zu metas=%zu endpoints=%zu sessions=%zu notifQps=%zu "
+      "notifBytes=%zu\n",
+      kFlips, after.numRemoteEngines, after.numRemoteMetas, after.numEndpointRuntimes,
+      after.numSessions, after.numNotifContexts, after.notifBufferBytes);
+  std::printf(
+      "[retention] delta over %d flips: engines=+%zu metas=+%zu endpoints=+%zu sessions=+%zu "
+      "notifQps=+%zu notifBytes=+%zu\n",
+      kFlips, after.numRemoteEngines - base.numRemoteEngines,
+      after.numRemoteMetas - base.numRemoteMetas,
+      after.numEndpointRuntimes - base.numEndpointRuntimes,
+      after.numSessions - base.numSessions, after.numNotifContexts - base.numNotifContexts,
+      after.notifBufferBytes - base.notifBufferBytes);
+
+  // The one hard assertion, and it is about the LEAK being real rather than
+  // about it being fixed: a survivor that is never told the old key died must
+  // be holding strictly more remote-engine state than before. If this ever
+  // fails, either someone added the collection this comment says is missing
+  // (good -- then flip this to an equality) or the instrument stopped reading.
+  Require(after.numRemoteEngines >= base.numRemoteEngines + kFlips,
+          "expected one orphaned remote-engine entry per flip; baseline=" +
+              std::to_string(base.numRemoteEngines) + " after=" +
+              std::to_string(after.numRemoteEngines) + " flips=" + std::to_string(kFlips));
+
+  // Still serving on the ORIGINAL key -- the orphaned state must not have
+  // broken the live path. Without this the test could pass on a wedged engine.
+  TransferStatus good;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Read(src.desc, 0, dst.desc, 0, 64, &good, uid);
+  Require(WaitTransferDone(&good, 5000, &err),
+          "engine must still serve the original peer after the flips: " + err);
+  Require(good.Succeeded(), "post-flip transfer on the original key failed: " + good.Message());
+}
+
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -1408,6 +1526,7 @@ int main(int argc, char* argv[]) {
        CaseRdmaUnknownRemoteMemoryIdFailsTransferWithoutAbort},
       {"rdma_deregistered_engine_fails_then_recovers",
        CaseRdmaDeregisteredEngineFailsTransferThenRecovers},
+      {"rdma_per_flip_retention_is_measured", CaseRdmaPerFlipRetentionIsMeasured},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},
