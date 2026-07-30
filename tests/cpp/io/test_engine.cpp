@@ -1648,6 +1648,91 @@ void CaseRdmaGateTombstoneLiftsOnReregister() {
   HIP_RUNTIME_CHECK(hipFree(lptr));
 }
 
+// REVIEW_M #76-1, and the inverted-retention assertion asked for since #69-4.
+//
+// The lift case above does NOT model sglang and says so at its own docstring:
+// it calls `ReregisterMemory` to reuse an id, which nothing in src/ or the
+// pybind layer does. On the real flip path `IOEngine::RegisterMemory` mints a
+// FRESH id every call (engine.cpp:363), so no tombstone is EVER lifted, and
+// before ReapMemoryGates() `memGates_` grew one retired entry per deregistered
+// id for the life of the process.
+//
+// So this case asserts the property that actually matters and that the lift
+// case cannot reach: over many register/transfer/deregister cycles with a NEW
+// id each time -- i.e. exactly what a PD flip stress does -- the retention is
+// FLAT, not merely positive. It is two-sided by construction: without the reap
+// `gateTombstones` equals the number of cycles, so the bound is what makes the
+// assertion fail on the old code and pass on the new.
+void CaseRdmaGateTombstonesAreBounded() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  // A small bound so the test is quick AND so the steady state is unambiguous:
+  // with 4 kept and 24 cycles, unbounded growth is 24 and bounded is <= 4+1.
+  // Set before the engine comes up -- the bound is read once, on first use.
+  ScopedEnvVar smallBound("MORI_IO_MAX_MEM_GATE_TOMBSTONES", "4");
+  const std::size_t kBound = 4;
+  const int kCycles = 24;
+
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_gate_bound", true);
+  auto dst = RegisterGpuMemory(pair.target.get(), 64 * 1024, 0);
+
+  void* lptr = nullptr;
+  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipMalloc(&lptr, 256 * 1024));
+  HIP_RUNTIME_CHECK(hipMemset(lptr, 0, 256 * 1024));
+
+  std::size_t peak = 0;
+  for (int i = 0; i < kCycles; ++i) {
+    // A FRESH id every cycle, via RegisterMemory rather than ReregisterMemory.
+    // This is the whole point: it is what sglang does, and it is what makes
+    // the lift unreachable.
+    MemoryDesc ldesc = pair.initiator->RegisterMemory(lptr, 256 * 1024, 0, MemoryLocationType::GPU);
+
+    TransferStatus st;
+    TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+    pair.initiator->Write(ldesc, 0, dst.desc, 0, 64, &st, uid);
+    std::string err;
+    Require(WaitTransferDone(&st, 5000, &err),
+            "cycle " + std::to_string(i) + ": transfer timed out: " + err);
+    Require(st.Succeeded(), "cycle " + std::to_string(i) + ": transfer failed: " + st.Message());
+
+    pair.initiator->DeregisterMemory(ldesc);
+    peak = std::max(peak, GetDeregQuiesceCensus().gateTombstones);
+  }
+
+  const std::size_t settled = GetDeregQuiesceCensus().gateTombstones;
+  std::printf("[gate-bound] %d cycles, fresh id each: peak=%zu settled=%zu bound=%zu\n", kCycles,
+              peak, settled, kBound);
+
+  // Non-vacuity FIRST: if the barrier never retired anything these cycles did
+  // not exercise the path, and a "flat at 0" would be a green for the wrong
+  // reason -- the same vacuous-leak-test mistake this team made at T1/T2 and
+  // had to strike at T3.
+  Require(peak > 0,
+          "VACUOUS: no tombstone was ever created, so flatness proves nothing (peak=0)");
+  // The actual claim. Pre-reap this is kCycles (24), so the margin is wide.
+  Require(settled <= kBound + 1, "tombstone retention is NOT bounded: settled=" +
+                                     std::to_string(settled) + " after " +
+                                     std::to_string(kCycles) + " cycles, bound=" +
+                                     std::to_string(kBound));
+  Require(peak <= kBound + 1, "tombstone retention PEAKED above the bound: peak=" +
+                                  std::to_string(peak) + ", bound=" + std::to_string(kBound));
+
+  // A transfer must still work AFTER all that reaping: the bound must not have
+  // evicted a gate that something live still needs.
+  MemoryDesc fresh = pair.initiator->RegisterMemory(lptr, 256 * 1024, 0, MemoryLocationType::GPU);
+  TransferStatus after;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Write(fresh, 0, dst.desc, 0, 64, &after, uid);
+  std::string err;
+  Require(WaitTransferDone(&after, 5000, &err), "post-reap transfer timed out: " + err);
+  Require(after.Succeeded(), "post-reap transfer failed: " + after.Message());
+  pair.initiator->DeregisterMemory(fresh);
+
+  HIP_RUNTIME_CHECK(hipFree(lptr));
+}
+
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -2155,6 +2240,7 @@ int main(int argc, char* argv[]) {
       {"rdma_dereg_reentry_is_refused_not_resurrected",
        CaseRdmaDeregReentryIsRefusedNotResurrected},
       {"rdma_gate_tombstone_lifts_on_reregister", CaseRdmaGateTombstoneLiftsOnReregister},
+      {"rdma_gate_tombstones_are_bounded", CaseRdmaGateTombstonesAreBounded},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},
