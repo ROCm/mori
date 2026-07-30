@@ -1543,6 +1543,44 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=Tru
     # Sizes must agree across ranks per object too: a symmetric object whose
     # size differs between ranks means a peer read runs past what its owner
     # published.
+    #
+    # NOT every object is allocated. `InitializeShmemBuf` guards the scale
+    # buffers on `inpScaleSize > 0` / `userScaleSize > 0`, and this suite runs
+    # scale_dim=0 with quant_type "none", so `inpScales`/`outScales` legitimately
+    # do not exist and the probe records them as {0, 0}. That is deliberate (an
+    # omitted entry would hide an object appearing or vanishing) but it means
+    # the comparisons below must first agree on WHICH objects exist and then
+    # compare only those. The first revision of this check did not, and both
+    # arms went red on exactly those two names with per-rank "offsets" of
+    # `0 - heap_base` -- i.e. it was comparing each rank's own heap base, which
+    # differs by construction (shmem/init.cpp:226 hipMallocs wherever the local
+    # allocator lands). Both arms failing IDENTICALLY is the signature of a test
+    # bug rather than a reject-specific defect, and that is how it was caught.
+    allocated = torch.tensor(
+        [1 if int(a_objs[n]["local_ptr"]) != 0 else 0 for n in names],
+        dtype=torch.int64,
+        device="cpu",
+    )
+    gathered_alloc = [torch.zeros_like(allocated) for _ in range(world_size)]
+    dist.all_gather(gathered_alloc, allocated, group=group)
+    alloc_rows = [[int(v) for v in g.tolist()] for g in gathered_alloc]
+    # Disagreement about existence IS a real defect -- one rank holding a buffer
+    # its peers do not is a write with no reader -- so it is asserted rather
+    # than silently skipped.
+    bad_alloc = [
+        (names[k], [row[k] for row in alloc_rows])
+        for k in range(len(names))
+        if len({row[k] for row in alloc_rows}) != 1
+    ]
+    assert not bad_alloc, (
+        f"rank {rank} [{arm}]: some ranks allocated a symmetric object and "
+        f"others did not -- (object, per-rank 1=allocated) = {bad_alloc}. The "
+        f"symmetric heap is allocated in lockstep; a buffer that exists on a "
+        f"subset of ranks means every later allocation is at a different offset "
+        f"on those ranks."
+    )
+    live = [k for k in range(len(names)) if alloc_rows[0][k] == 1]
+
     my_sizes = torch.tensor(
         [int(a_objs[n]["size"]) for n in names], dtype=torch.int64, device="cpu"
     )
@@ -1551,7 +1589,7 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=Tru
     size_rows = [[int(v) for v in g.tolist()] for g in gathered_sizes]
     bad_sizes = [
         (names[k], [row[k] for row in size_rows])
-        for k in range(len(names))
+        for k in live
         if len({row[k] for row in size_rows}) != 1
     ]
     assert not bad_sizes, (
@@ -1562,9 +1600,10 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=Tru
         f"config's capacity."
     )
 
-    # And the heap-relative OFFSET of every object must match across ranks, for
-    # the same reason (2) checks it for the barrier: RegisterStaticHeapSubRegion
-    # derives peers as `peerPtrs[i] + offset` from the LOCAL offset.
+    # And the heap-relative OFFSET of every allocated object must match across
+    # ranks, for the same reason (2) checks it for the barrier:
+    # RegisterStaticHeapSubRegion derives peers as `peerPtrs[i] + offset` from
+    # the LOCAL offset.
     my_offsets = torch.tensor(
         [int(a_objs[n]["local_ptr"]) - heap_base for n in names],
         dtype=torch.int64,
@@ -1575,7 +1614,7 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=Tru
     off_rows = [[int(v) for v in g.tolist()] for g in gathered_offsets]
     bad_offsets = [
         (names[k], [row[k] for row in off_rows])
-        for k in range(len(names))
+        for k in live
         if len({row[k] for row in off_rows}) != 1
     ]
     assert not bad_offsets, (
@@ -1584,6 +1623,17 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=Tru
         f"{bad_offsets}. RegisterStaticHeapSubRegion "
         f"(application/memory/symmetric_memory.cpp:392) uses the LOCAL offset "
         f"for every peer with no allgather to check it."
+    )
+
+    # The whole point of the all-object extension is that it probes the buffers
+    # that RESIZE. If the live set somehow reduced to the capacity-independent
+    # barrier again, this test is back to measuring nothing and must say so
+    # rather than report a green.
+    live_names = {names[k] for k in live}
+    assert {"tok.dispatchOut", "recvTokenNum"} <= live_names, (
+        f"rank {rank} [{arm}]: the capacity-scaled objects were not measured -- "
+        f"live objects were {sorted(live_names)}. A green from this test would "
+        f"be vacuous."
     )
 
 
