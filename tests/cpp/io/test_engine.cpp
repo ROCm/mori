@@ -1181,9 +1181,24 @@ void CaseRdmaTransferSurvivesConcurrentDeregister() {
 // property of RC semantics plus a missing recovery path, and it survives
 // 8f2d80b2.
 //
-// Still unmeasured, stated so: the ASAN RED/GREEN for 8f2d80b2, which this
-// failure now MASKS -- the case reaches its final arm before the sanitizer arm
-// would matter. In flight at the time of writing.
+// T36c: THE ASAN DISCRIMINATOR WAS RUN AND IT IS INCONCLUSIVE. Reporting the
+// non-result rather than quietly dropping it. Pre-fix side, built at
+// `8f2d80b2^` with HEAD's test overlaid (one variable changed):
+//   CMAKE_ASAN_RC=0 BUILD_ASAN_RC=0 ASAN_RACE_RC_pre=1
+//   census of `SUMMARY: AddressSanitizer:` lines = **374 bad-free, 0 of any
+//   other kind**, and in particular ZERO heap-use-after-free.
+//   log: logs/mori_io_M_t36asan_pre.log
+// Every bad-free stack is inside /opt/rocm/lib/libamdhip64.so.7 with a 4096-byte
+// region allocated by the same library -- ASAN interposing malloc under HIP,
+// which manages that memory itself. It is instrument noise, not a mori defect,
+// and 374 of them bury any real report.
+//
+// So `8f2d80b2` remains justified by SOURCE (the interleaving is written out at
+// its declaration) and is NOT sanitizer-proven. Two things would have to change
+// to get the proof: suppress the HIP allocator (ASAN_OPTIONS suppressions or a
+// host-memory-only fixture that never calls hipMalloc), AND fix the QP wedge
+// first, since the case now dies at the wedge before any post-free window.
+// That ordering is itself a finding: the wedge blocks its own diagnosis.
 
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
