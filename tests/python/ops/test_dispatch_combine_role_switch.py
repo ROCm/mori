@@ -31,6 +31,7 @@ import os
 
 import pytest
 import torch
+import torch.distributed as dist
 
 import mori
 from tests.python.ops.dispatch_combine_test_utils import (
@@ -987,6 +988,101 @@ def _worker_rank_asymmetric_reject(rank, world_size):
     _run_once(op, config)
 
 
+def _worker_rank_asymmetric_reject_heap_symmetry(rank, world_size):
+    """Measure the heap divergence a REJECT leaves behind, WITHOUT dispatching.
+
+    `_worker_rank_asymmetric_reject` hangs on all ranks in the post-combine
+    `torch.cuda.synchronize()` of the first `_run_once` after the rejection
+    (RESULTS_M T10b, py-spy stack identical on 4/4 ranks). A hang produces no
+    diagnostic -- just a queue timeout that misreports live ranks as silent --
+    so this variant runs the identical rejection and then reports heap
+    accounting instead of driving the kernel that wedges.
+
+    The hypothesis it exists to test: a rejection is the ONE path where ranks
+    run different symmetric-heap histories that are never reconciled. Rank 0 is
+    refused inside ValidateReconfigurable, i.e. BEFORE anything is freed, so it
+    does no heap work at all; its peers pass validation, allocate at PREFILL,
+    then give the capacity back -- two full free/alloc round trips. A first-fit
+    VA manager fed different histories can land the same logical buffer at a
+    different offset per rank, and `RegisterStaticHeapSubRegion`
+    (symmetric_memory.cpp:392) computes peers as `peerPtrs[i] + offset` with no
+    allgather to check. That is review #4 item 2's warning, and a combine
+    spinning on a peer flag that will never be written is exactly a hang in the
+    post-combine sync.
+
+    `test_rank_asymmetric_failure` does NOT cover this: there rank 0 attempts
+    the allocation and rolls back, so every rank does free+alloc.
+
+    This test asserts only what it can prove. If the heap returns to baseline
+    identically on every rank, the hypothesis is REFUTED and the hang is
+    somewhere else (kernel state, the give-back's device scratch) -- which is
+    just as useful, and is why the assertion is written to fail loudly with the
+    per-rank numbers either way.
+    """
+    config = _make_config(rank, world_size, DECODE_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+    _run_once(op, config)
+
+    baseline = _heap_stats()
+    if baseline is None:
+        # Not in static-heap mode, so there is nothing to measure. Return
+        # rather than pytest.skip(): Skipped is a BaseException and escaping it
+        # here leaves the parent's collective get() waiting forever (be825794).
+        return
+
+    target = 0 if rank == 0 else PREFILL_TOKENS
+    with pytest.raises(RuntimeError):
+        op.reconfigure(max_num_inp_token_per_rank=target)
+
+    after = _heap_stats()
+
+    # 1. Local accounting: a rejection must be heap-neutral on EVERY rank --
+    #    rank 0 never allocated, and its peers gave back everything they took.
+    #    Exact equality is the right bar: this heap is a deterministic first-fit
+    #    VA manager, not a caching allocator, so a closed loop must land on the
+    #    same numbers.
+    for key in ("total_free_space", "allocated_blocks", "num_mem_objs"):
+        assert after[key] == baseline[key], (
+            f"rank {rank}: {key} moved across a REJECTED reconfigure: "
+            f"{baseline[key]} -> {after[key]}. Nothing should have been "
+            f"allocated or freed net on any rank. "
+            f"(rank 0 rejects before freeing; peers resize then give back.)"
+        )
+
+    # 2. Cross-rank symmetry: the numbers must AGREE across ranks, not merely
+    #    return to each rank's own baseline. Rank 0 and its peers ran different
+    #    histories to get here, and it is the divergence -- not the drift --
+    #    that would move a peer VA offset. Gathered on CPU: the shmem group can
+    #    be gloo-only (bf9757e9).
+    if dist.is_initialized():
+        from mori.shmem import shmem_get_process_group
+
+        group = shmem_get_process_group()
+        mine = torch.tensor(
+            [
+                int(after["total_free_space"]),
+                int(after["allocated_blocks"]),
+                int(after["num_mem_objs"]),
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        gathered = [torch.zeros_like(mine) for _ in range(world_size)]
+        dist.all_gather(gathered, mine, group=group)
+        rows = [tuple(int(v) for v in g.tolist()) for g in gathered]
+        assert len(set(rows)) == 1, (
+            f"rank {rank}: symmetric heap DIVERGED across ranks after a "
+            f"rejection -- (total_free_space, allocated_blocks, num_mem_objs) "
+            f"per rank = {rows}. Ranks that ran different alloc/free histories "
+            f"are no longer at the same VA offsets, and "
+            f"RegisterStaticHeapSubRegion assumes they are."
+        )
+
+    # 3. The op still reports itself usable at the old capacity on every rank.
+    assert op.is_initialized is True, f"rank {rank} lost its buffers"
+    _assert_capacity(op, DECODE_TOKENS)
+
+
 def _worker_reconfigure_rejects_immutable_fields(rank, world_size):
     """numQpPerPe / useExternalInpBuffer are peer-visible; they must be frozen.
 
@@ -1338,6 +1434,23 @@ def test_finalized_getters_raise(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_finalized_getters_raise, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+def test_rank_asymmetric_reject_heap_symmetry(torch_dist_process_manager, world_size):
+    """Diagnostic for the T10b hang: does a REJECT leave the heap asymmetric?
+
+    Split out of `test_rank_asymmetric_reject`, which hangs (RESULTS_M T10b) in
+    the dispatch/combine AFTER the rejection -- and a hang yields no signal at
+    all, just a harness timeout naming ranks that are actually alive. This test
+    stops short of that dispatch and reports the numbers instead, so the next
+    turn starts from a measurement rather than the hypothesis.
+    """
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_rank_asymmetric_reject_heap_symmetry, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
