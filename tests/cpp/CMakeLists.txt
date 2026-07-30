@@ -26,14 +26,24 @@ target_link_libraries(test_transport_ibverbs mori_application)
 if(BUILD_IO)
   # Executed coverage for 19b718f3's hdr.len bound + type validation. Registered
   # with add_test so `ctest` runs it: the reason `tests/cpp/io/test_protocol.cpp`
-  # rotted into non-compiling (it still calls MessageRegEngine, removed from the
-  # header) is that it was never in this file, so nothing ever built it.
+  # was allowed to rot into non-compiling is that it was never in this file, so
+  # nothing ever built it.
   add_executable(test_protocol_header io/test_protocol_header.cpp)
   target_include_directories(test_protocol_header
                              PUBLIC ${CMAKE_SOURCE_DIR}/include)
   target_include_directories(test_protocol_header PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_protocol_header mori_application mori_io)
   add_test(NAME test_protocol_header COMMAND test_protocol_header)
+
+  # The PAYLOAD half of the same control plane -- the two ReadMessage*/
+  # WriteMessage* pairs over a real socket, back-to-back framing, and the
+  # mid-payload EOF path (99768347 + 3c6bc1a1), none of which the header test
+  # can reach. Registered for the reason stated just above.
+  add_executable(test_protocol io/test_protocol.cpp)
+  target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_protocol mori_application mori_io)
+  add_test(NAME test_protocol COMMAND test_protocol)
 
   add_executable(test_engine io/test_engine.cpp)
 
