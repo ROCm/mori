@@ -1970,6 +1970,103 @@ void CaseRdmaGateReapDoesNotStrandInflight() {
   HIP_RUNTIME_CHECK(hipFree(lptr));
 }
 
+// REVIEW_M #78-1/#79-3, and the case above's THIRD attempt -- this time with no
+// NIC in the loop at all.
+//
+// T45b/T45c/T45d measured that the end-to-end case cannot reach the strand:
+// `gateReapDeclined=0` in every run, because the reap evicts OLDEST-first and
+// by the time a later dereg's reap pops a gate, its WRs have long completed.
+// Three GPU runs, zero entries into the path. The property under test is pure
+// BOOKKEEPING -- does `retiredGateCount_` stay in step with `retiredOrder_`
+// when an eviction is declined -- and it needs no RDMA transfer to demonstrate.
+// `MemoryInflightGate::Acquire` returns a token that holds `Inflight()` above
+// zero for exactly as long as the test keeps it, which is the determinism the
+// timing-based version never had.
+//
+// TWO-SIDED, and unlike the end-to-end attempts this one is so by construction:
+//   pre-5acd688d : the held gate is popped and dropped without a re-push while
+//                  still counted, so `retiredGateCount_` never comes back down.
+//                  It sits permanently above the bound, so EVERY later reap
+//                  evicts the tombstone that same dereg just pushed and the
+//                  resident set collapses to the held gate alone.
+//   post-fix     : the held gate goes back on the deque, count and map agree,
+//                  and the retention settles at the bound.
+// Then the hold is released and the retention must come back DOWN -- without
+// that half, a re-push that pinned the entry forever would also pass.
+void CaseRdmaGateReapBookkeepingUnderDecline() {
+  // Deliberately no GPU and no peer: this is the bookkeeping, not the transfer.
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ScopedEnvVar smallBound("MORI_IO_MAX_MEM_GATE_TOMBSTONES", "1");
+  const std::size_t kBound = 1;
+
+  auto ctx =
+      std::make_unique<mori::application::RdmaContext>(mori::application::RdmaBackendType::IBVerbs);
+  RdmaBackendConfig cfg{};
+  RdmaManager mgr(cfg, ctx.get());
+  (void)ctx.release();
+
+  const DeregQuiesceCensus base = GetDeregQuiesceCensus();
+
+  // Gate 1: retire it while a token is HELD, so its Inflight() stays 1 and
+  // every reap that reaches it must decline. This is the stranded candidate.
+  const MemoryUniqueId kHeldId = 900001;
+  auto heldGate = mgr.GetOrCreateLocalMemoryGate(kHeldId);
+  std::shared_ptr<void> token = MemoryInflightGate::Acquire(heldGate);
+  Require(token != nullptr, "instrument check: Acquire on a fresh gate must return a token");
+  Require(heldGate->Inflight() == 1,
+          "instrument check: a held token must show Inflight()==1, got " +
+              std::to_string(heldGate->Inflight()));
+  // 1 ms: this quiesce MUST time out -- the token is held by this thread and
+  // cannot be released until below, so a long timeout would only stall.
+  const bool drained = mgr.QuiesceLocalMemory(kHeldId, 1);
+  Require(!drained, "instrument check: a quiesce with a held token must NOT drain");
+
+  // Now retire several more ids, each with nothing outstanding. Every one of
+  // these runs a reap, and each reap finds the HELD gate at the front of the
+  // deque (it retired first) and must decline it.
+  const int kLaterIds = 6;
+  for (int i = 0; i < kLaterIds; ++i) {
+    const MemoryUniqueId id = 900100 + i;
+    (void)mgr.GetOrCreateLocalMemoryGate(id);
+    Require(mgr.QuiesceLocalMemory(id, 1000), "a gate with no inflight posts must drain");
+  }
+
+  const DeregQuiesceCensus mid = GetDeregQuiesceCensus();
+  const std::size_t declined = mid.gateReapDeclined - base.gateReapDeclined;
+  const std::size_t residentWhileHeld = mid.gateTombstones;
+  std::printf("[gate-book] while held: declined=%zu resident=%zu bound=%zu (%d later ids)\n",
+              declined, residentWhileHeld, kBound, kLaterIds);
+
+  // NON-VACUITY. Unlike the end-to-end case this is guaranteed by construction
+  // -- the token is held by this very thread -- so a zero here means the reap
+  // never reached the held gate and every number below is void.
+  Require(declined > 0,
+          "VACUOUS: the held gate was never declined (gateReapDeclined=0), so the strand path "
+          "was not entered even with a token held by this thread. Not a pass.");
+
+  // THE DISCRIMINATOR.
+  Require(residentWhileHeld > kBound,
+          "STRANDED: with one gate held and " + std::to_string(kLaterIds) +
+              " later retirements, only " + std::to_string(residentWhileHeld) +
+              " tombstone(s) are resident at bound=" + std::to_string(kBound) +
+              ". The declined gate was dropped from the deque while still counted, so the count "
+              "and the map have diverged and every later dereg now evicts its own tombstone.");
+
+  // The other half: release the hold and the retention must come back DOWN.
+  token.reset();
+  Require(heldGate->Inflight() == 0, "instrument check: releasing the token must zero Inflight()");
+  const MemoryUniqueId kFinalId = 900200;
+  (void)mgr.GetOrCreateLocalMemoryGate(kFinalId);
+  Require(mgr.QuiesceLocalMemory(kFinalId, 1000), "final gate must drain");
+
+  const std::size_t residentAfter = GetDeregQuiesceCensus().gateTombstones;
+  std::printf("[gate-book] after release: resident=%zu bound=%zu\n", residentAfter, kBound);
+  Require(residentAfter <= kBound + 1,
+          "the re-pushed gate was never evicted after its posts drained: resident=" +
+              std::to_string(residentAfter) + " at bound=" + std::to_string(kBound) +
+              ". A re-push that pins forever is a leak, not a fix.");
+}
+
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -2479,6 +2576,7 @@ int main(int argc, char* argv[]) {
       {"rdma_gate_tombstone_lifts_on_reregister", CaseRdmaGateTombstoneLiftsOnReregister},
       {"rdma_gate_tombstones_are_bounded", CaseRdmaGateTombstonesAreBounded},
       {"rdma_gate_reap_does_not_strand_inflight", CaseRdmaGateReapDoesNotStrandInflight},
+      {"rdma_gate_reap_bookkeeping_under_decline", CaseRdmaGateReapBookkeepingUnderDecline},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},
