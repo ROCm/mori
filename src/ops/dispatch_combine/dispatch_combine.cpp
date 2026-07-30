@@ -208,7 +208,39 @@ void EpDispatchCombineHandle::FinalizeAll() {
   buffersInitialized = false;
 }
 
+// Fault injection for the teardown path, test-only, same shape and rationale as
+// ShouldInjectAllocFailure above: set MORI_TEST_FAIL_FINALIZE=1 and the NEXT
+// Finalize() on this rank throws instead of releasing.
+//
+// Needed because `finalize()` is the one collective in the published contract
+// whose error path has no other way to be reached. A real finalize failure is a
+// dead shmem context or a hipDeviceSynchronize reporting an earlier async
+// fault -- neither can be produced on demand from a test, and both are exactly
+// what a rank hits when its peers are already unwinding. Without a hook, the
+// try/finally in python `finalize()` (9909de28) is unfalsifiable: it claims a
+// raising rank still reaches its trailing barrier, and nothing can make a rank
+// raise.
+//
+// One-shot, like the alloc hook and for the same reason -- python's finalize()
+// is idempotent and callers (including the test's own cleanup) may call it
+// again, and a permanently-armed hook would make the recovery it is meant to
+// observe impossible.
+static bool ShouldInjectFinalizeFailure() {
+  const char* target = env::Get("MORI_TEST_FAIL_FINALIZE");
+  if ((target == nullptr) || (target[0] == '\0') || (target[0] == '0')) return false;
+  ::unsetenv("MORI_TEST_FAIL_FINALIZE");
+  return true;
+}
+
 void EpDispatchCombineHandle::Finalize() {
+  // BEFORE the !buffersInitialized early return, deliberately: the injected
+  // failure must model "this rank could not release", and an already-finalized
+  // handle returning success would silently skip the injection and hand the
+  // test a green that means nothing.
+  if (ShouldInjectFinalizeFailure()) {
+    throw std::runtime_error(
+        "MORI_TEST_FAIL_FINALIZE: failing EpDispatchCombineHandle::Finalize() on purpose");
+  }
   if (!buffersInitialized) return;
   auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
   if (states->status != mori::shmem::ShmemStatesStatus::Initialized) {
