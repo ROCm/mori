@@ -308,7 +308,23 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
            &mori::moe::EpDispatchCombineHandle::ResetBarrierGeneration,
            py::call_guard<py::gil_scoped_release>())
       .def_property_readonly("is_initialized",
-                             &mori::moe::EpDispatchCombineHandle::IsInitialized);
+                             &mori::moe::EpDispatchCombineHandle::IsInitialized)
+      // Read-only, rank-local, NOT collective: a diagnostic for tests that need
+      // to compare what each rank believes about the cross-device barrier
+      // rather than infer it from a hang. Returns a dict so the python side
+      // needs no bound struct type. Safe on a finalized handle.
+      .def("probe_barrier_state", [](const mori::moe::EpDispatchCombineHandle& h) {
+        auto p = h.ProbeBarrierState();
+        py::dict d;
+        d["initialized"] = p.initialized;
+        d["generation"] = p.generation;
+        d["seed"] = p.seed;
+        d["local_ptr"] = p.localPtr;
+        d["size"] = p.size;
+        d["peer_ptrs"] = p.peerPtrs;
+        d["slots"] = p.slots;
+        return d;
+      });
 
   m.def("get_dispatch_output_ptrs", &GetDispatchOutputPtrs);
   m.def("get_combine_output_ptrs", &GetCombineOutputPtrs);

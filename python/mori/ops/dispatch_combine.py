@@ -534,6 +534,30 @@ class EpDispatchCombineOp:
     def is_initialized(self):
         return self._handle.is_initialized
 
+    def probe_barrier_state(self):
+        """What this rank believes about the cross-device barrier. Diagnostic.
+
+        Read-only, rank-local, NOT collective, safe on a finalized handle.
+        Returns a dict (or None on a mori extension that predates the binding):
+
+            initialized, generation, seed, local_ptr, size, peer_ptrs, slots
+
+        A cross-device barrier makes progress only while the group agrees on
+        all three of: the generation counter, where each peer's barrier buffer
+        lives, and what is currently published in those slots. Gather this from
+        every rank and compare -- the symmetric-heap contract is that
+        `peer_ptrs[i]` seen by any rank equals `local_ptr` seen by rank i.
+
+        Exists because two successive fixes for the asymmetric-reject hang were
+        aimed at hypotheses inferred from outside the process (peer-VA offsets,
+        then the generation counter), and both were refuted after the fact. See
+        EpDispatchCombineHandle::ProbeBarrierState.
+        """
+        probe = getattr(self._handle, "probe_barrier_state", None)
+        if probe is None:
+            return None
+        return probe()
+
     def reconfigure(
         self,
         *,

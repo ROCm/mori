@@ -293,6 +293,46 @@ class EpDispatchCombineHandle {
   // barrier operation: call it with the op idle and on every rank.
   void ResetBarrierGeneration();
 
+  // Read-only snapshot of the state a cross-device barrier actually depends on,
+  // so a test can MEASURE which part of it diverges across ranks instead of
+  // inferring it from a hang.
+  //
+  // Why this exists: the asymmetric-reject hang has now survived two fixes
+  // aimed at hypotheses derived from the parent process's view (a peer-VA
+  // offset story, refuted by the heap-symmetry probe; a generation-counter
+  // story, refuted at world 8 when ResetBarrierGeneration did not help). Both
+  // were plausible and both were wrong, and each cost a turn. A barrier's
+  // progress depends on exactly three things -- the generation every rank
+  // holds, the local address of the symmetric flag buffer, and the address
+  // each rank believes its PEERS' copies live at -- and none of them was ever
+  // read. A rank that does no heap work keeps peer pointers derived from the
+  // heap layout its peers have since torn down and rebuilt twice, and
+  // RegisterStaticHeapSubRegion (symmetric_memory.cpp:392) computes those as
+  // `peerPtrs[i] + offset` with no allgather to check. Equal heap ACCOUNTING
+  // (total_free_space, block counts) does not imply equal ADDRESSES, so the
+  // heap-symmetry probe could not have caught that and its green is not
+  // evidence against it.
+  //
+  // Rank-local, read-only, no collective, safe on a finalized handle (reports
+  // initialized=false and zeros). The caller gathers it and compares.
+  struct BarrierProbe {
+    bool initialized{false};
+    // Generation this rank would enter its next barrier with.
+    uint64_t generation{0};
+    // Seed a freshly built handle of this config would use.
+    uint64_t seed{0};
+    // Local address + size of the symmetric barrier buffer.
+    uintptr_t localPtr{0};
+    size_t size{0};
+    // What THIS rank believes each peer's copy of that buffer is at. The
+    // symmetric-heap contract is that every rank agrees, i.e. peerPtrs[i] as
+    // seen by rank j must equal localPtr as seen by rank i, for all i, j.
+    std::vector<uintptr_t> peerPtrs;
+    // Current contents of the local barrier slots (what a spin reads).
+    std::vector<uint64_t> slots;
+  };
+  BarrierProbe ProbeBarrierState() const;
+
   index_t GetCurRankNumToken() const { return curRankNumToken; }
   int Fp8BlockwiseCombineScaleDim() const { return fp8BlockwiseCombineScaleDim; }
   int Fp8BlockwiseCombineScaleTypeSize() const { return fp8BlockwiseCombineScaleTypeSize; }

@@ -852,6 +852,46 @@ void EpDispatchCombineHandle::ResetBarrierGeneration() {
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 }
 
+EpDispatchCombineHandle::BarrierProbe EpDispatchCombineHandle::ProbeBarrierState() const {
+  BarrierProbe p;
+  p.seed = BarrierGenerationSeed();
+  if (!buffersInitialized) return p;
+  p.initialized = true;
+
+  if (crossDeviceBarrierFlag != nullptr) {
+    // Host-visible (hipMalloc'd and written by the host in InitializeBarrier).
+    p.generation = crossDeviceBarrierFlag[0];
+  }
+  if (!crossDeviceBarrierMemObj.IsValid()) return p;
+
+  void* localPtr = crossDeviceBarrierMemObj->Get();
+  p.localPtr = reinterpret_cast<uintptr_t>(localPtr);
+  p.size = crossDeviceBarrierMemObj->size;
+
+  // Peer pointers live on the CPU-side mirror of the symmetric object.
+  const auto* cpuObj = crossDeviceBarrierMemObj.cpu;
+  if (cpuObj != nullptr && cpuObj->peerPtrs != nullptr && config.worldSize > 0) {
+    p.peerPtrs.assign(cpuObj->peerPtrs, cpuObj->peerPtrs + config.worldSize);
+  }
+
+  // The slots a barrier spin actually reads: one uint64 per peer at the base of
+  // the local buffer (intranode.hpp:71-73).
+  if (localPtr != nullptr && config.worldSize > 0) {
+    size_t want = static_cast<size_t>(config.worldSize) * sizeof(uint64_t);
+    if (p.size >= want) {
+      p.slots.resize(config.worldSize);
+      // Uncached device memory, so a plain memcpy would be undefined here; go
+      // through HIP and tolerate failure rather than aborting a diagnostic.
+      hipError_t err = hipMemcpy(p.slots.data(), localPtr, want, hipMemcpyDeviceToHost);
+      if (err != hipSuccess) {
+        (void)hipGetLastError();
+        p.slots.clear();
+      }
+    }
+  }
+  return p;
+}
+
 void EpDispatchCombineHandle::InitializeBarrier() {
   size_t barrierSize = config.worldSize * sizeof(uint32_t);
   HipMallocOrThrow(&dispatchGridBarrier, barrierSize, "dispatchGridBarrier");
