@@ -357,6 +357,11 @@ class RdmaBackend : public Backend {
     }
   };
   RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
+  // Same, but reports failure through `status` and returns nullptr instead of
+  // throwing on the caller's thread. See the definition for why that matters.
+  RdmaBackendSession* GetOrCreateSessionCachedNoThrow(const MemoryDesc& local,
+                                                      const MemoryDesc& remote,
+                                                      TransferStatus* status);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
   std::shared_ptr<std::mutex> GetConnBuildLock(const EngineKey& remoteEngineKey,
                                                const TopoKeyPair& topo);

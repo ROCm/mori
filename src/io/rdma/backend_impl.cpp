@@ -1345,7 +1345,8 @@ void RdmaBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                             const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
-  RdmaBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+  RdmaBackendSession* sess = GetOrCreateSessionCachedNoThrow(localDest, remoteSrc, status);
+  if (sess == nullptr) return;
   sess->ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
 }
 
@@ -1362,7 +1363,8 @@ void RdmaBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
     return;
   }
 
-  RdmaBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+  RdmaBackendSession* sess = GetOrCreateSessionCachedNoThrow(localDest, remoteSrc, status);
+  if (sess == nullptr) return;
   sess->BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
 }
 
@@ -1501,6 +1503,35 @@ RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& loca
   }
   auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
   return emplacedIt->second.get();
+}
+
+// Lazy session establishment happens on the CALLER's thread, inside ReadWrite /
+// BatchReadWrite, and every step of it can throw: CreateSession itself raises
+// on "no local RDMA candidate" / "insufficient RDMA endpoints", and underneath
+// it BuildRdmaConn and AskRemoteMemoryRegion now raise out of the Protocol
+// rather than exit(-1). Those callers are void and report through
+// TransferStatus, so an escaping exception unwinds straight past IOEngine::Read
+// into sglang's transfer thread, which has no handler -- std::terminate, whole
+// process, for a peer-side condition the status contract can express.
+//
+// This is not a hypothetical for role-switch: a flip tears down and rebuilds
+// the peer's endpoints, so a transfer issued at the wrong instant is exactly
+// how a client lands on one of these throws.
+//
+// Returns nullptr with `status` set on failure; callers must check.
+RdmaBackendSession* RdmaBackend::GetOrCreateSessionCachedNoThrow(const MemoryDesc& local,
+                                                                 const MemoryDesc& remote,
+                                                                 TransferStatus* status) {
+  try {
+    return GetOrCreateSessionCached(local, remote);
+  } catch (const std::exception& e) {
+    MORI_IO_ERROR("Failed to establish RDMA session to engine {}: {}", remote.engineKey, e.what());
+    if (status != nullptr) {
+      status->Update(StatusCode::ERR_BAD_STATE,
+                     std::string("Failed to establish RDMA session: ") + e.what());
+    }
+    return nullptr;
+  }
 }
 
 void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {
