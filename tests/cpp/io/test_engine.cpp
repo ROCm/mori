@@ -958,9 +958,9 @@ void CaseRdmaPerFlipRetentionIsMeasured() {
   RdmaBackend::RemoteRetentionStats base = backend->GetRemoteRetentionStats();
   std::printf(
       "[retention] baseline: engines=%zu metas=%zu endpoints=%zu sessions=%zu notifQps=%zu "
-      "notifBytes=%zu\n",
+      "notifBytes=%zu regRuntimes=%zu\n",
       base.numRemoteEngines, base.numRemoteMetas, base.numEndpointRuntimes, base.numSessions,
-      base.numNotifContexts, base.notifBufferBytes);
+      base.numNotifContexts, base.notifBufferBytes, base.numRegisteredRuntimes);
 
   // NON-VACUITY: the warm transfer must have built something, or "it did not
   // grow" later would be a statement about an instrument that reads zero.
@@ -995,17 +995,32 @@ void CaseRdmaPerFlipRetentionIsMeasured() {
   RdmaBackend::RemoteRetentionStats after = backend->GetRemoteRetentionStats();
   std::printf(
       "[retention] after %d flips: engines=%zu metas=%zu endpoints=%zu sessions=%zu notifQps=%zu "
-      "notifBytes=%zu\n",
+      "notifBytes=%zu regRuntimes=%zu\n",
       kFlips, after.numRemoteEngines, after.numRemoteMetas, after.numEndpointRuntimes,
-      after.numSessions, after.numNotifContexts, after.notifBufferBytes);
+      after.numSessions, after.numNotifContexts, after.notifBufferBytes,
+      after.numRegisteredRuntimes);
   std::printf(
       "[retention] delta over %d flips: engines=+%zu metas=+%zu endpoints=+%zu sessions=+%zu "
-      "notifQps=+%zu notifBytes=+%zu\n",
+      "notifQps=+%zu notifBytes=+%zu regRuntimes=+%zu\n",
       kFlips, after.numRemoteEngines - base.numRemoteEngines,
       after.numRemoteMetas - base.numRemoteMetas,
       after.numEndpointRuntimes - base.numEndpointRuntimes,
       after.numSessions - base.numSessions, after.numNotifContexts - base.numNotifContexts,
-      after.notifBufferBytes - base.notifBufferBytes);
+      after.notifBufferBytes - base.notifBufferBytes,
+      after.numRegisteredRuntimes - base.numRegisteredRuntimes);
+
+  // REVIEW_M #69-2/#70-2. `registeredRuntimes_` is populated on EVERY
+  // RegisterEndpoint, INCLUDING the enableNotification=false early return that
+  // sglang takes (conn.py:376-382), so this is the counter that carries the
+  // per-flip retention in E's configuration -- the notifQps/notifBytes numbers
+  // this test used to headline are structurally 0 there. Printed as a fact,
+  // NOT asserted on: this case runs at enableNotification=true, and pinning an
+  // exact growth rate here would be asserting on the wrong configuration
+  // again. What it is asserted to be is NON-ZERO, i.e. a live instrument
+  // rather than the dead accessor #69-2 found.
+  Require(after.numRegisteredRuntimes > 0,
+          "instrument check: registeredRuntimes_ must be non-zero after real transfers, or the "
+          "counter #70-2 asked for is as dead as the accessor it came from");
 
   // The one hard assertion, and it is about the LEAK being real rather than
   // about it being fixed: a survivor that is never told the old key died must

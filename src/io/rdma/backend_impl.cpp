@@ -1623,6 +1623,9 @@ RdmaBackend::RemoteRetentionStats RdmaBackend::GetRemoteRetentionStats() const {
   if (notif) {
     s.numNotifContexts = notif->GetNumNotifContexts();
     s.notifBufferBytes = notif->GetNotifBufferBytes();
+    // The only one of these three that moves at enableNotification=false, i.e.
+    // in sglang's actual configuration. See the field's comment.
+    s.numRegisteredRuntimes = notif->GetNumRegisteredRuntimes();
   }
   {
     std::lock_guard<std::mutex> lock(sessionCacheMu);

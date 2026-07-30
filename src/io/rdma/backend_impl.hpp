@@ -382,6 +382,15 @@ class RdmaBackend : public Backend {
     std::size_t numSessions{0};         // RdmaBackend::sessionCache
     std::size_t numNotifContexts{0};    // NotifManager::notifCtxById_ (QPs)
     std::size_t notifBufferBytes{0};    // pinned host memory behind those QPs
+    // NotifManager::registeredRuntimes_. This is the ONE counter above that is
+    // live in sglang's configuration, and it was missing, which made the whole
+    // struct misleading there: sglang constructs RdmaBackendConfig with
+    // enableNotification=FALSE (conn.py:376-382), and under that
+    // NotifManager::RegisterEndpoint early-returns right after
+    // `registeredRuntimes_[rt->id] = rt` and never touches notifCtxById_. So
+    // numNotifContexts and notifBufferBytes are permanently 0 as E runs it,
+    // and the per-flip retention shows up HERE instead. (REVIEW_M #69-2/#70-2.)
+    std::size_t numRegisteredRuntimes{0};
   };
   RemoteRetentionStats GetRemoteRetentionStats() const;
 
