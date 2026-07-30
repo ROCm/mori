@@ -791,6 +791,107 @@ void CaseRdmaTransferBasic() {
               inbound.Message() + "'");
 }
 
+// REVIEW_M #66-3. `a5d37786` turned `assert(remoteMr->length == remote.size)`
+// into two named throws; until now that was compile-and-strings evidence only.
+// The peer's `:1119` arm answers a default-constructed (zero) MR for ANY memory
+// id it does not know, so a flipped peer that re-registered under new ids -- or
+// simply an id it never had -- lands here with NO fault injection required.
+//
+// The whole point is the PROCESS SURVIVES: this used to abort() the engine
+// (asserts are LIVE in this build, review #64-1), which on a real flip kills
+// the inference server for a peer-side condition TransferStatus can express.
+void CaseRdmaUnknownRemoteMemoryIdFailsTransferWithoutAbort() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_unknown_remote_id", true);
+  auto src = RegisterGpuMemory(pair.initiator.get(), 4096, 0);
+  auto dst = RegisterGpuMemory(pair.target.get(), 4096, 0);
+
+  // Same descriptor the peer really registered, except for the id: the peer
+  // has no such memory, so its control plane answers a zero-length MR.
+  MemoryDesc bogus = dst.desc;
+  bogus.id = dst.desc.id + 4242;
+
+  TransferStatus status;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Read(src.desc, 0, bogus, 0, 64, &status, uid);
+
+  Require(status.Failed(),
+          "transfer against an unknown remote memory id must FAIL, not succeed; code=" +
+              std::to_string(status.CodeUint32()) + ", msg='" + status.Message() + "'");
+  Require(status.Code() == StatusCode::ERR_BAD_STATE,
+          "unknown remote memory id should surface as ERR_BAD_STATE; got " +
+              std::to_string(status.CodeUint32()) + ", msg='" + status.Message() + "'");
+  Require(status.Message().find("does not know this id") != std::string::npos,
+          "expected a5d37786's zero-MR wording; got: " + status.Message());
+
+  // NON-VACUITY: prove the pair still works, i.e. we measured a rejected
+  // transfer on a live engine and not a wedged one. A test that only asserts a
+  // failure would also pass against an engine that fails everything.
+  TransferStatus good;
+  TransferUniqueId uid2 = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Read(src.desc, 0, dst.desc, 0, 64, &good, uid2);
+  std::string err;
+  Require(WaitTransferDone(&good, 5000, &err),
+          "engine must still serve real transfers after the bad-id rejection: " + err);
+  Require(good.Succeeded(), "post-rejection transfer failed: code=" +
+                                std::to_string(good.CodeUint32()) + ", msg='" + good.Message() +
+                                "'");
+}
+
+// REVIEW_M #66-2 + #66-3, the FLIP race itself: `DeregisterRemoteEngine` while
+// the initiator still holds a warm session for that peer. Two things are under
+// test and they are ordered as they occur on a flip:
+//   1. a transfer issued AFTER the deregistration must fail cleanly rather than
+//      abort (`065d5764`'s BuildRdmaConn throw) or RDMA-write against the dead
+//      peer's rkeys (this turn's engine-scoped invalidation, `4534e67c`);
+//   2. re-registering the engine -- what the peer's flip completion does --
+//      must restore service, which only holds if the caches really were
+//      dropped rather than left stale.
+void CaseRdmaDeregisteredEngineFailsTransferThenRecovers() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_dereg_engine", true);
+  auto src = RegisterGpuMemory(pair.initiator.get(), 4096, 0);
+  auto dst = RegisterGpuMemory(pair.target.get(), 4096, 0);
+
+  // Warm the session cache + the remote MR table FIRST -- that is the state
+  // the invalidation exists to clear, and without this the test would only
+  // exercise the cold path.
+  TransferStatus warm;
+  TransferUniqueId warmUid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Read(src.desc, 0, dst.desc, 0, 64, &warm, warmUid);
+  std::string err;
+  Require(WaitTransferDone(&warm, 5000, &err), "warm-up transfer timed out: " + err);
+  Require(warm.Succeeded(), "warm-up transfer failed: code=" +
+                                std::to_string(warm.CodeUint32()) + ", msg='" + warm.Message() +
+                                "'");
+
+  EngineDesc targetDesc = pair.target->GetEngineDesc();
+  pair.initiator->DeregisterRemoteEngine(targetDesc);
+
+  TransferStatus afterDereg;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Read(src.desc, 0, dst.desc, 0, 64, &afterDereg, uid);
+  Require(afterDereg.Failed(),
+          "a transfer to a DEREGISTERED engine must fail -- if it succeeded, the session/MR "
+          "caches were reused across the flip; code=" +
+              std::to_string(afterDereg.CodeUint32()) + ", msg='" + afterDereg.Message() + "'");
+
+  // Re-register: this is the peer's flip completing.
+  pair.initiator->RegisterRemoteEngine(targetDesc);
+  TransferStatus afterReReg;
+  TransferUniqueId uid2 = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Read(src.desc, 0, dst.desc, 0, 64, &afterReReg, uid2);
+  Require(WaitTransferDone(&afterReReg, 5000, &err),
+          "transfer after re-registering the flipped peer timed out: " + err);
+  Require(afterReReg.Succeeded(),
+          "engine must serve again once the peer re-registers; code=" +
+              std::to_string(afterReReg.CodeUint32()) + ", msg='" + afterReReg.Message() + "'");
+}
+
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -1287,6 +1388,10 @@ int main(int argc, char* argv[]) {
       {"rdma_backend_can_handle_rejects_sentinel_port_remote",
        CaseRdmaBackendCanHandleRejectsSentinelPortRemote},
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
+      {"rdma_unknown_remote_memory_id_fails_without_abort",
+       CaseRdmaUnknownRemoteMemoryIdFailsTransferWithoutAbort},
+      {"rdma_deregistered_engine_fails_then_recovers",
+       CaseRdmaDeregisteredEngineFailsTransferThenRecovers},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},
