@@ -198,12 +198,35 @@ def _load_hip_modules(kernel_type):
 
 
 class EpDispatchCombineOp:
-    def __init__(self, config):
+    def __init__(self, config, *, group=None):
+        """Construct an all-to-all dispatch/combine op.
+
+        Args:
+            config: EpDispatchCombineConfig.
+            group: process group to synchronize construction over. Defaults to
+                the group shmem was initialized with (see
+                :meth:`_shmem_barrier`). Pass the EP group explicitly when the
+                EP group is a strict subset of the world -- see below.
+
+        Construction is COLLECTIVE over the group that owns the symmetric heap,
+        for the same reason finalize() and reconfigure() are: the ctor's
+        ShmemExtMallocWithFlags calls carve VA out of the shared static heap and
+        every rank must issue them in the same order.
+
+        The barrier below used to be an unqualified ``dist.barrier()`` on the
+        WORLD group. That is the bug cdd2ee05 fixed for reconfigure() and it
+        came back in through the door: COORD turn 19 §2 tells sglang that a real
+        P<->D flip is ``finalize(group=ep)`` then **construct** at the target
+        role's kernel_type/capacity, and under attention-DP the EP group is a
+        strict subset of the world, so the finalize half synchronized correctly
+        and the construct half deadlocked against the non-EP ranks that never
+        flip. Defaulting to shmem_get_process_group() makes the whole flip
+        synchronize over one group.
+        """
         self.config = config
         _ensure_jit_kernels(config.kernel_type)
 
-        if dist.is_initialized():
-            dist.barrier()
+        self._shmem_barrier(group)
 
         handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
         self._cpp_config = mori_cpp.EpDispatchCombineConfig(
