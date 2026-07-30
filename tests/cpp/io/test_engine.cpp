@@ -1128,8 +1128,27 @@ void CaseRdmaTransferSurvivesConcurrentDeregister() {
               transfersIssued.load(), deregsDone.load());
 }
 
+// T37 UPDATE — the case above is now GREEN, and the fix is d862b1c5. Read the
+// T36 diagnosis below for the mechanism; this note records that it is CLOSED,
+// so nobody reads the (still accurate, still worth keeping) analysis as live.
+//   T37: [PASS] rdma_transfer_survives_concurrent_deregister (7141 ms)
+//        RACE_RC=0; full suite total=35 passed=34 failed=0 skipped=1
+//        (T36: 35/33/1/1). log: logs/mori_io_M_t37.log
+// d862b1c5 touches 4 src/ files and ZERO tests, so this is the SAME assertion
+// flipping, not a moved goalpost. The discriminator is two-sided by the numbers,
+// which is the part worth remembering: the wedge's signature is one qp_num
+// repeating forever, and it is gone.
+//        pre-fix  4 distinct qp_num in the log, TWO of them 449x each
+//        post-fix 768 distinct, max 20x each  (one flush drain, then never again)
+// The provoking CQE (status=10) is UNCHANGED and still in the T37 log — the
+// fault still happens; the QP is now retired instead of reused. Design chosen
+// was retire-and-rebuild, not re-arm: nothing in src/io drives
+// RESET->INIT->RTR->RTS, and a flip wants a fresh endpoint anyway.
+// Cost NOT measured: retirement means a BuildRdmaConn per dead QP.
+//
 // T36 MEASURED RESULT of the case above, recorded AT the code so nobody has to
-// find the log: it FAILS, and NOT from the use-after-free.
+// find the log: it FAILED, and NOT from the use-after-free. [FIXED at T37 —
+// see above; kept because the mechanism is what makes the fix reviewable.]
 //
 //   [FAIL] rdma_transfer_survives_concurrent_deregister (1421 ms):
 //          post-race transfer failed: Work Request Flushed Error
