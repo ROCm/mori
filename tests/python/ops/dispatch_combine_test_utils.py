@@ -409,6 +409,46 @@ def assert_worker_results(manager, world_size, timeout=None):
             # happened. Say what is measured, and get the stack.
             dumped = _dump_worker_stacks(procs, alive)
 
+            # The ranks that DID report are the diagnosis, and this function
+            # used to throw them away.
+            #
+            # `results` is dropped on the floor in this branch: the only path
+            # that reads it is the loop at the bottom, which a timeout never
+            # reaches. So a run where 7 of 8 ranks reported a real assertion
+            # failure and the 8th wedged printed nothing but "7/8 reported,
+            # ranks [0] silent" -- and the assertion message, the one artifact
+            # that says WHAT went wrong, was discarded.
+            #
+            # That is the more common shape here, not the rare one, and it is
+            # causal rather than incidental: this suite's failures are
+            # collective. A rank that fails an assertion stops calling
+            # barriers, so its peers wedge in the NEXT collective waiting for
+            # it -- the reporters are the cause and the silent rank is the
+            # symptom. Reporting only the symptom inverts it. T25's
+            # non-vacuity probe is the worked example: 7 ranks failed the leak
+            # assertion, rank 0 wedged at the entry barrier of the rebuild
+            # those 7 never arrived at, and the timeout text named only rank 0.
+            #
+            # Costs nothing when there is genuinely nothing to say: `result`
+            # is None for a rank that returned cleanly, so a pure wedge with no
+            # failed peers adds one line saying exactly that.
+            failed = [
+                (rank, result) for rank, result in sorted(results) if result is not None
+            ]
+            if failed:
+                detail = "\n".join(f"  rank {rank}: {result}" for rank, result in failed)
+                reported_detail = (
+                    f"\nRANKS THAT DID REPORT FAILED -- read these FIRST, they are "
+                    f"most likely the CAUSE and the silent rank the symptom (a rank "
+                    f"that fails an assertion stops calling collectives, so its peers "
+                    f"wedge in the next one waiting for it):\n{detail}\n"
+                )
+            else:
+                reported_detail = (
+                    f"\nThe {len(results)} rank(s) that reported all PASSED, so the "
+                    f"wedge is not a peer's assertion failure.\n"
+                )
+
             pytest.fail(
                 f"timed out after {timeout:.0f}s waiting for worker results: "
                 f"{len(results)}/{world_size} reported, ranks {silent} silent. "
@@ -419,6 +459,7 @@ def assert_worker_results(manager, world_size, timeout=None):
                 f"and makes every later test in the selection time out here as a "
                 f"false red. exitcode not-None means look for an exit(-1) from "
                 f"HIP_RUNTIME_CHECK, a segfault, or an OOM kill. "
+                f"{reported_detail}"
                 f"{dumped} (run with -s to see them)",
                 pytrace=False,
             )
