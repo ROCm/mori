@@ -386,6 +386,30 @@ class EpDispatchCombineOp:
             self.config.num_experts_per_rank, dtype=torch.int32, device="cuda"
         )
 
+    def _reset_barrier_generation(self):
+        """Put this rank's cross-device barrier back on the freshly-built seed.
+
+        See EpDispatchCombineHandle::ResetBarrierGeneration in
+        dispatch_combine.hpp for why the generation must be group-common.
+
+        Tolerates an older mori .so that predates the binding. That combination
+        is reachable in practice -- sglang picks mori up off PYTHONPATH and has
+        a destroy+recreate fallback, so the python here can be newer than the
+        extension it loaded -- and the honest behaviour is to leave the
+        generation alone rather than crash: without the binding the group has
+        the pre-existing hang on the reject path, which is no worse than
+        before, whereas raising would break resizes that work today.
+        """
+        reset = getattr(self._handle, "reset_barrier_generation", None)
+        if reset is None:
+            return
+        if not self._handle.is_initialized:
+            # Nothing to re-seed: this rank holds no buffers, so it has no
+            # barrier flag. It also cannot take part in a collective barrier
+            # until it is rebuilt, and the rebuild re-seeds it.
+            return
+        reset()
+
     @staticmethod
     def _shmem_barrier(group):
         """Barrier over the group that owns the symmetric heap.
@@ -690,6 +714,32 @@ class EpDispatchCombineOp:
             # later. Every rank reaches this line (worst != OK is itself agreed),
             # so the extra collective is symmetric and cannot hang.
             worst = self._agree_on_severity(group, local_severity)
+
+            # Converge the cross-device barrier GENERATION before anyone leaves.
+            #
+            # crossDeviceBarrierFlag is a monotonic generation counter that the
+            # group must hold in common (every barrier does atomicAdd(flag,1)
+            # then spins until its peers publish the same value --
+            # intranode.hpp:69,73), and InitializeBarrier() re-seeds it. So any
+            # outcome where SOME ranks rebuilt and others did not leaves the
+            # group split across two generations, and the next collective spins
+            # forever inside the kernel on every rank -- unkillable, no
+            # traceback, and it looks exactly like a product hang in dispatch.
+            #
+            # Concretely it is the REJECTED outcome that is asymmetric: the
+            # rejecting rank is refused inside ValidateReconfigurable BEFORE
+            # FinalizeAll, so it never re-seeds, while its peers resized and
+            # gave the capacity back (re-seeding twice). ROLLED_BACK and
+            # UNRECOVERABLE are already symmetric -- every rank passes through
+            # InitializeBarrier on those -- which is why the rollback
+            # asymmetry test has always passed while the reject one hung.
+            #
+            # Done for every non-OK outcome rather than just REJECTED: the cost
+            # is one memset on a path that is already raising, and the
+            # invariant "leave reconfigure() with the group on one generation"
+            # is easier to keep true than a per-severity argument. Every rank
+            # reaches this line (worst is itself agreed), so it stays collective.
+            self._reset_barrier_generation()
             self._shmem_barrier(group)
 
             # EVERY rank raises on the GROUP's worst outcome, including ranks

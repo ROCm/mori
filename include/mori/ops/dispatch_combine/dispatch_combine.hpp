@@ -267,6 +267,32 @@ class EpDispatchCombineHandle {
 
   bool IsInitialized() const { return buffersInitialized; }
 
+  // Re-seed the cross-device barrier generation to the value a freshly built
+  // handle starts at, and zero the symmetric barrier buffer with it.
+  //
+  // `crossDeviceBarrierFlag` is a monotonically increasing GENERATION counter,
+  // not a scratch flag: every barrier does atomicAdd(flag, 1) and then spins
+  // until its peers publish the same generation (intranode.hpp:69,73). So the
+  // group only makes progress while all ranks hold the SAME value, and
+  // InitializeBarrier() re-seeds it. Reconfigure() therefore re-seeds it on
+  // every rank that resizes -- but a rank that REJECTS the new config (or that
+  // the group agreed had nothing to do) never reaches InitializeBarrier and
+  // keeps its old, higher generation. The next collective then has that rank
+  // waiting on generation N while its peers publish 1: an unkillable spin
+  // inside the kernel on every rank.
+  //
+  // Exposed so those non-resizing paths can converge on the seed explicitly.
+  // Deliberately NOT a "restore the old value" snapshot: that direction is
+  // wrong for the InterNode families, where the peer buffer is an ACCUMULATOR
+  // (AMO_ADD, spun on as flag*numQps -- internode.hpp:357-360) that a rebuild
+  // re-allocates zeroed. Restoring a high generation there would wait for a
+  // total that can never accumulate. Converging DOWN on the seed is correct for
+  // both families because it matches what a rebuild produces.
+  //
+  // Collective, and it must be ordered against dispatch/combine like any other
+  // barrier operation: call it with the op idle and on every rank.
+  void ResetBarrierGeneration();
+
   index_t GetCurRankNumToken() const { return curRankNumToken; }
   int Fp8BlockwiseCombineScaleDim() const { return fp8BlockwiseCombineScaleDim; }
   int Fp8BlockwiseCombineScaleTypeSize() const { return fp8BlockwiseCombineScaleTypeSize; }
@@ -321,6 +347,10 @@ class EpDispatchCombineHandle {
 
   void InitializeBarrier();
   void FinalizeBarrier();
+  // The barrier generation a freshly built handle starts at (kernel-type
+  // dependent). Single source of truth for InitializeBarrier() and
+  // ResetBarrierGeneration().
+  uint64_t BarrierGenerationSeed() const;
 
  public:
   // Updated at each round of inference

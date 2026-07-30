@@ -301,6 +301,12 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("reconfigure", &mori::moe::EpDispatchCombineHandle::Reconfigure, py::arg("config"),
            py::call_guard<py::gil_scoped_release>())
+      // Also collective. Needed by the reconfigure() paths that do NOT rebuild
+      // (a rejection, or a group no-op) so they land on the same barrier
+      // generation as the ranks that did rebuild. See dispatch_combine.hpp.
+      .def("reset_barrier_generation",
+           &mori::moe::EpDispatchCombineHandle::ResetBarrierGeneration,
+           py::call_guard<py::gil_scoped_release>())
       .def_property_readonly("is_initialized",
                              &mori::moe::EpDispatchCombineHandle::IsInitialized);
 

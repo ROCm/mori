@@ -765,6 +765,44 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
 #endif
 }
 
+// The generation a freshly built handle starts at. Kept in one place so
+// InitializeBarrier() and ResetBarrierGeneration() cannot drift apart -- if
+// they disagree, a rank that resizes and a rank that does not end up on
+// different generations, which is exactly the hang this seed exists to avoid.
+uint64_t EpDispatchCombineHandle::BarrierGenerationSeed() const {
+  return ((config.kernelType == KernelType::InterNodeV1) ||
+          (config.kernelType == KernelType::InterNodeV1LL) ||
+          (config.kernelType == KernelType::AsyncLL))
+             ? 0
+             : 1;
+}
+
+void EpDispatchCombineHandle::ResetBarrierGeneration() {
+  if (!buffersInitialized || crossDeviceBarrierFlag == nullptr) return;
+  // Order against any in-flight kernel: the caller promises the op is idle, but
+  // a previous collective's barrier writes must be visible before we overwrite
+  // the generation, or we race the store we are trying to reset.
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  crossDeviceBarrierFlag[0] = BarrierGenerationSeed();
+  // The peer-visible side must match. A rank that resized got a freshly
+  // allocated (zeroed) crossDeviceBarrierMemObj; a rank that did not still
+  // holds the last generation its peers published. Leaving those stale values
+  // would let the very next barrier's spin exit early against a generation
+  // nobody has reached yet -- i.e. a missed barrier rather than a hang, which
+  // is the worse of the two failure modes.
+  if (crossDeviceBarrierMemObj.IsValid()) {
+    void* localPtr = crossDeviceBarrierMemObj->Get();
+    // Use the object's own recorded size rather than re-deriving the
+    // allocation expression: the two must agree, and only one of them can go
+    // stale if InitializeBarrier's sizing ever changes.
+    size_t sz = crossDeviceBarrierMemObj->size;
+    if (localPtr != nullptr && sz > 0) {
+      HIP_RUNTIME_CHECK(hipMemset(localPtr, 0, sz));
+    }
+  }
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+}
+
 void EpDispatchCombineHandle::InitializeBarrier() {
   size_t barrierSize = config.worldSize * sizeof(uint32_t);
   HipMallocOrThrow(&dispatchGridBarrier, barrierSize, "dispatchGridBarrier");
@@ -772,11 +810,7 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   // No memset: the host writes this flag on the very next line, and an async
   // hipMemset can land after that store and clobber it. See kNoMemset.
   HipMallocOrThrow(&crossDeviceBarrierFlag, sizeof(uint64_t), "crossDeviceBarrierFlag", kNoMemset);
-  crossDeviceBarrierFlag[0] = ((config.kernelType == KernelType::InterNodeV1) ||
-                               (config.kernelType == KernelType::InterNodeV1LL) ||
-                               (config.kernelType == KernelType::AsyncLL))
-                                  ? 0
-                                  : 1;
+  crossDeviceBarrierFlag[0] = BarrierGenerationSeed();
   crossDeviceBarrierMemObj =
       ShmemMallocAndReturnMemObjPtr(barrierSize * 2 * sizeof(uint64_t), hipDeviceMallocUncached);
 
