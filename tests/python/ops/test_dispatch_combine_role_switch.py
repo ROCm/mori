@@ -2065,6 +2065,156 @@ def _worker_reconfigure_noop_and_finalize(rank, world_size):
     del op
 
 
+def _worker_kernel_type_flip_destroy_recreate(rank, world_size):
+    """THE ACCEPTANCE FLIP: destroy + recreate across a KERNEL TYPE change.
+
+    Everything else in this file resizes an op with `reconfigure()`. That path
+    cannot do this flip at all: `ValidateReconfigurable`
+    (`dispatch_combine.cpp:294`) `require()`s `kernelType` unchanged and throws
+    `[reconfigure-rejected]`. The 05:27 acceptance directive makes the rebuilt
+    op have to match the target role's `max_num_tokens` AND `kernel_type` AND
+    dtype, and prefill runs a normal kernel while decode runs a low-latency
+    one -- so EVERY real P<->D flip changes kernelType and MUST take
+    `finalize()` -> construct a fresh op, which is what COORD [M, turn 18] §2
+    tells sglang to do.
+
+    That instruction shipped with zero coverage, and this is it. The two
+    finalize->construct pairs already in this file do not test it:
+    `_worker_reconfigure_noop_and_finalize` never constructs again, and
+    `_worker_finalized_getters_raise` rebuilds at the SAME config and via
+    `reconfigure()`, not a new op. `flip_and_flip_back` is parametrized over
+    both kernel types but each parametrization is a SEPARATE process holding
+    one kernel type for its whole life -- it never crosses.
+
+    What has to hold, and none of it is implied by the resize tests:
+      * the new op's buffers are laid out for the NEW kernel type. IntraNode
+        and IntraNodeLL share `ShmemBufsIntraNode` (`:598`) but launch
+        different kernels (`dispatch_combine.py:1066`), so a stale
+        `self._hip_module` bound from the old type would launch the old role's
+        kernels against the new role's buffers -- silent wrong answers, the
+        worst failure class this feature can have. Hence a full checked
+        dispatch+combine after every construction.
+      * the closed loop returns the symmetric heap EXACTLY to baseline. A
+        destroy+recreate is a different teardown path from a resize: the whole
+        handle is destructed rather than FinalizeAll'd in place.
+      * it works in BOTH directions and repeats -- P->D->P, because sglang
+        flips back.
+
+    JIT: `_ensure_jit_kernels` compiles per hip source and both intranode types
+    map to `ep_intranode` (`dispatch_combine.py:141-142`), so this particular
+    pair does not pay a second compile. Real P<->D (normal <-> AsyncLL) maps to
+    two different sources, which is exactly why COORD tells S to
+    `warmup_jit_kernels()` for BOTH roles before serving rather than compile
+    inside the flip. Both are warmed here anyway so the test states the
+    contract it is standing in for.
+    """
+    from mori.ops.dispatch_combine import warmup_jit_kernels
+
+    for kt in ("IntraNode", "IntraNodeLL"):
+        warmup_jit_kernels(getattr(mori.ops.EpDispatchCombineKernelType, kt))
+
+    baseline = _heap_stats()
+
+    # P: normal kernel at the prefill capacity.
+    p_config = _make_config(rank, world_size, PREFILL_TOKENS, "IntraNode")
+    op = mori.ops.EpDispatchCombineOp(p_config)
+    _assert_capacity(op, PREFILL_TOKENS)
+    _run_once(op, p_config)
+
+    if baseline is not None:
+        built = _heap_stats()
+        # Non-vacuity: if the op took no symmetric memory the closed-loop
+        # equality below would be trivially true, which is precisely how T1/T2's
+        # leak claim came to mean nothing.
+        assert built["total_free_space"] < baseline["total_free_space"], (
+            f"rank {rank}: the P op allocated no symmetric memory "
+            f"(baseline={baseline} built={built}) -- this test measures nothing"
+        )
+
+    # P -> D. reconfigure() CANNOT do this, and that is the whole point: assert
+    # it refuses, so this test also pins the reason the destroy+recreate path
+    # exists. If a later change makes reconfigure() accept a kernel-type change,
+    # this fails and COORD's advice to S has to be revisited -- rather than S
+    # silently getting a C++-rebuilt op still bound to the old _hip_module.
+    d_cpp_config = op._cpp_config
+    old_kt = d_cpp_config.kernel_type
+    d_cpp_config.kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNodeLL
+    try:
+        with pytest.raises(RuntimeError, match="must not change"):
+            op._handle.reconfigure(d_cpp_config)
+    finally:
+        d_cpp_config.kernel_type = old_kt
+
+    # A rejected reconfigure leaves the op usable, so the destroy below is a
+    # real teardown of a live op -- not a rescue of a broken one.
+    _assert_capacity(op, PREFILL_TOKENS)
+
+    op.finalize()
+    assert not op.is_initialized
+    del op
+
+    after_destroy = _heap_stats()
+    if baseline is not None and after_destroy is not None:
+        assert after_destroy["total_free_space"] == baseline["total_free_space"], (
+            f"rank {rank}: destroying the P op leaked "
+            f"{baseline['total_free_space'] - after_destroy['total_free_space']} "
+            f"symmetric bytes (baseline={baseline} after={after_destroy})"
+        )
+        assert after_destroy["num_mem_objs"] == baseline["num_mem_objs"], (
+            f"rank {rank}: destroying the P op leaked "
+            f"{after_destroy['num_mem_objs'] - baseline['num_mem_objs']} "
+            f"SymmMemObj registrations ({baseline} -> {after_destroy})"
+        )
+
+    # D: low-latency kernel at the decode capacity. Both fields change at once,
+    # which is the flip sglang actually issues.
+    d_config = _make_config(rank, world_size, DECODE_TOKENS, "IntraNodeLL")
+    op = mori.ops.EpDispatchCombineOp(d_config)
+    _assert_capacity(op, DECODE_TOKENS)
+    assert (
+        op.config.kernel_type.value
+        == mori.ops.EpDispatchCombineKernelType.IntraNodeLL.value
+    ), f"rank {rank}: the recreated op is not on the target role's kernel type"
+    _run_once(op, d_config)
+
+    # D -> P: flip back, the direction whose buffers GROW.
+    op.finalize()
+    del op
+    op = mori.ops.EpDispatchCombineOp(p_config)
+    _assert_capacity(op, PREFILL_TOKENS)
+    assert (
+        op.config.kernel_type.value
+        == mori.ops.EpDispatchCombineKernelType.IntraNode.value
+    )
+    _run_once(op, p_config)
+
+    op.finalize()
+    del op
+
+    after_cycle = _heap_stats()
+    if baseline is not None and after_cycle is not None:
+        assert after_cycle["total_free_space"] == baseline["total_free_space"], (
+            f"rank {rank}: a P->D->P destroy+recreate loop across a kernel-type "
+            f"change did not return the heap to baseline: {baseline} -> "
+            f"{after_cycle}"
+        )
+        assert after_cycle["allocated_blocks"] == baseline["allocated_blocks"], (
+            f"rank {rank}: VA block count moved across the closed loop: "
+            f"{baseline} -> {after_cycle}"
+        )
+        assert after_cycle["num_mem_objs"] == baseline["num_mem_objs"], (
+            f"rank {rank}: SymmMemObj count moved across the closed loop: "
+            f"{baseline} -> {after_cycle}"
+        )
+    if rank == 0:
+        print(
+            f"[kernel-type-flip] rank 0: RAN IntraNode@{PREFILL_TOKENS} -> "
+            f"IntraNodeLL@{DECODE_TOKENS} -> IntraNode@{PREFILL_TOKENS} via "
+            f"destroy+recreate, heap baseline={baseline} after={after_cycle}",
+            flush=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
@@ -2309,5 +2459,20 @@ def test_reconfigure_heap_fragmentation(
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_heap_fragmentation, [world_size, cycles])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+def test_kernel_type_flip_destroy_recreate(torch_dist_process_manager, world_size):
+    """The flip acceptance is measured on, and the one path with no coverage.
+
+    `reconfigure()` rejects a kernel-type change by design, so sglang must
+    destroy and recreate the op for every real P<->D flip (COORD [M, turn 18]
+    §2). That advice went to Team S with nothing exercising it.
+    """
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_kernel_type_flip_destroy_recreate, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
