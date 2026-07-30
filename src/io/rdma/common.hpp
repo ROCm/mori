@@ -236,6 +236,17 @@ struct DeregQuiesceCensus {
   // but it IS a curve, it is measured here, and a test asserts on the number
   // rather than on that reassurance.
   std::size_t gateTombstones{0};
+  // REVIEW_M #78-1/#79-3. Times ReapMemoryGates popped a tombstone off
+  // `retiredOrder_` and DECLINED to evict it because the gate still had posts
+  // outstanding -- i.e. the strand path, the one the fix is about.
+  //
+  // Exists because T45c measured that the obvious proxy is NOT the event:
+  // `quiesceTimedOut` counts a drain that gave up, but the reap evicts
+  // OLDEST-first, so the gate it examines is from an earlier cycle and is
+  // normally long drained. A test can time out 8 of 8 quiesces and still never
+  // decline a single eviction. Only this counter says the path was entered, so
+  // it is what a non-vacuity gate must assert on.
+  std::size_t gateReapDeclined{0};
 };
 DeregQuiesceCensus GetDeregQuiesceCensus();
 void RecordQuiesce(int inflightAtClose, bool drained);
@@ -244,6 +255,9 @@ void RecordEndpointsReaped(std::size_t n);
 // Absolute, not a delta: the current resident count. Set by RdmaManager under
 // its own lock every time memGates_ gains or loses a retired entry.
 void RecordGateTombstones(std::size_t resident);
+// Monotone, unlike the one above: a reap declined an eviction because the gate
+// still had posts. The non-vacuity signal for the strand path.
+void RecordGateReapDeclined(std::size_t n);
 
 struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)

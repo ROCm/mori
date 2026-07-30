@@ -498,6 +498,7 @@ std::size_t RdmaManager::ReapMemoryGates() {
   const std::size_t bound = maxMemGateTombstones_;
   if (bound == 0) return 0;
   std::size_t reaped = 0;
+  std::size_t declined = 0;
   {
     std::unique_lock<std::shared_mutex> lock(mu);
     // A gate we decline to evict must go BACK on the deque, and the walk has to
@@ -545,7 +546,15 @@ std::size_t RdmaManager::ReapMemoryGates() {
     for (auto rit = deferred.rbegin(); rit != deferred.rend(); ++rit) {
       retiredOrder_.push_front(*rit);
     }
+    declined = deferred.size();
   }
+  // Outside the lock: the census takes its own. Published because T45c measured
+  // that `quiesceTimedOut` is NOT a proxy for this -- 8/8 timed-out quiesces
+  // produced ZERO declines, since the reap examines the OLDEST tombstone and
+  // that one is from an earlier cycle and long drained. Without this counter a
+  // test cannot tell "the strand path ran and the fix held it" from "the strand
+  // path never ran", and those look identical in every other number.
+  if (declined > 0) RecordGateReapDeclined(declined);
   if (reaped > 0) {
     MORI_IO_TRACE("Reaped {} retired memory gate tombstone(s); bound is {}", reaped, bound);
   }

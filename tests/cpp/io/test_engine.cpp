@@ -33,6 +33,7 @@
 #include <cctype>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -1808,6 +1809,12 @@ void CaseRdmaGateReapDoesNotStrandInflight() {
   // once, not one) and CONTINUOUSLY replenished by another thread for the whole
   // of the dereg, exactly as that case does.
   std::size_t waited = 0;
+  // Held across ALL cycles and drained only at the end -- see the comment at
+  // the bottom of the loop for why draining per-cycle made the case vacuous.
+  // deque, not vector: TransferStatus is written by the CQ poll thread through
+  // a pointer taken at Write() time, and a vector reallocating would move those
+  // objects out from under it.
+  std::deque<std::vector<TransferStatus>> allStatuses;
   for (int i = 0; i < kStrandCycles; ++i) {
     MemoryDesc ldesc =
         pair.initiator->RegisterMemory(lptr, 8 * 1024 * 1024, 0, MemoryLocationType::GPU);
@@ -1837,36 +1844,55 @@ void CaseRdmaGateReapDoesNotStrandInflight() {
     pair.initiator->DeregisterMemory(ldesc);
     stopLoader.store(true, std::memory_order_release);
     loader.join();
-    // Let the burst land, so the suite is not left with genuinely live WRs
-    // against a deregistered lkey for the rest of the process.
-    for (int k = 0; k < kInflightDepth; ++k) {
+    // DELIBERATELY not drained here. T45c measured why: with each cycle drained
+    // before the next, the reap's OLDEST-first victim is always a gate from a
+    // previous cycle that has long since gone quiet, so `Inflight() > 0` is
+    // never true at the reap and ZERO evictions are declined -- 8/8 quiesces
+    // timed out and `gateReapDeclined` stayed 0. Timing a quiesce out and
+    // declining an eviction are different events, and only the second is the
+    // strand. Holding the bursts outstanding across cycles is what puts an
+    // inflight gate at the FRONT of the deque when a later reap gets there.
+    allStatuses.emplace_back(std::move(statuses));
+  }
+  // Drain everything now, so the suite is not left with genuinely live WRs
+  // against deregistered lkeys for the rest of the process.
+  for (auto& batch : allStatuses) {
+    for (auto& st : batch) {
       std::string terr;
-      WaitTransferDone(&statuses[k], 10000, &terr);
+      WaitTransferDone(&st, 10000, &terr);
     }
   }
 
   DeregQuiesceCensus afterStrand = GetDeregQuiesceCensus();
   const std::size_t timedOut = afterStrand.quiesceTimedOut - base.quiesceTimedOut;
+  const std::size_t declined = afterStrand.gateReapDeclined - base.gateReapDeclined;
   waited = afterStrand.quiesceWaited - base.quiesceWaited;
   const std::size_t strandedTombstones = afterStrand.gateTombstones;
   // `waited` is printed alongside `timedOut` on purpose: if a future run goes
   // vacuous again, these two separate "the transfers were never outstanding"
   // (waited=0) from "they were, but drained inside the timeout" (waited>0,
   // timedOut=0), and only the first is a driver problem.
-  std::printf("[gate-strand] after %d strand cycles: waited=%zu timedOut=%zu tombstones=%zu "
-              "bound=%zu maxInflightAtQuiesce=%zu\n",
-              kStrandCycles, waited, timedOut, strandedTombstones, kBound,
+  std::printf("[gate-strand] after %d strand cycles: waited=%zu timedOut=%zu DECLINED=%zu "
+              "tombstones=%zu bound=%zu maxInflightAtQuiesce=%zu\n",
+              kStrandCycles, waited, timedOut, declined, strandedTombstones, kBound,
               afterStrand.maxInflightAtQuiesce);
 
   // NON-VACUITY FIRST. If nothing timed out, the strand path was never entered
   // and everything below is a green for the wrong reason -- the same vacuous
   // mistake struck at T3 and re-asked for at every review since.
-  Require(timedOut > 0,
-          "VACUOUS: no quiesce timed out, so no gate was ever declined and the strand path was "
-          "not exercised (timedOut=0, waited=" + std::to_string(waited) +
-              "). This is a DRIVER failure, not a verdict on the fix: with waited=0 the "
-              "transfers were never outstanding at the barrier; with waited>0 they were, but "
-              "drained inside 1 ms. Deepen kInflightDepth. Not a pass either way.");
+  // NON-VACUITY, and it must gate on the DECLINE, not on the timeout. T45c
+  // measured the difference and it is the whole reason this counter exists:
+  // that run had timedOut=8/8 and still declined ZERO evictions, because the
+  // reap examines the OLDEST tombstone and the per-cycle drain had left it
+  // quiet. Gating on `timedOut` therefore passed a build with the fix REVERTED
+  // -- an identical green on both arms, i.e. no discrimination at all.
+  Require(declined > 0,
+          "VACUOUS: no eviction was ever DECLINED (gateReapDeclined=0), so no gate was stranded "
+          "and this run says nothing about the fix. timedOut=" + std::to_string(timedOut) +
+              " waited=" + std::to_string(waited) +
+              " -- note that timing a quiesce out is NOT the same event: the reap evicts "
+              "oldest-first, so the gate it examines must ITSELF still be inflight. A DRIVER "
+              "failure, not a verdict. Not a pass.");
 
   // (a) THE DISCRIMINATOR. Post-fix a declined gate goes back on the deque, so
   //     the retention holds near the bound. Pre-fix the count is inflated by
