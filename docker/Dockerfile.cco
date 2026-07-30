@@ -26,15 +26,15 @@ RUN apt-get update && \
 # ships runtime .so files but NO CMake configs and NO dev headers (rocm_smi.h,
 # etc.), so mori's `find_package(hip)` / HIP-language build cannot work.
 #
-# Enable with:  --build-arg INSTALL_ROCM714=1
-# (default 0 — the rocm/pytorch base images above already have a full /opt/rocm,
-#  and enabling this on top of one would clobber it.)
+# Disable with:  --build-arg INSTALL_ROCM714=0
+# (default 1 — installs the apt ROCm dev stack so CMake and hipconfig work
+#  inside pip build isolation without rocm_sdk_core.)
 #
 # AMD's apt ROCm 7.14 (same version as the torch wheel) unpacks under
 # /opt/rocm/core-7.14. We expose it at /opt/rocm (mori hardcodes that path) with
 # a top-level symlink farm, and add /usr/lib64/libc.so — hsakmtTargets.cmake
 # hardcodes that RPM-style path, which does not exist on Ubuntu.
-ARG INSTALL_ROCM714=0
+ARG INSTALL_ROCM714=1
 RUN if [ "${INSTALL_ROCM714}" = "1" ]; then set -ex && \
       apt-get update && \
       apt-get install -y --no-install-recommends wget gnupg ca-certificates && \
