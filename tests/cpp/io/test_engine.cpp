@@ -1161,10 +1161,29 @@ void CaseRdmaTransferSurvivesConcurrentDeregister() {
 // of the process and every later transfer fails -- not slow, not leaky: down.
 // That is a flip-robustness blocker, and it is the next thing to fix.
 //
-// NOT YET MEASURED: whether sglang actually leaves reads in flight across its
-// teardown (it drains first, in which case this needs the drain to be proven,
-// not assumed). Also unmeasured: ASAN RED/GREEN for the use-after-free, which
-// this failure now MASKS -- the case aborts before the sanitizer arm matters.
+// T36b: I said the sglang half was "not yet measured", so I measured it rather
+// than leaving the reader to. It is REACHABLE, and by a 3-second timeout:
+//
+//   conn.py:1574   _run_chunk -> rc = self._wait_chunk(statuses)   # DOES wait
+//   conn.py:691-692  teardown: for t in self._worker_threads: t.join(timeout=3.0)
+//   conn.py:693      self._worker_threads = []                     # unconditional
+//   conn.py:706-718  for desc in ...: self.engine.deregister_memory(desc)
+//
+// So the drain exists -- and it is BOUNDED. `join(timeout=3.0)` returns whether
+// the thread finished or not, there is no `t.is_alive()` check after it, and
+// the very next statements deregister every kv/aux/state desc. A chunk still in
+// _wait_chunk at t+3s therefore has its MR pulled out from under it, which is
+// step 1 of the sequence above. On dsv3-full, with large KV chunks and a busy
+// fabric, 3 seconds is not a comfortable margin -- it is the margin between a
+// clean flip and a dead QP.
+//
+// This does NOT need the use-after-free to be present; the QP wedge is a
+// property of RC semantics plus a missing recovery path, and it survives
+// 8f2d80b2.
+//
+// Still unmeasured, stated so: the ASAN RED/GREEN for 8f2d80b2, which this
+// failure now MASKS -- the case reaches its final arm before the sanitizer arm
+// would matter. In flight at the time of writing.
 
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
