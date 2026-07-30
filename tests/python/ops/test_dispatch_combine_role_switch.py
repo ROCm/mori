@@ -915,6 +915,94 @@ def _worker_rank_asymmetric_giveback_fails(rank, world_size):
     _run_once(op, config)
 
 
+def _worker_rank_asymmetric_finalize_fails(rank, world_size):
+    """Rank 0's finalize() RAISES while its N-1 peers finalize normally.
+
+    The teardown counterpart of the reject deadlock, and until 9909de28 it was
+    the same bug: python `finalize()` was `barrier / handle.finalize() /
+    barrier`, so a rank whose finalize threw unwound out of the middle and
+    never entered the trailing barrier. Its peers block there with N-1 of N
+    participants -- one rank raises, the rest hang, forever.
+
+    This matters more than its line count suggests. `finalize()` is published
+    COLLECTIVE in the COORD contract, and sglang calls it on the
+    destroy+recreate fallback that multi-node EP ALWAYS takes ([S, turn 2]),
+    so it is the teardown path of the configuration with the least other
+    coverage in this campaign.
+
+    The primary assertion is not a string: it is that every rank RETURNS inside
+    MORI_TEST_RESULT_TIMEOUT rather than the harness reporting silent ranks.
+    A hang here fails as a timeout naming the blocked peers, which is precisely
+    the signal the old code could not produce.
+
+    Also asserted:
+      1. the raising rank really raises (otherwise the injection did not fire
+         and the whole test is vacuous -- the failure mode that made two
+         earlier tests in this file assert against nothing);
+      2. the peers' finalize SUCCEEDS. Deliberately not a group verdict:
+         finalize is destructive by intent, there is no capacity to negotiate
+         back, and C++ FinalizeAll() is idempotent and frees what it can, so
+         the contract is "barriers stay balanced and the raiser is named", not
+         "every rank reports the group's worst outcome" as reconfigure() does.
+         Encoding that here keeps 9909de28's deliberate asymmetry from being
+         quietly changed later;
+      3. every rank -- including the raiser -- can still take part in a
+         collective afterwards. A rank that raised past its barrier would leave
+         the group off by one, and the very next collective would expose it.
+    """
+    config = _make_config(rank, world_size, DECODE_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+    _run_once(op, config)
+
+    if rank == 0:
+        # One-shot: the hook disarms itself as it fires, so rank 0's later
+        # finalize() (below) is a real one. A permanently-armed hook would make
+        # the recovery this test checks impossible.
+        os.environ["MORI_TEST_FAIL_FINALIZE"] = "1"
+
+    raised = None
+    try:
+        try:
+            op.finalize()
+        except RuntimeError as exc:
+            raised = str(exc)
+    finally:
+        os.environ.pop("MORI_TEST_FAIL_FINALIZE", None)
+
+    if rank == 0:
+        # (1) The injection must actually have fired, or nothing below is a test.
+        assert raised is not None, (
+            "rank 0's finalize() did not raise -- MORI_TEST_FAIL_FINALIZE never "
+            "fired, so this test proves nothing about the trailing barrier"
+        )
+        assert "MORI_TEST_FAIL_FINALIZE" in raised, f"rank 0: {raised}"
+    else:
+        # (2) Peers are NOT told about rank 0's failure. See the docstring:
+        # finalize deliberately has no severity agreement.
+        assert raised is None, f"rank {rank}: peers must not inherit a raise: {raised}"
+        assert op.is_initialized is False, f"rank {rank} still holds buffers"
+
+    # (3) The group is still collectively usable. If rank 0 had skipped its
+    # trailing barrier, it would be one barrier ahead of its peers from here on
+    # and this all_reduce would pair rank 0's value with the wrong round.
+    # Checked with a value that differs per rank so a mispairing shows up as a
+    # wrong sum rather than passing by luck.
+    probe = torch.tensor([rank + 1], dtype=torch.int32, device="cpu")
+    dist.all_reduce(probe, op=dist.ReduceOp.SUM, group=mori.shmem.shmem_get_process_group())
+    expected = world_size * (world_size + 1) // 2
+    assert int(probe.item()) == expected, (
+        f"rank {rank}: group is off by a collective after a failed finalize "
+        f"(got {int(probe.item())}, expected {expected})"
+    )
+
+    # And rank 0 -- whose buffers were never released, because the injection
+    # throws before any teardown work -- can still finalize for real. That is
+    # the difference between "this rank reported a failure" and "this rank is
+    # wedged": sglang's fallback path retries the teardown.
+    op.finalize()
+    assert op.is_initialized is False, f"rank {rank}: retry finalize did not release"
+
+
 def _worker_rank_asymmetric_reject(rank, world_size):
     """Rank 0 is handed an INVALID capacity; ranks 1-7 are handed a valid one.
 
@@ -1451,6 +1539,20 @@ def test_rank_asymmetric_reject_heap_symmetry(torch_dist_process_manager, world_
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_rank_asymmetric_reject_heap_symmetry, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+def test_rank_asymmetric_finalize_fails(torch_dist_process_manager, world_size):
+    """One rank's finalize() raises; the other N-1 must not hang.
+
+    The test 9909de28 has been owed since review #36. Its primary assertion is
+    that all N workers RETURN inside the harness timeout.
+    """
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_rank_asymmetric_finalize_fails, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
