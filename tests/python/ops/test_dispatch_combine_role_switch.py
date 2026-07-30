@@ -147,6 +147,36 @@ def _heap_stats():
     return mori.shmem.shmem_get_heap_stats()
 
 
+def _heap_stats_required(rank, what):
+    """`_heap_stats()`, but a None is a test FAILURE rather than a silent skip.
+
+    Every leak assertion in this module used to be written
+    `if before is not None and after is not None: assert ...`. In
+    non-static-heap mode (`MORI_SHMEM_HEAP_TYPE=normal`, VMM, Isolation)
+    `shmem_get_heap_stats()` returns None by design, and under that guard the
+    entire leak check VANISHES -- the test still reports green while making
+    none of the claims its docstring says it makes. That is the worst possible
+    shape for evidence in this campaign: a passing test that proves nothing,
+    indistinguishable from one that proved something. `MORI_SHMEM_HEAP_TYPE=
+    normal` is not hypothetical either; it was tried as a node-contention
+    workaround at T4b, and under it these tests would have gone green with zero
+    coverage.
+
+    So the counter is a hard REQUIREMENT of these tests. If it is unavailable,
+    fail loudly: a run that cannot measure the leak must never be quotable as a
+    run that found no leak.
+    """
+    stats = _heap_stats()
+    assert stats is not None, (
+        f"rank {rank}: symmetric-heap stats unavailable ({what}) -- this test "
+        f"cannot make its leak claim, so it fails rather than passing "
+        f"vacuously. shmem_get_heap_stats() returns None outside static-heap "
+        f"mode; re-run without MORI_SHMEM_HEAP_TYPE overriding it rather than "
+        f"reading this run as 'no leak'."
+    )
+    return stats
+
+
 def _assert_capacity(op, expected_tokens):
     """The rebuilt buffers must actually be sized for the new role."""
     assert op.config.max_num_inp_token_per_rank == expected_tokens
@@ -198,12 +228,7 @@ def _worker_leak_stress(rank, world_size, cycles):
     op = mori.ops.EpDispatchCombineOp(config)
     _run_once(op, config)
 
-    baseline = _heap_stats()
-    if baseline is None:
-        # Return, do NOT pytest.skip(): this runs in a worker process, and
-        # `Skipped` is a BaseException, so the worker's `except Exception`
-        # would miss it and leave the parent blocked on result_queue.get().
-        return
+    baseline = _heap_stats_required(rank, "leak-stress baseline")
 
     # Baseline is taken AFTER the first dispatch/combine so that any buffer
     # allocated lazily on first use is already counted; from here every cycle
@@ -261,16 +286,13 @@ def _worker_finalize_returns_everything(rank, world_size):
     sharpest possible test of the teardown path -- and it is the path sglang
     takes when it destroys an op rather than resizing it.
     """
-    before = _heap_stats()
-    if before is None:
-        # Return, not pytest.skip() -- see _worker_leak_stress.
-        return
+    before = _heap_stats_required(rank, "finalize-returns-everything baseline")
 
     config = _make_config(rank, world_size, PREFILL_TOKENS)
     op = mori.ops.EpDispatchCombineOp(config)
     _run_once(op, config)
 
-    during = _heap_stats()
+    during = _heap_stats_required(rank, "during")
     # Sanity: the op must actually have taken symmetric memory, otherwise the
     # "it all came back" assertion below would be trivially true.
     assert during["total_free_space"] < before["total_free_space"], (
@@ -282,7 +304,7 @@ def _worker_finalize_returns_everything(rank, world_size):
     op.finalize()
     assert not op.is_initialized
 
-    after = _heap_stats()
+    after = _heap_stats_required(rank, "after")
     assert after["total_free_space"] == before["total_free_space"], (
         f"rank {rank}: finalize() leaked "
         f"{before['total_free_space'] - after['total_free_space']} symmetric "
@@ -324,7 +346,7 @@ def _worker_flip_at_real_capacities(rank, world_size):
     campaign were lost to not distinguishing those two.
     """
     config = _make_config(rank, world_size, REAL_PREFILL_TOKENS)
-    before = _heap_stats()
+    before = _heap_stats_required(rank, "before")
 
     try:
         op = mori.ops.EpDispatchCombineOp(config)
@@ -343,7 +365,7 @@ def _worker_flip_at_real_capacities(rank, world_size):
 
     _run_once(op, config)
     _assert_capacity(op, REAL_PREFILL_TOKENS)
-    after_build = _heap_stats()
+    after_build = _heap_stats_required(rank, "after_build")
 
     # D: the shrink sglang performs on a P->D flip.
     op.reconfigure(max_num_inp_token_per_rank=REAL_DECODE_TOKENS)
@@ -355,17 +377,16 @@ def _worker_flip_at_real_capacities(rank, world_size):
     _assert_capacity(op, REAL_PREFILL_TOKENS)
     _run_once(op, config)
 
-    after_cycle = _heap_stats()
-    if after_build is not None and after_cycle is not None:
-        assert after_cycle["total_free_space"] == after_build["total_free_space"], (
-            f"rank {rank}: a {REAL_PREFILL_TOKENS}->{REAL_DECODE_TOKENS}->"
-            f"{REAL_PREFILL_TOKENS} flip did not return the heap to its starting "
-            f"state: {after_build} -> {after_cycle}"
-        )
-        assert after_cycle["num_mem_objs"] == after_build["num_mem_objs"], (
-            f"rank {rank}: symmetric object count moved across a closed flip "
-            f"loop: {after_build} -> {after_cycle}"
-        )
+    after_cycle = _heap_stats_required(rank, "after_cycle")
+    assert after_cycle["total_free_space"] == after_build["total_free_space"], (
+        f"rank {rank}: a {REAL_PREFILL_TOKENS}->{REAL_DECODE_TOKENS}->"
+        f"{REAL_PREFILL_TOKENS} flip did not return the heap to its starting "
+        f"state: {after_build} -> {after_cycle}"
+    )
+    assert after_cycle["num_mem_objs"] == after_build["num_mem_objs"], (
+        f"rank {rank}: symmetric object count moved across a closed flip "
+        f"loop: {after_build} -> {after_cycle}"
+    )
 
     if rank == 0:
         print(
@@ -377,12 +398,11 @@ def _worker_flip_at_real_capacities(rank, world_size):
 
     # And the teardown returns everything, at the real size.
     op.finalize()
-    after_final = _heap_stats()
-    if before is not None and after_final is not None:
-        assert after_final["total_free_space"] == before["total_free_space"], (
-            f"rank {rank}: finalize() at the real capacity leaked "
-            f"{before['total_free_space'] - after_final['total_free_space']} bytes"
-        )
+    after_final = _heap_stats_required(rank, "after_final")
+    assert after_final["total_free_space"] == before["total_free_space"], (
+        f"rank {rank}: finalize() at the real capacity leaked "
+        f"{before['total_free_space'] - after_final['total_free_space']} bytes"
+    )
 
 
 def _worker_finalized_getters_raise(rank, world_size):
@@ -562,7 +582,7 @@ def _worker_plain_device_oom_raises(rank, world_size):
     op = mori.ops.EpDispatchCombineOp(config)
     _run_once(op, config)
 
-    before = _heap_stats()
+    before = _heap_stats_required(rank, "before")
 
     # `dispSenderIdxMap` is the SECOND plain-device allocation in
     # InitializeOrderMapBuf, and InitializeShmemBuf/TokenNumSignalBuf have both
@@ -594,18 +614,17 @@ def _worker_plain_device_oom_raises(rank, world_size):
     # TokenNumSignalBuf would be leaked permanently, making each failed D->P
     # flip likelier to fail than the last. Exact equality, because the heap is
     # a deterministic first-fit VA manager and not a caching allocator.
-    after = _heap_stats()
-    if before is not None and after is not None:
-        assert after["total_free_space"] == before["total_free_space"], (
-            f"rank {rank}: a FAILED flip leaked symmetric heap: "
-            f"total_free_space {before['total_free_space']} -> "
-            f"{after['total_free_space']} "
-            f"(lost {before['total_free_space'] - after['total_free_space']} bytes)"
-        )
-        assert after["num_mem_objs"] == before["num_mem_objs"], (
-            f"rank {rank}: a FAILED flip leaked symmetric objects: "
-            f"num_mem_objs {before['num_mem_objs']} -> {after['num_mem_objs']}"
-        )
+    after = _heap_stats_required(rank, "after")
+    assert after["total_free_space"] == before["total_free_space"], (
+        f"rank {rank}: a FAILED flip leaked symmetric heap: "
+        f"total_free_space {before['total_free_space']} -> "
+        f"{after['total_free_space']} "
+        f"(lost {before['total_free_space'] - after['total_free_space']} bytes)"
+    )
+    assert after["num_mem_objs"] == before["num_mem_objs"], (
+        f"rank {rank}: a FAILED flip leaked symmetric objects: "
+        f"num_mem_objs {before['num_mem_objs']} -> {after['num_mem_objs']}"
+    )
 
     # A later legitimate flip must still succeed: a failed flip is retryable,
     # which is the contract sglang's role switch relies on to keep serving.
@@ -633,9 +652,7 @@ def _worker_repeated_failed_flips_do_not_accumulate(rank, world_size):
     op = mori.ops.EpDispatchCombineOp(config)
     _run_once(op, config)
 
-    baseline = _heap_stats()
-    if baseline is None:
-        return
+    baseline = _heap_stats_required(rank, "failed-flip-accumulation baseline")
 
     cycles = 10
     trace = []
@@ -699,7 +716,7 @@ def _worker_rank_asymmetric_failure(rank, world_size):
     op = mori.ops.EpDispatchCombineOp(config)
     _run_once(op, config)
 
-    before = _heap_stats()
+    before = _heap_stats_required(rank, "before")
 
     # Arm the injection on rank 0 ONLY. The hook is one-shot (it unsets the
     # variable as it fires), so rank 0's rollback to DECODE_TOKENS is NOT
@@ -738,16 +755,15 @@ def _worker_rank_asymmetric_failure(rank, world_size):
     _run_once(op, config)
 
     # And the divergence cost the heap nothing on any rank.
-    after = _heap_stats()
-    if before is not None and after is not None:
-        assert after["total_free_space"] == before["total_free_space"], (
-            f"rank {rank}: rank-asymmetric failed flip leaked symmetric heap: "
-            f"{before['total_free_space']} -> {after['total_free_space']}"
-        )
-        assert after["num_mem_objs"] == before["num_mem_objs"], (
-            f"rank {rank}: rank-asymmetric failed flip leaked symmetric objects: "
-            f"{before['num_mem_objs']} -> {after['num_mem_objs']}"
-        )
+    after = _heap_stats_required(rank, "after")
+    assert after["total_free_space"] == before["total_free_space"], (
+        f"rank {rank}: rank-asymmetric failed flip leaked symmetric heap: "
+        f"{before['total_free_space']} -> {after['total_free_space']}"
+    )
+    assert after["num_mem_objs"] == before["num_mem_objs"], (
+        f"rank {rank}: rank-asymmetric failed flip leaked symmetric objects: "
+        f"{before['num_mem_objs']} -> {after['num_mem_objs']}"
+    )
 
     # The group is still flippable: a subsequent real flip must work on all
     # ranks and still compute correctly. This is what sglang relies on to keep
@@ -1134,18 +1150,13 @@ def _worker_rank_asymmetric_reject_heap_symmetry(rank, world_size):
     op = mori.ops.EpDispatchCombineOp(config)
     _run_once(op, config)
 
-    baseline = _heap_stats()
-    if baseline is None:
-        # Not in static-heap mode, so there is nothing to measure. Return
-        # rather than pytest.skip(): Skipped is a BaseException and escaping it
-        # here leaves the parent's collective get() waiting forever (be825794).
-        return
+    baseline = _heap_stats_required(rank, "asymmetric-reject baseline")
 
     target = 0 if rank == 0 else PREFILL_TOKENS
     with pytest.raises(RuntimeError):
         op.reconfigure(max_num_inp_token_per_rank=target)
 
-    after = _heap_stats()
+    after = _heap_stats_required(rank, "after")
 
     # 1. Local accounting: a rejection must be heap-neutral on EVERY rank --
     #    rank 0 never allocated, and its peers gave back everything they took.
@@ -1301,8 +1312,19 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=Tru
     # hipMalloc'd wherever its own allocator lands it (shmem/init.cpp:226), so
     # raw local_ptr values differ on a perfectly healthy group. heap_base comes
     # from shmem_get_heap_stats() and is None outside static-heap mode.
-    _hs = mori.shmem.shmem_get_heap_stats()
-    heap_base = int(_hs["heap_base"]) if _hs else 0
+    # Same vacuity trap as the leak assertions: falling back to heap_base=0
+    # silently turns the OFFSET invariant back into a RAW-POINTER comparison,
+    # which is exactly the wrong quantity T14 caught this test comparing (each
+    # rank hipMallocs its own heap wherever its allocator lands it, so raw
+    # pointers differ on a perfectly healthy group). A missing heap_base must
+    # fail the test, not quietly change what it measures.
+    _hs = _heap_stats_required(rank, "heap base for the offset invariant")
+    assert "heap_base" in _hs, (
+        f"rank {rank}: shmem_get_heap_stats() has no 'heap_base' -- the "
+        f"extension predates 702e2f38 and this test cannot compute the "
+        f"cross-rank-comparable offset it asserts on."
+    )
+    heap_base = int(_hs["heap_base"])
 
     # Gather (generation, seed, heap-relative offset, size) from every rank.
     # CPU tensors: the shmem group can be gloo-only (bf9757e9).
@@ -1901,7 +1923,7 @@ def _worker_heap_fragmentation(rank, world_size, cycles):
     config = _make_config(rank, world_size, PREFILL_TOKENS)
     op = mori.ops.EpDispatchCombineOp(config)
 
-    start = _heap_stats()
+    start = _heap_stats_required(rank, "heap-fragmentation baseline")
 
     # Vary the requested capacity so successive allocations are NOT the same
     # size -- same-size realloc trivially reuses the just-freed block and would
@@ -1910,23 +1932,19 @@ def _worker_heap_fragmentation(rank, world_size, cycles):
     for i in range(cycles):
         op.reconfigure(max_num_inp_token_per_rank=DECODE_TOKENS + i)
         op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS + i)
-        if start is not None:
-            trace.append(_heap_stats())
+        trace.append(_heap_stats())
 
     # The real assertion: the largest size still fits after all that churn.
     op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
     _assert_capacity(op, PREFILL_TOKENS)
     _run_once(op, config)
 
-    if start is None:
-        return
-
     # Quantify the fragmentation instead of only asserting "it still worked".
     # `largest_free_block` collapsing while `total_free_space` holds steady is
     # the signature of a fragmenting first-fit heap, and it would put a hard
     # ceiling on how many times an sglang instance may flip role. Report the
     # trace in the failure message so a regression comes with its own data.
-    end = _heap_stats()
+    end = _heap_stats_required(rank, "end")
     summary = (
         f"rank {rank}: cycles={cycles} "
         f"start(free={start['total_free_space']} largest={start['largest_free_block']} "
@@ -2113,7 +2131,7 @@ def _worker_kernel_type_flip_destroy_recreate(rank, world_size):
     for kt in ("IntraNode", "IntraNodeLL"):
         warmup_jit_kernels(getattr(mori.ops.EpDispatchCombineKernelType, kt))
 
-    baseline = _heap_stats()
+    baseline = _heap_stats_required(rank, "baseline")
 
     # P: normal kernel at the prefill capacity.
     p_config = _make_config(rank, world_size, PREFILL_TOKENS, "IntraNode")
@@ -2121,15 +2139,14 @@ def _worker_kernel_type_flip_destroy_recreate(rank, world_size):
     _assert_capacity(op, PREFILL_TOKENS)
     _run_once(op, p_config)
 
-    if baseline is not None:
-        built = _heap_stats()
-        # Non-vacuity: if the op took no symmetric memory the closed-loop
-        # equality below would be trivially true, which is precisely how T1/T2's
-        # leak claim came to mean nothing.
-        assert built["total_free_space"] < baseline["total_free_space"], (
-            f"rank {rank}: the P op allocated no symmetric memory "
-            f"(baseline={baseline} built={built}) -- this test measures nothing"
-        )
+    built = _heap_stats_required(rank, "post-construct stats")
+    # Non-vacuity: if the op took no symmetric memory the closed-loop
+    # equality below would be trivially true, which is precisely how T1/T2's
+    # leak claim came to mean nothing.
+    assert built["total_free_space"] < baseline["total_free_space"], (
+        f"rank {rank}: the P op allocated no symmetric memory "
+        f"(baseline={baseline} built={built}) -- this test measures nothing"
+    )
 
     # P -> D. reconfigure() CANNOT do this, and that is the whole point: assert
     # it refuses, so this test also pins the reason the destroy+recreate path
@@ -2153,18 +2170,17 @@ def _worker_kernel_type_flip_destroy_recreate(rank, world_size):
     assert not op.is_initialized
     del op
 
-    after_destroy = _heap_stats()
-    if baseline is not None and after_destroy is not None:
-        assert after_destroy["total_free_space"] == baseline["total_free_space"], (
-            f"rank {rank}: destroying the P op leaked "
-            f"{baseline['total_free_space'] - after_destroy['total_free_space']} "
-            f"symmetric bytes (baseline={baseline} after={after_destroy})"
-        )
-        assert after_destroy["num_mem_objs"] == baseline["num_mem_objs"], (
-            f"rank {rank}: destroying the P op leaked "
-            f"{after_destroy['num_mem_objs'] - baseline['num_mem_objs']} "
-            f"SymmMemObj registrations ({baseline} -> {after_destroy})"
-        )
+    after_destroy = _heap_stats_required(rank, "after_destroy")
+    assert after_destroy["total_free_space"] == baseline["total_free_space"], (
+        f"rank {rank}: destroying the P op leaked "
+        f"{baseline['total_free_space'] - after_destroy['total_free_space']} "
+        f"symmetric bytes (baseline={baseline} after={after_destroy})"
+    )
+    assert after_destroy["num_mem_objs"] == baseline["num_mem_objs"], (
+        f"rank {rank}: destroying the P op leaked "
+        f"{after_destroy['num_mem_objs'] - baseline['num_mem_objs']} "
+        f"SymmMemObj registrations ({baseline} -> {after_destroy})"
+    )
 
     # D: low-latency kernel at the decode capacity. Both fields change at once,
     # which is the flip sglang actually issues.
@@ -2191,21 +2207,20 @@ def _worker_kernel_type_flip_destroy_recreate(rank, world_size):
     op.finalize()
     del op
 
-    after_cycle = _heap_stats()
-    if baseline is not None and after_cycle is not None:
-        assert after_cycle["total_free_space"] == baseline["total_free_space"], (
-            f"rank {rank}: a P->D->P destroy+recreate loop across a kernel-type "
-            f"change did not return the heap to baseline: {baseline} -> "
-            f"{after_cycle}"
-        )
-        assert after_cycle["allocated_blocks"] == baseline["allocated_blocks"], (
-            f"rank {rank}: VA block count moved across the closed loop: "
-            f"{baseline} -> {after_cycle}"
-        )
-        assert after_cycle["num_mem_objs"] == baseline["num_mem_objs"], (
-            f"rank {rank}: SymmMemObj count moved across the closed loop: "
-            f"{baseline} -> {after_cycle}"
-        )
+    after_cycle = _heap_stats_required(rank, "after_cycle")
+    assert after_cycle["total_free_space"] == baseline["total_free_space"], (
+        f"rank {rank}: a P->D->P destroy+recreate loop across a kernel-type "
+        f"change did not return the heap to baseline: {baseline} -> "
+        f"{after_cycle}"
+    )
+    assert after_cycle["allocated_blocks"] == baseline["allocated_blocks"], (
+        f"rank {rank}: VA block count moved across the closed loop: "
+        f"{baseline} -> {after_cycle}"
+    )
+    assert after_cycle["num_mem_objs"] == baseline["num_mem_objs"], (
+        f"rank {rank}: SymmMemObj count moved across the closed loop: "
+        f"{baseline} -> {after_cycle}"
+    )
     if rank == 0:
         print(
             f"[kernel-type-flip] rank 0: RAN IntraNode@{PREFILL_TOKENS} -> "
@@ -2530,7 +2545,7 @@ def _worker_construct_fails_on_one_rank(rank, world_size):
     warmup.finalize()
     del warmup
 
-    before = _heap_stats()
+    before = _heap_stats_required(rank, "before")
 
     # Arm on rank 0 ONLY. One-shot (TIMES defaults to 1): the hook disarms as it
     # fires, so the REBUILD at the end of this worker is not sabotaged -- the
@@ -2564,18 +2579,17 @@ def _worker_construct_fails_on_one_rank(rank, world_size):
     # reasoning -- the symmetric heap is a deterministic first-fit VA manager,
     # not a caching allocator, so anything other than a return to baseline is a
     # buffer that was allocated and never given back.
-    after = _heap_stats()
-    if before is not None and after is not None:
-        assert after["total_free_space"] == before["total_free_space"], (
-            f"rank {rank}: a FAILED construct leaked symmetric heap: "
-            f"{before['total_free_space']} -> {after['total_free_space']}. "
-            f"The healthy ranks raise out of __init__, so the caller never "
-            f"binds the op and nothing can free these buffers later."
-        )
-        assert after["num_mem_objs"] == before["num_mem_objs"], (
-            f"rank {rank}: a FAILED construct leaked symmetric objects: "
-            f"{before['num_mem_objs']} -> {after['num_mem_objs']}"
-        )
+    after = _heap_stats_required(rank, "after")
+    assert after["total_free_space"] == before["total_free_space"], (
+        f"rank {rank}: a FAILED construct leaked symmetric heap: "
+        f"{before['total_free_space']} -> {after['total_free_space']}. "
+        f"The healthy ranks raise out of __init__, so the caller never "
+        f"binds the op and nothing can free these buffers later."
+    )
+    assert after["num_mem_objs"] == before["num_mem_objs"], (
+        f"rank {rank}: a FAILED construct leaked symmetric objects: "
+        f"{before['num_mem_objs']} -> {after['num_mem_objs']}"
+    )
 
     # And the group can still be built and still computes correctly -- which is
     # what sglang's reconcile needs in order to retry or to fall back.
