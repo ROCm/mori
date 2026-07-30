@@ -223,8 +223,15 @@ static CqeFailureAdvice DescribeCqeFailure(ibv_wc_status status, CqeFailureOrigi
 /*                                           RdmaManager                                          */
 /* ---------------------------------------------------------------------------------------------- */
 
+// Defined below with the tombstone machinery it belongs to; declared here
+// because the ctor's member-init list is the one place the bound is read.
+static std::size_t ReadMaxMemGateTombstones();
+
 RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* ctx)
-    : config(cfg), ctx(ctx) {
+    // Init order follows DECLARATION order (config :201, ctx :204,
+    // maxMemGateTombstones_ :233), not written order, so listing it last keeps
+    // -Wreorder quiet and the two agreeing.
+    : config(cfg), ctx(ctx), maxMemGateTombstones_(ReadMaxMemGateTombstones()) {
   application::RdmaDeviceList devices = ctx->GetRdmaDeviceList();
   availDevices = GetActiveDevicePortList(devices);
   if (availDevices.empty()) {
@@ -438,24 +445,35 @@ void RdmaManager::PublishGateTombstoneCount() {
 // behaviour) for anyone who needs to debug a stale-descriptor report.
 static constexpr std::size_t kDefaultMaxMemGateTombstones = 64;
 
-static std::size_t GetMaxMemGateTombstones() {
-  static const std::size_t v = [] {
-    // `io::env::Override` with `mori::env::detail::ParseInt`, matching every
-    // other env read in this file (:81, :731-736, :1848-1852). NOT the bare
-    // `env::GetInt` this originally used: unqualified `env::` resolves to
-    // `mori::io::env` (include/mori/io/env.hpp:29), which has only `Override`,
-    // so that spelling did not compile at all -- see the T43 build.
-    //
-    // ParseInt, not ParsePositiveInt: 0 must be accepted, since 0 is the
-    // documented "disable the reap" value and a positive-only parser would
-    // silently fall back to the default for it. Override also WARNs on an
-    // unparseable value rather than silently defaulting, which is what we want
-    // for a knob that bounds a corruption-adjacent structure.
-    int n = static_cast<int>(kDefaultMaxMemGateTombstones);
-    env::Override("MORI_IO_MAX_MEM_GATE_TOMBSTONES", n, mori::env::detail::ParseInt);
-    return static_cast<std::size_t>(n < 0 ? 0 : n);
-  }();
-  return v;
+// Read PER MANAGER, at construction -- deliberately NOT a function-local
+// `static const`. That spelling latches the value on the FIRST call anywhere in
+// the process, and T43 measured what that costs: six earlier RDMA cases in
+// test_engine deregister memory, so `GetMaxMemGateTombstones()` had already run
+// (and cached 64) long before `rdma_gate_tombstones_are_bounded` set the env to
+// 4, and the assertion failed with `settled=24 bound=4` -- the reap never fired
+// because the bound it compared against was still the default.
+//
+// The latch is also wrong outside the test. `MORI_IO_MAX_MEM_GATE_TOMBSTONES`
+// reads like per-engine configuration, but a process hosting two IOEngines
+// would silently give the second one the first one's bound, and which engine
+// won would depend on which deregistered first. A per-instance read makes the
+// knob mean what its name says.
+//
+// `io::env::Override` with `mori::env::detail::ParseInt` matches every other env
+// read in this file (:81, :731-736, :1848-1852). NOT the bare `env::GetInt` this
+// originally used: unqualified `env::` resolves to `mori::io::env`
+// (include/mori/io/env.hpp:29), which declares only `Override`, so that spelling
+// did not compile at all -- see the T43 build.
+//
+// ParseInt, not ParsePositiveInt: 0 must be accepted, since 0 is the documented
+// "disable the reap" value and a positive-only parser would silently fall back
+// to the default for it. Override also WARNs on an unparseable value rather than
+// silently defaulting, which is what we want for a knob that bounds a
+// corruption-adjacent structure.
+static std::size_t ReadMaxMemGateTombstones() {
+  int n = static_cast<int>(kDefaultMaxMemGateTombstones);
+  env::Override("MORI_IO_MAX_MEM_GATE_TOMBSTONES", n, mori::env::detail::ParseInt);
+  return static_cast<std::size_t>(n < 0 ? 0 : n);
 }
 
 // REVIEW_M #76-1. Without this the map grows one retired entry per deregistered
@@ -469,7 +487,7 @@ static std::size_t GetMaxMemGateTombstones() {
 // from the map and skipped, which is why the deque holds ids and not iterators.
 // Caller must NOT hold `mu`.
 std::size_t RdmaManager::ReapMemoryGates() {
-  const std::size_t bound = GetMaxMemGateTombstones();
+  const std::size_t bound = maxMemGateTombstones_;
   if (bound == 0) return 0;
   std::size_t reaped = 0;
   {

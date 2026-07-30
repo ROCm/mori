@@ -224,6 +224,13 @@ class RdmaManager {
   // not iterators/pointers, so an entry lifted by ClearLocalMemoryGate in the
   // meantime is simply not found at reap time and skipped.
   std::deque<MemoryUniqueId> retiredOrder_;
+  // How many tombstones to retain, read from MORI_IO_MAX_MEM_GATE_TOMBSTONES
+  // ONCE PER MANAGER at construction. Was a function-local `static const`, i.e.
+  // latched process-wide on first use; T43 measured that failing
+  // `rdma_gate_tombstones_are_bounded` (`settled=24 bound=4`) because six
+  // earlier cases had already cached the default. Per-instance is also what the
+  // knob's name promises when a process hosts more than one engine.
+  const std::size_t maxMemGateTombstones_;
   std::unordered_map<EngineKey, RemoteEngineMeta> remotes;
   std::atomic<EndpointId> nextEndpointId_{1};
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> endpointsById_;
