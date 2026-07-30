@@ -369,3 +369,61 @@ def test_asyncll_reconfigure_resizes(torch_dist_process_manager, world_size):
             (_worker_asyncll_reconfigure_resizes, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
+
+
+def _worker_asyncll_no_flip_at_capacity(rank, world_size):
+    """THE DISCRIMINATOR for T42b. Construct at the target capacity and NEVER
+    reconfigure.
+
+    T42b faulted all four ranks with a GPU memory access fault inside the
+    AsyncLL kernel when the flip ran at Team E's measured sglang capacities
+    (4096 <-> 128). Before that can be attributed to this branch's role-switch
+    path, one question has to be answered: does AsyncLL work at that capacity
+    AT ALL?
+
+    It is a real question, not a formality. Upstream mori's own AsyncLL suite
+    caps at `max_num_inp_token_per_rank` 128
+    (test_dispatch_combine_async_ll.py:205, values `(1, 128)`), so 4096 has
+    never been exercised for this kernel by anyone -- upstream or here.
+
+    So: build ONE op at MORI_TEST_PREFILL_TOKENS, dispatch/combine once, tear
+    it down. No reconfigure, no flip, nothing this branch added is on the path.
+
+      * FAULTS  -> the bug is AsyncLL-at-large-capacity, it predates this
+                   branch, and the role-switch path is exonerated. It is then
+                   an upstream report, and E must not size a decode role at
+                   4096 on this kernel.
+      * PASSES  -> AsyncLL is fine at 4096 standalone and only the FLIP to it
+                   faults, which makes it MINE (Reconfigure leaving some
+                   capacity-derived state behind) and the top of my queue.
+
+    Either way it is decisive, and it costs one op construction.
+    """
+    config = _make_config(rank, world_size, PREFILL_TOKENS, "AsyncLL")
+    op = mori.ops.EpDispatchCombineOp(config)
+    try:
+        _assert_capacity(op, PREFILL_TOKENS, "AsyncLL")
+        # The dispatch is the point: the fault in T42b surfaced at sync() after
+        # the kernel launch, not at construction, so merely allocating the
+        # buffers would not reproduce it.
+        _run_once(op, config)
+        if rank == 0:
+            print(
+                f"[asyncll-nofilp] rank 0: constructed AND RAN AsyncLL at "
+                f"{PREFILL_TOKENS} tokens/rank with NO reconfigure -- so the "
+                f"kernel itself is fine at this capacity"
+            )
+    finally:
+        op.finalize()
+        del op
+        gc.collect()
+
+
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+def test_asyncll_no_flip_at_capacity(torch_dist_process_manager, world_size):
+    """Does AsyncLL work at this capacity WITHOUT any flip? See the worker."""
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_asyncll_no_flip_at_capacity, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
