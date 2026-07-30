@@ -257,6 +257,11 @@ void RecordPostRefused() {
   CensusData().postsRefused += 1;
 }
 
+void RecordEndpointsReaped(std::size_t n) {
+  std::lock_guard<std::mutex> lock(CensusMu());
+  CensusData().endpointsReaped += n;
+}
+
 uint64_t MakeNotifSendWrId(TransferUniqueId id) {
   if ((id & kNotifSendWrIdTag) != 0) {
     MORI_IO_ERROR("MakeNotifSendWrId: TransferUniqueId {} has bit 63 set; masking reserved tag",

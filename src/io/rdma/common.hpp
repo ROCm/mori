@@ -202,10 +202,18 @@ struct DeregQuiesceCensus {
   std::size_t quiesceTimedOut{0};   // ...and it gave up and deregistered anyway
   std::size_t postsRefused{0};      // a post was refused because the gate shut
   std::size_t maxInflightAtQuiesce{0};
+  // REVIEW_M #72-2. Retired endpoint runtimes dropped out of the CQ poll set by
+  // ReapRetiredEndpoints. Counted here rather than as a fresh instrument
+  // because the reap and the barrier are the same kind of claim -- "a cleanup
+  // that must be shown to have RUN, not just to have compiled" -- and every
+  // test that asserts on one already reads this struct. Structurally 0 before
+  // the reap existed, which is what makes an assertion on it two-sided.
+  std::size_t endpointsReaped{0};
 };
 DeregQuiesceCensus GetDeregQuiesceCensus();
 void RecordQuiesce(int inflightAtClose, bool drained);
 void RecordPostRefused();
+void RecordEndpointsReaped(std::size_t n);
 
 struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)

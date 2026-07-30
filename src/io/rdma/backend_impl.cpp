@@ -522,6 +522,7 @@ std::size_t RdmaManager::ReapRetiredEndpoints() {
       ++it;
     }
   }
+  if (reaped > 0) RecordEndpointsReaped(reaped);
   return reaped;
 }
 

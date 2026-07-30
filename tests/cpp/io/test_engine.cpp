@@ -1068,6 +1068,14 @@ void CaseRdmaTransferSurvivesConcurrentDeregister() {
   ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_dereg_race", true);
   auto src = RegisterGpuMemory(pair.initiator.get(), 4096, 0);
 
+  // REVIEW_M #72-2. This case is where QPs actually die -- T37 measured 768
+  // distinct qp_num over its 24 cycles -- so it is the only place the reap can
+  // be observed without inventing a second fault injector.
+  auto* raceBackend = dynamic_cast<RdmaBackend*>(pair.initiator->GetBackend(BackendType::RDMA));
+  Require(raceBackend != nullptr, "initiator must have an RDMA backend to read retention from");
+  DeregQuiesceCensus reapBase = GetDeregQuiesceCensus();
+  std::size_t runtimesBase = raceBackend->GetRemoteRetentionStats().numEndpointRuntimes;
+
   // Many SHORT-LIVED remote registrations: each cycle warms a session keyed on
   // that memory id, then deregisters it while a transfer against it is in
   // flight. Distinct ids per cycle is what makes each erase hit a live entry
@@ -1141,6 +1149,50 @@ void CaseRdmaTransferSurvivesConcurrentDeregister() {
           "post-race transfer failed: " + good.Message());
   std::printf("[dereg-race] %d transfers across %d deregister cycles, engine still serving\n",
               transfersIssued.load(), deregsDone.load());
+
+  // REVIEW_M #72-2, the two arms it asks for: that retired endpoints are REAPED
+  // out of the CQ poll set, and that `numEndpointRuntimes` is FLAT rather than
+  // growing one entry per dead QP forever.
+  //
+  // The reap is asynchronous by design (the poll thread does it, gated on the
+  // ledger draining), so give it bounded time rather than sampling once and
+  // racing it. Polling to a deadline is the honest form here: a fixed sleep
+  // either flakes or hides a reap that never happens.
+  DeregQuiesceCensus reapAfter = GetDeregQuiesceCensus();
+  std::size_t runtimesAfter = runtimesBase;
+  for (int waited = 0; waited < 5000; waited += 50) {
+    reapAfter = GetDeregQuiesceCensus();
+    runtimesAfter = raceBackend->GetRemoteRetentionStats().numEndpointRuntimes;
+    if (reapAfter.endpointsReaped > reapBase.endpointsReaped &&
+        runtimesAfter <= runtimesBase + static_cast<std::size_t>(kCycles)) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  std::printf("[reap] endpointsReaped %zu -> %zu; numEndpointRuntimes %zu -> %zu over %d cycles\n",
+              reapBase.endpointsReaped, reapAfter.endpointsReaped, runtimesBase, runtimesAfter,
+              kCycles);
+
+  // Arm 1, NON-VACUITY and the red side: pre-fix this is structurally 0,
+  // because ReapRetiredEndpoints did not exist and endpointsById_ had no erase
+  // anywhere in src/io. A run where it stays 0 has either not killed a QP or
+  // not reaped one, and either way the flat assertion below would be vacuous.
+  Require(reapAfter.endpointsReaped > reapBase.endpointsReaped,
+          "VACUOUS: no endpoint was reaped across " + std::to_string(kCycles) +
+              " deregister cycles, so this run does not show the poll set being drained "
+              "(endpointsReaped stayed at " + std::to_string(reapBase.endpointsReaped) + ")");
+
+  // Arm 2, the actual regression guard. Bound rather than equality: this case
+  // legitimately BUILDS endpoints too (every rebuilt session after a retirement
+  // adds one), so the invariant that matters is that the poll set does not grow
+  // WITH THE NUMBER OF DEAD QPS. T37 measured 768 distinct qp_num here; without
+  // the reap the map ends up holding on that order, and NotifManager::MainLoop
+  // walks all of them every round. kCycles is the generous headroom for the
+  // live endpoints a single trailing session needs.
+  Require(runtimesAfter <= runtimesBase + static_cast<std::size_t>(kCycles),
+          "the CQ poll set grew with the number of retired QPs: numEndpointRuntimes " +
+              std::to_string(runtimesBase) + " -> " + std::to_string(runtimesAfter) + " over " +
+              std::to_string(kCycles) + " cycles. Every entry is an ibv_poll_cq per round.");
 }
 
 // T37 UPDATE — the case above is now GREEN, and the fix is d862b1c5. Read the
