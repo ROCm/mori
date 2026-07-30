@@ -22,9 +22,11 @@
 # SOFTWARE.
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
-# Standalone cross-node AllGather perf (no compute): per size, time one AllGather,
-# report ms + algorithmic GB/s for RCCL vs one mori handle
-# (--handle hostproxy=hp_sdma | device=ibgda_sdma). Bit-exact gate.
+# Standalone cross-node AllGather perf (no compute): per size, time one mori
+# AllGather (--handle hostproxy=hp_sdma | device=ibgda_sdma) and report ms +
+# algorithmic GB/s. Bit-exact gate against a locally-computed reference (the
+# rank-major concat of each rank's deterministic input) -- no RCCL collective, so
+# the check does not depend on RCCL's cross-node RoCE bring-up.
 import argparse
 import os
 import sys
@@ -97,16 +99,19 @@ def _worker(rank, ws, rpn, device, mode, sizes_mb, reps, warmup):
             numel = (mb * 1024 * 1024) // 4
             inp = torch.arange(numel, device=device, dtype=torch.float32) + rank * 131.0
             om = torch.empty(numel * ws, dtype=torch.float32, device=device)
-            orf = torch.empty(numel * ws, dtype=torch.float32, device=device)
-            dist.all_gather_into_tensor(orf, inp)
+            # Reference is computed locally, not via RCCL: AllGather output is the
+            # rank-major concatenation of each rank's deterministic input
+            # (arange(numel) + r*131), so we can materialize the exact expected
+            # tensor on-device without any collective. This keeps the smoke test
+            # from depending on RCCL's cross-node RoCE bring-up (which is a
+            # separate concern from mori's own transport).
+            base = torch.arange(numel, device=device, dtype=torch.float32)
+            ref = torch.cat([base + r * 131.0 for r in range(ws)])
             assert h(inp, om, numel, main)
             main.synchronize()
             torch.cuda.synchronize()
-            bx = bool(torch.equal(om, orf))
+            bx = bool(torch.equal(om, ref))
             assert bx, f"bitexact MISMATCH {mb}MB"
-            r_ms = _time_ms(
-                lambda: (dist.all_gather_into_tensor(orf, inp)), reps, warmup
-            )
             m_ms = _time_ms(
                 lambda: (h(inp, om, numel, main), main.synchronize()),  # noqa: F821
                 reps,
@@ -115,17 +120,17 @@ def _worker(rank, ws, rpn, device, mode, sizes_mb, reps, warmup):
             out_gb = numel * ws * 4 / 1e9
             if rank == 0:
                 print(
-                    f"[ag-perf] {mb}MB | rccl={r_ms:.3f}ms ({out_gb/r_ms*1e3:.1f}GB/s) "
+                    f"[ag-perf] {mb}MB | "
                     f"{tag}={m_ms:.3f}ms ({out_gb/m_ms*1e3:.1f}GB/s) | bitexact={bx}"
                 )
-                rows.append((mb, r_ms, m_ms))
+                rows.append((mb, m_ms))
             dist.barrier()
         if rank == 0:
             os.makedirs(_LOGS, exist_ok=True)
             with open(os.path.join(_LOGS, f"ag_perf_{tag}.csv"), "w") as f:
-                f.write("size_mb,rccl_ms,%s_ms\n" % tag)
+                f.write("size_mb,%s_ms\n" % tag)
                 for r in rows:
-                    f.write("%d,%.4f,%.4f\n" % r)
+                    f.write("%d,%.4f\n" % r)
             print(f"[ag-perf] wrote {_LOGS}/ag_perf_{tag}.csv")
     finally:
         torch.cuda.synchronize()
@@ -151,9 +156,11 @@ def main():
     rpn = int(os.environ.get("LOCAL_WORLD_SIZE", ws))
     torch.cuda.set_device(lr)
     device = torch.device(f"cuda:{lr}")
-    dist.init_process_group(
-        backend="cpu:gloo,cuda:nccl", rank=rank, world_size=ws, device_id=device
-    )
+    # No device_id= here: passing it makes NCCL eager-connect every rank pair at
+    # init (cross-node RoCE QP bring-up). This smoke test never issues an NCCL
+    # collective (the reference is computed locally), so keep NCCL lazy -- barriers
+    # ride gloo -- and let mori's own transport be the only cross-node path.
+    dist.init_process_group(backend="cpu:gloo,cuda:nccl", rank=rank, world_size=ws)
     torch._C._distributed_c10d._register_process_group(
         "default", torch.distributed.group.WORLD
     )

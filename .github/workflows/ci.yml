@@ -801,8 +801,10 @@ jobs:
       - name: MORI-CCL internode hier allgather bit-exact smoke
         run: |
           # world=16 (2 node x 8 GPU) hierarchical AllGather: intra-node SDMA +
-          # inter-node RDMA, asserted byte-for-byte vs all_gather_into_tensor.
-          # Both inter-node legs: device = IBGDA (GPU-posted), hostproxy = CPU-posted.
+          # inter-node RDMA, asserted byte-for-byte against a locally-computed
+          # reference (no RCCL collective -> no dependency on RCCL's cross-node
+          # RoCE bring-up). Both inter-node legs: device = IBGDA (GPU-posted),
+          # hostproxy = CPU-posted.
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_ccl_ag.sh"
           PORT=29200
           for HANDLE in device hostproxy; do
