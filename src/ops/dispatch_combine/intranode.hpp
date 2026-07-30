@@ -1596,7 +1596,24 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   const size_t scaleBytes =
       UseFp8BlockwiseQuant ? static_cast<size_t>(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
                            : 0;
+// MORI_DISP_TDM is required, not incidental: the TDM header and the TdmShape/TdmIssue* helpers are
+// declared under it (top of this file), and it is part of the base environment anyway.
+#if defined(MORI_COMB_TDM) && defined(MORI_DISP_TDM) && \
+    (defined(__gfx1250__) || defined(__gfx1251__))
+  // A TDM store needs its destination on a 128B row boundary, and what decides that for slot k is
+  // the slot stride: hidden 7168 bf16 + 8 weights = 14368 B is only 32B-aligned, so every other slot
+  // would land off-row. Round the stride up to 128B. Safe against the allocation only while it stays
+  // under the host's per-slot reservation MaxXferBytesPerToken() (hidden + index + weight + srcTokId
+  // + scale; 14532 at this config, so 14464 fits) -- when it does not fit, keep the packed stride and
+  // the push below falls back to WarpCopy. Both the push and the reduce read this one constant, so
+  // the padded layout never leaves this kernel.
+  const size_t combXferPacked = hiddenBytes + scaleBytes + weightBytes;
+  const size_t combXferPadded = (combXferPacked + 127) & ~(size_t)127;
+  const size_t combXferBytes =
+      (combXferPadded <= config.MaxXferBytesPerToken()) ? combXferPadded : combXferPacked;
+#else
   const size_t combXferBytes = hiddenBytes + scaleBytes + weightBytes;
+#endif
 
   if constexpr (EnableStdMoE) {
 #ifdef ENABLE_STANDARD_MOE_ADAPT
@@ -1679,6 +1696,43 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
     }
 #else
+#if defined(MORI_COMB_TDM) && defined(MORI_DISP_TDM) && \
+    (defined(__gfx1250__) || defined(__gfx1251__))
+    // ---- TDM push, same shape as the dispatch payload phase (Phase 3b) ----
+    // One TDM load stages the token into a per-warp LDS tile, one TDM store lands it in the peer's
+    // slot. The tile cannot be skipped (TDM only sources LDS) and it is also what buys the win:
+    // cross-card per-lane stores are latency-bound, which is what held METAVEC to 995.5 GB/s and made
+    // SRCVEC worse when widened (§8), while TDM measures ~1580 at this geometry.
+    // One structural difference from dispatch caps the upside: a combine token has exactly ONE
+    // destination (the rank it came from), so this is 1-load:1-store and cannot amortize the load
+    // across topk peers the way dispatch's payload does.
+    // Chunking: combine's best geometry is wpb=32, where 32 full 14KB token tiles would want 458KB
+    // against a 320KB LDS budget. So a token ships in MORI_COMB_TDM chunks (=2 -> 7KB/warp -> 229KB).
+    // _combine_shared_mem() in dispatch_combine.py sizes the tile with this same formula.
+    constexpr int _cChunks = ((MORI_COMB_TDM) > 0) ? (MORI_COMB_TDM) : 1;
+    constexpr bool _cTdmType = std::is_same_v<T, TokT> && !UseFp8BlockwiseQuant &&
+                               (sizeof(TokT) == 2 || sizeof(TokT) == 4);
+    const int _cRowElems = 128 / (int)sizeof(TokT);  // elements in one legal 128B TDM row
+    const int _cTileElems =
+        (((int)((hiddenDim + _cChunks - 1) / _cChunks) + _cRowElems - 1) / _cRowElems) * _cRowElems;
+    // A slot stride that could not be padded to 128B, or a hidden dim below one row, leaves nothing
+    // for TDM to express -- those fall back to WarpCopy per token below.
+    const bool _cTdmOk = _cTdmType && ((combXferBytes & (size_t)127) == 0) &&
+                         ((int)hiddenDim >= _cRowElems);
+    extern __shared__ char sharedMem[];
+    constexpr int _cPtrArrays = 1 + (UseWeights ? 1 : 0) + (UseFp8BlockwiseQuant ? 1 : 0);
+    // Round past the pointer arrays to 128B. dispatch never had to: its tile sits at LDS offset 0
+    // and steps by hiddenDim*2 B per warp, so it is always 128B-phased. Here the tile follows the
+    // pointer arrays, whose size (arrays*warpNum*topk*8) is only 64B-aligned for e.g. warpNum=1,
+    // and 128B is both the TDM row size and the granularity every other alignment here is stated in.
+    const size_t _cTileBase =
+        (((size_t)_cPtrArrays * warpNum * config.numExpertPerToken * sizeof(void*)) + 127) &
+        ~(size_t)127;
+    TokT* _cTile = reinterpret_cast<TokT*>(sharedMem + _cTileBase) + (size_t)warpId * _cTileElems;
+    // A store issued but not yet drained still owns the tile. Kept across tokens so the drain can be
+    // deferred to the point it is actually needed (see the chunk loop).
+    bool _cPend = false;
+#endif
     for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
       index_t destTokId = localSrcMap[tokenIdx];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
@@ -1696,8 +1750,45 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                                                   args.inpTokenBuf + tokenIdx * hiddenDim,
                                                   hiddenDim, laneId);
       } else {
-        core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
-                       args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim);
+#if defined(MORI_COMB_TDM) && defined(MORI_DISP_TDM) && \
+    (defined(__gfx1250__) || defined(__gfx1251__))
+        // if constexpr for the same reason as the pull path: a plain if instantiates the body for
+        // every TokT the kernel is built with, including ones TDM cannot express. This one happens to
+        // compile for all of them today, so the guard is here to keep it that way, not to fix a break.
+        bool _pushDone = false;
+        if constexpr (_cTdmType) {
+          if (_cTdmOk) {
+          TokT* _dst = reinterpret_cast<TokT*>(destStagingPtr);
+          TokT* _src = reinterpret_cast<TokT*>(args.inpTokenBuf) + (size_t)tokenIdx * hiddenDim;
+          for (int _off = 0; _off < (int)hiddenDim; _off += _cTileElems) {
+            int _n = (int)hiddenDim - _off;
+            if (_n > _cTileElems) _n = _cTileElems;
+            if ((size_t)_n * sizeof(TokT) < 128) {
+              core::WarpCopy(_dst + _off, _src + _off, _n);  // tail below one legal TDM row
+              continue;
+            }
+            const gfx1250_TDM_GROUP1 _g1 = TdmShape<TokT>(_n);
+            // Drain the previous store only here, where the tile is about to be overwritten -- the
+            // one place it is actually required. dispatch does the same with its meta stores (§8:
+            // mSt measures issue only, the wait lands in mDrain), which is what lets the weights copy
+            // below and the next token's index math overlap a store still in flight. Waiting right
+            // after the issue instead would expose the full ~3.4us cross-card latency per chunk.
+            if (_cPend) {
+              __builtin_amdgcn_s_wait_tensorcnt(0);
+              _cPend = false;
+            }
+            TdmIssueLoad<TokT>(_cTile, _src + _off, _g1);
+            __builtin_amdgcn_s_wait_tensorcnt(0);
+            TdmIssueStore<TokT>(_dst + _off, _cTile, _g1);
+            _cPend = true;
+          }
+          _pushDone = true;
+          }
+        }
+        if (!_pushDone)
+#endif
+          core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
+                         args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim);
       }
       if constexpr (UseWeights) {
         if (args.weightsBuf) {
@@ -1707,6 +1798,13 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         }
       }
     }
+#if defined(MORI_COMB_TDM) && defined(MORI_DISP_TDM) && \
+    (defined(__gfx1250__) || defined(__gfx1251__))
+    // Mandatory: the deferred drain above only runs when a warp has another chunk to send, so the
+    // last store of every warp can still be in flight here. The cross-device barrier below orders
+    // memory, not the TDM engine, so without this a peer could read a half-written slot.
+    if (_cPend) __builtin_amdgcn_s_wait_tensorcnt(0);
+#endif
 #endif
   }
 
@@ -1742,6 +1840,45 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
   assert(config.numExpertPerToken < warpSize);
 
+#if defined(MORI_COMB_TDM) && defined(MORI_DISP_TDM) && \
+    (defined(__gfx1250__) || defined(__gfx1251__))
+  // ---- TDM pull, the P2P-read counterpart of the TDM push above ----
+  // Here the cross-card traffic is the gather, not the send: srcPtrs[] point into up to topk PEER
+  // buffers and the default path reads them with 16B per-lane vector loads. This variant instead
+  // TDM-loads each source's chunk into its own per-warp LDS tile, issues ALL of them before waiting
+  // (so topk TDM ops are in flight, which is the same intent as the load-first gather it replaces),
+  // then accumulates out of LDS in fp32 -- matching WarpAccumLF's fp32 accumulate so the numerics
+  // stay comparable.
+  //
+  // A peer VA on the global side of tensor_load_to_lds is established, not assumed: TDM_USAGE.md §7
+  // measures peer-READ (remote HBM -> local LDS) at 405-424 GB/s per card pair with a PASS check,
+  // in both directions, on an unmodified kernel. So this direction is legal; what is open is only
+  // whether it beats the vector gather it replaces.
+  //
+  // LDS: topk tiles per warp, so wpb * topk * chunkElems * sizeof(T) must fit the 320KB budget.
+  // At wpb=32/topk=8/bf16 that caps chunkElems at ~620, i.e. MORI_COMB_TDM>=14 for hidden 7168.
+  // _combine_shared_mem() in dispatch_combine.py sizes this and rejects a combination that overflows.
+  constexpr int _cPullChunks = ((MORI_COMB_TDM) > 0) ? (MORI_COMB_TDM) : 1;
+  constexpr bool _cPullType = UseP2PRead && std::is_same_v<T, TokT> && !UseFp8BlockwiseQuant &&
+                              (sizeof(TokT) == 2 || sizeof(TokT) == 4);
+  const int _cPullRowElems = 128 / (int)sizeof(TokT);
+  const int _cPullTileElems = (((int)((hiddenDim + _cPullChunks - 1) / _cPullChunks) +
+                                _cPullRowElems - 1) /
+                               _cPullRowElems) *
+                              _cPullRowElems;
+  const bool _cPullOk = _cPullType && ((int)hiddenDim >= _cPullRowElems);
+  TokT* _cPullTiles = nullptr;
+  if constexpr (_cPullType) {
+    constexpr int _cPullPtrArrays = 1 + (UseWeights ? 1 : 0) + (UseFp8BlockwiseQuant ? 1 : 0);
+    // 128B for the TDM row, which also covers the 16B lane loads the accumulate below uses.
+    const size_t _cPullBase = (((size_t)_cPullPtrArrays * warpNum * config.numExpertPerToken *
+                                sizeof(void*)) +
+                               127) &
+                              ~(size_t)127;
+    _cPullTiles = reinterpret_cast<TokT*>(sharedMem + _cPullBase) +
+                  (size_t)warpId * config.numExpertPerToken * _cPullTileElems;
+  }
+#endif
   for (int i = globalWarpId; i < (args.curRankNumToken * mwIter.warpsPerItem); i += globalWarpNum) {
     int tokenId, inTokenPartId;
     size_t hiddenDimOffset, hiddenDimSize;
@@ -1865,9 +2002,98 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                                               validAccumCount, laneId, hiddenDimSize);
     } else {
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
-      // 16B vec load + load-first/unroll gather (v2-style): keep AccumNum*Unroll
-      // remote peer reads in flight to hide CCO/xGMI latency (gfx1250 combine).
-      core::WarpAccumLF<T, 16>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
+#if defined(MORI_COMB_TDM) && defined(MORI_DISP_TDM) && \
+    (defined(__gfx1250__) || defined(__gfx1251__))
+      // if constexpr, not a plain if: this body is only well-formed for a 2/4-byte T==TokT. A runtime
+      // if still instantiates it for every TokT the kernel is built with, and the fp4 combine
+      // instantiation (TokT = mori_fp4x2_e2m1, 1 byte) has no conversion to float -- which is exactly
+      // how the compile gate failed. _cPullOk stays a runtime check for the shape/alignment part.
+      bool _pullDone = false;
+      if constexpr (_cPullType) {
+        if (_cPullOk) {
+        const int _nSrc = (int)validAccumCount;
+        for (size_t _off = 0; _off < hiddenDimSize; _off += _cPullTileElems) {
+          int _n = (int)(hiddenDimSize - _off);
+          if (_n > _cPullTileElems) _n = _cPullTileElems;
+          if ((size_t)_n * sizeof(TokT) < 128) {
+            // Tail below one legal TDM row. It cannot go to WarpAccumLF: that indexes srcs[i] from 0,
+            // so it would re-read the head of the segment instead of this tail. Direct scalar gather.
+            for (int _e = laneId; _e < _n; _e += warpSize) {
+              float _acc = 0.0f;
+              for (int _j = 0; _j < _nSrc; ++_j) {
+                if (srcPtrs[_j] == nullptr) continue;
+                _acc += (float)(srcPtrs[_j][_off + _e]);
+              }
+              outPtr[_off + _e] = T(_acc);
+            }
+            break;
+          }
+          const gfx1250_TDM_GROUP1 _pg1 = TdmShape<TokT>(_n);
+          for (int _j = 0; _j < _nSrc; ++_j) {
+            if (srcPtrs[_j] == nullptr) continue;
+            TdmIssueLoad<TokT>(_cPullTiles + (size_t)_j * _cPullTileElems, srcPtrs[_j] + _off, _pg1);
+          }
+          __builtin_amdgcn_s_wait_tensorcnt(0);
+          // Unlike the dispatch payload loop, where the TDM engine both writes and re-reads the tile,
+          // here the LANES read what the engine wrote. Fence so neither the compiler nor LDS ordering
+          // lets those reads float above the wait. TDM_USAGE.md §4 advises __syncthreads() for this,
+          // but that is for a tile shared across a block; s_wait_tensorcnt is a wave-level scalar wait
+          // and every lane reading here is in the wave that issued the load, so block scope is not
+          // needed -- and must be avoided, since this loop is not reached uniformly across the block.
+          __threadfence_block();
+          // Vectorised on purpose: the gather this replaces moves 16B per lane (WarpAccumLF<T,16>),
+          // so a 2-byte scalar loop here would add 8x the LDS instructions and the measurement would
+          // report this loop rather than the transport. fp32 accumulate matches WarpAccumLF.
+          constexpr int _cVB = 16;
+          constexpr int _cV = _cVB / (int)sizeof(TokT);
+          using _CVecT = typename core::VecTypeSelector<_cVB>::dataType;
+          const bool _cVecOk = ((hiddenDim % (size_t)_cV) == 0) &&
+                               ((hiddenDimOffset % (size_t)_cV) == 0) &&
+                               ((_cPullTileElems % _cV) == 0);
+          const int _nv = _cVecOk ? (_n / (warpSize * _cV)) * (warpSize * _cV) : 0;
+          for (int _e = laneId * _cV; _e < _nv; _e += warpSize * _cV) {
+            float _a[_cV];
+#pragma unroll
+            for (int _k = 0; _k < _cV; ++_k) _a[_k] = 0.0f;
+            for (int _j = 0; _j < _nSrc; ++_j) {
+              if (srcPtrs[_j] == nullptr) continue;
+              // Dereferenced directly rather than through core::load<16>: that takes a const void*,
+              // which addrspacecasts the LDS pointer to generic and leaves it to InferAddressSpaces
+              // to recover ds_read_b128 instead of a flat_load. Keeping the typed addrspace(3)
+              // pointer makes it unconditional. The 16B alignment it needs is why the tile base is
+              // rounded to 128B above. The global store below keeps core::load/store's nontemporal
+              // path, which is what WarpAccumLF uses and is right for the output.
+              _CVecT _sv =
+                  *reinterpret_cast<const _CVecT*>(_cPullTiles + (size_t)_j * _cPullTileElems + _e);
+#pragma unroll
+              for (int _k = 0; _k < _cV; ++_k)
+                _a[_k] += (float)(reinterpret_cast<const TokT*>(&_sv)[_k]);
+            }
+            union {
+              _CVecT _ov;
+              TokT _oe[_cV];
+            };
+#pragma unroll
+            for (int _k = 0; _k < _cV; ++_k) _oe[_k] = T(_a[_k]);
+            core::store<_cVB>(outPtr + _off + _e, _ov);
+          }
+          for (int _e = _nv + laneId; _e < _n; _e += warpSize) {
+            float _acc = 0.0f;
+            for (int _j = 0; _j < _nSrc; ++_j) {
+              if (srcPtrs[_j] == nullptr) continue;
+              _acc += (float)(_cPullTiles[(size_t)_j * _cPullTileElems + _e]);
+            }
+            outPtr[_off + _e] = T(_acc);
+          }
+        }
+          _pullDone = true;
+        }
+      }
+      if (!_pullDone)
+#endif
+        // 16B vec load + load-first/unroll gather (v2-style): keep AccumNum*Unroll
+        // remote peer reads in flight to hide CCO/xGMI latency (gfx1250 combine).
+        core::WarpAccumLF<T, 16>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
     }
 
     if constexpr (UseWeights) {

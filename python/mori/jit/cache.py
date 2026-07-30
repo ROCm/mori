@@ -116,6 +116,13 @@ def get_cache_dir(
         if os.environ.get("MORI_DISP_FASTDEDUP", "").lower() in ("1", "true", "on", "yes")
         else ""
     )
+    # -DMORI_COMB_TDM=N changes the combine push path AND its chunk count, so N is part of the key.
+    _comb_tdm = os.environ.get("MORI_COMB_TDM", "").strip().lower()
+    combtdm_suffix = (
+        f"_combtdm{int(_comb_tdm) if _comb_tdm.isdigit() else 2}"
+        if _comb_tdm not in ("", "0", "false", "off", "no")
+        else ""
+    )
     # Deletion diagnostics (wrong results on purpose) and the meta shape histogram.
     diag_suffix = "".join(
         f"_{n.lower()}"
@@ -124,7 +131,7 @@ def get_cache_dir(
     )
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{fastdedup_suffix}{diag_suffix}{cntstep_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{fastdedup_suffix}{combtdm_suffix}{diag_suffix}{cntstep_suffix}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)

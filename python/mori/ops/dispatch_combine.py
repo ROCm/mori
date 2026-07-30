@@ -662,12 +662,55 @@ class EpDispatchCombineOp:
         num_ptr_arrays = 1 + int(bool(use_weights))
         if quant_type in _BLOCKWISE_COMBINE_QUANT_TYPES:
             num_ptr_arrays += 1
-        return (
+        base = (
             warp_per_block
             * self.config.num_experts_per_token
             * num_ptr_arrays
             * _PTR_SIZE
         )
+        # MORI_COMB_TDM=N routes the combine token through TDM, which needs per-warp LDS tiles holding
+        # one chunk of a token. The kernel places them right AFTER the pointer arrays above, so this
+        # is a sum and not a max, and chunk_elems must match _cTileElems/_cPullTileElems in
+        # intranode.hpp: chunk rounded up to a whole 128B TDM row.
+        #
+        # The two transports need different tile counts, and which one is compiled follows the same
+        # flag that picks the kernel: use_external_inp_buf=True -> _nop2p -> PUSH (one tile per warp,
+        # staged then TDM-stored to the peer); False -> _p2p -> PULL (one tile per source, all topk
+        # loads issued before the wait).
+        #
+        # Blockwise-quant combine is excluded because the kernel gates TDM on
+        # !UseFp8BlockwiseQuant -- allocating a tile there would only shrink occupancy, and could
+        # trip the budget check below on a configuration that never runs TDM at all.
+        _comb_tdm = os.environ.get("MORI_COMB_TDM", "").strip().lower()
+        if (
+            _comb_tdm not in ("", "0", "false", "off", "no")
+            and quant_type not in _BLOCKWISE_COMBINE_QUANT_TYPES
+        ):
+            chunks = int(_comb_tdm) if _comb_tdm.isdigit() and int(_comb_tdm) > 0 else 2
+            elem = int(self.config.max_token_type_size)
+            row_elems = 128 // elem
+            hidden = int(self.config.hidden_dim)
+            chunk_elems = -(-hidden // chunks)
+            chunk_elems = -(-chunk_elems // row_elems) * row_elems
+            tiles_per_warp = (
+                1
+                if self.config.use_external_inp_buf
+                else int(self.config.num_experts_per_token)
+            )
+            tile_bytes = warp_per_block * tiles_per_warp * chunk_elems * elem
+            # The kernel rounds past the pointer arrays to 128B (TDM row) before the first tile.
+            total = ((base + 127) & ~127) + tile_bytes
+            # gfx1250 measured LDS budget is 327680 B per block. Overflowing it fails the launch with
+            # an opaque error, so say which knob to turn instead.
+            if total > 327680:
+                raise ValueError(
+                    f"MORI_COMB_TDM={chunks} needs {total} B of LDS for combine "
+                    f"(warp_per_block={warp_per_block}, tiles/warp={tiles_per_warp}, "
+                    f"chunk_elems={chunk_elems}) but the budget is 327680 B. "
+                    f"Raise MORI_COMB_TDM (smaller chunks) or lower warp_per_block."
+                )
+            base = total
+        return base
 
     def _launch(self, func_name, grid, block, shared_mem, stream, args_ptr):
         func = self._get_func(func_name)

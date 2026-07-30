@@ -293,6 +293,35 @@ def _disp_tdm_defines() -> list[str]:
     return ["-DMORI_DISP_TDM"] if val.lower() in ("1", "true", "on", "yes") else []
 
 
+def _comb_tdm_defines() -> list[str]:
+    """-DMORI_COMB_TDM=N sends the COMBINE token push through the gfx1250 TDM engine instead of
+    per-lane cross-card WarpCopy, reusing the shape the dispatch payload phase already proved (one
+    TDM load into a per-warp LDS tile, one TDM store into the peer's slot).
+
+    N is the number of chunks a token is split into, because the tile has to fit LDS: combine's best
+    geometry is warp_per_block=32, where 32 full 14KB tiles (hidden 7168 bf16) would want 458KB
+    against gfx1250's 320KB budget. N=2 gives 7KB/warp -> 229KB and is the default when the env value
+    is not a number. _combine_shared_mem() in ops/dispatch_combine.py must size the tile with the
+    same formula, so keep the two in sync.
+
+    Both combine transports are wired to this one gate so they can be compared later:
+      * `_nop2p` (UseP2PRead=false, use_external_inp_buf=True i.e. --zero-copy 0) -> PUSH: one TDM
+        load into a per-warp tile, one TDM store into the peer's slot. One tile per warp.
+      * `_p2p` (UseP2PRead=true, --zero-copy 1) -> PULL: the gather reads become topk TDM loads from
+        the peers into one tile per source, all issued before a single wait, then fp32 accumulate out
+        of LDS. Needs topk tiles per warp, so it wants a much larger N than the push path.
+    PUSH cannot run in the zero-copy layout (there the combine input buffer IS the peer's staging
+    buffer, so pushing would clobber the peer's own input), which is why the transport follows the
+    same flag that picks the kernel rather than being independently selectable. Default OFF."""
+    val = os.environ.get("MORI_COMB_TDM", "").strip().lower()
+    if val in ("", "0", "false", "off", "no"):
+        return []
+    chunks = 2
+    if val.isdigit() and int(val) > 0:
+        chunks = int(val)
+    return [f"-DMORI_COMB_TDM={chunks}"]
+
+
 def _disp_clean_defines() -> list[str]:
     """Kernel body selector: -DMORI_DISP_CLEAN builds the legacy clean IntraNode dispatch body
     (EpDispatchIntraNodeKernel_clean_body, default geometry 256 blocks x 16 warps) instead of the
@@ -507,6 +536,7 @@ def _hipcc_genco(
         *_profiler_defines(),
         *_ocp_fp_defines(cfg.arch),
         *_disp_tdm_defines(),
+        *_comb_tdm_defines(),
         *_disp_timing_defines(),
         *_disp_clean_defines(),
         *_disp_nophase_defines(),
