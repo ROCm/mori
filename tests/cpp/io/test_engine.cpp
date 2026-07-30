@@ -1075,6 +1075,11 @@ void CaseRdmaTransferSurvivesConcurrentDeregister() {
   Require(raceBackend != nullptr, "initiator must have an RDMA backend to read retention from");
   DeregQuiesceCensus reapBase = GetDeregQuiesceCensus();
   std::size_t runtimesBase = raceBackend->GetRemoteRetentionStats().numEndpointRuntimes;
+  // REVIEW_M #74-2: the arm above tracks `endpointsById_`, which is the map the
+  // previous commit fixed -- asserting only on it means the green tracks the
+  // field that got fixed. `numRegisteredRuntimes` is the NotifManager registry,
+  // and it is the one that is populated at sglang's enableNotification=false.
+  std::size_t registeredBase = raceBackend->GetRemoteRetentionStats().numRegisteredRuntimes;
 
   // Many SHORT-LIVED remote registrations: each cycle warms a session keyed on
   // that memory id, then deregisters it while a transfer against it is in
@@ -1160,18 +1165,23 @@ void CaseRdmaTransferSurvivesConcurrentDeregister() {
   // either flakes or hides a reap that never happens.
   DeregQuiesceCensus reapAfter = GetDeregQuiesceCensus();
   std::size_t runtimesAfter = runtimesBase;
+  std::size_t registeredAfter = registeredBase;
   for (int waited = 0; waited < 5000; waited += 50) {
     reapAfter = GetDeregQuiesceCensus();
-    runtimesAfter = raceBackend->GetRemoteRetentionStats().numEndpointRuntimes;
+    auto st = raceBackend->GetRemoteRetentionStats();
+    runtimesAfter = st.numEndpointRuntimes;
+    registeredAfter = st.numRegisteredRuntimes;
     if (reapAfter.endpointsReaped > reapBase.endpointsReaped &&
-        runtimesAfter <= runtimesBase + static_cast<std::size_t>(kCycles)) {
+        runtimesAfter <= runtimesBase + static_cast<std::size_t>(kCycles) &&
+        registeredAfter <= registeredBase + static_cast<std::size_t>(kCycles)) {
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
-  std::printf("[reap] endpointsReaped %zu -> %zu; numEndpointRuntimes %zu -> %zu over %d cycles\n",
+  std::printf("[reap] endpointsReaped %zu -> %zu; numEndpointRuntimes %zu -> %zu; "
+              "numRegisteredRuntimes %zu -> %zu over %d cycles\n",
               reapBase.endpointsReaped, reapAfter.endpointsReaped, runtimesBase, runtimesAfter,
-              kCycles);
+              registeredBase, registeredAfter, kCycles);
 
   // Arm 1, NON-VACUITY and the red side: pre-fix this is structurally 0,
   // because ReapRetiredEndpoints did not exist and endpointsById_ had no erase
@@ -1193,6 +1203,21 @@ void CaseRdmaTransferSurvivesConcurrentDeregister() {
           "the CQ poll set grew with the number of retired QPs: numEndpointRuntimes " +
               std::to_string(runtimesBase) + " -> " + std::to_string(runtimesAfter) + " over " +
               std::to_string(kCycles) + " cycles. Every entry is an ibv_poll_cq per round.");
+
+  // Arm 3, REVIEW_M #74-2, and this is the one that matters in production.
+  // `numEndpointRuntimes` above is RdmaManager's map; `numRegisteredRuntimes`
+  // is NotifManager's, and at `enableNotification=false` -- sglang's config,
+  // conn.py -- the notification path is off, so the RdmaManager map is not the
+  // thing that pins the runtime. Before 495b33c3 `registeredRuntimes_` had no
+  // erase anywhere in src/io, so this ends at ~one entry per dead QP (T39b's
+  // 192) with the QP still alive under each one. Same bound as arm 2 and for
+  // the same reason: live endpoints are legitimately built here too.
+  Require(registeredAfter <= registeredBase + static_cast<std::size_t>(kCycles),
+          "the NOTIFICATION registry grew with the number of retired QPs: "
+          "numRegisteredRuntimes " + std::to_string(registeredBase) + " -> " +
+              std::to_string(registeredAfter) + " over " + std::to_string(kCycles) +
+              " cycles. Each entry holds a live QP (and, with notification on, a pinned "
+              "buffer and an MR) for the life of the process.");
 }
 
 // T37 UPDATE — the case above is now GREEN, and the fix is d862b1c5. Read the
