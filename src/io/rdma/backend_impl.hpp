@@ -124,6 +124,28 @@ class RdmaManager {
   // landing on it. Returns how many route-table entries were removed (0 if it
   // was already retired, so the caller's log is not duplicated per CQE).
   std::size_t RetireEndpoint(EndpointId id);
+  // Reap retired endpoints out of `endpointsById_`, and hence out of the CQ
+  // poll set. RetireEndpoint deliberately does NOT do this (see above): the
+  // poll loop is mid-drain of the flush cascade when it runs, and those
+  // flushed WRs still need their ledger records released so their transfers
+  // report failure instead of hanging. So the erase is DEFERRED to here and
+  // gated on the ledger being empty, which is the point at which the NIC has
+  // nothing left referencing the QP.
+  //
+  // Without this, `endpointsById_` was insert-only for the life of the
+  // process and every retirement permanently added one `ibv_poll_cq` to
+  // NotifManager::MainLoop's per-round walk (backend_impl.cpp, the POLLING
+  // branch snapshots the whole map every round, and sglang runs
+  // PollCqMode::POLLING -- conn.py:370). REVIEW_M #72-2: after 24 flip cycles
+  // T37 measured 768 distinct QPs, i.e. 768 dead CQs polled per round. That
+  // makes it a LATENCY regression on the flip stress, not merely a leak, so
+  // it threatens ACCEPTANCE *Performance* and not just *Robustness*.
+  //
+  // Safe to call from the poll thread itself: the caller iterates a SNAPSHOT
+  // of shared_ptrs, so erasing from the map does not invalidate anything it
+  // holds, and the runtime stays alive until that snapshot is dropped.
+  // Returns how many were reaped.
+  std::size_t ReapRetiredEndpoints();
   // Route-table endpoints for one engine+topo that are NOT QP-fatal.
   int CountUsableEndpoint(EngineKey, TopoKeyPair);
 

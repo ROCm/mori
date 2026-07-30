@@ -258,6 +258,11 @@ class SubmissionLedger {
 
   bool HasOrphaned() const;
 
+  // Outstanding records — Posted plus Orphaned. Zero means the NIC has nothing
+  // left that references this QP, which is the precondition for reaping its
+  // runtime out of the poll set.
+  std::size_t NumRecords() const;
+
  private:
   mutable std::mutex mu_;
   uint64_t nextId_;

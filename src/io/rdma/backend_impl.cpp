@@ -500,6 +500,31 @@ std::size_t RdmaManager::RetireEndpoint(EndpointId id) {
   return removed;
 }
 
+std::size_t RdmaManager::ReapRetiredEndpoints() {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  std::size_t reaped = 0;
+  for (auto it = endpointsById_.begin(); it != endpointsById_.end();) {
+    const auto& rt = it->second;
+    // Three conditions, all necessary:
+    //  - the runtime exists;
+    //  - the QP is retired (qpFatal). A healthy endpoint is never reaped;
+    //  - its ledger is EMPTY. This is what makes the deferral correct rather
+    //    than merely delayed: while records remain, flushed WRs still need
+    //    ProcessOneCqe to release them, and dropping the runtime out of the
+    //    poll set first would leave those transfers hanging forever instead of
+    //    reporting failure -- strictly worse than the leak being fixed.
+    const bool reapable = rt && rt->ep.IsQpFatal() && rt->ep.ledger &&
+                          rt->ep.ledger->NumRecords() == 0;
+    if (reapable) {
+      it = endpointsById_.erase(it);
+      reaped++;
+    } else {
+      ++it;
+    }
+  }
+  return reaped;
+}
+
 EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   std::shared_lock<std::shared_mutex> lock(mu);
   auto remoteIt = remotes.find(engine);
@@ -1005,10 +1030,29 @@ void NotifManager::MainLoop() {
         continue;
       }
       FlushRoundStats roundStats;
+      bool sawRetired = false;
       for (auto& rt : snapshot) {
         roundStats.Merge(rt->id, ProcessOneCqe(rt));
+        if (rt->ep.IsQpFatal()) sawRetired = true;
       }
       EmitFlushSummaryIfNeeded(roundStats);
+      // REVIEW_M #72-2. Drop retired endpoints out of the poll set, but only
+      // when this round actually saw one: ReapRetiredEndpoints takes the
+      // RdmaManager WRITE lock, and this is the hot loop -- taking it
+      // unconditionally every round would serialize the poll thread against
+      // every ConnectEndpoint/CreateSession, which is a worse performance
+      // problem than the one being fixed. `sawRetired` is read off the
+      // snapshot's own shared flags, so it costs nothing when nothing is dead,
+      // which is the steady state.
+      if (sawRetired) {
+        std::size_t reaped = rdma->ReapRetiredEndpoints();
+        if (reaped > 0) {
+          MORI_IO_INFO(
+              "NotifManager: reaped {} retired endpoint runtime(s) out of the CQ poll set; their "
+              "ledgers are drained so nothing outstanding referenced them.",
+              reaped);
+        }
+      }
     }
   }
 }

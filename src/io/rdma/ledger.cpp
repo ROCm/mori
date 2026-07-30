@@ -74,6 +74,11 @@ int SubmissionLedger::ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth) {
   return total;
 }
 
+std::size_t SubmissionLedger::NumRecords() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return records_.size();
+}
+
 bool SubmissionLedger::HasOrphaned() const {
   std::lock_guard<std::mutex> lock(mu_);
   for (const auto& [id, rec] : records_) {
