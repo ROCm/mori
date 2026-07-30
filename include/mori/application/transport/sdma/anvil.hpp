@@ -161,7 +161,7 @@ inline int GetSdmaNumChannels(int defaultVal = 2) {
   const char* env = std::getenv("MORI_SDMA_NUM_CHANNELS");
   if (env != nullptr) {
     int val = std::atoi(env);
-    if (val >= 1) return val;
+    if (val >= 1) return val < kMaxSdmaChannelsPerPair ? val : kMaxSdmaChannelsPerPair;
   }
   return defaultVal;
 }

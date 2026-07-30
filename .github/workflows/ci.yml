@@ -165,6 +165,22 @@ jobs:
             cd $GITHUB_WORKSPACE && MORI_ENABLE_SDMA=1 timeout 300 pytest tests/python/ccl/test_allgather_param_contiguous.py -v
           "
 
+      - name: MORI-CCL (hier allgather offset spec, CPU)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 120 pytest tests/python/ccl/test_hier_allgather_cpu.py -v
+          "
+
+      - name: MORI-CCL (hier allgather bit-exact, single-node)
+        run: |
+          # Splits the local 8 GPUs into simulated nodes to drive the hierarchical
+          # pipeline (ranks_per_node < world), bit-exact vs all_gather_into_tensor.
+          # CUDA_GRAPH=0: the launch-collapse HIP-graph fallback is not yet
+          # bit-exact-safe on all archs -- exercise the eager path here.
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && MORI_ENABLE_SDMA=1 MORI_HIER_CUDA_GRAPH=0 timeout 400 pytest tests/python/ccl/test_hier_allgather.py -v
+          "
+
       - name: MORI-EP (async_ll IBGDA)
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
@@ -777,6 +793,40 @@ jobs:
               --ifname $NODE1_IFNAME \
               --cmd test --kernel-type async_ll \
               --quant-type none --dtype bf16 --max-tokens $TOKENS
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
+          done
+
+      - name: MORI-CCL internode hier allgather bit-exact smoke
+        run: |
+          # world=16 (2 node x 8 GPU) hierarchical AllGather: intra-node SDMA +
+          # inter-node RDMA, asserted byte-for-byte against a locally-computed
+          # reference (no RCCL collective -> no dependency on RCCL's cross-node
+          # RoCE bring-up). Both inter-node legs: device = IBGDA (GPU-posted),
+          # hostproxy = CPU-posted.
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_ccl_ag.sh"
+          PORT=29200
+          for HANDLE in device hostproxy; do
+            echo "=== hier allgather smoke handle=$HANDLE port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec
+              -e MORI_ENABLE_SDMA=1 -e MORI_INTERNODE_TIMEOUT=300
+              -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES
+              -e MORI_RDMA_SL=$MORI_RDMA_SL -e MORI_RDMA_TC=$MORI_RDMA_TC
+              $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME --handle $HANDLE --sizes-mb 8,64
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec \
+              -e MORI_ENABLE_SDMA=1 \
+              -e MORI_INTERNODE_TIMEOUT=300 \
+              -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+              -e MORI_RDMA_SL=$MORI_RDMA_SL -e MORI_RDMA_TC=$MORI_RDMA_TC \
+              $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME --handle $HANDLE --sizes-mb 8,64
             wait
             sleep 1
             PORT=$((PORT + 1))

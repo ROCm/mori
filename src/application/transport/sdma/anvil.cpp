@@ -29,11 +29,14 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 namespace anvil {
 
 auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int line) {
@@ -144,6 +147,52 @@ static const std::string getBusId(int deviceId) {
     busIdChar[i] = std::tolower(busIdChar[i]);
   }
   return std::string(busIdChar);
+}
+
+// hsa_iterate_agents (SetUp) enumerates ALL physical GPU agents in HSA order,
+// which is NOT filtered by HIP_VISIBLE_DEVICES. The srcDeviceId/deviceId that the
+// collective passes in is a HIP device ORDINAL (indexes only visible devices).
+// When the two diverge (e.g. HIP_VISIBLE_DEVICES=4,5,6,7) indexing gpuAgents_ by
+// the raw HIP ordinal selects the WRONG physical GPU -> the SDMA queue is created
+// on the wrong KFD node while the compute kernel runs on the intended GPU ->
+// "Memory access fault by GPU node-N". Match HIP ordinal -> HSA agent by PCI BDF
+// so the selection is correct in all cases. In the common HIP_VISIBLE_DEVICES=
+// 0..N-1 case this resolves to the identity map (BDF matches at the same index)
+// so the default path is behavior-identical.
+static int gpuAgentIndexForHipDevice(int hipDeviceId) {
+  static std::mutex mapMutex;
+  static std::unordered_map<int, int> hipToAgent;
+  std::lock_guard<std::mutex> lock(mapMutex);
+  auto it = hipToAgent.find(hipDeviceId);
+  if (it != hipToAgent.end()) return it->second;
+
+  // BDF of the HIP device, parsed from its "domain:bus:device.function" string.
+  std::string busId = getBusId(hipDeviceId);
+  unsigned domain = 0, bus = 0, dev = 0, func = 0;
+  std::sscanf(busId.c_str(), "%x:%x:%x.%x", &domain, &bus, &dev, &func);
+  uint32_t hipBdf = ((bus & 0xFF) << 8) | ((dev & 0x1F) << 3) | (func & 0x7);
+
+  // HSA_AMD_AGENT_INFO_BDFID exposes only the 16-bit bus/device/function, not the
+  // PCI domain, so on a multi-segment machine two GPUs can share the same 16-bit
+  // BDF. Only trust the match when it is UNIQUE; otherwise keep the identity
+  // fallback rather than risk selecting the wrong agent. domain is parsed but
+  // cannot be matched against the HSA side.
+  (void)domain;
+  int match = hipDeviceId;  // identity fallback (also correct when HIP and HSA order align)
+  int nMatch = 0, firstMatch = -1;
+  for (size_t a = 0; a < gpuAgents_.size(); ++a) {
+    uint32_t bdfid = 0;
+    if (hsa_agent_get_info(gpuAgents_[a], (hsa_agent_info_t)HSA_AMD_AGENT_INFO_BDFID, &bdfid) !=
+        HSA_STATUS_SUCCESS)
+      continue;
+    if ((bdfid & 0xFFFF) == (hipBdf & 0xFFFF)) {
+      ++nMatch;
+      if (firstMatch < 0) firstMatch = static_cast<int>(a);
+    }
+  }
+  if (nMatch == 1) match = firstMatch;
+  hipToAgent[hipDeviceId] = match;
+  return match;
 }
 
 SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAgent,
@@ -284,15 +333,16 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
   auto key = std::make_pair(srcDeviceId, dstDeviceId);
   for (int c = 0; c < numChannels; ++c) {
     uint32_t engineId = engines[c % numEngines];
-    sdma_channels_[key].emplace_back(
-        std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
+    sdma_channels_[key].emplace_back(std::make_unique<SdmaQueue>(
+        srcDeviceId, dstDeviceId, gpuAgents_[gpuAgentIndexForHipDevice(srcDeviceId)], engineId));
   }
   return true;
 }
 
 uint32_t AnvilLib::getNodeId(int deviceId) {
   uint32_t nodeId = 0;
-  CHECK_HSA_ERROR(hsa_agent_get_info(gpuAgents_[deviceId], HSA_AGENT_INFO_NODE, &nodeId));
+  CHECK_HSA_ERROR(hsa_agent_get_info(gpuAgents_[gpuAgentIndexForHipDevice(deviceId)],
+                                     HSA_AGENT_INFO_NODE, &nodeId));
   return nodeId;
 }
 

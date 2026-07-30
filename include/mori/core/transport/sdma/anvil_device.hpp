@@ -48,11 +48,11 @@ namespace anvil {
 constexpr uint32_t SDMA_QUEUE_SIZE = 256 * 1024;  // 256KB
 constexpr HSA_QUEUE_PRIORITY DEFAULT_PRIORITY = HSA_QUEUE_PRIORITY_NORMAL;
 constexpr unsigned int DEFAULT_QUEUE_PERCENTAGE = 100;
-constexpr int MAX_RETRIES = 1 << 30;
-constexpr bool BREAK_ON_RETRIES = true;
+constexpr long long MAX_RETRIES = 1LL << 34;
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 
+// SDMA_PKT_COPY_LINEAR DW2 (PARAMETER_UNION) stays 0: peak D2D/XGMI copy BW.
 __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, void* dstBuf,
                                                                  long long int packetSize) {
   SDMA_PKT_COPY_LINEAR copy_packet = {};
@@ -97,21 +97,14 @@ __device__ __forceinline__ SDMA_PKT_FENCE CreateFencePacket(HSAuint64* address, 
   return packet;
 }
 
-// Assumes signal is allocated in device memory
+// Assumes signal is allocated in device memory. The signal is written by the SDMA
+// engine, so the poll must be SYSTEM scope. Returns only once the signal lands.
 __device__ __forceinline__ bool waitForSignal(HSAuint64* addr, uint64_t expected) {
-  int retries = 0;
-  while (true) {
-    uint64_t value = __hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    if (value == expected) {
-      return true;
-    }
-    if constexpr (BREAK_ON_RETRIES) {
-      if (retries++ == MAX_RETRIES) {
-        break;
-      }
-    }
+  long long retries = 0;
+  while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) != expected) {
+    if (++retries > MAX_RETRIES) __builtin_trap();
   }
-  return false;
+  return true;
 }
 
 #endif  // __HIPCC__ || __CUDACC__
@@ -139,7 +132,7 @@ struct SdmaQueueDeviceHandle {
     const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
 
     uint64_t cur_index;
-    int retries = 0;
+    long long retries = 0;
 
     while (true) {
       cur_index = __hip_atomic_load(cachedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -158,12 +151,8 @@ struct SdmaQueueDeviceHandle {
           break;
         }
       }
-      if constexpr (BREAK_ON_RETRIES) {
-        if (retries++ == MAX_RETRIES) {
-          assert(false && "Retry limit exceed on reserve queue space");
-          break;
-        }
-      }
+      // Never return an unreserved index: fail loud rather than corrupt the queue.
+      if (++retries > MAX_RETRIES) __builtin_trap();
     }
     return cur_index;
   }
@@ -195,7 +184,7 @@ struct SdmaQueueDeviceHandle {
   }
 
   __device__ __forceinline__ void submitPacket(uint64_t base, uint64_t pendingWptr) {
-    int retries = 0;
+    long long retries = 0;
     while (true) {
       uint64_t val = __hip_atomic_load(committedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       __atomic_signal_fence(__ATOMIC_SEQ_CST);
@@ -204,12 +193,8 @@ struct SdmaQueueDeviceHandle {
       }
       __builtin_amdgcn_s_sleep(1);
 
-      if constexpr (BREAK_ON_RETRIES) {
-        if (retries++ == MAX_RETRIES) {
-          assert(false && "submitPacket: Retry limit exceeded");
-          break;
-        }
-      }
+      // Ringing the doorbell out of order would publish a partial packet.
+      if (++retries > MAX_RETRIES) __builtin_trap();
     }
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_wave_barrier();

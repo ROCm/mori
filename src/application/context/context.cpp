@@ -172,6 +172,13 @@ void Context::CollectHostNames() {
 // / Context::IsP2PDisabled() instead of getenv anywhere outside the
 // constructor.
 
+int Context::SameHostPeersBefore(int rank) const {
+  int n = 0;
+  for (int j = 0; j < rank; j++)
+    if (peerInfos[j].sameHost) n++;
+  return n;
+}
+
 void Context::InitializeTopologyAndTransports() {
   // Find my rank in node
   for (int i = 0; i <= LocalRank(); i++) {
@@ -352,10 +359,15 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
   }
   MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
 
+  // Within-node HIP device id = count of same-host peers before the rank
+  // (not globalRank % 8, which faults under sliced HIP_VISIBLE_DEVICES).
+  int localDevId = SameHostPeersBefore(LocalRank());
   for (int i = 0; i < WorldSize(); i++) {
     if (!peerCaps[i].canSDMA) continue;
-    if (i != LocalRank()) anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
-    anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
+    // Peer within-node device id: count of same-host peers before it.
+    int peerDevId = SameHostPeersBefore(i);
+    if (i != LocalRank()) anvil::EnablePeerAccess(localDevId, peerDevId);
+    anvil::anvil.connect(localDevId, peerDevId, sdmaNumChannels);
   }
   sdmaChannels_ = sdmaNumChannels;
   sdmaSetupDone = true;
