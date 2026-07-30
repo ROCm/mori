@@ -92,10 +92,13 @@ MessageHeader Protocol::ReadMessageHeader() {
   // and `3c6bc1a1` reworked this file without fixing it: `len` came straight
   // off the wire into `std::vector<char> buf(len)` two functions below, so a
   // truncated, byte-swapped or garbage header asks for up to 4 GiB. The type
-  // was checked only by `assert(hdr.type == ...)` at the call sites, which is
-  // compiled out under the `-DNDEBUG` this project builds with (the same
-  // vacuity `f2f02821` caught in a test), so in a release build there was no
-  // check at all.
+  // was checked only by `assert(hdr.type == ...)` at the call sites.
+  // CORRECTION (review #64-1): that assert was NOT compiled out -- this project
+  // does not build with -DNDEBUG (CMakeLists.txt:4 is a bare "-O3"; 0 of 49
+  // compile_commands.json entries carry NDEBUG; `__assert_fail` is in the
+  // shipped backend_impl.cpp.o). So the check was live and `abort()`ed the
+  // process rather than being absent. The length bound below is unaffected by
+  // that correction -- nothing ever bounded `len`.
   //
   // This is not a hypothetical peer being hostile. A PD role switch tears the
   // control plane down and re-establishes it on every flip, so a half-written

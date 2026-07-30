@@ -932,7 +932,8 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
 
   Protocol p(tcph);
   p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle, rank});
-  // Was `assert(hdr.type == ...)`, compiled out under -DNDEBUG. Review #62-5.
+  // Was `assert(hdr.type == ...)`, which ABORTED the engine on a mismatch --
+  // this project does not build with -DNDEBUG (review #64-1). Review #62-5.
   MessageHeader hdr = p.ReadMessageHeader(MessageType::RegEndpoint);
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
 
@@ -972,7 +973,8 @@ application::RdmaMemoryRegion ControlPlaneServer::AskRemoteMemoryRegion(EngineKe
 
   Protocol p(tcph);
   p.WriteMessageAskMemoryRegion({ekey, rdevId, id, {}});
-  // Was `assert(hdr.type == ...)`, compiled out under -DNDEBUG. Review #62-5.
+  // Was `assert(hdr.type == ...)`, which ABORTED the engine on a mismatch --
+  // this project does not build with -DNDEBUG (review #64-1). Review #62-5.
   MessageHeader hdr = p.ReadMessageHeader(MessageType::AskMemoryRegion);
   MessageAskMemoryRegion msg = p.ReadMessageAskMemoryRegion(hdr.len);
 
@@ -991,9 +993,11 @@ void ControlPlaneServer::AcceptRemoteEngineConn() {
 }
 
 void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
-  // Not an assert: under -O3 -DNDEBUG (build/CMakeCache.txt:97) it is compiled
-  // out, and `eps[fd]` on a missing key would then default-CONSTRUCT a handle
-  // with an indeterminate fd and Recv on it.
+  // Not an assert: an assert here `abort()`s the engine on a stale epoll event,
+  // which is a survivable condition. (The CMakeCache.txt:97 `-DNDEBUG` I cited
+  // in the original of this comment is CMake's recorded DEFAULT, not this
+  // build's flags -- see review #64-1; the assert would have been live, not
+  // compiled out. Either way a warn-and-return is the right behaviour.)
   auto epIt = eps.find(fd);
   if (epIt == eps.end()) {
     MORI_IO_WARN("ControlPlaneServer: event for unknown fd {}, ignoring", fd);
@@ -1051,7 +1055,17 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       break;
     }
     default:
-      assert(false && "not implemented");
+      // NOT an assert. This project does NOT build with -DNDEBUG (CMakeLists.txt:4
+      // sets CMAKE_CXX_FLAGS_RELEASE to a bare "-O3"; compile_commands.json has
+      // NDEBUG in 0 of 49 entries), so this assert was LIVE and it `abort()`ed
+      // the whole engine -- Team E has the log of it killing a dsv3-FULL prefill
+      // server one second after a successful role flip. A message type this
+      // build does not handle must cost that CONNECTION, not the process:
+      // MainLoop's catch drops the fd and keeps serving every other peer.
+      throw std::runtime_error(
+          "mori::io control-plane: unhandled message type " +
+          std::to_string(static_cast<unsigned>(hdr.type)) + " (len " + std::to_string(hdr.len) +
+          ") on fd " + std::to_string(fd) + "; dropping this connection");
   }
 
   ctx->CloseEndpoint(tcph);
