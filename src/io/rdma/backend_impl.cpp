@@ -492,21 +492,50 @@ std::size_t RdmaManager::ReapMemoryGates() {
   std::size_t reaped = 0;
   {
     std::unique_lock<std::shared_mutex> lock(mu);
-    while (retiredGateCount_ > bound && !retiredOrder_.empty()) {
+    // A gate we decline to evict must go BACK on the deque, and the walk has to
+    // terminate even if every candidate declines. REVIEW_M #78-1/#79-3: the old
+    // loop popped the front and `continue`d on Inflight()>0 WITHOUT re-pushing,
+    // while `retiredGateCount_` kept counting the entry -- and the only other
+    // decrement, ClearLocalMemoryGate, is unreachable in production (#77-2,
+    // IOEngine::RegisterMemory mints a fresh id per call). So each timed-out
+    // quiesce permanently inflated the count; once `bound` of them stranded,
+    // `retiredGateCount_ > bound` was true FOREVER, and every later dereg
+    // pushed one tombstone that this same call immediately popped and erased.
+    // Reentry protection would then be ZERO -- T41's measured 12/12 refusal
+    // becomes 0/12 -- precisely on the timed-out-quiesce path, i.e. where a WR
+    // may still carry the lkey and the risk is highest.
+    //
+    // Bounded by the deque length sampled at entry so a deque of all-inflight
+    // gates is walked exactly once instead of spinning on its own re-pushes.
+    std::size_t toVisit = retiredOrder_.size();
+    std::vector<MemoryUniqueId> deferred;
+    while (toVisit-- > 0 && retiredGateCount_ > bound && !retiredOrder_.empty()) {
       const MemoryUniqueId oldest = retiredOrder_.front();
       retiredOrder_.pop_front();
       auto it = memGates_.find(oldest);
       // Absent, replaced by a newer gate for a reused id, or no longer counted:
       // all mean this deque entry is stale and owns no retention to release.
+      // Dropping it is correct AND balanced -- an uncounted entry contributes
+      // nothing to retiredGateCount_, so there is nothing to strand.
       if (it == memGates_.end() || !it->second || !it->second->TombstoneCounted()) continue;
       // Never evict a gate that is still holding posts. Retiring() is set by
       // Quiesce, but a timed-out quiesce leaves inflight > 0, and dropping the
       // gate there would let a rebuilt session mint a fresh LIVE one and post
-      // against the very lkey the barrier failed to drain.
-      if (it->second->Inflight() > 0) continue;
+      // against the very lkey the barrier failed to drain. It is still COUNTED,
+      // so it must return to the deque or count and deque diverge.
+      if (it->second->Inflight() > 0) {
+        deferred.push_back(oldest);
+        continue;
+      }
       memGates_.erase(it);
       if (retiredGateCount_ > 0) retiredGateCount_ -= 1;
       ++reaped;
+    }
+    // Re-push at the FRONT, oldest-first, so the retirement order the eviction
+    // policy depends on survives: these are older than anything still queued
+    // behind them, and a later reap must reconsider them before younger gates.
+    for (auto rit = deferred.rbegin(); rit != deferred.rend(); ++rit) {
+      retiredOrder_.push_front(*rit);
     }
   }
   if (reaped > 0) {
