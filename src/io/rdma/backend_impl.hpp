@@ -103,6 +103,21 @@ class RdmaManager {
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
 
+  // --- Per-remote-engine retention counters (read-only diagnostics) ---------
+  // A PD flip gives the flipping side a brand-new engine key, so the SURVIVING
+  // peer accumulates one dead-key entry per flip in each of the maps below and
+  // never drops any of them (see the reachability note at
+  // RdmaBackend::DeregisterRemoteEngine). These make that accumulation
+  // OBSERVABLE from a test, which is the only way to tell a real leak from a
+  // plausible source reading -- the same reason ShmemGetHeapStats exists.
+  // Rank-local, read-only, taken under the same lock as the mutators, so they
+  // are a consistent snapshot rather than a torn read.
+  std::size_t GetNumRemoteEngines() const;
+  std::size_t GetNumEndpointRuntimes() const;
+  // Endpoints retained for ONE engine key, summed over its topo pairs. 0 both
+  // when the key is unknown and when it is known but holds no endpoints.
+  std::size_t GetNumEndpointsForEngine(const EngineKey&) const;
+
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
 
@@ -132,6 +147,16 @@ class NotifManager {
   ~NotifManager();
 
   void RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt);
+
+  // Read-only diagnostics, mirroring RdmaManager's. `notifCtxById_` is the one
+  // that costs real resources: RegisterEndpoint posix_memaligns
+  // notifPerQp*sizeof(NotifMessage) AND registers an RDMA MR per QP, and there
+  // is no per-endpoint removal anywhere -- only Shutdown() frees them. So this
+  // counter IS the pinned-host-memory + MR leak, in units of QPs.
+  std::size_t GetNumRegisteredRuntimes() const;
+  std::size_t GetNumNotifContexts() const;
+  // Bytes of pinned host memory held by those notification contexts.
+  std::size_t GetNotifBufferBytes() const;
 
   void RegisterDevice(int devId);
 
@@ -221,6 +246,8 @@ class ControlPlaneServer {
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
   std::optional<int> TryGetRemoteEnginePort(const EngineKey&) const;
+  // Read-only diagnostic: how many remote engine descriptors are retained.
+  std::size_t GetNumRemoteEngines() const;
 
   // Endpoint management
   void BuildRdmaConn(EngineKey, TopoKeyPair, int nicRank);
@@ -306,6 +333,20 @@ class RdmaBackend : public Backend {
     return server->GetListenPort();
   }
 
+  // One snapshot of everything this backend retains per remote engine. Exists
+  // so a multi-cycle flip stress can assert on NUMBERS instead of on a reading
+  // of the source: every field below is expected to stay FLAT across repeated
+  // peer churn and today several of them grow without bound.
+  struct RemoteRetentionStats {
+    std::size_t numRemoteEngines{0};    // ControlPlaneServer::engines
+    std::size_t numRemoteMetas{0};      // RdmaManager::remotes (rTable+mTable)
+    std::size_t numEndpointRuntimes{0}; // RdmaManager::endpointsById_
+    std::size_t numSessions{0};         // RdmaBackend::sessionCache
+    std::size_t numNotifContexts{0};    // NotifManager::notifCtxById_ (QPs)
+    std::size_t notifBufferBytes{0};    // pinned host memory behind those QPs
+  };
+  RemoteRetentionStats GetRemoteRetentionStats() const;
+
   void RegisterRemoteEngine(const EngineDesc&) override;
   void DeregisterRemoteEngine(const EngineDesc&) override;
   void RegisterMemory(MemoryDesc& desc) override;
@@ -387,7 +428,9 @@ class RdmaBackend : public Backend {
   // session cache
   std::unordered_map<SessionCacheKey, std::unique_ptr<RdmaBackendSession>, SessionCacheKeyHash>
       sessionCache;
-  std::mutex sessionCacheMu;
+  // mutable: GetRemoteRetentionStats() is a const read-only accessor and must
+  // still take this lock to get a consistent snapshot rather than a torn read.
+  mutable std::mutex sessionCacheMu;
   std::mutex connBuildMapMu_;
   std::unordered_map<ConnBuildKey, std::shared_ptr<std::mutex>, ConnBuildKeyHash> connBuildMu_;
 };

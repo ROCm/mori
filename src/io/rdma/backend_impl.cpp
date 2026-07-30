@@ -386,6 +386,25 @@ std::size_t RdmaManager::InvalidateRemoteMemoryForEngine(const EngineKey& ekey) 
   return dropped;
 }
 
+std::size_t RdmaManager::GetNumRemoteEngines() const {
+  std::shared_lock<std::shared_mutex> lock(mu);
+  return remotes.size();
+}
+
+std::size_t RdmaManager::GetNumEndpointRuntimes() const {
+  std::shared_lock<std::shared_mutex> lock(mu);
+  return endpointsById_.size();
+}
+
+std::size_t RdmaManager::GetNumEndpointsForEngine(const EngineKey& ekey) const {
+  std::shared_lock<std::shared_mutex> lock(mu);
+  auto it = remotes.find(ekey);
+  if (it == remotes.end()) return 0;
+  std::size_t total = 0;
+  for (const auto& [topo, eps] : it->second.rTable) total += eps.size();
+  return total;
+}
+
 /* ------------------------------------- Endpoint Management ------------------------------------ */
 int RdmaManager::CountEndpoint(EngineKey engine, TopoKeyPair key) {
   std::shared_lock<std::shared_mutex> lock(mu);
@@ -552,6 +571,23 @@ NotifManager::NotifManager(RdmaManager* rdmaMgr, const RdmaBackendConfig& cfg)
     : rdma(rdmaMgr), config(cfg) {}
 
 NotifManager::~NotifManager() { Shutdown(); }
+
+std::size_t NotifManager::GetNumRegisteredRuntimes() const {
+  std::lock_guard<std::mutex> lock(mu);
+  return registeredRuntimes_.size();
+}
+
+std::size_t NotifManager::GetNumNotifContexts() const {
+  std::lock_guard<std::mutex> lock(mu);
+  return notifCtxById_.size();
+}
+
+std::size_t NotifManager::GetNotifBufferBytes() const {
+  std::lock_guard<std::mutex> lock(mu);
+  // Every context is one posix_memalign of exactly this size (see
+  // RegisterEndpoint), so the product is exact, not an estimate.
+  return notifCtxById_.size() * static_cast<std::size_t>(config.notifPerQp) * sizeof(NotifMessage);
+}
 
 void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) {
   if (config.pollCqMode == PollCqMode::EVENT) {
@@ -920,6 +956,11 @@ void ControlPlaneServer::RegisterRemoteEngine(const EngineDesc& rdesc) {
 void ControlPlaneServer::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   std::lock_guard<std::mutex> lock(mu);
   engines.erase(rdesc.key);
+}
+
+std::size_t ControlPlaneServer::GetNumRemoteEngines() const {
+  std::lock_guard<std::mutex> lock(mu);
+  return engines.size();
 }
 
 std::optional<int> ControlPlaneServer::TryGetRemoteEnginePort(const EngineKey& ekey) const {
@@ -1432,6 +1473,24 @@ RdmaBackend::~RdmaBackend() {
 
 void RdmaBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
   server->RegisterRemoteEngine(rdesc);
+}
+
+RdmaBackend::RemoteRetentionStats RdmaBackend::GetRemoteRetentionStats() const {
+  RemoteRetentionStats s;
+  if (server) s.numRemoteEngines = server->GetNumRemoteEngines();
+  if (rdma) {
+    s.numRemoteMetas = rdma->GetNumRemoteEngines();
+    s.numEndpointRuntimes = rdma->GetNumEndpointRuntimes();
+  }
+  if (notif) {
+    s.numNotifContexts = notif->GetNumNotifContexts();
+    s.notifBufferBytes = notif->GetNotifBufferBytes();
+  }
+  {
+    std::lock_guard<std::mutex> lock(sessionCacheMu);
+    s.numSessions = sessionCache.size();
+  }
+  return s;
 }
 
 // REACHABILITY, measured 2026-07-30T11:55Z against sglang @38ad45fe (and the
