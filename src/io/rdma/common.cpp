@@ -172,6 +172,47 @@ static std::string BuildPostSendFailureHint(int ret, const EpPair& ep, size_t qp
   return {};
 }
 
+/* --------------------------------- MemoryInflightGate ----------------------------------------- */
+// The token is a `shared_ptr<void>` with a custom deleter rather than an RAII
+// class so that it can be parked in `CqCallbackMeta` (which the ledger already
+// keeps alive until the CQE lands) without that header knowing this type. The
+// aliasing keeps the gate itself alive too: a gate whose owning MemoryDesc is
+// long gone must still be there for the last token to decrement.
+std::shared_ptr<void> MemoryInflightGate::Acquire(
+    const std::shared_ptr<MemoryInflightGate>& gate) {
+  if (!gate) return nullptr;
+  // Increment FIRST, then re-check. The reverse order races with Quiesce:
+  // Quiesce could observe inflight_==0 and dereg between our check and our
+  // increment. This way a Quiesce that misses our increment must see
+  // retiring_==true set before it read inflight_, so we back out below.
+  gate->inflight_.fetch_add(1, std::memory_order_acq_rel);
+  if (gate->retiring_.load(std::memory_order_acquire)) {
+    gate->Release();
+    return nullptr;
+  }
+  return std::shared_ptr<void>(gate.get(), [gate](void*) { gate->Release(); });
+}
+
+void MemoryInflightGate::Release() {
+  if (inflight_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    // Notify under the lock: a Quiesce that has evaluated its predicate but
+    // not yet slept would otherwise miss this and wait out the full timeout.
+    std::lock_guard<std::mutex> lock(mu_);
+    cv_.notify_all();
+  }
+}
+
+bool MemoryInflightGate::Quiesce(int timeoutMs) {
+  retiring_.store(true, std::memory_order_release);
+  std::unique_lock<std::mutex> lock(mu_);
+  if (timeoutMs < 0) {
+    cv_.wait(lock, [this] { return inflight_.load(std::memory_order_acquire) == 0; });
+    return true;
+  }
+  return cv_.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                      [this] { return inflight_.load(std::memory_order_acquire) == 0; });
+}
+
 uint64_t MakeNotifSendWrId(TransferUniqueId id) {
   if ((id & kNotifSendWrIdTag) != 0) {
     MORI_IO_ERROR("MakeNotifSendWrId: TransferUniqueId {} has bit 63 set; masking reserved tag",

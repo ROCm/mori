@@ -22,6 +22,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -134,6 +135,55 @@ uint64_t MakeNotifSendWrId(TransferUniqueId id);
 std::vector<std::pair<uint64_t, uint32_t>> PlanChunks(uint32_t total, size_t chunkBytes,
                                                       int maxChunks);
 
+// Keeps `ibv_dereg_mr` from running while work requests that carry the MR's
+// lkey are still outstanding on a send queue.
+//
+// `8f2d80b2` made the C++ *session object* outlive a concurrent
+// `DeregisterMemory`, but the session holds its MRs BY VALUE as POD
+// {addr,lkey,rkey,length}, and `RdmaBackend::DeregisterMemory` calls
+// `ibv_dereg_mr` (rdma.cpp:381) before it invalidates the cache. So the
+// transfer the shared_ptr just kept alive goes on to post a WR with a lkey the
+// driver has already destroyed. Best case a CQE error; worst case the flip's
+// immediate re-registration recycles that key and the DMA lands in the NEW KV
+// buffer -- silent corruption, which is exactly the failure a gsm8k A/B shows
+// as "within noise" one run and garbage the next.
+//
+// Ordering alone does NOT close that: moving the invalidate before the dereg
+// still leaves a poster that read the MR a microsecond earlier, and it does
+// nothing for a WR already sitting in the SQ. What is needed is a barrier, so
+// this is a refcount whose release is driven by the CQE, not by the post
+// returning: the token below is parked in `CqCallbackMeta`, the ledger holds
+// that meta until the completion arrives, so the count reaches zero only once
+// the NIC is done reading the region.
+//
+// SCOPE, stated so it is not over-read: this is ONE-SIDED. It protects the
+// local lkey of the process that deregisters. A peer that deregisters while we
+// have a read outstanding against its rkey is a different failure (CQE
+// status 10) and is handled by the QP retirement in `d862b1c5`, not here.
+class MemoryInflightGate : public std::enable_shared_from_this<MemoryInflightGate> {
+ public:
+  // Returns a token that must be kept alive until the NIC is done with the
+  // region, or nullptr if the memory is already retiring -- in which case the
+  // caller must NOT post.
+  static std::shared_ptr<void> Acquire(const std::shared_ptr<MemoryInflightGate>& gate);
+
+  // Closes the gate to new posts and blocks until every outstanding token is
+  // released. Returns true if it drained, false if `timeoutMs` expired first
+  // (the caller then has to decide; a flip cannot block forever).
+  bool Quiesce(int timeoutMs);
+
+  bool Retiring() const { return retiring_.load(std::memory_order_acquire); }
+  int Inflight() const { return inflight_.load(std::memory_order_acquire); }
+
+ private:
+  void Release();
+
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  std::atomic<int> inflight_{0};
+  std::atomic<bool> retiring_{false};
+};
+
 struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
       : status(s), id(id_), totalBatchSize(n) {}
@@ -143,6 +193,10 @@ struct CqCallbackMeta {
   int totalBatchSize{0};
   std::atomic<uint32_t> finishedBatchSize{0};
   internal::IoCallDiagnostics diagnostics{};
+  // Held for the whole lifetime of the meta, which the ledger extends until the
+  // CQE lands. Destroying it is what lets a concurrent DeregisterMemory
+  // proceed. Never read; its destructor is the point.
+  std::shared_ptr<void> inflightToken{};
 };
 
 // SubmissionLedger: tracks per-EP WR submissions and enables precise sqDepth release.
