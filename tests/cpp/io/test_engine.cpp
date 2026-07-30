@@ -1733,6 +1733,172 @@ void CaseRdmaGateTombstonesAreBounded() {
   HIP_RUNTIME_CHECK(hipFree(lptr));
 }
 
+// REVIEW_M #78-1 / #79-3 -- the strand, and the ONE path the bounded case above
+// cannot reach because it never times a quiesce out.
+//
+// `ReapMemoryGates` pops `retiredOrder_.front()` and, on `Inflight() > 0`,
+// skips the eviction. Pre-5acd688d it skipped WITHOUT re-pushing, while
+// `retiredGateCount_` went on counting the entry, and the only other decrement
+// (`ClearLocalMemoryGate`) is unreachable in production -- `IOEngine::
+// RegisterMemory` mints a fresh id per call, so no re-registration lifts a
+// predecessor's tombstone. Each timed-out quiesce therefore inflated the count
+// permanently. Once `bound` of them stranded, `retiredGateCount_ > bound` was
+// true FOREVER: every later dereg pushed one tombstone and the same call popped
+// and erased it, so the resident tombstone set collapsed to ~0.
+//
+// That is not a bookkeeping nit. The tombstone is what refuses a post from a
+// session built before the dereg (see the reentry case), and it decays exactly
+// on the timed-out-quiesce path -- i.e. where a WR may STILL carry the lkey
+// ibv_dereg_mr is about to destroy, and the corruption risk is highest.
+//
+// TWO-SIDED, and the two sides are asserted separately:
+//   (a) `strandedTombstones` -- gates resident after N timed-out deregs. Pre-fix
+//       this trends to ~0 (each dereg's own tombstone is popped by that same
+//       dereg's reap); post-fix it holds at the bound. `> 0` is the claim, and
+//       it is structurally 0 on the old code once the count is inflated.
+//   (b) `postsRefused` must STILL move afterwards, i.e. reentry protection is
+//       alive rather than merely counted. This is the consequence a reader
+//       cares about, and it is what silently went to zero.
+//
+// Driving a TIMED-OUT quiesce is the whole trick and it is only possible since
+// 3270d75f: the timeout used to be a process-wide latched static, so no case
+// could shorten it after an earlier case had deregistered. Here it is 1 ms,
+// with ~4 MiB of chunked writes genuinely outstanding, so the drain gives up
+// with inflight > 0 -- which is what makes the reap decline and strand.
+void CaseRdmaGateReapDoesNotStrandInflight() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  // 1 ms: shorter than any real 4 MiB transfer, so the quiesce is GUARANTEED to
+  // time out with work still outstanding. Set before the pair is built -- the
+  // backend reads it once in its ctor (deregQuiesceTimeoutMs_).
+  ScopedEnvVar fastTimeout("MORI_IO_DEREG_QUIESCE_MS", "1");
+  // Bound 2, so only a couple of strands are needed to inflate the count past
+  // it and expose the collapse quickly.
+  ScopedEnvVar smallBound("MORI_IO_MAX_MEM_GATE_TOMBSTONES", "2");
+  const std::size_t kBound = 2;
+  const int kStrandCycles = 8;
+
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_gate_strand", true);
+  auto dst = RegisterGpuMemory(pair.target.get(), 8 * 1024 * 1024, 0);
+
+  void* lptr = nullptr;
+  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipMalloc(&lptr, 8 * 1024 * 1024));
+  HIP_RUNTIME_CHECK(hipMemset(lptr, 0, 8 * 1024 * 1024));
+
+  DeregQuiesceCensus base = GetDeregQuiesceCensus();
+  std::printf("[gate-strand] baseline: timedOut=%zu tombstones=%zu refused=%zu\n",
+              base.quiesceTimedOut, base.gateTombstones, base.postsRefused);
+
+  // PHASE 1 -- strand. Each cycle deregisters with a big transfer in flight and
+  // a 1 ms timeout, so Quiesce returns false with inflight > 0 and the reap
+  // declines that gate.
+  for (int i = 0; i < kStrandCycles; ++i) {
+    MemoryDesc ldesc =
+        pair.initiator->RegisterMemory(lptr, 8 * 1024 * 1024, 0, MemoryLocationType::GPU);
+
+    TransferStatus big;
+    TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+    // Issued and NOT waited on: the point is for it to be outstanding when the
+    // dereg's barrier samples inflight.
+    pair.initiator->Write(ldesc, 0, dst.desc, 0, 4 * 1024 * 1024, &big, uid);
+    pair.initiator->DeregisterMemory(ldesc);
+    // Now let it land, so the process is not left with a genuinely live WR
+    // against a deregistered lkey for the rest of the suite.
+    std::string terr;
+    WaitTransferDone(&big, 10000, &terr);
+  }
+
+  DeregQuiesceCensus afterStrand = GetDeregQuiesceCensus();
+  const std::size_t timedOut = afterStrand.quiesceTimedOut - base.quiesceTimedOut;
+  const std::size_t strandedTombstones = afterStrand.gateTombstones;
+  std::printf("[gate-strand] after %d strand cycles: timedOut=%zu tombstones=%zu bound=%zu\n",
+              kStrandCycles, timedOut, strandedTombstones, kBound);
+
+  // NON-VACUITY FIRST. If nothing timed out, the strand path was never entered
+  // and everything below is a green for the wrong reason -- the same vacuous
+  // mistake struck at T3 and re-asked for at every review since.
+  Require(timedOut > 0,
+          "VACUOUS: no quiesce timed out, so no gate was ever declined and the strand path was "
+          "not exercised (timedOut=0). Not a pass.");
+
+  // (a) THE DISCRIMINATOR. Post-fix a declined gate goes back on the deque, so
+  //     the retention holds near the bound. Pre-fix the count is inflated by
+  //     the stranded entries, `retiredGateCount_ > bound` is permanently true,
+  //     and each dereg's reap erases the tombstone that same dereg just pushed
+  //     -- so this collapses toward 0.
+  Require(strandedTombstones > 0,
+          "STRANDED: after " + std::to_string(timedOut) +
+              " timed-out quiesce(s) the resident tombstone set collapsed to 0, so the count and "
+              "the deque have diverged and reentry protection is gone");
+
+  // PHASE 2 -- (b) the CONSEQUENCE. A tombstone that is counted but not
+  //           resident refuses nothing. Drive a post into a dereg window and
+  //           require that it is still REFUSED.
+  MemoryDesc ldesc =
+      pair.initiator->RegisterMemory(lptr, 8 * 1024 * 1024, 0, MemoryLocationType::GPU);
+  {
+    // Warm the session cache, or there is no cached session for the dereg to
+    // invalidate and hence no reentry to race.
+    TransferStatus warm;
+    TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+    pair.initiator->Write(ldesc, 0, dst.desc, 0, 64, &warm, uid);
+    std::string werr;
+    WaitTransferDone(&warm, 5000, &werr);
+  }
+
+  DeregQuiesceCensus beforeReentry = GetDeregQuiesceCensus();
+  std::atomic<bool> deregStarted{false};
+  std::atomic<bool> stop{false};
+  std::atomic<int> posts{0};
+  std::atomic<int> badState{0};
+
+  std::thread reentry([&]() {
+    while (!deregStarted.load(std::memory_order_acquire)) std::this_thread::yield();
+    while (!stop.load(std::memory_order_acquire)) {
+      TransferStatus st;
+      TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+      pair.initiator->Write(ldesc, 0, dst.desc, 0, 64 * 1024, &st, uid);
+      posts.fetch_add(1, std::memory_order_relaxed);
+      if (st.CodeUint32() == static_cast<uint32_t>(StatusCode::ERR_BAD_STATE)) {
+        badState.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        std::string terr;
+        WaitTransferDone(&st, 5000, &terr);
+      }
+    }
+  });
+
+  TransferStatus big;
+  TransferUniqueId bigUid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Write(ldesc, 0, dst.desc, 0, 4 * 1024 * 1024, &big, bigUid);
+  deregStarted.store(true, std::memory_order_release);
+  pair.initiator->DeregisterMemory(ldesc);
+  // Keep posting briefly AFTER the dereg returns: the tombstone must refuse
+  // there too, and that is the window a stale sglang transfer thread lives in.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  stop.store(true, std::memory_order_release);
+  reentry.join();
+  std::string berr;
+  WaitTransferDone(&big, 10000, &berr);
+
+  DeregQuiesceCensus afterReentry = GetDeregQuiesceCensus();
+  std::printf("[gate-strand] reentry after strand: posts=%d ERR_BAD_STATE=%d refused %zu->%zu "
+              "tombstones=%zu\n",
+              posts.load(), badState.load(), beforeReentry.postsRefused,
+              afterReentry.postsRefused, afterReentry.gateTombstones);
+
+  Require(posts.load() > 0, "instrument check: no post was issued into the dereg window at all");
+  Require(afterReentry.postsRefused > beforeReentry.postsRefused,
+          "REENTRY PROTECTION IS DEAD after " + std::to_string(timedOut) +
+              " timed-out quiesce(s): a post into the dereg window was ADMITTED, not refused "
+              "(postsRefused stayed at " + std::to_string(beforeReentry.postsRefused) +
+              "). This is the corruption the tombstone exists to prevent.");
+
+  HIP_RUNTIME_CHECK(hipFree(lptr));
+}
+
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -2241,6 +2407,7 @@ int main(int argc, char* argv[]) {
        CaseRdmaDeregReentryIsRefusedNotResurrected},
       {"rdma_gate_tombstone_lifts_on_reregister", CaseRdmaGateTombstoneLiftsOnReregister},
       {"rdma_gate_tombstones_are_bounded", CaseRdmaGateTombstonesAreBounded},
+      {"rdma_gate_reap_does_not_strand_inflight", CaseRdmaGateReapDoesNotStrandInflight},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},
