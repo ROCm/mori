@@ -30,15 +30,21 @@
 // below therefore aborts on failure rather than vanishing. That is loud and
 // survivable-to-debug; the alternative is not.
 //
-// If anyone "fixes" the build by adding -DNDEBUG, these become silent and the
-// NEXT line derefs the thing that was just asserted to exist:
-//   :911 / :963  assert(engines.find(ekey) != engines.end())  -> engines[ekey]
-//   :918 / :1028 assert(!candidates.empty())                  -> candidates[rank]
-//   :497 / :536 / :548                                        -> device/QP derefs
-// Several of these sit on the PD role-switch path, where a flip rebuilds a
-// peer's endpoints and "the engine I just looked up is gone" is an ordinary
-// race rather than a hypothetical. Today they abort; under that flag they
-// corrupt. Convert them to throws before defining NDEBUG, not after.
+// If anyone "fixes" the build by adding -DNDEBUG, the remaining asserts become
+// silent and the NEXT line derefs the thing that was just asserted to exist:
+//   :517 / :539 / :556 / :568   -> device / comp-channel / QP derefs
+//   :693 / :699                 -> notification-context deref
+//   :1205 / :1407 / :1516       -> size-agreement checks before indexing
+//
+// THE FOUR ON THE PD ROLE-SWITCH PATH ARE NO LONGER ASSERTS. The two
+// `engines.find(ekey)` lookups (BuildRdmaConn, AskRemoteMemoryRegion) and the
+// two `candidates.empty()` checks now THROW, because on a flip
+// `DeregisterRemoteEngine` erases from `engines` under a concurrent transfer
+// and "the engine I just looked up is gone" is an ordinary race, not a
+// programmer error. Their throws land in handlers that already exist:
+// GetOrCreateSessionCachedNoThrow -> ERR_BAD_STATE on the transfer, and
+// MainLoop's catch -> "dropping fd ... after exception". A failed transfer or
+// a dropped connection, never a dead inference server.
 // (Review #64 items 1 and 3; see COORD [M, turn 37].)
 
 #include <sys/epoll.h>
@@ -928,14 +934,36 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
   application::TCPEndpointHandle tcph;
   {
     std::lock_guard<std::mutex> lock(mu);
-    assert((engines.find(ekey) != engines.end()) && "register engine first");
-    EngineDesc& rdesc = engines[ekey];
+    // Was an assert. On a PD flip `DeregisterRemoteEngine` erases from
+    // `engines` while a transfer thread may already be in here establishing a
+    // lazy session, so "the engine is gone" is an ordinary race on the flip
+    // path, not a programmer error. The assert `abort()`ed the whole engine
+    // for it -- asserts are LIVE in this build (review #64-1). The throw is
+    // caught by GetOrCreateSessionCachedNoThrow and reported as ERR_BAD_STATE
+    // on the transfer: a retryable failed transfer instead of a dead server.
+    // Also fixes an aliasing hazard the assert hid -- `engines[ekey]` on the
+    // next line would DEFAULT-CONSTRUCT an EngineDesc under -DNDEBUG and then
+    // Connect() to host "" port 0.
+    auto it = engines.find(ekey);
+    if (it == engines.end()) {
+      throw std::runtime_error("mori::io BuildRdmaConn: remote engine '" + ekey +
+                               "' is not registered (deregistered concurrently, or the engine was "
+                               "never registered)");
+    }
+    EngineDesc& rdesc = it->second;
     tcph = ctx->Connect(rdesc.host, rdesc.port);
   }
 
   int requestedNics = ResolveRequestedNics(config, topo.local, topo.remote);
   auto candidates = rdma->Search(topo.local, requestedNics);
-  assert(!candidates.empty());
+  // Was an assert, and `candidates[rank]` two lines down is the deref it
+  // guards. An empty Search() is a topology/config condition (no NIC matches
+  // the requested locality), not an invariant violation.
+  if (candidates.empty()) {
+    throw std::runtime_error(
+        "mori::io BuildRdmaConn: no RDMA NIC candidate for local topo device " +
+        std::to_string(topo.local.deviceId));
+  }
   int rank = std::min<int>(nicRank, static_cast<int>(candidates.size()) - 1);
   auto [devId, weight] = candidates[rank];
 
@@ -980,8 +1008,16 @@ application::RdmaMemoryRegion ControlPlaneServer::AskRemoteMemoryRegion(EngineKe
   application::TCPEndpointHandle tcph;
   {
     std::lock_guard<std::mutex> lock(mu);
-    assert((engines.find(ekey) != engines.end()) && "register engine first");
-    EngineDesc& rdesc = engines[ekey];
+    // Same race and same fix as BuildRdmaConn above -- and this one is MORE
+    // likely on a flip, because a flip re-registers every memory region and
+    // this is the call that asks the peer for each one.
+    auto it = engines.find(ekey);
+    if (it == engines.end()) {
+      throw std::runtime_error("mori::io AskRemoteMemoryRegion: remote engine '" + ekey +
+                               "' is not registered (deregistered concurrently, or the engine was "
+                               "never registered)");
+    }
+    EngineDesc& rdesc = it->second;
     tcph = ctx->Connect(rdesc.host, rdesc.port);
   }
 
@@ -1045,7 +1081,17 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
       int requestedNics = ResolveRequestedNics(config, msg.topo.remote, msg.topo.local);
       auto candidates = rdma->Search(msg.topo.remote, requestedNics);
-      assert(!candidates.empty());
+      // Was an assert, and it is the worst-placed one in the file: the topo
+      // searched here comes OFF THE WIRE (`msg.topo.remote`), so a peer whose
+      // topology this host cannot match `abort()`ed our engine. MainLoop's
+      // catch turns the throw into "dropping fd ... after exception" -- that
+      // peer's connection dies, everyone else keeps serving. Same
+      // one-message-costs-one-connection rule the header validation follows.
+      if (candidates.empty()) {
+        throw std::runtime_error(
+            "mori::io RegEndpoint: no RDMA NIC candidate for peer-requested topo device " +
+            std::to_string(msg.topo.remote.deviceId));
+      }
       int rdevId = msg.devId;
       int rank = std::min<int>(msg.nicRank, static_cast<int>(candidates.size()) - 1);
       auto [devId, weight] = candidates[rank];
