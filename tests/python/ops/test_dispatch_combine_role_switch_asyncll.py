@@ -65,8 +65,16 @@ from tests.python.ops.test_dispatch_combine_async_ll import (
     AsyncLLDispatchCombineTestCase,
 )
 
-PREFILL_TOKENS = 128
-DECODE_TOKENS = 8
+# Defaults kept small (see the main role-switch module for why: shared worker
+# pool, stress loops, injection headroom). But AsyncLL is the kernel sglang's
+# DECODE role actually runs, so this module is the one place where the real
+# capacities matter most -- and until now it could only ever run a 16x flip at
+# 128/8 while Team E measured sglang issuing 4096/128, a 32x flip at two orders
+# of magnitude more memory (COORD [E, turn 3]). Overridable rather than
+# hard-changed: the small values keep the suite cheap for the injection tests,
+# and a dedicated run can ask for the real ones without a rebuild.
+PREFILL_TOKENS = int(os.environ.get("MORI_TEST_PREFILL_TOKENS", "128"))
+DECODE_TOKENS = int(os.environ.get("MORI_TEST_DECODE_TOKENS", "8"))
 
 _WORLD_SIZES = (int(os.environ.get("MORI_TEST_WORLD_SIZE", "8")),)
 
