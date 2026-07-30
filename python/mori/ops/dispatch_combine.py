@@ -371,6 +371,43 @@ class EpDispatchCombineOp:
                 f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
             )
 
+        # EXIT barrier. The entry barrier above is NOT sufficient, and the
+        # asymmetry with finalize() -- which has always barriered on both sides
+        # -- is the bug.
+        #
+        # Several of the ctor's buffers are PEER-WRITABLE and are zeroed as part
+        # of allocation: ShmemMallocAndReturnMemObjPtr hipMemsets every
+        # symmetric object (dispatch_combine.cpp:412), and `dispTokOffsetMemObj`
+        # is the sharp one -- a dispatching peer does
+        # `atomicAdd(args.dispTokOffsetMemObj->GetAs<index_t*>(destPe), 1)`
+        # (intranode.hpp:132) directly into THIS rank's copy, and the kernel
+        # asserts the result against MaxNumTokensToRecv() on the very next line.
+        #
+        # With only an entry barrier the window is open: rank A returns from the
+        # ctor and launches its dispatch while rank B is still inside its own
+        # ctor, so B's hipMemset(buf, 0) lands AFTER A's atomicAdds have already
+        # counted into that buffer. The zeroing does not merely race the adds --
+        # it silently discards them, so B's counter restarts below the true
+        # occupancy and subsequent adds hand out slots that are already in use.
+        # The overflow surfaces as the device-side assertion
+        #   intranode.hpp:134 `destTokId < config.MaxNumTokensToRecv()`
+        #   "Total recv token overflow: increase maxTotalRecvTokens"
+        # which aborts the rank via HSA_STATUS_ERROR_EXCEPTION, i.e. a
+        # "Memory access fault by GPU node-N" and a dead process -- not a
+        # recoverable error.
+        #
+        # Why this went unseen for the whole campaign: the window is only open
+        # between one rank's return and the slowest rank's allocation, so it
+        # needs a construction skewed against a peer that is ALREADY dispatching
+        # -- which is why it reproduces only in longer sessions and only
+        # sometimes (RESULTS_M T21: five decompositions green, T20/T21f red on
+        # the identical selection). It is not specific to a role switch, but a
+        # flip is what makes it routine: COORD turn 19 tells sglang the P<->D
+        # flip is finalize() then CONSTRUCT, so every flip re-opens this window
+        # on a live server, where the peers are mid-inference rather than
+        # waiting in a test barrier.
+        self._shmem_barrier(group)
+
     # ------------------------------------------------------------------
     # Buffer lifecycle (teardown / rebuild)
     # ------------------------------------------------------------------
