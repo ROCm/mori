@@ -58,5 +58,11 @@ RUN if [ "${INSTALL_ROCM714}" = "1" ]; then set -ex && \
 
 ENV HIP_PATH=/opt/rocm
 ENV PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:${LD_LIBRARY_PATH}
+# Force the good ROCm 7.14 ROCr (apt/core-7.14) over the buggy pip-wheel ROCr.
+# Only preload libhsa-runtime64 — preloading libamdhip64 too triggers an LLVM
+# "spirv-expand-step registered more than once" abort.
+ENV LD_PRELOAD=/opt/rocm/lib/libhsa-runtime64.so.1
+
 
 RUN pip install --no-cache-dir flydsl
