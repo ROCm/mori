@@ -11,6 +11,7 @@
 # Usage (from the repo root, inside the container):
 #   tests/python/ops/run_role_switch_suite.sh build
 #   tests/python/ops/run_role_switch_suite.sh test '<pytest -k expr>'
+#   tests/python/ops/run_role_switch_suite.sh asyncll '<pytest -k expr>'
 #   tests/python/ops/run_role_switch_suite.sh regress
 set -u
 set -o pipefail
@@ -30,7 +31,7 @@ case "$mode" in
     rc=${PIPESTATUS[0]}
     echo "BUILD_RC=$rc"
     ;;
-  test|regress)
+  test|regress|asyncll)
     # ABORT, do not merely report, when the node cannot hold the run.
     #
     # Printing was not enough: T10a and T10b both bannered "VRAM free 6.3 GiB"
@@ -78,6 +79,14 @@ PYVRAM
     fi
     if [ "$mode" = "regress" ]; then
       target="tests/python/ops/test_dispatch_combine_intranode.py"
+    elif [ "$mode" = "asyncll" ]; then
+      # Its own module because MORI_ENABLE_SDMA has to be set before the
+      # session-scoped worker pool spawns -- it is a Context-construction
+      # snapshot (context.cpp:51), not a per-op read, and a late set
+      # desynchronizes SymmMemManager::Malloc from the transport choice.
+      # The module sets it at import; this mode exists so the file can be
+      # reached at all, since every other mode hardcodes its target.
+      target="tests/python/ops/test_dispatch_combine_role_switch_asyncll.py"
     else
       target="tests/python/ops/test_dispatch_combine_role_switch.py"
     fi
