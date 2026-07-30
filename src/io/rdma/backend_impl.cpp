@@ -21,6 +21,26 @@
 // SOFTWARE.
 #include "src/io/rdma/backend_impl.hpp"
 
+// THIS FILE DEPENDS ON `assert()` BEING LIVE. DO NOT ADD `-DNDEBUG`.
+//
+// mori does not currently define NDEBUG: `CMakeLists.txt:4` sets
+// CMAKE_CXX_FLAGS_RELEASE to a bare "-O3" (a normal variable, shadowing the
+// cache entry), NDEBUG appears in 0 of 49 compile_commands.json entries, and
+// `__assert_fail` is present in the shipped backend_impl.cpp.o. Every assert
+// below therefore aborts on failure rather than vanishing. That is loud and
+// survivable-to-debug; the alternative is not.
+//
+// If anyone "fixes" the build by adding -DNDEBUG, these become silent and the
+// NEXT line derefs the thing that was just asserted to exist:
+//   :911 / :963  assert(engines.find(ekey) != engines.end())  -> engines[ekey]
+//   :918 / :1028 assert(!candidates.empty())                  -> candidates[rank]
+//   :497 / :536 / :548                                        -> device/QP derefs
+// Several of these sit on the PD role-switch path, where a flip rebuilds a
+// peer's endpoints and "the engine I just looked up is gone" is an ordinary
+// race rather than a hypothetical. Today they abort; under that flag they
+// corrupt. Convert them to throws before defining NDEBUG, not after.
+// (Review #64 items 1 and 3; see COORD [M, turn 37].)
+
 #include <sys/epoll.h>
 
 #include <algorithm>
