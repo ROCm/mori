@@ -440,11 +440,19 @@ static constexpr std::size_t kDefaultMaxMemGateTombstones = 64;
 
 static std::size_t GetMaxMemGateTombstones() {
   static const std::size_t v = [] {
+    // `io::env::Override` with `mori::env::detail::ParseInt`, matching every
+    // other env read in this file (:81, :731-736, :1848-1852). NOT the bare
+    // `env::GetInt` this originally used: unqualified `env::` resolves to
+    // `mori::io::env` (include/mori/io/env.hpp:29), which has only `Override`,
+    // so that spelling did not compile at all -- see the T43 build.
+    //
     // ParseInt, not ParsePositiveInt: 0 must be accepted, since 0 is the
     // documented "disable the reap" value and a positive-only parser would
-    // silently fall back to the default for it.
+    // silently fall back to the default for it. Override also WARNs on an
+    // unparseable value rather than silently defaulting, which is what we want
+    // for a knob that bounds a corruption-adjacent structure.
     int n = static_cast<int>(kDefaultMaxMemGateTombstones);
-    if (auto v = env::GetInt("MORI_IO_MAX_MEM_GATE_TOMBSTONES")) n = *v;
+    env::Override("MORI_IO_MAX_MEM_GATE_TOMBSTONES", n, mori::env::detail::ParseInt);
     return static_cast<std::size_t>(n < 0 ? 0 : n);
   }();
   return v;
