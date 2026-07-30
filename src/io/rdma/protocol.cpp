@@ -71,11 +71,53 @@ Protocol::Protocol(application::TCPEndpointHandle eph) : ep(eph) {}
 
 Protocol::~Protocol() {}
 
+// Largest control-plane message we will allocate for.
+//
+// Every message on this channel is a msgpack of a handful of ints plus an
+// EngineKey and one RdmaEndpointHandle / RdmaMemoryRegion -- hundreds of
+// bytes. 1 MiB is four orders of magnitude of headroom and still bounds the
+// allocation to something a control-plane thread can absorb.
+constexpr uint32_t kMaxControlMessageBytes = 1u << 20;
+
 MessageHeader Protocol::ReadMessageHeader() {
   MessageHeader hdr;
   CheckSyscall(ep.Recv(&hdr.type, sizeof(hdr.type)), "recv");
   CheckSyscall(ep.Recv(&hdr.len, sizeof(hdr.len)), "recv");
   hdr.len = ntohl(hdr.len);
+
+  // VALIDATE THE HEADER HERE, where both the server loop and the two client
+  // call sites go through, rather than at the call sites.
+  //
+  // `486a1b53`'s own message named the unbounded `hdr.len` as the root hazard
+  // and `3c6bc1a1` reworked this file without fixing it: `len` came straight
+  // off the wire into `std::vector<char> buf(len)` two functions below, so a
+  // truncated, byte-swapped or garbage header asks for up to 4 GiB. The type
+  // was checked only by `assert(hdr.type == ...)` at the call sites, which is
+  // compiled out under the `-DNDEBUG` this project builds with (the same
+  // vacuity `f2f02821` caught in a test), so in a release build there was no
+  // check at all.
+  //
+  // This is not a hypothetical peer being hostile. A PD role switch tears the
+  // control plane down and re-establishes it on every flip, so a half-written
+  // header from a peer that flipped mid-message is the ordinary case on the
+  // path this campaign exists to exercise.
+  //
+  // Throwing is the established channel: on the server thread `486a1b53`'s
+  // handler turns it into DropControlPlaneConn(fd); on the two client call
+  // sites (BuildRdmaConn, AskRemoteMemoryRegion) it unwinds through the
+  // TcpEndpointGuard, which closes the fd -- see COORD for what that thread
+  // does with it, since there is no handler on that chain yet.
+  if (hdr.type != MessageType::RegEndpoint && hdr.type != MessageType::AskMemoryRegion) {
+    throw std::runtime_error(
+        "mori::io control-plane: unknown message type " +
+        std::to_string(static_cast<unsigned>(hdr.type)) + "; dropping this connection");
+  }
+  if (hdr.len > kMaxControlMessageBytes) {
+    throw std::runtime_error(
+        "mori::io control-plane: message length " + std::to_string(hdr.len) +
+        " exceeds the maximum of " + std::to_string(kMaxControlMessageBytes) +
+        " bytes; refusing to allocate, dropping this connection");
+  }
   return hdr;
 }
 
