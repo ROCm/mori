@@ -849,6 +849,22 @@ void CaseRdmaUnknownRemoteMemoryIdFailsTransferWithoutAbort() {
 //   2. re-registering the engine -- what the peer's flip completion does --
 //      must restore service, which only holds if the caches really were
 //      dropped rather than left stale.
+//
+// WHAT THIS CASE DOES **NOT** ESTABLISH -- measured in T34, do not read the
+// green as more than it is. The post-deregistration transfer is rejected by the
+// ROUTE layer, not by the caches: `CanHandle` -> `TryGetRemoteEnginePort`
+// misses as soon as `engines` is erased, so the log line is "No available
+// backend found" and `BuildRdmaConn`'s `065d5764` throw is never reached. A
+// build WITHOUT `4534e67c`'s invalidation would fail this transfer too. So:
+//  - step 1's assertion is carried by the route layer => NOT a discriminator
+//    for the stale-cache bug (#66-2);
+//  - step 2 succeeds either way, because this fixture's target never
+//    re-registers its MEMORY, so the pre-flip rkeys are still valid.
+// The invalidation IS proven to run and to have had something to drop, but by
+// the INFO line "dropped 1 cached remote memory region(s)" (1, not 0) rather
+// than by an assertion here. A true discriminator needs the peer to re-register
+// its memory under the same id so a stale rkey becomes WRONG rather than
+// merely old; that is the next test, not this one.
 void CaseRdmaDeregisteredEngineFailsTransferThenRecovers() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
