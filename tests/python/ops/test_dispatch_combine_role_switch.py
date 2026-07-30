@@ -1171,7 +1171,7 @@ def _worker_rank_asymmetric_reject_heap_symmetry(rank, world_size):
     _assert_capacity(op, DECODE_TOKENS)
 
 
-def _worker_rank_asymmetric_reject_barrier_state(rank, world_size):
+def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=True):
     """MEASURE what the group disagrees about after a REJECT. No dispatch.
 
     Two fixes for the reject hang have been aimed at hypotheses inferred from
@@ -1230,10 +1230,27 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size):
         f"and check BUILD_RC before reading this test's result."
     )
 
+    # BEFORE. A cross-rank comparison at one instant can only find a state that
+    # is asymmetric right now; it cannot see a rank whose barrier object MOVED
+    # while another rank's cached view of it did not. That delta is the thing a
+    # reject could actually break, because a reject is the one outcome where
+    # some ranks free and re-allocate the symmetric barrier twice and one rank
+    # does no heap work at all. So snapshot first and compare against the
+    # snapshot, not only across ranks.
+    before = op.probe_barrier_state()
+
     # The divergence: rank 0 alone asks for something C++ refuses (> 0 required).
-    target = 0 if rank == 0 else PREFILL_TOKENS
-    with pytest.raises(RuntimeError):
-        op.reconfigure(max_num_inp_token_per_rank=target)
+    # In the CONTROL arm every rank passes a valid target, so the resize path,
+    # the barriers and the probes are identical and only the reject is removed.
+    # Without that arm a red here is unattributable: it could be the reject or
+    # it could be anything a resize does, and this test has already produced one
+    # false positive (T13) by asserting an invariant that never held.
+    if do_reject:
+        target = 0 if rank == 0 else PREFILL_TOKENS
+        with pytest.raises(RuntimeError):
+            op.reconfigure(max_num_inp_token_per_rank=target)
+    else:
+        op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
 
     probe = op.probe_barrier_state()
     assert probe["initialized"] is True, f"rank {rank} lost its buffers"
@@ -1348,6 +1365,56 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size):
     # the spin read past what its peers publish.
     assert len({r[3] for r in rows}) == 1, (
         f"rank {rank}: barrier buffer SIZE diverged: {[r[3] for r in rows]}"
+    )
+
+    # (4) THE DELTA -- the invariant the cross-rank checks above structurally
+    #     cannot see, and the one a REJECT is uniquely positioned to break.
+    #
+    # After a reject: the rejecting rank was refused inside
+    # ValidateReconfigurable BEFORE FinalizeAll, so it did zero heap work and
+    # its `peer_ptrs` table is the one built at construction. Its peers, by
+    # contrast, freed and re-allocated the barrier object TWICE (grow, then
+    # give-back). If a peer's barrier landed at a different heap offset on the
+    # way back, that peer's own view is self-consistent and the cross-rank
+    # offset check at (2) still passes -- because every rank recomputes its
+    # offset from its own current state -- while the rejecting rank keeps
+    # pointing at where that buffer USED to be. Nobody writes the address it
+    # spins on, and the group wedges with no host-visible asymmetry anywhere.
+    # That is exactly the observed signature.
+    #
+    # Comparing each rank's own before/after is what detects it, and it is
+    # valid in both arms: peer_ptrs are viewer-local mappings, but they are the
+    # SAME viewer's mappings at two instants, so they are directly comparable
+    # (unlike the cross-rank form that produced T13's false positive).
+    moved = {}
+    if int(before["local_ptr"]) != int(probe["local_ptr"]):
+        moved["local_ptr"] = (int(before["local_ptr"]), int(probe["local_ptr"]))
+    if int(before["size"]) != int(probe["size"]):
+        moved["size"] = (int(before["size"]), int(probe["size"]))
+    b_peers = [int(p) for p in before["peer_ptrs"]]
+    a_peers = [int(p) for p in probe["peer_ptrs"]]
+    if b_peers != a_peers:
+        moved["peer_ptrs"] = (b_peers, a_peers)
+
+    # Did ANY rank move? Gather the boolean so that a rank which stayed put
+    # (the rejecter) reports its peers' movement rather than passing quietly.
+    # The rejecter is precisely the rank that cannot see the problem locally.
+    my_moved = torch.tensor([1 if moved else 0], dtype=torch.int64, device="cpu")
+    gathered_moved = [torch.zeros_like(my_moved) for _ in range(world_size)]
+    dist.all_gather(gathered_moved, my_moved, group=group)
+    moved_ranks = [i for i, g in enumerate(gathered_moved) if int(g.item())]
+
+    arm = "REJECT" if do_reject else "CONTROL (no reject)"
+    assert not moved_ranks, (
+        f"rank {rank} [{arm}]: the symmetric barrier object MOVED across the "
+        f"resize on rank(s) {moved_ranks}. This rank's own delta = {moved}. "
+        f"A rank that did no heap work (the rejecter) keeps a peer_ptrs entry "
+        f"addressing the OLD allocation, so its barrier spin waits on memory "
+        f"nobody writes -- a wedge with no host-visible cross-rank asymmetry, "
+        f"which is why every instantaneous probe so far has come back green. "
+        f"If this fires only in the REJECT arm and not in the CONTROL arm, the "
+        f"reject is the cause; if it fires in both, any resize does it and the "
+        f"reject is merely the case with no re-seed to hide it."
     )
 
 
@@ -1738,18 +1805,28 @@ def test_rank_asymmetric_finalize_fails(torch_dist_process_manager, world_size):
 
 
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
-def test_rank_asymmetric_reject_barrier_state(torch_dist_process_manager, world_size):
-    """Which of the three barrier invariants does a REJECT actually break?
+@pytest.mark.parametrize("do_reject", [False, True], ids=["control", "reject"])
+def test_rank_asymmetric_reject_barrier_state(
+    torch_dist_process_manager, world_size, do_reject
+):
+    """Which barrier invariant does a REJECT break -- and does a resize alone?
 
     The measurement `test_rank_asymmetric_reject`'s hang cannot give: it stops
     before the dispatch that wedges and compares the generation, the local
-    barrier addresses and the peer pointers across all ranks. Green refutes all
-    three and points at kernel-resident state; red names the one that broke and
-    prints the per-rank table.
+    barrier addresses and the peer pointers across all ranks, plus each rank's
+    own BEFORE/AFTER delta.
+
+    Runs in two arms so a result is ATTRIBUTABLE. `control` gives every rank a
+    valid target, so the resize, both barriers and both probes happen exactly
+    as in `reject` and only the rejection is removed. Without it, a red in the
+    reject arm cannot be told apart from "any resize does this", and a green
+    cannot be told apart from "the probe measures nothing" -- this test has
+    already produced one false positive (T13) by asserting an invariant that
+    never held on a healthy group.
     """
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
-            (_worker_rank_asymmetric_reject_barrier_state, [world_size])
+            (_worker_rank_asymmetric_reject_barrier_state, [world_size, do_reject])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
