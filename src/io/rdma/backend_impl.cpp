@@ -34,7 +34,7 @@
 // silent and the NEXT line derefs the thing that was just asserted to exist:
 //   :517 / :539 / :556 / :568   -> device / comp-channel / QP derefs
 //   :693 / :699                 -> notification-context deref
-//   :1205 / :1407 / :1516       -> size-agreement checks before indexing
+//   :1205 / :1407               -> size-agreement checks before indexing
 //
 // THE FOUR ON THE PD ROLE-SWITCH PATH ARE NO LONGER ASSERTS. The two
 // `engines.find(ekey)` lookups (BuildRdmaConn, AskRemoteMemoryRegion) and the
@@ -45,6 +45,9 @@
 // GetOrCreateSessionCachedNoThrow -> ERR_BAD_STATE on the transfer, and
 // MainLoop's catch -> "dropping fd ... after exception". A failed transfer or
 // a dropped connection, never a dead inference server.
+// `assert(remoteMr->length == remote.size)` in CreateSession is gone the same
+// way, for the same reason (E's turn-30 ask): a flipped peer answers an
+// unknown memory id with a zero MR at :1119.
 // (Review #64 items 1 and 3; see COORD [M, turn 37].)
 
 #include <sys/epoll.h>
@@ -1559,7 +1562,42 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
       auto remoteMr = rdma->GetRemoteMemory(ekey, ep.rdevId, remote.id);
       if (!remoteMr.has_value()) {
         remoteMr = server->AskRemoteMemoryRegion(ekey, ep.rdevId, remote.id);
-        assert(remoteMr->length == remote.size);
+        // E's standing ask (COORD [E, turn 30], "my highest-value ask for M").
+        // Was an assert. The peer's handler at :1119 answers an UNKNOWN memory
+        // id with a default-constructed MR -- `{}`, i.e. addr 0 / rkey 0 /
+        // length 0 -- because there is no NOT_FOUND status code yet (the TODO
+        // at :1118). A FLIPPED peer is exactly the peer that has forgotten the
+        // id: the flip re-registers its memory, so an in-flight session build
+        // that asks across the flip gets the zero MR.
+        //
+        // NB E's premise was that the assert is compiled out under -DNDEBUG
+        // (CMakeCache.txt:97) and the zero MR therefore gets REGISTERED. That
+        // premise is wrong for this build -- review #64-1 measured NDEBUG in 0
+        // of 49 compile_commands.json entries -- so today it aborts the engine
+        // instead. E's conclusion is right for a different reason, and the
+        // stronger one: an abort is a dead inference server where a throw is a
+        // failed transfer. Both readings agree the assert must go.
+        //
+        // Checked as a real condition, not an invariant: a zero-length or
+        // zero-address MR is diagnosed by name rather than folded into the
+        // size mismatch, because they have different causes (peer forgot the
+        // id vs peer knows a differently-sized region) and an operator acts
+        // differently on each. Throws into GetOrCreateSessionCachedNoThrow ->
+        // ERR_BAD_STATE on the transfer.
+        if (remoteMr->length == 0 || remoteMr->addr == 0) {
+          throw std::runtime_error(
+              "mori::io CreateSession: engine '" + ekey + "' returned a NULL memory region for id " +
+              std::to_string(remote.id) +
+              " (the peer does not know this id -- it has most likely re-registered its memory, "
+              "e.g. across a PD role switch); retry after re-registering");
+        }
+        if (remoteMr->length != remote.size) {
+          throw std::runtime_error(
+              "mori::io CreateSession: engine '" + ekey + "' memory region for id " +
+              std::to_string(remote.id) + " has length " + std::to_string(remoteMr->length) +
+              " but this side expects " + std::to_string(remote.size) +
+              "; an RDMA write against it would run off the end of the peer's registration");
+        }
         rdma->RegisterRemoteMemory(ekey, ep.rdevId, remote.id, remoteMr.value());
       }
       remoteMrByDev[ep.rdevId] = *remoteMr;
