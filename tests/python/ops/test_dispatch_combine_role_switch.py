@@ -27,6 +27,7 @@ role for a small per-step batch. On a flip the buffers must be freed and
 re-allocated for the new capacity, in place, with the shmem context intact --
 and dispatch/combine must still be numerically correct afterwards.
 """
+import gc
 import os
 
 import pytest
@@ -120,7 +121,29 @@ def _heap_stats():
     free bytes are constant whether or not `ShmemFree` is ever called. These
     counters come from the heap's own VA manager and so actually move when an
     a2a buffer is leaked.
+
+    Settles pending finalizations FIRST. Every caller uses this to take a
+    baseline and diff against it, and that diff is only attributable to the
+    code under test if no OTHER op releases its buffers in between. Ops from
+    earlier tests do exactly that: the worker pool is session-scoped, so a
+    previous test's op outlives its worker function, and when it is finally
+    collected pybind runs ~EpDispatchCombineHandle and returns that op's
+    buffers to the same heap -- inflating free space and producing a NEGATIVE
+    "leak" in a later test. Measured, not theorized: T15a's full-suite run had
+    `test_flip_at_real_capacities` fail on all 8 ranks with an identical
+    -110309888 bytes (more free after finalize than at its own baseline) while
+    the same test alone passes with a byte-identical closed loop (T15b).
+
+    That the free lands late at all is itself the datum: plain refcounting
+    would have released the op when its worker function returned, i.e. before
+    the next test's baseline. Something holds the reference past that point, so
+    teardown timing is not deterministic. Worth more than a test fix -- mori's
+    ShmemFree mutates the shared symmetric-heap VA manager, so a teardown whose
+    timing is set by a garbage collector is a teardown whose ORDER across ranks
+    is not guaranteed. sglang should hold its op explicitly and call finalize()
+    rather than letting it fall out of scope. Recorded for S in COORD.
     """
+    gc.collect()
     return mori.shmem.shmem_get_heap_stats()
 
 
