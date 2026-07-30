@@ -57,5 +57,6 @@ RUN if [ "${INSTALL_ROCM714}" = "1" ]; then set -ex && \
     fi
 
 ENV HIP_PATH=/opt/rocm
+ENV PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
 
 RUN pip install --no-cache-dir flydsl
