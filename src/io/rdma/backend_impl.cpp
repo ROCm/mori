@@ -1434,6 +1434,39 @@ void RdmaBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
   server->RegisterRemoteEngine(rdesc);
 }
 
+// REACHABILITY, measured 2026-07-30T11:55Z against sglang @38ad45fe (and the
+// teamE worktree): `deregister_remote_engine` has **ZERO callers in all of
+// sglang** -- `grep -rn --include=*.py` returns 0, while the control grep for
+// `register_remote_engine` returns 1 (conn.py:774, `_add_remote_peer`). So on
+// the REAL PD flip path nothing below this line executes, and the turn-39
+// invalidation is, as shipped, dead code for role-switch.
+//
+// It is deliberately KEPT, for two reasons that are worth stating rather than
+// re-deriving:
+//  1. It is correct and it is the right hook. Any caller that does tear a peer
+//     down -- a future sglang that prunes `decode_kv_args_table`, or a mori
+//     user outside sglang -- needs exactly this, and shipping the API without
+//     the invalidation is the bug review #66-2 identified.
+//  2. It is not what saves the flip today. What saves it is that a flip
+//     destroys the whole IOEngine (`MoriKVManager.teardown()` -> `self.engine =
+//     None` at conn.py:724) and `init_disaggregation` builds a NEW one, whose
+//     `engine_key` carries a fresh `uuid4().hex[:8]` (conn.py:362-366). A new
+//     key means new `remotes[ekey]` / `sessionCache` entries, so no stale rkey
+//     is reachable by lookup: the flip gets safety from throwing the container
+//     away, not from invalidating it.
+//
+// The corollary is the part that matters and it is NOT fixed by this function:
+// the SURVIVING peer never hears that the old key died. Its `engines`,
+// `remotes[oldKey]` (rTable + endpoints), `endpointsById_`, and NotifManager's
+// `registeredRuntimes_`/`notifCtxById_` all stay keyed on the DEAD engine key
+// for the life of the process -- and `notifCtxById_` holds, per QP, a
+// `posix_memalign` buffer and a registered MR that only `Shutdown()` releases
+// (there is no per-endpoint removal anywhere; `grep notifCtxById_` shows insert
+// and find, never erase). That is a per-flip, per-peer, per-QP leak of pinned
+// host memory and RDMA MRs on the peer that did NOT flip, and it accumulates
+// over a multi-cycle flip stress. Tracked as the next item; fixing it needs an
+// engine-scoped endpoint teardown, which is a bigger change than this one
+// because transfer threads hold `EndpointRuntime` shared_ptrs live.
 void RdmaBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   // Order matters: stop NEW sessions from being built against the dead engine
   // first (BuildRdmaConn throws once `engines` no longer has it), then drop the
