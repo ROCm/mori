@@ -1885,7 +1885,10 @@ void RdmaBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
 // also reached by CreateSession's lazy per-device fill -- which is exactly the
 // racing path the tombstone must refuse.
 void RdmaBackend::RegisterMemory(MemoryDesc& desc) {
-  if (rdma && rdma->ClearLocalMemoryGate(desc.id)) {
+  // Same ownership guard as DeregisterMemory below: only OUR ids have gates,
+  // and lifting a tombstone for a colliding remote id would reopen a local
+  // buffer that is still legitimately retired.
+  if (rdma && desc.engineKey == myEngKey && rdma->ClearLocalMemoryGate(desc.id)) {
     MORI_IO_INFO("RegisterMemory: memory id {} was retired by a previous deregister; the gate is "
                  "reopened and transfers against it are admitted again",
                  desc.id);
@@ -1905,7 +1908,28 @@ void RdmaBackend::RegisterMemory(MemoryDesc& desc) {
 void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
   server->DeregisterMemory(desc);
   InvalidateSessionsForMemory(desc.id);
-  if (!rdma->QuiesceLocalMemory(desc.id, GetDeregisterQuiesceTimeoutMs())) {
+  // A MemoryUniqueId is only unique WITHIN its owning engine -- every
+  // IOEngine seeds `nextMemUid` at 0 (engine.cpp:363) -- so a descriptor
+  // belonging to a REMOTE engine can carry an id that also names one of OUR
+  // live local buffers. memGates_ is keyed on the bare id, so quiescing a
+  // remote descriptor here would retire the local buffer that happens to share
+  // its number. T41 hit exactly that: `rdma_transfer_survives_concurrent_
+  // deregister` calls `initiator->DeregisterMemory(rdesc)` with the TARGET's
+  // descriptor, whose id 0 collides with the initiator's own `src` id 0, and
+  // the tombstone then refused every later transfer from src.
+  //
+  // The collision predates the tombstone; the ERASE simply left no residue, so
+  // it was silent. Guarding the barrier on ownership is correct on its own
+  // terms regardless: the gate protects an lkey WE registered, and there is no
+  // lkey of ours to protect for a descriptor we do not own.
+  //
+  // NOT FIXED HERE, and it is the same collision one layer down:
+  // `rdma->DeregisterLocalMemory(desc)` below keys mTable on {devId, id} with
+  // no engine discriminator either, so the remote-descriptor path can still
+  // deregister a local MR that shares the number. Reported rather than
+  // widened into this commit -- see WORKLOG T41.
+  const bool isLocal = desc.engineKey == myEngKey;
+  if (isLocal && !rdma->QuiesceLocalMemory(desc.id, GetDeregisterQuiesceTimeoutMs())) {
     // Deliberately NOT a throw and NOT an abort. A flip that cannot complete is
     // as bad as a corrupt one, so proceed -- but say so loudly, because past
     // this line the lkey may still be live for the NIC and this is the one
