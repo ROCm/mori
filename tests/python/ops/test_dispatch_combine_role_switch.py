@@ -1540,6 +1540,88 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=Tru
         f"switch changes."
     )
 
+    # (5b) THE SAME STALENESS CHECK ON THE TABLE THE KERNELS ACTUALLY READ,
+    #      AND ON THE DEVICE-SIDE COPY OF IT.
+    #
+    # Everything above reads `peer_ptrs`, the HOST table. No intranode kernel
+    # dereferences it: `GetAs<T*>(pe)` returns `p2pPeerPtrs[pe]`
+    # (application_device_types.hpp:137-138) and that is what intranode.hpp:65
+    # (barrier store), :186 (the recvTokenNum signal the SENDER spins on) and
+    # :392 all call. The two tables are built by separate loops
+    # (symmetric_memory.cpp:389-392 vs :394-397) from different sources -- the
+    # heap's RDMA peerPtrs vs its p2p (hipIpcOpenMemHandle) pointers -- so
+    # coherence of one does not imply coherence of the other.
+    #
+    # And `SymmMemObjPtr` holds TWO structs: a host one (:380) and a device one
+    # hipMalloc'd and copied at :409-421, with `operator->` picking between
+    # them on __device__ vs __host__ (:150-153). They are snapshotted at
+    # registration and never re-synced. Host code -- every probe written in
+    # this campaign -- reads `.cpu`; kernels read `.gpu`. A divergence between
+    # them is invisible to every check above and is precisely what a wedged
+    # kernel would dereference. So: assert the device copy EQUALS the host one,
+    # per object, per field.
+    assert any(o.get("gpu_read") for o in a_objs.values()), (
+        f"rank {rank} [{arm}]: no object reported gpu_read -- the device-side "
+        f"SymmMemObj readback did not happen on any buffer, so the host/device "
+        f"comparison below is vacuous. The .so is older than the python."
+    )
+
+    hostdev = []
+    for name in names:
+        o = a_objs[name]
+        if not o.get("gpu_read"):
+            # A failed readback is recorded rather than asserted away: it is a
+            # diagnostic limitation, not a product defect.
+            continue
+        if int(o["local_ptr"]) == 0:
+            continue  # unallocated; both sides are legitimately zero
+        if int(o["gpu_local_ptr"]) != int(o["local_ptr"]):
+            hostdev.append((name, "local_ptr", int(o["local_ptr"]), int(o["gpu_local_ptr"])))
+        if int(o["gpu_size"]) != int(o["size"]):
+            hostdev.append((name, "size", int(o["size"]), int(o["gpu_size"])))
+        for field, gfield in (("peer_ptrs", "gpu_peer_ptrs"),
+                              ("p2p_peer_ptrs", "gpu_p2p_peer_ptrs")):
+            h = [int(x) for x in (o.get(field) or [])]
+            g = [int(x) for x in (o.get(gfield) or [])]
+            if h and g and h != g:
+                hostdev.append((name, field, h, g))
+
+    assert not hostdev, (
+        f"rank {rank} [{arm}]: the DEVICE copy of a symmetric object disagrees "
+        f"with the HOST copy -- (object, field, host, device) = {hostdev}. "
+        f"SymmMemObjPtr holds two separately allocated structs "
+        f"(symmetric_memory.cpp:380 host, :409-421 device) and `operator->` "
+        f"picks between them on __device__ vs __host__ "
+        f"(application_device_types.hpp:150-153). Every host-side check in this "
+        f"suite reads the host one; every kernel reads the device one. A "
+        f"divergence here is a kernel dereferencing an address no host check "
+        f"can see, which is the exact shape of the wedge."
+    )
+
+    # Staleness on p2p_peer_ptrs, the table the kernels index.
+    stale_p2p = []
+    for k, name in enumerate(names):
+        bp = [int(x) for x in (b_objs[name].get("p2p_peer_ptrs") or [])]
+        ap = [int(x) for x in (a_objs[name].get("p2p_peer_ptrs") or [])]
+        if len(bp) != world_size or len(ap) != world_size:
+            continue  # unallocated object; nothing to check
+        for peer in range(world_size):
+            seen = ap[peer] - bp[peer]
+            truth = true_obj_deltas[peer][k]
+            if seen != truth:
+                stale_p2p.append((name, peer, seen, truth))
+
+    assert not stale_p2p, (
+        f"rank {rank} [{arm}]: STALE p2p PEER POINTERS -- (object, peer, delta "
+        f"this rank sees, delta that peer actually underwent) = {stale_p2p}. "
+        f"This is the table the kernels dereference: GetAs<T*>(pe) returns "
+        f"p2pPeerPtrs[pe] (application_device_types.hpp:137-138), used by "
+        f"intranode.hpp:65 for the barrier store and :186 for the recvTokenNum "
+        f"signal the SENDER spins on. `peer_ptrs`, which every earlier revision "
+        f"of this probe checked, is the RDMA-facing table and no intranode "
+        f"kernel reads it -- so a green there was never evidence about this."
+    )
+
     # Sizes must agree across ranks per object too: a symmetric object whose
     # size differs between ranks means a peer read runs past what its owner
     # published.
