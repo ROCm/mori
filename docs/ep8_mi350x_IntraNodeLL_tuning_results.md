@@ -12,7 +12,7 @@ Token counts: 1, 32, 64 (latency-optimal, small batch regime)
 
 | Tokens | block_num | warp_per_block | BW (GB/s) | Latency |
 |--------|-----------|----------------|-----------|---------|
-| 1 | 144 | 16 | 3.95 | 22.3 us |
+| 1 | 1 | 9 | 2.8 | 16.7 us |
 | 32 | 32 | 10 | 95.0 | 25.7 us |
 | 64 | 72 | 10 | 148.8 | 32.7 us |
 
@@ -33,11 +33,11 @@ Note: MI355X only shipped dispatch configs for IntraNodeLL; combine configs are 
 
 | Tokens | Baseline bn/wpb | Baseline BW | Tuned bn/wpb | Tuned BW | Delta |
 |--------|-----------------|-------------|--------------|----------|-------|
-| 1 | 1/9 | 2.8 | 144/16 | 3.95 | +41% |
+| 1 | 1/9 | 2.8 | 1/9 | 2.8 | 0% |
 | 32 | 32/9 | 79.0 | 32/10 | 95.0 | +20% |
 | 64 | 64/9 | 127.9 | 72/10 | 148.8 | +16% |
 
-Significant gains across all token counts. MI355X's wpb=9 is suboptimal on MI350X — wpb=10 or 16 performs better. At 1 token, bn=1 severely underutilizes the GPU; bn=144 allows more warps to overlap memory latency.
+Significant gains at 32+ token counts. MI355X's wpb=9 is suboptimal on MI350X for larger batches — wpb=10 performs better. At 1 token, the baseline bn=1/wpb=9 is kept as BW is too small to meaningfully differentiate configs; latency is the relevant metric.
 
 ### Combine (new — no MI355X baseline existed)
 
@@ -51,7 +51,7 @@ Significant gains across all token counts. MI355X's wpb=9 is suboptimal on MI350
 
 | Tokens | LL Dispatch lat | IntraNode Dispatch lat | LL Combine lat | IntraNode Combine lat |
 |--------|-----------------|------------------------|----------------|----------------------|
-| 1 | 22.3 us | — | 19.4 us | — |
+| 1 | 16.7 us | — | 19.4 us | — |
 | 32 | 25.7 us | — | 23.2 us | — |
 | 64 | 32.7 us | 32.1 us (fp8_e4m3) | 28.7 us | 28.6 us (P2P) |
 

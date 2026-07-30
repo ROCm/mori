@@ -10,11 +10,11 @@
       "dtype": "bf16",
       "num_tokens": 1,
       "hidden_dim": 7168,
-      "block_num": 144,
+      "block_num": 1,
       "rdma_block_num": 0,
-      "warp_per_block": 16,
-      "bandwidth_gbps": 3.95,
-      "latency_us": 22.25
+      "warp_per_block": 9,
+      "bandwidth_gbps": 2.8,
+      "latency_us": 16.7
     },
     {
       "dtype": "bf16",
