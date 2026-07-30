@@ -1171,6 +1171,129 @@ def _worker_rank_asymmetric_reject_heap_symmetry(rank, world_size):
     _assert_capacity(op, DECODE_TOKENS)
 
 
+def _worker_rank_asymmetric_reject_barrier_state(rank, world_size):
+    """MEASURE what the group disagrees about after a REJECT. No dispatch.
+
+    Two fixes for the reject hang have been aimed at hypotheses inferred from
+    outside the process and both were refuted after the fact: the peer-VA
+    offset story (T10, `1b407d45`, refuted by the heap-symmetry probe) and the
+    barrier-GENERATION story (T11, `a430c6e2`, refuted at world 8 in T12b with
+    the binding confirmed present in the shipped .so). This test stops guessing
+    and reads the three things a cross-device barrier actually depends on:
+
+      1. the GENERATION each rank holds (`crossDeviceBarrierFlag[0]`) -- every
+         barrier atomicAdds it and then spins until its peers publish the same
+         value (intranode.hpp:69,73), so the group progresses only while all
+         ranks agree;
+      2. each rank's LOCAL address for the symmetric barrier buffer;
+      3. what each rank believes its PEERS' copies are at.
+
+    (3) is the one nothing has ever checked, and it is not implied by (and
+    therefore not refuted by) the heap-symmetry probe: that compares heap
+    ACCOUNTING (total_free_space, block counts), and a deterministic first-fit
+    VA manager can return identical totals for different addresses. The
+    symmetric-heap contract is stronger than "same free space" -- it is
+    `peer_ptrs[i]` as seen by ANY rank == `local_ptr` as seen by rank i, which
+    `RegisterStaticHeapSubRegion` (symmetric_memory.cpp:392) assumes when it
+    derives peers as `peerPtrs[i] + offset` with no allgather to check.
+
+    Deliberately does NOT dispatch: `_worker_rank_asymmetric_reject` wedges in
+    the post-combine sync, and a wedge yields no diagnostic at all -- just a
+    harness timeout naming ranks that are in fact alive, which is how three
+    turns of this campaign were spent. This one always reports numbers.
+
+    Assertions are written so that a failure PRINTS the full per-rank table
+    for whichever invariant broke. A green here refutes all three mechanisms at
+    once and moves the search to kernel-resident state, which is equally
+    useful; the point is that either outcome is a measurement.
+    """
+    config = _make_config(rank, world_size, DECODE_TOKENS)
+    op = mori.ops.EpDispatchCombineOp(config)
+    _run_once(op, config)
+
+    if op.probe_barrier_state() is None:
+        # mori extension predates the binding (possible: sglang loads mori off
+        # PYTHONPATH). Return rather than pytest.skip() -- Skipped is a
+        # BaseException and escaping it here leaves the parent's collective
+        # get() waiting forever (be825794).
+        return
+
+    # The divergence: rank 0 alone asks for something C++ refuses (> 0 required).
+    target = 0 if rank == 0 else PREFILL_TOKENS
+    with pytest.raises(RuntimeError):
+        op.reconfigure(max_num_inp_token_per_rank=target)
+
+    probe = op.probe_barrier_state()
+    assert probe["initialized"] is True, f"rank {rank} lost its buffers"
+
+    if not dist.is_initialized():
+        return
+    from mori.shmem import shmem_get_process_group
+
+    group = shmem_get_process_group()
+
+    # Gather (generation, seed, local_ptr, size) + the peer_ptrs vector from
+    # every rank. CPU tensors: the shmem group can be gloo-only (bf9757e9).
+    mine = torch.tensor(
+        [
+            int(probe["generation"]),
+            int(probe["seed"]),
+            int(probe["local_ptr"]),
+            int(probe["size"]),
+        ],
+        dtype=torch.int64,
+        device="cpu",
+    )
+    gathered = [torch.zeros_like(mine) for _ in range(world_size)]
+    dist.all_gather(gathered, mine, group=group)
+    rows = [tuple(int(v) for v in g.tolist()) for g in gathered]
+    gens = [r[0] for r in rows]
+    local_ptrs = [r[2] for r in rows]
+
+    peers = torch.tensor(
+        [int(p) for p in probe["peer_ptrs"]] or [0] * world_size,
+        dtype=torch.int64,
+        device="cpu",
+    )
+    gathered_peers = [torch.zeros_like(peers) for _ in range(world_size)]
+    dist.all_gather(gathered_peers, peers, group=group)
+    peer_rows = [[int(v) for v in g.tolist()] for g in gathered_peers]
+
+    # (1) GENERATION. If this is what diverges, a430c6e2 did not take effect on
+    #     the reject path and the T11 mechanism is back in play.
+    assert len(set(gens)) == 1, (
+        f"rank {rank}: barrier GENERATION diverged after a REJECT -- per-rank "
+        f"generation = {gens} (seeds {[r[1] for r in rows]}). Every barrier "
+        f"spins until all ranks publish the SAME generation "
+        f"(intranode.hpp:69,73), so the next collective wedges. This is the "
+        f"T11/a430c6e2 mechanism: the rejecting rank is refused inside "
+        f"ValidateReconfigurable BEFORE FinalizeAll, so it never re-seeds."
+    )
+
+    # (2)+(3) ADDRESSES. The symmetric contract: what rank j thinks rank i's
+    #     buffer is at must equal what rank i says its buffer is at. This is
+    #     the invariant the heap-accounting probe cannot see.
+    for viewer, seen in enumerate(peer_rows):
+        if not seen or all(v == 0 for v in seen):
+            continue  # no peerPtrs on this rank (non-static-heap mode)
+        assert seen == local_ptrs, (
+            f"rank {rank}: PEER POINTERS diverged after a REJECT -- rank "
+            f"{viewer} believes the peers' barrier buffers are at {seen}, but "
+            f"the ranks themselves report {local_ptrs}. A combine will spin on "
+            f"an address nobody writes. RegisterStaticHeapSubRegion "
+            f"(symmetric_memory.cpp:392) derives peers as peerPtrs[i]+offset "
+            f"with no allgather, and a REJECT is the one outcome where a rank "
+            f"does zero heap work while its peers do two full free/alloc "
+            f"round trips."
+        )
+
+    # Every rank agrees on the buffer size too -- a size mismatch would make
+    # the spin read past what its peers publish.
+    assert len({r[3] for r in rows}) == 1, (
+        f"rank {rank}: barrier buffer SIZE diverged: {[r[3] for r in rows]}"
+    )
+
+
 def _worker_reconfigure_rejects_immutable_fields(rank, world_size):
     """numQpPerPe / useExternalInpBuffer are peer-visible; they must be frozen.
 
@@ -1553,6 +1676,23 @@ def test_rank_asymmetric_finalize_fails(torch_dist_process_manager, world_size):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_worker_rank_asymmetric_finalize_fails, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+def test_rank_asymmetric_reject_barrier_state(torch_dist_process_manager, world_size):
+    """Which of the three barrier invariants does a REJECT actually break?
+
+    The measurement `test_rank_asymmetric_reject`'s hang cannot give: it stops
+    before the dispatch that wedges and compares the generation, the local
+    barrier addresses and the peer pointers across all ranks. Green refutes all
+    three and points at kernel-resident state; red names the one that broke and
+    prints the per-rank table.
+    """
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_rank_asymmetric_reject_barrier_state, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
