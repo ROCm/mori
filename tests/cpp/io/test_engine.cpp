@@ -2007,23 +2007,44 @@ void CaseRdmaGateReapBookkeepingUnderDecline() {
 
   const DeregQuiesceCensus base = GetDeregQuiesceCensus();
 
-  // Gate 1: retire it while a token is HELD, so its Inflight() stays 1 and
-  // every reap that reaches it must decline. This is the stranded candidate.
-  const MemoryUniqueId kHeldId = 900001;
-  auto heldGate = mgr.GetOrCreateLocalMemoryGate(kHeldId);
-  std::shared_ptr<void> token = MemoryInflightGate::Acquire(heldGate);
-  Require(token != nullptr, "instrument check: Acquire on a fresh gate must return a token");
-  Require(heldGate->Inflight() == 1,
-          "instrument check: a held token must show Inflight()==1, got " +
-              std::to_string(heldGate->Inflight()));
-  // 1 ms: this quiesce MUST time out -- the token is held by this thread and
-  // cannot be released until below, so a long timeout would only stall.
-  const bool drained = mgr.QuiesceLocalMemory(kHeldId, 1);
-  Require(!drained, "instrument check: a quiesce with a held token must NOT drain");
+  // FOUR strands, and both the count and the ORDER of the phases matter. T45e
+  // measured that the resident count WHILE the gates are held discriminates
+  // NOTHING, and the reasoning is worth stating because it is what my first
+  // version got wrong: with S strands, post-fix the strands sit in the deque
+  // being declined and each new tombstone is evicted behind them; PRE-fix the
+  // strands are off the deque but still counted, so `count > bound` is likewise
+  // permanently true and each new tombstone is likewise evicted. Both arms show
+  // resident == S. Same number, different identity -- T45e read `resident=1`
+  // with `kStrands=1` and I mis-called it a strand.
+  //
+  // The arms separate only AFTER the hold is RELEASED. Post-fix the drained
+  // gates are still in the deque, so the next reap evicts them down to the
+  // bound. Pre-fix they were dropped from the deque and are unreachable
+  // forever, so they remain a permanent leak of exactly S entries -- and, worse,
+  // `retiredGateCount_` stays >= S so every future dereg keeps evicting its own
+  // fresh tombstone. Hence S must exceed the bound for the gap to be visible:
+  // 4 against bound=1.
+  const int kStrands = 4;
+  std::vector<std::shared_ptr<MemoryInflightGate>> heldGates;
+  std::vector<std::shared_ptr<void>> tokens;
+  for (int i = 0; i < kStrands; ++i) {
+    const MemoryUniqueId id = 900001 + i;
+    auto gate = mgr.GetOrCreateLocalMemoryGate(id);
+    std::shared_ptr<void> tok = MemoryInflightGate::Acquire(gate);
+    Require(tok != nullptr, "instrument check: Acquire on a fresh gate must return a token");
+    Require(gate->Inflight() == 1,
+            "instrument check: a held token must show Inflight()==1, got " +
+                std::to_string(gate->Inflight()));
+    // 1 ms: this quiesce MUST time out -- the token is held by this very thread
+    // and cannot be released until below, so a longer timeout would only stall.
+    Require(!mgr.QuiesceLocalMemory(id, 1),
+            "instrument check: a quiesce with a held token must NOT drain");
+    heldGates.push_back(std::move(gate));
+    tokens.push_back(std::move(tok));
+  }
 
-  // Now retire several more ids, each with nothing outstanding. Every one of
-  // these runs a reap, and each reap finds the HELD gate at the front of the
-  // deque (it retired first) and must decline it.
+  // Retire more ids with nothing outstanding. Each runs a reap, and each reap
+  // walks into the held gates at the front of the deque and must decline them.
   const int kLaterIds = 6;
   for (int i = 0; i < kLaterIds; ++i) {
     const MemoryUniqueId id = 900100 + i;
@@ -2034,37 +2055,46 @@ void CaseRdmaGateReapBookkeepingUnderDecline() {
   const DeregQuiesceCensus mid = GetDeregQuiesceCensus();
   const std::size_t declined = mid.gateReapDeclined - base.gateReapDeclined;
   const std::size_t residentWhileHeld = mid.gateTombstones;
-  std::printf("[gate-book] while held: declined=%zu resident=%zu bound=%zu (%d later ids)\n",
-              declined, residentWhileHeld, kBound, kLaterIds);
+  std::printf("[gate-book] while held: declined=%zu resident=%zu strands=%d bound=%zu (%d later)\n",
+              declined, residentWhileHeld, kStrands, kBound, kLaterIds);
 
-  // NON-VACUITY. Unlike the end-to-end case this is guaranteed by construction
-  // -- the token is held by this very thread -- so a zero here means the reap
-  // never reached the held gate and every number below is void.
+  // NON-VACUITY, and here it is guaranteed by construction rather than hoped
+  // for: the tokens are held by the asserting thread, so a zero means the reap
+  // never reached them and every number below is void.
   Require(declined > 0,
-          "VACUOUS: the held gate was never declined (gateReapDeclined=0), so the strand path "
-          "was not entered even with a token held by this thread. Not a pass.");
+          "VACUOUS: no held gate was ever declined (gateReapDeclined=0), so the strand path was "
+          "not entered even with tokens held by this thread. Not a pass.");
+  // NOT asserted as a discriminator -- see above, both arms give kStrands here.
+  // Asserted only as an instrument check that the strands are actually resident.
+  Require(residentWhileHeld >= static_cast<std::size_t>(kStrands),
+          "instrument check: expected at least the " + std::to_string(kStrands) +
+              " held gates to be resident, got " + std::to_string(residentWhileHeld));
 
-  // THE DISCRIMINATOR.
-  Require(residentWhileHeld > kBound,
-          "STRANDED: with one gate held and " + std::to_string(kLaterIds) +
-              " later retirements, only " + std::to_string(residentWhileHeld) +
-              " tombstone(s) are resident at bound=" + std::to_string(kBound) +
-              ". The declined gate was dropped from the deque while still counted, so the count "
-              "and the map have diverged and every later dereg now evicts its own tombstone.");
-
-  // The other half: release the hold and the retention must come back DOWN.
-  token.reset();
-  Require(heldGate->Inflight() == 0, "instrument check: releasing the token must zero Inflight()");
+  // THE DISCRIMINATOR: release every hold, then run one more retirement so a
+  // reap gets a chance to collect them.
+  for (auto& tok : tokens) tok.reset();
+  for (int i = 0; i < kStrands; ++i) {
+    Require(heldGates[i]->Inflight() == 0,
+            "instrument check: releasing the token must zero Inflight()");
+  }
   const MemoryUniqueId kFinalId = 900200;
   (void)mgr.GetOrCreateLocalMemoryGate(kFinalId);
   Require(mgr.QuiesceLocalMemory(kFinalId, 1000), "final gate must drain");
 
   const std::size_t residentAfter = GetDeregQuiesceCensus().gateTombstones;
-  std::printf("[gate-book] after release: resident=%zu bound=%zu\n", residentAfter, kBound);
+  std::printf("[gate-book] after release: resident=%zu strands=%d bound=%zu\n", residentAfter,
+              kStrands, kBound);
+  // Post-fix: the drained strands are still in the deque, so they are evicted
+  // down to the bound. Pre-fix: they were dropped from the deque and cannot be
+  // reached by any future reap, so residentAfter stays at kStrands(4) + the
+  // final tombstone -- well above bound+1 = 2. That gap is the claim.
   Require(residentAfter <= kBound + 1,
-          "the re-pushed gate was never evicted after its posts drained: resident=" +
-              std::to_string(residentAfter) + " at bound=" + std::to_string(kBound) +
-              ". A re-push that pins forever is a leak, not a fix.");
+          "STRANDED: after releasing all " + std::to_string(kStrands) +
+              " holds and running another retirement, " + std::to_string(residentAfter) +
+              " tombstone(s) are still resident at bound=" + std::to_string(kBound) +
+              ". A declined gate that was dropped from retiredOrder_ can never be evicted again, "
+              "so it leaks and keeps retiredGateCount_ permanently above the bound -- which makes "
+              "every later dereg evict its own fresh tombstone and zeroes reentry protection.");
 }
 
 void CaseRdmaNotificationDisabledBehavior() {
