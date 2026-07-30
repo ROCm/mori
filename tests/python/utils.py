@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import os
+import sys
 import time
 import torch
 import torch.distributed as dist
@@ -27,6 +28,33 @@ import socket
 from multiprocessing import Queue
 import mori
 import traceback
+
+
+# Where a worker's SIGUSR1 stack dump lands. One file per rank -- see the long
+# comment in TorchDistProcessManager._worker for why a shared stderr does not
+# work at world 8. Overridable so a run can keep its dumps beside its log.
+STACK_DUMP_DIR = os.environ.get("MORI_TEST_STACK_DUMP_DIR", "/tmp")
+
+
+def stack_dump_path(rank, pid=None):
+    """Path rank `rank`'s faulthandler dump is written to.
+
+    Keyed on the WORKER's pid, which both sides can name: the worker passes
+    nothing (defaults to its own getpid()), and the parent -- which is the
+    consumer, in assert_worker_results' timeout branch -- passes
+    manager.processes[rank].pid. Keying on the pid and not on the rank alone
+    matters because the pool is session-scoped and gets restarted: two
+    successive worker sets would otherwise write the same eight paths, and a
+    stale dump from a previous test read as the current wedge is worse than no
+    dump at all.
+    """
+    pid = os.getpid() if pid is None else pid
+    return os.path.join(STACK_DUMP_DIR, f"mori_stack_pid{pid}_rank{rank}.txt")
+
+
+# The worker's dump file, held at module scope so the fd outlives _worker's
+# frame -- faulthandler keeps the raw fd and writes nothing if it is closed.
+_STACK_DUMP_FILE = None
 
 
 str_to_dtype = {
@@ -170,12 +198,38 @@ class TorchDistProcessManager:
         # the launching Python frame. But distinguishing "wedged in python/
         # gloo teardown" from "spinning in device code" is precisely the open
         # question behind review #47-2, and the launching frame answers it.
+        #
+        # PER-RANK FILE, not the shared stderr. The first version of this
+        # dumped to the inherited stderr, and at world 8 that is unreadable:
+        # T25d's log holds 32 `Thread 0x` blocks from 8 ranks writing the same
+        # fd concurrently, byte-interleaved, with embedded NULs -- `tr -d
+        # '\000'` is needed even to grep it, and no single rank's stack can be
+        # reassembled from it. faulthandler makes no attempt to write a dump
+        # atomically (it emits one raw write per LINE), so interleaving is
+        # guaranteed, not unlucky. An instrument built to name the cause of a
+        # wedge that cannot be read at the world size the wedge happens at is
+        # not an instrument.
+        #
+        # The fd must stay open for the life of the process: faulthandler
+        # stores the raw fd, and writing to a closed one silently produces
+        # nothing. So bind it to a module-global rather than a local, and never
+        # close it.
         import faulthandler
         import signal
 
         faulthandler.enable()
         if hasattr(faulthandler, "register"):
-            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+            global _STACK_DUMP_FILE
+            try:
+                _STACK_DUMP_FILE = open(stack_dump_path(rank), "w")
+            except OSError:
+                _STACK_DUMP_FILE = None
+            faulthandler.register(
+                signal.SIGUSR1,
+                file=_STACK_DUMP_FILE if _STACK_DUMP_FILE is not None else sys.stderr,
+                all_threads=True,
+                chain=False,
+            )
 
         with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
             if init_shmem:

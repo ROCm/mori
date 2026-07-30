@@ -25,7 +25,11 @@ import signal
 import time
 
 import pytest
-from tests.python.utils import TorchDistProcessManager, data_type_supported
+from tests.python.utils import (
+    TorchDistProcessManager,
+    data_type_supported,
+    stack_dump_path,
+)
 import mori
 import torch
 import torch.distributed as dist
@@ -377,10 +381,46 @@ def _dump_worker_stacks(procs, alive_ranks, settle_s=2.0):
             pass
     if not sent:
         return "Could not signal any alive rank for a stack dump."
-    # Give the handlers a moment to write before pytest tears the run down;
-    # the dumps go to the workers' inherited stderr, not through this process.
+    # Give the handlers a moment to write before we read the files back.
     time.sleep(settle_s)
-    return f"Requested a SIGUSR1 stack dump from alive ranks {sent}; their Python stacks are in this run's stderr."
+
+    # READ THE DUMPS AND PUT THEM IN THE FAILURE MESSAGE.
+    #
+    # The previous version signalled the ranks and then told the reader to go
+    # look in stderr. Two things were wrong with that. The dumps went to a
+    # SHARED stderr, so at world 8 they arrived byte-interleaved and could not
+    # be attributed to a rank (T25d: 32 unreadable `Thread 0x` blocks). And
+    # even had they been readable, they were in the run log while the
+    # diagnosis was in pytest's failure text -- two artifacts, and only the
+    # second one survives into a WORKLOG entry. Each worker now writes its own
+    # file (tests/python/utils.stack_dump_path), so the stacks can be read
+    # back here, labelled by rank, and carried by the failure itself.
+    #
+    # Best-effort throughout: this runs on the way to a pytest.fail() and must
+    # never replace that failure with its own.
+    chunks = []
+    for i in sent:
+        try:
+            pid = procs[i].pid
+            with open(stack_dump_path(i, pid)) as fh:
+                text = fh.read().strip()
+        except (OSError, AttributeError, IndexError) as exc:
+            chunks.append(f"  rank {i}: <no stack: {type(exc).__name__}: {exc}>")
+            continue
+        if not text:
+            # The handler is registered but produced nothing -- the rank is
+            # wedged somewhere that never returns to the signal handler at
+            # all (a device spin with signals masked), which is itself a
+            # distinguishing observation and must not read as "no data".
+            chunks.append(f"  rank {i}: <handler produced an EMPTY dump>")
+        else:
+            indented = "\n".join("    " + ln for ln in text.splitlines())
+            chunks.append(f"  rank {i} stack:\n{indented}")
+    return (
+        f"SIGUSR1 stack dump from alive ranks {sent} "
+        f"(per-rank files under {os.path.dirname(stack_dump_path(0))}):\n"
+        + "\n".join(chunks)
+    )
 
 
 def assert_worker_results(manager, world_size, timeout=None):
@@ -460,7 +500,10 @@ def assert_worker_results(manager, world_size, timeout=None):
                 f"false red. exitcode not-None means look for an exit(-1) from "
                 f"HIP_RUNTIME_CHECK, a segfault, or an OOM kill. "
                 f"{reported_detail}"
-                f"{dumped} (run with -s to see them)",
+                # No "(run with -s to see them)" any more: the stacks are
+                # inline above, so the diagnosis no longer depends on a flag
+                # the failing run may not have been launched with.
+                f"{dumped}",
                 pytrace=False,
             )
         results.append((rank, result))
