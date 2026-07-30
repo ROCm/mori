@@ -245,6 +245,9 @@ class EpDispatchCombineOp:
         self._group = group
 
         self._shmem_barrier(group)
+        # Set BEFORE the try: the finally must be able to read it even if the
+        # very first statement in the body raises.
+        construct_failed = 1
         try:
 
             handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
@@ -390,6 +393,10 @@ class EpDispatchCombineOp:
                     f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
                 )
 
+            # Reached only if the whole body succeeded, so the finally's
+            # all-reduce contributes 0 from this rank.
+            construct_failed = 0
+
             # EXIT barrier. The entry barrier above is NOT sufficient, and the
             # asymmetry with finalize() -- which has always barriered on both sides
             # -- is the bug.
@@ -438,12 +445,44 @@ class EpDispatchCombineOp:
             # is exactly where a rank-local OOM is expected, so this is the
             # likely case, not the exotic one.
             #
-            # Barriering on the way out of a FAILED construction is correct,
-            # not merely safe: the peers must not proceed to dispatch into a
-            # rank that holds no buffers, and the exception still propagates
-            # on the rank that raised once the barrier returns, so sglang
-            # still sees the failure. Mirrors finalize()`s try/finally.
-            self._shmem_barrier(group)
+            # Barriering on the way out of a FAILED construction keeps the
+            # group from wedging, but -- read this before trusting it -- a
+            # barrier does NOT protect the peers from a rank that raised. It
+            # RELEASES them, into exactly the state the comment above warns
+            # about: a rank holding no buffers while seven peers dispatch into
+            # it, silently in the -O3 -DNDEBUG build they actually run. The
+            # barrier orders construction against use; it says nothing about
+            # whether construction SUCCEEDED.
+            #
+            # So agree, the way reconfigure() already does. A D->P construct is
+            # where a rank-local OOM is expected (the P role's dispatch buffer
+            # is the large one), and until now that failure was visible ONLY on
+            # the failing rank: its peers returned successfully from a
+            # construction whose peer had died, and the first they learned of it
+            # was a memory-access fault mid-inference.
+            #
+            # MAX over the group is the same primitive as _agree_on_severity,
+            # reused deliberately -- one collective, one shape of failure
+            # handling on both halves of a flip. Every rank raises, so sglang's
+            # reconcile sees the construct fail on all of them and can escalate
+            # once instead of racing seven survivors against one corpse.
+            #
+            # This all-reduce IS the barrier -- it is collective and blocking
+            # over the same group, so it subsumes the exit barrier rather than
+            # being added to it. If dist is not initialized _group_max returns
+            # the local value unchanged, matching _shmem_barrier's no-op, which
+            # is correct for single-process use.
+            worst = self._group_max(group, construct_failed)
+            if worst and not construct_failed:
+                # This rank built fine; a peer did not. Raise rather than return
+                # a usable-looking op: its buffers are symmetric with a rank
+                # that has none.
+                raise RuntimeError(
+                    "EpDispatchCombineOp construction failed on at least one peer "
+                    "rank; this rank's buffers are unusable because the group's "
+                    "symmetric allocation is incomplete. See the failing rank's "
+                    "log for the original error."
+                )
 
     # ------------------------------------------------------------------
     # Buffer lifecycle (teardown / rebuild)
