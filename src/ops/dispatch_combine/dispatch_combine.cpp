@@ -225,7 +225,28 @@ void EpDispatchCombineHandle::InitializeAll() {
   // python layer so the ordering holds for BOTH entry points that allocate --
   // the constructor and Reconfigure()'s rebuild -- and cannot be forgotten by a
   // future caller.
-  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  //
+  // THROW, do not HIP_RUNTIME_CHECK. That macro is fprintf + exit(-1)
+  // (application/utils/check.hpp:33-42), and 496ca8b2 converted the 14 of them
+  // that used to be in this function into throws precisely so Reconfigure()'s
+  // rollback (:388) could catch them and restore the old capacity. Putting one
+  // back here would be worse than the ones removed: hipDeviceSynchronize is
+  // exactly where a PRIOR async fault surfaces as a sticky error -- i.e. the
+  // very fault this sync exists to prevent -- so the most likely way to fail
+  // here is a fault, and exit(-1) would skip the python exit barrier
+  // (dispatch_combine.py's finally) and leave the 7 peers blocked in it
+  // forever. That is the 24b4379e reject-deadlock class again.
+  //
+  // Clear the sticky error before throwing, matching HipMallocOrThrow (:588):
+  // otherwise the next HIP call on the rollback path inherits this failure and
+  // the recovery we are enabling trips over the fault it recovered from.
+  hipError_t syncErr = hipDeviceSynchronize();
+  if (syncErr != hipSuccess) {
+    (void)hipGetLastError();
+    throw std::runtime_error(std::string("EpDispatchCombineHandle::InitializeAll: ") +
+                             "hipDeviceSynchronize failed after allocation: " +
+                             hipGetErrorString(syncErr));
+  }
 }
 
 void EpDispatchCombineHandle::FinalizeAll() {
