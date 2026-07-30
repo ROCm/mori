@@ -224,7 +224,6 @@ class EpDispatchCombineOp:
         synchronize over one group.
         """
         self.config = config
-        _ensure_jit_kernels(config.kernel_type)
 
         # Remember the construction group and make it the default for every
         # later collective on this op (finalize / reconfigure).
@@ -249,6 +248,28 @@ class EpDispatchCombineOp:
         # very first statement in the body raises.
         construct_failed = 1
         try:
+            # INSIDE the try, deliberately. This used to be the first statement
+            # of __init__, ahead of BOTH the entry barrier and this try -- so a
+            # rank that raised here (ValueError for an unknown kernel_type,
+            # :187; or anything ensure_compiled() can throw -- a JIT compile
+            # failure, a missing hipcc, a full/read-only cache dir) left
+            # __init__ having entered NEITHER the barrier at :246 NOR the
+            # finally's all-reduce, and its peers blocked in `_shmem_barrier`
+            # forever. That is precisely the reject-deadlock class 24b4379e
+            # closed for reconfigure() and 27874e2d closed for construct,
+            # reintroduced one line AHEAD of both guards.
+            #
+            # `_load_hip_modules` (below) raises the same family of error for
+            # the same input and has always been covered -- purely because it
+            # sits inside the try. There was no reason for the two to differ.
+            #
+            # It matters most on the disputed path: COORD turn 19 says a flip is
+            # finalize() then construct AT THE TARGET ROLE'S kernel_type, so
+            # normal<->AsyncLL is exactly the flip where this argument first
+            # differs between the two constructions -- and a per-rank JIT cache
+            # miss on the target kernel is a per-rank failure, not a symmetric
+            # one.
+            _ensure_jit_kernels(config.kernel_type)
 
             handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
             self._cpp_config = mori_cpp.EpDispatchCombineConfig(
