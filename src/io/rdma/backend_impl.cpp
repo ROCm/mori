@@ -75,13 +75,21 @@ namespace io {
 // MORI_IO_DEREG_QUIESCE_MS.
 static constexpr int kDefaultDeregisterQuiesceTimeoutMs = 5000;
 
-static int GetDeregisterQuiesceTimeoutMs() {
-  static const int v = [] {
-    int ms = kDefaultDeregisterQuiesceTimeoutMs;
-    env::Override("MORI_IO_DEREG_QUIESCE_MS", ms, mori::env::detail::ParsePositiveInt);
-    return ms;
-  }();
-  return v;
+// Read PER BACKEND, at construction. This was a function-local `static const`
+// and carried the exact defect b2453e44 removed from the tombstone bound: the
+// value latches on the FIRST call anywhere in the process, so a process hosting
+// two IOEngines silently gives the second whichever timeout the first read, and
+// which one wins depends on which deregistered first. `MORI_IO_DEREG_QUIESCE_MS`
+// reads like per-engine configuration and should mean it.
+//
+// It also made the timed-out-quiesce path untestable, which is why nothing ever
+// covered the strand REVIEW_M #78-1/#79-3 describes: a case cannot shorten the
+// timeout after any earlier case has deregistered, and the reentry case's own
+// comment (:1461-1464) records working around exactly that.
+static int ReadDeregisterQuiesceTimeoutMs() {
+  int ms = kDefaultDeregisterQuiesceTimeoutMs;
+  env::Override("MORI_IO_DEREG_QUIESCE_MS", ms, mori::env::detail::ParsePositiveInt);
+  return ms;
 }
 
 static void ValidateRdmaNotificationConfig(const RdmaBackendConfig& config) {
@@ -1899,7 +1907,7 @@ bool RdmaBackend::HasActiveDevices() {
 
 RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
                          const RdmaBackendConfig& beConfig)
-    : myEngKey(k), config(beConfig) {
+    : myEngKey(k), config(beConfig), deregQuiesceTimeoutMs_(ReadDeregisterQuiesceTimeoutMs()) {
   env::Override("MORI_IO_ENABLE_NOTIFICATION", config.enableNotification,
                 mori::env::detail::ParseBool);
   env::Override("MORI_IO_ENABLE_CHUNKING", config.enableTransferChunking,
@@ -2092,7 +2100,7 @@ void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
   // either direction. The collision path is reached by engines that dereg a
   // peer's descriptor -- which is what T41's fixture does.
   const bool isLocal = desc.engineKey == myEngKey;
-  if (isLocal && !rdma->QuiesceLocalMemory(desc.id, GetDeregisterQuiesceTimeoutMs())) {
+  if (isLocal && !rdma->QuiesceLocalMemory(desc.id, deregQuiesceTimeoutMs_)) {
     // Deliberately NOT a throw and NOT an abort. A flip that cannot complete is
     // as bad as a corrupt one, so proceed -- but say so loudly, because past
     // this line the lkey may still be live for the NIC and this is the one
@@ -2103,7 +2111,7 @@ void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
         "DeregisterMemory: memory id {} did NOT quiesce within {} ms; deregistering with work "
         "requests still outstanding against its lkey. A completion may DMA into memory this "
         "process has released or re-registered.",
-        desc.id, GetDeregisterQuiesceTimeoutMs());
+        desc.id, deregQuiesceTimeoutMs_);
   }
   if (isLocal) {
     rdma->DeregisterLocalMemory(desc);

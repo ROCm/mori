@@ -552,6 +552,12 @@ class RdmaBackend : public Backend {
  private:
   EngineKey myEngKey;
   RdmaBackendConfig config;
+  // How long DeregisterMemory waits for the NIC before it deregisters anyway,
+  // read from MORI_IO_DEREG_QUIESCE_MS ONCE PER BACKEND at construction. Was a
+  // function-local `static const`, i.e. latched process-wide on first use --
+  // the same defect b2453e44 removed from maxMemGateTombstones_, and the reason
+  // no test could ever drive the timed-out-quiesce path.
+  const int deregQuiesceTimeoutMs_;
   std::unique_ptr<RdmaManager> rdma{nullptr};
   std::unique_ptr<NotifManager> notif{nullptr};
   std::unique_ptr<ControlPlaneServer> server{nullptr};
