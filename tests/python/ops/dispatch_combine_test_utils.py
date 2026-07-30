@@ -21,6 +21,7 @@
 # SOFTWARE.
 import os
 import queue
+import signal
 import time
 
 import pytest
@@ -351,6 +352,37 @@ def start_torch_dist_process_manager(world_size=8, disable_p2p=False):
 RESULT_TIMEOUT_S = float(os.environ.get("MORI_TEST_RESULT_TIMEOUT", "600"))
 
 
+def _dump_worker_stacks(procs, alive_ranks, settle_s=2.0):
+    """SIGUSR1 every alive worker so it prints its Python stack to stderr.
+
+    The workers install a faulthandler SIGUSR1 handler (tests/python/utils.py),
+    so this costs one signal per rank and produces a real traceback for a rank
+    that is blocked in a collective -- as opposed to inferring the location
+    from which test failed, which is how this suite has been debugged so far
+    and which has been wrong every time it was checked against a stack.
+
+    Best-effort by construction: a rank spinning inside a HIP kernel shows the
+    launching Python frame, and a rank that dies between is_alive() and the
+    kill() is simply skipped. Never raises -- this runs on the way to a
+    pytest.fail() and must not replace that failure with its own.
+    """
+    if not alive_ranks:
+        return "No alive ranks to dump."
+    sent = []
+    for i in alive_ranks:
+        try:
+            os.kill(procs[i].pid, signal.SIGUSR1)
+            sent.append(i)
+        except (OSError, AttributeError, IndexError):
+            pass
+    if not sent:
+        return "Could not signal any alive rank for a stack dump."
+    # Give the handlers a moment to write before pytest tears the run down;
+    # the dumps go to the workers' inherited stderr, not through this process.
+    time.sleep(settle_s)
+    return f"Requested a SIGUSR1 stack dump from alive ranks {sent}; their Python stacks are in this run's stderr."
+
+
 def assert_worker_results(manager, world_size, timeout=None):
     timeout = RESULT_TIMEOUT_S if timeout is None else timeout
     deadline = time.monotonic() + timeout
@@ -362,15 +394,32 @@ def assert_worker_results(manager, world_size, timeout=None):
         except queue.Empty:
             reported = sorted(r for r, _ in results)
             silent = [r for r in range(world_size) if r not in reported]
-            exits = [
-                (i, p.exitcode) for i, p in enumerate(getattr(manager, "processes", []))
-            ]
+            procs = list(getattr(manager, "processes", []))
+            exits = [(i, p.exitcode) for i, p in enumerate(procs)]
+            alive = [i for i, p in enumerate(procs) if p.is_alive()]
+
+            # Before failing, ask the silent-but-ALIVE ranks where they are.
+            #
+            # This branch used to assert that a silent rank "exited without
+            # reporting". That is false for the failure this suite actually
+            # produces: every observed timeout in the campaign (T18d's three,
+            # T19b's three) reported exitcode None on all N ranks, i.e. they
+            # were alive and stopped, not crashed. The message sent six turns
+            # of debugging after exit(-1)/segfault/OOM-kill, none of which had
+            # happened. Say what is measured, and get the stack.
+            dumped = _dump_worker_stacks(procs, alive)
+
             pytest.fail(
                 f"timed out after {timeout:.0f}s waiting for worker results: "
                 f"{len(results)}/{world_size} reported, ranks {silent} silent. "
-                f"A silent rank exited without reporting -- look for an exit(-1) "
-                f"from HIP_RUNTIME_CHECK, a segfault, or an OOM kill in the "
-                f"captured stderr (run with -s). worker exitcodes: {exits}",
+                f"Of the silent ranks, {alive} are ALIVE (still running) and the "
+                f"rest exited without reporting. worker exitcodes: {exits}. "
+                f"ALIVE means wedged, not crashed -- a rank can report PASS and "
+                f"then wedge in teardown, which poisons the session-scoped pool "
+                f"and makes every later test in the selection time out here as a "
+                f"false red. exitcode not-None means look for an exit(-1) from "
+                f"HIP_RUNTIME_CHECK, a segfault, or an OOM kill. "
+                f"{dumped} (run with -s to see them)",
                 pytrace=False,
             )
         results.append((rank, result))

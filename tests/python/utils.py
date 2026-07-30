@@ -152,6 +152,31 @@ class TorchDistProcessManager:
 
     @staticmethod
     def _worker(rank, world_size, port, init_shmem, task_queue, result_queue):
+        # Make a wedged worker able to say WHERE it is wedged, on demand.
+        #
+        # The dominant failure shape in this suite is: every rank ALIVE
+        # (exitcode None), 0/N reported, the parent times out after 300s, and
+        # nothing anywhere names the line the ranks are stopped on. That has
+        # been re-derived from the parent's view across six turns of this
+        # campaign and the answer has never once come from the inference -- it
+        # came from reading source or from a real stack. So make the stack
+        # obtainable: on SIGUSR1 every thread of this worker dumps its Python
+        # frames to stderr, which pytest -s passes through to the run log.
+        # faulthandler's handler is async-signal-safe (raw write(2), no
+        # allocation), so it still fires from a thread blocked in a gloo
+        # collective -- which is exactly when it is wanted.
+        #
+        # It cannot unwind a rank spinning inside a HIP kernel; that shows as
+        # the launching Python frame. But distinguishing "wedged in python/
+        # gloo teardown" from "spinning in device code" is precisely the open
+        # question behind review #47-2, and the launching frame answers it.
+        import faulthandler
+        import signal
+
+        faulthandler.enable()
+        if hasattr(faulthandler, "register"):
+            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+
         with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
             if init_shmem:
                 mori.shmem.shmem_torch_process_group_init("default")
