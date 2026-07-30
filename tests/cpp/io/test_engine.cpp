@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -1026,6 +1027,106 @@ void CaseRdmaPerFlipRetentionIsMeasured() {
   Require(good.Succeeded(), "post-flip transfer on the original key failed: " + good.Message());
 }
 
+// REVIEW_M #68-1 / #67-2, the use-after-free `8f2d80b2` fixes. The interleaving
+// under test is the one sglang's flip actually produces:
+//
+//   transfer thread : GetOrCreateSessionCachedNoThrow returns the session and
+//                     DROPS sessionCacheMu, then dereferences it.
+//   flip thread     : MoriKVManager.teardown() -> engine.deregister_memory(desc)
+//                     -> RdmaBackend::DeregisterMemory -> InvalidateSessionsForMemory
+//                     erases the cache entry.
+//
+// Before the fix the cache owned the session through a `unique_ptr` and handed
+// out `it->second.get()`, so that erase DESTROYED the object the transfer
+// thread was about to use. After it, the getter returns a `shared_ptr` by
+// value and the erase only unpublishes.
+//
+// HONESTY ABOUT WHAT THIS PROVES: a use-after-free is not observable by
+// assertion -- freed memory usually still reads plausibly. Run under
+// -fsanitize=address this case is a two-sided discriminator (RED at 8f2d80b2^,
+// GREEN at 8f2d80b2). Run WITHOUT a sanitizer it is a stress that can pass on
+// broken code, and it is labelled so nobody cites a plain green as a proof.
+void CaseRdmaTransferSurvivesConcurrentDeregister() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_dereg_race", true);
+  auto src = RegisterGpuMemory(pair.initiator.get(), 4096, 0);
+
+  // Many SHORT-LIVED remote registrations: each cycle warms a session keyed on
+  // that memory id, then deregisters it while a transfer against it is in
+  // flight. Distinct ids per cycle is what makes each erase hit a live entry
+  // rather than a cold miss.
+  constexpr int kCycles = 24;
+  std::atomic<int> transfersIssued{0};
+  std::atomic<int> deregsDone{0};
+
+  for (int i = 0; i < kCycles; ++i) {
+    void* rptr = nullptr;
+    HIP_RUNTIME_CHECK(hipSetDevice(0));
+    HIP_RUNTIME_CHECK(hipMalloc(&rptr, 4096));
+    HIP_RUNTIME_CHECK(hipMemset(rptr, 0, 4096));
+    MemoryDesc rdesc =
+        pair.target->RegisterMemory(rptr, 4096, 0, MemoryLocationType::GPU);
+
+    // Warm the cache entry so the racing DeregisterMemory has something to erase.
+    {
+      TransferStatus warm;
+      TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+      pair.initiator->Read(src.desc, 0, rdesc, 0, 64, &warm, uid);
+      std::string werr;
+      WaitTransferDone(&warm, 5000, &werr);
+    }
+
+    std::atomic<bool> go{false};
+    std::thread transferThread([&]() {
+      while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+      for (int k = 0; k < 8; ++k) {
+        TransferStatus st;
+        TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+        // Reaching a freed session is exactly what this call used to do; a
+        // FAILED status here is fine and expected once the memory is gone.
+        pair.initiator->Read(src.desc, 0, rdesc, 0, 64, &st, uid);
+        std::string terr;
+        WaitTransferDone(&st, 5000, &terr);
+        transfersIssued.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+
+    go.store(true, std::memory_order_release);
+    std::this_thread::yield();
+    pair.initiator->DeregisterMemory(rdesc);  // erases the session under the transfer
+    pair.target->DeregisterMemory(rdesc);
+    deregsDone.fetch_add(1, std::memory_order_relaxed);
+
+    transferThread.join();
+    HIP_RUNTIME_CHECK(hipFree(rptr));
+  }
+
+  // NON-VACUITY on both sides: the race must actually have been driven. If the
+  // transfer thread never ran or no deregister landed, a green means nothing.
+  Require(transfersIssued.load() == kCycles * 8,
+          "instrument check: expected " + std::to_string(kCycles * 8) +
+              " transfers, got " + std::to_string(transfersIssued.load()));
+  Require(deregsDone.load() == kCycles,
+          "instrument check: expected " + std::to_string(kCycles) +
+              " deregisters, got " + std::to_string(deregsDone.load()));
+
+  // The engine must still be USABLE afterwards -- a wedged or corrupted engine
+  // would otherwise let the case pass by simply not crashing.
+  auto dst = RegisterGpuMemory(pair.target.get(), 4096, 0);
+  TransferStatus good;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Read(src.desc, 0, dst.desc, 0, 64, &good, uid);
+  std::string err;
+  Require(WaitTransferDone(&good, 5000, &err),
+          "engine must still serve after the deregister race: " + err);
+  Require(good.Succeeded(),
+          "post-race transfer failed: " + good.Message());
+  std::printf("[dereg-race] %d transfers across %d deregister cycles, engine still serving\n",
+              transfersIssued.load(), deregsDone.load());
+}
+
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -1527,6 +1628,8 @@ int main(int argc, char* argv[]) {
       {"rdma_deregistered_engine_fails_then_recovers",
        CaseRdmaDeregisteredEngineFailsTransferThenRecovers},
       {"rdma_per_flip_retention_is_measured", CaseRdmaPerFlipRetentionIsMeasured},
+      {"rdma_transfer_survives_concurrent_deregister",
+       CaseRdmaTransferSurvivesConcurrentDeregister},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},
