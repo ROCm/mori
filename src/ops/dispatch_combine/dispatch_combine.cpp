@@ -195,6 +195,37 @@ void EpDispatchCombineHandle::InitializeAll() {
   InitializeTokenNumSignalBuf();
   InitializeOrderMapBuf();
   InitializeBarrier();
+
+  // Drain the zeroing before returning to the host. This is the ALLOC->USE half
+  // of the ordering that Finalize (:258), Reconfigure (:337) and ~Handle (:397)
+  // already enforce on the USE->FREE half, and its absence is what made
+  // bd830302's exit barrier narrow the ctor race instead of closing it.
+  //
+  // Every buffer above is zeroed by an ASYNCHRONOUS hipMemset --
+  // ShmemMallocAndReturnMemObjPtr :412 for the symmetric objects and
+  // HipMallocOrThrow :565 for the plain-device scratch. hipMemset on device
+  // memory is async with respect to the host (the reason kNoMemset exists at
+  // :437), so without this sync the host returns from the ctor, reaches the
+  // python exit barrier, and RELEASES its peers while its own memsets are still
+  // queued on the null stream.
+  //
+  // That matters because several of these buffers are PEER-WRITABLE. A peer
+  // that leaves the barrier does
+  //   atomicAdd(args.dispTokOffsetMemObj->GetAs<index_t*>(destPe), 1)
+  // (intranode.hpp:132) directly into THIS rank's copy. A memset landing after
+  // those adds does not race them, it DISCARDS them: the counter restarts below
+  // true occupancy and hands out slots already in use, until
+  //   intranode.hpp:134 `destTokId < config.MaxNumTokensToRecv()`
+  // trips and HSA aborts the rank. In a release build that assert is compiled
+  // out (-DNDEBUG) and the same overflow writes past the recv buffer instead --
+  // silent a2a corruption rather than a crash.
+  //
+  // A host barrier alone cannot order a device-side write against a device-side
+  // memset; only the sync can. Placed inside InitializeAll() rather than at the
+  // python layer so the ordering holds for BOTH entry points that allocate --
+  // the constructor and Reconfigure()'s rebuild -- and cannot be forgotten by a
+  // future caller.
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 }
 
 void EpDispatchCombineHandle::FinalizeAll() {

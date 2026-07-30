@@ -227,186 +227,205 @@ class EpDispatchCombineOp:
         _ensure_jit_kernels(config.kernel_type)
 
         self._shmem_barrier(group)
+        try:
 
-        handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
-        self._cpp_config = mori_cpp.EpDispatchCombineConfig(
-            rank=config.rank,
-            world_size=config.world_size,
-            hidden_dim=config.hidden_dim,
-            scale_dim=config.scale_dim,
-            scale_type_size=config.scale_type_size,
-            max_token_type_size=config.max_token_type_size,
-            max_num_inp_token_per_rank=config.max_num_inp_token_per_rank,
-            num_experts_per_rank=config.num_experts_per_rank,
-            num_experts_per_token=config.num_experts_per_token,
-            warp_num_per_block=config.warp_num_per_block,
-            block_num=config.block_num,
-            use_external_inp_buf=config.use_external_inp_buf,
-            kernel_type=config.kernel_type,
-            gpu_per_node=config.gpu_per_node,
-            rdma_block_num=config.rdma_block_num,
-            num_qp_per_pe=config.num_qp_per_pe,
-            quant_type=_normalize_quant_type(config.quant_type),
-            max_total_recv_tokens=config.max_total_recv_tokens,
-        )
+            handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
+            self._cpp_config = mori_cpp.EpDispatchCombineConfig(
+                rank=config.rank,
+                world_size=config.world_size,
+                hidden_dim=config.hidden_dim,
+                scale_dim=config.scale_dim,
+                scale_type_size=config.scale_type_size,
+                max_token_type_size=config.max_token_type_size,
+                max_num_inp_token_per_rank=config.max_num_inp_token_per_rank,
+                num_experts_per_rank=config.num_experts_per_rank,
+                num_experts_per_token=config.num_experts_per_token,
+                warp_num_per_block=config.warp_num_per_block,
+                block_num=config.block_num,
+                use_external_inp_buf=config.use_external_inp_buf,
+                kernel_type=config.kernel_type,
+                gpu_per_node=config.gpu_per_node,
+                rdma_block_num=config.rdma_block_num,
+                num_qp_per_pe=config.num_qp_per_pe,
+                quant_type=_normalize_quant_type(config.quant_type),
+                max_total_recv_tokens=config.max_total_recv_tokens,
+            )
 
-        self._handle = handle_class(self._cpp_config)
-        self._hip_module = _load_hip_modules(config.kernel_type)
-        self._refresh_handle_state()
+            self._handle = handle_class(self._cpp_config)
+            self._hip_module = _load_hip_modules(config.kernel_type)
+            self._refresh_handle_state()
 
-        self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
-        self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
-            "get_dispatch_src_token_pos"
-        )
-        self._get_cur_rank_num_token = _cpp_dispatch_combine_factory(
-            "get_cur_rank_num_token"
-        )
-        self._get_dispatch_sender_token_idx_map_func = _cpp_dispatch_combine_factory(
-            "get_dispatch_sender_token_idx_map"
-        )
-        self._get_dispatch_receiver_token_idx_map_func = _cpp_dispatch_combine_factory(
-            "get_dispatch_receiver_token_idx_map"
-        )
-        self._get_registered_combine_input_buffer = _cpp_dispatch_combine_factory(
-            "get_registered_combine_input_buffer"
-        )
+            self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
+            self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
+                "get_dispatch_src_token_pos"
+            )
+            self._get_cur_rank_num_token = _cpp_dispatch_combine_factory(
+                "get_cur_rank_num_token"
+            )
+            self._get_dispatch_sender_token_idx_map_func = _cpp_dispatch_combine_factory(
+                "get_dispatch_sender_token_idx_map"
+            )
+            self._get_dispatch_receiver_token_idx_map_func = _cpp_dispatch_combine_factory(
+                "get_dispatch_receiver_token_idx_map"
+            )
+            self._get_registered_combine_input_buffer = _cpp_dispatch_combine_factory(
+                "get_registered_combine_input_buffer"
+            )
 
-        self.launch_config_mode = os.environ.get("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL")
-        if self.launch_config_mode == "AUTO":
-            self._dispatch_rules = None
-            self._combine_rules = None
-            self._qt_str = "none"
-            try:
-                from mori.ops.tuning_config import (
-                    TuningConfigManager,
-                    kernel_type_to_config_str,
-                    quant_type_to_config_str,
-                    detect_gpu_model,
+            self.launch_config_mode = os.environ.get("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL")
+            if self.launch_config_mode == "AUTO":
+                self._dispatch_rules = None
+                self._combine_rules = None
+                self._qt_str = "none"
+                try:
+                    from mori.ops.tuning_config import (
+                        TuningConfigManager,
+                        kernel_type_to_config_str,
+                        quant_type_to_config_str,
+                        detect_gpu_model,
+                    )
+                    from mori.jit.config import detect_gpu_arch
+
+                    gpu_arch = detect_gpu_arch()
+                    gpu_model = detect_gpu_model()
+                    kt_str = kernel_type_to_config_str(config.kernel_type)
+                    self._qt_str = quant_type_to_config_str(config.quant_type)
+                    mgr = TuningConfigManager.get_instance(
+                        gpu_arch,
+                        kt_str,
+                        config.world_size,
+                        gpu_model,
+                    )
+                    self._dispatch_rules = mgr.dispatch_rules or None
+                    self._combine_rules = mgr.combine_rules or None
+                    if logger.isEnabledFor(logging.DEBUG):
+                        if self._dispatch_rules is None and self._combine_rules is None:
+                            logger.debug(
+                                "AUTO tuning: no config for %s_%s_%s_ep%d; "
+                                "using hard-coded fallback.",
+                                gpu_arch,
+                                gpu_model,
+                                kt_str,
+                                config.world_size,
+                            )
+                        else:
+                            d_dtypes = sorted(
+                                {r["dtype"] for r in (self._dispatch_rules or [])}
+                            )
+                            c_dtypes = sorted(
+                                {r["dtype"] for r in (self._combine_rules or [])}
+                            )
+                            logger.debug(
+                                "AUTO tuning: %s_%s_%s_ep%d — "
+                                "dispatch(%d rules, dtypes=%s) combine(%d rules, dtypes=%s)",
+                                gpu_arch,
+                                gpu_model,
+                                kt_str,
+                                config.world_size,
+                                len(self._dispatch_rules or []),
+                                d_dtypes,
+                                len(self._combine_rules or []),
+                                c_dtypes,
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "AUTO tuning: failed to load config (%s); "
+                        "using hard-coded fallback.",
+                        exc,
+                    )
+
+                if (
+                    config.kernel_type.value
+                    == EpDispatchCombineKernelType.InterNodeV1.value
+                ):
+                    (
+                        self.auto_block_num,
+                        self.auto_rdma_block_num,
+                        self.auto_warp_per_block,
+                    ) = (96, 64, 8)
+                elif (
+                    config.kernel_type.value
+                    == EpDispatchCombineKernelType.InterNodeV1LL.value
+                ):
+                    (
+                        self.auto_block_num,
+                        self.auto_rdma_block_num,
+                        self.auto_warp_per_block,
+                    ) = (256, 128, 8)
+                else:
+                    (
+                        self.auto_block_num,
+                        self.auto_rdma_block_num,
+                        self.auto_warp_per_block,
+                    ) = (128, 0, 16)
+            elif self.launch_config_mode == "MANUAL":
+                self._dispatch_rules = None
+                self._combine_rules = None
+                self._qt_str = "none"
+                self.auto_block_num, self.auto_rdma_block_num, self.auto_warp_per_block = (
+                    None,
+                    None,
+                    None,
                 )
-                from mori.jit.config import detect_gpu_arch
-
-                gpu_arch = detect_gpu_arch()
-                gpu_model = detect_gpu_model()
-                kt_str = kernel_type_to_config_str(config.kernel_type)
-                self._qt_str = quant_type_to_config_str(config.quant_type)
-                mgr = TuningConfigManager.get_instance(
-                    gpu_arch,
-                    kt_str,
-                    config.world_size,
-                    gpu_model,
-                )
-                self._dispatch_rules = mgr.dispatch_rules or None
-                self._combine_rules = mgr.combine_rules or None
-                if logger.isEnabledFor(logging.DEBUG):
-                    if self._dispatch_rules is None and self._combine_rules is None:
-                        logger.debug(
-                            "AUTO tuning: no config for %s_%s_%s_ep%d; "
-                            "using hard-coded fallback.",
-                            gpu_arch,
-                            gpu_model,
-                            kt_str,
-                            config.world_size,
-                        )
-                    else:
-                        d_dtypes = sorted(
-                            {r["dtype"] for r in (self._dispatch_rules or [])}
-                        )
-                        c_dtypes = sorted(
-                            {r["dtype"] for r in (self._combine_rules or [])}
-                        )
-                        logger.debug(
-                            "AUTO tuning: %s_%s_%s_ep%d — "
-                            "dispatch(%d rules, dtypes=%s) combine(%d rules, dtypes=%s)",
-                            gpu_arch,
-                            gpu_model,
-                            kt_str,
-                            config.world_size,
-                            len(self._dispatch_rules or []),
-                            d_dtypes,
-                            len(self._combine_rules or []),
-                            c_dtypes,
-                        )
-            except Exception as exc:
-                logger.warning(
-                    "AUTO tuning: failed to load config (%s); "
-                    "using hard-coded fallback.",
-                    exc,
-                )
-
-            if (
-                config.kernel_type.value
-                == EpDispatchCombineKernelType.InterNodeV1.value
-            ):
-                (
-                    self.auto_block_num,
-                    self.auto_rdma_block_num,
-                    self.auto_warp_per_block,
-                ) = (96, 64, 8)
-            elif (
-                config.kernel_type.value
-                == EpDispatchCombineKernelType.InterNodeV1LL.value
-            ):
-                (
-                    self.auto_block_num,
-                    self.auto_rdma_block_num,
-                    self.auto_warp_per_block,
-                ) = (256, 128, 8)
             else:
-                (
-                    self.auto_block_num,
-                    self.auto_rdma_block_num,
-                    self.auto_warp_per_block,
-                ) = (128, 0, 16)
-        elif self.launch_config_mode == "MANUAL":
-            self._dispatch_rules = None
-            self._combine_rules = None
-            self._qt_str = "none"
-            self.auto_block_num, self.auto_rdma_block_num, self.auto_warp_per_block = (
-                None,
-                None,
-                None,
-            )
-        else:
-            raise ValueError(
-                f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
-            )
+                raise ValueError(
+                    f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
+                )
 
-        # EXIT barrier. The entry barrier above is NOT sufficient, and the
-        # asymmetry with finalize() -- which has always barriered on both sides
-        # -- is the bug.
-        #
-        # Several of the ctor's buffers are PEER-WRITABLE and are zeroed as part
-        # of allocation: ShmemMallocAndReturnMemObjPtr hipMemsets every
-        # symmetric object (dispatch_combine.cpp:412), and `dispTokOffsetMemObj`
-        # is the sharp one -- a dispatching peer does
-        # `atomicAdd(args.dispTokOffsetMemObj->GetAs<index_t*>(destPe), 1)`
-        # (intranode.hpp:132) directly into THIS rank's copy, and the kernel
-        # asserts the result against MaxNumTokensToRecv() on the very next line.
-        #
-        # With only an entry barrier the window is open: rank A returns from the
-        # ctor and launches its dispatch while rank B is still inside its own
-        # ctor, so B's hipMemset(buf, 0) lands AFTER A's atomicAdds have already
-        # counted into that buffer. The zeroing does not merely race the adds --
-        # it silently discards them, so B's counter restarts below the true
-        # occupancy and subsequent adds hand out slots that are already in use.
-        # The overflow surfaces as the device-side assertion
-        #   intranode.hpp:134 `destTokId < config.MaxNumTokensToRecv()`
-        #   "Total recv token overflow: increase maxTotalRecvTokens"
-        # which aborts the rank via HSA_STATUS_ERROR_EXCEPTION, i.e. a
-        # "Memory access fault by GPU node-N" and a dead process -- not a
-        # recoverable error.
-        #
-        # Why this went unseen for the whole campaign: the window is only open
-        # between one rank's return and the slowest rank's allocation, so it
-        # needs a construction skewed against a peer that is ALREADY dispatching
-        # -- which is why it reproduces only in longer sessions and only
-        # sometimes (RESULTS_M T21: five decompositions green, T20/T21f red on
-        # the identical selection). It is not specific to a role switch, but a
-        # flip is what makes it routine: COORD turn 19 tells sglang the P<->D
-        # flip is finalize() then CONSTRUCT, so every flip re-opens this window
-        # on a live server, where the peers are mid-inference rather than
-        # waiting in a test barrier.
-        self._shmem_barrier(group)
+            # EXIT barrier. The entry barrier above is NOT sufficient, and the
+            # asymmetry with finalize() -- which has always barriered on both sides
+            # -- is the bug.
+            #
+            # Several of the ctor's buffers are PEER-WRITABLE and are zeroed as part
+            # of allocation: ShmemMallocAndReturnMemObjPtr hipMemsets every
+            # symmetric object (dispatch_combine.cpp:412), and `dispTokOffsetMemObj`
+            # is the sharp one -- a dispatching peer does
+            # `atomicAdd(args.dispTokOffsetMemObj->GetAs<index_t*>(destPe), 1)`
+            # (intranode.hpp:132) directly into THIS rank's copy, and the kernel
+            # asserts the result against MaxNumTokensToRecv() on the very next line.
+            #
+            # With only an entry barrier the window is open: rank A returns from the
+            # ctor and launches its dispatch while rank B is still inside its own
+            # ctor, so B's hipMemset(buf, 0) lands AFTER A's atomicAdds have already
+            # counted into that buffer. The zeroing does not merely race the adds --
+            # it silently discards them, so B's counter restarts below the true
+            # occupancy and subsequent adds hand out slots that are already in use.
+            # The overflow surfaces as the device-side assertion
+            #   intranode.hpp:134 `destTokId < config.MaxNumTokensToRecv()`
+            #   "Total recv token overflow: increase maxTotalRecvTokens"
+            # which aborts the rank via HSA_STATUS_ERROR_EXCEPTION, i.e. a
+            # "Memory access fault by GPU node-N" and a dead process -- not a
+            # recoverable error.
+            #
+            # Why this went unseen for the whole campaign: the window is only open
+            # between one rank's return and the slowest rank's allocation, so it
+            # needs a construction skewed against a peer that is ALREADY dispatching
+            # -- which is why it reproduces only in longer sessions and only
+            # sometimes (RESULTS_M T21: five decompositions green, T20/T21f red on
+            # the identical selection). It is not specific to a role switch, but a
+            # flip is what makes it routine: COORD turn 19 tells sglang the P<->D
+            # flip is finalize() then CONSTRUCT, so every flip re-opens this window
+            # on a live server, where the peers are mid-inference rather than
+            # waiting in a test barrier.
+        finally:
+            # The exit barrier must run even when the body RAISED.
+            #
+            # It used to sit AFTER the `raise ValueError` for a bad
+            # MORI_EP_LAUNCH_CONFIG_MODE, and after the C++ handle
+            # construction that throws std::bad_alloc on a symmetric- or
+            # plain-device OOM. Either way a single rank could leave __init__
+            # by exception while its peers blocked in the barrier forever --
+            # the same reject-deadlock class 24b4379e fixed for reconfigure(),
+            # reintroduced on the CONSTRUCT half of the flip. A D->P construct
+            # is exactly where a rank-local OOM is expected, so this is the
+            # likely case, not the exotic one.
+            #
+            # Barriering on the way out of a FAILED construction is correct,
+            # not merely safe: the peers must not proceed to dispatch into a
+            # rank that holds no buffers, and the exception still propagates
+            # on the rank that raised once the barrier returns, so sglang
+            # still sees the failure. Mirrors finalize()`s try/finally.
+            self._shmem_barrier(group)
 
     # ------------------------------------------------------------------
     # Buffer lifecycle (teardown / rebuild)
