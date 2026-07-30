@@ -540,7 +540,16 @@ class EpDispatchCombineOp:
         Read-only, rank-local, NOT collective, safe on a finalized handle.
         Returns a dict (or None on a mori extension that predates the binding):
 
-            initialized, generation, seed, local_ptr, size, peer_ptrs, slots
+            initialized, generation, seed, local_ptr, size, peer_ptrs, slots,
+            objects
+
+        `objects` maps every symmetric object's name to
+        {local_ptr, size, peer_ptrs}. It exists because local_ptr/peer_ptrs
+        above describe only `crossDeviceBarrierMemObj`, which is 512 B at world
+        8, capacity-INDEPENDENT, and allocated last -- i.e. the one object a
+        resize is least likely to move. The buffers a role switch actually
+        resizes (tok.dispatchOut, recvTokenNum, dispTokOffset, ...) are the ones
+        a non-participating rank can hold stale peer addresses for.
 
         A cross-device barrier makes progress only while the group agrees on
         all three of: the generation counter, where each peer's barrier buffer

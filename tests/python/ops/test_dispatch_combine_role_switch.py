@@ -1268,12 +1268,24 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=Tru
     # Without that arm a red here is unattributable: it could be the reject or
     # it could be anything a resize does, and this test has already produced one
     # false positive (T13) by asserting an invariant that never held.
+    #
+    # THE ARMS MUST HAVE THE SAME HEAP HISTORY ON THE PEERS, or the control
+    # controls for nothing (review #40 item 1). In the REJECT arm the python
+    # wrapper has ranks 1-7 grow to PREFILL, then agree on rank 0's rejection,
+    # then GIVE BACK to DECODE -- two full free/alloc round trips, ending at
+    # DECODE. An earlier control did a single reconfigure(PREFILL) and ended at
+    # PREFILL, so a red in the reject arm alone was equally explained by "a
+    # grow followed by a shrink moves an offset", which has nothing to do with
+    # rejection. The control now does grow-then-shrink on EVERY rank: identical
+    # allocation sequence, identical final capacity, and the ONLY difference is
+    # that rank 0 participates instead of being refused before FinalizeAll.
     if do_reject:
         target = 0 if rank == 0 else PREFILL_TOKENS
         with pytest.raises(RuntimeError):
             op.reconfigure(max_num_inp_token_per_rank=target)
     else:
         op.reconfigure(max_num_inp_token_per_rank=PREFILL_TOKENS)
+        op.reconfigure(max_num_inp_token_per_rank=DECODE_TOKENS)
 
     probe = op.probe_barrier_state()
     assert probe["initialized"] is True, f"rank {rank} lost its buffers"
@@ -1457,6 +1469,121 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=Tru
     assert int(probe["size"]) >= world_size * 8, (
         f"rank {rank} [{arm}]: barrier buffer is {probe['size']} B, too small "
         f"for {world_size} uint64 peer slots after the resize."
+    )
+
+    # (5) THE SAME CHECKS, FOR EVERY SYMMETRIC OBJECT.
+    #
+    # Everything above reads `crossDeviceBarrierMemObj` only, and that object
+    # is 512 B at world 8, CAPACITY-INDEPENDENT, and allocated LAST by
+    # InitializeAll -- so under a first-fit VA manager it is the object most
+    # likely to land back exactly where it started. It literally cannot exhibit
+    # the defect being hunted, which is the likeliest reason (4) came back green
+    # (T15e) against a wedge that still reproduces. The objects that DO scale
+    # with the capacity are the ones a rejecting rank derives stale peer
+    # addresses for, and `recvTokenNum` is the sharpest case: the intranode
+    # dispatch protocol waits on a signal and then STORES INTO THE PEER'S
+    # recvTokenNumMemObj (intranode.hpp:183-186), so a stale entry there is a
+    # write nobody reads and a peer that spins forever -- with no cross-rank
+    # asymmetry any instantaneous probe can see.
+    b_objs = before.get("objects") or {}
+    a_objs = probe.get("objects") or {}
+    assert a_objs, (
+        f"rank {rank} [{arm}]: probe_barrier_state() returned no `objects` map, "
+        f"so only the one capacity-independent buffer was measured and this "
+        f"test's headline check did NOT run. The .so is older than the python."
+    )
+
+    # An object appearing or vanishing across the resize is itself a defect:
+    # every rank must own the same set, or `record`'s positional invariants and
+    # the kernel's own arg struct disagree about what exists.
+    assert set(a_objs.keys()) == set(b_objs.keys()), (
+        f"rank {rank} [{arm}]: the set of symmetric objects CHANGED across the "
+        f"resize: before={sorted(b_objs)} after={sorted(a_objs)}"
+    )
+
+    names = sorted(a_objs.keys())
+    # One all_gather for all objects rather than one per object: 20-odd
+    # collectives inside an assertion path is a good way to invent a new hang.
+    my_obj_deltas = torch.tensor(
+        [
+            int(a_objs[n]["local_ptr"]) - int(b_objs[n]["local_ptr"])
+            for n in names
+        ],
+        dtype=torch.int64,
+        device="cpu",
+    )
+    gathered_obj = [torch.zeros_like(my_obj_deltas) for _ in range(world_size)]
+    dist.all_gather(gathered_obj, my_obj_deltas, group=group)
+    # true_obj_deltas[peer][k] = how far rank `peer`'s object `names[k]` moved.
+    true_obj_deltas = [[int(v) for v in g.tolist()] for g in gathered_obj]
+
+    stale_objs = []
+    for k, name in enumerate(names):
+        bp = [int(x) for x in b_objs[name]["peer_ptrs"]]
+        ap = [int(x) for x in a_objs[name]["peer_ptrs"]]
+        if not bp or not ap or len(bp) != world_size or len(ap) != world_size:
+            continue  # unallocated object (recorded as {0,0}); nothing to check
+        for peer in range(world_size):
+            seen = ap[peer] - bp[peer]
+            truth = true_obj_deltas[peer][k]
+            if seen != truth:
+                stale_objs.append((name, peer, seen, truth))
+
+    assert not stale_objs, (
+        f"rank {rank} [{arm}]: STALE peer pointers on resizing symmetric "
+        f"objects. Each entry is (object, peer, delta this rank sees, delta "
+        f"that peer actually underwent): {stale_objs}. This rank will read and "
+        f"write those peers at addresses their buffers have moved away from. "
+        f"Unlike the barrier buffer -- which is capacity-independent and "
+        f"allocated last, so it usually lands back in place -- these objects "
+        f"resize with max_num_inp_token_per_rank, which is exactly what a role "
+        f"switch changes."
+    )
+
+    # Sizes must agree across ranks per object too: a symmetric object whose
+    # size differs between ranks means a peer read runs past what its owner
+    # published.
+    my_sizes = torch.tensor(
+        [int(a_objs[n]["size"]) for n in names], dtype=torch.int64, device="cpu"
+    )
+    gathered_sizes = [torch.zeros_like(my_sizes) for _ in range(world_size)]
+    dist.all_gather(gathered_sizes, my_sizes, group=group)
+    size_rows = [[int(v) for v in g.tolist()] for g in gathered_sizes]
+    bad_sizes = [
+        (names[k], [row[k] for row in size_rows])
+        for k in range(len(names))
+        if len({row[k] for row in size_rows}) != 1
+    ]
+    assert not bad_sizes, (
+        f"rank {rank} [{arm}]: symmetric object SIZE diverged across ranks "
+        f"after the resize -- (object, per-rank size) = {bad_sizes}. A REJECT "
+        f"is the one outcome where a rank keeps its old capacity while its "
+        f"peers change theirs, and every kernel indexes these by the LOCAL "
+        f"config's capacity."
+    )
+
+    # And the heap-relative OFFSET of every object must match across ranks, for
+    # the same reason (2) checks it for the barrier: RegisterStaticHeapSubRegion
+    # derives peers as `peerPtrs[i] + offset` from the LOCAL offset.
+    my_offsets = torch.tensor(
+        [int(a_objs[n]["local_ptr"]) - heap_base for n in names],
+        dtype=torch.int64,
+        device="cpu",
+    )
+    gathered_offsets = [torch.zeros_like(my_offsets) for _ in range(world_size)]
+    dist.all_gather(gathered_offsets, my_offsets, group=group)
+    off_rows = [[int(v) for v in g.tolist()] for g in gathered_offsets]
+    bad_offsets = [
+        (names[k], [row[k] for row in off_rows])
+        for k in range(len(names))
+        if len({row[k] for row in off_rows}) != 1
+    ]
+    assert not bad_offsets, (
+        f"rank {rank} [{arm}]: symmetric HEAP OFFSET diverged across ranks "
+        f"after the resize -- (object, per-rank offset from own heap base) = "
+        f"{bad_offsets}. RegisterStaticHeapSubRegion "
+        f"(application/memory/symmetric_memory.cpp:392) uses the LOCAL offset "
+        f"for every peer with no allgather to check it."
     )
 
 
