@@ -188,6 +188,37 @@ def _ensure_jit_kernels(kernel_type):
     ensure_compiled(_KERNEL_TYPE_TO_HIP[kernel_type])
 
 
+def _local_free_is_safe():
+    """True when releasing symmetric buffers is a RANK-LOCAL operation.
+
+    Only StaticHeap mode makes that true. `FreeStaticHeap`
+    (shmem/memory.cpp:113) is DeregisterStaticHeapSubRegion + HeapVAManager::Free
+    with no collective, so one rank can free while its peers do not. Under
+    `MORI_SHMEM_MODE=vmm_heap` the same call reaches `VMMFreeChunk`, which does
+    an unconditional `bootNet.Allgather` to cross-check offset/size across the
+    world (application/memory/symmetric_memory.cpp:1544) -- a collective, which
+    hangs if a peer is not there to join it.
+
+    That distinction only matters on ONE path: the ctor's peer-failure branch,
+    where the healthy ranks release AFTER learning a peer died, i.e. precisely
+    when a rank is missing from the collective.
+
+    `shmem_get_heap_stats()` is used as the discriminator rather than re-reading
+    MORI_SHMEM_MODE, because it reports what shmem was ACTUALLY initialized with:
+    ShmemGetHeapStats returns -1 -> None for every mode but StaticHeap
+    (shmem/memory.cpp:264), and ConfigureShmemMode (shmem/init.cpp:627) silently
+    falls back to StaticHeap on an unrecognized value, so the env var and the
+    live mode can disagree. Conservative on error: anything unexpected reads as
+    "not safe", which costs a leak rather than a deadlock.
+    """
+    try:
+        from mori.shmem import shmem_get_heap_stats
+
+        return shmem_get_heap_stats() is not None
+    except Exception:
+        return False
+
+
 def _load_hip_modules(kernel_type):
     """Load HipModule for the given kernel_type and init shmem gpu states."""
     from mori.ops._jit_loader import load_hip_module
@@ -519,6 +550,27 @@ class EpDispatchCombineOp:
                 # C++ FinalizeAll() directly keeps the group's collective count
                 # balanced at exactly one all-reduce for every rank.
                 #
+                # "LOCAL" IS MODE-DEPENDENT, and the whole argument above rests
+                # on it, so it is now CHECKED rather than asserted in prose.
+                # True in StaticHeap: FreeStaticHeap (shmem/memory.cpp:113) is
+                # DeregisterStaticHeapSubRegion + HeapVAManager::Free, no
+                # collective. NOT true in VMHeap, where VMMFreeChunk does an
+                # unconditional bootNet.Allgather to cross-check offset/size
+                # (symmetric_memory.cpp:1544) -- so under
+                # MORI_SHMEM_MODE=vmm_heap this release would hang the seven
+                # healthy ranks against a failing rank that is not there to
+                # participate. It is a plain env var (ConfigureShmemMode,
+                # init.cpp:607), so it is reachable, not exotic.
+                #
+                # `shmem_get_heap_stats()` is the mode discriminator we already
+                # have: ShmemGetHeapStats returns -1 -> None for every mode
+                # except StaticHeap (shmem/memory.cpp:264), because only
+                # StaticHeap has one HeapVAManager to report. Outside StaticHeap
+                # we therefore SKIP the release and say so in the error. Leaking
+                # one buffer set on a failed construct is bad; deadlocking all
+                # seven survivors is worse, and unlike the leak it is not
+                # recoverable.
+                #
                 # The outcome is group-uniform, which is the property that makes
                 # it safe: the FAILING rank was already left holding nothing by
                 # the C++ ctor's own FinalizeAll() on its error path
@@ -532,9 +584,11 @@ class EpDispatchCombineOp:
                 # allocating has is_initialized False and needs no release, and
                 # a release that itself fails must not mask the peer-failure
                 # RuntimeError below, which is the diagnosis the caller needs.
+                released = False
                 try:
-                    if self._handle.is_initialized:
+                    if _local_free_is_safe() and self._handle.is_initialized:
                         self._handle.finalize()
+                        released = True
                 except Exception:
                     pass
                 raise RuntimeError(
@@ -542,6 +596,16 @@ class EpDispatchCombineOp:
                     "rank; this rank's buffers are unusable because the group's "
                     "symmetric allocation is incomplete. See the failing rank's "
                     "log for the original error."
+                    + (
+                        ""
+                        if released
+                        else " NOTE: this rank's symmetric buffers were NOT "
+                        "released -- freeing is only rank-local under "
+                        "MORI_SHMEM_MODE=static_heap, and releasing here in "
+                        "another mode would deadlock against the failing rank. "
+                        "The heap will not return to its pre-construct baseline; "
+                        "do not retry the construct indefinitely."
+                    ),
                 )
 
     # ------------------------------------------------------------------
