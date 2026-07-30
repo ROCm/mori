@@ -351,7 +351,36 @@ class EpDispatchCombineHandle {
       std::string name;
       uintptr_t localPtr{0};
       size_t size{0};
+      // The HOST-side peer table. NOTHING IN ANY KERNEL READS THIS.
+      // symmetric_memory.cpp:389-392 fills it as `heapObj->peerPtrs[i] +
+      // offset`, i.e. the RDMA-facing address of peer i's copy.
       std::vector<uintptr_t> peerPtrs;
+      // The table every intranode kernel actually dereferences.
+      // `SymmMemObj::GetAs<T*>(pe)` returns `p2pPeerPtrs[pe]`
+      // (application_device_types.hpp:137-138), and that is what
+      // intranode.hpp:65 / :186 / :392 call. It is built separately
+      // (symmetric_memory.cpp:394-397, from the heap's p2pPeerPtrs, which for a
+      // non-RDMA peer is the address hipIpcOpenMemHandle returned in THIS
+      // rank's address space) and copied to the device separately (:417-419).
+      // Probing only `peerPtrs` therefore proves the coherence of a table no
+      // kernel consults -- the same defect class as probing only the
+      // capacity-independent barrier buffer.
+      std::vector<uintptr_t> p2pPeerPtrs;
+      // The DEVICE copy of the same four quantities, read back with hipMemcpy.
+      //
+      // `SymmMemObjPtr` holds two independently allocated SymmMemObj structs
+      // (symmetric_memory.cpp:380 host / :409-421 device) and `operator->`
+      // silently picks between them on __device__ vs __host__
+      // (application_device_types.hpp:150-153). Host code -- including every
+      // probe this campaign has written -- reads `.cpu`; kernels read `.gpu`.
+      // They are snapshotted at registration and never re-synced, so they can
+      // disagree, and a disagreement is invisible to any host-side check while
+      // being exactly what the wedged kernel would dereference.
+      bool gpuRead{false};  // false => the device readback itself failed
+      uintptr_t gpuLocalPtr{0};
+      size_t gpuSize{0};
+      std::vector<uintptr_t> gpuPeerPtrs;
+      std::vector<uintptr_t> gpuP2pPeerPtrs;
     };
     std::vector<SymmObjProbe> objects;
     // DEVICE-RESIDENT CONTENTS of the plain-device scalars a kernel spins on.

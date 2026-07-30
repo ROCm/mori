@@ -884,6 +884,54 @@ EpDispatchCombineHandle::BarrierProbe EpDispatchCombineHandle::ProbeBarrierState
       if (obj.cpu->peerPtrs != nullptr && config.worldSize > 0) {
         e.peerPtrs.assign(obj.cpu->peerPtrs, obj.cpu->peerPtrs + config.worldSize);
       }
+      // p2pPeerPtrs is the table the kernels dereference -- GetAs<T*>(pe)
+      // returns p2pPeerPtrs[pe] (application_device_types.hpp:137-138), which
+      // is what intranode.hpp:65/:186/:392 use. peerPtrs above is the
+      // RDMA-facing table and no intranode kernel reads it.
+      if (obj.cpu->p2pPeerPtrs != nullptr && config.worldSize > 0) {
+        e.p2pPeerPtrs.assign(obj.cpu->p2pPeerPtrs, obj.cpu->p2pPeerPtrs + config.worldSize);
+      }
+      // And read back the DEVICE-side SymmMemObj. `.cpu` and `.gpu` are two
+      // separately allocated structs (symmetric_memory.cpp:380 vs :409-421)
+      // that are snapshotted at registration and never re-synced; every
+      // host-side check ever written here has read `.cpu` while every kernel
+      // reads `.gpu`, so a divergence between them is simultaneously invisible
+      // to this probe's previous revisions and exactly what a wedged kernel
+      // would dereference.
+      //
+      // Tolerate a failed copy rather than aborting -- a diagnostic must never
+      // be the thing that kills the run it is diagnosing.
+      mori::application::SymmMemObj devObj;
+      if (hipMemcpy(&devObj, obj.gpu, sizeof(mori::application::SymmMemObj),
+                    hipMemcpyDeviceToHost) == hipSuccess) {
+        e.gpuRead = true;
+        e.gpuLocalPtr = reinterpret_cast<uintptr_t>(devObj.localPtr);
+        e.gpuSize = devObj.size;
+        if (config.worldSize > 0) {
+          // devObj.peerPtrs / p2pPeerPtrs are DEVICE pointers to the peer
+          // tables (allocated at :413 and :417), so they need a second copy.
+          const size_t want = static_cast<size_t>(config.worldSize) * sizeof(uintptr_t);
+          if (devObj.peerPtrs != nullptr) {
+            std::vector<uintptr_t> v(config.worldSize);
+            if (hipMemcpy(v.data(), devObj.peerPtrs, want, hipMemcpyDeviceToHost) == hipSuccess) {
+              e.gpuPeerPtrs = std::move(v);
+            } else {
+              (void)hipGetLastError();
+            }
+          }
+          if (devObj.p2pPeerPtrs != nullptr) {
+            std::vector<uintptr_t> v(config.worldSize);
+            if (hipMemcpy(v.data(), devObj.p2pPeerPtrs, want, hipMemcpyDeviceToHost) ==
+                hipSuccess) {
+              e.gpuP2pPeerPtrs = std::move(v);
+            } else {
+              (void)hipGetLastError();
+            }
+          }
+        }
+      } else {
+        (void)hipGetLastError();
+      }
     }
     p.objects.push_back(std::move(e));
   };

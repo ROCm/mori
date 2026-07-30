@@ -333,6 +333,17 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
           e["local_ptr"] = o.localPtr;
           e["size"] = o.size;
           e["peer_ptrs"] = o.peerPtrs;
+          // The table the KERNELS dereference (GetAs<T*>(pe) ->
+          // p2pPeerPtrs[pe]) plus the device-side mirror of the whole
+          // SymmMemObj. `peer_ptrs` above is the RDMA-facing host table and no
+          // intranode kernel reads it, so a check over it alone proves the
+          // coherence of something nothing consults.
+          e["p2p_peer_ptrs"] = o.p2pPeerPtrs;
+          e["gpu_read"] = o.gpuRead;
+          e["gpu_local_ptr"] = o.gpuLocalPtr;
+          e["gpu_size"] = o.gpuSize;
+          e["gpu_peer_ptrs"] = o.gpuPeerPtrs;
+          e["gpu_p2p_peer_ptrs"] = o.gpuP2pPeerPtrs;
           objs[py::str(o.name)] = e;
         }
         d["objects"] = objs;
