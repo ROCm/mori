@@ -101,7 +101,10 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
 
 // Expose SDMA C API. Symbol tags kept in sync with _bindings.py:
 //   put/get carry a coop tag (thread/warp/block); a "_ns" suffix selects the
-//   no-signal (fire-and-forget) variant, which quiet/quiet_queue cannot drain.
+//   no-signal (fire-and-forget) variant.
+// optFlags is a template parameter on the device API but stays a runtime `flags`
+// argument here, so the C ABI and the Python binding are unchanged: the wrapper
+// picks the instantiation. The branch is on a value uniform across the group.
 // Entire block compile-gated on BUILD_CCO_SDMA — when off, no cco_sdma_* symbols
 // are emitted (matches the host lib, which builds no SDMA queues).
 #if BUILD_CCO_SDMA
@@ -109,8 +112,13 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
   CCO_DEV void cco_sdma_##OP##__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO,            \
                                       uint64_t sW, uint64_t sO, uint64_t n, int qid, int flags) { \
     Sdma sdma{*AsDevComm(dc)};                                                                    \
-    sdma.OP<COOP, SIG>(peer, AsWindow(dW), dO, AsWindow(sW), sO, n, qid,                          \
-                       static_cast<uint32_t>(flags));                                             \
+    if (static_cast<uint32_t>(flags) & ccoSdmaOptFlagsAggregate) {                                \
+      sdma.OP<COOP, SIG, false, ccoSdmaOptFlagsAggregate>(peer, AsWindow(dW), dO, AsWindow(sW),   \
+                                                          sO, n, qid);                            \
+    } else {                                                                                      \
+      sdma.OP<COOP, SIG, false, ccoSdmaOptFlagsDefault>(peer, AsWindow(dW), dO, AsWindow(sW), sO, \
+                                                        n, qid);                                  \
+    }                                                                                             \
   }
 
 CCO_DEF_SDMA_XFER(put, thread, ccoCoopThread, true)

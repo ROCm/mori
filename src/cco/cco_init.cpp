@@ -1825,8 +1825,6 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     size_t poolBytes = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue * sizeof(uint64_t);
     HIP_RUNTIME_CHECK(hipMalloc(&sdma.signalBuf, poolBytes));
     HIP_RUNTIME_CHECK(hipMemset(sdma.signalBuf, 0, poolBytes));
-    HIP_RUNTIME_CHECK(hipMalloc(&sdma.expectSignals, poolBytes));
-    HIP_RUNTIME_CHECK(hipMemset(sdma.expectSignals, 0, poolBytes));
 
     // Use std::vector for host scratch so any exception thrown by
     // bootNet->Allgather (cross-rank comm) doesn't leak heap.
@@ -1878,11 +1876,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
                                 sizeof(uint64_t*) * comm->lsaSize, hipMemcpyHostToDevice));
 
     sdma.deviceHandles = comm->sdmaDevHandles;
-    MORI_SHMEM_TRACE(
-        "ccoDevCommCreate: SDMA pool signalBuf={} expectSignals={} "
-        "peerSignalPtrs={} numQueue={}",
-        (void*)sdma.signalBuf, (void*)sdma.expectSignals, (void*)sdma.peerSignalPtrs,
-        sdma.sdmaNumQueue);
+    MORI_SHMEM_TRACE("ccoDevCommCreate: SDMA pool signalBuf={} peerSignalPtrs={} numQueue={}",
+                     (void*)sdma.signalBuf, (void*)sdma.peerSignalPtrs, sdma.sdmaNumQueue);
   }
 
   // Fill the caller-provided host struct in place — no device allocation. It
@@ -2026,7 +2021,6 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
     HIP_RUNTIME_CHECK(hipFree(sdma.peerSignalPtrs));
   }
   if (sdma.signalBuf) HIP_RUNTIME_CHECK(hipFree(sdma.signalBuf));
-  if (sdma.expectSignals) HIP_RUNTIME_CHECK(hipFree(sdma.expectSignals));
 
   ccoWindowTableNode* node = hostShadow.windowTable;
   while (node) {

@@ -54,6 +54,10 @@ void PrintUsage(const char* program) {
                "  -T threads     threads per block\n"
                "  -s scope       thread | warp | block | thread_agg (default block)\n"
                "                 thread_agg = thread scope + ThreadAggregate (bw only)\n"
+               "  -C comp        SDMA latency completion: quiet | signal (default quiet)\n"
+               "                 quiet  = quietQueue(), engine read pointer drain\n"
+               "                 signal = put carries a local-signal ATOMIC, then\n"
+               "                          waitSignal() on our own signalBuf slot\n"
                "  -a             SDMA: aggregate doorbell — post the per-iter batch\n"
                "                 without ringing, then one commit() (bw only)\n"
                "  -A depth       SDMA: sub-copies per queue per iter (default 1);\n"
@@ -89,7 +93,7 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
   };
 
   int opt = 0;
-  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:")) != -1) {
+  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:")) != -1) {
     switch (opt) {
       case 'h':
         return 2;
@@ -141,6 +145,16 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
           out_args->put_scope = PutScope::kBlock;
         } else if (std::strcmp(optarg, "thread_agg") == 0) {
           out_args->put_scope = PutScope::kThreadAgg;
+        } else {
+          return 1;
+        }
+        out_args->put_scope_explicit = true;
+        break;
+      case 'C':
+        if (std::strcmp(optarg, "quiet") == 0) {
+          out_args->sdma_comp = SdmaComp::kQuiet;
+        } else if (std::strcmp(optarg, "signal") == 0) {
+          out_args->sdma_comp = SdmaComp::kSignal;
         } else {
           return 1;
         }

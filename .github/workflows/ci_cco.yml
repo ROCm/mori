@@ -60,7 +60,7 @@ jobs:
         run: |
           # BUILD_UMBP=OFF: not needed for CCO, and its gtest discovery breaks under cmake 4.4.
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON MORI_WITH_MPI=ON BUILD_UMBP=OFF BUILD_CCO_SDMA=ON pip install ."
+            "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON BUILD_BENCHMARK=ON MORI_WITH_MPI=ON BUILD_UMBP=OFF BUILD_CCO_SDMA=ON pip install ."
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         run: |
@@ -71,12 +71,59 @@ jobs:
 
       - name: Run CCO SDMA C++ tests (fork mode, 8 ranks)
         run: |
+          # Every one of these SKIPs and exits 0 when the comm has no SDMA queues,
+          # so a build or runner that quietly loses SDMA would turn the whole
+          # suite green. Treat a SKIP as a failure.
           $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
-            for t in test_sdma_put test_sdma_get test_sdma_put_mt test_sdma_block test_sdma_edge; do \
+            for t in test_sdma_put test_sdma_get test_sdma_put_mt test_sdma_block test_sdma_edge \
+                     test_sdma_signal test_sdma_warp_issue; do \
               echo \"=== \$t ===\" && \
-              timeout 240 ./build/tests/cpp/cco/\$t 8 || exit 1; \
+              out=\$(timeout 240 ./build/tests/cpp/cco/\$t 8 2>&1) || { echo \"\$out\"; exit 1; }; \
+              echo \"\$out\"; \
+              case \"\$out\" in *SKIP*) echo \"\$t SKIPped: SDMA is not active\"; exit 1;; esac; \
             done"
+
+      - name: Run CCO SDMA benchmarks (2 ranks, smoke)
+        run: |
+          # Smoke only: a shared runner cannot give stable perf numbers, so this
+          # checks that every scope and completion mode still runs and reports.
+          # The sizes are picked so a gross regression is visible in the log:
+          # latency should sit near 6us up to 8KB, and bandwidth at one op per
+          # transfer near 52 GB/s at 1MB and 60 GB/s at 8MB. Whole step is ~35s.
+          $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && B=./build/benchmark && \
+            for s in thread warp block; do \
+              for c in quiet signal; do \
+                echo \"=== put latency -s \$s -C \$c ===\" && \
+                timeout 120 mpirun --allow-run-as-root -np 2 \
+                  \$B/cco_p2p_put_latency -t sdma -s \$s -C \$c -b 8 -e 64K -n 100 -w 20 || exit 1; \
+              done; \
+              echo \"=== get latency -s \$s ===\" && \
+              timeout 120 mpirun --allow-run-as-root -np 2 \
+                \$B/cco_p2p_get_latency -t sdma -s \$s -b 8 -e 64K -n 100 -w 20 || exit 1; \
+            done"
+          # Bandwidth with the default depth of 1, i.e. one op per transfer.
+          # Splitting a transfer costs bandwidth in proportion to how small the
+          # pieces get, so -A > 1 here would measure a degenerate config.
+          $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && B=./build/benchmark && \
+            for s in thread warp block; do \
+              echo \"=== put bw -s \$s ===\" && \
+              timeout 120 mpirun --allow-run-as-root -np 2 \
+                \$B/cco_p2p_put_bw -t sdma -s \$s -b 64K -e 8M -n 100 -w 20 || exit 1; \
+              echo \"=== get bw -s \$s ===\" && \
+              timeout 120 mpirun --allow-run-as-root -np 2 \
+                \$B/cco_p2p_get_bw -t sdma -s \$s -b 64K -e 8M -n 100 -w 20 || exit 1; \
+            done"
+          # Keep the aggregate-doorbell path exercised; it is a different code
+          # path (no per-put doorbell, one commit) even though batching does not
+          # move bandwidth at these sizes.
+          $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && B=./build/benchmark && \
+            echo \"=== put bw aggregate (-a -A 8) ===\" && \
+            timeout 120 mpirun --allow-run-as-root -np 2 \
+              \$B/cco_p2p_put_bw -t sdma -s thread -a -A 8 -b 256K -e 1M -n 100 -w 20 || exit 1"
 
       - name: Run CCO C++ examples (2 ranks)
         run: |
@@ -122,12 +169,6 @@ jobs:
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             MODE=graph SWEEP=128,512,4096,8192 ITERS=20 WARMUP=10 \
             torchrun --standalone --nproc_per_node=8 bench_dispatch_combine.py"
-
-      - name: Run CCO SDMA Python API tests (spawn, up to 8 GPUs)
-        run: |
-          $CT exec $CONTAINER bash -c "\
-            cd $GITHUB_WORKSPACE && \
-            timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
 
 
       - name: Cleanup

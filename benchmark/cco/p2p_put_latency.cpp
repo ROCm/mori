@@ -73,17 +73,76 @@ __global__ void ibgda_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin
   }
 }
 
-// SDMA: one thread issues a single whole-buffer put on queue 0 + quiet per
-// iteration, so the per-op time tracks the SDMA dispatch + completion round trip.
+// SDMA: a single whole-buffer put on queue 0 + quiet per iteration, so the
+// per-op time tracks the SDMA dispatch + completion round trip. Coop selects the
+// issue granularity only — the copy is never split, so all three scopes move the
+// same bytes over the same queue and the delta is pure issue overhead:
+//   thread — the calling thread fills the WQE and rings the doorbell.
+//   warp / block — the group's leader does it (leader-only single writer).
+// SignalComp picks the local-completion mechanism (both are sender-side only):
+//   false — quietQueue(): wait for the engine's read pointer to pass our wptr.
+//   true  — the put carries a trailing ATOMIC into our own signalBuf slot and we
+//           waitSignal() on it. The slot is never reset, so we snapshot it on
+//           entry and count up from there.
+// Completion waits on queue 0 only. quiet<Coop>() would drain every queue, and
+// the extra uncached rptr read on an idle queue costs ~1.3us here — real, but an
+// artifact of quiet's all-queue semantics rather than of the issue scope.
+template <typename Coop, bool SignalComp>
 __global__ void sdma_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int peerLsa, int iter) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  if (blockIdx.x != 0) return;
   ccoSdma sdma{devComm};
   const size_t bytes = len_doubles * sizeof(double);
+
+  // Local signals land in signalBuf[myLsaRank*n + q] — indexed by us as the
+  // sender, not by the peer — and persist across launches.
+  uint64_t expected = 0;
+  if constexpr (SignalComp) {
+    const uint32_t nq = devComm.sdma.sdmaNumQueue;
+    expected = devComm.sdma.signalBuf[static_cast<uint32_t>(devComm.lsaRank) * nq];
+  }
+
   for (int i = 0; i < iter; i++) {
-    sdma.put(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), 0,
-             reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, 0);
-    sdma.quietQueue(peerLsa, 0);
+    sdma.put<Coop, SignalComp, /*remoteSignal=*/false>(
+        peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), 0, reinterpret_cast<ccoWindow_t>(sendWin),
+        0, bytes, 0);
+    if constexpr (SignalComp) {
+      sdma.waitSignal(devComm.lsaRank, 0, ++expected);
+      Coop{}.sync();  // pin the iteration boundary for the whole group
+    } else {
+      // Scope-aware: leader-only drain + sync. Letting every lane poll the
+      // uncached rptr costs ~0.4us at block scope and drains no sooner.
+      sdma.quietQueue<Coop>(peerLsa, 0);  // syncs internally
+    }
+  }
+}
+
+template <typename Coop>
+static void launch_sdma_lat_scope(SdmaComp comp, dim3 block, ccoWindowDevice* sendWin,
+                                  ccoWindowDevice* recvWin, size_t len_doubles, ccoDevComm devComm,
+                                  int peerLsa, int iter) {
+  if (comp == SdmaComp::kSignal) {
+    hipLaunchKernelGGL((sdma_put_lat<Coop, true>), dim3(1), block, 0, 0, sendWin, recvWin,
+                       len_doubles, devComm, peerLsa, iter);
+  } else {
+    hipLaunchKernelGGL((sdma_put_lat<Coop, false>), dim3(1), block, 0, 0, sendWin, recvWin,
+                       len_doubles, devComm, peerLsa, iter);
+  }
+}
+
+static void launch_sdma_lat(PutScope scope, SdmaComp comp, ccoWindowDevice* sendWin,
+                            ccoWindowDevice* recvWin, size_t len_doubles, ccoDevComm devComm,
+                            int peerLsa, int iter, int block_threads) {
+  if (scope == PutScope::kWarp) {
+    launch_sdma_lat_scope<ccoCoopWarp>(comp, dim3(block_threads), sendWin, recvWin, len_doubles,
+                                       devComm, peerLsa, iter);
+  } else if (scope == PutScope::kBlock) {
+    launch_sdma_lat_scope<ccoCoopBlock>(comp, dim3(block_threads), sendWin, recvWin, len_doubles,
+                                        devComm, peerLsa, iter);
+  } else {
+    // thread / thread_agg: SDMA has no ThreadAggregate mode, so both run one thread.
+    launch_sdma_lat_scope<ccoCoopThread>(comp, dim3(1), sendWin, recvWin, len_doubles, devComm,
+                                         peerLsa, iter);
   }
 }
 
@@ -102,6 +161,11 @@ int main(int argc, char** argv) {
   PerfArgs& args = ctx.args;
   const int my_pe = ctx.my_pe;
   const bool run_kernels = (my_pe == 0);
+
+  // SDMA keeps its historical thread-scope default; -s selects warp/block.
+  if (args.transport == Transport::kSdma && !args.put_scope_explicit) {
+    args.put_scope = PutScope::kThread;
+  }
 
   const int block_threads =
       LatencyBlockThreads(args.put_scope, args.threads_per_block, ctx.device_warp_size);
@@ -132,8 +196,8 @@ int main(int argc, char** argv) {
     if (run_kernels) {
       const float ms = RunWarmupAndTimed(res, args.warmup, args.iters, [&](int count) {
         if (args.transport == Transport::kSdma) {
-          hipLaunchKernelGGL(sdma_put_lat, dim3(1), dim3(1), 0, 0, ctx.send_win, ctx.recv_win,
-                             len_doubles, ctx.devComm, ctx.peer_lsa_rank, count);
+          launch_sdma_lat(args.put_scope, args.sdma_comp, ctx.send_win, ctx.recv_win, len_doubles,
+                          ctx.devComm, ctx.peer_lsa_rank, count, block_threads);
         } else if (args.transport == Transport::kLsa) {
           hipLaunchKernelGGL(lsa_put_lat, grid, block, 0, 0, ctx.send_win, ctx.recv_win,
                              len_doubles, ctx.peer_lsa_rank, count);
@@ -154,12 +218,16 @@ int main(int argc, char** argv) {
 
   ccoBarrierAll(ctx.comm);
   if (my_pe == 0) {
-    // SDMA latency uses a single queue / single thread.
+    // SDMA latency always uses a single queue; thread_agg has no SDMA analogue.
     int print_block = block_threads;
     const char* print_scope = ScopeToChar(args.put_scope);
-    if (args.transport == Transport::kSdma) {
+    if (args.transport == Transport::kSdma &&
+        (args.put_scope == PutScope::kThread || args.put_scope == PutScope::kThreadAgg)) {
       print_block = 1;
       print_scope = "thread";
+    }
+    if (args.transport == Transport::kSdma) {
+      std::printf("# sdma completion = %s\n", SdmaCompToChar(args.sdma_comp));
     }
     PrintPerfTable("p2p_put_latency unidirection", TransportToChar(args.transport), print_scope, 1,
                    print_block, ctx.device_warp_size, args.iters, args.warmup,
