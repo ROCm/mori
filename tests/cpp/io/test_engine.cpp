@@ -1778,6 +1778,9 @@ void CaseRdmaGateReapDoesNotStrandInflight() {
   ScopedEnvVar smallBound("MORI_IO_MAX_MEM_GATE_TOMBSTONES", "2");
   const std::size_t kBound = 2;
   const int kStrandCycles = 8;
+  // Simultaneous outstanding 4 MiB writes per cycle. See the loop below for why
+  // one was measurably not enough.
+  const int kInflightDepth = 16;
 
   ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_gate_strand", true);
   auto dst = RegisterGpuMemory(pair.target.get(), 8 * 1024 * 1024, 0);
@@ -1791,37 +1794,79 @@ void CaseRdmaGateReapDoesNotStrandInflight() {
   std::printf("[gate-strand] baseline: timedOut=%zu tombstones=%zu refused=%zu\n",
               base.quiesceTimedOut, base.gateTombstones, base.postsRefused);
 
-  // PHASE 1 -- strand. Each cycle deregisters with a big transfer in flight and
-  // a 1 ms timeout, so Quiesce returns false with inflight > 0 and the reap
+  // PHASE 1 -- strand. Each cycle deregisters with transfers in flight and a
+  // 1 ms timeout, so Quiesce returns false with inflight > 0 and the reap
   // declines that gate.
+  //
+  // Getting inflight > 0 AT THE BARRIER is the hard part, and the first version
+  // of this case measured that the hard way: one 4 MiB write, issued and not
+  // waited on, gave `timedOut=0` over 8 cycles (T45, mori_t45.log) -- the write
+  // lands in well under the time DeregisterMemory spends in its control-plane
+  // and session-invalidation steps before it even reaches step 3. The existing
+  // reentry case sees the same thing from the other side: `waited=2` out of 64
+  // quiesce calls. So the work has to be BOTH deep (many WRs outstanding at
+  // once, not one) and CONTINUOUSLY replenished by another thread for the whole
+  // of the dereg, exactly as that case does.
+  std::size_t waited = 0;
   for (int i = 0; i < kStrandCycles; ++i) {
     MemoryDesc ldesc =
         pair.initiator->RegisterMemory(lptr, 8 * 1024 * 1024, 0, MemoryLocationType::GPU);
 
-    TransferStatus big;
-    TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
-    // Issued and NOT waited on: the point is for it to be outstanding when the
-    // dereg's barrier samples inflight.
-    pair.initiator->Write(ldesc, 0, dst.desc, 0, 4 * 1024 * 1024, &big, uid);
+    std::atomic<bool> stopLoader{false};
+    std::vector<TransferStatus> statuses(kInflightDepth);
+    // Depth: many WRs outstanding simultaneously, so the SQ is not empty by the
+    // time the barrier samples.
+    for (int k = 0; k < kInflightDepth; ++k) {
+      TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+      pair.initiator->Write(ldesc, 0, dst.desc, 0, 4 * 1024 * 1024, &statuses[k], uid);
+    }
+    // Continuity: keep posting for the whole of the dereg, so the drain cannot
+    // simply outlast a fixed burst.
+    std::thread loader([&]() {
+      while (!stopLoader.load(std::memory_order_acquire)) {
+        TransferStatus st;
+        TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+        pair.initiator->Write(ldesc, 0, dst.desc, 0, 4 * 1024 * 1024, &st, uid);
+        if (st.CodeUint32() != static_cast<uint32_t>(StatusCode::ERR_BAD_STATE)) {
+          std::string terr;
+          WaitTransferDone(&st, 10000, &terr);
+        }
+      }
+    });
+
     pair.initiator->DeregisterMemory(ldesc);
-    // Now let it land, so the process is not left with a genuinely live WR
-    // against a deregistered lkey for the rest of the suite.
-    std::string terr;
-    WaitTransferDone(&big, 10000, &terr);
+    stopLoader.store(true, std::memory_order_release);
+    loader.join();
+    // Let the burst land, so the suite is not left with genuinely live WRs
+    // against a deregistered lkey for the rest of the process.
+    for (int k = 0; k < kInflightDepth; ++k) {
+      std::string terr;
+      WaitTransferDone(&statuses[k], 10000, &terr);
+    }
   }
 
   DeregQuiesceCensus afterStrand = GetDeregQuiesceCensus();
   const std::size_t timedOut = afterStrand.quiesceTimedOut - base.quiesceTimedOut;
+  waited = afterStrand.quiesceWaited - base.quiesceWaited;
   const std::size_t strandedTombstones = afterStrand.gateTombstones;
-  std::printf("[gate-strand] after %d strand cycles: timedOut=%zu tombstones=%zu bound=%zu\n",
-              kStrandCycles, timedOut, strandedTombstones, kBound);
+  // `waited` is printed alongside `timedOut` on purpose: if a future run goes
+  // vacuous again, these two separate "the transfers were never outstanding"
+  // (waited=0) from "they were, but drained inside the timeout" (waited>0,
+  // timedOut=0), and only the first is a driver problem.
+  std::printf("[gate-strand] after %d strand cycles: waited=%zu timedOut=%zu tombstones=%zu "
+              "bound=%zu maxInflightAtQuiesce=%zu\n",
+              kStrandCycles, waited, timedOut, strandedTombstones, kBound,
+              afterStrand.maxInflightAtQuiesce);
 
   // NON-VACUITY FIRST. If nothing timed out, the strand path was never entered
   // and everything below is a green for the wrong reason -- the same vacuous
   // mistake struck at T3 and re-asked for at every review since.
   Require(timedOut > 0,
           "VACUOUS: no quiesce timed out, so no gate was ever declined and the strand path was "
-          "not exercised (timedOut=0). Not a pass.");
+          "not exercised (timedOut=0, waited=" + std::to_string(waited) +
+              "). This is a DRIVER failure, not a verdict on the fix: with waited=0 the "
+              "transfers were never outstanding at the barrier; with waited>0 they were, but "
+              "drained inside 1 ms. Deepen kInflightDepth. Not a pass either way.");
 
   // (a) THE DISCRIMINATOR. Post-fix a declined gate goes back on the deque, so
   //     the retention holds near the bound. Pre-fix the count is inflated by
