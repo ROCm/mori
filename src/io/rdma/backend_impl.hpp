@@ -144,8 +144,14 @@ class RdmaManager {
   // Safe to call from the poll thread itself: the caller iterates a SNAPSHOT
   // of shared_ptrs, so erasing from the map does not invalidate anything it
   // holds, and the runtime stays alive until that snapshot is dropped.
-  // Returns how many were reaped.
-  std::size_t ReapRetiredEndpoints();
+  // Returns the ids that were reaped, NOT just a count: NotifManager holds a
+  // second shared_ptr to each runtime in `registeredRuntimes_` (plus, when
+  // notification is on, a pinned buffer and an MR in `notifCtxById_`), and the
+  // caller must reap those under NotifManager's own lock. Erasing only here
+  // leaves the QP resident for the life of the process and keeps
+  // `numRegisteredRuntimes` -- the counter that is live at sglang's
+  // `enableNotification=false` -- growing per dead QP. REVIEW_M #74-2.
+  std::vector<EndpointId> ReapRetiredEndpoints();
   // Route-table endpoints for one engine+topo that are NOT QP-fatal.
   int CountUsableEndpoint(EngineKey, TopoKeyPair);
 
@@ -200,6 +206,13 @@ class NotifManager {
   ~NotifManager();
 
   void RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt);
+
+  // The NotifManager half of the reap. Takes the ids returned by
+  // RdmaManager::ReapRetiredEndpoints -- i.e. QPs that are qpFatal AND whose
+  // ledger has drained -- and drops them from `registeredRuntimes_`, removes
+  // their comp-channel from epoll in EVENT mode, and frees + deregisters their
+  // notification context. Returns how many were found and reaped.
+  std::size_t ReapEndpoints(const std::vector<EndpointId>& ids);
 
   // Read-only diagnostics, mirroring RdmaManager's. `notifCtxById_` is the one
   // that costs real resources: RegisterEndpoint posix_memaligns

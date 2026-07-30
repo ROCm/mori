@@ -500,9 +500,9 @@ std::size_t RdmaManager::RetireEndpoint(EndpointId id) {
   return removed;
 }
 
-std::size_t RdmaManager::ReapRetiredEndpoints() {
+std::vector<EndpointId> RdmaManager::ReapRetiredEndpoints() {
   std::unique_lock<std::shared_mutex> lock(mu);
-  std::size_t reaped = 0;
+  std::vector<EndpointId> reapedIds;
   for (auto it = endpointsById_.begin(); it != endpointsById_.end();) {
     const auto& rt = it->second;
     // Three conditions, all necessary:
@@ -516,14 +516,22 @@ std::size_t RdmaManager::ReapRetiredEndpoints() {
     const bool reapable = rt && rt->ep.IsQpFatal() && rt->ep.ledger &&
                           rt->ep.ledger->NumRecords() == 0;
     if (reapable) {
+      reapedIds.push_back(it->first);
       it = endpointsById_.erase(it);
-      reaped++;
     } else {
       ++it;
     }
   }
-  if (reaped > 0) RecordEndpointsReaped(reaped);
-  return reaped;
+  if (!reapedIds.empty()) RecordEndpointsReaped(reapedIds.size());
+  // The ids, not just the count: NotifManager holds a SECOND shared_ptr to each
+  // of these runtimes in `registeredRuntimes_`, and that map is the one that is
+  // live at sglang's `enableNotification=false` (RegisterEndpoint's early-return
+  // branch still inserts into it). Erasing here only would leave the runtime and
+  // its QP resident for the life of the process and keep `numRegisteredRuntimes`
+  // growing per dead QP -- REVIEW_M #74-2. The caller reaps the notif side with
+  // these ids, under NotifManager's own lock, so neither manager's lock is ever
+  // taken while holding the other's.
+  return reapedIds;
 }
 
 EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
@@ -703,6 +711,59 @@ std::size_t NotifManager::GetNotifBufferBytes() const {
   // Every context is one posix_memalign of exactly this size (see
   // RegisterEndpoint), so the product is exact, not an estimate.
   return notifCtxById_.size() * static_cast<std::size_t>(config.notifPerQp) * sizeof(NotifMessage);
+}
+
+std::size_t NotifManager::ReapEndpoints(const std::vector<EndpointId>& ids) {
+  // REVIEW_M #74-2. RdmaManager::ReapRetiredEndpoints drops the runtime out of
+  // `endpointsById_` and hence out of the POLLING branch's per-round walk, but
+  // `registeredRuntimes_` holds a second shared_ptr to the same object and had
+  // no erase anywhere. At `enableNotification=false` -- sglang's setting -- that
+  // map is the ONLY one that grows, which is exactly why `numRegisteredRuntimes`
+  // was added; reaping one map and not the other means the counter that moves in
+  // production keeps growing one entry per dead QP.
+  std::size_t reaped = 0;
+  std::vector<QpNotifContext> toFree;
+  std::vector<int> devIdOf;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    for (EndpointId id : ids) {
+      auto rit = registeredRuntimes_.find(id);
+      if (rit == registeredRuntimes_.end()) continue;
+      const int ldevId = rit->second ? rit->second->ep.ldevId : -1;
+      // EVENT mode mirrors the poll set in epoll rather than in the map walk,
+      // so the same reap has to remove the comp-channel fd or the poll-set fix
+      // does not exist on that path. Best-effort: the fd may already be gone.
+      if (config.pollCqMode == PollCqMode::EVENT && epfd >= 0 && rit->second &&
+          rit->second->ep.local.ibvHandle.compCh) {
+        epoll_ctl(epfd, EPOLL_CTL_DEL, rit->second->ep.local.ibvHandle.compCh->fd, nullptr);
+      }
+      registeredRuntimes_.erase(rit);
+      reaped++;
+      // The notif context is the part that costs real resources: one
+      // posix_memalign of notifPerQp*sizeof(NotifMessage) plus a registered MR
+      // per QP. Only Shutdown() used to release them. Defer the actual free to
+      // outside the lock -- ibv_dereg_mr can block, and the poll thread calls
+      // this.
+      auto nit = notifCtxById_.find(id);
+      if (nit != notifCtxById_.end()) {
+        toFree.push_back(nit->second);
+        devIdOf.push_back(ldevId);
+        notifCtxById_.erase(nit);
+      }
+    }
+  }
+  for (std::size_t i = 0; i < toFree.size(); ++i) {
+    // Safe to dereg here and not earlier: the caller only passes ids whose QP is
+    // qpFatal AND whose ledger has drained, so the NIC has no outstanding WR
+    // that could still reference this lkey. That is the same condition the
+    // dereg barrier (bed8584e) enforces for user memory.
+    if (devIdOf[i] >= 0) {
+      application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(devIdOf[i]);
+      if (devCtx) devCtx->DeregisterRdmaMemoryRegion(toFree[i].buf);
+    }
+    free(toFree[i].buf);
+  }
+  return reaped;
 }
 
 void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) {
@@ -995,6 +1056,7 @@ void NotifManager::MainLoop() {
     while (running.load()) {
       FlushRoundStats roundStats;
       bool handledCqEvent = false;
+      bool sawRetiredEvent = false;
       int nfds = epoll_wait(epfd, events, maxEvents, 0 /*ms*/);
       for (int i = 0; i < nfds; ++i) {
         EndpointId eid = events[i].data.u64;
@@ -1017,9 +1079,24 @@ void NotifManager::MainLoop() {
 
         handledCqEvent = true;
         roundStats.Merge(rt->id, ProcessOneCqe(rt));
+        if (rt->ep.IsQpFatal()) sawRetiredEvent = true;
       }
       if (handledCqEvent) {
         EmitFlushSummaryIfNeeded(roundStats);
+      }
+      // REVIEW_M #74-2 secondary: EVENT mode does not walk a map, but it does
+      // keep the retired QP's comp-channel in epoll and its runtime in both
+      // registries forever. Same reap, same ledger-drained gate; ReapEndpoints
+      // does the EPOLL_CTL_DEL.
+      if (sawRetiredEvent) {
+        std::vector<EndpointId> reapedIds = rdma->ReapRetiredEndpoints();
+        if (!reapedIds.empty()) {
+          std::size_t notifReaped = ReapEndpoints(reapedIds);
+          MORI_IO_INFO(
+              "NotifManager[EVENT]: reaped {} retired endpoint runtime(s), {} from the "
+              "notification registry (epoll fds removed).",
+              reapedIds.size(), notifReaped);
+        }
       }
     }
   } else {
@@ -1046,12 +1123,15 @@ void NotifManager::MainLoop() {
       // snapshot's own shared flags, so it costs nothing when nothing is dead,
       // which is the steady state.
       if (sawRetired) {
-        std::size_t reaped = rdma->ReapRetiredEndpoints();
-        if (reaped > 0) {
+        std::vector<EndpointId> reapedIds = rdma->ReapRetiredEndpoints();
+        if (!reapedIds.empty()) {
+          // Both maps, or the reap is half a reap: see ReapEndpoints.
+          std::size_t notifReaped = ReapEndpoints(reapedIds);
           MORI_IO_INFO(
-              "NotifManager: reaped {} retired endpoint runtime(s) out of the CQ poll set; their "
-              "ledgers are drained so nothing outstanding referenced them.",
-              reaped);
+              "NotifManager: reaped {} retired endpoint runtime(s) out of the CQ poll set and {} "
+              "out of the notification registry; their ledgers are drained so nothing outstanding "
+              "referenced them.",
+              reapedIds.size(), notifReaped);
         }
       }
     }
