@@ -2009,11 +2009,33 @@ void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
   // terms regardless: the gate protects an lkey WE registered, and there is no
   // lkey of ours to protect for a descriptor we do not own.
   //
-  // NOT FIXED HERE, and it is the same collision one layer down:
-  // `rdma->DeregisterLocalMemory(desc)` below keys mTable on {devId, id} with
-  // no engine discriminator either, so the remote-descriptor path can still
-  // deregister a local MR that shares the number. Reported rather than
-  // widened into this commit -- see WORKLOG T41.
+  // REVIEW_M #77-1. Splitting these two was strictly WORSE than not guarding at
+  // all: e9ca17df made the quiesce conditional on ownership but left the
+  // `ibv_dereg_mr` below unconditional, so on the collision path the drain was
+  // removed and the tear-down kept -- a colliding local MR was destroyed with
+  // ZERO barrier where before it was at least quiesced first. Both halves are
+  // guarded here, in one place, for that reason.
+  //
+  // Skipping the dereg for a non-owned descriptor is not a workaround, it is
+  // the correct semantics: `mTable` holds LOCAL MRs only. Its sole writer is
+  // `RdmaManager::RegisterLocalMemory` (:331) and both call sites pass a
+  // descriptor we own -- the control plane's own `mems[]` entry (:1557) and
+  // CreateSession's `local` (:2183); remote MRs live in a different map
+  // entirely (`remotes[ekey].mTable`, :558). So for a remote descriptor there
+  // is nothing of ours to deregister, and any `key.id == desc.id` hit in
+  // `DeregisterLocalMemory` is a numeric collision with one of OUR live
+  // buffers, i.e. every match on this path is a wrong one.
+  //
+  // The underlying defect is unchanged and still worth fixing upstream:
+  // `DeregisterLocalMemory` keys mTable on {devId, id} with no engine
+  // discriminator, so it cannot tell the two apart by itself. This guard means
+  // it is never asked to.
+  //
+  // REACHABILITY for S/E, stated rather than left to be inferred: sglang
+  // deregisters only its own descriptors (`mori/conn.py:787-794`), so the PD
+  // flip path always has isLocal=true and is unaffected by this guard in
+  // either direction. The collision path is reached by engines that dereg a
+  // peer's descriptor -- which is what T41's fixture does.
   const bool isLocal = desc.engineKey == myEngKey;
   if (isLocal && !rdma->QuiesceLocalMemory(desc.id, GetDeregisterQuiesceTimeoutMs())) {
     // Deliberately NOT a throw and NOT an abort. A flip that cannot complete is
@@ -2028,7 +2050,18 @@ void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
         "process has released or re-registered.",
         desc.id, GetDeregisterQuiesceTimeoutMs());
   }
-  rdma->DeregisterLocalMemory(desc);
+  if (isLocal) {
+    rdma->DeregisterLocalMemory(desc);
+  } else {
+    // Loud, because this is a caller deregistering a descriptor it does not
+    // own. That is legal (the id namespace is per-engine) but it used to
+    // silently destroy one of our MRs, so a log line here is what makes the
+    // difference between the guard working and the guard being untested.
+    MORI_IO_INFO(
+        "DeregisterMemory: descriptor id {} belongs to engine {}, not {}; skipping the local "
+        "quiesce and deregister (no local MR of ours is named by it)",
+        desc.id, desc.engineKey, myEngKey);
+  }
 }
 
 bool RdmaBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const {
