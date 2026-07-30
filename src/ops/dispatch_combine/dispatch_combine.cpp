@@ -489,16 +489,33 @@ static constexpr int kNoMemset = -1000;
 // symmetric heap, which is the corruption class the severity agreement exists
 // to report rather than hide.
 static bool ShouldInjectAllocFailure(const char* what) {
-  const char* target = env::Get("MORI_TEST_FAIL_HIPMALLOC");
-  if ((target == nullptr) || (target[0] == '\0') || (what == nullptr)) return false;
-  if (std::strcmp(target, what) != 0) return false;
-
-  // Re-arming (a new test setting the var again, possibly to a different site)
-  // resets the counts. Keyed on the target string so consecutive tests in one
-  // worker process do not inherit each other's remaining fires.
+  // Re-arming resets the counts. Keyed on the target string so consecutive
+  // tests in one worker process do not inherit each other's remaining fires.
   static std::string armedFor;
   static int firesLeft = 0;
   static int skipsLeft = 0;
+
+  const char* target = env::Get("MORI_TEST_FAIL_HIPMALLOC");
+  if ((target == nullptr) || (target[0] == '\0')) {
+    // Disarmed -- either never armed, or a test popped the env var in its
+    // `finally`. Forget the remaining state HERE rather than only on a target
+    // change (REVIEW_M #28-3). The old code kept `armedFor` set until some
+    // LATER call arrived with a different target, so a test that armed
+    // TIMES=2 and only spent one fire (its rollback succeeded, so the second
+    // site was never reached) left firesLeft=1 and skipsLeft behind. The next
+    // test arming the SAME buffer name -- and every asymmetry test in this
+    // suite uses "dispSenderIdxMap" -- then saw armedFor == target, skipped
+    // the reset, and inherited the previous test's counts instead of its own
+    // TIMES/AFTER. It would fail at the wrong allocation, and the resulting
+    // red would be attributed to product code. All the worker processes are
+    // session-scoped and shared across the whole file, so this is reachable in
+    // an ordinary full-suite run and NOT in a `-k` selection of one test,
+    // which is the worst way for a bug to behave.
+    armedFor.clear();
+    return false;
+  }
+  if ((what == nullptr) || (std::strcmp(target, what) != 0)) return false;
+
   if (armedFor != target) {
     armedFor = target;
     const char* timesStr = env::Get("MORI_TEST_FAIL_HIPMALLOC_TIMES");
