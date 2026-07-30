@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -45,7 +46,64 @@ IBVerbsDeviceContext::~IBVerbsDeviceContext() {
   }
 }
 
+namespace {
+
+// Releases the endpoint resources created so far if CreateRdmaEndpoint unwinds.
+//
+// c858f398 registered cq/compCh with the destructor pools at creation so they
+// could not be lost, which fixed the leak-past-teardown but NOT the thing the
+// error message asks the caller to do. `ibv_create_qp failed ... reduce
+// numQpPerPe` invites an in-place retry, and a tracked-but-not-released CQ
+// still occupies the HCA's budget until ~IBVerbsDeviceContext -- so each retry
+// consumed one more CQ off the very budget the message said to reduce, and the
+// advice made the exhaustion monotonically worse. Tracking is the right
+// property for teardown; for a retry the resources have to actually go back.
+//
+// Commit() on the success path; anything else destroys and de-registers. Order
+// matters: the QP references the CQ and the CQ references the comp channel, so
+// they are torn down in reverse creation order, exactly as
+// ~IBVerbsDeviceContext does.
+class EndpointCreationGuard {
+ public:
+  EndpointCreationGuard(std::unordered_map<void*, ibv_cq*>& cqPool,
+                        std::vector<ibv_comp_channel*>& compChPool)
+      : cqPool_(cqPool), compChPool_(compChPool) {}
+
+  ~EndpointCreationGuard() {
+    if (committed_) return;
+    if (srq_) ibv_destroy_srq(srq_);
+    if (cq_) {
+      cqPool_.erase(cq_);
+      ibv_destroy_cq(cq_);
+    }
+    if (compCh_) {
+      compChPool_.erase(std::remove(compChPool_.begin(), compChPool_.end(), compCh_),
+                        compChPool_.end());
+      ibv_destroy_comp_channel(compCh_);
+    }
+  }
+
+  EndpointCreationGuard(const EndpointCreationGuard&) = delete;
+  EndpointCreationGuard& operator=(const EndpointCreationGuard&) = delete;
+
+  void TrackCompCh(ibv_comp_channel* compCh) { compCh_ = compCh; }
+  void TrackCq(ibv_cq* cq) { cq_ = cq; }
+  void TrackSrq(ibv_srq* srq) { srq_ = srq; }
+  void Commit() { committed_ = true; }
+
+ private:
+  std::unordered_map<void*, ibv_cq*>& cqPool_;
+  std::vector<ibv_comp_channel*>& compChPool_;
+  ibv_comp_channel* compCh_{nullptr};
+  ibv_cq* cq_{nullptr};
+  ibv_srq* srq_{nullptr};
+  bool committed_{false};
+};
+
+}  // namespace
+
 RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
+  EndpointCreationGuard guard(cqPool, compChPool);
   ibv_context* context = GetIbvContext();
   const ibv_device_attr_ex* deviceAttr = GetRdmaDevice()->GetDeviceAttr();
 
@@ -84,6 +142,7 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   endpoint.ibvHandle.compCh = config.withCompChannel ? ibv_create_comp_channel(context) : nullptr;
   if (endpoint.ibvHandle.compCh) {
     compChPool.push_back(endpoint.ibvHandle.compCh);
+    guard.TrackCompCh(endpoint.ibvHandle.compCh);
   }
   endpoint.ibvHandle.cq =
       ibv_create_cq(context, config.maxCqeNum, NULL, endpoint.ibvHandle.compCh, 0);
@@ -102,6 +161,7 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
         "cqe count exceeds the device attributes.");
   }
   cqPool.insert({endpoint.ibvHandle.cq, endpoint.ibvHandle.cq});
+  guard.TrackCq(endpoint.ibvHandle.cq);
 
   // TODO: should also manage the lifecycle of completion channel && srq
   if (config.withCompChannel)
@@ -110,6 +170,7 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
 
   assert(config.maxMsgSge <= GetRdmaDevice()->GetDeviceAttr()->orig_attr.max_sge);
   endpoint.ibvHandle.srq = config.enableSrq ? CreateRdmaSrqIfNx(config) : nullptr;
+  guard.TrackSrq(endpoint.ibvHandle.srq);
 
   uint32_t maxRecvWr = config.maxRecvWr != 0 ? config.maxRecvWr : config.maxMsgsNum;
   ibv_qp_init_attr qpAttr = {.send_cq = endpoint.ibvHandle.cq,
@@ -153,6 +214,10 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   // cq and compCh were registered at creation, above. Only the QP is left, and
   // nothing between its creation and here can throw.
   qpPool.insert({endpoint.ibvHandle.qp->qp_num, endpoint.ibvHandle.qp});
+  // Past every throw: the endpoint is the caller's now, and its resources are
+  // owned by the pools until ~IBVerbsDeviceContext. Nothing for the guard to
+  // release.
+  guard.Commit();
   return endpoint;
 }
 
