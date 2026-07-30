@@ -78,6 +78,17 @@ class RdmaManager {
   application::RdmaMemoryRegion RegisterLocalMemory(int ldevId, const MemoryDesc& desc);
   void DeregisterLocalMemory(int ldevId, const MemoryDesc& desc);
   void DeregisterLocalMemory(const MemoryDesc& desc);
+  // The in-flight gate for one local memory id, created on first use. A
+  // session captures this at CreateSession time and every post takes a token
+  // from it, so `QuiesceLocalMemory` below can wait the NIC out before
+  // ibv_dereg_mr destroys the lkey those posts carry. See MemoryInflightGate.
+  std::shared_ptr<MemoryInflightGate> GetOrCreateLocalMemoryGate(MemoryUniqueId);
+  // Close the gate to new posts and wait for outstanding ones to complete.
+  // Returns true if it drained. Removes the gate either way: a gate left in
+  // the map would be re-handed to a session built after the id is
+  // re-registered, and it is permanently `retiring_`, so every later post
+  // against the reused id would be refused.
+  bool QuiesceLocalMemory(MemoryUniqueId, int timeoutMs);
 
   // Remote memory management APIs
   std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int remRdmaDevId,
@@ -145,6 +156,11 @@ class RdmaManager {
   std::vector<application::RdmaDeviceContext*> deviceCtxs;
 
   MemoryTable mTable;
+  // Keyed by memory id, NOT MemoryKey{devId,id}: one dereg call tears down
+  // every per-device MR for the id (see DeregisterLocalMemory(desc)), so the
+  // barrier has to cover the id as a whole or a multi-NIC session would drain
+  // one device and dereg the other out from under itself.
+  std::unordered_map<MemoryUniqueId, std::shared_ptr<MemoryInflightGate>> memGates_;
   std::unordered_map<EngineKey, RemoteEngineMeta> remotes;
   std::atomic<EndpointId> nextEndpointId_{1};
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> endpointsById_;
@@ -312,7 +328,8 @@ class RdmaBackendSession : public BackendSession {
   RdmaBackendSession(const RdmaBackendConfig& config,
                      std::vector<application::RdmaMemoryRegion> localMrPerEp,
                      std::vector<application::RdmaMemoryRegion> remoteMrPerEp, const EpPairVec& eps,
-                     Executor* executor);
+                     Executor* executor,
+                     std::shared_ptr<MemoryInflightGate> localGate = nullptr);
   ~RdmaBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -330,6 +347,12 @@ class RdmaBackendSession : public BackendSession {
   std::vector<application::RdmaMemoryRegion> remoteMrPerEp{};
   EpPairVec eps{};
   Executor* executor{nullptr};
+  // Gate for the LOCAL memory id this session was built against. `localMrPerEp`
+  // is a set of POD copies with no back-reference to the ibv_mr, so this is the
+  // only thing tying the session's posts to the lifetime of the registration.
+  // Null only for a default-constructed session (the CreateSession(local,
+  // remote) overload fills it in before use).
+  std::shared_ptr<MemoryInflightGate> localGate{};
 };
 
 /* ---------------------------------------------------------------------------------------------- */

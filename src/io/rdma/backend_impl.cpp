@@ -66,6 +66,24 @@
 namespace mori {
 namespace io {
 
+// How long DeregisterMemory waits for outstanding work requests against the
+// region before it destroys the MR anyway. Chosen against the thing that
+// actually races it: sglang's flip teardown joins its worker threads with
+// `join(timeout=3.0)` and then deregisters unconditionally (conn.py:691-718),
+// so a transfer can still be in `_wait_chunk` when we are called. 5 s covers
+// that 3 s window with margin while still bounding the flip. Override with
+// MORI_IO_DEREG_QUIESCE_MS.
+static constexpr int kDefaultDeregisterQuiesceTimeoutMs = 5000;
+
+static int GetDeregisterQuiesceTimeoutMs() {
+  static const int v = [] {
+    int ms = kDefaultDeregisterQuiesceTimeoutMs;
+    env::Override("MORI_IO_DEREG_QUIESCE_MS", ms, mori::env::detail::ParsePositiveInt);
+    return ms;
+  }();
+  return v;
+}
+
 static void ValidateRdmaNotificationConfig(const RdmaBackendConfig& config) {
   if (config.enableNotification && config.notifPerQp == 0) {
     MORI_IO_ERROR(
@@ -321,6 +339,32 @@ void RdmaManager::DeregisterLocalMemory(int devId, const MemoryDesc& desc) {
     deviceCtxs[devId]->DeregisterRdmaMemoryRegion(reinterpret_cast<void*>(desc.data));
     mTable.erase(key);
   }
+}
+
+std::shared_ptr<MemoryInflightGate> RdmaManager::GetOrCreateLocalMemoryGate(MemoryUniqueId id) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  auto& gate = memGates_[id];
+  if (!gate) gate = std::make_shared<MemoryInflightGate>();
+  return gate;
+}
+
+bool RdmaManager::QuiesceLocalMemory(MemoryUniqueId id, int timeoutMs) {
+  std::shared_ptr<MemoryInflightGate> gate;
+  {
+    std::unique_lock<std::shared_mutex> lock(mu);
+    auto it = memGates_.find(id);
+    if (it == memGates_.end()) return true;  // nothing ever posted against it
+    gate = it->second;
+    // Erase while still holding the lock, BEFORE draining: a session built
+    // after this point must get a fresh gate, not this permanently-retiring
+    // one. Sessions already holding it keep it alive through their shared_ptr,
+    // which is what makes the drain below meaningful.
+    memGates_.erase(it);
+  }
+  // Dropped the lock on purpose. Quiesce blocks on the CQ poll thread, and
+  // that thread takes `mu` on other paths -- holding it here would deadlock the
+  // very drain we are waiting for.
+  return gate->Quiesce(timeoutMs);
 }
 
 void RdmaManager::DeregisterLocalMemory(const MemoryDesc& desc) {
@@ -1402,18 +1446,32 @@ EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
 RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
                                        std::vector<application::RdmaMemoryRegion> localMrPerEp,
                                        std::vector<application::RdmaMemoryRegion> remoteMrPerEp,
-                                       const EpPairVec& e, Executor* exec)
+                                       const EpPairVec& e, Executor* exec,
+                                       std::shared_ptr<MemoryInflightGate> gate)
     : config(config),
       localMrPerEp(std::move(localMrPerEp)),
       remoteMrPerEp(std::move(remoteMrPerEp)),
       eps(e),
-      executor(exec) {}
+      executor(exec),
+      localGate(std::move(gate)) {}
 
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
+  // Taken BEFORE the post and released by the CQE (the ledger holds this meta
+  // until then). A null return means DeregisterMemory has already closed the
+  // gate, so posting would carry a doomed lkey -- fail the transfer instead.
+  if (localGate) {
+    callbackMeta->inflightToken = MemoryInflightGate::Acquire(localGate);
+    if (callbackMeta->inflightToken == nullptr) {
+      status->Update(StatusCode::ERR_BAD_STATE,
+                     "mori::io: the local memory region for this transfer is being deregistered "
+                     "(e.g. a PD role-switch teardown); re-register and retry");
+      return;
+    }
+  }
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
 
   RdmaOpRet ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, {localOffset},
@@ -1439,6 +1497,16 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, sizes.size());
+  // See ReadWrite above for why this is taken before the post.
+  if (localGate) {
+    callbackMeta->inflightToken = MemoryInflightGate::Acquire(localGate);
+    if (callbackMeta->inflightToken == nullptr) {
+      status->Update(StatusCode::ERR_BAD_STATE,
+                     "mori::io: the local memory region for this transfer is being deregistered "
+                     "(e.g. a PD role-switch teardown); re-register and retry");
+      return;
+    }
+  }
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
   RdmaOpRet ret;
   if (executor) {
@@ -1608,10 +1676,32 @@ void RdmaBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
 
 void RdmaBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc); }
 
+// Order is load-bearing and each step closes a DIFFERENT window; REVIEW_M #70-1
+// is right that no permutation of the old three steps was sufficient.
+//   1. stop the control plane handing the id out (a peer asking for the MR
+//      after this gets the NULL-MR throw from CreateSession, not a live rkey);
+//   2. stop NEW sessions being handed the id's MRs;
+//   3. QUIESCE -- close the gate and wait for work requests already on a send
+//      queue to complete. This is the only step that can wait for the NIC;
+//   4. only now ibv_dereg_mr, with nothing outstanding against the lkey.
+// Steps 1-2 are cheap and racy-but-monotone; step 3 is the actual barrier.
 void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
   server->DeregisterMemory(desc);
-  rdma->DeregisterLocalMemory(desc);
   InvalidateSessionsForMemory(desc.id);
+  if (!rdma->QuiesceLocalMemory(desc.id, GetDeregisterQuiesceTimeoutMs())) {
+    // Deliberately NOT a throw and NOT an abort. A flip that cannot complete is
+    // as bad as a corrupt one, so proceed -- but say so loudly, because past
+    // this line the lkey may still be live for the NIC and this is the one
+    // remaining path to the corruption the barrier exists to prevent. The
+    // timeout is generous relative to any real transfer; hitting it means a
+    // transfer is wedged, which is itself the thing to investigate.
+    MORI_IO_ERROR(
+        "DeregisterMemory: memory id {} did NOT quiesce within {} ms; deregistering with work "
+        "requests still outstanding against its lkey. A completion may DMA into memory this "
+        "process has released or re-registered.",
+        desc.id, GetDeregisterQuiesceTimeoutMs());
+  }
+  rdma->DeregisterLocalMemory(desc);
 }
 
 bool RdmaBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const {
@@ -1810,7 +1900,7 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   }
 
   sess = RdmaBackendSession(config, std::move(localMrPerEp), std::move(remoteMrPerEp), epSet,
-                            executor.get());
+                            executor.get(), rdma->GetOrCreateLocalMemoryGate(local.id));
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
