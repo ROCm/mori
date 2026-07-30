@@ -41,6 +41,7 @@
 #include "src/io/fabric/backend_impl.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/xgmi/backend_impl.hpp"
+#include "src/io/roctx_mori.hpp"  // ADDITIVE: MORI_ROCTX-gated host-send roctx markers
 
 namespace mori {
 namespace io {
@@ -151,6 +152,8 @@ void IOEngineSession::BatchWrite(const SizeVec& localOffsets, const SizeVec& rem
                                  const SizeVec& sizes, TransferStatus* status,
                                  TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  // ADDITIVE (MORI_ROCTX=1): brackets the host KV-send dispatch for this transfer.
+  mori::io::MoriRoctxRange _mori_roctx_("mori.io.session_batch_write", static_cast<uint64_t>(id));
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session batch write");
   backendSess->BatchWrite(localOffsets, remoteOffsets, sizes, status, id);
@@ -529,6 +532,8 @@ void IOEngine::BatchWrite(const MemDescVec& localSrc, const BatchSizeVec& localO
                           const BatchSizeVec& sizes, TransferStatusPtrVec& status,
                           TransferUniqueIdVec& ids) {
   MORI_IO_FUNCTION_TIMER;
+  // ADDITIVE (MORI_ROCTX=1): brackets the host engine-level batch KV-send.
+  mori::io::MoriRoctxRange _mori_roctx_("mori.io.engine_batch_write");
   size_t batchSize = localSrc.size();
   assert(batchSize == remoteDest.size());
   assert(batchSize == localOffsets.size());
