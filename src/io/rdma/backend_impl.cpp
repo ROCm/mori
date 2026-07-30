@@ -887,6 +887,23 @@ std::optional<int> ControlPlaneServer::TryGetRemoteEnginePort(const EngineKey& e
   return it->second.port;
 }
 
+namespace {
+
+// Closes a client-side control-plane TCP endpoint on ANY exit from the scope.
+// Needed because the Protocol calls now throw rather than exit(-1); see the
+// comment at the use site in BuildRdmaConn.
+struct TcpEndpointGuard {
+  application::TCPContext* ctx;
+  application::TCPEndpointHandle handle;
+  ~TcpEndpointGuard() {
+    if (ctx != nullptr) ctx->CloseEndpoint(handle);
+  }
+  TcpEndpointGuard(const TcpEndpointGuard&) = delete;
+  TcpEndpointGuard& operator=(const TcpEndpointGuard&) = delete;
+};
+
+}  // namespace
+
 void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nicRank) {
   application::TCPEndpointHandle tcph;
   {
@@ -904,6 +921,15 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
 
   application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
 
+  // The protocol calls below now THROW on a socket error instead of
+  // exit(-1)ing (protocol.cpp CheckSyscall). That is the point -- but it means
+  // this function can be unwound through, and `tcph` is a raw fd whose only
+  // close is the CloseEndpoint at the end. A peer that dies mid-handshake
+  // would leak one fd per attempt, and a PD role switch retries the handshake
+  // on every flip, so the leak is per-flip and unbounded. Close on the way out
+  // either way.
+  TcpEndpointGuard tcpGuard{ctx.get(), tcph};
+
   Protocol p(tcph);
   p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle, rank});
   MessageHeader hdr = p.ReadMessageHeader();
@@ -915,7 +941,7 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
   notif->RegisterEndpoint(ert);
   MORI_IO_INFO("Built RdmaConn for engine {} with topo local({},{}) remote({},{})", ekey,
                topo.local.deviceId, topo.local.loc, topo.remote.deviceId, topo.remote.loc);
-  ctx->CloseEndpoint(tcph);
+  // tcpGuard closes tcph -- on this path and on the throw path alike.
 }
 
 void ControlPlaneServer::RegisterMemory(MemoryDesc& desc) {
@@ -937,6 +963,12 @@ application::RdmaMemoryRegion ControlPlaneServer::AskRemoteMemoryRegion(EngineKe
     EngineDesc& rdesc = engines[ekey];
     tcph = ctx->Connect(rdesc.host, rdesc.port);
   }
+
+  // This function never closed `tcph` on ANY path -- one leaked fd per
+  // AskRemoteMemoryRegion, pre-existing and independent of the throw change.
+  // The throw only widens it, so fix it here rather than leaving a known leak
+  // on the path a flip re-runs for every memory region it re-registers.
+  TcpEndpointGuard tcpGuard{ctx.get(), tcph};
 
   Protocol p(tcph);
   p.WriteMessageAskMemoryRegion({ekey, rdevId, id, {}});
