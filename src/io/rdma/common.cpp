@@ -262,6 +262,14 @@ void RecordEndpointsReaped(std::size_t n) {
   CensusData().endpointsReaped += n;
 }
 
+// Assignment, not accumulation -- see the field's comment. This is the one
+// non-monotone entry in the census and it is a RETENTION curve, so a test must
+// be able to watch it come back DOWN, not just up.
+void RecordGateTombstones(std::size_t resident) {
+  std::lock_guard<std::mutex> lock(CensusMu());
+  CensusData().gateTombstones = resident;
+}
+
 uint64_t MakeNotifSendWrId(TransferUniqueId id) {
   if ((id & kNotifSendWrIdTag) != 0) {
     MORI_IO_ERROR("MakeNotifSendWrId: TransferUniqueId {} has bit 63 set; masking reserved tag",

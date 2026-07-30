@@ -1435,6 +1435,219 @@ void CaseRdmaDeregisterWaitsForInflightPosts() {
   Require(good.Succeeded(), "post-barrier transfer failed: " + good.Message());
 }
 
+// THE REENTRY DISCRIMINATOR for `1ec6dba1` / REVIEW_M #73-1, #74-1, #75-1.
+//
+// The case above proves the barrier BLOCKS. It cannot prove the barrier is
+// REACHABLE on its own reentry path, and three reviews running it read
+// `postsRefused == 0` -- i.e. the interleaving the barrier exists for was never
+// once entered. This case enters it deliberately.
+//
+// The window: DeregisterMemory calls InvalidateSessionsForMemory (erasing the
+// session cache) and THEN drains. A transfer issued in between misses the
+// cache, rebuilds through CreateSession, and asks
+// GetOrCreateLocalMemoryGate(local.id) for a gate.
+//   pre-1ec6dba1 : Quiesce had already ERASED the entry, so the id gets a FRESH
+//                  NON-RETIRING gate, Acquire SUCCEEDS, and the post goes out
+//                  carrying an lkey that ibv_dereg_mr is about to destroy.
+//                  postsRefused stays 0 -- silently, which is the whole
+//                  problem: the run looks identical to a run that never raced.
+//   post-fix     : the entry is a retiring TOMBSTONE, the same gate comes back,
+//                  Acquire returns nullptr, the post is REFUSED with
+//                  ERR_BAD_STATE and postsRefused goes POSITIVE.
+// So `postsRefused > 0` is two-sided in exactly the direction the reviews
+// asked for, and a run where it stays 0 is VACUOUS -- it did not land a post
+// inside the drain -- and must report itself as such rather than pass.
+//
+// Landing inside the drain is the only delicate part. MORI_IO_DEREG_QUIESCE_MS
+// is read once into a function-local static, so it cannot be widened here after
+// another case has run; instead the window is widened the honest way, by having
+// ~1 MiB of chunked reads genuinely outstanding so the drain has real work to
+// wait for, and by hammering posts from a second thread for the whole of it.
+void CaseRdmaDeregReentryIsRefusedNotResurrected() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_dereg_reentry", true);
+  auto dst = RegisterGpuMemory(pair.target.get(), 4 * 1024 * 1024, 0);
+
+  DeregQuiesceCensus base = GetDeregQuiesceCensus();
+  std::printf("[dereg-reentry] baseline: refused=%zu calls=%zu waited=%zu tombstones=%zu\n",
+              base.postsRefused, base.quiesceCalls, base.quiesceWaited, base.gateTombstones);
+
+  constexpr int kCycles = 12;
+  std::atomic<int> postsAfterDereg{0};
+  std::atomic<int> badStateSeen{0};
+  std::atomic<int> admittedAfterDereg{0};
+
+  for (int i = 0; i < kCycles; ++i) {
+    void* lptr = nullptr;
+    HIP_RUNTIME_CHECK(hipSetDevice(0));
+    HIP_RUNTIME_CHECK(hipMalloc(&lptr, 4 * 1024 * 1024));
+    HIP_RUNTIME_CHECK(hipMemset(lptr, 0, 4 * 1024 * 1024));
+    MemoryDesc ldesc =
+        pair.initiator->RegisterMemory(lptr, 4 * 1024 * 1024, 0, MemoryLocationType::GPU);
+
+    // Warm the cache so the dereg has a session to invalidate -- without this
+    // there is no cache miss to race with and the case is trivially vacuous.
+    {
+      TransferStatus warm;
+      TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+      pair.initiator->Write(ldesc, 0, dst.desc, 0, 64, &warm, uid);
+      std::string werr;
+      WaitTransferDone(&warm, 5000, &werr);
+    }
+
+    std::atomic<bool> deregStarted{false};
+    std::atomic<bool> stop{false};
+
+    // The reentry thread. It does NOT start until the dereg is under way, so
+    // every post it makes is a post into the window.
+    std::thread reentry([&]() {
+      while (!deregStarted.load(std::memory_order_acquire)) std::this_thread::yield();
+      while (!stop.load(std::memory_order_acquire)) {
+        TransferStatus st;
+        TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+        // A stale-descriptor transfer, which is exactly what a racing sglang
+        // transfer thread holds across a flip's teardown.
+        pair.initiator->Write(ldesc, 0, dst.desc, 0, 64 * 1024, &st, uid);
+        postsAfterDereg.fetch_add(1, std::memory_order_relaxed);
+        if (st.CodeUint32() == static_cast<uint32_t>(StatusCode::ERR_BAD_STATE)) {
+          badStateSeen.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          admittedAfterDereg.fetch_add(1, std::memory_order_relaxed);
+          std::string terr;
+          WaitTransferDone(&st, 5000, &terr);
+        }
+      }
+    });
+
+    // Real work outstanding, so the drain has something to wait for and the
+    // window has nonzero width.
+    std::thread loader([&]() {
+      for (int k = 0; k < 4; ++k) {
+        TransferStatus st;
+        TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+        pair.initiator->Write(ldesc, 0, dst.desc, 0, 1024 * 1024, &st, uid);
+        std::string terr;
+        WaitTransferDone(&st, 5000, &terr);
+      }
+    });
+
+    deregStarted.store(true, std::memory_order_release);
+    pair.initiator->DeregisterMemory(ldesc);
+    stop.store(true, std::memory_order_release);
+
+    reentry.join();
+    loader.join();
+    HIP_RUNTIME_CHECK(hipFree(lptr));
+  }
+
+  DeregQuiesceCensus after = GetDeregQuiesceCensus();
+  std::printf("[dereg-reentry] after: refused=%zu calls=%zu waited=%zu tombstones=%zu "
+              "(%d posts into the window, %d ERR_BAD_STATE, %d admitted)\n",
+              after.postsRefused, after.quiesceCalls, after.quiesceWaited, after.gateTombstones,
+              postsAfterDereg.load(), badStateSeen.load(), admittedAfterDereg.load());
+
+  Require(postsAfterDereg.load() > 0,
+          "instrument check: no post was issued into the dereg window at all");
+
+  // 1. THE DISCRIMINATOR. Positive only if a post reached the gate AFTER
+  //    Quiesce closed it -- i.e. the reentry path exists, was taken, and the
+  //    tombstone caught it. At pre-fix HEAD this is 0 because the fresh gate
+  //    admits the post instead, which is the corruption.
+  Require(after.postsRefused > base.postsRefused,
+          "VACUOUS: postsRefused did not move, so no post landed inside the drain and this run "
+          "did not discriminate the tombstone from the erase it replaced (stayed at " +
+              std::to_string(base.postsRefused) + "). Not a pass.");
+
+  // 2. And the refusal surfaced to the CALLER as ERR_BAD_STATE, not as a
+  //    silent success against a doomed lkey. Ties the census number to
+  //    observable behaviour rather than to an internal counter alone.
+  Require(badStateSeen.load() > 0,
+          "the census counted refusals but no caller saw ERR_BAD_STATE; the refusal is not "
+          "reaching the transfer status");
+
+  // 3. The tombstone is RESIDENT while retired -- this is the retention the
+  //    fix deliberately adds, asserted rather than asserted-away.
+  Require(after.gateTombstones > 0,
+          "expected retired gates resident in memGates_ after " + std::to_string(kCycles) +
+              " deregisters, saw " + std::to_string(after.gateTombstones));
+
+  // 4. The engine still serves on a FRESH registration. The tombstone must
+  //    refuse the dead id, not wedge the process.
+  auto fresh = RegisterGpuMemory(pair.initiator.get(), 4096, 0);
+  TransferStatus good;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Write(fresh.desc, 0, dst.desc, 0, 64, &good, uid);
+  std::string err;
+  Require(WaitTransferDone(&good, 5000, &err),
+          "engine must still serve after the tombstone: " + err);
+  Require(good.Succeeded(), "post-tombstone transfer failed: " + good.Message());
+}
+
+// The tombstone must LIFT, or it is just a leak with a good excuse. Asserts the
+// retention curve comes back DOWN when the same id is re-registered, and that a
+// transfer against the reopened id is admitted again.
+//
+// LIMITATION, stated here and not only in WORKLOG: this drives
+// `ReregisterMemory`, which reuses the id. `IOEngine::RegisterMemory`
+// (engine.cpp:363) mints a FRESH id on every call, so the PRODUCTION path --
+// including every sglang flip -- never reuses an id and therefore never lifts
+// a tombstone. The residency this case shows coming back down is real but is
+// NOT what sglang will see; sglang will see monotone growth of ~one empty
+// gate + map node per deregistered id. That is the bound, it is small, and it
+// is measured by `gateTombstones` in the reentry case above rather than
+// argued.
+void CaseRdmaGateTombstoneLiftsOnReregister() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_gate_lift", true);
+  auto dst = RegisterGpuMemory(pair.target.get(), 64 * 1024, 0);
+
+  void* lptr = nullptr;
+  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipMalloc(&lptr, 256 * 1024));
+  HIP_RUNTIME_CHECK(hipMemset(lptr, 0, 256 * 1024));
+  MemoryDesc ldesc = pair.initiator->RegisterMemory(lptr, 256 * 1024, 0, MemoryLocationType::GPU);
+
+  {
+    TransferStatus warm;
+    TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+    pair.initiator->Write(ldesc, 0, dst.desc, 0, 64, &warm, uid);
+    std::string werr;
+    WaitTransferDone(&warm, 5000, &werr);
+  }
+
+  pair.initiator->DeregisterMemory(ldesc);
+  const std::size_t retired = GetDeregQuiesceCensus().gateTombstones;
+  std::printf("[gate-lift] after dereg: tombstones=%zu\n", retired);
+  Require(retired > 0, "dereg must leave a tombstone; saw " + std::to_string(retired));
+
+  // Re-register THE SAME id. This is the event that makes the id safe again.
+  MemoryDesc again = ldesc;
+  pair.initiator->ReregisterMemory(again);
+  const std::size_t afterLift = GetDeregQuiesceCensus().gateTombstones;
+  std::printf("[gate-lift] after re-register: tombstones=%zu\n", afterLift);
+  Require(afterLift < retired,
+          "re-registering the id must LIFT its tombstone: " + std::to_string(retired) + " -> " +
+              std::to_string(afterLift));
+
+  // And a transfer against the reopened id is admitted, not refused. Without
+  // this the lift is bookkeeping only.
+  TransferStatus reopened;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Write(again, 0, dst.desc, 0, 64, &reopened, uid);
+  std::string err;
+  Require(WaitTransferDone(&reopened, 5000, &err),
+          "a transfer against the REOPENED id must be admitted: " + err);
+  Require(reopened.Succeeded(),
+          "transfer against the reopened id failed: " + reopened.Message());
+
+  pair.initiator->DeregisterMemory(again);
+  HIP_RUNTIME_CHECK(hipFree(lptr));
+}
+
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -1939,6 +2152,9 @@ int main(int argc, char* argv[]) {
       {"rdma_transfer_survives_concurrent_deregister",
        CaseRdmaTransferSurvivesConcurrentDeregister},
       {"rdma_dereg_waits_for_inflight_posts", CaseRdmaDeregisterWaitsForInflightPosts},
+      {"rdma_dereg_reentry_is_refused_not_resurrected",
+       CaseRdmaDeregReentryIsRefusedNotResurrected},
+      {"rdma_gate_tombstone_lifts_on_reregister", CaseRdmaGateTombstoneLiftsOnReregister},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},

@@ -94,6 +94,11 @@ class RdmaManager {
   // safe again. Returns true if a RETIRED gate was cleared (i.e. the tombstone
   // was doing work), false if there was nothing or it was still live.
   bool ClearLocalMemoryGate(MemoryUniqueId);
+  // Recount the retired gates resident in memGates_ and publish to the dereg
+  // census, so the tombstone's retention is a NUMBER a test can watch rise and
+  // fall rather than a reassurance in a comment. Takes `mu`; do not call with
+  // it held.
+  void PublishGateTombstoneCount();
 
   // Remote memory management APIs
   std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int remRdmaDevId,

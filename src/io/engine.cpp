@@ -382,6 +382,19 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   return memDesc;
 }
 
+// Deliberately does NOT touch nextMemUid: the id is the caller's, already
+// minted, and reusing it is the entire point. Everything else matches the
+// mint-a-new-id path -- same backend fan-out, same memPool insert -- so the
+// only difference between the two is where the id comes from.
+void IOEngine::ReregisterMemory(MemoryDesc& memDesc) {
+  for (auto& it : backends) {
+    it.second->RegisterMemory(memDesc);
+  }
+  memPool.insert({memDesc.id, memDesc});
+  MORI_IO_TRACE("Re-register memory id {} address {} size {}", memDesc.id, memDesc.data,
+                memDesc.size);
+}
+
 void IOEngine::DeregisterMemory(const MemoryDesc& desc) {
   for (auto& it : backends) {
     it.second->DeregisterMemory(desc);

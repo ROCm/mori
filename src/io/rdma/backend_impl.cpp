@@ -388,7 +388,26 @@ bool RdmaManager::QuiesceLocalMemory(MemoryUniqueId id, int timeoutMs) {
   // that thread takes `mu` on other paths -- holding it here would deadlock the
   // very drain we are waiting for. Safe to drop precisely BECAUSE the entry is
   // still there: whoever races in behind us finds the retiring gate.
-  return gate->Quiesce(timeoutMs);
+  const bool drained = gate->Quiesce(timeoutMs);
+  // Published AFTER the drain, since Quiesce() is what sets retiring_ and the
+  // id we just touched would not be counted before it. Recounted rather than
+  // incremented so a second dereg of the same id cannot double-count a
+  // tombstone that is already resident.
+  PublishGateTombstoneCount();
+  return drained;
+}
+
+// Recount the retired residents of memGates_ and publish to the census. Takes
+// `mu` itself; must NOT be called with it already held.
+void RdmaManager::PublishGateTombstoneCount() {
+  std::size_t retired = 0;
+  {
+    std::shared_lock<std::shared_mutex> lock(mu);
+    for (const auto& [_, g] : memGates_) {
+      if (g && g->Retiring()) ++retired;
+    }
+  }
+  RecordGateTombstones(retired);
 }
 
 // The other half of the tombstone above. Called when the id is legitimately
@@ -398,11 +417,17 @@ bool RdmaManager::QuiesceLocalMemory(MemoryUniqueId id, int timeoutMs) {
 // the old generation must not be able to keep the new gate's count off zero.
 // Returns whether a retired gate was actually cleared, for the log.
 bool RdmaManager::ClearLocalMemoryGate(MemoryUniqueId id) {
-  std::unique_lock<std::shared_mutex> lock(mu);
-  auto it = memGates_.find(id);
-  if (it == memGates_.end()) return false;
-  const bool wasRetiring = it->second && it->second->Retiring();
-  memGates_.erase(it);
+  bool wasRetiring = false;
+  {
+    std::unique_lock<std::shared_mutex> lock(mu);
+    auto it = memGates_.find(id);
+    if (it == memGates_.end()) return false;
+    wasRetiring = it->second && it->second->Retiring();
+    memGates_.erase(it);
+  }
+  // So the census can watch the retention curve come back DOWN, which is the
+  // only thing that distinguishes a bounded tombstone from a leak.
+  PublishGateTombstoneCount();
   return wasRetiring;
 }
 

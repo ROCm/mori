@@ -209,11 +209,27 @@ struct DeregQuiesceCensus {
   // test that asserts on one already reads this struct. Structurally 0 before
   // the reap existed, which is what makes an assertion on it two-sided.
   std::size_t endpointsReaped{0};
+  // REVIEW_M #75-1. Retired-but-not-yet-reopened gates currently resident in
+  // memGates_ -- the tombstones that make the barrier reentry-safe. Exposed,
+  // and NOT monotone like the rest (it can go down when RegisterMemory lifts
+  // one), because the tombstone is a deliberate RETENTION and this team does
+  // not get to add one silently after spending five turns on other people's:
+  // `IOEngine::RegisterMemory` mints a FRESH id per registration
+  // (engine.cpp:363), so a re-registered buffer does NOT lift its
+  // predecessor's tombstone, and this grows one entry per deregistered id for
+  // the life of the process. An empty MemoryInflightGate is ~64 bytes plus a
+  // map node, so at sglang's handful of descriptors per flip it is small --
+  // but it IS a curve, it is measured here, and a test asserts on the number
+  // rather than on that reassurance.
+  std::size_t gateTombstones{0};
 };
 DeregQuiesceCensus GetDeregQuiesceCensus();
 void RecordQuiesce(int inflightAtClose, bool drained);
 void RecordPostRefused();
 void RecordEndpointsReaped(std::size_t n);
+// Absolute, not a delta: the current resident count. Set by RdmaManager under
+// its own lock every time memGates_ gains or loses a retired entry.
+void RecordGateTombstones(std::size_t resident);
 
 struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)

@@ -92,6 +92,15 @@ class IOEngine {
   void DeregisterRemoteEngine(const EngineDesc&);
 
   MemoryDesc RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc);
+  // Re-register a PREVIOUSLY DEREGISTERED descriptor under its ORIGINAL id,
+  // instead of minting a fresh one as the overload above does. This is the
+  // event that lifts the dereg barrier's tombstone for that id (see
+  // RdmaManager::QuiesceLocalMemory), so it is the only way a caller that
+  // wants to keep using the same MemoryDesc after a teardown can get transfers
+  // admitted again. sglang's flip does not use it today -- it re-registers
+  // fresh buffers and gets fresh ids -- and it exists so that behaviour is
+  // TESTABLE rather than asserted.
+  void ReregisterMemory(MemoryDesc& desc);
   void DeregisterMemory(const MemoryDesc& desc);
 
   TransferUniqueId AllocateTransferUniqueId();
