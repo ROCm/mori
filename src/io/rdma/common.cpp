@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -204,13 +205,56 @@ void MemoryInflightGate::Release() {
 
 bool MemoryInflightGate::Quiesce(int timeoutMs) {
   retiring_.store(true, std::memory_order_release);
-  std::unique_lock<std::mutex> lock(mu_);
-  if (timeoutMs < 0) {
-    cv_.wait(lock, [this] { return inflight_.load(std::memory_order_acquire) == 0; });
-    return true;
+  // Sampled AFTER the store, so anything counted here is a WR that was already
+  // posted -- no later post can be admitted. This is the number that says
+  // whether the barrier did anything.
+  const int atClose = inflight_.load(std::memory_order_acquire);
+  inflightAtQuiesce_.store(atClose, std::memory_order_release);
+
+  bool drained = true;
+  {
+    std::unique_lock<std::mutex> lock(mu_);
+    auto done = [this] { return inflight_.load(std::memory_order_acquire) == 0; };
+    if (timeoutMs < 0) {
+      cv_.wait(lock, done);
+    } else {
+      drained = cv_.wait_for(lock, std::chrono::milliseconds(timeoutMs), done);
+    }
   }
-  return cv_.wait_for(lock, std::chrono::milliseconds(timeoutMs),
-                      [this] { return inflight_.load(std::memory_order_acquire) == 0; });
+  RecordQuiesce(atClose, drained);
+  return drained;
+}
+
+/* ------------------------------- DeregQuiesceCensus ------------------------------------------- */
+namespace {
+std::mutex& CensusMu() {
+  static std::mutex m;
+  return m;
+}
+DeregQuiesceCensus& CensusData() {
+  static DeregQuiesceCensus c;
+  return c;
+}
+}  // namespace
+
+DeregQuiesceCensus GetDeregQuiesceCensus() {
+  std::lock_guard<std::mutex> lock(CensusMu());
+  return CensusData();
+}
+
+void RecordQuiesce(int inflightAtClose, bool drained) {
+  std::lock_guard<std::mutex> lock(CensusMu());
+  DeregQuiesceCensus& c = CensusData();
+  c.quiesceCalls += 1;
+  if (inflightAtClose > 0) c.quiesceWaited += 1;
+  if (!drained) c.quiesceTimedOut += 1;
+  c.maxInflightAtQuiesce =
+      std::max(c.maxInflightAtQuiesce, static_cast<std::size_t>(std::max(0, inflightAtClose)));
+}
+
+void RecordPostRefused() {
+  std::lock_guard<std::mutex> lock(CensusMu());
+  CensusData().postsRefused += 1;
 }
 
 uint64_t MakeNotifSendWrId(TransferUniqueId id) {

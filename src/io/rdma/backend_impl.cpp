@@ -1466,6 +1466,7 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
   if (localGate) {
     callbackMeta->inflightToken = MemoryInflightGate::Acquire(localGate);
     if (callbackMeta->inflightToken == nullptr) {
+      RecordPostRefused();
       status->Update(StatusCode::ERR_BAD_STATE,
                      "mori::io: the local memory region for this transfer is being deregistered "
                      "(e.g. a PD role-switch teardown); re-register and retry");
@@ -1501,6 +1502,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   if (localGate) {
     callbackMeta->inflightToken = MemoryInflightGate::Acquire(localGate);
     if (callbackMeta->inflightToken == nullptr) {
+      RecordPostRefused();
       status->Update(StatusCode::ERR_BAD_STATE,
                      "mori::io: the local memory region for this transfer is being deregistered "
                      "(e.g. a PD role-switch teardown); re-register and retry");

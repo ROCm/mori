@@ -175,14 +175,37 @@ class MemoryInflightGate : public std::enable_shared_from_this<MemoryInflightGat
   bool Retiring() const { return retiring_.load(std::memory_order_acquire); }
   int Inflight() const { return inflight_.load(std::memory_order_acquire); }
 
+  // How many posts this gate was holding at the moment Quiesce closed it, i.e.
+  // how many work requests would have had their lkey destroyed under them by
+  // the old code. Zero means the barrier was a no-op for that dereg. A test
+  // that does not see this go positive has not driven the race, so it must
+  // report itself VACUOUS rather than green -- the same non-vacuity discipline
+  // the endpoint-retirement counters exist for.
+  int InflightAtQuiesce() const { return inflightAtQuiesce_.load(std::memory_order_acquire); }
+
  private:
   void Release();
 
   mutable std::mutex mu_;
   std::condition_variable cv_;
   std::atomic<int> inflight_{0};
+  std::atomic<int> inflightAtQuiesce_{0};
   std::atomic<bool> retiring_{false};
 };
+
+// Process-wide census of what the barrier actually did, so a test can assert on
+// NUMBERS instead of on a reading of the source. Rank-local, monotone,
+// diagnostics only -- nothing branches on these.
+struct DeregQuiesceCensus {
+  std::size_t quiesceCalls{0};      // DeregisterMemory reached the barrier
+  std::size_t quiesceWaited{0};     // ...and there was >=1 WR outstanding
+  std::size_t quiesceTimedOut{0};   // ...and it gave up and deregistered anyway
+  std::size_t postsRefused{0};      // a post was refused because the gate shut
+  std::size_t maxInflightAtQuiesce{0};
+};
+DeregQuiesceCensus GetDeregQuiesceCensus();
+void RecordQuiesce(int inflightAtClose, bool drained);
+void RecordPostRefused();
 
 struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)

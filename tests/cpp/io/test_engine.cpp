@@ -1219,6 +1219,130 @@ void CaseRdmaTransferSurvivesConcurrentDeregister() {
 // first, since the case now dies at the wedge before any post-free window.
 // That ordering is itself a finding: the wedge blocks its own diagnosis.
 
+// THE BARRIER DISCRIMINATOR for `bde6eeb3` / REVIEW_M #70-1.
+//
+// Distinct from the case above, and the distinction is the whole point: that
+// one deregisters the REMOTE descriptor, which kills an rkey and is covered by
+// d862b1c5's QP retirement. This one deregisters the INITIATOR's OWN LOCAL
+// source buffer while its own reads are in flight -- the lkey path, which is
+// what `MemoryInflightGate` guards and what sglang's flip actually does
+// (`MoriKVManager.teardown()` deregisters every local kv/aux/state desc after a
+// bounded `join(timeout=3.0)`, conn.py:691-718).
+//
+// It asserts on the CENSUS, not on a survival bit, because a use-after-dereg is
+// not observable by assertion -- an ibv_dereg_mr'd lkey usually still "works"
+// until the driver reuses it. The census numbers ARE two-sided:
+//   pre-fix : quiesceCalls == 0 (there is no barrier to call)
+//   post-fix: quiesceCalls > 0 AND quiesceWaited > 0
+// and `quiesceWaited > 0` is the non-vacuity check -- it means the barrier
+// genuinely found work requests outstanding and BLOCKED, i.e. those are exactly
+// the WRs whose lkey the old code destroyed underneath them. A run where it
+// stays 0 has not driven the race and must be reported VACUOUS, not green.
+void CaseRdmaDeregisterWaitsForInflightPosts() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_dereg_barrier", true);
+  auto dst = RegisterGpuMemory(pair.target.get(), 64 * 1024, 0);
+
+  DeregQuiesceCensus base = GetDeregQuiesceCensus();
+  std::printf("[dereg-barrier] baseline: calls=%zu waited=%zu timedOut=%zu refused=%zu maxIf=%zu\n",
+              base.quiesceCalls, base.quiesceWaited, base.quiesceTimedOut, base.postsRefused,
+              base.maxInflightAtQuiesce);
+
+  constexpr int kCycles = 16;
+  std::atomic<int> transfersIssued{0};
+  std::atomic<int> deregsDone{0};
+
+  for (int i = 0; i < kCycles; ++i) {
+    // A fresh LOCAL registration per cycle: this is the buffer we will pull out
+    // from under our own posts. Big enough (1 MiB, chunked into many WRs) that
+    // the transfer is still on the wire when the dereg lands -- a 64-byte read
+    // completes too fast to ever catch.
+    void* lptr = nullptr;
+    HIP_RUNTIME_CHECK(hipSetDevice(0));
+    HIP_RUNTIME_CHECK(hipMalloc(&lptr, 1024 * 1024));
+    HIP_RUNTIME_CHECK(hipMemset(lptr, 0, 1024 * 1024));
+    MemoryDesc ldesc = pair.initiator->RegisterMemory(lptr, 1024 * 1024, 0,
+                                                      MemoryLocationType::GPU);
+
+    // Warm the session so the racing dereg has a live gate to close.
+    {
+      TransferStatus warm;
+      TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+      pair.initiator->Write(ldesc, 0, dst.desc, 0, 64, &warm, uid);
+      std::string werr;
+      WaitTransferDone(&warm, 5000, &werr);
+    }
+
+    std::atomic<bool> posted{false};
+    std::thread transferThread([&]() {
+      for (int k = 0; k < 8; ++k) {
+        TransferStatus st;
+        TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+        // 64 KiB out of the 1 MiB local region. A refusal (ERR_BAD_STATE, gate
+        // already shut) is a CORRECT outcome here, not a failure -- that is the
+        // barrier declining a doomed post instead of issuing it.
+        pair.initiator->Write(ldesc, 0, dst.desc, 0, 64 * 1024, &st, uid);
+        posted.store(true, std::memory_order_release);
+        std::string terr;
+        WaitTransferDone(&st, 5000, &terr);
+        transfersIssued.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+
+    // Wait for at least one post to be ISSUED, then dereg immediately. Waiting
+    // on the flag rather than sleeping is what makes the race land inside the
+    // in-flight window instead of after it.
+    while (!posted.load(std::memory_order_acquire)) std::this_thread::yield();
+    pair.initiator->DeregisterMemory(ldesc);
+    deregsDone.fetch_add(1, std::memory_order_relaxed);
+
+    transferThread.join();
+    HIP_RUNTIME_CHECK(hipFree(lptr));
+  }
+
+  DeregQuiesceCensus after = GetDeregQuiesceCensus();
+  std::printf("[dereg-barrier] after: calls=%zu waited=%zu timedOut=%zu refused=%zu maxIf=%zu "
+              "(%d transfers, %d deregs)\n",
+              after.quiesceCalls, after.quiesceWaited, after.quiesceTimedOut, after.postsRefused,
+              after.maxInflightAtQuiesce, transfersIssued.load(), deregsDone.load());
+
+  Require(transfersIssued.load() == kCycles * 8,
+          "instrument check: expected " + std::to_string(kCycles * 8) + " transfers, got " +
+              std::to_string(transfersIssued.load()));
+
+  // 1. The barrier RAN. Zero here at pre-fix HEAD is the red side.
+  Require(after.quiesceCalls - base.quiesceCalls >= static_cast<std::size_t>(kCycles),
+          "every DeregisterMemory must reach the barrier: saw " +
+              std::to_string(after.quiesceCalls - base.quiesceCalls) + " for " +
+              std::to_string(kCycles) + " deregisters");
+
+  // 2. NON-VACUITY: it actually BLOCKED on outstanding work at least once. If
+  //    this is 0 the race was never driven and the green above is worthless.
+  Require(after.quiesceWaited > base.quiesceWaited,
+          "VACUOUS: the barrier never found a work request outstanding, so this run did not "
+          "drive the race the case exists for (quiesceWaited stayed at " +
+              std::to_string(base.quiesceWaited) + "). Not a pass.");
+
+  // 3. It DRAINED rather than giving up. A timeout means we deregistered with
+  //    WRs still live, which is the corruption this exists to prevent.
+  Require(after.quiesceTimedOut == base.quiesceTimedOut,
+          "the barrier TIMED OUT and deregistered with work requests still outstanding: " +
+              std::to_string(after.quiesceTimedOut - base.quiesceTimedOut) + " time(s)");
+
+  // 4. And the engine still serves afterwards -- a barrier that deadlocks the
+  //    flip is not an improvement over one that corrupts it.
+  auto fresh = RegisterGpuMemory(pair.initiator.get(), 4096, 0);
+  TransferStatus good;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Write(fresh.desc, 0, dst.desc, 0, 64, &good, uid);
+  std::string err;
+  Require(WaitTransferDone(&good, 5000, &err),
+          "engine must still serve after the dereg barrier: " + err);
+  Require(good.Succeeded(), "post-barrier transfer failed: " + good.Message());
+}
+
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -1722,6 +1846,7 @@ int main(int argc, char* argv[]) {
       {"rdma_per_flip_retention_is_measured", CaseRdmaPerFlipRetentionIsMeasured},
       {"rdma_transfer_survives_concurrent_deregister",
        CaseRdmaTransferSurvivesConcurrentDeregister},
+      {"rdma_dereg_waits_for_inflight_posts", CaseRdmaDeregisterWaitsForInflightPosts},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},
