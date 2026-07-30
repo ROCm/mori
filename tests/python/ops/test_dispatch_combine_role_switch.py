@@ -2476,3 +2476,120 @@ def test_kernel_type_flip_destroy_recreate(torch_dist_process_manager, world_siz
             (_worker_kernel_type_flip_destroy_recreate, [world_size])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
+
+
+def _worker_construct_fails_on_one_rank(rank, world_size):
+    """ONE rank's CONSTRUCTION fails; all 8 must raise, and none may leak.
+
+    The construct half of a flip had no coverage at all until this test, which
+    is why 27874e2d (the ctor all-reduce) and 3aab3b80 (the local release that
+    goes with it) shipped untested. It is not an exotic path: COORD [M, turn 19]
+    §2 tells sglang a real P<->D flip is finalize() then CONSTRUCT at the target
+    role's capacity, and a D->P construct allocates the LARGE prefill-sized
+    buffers -- so a rank-local OOM on ONE rank of the group is the *expected*
+    failure of the flip direction sglang actually has to survive, not a
+    hypothetical.
+
+    Three properties, and each one is a distinct bug that shipped:
+
+    1. EVERY rank raises. Before 27874e2d the seven healthy ranks returned a
+       usable-LOOKING op whose buffers are symmetric with a rank that has none;
+       the first they learned of it was a memory-access fault mid-inference.
+       Asserted on all 8, not just rank 0, because "the failing rank raised" was
+       always true -- the bug was the other seven.
+    2. NO rank leaks. Before 3aab3b80 the seven healthy ranks raised out of
+       __init__ *holding their full buffers*, and since __init__ raised there is
+       no `self` bound in the caller and nothing left to finalize. That is
+       exactly-once-per-failure heap loss, in the direction where retry is the
+       whole point, so the exact-equality heap assertion below is the load-
+       bearing one. It is checked on all 8 for the same reason as (1): rank 0
+       was always released by the C++ ctor's own error path.
+    3. The group is still USABLE afterwards. A failed construct must leave the
+       symmetric heap in a state where the next construct -- sglang's retry, or
+       a fall back to the other role -- actually works and computes correctly.
+       The final _run_once() with a CPU-reference check is what would catch a
+       VA-offset desync across the divergent alloc histories (rank 0 did a
+       partial-then-freed allocation; its peers did a full one), the same
+       corruption class _worker_rank_asymmetric_failure guards on the
+       reconfigure path.
+
+    Note the injection differs from the reconfigure tests: those arm the hook
+    around a reconfigure() on an already-built op. Here the hook must be armed
+    around the CONSTRUCTOR itself, so the op never exists on any rank and there
+    is deliberately no object to inspect afterwards -- only the heap and a
+    fresh construct can say what happened.
+    """
+    import os
+
+    # Build and tear down once first, so the heap baseline is taken after the
+    # allocator has seen this exact size class. Comparing against a pristine
+    # never-allocated heap would let a first-fit artifact read as a leak.
+    config = _make_config(rank, world_size, DECODE_TOKENS)
+    warmup = mori.ops.EpDispatchCombineOp(config)
+    _run_once(warmup, config)
+    warmup.finalize()
+    del warmup
+
+    before = _heap_stats()
+
+    # Arm on rank 0 ONLY. One-shot (TIMES defaults to 1): the hook disarms as it
+    # fires, so the REBUILD at the end of this worker is not sabotaged -- the
+    # point is that the group recovers, and a permanently-armed hook could not
+    # tell "recovered" from "still broken".
+    if rank == 0:
+        os.environ["MORI_TEST_FAIL_HIPMALLOC"] = "dispSenderIdxMap"
+    try:
+        with pytest.raises(Exception) as excinfo:
+            mori.ops.EpDispatchCombineOp(config)
+    finally:
+        os.environ.pop("MORI_TEST_FAIL_HIPMALLOC", None)
+
+    message = str(excinfo.value)
+    if rank == 0:
+        # The originating rank surfaces the C++ allocation error itself. Asserted
+        # loosely on purpose: the value here is that rank 0 raised at all, and
+        # pinning the C++ wording would make this test a tripwire for unrelated
+        # message edits.
+        assert message, "rank 0: construction failed with an empty message"
+    else:
+        # The peers get the group verdict, and this string is published to Team S
+        # (COORD [M, turn 25]) -- S's moriep.py classifier branches on it, so it
+        # is part of the contract and is asserted verbatim-ish.
+        assert (
+            "construction failed on at least one peer" in message
+        ), f"rank {rank}: expected the group verdict, got: {message}"
+
+    # THE ASSERTION THIS TEST EXISTS FOR: a failed construct costs the heap
+    # nothing, on every rank. Exact equality, per _worker_leak_stress's
+    # reasoning -- the symmetric heap is a deterministic first-fit VA manager,
+    # not a caching allocator, so anything other than a return to baseline is a
+    # buffer that was allocated and never given back.
+    after = _heap_stats()
+    if before is not None and after is not None:
+        assert after["total_free_space"] == before["total_free_space"], (
+            f"rank {rank}: a FAILED construct leaked symmetric heap: "
+            f"{before['total_free_space']} -> {after['total_free_space']}. "
+            f"The healthy ranks raise out of __init__, so the caller never "
+            f"binds the op and nothing can free these buffers later."
+        )
+        assert after["num_mem_objs"] == before["num_mem_objs"], (
+            f"rank {rank}: a FAILED construct leaked symmetric objects: "
+            f"{before['num_mem_objs']} -> {after['num_mem_objs']}"
+        )
+
+    # And the group can still be built and still computes correctly -- which is
+    # what sglang's reconcile needs in order to retry or to fall back.
+    op = mori.ops.EpDispatchCombineOp(config)
+    _assert_capacity(op, DECODE_TOKENS)
+    _run_once(op, config)
+    op.finalize()
+
+
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+def test_construct_fails_on_one_rank(torch_dist_process_manager, world_size):
+    """The CONSTRUCT half of a flip, failing asymmetrically. See the worker."""
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_worker_construct_fails_on_one_rank, [world_size])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
