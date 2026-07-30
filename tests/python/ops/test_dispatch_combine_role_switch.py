@@ -1390,54 +1390,73 @@ def _worker_rank_asymmetric_reject_barrier_state(rank, world_size, do_reject=Tru
         f"rank {rank}: barrier buffer SIZE diverged: {[r[3] for r in rows]}"
     )
 
-    # (4) THE DELTA -- the invariant the cross-rank checks above structurally
-    #     cannot see, and the one a REJECT is uniquely positioned to break.
+    # (4) THE STALENESS DELTA -- the invariant the cross-rank checks above
+    #     structurally cannot see, and the one a REJECT is uniquely positioned
+    #     to break.
     #
-    # After a reject: the rejecting rank was refused inside
-    # ValidateReconfigurable BEFORE FinalizeAll, so it did zero heap work and
-    # its `peer_ptrs` table is the one built at construction. Its peers, by
-    # contrast, freed and re-allocated the barrier object TWICE (grow, then
-    # give-back). If a peer's barrier landed at a different heap offset on the
-    # way back, that peer's own view is self-consistent and the cross-rank
-    # offset check at (2) still passes -- because every rank recomputes its
-    # offset from its own current state -- while the rejecting rank keeps
-    # pointing at where that buffer USED to be. Nobody writes the address it
-    # spins on, and the group wedges with no host-visible asymmetry anywhere.
-    # That is exactly the observed signature.
+    # After a reject the rejecting rank was refused inside
+    # ValidateReconfigurable BEFORE FinalizeAll, so it did zero heap work,
+    # while its peers freed and re-allocated the barrier object TWICE (grow,
+    # then give-back). If a peer's barrier lands somewhere new, that peer's own
+    # view is self-consistent and the cross-rank offset check at (2) still
+    # passes -- every rank recomputes its offset from its own current state --
+    # while a rank that did not participate keeps pointing where the buffer
+    # USED to be. Nobody writes the address it spins on: a wedge with no
+    # host-visible cross-rank asymmetry, which is why the instantaneous probes
+    # come back green against a hang that still reproduces.
     #
-    # Comparing each rank's own before/after is what detects it, and it is
-    # valid in both arms: peer_ptrs are viewer-local mappings, but they are the
-    # SAME viewer's mappings at two instants, so they are directly comparable
-    # (unlike the cross-rank form that produced T13's false positive).
-    moved = {}
-    if int(before["local_ptr"]) != int(probe["local_ptr"]):
-        moved["local_ptr"] = (int(before["local_ptr"]), int(probe["local_ptr"]))
-    if int(before["size"]) != int(probe["size"]):
-        moved["size"] = (int(before["size"]), int(probe["size"]))
+    # THE ASSERTION IS NOT "nothing moved". An earlier revision of this check
+    # asserted exactly that and the CONTROL arm caught it on its first run
+    # (T15d): with no reject at all, every rank's barrier moved by *precisely
+    # the same* +33765120 bytes, and every viewer's whole peer table moved by
+    # that same amount too. Moving is what a free-and-realloc at a new size
+    # DOES, on every rank, symmetrically -- it is the healthy case, and that is
+    # what a control arm is for. (This is the second time an assertion on this
+    # probe has been wrong in the safe direction; T13's cross-rank form was the
+    # first. Both were caught before being reported as findings.)
+    #
+    # The invariant that actually matters is STALENESS: whatever rank i's
+    # barrier did, every viewer's peer_ptrs[i] must have done the same thing.
+    # Deltas are the comparable quantity even though the absolute addresses are
+    # not -- peer_ptrs[i] is `peer i's heap base in the viewer's VA + offset_i`,
+    # and the heap base is fixed for the process lifetime, so
+    # delta(peer_ptrs[i]) == delta(offset_i) == delta(rank i's local_ptr).
+    # A viewer whose entry for rank i did NOT track rank i is holding a stale
+    # address, and that is the mechanism, proven rather than inferred.
+    my_delta = int(probe["local_ptr"]) - int(before["local_ptr"])
     b_peers = [int(p) for p in before["peer_ptrs"]]
     a_peers = [int(p) for p in probe["peer_ptrs"]]
-    if b_peers != a_peers:
-        moved["peer_ptrs"] = (b_peers, a_peers)
 
-    # Did ANY rank move? Gather the boolean so that a rank which stayed put
-    # (the rejecter) reports its peers' movement rather than passing quietly.
-    # The rejecter is precisely the rank that cannot see the problem locally.
-    my_moved = torch.tensor([1 if moved else 0], dtype=torch.int64, device="cpu")
-    gathered_moved = [torch.zeros_like(my_moved) for _ in range(world_size)]
-    dist.all_gather(gathered_moved, my_moved, group=group)
-    moved_ranks = [i for i, g in enumerate(gathered_moved) if int(g.item())]
+    deltas = torch.tensor([my_delta], dtype=torch.int64, device="cpu")
+    gathered_deltas = [torch.zeros_like(deltas) for _ in range(world_size)]
+    dist.all_gather(gathered_deltas, deltas, group=group)
+    true_deltas = [int(g.item()) for g in gathered_deltas]
 
     arm = "REJECT" if do_reject else "CONTROL (no reject)"
-    assert not moved_ranks, (
-        f"rank {rank} [{arm}]: the symmetric barrier object MOVED across the "
-        f"resize on rank(s) {moved_ranks}. This rank's own delta = {moved}. "
-        f"A rank that did no heap work (the rejecter) keeps a peer_ptrs entry "
-        f"addressing the OLD allocation, so its barrier spin waits on memory "
-        f"nobody writes -- a wedge with no host-visible cross-rank asymmetry, "
-        f"which is why every instantaneous probe so far has come back green. "
-        f"If this fires only in the REJECT arm and not in the CONTROL arm, the "
-        f"reject is the cause; if it fires in both, any resize does it and the "
-        f"reject is merely the case with no re-seed to hide it."
+
+    if b_peers and a_peers and len(b_peers) == world_size:
+        peer_deltas = [a - b for a, b in zip(a_peers, b_peers)]
+        stale = [
+            i for i in range(world_size) if peer_deltas[i] != true_deltas[i]
+        ]
+        assert not stale, (
+            f"rank {rank} [{arm}]: STALE peer pointers after the resize. This "
+            f"rank's mapping for peer(s) {stale} did not follow where those "
+            f"peers' barrier buffers actually went. Per-peer delta as seen "
+            f"from here = {peer_deltas}; the deltas those ranks actually "
+            f"underwent = {true_deltas}. A barrier spin reads its peers at "
+            f"these addresses (intranode.hpp:71-73), so an entry that did not "
+            f"track its peer means this rank waits on memory nobody writes -- "
+            f"a wedge with no cross-rank asymmetry any instantaneous probe can "
+            f"see. Moving is NOT the defect (the control arm measured every "
+            f"rank moving by an identical +33765120 B on a healthy resize); "
+            f"failing to move TOGETHER is."
+        )
+
+    # The buffer must also still be big enough for the slots the spin reads.
+    assert int(probe["size"]) >= world_size * 8, (
+        f"rank {rank} [{arm}]: barrier buffer is {probe['size']} B, too small "
+        f"for {world_size} uint64 peer slots after the resize."
     )
 
 
