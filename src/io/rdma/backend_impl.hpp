@@ -402,12 +402,19 @@ class RdmaBackend : public Backend {
       return topoHash ^ (engineHash + 0x9e3779b97f4a7c15ULL + (topoHash << 6) + (topoHash >> 2));
     }
   };
-  RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
+  // Returns a SHARED owner, by value, and not a raw pointer into the cache.
+  // The two Invalidate* below erase entries while a transfer thread is between
+  // its lookup and its `sess->ReadWrite`; with `unique_ptr` + `.get()` that
+  // erase destroyed the object under the transfer. Handing out a shared_ptr
+  // makes the cache one owner among several: an erase unpublishes the session
+  // but the in-flight transfer's copy keeps it alive until it returns.
+  std::shared_ptr<RdmaBackendSession> GetOrCreateSessionCached(const MemoryDesc& local,
+                                                               const MemoryDesc& remote);
   // Same, but reports failure through `status` and returns nullptr instead of
   // throwing on the caller's thread. See the definition for why that matters.
-  RdmaBackendSession* GetOrCreateSessionCachedNoThrow(const MemoryDesc& local,
-                                                      const MemoryDesc& remote,
-                                                      TransferStatus* status);
+  std::shared_ptr<RdmaBackendSession> GetOrCreateSessionCachedNoThrow(const MemoryDesc& local,
+                                                                      const MemoryDesc& remote,
+                                                                      TransferStatus* status);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
   // Engine-scoped counterpart of the above, for a peer that flipped role. The
   // sessionCache is keyed {engineKey, localId, remoteId} and holds MRs/endpoint
@@ -426,7 +433,7 @@ class RdmaBackend : public Backend {
   std::unique_ptr<ControlPlaneServer> server{nullptr};
   std::unique_ptr<Executor> executor{nullptr};
   // session cache
-  std::unordered_map<SessionCacheKey, std::unique_ptr<RdmaBackendSession>, SessionCacheKeyHash>
+  std::unordered_map<SessionCacheKey, std::shared_ptr<RdmaBackendSession>, SessionCacheKeyHash>
       sessionCache;
   // mutable: GetRemoteRetentionStats() is a const read-only accessor and must
   // still take this lock to get a consistent snapshot rather than a torn read.

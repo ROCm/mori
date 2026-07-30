@@ -131,7 +131,13 @@ class XgmiBackend : public Backend {
       return seed;
     }
   };
-  XgmiBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
+  // Shared owner returned BY VALUE -- same lifetime rule as the RDMA backend:
+  // InvalidateSessionsForMemory erases while a transfer thread sits between its
+  // lookup and its `sess->ReadWrite`, and a raw pointer into the map is dangling
+  // by then. sglang's flip teardown deregisters every kv/aux/state desc, so this
+  // is on the flip path, not a hypothetical.
+  std::shared_ptr<XgmiBackendSession> GetOrCreateSessionCached(const MemoryDesc& local,
+                                                               const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
 
  private:
@@ -177,7 +183,7 @@ class XgmiBackend : public Backend {
   std::unordered_map<MemoryUniqueId, hipIpcMemHandle_t> localIpcHandles;
   std::unordered_map<IpcCacheKey, IpcHandleEntry, IpcCacheKeyHash> remoteIpcHandles;
 
-  std::unordered_map<SessionCacheKey, std::unique_ptr<XgmiBackendSession>, SessionCacheKeyHash>
+  std::unordered_map<SessionCacheKey, std::shared_ptr<XgmiBackendSession>, SessionCacheKeyHash>
       sessionCache;
   std::mutex sessionCacheMu;
 

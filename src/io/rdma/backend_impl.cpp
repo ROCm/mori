@@ -1556,7 +1556,11 @@ void RdmaBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                             const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
-  RdmaBackendSession* sess = GetOrCreateSessionCachedNoThrow(localDest, remoteSrc, status);
+  // Held by value for the whole call: the cache entry may be erased by a
+  // concurrent DeregisterMemory (every sglang flip does this) between here and
+  // the ReadWrite below, and this copy is what keeps the session alive.
+  std::shared_ptr<RdmaBackendSession> sess =
+      GetOrCreateSessionCachedNoThrow(localDest, remoteSrc, status);
   if (sess == nullptr) return;
   sess->ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
 }
@@ -1574,7 +1578,11 @@ void RdmaBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
     return;
   }
 
-  RdmaBackendSession* sess = GetOrCreateSessionCachedNoThrow(localDest, remoteSrc, status);
+  // Held by value for the whole call: the cache entry may be erased by a
+  // concurrent DeregisterMemory (every sglang flip does this) between here and
+  // the ReadWrite below, and this copy is what keeps the session alive.
+  std::shared_ptr<RdmaBackendSession> sess =
+      GetOrCreateSessionCachedNoThrow(localDest, remoteSrc, status);
   if (sess == nullptr) return;
   sess->BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
 }
@@ -1729,26 +1737,30 @@ bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id
   return notif->PopInboundTransferStatus(remote, id, status);
 }
 
-RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,
-                                                          const MemoryDesc& remote) {
+// Every return is a COPY of the cache's shared_ptr, never a raw pointer into
+// the map. That copy is what makes the erase in InvalidateSessionsForMemory /
+// InvalidateSessionsForEngine safe against a concurrent transfer: see the
+// declaration for the exact interleaving it closes.
+std::shared_ptr<RdmaBackendSession> RdmaBackend::GetOrCreateSessionCached(
+    const MemoryDesc& local, const MemoryDesc& remote) {
   SessionCacheKey key{remote.engineKey, local.id, remote.id};
   {
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
     if (it != sessionCache.end()) {
-      return it->second.get();
+      return it->second;
     }
   }
   // create outside lock (CreateSession may allocate / block); then insert
-  auto newSess = std::make_unique<RdmaBackendSession>();
+  auto newSess = std::make_shared<RdmaBackendSession>();
   CreateSession(local, remote, *newSess);
   std::lock_guard<std::mutex> lock(sessionCacheMu);
   auto it = sessionCache.find(key);
   if (it != sessionCache.end()) {
-    return it->second.get();
+    return it->second;
   }
   auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
-  return emplacedIt->second.get();
+  return emplacedIt->second;
 }
 
 // Lazy session establishment happens on the CALLER's thread, inside ReadWrite /
@@ -1765,9 +1777,8 @@ RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& loca
 // how a client lands on one of these throws.
 //
 // Returns nullptr with `status` set on failure; callers must check.
-RdmaBackendSession* RdmaBackend::GetOrCreateSessionCachedNoThrow(const MemoryDesc& local,
-                                                                 const MemoryDesc& remote,
-                                                                 TransferStatus* status) {
+std::shared_ptr<RdmaBackendSession> RdmaBackend::GetOrCreateSessionCachedNoThrow(
+    const MemoryDesc& local, const MemoryDesc& remote, TransferStatus* status) {
   try {
     return GetOrCreateSessionCached(local, remote);
   } catch (const std::exception& e) {

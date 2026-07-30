@@ -873,7 +873,8 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
 void XgmiBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                             const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id, bool isRead) {
-  XgmiBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+  // By value: keeps the session alive across a concurrent InvalidateSessions*.
+  std::shared_ptr<XgmiBackendSession> sess = GetOrCreateSessionCached(localDest, remoteSrc);
   if (sess == nullptr) {
     status->Update(StatusCode::ERR_BAD_STATE, "XGMI: Failed to create session");
     return;
@@ -886,7 +887,8 @@ void XgmiBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
                                  const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                                  const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
                                  bool isRead) {
-  XgmiBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+  // By value: keeps the session alive across a concurrent InvalidateSessions*.
+  std::shared_ptr<XgmiBackendSession> sess = GetOrCreateSessionCached(localDest, remoteSrc);
   if (sess == nullptr) {
     status->Update(StatusCode::ERR_BAD_STATE, "XGMI: Failed to create session");
     return;
@@ -933,14 +935,14 @@ BackendSession* XgmiBackend::CreateSession(const MemoryDesc& local, const Memory
                                 streamPool.get(), eventPool.get());
 }
 
-XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& local,
-                                                          const MemoryDesc& remote) {
+std::shared_ptr<XgmiBackendSession> XgmiBackend::GetOrCreateSessionCached(
+    const MemoryDesc& local, const MemoryDesc& remote) {
   SessionCacheKey key{remote.engineKey, local.id, remote.id};
 
   std::lock_guard<std::mutex> lock(sessionCacheMu);
   auto it = sessionCache.find(key);
   if (it != sessionCache.end()) {
-    return it->second.get();
+    return it->second;
   }
 
   void* localAddr = reinterpret_cast<void*>(local.data);
@@ -972,14 +974,13 @@ XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& loca
   }
 
   auto sess =
-      std::make_unique<XgmiBackendSession>(config, localAddr, remoteAddr, localDevice, remoteDevice,
+      std::make_shared<XgmiBackendSession>(config, localAddr, remoteAddr, localDevice, remoteDevice,
                                            ipcSession, this, streamPool.get(), eventPool.get());
 
-  XgmiBackendSession* rawPtr = sess.get();
-  sessionCache[key] = std::move(sess);
+  sessionCache[key] = sess;
 
   MORI_IO_TRACE("XGMI: Created session for local.id={}, remote.id={}", local.id, remote.id);
-  return rawPtr;
+  return sess;
 }
 
 void XgmiBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {
