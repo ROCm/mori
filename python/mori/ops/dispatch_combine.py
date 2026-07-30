@@ -226,6 +226,24 @@ class EpDispatchCombineOp:
         self.config = config
         _ensure_jit_kernels(config.kernel_type)
 
+        # Remember the construction group and make it the default for every
+        # later collective on this op (finalize / reconfigure).
+        #
+        # Without this, a caller that must pass an explicit EP group -- which is
+        # exactly the attention-DP case this kwarg exists for -- has FOUR
+        # independent places to pass it, and any mismatch is a deadlock: the
+        # ctor barriers on one group while finalize() barriers on another, so
+        # the ranks never meet. sglang's reconcile constructs and tears down the
+        # op in different functions, so "pass the same group everywhere" is a
+        # real thing to get wrong, not a hypothetical.
+        #
+        # An explicit `group=` still wins per call, so a caller that genuinely
+        # needs a different group can pass one. This only changes what
+        # `group=None` MEANS -- from "the shmem group" to "the group this op was
+        # constructed over" -- and those are the same value whenever the ctor
+        # was called with group=None, which is every existing caller.
+        self._group = group
+
         self._shmem_barrier(group)
         try:
 
@@ -489,6 +507,22 @@ class EpDispatchCombineOp:
             return
         reset()
 
+    def _default_group(self, group):
+        """Resolve `group=None` to the group this op was constructed over.
+
+        Called ONCE at the top of each public collective, not at each barrier,
+        so that every barrier and all-reduce within one call is guaranteed to
+        use the same value -- a resolve-per-barrier would reintroduce exactly
+        the split this exists to prevent if the two ever disagreed.
+
+        `getattr` rather than a plain attribute read: an op that was
+        unpickled, or constructed by an older mori python and then driven by
+        this one, has no `_group`. Falling back to None means "the shmem
+        group", which is the pre-existing behaviour, so the worst case is no
+        change rather than an AttributeError on the flip path.
+        """
+        return group if group is not None else getattr(self, "_group", None)
+
     @staticmethod
     def _shmem_barrier(group):
         """Barrier over the group that owns the symmetric heap.
@@ -580,8 +614,11 @@ class EpDispatchCombineOp:
 
         Args:
             group: process group to synchronize over. Defaults to the group
-                shmem was initialized with (see :meth:`_shmem_barrier`).
+                this op was CONSTRUCTED over, and then to the group shmem was
+                initialized with (see :meth:`_shmem_barrier`). Passing a group
+                here that differs from the constructor's is a deadlock.
         """
+        group = self._default_group(group)
         self._shmem_barrier(group)
         try:
             self._handle.finalize()
@@ -663,8 +700,10 @@ class EpDispatchCombineOp:
 
         Only capacity fields may change; the C++ side raises on any change to a
         peer-visible / layout-defining field. Collective, same rules as
-        :meth:`finalize`.
+        :meth:`finalize` -- including that `group` defaults to the group this op
+        was CONSTRUCTED over.
         """
+        group = self._default_group(group)
         if max_num_inp_token_per_rank is None:
             max_num_inp_token_per_rank = self.config.max_num_inp_token_per_rank
         if max_total_recv_tokens is None:
