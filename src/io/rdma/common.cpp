@@ -186,6 +186,15 @@ uint64_t MakeNotifSendWrId(TransferUniqueId id) {
 static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const char* opTag,
                               std::string* errMsg, SqReserveFailureKind* failureKind = nullptr) {
   if (wrCount <= 0 || !ep.sqDepth) return true;
+  // Checked BEFORE `degraded`: a QP-fatal endpoint is permanently unusable, and
+  // posting to a QP in the RC ERROR state only manufactures more flush errors.
+  // Reported as Degraded so the caller's existing failure handling applies
+  // unchanged; the message distinguishes the two for an operator.
+  if (ep.IsQpFatal()) {
+    SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
+    if (errMsg) *errMsg = "EP QP is in the ERROR state and was retired; rejecting new submissions";
+    return false;
+  }
   if (ep.degraded && ep.degraded->load(std::memory_order_relaxed)) {
     SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
     if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";

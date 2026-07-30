@@ -415,6 +415,41 @@ int RdmaManager::CountEndpoint(EngineKey engine, TopoKeyPair key) {
   return tableIt->second.size();
 }
 
+int RdmaManager::CountUsableEndpoint(EngineKey engine, TopoKeyPair key) {
+  std::shared_lock<std::shared_mutex> lock(mu);
+  auto remoteIt = remotes.find(engine);
+  if (remoteIt == remotes.end()) return 0;
+  auto tableIt = remoteIt->second.rTable.find(key);
+  if (tableIt == remoteIt->second.rTable.end()) return 0;
+  int usable = 0;
+  for (const auto& ep : tableIt->second) {
+    if (!ep.IsQpFatal()) usable++;
+  }
+  return usable;
+}
+
+std::size_t RdmaManager::RetireEndpoint(EndpointId id) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  auto rtIt = endpointsById_.find(id);
+  if (rtIt == endpointsById_.end() || !rtIt->second) return 0;
+  // Match on the QP number, not on the EndpointId: the route table stores
+  // EpPair VALUES, copied at ConnectEndpoint time, and carries no id. The QP
+  // number is the one field that is unique per endpoint and stable across
+  // those copies.
+  const uint32_t deadQpn = rtIt->second->ep.local.handle.qpn;
+  std::size_t removed = 0;
+  for (auto& [ekey, meta] : remotes) {
+    for (auto& [topo, eps] : meta.rTable) {
+      auto newEnd = std::remove_if(eps.begin(), eps.end(), [&](const EpPair& ep) {
+        return ep.local.handle.qpn == deadQpn;
+      });
+      removed += static_cast<std::size_t>(std::distance(newEnd, eps.end()));
+      eps.erase(newEnd, eps.end());
+    }
+  }
+  return removed;
+}
+
 EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   std::shared_lock<std::shared_mutex> lock(mu);
   auto remoteIt = remotes.find(engine);
@@ -523,7 +558,8 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
             std::make_shared<std::atomic<int>>(0),
             static_cast<int>(epConfig.maxMsgsNum),
             std::make_shared<std::atomic<bool>>(false),
-            std::make_shared<SubmissionLedger>(config.notifPerQp)};
+            std::make_shared<SubmissionLedger>(config.notifPerQp),
+            std::make_shared<std::atomic<bool>>(false)};
   meta.rTable[topoKey].push_back(ep);
 
   EndpointId id = nextEndpointId_.fetch_add(1);
@@ -674,6 +710,27 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
           MORI_IO_DEBUG("ProcessOneCqe: flush error #{}: wr_id={} qp_num={}", flushDrain.count,
                         wc[i].wr_id, wc[i].qp_num);
         } else {
+          // Non-flush error on a Reliable Connected QP is a CONNECTION failure,
+          // not a request failure: the QP has already transitioned to ERROR and
+          // every WR posted after it completes IBV_WC_WR_FLUSH_ERR forever.
+          // Retire the QP here, at the only place that sees the root cause, so
+          // that (a) TryReserveSqDepth stops admitting work onto a dead QP and
+          // (b) CreateSession rebuilds instead of handing the same corpse to a
+          // brand-new session for a brand-new memory id. Measured before this
+          // change (WORKLOG T36): one deregister-during-transfer produced
+          // status=10 on qp_num=42863 followed by ~700 rounds of flush errors
+          // on that same qp_num, and a later transfer on an unrelated
+          // descriptor still failed.
+          const bool firstFatal =
+              ep.qpFatal && !ep.qpFatal->exchange(true, std::memory_order_relaxed);
+          if (firstFatal) {
+            MORI_IO_ERROR(
+                "ProcessOneCqe: retiring QP as UNUSABLE: eid={} qp_num={} status={}; an RC QP that "
+                "took a non-flush completion error is in the ERROR state and mori does not "
+                "re-arm it. New sessions will rebuild a fresh endpoint.",
+                rt->id, wc[i].qp_num, static_cast<uint32_t>(wc[i].status));
+            rdma->RetireEndpoint(rt->id);
+          }
           // Non-flush error: this is the root cause — always log at ERROR.
           if (failureAdvice.HasHint()) {
             MORI_IO_ERROR(
@@ -1406,7 +1463,18 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
 }
 
-bool RdmaBackendSession::Alive() const { return true; }
+// A session is only as alive as its worst QP. It holds EpPair COPIES made at
+// CreateSession time, but `qpFatal` is a shared_ptr, so a retirement performed
+// by the CQ poll thread is visible here without the session being touched.
+// Unconditional `true` meant a cached session kept striping onto a QP in the RC
+// ERROR state, and since the cache key is {engineKey, localId, remoteId}, every
+// later transfer between that same pair of descriptors failed forever.
+bool RdmaBackendSession::Alive() const {
+  for (const auto& ep : eps) {
+    if (ep.IsQpFatal()) return false;
+  }
+  return true;
+}
 
 /* ----------------------------------------------------------------------------------------------
  */
@@ -1618,7 +1686,12 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   std::vector<int> desiredPerRank = BuildDesiredQpCounts(config.qpPerTransfer, effectiveNumNics);
 
   if (effectiveNumNics == 1) {
-    int epNum = rdma->CountEndpoint(ekey, kp);
+    // Count only endpoints that are still usable. RetireEndpoint already
+    // removes a QP-fatal endpoint from the route table, so this is normally
+    // the same number; it is re-checked here because the retirement and this
+    // build race (the CQ poll thread stores qpFatal, then takes the write
+    // lock), and reusing a retired QP is precisely the wedge being fixed.
+    int epNum = rdma->CountUsableEndpoint(ekey, kp);
     for (int i = epNum; i < config.qpPerTransfer; ++i) {
       server->BuildRdmaConn(ekey, kp, 0);
     }
@@ -1643,6 +1716,14 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   }
 
   EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
+  // Final filter. A QP retired between the build above and this read is still
+  // in flight through RetireEndpoint's write lock; dropping it here means a
+  // fresh session can never be assembled out of a dead QP, which is the whole
+  // point. If that leaves too few, the throw below is the correct outcome: it
+  // surfaces as ERR_BAD_STATE on the transfer instead of a permanent hang.
+  eps.erase(std::remove_if(eps.begin(), eps.end(),
+                           [](const EpPair& ep) { return ep.IsQpFatal(); }),
+            eps.end());
   if (static_cast<int>(eps.size()) < config.qpPerTransfer) {
     throw std::runtime_error("RdmaBackend::CreateSession: insufficient RDMA endpoints");
   }
@@ -1748,7 +1829,20 @@ std::shared_ptr<RdmaBackendSession> RdmaBackend::GetOrCreateSessionCached(
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
     if (it != sessionCache.end()) {
-      return it->second;
+      // Evict rather than return a session whose QP has been retired. The
+      // erase only drops the CACHE's reference; a transfer thread already
+      // holding a copy keeps the object alive and will fail its own transfer
+      // through the normal degraded/SQ path (see the declaration's note on
+      // why this cache hands out shared_ptr by value).
+      if (it->second && !it->second->Alive()) {
+        MORI_IO_WARN(
+            "GetOrCreateSessionCached: evicting session to engine {} (local id {}, remote id {}) "
+            "-- one of its QPs was retired as unusable; rebuilding",
+            remote.engineKey, local.id, remote.id);
+        sessionCache.erase(it);
+      } else {
+        return it->second;
+      }
     }
   }
   // create outside lock (CreateSession may allocate / block); then insert
@@ -1757,7 +1851,11 @@ std::shared_ptr<RdmaBackendSession> RdmaBackend::GetOrCreateSessionCached(
   std::lock_guard<std::mutex> lock(sessionCacheMu);
   auto it = sessionCache.find(key);
   if (it != sessionCache.end()) {
-    return it->second;
+    // Same check as on the fast path: another thread may have raced us in with
+    // a session built before the retirement, and returning it would undo the
+    // eviction we just performed.
+    if (it->second && it->second->Alive()) return it->second;
+    sessionCache.erase(it);
   }
   auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
   return emplacedIt->second;

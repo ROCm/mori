@@ -200,6 +200,19 @@ struct EpPair {
   // Degraded flag — set on partial post without signaled tail.
   std::shared_ptr<std::atomic<bool>> degraded;
   std::shared_ptr<SubmissionLedger> ledger;
+  // QP-fatal flag. `degraded` is RECOVERABLE (ProcessOneCqe clears it once the
+  // orphaned WRs drain); this one is NOT. On a Reliable Connected QP every
+  // completion error other than IBV_WC_WR_FLUSH_ERR transitions the QP to the
+  // ERROR state, and mori never drives it back (there is no ibv_modify_qp
+  // anywhere under src/io), so the QP is dead for the life of the process.
+  // Shared across every EpPair copy of the same QP — the route table's, the
+  // EndpointRuntime's and every cached session's — so one store retires it
+  // everywhere at once.
+  std::shared_ptr<std::atomic<bool>> qpFatal;
+
+  bool IsQpFatal() const {
+    return qpFatal && qpFatal->load(std::memory_order_relaxed);
+  }
 };
 
 using EndpointId = uint64_t;

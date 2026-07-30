@@ -100,6 +100,21 @@ class RdmaManager {
                              int weight);
   std::shared_ptr<EndpointRuntime> GetEndpointRuntime(EndpointId id);
   std::vector<std::shared_ptr<EndpointRuntime>> SnapshotEndpointRuntimes();
+  // Remove one endpoint from the ROUTE TABLE so CreateSession's
+  // `CountEndpoint < qpPerTransfer` test builds a replacement instead of
+  // handing out the retired one. Called when a QP takes a non-flush completion
+  // error, i.e. when it is in the RC ERROR state and unusable forever.
+  //
+  // Deliberately does NOT erase `endpointsById_`: the CQ poll loop holds a
+  // shared_ptr to that runtime and is mid-drain of the flush cascade when this
+  // runs, and the flushed WRs still need their ledger records released so the
+  // transfers they belong to report failure rather than hang. The runtime is
+  // reaped with the backend; retiring it from routing is what stops NEW work
+  // landing on it. Returns how many route-table entries were removed (0 if it
+  // was already retired, so the caller's log is not duplicated per CQE).
+  std::size_t RetireEndpoint(EndpointId id);
+  // Route-table endpoints for one engine+topo that are NOT QP-fatal.
+  int CountUsableEndpoint(EngineKey, TopoKeyPair);
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
 
