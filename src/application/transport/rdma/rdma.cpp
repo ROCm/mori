@@ -21,6 +21,9 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/rdma.hpp"
 
+#include <hsa/hsa.h>
+#include <hsa/hsa_ext_amd.h>
+
 #include <algorithm>
 #include <cassert>
 #include <cctype>
@@ -33,10 +36,6 @@
 #include <unordered_set>
 
 #include "infiniband/verbs.h"
-
-#include <hsa/hsa.h>
-#include <hsa/hsa_ext_amd.h>
-
 #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
 #include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
@@ -490,8 +489,8 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(vo
     uint64_t dmabufOffset = 0;
     int dmabufFd = TryExportDmabufFd(ptr, size, &dmabufOffset);
     if (dmabufFd < 0) return nullptr;
-    ibv_mr* mr = ibv_reg_dmabuf_mr(pd, dmabufOffset, size, reinterpret_cast<uint64_t>(ptr), dmabufFd,
-                                   effectiveAccessFlag);
+    ibv_mr* mr = ibv_reg_dmabuf_mr(pd, dmabufOffset, size, reinterpret_cast<uint64_t>(ptr),
+                                   dmabufFd, effectiveAccessFlag);
     close(dmabufFd);
     return mr;
   };
