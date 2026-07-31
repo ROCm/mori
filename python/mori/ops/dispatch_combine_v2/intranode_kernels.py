@@ -93,7 +93,7 @@ LANE_MASK = WAVE - 1
 LOG2_WAVE = WAVE.bit_length() - 1
 _BALLOT_INT = T.i64 if WAVE == 64 else T.i32
 _LANE_STRIDE_I32 = WAVE * 4  # one wave of lanes, vec4 (16B) each
-_MAIN_STRIDE_I32 = 2 * _LANE_STRIDE_I32
+_MAIN_STRIDE_I32 = 4 * _LANE_STRIDE_I32
 _BUTTERFLY_OFFSETS = tuple(WAVE >> i for i in range(1, LOG2_WAVE + 1))
 
 # ── dispatch ──────────────────────────────────────────────────────────────
@@ -166,152 +166,200 @@ def make_dispatch(
         rsrc_dest_ctr = create_buffer_resource_from_addr(addr_dest_pe_ctr)
         rsrc_disp_bar = create_buffer_resource_from_addr(addr_disp_bar)
 
-        # ── Phase 1: P2P-scatter each (src_tok, k_slot) to its dest PE ──
-        for work_idx in range(global_warp_id, work_limit, global_warp_num):
-            src_tok = work_idx // experts_per_token
-            k_slot = work_idx % experts_per_token
-            dest_expert = buffer_load(
-                rsrc_inp_idx, work_idx, vec_width=1, dtype=T.i32()
-            )
-            # Dedup: one token routed to several experts on the SAME dest PE must
-            # be sent only once. Each lane l (< k) inspects this token's l-th
-            # expert; if a LOWER lane already targets our dest_pe, this
-            # (src_tok, k_slot) is a duplicate and gets dropped. safe_lane keeps
-            # the probe in-bounds for lanes >= k_slot.
-            safe_lane = arith.select(lane < k_slot, lane, 0)
-            lane_expert = buffer_load(
+        # ── Phase 1: P2P-scatter each src token to its (deduped) dest PEs ──
+        # One warp owns a whole src token. Lane l (< k) inspects this token's
+        # l-th expert; a slot is the "owner" of its dest PE iff no LOWER lane
+        # already targets that same dest PE (dedup: one token -> a dest PE once).
+        # Each owner allocates a recv slot on its dest PE and publishes metadata.
+        # The token embedding is then loaded from local HBM ONCE per tile and
+        # stored to every distinct dest (load-once / store-many), removing the
+        # per-k redundant local reloads of the same token.
+        for src_tok in range(global_warp_id, inp_cur_tok, global_warp_num):
+            in_k = lane < experts_per_token
+            safe_slot = arith.select(in_k, lane, 0)
+            expert_lane = buffer_load(
                 rsrc_inp_idx,
-                src_tok * experts_per_token + safe_lane,
+                src_tok * experts_per_token + safe_slot,
                 vec_width=1,
                 dtype=T.i32(),
             )
-            dest_pe = dest_expert // experts_per_rank
-            lane_dest_pe = lane_expert // experts_per_rank
-            dup_per_lane = arith.select(
-                lane_dest_pe == dest_pe, arith.select(lane < k_slot, lane, WAVE), WAVE
+            # dest PE of this lane's slot; lanes >= k use npes (never matches).
+            dest_pe_lane = arith.select(
+                in_k, expert_lane // experts_per_rank, arith.constant(npes)
             )
-            dup_ballot = ballot(_BALLOT_INT(), dup_per_lane < WAVE)
-            is_dup = dup_ballot != 0
 
             if const_expr(replay):
-                # decode dest_tok_id from cached tok_map (skip atomic alloc; same layout)
-                cached = buffer_load(rsrc_tok_map, work_idx, vec_width=1, dtype=T.i32())
-                is_dup_or_overflow = cached >= sentinel_val
-                do_publish = cached < sentinel_val
-                dest_tok_id = cached - dest_pe * max_recv
-            else:
-                dest_tok_lane0 = arith.constant(0)
-                if lane == 0:
-                    if dup_ballot == 0:
-                        peer_tok_off = fx.Int64(window.lsa_ptr(dest_pe, off_tok_off))
-                        dest_tok_lane0 = P.atomic_add_global(peer_tok_off, fx.Int32(1))
-                dest_tok_id = readlane(T.i32(), dest_tok_lane0, 0)
-                overflow = dest_tok_id >= max_recv
-                is_dup_or_overflow = arith.select(is_dup, is_dup, overflow)
-                no_dup = dup_ballot == 0
-                in_cap = dest_tok_id < max_recv
-                do_publish = arith.select(no_dup, in_cap, no_dup)
-                tok_map_entry = arith.select(
-                    is_dup_or_overflow, sentinel_val, dest_pe * max_recv + dest_tok_id
+                # decode each slot from cached tok_map (skip atomic alloc).
+                cached = buffer_load(
+                    rsrc_tok_map,
+                    src_tok * experts_per_token + safe_slot,
+                    vec_width=1,
+                    dtype=T.i32(),
                 )
-                if lane == 0:
-                    buffer_store(tok_map_entry, rsrc_tok_map, work_idx)
+            else:
+                # owner_l = no lower lane j (< l, j < k) shares dest_pe_lane.
+                dup_cnt = arith.constant(0)
+                for j in range_constexpr(experts_per_token):
+                    pe_j = readlane(T.i32(), dest_pe_lane, j)
+                    match_j = arith.select(
+                        pe_j == dest_pe_lane,
+                        arith.select(j < lane, arith.constant(1), arith.constant(0)),
+                        arith.constant(0),
+                    )
+                    dup_cnt = dup_cnt + match_j
+                owner_i32 = arith.select(
+                    dup_cnt == arith.constant(0), arith.constant(1), arith.constant(0)
+                )
 
-            if lane == 0:
-                if do_publish:
-                    # publish this recv slot's origin into the dest peer's tis
-                    # (recv slot -> global source token id) for combine routing.
-                    src_tok_encoded = rank * max_tok_per_rank + src_tok
-                    peer_tis = fx.Int64(window.lsa_ptr(dest_pe, off_tis))
-                    buffer_store(
-                        src_tok_encoded,
-                        create_buffer_resource_from_addr(peer_tis),
-                        dest_tok_id,
-                    )
-                    dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
-                        dest_pe
-                    ) * fx.Int64(4)
-                    P.atomic_add_global(dest_ctr_addr, fx.Int32(1))
-
-            # Per-lane (weight, expert-idx) scatter (lanes < k).
-            if lane < experts_per_token:
-                if do_publish:
-                    weight_src_off = src_tok * experts_per_token + lane
-                    weight_val = buffer_load(
-                        rsrc_inp_wts, weight_src_off, vec_width=1, dtype=T.f32()
-                    )
-                    idx_val = buffer_load(
-                        rsrc_inp_idx, weight_src_off, vec_width=1, dtype=T.i32()
-                    )
-                    dest_slot = dest_tok_id * experts_per_token + lane
-                    peer_wts = fx.Int64(window.lsa_ptr(dest_pe, off_out_wts))
-                    buffer_store(
-                        arith.bitcast(T.i32(), weight_val),
-                        create_buffer_resource_from_addr(peer_wts),
-                        dest_slot,
-                    )
-                    peer_idx = fx.Int64(window.lsa_ptr(dest_pe, off_out_idx))
-                    buffer_store(
-                        idx_val, create_buffer_resource_from_addr(peer_idx), dest_slot
-                    )
-
-            # Per-token scales scatter: forward the src token's scale_num_i32 dwords
-            # to the dest peer's out_scales[dest_tok_id] (lane-strided to cover
-            # scale_dim > one wavefront). Verbatim copy (opaque bytes).
-            if const_expr(enable_scales):
-                if do_publish:
-                    rsrc_inp_scales = create_buffer_resource_from_addr(addr_inp_scales)
-                    peer_scales = fx.Int64(window.lsa_ptr(dest_pe, off_out_scales))
-                    rsrc_peer_scales = create_buffer_resource_from_addr(peer_scales)
-                    for k_off in range(lane, scale_num_i32, WAVE):
-                        scale_val = buffer_load(
-                            rsrc_inp_scales,
-                            src_tok * scale_num_i32 + k_off,
-                            vec_width=1,
-                            dtype=T.i32(),
+            # Resolve to distinct dest PEs as warp-uniform per-slot lists. Slot
+            # alloc, tok_map and the tis/ctr publish stay lane-0-driven (the
+            # per-work-item baseline pattern); only weights/embedding fan out
+            # across lanes.
+            dst_pub = []
+            dst_pe = []
+            dst_tok = []
+            dst_rsrc = []
+            for s in range_constexpr(experts_per_token):
+                pe_s = readlane(T.i32(), dest_pe_lane, s)
+                if const_expr(replay):
+                    cached_s = readlane(T.i32(), cached, s)
+                    pub_s = cached_s < sentinel_val
+                    tok_s = cached_s - pe_s * max_recv
+                else:
+                    owner_s = readlane(T.i32(), owner_i32, s) == arith.constant(1)
+                    # lane 0 allocates one recv slot on this (distinct) dest PE.
+                    tok_lane0 = arith.constant(0)
+                    if owner_s:
+                        if lane == 0:
+                            peer_tok_off = fx.Int64(
+                                window.lsa_ptr(pe_s, off_tok_off)
+                            )
+                            tok_lane0 = P.atomic_add_global(peer_tok_off, fx.Int32(1))
+                    tok_s = readlane(T.i32(), tok_lane0, 0)
+                    in_cap_s = tok_s < max_recv
+                    pub_s = arith.select(owner_s, in_cap_s, owner_s)
+                    if lane == 0:
+                        entry_s = arith.select(
+                            pub_s, pe_s * max_recv + tok_s, sentinel_val
                         )
                         buffer_store(
-                            scale_val,
-                            rsrc_peer_scales,
-                            dest_tok_id * scale_num_i32 + k_off,
+                            entry_s, rsrc_tok_map, src_tok * experts_per_token + s
                         )
+                safe_tok_s = arith.select(pub_s, tok_s, arith.constant(0))
+                remote_tok_addr = fx.Int64(
+                    window.lsa_ptr(pe_s, off_out_tok)
+                ) + fx.Int64(safe_tok_s) * fx.Int64(nbytes)
+                dst_pub.append(pub_s)
+                dst_pe.append(pe_s)
+                dst_tok.append(safe_tok_s)
+                dst_rsrc.append(create_buffer_resource_from_addr(remote_tok_addr))
 
-            # Token-embedding scatter: each lane owns 4 i32 (16B). Two vec4 streams
-            # (chunk and chunk+_LANE_STRIDE_I32, stride _MAIN_STRIDE_I32) for
-            # memory-level parallelism; a one-stream tail covers the remainder.
-            # Dropped slots (dup/overflow) set copy_end == lane_i32_off → no-op.
-            peer_tok_base = fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
-            remote_tok_addr = peer_tok_base + fx.Int64(dest_tok_id) * fx.Int64(nbytes)
+            # Metadata fan-out: publish to each distinct dest PE.
+            for s in range_constexpr(experts_per_token):
+                if dst_pub[s]:
+                    if lane == 0:
+                        # recv slot -> global source token id (combine routing).
+                        src_tok_encoded = rank * max_tok_per_rank + src_tok
+                        peer_tis = fx.Int64(window.lsa_ptr(dst_pe[s], off_tis))
+                        buffer_store(
+                            src_tok_encoded,
+                            create_buffer_resource_from_addr(peer_tis),
+                            dst_tok[s],
+                        )
+                        dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
+                            dst_pe[s]
+                        ) * fx.Int64(4)
+                        P.atomic_add_global(dest_ctr_addr, fx.Int32(1))
+                    if lane < experts_per_token:
+                        weight_src_off = src_tok * experts_per_token + lane
+                        weight_val = buffer_load(
+                            rsrc_inp_wts, weight_src_off, vec_width=1, dtype=T.f32()
+                        )
+                        idx_val = buffer_load(
+                            rsrc_inp_idx, weight_src_off, vec_width=1, dtype=T.i32()
+                        )
+                        dest_slot = dst_tok[s] * experts_per_token + lane
+                        peer_wts = fx.Int64(window.lsa_ptr(dst_pe[s], off_out_wts))
+                        buffer_store(
+                            arith.bitcast(T.i32(), weight_val),
+                            create_buffer_resource_from_addr(peer_wts),
+                            dest_slot,
+                        )
+                        peer_idx = fx.Int64(window.lsa_ptr(dst_pe[s], off_out_idx))
+                        buffer_store(
+                            idx_val,
+                            create_buffer_resource_from_addr(peer_idx),
+                            dest_slot,
+                        )
+                    if const_expr(enable_scales):
+                        # Forward the src token's scale_num_i32 dwords verbatim.
+                        rsrc_inp_scales = create_buffer_resource_from_addr(
+                            addr_inp_scales
+                        )
+                        peer_scales = fx.Int64(
+                            window.lsa_ptr(dst_pe[s], off_out_scales)
+                        )
+                        rsrc_peer_scales = create_buffer_resource_from_addr(peer_scales)
+                        for k_off in range(lane, scale_num_i32, WAVE):
+                            scale_val = buffer_load(
+                                rsrc_inp_scales,
+                                src_tok * scale_num_i32 + k_off,
+                                vec_width=1,
+                                dtype=T.i32(),
+                            )
+                            buffer_store(
+                                scale_val,
+                                rsrc_peer_scales,
+                                dst_tok[s] * scale_num_i32 + k_off,
+                            )
+
+            # Token-embedding scatter: each lane owns 4 i32 (16B). Four vec4 streams
+            # (chunk + k*_LANE_STRIDE_I32 for k in 0..3, stride _MAIN_STRIDE_I32) for
+            # memory-level parallelism; a one-stream tail covers the remainder. The
+            # local load happens ONCE per tile and fans out to every dest PE that
+            # published a slot for this token (load-once / store-many).
             local_tok_addr = fx.Int64(addr_inp_tok) + fx.Int64(src_tok) * fx.Int64(
                 nbytes
             )
             rsrc_src = create_buffer_resource_from_addr(local_tok_addr)
-            rsrc_dst = create_buffer_resource_from_addr(remote_tok_addr)
             lane_i32_off = lane * 4
             safe_end_i32 = (n_i32 // _MAIN_STRIDE_I32) * _MAIN_STRIDE_I32
             if const_expr(n_i32 >= _MAIN_STRIDE_I32 and safe_end_i32 > 0):
-                copy_end_main = arith.select(
-                    is_dup_or_overflow, lane_i32_off, safe_end_i32
-                )
-                for chunk in range(lane_i32_off, copy_end_main, _MAIN_STRIDE_I32):
+                for chunk in range(lane_i32_off, safe_end_i32, _MAIN_STRIDE_I32):
                     vec_a = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
                     vec_b = buffer_load(
                         rsrc_src, chunk + _LANE_STRIDE_I32, vec_width=4, dtype=T.i32()
                     )
-                    buffer_store(vec_a, rsrc_dst, chunk)
-                    buffer_store(vec_b, rsrc_dst, chunk + _LANE_STRIDE_I32)
+                    vec_c = buffer_load(
+                        rsrc_src, chunk + 2 * _LANE_STRIDE_I32, vec_width=4, dtype=T.i32()
+                    )
+                    vec_d = buffer_load(
+                        rsrc_src, chunk + 3 * _LANE_STRIDE_I32, vec_width=4, dtype=T.i32()
+                    )
+                    for s in range_constexpr(experts_per_token):
+                        if dst_pub[s]:
+                            buffer_store(vec_a, dst_rsrc[s], chunk)
+                            buffer_store(vec_b, dst_rsrc[s], chunk + _LANE_STRIDE_I32)
+                            buffer_store(
+                                vec_c, dst_rsrc[s], chunk + 2 * _LANE_STRIDE_I32
+                            )
+                            buffer_store(
+                                vec_d, dst_rsrc[s], chunk + 3 * _LANE_STRIDE_I32
+                            )
             if const_expr(safe_end_i32 < n_i32):
-                copy_end_tail = arith.select(is_dup_or_overflow, lane_i32_off, n_i32)
                 for chunk in range(
-                    lane_i32_off + safe_end_i32, copy_end_tail, _LANE_STRIDE_I32
+                    lane_i32_off + safe_end_i32, n_i32, _LANE_STRIDE_I32
                 ):
                     vec_a = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
-                    buffer_store(vec_a, rsrc_dst, chunk)
+                    for s in range_constexpr(experts_per_token):
+                        if dst_pub[s]:
+                            buffer_store(vec_a, dst_rsrc[s], chunk)
             elif const_expr(n_i32 < _MAIN_STRIDE_I32):
-                copy_end_small = arith.select(is_dup_or_overflow, lane_i32_off, n_i32)
-                for chunk in range(lane_i32_off, copy_end_small, _LANE_STRIDE_I32):
+                for chunk in range(lane_i32_off, n_i32, _LANE_STRIDE_I32):
                     vec_a = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
-                    buffer_store(vec_a, rsrc_dst, chunk)
+                    for s in range_constexpr(experts_per_token):
+                        if dst_pub[s]:
+                            buffer_store(vec_a, dst_rsrc[s], chunk)
 
         if const_expr(enable_signal):
             # Self-reset total_recv (replaces the host-side total_recv.zero_()):
@@ -644,8 +692,6 @@ def make_combine(
             if tid == 0:
                 P.spin_until_gt_i32(fx.Int64(addr_comb_bar), 0)
             fx.barrier()
-            if tid == 0:
-                P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
@@ -828,6 +874,12 @@ def make_combine(
 
             _accum_loop()
 
+        # Arrival ack moved to kernel end: each non-zero block signals
+        # completion here (after compute) instead of at entry.
+        if bid != 0:
+            fx.barrier()
+            if tid == 0:
+                P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
         if global_warp_id == 0:
             if lane == 0:
                 P.spin_until_gt_i32(fx.Int64(addr_comb_bar), block_num - 1)

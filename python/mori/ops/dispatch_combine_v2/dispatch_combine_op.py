@@ -618,6 +618,7 @@ class EpDispatchCombineOp:
                     off_out_wts=arena.offset("out_wts"),
                     reset_total_recv=True,
                     fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
+                    _unroll=4,
                 )
                 for (b, w) in combine_specs
             }
