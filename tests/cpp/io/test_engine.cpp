@@ -1260,6 +1260,87 @@ void CaseRdmaTransferBasic() {
               inbound.Message() + "'");
 }
 
+void CaseRdmaDmabufInteriorRangeTransfer() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  // Force the dma-buf registration path (RegisterRdmaMemoryRegionAuto), which this
+  // fix touches. The regression: TryExportDmabufFd exports a dma-buf fd for the
+  // whole *backing* allocation, so registering an interior sub-range with offset 0
+  // pointed the MR at the allocation base instead of base+offset. Transfers then
+  // hit LOC_PROT or silently landed at the wrong address.
+  ScopedEnvVar enableDmabuf("MORI_ENABLE_DMABUF_REG", "1");
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_dmabuf_interior", true);
+
+  constexpr size_t kAlloc = 64 * 1024 * 1024;   // 64 MiB backing allocation
+  constexpr size_t kOffset = 32 * 1024 * 1024;  // nonzero interior offset
+  constexpr size_t kXfer = 1 * 1024 * 1024;     // transferred sub-range
+
+  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  void* srcBase = nullptr;
+  void* dstBase = nullptr;
+  HIP_RUNTIME_CHECK(hipMalloc(&srcBase, kAlloc));
+  HIP_RUNTIME_CHECK(hipMalloc(&dstBase, kAlloc));
+  void* srcInterior = static_cast<char*>(srcBase) + kOffset;
+  void* dstInterior = static_cast<char*>(dstBase) + kOffset;
+
+  // Base regions get a sentinel (0x11); the src sub-range gets the payload (0xCD),
+  // the dst sub-range is cleared (0x00). If the MR wrongly resolves to the base,
+  // the write lands at dstBase and the checks below catch it two ways: the dst
+  // sub-range stays 0x00 (payload missing) and/or the dst base sentinel is clobbered.
+  HIP_RUNTIME_CHECK(hipMemset(srcBase, 0x11, kAlloc));
+  HIP_RUNTIME_CHECK(hipMemset(dstBase, 0x11, kAlloc));
+  HIP_RUNTIME_CHECK(hipMemset(srcInterior, 0xCD, kXfer));
+  HIP_RUNTIME_CHECK(hipMemset(dstInterior, 0x00, kXfer));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  MemoryDesc srcDesc =
+      pair.initiator->RegisterMemory(srcInterior, kXfer, 0, MemoryLocationType::GPU);
+  MemoryDesc dstDesc = pair.target->RegisterMemory(dstInterior, kXfer, 0, MemoryLocationType::GPU);
+
+  TransferStatus status;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Write(srcDesc, 0, dstDesc, 0, kXfer, &status, uid);
+
+  std::string err;
+  Require(WaitTransferDone(&status, 5000, &err), "dmabuf interior transfer timeout: " + err);
+  Require(status.Succeeded(),
+          "dmabuf interior transfer failed: code=" + std::to_string(status.CodeUint32()) +
+              ", msg='" + status.Message() + "'");
+
+  std::vector<uint8_t> host(kXfer);
+  HIP_RUNTIME_CHECK(hipMemcpy(host.data(), dstInterior, kXfer, hipMemcpyDeviceToHost));
+  size_t badAt = kXfer;
+  for (size_t i = 0; i < kXfer; ++i) {
+    if (host[i] != 0xCD) {
+      badAt = i;
+      break;
+    }
+  }
+  Require(badAt == kXfer,
+          "dma-buf interior-range transfer wrote wrong data at byte " + std::to_string(badAt) +
+              " (a zero dma-buf offset lands the write at the allocation base, not base+offset)");
+
+  std::vector<uint8_t> hostBase(kXfer);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBase.data(), dstBase, kXfer, hipMemcpyDeviceToHost));
+  size_t clobberAt = kXfer;
+  for (size_t i = 0; i < kXfer; ++i) {
+    if (hostBase[i] != 0x11) {
+      clobberAt = i;
+      break;
+    }
+  }
+  Require(clobberAt == kXfer,
+          "dma-buf interior-range transfer clobbered the allocation base at byte " +
+              std::to_string(clobberAt) + " (indicates the MR resolved to offset 0)");
+
+  pair.initiator->DeregisterMemory(srcDesc);
+  pair.target->DeregisterMemory(dstDesc);
+  HIP_RUNTIME_CHECK(hipFree(srcBase));
+  HIP_RUNTIME_CHECK(hipFree(dstBase));
+}
+
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -1776,6 +1857,7 @@ int main(int argc, char* argv[]) {
       {"rdma_backend_can_handle_rejects_sentinel_port_remote",
        CaseRdmaBackendCanHandleRejectsSentinelPortRemote},
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
+      {"rdma_dmabuf_interior_range_transfer", CaseRdmaDmabufInteriorRangeTransfer},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},
