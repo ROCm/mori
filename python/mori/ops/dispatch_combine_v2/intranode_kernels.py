@@ -788,6 +788,7 @@ def make_combine(
     warp_num_per_block,
     off_out_tok,
     off_xdb_mem,
+    max_block_num=None,
     off_out_wts=0,
     enable_weights=True,
     fp8_direct_cast=False,
@@ -796,6 +797,11 @@ def make_combine(
     _s3_cache=2,
     _unroll=2,
 ):
+    # Size of the per-block xdb flag counter array (>= block_num). All variants
+    # sharing the flag buffer pass the same max_block_num so the tail counters
+    # stay in lockstep across calls that pick different block_num.
+    if max_block_num is None:
+        max_block_num = block_num
     # Transport dtype = external dtype, except fp8_direct_cast wires fp8 while
     # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit). fp4: i32 = 8 fp4.
     _to_accum2, _from_accum2, _zero_accum = _accum_funcs(
@@ -831,38 +837,59 @@ def make_combine(
 
         window = cco.Window(arena)
         rsrc_tok_map = create_buffer_resource_from_addr(addr_tok_map)
-        rsrc_comb_bar = create_buffer_resource_from_addr(addr_comb_bar)
         rsrc_total_recv = create_buffer_resource_from_addr(addr_total_recv)
         rsrc_out = create_buffer_resource_from_addr(addr_out)
-        xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
+        rsrc_xdb_flag = create_buffer_resource_from_addr(addr_xdb_flag)
 
-        # ── Stage 1: cross-device entry barrier (block 0 only) ──
-        # Block 0 handles the full xdb handshake, then signals other blocks
-        # via comb_bar. Eliminates the grid barrier and per-block xdb spin.
+        # ── Stage 1: per-block cross-device entry barrier ──
+        # Each block owns a PRIVATE flag counter xdb_flag[bid]; all counters stay
+        # in lockstep (== combine call count) because every block bumps its own
+        # once per call (single writer -> no atomic, no cross-block race). Block 0
+        # pushes this call's flag to every peer's shared xdb slot (npes posted
+        # writes); then EVERY block independently polls the SAME local slots for
+        # its own flag. No shared comb_bar (no atomic contention / reset /
+        # cross-call race) and no block-0 funnel; the monotonic flag needs no
+        # reset. Polling is local (peer pushes into our slots), so the extra
+        # per-block spins add no remote traffic.
+        phase = fx.Int64(
+            buffer_load(rsrc_xdb_flag, bid, vec_width=1, dtype=T.i64())
+        )
         if grid_thread_id < npes:
             xdb_remote = fx.Int64(
                 window.lsa_ptr(grid_thread_id, off_xdb_mem)
             ) + fx.Int64(rank) * fx.Int64(8)
-            P.store_i64_system(xdb_remote, arith.constant(0), xdb_cur_flag)
-        if grid_thread_id == 0:
-            P.atomic_add_global(
-                fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64())
+            P.store_i64_system(xdb_remote, arith.constant(0), phase)
+        # advance this block's private counter for the next call (single writer)
+        if tid == 0:
+            buffer_store(
+                phase + arith.constant(1, type=T.i64()), rsrc_xdb_flag, bid
             )
-        if grid_thread_id < npes:
+            # the last block also advances the unused tail counters so a later
+            # call that picks a larger block_num still reads synced counters.
+            if const_expr(max_block_num > block_num):
+                if bid == block_num - 1:
+                    for j in range_constexpr(max_block_num - block_num):
+                        buffer_store(
+                            phase + arith.constant(1, type=T.i64()),
+                            rsrc_xdb_flag,
+                            block_num + j,
+                        )
+        # every block independently polls the shared local slots (local reads).
+        # Use >= (not ==): every block — including late-scheduled ones — reads the
+        # slot, so a faster peer can lap us and overwrite its (monotonic) push with
+        # a higher call count before our late blocks read it. `>=` still releases
+        # (a peer being ahead is the safe direction); `==` would deadlock.
+        if tid < npes:
             xdb_peer_slot = fx.Int64(
                 window.lsa_ptr(my_lsa_rank, off_xdb_mem)
-            ) + fx.Int64(grid_thread_id) * fx.Int64(8)
-            P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
-        if bid == 0:
-            fx.barrier()
-            if tid == 0:
-                P.store_i32_system(
-                    fx.Int64(addr_comb_bar), arith.constant(0), arith.constant(1)
-                )
-        if bid != 0:
-            if tid == 0:
-                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), 0)
-            fx.barrier()
+            ) + fx.Int64(tid) * fx.Int64(8)
+            P.spin_until_ge_i64(xdb_peer_slot, phase)
+        fx.barrier()
+        # No acquire fence needed here: the gather reads peer out_tok via
+        # non-temporal loads (cache-bypassing, always fresh from HBM), and the
+        # spin above is a control dependency ordering the gather after the flag.
+        # Peer's out_tok is written before its flag push (kernel boundary), so
+        # observing the flag implies the data is ready.
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
@@ -1045,16 +1072,10 @@ def make_combine(
 
             _accum_loop()
 
-        # Arrival ack moved to kernel end: each non-zero block signals
-        # completion here (after compute) instead of at entry.
-        if bid != 0:
-            fx.barrier()
-            if tid == 0:
-                P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
-        if global_warp_id == 0:
-            if lane == 0:
-                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), block_num - 1)
-                buffer_store(arith.constant(0), rsrc_comb_bar, 0)
+        # No exit barrier: the per-block monotonic flag needs no reset, and gather
+        # does no post-completion work, so kernel retirement (stream-ordered) is
+        # the only completion signal the host needs. This removes the former
+        # (block_num-1)-way contended atomic_add on comb_bar.
 
     @flyc.jit
     def run(

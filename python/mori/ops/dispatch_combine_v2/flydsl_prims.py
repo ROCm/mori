@@ -206,6 +206,18 @@ def spin_until_eq_i64(addr_i64, val):
     return _spin64(addr_i64, lambda cur: cur != fx.Int64(val))
 
 
+def spin_until_ge_i64(addr_i64, val):
+    """Spin until *addr (i64) >= val (signed).
+
+    For a MONOTONIC cross-device flag this is deadlock-safe under lapping: if a
+    faster peer overwrites the slot with a higher call count before a slow rank
+    reads it, `>=` still passes (whereas `==` would spin forever). It only
+    releases early when the peer is *ahead* — the safe direction for a
+    wait-for-peer barrier.
+    """
+    return _spin64(addr_i64, lambda cur: cur < fx.Int64(val))
+
+
 def spin_until_eq_i32(addr_i64, val):
     """Spin until *addr == val."""
     return _spin(addr_i64, lambda cur: cur != fx.Int32(val))

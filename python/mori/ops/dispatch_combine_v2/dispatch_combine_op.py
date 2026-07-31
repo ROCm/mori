@@ -515,7 +515,17 @@ class EpDispatchCombineOp:
         self.dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self.total_recv = torch.zeros(1, dtype=torch.int32, device=device)
         self.combine_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        self.cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
+        # Per-block xdb flag counters for the gather combine entry barrier: one
+        # i64 per block, sized to the largest combine block_num across variants so
+        # every block owns a private counter and all stay in lockstep across calls
+        # that pick different block_num (the last block advances the tail).
+        if cfg.schedule:
+            self._max_comb_block = max(b[3] for b in cfg.schedule)
+        else:
+            self._max_comb_block = cfg.combine_block_num
+        self.cross_device_flag = torch.ones(
+            self._max_comb_block, dtype=torch.int64, device=device
+        )
         c_dt = cfg.combine_dtype  # combine output dtype
         c_elem = cfg.combine_elem_size
         if c_dt == torch.float4_e2m1fn_x2:  # fp4 combine outputs fp4 (hidden/2 B/token)
@@ -629,6 +639,7 @@ class EpDispatchCombineOp:
                     warp_num_per_block=w,
                     off_out_tok=arena.offset("out_tok"),
                     off_xdb_mem=arena.offset("cross_device_barrier"),
+                    max_block_num=self._max_comb_block,
                     off_out_wts=arena.offset("out_wts"),
                     reset_total_recv=True,
                     fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
