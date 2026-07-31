@@ -166,12 +166,27 @@ _GFX1250_DEFAULT = dict(
     combine_warp_num_per_block=16,
     schedule=_GFX1250_SCHED_BF16,
 )
-# DeepSeek-V4-Pro shape (hidden 7168, topk 6, 384 experts). RE-VALIDATED 2026-07-15
-# EP4 bf16 vec4 at the topk=8 schedule geometries: geometry is topk-independent
-# (tracks token count, not topk) — per-size optimum matches topk=8, so reuse the
-# same schedule. Measured vec4 GB/s (disp/comb): 16=6/4 256=95/67 512=164/93
-# 1024=212/116 2048=252/164 4096=281/200 8192=293/238 16384=300/272.
-_GFX1250_SCHED_BF16_T6 = _GFX1250_SCHED_BF16
+# DeepSeek-V4-Pro shape (hidden 7168, topk 6, 384 experts). RE-TUNED 2026-07-31 EP4
+# bf16 with the LOAD-ONCE/store-many + 4-way dispatch kernel (host-selected by
+# load_once_threshold=4096: tokens >4096 take load-once, tokens <=4096 the original
+# per-(token,expert) path). Full block x warp sweep (tok 256..16384), disp/comb each.
+# Key lessons: (a) dispatch load-once has a SHARP resonance at block=256 (== the
+# 256-CU grid, 1 block/CU) + warp 8 for large tok — 8192 256x8w=968, peaks ~1108 @16384;
+# the disp column flips 256x32 (original, many warps to fill the grid) -> 256x8
+# (load-once) exactly across the 4096 threshold. (b) below the threshold 256x32w wins
+# (4096=756, 1024=428); <=256 tok is latency-flat (~140, any geom). (c) COMBINE also
+# wants block=256 (=CU): the old "<CU, 192 ceiling" guardrail was too conservative —
+# 256 blocks stay co-resident (1/CU) and win big: 8192 256x8w=968 vs 192x16=816 (+19%),
+# 16384 256x8w=1149 vs 192x8=953 (+21%); warp ramps 4->8 (1024 wants 256x4=378). Only
+# tiny tok (<=256) still wants a small block (64x4=155; a 256-block starves it, ->92).
+# Measured GB/s (disp/comb): 256=140/155 1024=428/378 4096=756/741 8192=968/968
+# 16384=1108/1149.
+_GFX1250_SCHED_BF16_T6 = (
+    (256, 128, 16, 64, 4),  # <=256:  disp orig latency-flat ~140; comb small-block 64/4=156
+    (1024, 192, 32, 128, 8),  # <=1024: disp orig warp32=433 (192x32==256x32, min block); comb 128/8=409
+    (4096, 256, 32, 256, 16),  # <=4096: disp orig 256x32=756; comb 256/16=865
+    (None, 256, 8, 256, 16),  # >4096:  disp load-once 256x8; comb 256x16 (1062@8192, 1225@16384)
+)
 # EP8 (world_size=8) RE-TUNED 2026-07-13 on gfx1250 CROSS-NODE (2 nodes x 4 GPUs
 # over the UALink fabric), bf16, with the vec4 combine-gather kernel, full 2-pass
 # block x warp sweep (tok 8..8192). dispatch unchanged by vec4: block 128, warp
