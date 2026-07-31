@@ -176,6 +176,14 @@ jobs:
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
       NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
+      # Perf dashboard capture (MI355X_AINIC only for now). Empty MORI_PERF_OUT
+      # makes tests/python/perf_report.record_perf a no-op, so other platforms
+      # are unaffected.
+      MORI_PERF_OUT: ${{ matrix.platform == 'MI355X_AINIC' && format('{0}/_perf/perf.jsonl', github.workspace) || '' }}
+      MORI_PERF_RUN_ID: ${{ github.run_id }}
+      MORI_PERF_COMMIT: ${{ github.sha }}
+      MORI_PERF_PLATFORM: ${{ matrix.platform }}
+      MORI_PERF_PYTHON: ${{ matrix.python }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -201,6 +209,12 @@ jobs:
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
             ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
+            -e MORI_PERF_OUT=$MORI_PERF_OUT \
+            -e MORI_PERF_RUN_ID=$MORI_PERF_RUN_ID \
+            -e MORI_PERF_COMMIT=$MORI_PERF_COMMIT \
+            -e MORI_PERF_PLATFORM=$MORI_PERF_PLATFORM \
+            -e MORI_PERF_PYTHON=$MORI_PERF_PYTHON \
+            -e MORI_PERF_DATE=$(date -u +%Y-%m-%d) \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -314,6 +328,22 @@ jobs:
             timeout 300 pytest tests/python/umbp/ -v
           "
 
+      - name: Fix perf data ownership
+        if: always() && matrix.platform == 'MI355X_AINIC'
+        run: |
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+            chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE/_perf 2>/dev/null || true
+          ls -l $GITHUB_WORKSPACE/_perf 2>/dev/null || echo "no _perf dir"
+
+      - name: Upload perf data (intra EP)
+        if: always() && matrix.platform == 'MI355X_AINIC'
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-data-intra-${{ matrix.platform }}-py${{ matrix.python }}
+          path: ${{ github.workspace }}/_perf/*.jsonl
+          if-no-files-found: warn
+          retention-days: 45
+
       - name: Cleanup
         if: always()
         run: |
@@ -386,6 +416,12 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      # Perf dashboard capture on node1/rank0 (MI355X_AINIC only for now).
+      MORI_PERF_OUT: ${{ matrix.platform == 'MI355X_AINIC' && format('{0}/_perf/perf.jsonl', github.workspace) || '' }}
+      MORI_PERF_RUN_ID: ${{ github.run_id }}
+      MORI_PERF_COMMIT: ${{ github.sha }}
+      MORI_PERF_PLATFORM: ${{ matrix.platform }}
+      MORI_PERF_PYTHON: ${{ matrix.python }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -412,6 +448,12 @@ jobs:
             -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
             -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
             -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
+            -e MORI_PERF_OUT=$MORI_PERF_OUT \
+            -e MORI_PERF_RUN_ID=$MORI_PERF_RUN_ID \
+            -e MORI_PERF_COMMIT=$MORI_PERF_COMMIT \
+            -e MORI_PERF_PLATFORM=$MORI_PERF_PLATFORM \
+            -e MORI_PERF_PYTHON=$MORI_PERF_PYTHON \
+            -e MORI_PERF_DATE=$(date -u +%Y-%m-%d) \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -588,6 +630,24 @@ jobs:
             PORT=$((PORT + 1))
           done
 
+      - name: Fix perf data ownership (node1)
+        if: always() && matrix.platform == 'MI355X_AINIC'
+        run: |
+          if $CT image inspect $IMAGE &>/dev/null; then
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE/_perf 2>/dev/null || true
+          fi
+          ls -l $GITHUB_WORKSPACE/_perf 2>/dev/null || echo "no _perf dir"
+
+      - name: Upload perf data (internode EP + IO)
+        if: always() && matrix.platform == 'MI355X_AINIC'
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-data-internode-${{ matrix.platform }}-py${{ matrix.python }}
+          path: ${{ github.workspace }}/_perf/*.jsonl
+          if-no-files-found: warn
+          retention-days: 45
+
       - name: Cleanup node1
         if: always()
         run: |
@@ -603,6 +663,68 @@ jobs:
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT rm -f $CONTAINER || true"
+
+  # ── Stage 2c: Performance report ───────────────────────────────────────────
+  # Aggregates the perf JSON emitted by the intra/internode/IO benchmarks into a
+  # Markdown report rendered directly in the run's job summary. Everything lives
+  # in build artifacts (no gh-pages / git commits): the current run's perf-data-*
+  # artifacts plus a best-effort pull of recent nightly runs' artifacts so the
+  # report can show a short per-metric trend across runs.
+  perf-report:
+    name: perf report
+    needs: [test-wheel, test-wheel-internode]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download this run's perf data
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: perf-data-*
+          # No merge-multiple: every artifact contains a file named perf.jsonl,
+          # so merging into one dir would overwrite them. Keep each artifact in
+          # its own subdir; build_report.py globs *.jsonl recursively.
+          path: perf_in/current
+
+      - name: Fetch history from recent nightly runs (best-effort)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p perf_in/history
+          ids=$(gh run list --workflow nightly.yml \
+                  --branch "${{ github.ref_name }}" \
+                  --status completed --limit 15 \
+                  --json databaseId -q '.[].databaseId' || true)
+          for id in $ids; do
+            [ "$id" = "${{ github.run_id }}" ] && continue
+            echo "Fetching perf artifacts from run $id"
+            gh run download "$id" --pattern 'perf-data-*' \
+              --dir "perf_in/history/$id" || true
+          done
+          echo "History fetched:"; find perf_in/history -name '*.jsonl' 2>/dev/null || true
+
+      - name: Build report
+        run: |
+          python3 tools/perf/build_report.py \
+            --input-dir perf_in \
+            --output-dir perf_report
+          cat perf_report/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload perf report
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: perf_report
+          retention-days: 45
 
   # ── Stage 3: Test PyPI wheel (install + import verification) ────────────────
   test-pypi-wheel:

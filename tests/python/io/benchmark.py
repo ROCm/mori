@@ -1071,6 +1071,43 @@ class MoriIoBenchmark:
         else:
             return f"RDMA Benchmark: Initiator Rank {self.role_rank}"
 
+    def _emit_io_perf(self, perf_rows):
+        """Emit one perf record per benchmarked message/batch size (initiator only)."""
+        if not perf_rows:
+            return
+        try:
+            from tests.python.perf_report import record_perf
+        except Exception as exc:  # pragma: no cover
+            print(f"[perf_report] io import failed: {exc}")
+            return
+
+        base_params = {
+            "backend": self.backend_type,
+            "op_type": self.op_type,
+            "transfer_batch_size": self.transfer_batch_size,
+            "enable_batch_transfer": bool(self.enable_batch_transfer),
+            "enable_sess": bool(self.enable_sess),
+            "num_qp_per_transfer": getattr(self, "num_qp_per_transfer", None),
+            "num_worker_threads": getattr(self, "num_worker_threads", None),
+            "num_initiator_dev": getattr(self, "num_initiator_dev", None),
+            "num_target_dev": getattr(self, "num_target_dev", None),
+        }
+        for row in perf_rows:
+            params = dict(base_params)
+            params["msg_size"] = row["msg_size"]
+            params["batch_size"] = row["batch_size"]
+            record_perf(
+                category="io",
+                params=params,
+                metrics={
+                    "max_bw_gbps": row["max_bw_gbps"],
+                    "avg_bw_gbps": row["avg_bw_gbps"],
+                    "min_lat_us": row["min_lat_us"],
+                    "avg_lat_us": row["avg_lat_us"],
+                    "total_mb": row["total_mb"],
+                },
+            )
+
     def _run_benchmark_loop(self):
         self.run_once(self.buffer_size, self.transfer_batch_size)
 
@@ -1087,6 +1124,34 @@ class MoriIoBenchmark:
             title=self._get_table_title(),
         )
 
+        perf_rows = []
+
+        def _add_row(msg_size, batch, total_mem_mb, max_bw, avg_bw, min_lat, avg_lat):
+            table.add_row(
+                [
+                    msg_size,
+                    batch,
+                    f"{total_mem_mb:.2f}",
+                    f"{max_bw:.2f}",
+                    f"{avg_bw:.2f}",
+                    f"{min_lat:.2f}",
+                    f"{avg_lat:.2f}",
+                ]
+            )
+            # Skip TARGET/no-op rows (which report all zeros).
+            if avg_bw > 0:
+                perf_rows.append(
+                    {
+                        "msg_size": int(msg_size),
+                        "batch_size": int(batch),
+                        "total_mb": round(float(total_mem_mb), 2),
+                        "max_bw_gbps": round(float(max_bw), 2),
+                        "avg_bw_gbps": round(float(avg_bw), 2),
+                        "min_lat_us": round(float(min_lat), 2),
+                        "avg_lat_us": round(float(avg_lat), 2),
+                    }
+                )
+
         if self.sweep:
             cur_size = self.sweep_start_size
             max_size = self.sweep_max_size
@@ -1100,16 +1165,14 @@ class MoriIoBenchmark:
                         cur_size, self.transfer_batch_size, self.iters
                     )
                 )
-                table.add_row(
-                    [
-                        cur_size,
-                        self.transfer_batch_size,
-                        f"{total_mem_mb:.2f}",
-                        f"{max_bw:.2f}",
-                        f"{avg_bw:.2f}",
-                        f"{min_duration:.2f}",
-                        f"{avg_duration:.2f}",
-                    ]
+                _add_row(
+                    cur_size,
+                    self.transfer_batch_size,
+                    total_mem_mb,
+                    max_bw,
+                    avg_bw,
+                    min_duration,
+                    avg_duration,
                 )
                 if self.sweep_step > 0:
                     cur_size += self.sweep_step
@@ -1128,16 +1191,14 @@ class MoriIoBenchmark:
                         self.buffer_size, cur_transfer_batch_size, self.iters
                     )
                 )
-                table.add_row(
-                    [
-                        self.buffer_size,
-                        cur_transfer_batch_size,
-                        f"{total_mem_mb:.2f}",
-                        f"{max_bw:.2f}",
-                        f"{avg_bw:.2f}",
-                        f"{min_duration:.2f}",
-                        f"{avg_duration:.2f}",
-                    ]
+                _add_row(
+                    self.buffer_size,
+                    cur_transfer_batch_size,
+                    total_mem_mb,
+                    max_bw,
+                    avg_bw,
+                    min_duration,
+                    avg_duration,
                 )
                 cur_transfer_batch_size *= 2
         else:
@@ -1146,22 +1207,21 @@ class MoriIoBenchmark:
                     self.buffer_size, self.transfer_batch_size, self.iters
                 )
             )
-            table.add_row(
-                [
-                    self.buffer_size,
-                    self.transfer_batch_size,
-                    f"{total_mem_mb:.2f}",
-                    f"{max_bw:.2f}",
-                    f"{avg_bw:.2f}",
-                    f"{min_duration:.2f}",
-                    f"{avg_duration:.2f}",
-                ]
+            _add_row(
+                self.buffer_size,
+                self.transfer_batch_size,
+                total_mem_mb,
+                max_bw,
+                avg_bw,
+                min_duration,
+                avg_duration,
             )
 
         if (
             self.backend_type == "xgmi" and not self.xgmi_multiprocess
         ) or self.role is EngineRole.INITIATOR:
             print(table)
+            self._emit_io_perf(perf_rows)
 
     def run(self):
         if self.backend_type == "xgmi":
