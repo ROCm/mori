@@ -732,6 +732,7 @@ def _save_intranode_tuning_result(
     best_disp_lat=None,
     best_comb_lat=None,
     kernel_type_str="IntraNode",
+    topk=None,
 ):
     from pathlib import Path
     from mori.ops.tuning_config import (
@@ -760,6 +761,7 @@ def _save_intranode_tuning_result(
         "dtype": disp_dtype_str,
         "num_tokens": max_num_inp_token_per_rank,
         "hidden_dim": dispatch_hidden_dim,
+        "topk": topk,
         "block_num": best_disp_config[0],
         "rdma_block_num": 0,
         "warp_per_block": best_disp_config[1],
@@ -771,6 +773,7 @@ def _save_intranode_tuning_result(
         "dtype": comb_dtype_str,
         "num_tokens": max_num_inp_token_per_rank,
         "hidden_dim": combine_hidden_dim,
+        "topk": topk,
         "zero_copy": bool(zero_copy),
         "quant_type": qt_str,
         "block_num": best_comb_config[0],
@@ -1215,6 +1218,7 @@ def _bench_dispatch_combine(
                         best_disp_lat=best_disp_lat,
                         best_comb_lat=best_comb_lat,
                         kernel_type_str=kernel_type_str,
+                        topk=num_experts_per_token,
                     )
 
         else:
