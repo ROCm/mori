@@ -1014,6 +1014,9 @@ const unsigned int CCO_SDMA_OP_ATOMIC = 10;
 const unsigned int CCO_SDMA_SUBOP_COPY_LINEAR = 0;
 const unsigned int CCO_SDMA_ATOMIC_ADD64 = 47;
 const unsigned int CCO_SDMA_MEMORY_SCOPE_SYS = 3;
+// A COPY's count field is 30 bits, so one packet moves at most 1GB. ROCr rounds
+// the cap down to a 32B multiple so chunk boundaries stay unit-aligned.
+constexpr size_t CCO_SDMA_MAX_COPY_BYTES = 0x3fffffe0ull;
 
 // gfx12.5+ reads cache scope and temporal hints out of bits gfx9 leaves reserved,
 // gated by the header's npd bit. ROCr picks the same split (BlitSdmaV6 vs V4);
@@ -1662,6 +1665,30 @@ __device__ inline void ccoSdmaDispatchPut(const ccoSdmaContext& s, int peer, uin
   }
 }
 
+// Split a transfer larger than one packet can express. Signals ride the last
+// chunk only: the queue runs in order, so they still mean the whole transfer
+// landed, and `expected` stays one per call.
+template <typename Coop, bool localSignal, bool remoteSignal, uint32_t optFlags,
+          ccoSdmaThreadMode threadMode>
+__device__ inline void ccoSdmaDispatchChunked(const ccoSdmaContext& s, int peer, uint32_t n,
+                                              void* dst, void* src, size_t bytes, int queueId,
+                                              uint32_t myLsaRank, uint32_t lsaSize) {
+  if (__builtin_expect(bytes <= CCO_SDMA_MAX_COPY_BYTES, 1)) {
+    ccoSdmaDispatchPut<Coop, localSignal, remoteSignal, optFlags, threadMode>(
+        s, peer, n, dst, src, bytes, queueId, myLsaRank, lsaSize);
+    return;
+  }
+  size_t off = 0;
+  for (; bytes - off > CCO_SDMA_MAX_COPY_BYTES; off += CCO_SDMA_MAX_COPY_BYTES) {
+    ccoSdmaDispatchPut<Coop, false, false, optFlags, threadMode>(
+        s, peer, n, static_cast<char*>(dst) + off, static_cast<char*>(src) + off,
+        CCO_SDMA_MAX_COPY_BYTES, queueId, myLsaRank, lsaSize);
+  }
+  ccoSdmaDispatchPut<Coop, localSignal, remoteSignal, optFlags, threadMode>(
+      s, peer, n, static_cast<char*>(dst) + off, static_cast<char*>(src) + off, bytes - off,
+      queueId, myLsaRank, lsaSize);
+}
+
 struct ccoSdma {
   ccoDevComm const& comm;
 
@@ -1693,7 +1720,7 @@ struct ccoSdma {
     const uint32_t myLsaRank = static_cast<uint32_t>(comm.lsaRank);
     void* dst = ccoGetLsaPeerPtr(dstWin, peer, dstOffset);
     void* src = ccoGetLocalPtr(srcWin, srcOffset);
-    ccoSdmaDispatchPut<Coop, localSignal, remoteSignal, optFlags, threadMode>(
+    ccoSdmaDispatchChunked<Coop, localSignal, remoteSignal, optFlags, threadMode>(
         s, peer, n, dst, src, bytes, queueId, myLsaRank, static_cast<uint32_t>(comm.lsaSize));
   }
 
@@ -1716,7 +1743,7 @@ struct ccoSdma {
     const uint32_t myLsaRank = static_cast<uint32_t>(comm.lsaRank);
     void* dst = ccoGetLocalPtr(dstWin, dstOffset);
     void* src = ccoGetLsaPeerPtr(srcWin, peer, srcOffset);
-    ccoSdmaDispatchPut<Coop, localSignal, remoteSignal, optFlags, threadMode>(
+    ccoSdmaDispatchChunked<Coop, localSignal, remoteSignal, optFlags, threadMode>(
         s, peer, n, dst, src, bytes, queueId, myLsaRank, static_cast<uint32_t>(comm.lsaSize));
   }
 
