@@ -886,6 +886,10 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
     totalBids++;
   }
 
+  if (blockId == 0 && warpId == 0 && laneId == 0) {
+    printf("totablBids %d\n", totalBids);
+  }
+
   int processedCount = 0;
   int batchStart = 0;
   while (processedCount < totalBids) {
@@ -931,10 +935,6 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
                  j += numRecvBlock * warpNum) {
               int tokIdx = SendBufSlotOffset(config, node, j);
 
-              if (laneId == 0 && warpId == 0 && bid == 0) {
-                printf("[PE%d] node %d k %d j %d tokIdx: %d\n", myPe, node, k, j, tokIdx);
-              }
-
               if (laneId < config.numExpertPerToken) {
                 srcPtrs[laneId] = nullptr;
                 srcWeightsPtr[laneId] = nullptr;
@@ -942,11 +942,6 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
                     args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId];
                 index_t destPe = PeFromFlatTokenIndex(config, destTokId);
                 index_t destNode = destPe / config.gpuPerNode;
-
-                if (myPe == 0) {
-                  printf("[PE%d] destTokId: %d destPe %d destNode %d\n", myPe, destTokId, destPe,
-                         destNode);
-                }
 
                 if (destNode == myNode) {
                   index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
@@ -999,6 +994,11 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
             }
           }
           processedMask |= (1u << relativeIdx);
+
+          if (laneId == 0 && myPe == 0) {
+            printf("[PE %d]blockId %d warpId %d bid %d processedMask %d\n", myPe, blockId, warpId,
+                   bid, processedMask);
+          }
         }
         bidIdx++;
       }
