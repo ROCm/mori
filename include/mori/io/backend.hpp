@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
@@ -194,6 +195,11 @@ class Backend {
                                         TransferStatus* status) = 0;
 
   virtual bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const { return true; }
+
+  // Why CanHandle() rejected this pair; empty when supported. Callers have no other error channel.
+  virtual std::string ExplainCannotHandle(const MemoryDesc& local, const MemoryDesc& remote) const {
+    return CanHandle(local, remote) ? std::string{} : std::string{"backend declined this pair"};
+  }
 };
 
 }  // namespace io

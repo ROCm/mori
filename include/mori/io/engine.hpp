@@ -108,6 +108,8 @@ class IOEngine {
   StatusCode WaitAll(const std::vector<TransferStatus*>& statuses, int timeoutMs = -1);
 
   std::optional<IOEngineSession> CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
+  // Why CreateSession() could not build a session for this pair, empty when it can.
+  std::string ExplainSessionUnavailable(const MemoryDesc& local, const MemoryDesc& remote) const;
   void LoadScatterGatherModule(const std::string& hsacoPath);
   void LoadFabricCopyModule(const std::string& hsacoPath);
 
@@ -150,6 +152,8 @@ class IOEngine {
   };
 
   Backend* SelectBackend(const MemoryDesc& local, const MemoryDesc& remote);
+  // Install a backend and replay the registrations it missed by coming up late.
+  Backend* InsertBackend(BackendType type, std::unique_ptr<Backend> backend);
   bool SupportsXgmiBackendByP2P() const;
   void EnsureXgmiBackendCreatedIfSupported();
   void InvalidateRouteCache();
@@ -164,6 +168,8 @@ class IOEngine {
   std::atomic<uint32_t> nextTransferUid{0};
   std::atomic<uint32_t> nextMemUid{0};
   std::unordered_map<MemoryUniqueId, MemoryDesc> memPool;
+  // Remote engines registered so far, replayed into backends created later.
+  std::unordered_map<EngineKey, EngineDesc> remoteEngines;
   std::unordered_map<BackendType, std::unique_ptr<Backend>> backends;
   mutable std::shared_mutex routeCacheMu;
   std::unordered_map<RouteCacheKey, BackendType, RouteCacheKeyHash> routeCache;

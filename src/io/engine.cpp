@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -213,9 +214,7 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
                    internal::kXgmiOnlyFallbackPlaceholderPort);
 
       XgmiBackendConfig xgmiConfig{};
-      auto backend = std::make_unique<XgmiBackend>(desc.key, config, xgmiConfig);
-      backends.insert({BackendType::XGMI, std::move(backend)});
-      InvalidateRouteCache();
+      InsertBackend(BackendType::XGMI, std::make_unique<XgmiBackend>(desc.key, config, xgmiConfig));
       return;
     }
 
@@ -246,23 +245,38 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
       }
     }
 
-    backends.insert({type, std::move(backend)});
-    InvalidateRouteCache();
+    InsertBackend(type, std::move(backend));
     EnsureXgmiBackendCreatedIfSupported();
   } else if (type == BackendType::XGMI) {
-    auto backend = std::make_unique<XgmiBackend>(desc.key, config,
-                                                 static_cast<const XgmiBackendConfig&>(beConfig));
-    backends.insert({type, std::move(backend)});
-    InvalidateRouteCache();
+    InsertBackend(type, std::make_unique<XgmiBackend>(
+                            desc.key, config, static_cast<const XgmiBackendConfig&>(beConfig)));
   } else if (type == BackendType::FABRIC) {
-    auto backend = std::make_unique<FabricBackend>(
-        desc.key, config, static_cast<const FabricBackendConfig&>(beConfig));
-    backends.insert({type, std::move(backend)});
-    InvalidateRouteCache();
+    InsertBackend(type, std::make_unique<FabricBackend>(
+                            desc.key, config, static_cast<const FabricBackendConfig&>(beConfig)));
   } else {
     assert(false && "not implemented");
   }
   MORI_IO_INFO("Create backend type {}", static_cast<uint32_t>(type));
+}
+
+Backend* IOEngine::InsertBackend(BackendType type, std::unique_ptr<Backend> backend) {
+  auto [it, inserted] = backends.insert({type, std::move(backend)});
+  Backend* raw = it->second.get();
+  InvalidateRouteCache();
+  if (!inserted) return raw;
+
+  // Replay registrations this late backend missed; without them it can route no prior pair.
+  for (const auto& [key, remoteDesc] : remoteEngines) {
+    raw->RegisterRemoteEngine(remoteDesc);
+  }
+  for (auto& [id, memDesc] : memPool) {
+    raw->RegisterMemory(memDesc);
+  }
+  if (!remoteEngines.empty() || !memPool.empty()) {
+    MORI_IO_INFO("Backend type {} replayed {} remote engine(s) and {} memory registration(s)",
+                 static_cast<uint32_t>(type), remoteEngines.size(), memPool.size());
+  }
+  return raw;
 }
 
 bool IOEngine::SupportsXgmiBackendByP2P() const {
@@ -325,9 +339,7 @@ void IOEngine::EnsureXgmiBackendCreatedIfSupported() {
 
   try {
     XgmiBackendConfig xgmiConfig{};
-    auto backend = std::make_unique<XgmiBackend>(desc.key, config, xgmiConfig);
-    backends.insert({BackendType::XGMI, std::move(backend)});
-    InvalidateRouteCache();
+    InsertBackend(BackendType::XGMI, std::make_unique<XgmiBackend>(desc.key, config, xgmiConfig));
     MORI_IO_INFO("Auto-created XGMI backend after RDMA initialization");
   } catch (const std::exception& e) {
     MORI_IO_WARN("Auto-create XGMI backend failed: {}", e.what());
@@ -342,6 +354,7 @@ void IOEngine::RemoveBackend(BackendType type) {
 }
 
 void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
+  remoteEngines[remote.key] = remote;
   for (auto& it : backends) {
     it.second->RegisterRemoteEngine(remote);
   }
@@ -351,6 +364,7 @@ void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
 }
 
 void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
+  remoteEngines.erase(remote.key);
   for (auto& it : backends) {
     it.second->DeregisterRemoteEngine(remote);
   }
@@ -371,6 +385,15 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   memDesc.loc = loc;
   if (loc == MemoryLocationType::CPU && data != nullptr) {
     memDesc.numaNode = DetectNumaNode(data);
+  }
+
+  if (backends.empty()) {
+    // No backend yet: descriptor has no transport credentials and cannot be back-filled.
+    MORI_IO_WARN(
+        "Register memory id {} before any backend exists: the returned MemoryDesc has no "
+        "transport credentials and a peer given this descriptor cannot reach it. Call "
+        "CreateBackend() first, then register memory.",
+        memDesc.id);
   }
 
   for (auto& it : backends) {
@@ -558,14 +581,62 @@ std::optional<IOEngineSession> IOEngine::CreateSession(const MemoryDesc& local,
 
   Backend* backend = SelectBackend(local, remote);
   if (backend == nullptr) {
+    MORI_IO_ERROR("Create session failed, {}", ExplainSessionUnavailable(local, remote));
     return std::nullopt;
   }
   sess.backendSess.reset(backend->CreateSession(local, remote));
   if (sess.backendSess == nullptr) {
+    uint32_t backendType = 0;
+    for (const auto& [type, candidate] : backends) {
+      if (candidate.get() == backend) backendType = static_cast<uint32_t>(type);
+    }
+    MORI_IO_ERROR(
+        "Create session failed, backend type {} accepted local mem id {} (device {}) -> remote mem "
+        "id {} (device {}) on engine {} but could not set the session up; see the preceding "
+        "backend "
+        "warning for the failing step",
+        backendType, local.id, local.deviceId, remote.id, remote.deviceId, remote.engineKey);
     return std::nullopt;
   }
 
   return sess;
+}
+
+std::string IOEngine::ExplainSessionUnavailable(const MemoryDesc& local,
+                                                const MemoryDesc& remote) const {
+  std::ostringstream oss;
+  oss << "no backend can handle local mem id " << local.id << " (device " << local.deviceId
+      << ", bus " << (local.deviceBusId.empty() ? "unknown" : local.deviceBusId)
+      << ") -> remote mem id " << remote.id << " (device " << remote.deviceId << ", bus "
+      << (remote.deviceBusId.empty() ? "unknown" : remote.deviceBusId) << ") on engine "
+      << remote.engineKey << ". ";
+
+  if (backends.empty()) {
+    oss << "No backend has been created on engine " << desc.key << "; call CreateBackend() first.";
+    return oss.str();
+  }
+
+  std::ostringstream reasons;
+  bool anyDeclined = false;
+  bool first = true;
+  for (const auto& [type, backend] : backends) {
+    std::string reason = backend->ExplainCannotHandle(local, remote);
+    if (reason.empty()) continue;
+    anyDeclined = true;
+    if (!first) reasons << "; ";
+    first = false;
+    reasons << "backend type " << static_cast<uint32_t>(type) << ": " << reason;
+  }
+
+  if (!anyDeclined) {
+    // A backend accepted the pair; setup failed (e.g. XGMI hipIpcOpenMemHandle) and logs itself.
+    oss << "A backend accepted the pair but could not set the session up; see the preceding "
+           "backend warning for the failing step.";
+    return oss.str();
+  }
+
+  oss << "Backends declined it: " << reasons.str();
+  return oss.str();
 }
 
 void IOEngine::LoadScatterGatherModule(const std::string& hsacoPath) {

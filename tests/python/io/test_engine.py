@@ -33,6 +33,7 @@ from mori.io import (
     StatusCode,
     MemoryLocationType,
     RdmaBackendConfig,
+    SessionUnavailableError,
     XgmiBackendConfig,
     set_log_level,
 )
@@ -651,8 +652,12 @@ def test_no_backend():
     assert transfer_status.Failed()
     assert transfer_status.Code() == StatusCode.ERR_BAD_STATE
 
-    sess = initiator.create_session(initiator_mem, target_mem)
-    assert sess is None
+    # Session creation has no TransferStatus to report through, so it must raise
+    # and name the cause rather than hand back a bare None that only fails later
+    # on the first batch_read.
+    with pytest.raises(SessionUnavailableError) as excinfo:
+        initiator.create_session(initiator_mem, target_mem)
+    assert "No backend has been created" in str(excinfo.value)
 
 
 @pytest.fixture(scope="module")

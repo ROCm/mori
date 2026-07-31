@@ -1017,29 +1017,51 @@ bool XgmiBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id
 }
 
 bool XgmiBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const {
+  return ExplainCannotHandle(local, remote).empty();
+}
+
+std::string XgmiBackend::ExplainCannotHandle(const MemoryDesc& local,
+                                             const MemoryDesc& remote) const {
   if (local.loc != MemoryLocationType::GPU || remote.loc != MemoryLocationType::GPU) {
-    return false;
+    return "XGMI moves GPU memory only (local loc " +
+           std::to_string(static_cast<uint32_t>(local.loc)) + ", remote loc " +
+           std::to_string(static_cast<uint32_t>(remote.loc)) + ")";
   }
 
   if (!IsSameNodeEngine(remote.engineKey)) {
-    return false;
+    std::lock_guard<std::mutex> lock(remoteEnginesMu);
+    if (remoteEngines.find(remote.engineKey) == remoteEngines.end()) {
+      return "remote engine " + remote.engineKey +
+             " is unknown to the XGMI backend; RegisterRemoteEngine() must run after the backend "
+             "is created";
+    }
+    return "remote engine " + remote.engineKey + " is on a different node (local node_id " +
+           (myNodeId.empty() ? "unset" : myNodeId) + ", hostname " + myHostname + ")";
   }
 
   if (remote.deviceBusId.empty()) {
-    return false;
+    return "remote mem id " + std::to_string(remote.id) +
+           " has no PCI bus id, so its GPU cannot be located on this node";
   }
 
   // Visible fast path: remote GPU is in this process's HIP_VISIBLE_DEVICES
   auto visibleRemote = LookupVisibleDevice(remote.deviceBusId);
   if (visibleRemote.has_value()) {
-    return IsP2PAccessible(local.deviceId, visibleRemote.value());
+    if (IsP2PAccessible(local.deviceId, visibleRemote.value())) return {};
+    return "no GPU P2P access between visible devices " + std::to_string(local.deviceId) + " and " +
+           std::to_string(visibleRemote.value());
   }
 
   // Hidden-device path: remote GPU is not visible but may be on the same XGMI hive
   if (IsIpcHandleEmpty(remote.ipcHandle)) {
-    return false;
+    return "remote mem id " + std::to_string(remote.id) + " on hidden GPU " + remote.deviceBusId +
+           " carries an empty IPC handle; the peer registered it before creating its XGMI backend";
   }
-  return IsTopologyEligible(local.deviceId, remote.deviceBusId);
+  if (!IsTopologyEligible(local.deviceId, remote.deviceBusId)) {
+    return "hidden GPU " + remote.deviceBusId + " is not on the same XGMI hive as visible device " +
+           std::to_string(local.deviceId);
+  }
+  return {};
 }
 
 }  // namespace io

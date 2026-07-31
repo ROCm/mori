@@ -920,12 +920,10 @@ class MoriIoBenchmark:
         else:
             target_mem_desc = self.recv_bytes(self.num_initiator_dev + self.role_rank)
             self.target_mem = MemoryDesc.unpack(target_mem_desc)
+            # create_session raises SessionUnavailableError naming the actual
+            # reason (e.g. peers not in the same vPOD, or remote memory not
+            # fabric-exportable).
             self.sess = self.engine.create_session(self.mem, self.target_mem)
-            if self.sess is None:
-                raise RuntimeError(
-                    "create_session returned None for fabric: peers likely not in the "
-                    "same vPOD, or remote memory is not fabric-exportable"
-                )
 
     def run_single_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size

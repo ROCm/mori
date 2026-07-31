@@ -214,6 +214,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("Write", &mori::io::IOEngine::Write, py::call_guard<py::gil_scoped_release>())
       .def("BatchWrite", &mori::io::IOEngine::BatchWrite, py::call_guard<py::gil_scoped_release>())
       .def("CreateSession", &mori::io::IOEngine::CreateSession)
+      .def("ExplainSessionUnavailable", &mori::io::IOEngine::ExplainSessionUnavailable)
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus,
            py::call_guard<py::gil_scoped_release>())
       .def("WaitAll", &mori::io::IOEngine::WaitAll, py::arg("statuses"), py::arg("timeout_ms") = -1,

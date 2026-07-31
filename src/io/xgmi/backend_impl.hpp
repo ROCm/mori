@@ -95,6 +95,7 @@ class XgmiBackend : public Backend {
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
+  std::string ExplainCannotHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
   bool IsP2PAccessible(int srcDevice, int dstDevice) const;
   void LoadScatterGatherModule(const std::string& hsacoPath);

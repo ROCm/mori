@@ -34,6 +34,10 @@ TORCH_DEVICE_TYPE_MAP = {
 }
 
 
+class SessionUnavailableError(RuntimeError):
+    """No backend could build a transfer session for a local/remote memory pair."""
+
+
 class IOEngineSession:
     def __init__(self, mori_sess):
         self._sess = mori_sess
@@ -223,7 +227,10 @@ class IOEngine:
     def create_session(self, local_mem, remote_mem):
         mori_sess = self._engine.CreateSession(local_mem, remote_mem)
         if mori_sess is None:
-            return None
+            # Returning None here pushed the failure to the first transfer call, surfacing as an unattributable AttributeError on NoneType.
+            raise SessionUnavailableError(
+                self._engine.ExplainSessionUnavailable(local_mem, remote_mem)
+            )
         return IOEngineSession(mori_sess)
 
     def pop_inbound_transfer_status(self, remote_key, transfer_uid):
