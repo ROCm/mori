@@ -401,13 +401,30 @@ def _disp_nophase_defines() -> list[str]:
     buffers once staging was gone. METAFUSE measured 462.6 GB/s and its body has been removed, so
     NOSTG now leaves nothing feeding them and is diagnostic-only like the other two.
 
+    Three more split the payload loop itself, to find why it reaches 1192 GB/s where the pure-TDM
+    a2a probe reaches 1664 at the same tile size, grid and warp count. PAYRAW keeps the TDM traffic
+    and drops only the routing (map read, shfl, slot arithmetic); NOLOAD keeps the stores and drops
+    the load; NOSEND keeps the load and drops the stores.
+
     Never enable with ACC=1; the dispatch output is deliberately incomplete.
     """
     out: list[str] = []
-    for name in ("NOMETA", "NOPAY", "NOSTG"):
+    for name in ("NOMETA", "NOPAY", "NOSTG", "PAYRAW", "NOLOAD", "NOSEND", "PREBASE"):
         if os.environ.get(f"MORI_DISP_{name}", "").lower() in ("1", "true", "on", "yes"):
             out.append(f"-DMORI_DISP_{name}")
+    out.extend(_disp_pay2d_defines())
     return out
+
+
+def _disp_pay2d_defines() -> list[str]:
+    """-DMORI_DISP_PAY2D=D0 reshapes the payload's TDM descriptor from the 1 x hiddenDim wedge to a
+    D0 x (hiddenDim/D0) 2D tile. gfx1250 wants both tensor dims >= 2 (TdmShape2D in intranode.hpp
+    records this), and the payload descriptor was the only one still sending tensorDim1 == 1 while
+    the meta path and the pure-TDM a2a probe both send 2D. D0 is the fast dim in ELEMENTS and must
+    divide hiddenDim; the kernel falls back to the 1D shape when it does not. The 128B minimum row
+    means D0 >= 64 for bf16."""
+    v = os.environ.get("MORI_DISP_PAY2D", "").strip()
+    return [f"-DMORI_DISP_PAY2D={int(v)}"] if v.isdigit() and int(v) > 1 else []
 
 
 def _disp_timing_defines() -> list[str]:

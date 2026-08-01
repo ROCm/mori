@@ -690,14 +690,25 @@ class EpDispatchCombineOp:
             elem = int(self.config.max_token_type_size)
             row_elems = 128 // elem
             hidden = int(self.config.hidden_dim)
-            chunk_elems = -(-hidden // chunks)
-            chunk_elems = -(-chunk_elems // row_elems) * row_elems
-            tiles_per_warp = (
-                1
-                if self.config.use_external_inp_buf
-                else int(self.config.num_experts_per_token)
-            )
-            tile_bytes = warp_per_block * tiles_per_warp * chunk_elems * elem
+            topk = int(self.config.num_experts_per_token)
+            world = int(self.config.world_size)
+            if self.config.use_external_inp_buf:
+                # PUSH never splits a token and never holds more than one: one warp sends one whole
+                # token to its one destination PE, so the tile is exactly hiddenDim elements and
+                # MORI_COMB_TDM only gates TDM on/off there.
+                tile_elems = hidden
+                tiles_per_warp = 1
+            else:
+                # PULL still chunks, because a warp holds one tile per SOURCE rather than one tile
+                # total, so whole tokens would not fit. The source count is min(topk, world_size), not
+                # topk: dispatch dedups a token's experts by destination PE and combine compacts the
+                # survivors, so one survives per distinct PE. Must match _cPullSrcMax in
+                # intranode.hpp, including the world_size <= 4 condition -- that is where the
+                # compaction that makes the tile indices dense runs.
+                tile_elems = -(-hidden // chunks)
+                tile_elems = -(-tile_elems // row_elems) * row_elems
+                tiles_per_warp = world if (world <= 4 and world < topk) else topk
+            tile_bytes = warp_per_block * tiles_per_warp * tile_elems * elem
             # The kernel rounds past the pointer arrays to 128B (TDM row) before the first tile.
             total = ((base + 127) & ~127) + tile_bytes
             # gfx1250 measured LDS budget is 327680 B per block. Overflowing it fails the launch with
@@ -706,8 +717,8 @@ class EpDispatchCombineOp:
                 raise ValueError(
                     f"MORI_COMB_TDM={chunks} needs {total} B of LDS for combine "
                     f"(warp_per_block={warp_per_block}, tiles/warp={tiles_per_warp}, "
-                    f"chunk_elems={chunk_elems}) but the budget is 327680 B. "
-                    f"Raise MORI_COMB_TDM (smaller chunks) or lower warp_per_block."
+                    f"tile_elems={tile_elems}) but the budget is 327680 B. "
+                    f"Raise MORI_COMB_TDM (smaller PULL chunks) or lower warp_per_block."
                 )
             base = total
         return base

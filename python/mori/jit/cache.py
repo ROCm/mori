@@ -132,12 +132,15 @@ def get_cache_dir(
     # Deletion diagnostics (wrong results on purpose) and the meta shape histogram.
     diag_suffix = "".join(
         f"_{n.lower()}"
-        for n in ("NOSTG", "NOMETA", "NOPAY", "METADIAG")
+        for n in ("NOSTG", "NOMETA", "NOPAY", "METADIAG", "PAYRAW", "NOLOAD", "NOSEND", "PREBASE")
         if os.environ.get(f"MORI_DISP_{n}", "").lower() in ("1", "true", "on", "yes")
     )
+    # -DMORI_DISP_PAY2D=D0 reshapes the payload TDM descriptor, so D0 is part of the key.
+    _pay2d = os.environ.get("MORI_DISP_PAY2D", "").strip()
+    pay2d_suffix = f"_pay2d{int(_pay2d)}" if _pay2d.isdigit() and int(_pay2d) > 1 else ""
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{fastdedup_suffix}{combtdm_suffix}{comb_diag_suffix}{diag_suffix}{cntstep_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{fastdedup_suffix}{combtdm_suffix}{comb_diag_suffix}{diag_suffix}{pay2d_suffix}{cntstep_suffix}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)

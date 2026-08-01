@@ -601,19 +601,22 @@ class EpDispatchCombineTestCase:
         # intact. Without this escape the bench asserts before it ever reaches the timing loop, so
         # the diagnostic cannot be measured at all. Deliberately loud, and deliberately keyed on the
         # same env var the compile gate reads, so a stale export can never silently disarm the check.
-        if os.environ.get("MORI_COMB_NOREDUCE", "").strip().lower() in (
-            "1",
-            "true",
-            "on",
-            "yes",
+        # MORI_BENCH_SKIPCHECK is the same escape for pricing a path that is known-broken before
+        # deciding whether to fix it -- the PUSH combine (--zero-copy 0) drops one source of topk, so
+        # it cannot be benchmarked at all while this assert stands. It must stay opt-in and separate
+        # from the gate above so it can never be confused for a passing run.
+        for var, why in (
+            ("MORI_COMB_NOREDUCE", "combine folds one source instead of topk"),
+            ("MORI_COMB_PUSHONLY", "combine returns after the push and writes no output"),
+            ("MORI_BENCH_SKIPCHECK", "explicitly pricing a known-broken path"),
         ):
-            if self.config.rank == 0:
-                print(
-                    "[SKIPCHECK] MORI_COMB_NOREDUCE is set: combine output is wrong on purpose, "
-                    "value check skipped. Bandwidth from this run is a transport ceiling, NOT a "
-                    "shippable number."
-                )
-            return
+            if os.environ.get(var, "").strip().lower() in ("1", "true", "on", "yes"):
+                if self.config.rank == 0:
+                    print(
+                        f"[SKIPCHECK] {var} is set ({why}): combine output is NOT verified. "
+                        "Bandwidth from this run is a diagnostic, NOT a shippable number."
+                    )
+                return
 
         for i in range(all_rank_num_token[self.config.rank]):
             # Ignore -1 routing sentinels: they should be skipped by
