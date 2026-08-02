@@ -2753,6 +2753,21 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   // so it is roughly half local quantise, half gather, and the fold and the barrier are noise. The
   // quantise half is attacked in WarpQuantizeBf16ToFp8BlockwiseVec (MORI_COMB_QSTGU, 778 -> 410).
   //
+  // WIDTH, which those numbers hide, and which turned out to be the larger effect. Every figure
+  // above is at 64x8, the bf16 ZC=1 tuned point, and blockwise had simply never been measured
+  // anywhere else. Both halves scale with the grid: full/NOQUANT at 64/128/256 blocks reads
+  // 1044.2/636.0, 581.7/348.4, 385.9/222.1. The reason one width could not serve both is that the
+  // two halves want opposite things -- the gather is bound by peer reads in flight and by the LDS
+  // its tiles need, the quantise is a local stream that wants every CU -- so the quantise now
+  // launches as EpCombineQuantizeInputKernel_bf16 ahead of this kernel (MORI_COMB_QPRE, and the
+  // combine launch then passes useExternalInpBuffer=0 so the arm above compiles to nothing).
+  // MEASURED EP4 fp8_blockwise, check armed, rc=0 on every row:
+  //     inline, combine 64x8                       1011.3us
+  //     split, pre 256x8, combine 64x8              856.4
+  //     split, pre 256x8, combine 256x8             428.2
+  //     split, pre 256x8, combine 256x16            367.6
+  //     bf16 zero-copy PULL 64x8, the bar           169.2   / 1254.7 GB/s
+  //
   // The gather half is 106 MB in ~500us and is NOT the descriptor shape. Priced with NOQUANT
   // holding the quantise pass out: chunked at 2 chunks 628.7us, whole-token chunks 609.2, QUAD
   // depth 4 632.0, QUAD depth 4 split 2 868.2 -- three structurally different decompositions inside
