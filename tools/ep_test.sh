@@ -18,9 +18,10 @@
 #   BASE                             gates shared by every spec
 #   ZC                               0 = PUSH (_nop2p), 1 = PULL (_p2p, cross-card read)
 #   QT                               none / fp8_blockwise / fp8_direct_cast
-#   DEPLOY=1                         docker cp working-tree files staged in /tmp over the container
-#                                    checkout first; default 0 = run what is checked out there
+#   REV=<branch|commit>              fetch and hard-checkout that rev in the container before running;
+#                                    empty (default) runs whatever is already checked out there
 # Examples:
+#   REV=tdm-dispatch ./tools/ep_test.sh
 #   ./tools/ep_test.sh
 #   SPECS="full=; nopush=MORI_COMB_NOPUSH=1" CBNS="64 128" ./tools/ep_test.sh
 #   SPECS="check!=" ZC=1 ./tools/ep_test.sh
@@ -32,6 +33,7 @@ CBNS="${CBNS:-}"        # non-empty: run every spec once per block count (diagno
 CWPB="${CWPB:-8}"
 DBN="${DBN:-64}"        # SAME = follow the combine block count being swept (per-row geometry)
 DWPB="${DWPB:-8}"       # SAME = follow CWPB
+WS="${WS:-4}"           # peer count; 2 is the case where round-robin has the least imbalance to recover
 ZC="${ZC:-0}"           # 0 = PUSH (_nop2p), 1 = PULL (_p2p, cross-card read)
 QT="${QT:-none}"        # none / fp8_blockwise / fp8_direct_cast; blockwise only pairs with ZC=0
 # BARSLEEP is deliberately NOT set here. It used to default to 127 in this script, which silently
@@ -41,36 +43,48 @@ QT="${QT:-none}"        # none / fp8_blockwise / fp8_direct_cast; blockwise only
 # RUNRR alone 168.9 / 1199, RUNRR+BARSLEEP=127 171.1 / 1183. Passing it explicitly here made every
 # geometry in this script read ~2us slow and produced a phantom "regression" against the recorded
 # 168.9 / 1199 baseline. Set it per-spec if a run is actually studying the barrier.
-BASE="${BASE:-MORI_COMB_RUNRR=1}"
+# BASE is empty on purpose. It used to carry MORI_COMB_RUNRR=1, which was worth 22% on PUSH and so
+# looked mandatory; the push loop now always uses that ordering (the queued variant, measured better
+# at both EP2 and EP4), so there is nothing left to pass. Anything set here applies to every spec.
+BASE="${BASE:-}"
 SPECS="${SPECS:-full=}"
-DEPLOY="${DEPLOY:-0}"
+REV="${REV:-}"
 
-if [ "$DEPLOY" = 1 ]; then
-echo "######## deploy"
-for f in \
-  src/ops/dispatch_combine/intranode.hpp \
-  src/ops/kernels/ep_intranode.hip \
-  include/mori/core/transport/p2p/device_primitives.hpp \
-  python/mori/jit/core.py \
-  python/mori/jit/cache.py \
-  python/mori/ops/dispatch_combine.py \
-  tests/python/ops/bench_dispatch_combine.py \
-  tests/python/ops/dispatch_combine_test_utils.py; do
-  # include/mori and src/ops are both part of the JIT cache content hash (jit/core.py), so a stale
-  # copy here does not just run old code, it runs old code under the CURRENT cache key.
-  [ -f "/tmp/$(basename $f)" ] && docker cp "/tmp/$(basename $f)" "$CTR:$SRC/$f"
-done
-docker exec "$CTR" bash -lc "cd $SRC
-for f in src/ops/dispatch_combine/intranode.hpp src/ops/kernels/ep_intranode.hip include/mori/core/transport/p2p/device_primitives.hpp python/mori/jit/core.py python/mori/jit/cache.py python/mori/ops/dispatch_combine.py tests/python/ops/bench_dispatch_combine.py tests/python/ops/dispatch_combine_test_utils.py; do
-  sed -i 's/\r\$//' \$f
-  printf '  %-44s md5=%s\n' \$f \$(md5sum \$f | cut -c1-12)
-done"
+# Source comes from git, never from a docker cp of the working tree. Copying had two silent failure
+# modes and both fired: a stage step that landed files in the node's /tmp without entering the
+# container produced a gfx942 compile log identical to the pre-fix one (the fix was never read), and
+# the copy list was a fixed set that did not include launch.cpp, so editing it deployed nothing. Both
+# read as "the change did not work" rather than "the change never arrived". A rev is verifiable on
+# both ends, and carries whatever was touched.
+echo "######## source"
+docker exec "$CTR" bash -lc "cd $SRC || exit 1
+if [ -n '$REV' ]; then
+  timeout 120 git fetch --quiet origin 2>/dev/null || echo '  fetch failed (no network/key), using local objects'
+  git checkout -f --detach '$REV' >/dev/null 2>&1 || git checkout -f --detach 'origin/$REV' >/dev/null 2>&1 || {
+    echo '  no such rev: $REV'; exit 1; }
 fi
+printf '  HEAD %s  %s\n' \"\$(git rev-parse --short HEAD)\" \"\$(git log -1 --format=%s | cut -c1-72)\"
+# Printed unconditionally, and this is the point of the block: a result is only attributable if the
+# run says which tree produced it. A dirty tree is not fatal (it is how you test an unpushed idea),
+# it just means the rev above is not what ran.
+d=\$(git status --porcelain -- src include python tests)
+if [ -n \"\$d\" ]; then
+  echo '  DIRTY, the run below is NOT the commit above:'
+  echo \"\$d\" | head -12 | sed 's/^/    /'
+fi" || exit 1
+# No JIT cache drop after a checkout: the cache key hashes the content of src/ops and include/mori
+# (jit/cache.py), so a different tree already resolves to a different cache dir on its own.
 
 docker exec -i "$CTR" bash -lc 'cat > /tmp/ep_test_inner.sh' <<INNER
 #!/bin/bash
 cd $SRC || exit 1
-export MORI_EP_COMM=cco MORI_DISP_BATCH=1 MORI_DISP_TDM=1 MORI_COMB_TDM=1
+# Nothing that changes kernel behaviour is exported here any more, and that is the point: what is
+# left is bootstrap only (loopback interface, rendezvous address, heap size, unbuffered stdout).
+# The five that used to sit here are gone for cause -- MORI_DISP_BATCH was read by nothing at all,
+# MORI_DISP_TDM is implied by the arch, MORI_COMB_TDM=1 was not "on" but an override of the resolved
+# default of 2 chunks, MORI_COMB_RUNRR is now the only push order, and MORI_EP_COMM=cco is the
+# gfx125x default. Each of them was a fact about the hardware or a settled choice being spelled as
+# something the caller had to remember.
 export MORI_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo PYTHONPATH=$SRC
 export MASTER_ADDR=127.0.0.1 MORI_SHMEM_HEAP_SIZE=6G PYTHONUNBUFFERED=1
 HN=\$(hostname); grep -q "\$HN" /etc/hosts || echo "127.0.0.1 \$HN" >> /etc/hosts
@@ -91,7 +105,7 @@ run() { # \$1=tag \$2=gates \$3=1 means run WITH the correctness check
   dw=$DWPB; [ "\$dw" = SAME ] && dw=$CWPB
   env \$sk $BASE \$2 MASTER_PORT=\$P \
     timeout 900 python3 tests/python/ops/bench_dispatch_combine.py \
-    --cmd bench --world-size 4 --dtype bf16 --max-tokens 4096 --hidden-dim 7168 \
+    --cmd bench --world-size $WS --dtype bf16 --max-tokens 4096 --hidden-dim 7168 \
     --num-experts-per-rank 64 --num-experts-per-token 8 --zero-copy $ZC --quant-type $QT \
     --dispatch-block-num \$db --dispatch-warp-per-block \$dw \
     --combine-block-num \$CB --combine-warp-per-block $CWPB > /tmp/ep_test_\$1.log 2>&1
