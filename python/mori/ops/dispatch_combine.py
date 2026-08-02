@@ -147,7 +147,7 @@ _QUANT_TYPE_MAP = {
 
 # Blockwise combine quant types share the staging/scale layout and kernel launch config; only the
 # element codec (and staging slot size) differ, so kernel selection treats them together and then
-# swaps the codec token (fp8bwq <-> fp4bwq) in the kernel name.
+# swaps the codec token (fp8_blockwise <-> fp4_blockwise) in the kernel name.
 def _comb_qpull() -> bool:
     """Whether blockwise combine moves its bytes by PULL gather rather than PUSH staging.
 
@@ -178,15 +178,15 @@ _BLOCKWISE_COMBINE_QUANT_TYPES = (
 )
 
 # The FP4 blockwise combine kernels registered in ep_intranode.hip. Kernel-name selection derives
-# an fp4bwq name from the fp8bwq one; the result is asserted against this set so a mismatch fails
+# an fp4_blockwise name from the fp8_blockwise one; the result is asserted against this set so a mismatch fails
 # loudly instead of launching a non-existent symbol.
 _FP4_COMBINE_KERNELS = frozenset(
     {
-        "EpCombineIntraNodeKernel_bf16_nop2p_fp4bwq",
-        "EpCombineIntraNodeKernel_bf16_nop2p_fp4bwq_noweight_block128_vec8",
-        "EpCombineIntraNodeKernel_bf16_nop2p_fp4bwq_noweight_block256_vec8",
-        "EpCombineIntraNodeKernel_bf16_nop2p_fp4bwq_noweight_block128_vec8_top9",
-        "EpCombineIntraNodeKernel_bf16_nop2p_fp4bwq_noweight_block256_vec8_top9",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp4_blockwise",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp4_blockwise_noweight_block128_vec8",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp4_blockwise_noweight_block256_vec8",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp4_blockwise_noweight_block128_vec8_top9",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp4_blockwise_noweight_block256_vec8_top9",
     }
 )
 
@@ -1530,36 +1530,36 @@ class EpDispatchCombineOp:
                 # It costs the weightless top8/top9 vec8 kernels below, which have no _p2p variant;
                 # they need worldSize > 4 to be eligible, so at EP4 there is nothing to give up.
                 # fp4 is excluded: the kernel's _cPullBwq gate refuses UseFp4Combine (packed 2-per-
-                # byte indexing is not what the tile fold assumes) and no _p2p_fp4bwq is registered.
+                # byte indexing is not what the tile fold assumes) and no _p2p_fp4_blockwise is registered.
                 _qpull = _comb_qpull() and (
                     quant_type != EpDispatchCombineQuantType.Fp4BlockwiseQuant
                 )
                 kernel_name = (
-                    "EpCombineIntraNodeKernel_bf16_p2p_fp8bwq"
+                    "EpCombineIntraNodeKernel_bf16_p2p_fp8_blockwise"
                     if _qpull
-                    else "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq"
+                    else "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise"
                 )
                 use_vec8_top8 = False
                 if base_vec8_top8_eligible and not _qpull:
                     if block_elems == 128:
                         kernel_name = (
-                            "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8_top9"
+                            "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block128_vec8_top9"
                             if top9
-                            else "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8"
+                            else "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block128_vec8"
                         )
                         use_vec8_top8 = True
                     elif block_elems == 256:
                         kernel_name = (
-                            "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8_top9"
+                            "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block256_vec8_top9"
                             if top9
-                            else "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8"
+                            else "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block256_vec8"
                         )
                         use_vec8_top8 = True
                 # Blockwise FP4: select the packed-FP4 kernel variants (identical launch config to
-                # the fp8bwq variants; only the in-kernel quant/dequant math differs). Assert the
-                # derived name is a registered fp4bwq symbol so a naming mismatch fails loudly.
+                # the fp8_blockwise variants; only the in-kernel quant/dequant math differs). Assert the
+                # derived name is a registered fp4_blockwise symbol so a naming mismatch fails loudly.
                 if quant_type == EpDispatchCombineQuantType.Fp4BlockwiseQuant:
-                    kernel_name = kernel_name.replace("_fp8bwq", "_fp4bwq")
+                    kernel_name = kernel_name.replace("_fp8_blockwise", "_fp4_blockwise")
                     assert (
                         kernel_name in _FP4_COMBINE_KERNELS
                     ), f"fp4_blockwise combine selected unregistered kernel '{kernel_name}'"
@@ -1624,8 +1624,8 @@ class EpDispatchCombineOp:
             elif quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
                 self._launch_multi(
                     [
-                        "EpCombineLowLatencyAsyncSendCopy_bf16_fp8bwq",
-                        "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8bwq",
+                        "EpCombineLowLatencyAsyncSendCopy_bf16_fp8_blockwise",
+                        "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8_blockwise",
                     ],
                     [mp_aligned, self.config.world_size],
                     [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
@@ -1725,7 +1725,7 @@ class EpDispatchCombineOp:
                 self._launch_multi(
                     [
                         "EpCombineLowLatencyAsyncRecvTransfer_bf16",
-                        "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bwq",
+                        "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8_blockwise",
                     ],
                     [self.config.world_size, mp_aligned],
                     [self._warp_size * actual_wpb, self._warp_size * actual_wpb],

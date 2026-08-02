@@ -17,12 +17,12 @@ WRAP_ALL_TYPES_BOOL3(EpCombineIntraNodeKernel, _p2p, true, false, false)
 WRAP_ALL_TYPES_BOOL3(EpCombineIntraNodeKernel, _nop2p, false, false, false)
 WRAP_ALL_TYPES_BOOL3(EpCombineIntraNodeKernel, _p2p_stdmoe, true, true, false)
 WRAP_BOOL3(EpCombineIntraNodeKernel, bf16_nop2p_fp8cast, hip_bfloat16, false, false, true)
-MORI_FP8_ANY(WRAP_BOOL4(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq, hip_bfloat16, false, false,
+MORI_FP8_ANY(WRAP_BOOL4(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise, hip_bfloat16, false, false,
                         false, true))
 // PULL blockwise. The point of quantising is to move half the bytes, and _nop2p spends that saving
 // and more: its send quantises straight into the PEER's staging slot, a per-lane cross-card scatter
 // that skips the TDM store the plain path gets, so fp8 ends up SLOWER than bf16 (measured at 64x8
-// EP4: bf16 push 417.5us against fp8bwq 3679.2us for half the payload). With UseP2PRead=true the
+// EP4: bf16 push 417.5us against fp8_blockwise 3679.2us for half the payload). With UseP2PRead=true the
 // same kernel instead quantises into its OWN combineInp (intranode.hpp:2237, taken because
 // useExternalInpBuffer stays true) and the consumers read peer fp8 + peer scales -- a path the
 // gather already implements in full (intranode.hpp:3509-3521). Only the symbol was missing.
@@ -34,30 +34,30 @@ MORI_FP8_ANY(WRAP_BOOL4(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq, hip_bfloat1
 // 1-byte TokT, measured 4748.6us -- worse than PUSH, because it turned a cross-card scatter of
 // writes into a cross-card scatter of reads and PUSH at least gathers from local staging. The win
 // is the bulk TDM move, not the direction of travel.
-MORI_FP8_ANY(WRAP_BOOL4(EpCombineIntraNodeKernel, bf16_p2p_fp8bwq, hip_bfloat16, true, false,
+MORI_FP8_ANY(WRAP_BOOL4(EpCombineIntraNodeKernel, bf16_p2p_fp8_blockwise, hip_bfloat16, true, false,
                         false, true))
-MORI_FP8_ANY(WRAP_BOOL6(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq_noweight_block128_vec8,
+MORI_FP8_ANY(WRAP_BOOL6(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise_noweight_block128_vec8,
                         hip_bfloat16, false, false, false, true, false, 128))
-MORI_FP8_ANY(WRAP_BOOL6(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq_noweight_block256_vec8,
+MORI_FP8_ANY(WRAP_BOOL6(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise_noweight_block256_vec8,
                         hip_bfloat16, false, false, false, true, false, 256))
 // AccumNum=9 variants: shared-expert fusion routes every token through 9 sources
 // (8 routed + 1 fused shared expert, topk 8->9). Same weightless vec8 path as top8.
-MORI_FP8_ANY(WRAP_BOOL7(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq_noweight_block128_vec8_top9,
+MORI_FP8_ANY(WRAP_BOOL7(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise_noweight_block128_vec8_top9,
                         hip_bfloat16, false, false, false, true, false, 128, 9))
-MORI_FP8_ANY(WRAP_BOOL7(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq_noweight_block256_vec8_top9,
+MORI_FP8_ANY(WRAP_BOOL7(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise_noweight_block256_vec8_top9,
                         hip_bfloat16, false, false, false, true, false, 256, 9))
 
-// Blockwise FP4 (E2M1) combine: same as the fp8bwq variants but with UseFp4Combine=true (8th
+// Blockwise FP4 (E2M1) combine: same as the fp8_blockwise variants but with UseFp4Combine=true (8th
 // template arg), transporting packed FP4 (0.5 byte/elem) over the shared blockwise staging path.
-MORI_FP8_ANY(WRAP_BOOL8(EpCombineIntraNodeKernel, bf16_nop2p_fp4bwq, hip_bfloat16, false, false,
+MORI_FP8_ANY(WRAP_BOOL8(EpCombineIntraNodeKernel, bf16_nop2p_fp4_blockwise, hip_bfloat16, false, false,
                         false, true, true, 0, 8, true))
-MORI_FP8_ANY(WRAP_BOOL8(EpCombineIntraNodeKernel, bf16_nop2p_fp4bwq_noweight_block128_vec8,
+MORI_FP8_ANY(WRAP_BOOL8(EpCombineIntraNodeKernel, bf16_nop2p_fp4_blockwise_noweight_block128_vec8,
                         hip_bfloat16, false, false, false, true, false, 128, 8, true))
-MORI_FP8_ANY(WRAP_BOOL8(EpCombineIntraNodeKernel, bf16_nop2p_fp4bwq_noweight_block256_vec8,
+MORI_FP8_ANY(WRAP_BOOL8(EpCombineIntraNodeKernel, bf16_nop2p_fp4_blockwise_noweight_block256_vec8,
                         hip_bfloat16, false, false, false, true, false, 256, 8, true))
-MORI_FP8_ANY(WRAP_BOOL8(EpCombineIntraNodeKernel, bf16_nop2p_fp4bwq_noweight_block128_vec8_top9,
+MORI_FP8_ANY(WRAP_BOOL8(EpCombineIntraNodeKernel, bf16_nop2p_fp4_blockwise_noweight_block128_vec8_top9,
                         hip_bfloat16, false, false, false, true, false, 128, 9, true))
-MORI_FP8_ANY(WRAP_BOOL8(EpCombineIntraNodeKernel, bf16_nop2p_fp4bwq_noweight_block256_vec8_top9,
+MORI_FP8_ANY(WRAP_BOOL8(EpCombineIntraNodeKernel, bf16_nop2p_fp4_blockwise_noweight_block256_vec8_top9,
                         hip_bfloat16, false, false, false, true, false, 256, 9, true))
 
 // Convert (used with ENABLE_STANDARD_MOE_ADAPT)

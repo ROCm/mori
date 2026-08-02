@@ -569,28 +569,29 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
         }
         // Pick the AccumNum=8/9 + VecBytes=8 specialization when (no weights, hidden_dim % 512 ==
         // 0, top-k in {8,9}, EP > 4) and block_elems matches a registered symbol. top-k==9 covers
-        // shared-expert fusion (8 routed + 1 fused shared). The FP4 variants ("fp4bwq") share the
-        // exact launch config as FP8 ("fp8bwq"); only the in-kernel codec differs. Keep in sync
-        // with the Python launch path in dispatch_combine.py.
+        // shared-expert fusion (8 routed + 1 fused shared). The FP4 variants share the exact launch
+        // config as FP8; only the in-kernel codec differs. Keep in sync with the Python launch path
+        // in dispatch_combine.py -- except on transport, where they already differ: that path picks
+        // PULL on gfx125x while every name built here is _nop2p, i.e. PUSH.
         const int block_elems = (args.config.hiddenDim + fp8ScaleDim - 1) / fp8ScaleDim;
         const bool baseVec8Top8Eligible =
             !hasWeights && (args.config.hiddenDim % 512 == 0) &&
             (args.config.numExpertPerToken == 8 || args.config.numExpertPerToken == 9) &&
             args.config.worldSize > 4;
         const bool top9 = (args.config.numExpertPerToken == 9);
-        const std::string bwq = isFp4 ? "fp4bwq" : "fp8bwq";
+        const std::string codec = isFp4 ? "fp4_blockwise" : "fp8_blockwise";
         const std::string prefix = "EpCombineIntraNodeKernel_bf16_nop2p_";
-        std::string kernel_name = prefix + bwq;
+        std::string kernel_name = prefix + codec;
         bool useVec8Top8 = false;
         if (baseVec8Top8Eligible && (block_elems == 128 || block_elems == 256)) {
-          kernel_name = prefix + bwq + "_noweight_block" + std::to_string(block_elems) + "_vec8" +
+          kernel_name = prefix + codec + "_noweight_block" + std::to_string(block_elems) + "_vec8" +
                         (top9 ? "_top9" : "");
           useVec8Top8 = true;
         }
-        int fp8bwq_smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
+        int fp8_blockwise_smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
                                              /*use_scale_ptrs=*/true,
                                              /*use_weight_ptrs=*/!useVec8Top8);
-        reg.Launch(kernel_name, bn, block_x, fp8bwq_smem, stream, &args, args_size);
+        reg.Launch(kernel_name, bn, block_x, fp8_blockwise_smem, stream, &args, args_size);
       } else if (args.config.useExternalInpBuffer) {
         reg.Launch(std::string("EpCombineIntraNodeKernel_") + sfx + "_nop2p", bn, block_x, smem,
                    stream, &args, args_size);
