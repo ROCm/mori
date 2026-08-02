@@ -981,7 +981,28 @@ class EpDispatchCombineOp:
             # reservation stays at the pointer arrays.
         return base
 
+    _launch_traced = set()
+
     def _launch(self, func_name, grid, block, shared_mem, stream, args_ptr):
+        # MORI_EP_TRACE_LAUNCH=1 prints each distinct (symbol, geometry, LDS) once. Which symbol a
+        # config lands on, and how much LDS it asked for, decide which in-kernel transport is
+        # eligible -- the tile paths all carry a runtime budget check and fall back silently when
+        # it fails -- and reading that off the source means tracking arch defaults through three
+        # files. One line of output settles it instead.
+        if os.environ.get("MORI_EP_TRACE_LAUNCH", "").strip().lower() in (
+            "1",
+            "true",
+            "on",
+            "yes",
+        ):
+            key = (func_name, grid[0], block[0], shared_mem)
+            if key not in EpDispatchCombineOp._launch_traced:
+                EpDispatchCombineOp._launch_traced.add(key)
+                print(
+                    f"[EPLAUNCH] {func_name} grid={grid[0]} block={block[0]} "
+                    f"lds={shared_mem}",
+                    flush=True,
+                )
         func = self._get_func(func_name)
         func.launch_struct(grid, block, shared_mem, stream, args_ptr)
 

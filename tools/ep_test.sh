@@ -127,6 +127,9 @@ run() { # $1=tag  $2=gates  $3=1 means run WITH the correctness check
     "$1" "$rc" "$(avg Combine lat)" "$(avg Combine bw)" "$(avg Dispatch lat)" "$(avg Dispatch bw)"
   grep -oE "AssertionError|Memory access fault.*|HSA_STATUS[A-Z_]*|LDS.*exceed.*|out of memory|invalid configuration" "$log" | head -2 | sed 's/^/       /'
   grep -oE "\[BENCHW\].*|Weight mismatch for token [0-9]+" "$log" | head -3 | sed 's/^/       /'
+  # MORI_EP_TRACE_LAUNCH=1 only: which symbol and how much LDS this spec actually launched. Off
+  # unless asked for, so this grep finds nothing on a normal run.
+  grep -oE "\[EPLAUNCH\].*" "$log" | sort -u | head -4 | sed 's/^/       /'
 }
 
 echo "## geometry comb <cbn>x${CWPB}  disp ${DBN}x${DWPB}  WS=$WS  ZC=$ZC  QT=$QT  BASE='$BASE'"
