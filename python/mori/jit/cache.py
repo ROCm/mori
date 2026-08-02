@@ -165,13 +165,20 @@ def get_cache_dir(
     if _lb.isdigit() and int(_lb) > 0:
         pipe_suffix += f"_lb{int(_lb)}"
     # Combine's [CSPLIT] bucket print and its deletion diagnostics (all but TIMING are wrong on
-    # purpose). NOPUSH/PUSHONLY/NOWEIGHT each delete a different part of the push path, so each is its
-    # own binary; leaving them out of the key is what made the earlier deletion A/B compare a build
-    # with itself.
+    # purpose). Each deletes a different part of the kernel, so each is its own binary; leaving one
+    # out of the key is what made the earlier deletion A/B compare a build with itself.
+    #
+    # DERIVED from the emitter rather than restated, because restating it failed exactly once and
+    # silently. MORI_COMB_NOQUANT emitted a -D that this list did not name, so a NOQUANT run reused
+    # the full build's .hsaco and reported the full build's time -- which read as "deleting the
+    # local quantise pass costs 0us", i.e. as a fact about the kernel rather than about the cache.
+    # It survived because 0 is a plausible-looking number. Two more gates added in the same session
+    # (RELFENCE, QNOSC) had the same hole and produced two more null results. A second list cannot
+    # be kept in step by care; the only fix that holds is not having one.
+    from .core import _comb_diag_defines
+
     comb_diag_suffix = "".join(
-        f"_{n.lower()}"
-        for n in ("TIMING", "NOREDUCE", "NOPUSH", "NOGATHER", "PUSHONLY", "NOWEIGHT", "NOROUTE", "SPREAD", "RUNRR", "RUNRRQ", "DUMPCNT", "BARRIER2", "BARNOFENCE", "BARFAN", "NOBAR")
-        if os.environ.get(f"MORI_COMB_{n}", "").lower() in ("1", "true", "on", "yes")
+        "_" + d.removeprefix("-DMORI_COMB_").lower() for d in _comb_diag_defines()
     )
     # Deletion diagnostics (wrong results on purpose) and the meta shape histogram.
     diag_suffix = "".join(
@@ -182,9 +189,19 @@ def get_cache_dir(
     # -DMORI_DISP_PAY2D=D0 reshapes the payload TDM descriptor, so D0 is part of the key.
     _pay2d = os.environ.get("MORI_DISP_PAY2D", "").strip()
     pay2d_suffix = f"_pay2d{int(_pay2d)}" if _pay2d.isdigit() and int(_pay2d) > 1 else ""
+    # The readable suffixes above are worth keeping -- a cache directory that names the gates it was
+    # built with has caught real mistakes -- but they are a hand-maintained restatement of what the
+    # compiler is actually given, and a restatement can omit a name. This closes that for good: the
+    # key also carries a hash of the REAL -D list, so a gate missing from every suffix above still
+    # lands in its own directory. The suffixes stay for reading; this decides.
+    from .core import _tunable_defines
+
+    flag_hash = hashlib.sha256(
+        "|".join(sorted(_tunable_defines())).encode()
+    ).hexdigest()[:8]
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{timing_suffix}{fastdedup_suffix}{combtdm_suffix}{barsleep_suffix}{barspread_suffix}{pipe_suffix}{comb_diag_suffix}{diag_suffix}{pay2d_suffix}{cntstep_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{timing_suffix}{fastdedup_suffix}{combtdm_suffix}{barsleep_suffix}{barspread_suffix}{pipe_suffix}{comb_diag_suffix}{diag_suffix}{pay2d_suffix}{cntstep_suffix}_f{flag_hash}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)

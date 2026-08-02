@@ -867,6 +867,29 @@ def _build_bitcode(
     print(f"[mori-jit] Cached: {output}")
 
 
+def _tunable_defines() -> list[str]:
+    """Every -D whose value depends on the environment or the target arch.
+
+    One list, used both to compile and (through cache.get_cache_dir) to key the result. That is the
+    point of it existing: these two used to be written out separately, and the separate copy in
+    cache.py was missing MORI_COMB_NOQUANT. A NOQUANT run therefore compiled nothing, loaded the
+    full build's .hsaco and reported the full build's time -- which reads as "deleting the local
+    quantise pass costs 0us" and is a statement about the cache, not the kernel. Two gates added
+    later had the same hole. Anything constant across runs (platform, NIC, arch fp traits) stays
+    out; it cannot make two runs differ.
+    """
+    return [
+        *_comb_tdm_defines(),
+        *_comb_barsleep_defines(),
+        *_comb_barspread_defines(),
+        *_comb_pipe_defines(),
+        *_comb_diag_defines(),
+        *_disp_timing_defines(),
+        *_disp_nophase_defines(),
+        *_disp_metadiag_defines(),
+    ]
+
+
 def _hipcc_genco(
     cfg: BuildConfig,
     source: Path,
@@ -887,14 +910,7 @@ def _hipcc_genco(
         *_ccqe_defines(),
         *_profiler_defines(),
         *_ocp_fp_defines(cfg.arch),
-        *_comb_tdm_defines(),
-        *_comb_barsleep_defines(),
-        *_comb_barspread_defines(),
-        *_comb_pipe_defines(),
-        *_comb_diag_defines(),
-        *_disp_timing_defines(),
-        *_disp_nophase_defines(),
-        *_disp_metadiag_defines(),
+        *_tunable_defines(),
     ]
 
     for d in include_dirs:
