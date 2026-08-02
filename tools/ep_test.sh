@@ -33,6 +33,22 @@
 set -uo pipefail
 SRC="${SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$SRC" || exit 1
+
+# ONE of these at a time on a node, enforced rather than remembered. Two overlapping runs put two
+# four-rank jobs on the same four GPUs; each spins on its own cross-device barrier, neither can be
+# scheduled to let the other finish, every rank lands in D state where SIGKILL does not reach it,
+# and the recovery is docker stop plus a per-device rocm-smi --gpureset. That happened because a
+# remote `timeout` killed the ssh-side bash and left THIS loop running inside the container, and
+# the next script started anyway. The per-run pkill below cannot help: by then both loops are live
+# and they take turns killing each other's bench. It cost two hours and a node reboot.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>/tmp/ep_test.lock
+  if ! flock -n 9; then
+    echo "ABORT: another ep_test.sh holds /tmp/ep_test.lock (pid $(cat /tmp/ep_test.pid 2>/dev/null))"
+    exit 1
+  fi
+  echo $$ > /tmp/ep_test.pid
+fi
 CBN="${CBN:-64}"        # single value; use CBNS to sweep
 CBNS="${CBNS:-}"        # non-empty: run every spec once per block count (diagnostic; default is 64x8)
 CWPB="${CWPB:-8}"
