@@ -570,7 +570,24 @@ def _comb_pipe_defines() -> list[str]:
     _lb = os.environ.get("MORI_COMB_LB", "").strip()
     if _lb.isdigit() and int(_lb) > 0:
         out.append(f"-DMORI_COMB_LB={int(_lb)}")
+    out.append(f"-DMORI_COMB_QSTGU={_comb_qstgu()}")
     return out
+
+
+def _comb_qstgu() -> int:
+    """Scale blocks the blockwise quantise/stage pass keeps in flight per subwarp.
+
+    This is the pass that turns the caller's bf16 tensor into the fp8 + scales the peers will pull,
+    and it runs ONLY under blockwise quant with a caller-owned input buffer -- bf16 zero-copy has no
+    analogue of it. As written it was one dependent load per scale block, and MEASURED at 64x8 EP4
+    that is 778us of a 1409.5us combine (full 1409.5, MORI_COMB_NOQUANT 631.1), against 15.8us for
+    the launch and the cross-device barrier together. See WarpQuantizeBf16ToFp8BlockwiseVec.
+
+    1 is the old behaviour. Correctness-preserving at every value: only the order of the loads
+    changes, not which bytes are read, reduced or stored.
+    """
+    val = os.environ.get("MORI_COMB_QSTGU", "").strip()
+    return int(val) if val.isdigit() and int(val) >= 1 else 4
 
 
 def _comb_diag_defines() -> list[str]:

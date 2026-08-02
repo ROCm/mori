@@ -1171,6 +1171,12 @@ struct Bf16Vec<16> {
   }
 };
 
+// How many scale blocks this warp keeps in flight in the exact-fit path below. 1 restores the
+// old one-block-at-a-time chain. Overridden by -DMORI_COMB_QSTGU=N from python/mori/jit/core.py.
+#ifndef MORI_COMB_QSTGU
+#define MORI_COMB_QSTGU 4
+#endif
+
 template <int SubwarpSize, int InVecBytes, int MaxCacheIters, typename Fp8T>
 __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
     Fp8T* __restrict__ dstToken, float* __restrict__ dstScales,
@@ -1194,8 +1200,64 @@ __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
   const int maxIters = (blockElems + kStrideElems - 1) / kStrideElems;
 
   bool subwarpScaled = false;
+  // Block 0's scale, kept on lane 0 by the exact-fit path so the sign flip at the end of the
+  // function does not have to read it back. dstScales lives in hipDeviceMallocUncached memory
+  // (dispatch_combine.cpp), so that read-back is a full memory round trip per token for one float.
+  float sb0Scale = 0.0f;
+  bool sb0Cached = false;
 
-  for (int sbBase = 0; sbBase < scaleDim; sbBase += kSubwarpsPerWarp) {
+  int sbStart = 0;
+  // EXACT-FIT PATH: one subwarp covers one scale block in one vector, and every block is full.
+  // True for the shipping shape -- hidden 7168, scaleDim 56, blockElems 128 == SubwarpSize(16) *
+  // kVecElems(8) -- and the general loop below still handles everything else.
+  //
+  // The general loop is one dependent chain per block: load 16 B, subwarp-max it, broadcast the
+  // scale, convert, store, and only then issue the next block's load. Nothing covers the load
+  // latency. Occupancy cannot cover it either -- the combine kernel reserves 116 KB of LDS for the
+  // gather tiles, so a CU holds one 8-warp block and a SIMD holds two waves. MEASURED at 64x8 EP4
+  // fp8_blockwise (full 1409.5us, MORI_COMB_NOQUANT 631.1us, so this pass alone is 778us): 14813
+  // tokens over 512 warps is 29 tokens each, 28 blocks per token, 812 chained iterations, which is
+  // ~1900 cycles apiece -- a load latency, not work.
+  //
+  // So issue MORI_COMB_QSTGU blocks' loads before reducing any of them. The reduce, the divide and
+  // the store are unchanged and still happen per block; only the order changes, so the bytes and
+  // the arithmetic are identical to the loop below and this is not an approximation of it.
+  if (maxIters == 1 && blockElems == kStrideElems && blockElems * scaleDim == hiddenDim) {
+    constexpr int kU = (MORI_COMB_QSTGU) < 1 ? 1 : (MORI_COMB_QSTGU);
+    constexpr int kStep = kSubwarpsPerWarp * kU;
+    for (; sbStart + kStep <= scaleDim; sbStart += kStep) {
+      typename Bf16Vec<InVecBytes>::LoadT cached[kU];
+      int bases[kU];
+#pragma unroll
+      for (int u = 0; u < kU; ++u) {
+        bases[u] = (sbStart + u * kSubwarpsPerWarp + subWarpId) * blockElems + subLaneId * kVecElems;
+        cached[u] = load<InVecBytes>(srcToken + bases[u]);
+      }
+#pragma unroll
+      for (int u = 0; u < kU; ++u) {
+        const int sb = sbStart + u * kSubwarpsPerWarp + subWarpId;
+        uint32_t maxBits = SubwarpReduceMaxU32<SubwarpSize>(Bf16Vec<InVecBytes>::MaxAbsBits(cached[u]));
+        maxBits = static_cast<uint32_t>(__shfl(static_cast<int>(maxBits), 0, SubwarpSize));
+        const float maxAbs = Bf16BitsToF32(static_cast<uint16_t>(maxBits));
+        const bool sbScaled = (maxAbs > fp8Max);
+        subwarpScaled = subwarpScaled || sbScaled;
+        float invScale = 1.0f;
+        if (subLaneId == 0) {
+          const float s = sbScaled ? (maxAbs * invFp8Max) : 1.0f;
+          dstScales[sb] = s;
+          if (sb == 0) {
+            sb0Scale = s;
+            sb0Cached = true;
+          }
+          if (sbScaled) invScale = fp8Max / maxAbs;
+        }
+        invScale = __shfl(invScale, 0, SubwarpSize);
+        Bf16Vec<InVecBytes>::template QuantizeStore<Fp8T>(dstBytes, bases[u], cached[u], invScale);
+      }
+    }
+  }
+
+  for (int sbBase = sbStart; sbBase < scaleDim; sbBase += kSubwarpsPerWarp) {
     const int sb = sbBase + subWarpId;
     if (sb >= scaleDim) continue;
 
@@ -1328,7 +1390,7 @@ __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
   }
 
   const int anyScaled = __any(static_cast<int>(subwarpScaled));
-  if (laneId == 0 && anyScaled) dstScales[0] = -dstScales[0];
+  if (laneId == 0 && anyScaled) dstScales[0] = -(sb0Cached ? sb0Scale : dstScales[0]);
 }
 
 }  // namespace detail
