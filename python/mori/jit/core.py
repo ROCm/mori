@@ -573,7 +573,30 @@ def _comb_pipe_defines() -> list[str]:
     out.append(f"-DMORI_COMB_QSTGU={_comb_qstgu()}")
     out.append(f"-DMORI_COMB_QWIDE={_comb_qwide()}")
     out.append(f"-DMORI_COMB_RELFENCE={_comb_relfence()}")
+    out.append(f"-DMORI_COMB_QSCW={_comb_qscw()}")
     return out
+
+
+def _comb_qscw() -> int:
+    """How the blockwise quantise pass writes the per-block scales.
+
+    The scales are 56 floats per token against 7168 bytes of fp8, so 3% of the bytes -- but not 3%
+    of the stores. In the exact-fit path one subwarp owns one scale block, so the scale write is
+    one 4-byte store from one lane in each of 16, i.e. 8 live bytes per store instruction, and
+    there are as many of those instructions per token as there are 256-byte fp8 stores. dstScales
+    is hipDeviceMallocUncached, where a store instruction costs a transaction whether it carries 8
+    bytes or 256.
+
+        0  one store per subwarp per block. What the pass has always done.
+        1  gather each group of scales into consecutive lanes with __shfl and store the group in
+           one instruction. Same bytes to the same addresses, and no LDS: the shuffle pattern is
+           fixed per unrolled step, so the register indices stay static.
+        2  DIAGNOSTIC, WRONG RESULTS: do not write the scales at all. This is the upper bound on
+           what 1 could ever be worth, and it is the row to read first -- if 2 buys nothing then 1
+           cannot either, and the idea is dead without building it.
+    """
+    val = os.environ.get("MORI_COMB_QSCW", "").strip()
+    return int(val) if val in ("0", "1", "2") else 0
 
 
 def _comb_relfence() -> int:
