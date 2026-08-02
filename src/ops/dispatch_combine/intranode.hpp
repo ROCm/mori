@@ -3554,7 +3554,13 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
           if constexpr (UseFp8BlockwiseQuant) {
             float* scalePtr = args.shmemInpScalesMemObj->template GetAs<float*>(destPe) +
                               destLocalTokId * args.fp8BlockwiseCombineScaleDim;
+#if defined(MORI_COMB_QNOSC)
+            // See the QNOSC note at the fold. This deref is a peer read too -- one per (token,
+            // expert) rather than one per (vector, source) -- so it goes with them.
+            srcScalePtrs[j] = scalePtr;
+#else
             srcScalePtrs[j] = (scalePtr[0] < 0.0f) ? scalePtr : nullptr;
+#endif
           }
         } else {
           srcPtrs[j] = reinterpret_cast<TokT*>(
@@ -3846,6 +3852,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
               for (int _j = 0; _j < _nSrc; ++_j) {
                 if (srcPtrs[_j] == nullptr) continue;
                 float _hScale = 1.0f;
+#if !defined(MORI_COMB_QNOSC)
                 if constexpr (_cPullBwq) {
                   const float* _sp = srcScalePtrs[_j];
                   if (_sp != nullptr) {
@@ -3853,6 +3860,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                     if (_hSb == 0 && _hScale < 0.0f) _hScale = -_hScale;
                   }
                 }
+#endif
                 const float _v = (float)(srcPtrs[_j][_off + _e]);
                 _acc += _cPullBwq ? (_v * _hScale) : _v;
               }
@@ -3937,6 +3945,19 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             for (int _j = 0; _j < _nRed; ++_j) {
               if (_CROW_DEAD(_j)) continue;
               float _cScale = 1.0f;
+              // WRONG RESULTS ON PURPOSE under MORI_COMB_QNOSC, same family as NOREDUCE/NOPUSH:
+              // fold the fp8 bytes with a scale of 1 and leave EVERYTHING else -- the transport,
+              // the tiles, the arithmetic -- byte for byte. full minus this is the price of the
+              // scale reads alone.
+              //
+              // Why they are the suspect: srcScalePtrs[_j] is a PEER pointer (:3542) into
+              // shmemInpScalesMemObj, which is hipDeviceMallocUncached (dispatch_combine.cpp:378).
+              // So this is an uncached cross-card load, issued once per source per vector inside
+              // the innermost fold -- 28 iterations x up to 8 sources per token at hidden 7168 --
+              // and there is nothing to cache it in. The token bytes next to it do not work this
+              // way at all: TDM already bulk-loaded them into LDS above. bf16 has no analogue of
+              // this load, which is the shape of an 8x gap that half the bytes cannot explain.
+#if !defined(MORI_COMB_QNOSC)
               if constexpr (_cPullBwq) {
                 // Same sentinel the scalar dequant helpers use: the producer negates entry 0 to mark
                 // "this token really was scaled", so entry 0 has to be undone before it is applied.
@@ -3946,6 +3967,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                   if (_cSb == 0 && _cScale < 0.0f) _cScale = -_cScale;
                 }
               }
+#endif
               // Dereferenced directly rather than through core::load<16>: that takes a const void*,
               // which addrspacecasts the LDS pointer to generic and leaves it to InferAddressSpaces
               // to recover ds_read_b128 instead of a flat_load. Keeping the typed addrspace(3)
@@ -3975,6 +3997,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             for (int _j = 0; _j < _nRed; ++_j) {
               if (_CROW_DEAD(_j)) continue;
               float _tScale = 1.0f;
+#if !defined(MORI_COMB_QNOSC)
               if constexpr (_cPullBwq) {
                 const float* _sp = srcScalePtrs[_j];
                 if (_sp != nullptr) {
@@ -3982,6 +4005,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                   if (_tSb == 0 && _tScale < 0.0f) _tScale = -_tScale;
                 }
               }
+#endif
               const float _v = (float)(_cPullTiles[(size_t)_j * _rowStride + _e]);
               _acc += _cPullBwq ? (_v * _tScale) : _v;
             }

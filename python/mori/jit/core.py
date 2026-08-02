@@ -658,6 +658,7 @@ def _comb_diag_defines() -> list[str]:
             "MORI_COMB_NOROUTE",
             "MORI_COMB_DUMPCNT",
             "MORI_COMB_RELFENCE",
+            "MORI_COMB_QNOSC",
         )
         if os.environ.get(name, "").strip().lower() in ("1", "true", "on", "yes")
     ]
