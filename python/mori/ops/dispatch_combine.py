@@ -227,27 +227,44 @@ def _comb_env_int(name: str, default: int) -> int:
     return default
 
 
-def _comb_qpre() -> bool:
+def _comb_qpre_mode() -> str:
     """Whether the blockwise quantise pass runs as its OWN kernel before the combine kernel.
 
     This is the blockwise counterpart of _comb_pull_mode()="host", and it is here for the same
     reason: staging and gathering want different launch widths, and one fused kernel can only have
-    one. The gather is bound by peer reads in flight and by the LDS its tiles need, so it stops
-    improving past 64x8; the quantise is a pure local stream over the caller's bf16 and wants every
-    CU on the card. MEASURED 64x8 EP4 fp8_blockwise, full minus MORI_COMB_NOQUANT: the inline pass
-    is 408.2us at 64 blocks and 163.8 at 256, while the same bytes moved by hipMemcpyDtoD run at
-    6.3 TB/s, i.e. 50us. Splitting the launch is what lets each half have its own width.
+    one. The gather is bound by peer reads in flight and by the LDS its tiles need; the quantise is
+    a pure local stream over the caller's bf16 with no cross-card edge in it at all. Fusing them
+    made one width serve both. MEASURED EP4 fp8_blockwise, check armed, rc=0 on every row:
+
+        inline, combine 64x8                        1011.3us
+        split, pre 256x8, combine 64x8               856.4
+        split, pre 256x8, combine 256x8              428.2
+        split, pre 256x8, combine 256x16             367.6
+        bf16 zero-copy PULL 64x8 (the bar)           169.2   / 1254.7 GB/s
 
     Only the PULL blockwise path can use it: PUSH quantises straight into the peer's slot, which is
-    the transport itself and not a separable pass. MORI_COMB_QPRE overrides; MORI_COMB_QPRE_BN and
-    MORI_COMB_QPRE_WPB set the pre-pass geometry (default: 4 blocks per CU, 8 warps each).
+    the transport itself and not a separable pass.
+
+      "on"  / 1  -- launch it.
+      "off" / 0  -- keep the pass inside the combine kernel.
+      "noq"      -- DIAGNOSTIC, WRONG RESULTS: take the split path but never launch the pre-kernel,
+                    so the combine kernel is the gather and nothing else. This is the deletion
+                    pricing for the pass, and it exists as its own mode because the -D that used to
+                    do that job (MORI_COMB_NOQUANT) changes the build, and a new -D set costs a
+                    ~890s JIT rebuild on this node. Read in Python, so it is free.
+
+    MORI_COMB_QPRE_BN and MORI_COMB_QPRE_WPB set the pre-pass geometry (default: 4 blocks per CU,
+    8 warps each). MEASURED at combine 64x8, pre-grid alone moving: 1024x8 1143.5us, 512x8 940.7,
+    128x8 876.0, 512x4 860.4, 256x8 856.4.
     """
     val = os.environ.get("MORI_COMB_QPRE", "").strip().lower()
     if val in ("1", "true", "on", "yes"):
-        return True
+        return "on"
     if val in ("0", "false", "no", "off"):
-        return False
-    return _is_gfx125x()
+        return "off"
+    if val == "noq":
+        return "noq"
+    return "on" if _is_gfx125x() else "off"
 
 
 _BLOCKWISE_COMBINE_QUANT_TYPES = (
@@ -1516,8 +1533,9 @@ class EpDispatchCombineOp:
         # Blockwise PULL: run the quantise pass as its own kernel and tell the combine kernel the
         # input buffer is no longer external, which is the one flag its staging arm reads. Decided
         # here rather than at the launch below because the flag has to reach build_args.
+        qpre_mode = _comb_qpre_mode()
         qpre = (
-            _comb_qpre()
+            qpre_mode != "off"
             and actual_use_ext
             and self.config.kernel_type.value
             == EpDispatchCombineKernelType.IntraNode.value
@@ -1716,8 +1734,13 @@ class EpDispatchCombineOp:
                 )
                 # MORI_COMB_NOQUANT deletes the quantise pass to price it, and the pass moved out
                 # of the kernel the -D lives in, so honour it here or deletion pricing silently
-                # stops deleting anything. WRONG RESULTS, same as it always was.
-                if qpre and not os.environ.get("MORI_COMB_NOQUANT", "").strip():
+                # stops deleting anything. MORI_COMB_QPRE=noq is the same deletion without the
+                # rebuild. WRONG RESULTS either way, same as it always was.
+                if (
+                    qpre
+                    and qpre_mode != "noq"
+                    and not os.environ.get("MORI_COMB_NOQUANT", "").strip()
+                ):
                     # Its own width, and deliberately not the combine geometry: this pass has no
                     # cross-card edge and no LDS tiles, so the only thing it wants is enough waves
                     # to hide the loads. Grid-strided over a token count that only the device
