@@ -183,16 +183,24 @@ def _comb_pull_mode() -> str:
 
       "host"   -- a d2d copy on the caller's stream before launch. The kernel then runs the
                   ordinary zero-copy _p2p path unchanged, so correctness is inherited from the
-                  path that already passes.
-      "kernel" -- the kernel stages the token itself and then reads peers. Cheaper in principle
-                  (the copy can overlap the gather) but it puts a cross-card visibility edge in
-                  the middle of the kernel that the zero-copy path does not have.
+                  path that already passes. MEASURED 64x8 EP4 bf16, check armed, rc=0:
+                  236.7us / 896.9 GB/s against PUSH 318.8us / 666.0 GB/s. The 67.7us over the
+                  169.0us zero-copy reference is the copy, 424 MB of local traffic at 6.3 TB/s.
+      "kernel" -- KNOWN WRONG, kept only to name what was tried. The kernel stages the token
+                  itself and then reads peers, which is what blockwise does under QPULL, and it
+                  fails the correctness check at EP4 (rc=1, max diff 3.75 against tol 0.159 on
+                  3 of 4 ranks). Two candidate causes are already excluded by measurement rather
+                  than argument: MORI_COMB_RELFENCE (a per-block release fence) does not fix it,
+                  and MORI_COMB_FASTPATH=0 does not either, so it is neither cross-card
+                  visibility nor the QUAD/TDM gather.
+      "both"   -- DIAGNOSTIC: host copy AND the in-kernel staging, which rewrites the same bytes.
+                  Isolates the staging loop, the one thing that differs between host and kernel.
       "off"    -- keep PUSH.
 
     Default is set by measurement in _comb_pull_default(); MORI_COMB_PULL overrides.
     """
     val = os.environ.get("MORI_COMB_PULL", "").strip().lower()
-    if val in ("host", "kernel", "off"):
+    if val in ("host", "kernel", "both", "off"):
         return val
     if val in ("1", "true", "on", "yes"):
         return "host"
@@ -202,8 +210,14 @@ def _comb_pull_mode() -> str:
 
 
 def _comb_pull_default() -> str:
-    """Transport for a caller-owned combine input when MORI_COMB_PULL is unset."""
-    return "off"
+    """Transport for a caller-owned combine input when MORI_COMB_PULL is unset.
+
+    gfx125x stages and pulls; everywhere else keeps PUSH, since the win is measured on the TDM
+    gather and nothing says it carries to an arch without one. Owning your input buffer used to
+    cost 25.8% of combine (318.8us against 236.7us at 64x8 EP4) for a property of the allocation
+    rather than anything about the data.
+    """
+    return "host" if _is_gfx125x() else "off"
 
 
 _BLOCKWISE_COMBINE_QUANT_TYPES = (
@@ -1431,15 +1445,18 @@ class EpDispatchCombineOp:
             == EpDispatchCombineQuantType.None_
         ):
             _pm = _comb_pull_mode()
-            if _pm == "host":
+            if _pm in ("host", "both"):
                 reg = self.get_registered_combine_input_buffer(input.dtype, hidden_dim)
                 reg[: input.size(0)].copy_(input)
-                # From here on this call is indistinguishable from a zero-copy one, which is the
-                # point: no kernel, no argument and no tile size differs from the path that passes.
-                use_external_inp_buf = 0
-                actual_use_ext = 0
-                is_zero_copy = True
                 force_pull = True
+                if _pm == "host":
+                    # From here on this call is indistinguishable from a zero-copy one, which is
+                    # the point: no kernel, no argument and no tile size differs from the path
+                    # that already passes. "both" deliberately leaves the flag set instead, so
+                    # the kernel also stages, and the only live difference is that loop.
+                    use_external_inp_buf = 0
+                    actual_use_ext = 0
+                    is_zero_copy = True
             elif _pm == "kernel":
                 # The buffer flag stays set -- that is what makes the kernel run its own staging
                 # arm -- while the kernel compiled is the PULL one, so the transport follows the

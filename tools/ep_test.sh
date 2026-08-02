@@ -39,7 +39,11 @@ CWPB="${CWPB:-8}"
 DBN="${DBN:-64}"        # SAME = follow the combine block count being swept (per-row geometry)
 DWPB="${DWPB:-8}"       # SAME = follow CWPB
 WS="${WS:-4}"           # peer count; 2 is the case where round-robin has the least imbalance to recover
-ZC="${ZC:-0}"           # 0 = PUSH (_nop2p), 1 = PULL (_p2p, cross-card read)
+ZC="${ZC:-0}"           # who owns the combine input buffer: 0 = the caller, 1 = mori.
+                        # It stopped meaning "PUSH or PULL" once gfx125x started staging a
+                        # caller-owned buffer into the registered one and pulling anyway
+                        # (236.7us / 896.9 GB/s against the old 318.8 / 666.0). MORI_COMB_PULL=off
+                        # is how you get the PUSH transport back for a comparison.
 QT="${QT:-none}"        # none / fp8_blockwise / fp8_direct_cast; blockwise only pairs with ZC=0
 # BARSLEEP is deliberately NOT set here. It used to default to 127 in this script, which silently
 # overrode the library's own default of 15 (jit/core.py) and cost 2.2us on every PULL reading:
