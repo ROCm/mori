@@ -172,23 +172,6 @@ def _comb_qpull() -> bool:
     return _is_gfx125x()
 
 
-def _comb_pull_plain() -> bool:
-    """MORI_COMB_PULL=1: run NON-quantised combine over the PULL gather even when the caller owns
-    the input buffer.
-
-    The same decoupling blockwise already relies on. PULL still honours an external input buffer:
-    the kernel stages it into its own symmetric combineInp first (the WarpCopy arm under UseP2PRead
-    in intranode.hpp) and the peers bulk-read that, instead of the producer scattering writes into
-    peer slots. MEASURED 64x8 EP4 bf16, check armed, rc=0 on both: PUSH 318.3us / 667.0 GB/s
-    against zero-copy PULL 168.9us / 1256.7 GB/s, while dispatch on the same runs reads 1221.8.
-
-    Off by default because that 168.9us is a ZERO-COPY figure that never runs the staging copy this
-    option adds, so it bounds the result rather than predicting it. Blockwise pays the same staging
-    and still wins 2.58x, which is why this is worth measuring instead of assuming either way.
-    """
-    return os.environ.get("MORI_COMB_PULL", "").strip().lower() in ("1", "true", "on", "yes")
-
-
 _BLOCKWISE_COMBINE_QUANT_TYPES = (
     EpDispatchCombineQuantType.Fp8BlockwiseQuant,
     EpDispatchCombineQuantType.Fp4BlockwiseQuant,
@@ -838,14 +821,8 @@ class EpDispatchCombineOp:
             world = int(self.config.world_size)
             # _qpull_bwq keeps use_external_inp_buf True (that is what makes the kernel quantise
             # locally) while compiling UseP2PRead=true, so the transport here follows the KERNEL,
-            # not the buffer flag. _pull_plain is the same disagreement without the quantise, and
-            # both have to be reflected here: size for PUSH while the kernel runs PULL and the tile
-            # layout is off by a whole tile, which is a wrong answer rather than a slow one.
-            _pull_plain = (
-                _comb_pull_plain()
-                and quant_type not in _BLOCKWISE_COMBINE_QUANT_TYPES
-            )
-            if self.config.use_external_inp_buf and not _qpull_bwq and not _pull_plain:
+            # not the buffer flag. This is the one case where the two disagree.
+            if self.config.use_external_inp_buf and not _qpull_bwq:
                 # PUSH never splits a token and never holds more than one: one warp sends one whole
                 # token to its one destination PE, so the tile is exactly hiddenDim elements and
                 # MORI_COMB_TDM only gates TDM on/off there.
@@ -1612,12 +1589,8 @@ class EpDispatchCombineOp:
                         args_ptr,
                     )
                 else:
-                    # Transport follows the kernel, not the buffer flag. PULL honours an external
-                    # input buffer by staging it into combineInp before the peers read it, so this
-                    # stays a transport choice rather than a change of API contract.
-                    _tr = "_p2p" if _comb_pull_plain() else "_nop2p"
                     self._launch(
-                        f"EpCombineIntraNodeKernel_{sfx}{_tr}",
+                        f"EpCombineIntraNodeKernel_{sfx}_nop2p",
                         grid,
                         block,
                         shared_mem,
