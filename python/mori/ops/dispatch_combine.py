@@ -240,7 +240,7 @@ def _comb_qpre() -> bool:
 
     Only the PULL blockwise path can use it: PUSH quantises straight into the peer's slot, which is
     the transport itself and not a separable pass. MORI_COMB_QPRE overrides; MORI_COMB_QPRE_BN and
-    MORI_COMB_QPRE_WPB set the pre-pass geometry (default: 4 blocks per CU, 4 warps each).
+    MORI_COMB_QPRE_WPB set the pre-pass geometry (default: 4 blocks per CU, 8 warps each).
     """
     val = os.environ.get("MORI_COMB_QPRE", "").strip().lower()
     if val in ("1", "true", "on", "yes"):
@@ -1722,7 +1722,7 @@ class EpDispatchCombineOp:
                     # cross-card edge and no LDS tiles, so the only thing it wants is enough waves
                     # to hide the loads. Grid-strided over a token count that only the device
                     # knows, so the grid is a latency-hiding choice and not a partition.
-                    q_wpb = _comb_env_int("MORI_COMB_QPRE_WPB", 4)
+                    q_wpb = _comb_env_int("MORI_COMB_QPRE_WPB", 8)
                     q_bn = _comb_env_int(
                         "MORI_COMB_QPRE_BN",
                         4 * int(self._handle_info["multi_processor_count"]),
