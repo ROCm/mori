@@ -103,12 +103,6 @@ def get_cache_dir(
         if os.environ.get("MORI_CNT_STEP", "").strip().isdigit()
         else ""
     )
-    # -DMORI_DISP_CLEAN builds the legacy clean dispatch body instead of the default one.
-    clean_suffix = (
-        "_dispclean"
-        if os.environ.get("MORI_DISP_CLEAN", "").lower() in ("1", "true", "on", "yes")
-        else ""
-    )
     # Every remaining dispatch gate changes the compiled code. Same source tree, different binary ->
     # each MUST be part of the key or an A/B silently reuses one .hsaco.
     fastdedup_suffix = (
@@ -116,17 +110,72 @@ def get_cache_dir(
         if os.environ.get("MORI_DISP_FASTDEDUP", "").lower() in ("1", "true", "on", "yes")
         else ""
     )
-    # -DMORI_COMB_TDM=N changes the combine push path AND its chunk count, so N is part of the key.
-    _comb_tdm = os.environ.get("MORI_COMB_TDM", "").strip().lower()
-    combtdm_suffix = (
-        f"_combtdm{int(_comb_tdm) if _comb_tdm.isdigit() else 2}"
-        if _comb_tdm not in ("", "0", "false", "off", "no")
-        else ""
+    # Every combine gate below is read through the resolvers in core.py rather than off the
+    # environment, because those now carry ARCH-DEPENDENT DEFAULTS: the same empty environment
+    # produces different -D flags on gfx1250 than on gfx942. Reading os.environ here would key both
+    # builds the same and hand one of them the other's .hsaco.
+    from .core import (
+        _comb_barsleep_defines,
+        _comb_barspread_defines,
+        _comb_tdm_chunks,
+        _COMB_OPT_IN_FLAGS,
+        _COMB_QUAD_DEFAULT_FLAGS,
+        _comb_flag,
     )
-    # Combine's [CSPLIT] bucket print, and its deletion diagnostic (NOREDUCE is wrong on purpose).
+
+    # -DMORI_COMB_TDM=N changes the combine push path AND its chunk count, so N is part of the key.
+    combtdm_suffix = f"_combtdm{_comb_tdm_chunks()}" if _comb_tdm_chunks() else ""
+    # -DMORI_COMB_BARSLEEP=N changes the barrier's poll backoff, so N is part of the key.
+    barsleep_suffix = "".join(
+        "_barsl" + d.rsplit("=", 1)[1] for d in _comb_barsleep_defines()
+    )
+    # -DMORI_COMB_BARSPREAD=N is the per-block line stride of the fanout barrier, so N is in the key.
+    barspread_suffix = "".join(
+        "_barsp" + d.rsplit("=", 1)[1] for d in _comb_barspread_defines()
+    )
+    # -DMORI_COMB_PIPE=N is the PULL gather's buffer count, so N is part of the key.
+    _pipe = os.environ.get("MORI_COMB_PIPE", "").strip().lower()
+    _pipe_n = int(_pipe) if _pipe.isdigit() else (2 if _pipe in ("true", "on", "yes") else 0)
+    if _pipe_n == 1:
+        _pipe_n = 2
+    pipe_suffix = f"_pipe{_pipe_n}" if _pipe_n >= 2 else ""
+    # QUAD's depth and split both change the emitted -D, so both are part of the key.
+    from .core import _comb_quad_depth, _comb_quad_split
+
+    _quad = _comb_quad_depth()
+    if _quad >= 2:
+        pipe_suffix += f"_quad{_quad}x{_comb_quad_split()}"
+    for _g in _COMB_QUAD_DEFAULT_FLAGS:
+        if _comb_flag(f"MORI_COMB_{_g}", bool(_quad >= 2)):
+            pipe_suffix += "_" + _g.lower()
+    for _g in _COMB_OPT_IN_FLAGS:
+        if _comb_flag(f"MORI_COMB_{_g}", False):
+            pipe_suffix += "_" + _g.lower()
+    from .core import _comb_qloc, _comb_qob, _comb_qtst
+
+    if _comb_qloc():
+        pipe_suffix += f"_qloc{_comb_qloc()}"
+    for _g in ("THLD", "THST", "SCLD", "SCST"):
+        _v = os.environ.get(f"MORI_COMB_{_g}", "").strip()
+        if _v.isdigit() and int(_v) > 0:
+            pipe_suffix += f"_{_g.lower()}{int(_v)}"
+    if _comb_qtst():
+        pipe_suffix += f"_qtst{_comb_qtst()}"
+        if _comb_qob():
+            pipe_suffix += f"o{_comb_qob()}"
+    _qred = os.environ.get("MORI_COMB_QRED", "").strip()
+    if _qred.isdigit():
+        pipe_suffix += f"_qred{int(_qred)}"
+    _lb = os.environ.get("MORI_COMB_LB", "").strip()
+    if _lb.isdigit() and int(_lb) > 0:
+        pipe_suffix += f"_lb{int(_lb)}"
+    # Combine's [CSPLIT] bucket print and its deletion diagnostics (all but TIMING are wrong on
+    # purpose). NOPUSH/PUSHONLY/NOWEIGHT each delete a different part of the push path, so each is its
+    # own binary; leaving them out of the key is what made the earlier deletion A/B compare a build
+    # with itself.
     comb_diag_suffix = "".join(
         f"_{n.lower()}"
-        for n in ("TIMING", "NOREDUCE")
+        for n in ("TIMING", "NOREDUCE", "NOPUSH", "NOGATHER", "PUSHONLY", "NOWEIGHT", "NOROUTE", "SPREAD", "RUNRR", "RUNRRQ", "DUMPCNT", "BARRIER2", "BARNOFENCE", "BARFAN", "NOBAR")
         if os.environ.get(f"MORI_COMB_{n}", "").lower() in ("1", "true", "on", "yes")
     )
     # Deletion diagnostics (wrong results on purpose) and the meta shape histogram.
@@ -140,7 +189,7 @@ def get_cache_dir(
     pay2d_suffix = f"_pay2d{int(_pay2d)}" if _pay2d.isdigit() and int(_pay2d) > 1 else ""
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{clean_suffix}{fastdedup_suffix}{combtdm_suffix}{comb_diag_suffix}{diag_suffix}{pay2d_suffix}{cntstep_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{tdm_suffix}{timing_suffix}{fastdedup_suffix}{combtdm_suffix}{barsleep_suffix}{barspread_suffix}{pipe_suffix}{comb_diag_suffix}{diag_suffix}{pay2d_suffix}{cntstep_suffix}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)

@@ -33,7 +33,23 @@
 #ifdef ENABLE_PROFILER
 #include "mori/profiler/profiler.hpp"
 #endif
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
+// TdmShape / TdmIssueLoad / TdmIssueStore are phase-agnostic descriptor primitives, but they used
+// to be declared under MORI_DISP_TDM alone. That made combine's TDM paths silently require a
+// DISPATCH env var: a caller who asked for MORI_COMB_TDM and nothing else compiled a kernel with
+// every combine TDM path #if'd out and no diagnostic. Compile the primitives when EITHER phase asks
+// for them, and let each phase's own gate decide whether to USE them.
+//
+// VERIFIED at 64x8 ZC=1, checked: with MORI_DISP_TDM unset (back when a second, non-TDM dispatch
+// body still existed to fall back to), combine still ran QUAD at 167.9us / 1206 GB/s, rc=0. Note
+// what that run also said about the OTHER direction, which this does not fix and never did: the
+// dispatch body is TDM-only, so MORI_DISP_TDM unset produces a dispatch that fails the bench's
+// check (rc=1) -- with the combine gates off too, i.e. on a build textually identical to the one
+// before this decoupling, so it is a dispatch-side gap and not a regression from it.
+#if (defined(MORI_DISP_TDM) || defined(MORI_COMB_TDM)) && \
+    (defined(__gfx1250__) || defined(__gfx1251__))
+#define MORI_TDM_OK 1
+#endif
+#if defined(MORI_TDM_OK)
 #include <hip/amd_detail/amd_gfx1250_TDM.h>
 // Experimental: send the dispatch token payload cross-card via the gfx1250 TDM
 // (tensor global<->LDS DMA) engine instead of core::WarpCopy. Single-buffer: one
@@ -55,12 +71,16 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape(int hiddenDim) {
   gfx1250_TDM_GROUP1 g1;
   g1.dataSize(sizeof(T) == 4 ? 2 : (sizeof(T) == 2 ? 1 : 0));
 #if defined(MORI_DISP_PAY2D)
-  // The 1xN form below is the wedge TdmShape2D warns about right underneath: gfx1250 wants both
-  // dims >= 2, and this payload descriptor is the last place still shipping tensorDim1 == 1. The
-  // meta path and the pure-TDM a2a probe both send 2D tiles, and a2a reaches 1664 GB/s where this
-  // payload reaches 1192 at the same tile size, grid and warp count -- with load, routing, tile
-  // size and the peer base lookup all separately ruled out. Fold the token into a
-  // MORI_DISP_PAY2D-wide 2D tile whenever the hidden dim divides evenly.
+  // MEASURED NULL -- keep the 1xN form, this knob is only still here to stop the next person
+  // re-deriving the same wrong theory. The 1xN below is the wedge TdmShape2D warns about (gfx1250
+  // wants both dims >= 2) and this descriptor is the last place shipping tensorDim1 == 1, so the
+  // standing theory was that it explained the payload/a2a gap. It does not. At 64x8 PUSH/TDM with
+  // MORI_COMB_SPREAD, folding hiddenDim=7168 into a 2D tile changed nothing and the narrowest legal
+  // row made it worse: combine 618.7us / dispatch 1253.1 GB/s for the 1xN wedge, against 617.8 /
+  // 1252.0 at 128x56 (256B rows) and 618.4 / 1255.9 at 256x28 (512B rows), while 64x112 -- rows
+  // exactly on the 128B floor -- read 639.5us / 1096.7 GB/s. Both phases move the same bytes with
+  // the same tile, so descriptor shape is simply not what either one is limited by.
+  // Fold the token into a MORI_DISP_PAY2D-wide 2D tile whenever the hidden dim divides evenly.
   if (hiddenDim % (MORI_DISP_PAY2D) == 0 && hiddenDim / (MORI_DISP_PAY2D) >= 2) {
     const int d0 = (MORI_DISP_PAY2D);
     const int d1 = hiddenDim / (MORI_DISP_PAY2D);
@@ -76,20 +96,54 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape(int hiddenDim) {
   return g1;
 }
 // Issue an async TDM load global->LDS (does NOT wait for completion).
-template <typename T>
+//
+// TH and SCOPE are GROUP0's temporal hint and scope trait, which every caller here has been leaving
+// at the descriptor's default of 0. They are template parameters rather than gates read inside so
+// that combine can move them without moving dispatch's in the same binary. Neither weakens
+// coherence: the peer reads are ordered by the cross-device barrier, not by the cache, and a hint
+// that declines to ALLOCATE is strictly more conservative than one that does.
+template <typename T, int TH = 0, int SCOPE = 0>
 __device__ __forceinline__ void TdmIssueLoad(T* ldsTile, const T* src, const gfx1250_TDM_GROUP1& g1) {
   typedef int _tdm_v4i __attribute__((ext_vector_type(4)));
   typedef int _tdm_v8i __attribute__((ext_vector_type(8)));
   gfx1250_TDM_GROUP0 g0; g0.ldsAddr((uintptr_t)ldsTile); g0.globalAddr((uintptr_t)src);
+  if constexpr (TH != 0) g0.m_th = TH;
+  if constexpr (SCOPE != 0) g0.m_scope_trait = SCOPE;
   _tdm_v4i z4{0, 0, 0, 0}; _tdm_v8i z8{0, 0, 0, 0, 0, 0, 0, 0};
   __builtin_amdgcn_tensor_load_to_lds(g0.m_bitfield, g1.m_bitfield, z4, z4, z8, 0);
 }
-// Issue an async TDM store LDS->global (does NOT wait for completion).
+// A 2D descriptor whose second dim walks nRows equally spaced copies of the same contiguous run --
+// ONE op where the caller would otherwise issue one per row. Combine's PUSH reduce is exactly this
+// shape: a token's contributions sit at SendBufSlotOffset(config, destPe, tokenId) = destPe *
+// MaxNumTokensToSendPerRank + tokenId, so for a fixed token the sources are a constant pitch apart.
+//
+// WHICH field carries the pitch is measured, not reasoned: every other caller here sets strideN ==
+// dimN (dense), which fits more than one reading of the fields. tools/tdm_wait_stride.cc sweeps the
+// three plausible encodings against a byte check with the rows 1M elements apart -- tensorDim0Stride
+// passes 0/9728, tensorDim1Stride fails 7296/9728. The engine lands the rows DENSELY in LDS, i.e.
+// tile[j * rowElems + i], which is why callers must stride the tile by rowElems and not by their
+// own tile pitch.
 template <typename T>
+__device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShapeGather(int rowElems, int nRows,
+                                                             uint32_t pitchElems) {
+  gfx1250_TDM_GROUP1 g1;
+  g1.dataSize(sizeof(T) == 4 ? 2 : (sizeof(T) == 2 ? 1 : 0));
+  g1.tensorDim0(rowElems);
+  g1.tensorDim1(nRows);
+  g1.tensorDim0Stride(pitchElems);
+  g1.tensorDim1Stride(nRows);
+  g1.tileDim0(rowElems);
+  g1.tileDim1(nRows);
+  return g1;
+}
+// Issue an async TDM store LDS->global (does NOT wait for completion).
+template <typename T, int TH = 0, int SCOPE = 0>
 __device__ __forceinline__ void TdmIssueStore(T* dst, T* ldsTile, const gfx1250_TDM_GROUP1& g1) {
   typedef int _tdm_v4i __attribute__((ext_vector_type(4)));
   typedef int _tdm_v8i __attribute__((ext_vector_type(8)));
   gfx1250_TDM_GROUP0 g0; g0.ldsAddr((uintptr_t)ldsTile); g0.globalAddr((uintptr_t)dst);
+  if constexpr (TH != 0) g0.m_th = TH;
+  if constexpr (SCOPE != 0) g0.m_scope_trait = SCOPE;
   _tdm_v4i z4{0, 0, 0, 0}; _tdm_v8i z8{0, 0, 0, 0, 0, 0, 0, 0};
   __builtin_amdgcn_tensor_store_from_lds(g0.m_bitfield, g1.m_bitfield, z4, z4, z8, 0);
 }
@@ -371,6 +425,263 @@ __device__ unsigned long long _comb_timing_call_idx = 0ull;
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BarrierKernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
+// Backoff between two polls of the cross-device flag, in s_sleep units of ~64 clocks. It has to be
+// a macro: s_sleep takes an immediate. See the measurement note inside the barrier for why the poll
+// RATE, not the poll itself, is what the barrier costs.
+#ifndef MORI_COMB_BARSLEEP
+#define MORI_COMB_BARSLEEP 1
+#endif
+// Diagnostic only, WRONG RESULTS: keep every block's poll, drop every block's acquire but block 0's.
+#ifndef MORI_COMB_BARNOFENCE
+#define MORI_COMB_BARNOFENCE 0
+#endif
+// Block 0 alone polls the uncached flags and fans the release out through cached memory, while every
+// block keeps its own system-scope acquire. See the note at the wait below.
+#ifndef MORI_COMB_BARFAN
+#define MORI_COMB_BARFAN 0
+#endif
+// Diagnostic only, WRONG RESULTS: drop the cross-device wait from an otherwise complete kernel, so
+// that full - NOBAR is what the barrier costs IN a combine rather than on its own.
+#ifndef MORI_COMB_NOBAR
+#define MORI_COMB_NOBAR 0
+#endif
+// Block 0 polls, then broadcasts the epoch into one padded line PER BLOCK, N uint32 words apart
+// (32 = 128B). Correctness-preserving. See the note at the wait below.
+#ifndef MORI_COMB_BARSPREAD
+#define MORI_COMB_BARSPREAD 0
+#endif
+// Double-buffer the PULL gather so chunk k+1's peer reads are in flight while chunk k is folded.
+// Correctness-preserving. See the note in the combine reduce loop.
+#ifndef MORI_COMB_PIPE
+#define MORI_COMB_PIPE 0
+#endif
+// Decompose the PULL gather by source (one warp per source, whole-token reads) instead of by
+// hidden-dim chunk. The value is the number of tile buffers per warp (1 or 2 both mean 2).
+// Correctness-preserving. See the note above the reduce loop.
+#ifndef MORI_COMB_QUAD
+#define MORI_COMB_QUAD 0
+#endif
+// Split each QUAD tile into this many parts, so a warp can keep MORI_COMB_QUAD-1 smaller reads in
+// flight for the same LDS. Correctness-preserving. See the note above the reduce loop.
+#ifndef MORI_COMB_QSPLIT
+#define MORI_COMB_QSPLIT 1
+#endif
+// Dynamic LDS a block may reserve on gfx125x. The combine TDM paths size their tiles against this
+// at RUNTIME because the gates that turn them on are compile-time while warpNum is not, and the
+// host reserves against the same number in _combine_shared_mem() (python/mori/ops/dispatch_combine
+// .py). Anything that changes one of the two formulas has to change the other in the same commit.
+#ifndef MORI_COMB_LDS_BUDGET
+#define MORI_COMB_LDS_BUDGET 327680
+#endif
+// Use a bare s_barrier for the QUAD group sync instead of __syncthreads(). Correctness-preserving:
+// see the note at _Q_BARRIER.
+#ifndef MORI_COMB_QBAR
+#define MORI_COMB_QBAR 0
+#endif
+// Delete the QUAD group sync entirely. DIAGNOSTIC, WRONG RESULTS -- pair with MORI_BENCH_SKIPCHECK.
+// It prices what the two barriers per unit cost in total, which is the ceiling on what any
+// group-scoped replacement (MORI_COMB_QFLAG) could ever win back. Worth pricing because the sync is
+// block-wide over all warpNum warps while the fold only needs the worldSize warps of one group, and
+// because barrier B sits between the tensorcnt wait and the fold: each warp arrives only once ITS
+// OWN peer read has landed, so every warp ends up waiting on the slowest read of the whole block
+// rather than the slowest of its own group.
+//
+// MEASURED at 64x8 ZC=1 on the shipping gates: full 168.5us, QNOSYNC 171.5us. Deleting BOTH
+// barriers of every unit does not save time, it LOSES 3.0us against a 0.4us run-to-run spread. So
+// the ceiling on any group-scoped barrier is zero and this whole line of attack is closed.
+// The reason is that the block's warps do not need a barrier to be in lockstep: they share one
+// in-order TDM engine, so a warp's own s_wait_tensorcnt already implies every op issued before it
+// -- including the other warps' -- has retired. The barrier only records a synchronisation the
+// engine already forced, and removing it just gives the scheduler freedom it cannot use.
+#ifndef MORI_COMB_QNOPF
+#define MORI_COMB_QNOPF 0
+#endif
+#ifndef MORI_COMB_QNOSYNC
+#define MORI_COMB_QNOSYNC 0
+#endif
+// QUAD fold depth cap. DIAGNOSTIC, WRONG RESULTS for anything below the real source count.
+#ifndef MORI_COMB_QRED
+#define MORI_COMB_QRED (-1)
+#endif
+// Replace the QUAD group barriers with per-slot arrival/departure counters in LDS, so a warp can
+// run ahead into its next peer read while the rest of its group is still folding, and so the two
+// groups of a block stop being locked into the same phase. Correctness-preserving.
+//
+// DO NOT ENABLE. MEASURED at 64x8 ZC=1 on the shipping gates, checked (rc=0): 209.6us against a
+// 168.5us full, i.e. 41.1us worse. It buys nothing because there is nothing to decouple -- see
+// MORI_COMB_QNOSYNC, where deleting the barriers outright also loses time -- and it pays for that
+// nothing with an LDS atomic and a spin per warp per unit. The motivation recorded here was an old
+// decomposition (transport alone 138.8us, everything-but-transport 160.1us, full 278.7us) taken
+// before QU4/QCVT/QTST=2 landed; at the current 168.5us the fold is only 2.2us of exposed time,
+// so the overlap this was meant to buy does not exist to be bought.
+#ifndef MORI_COMB_QFLAG
+#define MORI_COMB_QFLAG 0
+#endif
+// Peel the common "every source survived dedup" case out of the QUAD fold so its trip count is a
+// compile-time 4. Correctness-preserving, and bit-identical: the adds keep their left-to-right
+// order. The generic loop's bound is a runtime value, so the compiler issues one ds_load, waits,
+// adds, then issues the next -- four dependent LDS round trips per 16 B chunk.
+#ifndef MORI_COMB_QU4
+#define MORI_COMB_QU4 0
+#endif
+// Store the QUAD fold's 16 B result as ONE nontemporal b128 instead of the two b64 halves that
+// core::store<16> emits. Correctness-preserving. The two halves each write 8 of every 16 bytes, so
+// the write is half-density and costs two L2 transactions where one would do, and the microbench
+// (tools/_ct_epsim.sh mode10 WKIND=2 vs 4) prices stores as the ONLY thing that does not overlap
+// with the TDM peer reads.
+#ifndef MORI_COMB_QST16
+#define MORI_COMB_QST16 0
+#endif
+// Fold into an LDS tile and let the TDM engine store THAT to the output, instead of the warp
+// storing its result with vector stores. Correctness-preserving. The microbench
+// (tools/_ct_epsim.sh mode10) is unambiguous about why: with a peer read in flight, dependent FMAs
+// are ~97% hidden and LDS reads are entirely free, but global stores and global loads cost full
+// price from the very first one. Vector memory from the wave is the ONE thing that does not
+// overlap with the engine, and the fold's output store is the only vector memory left in the loop.
+#ifndef MORI_COMB_QTST
+#define MORI_COMB_QTST 0
+#endif
+// Convert the fold's f32 accumulator to bf16 with v_cvt_pk_bf16_f32 (two elements, one VALU)
+// instead of T(float). Correctness-preserving -- both round to nearest even.
+//
+// T here is hip/hip_bfloat16.h's hip_bfloat16, and its float constructor is a SOFTWARE round: the
+// disassembly of the fold (tools/_ct_isa.sh MARK=tensor_store_from_lds) is v_bfe_u32 / v_add3_u32
+// 0x7fff / v_cmp_ne 0x7f800000 / s_and_saveexec / v_cndmask / s_or_b32 exec -- about twenty VALU
+// AND TWO EXEC-MASK BRANCHES for every single output element, for a NaN case this kernel's data
+// cannot produce. gfx1250 has the instruction (llvm-mc accepts v_cvt_pk_bf16_f32 and __hip_bfloat16
+// -- the OTHER bf16 type -- compiles a float cast straight to it); the legacy struct simply does
+// not use it. This is why the fold prices at 90.5us for 202 MB of LDS reads, 2.2 TB/s, ten times
+// off what LDS can do: it was never the reads.
+#ifndef MORI_COMB_QCVT
+#define MORI_COMB_QCVT 0
+#endif
+// Slots in the QUAD fold's OUTPUT ring, independent of the tile ring's depth. See the note at _qOB.
+#ifndef MORI_COMB_QOB
+#define MORI_COMB_QOB 0
+#endif
+// Queue QTST=2's store BEHIND this unit's peer read instead of ahead of it. Correctness-preserving.
+// MEASURED LOSS, 211.8us against a 168.5us base: the engine retires in order, and a store queued
+// behind the load is a store the NEXT unit's wait sits behind, which is worse than paying it in
+// front where the fold that follows covers it.
+#ifndef MORI_COMB_QTLATE
+#define MORI_COMB_QTLATE 0
+#endif
+// ALL THREE SETTINGS ARE LOSSES. Kept because between them they falsify the model that everything
+// else here was built on -- that the kernel is limited by ENGINE BYTES -- and nothing about the
+// result is guessable from the code.
+//
+// 1 = read this rank's own copy of the token with vector loads inside the fold, 2 = same but staged
+// in registers before the barrier, 3 = drop the read and do not make up for it (DIAGNOSTIC, WRONG
+// RESULTS, pair with MORI_BENCH_SKIPCHECK). 1 and 2 are correctness-preserving; see the reordering
+// note at the fold.
+//
+// One of a token's up-to-four deduped sources is almost always myPe, and that one is in LOCAL HBM,
+// so taking it off the engine drops engine reads from 202.47 MB to ~143.8 MB. Measured against a
+// 168.5us base at 64x8: 1 -> 264.4us, 2 -> 264.6us, 3 -> 171.7us.
+//
+// Two things follow. Dropping a whole 14336 B local read off the engine and replacing it with a
+// 128 B dummy is worth NOTHING (3), so engine bytes are not the limit and the additive read/store
+// accounting that motivated this was a coincidence. And 58.7 MB of perfectly coalesced vector loads
+// from local HBM cost ~96us, ~520 GB/s, whether issued in the fold or hoisted in front of the
+// barrier with four chunks in flight (1 vs 2 differ by 0.2us) -- so it is not exposed latency
+// either. Vector memory from the wave simply does not run alongside the engine, which is the same
+// thing QTST was introduced for on the store side.
+#ifndef MORI_COMB_QLOC
+#define MORI_COMB_QLOC 0
+#endif
+// Drop the QUAD gather's DUMMY peer reads instead of issuing them to keep the wait immediates
+// uniform. Correctness-preserving.
+//
+// A token's experts dedup to at most worldSize distinct source ranks and average 3.45 of them here
+// (202.47 MB read for 58.72 MB of tokens), so about one warp in seven has no source for the unit it
+// is on and issues a 128 B read of this rank's own buffer purely so that every warp of the group
+// has the same number of ops outstanding at the wait. The reason to bother deleting a 128 B read is
+// that the engine at this geometry prices OPS, not bytes: quartering the store size at four times
+// the op count (QTST=1) costs +57us, and taking a whole 14336 B local read off the engine
+// (QLOC=3) buys nothing at all. What that leaves is a per-op cost that a dummy pays in full.
+//
+// The wait immediate is then no longer the same for every warp or every unit, and the builtin takes
+// an immediate, so it becomes a switch over the ops this warp actually issued after the load it is
+// waiting on -- at depth 2 that is at most this iteration's store and this iteration's launch.
+// Over-waiting is safe and under-waiting is not, which is exactly why the dummies were there.
+//
+// MEASURED LOSS, 236.8us against a 168.2us base, and it is correct (rc=0 with the check on), so the
+// +68.6us is not the deleted ops coming back some other way. Deleting one op in seven cannot cost
+// forty percent; what a runtime-selected wait costs is the pipelining around it, and this kernel is
+// pinned at 128 VGPRs with 26 already spilled, where the last few registers were worth 367us
+// (depth 3 vs 4, see the note at the count ring). Left off, and left here so the op-cost theory the
+// QTST=1 and QLOC=3 numbers suggest is not tried this way twice.
+#ifndef MORI_COMB_QNOOP
+#define MORI_COMB_QNOOP 0
+#endif
+// Temporal hint / scope trait on the QUAD peer read and on its output store, 0 = the descriptor's
+// default. Correctness-preserving. Every byte either move touches L2 exactly once -- a peer read
+// lands in LDS and the fold never reads it back through L2, the output store is read next by the
+// host -- so allocating either in L2 looked like pure eviction pressure on the other.
+//
+// MEASURED NULL. Against a 168.5us base: THST 1/2/3 -> 169.0 / 169.0 / 168.8, THLD 1 -> 169.1, all
+// inside the run-to-run spread. Whatever these bytes do to L2 is not what the kernel is waiting on.
+#ifndef MORI_COMB_THLD
+#define MORI_COMB_THLD 0
+#endif
+#ifndef MORI_COMB_THST
+#define MORI_COMB_THST 0
+#endif
+#ifndef MORI_COMB_SCLD
+#define MORI_COMB_SCLD 0
+#endif
+#ifndef MORI_COMB_SCST
+#define MORI_COMB_SCST 0
+#endif
+typedef int _mori_v4i __attribute__((ext_vector_type(4)));
+// Two f32 -> a packed pair of bf16 bits, one instruction when T is a bf16. Falls back to the
+// type's own conversion for every other T, so the callers need no type test.
+template <typename T>
+__device__ __forceinline__ uint32_t MoriPackTo2(float a, float b) {
+  if constexpr (std::is_same_v<T, hip_bfloat16>) {
+    const __hip_bfloat162 p = __float22bfloat162_rn(float2{a, b});
+    // Component-wise rather than a bit_cast: __hip_bfloat162 is not trivially copyable, and the
+    // raw accessor is the only documented way to its bits.
+    const __hip_bfloat16_raw _lo = p.x, _hi = p.y;
+    return (uint32_t)(unsigned short)_lo.x | ((uint32_t)(unsigned short)_hi.x << 16);
+  } else {
+    return 0;
+  }
+}
+// Delete the QUAD peer reads but keep the barriers, the routing and the fold. DIAGNOSTIC, WRONG
+// RESULTS. Its whole point is that full minus this is the transport's MARGINAL cost, which next to
+// the transport's cost ALONE (NOROUTE+NOREDUCE) says whether the two halves overlap at all.
+#ifndef MORI_COMB_QNOXFER
+#define MORI_COMB_QNOXFER 0
+#endif
+#if MORI_COMB_QBAR
+// __syncthreads() is `s_waitcnt lgkmcnt(0) vmcnt(0); s_barrier`, and the vmcnt(0) is the problem:
+// the only vector memory this loop has outstanding is the fold's own output stores, which nobody
+// in the block reads, so draining them at every iteration serialises a store round trip into the
+// critical path that the next token's TDM read should have been covering.
+// What the barrier actually has to order is the TDM tiles, and those are already complete: each
+// warp did s_wait_tensorcnt before it, and the engine's LDS writes are visible to the block once
+// that returns. Lane LDS writes (srcPtrs) never cross warps. So s_barrier plus s_wait_dscnt is
+// sufficient, with an empty asm memory clobber to stop the compiler, which cannot see the engine's
+// writes, from hoisting the tile reads above it. The dscnt is not optional: this barrier is also
+// what says the fold has finished READING a buffer before the engine refills it, and s_barrier
+// alone does not retire the fold's outstanding ds_reads.
+#define _Q_BARRIER()                               \
+  do {                                             \
+    asm volatile("s_wait_dscnt 0x0" ::: "memory"); \
+    __builtin_amdgcn_s_barrier();                  \
+    asm volatile("" ::: "memory");                 \
+  } while (0)
+#else
+#define _Q_BARRIER() __syncthreads()
+#endif
+#if MORI_COMB_QNOSYNC
+// The dscnt wait stays: without it the fold's own ds_reads are not retired before the engine
+// refills the slot, and the run turns into a crash rather than a wrong answer, which prices
+// nothing. Only the cross-warp ordering is deleted.
+#undef _Q_BARRIER
+#define _Q_BARRIER() asm volatile("s_wait_dscnt 0x0" ::: "memory")
+#endif
 template <typename T>
 inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T> args,
                                                          const uint64_t crossDeviceBarrierFlag) {
@@ -382,6 +693,11 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   int globalWarpNum = gridDim.x * warpNum;
 
   __syncthreads();
+  // Release side, deliberately left alone: the fence at ~396 runs only on block 0's first worldSize
+  // threads, so on paper another block's stores could still be in flight when the peer flag goes up.
+  // A per-block __threadfence_system() here was tried and is NOT needed -- the acquire added at the
+  // end of this function is sufficient for the PUSH bug (0/32 wrong tokens at every block count).
+  // Add it only against a failure that actually reproduces, since it costs a fence per block.
   if (thdId == 0) atomicAdd(args.combineGridBarrier, 1);
 
   if (globalThdId < args.config.worldSize) {
@@ -398,316 +714,210 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
 
   uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
+  // MEASURED, priced on its own by NOPUSH+PUSHONLY (which leaves launch + this function):
+  // 69.9us at 128 blocks, 20.9 at 32, 14.1 at 8 -- ~0.51us per block above 32. Sixteen of these back
+  // to back cost 83.3us each with the ranks already in lockstep, so this is the function's own cost,
+  // not the launch skew between the four processes (only a launch's FIRST sync point can pay that).
+  //
+  // Where the 0.51us/block goes is only half answered. Deleting the poll AND the fence together for
+  // every block but 0 takes 69.6 -> 15.0, so 54.6us is per-block and lives in these two statements.
+  // Changing the fence's SCOPE, system -> agent, is free (69.6 -> 70.3, full kernel 251.1 -> 252.5),
+  // but that never priced the fence, only its scope. And backing the poll RATE off by 127x
+  // (MORI_COMB_BARSLEEP, s_sleep 1 -> 127, i.e. ~4us between two polls) returns just 15.2 of the
+  // 54.6: 69.3 -> 58.5, full 251.6 -> 236.1. So poll frequency is worth ~15 and the remaining ~44
+  // is insensitive to it. crossDeviceBarrier is hipDeviceMallocUncached and has to be, or a peer's
+  // flag write would never become visible, so none of those reads can be absorbed by a cache.
+  //
+  // EVERY NUMBER ABOVE IS THE PUSH PATH, AND 127 IS A LOSS ANYWHERE ELSE. Backing off only pays
+  // while the wait is long enough to hide the oversleep, and PUSH's is: 58.5us at 128 blocks. On
+  // PULL/QUAD the same wait is 7.6us (full 171.3 vs MORI_COMB_NOBAR 163.7, 64x8 ZC=1 bf16 EP4), so
+  // a ~4us gap between polls overshoots it and the backoff turns negative. MEASURED at 64x8 ZC=1
+  // with the check armed: RUNRR alone 168.9us / 1199 GB/s, RUNRR + BARSLEEP=127 171.1 / 1183, i.e.
+  // 127 COSTS 2.2us here. The default is 15 (jit/core.py), which is the bottom of the sweep on this
+  // path; do not raise it to 127 on the strength of the PUSH numbers above, and do not let a
+  // measurement harness pin it either -- tools/_ct_nobar.sh used to, and every PULL geometry it
+  // reported read ~2us slow against a baseline that had been taken at the default.
+  //
+  // MORI_COMB_BARNOFENCE splits that 44 between the two statements: every block still polls, so the
+  // flags are observed exactly as today, and only the invalidate is dropped off blocks other than 0.
+  // The FENCE IS FREE, 58.6 -> 58.3 at BARSLEEP=127 and 69.3 -> 69.9 at 1 -- 127 fences are worth
+  // less than the run-to-run noise -- and the gate is live rather than a cache-key collision: it
+  // builds into its own _barnofence directory and, run without MORI_BENCH_SKIPCHECK, it is the one
+  // config here that fails the bench's combine check (rc=1, AssertionError) while the same build
+  // with the fence passes at 236.9. So all ~44us is the uncached reads: 128 blocks' worth arrive the
+  // instant the flag flips and serialise on the same line, which is why backing off the RATE cannot
+  // touch them and why the only lever left is the NUMBER OF READERS.
+  //
+  // MORI_COMB_BARFAN is that lever, and it is a retry of something that already failed once. The
+  // first attempt had block 0 poll alone and republish an epoch into combineGridBarrier[1] for the
+  // others, and it was both SLOWER (69.6 -> 112.1) and WRONG (rank 3 token 6 off by 2.75 against tol
+  // 0.12, the dropped-source signature; tools/ep4_push_diag.py at wpb=1 stayed clean, so it needed
+  // many waves per block to show). Both symptoms come from the same detail: that version leaned on
+  // an __ATOMIC_ACQUIRE load in the spin to do the invalidating. At agent scope that emits a
+  // device-scope invalidate every single iteration -- expensive, and the wrong domain for lines a
+  // THIRD agent wrote. BARNOFENCE has since shown the system-scope fence is what actually buys the
+  // correctness and that it costs nothing, so this version spins RELAXED on cached memory and keeps
+  // the per-block __threadfence_system() untouched. Knowing the data has landed travels over the
+  // epoch; invalidating the CU's own L1 stays local and system-scoped, where it was all along.
+  //
+  // That half worked and it is still OFF. Correctness came back -- full at BARSLEEP=127 is rc=0
+  // without MORI_BENCH_SKIPCHECK, where the first attempt asserted -- so the acquire's device-scope
+  // invalidate really was the bug. But it is SLOWER, not faster: barrier 58.5 -> 110.8, full 236.9
+  // -> 309.2, and 110.8 is the same number the acquire version got (112.1). Neither the memory
+  // ordering nor the backoff moves it, so the fanout's cost is its SHAPE. Replacing 128 uncached
+  // reads of one line with 127 device-scope atomic reads of one line buys nothing, and now they are
+  // paid in series behind block 0's poll instead of in parallel with each other, which is roughly
+  // the doubling observed. What is expensive is 128 CUs reading THE SAME LINE at a coherence point;
+  // whether that point is the fabric or the L2 barely matters.
+  //
+  // The lever that is left, then, is spreading, not fanning out: block 0 polls the real flags once
+  // and broadcasts the epoch into 128 separately padded lines so each block reads a line no one else
+  // touches. Stores pipeline and never round-trip, so writing 128 of them should not cost what
+  // reading one line 128 times does. It needs a real per-block scratch array, which combineGridBarrier
+  // (worldSize uint32s) cannot host, so it is the first barrier change that requires a host-side
+  // allocation and a library rebuild rather than a header edit.
+#if MORI_COMB_NOBAR
+  // DIAGNOSTIC ONLY, WRONG RESULTS. Deletes the cross-device WAIT and nothing else: the arrival
+  // count, the reset, the peer flag stores and the flag increment all still run, because those are
+  // the invariants the next replay needs and removing them hangs rather than measures.
+  //
+  // This is the only honest way to price this barrier, and every earlier number was the other
+  // deletion. NOPUSH+PUSHONLY leaves launch and barrier, so it prices the barrier ALONE, and alone
+  // it is a different barrier: with the push gone every block reaches the arrival counter in the
+  // kernel's first microsecond instead of staggered behind its own sends, and there is no peer
+  // still pushing to wait for. It also cannot separate itself from the launch, which is most of the
+  // 15.0us floor a single polling block leaves behind. So "barrier = 58us, 25% of combine" was the
+  // cost of a barrier in an empty kernel, not what the barrier adds to a real combine. What it adds
+  // is full - NOBAR, and part of even that is waiting for the slowest peer's push, which no cheaper
+  // barrier can recover -- only not having a global barrier at all, the way DeepEP and NCCL EP flag
+  // per chunk, can overlap it away.
+  //
+  // The fence below is deliberately left in, so that full - NOBAR is the wait and only the wait.
+  (void)localBarrierPtr;
+  if (thdId < args.config.worldSize) {
+#elif MORI_COMB_BARFAN
+  // The epoch is the barrier flag itself, so it is fresh on every call for free: the cross-device
+  // wait already needs a value the peers have not published before, or it would fall straight
+  // through. combineGridBarrier is worldSize uint32s and only [0] is the arrival counter, so [1] is
+  // spare -- internode_v1.cpp already uses it this way -- and hipMemset leaves it 0 while the flag
+  // starts at 1.
+  uint32_t* fanWord = args.combineGridBarrier + 1;
+  uint32_t fanEpoch = static_cast<uint32_t>(crossDeviceBarrierFlag);
+  if (blockIdx.x == 0) {
+    if (thdId < args.config.worldSize) {
+      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
+        __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
+      }
+    }
+    // Every lane of wave 0 has its own flag before any of them publishes, same condition the
+    // non-fanout path gets from wave lockstep.
+    __syncthreads();
+    if (thdId == 0)
+      __hip_atomic_store(fanWord, fanEpoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+  } else {
+    // RELAXED on purpose: an acquire here is what made the first attempt cost 112us, and it is not
+    // needed, because the invalidate this block requires is the system-scope fence below and no
+    // agent-scope one would have covered the peer's lines anyway.
+    if (thdId == 0) {
+      while (__hip_atomic_load(fanWord, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != fanEpoch) {
+        __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
+      }
+    }
+    __syncthreads();
+  }
+  if (thdId < args.config.worldSize) {
+#elif MORI_COMB_BARSPREAD
+  // Spreading, the lever BARFAN was not. What is expensive is many CUs hitting ONE line at a
+  // coherence point, not whether that line is cached -- BARFAN swapped 128 uncached reads of one
+  // line for 127 agent-scope reads of one line and doubled the barrier. Here block 0 polls the real
+  // flags once and republishes the epoch into gridDim.x lines MORI_COMB_BARSPREAD words apart, so
+  // every other block reads a line no other block touches. Stores pipeline and do not round-trip,
+  // so the publish should cost what one line's worth of reads costs, not gridDim.x of them.
+  //
+  // Measured cost of what this replaces (full - MORI_COMB_NOBAR, i.e. the wait's marginal cost in a
+  // real combine, not the NOPUSH+PUSHONLY empty kernel): 6.9us at 32 blocks, 16.8 at 64, 44.4 at
+  // 128, 150.4 at 256. It grows faster than the block count, and the part that no barrier can
+  // remove -- waiting for the slowest peer's push -- is bounded above by the 32-block figure.
+  //
+  // The lines are borrowed from interNodeDispDestTokIdMap: allocated and zeroed unconditionally at
+  // construction (dispatch_combine.cpp:503) to worldSize/gpuPerNode * maxNumInpTokenPerRank *
+  // numExpertPerToken index_t = 128KB here, and read by no intranode kernel. That keeps this a
+  // header-only experiment; the epoch is the barrier flag, which is monotonic and never 0, so the
+  // zeroed buffer cannot false-match on the first call. Shipping it needs its own allocation.
+  uint32_t* fanLines = reinterpret_cast<uint32_t*>(args.interNodeDispDestTokIdMap);
+  uint32_t fanEpoch = static_cast<uint32_t>(crossDeviceBarrierFlag);
+  if (blockIdx.x == 0) {
+    if (thdId < args.config.worldSize) {
+      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
+        __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
+      }
+    }
+    __syncthreads();
+    // One release for the whole publish rather than one per store: the stores carry no data, only
+    // the epoch, and the only thing that must precede them is block 0's observation of the flags.
+    __threadfence();
+    for (int b = thdId; b < gridDim.x; b += blockDim.x) {
+      __hip_atomic_store(fanLines + (size_t)b * MORI_COMB_BARSPREAD, fanEpoch, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
+    }
+  } else {
+    // Agent scope, so the load bypasses this CU's L1 and actually re-reads L2; RELAXED because the
+    // invalidate this block needs is the system-scope fence below, exactly as in BARFAN.
+    if (thdId == 0) {
+      while (__hip_atomic_load(fanLines + (size_t)blockIdx.x * MORI_COMB_BARSPREAD,
+                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != fanEpoch) {
+        __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
+      }
+    }
+    __syncthreads();
+  }
+  if (thdId < args.config.worldSize) {
+#else
   if (thdId < args.config.worldSize) {
     // Backoff in the cross-device wait: the empty tight spin livelocks the cco/xGMI
     // fabric under CNT2's timing and never re-observes the peer's flag write ->
     // combine hangs (plain's slower timing happens to dodge it). s_sleep throttles
     // the poll (matches GridBarrier's spin) and lets the peer flag become visible.
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
-      __builtin_amdgcn_s_sleep(1);
+      __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
     }
-  }
-  __syncthreads();
-}
-
-/* ---------------------------------------------------------------------------------------------- */
-/*        EpDispatchIntraNodeKernel_clean_body (legacy wide-grid, block-local batched slot)         */
-/* ---------------------------------------------------------------------------------------------- */
-// LEGACY high-bandwidth body, selected with -DMORI_DISP_CLEAN. Default launch geometry is
-// 256 blocks x 16 warps (see _resolve_launch_params in python/mori/ops/dispatch_combine.py):
-// it interleaves metadata with the payload per token and relies on a wide grid to hide that,
-// unlike EpDispatchIntraNodeKernel_body below which batches metadata and runs at 64x8.
-//
-// Block-local exact-count + batched remote reservation. Avoids BOTH:
-//  (1) NOTIFY's remote count-matrix exchange/prefix + grid barriers -- everything here is
-//      block-local, so phase transitions are just __syncthreads (no grid barrier), and
-//  (2) legacy's per-token REMOTE fetch_add -- here each block does ONE remote fetch_add(N)
-//      per destPe, N = the block's EXACT committed count (counted locally first) so there
-//      is no over-reservation / no holes (the concern that rules out a blind batch atomic).
-// Per token the slot is a fast LDS atomic; payload via clean 1D TDM. Remote atomics drop
-// from O(committed tokens) to npes*numBlocks. Completion tail identical to legacy.
-template <typename T, bool EnableStdMoE = false>
-__device__ void EpDispatchIntraNodeKernel_clean_body(EpDispatchCombineArgs<T> args) {
-  const EpDispatchCombineConfig& config = args.config;
-  int thdId = threadIdx.x;
-  int laneId = threadIdx.x & (warpSize - 1);
-  int warpId = thdId / warpSize;
-  int warpNum = blockDim.x / warpSize;
-  int globalWarpId = blockIdx.x * warpNum + warpId;
-  int globalWarpNum = gridDim.x * warpNum;
-  int myPe = config.rank;
-  int npes = config.worldSize;
-  size_t hiddenDim = config.HiddenDimSz();
-  const int topk = config.numExpertPerToken;
-  const int Npair = args.curRankNumToken * topk;
-
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-  extern __shared__ char _tdmBatchSmem[];
-  T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem) + (size_t)warpId * hiddenDim;
-  const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
 #endif
-
-  constexpr int kMaxNpes = MAX_GPUS_PER_NODE;
-  __shared__ index_t s_N[kMaxNpes];     // block's committed count per destPe
-  __shared__ index_t s_base[kMaxNpes];  // reserved contiguous base slot on destPe
-  __shared__ index_t s_run[kMaxNpes];   // block-local running distribution index
-
-#if defined(MORI_DISP_TIMING)
-  long long _pt[8];
-  long long _pbStart = 0;  // thd0 Part-B start clock (per-block register, for duration diff)
-  const bool _ptOn = (myPe == 0 && blockIdx.x == 0 && thdId == 0);
-#define _BPTS(i) do { if (_ptOn) _pt[i] = clock64(); } while (0)
+    // Acquire here, inside the wait, instead of after a block-wide rendezvous. worldSize <= warpSize,
+    // so these threads are all in wave 0 and the wave does not leave the loop above until every one
+    // of its active lanes has seen its own flag -- which is exactly the condition the extra
+    // __syncthreads used to buy. Being one wave, this is also ONE invalidate, not worldSize of them.
+    // What this saves over fencing after the rendezvous is a whole block-wide sync round trip: the
+    // other warps park at the single __syncthreads below while wave 0 is still polling.
+#if MORI_COMB_BARNOFENCE
+    if (blockIdx.x == 0) __threadfence_system();
 #else
-#define _BPTS(i) do {} while (0)
+    __threadfence_system();
 #endif
-  _BPTS(0);  // kernel entry
-
-  // ---- Phase 1: block-local count committed tokens per destPe (+ drop sentinels) ----
-  for (int p = thdId; p < npes; p += blockDim.x) { s_N[p] = 0; s_run[p] = 0; }
+  }
+  // Acquire, and it is what made combine PUSH numerically correct. The wait above is a RELAXED load,
+  // so observing the flag ordered nothing and left the block's vector L1 holding what it cached
+  // before -- for PUSH that is the zeroed staging, so the fold read 0.0 for slots another block had
+  // just filled and silently dropped whole contributions (that is the long-standing "PUSH drops one
+  // source of topk" that forced MORI_BENCH_SKIPCHECK). The first __syncthreads is what makes the
+  // fence meaningful: the flags are waited on by threads 0..worldSize-1, so without it thread 0
+  // could invalidate before thread 3 is done. L1 is per-CU and a block is resident on one CU, so one
+  // fence per block covers all its warps.
+  // tools/ep4_push_diag.py, EP4, 32 tokens/rank, wpb=1: before, bn=1 was clean (push and fold share
+  // the CU, so its L1 was never stale) while bn=8/32/128 lost 4-16 of 32 tokens per rank; after, all
+  // four block counts are 0/32 on all four ranks, and the gated MORI_COMB_DUMPCNT build confirms
+  // validAccumCount now equals unique_pes for every token.
+  // Cost, combine mean_lat, before -> after: EP4 64x8 full 719.3 -> 727.5, spread 616.8 -> 626.5,
+  // runrr 622.0 -> 628.0; EP4 128x8 spread 444.6 -> 454.6, runrr 424.8 -> 432.2; EP2 64x8 spread
+  // 360.8 -> 364.1, runrr 377.8 -> 382.8. A flat 6-10us regardless of geometry, which is the shape
+  // of a one-off invalidate per block, not something that scales with the payload.
   __syncthreads();
-  if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))  // PER-TOKEN 1-load:N-store is now the DEFAULT batch path (gfx125x+TDM)
-    // PER-TOKEN count: one warp per token. Lanes 0..topk-1 read the token's experts;
-    // dedup to distinct destPe via ONE __match_any_sync (CNT2 rule, lowest lane kept);
-    // count each kept lane's destPe; write drop-sentinels for the non-kept slots. Same
-    // committed set as Phase 3 (identical keep rule) so s_N matches the store count.
-    for (int tok = globalWarpId; tok < args.curRankNumToken; tok += globalWarpNum) {
-      index_t myExpert = (laneId < topk) ? args.tokenIndices[(size_t)tok * topk + laneId] : (index_t)-1;
-      int myDestPe = -1;
-      if (myExpert >= 0) { int d = (int)(myExpert / config.numExpertPerRank);
-                           if (d >= 0 && d < config.worldSize) myDestPe = d; }
-      unsigned mv = (myDestPe >= 0) ? (unsigned)myDestPe : 0xFFFFFFFFu;
-      unsigned long long grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
-      int keep = (myDestPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
-      if (laneId < topk && !keep)
-        args.dispDestTokIdMap[(size_t)tok * topk + laneId] = FlatTokenIndex(config, config.worldSize, 0);
-      if (keep) atomicAdd(&s_N[myDestPe], 1);
-    }
-#else
-    for (int i = globalWarpId; i < Npair; i += globalWarpNum) {
-      index_t destExpert = args.tokenIndices[i];
-      if (destExpert < 0) {
-        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-        continue;
-      }
-      index_t destPe = destExpert / config.numExpertPerRank;
-      if (destPe < 0 || destPe >= config.worldSize) {
-        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-        continue;
-      }
-      index_t srcTokId = i / topk;
-      int condition = 0;
-      if (laneId < (i % topk)) {
-        index_t otherExpert = args.tokenIndices[srcTokId * topk + laneId];
-        condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
-      }
-      if (__any(condition)) {
-        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-        continue;
-      }
-      if (laneId == 0) atomicAdd(&s_N[destPe], 1);
-    }
-#endif
-  }
-  __syncthreads();
-
-  _BPTS(1);  // <- phase1 count (block-local histogram)
-  // ---- Phase 2: reserve N contiguous slots per destPe with ONE remote atomic each ----
-  for (int p = thdId; p < npes; p += blockDim.x) {
-    if (s_N[p] > 0) {
-      s_base[p] = __hip_atomic_fetch_add(
-          args.dispTokOffsetMemObj->template GetAs<index_t*>(p), s_N[p], __ATOMIC_RELAXED,
-          __HIP_MEMORY_SCOPE_SYSTEM);
-      atomicAdd(args.destPeTokenCounter + p, s_N[p]);
-    }
-  }
-  __syncthreads();
-
-  _BPTS(2);  // <- phase2 reserve (npes remote atomicAdd(N))
-#if defined(MORI_DISP_TIMING)
-  if (thdId == 0) _pbStart = clock64();  // per-block Part-B start (register)
-#endif
-  // ---- Phase 3: distribute LOCAL slots + send payload (clean 1D TDM, no remote atomic) ----
-  if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
-#if defined(MORI_DISP_TDM) && (defined(__gfx1250__) || defined(__gfx1251__))
-    // PER-TOKEN 1 load : N store. One warp per token: LOAD the token ONCE into the LDS tile,
-    // then STORE it to each DISTINCT destPe from that same tile (load amortized, like a2a's
-    // 1-load:N-store). Slot is a fast block-local LDS atomic on the Phase-2 reserved base;
-    // dedup via __match_any_sync (same keep rule as Phase 1). Per kept peer we also scatter
-    // the routing metadata: dispDestTokIdMap + reverse map (dispTokIdToSrcTokId) + weights +
-    // indices + scales. scales go through the 16B-coalesced WarpScaleCopy (byte-path fix).
-    for (int tok = globalWarpId; tok < args.curRankNumToken; tok += globalWarpNum) {
-      index_t myExpert = (laneId < topk) ? args.tokenIndices[(size_t)tok * topk + laneId] : (index_t)-1;
-      int myDestPe = -1;
-      if (myExpert >= 0) { int d = (int)(myExpert / config.numExpertPerRank);
-                           if (d >= 0 && d < config.worldSize) myDestPe = d; }
-      unsigned mv = (myDestPe >= 0) ? (unsigned)myDestPe : 0xFFFFFFFFu;
-      unsigned long long grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
-      int keep = (myDestPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
-      if (!__any(keep)) continue;   // token routed nowhere valid -> skip (no load)
-
-      TdmIssueLoad<T>(_tdmTile, args.inpTokenBuf + (size_t)tok * hiddenDim, _tdmG1);
-      bool loadWaited = false;
-      for (int l = 0; l < topk; ++l) {
-        if (!__shfl(keep, l)) continue;         // fixed l -> uniform shfl
-        int d = __shfl(myDestPe, l);
-        index_t destTokId = 0;
-        if (laneId == 0) {
-          index_t j = atomicAdd(&s_run[d], 1);
-          destTokId = s_base[d] + j;
-          args.dispDestTokIdMap[(size_t)tok * topk + l] = FlatTokenIndex(config, d, destTokId);
-          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(d)[destTokId] =
-              FlatTokenIndex(config, myPe, tok);
-        }
-        destTokId = __shfl(destTokId, 0);
-        if (laneId < config.numExpertPerToken) {
-          if (args.weightsBuf) {
-            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-                d)[destTokId * config.numExpertPerToken + laneId] =
-                args.weightsBuf[(size_t)tok * config.numExpertPerToken + laneId];
-          }
-          args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-              d)[destTokId * config.numExpertPerToken + laneId] =
-              args.tokenIndices[(size_t)tok * config.numExpertPerToken + laneId];
-        }
-        if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-          size_t dso = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
-          size_t sso = (size_t)tok * config.scaleDim * config.scaleTypeSize;
-          WarpScaleCopy(args.shmemOutScalesMemObj->template GetAs<uint8_t*>(d) + dso,
-                        args.scalesBuf + sso, config.scaleDim * config.scaleTypeSize);
-        }
-        if (!loadWaited) { __builtin_amdgcn_s_wait_tensorcnt(0); loadWaited = true; }  // load done -> tile valid
-        TdmIssueStore<T>(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(d) +
-                             (size_t)destTokId * hiddenDim,
-                         _tdmTile, _tdmG1);
-      }
-      __builtin_amdgcn_s_wait_tensorcnt(0);   // drain all N stores before reusing tile next token
-    }
-#else
-    // Fallback ONLY for non-TDM / non-gfx125x builds: per-pair N-load:N-store WarpCopy.
-    for (int i = globalWarpId; i < Npair; i += globalWarpNum) {
-      index_t destExpert = args.tokenIndices[i];
-      if (destExpert < 0) continue;
-      index_t destPe = destExpert / config.numExpertPerRank;
-      if (destPe < 0 || destPe >= config.worldSize) continue;
-      index_t srcTokId = i / topk;
-      int condition = 0;
-      if (laneId < (i % topk)) {
-        index_t otherExpert = args.tokenIndices[srcTokId * topk + laneId];
-        condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
-      }
-      if (__any(condition)) continue;
-
-      index_t destTokId = 0;
-      if (laneId == 0) {
-        index_t j = atomicAdd(&s_run[destPe], 1);       // fast LDS slot (was remote)
-        destTokId = s_base[destPe] + j;
-        args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-            FlatTokenIndex(config, myPe, srcTokId);
-      }
-      destTokId = __shfl(destTokId, 0);
-
-      if (laneId < config.numExpertPerToken) {
-        if (args.weightsBuf) {
-          args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-              destPe)[destTokId * config.numExpertPerToken + laneId] =
-              args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-        }
-        args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-            destPe)[destTokId * config.numExpertPerToken + laneId] =
-            args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-      }
-      if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-        size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
-        size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
-        core::WarpCopy(
-            args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
-            args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
-      }
-      size_t destTokOffset = (size_t)destTokId * hiddenDim;
-      core::WarpCopy<T, 8>(
-          args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-          args.inpTokenBuf + (size_t)srcTokId * hiddenDim, hiddenDim);
-    }
-#endif  // TDM+gfx125x PER-TOKEN default vs WarpCopy fallback
-  }
-  __syncthreads();
-  _BPTS(3);  // <- phase3 payload copy (Part B: 1D TDM)
-#if defined(MORI_DISP_TIMING)
-  if (thdId == 0) atomicMax(&_pb_maxdur, (unsigned long long)(clock64() - _pbStart));  // per-block Part-B duration
-#endif
-
-  // ---- Completion (identical to legacy): all blocks arrive, then per-peer release-signal ----
-  if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
-  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
-      _BPTS(4);  // <- grid barrier satisfied (all local blocks arrived)
-      __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
-      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-      shmem::ShmemInt32WaitUntilEquals(signal, 0);
-      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
-      core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
-    }
-    _BPTS(5);  // <- all per-peer completion signals sent
-  }
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      index_t* signal = recvTokenNums + destPe;
-      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
-      core::AtomicStoreRelaxedSystem(signal, 0);
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-      args.destPeTokenCounter[destPe] = 0;
-    }
-    if (laneId == 0) {
-      args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
-    }
-    _BPTS(6);  // <- all peers' signals received (completion done)
-  }
-#if defined(MORI_DISP_TIMING)
-  if (_ptOn && !args.replayMode) {  // print ONCE, on a REAL (non-replay) launch that actually copied
-    __threadfence();  // see all blocks' atomicMax(_pb_maxdur) before reading it
-    long long _totChk = _pt[6] - _pt[0];
-    unsigned long long _callIdx = atomicAdd(&_bphase_timing_call_idx, 1ull);
-    if (_totChk > 0 && _totChk < 20000000LL && _callIdx == 3ull) {
-      long long p1 = _pt[1] - _pt[0], p2 = _pt[2] - _pt[1];
-      long long pB = _pt[3] - _pt[2], pc = _pt[6] - _pt[3];
-      // completion sub-phases: grid barrier wait / per-peer signal send / wait peer recv
-      long long cbar = _pt[4] - _pt[3], csig = _pt[5] - _pt[4], cwait = _pt[6] - _pt[5];
-      long long tot = _pt[6] - _pt[0];  // blk0 finishes last (does the x-card signal) => whole-kernel wall
-      double t = (double)(tot ? tot : 1);
-      // block0-local view (BIASED: blk0 copies few tokens then spins at the barrier).
-      printf("[BPHASE] blk0 cyc: count=%lld reserve=%lld partB=%lld compl=%lld tot=%lld\n", p1, p2, pB, pc, tot);
-      printf("[BPHASE] blk0 pct: count=%.2f reserve=%.2f partB=%.2f compl=%.2f\n",
-             100.0 * p1 / t, 100.0 * p2 / t, 100.0 * pB / t, 100.0 * pc / t);
-      printf("[BPHASE] compl cyc: barrier=%lld sigsend=%lld waitpeer=%lld\n", cbar, csig, cwait);
-      printf("[BPHASE] compl pct: barrier=%.2f sigsend=%.2f waitpeer=%.2f\n",
-             100.0 * cbar / t, 100.0 * csig / t, 100.0 * cwait / t);
-      // ACCURATE Part-B: busiest-block copy DURATION / whole-kernel wall (both same clock64 domain,
-      // both DIFFS). frac dimensionless -> PartB algo-BW = dispatch algo-BW / frac (a2a-aligned).
-      double frac = (double)_pb_maxdur / t;
-      printf("[BPHASE] PARTB(xblk): partB_maxdur=%llu kernel=%lld frac=%.4f  =>  PartB_algoBW = dispatch_algoBW / %.4f\n",
-             _pb_maxdur, tot, frac, frac);
-    }
-  }
-#endif
-#undef _BPTS
-#ifdef ENABLE_STANDARD_MOE_ADAPT
-  if constexpr (EnableStdMoE) {
-    InvokeConvertDispatchOutput<T>(args, myPe);
-  }
-#endif
 }
 
 /* ---------------------------------------------------------------------------------------------- */
 /*             EpDispatchIntraNodeKernel_body (DEFAULT: narrow grid, batched metadata)              */
 /* ---------------------------------------------------------------------------------------------- */
-// Default dispatch body. Default launch geometry is 64 blocks x 8 warps (see
-// _resolve_launch_params in python/mori/ops/dispatch_combine.py). Versus the legacy clean body it
+// The dispatch body. Launch geometry is 64 blocks x 8 warps (see _resolve_launch_params in
+// python/mori/ops/dispatch_combine.py). Versus the deleted legacy clean body it
 //   (1) gathers each token's idx/weights/scale/srcmap into peer-local, destTokId-ordered staging
 //       during FINALIZE, then ships each (block, peer) run as ONE batched 4-field TDM copy,
 //       instead of interleaving scattered per-token metadata stores with the payload, and
@@ -1642,17 +1852,12 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #endif
 }
 
-// Body selector. The extern-C launch symbol EpDispatchIntraNodeBatchKernel_<dtype> calls *_body
-// directly (see WRAP_BOOL in ep_common.hip) and bypasses the __global__ wrapper below, so the
-// switch has to live here. Default is EpDispatchIntraNodeKernel_body (64 blocks x 8 warps);
-// -DMORI_DISP_CLEAN selects the legacy EpDispatchIntraNodeKernel_clean_body (256 x 16).
+// The extern-C launch symbol EpDispatchIntraNodeBatchKernel_<dtype> calls *_body directly (see
+// WRAP_BOOL in ep_common.hip) and bypasses the __global__ wrapper below, so this forwarder is what
+// the launch path actually reaches. There is one body: EpDispatchIntraNodeKernel_body, 64x8.
 template <typename T, bool EnableStdMoE = false>
 __device__ void EpDispatchIntraNodeBatchKernel_body(EpDispatchCombineArgs<T> args) {
-#ifdef MORI_DISP_CLEAN
-  EpDispatchIntraNodeKernel_clean_body<T, EnableStdMoE>(args);
-#else
   EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
-#endif
 }
 
 template <typename T, bool EnableStdMoE = false>
@@ -1714,10 +1919,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   const size_t scaleBytes =
       UseFp8BlockwiseQuant ? static_cast<size_t>(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
                            : 0;
-// MORI_DISP_TDM is required, not incidental: the TDM header and the TdmShape/TdmIssue* helpers are
-// declared under it (top of this file), and it is part of the base environment anyway.
-#if defined(MORI_COMB_TDM) && defined(MORI_DISP_TDM) && \
-    (defined(__gfx1250__) || defined(__gfx1251__))
+#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
   // A TDM store needs its destination on a 128B row boundary, and what decides that for slot k is
   // the slot stride: hidden 7168 bf16 + 8 weights = 14368 B is only 32B-aligned, so every other slot
   // would land off-row. Round the stride up to 128B. That only fits while it stays under the host's
@@ -1742,6 +1944,14 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
     InvokeConvertCombineInput<T, UseP2PRead>(args, myPe);
 #endif
   } else if constexpr (UseP2PRead) {
+    // WRONG RESULTS ON PURPOSE, same family as MORI_COMB_NOPUSH/NOREDUCE: skip the local
+    // stage-and-quantise entirely and let the peers read whatever the last launch left in
+    // combineInp. The transport and the fold below are byte-for-byte unchanged, so full minus this
+    // prices this pass on its own. It exists because on the PULL+blockwise path this pass has no
+    // analogue in the bf16 baseline at all -- bf16 runs zero-copy, where the caller has already
+    // written the registered buffer and this loop does not execute -- so it is the one phase the
+    // 168.4us reference cannot be used to bound. Pair with MORI_BENCH_SKIPCHECK.
+#if !defined(MORI_COMB_NOQUANT)
     if (args.config.useExternalInpBuffer) {
       for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
         if constexpr (UseFp8BlockwiseQuant) {
@@ -1761,6 +1971,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         }
       }
     }
+#endif
     if constexpr (UseWeights) {
       MORI_TRACE_NEXT(seq, Slot::CombineCopyWeights);
       if (args.weightsBuf) {
@@ -1830,8 +2041,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
     }
 #else
-#if defined(MORI_COMB_TDM) && defined(MORI_DISP_TDM) && \
-    (defined(__gfx1250__) || defined(__gfx1251__))
+#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
     // ---- TDM push, same shape as the dispatch payload phase (Phase 3b) ----
     // One TDM load stages the token into a per-warp LDS tile, one TDM store lands it in the peer's
     // slot. The tile cannot be skipped (TDM only sources LDS) and it is also what buys the win:
@@ -1876,8 +2086,72 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
     // 64x8/NOREDUCE, the same null result as §8's PAYBUF on the dispatch side (1280.8 vs 1280.7):
     // the engine does not want a deeper queue per warp, so halving the wait count bought nothing and
     // only cost occupancy. Do not reintroduce it.
-    for (int tokenIdx = globalWarpId; tokenIdx < _cPushEnd; tokenIdx += globalWarpNum) {
+    // Two attacks on the per-token destination lookup were measured at 64x8 PUSH/TDM and BOTH came
+    // back null; do not reintroduce them. Against full at 721.9us: MAPBATCH, which replaced the
+    // per-token lookup with one lane-parallel batch per warp plus __shfl (dispatch's shape at
+    // :1412-1435), read 719.3us; PREBASE, which hoisted the four peer base pointers into registers
+    // so p2pPeerPtrs[destPe] was not re-read per token, read 719.5us; together 718.9us. That is
+    // 3.0us against the 101.1us that MORI_COMB_NOROUTE removes, i.e. the lookup's memory traffic
+    // is NOT what NOROUTE was pricing. The address localSrcMap[tokenIdx] depends only on the loop
+    // counter, so the compiler is already free to hoist the load above the previous token's TDM
+    // waits, and the null says it does -- there was no serialisation left to remove, uncached or
+    // not. What NOROUTE changes is the instantaneous peer spread, which MORI_COMB_SPREAD then
+    // recovered in full without touching a single destination.
+#if defined(MORI_COMB_SPREAD)
+    // Dispatch reserves this rank's slots on a peer as one contiguous run PER (source rank, source
+    // block) (:904-906), ~55 slots wide at this geometry. destPe is that run's source rank, so the
+    // ~512 tokens in flight at any instant sit in a 512-wide window of the recv index space, i.e.
+    // ~9 runs, and pile onto whichever peers those runs happen to belong to instead of driving all
+    // four. Every other structural feature of this loop is already priced null by epsim mode8 --
+    // same descriptor, same 14336 B token on a 14336 B stride, scattered slot, one destination per
+    // token, two waits, same t += gwn partition -- and that reads 1315.8 GB/s where this loop reads
+    // 850. The one thing mode8 does differently is p = slot % nPeers, a uniform INSTANTANEOUS
+    // spread over the peers.
+    // Stepping the index space by a large prime is a bijection whenever the prime does not divide
+    // the count, so the same tokens are sent exactly once to the same destinations with the same
+    // bytes -- only the order in which a warp picks them up changes. Consecutive steps then land
+    // ~9973 apart, so the 512 concurrent indices cover the whole space and hit every run.
+    // MEASURED at 64x8 PUSH/TDM: send phase 236.6 -> 136.5us (856 -> 1483 GB/s), combine 716.8 ->
+    // 616.7us. That is 100.1us of the 101.1us MORI_COMB_NOROUTE removes by forcing a round-robin
+    // destination, i.e. reordering recovers essentially all of it while keeping results intact.
+    // This is why the loop's per-token work was never the problem and why three separate attempts
+    // to shave it (PUSH2, the descriptor rebuild, MAPBATCH/PREBASE) all read null.
+    constexpr index_t _cSpreadMul = 9973;
+    const bool _cSpreadOk = (_cPushEnd > 0) && (_cPushEnd % _cSpreadMul != 0);
+#endif
+    // The reordering has to stay SCATTERED, not merely spread. Giving each warp a contiguous block
+    // instead -- so the indices in flight sit exactly ceil(N/globalWarpNum) apart and span the recv
+    // space by construction, with no constant to tune -- was implemented and measured, and it is
+    // NOT a substitute: EP2 64x8 combine went 368.8 full / 360.9 prime / 397.4 blocks, i.e. blocks
+    // are 7.8% WORSE than not reordering at all, while EP4 had it within +-2% (64x8 627.2 vs 617.3,
+    // 128x8 436.7 vs 445.4, repeats agreeing to 2us). A host-side model of the peer distribution
+    // scores blocks and the prime identically at every EP size, so what blocks lose is not balance
+    // but their fixed stride through the source and the peer's staging. Do not reintroduce them.
+    // The prime's own weakness is real but has not been hit: it is a permutation only up to gcd, and
+    // near a multiple of 9973 it degenerates to the identity (N=9972) or a reversal (N=9974) -- both
+    // still correct, both no longer spreading. If a geometry ever lands there, derive the step from
+    // _cPushEnd (~N/phi, then incremented to coprimality) rather than switching to blocks.
+    // The send itself, factored out of the loop so the token ORDER can be varied without keeping a
+    // second copy of it in sync. Warp-uniform: every call is made by a whole warp.
+    auto _cSendTok = [&](const int tokenIdx) {
+      // MORI_COMB_NOROUTE is DIAGNOSTIC ONLY and GIVES WRONG RESULTS -- pair with
+      // MORI_BENCH_SKIPCHECK. At 64x8 PUSH/TDM it is worth ~101us of a ~237us send phase, but it
+      // does NOT price the lookup: MAPBATCH and PREBASE attacked the load from both sides and moved
+      // 3.0us between them (see above). It prices the instantaneous peer spread, because
+      // destPe = tokenIdx % worldSize makes every warp round-robin the peers on consecutive tokens.
+      // MORI_COMB_SPREAD reaches the same number (136.5us vs this gate's 139.4us) while keeping the
+      // real destinations, so use SPREAD -- this gate is only still here to bound what reordering
+      // can buy.
+      // The synthetic index is NOT tokenIdx: flat space is worldSize*MaxNumTokensToSend(), so
+      // every token would land on PE 0 and the four-way scatter would collapse into a single-card
+      // flood. This form keeps destPe round-robin over the PEs and destLocalTokId inside
+      // MaxNumTokensToSendPerRank(), i.e. per-PE bytes stay 1/worldSize each.
+#if defined(MORI_COMB_NOROUTE)
+      index_t destTokId = (tokenIdx % config.worldSize) * config.MaxNumTokensToSend() +
+                          (tokenIdx / config.worldSize);
+#else
       index_t destTokId = localSrcMap[tokenIdx];
+#endif
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
       index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
@@ -1893,8 +2167,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                                                   args.inpTokenBuf + tokenIdx * hiddenDim,
                                                   hiddenDim, laneId);
       } else {
-#if defined(MORI_COMB_TDM) && defined(MORI_DISP_TDM) && \
-    (defined(__gfx1250__) || defined(__gfx1251__))
+#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
         if (combSlotOn128B) {
           TokT* _dst = reinterpret_cast<TokT*>(destStagingPtr);
           TokT* _src = reinterpret_cast<TokT*>(args.inpTokenBuf) + (size_t)tokenIdx * hiddenDim;
@@ -1916,6 +2189,16 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
           core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
                          args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim);
       }
+      // MORI_COMB_NOWEIGHT deletes this and GIVES WRONG RESULTS -- pair with MORI_BENCH_SKIPCHECK.
+      // It prices the one thing in this loop that has never been priced: a 32B cross-card write per
+      // token, topk floats landing in the peer's slot. The dispatch side does not have this shape at
+      // all -- it moved every scattered cross-card write out of the payload loop into its own meta
+      // phase -- and §8 measured that shape to be latency-bound (METAVEC 995.5 GB/s, and SRCVEC got
+      // WORSE when widened because fewer lanes meant fewer concurrent transactions). The send
+      // marginal is 231us against a 1:1 structural ceiling of 1397 GB/s (EP SIM mode6) i.e. ~152us,
+      // and this is the last candidate for the difference: everything else in the loop has been
+      // deleted and measured null (PUSH2, the per-token descriptor rebuild, slot 128B phasing).
+#if !defined(MORI_COMB_NOWEIGHT)
       if constexpr (UseWeights) {
         if (args.weightsBuf) {
           core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes + scaleBytes),
@@ -1923,9 +2206,128 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                          config.numExpertPerToken);
         }
       }
+#endif
+    };
+
+#if defined(MORI_COMB_RUNRR) || defined(MORI_COMB_RUNRRQ)
+    // Round-robin the peers EXPLICITLY instead of relying on a hash to scatter them. This side does
+    // know the destination layout: destPe is readable per token from localSrcMap, and it is constant
+    // over each ~55-token run, so a block can bucket a tile of tokens by peer and then emit them
+    // peer-interleaved. Slot q goes to peer q%npes, so any npes consecutive warps of a block are on
+    // npes DISTINCT peers by construction rather than with probability -- the ideal that
+    // MORI_COMB_NOROUTE only reaches by falsifying the destinations.
+    // The tile is drawn from this block's STRIDED subset {blockIdx.x, +gridDim.x, ...}, not from a
+    // contiguous chunk: at 64 blocks a chunk is ~220 tokens against ~55-token runs, i.e. only ~4
+    // draws, and a block would routinely hold no token at all for some peer. The strided subset
+    // spans the whole recv space, so every peer is present in every tile.
+    // Counting sort in two passes over ONE tile array; per-peer buckets would need npes*kRRTile and
+    // the per-warp TDM tiles already hold warpNum*hiddenDim*sizeof(TokT) (112 KB at 8x7168 bf16).
+    // MEASURED at 128x8 PUSH/TDM, send isolated by MORI_COMB_NOPUSH (297.4us) against 202.47 MB:
+    // SPREAD 444.7 -> send 147.3us -> 1374.5 GB/s, this -> 425.4/425.0 -> 128.0/127.6us ->
+    // 1581.8/1586.8 GB/s, i.e. TDM's ~1580 at this geometry. That also retires the claim that 1:1
+    // (one descriptor per token, one destination per token) caps this loop near epsim mode7's
+    // 1461.5 GB/s and that only batching several tokens into one descriptor could beat it -- the
+    // shape was never the limit, the instantaneous peer mix was.
+    // Block sweep at EP4, each geometry against its own NOPUSH baseline (the gather side moves too):
+    //   cbn 128  NOPUSH 298.2  SPREAD 444.1 (1387.7 GB/s)  this 425.1 (1595.5 GB/s)
+    //   cbn 192  NOPUSH 297.5  SPREAD 491.6 (1043.1)       this 432.6 (1498.7)
+    //   cbn 256  NOPUSH 279.4  SPREAD 576.9 ( 680.6)       this 455.4 (1150.4)
+    // 128 is the peak and both fall off past it, but the hash falls off far faster: the more warps
+    // are in flight, the less a statistical spread keeps the peers evenly driven.
+    // It is NOT a strict win: the gain grows with warp count and with npes, and below that the sort
+    // and its four __syncthreads cost more than the balance buys. 64x8 reads 622.0/622.9 against
+    // SPREAD's 616.8 (+0.9%), and EP2 64x8 reads 377.8 against 360.8 (+4.7%) -- at two peers, one of
+    // which is this rank, round-robin just alternates a local copy with a remote one and there is
+    // almost no imbalance left to recover (SPREAD itself is only 2.1% there).
+    constexpr int kRRTile = 512;
+    __shared__ int s_rrIdx[kRRTile];
+    __shared__ int s_rrCnt[MAX_GPUS_PER_NODE];
+    __shared__ int s_rrOff[MAX_GPUS_PER_NODE];
+    __shared__ int s_rrFill[MAX_GPUS_PER_NODE];
+    __shared__ int s_rrTake[MAX_GPUS_PER_NODE];
+    __shared__ int s_rrMax;
+    const int _rrEnd = (int)_cPushEnd;
+    const int _rrMine =
+        (_rrEnd > (int)blockIdx.x) ? ((_rrEnd - 1 - (int)blockIdx.x) / (int)gridDim.x + 1) : 0;
+    for (int _rrK0 = 0; _rrK0 < _rrMine; _rrK0 += kRRTile) {
+      const int _rrTileN = ((_rrMine - _rrK0) < kRRTile) ? (_rrMine - _rrK0) : kRRTile;
+      for (int p = thdId; p < npes; p += blockDim.x) {
+        s_rrCnt[p] = 0;
+        s_rrFill[p] = 0;
+        s_rrTake[p] = 0;
+      }
+      __syncthreads();
+      for (int i = thdId; i < _rrTileN; i += blockDim.x) {
+        const int t = (int)blockIdx.x + (_rrK0 + i) * (int)gridDim.x;
+        atomicAdd(&s_rrCnt[(int)PeFromFlatTokenIndex(config, localSrcMap[t])], 1);
+      }
+      __syncthreads();
+      if (thdId == 0) {
+        int acc = 0, mx = 0;
+        for (int p = 0; p < npes; ++p) {
+          s_rrOff[p] = acc;
+          acc += s_rrCnt[p];
+          if (s_rrCnt[p] > mx) mx = s_rrCnt[p];
+        }
+        s_rrMax = mx;
+      }
+      __syncthreads();
+      for (int i = thdId; i < _rrTileN; i += blockDim.x) {
+        const int t = (int)blockIdx.x + (_rrK0 + i) * (int)gridDim.x;
+        const int p = (int)PeFromFlatTokenIndex(config, localSrcMap[t]);
+        s_rrIdx[s_rrOff[p] + atomicAdd(&s_rrFill[p], 1)] = t;
+      }
+      __syncthreads();
+#if defined(MORI_COMB_RUNRRQ)
+      // Slot q -> peer q%npes pins a warp to one peer whenever gcd(warpNum, npes) > 1, which is the
+      // normal case (8 warps, 4 peers): warp w only ever sees q = w + k*warpNum, so p = w%npes for
+      // its whole life. One of those peers is THIS rank, whose "send" is a local copy and costs a
+      // fraction of a cross-card one, so warpNum/npes warps per block run out of work early and the
+      // block waits on them while the real links are driven by the rest.
+      // Take from a queue instead: first choice is still (warpId + iter) % npes, so the warps in
+      // flight are spread across the peers, but the choice rotates and an exhausted peer is skipped,
+      // so a warp that finishes the cheap local tokens moves onto a link instead of idling. The
+      // ticket is one LDS atomic on lane 0, broadcast so the whole warp agrees.
+      for (int _rrIter = 0;; ++_rrIter) {
+        int _rrGot = -1;
+        if (laneId == 0) {
+          for (int s = 0; s < npes; ++s) {
+            const int p = (warpId + _rrIter + s) % npes;
+            const int e = atomicAdd(&s_rrTake[p], 1);
+            if (e < s_rrCnt[p]) {
+              _rrGot = s_rrOff[p] + e;
+              break;
+            }
+          }
+        }
+        _rrGot = __shfl(_rrGot, 0);
+        if (_rrGot < 0) break;
+        _cSendTok(s_rrIdx[_rrGot]);
+      }
+#else
+      // Uneven buckets just leave holes in the flattened order; skipping them keeps the peer of slot
+      // q fixed at q%npes, which is the whole point.
+      const int _rrQEnd = npes * s_rrMax;
+      for (int q = warpId; q < _rrQEnd; q += warpNum) {
+        const int p = q % npes;
+        const int e = q / npes;
+        if (e < s_rrCnt[p]) _cSendTok(s_rrIdx[s_rrOff[p] + e]);
+      }
+#endif
+      __syncthreads();  // s_rrIdx is reused by the next tile
     }
-#if defined(MORI_COMB_TDM) && defined(MORI_DISP_TDM) && \
-    (defined(__gfx1250__) || defined(__gfx1251__))
+#else
+    for (int _cStep = globalWarpId; _cStep < _cPushEnd; _cStep += globalWarpNum) {
+#if defined(MORI_COMB_SPREAD)
+      _cSendTok(_cSpreadOk
+                    ? (int)(((int64_t)_cStep * (int64_t)_cSpreadMul) % (int64_t)_cPushEnd)
+                    : _cStep);
+#else
+      _cSendTok(_cStep);
+#endif
+    }
+#endif
+#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
     // Mandatory: the deferred drain above only runs when a warp has another token to send, so the
     // last store of every warp can still be in flight here. The cross-device barrier below orders
     // memory, not the TDM engine, so without this a peer could read a half-written slot.
@@ -1940,6 +2342,18 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   // Make sure copy on all GPUs are finished
   MORI_TRACE_NEXT(seq, Slot::CombineBarrier);
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
+#if defined(MORI_COMB_BARRIER2)
+  // DIAGNOSTIC ONLY, and it does not change results -- an extra barrier is a no-op for correctness.
+  // NOPUSH+PUSHONLY prices "launch + barrier" at 69.8us, but that lumps together two things with
+  // opposite fixes: the barrier's own logic, and the launch skew between the four processes, which
+  // the FIRST sync point absorbs no matter how it is implemented. These 15 extra barriers run with
+  // the ranks already in lockstep, so (barrier16 - barrier1) / 15 is the logic cost alone. 15x also
+  // makes the measurement immune to the failure that invalidated MORI_COMB_NOGATHER: a dead compile
+  // gate reads exactly 0 here, while a real one cannot, since one barrier is not free.
+  // The +(1<<20) keeps each extra epoch clear of the flag values the per-launch counter will reach.
+  for (int _b = 1; _b <= 15; ++_b)
+    CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag + (uint64_t)_b * (1ull << 20));
+#endif
   // With a routing handle, the caller owns this tensor (it may still be alive in autograd ctx),
   // so we skip the reset. The next dispatch will allocate or replay its own.
   if (args.dispTokIdToSrcTokIdLocal == nullptr) {
@@ -1979,8 +2393,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
   assert(config.numExpertPerToken < warpSize);
 
-#if defined(MORI_COMB_TDM) && defined(MORI_DISP_TDM) && \
-    (defined(__gfx1250__) || defined(__gfx1251__))
+#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
   // ---- TDM pull, the P2P-read counterpart of the TDM push above ----
   // Here the cross-card traffic is the gather, not the send: srcPtrs[] point into up to topk PEER
   // buffers and the default path reads them with 16B per-lane vector loads. This variant instead
@@ -1996,7 +2409,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   //
   // LDS: one tile per SOURCE per warp, so wpb * srcMax * chunkElems * sizeof(T) must fit the 320KB
   // budget. _combine_shared_mem() in dispatch_combine.py sizes this with the same srcMax and rejects
-  // a combination that overflows.
+  // a combination that overflows. PUSH is the exception -- see _cPullTileElems below, where the
+  // tiles alias the send tile that is already allocated and already dead.
   //
   // srcMax is min(topk, worldSize), NOT topk, whenever the ballot compaction below runs: dispatch
   // dedups a token's topk experts by destPe (__match_any_sync, keeping the lowest lane and writing
@@ -2007,20 +2421,99 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   // this kernel (chunk 1024 -> 2432 at CBN128/wpb16). The compaction is what makes the used indices
   // dense, so this bound is only safe where it runs; above that, tiles stay sparse at topk.
   constexpr int _cPullChunks = ((MORI_COMB_TDM) > 0) ? (MORI_COMB_TDM) : 1;
-  constexpr bool _cPullType = UseP2PRead && std::is_same_v<T, TokT> && !UseFp8BlockwiseQuant &&
-                              (sizeof(TokT) == 2 || sizeof(TokT) == 4);
+  // UseP2PRead is deliberately NOT part of this. It used to be, which meant the whole tile path was
+  // compiled out of the PUSH build -- the configuration this kernel actually ships at (--zero-copy
+  // 0) -- so its reduce ran the lane gather at :2524 and MORI_COMB_TIMING measured cIssue=cWait=0.
+  // In PUSH the sources are the local staging slots the peers pushed into rather than peer VAs, but
+  // nothing below cares where they point: TDM's global side takes a local address just as happily.
+  // Blockwise rides the tile path on PULL only. The point is that quantising is supposed to move
+  // HALF the bytes, and until this existed it moved them worse: _nop2p scatters fp8 into the peer's
+  // slot lane by lane, and _p2p without tiles just turns that into a lane-by-lane cross-card READ
+  // (measured 3668.6 / 4748.6us at 64x8 EP4 against bf16 PULL's 168.4). TDM itself never cared --
+  // it shapes 1-byte elements like any other (:2339) -- so the only real work is that the fold has
+  // to dequantise out of LDS, which is why T (bf16 out) and TokT (fp8 tile) stop being the same
+  // type below. PUSH is deliberately left alone: there the tiles alias the send tile at a
+  // combXferBytes pitch and the gather descriptor would have to skip the interleaved scales.
+  //
+  // MEASURED at 64x8 EP4, MORI_COMB_TDM=4, check armed, rc=0: 3667.8us on the _nop2p push against
+  // 1466.4us here, a factor 2.5, and dispatch drops 237.7 -> 175.9 because the quantise stops
+  // scattering into peer memory. The 2201us this removes is TRANSPORT, not quantise math: an
+  // earlier decomposition charged ~2520us to the math by subtracting fp8_direct_cast's push phase
+  // from blockwise's, which would have put the floor above this measurement -- so that subtraction
+  // was wrong. What the push path actually spends it on is the 8-byte-per-lane cross-card store in
+  // QuantizeStore; here the quantise lands in local memory and TDM moves the token in bulk.
+  //
+  // Chunk count wants to be LOW, opposite to the bf16 tiles: MORI_COMB_TDM 2/4/8/16 gives
+  // 1410.0 / 1465.3 / 1706.3 / 1746.1us, all rc=0. An fp8 tile is half the bytes of a bf16 one, so
+  // the LDS that forced bf16 to split a token buys whole-token rows here, and splitting further
+  // only pays more descriptors for narrower rows.
+  //
+  // WHAT IS LEFT IS THE DESCRIPTOR COUNT, not the quantise and not the fold. Priced at chunk 2 with
+  // the deletion gates (SKIPCHECK, 64x8 EP4): full 1410.7us, MORI_COMB_NOQUANT 1412.9us,
+  // MORI_COMB_NOREDUCE 1323.1us, both 1323.9us. So the local stage-and-quantise pass costs nothing
+  // measurable, the fp32 dequantise fold costs 87.6us, and 1323us is the peer reads alone -- about
+  // 101 MB at 72 GB/s, against 885 GB/s for bf16 on this same chunked path and 1202 GB/s for QUAD.
+  // The chunk sweep says which: more chunks means less LDS and better occupancy yet it gets SLOWER,
+  // so this is bound by per-descriptor overhead, and a token here is 2 chunks x 4 sources = 8
+  // descriptors of 3584 B. QUAD is the shape that fixes it -- one descriptor for a whole token,
+  // depth-2 buffered -- and it is cheaper in LDS for fp8 than for the bf16 it already serves. It is
+  // gated off for blockwise at :2838.
+  //
+  // Reaching this at all needed the reduce's `if constexpr (UseFp8BlockwiseQuant)` chain narrowed
+  // (:3627): it is a COMPILE-time chain, so while blockwise matched there the tile block was never
+  // instantiated for it and no runtime gate could have helped. The tell was that sweeping
+  // MORI_COMB_TDM moved nothing (4745.8us at 4 chunks, 4754.1 at 8) while the chunk count is a
+  // direct factor of the tile size.
+  constexpr bool _cPullBwq =
+      UseFp8BlockwiseQuant && !UseFp4Combine && UseP2PRead && (sizeof(TokT) == 1);
+  constexpr bool _cPullType = (std::is_same_v<T, TokT> && !UseFp8BlockwiseQuant &&
+                               (sizeof(TokT) == 2 || sizeof(TokT) == 4)) ||
+                              _cPullBwq;
   const int _cPullRowElems = 128 / (int)sizeof(TokT);
-  const int _cPullTileElems = (((int)((hiddenDim + _cPullChunks - 1) / _cPullChunks) +
-                                _cPullRowElems - 1) /
-                               _cPullRowElems) *
-                              _cPullRowElems;
-  const bool _cPullOk = _cPullType && ((int)hiddenDim >= _cPullRowElems);
   // Must match tiles_per_warp in _combine_shared_mem(); worldSize <= 4 is the same condition that
   // guards the compaction. A per-token guard below re-checks validAccumCount against this, so an
   // unexpected source count falls back to the gather instead of writing into the next warp's tiles.
   const int _cPullSrcMax = (config.worldSize <= 4 && config.worldSize < config.numExpertPerToken)
                                ? config.worldSize
                                : config.numExpertPerToken;
+  // The two transports get their tile size from different budgets, matching the two branches in
+  // _combine_shared_mem():
+  //   PULL  allocates srcMax tiles per warp and sizes them by the MORI_COMB_TDM chunk count.
+  //   PUSH  allocates ONE whole-token tile per warp for the send at :1896, and that tile is dead by
+  //         the time we get here -- the mandatory drain at :2158 retired every store that owned it
+  //         before the barrier. So the source tiles ALIAS it: srcMax * tileElems <= hiddenDim puts
+  //         all of them inside the send tile at the same _cTileBase, and the reduce costs zero extra
+  //         LDS and zero occupancy. At hidden 7168 / srcMax 4 that is 1792 elems (3584 B rows, well
+  //         clear of the 128B floor) and 4 chunks, exactly filling the tile.
+  //
+  // MEASURED, DO NOT HALVE THIS TO DOUBLE-BUFFER. A software pipeline (issue chunk k+1, wait
+  // tensorcnt(1), fold chunk k) was built and measured, and it works -- it is worth 6.7us at
+  // 128x16 RUNRR, 13.8 at 128x8, 5.4 at 128x16 SPREAD. But there is nowhere to put the second
+  // buffer: wpb16 already spends 229 KB of the 320 KB budget on the send tiles this aliases, so the
+  // chunk has to drop to 896 elems, and paying twice the descriptors for half-width rows costs
+  // 22.2 / 44.6 / 21.4us at those same three points. Net 251.4 -> 266.9 at the best point. The
+  // pipeline is not the problem; the LDS it needs is.
+  const int _cPullTileElems =
+      UseP2PRead ? ((((int)((hiddenDim + _cPullChunks - 1) / _cPullChunks) + _cPullRowElems - 1) /
+                     _cPullRowElems) *
+                    _cPullRowElems)
+                 : (((int)hiddenDim / _cPullSrcMax / _cPullRowElems) * _cPullRowElems);
+  // Same runtime-geometry problem the QUAD path has, and the same rule: the tile count is fixed at
+  // compile time but warpNum is not, so PULL at a wide block can want more LDS than a block may
+  // reserve. When it does not fit this whole transport declines and the token falls through to
+  // WarpAccumLF, which needs no tiles at all. PUSH is excluded because its tiles ALIAS the send tile
+  // that dispatch already reserved, so they cost nothing extra here. Mirrors the PULL branch of
+  // _combine_shared_mem() in python/mori/ops/dispatch_combine.py; change both or neither.
+  const size_t _cPullLdsNeed =
+      ((((size_t)(1 + (UseWeights ? 1 : 0) + (UseFp8BlockwiseQuant ? 1 : 0)) * warpNum *
+         config.numExpertPerToken * sizeof(void*)) +
+        127) &
+       ~(size_t)127) +
+      (size_t)warpNum * ((MORI_COMB_PIPE && UseP2PRead) ? ((MORI_COMB_PIPE) < 2 ? 2 : (MORI_COMB_PIPE)) : 1) *
+          _cPullSrcMax * _cPullTileElems * sizeof(TokT);
+  const bool _cPullOk = _cPullType && ((int)hiddenDim >= _cPullRowElems) &&
+                        (_cPullTileElems >= _cPullRowElems) &&
+                        (!UseP2PRead || _cPullLdsNeed <= (size_t)MORI_COMB_LDS_BUDGET);
   TokT* _cPullTiles = nullptr;
   if constexpr (_cPullType) {
     constexpr int _cPullPtrArrays = 1 + (UseWeights ? 1 : 0) + (UseFp8BlockwiseQuant ? 1 : 0);
@@ -2030,9 +2523,26 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                                 sizeof(void*)) +
                                127) &
                               ~(size_t)127;
+    // Two tile sets per warp under MORI_COMB_PIPE, and only on the PULL side: PUSH's fold aliases
+    // the send tile that is already allocated, so there is no second buffer to hand out there and
+    // the pipeline below declines that case anyway. _combine_shared_mem() applies the same factor.
+    constexpr int _cPullBufs =
+        (MORI_COMB_PIPE && UseP2PRead) ? ((MORI_COMB_PIPE) < 2 ? 2 : (MORI_COMB_PIPE)) : 1;
     _cPullTiles = reinterpret_cast<TokT*>(sharedMem + _cPullBase) +
-                  (size_t)warpId * _cPullSrcMax * _cPullTileElems;
+                  (size_t)warpId * _cPullBufs * _cPullSrcMax * _cPullTileElems;
   }
+  // [L2] One descriptor for ALL sources instead of one per source. Only PUSH: there the sources are
+  // slots in THIS rank's staging buffer at a constant pitch (see TdmShapeGather), while PULL's
+  // sources are on different cards and share no base pointer at all.
+  // The rows are indexed by destPe rather than compacted, so the fetch always covers worldSize rows
+  // and folds the ones a mask says are real -- a token that deduped down to 3 sources reads one dead
+  // slot it then ignores. That slot is allocated and in bounds (destPe < worldSize by construction),
+  // it just holds whatever the previous launch left, which is why the mask cannot be inferred from
+  // the data.
+  const uint32_t _cGatherPitch =
+      (uint32_t)((size_t)config.MaxNumTokensToSendPerRank() * combXferBytes / sizeof(TokT));
+  const bool _cGatherOk = _cPullOk && !UseP2PRead && (_cPullSrcMax == config.worldSize) &&
+                          ((combXferBytes % sizeof(TokT)) == 0);
 #endif
 #if defined(MORI_COMB_TIMING)
   unsigned long long _cSetup = 0ull, _cIssue = 0ull, _cWait = 0ull, _cRed = 0ull;
@@ -2047,7 +2557,794 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 #else
 #define _CSTAMP(acc) do { } while (0)
 #endif
-  for (int i = globalWarpId; i < (args.curRankNumToken * mwIter.warpsPerItem); i += globalWarpNum) {
+  // MORI_COMB_NOGATHER is DIAGNOSTIC ONLY and PRODUCES WRONG RESULTS -- the mirror of
+  // MORI_COMB_NOPUSH, and it exists because NOPUSH alone cannot separate the two things left in a
+  // no-push build: the barrier and this loop. Pairing them prices the barrier on its own, which is
+  // the one term the REDUCE simulator (tools/tdm_redsim.cc) cannot model and therefore the one that
+  // has to be measured before the simulator's number means anything. Zeroing the trip count leaves
+  // the launch geometry, the LDS reservation and the push side byte-identical, same as NOPUSH.
+#if defined(MORI_COMB_NOGATHER)
+  const int _cRedEnd = 0;
+#else
+  const int _cRedEnd = (int)(args.curRankNumToken * mwIter.warpsPerItem);
+#endif
+#if MORI_COMB_QUAD && defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
+  // ---------------------------------------------------------------------------------------------
+  // QUAD: decompose the PULL gather by SOURCE instead of by hidden-dim chunk.
+  //
+  // Why. tools/_ct_epsim.sh mode9 measures the peer-read ceiling at exactly this launch geometry
+  // (grid 64, block 256, 4 peers) as a function of the TDM read size, and it is the read SIZE that
+  // decides it -- not the number of reads in flight:
+  //     2432 elems (4864 B) x4 in flight ->  801 GB/s      2432 x8 ->  849 GB/s
+  //     4864 elems (9728 B) x4           -> 1322 GB/s
+  //     7168 elems (14336 B, whole token) x1 -> 1241, x2   -> 1395 GB/s
+  // The chunked gather is stuck at the top line: one warp needs one tile PER SOURCE, and
+  // srcMax * hiddenDim * sizeof(TokT) * warpNum = 458 KB of LDS at 8 warps, over the 320 KB budget,
+  // so the chunk has to shrink to 2432 elems and the reads land in the slow regime.
+  //
+  // Turning the decomposition 90 degrees fixes that: warp w of a group of worldSize warps owns ONE
+  // source and reads that source's WHOLE token in one descriptor, so each warp needs one tile, not
+  // four. Double-buffered that is 2 * hiddenDim * sizeof(TokT) * warpNum = 229 KB, it fits, and the
+  // reads are the 14336 B ones. The group then folds cooperatively out of LDS: warp w reduces the
+  // w-th slice of the hidden dim across all worldSize tiles, so every byte read is folded exactly
+  // once and no warp folds a slice it did not read.
+  //
+  // The two __syncthreads are what makes the double buffer safe with a shared tile set:
+  //   top of iteration   - nobody is still folding out of the buffer we are about to overwrite
+  //   after the wait     - every warp of the group has landed its tile for THIS token
+  // and the prefetch is issued between them, so the next token's reads are in flight for the whole
+  // fold. Trip count is uniform across the block (ceil over groups), which is what lets a
+  // __syncthreads live in this loop at all; groups past the end still execute both barriers and
+  // simply fold nothing.
+  bool _qDone = false;
+  // _cPullBwq is admitted here for the reason the chunked path measured out: at chunk 2 that path
+  // spends 1323us of its 1410.7us purely on peer reads (~101 MB at 72 GB/s) while the quantise
+  // costs nothing measurable and the fold 87.6us, and more chunks make it WORSE (1410 -> 1746 from
+  // 2 to 16) even though they shrink the tiles and raise occupancy. That shape is per-descriptor
+  // overhead, not bandwidth, and QUAD is the answer to it: one whole-token descriptor per source
+  // instead of chunks x sources. fp8 also fits it better than the bf16 it already serves -- 112 KB
+  // of double buffer at 8 warps against 229 KB -- so the depth that bf16 cannot afford is free here.
+  if constexpr (_cPullType && UseP2PRead && (!UseFp8BlockwiseQuant || _cPullBwq)) {
+    // Depth and split are the two knobs the fold/transport overlap turns on. Whole-token reads
+    // (split 1) buy the fastest transport -- 119us of the 136.8us that MORI_COMB_NOROUTE +
+    // MORI_COMB_NOREDUCE leaves -- but at 8 warps they only fit twice over in LDS, so exactly one
+    // read is in flight while a token is folded and the 139us of fold+store lands on top of the
+    // transport instead of inside it. Splitting the token trades read size for depth:
+    //   split 1, depth 2: 14336 B reads, 1 in flight  (LDS 229 KB)
+    //   split 2, depth 4: 7168 B reads,  3 in flight  (LDS 229 KB)
+    //   split 2, depth 5: 7168 B reads,  4 in flight  (LDS 287 KB)
+    // and mode9 prices the reads themselves at 1395 / 1079 / 1079 GB/s respectively, so the split
+    // only pays if the overlap it buys is worth more than the 23% of read rate it costs.
+    //
+    // What the ONE read in flight at split 1 / depth 2 is worth: 71.0us, i.e. 168.9 -> 239.9 at
+    // 64x8 when MORI_COMB_QNOPF holds the LDS constant and removes only the overlap. Note what that
+    // says about reading the MORI_COMB_TIMING buckets, because it is easy to get backwards: those
+    // price fold at 2.2us and store at 21.3us, but they are measured WITH this overlap running, so
+    // they are what is left EXPOSED, not what the work costs. The warp-side work per token is
+    // ~95us; the prefetch hides ~71 of it behind the reads and ~24 stays exposed. Only the store's
+    // share stays exposed no matter how deep the ring goes, because it shares the in-order engine
+    // with the reads and cannot overlap them -- the fold, the barrier and the routing setup can.
+    constexpr int _qBufs = ((MORI_COMB_QUAD) < 2) ? 2 : (MORI_COMB_QUAD);
+    constexpr int _qSplit = ((MORI_COMB_QSPLIT) < 1) ? 1 : (MORI_COMB_QSPLIT);
+    const int _qSize = config.worldSize;
+    const int _qTile = (int)(hiddenDim / _qSplit);
+    const int _qPart = (_qSize > 0) ? (_qTile / _qSize) : 0;
+    // Whether this launch's geometry leaves room for the tiles. The gates are compile-time but
+    // warpNum is not, so a build that has QUAD enabled can still be launched at a width whose tiles
+    // do not fit -- 16 warps want 458 KB of whole-token double buffer against a 320 KB budget. That
+    // has to fall through to the chunked gather rather than run off the end of LDS, and the host's
+    // _combine_shared_mem() in python/mori/ops/dispatch_combine.py decides how much to reserve with
+    // the SAME arithmetic. The two must agree exactly: if the host sizes for QUAD and the kernel
+    // declines it (or the reverse) the reserve and the layout disagree by a tile.
+    constexpr int _qLdsPtrArrays = 1 + (UseWeights ? 1 : 0) + (UseFp8BlockwiseQuant ? 1 : 0);
+    const int _qLdsGroups = (_qSize > 0 && warpNum / _qSize > 0) ? (warpNum / _qSize) : 1;
+    size_t _qLdsNeed =
+        (((size_t)_qLdsPtrArrays * warpNum * config.numExpertPerToken * sizeof(void*)) + 127) &
+        ~(size_t)127;
+    _qLdsNeed += (size_t)warpNum * _qBufs * _qTile * sizeof(TokT);
+    _qLdsNeed += (size_t)(warpNum + 2 * _qLdsGroups) * _qBufs * sizeof(int);
+    if (MORI_COMB_QLOC) _qLdsNeed += (size_t)2 * warpNum * _qBufs * sizeof(int);
+    if (MORI_COMB_QTST) {
+      const int _qLdsOB = ((MORI_COMB_QOB) < _qBufs) ? _qBufs : (MORI_COMB_QOB);
+      _qLdsNeed = (_qLdsNeed + 127) & ~(size_t)127;
+      _qLdsNeed += (size_t)warpNum * _qLdsOB * _qPart * sizeof(T);
+    }
+    // WEIGHTS ARE HANDLED, in _qSetup below rather than here. Worth stating because the control
+    // flow reads the other way: setting _qDone skips the per-token loop at the bottom of the
+    // kernel, and that loop contains the OTHER weight reduction (Slot::CombineAccumWeights), so
+    // this path looks like it drops weights until you find _qSetup's copy. A guard that made QUAD
+    // decline whenever weightsBuf was non-null was written on that misreading and then measured
+    // out: with weights live and the guard bypassed, EP4 bf16 hidden 7168 4096 tokens at 64x8
+    // passes the bench's weight check (out_w 4096x8, all 32768 entries written). The guard is gone
+    // because it would have cost every weight-passing caller the fast path for nothing.
+    // UNRESOLVED, AND THIS IS A GUARD RATHER THAN A FIX: blockwise QUAD gives wrong results at
+    // depth 2 and correct ones at depth 4. MEASURED 64x8 EP4 fp8_blockwise MORI_COMB_QPULL=1, check
+    // armed: MORI_COMB_QUAD=2 fails the bench comparison, =4 passes at 1387.1us. Both fit LDS
+    // (114 KB and 229 KB against 320 KB) and the host reserves what the kernel lays out in both, so
+    // it is not a layout mismatch; depth is the only difference, which makes it an ordering bug in
+    // the ring rather than in the dequantise arithmetic. Until it is understood, blockwise declines
+    // QUAD below depth 4 instead of quietly computing the wrong sum -- and note that the ARCH
+    // DEFAULT picks depth 2, so without this a plain MORI_COMB_QPULL=1 run lands on the broken one.
+    // _combine_shared_mem() carries the same condition.
+    if ((!_cPullBwq || _qBufs >= 4) &&
+        _cRedEnd > 0 && _qSize >= 2 && _cPullSrcMax == _qSize && (warpNum % _qSize) == 0 &&
+        mwIter.warpsPerItem == 1 && _qPart > 0 && (hiddenDim % (size_t)(_qSplit * _qSize)) == 0 &&
+        (_qPart % (16 / (int)sizeof(T))) == 0 && _qTile >= _cPullRowElems &&
+        _qLdsNeed <= (size_t)MORI_COMB_LDS_BUDGET) {
+      const int _qPerBlk = warpNum / _qSize;
+      const int _qId = warpId / _qSize;
+      const int _qLane = warpId % _qSize;  // this warp's source, and its slice of the fold
+      const int _qGroup = (int)blockIdx.x * _qPerBlk + _qId;
+      const int _qCount = (int)gridDim.x * _qPerBlk;
+      const int _qN = (int)args.curRankNumToken;
+      const int _qIter = (_qN + _qCount - 1) / _qCount;
+      // Same layout rule as the chunked path: pointer arrays first, tiles from the next 128B row.
+      constexpr int _qPtrArrays = 1 + (UseWeights ? 1 : 0) + (UseFp8BlockwiseQuant ? 1 : 0);
+      const size_t _qBaseOff =
+          (((size_t)_qPtrArrays * warpNum * config.numExpertPerToken * sizeof(void*)) + 127) &
+          ~(size_t)127;
+      TokT* const _qTiles = reinterpret_cast<TokT*>(sharedMem + _qBaseOff);
+      TokT* const _qMine = _qTiles + (size_t)warpId * _qBufs * _qTile;
+      const TokT* const _qGroupBase = _qTiles + (size_t)(_qId * _qSize) * _qBufs * _qTile;
+      const gfx1250_TDM_GROUP1 _qPgFull = TdmShape<TokT>(_qTile);
+      const gfx1250_TDM_GROUP1 _qPgDummy = TdmShape<TokT>(_cPullRowElems);
+      // A source that dedup removed still has to issue something: the wait immediate below counts
+      // ops, not bytes, so every warp must issue exactly one per token. One 128B row off this
+      // rank's own staging is the cheapest legal load, and its tile is never folded.
+      TokT* const _qSafe = args.intraNodeTokBufs.combineInp->template GetAs<TokT*>(myPe);
+      // Build the compacted source list for one token and hand back this warp's own source. The
+      // weights, which do not go through LDS at all, are accumulated here too -- setup runs exactly
+      // once per token, one iteration AHEAD of the fold, and srcWeightsPtr is overwritten by the
+      // next call, so this is the only place they can be read.
+      auto _qSetup = [&](int _tok, int& _cntOut, int& _locOut, TokT*& _locPtrOut) -> TokT* {
+        _locOut = -1;
+        _locPtrOut = nullptr;
+        if (_tok >= _qN) {
+          _cntOut = 0;
+          return nullptr;
+        }
+        int _isLocalLane = 0;
+        for (int _j = laneId; _j < config.numExpertPerToken; _j += warpSize) {
+          index_t _dt = args.dispDestTokIdMap[(size_t)_tok * config.numExpertPerToken + _j];
+          index_t _dp = PeFromFlatTokenIndex(config, _dt);
+          if (_j == laneId && _dp == (index_t)myPe) _isLocalLane = 1;
+          if (_dp < config.worldSize) {
+            index_t _dl = LocalTokIdFromFlatTokenIndex(config, _dt);
+            srcPtrs[_j] = args.intraNodeTokBufs.combineInp->template GetAs<TokT*>(_dp) +
+                          (size_t)_dl * hiddenDim;
+            if constexpr (UseWeights) {
+              srcWeightsPtr[_j] = args.shmemInpWeightsMemObj->template GetAs<float*>(_dp) +
+                                  (size_t)_dl * config.numExpertPerToken;
+            }
+            if constexpr (_cPullBwq) {
+              // Same negative-entry-0 sentinel the chunked path reads: a producer that never had to
+              // scale leaves entry 0 positive and the fold must treat the source as unscaled.
+              float* _sp = args.shmemInpScalesMemObj->template GetAs<float*>(_dp) +
+                           (size_t)_dl * args.fp8BlockwiseCombineScaleDim;
+              srcScalePtrs[_j] = (_sp[0] < 0.0f) ? _sp : nullptr;
+            }
+          } else {
+            srcPtrs[_j] = nullptr;
+            if constexpr (UseWeights) srcWeightsPtr[_j] = nullptr;
+            if constexpr (_cPullBwq) srcScalePtrs[_j] = nullptr;
+          }
+        }
+        int _isValid = 0;
+        TokT* _myPtr = nullptr;
+        float* _myScale = nullptr;
+        if (laneId < config.numExpertPerToken) {
+          _myPtr = srcPtrs[laneId];
+          if constexpr (_cPullBwq) _myScale = srcScalePtrs[laneId];
+          _isValid = (_myPtr != nullptr) ? 1 : 0;
+        }
+        unsigned long long _mask = __ballot(_isValid);
+        const int _cnt = __popcll(_mask);
+        if (_cnt < config.numExpertPerToken && _isValid) {
+          // Scales ride the SAME compaction as the pointers, and must: the fold indexes tile _j and
+          // scale _j by one compacted index, and a tile's source is decided by which warp of the
+          // group loaded it. Compacting one and not the other silently pairs a token with another
+          // source's scale.
+          const int _slot = __popcll(_mask & ((1ULL << laneId) - 1));
+          srcPtrs[_slot] = _myPtr;
+          if constexpr (_cPullBwq) srcScalePtrs[_slot] = _myScale;
+        }
+        // Which COMPACTED slot, if any, is this rank's own copy. Whichever warp owns that slot can
+        // fetch it with ordinary vector loads, which is 29% of the gather's bytes taken off the TDM
+        // engine -- and engine bytes are what the kernel is now limited by: reads and the output
+        // store are perfectly additive at ~1750 GB/s each (145.3us for 202.47 MB of reads, 33.4us
+        // for 58.7 MB of stores, 178.7 together against 178.2 measured).
+        if (MORI_COMB_QLOC) {
+          unsigned long long _lmask = __ballot(_isValid && _isLocalLane);
+          if (_lmask) {
+            const int _ll = __builtin_ctzll(_lmask);
+            _locOut = __popcll(_mask & ((1ULL << _ll) - 1));
+            _locPtrOut = srcPtrs[_locOut];
+          }
+        }
+        if constexpr (UseWeights) {
+          if (args.weightsBuf != nullptr && _qLane == 0) {
+            core::WarpAccum<float, 4>(
+                args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
+                    (size_t)_tok * config.numExpertPerToken,
+                srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+          }
+        }
+        _cntOut = _cnt;
+        return (_qLane < _cnt) ? srcPtrs[_qLane] : nullptr;
+      };
+      auto _qIssue = [&](TokT* _dst, TokT* _src) {
+        if (_src != nullptr)
+          TdmIssueLoad<TokT, MORI_COMB_THLD, MORI_COMB_SCLD>(_dst, _src, _qPgFull);
+        else
+          TdmIssueLoad<TokT, MORI_COMB_THLD, MORI_COMB_SCLD>(_dst, _qSafe, _qPgDummy);
+      };
+      // Both DIAGNOSTIC ONLY and both PRODUCE WRONG RESULTS -- pair with MORI_BENCH_SKIPCHECK.
+      // They price the two things this decomposition adds that the chunked gather does not have:
+      // the per-token source lookup, which every warp of the group now repeats (worldSize times per
+      // token instead of once), and the cooperative fold plus its two barriers. The loads, their
+      // sizes and their peers are untouched by either, so full minus each is that term alone.
+#if defined(MORI_COMB_NOROUTE)
+      constexpr bool _qNoRoute = true;
+#else
+      constexpr bool _qNoRoute = false;
+#endif
+#if defined(MORI_COMB_NOREDUCE)
+      constexpr bool _qNoRed = true;
+#else
+      constexpr bool _qNoRed = false;
+#endif
+      // QLOC only takes a load off the engine if the fold is going to make up for it, so it rides
+      // on the unrolled four-source path and stands down for the diagnostics that delete the fold
+      // (NOREDUCE) or truncate it (QRED).
+      constexpr bool _qLocSkip =
+          (MORI_COMB_QLOC) && (MORI_COMB_QU4) && ((MORI_COMB_QRED) < 0) && !_qNoRed;
+      // QLOC=3 drops the local peer read and does NOT make up for it, so the fold adds one tile of
+      // stale LDS. DIAGNOSTIC, WRONG RESULTS -- pair with MORI_BENCH_SKIPCHECK. It is the only way
+      // to price ENGINE BYTES at the margin with everything else held fixed, which is the model the
+      // rest of this decomposition rests on.
+      constexpr bool _qLocOn = _qLocSkip && (MORI_COMB_QLOC) != 3;
+      // The unit of work is (token, part). Parts of one token are consecutive units, so the source
+      // lookup still runs once per token no matter what the split is; only the issue offset moves.
+      //
+      // The fold needs the source count that setup produced _qBufs-1 units EARLIER, and that ring
+      // lives in LDS, not in registers. A register ring is what the code wants to be, but this
+      // kernel is pinned at 128 VGPRs and already spilling 26 of them, and __launch_bounds__ does
+      // not move the pin. Carrying depth-many counts in registers pushed it to 34 spills and 224 B
+      // of scratch (llvm-readelf), and that step -- nothing else, same tiles, same stores, same
+      // reads -- is the whole difference between 402us at depth 3 and 769us at depth 4. Two LDS
+      // accesses per unit cost nothing by comparison. Each warp owns its own _qBufs slots, so no
+      // barrier orders them, and the slot written here (_uN) is never the slot read (_u).
+      constexpr bool _qFlag = (MORI_COMB_QFLAG) != 0;
+      const int _qUnits = _qIter * _qSplit;
+      int* const _qLdsAux = reinterpret_cast<int*>(_qTiles + (size_t)warpNum * _qBufs * _qTile);
+      int* const _qCntRing = _qLdsAux + warpId * _qBufs;
+      // Per-slot arrival / departure counters, one pair per GROUP, used only by MORI_COMB_QFLAG.
+      // They are monotonic -- the k-th use of a slot expects _qSize*(k+1) -- so there is no reset
+      // and no sense bit to get wrong.
+      int* const _qArrive = _qLdsAux + warpNum * _qBufs + _qId * _qBufs;
+      int* const _qDepart = _qLdsAux + (warpNum + _qPerBlk) * _qBufs + _qId * _qBufs;
+      // MORI_COMB_QLOC's local-source pointer ring, two ints per slot, same reason the count ring
+      // is in LDS rather than in registers.
+      constexpr int _qLocRingN = (MORI_COMB_QLOC) ? 2 : 0;
+      int* const _qLocRing = _qLdsAux + (warpNum + 2 * _qPerBlk) * _qBufs + 2 * warpId * _qBufs;
+      // MORI_COMB_QTST's output tiles: _qBufs per warp of _qPart elements, past the counters.
+      // _qBufs of them, not two, because the store for a unit is only known retired when the LOAD
+      // issued _qBufs-1 units later is, and that load precedes only the stores from _qBufs units
+      // back. Aligned to 128 B so every TDM store row starts on a row boundary.
+      TokT* const _qOut = reinterpret_cast<TokT*>(
+          (reinterpret_cast<uintptr_t>(_qLdsAux + (warpNum + 2 * _qPerBlk) * _qBufs +
+                                       _qLocRingN * warpNum * _qBufs) +
+           127) &
+          ~(uintptr_t)127);
+      // QTST=1 gives every warp its own output slices; QTST=2 lays the GROUP's four slices out
+      // contiguously per buffer instead, so the whole token is one descriptor and _qLane 0 ships it
+      // alone. Same LDS either way -- _qPerBlk*_qBufs*_qTile == warpNum*_qBufs*_qPart -- but the op
+      // is 14336 B rather than 3584 B, and read size is what sets the engine's rate (mode9: 4864 B
+      // -> 801 GB/s, 14336 B -> 1395). 58.7 MB of output shipped 3584 B at a time is the whole
+      // reason QTST=1 cost more than the vector stores it replaced.
+      // QTST=3 goes one step further than 2: the block's _qPerBlk groups hold CONSECUTIVE tokens
+      // (_qGroup = blockIdx*_qPerBlk + _qId), so their outputs are contiguous in combineOut, and
+      // laying the output ring out slot-major makes them contiguous in LDS too. One warp then ships
+      // the whole block's tokens in a single 28672 B descriptor. Only at _qSplit == 1, where a
+      // group's slice IS the whole token and consecutive tokens are therefore adjacent bytes.
+      constexpr bool _qTB = (MORI_COMB_QTST) == 3;
+      constexpr bool _qTG = (MORI_COMB_QTST) == 2 || _qTB;
+      static_assert(!_qTB || _qSplit == 1,
+                    "MORI_COMB_QTST=3 needs MORI_COMB_QSPLIT=1: at split>1 a group holds one PART "
+                    "of a token, and consecutive groups' parts are not adjacent in combineOut.");
+      // The output ring is sized independently of the tile ring. A store is issued one unit after
+      // its fold and only has to be retired before the fold that reuses its slot, so _qOB slots buy
+      // it _qOB-1 iterations to complete; at _qOB == _qBufs == 2 that is one, which is why the
+      // store shows up as exposed time at all. The wait immediates do not change: 2(D-1) already
+      // retires everything up to store(u-D), so any _qOB >= D is safe with no extra wait.
+      constexpr int _qOB = ((MORI_COMB_QOB) < _qBufs) ? _qBufs : (MORI_COMB_QOB);
+      T* const _qOutBase = reinterpret_cast<T*>(_qOut);
+      const size_t _qOutGrp = _qTB ? (size_t)_qId * _qTile : (size_t)_qId * _qOB * _qTile;
+      T* const _qOutMine = _qTG ? (_qOutBase + _qOutGrp + (size_t)_qLane * _qPart)
+                                : (_qOutBase + (size_t)warpId * _qOB * _qPart);
+      const size_t _qOutStride = _qTB ? (size_t)_qPerBlk * _qTile
+                                      : (_qTG ? (size_t)_qTile : (size_t)_qPart);
+      const gfx1250_TDM_GROUP1 _qPgOut = _qTG ? TdmShape<T>(_qTile) : TdmShape<T>(_qPart);
+      // tensorcnt counts loads and stores together and retires them in order, so a warp that also
+      // stores has twice as much outstanding at the wait. Issue order for such a warp is, per unit
+      // k, one store then one load; at unit u's wait the ops issued after load(u) are D-1 stores
+      // and D-1 loads. That same immediate also covers the other hazard the store introduces --
+      // the store that reads the LDS slot this unit is about to overwrite sits 2D-1 ops from the
+      // end, so waiting 2(D-1) has already retired it. Under QTST=2 only _qLane 0 stores, so the
+      // two immediates differ per warp; both are compile-time, the choice between them is not.
+      constexpr int _qTstOps = (MORI_COMB_QTST) ? (_qBufs - 1) : 0;
+      constexpr int _qWaitLd = _qBufs - 1;
+      constexpr int _qWaitSt = (_qBufs - 1) + _qTstOps;
+      const bool _qStIssuer =
+          (MORI_COMB_QTST) != 0 && (!_qTG || (_qTB ? (warpId == 0) : (_qLane == 0)));
+      int _qPreCnt = 0;
+      int _qPreLoc = -1;
+      TokT* _qPre = nullptr;
+      TokT* _qPreLocPtr = nullptr;
+      // QNOOP needs the exact op count, so both issuers report whether they actually issued. Depth
+      // 2 and a group-wide store only: at deeper rings the loads issued after this one span more
+      // than the current iteration and would need a ring to remember, and under QTST=1 the store
+      // is issued after the wait rather than before it.
+      constexpr bool _qNoOp =
+          (MORI_COMB_QNOOP) && _qBufs == 2 && _qTG && !(MORI_COMB_QNOXFER) && !(MORI_COMB_QTLATE);
+      auto _qUnitTok = [&](int _u) { return _qGroup + (_u / _qSplit) * _qCount; };
+      // QTST=2's whole-token store of a finished unit, issued by _qLane 0 for the whole group.
+      auto _qShipPrev = [&](int _up) -> bool {
+        const int _tp = _qUnitTok(_up);
+        if constexpr (_qTB) {
+          // Group 0's token, then however many of the block's consecutive tokens are real. They
+          // run out only on a group's last iteration, and the survivors are always a prefix.
+          const int _t0 = _tp - _qId;
+          int _nv = 0;
+          while (_nv < _qPerBlk && _t0 + _nv < _qN) ++_nv;
+          if (warpId != 0 || _nv == 0) return false;
+          TdmIssueStore<T, MORI_COMB_THST, MORI_COMB_SCST>(
+              args.intraNodeTokBufs.combineOut->template GetAs<T*>() + (size_t)_t0 * hiddenDim,
+              _qOutBase + (size_t)(_up % _qOB) * _qPerBlk * _qTile, TdmShape<T>(_nv * _qTile));
+          return true;
+        }
+        if (_qLane != 0 || _tp >= _qN) return false;
+        TdmIssueStore<T, MORI_COMB_THST, MORI_COMB_SCST>(
+            args.intraNodeTokBufs.combineOut->template GetAs<T*>() +
+                (size_t)_tp * hiddenDim + (size_t)(_up % _qSplit) * (size_t)_qTile,
+            _qOutBase + _qOutGrp + (size_t)(_up % _qOB) * _qTile, _qPgOut);
+        return true;
+      };
+      auto _qLaunch = [&](int _u) -> bool {
+        const int _part = (_qSplit == 1) ? 0 : (_u % _qSplit);
+        if (_part == 0 && !(_qNoRoute && _u > 0))
+          _qPre = _qSetup(_qUnitTok(_u), _qPreCnt, _qPreLoc, _qPreLocPtr);
+        // The local source's index rides in the count ring's high bits rather than in a ring of its
+        // own; the count itself is at most topk.
+        _qCntRing[_u % _qBufs] =
+            (MORI_COMB_QLOC) ? (_qPreCnt | ((_qPreLoc + 1) << 8)) : _qPreCnt;
+        if (MORI_COMB_QLOC) {
+          const uint64_t _lp = (uint64_t)(uintptr_t)_qPreLocPtr;
+          _qLocRing[2 * (_u % _qBufs)] = (int)(uint32_t)_lp;
+          _qLocRing[2 * (_u % _qBufs) + 1] = (int)(uint32_t)(_lp >> 32);
+        }
+        if (MORI_COMB_QNOXFER) return false;
+        // The warp that owns the local source issues a DUMMY load: the fold will read that source
+        // straight from HBM, but outside QNOOP the op must still exist or the wait immediates,
+        // which are counts of outstanding ops, would be wrong for this warp alone.
+        const bool _qSkip = _qLocSkip && (_qPreLoc == _qLane) && (_qPreCnt == 4);
+        TokT* const _src =
+            (_qPre != nullptr && !_qSkip) ? (_qPre + (size_t)_part * _qTile) : nullptr;
+        if (_qNoOp && _src == nullptr) return false;
+        _qIssue(_qMine + (size_t)(_u % _qBufs) * _qTile, _src);
+        return true;
+      };
+      // A warp signals a slot after its own peer read for that slot has landed, and waits for the
+      // group's four signals before folding it. Only lane 0 touches the counter; the wave is in
+      // lockstep, so the spin holds the whole warp, and the dscnt wait is what publishes the tile
+      // the TDM engine wrote (tensorcnt already retired it) before the flag becomes visible.
+      auto _qSignal = [&](int* _p) {
+        asm volatile("s_wait_dscnt 0x0" ::: "memory");
+        if (laneId == 0)
+          __hip_atomic_fetch_add(_p, 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_WORKGROUP);
+      };
+      auto _qSpin = [&](int* _p, int _want) {
+        if (laneId == 0) {
+          while (__hip_atomic_load(_p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_WORKGROUP) < _want)
+            __builtin_amdgcn_s_sleep(1);
+        }
+        asm volatile("s_wait_dscnt 0x0" ::: "memory");
+      };
+      if (_qFlag) {
+        for (int _k = (int)threadIdx.x; _k < 2 * _qPerBlk * _qBufs; _k += (int)blockDim.x)
+          _qLdsAux[warpNum * _qBufs + _k] = 0;
+        __syncthreads();
+      }
+      // Same rule as the chunked fold: pin the OUTPUT at 16B, the widest vector there is, and let
+      // the element count follow from T so the tile read narrows to whatever TokT needs. Deriving
+      // the count from the tile instead -- which is what this did while T and TokT were always the
+      // same type -- gives 16 elements on an fp8 tile and asks for a 32B store. Both existing
+      // instantiations are unchanged: bf16 is 8 elems / 16B read, fp32 is 4 elems / 16B read.
+      constexpr int _qOutVB = 16;
+      constexpr int _qV = _qOutVB / (int)sizeof(T);
+      constexpr int _qVB = _qV * (int)sizeof(TokT);
+      using _QVecT = typename core::VecTypeSelector<_qVB>::dataType;
+      using _QOutVecT = typename core::VecTypeSelector<_qOutVB>::dataType;
+      // Per-block scale for the dequantising fold. blockElems (128 or 256) is a multiple of _qV, so
+      // one vector never straddles two scale blocks and the scale is loaded once per source per
+      // vector rather than per element.
+      const int _qBlkElems =
+          _cPullBwq ? (int)((hiddenDim + args.fp8BlockwiseCombineScaleDim - 1) /
+                            args.fp8BlockwiseCombineScaleDim)
+                    : 1;
+      constexpr bool _qCvtPk = std::is_same_v<TokT, hip_bfloat16> && std::is_same_v<T, hip_bfloat16>;
+      // Round to the VECTOR width, not to a whole warp's worth of it. Rounding to warpSize*_qV
+      // throws the remainder at the 2-byte-per-lane scalar loop below, and the remainder is not
+      // small: _qPart is 1792 elements at split 1 (14% scalar) and 896 at split 2 (43%), which is
+      // most of why splitting the tile looked like it cost 3x. The enable condition already
+      // guarantees _qPart % _qV == 0, so this leaves nothing over; the last vector iteration just
+      // runs with some lanes idle.
+      const int _qnv = (_qPart / _qV) * _qV;
+      // QLOC>=2 stages the local source in REGISTERS before the barrier instead of loading it
+      // inside the fold. QLOC=1 is 96us slower than no QLOC at all, and that is not bandwidth: the
+      // fold's four chunks each expose a full HBM round trip, ~1500 cycles x 4 x 32 units, which is
+      // the whole regression. Issued up here the loads sit in flight across the barrier and the
+      // tensorcnt wait -- exactly where the warp has nothing to do -- and the fold finds them
+      // arrived. The barrier's asm memory clobber is what keeps the scheduler from sinking them
+      // back down to their uses.
+      constexpr int _qPF = 4;
+      const bool _qLocPf = (MORI_COMB_QLOC) >= 2 && _qnv <= _qPF * warpSize * _qV;
+      for (int _k = 0; _k < _qBufs - 1 && _k < _qUnits; ++_k) _qLaunch(_k);
+      for (int _u = 0; _u < _qUnits; ++_u) {
+        const int _tok = _qUnitTok(_u);
+        const int _buf = _u % _qBufs;
+        const int _obuf = _u % _qOB;
+        const int _cntRaw = _qCntRing[_buf];
+        const int _cntCur = (MORI_COMB_QLOC) ? (_cntRaw & 0xff) : _cntRaw;
+        const int _locCur = (MORI_COMB_QLOC) ? ((_cntRaw >> 8) - 1) : -1;
+        const TokT* _locPtr = nullptr;
+        if (MORI_COMB_QLOC) {
+          const uint64_t _lp = (uint32_t)_qLocRing[2 * _buf] |
+                               ((uint64_t)(uint32_t)_qLocRing[2 * _buf + 1] << 32);
+          _locPtr = (const TokT*)(uintptr_t)_lp;
+        }
+        const int _uPart = _u % _qSplit;
+        const bool _qPfOn = _qLocPf && _qLocOn && _tok < _qN && _cntCur == 4 && _locCur >= 0 &&
+                            _locPtr != nullptr;
+        _QVecT _qPfv[_qPF];
+        if (_qPfOn) {
+          const TokT* const _gp =
+              _locPtr + (size_t)_uPart * (size_t)_qTile + (size_t)_qLane * (size_t)_qPart;
+#pragma unroll
+          for (int _k = 0; _k < _qPF; ++_k) {
+            const int _e = laneId * _qV + _k * warpSize * _qV;
+            if (_e < _qnv) _qPfv[_k] = *reinterpret_cast<const _QVecT*>(_gp + _e);
+          }
+        }
+        if (!_qFlag) _Q_BARRIER();
+        // With flags there is no barrier above, so the warp that ships unit u-1 has to establish
+        // for itself that its group finished folding INTO that output slot. Same predicate as the
+        // refill spin further down -- at _qBufs == 2 the slot being shipped and the slot about to
+        // be refilled are the same one -- but it has to run BEFORE the store, not after it.
+        // Without this the flag path and QTST=2 are silently racy rather than merely slow.
+        if (_qFlag && _qTG && !_qTB && _u > 0 && _qLane == 0)
+          _qSpin(&_qDepart[(_u - 1) % _qBufs], _qSize * ((_u - 1) / _qBufs + 1));
+        // QTST=2 ships the PREVIOUS unit here rather than at the end of its own iteration: the
+        // barrier just above is what makes all four warps' slices of that tile visible, and it is
+        // the earliest point at which one warp may read the other three's work.
+        //
+        // QTLATE moves it after this unit's load is issued instead. Same ops, same immediates --
+        // only the order they enter the engine changes. Worth a gate because the engine retires in
+        // order, so a store queued ahead of a load delays that load by its whole service time,
+        // while a store queued behind it is off the critical path: the store has _qOB-1 iterations
+        // before its slot is reused, and nothing waits on it in between.
+        bool _qStNow = false;
+        if (_qTG && _u > 0 && !(MORI_COMB_QTLATE)) _qStNow = _qShipPrev(_u - 1);
+        // Steady state: unit _u's tile is the oldest of exactly _qBufs-1 outstanding ops, and that
+        // is a compile-time immediate. Only the drain at the end of the loop, where fewer are left
+        // in flight, needs the switch -- the builtin takes an immediate, not a value.
+        const int _uN = _u + _qBufs - 1;
+        // Refilling a slot needs every warp of the group done folding its previous occupant, which
+        // under flags is a wait on that slot's departures rather than on the whole block.
+        if (_qFlag && _uN < _qUnits && _uN >= _qBufs)
+          _qSpin(&_qDepart[_uN % _qBufs], _qSize * (_uN / _qBufs));
+        if (_qNoOp) {
+          // Everything this warp put in the engine AFTER the load it is about to consume: at depth
+          // 2 that is this iteration's store and this iteration's launch, both just decided. A warp
+          // that skipped its own load waits on a count that is at least what it has outstanding, so
+          // the wait is a no-op for it, which is the whole point.
+          const bool _qLdNow = (_uN < _qUnits) ? _qLaunch(_uN) : false;
+          switch ((_qStNow ? 1 : 0) + (_qLdNow ? 1 : 0)) {
+            case 1: __builtin_amdgcn_s_wait_tensorcnt(1); break;
+            case 2: __builtin_amdgcn_s_wait_tensorcnt(2); break;
+            default: __builtin_amdgcn_s_wait_tensorcnt(0); break;
+          }
+        } else if (MORI_COMB_QNOXFER) {
+          if (_uN < _qUnits) _qLaunch(_uN);
+          if (_qTG && _u > 0 && (MORI_COMB_QTLATE)) _qShipPrev(_u - 1);
+        } else if (_uN < _qUnits) {
+          _qLaunch(_uN);
+          if (_qTG && _u > 0 && (MORI_COMB_QTLATE)) _qShipPrev(_u - 1);
+          if (MORI_COMB_QNOPF)
+            // Prices what the depth buys, without touching the LDS layout that pays for it. Waiting
+            // for the prefetch too leaves NOTHING in flight across the fold, which is depth 1's
+            // timing structure at depth 2's footprint, so the delta is the overlap alone and not
+            // the tile budget. Correctness-preserving -- a longer wait never releases a tile early
+            // -- so it runs with the check on. Diagnostic only.
+            //
+            // MEASURED at 64x8 ZC=1, two runs each: 168.7/169.1us with the prefetch against
+            // 239.8/240.0 without, so the second buffer is worth 71.0us -- 42% of the kernel, on
+            // 0.4us of run-to-run noise. (Timing runs, SKIPCHECK; the gates they share are the ones
+            // endorsed rc=0 with the check on, and this branch only ever waits LONGER.)
+            // DO NOT "SAVE" IT. The 14336 B/warp it costs buys nothing
+            // back at this geometry anyway: 64 blocks on 256 CUs is one block per CU whether the
+            // block asks for 281 KB or 141 KB.
+            __builtin_amdgcn_s_wait_tensorcnt(0);
+          else if (_qStIssuer)
+            __builtin_amdgcn_s_wait_tensorcnt(_qWaitSt);
+          else
+            __builtin_amdgcn_s_wait_tensorcnt(_qWaitLd);
+        } else {
+          if (_qTG && _u > 0 && (MORI_COMB_QTLATE)) _qShipPrev(_u - 1);
+          switch ((_qUnits - 1 - _u) + (_qStIssuer ? _qTstOps : 0)) {
+            case 1: __builtin_amdgcn_s_wait_tensorcnt(1); break;
+            case 2: __builtin_amdgcn_s_wait_tensorcnt(2); break;
+            case 3: __builtin_amdgcn_s_wait_tensorcnt(3); break;
+            case 4: __builtin_amdgcn_s_wait_tensorcnt(4); break;
+            case 5: __builtin_amdgcn_s_wait_tensorcnt(5); break;
+            case 6: __builtin_amdgcn_s_wait_tensorcnt(6); break;
+            case 7: __builtin_amdgcn_s_wait_tensorcnt(7); break;
+            case 8: __builtin_amdgcn_s_wait_tensorcnt(8); break;
+            case 9: __builtin_amdgcn_s_wait_tensorcnt(9); break;
+            default: __builtin_amdgcn_s_wait_tensorcnt(0); break;
+          }
+        }
+        if (_qFlag) {
+          _qSignal(&_qArrive[_buf]);
+          _qSpin(&_qArrive[_buf], _qSize * (_u / _qBufs + 1));
+        } else {
+          _Q_BARRIER();
+        }
+        // Under QTST every unit with a real token must issue exactly one store, because the wait
+        // immediate above counts ops. _tok >= _qN is the only skip that is safe to leave out: it
+        // can only happen on a group's last token iteration and every unit after it is skipped
+        // too, so the loads those later units under-wait on are never folded. A live token with
+        // no sources would not be, hence the zero fill rather than a skip.
+        const bool _qOutTdm = (MORI_COMB_QTST) && (_tok < _qN);
+        if (_qOutTdm && (_qNoRed || _cntCur <= 0)) {
+          for (int _e = laneId; _e < _qPart; _e += warpSize)
+            (_qOutMine + (size_t)_obuf * _qOutStride)[_e] = T(0.0f);
+        }
+        if (!_qNoRed && _tok < _qN && _cntCur > 0) {
+          // MORI_COMB_QRED caps how many of the token's sources are actually folded. 0 stores a
+          // zero and touches no tile, which prices the output store on its own; 1 prices one
+          // source's LDS read and add. DIAGNOSTIC, WRONG RESULTS unless it covers every source.
+          const int _cntRed = ((MORI_COMB_QRED) < 0 || (MORI_COMB_QRED) > _cntCur)
+                                  ? _cntCur
+                                  : (MORI_COMB_QRED);
+          const size_t _o = (size_t)_qLane * (size_t)_qPart;
+          // Under QTST the fold's destination is an LDS tile that the engine ships afterwards, so
+          // every write below is a ds_store and the loop issues no vector memory at all. The two
+          // pointers stay SEPARATE and the choice is if constexpr inside _qStore: selecting them
+          // with a ternary makes the result a generic pointer, and the backend then loses the
+          // address space for the QTST=0 case too and emits flat_store for every output store.
+          T* const _out = args.intraNodeTokBufs.combineOut->template GetAs<T*>() +
+                          (size_t)_tok * hiddenDim + (size_t)_uPart * (size_t)_qTile + _o;
+          T* const _outLds = _qOutMine + (size_t)_obuf * _qOutStride;
+          const TokT* const _tBase = _qGroupBase + (size_t)_buf * _qTile + _o;
+          const size_t _tStride = (size_t)_qBufs * _qTile;
+          auto _qStore = [&](int _e, _QOutVecT _v) {
+            if constexpr (MORI_COMB_QTST) {
+              // _outLds is T-typed, so this store is output-width like the global one below, not
+              // tile-width -- the two stopped being the same thing once TokT could be fp8.
+              *reinterpret_cast<_QOutVecT*>(_outLds + _e) = _v;  // the engine ships it below
+            } else if constexpr (MORI_COMB_QST16) {
+              __builtin_nontemporal_store(*reinterpret_cast<const _mori_v4i*>(&_v),
+                                          reinterpret_cast<_mori_v4i*>(_out + _e));
+            } else {
+              core::store<_qOutVB>(_out + _e, _v);
+            }
+          };
+          // MORI_COMB_QLOC: three tiles from LDS, this rank's own copy straight from HBM. The
+          // rotation changes the ORDER of the four adds, which is why this is not bit-identical to
+          // the path below -- it is still four bf16 values widened to f32, and the compaction has
+          // already reordered them away from the reference's expert order, so the accumulate order
+          // was never the reference's to begin with.
+          //
+          // The tile the skipped source would have filled is left untouched and never read. Mixing
+          // the two address spaces in one pointer is what has to be avoided, not the two loops:
+          // a select between an LDS and a global pointer makes the result generic and the backend
+          // then emits flat_load for ALL FOUR sources.
+          // Both specialisations below still assume T and TokT are one type in their output union,
+          // and neither applies a scale, so blockwise takes the general loop. QLOC would also have
+          // to dequantise a source read straight from HBM rather than from a tile.
+          if (!_cPullBwq && _qLocOn && _cntRed == 4 && _locCur >= 0 && _locPtr != nullptr) {
+            const TokT* const _g = _locPtr + (size_t)_uPart * (size_t)_qTile + _o;
+            const TokT* _p0 = _tBase + (size_t)((_locCur + 1) & 3) * _tStride;
+            const TokT* _p1 = _tBase + (size_t)((_locCur + 2) & 3) * _tStride;
+            const TokT* _p2 = _tBase + (size_t)((_locCur + 3) & 3) * _tStride;
+            auto _qFold3 = [&](int _e, const _QVecT& _vg) {
+              const _QVecT _v0 = *reinterpret_cast<const _QVecT*>(_p0 + _e);
+              const _QVecT _v1 = *reinterpret_cast<const _QVecT*>(_p1 + _e);
+              const _QVecT _v2 = *reinterpret_cast<const _QVecT*>(_p2 + _e);
+              float _qAcc[_qV];
+              // Output-typed even though this specialisation only ever runs for T == TokT: it is
+              // still COMPILED for the fp8 instantiation (the _cPullBwq test that skips it is a
+              // runtime if, not if constexpr), so the union has to describe the store, not the tile.
+              union {
+                _QOutVecT _ov;
+                T _oe[_qV];
+                uint32_t _ow[_qOutVB / 4];
+              };
+#pragma unroll
+              for (int _k = 0; _k < _qV; ++_k) {
+                const float _s = (float)(reinterpret_cast<const TokT*>(&_vg)[_k]) +
+                                 (float)(reinterpret_cast<const TokT*>(&_v0)[_k]) +
+                                 (float)(reinterpret_cast<const TokT*>(&_v1)[_k]) +
+                                 (float)(reinterpret_cast<const TokT*>(&_v2)[_k]);
+                if constexpr ((MORI_COMB_QCVT) && _qCvtPk) {
+                  _qAcc[_k] = _s;
+                } else {
+                  _oe[_k] = T(_s);
+                }
+              }
+              if constexpr ((MORI_COMB_QCVT) && _qCvtPk) {
+#pragma unroll
+                for (int _k = 0; _k < _qV / 2; ++_k)
+                  _ow[_k] = MoriPackTo2<TokT>(_qAcc[2 * _k], _qAcc[2 * _k + 1]);
+              }
+              _qStore(_e, _ov);
+            };
+            if (_qPfOn) {
+#pragma unroll
+              for (int _k = 0; _k < _qPF; ++_k) {
+                const int _e = laneId * _qV + _k * warpSize * _qV;
+                if (_e < _qnv) _qFold3(_e, _qPfv[_k]);
+              }
+            } else {
+              for (int _e = laneId * _qV; _e < _qnv; _e += warpSize * _qV)
+                _qFold3(_e, *reinterpret_cast<const _QVecT*>(_g + _e));
+            }
+          } else if (!_cPullBwq && (MORI_COMB_QU4) && _cntRed == 4) {
+            const TokT* _p0 = _tBase;
+            const TokT* _p1 = _tBase + _tStride;
+            const TokT* _p2 = _tBase + 2 * _tStride;
+            const TokT* _p3 = _tBase + 3 * _tStride;
+            for (int _e = laneId * _qV; _e < _qnv; _e += warpSize * _qV) {
+              const _QVecT _v0 = *reinterpret_cast<const _QVecT*>(_p0 + _e);
+              const _QVecT _v1 = *reinterpret_cast<const _QVecT*>(_p1 + _e);
+              const _QVecT _v2 = *reinterpret_cast<const _QVecT*>(_p2 + _e);
+              const _QVecT _v3 = *reinterpret_cast<const _QVecT*>(_p3 + _e);
+              float _qAcc[_qV];
+              // Output-typed even though this specialisation only ever runs for T == TokT: it is
+              // still COMPILED for the fp8 instantiation (the _cPullBwq test that skips it is a
+              // runtime if, not if constexpr), so the union has to describe the store, not the tile.
+              union {
+                _QOutVecT _ov;
+                T _oe[_qV];
+                uint32_t _ow[_qOutVB / 4];
+              };
+#pragma unroll
+              for (int _k = 0; _k < _qV; ++_k) {
+                // Left to right, exactly the order the accumulating loop below uses.
+                const float _s = (float)(reinterpret_cast<const TokT*>(&_v0)[_k]) +
+                                 (float)(reinterpret_cast<const TokT*>(&_v1)[_k]) +
+                                 (float)(reinterpret_cast<const TokT*>(&_v2)[_k]) +
+                                 (float)(reinterpret_cast<const TokT*>(&_v3)[_k]);
+                if constexpr ((MORI_COMB_QCVT) && _qCvtPk) {
+                  _qAcc[_k] = _s;
+                } else {
+                  _oe[_k] = T(_s);
+                }
+              }
+              if constexpr ((MORI_COMB_QCVT) && _qCvtPk) {
+#pragma unroll
+                for (int _k = 0; _k < _qV / 2; ++_k)
+                  _ow[_k] = MoriPackTo2<TokT>(_qAcc[2 * _k], _qAcc[2 * _k + 1]);
+              }
+              _qStore(_e, _ov);
+            }
+          } else {
+            for (int _e = laneId * _qV; _e < _qnv; _e += warpSize * _qV) {
+              float _a[_qV];
+#pragma unroll
+              for (int _k = 0; _k < _qV; ++_k) _a[_k] = 0.0f;
+              // Absolute position in the token: this warp folds slice _o of chunk _uPart.
+              const int _qSb =
+                  _cPullBwq
+                      ? (int)(((size_t)_uPart * (size_t)_qTile + _o + (size_t)_e) / _qBlkElems)
+                      : 0;
+              for (int _j = 0; _j < _cntRed; ++_j) {
+                _QVecT _sv =
+                    *reinterpret_cast<const _QVecT*>(_tBase + (size_t)_j * _tStride + (size_t)_e);
+                float _qs = 1.0f;
+                if constexpr (_cPullBwq) {
+                  const float* _sp = srcScalePtrs[_j];
+                  if (_sp != nullptr) {
+                    _qs = _sp[_qSb];
+                    if (_qSb == 0 && _qs < 0.0f) _qs = -_qs;
+                  }
+                }
+#pragma unroll
+                for (int _k = 0; _k < _qV; ++_k) {
+                  const float _v = (float)(reinterpret_cast<const TokT*>(&_sv)[_k]);
+                  _a[_k] += _cPullBwq ? (_v * _qs) : _v;
+                }
+              }
+              union {
+                _QOutVecT _ov;
+                T _oe[_qV];
+                uint32_t _ow[_qOutVB / 4];
+              };
+              if constexpr ((MORI_COMB_QCVT) && _qCvtPk) {
+#pragma unroll
+                for (int _k = 0; _k < _qV / 2; ++_k)
+                  _ow[_k] = MoriPackTo2<TokT>(_a[2 * _k], _a[2 * _k + 1]);
+              } else {
+#pragma unroll
+                for (int _k = 0; _k < _qV; ++_k) _oe[_k] = T(_a[_k]);
+              }
+              _qStore(_e, _ov);
+            }
+          }
+          for (int _e = _qnv + laneId; _e < _qPart; _e += warpSize) {
+            float _acc = 0.0f;
+            const int _qTSb =
+                _cPullBwq ? (int)(((size_t)_uPart * (size_t)_qTile + _o + (size_t)_e) / _qBlkElems)
+                          : 0;
+            for (int _j = 0; _j < _cntRed; ++_j) {
+              if constexpr (_cPullBwq) {
+                float _qs = 1.0f;
+                const float* _sp = srcScalePtrs[_j];
+                if (_sp != nullptr) {
+                  _qs = _sp[_qTSb];
+                  if (_qTSb == 0 && _qs < 0.0f) _qs = -_qs;
+                }
+                _acc += (float)(_qGroupBase[((size_t)_j * _qBufs + (size_t)_buf) * _qTile + _o +
+                                            (size_t)_e]) *
+                        _qs;
+                continue;
+              }
+              // Under QLOC one of the tiles was never filled; that source lives in HBM. Empty in
+              // the shipped configuration -- _qPart is a multiple of the vector width -- but the
+              // loop above is not the only reader of the tiles and this one must agree with it.
+              if (_qLocOn && _cntRed == 4 && _j == _locCur && _locPtr != nullptr) {
+                _acc += (float)(_locPtr[(size_t)_uPart * (size_t)_qTile + _o + (size_t)_e]);
+                continue;
+              }
+              _acc += (float)(_qGroupBase[((size_t)_j * _qBufs + (size_t)_buf) * _qTile + _o +
+                                          (size_t)_e]);
+            }
+            if constexpr (MORI_COMB_QTST)
+              _outLds[_e] = T(_acc);
+            else
+              _out[_e] = T(_acc);
+          }
+        }
+        if (_qOutTdm && !_qTG) {
+          // The engine reads LDS, so the fold's ds_stores into the tile have to have retired.
+          asm volatile("s_wait_dscnt 0x0" ::: "memory");
+          TdmIssueStore<T, MORI_COMB_THST, MORI_COMB_SCST>(
+              args.intraNodeTokBufs.combineOut->template GetAs<T*>() + (size_t)_tok * hiddenDim +
+                  (size_t)_uPart * (size_t)_qTile + (size_t)_qLane * (size_t)_qPart,
+              _qOutMine + (size_t)_obuf * _qPart, _qPgOut);
+        }
+        if (_qFlag) _qSignal(&_qDepart[_buf]);
+      }
+      if (_qTG && _qUnits > 0) {
+        _Q_BARRIER();  // publish the last unit's four slices before one warp reads them
+        _qShipPrev(_qUnits - 1);
+      }
+      if (MORI_COMB_QTST) {
+        __builtin_amdgcn_s_wait_tensorcnt(0);
+        // Only _qLane 0 waited under QTST=2, and the tiles it was reading are shared, so the rest
+        // of the group must not run on into anything that reuses LDS.
+        if (_qTG) __syncthreads();
+      }
+      // The tail barrier is what the flag path owes the rest of the kernel: a warp can leave the
+      // loop while its group is still folding out of LDS, and whatever runs next must not reuse it.
+      if (_qFlag) __syncthreads();
+      _qDone = true;
+    }
+  }
+  if (!_qDone)
+#endif
+  for (int i = globalWarpId; i < _cRedEnd; i += globalWarpNum) {
     int tokenId, inTokenPartId;
     size_t hiddenDimOffset, hiddenDimSize;
     mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
@@ -2128,9 +3425,52 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         }
       }
     }
+#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
+    // [L2] Which of the worldSize rows the one gather brings back are real contributions. The
+    // compaction above destroys this: it packs the survivors down to srcPtrs[0..validAccumCount) in
+    // ballot order, so after it runs the index no longer says which destPe a pointer came from --
+    // which is the only thing the row layout is keyed on. Re-deriving destPe here costs one extra
+    // read of a line the loop above just touched, against inverting a compaction the fallback path
+    // still wants. worldSize <= warpSize and topk < warpSize (asserted above), so each of the topk
+    // entries lives on its own lane and __ballot sees all of them.
+    int _peMask = 0;
+    const TokT* _gBase = nullptr;
+    if (_cGatherOk) {
+      int _lanePe = -1;
+      if (laneId < config.numExpertPerToken) {
+        index_t _dt = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + laneId];
+        _lanePe = (int)PeFromFlatTokenIndex(config, _dt);
+      }
+      for (int p = 0; p < config.worldSize; ++p)
+        if (__ballot(_lanePe == p) != 0ull) _peMask |= (1 << p);
+      // Row 0 is destPe 0's slot whether or not destPe 0 contributed; the pitch walks the rest.
+      _gBase = reinterpret_cast<const TokT*>(
+                   args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
+                   (size_t)SendBufSlotOffset(config, 0, tokenId) * combXferBytes) +
+               hiddenDimOffset;
+    }
+#endif
     _CSTAMP(_cSetup);
 
-    if constexpr (UseFp8BlockwiseQuant) {
+#if defined(MORI_COMB_DUMPCNT)
+    // DIAGNOSTIC, WRONG OUTPUT BY CONSTRUCTION: write the number of non-null sources this warp is
+    // about to fold instead of the sum. The PUSH bug drops exactly one contribution and the lost one
+    // reads 0.0, which is either "the pointer was never built" (count is short) or "the fold skipped
+    // a good pointer" (count is right). One run separates the two. Pair with MORI_BENCH_SKIPCHECK.
+    for (size_t _e = laneId; _e < hiddenDimSize; _e += warpSize) {
+      outPtr[_e] = (T)(float)validAccumCount;
+    }
+    continue;
+#endif
+
+    // _cPullBwq steers blockwise AWAY from these helpers and into the TDM tile path in the else
+    // below. It has to be done by narrowing this chain rather than by a runtime test inside it:
+    // `else if constexpr` is a COMPILE-time chain, so while blockwise matched here the tile block
+    // was never instantiated for it at all -- which is why allocating tiles and sweeping
+    // MORI_COMB_TDM moved nothing (4745.8us at 4 chunks against 4754.1 at 8). The tile path still
+    // declines at runtime on shape or LDS budget, and the fallback at the end of the else picks
+    // those up, so this is a redirect and not a replacement.
+    if constexpr (UseFp8BlockwiseQuant && !_cPullBwq) {
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
       if constexpr (Vec8Top8BlockElems != 0) {
         if (mwIter.warpsPerItem == 1) {
@@ -2164,15 +3504,17 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
               hiddenDimSize, hiddenDim, args.fp8BlockwiseCombineScaleDim);
         }
       }
-    } else if constexpr (!std::is_same_v<T, TokT> &&
+    } else if constexpr (!_cPullBwq && !std::is_same_v<T, TokT> &&
                          std::is_same_v<TokT, core::CombineInternalFp8>) {
+      // Blockwise has to be kept out of here too, and not only out of the branch above: it is
+      // bf16-out/fp8-tok, so it MATCHES this condition, and this helper is the unscaled cast. It
+      // would silently sum raw fp8 and throw every scale away.
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
       core::WarpAccumCombineInternalFp8ToBf16(outPtr, reinterpret_cast<const TokT* const*>(srcPtrs),
                                               validAccumCount, laneId, hiddenDimSize);
     } else {
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
-#if defined(MORI_COMB_TDM) && defined(MORI_DISP_TDM) && \
-    (defined(__gfx1250__) || defined(__gfx1251__))
+#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
       // if constexpr, not a plain if: this body is only well-formed for a 2/4-byte T==TokT. A runtime
       // if still instantiates it for every TokT the kernel is built with, and the fp4 combine
       // instantiation (TokT = mori_fp4x2_e2m1, 1 byte) has no conversion to float -- which is exactly
@@ -2181,6 +3523,123 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       if constexpr (_cPullType) {
         if (_cPullOk && (int)validAccumCount <= _cPullSrcMax) {
         const int _nSrc = (int)validAccumCount;
+#if MORI_COMB_PIPE
+        // Software pipeline for the PULL gather: issue chunk k+1's loads BEFORE folding chunk k, so
+        // the fabric is never idle while the lanes are doing fp32 adds and the output store.
+        //
+        // Why it matters here and not on the push side: the unpipelined loop is
+        // issue -> s_wait_tensorcnt(0) -> fold -> store, and the fold half has NOTHING in flight.
+        // Measured at 64x8 ZC=1 MORI_COMB_TDM=2, gather+fold is 228.7us for 202.47MB of peer reads
+        // = 885 GB/s against a 1.40 TB/s P2P read ceiling, and the per-warp arithmetic is nowhere
+        // near enough to explain the gap.
+        //
+        // s_wait_tensorcnt takes an IMMEDIATE, so the number of ops in flight from the next chunk
+        // has to be a compile-time constant. It is made constant by issuing exactly _cPipeSrc ops
+        // per chunk regardless of how many sources survived dedup: a dead source gets a 128B dummy
+        // load (one legal TDM row) into its own tile, which is never folded. That costs
+        // (srcMax - validAccumCount) * 128 B per chunk instead of the 16% of a full extra row that
+        // padding with real loads would cost.
+        //
+        // Relies on tensorcnt retiring in issue order, which is the same assumption s_waitcnt vmcnt
+        // makes for loads. If it does not hold, the fold reads a tile that is still being written
+        // and the bench's combine check fails -- so this gate is always run once WITHOUT
+        // MORI_BENCH_SKIPCHECK before any timing is believed.
+        constexpr int _cPipeSrc = 4;
+        constexpr int _cPipeBufs = (MORI_COMB_PIPE) < 2 ? 2 : (MORI_COMB_PIPE);
+        constexpr int _cPipeAhead = _cPipeBufs - 1;
+        const int _cPipeChunks =
+            (int)((hiddenDimSize + (size_t)_cPullTileElems - 1) / (size_t)_cPullTileElems);
+        // A chunk shorter than one 128B TDM row cannot be issued, and letting one appear mid-ring
+        // would desynchronise the fixed wait immediates below. Hand the whole token to the
+        // unpipelined loop instead; at hidden 7168 with 64-element-rounded tiles it never happens.
+        const bool _cPipeFits =
+            (_cPipeChunks >= 1) &&
+            ((size_t)(hiddenDimSize - (size_t)(_cPipeChunks - 1) * _cPullTileElems) *
+                 sizeof(TokT) >=
+             128);
+        // _foldChunk below is a second copy of the fold and has no dequantise in it, so blockwise
+        // must not enter the pipeline -- it would sum raw fp8 and drop every scale.
+        if (!_cPullBwq && !_cGatherOk && _cPullSrcMax == _cPipeSrc && _nSrc >= 1 && _cPipeFits &&
+            (size_t)_cPullTileElems * sizeof(TokT) >= 128) {
+          const int _tile = _cPullTileElems;
+          const gfx1250_TDM_GROUP1 _pgFull = TdmShape<TokT>(_tile);
+          const gfx1250_TDM_GROUP1 _pgDummy = TdmShape<TokT>(_cPullRowElems);
+          // _cPipeBufs tile sets per warp; _combine_shared_mem() scales tiles_per_warp by the same
+          // factor. Bytes IN FLIGHT per CU is what this knob buys: 8 warps * (bufs-1) * srcMax *
+          // tile, against a fabric read whose round trip the LDS budget is too small to cover.
+          auto _issueChunk = [&](size_t _o, int _n, TokT* _tb) {
+            const gfx1250_TDM_GROUP1 _pg = (_n == _tile) ? _pgFull : TdmShape<TokT>(_n);
+#pragma unroll
+            for (int _j = 0; _j < _cPipeSrc; ++_j) {
+              if (_j < _nSrc)
+                TdmIssueLoad<TokT>(_tb + (size_t)_j * _tile, srcPtrs[_j] + _o, _pg);
+              else
+                TdmIssueLoad<TokT>(_tb + (size_t)_j * _tile, srcPtrs[0] + _o, _pgDummy);
+            }
+          };
+          auto _foldChunk = [&](size_t _o, int _n, const TokT* _tb) {
+            constexpr int _pVB = 16;
+            constexpr int _pV = _pVB / (int)sizeof(TokT);
+            using _PVecT = typename core::VecTypeSelector<_pVB>::dataType;
+            const bool _vecOk = ((hiddenDim % (size_t)_pV) == 0) &&
+                                ((hiddenDimOffset % (size_t)_pV) == 0) && ((_tile % _pV) == 0);
+            const int _nv = _vecOk ? (_n / (warpSize * _pV)) * (warpSize * _pV) : 0;
+            for (int _e = laneId * _pV; _e < _nv; _e += warpSize * _pV) {
+              float _a[_pV];
+#pragma unroll
+              for (int _k = 0; _k < _pV; ++_k) _a[_k] = 0.0f;
+              for (int _j = 0; _j < _nSrc; ++_j) {
+                _PVecT _sv = *reinterpret_cast<const _PVecT*>(_tb + (size_t)_j * _tile + _e);
+#pragma unroll
+                for (int _k = 0; _k < _pV; ++_k)
+                  _a[_k] += (float)(reinterpret_cast<const TokT*>(&_sv)[_k]);
+              }
+              union {
+                _PVecT _ov;
+                TokT _oe[_pV];
+              };
+#pragma unroll
+              for (int _k = 0; _k < _pV; ++_k) _oe[_k] = T(_a[_k]);
+              core::store<_pVB>(outPtr + _o + _e, _ov);
+            }
+            for (int _e = _nv + laneId; _e < _n; _e += warpSize) {
+              float _acc = 0.0f;
+              for (int _j = 0; _j < _nSrc; ++_j) _acc += (float)(_tb[(size_t)_j * _tile + _e]);
+              outPtr[_o + _e] = T(_acc);
+            }
+          };
+          auto _chunkOff = [&](int _c) { return (size_t)_c * (size_t)_tile; };
+          auto _chunkLen = [&](int _c) {
+            size_t _rem = hiddenDimSize - _chunkOff(_c);
+            return (int)(_rem < (size_t)_tile ? _rem : (size_t)_tile);
+          };
+          auto _bufOf = [&](int _c) {
+            return _cPullTiles + (size_t)(_c % _cPipeBufs) * _cPipeSrc * _tile;
+          };
+#pragma unroll
+          for (int _c = 0; _c < _cPipeAhead; ++_c)
+            if (_c < _cPipeChunks) _issueChunk(_chunkOff(_c), _chunkLen(_c), _bufOf(_c));
+          for (int _c = 0; _c < _cPipeChunks; ++_c) {
+            const int _cN = _c + _cPipeAhead;
+            if (_cN < _cPipeChunks) _issueChunk(_chunkOff(_cN), _chunkLen(_cN), _bufOf(_cN));
+            // Everything still outstanding belongs to chunks after _c, so waiting for exactly that
+            // many leaves the prefetch in flight. The immediate has to be a literal, hence the
+            // switch; _cPipeBufs is capped at 4 below by the LDS budget anyway.
+            int _ahead = _cPipeChunks - 1 - _c;
+            if (_ahead > _cPipeAhead) _ahead = _cPipeAhead;
+            switch (_ahead) {
+              case 1: __builtin_amdgcn_s_wait_tensorcnt(1 * _cPipeSrc); break;
+              case 2: __builtin_amdgcn_s_wait_tensorcnt(2 * _cPipeSrc); break;
+              case 3: __builtin_amdgcn_s_wait_tensorcnt(3 * _cPipeSrc); break;
+              default: __builtin_amdgcn_s_wait_tensorcnt(0); break;
+            }
+            __threadfence_block();
+            _foldChunk(_chunkOff(_c), _chunkLen(_c), _bufOf(_c));
+          }
+          _pullDone = true;
+        }
+        if (!_pullDone)
+#endif
         for (size_t _off = 0; _off < hiddenDimSize; _off += _cPullTileElems) {
           int _n = (int)(hiddenDimSize - _off);
           if (_n > _cPullTileElems) _n = _cPullTileElems;
@@ -2189,18 +3648,49 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             // so it would re-read the head of the segment instead of this tail. Direct scalar gather.
             for (int _e = laneId; _e < _n; _e += warpSize) {
               float _acc = 0.0f;
+              // Reads the source directly rather than a tile, so the scale block comes from the
+              // same absolute position but the element index still carries hiddenDimOffset.
+              const int _hSb =
+                  _cPullBwq
+                      ? (int)((hiddenDimOffset + (size_t)_off + (size_t)_e) /
+                              ((hiddenDim + args.fp8BlockwiseCombineScaleDim - 1) /
+                               args.fp8BlockwiseCombineScaleDim))
+                      : 0;
               for (int _j = 0; _j < _nSrc; ++_j) {
                 if (srcPtrs[_j] == nullptr) continue;
-                _acc += (float)(srcPtrs[_j][_off + _e]);
+                float _hScale = 1.0f;
+                if constexpr (_cPullBwq) {
+                  const float* _sp = srcScalePtrs[_j];
+                  if (_sp != nullptr) {
+                    _hScale = _sp[_hSb];
+                    if (_hSb == 0 && _hScale < 0.0f) _hScale = -_hScale;
+                  }
+                }
+                const float _v = (float)(srcPtrs[_j][_off + _e]);
+                _acc += _cPullBwq ? (_v * _hScale) : _v;
               }
               outPtr[_off + _e] = T(_acc);
             }
             break;
           }
-          const gfx1250_TDM_GROUP1 _pg1 = TdmShape<TokT>(_n);
-          for (int _j = 0; _j < _nSrc; ++_j) {
-            if (srcPtrs[_j] == nullptr) continue;
-            TdmIssueLoad<TokT>(_cPullTiles + (size_t)_j * _cPullTileElems, srcPtrs[_j] + _off, _pg1);
+          // [L2] One descriptor for every row when the sources are a constant pitch apart (PUSH),
+          // one per source otherwise (PULL, where they live on different cards). The gather packs
+          // the rows densely at stride _n, NOT at the tile pitch, so everything below indexes the
+          // tile by _rowStride; and it addresses rows by destPe, so validity comes from _peMask
+          // instead of from the compacted srcPtrs.
+          const bool _useGather = _cGatherOk;
+          const int _rowCnt = _useGather ? config.worldSize : _nSrc;
+          const int _rowStride = _useGather ? _n : _cPullTileElems;
+          if (_useGather) {
+            TdmIssueLoad<TokT>(_cPullTiles, _gBase + _off,
+                               TdmShapeGather<TokT>(_n, config.worldSize, _cGatherPitch));
+          } else {
+            const gfx1250_TDM_GROUP1 _pg1 = TdmShape<TokT>(_n);
+            for (int _j = 0; _j < _nSrc; ++_j) {
+              if (srcPtrs[_j] == nullptr) continue;
+              TdmIssueLoad<TokT>(_cPullTiles + (size_t)_j * _cPullTileElems, srcPtrs[_j] + _off,
+                                 _pg1);
+            }
           }
           _CSTAMP(_cIssue);
           __builtin_amdgcn_s_wait_tensorcnt(0);
@@ -2214,8 +3704,12 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
           // is capped: the sub-row tail is left whole, being under 1% of a token and its own transport.
           const int _nRed = 1;
 #else
-          const int _nRed = _nSrc;
+          const int _nRed = _rowCnt;
 #endif
+          // Row _j is real when the mask says so under the gather, and when its compacted pointer is
+          // non-null otherwise. A gathered row that is not in the mask holds whatever the previous
+          // launch left in that slot, so this is a correctness test, not an optimisation.
+#define _CROW_DEAD(_j) (_useGather ? (((_peMask >> (_j)) & 1) == 0) : (srcPtrs[_j] == nullptr))
           // Unlike the dispatch payload loop, where the TDM engine both writes and re-reads the tile,
           // here the LANES read what the engine wrote. Fence so neither the compiler nor LDS ordering
           // lets those reads float above the wait. TDM_USAGE.md §4 advises __syncthreads() for this,
@@ -2226,19 +3720,45 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
           // Vectorised on purpose: the gather this replaces moves 16B per lane (WarpAccumLF<T,16>),
           // so a 2-byte scalar loop here would add 8x the LDS instructions and the measurement would
           // report this loop rather than the transport. fp32 accumulate matches WarpAccumLF.
-          constexpr int _cVB = 16;
-          constexpr int _cV = _cVB / (int)sizeof(TokT);
+          // The STORE is what gets pinned at 16B -- the widest VecTypeSelector has -- and the element
+          // count follows from it, so the LDS read narrows to whatever TokT needs. Pinning the read
+          // instead (what this did while T and TokT were the same type) asks for a 32B store on the
+          // 4-byte token type, which has no vector. bf16 gives 8 elems / 16B read and fp32 gives 4
+          // elems / 16B read, both exactly as before; the fp8 tile gives 8 elems / 8B read.
+          constexpr int _cOutVB = 16;
+          constexpr int _cV = _cOutVB / (int)sizeof(T);
+          constexpr int _cVB = _cV * (int)sizeof(TokT);
           using _CVecT = typename core::VecTypeSelector<_cVB>::dataType;
+          using _COutVecT = typename core::VecTypeSelector<_cOutVB>::dataType;
           const bool _cVecOk = ((hiddenDim % (size_t)_cV) == 0) &&
-                               ((hiddenDimOffset % (size_t)_cV) == 0) &&
-                               ((_cPullTileElems % _cV) == 0);
+                               ((hiddenDimOffset % (size_t)_cV) == 0) && ((_rowStride % _cV) == 0);
           const int _nv = _cVecOk ? (_n / (warpSize * _cV)) * (warpSize * _cV) : 0;
+          // Blockwise scales are per block of blockElems, and blockElems (128 or 256) is a multiple
+          // of _cV, so the block index is uniform across a lane's vector and costs one scale load
+          // per source per vector rather than one per element.
+          const int _cBlkElems =
+              _cPullBwq ? (int)((hiddenDim + args.fp8BlockwiseCombineScaleDim - 1) /
+                                args.fp8BlockwiseCombineScaleDim)
+                        : 1;
           for (int _e = laneId * _cV; _e < _nv; _e += warpSize * _cV) {
             float _a[_cV];
 #pragma unroll
             for (int _k = 0; _k < _cV; ++_k) _a[_k] = 0.0f;
+            // Absolute position drives the scale block; _e is only the offset inside this chunk.
+            const int _cSb =
+                _cPullBwq ? (int)((hiddenDimOffset + (size_t)_off + (size_t)_e) / _cBlkElems) : 0;
             for (int _j = 0; _j < _nRed; ++_j) {
-              if (srcPtrs[_j] == nullptr) continue;
+              if (_CROW_DEAD(_j)) continue;
+              float _cScale = 1.0f;
+              if constexpr (_cPullBwq) {
+                // Same sentinel the scalar dequant helpers use: the producer negates entry 0 to mark
+                // "this token really was scaled", so entry 0 has to be undone before it is applied.
+                const float* _sp = srcScalePtrs[_j];
+                if (_sp != nullptr) {
+                  _cScale = _sp[_cSb];
+                  if (_cSb == 0 && _cScale < 0.0f) _cScale = -_cScale;
+                }
+              }
               // Dereferenced directly rather than through core::load<16>: that takes a const void*,
               // which addrspacecasts the LDS pointer to generic and leaves it to InferAddressSpaces
               // to recover ds_read_b128 instead of a flat_load. Keeping the typed addrspace(3)
@@ -2246,27 +3766,41 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
               // rounded to 128B above. The global store below keeps core::load/store's nontemporal
               // path, which is what WarpAccumLF uses and is right for the output.
               _CVecT _sv =
-                  *reinterpret_cast<const _CVecT*>(_cPullTiles + (size_t)_j * _cPullTileElems + _e);
+                  *reinterpret_cast<const _CVecT*>(_cPullTiles + (size_t)_j * _rowStride + _e);
 #pragma unroll
-              for (int _k = 0; _k < _cV; ++_k)
-                _a[_k] += (float)(reinterpret_cast<const TokT*>(&_sv)[_k]);
+              for (int _k = 0; _k < _cV; ++_k) {
+                const float _v = (float)(reinterpret_cast<const TokT*>(&_sv)[_k]);
+                _a[_k] += _cPullBwq ? (_v * _cScale) : _v;
+              }
             }
             union {
-              _CVecT _ov;
-              TokT _oe[_cV];
+              _COutVecT _ov;
+              T _oe[_cV];
             };
 #pragma unroll
             for (int _k = 0; _k < _cV; ++_k) _oe[_k] = T(_a[_k]);
-            core::store<_cVB>(outPtr + _off + _e, _ov);
+            core::store<_cOutVB>(outPtr + _off + _e, _ov);
           }
           for (int _e = _nv + laneId; _e < _n; _e += warpSize) {
             float _acc = 0.0f;
+            const int _tSb =
+                _cPullBwq ? (int)((hiddenDimOffset + (size_t)_off + (size_t)_e) / _cBlkElems) : 0;
             for (int _j = 0; _j < _nRed; ++_j) {
-              if (srcPtrs[_j] == nullptr) continue;
-              _acc += (float)(_cPullTiles[(size_t)_j * _cPullTileElems + _e]);
+              if (_CROW_DEAD(_j)) continue;
+              float _tScale = 1.0f;
+              if constexpr (_cPullBwq) {
+                const float* _sp = srcScalePtrs[_j];
+                if (_sp != nullptr) {
+                  _tScale = _sp[_tSb];
+                  if (_tSb == 0 && _tScale < 0.0f) _tScale = -_tScale;
+                }
+              }
+              const float _v = (float)(_cPullTiles[(size_t)_j * _rowStride + _e]);
+              _acc += _cPullBwq ? (_v * _tScale) : _v;
             }
             outPtr[_off + _e] = T(_acc);
           }
+#undef _CROW_DEAD
           _CSTAMP(_cRed);
         }
           _pullDone = true;
@@ -2275,6 +3809,15 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       if (!_pullDone)
 #endif
       {
+        if constexpr (_cPullBwq) {
+          // The tile path declined this token (shape, alignment, or LDS budget). WarpAccumLF cannot
+          // stand in for blockwise: it sums the fp8 bytes raw with no scale at all. Use the same
+          // helper the non-tile build uses, which is why redirecting the chain above is safe.
+          core::WarpAccumCombineDequantSegment<UseFp4Combine, T, core::CombineInternalFp8>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDimOffset,
+              hiddenDimSize, hiddenDim, args.fp8BlockwiseCombineScaleDim);
+        } else
 #if defined(MORI_COMB_NOREDUCE)
         // PUSH's cross-card work is the send phase before the barrier; this gather is entirely local.
         // So dropping it whole is the exact analogue of what NOREDUCE does on the pull side, and it
@@ -2345,10 +3888,25 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 #undef _CSTAMP
 }
 
+// Without a launch bound the compiler must assume the default 1024-thread block, which is 4 waves
+// per SIMD, which caps the kernel at 128 VGPRs -- and llvm-readelf says the bf16 p2p combine spills
+// 26 registers into a 176 B private segment at that cap. It can never USE 4 waves per SIMD: this
+// path asks for 229 KB of the 320 KB LDS, so one block per CU, and at 8 warps that is 2 waves per
+// SIMD. MORI_COMB_LB tells the compiler the block size the host actually launches, which doubles
+// the VGPR budget for free. Correctness-preserving, but the launch FAILS if block_x exceeds it, so
+// it stays opt-in and must be set to warp_per_block * 64.
+#ifndef MORI_COMB_LB
+#define MORI_COMB_LB 0
+#endif
+#if MORI_COMB_LB
+#define _MORI_COMB_LB_ATTR __launch_bounds__(MORI_COMB_LB)
+#else
+#define _MORI_COMB_LB_ATTR
+#endif
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
           int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false>
-__global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
+__global__ void _MORI_COMB_LB_ATTR EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast, UseFp8BlockwiseQuant,
                                 UseWeights, Vec8Top8BlockElems, Vec8AccumNum, UseFp4Combine>(args);
 }

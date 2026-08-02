@@ -148,6 +148,11 @@ _QUANT_TYPE_MAP = {
 # Blockwise combine quant types share the staging/scale layout and kernel launch config; only the
 # element codec (and staging slot size) differ, so kernel selection treats them together and then
 # swaps the codec token (fp8bwq <-> fp4bwq) in the kernel name.
+def _comb_qpull() -> bool:
+    """MORI_COMB_QPULL=1: run blockwise combine over the PULL gather instead of PUSH staging."""
+    return os.environ.get("MORI_COMB_QPULL", "").strip().lower() in ("1", "true", "on", "yes")
+
+
 _BLOCKWISE_COMBINE_QUANT_TYPES = (
     EpDispatchCombineQuantType.Fp8BlockwiseQuant,
     EpDispatchCombineQuantType.Fp4BlockwiseQuant,
@@ -308,6 +313,11 @@ except AttributeError:
 
 # pointer size on device for shared memory calculation (sizeof(T**) and sizeof(float**))
 _PTR_SIZE = 8
+
+# Dynamic LDS a block may reserve on gfx125x, measured. Must equal MORI_COMB_LDS_BUDGET in
+# src/ops/dispatch_combine/intranode.hpp: the kernel picks its combine transport by testing its
+# tiles against that number, and this function reserves for whichever one it will pick.
+_COMB_LDS_BUDGET = 327680
 
 
 def warmup_jit_kernels(kernel_type):
@@ -575,11 +585,43 @@ class EpDispatchCombineOp:
         without changing the footprint. They are recorded because they bound what the payload phase
         can do when TDM concurrency is not the constraint.
 
-        The legacy clean body (-DMORI_DISP_CLEAN) interleaves scattered per-token metadata with the
-        payload instead and needs the wide grid to hide it.
+        This is the ONLY dispatch body now: the legacy clean body, which interleaved scattered
+        per-token metadata with the payload and wanted 256x16 to hide that, has been deleted along
+        with its -DMORI_DISP_CLEAN gate.
         """
-        if os.environ.get("MORI_DISP_CLEAN", "").lower() in ("1", "true", "on", "yes"):
-            return 256, 16
+        return 64, 8
+
+    def _intranode_combine_default_launch(self):
+        """Per-body default (block_num, warp_per_block) for the IntraNode combine kernel.
+
+        64x8 on gfx125x, the same geometry dispatch defaults to, so an intra-node caller with no
+        opinion gets ONE shape for both phases instead of two unrelated ones. (0, 0) elsewhere means
+        "no opinion, use the config defaults", which is the behaviour every arch had before the QUAD
+        transport existed; the width only matters where the TDM transports exist at all.
+
+        QUAD needs one whole-token tile per warp, double buffered, plus an output tile: at hidden
+        7168 bf16 that is 287,872 B at 8 warps against a 327,680 B budget, and 574,976 at 16. So the
+        width is not a tuning choice here, it is the difference between the fast transport running
+        and the kernel falling back to WarpAccumLF. 64 blocks with 8 warps is where it was measured:
+        168.9us for 212.3 MB = 1255 GB/s, rc=0 on the bench's per-element check.
+
+        The width is applied even where QUAD is off (external input buffer, blockwise quant, or the
+        gates turned down), because the fallback it hands those configs is worse: with no per-body
+        default they land on config.block_num / config.warp_num_per_block, which is 80x8 and was
+        measured at 104.6 GB/s.
+
+        Only a default. An explicit block_num/warp_per_block from the caller, a tuning-config hit,
+        and AUTO mode all still win, and each of those paths goes through the LDS budget in
+        _combine_shared_mem(), which falls back to a transport that fits rather than failing.
+        Verified both ways, rc=0 each time: a caller passing block_num=-1/warp_per_block=-1 (no
+        opinion, which is what this default is for) lands on 64x8 and 168.9us / 1255 GB/s, and the
+        same workload forced to 16 warps runs 1171.2us -- both TDM transports decline on LDS, the
+        gather takes over, and nothing crashes or corrupts.
+        """
+        from mori.jit.core import _FASTPATH_ARCH_PREFIX, _target_arch
+
+        if not _target_arch().startswith(_FASTPATH_ARCH_PREFIX):
+            return 0, 0
         return 64, 8
 
     def _resolve_launch_params(
@@ -595,6 +637,7 @@ class EpDispatchCombineOp:
         zero_copy=None,
         quant_type=None,
         is_intranode_dispatch=False,
+        is_intranode_combine=False,
     ):
         if tuning_rules and dtype is not None:
             from mori.ops.tuning_config import TuningConfigManager
@@ -607,12 +650,12 @@ class EpDispatchCombineOp:
         bn = self.auto_block_num if self.auto_block_num else block_num
         rbn = self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num
         wpb = self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block
-        def_bn, def_wpb = (
-            self._intranode_dispatch_default_launch()
-            if is_intranode_dispatch
-            and self.config.kernel_type == EpDispatchCombineKernelType.IntraNode
-            else (0, 0)
-        )
+        def_bn, def_wpb = (0, 0)
+        if self.config.kernel_type == EpDispatchCombineKernelType.IntraNode:
+            if is_intranode_dispatch:
+                def_bn, def_wpb = self._intranode_dispatch_default_launch()
+            elif is_intranode_combine:
+                def_bn, def_wpb = self._intranode_combine_default_launch()
         actual_bn = (def_bn or self.config.block_num) if bn <= 0 else bn
         actual_rbn = self.config.rdma_block_num if rbn <= 0 else rbn
         actual_wpb = (def_wpb or self.config.warp_num_per_block) if wpb <= 0 else wpb
@@ -648,9 +691,8 @@ class EpDispatchCombineOp:
         return base
 
     def _intranode_dispatch_kernel(self, sfx, stdmoe=False):
-        """Intra-node dispatch. One launch symbol, two bodies selected at JIT compile time in
-        intranode.hpp: EpDispatchIntraNodeKernel_body by default, or the legacy
-        EpDispatchIntraNodeKernel_clean_body under MORI_DISP_CLEAN."""
+        """Intra-node dispatch. One launch symbol, one body: EpDispatchIntraNodeKernel_body in
+        intranode.hpp."""
         name = f"EpDispatchIntraNodeBatchKernel_{sfx}"
         if stdmoe:
             name += "_stdmoe"
@@ -681,18 +723,37 @@ class EpDispatchCombineOp:
         # Blockwise-quant combine is excluded because the kernel gates TDM on
         # !UseFp8BlockwiseQuant -- allocating a tile there would only shrink occupancy, and could
         # trip the budget check below on a configuration that never runs TDM at all.
-        _comb_tdm = os.environ.get("MORI_COMB_TDM", "").strip().lower()
-        if (
-            _comb_tdm not in ("", "0", "false", "off", "no")
-            and quant_type not in _BLOCKWISE_COMBINE_QUANT_TYPES
-        ):
-            chunks = int(_comb_tdm) if _comb_tdm.isdigit() and int(_comb_tdm) > 0 else 2
-            elem = int(self.config.max_token_type_size)
+        #
+        # The exclusion is total, and that is fine rather than merely tolerable: blockwise quant
+        # requires PUSH (bench and launch.cpp both reject --zero-copy 1 for it) while QUAD requires
+        # PULL, so the two can never be asked for at once. MEASURED with the arch defaults live,
+        # fp8_blockwise EP4 bf16 hidden 7168 4096 tokens at 64x8, check armed: 6037.6us rc=0, and
+        # the same run with MORI_COMB_FASTPATH=0 gives 6173.5us rc=0 -- within 2%, i.e. the gates
+        # are genuinely inert here, not silently changing a quantised result. (That 34 GB/s is its
+        # own problem and has nothing to do with these gates.)
+        from mori.jit.core import _comb_env_set, _comb_tdm_chunks
+
+        chunks = _comb_tdm_chunks()
+        # ...that exclusion held only while blockwise was PUSH-only. Under MORI_COMB_QPULL the
+        # kernel runs _p2p and _cPullBwq lets blockwise onto the tile path, so the tiles have to be
+        # reserved here or _cPullOk fails its budget check and silently drops back to the lane
+        # gather -- the slow thing this is meant to remove.
+        _qpull_bwq = _comb_qpull() and (
+            quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant
+        )
+        if chunks and (quant_type not in _BLOCKWISE_COMBINE_QUANT_TYPES or _qpull_bwq):
+            # The tile holds TokT, which is 1-byte fp8 under blockwise rather than the token dtype,
+            # so both the row width and the byte total below follow sizeof(TokT). Mirrors
+            # _cPullRowElems = 128 / sizeof(TokT).
+            elem = 1 if _qpull_bwq else int(self.config.max_token_type_size)
             row_elems = 128 // elem
             hidden = int(self.config.hidden_dim)
             topk = int(self.config.num_experts_per_token)
             world = int(self.config.world_size)
-            if self.config.use_external_inp_buf:
+            # _qpull_bwq keeps use_external_inp_buf True (that is what makes the kernel quantise
+            # locally) while compiling UseP2PRead=true, so the transport here follows the KERNEL,
+            # not the buffer flag. This is the one case where the two disagree.
+            if self.config.use_external_inp_buf and not _qpull_bwq:
                 # PUSH never splits a token and never holds more than one: one warp sends one whole
                 # token to its one destination PE, so the tile is exactly hiddenDim elements and
                 # MORI_COMB_TDM only gates TDM on/off there.
@@ -708,19 +769,96 @@ class EpDispatchCombineOp:
                 tile_elems = -(-hidden // chunks)
                 tile_elems = -(-tile_elems // row_elems) * row_elems
                 tiles_per_warp = world if (world <= 4 and world < topk) else topk
+                # MORI_COMB_QUAD turns the decomposition 90 degrees: one warp owns one SOURCE and
+                # reads that source's token, so a warp needs one tile instead of one per source.
+                # QUAD=D gives it D of them, QSPLIT=S cuts each to hidden/S elements, and the two
+                # trade off exactly: D*(hidden/S)*elem*wpb bytes buy D-1 reads in flight at
+                # (hidden/S)*elem bytes each.
+                from mori.jit.core import _comb_quad_depth, _comb_quad_split
+
+                # QUAD now serves blockwise too (the kernel gate takes _cPullBwq), and `elem` above
+                # is already 1 there, so the tiles reserved here are the fp8 ones the kernel lays
+                # out. Getting this wrong in either direction is a silent layout mismatch, not a
+                # slowdown: host and kernel must agree on the tile size to the byte -- which is why
+                # the depth-4 floor below is repeated from intranode.hpp rather than assumed. See
+                # there for why blockwise refuses depth 2 (wrong results, cause not yet found).
+                _qd = _comb_quad_depth()
+                if _qpull_bwq and _qd < 4:
+                    _qd = 0
+                if _qd >= 2:
+                    _qs = _comb_quad_split()
+                    tile_elems = hidden // _qs
+                    tiles_per_warp = _qd
+                    tile_bytes = warp_per_block * tiles_per_warp * tile_elems * elem
+                    # ... plus one int per (warp, buffer) for the source-count ring that follows
+                    # the tiles (it is in LDS because holding it in registers spills), and two
+                    # more per (group, buffer) for MORI_COMB_QFLAG's arrival/departure counters.
+                    _qgroups = max(1, warp_per_block // world)
+                    tile_bytes += (warp_per_block + 2 * _qgroups) * tiles_per_warp * 4
+                    # MORI_COMB_QLOC needs the local source's POINTER to survive from the launch of
+                    # a unit to its fold, which is the same ring problem as the count: two more ints
+                    # per (warp, buffer).
+                    from mori.jit.core import _comb_qloc
+
+                    if _comb_qloc():
+                        tile_bytes += 2 * warp_per_block * tiles_per_warp * 4
+                    # MORI_COMB_QTST folds into LDS and lets the TDM engine store that out, which
+                    # costs one more buffer set of the fold's SLICE of a tile -- 1/world of the
+                    # tiles -- 128B-aligned past the counters.
+                    from mori.jit.core import _comb_qob, _comb_qtst
+
+                    if _comb_qtst():
+                        _qob = max(_comb_qob(), _qd)
+                        tile_bytes = (tile_bytes + 127) & ~127
+                        tile_bytes += warp_per_block * _qob * (tile_elems // world) * elem
+                    total = ((base + 127) & ~127) + tile_bytes
+                    # Mirrors the _qLdsNeed guard in intranode.hpp, which declines QUAD at a width
+                    # whose tiles do not fit and lets the token fall through to the chunked gather.
+                    # Reserving QUAD's footprint here while the kernel runs the chunked path (or the
+                    # reverse) is a silent layout mismatch, so the two predicates are the same one.
+                    if total <= _COMB_LDS_BUDGET:
+                        return total
+                    if _comb_env_set("MORI_COMB_QUAD"):
+                        raise ValueError(
+                            f"MORI_COMB_QUAD={_qd} MORI_COMB_QSPLIT={_qs} needs {total} B of LDS "
+                            f"for combine (warp_per_block={warp_per_block}) but the budget is "
+                            f"{_COMB_LDS_BUDGET} B. Lower warp_per_block, raise MORI_COMB_QSPLIT, "
+                            f"or unset MORI_COMB_QUAD to let the arch default pick a transport "
+                            f"that fits."
+                        )
+                    # Arch default, not a request: fall through to the chunked tiles below, which
+                    # are what the kernel will use.
+                    tile_elems = -(-hidden // chunks)
+                    tile_elems = -(-tile_elems // row_elems) * row_elems
+                    tiles_per_warp = world if (world <= 4 and world < topk) else topk
+                # MORI_COMB_PIPE=N gives the PULL gather N tile sets per warp so N-1 chunks of peer
+                # reads stay in flight while one is folded. Must match _cPullBufs in intranode.hpp.
+                _pipe = os.environ.get("MORI_COMB_PIPE", "").strip().lower()
+                _pipe_n = (
+                    int(_pipe) if _pipe.isdigit() else (2 if _pipe in ("true", "on", "yes") else 0)
+                )
+                if _pipe_n == 1:
+                    _pipe_n = 2
+                if _pipe_n >= 2:
+                    tiles_per_warp *= _pipe_n
             tile_bytes = warp_per_block * tiles_per_warp * tile_elems * elem
             # The kernel rounds past the pointer arrays to 128B (TDM row) before the first tile.
             total = ((base + 127) & ~127) + tile_bytes
-            # gfx1250 measured LDS budget is 327680 B per block. Overflowing it fails the launch with
-            # an opaque error, so say which knob to turn instead.
-            if total > 327680:
+            if total <= _COMB_LDS_BUDGET:
+                base = total
+            elif _comb_env_set("MORI_COMB_TDM") or self.config.use_external_inp_buf:
+                # PUSH has no fallback in the kernel -- its fold aliases the send tile rather than
+                # allocating one -- so an overflow there is still fatal, as is one the caller asked
+                # for by naming MORI_COMB_TDM.
                 raise ValueError(
                     f"MORI_COMB_TDM={chunks} needs {total} B of LDS for combine "
                     f"(warp_per_block={warp_per_block}, tiles/warp={tiles_per_warp}, "
-                    f"tile_elems={tile_elems}) but the budget is 327680 B. "
+                    f"tile_elems={tile_elems}) but the budget is {_COMB_LDS_BUDGET} B. "
                     f"Raise MORI_COMB_TDM (smaller PULL chunks) or lower warp_per_block."
                 )
-            base = total
+            # Else: arch default at a width the tiles do not fit. _cPullOk in intranode.hpp fails
+            # the same test and the gather falls back to WarpAccumLF, which needs no tiles, so the
+            # reservation stays at the pointer arrays.
         return base
 
     def _launch(self, func_name, grid, block, shared_mem, stream, args_ptr):
@@ -1186,6 +1324,7 @@ class EpDispatchCombineOp:
             tuning_rules=self._combine_rules,
             zero_copy=is_zero_copy,
             quant_type=self._qt_str,
+            is_intranode_combine=True,
         )
         self._cached_combine_launch = (actual_bn, actual_rbn, actual_wpb)
         stream = _current_stream()
@@ -1315,9 +1454,26 @@ class EpDispatchCombineOp:
                     and self.config.world_size > 4
                 )
                 top9 = self.config.num_experts_per_token == 9
-                kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq"
+                # MORI_COMB_QPULL=1 routes blockwise over the PULL gather instead of the PUSH
+                # staging. useExternalInpBuffer stays true either way -- that is what makes the
+                # kernel quantise into its own combineInp rather than expecting bf16 already there
+                # -- so this only swaps which half of the kernel moves the bytes.
+                # MEASURED 64x8 EP4 MORI_COMB_TDM=4, check armed, rc=0: 3667.8us -> 1466.4us.
+                # Still opt-in: no vec8 variant is registered for _p2p, so the weightless top8/top9
+                # fast paths below are given up when this is on, and only fp8 (not fp4) has a
+                # _p2p symbol.
+                # fp4 is excluded: the kernel's _cPullBwq gate refuses UseFp4Combine (packed 2-per-
+                # byte indexing is not what the tile fold assumes) and no _p2p_fp4bwq is registered.
+                _qpull = _comb_qpull() and (
+                    quant_type != EpDispatchCombineQuantType.Fp4BlockwiseQuant
+                )
+                kernel_name = (
+                    "EpCombineIntraNodeKernel_bf16_p2p_fp8bwq"
+                    if _qpull
+                    else "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq"
+                )
                 use_vec8_top8 = False
-                if base_vec8_top8_eligible:
+                if base_vec8_top8_eligible and not _qpull:
                     if block_elems == 128:
                         kernel_name = (
                             "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8_top9"

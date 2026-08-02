@@ -293,6 +293,96 @@ def _disp_tdm_defines() -> list[str]:
     return ["-DMORI_DISP_TDM"] if val.lower() in ("1", "true", "on", "yes") else []
 
 
+# Prefix rather than an enumeration: this tracks the kernel-side #if, which tests the gfx125x
+# arch macros, and a new member of that family should not need a second edit here to be recognised.
+_FASTPATH_ARCH_PREFIX = "gfx125"
+_arch_cache: str | None = None
+_fastpath_cache: bool | None = None
+
+
+def _target_arch() -> str:
+    """The arch the JIT will compile for, or "" when it cannot be determined.
+
+    detect_gpu_arch() rather than get_build_config(): the latter also insists on hipcc and the LLVM
+    tools, and this is called from the LAUNCH path (the LDS budget in ops/dispatch_combine.py) where
+    a missing compiler must not raise. Any failure degrades to "", i.e. no fast path, never a crash.
+    """
+    global _arch_cache
+    if _arch_cache is None:
+        try:
+            from .config import detect_gpu_arch
+
+            _arch_cache = detect_gpu_arch(os.environ.get("ROCM_PATH", "/opt/rocm"))
+        except Exception:
+            _arch_cache = ""
+    return _arch_cache
+
+
+def _comb_fastpath() -> bool:
+    """Whether combine's TDM/QUAD transport is on when the caller has set no gates.
+
+    This is the single place that decides it. Every MORI_COMB_* reader below falls back to it, the
+    cache key in cache.py derives from the same readers, and the LDS budget in
+    ops/dispatch_combine.py calls them too -- so the emitted -D flags, the .hsaco identity and the
+    shared-memory reservation cannot drift apart.
+
+    The gates it turns on are the configuration measured at 64x8 ZC=1 on gfx1250. Checked (rc=0 on
+    the bench's per-element combine check) with NOTHING in the environment: 168.6us / 1201 GB/s for
+    202.47 MB, matching the 168.5us the same gates reach when set by hand. The same run with
+    MORI_COMB_FASTPATH=0 is 2311.5us / 88 GB/s -- the vector-load gather this replaces, at a
+    geometry it was never tuned for -- and is also rc=0, so the fallback stays correct.
+
+    They are only defaults: an explicit env value always wins, including an explicit 0, and
+    MORI_COMB_FASTPATH=0 turns the whole set off in one move.
+
+    Restricted to gfx125x because that is where the TDM engine exists at all -- the kernel-side #if
+    tests the same arch family, so enabling these elsewhere would emit -D flags that compile to
+    nothing while still forking the cache key.
+    """
+    global _fastpath_cache
+    if _fastpath_cache is None:
+        val = os.environ.get("MORI_COMB_FASTPATH", "").strip().lower()
+        if val in ("0", "false", "off", "no"):
+            _fastpath_cache = False
+        elif val in ("1", "true", "on", "yes"):
+            _fastpath_cache = True
+        else:
+            _fastpath_cache = _target_arch().startswith(_FASTPATH_ARCH_PREFIX)
+    return _fastpath_cache
+
+
+def _comb_env_set(name: str) -> bool:
+    """Whether the caller named this gate at all, as opposed to inheriting the arch default.
+
+    The LDS budget needs the distinction: a geometry too wide for a gate the ARCH turned on should
+    quietly fall back to a transport that fits, but the same geometry against a gate the CALLER
+    asked for has to say so instead of silently ignoring them.
+    """
+    return os.environ.get(name, "").strip() != ""
+
+
+def _comb_flag(name: str, default: bool) -> bool:
+    """An on/off MORI_COMB_* gate, where "unset" is distinct from "explicitly off"."""
+    val = os.environ.get(name, "").strip().lower()
+    if val == "":
+        return default
+    return val in ("1", "true", "on", "yes")
+
+
+# On/off combine gates that ride with the QUAD fold, and the ones that never default on.
+# cache.py walks the same two lists so the .hsaco name and the -D flags cannot disagree.
+_COMB_QUAD_DEFAULT_FLAGS = ("QBAR", "QU4", "QCVT")
+_COMB_OPT_IN_FLAGS = (
+    "QNOXFER",
+    "QFLAG",
+    "QST16",
+    "QTLATE",
+    "QNOOP",
+    "QNOSYNC",
+    "QNOPF",
+)
+
+
 def _comb_tdm_defines() -> list[str]:
     """-DMORI_COMB_TDM=N sends the COMBINE token push through the gfx1250 TDM engine instead of
     per-lane cross-card WarpCopy, reusing the shape the dispatch payload phase already proved (one
@@ -312,14 +402,183 @@ def _comb_tdm_defines() -> list[str]:
         of LDS. Needs topk tiles per warp, so it wants a much larger N than the push path.
     PUSH cannot run in the zero-copy layout (there the combine input buffer IS the peer's staging
     buffer, so pushing would clobber the peer's own input), which is why the transport follows the
-    same flag that picks the kernel rather than being independently selectable. Default OFF."""
+    same flag that picks the kernel rather than being independently selectable. Defaults to 2 where
+    _comb_fastpath() says so, off everywhere else."""
+    return [f"-DMORI_COMB_TDM={_comb_tdm_chunks()}"] if _comb_tdm_chunks() else []
+
+
+def _comb_tdm_chunks() -> int:
+    """MORI_COMB_TDM's resolved chunk count, 0 when the TDM transport is off."""
     val = os.environ.get("MORI_COMB_TDM", "").strip().lower()
-    if val in ("", "0", "false", "off", "no"):
+    if val == "":
+        return 2 if _comb_fastpath() else 0
+    if val in ("0", "false", "off", "no"):
+        return 0
+    return int(val) if val.isdigit() and int(val) > 0 else 2
+
+
+def _comb_barsleep_defines() -> list[str]:
+    """-DMORI_COMB_BARSLEEP=N sets the backoff between two polls of the combine barrier's
+    cross-device flag, in s_sleep units of ~64 clocks (default 1).
+
+    The barrier costs 69.6us at 128 blocks and 15.0us when only block 0 polls and fences, so 54.6us
+    of it is per-block work on flags that live in hipDeviceMallocUncached memory -- they must, or a
+    peer's write would never be seen -- which makes every poll from every block a real fabric
+    transaction aimed at the same 32 bytes. Backing off trades a bounded amount of exit latency for
+    a proportional cut in that traffic, and unlike moving the poll it cannot change what any block
+    observes. Measured, it is worth 15.2us and no more: 1 -> 8 -> 32 -> 127 gives barrier 69.3, 65.8,
+    61.4, 58.5 and full combine 251.6, 246.0, 240.3, 236.1. The other ~44us does not respond to poll
+    RATE at all, so it is one fixed cost per block -- the acquire itself, or the 128 uncached reads
+    that all arrive the instant the flag flips and serialise on one line. MORI_COMB_BARNOFENCE is
+    the gate that tells those two apart.
+
+    Those numbers are all PUSH, where the wait is 58.5us and long enough to hide the oversleep. The
+    PULL/QUAD wait is 7.6us, so the same 127 overshoots it and turns into a net loss: at 64x8 ZC=1
+    bf16 EP4 with the check armed, RUNRR alone reads 168.9us / 1199 GB/s against RUNRR+127 at
+    171.1 / 1183. Anything that pins this value instead of taking the default therefore reports
+    every PULL geometry ~2us slow, which is exactly how tools/_ct_nobar.sh manufactured a phantom
+    2% regression against a baseline that had been recorded at the default."""
+    val = os.environ.get("MORI_COMB_BARSLEEP", "").strip()
+    if val == "":
+        # 15 was the bottom of the sweep at 64x8: 1 thrashes the flag line (+1.2us), the old 127
+        # oversleeps. Only worth setting where the barrier is being paid for at all.
+        return ["-DMORI_COMB_BARSLEEP=15"] if _comb_fastpath() else []
+    if not val.isdigit() or int(val) <= 0:
         return []
-    chunks = 2
-    if val.isdigit() and int(val) > 0:
-        chunks = int(val)
-    return [f"-DMORI_COMB_TDM={chunks}"]
+    return [f"-DMORI_COMB_BARSLEEP={int(val)}"]
+
+
+def _comb_barspread_defines() -> list[str]:
+    """-DMORI_COMB_BARSPREAD=N makes block 0 poll the cross-device flags alone and republish the
+    epoch into one line PER BLOCK, N uint32 words apart (32 = 128B). Correctness-preserving,
+    default OFF.
+
+    Priced by MORI_COMB_NOBAR, which is the only honest measurement of the wait (full minus the
+    wait, in a complete kernel): 6.9us at 32 blocks, 16.8 at 64, 44.4 at 128, 150.4 at 256. Growing
+    faster than the block count is what says the cost is contention on the single flag line rather
+    than the unavoidable wait for the slowest peer, which the 32-block figure bounds at <= 6.9us.
+    BARFAN already showed that moving that line into cache changes nothing (58.5 -> 110.8), so the
+    variable left is how many blocks read the SAME line, which is what N spreads apart."""
+    val = os.environ.get("MORI_COMB_BARSPREAD", "").strip()
+    if val == "":
+        return ["-DMORI_COMB_BARSPREAD=16"] if _comb_fastpath() else []
+    if not val.isdigit() or int(val) <= 0:
+        return []
+    return [f"-DMORI_COMB_BARSPREAD={int(val)}"]
+
+
+def _comb_quad_depth() -> int:
+    """Tile buffers per warp for the QUAD gather, 0 when it is off. The legacy spelling
+    MORI_COMB_QUAD=1 means the original double buffer, so it reads as 2. The LDS budget in
+    ops/dispatch_combine.py and the cache key both have to agree with this."""
+    val = os.environ.get("MORI_COMB_QUAD", "").strip().lower()
+    if val == "":
+        # Follows the resolved TDM chunk count rather than _comb_fastpath() directly: with
+        # MORI_COMB_TDM=0 the kernel's #if compiles the whole QUAD body out, and a QUAD depth that
+        # only the host believes in would have it reserve tiles nothing ever writes.
+        return 2 if (_comb_fastpath() and _comb_tdm_chunks()) else 0
+    if val.isdigit():
+        n = int(val)
+        return 2 if n == 1 else (n if n >= 2 else 0)
+    return 2 if val in ("true", "on", "yes") else 0
+
+
+def _comb_quad_split() -> int:
+    """Parts each QUAD tile is cut into. 1 is the whole-token read."""
+    val = os.environ.get("MORI_COMB_QSPLIT", "").strip()
+    return int(val) if val.isdigit() and int(val) >= 1 else 1
+
+
+def _comb_qtst() -> int:
+    """How the QUAD fold's output leaves LDS: 0 = the warp's own vector stores, 1 = one TDM store
+    per warp of its own slice, 2 = one whole-token TDM store per group, 3 = one TDM store per BLOCK
+    covering its groups' consecutive tokens. The LDS budget in ops/dispatch_combine.py and the
+    cache key both have to agree with this."""
+    val = os.environ.get("MORI_COMB_QTST", "").strip().lower()
+    if val == "":
+        # 2 (one whole-token store per group) is the shape that was measured fastest; it only exists
+        # inside the QUAD fold, so it defaults on exactly when QUAD does.
+        return 2 if _comb_quad_depth() else 0
+    if val.isdigit():
+        n = int(val)
+        return n if n in (1, 2, 3) else 0
+    return 1 if val in ("true", "on", "yes") else 0
+
+
+def _comb_qloc() -> int:
+    """Read this rank's own copy of a token with vector loads during the fold instead of pulling it
+    over the TDM engine: 1 = load it inside the fold, 2 = stage it in registers before the barrier.
+    Costs two more ints per (warp, buffer) of LDS for the pointer ring."""
+    val = os.environ.get("MORI_COMB_QLOC", "").strip().lower()
+    if val.isdigit():
+        n = int(val)
+        return n if n in (1, 2, 3) else 0
+    return 1 if val in ("true", "on", "yes") else 0
+
+
+def _comb_qob() -> int:
+    """Slots in the QUAD fold's output ring, 0 when it should follow the tile ring's depth."""
+    val = os.environ.get("MORI_COMB_QOB", "").strip()
+    return int(val) if val.isdigit() and int(val) >= 2 else 0
+
+
+def _comb_pipe_defines() -> list[str]:
+    """-DMORI_COMB_PIPE=1 double-buffers the PULL gather: chunk k+1's peer reads are issued before
+    chunk k is folded, so the fabric is not idle for the fp32 add and the output store.
+    Correctness-preserving, default OFF, and it doubles the PULL tile budget in
+    _combine_shared_mem().
+
+    What it attacks, measured at 64x8 ZC=1 MORI_COMB_TDM=2 (noTIMING, deletion pricing):
+    combine 255.7us, of which 27.0 is barrier+launch, leaving 228.7us of gather+fold for 202.47MB
+    of peer reads = 885 GB/s against a 1.40 TB/s P2P read ceiling. The unpipelined loop has nothing
+    in flight for the whole fold half, which is the only structural reason for a gap that size."""
+    val = os.environ.get("MORI_COMB_PIPE", "").strip()
+    out = []
+    if val.isdigit() and int(val) >= 2:
+        out.append(f"-DMORI_COMB_PIPE={int(val)}")
+    elif val.lower() in ("1", "true", "on", "yes"):
+        out.append("-DMORI_COMB_PIPE=2")
+    # MORI_COMB_QUAD=N: one warp per SOURCE, whole-token peer reads, group of worldSize warps folds
+    # one token cooperatively, with N tile buffers per warp (1 and 2 both mean 2).
+    # Correctness-preserving. It exists because the peer-read ceiling at grid 64 is set by the TDM
+    # read SIZE (tools/_ct_epsim.sh mode9: 4864 B -> 801 GB/s, 14336 B -> 1395 GB/s) and the chunked
+    # gather cannot afford whole-token reads in LDS. MORI_COMB_QSPLIT=S cuts each tile into S parts,
+    # which is how depth beyond 2 is paid for: S halves the tile so N can double for the same LDS.
+    _quad = _comb_quad_depth()
+    if _quad >= 2:
+        out.append(f"-DMORI_COMB_QUAD={_quad}")
+        out.append(f"-DMORI_COMB_QSPLIT={_comb_quad_split()}")
+    # QBAR/QU4/QCVT are the three correctness-preserving wins that only exist inside the QUAD fold,
+    # so they default on with it. The rest are diagnostics and stay opt-in.
+    for _g in _COMB_QUAD_DEFAULT_FLAGS:
+        if _comb_flag(f"MORI_COMB_{_g}", bool(_quad >= 2)):
+            out.append(f"-DMORI_COMB_{_g}=1")
+    for _g in _COMB_OPT_IN_FLAGS:
+        if _comb_flag(f"MORI_COMB_{_g}", False):
+            out.append(f"-DMORI_COMB_{_g}=1")
+    if _comb_qloc():
+        out.append(f"-DMORI_COMB_QLOC={_comb_qloc()}")
+    # GROUP0's temporal hint / scope trait on combine's QUAD peer read and output store.
+    for _g in ("THLD", "THST", "SCLD", "SCST"):
+        _v = os.environ.get(f"MORI_COMB_{_g}", "").strip()
+        if _v.isdigit() and int(_v) > 0:
+            out.append(f"-DMORI_COMB_{_g}={int(_v)}")
+    # QTST has two shapes, not just on/off: 1 = one store per warp of its own slice, 2 = one
+    # whole-token store per group. See the note at _qTG in intranode.hpp.
+    _qtst = _comb_qtst()
+    if _qtst:
+        out.append(f"-DMORI_COMB_QTST={_qtst}")
+        if _comb_qob():
+            out.append(f"-DMORI_COMB_QOB={_comb_qob()}")
+    _qred = os.environ.get("MORI_COMB_QRED", "").strip()
+    if _qred.isdigit():
+        out.append(f"-DMORI_COMB_QRED={int(_qred)}")
+    # -DMORI_COMB_LB=N is the combine kernel's __launch_bounds__. Must be >= the launched block
+    # size or the launch fails; set it to combine_warp_per_block * 64.
+    _lb = os.environ.get("MORI_COMB_LB", "").strip()
+    if _lb.isdigit() and int(_lb) > 0:
+        out.append(f"-DMORI_COMB_LB={int(_lb)}")
+    return out
 
 
 def _comb_diag_defines() -> list[str]:
@@ -335,23 +594,77 @@ def _comb_diag_defines() -> list[str]:
     TDM pull path still issues and waits on every peer load, so the cross-card traffic is byte-for-byte
     unchanged, but the lanes fold one tile instead of topk. The bandwidth gap against a full build is
     therefore the fold alone, i.e. what combine would reach if the reduction were free. Never gate
-    correctness on it."""
+    correctness on it.
+
+    MORI_COMB_NOQUANT deletes the PULL side's local stage-and-quantise pass (intranode.hpp:2234),
+    the loop that reads the caller's bf16 and writes fp8 + scales into this rank's own combineInp
+    before the peers read it. Transport and fold are untouched, so full - NOQUANT is that pass on
+    its own. It is needed because this phase has NO counterpart in the bf16 PULL reference: bf16
+    runs zero-copy, where useExternalInpBuffer is false and the loop does not execute at all, so
+    the 168.4us baseline cannot bound it. WRONG RESULTS, needs MORI_BENCH_SKIPCHECK.
+
+    The three PUSH-side gates below were read by the kernel but never passed here, so setting them did
+    nothing AND did not change the cache key -- an A/B against them silently compared a binary with
+    itself and read "this phase is free". They are the combine counterparts of MORI_DISP_NOPAY:
+    NOPUSH zeroes the push loop's trip count, leaving geometry, LDS and the whole gather side
+    byte-identical, so kernel(full) - kernel(NOPUSH) is the send's unbiased marginal cost; NOGATHER
+    is its mirror on the reduce loop, and the pair is the only way to price the barrier that sits
+    between them (NOPUSH+NOGATHER leaves the barrier and the launch and nothing else); PUSHONLY
+    returns right after the push and the barrier, so it prices everything downstream of them;
+    NOWEIGHT drops only the per-token 32B cross-card weight write inside the send loop. NOROUTE
+    replaces the send loop's localSrcMap lookup with arithmetic, which also moves where the token
+    lands. All of them give wrong results and need MORI_BENCH_SKIPCHECK.
+
+    NOWEIGHT only prices anything when weights are actually passed: the bench calls combine() with
+    weights=None, which leaves args.weightsBuf null and the guarded copy unreachable, so on that
+    workload it deletes dead code and reads as free.
+
+    NOROUTE is worth 101.1us at 64x8 PUSH/TDM but prices the DESTINATION, not the lookup: two
+    correctness-preserving attacks on the lookup itself (batching it per warp, hoisting the peer
+    base pointers) moved 3.0us between them and were deleted -- see the push loop's comment.
+
+    MORI_COMB_BARNOFENCE and MORI_COMB_BARFAN are the two barrier gates. NOFENCE is a pricing gate
+    and WRONG BY CONSTRUCTION: every block still polls the cross-device flags, only the per-block
+    system-scope acquire is dropped off blocks other than 0. It says the fence is free (58.6 -> 58.3)
+    and, run without MORI_BENCH_SKIPCHECK, that it is nonetheless load-bearing (rc=1 against the same
+    build's 236.9 with it). Together with the backoff sweep that pins the barrier's 54.6us per-block
+    cost on the uncached reads themselves, which no backoff can reach. BARFAN has block 0 poll alone
+    and fan the release out through cached memory while every block keeps its own fence; it needs
+    worldSize >= 2, since it parks the epoch in combineGridBarrier[1]. It is CORRECT but SLOWER
+    (barrier 58.5 -> 110.8, full 236.9 -> 309.2) and stays off: swapping 128 uncached reads of one
+    line for 127 device-scope reads of one line buys nothing and serialises them behind block 0.
+
+    MORI_COMB_NOBAR is the barrier's honest price: it deletes the cross-device WAIT from an
+    otherwise complete kernel, keeping the arrival count, the flag stores and the flag increment,
+    which the next replay needs. Every earlier barrier number came from the opposite deletion,
+    NOPUSH+PUSHONLY, which prices a barrier that no longer resembles the real one -- nothing
+    staggers the blocks' arrival, no peer is still pushing, and the launch cannot be separated out.
+
+    MORI_COMB_SPREAD is NOT a deletion -- it walks the same tokens in a different order (a prime-step
+    bijection) so the tokens in flight at any instant spread over all peers instead of clustering in
+    the per-(source rank, source block) runs dispatch reserves. Same destinations, same bytes."""
     return [
         f"-D{name}"
-        for name in ("MORI_COMB_TIMING", "MORI_COMB_NOREDUCE")
+        for name in (
+            "MORI_COMB_TIMING",
+            "MORI_COMB_NOREDUCE",
+            "MORI_COMB_NOQUANT",
+            "MORI_COMB_NOPUSH",
+            "MORI_COMB_NOGATHER",
+            "MORI_COMB_BARRIER2",
+            "MORI_COMB_BARNOFENCE",
+            "MORI_COMB_BARFAN",
+            "MORI_COMB_NOBAR",
+            "MORI_COMB_PUSHONLY",
+            "MORI_COMB_NOWEIGHT",
+            "MORI_COMB_NOROUTE",
+            "MORI_COMB_SPREAD",
+            "MORI_COMB_RUNRR",
+            "MORI_COMB_RUNRRQ",
+            "MORI_COMB_DUMPCNT",
+        )
         if os.environ.get(name, "").strip().lower() in ("1", "true", "on", "yes")
     ]
-
-
-def _disp_clean_defines() -> list[str]:
-    """Kernel body selector: -DMORI_DISP_CLEAN builds the legacy clean IntraNode dispatch body
-    (EpDispatchIntraNodeKernel_clean_body, default geometry 256 blocks x 16 warps) instead of the
-    default EpDispatchIntraNodeKernel_body (64 x 8). Gated by MORI_DISP_CLEAN env; default OFF."""
-    return (
-        ["-DMORI_DISP_CLEAN"]
-        if os.environ.get("MORI_DISP_CLEAN", "").lower() in ("1", "true", "on", "yes")
-        else []
-    )
 
 
 def _disp_metadiag_defines() -> list[str]:
@@ -422,7 +735,11 @@ def _disp_pay2d_defines() -> list[str]:
     records this), and the payload descriptor was the only one still sending tensorDim1 == 1 while
     the meta path and the pure-TDM a2a probe both send 2D. D0 is the fast dim in ELEMENTS and must
     divide hiddenDim; the kernel falls back to the 1D shape when it does not. The 128B minimum row
-    means D0 >= 64 for bf16."""
+    means D0 >= 64 for bf16.
+
+    MEASURED NULL at 64x8 PUSH/TDM + SPREAD, hiddenDim 7168 -- D0=128 and D0=256 are within noise of
+    the 1xN wedge on both phases and D0=64 is worse. Descriptor shape is not what limits either
+    payload phase; see TdmShape in intranode.hpp for the numbers."""
     v = os.environ.get("MORI_DISP_PAY2D", "").strip()
     return [f"-DMORI_DISP_PAY2D={int(v)}"] if v.isdigit() and int(v) > 1 else []
 
@@ -575,9 +892,11 @@ def _hipcc_genco(
         *_ocp_fp_defines(cfg.arch),
         *_disp_tdm_defines(),
         *_comb_tdm_defines(),
+        *_comb_barsleep_defines(),
+        *_comb_barspread_defines(),
+        *_comb_pipe_defines(),
         *_comb_diag_defines(),
         *_disp_timing_defines(),
-        *_disp_clean_defines(),
         *_disp_nophase_defines(),
         *_disp_metadiag_defines(),
     ]

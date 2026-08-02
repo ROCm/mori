@@ -3,8 +3,8 @@
 MORI_DEFINE_GPU_STATES
 
 // Dispatch (block-local exact count + one remote fetch_add(N) per destPe + local slot
-// distribution + 1D TDM). The body behind this symbol is picked in intranode.hpp: the default
-// EpDispatchIntraNodeKernel_body, or the legacy clean body under -DMORI_DISP_CLEAN.
+// distribution + 1D TDM). The body behind this symbol is EpDispatchIntraNodeKernel_body in
+// intranode.hpp.
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeBatchKernel, , false)
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeBatchKernel, _stdmoe, true)
 
@@ -18,6 +18,23 @@ WRAP_ALL_TYPES_BOOL3(EpCombineIntraNodeKernel, _nop2p, false, false, false)
 WRAP_ALL_TYPES_BOOL3(EpCombineIntraNodeKernel, _p2p_stdmoe, true, true, false)
 WRAP_BOOL3(EpCombineIntraNodeKernel, bf16_nop2p_fp8cast, hip_bfloat16, false, false, true)
 MORI_FP8_ANY(WRAP_BOOL4(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq, hip_bfloat16, false, false,
+                        false, true))
+// PULL blockwise. The point of quantising is to move half the bytes, and _nop2p spends that saving
+// and more: its send quantises straight into the PEER's staging slot, a per-lane cross-card scatter
+// that skips the TDM store the plain path gets, so fp8 ends up SLOWER than bf16 (measured at 64x8
+// EP4: bf16 push 417.5us against fp8bwq 3679.2us for half the payload). With UseP2PRead=true the
+// same kernel instead quantises into its OWN combineInp (intranode.hpp:2237, taken because
+// useExternalInpBuffer stays true) and the consumers read peer fp8 + peer scales -- a path the
+// gather already implements in full (intranode.hpp:3509-3521). Only the symbol was missing.
+//
+// MEASURED at 64x8 EP4, MORI_COMB_TDM=4, check armed, both rc=0: _nop2p 3667.8us against 1466.4us
+// here under MORI_COMB_QPULL=1, plus dispatch 237.7 -> 175.9.
+//
+// It only pays WITH the tile path. Switching transport alone, while _cPullType still refused
+// 1-byte TokT, measured 4748.6us -- worse than PUSH, because it turned a cross-card scatter of
+// writes into a cross-card scatter of reads and PUSH at least gathers from local staging. The win
+// is the bulk TDM move, not the direction of travel.
+MORI_FP8_ANY(WRAP_BOOL4(EpCombineIntraNodeKernel, bf16_p2p_fp8bwq, hip_bfloat16, true, false,
                         false, true))
 MORI_FP8_ANY(WRAP_BOOL6(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq_noweight_block128_vec8,
                         hip_bfloat16, false, false, false, true, false, 128))

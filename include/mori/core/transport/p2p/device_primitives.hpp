@@ -1378,6 +1378,42 @@ __device__ __forceinline__ void WarpQuantizeToFp8Blockwise(Fp8T* __restrict__ ds
       }
     }
 
+    // Wave32 (gfx125x) analogue of the block above, and it exists because that block is dead there
+    // while the generic tail below is actively bad: it picks SubwarpSize == warpSize == 32, so
+    // kStrideElems (32 lanes x 8 elems = 256) overshoots a 128-element block and lanes 16-31 find
+    // hasVec false and idle, AND kSubwarpsPerWarp collapses to 1 so the outer loop runs scaleDim
+    // times instead of scaleDim/2. For the shipping shape (hidden 7168, scaleDim 56, blockElems
+    // 128) that is 56 iterations at 16/32 lanes where this branch gives 28 at 32/32. Same intent as
+    // the wave64 block -- size the subwarp to one block so a warp carries several blocks at once --
+    // only the arithmetic differs. Guarded on the subwarp actually being covered, so a block too
+    // short to fill 16 lanes keeps the old path rather than idling even more of them.
+    //
+    // MEASURED, fp8_blockwise EP4 bf16 hidden 7168 4096 tokens, combine 64x8 ZC=0, check armed
+    // (rc=0 both): the push phase priced by MORI_COMB_PUSHONLY minus MORI_COMB_PUSHONLY+NOPUSH goes
+    // 4902.1us -> 2472.6us, a factor 1.98 against the 2.0 the iteration/lane counts predict, and
+    // the whole combine goes 6037.6us -> 3679.2us. Geometry untouched -- this buys nothing extra
+    // from the machine, it just stops half the wave idling.
+    if ((warpSize == 32) && (scaleDim > 1)) {
+      if (blockAligned8 && srcAligned8 && dstAligned8 && (blockElems >= 16 * 8)) {
+        detail::WarpQuantizeBf16ToFp8BlockwiseVec<16, 16, 4, Fp8T>(
+            dstToken, dstScales, reinterpret_cast<const hip_bfloat16*>(srcToken), hiddenDim,
+            scaleDim);
+        return;
+      }
+      if (blockAligned4 && srcAligned8 && dstAligned4 && (blockElems >= 16 * 4)) {
+        detail::WarpQuantizeBf16ToFp8BlockwiseVec<16, 8, 4, Fp8T>(
+            dstToken, dstScales, reinterpret_cast<const hip_bfloat16*>(srcToken), hiddenDim,
+            scaleDim);
+        return;
+      }
+      if (blockAligned2 && srcAligned4 && ((dstPtr & 0x1) == 0) && (blockElems >= 16 * 2)) {
+        detail::WarpQuantizeBf16ToFp8BlockwiseVec<16, 4, 4, Fp8T>(
+            dstToken, dstScales, reinterpret_cast<const hip_bfloat16*>(srcToken), hiddenDim,
+            scaleDim);
+        return;
+      }
+    }
+
     if (blockAligned8 && srcAligned8 && dstAligned8) {
       detail::WarpQuantizeBf16ToFp8BlockwiseVec<warpSize, 16, 4, Fp8T>(
           dstToken, dstScales, reinterpret_cast<const hip_bfloat16*>(srcToken), hiddenDim,
