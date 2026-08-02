@@ -149,8 +149,27 @@ _QUANT_TYPE_MAP = {
 # element codec (and staging slot size) differ, so kernel selection treats them together and then
 # swaps the codec token (fp8bwq <-> fp4bwq) in the kernel name.
 def _comb_qpull() -> bool:
-    """MORI_COMB_QPULL=1: run blockwise combine over the PULL gather instead of PUSH staging."""
-    return os.environ.get("MORI_COMB_QPULL", "").strip().lower() in ("1", "true", "on", "yes")
+    """Whether blockwise combine moves its bytes by PULL gather rather than PUSH staging.
+
+    gfx125x defaults to PULL, every other arch keeps PUSH, and MORI_COMB_QPULL wins either way.
+
+    The two differ only in who carries the bytes, not in what is computed. PUSH has the producer
+    quantise straight into the peer's staging slot, which is a per-lane cross-card scatter that
+    cannot use a TDM bulk store. PULL has it quantise into its own buffer and lets each consumer
+    read peer fp8 plus scales in bulk. MEASURED 64x8 EP4 bf16 fp8_blockwise, correctness check
+    armed, rc=0 on both: PUSH 3646.2us / 58.3 GB/s against PULL 1410.9us / 150.5 GB/s.
+
+    Chunk count is not part of the win and the recorded 1466.4us figure misattributed it:
+    MORI_COMB_TDM=4 on its own moves nothing (3651.7us against 3646.2us), and on top of PULL it
+    COSTS 3.9% (1466.7us against 1410.9us). PULL at the default chunk count is the fast one.
+
+    PULL gives up the weightless top8/top9 vec8 kernels, which have no _p2p variant. That is free at
+    EP4, where those need worldSize > 4 to be eligible at all, and is NOT measured above it.
+    """
+    val = os.environ.get("MORI_COMB_QPULL", "").strip().lower()
+    if val:
+        return val in ("1", "true", "on", "yes")
+    return _is_gfx125x()
 
 
 _BLOCKWISE_COMBINE_QUANT_TYPES = (
@@ -1504,14 +1523,12 @@ class EpDispatchCombineOp:
                     and self.config.world_size > 4
                 )
                 top9 = self.config.num_experts_per_token == 9
-                # MORI_COMB_QPULL=1 routes blockwise over the PULL gather instead of the PUSH
-                # staging. useExternalInpBuffer stays true either way -- that is what makes the
-                # kernel quantise into its own combineInp rather than expecting bf16 already there
-                # -- so this only swaps which half of the kernel moves the bytes.
-                # MEASURED 64x8 EP4 MORI_COMB_TDM=4, check armed, rc=0: 3667.8us -> 1466.4us.
-                # Still opt-in: no vec8 variant is registered for _p2p, so the weightless top8/top9
-                # fast paths below are given up when this is on, and only fp8 (not fp4) has a
-                # _p2p symbol.
+                # PULL, the gfx125x default (_comb_qpull), routes blockwise over the gather instead
+                # of the PUSH staging. useExternalInpBuffer stays true either way -- that is what
+                # makes the kernel quantise into its own combineInp rather than expecting bf16
+                # already there -- so this only swaps which half of the kernel moves the bytes.
+                # It costs the weightless top8/top9 vec8 kernels below, which have no _p2p variant;
+                # they need worldSize > 4 to be eligible, so at EP4 there is nothing to give up.
                 # fp4 is excluded: the kernel's _cPullBwq gate refuses UseFp4Combine (packed 2-per-
                 # byte indexing is not what the tile fold assumes) and no _p2p_fp4bwq is registered.
                 _qpull = _comb_qpull() and (
