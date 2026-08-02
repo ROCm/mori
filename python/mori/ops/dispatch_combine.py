@@ -220,6 +220,36 @@ def _comb_pull_default() -> str:
     return "host" if _is_gfx125x() else "off"
 
 
+def _comb_env_int(name: str, default: int) -> int:
+    val = os.environ.get(name, "").strip()
+    if val.isdigit() and int(val) > 0:
+        return int(val)
+    return default
+
+
+def _comb_qpre() -> bool:
+    """Whether the blockwise quantise pass runs as its OWN kernel before the combine kernel.
+
+    This is the blockwise counterpart of _comb_pull_mode()="host", and it is here for the same
+    reason: staging and gathering want different launch widths, and one fused kernel can only have
+    one. The gather is bound by peer reads in flight and by the LDS its tiles need, so it stops
+    improving past 64x8; the quantise is a pure local stream over the caller's bf16 and wants every
+    CU on the card. MEASURED 64x8 EP4 fp8_blockwise, full minus MORI_COMB_NOQUANT: the inline pass
+    is 408.2us at 64 blocks and 163.8 at 256, while the same bytes moved by hipMemcpyDtoD run at
+    6.3 TB/s, i.e. 50us. Splitting the launch is what lets each half have its own width.
+
+    Only the PULL blockwise path can use it: PUSH quantises straight into the peer's slot, which is
+    the transport itself and not a separable pass. MORI_COMB_QPRE overrides; MORI_COMB_QPRE_BN and
+    MORI_COMB_QPRE_WPB set the pre-pass geometry (default: 4 blocks per CU, 4 warps each).
+    """
+    val = os.environ.get("MORI_COMB_QPRE", "").strip().lower()
+    if val in ("1", "true", "on", "yes"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    return _is_gfx125x()
+
+
 _BLOCKWISE_COMBINE_QUANT_TYPES = (
     EpDispatchCombineQuantType.Fp8BlockwiseQuant,
     EpDispatchCombineQuantType.Fp4BlockwiseQuant,
@@ -1483,6 +1513,19 @@ class EpDispatchCombineOp:
                 # arm -- while the kernel compiled is the PULL one, so the transport follows the
                 # kernel and not the flag. Same disagreement _qpull_bwq already relies on.
                 force_pull = True
+        # Blockwise PULL: run the quantise pass as its own kernel and tell the combine kernel the
+        # input buffer is no longer external, which is the one flag its staging arm reads. Decided
+        # here rather than at the launch below because the flag has to reach build_args.
+        qpre = (
+            _comb_qpre()
+            and actual_use_ext
+            and self.config.kernel_type.value
+            == EpDispatchCombineKernelType.IntraNode.value
+            and _normalize_quant_type(self.config.quant_type)
+            == EpDispatchCombineQuantType.Fp8BlockwiseQuant
+            and _comb_qpull()
+        )
+        kernel_ext_flag = 0 if qpre else use_external_inp_buf
         cur_n = (
             self._routing_source_token_count(routing)
             if routing is not None
@@ -1520,14 +1563,14 @@ class EpDispatchCombineOp:
                 rdma_block_num=actual_rbn,
                 hidden_dim=hidden_dim,
                 replay_mode=False,
-                use_external_inp_buf=use_external_inp_buf,
+                use_external_inp_buf=kernel_ext_flag,
             )
         else:
             args_ptr = mori_cpp.build_args(
                 self._handle,
                 rdma_block_num=actual_rbn,
                 hidden_dim=hidden_dim,
-                use_external_inp_buf=use_external_inp_buf,
+                use_external_inp_buf=kernel_ext_flag,
             )
 
         grid = (actual_bn,)
@@ -1671,6 +1714,27 @@ class EpDispatchCombineOp:
                 shared_mem = self._combine_shared_mem(
                     actual_wpb, use_weights=not use_vec8_top8
                 )
+                # MORI_COMB_NOQUANT deletes the quantise pass to price it, and the pass moved out
+                # of the kernel the -D lives in, so honour it here or deletion pricing silently
+                # stops deleting anything. WRONG RESULTS, same as it always was.
+                if qpre and not os.environ.get("MORI_COMB_NOQUANT", "").strip():
+                    # Its own width, and deliberately not the combine geometry: this pass has no
+                    # cross-card edge and no LDS tiles, so the only thing it wants is enough waves
+                    # to hide the loads. Grid-strided over a token count that only the device
+                    # knows, so the grid is a latency-hiding choice and not a partition.
+                    q_wpb = _comb_env_int("MORI_COMB_QPRE_WPB", 4)
+                    q_bn = _comb_env_int(
+                        "MORI_COMB_QPRE_BN",
+                        4 * int(self._handle_info["multi_processor_count"]),
+                    )
+                    self._launch(
+                        "EpCombineQuantizeInputKernel_bf16",
+                        (q_bn,),
+                        (self._warp_size * q_wpb,),
+                        0,
+                        stream,
+                        args_ptr,
+                    )
                 self._last_combine_kernel_name = kernel_name
                 self._launch(
                     kernel_name,

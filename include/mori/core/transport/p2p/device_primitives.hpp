@@ -929,6 +929,20 @@ __device__ __forceinline__ uint32_t SubwarpReduceMaxU32(uint32_t val) {
   return val;
 }
 
+// Same reduction, butterfly instead of tree, so EVERY lane of the subwarp ends with the max rather
+// than only lane 0. Same instruction count; what it saves is the caller's broadcast afterwards, and
+// then the scale can be derived on every lane instead of on lane 0 and broadcast again. Two
+// cross-lane ops per scale block, and the blockwise quantise pass runs 28 of those per token.
+template <int Width>
+__device__ __forceinline__ uint32_t SubwarpAllReduceMaxU32(uint32_t val) {
+  for (int delta = (Width >> 1); delta > 0; delta >>= 1) {
+    const int other = __shfl_xor(static_cast<int>(val), delta, Width);
+    const int cur = static_cast<int>(val);
+    val = static_cast<uint32_t>((cur > other) ? cur : other);
+  }
+  return val;
+}
+
 // Float32 (IEEE 754): 1 sign + 8 exp + 23 mantissa
 // BFloat16: 1 sign + 8 exp + 7 mantissa
 // Bf16BitsToF32 is faster than __bfloat162float
@@ -1239,12 +1253,14 @@ __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
 #pragma unroll
       for (int u = 0; u < kU; ++u) {
         const int sb = sbStart + u * kSubwarpsPerWarp + subWarpId;
-        uint32_t maxBits = SubwarpReduceMaxU32<SubwarpSize>(Bf16Vec<InVecBytes>::MaxAbsBits(cached[u]));
-        maxBits = static_cast<uint32_t>(__shfl(static_cast<int>(maxBits), 0, SubwarpSize));
+        // Butterfly, so the two broadcasts the tree reduction needs -- one for the max, one for the
+        // scale computed on lane 0 -- both go away and every lane derives the scale itself.
+        const uint32_t maxBits =
+            SubwarpAllReduceMaxU32<SubwarpSize>(Bf16Vec<InVecBytes>::MaxAbsBits(cached[u]));
         const float maxAbs = Bf16BitsToF32(static_cast<uint16_t>(maxBits));
         const bool sbScaled = (maxAbs > fp8Max);
         subwarpScaled = subwarpScaled || sbScaled;
-        float invScale = 1.0f;
+        const float invScale = sbScaled ? (fp8Max / maxAbs) : 1.0f;
         if (subLaneId == 0) {
           const float s = sbScaled ? (maxAbs * invFp8Max) : 1.0f;
           dstScales[sb] = s;
@@ -1252,9 +1268,7 @@ __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
             sb0Scale = s;
             sb0Cached = true;
           }
-          if (sbScaled) invScale = fp8Max / maxAbs;
         }
-        invScale = __shfl(invScale, 0, SubwarpSize);
         Bf16Vec<InVecBytes>::template QuantizeStore<Fp8T>(dstBytes, bases[u], cached[u], invScale);
       }
     }

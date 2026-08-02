@@ -2105,6 +2105,54 @@ __global__ void EpDispatchIntraNodeBatchKernel(EpDispatchCombineArgs<T> args) {
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                               EpCombineQuantizeInputKernel (pre-pass)                          */
+/* ---------------------------------------------------------------------------------------------- */
+// The blockwise quantise that the PULL combine kernel used to run inline, lifted into a kernel of
+// its own so it can be launched at ITS OWN width. Same reasoning, and the same shape, as the host
+// d2d copy that _comb_pull_mode()="host" already uses for an unquantised caller-owned buffer: the
+// staging pass and the gather want opposite geometries and the fused kernel can only have one.
+//
+// The gather wants 64x8 -- it is bound by how many peer reads a block can keep in flight and by the
+// LDS the tiles need, and widening it past that only splits the same reads across more blocks. The
+// quantise wants everything the card has: it is a pure streaming pass over 212 MB of local bf16
+// with no cross-card edge in it at all, so it is bound by latency hiding. Fusing them pinned the
+// quantise to the gather's width, and MEASURED at 64x8 EP4 fp8_blockwise that is what the pass
+// costs: 408.2us inline at 64 blocks against 163.8 at 256 (full minus MORI_COMB_NOQUANT at each).
+// Neither number is the pass's floor -- 318 MB of local traffic at the 6.3 TB/s the d2d copy gets
+// is 50us -- and the 64-block one is not even the best the fused kernel can do.
+//
+// Correctness comes from the stream, not from a new edge: this kernel completes before the combine
+// kernel starts, so every peer's fp8 and scales are visible by the time anyone's barrier opens.
+// That is strictly stronger than the in-kernel arm, which needed a per-block release fence to hold
+// (see MORI_COMB_RELFENCE) because block 0 could signal while other blocks were still storing.
+template <typename T>
+__device__ __forceinline__ void EpCombineQuantizeInputKernel_body(EpDispatchCombineArgs<T> args) {
+  using Fp8T = core::CombineInternalFp8;
+  const index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
+  if (totalRecvTokenNum <= 0) return;
+  const size_t hiddenDim = args.config.HiddenDimSz();
+  const int scaleDim = args.fp8BlockwiseCombineScaleDim;
+  const int warpNum = blockDim.x / warpSize;
+  const int warpId = threadIdx.x / warpSize;
+  const int globalWarpId = blockIdx.x * warpNum + warpId;
+  const int globalWarpNum = gridDim.x * warpNum;
+  Fp8T* dstBase = args.intraNodeTokBufs.combineInp->template GetAs<Fp8T*>();
+  float* scaleBase = args.shmemInpScalesMemObj->template GetAs<float*>();
+  for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
+    core::WarpQuantizeToFp8Blockwise<Fp8T>(dstBase + (size_t)i * hiddenDim,
+                                           scaleBase + (size_t)i * scaleDim,
+                                           args.inpTokenBuf + (size_t)i * hiddenDim, hiddenDim,
+                                           scaleDim);
+  }
+  // One release per thread before it exits, so the bytes are visible to ANOTHER CARD and not just
+  // to the next kernel on this one. End-of-kernel gives the launch that follows an agent-scope
+  // release for free; what a peer's TDM read needs is system scope, and that is the same gap the
+  // in-kernel staging arm had to close with MORI_COMB_RELFENCE. Cheap here -- once per thread at
+  // the end, not once per token.
+  __threadfence_system();
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineIntraNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,

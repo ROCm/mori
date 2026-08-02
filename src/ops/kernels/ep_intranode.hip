@@ -36,6 +36,10 @@ MORI_FP8_ANY(WRAP_BOOL4(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise, hip_
 // is the bulk TDM move, not the direction of travel.
 MORI_FP8_ANY(WRAP_BOOL4(EpCombineIntraNodeKernel, bf16_p2p_fp8_blockwise, hip_bfloat16, true, false,
                         false, true))
+// The blockwise quantise pass as a kernel of its own, so it can be launched wider than the gather
+// wants to be. Paired with useExternalInpBuffer=0 on the combine launch, which is the flag that
+// switches the in-kernel staging arm off; see EpCombineQuantizeInputKernel_body in intranode.hpp.
+MORI_FP8_ANY(WRAP(EpCombineQuantizeInputKernel, bf16, hip_bfloat16))
 MORI_FP8_ANY(WRAP_BOOL6(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise_noweight_block128_vec8,
                         hip_bfloat16, false, false, false, true, false, 128))
 MORI_FP8_ANY(WRAP_BOOL6(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise_noweight_block256_vec8,
