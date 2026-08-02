@@ -285,14 +285,6 @@ def _profiler_defines() -> list[str]:
     return ["-DENABLE_PROFILER"] if is_profiler_enabled() else []
 
 
-def _disp_tdm_defines() -> list[str]:
-    """Experimental: -DMORI_DISP_TDM routes the EP dispatch token payload through
-    the gfx1250 TDM engine (see src/ops/dispatch_combine/intranode.hpp). Gated by
-    the MORI_DISP_TDM env so the JIT kernel matches the host launch build."""
-    val = os.environ.get("MORI_DISP_TDM", "")
-    return ["-DMORI_DISP_TDM"] if val.lower() in ("1", "true", "on", "yes") else []
-
-
 # Prefix rather than an enumeration: this tracks the kernel-side #if, which tests the gfx125x
 # arch macros, and a new member of that family should not need a second edit here to be recognised.
 _FASTPATH_ARCH_PREFIX = "gfx125"
@@ -640,9 +632,15 @@ def _comb_diag_defines() -> list[str]:
     NOPUSH+PUSHONLY, which prices a barrier that no longer resembles the real one -- nothing
     staggers the blocks' arrival, no peer is still pushing, and the launch cannot be separated out.
 
-    MORI_COMB_SPREAD is NOT a deletion -- it walks the same tokens in a different order (a prime-step
-    bijection) so the tokens in flight at any instant spread over all peers instead of clustering in
-    the per-(source rank, source block) runs dispatch reserves. Same destinations, same bytes."""
+    Every flag left in this list is a DELETION or a diagnostic, which is what makes "off" the right
+    default for all of them. The push loop's token ORDER used to be selected from here too --
+    MORI_COMB_SPREAD (prime-step bijection), MORI_COMB_RUNRR (bucket by peer, flattened take) and
+    MORI_COMB_RUNRRQ (bucket by peer, queued take) -- and that was a category error: reordering is
+    not a deletion, all three produce correct results, and which one is fastest is decided by the
+    peer count and the warp count, both of which the kernel knows at launch. The queued bucket order
+    won at every measured point (64x8 bf16 PUSH, check armed: EP4 319.4us against 417.6 unordered
+    and 325.8 flattened, EP2 196.6 against 203.4 and 216.2), so it is now the only push order and
+    the three flags are gone."""
     return [
         f"-D{name}"
         for name in (
@@ -658,9 +656,6 @@ def _comb_diag_defines() -> list[str]:
             "MORI_COMB_PUSHONLY",
             "MORI_COMB_NOWEIGHT",
             "MORI_COMB_NOROUTE",
-            "MORI_COMB_SPREAD",
-            "MORI_COMB_RUNRR",
-            "MORI_COMB_RUNRRQ",
             "MORI_COMB_DUMPCNT",
         )
         if os.environ.get(name, "").strip().lower() in ("1", "true", "on", "yes")
@@ -890,7 +885,6 @@ def _hipcc_genco(
         *_ccqe_defines(),
         *_profiler_defines(),
         *_ocp_fp_defines(cfg.arch),
-        *_disp_tdm_defines(),
         *_comb_tdm_defines(),
         *_comb_barsleep_defines(),
         *_comb_barspread_defines(),

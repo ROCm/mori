@@ -1133,7 +1133,12 @@ def _bench_dispatch_combine(
         quant_type=quant_type,
     )
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
-        if os.environ.get("MORI_EP_COMM", "").strip().lower() != "cco":
+        # Ask the op layer which backend it resolved rather than re-reading MORI_EP_COMM here: the
+        # backend is an arch default now, so a copy of the env test would init the shmem heap for an
+        # op that went on to use cco.
+        from mori.ops.dispatch_combine import _ep_comm
+
+        if _ep_comm() != "cco":
             mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
         # For fp8_blockwise, plumb the kernel-internal scale_dim into the

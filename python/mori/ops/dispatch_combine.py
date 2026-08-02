@@ -78,20 +78,20 @@ def _detect_warp_size():
     return _DEFAULT_WAVE_SIZE
 
 # Process-global CCO communicator, reused across ops (creating one per op would
-# re-run the socket bootstrap every time). Only used when MORI_EP_COMM=cco, which
+# re-run the socket bootstrap every time). Used when _ep_comm() resolves to cco, which
 # routes the C++ EP handle's symmetric buffers through a cco LSA window instead of
 # the mori-shmem heap (enables intra-node EP on archs without shmem support).
 _CCO_COMM = None
 
 
 def _maybe_get_cco_comm(config):
-    """Return a cached cco Communicator when MORI_EP_COMM=cco, else None.
+    """Return a cached cco Communicator when the resolved backend is cco, else None.
 
     Bootstraps once via a torch.distributed broadcast of the cco unique-id (the
     same pattern the v2/FlyDSL path uses), sized for this config's symmetric
     buffers. Reused for the lifetime of the process.
     """
-    if os.environ.get("MORI_EP_COMM", "").strip().lower() != "cco":
+    if _ep_comm() != "cco":
         return None
     global _CCO_COMM
     if _CCO_COMM is not None:
@@ -318,6 +318,47 @@ _PTR_SIZE = 8
 # src/ops/dispatch_combine/intranode.hpp: the kernel picks its combine transport by testing its
 # tiles against that number, and this function reserves for whichever one it will pick.
 _COMB_LDS_BUDGET = 327680
+
+
+def _is_gfx125x():
+    """Whether this device takes the TDM code paths.
+
+    Single source of truth on the host side, because three things have to agree with the kernel's
+    own `#if defined(__gfx1250__) || defined(__gfx1251__)` and with each other: which dispatch body
+    runs, how much dynamic LDS is reserved for it, and what launch geometry it is given. They used
+    to be keyed on the MORI_DISP_TDM env instead, which let all three disagree with the compiled
+    kernel whenever the variable was unset.
+
+    jit.core owns the arch string because the JIT is what compiles for it. Any failure degrades to
+    False, i.e. the portable body, never a crash on the launch path.
+    """
+    try:
+        from mori.jit.core import _FASTPATH_ARCH_PREFIX, _target_arch
+
+        return _target_arch().startswith(_FASTPATH_ARCH_PREFIX)
+    except Exception:
+        return False
+
+
+def _ep_comm():
+    """Resolved backend for the EP handle's symmetric buffers: "cco" or "shmem".
+
+    gfx125x defaults to cco, everything else keeps mori-shmem. An explicit MORI_EP_COMM wins either
+    way, so the variable is still there for anyone who needs to force the other one.
+
+    This is an arch default for the same reason the dispatch body is: which backend can carry the
+    symmetric buffers is a property of the hardware, and a caller who has to know that in order to
+    set an environment variable will eventually not know it. cco routes the buffers through an LSA
+    window instead of the shmem heap, which is what makes intra-node EP work on an arch without
+    shmem support.
+
+    NOT VERIFIED on any non-gfx125x device -- there is none on this machine -- which is exactly why
+    the non-125x branch keeps the behaviour it already had rather than being changed blind.
+    """
+    val = os.environ.get("MORI_EP_COMM", "").strip().lower()
+    if val:
+        return val
+    return "cco" if _is_gfx125x() else "shmem"
 
 
 def warmup_jit_kernels(kernel_type):
@@ -551,10 +592,15 @@ class EpDispatchCombineOp:
     def _intranode_dispatch_default_launch(self):
         """Per-body default (block_num, warp_per_block) for the IntraNode dispatch kernel.
 
-        The default body (EpDispatchIntraNodeKernel_body) batches metadata into one TDM copy per
-        (block, peer) run. That argues for a narrow grid where each block owns a large contiguous
-        run, and 64 blocks came from that reasoning -- correctly, as it turns out, but the 8 warps
-        that came with it left the payload phase starved of concurrent TDM.
+        Split on the ARCH, matching the #if that picks the body in intranode.hpp. gfx125x runs
+        EpDispatchIntraNodeKernel_body and takes 64x8; every other arch runs the WarpCopy body,
+        which interleaves scattered per-token metadata with the payload and needs the wide grid to
+        hide that, so it keeps its historical 256x16.
+
+        The gfx125x body batches metadata into one TDM copy per (block, peer) run. That argues for
+        a narrow grid where each block owns a large contiguous run, and 64 blocks came from that
+        reasoning -- correctly, as it turns out, but the 8 warps that came with it left the payload
+        phase starved of concurrent TDM.
 
         Device facts (measured, torch.cuda.get_device_properties on gfx1250): CU=256,
         LDS=327680B per CU AND per block, max 2048 threads/CU, warpSize=32. At wpb=8 the tile is
@@ -585,10 +631,12 @@ class EpDispatchCombineOp:
         without changing the footprint. They are recorded because they bound what the payload phase
         can do when TDM concurrency is not the constraint.
 
-        This is the ONLY dispatch body now: the legacy clean body, which interleaved scattered
-        per-token metadata with the payload and wanted 256x16 to hide that, has been deleted along
-        with its -DMORI_DISP_CLEAN gate.
+        Which body runs used to be an env choice (-DMORI_DISP_CLEAN) on top of another env choice
+        (-DMORI_DISP_TDM). Both are gone: an environment variable could pick the empty body on
+        gfx125x or the wide-grid body's geometry on hardware running the narrow-grid one.
         """
+        if not _is_gfx125x():
+            return 256, 16
         return 64, 8
 
     def _intranode_combine_default_launch(self):
@@ -618,9 +666,7 @@ class EpDispatchCombineOp:
         same workload forced to 16 warps runs 1171.2us -- both TDM transports decline on LDS, the
         gather takes over, and nothing crashes or corrupts.
         """
-        from mori.jit.core import _FASTPATH_ARCH_PREFIX, _target_arch
-
-        if not _target_arch().startswith(_FASTPATH_ARCH_PREFIX):
+        if not _is_gfx125x():
             return 0, 0
         return 64, 8
 
@@ -671,11 +717,15 @@ class EpDispatchCombineOp:
             + self.config.num_experts_per_rank * warp_per_block
             + self.config.num_experts_per_rank
         ) * 4  # sizeof(index_t)
-        # Experimental TDM dispatch (MORI_DISP_TDM): the IntraNode dispatch kernel
-        # stages each token's hidden-dim payload through ONE per-warp LDS tile, so it
-        # needs warp_per_block * hiddenDim * elemSize bytes of dynamic shared. Here
-        # warp_per_block is the DEVICE warp count per block (block = warpSize*wpb).
-        if os.environ.get("MORI_DISP_TDM", "").lower() in ("1", "true", "on", "yes"):
+        # On gfx125x the IntraNode dispatch body stages each token's hidden-dim payload through ONE
+        # per-warp LDS tile, so it needs warp_per_block * hiddenDim * elemSize bytes of dynamic
+        # shared. Here warp_per_block is the DEVICE warp count per block (block = warpSize*wpb).
+        # Everywhere else the WarpCopy body runs, which stages nothing and needs only `base`.
+        #
+        # This tests the ARCH, matching the #if that selects the body in intranode.hpp. It used to
+        # test MORI_DISP_TDM, which meant an unset env reserved `base` for a kernel that stages
+        # 14KB tiles per warp into that reservation.
+        if _is_gfx125x():
             # One FULL token tile per warp = hidden*elemSize bytes (14KB at hidden 7168 bf16), so
             # wpb<=16 stays inside the 320KB gfx1250 LDS budget. A second tile per warp for payload
             # double-buffering is not worth its 229KB (measured 1280.8 vs 1280.7 GB/s, see the drain

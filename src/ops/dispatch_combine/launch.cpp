@@ -440,11 +440,17 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
 
   unsigned int block_x = WARP_SIZE * wpb;
   int smem = dispatch_shared_mem(handle.config, wpb);
-#ifdef MORI_DISP_TDM
-  // TDM dispatch stages each token payload through ONE per-warp LDS tile; size the
-  // dynamic shared to warpNum * hiddenDim * elemSize (see intranode.hpp). gfx1250
-  // has 320KB LDS/CU, so a 14KB bf16 tile lets ~22 warps/CU stay resident.
-  {
+  // The gfx125x dispatch body stages each token payload through ONE per-warp LDS tile; size the
+  // dynamic shared to warpNum * hiddenDim * elemSize (see intranode.hpp). gfx1250 has 320KB LDS/CU,
+  // so a 14KB bf16 tile lets ~22 warps/CU stay resident. Other arches take the WarpCopy body, which
+  // stages nothing and keeps the index-array reservation above.
+  //
+  // Keyed on the RUNTIME arch, not on a build macro. It used to be #ifdef MORI_DISP_TDM, which is
+  // the same condition the kernel used to compile its body under; now that the body is selected by
+  // __gfx1250__/__gfx1251__ alone, a host built without that macro would under-reserve LDS for a
+  // kernel that stages tiles into it. detect_hardware() has already cached the arch string.
+  detect_hardware();
+  if (s_cached_arch.rfind("gfx125", 0) == 0) {
     int ws = 32;
     (void)hipDeviceGetAttribute(&ws, hipDeviceAttributeWarpSize, 0);
     if (ws <= 0) ws = 32;
@@ -454,7 +460,6 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
     size_t elem = (dtype == HIP_R_32F) ? 4u : ((dtype == HIP_R_16BF) ? 2u : 1u);
     smem = warpNum * hd * static_cast<int>(elem);
   }
-#endif
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(dtype);
   auto& reg = KernelRegistry::Instance();
