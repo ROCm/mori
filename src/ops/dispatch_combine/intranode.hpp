@@ -2499,6 +2499,19 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 #endif
   }
 
+  // Release edge for the LOCAL staging arm at :2149, which is the one write in this kernel that a
+  // peer reads out of this rank's own combineInp instead of finding already pushed into its slot.
+  // :693 records the per-block release fence as "add it only against a failure that reproduces";
+  // PULL with a caller-owned input buffer is a failure that reproduces (3 of 4 ranks wrong), so
+  // this is the candidate. It is a candidate and not the answer: combineInp is
+  // hipDeviceMallocUncached (dispatch_combine.cpp:324), which is exactly the allocation a
+  // visibility bug should not survive, and blockwise runs the same staging arm under QPULL and
+  // passes. Kept behind a gate so the A/B can say which.
+#if defined(MORI_COMB_RELFENCE)
+  if constexpr (UseP2PRead) {
+    if (args.config.useExternalInpBuffer) __threadfence_system();
+  }
+#endif
   // Make sure copy on all GPUs are finished
   MORI_TRACE_NEXT(seq, Slot::CombineBarrier);
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);

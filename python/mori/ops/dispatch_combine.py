@@ -172,6 +172,40 @@ def _comb_qpull() -> bool:
     return _is_gfx125x()
 
 
+def _comb_pull_mode() -> str:
+    """How a CALLER-OWNED (use_external_inp_buf) combine input reaches the PULL gather.
+
+    PULL is the fast transport -- each consumer bulk-reads its peers' buffers instead of having
+    every producer scatter per-lane writes across the fabric -- but the kernel can only read a
+    peer's buffer if the bytes are IN a symmetric buffer, and a caller-owned tensor is not one.
+    That is the whole reason use_external_inp_buf has been pinned to PUSH. The bytes therefore
+    have to be staged into the registered buffer first, and this picks who does it:
+
+      "host"   -- a d2d copy on the caller's stream before launch. The kernel then runs the
+                  ordinary zero-copy _p2p path unchanged, so correctness is inherited from the
+                  path that already passes.
+      "kernel" -- the kernel stages the token itself and then reads peers. Cheaper in principle
+                  (the copy can overlap the gather) but it puts a cross-card visibility edge in
+                  the middle of the kernel that the zero-copy path does not have.
+      "off"    -- keep PUSH.
+
+    Default is set by measurement in _comb_pull_default(); MORI_COMB_PULL overrides.
+    """
+    val = os.environ.get("MORI_COMB_PULL", "").strip().lower()
+    if val in ("host", "kernel", "off"):
+        return val
+    if val in ("1", "true", "on", "yes"):
+        return "host"
+    if val in ("0", "false", "no"):
+        return "off"
+    return _comb_pull_default()
+
+
+def _comb_pull_default() -> str:
+    """Transport for a caller-owned combine input when MORI_COMB_PULL is unset."""
+    return "off"
+
+
 _BLOCKWISE_COMBINE_QUANT_TYPES = (
     EpDispatchCombineQuantType.Fp8BlockwiseQuant,
     EpDispatchCombineQuantType.Fp4BlockwiseQuant,
@@ -767,7 +801,7 @@ class EpDispatchCombineOp:
             name += "_stdmoe"
         return name
 
-    def _combine_shared_mem(self, warp_per_block, use_weights=True):
+    def _combine_shared_mem(self, warp_per_block, use_weights=True, force_pull=False):
         """Shared memory for combine kernels."""
         quant_type = _normalize_quant_type(self.config.quant_type)
         num_ptr_arrays = 1 + int(bool(use_weights))
@@ -822,7 +856,10 @@ class EpDispatchCombineOp:
             # _qpull_bwq keeps use_external_inp_buf True (that is what makes the kernel quantise
             # locally) while compiling UseP2PRead=true, so the transport here follows the KERNEL,
             # not the buffer flag. This is the one case where the two disagree.
-            if self.config.use_external_inp_buf and not _qpull_bwq:
+            # force_pull is the same disagreement as _qpull_bwq from the other direction: the
+            # caller owns the input buffer but its bytes were staged into the registered one
+            # before launch, so the kernel is a _p2p kernel and needs PULL tiles.
+            if self.config.use_external_inp_buf and not _qpull_bwq and not force_pull:
                 # PUSH never splits a token and never holds more than one: one warp sends one whole
                 # token to its one destination PE, so the tile is exactly hiddenDim elements and
                 # MORI_COMB_TDM only gates TDM on/off there.
@@ -1378,6 +1415,36 @@ class EpDispatchCombineOp:
             else int(self.config.use_external_inp_buf)
         )
         is_zero_copy = not actual_use_ext
+        # "PULL + caller-owned input", host route: stage the caller's bytes into the registered
+        # buffer here, on their stream, then run the ordinary zero-copy _p2p kernel untouched.
+        # The stream orders the copy before the launch, so the kernel's existing producer/consumer
+        # barrier remains the only cross-card edge -- exactly the situation true zero copy is in,
+        # which is why this inherits its correctness rather than needing a new argument for it.
+        # Restricted to unquantised intranode combine: blockwise reaches PULL through
+        # _comb_qpull instead, and fp8_direct_cast has no _p2p kernel to fall into.
+        force_pull = False
+        if (
+            actual_use_ext
+            and self.config.kernel_type.value
+            == EpDispatchCombineKernelType.IntraNode.value
+            and _normalize_quant_type(self.config.quant_type)
+            == EpDispatchCombineQuantType.None_
+        ):
+            _pm = _comb_pull_mode()
+            if _pm == "host":
+                reg = self.get_registered_combine_input_buffer(input.dtype, hidden_dim)
+                reg[: input.size(0)].copy_(input)
+                # From here on this call is indistinguishable from a zero-copy one, which is the
+                # point: no kernel, no argument and no tile size differs from the path that passes.
+                use_external_inp_buf = 0
+                actual_use_ext = 0
+                is_zero_copy = True
+                force_pull = True
+            elif _pm == "kernel":
+                # The buffer flag stays set -- that is what makes the kernel run its own staging
+                # arm -- while the kernel compiled is the PULL one, so the transport follows the
+                # kernel and not the flag. Same disagreement _qpull_bwq already relies on.
+                force_pull = True
         cur_n = (
             self._routing_source_token_count(routing)
             if routing is not None
@@ -1429,7 +1496,7 @@ class EpDispatchCombineOp:
         block = (self._warp_size * actual_wpb,)
         kt = self.config.kernel_type.value
         quant_type = _normalize_quant_type(self.config.quant_type)
-        shared_mem = self._combine_shared_mem(actual_wpb)
+        shared_mem = self._combine_shared_mem(actual_wpb, force_pull=force_pull)
 
         if quant_type in _BLOCKWISE_COMBINE_QUANT_TYPES:
             label = (
@@ -1589,8 +1656,12 @@ class EpDispatchCombineOp:
                         args_ptr,
                     )
                 else:
+                    # force_pull here means MORI_COMB_PULL=kernel: caller still owns the input
+                    # buffer, but the kernel stages it into combineInp itself and the peers read
+                    # that, so the _p2p symbol is the right one despite the flag.
+                    _tr = "_p2p" if force_pull else "_nop2p"
                     self._launch(
-                        f"EpCombineIntraNodeKernel_{sfx}_nop2p",
+                        f"EpCombineIntraNodeKernel_{sfx}{_tr}",
                         grid,
                         block,
                         shared_mem,
