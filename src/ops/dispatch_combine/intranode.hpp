@@ -92,6 +92,51 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape(int hiddenDim) {
   g1.tileDim0(hiddenDim); g1.tileDim1(1);
   return g1;
 }
+// 0 = off, 1 = widen only 1-byte element types, 2 = widen everything the alignment allows.
+#ifndef MORI_COMB_QWIDE
+#define MORI_COMB_QWIDE 1
+#endif
+// The same contiguous run described in the WIDEST element type its byte count allows.
+//
+// The descriptor's dataSize is the element width, and for a run that is contiguous in both LDS and
+// global memory it carries no information the transfer needs -- 3584 one-byte elements and 896
+// four-byte elements name the same 3584 bytes at the same address. It is not free to the engine
+// though. MEASURED at 64x8 EP4 on the chunked PULL gather, same code, same descriptor count, same
+// 3584 ELEMENTS per descriptor, MORI_COMB_NOQUANT holding the quantise pass out:
+//   bf16 (dataSize 1, 7168 B rows)  247.7us for 212 MB   857 GB/s
+//   fp8  (dataSize 0, 3584 B rows)  493.2us for 106 MB   215 GB/s
+// Half the bytes taking twice as long is a factor of four per byte that the payload cannot explain,
+// and the element count is identical across the two, so it is not an elements-per-cycle limit
+// either. What is left is the 1-byte dataSize itself.
+//
+// Alignment is the caller's to guarantee: both the LDS tile and the global address must satisfy the
+// width this picks. Every combine PULL site feeds it a 128B-aligned tile and a token base that is a
+// multiple of hiddenDim, so the byte count is what decides.
+template <typename T>
+__device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShapeWide(int nElems) {
+  if constexpr ((MORI_COMB_QWIDE) == 0 || (sizeof(T) == 4) ||
+                ((MORI_COMB_QWIDE) == 1 && sizeof(T) != 1)) {
+    return TdmShape<T>(nElems);
+  } else {
+    const int bytes = nElems * (int)sizeof(T);
+    gfx1250_TDM_GROUP1 g1;
+    int d0;
+    if ((bytes & 3) == 0) {
+      g1.dataSize(2);
+      d0 = bytes >> 2;
+    } else if ((bytes & 1) == 0) {
+      g1.dataSize(1);
+      d0 = bytes >> 1;
+    } else {
+      g1.dataSize(0);
+      d0 = bytes;
+    }
+    g1.tensorDim0(d0); g1.tensorDim1(1);
+    g1.tensorDim0Stride(d0); g1.tensorDim1Stride(1);
+    g1.tileDim0(d0); g1.tileDim1(1);
+    return g1;
+  }
+}
 // Issue an async TDM load global->LDS (does NOT wait for completion).
 //
 // TH and SCOPE are GROUP0's temporal hint and scope trait, which every caller here has been leaving
@@ -2873,8 +2918,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       TokT* const _qTiles = reinterpret_cast<TokT*>(sharedMem + _qBaseOff);
       TokT* const _qMine = _qTiles + (size_t)warpId * _qBufs * _qTile;
       const TokT* const _qGroupBase = _qTiles + (size_t)(_qId * _qSize) * _qBufs * _qTile;
-      const gfx1250_TDM_GROUP1 _qPgFull = TdmShape<TokT>(_qTile);
-      const gfx1250_TDM_GROUP1 _qPgDummy = TdmShape<TokT>(_cPullRowElems);
+      const gfx1250_TDM_GROUP1 _qPgFull = TdmShapeWide<TokT>(_qTile);
+      const gfx1250_TDM_GROUP1 _qPgDummy = TdmShapeWide<TokT>(_cPullRowElems);
       // A source that dedup removed still has to issue something: the wait immediate below counts
       // ops, not bytes, so every warp must issue exactly one per token. One 128B row off this
       // rank's own staging is the cheapest legal load, and its tile is never folded.
@@ -3755,13 +3800,13 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         if (!_cPullBwq && !_cGatherOk && _cPullSrcMax == _cPipeSrc && _nSrc >= 1 && _cPipeFits &&
             (size_t)_cPullTileElems * sizeof(TokT) >= 128) {
           const int _tile = _cPullTileElems;
-          const gfx1250_TDM_GROUP1 _pgFull = TdmShape<TokT>(_tile);
-          const gfx1250_TDM_GROUP1 _pgDummy = TdmShape<TokT>(_cPullRowElems);
+          const gfx1250_TDM_GROUP1 _pgFull = TdmShapeWide<TokT>(_tile);
+          const gfx1250_TDM_GROUP1 _pgDummy = TdmShapeWide<TokT>(_cPullRowElems);
           // _cPipeBufs tile sets per warp; _combine_shared_mem() scales tiles_per_warp by the same
           // factor. Bytes IN FLIGHT per CU is what this knob buys: 8 warps * (bufs-1) * srcMax *
           // tile, against a fabric read whose round trip the LDS budget is too small to cover.
           auto _issueChunk = [&](size_t _o, int _n, TokT* _tb) {
-            const gfx1250_TDM_GROUP1 _pg = (_n == _tile) ? _pgFull : TdmShape<TokT>(_n);
+            const gfx1250_TDM_GROUP1 _pg = (_n == _tile) ? _pgFull : TdmShapeWide<TokT>(_n);
 #pragma unroll
             for (int _j = 0; _j < _cPipeSrc; ++_j) {
               if (_j < _nSrc)
@@ -3880,7 +3925,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             TdmIssueLoad<TokT>(_cPullTiles, _gBase + _off,
                                TdmShapeGather<TokT>(_n, config.worldSize, _cGatherPitch));
           } else {
-            const gfx1250_TDM_GROUP1 _pg1 = TdmShape<TokT>(_n);
+            const gfx1250_TDM_GROUP1 _pg1 = TdmShapeWide<TokT>(_n);
             for (int _j = 0; _j < _nSrc; ++_j) {
               if (srcPtrs[_j] == nullptr) continue;
               TdmIssueLoad<TokT>(_cPullTiles + (size_t)_j * _cPullTileElems, srcPtrs[_j] + _off,

@@ -571,7 +571,25 @@ def _comb_pipe_defines() -> list[str]:
     if _lb.isdigit() and int(_lb) > 0:
         out.append(f"-DMORI_COMB_LB={int(_lb)}")
     out.append(f"-DMORI_COMB_QSTGU={_comb_qstgu()}")
+    out.append(f"-DMORI_COMB_QWIDE={_comb_qwide()}")
     return out
+
+
+def _comb_qwide() -> int:
+    """Whether combine's PULL gather describes its peer reads in the widest element type the byte
+    count allows: 0 = off, 1 = only for 1-byte tokens (fp8/fp4 blockwise), 2 = for every token type.
+
+    The descriptor's dataSize is not free even though it carries nothing a contiguous copy needs.
+    MEASURED at 64x8 EP4 on the chunked PULL gather with MORI_COMB_NOQUANT holding the quantise pass
+    out, same code and the same 3584 elements per descriptor in both rows: bf16 at dataSize 1 moves
+    212 MB in 247.7us (857 GB/s), fp8 at dataSize 0 moves 106 MB in 493.2us (215 GB/s). See
+    TdmShapeWide in intranode.hpp.
+
+    Default 1 rather than 2 because only the 1-byte case has been measured to be broken; 2 exists to
+    ask the same question of bf16.
+    """
+    val = os.environ.get("MORI_COMB_QWIDE", "").strip()
+    return int(val) if val.isdigit() and int(val) in (0, 1, 2) else 1
 
 
 def _comb_qstgu() -> int:
