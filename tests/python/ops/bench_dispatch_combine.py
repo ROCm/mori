@@ -338,18 +338,34 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                     dispatch_output[:total_recv_num_token, :]
                 )
 
-        combine_output, _ = op.combine(
+        # MORI_BENCH_WEIGHTS=1 passes the dispatched weights instead of None, which is the only way
+        # to exercise combine's weight reduction on a 4-GPU node: the pytest suite that covers it is
+        # pinned at world_size=8. Off by default so the timing runs keep their historical shape.
+        _bw = os.environ.get("MORI_BENCH_WEIGHTS", "").strip().lower() in ("1", "true", "on", "yes")
+        combine_output, combine_output_weight = op.combine(
             combine_input,
-            None,
+            dispatch_weights if _bw else None,
             dispatch_indices,
             block_num=combine_block_num,
             warp_per_block=combine_warp_per_block,
         )
+        if _bw:
+            # Loud, because a silent None here would make the weight path look tested when the
+            # check never ran -- which is exactly how the QUAD weight gap survived this long.
+            assert (
+                combine_output_weight is not None
+            ), "MORI_BENCH_WEIGHTS=1 but combine() returned no weight output"
+            if self.config.rank == 0:
+                print(
+                    f"[BENCHW] weights live, out_w={tuple(combine_output_weight.shape)} "
+                    f"nonzero={int(combine_output_weight.count_nonzero())} check={check}"
+                )
         if check:
             self.check_combine_result(
                 op,
                 test_data,
                 combine_output,
+                combine_output_weight=combine_output_weight if _bw else None,
                 combine_data_type=self.combine_data_type,
             )
         self.sync()
@@ -451,6 +467,50 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         self._steady_rounds.append(
             (steady_us, steady_bytes / (1000**3) / (steady_us / 1e6))
         )
+        dispatch_recv_num_token.zero_()
+        self.sync()
+
+        # The same EPV2 timing for COMBINE, which never had one. Dispatch got it above so that this
+        # bench and dispatch_combine_v2's could be compared on one ruler; combine was left out, so
+        # there was no honest way to put this kernel next to the cco-LSA one. This is that ruler.
+        #
+        # It reads 108.7us where the alternating loop below reads 236.6, and BOTH are right about
+        # different questions. What a combine costs inside a step is 236.6: e2e, which chains
+        # dispatch and combine in ONE graph with no per-iteration launch boundary and the ranks
+        # locked in step by construction, reads 401us against the alternating loop's 174 + 236.6 =
+        # 410, so nine microseconds split between two ops is the entire launch-boundary story and
+        # nothing here is rank de-alignment. That was worth ruling out explicitly, since combine's
+        # cross-device barrier is exactly the part that would turn de-alignment into wait time: it
+        # would show up hardest under MORI_COMB_NOPUSH+PUSHONLY, that config being launch and
+        # barrier and nothing else, and there the two rulers agree (58.0 vs 57.7); the alternating
+        # rounds are also flat to 1us over all 10 rounds and all 4 ranks with no round-0 spike.
+        #
+        # The 108.7 is low because N back-to-back replays with no dispatch in between leave the
+        # working set LLC-resident -- 202.47MB in 108.7us is 1.86 TB/s, past every wire number on
+        # this box (1.54 write, 1.40 P2P read), so it is a comparison metric and not a throughput
+        # one. Do not convert it to GB/s and do not quote it as a step cost. Do use it, and only
+        # it, against numbers out of dispatch_combine_v2's time_graph, which warms its cache the
+        # same way.
+        # One dispatch first: combine sizes its loops off totalRecvTokenNum, which the zero_() above
+        # just cleared, so without it the replays would fold nothing and read as free.
+        dispatch_graph.replay()
+        self.sync()
+        for _ in range(graph_replay_iters):
+            combine_graph.replay()
+            self.sync()  # lock-step warmup, as EPV2 does, so no rank laps another's barrier flag
+        comb_steady_start = torch.cuda.Event(enable_timing=True)
+        comb_steady_end = torch.cuda.Event(enable_timing=True)
+        comb_steady_start.record()
+        for _ in range(graph_replay_iters):
+            combine_graph.replay()
+        comb_steady_end.record()
+        torch.cuda.synchronize()
+        comb_steady_us = (
+            comb_steady_start.elapsed_time(comb_steady_end) * 1000.0 / graph_replay_iters
+        )
+        if not hasattr(self, "_comb_steady_rounds"):
+            self._comb_steady_rounds = []
+        self._comb_steady_rounds.append(comb_steady_us)
         dispatch_recv_num_token.zero_()
         self.sync()
 
@@ -635,11 +695,16 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             dist.all_gather(comb_dur_list, torch.tensor([comb_dur * 1000]))
             dist.all_gather(comb_bw_list, torch.tensor([comb_bw]))
             dist.all_gather(e2e_dur_list, torch.tensor([e2e_dur * 1000]))
+            # 1000**2, matching the 1000**3 the bandwidths above are computed with. This printed
+            # 1024**2 while the label said MB, so the same payload appeared as 202.47 here and as
+            # 212.3 when reconstructed from bw x lat -- a 4.86% phantom that got recorded as "this
+            # bench receives 682 fewer tokens than theory" and propagated into every hand-computed
+            # GB/s that divided this figure by the latency.
             dist.all_gather(
-                disp_bytes_list, torch.tensor([disp_total_bytes / (1024**2)])
+                disp_bytes_list, torch.tensor([disp_total_bytes / (1000**2)])
             )
             dist.all_gather(
-                comb_bytes_list, torch.tensor([comb_total_bytes / (1024**2)])
+                comb_bytes_list, torch.tensor([comb_total_bytes / (1000**2)])
             )
 
             disp_duration_us_list.append([round(t.item(), 1) for t in disp_dur_list])
@@ -691,6 +756,16 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 )
 
             print()
+            comb_steady = getattr(self, "_comb_steady_rounds", [])
+            if comb_steady:
+                print(
+                    f"Combine rank0 EPV2-timing ({graph_replay_iters} back-to-back replays per "
+                    f"event pair, cf. dispatch_combine_v2 time_graph) -- compare ONLY against v2's "
+                    f"time_graph, it is LLC-warm; step cost is the rounds below: "
+                    f"best {min(comb_steady):.1f}us  "
+                    f"mean {sum(comb_steady) / len(comb_steady):.1f}us  "
+                    f"(n={len(comb_steady)} rounds)"
+                )
             print("Combine result:")
             for i, duration_us in enumerate(comb_duration_us_list):
                 algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size

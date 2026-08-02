@@ -601,14 +601,20 @@ class EpDispatchCombineTestCase:
         # intact. Without this escape the bench asserts before it ever reaches the timing loop, so
         # the diagnostic cannot be measured at all. Deliberately loud, and deliberately keyed on the
         # same env var the compile gate reads, so a stale export can never silently disarm the check.
-        # MORI_BENCH_SKIPCHECK is the same escape for pricing a path that is known-broken before
-        # deciding whether to fix it -- the PUSH combine (--zero-copy 0) drops one source of topk, so
-        # it cannot be benchmarked at all while this assert stands. It must stay opt-in and separate
-        # from the gate above so it can never be confused for a passing run.
+        # MORI_BENCH_SKIPCHECK is the same escape, for timing a path before it is known to be
+        # correct. It is a general diagnostic switch, NOT a statement about any particular path.
+        #
+        # It used to be documented here as existing because "the PUSH combine (--zero-copy 0) drops
+        # one source of topk". THAT IS NOT TRUE, whatever it was describing when it was written.
+        # Measured with this very check armed (MORI_BENCH_SKIPCHECK=0), EP4 bf16 hidden 7168, 4096
+        # tokens, topk 8, combine 64x8: --zero-copy 0 passes at 417.5us with the TDM push transport
+        # and at 2553.9us without it. test_dispatch_combine also parametrises use_external_inp_buf
+        # over (True, False), i.e. PUSH is in the suite. Do not reintroduce the claim without a
+        # failing run to point at.
         for var, why in (
             ("MORI_COMB_NOREDUCE", "combine folds one source instead of topk"),
             ("MORI_COMB_PUSHONLY", "combine returns after the push and writes no output"),
-            ("MORI_BENCH_SKIPCHECK", "explicitly pricing a known-broken path"),
+            ("MORI_BENCH_SKIPCHECK", "timing a path whose correctness is not being asserted"),
         ):
             if os.environ.get(var, "").strip().lower() in ("1", "true", "on", "yes"):
                 if self.config.rank == 0:
