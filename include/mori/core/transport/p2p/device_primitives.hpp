@@ -1174,7 +1174,7 @@ struct Bf16Vec<16> {
 // How many scale blocks this warp keeps in flight in the exact-fit path below. 1 restores the
 // old one-block-at-a-time chain. Overridden by -DMORI_COMB_QSTGU=N from python/mori/jit/core.py.
 #ifndef MORI_COMB_QSTGU
-#define MORI_COMB_QSTGU 4
+#define MORI_COMB_QSTGU 7
 #endif
 
 template <int SubwarpSize, int InVecBytes, int MaxCacheIters, typename Fp8T>
@@ -1222,6 +1222,9 @@ __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
   // So issue MORI_COMB_QSTGU blocks' loads before reducing any of them. The reduce, the divide and
   // the store are unchanged and still happen per block; only the order changes, so the bytes and
   // the arithmetic are identical to the loop below and this is not an approximation of it.
+  // MEASURED, check armed, this pass isolated by subtracting the 630.0us gather: depth 1 718.8us,
+  // depth 4 444.9, depth 7 410.5. It flattens at 7, which is also the exact fit -- 56 scale blocks
+  // over 2 subwarps is 28 iterations, and 28/7 leaves no tail for the general loop below.
   if (maxIters == 1 && blockElems == kStrideElems && blockElems * scaleDim == hiddenDim) {
     constexpr int kU = (MORI_COMB_QSTGU) < 1 ? 1 : (MORI_COMB_QSTGU);
     constexpr int kStep = kSubwarpsPerWarp * kU;

@@ -572,7 +572,27 @@ def _comb_pipe_defines() -> list[str]:
         out.append(f"-DMORI_COMB_LB={int(_lb)}")
     out.append(f"-DMORI_COMB_QSTGU={_comb_qstgu()}")
     out.append(f"-DMORI_COMB_QWIDE={_comb_qwide()}")
+    out.append(f"-DMORI_COMB_RELFENCE={_comb_relfence()}")
     return out
+
+
+def _comb_relfence() -> int:
+    """Whether each block fences to system scope before combine's cross-device barrier when it has
+    just staged a caller-owned buffer that peers will read. 1 = yes (default), 0 = the old behaviour.
+
+    This is a CORRECTNESS default, not a tuning one. The barrier's release side fences on block 0's
+    first worldSize threads only, so another block's stores can still be in flight when the peer flag
+    goes up. MEASURED at 64x8 EP4 bf16 ZC=0 MORI_COMB_PULL=kernel with the check armed: without the
+    fence 3 of 4 ranks are wrong, with it rc=0. 0 is kept only so the failure can be reproduced.
+
+    Note what hid this: the gate used to be a plain on/off diagnostic name, and the build cache key
+    did not include it, so the "with fence" run reused the "without fence" binary and reported rc=1.
+    That reads as "the fence does not fix it" and sent the whole question down the wrong path.
+    """
+    val = os.environ.get("MORI_COMB_RELFENCE", "").strip().lower()
+    if val in ("0", "false", "off", "no"):
+        return 0
+    return 1
 
 
 def _comb_qwide() -> int:
@@ -585,11 +605,14 @@ def _comb_qwide() -> int:
     212 MB in 247.7us (857 GB/s), fp8 at dataSize 0 moves 106 MB in 493.2us (215 GB/s). See
     TdmShapeWide in intranode.hpp.
 
-    Default 1 rather than 2 because only the 1-byte case has been measured to be broken; 2 exists to
-    ask the same question of bf16.
+    MEASURED NULL, WHICH IS WHY IT DEFAULTS OFF. The theory above was that a dataSize of 0 is what
+    makes the fp8 gather slow, since bf16 moves twice the bytes through the same code in 247.7us
+    while fp8 takes 493.2. Describing the identical run in 4-byte elements reads 630.0us against
+    631.1 for the whole combine, and 1349.4 against 1348.8 with the quantise pass live -- nothing.
+    The gate is kept, at 0, so the next person does not have to rebuild it to re-ask.
     """
     val = os.environ.get("MORI_COMB_QWIDE", "").strip()
-    return int(val) if val.isdigit() and int(val) in (0, 1, 2) else 1
+    return int(val) if val.isdigit() and int(val) in (0, 1, 2) else 0
 
 
 def _comb_qstgu() -> int:
@@ -602,10 +625,13 @@ def _comb_qstgu() -> int:
     the launch and the cross-device barrier together. See WarpQuantizeBf16ToFp8BlockwiseVec.
 
     1 is the old behaviour. Correctness-preserving at every value: only the order of the loads
-    changes, not which bytes are read, reduced or stored.
+    changes, not which bytes are read, reduced or stored. MEASURED at 64x8 EP4, check armed, with
+    the gather (630.0us) subtracted off to leave this pass alone:
+        QSTGU 1  718.8us      QSTGU 4  444.9us      QSTGU 7  410.5us
+    7 is where it flattens, and 56 scale blocks over 2 subwarps makes 7 an exact fit with no tail.
     """
     val = os.environ.get("MORI_COMB_QSTGU", "").strip()
-    return int(val) if val.isdigit() and int(val) >= 1 else 4
+    return int(val) if val.isdigit() and int(val) >= 1 else 7
 
 
 def _comb_diag_defines() -> list[str]:
@@ -692,7 +718,6 @@ def _comb_diag_defines() -> list[str]:
             "MORI_COMB_NOWEIGHT",
             "MORI_COMB_NOROUTE",
             "MORI_COMB_DUMPCNT",
-            "MORI_COMB_RELFENCE",
             "MORI_COMB_QNOSC",
         )
         if os.environ.get(name, "").strip().lower() in ("1", "true", "on", "yes")

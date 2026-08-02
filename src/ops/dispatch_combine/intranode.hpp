@@ -2544,15 +2544,26 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 #endif
   }
 
-  // Release edge for the LOCAL staging arm at :2149, which is the one write in this kernel that a
-  // peer reads out of this rank's own combineInp instead of finding already pushed into its slot.
-  // :693 records the per-block release fence as "add it only against a failure that reproduces";
-  // PULL with a caller-owned input buffer is a failure that reproduces (3 of 4 ranks wrong), so
-  // this is the candidate. It is a candidate and not the answer: combineInp is
-  // hipDeviceMallocUncached (dispatch_combine.cpp:324), which is exactly the allocation a
-  // visibility bug should not survive, and blockwise runs the same staging arm under QPULL and
-  // passes. Kept behind a gate so the A/B can say which.
-#if defined(MORI_COMB_RELFENCE)
+  // Release edge for the LOCAL staging arm above, which is the one write in this kernel that a peer
+  // reads out of this rank's own combineInp instead of finding already pushed into its slot. The
+  // barrier's own release fences on block 0's first worldSize threads (:750), so every other block's
+  // stores can still be in flight when the peer flag goes up.
+  //
+  // ON BY DEFAULT because it is the difference between right and wrong, not between fast and slow.
+  // MEASURED 64x8 EP4 bf16 ZC=0 MORI_COMB_PULL=kernel, check armed: without it 3 of 4 ranks are
+  // wrong, with it rc=0 at 544.9us. That combineInp is hipDeviceMallocUncached does not save it --
+  // uncached describes how the OWNER's loads behave, not when a store retires far enough for
+  // another card to see it -- and neither does blockwise passing without it, which only means that
+  // pass is slow enough to close the window on its own. It runs the same staging arm.
+  //
+  // This was recorded as REFUTED for one round: an A/B said the fence changed nothing. It changed
+  // nothing because it was never compiled -- the gate's -D was missing from the build cache key, so
+  // the "with fence" run loaded the "without fence" .hsaco. Set MORI_COMB_RELFENCE=0 to reproduce
+  // the failure; that is the only reason 0 still exists.
+#ifndef MORI_COMB_RELFENCE
+#define MORI_COMB_RELFENCE 1
+#endif
+#if MORI_COMB_RELFENCE
   if constexpr (UseP2PRead) {
     if (args.config.useExternalInpBuffer) __threadfence_system();
   }
@@ -2681,16 +2692,25 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   // the LDS that forced bf16 to split a token buys whole-token rows here, and splitting further
   // only pays more descriptors for narrower rows.
   //
-  // WHAT IS LEFT IS THE DESCRIPTOR COUNT, not the quantise and not the fold. Priced at chunk 2 with
-  // the deletion gates (SKIPCHECK, 64x8 EP4): full 1410.7us, MORI_COMB_NOQUANT 1412.9us,
-  // MORI_COMB_NOREDUCE 1323.1us, both 1323.9us. So the local stage-and-quantise pass costs nothing
-  // measurable, the fp32 dequantise fold costs 87.6us, and 1323us is the peer reads alone -- about
-  // 101 MB at 72 GB/s, against 885 GB/s for bf16 on this same chunked path and 1202 GB/s for QUAD.
-  // The chunk sweep says which: more chunks means less LDS and better occupancy yet it gets SLOWER,
-  // so this is bound by per-descriptor overhead, and a token here is 2 chunks x 4 sources = 8
-  // descriptors of 3584 B. QUAD is the shape that fixes it -- one descriptor for a whole token,
-  // depth-2 buffered -- and it is cheaper in LDS for fp8 than for the bf16 it already serves. It is
-  // gated off for blockwise at :2838.
+  // WHERE THE TIME ACTUALLY GOES, re-measured after the build cache stopped handing NOQUANT runs
+  // the full build's binary. The earlier version of this note read "the local stage-and-quantise
+  // pass costs nothing measurable and 1323us is the peer reads alone". Both halves were the cache:
+  // MORI_COMB_NOQUANT emitted a -D the key did not name, so it compiled nothing and reported the
+  // full build's time. Deletion pricing at chunk 2 (SKIPCHECK, 64x8 EP4, honest key):
+  //     full                          1409.5us
+  //     MORI_COMB_NOQUANT              631.1     -> the local quantise/stage pass is 778us
+  //     MORI_COMB_PUSHONLY+NOQUANT      15.8     -> launch and the cross-device barrier together
+  //     MORI_COMB_NOREDUCE            1324.4     -> three of the four folded sources are 85us
+  //     MORI_COMB_QNOSC               1336.5     -> every peer scale read is 73us
+  // so it is roughly half local quantise, half gather, and the fold and the barrier are noise. The
+  // quantise half is attacked in WarpQuantizeBf16ToFp8BlockwiseVec (MORI_COMB_QSTGU, 778 -> 410).
+  //
+  // The gather half is 106 MB in ~500us and is NOT the descriptor shape. Priced with NOQUANT
+  // holding the quantise pass out: chunked at 2 chunks 628.7us, whole-token chunks 609.2, QUAD
+  // depth 4 632.0, QUAD depth 4 split 2 868.2 -- three structurally different decompositions inside
+  // 4% of each other. Nor is it the 1-byte descriptor dataSize, which was the next theory and is
+  // also dead: describing the same run in 4-byte elements (MORI_COMB_QWIDE) reads 630.0 against
+  // 631.1. For scale, bf16 on this same chunked code moves TWICE the bytes in 247.7us.
   //
   // Reaching this at all needed the reduce's `if constexpr (UseFp8BlockwiseQuant)` chain narrowed
   // (:3627): it is a COMPILE-time chain, so while blockwise matched there the tile block was never
@@ -2829,13 +2849,14 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   // __syncthreads live in this loop at all; groups past the end still execute both barriers and
   // simply fold nothing.
   bool _qDone = false;
-  // _cPullBwq is admitted here for the reason the chunked path measured out: at chunk 2 that path
-  // spends 1323us of its 1410.7us purely on peer reads (~101 MB at 72 GB/s) while the quantise
-  // costs nothing measurable and the fold 87.6us, and more chunks make it WORSE (1410 -> 1746 from
-  // 2 to 16) even though they shrink the tiles and raise occupancy. That shape is per-descriptor
-  // overhead, not bandwidth, and QUAD is the answer to it: one whole-token descriptor per source
-  // instead of chunks x sources. fp8 also fits it better than the bf16 it already serves -- 112 KB
-  // of double buffer at 8 warps against 229 KB -- so the depth that bf16 cannot afford is free here.
+  // _cPullBwq is admitted here, but the reason recorded for admitting it was wrong and the result
+  // is a wash. The claim was that the chunked path spends 1323 of its 1410.7us on peer reads and
+  // that per-descriptor overhead explains it, so one whole-token descriptor per source would fix
+  // it. The 1323 was the build cache (see the note at the chunked gather); the honest split is
+  // 778us of local quantise and ~500us of gather. MEASURED with MORI_COMB_NOQUANT holding the
+  // quantise out, 64x8 EP4: chunked 628.7us, QUAD depth 4 632.0, QUAD depth 4 split 2 868.2. QUAD
+  // buys blockwise nothing here. It stays admitted because it is not a loss and the depth-2 guard
+  // below is a real bug worth keeping visible, not because the gather wants this shape.
   if constexpr (_cPullType && UseP2PRead && (!UseFp8BlockwiseQuant || _cPullBwq)) {
     // Depth and split are the two knobs the fold/transport overlap turns on. Whole-token reads
     // (split 1) buy the fastest transport -- 119us of the 136.8us that MORI_COMB_NOROUTE +
