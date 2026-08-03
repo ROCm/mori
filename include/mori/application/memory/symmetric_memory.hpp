@@ -81,9 +81,10 @@ class SymmMemManager {
   SymmMemObjPtr GetVMMHeapObj() const { return vmmHeapObj; }
   size_t GetVMMChunkSize() const { return vmmChunkSize; }
 
-  // Per-NIC rkeys for send-side routing (proxy mode).
+  // Per-NIC keys for send-side routing (proxy mode).
+  // perNicLkeys[nic] = lkey for MY buffer registered on nic's PD.
   // perNicPeerRkeys[nic][peer] = rkey for peer's buffer registered on nic's PD.
-  // Populated during RegisterSymmMemObj when allRdmaDeviceContexts.size() > 1.
+  std::vector<uint32_t> perNicLkeys;
   std::vector<std::vector<uint32_t>> perNicPeerRkeys;
 
   // Common Utilities

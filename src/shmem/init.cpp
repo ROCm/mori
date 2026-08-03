@@ -730,21 +730,9 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
     int numNics = static_cast<int>(allCtxs.size());
     int numQpPerPe = ctx->GetNumQpPerPe();
 
-    // Register symmetric memory on each NIC's PD for send-side routing.
-    // This allows any NIC to DMA this GPU's buffer across XGMI.
-    std::vector<uint32_t> perNicLkeys(numNics, 0);
-    if (states->memoryStates && states->memoryStates->staticHeapBasePtr && numNics > 0) {
-      void* heapPtr = states->memoryStates->staticHeapBasePtr;
-      size_t heapSize = states->memoryStates->staticHeapSize;
-      fprintf(stderr, "[MoRI-PROXY] Registering heap MR on %d NICs (ptr=%p size=%zu)\n",
-              numNics, heapPtr, heapSize);
-      for (int n = 0; n < numNics; n++) {
-        if (!allCtxs[n]) continue;
-        auto mr = allCtxs[n]->RegisterRdmaMemoryRegionAuto(heapPtr, heapSize);
-        perNicLkeys[n] = mr.lkey;
-        fprintf(stderr, "[MoRI-PROXY]   NIC %d: lkey=%u rkey=%u\n", n, mr.lkey, mr.rkey);
-      }
-    }
+    // Per-NIC lkeys were already registered in symmetric_memory.cpp during heap allocation.
+    // Just read them from the SymmMemManager.
+    const auto& perNicLkeys = states->memoryStates->symmMemMgr->perNicLkeys;
 
     // Build QP handles with per-NIC lkey and rkey overrides.
     // QP[i] was created on allRdmaDeviceContexts[qpSlot % numNics].
@@ -771,7 +759,7 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
     }
     fprintf(stderr, "[MoRI-PROXY] Found %d QPs in %zu slots for proxy thread (%d NICs)\n",
             qpCount, qps.size(), numNics);
-    if (!qps.empty()) {
+    if (qpCount > 0) {
       states->proxyThread = std::make_unique<core::ProxyThread>();
       states->proxyThread->Init(states->gpuStates.proxyRing, std::move(qps));
       states->proxyThread->Start();
@@ -795,14 +783,21 @@ bool ShmemIsInitialized() {
 
 static void FinalizeGpuStates(ShmemStates* states) {
   // Shutdown proxy thread before freeing GPU states
+  fprintf(stderr, "[MoRI-PROXY] FinalizeGpuStates: shutting down proxy...\n");
   if (states->proxyThread) {
+    fprintf(stderr, "[MoRI-PROXY]   Calling proxyThread->Shutdown()\n");
     states->proxyThread->Shutdown();
+    fprintf(stderr, "[MoRI-PROXY]   proxyThread->Shutdown() done\n");
     states->proxyThread.reset();
+    fprintf(stderr, "[MoRI-PROXY]   proxyThread reset done\n");
   }
   if (states->gpuStates.proxyRing) {
+    fprintf(stderr, "[MoRI-PROXY]   Freeing proxyRing %p\n", (void*)states->gpuStates.proxyRing);
     free(states->gpuStates.proxyRing);
     states->gpuStates.proxyRing = nullptr;
+    fprintf(stderr, "[MoRI-PROXY]   proxyRing freed\n");
   }
+  fprintf(stderr, "[MoRI-PROXY] Proxy cleanup done\n");
 
   hipDeviceSynchronize();
   (void)hipGetLastError();

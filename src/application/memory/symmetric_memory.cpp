@@ -213,16 +213,21 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   const auto& allCtxs = context.GetAllRdmaDeviceContexts();
   int numNics = static_cast<int>(allCtxs.size());
   if (numNics > 1 && anyRdmaPeer) {
+    perNicLkeys.resize(numNics, 0);
     perNicPeerRkeys.resize(numNics);
     for (int n = 0; n < numNics; n++) {
+      // Barrier before each NIC's registration to serialize across processes
+      // and avoid concurrent ibv_reg_mr calls on the same NIC from different GPUs.
+      bootNet.Barrier();
       perNicPeerRkeys[n].resize(worldSize, 0);
       if (allCtxs[n]) {
         auto mr = allCtxs[n]->RegisterRdmaMemoryRegionAuto(localPtr, size);
+        perNicLkeys[n] = mr.lkey;
         perNicPeerRkeys[n][rank] = mr.rkey;
       }
       bootNet.Allgather(&perNicPeerRkeys[n][rank], perNicPeerRkeys[n].data(), sizeof(uint32_t));
     }
-    fprintf(stderr, "[MoRI-PROXY] Per-NIC rkey exchange done: %d NICs × %d peers\n", numNics, worldSize);
+    fprintf(stderr, "[MoRI-PROXY] Per-NIC MR + rkey exchange done: %d NICs × %d peers\n", numNics, worldSize);
   }
 
   // Copy memory object to GPU memory, we need to access it from GPU directly
