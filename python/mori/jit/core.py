@@ -734,8 +734,8 @@ def _comb_diag_defines() -> list[str]:
 
     MORI_COMB_FOLDVEC is the one exception to that: it is CORRECTNESS-PRESERVING, and it is here
     only because it needs the same -D and cache-key plumbing. It routes PUSH's fold through the 16B
-    lane-load gather (WarpAccumLF) instead of the TDM tile path, to price the LDS round trip the
-    tile path pays for data each byte of which is read exactly once. See _cPullOk in intranode.hpp.
+    lane-load gather instead of the TDM tile path, and it is kept as a SETTLED NEGATIVE -- dropping
+    the tile costs 596.1us against 311.5. See _cPullOk in intranode.hpp for what that measured.
 
     Every other flag in this list is a DELETION or a diagnostic, which is what makes "off" the right
     default for all of them. The push loop's token ORDER used to be selected from here too --

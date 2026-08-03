@@ -2839,12 +2839,18 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   // jit/core.py that is not a deletion; it is there because it needs the same -D and cache-key
   // plumbing. PULL is left alone so the QUAD fold is not disturbed.
   //
-  // What it asks: a reduce reads each byte exactly once, so staging it in LDS buys no reuse and
-  // costs a round trip plus a tensorcnt drain per chunk, and the tile pins all 115712 B of LDS,
-  // which caps how much can be in flight. DeepEP's reduce epilogue does the same job with plain
-  // vector loads straight into registers, unrolled 2-4 deep (combine_utils.cuh combine_reduce).
-  // MEASURED here at 64x8 EP4 PUSH by deletion: fetch+writeback is 108.7us for 293.6 MB, 2701 GB/s
-  // against 6.3 TB/s of local bandwidth.
+  // It was added to ask whether the LDS round trip is waste -- a reduce reads each byte exactly
+  // once, so the tile buys no reuse, and DeepEP's epilogue folds with plain register loads. ANSWER:
+  // NO, KEEP THE TILE. At 64x8 EP4 PUSH, 596.1us against 311.5, i.e. the fold goes from 157.8us to
+  // roughly 442. tools/tdm_redsim.cc agrees out of kernel at 102.19 vs 32.15us. A wave32 lane gather
+  // moves 512 B per source per step; the tile moves a 1792-element chunk. Fewer, larger requests win
+  // by more than the round trip costs.
+  //
+  // The 2701 GB/s that motivated this was an OCCUPANCY artifact, not a transport one. The tile pins
+  // 115712 B of LDS, so a CU holds one block, and CBN=64 was leaving 192 of 256 CUs idle. At CBN=256
+  // the same fold is 45.3us / ~8 TB/s and combine is 220.9us. Layout was ruled out alongside it:
+  // RED_ADJ=1 packs a token's sources adjacently, DeepEP-style, instead of 58.7 MB apart, and moves
+  // nothing (32.22 vs 32.15us). Keep the gate -- it is the reproduction path for all three.
 #if defined(MORI_COMB_FOLDVEC)
   constexpr bool _cFoldVec = true;
 #else
