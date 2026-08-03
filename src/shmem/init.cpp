@@ -723,7 +723,7 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   GpuStateInit(states);
 
   // Start proxy thread if proxy mode is enabled
-  if (false && states->gpuStates.useProxy && states->gpuStates.proxyRing) {
+  if (states->gpuStates.useProxy && states->gpuStates.proxyRing) {
     auto* ctx = states->rdmaStates->commContext;
     const auto& hostEndpoints = ctx->GetRdmaEndpoints();
     const auto& allCtxs = ctx->GetAllRdmaDeviceContexts();

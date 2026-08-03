@@ -480,7 +480,11 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
 
 IonicDeviceContext::IonicDeviceContext(RdmaDevice* rdma_device, ibv_context* context, ibv_pd* in_pd)
     : RdmaDeviceContext(rdma_device, in_pd) {
-  create_parent_domain(context, in_pd);
+  const char* proxyEnvPD = std::getenv("MORI_USE_IBGDA_PROXY");
+  bool useProxyPD = proxyEnvPD && (std::string(proxyEnvPD) == "1" || std::string(proxyEnvPD) == "true");
+  if (!useProxyPD) {
+    create_parent_domain(context, in_pd);
+  }
 }
 
 IonicDeviceContext::~IonicDeviceContext() {
@@ -500,6 +504,37 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   int ret;
 
   assert(!config.withCompChannel && !config.enableSrq && "not implemented");
+
+  const char* proxyEnvQP = std::getenv("MORI_USE_IBGDA_PROXY");
+  bool useProxyQP = proxyEnvQP && (std::string(proxyEnvQP) == "1" || std::string(proxyEnvQP) == "true");
+
+  if (useProxyQP) {
+    ibv_pd* basePd = GetIbvPd();
+    ibv_cq* plainCq = ibv_create_cq(context, config.maxMsgsNum * 2, nullptr, nullptr, 0);
+    assert(plainCq);
+    ibv_qp_init_attr qa{};
+    qa.send_cq = plainCq; qa.recv_cq = plainCq; qa.qp_type = IBV_QPT_RC;
+    qa.cap.max_send_wr = config.maxMsgsNum;
+    qa.cap.max_recv_wr = config.maxRecvWr != 0 ? config.maxRecvWr : config.maxMsgsNum;
+    qa.cap.max_send_sge = 1; qa.cap.max_recv_sge = 1; qa.cap.max_inline_data = 64;
+    ibv_qp* plainQp = ibv_create_qp(basePd, &qa);
+    assert(plainQp);
+
+    RdmaEndpoint endpoint;
+    endpoint.handle.psn = 0;
+    endpoint.handle.portId = config.portId;
+    endpoint.handle.qpn = plainQp->qp_num;
+    const ibv_port_attr* gidPortAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+    assert(gidPortAttr);
+    GidSelectionResult gidSel = AutoSelectGidIndex(context, config.portId, gidPortAttr, config.gidIdx);
+    memcpy(endpoint.handle.eth.gid, gidSel.gid.raw, sizeof(endpoint.handle.eth.gid));
+    endpoint.handle.eth.gidIdx = gidSel.gidIdx;
+    endpoint.vendorId = RdmaDeviceVendorId::Pensando;
+    endpoint.ibvHandle.qp = plainQp;
+    endpoint.ibvHandle.cq = plainCq;
+    proxyQpPool[plainQp->qp_num] = plainQp;
+    return endpoint;
+  }
 
   const char* proxyEnv = std::getenv("MORI_USE_IBGDA_PROXY");
   bool useProxy = proxyEnv && (std::string(proxyEnv) == "1" || std::string(proxyEnv) == "true");
