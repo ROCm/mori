@@ -59,14 +59,18 @@ row "p2 prefetch off vs on, gather alone, 256x16" \
 3)
 # ---- PHASE 3: back on the default key, so free. Where each half wants to run. The two halves want
 #      opposite widths, which is why they are separate kernels at all, and only the pre-kernel grid
-#      has been swept (256x8 best of 1024/512/256/128). The GATHER's width at fp8 has not been:
-#      every gather figure on record is at a width chosen for bf16, which moves twice the bytes per
-#      descriptor and so has a different in-flight ceiling.
+#      has been swept (256x8 best of 1024/512/256/128) -- and that sweep was taken with the combine
+#      pinned at 64x8, where the gather dominates and hides the pre-kernel's own shape.
 echo "PHASE3"
 row "p3 gather width sweep, quantise deleted" \
   "$G CBNS='64 128 256 512' CWPB=8 SPECS='noq=MORI_COMB_QPRE=noq'"
 row "p3 gather width sweep at 16 warps" \
   "$G CBNS='128 256 512' CWPB=16 SPECS='noq=MORI_COMB_QPRE=noq'"
+# The pre-kernel re-swept against the FAST gather instead of the slow one. It has no LDS and no
+# cross-card edge, so the only thing it wants is waves; whether 8 warps and 4 blocks per CU is
+# actually that has never been tested where the answer would show.
+row "p3 pre-kernel grid, combine held at 256x16" \
+  "$G CBN=256 CWPB=16 SPECS='q256x8=MORI_COMB_QPRE_BN=256 MORI_COMB_QPRE_WPB=8; q512x8=MORI_COMB_QPRE_BN=512 MORI_COMB_QPRE_WPB=8; q256x16=MORI_COMB_QPRE_BN=256 MORI_COMB_QPRE_WPB=16; q512x16=MORI_COMB_QPRE_BN=512 MORI_COMB_QPRE_WPB=16; q1024x4=MORI_COMB_QPRE_BN=1024 MORI_COMB_QPRE_WPB=4'"
 ;;
 
 esac
