@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Read a run log mid-flight. LOG names it; CTR names the container.
+# Everything the step runner has recorded so far, from the log that lives in the container
+# filesystem rather than /tmp, plus the ep_test breadcrumb -- a "run" line with no matching "done"
+# names the spec that was live when a node stopped answering.
 set -uo pipefail
 CTR="${CTR:-MORI-F1}"
-LOG="${LOG:-/tmp/q_decide.log}"
+SRC="${SRC:-/root/mori_tdm}"
 docker exec "$CTR" bash -lc "
-  grep -E '^START|^END|^###|^  [a-z]|^       ' $LOG | tail -70
-  echo \"--- \$(wc -l < $LOG) lines, \$(pgrep -fc bench_dispatch_combine 2>/dev/null || echo 0) bench procs live\"
+  echo '== results =='
+  grep -E '^###|^  [a-z]|^       ' $SRC/.q_decide.log 2>/dev/null | tail -60
+  echo '== breadcrumb (tail) =='
+  tail -12 $SRC/.ep_test_last 2>/dev/null
+  echo \"== live: \$(pgrep -fc bench_dispatch_combine 2>/dev/null || echo 0) bench procs ==\"
 "
 echo "QPOLL_DONE"

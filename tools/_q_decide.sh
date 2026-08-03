@@ -1,47 +1,53 @@
 #!/usr/bin/env bash
-# The run to fire the moment a gfx1250 node is back. It answers, in one sitting, the question the
-# fp8 combine has been stuck on: why does a gather that moves HALF the bytes take 2.5x longer than
-# the bf16 one, invariant to every read-shape knob?
+# ONE spec per invocation, appended to a log inside the container filesystem so it survives the
+# node. STEP picks which.
 #
-# Order matters -- the first rows are the ones a short window must not lose.
+# It is a step runner rather than a 25-minute sweep because f01-1 died in the middle of one and
+# took the whole queue with it, leaving no way to say which spec was running -- and f01-2 died the
+# same way earlier. Until something is known about what kills these boxes, no run may be longer
+# than the evidence it produces.
 #
-# 1. pipe rows FIRST, with the check armed. MORI_COMB_PIPE=2 now admits blockwise (the fold it was
-#    excluded from dequantises), and that code has never run. rc=0 is the gate on believing the
-#    rest of the row; overlap is the only structural knob blockwise never had.
-# 2. dcast: fp8 transport with NO scales and no blockwise fold. If this lands near half the bf16
-#    time, the fp8 gather is fine and everything lost is blockwise-specific, which contradicts the
-#    73us that deletion pricing puts on the scale reads and means the deletion pricing is what is
-#    wrong. If it is slow too, the loss is in the 1-byte tile path itself.
-# 3. the deletion decomposition, re-taken on this node so nothing is compared across machines.
+# What the steps answer, in the order a short window should spend itself:
+#   1 bf16_zc1   the bar, and a health check: it is the one row known to pass on a fresh node
+#   2 bwq_pipe2  MORI_COMB_PIPE=2, which now admits blockwise. NEVER RUN. Check armed: rc is the
+#                gate on believing the time.
+#   3 bwq_base   blockwise as it ships, same geometry, same session
+#   4 dcast      fp8 with NO scales and no blockwise fold. Near half the bf16 time here means the
+#                fp8 transport is fine and the loss is blockwise-specific -- which contradicts the
+#                73us that deletion pricing puts on the scale reads, and would mean the deletion
+#                pricing is what is wrong.
+#   5 bwq_gather the quantise pass deleted (QPRE=noq): the gather alone
+#   6 bwq_pure   gather with the fold and the scale reads deleted too: transport alone. This is the
+#                number the whole question turns on -- 106 MB against a fabric that does 1.4 TB/s.
+#   7 bf16_zc0   the caller-owned-buffer path, which is the other half of the ask
 #
-# CBN/CWPB are swept at the two points that matter: 64x8 (the bf16 tuned point, and the geometry
-# the ask names) and 256x16 (the best blockwise has managed, 367.6us).
+# CBN/CWPB default to the 64x8 the ask names; re-run the same steps at 256 16 afterwards.
 set -uo pipefail
 CTR="${CTR:-MORI-F1}"
 SRC="${SRC:-/root/mori_tdm}"
-LOG="${LOG:-/tmp/q_decide.log}"
+LOG="${LOG:-$SRC/.q_decide.log}"
+STEP="${STEP:-1}"
+CBN="${CBN:-64}"
+CWPB="${CWPB:-8}"
+
+case "$STEP" in
+  1) QT=none;            ZC=1; SPECS='bf16_zc1!=' ;;
+  2) QT=fp8_blockwise;   ZC=0; SPECS='bwq_pipe2!=MORI_COMB_PIPE=2' ;;
+  3) QT=fp8_blockwise;   ZC=0; SPECS='bwq_base!=' ;;
+  4) QT=fp8_direct_cast; ZC=0; SPECS='dcast!=' ;;
+  5) QT=fp8_blockwise;   ZC=0; SPECS='bwq_gather=MORI_COMB_QPRE=noq' ;;
+  6) QT=fp8_blockwise;   ZC=0; SPECS='bwq_pure=MORI_COMB_QPRE=noq MORI_COMB_QNOSC=1 MORI_COMB_NOREDUCE=1' ;;
+  7) QT=none;            ZC=0; SPECS='bf16_zc0!=' ;;
+  *) echo "unknown STEP=$STEP"; exit 1 ;;
+esac
 
 docker exec "$CTR" bash -lc "cd $SRC && git fetch --quiet origin && git reset --hard origin/tdm-dispatch 2>&1 | tail -1"
-docker exec -d "$CTR" bash -lc "
-  cd $SRC && : > $LOG
-  echo \"START \$(date -u +%H:%M:%S)\" >> $LOG
-  for geo in '64 8' '256 16'; do
-    set -- \$geo
-    echo \"### comb \$1 x \$2\" >> $LOG
-    # 1. the new path, correctness first
-    QT=fp8_blockwise ZC=0 CBN=\$1 CWPB=\$2 DBN=64 DWPB=8 WS=4 \
-      SPECS='bwq_pipe2!=MORI_COMB_PIPE=2; bwq_base!=' ./tools/ep_test.sh >> $LOG 2>&1
-    # 2. fp8 with no scales at all
-    QT=fp8_direct_cast ZC=0 CBN=\$1 CWPB=\$2 DBN=64 DWPB=8 WS=4 \
-      SPECS='dcast!=' ./tools/ep_test.sh >> $LOG 2>&1
-    # 3. where the time goes, on this node
-    QT=fp8_blockwise ZC=0 CBN=\$1 CWPB=\$2 DBN=64 DWPB=8 WS=4 \
-      SPECS='bwq_gather=MORI_COMB_QPRE=noq; bwq_nosc=MORI_COMB_QNOSC=1; bwq_nored=MORI_COMB_NOREDUCE=1; bwq_pure=MORI_COMB_QPRE=noq MORI_COMB_QNOSC=1 MORI_COMB_NOREDUCE=1' \
-      ./tools/ep_test.sh >> $LOG 2>&1
-    # 4. the bar, same node same session
-    QT=none ZC=1 CBN=\$1 CWPB=\$2 DBN=64 DWPB=8 WS=4 SPECS='bf16_zc1!=' ./tools/ep_test.sh >> $LOG 2>&1
-    QT=none ZC=0 CBN=\$1 CWPB=\$2 DBN=64 DWPB=8 WS=4 SPECS='bf16_zc0!=' ./tools/ep_test.sh >> $LOG 2>&1
-  done
-  echo \"END \$(date -u +%H:%M:%S)\" >> $LOG
+echo "== step $STEP: QT=$QT ZC=$ZC $CBN x $CWPB  SPECS='$SPECS' =="
+docker exec "$CTR" bash -lc "
+  cd $SRC
+  echo \"### step $STEP  $(date -u +%FT%TZ)  QT=$QT ZC=$ZC ${CBN}x${CWPB}\" >> $LOG
+  QT=$QT ZC=$ZC CBN=$CBN CWPB=$CWPB DBN=64 DWPB=8 WS=4 SPECS='$SPECS' ./tools/ep_test.sh 2>&1 |
+    tee -a $LOG | grep -E '^  |^## HEAD|^       '
+  echo \"### step $STEP end \$(rocm-smi --showmeminfo vram 2>/dev/null | grep -c 'VRAM Total Used') cards report\" >> $LOG
 "
-echo "LAUNCHED -> $LOG (about 25 min; poll with _q_poll.sh)"
+echo "Q_STEP_${STEP}_DONE"
