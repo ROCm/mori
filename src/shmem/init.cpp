@@ -738,22 +738,27 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
     // QP[i] was created on allRdmaDeviceContexts[qpSlot % numNics].
     // Endpoint layout: [pe0_qp0, pe0_qp1, ..., pe0_qpN, pe1_qp0, ...]
     // For peer pe, QP slot qp: nicIdx = qp % numNics
+    // Build QP handles indexed by epIndex so GPU kernel's qp_idx maps directly.
+    // Non-RDMA slots have null QP — proxy thread skips them.
     const auto& perNicRkeys = states->memoryStates->symmMemMgr->perNicPeerRkeys;
-    std::vector<core::ProxyQpHandle> qps;
+    std::vector<core::ProxyQpHandle> qps(hostEndpoints.size());
+    int qpCount = 0;
     for (size_t i = 0; i < hostEndpoints.size(); i++) {
       if (hostEndpoints[i].ibvHandle.qp != nullptr) {
-        int pe = i / numQpPerPe;
         int qpSlot = i % numQpPerPe;
+        int pe = i / numQpPerPe;
         int nicIdx = (numNics > 1) ? (qpSlot % numNics) : 0;
         uint32_t lkey = (nicIdx < (int)perNicLkeys.size()) ? perNicLkeys[nicIdx] : 0;
         uint32_t rkey = 0;
         if (nicIdx < (int)perNicRkeys.size() && pe < (int)perNicRkeys[nicIdx].size()) {
           rkey = perNicRkeys[nicIdx][pe];
         }
-        qps.push_back({hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq, lkey, rkey});
+        qps[i] = {hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq, lkey, rkey};
+        qpCount++;
       }
     }
-    fprintf(stderr, "[MoRI-PROXY] Found %zu QPs for proxy thread (%d NICs)\n", qps.size(), numNics);
+    fprintf(stderr, "[MoRI-PROXY] Found %d QPs in %zu slots for proxy thread (%d NICs)\n",
+            qpCount, qps.size(), numNics);
     if (!qps.empty()) {
       states->proxyThread = std::make_unique<core::ProxyThread>();
       states->proxyThread->Init(states->gpuStates.proxyRing, std::move(qps));

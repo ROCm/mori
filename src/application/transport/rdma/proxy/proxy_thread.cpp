@@ -73,8 +73,20 @@ void ProxyThread::MainLoop() {
 
       if (cmd->status == PROXY_PENDING) {
         uint32_t qi = cmd->qp_idx;
-        if (qi >= qps_.size()) qi = 0;
+        if (qi >= qps_.size()) {
+          fprintf(stderr, "proxy: qp_idx=%u out of range (%zu)\n", qi, qps_.size());
+          cmd->status = PROXY_ERROR;
+          next_slot_++;
+          continue;
+        }
         ProxyQpHandle& qph = qps_[qi];
+        if (qph.qp == nullptr) {
+          // Non-RDMA peer slot — shouldn't happen in normal flow
+          fprintf(stderr, "proxy: null QP at idx=%u\n", qi);
+          cmd->status = PROXY_ERROR;
+          next_slot_++;
+          continue;
+        }
 
         ibv_sge sge{};
         sge.addr = cmd->src_addr;
