@@ -607,9 +607,11 @@ void GpuStateInit(ShmemStates* states) {
     hipError_t err = hipSuccess;
     if (allocErr == 0 && ringPtr) {
       ring = static_cast<core::ProxyRing*>(ringPtr);
-      // Skip hipHostRegister — it corrupts GPU state in multiprocessing.spawn.
-      // The proxy ring is CPU-only; GPU reads via __hip_atomic_load on
-      // host-mapped pointers which work without explicit registration.
+      hipError_t regErr = hipHostRegister(ring, sizeof(core::ProxyRing),
+                                          hipHostRegisterMapped | hipHostRegisterPortable);
+      if (regErr != hipSuccess) {
+        fprintf(stderr, "[MoRI-PROXY] hipHostRegister failed: %d (non-fatal)\n", (int)regErr);
+      }
     } else {
       err = hipErrorMemoryAllocation;
     }
@@ -793,6 +795,7 @@ static void FinalizeGpuStates(ShmemStates* states) {
   }
   if (states->gpuStates.proxyRing) {
     fprintf(stderr, "[MoRI-PROXY]   Freeing proxyRing %p\n", (void*)states->gpuStates.proxyRing);
+    hipHostUnregister(states->gpuStates.proxyRing);
     free(states->gpuStates.proxyRing);
     states->gpuStates.proxyRing = nullptr;
     fprintf(stderr, "[MoRI-PROXY]   proxyRing freed\n");

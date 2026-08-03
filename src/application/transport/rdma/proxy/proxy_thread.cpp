@@ -40,6 +40,7 @@ void* ProxyThread::ThreadFunc(void* arg) {
 }
 
 void ProxyThread::DrainCq(ProxyQpHandle& qph) {
+  if (!qph.cq) return;
   ibv_wc wc[32];
   int n;
   while ((n = ibv_poll_cq(qph.cq, 32, wc)) > 0) {
@@ -161,9 +162,11 @@ void ProxyThread::MainLoop() {
       }
     }
 
-    // ALWAYS drain CQ — this is critical for freeing SQ slots and completing GPU waits
-    for (auto& qph : qps_) {
-      DrainCq(qph);
+    // Only drain CQ after we've posted at least one command
+    if (ops_posted_ > 0) {
+      for (auto& qph : qps_) {
+        if (qph.qp) DrainCq(qph);
+      }
     }
   }
 }
