@@ -1013,10 +1013,16 @@ class EpDispatchCombineOp:
             total = ((base + 127) & ~127) + tile_bytes
             if total <= _COMB_LDS_BUDGET:
                 base = total
-            elif _comb_env_set("MORI_COMB_TDM") or self.config.use_external_inp_buf:
+            elif _comb_env_set("MORI_COMB_TDM") or (
+                self.config.use_external_inp_buf and not _qpull_bwq and not force_pull
+            ):
                 # PUSH has no fallback in the kernel -- its fold aliases the send tile rather than
                 # allocating one -- so an overflow there is still fatal, as is one the caller asked
-                # for by naming MORI_COMB_TDM.
+                # for by naming MORI_COMB_TDM. The buffer flag alone does not mean PUSH any more:
+                # under _qpull_bwq and force_pull the caller owns the input while the kernel
+                # compiled is _p2p, and _cPullOk there declines the tiles and gathers without them.
+                # Raising on those turned a fallback into a crash, which is how MORI_COMB_PIPE=2 at
+                # 16 warps behaves -- 458 KB of tiles against a 320 KB budget.
                 raise ValueError(
                     f"MORI_COMB_TDM={chunks} needs {total} B of LDS for combine "
                     f"(warp_per_block={warp_per_block}, tiles/warp={tiles_per_warp}, "

@@ -3879,9 +3879,23 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             ((size_t)(hiddenDimSize - (size_t)(_cPipeChunks - 1) * _cPullTileElems) *
                  sizeof(TokT) >=
              128);
-        // _foldChunk below is a second copy of the fold and has no dequantise in it, so blockwise
-        // must not enter the pipeline -- it would sum raw fp8 and drop every scale.
-        if (!_cPullBwq && !_cGatherOk && _cPullSrcMax == _cPipeSrc && _nSrc >= 1 && _cPipeFits &&
+        // _foldChunk below used to be a second copy of the fold with no dequantise in it, which is
+        // why blockwise was refused here: it would have summed raw fp8 and dropped every scale. It
+        // dequantises now, on the same terms as the unpipelined fold below (scale per vector, the
+        // negated entry 0 undone), so the refusal is gone.
+        //
+        // NOT MEASURED. Both gfx1250 nodes stopped answering ssh before this could be run, so the
+        // only claim being made is the code-level one: blockwise was excluded by a property of this
+        // lambda rather than by anything about the transport, and it no longer is. What makes that
+        // worth landing unmeasured is that the fp8 gather is the one place where every read-shape
+        // knob reads null -- chunk 2 628.7us, whole-token 609.2, QUAD depth 4 632.0, 4-byte
+        // descriptors 630.0 -- while the fold it waits on is the expensive one (dequantise, not a
+        // bare add). A warp with nothing in flight for the whole fold is the shape that produces
+        // exactly that null, and overlap is the only structural knob blockwise never had. MEASURE
+        // IT BEFORE BELIEVING IT: MORI_COMB_PIPE=2 against the default at 64x8 and 256x16, check
+        // armed, and note the LDS doubles (_cPullLdsNeed above and _combine_shared_mem() both
+        // already scale by the pipe depth, so an overflow falls back rather than misreading tiles).
+        if (!_cGatherOk && _cPullSrcMax == _cPipeSrc && _nSrc >= 1 && _cPipeFits &&
             (size_t)_cPullTileElems * sizeof(TokT) >= 128) {
           const int _tile = _cPullTileElems;
           const gfx1250_TDM_GROUP1 _pgFull = TdmShapeWide<TokT>(_tile);
@@ -3899,10 +3913,23 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                 TdmIssueLoad<TokT>(_tb + (size_t)_j * _tile, srcPtrs[0] + _o, _pgDummy);
             }
           };
+          // Same convention as the unpipelined fold: the STORE is pinned at 16 B and the element
+          // count follows from T, so the LDS read narrows to whatever TokT needs (bf16 8 elems /
+          // 16 B, the fp8 tile 8 elems / 8 B). Sizing the vector off TokT instead -- what this did
+          // while blockwise could not get here -- asks for a 16-element bf16 store, which has no
+          // vector type, and wrote the accumulator back as TokT.
+          constexpr int _pOutVB = 16;
+          constexpr int _pV = _pOutVB / (int)sizeof(T);
+          constexpr int _pVB = _pV * (int)sizeof(TokT);
+          using _PVecT = typename core::VecTypeSelector<_pVB>::dataType;
+          using _POutVecT = typename core::VecTypeSelector<_pOutVB>::dataType;
+          // blockElems is a multiple of _pV, so one vector never straddles two scale blocks and the
+          // scale is loaded once per source per vector, exactly as at :4063.
+          const int _pBlkElems =
+              _cPullBwq ? (int)((hiddenDim + args.fp8BlockwiseCombineScaleDim - 1) /
+                                args.fp8BlockwiseCombineScaleDim)
+                        : 1;
           auto _foldChunk = [&](size_t _o, int _n, const TokT* _tb) {
-            constexpr int _pVB = 16;
-            constexpr int _pV = _pVB / (int)sizeof(TokT);
-            using _PVecT = typename core::VecTypeSelector<_pVB>::dataType;
             const bool _vecOk = ((hiddenDim % (size_t)_pV) == 0) &&
                                 ((hiddenDimOffset % (size_t)_pV) == 0) && ((_tile % _pV) == 0);
             const int _nv = _vecOk ? (_n / (warpSize * _pV)) * (warpSize * _pV) : 0;
@@ -3910,23 +3937,50 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
               float _a[_pV];
 #pragma unroll
               for (int _k = 0; _k < _pV; ++_k) _a[_k] = 0.0f;
+              const int _pSb =
+                  _cPullBwq ? (int)((hiddenDimOffset + _o + (size_t)_e) / _pBlkElems) : 0;
               for (int _j = 0; _j < _nSrc; ++_j) {
+                float _ps = 1.0f;
+                if constexpr (_cPullBwq) {
+                  // The producer negates entry 0 to mark "this token really was scaled", so entry 0
+                  // has to be undone before it is applied.
+                  const float* _sp = srcScalePtrs[_j];
+                  if (_sp != nullptr) {
+                    _ps = _sp[_pSb];
+                    if (_pSb == 0 && _ps < 0.0f) _ps = -_ps;
+                  }
+                }
                 _PVecT _sv = *reinterpret_cast<const _PVecT*>(_tb + (size_t)_j * _tile + _e);
 #pragma unroll
-                for (int _k = 0; _k < _pV; ++_k)
-                  _a[_k] += (float)(reinterpret_cast<const TokT*>(&_sv)[_k]);
+                for (int _k = 0; _k < _pV; ++_k) {
+                  const float _v = (float)(reinterpret_cast<const TokT*>(&_sv)[_k]);
+                  _a[_k] += _cPullBwq ? (_v * _ps) : _v;
+                }
               }
               union {
-                _PVecT _ov;
-                TokT _oe[_pV];
+                _POutVecT _ov;
+                T _oe[_pV];
               };
 #pragma unroll
               for (int _k = 0; _k < _pV; ++_k) _oe[_k] = T(_a[_k]);
-              core::store<_pVB>(outPtr + _o + _e, _ov);
+              core::store<_pOutVB>(outPtr + _o + _e, _ov);
             }
             for (int _e = _nv + laneId; _e < _n; _e += warpSize) {
               float _acc = 0.0f;
-              for (int _j = 0; _j < _nSrc; ++_j) _acc += (float)(_tb[(size_t)_j * _tile + _e]);
+              const int _pTSb =
+                  _cPullBwq ? (int)((hiddenDimOffset + _o + (size_t)_e) / _pBlkElems) : 0;
+              for (int _j = 0; _j < _nSrc; ++_j) {
+                float _ts = 1.0f;
+                if constexpr (_cPullBwq) {
+                  const float* _sp = srcScalePtrs[_j];
+                  if (_sp != nullptr) {
+                    _ts = _sp[_pTSb];
+                    if (_pTSb == 0 && _ts < 0.0f) _ts = -_ts;
+                  }
+                }
+                const float _v = (float)(_tb[(size_t)_j * _tile + _e]);
+                _acc += _cPullBwq ? (_v * _ts) : _v;
+              }
               outPtr[_o + _e] = T(_acc);
             }
           };

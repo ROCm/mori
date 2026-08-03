@@ -111,10 +111,20 @@ idle() {
   echo "ABORT: $u bytes of VRAM still in use after 120s"; exit 1
 }
 
+# A breadcrumb that survives the node, written before each spec and closed out after it. Two
+# gfx1250 boxes have now stopped answering ssh in the middle of a sweep, and in both cases the only
+# record of which spec was running lived in /tmp on the machine that was gone -- so "what kills the
+# node" is still unknown after paying for it twice. This file is inside the container's own
+# filesystem, which survives a host reboot, and a line without a matching "done" names the suspect.
+CRUMB="$SRC/.ep_test_last"
+crumb() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$CRUMB" 2>/dev/null; sync 2>/dev/null; }
+crumb "sweep start geometry=${CBNS:-$CBN}x$CWPB WS=$WS ZC=$ZC QT=$QT"
+
 P=$(( 37000 + RANDOM % 900 ))
 run() { # $1=tag  $2=gates  $3=1 means run WITH the correctness check
   pkill -9 -f bench_dispatch_combine 2>/dev/null; pkill -9 -f spawn_main 2>/dev/null
   sleep 4; idle
+  crumb "run  $1  gates='$2'"
   P=$((P+1))
   local sk=MORI_BENCH_SKIPCHECK=1; [ "${3:-0}" = 1 ] && sk=MORI_BENCH_SKIPCHECK=0
   local db=$DBN; [ "$db" = SAME ] && db=$CB
@@ -139,6 +149,7 @@ run() { # $1=tag  $2=gates  $3=1 means run WITH the correctness check
        /^Round [0-9]+ duration/&&c{n++;for(i=1;i<=NF;i++)if($i==fld)s+=$(i+1)}
        END{if(n)printf "%.1f",s/n; else print "NA"}' "$log"
   }
+  crumb "done $1  rc=$rc"
   printf "  %-18s rc=%-3s combine=%8s us (%7s GB/s)  disp=%7s us (%7s GB/s)\n" \
     "$1" "$rc" "$(avg Combine lat)" "$(avg Combine bw)" "$(avg Dispatch lat)" "$(avg Dispatch bw)"
   grep -oE "AssertionError|Memory access fault.*|HSA_STATUS[A-Z_]*|LDS.*exceed.*|out of memory|invalid configuration" "$log" | head -2 | sed 's/^/       /'
@@ -163,4 +174,5 @@ for CB in ${CBNS:-$CBN}; do
   done
   IFS=$OLDIFS
 done
+crumb "sweep end"
 echo EP_TEST_DONE
