@@ -186,6 +186,10 @@ struct PoolClientConfig {
   int ssd_write_staging_slots = 0;
   size_t ssd_write_staging_size = 268435456;  // 256 MiB, used only when slots > 0
 
+  // See UMBPDistributedConfig::ssd_staging_use_hugepages.
+  bool ssd_staging_use_hugepages = false;
+  size_t ssd_staging_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+
   std::vector<ExportableDram> dram_buffers;
   PeerSsdConfig ssd;
 
@@ -236,6 +240,8 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
   pc.ssd_write_staging_slots = dc.ssd_write_staging_slots;
   pc.ssd_write_staging_size = dc.ssd_write_staging_size;
+  pc.ssd_staging_use_hugepages = dc.ssd_staging_use_hugepages;
+  pc.ssd_staging_hugepage_size = dc.ssd_staging_hugepage_size;
   pc.peer_service_port = dc.peer_service_port;
   pc.cache_remote_fetches = dc.cache_remote_fetches;
   pc.cache_remote_admission = dc.cache_remote_admission;

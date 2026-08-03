@@ -273,6 +273,16 @@ struct UMBPDistributedConfig {
   int ssd_write_staging_slots = -1;
   size_t ssd_write_staging_size = 268435456;  // 256 MiB, used only when enabled
 
+  // Back the SSD staging buffer (read region + write-staging region, if any)
+  // with hugetlbfs pages instead of regular 4 KiB anonymous memory. The
+  // buffer takes sustained RDMA + NVMe DMA traffic at multi-GB/s, so TLB
+  // pressure on a plain 4 KiB mapping is non-trivial at typical (256 MiB+)
+  // sizes. Mirrors dram.use_hugepages / dram.hugepage_size; falls back to a
+  // regular mapping automatically if the node has no free hugepages (see
+  // HostMemAllocator::Alloc).
+  bool ssd_staging_use_hugepages = false;
+  size_t ssd_staging_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+
   uint16_t peer_service_port = 0;  // gRPC peer service port
 
   bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally

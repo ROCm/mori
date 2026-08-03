@@ -123,7 +123,7 @@ class PoolClient {
   bool Exists(const std::string& key);
   std::vector<bool> BatchExists(const std::vector<std::string>& keys);
 
-  void* SsdStagingPtr() const { return ssd_staging_buffer_.get(); }
+  void* SsdStagingPtr() const { return ssd_staging_buffer_.ptr; }
   size_t SsdStagingSize() const { return config_.ssd_staging_buffer_size; }
   const std::vector<uint8_t>& SsdStagingMemDescBytes() const { return ssd_staging_mem_desc_bytes_; }
 
@@ -188,7 +188,10 @@ class PoolClient {
   char* staging_buffer_ = nullptr;
   std::mutex staging_mutex_;
 
-  std::unique_ptr<char[]> ssd_staging_buffer_;
+  // Backed by hugetlbfs pages when config_.ssd_staging_use_hugepages is set
+  // (falls back to a regular anonymous mapping if the node has no free
+  // hugepages); freed via HostMemAllocator::Free, not delete[].
+  HostBufferHandle ssd_staging_buffer_;
   mori::io::MemoryDesc ssd_staging_mem_{};
   std::vector<uint8_t> ssd_staging_mem_desc_bytes_;
   // Read region is [0, config_.ssd_staging_buffer_size); the direct-SSD put

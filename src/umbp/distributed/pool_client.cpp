@@ -509,12 +509,30 @@ bool PoolClient::Init() {
     ssd_write_staging_bytes_ =
         config_.ssd_write_staging_slots > 0 ? config_.ssd_write_staging_size : 0;
     ssd_staging_total_bytes_ = config_.ssd_staging_buffer_size + ssd_write_staging_bytes_;
-    ssd_staging_buffer_ = std::make_unique<char[]>(ssd_staging_total_bytes_);
-    std::memset(ssd_staging_buffer_.get(), 0, ssd_staging_total_bytes_);
+
+    HostMemAllocator ssd_staging_allocator;
+    HostBufferOptions ssd_staging_opts;
+    ssd_staging_opts.backing = config_.ssd_staging_use_hugepages
+                                   ? HostBufferBacking::kAnonymousHugetlb
+                                   : HostBufferBacking::kAnonymous;
+    ssd_staging_opts.hugepage_size = config_.ssd_staging_hugepage_size;
+    ssd_staging_buffer_ = ssd_staging_allocator.Alloc(ssd_staging_total_bytes_, ssd_staging_opts);
+    if (!ssd_staging_buffer_.valid()) {
+      MORI_UMBP_ERROR("[PoolClient] SSD staging buffer allocation failed ({} bytes)",
+                      ssd_staging_total_bytes_);
+      initialized_ = false;
+      return false;
+    }
+    if (config_.ssd_staging_use_hugepages &&
+        ssd_staging_buffer_.actual_backing != HostBufferBacking::kAnonymousHugetlb) {
+      MORI_UMBP_WARN(
+          "[PoolClient] SSD staging buffer fell back to a regular (non-hugepage) mapping — "
+          "node likely has no free hugetlb pages");
+    }
+    std::memset(ssd_staging_buffer_.ptr, 0, ssd_staging_total_bytes_);
     if (io_engine_) {
-      ssd_staging_mem_ =
-          io_engine_->RegisterMemory(ssd_staging_buffer_.get(), ssd_staging_total_bytes_, -1,
-                                     mori::io::MemoryLocationType::CPU);
+      ssd_staging_mem_ = io_engine_->RegisterMemory(
+          ssd_staging_buffer_.ptr, ssd_staging_total_bytes_, -1, mori::io::MemoryLocationType::CPU);
       msgpack::sbuffer sbuf;
       msgpack::pack(sbuf, ssd_staging_mem_);
       ssd_staging_mem_desc_bytes_.assign(sbuf.data(), sbuf.data() + sbuf.size());
@@ -531,8 +549,8 @@ bool PoolClient::Init() {
       write_staging.region_size = ssd_write_staging_bytes_;
     }
     peer_service_ = std::make_unique<PeerServiceServer>(
-        peer_alloc_.get(), peer_ssd_.get(), ssd_staging_buffer_.get(),
-        ssd_staging_buffer_ ? ssd_staging_total_bytes_ : 0, ssd_staging_mem_desc_bytes_,
+        peer_alloc_.get(), peer_ssd_.get(), ssd_staging_buffer_.ptr,
+        ssd_staging_buffer_.valid() ? ssd_staging_total_bytes_ : 0, ssd_staging_mem_desc_bytes_,
         config_.ssd_staging_buffer_slots, SsdReadLeaseTtl(), engine_desc_bytes,
         master_client_.get(), ssd_copy_pipeline_.get(), write_staging);
     if (!peer_service_->Start(config_.peer_service_port)) {
@@ -642,9 +660,10 @@ void PoolClient::Shutdown() {
       registered_regions_.clear();
     }
     if (staging_buffer_) io_engine_->DeregisterMemory(staging_mem_);
-    if (ssd_staging_buffer_) {
+    if (ssd_staging_buffer_.valid()) {
       io_engine_->DeregisterMemory(ssd_staging_mem_);
-      ssd_staging_buffer_.reset();
+      HostMemAllocator ssd_staging_allocator;
+      ssd_staging_allocator.Free(ssd_staging_buffer_);
     }
     for (auto& mem : export_dram_mems_) io_engine_->DeregisterMemory(mem);
     export_dram_mems_.clear();

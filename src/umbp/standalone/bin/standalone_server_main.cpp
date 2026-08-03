@@ -169,6 +169,14 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
     *error = "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS must be > 0";
     return false;
   }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES", &dist.ssd_staging_use_hugepages,
+                    error)) {
+    return false;
+  }
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_SSD_STAGING_HUGEPAGE_SIZE", &dist.ssd_staging_hugepage_size,
+                    error)) {
+    return false;
+  }
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_CACHE_REMOTE_FETCHES", &dist.cache_remote_fetches, error))
     return false;
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);

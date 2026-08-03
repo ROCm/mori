@@ -242,6 +242,8 @@ void RegisterMoriUmbp(py::module_& m) {
       // Direct-SSD put staging: -1 = auto (on in pure-SSD mode), 0 = off, >0 = slots.
       .def_readwrite("ssd_write_staging_slots", &UMBPDistributedConfig::ssd_write_staging_slots)
       .def_readwrite("ssd_write_staging_size", &UMBPDistributedConfig::ssd_write_staging_size)
+      .def_readwrite("ssd_staging_use_hugepages", &UMBPDistributedConfig::ssd_staging_use_hugepages)
+      .def_readwrite("ssd_staging_hugepage_size", &UMBPDistributedConfig::ssd_staging_hugepage_size)
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
       .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)
       .def_readwrite("cache_remote_admission", &UMBPDistributedConfig::cache_remote_admission)
