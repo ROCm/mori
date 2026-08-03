@@ -329,16 +329,19 @@ def make_dispatch(
                 P.fence_system_release()
 
             # ── Phase 2: grid barrier + per-peer count signal ──
+            # s_barrier only syncs wavefronts; drain memory counters first so the
+            # token/count stores above are complete before the grid barrier makes
+            # them visible to peers (unlike HIP __syncthreads, gpu.barrier has no
+            # implicit s_waitcnt).
+            P.waitcnt_all()
             fx.barrier()
             if tid == 0:
-                P.fence_system_release()
                 P.atomic_add_global(fx.Int64(addr_disp_bar), arith.constant(1))
 
             local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
             for dest_pe in range(lane, npes, WAVE):
                 if global_warp_id == 0:
                     P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
-                    P.fence_system_acquire()
                     buffer_store(arith.constant(0), rsrc_disp_bar, 0)
                     signal_value = (
                         buffer_load(rsrc_dest_ctr, dest_pe, vec_width=1, dtype=T.i32())
