@@ -159,6 +159,7 @@ class IonicDeviceContext : public RdmaDeviceContext {
 
   std::unordered_map<uint32_t, IonicCqContainer*> cqPool;
   std::unordered_map<uint32_t, IonicQpContainer*> qpPool;
+  std::unordered_map<uint32_t, ibv_qp*> proxyQpPool;  // plain QPs for proxy mode
 };
 
 class IonicDevice : public RdmaDevice {
