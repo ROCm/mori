@@ -158,6 +158,12 @@ struct RemoteAddrInfo {
 
 #if !defined(__HIPCC__) && !defined(__CUDACC__)
 
+#include <memory>
+
+}  // namespace shmem
+namespace core { class ProxyThread; }
+namespace shmem {
+
 enum ShmemStatesStatus {
   New = 0,
   Initialized = 1,
@@ -183,6 +189,7 @@ struct ShmemStates {
   MemoryStates* memoryStates{nullptr};
   ModuleStates moduleStates;  // JIT module state for this GPU
   GpuStates gpuStates;        // host-side copy of device GpuStates for this GPU
+  std::unique_ptr<core::ProxyThread> proxyThread;  // CPU proxy for IBGDA on ionic
 
   // Asserts that ShmemInit has been called and the slot is currently usable.
   // Used by APIs that touch GPU state (allocation, barrier, module init)

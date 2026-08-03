@@ -2,6 +2,8 @@
 // MIT License
 #pragma once
 
+#if !defined(__HIPCC__) && !defined(__CUDACC__)
+
 #include <infiniband/verbs.h>
 #include <pthread.h>
 
@@ -43,3 +45,5 @@ class ProxyThread {
 
 }  // namespace core
 }  // namespace mori
+
+#endif  // !defined(__HIPCC__) && !defined(__CUDACC__)

@@ -36,6 +36,7 @@
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/utils/cpu_affinity.hpp"
+#include "mori/core/transport/rdma/proxy/proxy_thread.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -592,6 +593,24 @@ void GpuStateInit(ShmemStates* states) {
   states->gpuStates.worldSize = states->bootStates->worldSize;
   states->gpuStates.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
 
+  // Check if IBGDA proxy mode is requested
+  const char* proxyEnv = std::getenv("MORI_USE_IBGDA_PROXY");
+  if (proxyEnv && (std::string(proxyEnv) == "1" || std::string(proxyEnv) == "true")) {
+    MORI_SHMEM_INFO("IBGDA proxy mode enabled (MORI_USE_IBGDA_PROXY=1)");
+    core::ProxyRing* ring = nullptr;
+    hipError_t err = hipHostMalloc(&ring, sizeof(core::ProxyRing),
+                                   hipHostMallocMapped | hipHostMallocCoherent);
+    if (err == hipSuccess && ring) {
+      memset(ring, 0, sizeof(core::ProxyRing));
+      states->gpuStates.useProxy = true;
+      states->gpuStates.proxyRing = ring;
+      MORI_SHMEM_INFO("Proxy ring allocated: {:p} ({} bytes, {} slots)",
+                      (void*)ring, sizeof(core::ProxyRing), core::PROXY_RING_SIZE);
+    } else {
+      MORI_SHMEM_ERROR("Failed to allocate proxy ring: hipHostMalloc returned {}", (int)err);
+    }
+  }
+
   // Copy communication metadata to GPU
   CopyTransportTypesToGpu(states);
   CopyRdmaEndpointsToGpu(states);
@@ -690,6 +709,23 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   MemoryStatesInit(states);
   GpuStateInit(states);
 
+  // Start proxy thread if proxy mode is enabled
+  if (states->gpuStates.useProxy && states->gpuStates.proxyRing) {
+    const auto& hostEndpoints = states->rdmaStates->commContext->GetRdmaEndpoints();
+    std::vector<core::ProxyQpHandle> qps;
+    for (size_t i = 0; i < hostEndpoints.size(); i++) {
+      if (hostEndpoints[i].ibvHandle.qp != nullptr) {
+        qps.push_back({hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq});
+      }
+    }
+    if (!qps.empty()) {
+      states->proxyThread = std::make_unique<core::ProxyThread>();
+      states->proxyThread->Init(states->gpuStates.proxyRing, std::move(qps));
+      states->proxyThread->Start();
+      MORI_SHMEM_INFO("Proxy thread started with {} QPs", qps.size());
+    }
+  }
+
   states->status = ShmemStatesStatus::Initialized;
   MORI_SHMEM_INFO("Shmem initialization completed");
   return 0;
@@ -704,6 +740,16 @@ bool ShmemIsInitialized() {
 /* ---------------------------------------------------------------------------------------------- */
 
 static void FinalizeGpuStates(ShmemStates* states) {
+  // Shutdown proxy thread before freeing GPU states
+  if (states->proxyThread) {
+    states->proxyThread->Shutdown();
+    states->proxyThread.reset();
+  }
+  if (states->gpuStates.proxyRing) {
+    hipHostFree(states->gpuStates.proxyRing);
+    states->gpuStates.proxyRing = nullptr;
+  }
+
   hipDeviceSynchronize();
   (void)hipGetLastError();
   HIP_RUNTIME_CHECK(hipFree(states->gpuStates.transportTypes));

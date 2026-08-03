@@ -62,7 +62,8 @@ list(
   topology/net.cpp
   topology/node.cpp
   topology/pci.cpp
-  topology/system.cpp)
+  topology/system.cpp
+  transport/rdma/proxy/proxy_thread.cpp)
 
 # libibverbs is loaded at runtime via dlopen (see ibv_shim.cpp), not linked. The
 # shim is built as an object library with hidden visibility so every mori shared
