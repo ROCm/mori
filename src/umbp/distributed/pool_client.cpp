@@ -22,6 +22,7 @@
 #include "umbp/distributed/pool_client.h"
 
 #include <grpcpp/grpcpp.h>
+#include <hip/hip_runtime_api.h>
 
 #include <algorithm>
 #include <chrono>
@@ -58,6 +59,78 @@ namespace mori::umbp {
 namespace {
 
 bool IsValidMemoryDesc(const mori::io::MemoryDesc& desc) { return desc.size > 0; }
+
+struct PointerLocation {
+  mori::io::MemoryLocationType location{mori::io::MemoryLocationType::CPU};
+  int device_id{-1};
+
+  bool IsDevice() const { return location == mori::io::MemoryLocationType::GPU; }
+};
+
+// hipPointerGetAttributes reports ordinary malloc/mmap memory as either
+// hipMemoryTypeUnregistered or an invalid-value lookup, depending on the ROCm
+// runtime version. Both mean CPU memory here. Managed memory is intentionally
+// not treated as a stable GPU RDMA region because its backing pages may move.
+PointerLocation DetectPointerLocation(const void* ptr) {
+  if (ptr == nullptr) return {};
+
+  hipPointerAttribute_t attributes{};
+  const hipError_t status = hipPointerGetAttributes(&attributes, ptr);
+  if (status == hipSuccess) {
+    if (attributes.type == hipMemoryTypeDevice && attributes.device >= 0) {
+      return {mori::io::MemoryLocationType::GPU, attributes.device};
+    }
+    return {};
+  }
+
+  // An attribute miss is normal for unregistered host memory. Clear HIP's
+  // thread-local error so it cannot poison a later runtime call.
+  (void)hipGetLastError();
+  return {};
+}
+
+class ScopedHipDevice {
+ public:
+  explicit ScopedHipDevice(int device_id) {
+    if (device_id < 0) return;
+    if (hipGetDevice(&previous_device_) != hipSuccess) {
+      (void)hipGetLastError();
+      return;
+    }
+    if (previous_device_ != device_id) {
+      if (hipSetDevice(device_id) != hipSuccess) {
+        (void)hipGetLastError();
+        return;
+      }
+      changed_ = true;
+    }
+    valid_ = true;
+  }
+
+  ~ScopedHipDevice() {
+    if (changed_) {
+      const hipError_t status = hipSetDevice(previous_device_);
+      if (status != hipSuccess) (void)hipGetLastError();
+    }
+  }
+
+  bool IsValid() const { return valid_; }
+
+ private:
+  int previous_device_{-1};
+  bool changed_{false};
+  bool valid_{false};
+};
+
+bool DeviceCopy(void* dst, const void* src, size_t size, hipMemcpyKind kind, int device_id) {
+  const hipError_t status = hipMemcpy(dst, src, size, kind);
+  if (status != hipSuccess) {
+    MORI_UMBP_ERROR("[PoolClient] hipMemcpy failed on device {}: {}", device_id,
+                    hipGetErrorString(status));
+    return false;
+  }
+  return true;
+}
 
 // Key for grouping page transfers by their (local MR, remote MR) pair.
 struct PairKey {
@@ -667,10 +740,38 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size) {
   }
   std::lock_guard<std::mutex> lock(registered_mem_mutex_);
   for (auto& reg : registered_regions_) {
-    if (reg.base == ptr) return true;
+    if (reg.base == ptr) {
+      if (size <= reg.size) return true;
+      MORI_UMBP_ERROR(
+          "[PoolClient] RegisterMemory: ptr={} already registered with smaller size {} < {}", ptr,
+          reg.size, size);
+      return false;
+    }
   }
-  auto mem_desc = io_engine_->RegisterMemory(ptr, size, -1, mori::io::MemoryLocationType::CPU);
-  registered_regions_.push_back({ptr, size, mem_desc});
+
+  const PointerLocation pointer_location = DetectPointerLocation(ptr);
+  try {
+    auto mem_desc = io_engine_->RegisterMemory(ptr, size, pointer_location.device_id,
+                                               pointer_location.location);
+    if (!IsValidMemoryDesc(mem_desc) || mem_desc.data != reinterpret_cast<uintptr_t>(ptr) ||
+        mem_desc.size < size || mem_desc.loc != pointer_location.location ||
+        (pointer_location.IsDevice() && mem_desc.deviceId != pointer_location.device_id)) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] RegisterMemory: invalid descriptor for ptr={}, size={}, device={}, loc={}",
+          ptr, size, pointer_location.device_id, static_cast<uint32_t>(pointer_location.location));
+      if (IsValidMemoryDesc(mem_desc)) io_engine_->DeregisterMemory(mem_desc);
+      return false;
+    }
+    registered_regions_.push_back({ptr, size, mem_desc});
+  } catch (const std::exception& error) {
+    MORI_UMBP_ERROR("[PoolClient] RegisterMemory failed for ptr={}, size={}: {}", ptr, size,
+                    error.what());
+    return false;
+  } catch (...) {
+    MORI_UMBP_ERROR("[PoolClient] RegisterMemory failed for ptr={}, size={}: unknown error", ptr,
+                    size);
+    return false;
+  }
   return true;
 }
 
@@ -705,6 +806,17 @@ std::optional<std::pair<mori::io::MemoryDesc, size_t>> PoolClient::FindRegistere
 bool PoolClient::LocalPutPages(const std::vector<PageLocation>& pages, uint64_t page_size,
                                const void* src, size_t size) {
   const char* src_bytes = static_cast<const char*>(src);
+  const auto registered_source = FindRegisteredMemory(src, size);
+  const PointerLocation source_location =
+      registered_source.has_value()
+          ? PointerLocation{registered_source->first.loc, registered_source->first.deviceId}
+          : DetectPointerLocation(src);
+  ScopedHipDevice device_guard(source_location.IsDevice() ? source_location.device_id : -1);
+  if (source_location.IsDevice() && !device_guard.IsValid()) {
+    MORI_UMBP_ERROR("[PoolClient] failed to select GPU device {} for local Put",
+                    source_location.device_id);
+    return false;
+  }
   for (size_t i = 0; i < pages.size(); ++i) {
     const auto& p = pages[i];
     if (p.buffer_index >= config_.dram_buffers.size()) {
@@ -718,7 +830,15 @@ bool PoolClient::LocalPutPages(const std::vector<PageLocation>& pages, uint64_t 
       return false;
     }
     const uint64_t bytes = LogicalPageBytes(i, pages.size(), page_size, size);
-    LocalCopyBlock(static_cast<char*>(dram.buffer) + off, src_bytes + i * page_size, bytes);
+    void* dst = static_cast<char*>(dram.buffer) + off;
+    const void* page_src = src_bytes + i * page_size;
+    if (source_location.IsDevice()) {
+      if (!DeviceCopy(dst, page_src, bytes, hipMemcpyDeviceToHost, source_location.device_id)) {
+        return false;
+      }
+    } else {
+      LocalCopyBlock(dst, page_src, bytes);
+    }
   }
   return true;
 }
@@ -726,6 +846,18 @@ bool PoolClient::LocalPutPages(const std::vector<PageLocation>& pages, uint64_t 
 bool PoolClient::LocalGetPages(const std::vector<PageLocation>& pages, uint64_t page_size,
                                void* dst, size_t size) {
   char* dst_bytes = static_cast<char*>(dst);
+  const auto registered_destination = FindRegisteredMemory(dst, size);
+  const PointerLocation destination_location =
+      registered_destination.has_value() ? PointerLocation{registered_destination->first.loc,
+                                                           registered_destination->first.deviceId}
+                                         : DetectPointerLocation(dst);
+  ScopedHipDevice device_guard(destination_location.IsDevice() ? destination_location.device_id
+                                                               : -1);
+  if (destination_location.IsDevice() && !device_guard.IsValid()) {
+    MORI_UMBP_ERROR("[PoolClient] failed to select GPU device {} for local Get",
+                    destination_location.device_id);
+    return false;
+  }
   for (size_t i = 0; i < pages.size(); ++i) {
     const auto& p = pages[i];
     if (p.buffer_index >= config_.dram_buffers.size()) {
@@ -739,7 +871,16 @@ bool PoolClient::LocalGetPages(const std::vector<PageLocation>& pages, uint64_t 
       return false;
     }
     const uint64_t bytes = LogicalPageBytes(i, pages.size(), page_size, size);
-    LocalCopyBlock(dst_bytes + i * page_size, static_cast<const char*>(dram.buffer) + off, bytes);
+    void* page_dst = dst_bytes + i * page_size;
+    const void* src = static_cast<const char*>(dram.buffer) + off;
+    if (destination_location.IsDevice()) {
+      if (!DeviceCopy(page_dst, src, bytes, hipMemcpyHostToDevice,
+                      destination_location.device_id)) {
+        return false;
+      }
+    } else {
+      LocalCopyBlock(page_dst, src, bytes);
+    }
   }
   return true;
 }
@@ -1383,6 +1524,15 @@ bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, P
       entry.zero_copy = zero_copy;
       entry.use_staging = false;
       entry.staging_offset = 0;
+    } else if (DetectPointerLocation(entry.item->src).IsDevice()) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] BuildRemotePutTransfers: GPU source for key='{}' is not registered; "
+          "refusing host staging fallback",
+          (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"});
+      entry.zero_copy.reset();
+      entry.use_staging = false;
+      entry.failed = true;
+      continue;
     } else {
       entry.zero_copy.reset();
       entry.use_staging = true;
@@ -1972,6 +2122,15 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, P
       entry.zero_copy = zero_copy;
       entry.use_staging = false;
       entry.staging_offset = 0;
+    } else if (DetectPointerLocation(entry.item->dst).IsDevice()) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] BuildRemoteGetTransfers: GPU destination for key='{}' is not registered; "
+          "refusing host staging fallback",
+          (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"});
+      entry.zero_copy.reset();
+      entry.use_staging = false;
+      entry.failed = true;
+      continue;
     } else {
       entry.zero_copy.reset();
       entry.use_staging = true;
@@ -2244,6 +2403,10 @@ bool PoolClient::RemoteDramScatterWrite(PeerConnection& peer,
     }
   }
   if (!used_zero_copy) {
+    if (DetectPointerLocation(src).IsDevice()) {
+      MORI_UMBP_ERROR("[PoolClient] RemoteDramScatterWrite: refusing host staging for GPU source");
+      return false;
+    }
     if (size > config_.staging_buffer_size) return false;
     staging_lock.lock();
     std::memcpy(staging_buffer_.get(), src, size);
@@ -2318,6 +2481,11 @@ bool PoolClient::RemoteDramScatterRead(PeerConnection& peer, const std::vector<P
     }
   }
   if (!used_zero_copy) {
+    if (DetectPointerLocation(dst).IsDevice()) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] RemoteDramScatterRead: refusing host staging for GPU destination");
+      return false;
+    }
     if (size > config_.staging_buffer_size) return false;
     staging_lock.lock();
     local_mem = staging_mem_;
@@ -2540,7 +2708,13 @@ PoolClient::SsdGetOutcome PoolClient::RemoteSsdReadOnce(PeerConnection& peer,
     status.Wait();
     rdma_ok = status.Succeeded();
   }
-  if (!rdma_ok && size <= config_.staging_buffer_size) {
+  const bool device_destination = DetectPointerLocation(dst).IsDevice();
+  if (!rdma_ok && device_destination) {
+    MORI_UMBP_ERROR(
+        "[PoolClient] RemoteSsdRead key='{}': GPU destination is not registered or RDMA failed; "
+        "refusing host staging fallback",
+        key);
+  } else if (!rdma_ok && size <= config_.staging_buffer_size) {
     std::lock_guard<std::mutex> lock(staging_mutex_);
     auto uid = io_engine_->AllocateTransferUniqueId();
     mori::io::TransferStatus status;
