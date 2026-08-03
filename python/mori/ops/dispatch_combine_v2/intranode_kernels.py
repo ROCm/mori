@@ -331,6 +331,7 @@ def make_dispatch(
             # ── Phase 2: grid barrier + per-peer count signal ──
             fx.barrier()
             if tid == 0:
+                P.fence_system_release()
                 P.atomic_add_global(fx.Int64(addr_disp_bar), arith.constant(1))
 
             local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
