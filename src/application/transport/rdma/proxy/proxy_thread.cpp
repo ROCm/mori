@@ -81,6 +81,12 @@ void ProxyThread::MainLoop() {
         sge.length = cmd->length;
         sge.lkey = (qph.lkey_override != 0) ? qph.lkey_override : cmd->lkey;
 
+        if (ops_posted_ < 3) {
+          fprintf(stderr, "[MoRI-PROXY] post #%lu: qp_idx=%u op=%u len=%u lkey=%u(cmd=%u,ovr=%u) rkey=%u src=0x%lx dst=0x%lx\n",
+                  ops_posted_, qi, cmd->op, cmd->length, sge.lkey, cmd->lkey, qph.lkey_override,
+                  cmd->rkey, cmd->src_addr, cmd->dst_addr);
+        }
+
         ibv_send_wr wr{};
         wr.wr_id = next_slot_;
         wr.sg_list = &sge;
@@ -91,24 +97,24 @@ void ProxyThread::MainLoop() {
           case PROXY_RDMA_WRITE:
             wr.opcode = IBV_WR_RDMA_WRITE;
             wr.wr.rdma.remote_addr = cmd->dst_addr;
-            wr.wr.rdma.rkey = cmd->rkey;
+            wr.wr.rdma.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
             break;
           case PROXY_RDMA_WRITE_INLINE:
             wr.opcode = IBV_WR_RDMA_WRITE;
             wr.send_flags |= IBV_SEND_INLINE;
             wr.wr.rdma.remote_addr = cmd->dst_addr;
-            wr.wr.rdma.rkey = cmd->rkey;
+            wr.wr.rdma.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
             break;
           case PROXY_ATOMIC_FETCH_ADD:
             wr.opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
             wr.wr.atomic.remote_addr = cmd->dst_addr;
-            wr.wr.atomic.rkey = cmd->rkey;
+            wr.wr.atomic.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
             wr.wr.atomic.compare_add = cmd->atomic_arg;
             break;
           case PROXY_ATOMIC_CMP_SWAP:
             wr.opcode = IBV_WR_ATOMIC_CMP_AND_SWP;
             wr.wr.atomic.remote_addr = cmd->dst_addr;
-            wr.wr.atomic.rkey = cmd->rkey;
+            wr.wr.atomic.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
             wr.wr.atomic.compare_add = cmd->atomic_arg;
             wr.wr.atomic.swap = cmd->atomic_swap;
             break;

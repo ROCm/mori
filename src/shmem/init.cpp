@@ -712,14 +712,48 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
 
   // Start proxy thread if proxy mode is enabled
   if (states->gpuStates.useProxy && states->gpuStates.proxyRing) {
-    const auto& hostEndpoints = states->rdmaStates->commContext->GetRdmaEndpoints();
+    auto* ctx = states->rdmaStates->commContext;
+    const auto& hostEndpoints = ctx->GetRdmaEndpoints();
+    const auto& allCtxs = ctx->GetAllRdmaDeviceContexts();
+    int numNics = static_cast<int>(allCtxs.size());
+    int numQpPerPe = ctx->GetNumQpPerPe();
+
+    // Register symmetric memory on each NIC's PD for send-side routing.
+    // This allows any NIC to DMA this GPU's buffer across XGMI.
+    std::vector<uint32_t> perNicLkeys(numNics, 0);
+    if (states->memoryStates && states->memoryStates->staticHeapBasePtr && numNics > 0) {
+      void* heapPtr = states->memoryStates->staticHeapBasePtr;
+      size_t heapSize = states->memoryStates->staticHeapSize;
+      fprintf(stderr, "[MoRI-PROXY] Registering heap MR on %d NICs (ptr=%p size=%zu)\n",
+              numNics, heapPtr, heapSize);
+      for (int n = 0; n < numNics; n++) {
+        if (!allCtxs[n]) continue;
+        auto mr = allCtxs[n]->RegisterRdmaMemoryRegionAuto(heapPtr, heapSize);
+        perNicLkeys[n] = mr.lkey;
+        fprintf(stderr, "[MoRI-PROXY]   NIC %d: lkey=%u rkey=%u\n", n, mr.lkey, mr.rkey);
+      }
+    }
+
+    // Build QP handles with per-NIC lkey and rkey overrides.
+    // QP[i] was created on allRdmaDeviceContexts[qpSlot % numNics].
+    // Endpoint layout: [pe0_qp0, pe0_qp1, ..., pe0_qpN, pe1_qp0, ...]
+    // For peer pe, QP slot qp: nicIdx = qp % numNics
+    const auto& perNicRkeys = states->memoryStates->symmMemMgr->perNicPeerRkeys;
     std::vector<core::ProxyQpHandle> qps;
     for (size_t i = 0; i < hostEndpoints.size(); i++) {
       if (hostEndpoints[i].ibvHandle.qp != nullptr) {
-        qps.push_back({hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq});
+        int pe = i / numQpPerPe;
+        int qpSlot = i % numQpPerPe;
+        int nicIdx = (numNics > 1) ? (qpSlot % numNics) : 0;
+        uint32_t lkey = (nicIdx < (int)perNicLkeys.size()) ? perNicLkeys[nicIdx] : 0;
+        uint32_t rkey = 0;
+        if (nicIdx < (int)perNicRkeys.size() && pe < (int)perNicRkeys[nicIdx].size()) {
+          rkey = perNicRkeys[nicIdx][pe];
+        }
+        qps.push_back({hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq, lkey, rkey});
       }
     }
-    fprintf(stderr, "[MoRI-PROXY] Found %zu QPs for proxy thread\n", qps.size());
+    fprintf(stderr, "[MoRI-PROXY] Found %zu QPs for proxy thread (%d NICs)\n", qps.size(), numNics);
     if (!qps.empty()) {
       states->proxyThread = std::make_unique<core::ProxyThread>();
       states->proxyThread->Init(states->gpuStates.proxyRing, std::move(qps));

@@ -97,6 +97,9 @@ class Context {
 
   RdmaContext* GetRdmaContext() const { return rdmaContext.get(); }
   RdmaDeviceContext* GetRdmaDeviceContext() const { return rdmaDeviceContext.get(); }
+  const std::vector<std::unique_ptr<RdmaDeviceContext>>& GetAllRdmaDeviceContexts() const {
+    return allRdmaDeviceContexts;
+  }
   bool RdmaTransportEnabled() const { return GetRdmaDeviceContext() != nullptr; }
 
   // Check if P2P connection is possible with a peer (same node)

@@ -208,6 +208,23 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   }
   bootNet.Allgather(&cpuMemObj->peerRkeys[rank], cpuMemObj->peerRkeys, sizeof(uint32_t));
 
+  // Per-NIC MR registration for send-side routing (proxy mode).
+  // Register the buffer on each NIC's PD and exchange rkeys.
+  const auto& allCtxs = context.GetAllRdmaDeviceContexts();
+  int numNics = static_cast<int>(allCtxs.size());
+  if (numNics > 1 && anyRdmaPeer) {
+    perNicPeerRkeys.resize(numNics);
+    for (int n = 0; n < numNics; n++) {
+      perNicPeerRkeys[n].resize(worldSize, 0);
+      if (allCtxs[n]) {
+        auto mr = allCtxs[n]->RegisterRdmaMemoryRegionAuto(localPtr, size);
+        perNicPeerRkeys[n][rank] = mr.rkey;
+      }
+      bootNet.Allgather(&perNicPeerRkeys[n][rank], perNicPeerRkeys[n].data(), sizeof(uint32_t));
+    }
+    fprintf(stderr, "[MoRI-PROXY] Per-NIC rkey exchange done: %d NICs × %d peers\n", numNics, worldSize);
+  }
+
   // Copy memory object to GPU memory, we need to access it from GPU directly
   SymmMemObj* gpuMemObj;
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj, sizeof(SymmMemObj)));

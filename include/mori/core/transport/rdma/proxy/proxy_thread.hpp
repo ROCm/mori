@@ -18,7 +18,8 @@ namespace core {
 struct ProxyQpHandle {
   ibv_qp* qp{nullptr};
   ibv_cq* cq{nullptr};
-  uint32_t lkey_override{0};  // per-NIC lkey for send-side routing (0 = use cmd's lkey)
+  uint32_t lkey_override{0};   // per-NIC lkey for send-side routing (0 = use cmd's lkey)
+  uint32_t rkey_override{0};   // per-NIC rkey for remote buffer on this NIC (0 = use cmd's rkey)
 };
 
 class ProxyThread {
