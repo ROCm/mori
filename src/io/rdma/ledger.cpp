@@ -19,16 +19,50 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <algorithm>
+
+#include "mori/io/logging.hpp"
 #include "src/io/rdma/common.hpp"
 
 namespace mori {
 namespace io {
 
+namespace {
+// Smallest power of two >= v, with a floor so tiny SQ depths still get a
+// reasonable ring. Capacity must be strictly greater than the max number of
+// live records (bounded by maxSqDepth) so recordId & (cap-1) never aliases a
+// still-live slot.
+uint64_t RingCapacityFor(int maxSqDepth) {
+  constexpr uint64_t kSlack = 64;   // headroom above maxSqDepth
+  constexpr uint64_t kFloor = 256;  // minimum ring size
+  uint64_t need = static_cast<uint64_t>(std::max(0, maxSqDepth)) + kSlack;
+  uint64_t cap = kFloor;
+  while (cap < need) cap <<= 1;
+  return cap;
+}
+}  // namespace
+
+SubmissionLedger::SubmissionLedger(uint32_t notifPerQp, int maxSqDepth)
+    : nextId_{notifPerQp == 0 ? 1u : notifPerQp} {
+  const uint64_t cap = RingCapacityFor(maxSqDepth);
+  capMask_ = cap - 1;
+  ring_.resize(cap);  // default-constructed records have recordId == 0 (empty)
+}
+
 uint64_t SubmissionLedger::Insert(int postedWr, bool hasSignaledTail,
                                   std::shared_ptr<CqCallbackMeta> meta, int batchSize) {
   std::lock_guard<std::mutex> lock(mu_);
   uint64_t id = nextId_++;
-  records_[id] = SubmissionRecord{
+  SubmissionRecord& slot = ring_[id & capMask_];
+  if (MORI_UNLIKELY(slot.recordId != 0)) {
+    // Should be unreachable: admission control caps live records at maxSqDepth < capacity.
+    MORI_IO_CRITICAL(
+        "SubmissionLedger::Insert ring overflow: slot for recordId {} still holds live recordId "
+        "{} (capacity {}); increase ring capacity",
+        id, slot.recordId, capMask_ + 1);
+    std::abort();
+  }
+  slot = SubmissionRecord{
       id, postedWr, hasSignaledTail, SubmissionState::Posted, std::move(meta), batchSize};
   return id;
 }
@@ -37,37 +71,49 @@ void SubmissionLedger::InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMe
                                       int batchSize) {
   std::lock_guard<std::mutex> lock(mu_);
   uint64_t id = nextId_++;
-  records_[id] =
+  SubmissionRecord& slot = ring_[id & capMask_];
+  if (MORI_UNLIKELY(slot.recordId != 0)) {
+    MORI_IO_CRITICAL(
+        "SubmissionLedger::InsertOrphaned ring overflow: slot for recordId {} still holds live "
+        "recordId {} (capacity {}); increase ring capacity",
+        id, slot.recordId, capMask_ + 1);
+    std::abort();
+  }
+  slot =
       SubmissionRecord{id, postedWr, false, SubmissionState::Orphaned, std::move(meta), batchSize};
 }
 
 std::shared_ptr<CqCallbackMeta> SubmissionLedger::ReleaseByCqe(uint64_t recordId,
                                                                std::atomic<int>* sqDepth,
                                                                int* outBatchSize) {
-  std::lock_guard<std::mutex> lock(mu_);
-  auto it = records_.find(recordId);
-  if (it == records_.end()) return nullptr;
-  SubmissionRecord& rec = it->second;
-  if (sqDepth && rec.postedWr > 0) sqDepth->fetch_sub(rec.postedWr, kSqAdmissionOrder);
-  if (outBatchSize) *outBatchSize = rec.batchSize;
-  auto meta = std::move(rec.meta);
-  records_.erase(it);
+  int postedWr = 0;
+  std::shared_ptr<CqCallbackMeta> meta;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    SubmissionRecord& slot = ring_[recordId & capMask_];
+    if (slot.recordId != recordId) return nullptr;  // stale / already released
+    postedWr = slot.postedWr;
+    if (outBatchSize) *outBatchSize = slot.batchSize;
+    meta = std::move(slot.meta);
+    slot.recordId = 0;  // mark empty
+  }
+  if (sqDepth && postedWr > 0) sqDepth->fetch_sub(postedWr, kSqAdmissionOrder);
   return meta;
 }
 
 int SubmissionLedger::ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth) {
-  std::lock_guard<std::mutex> lock(mu_);
   int total = 0;
-  // Only erase Orphaned records.  Posted records still have signaled WRs whose
-  // CQEs may arrive later; they must remain so ReleaseByCqe() can update the
-  // corresponding TransferStatus and release sqDepth normally.
-  auto it = records_.begin();
-  while (it != records_.end()) {
-    if (it->second.state == SubmissionState::Orphaned) {
-      total += it->second.postedWr;
-      it = records_.erase(it);
-    } else {
-      ++it;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    // Only release Orphaned records.  Posted records still have signaled WRs
+    // whose CQEs may arrive later; they must remain so ReleaseByCqe() can update
+    // the corresponding TransferStatus and release sqDepth normally.
+    for (SubmissionRecord& slot : ring_) {
+      if (slot.recordId != 0 && slot.state == SubmissionState::Orphaned) {
+        total += slot.postedWr;
+        slot.meta.reset();
+        slot.recordId = 0;  // mark empty
+      }
     }
   }
   if (sqDepth && total > 0) sqDepth->fetch_sub(total, kSqAdmissionOrder);
@@ -76,8 +122,8 @@ int SubmissionLedger::ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth) {
 
 bool SubmissionLedger::HasOrphaned() const {
   std::lock_guard<std::mutex> lock(mu_);
-  for (const auto& [id, rec] : records_) {
-    if (rec.state == SubmissionState::Orphaned) return true;
+  for (const SubmissionRecord& slot : ring_) {
+    if (slot.recordId != 0 && slot.state == SubmissionState::Orphaned) return true;
   }
   return false;
 }
