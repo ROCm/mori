@@ -6,14 +6,34 @@ import "umbp.proto";
 service UMBPPeer {
   rpc GetPeerInfo(GetPeerInfoRequest) returns (GetPeerInfoResponse);
 
-  // SSD read staging.  The direct-SSD-put RPCs (AllocateWriteSlot /
-  // CommitSsdWrite) were removed in the SSD-tier redesign: SSD is now an
-  // async copy-on-commit cold tier, not a writer-driven put target.
-  // PrepareSsdRead is key-based (the peer looks up the SSD location by key via
-  // PeerSsdManager) and returns a typed status + the actual size; ReleaseSsdLease
-  // is a best-effort fast release (slots are also reclaimed by lease TTL).
+  // SSD read staging.  PrepareSsdRead is key-based (the peer looks up the SSD
+  // location by key via PeerSsdManager) and returns a typed status + the actual
+  // size; ReleaseSsdLease is a best-effort fast release (slots are also
+  // reclaimed by lease TTL).
   rpc PrepareSsdRead   (PrepareSsdReadRequest)   returns (PrepareSsdReadResponse);
   rpc ReleaseSsdLease  (ReleaseSsdLeaseRequest)  returns (ReleaseSsdLeaseResponse);
+
+  // Batched SSD read: claim up to N slots, serve them with ONE PeerSsdManager
+  // batch read (which fans across every drive of a multi-drive tier), and hand
+  // the reader all offsets at once so it can issue a single batched RDMA.  The
+  // per-key path above costs one RPC + one device read + one RDMA per key and
+  // leaves every drive but one idle; this is the throughput path.
+  rpc BatchPrepareSsdRead  (BatchPrepareSsdReadRequest)  returns (BatchPrepareSsdReadResponse);
+  rpc BatchReleaseSsdLeases(BatchReleaseSsdLeasesRequest) returns (BatchReleaseSsdLeasesResponse);
+
+  // Direct-SSD put.  Re-introduced (an earlier redesign had removed
+  // AllocateWriteSlot / CommitSsdWrite) because SSD is a routable put target
+  // again: a pure-SSD node has no DRAM tier to land bytes in, so a writer must
+  // be able to push straight to a peer's SSD.  Flow mirrors the DRAM put:
+  //   BatchAllocateSsdWriteSlots -> writer RDMA-writes into the returned
+  //   staging offsets -> BatchCommitSsdWrites (one PeerSsdManager::WriteBatch)
+  //   or BatchAbortSsdWriteSlots on failure.
+  rpc BatchAllocateSsdWriteSlots(BatchAllocateSsdWriteSlotsRequest)
+      returns (BatchAllocateSsdWriteSlotsResponse);
+  rpc BatchCommitSsdWrites      (BatchCommitSsdWritesRequest)
+      returns (BatchCommitSsdWritesResponse);
+  rpc BatchAbortSsdWriteSlots   (BatchAbortSsdWriteSlotsRequest)
+      returns (BatchAbortSsdWriteSlotsResponse);
 
   // DRAM/HBM allocator + key map (new — peer is now the canonical owner).
   rpc AllocateSlot(AllocateSlotRequest) returns (AllocateSlotResponse);
@@ -37,7 +57,14 @@ message GetPeerInfoResponse {
   bytes  engine_desc           = 1;
   // SSD capacity is reported via heartbeat tier_capacities, not here.
   bytes  ssd_staging_mem_desc  = 6;  // packed MemoryDesc for dedicated SSD staging buffer
-  uint64 ssd_staging_size      = 7;  // total staging buffer size
+  uint64 ssd_staging_size      = 7;  // total staging buffer size (read + write regions)
+
+  // Direct-SSD put capability.  Zero slots means the peer does not accept
+  // direct SSD writes (no write staging carved), and a writer routed to its SSD
+  // tier must fail the key rather than guess.  The write region lives ABOVE the
+  // read region inside the same registered buffer, so no second MemoryDesc.
+  uint64 ssd_write_staging_slots     = 10;
+  uint64 ssd_write_staging_slot_size = 11;  // max single-key direct SSD put
 
   // DRAM/HBM buffer descriptors — peer-owned in the new design, exposed
   // here so writers can hydrate first-contact peers without going through
@@ -82,6 +109,79 @@ message ReleaseSsdLeaseRequest {
 }
 message ReleaseSsdLeaseResponse {
   bool success = 1;
+}
+
+// Batched SSD read.  The peer claims a slot per key (as many as are free — a
+// short response is normal, the reader loops for the rest), issues ONE batch
+// read across the tier's drives, and returns per-key status/offset/lease.
+message BatchPrepareSsdReadRequest {
+  repeated string keys      = 1;
+  repeated uint64 max_sizes = 2;  // parallel to keys
+}
+// Per-key entry, parallel to request.keys.  A key the peer could not claim a
+// slot for reports SSD_READ_NO_SLOT (transient, retryable — never a miss).
+message BatchPrepareSsdReadResponse {
+  repeated SsdReadStatus status         = 1;
+  repeated uint64        staging_offset = 2;
+  repeated uint64        size           = 3;
+  repeated uint64        lease_id       = 4;
+  uint64                 lease_ttl_ms   = 5;  // batch-invariant
+}
+
+message BatchReleaseSsdLeasesRequest {
+  repeated uint64 lease_ids = 1;
+}
+message BatchReleaseSsdLeasesResponse {
+  repeated bool success = 1;
+}
+
+// ============================================================
+//  Direct-SSD put (write staging)
+// ============================================================
+
+// Per-key outcome of a write-slot claim.  NO_SLOT is transient (staging
+// exhausted — the writer retries the remainder in the next round); NO_SPACE
+// means the SSD tier itself cannot fit the key, so the writer should retry
+// RoutePut with this node excluded, exactly like the DRAM allocator's ENOSPC.
+enum SsdWriteStatus {
+  SSD_WRITE_OK              = 0;
+  SSD_WRITE_NO_SLOT         = 1;  // staging slots exhausted → transient/retryable
+  SSD_WRITE_SIZE_TOO_LARGE  = 2;  // key larger than one staging slot
+  SSD_WRITE_NO_SPACE        = 3;  // SSD tier full → retry RoutePut with exclude_nodes
+  SSD_WRITE_ALREADY_EXISTS  = 4;  // peer-side dedup hit; no transfer needed
+  SSD_WRITE_ERROR           = 5;
+}
+
+message BatchAllocateSsdWriteSlotsRequest {
+  repeated string keys  = 1;
+  repeated uint64 sizes = 2;  // parallel to keys
+}
+message BatchAllocateSsdWriteSlotsResponse {
+  repeated SsdWriteStatus status         = 1;
+  repeated uint64         staging_offset = 2;  // offset into ssd_staging_mem_desc
+  repeated uint64         lease_id       = 3;
+  uint64                  lease_ttl_ms   = 4;  // batch-invariant
+}
+
+// Commit: the writer's RDMA into the staging slots has completed, so the peer
+// copies staging -> SSD with ONE PeerSsdManager::WriteBatch (parallel across
+// drives) and emits ADD SSD for every key that landed.
+message BatchCommitSsdWritesRequest {
+  repeated uint64 lease_ids = 1;
+  repeated string keys      = 2;  // parallel to lease_ids
+  repeated uint64 sizes     = 3;  // parallel to lease_ids
+}
+message BatchCommitSsdWritesResponse {
+  repeated bool success = 1;
+}
+
+// Abort: release claimed slots without writing (the writer's RDMA failed).
+// Idempotent; slots are also reclaimed by lease TTL.
+message BatchAbortSsdWriteSlotsRequest {
+  repeated uint64 lease_ids = 1;
+}
+message BatchAbortSsdWriteSlotsResponse {
+  repeated bool success = 1;
 }
 
 // ============================================================

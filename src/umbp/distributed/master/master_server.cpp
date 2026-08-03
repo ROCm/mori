@@ -174,6 +174,8 @@ MasterServerConfig MasterServerConfig::FromEnvironment() {
       GetEnvEnum("UMBP_ROUTE_PUT_SELECT_ALGO", "most_available", {"most_available", "random"});
   cfg.route_put_affinity =
       GetEnvEnum("UMBP_ROUTE_PUT_NODE_AFFINITY", "none", {"none", "same", "local"});
+  cfg.route_put_ssd_mode =
+      GetEnvEnum("UMBP_ROUTE_PUT_SSD_MODE", "auto", {"auto", "always", "never"});
 
   using Algo = ConfigurableRoutePutStrategy::SelectAlgo;
   using Affinity = ConfigurableRoutePutStrategy::NodeAffinity;
@@ -184,7 +186,13 @@ MasterServerConfig MasterServerConfig::FromEnvironment() {
   } else if (cfg.route_put_affinity == "local") {
     affinity = Affinity::kLocal;
   }
-  cfg.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(algo, affinity);
+  SsdPutMode ssd_mode = SsdPutMode::kAuto;
+  if (cfg.route_put_ssd_mode == "always") {
+    ssd_mode = SsdPutMode::kAlways;
+  } else if (cfg.route_put_ssd_mode == "never") {
+    ssd_mode = SsdPutMode::kNever;
+  }
+  cfg.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(algo, affinity, ssd_mode);
   return cfg;
 }
 

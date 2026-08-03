@@ -186,6 +186,11 @@ class PoolClient {
   std::unique_ptr<char[]> ssd_staging_buffer_;
   mori::io::MemoryDesc ssd_staging_mem_{};
   std::vector<uint8_t> ssd_staging_mem_desc_bytes_;
+  // Read region is [0, config_.ssd_staging_buffer_size); the direct-SSD put
+  // write region is the ssd_write_staging_bytes_ that follow it (0 when the
+  // path is disabled).  Total = both, and is what gets RDMA-registered.
+  size_t ssd_write_staging_bytes_ = 0;
+  size_t ssd_staging_total_bytes_ = 0;
 
   // Lazy peer connections (one per remote node).  Engine descs cached
   // here; DRAM memory descs hydrated on first AllocateSlot/ResolveKey
@@ -199,6 +204,11 @@ class PoolClient {
     std::mutex ssd_op_mutex;
     mori::io::MemoryDesc ssd_staging_mem{};
     size_t ssd_staging_size = 0;
+    // Direct-SSD put capability, learned from GetPeerInfo.  Zero slots means
+    // this peer does not accept direct SSD writes, so a key routed to its SSD
+    // tier must fail rather than RDMA into a region that does not exist.
+    size_t ssd_write_staging_slots = 0;
+    size_t ssd_write_staging_slot_size = 0;
   };
   std::mutex peers_mutex_;
   std::unordered_map<std::string, std::unique_ptr<PeerConnection>> peers_;
@@ -244,6 +254,8 @@ class PoolClient {
   SsdGetOutcome RemoteSsdReadOnce(PeerConnection& peer, const std::string& key, void* dst,
                                   size_t size);
   void ReleaseSsdLeaseBestEffort(::umbp::UMBPPeer::Stub* stub, uint64_t lease_id);
+  void BatchReleaseSsdLeasesBestEffort(::umbp::UMBPPeer::Stub* stub,
+                                       const std::vector<uint64_t>& lease_ids);
 
   // Zero-copy registered memory regions.
   struct RegisteredRegion {
@@ -323,12 +335,48 @@ class PoolClient {
   };
 
   // Pure grouping for one BatchPut (no IO, no local put executed; mirrors
-  // BatchGetPlan).  Put has no remote-SSD target.  local_items hold full items
-  // (not bare indices) so the deferred local memcpy keeps its route tier.
+  // BatchGetPlan).  local_items hold full items (not bare indices) so the
+  // deferred local memcpy keeps its route tier.  SSD-routed keys are split out
+  // because they take a different landing path entirely: a batched
+  // PeerSsdManager write locally, or allocate/RDMA/commit against the peer's
+  // write staging remotely.
   struct BatchPutPlan {
     std::unordered_map<std::string, std::vector<BatchPutItem>> remote_groups;
     std::vector<BatchPutItem> local_items;
+    std::unordered_map<std::string, std::vector<BatchPutItem>> remote_ssd_groups;
+    std::vector<BatchPutItem> local_ssd_items;
   };
+
+  // Pure-SSD node: no DRAM/HBM pool was exported, so the SSD tier is the only
+  // place a put (or a re-cache of a remote fetch) can land here.  Matches the
+  // "no DRAM/HBM total bytes" signal RoutePut's SsdPutMode::kAuto keys off.
+  bool IsPureSsdNode() const { return config_.dram_buffers.empty() && peer_ssd_ != nullptr; }
+
+  // Self-target SSD put: one PeerSsdManager::WriteBatch for the whole group, so
+  // a multi-drive tier writes every drive at once.
+  void ExecuteLocalSsdBatchPut(const std::vector<BatchPutItem>& items,
+                               std::vector<PutEntryOutcome>* results);
+
+  // Remote SSD put for one peer: BatchAllocateSsdWriteSlots -> one batched RDMA
+  // write into the returned staging offsets -> BatchCommitSsdWrites.  Loops in
+  // rounds while the peer's write slots are exhausted (NO_SLOT), which is a
+  // transient condition, never a failure.
+  void ProcessRemoteSsdBatchPut(const std::vector<BatchPutItem>& items,
+                                std::vector<PutEntryOutcome>* results);
+
+  // RDMA every item's bytes into the peer's write-staging slots at
+  // @p remote_offsets (parallel to @p items).  Zero-copy when every source is
+  // registered; otherwise packs through this client's own staging buffer in as
+  // few batched transfers as it holds.  All-or-nothing: false means the caller
+  // must abort the leases rather than commit.
+  bool RemoteSsdStagedWrite(PeerConnection& peer, const std::vector<const BatchPutItem*>& items,
+                            const std::vector<uint64_t>& remote_offsets);
+
+  // Best-effort release of claimed write slots after a failed transfer/commit.
+  // Correctness does not depend on it (lease TTL reclaims), but it stops the
+  // next writer from queueing behind a dead lease.
+  void AbortRemoteSsdWriteSlots(::umbp::UMBPPeer::Stub* stub,
+                                const std::vector<uint64_t>& lease_ids);
 
   // Group a BatchPut's routes into a BatchPutPlan; master-side dedup and
   // zero-size skips are projected straight into *results.
@@ -412,7 +460,24 @@ class PoolClient {
   // Remote SSD reads (one staging slot + lease per key) with bounded retry
   // (default off) on transient NO_SLOT / reader-local lease expiry; an rpc
   // failure is hard not-served, and a NOT_FOUND short-circuits as a miss.
-  void ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results);
+  // @p per_item_ok is parallel to @p items (NOT indexed by item.index) and is
+  // a vector<char> rather than vector<bool> precisely so several node workers
+  // can run concurrently: vector<bool> is bit-packed, so two threads writing
+  // different keys could share a word.  The caller merges into results.
+  void ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items,
+                                std::vector<char>* per_item_ok);
+
+  // Batched remote SSD get for one peer: BatchPrepareSsdRead -> ONE batched
+  // RDMA read pulling every staged key home -> BatchReleaseSsdLeases.  Replaces
+  // the per-key PrepareSsdRead/RDMA/Release round trip, which serialized the
+  // owner's drives and its network.  @p slots is parallel to @p items and holds
+  // each item's position in per_item_ok.  Returns the (item, slot) pairs that
+  // came back transient (NO_SLOT / lease expiry) so the caller retries just
+  // those — a transient outcome is never reported as a cache miss.
+  std::vector<size_t> RemoteSsdBatchReadOnce(PeerConnection& peer,
+                                             const std::vector<BatchGetItem>& items,
+                                             const std::vector<size_t>& slots,
+                                             std::vector<char>* per_item_ok);
 
   // Periodic SSD metrics provider (registered in Init() when SSD is enabled, run
   // once per metrics flush tick in the metrics thread).  Reads the cheap atomics

@@ -31,6 +31,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/local/tiers/dram_tier.h"
 #include "umbp/local/tiers/dummy_ssd_tier.h"
+#include "umbp/local/tiers/ssd_backend_factory.h"
 #include "umbp/local/tiers/ssd_tier.h"
 #ifdef USE_SPDK
 #include "umbp/local/tiers/spdk_ssd_tier.h"
@@ -519,8 +520,8 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
       if (role_ == UMBPRole::SharedSSDFollower) {
         segmented_access_mode = SSDAccessMode::ReadOnlyShared;
       }
-      ssd_backend = std::make_unique<SSDTier>(config_.ssd.storage_dir, config_.ssd.capacity_bytes,
-                                              config_.ssd, segmented_access_mode);
+      // Multi-drive when storage_dir names more than one directory.
+      ssd_backend = MakeFileSsdBackend(config_.ssd, segmented_access_mode);
     }
     tiers_.push_back({StorageTier::LOCAL_SSD, std::move(ssd_backend)});
   }

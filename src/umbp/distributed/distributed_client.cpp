@@ -38,19 +38,32 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
 
   const auto& dc = config.distributed.value();
 
-  HostMemAllocator allocator;
-  HostBufferOptions opts;
-  opts.backing = config.dram.use_hugepages ? HostBufferBacking::kAnonymousHugetlb
-                                           : HostBufferBacking::kAnonymous;
-  opts.hugepage_size = config.dram.hugepage_size;
-  opts.numa_node = config.dram.numa_node;
-  opts.prefault = config.dram.prefault;
+  // Pure-SSD mode: dram.capacity_bytes == 0 with an enabled SSD tier.  No host
+  // DRAM pool is allocated at all, the node advertises no DRAM capacity, and
+  // puts routed here land straight on SSD (RoutePut's SsdPutMode::kAuto keys off
+  // exactly this "no DRAM/HBM total bytes" signal).
+  const bool pure_ssd = config_.IsPureSsdMode();
 
-  dram_pool_handle_ = allocator.Alloc(config.dram.capacity_bytes, opts);
-  if (!dram_pool_handle_.valid()) {
-    throw std::runtime_error("DistributedClient: memory allocation failed for DRAM pool");
+  if (pure_ssd) {
+    MORI_UMBP_INFO(
+        "[DistributedClient] pure-SSD mode: no DRAM pool, SSD tier is the whole cache "
+        "({}MB across {} drive(s))",
+        config_.ssd.capacity_bytes / (1024 * 1024), config_.ssd.StorageDirs().size());
+  } else {
+    HostMemAllocator allocator;
+    HostBufferOptions opts;
+    opts.backing = config.dram.use_hugepages ? HostBufferBacking::kAnonymousHugetlb
+                                             : HostBufferBacking::kAnonymous;
+    opts.hugepage_size = config.dram.hugepage_size;
+    opts.numa_node = config.dram.numa_node;
+    opts.prefault = config.dram.prefault;
+
+    dram_pool_handle_ = allocator.Alloc(config.dram.capacity_bytes, opts);
+    if (!dram_pool_handle_.valid()) {
+      throw std::runtime_error("DistributedClient: memory allocation failed for DRAM pool");
+    }
+    dram_pool_ = dram_pool_handle_.ptr;
   }
-  dram_pool_ = dram_pool_handle_.ptr;
   // Use mapped_size (>= capacity_bytes, rounded up to page/hugepage boundary)
   // so that RDMA registration, PeerDramAllocator capacity, and master-reported
   // tier_capacities all agree on a single value.  This means the effective
@@ -60,14 +73,20 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // tier_capacities but never allocated by PeerDramAllocator; heartbeat's
   // TierCapacitiesSnapshot() will correct master's view.  Both default to
   // 2 MiB, so this only matters with non-default page size combinations.
-  dram_pool_size_ = dram_pool_handle_.mapped_size;
+  dram_pool_size_ = pure_ssd ? 0 : dram_pool_handle_.mapped_size;
 
   // Lower SSD config to the peer.  When ssd.enabled, the peer builds a
   // PeerSsdManager (SSDTier backend) from the SSD config (UMBPSsdConfig) and
   // reports SSD capacity via TierType::SSD; when disabled, behavior is exactly
   // DRAM-only (no PeerSsdManager, no SSD capacity, no SSD event source).
-  std::map<TierType, TierCapacity> tier_capacities = {
-      {TierType::DRAM, {dram_pool_size_, dram_pool_size_}}};
+  //
+  // In pure-SSD mode the DRAM entry is omitted entirely rather than reported as
+  // zero: RoutePut reads "no DRAM/HBM total bytes" as "pure-SSD node", and an
+  // absent tier and a zero-sized tier must not disagree.
+  std::map<TierType, TierCapacity> tier_capacities;
+  if (!pure_ssd) {
+    tier_capacities[TierType::DRAM] = {dram_pool_size_, dram_pool_size_};
+  }
   PeerSsdConfig ssd_cfg;
   if (config_.ssd.enabled) {
     ssd_cfg.enabled = true;
@@ -75,16 +94,30 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     const uint64_t ssd_cap = config_.ssd.capacity_bytes;
     tier_capacities[TierType::SSD] = {ssd_cap, ssd_cap};
   }
-  auto pc_config = ToPoolClientConfig(dc,
-                                      /*dram_buffers=*/{{dram_pool_, dram_pool_size_}},
-                                      std::move(tier_capacities), std::move(ssd_cfg));
+  std::vector<ExportableDram> dram_buffers;
+  if (!pure_ssd) dram_buffers.push_back({dram_pool_, dram_pool_size_});
+  auto pc_config = ToPoolClientConfig(dc, std::move(dram_buffers), std::move(tier_capacities),
+                                      std::move(ssd_cfg));
   pc_config.copy_pipeline = config_.copy_pipeline;
+
+  // Resolve the direct-SSD put write staging: -1 means "auto", which enables it
+  // exactly in pure-SSD mode — that is where a peer MUST accept a direct SSD
+  // write because it has no DRAM tier for the bytes to land in first.
+  const int requested_write_slots = dc.ssd_write_staging_slots;
+  if (requested_write_slots < 0) {
+    pc_config.ssd_write_staging_slots = pure_ssd ? dc.ssd_staging_buffer_slots : 0;
+  } else {
+    pc_config.ssd_write_staging_slots = requested_write_slots;
+  }
+  pc_config.ssd_write_staging_size = dc.ssd_write_staging_size;
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
   if (!pool_client_->Init()) {
     pool_client_.reset();
-    HostMemAllocator cleanup_allocator;
-    cleanup_allocator.Free(dram_pool_handle_);
+    if (dram_pool_ != nullptr) {  // no pool was allocated in pure-SSD mode
+      HostMemAllocator cleanup_allocator;
+      cleanup_allocator.Free(dram_pool_handle_);
+    }
     dram_pool_ = nullptr;
     dram_pool_size_ = 0;
     throw std::runtime_error("DistributedClient: PoolClient::Init() failed");

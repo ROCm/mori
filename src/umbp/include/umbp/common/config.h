@@ -78,12 +78,42 @@ struct UMBPDurabilityConfig {
 
 struct UMBPSsdConfig {
   bool enabled = true;
+  // One or more storage directories, comma-separated — the same convention as
+  // spdk_nvme_pci_addr.  Naming >1 directory (normally one mount point per
+  // physical drive) fans the tier across them via ShardedSsdTier, so a batch of
+  // keys is written to and read from every drive concurrently and the tier
+  // delivers their aggregate bandwidth.  capacity_bytes is the TOTAL across all
+  // directories and is split evenly among them.
   std::string storage_dir = "/tmp/umbp_ssd";
   size_t capacity_bytes = 32ULL * 1024 * 1024 * 1024;
   UMBPSsdLayoutMode layout_mode = UMBPSsdLayoutMode::SegmentedLog;
   size_t segment_size_bytes = 256ULL * 1024 * 1024;
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
+
+  // Worker threads used by the sharded tier's batch paths.  0 = one per shard,
+  // which is what saturates N drives.  Ignored with a single directory.
+  int shard_io_threads = 0;
+
+  // Split storage_dir on ',' — one entry per drive.  Always returns at least
+  // one element (falls back to the default when the string is empty).
+  std::vector<std::string> StorageDirs() const {
+    std::vector<std::string> dirs;
+    size_t start = 0;
+    while (start <= storage_dir.size()) {
+      size_t comma = storage_dir.find(',', start);
+      if (comma == std::string::npos) comma = storage_dir.size();
+      std::string part = storage_dir.substr(start, comma - start);
+      // Trim surrounding whitespace so "a, b" works as well as "a,b".
+      size_t b = part.find_first_not_of(" \t");
+      size_t e = part.find_last_not_of(" \t");
+      if (b != std::string::npos) dirs.push_back(part.substr(b, e - b + 1));
+      if (comma == storage_dir.size()) break;
+      start = comma + 1;
+    }
+    if (dirs.empty()) dirs.push_back("/tmp/umbp_ssd");
+    return dirs;
+  }
 
   // Local SSD-tier capacity watermarks for the distributed PeerSsdManager's
   // local eviction.  When used/total crosses high_watermark the owner
@@ -223,6 +253,14 @@ struct UMBPDistributedConfig {
   // Remote SSD read staging slots; per-slot = ssd_staging_buffer_size / this.
   int ssd_staging_buffer_slots = 16;
 
+  // Direct-SSD put write staging.  -1 = auto (enabled with `slots` write slots
+  // only in pure-SSD mode, where a peer has no DRAM tier to land a put in);
+  // 0 = force off; > 0 = force on with that many slots.  The region is
+  // allocated in addition to ssd_staging_buffer_size, so turning it on never
+  // shrinks a read slot.
+  int ssd_write_staging_slots = -1;
+  size_t ssd_write_staging_size = 268435456;  // 256 MiB, used only when enabled
+
   uint16_t peer_service_port = 0;  // gRPC peer service port
 
   bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
@@ -296,9 +334,24 @@ struct UMBPConfig {
     return UMBPRole::Standalone;
   }
 
+  // Pure-SSD mode: no host-DRAM tier at all, SSD carries the whole cache.  In
+  // this mode the node reports no DRAM capacity, RoutePut targets SSD directly
+  // (see UMBP_ROUTE_PUT_SSD_MODE), and puts land on SSD instead of going
+  // through a DRAM commit + async copy-on-commit.
+  bool IsPureSsdMode() const {
+    return dram.capacity_bytes == 0 && ssd.enabled && ssd.capacity_bytes > 0;
+  }
+
   bool Validate(std::string* error_message = nullptr) const {
-    if (dram.capacity_bytes == 0) {
-      if (error_message) *error_message = "dram.capacity_bytes must be > 0";
+    // dram.capacity_bytes == 0 is legal only in pure-SSD mode, where the SSD
+    // tier is the entire cache; otherwise a zero DRAM pool leaves no tier that
+    // can accept a put.
+    if (dram.capacity_bytes == 0 && !IsPureSsdMode()) {
+      if (error_message) {
+        *error_message =
+            "dram.capacity_bytes must be > 0 (or enable pure-SSD mode: ssd.enabled with "
+            "ssd.capacity_bytes > 0)";
+      }
       return false;
     }
     if (ssd.enabled) {
@@ -389,8 +442,10 @@ struct UMBPConfig {
 
     cfg.dram.capacity_bytes = getenv_size("UMBP_DRAM_CAPACITY", cfg.dram.capacity_bytes);
     cfg.ssd.enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd.enabled ? 1 : 0) != 0;
+    // Comma-separated for multi-drive, e.g. "/mnt/nvme0,/mnt/nvme1".
     cfg.ssd.storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd.storage_dir);
     cfg.ssd.capacity_bytes = getenv_size("UMBP_SSD_CAPACITY", cfg.ssd.capacity_bytes);
+    cfg.ssd.shard_io_threads = getenv_int("UMBP_SSD_SHARD_IO_THREADS", cfg.ssd.shard_io_threads);
     cfg.eviction.policy = getenv_str("UMBP_EVICTION_POLICY", cfg.eviction.policy);
     cfg.dram.high_watermark = getenv_double("UMBP_DRAM_HIGH_WM", cfg.dram.high_watermark);
     cfg.dram.low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram.low_watermark);

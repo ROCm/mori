@@ -233,5 +233,180 @@ TEST(OwnedLocationSourceAgg, NullSourcesAreSkipped) {
   EXPECT_TRUE(SnapshotAllSourcesForFullSync({nullptr}).empty());
 }
 
+// ---------------------------------------------------------------------------
+//  Batched direct-SSD paths (WriteBatch / PrepareReadBatch)
+// ---------------------------------------------------------------------------
+
+TEST_F(PeerSsdManagerTest, WriteBatchRecordsEveryKeyAndQueuesOneAddEach) {
+  PeerSsdManager mgr(MakeConfig());
+  constexpr int kN = 32;
+  std::vector<std::string> keys;
+  std::vector<std::string> payloads;
+  std::vector<const void*> srcs;
+  std::vector<size_t> sizes;
+  for (int i = 0; i < kN; ++i) {
+    keys.push_back("bk-" + std::to_string(i));
+    payloads.push_back(std::string(4096, static_cast<char>('a' + (i % 26))));
+  }
+  for (int i = 0; i < kN; ++i) {
+    srcs.push_back(payloads[i].data());
+    sizes.push_back(payloads[i].size());
+  }
+
+  auto ok = mgr.WriteBatch(keys, srcs, sizes);
+  ASSERT_EQ(ok.size(), static_cast<size_t>(kN));
+  for (int i = 0; i < kN; ++i) {
+    EXPECT_TRUE(ok[i]) << "key " << i;
+    EXPECT_TRUE(mgr.Exists(keys[i]));
+  }
+
+  auto events = mgr.DrainPendingEvents();
+  EXPECT_EQ(events.size(), static_cast<size_t>(kN));
+  for (const auto& e : events) {
+    EXPECT_EQ(e.kind, KvEvent::Kind::ADD);
+    EXPECT_EQ(e.tier, TierType::SSD);
+    EXPECT_EQ(e.size, 4096u);
+  }
+}
+
+// An already-resident key must succeed with no device write and no second ADD:
+// re-putting a live key is the common case on a warm cache.
+TEST_F(PeerSsdManagerTest, WriteBatchDedupsAlreadyOwnedKeys) {
+  PeerSsdManager mgr(MakeConfig());
+  const std::string value(2048, 'D');
+  ASSERT_TRUE(mgr.Write("dup", OneSegment(value), value.size()));
+  ASSERT_EQ(mgr.DrainPendingEvents().size(), 1u);
+
+  std::vector<std::string> keys = {"dup", "fresh"};
+  const std::string fresh(2048, 'F');
+  std::vector<const void*> srcs = {value.data(), fresh.data()};
+  std::vector<size_t> sizes = {value.size(), fresh.size()};
+
+  auto ok = mgr.WriteBatch(keys, srcs, sizes);
+  EXPECT_TRUE(ok[0]);
+  EXPECT_TRUE(ok[1]);
+
+  auto events = mgr.DrainPendingEvents();
+  ASSERT_EQ(events.size(), 1u);  // only "fresh"
+  EXPECT_EQ(events[0].key, "fresh");
+}
+
+TEST_F(PeerSsdManagerTest, WriteBatchRejectsMismatchedLengths) {
+  PeerSsdManager mgr(MakeConfig());
+  const std::string value(64, 'X');
+  auto ok = mgr.WriteBatch({"a", "b"}, {value.data()}, {value.size()});
+  ASSERT_EQ(ok.size(), 2u);
+  EXPECT_FALSE(ok[0]);
+  EXPECT_FALSE(ok[1]);
+}
+
+TEST_F(PeerSsdManagerTest, PrepareReadBatchServesEveryKey) {
+  PeerSsdManager mgr(MakeConfig());
+  constexpr int kN = 16;
+  constexpr size_t kSize = 8192;
+  std::vector<std::string> keys, payloads;
+  std::vector<const void*> srcs;
+  std::vector<size_t> sizes;
+  for (int i = 0; i < kN; ++i) {
+    keys.push_back("rk-" + std::to_string(i));
+    payloads.push_back(std::string(kSize, static_cast<char>(i)));
+  }
+  for (int i = 0; i < kN; ++i) {
+    srcs.push_back(payloads[i].data());
+    sizes.push_back(kSize);
+  }
+  ASSERT_EQ(mgr.WriteBatch(keys, srcs, sizes).size(), static_cast<size_t>(kN));
+
+  std::vector<std::string> outs(kN, std::string(kSize, '\0'));
+  std::vector<void*> dsts;
+  std::vector<size_t> caps(kN, kSize);
+  for (auto& o : outs) dsts.push_back(o.data());
+
+  auto res = mgr.PrepareReadBatch(keys, dsts, caps);
+  ASSERT_EQ(res.size(), static_cast<size_t>(kN));
+  for (int i = 0; i < kN; ++i) {
+    EXPECT_EQ(res[i].status, SsdReadStatus::kOk) << "key " << i;
+    EXPECT_EQ(res[i].size, kSize);
+    EXPECT_EQ(outs[i], payloads[i]);
+  }
+}
+
+// Per-key outcomes must be independent: a miss and an over-cap key must not
+// spoil the keys around them.
+TEST_F(PeerSsdManagerTest, PrepareReadBatchMixesHitMissAndTooLarge) {
+  PeerSsdManager mgr(MakeConfig());
+  const std::string small(1024, 'S');
+  const std::string big(8192, 'B');
+  ASSERT_TRUE(mgr.Write("hit", OneSegment(small), small.size()));
+  ASSERT_TRUE(mgr.Write("toobig", OneSegment(big), big.size()));
+
+  std::string out_hit(1024, '\0');
+  std::string out_miss(1024, '\0');
+  std::string out_big(1024, '\0');
+  std::vector<std::string> keys = {"hit", "absent", "toobig"};
+  std::vector<void*> dsts = {out_hit.data(), out_miss.data(), out_big.data()};
+  std::vector<size_t> caps = {1024, 1024, 1024};  // "toobig" is 8192 > cap
+
+  auto res = mgr.PrepareReadBatch(keys, dsts, caps);
+  ASSERT_EQ(res.size(), 3u);
+  EXPECT_EQ(res[0].status, SsdReadStatus::kOk);
+  EXPECT_EQ(out_hit, small);
+  EXPECT_EQ(res[1].status, SsdReadStatus::kNotFound);
+  EXPECT_EQ(res[2].status, SsdReadStatus::kSizeTooLarge);
+  EXPECT_EQ(res[2].size, big.size());  // reports the ACTUAL size so the caller can resize
+}
+
+// Multi-drive: the manager must fan a batch across every configured directory
+// and still resolve each key on read-back.
+TEST_F(PeerSsdManagerTest, MultiDriveWriteBatchSpreadsAndReadsBack) {
+  PeerSsdConfig cfg = MakeConfig(128ULL * 1024 * 1024);
+  const std::string d0 = dir_.string() + "_m0";
+  const std::string d1 = dir_.string() + "_m1";
+  const std::string d2 = dir_.string() + "_m2";
+  cfg.ssd.storage_dir = d0 + "," + d1 + "," + d2;
+  PeerSsdManager mgr(cfg);
+
+  constexpr int kN = 60;
+  constexpr size_t kSize = 4096;
+  std::vector<std::string> keys, payloads;
+  std::vector<const void*> srcs;
+  std::vector<size_t> sizes;
+  for (int i = 0; i < kN; ++i) {
+    keys.push_back("mk-" + std::to_string(i));
+    payloads.push_back(std::string(kSize, static_cast<char>('0' + (i % 10))));
+  }
+  for (int i = 0; i < kN; ++i) {
+    srcs.push_back(payloads[i].data());
+    sizes.push_back(kSize);
+  }
+
+  auto ok = mgr.WriteBatch(keys, srcs, sizes);
+  for (int i = 0; i < kN; ++i) EXPECT_TRUE(ok[i]) << "key " << i;
+
+  // Every drive got a share of the batch.
+  for (const auto& d : {d0, d1, d2}) {
+    uintmax_t bytes = 0;
+    for (const auto& entry : fs::directory_iterator(d)) {
+      if (entry.is_regular_file()) bytes += entry.file_size();
+    }
+    EXPECT_GT(bytes, 0u) << "drive " << d << " got nothing";
+  }
+
+  std::vector<std::string> outs(kN, std::string(kSize, '\0'));
+  std::vector<void*> dsts;
+  std::vector<size_t> caps(kN, kSize);
+  for (auto& o : outs) dsts.push_back(o.data());
+  auto res = mgr.PrepareReadBatch(keys, dsts, caps);
+  for (int i = 0; i < kN; ++i) {
+    EXPECT_EQ(res[i].status, SsdReadStatus::kOk) << "key " << i;
+    EXPECT_EQ(outs[i], payloads[i]);
+  }
+
+  for (const auto& d : {d0, d1, d2}) {
+    std::error_code ec;
+    fs::remove_all(d, ec);
+  }
+}
+
 }  // namespace
 }  // namespace mori::umbp

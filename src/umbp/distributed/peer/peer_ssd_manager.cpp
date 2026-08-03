@@ -23,9 +23,11 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <tuple>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/local/tiers/spdk_proxy_tier.h"
+#include "umbp/local/tiers/ssd_backend_factory.h"
 #include "umbp/local/tiers/ssd_tier.h"
 #include "umbp/local/tiers/tier_backend.h"
 
@@ -61,9 +63,11 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
   // Explicit backend selection — an unknown value is a configuration error, not
   // a reason to silently fall back to the file backend.
   if (ssd.ssd_backend == "file") {
-    backend_ = std::make_unique<SSDTier>(ssd.storage_dir, ssd.capacity_bytes, ssd);
-    MORI_UMBP_INFO("[PeerSsdManager] SSDTier ready dir={} capacity={}B", ssd.storage_dir,
-                   ssd.capacity_bytes);
+    // One directory -> SSDTier; several (comma-separated) -> ShardedSsdTier
+    // spreading keys across the drives, so batch IO runs on all of them at once.
+    backend_ = MakeFileSsdBackend(ssd);
+    MORI_UMBP_INFO("[PeerSsdManager] file backend ready dirs=[{}] drives={} capacity={}B",
+                   ssd.storage_dir, ssd.StorageDirs().size(), ssd.capacity_bytes);
     return;
   }
 
@@ -208,6 +212,108 @@ bool PeerSsdManager::Write(const std::string& key,
     EvictToLowWatermark();
   }
   return true;
+}
+
+std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& keys,
+                                             const std::vector<const void*>& srcs,
+                                             const std::vector<size_t>& sizes) {
+  std::vector<bool> results(keys.size(), false);
+  if (!backend_ || keys.empty()) return results;
+  if (srcs.size() != keys.size() || sizes.size() != keys.size()) {
+    MORI_UMBP_ERROR("[PeerSsdManager] WriteBatch: mismatched input lengths ({} / {} / {})",
+                    keys.size(), srcs.size(), sizes.size());
+    return results;
+  }
+
+  // Pass 1 — dedup under one lock.  Already-owned keys succeed with no IO (same
+  // rationale as Write: a sequential re-put must not repeat the device write).
+  std::vector<size_t> todo;
+  todo.reserve(keys.size());
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (sizes[i] == 0) continue;  // meaningless put; leave results[i] == false
+      if (owned_.find(keys[i]) != owned_.end()) {
+        TouchLocked(keys[i]);
+        results[i] = true;
+        continue;
+      }
+      todo.push_back(i);
+    }
+  }
+  if (todo.empty()) return results;
+
+  auto gather = [&](const std::vector<size_t>& idxs) {
+    std::vector<std::string> k;
+    std::vector<const void*> d;
+    std::vector<size_t> z;
+    k.reserve(idxs.size());
+    d.reserve(idxs.size());
+    z.reserve(idxs.size());
+    for (size_t i : idxs) {
+      k.push_back(keys[i]);
+      d.push_back(srcs[i]);
+      z.push_back(sizes[i]);
+    }
+    return std::make_tuple(std::move(k), std::move(d), std::move(z));
+  };
+
+  // Pass 2 — one batched backend write outside the lock.  Failures are most
+  // likely ENOSPC, so retry exactly those once after a single eviction round
+  // (mirrors Write's evict-and-retry, amortized over the whole batch).
+  auto [bk, bd, bz] = gather(todo);
+  auto ok = backend_->BatchWrite(bk, bd, bz);
+  ok.resize(todo.size(), false);
+
+  std::vector<size_t> retry;
+  for (size_t j = 0; j < todo.size(); ++j) {
+    if (!ok[j]) retry.push_back(todo[j]);
+  }
+  if (!retry.empty()) {
+    EvictToLowWatermark();
+    auto [rk, rd, rz] = gather(retry);
+    auto retry_ok = backend_->BatchWrite(rk, rd, rz);
+    retry_ok.resize(retry.size(), false);
+    for (size_t j = 0, r = 0; j < todo.size(); ++j) {
+      if (!ok[j]) ok[j] = retry_ok[r++];
+    }
+  }
+
+  // Pass 3 — record locations + ADD events under one lock.  The owned_ re-check
+  // matches Write: a concurrent writer may have landed the same content-addressed
+  // bytes, and only the first recorder emits ADD SSD.
+  uint64_t written_bytes = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t j = 0; j < todo.size(); ++j) {
+      const size_t i = todo[j];
+      if (!ok[j]) continue;
+      results[i] = true;
+      written_bytes += sizes[i];
+      if (owned_.find(keys[i]) != owned_.end()) {
+        TouchLocked(keys[i]);
+      } else {
+        lru_.push_front(keys[i]);
+        owned_.emplace(keys[i], OwnedEntry{sizes[i], lru_.begin()});
+        pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, keys[i], TierType::SSD, sizes[i]});
+      }
+    }
+  }
+  metrics_.copy_bytes.fetch_add(written_bytes, std::memory_order_relaxed);
+
+  for (size_t j = 0; j < todo.size(); ++j) {
+    if (!ok[j]) {
+      MORI_UMBP_WARN("[PeerSsdManager] WriteBatch: backend write failed key={} size={}",
+                     keys[todo[j]], sizes[todo[j]]);
+    }
+  }
+
+  // One check-after-write for the whole batch instead of one per key.
+  auto [used, total] = Capacity();
+  if (total > 0 && static_cast<double>(used) >= high_watermark_ * static_cast<double>(total)) {
+    EvictToLowWatermark();
+  }
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +506,100 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
   metrics_.read_ok.fetch_add(1, std::memory_order_relaxed);
   metrics_.read_bytes.fetch_add(size, std::memory_order_relaxed);  // SSD read IO bandwidth source
   return SsdReadOutcome{SsdReadStatus::kOk, size};
+}
+
+std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<std::string>& keys,
+                                                             const std::vector<void*>& dsts,
+                                                             const std::vector<size_t>& caps) {
+  std::vector<SsdReadOutcome> out(keys.size(), SsdReadOutcome{SsdReadStatus::kNotFound, 0});
+  if (keys.empty()) return out;
+  if (!backend_) {
+    metrics_.read_not_found.fetch_add(keys.size(), std::memory_order_relaxed);
+    return out;
+  }
+  if (dsts.size() != keys.size() || caps.size() != keys.size()) {
+    MORI_UMBP_ERROR("[PeerSsdManager] PrepareReadBatch: mismatched input lengths ({} / {} / {})",
+                    keys.size(), dsts.size(), caps.size());
+    for (auto& o : out) o = SsdReadOutcome{SsdReadStatus::kError, 0};
+    return out;
+  }
+
+  // Pass 1 — resolve sizes and mark every servable key in flight under ONE lock
+  // acquisition (the per-key path pays two per key).
+  std::vector<size_t> todo;
+  todo.reserve(keys.size());
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      auto it = owned_.find(keys[i]);
+      if (it == owned_.end() || evicting_.count(keys[i]) != 0) {
+        metrics_.read_not_found.fetch_add(1, std::memory_order_relaxed);
+        continue;  // stays kNotFound
+      }
+      const size_t size = it->second.size;
+      if (size > caps[i]) {
+        metrics_.read_size_too_large.fetch_add(1, std::memory_order_relaxed);
+        MORI_UMBP_WARN(
+            "[PeerSsdManager] SSD read key={} size={}B exceeds per-slot staging cap {}B; "
+            "raise ssd_staging_buffer_size or lower ssd_staging_buffer_slots",
+            keys[i], size, caps[i]);
+        out[i] = SsdReadOutcome{SsdReadStatus::kSizeTooLarge, size};
+        continue;
+      }
+      out[i].size = size;
+      ++inflight_reads_[keys[i]];
+      todo.push_back(i);
+    }
+  }
+  if (todo.empty()) return out;
+
+  // Pass 2 — one batched backend read outside the lock; ShardedSsdTier turns
+  // this into concurrent IO on every drive holding part of the batch.
+  std::vector<std::string> k;
+  std::vector<uintptr_t> d;
+  std::vector<size_t> z;
+  k.reserve(todo.size());
+  d.reserve(todo.size());
+  z.reserve(todo.size());
+  for (size_t i : todo) {
+    k.push_back(keys[i]);
+    d.push_back(reinterpret_cast<uintptr_t>(dsts[i]));
+    z.push_back(out[i].size);
+  }
+  auto ok = backend_->BatchReadIntoPtr(k, d, z);
+  ok.resize(todo.size(), false);
+
+  // Pass 3 — release the in-flight marks, refresh LRU for the reads that landed,
+  // and wake a waiting ClearLocal once the last read drains.
+  uint64_t read_bytes = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t j = 0; j < todo.size(); ++j) {
+      const size_t i = todo[j];
+      auto rit = inflight_reads_.find(keys[i]);
+      if (rit != inflight_reads_.end() && --rit->second <= 0) inflight_reads_.erase(rit);
+      if (ok[j] && owned_.find(keys[i]) != owned_.end()) TouchLocked(keys[i]);
+    }
+    if (inflight_reads_.empty()) reads_drained_cv_.notify_all();
+  }
+
+  for (size_t j = 0; j < todo.size(); ++j) {
+    const size_t i = todo[j];
+    if (ok[j]) {
+      out[i].status = SsdReadStatus::kOk;
+      read_bytes += out[i].size;
+      metrics_.read_ok.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      // owned_ had the key but the backend couldn't serve it (a local evict
+      // raced us, or a corrupt record): kError, not a definitive miss.
+      out[i].status = SsdReadStatus::kError;
+      metrics_.read_error.fetch_add(1, std::memory_order_relaxed);
+      MORI_UMBP_WARN("[PeerSsdManager] PrepareReadBatch backend read failed key={} size={}",
+                     keys[i], out[i].size);
+    }
+  }
+  metrics_.read_bytes.fetch_add(read_bytes, std::memory_order_relaxed);
+  return out;
 }
 
 // ---------------------------------------------------------------------------

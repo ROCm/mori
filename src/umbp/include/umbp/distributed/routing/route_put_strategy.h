@@ -84,34 +84,69 @@ class RoutePutStrategy {
       const std::unordered_set<std::string>& exclude_nodes) = 0;
 };
 
-/// Configurable batch put strategy combining two orthogonal knobs:
-///   - base select algorithm: most-available vs capacity-weighted random;
-///   - node affinity: none / same-node / local-node.
+/// Whether RoutePut may steer a put straight at a node's SSD tier.
 ///
-/// Both knobs are wired from env vars at master startup
-/// (UMBP_ROUTE_PUT_SELECT_ALGO / UMBP_ROUTE_PUT_NODE_AFFINITY).  Tier order is
-/// always HBM -> DRAM; SSD is never a direct-put target.  Projected capacity is
-/// deducted on the batch-local candidates copy within SelectBatch; nothing is
-/// written back to the registry.
+/// Historically SSD was never a put target: it was filled only by
+/// copy-on-commit from a DRAM landing, so routing a put there would have named
+/// a tier with no direct-put semantics.  The direct-SSD put path removes that
+/// restriction, and pure-SSD nodes (no DRAM pool at all) depend on it.
+enum class SsdPutMode {
+  /// SSD only when the node has NO usable DRAM/HBM capacity at all — i.e. a
+  /// pure-SSD node.  Mixed nodes behave exactly as before.  Default.
+  kAuto,
+  /// SSD considered on every node, after HBM and DRAM.  Turns a full-DRAM node
+  /// into an SSD spill target instead of failing the put.
+  kAlways,
+  /// Legacy behavior: HBM -> DRAM only; a key that fits nowhere is unroutable.
+  kNever,
+};
+
+/// Configurable batch put strategy combining three orthogonal knobs:
+///   - base select algorithm: most-available vs capacity-weighted random;
+///   - node affinity: none / same-node / local-node;
+///   - SSD put mode: auto / always / never.
+///
+/// All three are wired from env vars at master startup
+/// (UMBP_ROUTE_PUT_SELECT_ALGO / UMBP_ROUTE_PUT_NODE_AFFINITY /
+/// UMBP_ROUTE_PUT_SSD_MODE).  Tier order is HBM -> DRAM -> SSD, with the SSD
+/// step gated by the mode above.  Projected capacity is deducted on the
+/// batch-local candidates copy within SelectBatch; nothing is written back to
+/// the registry.
 class ConfigurableRoutePutStrategy : public RoutePutStrategy {
  public:
   enum class SelectAlgo { kMostAvailable, kRandom };
   enum class NodeAffinity { kNone, kSame, kLocal };
 
-  ConfigurableRoutePutStrategy(SelectAlgo algo, NodeAffinity affinity);
+  ConfigurableRoutePutStrategy(SelectAlgo algo, NodeAffinity affinity,
+                               SsdPutMode ssd_mode = SsdPutMode::kAuto);
   /// Test-only ctor: pins the RNG seed so capacity-weighted random draws are
   /// reproducible.  Production uses the thread_local RNG (no shared state).
-  ConfigurableRoutePutStrategy(SelectAlgo algo, NodeAffinity affinity, uint64_t rng_seed);
+  ConfigurableRoutePutStrategy(SelectAlgo algo, NodeAffinity affinity, uint64_t rng_seed,
+                               SsdPutMode ssd_mode = SsdPutMode::kAuto);
 
   std::vector<std::optional<RoutePutResult>> SelectBatch(
       const std::string& requester_node_id, const std::vector<uint64_t>& block_sizes,
       const std::vector<bool>& already_exists, std::vector<ClientRecord> candidates,
       const std::unordered_set<std::string>& exclude_nodes) override;
 
-  /// Human-readable "algo/affinity" for startup logging.
+  /// Human-readable "algo/affinity/ssd_mode" for startup logging.
   std::string Describe() const;
 
  private:
+  /// Tiers this strategy will consider, fastest first.  HBM -> DRAM, plus SSD
+  /// when ssd_mode_ != kNever (per-node eligibility still applies, see
+  /// SsdEligibleOnNode).
+  const std::vector<TierType>& TierOrder() const { return tier_order_; }
+
+  /// Whether @p client may take a direct SSD put.  Always true under kAlways;
+  /// under kAuto only for a node with no usable DRAM/HBM capacity (a pure-SSD
+  /// node), so a mixed node never silently demotes a put to its cold tier.
+  bool SsdEligibleOnNode(const ClientRecord& client) const;
+
+  /// Tier-eligibility gate applied before any capacity check.  Non-SSD tiers
+  /// always pass; SSD defers to SsdEligibleOnNode.
+  bool TierEligibleOnNode(const ClientRecord& client, TierType tier) const;
+
   /// Try only @p node_id on exactly @p tier; nullopt if it cannot fit
   /// @p block_size.  No cross-node, no cross-tier fallback.
   std::optional<RoutePutResult> TrySelectOnNodeTier(
@@ -142,6 +177,8 @@ class ConfigurableRoutePutStrategy : public RoutePutStrategy {
 
   SelectAlgo algo_;
   NodeAffinity affinity_;
+  SsdPutMode ssd_mode_ = SsdPutMode::kAuto;
+  std::vector<TierType> tier_order_;
   bool seeded_ = false;
   std::mt19937 rng_;
   std::mutex rng_mutex_;

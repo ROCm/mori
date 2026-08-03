@@ -81,6 +81,20 @@ class PeerSsdManager : public OwnedLocationSource {
   bool Write(const std::string& key, const std::vector<std::pair<const void*, size_t>>& segments,
              size_t total_size);
 
+  // Batched form of Write for contiguous sources — the direct-SSD put path.
+  // One dedup pass, ONE backend BatchWrite (which a multi-drive ShardedSsdTier
+  // fans across every drive in parallel), then one recording pass.  This is
+  // what makes an SSD-target BatchPut scale with drive count instead of
+  // serializing key-by-key; a per-key Write loop would idle every drive but one.
+  //
+  // Result length and order match @p keys.  An already-owned key reports true
+  // without any device IO (LRU refreshed).  On a partial failure the failed keys
+  // are retried once after a single eviction round, so a batch that trips the
+  // high watermark mid-way still lands.
+  std::vector<bool> WriteBatch(const std::vector<std::string>& keys,
+                               const std::vector<const void*>& srcs,
+                               const std::vector<size_t>& sizes);
+
   // Local eviction of a single key.  Read priority: a key with an
   // in-flight PrepareRead (inflight_reads_ > 0) is NOT evicted (returns false).
   // Concurrency: marks the key in evicting_ under the lock, runs the backend
@@ -124,6 +138,17 @@ class PeerSsdManager : public OwnedLocationSource {
   // returns kOk.  The backend IO runs outside the lock; the key is marked
   // in-flight (inflight_reads_) across that window so eviction skips it.
   SsdReadOutcome PrepareRead(const std::string& key, void* staging_ptr, size_t staging_cap);
+
+  // Batched form of PrepareRead: resolve + mark every key in flight under one
+  // lock, issue ONE backend BatchReadIntoPtr (fanned across drives by
+  // ShardedSsdTier), then release the marks in one pass.  Per-key semantics are
+  // identical to PrepareRead — including kNotFound for an evicting key and
+  // kSizeTooLarge rejected before any device IO.
+  //
+  // @p dsts and @p caps are parallel to @p keys; the result is too.
+  std::vector<SsdReadOutcome> PrepareReadBatch(const std::vector<std::string>& keys,
+                                               const std::vector<void*>& dsts,
+                                               const std::vector<size_t>& caps);
 
   // OwnedLocationSource — all events carry TierType::SSD.
   std::vector<KvEvent> DrainPendingEvents() override;

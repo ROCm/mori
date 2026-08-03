@@ -106,6 +106,10 @@ struct MasterServerConfig {
   // FromEnvironment() alongside put_strategy.
   std::string route_put_algo = "most_available";
   std::string route_put_affinity = "none";
+  // "auto" | "always" | "never" — whether RoutePut may target a node's SSD tier
+  // directly.  "auto" (default) allows it only on pure-SSD nodes (no DRAM/HBM
+  // capacity at all), so mixed deployments keep the previous behavior.
+  std::string route_put_ssd_mode = "auto";
 
   // Composes ClientRegistryConfig::FromEnvironment() and
   // EvictionConfig::FromEnvironment().  listen_address is NOT read from env
@@ -165,6 +169,15 @@ struct PoolClientConfig {
   // must be >= the largest single-key page KV (61-layer MLA page ~= 4.5 MB).
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
 
+  // Direct-SSD put write staging (peer side).  0 slots disables the path: this
+  // node advertises no write slots and rejects direct SSD writes, which is the
+  // behavior for any DRAM-backed deployment.  DistributedClient turns it on
+  // automatically in pure-SSD mode (no DRAM pool → a writer routed here has no
+  // other landing tier).  This region is allocated ON TOP of
+  // ssd_staging_buffer_size, so enabling it never shrinks a read slot.
+  int ssd_write_staging_slots = 0;
+  size_t ssd_write_staging_size = 268435456;  // 256 MiB, used only when slots > 0
+
   std::vector<ExportableDram> dram_buffers;
   PeerSsdConfig ssd;
 
@@ -209,6 +222,8 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.staging_buffer_size = dc.staging_buffer_size;
   pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
+  pc.ssd_write_staging_slots = dc.ssd_write_staging_slots;
+  pc.ssd_write_staging_size = dc.ssd_write_staging_size;
   pc.peer_service_port = dc.peer_service_port;
   pc.cache_remote_fetches = dc.cache_remote_fetches;
   pc.cache_remote_admission = dc.cache_remote_admission;

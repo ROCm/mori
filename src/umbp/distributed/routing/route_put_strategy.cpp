@@ -35,11 +35,27 @@ namespace mori::umbp {
 // ---------------------------------------------------------------------------
 namespace {
 
-// SSD is intentionally excluded: there is no direct SSD put — the SSD copy is
-// filled asynchronously by copy-on-commit.  RoutePut must never steer a put at
-// a tier with no direct-put semantics, even though SSD capacity is reported via
-// heartbeat.
-constexpr std::array<TierType, 2> kPutTierOrder = {TierType::HBM, TierType::DRAM};
+// Tier priority, fastest first.  SSD is included only when the strategy's
+// SsdPutMode allows it (see ConfigurableRoutePutStrategy::TierOrder) — with the
+// direct-SSD put path there IS now a put semantics for SSD, but a mixed node
+// must not silently demote a put to its cold tier.
+std::vector<TierType> BuildTierOrder(SsdPutMode mode) {
+  std::vector<TierType> order = {TierType::HBM, TierType::DRAM};
+  if (mode != SsdPutMode::kNever) order.push_back(TierType::SSD);
+  return order;
+}
+
+// Total (not available) DRAM+HBM bytes a node reports.  Zero means the node has
+// no host-memory tier at all — a pure-SSD node — as opposed to a node whose
+// DRAM merely happens to be full right now.
+uint64_t HostMemoryTotalBytes(const ClientRecord& client) {
+  uint64_t total = 0;
+  for (TierType t : {TierType::HBM, TierType::DRAM}) {
+    auto it = client.tier_capacities.find(t);
+    if (it != client.tier_capacities.end()) total += it->second.total_bytes;
+  }
+  return total;
+}
 
 std::string JoinStrings(const std::vector<std::string>& items) {
   if (items.empty()) return "";
@@ -81,14 +97,18 @@ std::string SummarizeClientTiers(const std::vector<ClientRecord>& alive_clients)
   return JoinStrings(summaries);
 }
 
-// Indices of candidates that can fit block_size on a single @p tier.
+// Indices of candidates that can fit block_size on a single @p tier and pass
+// @p tier_eligible (the SSD-put gate; always true for HBM/DRAM).
+template <typename EligibleFn>
 std::vector<size_t> CollectEligibleOnTier(const std::vector<ClientRecord>& candidates,
                                           TierType tier, uint64_t block_size,
-                                          const std::unordered_set<std::string>& exclude_nodes) {
+                                          const std::unordered_set<std::string>& exclude_nodes,
+                                          const EligibleFn& tier_eligible) {
   std::vector<size_t> indices;
   for (size_t i = 0; i < candidates.size(); ++i) {
     const auto& client = candidates[i];
     if (exclude_nodes.count(client.node_id)) continue;
+    if (!tier_eligible(client, tier)) continue;
     auto it = client.tier_capacities.find(tier);
     if (it == client.tier_capacities.end()) continue;
     if (it->second.available_bytes < block_size) continue;
@@ -154,12 +174,42 @@ bool ApplyProjectedDeduction(std::vector<ClientRecord>& candidates, const RouteP
 // ---------------------------------------------------------------------------
 //  ConfigurableRoutePutStrategy
 // ---------------------------------------------------------------------------
-ConfigurableRoutePutStrategy::ConfigurableRoutePutStrategy(SelectAlgo algo, NodeAffinity affinity)
-    : algo_(algo), affinity_(affinity) {}
+ConfigurableRoutePutStrategy::ConfigurableRoutePutStrategy(SelectAlgo algo, NodeAffinity affinity,
+                                                           SsdPutMode ssd_mode)
+    : algo_(algo),
+      affinity_(affinity),
+      ssd_mode_(ssd_mode),
+      tier_order_(BuildTierOrder(ssd_mode)) {}
 
 ConfigurableRoutePutStrategy::ConfigurableRoutePutStrategy(SelectAlgo algo, NodeAffinity affinity,
-                                                           uint64_t rng_seed)
-    : algo_(algo), affinity_(affinity), seeded_(true), rng_(rng_seed) {}
+                                                           uint64_t rng_seed, SsdPutMode ssd_mode)
+    : algo_(algo),
+      affinity_(affinity),
+      ssd_mode_(ssd_mode),
+      tier_order_(BuildTierOrder(ssd_mode)),
+      seeded_(true),
+      rng_(rng_seed) {}
+
+bool ConfigurableRoutePutStrategy::SsdEligibleOnNode(const ClientRecord& client) const {
+  switch (ssd_mode_) {
+    case SsdPutMode::kAlways:
+      return true;
+    case SsdPutMode::kNever:
+      return false;
+    case SsdPutMode::kAuto:
+    default:
+      // Pure-SSD node only.  Keyed on TOTAL host-memory bytes, not available:
+      // a node whose DRAM is merely full still wants the put to go to a peer
+      // with free DRAM rather than to its own cold tier.
+      return HostMemoryTotalBytes(client) == 0;
+  }
+}
+
+bool ConfigurableRoutePutStrategy::TierEligibleOnNode(const ClientRecord& client,
+                                                      TierType tier) const {
+  if (tier != TierType::SSD) return true;
+  return SsdEligibleOnNode(client);
+}
 
 std::string ConfigurableRoutePutStrategy::Describe() const {
   std::string out = (algo_ == SelectAlgo::kRandom) ? "random" : "most_available";
@@ -174,6 +224,19 @@ std::string ConfigurableRoutePutStrategy::Describe() const {
     case NodeAffinity::kNone:
     default:
       out += "none";
+      break;
+  }
+  out += '/';
+  switch (ssd_mode_) {
+    case SsdPutMode::kAlways:
+      out += "ssd:always";
+      break;
+    case SsdPutMode::kNever:
+      out += "ssd:never";
+      break;
+    case SsdPutMode::kAuto:
+    default:
+      out += "ssd:auto";
       break;
   }
   return out;
@@ -196,6 +259,7 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNodeTier(
   auto it = std::find_if(candidates.begin(), candidates.end(),
                          [&](const ClientRecord& c) { return c.node_id == node_id; });
   if (it == candidates.end()) return std::nullopt;
+  if (!TierEligibleOnNode(*it, tier)) return std::nullopt;
   auto cap = it->tier_capacities.find(tier);
   if (cap == it->tier_capacities.end() || cap->second.available_bytes < block_size) {
     return std::nullopt;
@@ -206,7 +270,7 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNodeTier(
 std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNode(
     const std::vector<ClientRecord>& candidates, const std::string& node_id, uint64_t block_size,
     const std::unordered_set<std::string>& exclude_nodes) const {
-  for (TierType tier : kPutTierOrder) {
+  for (TierType tier : TierOrder()) {
     if (auto r = TrySelectOnNodeTier(candidates, node_id, tier, block_size, exclude_nodes)) {
       return r;
     }
@@ -218,7 +282,10 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::SelectByAlgo(
     const std::vector<ClientRecord>& candidates, uint64_t block_size,
     const std::unordered_set<std::string>& exclude_nodes,
     const std::optional<std::string>& preferred_node) {
-  for (TierType tier : kPutTierOrder) {
+  const auto tier_eligible = [this](const ClientRecord& c, TierType t) {
+    return TierEligibleOnNode(c, t);
+  };
+  for (TierType tier : TierOrder()) {
     // Node preference applies only within this tier, so a preferred node that is
     // full on the faster tier never preempts a remote node that still has room
     // there: tier priority is preserved.
@@ -229,7 +296,7 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::SelectByAlgo(
       }
     }
     std::vector<size_t> eligible =
-        CollectEligibleOnTier(candidates, tier, block_size, exclude_nodes);
+        CollectEligibleOnTier(candidates, tier, block_size, exclude_nodes, tier_eligible);
     if (eligible.empty()) continue;
 
     auto available = [&](size_t idx) {

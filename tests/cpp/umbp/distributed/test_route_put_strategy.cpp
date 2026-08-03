@@ -339,19 +339,35 @@ TEST(ConfigurableRoutePut, OrderAndDedupPreserved) {
   EXPECT_EQ(out[2]->outcome, RoutePutOutcome::kAlreadyExists);
 }
 
-TEST(ConfigurableRoutePut, NeverRoutesToSsd) {
+// Previously "NeverRoutesToSsd": SSD was unroutable because it had no direct-put
+// semantics.  The direct-SSD put path changes that, so the default mode
+// (SsdPutMode::kAuto) now routes an SSD-ONLY node — a pure-SSD deployment, which
+// has no other landing tier.  What must NOT change is that a node with a real
+// DRAM tier keeps its put on DRAM.
+TEST(ConfigurableRoutePut, DefaultRoutesSsdOnlyNodeButStillPrefersDram) {
   ConfigurableRoutePutStrategy strat(Algo::kMostAvailable, Affinity::kNone);
   std::vector<ClientRecord> only_ssd{
       MakeClient("a", "a-addr", {{TierType::SSD, {100 * GB, 100 * GB}}})};
   auto out = strat.SelectBatch("req", {1 * GB}, NoDedup(1), only_ssd, {});
   ASSERT_EQ(out.size(), 1u);
-  EXPECT_FALSE(out[0].has_value());
+  ASSERT_TRUE(out[0].has_value());
+  EXPECT_EQ(out[0]->tier, TierType::SSD);
 
   std::vector<ClientRecord> ssd_and_dram{MakeClient(
       "a", "a-addr", {{TierType::SSD, {100 * GB, 100 * GB}}, {TierType::DRAM, {2 * GB, 2 * GB}}})};
   auto out2 = strat.SelectBatch("req", {1 * GB}, NoDedup(1), ssd_and_dram, {});
   ASSERT_TRUE(out2[0].has_value());
   EXPECT_EQ(out2[0]->tier, TierType::DRAM);
+}
+
+// The old behavior stays reachable for anyone who wants it back.
+TEST(ConfigurableRoutePut, SsdModeNeverRestoresLegacyUnroutable) {
+  ConfigurableRoutePutStrategy strat(Algo::kMostAvailable, Affinity::kNone, SsdPutMode::kNever);
+  std::vector<ClientRecord> only_ssd{
+      MakeClient("a", "a-addr", {{TierType::SSD, {100 * GB, 100 * GB}}})};
+  auto out = strat.SelectBatch("req", {1 * GB}, NoDedup(1), only_ssd, {});
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_FALSE(out[0].has_value());
 }
 
 // Strong, seed-independent: a node that cannot fit the block is never selected.
@@ -523,6 +539,98 @@ TEST(ConfigurableRoutePut, LocalUnknownRequesterFallsBack) {
 }
 
 // ---- GetEnvEnum tests ----
+
+// ---- SSD as a direct put target (pure-SSD nodes) ----
+
+// A pure-SSD node reports NO DRAM/HBM tier at all.  That absence — not a
+// zero-sized DRAM entry — is the signal SsdPutMode::kAuto keys off.
+ClientRecord MakePureSsdClient(const std::string& node_id, const std::string& addr,
+                               uint64_t ssd_bytes) {
+  return MakeClient(node_id, addr, {{TierType::SSD, {ssd_bytes, ssd_bytes}}});
+}
+
+TEST(SsdPutMode, AutoRoutesToSsdOnPureSsdNode) {
+  ConfigurableRoutePutStrategy strat(Algo::kMostAvailable, Affinity::kNone, SsdPutMode::kAuto);
+  std::vector<ClientRecord> clients = {MakePureSsdClient("ssd0", "10.0.0.1:9000", 100 * GB)};
+
+  auto res = SelectOne(strat, clients, 1 * GB, {});
+  ASSERT_TRUE(res.has_value());
+  EXPECT_EQ(res->outcome, RoutePutOutcome::kRouted);
+  EXPECT_EQ(res->node_id, "ssd0");
+  EXPECT_EQ(res->tier, TierType::SSD);
+}
+
+// A node that merely has FULL DRAM must not have its put demoted to its own
+// cold tier under kAuto — the point of "auto" is pure-SSD nodes only.
+TEST(SsdPutMode, AutoDoesNotSpillMixedNodeToSsd) {
+  ConfigurableRoutePutStrategy strat(Algo::kMostAvailable, Affinity::kNone, SsdPutMode::kAuto);
+  std::vector<ClientRecord> clients = {MakeClient(
+      "mixed", "10.0.0.2:9000",
+      {{TierType::DRAM, {10 * GB, /*available=*/0}}, {TierType::SSD, {100 * GB, 100 * GB}}})};
+
+  auto res = SelectOne(strat, clients, 1 * GB, {});
+  EXPECT_FALSE(res.has_value());
+}
+
+TEST(SsdPutMode, AlwaysSpillsMixedNodeToSsdAfterDram) {
+  ConfigurableRoutePutStrategy strat(Algo::kMostAvailable, Affinity::kNone, SsdPutMode::kAlways);
+  std::vector<ClientRecord> clients = {MakeClient(
+      "mixed", "10.0.0.2:9000",
+      {{TierType::DRAM, {10 * GB, /*available=*/0}}, {TierType::SSD, {100 * GB, 100 * GB}}})};
+
+  auto res = SelectOne(strat, clients, 1 * GB, {});
+  ASSERT_TRUE(res.has_value());
+  EXPECT_EQ(res->tier, TierType::SSD);
+}
+
+// Tier priority survives: DRAM with room still beats SSD even under kAlways.
+TEST(SsdPutMode, AlwaysStillPrefersDramWhenItFits) {
+  ConfigurableRoutePutStrategy strat(Algo::kMostAvailable, Affinity::kNone, SsdPutMode::kAlways);
+  std::vector<ClientRecord> clients = {
+      MakeClient("mixed", "10.0.0.2:9000",
+                 {{TierType::DRAM, {10 * GB, 10 * GB}}, {TierType::SSD, {100 * GB, 100 * GB}}})};
+
+  auto res = SelectOne(strat, clients, 1 * GB, {});
+  ASSERT_TRUE(res.has_value());
+  EXPECT_EQ(res->tier, TierType::DRAM);
+}
+
+TEST(SsdPutMode, NeverKeepsLegacyBehavior) {
+  ConfigurableRoutePutStrategy strat(Algo::kMostAvailable, Affinity::kNone, SsdPutMode::kNever);
+  std::vector<ClientRecord> clients = {MakePureSsdClient("ssd0", "10.0.0.1:9000", 100 * GB)};
+
+  EXPECT_FALSE(SelectOne(strat, clients, 1 * GB, {}).has_value());
+}
+
+// With several pure-SSD nodes, most_available spreads the batch across them and
+// the projected deduction keeps later keys honest — that is what makes a
+// multi-node pure-SSD pool aggregate.
+TEST(SsdPutMode, SpreadsBatchAcrossPureSsdNodes) {
+  ConfigurableRoutePutStrategy strat(Algo::kMostAvailable, Affinity::kNone, SsdPutMode::kAuto);
+  std::vector<ClientRecord> clients = {MakePureSsdClient("ssd0", "10.0.0.1:9000", 8 * GB),
+                                       MakePureSsdClient("ssd1", "10.0.0.2:9000", 8 * GB)};
+
+  std::vector<uint64_t> sizes(8, 1 * GB);
+  auto out = strat.SelectBatch("req", sizes, std::vector<bool>(8, false), clients, {});
+  ASSERT_EQ(out.size(), 8u);
+  int on_ssd0 = 0, on_ssd1 = 0;
+  for (const auto& r : out) {
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->tier, TierType::SSD);
+    (r->node_id == "ssd0" ? on_ssd0 : on_ssd1)++;
+  }
+  EXPECT_EQ(on_ssd0, 4);
+  EXPECT_EQ(on_ssd1, 4);
+}
+
+TEST(SsdPutMode, DescribeReportsMode) {
+  EXPECT_EQ(ConfigurableRoutePutStrategy(Algo::kMostAvailable, Affinity::kNone, SsdPutMode::kAuto)
+                .Describe(),
+            "most_available/none/ssd:auto");
+  EXPECT_EQ(
+      ConfigurableRoutePutStrategy(Algo::kRandom, Affinity::kLocal, SsdPutMode::kAlways).Describe(),
+      "random/local/ssd:always");
+}
 
 TEST(GetEnvEnum, ResolvesValidEmptyAndUnknown) {
   const char* kName = "UMBP_TEST_ROUTE_PUT_ENUM";

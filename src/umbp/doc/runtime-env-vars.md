@@ -120,10 +120,12 @@ Python wrapper construct one) — they are read once.
 | `UMBP_DRAM_CAPACITY` | 4 GiB | `dram.capacity_bytes`. |
 | `UMBP_DRAM_HIGH_WM` / `UMBP_DRAM_LOW_WM` | `0.9` / `0.7` | DRAM tier eviction watermarks. |
 | `UMBP_SSD_ENABLED` | `1` | `0` to disable the SSD tier entirely. |
-| `UMBP_SSD_DIR` | `/tmp/umbp_ssd` | POSIX backend root. |
-| `UMBP_SSD_CAPACITY` | 32 GiB | `ssd.capacity_bytes`. |
+| `UMBP_SSD_DIR` | `/tmp/umbp_ssd` | POSIX backend root(s).  **Comma-separated for multi-drive**, one directory per physical drive (e.g. `/mnt/nvme0,/mnt/nvme1`).  More than one turns the tier into a `ShardedSsdTier`: keys are placed on the drive with the most free space and batch IO runs on every drive at once, so the tier delivers their aggregate bandwidth. |
+| `UMBP_SSD_CAPACITY` | 32 GiB | `ssd.capacity_bytes`.  With multiple `UMBP_SSD_DIR` entries this is the TOTAL budget, split evenly across the drives. |
+| `UMBP_SSD_SHARD_IO_THREADS` | `0` | Worker threads for the multi-drive batch paths.  `0` = one per drive (what saturates N drives).  Ignored with a single directory. |
 | `UMBP_SSD_BACKEND` | `file` | `file` or `spdk`. Implicitly upgraded to `spdk` if `UMBP_SPDK_NVME_PCI` is set. |
 | `UMBP_EVICTION_POLICY` | `lru` | Forwarded to `eviction.policy`. |
+| `UMBP_ROUTE_PUT_SSD_MODE` | `auto` | Whether RoutePut may target a node's SSD tier directly.  `auto` = only on **pure-SSD nodes** (nodes reporting no DRAM/HBM capacity at all), so mixed deployments are unchanged; `always` = SSD considered on every node after HBM and DRAM, turning a full-DRAM node into a spill target instead of failing the put; `never` = legacy HBM→DRAM only. |
 | `UMBP_ROLE` | (empty) | `leader` / `follower` / `standalone`. If unset, falls back to `LOCAL_RANK` / `OMPI_COMM_WORLD_LOCAL_RANK` / `SLURM_LOCALID` / `MPI_LOCALRANKID`: rank 0 → leader, others → follower. |
 | `UMBP_SPDK_BDEV` | (empty) | SPDK bdev name (e.g. `Malloc0`, `NVMe0n1`). |
 | `UMBP_SPDK_REACTOR_MASK` | `0x1` | SPDK reactor CPU mask. |

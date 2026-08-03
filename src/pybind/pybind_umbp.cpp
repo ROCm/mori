@@ -166,6 +166,9 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("capacity_bytes", &UMBPSsdConfig::capacity_bytes)
       .def_readwrite("layout_mode", &UMBPSsdConfig::layout_mode)
       .def_readwrite("segment_size_bytes", &UMBPSsdConfig::segment_size_bytes)
+      // Multi-drive: storage_dir accepts a comma-separated list (one per drive);
+      // shard_io_threads=0 means one worker per drive.
+      .def_readwrite("shard_io_threads", &UMBPSsdConfig::shard_io_threads)
       .def_readwrite("high_watermark", &UMBPSsdConfig::high_watermark)
       .def_readwrite("low_watermark", &UMBPSsdConfig::low_watermark)
       .def_readwrite("io", &UMBPSsdConfig::io)
@@ -230,6 +233,9 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
       .def_readwrite("ssd_staging_buffer_size", &UMBPDistributedConfig::ssd_staging_buffer_size)
       .def_readwrite("ssd_staging_buffer_slots", &UMBPDistributedConfig::ssd_staging_buffer_slots)
+      // Direct-SSD put staging: -1 = auto (on in pure-SSD mode), 0 = off, >0 = slots.
+      .def_readwrite("ssd_write_staging_slots", &UMBPDistributedConfig::ssd_write_staging_slots)
+      .def_readwrite("ssd_write_staging_size", &UMBPDistributedConfig::ssd_write_staging_size)
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
       .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)
       .def_readwrite("cache_remote_admission", &UMBPDistributedConfig::cache_remote_admission)
