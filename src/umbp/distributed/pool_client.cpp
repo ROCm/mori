@@ -1437,7 +1437,7 @@ bool PoolClient::RemoteSsdStagedWrite(PeerConnection& peer,
     mori::io::BatchSizeVec local_offsets(1), remote_offs(1), sizes(1);
     size_t first = i;
     while (i < items.size() && packed_bytes + items[i]->size <= config_.staging_buffer_size) {
-      std::memcpy(staging_buffer_.get() + packed_bytes, items[i]->src, items[i]->size);
+      std::memcpy(staging_buffer_ + packed_bytes, items[i]->src, items[i]->size);
       local_offsets[0].push_back(packed_bytes);
       remote_offs[0].push_back(remote_offsets[i]);
       sizes[0].push_back(items[i]->size);
@@ -3251,7 +3251,7 @@ std::vector<size_t> PoolClient::RemoteSsdBatchReadOnce(PeerConnection& peer,
         if (!statuses[0].Succeeded()) continue;
         size_t off = 0;
         for (size_t j : members) {
-          std::memcpy(items[staged[j]].dst, staging_buffer_.get() + off, items[staged[j]].size);
+          std::memcpy(items[staged[j]].dst, staging_buffer_ + off, items[staged[j]].size);
           off += items[staged[j]].size;
           rdma_ok[j] = 1;
         }
