@@ -501,6 +501,49 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
 
   assert(!config.withCompChannel && !config.enableSrq && "not implemented");
 
+  const char* proxyEnv = std::getenv("MORI_USE_IBGDA_PROXY");
+  bool useProxy = proxyEnv && (std::string(proxyEnv) == "1" || std::string(proxyEnv) == "true");
+
+  if (useProxy) {
+    fprintf(stderr, "[MoRI-PROXY-QP] Creating plain QP on %s (proxy mode)...\n",
+            GetRdmaDevice()->Name().c_str());
+    ibv_pd* basePd = GetIbvPd();
+    fprintf(stderr, "[MoRI-PROXY-QP]   basePd=%p, context=%p\n", (void*)basePd, (void*)context);
+
+    ibv_cq* plainCq = ibv_create_cq(context, config.maxMsgsNum * 2, nullptr, nullptr, 0);
+    fprintf(stderr, "[MoRI-PROXY-QP]   CQ created: %p\n", (void*)plainCq);
+    assert(plainCq);
+
+    ibv_qp_init_attr qa{};
+    qa.send_cq = plainCq; qa.recv_cq = plainCq; qa.qp_type = IBV_QPT_RC;
+    qa.cap.max_send_wr = config.maxMsgsNum;
+    qa.cap.max_recv_wr = config.maxRecvWr != 0 ? config.maxRecvWr : config.maxMsgsNum;
+    qa.cap.max_send_sge = 1; qa.cap.max_recv_sge = 1; qa.cap.max_inline_data = 64;
+    ibv_qp* plainQp = ibv_create_qp(basePd, &qa);
+    fprintf(stderr, "[MoRI-PROXY-QP]   QP created: %p qpn=%u\n",
+            (void*)plainQp, plainQp ? plainQp->qp_num : 0);
+    assert(plainQp);
+
+    RdmaEndpoint endpoint;
+    endpoint.handle.psn = 0;
+    endpoint.handle.portId = config.portId;
+    endpoint.handle.qpn = plainQp->qp_num;
+
+    const ibv_port_attr* gidPortAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+    assert(gidPortAttr);
+    GidSelectionResult gidSel = AutoSelectGidIndex(context, config.portId, gidPortAttr, config.gidIdx);
+    memcpy(endpoint.handle.eth.gid, gidSel.gid.raw, sizeof(endpoint.handle.eth.gid));
+    endpoint.handle.eth.gidIdx = gidSel.gidIdx;
+    endpoint.vendorId = RdmaDeviceVendorId::Pensando;
+    endpoint.ibvHandle.qp = plainQp;
+    endpoint.ibvHandle.cq = plainCq;
+
+    proxyQpPool[plainQp->qp_num] = plainQp;
+    fprintf(stderr, "[MoRI-PROXY-QP]   Done: qpn=%u on %s\n",
+            plainQp->qp_num, GetRdmaDevice()->Name().c_str());
+    return endpoint;
+  }
+
   struct ibv_pd* pd = pd_uxdma[qp_counter & 1];
   qp_counter++;
   IonicCqContainer* cq = new IonicCqContainer(context, config, pd);
@@ -568,6 +611,37 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
 void IonicDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
                                          const RdmaEndpointHandle& remote, uint32_t qpn) {
   uint32_t local_qpn = local.qpn;
+
+  // Proxy mode: plain QP connection
+  if (proxyQpPool.find(local_qpn) != proxyQpPool.end()) {
+    ibv_qp* plainQp = proxyQpPool.at(local_qpn);
+    fprintf(stderr, "[MoRI-PROXY-QP] Connecting plain QP %u → remote %u\n", local_qpn, remote.qpn);
+
+    { ibv_qp_attr a{}; a.qp_state = IBV_QPS_INIT; a.port_num = local.portId;
+      a.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
+      int r = ibv_modify_qp(plainQp, &a, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+      fprintf(stderr, "[MoRI-PROXY-QP]   RST→INIT: %s\n", r ? strerror(r) : "OK"); }
+
+    { ibv_qp_attr a{}; a.qp_state = IBV_QPS_RTR; a.path_mtu = IBV_MTU_4096;
+      a.dest_qp_num = remote.qpn; a.rq_psn = remote.psn;
+      a.max_dest_rd_atomic = 1; a.min_rnr_timer = 12;
+      memcpy(&a.ah_attr.grh.dgid, remote.eth.gid, 16);
+      a.ah_attr.grh.sgid_index = local.eth.gidIdx; a.ah_attr.grh.hop_limit = 1;
+      a.ah_attr.is_global = 1; a.ah_attr.port_num = local.portId;
+      int r = ibv_modify_qp(plainQp, &a, IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+          IBV_QP_RQ_PSN | IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+      fprintf(stderr, "[MoRI-PROXY-QP]   INIT→RTR: %s\n", r ? strerror(r) : "OK"); }
+
+    { ibv_qp_attr a{}; a.qp_state = IBV_QPS_RTS; a.sq_psn = local.psn;
+      a.timeout = 14; a.retry_cnt = 7; a.rnr_retry = 7; a.max_rd_atomic = 1;
+      int r = ibv_modify_qp(plainQp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
+          IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC);
+      fprintf(stderr, "[MoRI-PROXY-QP]   RTR→RTS: %s\n", r ? strerror(r) : "OK"); }
+
+    fprintf(stderr, "[MoRI-PROXY-QP] Connected plain QP %u → remote %u\n", local_qpn, remote.qpn);
+    return;
+  }
+
   assert(qpPool.find(local_qpn) != qpPool.end());
   IonicQpContainer* qp = qpPool.at(local_qpn);
 

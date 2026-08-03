@@ -768,6 +768,7 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   }
 
   states->status = ShmemStatesStatus::Initialized;
+  fprintf(stderr, "[MoRI-PROXY] Shmem init COMPLETE (rank=%d)\n", states->gpuStates.rank);
   MORI_SHMEM_INFO("Shmem initialization completed");
   return 0;
 }
