@@ -315,10 +315,10 @@ def make_dispatch(
 
         if const_expr(enable_signal):
             # Self-reset total_recv (replaces the host-side total_recv.zero_()):
-            # only warp 0 accumulates into it in Phase 3, so warp 0 zeros it here
-            # and release-fences before the grid barrier; the Phase-2 acquire then
-            # orders the Phase-3 atomic adds after this zero. No other warp touches
-            # total_recv, so there is no cross-block race.
+            # only global warp 0 touches it — lane 0 zeros it here, all lanes
+            # accumulate into it in Phase 3. The waitcnt_all + grid barrier below
+            # drains this store before the Phase-3 adds; total_recv is local, so
+            # no release fence / L2 writeback is needed.
             if global_warp_id == 0:
                 if lane == 0:
                     buffer_store(
@@ -326,7 +326,6 @@ def make_dispatch(
                         create_buffer_resource_from_addr(addr_total_recv),
                         0,
                     )
-                P.fence_system_release()
 
             # ── Phase 2: grid barrier + per-peer count signal ──
             # s_barrier only syncs wavefronts; drain memory counters first so the
