@@ -702,7 +702,12 @@ class EpDispatchCombineOp:
         )
 
     def combine_in_view(self):
-        """out_tok as combine dtype [max_recv, hidden] — combine()'s copy target."""
+        """Symmetric buffer [max_recv, hidden] that combine() reads from via P2P.
+
+        To skip the d2d copy inside combine(), write expert output directly
+        into this view (e.g. point the GEMM output pointer here), then pass
+        it as the ``input`` argument to combine().  combine() detects the
+        matching data_ptr and elides the copy."""
         cdt = self.cfg.combine_dtype
         cols = (
             self.cfg.hidden_dim // 2
@@ -914,7 +919,6 @@ class EpDispatchCombineOp:
             # copy in the combine-dtype layout (not recv_tokens()'s dispatch view)
             dst = self.combine_in_view().view(-1)[: input.numel()]
             dst.copy_(input.reshape(-1))
-        self.combine_out.zero_()
         stream = fx.Stream(torch.cuda.current_stream())
         _, comb_spec = self._pick(routing.cur_rank_num_token)
         self._combine_variants[comb_spec](
