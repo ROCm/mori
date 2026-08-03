@@ -3845,6 +3845,77 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       if constexpr (_cPullType) {
         if (_cPullOk && (int)validAccumCount <= _cPullSrcMax) {
         const int _nSrc = (int)validAccumCount;
+        // ---- blockwise scale row, prefetched into registers, once per token per source ----
+        //
+        // WHAT IT REPLACES. Both folds below want one scale per source per vector, and srcScalePtrs
+        // is a PEER pointer into shmemInpScalesMemObj, which is hipDeviceMallocUncached
+        // (dispatch_combine.cpp:378). Read there, every one of those is a cross-card 4 B load
+        // sitting in the innermost loop with the arithmetic that needs it waiting behind it -- one
+        // fabric round trip per vector per source, ~28 x nSrc per token at hidden 7168, none of
+        // which can be cached or coalesced.
+        //
+        // WHY REGISTERS AND NOT SOMEWHERE ELSE. Measured in tools/g_micro.cc, which is this gather
+        // and nothing else on four cards, at 256 blocks x 16 warps, 4096 tokens, chunk 3584, fp8
+        // 105.8 MB of peer reads per card:
+        //     as it shipped (load per vector)                288.5 us
+        //     one lane per block loads, others shuffle       357.3 us   <- REJECTED
+        //     whole row into LDS once, read from LDS         131.9 us
+        //     whole row into REGISTERS once, read by shuffle 136.4 us   <- this
+        //     transport floor, fold deleted                   89.4 us
+        //     bf16 at the same point, twice the bytes        170.4 us
+        // The shuffle-only variant is the one that says what the cost really is: it issues the same
+        // NUMBER of fabric transactions as the prefetch and buys almost nothing, because what costs
+        // is not the count but that each load is serialised inside the fold. A prefetch issues the
+        // whole row back to back and waits once. LDS is 4 us better than registers and needs
+        // _combine_shared_mem() to reserve a region that matches to the byte; registers need no
+        // host-side agreement at all, and a silent layout mismatch is a worse failure than 3%.
+        //
+        // The bounds are what keep it in registers: scr must be indexed by a compile-time source
+        // index (an indexed local array goes to scratch, and the spill would cost more than the
+        // loads) and must be small, so this arm runs only for <= 4 sources and a scale row that
+        // fits 2 entries per lane. Everything else falls back to the direct load below.
+        constexpr int _cScSrcMax = 4;
+        constexpr int _cScReg = 2;
+        const int _cScDim = _cPullBwq ? args.fp8BlockwiseCombineScaleDim : 0;
+        const bool _cScOk =
+            _cPullBwq && (_cPullSrcMax <= _cScSrcMax) && (_cScDim <= _cScReg * warpSize);
+        float _cScReel[_cScSrcMax][_cScReg];
+#pragma unroll
+        for (int _j = 0; _j < _cScSrcMax; ++_j)
+#pragma unroll
+          for (int _r = 0; _r < _cScReg; ++_r) _cScReel[_j][_r] = 1.0f;
+        if (_cScOk) {
+#pragma unroll
+          for (int _j = 0; _j < _cScSrcMax; ++_j) {
+            if (_j >= _nSrc) continue;
+            const float* _sp = srcScalePtrs[_j];
+            if (_sp == nullptr) continue;
+#pragma unroll
+            for (int _r = 0; _r < _cScReg; ++_r) {
+              const int _k = _r * warpSize + laneId;
+              if (_k < _cScDim) _cScReel[_j][_r] = _sp[_k];
+            }
+          }
+        }
+        // Entry 0 of each row carries the producer's "this token really was scaled" sentinel as a
+        // negation, and entry 0 is lane 0's register 0. Undoing it once here means neither fold
+        // below has to test for it per element.
+        static_assert(_cScReg == 2, "_cScGet indexes the row as exactly two registers");
+#pragma unroll
+        for (int _j = 0; _j < _cScSrcMax; ++_j)
+          if (_cScOk && laneId == 0 && _cScReel[_j][0] < 0.0f) _cScReel[_j][0] = -_cScReel[_j][0];
+        // Reads block _sb of source _j out of the prefetched row. No integer division: the row is
+        // at most two registers deep, so the register index is a compare and the lane index a
+        // subtract.
+        auto _cScGet = [&](int _j, int _sb) -> float {
+          const bool _hi = (_sb >= warpSize);
+          const int _lane = _hi ? (_sb - warpSize) : _sb;
+          float _v = 1.0f;
+#pragma unroll
+          for (int _jj = 0; _jj < _cScSrcMax; ++_jj)
+            if (_jj == _j) _v = _hi ? _cScReel[_jj][1] : _cScReel[_jj][0];
+          return __shfl(_v, _lane);
+        };
 #if MORI_COMB_PIPE
         // Software pipeline for the PULL gather: issue chunk k+1's loads BEFORE folding chunk k, so
         // the fabric is never idle while the lanes are doing fp32 adds and the output store.
@@ -3953,12 +4024,15 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                 float _ps = 1.0f;
 #if !defined(MORI_COMB_QNOSC)
                 if constexpr (_cPullBwq) {
-                  // The producer negates entry 0 to mark "this token really was scaled", so entry 0
-                  // has to be undone before it is applied.
-                  const float* _sp = srcScalePtrs[_j];
-                  if (_sp != nullptr) {
-                    _ps = _sp[_pSb];
-                    if (_pSb == 0 && _ps < 0.0f) _ps = -_ps;
+                  if (_cScOk) {
+                    _ps = _cScGet(_j, _pSb);
+                  } else {
+                    // No prefetch here: read the peer's row directly, sentinel and all.
+                    const float* _sp = srcScalePtrs[_j];
+                    if (_sp != nullptr) {
+                      _ps = _sp[_pSb];
+                      if (_pSb == 0 && _ps < 0.0f) _ps = -_ps;
+                    }
                   }
                 }
 #endif
@@ -3985,6 +4059,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                 float _ts = 1.0f;
 #if !defined(MORI_COMB_QNOSC)
                 if constexpr (_cPullBwq) {
+                  // Direct read, for the same reason as the unpipelined tail below: lanes can have
+                  // different trip counts here and _cScGet is a wave-wide shuffle.
                   const float* _sp = srcScalePtrs[_j];
                   if (_sp != nullptr) {
                     _ts = _sp[_pTSb];
@@ -4156,12 +4232,18 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
               // this load, which is the shape of an 8x gap that half the bytes cannot explain.
 #if !defined(MORI_COMB_QNOSC)
               if constexpr (_cPullBwq) {
-                // Same sentinel the scalar dequant helpers use: the producer negates entry 0 to mark
-                // "this token really was scaled", so entry 0 has to be undone before it is applied.
-                const float* _sp = srcScalePtrs[_j];
-                if (_sp != nullptr) {
-                  _cScale = _sp[_cSb];
-                  if (_cSb == 0 && _cScale < 0.0f) _cScale = -_cScale;
+                if (_cScOk) {
+                  // Prefetched above, once per token per source. This is the load that was costing
+                  // 288.5us against 136.4 for the same gather with the row in registers.
+                  _cScale = _cScGet(_j, _cSb);
+                } else {
+                  // Same sentinel the scalar dequant helpers use: the producer negates entry 0 to
+                  // mark "this token really was scaled", so entry 0 is undone before it is applied.
+                  const float* _sp = srcScalePtrs[_j];
+                  if (_sp != nullptr) {
+                    _cScale = _sp[_cSb];
+                    if (_cSb == 0 && _cScale < 0.0f) _cScale = -_cScale;
+                  }
                 }
               }
 #endif
@@ -4196,6 +4278,9 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
               float _tScale = 1.0f;
 #if !defined(MORI_COMB_QNOSC)
               if constexpr (_cPullBwq) {
+                // Deliberately NOT the prefetched row: this tail loop is the one place where lanes
+                // can have different trip counts, and _cScGet is a shuffle, which needs the whole
+                // wave. It covers under a warp's worth of elements per chunk.
                 const float* _sp = srcScalePtrs[_j];
                 if (_sp != nullptr) {
                   _tScale = _sp[_tSb];
