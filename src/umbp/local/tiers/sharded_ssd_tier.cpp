@@ -22,10 +22,13 @@
 #include "umbp/local/tiers/sharded_ssd_tier.h"
 
 #include <algorithm>
+#include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/ssd_perf.h"
 
 namespace mori::umbp {
 
@@ -52,6 +55,29 @@ void RunPerShard(const std::vector<int>& busy_shards, int max_threads, Fn&& fn) 
   // Remaining buckets (including everything past the thread cap) run here.
   for (size_t i = spawn; i < busy_shards.size(); ++i) fn(busy_shards[i]);
   for (auto& t : workers) t.join();
+}
+
+// Render the per-drive fan-out of one batch as "s0:keys=64/32MiB/12.4ms ...".
+// Imbalance in `keys` means the placement policy is not spreading the batch;
+// per-shard times far below the batch wall time mean the drives are not
+// actually overlapping (too few io_threads, or one straggler drive).
+std::string FormatShardFanout(const std::vector<int>& busy,
+                              const std::vector<std::vector<size_t>>& buckets,
+                              const std::vector<size_t>& sizes, const std::vector<double>& shard_ms,
+                              size_t num_shards) {
+  std::ostringstream oss;
+  for (size_t s = 0; s < num_shards; ++s) {
+    if (s) oss << ' ';
+    uint64_t bytes = 0;
+    for (size_t i : buckets[s]) bytes += sizes[i];
+    oss << 's' << s << ":keys=" << buckets[s].size() << '/' << (bytes >> 20) << "MiB/";
+    oss.setf(std::ios::fixed);
+    oss.precision(2);
+    oss << shard_ms[s] << "ms";
+    oss.unsetf(std::ios::fixed);
+  }
+  if (busy.empty()) oss << " <no-busy-shards>";
+  return oss.str();
 }
 
 }  // namespace
@@ -315,7 +341,11 @@ std::vector<bool> ShardedSsdTier::BatchWrite(const std::vector<std::string>& key
     if (!buckets[s].empty()) busy.push_back(static_cast<int>(s));
   }
 
+  const auto t_fanout = ssdperf::Now();
+  std::vector<double> shard_ms(shards_.size(), 0.0);
+
   RunPerShard(busy, io_threads_, [&](int s) {
+    const auto t_shard = ssdperf::Now();
     const auto& idxs = buckets[s];
     std::vector<std::string> k;
     std::vector<const void*> d;
@@ -332,7 +362,23 @@ std::vector<bool> ShardedSsdTier::BatchWrite(const std::vector<std::string>& key
     for (size_t j = 0; j < idxs.size(); ++j) {
       results[idxs[j]] = j < shard_res.size() && shard_res[j];
     }
+    shard_ms[s] = ssdperf::MsSince(t_shard);  // disjoint shards: no race on shard_ms
   });
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = ssdperf::MsSince(t_fanout);
+    uint64_t bytes = 0;
+    for (size_t z : sizes) bytes += z;
+    double slowest = 0.0;
+    for (double m : shard_ms) slowest = std::max(slowest, m);
+    MORI_UMBP_INFO(
+        "[SsdPerf/shard] PUT drives={} io_threads={} busy={} keys={} bytes={} total_ms={:.3f} "
+        "GB_s={:.2f} slowest_drive_ms={:.3f} overlap={:.2f}x | {}",
+        shards_.size(), io_threads_, busy.size(), keys.size(), bytes, total_ms,
+        ssdperf::GbPerSec(bytes, total_ms), slowest,
+        total_ms > 0.0 ? std::accumulate(shard_ms.begin(), shard_ms.end(), 0.0) / total_ms : 0.0,
+        FormatShardFanout(busy, buckets, sizes, shard_ms, shards_.size()));
+  }
 
   // Roll back the map/hint for newly-assigned keys whose write failed, so a
   // retry is free to pick a different drive.
@@ -374,7 +420,11 @@ std::vector<bool> ShardedSsdTier::BatchReadIntoPtr(const std::vector<std::string
     if (!buckets[s].empty()) busy.push_back(static_cast<int>(s));
   }
 
+  const auto t_fanout = ssdperf::Now();
+  std::vector<double> shard_ms(shards_.size(), 0.0);
+
   RunPerShard(busy, io_threads_, [&](int s) {
+    const auto t_shard = ssdperf::Now();
     const auto& idxs = buckets[s];
     std::vector<std::string> k;
     std::vector<uintptr_t> d;
@@ -391,7 +441,27 @@ std::vector<bool> ShardedSsdTier::BatchReadIntoPtr(const std::vector<std::string
     for (size_t j = 0; j < idxs.size(); ++j) {
       results[idxs[j]] = j < shard_res.size() && shard_res[j];
     }
+    shard_ms[s] = ssdperf::MsSince(t_shard);  // disjoint shards: no race on shard_ms
   });
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = ssdperf::MsSince(t_fanout);
+    uint64_t bytes = 0, missing = 0;
+    for (size_t i = 0; i < keys.size(); ++i) bytes += sizes[i];
+    for (const auto& b : buckets) missing += b.size();
+    missing = keys.size() - missing;
+    double slowest = 0.0;
+    for (double m : shard_ms) slowest = std::max(slowest, m);
+    // overlap = sum(per-drive time) / wall time.  ~1.0 means the drives ran one
+    // after another (no parallelism); ~N means all N drives were busy at once.
+    MORI_UMBP_INFO(
+        "[SsdPerf/shard] GET drives={} io_threads={} busy={} keys={} unmapped={} bytes={} "
+        "total_ms={:.3f} GB_s={:.2f} slowest_drive_ms={:.3f} overlap={:.2f}x | {}",
+        shards_.size(), io_threads_, busy.size(), keys.size(), missing, bytes, total_ms,
+        ssdperf::GbPerSec(bytes, total_ms), slowest,
+        total_ms > 0.0 ? std::accumulate(shard_ms.begin(), shard_ms.end(), 0.0) / total_ms : 0.0,
+        FormatShardFanout(busy, buckets, sizes, shard_ms, shards_.size()));
+  }
   return results;
 }
 

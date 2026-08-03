@@ -85,6 +85,11 @@ class SSDTier : public TierBackend {
 
   bool EnsureActiveSegment(size_t need_bytes);
   bool RefreshFromDiskLocked(bool force_full_rescan);
+  // Startup repair: truncate each segment to the last record the scanner could
+  // parse.  Removes records from an older kRecordVersion and torn tails, both of
+  // which would otherwise make every subsequently appended record unreadable
+  // after a restart.  Owner-only; no-op for a fully-parsed segment.
+  void DropUnparsedTailsLocked();
   bool OpenOrCreateSegmentLocked(uint64_t segment_id);
 
   bool RefreshFollowerLocked() const;

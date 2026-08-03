@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/ssd_perf.h"
 #include "umbp/local/tiers/segment/segment_format.h"
 
 namespace fs = std::filesystem;
@@ -61,8 +62,48 @@ SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& s
   fs::create_directories(dir_);
   std::lock_guard<std::mutex> lock(mu_);
   RefreshFromDiskLocked(true);
+  DropUnparsedTailsLocked();
   if (!IsReadOnlyShared() && index_.Segments().empty()) {
     OpenOrCreateSegmentLocked(0);
+  }
+}
+
+void SSDTier::DropUnparsedTailsLocked() {
+  // A follower must never rewrite the shared log; the owner does this once at
+  // startup, before any write can land.
+  if (IsReadOnlyShared()) return;
+
+  for (auto& kv : index_.MutableSegments()) {
+    auto& seg = kv.second;
+    if (seg.fd < 0) continue;
+
+    struct stat st;
+    if (fstat(seg.fd, &st) != 0) continue;
+    const uint64_t file_size = static_cast<uint64_t>(st.st_size);
+    if (seg.scanned_offset >= file_size) continue;  // fully parsed, nothing to do
+
+    // Bytes past the last parsed record boundary are permanently unreachable:
+    // the scanner stops at the first header it cannot read and every later
+    // restart stops at the same place.  Two ways to get here --
+    //   * records written by an older kRecordVersion (e.g. the CRC-32/ISO-HDLC
+    //     v1 format that preceded CRC-32C), and
+    //   * a torn tail record from a crash mid-write.
+    // Either way, appending after them silently loses the new records on the
+    // next restart, so truncate instead.  Safe by construction: the SSD tier is
+    // a cache whose contents are re-fetchable.
+    const uint64_t dropped = file_size - seg.scanned_offset;
+    MORI_UMBP_WARN(
+        "[SSDTier] {}: dropping {}B of unreadable tail (stale record version or torn write); "
+        "segment truncated to the last valid record at offset {}",
+        seg.path, dropped, seg.scanned_offset);
+    if (ftruncate(seg.fd, static_cast<off_t>(seg.scanned_offset)) != 0) {
+      MORI_UMBP_ERROR("[SSDTier] {}: ftruncate to {} failed; segment left as-is", seg.path,
+                      seg.scanned_offset);
+      continue;
+    }
+    // Reset the append cursor too, otherwise the next write leaves a hole that
+    // the scanner would stop at all over again.
+    seg.write_offset = seg.scanned_offset;
   }
 }
 
@@ -157,14 +198,18 @@ bool SSDTier::Write(const std::string& key, const void* data, size_t size) {
 
   const size_t record_size = sizeof(segment::RecordHeader) + key.size() + size;
   segment::PreparedRecord pr;
+
+  // Phase 1a (no lock): checksum + assemble, same rationale as WriteBatch.
+  writer_->Build(key, data, size, &pr);
+
   int write_fd = -1;
   {
-    // Phase 1: reserve index space and build record buffer under mu_
+    // Phase 1b: reserve index space under mu_
     std::lock_guard<std::mutex> lock(mu_);
     if (!EnsureActiveSegment(record_size)) return false;
     auto* seg = GetSegmentLocked(index_.active_segment_id());
     if (!seg) return false;
-    if (!writer_->Prepare(key, data, size, seg, index_, &pr)) return false;
+    if (!writer_->Reserve(key, size, seg, index_, &pr)) return false;
     write_fd = seg->fd;
   }
 
@@ -205,11 +250,30 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
     return all_ok;
   }
 
+  // Stage timers for the [SsdPerf/tier] PUT breakdown (no-ops unless
+  // UMBP_SSD_TIMING is set).  `prepare` covers the CRC + record memcpy done
+  // under mu_, which is the stage that blocks concurrent reads on this drive.
+  const auto t_begin = ssdperf::Now();
+  double build_ms = 0.0, lock_ms = 0.0, reserve_ms = 0.0, io_ms = 0.0, sync_ms = 0.0;
+
+  // Phase 1a (NO lock): checksum + assemble every record.  This is the expensive
+  // half of the old Prepare() and it touches no shared state, so keeping it out
+  // of mu_ stops a write batch from blocking concurrent reads on this drive for
+  // the whole of its CRC + copy time.
+  std::vector<segment::PreparedRecord> built(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    writer_->Build(keys[i], data_ptrs[i], sizes[i], &built[i]);
+  }
+  build_ms = ssdperf::MsSince(t_begin);
+
   std::vector<segment::PreparedRecord> prepared;
   int write_fd = -1;
   {
-    // Phase 1: reserve index space and build record buffers under mu_
+    // Phase 1b: reserve index/segment space under mu_ (cheap: no CRC, no copy).
+    const auto t_lock = ssdperf::Now();
     std::lock_guard<std::mutex> lock(mu_);
+    const auto t_locked = ssdperf::Now();
+    lock_ms = ssdperf::MsBetween(t_lock, t_locked);
     if (!EnsureActiveSegment(total_bytes)) return false;
     auto* seg = GetSegmentLocked(index_.active_segment_id());
     if (!seg) return false;
@@ -217,22 +281,38 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
 
     prepared.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-      segment::PreparedRecord pr;
-      if (!writer_->Prepare(keys[i], data_ptrs[i], sizes[i], seg, index_, &pr)) continue;
-      prepared.push_back(std::move(pr));
+      if (!writer_->Reserve(keys[i], sizes[i], seg, index_, &built[i])) continue;
+      prepared.push_back(std::move(built[i]));
     }
+    reserve_ms = ssdperf::MsSince(t_locked);
   }
 
   if (prepared.empty()) return true;
 
   // Phase 2: perform I/O outside mu_
   const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
+  const auto t_io = ssdperf::Now();
   IoStatus status;
   if (needs_io_lock) {
     std::lock_guard<std::mutex> io_lock(io_mu_);
-    status = writer_->WriteRecords(write_fd, prepared, ShouldSyncOnWrite());
+    status = writer_->WriteRecords(write_fd, prepared, ShouldSyncOnWrite(), &sync_ms);
   } else {
-    status = writer_->WriteRecords(write_fd, prepared, ShouldSyncOnWrite());
+    status = writer_->WriteRecords(write_fd, prepared, ShouldSyncOnWrite(), &sync_ms);
+  }
+  io_ms = ssdperf::MsSince(t_io) - sync_ms;
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = ssdperf::MsSince(t_begin);
+    MORI_UMBP_INFO(
+        "[SsdPerf/tier] PUT dir={} keys={} bytes={} total_ms={:.3f} GB_s={:.2f} | "
+        "build_crc_memcpy={:.3f}ms ({:.0f}%, lock-free) mu_wait={:.3f}ms reserve={:.3f}ms "
+        "({:.0f}%, under mu_) dev_write={:.3f}ms ({:.0f}%) fsync={:.3f}ms ({:.0f}%) | "
+        "crc_GB_s={:.2f} dev_GB_s={:.2f} sync_on_write={}",
+        dir_, prepared.size(), total_bytes, total_ms, ssdperf::GbPerSec(total_bytes, total_ms),
+        build_ms, ssdperf::Pct(build_ms, total_ms), lock_ms, reserve_ms,
+        ssdperf::Pct(reserve_ms, total_ms), io_ms, ssdperf::Pct(io_ms, total_ms), sync_ms,
+        ssdperf::Pct(sync_ms, total_ms), ssdperf::GbPerSec(total_bytes, build_ms),
+        ssdperf::GbPerSec(total_bytes, io_ms), ShouldSyncOnWrite());
   }
 
   if (!status.ok()) {
@@ -309,9 +389,17 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
   std::vector<ReadLookup> lookups;
   lookups.reserve(keys.size());
 
+  // Stage timers for the [SsdPerf/tier] GET breakdown (no-ops unless
+  // UMBP_SSD_TIMING is set).  The three stages are disjoint and cover the whole
+  // call, so their percentages answer "device or CPU?" directly.
+  const auto t_begin = ssdperf::Now();
+  double lock_ms = 0.0, lookup_ms = 0.0, io_ms = 0.0, crc_ms = 0.0;
+
   // Phase 1 (mu_ held): batch index lookup + metadata extraction.
   {
     std::lock_guard<std::mutex> lock(mu_);
+    const auto t_locked = ssdperf::Now();
+    lock_ms = ssdperf::MsBetween(t_begin, t_locked);
 
     // Follower: do a single refresh if any key is missing.
     if (IsReadOnlyShared()) {
@@ -337,6 +425,7 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
       lookups.push_back({i, seg->fd, meta->value_offset, meta->crc32, sizes[i],
                          reinterpret_cast<void*>(dst_ptrs[i])});
     }
+    lookup_ms = ssdperf::MsSince(t_locked);
   }
 
   if (lookups.empty()) return results;
@@ -344,6 +433,7 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
   // Phase 2 (io_mu_ if needed): batch I/O.
   const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
   const bool use_batch = io_driver_->Capabilities().batch_read && lookups.size() > 1;
+  const auto t_io = ssdperf::Now();
 
   std::vector<bool> io_ok(lookups.size(), false);
 
@@ -397,15 +487,34 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
     }
   }
 
+  io_ms = ssdperf::MsSince(t_io);
+
   // Phase 3 (no lock): per-key CRC verification.
+  const auto t_crc = ssdperf::Now();
+  uint64_t verified_bytes = 0;
   for (size_t j = 0; j < lookups.size(); ++j) {
     if (!io_ok[j]) continue;
     const auto& lk = lookups[j];
+    verified_bytes += lk.size;
     if (segment::ComputeRecordCrc32(keys[lk.orig_idx], lk.dst, lk.size) != lk.expected_crc) {
       RememberStatus(IoStatus::Corruption("segment CRC mismatch"));
       continue;
     }
     results[lk.orig_idx] = true;
+  }
+  crc_ms = ssdperf::MsSince(t_crc);
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = lock_ms + lookup_ms + io_ms + crc_ms;
+    MORI_UMBP_INFO(
+        "[SsdPerf/tier] GET dir={} keys={} served={} bytes={} total_ms={:.3f} GB_s={:.2f} | "
+        "mu_wait={:.3f}ms index={:.3f}ms ({:.0f}%) dev_read={:.3f}ms ({:.0f}%) crc={:.3f}ms "
+        "({:.0f}%) | dev_GB_s={:.2f} crc_GB_s={:.2f} batched={}",
+        dir_, keys.size(), lookups.size(), verified_bytes, total_ms,
+        ssdperf::GbPerSec(verified_bytes, total_ms), lock_ms, lookup_ms,
+        ssdperf::Pct(lookup_ms, total_ms), io_ms, ssdperf::Pct(io_ms, total_ms), crc_ms,
+        ssdperf::Pct(crc_ms, total_ms), ssdperf::GbPerSec(verified_bytes, io_ms),
+        ssdperf::GbPerSec(verified_bytes, crc_ms), use_batch);
   }
 
   return results;

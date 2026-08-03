@@ -44,6 +44,7 @@
 #include "mori/io/backend.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
+#include "umbp/common/ssd_perf.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
@@ -3052,6 +3053,8 @@ void PoolClient::ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items
   std::lock_guard<std::mutex> op_lock(peer.ssd_op_mutex);
 
   const uint32_t max_attempts = SsdGetTransientMaxAttempts();
+  const auto t_perf = ssdperf::Now();
+  uint32_t rounds = 0;
 
   // Round 1 covers every key; later rounds only re-try the transient remainder
   // (the peer ran out of staging slots, or our lease expired before the RDMA).
@@ -3059,6 +3062,7 @@ void PoolClient::ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items
   for (size_t i = 0; i < items.size(); ++i) pending[i] = i;
 
   for (uint32_t attempt = 0; attempt < max_attempts && !pending.empty(); ++attempt) {
+    ++rounds;
     std::vector<BatchGetItem> round_items;
     round_items.reserve(pending.size());
     for (size_t slot : pending) round_items.push_back(items[slot]);
@@ -3068,6 +3072,27 @@ void PoolClient::ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items
     if (!pending.empty() && attempt + 1 < max_attempts) {
       std::this_thread::sleep_for(SsdGetRetryBackoff());
     }
+  }
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = ssdperf::MsSince(t_perf);
+    uint64_t served_bytes = 0, asked_bytes = 0;
+    size_t served = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+      asked_bytes += items[i].size;
+      if ((*per_item_ok)[i]) {
+        ++served;
+        served_bytes += items[i].size;
+      }
+    }
+    // dropped>0 with max_attempts=1 is the slot-cap cliff: those keys are
+    // reported as a cache miss even though the peer holds them on SSD.  Raise
+    // UMBP_SSD_GET_MAX_ATTEMPTS and/or ssd_staging_buffer_slots.
+    MORI_UMBP_INFO(
+        "[SsdPerf/remote] BATCH peer={} keys={} served={} dropped={} rounds={}/{} "
+        "asked_bytes={} served_bytes={} total_ms={:.3f} GB_s={:.2f}",
+        peer.peer_address, items.size(), served, items.size() - served, rounds, max_attempts,
+        asked_bytes, served_bytes, total_ms, ssdperf::GbPerSec(served_bytes, total_ms));
   }
 
   // Optional reader-side diagnostic: lease expiry is reader-local and never
@@ -3114,11 +3139,19 @@ std::vector<size_t> PoolClient::RemoteSsdBatchReadOnce(PeerConnection& peer,
     req.add_keys(*item.key);
     req.add_max_sizes(item.size);
   }
+  // Stage timers for the [SsdPerf/remote] breakdown (no-ops unless
+  // UMBP_SSD_TIMING is set).  `prepare_rpc` covers the peer's whole SSD read
+  // (the peer logs its own [SsdPerf/peer] / [SsdPerf/tier] split for the same
+  // window), `rdma` is the pull of the staged bytes.
+  const auto t_perf = ssdperf::Now();
+  double prepare_rpc_ms = 0.0, rdma_ms = 0.0, release_ms = 0.0;
+
   ::umbp::BatchPrepareSsdReadResponse resp;
   {
     grpc::ClientContext ctx;
     ctx.set_deadline(std::chrono::system_clock::now() + rpc_timeout);
     const grpc::Status rpc = stub->BatchPrepareSsdRead(&ctx, req, &resp);
+    prepare_rpc_ms = ssdperf::MsSince(t_perf);
     if (!rpc.ok()) {
       MORI_UMBP_DEBUG("[PoolClient] BatchPrepareSsdRead on '{}' failed (code={})",
                       peer.peer_address, static_cast<int>(rpc.error_code()));
@@ -3163,6 +3196,7 @@ std::vector<size_t> PoolClient::RemoteSsdBatchReadOnce(PeerConnection& peer,
 
   // ONE batched RDMA read for every staged key.  This is the throughput step:
   // the previous shape issued one Read per key and waited for each in turn.
+  const auto t_rdma = ssdperf::Now();
   std::vector<char> rdma_ok(staged.size(), 0);
   if (!staged.empty()) {
     std::vector<size_t> zc, staged_copy;
@@ -3259,6 +3293,8 @@ std::vector<size_t> PoolClient::RemoteSsdBatchReadOnce(PeerConnection& peer,
     }
   }
 
+  rdma_ms = ssdperf::MsSince(t_rdma);
+
   // Re-check the lease AFTER the transfers: bytes that landed past the deadline
   // are untrusted (the peer's reclaim point may have passed), so they become a
   // transient retry rather than a served key.
@@ -3279,7 +3315,32 @@ std::vector<size_t> PoolClient::RemoteSsdBatchReadOnce(PeerConnection& peer,
         break;  // not served, not retried
     }
   }
+  const auto t_release = ssdperf::Now();
   BatchReleaseSsdLeasesBestEffort(stub, leases);
+  release_ms = ssdperf::MsSince(t_release);
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = ssdperf::MsSince(t_perf);
+    uint64_t asked_bytes = 0, staged_bytes = 0;
+    for (const auto& item : items) asked_bytes += item.size;
+    for (size_t i : staged) staged_bytes += items[i].size;
+    size_t no_slot = 0, not_found = 0;
+    for (size_t i = 0; i < items.size() && i < static_cast<size_t>(resp.status_size()); ++i) {
+      if (resp.status(i) == ::umbp::SSD_READ_NO_SLOT) ++no_slot;
+      if (resp.status(i) == ::umbp::SSD_READ_NOT_FOUND) ++not_found;
+    }
+    // no_slot > 0 means the peer's read-staging pool (ssd_staging_buffer_slots)
+    // capped this round: only `staged` keys of `items` could be served at once,
+    // regardless of how many drives back the tier.
+    MORI_UMBP_INFO(
+        "[SsdPerf/remote] GET peer={} asked={} staged={} no_slot={} not_found={} "
+        "asked_bytes={} staged_bytes={} total_ms={:.3f} GB_s={:.2f} | prepare_rpc={:.3f}ms "
+        "({:.0f}%) rdma={:.3f}ms ({:.0f}%) release={:.3f}ms | rdma_GB_s={:.2f}",
+        peer.peer_address, items.size(), staged.size(), no_slot, not_found, asked_bytes,
+        staged_bytes, total_ms, ssdperf::GbPerSec(staged_bytes, total_ms), prepare_rpc_ms,
+        ssdperf::Pct(prepare_rpc_ms, total_ms), rdma_ms, ssdperf::Pct(rdma_ms, total_ms),
+        release_ms, ssdperf::GbPerSec(staged_bytes, rdma_ms));
+  }
   return transient;
 }
 

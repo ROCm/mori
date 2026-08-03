@@ -468,6 +468,24 @@ struct UMBPConfig {
     cfg.ssd.storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd.storage_dir);
     cfg.ssd.capacity_bytes = getenv_size("UMBP_SSD_CAPACITY", cfg.ssd.capacity_bytes);
     cfg.ssd.shard_io_threads = getenv_int("UMBP_SSD_SHARD_IO_THREADS", cfg.ssd.shard_io_threads);
+    // Durability of the SSD cache tier.  "strict" (default) fdatasync()s every
+    // batch write; "relaxed" leaves the data in the page cache and lets the
+    // kernel flush it.  Relaxed is safe for a pure cache — the bytes are
+    // re-fetchable, and the distributed peer discards leftover segments at
+    // startup anyway (see PeerSsdManager::DiscardLeftoverOnStartup) — so the
+    // flush buys nothing there while costing a large share of write time.
+    {
+      const std::string durability =
+          getenv_str("UMBP_SSD_DURABILITY",
+                     cfg.ssd.durability.mode == UMBPDurabilityMode::Relaxed ? "relaxed" : "strict");
+      if (durability == "relaxed" || durability == "RELAXED") {
+        cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+      } else if (durability == "strict" || durability == "STRICT") {
+        cfg.ssd.durability.mode = UMBPDurabilityMode::Strict;
+      }
+      // Any other value leaves the configured mode untouched; Validate() does
+      // not police this field, so silently keeping the default beats guessing.
+    }
     cfg.eviction.policy = getenv_str("UMBP_EVICTION_POLICY", cfg.eviction.policy);
     cfg.dram.high_watermark = getenv_double("UMBP_DRAM_HIGH_WM", cfg.dram.high_watermark);
     cfg.dram.low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram.low_watermark);

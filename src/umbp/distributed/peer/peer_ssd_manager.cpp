@@ -26,6 +26,7 @@
 #include <tuple>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/ssd_perf.h"
 #include "umbp/local/tiers/spdk_proxy_tier.h"
 #include "umbp/local/tiers/ssd_backend_factory.h"
 #include "umbp/local/tiers/ssd_tier.h"
@@ -225,6 +226,11 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
     return results;
   }
 
+  // Stage timers for the [SsdPerf/peer] PUT breakdown (no-ops unless
+  // UMBP_SSD_TIMING is set).
+  const auto t_begin = ssdperf::Now();
+  double dedup_ms = 0.0, backend_ms = 0.0, retry_ms = 0.0, record_ms = 0.0, evict_ms = 0.0;
+
   // Pass 1 — dedup under one lock.  Already-owned keys succeed with no IO (same
   // rationale as Write: a sequential re-put must not repeat the device write).
   std::vector<size_t> todo;
@@ -241,6 +247,8 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
       todo.push_back(i);
     }
   }
+  dedup_ms = ssdperf::MsSince(t_begin);
+  const size_t dedup_hits = keys.size() - todo.size();
   if (todo.empty()) return results;
 
   auto gather = [&](const std::vector<size_t>& idxs) {
@@ -261,15 +269,18 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
   // Pass 2 — one batched backend write outside the lock.  Failures are most
   // likely ENOSPC, so retry exactly those once after a single eviction round
   // (mirrors Write's evict-and-retry, amortized over the whole batch).
+  const auto t_backend = ssdperf::Now();
   auto [bk, bd, bz] = gather(todo);
   auto ok = backend_->BatchWrite(bk, bd, bz);
   ok.resize(todo.size(), false);
+  backend_ms = ssdperf::MsSince(t_backend);
 
   std::vector<size_t> retry;
   for (size_t j = 0; j < todo.size(); ++j) {
     if (!ok[j]) retry.push_back(todo[j]);
   }
   if (!retry.empty()) {
+    const auto t_retry = ssdperf::Now();
     EvictToLowWatermark();
     auto [rk, rd, rz] = gather(retry);
     auto retry_ok = backend_->BatchWrite(rk, rd, rz);
@@ -277,11 +288,13 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
     for (size_t j = 0, r = 0; j < todo.size(); ++j) {
       if (!ok[j]) ok[j] = retry_ok[r++];
     }
+    retry_ms = ssdperf::MsSince(t_retry);
   }
 
   // Pass 3 — record locations + ADD events under one lock.  The owned_ re-check
   // matches Write: a concurrent writer may have landed the same content-addressed
   // bytes, and only the first recorder emits ADD SSD.
+  const auto t_record = ssdperf::Now();
   uint64_t written_bytes = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -300,6 +313,7 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
     }
   }
   metrics_.copy_bytes.fetch_add(written_bytes, std::memory_order_relaxed);
+  record_ms = ssdperf::MsSince(t_record);
 
   for (size_t j = 0; j < todo.size(); ++j) {
     if (!ok[j]) {
@@ -309,9 +323,23 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
   }
 
   // One check-after-write for the whole batch instead of one per key.
+  const auto t_evict = ssdperf::Now();
   auto [used, total] = Capacity();
   if (total > 0 && static_cast<double>(used) >= high_watermark_ * static_cast<double>(total)) {
     EvictToLowWatermark();
+  }
+  evict_ms = ssdperf::MsSince(t_evict);
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = ssdperf::MsSince(t_begin);
+    MORI_UMBP_INFO(
+        "[SsdPerf/peer] PUT keys={} dedup_hits={} written={} bytes={} total_ms={:.3f} GB_s={:.2f} "
+        "| "
+        "dedup={:.3f}ms backend={:.3f}ms ({:.0f}%) evict_retry={:.3f}ms record={:.3f}ms "
+        "evict_check={:.3f}ms | used={}/{}B",
+        keys.size(), dedup_hits, todo.size(), written_bytes, total_ms,
+        ssdperf::GbPerSec(written_bytes, total_ms), dedup_ms, backend_ms,
+        ssdperf::Pct(backend_ms, total_ms), retry_ms, record_ms, evict_ms, used, total);
   }
   return results;
 }
@@ -524,6 +552,11 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
     return out;
   }
 
+  // Stage timers for the [SsdPerf/peer] GET breakdown (no-ops unless
+  // UMBP_SSD_TIMING is set).
+  const auto t_begin = ssdperf::Now();
+  double resolve_ms = 0.0, backend_ms = 0.0, release_ms = 0.0;
+
   // Pass 1 — resolve sizes and mark every servable key in flight under ONE lock
   // acquisition (the per-key path pays two per key).
   std::vector<size_t> todo;
@@ -551,7 +584,17 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
       todo.push_back(i);
     }
   }
-  if (todo.empty()) return out;
+  resolve_ms = ssdperf::MsSince(t_begin);
+  const size_t not_owned = keys.size() - todo.size();
+  if (todo.empty()) {
+    if (ssdperf::Enabled()) {
+      MORI_UMBP_INFO(
+          "[SsdPerf/peer] GET keys={} served=0 not_owned={} total_ms={:.3f} | resolve={:.3f}ms "
+          "(no backend IO: nothing owned locally)",
+          keys.size(), not_owned, ssdperf::MsSince(t_begin), resolve_ms);
+    }
+    return out;
+  }
 
   // Pass 2 — one batched backend read outside the lock; ShardedSsdTier turns
   // this into concurrent IO on every drive holding part of the batch.
@@ -566,11 +609,14 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
     d.push_back(reinterpret_cast<uintptr_t>(dsts[i]));
     z.push_back(out[i].size);
   }
+  const auto t_backend = ssdperf::Now();
   auto ok = backend_->BatchReadIntoPtr(k, d, z);
   ok.resize(todo.size(), false);
+  backend_ms = ssdperf::MsSince(t_backend);
 
   // Pass 3 — release the in-flight marks, refresh LRU for the reads that landed,
   // and wake a waiting ClearLocal once the last read drains.
+  const auto t_release = ssdperf::Now();
   uint64_t read_bytes = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -599,6 +645,21 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
     }
   }
   metrics_.read_bytes.fetch_add(read_bytes, std::memory_order_relaxed);
+  release_ms = ssdperf::MsSince(t_release);
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = ssdperf::MsSince(t_begin);
+    size_t served = 0;
+    for (size_t j = 0; j < todo.size(); ++j) {
+      if (ok[j]) ++served;
+    }
+    MORI_UMBP_INFO(
+        "[SsdPerf/peer] GET keys={} attempted={} served={} not_owned={} bytes={} total_ms={:.3f} "
+        "GB_s={:.2f} | resolve={:.3f}ms backend={:.3f}ms ({:.0f}%) release_lru={:.3f}ms",
+        keys.size(), todo.size(), served, not_owned, read_bytes, total_ms,
+        ssdperf::GbPerSec(read_bytes, total_ms), resolve_ms, backend_ms,
+        ssdperf::Pct(backend_ms, total_ms), release_ms);
+  }
   return out;
 }
 

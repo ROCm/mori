@@ -32,6 +32,13 @@ namespace mori::umbp {
 std::unique_ptr<TierBackend> MakeFileSsdBackend(const UMBPSsdConfig& ssd_config,
                                                 SSDAccessMode access_mode) {
   const std::vector<std::string> dirs = ssd_config.StorageDirs();
+  // Surface the resolved durability mode once: "strict" fdatasync()s every batch
+  // write and, on a real drive, dominates write time.  UMBP_SSD_DURABILITY.
+  MORI_UMBP_INFO("[MakeFileSsdBackend] drives={} durability={} io_backend={} queue_depth={}",
+                 dirs.size(),
+                 ssd_config.durability.mode == UMBPDurabilityMode::Strict ? "strict" : "relaxed",
+                 ssd_config.io.backend == UMBPIoBackend::IoUring ? "io_uring" : "posix",
+                 ssd_config.io.queue_depth);
   if (dirs.size() == 1) {
     return std::make_unique<SSDTier>(dirs[0], ssd_config.capacity_bytes, ssd_config, access_mode);
   }
