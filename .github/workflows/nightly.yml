@@ -261,7 +261,8 @@ jobs:
 
       - name: MORI-EP bench
         run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE \
+            -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
             timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
             timeout 120 python3 tests/python/ops/bench_dispatch_combine.py \
@@ -305,7 +306,8 @@ jobs:
 
       - name: MORI-EP async kernel bench (intranode)
         run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE \
+            -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
             PORT=12390
             for TOKENS in 64 128; do
@@ -513,8 +515,8 @@ jobs:
             --ifname $NODE2_IFNAME
             -- --op-type write --transfer-batch-size 128 --all
             --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4
-            --enable-sess --enable-batch-transfer
-            --num-qp-per-transfer 2 --num-worker-threads 2
+            --batch-contiguous --disable-chunking --enable-sess --enable-batch-transfer
+            --num-qp-per-transfer 8 --num-worker-threads 8
             --num-initiator-dev 8 --num-target-dev 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
@@ -523,8 +525,8 @@ jobs:
             --ifname $NODE1_IFNAME \
             -- --op-type write --transfer-batch-size 128 --all \
             --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 \
-            --enable-sess --enable-batch-transfer \
-            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --batch-contiguous --disable-chunking --enable-sess --enable-batch-transfer \
+            --num-qp-per-transfer 8 --num-worker-threads 8 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
 
@@ -538,8 +540,8 @@ jobs:
             --rank 1 --master-addr $NODE1_HOST --master-port $PORT
             --ifname $NODE2_IFNAME
             -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8
-            --enable-batch-transfer --enable-sess --poll_cq_mode event
-            --num-qp-per-transfer 2 --num-worker-threads 2
+            --batch-contiguous --disable-chunking --enable-batch-transfer --enable-sess --poll_cq_mode event
+            --num-qp-per-transfer 8 --num-worker-threads 8
             --num-initiator-dev 8 --num-target-dev 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
@@ -547,8 +549,8 @@ jobs:
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME \
             -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 \
-            --enable-batch-transfer --enable-sess --poll_cq_mode event \
-            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --batch-contiguous --disable-chunking --enable-batch-transfer --enable-sess --poll_cq_mode event \
+            --num-qp-per-transfer 8 --num-worker-threads 8 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
 
@@ -560,13 +562,15 @@ jobs:
             for TOKENS in 64 128 1024 2048 4096; do
               echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
               NODE2_CMD=(
-                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+                $CT exec -e MORI_INTERNODE_TIMEOUT=600
+                -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO $CONTAINER bash $SCRIPT
                 --rank 1 --master-addr $NODE1_HOST --master-port $PORT
                 --ifname $NODE2_IFNAME
                 --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
               )
               ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 \
+                -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO $CONTAINER bash $SCRIPT \
                 --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
                 --ifname $NODE1_IFNAME \
                 --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
