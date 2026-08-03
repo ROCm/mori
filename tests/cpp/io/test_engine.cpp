@@ -45,6 +45,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/io/io.hpp"
+#include "mori/utils/host_utils.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/rdma/common.hpp"
 
@@ -1604,14 +1605,17 @@ int RunHiddenDeviceImporter(const char* shmPath) {
   XgmiBackendConfig xgmiCfg{};
   engine.CreateBackend(BackendType::XGMI, xgmiCfg);
 
-  // Register the remote engine so IsSameNodeEngine returns true
+  // Register the remote engine so IsSameNodeEngine returns true.
+  // nodeId must be resolved the same way IOEngine/XgmiBackend do (boot_id when
+  // available, falling back to hostname) -- otherwise it can mismatch this
+  // process's own resolved node id and make IsSameNodeEngine spuriously fail.
   EngineDesc remoteEngDesc;
   remoteEngDesc.key = remoteDesc.engineKey;
   {
     char hostname[HOST_NAME_MAX];
     gethostname(hostname, HOST_NAME_MAX);
     remoteEngDesc.hostname = std::string(hostname);
-    remoteEngDesc.nodeId = remoteEngDesc.hostname;
+    remoteEngDesc.nodeId = mori::ResolveNodeId(remoteEngDesc.hostname);
   }
   remoteEngDesc.host = "127.0.0.1";
   remoteEngDesc.port = 0;
