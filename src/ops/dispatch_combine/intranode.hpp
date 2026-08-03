@@ -4248,6 +4248,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
           // instead (what this did while T and TokT were the same type) asks for a 32B store on the
           // 4-byte token type, which has no vector. bf16 gives 8 elems / 16B read and fp32 gives 4
           // elems / 16B read, both exactly as before; the fp8 tile gives 8 elems / 8B read.
+          // Compile-time bound for the unrolled fold under MORI_COMB_FOLDU. 4 covers the geometry
+          // this kernel ships at -- the destPe dedup caps live sources at worldSize -- and anything
+          // above it takes the plain loop instead of growing the register array.
+          constexpr int _cRedSrcMax = 4;
           constexpr int _cOutVB = 16;
           constexpr int _cV = _cOutVB / (int)sizeof(T);
           constexpr int _cVB = _cV * (int)sizeof(TokT);
@@ -4270,8 +4274,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             // Absolute position drives the scale block; _e is only the offset inside this chunk.
             const int _cSb =
                 _cPullBwq ? (int)((hiddenDimOffset + (size_t)_off + (size_t)_e) / _cBlkElems) : 0;
-            for (int _j = 0; _j < _nRed; ++_j) {
-              if (_CROW_DEAD(_j)) continue;
+            // One row's contribution, factored out only so the two source loops below can share it.
+            auto _cFoldRow = [&](int _j, const _CVecT& _sv) {
               float _cScale = 1.0f;
               // WRONG RESULTS ON PURPOSE under MORI_COMB_QNOSC, same family as NOREDUCE/NOPUSH:
               // fold the fp8 bytes with a scale of 1 and leave EVERYTHING else -- the transport,
@@ -4302,20 +4306,55 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                 }
               }
 #endif
-              // Dereferenced directly rather than through core::load<16>: that takes a const void*,
-              // which addrspacecasts the LDS pointer to generic and leaves it to InferAddressSpaces
-              // to recover ds_read_b128 instead of a flat_load. Keeping the typed addrspace(3)
-              // pointer makes it unconditional. The 16B alignment it needs is why the tile base is
-              // rounded to 128B above. The global store below keeps core::load/store's nontemporal
-              // path, which is what WarpAccumLF uses and is right for the output.
-              _CVecT _sv =
-                  *reinterpret_cast<const _CVecT*>(_cPullTiles + (size_t)_j * _rowStride + _e);
 #pragma unroll
               for (int _k = 0; _k < _cV; ++_k) {
                 const float _v = (float)(reinterpret_cast<const TokT*>(&_sv)[_k]);
                 _a[_k] += _cPullBwq ? (_v * _cScale) : _v;
               }
+            };
+            // Dereferenced directly rather than through core::load<16>: that takes a const void*,
+            // which addrspacecasts the LDS pointer to generic and leaves it to InferAddressSpaces
+            // to recover ds_read_b128 instead of a flat_load. Keeping the typed addrspace(3)
+            // pointer makes it unconditional. The 16B alignment it needs is why the tile base is
+            // rounded to 128B above. The global store below keeps core::load/store's nontemporal
+            // path, which is what WarpAccumLF uses and is right for the output.
+#define _CROW_AT(_j) \
+  (*reinterpret_cast<const _CVecT*>(_cPullTiles + (size_t)(_j) * _rowStride + _e))
+#if defined(MORI_COMB_FOLDU)
+            // Read every source before consuming any of them, so the ds_read_b128s issue back to
+            // back instead of each waiting on the previous accumulate. _nRed is a runtime value, so
+            // the plain loop below cannot be unrolled and the reads stay serialised -- that is the
+            // whole cost this removes, and it is why the bound here has to be a compile-time
+            // constant with a runtime guard, the same shape as _cScSrcMax above. A runtime index
+            // into _svR would put it in scratch, which costs more than the latency it hides.
+            //
+            // WHY IT MATTERS MORE THAN IT LOOKS: the binding constraint is 64 CU x 8 warp
+            // (.cursor/rules/ep-dispatch.mdc), i.e. two waves per SIMD, which cannot cover an LDS
+            // read latency by thread parallelism -- and adding warps is what the rule forbids. ILP
+            // inside the wave is the only lever left. MEASURED in tools/tdm_redsim.cc at 64x8:
+            // 98.10 -> 77.87us on the full fold, 76.99 -> 57.26 with the loads deleted. Going wider
+            // than one position at a time (RED_UNROLL=2) gives it back to register pressure, 80.24.
+            if (_nRed <= _cRedSrcMax) {
+              _CVecT _svR[_cRedSrcMax];
+#pragma unroll
+              for (int _j = 0; _j < _cRedSrcMax; ++_j) {
+                if (_j >= _nRed || _CROW_DEAD(_j)) continue;
+                _svR[_j] = _CROW_AT(_j);
+              }
+#pragma unroll
+              for (int _j = 0; _j < _cRedSrcMax; ++_j) {
+                if (_j >= _nRed || _CROW_DEAD(_j)) continue;
+                _cFoldRow(_j, _svR[_j]);
+              }
+            } else
+#endif
+            {
+              for (int _j = 0; _j < _nRed; ++_j) {
+                if (_CROW_DEAD(_j)) continue;
+                _cFoldRow(_j, _CROW_AT(_j));
+              }
             }
+#undef _CROW_AT
             union {
               _COutVecT _ov;
               T _oe[_cV];
