@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 #include "mori/core/transport/p2p/device_primitives.hpp"
 using CombFp8 = mori::core::CombineInternalFp8;
@@ -108,6 +109,13 @@ __device__ __forceinline__ void IssueLoad(void* lds, const void* src,
 //        the arithmetic that needs them. Mode 2 issues all 56 back to back and waits once.
 //        5 = the row prefetched into REGISTERS instead of LDS (scaleDim/warpSize = 2 per lane) and
 //        read back by shuffle. Same parallel issue as 2, no LDS, so no host-side layout to agree.
+//        6 = no prefetch at all: 4 elements per lane instead of 8, so a wave covers exactly one
+//        scale block and sb is WAVE-UNIFORM. sc[j][sb] is then a uniform address and the compiler
+//        can issue it on the scalar unit -- one load per source per step instead of one per lane.
+//        This is the mode that asks whether modes 2/4/5 are solving the wrong problem: they all
+//        assume the row has to be fetched once and distributed, when the divergence that makes
+//        distribution necessary is a consequence of the fold's own lane mapping. It pays with
+//        8 B output stores instead of 16 B.
 // NSRCC: sources issued per chunk, a compile-time constant so the wait immediate can be one.
 template <int ELEMB, int PIPE, int DEQ, int NSRCC>
 __global__ __launch_bounds__(1024) void gmicro(unsigned short* __restrict__ out,
@@ -204,7 +212,21 @@ __global__ __launch_bounds__(1024) void gmicro(unsigned short* __restrict__ out,
         if (laneId == 0) o[off] = (unsigned short)tb[0];
         return;
       }
-      const int V = 8;  // 16 B out per lane, as in the kernel
+      // 8 elements per lane is what the kernel does: a 16 B output store, and 32 lanes covering 256
+      // elements, which at blockElems 128 is TWO scale blocks. That is what makes sb lane-varying
+      // and forces every scheme above to move a value between lanes.
+      //
+      // Mode 6 asks whether the transfer is needed at all: at 4 elements per lane a wave covers
+      // exactly 128 elements, one scale block, so sb is WAVE-UNIFORM and sc[j][sb] is a uniform
+      // address the compiler can put on the scalar unit. No prefetch, no shuffle, no LDS -- one
+      // scalar load per source per step. It pays for that with half-width output stores, so it is
+      // only better if the scale traffic really is what dominates.
+      constexpr int V = (DEQ == 6 && ELEMB == 1) ? 4 : 8;
+      // Explicit vector types rather than memcpy: the tile is in LDS, and a typed load is what
+      // makes this a ds_read of the right width instead of leaving it to the address-space pass.
+      using InW = std::conditional_t<ELEMB == 2, uint4,
+                                     std::conditional_t<(V == 8), uint64_t, uint32_t>>;
+      using OutW = std::conditional_t<(V == 8), uint4, uint2>;
       const int nv = (n / (warpSize * V)) * (warpSize * V);
       for (int e = laneId * V; e < nv; e += warpSize * V) {
         float a[V];
@@ -242,25 +264,24 @@ __global__ __launch_bounds__(1024) void gmicro(unsigned short* __restrict__ out,
             if (sb == 0 && s < 0.f) s = -s;
           }
           const char* row = tb + (size_t)j * chunkElems * ELEMB + (size_t)e * ELEMB;
-          if (ELEMB == 1) {
-            const uint64_t w = *reinterpret_cast<const uint64_t*>(row);
+          const InW w = *reinterpret_cast<const InW*>(row);
+          if constexpr (ELEMB == 1) {
             const unsigned char* p = reinterpret_cast<const unsigned char*>(&w);
 #pragma unroll
             for (int k = 0; k < V; ++k) a[k] += f8f(p[k]) * s;
           } else {
-            const uint4 w = *reinterpret_cast<const uint4*>(row);
             const unsigned short* p = reinterpret_cast<const unsigned short*>(&w);
 #pragma unroll
             for (int k = 0; k < V; ++k) a[k] += bf2f(p[k]);
           }
         }
         union {
-          uint4 ov;
+          OutW ov;
           unsigned short oe[V];
         };
 #pragma unroll
         for (int k = 0; k < V; ++k) oe[k] = f2bf(a[k]);
-        *reinterpret_cast<uint4*>(o + off + e) = ov;
+        *reinterpret_cast<OutW*>(o + off + e) = ov;
       }
       for (int e = nv + laneId; e < n; e += warpSize) {
         float acc = 0.f;
@@ -479,12 +500,14 @@ int main() {
             case 3: _GLAUNCH((gmicro<1, 0, 3, 4>)); break;
             case 4: _GLAUNCH((gmicro<1, 0, 4, 4>)); break;
             case 5: _GLAUNCH((gmicro<1, 0, 5, 4>)); break;
+            case 6: _GLAUNCH((gmicro<1, 0, 6, 4>)); break;
             case 8: _GLAUNCH((gmicro<1, 1, 0, 4>)); break;
             case 9: _GLAUNCH((gmicro<1, 1, 1, 4>)); break;
             case 10: _GLAUNCH((gmicro<1, 1, 2, 4>)); break;
             case 11: _GLAUNCH((gmicro<1, 1, 3, 4>)); break;
             case 12: _GLAUNCH((gmicro<1, 1, 4, 4>)); break;
             case 13: _GLAUNCH((gmicro<1, 1, 5, 4>)); break;
+            case 14: _GLAUNCH((gmicro<1, 1, 6, 4>)); break;
             case 16: _GLAUNCH((gmicro<2, 0, 0, 4>)); break;
             case 19: _GLAUNCH((gmicro<2, 0, 3, 4>)); break;
             case 24: _GLAUNCH((gmicro<2, 1, 0, 4>)); break;
