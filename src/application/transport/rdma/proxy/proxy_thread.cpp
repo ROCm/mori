@@ -79,7 +79,7 @@ void ProxyThread::MainLoop() {
         ibv_sge sge{};
         sge.addr = cmd->src_addr;
         sge.length = cmd->length;
-        sge.lkey = cmd->lkey;
+        sge.lkey = (qph.lkey_override != 0) ? qph.lkey_override : cmd->lkey;
 
         ibv_send_wr wr{};
         wr.wr_id = next_slot_;

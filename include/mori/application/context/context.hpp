@@ -195,6 +195,9 @@ class Context {
 
   std::unique_ptr<RdmaContext> rdmaContext{nullptr};
   std::unique_ptr<RdmaDeviceContext> rdmaDeviceContext{nullptr};
+  // One context per available RDMA device (rail). Index = QP slot index.
+  // For non-rail-isolated fabrics this has exactly one entry (same as rdmaDeviceContext).
+  std::vector<std::unique_ptr<RdmaDeviceContext>> allRdmaDeviceContexts;
 
   std::vector<RdmaEndpoint> rdmaEps;
   bool initialEndpointsBuilt{false};

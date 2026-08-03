@@ -243,6 +243,25 @@ void Context::InitializeTopologyAndTransports() {
                   devicePortId, device->Name());
   }
 
+  // Build per-rail device contexts for rail-affinity QP pairing.
+  // On rail-isolated fabrics (e.g. Pensando AINIC), QP index qp must use
+  // allRdmaDeviceContexts[qp % N] so each QP's advertised GID is that
+  // rail's own GID. On non-rail-isolated fabrics all N entries are equivalent.
+  allRdmaDeviceContexts.clear();
+  for (const auto& dp : activeDevicePortList) {
+    RdmaDeviceContext* ctx = dp.first->CreateRdmaDeviceContext();
+    if (ctx != nullptr) {
+      allRdmaDeviceContexts.emplace_back(ctx);
+    }
+  }
+  if (allRdmaDeviceContexts.empty() && rdmaDeviceContext) {
+    // Fallback: no devices in list but primary context exists — include it.
+    allRdmaDeviceContexts.emplace_back(
+        rdmaDeviceContext->GetRdmaDevice()->CreateRdmaDeviceContext());
+  }
+  MORI_APP_INFO("rank {} allRdmaDeviceContexts size: {}", LocalRank(),
+                allRdmaDeviceContexts.size());
+
   int numQpPerPe = 4;
   const char* envNumQp = std::getenv("MORI_NUM_QP_PER_PE");
   if (envNumQp != nullptr) {
@@ -380,11 +399,22 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
 void Context::BuildAndConnectInitialEndpoints() {
   // Build the worldSize × numQpPerPe rdmaEps vector. Non-RDMA peer slots are
   // populated with empty stubs to keep the indexing uniform.
+  //
+  // Rail-affinity QP pairing for rail-isolated fabrics (e.g. Pensando AINIC):
+  // QP slot `qp` is created from allRdmaDeviceContexts[qp % N] so that each
+  // QP's advertised GID is the GID of ionic_qp, not always ionic_0. After
+  // AllToAll exchange the remote side's ModifyInit2Rtr sets dgid = remote
+  // ionic_qp GID, enabling same-rail routing. On non-rail-isolated fabrics
+  // (e.g. CX7) allRdmaDeviceContexts has 1 entry and behaviour is unchanged.
+  const int numRailContexts = static_cast<int>(allRdmaDeviceContexts.size());
   rdmaEps.reserve(static_cast<size_t>(WorldSize()) * numQpPerPe);
   for (int i = 0; i < WorldSize(); i++) {
     if (transportTypes[i] == TransportType::RDMA) {
       for (int qp = 0; qp < numQpPerPe; qp++) {
-        RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig);
+        RdmaDeviceContext* ctx = (numRailContexts > 1)
+            ? allRdmaDeviceContexts[qp % numRailContexts].get()
+            : rdmaDeviceContext.get();
+        RdmaEndpoint ep = ctx->CreateRdmaEndpoint(savedEpConfig);
         rdmaEps.push_back(ep);
       }
     } else {
@@ -395,24 +425,30 @@ void Context::BuildAndConnectInitialEndpoints() {
   }
 
   // Exchange endpoint handles via AllToAll (worldSize × numQpPerPe handles).
+  // Each handle carries the GID for its specific rail so that ModifyInit2Rtr
+  // on the remote side uses the matching rail's GID as dgid.
   int totalEps = WorldSize() * numQpPerPe;
   std::vector<RdmaEndpointHandle> localToPeerEpHandles(totalEps);
   std::vector<RdmaEndpointHandle> peerToLocalEpHandles(totalEps);
-  for (int i = 0; i < rdmaEps.size(); i++) {
+  for (int i = 0; i < (int)rdmaEps.size(); i++) {
     localToPeerEpHandles[i] = rdmaEps[i].handle;
   }
   bootNet.AllToAll(localToPeerEpHandles.data(), peerToLocalEpHandles.data(),
                    sizeof(RdmaEndpointHandle) * numQpPerPe);
 
   // Connect each RDMA peer's QPs (INIT -> RTR -> RTS).
+  // Use the rail-indexed context so ConnectEndpoint finds the QP in its qpPool.
   for (int peer = 0; peer < WorldSize(); peer++) {
     if (transportTypes[peer] != TransportType::RDMA) {
       continue;
     }
     for (int qp = 0; qp < numQpPerPe; qp++) {
       int epIndex = peer * numQpPerPe + qp;
-      rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[epIndex],
-                                         peerToLocalEpHandles[epIndex], qp);
+      RdmaDeviceContext* ctx = (numRailContexts > 1)
+          ? allRdmaDeviceContexts[qp % numRailContexts].get()
+          : rdmaDeviceContext.get();
+      ctx->ConnectEndpoint(localToPeerEpHandles[epIndex],
+                           peerToLocalEpHandles[epIndex], qp);
     }
   }
 }
@@ -442,7 +478,11 @@ std::vector<RdmaEndpoint> Context::CreateAdditionalEndpoints(int qpPerPe,
       continue;
     }
     for (int qp = 0; qp < qpPerPe; qp++) {
-      RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig);
+      const int nCtx = static_cast<int>(allRdmaDeviceContexts.size());
+      RdmaDeviceContext* ctx = (nCtx > 1)
+          ? allRdmaDeviceContexts[qp % nCtx].get()
+          : rdmaDeviceContext.get();
+      RdmaEndpoint ep = ctx->CreateRdmaEndpoint(savedEpConfig);
       eps.push_back(ep);
     }
   }
@@ -465,7 +505,11 @@ void Context::ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, i
     if (!ShouldCreateQpForPeer(peer, LocalRank(), peerCaps, peerMask)) continue;
     for (int qp = 0; qp < qpPerPe; qp++) {
       int idx = peer * qpPerPe + qp;
-      rdmaDeviceContext->ConnectEndpoint(localHandles[idx], peerHandles[idx], qp);
+      const int nCtx = static_cast<int>(allRdmaDeviceContexts.size());
+      RdmaDeviceContext* ctx = (nCtx > 1)
+          ? allRdmaDeviceContexts[qp % nCtx].get()
+          : rdmaDeviceContext.get();
+      ctx->ConnectEndpoint(localHandles[idx], peerHandles[idx], qp);
     }
   }
 }
