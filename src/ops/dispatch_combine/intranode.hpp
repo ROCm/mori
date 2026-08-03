@@ -3885,9 +3885,19 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 #pragma unroll
           for (int _r = 0; _r < _cScReg; ++_r) _cScReel[_j][_r] = 1.0f;
         if (_cScOk) {
+          // All _cScSrcMax rows, not just the first _nSrc. The two folds below index srcScalePtrs by
+          // a ROW index, and which index space that is depends on the path: the chunked fold uses
+          // the compacted slot (dense in [0, validAccumCount)), the gather fold uses destPe (dense
+          // in [0, worldSize) with a mask). Prefetching [0, _nSrc) would be right for the first and
+          // silently hand back 1.0 for a live high-numbered PE in the second. Making this a plain
+          // cache of srcScalePtrs[_j][k], with no opinion about which _j the fold will ask for, is
+          // what makes it equivalent to the direct load it replaces. Every entry of the array is
+          // written above -- a pointer or nullptr -- so reading all four is in bounds, and the cost
+          // is the ~0.55 rows per token by which worldSize exceeds the average live count.
 #pragma unroll
           for (int _j = 0; _j < _cScSrcMax; ++_j) {
-            if (_j >= _nSrc) continue;
+            // The array is topk-wide, and topk can be under 4.
+            if (_j >= (int)config.numExpertPerToken) continue;
             const float* _sp = srcScalePtrs[_j];
             if (_sp == nullptr) continue;
 #pragma unroll
@@ -3910,11 +3920,21 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         auto _cScGet = [&](int _j, int _sb) -> float {
           const bool _hi = (_sb >= warpSize);
           const int _lane = _hi ? (_sb - warpSize) : _sb;
-          float _v = 1.0f;
+          float _v0 = 1.0f, _v1 = 1.0f;
 #pragma unroll
           for (int _jj = 0; _jj < _cScSrcMax; ++_jj)
-            if (_jj == _j) _v = _hi ? _cScReel[_jj][1] : _cScReel[_jj][0];
-          return __shfl(_v, _lane);
+            if (_jj == _j) {
+              _v0 = _cScReel[_jj][0];
+              _v1 = _cScReel[_jj][1];
+            }
+          // Both shuffles, then select -- NOT select then one shuffle. Which register a lane wants
+          // depends on that lane's own _sb, so selecting first makes each lane broadcast the
+          // register the SOURCE lane happened to want, and a caller asking for entry 40 gets entry
+          // 8. At hidden 7168 the row is 56 entries over a 32-lane wave, so both halves are live in
+          // the same wave and it is wrong for real, not just in principle.
+          const float _r0 = __shfl(_v0, _lane);
+          const float _r1 = __shfl(_v1, _lane);
+          return _hi ? _r1 : _r0;
         };
 #if MORI_COMB_PIPE
         // Software pipeline for the PULL gather: issue chunk k+1's loads BEFORE folding chunk k, so

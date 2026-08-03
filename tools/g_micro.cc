@@ -224,7 +224,13 @@ __global__ __launch_bounds__(1024) void gmicro(unsigned short* __restrict__ out,
           if (j >= nSrc) continue;
           float s = 1.f;
           if (ELEMB == 1 && DEQ == 5) {
-            s = __shfl(scr[j][sb / warpSize], sb % warpSize);
+            // Shuffle BOTH registers and then select. Selecting first and shuffling once is wrong:
+            // which register a lane wants depends on that lane's own sb, so it would broadcast
+            // whichever register the SOURCE lane wanted. Both halves of the row are live in the
+            // same wave here (56 entries, 32 lanes), so it is wrong in this configuration.
+            const float r0 = __shfl(scr[j][0], sb % warpSize);
+            const float r1 = __shfl(scr[j][1], sb % warpSize);
+            s = (sb >= warpSize) ? r1 : r0;
             if (sb == 0 && s < 0.f) s = -s;
           } else if (ELEMB == 1 && DEQ == 4) {
             float t = 0.f;
@@ -381,8 +387,15 @@ int main() {
     // fp8 reading, so bf16 runs are timed only.
     CK(hipMemset(dv[d].stage, 0x38, stageElems * elemB));
     CK(hipMemset(dv[d].out, 0, (size_t)nTok * hid * sizeof(unsigned short)));
+    // Entry k of every row is k+1, not a constant. It used to be 2.0 everywhere, and that made the
+    // check below blind to WHICH entry a mode read: the register-prefetch mode had an indexing bug
+    // that returned a different entry of the right row and still passed. Distinct values also stay
+    // exact through the bf16 store -- 4 sources x entry 56 is 224, inside bf16's integer range.
     float* hs = (float*)malloc(scaleElems * sizeof(float));
-    for (size_t i = 0; i < scaleElems; ++i) hs[i] = ((i % scaleDim) == 0) ? -2.0f : 2.0f;
+    for (size_t i = 0; i < scaleElems; ++i) {
+      const size_t k = i % scaleDim;
+      hs[i] = (k == 0) ? -1.0f : (float)(k + 1);
+    }
     CK(hipMemcpy(dv[d].scales, hs, scaleElems * sizeof(float), hipMemcpyHostToDevice));
     free(hs);
     CK(hipStreamCreate(&dv[d].stream));
@@ -509,21 +522,24 @@ int main() {
         }
         char verdict[32] = "";
         if (check && elemB == 1 && deq != 0 && deq != 3) {
-          // Every byte is fp8 1.0 and every scale is 2.0 (entry 0 negated), so a token folds to
-          // exactly 2 * live sources. A wrong row stride, a skipped source or a dropped scale all
-          // move this.
+          // Every byte is fp8 1.0 and entry k of every scale row is k+1 (entry 0 negated), so
+          // element e of a token folds to exactly (e/blockElems + 1) * live sources. Varying with e
+          // is the point: it catches reading the wrong entry of the right row, which a constant row
+          // cannot. A wrong row stride, a skipped source or a dropped scale still move it too.
           CK(hipSetDevice(0));
           const int nchk = nTok < 32 ? nTok : 32;
           unsigned short* h = (unsigned short*)malloc((size_t)nchk * hid * 2);
           CK(hipMemcpy(h, dv[0].out, (size_t)nchk * hid * 2, hipMemcpyDeviceToHost));
+          const int blockElems = (hid + scaleDim - 1) / scaleDim;
           long bad = 0;
           for (int t = 0; t < nchk; ++t) {
-            const float want = 2.0f * __builtin_popcount((unsigned)hMask[t]);
-            unsigned u;
-            memcpy(&u, &want, 4);
-            const unsigned short wbf = (unsigned short)(u >> 16);
-            for (int e = 0; e < hid; ++e)
-              if (h[(size_t)t * hid + e] != wbf) ++bad;
+            const float live = (float)__builtin_popcount((unsigned)hMask[t]);
+            for (int e = 0; e < hid; ++e) {
+              const float want = live * (float)(e / blockElems + 1);
+              unsigned u;
+              memcpy(&u, &want, 4);
+              if (h[(size_t)t * hid + e] != (unsigned short)(u >> 16)) ++bad;
+            }
           }
           snprintf(verdict, sizeof(verdict), bad ? " BAD %ld" : " ok", bad);
           free(h);
