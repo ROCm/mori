@@ -732,7 +732,12 @@ def _comb_diag_defines() -> list[str]:
     NOPUSH+PUSHONLY, which prices a barrier that no longer resembles the real one -- nothing
     staggers the blocks' arrival, no peer is still pushing, and the launch cannot be separated out.
 
-    Every flag left in this list is a DELETION or a diagnostic, which is what makes "off" the right
+    MORI_COMB_FOLDVEC is the one exception to that: it is CORRECTNESS-PRESERVING, and it is here
+    only because it needs the same -D and cache-key plumbing. It routes PUSH's fold through the 16B
+    lane-load gather (WarpAccumLF) instead of the TDM tile path, to price the LDS round trip the
+    tile path pays for data each byte of which is read exactly once. See _cPullOk in intranode.hpp.
+
+    Every other flag in this list is a DELETION or a diagnostic, which is what makes "off" the right
     default for all of them. The push loop's token ORDER used to be selected from here too --
     MORI_COMB_SPREAD (prime-step bijection), MORI_COMB_RUNRR (bucket by peer, flattened take) and
     MORI_COMB_RUNRRQ (bucket by peer, queued take) -- and that was a category error: reordering is
@@ -756,6 +761,7 @@ def _comb_diag_defines() -> list[str]:
             "MORI_COMB_PUSHONLY",
             "MORI_COMB_NOWEIGHT",
             "MORI_COMB_NOROUTE",
+            "MORI_COMB_FOLDVEC",
             "MORI_COMB_DUMPCNT",
             "MORI_COMB_QNOSC",
         )

@@ -2833,7 +2833,25 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
        ~(size_t)127) +
       (size_t)warpNum * ((MORI_COMB_PIPE && UseP2PRead) ? ((MORI_COMB_PIPE) < 2 ? 2 : (MORI_COMB_PIPE)) : 1) *
           _cPullSrcMax * _cPullTileElems * sizeof(TokT);
-  const bool _cPullOk = _cPullType && ((int)hiddenDim >= _cPullRowElems) &&
+  // MORI_COMB_FOLDVEC sends PUSH's fold down the 16B lane-load gather at the bottom of this chain
+  // (WarpAccumLF) instead of the TDM tile path. CORRECTNESS-PRESERVING -- both fold the same sources
+  // in fp32, they differ only in how the bytes arrive -- and the only member of the gate list in
+  // jit/core.py that is not a deletion; it is there because it needs the same -D and cache-key
+  // plumbing. PULL is left alone so the QUAD fold is not disturbed.
+  //
+  // What it asks: a reduce reads each byte exactly once, so staging it in LDS buys no reuse and
+  // costs a round trip plus a tensorcnt drain per chunk, and the tile pins all 115712 B of LDS,
+  // which caps how much can be in flight. DeepEP's reduce epilogue does the same job with plain
+  // vector loads straight into registers, unrolled 2-4 deep (combine_utils.cuh combine_reduce).
+  // MEASURED here at 64x8 EP4 PUSH by deletion: fetch+writeback is 108.7us for 293.6 MB, 2701 GB/s
+  // against 6.3 TB/s of local bandwidth.
+#if defined(MORI_COMB_FOLDVEC)
+  constexpr bool _cFoldVec = true;
+#else
+  constexpr bool _cFoldVec = false;
+#endif
+  const bool _cPullOk = _cPullType && !(_cFoldVec && !UseP2PRead) &&
+                        ((int)hiddenDim >= _cPullRowElems) &&
                         (_cPullTileElems >= _cPullRowElems) &&
                         (!UseP2PRead || _cPullLdsNeed <= (size_t)MORI_COMB_LDS_BUDGET);
   TokT* _cPullTiles = nullptr;
