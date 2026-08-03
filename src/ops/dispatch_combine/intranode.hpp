@@ -3924,11 +3924,21 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
           using _PVecT = typename core::VecTypeSelector<_pVB>::dataType;
           using _POutVecT = typename core::VecTypeSelector<_pOutVB>::dataType;
           // blockElems is a multiple of _pV, so one vector never straddles two scale blocks and the
-          // scale is loaded once per source per vector, exactly as at :4063.
+          // scale is loaded once per source per vector, exactly as _cBlkElems does in the
+          // unpipelined fold below.
           const int _pBlkElems =
               _cPullBwq ? (int)((hiddenDim + args.fp8BlockwiseCombineScaleDim - 1) /
                                 args.fp8BlockwiseCombineScaleDim)
                         : 1;
+          // The deletion knobs have to be honoured HERE as well as in the unpipelined fold below,
+          // or a pricing run that happens to take this path reports the deleted term as free and
+          // the two paths stop being comparable -- the same way the cache key once made every
+          // diagnostic read zero. Both are WRONG RESULTS ON PURPOSE; pair with MORI_BENCH_SKIPCHECK.
+#if defined(MORI_COMB_NOREDUCE)
+          const int _pNRed = 1;
+#else
+          const int _pNRed = _nSrc;
+#endif
           auto _foldChunk = [&](size_t _o, int _n, const TokT* _tb) {
             const bool _vecOk = ((hiddenDim % (size_t)_pV) == 0) &&
                                 ((hiddenDimOffset % (size_t)_pV) == 0) && ((_tile % _pV) == 0);
@@ -3939,8 +3949,9 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
               for (int _k = 0; _k < _pV; ++_k) _a[_k] = 0.0f;
               const int _pSb =
                   _cPullBwq ? (int)((hiddenDimOffset + _o + (size_t)_e) / _pBlkElems) : 0;
-              for (int _j = 0; _j < _nSrc; ++_j) {
+              for (int _j = 0; _j < _pNRed; ++_j) {
                 float _ps = 1.0f;
+#if !defined(MORI_COMB_QNOSC)
                 if constexpr (_cPullBwq) {
                   // The producer negates entry 0 to mark "this token really was scaled", so entry 0
                   // has to be undone before it is applied.
@@ -3950,6 +3961,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                     if (_pSb == 0 && _ps < 0.0f) _ps = -_ps;
                   }
                 }
+#endif
                 _PVecT _sv = *reinterpret_cast<const _PVecT*>(_tb + (size_t)_j * _tile + _e);
 #pragma unroll
                 for (int _k = 0; _k < _pV; ++_k) {
@@ -3969,8 +3981,9 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
               float _acc = 0.0f;
               const int _pTSb =
                   _cPullBwq ? (int)((hiddenDimOffset + _o + (size_t)_e) / _pBlkElems) : 0;
-              for (int _j = 0; _j < _nSrc; ++_j) {
+              for (int _j = 0; _j < _pNRed; ++_j) {
                 float _ts = 1.0f;
+#if !defined(MORI_COMB_QNOSC)
                 if constexpr (_cPullBwq) {
                   const float* _sp = srcScalePtrs[_j];
                   if (_sp != nullptr) {
@@ -3978,6 +3991,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                     if (_pTSb == 0 && _ts < 0.0f) _ts = -_ts;
                   }
                 }
+#endif
                 const float _v = (float)(_tb[(size_t)_j * _tile + _e]);
                 _acc += _cPullBwq ? (_v * _ts) : _v;
               }
