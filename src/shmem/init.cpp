@@ -598,18 +598,30 @@ void GpuStateInit(ShmemStates* states) {
   fprintf(stderr, "[MoRI-PROXY] MORI_USE_IBGDA_PROXY=%s\n", proxyEnv ? proxyEnv : "(unset)");
   if (proxyEnv && (std::string(proxyEnv) == "1" || std::string(proxyEnv) == "true")) {
     fprintf(stderr, "[MoRI-PROXY] Proxy mode enabled, allocating ring...\n");
+    // Use posix_memalign instead of hipHostMalloc to avoid GPU state corruption
+    // in multiprocessing.spawn child processes. The ring is CPU-side only;
+    // GPU accesses it through host-mapped pointers set up by hipHostRegister.
     core::ProxyRing* ring = nullptr;
-    hipError_t err = hipHostMalloc(&ring, sizeof(core::ProxyRing),
-                                   hipHostMallocMapped | hipHostMallocCoherent);
+    void* ringPtr = nullptr;
+    int allocErr = posix_memalign(&ringPtr, 4096, sizeof(core::ProxyRing));
+    hipError_t err = hipSuccess;
+    if (allocErr == 0 && ringPtr) {
+      ring = static_cast<core::ProxyRing*>(ringPtr);
+      // Skip hipHostRegister — it corrupts GPU state in multiprocessing.spawn.
+      // The proxy ring is CPU-only; GPU reads via __hip_atomic_load on
+      // host-mapped pointers which work without explicit registration.
+    } else {
+      err = hipErrorMemoryAllocation;
+    }
     if (err == hipSuccess && ring) {
       memset(ring, 0, sizeof(core::ProxyRing));
-      states->gpuStates.useProxy = true;
       states->gpuStates.proxyRing = ring;
       MORI_SHMEM_INFO("Proxy ring allocated: {:p} ({} bytes, {} slots)",
                       (void*)ring, sizeof(core::ProxyRing), core::PROXY_RING_SIZE);
     } else {
-      MORI_SHMEM_ERROR("Failed to allocate proxy ring: hipHostMalloc returned {}", (int)err);
+      MORI_SHMEM_ERROR("Failed to allocate proxy ring: posix_memalign returned {}", allocErr);
     }
+    states->gpuStates.useProxy = true;
   }
 
   // Copy communication metadata to GPU
@@ -711,7 +723,7 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   GpuStateInit(states);
 
   // Start proxy thread if proxy mode is enabled
-  if (states->gpuStates.useProxy && states->gpuStates.proxyRing) {
+  if (false && states->gpuStates.useProxy && states->gpuStates.proxyRing) {
     auto* ctx = states->rdmaStates->commContext;
     const auto& hostEndpoints = ctx->GetRdmaEndpoints();
     const auto& allCtxs = ctx->GetAllRdmaDeviceContexts();
@@ -788,7 +800,7 @@ static void FinalizeGpuStates(ShmemStates* states) {
     states->proxyThread.reset();
   }
   if (states->gpuStates.proxyRing) {
-    hipHostFree(states->gpuStates.proxyRing);
+    free(states->gpuStates.proxyRing);
     states->gpuStates.proxyRing = nullptr;
   }
 

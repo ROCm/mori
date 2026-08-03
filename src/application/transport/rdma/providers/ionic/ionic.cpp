@@ -480,14 +480,7 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
 
 IonicDeviceContext::IonicDeviceContext(RdmaDevice* rdma_device, ibv_context* context, ibv_pd* in_pd)
     : RdmaDeviceContext(rdma_device, in_pd) {
-  const char* proxyEnv = std::getenv("MORI_USE_IBGDA_PROXY");
-  bool useProxy = proxyEnv && (std::string(proxyEnv) == "1" || std::string(proxyEnv) == "true");
-  if (!useProxy) {
-    create_parent_domain(context, in_pd);
-  } else {
-    fprintf(stderr, "[MoRI-PROXY] Skipping parent domain creation for %s (proxy mode)\n",
-            rdma_device->Name().c_str());
-  }
+  create_parent_domain(context, in_pd);
 }
 
 IonicDeviceContext::~IonicDeviceContext() {
