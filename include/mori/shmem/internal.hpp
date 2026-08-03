@@ -25,6 +25,7 @@
 #include <cassert>  // assert() — used in device code below, needed in both host/device compiles
 
 #include "mori/application/application_device_types.hpp"
+#include "mori/core/transport/rdma/proxy/proxy_types.hpp"
 #include "mori/core/utils/utils.hpp"
 #include "mori/hip_compat.hpp"
 #include "mori/utils/limits.hpp"
@@ -128,6 +129,9 @@ struct GpuStates {
   uintptr_t heapEndAddr{0};                   // End address of symmetric heap (base + size)
   application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
   uint64_t* internalSyncPtr{nullptr};         // Pointer to the internal synchronization object
+
+  bool useProxy{false};
+  core::ProxyRing* proxyRing{nullptr};
 };
 
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)

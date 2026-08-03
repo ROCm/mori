@@ -25,6 +25,7 @@
 
 #include "mori/application/application_device_types.hpp"
 #include "mori/core/core.hpp"
+#include "mori/core/transport/rdma/proxy/proxy_device_primitives.hpp"
 #include "mori/shmem/internal.hpp"
 
 namespace mori {
@@ -257,6 +258,19 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
 
 inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+
+  // Proxy path: wait for all pending proxy ops to complete.
+  // Conservative: scans entire ring for any PENDING slots.
+  if (globalGpuStates->useProxy && globalGpuStates->proxyRing) {
+    uint32_t head = globalGpuStates->proxyRing->gpu_head;
+    if (head > core::PROXY_RING_SIZE) {
+      core::ProxyQuiet(globalGpuStates->proxyRing, head - core::PROXY_RING_SIZE, core::PROXY_RING_SIZE);
+    } else {
+      core::ProxyQuiet(globalGpuStates->proxyRing, 0, head);
+    }
+    return;
+  }
+
   const int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle& wqHandle = globalGpuStates->rdmaEndpoints[epIndex].wqHandle;
   core::CompletionQueueHandle& cqHandle = globalGpuStates->rdmaEndpoints[epIndex].cqHandle;
@@ -546,6 +560,16 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     }
     MORI_PRINTF("blockIdx.x=%d, threadIdx.x=%d, remaining=%zu, transfer_size=%zu\n", blockIdx.x,
                 threadIdx.x, remaining, transfer_size);
+
+    // Proxy path: bypass IBGDA, use CPU proxy thread for RDMA posting
+    if (globalGpuStates->useProxy && globalGpuStates->proxyRing) {
+      core::ProxyPostWrite(globalGpuStates->proxyRing, epIndex,
+                           srcAddr, lkey, raddr, rkey, transfer_size);
+      remaining -= transfer_size;
+      currentOffset += transfer_size;
+      continue;
+    }
+
     // Post RDMA write (unified code for both fast and slow paths)
     uint32_t warp_sq_counter{0};
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
