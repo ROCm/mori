@@ -497,6 +497,13 @@ __device__ unsigned long long _comb_timing_call_idx = 0ull;
 #ifndef MORI_COMB_PIPE
 #define MORI_COMB_PIPE 0
 #endif
+// Prefetch a blockwise source's whole scale row into registers once per token instead of reading
+// one scale per source per vector out of the peer's uncached allocation.
+// Correctness-preserving, default ON. See the note at _cScReel in the combine reduce loop; 0 is
+// there so the prefetch can be priced in one binary-honest A/B.
+#ifndef MORI_COMB_SCPRE
+#define MORI_COMB_SCPRE 1
+#endif
 // Decompose the PULL gather by source (one warp per source, whole-token reads) instead of by
 // hidden-dim chunk. The value is the number of tile buffers per warp (1 or 2 both mean 2).
 // Correctness-preserving. See the note above the reduce loop.
@@ -3870,6 +3877,13 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         // _combine_shared_mem() to reserve a region that matches to the byte; registers need no
         // host-side agreement at all, and a silent layout mismatch is a worse failure than 3%.
         //
+        // Those four figures were taken with a version that read the row with ONE shuffle, which
+        // was wrong (see _cScGet) and which the microbench could not tell, because its scale row
+        // was a constant and reading the wrong entry of it gave the right answer. Both are fixed;
+        // the traffic is unchanged and the extra cost is one ds_bpermute per source per vector, so
+        // treat 136.4 as an underestimate of this code until MORI_COMB_SCPRE=0/1 re-prices it in
+        // the kernel itself, which is what that gate is for.
+        //
         // The bounds are what keep it in registers: scr must be indexed by a compile-time source
         // index (an indexed local array goes to scratch, and the spill would cost more than the
         // loads) and must be small, so this arm runs only for <= 4 sources and a scale row that
@@ -3877,27 +3891,24 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         constexpr int _cScSrcMax = 4;
         constexpr int _cScReg = 2;
         const int _cScDim = _cPullBwq ? args.fp8BlockwiseCombineScaleDim : 0;
-        const bool _cScOk =
-            _cPullBwq && (_cPullSrcMax <= _cScSrcMax) && (_cScDim <= _cScReg * warpSize);
+        const bool _cScOk = (MORI_COMB_SCPRE) && _cPullBwq && (_cPullSrcMax <= _cScSrcMax) &&
+                            (_cScDim <= _cScReg * warpSize);
         float _cScReel[_cScSrcMax][_cScReg];
 #pragma unroll
         for (int _j = 0; _j < _cScSrcMax; ++_j)
 #pragma unroll
           for (int _r = 0; _r < _cScReg; ++_r) _cScReel[_j][_r] = 1.0f;
+        // [0, _nSrc) is the right range because srcScalePtrs is indexed here by the COMPACTED slot,
+        // and that has to be argued rather than assumed: the other fold in this loop indexes the
+        // same array by destPe instead (_CROW_DEAD below reads _peMask, and _rowCnt is worldSize
+        // there), and prefetching the compacted range for that one would hand back 1.0 for a live
+        // high-numbered PE. It cannot happen: _cPullBwq requires UseP2PRead (:2685) and _cGatherOk
+        // requires !UseP2PRead (:2859), so blockwise and the destPe-indexed fold are mutually
+        // exclusive, and every _j that reaches _cScGet is a compacted slot below validAccumCount.
         if (_cScOk) {
-          // All _cScSrcMax rows, not just the first _nSrc. The two folds below index srcScalePtrs by
-          // a ROW index, and which index space that is depends on the path: the chunked fold uses
-          // the compacted slot (dense in [0, validAccumCount)), the gather fold uses destPe (dense
-          // in [0, worldSize) with a mask). Prefetching [0, _nSrc) would be right for the first and
-          // silently hand back 1.0 for a live high-numbered PE in the second. Making this a plain
-          // cache of srcScalePtrs[_j][k], with no opinion about which _j the fold will ask for, is
-          // what makes it equivalent to the direct load it replaces. Every entry of the array is
-          // written above -- a pointer or nullptr -- so reading all four is in bounds, and the cost
-          // is the ~0.55 rows per token by which worldSize exceeds the average live count.
 #pragma unroll
           for (int _j = 0; _j < _cScSrcMax; ++_j) {
-            // The array is topk-wide, and topk can be under 4.
-            if (_j >= (int)config.numExpertPerToken) continue;
+            if (_j >= _nSrc) continue;
             const float* _sp = srcScalePtrs[_j];
             if (_sp == nullptr) continue;
 #pragma unroll

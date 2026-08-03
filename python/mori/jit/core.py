@@ -574,7 +574,23 @@ def _comb_pipe_defines() -> list[str]:
     out.append(f"-DMORI_COMB_QWIDE={_comb_qwide()}")
     out.append(f"-DMORI_COMB_RELFENCE={_comb_relfence()}")
     out.append(f"-DMORI_COMB_QSCW={_comb_qscw()}")
+    out.append(f"-DMORI_COMB_SCPRE={_comb_scpre()}")
     return out
+
+
+def _comb_scpre() -> int:
+    """Prefetch a blockwise source's whole scale row into registers once per token, instead of
+    reading one scale per source per vector out of the peer's uncached allocation.
+
+    Correctness-preserving; default ON. 0 exists so the prefetch can be PRICED in one binary-honest
+    A/B rather than across two commits, which is the only kind of before/after this tree accepts --
+    and the closest thing available before it existed was MORI_COMB_QNOSC, which deletes the scales
+    entirely and is wrong by construction, so it could only bracket the answer.
+    """
+    val = os.environ.get("MORI_COMB_SCPRE", "").strip().lower()
+    if val in ("0", "false", "off", "no"):
+        return 0
+    return 1
 
 
 def _comb_qscw() -> int:
