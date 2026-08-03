@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 // bench_engine.cpp
 //
 // A C++ benchmark for MORI-IO whose measurement methodology exactly matches
@@ -29,238 +50,545 @@
 //      TRANSFER, matching nixl's total_duration/(per_thread_iter*batch_size)
 //      (nixl counts block_size*batch_size descriptors per request).
 //
-// Rendezvous: 2 processes (one per node), TCP socket exchange of EngineDesc and
-// MemoryDesc (msgpack, same as MORI's pybind pack()/unpack()). Rank 0 =
-// initiator, rank 1 = target. Initiator drives all transfers (RDMA one-sided
-// WRITE/READ); target only registers memory and waits.
+// Rendezvous: 2 processes (one per node) exchange EngineDesc and MemoryDesc over
+// mori::application::SocketBootstrapNetwork (msgpack, same as MORI's pybind
+// pack()/unpack()).
+// Rank 0 = initiator, rank 1 = target. Initiator drives all transfers (RDMA
+// one-sided WRITE/READ); target only registers memory and waits.
 //
-// Build: see build.sh (links libmori_io + libmori_application from the editable
-// install, includes 3rdparty/msgpack-c + HIP).
+// Build: the `bench_engine` target in tests/cpp/CMakeLists.txt (needs
+// -DBUILD_IO=ON). Run `bench_engine --help` for the flag list, and see
+// docs/MORI-IO-BENCHMARK.md for the two-node walkthrough.
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
+#include <msgpack.hpp>
 #include <optional>
+#include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
-#include <hip/hip_runtime.h>
-#include <msgpack.hpp>
-
+#include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/io/io.hpp"
 
 using namespace mori::io;
 using Clock = std::chrono::steady_clock;
 
-#define HIP_CHECK(expr)                                                                   \
-  do {                                                                                    \
-    hipError_t _e = (expr);                                                               \
-    if (_e != hipSuccess) {                                                               \
-      std::cerr << "HIP error " << hipGetErrorString(_e) << " at " << __FILE__ << ":"     \
-                << __LINE__ << std::endl;                                                 \
-      std::exit(1);                                                                       \
-    }                                                                                     \
+namespace {
+
+// A local HIP_CHECK, as in the other standalone tests and benchmarks. It throws
+// rather than terminating, like the one in examples/collective/intra_node, so a
+// failure unwinds through main() and releases the memory registration before the
+// pages it covers; mori::application::HIP_RUNTIME_CHECK cannot be used here
+// because it exits the process and would leave the MR behind.
+[[noreturn]] void ThrowHipError(hipError_t e, const char* file, int line) {
+  throw std::runtime_error(std::string("HIP error ") + hipGetErrorString(e) + " at " + file + ":" +
+                           std::to_string(line));
+}
+
+}  // namespace
+
+#define HIP_CHECK(expr)                                          \
+  do {                                                           \
+    hipError_t _e = (expr);                                      \
+    if (_e != hipSuccess) ThrowHipError(_e, __FILE__, __LINE__); \
   } while (0)
 
-// ------------------------- tiny TCP rendezvous -----------------------------
-// Rank 0 listens, rank 1 connects. Then symmetric length-prefixed blob swap.
+namespace {
 
-static int TcpListenAccept(uint16_t port) {
-  int lfd = socket(AF_INET, SOCK_STREAM, 0);
-  int opt = 1;
-  setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port = htons(port);
-  if (bind(lfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    perror("bind");
-    std::exit(1);
+// --------------------------- buffer ownership -------------------------------
+// Owns the benchmark buffer together with its NIC registration. The backend
+// holds an MR over these pages, so the registration has to be dropped before
+// they are released -- on every exit path, including one taken by an exception
+// from the engine or the bootstrap. That ordering requirement is why this is a
+// scope guard instead of two calls at the end of the run.
+class BenchBuffer {
+ public:
+  BenchBuffer(IOEngine& engine, size_t bytes, int device, MemoryLocationType loc)
+      : engine(engine), cpu(loc == MemoryLocationType::CPU) {
+    if (cpu)
+      HIP_CHECK(hipHostMalloc(&ptr, bytes, 0));
+    else
+      HIP_CHECK(hipMalloc(&ptr, bytes));
+    try {
+      desc = engine.RegisterMemory(ptr, bytes, device, loc);
+    } catch (...) {
+      Free();
+      throw;
+    }
+    registered = true;
   }
-  listen(lfd, 1);
-  int fd = accept(lfd, nullptr, nullptr);
-  close(lfd);
-  return fd;
+
+  ~BenchBuffer() {
+    // Teardown of a failing run must not mask the original error, so both steps
+    // report instead of throwing.
+    if (registered) {
+      try {
+        engine.DeregisterMemory(desc);
+      } catch (const std::exception& e) {
+        std::cerr << "DeregisterMemory failed: " << e.what() << std::endl;
+      }
+    }
+    Free();
+  }
+
+  BenchBuffer(const BenchBuffer&) = delete;
+  BenchBuffer& operator=(const BenchBuffer&) = delete;
+
+  void* Data() const { return ptr; }
+  const MemoryDesc& Desc() const { return desc; }
+
+ private:
+  void Free() {
+    if (!ptr) return;
+    hipError_t e = cpu ? hipHostFree(ptr) : hipFree(ptr);
+    if (e != hipSuccess) {
+      std::cerr << "buffer free failed: " << hipGetErrorString(e) << std::endl;
+    }
+    ptr = nullptr;
+  }
+
+  IOEngine& engine;
+  const bool cpu;
+  void* ptr{nullptr};
+  bool registered{false};
+  MemoryDesc desc;
+};
+
+// ------------------------------ validation ---------------------------------
+// The Python benchmark checks correctness as part of the run (benchmark.py
+// _validate_rdma): it performs a transfer, ships the target's buffer back over
+// the control plane and byte-compares it against the initiator's source. We do
+// the same check here, but exchange a per-slot checksum instead of the payload,
+// so validating a multi-hundred-MiB sweep point stays O(batch) on the wire while
+// still covering every transferred byte.
+//
+// Both buffers are seeded with a rank-dependent, offset-dependent pattern, so an
+// un-issued transfer, a short transfer, or one landing at the wrong offset all
+// leave the two sides disagreeing.
+
+uint64_t Fnv1a(const uint8_t* p, size_t n, uint64_t h = 1469598103934665603ull) {
+  for (size_t i = 0; i < n; ++i) {
+    h ^= p[i];
+    h *= 1099511628211ull;
+  }
+  return h;
 }
 
-static int TcpConnect(const std::string& host, uint16_t port) {
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-  inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-  for (int retry = 0; retry < 100; ++retry) {
-    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) return fd;
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+// Byte at absolute offset p is a function of (p, rank), so the two ranks start
+// out differing everywhere and every byte position is distinguishable.
+void FillPattern(void* buf, size_t bytes, int rank) {
+  constexpr size_t kTile = 1u << 20;
+  std::vector<uint8_t> tile(std::min(bytes, kTile));
+  for (size_t base = 0; base < bytes; base += tile.size()) {
+    const size_t n = std::min(tile.size(), bytes - base);
+    for (size_t i = 0; i < n; ++i) {
+      const uint64_t p = base + i;
+      tile[i] = static_cast<uint8_t>((p * 2654435761ull + rank * 0x9E3779B9ull) >> 13);
+    }
+    HIP_CHECK(hipMemcpy(static_cast<char*>(buf) + base, tile.data(), n, hipMemcpyHostToDevice));
   }
-  std::cerr << "connect failed to " << host << ":" << port << std::endl;
-  std::exit(1);
 }
 
-static void SendAll(int fd, const void* buf, size_t n) {
-  const char* p = static_cast<const char*>(buf);
-  while (n) {
-    ssize_t k = send(fd, p, n, 0);
-    if (k <= 0) { perror("send"); std::exit(1); }
-    p += k; n -= k;
+// One checksum per transferred slot, so a mismatch names the slot that differs
+// rather than just failing the whole point.
+std::vector<uint64_t> SlotChecksums(const void* buf, const SizeVec& offsets, size_t msg) {
+  std::vector<uint64_t> sums(offsets.size());
+  std::vector<uint8_t> host(msg);
+  for (size_t i = 0; i < offsets.size(); ++i) {
+    HIP_CHECK(hipMemcpy(host.data(), static_cast<const char*>(buf) + offsets[i], msg,
+                        hipMemcpyDeviceToHost));
+    sums[i] = Fnv1a(host.data(), msg);
   }
+  return sums;
 }
-static void RecvAll(int fd, void* buf, size_t n) {
-  char* p = static_cast<char*>(buf);
-  while (n) {
-    ssize_t k = recv(fd, p, n, 0);
-    if (k <= 0) { perror("recv"); std::exit(1); }
-    p += k; n -= k;
+
+// ------------------------- control-plane rendezvous -------------------------
+// Adapter over MORI's SocketBootstrapNetwork -- the same bootstrap layer
+// src/cco/cco_init.cpp and src/shmem/init.cpp use to bring up multi-node jobs --
+// so the benchmark inherits the library's rendezvous policy instead of carrying a
+// second one: connect and accept retried over the MORI_BOOTSTRAP_TIMEOUT budget
+// (300s default), a Barrier that blocks for as long as the initiator's sweep
+// takes, failures raised as exceptions, and Finalize() from the destructor.
+//
+// Both ranks derive the same UniqueId from the master endpoint, so nothing has to
+// carry it between them. The bootstrap picks its own local interface; set
+// MORI_SOCKET_IFNAME when that choice has no route to the peer.
+class Rendezvous {
+ public:
+  Rendezvous(int rank, const std::string& masterIp, uint16_t port)
+      : boot(mori::application::SocketBootstrapNetwork::GenerateUniqueId(masterIp, port), rank,
+             kWorldSize),
+        myRank(rank) {
+    boot.Initialize();
   }
-}
-static void SendBlob(int fd, const std::string& b) {
-  uint64_t len = b.size();
-  SendAll(fd, &len, sizeof(len));
-  SendAll(fd, b.data(), len);
-}
-static std::string RecvBlob(int fd) {
-  uint64_t len = 0;
-  RecvAll(fd, &len, sizeof(len));
-  std::string b(len, '\0');
-  RecvAll(fd, b.data(), len);
-  return b;
-}
-static void Barrier(int fd) {  // symmetric 1-byte ping-pong
-  char c = 'x';
-  SendAll(fd, &c, 1);
-  RecvAll(fd, &c, 1);
-}
+
+  // Contribute this rank's blob, return the peer's. Allgather is fixed-size while
+  // packed descriptors are not, so sizes go first and the payload round pads every
+  // rank up to the larger of the two.
+  std::string ExchangeBlob(const std::string& mine) {
+    uint64_t sizes[kWorldSize] = {};
+    uint64_t mySize = mine.size();
+    boot.Allgather(&mySize, sizes, sizeof(mySize));
+
+    const size_t stride = std::max(sizes[0], sizes[1]);
+    if (stride == 0) return {};
+
+    std::vector<char> sendBuf(stride, 0), recvBuf(stride * kWorldSize, 0);
+    std::memcpy(sendBuf.data(), mine.data(), mine.size());
+    boot.Allgather(sendBuf.data(), recvBuf.data(), stride);
+
+    const int peer = 1 - myRank;
+    return std::string(recvBuf.data() + peer * stride, sizes[peer]);
+  }
+
+  void Barrier() { boot.Barrier(); }
+
+ private:
+  // Rank 0 initiates, rank 1 targets.
+  static constexpr int kWorldSize = 2;
+
+  mori::application::SocketBootstrapNetwork boot;
+  const int myRank;
+};
 
 template <typename T>
-static std::string Pack(const T& v) {
+std::string Pack(const T& v) {
   msgpack::sbuffer buf;
   msgpack::pack(buf, v);
   return std::string(buf.data(), buf.size());
 }
 template <typename T>
-static T Unpack(const std::string& b) {
+T Unpack(const std::string& b) {
   auto oh = msgpack::unpack(b.data(), b.size());
   return oh.get().as<T>();
+}
+
+// Compare the transferred slots of both ranks' buffers after the sweep. Both
+// sides derive the geometry from the same args, so the only thing that crosses
+// the wire is one checksum per slot. Only the initiator reports.
+//
+// BOTH ranks must call this unconditionally, even when --skip-validate is set:
+// the exchange is a collective, so a rank that returned early would leave its
+// peer blocked in Allgather until the bootstrap timeout. Opting out therefore
+// contributes an empty checksum vector rather than skipping the call, which also
+// makes the flag safe to pass to only one side -- either empty vector downgrades
+// the run to "skipped" instead of hanging or reporting a bogus failure.
+bool ValidateTransfer(Rendezvous& rdv, const void* buf, size_t msg, int batch, bool batched,
+                      bool batchContiguous, int rank, bool wanted) {
+  std::vector<uint64_t> mine;
+  if (wanted) {
+    // Mirror the offsets the sweep actually used: the batched path strides by
+    // msg+1 unless --batch-contiguous, while the singles path is always
+    // contiguous (same asymmetry as the Python bench's run_single_once).
+    const size_t stride = batched ? (batchContiguous ? msg : msg + 1) : msg;
+    SizeVec offsets(static_cast<size_t>(batch));
+    for (int i = 0; i < batch; ++i) offsets[i] = static_cast<size_t>(i) * stride;
+    mine = SlotChecksums(buf, offsets, msg);
+  }
+
+  const auto peer = Unpack<std::vector<uint64_t>>(rdv.ExchangeBlob(Pack(mine)));
+  if (rank != 0) return true;
+
+  if (mine.empty() || peer.empty()) {
+    std::cout << "validation: skipped"
+              << (mine.empty() ? "" : " (peer opted out with --skip-validate)") << std::endl;
+    return true;
+  }
+  if (peer.size() != mine.size()) {
+    std::cerr << "VALIDATION FAILED: peer returned " << peer.size() << " checksums, expected "
+              << mine.size() << std::endl;
+    return false;
+  }
+  for (size_t i = 0; i < mine.size(); ++i) {
+    if (mine[i] != peer[i]) {
+      std::cerr << "VALIDATION FAILED: slot " << i << " of " << mine.size()
+                << " differs at msg=" << msg << " batch=" << batch << " (initiator " << std::hex
+                << mine[i] << " vs target " << peer[i] << std::dec << ")" << std::endl;
+      return false;
+    }
+  }
+  std::cout << "validation: OK (" << batch << " slot(s) x " << msg << " B byte-identical)"
+            << std::endl;
+  return true;
 }
 
 // ------------------------------- config ------------------------------------
 // Flags mirror MORI's Python benchmark (tests/python/io/benchmark.py) so runs
 // are directly comparable. Names use the Python spelling where they exist.
 struct Args {
-  int rank = 0;                  // 0=initiator, 1=target
-  std::string master_ip;         // rank 1 connects here (rank 0's data IP) for TCP rendezvous
-  std::string self_ip;           // this rank's own reachable IP (advertised in EngineDesc)
+  int rank = 0;           // 0=initiator, 1=target
+  std::string master_ip;  // bootstrap root (rank 0's data IP); both ranks pass the same
+  std::string self_ip;    // this rank's own reachable IP (advertised in EngineDesc)
   uint16_t port = 18515;
   int gpu = 0;
   int target_dev_offset = 0;     // --target-dev-offset (target GPU = (gpu+offset)%ndev)
   std::string op = "write";      // write|read
+  std::string backend = "rdma";  // --backend rdma|xgmi (xgmi = intra-node GPU<->GPU)
 
   // Sweep control (Python parity). --all sweeps message size; --all-batch sweeps
   // batch size. Neither set => single run at (buffer_size, batch).
-  bool sweep_all = false;        // --all
-  bool sweep_batch = false;      // --all-batch
-  size_t buffer_size = 32768;    // --buffer-size (single message size when not sweeping)
-  size_t sweep_start = 8;        // --sweep-start-size (Python default 8)
-  size_t sweep_max = 1u << 20;   // --sweep-max-size (Python default 2^20)
-  size_t sweep_step = 0;         // --sweep-step (0 = geometric x2; >0 = linear +step)
+  bool sweep_all = false;       // --all
+  bool sweep_batch = false;     // --all-batch
+  size_t buffer_size = 32768;   // --buffer-size (single message size when not sweeping)
+  size_t sweep_start = 8;       // --sweep-start-size (Python default 8)
+  size_t sweep_max = 1u << 20;  // --sweep-max-size (Python default 2^20)
+  size_t sweep_step = 0;        // --sweep-step (0 = geometric x2; >0 = linear +step)
   int iters = 500;
-  int warmup = 50;               // --warmup-iters
+  int warmup = 50;  // --warmup-iters
 
   // RdmaBackendConfig knobs
-  int qp_per_transfer = 4;       // --num-qp-per-transfer
-  int worker_threads = 1;        // --num-worker-threads
-  int post_batch_size = -1;      // --post-batch-size
+  int qp_per_transfer = 4;               // --num-qp-per-transfer
+  int worker_threads = 1;                // --num-worker-threads
+  int post_batch_size = -1;              // --post-batch-size
   std::string poll_cq_mode = "polling";  // polling|event
-  bool disable_chunking = false; // --disable-chunking (default: chunking ON, like Python)
-  size_t chunk_bytes = 65536;    // --chunk-bytes
-  int max_chunks = 64;           // --max-chunks
-  int max_send_wr = 0;           // --max-send-wr (0 = leave default)
-  int max_cqe_num = 0;           // --max-cqe-num
-  int max_msg_sge = 0;           // --max-msg-sge
+  bool disable_chunking = false;         // --disable-chunking (default: chunking ON, like Python)
+  size_t chunk_bytes = 65536;            // --chunk-bytes
+  int max_chunks = 64;                   // --max-chunks
+  int max_send_wr = 0;                   // --max-send-wr (0 = leave default)
+  int max_cqe_num = 0;                   // --max-cqe-num
+  int max_msg_sge = 0;                   // --max-msg-sge
+
+  // XgmiBackendConfig knobs (--backend xgmi)
+  int num_streams = 64;  // --num-streams
+  int num_events = 64;   // --num-events
 
   // batch / session
-  int batch = 1;                 // --transfer-batch-size (transfers per request)
+  int batch = 1;                      // --transfer-batch-size (transfers per request)
   bool enable_batch_transfer = true;  // --enable-batch-transfer / --disable-batch-transfer.
-                                 // ON (default): batch>1 => ONE N-descriptor batch request
-                                 // (nixl-equivalent). OFF: batch>1 => N individual single
-                                 // transfers per iteration (Python run_single_once path).
-  bool batch_contiguous = false; // --batch-contiguous (adjacent offsets → merged WR);
-                                 // default strided (each transfer a separate WR)
-  bool enable_sess = false;      // --enable-sess (session fast-path); Python default: off
+                                      // ON (default): batch>1 => ONE N-descriptor batch request
+                                      // (nixl-equivalent). OFF: batch>1 => N individual single
+                                      // transfers per iteration (Python run_single_once path).
+  bool batch_contiguous = false;      // --batch-contiguous (adjacent offsets → merged WR);
+                                      // default strided (each transfer a separate WR)
+  bool enable_sess = false;           // --enable-sess (session fast-path); Python default: off
 
   std::string mem_type = "gpu";  // --mem-type gpu|cpu
   std::string init_mem_type;     // --initiator-mem-type (empty => mem_type)
   std::string target_mem_type;   // --target-mem-type   (empty => mem_type)
 
   std::string log_level = "info";  // --log-level trace|debug|info|warning|error|critical
+
+  // Correctness check on the last sweep point, on by default to match the Python
+  // benchmark (which always validates). --skip-validate opts out.
+  bool skip_validate = false;  // --skip-validate
+
+  bool help = false;  // -h / --help
 };
 
-static Args ParseArgs(int argc, char** argv) {
+void PrintUsage(const char* argv0) {
+  std::printf(
+      "Usage: %s --rank <0|1> --master-ip <IP> [OPTIONS]\n"
+      "\n"
+      "nixlbench-matching MORI-IO transfer benchmark. Start rank 1 (the target)\n"
+      "first, then rank 0 (the initiator), which drives every transfer and prints\n"
+      "the results. Both ranks must be given the same workload arguments. See\n"
+      "docs/MORI-IO-BENCHMARK.md for the full walkthrough.\n"
+      "\n"
+      "Rendezvous:\n"
+      "  --rank N                 0 = initiator, 1 = target\n"
+      "  --master-ip IP           rank 0's IP; pass the same value on both ranks\n"
+      "  --self-ip IP             this rank's peer-reachable IP (default: --master-ip)\n"
+      "  --port N                 bootstrap port (default: 18515)\n"
+      "\n"
+      "Workload:\n"
+      "  --op <write|read>        transfer direction (default: write)\n"
+      "  --backend <rdma|xgmi>    (default: rdma)\n"
+      "  --buffer-size N          message size in bytes when not sweeping (default: 32768)\n"
+      "  --transfer-batch-size N  transfers per iteration (default: 1)\n"
+      "  --enable-batch-transfer  one N-descriptor batch request per iteration (default)\n"
+      "  --disable-batch-transfer N individual transfers per iteration instead\n"
+      "  --batch-contiguous       adjacent slot offsets (default: strided by msg+1)\n"
+      "  --iters N                timed iterations (default: 500)\n"
+      "  --warmup-iters N         untimed warmup iterations (default: 50)\n"
+      "  --enable-sess            use the session fast path (default: off)\n"
+      "  --disable-sess           call the engine APIs directly\n"
+      "\n"
+      "Sweeps (default: a single point at --buffer-size):\n"
+      "  --all                    sweep message size --sweep-start..--sweep-max\n"
+      "  --all-batch              sweep batch 1..32768 at --buffer-size\n"
+      "  --sweep-start N          (default: 8)\n"
+      "  --sweep-max N            (default: 1048576)\n"
+      "  --sweep-step N           0 = geometric x2, >0 = linear +N (default: 0)\n"
+      "\n"
+      "Memory:\n"
+      "  --mem-type <gpu|cpu>     (default: gpu)\n"
+      "  --initiator-mem-type T   overrides --mem-type on rank 0\n"
+      "  --target-mem-type T      overrides --mem-type on rank 1\n"
+      "  --gpu N                  local device ordinal (default: 0)\n"
+      "  --target-dev-offset N    target GPU = (gpu + offset) %% device count\n"
+      "\n"
+      "RDMA tuning:\n"
+      "  --num-qp-per-transfer N  (default: 4)\n"
+      "  --num-worker-threads N   (default: 1)\n"
+      "  --post-batch-size N      (default: -1, backend default)\n"
+      "  --poll_cq_mode <polling|event>   (default: polling)\n"
+      "  --disable-chunking       chunking is on by default\n"
+      "  --chunk-bytes N          (default: 65536)\n"
+      "  --max-chunks N           (default: 64)\n"
+      "  --max-send-wr N          0 = backend default\n"
+      "  --max-cqe-num N          0 = backend default\n"
+      "  --max-msg-sge N          0 = backend default\n"
+      "\n"
+      "XGMI tuning:\n"
+      "  --num-streams N          (default: 64)\n"
+      "  --num-events N           (default: 64)\n"
+      "\n"
+      "Other:\n"
+      "  --skip-validate          skip the post-sweep checksum comparison\n"
+      "  --log-level LEVEL        trace|debug|info|warning|error|critical (default: info)\n"
+      "  -h, --help               show this message\n",
+      argv0);
+}
+
+Args ParseArgs(int argc, char** argv) {
   Args a;
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
-    auto next = [&]() { return std::string(argv[++i]); };
-    if (k == "--rank") a.rank = std::stoi(next());
-    else if (k == "--master-ip") a.master_ip = next();
-    else if (k == "--self-ip") a.self_ip = next();
-    else if (k == "--port") a.port = static_cast<uint16_t>(std::stoi(next()));
-    else if (k == "--gpu") a.gpu = std::stoi(next());
-    else if (k == "--target-dev-offset") a.target_dev_offset = std::stoi(next());
-    else if (k == "--op" || k == "--op-type") a.op = next();
-    else if (k == "--all") a.sweep_all = true;
-    else if (k == "--all-batch") a.sweep_batch = true;
-    else if (k == "--buffer-size") a.buffer_size = std::stoull(next());
-    else if (k == "--sweep-start" || k == "--sweep-start-size") a.sweep_start = std::stoull(next());
-    else if (k == "--sweep-max" || k == "--sweep-max-size") a.sweep_max = std::stoull(next());
-    else if (k == "--sweep-step") a.sweep_step = std::stoull(next());
-    else if (k == "--iters") a.iters = std::stoi(next());
-    else if (k == "--warmup" || k == "--warmup-iters") a.warmup = std::stoi(next());
-    else if (k == "--qp-per-transfer" || k == "--num-qp-per-transfer") a.qp_per_transfer = std::stoi(next());
-    else if (k == "--worker-threads" || k == "--num-worker-threads") a.worker_threads = std::stoi(next());
-    else if (k == "--post-batch-size") a.post_batch_size = std::stoi(next());
-    else if (k == "--poll_cq_mode" || k == "--poll-cq-mode") a.poll_cq_mode = next();
-    else if (k == "--disable-chunking") a.disable_chunking = true;
-    else if (k == "--chunk-bytes") a.chunk_bytes = std::stoull(next());
-    else if (k == "--max-chunks") a.max_chunks = std::stoi(next());
-    else if (k == "--max-send-wr") a.max_send_wr = std::stoi(next());
-    else if (k == "--max-cqe-num") a.max_cqe_num = std::stoi(next());
-    else if (k == "--max-msg-sge") a.max_msg_sge = std::stoi(next());
-    else if (k == "--batch" || k == "--transfer-batch-size") a.batch = std::stoi(next());
-    else if (k == "--enable-batch-transfer") a.enable_batch_transfer = true;
-    else if (k == "--disable-batch-transfer") a.enable_batch_transfer = false;
-    else if (k == "--batch-contiguous") a.batch_contiguous = true;
-    else if (k == "--enable-sess") a.enable_sess = true;
-    else if (k == "--disable-sess") a.enable_sess = false;
-    else if (k == "--mem-type") a.mem_type = next();
-    else if (k == "--initiator-mem-type") a.init_mem_type = next();
-    else if (k == "--target-mem-type") a.target_mem_type = next();
-    else if (k == "--log-level") a.log_level = next();
-    else { std::cerr << "unknown arg " << k << std::endl; std::exit(1); }
+    // Checked rather than argv[++i] directly: a value-taking flag in last
+    // position would otherwise construct a std::string from argv[argc], which
+    // is null.
+    auto next = [&]() {
+      if (i + 1 >= argc) throw std::invalid_argument("missing value for " + k);
+      return std::string(argv[++i]);
+    };
+    if (k == "-h" || k == "--help")
+      a.help = true;
+    else if (k == "--rank")
+      a.rank = std::stoi(next());
+    else if (k == "--master-ip")
+      a.master_ip = next();
+    else if (k == "--self-ip")
+      a.self_ip = next();
+    else if (k == "--port")
+      a.port = static_cast<uint16_t>(std::stoi(next()));
+    else if (k == "--gpu")
+      a.gpu = std::stoi(next());
+    else if (k == "--target-dev-offset")
+      a.target_dev_offset = std::stoi(next());
+    else if (k == "--op" || k == "--op-type")
+      a.op = next();
+    else if (k == "--backend")
+      a.backend = next();
+    else if (k == "--all")
+      a.sweep_all = true;
+    else if (k == "--all-batch")
+      a.sweep_batch = true;
+    else if (k == "--buffer-size")
+      a.buffer_size = std::stoull(next());
+    else if (k == "--sweep-start" || k == "--sweep-start-size")
+      a.sweep_start = std::stoull(next());
+    else if (k == "--sweep-max" || k == "--sweep-max-size")
+      a.sweep_max = std::stoull(next());
+    else if (k == "--sweep-step")
+      a.sweep_step = std::stoull(next());
+    else if (k == "--iters")
+      a.iters = std::stoi(next());
+    else if (k == "--warmup" || k == "--warmup-iters")
+      a.warmup = std::stoi(next());
+    else if (k == "--qp-per-transfer" || k == "--num-qp-per-transfer")
+      a.qp_per_transfer = std::stoi(next());
+    else if (k == "--worker-threads" || k == "--num-worker-threads")
+      a.worker_threads = std::stoi(next());
+    else if (k == "--post-batch-size")
+      a.post_batch_size = std::stoi(next());
+    else if (k == "--poll_cq_mode" || k == "--poll-cq-mode")
+      a.poll_cq_mode = next();
+    else if (k == "--disable-chunking")
+      a.disable_chunking = true;
+    else if (k == "--chunk-bytes")
+      a.chunk_bytes = std::stoull(next());
+    else if (k == "--max-chunks")
+      a.max_chunks = std::stoi(next());
+    else if (k == "--max-send-wr")
+      a.max_send_wr = std::stoi(next());
+    else if (k == "--max-cqe-num")
+      a.max_cqe_num = std::stoi(next());
+    else if (k == "--max-msg-sge")
+      a.max_msg_sge = std::stoi(next());
+    else if (k == "--num-streams")
+      a.num_streams = std::stoi(next());
+    else if (k == "--num-events")
+      a.num_events = std::stoi(next());
+    else if (k == "--batch" || k == "--transfer-batch-size")
+      a.batch = std::stoi(next());
+    else if (k == "--enable-batch-transfer")
+      a.enable_batch_transfer = true;
+    else if (k == "--disable-batch-transfer")
+      a.enable_batch_transfer = false;
+    else if (k == "--batch-contiguous")
+      a.batch_contiguous = true;
+    else if (k == "--enable-sess")
+      a.enable_sess = true;
+    else if (k == "--disable-sess")
+      a.enable_sess = false;
+    else if (k == "--mem-type")
+      a.mem_type = next();
+    else if (k == "--initiator-mem-type")
+      a.init_mem_type = next();
+    else if (k == "--target-mem-type")
+      a.target_mem_type = next();
+    else if (k == "--skip-validate")
+      a.skip_validate = true;
+    else if (k == "--log-level")
+      a.log_level = next();
+    else
+      throw std::invalid_argument("unknown arg " + k + " (try --help)");
   }
   return a;
 }
 
 // ------------------------------ main ---------------------------------------
-int main(int argc, char** argv) {
+int RunBenchmark(int argc, char** argv) {
   Args a = ParseArgs(argc, argv);
+  if (a.help) {
+    PrintUsage(argv[0]);
+    return 0;
+  }
   SetLogLevel(a.log_level);
+
+  // Rejected up front because each of these either corrupts the run or reports a
+  // number for something the caller did not ask for: rank feeds the two-rank
+  // bootstrap's peer indexing, iters and batch are divisors of the reported
+  // latency, a zero message size makes the geometric sweep loop forever, and an
+  // unrecognised op or memory type would otherwise fall back silently to
+  // write/GPU.
+  if (a.rank != 0 && a.rank != 1) {
+    throw std::invalid_argument("--rank must be 0 (initiator) or 1 (target)");
+  }
+  if (a.backend != "rdma" && a.backend != "xgmi") {
+    throw std::invalid_argument("--backend must be rdma or xgmi (got " + a.backend + ")");
+  }
+  if (a.op != "read" && a.op != "write") {
+    throw std::invalid_argument("--op must be read or write (got " + a.op + ")");
+  }
+  if (a.iters <= 0) throw std::invalid_argument("--iters must be > 0");
+  if (a.batch <= 0) throw std::invalid_argument("--transfer-batch-size must be > 0");
+  if (a.warmup < 0) throw std::invalid_argument("--warmup-iters must be >= 0");
+  if (a.sweep_all ? a.sweep_start == 0 : a.buffer_size == 0) {
+    throw std::invalid_argument("message size must be > 0");
+  }
+  for (const std::string& m : {a.mem_type, a.init_mem_type, a.target_mem_type}) {
+    if (!m.empty() && m != "gpu" && m != "cpu") {
+      throw std::invalid_argument("memory type must be gpu or cpu (got " + m + ")");
+    }
+  }
 
   // Per-role memory type: initiator (rank 0) / target (rank 1) may override the
   // shared --mem-type, enabling mixed CPU<->GPU transfers. Each process only
   // allocates its own side, so no cross-node coupling is needed.
   const std::string myMem = (a.rank == 0)
-      ? (!a.init_mem_type.empty() ? a.init_mem_type : a.mem_type)
-      : (!a.target_mem_type.empty() ? a.target_mem_type : a.mem_type);
+                                ? (!a.init_mem_type.empty() ? a.init_mem_type : a.mem_type)
+                                : (!a.target_mem_type.empty() ? a.target_mem_type : a.mem_type);
   const bool cpuMem = (myMem == "cpu");
   const MemoryLocationType memLoc = cpuMem ? MemoryLocationType::CPU : MemoryLocationType::GPU;
 
@@ -289,6 +617,11 @@ int main(int argc, char** argv) {
   } else {
     plan.emplace_back(a.buffer_size, a.batch);
   }
+  // The last point is validated after the sweep, so an empty plan would read off
+  // the end of it.
+  if (plan.empty()) {
+    throw std::invalid_argument("empty sweep: --sweep-start exceeds --sweep-max");
+  }
 
   // Buffer must hold the largest single REQUEST across the whole plan. Strided
   // batch (default) needs (msg+1)*batch to keep slots non-adjacent; contiguous
@@ -303,14 +636,6 @@ int main(int argc, char** argv) {
     bufBytes = std::max(bufBytes, need);
   }
 
-  void* buf = nullptr;
-  if (cpuMem) {
-    HIP_CHECK(hipHostMalloc(&buf, bufBytes, 0));
-  } else {
-    HIP_CHECK(hipMalloc(&buf, bufBytes));
-  }
-  HIP_CHECK(hipMemset(buf, 0, bufBytes));
-
   // Out-of-band control endpoint for the MORI engine. host MUST be an IP the
   // peer can reach (advertised via EngineDesc for RDMA QP setup). Defaults to
   // master_ip: correct for rank 0 (it IS the master); rank 1 should pass
@@ -321,45 +646,66 @@ int main(int argc, char** argv) {
   std::string key = a.rank == 0 ? "initiator" : "target";
   IOEngine engine(key, cfg);
 
-  RdmaBackendConfig rdmaCfg{};
-  rdmaCfg.qpPerTransfer = a.qp_per_transfer;
-  rdmaCfg.postBatchSize = a.post_batch_size;
-  rdmaCfg.numWorkerThreads = a.worker_threads;
-  rdmaCfg.pollCqMode = (a.poll_cq_mode == "event") ? PollCqMode::EVENT : PollCqMode::POLLING;
-  rdmaCfg.enableNotification = false;         // match MORI Python bench RDMA path
-  rdmaCfg.enableTransferChunking = !a.disable_chunking;  // chunking ON by default (Python parity)
-  rdmaCfg.chunkBytes = a.chunk_bytes;
-  rdmaCfg.maxChunksPerTransfer = a.max_chunks;
-  if (a.max_send_wr > 0) rdmaCfg.maxSendWr = a.max_send_wr;
-  if (a.max_cqe_num > 0) rdmaCfg.maxCqeNum = a.max_cqe_num;
-  if (a.max_msg_sge > 0) rdmaCfg.maxMsgSge = a.max_msg_sge;
-  engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+  // XGMI moves data over Infinity Fabric between two GPUs on the SAME host, so
+  // its knobs are stream/event depth rather than QPs and chunking. The RDMA-only
+  // flags above are simply unused on that path.
+  if (a.backend == "xgmi") {
+    XgmiBackendConfig xgmiCfg{};
+    xgmiCfg.numStreams = a.num_streams;
+    xgmiCfg.numEvents = a.num_events;
+    engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+  } else {
+    RdmaBackendConfig rdmaCfg{};
+    rdmaCfg.qpPerTransfer = a.qp_per_transfer;
+    rdmaCfg.postBatchSize = a.post_batch_size;
+    rdmaCfg.numWorkerThreads = a.worker_threads;
+    rdmaCfg.pollCqMode = (a.poll_cq_mode == "event") ? PollCqMode::EVENT : PollCqMode::POLLING;
+    rdmaCfg.enableNotification = false;                    // match MORI Python bench RDMA path
+    rdmaCfg.enableTransferChunking = !a.disable_chunking;  // chunking ON by default (Python parity)
+    rdmaCfg.chunkBytes = a.chunk_bytes;
+    rdmaCfg.maxChunksPerTransfer = a.max_chunks;
+    if (a.max_send_wr > 0) rdmaCfg.maxSendWr = a.max_send_wr;
+    if (a.max_cqe_num > 0) rdmaCfg.maxCqeNum = a.max_cqe_num;
+    if (a.max_msg_sge > 0) rdmaCfg.maxMsgSge = a.max_msg_sge;
+    engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+  }
 
-  MemoryDesc localMem = engine.RegisterMemory(buf, bufBytes, gpu, memLoc);
+  // Declared after the engine so it is destroyed first, i.e. the MR is dropped
+  // while the engine that owns it is still alive.
+  BenchBuffer buffer(engine, bufBytes, gpu, memLoc);
+  void* buf = buffer.Data();
+  const MemoryDesc& localMem = buffer.Desc();
 
-  // --- rendezvous over a side TCP socket -----------------------------------
-  int sock = (a.rank == 0) ? TcpListenAccept(a.port) : TcpConnect(a.master_ip, a.port);
-  int one = 1;
-  setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  // Rank-dependent seed pattern rather than zeros, so the post-sweep validation
+  // can tell "the transfer moved my bytes" from "both buffers happened to match".
+  if (a.skip_validate) {
+    HIP_CHECK(hipMemset(buf, 0, bufBytes));
+  } else {
+    FillPattern(buf, bufBytes, a.rank);
+  }
+
+  // --- rendezvous over MORI's socket bootstrap ------------------------------
+  Rendezvous rdv(a.rank, a.master_ip, a.port);
 
   // Exchange EngineDesc then register the remote engine.
   EngineDesc myEng = engine.GetEngineDesc();
-  SendBlob(sock, Pack(myEng));
-  EngineDesc peerEng = Unpack<EngineDesc>(RecvBlob(sock));
+  EngineDesc peerEng = Unpack<EngineDesc>(rdv.ExchangeBlob(Pack(myEng)));
   engine.RegisterRemoteEngine(peerEng);
 
   // Exchange MemoryDesc.
-  SendBlob(sock, Pack(localMem));
-  MemoryDesc peerMem = Unpack<MemoryDesc>(RecvBlob(sock));
+  MemoryDesc peerMem = Unpack<MemoryDesc>(rdv.ExchangeBlob(Pack(localMem)));
 
-  Barrier(sock);
+  rdv.Barrier();
 
   if (a.rank == 1) {
     // Target: nothing to drive. RDMA one-sided ops complete without target CPU.
     // Just hold memory registered until the initiator says it's done.
-    Barrier(sock);   // wait for initiator to finish the whole sweep
-    if (cpuMem) HIP_CHECK(hipHostFree(buf)); else HIP_CHECK(hipFree(buf));
-    close(sock);
+    rdv.Barrier();  // wait for initiator to finish the whole sweep
+    // Collective with the initiator's call below, so it runs even under
+    // --skip-validate; the target only contributes checksums and does not report.
+    const auto& last = plan.back();
+    ValidateTransfer(rdv, buf, last.first, last.second, a.enable_batch_transfer && last.second > 1,
+                     a.batch_contiguous, a.rank, !a.skip_validate);
     return 0;
   }
 
@@ -371,7 +717,7 @@ int main(int argc, char** argv) {
   std::optional<IOEngineSession> sessOpt;
   if (useSess) {
     sessOpt = engine.CreateSession(localMem, peerMem);
-    if (!sessOpt) { std::cerr << "CreateSession failed" << std::endl; std::exit(1); }
+    if (!sessOpt) throw std::runtime_error("CreateSession failed");
     sessPtr = &*sessOpt;
   }
   const bool isRead = (a.op == "read");
@@ -388,7 +734,7 @@ int main(int argc, char** argv) {
     //     submissions per iteration (Python run_single_once), each its own status.
     // batch==1 is a single transfer either way.
     const bool batched = a.enable_batch_transfer && curBatch > 1;
-    const int perSlot = batched ? 1 : curBatch;    // statuses per request
+    const int perSlot = batched ? 1 : curBatch;  // statuses per request
     // Strict stop-and-wait: one request outstanding at a time (nixl
     // --pipeline_depth 1). [perSlot] status array (TransferStatus is
     // non-copyable, so a flat vector rather than nested).
@@ -405,9 +751,14 @@ int main(int argc, char** argv) {
       offsets[i] = static_cast<size_t>(i) * stride;
       sizes[i] = msg;
     }
-    // Engine (non-session) batch path needs vec-of-vec + desc vectors.
+    // Engine (non-session) batch path needs vec-of-vec + desc vectors. These and
+    // the status/id vectors below are built once per sweep point and reused every
+    // iteration: allocating them inside post() would charge two heap
+    // allocation/free pairs per iteration to the reported latency.
     MemDescVec locVec{localMem}, remVec{peerMem};
     BatchSizeVec offVec{offsets}, sizeVec{sizes};
+    TransferStatusPtrVec statusPtrs{&st[0]};
+    TransferUniqueIdVec batchIds(1);
 
     auto post = [&]() {
       TransferStatus* base = &st[0];
@@ -417,13 +768,17 @@ int main(int argc, char** argv) {
         TransferUniqueId id =
             useSess ? sessPtr->AllocateTransferUniqueId() : engine.AllocateTransferUniqueId();
         if (useSess) {
-          if (isRead) sessPtr->BatchRead(offsets, offsets, sizes, &base[0], id);
-          else        sessPtr->BatchWrite(offsets, offsets, sizes, &base[0], id);
+          if (isRead)
+            sessPtr->BatchRead(offsets, offsets, sizes, &base[0], id);
+          else
+            sessPtr->BatchWrite(offsets, offsets, sizes, &base[0], id);
         } else {
-          TransferStatusPtrVec sp{&base[0]};
-          TransferUniqueIdVec ids{id};
-          if (isRead) engine.BatchRead(locVec, offVec, remVec, offVec, sizeVec, sp, ids);
-          else        engine.BatchWrite(locVec, offVec, remVec, offVec, sizeVec, sp, ids);
+          statusPtrs[0] = &base[0];
+          batchIds[0] = id;
+          if (isRead)
+            engine.BatchRead(locVec, offVec, remVec, offVec, sizeVec, statusPtrs, batchIds);
+          else
+            engine.BatchWrite(locVec, offVec, remVec, offVec, sizeVec, statusPtrs, batchIds);
         }
       } else {
         // curBatch individual single-transfer submissions (Python run_single_once);
@@ -434,11 +789,15 @@ int main(int argc, char** argv) {
           TransferUniqueId id =
               useSess ? sessPtr->AllocateTransferUniqueId() : engine.AllocateTransferUniqueId();
           if (useSess) {
-            if (isRead) sessPtr->Read(off, off, msg, &base[i], id);
-            else        sessPtr->Write(off, off, msg, &base[i], id);
+            if (isRead)
+              sessPtr->Read(off, off, msg, &base[i], id);
+            else
+              sessPtr->Write(off, off, msg, &base[i], id);
           } else {
-            if (isRead) engine.Read(localMem, off, peerMem, off, msg, &base[i], id);
-            else        engine.Write(localMem, off, peerMem, off, msg, &base[i], id);
+            if (isRead)
+              engine.Read(localMem, off, peerMem, off, msg, &base[i], id);
+            else
+              engine.Write(localMem, off, peerMem, off, msg, &base[i], id);
           }
         }
       }
@@ -463,10 +822,10 @@ int main(int argc, char** argv) {
     // ---- warmup (excluded from timing) ----
     for (int w = 0; w < a.warmup; ++w) {
       post();
-      while (!reqDone()) { /* spin: CQ worker thread stores status */ }
+      while (!reqDone()) { /* spin: CQ worker thread stores status */
+      }
       if (TransferStatus* f = reqFailed()) {
-        std::cerr << "warmup transfer failed: " << f->Message() << std::endl;
-        std::exit(1);
+        throw std::runtime_error("warmup transfer failed: " + f->Message());
       }
     }
 
@@ -479,10 +838,10 @@ int main(int argc, char** argv) {
       post();
       // spin-poll, mirroring nixl's "check status, if IN_PROG continue" scan
       // (status flags stored by MORI's CQ worker thread)
-      while (!reqDone()) { /* spin */ }
+      while (!reqDone()) { /* spin */
+      }
       if (TransferStatus* f = reqFailed()) {
-        std::cerr << "transfer failed: " << f->Message() << std::endl;
-        std::exit(1);
+        throw std::runtime_error("transfer failed: " + f->Message());
       }
     }
     auto t1 = Clock::now();
@@ -496,19 +855,38 @@ int main(int argc, char** argv) {
     //   avg_bw       = total_bytes/1e9 / (total_us/1e6)                 [GB/s, GB=10^9]
     //   avg_latency  = total_us / (iters * curBatch)                    [us per transfer]
     // matching nixl's avg_latency = total_duration/(per_thread_iter*batch_size).
-    const int effBatch = curBatch;
-    const double numXfers = static_cast<double>(a.iters) * effBatch;
+    const double numXfers = static_cast<double>(a.iters) * curBatch;
     double total_bytes = static_cast<double>(msg) * numXfers;
-    double avg_bw = (total_bytes / 1e9) / (total_us / 1e6);   // GB/s, GB=10^9
-    double avg_lat = total_us / numXfers;                      // us per single transfer
+    double avg_bw = (total_bytes / 1e9) / (total_us / 1e6);  // GB/s, GB=10^9
+    double avg_lat = total_us / numXfers;                    // us per single transfer
 
-    std::printf("%-11zu %-6d %-6d %-12.2f %-11.2f %-.1f\n", msg, effBatch, a.iters, avg_bw, avg_lat,
+    std::printf("%-11zu %-6d %-6d %-12.2f %-11.2f %-.1f\n", msg, curBatch, a.iters, avg_bw, avg_lat,
                 total_us);
     std::fflush(stdout);
   }
 
-  Barrier(sock);   // tell target we're done
-  if (cpuMem) HIP_CHECK(hipHostFree(buf)); else HIP_CHECK(hipFree(buf));
-  close(sock);
-  return 0;
+  rdv.Barrier();  // tell target we're done
+
+  // Correctness check on the last sweep point, matching the Python benchmark's
+  // always-on validation. Runs after the timed region so it cannot perturb the
+  // reported numbers.
+  const auto& last = plan.back();
+  const bool valid = ValidateTransfer(rdv, buf, last.first, last.second,
+                                      a.enable_batch_transfer && last.second > 1,
+                                      a.batch_contiguous, a.rank, !a.skip_validate);
+  return valid ? 0 : 1;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  // Both the bootstrap layer and the IO engine report failures by throwing, so
+  // unwinding here runs the destructors instead of leaving teardown to an exit
+  // path.
+  try {
+    return RunBenchmark(argc, argv);
+  } catch (const std::exception& e) {
+    std::cerr << "bench_engine: " << e.what() << std::endl;
+    return 1;
+  }
 }
