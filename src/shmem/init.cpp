@@ -595,8 +595,9 @@ void GpuStateInit(ShmemStates* states) {
 
   // Check if IBGDA proxy mode is requested
   const char* proxyEnv = std::getenv("MORI_USE_IBGDA_PROXY");
+  fprintf(stderr, "[MoRI-PROXY] MORI_USE_IBGDA_PROXY=%s\n", proxyEnv ? proxyEnv : "(unset)");
   if (proxyEnv && (std::string(proxyEnv) == "1" || std::string(proxyEnv) == "true")) {
-    MORI_SHMEM_INFO("IBGDA proxy mode enabled (MORI_USE_IBGDA_PROXY=1)");
+    fprintf(stderr, "[MoRI-PROXY] Proxy mode enabled, allocating ring...\n");
     core::ProxyRing* ring = nullptr;
     hipError_t err = hipHostMalloc(&ring, sizeof(core::ProxyRing),
                                    hipHostMallocMapped | hipHostMallocCoherent);
@@ -718,11 +719,12 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
         qps.push_back({hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq});
       }
     }
+    fprintf(stderr, "[MoRI-PROXY] Found %zu QPs for proxy thread\n", qps.size());
     if (!qps.empty()) {
       states->proxyThread = std::make_unique<core::ProxyThread>();
       states->proxyThread->Init(states->gpuStates.proxyRing, std::move(qps));
       states->proxyThread->Start();
-      MORI_SHMEM_INFO("Proxy thread started with {} QPs", qps.size());
+      fprintf(stderr, "[MoRI-PROXY] Proxy thread started\n");
     }
   }
 
