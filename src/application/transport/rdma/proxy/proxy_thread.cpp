@@ -115,7 +115,15 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
 }
 
 void ProxyThread::MainLoop() {
-  hipSetDevice(gpu_id_);
+  // Initialize HIP context for this thread without changing the device.
+  // This ensures CPU writes to GPU VRAM via __atomic_fetch_add go
+  // through the correct PCIe BAR mapping.
+  int curDev = -1;
+  hipGetDevice(&curDev);
+  if (curDev != gpu_id_) {
+    fprintf(stderr, "[MoRI-PROXY] Thread GPU mismatch: cur=%d need=%d, setting\n", curDev, gpu_id_);
+    hipSetDevice(gpu_id_);
+  }
   while (!ring_->shutdown) {
     bool did_work = false;
 
