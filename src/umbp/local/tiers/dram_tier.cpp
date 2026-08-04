@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -114,6 +115,206 @@ struct CopyJob {
   bool copied{false};
 };
 
+// ---------------------------------------------------------------------------
+// Opt-in profiling (UMBP_DRAM_PROFILE=1). Answers the two questions that gate
+// the next round of optimization work:
+//   1. how much of a batch's wall time is spent waiting for mu_ (i.e. how much
+//      the 8 ranks serialize against each other);
+//   2. how many hipMemcpyAsync submissions would survive if adjacent objects
+//      were merged (i.e. whether contiguous merging is worth implementing).
+// Zero cost when disabled: one predictable branch per batch.
+// ---------------------------------------------------------------------------
+
+bool ProfileEnabled() {
+  static const bool enabled = [] {
+    const char* raw = std::getenv("UMBP_DRAM_PROFILE");
+    return raw != nullptr && raw[0] == '1';
+  }();
+  return enabled;
+}
+
+// Report every N batches so a normal E2E run produces a handful of lines.
+constexpr uint64_t kProfileReportEvery = 512;
+
+// How many batches are inside the tier at the same instant. Zero lock wait can
+// mean either "no contention" or "requests never arrive together"; this tells
+// them apart, which decides whether finer locking could buy anything at all.
+struct InFlightStats {
+  std::atomic<int> current{0};
+  std::atomic<int> peak{0};
+  std::atomic<uint64_t> samples{0};
+  std::atomic<uint64_t> sum{0};
+};
+
+InFlightStats& BatchInFlight() {
+  static InFlightStats stats;
+  return stats;
+}
+
+class ScopedInFlight {
+ public:
+  ScopedInFlight() {
+    if (!ProfileEnabled()) return;
+    active_ = true;
+    InFlightStats& stats = BatchInFlight();
+    const int now = stats.current.fetch_add(1, std::memory_order_relaxed) + 1;
+    int observed = stats.peak.load(std::memory_order_relaxed);
+    while (now > observed &&
+           !stats.peak.compare_exchange_weak(observed, now, std::memory_order_relaxed)) {
+    }
+    stats.sum.fetch_add(static_cast<uint64_t>(now), std::memory_order_relaxed);
+    stats.samples.fetch_add(1, std::memory_order_relaxed);
+  }
+  ~ScopedInFlight() {
+    if (!active_) return;
+    BatchInFlight().current.fetch_sub(1, std::memory_order_relaxed);
+  }
+
+ private:
+  bool active_{false};
+};
+
+struct LockStats {
+  const char* name;
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> wait_us{0};
+  std::atomic<uint64_t> held_us{0};
+  std::atomic<uint64_t> objects{0};
+};
+
+LockStats& ReadLockStats() {
+  static LockStats stats{"ReadBatchIntoPtr"};
+  return stats;
+}
+
+LockStats& WriteLockStats() {
+  static LockStats stats{"BatchWrite"};
+  return stats;
+}
+
+void RecordLockStats(LockStats& stats, uint64_t wait_us, uint64_t held_us, size_t objects) {
+  stats.wait_us.fetch_add(wait_us, std::memory_order_relaxed);
+  stats.held_us.fetch_add(held_us, std::memory_order_relaxed);
+  stats.objects.fetch_add(objects, std::memory_order_relaxed);
+  const uint64_t n = stats.calls.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n % kProfileReportEvery != 0) return;
+
+  const uint64_t wait = stats.wait_us.load(std::memory_order_relaxed);
+  const uint64_t held = stats.held_us.load(std::memory_order_relaxed);
+  const uint64_t objs = stats.objects.load(std::memory_order_relaxed);
+  const uint64_t total = wait + held;
+  const InFlightStats& flight = BatchInFlight();
+  const uint64_t samples = flight.samples.load(std::memory_order_relaxed);
+  const uint64_t sum = flight.sum.load(std::memory_order_relaxed);
+  MORI_UMBP_INFO(
+      "[DRAMTier/profile] {} batches={} objects={} avg_lock_wait={}us avg_lock_held={}us "
+      "wait_share={}% | in_flight avg={}.{:02d} peak={}",
+      stats.name, n, objs, wait / n, held / n, total == 0 ? 0 : (wait * 100 / total),
+      samples == 0 ? 0 : sum / samples, samples == 0 ? 0 : (sum * 100 / samples) % 100,
+      flight.peak.load(std::memory_order_relaxed));
+}
+
+struct MergeStats {
+  const char* name;
+  std::atomic<uint64_t> batches{0};
+  std::atomic<uint64_t> objects{0};
+  std::atomic<uint64_t> runs_gpu{0};   // runs if only the GPU side had to be adjacent
+  std::atomic<uint64_t> runs_dram{0};  // runs if only the DRAM side had to be adjacent
+  std::atomic<uint64_t> runs_both{0};  // runs with both adjacent -- the real submission count
+};
+
+MergeStats& OffloadMergeStats() {
+  static MergeStats stats{"offload D2H (src=GPU dst=DRAM)"};
+  return stats;
+}
+
+MergeStats& LoadMergeStats() {
+  static MergeStats stats{"load    H2D (src=DRAM dst=GPU)"};
+  return stats;
+}
+
+// Counts how many contiguous runs the batch would collapse into. A run of k
+// objects becomes one hipMemcpyAsync, so runs_both/objects is exactly the
+// submission-count reduction that merging would buy. runs_gpu / runs_dram show
+// which side is the obstacle: the DRAM side is ours to control (slot placement
+// follows the order objects are sent), the GPU side is the tree allocator's.
+void RecordMergeability(const std::vector<CopyJob*>& jobs, hipMemcpyKind kind) {
+  if (jobs.empty()) return;
+  const bool src_is_gpu = (kind == hipMemcpyDeviceToHost);
+  MergeStats& stats = src_is_gpu ? OffloadMergeStats() : LoadMergeStats();
+
+  auto gpu_of = [src_is_gpu](const CopyJob* j) {
+    return static_cast<const char*>(src_is_gpu ? j->src : static_cast<const void*>(j->dst));
+  };
+  auto dram_of = [src_is_gpu](const CopyJob* j) {
+    return static_cast<const char*>(src_is_gpu ? static_cast<const void*>(j->dst) : j->src);
+  };
+
+  // Sort by the DRAM side: that is the ordering we could actually impose.
+  std::vector<const CopyJob*> sorted(jobs.begin(), jobs.end());
+  std::sort(sorted.begin(), sorted.end(),
+            [&](const CopyJob* a, const CopyJob* b) { return dram_of(a) < dram_of(b); });
+
+  uint64_t runs_gpu = 1, runs_dram = 1, runs_both = 1;
+  for (size_t i = 1; i < sorted.size(); ++i) {
+    const CopyJob* prev = sorted[i - 1];
+    const CopyJob* cur = sorted[i];
+    const bool gpu_adjacent = gpu_of(prev) + prev->size == gpu_of(cur);
+    const bool dram_adjacent = dram_of(prev) + prev->size == dram_of(cur);
+    if (!gpu_adjacent) ++runs_gpu;
+    if (!dram_adjacent) ++runs_dram;
+    if (!gpu_adjacent || !dram_adjacent) ++runs_both;
+  }
+
+  stats.objects.fetch_add(sorted.size(), std::memory_order_relaxed);
+  stats.runs_gpu.fetch_add(runs_gpu, std::memory_order_relaxed);
+  stats.runs_dram.fetch_add(runs_dram, std::memory_order_relaxed);
+  stats.runs_both.fetch_add(runs_both, std::memory_order_relaxed);
+  const uint64_t n = stats.batches.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n % kProfileReportEvery != 0) return;
+
+  const uint64_t objs = stats.objects.load(std::memory_order_relaxed);
+  auto pct = [objs](const std::atomic<uint64_t>& runs) {
+    return objs == 0 ? 100 : runs.load(std::memory_order_relaxed) * 100 / objs;
+  };
+  MORI_UMBP_INFO(
+      "[DRAMTier/profile] mergeability {} batches={} objects={} | submissions kept: "
+      "gpu-side-only={}% dram-side-only={}% both={}%",
+      stats.name, n, objs, pct(stats.runs_gpu), pct(stats.runs_dram), pct(stats.runs_both));
+}
+
+// Times mu_ acquisition and the critical section, then reports periodically.
+class ProfiledLock {
+ public:
+  ProfiledLock(std::mutex& mutex, LockStats& stats, size_t objects)
+      : lock_(mutex, std::defer_lock), stats_(stats), objects_(objects) {
+    if (!ProfileEnabled()) {
+      lock_.lock();
+      return;
+    }
+    profiling_ = true;
+    const auto before = std::chrono::steady_clock::now();
+    lock_.lock();
+    acquired_ = std::chrono::steady_clock::now();
+    wait_us_ = std::chrono::duration_cast<std::chrono::microseconds>(acquired_ - before).count();
+  }
+
+  ~ProfiledLock() {
+    if (!profiling_) return;
+    const auto held = std::chrono::steady_clock::now() - acquired_;
+    RecordLockStats(stats_, wait_us_,
+                    std::chrono::duration_cast<std::chrono::microseconds>(held).count(), objects_);
+  }
+
+ private:
+  std::unique_lock<std::mutex> lock_;
+  LockStats& stats_;
+  size_t objects_;
+  bool profiling_{false};
+  uint64_t wait_us_{0};
+  std::chrono::steady_clock::time_point acquired_{};
+};
+
 void CopyHostJobs(const std::vector<CopyJob*>& jobs, int num_threads) {
   if (jobs.empty()) return;
   num_threads = std::max(1, std::min(num_threads, static_cast<int>(jobs.size())));
@@ -182,17 +383,43 @@ void CopyDeviceJobs(const std::vector<CopyJob*>& jobs, int device_id, hipMemcpyK
   hipStream_t stream = DeviceStream(device_id);
   if (stream == nullptr) return;
 
+  // Coalesce runs whose source AND destination are both adjacent into one
+  // submission. Submission cost (~10us) dominates the DMA itself (~1.5us for a
+  // 72 KiB KV object), so collapsing a run of k objects is close to a k-fold
+  // win on the layer-wise load path. This pays off only because the connector
+  // sends offloads in GPU-address order, which makes the tier's slot layout
+  // mirror the GPU layout -- see UMBP_STANDALONE_PROCESS_DESIGN.md 11.2.
+  std::vector<CopyJob*> ordered(jobs.begin(), jobs.end());
+  std::sort(ordered.begin(), ordered.end(), [](const CopyJob* a, const CopyJob* b) {
+    return a->src < b->src;
+  });
+
   hipError_t status = hipSuccess;
   bool enqueued_all = true;
-  for (CopyJob* job : jobs) {
-    status = hipMemcpyAsync(job->dst, job->src, job->size, kind, stream);
+  for (size_t begin = 0; begin < ordered.size();) {
+    size_t end = begin + 1;
+    size_t bytes = ordered[begin]->size;
+    while (end < ordered.size()) {
+      const CopyJob* prev = ordered[end - 1];
+      const CopyJob* cur = ordered[end];
+      const bool src_adjacent =
+          static_cast<const char*>(prev->src) + prev->size == static_cast<const char*>(cur->src);
+      const bool dst_adjacent =
+          static_cast<char*>(prev->dst) + prev->size == static_cast<char*>(cur->dst);
+      if (!src_adjacent || !dst_adjacent) break;
+      bytes += cur->size;
+      ++end;
+    }
+
+    status = hipMemcpyAsync(ordered[begin]->dst, ordered[begin]->src, bytes, kind, stream);
     if (status != hipSuccess) {
-      MORI_UMBP_ERROR("[DRAMTier] hipMemcpyAsync failed on device {}: {}", device_id,
-                      hipGetErrorString(status));
+      MORI_UMBP_ERROR("[DRAMTier] hipMemcpyAsync failed on device {} ({} bytes, {} objects): {}",
+                      device_id, bytes, end - begin, hipGetErrorString(status));
       (void)hipGetLastError();
       enqueued_all = false;
       break;
     }
+    begin = end;
   }
 
   const hipError_t sync_status = hipStreamSynchronize(stream);
@@ -224,6 +451,7 @@ void CopyJobs(std::vector<CopyJob>* jobs, int host_threads, hipMemcpyKind device
 
   CopyHostJobs(host_jobs, host_threads);
   for (auto& [device_id, grouped_jobs] : device_jobs) {
+    if (ProfileEnabled()) RecordMergeability(grouped_jobs, device_copy_kind);
     CopyDeviceJobs(grouped_jobs, device_id, device_copy_kind);
   }
 }
@@ -453,7 +681,11 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
   // during the parallel copy without a use-after-free against Write/Evict/
   // Clear. The per-block copies still run in parallel within the batch, which
   // is what breaks the single-core memcpy ceiling on cold DRAM.
-  std::lock_guard<std::mutex> lock(mu_);
+  //
+  // This whole-batch hold is what serializes concurrent clients; ProfiledLock
+  // quantifies it under UMBP_DRAM_PROFILE=1.
+  ScopedInFlight in_flight;
+  ProfiledLock lock(mu_, ReadLockStats(), n);
 
   std::vector<CopyJob> jobs;
   jobs.reserve(n);
@@ -486,7 +718,12 @@ std::vector<bool> DRAMTier::BatchWrite(const std::vector<std::string>& keys,
   // reads/writes). Slot allocation mutates free_list_/slots_ and must be serial;
   // only the per-block payload copies run in parallel, which is what breaks the
   // single-core memcpy ceiling on the backup path.
-  std::lock_guard<std::mutex> lock(mu_);
+  //
+  // Phase 2 could in principle run outside the lock (the reserved-but-
+  // unregistered region is unreachable to other threads); ProfiledLock measures
+  // what that would be worth. See UMBP_STANDALONE_PROCESS_DESIGN.md 11.1.
+  ScopedInFlight in_flight;
+  ProfiledLock lock(mu_, WriteLockStats(), n);
 
   struct WriteJob {
     CopyJob copy;

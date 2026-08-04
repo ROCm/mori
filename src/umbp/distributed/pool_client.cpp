@@ -734,6 +734,65 @@ std::optional<std::pair<mori::io::MemoryDesc, size_t>> PoolClient::FindRegistere
 //  Self-target fast paths
 // ---------------------------------------------------------------------------
 
+// One object occupies ceil(size / page_size) tier pages. The user-side buffer is
+// contiguous by construction (page i sits at i * page_size), so whenever the
+// tier side is also contiguous the whole run can move in a single copy.
+// PageBitmapAllocator::Allocate prefers a same-buffer continuous run (its
+// strategy 1), so in the common case an object collapses to exactly one run --
+// turning ceil(size / page_size) synchronous hipMemcpy round trips into one.
+struct TierPageRun {
+  size_t first_page = 0;      // index into `pages`, also the user-side page index
+  uint32_t buffer_index = 0;
+  uint64_t tier_offset = 0;   // byte offset inside that tier buffer
+  uint64_t bytes = 0;
+};
+
+// Merging can be turned off with UMBP_LOCAL_PAGE_MERGE=0 to A/B the win
+// without rebuilding, mirroring UMBP_DRAM_NT_COPY in the DRAM tier.
+bool LocalPageMergeEnabled() {
+  static const bool enabled = [] {
+    const char* raw = std::getenv("UMBP_LOCAL_PAGE_MERGE");
+    return !(raw != nullptr && raw[0] == '0');
+  }();
+  return enabled;
+}
+
+// Validates every page and groups them into maximal tier-contiguous runs.
+// Returns false (after logging) on the same conditions the per-page loop used
+// to reject: unknown buffer index, unmapped buffer, or an out-of-range offset.
+bool BuildTierPageRuns(const std::vector<PageLocation>& pages, uint64_t page_size, size_t size,
+                       const std::vector<ExportableDram>& dram_buffers, const char* op,
+                       std::vector<TierPageRun>* runs) {
+  runs->clear();
+  for (size_t i = 0; i < pages.size(); ++i) {
+    const auto& p = pages[i];
+    if (p.buffer_index >= dram_buffers.size()) {
+      MORI_UMBP_ERROR("[PoolClient] local {}: invalid buffer_index {}", op, p.buffer_index);
+      return false;
+    }
+    const auto& dram = dram_buffers[p.buffer_index];
+    const uint64_t off = static_cast<uint64_t>(p.page_index) * page_size;
+    if (!dram.buffer || page_size > dram.size || off > dram.size - page_size) {
+      MORI_UMBP_ERROR("[PoolClient] local {}: OOB buf={} off={}", op, p.buffer_index, off);
+      return false;
+    }
+    const uint64_t bytes = LogicalPageBytes(i, pages.size(), page_size, size);
+
+    // Extend the open run only if this page continues it on the tier side. The
+    // user side needs no check: only the final page can be short, so every
+    // interior page is exactly page_size and the user offsets stay dense.
+    if (!runs->empty() && LocalPageMergeEnabled()) {
+      TierPageRun& last = runs->back();
+      if (last.buffer_index == p.buffer_index && last.tier_offset + last.bytes == off) {
+        last.bytes += bytes;
+        continue;
+      }
+    }
+    runs->push_back({i, p.buffer_index, off, bytes});
+  }
+  return true;
+}
+
 bool PoolClient::LocalPutPages(const std::vector<PageLocation>& pages, uint64_t page_size,
                                const void* src, size_t size) {
   const char* src_bytes = static_cast<const char*>(src);
@@ -749,27 +808,19 @@ bool PoolClient::LocalPutPages(const std::vector<PageLocation>& pages, uint64_t 
                     source_location.device_id);
     return false;
   }
-  for (size_t i = 0; i < pages.size(); ++i) {
-    const auto& p = pages[i];
-    if (p.buffer_index >= config_.dram_buffers.size()) {
-      MORI_UMBP_ERROR("[PoolClient] local Put: invalid buffer_index {}", p.buffer_index);
-      return false;
-    }
-    auto& dram = config_.dram_buffers[p.buffer_index];
-    const uint64_t off = static_cast<uint64_t>(p.page_index) * page_size;
-    if (!dram.buffer || page_size > dram.size || off > dram.size - page_size) {
-      MORI_UMBP_ERROR("[PoolClient] local Put: OOB buf={} off={}", p.buffer_index, off);
-      return false;
-    }
-    const uint64_t bytes = LogicalPageBytes(i, pages.size(), page_size, size);
-    void* dst = static_cast<char*>(dram.buffer) + off;
-    const void* page_src = src_bytes + i * page_size;
+  std::vector<TierPageRun> runs;
+  if (!BuildTierPageRuns(pages, page_size, size, config_.dram_buffers, "Put", &runs)) return false;
+
+  for (const auto& run : runs) {
+    void* dst = static_cast<char*>(config_.dram_buffers[run.buffer_index].buffer) + run.tier_offset;
+    const void* page_src = src_bytes + run.first_page * page_size;
     if (source_location.IsDevice()) {
-      if (!DeviceCopy(dst, page_src, bytes, hipMemcpyDeviceToHost, source_location.device_id)) {
+      if (!DeviceCopy(dst, page_src, run.bytes, hipMemcpyDeviceToHost,
+                      source_location.device_id)) {
         return false;
       }
     } else {
-      LocalCopyBlock(dst, page_src, bytes);
+      LocalCopyBlock(dst, page_src, run.bytes);
     }
   }
   return true;
@@ -791,28 +842,20 @@ bool PoolClient::LocalGetPages(const std::vector<PageLocation>& pages, uint64_t 
                     destination_location.device_id);
     return false;
   }
-  for (size_t i = 0; i < pages.size(); ++i) {
-    const auto& p = pages[i];
-    if (p.buffer_index >= config_.dram_buffers.size()) {
-      MORI_UMBP_ERROR("[PoolClient] local Get: invalid buffer_index {}", p.buffer_index);
-      return false;
-    }
-    auto& dram = config_.dram_buffers[p.buffer_index];
-    const uint64_t off = static_cast<uint64_t>(p.page_index) * page_size;
-    if (!dram.buffer || page_size > dram.size || off > dram.size - page_size) {
-      MORI_UMBP_ERROR("[PoolClient] local Get: OOB buf={} off={}", p.buffer_index, off);
-      return false;
-    }
-    const uint64_t bytes = LogicalPageBytes(i, pages.size(), page_size, size);
-    void* page_dst = dst_bytes + i * page_size;
-    const void* src = static_cast<const char*>(dram.buffer) + off;
+  std::vector<TierPageRun> runs;
+  if (!BuildTierPageRuns(pages, page_size, size, config_.dram_buffers, "Get", &runs)) return false;
+
+  for (const auto& run : runs) {
+    void* page_dst = dst_bytes + run.first_page * page_size;
+    const void* src =
+        static_cast<const char*>(config_.dram_buffers[run.buffer_index].buffer) + run.tier_offset;
     if (destination_location.IsDevice()) {
-      if (!DeviceCopy(page_dst, src, bytes, hipMemcpyHostToDevice,
+      if (!DeviceCopy(page_dst, src, run.bytes, hipMemcpyHostToDevice,
                       destination_location.device_id)) {
         return false;
       }
     } else {
-      LocalCopyBlock(page_dst, src, bytes);
+      LocalCopyBlock(page_dst, src, run.bytes);
     }
   }
   return true;
