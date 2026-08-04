@@ -4336,7 +4336,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             // path, which is what WarpAccumLF uses and is right for the output.
 #define _CROW_AT(_j) \
   (*reinterpret_cast<const _CVecT*>(_cPullTiles + (size_t)(_j) * _rowStride + _e))
-#if defined(MORI_COMB_FOLDU)
+#if defined(MORI_COMB_FOLDU) || defined(MORI_COMB_FOLDB)
             // Read every source before consuming any of them, so the ds_read_b128s issue back to
             // back instead of each waiting on the previous accumulate. _nRed is a runtime value, so
             // the plain loop below cannot be unrolled and the reads stay serialised -- that is the
@@ -4363,8 +4363,24 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
               _CVecT _svR[_cRedSrcMax];
 #pragma unroll
               for (int _j = 0; _j < _cRedSrcMax; ++_j) {
+#if defined(MORI_COMB_FOLDB)
+                // Clamp, do not skip. The skip below is what made batching the reads nearly
+                // worthless: each `continue` puts its ds_load in its own exec-masked block, and the
+                // compiler opens every one of those blocks with `s_wait_loadcnt_dscnt 0x0` -- a
+                // wait for ALL outstanding loads, not a partial one -- so the four ds_load_b128s
+                // run strictly one after another no matter what order the source asks for. Reading
+                // row 0 for a dead slot and discarding it below costs one extra LDS read and lets
+                // all four issue back to back under a single wait.
+                //
+                // In bounds by construction: the gather always fetches worldSize rows and the tile
+                // is sized for _cRedSrcMax of them, so row 0 exists whenever the loop runs. The
+                // clamp is only needed for worldSize < _cRedSrcMax, where rows above _nRed are
+                // outside the fetched region.
+                _svR[_j] = _CROW_AT((_j < _nRed) ? _j : 0);
+#else
                 if (_j >= _nRed || _CROW_DEAD(_j)) continue;
                 _svR[_j] = _CROW_AT(_j);
+#endif
               }
 #pragma unroll
               for (int _j = 0; _j < _cRedSrcMax; ++_j) {

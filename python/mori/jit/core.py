@@ -754,7 +754,13 @@ def _comb_diag_defines() -> list[str]:
       MORI_COMB_FOLDU    reads every source into registers before accumulating any of them, so the
                          ds_read_b128s issue back to back. Worth 314.6 -> 309.3us at 64x8, i.e.
                          1.8% -- real and repeatable, but a third of what the microbenchmark
-                         predicted. Both are documented where they act, at _cPullOk and
+                         predicted.
+      MORI_COMB_FOLDB    implies FOLDU and drops the per-source skip from the READ loop, which is
+                         why FOLDU alone bought so little: each skip puts its ds_load in its own
+                         exec-masked block and the compiler opens every one with
+                         s_wait_loadcnt_dscnt 0x0, so the four loads stay serialised however the
+                         source orders them. A dead slot reads row 0 and is discarded in the
+                         accumulate. All three are documented where they act, at _cPullOk and
                          _cRedSrcMax in intranode.hpp.
 
     Every other flag in this list is a DELETION or a diagnostic, which is what makes "off" the right
@@ -782,6 +788,7 @@ def _comb_diag_defines() -> list[str]:
             "MORI_COMB_PUSHONLY",
             "MORI_COMB_NOWEIGHT",
             "MORI_COMB_NOROUTE",
+            "MORI_COMB_FOLDB",
             "MORI_COMB_FOLDVEC",
             "MORI_COMB_FOLDU",
             "MORI_COMB_DUMPCNT",
