@@ -91,6 +91,7 @@ endif()
 
 # Core static library
 set(UMBP_CORE_SRCS
+    common/device_copy.cpp
     local/block_index/local_block_index.cpp
     storage/io/storage_io_driver.cpp
     storage/io/posix_storage_io_driver.cpp
@@ -123,6 +124,7 @@ endif()
 add_library(umbp_core STATIC ${UMBP_CORE_SRCS})
 target_include_directories(umbp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(umbp_core PRIVATE pthread)
+target_link_libraries(umbp_core PUBLIC hip::host)
 if(UNIX)
   target_link_libraries(umbp_core PRIVATE rt)
 endif()

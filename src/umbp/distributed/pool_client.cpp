@@ -44,6 +44,7 @@
 
 #include "mori/io/backend.hpp"
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/device_copy.h"
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
@@ -59,78 +60,6 @@ namespace mori::umbp {
 namespace {
 
 bool IsValidMemoryDesc(const mori::io::MemoryDesc& desc) { return desc.size > 0; }
-
-struct PointerLocation {
-  mori::io::MemoryLocationType location{mori::io::MemoryLocationType::CPU};
-  int device_id{-1};
-
-  bool IsDevice() const { return location == mori::io::MemoryLocationType::GPU; }
-};
-
-// hipPointerGetAttributes reports ordinary malloc/mmap memory as either
-// hipMemoryTypeUnregistered or an invalid-value lookup, depending on the ROCm
-// runtime version. Both mean CPU memory here. Managed memory is intentionally
-// not treated as a stable GPU RDMA region because its backing pages may move.
-PointerLocation DetectPointerLocation(const void* ptr) {
-  if (ptr == nullptr) return {};
-
-  hipPointerAttribute_t attributes{};
-  const hipError_t status = hipPointerGetAttributes(&attributes, ptr);
-  if (status == hipSuccess) {
-    if (attributes.type == hipMemoryTypeDevice && attributes.device >= 0) {
-      return {mori::io::MemoryLocationType::GPU, attributes.device};
-    }
-    return {};
-  }
-
-  // An attribute miss is normal for unregistered host memory. Clear HIP's
-  // thread-local error so it cannot poison a later runtime call.
-  (void)hipGetLastError();
-  return {};
-}
-
-class ScopedHipDevice {
- public:
-  explicit ScopedHipDevice(int device_id) {
-    if (device_id < 0) return;
-    if (hipGetDevice(&previous_device_) != hipSuccess) {
-      (void)hipGetLastError();
-      return;
-    }
-    if (previous_device_ != device_id) {
-      if (hipSetDevice(device_id) != hipSuccess) {
-        (void)hipGetLastError();
-        return;
-      }
-      changed_ = true;
-    }
-    valid_ = true;
-  }
-
-  ~ScopedHipDevice() {
-    if (changed_) {
-      const hipError_t status = hipSetDevice(previous_device_);
-      if (status != hipSuccess) (void)hipGetLastError();
-    }
-  }
-
-  bool IsValid() const { return valid_; }
-
- private:
-  int previous_device_{-1};
-  bool changed_{false};
-  bool valid_{false};
-};
-
-bool DeviceCopy(void* dst, const void* src, size_t size, hipMemcpyKind kind, int device_id) {
-  const hipError_t status = hipMemcpy(dst, src, size, kind);
-  if (status != hipSuccess) {
-    MORI_UMBP_ERROR("[PoolClient] hipMemcpy failed on device {}: {}", device_id,
-                    hipGetErrorString(status));
-    return false;
-  }
-  return true;
-}
 
 // Key for grouping page transfers by their (local MR, remote MR) pair.
 struct PairKey {
@@ -750,15 +679,17 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size) {
   }
 
   const PointerLocation pointer_location = DetectPointerLocation(ptr);
+  const auto memory_location = pointer_location.IsDevice() ? mori::io::MemoryLocationType::GPU
+                                                           : mori::io::MemoryLocationType::CPU;
   try {
-    auto mem_desc = io_engine_->RegisterMemory(ptr, size, pointer_location.device_id,
-                                               pointer_location.location);
+    auto mem_desc =
+        io_engine_->RegisterMemory(ptr, size, pointer_location.device_id, memory_location);
     if (!IsValidMemoryDesc(mem_desc) || mem_desc.data != reinterpret_cast<uintptr_t>(ptr) ||
-        mem_desc.size < size || mem_desc.loc != pointer_location.location ||
+        mem_desc.size < size || mem_desc.loc != memory_location ||
         (pointer_location.IsDevice() && mem_desc.deviceId != pointer_location.device_id)) {
       MORI_UMBP_ERROR(
           "[PoolClient] RegisterMemory: invalid descriptor for ptr={}, size={}, device={}, loc={}",
-          ptr, size, pointer_location.device_id, static_cast<uint32_t>(pointer_location.location));
+          ptr, size, pointer_location.device_id, static_cast<uint32_t>(memory_location));
       if (IsValidMemoryDesc(mem_desc)) io_engine_->DeregisterMemory(mem_desc);
       return false;
     }
@@ -809,7 +740,8 @@ bool PoolClient::LocalPutPages(const std::vector<PageLocation>& pages, uint64_t 
   const auto registered_source = FindRegisteredMemory(src, size);
   const PointerLocation source_location =
       registered_source.has_value()
-          ? PointerLocation{registered_source->first.loc, registered_source->first.deviceId}
+          ? PointerLocation{registered_source->first.loc == mori::io::MemoryLocationType::GPU,
+                            registered_source->first.deviceId}
           : DetectPointerLocation(src);
   ScopedHipDevice device_guard(source_location.IsDevice() ? source_location.device_id : -1);
   if (source_location.IsDevice() && !device_guard.IsValid()) {
@@ -848,9 +780,10 @@ bool PoolClient::LocalGetPages(const std::vector<PageLocation>& pages, uint64_t 
   char* dst_bytes = static_cast<char*>(dst);
   const auto registered_destination = FindRegisteredMemory(dst, size);
   const PointerLocation destination_location =
-      registered_destination.has_value() ? PointerLocation{registered_destination->first.loc,
-                                                           registered_destination->first.deviceId}
-                                         : DetectPointerLocation(dst);
+      registered_destination.has_value()
+          ? PointerLocation{registered_destination->first.loc == mori::io::MemoryLocationType::GPU,
+                            registered_destination->first.deviceId}
+          : DetectPointerLocation(dst);
   ScopedHipDevice device_guard(destination_location.IsDevice() ? destination_location.device_id
                                                                : -1);
   if (destination_location.IsDevice() && !device_guard.IsValid()) {

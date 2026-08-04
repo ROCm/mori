@@ -41,6 +41,7 @@
 #include <thread>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/device_copy.h"
 #include "umbp/local/host_mem_allocator.h"
 #include "umbp/standalone/ipc.h"
 
@@ -460,7 +461,11 @@ void StandaloneProcessClient::Close() {
   if (closed_) return;
   try {
     DeregisterMemoryLocked();
+  } catch (const std::exception& error) {
+    MORI_UMBP_ERROR("[StandaloneProcessClient] deregistration during close failed: {}",
+                    error.what());
   } catch (...) {
+    MORI_UMBP_ERROR("[StandaloneProcessClient] deregistration during close failed");
   }
   closed_ = true;
   stub_.reset();
@@ -472,6 +477,86 @@ bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size) {
   std::unique_lock lk(op_mutex_);
   if (closed_) return false;
 
+  const PointerLocation location = DetectPointerLocation(reinterpret_cast<void*>(ptr));
+  if (location.IsDevice()) return RegisterDeviceMemory(ptr, size, location.device_id);
+  return RegisterHostShmMemory(ptr, size);
+}
+
+bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id) {
+  if (ptr == 0 || size == 0) return false;
+  ScopedHipDevice device_guard(device_id);
+  if (!device_guard.IsValid()) {
+    MORI_UMBP_ERROR("[StandaloneProcessClient] failed to select GPU device {}", device_id);
+    return false;
+  }
+
+  void* allocation_base = nullptr;
+  size_t allocation_size = 0;
+  const hipError_t range_status =
+      hipMemGetAddressRange(reinterpret_cast<hipDeviceptr_t*>(&allocation_base), &allocation_size,
+                            reinterpret_cast<hipDeviceptr_t>(ptr));
+  if (range_status != hipSuccess || allocation_base == nullptr) {
+    MORI_UMBP_ERROR("[StandaloneProcessClient] hipMemGetAddressRange failed for ptr=0x{:x}: {}",
+                    ptr, hipGetErrorString(range_status));
+    (void)hipGetLastError();
+    return false;
+  }
+
+  const uintptr_t allocation_address = reinterpret_cast<uintptr_t>(allocation_base);
+  if (ptr < allocation_address) return false;
+  const uint64_t ipc_offset = static_cast<uint64_t>(ptr - allocation_address);
+  if (ipc_offset > allocation_size || size > allocation_size - ipc_offset) {
+    MORI_UMBP_ERROR(
+        "[StandaloneProcessClient] GPU registration range exceeds allocation: ptr=0x{:x} "
+        "size={} alloc_base=0x{:x} alloc_size={}",
+        ptr, size, allocation_address, allocation_size);
+    return false;
+  }
+
+  hipIpcMemHandle_t handle{};
+  const hipError_t handle_status = hipIpcGetMemHandle(&handle, allocation_base);
+  if (handle_status != hipSuccess) {
+    MORI_UMBP_ERROR("[StandaloneProcessClient] hipIpcGetMemHandle failed for ptr=0x{:x}: {}", ptr,
+                    hipGetErrorString(handle_status));
+    (void)hipGetLastError();
+    return false;
+  }
+
+  ::umbp::RegisterMemoryRequest req;
+  req.set_client_id(ClientId());
+  req.set_worker_base(ptr);
+  req.set_size(size);
+  req.set_worker_node_id(standalone_config_.worker_node_id);
+  req.set_worker_node_address(standalone_config_.worker_node_address);
+  for (const auto& tag : standalone_config_.tags) req.add_tags(tag);
+  req.set_kind(::umbp::MEMORY_KIND_GPU_IPC);
+  req.set_device_id(device_id);
+  req.set_ipc_handle(reinterpret_cast<const char*>(&handle), sizeof(handle));
+  req.set_ipc_offset(ipc_offset);
+  req.set_alloc_base(allocation_address);
+
+  grpc::ClientContext ctx;
+  ::umbp::BoolResponse resp;
+  const grpc::Status rpc_status = stub_->RegisterMemory(&ctx, req, &resp);
+  if (!rpc_status.ok() || !resp.ok()) {
+    MORI_UMBP_ERROR("[StandaloneProcessClient] GPU RegisterMemory failed: {}",
+                    rpc_status.ok() ? resp.error() : rpc_status.error_message());
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(registration_mu_);
+  auto existing = std::find_if(regions_.begin(), regions_.end(), [&](const RegisteredRegion& r) {
+    return r.base == ptr && r.kind == RegionKind::kGpuIpc;
+  });
+  if (existing != regions_.end()) {
+    existing->size = size;
+  } else {
+    regions_.push_back({ptr, size, RegionKind::kGpuIpc});
+  }
+  return true;
+}
+
+bool StandaloneProcessClient::RegisterHostShmMemory(uintptr_t ptr, size_t size) {
   auto allocation = HostMemAllocator::AcquireShmAllocation(ptr, size);
   if (!allocation.has_value()) {
     throw std::runtime_error(
@@ -514,7 +599,7 @@ bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size) {
       existing->size = allocation->mapped_size;
       HostMemAllocator::ReleaseShmAllocation(base);
     } else {
-      regions_.push_back({base, allocation->mapped_size});
+      regions_.push_back({base, allocation->mapped_size, RegionKind::kHostShm});
     }
     acquired_kept = true;
   } catch (...) {
@@ -533,7 +618,7 @@ void StandaloneProcessClient::DeregisterMemoryLocked() {
     std::lock_guard<std::mutex> lock(registration_mu_);
     if (regions_.empty()) return;
     client_id = client_id_;
-    regions.swap(regions_);
+    regions = regions_;
   }
 
   // One RPC tears down all of this client's regions server-side (UnmapClient),
@@ -542,8 +627,21 @@ void StandaloneProcessClient::DeregisterMemoryLocked() {
   ::umbp::DeregisterMemoryRequest req;
   req.set_client_id(client_id);
   ::umbp::Empty resp;
-  if (stub_) stub_->DeregisterMemory(&ctx, req, &resp);
-  for (const auto& region : regions) HostMemAllocator::ReleaseShmAllocation(region.base);
+  if (!stub_) throw std::runtime_error("standalone DeregisterMemory RPC has no active stub");
+  const grpc::Status status = stub_->DeregisterMemory(&ctx, req, &resp);
+  if (!status.ok()) {
+    throw std::runtime_error("standalone DeregisterMemory RPC failed: " + status.error_message());
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(registration_mu_);
+    regions_.clear();
+  }
+  for (const auto& region : regions) {
+    if (region.kind == RegionKind::kHostShm) {
+      HostMemAllocator::ReleaseShmAllocation(region.base);
+    }
+  }
 }
 
 void StandaloneProcessClient::DeregisterMemory(uintptr_t /*ptr*/) {

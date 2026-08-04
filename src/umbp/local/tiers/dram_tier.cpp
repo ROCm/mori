@@ -29,12 +29,18 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
+
+#include "mori/utils/mori_log.hpp"
+#include "umbp/common/device_copy.h"
 
 namespace mori::umbp {
 
@@ -96,6 +102,129 @@ inline void CopyBlock(void* dst, const void* src, size_t size) {
     NtCopyAvx2(static_cast<char*>(dst), static_cast<const char*>(src), size);
   } else {
     std::memcpy(dst, src, size);
+  }
+}
+
+struct CopyJob {
+  void* dst;
+  const void* src;
+  const void* classified_ptr;
+  size_t size;
+  size_t idx;
+  bool copied{false};
+};
+
+void CopyHostJobs(const std::vector<CopyJob*>& jobs, int num_threads) {
+  if (jobs.empty()) return;
+  num_threads = std::max(1, std::min(num_threads, static_cast<int>(jobs.size())));
+  if (num_threads == 1) {
+    for (CopyJob* job : jobs) {
+      CopyBlock(job->dst, job->src, job->size);
+      job->copied = true;
+    }
+    return;
+  }
+
+  std::atomic<size_t> next{0};
+  auto worker = [&]() {
+    size_t i = 0;
+    while ((i = next.fetch_add(1)) < jobs.size()) {
+      CopyJob* job = jobs[i];
+      CopyBlock(job->dst, job->src, job->size);
+      job->copied = true;
+    }
+  };
+  std::vector<std::thread> pool;
+  pool.reserve(num_threads);
+  for (int i = 0; i < num_threads; ++i) pool.emplace_back(worker);
+  for (auto& thread : pool) thread.join();
+}
+
+// One reusable stream per device.
+//
+// Creating and destroying a stream around every batch costs ~6.5 ms per pair on
+// MI355X/ROCm 7.2 (measured), which dwarfs the copies themselves: a layer-wise
+// KV load issues 2 * num_layers batches per request, so the churn alone added
+// ~1 s per rank and, because ReadBatchIntoPtr holds mu_ for the whole batch,
+// ~8 s once 8 ranks serialize behind it. Reusing the stream removes that.
+//
+// The streams are intentionally never destroyed: tearing down HIP resources
+// from a static destructor races with runtime teardown. They are a fixed,
+// per-device cost that ends with the process.
+hipStream_t DeviceStream(int device_id) {
+  static std::mutex stream_mu;
+  static std::map<int, hipStream_t> streams;
+  std::lock_guard<std::mutex> lock(stream_mu);
+  auto it = streams.find(device_id);
+  if (it != streams.end()) return it->second;
+
+  hipStream_t stream = nullptr;
+  const hipError_t status = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
+  if (status != hipSuccess) {
+    MORI_UMBP_ERROR("[DRAMTier] hipStreamCreateWithFlags failed on device {}: {}", device_id,
+                    hipGetErrorString(status));
+    (void)hipGetLastError();
+    return nullptr;
+  }
+  streams.emplace(device_id, stream);
+  return stream;
+}
+
+void CopyDeviceJobs(const std::vector<CopyJob*>& jobs, int device_id, hipMemcpyKind kind) {
+  if (jobs.empty()) return;
+  ScopedHipDevice device_guard(device_id);
+  if (!device_guard.IsValid()) {
+    MORI_UMBP_ERROR("[DRAMTier] failed to select GPU device {}", device_id);
+    return;
+  }
+
+  // Created under the device guard above, so the stream belongs to device_id.
+  hipStream_t stream = DeviceStream(device_id);
+  if (stream == nullptr) return;
+
+  hipError_t status = hipSuccess;
+  bool enqueued_all = true;
+  for (CopyJob* job : jobs) {
+    status = hipMemcpyAsync(job->dst, job->src, job->size, kind, stream);
+    if (status != hipSuccess) {
+      MORI_UMBP_ERROR("[DRAMTier] hipMemcpyAsync failed on device {}: {}", device_id,
+                      hipGetErrorString(status));
+      (void)hipGetLastError();
+      enqueued_all = false;
+      break;
+    }
+  }
+
+  const hipError_t sync_status = hipStreamSynchronize(stream);
+  if (sync_status != hipSuccess) {
+    MORI_UMBP_ERROR("[DRAMTier] hipStreamSynchronize failed on device {}: {}", device_id,
+                    hipGetErrorString(sync_status));
+    (void)hipGetLastError();
+    enqueued_all = false;
+  }
+
+  if (enqueued_all) {
+    for (CopyJob* job : jobs) job->copied = true;
+  }
+}
+
+void CopyJobs(std::vector<CopyJob>* jobs, int host_threads, hipMemcpyKind device_copy_kind) {
+  if (jobs->empty()) return;
+  std::vector<CopyJob*> host_jobs;
+  std::map<int, std::vector<CopyJob*>> device_jobs;
+  host_jobs.reserve(jobs->size());
+  for (CopyJob& job : *jobs) {
+    const PointerLocation location = DetectPointerLocation(job.classified_ptr);
+    if (location.IsDevice()) {
+      device_jobs[location.device_id].push_back(&job);
+    } else {
+      host_jobs.push_back(&job);
+    }
+  }
+
+  CopyHostJobs(host_jobs, host_threads);
+  for (auto& [device_id, grouped_jobs] : device_jobs) {
+    CopyDeviceJobs(grouped_jobs, device_id, device_copy_kind);
   }
 }
 
@@ -268,7 +397,17 @@ bool DRAMTier::Write(const std::string& key, const void* data, size_t size) {
     return false;
   }
 
-  std::memcpy(static_cast<char*>(base_ptr_) + offset, data, size);
+  const PointerLocation source_location = DetectPointerLocation(data);
+  if (source_location.IsDevice()) {
+    ScopedHipDevice device_guard(source_location.device_id);
+    if (!device_guard.IsValid() || !DeviceCopy(static_cast<char*>(base_ptr_) + offset, data, size,
+                                               hipMemcpyDeviceToHost, source_location.device_id)) {
+      Deallocate(offset, size);
+      return false;
+    }
+  } else {
+    std::memcpy(static_cast<char*>(base_ptr_) + offset, data, size);
+  }
   slots_[key] = {offset, size};
   used_ += size;
   TouchLRU(key);
@@ -286,8 +425,18 @@ bool DRAMTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t siz
   // would produce a partially-filled KV block with no error signal.
   if (size != it->second.size) return false;
 
-  std::memcpy(reinterpret_cast<void*>(dst_ptr), static_cast<char*>(base_ptr_) + it->second.offset,
-              size);
+  void* dst = reinterpret_cast<void*>(dst_ptr);
+  const PointerLocation destination_location = DetectPointerLocation(dst);
+  if (destination_location.IsDevice()) {
+    ScopedHipDevice device_guard(destination_location.device_id);
+    if (!device_guard.IsValid() ||
+        !DeviceCopy(dst, static_cast<char*>(base_ptr_) + it->second.offset, size,
+                    hipMemcpyHostToDevice, destination_location.device_id)) {
+      return false;
+    }
+  } else {
+    std::memcpy(dst, static_cast<char*>(base_ptr_) + it->second.offset, size);
+  }
   TouchLRU(key);
   return true;
 }
@@ -306,46 +455,23 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
   // is what breaks the single-core memcpy ceiling on cold DRAM.
   std::lock_guard<std::mutex> lock(mu_);
 
-  struct Job {
-    void* dst;
-    const void* src;
-    size_t size;
-    size_t idx;
-  };
-  std::vector<Job> jobs;
+  std::vector<CopyJob> jobs;
   jobs.reserve(n);
   for (size_t i = 0; i < n; ++i) {
     auto it = slots_.find(keys[i]);
     if (it == slots_.end()) continue;
     if (sizes[i] != it->second.size) continue;
-    jobs.push_back({reinterpret_cast<void*>(dst_ptrs[i]),
-                    static_cast<char*>(base_ptr_) + it->second.offset, sizes[i], i});
+    void* dst = reinterpret_cast<void*>(dst_ptrs[i]);
+    jobs.push_back(
+        {dst, static_cast<char*>(base_ptr_) + it->second.offset, dst, sizes[i], i, false});
   }
 
-  int num_threads = read_threads_;
-  if (num_threads > static_cast<int>(jobs.size())) num_threads = static_cast<int>(jobs.size());
-
-  if (num_threads <= 1) {
-    for (const auto& j : jobs) {
-      CopyBlock(j.dst, j.src, j.size);
-      results[j.idx] = true;
-    }
-  } else {
-    std::atomic<size_t> next{0};
-    auto worker = [&]() {
-      size_t i;
-      while ((i = next.fetch_add(1)) < jobs.size()) {
-        CopyBlock(jobs[i].dst, jobs[i].src, jobs[i].size);
-      }
-    };
-    std::vector<std::thread> pool;
-    pool.reserve(num_threads);
-    for (int t = 0; t < num_threads; ++t) pool.emplace_back(worker);
-    for (auto& th : pool) th.join();
-    for (const auto& j : jobs) results[j.idx] = true;
+  CopyJobs(&jobs, read_threads_, hipMemcpyHostToDevice);
+  for (const auto& job : jobs) {
+    if (!job.copied) continue;
+    results[job.idx] = true;
+    TouchLRU(keys[job.idx]);
   }
-
-  for (const auto& j : jobs) TouchLRU(keys[j.idx]);
   return results;
 }
 
@@ -362,15 +488,13 @@ std::vector<bool> DRAMTier::BatchWrite(const std::vector<std::string>& keys,
   // single-core memcpy ceiling on the backup path.
   std::lock_guard<std::mutex> lock(mu_);
 
-  struct Job {
-    void* dst;
-    const void* src;
-    size_t size;
-    size_t idx;
+  struct WriteJob {
+    CopyJob copy;
     size_t offset;
   };
-  std::vector<Job> jobs;
-  jobs.reserve(n);
+  std::vector<WriteJob> write_jobs;
+  std::vector<CopyJob> copy_jobs;
+  write_jobs.reserve(n);
 
   // Phase 1 (serial): free any existing slot for the key, then allocate. Does
   // NOT self-evict — a key that doesn't fit is left false so the upper layer
@@ -389,35 +513,29 @@ std::vector<bool> DRAMTier::BatchWrite(const std::vector<std::string>& keys,
     }
     size_t offset = Allocate(sizes[i]);
     if (offset == static_cast<size_t>(-1)) continue;
-    jobs.push_back({static_cast<char*>(base_ptr_) + offset, data_ptrs[i], sizes[i], i, offset});
+    write_jobs.push_back(
+        {{static_cast<char*>(base_ptr_) + offset, data_ptrs[i], data_ptrs[i], sizes[i], i, false},
+         offset});
   }
 
-  // Phase 2 (parallel): non-temporal CopyBlock each payload into its slot.
-  int num_threads = write_threads_;
-  if (num_threads > static_cast<int>(jobs.size())) num_threads = static_cast<int>(jobs.size());
-
-  if (num_threads <= 1) {
-    for (const auto& j : jobs) CopyBlock(j.dst, j.src, j.size);
-  } else {
-    std::atomic<size_t> next{0};
-    auto worker = [&]() {
-      size_t i;
-      while ((i = next.fetch_add(1)) < jobs.size()) {
-        CopyBlock(jobs[i].dst, jobs[i].src, jobs[i].size);
-      }
-    };
-    std::vector<std::thread> pool;
-    pool.reserve(num_threads);
-    for (int t = 0; t < num_threads; ++t) pool.emplace_back(worker);
-    for (auto& th : pool) th.join();
-  }
+  // Phase 2: preserve the existing parallel host path; GPU jobs are grouped by
+  // device and submitted to one stream with one synchronization per device.
+  copy_jobs.reserve(write_jobs.size());
+  for (const auto& job : write_jobs) copy_jobs.push_back(job.copy);
+  CopyJobs(&copy_jobs, write_threads_, hipMemcpyDeviceToHost);
 
   // Phase 3 (serial): register slots + LRU, mark successes.
-  for (const auto& j : jobs) {
-    slots_[keys[j.idx]] = {j.offset, j.size};
-    used_ += j.size;
-    TouchLRU(keys[j.idx]);
-    results[j.idx] = true;
+  for (size_t i = 0; i < write_jobs.size(); ++i) {
+    const WriteJob& write_job = write_jobs[i];
+    const CopyJob& copy_job = copy_jobs[i];
+    if (!copy_job.copied) {
+      Deallocate(write_job.offset, copy_job.size);
+      continue;
+    }
+    slots_[keys[copy_job.idx]] = {write_job.offset, copy_job.size};
+    used_ += copy_job.size;
+    TouchLRU(keys[copy_job.idx]);
+    results[copy_job.idx] = true;
   }
   return results;
 }

@@ -22,6 +22,7 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+#include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -32,6 +33,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
@@ -41,6 +43,7 @@
 #include "umbp/standalone/ipc.h"
 #include "umbp/standalone/standalone_server.h"
 #include "umbp/umbp_client.h"
+#include "umbp_standalone.grpc.pb.h"
 
 namespace mori::umbp {
 namespace {
@@ -177,6 +180,46 @@ TEST(StandaloneShmIpcTest, RawUdsFdRegistrationTransfersFd) {
   allocator.Free(handle);
 
   EXPECT_TRUE(receiver_ok.load());
+}
+
+TEST(StandaloneShmIpcTest, GpuRegistrationRejectsSsdBackedServer) {
+  const std::string suffix = std::to_string(getpid());
+  const std::string address = "unix:///tmp/umbp_standalone_gpu_reject_" + suffix + ".sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  const std::string ssd_path = "/tmp/umbp_standalone_gpu_reject_ssd_" + suffix;
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+  std::filesystem::remove_all(ssd_path);
+
+  UMBPConfig config;
+  config.dram.capacity_bytes = 1 << 20;
+  config.ssd.enabled = true;
+  config.ssd.storage_dir = ssd_path;
+  config.ssd.capacity_bytes = 1 << 20;
+  standalone::StandaloneServer server(config, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+  auto stub = ::umbp::UMBPStandalone::NewStub(channel);
+  grpc::ClientContext context;
+  ::umbp::RegisterMemoryRequest request;
+  request.set_kind(::umbp::MEMORY_KIND_GPU_IPC);
+  request.set_client_id("gpu-client");
+  request.set_worker_base(0x1000);
+  request.set_size(4096);
+  ::umbp::BoolResponse response;
+  const grpc::Status status = stub->RegisterMemory(&context, request, &response);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(response.ok());
+  EXPECT_NE(response.error().find("SSD"), std::string::npos);
+
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+  std::filesystem::remove_all(ssd_path);
 }
 
 TEST(StandaloneShmIpcTest, StandaloneClientUsesNonZeroOffsetsAndCanReregister) {

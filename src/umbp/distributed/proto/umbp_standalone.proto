@@ -99,6 +99,11 @@ message BatchBoolResponse {
   repeated bool ok = 1;
 }
 
+enum MemoryKind {
+  MEMORY_KIND_HOST_SHM = 0;
+  MEMORY_KIND_GPU_IPC = 1;
+}
+
 message RegisterMemoryRequest {
   string client_id = 1;
   uint64 worker_base = 2;
@@ -106,6 +111,11 @@ message RegisterMemoryRequest {
   string worker_node_id = 4;
   string worker_node_address = 5;
   repeated string tags = 6;
+  MemoryKind kind = 7;
+  int32 device_id = 8;
+  bytes ipc_handle = 9;
+  uint64 ipc_offset = 10;
+  uint64 alloc_base = 11;
 }
 
 message DeregisterMemoryRequest {

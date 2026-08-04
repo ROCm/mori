@@ -37,15 +37,18 @@
 #include <chrono>
 #include <climits>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/device_copy.h"
 #include "umbp/standalone/external_kv_identity_client.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/umbp_client.h"
@@ -398,6 +401,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
     }
+    if (request->kind() == ::umbp::MEMORY_KIND_GPU_IPC) {
+      RegisterGpuIpc(*request, response);
+      return grpc::Status::OK;
+    }
     std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
     bool ok = false;
     {
@@ -516,10 +523,32 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
  private:
+  enum class MemoryKind { kHostShm, kGpuIpc };
+
   struct RegisteredMemory {
     void* base = nullptr;
     uint64_t worker_base = 0;
     uint64_t size = 0;
+    MemoryKind kind = MemoryKind::kHostShm;
+    int device_id = -1;
+    uint64_t alloc_base = 0;
+    std::string client_id;
+  };
+
+  struct IpcKey {
+    std::string client_id;
+    int device_id = -1;
+    uint64_t alloc_base = 0;
+
+    bool operator<(const IpcKey& other) const {
+      return std::tie(client_id, device_id, alloc_base) <
+             std::tie(other.client_id, other.device_id, other.alloc_base);
+    }
+  };
+
+  struct IpcMapping {
+    void* base = nullptr;
+    size_t refcount = 0;
   };
 
   bool BackendIsDistributed() const {
@@ -702,22 +731,12 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
 
     std::string client_id(msg.client_id);
-    RegisteredMemory entry{mapped, static_cast<uint64_t>(msg.worker_base), msg.size};
-    std::optional<RegisteredMemory> old_mem;
-    {
-      std::lock_guard<std::mutex> lock(memory_mu_);
-      auto& regions = memory_[client_id];
-      auto existing = std::find_if(
-          regions.begin(), regions.end(),
-          [&](const RegisteredMemory& mem) { return mem.worker_base == entry.worker_base; });
-      if (existing != regions.end()) {
-        // Same region re-registered: replace the mapping, release the old one.
-        old_mem = *existing;
-        *existing = entry;
-      } else {
-        regions.push_back(entry);
-      }
-    }
+    RegisteredMemory entry;
+    entry.base = mapped;
+    entry.worker_base = static_cast<uint64_t>(msg.worker_base);
+    entry.size = msg.size;
+    entry.client_id = client_id;
+    std::optional<RegisteredMemory> old_mem = InsertOrReplaceRegion(client_id, entry);
     // Release outside the lock, and via ReleaseRegisteredMemory so the backend
     // deregisters the region before its mapping is munmap'd (required by the
     // distributed backend; see design-standalone-process-mode.md §5.3/§6.3).
@@ -725,6 +744,144 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     MORI_UMBP_INFO("[StandaloneServer] registered shm client_id={} worker_base=0x{:x} size={}MB",
                    client_id, msg.worker_base, msg.size / (1024 * 1024));
     return true;
+  }
+
+  bool HasIdenticalGpuRegion(const ::umbp::RegisterMemoryRequest& request) {
+    std::lock_guard<std::mutex> lock(memory_mu_);
+    auto it = memory_.find(request.client_id());
+    if (it == memory_.end()) return false;
+    return std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& mem) {
+      return mem.kind == MemoryKind::kGpuIpc && mem.worker_base == request.worker_base() &&
+             mem.size == request.size() && mem.device_id == request.device_id() &&
+             mem.alloc_base == request.alloc_base();
+    });
+  }
+
+  std::optional<RegisteredMemory> InsertOrReplaceRegion(const std::string& client_id,
+                                                        const RegisteredMemory& entry) {
+    std::lock_guard<std::mutex> lock(memory_mu_);
+    auto& regions = memory_[client_id];
+    auto existing = std::find_if(regions.begin(), regions.end(), [&](const RegisteredMemory& mem) {
+      return mem.worker_base == entry.worker_base;
+    });
+    if (existing == regions.end()) {
+      regions.push_back(entry);
+      return std::nullopt;
+    }
+    RegisteredMemory old = *existing;
+    *existing = entry;
+    return old;
+  }
+
+  void RegisterGpuIpc(const ::umbp::RegisterMemoryRequest& request,
+                      ::umbp::BoolResponse* response) {
+    if (client_->GetDeploymentMode() != UMBPDeploymentMode::Local) {
+      SetBool(response, false, "GPU IPC registration requires a Local inner backend");
+      return;
+    }
+    if (backend_config_.ssd.enabled) {
+      SetBool(response, false,
+              "GPU IPC registration requires SSD to be disabled "
+              "(start the server with UMBP_SSD_ENABLED=0)");
+      return;
+    }
+    if (request.client_id().empty() || request.worker_base() == 0 || request.size() == 0 ||
+        request.alloc_base() == 0 || request.ipc_handle().size() != sizeof(hipIpcMemHandle_t)) {
+      SetBool(response, false, "invalid GPU IPC registration payload");
+      return;
+    }
+    if (HasIdenticalGpuRegion(request)) {
+      SetBool(response, true);
+      return;
+    }
+
+    const IpcKey key{request.client_id(), request.device_id(), request.alloc_base()};
+    ScopedHipDevice device_guard(request.device_id());
+    if (!device_guard.IsValid()) {
+      SetBool(response, false, "hipSetDevice failed for the requested device_id");
+      return;
+    }
+
+    void* mapped_base = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(ipc_mu_);
+      auto existing = ipc_maps_.find(key);
+      if (existing != ipc_maps_.end()) {
+        ++existing->second.refcount;
+        mapped_base = existing->second.base;
+      } else {
+        hipIpcMemHandle_t handle{};
+        std::memcpy(&handle, request.ipc_handle().data(), sizeof(handle));
+        const hipError_t status =
+            hipIpcOpenMemHandle(&mapped_base, handle, hipIpcMemLazyEnablePeerAccess);
+        if (status != hipSuccess) {
+          const std::string error = hipGetErrorString(status);
+          (void)hipGetLastError();
+          SetBool(response, false, "hipIpcOpenMemHandle failed: " + error);
+          return;
+        }
+        ipc_maps_.emplace(key, IpcMapping{mapped_base, 1});
+      }
+    }
+
+    const uintptr_t mapped_address = reinterpret_cast<uintptr_t>(mapped_base);
+    if (request.ipc_offset() > std::numeric_limits<uintptr_t>::max() - mapped_address) {
+      ReleaseIpcMapping(key);
+      SetBool(response, false, "GPU IPC offset overflows the mapped address");
+      return;
+    }
+
+    RegisteredMemory entry;
+    entry.base = reinterpret_cast<void*>(mapped_address + request.ipc_offset());
+    entry.worker_base = request.worker_base();
+    entry.size = request.size();
+    entry.kind = MemoryKind::kGpuIpc;
+    entry.device_id = request.device_id();
+    entry.alloc_base = request.alloc_base();
+    entry.client_id = request.client_id();
+    if (!RegisterBackendMemory(entry.base, static_cast<size_t>(entry.size))) {
+      ReleaseIpcMapping(key);
+      SetBool(response, false, "inner backend RegisterMemory failed");
+      return;
+    }
+
+    std::optional<RegisteredMemory> old_mem = InsertOrReplaceRegion(request.client_id(), entry);
+    if (old_mem.has_value()) ReleaseRegisteredMemory(*old_mem);
+    MORI_UMBP_INFO(
+        "[StandaloneServer] registered GPU IPC client_id={} worker_base=0x{:x} size={}MB "
+        "device={}",
+        request.client_id(), request.worker_base(), request.size() / (1024 * 1024),
+        request.device_id());
+    SetBool(response, true);
+  }
+
+  void ReleaseIpcMapping(const IpcKey& key) {
+    void* mapped_base = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(ipc_mu_);
+      auto it = ipc_maps_.find(key);
+      if (it == ipc_maps_.end()) return;
+      if (--it->second.refcount != 0) return;
+      mapped_base = it->second.base;
+      ipc_maps_.erase(it);
+    }
+
+    ScopedHipDevice device_guard(key.device_id);
+    if (!device_guard.IsValid()) {
+      MORI_UMBP_WARN("[StandaloneServer] failed to select GPU {} while closing IPC mapping",
+                     key.device_id);
+    }
+    const hipError_t status = hipIpcCloseMemHandle(mapped_base);
+    if (status != hipSuccess) {
+      MORI_UMBP_WARN("[StandaloneServer] hipIpcCloseMemHandle failed for client_id={}: {}",
+                     key.client_id, hipGetErrorString(status));
+      (void)hipGetLastError();
+    }
+  }
+
+  size_t IpcMappingCount() {
+    std::lock_guard<std::mutex> lock(ipc_mu_);
+    return ipc_maps_.size();
   }
 
   void UnmapClient(const std::string& client_id) {
@@ -736,7 +893,14 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       mems.swap(it->second);
       memory_.erase(it);
     }
+    const size_t mappings_before = IpcMappingCount();
     for (const auto& mem : mems) ReleaseRegisteredMemory(mem);
+    const size_t mappings_after = IpcMappingCount();
+    MORI_UMBP_INFO(
+        "[StandaloneServer] unmapped client_id={} regions={} ipc_allocations_released={} "
+        "ipc_allocations_remaining={}",
+        client_id, mems.size(),
+        mappings_before >= mappings_after ? mappings_before - mappings_after : 0, mappings_after);
   }
 
   void UnmapAll() {
@@ -763,7 +927,11 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       std::lock_guard<std::mutex> lock(client_mu_);
       client_->DeregisterMemory(reinterpret_cast<uintptr_t>(mem.base));
     }
-    munmap(mem.base, static_cast<size_t>(mem.size));
+    if (mem.kind == MemoryKind::kGpuIpc) {
+      ReleaseIpcMapping(IpcKey{mem.client_id, mem.device_id, mem.alloc_base});
+    } else {
+      munmap(mem.base, static_cast<size_t>(mem.size));
+    }
   }
 
   // Resolves (client_id, region_base, offset) to a server-local pointer.
@@ -860,10 +1028,12 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   std::mutex client_mu_;
   std::mutex memory_mu_;
+  std::mutex ipc_mu_;
   // A worker registers N non-contiguous host regions (e.g. DeepSeek-V4's KV
   // side pools), so each client_id maps to a list of regions, resolved by
   // worker_base at data-op time.
   std::map<std::string, std::vector<RegisteredMemory>> memory_;
+  std::map<IpcKey, IpcMapping> ipc_maps_;
   std::mutex external_identity_lifecycle_mu_;
   std::mutex external_identity_mu_;
   std::map<std::string, std::shared_ptr<ExternalKvIdentityClient>> external_identities_;
