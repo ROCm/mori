@@ -222,6 +222,41 @@ def _load_hip_modules(kernel_type):
     return load_hip_module(_KERNEL_TYPE_TO_HIP[kernel_type], init_shmem=True)
 
 
+class ResizeRejected(ValueError):
+    """The requested config is not resizable. Nothing was freed on any rank."""
+
+
+class ResizeRolledBack(RuntimeError):
+    """The resize failed. Every rank is back at the old capacity and usable."""
+
+
+class ResizeFatal(RuntimeError):
+    """At least one rank owns no buffers. The op is dead; recreate it."""
+
+
+# MAX-reduced across the EP group, so the numerically largest must be the worst.
+_SEVERITY_OK = 0
+_SEVERITY_REJECTED = 1
+_SEVERITY_ROLLED_BACK = 2
+_SEVERITY_FATAL = 3
+_SEVERITY_ERRORS = {
+    _SEVERITY_REJECTED: ResizeRejected,
+    _SEVERITY_ROLLED_BACK: ResizeRolledBack,
+    _SEVERITY_FATAL: ResizeFatal,
+}
+
+
+def _group_max(group, value):
+    # CPU tensor on purpose: the group sglang initializes shmem with is a gloo
+    # cpu_group, and this reduction is the one thing between a partial resize and
+    # corrupt peer pointers -- it must not be the part that needs a CUDA backend.
+    if not dist.is_initialized():
+        return value
+    flag = torch.tensor([value], dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
+    return int(flag.item())
+
+
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
@@ -254,7 +289,7 @@ class EpDispatchCombineOp:
 
         self._handle = handle_class(self._cpp_config)
         self._hip_module = _load_hip_modules(config.kernel_type)
-        self._handle_info = mori_cpp.get_handle_info(self._handle)
+        self._refresh_handle_state()
 
         self._fp8_blockwise_combine_scale_dim = self._handle_info[
             "fp8_blockwise_combine_scale_dim"
@@ -262,9 +297,6 @@ class EpDispatchCombineOp:
         self._fp8_blockwise_combine_scale_type_size = self._handle_info[
             "fp8_blockwise_combine_scale_type_size"
         ]
-
-        self._dispatch_out_ptrs = mori_cpp.get_dispatch_output_ptrs(self._handle, True)
-        self._combine_out_ptrs = mori_cpp.get_combine_output_ptrs(self._handle, True)
 
         self.local_expert_count = torch.zeros(
             config.num_experts_per_rank, dtype=torch.int32, device="cuda"
@@ -386,6 +418,107 @@ class EpDispatchCombineOp:
             raise ValueError(
                 f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
             )
+
+    @staticmethod
+    def _quiesce(group):
+        """Device sync THEN host barrier, in that order. The barrier alone proves
+        every rank reached this line, not that its kernels finished, and freeing a
+        symmetric buffer a peer is still reading corrupts that peer silently."""
+        torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier(group=group)
+
+    def _refresh_handle_state(self):
+        """Re-read everything a rebuild invalidates: the buffer pointers, and the
+        capacity the C++ side actually settled on after its own clamping."""
+        self._handle_info = mori_cpp.get_handle_info(self._handle)
+        self._dispatch_out_ptrs = mori_cpp.get_dispatch_output_ptrs(self._handle, True)
+        self._combine_out_ptrs = mori_cpp.get_combine_output_ptrs(self._handle, True)
+        for name in ("max_num_inp_token_per_rank", "max_total_recv_tokens"):
+            setattr(self._cpp_config, name, self._handle_info[name])
+            setattr(self.config, name, self._handle_info[name])
+
+    @property
+    def is_initialized(self):
+        """Rank-local. Never a group verdict -- a peer of a dead rank reads True."""
+        return self._handle.is_initialized
+
+    def finalize(self, *, group=None):
+        """Release the a2a buffers. Collective, idempotent, op unusable after.
+
+        Every rank must call it the same number of times, nothing in flight.
+
+        An op that has reconfigured must be finalized before the shmem heap is
+        torn down, or its destructor frees into a heap that is gone and the next
+        collective on the process dies with an unattributable HIP error.
+        """
+        self._quiesce(group)
+        try:
+            self._handle.finalize()
+        finally:
+            # Not optional on the error path: a rank that raises past this barrier
+            # leaves its peers waiting for a participant that never arrives.
+            if dist.is_initialized():
+                dist.barrier(group=group)
+
+    def reconfigure(self, max_num_inp_token_per_rank, *, group=None):
+        """Operate the a2a buffers at a new capacity. Collective; returns None.
+
+        Raises :class:`ResizeRejected` if the capacity is not resizable (nothing
+        was freed anywhere), :class:`ResizeRolledBack` if it failed and every rank
+        is back at the old capacity, or :class:`ResizeFatal` if some rank was left
+        owning nothing. The outcome is reduced over the group, so all ranks raise
+        the same type -- branch on the type, not on the message.
+
+        Caller guarantees: every rank enters, nothing in flight, and the target
+        was agreed beforehand. This reduces the outcome, not the request.
+        """
+        self._quiesce(group)
+
+        # The recv budget is carried over -- not per-role, and C++ settles it.
+        previous = (
+            self._cpp_config.max_num_inp_token_per_rank,
+            self._cpp_config.max_total_recv_tokens,
+        )
+        severity, err = self._try_resize(max_num_inp_token_per_rank, previous[1])
+
+        # Reduce, never raise locally: a rank that bailed on its own failure would
+        # leave its peers blocked in this all_reduce forever.
+        group_severity = _group_max(group, severity)
+        if group_severity != _SEVERITY_OK:
+            if severity == _SEVERITY_OK:
+                # This rank grew but a peer did not; give the capacity back for
+                # real, not just in config, or the heap stops being symmetric.
+                severity, _ = self._try_resize(*previous, release_capacity=True)
+                severity = max(severity, _SEVERITY_ROLLED_BACK)
+            group_severity = _group_max(group, severity)
+        if self._handle.is_initialized:
+            self._refresh_handle_state()
+        if dist.is_initialized():
+            dist.barrier(group=group)
+
+        if group_severity != _SEVERITY_OK:
+            raise _SEVERITY_ERRORS[group_severity](
+                f"mori a2a resize to {max_num_inp_token_per_rank} tokens/rank failed"
+                f" (this rank: {err if err is not None else 'succeeded, gave the capacity back'})"
+            )
+
+    def _try_resize(
+        self, max_num_inp_token_per_rank, max_total_recv_tokens, release_capacity=False
+    ):
+        """One rank's half of a resize. Returns (severity, error-or-None)."""
+        self._cpp_config.max_num_inp_token_per_rank = max_num_inp_token_per_rank
+        self._cpp_config.max_total_recv_tokens = max_total_recv_tokens
+        try:
+            self._handle.reconfigure(self._cpp_config, release_capacity)
+        except ValueError as err:
+            return _SEVERITY_REJECTED, err
+        except Exception as err:
+            # The C++ side rolls back to the old capacity when it can; only when
+            # that also failed does the handle end up owning nothing.
+            usable = self._handle.is_initialized
+            return (_SEVERITY_ROLLED_BACK if usable else _SEVERITY_FATAL), err
+        return _SEVERITY_OK, None
 
     # ------------------------------------------------------------------
     # Kernel launch helpers

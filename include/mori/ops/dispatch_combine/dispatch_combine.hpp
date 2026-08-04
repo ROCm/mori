@@ -271,6 +271,30 @@ class EpDispatchCombineHandle {
 
   void LaunchReset(hipStream_t = 0);
 
+  // Release every buffer the handle owns. Idempotent. Collective: it frees from
+  // the symmetric heap.
+  void Finalize();
+
+  // Operate at a new capacity. Only maxNumInpTokenPerRank and maxTotalRecvTokens
+  // may differ; changing any other field throws std::invalid_argument before
+  // anything is touched. The allocation is a high-water mark -- an instance that
+  // flips roles wants the larger role's buffers again a moment later -- so only a
+  // grow reallocates and a shrink cannot fail. A grow that cannot allocate
+  // restores the old capacity and throws std::runtime_error, handle still usable;
+  // if the restore also fails the handle owns nothing and IsInitialized() goes
+  // false -- fatal for the whole group, since symmetric buffers mean nothing
+  // unless every rank holds them.
+  //
+  // releaseCapacity makes a shrink reallocate for real. A rank addresses a peer's
+  // symmetric buffer at its OWN heap offset, so the group stays addressable only
+  // while every rank runs the same allocation sequence: a rank that grew while a
+  // peer failed has to hand the memory back, not just the config.
+  void Reconfigure(const EpDispatchCombineConfig& newConfig, bool releaseCapacity = false);
+
+  // Rank-local. A peer of a failed rank reads true while the group is dead, so
+  // this is an input to a group verdict, never the verdict itself.
+  bool IsInitialized() const { return buffersInitialized; }
+
   index_t GetCurRankNumToken() const { return curRankNumToken; }
   int Fp8BlockwiseCombineScaleDim() const { return fp8BlockwiseCombineScaleDim; }
   int Fp8BlockwiseCombineScaleTypeSize() const { return fp8BlockwiseCombineScaleTypeSize; }
@@ -301,6 +325,11 @@ class EpDispatchCombineHandle {
   }
 
  private:
+  void NormalizeConfig();
+  void InitializeAll();
+  void FinalizeAll();
+  void ValidateReconfigurable(const EpDispatchCombineConfig& newConfig) const;
+
   void InitializeShmemBuf();
   void FinalizeShmemBuf();
 
@@ -312,6 +341,10 @@ class EpDispatchCombineHandle {
 
   void InitializeBarrier();
   void FinalizeBarrier();
+
+  bool buffersInitialized{false};
+  // What the buffers were sized for, which a shrink deliberately leaves behind.
+  EpDispatchCombineConfig allocatedConfig;
 
  public:
   // Updated at each round of inference
