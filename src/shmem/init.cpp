@@ -757,9 +757,7 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
         if (nicIdx < (int)perNicRkeys.size() && pe < (int)perNicRkeys[nicIdx].size()) {
           rkey = perNicRkeys[nicIdx][pe];
         }
-        qps[i] = {hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq, lkey, rkey,
-                  hostEndpoints[i].ibvHandle.recvBuf, hostEndpoints[i].ibvHandle.recvLkey,
-                  hostEndpoints[i].ibvHandle.recvCount};
+        qps[i] = {hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq, lkey, rkey};
         qpCount++;
       }
     }
@@ -767,8 +765,7 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
             qpCount, qps.size(), numNics);
     if (qpCount > 0) {
       states->proxyThread = std::make_unique<core::ProxyThread>();
-      int gpuId = states->gpuStates.rank % numNics;
-      states->proxyThread->Init(states->gpuStates.proxyRing, std::move(qps), gpuId);
+      states->proxyThread->Init(states->gpuStates.proxyRing, std::move(qps));
       states->proxyThread->Start();
       fprintf(stderr, "[MoRI-PROXY] Proxy thread started\n");
     }

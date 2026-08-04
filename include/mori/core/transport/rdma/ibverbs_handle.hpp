@@ -42,9 +42,6 @@ struct IBVerbsHandle {
   ibv_cq* cq{nullptr};
   ibv_srq* srq{nullptr};
   ibv_comp_channel* compCh{nullptr};
-  void* recvBuf{nullptr};
-  uint32_t recvLkey{0};
-  uint32_t recvCount{0};
 };
 
 }  // namespace core

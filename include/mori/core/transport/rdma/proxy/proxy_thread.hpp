@@ -18,11 +18,8 @@ namespace core {
 struct ProxyQpHandle {
   ibv_qp* qp{nullptr};
   ibv_cq* cq{nullptr};
-  uint32_t lkey_override{0};   // per-NIC lkey for send-side routing (0 = use cmd's lkey)
-  uint32_t rkey_override{0};   // per-NIC rkey for remote buffer on this NIC (0 = use cmd's rkey)
-  void* recv_buf{nullptr};     // recv buffer for incoming SEND_WITH_IMM (atomic emulation)
-  uint32_t recv_lkey{0};       // lkey for recv buffer MR
-  uint32_t recv_count{0};      // number of recv WRs posted
+  uint32_t lkey_override{0};
+  uint32_t rkey_override{0};
 };
 
 class ProxyThread {
@@ -30,7 +27,7 @@ class ProxyThread {
   ProxyThread() = default;
   ~ProxyThread();
 
-  void Init(ProxyRing* ring, std::vector<ProxyQpHandle> qps, int gpuId = 0);
+  void Init(ProxyRing* ring, std::vector<ProxyQpHandle> qps);
   void Start();
   void Shutdown();
 
@@ -46,9 +43,6 @@ class ProxyThread {
   uint32_t next_slot_{0};
   uint64_t ops_posted_{0};
   uint64_t ops_completed_{0};
-  uint64_t idle_count_{0};
-  uint64_t recv_atomics_{0};
-  int gpu_id_{0};
 };
 
 }  // namespace core

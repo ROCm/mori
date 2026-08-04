@@ -153,12 +153,6 @@ class IonicDeviceContext : public RdmaDeviceContext {
                                         uint64_t resource_type);
   void create_parent_domain(ibv_context* context, struct ibv_pd* pd_orig);
 
-  struct ProxyRecvInfo { void* buf{nullptr}; uint32_t lkey{0}; uint32_t count{0}; };
-  ProxyRecvInfo GetProxyRecvInfo(uint32_t qpn) {
-    auto it = proxyRecvInfo.find(qpn);
-    return (it != proxyRecvInfo.end()) ? it->second : ProxyRecvInfo{};
-  }
-
  private:
   uint32_t pdn;
   struct ibv_pd* pd_uxdma[2];
@@ -166,7 +160,6 @@ class IonicDeviceContext : public RdmaDeviceContext {
   std::unordered_map<uint32_t, IonicCqContainer*> cqPool;
   std::unordered_map<uint32_t, IonicQpContainer*> qpPool;
   std::unordered_map<uint32_t, ibv_qp*> proxyQpPool;
-  std::unordered_map<uint32_t, ProxyRecvInfo> proxyRecvInfo;
 };
 
 class IonicDevice : public RdmaDevice {
