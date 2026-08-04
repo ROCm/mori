@@ -111,6 +111,11 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   int worldSize = bootNet.GetWorldSize();
   int rank = bootNet.GetLocalRank();
 
+  static int regCount = 0;
+  if (regCount < 3 || heap_begin)
+    fprintf(stderr, "[MoRI] RegisterSymmMemObj #%d rank=%d heap=%d size=%zu\n", regCount, rank, heap_begin, size);
+  regCount++;
+
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;

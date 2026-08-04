@@ -624,6 +624,8 @@ void GpuStateInit(ShmemStates* states) {
     states->gpuStates.useProxy = true;
   }
 
+  fprintf(stderr, "[MoRI] SHMEM init: proxy setup done, rank=%d\n", states->gpuStates.rank);
+
   // Copy communication metadata to GPU
   CopyTransportTypesToGpu(states);
   CopyRdmaEndpointsToGpu(states);
