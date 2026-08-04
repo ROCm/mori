@@ -718,7 +718,7 @@ void IonicDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
 
     // Post receive WRs after QP reaches RTS — Pensando rejects post_recv in RESET.
     {
-      constexpr int kRecvCount = 128;
+      constexpr int kRecvCount = 512;
       constexpr size_t kRecvBufSz = kRecvCount * 64;
       void* rbuf = nullptr;
       posix_memalign(&rbuf, 4096, kRecvBufSz);
