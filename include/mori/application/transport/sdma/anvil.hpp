@@ -112,7 +112,6 @@ class AnvilLib {
   // reach maximum bandwidth (sysfs recommended_sdma_engine_id_mask). Returns 0
   // if the link or property is unavailable, in which case callers fall back to
   // the static OAM map.
-  uint32_t getHostLinkEngineMask(int srcDeviceId);
   uint32_t getRecommendedEngineMask(int srcDeviceId, int dstDeviceId);
 
   struct PairHash {

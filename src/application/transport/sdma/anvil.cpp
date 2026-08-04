@@ -315,17 +315,8 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
   std::vector<uint32_t> engines;
   if (srcDeviceId == dstDeviceId) {
     // A loopback copy never traverses xGMI and has no self io_link, so KFD
-    // reports no recommended engine for it. Spread over the engines KFD
-    // recommends for the CPU link instead of pinning to 0: an engine holds only
-    // NumSdmaQueuesPerEngine queues and ROCr's blit queues already sit on the
-    // low ones, so one engine caps the whole comm at a few channels. Taking the
-    // mask rather than assuming engine ids run 0..N-1 keeps this correct on
-    // parts where the general engines are not the low ones.
-    uint32_t mask = getHostLinkEngineMask(srcDeviceId);
-    for (uint32_t b = 0; b < 32; ++b) {
-      if (mask & (1u << b)) engines.push_back(b);
-    }
-    if (engines.empty()) engines.push_back(0);
+    // reports no recommended engine. Use a general (non-xGMI) SDMA engine.
+    engines.push_back(0);
   } else {
     uint32_t mask = getRecommendedEngineMask(srcDeviceId, dstDeviceId);
     for (uint32_t b = 0; b < 32; ++b) {
@@ -353,28 +344,6 @@ uint32_t AnvilLib::getNodeId(int deviceId) {
   CHECK_HSA_ERROR(hsa_agent_get_info(gpuAgents_[gpuAgentIndexForHipDevice(deviceId)],
                                      HSA_AGENT_INFO_NODE, &nodeId));
   return nodeId;
-}
-
-// Engines KFD recommends for this GPU's link to a CPU node, i.e. the general
-// (non-xGMI) ones. Zero if the node reports no such link.
-uint32_t AnvilLib::getHostLinkEngineMask(int srcDeviceId) {
-  const uint32_t srcNode = getNodeId(srcDeviceId);
-  HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0) {
-    return 0;
-  }
-  std::vector<HsaIoLinkProperties> links(props.NumIOLinks);
-  if (hsaKmtGetNodeIoLinkProperties(srcNode, props.NumIOLinks, links.data()) !=
-      HSAKMT_STATUS_SUCCESS) {
-    return 0;
-  }
-  for (const auto& link : links) {
-    HsaNodeProperties to{};
-    if (hsaKmtGetNodeProperties(link.NodeTo, &to) != HSAKMT_STATUS_SUCCESS) continue;
-    if (to.NumFComputeCores != 0) continue;  // GPU node, not the host
-    if (link.RecSdmaEngIdMask) return link.RecSdmaEngIdMask;
-  }
-  return 0;
 }
 
 uint32_t AnvilLib::getRecommendedEngineMask(int srcDeviceId, int dstDeviceId) {
