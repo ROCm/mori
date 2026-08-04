@@ -39,6 +39,7 @@ from .intranode_kernels import (
     make_convert_dispatch_output,
     make_convert_combine_input,
     make_local_expert_count,
+    _COMB_NSTREAMS,
 )
 
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
@@ -619,6 +620,7 @@ class EpDispatchCombineOp:
                     fp8_blockwise=cfg.fp8_blockwise,
                     scale_dim=cfg.combine_scale_dim,
                     reset_total_recv=False,
+                    _unroll=_COMB_NSTREAMS,
                 )
                 for (b, w) in combine_specs
             }
@@ -639,7 +641,7 @@ class EpDispatchCombineOp:
                     off_out_wts=arena.offset("out_wts"),
                     reset_total_recv=True,
                     fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
-                    _unroll=4,
+                    _unroll=_COMB_NSTREAMS,
                 )
                 for (b, w) in combine_specs
             }

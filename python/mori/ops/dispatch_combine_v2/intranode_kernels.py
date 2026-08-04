@@ -94,6 +94,7 @@ LOG2_WAVE = WAVE.bit_length() - 1
 _BALLOT_INT = T.i64 if WAVE == 64 else T.i32
 _LANE_STRIDE_I32 = WAVE * 4  # one wave of lanes, vec4 (16B) each
 _DISP_NSTREAMS = 4 if WAVE == 32 else 2
+_COMB_NSTREAMS = 4 if WAVE == 32 else 2
 _MAIN_STRIDE_I32 = _DISP_NSTREAMS * _LANE_STRIDE_I32
 _BUTTERFLY_OFFSETS = tuple(WAVE >> i for i in range(1, LOG2_WAVE + 1))
 
@@ -1138,6 +1139,7 @@ def make_combine_scatter(
     scale_dim=0,
     reset_total_recv=True,
     _s3_cache=2,
+    _unroll=2,
 ):
     """Scatter combine (mori useExternalInpBuffer / _nop2p path).
 
@@ -1165,6 +1167,7 @@ def make_combine_scatter(
     wire_n_i32 = wire_nbytes // 4
     out_n_i32 = (hidden_dim * 2) // 4 if _fp8_out else wire_n_i32
     out_step_mult = 2 if _fp8_out else 1
+    _use_vec4_s = (wire_n_i32 % 4 == 0) and not _fp8_out
     if fp8_blockwise:
         block_elems = hidden_dim // scale_dim
         assert (
@@ -1314,9 +1317,15 @@ def make_combine_scatter(
                     )
                     buffer_store(fp8, rsrc_dst, elem)
             else:
-                for elem in range(lane, wire_n_i32, WAVE):
-                    v = buffer_load(rsrc_src, elem, vec_width=1, dtype=T.i32())
-                    buffer_store(v, rsrc_dst, elem)
+                for chunk in range(0, wire_n_i32, _MAIN_STRIDE_I32):
+                    vecs = [
+                        buffer_load(rsrc_src, chunk + k * _LANE_STRIDE_I32,
+                                    vec_width=4, dtype=T.i32())
+                        for k in range(_DISP_NSTREAMS)
+                    ]
+                    for k in range(_DISP_NSTREAMS):
+                        buffer_store(vecs[k], rsrc_dst,
+                                     chunk + k * _LANE_STRIDE_I32)
             if const_expr(enable_weights):
                 # forward this recv slot's weights (dispatch put them in out_wts[recv_slot])
                 # to the ORIGIN's comb_wts[computing_rank*M + lid] (dedicated
@@ -1405,6 +1414,7 @@ def make_combine_scatter(
             expert_rsrcs = []
             expert_valids = []
             expert_pes = []
+            expert_addrs = []
             expert_scales = []
             for k_slot in range_constexpr(experts_per_token):
                 encoded_k = buffer_load(
@@ -1418,6 +1428,7 @@ def make_combine_scatter(
                     fx.Int64(safe_pe) * fx.Int64(max_tok_per_rank) + fx.Int64(tok_id)
                 ) * fx.Int64(wire_nbytes)
                 expert_rsrcs.append(create_buffer_resource_from_addr(src_addr))
+                expert_addrs.append(src_addr)
                 expert_valids.append(valid)
                 expert_pes.append(safe_pe)
                 if const_expr(fp8_blockwise):
@@ -1505,11 +1516,55 @@ def make_combine_scatter(
                         acc = acc + to_acc(v)
                 buffer_store(from_acc(acc), rsrc_out, out_base + off * out_step_mult)
 
-            def _loop():
-                for u in range(lane, eff, WAVE):
-                    _one(unit_base + u)
+            if const_expr(_use_vec4_s):
+                VEC = 4
+                STEP_CHUNK = WAVE * VEC
+                STEP_V4 = _unroll * STEP_CHUNK
 
-            _loop()
+                def _load_expert_vecs(off):
+                    vecs = []
+                    valids = []
+                    for k_slot in range_constexpr(experts_per_token):
+                        vecs.append(P.load_v4i32_nt(expert_addrs[k_slot], off))
+                        valids.append(expert_valids[k_slot])
+                    return vecs, valids
+
+                def _accum_loop():
+                    main_end = (eff // STEP_V4) * STEP_V4
+                    for u in range(lane * VEC, main_end, STEP_V4):
+                        base = unit_base + u
+                        pre_vecs = []
+                        pre_valids = []
+                        for r in range_constexpr(_unroll):
+                            off_r = base + r * STEP_CHUNK
+                            vecs_r, valids_r = _load_expert_vecs(off_r)
+                            pre_vecs.append(vecs_r)
+                            pre_valids.append(valids_r)
+                        for j in range_constexpr(VEC):
+                            for r in range_constexpr(_unroll):
+                                off = base + r * STEP_CHUNK
+                                acc = zero_acc()
+                                for k_slot in range_constexpr(experts_per_token):
+                                    elem = vector.extract(
+                                        pre_vecs[r][k_slot], static_position=[j]
+                                    )
+                                    v = arith.select(
+                                        pre_valids[r][k_slot], elem, arith.constant(0)
+                                    )
+                                    acc = acc + to_acc(v)
+                                buffer_store(
+                                    from_acc(acc), rsrc_out, out_base + off + j
+                                )
+                    for u in range(main_end + lane, eff, WAVE):
+                        _one(unit_base + u)
+
+            else:
+
+                def _accum_loop():
+                    for u in range(lane, eff, WAVE):
+                        _one(unit_base + u)
+
+            _accum_loop()
 
         if global_warp_id == 0:
             if lane == 0:
