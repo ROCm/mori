@@ -760,7 +760,6 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
         qpCount++;
       }
     }
-            qpCount, qps.size(), numNics);
     if (qpCount > 0) {
       states->proxyThread = std::make_unique<core::ProxyThread>();
       int gpuId = states->gpuStates.rank % numNics;

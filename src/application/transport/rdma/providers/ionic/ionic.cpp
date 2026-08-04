@@ -548,7 +548,6 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
     endpoint.atomicIbuf.nslots = ibufSlots;
 
     proxyQpPool[plainQp->qp_num] = plainQp;
-            plainQp->qp_num, ibufAddr, ibufMr->lkey, GetRdmaDevice()->Name().c_str());
     return endpoint;
   }
 
@@ -556,7 +555,6 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   bool useProxy = proxyEnv && (std::string(proxyEnv) == "1" || std::string(proxyEnv) == "true");
 
   if (useProxy) {
-            GetRdmaDevice()->Name().c_str());
     ibv_pd* basePd = GetIbvPd();
 
     ibv_cq* plainCq = ibv_create_cq(context, config.maxMsgsNum * 2, nullptr, nullptr, 0);
@@ -568,7 +566,6 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
     qa.cap.max_recv_wr = config.maxRecvWr != 0 ? config.maxRecvWr : config.maxMsgsNum;
     qa.cap.max_send_sge = 1; qa.cap.max_recv_sge = 1; qa.cap.max_inline_data = 64;
     ibv_qp* plainQp = ibv_create_qp(basePd, &qa);
-            (void*)plainQp, plainQp ? plainQp->qp_num : 0);
     assert(plainQp);
 
     RdmaEndpoint endpoint;
@@ -598,10 +595,8 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
     endpoint.atomicIbuf.lkey = ibufMr->lkey;
     endpoint.atomicIbuf.rkey = ibufMr->rkey;
     endpoint.atomicIbuf.nslots = ibufSlots;
-            ibufAddr, ibufMr->lkey, ibufSlots);
 
     proxyQpPool[plainQp->qp_num] = plainQp;
-            plainQp->qp_num, GetRdmaDevice()->Name().c_str());
     return endpoint;
   }
 
@@ -678,12 +673,11 @@ void IonicDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
     ibv_qp* plainQp = proxyQpPool.at(local_qpn);
     RdmaDevice* rdmaDevice = GetRdmaDevice();
     const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
-            local_qpn, remote.qpn, local.portId, portAttr.active_mtu);
 
     { ibv_qp_attr a{}; a.qp_state = IBV_QPS_INIT; a.port_num = local.portId;
       a.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
-      int r = ibv_modify_qp(plainQp, &a, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+      ibv_modify_qp(plainQp, &a, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS); }
 
     { ibv_qp_attr a{}; a.qp_state = IBV_QPS_RTR;
       a.path_mtu = portAttr.active_mtu;
@@ -695,14 +689,13 @@ void IonicDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
       a.ah_attr.sl = ReadRdmaServiceLevelEnv().value_or(0);
       std::optional<uint8_t> tc = ReadRdmaTrafficClassEnv();
       if (tc.has_value()) a.ah_attr.grh.traffic_class = tc.value();
-              a.ah_attr.sl, a.ah_attr.grh.traffic_class, a.ah_attr.grh.sgid_index);
-      int r = ibv_modify_qp(plainQp, &a, IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-          IBV_QP_RQ_PSN | IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+      ibv_modify_qp(plainQp, &a, IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+          IBV_QP_RQ_PSN | IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER); }
 
     { ibv_qp_attr a{}; a.qp_state = IBV_QPS_RTS; a.sq_psn = local.psn;
       a.timeout = 14; a.retry_cnt = 7; a.rnr_retry = 7; a.max_rd_atomic = 15;
-      int r = ibv_modify_qp(plainQp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
-          IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC);
+      ibv_modify_qp(plainQp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
+          IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC); }
 
     // Post recv WRs for SEND_WITH_IMM barrier atomic emulation
     {
