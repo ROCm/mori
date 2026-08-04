@@ -2,6 +2,8 @@
 // MIT License
 #include "mori/core/transport/rdma/proxy/proxy_thread.hpp"
 
+#include <arpa/inet.h>
+#include <hip/hip_runtime_api.h>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -12,12 +14,13 @@ namespace core {
 
 ProxyThread::~ProxyThread() { Shutdown(); }
 
-void ProxyThread::Init(ProxyRing* ring, std::vector<ProxyQpHandle> qps) {
+void ProxyThread::Init(ProxyRing* ring, std::vector<ProxyQpHandle> qps, int gpuId) {
   ring_ = ring;
   qps_ = std::move(qps);
   next_slot_ = 0;
   ops_posted_ = 0;
   ops_completed_ = 0;
+  gpu_id_ = gpuId;
 }
 
 void ProxyThread::Start() {
@@ -45,16 +48,46 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
   int n;
   while ((n = ibv_poll_cq(qph.cq, 32, wc)) > 0) {
     for (int i = 0; i < n; i++) {
+      // Recv CQE: incoming SEND_WITH_IMM carrying atomic emulation payload
+      if (wc[i].opcode == IBV_WC_RECV || wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+        if (wc[i].status == IBV_WC_SUCCESS && wc[i].byte_len >= 16) {
+          // Read [dst_addr, add_value] from recv buffer
+          uint32_t recv_idx = static_cast<uint32_t>(wc[i].wr_id);
+          if (recv_idx < qph.recv_count && qph.recv_buf) {
+            struct { uint64_t addr; uint64_t val; } payload;
+            memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
+            // CPU atomic add on GPU memory. Use __atomic with SEQ_CST + sfence.
+            // Note: may race with GPU-side P2P atomics on first token.
+            volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
+            __atomic_fetch_add(target, payload.val, __ATOMIC_SEQ_CST);
+            asm volatile("sfence" ::: "memory");
+            recv_atomics_++;
+            // Re-post recv WR
+            ibv_sge rsge{};
+            rsge.addr = reinterpret_cast<uintptr_t>(qph.recv_buf) + recv_idx * 64;
+            rsge.length = 64;
+            rsge.lkey = qph.recv_lkey;
+            ibv_recv_wr rwr{}, *rbad = nullptr;
+            rwr.wr_id = recv_idx;
+            rwr.sg_list = &rsge;
+            rwr.num_sge = 1;
+            ibv_post_recv(qph.qp, &rwr, &rbad);
+          }
+        } else if (wc[i].status != IBV_WC_SUCCESS) {
+          fprintf(stderr, "proxy: RECV CQE error status=%d (%s) ibvQP=%u\n",
+                  wc[i].status, ibv_wc_status_str(wc[i].status),
+                  qph.qp ? qph.qp->qp_num : 0);
+        }
+        continue;
+      }
+      // Send CQE: our outgoing op completed
       uint32_t slot = static_cast<uint32_t>(wc[i].wr_id) & PROXY_RING_MASK;
       if (wc[i].status == IBV_WC_SUCCESS) {
-        if (wc[i].opcode == IBV_WC_FETCH_ADD || wc[i].opcode == IBV_WC_COMP_SWAP) {
-          // For fetch atomics, the result is already in the ibuf.
-          // The GPU reads it from ibuf_addr after seeing COMPLETED.
-        }
         ring_->cmds[slot].status = PROXY_COMPLETED;
       } else {
-        fprintf(stderr, "proxy: CQE error slot=%u status=%d (%s) wr_id=%lu\n",
-                slot, wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].wr_id);
+        fprintf(stderr, "proxy: CQE error slot=%u status=%d (%s) wr_id=%lu ibvQP=%u\n",
+                slot, wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].wr_id,
+                qph.qp ? qph.qp->qp_num : 0);
         ring_->cmds[slot].status = PROXY_ERROR;
       }
       ops_completed_++;
@@ -92,12 +125,13 @@ void ProxyThread::MainLoop() {
         ibv_sge sge{};
         sge.addr = cmd->src_addr;
         sge.length = cmd->length;
-        sge.lkey = (qph.lkey_override != 0) ? qph.lkey_override : cmd->lkey;
+        bool isAtomic = (cmd->op == PROXY_ATOMIC_FETCH_ADD || cmd->op == PROXY_ATOMIC_CMP_SWAP);
+        sge.lkey = (isAtomic) ? cmd->lkey
+                   : (qph.lkey_override != 0) ? qph.lkey_override : cmd->lkey;
 
         if (ops_posted_ < 3) {
-          fprintf(stderr, "[MoRI-PROXY] post #%lu: qp_idx=%u op=%u len=%u lkey=%u(cmd=%u,ovr=%u) rkey=%u src=0x%lx dst=0x%lx\n",
-                  ops_posted_, qi, cmd->op, cmd->length, sge.lkey, cmd->lkey, qph.lkey_override,
-                  cmd->rkey, cmd->src_addr, cmd->dst_addr);
+          fprintf(stderr, "[MoRI-PROXY] post #%lu: qp_idx=%u op=%u len=%u\n",
+                  ops_posted_, qi, cmd->op, cmd->length);
         }
 
         ibv_send_wr wr{};
@@ -119,18 +153,20 @@ void ProxyThread::MainLoop() {
             wr.wr.rdma.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
             break;
           case PROXY_ATOMIC_FETCH_ADD:
-            wr.opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
-            wr.wr.atomic.remote_addr = cmd->dst_addr;
-            wr.wr.atomic.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
-            wr.wr.atomic.compare_add = cmd->atomic_arg;
+          case PROXY_ATOMIC_CMP_SWAP: {
+            // Pensando AINIC: atomics return CQE OK but don't modify remote memory.
+            // Emulate via SEND_WITH_IMM: send [dst_addr, add_value] inline.
+            // Receiver proxy thread does CPU atomic add on the GPU address.
+            struct { uint64_t addr; uint64_t val; } payload;
+            payload.addr = cmd->dst_addr;
+            payload.val = cmd->atomic_arg;
+            memcpy(reinterpret_cast<void*>(sge.addr), &payload, 16);
+            sge.length = 16;
+            wr.opcode = IBV_WR_SEND_WITH_IMM;
+            wr.imm_data = htonl(0xA70C); // magic marker
+            wr.send_flags |= IBV_SEND_FENCE | IBV_SEND_INLINE;
             break;
-          case PROXY_ATOMIC_CMP_SWAP:
-            wr.opcode = IBV_WR_ATOMIC_CMP_AND_SWP;
-            wr.wr.atomic.remote_addr = cmd->dst_addr;
-            wr.wr.atomic.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
-            wr.wr.atomic.compare_add = cmd->atomic_arg;
-            wr.wr.atomic.swap = cmd->atomic_swap;
-            break;
+          }
           default:
             cmd->status = PROXY_ERROR;
             next_slot_++;
@@ -168,6 +204,9 @@ void ProxyThread::MainLoop() {
         if (qph.qp) DrainCq(qph);
       }
     }
+
+    if (!did_work) idle_count_++;
+    else idle_count_ = 0;
   }
 }
 

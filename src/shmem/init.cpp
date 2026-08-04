@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -737,25 +738,28 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
     const auto& perNicLkeys = states->memoryStates->symmMemMgr->perNicLkeys;
 
     // Build QP handles with per-NIC lkey and rkey overrides.
-    // QP[i] was created on allRdmaDeviceContexts[qpSlot % numNics].
-    // Endpoint layout: [pe0_qp0, pe0_qp1, ..., pe0_qpN, pe1_qp0, ...]
-    // For peer pe, QP slot qp: nicIdx = qp % numNics
+    // QP for peer pe uses agreed rail = max(myLocalGpu, peerLocalGpu) so
+    // both sides of the connection are on the same NIC (rail isolation).
     // Build QP handles indexed by epIndex so GPU kernel's qp_idx maps directly.
     // Non-RDMA slots have null QP — proxy thread skips them.
     const auto& perNicRkeys = states->memoryStates->symmMemMgr->perNicPeerRkeys;
+    int myLocalGpu = states->gpuStates.rank % numNics;
     std::vector<core::ProxyQpHandle> qps(hostEndpoints.size());
     int qpCount = 0;
     for (size_t i = 0; i < hostEndpoints.size(); i++) {
       if (hostEndpoints[i].ibvHandle.qp != nullptr) {
         int qpSlot = i % numQpPerPe;
         int pe = i / numQpPerPe;
-        int nicIdx = (numNics > 1) ? (qpSlot % numNics) : 0;
+        int peerLocalGpu = pe % numNics;
+        int nicIdx = (numNics > 1) ? (std::max(myLocalGpu, peerLocalGpu) % numNics) : 0;
         uint32_t lkey = (nicIdx < (int)perNicLkeys.size()) ? perNicLkeys[nicIdx] : 0;
         uint32_t rkey = 0;
         if (nicIdx < (int)perNicRkeys.size() && pe < (int)perNicRkeys[nicIdx].size()) {
           rkey = perNicRkeys[nicIdx][pe];
         }
-        qps[i] = {hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq, lkey, rkey};
+        qps[i] = {hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq, lkey, rkey,
+                  hostEndpoints[i].ibvHandle.recvBuf, hostEndpoints[i].ibvHandle.recvLkey,
+                  hostEndpoints[i].ibvHandle.recvCount};
         qpCount++;
       }
     }
@@ -763,7 +767,8 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
             qpCount, qps.size(), numNics);
     if (qpCount > 0) {
       states->proxyThread = std::make_unique<core::ProxyThread>();
-      states->proxyThread->Init(states->gpuStates.proxyRing, std::move(qps));
+      int gpuId = states->gpuStates.rank % numNics;
+      states->proxyThread->Init(states->gpuStates.proxyRing, std::move(qps), gpuId);
       states->proxyThread->Start();
       fprintf(stderr, "[MoRI-PROXY] Proxy thread started\n");
     }

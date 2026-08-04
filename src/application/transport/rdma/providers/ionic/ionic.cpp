@@ -532,7 +532,24 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
     endpoint.vendorId = RdmaDeviceVendorId::Pensando;
     endpoint.ibvHandle.qp = plainQp;
     endpoint.ibvHandle.cq = plainCq;
+
+    size_t ibufSlots = RoundUpPowOfTwo(config.atomicIbufSlots);
+    size_t ibufSize = (ibufSlots + 1) * 8;
+    void* ibufAddr = nullptr;
+    int ae = posix_memalign(&ibufAddr, 4096, ibufSize);
+    assert(ae == 0 && ibufAddr);
+    memset(ibufAddr, 0, ibufSize);
+    ibv_mr* ibufMr = ibv_reg_mr(basePd, ibufAddr, ibufSize,
+        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    assert(ibufMr);
+    endpoint.atomicIbuf.addr = reinterpret_cast<uintptr_t>(ibufAddr);
+    endpoint.atomicIbuf.lkey = ibufMr->lkey;
+    endpoint.atomicIbuf.rkey = ibufMr->rkey;
+    endpoint.atomicIbuf.nslots = ibufSlots;
+
     proxyQpPool[plainQp->qp_num] = plainQp;
+    fprintf(stderr, "[MoRI-PROXY-QP] Done: qpn=%u ibuf=%p ibufLkey=%u on %s\n",
+            plainQp->qp_num, ibufAddr, ibufMr->lkey, GetRdmaDevice()->Name().c_str());
     return endpoint;
   }
 
@@ -572,6 +589,22 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
     endpoint.vendorId = RdmaDeviceVendorId::Pensando;
     endpoint.ibvHandle.qp = plainQp;
     endpoint.ibvHandle.cq = plainCq;
+
+    size_t ibufSlots = RoundUpPowOfTwo(config.atomicIbufSlots);
+    size_t ibufSize = (ibufSlots + 1) * 8;
+    void* ibufAddr = nullptr;
+    int ae = posix_memalign(&ibufAddr, 4096, ibufSize);
+    assert(ae == 0 && ibufAddr);
+    memset(ibufAddr, 0, ibufSize);
+    ibv_mr* ibufMr = ibv_reg_mr(basePd, ibufAddr, ibufSize,
+        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    assert(ibufMr);
+    endpoint.atomicIbuf.addr = reinterpret_cast<uintptr_t>(ibufAddr);
+    endpoint.atomicIbuf.lkey = ibufMr->lkey;
+    endpoint.atomicIbuf.rkey = ibufMr->rkey;
+    endpoint.atomicIbuf.nslots = ibufSlots;
+    fprintf(stderr, "[MoRI-PROXY-QP]   atomicIbuf: addr=%p lkey=%u nslots=%zu\n",
+            ibufAddr, ibufMr->lkey, ibufSlots);
 
     proxyQpPool[plainQp->qp_num] = plainQp;
     fprintf(stderr, "[MoRI-PROXY-QP]   Done: qpn=%u on %s\n",
@@ -647,31 +680,70 @@ void IonicDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
                                          const RdmaEndpointHandle& remote, uint32_t qpn) {
   uint32_t local_qpn = local.qpn;
 
-  // Proxy mode: plain QP connection
+  // Proxy mode: plain QP connection — match non-proxy QP parameters exactly
   if (proxyQpPool.find(local_qpn) != proxyQpPool.end()) {
     ibv_qp* plainQp = proxyQpPool.at(local_qpn);
-    fprintf(stderr, "[MoRI-PROXY-QP] Connecting plain QP %u → remote %u\n", local_qpn, remote.qpn);
+    RdmaDevice* rdmaDevice = GetRdmaDevice();
+    const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
+    fprintf(stderr, "[MoRI-PROXY-QP] Connecting plain QP %u → remote %u (port=%u mtu=%d)\n",
+            local_qpn, remote.qpn, local.portId, portAttr.active_mtu);
 
     { ibv_qp_attr a{}; a.qp_state = IBV_QPS_INIT; a.port_num = local.portId;
-      a.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
+      a.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
+                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
       int r = ibv_modify_qp(plainQp, &a, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
       fprintf(stderr, "[MoRI-PROXY-QP]   RST→INIT: %s\n", r ? strerror(r) : "OK"); }
 
-    { ibv_qp_attr a{}; a.qp_state = IBV_QPS_RTR; a.path_mtu = IBV_MTU_4096;
+    { ibv_qp_attr a{}; a.qp_state = IBV_QPS_RTR;
+      a.path_mtu = portAttr.active_mtu;
       a.dest_qp_num = remote.qpn; a.rq_psn = remote.psn;
-      a.max_dest_rd_atomic = 1; a.min_rnr_timer = 12;
+      a.max_dest_rd_atomic = 15; a.min_rnr_timer = 12;
       memcpy(&a.ah_attr.grh.dgid, remote.eth.gid, 16);
       a.ah_attr.grh.sgid_index = local.eth.gidIdx; a.ah_attr.grh.hop_limit = 1;
       a.ah_attr.is_global = 1; a.ah_attr.port_num = local.portId;
+      a.ah_attr.sl = ReadRdmaServiceLevelEnv().value_or(0);
+      std::optional<uint8_t> tc = ReadRdmaTrafficClassEnv();
+      if (tc.has_value()) a.ah_attr.grh.traffic_class = tc.value();
+      fprintf(stderr, "[MoRI-PROXY-QP]   sl=%d tc=%d sgid_idx=%d\n",
+              a.ah_attr.sl, a.ah_attr.grh.traffic_class, a.ah_attr.grh.sgid_index);
       int r = ibv_modify_qp(plainQp, &a, IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
           IBV_QP_RQ_PSN | IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
       fprintf(stderr, "[MoRI-PROXY-QP]   INIT→RTR: %s\n", r ? strerror(r) : "OK"); }
 
     { ibv_qp_attr a{}; a.qp_state = IBV_QPS_RTS; a.sq_psn = local.psn;
-      a.timeout = 14; a.retry_cnt = 7; a.rnr_retry = 7; a.max_rd_atomic = 1;
+      a.timeout = 14; a.retry_cnt = 7; a.rnr_retry = 7; a.max_rd_atomic = 15;
       int r = ibv_modify_qp(plainQp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
           IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC);
       fprintf(stderr, "[MoRI-PROXY-QP]   RTR→RTS: %s\n", r ? strerror(r) : "OK"); }
+
+    // Post receive WRs after QP reaches RTS — Pensando rejects post_recv in RESET.
+    {
+      constexpr int kRecvCount = 128;
+      constexpr size_t kRecvBufSz = kRecvCount * 64;
+      void* rbuf = nullptr;
+      posix_memalign(&rbuf, 4096, kRecvBufSz);
+      assert(rbuf);
+      memset(rbuf, 0, kRecvBufSz);
+      ibv_mr* rmr = ibv_reg_mr(GetIbvPd(), rbuf, kRecvBufSz,
+          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+      assert(rmr);
+      int posted = 0;
+      for (int r = 0; r < kRecvCount; r++) {
+        ibv_sge rsge{};
+        rsge.addr = reinterpret_cast<uintptr_t>(rbuf) + r * 64;
+        rsge.length = 64;
+        rsge.lkey = rmr->lkey;
+        ibv_recv_wr rwr{}, *rbad = nullptr;
+        rwr.wr_id = r;
+        rwr.sg_list = &rsge;
+        rwr.num_sge = 1;
+        int rr = ibv_post_recv(plainQp, &rwr, &rbad);
+        if (rr == 0) posted++;
+        else if (r == 0) fprintf(stderr, "[MoRI-PROXY-QP] post_recv failed: %s\n", strerror(rr));
+      }
+      fprintf(stderr, "[MoRI-PROXY-QP] Posted %d recv WRs on QP %u\n", posted, local_qpn);
+      proxyRecvInfo[local_qpn] = {rbuf, rmr->lkey, static_cast<uint32_t>(kRecvCount)};
+    }
 
     fprintf(stderr, "[MoRI-PROXY-QP] Connected plain QP %u → remote %u\n", local_qpn, remote.qpn);
     return;
