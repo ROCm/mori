@@ -134,37 +134,79 @@ _TUNING_CONFIGS_DIR = Path(__file__).parent / "tuning_configs"
 _gpu_model_cache: str | None = None
 _gpu_model_detected: bool = False
 
-_ARCH_CU_TO_MODEL: dict[tuple[str, int], str] = {
-    ("gfx942", 304): "mi300x",
-    ("gfx942", 228): "mi308x",
-    ("gfx950", 304): "mi355x",
-    ("gfx950", 256): "mi350x",
+# PCI device IDs (KFD `device_id`) → model name.  CU count is deliberately NOT
+# used — it cannot separate MI300X from MI325X (both 304 CU) or MI350X from
+# MI355X (both 256 CU), and shifts with compute partitioning / CU masking.
+_DID_TO_MODEL: dict[int, str] = {
+    0x74A1: "mi300x",
+    0x74A5: "mi325x",
+    0x74A2: "mi308x",
+    0x75A0: "mi350x",
+    0x75A3: "mi355x",
+}
+
+_ARCH_TO_MODEL: dict[int, str] = {
+    90500: "mi355x",  # gfx950 fallback
 }
 
 
+def _kfd_topology() -> tuple[int, int]:
+    """(gfx_target_version, device_id) of the first GPU node from KFD sysfs.
+    Torch/HIP-free.  Returns (0, 0) if sysfs is unavailable."""
+    import glob
+
+    for props in sorted(
+        glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties")
+    ):
+        try:
+            vals: dict[str, int] = {}
+            with open(props) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) == 2:
+                        vals[parts[0]] = int(parts[1])
+            if vals.get("simd_count", 0) <= 0:
+                continue
+            return vals.get("gfx_target_version", 0), vals.get("device_id", 0)
+        except Exception:
+            continue
+    return 0, 0
+
+
 def detect_gpu_model() -> str | None:
-    """Detect GPU model from device name, e.g. 'mi300x', 'mi308x'."""
+    """Detect GPU model from device name, e.g. 'mi300x', 'mi308x'.
+
+    Strategy: (1) regex on torch device name, (2) PCI DID via KFD sysfs,
+    (3) gfx arch fallback."""
     global _gpu_model_cache, _gpu_model_detected
     if _gpu_model_detected:
         return _gpu_model_cache
     _gpu_model_detected = True
+
+    # 1) Try torch device name (works when the driver reports a human name)
     try:
         props = torch.cuda.get_device_properties(0)
         name = props.name.lower()
     except Exception:
-        return None
+        name = ""
     import re
 
     m = re.search(r"\bmi\d+\w*", name)
     if m:
         _gpu_model_cache = m.group(0)
-    else:
-        try:
-            arch = props.gcnArchName.split(":")[0]
-            cus = props.multi_processor_count
-            _gpu_model_cache = _ARCH_CU_TO_MODEL.get((arch, cus))
-        except Exception:
-            pass
+        return _gpu_model_cache
+
+    # 2) PCI DID from KFD sysfs — separates MI300X/MI325X, MI350X/MI355X
+    gfx, did = _kfd_topology()
+    model = _DID_TO_MODEL.get(did)
+    if model is not None:
+        _gpu_model_cache = model
+        return _gpu_model_cache
+
+    # 3) Arch fallback for parts whose DID is not enumerated
+    model = _ARCH_TO_MODEL.get(gfx)
+    if model is not None:
+        _gpu_model_cache = model
     return _gpu_model_cache
 
 
