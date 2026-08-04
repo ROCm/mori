@@ -87,6 +87,11 @@ class SymmMemManager {
   std::vector<uint32_t> perNicLkeys;
   std::vector<std::vector<uint32_t>> perNicPeerRkeys;
 
+  // Cached heap rkeys — sub-allocations reuse these instead of doing
+  // redundant ibv_reg_mr + Allgather for each shmem_malloc.
+  uint32_t heapLkey_{0};
+  std::vector<uint32_t> heapRkeys_;
+
   // Common Utilities
   SymmMemObjPtr Get(void* localPtr) const;
   HeapVAManager* GetHeapVAManager() const { return heapVAManager.get(); }
