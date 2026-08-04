@@ -25,15 +25,46 @@ set -uo pipefail
 # during capture raises hipErrorStreamCaptureUnsupported. Subtraction gives the duration (the copy
 # is in the ZC=0 graph and absent from the ZC=1 one); MORI_COMB_CPTIME prints the byte count, which
 # is the half that was being assumed. Size print is once, so both combine numbers stay usable.
+# MEASURED 1e08978: ZC=0 host 263.2 / ZC=1 197.5, copy = 65.7us on 16384 x 7168 bf16 = 224 MiB,
+# so 3575 GB/s of payload. The DIFFERENCE matches the 66.3 and 67.7 on record, but both ABSOLUTE
+# numbers are ~20% off the history (ZC=1 was 167.6 combine / 173.6 disp, this run 197.5 / 212.5)
+# and dispatch moved too -- dispatch contains no staging copy and was not touched, so whatever
+# this is, it is not the change under test. The GPUs are idle (no KFD compute pids, VRAM at the
+# 175MB floor), so the remaining candidates are the node itself and one config difference: the
+# history ran the spec with '!' (check armed, SKIPCHECK=0) and the run above ran it without.
+#
+# This sweep isolates that: same ZC, same head, one spec each way. If both land near 197 the
+# config is innocent and the node has drifted; if the checked one returns to ~167 then SKIPCHECK
+# changes what is being timed and every unchecked number this session needs re-reading.
+# MEASURED: check armed 197.5 / not armed 198.2, so SKIPCHECK is innocent. Remaining split is
+# node drift vs a regression in 1e3729d..1e08978, which contains FOLDB and b45a9d99 (blockwise
+# into the pipelined gather) -- both kernel changes. Go back to the commit the 167.6/173.6 pair
+# was taken on and re-run it: same node, same hour, only the code differs.
+#
+# CHECK THE HEAD LINE. This clone is shallow and single-branch, so fetching a bare sha can fail
+# while leaving the old checkout in place, which would print ~197 and read as "node drift" when
+# nothing was actually rolled back.
+# Is the node back? 1e3729d gave 167.6 at ~12:53 and 197.2 at ~14:46 -- same commit, same
+# container, and the only event in between was a neighbour running four-rank tests at 13:06-13:34.
+# Current HEAD was measured equal to 1e3729d today (197.5 vs 197.2), so HEAD is the useful thing
+# to re-run: back near 167 means the node recovered, still 197 means something persists.
+#
+# Snapshot the environment INTO THE SAME LOG as the numbers. Every figure in HANDOFF §20 is bare
+# -- no load, no neighbours, no container age -- which is exactly why deciding whether 197 was a
+# regression or a dirty node took an afternoon and three wrong answers.
+echo "=== environment at start ==="
+date -u '+  utc %F %T'
+uptime | sed 's/^/  /'
+docker ps --format '  ctr {{.Names}} {{.Status}}'
+ps -eo pcpu,pid,etime,comm --sort=-pcpu --no-headers 2>/dev/null | head -5 | sed 's/^/  cpu /'
+rocm-smi --showuse 2>/dev/null | grep -iE "GPU\[" | sed 's/^/  /'
+rocm-smi --showmeminfo vram 2>/dev/null | grep -iE "Used" | sed 's/^/  /'
+echo "=== end environment ==="
+
 export REV=debug-aa
 export BASE=""
 export CBN=64 CWPB=8
-
-export ZC=0
-export SPECS="zc0host=MORI_COMB_CPTIME=1"
-bash /tmp/_ct_aa1.sh
-
-echo "=== second leg: ZC=1, same head, no staging copy ==="
 export ZC=1
-export SPECS="zc1="
+export SPECS="zc1now!="
+
 exec bash /tmp/_ct_aa1.sh
