@@ -129,9 +129,8 @@ _gpu_model_detected: bool = False
 
 _ARCH_CU_TO_MODEL: dict[tuple[str, int], str] = {
     ("gfx942", 304): "mi300x",
-    ("gfx942", 228): "mi308x",
-    ("gfx950", 304): "mi355x",
-    ("gfx950", 256): "mi350x",
+    ("gfx942", 80): "mi308x",
+    ("gfx950", 256): "mi355x",
 }
 
 
