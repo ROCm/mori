@@ -1,0 +1,100 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx950",
+  "gpu_model": "mi350x",
+  "kernel_type": "IntraNodeLL",
+  "ep_size": 8,
+  "phase": "dispatch",
+  "rules": [
+    {
+      "dtype": "bf16",
+      "num_tokens": 1,
+      "hidden_dim": 7168,
+      "block_num": 1,
+      "rdma_block_num": 0,
+      "warp_per_block": 9,
+      "bandwidth_gbps": 2.8,
+      "latency_us": 16.7
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 32,
+      "hidden_dim": 7168,
+      "block_num": 32,
+      "rdma_block_num": 0,
+      "warp_per_block": 10,
+      "bandwidth_gbps": 94.96,
+      "latency_us": 25.72
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 64,
+      "hidden_dim": 7168,
+      "block_num": 72,
+      "rdma_block_num": 0,
+      "warp_per_block": 10,
+      "bandwidth_gbps": 148.82,
+      "latency_us": 32.7
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 128,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 14,
+      "bandwidth_gbps": 207.03,
+      "latency_us": 46.95
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 256,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 14,
+      "bandwidth_gbps": 263.69,
+      "latency_us": 73.66
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 512,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 310.71,
+      "latency_us": 124.88
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 1024,
+      "hidden_dim": 7168,
+      "block_num": 80,
+      "rdma_block_num": 0,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 341.72,
+      "latency_us": 227.45
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 2048,
+      "hidden_dim": 7168,
+      "block_num": 104,
+      "rdma_block_num": 0,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 359.34,
+      "latency_us": 432.51
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 4096,
+      "hidden_dim": 7168,
+      "block_num": 128,
+      "rdma_block_num": 0,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 370.65,
+      "latency_us": 839.57
+    }
+  ]
+}

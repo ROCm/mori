@@ -1,0 +1,150 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx950",
+  "gpu_model": "mi350x",
+  "kernel_type": "IntraNode",
+  "ep_size": 2,
+  "phase": "dispatch",
+  "rules": [
+    {
+      "dtype": "fp4",
+      "num_tokens": 64,
+      "hidden_dim": 3584,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 15.97,
+      "latency_us": 28.6
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 128,
+      "hidden_dim": 3584,
+      "block_num": 184,
+      "rdma_block_num": 0,
+      "warp_per_block": 6,
+      "bandwidth_gbps": 28.03,
+      "latency_us": 32.65
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 256,
+      "hidden_dim": 3584,
+      "block_num": 208,
+      "rdma_block_num": 0,
+      "warp_per_block": 10,
+      "bandwidth_gbps": 43.25,
+      "latency_us": 42.3
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 512,
+      "hidden_dim": 3584,
+      "block_num": 208,
+      "rdma_block_num": 0,
+      "warp_per_block": 10,
+      "bandwidth_gbps": 58.78,
+      "latency_us": 62.35
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 1024,
+      "hidden_dim": 3584,
+      "block_num": 128,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 70.71,
+      "latency_us": 103.25
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 2048,
+      "hidden_dim": 3584,
+      "block_num": 256,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 81.06,
+      "latency_us": 180.45
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 4096,
+      "hidden_dim": 3584,
+      "block_num": 255,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 87.94,
+      "latency_us": 332.5
+    },
+    {
+      "dtype": "fp8_e4m3",
+      "num_tokens": 64,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 32.73,
+      "latency_us": 27.95
+    },
+    {
+      "dtype": "fp8_e4m3",
+      "num_tokens": 128,
+      "hidden_dim": 7168,
+      "block_num": 128,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 49.56,
+      "latency_us": 36.85
+    },
+    {
+      "dtype": "fp8_e4m3",
+      "num_tokens": 256,
+      "hidden_dim": 7168,
+      "block_num": 128,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 67.97,
+      "latency_us": 53.9
+    },
+    {
+      "dtype": "fp8_e4m3",
+      "num_tokens": 512,
+      "hidden_dim": 7168,
+      "block_num": 176,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 82.42,
+      "latency_us": 88.95
+    },
+    {
+      "dtype": "fp8_e4m3",
+      "num_tokens": 1024,
+      "hidden_dim": 7168,
+      "block_num": 208,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 92.88,
+      "latency_us": 157.5
+    },
+    {
+      "dtype": "fp8_e4m3",
+      "num_tokens": 2048,
+      "hidden_dim": 7168,
+      "block_num": 128,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 99.07,
+      "latency_us": 295.4
+    },
+    {
+      "dtype": "fp8_e4m3",
+      "num_tokens": 4096,
+      "hidden_dim": 7168,
+      "block_num": 128,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 103.19,
+      "latency_us": 567.1
+    }
+  ]
+}

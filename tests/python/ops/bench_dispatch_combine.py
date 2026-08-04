@@ -731,6 +731,7 @@ def _save_intranode_tuning_result(
     zero_copy=True,
     best_disp_lat=None,
     best_comb_lat=None,
+    kernel_type_str="IntraNode",
 ):
     from pathlib import Path
     from mori.ops.tuning_config import (
@@ -751,7 +752,7 @@ def _save_intranode_tuning_result(
     metadata = {
         "gpu_arch": gpu_arch,
         "gpu_model": gpu_model,
-        "kernel_type": "IntraNode",
+        "kernel_type": kernel_type_str,
         "ep_size": world_size,
     }
 
@@ -791,7 +792,7 @@ def _save_intranode_tuning_result(
             repo_tuning_dir
             / build_config_filename(
                 gpu_arch,
-                "IntraNode",
+                kernel_type_str,
                 world_size,
                 gpu_model,
                 "dispatch",
@@ -801,7 +802,7 @@ def _save_intranode_tuning_result(
             repo_tuning_dir
             / build_config_filename(
                 gpu_arch,
-                "IntraNode",
+                kernel_type_str,
                 world_size,
                 gpu_model,
                 "combine",
@@ -898,6 +899,7 @@ def _bench_dispatch_combine(
     input_shift=0.0,
     force_scale_active=False,
     report_scale_stats=False,
+    kernel_type_str="IntraNode",
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -908,6 +910,12 @@ def _bench_dispatch_combine(
         combine_hidden_dim = hidden_dim // 2
     else:
         combine_hidden_dim = hidden_dim
+
+    _kernel_type_map = {
+        "IntraNode": mori.ops.EpDispatchCombineKernelType.IntraNode,
+        "IntraNodeLL": mori.ops.EpDispatchCombineKernelType.IntraNodeLL,
+    }
+    kernel_type_enum = _kernel_type_map[kernel_type_str]
 
     if quant_type == "fp8_direct_cast" and combine_data_type is not torch.bfloat16:
         raise ValueError(
@@ -940,6 +948,7 @@ def _bench_dispatch_combine(
         use_external_inp_buf=not zero_copy,  # zero-copy mode requires use_external_inp_buf=False
         gpu_per_node=world_size,
         quant_type=quant_type,
+        kernel_type=kernel_type_enum,
     )
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
@@ -1205,6 +1214,7 @@ def _bench_dispatch_combine(
                         zero_copy=bool(zero_copy),
                         best_disp_lat=best_disp_lat,
                         best_comb_lat=best_comb_lat,
+                        kernel_type_str=kernel_type_str,
                     )
 
         else:
@@ -1236,6 +1246,7 @@ def bench_dispatch_combine(
     input_shift=0.0,
     force_scale_active=False,
     report_scale_stats=False,
+    kernel_type_str="IntraNode",
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -1268,6 +1279,7 @@ def bench_dispatch_combine(
             input_shift,
             force_scale_active,
             report_scale_stats,
+            kernel_type_str,
         ),
         nprocs=world_size,
         join=True,
@@ -1414,6 +1426,13 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--kernel-type",
+        type=str,
+        default="IntraNode",
+        choices=["IntraNode", "IntraNodeLL"],
+        help="Kernel type to tune (default: IntraNode)",
+    )
+    parser.add_argument(
         "--input-dist",
         type=str,
         default="normal",
@@ -1537,4 +1556,5 @@ if __name__ == "__main__":
         input_shift=args.input_shift,
         force_scale_active=bool(args.force_scale_active),
         report_scale_stats=bool(args.report_scale_stats),
+        kernel_type_str=args.kernel_type,
     )

@@ -127,6 +127,13 @@ _TUNING_CONFIGS_DIR = Path(__file__).parent / "tuning_configs"
 _gpu_model_cache: str | None = None
 _gpu_model_detected: bool = False
 
+_ARCH_CU_TO_MODEL: dict[tuple[str, int], str] = {
+    ("gfx942", 304): "mi300x",
+    ("gfx942", 228): "mi308x",
+    ("gfx950", 304): "mi355x",
+    ("gfx950", 256): "mi350x",
+}
+
 
 def detect_gpu_model() -> str | None:
     """Detect GPU model from device name, e.g. 'mi300x', 'mi308x'."""
@@ -135,7 +142,8 @@ def detect_gpu_model() -> str | None:
         return _gpu_model_cache
     _gpu_model_detected = True
     try:
-        name = torch.cuda.get_device_properties(0).name.lower()
+        props = torch.cuda.get_device_properties(0)
+        name = props.name.lower()
     except Exception:
         return None
     import re
@@ -143,6 +151,13 @@ def detect_gpu_model() -> str | None:
     m = re.search(r"\bmi\d+\w*", name)
     if m:
         _gpu_model_cache = m.group(0)
+    else:
+        try:
+            arch = props.gcnArchName.split(":")[0]
+            cus = props.multi_processor_count
+            _gpu_model_cache = _ARCH_CU_TO_MODEL.get((arch, cus))
+        except Exception:
+            pass
     return _gpu_model_cache
 
 
