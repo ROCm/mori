@@ -125,9 +125,9 @@ void ProxyThread::MainLoop() {
         sge.length = cmd->length;
         sge.lkey = (qph.lkey_override != 0) ? qph.lkey_override : cmd->lkey;
 
-        if (ops_posted_ < 3) {
-          fprintf(stderr, "[MoRI-PROXY] post #%lu: qp_idx=%u op=%u len=%u\n",
-                  ops_posted_, qi, cmd->op, cmd->length);
+        if (ops_posted_ < 3 || (ops_posted_ % 100 == 0)) {
+          fprintf(stderr, "[MoRI-PROXY] post #%lu: qp_idx=%u op=%u len=%u head=%u next=%u\n",
+                  ops_posted_, qi, cmd->op, cmd->length, head, next_slot_);
         }
 
         ibv_send_wr wr{};
@@ -208,6 +208,15 @@ void ProxyThread::MainLoop() {
     if (ops_posted_ > 0) {
       for (auto& qph : qps_) {
         if (qph.qp) DrainCq(qph);
+      }
+    }
+
+    if (!did_work && ops_posted_ > 0 && ops_completed_ < ops_posted_) {
+      static thread_local uint64_t idle = 0;
+      if (++idle == 20000000) {
+        fprintf(stderr, "[MoRI-PROXY] STALL: posted=%lu completed=%lu head=%u next=%u\n",
+                ops_posted_, ops_completed_, ring_->gpu_head, next_slot_);
+        idle = 0;
       }
     }
   }

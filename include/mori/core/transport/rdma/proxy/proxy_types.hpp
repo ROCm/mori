@@ -40,7 +40,7 @@ struct alignas(128) ProxyCmd {
   uint8_t pad1[128 - 72];
 };
 
-static constexpr uint32_t PROXY_RING_SIZE = 1024;
+static constexpr uint32_t PROXY_RING_SIZE = 8192;
 static constexpr uint32_t PROXY_RING_MASK = PROXY_RING_SIZE - 1;
 
 struct ProxyRing {
