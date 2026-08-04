@@ -150,13 +150,15 @@ void ProxyThread::MainLoop() {
             break;
           case PROXY_SIGNAL_WRITE: {
             // Signal paired with data: RDMA_WRITE so both go through same
-            // NIC → PCIe → GPU VRAM path. FENCE ensures data arrives first.
+            // NIC → PCIe → GPU VRAM path. RC QP guarantees responder-side
+            // ordering — data write completes before signal write at the
+            // remote GPU without needing IBV_SEND_FENCE.
             uint64_t val = cmd->atomic_arg;
             memcpy(reinterpret_cast<void*>(sge.addr), &val, 8);
             sge.length = 8;
             sge.lkey = cmd->lkey;
             wr.opcode = IBV_WR_RDMA_WRITE;
-            wr.send_flags |= IBV_SEND_FENCE | IBV_SEND_INLINE;
+            wr.send_flags |= IBV_SEND_INLINE;
             wr.wr.rdma.remote_addr = cmd->dst_addr;
             wr.wr.rdma.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
             break;
@@ -213,9 +215,21 @@ void ProxyThread::MainLoop() {
 
     if (!did_work && ops_posted_ > 0 && ops_completed_ < ops_posted_) {
       static thread_local uint64_t idle = 0;
-      if (++idle == 20000000) {
-        fprintf(stderr, "[MoRI-PROXY] STALL: posted=%lu completed=%lu head=%u next=%u\n",
-                ops_posted_, ops_completed_, ring_->gpu_head, next_slot_);
+      static thread_local int dump_count = 0;
+      if (++idle == 50000000 && dump_count < 3) {
+        fprintf(stderr, "[MoRI-PROXY] STALL: posted=%lu completed=%lu head=%u next=%u gpu=%d\n",
+                ops_posted_, ops_completed_, ring_->gpu_head, next_slot_, gpu_id_);
+        int pending = 0;
+        for (uint32_t s = 0; s < PROXY_RING_SIZE && pending < 5; s++) {
+          uint32_t st = ring_->cmds[s].status;
+          if (st != PROXY_FREE && st != PROXY_COMPLETED) {
+            fprintf(stderr, "[MoRI-PROXY] PENDING slot=%u status=%u op=%u qp_idx=%u len=%u\n",
+                    s, st, ring_->cmds[s].op, ring_->cmds[s].qp_idx, ring_->cmds[s].length);
+            pending++;
+          }
+        }
+        if (pending == 0) fprintf(stderr, "[MoRI-PROXY] No pending slots — GPU waiting for data\n");
+        dump_count++;
         idle = 0;
       }
     }
