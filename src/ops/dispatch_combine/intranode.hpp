@@ -4376,6 +4376,11 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                 // is sized for _cRedSrcMax of them, so row 0 exists whenever the loop runs. The
                 // clamp is only needed for worldSize < _cRedSrcMax, where rows above _nRed are
                 // outside the fetched region.
+                //
+                // MEASURED at 64x8 EP4 bf16 PUSH, check armed, rc=0: the fold is 160.6 -> 133.6us
+                // (-16.8%) isolated on the NOPUSH baseline, and the whole combine 314.7 -> 287.9
+                // (-8.5%). The two agree to 0.2us, which is the point of measuring both. Five times
+                // what FOLDU alone was worth, from deleting a branch rather than reordering reads.
                 _svR[_j] = _CROW_AT((_j < _nRed) ? _j : 0);
 #else
                 if (_j >= _nRed || _CROW_DEAD(_j)) continue;

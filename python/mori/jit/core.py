@@ -760,8 +760,9 @@ def _comb_diag_defines() -> list[str]:
                          exec-masked block and the compiler opens every one with
                          s_wait_loadcnt_dscnt 0x0, so the four loads stay serialised however the
                          source orders them. A dead slot reads row 0 and is discarded in the
-                         accumulate. All three are documented where they act, at _cPullOk and
-                         _cRedSrcMax in intranode.hpp.
+                         accumulate. Worth 314.7 -> 287.9us with the check armed, and 160.6 ->
+                         133.6 on the fold measured on its own. All three are documented where
+                         they act, at _cPullOk and _cRedSrcMax in intranode.hpp.
 
     Every other flag in this list is a DELETION or a diagnostic, which is what makes "off" the right
     default for all of them. The push loop's token ORDER used to be selected from here too --
