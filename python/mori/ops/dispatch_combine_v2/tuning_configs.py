@@ -209,6 +209,10 @@ _DEVICES = {
 }
 
 
+# Kept as a module-level name: tests and benches call tuning_configs._topology().
+_topology = gpu_utils.topology
+
+
 def _cu_count():
     return gpu_utils.cu_count()
 
