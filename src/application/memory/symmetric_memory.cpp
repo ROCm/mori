@@ -212,12 +212,14 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   // Register the buffer on each NIC's PD and exchange rkeys.
   const auto& allCtxs = context.GetAllRdmaDeviceContexts();
   int numNics = static_cast<int>(allCtxs.size());
-  if (numNics > 1 && anyRdmaPeer) {
+  // Per-NIC MR registration only for the heap (heap_begin=true).
+  // Sub-allocations within the heap share the heap's MR — re-registering
+  // them wastes time (8 barriers × 8 Allgathers per call) and overwrites
+  // the heap's perNicLkeys/perNicPeerRkeys with sub-allocation keys.
+  if (numNics > 1 && anyRdmaPeer && heap_begin) {
     perNicLkeys.resize(numNics, 0);
     perNicPeerRkeys.resize(numNics);
     for (int n = 0; n < numNics; n++) {
-      // Barrier before each NIC's registration to serialize across processes
-      // and avoid concurrent ibv_reg_mr calls on the same NIC from different GPUs.
       bootNet.Barrier();
       perNicPeerRkeys[n].resize(worldSize, 0);
       if (allCtxs[n]) {
