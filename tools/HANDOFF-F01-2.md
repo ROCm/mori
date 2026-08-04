@@ -1502,7 +1502,66 @@ PULL 参照 236.7,差距从 78 缩到 51。
 `s_and_saveexec_b32` 295 / `s_cbranch_execz` 264 / `s_wait_loadcnt_dscnt` 169 / `v_pk_add_f32` 252。
 **没有 `v_cvt_*_bf16`** —— bf16→f32 是 `v_and 0xffff0000` + `v_lshl 16`,已经是最优形式,别再往这上面想。
 
-### 20.9 工具
+### 20.9 fold 循环已经基本追平 SIM;**剩下的不在 fold 里**
+
+FOLDB 之后跑 `MORI_COMB_TIMING`(`[CSPLIT]`,64×8,PUSH):
+
+| 段 | base | FOLDB | 说明 |
+|---|---|---|---|
+| cSetup | ~10.3 | ~10.0 | 每 token 路由(srcPtrs/peMask) |
+| cIssue | ~3.7 | ~3.8 | TDM 发起 |
+| cWait | ~30 | ~30 | `s_wait_tensorcnt` |
+| **cRed** | **~135** | **~105.7** | **fold 循环本身** |
+| cKern | ~181 | ~150 | |
+
+**`cRed` 105.7 对 `tdm_redsim` 98.10 —— 只差 7.6us(7.7%)。**
+之前"fold 133.6 差 sim 35.5"是**混口径**:那 133.6 含 cWait 30 + cSetup 10 + cIssue 4。
+**别再拿"fold 比 sim 慢 60us"当待办**,fold 循环这条线已经到头,最多还剩 7.6。
+
+`cWait` 的真实暴露用删除法量(CSPLIT 带 printf 扰动,不准):
+
+```
+foldb 288.4   foldbnowait 268.4   =>  等待暴露 20.0us (6.9%)
+```
+
+### 20.10 下一步:**PUSH 侧 token 级双缓冲**。旧的"不要双缓冲"结论在 wpb8 不成立
+
+`intranode.hpp:2811` 写着 **"MEASURED, DO NOT HALVE THIS TO DOUBLE-BUFFER"**:流水建过、有效
+(128x8 值 13.8us),但 wpb16 下 send tile 已占 320KB 里的 229KB,chunk 只能砍到 896 elems,
+双倍 descriptor 换半宽 row 赔 22.2/44.6/21.4us,净 251.4 → 266.9。
+
+**那是 wpb16 的账。我们被规则钉死在 wpb8**,同一段注释 :2850 给出 wpb8 用量 **115712 B**:
+
+```
+tile/warp = _cPullSrcMax(4) x _cPullTileElems(1792) x sizeof(bf16)(2) = 14336 B
+x 8 warp = 114688 B  + ptr arrays ~1KB  ~= 115712 B      <- 现状
+双缓冲     231424 B  < 320KB 上限                          <- 放得下,**无需 halve chunk**
+```
+
+CBN=64 时 64 个 block 摊在 256 CU 上,每 CU 一个 block,LDS 不制约 occupancy。
+⇒ **那 22us 的赔本项在 wpb8 根本不会发生**,旧结论不可直接套用。
+
+而且 PUSH 比 PULL 好做:gather 路径每 token **恰好 1 个** `TdmIssueLoad`(:4208),
+`s_wait_tensorcnt` 的立即数天然是常量 1,不需要 PULL 那套 dummy load 补齐。
+
+改造(`:3694` 的 `for (i = globalWarpId; ...)`,现在是严格 `setup → issue → wait → fold`):
+
+```
+prologue: decode(i0); issue(tile[0], i0)
+loop k:   inext = i + globalWarpNum
+          if (inext < end) { decode(inext); issue(tile[(k+1)&1], inext); }
+          setup(i)                      <- 挪到 issue 之后,10us 的路由也藏进传输
+          (inext < end) ? wait(1) : wait(0)    <- 两个分支各自是常量立即数
+          fold(tile[k&1])
+```
+
+上界 = cWait 20 + 部分 cSetup 10 = **最多 30us**。
+
+**动手前必须**:`_cPullBufs`(:2875)对 PUSH 放开、kernel 侧 LDS(:2834)与 host
+`_combine_shared_mem()`(python/mori/ops/dispatch_combine.py)**同时**改,两边算式必须逐字一致
+(:2828 / :2874 反复强调)。**LDS 算错 = 越界 = 不可杀的 D 态**,见第 0 节第 3 条。
+
+### 20.11 工具
 
 - `tdm_redsim.cc` 加了 `RED_ADJ`(0=线上布局 / 1=相邻)、`RED_UNROLL`(0=原样 / 1=先读齐再累加 / 2=一次两位置)、
   `MODE=6`(读 LDS 但用位或代替算术,隔离读)、`MODE=7`(只写输出,隔离存)。

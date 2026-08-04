@@ -9,18 +9,17 @@
 # Read with:  _send_ct.ps1 -Script tools/_ct_bgread.sh -Envp "TAG=<tag>"
 set -uo pipefail
 
-# --- this run: where are the 35.5us the fold still has over the simulator? -----------------------
-# FOLDB got the fold to 133.6 against tdm_redsim's 98.10 at the same geometry. Rather than guess at
-# the next branch to delete, let [CSPLIT] split the kernel: cSetup is the per-token routing, cIssue
-# the TDM launch, cWait the tensorcnt wait, cRed the fold loop itself. The simulator models only
-# cRed, so whichever of the others is large IS the unmodelled gap, and it is measured rather than
-# inferred by subtraction.
-# Caveat on reading it: the buckets are atomicMax over warps, and only the first 12 calls print, so
-# early rows include the cold launch -- read the last rows. Neither spec carries '!' because the
-# printf itself perturbs the timing, so these are for APPORTIONING, not for headline numbers.
+# --- this run: how much of cWait is actually exposed, now that the fold is fast? -----------------
+# [CSPLIT] puts the fold loop at 105.7us against the simulator's 98.10 -- only 7.6 left there -- and
+# cWait at ~30. PUSH runs issue -> wait -> fold strictly in order (MORI_COMB_PIPE only ever wired
+# itself to the PULL side, see the UseP2PRead guards), so none of that wait is hidden. NOWAIT
+# deletes the s_wait_tensorcnt to price the whole of it before spending LDS on a double buffer.
+#   foldb        287.9us on record, re-run in the same batch so the delta is same-batch
+#   foldbnowait  WRONG RESULTS by construction: folds a tile the engine may still be writing.
+#                Upper bound on what any amount of overlap could ever recover.
 export REV=debug-aa
 export BASE="MORI_COMB_PULL=off"
 export CBN=64 CWPB=8
-export SPECS="basetm=MORI_COMB_TIMING=1,foldbtm=MORI_COMB_TIMING=1 MORI_COMB_FOLDB=1"
+export SPECS="foldb=MORI_COMB_FOLDB=1,foldbnowait=MORI_COMB_FOLDB=1 MORI_COMB_NOWAIT=1"
 
 exec bash /tmp/_ct_aa1.sh
