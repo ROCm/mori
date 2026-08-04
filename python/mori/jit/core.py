@@ -566,10 +566,17 @@ def _comb_pipe_defines() -> list[str]:
     if _qred.isdigit():
         out.append(f"-DMORI_COMB_QRED={int(_qred)}")
     # -DMORI_COMB_LB=N is the combine kernel's __launch_bounds__. Must be >= the launched block
-    # size or the launch fails; set it to combine_warp_per_block * 64.
+    # size or the launch fails; set it to combine_warp_per_block * 32, since gfx1250 is wave32.
+    # PAIR IT WITH MORI_COMB_WPEU or it does nothing measurable: the one-argument __launch_bounds__
+    # only sets amdgpu_flat_work_group_size, and the VGPR budget follows amdgpu_waves_per_eu, which
+    # the second argument carries. LB=256 alone gave a byte-identical code object (128 VGPRs, 29
+    # spills, 192 B scratch) and 314.8us against 314.6. See the macro in intranode.hpp.
     _lb = os.environ.get("MORI_COMB_LB", "").strip()
     if _lb.isdigit() and int(_lb) > 0:
         out.append(f"-DMORI_COMB_LB={int(_lb)}")
+    _wpeu = os.environ.get("MORI_COMB_WPEU", "").strip()
+    if _wpeu.isdigit() and int(_wpeu) > 0:
+        out.append(f"-DMORI_COMB_WPEU={int(_wpeu)}")
     out.append(f"-DMORI_COMB_QSTGU={_comb_qstgu()}")
     out.append(f"-DMORI_COMB_QWIDE={_comb_qwide()}")
     out.append(f"-DMORI_COMB_RELFENCE={_comb_relfence()}")

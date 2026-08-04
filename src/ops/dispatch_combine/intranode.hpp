@@ -4500,17 +4500,31 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 #undef _CSTAMP
 }
 
-// Without a launch bound the compiler must assume the default 1024-thread block, which is 4 waves
-// per SIMD, which caps the kernel at 128 VGPRs -- and llvm-readelf says the bf16 p2p combine spills
-// 26 registers into a 176 B private segment at that cap. It can never USE 4 waves per SIMD: this
+// Without a launch bound the compiler must assume the default 1024-thread block, which caps the
+// kernel at 128 VGPRs -- and llvm-readelf says the bf16 nop2p combine spills 29 registers into a
+// 192 B private segment at that cap (176 B / 26 for p2p). It can never USE a block that big: this
 // path asks for 229 KB of the 320 KB LDS, so one block per CU, and at 8 warps that is 2 waves per
-// SIMD. MORI_COMB_LB tells the compiler the block size the host actually launches, which doubles
-// the VGPR budget for free. Correctness-preserving, but the launch FAILS if block_x exceeds it, so
-// it stays opt-in and must be set to warp_per_block * 64.
+// SIMD.
+//
+// SET BOTH NUMBERS. MORI_COMB_LB alone does nothing: HIP expands the one-argument form to
+// amdgpu_flat_work_group_size() and NOTHING ELSE (amd_hip_runtime.h, launch_bounds_impl0), and the
+// VGPR budget is decided by amdgpu_waves_per_eu, which only the two-argument form sets. Measured:
+// MORI_COMB_LB=256 on its own produced a byte-identical code object -- same 128 VGPRs, same 29
+// spills, same 192 B -- and combine was 314.8us against 314.6 for the default build. That is what
+// the older note at the QUAD ring meant by "__launch_bounds__ does not move the pin".
+//
+// The block size is warp_per_block * 32, NOT * 64: gfx1250 is wave32. The docstring used to say 64,
+// which lands on 512 for the 8-warp geometry -- above the real 256, so the launch still succeeds
+// and the bound still buys nothing, which is a hard failure to notice.
 #ifndef MORI_COMB_LB
 #define MORI_COMB_LB 0
 #endif
-#if MORI_COMB_LB
+#ifndef MORI_COMB_WPEU
+#define MORI_COMB_WPEU 0
+#endif
+#if MORI_COMB_LB && MORI_COMB_WPEU
+#define _MORI_COMB_LB_ATTR __launch_bounds__(MORI_COMB_LB, MORI_COMB_WPEU)
+#elif MORI_COMB_LB
 #define _MORI_COMB_LB_ATTR __launch_bounds__(MORI_COMB_LB)
 #else
 #define _MORI_COMB_LB_ATTR
