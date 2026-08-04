@@ -596,9 +596,7 @@ void GpuStateInit(ShmemStates* states) {
 
   // Check if IBGDA proxy mode is requested
   const char* proxyEnv = std::getenv("MORI_USE_IBGDA_PROXY");
-  fprintf(stderr, "[MoRI-PROXY] MORI_USE_IBGDA_PROXY=%s\n", proxyEnv ? proxyEnv : "(unset)");
   if (proxyEnv && (std::string(proxyEnv) == "1" || std::string(proxyEnv) == "true")) {
-    fprintf(stderr, "[MoRI-PROXY] Proxy mode enabled, allocating ring...\n");
     // Use posix_memalign instead of hipHostMalloc to avoid GPU state corruption
     // in multiprocessing.spawn child processes. The ring is CPU-side only;
     // GPU accesses it through host-mapped pointers set up by hipHostRegister.
@@ -611,7 +609,6 @@ void GpuStateInit(ShmemStates* states) {
       hipError_t regErr = hipHostRegister(ring, sizeof(core::ProxyRing),
                                           hipHostRegisterMapped | hipHostRegisterPortable);
       if (regErr != hipSuccess) {
-        fprintf(stderr, "[MoRI-PROXY] hipHostRegister failed: %d (non-fatal)\n", (int)regErr);
       }
     } else {
       err = hipErrorMemoryAllocation;
@@ -763,19 +760,16 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
         qpCount++;
       }
     }
-    fprintf(stderr, "[MoRI-PROXY] Found %d QPs in %zu slots for proxy thread (%d NICs)\n",
             qpCount, qps.size(), numNics);
     if (qpCount > 0) {
       states->proxyThread = std::make_unique<core::ProxyThread>();
       int gpuId = states->gpuStates.rank % numNics;
       states->proxyThread->Init(states->gpuStates.proxyRing, std::move(qps), gpuId);
       states->proxyThread->Start();
-      fprintf(stderr, "[MoRI-PROXY] Proxy thread started\n");
     }
   }
 
   states->status = ShmemStatesStatus::Initialized;
-  fprintf(stderr, "[MoRI-PROXY] Shmem init COMPLETE (rank=%d)\n", states->gpuStates.rank);
   MORI_SHMEM_INFO("Shmem initialization completed");
   return 0;
 }
@@ -790,22 +784,15 @@ bool ShmemIsInitialized() {
 
 static void FinalizeGpuStates(ShmemStates* states) {
   // Shutdown proxy thread before freeing GPU states
-  fprintf(stderr, "[MoRI-PROXY] FinalizeGpuStates: shutting down proxy...\n");
   if (states->proxyThread) {
-    fprintf(stderr, "[MoRI-PROXY]   Calling proxyThread->Shutdown()\n");
     states->proxyThread->Shutdown();
-    fprintf(stderr, "[MoRI-PROXY]   proxyThread->Shutdown() done\n");
     states->proxyThread.reset();
-    fprintf(stderr, "[MoRI-PROXY]   proxyThread reset done\n");
   }
   if (states->gpuStates.proxyRing) {
-    fprintf(stderr, "[MoRI-PROXY]   Freeing proxyRing %p\n", (void*)states->gpuStates.proxyRing);
     hipHostUnregister(states->gpuStates.proxyRing);
     free(states->gpuStates.proxyRing);
     states->gpuStates.proxyRing = nullptr;
-    fprintf(stderr, "[MoRI-PROXY]   proxyRing freed\n");
   }
-  fprintf(stderr, "[MoRI-PROXY] Proxy cleanup done\n");
 
   hipDeviceSynchronize();
   (void)hipGetLastError();

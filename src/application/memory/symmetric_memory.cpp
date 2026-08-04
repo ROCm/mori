@@ -227,7 +227,6 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       }
       bootNet.Allgather(&perNicPeerRkeys[n][rank], perNicPeerRkeys[n].data(), sizeof(uint32_t));
     }
-    fprintf(stderr, "[MoRI-PROXY] Per-NIC MR + rkey exchange done: %d NICs × %d peers\n", numNics, worldSize);
   }
 
   // Copy memory object to GPU memory, we need to access it from GPU directly
