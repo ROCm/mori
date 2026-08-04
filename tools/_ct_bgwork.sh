@@ -9,17 +9,23 @@
 # Read with:  _send_ct.ps1 -Script tools/_ct_bgread.sh -Envp "TAG=<tag>"
 set -uo pipefail
 
-# --- this run: how much of cWait is actually exposed, now that the fold is fast? -----------------
-# [CSPLIT] puts the fold loop at 105.7us against the simulator's 98.10 -- only 7.6 left there -- and
-# cWait at ~30. PUSH runs issue -> wait -> fold strictly in order (MORI_COMB_PIPE only ever wired
-# itself to the PULL side, see the UseP2PRead guards), so none of that wait is hidden. NOWAIT
-# deletes the s_wait_tensorcnt to price the whole of it before spending LDS on a double buffer.
-#   foldb        287.9us on record, re-run in the same batch so the delta is same-batch
-#   foldbnowait  WRONG RESULTS by construction: folds a tile the engine may still be writing.
-#                Upper bound on what any amount of overlap could ever recover.
+# --- this run: which baseline is PUSH actually supposed to beat? ---------------------------------
+# MORI_COMB_PULL picks who stages a caller-owned input (host / kernel / off), NOT the transport.
+# Every run in this session used BASE=off, which HANDOFF §18.2 records as the SLOWEST of the three
+# (318.8us) -- so the 314.7 -> 287.9 win is real but sits on the wrong line. Re-measure all of them
+# on this HEAD rather than quoting that table.
+#   host!    ZC=0 default: one d2d on the caller stream, then the zero-copy PULL path (was 236.7)
+#   push!    ZC=0 PUSH with FOLDB, i.e. what this session built            (was 287.9)
+# MEASURED on 1e3729d: host 233.9 / push 288.2, so PUSH is 54.3us behind PULL in its OWN scenario.
+#
+# Now the ZC=1 leg, which is where the 169.0/1255.9 reference lives. ZC is per-run, not per-spec,
+# hence a separate sweep. Worth pinning down because dispatch in the ZC=0 run above reads
+# 173.6us/1223.6 GB/s, close enough to "170us, 1220GB" that the target could be either number, and
+# they imply completely different work.
 export REV=debug-aa
-export BASE="MORI_COMB_PULL=off"
+export BASE=""
+export ZC=1
 export CBN=64 CWPB=8
-export SPECS="foldb=MORI_COMB_FOLDB=1,foldbnowait=MORI_COMB_FOLDB=1 MORI_COMB_NOWAIT=1"
+export SPECS="zc1!="
 
 exec bash /tmp/_ct_aa1.sh
