@@ -44,6 +44,8 @@ from typing import ClassVar
 
 import torch
 
+from mori.ops import utils as gpu_utils
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -127,36 +129,29 @@ _TUNING_CONFIGS_DIR = Path(__file__).parent / "tuning_configs"
 _gpu_model_cache: str | None = None
 _gpu_model_detected: bool = False
 
-_ARCH_CU_TO_MODEL: dict[tuple[str, int], str] = {
-    ("gfx942", 304): "mi300x",
-    ("gfx942", 80): "mi308x",
-    ("gfx950", 256): "mi355x",
-}
-
 
 def detect_gpu_model() -> str | None:
-    """Detect GPU model from device name, e.g. 'mi300x', 'mi308x'."""
+    """Detect GPU model, e.g. 'mi300x', 'mi308x'. KFD-sysfs PCI DID first (exact,
+    needs no HIP context); the torch device name is only parsed for parts the DID
+    table doesn't know yet."""
     global _gpu_model_cache, _gpu_model_detected
     if _gpu_model_detected:
         return _gpu_model_cache
     _gpu_model_detected = True
-    try:
-        props = torch.cuda.get_device_properties(0)
-        name = props.name.lower()
-    except Exception:
-        return None
+
+    _gpu_model_cache = gpu_utils.detect_model()
+    if _gpu_model_cache is not None:
+        return _gpu_model_cache
+
     import re
 
-    m = re.search(r"\bmi\d+\w*", name)
-    if m:
-        _gpu_model_cache = m.group(0)
-    else:
-        try:
-            arch = props.gcnArchName.split(":")[0]
-            cus = props.multi_processor_count
-            _gpu_model_cache = _ARCH_CU_TO_MODEL.get((arch, cus))
-        except Exception:
-            pass
+    try:
+        name = torch.cuda.get_device_properties(0).name.lower()
+        m = re.search(r"\bmi\d+\w*", name)
+        if m:
+            _gpu_model_cache = m.group(0)
+    except Exception:
+        pass
     return _gpu_model_cache
 
 
