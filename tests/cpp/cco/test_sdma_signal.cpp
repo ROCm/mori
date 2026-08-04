@@ -242,7 +242,10 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
             char what[96];
             snprintf(what, sizeof(what), "A[scope=%d q=%d agg=%d %zuB]", scope, q, agg, bytes);
             if (verbose) printf("[rank %d] %s\n", rank, what), fflush(stdout);
+            // hipMemset is async and ccoBarrierAll syncs hosts only; a late fill
+            // clobbers a peer's put.
             HIP_CHECK(hipMemset(recvBuf, 0xff, BUF_BYTES));
+            HIP_CHECK(hipDeviceSynchronize());
             mori::cco::ccoBarrierAll(comm);
 #define MATRIX_LAUNCH(FLAGS)                                            \
   do {                                                                  \
@@ -293,6 +296,7 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
       if (verbose) printf("[rank %d] %s\n", rank, tag), fflush(stdout);
       HIP_CHECK(hipMemset(recvBuf, 0xff, BUF_BYTES));
       HIP_CHECK(hipMemset(devRes, 0, sizeof(SignalResult)));
+      HIP_CHECK(hipDeviceSynchronize());
       mori::cco::ccoBarrierAll(comm);  // before the puts, not before the verify
       if (mode == 0)
         SdmaSignalKernel<false, true>
@@ -361,6 +365,7 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
           uint64_t before = 0, after = 0;
           HIP_CHECK(hipMemcpy(&before, slot, sizeof(before), hipMemcpyDeviceToHost));
           HIP_CHECK(hipMemset(recvBuf, 0xff, BUF_BYTES));
+          HIP_CHECK(hipDeviceSynchronize());
           mori::cco::ccoBarrierAll(comm);
           if (perCopy)
             SdmaGroupSignalKernel<mori::cco::ccoSdmaOptFlagsSignalPerCopy>

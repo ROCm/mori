@@ -200,7 +200,9 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
 
     // ── phase 1: wraparound ──────────────────────────────────────────────────
     // recv slot s ends up written by rank s (last-writer-wins over WRAP_ITERS).
+    // hipMemset is async and ccoBarrierAll syncs hosts only; a late fill clobbers a peer's put.
     HIP_CHECK(hipMemset(recvBuf, 0xff, bufSize));
+    HIP_CHECK(hipDeviceSynchronize());
     mori::cco::ccoBarrierAll(comm);
     SdmaWrapKernel<<<1, 64, 0, stream>>>(sendWin, recvWin, COUNT, WRAP_ITERS, devComm);
     HIP_CHECK(hipStreamSynchronize(stream));
@@ -258,6 +260,7 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
           hostSendB[p * slotBytes + i] = static_cast<unsigned char>((rank * 17 + i) & 0xff);
       HIP_CHECK(hipMemcpy(sendBuf, hostSendB.data(), bufSize, hipMemcpyHostToDevice));
       HIP_CHECK(hipMemset(recvBuf, 0x00, bufSize));
+      HIP_CHECK(hipDeviceSynchronize());
 
       mori::cco::ccoBarrierAll(comm);
       SdmaTinyKernel<<<nranks, 64, 0, stream>>>(sendWin, recvWin, slotBytes, tinyBytes, devComm);
@@ -287,6 +290,7 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
     // ── phase 4: wraparound with MIXED slot sizes ────────────────────────────
     HIP_CHECK(hipMemcpy(sendBuf, hostSend.data(), bufSize, hipMemcpyHostToDevice));
     HIP_CHECK(hipMemset(recvBuf, 0xff, bufSize));
+    HIP_CHECK(hipDeviceSynchronize());
     mori::cco::ccoBarrierAll(comm);
     SdmaMixWrapKernel<<<1, 64, 0, stream>>>(sendWin, recvWin, COUNT, MIXWRAP_ROUNDS, devComm);
     HIP_CHECK(hipStreamSynchronize(stream));
