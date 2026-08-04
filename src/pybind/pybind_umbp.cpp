@@ -169,6 +169,9 @@ void RegisterMoriUmbp(py::module_& m) {
       // Multi-drive: storage_dir accepts a comma-separated list (one per drive);
       // shard_io_threads=0 means one worker per drive.
       .def_readwrite("shard_io_threads", &UMBPSsdConfig::shard_io_threads)
+      .def_readwrite("tier_io_threads", &UMBPSsdConfig::tier_io_threads)
+      .def_readwrite("direct_io", &UMBPSsdConfig::direct_io)
+      .def_readwrite("verify_crc", &UMBPSsdConfig::verify_crc)
       .def_readwrite("high_watermark", &UMBPSsdConfig::high_watermark)
       .def_readwrite("low_watermark", &UMBPSsdConfig::low_watermark)
       .def_readwrite("io", &UMBPSsdConfig::io)
