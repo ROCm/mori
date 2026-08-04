@@ -84,6 +84,7 @@ SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
   const char* proxyEnv = std::getenv("MORI_USE_IBGDA_PROXY");
   bool useProxy = proxyEnv && (std::string(proxyEnv) == "1" || std::string(proxyEnv) == "true");
   if (context.IsSdmaEnabled() || useProxy) {
+    fprintf(stderr, "[MoRI-PROXY] Allocating UNCACHED symmetric memory: %zu bytes\n", size);
     HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&ptr, size, hipDeviceMallocUncached));
   } else {
     HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));
