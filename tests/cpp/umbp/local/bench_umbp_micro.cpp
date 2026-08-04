@@ -97,6 +97,12 @@ struct BenchConfig {
   UMBPIoBackend ssd_io_backend = UMBPIoBackend::Posix;
   size_t ssd_io_queue_depth = 4096;
   UMBPDurabilityMode ssd_durability_mode = UMBPDurabilityMode::Relaxed;
+  // Off by default so existing numbers stay comparable.  Turn direct I/O on for
+  // any measurement meant to describe the drive: buffered, this bench reads back
+  // out of the page cache and reports DRAM bandwidth with an SSD label on it.
+  bool ssd_direct_io = false;
+  bool ssd_verify_crc = true;
+  int ssd_tier_io_threads = 4;
 
   std::vector<int> thread_counts = {1, 2, 4, 8};
 
@@ -415,6 +421,9 @@ static UMBPConfig MakeBaseSsdConfig(const BenchConfig& cfg) {
   ucfg.ssd.io.queue_depth = cfg.ssd_io_queue_depth;
   ucfg.ssd.durability.mode = cfg.ssd_durability_mode;
   ucfg.ssd.segment_size_bytes = cfg.segment_size;
+  ucfg.ssd.direct_io = cfg.ssd_direct_io;
+  ucfg.ssd.verify_crc = cfg.ssd_verify_crc;
+  ucfg.ssd.tier_io_threads = cfg.ssd_tier_io_threads;
   return ucfg;
 }
 
@@ -1253,9 +1262,11 @@ static std::string JoinVariant(std::initializer_list<std::string> parts) {
 }
 
 static bool BatchFitsSegment(const WriteBatchDesc& desc, size_t segment_size) {
+  // Must mirror SSDTier::WriteBatch, which decides batch-vs-fallback on the
+  // padded on-disk size, not the raw byte count.
   size_t total_bytes = 0;
   for (size_t i = 0; i < desc.keys.size(); ++i) {
-    total_bytes += sizeof(segment::RecordHeader) + desc.keys[i].size() + desc.sizes[i];
+    total_bytes += static_cast<size_t>(segment::RecordBytes(desc.keys[i].size(), desc.sizes[i]));
   }
   return total_bytes <= segment_size;
 }
@@ -3266,6 +3277,14 @@ static void PrintUsage(const char* argv0) {
       "  --ssd-durability <strict|relaxed>\n"
       "  --ssd-backend <file|spdk>       SSD backend (default: file)\n"
       "                                   spdk requires UMBP_SPDK_NVME_PCI env var\n"
+      "  --ssd-direct-io <0|1>            Bypass the page cache (O_DIRECT). Default 0.\n"
+      "                                   Buffered, this bench re-reads from RAM and\n"
+      "                                   reports DRAM bandwidth, not the drive's.\n"
+      "  --ssd-verify-crc <0|1>           Checksum on write / verify on read (default 1).\n"
+      "                                   0 isolates storage cost from integrity cost --\n"
+      "                                   the DRAM tier does no checksumming at all.\n"
+      "  --ssd-tier-io-threads N          Threads for the tier's CPU phases (default 4,\n"
+      "                                   matching the DRAM tier's read_threads_).\n"
       "\n"
       "E2E (sglang connector simulation):\n"
       "  --model <deepseek-v3|deepseek-v2|llama-70b|llama-8b>\n"
@@ -3384,6 +3403,12 @@ static ParsedArgs ParseArgs(int argc, char* argv[]) {
     } else if (arg == "--ssd-queue-depth" && i + 1 < argc) {
       user_ssd_io_queue_depth = std::stoull(argv[++i]);
       override_ssd_io_queue_depth = true;
+    } else if (arg == "--ssd-direct-io" && i + 1 < argc) {
+      cfg.ssd_direct_io = std::stoi(argv[++i]) != 0;
+    } else if (arg == "--ssd-verify-crc" && i + 1 < argc) {
+      cfg.ssd_verify_crc = std::stoi(argv[++i]) != 0;
+    } else if (arg == "--ssd-tier-io-threads" && i + 1 < argc) {
+      cfg.ssd_tier_io_threads = std::stoi(argv[++i]);
     } else if (arg == "--ssd-durability" && i + 1 < argc) {
       std::string durability = argv[++i];
       if (!ParseDurabilityMode(durability, user_ssd_durability)) {

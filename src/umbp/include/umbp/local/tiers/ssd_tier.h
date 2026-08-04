@@ -76,12 +76,26 @@ class SSDTier : public TierBackend {
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
   const IoStatus& LastIoStatus() const { return last_io_status_; }
   std::optional<std::string> GetLocationId(const std::string& key) const override;
+  // Enables O_DIRECT for segments opened from here on.  Takes effect for
+  // segments opened after the call; existing fds keep their current mode, so
+  // the intended use is at construction (ssd.direct_io) rather than mid-run.
+  void SetColdRead(bool enable) override;
+
+  // True when segment I/O is actually bypassing the page cache.  False if
+  // direct I/O was never requested, or was requested and the probe failed.
+  bool direct_io_active() const { return direct_io_; }
 
  private:
   bool IsReadOnlyShared() const { return access_mode_ == SSDAccessMode::ReadOnlyShared; }
   bool ShouldSyncOnWrite() const {
     return ssd_config_.durability.mode == UMBPDurabilityMode::Strict;
   }
+  int SegmentOpenFlags() const;
+  // Empirical check that this directory's filesystem supports O_DIRECT at
+  // kRecordAlign: opens a probe file, writes and reads back one aligned block.
+  // Cheaper to trust than a reported capability, and it catches tmpfs/overlayfs
+  // (which reject the open) as well as devices needing coarser alignment.
+  bool ProbeDirectIo() const;
 
   bool EnsureActiveSegment(size_t need_bytes);
   bool RefreshFromDiskLocked(bool force_full_rescan);
@@ -96,13 +110,19 @@ class SSDTier : public TierBackend {
   segment::Meta* GetSegmentLocked(uint64_t segment_id);
   const segment::Meta* GetSegmentLocked(uint64_t segment_id) const;
   bool ReadRecordLocked(const std::string& key, void* dst, size_t size, uint32_t expected_crc,
-                        uint64_t value_offset, int read_fd) const;
+                        uint64_t value_offset, int read_fd, bool crc_valid) const;
   void RememberStatus(IoStatus status) const;
+  // Issue one value read, transparently bouncing through an aligned buffer when
+  // direct I/O is on and `dst`/`size` do not meet the alignment rules.
+  IoStatus ReadValueInto(int fd, void* dst, size_t size, uint64_t value_offset) const;
+  bool ShouldVerifyCrc(bool crc_valid) const { return ssd_config_.verify_crc && crc_valid; }
+  int TierThreads() const;
 
   std::string dir_;
   size_t capacity_;
   UMBPSsdConfig ssd_config_;
   SSDAccessMode access_mode_;
+  bool direct_io_ = false;
 
   mutable std::mutex mu_;
   mutable std::mutex io_mu_;

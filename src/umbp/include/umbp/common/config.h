@@ -95,6 +95,35 @@ struct UMBPSsdConfig {
   // which is what saturates N drives.  Ignored with a single directory.
   int shard_io_threads = 0;
 
+  // Worker threads for the CPU-bound phases *inside* one SSDTier: checksum
+  // verification on read, checksum + record assembly on write.  Distinct from
+  // shard_io_threads, which fans out across drives — this fans out within a
+  // single drive's batch and is what makes a 1-drive SSD tier comparable to the
+  // DRAM tier, whose read_threads_/write_threads_ default to 4.  Matching that
+  // default keeps a DRAM-vs-SSD comparison from silently measuring 4 threads
+  // against 1.
+  int tier_io_threads = 4;
+
+  // Bypass the page cache (O_DIRECT) for all segment I/O.
+  //
+  // The tier is itself a cache, so buffered I/O gives it a second, unmanaged
+  // DRAM cache underneath: reads are served from RAM at many times device
+  // bandwidth, the node reports DRAM it is actually consuming as free, and any
+  // measurement of drive behaviour is meaningless.  With this on, reported tier
+  // bandwidth is the device's.
+  //
+  // Requires a filesystem that supports O_DIRECT (ext4/xfs do; tmpfs and
+  // overlayfs do not) — the tier probes at startup and falls back to buffered
+  // with a warning rather than failing to come up.
+  bool direct_io = false;
+
+  // Compute checksums on write and verify them on read.  On by default; turning
+  // it off is for isolating how much of the SSD path's cost is integrity work
+  // rather than storage, since the DRAM tier does no checksumming at all and an
+  // unqualified DRAM-vs-SSD comparison otherwise conflates the two.  Records
+  // written with it off are marked kFlagNoCrc and stay readable either way.
+  bool verify_crc = true;
+
   // Split storage_dir on ',' — one entry per drive.  Always returns at least
   // one element (falls back to the default when the string is empty).
   std::vector<std::string> StorageDirs() const {
@@ -169,6 +198,13 @@ struct UMBPSsdConfig {
     }
     if (segment_size_bytes == 0) {
       if (error_message) *error_message = "ssd.segment_size_bytes must be > 0";
+      return false;
+    }
+    // Records are padded to segment::kRecordAlign (4096), so a segment whose
+    // size is not a multiple of it would leave the append cursor unaligned at
+    // the roll-over and break direct I/O on the next segment.
+    if (segment_size_bytes % 4096 != 0) {
+      if (error_message) *error_message = "ssd.segment_size_bytes must be a multiple of 4096";
       return false;
     }
     // Watermarks must satisfy 0 < low < high <= 1.  Fail fast on a misconfigured
@@ -468,6 +504,9 @@ struct UMBPConfig {
     cfg.ssd.storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd.storage_dir);
     cfg.ssd.capacity_bytes = getenv_size("UMBP_SSD_CAPACITY", cfg.ssd.capacity_bytes);
     cfg.ssd.shard_io_threads = getenv_int("UMBP_SSD_SHARD_IO_THREADS", cfg.ssd.shard_io_threads);
+    cfg.ssd.tier_io_threads = getenv_int("UMBP_SSD_TIER_IO_THREADS", cfg.ssd.tier_io_threads);
+    cfg.ssd.direct_io = getenv_int("UMBP_SSD_DIRECT_IO", cfg.ssd.direct_io ? 1 : 0) != 0;
+    cfg.ssd.verify_crc = getenv_int("UMBP_SSD_VERIFY_CRC", cfg.ssd.verify_crc ? 1 : 0) != 0;
     // Durability of the SSD cache tier.  "strict" (default) fdatasync()s every
     // batch write; "relaxed" leaves the data in the page cache and lets the
     // kernel flush it.  Relaxed is safe for a pure cache — the bytes are
