@@ -56,10 +56,29 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
           if (recv_idx < qph.recv_count && qph.recv_buf) {
             struct { uint64_t addr; uint64_t val; } payload;
             memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
-            // CPU atomic add on GPU memory. Use __atomic with SEQ_CST + sfence.
-            // Note: may race with GPU-side P2P atomics on first token.
+            // Atomic add on GPU VRAM from CPU. With hipDeviceMallocUncached,
+            // GPU reads bypass L2 cache so they see CPU writes directly.
+            //
+            // IMPORTANT: The prior RDMA_WRITE (data) and this SEND_WITH_IMM
+            // (signal) were sent with FENCE on the same QP, but take different
+            // paths: data goes NIC→GPU VRAM via DMA, signal goes NIC→CPU recv
+            // buffer→here. We must ensure the data DMA completed before we
+            // increment the signal counter that tells the GPU "data is ready".
+            // Read-back from the data destination address forces PCIe ordering.
+            // Fence: ensure prior RDMA_WRITE data has landed in GPU VRAM
+            // before incrementing the signal counter that tells the GPU
+            // "data is ready". Read from the data region base address to
+            // force PCIe posted write ordering, then do the signal atomic.
+            // The data region starts at the base of symmetric memory (page-aligned),
+            // so read from a page-aligned address near the signal to force ordering.
+            uintptr_t page_addr = payload.addr & ~0xFFFULL;
+            volatile uint64_t fence_read = *reinterpret_cast<volatile uint64_t*>(page_addr);
+            (void)fence_read;
+            asm volatile("mfence" ::: "memory");
+
             volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
             __atomic_fetch_add(target, payload.val, __ATOMIC_SEQ_CST);
+            asm volatile("clflush (%0)" :: "r"(target) : "memory");
             asm volatile("sfence" ::: "memory");
             recv_atomics_++;
             // Re-post recv WR
@@ -96,6 +115,7 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
 }
 
 void ProxyThread::MainLoop() {
+  hipSetDevice(gpu_id_);
   while (!ring_->shutdown) {
     bool did_work = false;
 
