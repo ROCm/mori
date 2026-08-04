@@ -176,7 +176,9 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
     };
 
     auto run = [&](const char* what, int chunks, auto launch) {
+      // hipMemset is async and ccoBarrierAll syncs hosts only; a late fill clobbers a peer's put.
       HIP_CHECK(hipMemset(recvBuf, 0xff, BUF_BYTES));
+      HIP_CHECK(hipDeviceSynchronize());
       mori::cco::ccoBarrierAll(comm);
       launch();
       HIP_CHECK(hipStreamSynchronize(stream));  // hangs here if issuers deadlock
