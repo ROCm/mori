@@ -726,6 +726,13 @@ def _comb_diag_defines() -> list[str]:
     (barrier 58.5 -> 110.8, full 236.9 -> 309.2) and stays off: swapping 128 uncached reads of one
     line for 127 device-scope reads of one line buys nothing and serialises them behind block 0.
 
+    MORI_COMB_NOWAIT deletes the s_wait_tensorcnt the PUSH fold does on its own TDM load, so
+    full - NOWAIT is the time a warp spends stalled waiting for its tile and nothing else. It exists
+    because double buffering is gated on UseP2PRead: on the PUSH path the fold aliases the send tile,
+    so _cPullBufs is 1 and every token is a serial issue -> wait -> fold with no overlap, which is
+    the leading suspect for the ~60us by which this fold exceeds tdm_redsim's. WRONG RESULTS -- the
+    lanes fold a half-written tile -- but in bounds, since the LDS and the addresses are unchanged.
+
     MORI_COMB_NOBAR is the barrier's honest price: it deletes the cross-device WAIT from an
     otherwise complete kernel, keeping the arrival count, the flag stores and the flag increment,
     which the next replay needs. Every earlier barrier number came from the opposite deletion,
@@ -738,8 +745,10 @@ def _comb_diag_defines() -> list[str]:
       MORI_COMB_FOLDVEC  routes PUSH's fold through the 16B lane-load gather instead of the TDM tile
                          path. A SETTLED NEGATIVE -- dropping the tile costs 596.1us against 311.5.
       MORI_COMB_FOLDU    reads every source into registers before accumulating any of them, so the
-                         ds_read_b128s issue back to back. Both are documented where they act, at
-                         _cPullOk and _cRedSrcMax in intranode.hpp.
+                         ds_read_b128s issue back to back. Worth 314.6 -> 309.3us at 64x8, i.e.
+                         1.8% -- real and repeatable, but a third of what the microbenchmark
+                         predicted. Both are documented where they act, at _cPullOk and
+                         _cRedSrcMax in intranode.hpp.
 
     Every other flag in this list is a DELETION or a diagnostic, which is what makes "off" the right
     default for all of them. The push loop's token ORDER used to be selected from here too --
@@ -758,6 +767,7 @@ def _comb_diag_defines() -> list[str]:
             "MORI_COMB_NOQUANT",
             "MORI_COMB_NOPUSH",
             "MORI_COMB_NOGATHER",
+            "MORI_COMB_NOWAIT",
             "MORI_COMB_BARRIER2",
             "MORI_COMB_BARNOFENCE",
             "MORI_COMB_BARFAN",

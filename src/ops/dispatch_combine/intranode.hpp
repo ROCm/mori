@@ -4216,7 +4216,23 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             }
           }
           _CSTAMP(_cIssue);
+          // WRONG RESULTS ON PURPOSE under MORI_COMB_NOWAIT, same family as NOPUSH/NOGATHER/NOREDUCE:
+          // drop the wait and fold whatever is in the tile, so full-minus-this is the time the warp
+          // spends stalled on its own TDM load and nothing else.
+          //
+          // Why that term is worth pricing here and cannot be read off tdm_redsim: _cPullBufs is 1 on
+          // this path (see its definition -- double buffering is gated on UseP2PRead, because PUSH's
+          // fold aliases the send tile and there is no second buffer to hand out). The tile holds a
+          // whole token's worth of every source, so the chunk loop runs once and each token is a
+          // strictly serial issue -> wait -> fold with nothing overlapping it. That serialisation is
+          // the leading candidate for the ~60us by which this fold exceeds the simulator's.
+          //
+          // Safe despite being wrong: the LDS is already reserved and the addresses are unchanged, so
+          // the lanes read stale or half-written tile bytes, never out of bounds. The loads still
+          // issue, so the traffic is byte-identical; only the ordering guarantee is gone.
+#if !defined(MORI_COMB_NOWAIT)
           __builtin_amdgcn_s_wait_tensorcnt(0);
+#endif
           _CSTAMP(_cWait);
 #if defined(MORI_COMB_NOREDUCE)
           // WRONG RESULTS ON PURPOSE, same family as MORI_DISP_NOMETA/NOPAY: every peer load above is
@@ -4328,12 +4344,21 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             // constant with a runtime guard, the same shape as _cScSrcMax above. A runtime index
             // into _svR would put it in scratch, which costs more than the latency it hides.
             //
-            // WHY IT MATTERS MORE THAN IT LOOKS: the binding constraint is 64 CU x 8 warp
+            // Why it is worth doing at all: the binding constraint is 64 CU x 8 warp
             // (.cursor/rules/ep-dispatch.mdc), i.e. two waves per SIMD, which cannot cover an LDS
             // read latency by thread parallelism -- and adding warps is what the rule forbids. ILP
-            // inside the wave is the only lever left. MEASURED in tools/tdm_redsim.cc at 64x8:
-            // 98.10 -> 77.87us on the full fold, 76.99 -> 57.26 with the loads deleted. Going wider
-            // than one position at a time (RED_UNROLL=2) gives it back to register pressure, 80.24.
+            // inside the wave is the only lever left. In tools/tdm_redsim.cc at 64x8 that is worth
+            // 98.10 -> 77.87us on the full fold, and 76.99 -> 57.26 with the loads deleted. Going
+            // wider than one position at a time (RED_UNROLL=2) hands it back to register pressure,
+            // 80.24.
+            //
+            // BUT THE KERNEL ONLY GETS A THIRD OF THAT: 314.6 -> 309.3us at 64x8 EP4 bf16 PUSH,
+            // both rc=0, stable to under 1us within a spec. 1.8%, not 21%. The sim's fold is 98.10
+            // where this one's is 157.8, and the ~60us it does not model -- routing, weights, the
+            // MultiWarpIter dispatch, the barrier interaction -- is untouched by how the ds_reads
+            // are issued, so the saving lands on a smaller base than the sim implies. Do not quote
+            // the redsim number as if it were this kernel's; that 1.6x gap is where the rest of the
+            // fold's cost is hiding and it has not been accounted for yet.
             if (_nRed <= _cRedSrcMax) {
               _CVecT _svR[_cRedSrcMax];
 #pragma unroll
