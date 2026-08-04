@@ -909,9 +909,9 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
     uintptr_t sigRaddr = signalDest->peerPtrs[pe] + signalDestOffset;
     uint32_t sigRkey = signalDest->peerRkeys[pe];
     core::IbufHandle& ibuf = globalGpuStates->rdmaEndpoints[epIndex].atomicIbuf;
-    core::ProxyPostAtomicNonFetch(globalGpuStates->proxyRing, epIndex,
-                                  sigRaddr, sigRkey, signalValue,
-                                  ibuf.lkey, ibuf.addr);
+    core::ProxyPostSignalWrite(globalGpuStates->proxyRing, epIndex,
+                               sigRaddr, sigRkey, signalValue,
+                               ibuf.lkey, ibuf.addr);
     return;
   }
 

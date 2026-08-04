@@ -20,6 +20,9 @@ struct ProxyQpHandle {
   ibv_cq* cq{nullptr};
   uint32_t lkey_override{0};
   uint32_t rkey_override{0};
+  void* recv_buf{nullptr};
+  uint32_t recv_lkey{0};
+  uint32_t recv_count{0};
 };
 
 class ProxyThread {
@@ -27,7 +30,7 @@ class ProxyThread {
   ProxyThread() = default;
   ~ProxyThread();
 
-  void Init(ProxyRing* ring, std::vector<ProxyQpHandle> qps);
+  void Init(ProxyRing* ring, std::vector<ProxyQpHandle> qps, int gpuId = 0);
   void Start();
   void Shutdown();
 
@@ -43,6 +46,7 @@ class ProxyThread {
   uint32_t next_slot_{0};
   uint64_t ops_posted_{0};
   uint64_t ops_completed_{0};
+  int gpu_id_{0};
 };
 
 }  // namespace core

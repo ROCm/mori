@@ -104,6 +104,33 @@ inline __device__ uint32_t ProxyPostAtomicNonFetch(
   return seq;
 }
 
+// Signal write: RDMA_WRITE of value to remote addr on the SAME NIC path
+// as the preceding data write. Used for signals paired with data
+// (ShmemPutMemNbiSignalThread) to ensure PCIe write ordering.
+inline __device__ uint32_t ProxyPostSignalWrite(
+    volatile ProxyRing* ring, uint32_t qp_idx,
+    uint64_t dst_addr, uint32_t rkey,
+    uint64_t value, uint32_t lkey,
+    uint64_t ibuf_addr) {
+  uint32_t seq = ProxyReserveSlot(ring);
+  uint32_t slot = seq & PROXY_RING_MASK;
+  ProxyWaitSlotFree(ring, slot);
+
+  ring->cmds[slot].op = PROXY_SIGNAL_WRITE;
+  ring->cmds[slot].qp_idx = qp_idx;
+  ring->cmds[slot].src_addr = ibuf_addr;
+  ring->cmds[slot].dst_addr = dst_addr;
+  ring->cmds[slot].length = 8;
+  ring->cmds[slot].lkey = lkey;
+  ring->cmds[slot].rkey = rkey;
+  ring->cmds[slot].atomic_arg = value;
+  ring->cmds[slot].flags = 1;
+
+  __threadfence_system();
+  ring->cmds[slot].status = PROXY_PENDING;
+  return seq;
+}
+
 inline __device__ uint64_t ProxyPostAtomicFetch(
     volatile ProxyRing* ring, uint32_t qp_idx,
     uint64_t dst_addr, uint32_t rkey,

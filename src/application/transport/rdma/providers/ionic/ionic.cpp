@@ -716,6 +716,33 @@ void IonicDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
           IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC);
       fprintf(stderr, "[MoRI-PROXY-QP]   RTR→RTS: %s\n", r ? strerror(r) : "OK"); }
 
+    // Post recv WRs for SEND_WITH_IMM barrier atomic emulation
+    {
+      constexpr int kRecvCount = 512;
+      constexpr size_t kRecvBufSz = kRecvCount * 64;
+      void* rbuf = nullptr;
+      posix_memalign(&rbuf, 4096, kRecvBufSz);
+      assert(rbuf);
+      memset(rbuf, 0, kRecvBufSz);
+      ibv_mr* rmr = ibv_reg_mr(GetIbvPd(), rbuf, kRecvBufSz,
+          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+      assert(rmr);
+      int posted = 0;
+      for (int r = 0; r < kRecvCount; r++) {
+        ibv_sge rsge{};
+        rsge.addr = reinterpret_cast<uintptr_t>(rbuf) + r * 64;
+        rsge.length = 64;
+        rsge.lkey = rmr->lkey;
+        ibv_recv_wr rwr{}, *rbad = nullptr;
+        rwr.wr_id = r;
+        rwr.sg_list = &rsge;
+        rwr.num_sge = 1;
+        ibv_post_recv(plainQp, &rwr, &rbad);
+        posted++;
+      }
+      proxyRecvInfo[local_qpn] = {rbuf, rmr->lkey, static_cast<uint32_t>(kRecvCount)};
+    }
+
     fprintf(stderr, "[MoRI-PROXY-QP] Connected plain QP %u → remote %u\n", local_qpn, remote.qpn);
     return;
   }

@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/env_utils.hpp"
@@ -460,6 +461,13 @@ void Context::BuildAndConnectInitialEndpoints() {
           : rdmaDeviceContext.get();
       ctx->ConnectEndpoint(localToPeerEpHandles[epIndex],
                            peerToLocalEpHandles[epIndex], qp);
+      auto* ionic = dynamic_cast<IonicDeviceContext*>(ctx);
+      if (ionic) {
+        auto ri = ionic->GetProxyRecvInfo(rdmaEps[epIndex].handle.qpn);
+        rdmaEps[epIndex].ibvHandle.recvBuf = ri.buf;
+        rdmaEps[epIndex].ibvHandle.recvLkey = ri.lkey;
+        rdmaEps[epIndex].ibvHandle.recvCount = ri.count;
+      }
     }
   }
 }

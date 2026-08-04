@@ -11,8 +11,9 @@ enum ProxyCmdOp : uint32_t {
   PROXY_NOP = 0,
   PROXY_RDMA_WRITE = 1,
   PROXY_RDMA_WRITE_INLINE = 2,
-  PROXY_ATOMIC_FETCH_ADD = 3,
+  PROXY_ATOMIC_FETCH_ADD = 3,   // standalone atomic (barrier) → SEND_WITH_IMM
   PROXY_ATOMIC_CMP_SWAP = 4,
+  PROXY_SIGNAL_WRITE = 5,      // signal paired with data → RDMA_WRITE (same PCIe path)
 };
 
 enum ProxyCmdStatus : uint32_t {
