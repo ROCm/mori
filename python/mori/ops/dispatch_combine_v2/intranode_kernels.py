@@ -93,7 +93,8 @@ LANE_MASK = WAVE - 1
 LOG2_WAVE = WAVE.bit_length() - 1
 _BALLOT_INT = T.i64 if WAVE == 64 else T.i32
 _LANE_STRIDE_I32 = WAVE * 4  # one wave of lanes, vec4 (16B) each
-_MAIN_STRIDE_I32 = 4 * _LANE_STRIDE_I32
+_DISP_NSTREAMS = 4 if WAVE == 32 else 2
+_MAIN_STRIDE_I32 = _DISP_NSTREAMS * _LANE_STRIDE_I32
 _BUTTERFLY_OFFSETS = tuple(WAVE >> i for i in range(1, LOG2_WAVE + 1))
 
 # ── dispatch ──────────────────────────────────────────────────────────────
@@ -323,11 +324,6 @@ def make_dispatch(
                                     dst_tok[s] * scale_num_i32 + k_off,
                                 )
 
-                # Token-embedding scatter: each lane owns 4 i32 (16B). Four vec4
-                # streams (chunk + k*_LANE_STRIDE_I32 for k in 0..3, stride
-                # _MAIN_STRIDE_I32) for memory-level parallelism; a one-stream tail
-                # covers the remainder. The local load happens ONCE per tile and
-                # fans out to every dest PE that published a slot (load-once).
                 local_tok_addr = fx.Int64(addr_inp_tok) + fx.Int64(src_tok) * fx.Int64(
                     nbytes
                 )
@@ -336,26 +332,16 @@ def make_dispatch(
                 safe_end_i32 = (n_i32 // _MAIN_STRIDE_I32) * _MAIN_STRIDE_I32
                 if const_expr(n_i32 >= _MAIN_STRIDE_I32 and safe_end_i32 > 0):
                     for chunk in range(lane_i32_off, safe_end_i32, _MAIN_STRIDE_I32):
-                        vec_a = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
-                        vec_b = buffer_load(
-                            rsrc_src, chunk + _LANE_STRIDE_I32, vec_width=4, dtype=T.i32()
-                        )
-                        vec_c = buffer_load(
-                            rsrc_src, chunk + 2 * _LANE_STRIDE_I32, vec_width=4, dtype=T.i32()
-                        )
-                        vec_d = buffer_load(
-                            rsrc_src, chunk + 3 * _LANE_STRIDE_I32, vec_width=4, dtype=T.i32()
-                        )
+                        vecs = [
+                            buffer_load(rsrc_src, chunk + k * _LANE_STRIDE_I32,
+                                        vec_width=4, dtype=T.i32())
+                            for k in range(_DISP_NSTREAMS)
+                        ]
                         for s in range_constexpr(experts_per_token):
                             if dst_pub[s]:
-                                buffer_store(vec_a, dst_rsrc[s], chunk)
-                                buffer_store(vec_b, dst_rsrc[s], chunk + _LANE_STRIDE_I32)
-                                buffer_store(
-                                    vec_c, dst_rsrc[s], chunk + 2 * _LANE_STRIDE_I32
-                                )
-                                buffer_store(
-                                    vec_d, dst_rsrc[s], chunk + 3 * _LANE_STRIDE_I32
-                                )
+                                for k in range(_DISP_NSTREAMS):
+                                    buffer_store(vecs[k], dst_rsrc[s],
+                                                 chunk + k * _LANE_STRIDE_I32)
                 if const_expr(safe_end_i32 < n_i32):
                     for chunk in range(
                         lane_i32_off + safe_end_i32, n_i32, _LANE_STRIDE_I32
@@ -484,13 +470,6 @@ def make_dispatch(
                                 dest_tok_id * scale_num_i32 + k_off,
                             )
 
-                # Token-embedding scatter: each lane owns 4 i32 (16B). Four vec4
-                # streams (chunk + k*_LANE_STRIDE_I32 for k in 0..3, stride
-                # _MAIN_STRIDE_I32) for memory-level parallelism, matching the
-                # load-once path's 4-way load width so the two variants differ ONLY
-                # in load-once/store-many vs per-work-item reload. A one-stream tail
-                # covers the remainder. Dropped slots (dup/overflow) set copy_end ==
-                # lane_i32_off → no-op.
                 peer_tok_base = fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
                 remote_tok_addr = peer_tok_base + fx.Int64(dest_tok_id) * fx.Int64(nbytes)
                 local_tok_addr = fx.Int64(addr_inp_tok) + fx.Int64(src_tok) * fx.Int64(
@@ -505,20 +484,14 @@ def make_dispatch(
                         is_dup_or_overflow, lane_i32_off, safe_end_i32
                     )
                     for chunk in range(lane_i32_off, copy_end_main, _MAIN_STRIDE_I32):
-                        vec_a = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
-                        vec_b = buffer_load(
-                            rsrc_src, chunk + _LANE_STRIDE_I32, vec_width=4, dtype=T.i32()
-                        )
-                        vec_c = buffer_load(
-                            rsrc_src, chunk + 2 * _LANE_STRIDE_I32, vec_width=4, dtype=T.i32()
-                        )
-                        vec_d = buffer_load(
-                            rsrc_src, chunk + 3 * _LANE_STRIDE_I32, vec_width=4, dtype=T.i32()
-                        )
-                        buffer_store(vec_a, rsrc_dst, chunk)
-                        buffer_store(vec_b, rsrc_dst, chunk + _LANE_STRIDE_I32)
-                        buffer_store(vec_c, rsrc_dst, chunk + 2 * _LANE_STRIDE_I32)
-                        buffer_store(vec_d, rsrc_dst, chunk + 3 * _LANE_STRIDE_I32)
+                        vecs = [
+                            buffer_load(rsrc_src, chunk + k * _LANE_STRIDE_I32,
+                                        vec_width=4, dtype=T.i32())
+                            for k in range(_DISP_NSTREAMS)
+                        ]
+                        for k in range(_DISP_NSTREAMS):
+                            buffer_store(vecs[k], rsrc_dst,
+                                         chunk + k * _LANE_STRIDE_I32)
                 if const_expr(safe_end_i32 < n_i32):
                     copy_end_tail = arith.select(is_dup_or_overflow, lane_i32_off, n_i32)
                     for chunk in range(
