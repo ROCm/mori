@@ -125,10 +125,7 @@ void ProxyThread::MainLoop() {
         sge.length = cmd->length;
         sge.lkey = (qph.lkey_override != 0) ? qph.lkey_override : cmd->lkey;
 
-        if (ops_posted_ < 3 || (ops_posted_ % 100 == 0)) {
-          fprintf(stderr, "[MoRI-PROXY] post #%lu: qp_idx=%u op=%u len=%u head=%u next=%u\n",
-                  ops_posted_, qi, cmd->op, cmd->length, head, next_slot_);
-        }
+        (void)head; // suppress unused warning
 
         ibv_send_wr wr{};
         wr.wr_id = next_slot_;
@@ -213,26 +210,6 @@ void ProxyThread::MainLoop() {
       }
     }
 
-    if (!did_work && ops_posted_ > 0 && ops_completed_ < ops_posted_) {
-      static thread_local uint64_t idle = 0;
-      static thread_local int dump_count = 0;
-      if (++idle == 50000000 && dump_count < 3) {
-        fprintf(stderr, "[MoRI-PROXY] STALL: posted=%lu completed=%lu head=%u next=%u gpu=%d\n",
-                ops_posted_, ops_completed_, ring_->gpu_head, next_slot_, gpu_id_);
-        int pending = 0;
-        for (uint32_t s = 0; s < PROXY_RING_SIZE && pending < 5; s++) {
-          uint32_t st = ring_->cmds[s].status;
-          if (st != PROXY_FREE && st != PROXY_COMPLETED) {
-            fprintf(stderr, "[MoRI-PROXY] PENDING slot=%u status=%u op=%u qp_idx=%u len=%u\n",
-                    s, st, ring_->cmds[s].op, ring_->cmds[s].qp_idx, ring_->cmds[s].length);
-            pending++;
-          }
-        }
-        if (pending == 0) fprintf(stderr, "[MoRI-PROXY] No pending slots — GPU waiting for data\n");
-        dump_count++;
-        idle = 0;
-      }
-    }
   }
 }
 
