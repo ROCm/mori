@@ -314,9 +314,20 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
   // single recommended engine all channels share it.
   std::vector<uint32_t> engines;
   if (srcDeviceId == dstDeviceId) {
-    // A loopback copy never traverses xGMI and has no self io_link, so KFD
-    // reports no recommended engine. Use a general (non-xGMI) SDMA engine.
-    engines.push_back(0);
+    // Loopback has no self io_link, so KFD recommends no engine. On gfx1250 each
+    // engine holds only 6 queues and ROCr's blit queues already sit on the low
+    // ones, so pinning every loopback channel to engine 0 hits NO_MEMORY at the
+    // sixth channel; spread over the CPU-link engines (all 16 there) instead.
+    // Other archs are not engine-0-bound for loopback (gfx950: 8 queues/engine,
+    // only engines 0-1 general) and regress if a channel lands on a busy engine,
+    // so keep them pinned to engine 0.
+    if (isGfx1250(srcDeviceId)) {
+      uint32_t mask = getHostLinkEngineMask(srcDeviceId);
+      for (uint32_t b = 0; b < 32; ++b) {
+        if (mask & (1u << b)) engines.push_back(b);
+      }
+    }
+    if (engines.empty()) engines.push_back(0);
   } else {
     uint32_t mask = getRecommendedEngineMask(srcDeviceId, dstDeviceId);
     for (uint32_t b = 0; b < 32; ++b) {
@@ -365,6 +376,36 @@ uint32_t AnvilLib::getRecommendedEngineMask(int srcDeviceId, int dstDeviceId) {
     }
   }
   return 0;
+}
+
+// Engines KFD recommends for this GPU's link to a CPU node, i.e. the general
+// (non-xGMI) ones. Zero if the node reports no such link.
+uint32_t AnvilLib::getHostLinkEngineMask(int srcDeviceId) {
+  const uint32_t srcNode = getNodeId(srcDeviceId);
+  HsaNodeProperties props{};
+  if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0) {
+    return 0;
+  }
+  std::vector<HsaIoLinkProperties> links(props.NumIOLinks);
+  if (hsaKmtGetNodeIoLinkProperties(srcNode, props.NumIOLinks, links.data()) !=
+      HSAKMT_STATUS_SUCCESS) {
+    return 0;
+  }
+  for (const auto& link : links) {
+    HsaNodeProperties to{};
+    if (hsaKmtGetNodeProperties(link.NodeTo, &to) != HSAKMT_STATUS_SUCCESS) continue;
+    if (to.NumFComputeCores != 0) continue;  // GPU node, not the host
+    if (link.RecSdmaEngIdMask) return link.RecSdmaEngIdMask;
+  }
+  return 0;
+}
+
+// gfx12.5+ (gfx1250): the only arch whose loopback channels are spread over
+// engines. See connect() for why.
+bool AnvilLib::isGfx1250(int deviceId) {
+  HsaNodeProperties props{};
+  if (hsaKmtGetNodeProperties(getNodeId(deviceId), &props) != HSAKMT_STATUS_SUCCESS) return false;
+  return props.EngineId.ui32.Major == 12 && props.EngineId.ui32.Minor == 5;
 }
 
 SdmaQueue* AnvilLib::getSdmaQueue(int srcDeviceId, int dstDeviceId, int channel_idx) {
