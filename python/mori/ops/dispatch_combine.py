@@ -227,54 +227,38 @@ def _comb_env_int(name: str, default: int) -> int:
     return default
 
 
+_cpsize_reported = False
+
+
 def _comb_cptime() -> bool:
-    """Time the ZC=0 staging copy directly instead of inferring it by subtraction.
+    """Report the SIZE of the ZC=0 staging copy. Not its duration -- see below.
 
-    233.9us (ZC=0 host) minus 167.6 (ZC=1) puts the copy at 66.3us, and the subtraction is sound
-    because the kernel either side of it is byte-identical. What it does NOT give is the byte
-    count: the copy moves input.size(0) rows, which is num_recv_tokens after routing, and every
-    bandwidth figure quoted for this copy has been derived from an ASSUMED row count. This prints
-    the row count with the time so the two stop being independent guesses.
+    233.9us (ZC=0 host) minus 167.6 (ZC=1) puts the copy at 66.3us, and the subtraction is sound:
+    the copy is inside the combine graph, the ZC=1 graph does not contain it, and the kernel
+    either side is byte-identical. What subtraction does NOT give is the byte count. The copy
+    moves input.size(0) rows, i.e. num_recv_tokens after routing, and every bandwidth figure
+    quoted for it so far rests on an ASSUMED row count -- 8192 rows would be 117 MiB where
+    HANDOFF §18.2 assumed 212 MB, a factor of two.
 
-    Costs a synchronize per call, so it is diagnostic only -- the surrounding combine timing is
-    not usable while it is on.
+    Timing it here with cuda events is not possible: the bench captures combine into a cuda graph
+    (bench_dispatch_combine.py:180), and synchronize during capture raises
+    hipErrorStreamCaptureUnsupported. Hence size only, which is a plain host-side print and legal
+    during capture. Fires once -- capture happens once, and the shape never changes.
     """
     return os.environ.get("MORI_COMB_CPTIME", "").strip() in ("1", "true", "on", "yes")
 
 
-class _CopyTimer:
-    """Brackets one d2d staging copy with cuda events. Prints only the first few calls: the copy
-    is the same size every iteration, and the first is the only one that is cold."""
-
-    _seen = 0
-    _LIMIT = 6
-
-    def __init__(self, src):
-        self.src = src
-        self.on = _CopyTimer._seen < _CopyTimer._LIMIT
-        if self.on:
-            self.t0 = torch.cuda.Event(enable_timing=True)
-            self.t1 = torch.cuda.Event(enable_timing=True)
-            self.t0.record()
-
-    def report(self):
-        if not self.on:
-            return
-        self.t1.record()
-        torch.cuda.synchronize()
-        ms = self.t0.elapsed_time(self.t1)
-        nbytes = self.src.numel() * self.src.element_size()
-        us = ms * 1e3
-        # Two figures because both get quoted and they differ by 2x: "moved" is the payload, and
-        # "traffic" is what the HBM actually sees, a read plus a write of the same bytes.
-        moved = nbytes / us * 1e-3 if us > 0 else 0.0
-        print(
-            f"[CPTIME] call={_CopyTimer._seen} rows={self.src.size(0)} "
-            f"bytes={nbytes} ({nbytes / 2**20:.1f} MiB) us={us:.1f} "
-            f"moved={moved:.0f} GB/s traffic={2 * moved:.0f} GB/s",
-            flush=True,
-        )
-        _CopyTimer._seen += 1
+def _report_copy_size(src):
+    global _cpsize_reported
+    if _cpsize_reported:
+        return
+    _cpsize_reported = True
+    nbytes = src.numel() * src.element_size()
+    print(
+        f"[CPTIME] rows={src.size(0)} cols={src.size(1)} dtype={src.dtype} "
+        f"bytes={nbytes} ({nbytes / 2**20:.2f} MiB)",
+        flush=True,
+    )
 
 
 def _comb_qpre_mode() -> str:
@@ -1572,11 +1556,8 @@ class EpDispatchCombineOp:
             if _pm in ("host", "both"):
                 reg = self.get_registered_combine_input_buffer(input.dtype, hidden_dim)
                 if _comb_cptime():
-                    _cp_t = _CopyTimer(input)
-                    reg[: input.size(0)].copy_(input)
-                    _cp_t.report()
-                else:
-                    reg[: input.size(0)].copy_(input)
+                    _report_copy_size(input)
+                reg[: input.size(0)].copy_(input)
                 force_pull = True
                 if _pm == "host":
                     # From here on this call is indistinguishable from a zero-copy one, which is

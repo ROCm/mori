@@ -58,7 +58,7 @@ docker exec -e SPECS -e BASE -e ZC -e QT -e CBN -e CBNS -e CWPB -e DBN -e DWPB -
   # one stage later. The filter is what keeps the output small; TAIL is now only a compatibility
   # no-op for callers that still set it.
   ./tools/ep_test.sh 2>&1 | tee /tmp/aa1_full.log \
-    | grep --line-buffered -E "^  |^## |^ABORT|^EP_TEST_DONE|^\[CSPLIT\] rank=0"
+    | grep --line-buffered -E "^  |^## |^ABORT|^EP_TEST_DONE|^\[CSPLIT\] rank=0|^\[CPTIME\]"
   echo "  (full output: /tmp/aa1_full.log in $C)"
 '
 echo "AA1_DONE"

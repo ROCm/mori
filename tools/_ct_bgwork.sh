@@ -14,18 +14,26 @@ set -uo pipefail
 # Every run in this session used BASE=off, which HANDOFF §18.2 records as the SLOWEST of the three
 # (318.8us) -- so the 314.7 -> 287.9 win is real but sits on the wrong line. Re-measure all of them
 # on this HEAD rather than quoting that table.
-#   host!    ZC=0 default: one d2d on the caller stream, then the zero-copy PULL path (was 236.7)
-#   push!    ZC=0 PUSH with FOLDB, i.e. what this session built            (was 287.9)
-# MEASURED on 1e3729d: host 233.9 / push 288.2, so PUSH is 54.3us behind PULL in its OWN scenario.
+# Price the ZC=0 staging copy. Both legs on ONE head, because the 233.9 / 167.6 pair quoted so far
+# was taken on 1e3729d, before FOLDB, and FOLDB touches the fold loop that BOTH transports run.
 #
-# Now the ZC=1 leg, which is where the 169.0/1255.9 reference lives. ZC is per-run, not per-spec,
-# hence a separate sweep. Worth pinning down because dispatch in the ZC=0 run above reads
-# 173.6us/1223.6 GB/s, close enough to "170us, 1220GB" that the target could be either number, and
-# they imply completely different work.
+# ZC is per-run, not per-spec, so this is two sweeps rather than two specs. They run back to back,
+# which the one-job-at-a-time rule allows only because both configurations are ones we have already
+# run repeatedly -- do NOT extend this pattern to an untried gate combination.
+#
+# Cannot time the copy in-band: the bench captures combine into a cuda graph, and synchronize
+# during capture raises hipErrorStreamCaptureUnsupported. Subtraction gives the duration (the copy
+# is in the ZC=0 graph and absent from the ZC=1 one); MORI_COMB_CPTIME prints the byte count, which
+# is the half that was being assumed. Size print is once, so both combine numbers stay usable.
 export REV=debug-aa
 export BASE=""
-export ZC=1
 export CBN=64 CWPB=8
-export SPECS="zc1!="
 
+export ZC=0
+export SPECS="zc0host=MORI_COMB_CPTIME=1"
+bash /tmp/_ct_aa1.sh
+
+echo "=== second leg: ZC=1, same head, no staging copy ==="
+export ZC=1
+export SPECS="zc1="
 exec bash /tmp/_ct_aa1.sh
