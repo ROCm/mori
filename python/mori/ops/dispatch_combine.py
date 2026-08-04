@@ -450,7 +450,13 @@ class EpDispatchCombineOp:
             from mori.ops.tuning_config import TuningConfigManager
 
             params = TuningConfigManager.lookup(
-                tuning_rules, dtype, num_tokens, hidden_dim, zero_copy, quant_type
+                tuning_rules,
+                dtype,
+                num_tokens,
+                hidden_dim,
+                zero_copy,
+                quant_type,
+                topk=self.config.num_experts_per_token,
             )
             if params is not None:
                 return params.block_num, params.rdma_block_num, params.warp_per_block
@@ -515,6 +521,7 @@ class EpDispatchCombineOp:
                 self.config.hidden_dim,
                 zero_copy=zc,
                 quant_type=qt,
+                topk=self.config.num_experts_per_token,
             )
             if params is not None:
                 return params.block_num, params.rdma_block_num, params.warp_per_block
