@@ -101,6 +101,36 @@ int DetectNumaNode(void* addr) {
 #endif
 }
 
+// Classify a pointer as host or device so callers that do not track where a
+// buffer came from can pass MemoryLocationType::Unknown and get it right.
+// Registering device memory as CPU "works" on hardware whose HBM is host
+// readable over large-BAR, but it is a lie the rest of the stack acts on: NIC
+// selection, deviceBusId and the NUMA probe below all key off `loc`.
+//
+// `*device` is filled in only when it was left unset (< 0) and the pointer
+// turns out to be device memory, so an explicit caller-supplied ordinal always
+// wins.
+//
+// Managed and unified allocations are deliberately reported as host: they are
+// migratable, so the device ordinal attached to one now is not a durable fact,
+// and the host mapping is the one that is always valid.
+MemoryLocationType DetectMemoryLocation(void* data, int* device) {
+  hipPointerAttribute_t attr{};
+  const hipError_t err = hipPointerGetAttributes(&attr, data);
+  // A host pointer is not an error worth reporting, but it DOES leave the
+  // sticky per-thread error set, which would surface at whatever unrelated
+  // hipGetLastError() runs next.  Clear it here, as the other probe sites in
+  // this repo do.
+  (void)hipGetLastError();
+  if (err != hipSuccess) return MemoryLocationType::CPU;
+
+  if (attr.type == hipMemoryTypeDevice) {
+    if (device != nullptr && *device < 0) *device = attr.device;
+    return MemoryLocationType::GPU;
+  }
+  return MemoryLocationType::CPU;
+}
+
 }  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -359,6 +389,14 @@ void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
 }
 
 MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc) {
+  // Unknown means "you work it out": callers that hold an opaque pointer (the
+  // UMBP pool client, say) can hand it over instead of guessing CPU.  An
+  // explicit CPU/GPU is always taken at face value, so this cannot change the
+  // behaviour of a caller that already knows.
+  if (loc == MemoryLocationType::Unknown && data != nullptr) {
+    loc = DetectMemoryLocation(data, &device);
+  }
+
   MemoryDesc memDesc;
   memDesc.engineKey = desc.key;
   memDesc.id = nextMemUid.fetch_add(1, std::memory_order_relaxed);
