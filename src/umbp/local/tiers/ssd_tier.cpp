@@ -61,8 +61,48 @@ SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& s
   fs::create_directories(dir_);
   std::lock_guard<std::mutex> lock(mu_);
   RefreshFromDiskLocked(true);
+  DropUnparsedTailsLocked();
   if (!IsReadOnlyShared() && index_.Segments().empty()) {
     OpenOrCreateSegmentLocked(0);
+  }
+}
+
+void SSDTier::DropUnparsedTailsLocked() {
+  // A follower must never rewrite the shared log; the owner does this once at
+  // startup, before any write can land.
+  if (IsReadOnlyShared()) return;
+
+  for (auto& kv : index_.MutableSegments()) {
+    auto& seg = kv.second;
+    if (seg.fd < 0) continue;
+
+    struct stat st;
+    if (fstat(seg.fd, &st) != 0) continue;
+    const uint64_t file_size = static_cast<uint64_t>(st.st_size);
+    if (seg.scanned_offset >= file_size) continue;  // fully parsed, nothing to do
+
+    // Bytes past the last parsed record boundary are permanently unreachable:
+    // the scanner stops at the first header it cannot read and every later
+    // restart stops at the same place.  Two ways to get here --
+    //   * records written by an older kRecordVersion (e.g. the CRC-32/ISO-HDLC
+    //     v1 format that preceded CRC-32C), and
+    //   * a torn tail record from a crash mid-write.
+    // Either way, appending after them silently loses the new records on the
+    // next restart, so truncate instead.  Safe by construction: the SSD tier is
+    // a cache whose contents are re-fetchable.
+    const uint64_t dropped = file_size - seg.scanned_offset;
+    MORI_UMBP_WARN(
+        "[SSDTier] {}: dropping {}B of unreadable tail (stale record version or torn write); "
+        "segment truncated to the last valid record at offset {}",
+        seg.path, dropped, seg.scanned_offset);
+    if (ftruncate(seg.fd, static_cast<off_t>(seg.scanned_offset)) != 0) {
+      MORI_UMBP_ERROR("[SSDTier] {}: ftruncate to {} failed; segment left as-is", seg.path,
+                      seg.scanned_offset);
+      continue;
+    }
+    // Reset the append cursor too, otherwise the next write leaves a hole that
+    // the scanner would stop at all over again.
+    seg.write_offset = seg.scanned_offset;
   }
 }
 

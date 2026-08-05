@@ -20,11 +20,15 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <vector>
 
 #include "umbp/local/tiers/local_storage_manager.h"
+#include "umbp/local/tiers/segment/segment_format.h"
 
 using namespace mori::umbp;
 
@@ -285,6 +289,59 @@ void test_ssd_batch_read_io_uring() {
   std::cout << "PASSED" << std::endl;
 }
 
+// A segment whose head cannot be parsed -- a record from an older
+// kRecordVersion (the CRC-32/ISO-HDLC v1 format that preceded CRC-32C), or a
+// torn tail from a crash -- must not poison the file.  Before
+// DropUnparsedTailsLocked, the scanner stopped at the bad header on every
+// restart while writes kept appending past it, so newly written keys were lost
+// on the next open and the tier silently degraded to a 0% hit rate.
+void test_segment_with_unreadable_head_is_reclaimed() {
+  std::cout << "test_segment_with_unreadable_head_is_reclaimed... ";
+  const std::string dir = "/tmp/umbp_test_stale_version";
+  std::filesystem::remove_all(dir);
+
+  UMBPConfig cfg;
+  cfg.dram.capacity_bytes = 1024 * 1024;
+  cfg.ssd.enabled = true;
+  cfg.ssd.storage_dir = dir;
+  cfg.ssd.capacity_bytes = 64 * 1024 * 1024;
+
+  std::vector<char> payload(4096, 'V');
+  {
+    LocalStorageManager mgr(cfg);
+    assert(mgr.Write("pre_upgrade", payload.data(), payload.size(), StorageTier::LOCAL_SSD));
+  }
+
+  // Rewrite the first record's version field to an unsupported value, which is
+  // exactly what a pre-upgrade segment looks like to the current scanner.
+  const std::string seg_path = dir + "/" + segment::BuildFileName(0);
+  {
+    std::fstream f(seg_path, std::ios::in | std::ios::out | std::ios::binary);
+    assert(f.is_open());
+    const uint16_t bogus_version = segment::kRecordVersion - 1;
+    f.seekp(offsetof(segment::RecordHeader, version));
+    f.write(reinterpret_cast<const char*>(&bogus_version), sizeof(bogus_version));
+  }
+
+  // Reopen and write a new key: the stale head must be dropped, not appended to.
+  {
+    LocalStorageManager mgr(cfg);
+    assert(mgr.Write("post_upgrade", payload.data(), payload.size(), StorageTier::LOCAL_SSD));
+  }
+
+  // Restart once more: the new key must survive, and the stale one must be gone.
+  {
+    LocalStorageManager mgr(cfg);
+    std::vector<char> buf(payload.size(), 0);
+    assert(mgr.ReadIntoPtr("post_upgrade", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
+    assert(buf == payload);
+    assert(!mgr.ReadIntoPtr("pre_upgrade", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
+    mgr.Clear();
+  }
+  std::filesystem::remove_all(dir);
+  std::cout << "PASSED" << std::endl;
+}
+
 int main() {
   std::cout << "=== Segmented SSD Tier Tests ===" << std::endl;
   test_segmented_recovery();
@@ -294,6 +351,7 @@ int main() {
   test_ssd_batch_read();
   test_ssd_batch_read_partial();
   test_ssd_batch_read_io_uring();
+  test_segment_with_unreadable_head_is_reclaimed();
   std::cout << "All Segmented SSD Tier tests passed!" << std::endl;
   return 0;
 }
