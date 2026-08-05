@@ -86,7 +86,9 @@ def _dedup_key(rec):
 
 def load_records(input_dir):
     records, seen = [], set()
-    for path in sorted(glob.glob(os.path.join(input_dir, "**", "*.jsonl"), recursive=True)):
+    for path in sorted(
+        glob.glob(os.path.join(input_dir, "**", "*.jsonl"), recursive=True)
+    ):
         try:
             with open(path, encoding="utf-8") as fh:
                 for line in fh:
@@ -142,7 +144,9 @@ def _ascii_table(title, headers, rows):
         return "+" + "+".join("-" * (w + 2) for w in widths) + "+"
 
     def line(vals):
-        return "|" + "|".join(" " + v.center(w) + " " for v, w in zip(vals, widths)) + "|"
+        return (
+            "|" + "|".join(" " + v.center(w) + " " for v, w in zip(vals, widths)) + "|"
+        )
 
     inner = sum(w + 2 for w in widths) + (cols - 1)
     out = [sep()]
@@ -171,9 +175,7 @@ def _html_table(headers, groups):
         for i, row in enumerate(rows):
             out.append("  <tr>")
             if i == 0:
-                out.append(
-                    f'    <td rowspan="{len(rows)}">{_esc(group_label)}</td>'
-                )
+                out.append(f'    <td rowspan="{len(rows)}">{_esc(group_label)}</td>')
             out += [f"    <td>{_esc(c)}</td>" for c in row]
             out.append("  </tr>")
     out.append("</table>")
@@ -292,16 +294,24 @@ def _ep_sections(records):
     lines.append(f"**Bandwidth** ({cfg})")
     lines.append("")
     bw_headers = [
-        "Hardware", "Kernels", "Tokens",
-        "Dispatch XGMI", "Dispatch RDMA", "Combine XGMI", "Combine RDMA",
+        "Hardware",
+        "Kernels",
+        "Tokens",
+        "Dispatch XGMI",
+        "Dispatch RDMA",
+        "Combine XGMI",
+        "Combine RDMA",
     ]
     bw_groups = []
     for plat, rows in _group_by_platform(ep_rows):
         grows = [
             [
-                r["kernel"], r["tokens"],
-                _bw(r["disp_xgmi"]), _bw(r["disp_rdma"]),
-                _bw(r["comb_xgmi"]), _bw(r["comb_rdma"]),
+                r["kernel"],
+                r["tokens"],
+                _bw(r["disp_xgmi"]),
+                _bw(r["disp_rdma"]),
+                _bw(r["comb_xgmi"]),
+                _bw(r["comb_rdma"]),
             ]
             for r in rows
         ]
@@ -313,16 +323,24 @@ def _ep_sections(records):
     lines.append(f"**Latency** ({cfg})")
     lines.append("")
     lat_headers = [
-        "Hardware", "Kernels", "Tokens",
-        "Dispatch Latency", "Dispatch BW", "Combine Latency", "Combine BW",
+        "Hardware",
+        "Kernels",
+        "Tokens",
+        "Dispatch Latency",
+        "Dispatch BW",
+        "Combine Latency",
+        "Combine BW",
     ]
     lat_groups = []
     for plat, rows in _group_by_platform(ep_rows):
         grows = [
             [
-                r["kernel"], r["tokens"],
-                _lat(r["disp_lat"]), _bw(r["disp_bw"]),
-                _lat(r["comb_lat"]), _bw(r["comb_bw"]),
+                r["kernel"],
+                r["tokens"],
+                _lat(r["disp_lat"]),
+                _bw(r["disp_bw"]),
+                _lat(r["comb_lat"]),
+                _bw(r["comb_bw"]),
             ]
             for r in rows
         ]
@@ -333,8 +351,13 @@ def _ep_sections(records):
 
 
 _IO_HEADERS = [
-    "MsgSize (B)", "BatchSize", "TotalSize (MB)",
-    "Max BW (GB/s)", "Avg Bw (GB/s)", "Min Lat (us)", "Avg Lat (us)",
+    "MsgSize (B)",
+    "BatchSize",
+    "TotalSize (MB)",
+    "Max BW (GB/s)",
+    "Avg Bw (GB/s)",
+    "Min Lat (us)",
+    "Avg Lat (us)",
 ]
 
 
@@ -373,10 +396,12 @@ def _io_section(records):
     for r in rows:
         groups.setdefault((r["platform"], r["backend"], r["op"]), []).append(r)
 
-    for (plat, backend, op) in sorted(groups):
+    for plat, backend, op in sorted(groups):
         grp = sorted(groups[(plat, backend, op)], key=lambda r: r["msg"] or 0)
         batches = sorted({r["batch"] for r in grp if r["batch"] is not None})
-        batch_txt = f"{batches[0]} consecutive transfers" if len(batches) == 1 else "batched"
+        batch_txt = (
+            f"{batches[0]} consecutive transfers" if len(batches) == 1 else "batched"
+        )
         lines.append(
             f"GPU Direct {str(backend).upper()} {str(op).upper()}, "
             f"pairwise, {batch_txt}, {plat}:"
@@ -385,8 +410,16 @@ def _io_section(records):
         lines.append("```")
         trows = [
             [
-                _num(r["msg"], "{:d}") if isinstance(r["msg"], int) else _num(r["msg"], "{:.0f}"),
-                _num(r["batch"], "{:d}") if isinstance(r["batch"], int) else _num(r["batch"], "{:.0f}"),
+                (
+                    _num(r["msg"], "{:d}")
+                    if isinstance(r["msg"], int)
+                    else _num(r["msg"], "{:.0f}")
+                ),
+                (
+                    _num(r["batch"], "{:d}")
+                    if isinstance(r["batch"], int)
+                    else _num(r["batch"], "{:.0f}")
+                ),
                 _num(r["total_mb"]),
                 _num(r["max_bw"]),
                 _num(r["avg_bw"]),
@@ -406,10 +439,7 @@ def build_markdown(records):
     total = len(records)
     platforms = sorted({r.get("platform", "") for r in records if r.get("platform")})
     runs = sorted(
-        {
-            (r.get("date") or "") + " " + (r.get("commit") or "")[:8]
-            for r in records
-        }
+        {(r.get("date") or "") + " " + (r.get("commit") or "")[:8] for r in records}
     )
 
     parts = ["# MORI Nightly Performance Report", ""]
