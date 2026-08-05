@@ -157,14 +157,18 @@ bool SSDTier::Write(const std::string& key, const void* data, size_t size) {
 
   const size_t record_size = sizeof(segment::RecordHeader) + key.size() + size;
   segment::PreparedRecord pr;
+
+  // Phase 1a (no lock): checksum + assemble, same rationale as WriteBatch.
+  writer_->Build(key, data, size, &pr);
+
   int write_fd = -1;
   {
-    // Phase 1: reserve index space and build record buffer under mu_
+    // Phase 1b: reserve index space under mu_
     std::lock_guard<std::mutex> lock(mu_);
     if (!EnsureActiveSegment(record_size)) return false;
     auto* seg = GetSegmentLocked(index_.active_segment_id());
     if (!seg) return false;
-    if (!writer_->Prepare(key, data, size, seg, index_, &pr)) return false;
+    if (!writer_->Reserve(key, size, seg, index_, &pr)) return false;
     write_fd = seg->fd;
   }
 
@@ -205,10 +209,19 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
     return all_ok;
   }
 
+  // Phase 1a (NO lock): checksum + assemble every record.  This is the expensive
+  // half of the old Prepare() and it touches no shared state, so keeping it out
+  // of mu_ stops a write batch from blocking concurrent reads on this drive for
+  // the whole of its CRC + copy time.
+  std::vector<segment::PreparedRecord> built(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    writer_->Build(keys[i], data_ptrs[i], sizes[i], &built[i]);
+  }
+
   std::vector<segment::PreparedRecord> prepared;
   int write_fd = -1;
   {
-    // Phase 1: reserve index space and build record buffers under mu_
+    // Phase 1b: reserve index/segment space under mu_ (cheap: no CRC, no copy).
     std::lock_guard<std::mutex> lock(mu_);
     if (!EnsureActiveSegment(total_bytes)) return false;
     auto* seg = GetSegmentLocked(index_.active_segment_id());
@@ -217,9 +230,8 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
 
     prepared.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-      segment::PreparedRecord pr;
-      if (!writer_->Prepare(keys[i], data_ptrs[i], sizes[i], seg, index_, &pr)) continue;
-      prepared.push_back(std::move(pr));
+      if (!writer_->Reserve(keys[i], sizes[i], seg, index_, &built[i])) continue;
+      prepared.push_back(std::move(built[i]));
     }
   }
 
