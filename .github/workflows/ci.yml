@@ -565,7 +565,7 @@ jobs:
             --rank 1 --master-addr $NODE1_HOST --master-port $PORT
             --ifname $NODE2_IFNAME
             -- --op-type write --transfer-batch-size 128 --all
-            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 128
             --enable-sess --enable-batch-transfer
             --num-qp-per-transfer 2
             --num-initiator-dev 8 --num-target-dev 8
@@ -575,7 +575,7 @@ jobs:
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME \
             -- --op-type write --transfer-batch-size 128 --all \
-            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 \
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 128 \
             --enable-sess --enable-batch-transfer \
             --num-qp-per-transfer 2 \
             --num-initiator-dev 8 --num-target-dev 8
