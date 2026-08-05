@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -58,6 +59,7 @@ class ModuleLogger {
  public:
   // Initialize a module-specific logger
   void InitModule(const std::string& moduleName, Level level = Level::ERROR) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     // Check if logger already exists
     auto existing_logger = spdlog::get(moduleName);
     std::shared_ptr<spdlog::logger> logger;
@@ -108,6 +110,7 @@ class ModuleLogger {
 
   // Get logger for a specific module
   std::shared_ptr<spdlog::logger> GetLogger(const std::string& moduleName) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     auto it = loggers_.find(moduleName);
     if (it != loggers_.end()) {
       return it->second;
@@ -119,23 +122,28 @@ class ModuleLogger {
 
   // Set log level for a specific module
   void SetModuleLevel(const std::string& moduleName, Level level) {
-    // Check if this module is protected by environment variable
-    if (HasEnvOverride(moduleName)) {
-      // Log a warning but don't change the level
-      auto logger = GetLogger("application");  // Use application logger for warnings
-      logger->warn(
-          "Attempted to change log level for module '{}' which is controlled by environment "
-          "variable. Use ForceSetModuleLevel() to override.",
-          moduleName);
-      return;
+    std::shared_ptr<spdlog::logger> appLogger;
+    {
+      std::lock_guard<std::recursive_mutex> lock(mutex_);
+      // Check if this module is protected by environment variable
+      if (HasEnvOverride(moduleName)) {
+        appLogger = GetLogger("application");  // Use application logger for warnings
+      } else {
+        auto logger = GetLogger(moduleName);
+        logger->set_level(ConvertLevel(level));
+        return;
+      }
     }
-
-    auto logger = GetLogger(moduleName);
-    logger->set_level(ConvertLevel(level));
+    // Warn outside the lock: this is I/O, not map access.
+    appLogger->warn(
+        "Attempted to change log level for module '{}' which is controlled by environment "
+        "variable. Use ForceSetModuleLevel() to override.",
+        moduleName);
   }
 
   // Set log level for all modules (global control)
   void SetGlobalLevel(Level level) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     globalLevel_ = level;
     globalLevelSet_ = true;
 
@@ -150,6 +158,7 @@ class ModuleLogger {
 
   // Set log level with priority check (used internally for env vars)
   void SetModuleLevelInternal(const std::string& moduleName, Level level, bool fromEnv = false) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     auto logger = GetLogger(moduleName);
     logger->set_level(ConvertLevel(level));
     if (fromEnv) {
@@ -159,26 +168,40 @@ class ModuleLogger {
 
   // Check if a module has environment override
   bool HasEnvOverride(const std::string& moduleName) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     return envOverrides_.find(moduleName) != envOverrides_.end();
   }
 
   // Clear environment overrides for a module
-  void ClearEnvOverride(const std::string& moduleName) { envOverrides_.erase(moduleName); }
+  void ClearEnvOverride(const std::string& moduleName) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    envOverrides_.erase(moduleName);
+  }
 
   // Force set log level (ignores env protection)
   void ForceSetModuleLevel(const std::string& moduleName, Level level) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     auto logger = GetLogger(moduleName);
     logger->set_level(ConvertLevel(level));
   }
 
   // Get current global level
-  Level GetGlobalLevel() const { return globalLevel_; }
+  Level GetGlobalLevel() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    return globalLevel_;
+  }
 
   // Check if global level is set
-  bool IsGlobalLevelSet() const { return globalLevelSet_; }
+  bool IsGlobalLevelSet() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    return globalLevelSet_;
+  }
 
   // Clear global level setting (revert to individual module control)
-  void ClearGlobalLevel() { globalLevelSet_ = false; }
+  void ClearGlobalLevel() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    globalLevelSet_ = false;
+  }
 
   // Convert string to level
   Level LevelFromString(const std::string& strLevel) {
@@ -194,9 +217,12 @@ class ModuleLogger {
     return Level::ERROR;
   }
 
-  // Allow access to loggers for advanced configuration
-  std::unordered_map<std::string, std::shared_ptr<spdlog::logger>>& GetLoggers() {
-    return loggers_;
+  // Applies fn to every logger; whole loop runs under the lock so loggers_ can't
+  // rehash mid-iteration.
+  template <typename F>
+  void ForEachLogger(F&& fn) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    for (auto& [name, lg] : loggers_) fn(name, lg);
   }
 
  private:
@@ -204,6 +230,9 @@ class ModuleLogger {
   std::unordered_map<std::string, Level> envOverrides_;  // Track env variable overrides
   Level globalLevel_ = Level::ERROR;
   bool globalLevelSet_ = false;
+  // Guards loggers_, envOverrides_, globalLevel_, globalLevelSet_. Recursive
+  // since methods call each other while holding it (e.g. GetLogger -> InitModule).
+  mutable std::recursive_mutex mutex_;
 
   spdlog::level::level_enum ConvertLevel(Level level) {
     switch (level) {
@@ -409,9 +438,7 @@ inline void InitializeLoggingFromEnv() {
   // Check for log pattern override
   const char* logPattern = std::getenv("MORI_LOG_PATTERN");
   if (logPattern) {
-    for (auto& [name, moduleLogger] : logger.GetLoggers()) {
-      moduleLogger->set_pattern(logPattern);
-    }
+    logger.ForEachLogger([&](auto&, auto& moduleLogger) { moduleLogger->set_pattern(logPattern); });
     MORI_INFO(modules::APPLICATION, "Set custom log pattern from MORI_LOG_PATTERN: {}", logPattern);
   }
 
@@ -421,9 +448,8 @@ inline void InitializeLoggingFromEnv() {
     try {
       // Create file sink and add it to all loggers
       auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFile, true);
-      for (auto& [name, moduleLogger] : logger.GetLoggers()) {
-        moduleLogger->sinks().push_back(file_sink);
-      }
+      logger.ForEachLogger(
+          [&](auto&, auto& moduleLogger) { moduleLogger->sinks().push_back(file_sink); });
       MORI_INFO(modules::APPLICATION, "Added log file output: {}", logFile);
     } catch (const std::exception& e) {
       MORI_ERROR(modules::APPLICATION, "Failed to open log file {}: {}", logFile, e.what());
