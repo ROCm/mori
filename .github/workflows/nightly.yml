@@ -530,27 +530,33 @@ jobs:
             --num-initiator-dev 8 --num-target-dev 8
           wait
 
+      # Correctness/smoke check only: a fixed 4KB single-point read, not a sweep.
+      # The numbers are far below what the write sweep reports, so this step runs
+      # with MORI_PERF_OUT cleared and contributes nothing to the perf report.
+      # Config intentionally matches ci.yml (2 QP, no --batch-contiguous, no
+      # --disable-chunking): merging the batch into one WR starves the
+      # `--poll_cq_mode event` CQ loop and the step hangs until the 600s timeout.
       - name: MORI-IO internode read
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           PORT=29121
           echo "=== MORI-IO internode benchmark: batch-session-read port=$PORT ==="
           NODE2_CMD=(
-            $CT exec $CONTAINER bash $SCRIPT
+            $CT exec -e MORI_PERF_OUT= $CONTAINER bash $SCRIPT
             --rank 1 --master-addr $NODE1_HOST --master-port $PORT
             --ifname $NODE2_IFNAME
             -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8
-            --batch-contiguous --disable-chunking --enable-batch-transfer --enable-sess --poll_cq_mode event
-            --num-qp-per-transfer 8 --num-worker-threads 8
+            --enable-batch-transfer --enable-sess --poll_cq_mode event
+            --num-qp-per-transfer 2 --num-worker-threads 2
             --num-initiator-dev 8 --num-target-dev 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-          $CT exec $CONTAINER bash $SCRIPT \
+          $CT exec -e MORI_PERF_OUT= $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME \
             -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 \
-            --batch-contiguous --disable-chunking --enable-batch-transfer --enable-sess --poll_cq_mode event \
-            --num-qp-per-transfer 8 --num-worker-threads 8 \
+            --enable-batch-transfer --enable-sess --poll_cq_mode event \
+            --num-qp-per-transfer 2 --num-worker-threads 2 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
 

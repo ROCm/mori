@@ -33,6 +33,8 @@ mirror the project README's ``## Benchmarks`` section:
   Intra-node runs appear as ``EP8`` (XGMI only, RDMA shown as ``x``); inter-node
   runs as ``EP16-V1`` / ``EP16-V1-LL`` with both XGMI and RDMA.
 * **MORI-IO**: an RDMA/XGMI transfer table (bandwidth + latency per message size).
+  ``read`` records are excluded - the nightly read step is a fixed-size smoke
+  check, not a sweep, so its numbers are not comparable to the write sweep.
 
 Also writes ``history.jsonl`` (merged/deduped records) so the next run can feed
 it back in. Stdlib only; append the report to ``$GITHUB_STEP_SUMMARY`` and/or
@@ -360,7 +362,16 @@ _IO_HEADERS = [
 
 
 def _io_section(records):
-    io = [r for r in records if r.get("category") == "io"]
+    # Only the write sweep is a real perf signal. The read step is a fixed 4KB
+    # single-point smoke check whose numbers sit far below the sweep's, so it is
+    # dropped here as well as at the source (nightly clears MORI_PERF_OUT for it)
+    # -- history from earlier runs still carries read records.
+    io = [
+        r
+        for r in records
+        if r.get("category") == "io"
+        and (r.get("params") or {}).get("op_type") != "read"
+    ]
     if not io:
         return ""
 
