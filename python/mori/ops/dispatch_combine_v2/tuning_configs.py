@@ -29,8 +29,7 @@ gfx950 — all from KFD sysfs, no torch/HIP dependency. block_num must stay
 <= CU count; re-tune per GPU.
 """
 
-import functools
-import glob
+from mori.ops import utils as gpu_utils
 
 
 # ── MI308X (gfx942, 80 CU) — measured 2026-07-08, EP8, from a block x warp sweep.
@@ -210,57 +209,25 @@ _DEVICES = {
 }
 
 
-# PCI device IDs (KFD `device_id`) → device table key. gfx942 family only; the
-# gfx950 parts (MI350/MI355X) are matched by arch below since their DIDs vary.
-_DID_TO_KEY = {
-    0x74A1: "mi300x",  # MI300X
-    0x74A5: "mi325x",  # MI325X (304-CU gfx942; tuned 2026-07-08)
-    0x74A2: "mi308x",  # MI308X (80 CU)
-}
-
-
-@functools.lru_cache(maxsize=1)
-def _topology():
-    """(cu_count, gfx_target_version, device_id) of the first GPU node from KFD
-    sysfs. torch/HIP-free. gfx_target_version is e.g. 90402 (gfx942), 90500
-    (gfx950); device_id is the PCI DID (e.g. 0x74a2 = MI308X). Homogeneous host
-    assumed. Returns (0, 0, 0) if sysfs is unavailable (no KFD mounted)."""
-    for props in sorted(glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties")):
-        try:
-            vals = {}
-            with open(props) as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) == 2:
-                        vals[parts[0]] = int(parts[1])
-            simd = vals.get("simd_count", 0)
-            if simd <= 0:  # CPU / non-GPU node
-                continue
-            spc = vals.get("simd_per_cu", 0) or 1
-            return (
-                simd // spc,
-                vals.get("gfx_target_version", 0),
-                vals.get("device_id", 0),
-            )
-        except Exception:
-            continue
-    return 0, 0, 0
+# Kept as a module-level name: tests and benches call tuning_configs._topology().
+_topology = gpu_utils.topology
 
 
 def _cu_count():
-    return _topology()[0]
+    return gpu_utils.cu_count()
+
+
+# Models with no table of their own that reuse a tuned sibling's schedule.
+_MODEL_ALIAS = {"mi350x": "mi355x"}  # same die, same 256 CU; clocks differ
 
 
 def _device_key():
-    """Map the current GPU to a device table key: exact PCI DID first, then arch
-    for gfx950. Returns None if unknown (caller uses a CU-scaled default)."""
-    _, gfx, did = _topology()
-    key = _DID_TO_KEY.get(did)
-    if key is not None:
-        return key
-    if gfx == 90500:  # gfx950 (MI350 / MI355X), DID varies
-        return "mi355x"
-    if gfx == 120500:  # gfx1250 (256 CU, wave32), DID varies
+    """Map the current GPU to a device table key: PCI DID first, then arch.
+    Returns None if unknown (caller uses a CU-scaled default)."""
+    model = gpu_utils.detect_model()
+    if model is not None:
+        return _MODEL_ALIAS.get(model, model)
+    if gpu_utils.topology()[1] == 120500:  # gfx1250 has no MI model name
         return "gfx1250"
     return None
 
