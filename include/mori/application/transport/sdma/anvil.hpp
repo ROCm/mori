@@ -114,6 +114,13 @@ class AnvilLib {
   // the static OAM map.
   uint32_t getRecommendedEngineMask(int srcDeviceId, int dstDeviceId);
 
+  // Bitmask of the general (CPU-link, non-xGMI) SDMA engines. Zero if the node
+  // reports no CPU link. Used to spread loopback channels on gfx1250.
+  uint32_t getHostLinkEngineMask(int srcDeviceId);
+
+  // True for gfx1250 (gfx12.5), the only arch that spreads loopback channels.
+  bool isGfx1250(int deviceId);
+
   struct PairHash {
     std::size_t operator()(const std::pair<int, int>& p) const {
       return std::hash<int>()(p.first) ^ (std::hash<int>()(p.second) << 16);
