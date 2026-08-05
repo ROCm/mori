@@ -29,10 +29,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <iomanip>
 #include <limits>
 #include <msgpack.hpp>
 #include <new>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -45,6 +47,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
 #include "umbp/common/ssd_perf.h"
+#include "umbp/distributed/batch_dist_log.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
@@ -1030,6 +1033,7 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
   if (routes.size() < keys.size()) routes.resize(keys.size());
 
   BatchPutPlan plan = PartitionBatchPutTargets(keys, srcs, sizes, routes, &outcomes);
+  LogBatchPutDistribution(plan, keys.size(), outcomes);
   ExecuteBatchPutPlan(plan, &outcomes);
 
   const auto call_end = std::chrono::steady_clock::now();
@@ -1050,6 +1054,202 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
     results[i] = (outcomes[i] != PutEntryOutcome::kFailed);
   }
   return results;
+}
+
+namespace {
+
+// Fan-out log gates: 0 = off, N = log every Nth batch.  Read once; the value
+// cannot change under a running client.
+uint32_t PutDistLogEvery() {
+  static const uint32_t v = GetEnvUint32("UMBP_PUT_DIST_LOG", 1);
+  return v;
+}
+
+uint32_t GetDistLogEvery() {
+  static const uint32_t v = GetEnvUint32("UMBP_GET_DIST_LOG", 1);
+  return v;
+}
+
+}  // namespace
+
+void PoolClient::LogBatchPutDistribution(const BatchPutPlan& plan, size_t total_keys,
+                                         const std::vector<PutEntryOutcome>& outcomes) {
+  const uint32_t every = PutDistLogEvery();
+  if (every == 0) return;
+
+  // Self-target keys are tagged "<node>(local)" so a batch that never leaves the
+  // writer is unmistakable next to one fanned out over peers.
+  const std::string& self = config_.master_config.node_id;
+  BatchDistMap batch;
+  auto add = [&batch](const std::string& target, const std::vector<BatchPutItem>& items) {
+    if (items.empty()) return;
+    auto& entry = batch[target];
+    entry.first += items.size();
+    for (const auto& item : items) entry.second += item.size;
+  };
+  add(self + "(local)/DRAM", plan.local_items);
+  add(self + "(local)/SSD", plan.local_ssd_items);
+  for (const auto& [node_id, items] : plan.remote_groups) add(node_id + "/DRAM", items);
+  for (const auto& [node_id, items] : plan.remote_ssd_groups) add(node_id + "/SSD", items);
+
+  uint64_t dedup = 0;
+  for (const auto& outcome : outcomes) {
+    if (outcome == PutEntryOutcome::kAlreadyExists) ++dedup;
+  }
+  const uint64_t planned_keys = BatchDistTotalKeys(batch);
+  // Everything the plan does not carry: master said unroutable, or the key was
+  // dropped as zero-size in PartitionBatchPutTargets.
+  const uint64_t accounted = planned_keys + dedup;
+  const uint64_t unplanned = total_keys > accounted ? total_keys - accounted : 0;
+  const size_t remote_nodes = plan.remote_groups.size() + plan.remote_ssd_groups.size();
+
+  std::string cumulative_str;
+  uint64_t cumulative_keys = 0;
+  double cumulative_max_share = 0.0;
+  uint64_t batch_index = 0;
+  {
+    std::lock_guard<std::mutex> lock(batch_dist_mutex_);
+    AccumulateBatchDist(batch, &put_dist_cumulative_);
+    batch_index = ++put_dist_batches_;
+    if (batch_index % every != 0) return;
+    cumulative_keys = BatchDistTotalKeys(put_dist_cumulative_);
+    cumulative_str = FormatBatchDist(put_dist_cumulative_, cumulative_keys);
+    cumulative_max_share = BatchDistMaxShare(put_dist_cumulative_, cumulative_keys);
+  }
+
+  // Muted: this fires once per BatchPut and is far too chatty to leave on by
+  // default.  The accounting above still runs, so uncommenting this line is all
+  // it takes to get the fan-out view back when diagnosing a skewed pure-SSD
+  // write path (see doc/pure-ssd-mode.md, "Observability").
+  // MORI_UMBP_INFO(
+  //     "[PoolClient] put_dist #{} keys={} planned={} dedup={} unplanned={} remote_peers={} "
+  //     "bytes={} batch=[{}] batch_max_share={:.1f}% cumulative_keys={} cumulative=[{}] "
+  //     "cumulative_max_share={:.1f}%",
+  //     batch_index, total_keys, planned_keys, dedup, unplanned, remote_nodes,
+  //     BatchDistTotalBytes(batch), FormatBatchDist(batch, planned_keys),
+  //     BatchDistMaxShare(batch, planned_keys), cumulative_keys, cumulative_str,
+  //     cumulative_max_share);
+  (void)unplanned;
+  (void)remote_nodes;
+  (void)cumulative_str;
+  (void)cumulative_max_share;
+}
+
+void PoolClient::LogBatchGetDistribution(const BatchGetPlan& plan, size_t total_keys,
+                                         const std::vector<size_t>& sizes, double elapsed_seconds,
+                                         const std::vector<BatchGetTargetTiming>& timings) {
+  const uint32_t every = GetDistLogEvery();
+  if (every == 0) return;
+
+  const std::string& self = config_.master_config.node_id;
+  BatchDistMap batch;
+  auto add_items = [&batch](const std::string& target, const std::vector<BatchGetItem>& items) {
+    if (items.empty()) return;
+    auto& entry = batch[target];
+    entry.first += items.size();
+    for (const auto& item : items) entry.second += item.size;
+  };
+  auto add_indices = [&batch, &sizes](const std::string& target,
+                                      const std::vector<size_t>& indices) {
+    if (indices.empty()) return;
+    auto& entry = batch[target];
+    entry.first += indices.size();
+    for (size_t i : indices) entry.second += i < sizes.size() ? sizes[i] : 0;
+  };
+  add_indices(self + "(local)/DRAM", plan.local_dram_indices);
+  add_indices(self + "(local)/SSD", plan.local_ssd_indices);
+  for (const auto& [node_id, items] : plan.remote_dram_groups) add_items(node_id + "/DRAM", items);
+  for (const auto& [node_id, items] : plan.remote_ssd_groups) add_items(node_id + "/SSD", items);
+
+  const uint64_t planned_keys = BatchDistTotalKeys(batch);
+  const uint64_t planned_bytes = BatchDistTotalBytes(batch);
+  // remote_ssd_groups is exactly the number of concurrent SSD read workers
+  // ExecuteBatchGetPlan spawns (one per owning node), so printing it next to the
+  // wall time shows whether the aggregate read is actually fanned out.
+  const size_t ssd_workers = plan.remote_ssd_groups.size();
+
+  std::string cumulative_str;
+  uint64_t cumulative_keys = 0;
+  double cumulative_max_share = 0.0;
+  uint64_t batch_index = 0;
+  {
+    std::lock_guard<std::mutex> lock(batch_dist_mutex_);
+    AccumulateBatchDist(batch, &get_dist_cumulative_);
+    batch_index = ++get_dist_batches_;
+    if (batch_index % every != 0) return;
+    cumulative_keys = BatchDistTotalKeys(get_dist_cumulative_);
+    cumulative_str = FormatBatchDist(get_dist_cumulative_, cumulative_keys);
+    cumulative_max_share = BatchDistMaxShare(get_dist_cumulative_, cumulative_keys);
+  }
+
+  // Muted: fires once per BatchGet.  Everything from here down is log-only --
+  // the straggler pass sorts the per-target timings and formats a string on
+  // every batch -- so it is commented out as a block rather than left running
+  // to feed a call that no longer prints.  The cumulative accounting above
+  // still runs; uncomment this block to get the read fan-out view back (see
+  // doc/pure-ssd-mode.md, "Observability").
+  //
+  // const double elapsed_ms = elapsed_seconds * 1000.0;
+  // const double gb_s =
+  //     elapsed_seconds > 0.0
+  //         ? static_cast<double>(planned_bytes) / elapsed_seconds / (1000.0 * 1000.0 * 1000.0)
+  //         : 0.0;
+  //
+  // Straggler accounting.  Every remote worker starts together and the batch
+  // blocks until the LAST one returns, so:
+  //   tail_ms   = slowest - median : wall time the batch spent waiting on the
+  //               straggler after half its targets were already done.
+  //   tail_pct  = that as a share of the whole batch -- the fraction of the
+  //               batch's wall time that buys no bandwidth.
+  //   nostall_GB_s = the rate the batch WOULD have hit had every target
+  //               finished at the median. The gap between GB_s and this is the
+  //               straggler cost, measured on this batch, not inferred from a
+  //               p99 over unrelated calls.
+  // std::string straggler = "n/a";
+  // if (!timings.empty()) {
+  //   std::vector<double> ms;
+  //   ms.reserve(timings.size());
+  //   for (const auto& t : timings) ms.push_back(t.ms);
+  //   std::sort(ms.begin(), ms.end());
+  //   const double slowest = ms.back();
+  //   const double median = ms[ms.size() / 2];
+  //   const double fastest = ms.front();
+  //   const double tail_ms = slowest - median;
+  //   const double tail_pct = elapsed_ms > 0.0 ? 100.0 * tail_ms / elapsed_ms : 0.0;
+  //   const double nostall_s = elapsed_seconds - (tail_ms / 1000.0);
+  //   const double nostall_gb_s =
+  //       nostall_s > 0.0 ? static_cast<double>(planned_bytes) / nostall_s / 1e9 : 0.0;
+  //   // Name the straggler: a node that is repeatedly slowest is a different
+  //   // problem (bad drive, hot node) from a randomly-rotating one (queueing).
+  //   const auto* worst = &timings.front();
+  //   for (const auto& t : timings) {
+  //     if (t.ms > worst->ms) worst = &t;
+  //   }
+  //   std::ostringstream oss;
+  //   oss << std::fixed << std::setprecision(2) << "slowest=" << slowest << "ms@"
+  //       << (worst->node_id.empty() ? "<unknown>" : worst->node_id) << " median=" << median
+  //       << "ms fastest=" << fastest << "ms spread=" << (median > 0.0 ? slowest / median : 0.0)
+  //       << "x tail_ms=" << tail_ms << " tail_pct=" << std::setprecision(1) << tail_pct
+  //       << "% nostall_GB_s=" << std::setprecision(2) << nostall_gb_s;
+  //   straggler = oss.str();
+  // }
+  //
+  // MORI_UMBP_INFO(
+  //     "[PoolClient] get_dist #{} keys={} planned={} missing={} remote_ssd_workers={} bytes={} "
+  //     "elapsed_ms={:.3f} GB_s={:.2f} straggler=[{}] batch=[{}] batch_max_share={:.1f}% "
+  //     "cumulative_keys={} cumulative=[{}] cumulative_max_share={:.1f}%",
+  //     batch_index, total_keys, planned_keys, total_keys - planned_keys, ssd_workers,
+  //     planned_bytes, elapsed_ms, gb_s, straggler, FormatBatchDist(batch, planned_keys),
+  //     BatchDistMaxShare(batch, planned_keys), cumulative_keys, cumulative_str,
+  //     cumulative_max_share);
+  (void)total_keys;
+  (void)elapsed_seconds;
+  (void)timings;
+  (void)planned_keys;
+  (void)planned_bytes;
+  (void)ssd_workers;
+  (void)cumulative_str;
+  (void)cumulative_max_share;
 }
 
 PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
@@ -1944,11 +2144,15 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
   }
 
   BatchGetPlan plan = PartitionBatchGetTargets(keys, dsts, sizes, routes);
-  ExecuteBatchGetPlan(plan, keys, dsts, sizes, &results);
+  std::vector<BatchGetTargetTiming> target_timings;
+  ExecuteBatchGetPlan(plan, keys, dsts, sizes, &results, &target_timings);
 
   const auto call_end = std::chrono::steady_clock::now();
   const double seconds =
       std::chrono::duration_cast<std::chrono::duration<double>>(call_end - call_start).count();
+  // Logged after execution so the wall time (and therefore the implied
+  // aggregate GB/s) belongs to the same batch as the fan-out it describes.
+  LogBatchGetDistribution(plan, keys.size(), sizes, seconds, target_timings);
   if (seconds > 0.0) {
     auto split = ComputeBatchBandwidthBytes(results, sizes, routes, config_.master_config.node_id);
     ObserveBatchBandwidth(*master_client_, split.local, seconds,
@@ -2005,7 +2209,8 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
 
 void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                                      const std::vector<void*>& dsts,
-                                     const std::vector<size_t>& sizes, std::vector<bool>* results) {
+                                     const std::vector<size_t>& sizes, std::vector<bool>* results,
+                                     std::vector<BatchGetTargetTiming>* target_timings) {
   // Parallel local DRAM reads: different threads handle different keys. Resolve
   // is mutex-serialized in the allocator; the per-key memcpy in
   // ExecuteLocalGet->LocalGetPages runs lock-free in parallel. results is
@@ -2102,14 +2307,35 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
     std::vector<std::vector<char>> oks(groups.size());
     for (size_t g = 0; g < groups.size(); ++g) oks[g].assign(groups[g]->size(), 0);
 
+    // Per-target wall time.  The workers start together and the batch blocks on
+    // the join, so max(ms) - median(ms) is time the whole batch spent waiting on
+    // stragglers alone -- the straggler cost, measured rather than inferred.
+    std::vector<double> tms(groups.size(), 0.0);
+    auto run_one = [&](size_t g) {
+      const auto t0 = std::chrono::steady_clock::now();
+      ProcessRemoteSsdBatchGet(*groups[g], &oks[g]);
+      tms[g] = std::chrono::duration_cast<std::chrono::duration<double>>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count() *
+               1000.0;
+    };
+
     std::vector<std::thread> workers;
     workers.reserve(groups.size() - 1);
     for (size_t g = 0; g + 1 < groups.size(); ++g) {
-      workers.emplace_back(
-          [this, g, &groups, &oks]() { ProcessRemoteSsdBatchGet(*groups[g], &oks[g]); });
+      workers.emplace_back([&run_one, g]() { run_one(g); });
     }
-    ProcessRemoteSsdBatchGet(*groups.back(), &oks.back());  // last group inline
+    run_one(groups.size() - 1);  // last group inline
     for (auto& t : workers) t.join();
+
+    if (target_timings != nullptr) {
+      for (size_t g = 0; g < groups.size(); ++g) {
+        uint64_t b = 0;
+        for (const auto& item : *groups[g]) b += item.size;
+        target_timings->push_back(BatchGetTargetTiming{
+            groups[g]->empty() ? std::string() : groups[g]->front().route.node_id, tms[g], b});
+      }
+    }
 
     for (size_t g = 0; g < groups.size(); ++g) {
       for (size_t k = 0; k < groups[g]->size(); ++k) {

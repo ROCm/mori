@@ -23,10 +23,14 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <random>
 #include <sstream>
+#include <utility>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/env_time.h"
+#include "umbp/distributed/batch_dist_log.h"
 
 namespace mori::umbp {
 
@@ -167,6 +171,13 @@ bool ApplyProjectedDeduction(std::vector<ClientRecord>& candidates, const RouteP
   }
   tier_it->second.available_bytes -= block_size;
   return true;
+}
+
+// Log one batch-distribution line every N batches; 0 disables the line
+// entirely.  Read once (the value cannot change under a running master).
+uint32_t PutDistLogEvery() {
+  static const uint32_t v = GetEnvUint32("UMBP_PUT_DIST_LOG", 1);
+  return v;
 }
 
 }  // namespace
@@ -445,7 +456,71 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
     results.push_back(std::move(selected));
   }
 
+  LogBatchDistribution(requester_node_id, results, block_sizes, algo_desc);
   return results;
+}
+
+void ConfigurableRoutePutStrategy::LogBatchDistribution(
+    const std::string& requester_node_id, const std::vector<std::optional<RoutePutResult>>& results,
+    const std::vector<uint64_t>& block_sizes, const std::string& algo_desc) {
+  const uint32_t every = PutDistLogEvery();
+  if (every == 0) return;
+
+  BatchDistMap batch;
+  uint64_t routed = 0, dedup = 0, unroutable = 0, routed_bytes = 0;
+  for (size_t i = 0; i < results.size(); ++i) {
+    if (!results[i].has_value()) {
+      ++unroutable;
+      continue;
+    }
+    if (results[i]->outcome == RoutePutOutcome::kAlreadyExists) {
+      ++dedup;
+      continue;
+    }
+    const uint64_t bytes = i < block_sizes.size() ? block_sizes[i] : 0;
+    auto& entry = batch[results[i]->node_id + "/" + TierTypeName(results[i]->tier)];
+    entry.first += 1;
+    entry.second += bytes;
+    ++routed;
+    routed_bytes += bytes;
+  }
+
+  // Fold into the cumulative view and decide whether this batch prints, both
+  // under one lock so a sampled line still reflects every preceding batch.
+  std::string cumulative_str;
+  uint64_t cumulative_keys = 0;
+  double cumulative_max_share = 0.0;
+  uint64_t batch_index = 0;
+  {
+    std::lock_guard<std::mutex> lock(dist_mutex_);
+    AccumulateBatchDist(batch, &dist_cumulative_);
+    batch_index = ++dist_batches_;
+    if (batch_index % every != 0) return;
+    cumulative_keys = BatchDistTotalKeys(dist_cumulative_);
+    cumulative_str = FormatBatchDist(dist_cumulative_, cumulative_keys);
+    cumulative_max_share = BatchDistMaxShare(dist_cumulative_, cumulative_keys);
+  }
+
+  // Muted: this fires once per BatchRoutePut on the master, which sees every
+  // client's traffic, so it is the noisiest of the three.  The cumulative
+  // accounting above still runs; uncomment to see where the router is actually
+  // placing keys (see doc/pure-ssd-mode.md, "Observability").
+  // MORI_UMBP_INFO(
+  //     "[RoutePutStrategy] batch_dist #{} requester={} keys={} routed={} dedup={} unroutable={} "
+  //     "routed_bytes={} targets={} algo=[{}] batch=[{}] batch_max_share={:.1f}% "
+  //     "cumulative_keys={} cumulative=[{}] cumulative_max_share={:.1f}%",
+  //     batch_index, requester_node_id.empty() ? "<unknown>" : requester_node_id, results.size(),
+  //     routed, dedup, unroutable, routed_bytes, batch.size(), algo_desc,
+  //     FormatBatchDist(batch, routed), BatchDistMaxShare(batch, routed), cumulative_keys,
+  //     cumulative_str, cumulative_max_share);
+  (void)requester_node_id;
+  (void)algo_desc;
+  (void)routed;
+  (void)dedup;
+  (void)unroutable;
+  (void)routed_bytes;
+  (void)cumulative_str;
+  (void)cumulative_max_share;
 }
 
 }  // namespace mori::umbp

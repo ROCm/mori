@@ -398,6 +398,43 @@ class PoolClient {
   // per peer serially.  Writes per-key outcomes into *results.
   void ExecuteBatchPutPlan(const BatchPutPlan& plan, std::vector<PutEntryOutcome>* results);
 
+  // Writer-side fan-out of one BatchPut: how many keys/bytes this batch sends to
+  // each target node+tier (self included, tagged "local").  The master's own
+  // batch_dist line covers every client at once; this one is what a single
+  // writer sees, so a client that keeps landing on one node -- the thing that
+  // caps aggregate NVMe write bandwidth in a pure-SSD deployment -- is visible
+  // without cross-referencing the master log.  Gated by UMBP_PUT_DIST_LOG
+  // (0 = off, N = every Nth batch); cumulative totals ride every line.
+  void LogBatchPutDistribution(const BatchPutPlan& plan, size_t total_keys,
+                               const std::vector<PutEntryOutcome>& outcomes);
+
+  // Per-target wall time for one BatchGet's remote-SSD fan-out: the workers run
+  // concurrently, so the batch cannot finish before its SLOWEST target does.
+  // Collected so the straggler cost can be measured directly instead of being
+  // inferred from a p99 over unrelated calls.
+  struct BatchGetTargetTiming {
+    std::string node_id;
+    double ms = 0.0;
+    uint64_t bytes = 0;
+  };
+
+  // BatchGet counterpart of LogBatchPutDistribution, gated by UMBP_GET_DIST_LOG.
+  // `elapsed` is the whole-batch wall time, reported next to the per-node byte
+  // split so the read fan-out (one worker per owning node) can be checked for
+  // actual overlap rather than assumed.  `timings` (when non-empty) adds the
+  // straggler breakdown: how much of that wall time was spent waiting only on
+  // the last target to return.
+  void LogBatchGetDistribution(const BatchGetPlan& plan, size_t total_keys,
+                               const std::vector<size_t>& sizes, double elapsed_seconds,
+                               const std::vector<BatchGetTargetTiming>& timings);
+
+  std::mutex batch_dist_mutex_;
+  uint64_t put_dist_batches_ = 0;
+  uint64_t get_dist_batches_ = 0;
+  // "node/TIER" -> {keys, bytes} planned since this client started.
+  std::map<std::string, std::pair<uint64_t, uint64_t>> put_dist_cumulative_;
+  std::map<std::string, std::pair<uint64_t, uint64_t>> get_dist_cumulative_;
+
   // Group a BatchGet's routes into a BatchGetPlan (no IO issued).  Mirrors
   // PartitionBatchPutTargets, but deliberately does NOT execute local reads:
   // ExecuteBatchGetPlan decides where the local reads run so they can overlap
@@ -413,7 +450,8 @@ class PoolClient {
   // (submit -> wait).  Reads the plan; writes per-key outcomes into *results.
   void ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                            const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
-                           std::vector<bool>* results);
+                           std::vector<bool>* results,
+                           std::vector<BatchGetTargetTiming>* target_timings = nullptr);
 
   struct TransferInstruction {
     size_t entry_index;

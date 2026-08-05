@@ -22,11 +22,13 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <random>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "umbp/distributed/types.h"
@@ -174,6 +176,23 @@ class ConfigurableRoutePutStrategy : public RoutePutStrategy {
   /// Draw an index in [0, weights.size()) with probability proportional to the
   /// weights.  Uses the pinned RNG when seeded, else a thread_local RNG.
   size_t PickWeighted(const std::vector<uint64_t>& weights);
+
+  /// One-line "where did this batch land" summary, emitted at the end of every
+  /// SelectBatch (gated by UMBP_PUT_DIST_LOG, see PutDistLogEvery()).  Reports
+  /// the per-node/tier key+byte split for THIS batch plus the process-cumulative
+  /// split, because the batch-local view alone cannot show cross-batch skew:
+  /// projected deductions are discarded at the end of each batch, so every batch
+  /// restarts from the same (heartbeat-aged) capacity snapshot.  On a pure-SSD
+  /// deployment the cumulative share is the number that says whether the write
+  /// path is actually spreading over every node's drives.
+  void LogBatchDistribution(const std::string& requester_node_id,
+                            const std::vector<std::optional<RoutePutResult>>& results,
+                            const std::vector<uint64_t>& block_sizes, const std::string& algo_desc);
+
+  std::mutex dist_mutex_;
+  uint64_t dist_batches_ = 0;
+  /// "node/TIER" -> {keys, bytes} routed since master start.
+  std::map<std::string, std::pair<uint64_t, uint64_t>> dist_cumulative_;
 
   SelectAlgo algo_;
   NodeAffinity affinity_;
