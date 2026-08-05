@@ -33,6 +33,7 @@ from mori.io import (
     StatusCode,
     MemoryLocationType,
     RdmaBackendConfig,
+    TcpBackendConfig,
     XgmiBackendConfig,
     set_log_level,
 )
@@ -878,3 +879,153 @@ def test_xgmi_cross_engine_transfer():
     status.Wait()
     assert status.Succeeded()
     assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+
+
+# --------------------------------------------------------------------------- #
+#                              TCP backend tests                              #
+# --------------------------------------------------------------------------- #
+
+
+def _wait_inbound_status(engine, remote_engine_key, remote_transfer_uid, timeout_s=5.0):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        st = engine.pop_inbound_transfer_status(remote_engine_key, remote_transfer_uid)
+        if st is not None:
+            return st
+        time.sleep(0.001)
+    raise RuntimeError("Timed out waiting for inbound status")
+
+
+def _wait_tcp_status(status, timeout_s=5.0):
+    deadline = time.time() + timeout_s
+    while status.InProgress() and time.time() < deadline:
+        time.sleep(0.001)
+    assert not status.InProgress(), "Timed out waiting for TCP transfer status"
+
+
+def _create_tcp_engine_pair(name_prefix, port_a=0, port_b=0):
+    cfg_a = IOEngineConfig(host="127.0.0.1", port=port_a)
+    cfg_b = IOEngineConfig(host="127.0.0.1", port=port_b)
+
+    a = IOEngine(key=f"{name_prefix}_a", config=cfg_a)
+    b = IOEngine(key=f"{name_prefix}_b", config=cfg_b)
+
+    a.create_backend(BackendType.TCP, TcpBackendConfig())
+    b.create_backend(BackendType.TCP, TcpBackendConfig())
+
+    a_desc = a.get_engine_desc()
+    b_desc = b.get_engine_desc()
+    a.register_remote_engine(b_desc)
+    b.register_remote_engine(a_desc)
+    return a, b, a_desc, b_desc
+
+
+def test_tcp_engine_desc_port_zero_auto_bind():
+    set_log_level("error")
+    engine = IOEngine(
+        key="engine_tcp_port0", config=IOEngineConfig(host="127.0.0.1", port=0)
+    )
+    engine.create_backend(BackendType.TCP, TcpBackendConfig())
+    desc = engine.get_engine_desc()
+    assert desc.port > 0
+
+
+def test_tcp_config_defaults_and_lane_validation():
+    cfg = TcpBackendConfig()
+    assert cfg.sock_sndbuf_bytes == 32 * 1024 * 1024
+    assert cfg.sock_rcvbuf_bytes == 32 * 1024 * 1024
+    assert cfg.num_data_conns == 8
+    assert cfg.striping_threshold_bytes == 64 * 1024
+    with pytest.raises(ValueError):
+        TcpBackendConfig(num_data_conns=0)
+    with pytest.raises(ValueError):
+        TcpBackendConfig(num_data_conns=17)
+
+
+def test_tcp_cpu_write_read_and_batch():
+    set_log_level("error")
+    a, b, a_desc, b_desc = _create_tcp_engine_pair("tcp_cpu")
+
+    # Allocate CPU tensors and register memory.
+    src = torch.arange(0, 1024 * 4, dtype=torch.uint8)
+    dst = torch.zeros_like(src)
+    src_md = a.register_torch_tensor(src)
+    dst_md = b.register_torch_tensor(dst)
+
+    # MemoryDesc serialization should work for TCP too.
+    packed = dst_md.pack()
+    dst_md_remote = MemoryDesc.unpack(packed)
+    assert dst_md == dst_md_remote
+
+    # Single write
+    uid = a.allocate_transfer_uid()
+    st = a.write(src_md, 0, dst_md, 0, src.numel() * src.element_size(), uid)
+    _wait_tcp_status(st)
+    assert st.Succeeded(), st.Message()
+    bst = _wait_inbound_status(b, a_desc.key, uid)
+    assert bst.Succeeded(), bst.Message()
+    assert torch.equal(src, dst)
+
+    # Single read (b -> a)
+    dst.zero_()
+    uid = a.allocate_transfer_uid()
+    st = a.read(src_md, 0, dst_md, 0, src.numel() * src.element_size(), uid)
+    _wait_tcp_status(st)
+    assert st.Succeeded(), st.Message()
+    bst = _wait_inbound_status(b, a_desc.key, uid)
+    assert bst.Succeeded(), bst.Message()
+    assert torch.equal(src, dst)
+
+    # Batch write via session
+    sess = a.create_session(src_md, dst_md)
+    assert sess is not None
+    offsets = [0, 256, 512, 768]
+    sizes = [128, 128, 128, 128]
+
+    dst.zero_()
+    uid = sess.allocate_transfer_uid()
+    st = sess.batch_write(offsets, offsets, sizes, uid)
+    _wait_tcp_status(st)
+    assert st.Succeeded(), st.Message()
+    bst = _wait_inbound_status(b, a_desc.key, uid)
+    assert bst.Succeeded(), bst.Message()
+
+    for off, sz in zip(offsets, sizes):
+        assert torch.equal(src[off : off + sz], dst[off : off + sz])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_tcp_gpu_write_read_and_batch_staging():
+    set_log_level("error")
+    a, b, a_desc, _ = _create_tcp_engine_pair("tcp_gpu")
+    src = torch.arange(0, 4096, dtype=torch.uint8, device="cuda:0")
+    dst = torch.zeros_like(src)
+    src_md = a.register_torch_tensor(src)
+    dst_md = b.register_torch_tensor(dst)
+
+    uid = a.allocate_transfer_uid()
+    status = a.write(src_md, 0, dst_md, 0, src.numel(), uid)
+    _wait_tcp_status(status)
+    assert status.Succeeded(), status.Message()
+    assert _wait_inbound_status(b, a_desc.key, uid).Succeeded()
+    assert torch.equal(src, dst)
+
+    expected = dst.clone()
+    src.zero_()
+    uid = a.allocate_transfer_uid()
+    status = a.read(src_md, 0, dst_md, 0, dst.numel(), uid)
+    _wait_tcp_status(status)
+    assert status.Succeeded(), status.Message()
+    assert torch.equal(src, expected)
+
+    dst.zero_()
+    session = a.create_session(src_md, dst_md)
+    assert session is not None
+    offsets = [0, 1024, 2048, 3072]
+    sizes = [511, 509, 507, 505]
+    uid = session.allocate_transfer_uid()
+    status = session.batch_write(offsets, offsets, sizes, uid)
+    _wait_tcp_status(status)
+    assert status.Succeeded(), status.Message()
+    for off, size in zip(offsets, sizes):
+        assert torch.equal(src[off : off + size], dst[off : off + size])

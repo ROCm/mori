@@ -6,6 +6,9 @@ set(MORI_IO_SOURCES
     rdma/executor.cpp
     rdma/common.cpp
     rdma/ledger.cpp
+    tcp/backend_impl.cpp
+    tcp/protocol.cpp
+    tcp/transport.cpp
     xgmi/backend_impl.cpp
     xgmi/hip_resource_pool.cpp
     fabric/backend_impl.cpp

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run one node of the two-node MORI-IO RDMA benchmark via torchrun.
+# Run one node of the two-node MORI-IO benchmark via torchrun.
 #
 # Usage:
 #   run_internode_io_benchmark.sh \
@@ -8,10 +8,14 @@
 #     --ifname <nic> \
 #     [--master-port <port>] \
 #     [--host <io-engine-host>] \
+#     [--backend <backend>] \
 #     -- [benchmark.py args...]
 #
 # The benchmark args after `--` are forwarded to tests/python/io/benchmark.py.
-# The script always runs the RDMA backend in 2-node mode with nproc_per_node=1.
+# The backend name is forwarded to benchmark.py unchanged (MORI supports RDMA,
+# TCP, Fabric, and XGMI). This helper launches a 2-node topology with
+# nproc_per_node=1, so CI uses it for the cross-node backends. The default is
+# RDMA.
 # Timeout can be overridden via MORI_IO_BENCH_TIMEOUT_SEC.
 
 set -euo pipefail
@@ -22,6 +26,7 @@ MASTER_PORT=1234
 IFNAME=""
 HOST=""
 NUMA_NODE=""
+BACKEND="rdma"
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -32,6 +37,7 @@ while [[ $# -gt 0 ]]; do
     --ifname)       IFNAME="$2";      shift 2 ;;
     --host)         HOST="$2";        shift 2 ;;
     --numa)         NUMA_NODE="$2";   shift 2 ;;
+    --backend)      BACKEND="$2";     shift 2 ;;
     --)             shift; EXTRA_ARGS=("$@"); break ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -100,6 +106,6 @@ exec "${NUMACTL[@]}" timeout "$BENCH_TIMEOUT_SEC" torchrun \
   --master_addr="$MASTER_ADDR" \
   --master_port="$MASTER_PORT" \
   -m tests.python.io.benchmark \
-  --backend rdma \
+  --backend "$BACKEND" \
   --host "$HOST" \
   "${EXTRA_ARGS[@]}"
