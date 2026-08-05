@@ -341,10 +341,16 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
   }
   int numEngines = static_cast<int>(engines.size());
 
-  auto key = std::make_pair(srcDeviceId, dstDeviceId);
-  for (int c = 0; c < numChannels; ++c) {
+  // Queues live in this process-global singleton and are shared across every
+  // Context/comm for this device pair (getSdmaQueue keys on device ids, not on
+  // the comm), and are only reclaimed when the process exits. So create just the
+  // shortfall: appending on every connect() would pile up unused duplicate
+  // hardware queues (getSdmaQueue only ever indexes the first numChannels) and
+  // eventually exhaust the per-engine queue slots.
+  auto& channels = sdma_channels_[std::make_pair(srcDeviceId, dstDeviceId)];
+  for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
     uint32_t engineId = engines[c % numEngines];
-    sdma_channels_[key].emplace_back(std::make_unique<SdmaQueue>(
+    channels.emplace_back(std::make_unique<SdmaQueue>(
         srcDeviceId, dstDeviceId, gpuAgents_[gpuAgentIndexForHipDevice(srcDeviceId)], engineId));
   }
   return true;
