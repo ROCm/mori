@@ -15,6 +15,10 @@
 namespace mori {
 namespace core {
 
+struct InlineBuf {
+  uint64_t data[2];
+};
+
 struct ProxyQpHandle {
   ibv_qp* qp{nullptr};
   ibv_cq* cq{nullptr};
@@ -38,6 +42,9 @@ class ProxyThread {
   static void* ThreadFunc(void* arg);
   void MainLoop();
   void DrainCq(ProxyQpHandle& qph);
+  bool BuildWr(volatile ProxyCmd* cmd, ProxyQpHandle& qph,
+               ibv_send_wr& wr, ibv_sge& sge, uint32_t slot_id,
+               InlineBuf& ibuf);
 
   ProxyRing* ring_{nullptr};
   std::vector<ProxyQpHandle> qps_;

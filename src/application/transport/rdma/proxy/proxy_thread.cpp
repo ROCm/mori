@@ -44,24 +44,20 @@ void* ProxyThread::ThreadFunc(void* arg) {
 
 void ProxyThread::DrainCq(ProxyQpHandle& qph) {
   if (!qph.cq) return;
-  ibv_wc wc[32];
+  ibv_wc wc[64];
   int n;
-  while ((n = ibv_poll_cq(qph.cq, 32, wc)) > 0) {
+  while ((n = ibv_poll_cq(qph.cq, 64, wc)) > 0) {
     for (int i = 0; i < n; i++) {
-      // Recv CQE: incoming SEND_WITH_IMM for barrier atomic emulation
       if (wc[i].opcode == IBV_WC_RECV || wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
         if (wc[i].status == IBV_WC_SUCCESS && wc[i].byte_len >= 16) {
           uint32_t recv_idx = static_cast<uint32_t>(wc[i].wr_id);
           if (recv_idx < qph.recv_count && qph.recv_buf) {
             struct { uint64_t addr; uint64_t val; } payload;
             memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
-            // Barrier atomics have no data-ordering requirement, so CPU
-            // atomic on GPU VRAM is safe (no concurrent NIC DMA to race with).
             volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
             __atomic_fetch_add(target, payload.val, __ATOMIC_SEQ_CST);
             asm volatile("clflush (%0)" :: "r"(target) : "memory");
             asm volatile("sfence" ::: "memory");
-            // Re-post recv WR
             ibv_sge rsge{};
             rsge.addr = reinterpret_cast<uintptr_t>(qph.recv_buf) + recv_idx * 64;
             rsge.length = 64;
@@ -79,7 +75,6 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
         }
         continue;
       }
-      // Send CQE: our outgoing op completed
       uint32_t slot = static_cast<uint32_t>(wc[i].wr_id) & PROXY_RING_MASK;
       if (wc[i].status == IBV_WC_SUCCESS) {
         ring_->cmds[slot].status = PROXY_COMPLETED;
@@ -94,122 +89,177 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
   }
 }
 
+// Build a single ibv_send_wr from a ProxyCmd. Returns false on invalid op.
+bool ProxyThread::BuildWr(volatile ProxyCmd* cmd, ProxyQpHandle& qph,
+                          ibv_send_wr& wr, ibv_sge& sge, uint32_t slot_id,
+                          InlineBuf& ibuf) {
+  sge.addr = cmd->src_addr;
+  sge.length = cmd->length;
+  sge.lkey = (qph.lkey_override != 0) ? qph.lkey_override : cmd->lkey;
+
+  wr = {};
+  wr.wr_id = slot_id;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.send_flags = IBV_SEND_SIGNALED;
+
+  switch (cmd->op) {
+    case PROXY_RDMA_WRITE:
+      wr.opcode = IBV_WR_RDMA_WRITE;
+      wr.wr.rdma.remote_addr = cmd->dst_addr;
+      wr.wr.rdma.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
+      break;
+    case PROXY_RDMA_WRITE_INLINE:
+      wr.opcode = IBV_WR_RDMA_WRITE;
+      wr.send_flags |= IBV_SEND_INLINE;
+      wr.wr.rdma.remote_addr = cmd->dst_addr;
+      wr.wr.rdma.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
+      break;
+    case PROXY_SIGNAL_WRITE: {
+      ibuf.data[0] = cmd->atomic_arg;
+      sge.addr = reinterpret_cast<uintptr_t>(&ibuf.data[0]);
+      sge.length = 8;
+      sge.lkey = cmd->lkey;
+      wr.opcode = IBV_WR_RDMA_WRITE;
+      wr.send_flags |= IBV_SEND_INLINE;
+      wr.wr.rdma.remote_addr = cmd->dst_addr;
+      wr.wr.rdma.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
+      break;
+    }
+    case PROXY_ATOMIC_FETCH_ADD:
+    case PROXY_ATOMIC_CMP_SWAP: {
+      ibuf.data[0] = cmd->dst_addr;
+      ibuf.data[1] = cmd->atomic_arg;
+      sge.addr = reinterpret_cast<uintptr_t>(&ibuf.data[0]);
+      sge.length = 16;
+      wr.opcode = IBV_WR_SEND_WITH_IMM;
+      wr.imm_data = htonl(0xA70C);
+      wr.send_flags |= IBV_SEND_FENCE | IBV_SEND_INLINE;
+      break;
+    }
+    default:
+      return false;
+  }
+  return true;
+}
+
 void ProxyThread::MainLoop() {
   hipSetDevice(gpu_id_);
-  while (!ring_->shutdown) {
-    bool did_work = false;
 
+  static constexpr int kMaxBatch = 64;
+  ibv_send_wr wrs[kMaxBatch];
+  ibv_sge sges[kMaxBatch];
+  InlineBuf ibufs[kMaxBatch];
+  uint32_t wr_qp[kMaxBatch];
+  int batch_count = 0;
+
+  while (!ring_->shutdown) {
+    batch_count = 0;
+
+    // Collect up to kMaxBatch pending commands from the ring
     uint32_t head = ring_->gpu_head;
-    if (next_slot_ < head) {
+    while (next_slot_ < head && batch_count < kMaxBatch) {
       uint32_t slot = next_slot_ & PROXY_RING_MASK;
       volatile ProxyCmd* cmd = &ring_->cmds[slot];
 
-      if (cmd->status == PROXY_PENDING) {
-        uint32_t qi = cmd->qp_idx;
-        if (qi >= qps_.size()) {
-          fprintf(stderr, "proxy: qp_idx=%u out of range (%zu)\n", qi, qps_.size());
-          cmd->status = PROXY_ERROR;
-          next_slot_++;
-          continue;
-        }
-        ProxyQpHandle& qph = qps_[qi];
-        if (qph.qp == nullptr) {
-          fprintf(stderr, "proxy: null QP at idx=%u\n", qi);
-          cmd->status = PROXY_ERROR;
-          next_slot_++;
-          continue;
-        }
+      if (cmd->status != PROXY_PENDING) break;
 
-        ibv_sge sge{};
-        sge.addr = cmd->src_addr;
-        sge.length = cmd->length;
-        sge.lkey = (qph.lkey_override != 0) ? qph.lkey_override : cmd->lkey;
-
-        (void)head; // suppress unused warning
-
-        ibv_send_wr wr{};
-        wr.wr_id = next_slot_;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags = IBV_SEND_SIGNALED;
-
-        switch (cmd->op) {
-          case PROXY_RDMA_WRITE:
-            wr.opcode = IBV_WR_RDMA_WRITE;
-            wr.wr.rdma.remote_addr = cmd->dst_addr;
-            wr.wr.rdma.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
-            break;
-          case PROXY_RDMA_WRITE_INLINE:
-            wr.opcode = IBV_WR_RDMA_WRITE;
-            wr.send_flags |= IBV_SEND_INLINE;
-            wr.wr.rdma.remote_addr = cmd->dst_addr;
-            wr.wr.rdma.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
-            break;
-          case PROXY_SIGNAL_WRITE: {
-            // Signal paired with data: RDMA_WRITE so both go through same
-            // NIC → PCIe → GPU VRAM path. RC QP guarantees responder-side
-            // ordering — data write completes before signal write at the
-            // remote GPU without needing IBV_SEND_FENCE.
-            uint64_t val = cmd->atomic_arg;
-            memcpy(reinterpret_cast<void*>(sge.addr), &val, 8);
-            sge.length = 8;
-            sge.lkey = cmd->lkey;
-            wr.opcode = IBV_WR_RDMA_WRITE;
-            wr.send_flags |= IBV_SEND_INLINE;
-            wr.wr.rdma.remote_addr = cmd->dst_addr;
-            wr.wr.rdma.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
-            break;
-          }
-          case PROXY_ATOMIC_FETCH_ADD:
-          case PROXY_ATOMIC_CMP_SWAP: {
-            // Standalone atomic (barrier): SEND_WITH_IMM so receiver proxy
-            // does CPU __atomic_fetch_add. No data-ordering requirement.
-            struct { uint64_t addr; uint64_t val; } payload;
-            payload.addr = cmd->dst_addr;
-            payload.val = cmd->atomic_arg;
-            memcpy(reinterpret_cast<void*>(sge.addr), &payload, 16);
-            sge.length = 16;
-            wr.opcode = IBV_WR_SEND_WITH_IMM;
-            wr.imm_data = htonl(0xA70C);
-            wr.send_flags |= IBV_SEND_FENCE | IBV_SEND_INLINE;
-            break;
-          }
-          default:
-            cmd->status = PROXY_ERROR;
-            next_slot_++;
-            continue;
-        }
-
-        ibv_send_wr* bad = nullptr;
-        int ret = ibv_post_send(qph.qp, &wr, &bad);
-
-        if (ret == ENOMEM) {
-          for (int attempt = 0; attempt < 1000; attempt++) {
-            DrainCq(qph);
-            ret = ibv_post_send(qph.qp, &wr, &bad);
-            if (ret != ENOMEM) break;
-            usleep(0);
-          }
-        }
-
-        if (ret) {
-          fprintf(stderr, "proxy: ibv_post_send failed: %s (ret=%d) op=%u\n",
-                  strerror(ret), ret, cmd->op);
-          cmd->status = PROXY_ERROR;
-        } else {
-          ops_posted_++;
-        }
+      uint32_t qi = cmd->qp_idx;
+      if (qi >= qps_.size() || qps_[qi].qp == nullptr) {
+        cmd->status = PROXY_ERROR;
         next_slot_++;
-        did_work = true;
+        continue;
+      }
+
+      if (!BuildWr(cmd, qps_[qi], wrs[batch_count], sges[batch_count], next_slot_, ibufs[batch_count])) {
+        cmd->status = PROXY_ERROR;
+        next_slot_++;
+        continue;
+      }
+
+      wr_qp[batch_count] = qi;
+      wrs[batch_count].next = nullptr;
+      next_slot_++;
+      batch_count++;
+    }
+
+    // Post the batch: group WRs by QP, chain each group, post with one ibv_post_send call
+    if (batch_count > 0) {
+      // Build per-QP chains: chain_head[qi] points to first WR for that QP
+      int chain_head[kMaxBatch];
+      int chain_tail[kMaxBatch];
+      int num_chains = 0;
+      uint32_t seen_qps[kMaxBatch];
+
+      for (int k = 0; k < batch_count; k++) {
+        uint32_t qi = wr_qp[k];
+        wrs[k].next = nullptr;
+        int found = -1;
+        for (int c = 0; c < num_chains; c++) {
+          if (seen_qps[c] == qi) { found = c; break; }
+        }
+        if (found >= 0) {
+          wrs[chain_tail[found]].next = &wrs[k];
+          chain_tail[found] = k;
+        } else {
+          seen_qps[num_chains] = qi;
+          chain_head[num_chains] = k;
+          chain_tail[num_chains] = k;
+          num_chains++;
+        }
+      }
+
+      // Post each chain
+      for (int c = 0; c < num_chains; c++) {
+        uint32_t qi = seen_qps[c];
+        ProxyQpHandle& qph = qps_[qi];
+
+        ibv_send_wr* to_post = &wrs[chain_head[c]];
+        while (to_post) {
+          ibv_send_wr* bad = nullptr;
+          int ret = ibv_post_send(qph.qp, to_post, &bad);
+
+          if (ret == 0) {
+            ops_posted_++;
+            break;
+          }
+
+          if (ret == ENOMEM) {
+            // SQ full: drain CQEs and retry from the failed WR
+            to_post = bad ? bad : to_post;
+            for (int attempt = 0; attempt < 10000; attempt++) {
+              DrainCq(qph);
+              bad = nullptr;
+              ret = ibv_post_send(qph.qp, to_post, &bad);
+              if (ret == 0) break;
+              if (ret == ENOMEM) {
+                to_post = bad ? bad : to_post;
+              } else {
+                break;
+              }
+            }
+            if (ret == 0) {
+              ops_posted_++;
+              break;
+            }
+          }
+
+          // Fatal error: mark remaining WRs as error
+          ibv_send_wr* w = to_post;
+          while (w) {
+            uint32_t slot = static_cast<uint32_t>(w->wr_id) & PROXY_RING_MASK;
+            ring_->cmds[slot].status = PROXY_ERROR;
+            w = w->next;
+          }
+          break;
+        }
       }
     }
 
-    if (ops_posted_ > 0) {
-      for (auto& qph : qps_) {
-        if (qph.qp) DrainCq(qph);
-      }
+    // Drain all CQs
+    for (auto& qph : qps_) {
+      if (qph.qp) DrainCq(qph);
     }
-
   }
 }
 

@@ -131,7 +131,11 @@ struct GpuStates {
   uint64_t* internalSyncPtr{nullptr};         // Pointer to the internal synchronization object
 
   bool useProxy{false};
-  core::ProxyRing* proxyRing{nullptr};
+  core::ProxyRing* proxyRings[core::PROXY_MAX_NICS]{};
+  uint32_t proxyQuietHead[core::PROXY_MAX_NICS]{};
+  int numProxyRings{0};
+  int numNics{0};
+  int localGpuIdx{0};
 };
 
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
@@ -189,7 +193,7 @@ struct ShmemStates {
   MemoryStates* memoryStates{nullptr};
   ModuleStates moduleStates;  // JIT module state for this GPU
   GpuStates gpuStates;        // host-side copy of device GpuStates for this GPU
-  std::unique_ptr<core::ProxyThread> proxyThread;  // CPU proxy for IBGDA on ionic
+  std::vector<std::unique_ptr<core::ProxyThread>> proxyThreads;  // per-NIC CPU proxy threads
 
   // Asserts that ShmemInit has been called and the slot is currently usable.
   // Used by APIs that touch GPU state (allocation, barrier, module init)

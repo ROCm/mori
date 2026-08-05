@@ -597,31 +597,39 @@ void GpuStateInit(ShmemStates* states) {
   // Check if IBGDA proxy mode is requested
   const char* proxyEnv = std::getenv("MORI_USE_IBGDA_PROXY");
   if (proxyEnv && (std::string(proxyEnv) == "1" || std::string(proxyEnv) == "true")) {
-    // Use posix_memalign instead of hipHostMalloc to avoid GPU state corruption
-    // in multiprocessing.spawn child processes. The ring is CPU-side only;
-    // GPU accesses it through host-mapped pointers set up by hipHostRegister.
-    core::ProxyRing* ring = nullptr;
-    void* ringPtr = nullptr;
-    int allocErr = posix_memalign(&ringPtr, 4096, sizeof(core::ProxyRing));
-    hipError_t err = hipSuccess;
-    if (allocErr == 0 && ringPtr) {
-      ring = static_cast<core::ProxyRing*>(ringPtr);
-      hipError_t regErr = hipHostRegister(ring, sizeof(core::ProxyRing),
-                                          hipHostRegisterMapped | hipHostRegisterPortable);
-      if (regErr != hipSuccess) {
+    // Determine number of NICs for per-NIC ring allocation
+    int numNics = 1;
+    if (states->rdmaStates && states->rdmaStates->commContext) {
+      numNics = static_cast<int>(states->rdmaStates->commContext->GetAllRdmaDeviceContexts().size());
+      if (numNics < 1) numNics = 1;
+      if (numNics > core::PROXY_MAX_NICS) numNics = core::PROXY_MAX_NICS;
+    }
+
+    // Allocate one ProxyRing per NIC. Each ring has its own gpu_head so
+    // GPU warps targeting different NICs don't contend on the same atomic.
+    int allocated = 0;
+    for (int n = 0; n < numNics; n++) {
+      void* ringPtr = nullptr;
+      int allocErr = posix_memalign(&ringPtr, 4096, sizeof(core::ProxyRing));
+      if (allocErr == 0 && ringPtr) {
+        auto* ring = static_cast<core::ProxyRing*>(ringPtr);
+        hipError_t regErr = hipHostRegister(ring, sizeof(core::ProxyRing),
+                                            hipHostRegisterMapped | hipHostRegisterPortable);
+        if (regErr == hipSuccess) {
+          memset(ring, 0, sizeof(core::ProxyRing));
+          states->gpuStates.proxyRings[n] = ring;
+          allocated++;
+        } else {
+          free(ringPtr);
+        }
       }
-    } else {
-      err = hipErrorMemoryAllocation;
     }
-    if (err == hipSuccess && ring) {
-      memset(ring, 0, sizeof(core::ProxyRing));
-      states->gpuStates.proxyRing = ring;
-      MORI_SHMEM_INFO("Proxy ring allocated: {:p} ({} bytes, {} slots)",
-                      (void*)ring, sizeof(core::ProxyRing), core::PROXY_RING_SIZE);
-    } else {
-      MORI_SHMEM_ERROR("Failed to allocate proxy ring: posix_memalign returned {}", allocErr);
-    }
+    states->gpuStates.numProxyRings = allocated;
+    states->gpuStates.numNics = numNics;
+    states->gpuStates.localGpuIdx = states->gpuStates.rank % numNics;
     states->gpuStates.useProxy = true;
+    MORI_SHMEM_INFO("Proxy: {} rings allocated for {} NICs, localGpuIdx={}",
+                    allocated, numNics, states->gpuStates.localGpuIdx);
   }
 
   fprintf(stderr, "[MoRI] SHMEM init: proxy setup done, rank=%d\n", states->gpuStates.rank);
@@ -724,50 +732,48 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   MemoryStatesInit(states);
   GpuStateInit(states);
 
-  // Start proxy thread if proxy mode is enabled
-  if (states->gpuStates.useProxy && states->gpuStates.proxyRing) {
+  // Start per-NIC proxy threads if proxy mode is enabled
+  if (states->gpuStates.useProxy && states->gpuStates.numProxyRings > 0) {
     auto* ctx = states->rdmaStates->commContext;
     const auto& hostEndpoints = ctx->GetRdmaEndpoints();
-    const auto& allCtxs = ctx->GetAllRdmaDeviceContexts();
-    int numNics = static_cast<int>(allCtxs.size());
+    int numNics = states->gpuStates.numNics;
     int numQpPerPe = ctx->GetNumQpPerPe();
-
-    // Per-NIC lkeys were already registered in symmetric_memory.cpp during heap allocation.
-    // Just read them from the SymmMemManager.
     const auto& perNicLkeys = states->memoryStates->symmMemMgr->perNicLkeys;
-
-    // Build QP handles with per-NIC lkey and rkey overrides.
-    // QP for peer pe uses agreed rail = max(myLocalGpu, peerLocalGpu) so
-    // both sides of the connection are on the same NIC (rail isolation).
-    // Build QP handles indexed by epIndex so GPU kernel's qp_idx maps directly.
-    // Non-RDMA slots have null QP — proxy thread skips them.
     const auto& perNicRkeys = states->memoryStates->symmMemMgr->perNicPeerRkeys;
-    int myLocalGpu = states->gpuStates.rank % numNics;
-    std::vector<core::ProxyQpHandle> qps(hostEndpoints.size());
-    int qpCount = 0;
-    for (size_t i = 0; i < hostEndpoints.size(); i++) {
-      if (hostEndpoints[i].ibvHandle.qp != nullptr) {
-        int qpSlot = i % numQpPerPe;
-        int pe = i / numQpPerPe;
-        int peerLocalGpu = pe % numNics;
-        int nicIdx = (numNics > 1) ? (std::max(myLocalGpu, peerLocalGpu) % numNics) : 0;
-        uint32_t lkey = (nicIdx < (int)perNicLkeys.size()) ? perNicLkeys[nicIdx] : 0;
-        uint32_t rkey = 0;
-        if (nicIdx < (int)perNicRkeys.size() && pe < (int)perNicRkeys[nicIdx].size()) {
-          rkey = perNicRkeys[nicIdx][pe];
+    int myLocalGpu = states->gpuStates.localGpuIdx;
+    int gpuId = states->gpuStates.rank % numNics;
+
+    for (int n = 0; n < numNics; n++) {
+      if (!states->gpuStates.proxyRings[n]) continue;
+
+      // Build QP vector for this NIC only (full size, nulls for other NICs' QPs)
+      std::vector<core::ProxyQpHandle> nicQps(hostEndpoints.size());
+      int nicQpCount = 0;
+      for (size_t i = 0; i < hostEndpoints.size(); i++) {
+        if (hostEndpoints[i].ibvHandle.qp != nullptr) {
+          int pe = i / numQpPerPe;
+          int peerLocalGpu = pe % numNics;
+          int nicIdx = (numNics > 1) ? (std::max(myLocalGpu, peerLocalGpu) % numNics) : 0;
+          if (nicIdx != n) continue;
+          uint32_t lkey = (nicIdx < (int)perNicLkeys.size()) ? perNicLkeys[nicIdx] : 0;
+          uint32_t rkey = 0;
+          if (nicIdx < (int)perNicRkeys.size() && pe < (int)perNicRkeys[nicIdx].size()) {
+            rkey = perNicRkeys[nicIdx][pe];
+          }
+          nicQps[i] = {hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq, lkey, rkey,
+                       hostEndpoints[i].ibvHandle.recvBuf, hostEndpoints[i].ibvHandle.recvLkey,
+                       hostEndpoints[i].ibvHandle.recvCount};
+          nicQpCount++;
         }
-        qps[i] = {hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq, lkey, rkey,
-                  hostEndpoints[i].ibvHandle.recvBuf, hostEndpoints[i].ibvHandle.recvLkey,
-                  hostEndpoints[i].ibvHandle.recvCount};
-        qpCount++;
+      }
+      if (nicQpCount > 0) {
+        auto thread = std::make_unique<core::ProxyThread>();
+        thread->Init(states->gpuStates.proxyRings[n], std::move(nicQps), gpuId);
+        thread->Start();
+        states->proxyThreads.push_back(std::move(thread));
       }
     }
-    if (qpCount > 0) {
-      states->proxyThread = std::make_unique<core::ProxyThread>();
-      int gpuId = states->gpuStates.rank % numNics;
-      states->proxyThread->Init(states->gpuStates.proxyRing, std::move(qps), gpuId);
-      states->proxyThread->Start();
-    }
+    MORI_SHMEM_INFO("Proxy: {} threads started for {} NICs", states->proxyThreads.size(), numNics);
   }
 
   states->status = ShmemStatesStatus::Initialized;
@@ -784,15 +790,17 @@ bool ShmemIsInitialized() {
 /* ---------------------------------------------------------------------------------------------- */
 
 static void FinalizeGpuStates(ShmemStates* states) {
-  // Shutdown proxy thread before freeing GPU states
-  if (states->proxyThread) {
-    states->proxyThread->Shutdown();
-    states->proxyThread.reset();
+  // Shutdown all per-NIC proxy threads before freeing rings
+  for (auto& t : states->proxyThreads) {
+    if (t) t->Shutdown();
   }
-  if (states->gpuStates.proxyRing) {
-    hipHostUnregister(states->gpuStates.proxyRing);
-    free(states->gpuStates.proxyRing);
-    states->gpuStates.proxyRing = nullptr;
+  states->proxyThreads.clear();
+  for (int n = 0; n < core::PROXY_MAX_NICS; n++) {
+    if (states->gpuStates.proxyRings[n]) {
+      hipHostUnregister(states->gpuStates.proxyRings[n]);
+      free(states->gpuStates.proxyRings[n]);
+      states->gpuStates.proxyRings[n] = nullptr;
+    }
   }
 
   hipDeviceSynchronize();

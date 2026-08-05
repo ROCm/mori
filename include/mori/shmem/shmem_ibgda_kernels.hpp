@@ -31,6 +31,16 @@
 namespace mori {
 namespace shmem {
 
+#ifdef __HIPCC__
+inline __device__ volatile core::ProxyRing* ProxyRingForEp(
+    GpuStates* gs, uint32_t epIndex) {
+  int pe = epIndex / gs->numQpPerPe;
+  int peerLocal = pe % gs->numNics;
+  int nicIdx = (gs->localGpuIdx > peerLocal ? gs->localGpuIdx : peerLocal) % gs->numNics;
+  return gs->proxyRings[nicIdx];
+}
+#endif
+
 #ifdef MORI_DEVICE_NIC_BNXT
 #define DISPATCH_MLX5 0
 #define DISPATCH_BNXT 1
@@ -259,14 +269,16 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
 inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
 
-  // Proxy path: wait for all pending proxy ops to complete.
-  // Conservative: scans entire ring for any PENDING slots.
-  if (globalGpuStates->useProxy && globalGpuStates->proxyRing) {
-    uint32_t head = globalGpuStates->proxyRing->gpu_head;
-    if (head > core::PROXY_RING_SIZE) {
-      core::ProxyQuiet(globalGpuStates->proxyRing, head - core::PROXY_RING_SIZE, core::PROXY_RING_SIZE);
-    } else {
-      core::ProxyQuiet(globalGpuStates->proxyRing, 0, head);
+  // Proxy path: wait only for ops posted since the last quiet.
+  if (globalGpuStates->useProxy && globalGpuStates->numProxyRings > 0) {
+    for (int n = 0; n < globalGpuStates->numProxyRings; n++) {
+      volatile core::ProxyRing* ring = globalGpuStates->proxyRings[n];
+      if (!ring) continue;
+      uint32_t head = ring->gpu_head;
+      uint32_t lastQuiet = globalGpuStates->proxyQuietHead[n];
+      if (head == lastQuiet) continue;
+      core::ProxyQuiet(ring, lastQuiet, head - lastQuiet);
+      globalGpuStates->proxyQuietHead[n] = head;
     }
     return;
   }
@@ -561,9 +573,10 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     MORI_PRINTF("blockIdx.x=%d, threadIdx.x=%d, remaining=%zu, transfer_size=%zu\n", blockIdx.x,
                 threadIdx.x, remaining, transfer_size);
 
-    // Proxy path: bypass IBGDA, use CPU proxy thread for RDMA posting
-    if (globalGpuStates->useProxy && globalGpuStates->proxyRing) {
-      core::ProxyPostWrite(globalGpuStates->proxyRing, epIndex,
+    // Proxy path: bypass IBGDA, use per-NIC CPU proxy thread for RDMA posting
+    if (globalGpuStates->useProxy && globalGpuStates->numProxyRings > 0) {
+      volatile core::ProxyRing* ring = ProxyRingForEp(globalGpuStates, epIndex);
+      core::ProxyPostWrite(ring, epIndex,
                            srcAddr, lkey, raddr, rkey, transfer_size);
       remaining -= transfer_size;
       currentOffset += transfer_size;
@@ -751,9 +764,10 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
     rkey = dest->peerRkeys[pe];
   }
   // Proxy path for inline writes
-  if (globalGpuStates->useProxy && globalGpuStates->proxyRing) {
+  if (globalGpuStates->useProxy && globalGpuStates->numProxyRings > 0) {
     int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
-    core::ProxyPostWriteInline(globalGpuStates->proxyRing, epIndex,
+    volatile core::ProxyRing* ring = ProxyRingForEp(globalGpuStates, epIndex);
+    core::ProxyPostWriteInline(ring, epIndex,
                                reinterpret_cast<uint64_t>(val), 0, raddr, rkey, bytes);
     return;
   }
@@ -897,19 +911,20 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
 
-  // Proxy path: data write + signal as two proxy commands
-  if (globalGpuStates->useProxy && globalGpuStates->proxyRing) {
+  // Proxy path: data write + signal as two proxy commands on the same NIC ring
+  if (globalGpuStates->useProxy && globalGpuStates->numProxyRings > 0) {
     int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
+    volatile core::ProxyRing* ring = ProxyRingForEp(globalGpuStates, epIndex);
     uint32_t lkey = source->lkey;
     uintptr_t srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset;
     uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
     uint32_t rkey = dest->peerRkeys[pe];
-    core::ProxyPostWrite(globalGpuStates->proxyRing, epIndex,
+    core::ProxyPostWrite(ring, epIndex,
                          srcAddr, lkey, raddr, rkey, bytes);
     uintptr_t sigRaddr = signalDest->peerPtrs[pe] + signalDestOffset;
     uint32_t sigRkey = signalDest->peerRkeys[pe];
     core::IbufHandle& ibuf = globalGpuStates->rdmaEndpoints[epIndex].atomicIbuf;
-    core::ProxyPostSignalWrite(globalGpuStates->proxyRing, epIndex,
+    core::ProxyPostSignalWrite(ring, epIndex,
                                sigRaddr, sigRkey, signalValue,
                                ibuf.lkey, ibuf.addr);
     return;
@@ -1280,12 +1295,13 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   }
 
   // Proxy path for non-fetch atomic
-  if (globalGpuStates->useProxy && globalGpuStates->proxyRing) {
+  if (globalGpuStates->useProxy && globalGpuStates->numProxyRings > 0) {
     int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
+    volatile core::ProxyRing* ring = ProxyRingForEp(globalGpuStates, epIndex);
     core::IbufHandle& ibuf = globalGpuStates->rdmaEndpoints[epIndex].atomicIbuf;
     uint64_t atomicVal = 0;
     memcpy(&atomicVal, val, bytes <= 8 ? bytes : 8);
-    core::ProxyPostAtomicNonFetch(globalGpuStates->proxyRing, epIndex,
+    core::ProxyPostAtomicNonFetch(ring, epIndex,
                                   raddr, rkey, atomicVal, ibuf.lkey, ibuf.addr);
     return;
   }
@@ -1456,8 +1472,9 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
 
   // Proxy path for fetch atomic
-  if (globalGpuStates->useProxy && globalGpuStates->proxyRing) {
+  if (globalGpuStates->useProxy && globalGpuStates->numProxyRings > 0) {
     int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
+    volatile core::ProxyRing* ring = ProxyRingForEp(globalGpuStates, epIndex);
     core::IbufHandle& ibuf = globalGpuStates->rdmaEndpoints[epIndex].atomicIbuf;
     uintptr_t raddr;
     uint32_t rkey;
@@ -1471,7 +1488,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
     uint64_t atomicVal = 0;
     memcpy(&atomicVal, val, bytes <= 8 ? bytes : 8);
     uint64_t result = core::ProxyPostAtomicFetch(
-        globalGpuStates->proxyRing, epIndex,
+        ring, epIndex,
         raddr, rkey, atomicVal, ibuf.lkey, ibuf.addr);
     T retVal;
     memcpy(&retVal, &result, sizeof(T));
