@@ -34,32 +34,6 @@
     },
     {
       "dtype": "bf16",
-      "num_tokens": 1024,
-      "hidden_dim": 7168,
-      "block_num": 128,
-      "rdma_block_num": 85,
-      "warp_per_block": 16,
-      "bandwidth_gbps": 61.1,
-      "avg_rdma_bandwidth_gbps": 62.52,
-      "avg_xgmi_bandwidth_gbps": 209.16,
-      "avg_ll_bandwidth_gbps": 254.3,
-      "avg_latency_us": 468.96
-    },
-    {
-      "dtype": "bf16",
-      "num_tokens": 2048,
-      "hidden_dim": 7168,
-      "block_num": 256,
-      "rdma_block_num": 170,
-      "warp_per_block": 4,
-      "bandwidth_gbps": 67.53,
-      "avg_rdma_bandwidth_gbps": 69.49,
-      "avg_xgmi_bandwidth_gbps": 227.33,
-      "avg_ll_bandwidth_gbps": 283.32,
-      "avg_latency_us": 842.62
-    },
-    {
-      "dtype": "bf16",
       "num_tokens": 4096,
       "hidden_dim": 7168,
       "block_num": 256,

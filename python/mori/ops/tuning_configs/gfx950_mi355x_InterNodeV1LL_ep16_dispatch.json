@@ -34,19 +34,6 @@
     },
     {
       "dtype": "bf16",
-      "num_tokens": 1024,
-      "hidden_dim": 7168,
-      "block_num": 256,
-      "rdma_block_num": 170,
-      "warp_per_block": 16,
-      "bandwidth_gbps": 270.11,
-      "avg_rdma_bandwidth_gbps": 68.58,
-      "avg_xgmi_bandwidth_gbps": 223.46,
-      "avg_ll_bandwidth_gbps": 277.95,
-      "avg_latency_us": 428.45
-    },
-    {
-      "dtype": "bf16",
       "num_tokens": 2048,
       "hidden_dim": 7168,
       "block_num": 256,
