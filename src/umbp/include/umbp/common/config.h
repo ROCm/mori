@@ -85,6 +85,32 @@ struct UMBPSsdConfig {
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
 
+  // Worker threads for the CPU-bound phases *inside* one SSDTier: checksum
+  // verification on read, checksum + record assembly on write.  Matches the DRAM
+  // tier's read_threads_/write_threads_ default of 4, so a DRAM-vs-SSD
+  // comparison does not silently measure 4 threads against 1.
+  int tier_io_threads = 4;
+
+  // Bypass the page cache (O_DIRECT) for all segment I/O.
+  //
+  // The tier is itself a cache, so buffered I/O gives it a second, unmanaged
+  // DRAM cache underneath: reads are served from RAM at many times device
+  // bandwidth, the node reports DRAM it is actually consuming as free, and any
+  // measurement of drive behaviour is meaningless.  With this on, reported tier
+  // bandwidth is the device's.
+  //
+  // Requires a filesystem that supports O_DIRECT (ext4/xfs do; tmpfs and
+  // overlayfs do not) — the tier probes at startup and falls back to buffered
+  // with a warning rather than failing to come up.
+  bool direct_io = false;
+
+  // Compute checksums on write and verify them on read.  On by default; turning
+  // it off is for isolating how much of the SSD path's cost is integrity work
+  // rather than storage, since the DRAM tier does no checksumming at all.
+  // Records written with it off are marked kFlagNoCrc and stay readable either
+  // way, so the setting can differ between the writer and a later reader.
+  bool verify_crc = true;
+
   // Local SSD-tier capacity watermarks for the distributed PeerSsdManager's
   // local eviction.  When used/total crosses high_watermark the owner
   // peer evicts its oldest keys down to low_watermark.  Mirrors the DRAM tier's
@@ -139,6 +165,13 @@ struct UMBPSsdConfig {
     }
     if (segment_size_bytes == 0) {
       if (error_message) *error_message = "ssd.segment_size_bytes must be > 0";
+      return false;
+    }
+    // Records are padded to segment::kRecordAlign (4096), so a segment whose
+    // size is not a multiple of it would leave the append cursor unaligned at
+    // the roll-over and break direct I/O on the next segment.
+    if (segment_size_bytes % 4096 != 0) {
+      if (error_message) *error_message = "ssd.segment_size_bytes must be a multiple of 4096";
       return false;
     }
     // Watermarks must satisfy 0 < low < high <= 1.  Fail fast on a misconfigured
@@ -391,6 +424,9 @@ struct UMBPConfig {
     cfg.ssd.enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd.enabled ? 1 : 0) != 0;
     cfg.ssd.storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd.storage_dir);
     cfg.ssd.capacity_bytes = getenv_size("UMBP_SSD_CAPACITY", cfg.ssd.capacity_bytes);
+    cfg.ssd.tier_io_threads = getenv_int("UMBP_SSD_TIER_IO_THREADS", cfg.ssd.tier_io_threads);
+    cfg.ssd.direct_io = getenv_int("UMBP_SSD_DIRECT_IO", cfg.ssd.direct_io ? 1 : 0) != 0;
+    cfg.ssd.verify_crc = getenv_int("UMBP_SSD_VERIFY_CRC", cfg.ssd.verify_crc ? 1 : 0) != 0;
     cfg.eviction.policy = getenv_str("UMBP_EVICTION_POLICY", cfg.eviction.policy);
     cfg.dram.high_watermark = getenv_double("UMBP_DRAM_HIGH_WM", cfg.dram.high_watermark);
     cfg.dram.low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram.low_watermark);

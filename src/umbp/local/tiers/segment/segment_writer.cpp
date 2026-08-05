@@ -29,22 +29,26 @@ void Writer::Build(const std::string& key, const void* data, size_t size,
                    PreparedRecord* out) const {
   if (!out) return;
 
-  const size_t record_size = sizeof(RecordHeader) + key.size() + size;
-  out->crc32 = ComputeRecordCrc32(key, data, size);
+  out->crc_valid = compute_crc_;
+  out->crc32 = compute_crc_ ? ComputeRecordCrc32(key, data, size) : 0;
 
   RecordHeader hdr;
   hdr.magic = kRecordMagic;
   hdr.version = kRecordVersion;
-  hdr.flags = kFlagCommitted;
+  hdr.flags = kFlagCommitted | (compute_crc_ ? 0 : kFlagNoCrc);
   hdr.key_len = static_cast<uint32_t>(key.size());
   hdr.value_size = static_cast<uint32_t>(size);
   hdr.crc32 = out->crc32;
   hdr.generation = 0;  // stamped by Reserve, which allocates the generation
 
-  out->record.resize(record_size);
+  // v3 layout: [header|key|pad] [value|pad], both parts alignment multiples, so
+  // the value lands on an aligned offset and the next record starts aligned.
+  // Resize() zeroes the padding, so no heap contents reach the device.
+  const uint64_t prefix = PrefixBytes(key.size());
+  out->record.Resize(static_cast<size_t>(RecordBytes(key.size(), size)));
   std::memcpy(out->record.data(), &hdr, sizeof(hdr));
   std::memcpy(out->record.data() + sizeof(hdr), key.data(), key.size());
-  std::memcpy(out->record.data() + sizeof(hdr) + key.size(), data, size);
+  std::memcpy(out->record.data() + prefix, data, size);
 }
 
 bool Writer::Reserve(const std::string& key, size_t size, Meta* segment_meta, Index& index,
@@ -52,7 +56,8 @@ bool Writer::Reserve(const std::string& key, size_t size, Meta* segment_meta, In
   if (!segment_meta || !out) return false;
   if (out->record.size() < sizeof(RecordHeader)) return false;  // Build() not run
 
-  if (!index.PrepareWrite(key, size, key.size(), out->crc32, segment_meta, &out->reservation))
+  if (!index.PrepareWrite(key, size, key.size(), out->crc32, segment_meta, &out->reservation,
+                          out->crc_valid))
     return false;
 
   // Patch the one header field the reservation produces, in place, instead of
@@ -71,8 +76,11 @@ bool Writer::Prepare(const std::string& key, const void* data, size_t size, Meta
 }
 
 IoStatus Writer::WriteRecord(int fd, const PreparedRecord& pr, bool should_sync) const {
-  IoStatus status =
-      io_driver_.WriteAt(fd, pr.record.data(), pr.record.size(), pr.reservation.record_offset);
+  // padded_size(), not size(): under O_DIRECT the length must be an alignment
+  // multiple.  Build() already sized the record to one, so these agree — the
+  // explicit call documents the requirement and survives a future layout change.
+  IoStatus status = io_driver_.WriteAt(fd, pr.record.data(), pr.record.padded_size(),
+                                       pr.reservation.record_offset);
   if (!status.ok()) return status;
   if (should_sync) return io_driver_.Sync(fd);
   return IoStatus::Ok();
@@ -83,7 +91,7 @@ IoStatus Writer::WriteRecords(int fd, const std::vector<PreparedRecord>& records
   std::vector<IoWriteOp> ops;
   ops.reserve(records.size());
   for (const auto& pr : records) {
-    ops.push_back({fd, pr.record.data(), pr.record.size(), pr.reservation.record_offset});
+    ops.push_back({fd, pr.record.data(), pr.record.padded_size(), pr.reservation.record_offset});
   }
 
   IoStatus status = io_driver_.WriteBatch(ops);
