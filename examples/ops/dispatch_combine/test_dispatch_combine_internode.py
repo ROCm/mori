@@ -51,25 +51,21 @@ _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 _BW_NOISE_MARGIN = 1.0
 
 
-def _record_perf(category, params, metrics):
-    """Robustly emit a perf record.
+def _perf_report():
+    """Import the shared perf emitter module.
 
     This script is launched by torchrun as a file path (not ``-m``), so the
-    repo root is not guaranteed to be importable. Inject it before importing
-    the shared emitter, and never let reporting break the benchmark.
+    repo root is not guaranteed to be importable; inject it first.
     """
-    try:
-        import sys
-        from pathlib import Path
+    import sys
+    from pathlib import Path
 
-        repo_root = str(Path(__file__).resolve().parents[3])
-        if repo_root not in sys.path:
-            sys.path.insert(0, repo_root)
-        from tests.python.perf_report import record_perf
+    repo_root = str(Path(__file__).resolve().parents[3])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    import tests.python.perf_report as perf_report
 
-        record_perf(category, params, metrics)
-    except Exception as exc:  # pragma: no cover
-        print(f"[perf_report] internode emit failed: {exc}")
+    return perf_report
 
 
 def _emit_internode_perf(
@@ -87,45 +83,49 @@ def _emit_internode_perf(
 
     ``bench_stats`` is ``(disp_tuple, comb_tuple)`` where each tuple is
     ``(xgmi, rdma, ll, lat)`` and each of those is ``(worst, best, avg)``.
+
+    Reporting must never break the benchmark, so any failure is swallowed.
     """
-    disp, comb = bench_stats
+    try:
+        perf_report = _perf_report()
 
-    def _best_bw(triple):
-        return round(float(triple[1]), 2)
+        def _best_bw(triple):
+            return round(float(triple[1]), 2)
 
-    def _avg_lat(triple):
-        return round(float(triple[2]), 2)
+        def _avg_lat(triple):
+            return round(float(triple[2]), 2)
 
-    disp_xgmi, disp_rdma, disp_ll, disp_lat = disp
-    comb_xgmi, comb_rdma, comb_ll, comb_lat = comb
+        disp, comb = bench_stats
+        disp_xgmi, disp_rdma, disp_ll, disp_lat = disp
+        comb_xgmi, comb_rdma, comb_ll, comb_lat = comb
 
-    _record_perf(
-        category="internode_ep",
-        params={
-            "world_size": world_size,
-            "max_tokens": max_tokens,
-            "kernel_type": kernel_type,
-            "dtype": str(dtype).split(".")[-1],
-            "combine_dtype": (
-                str(combine_dtype).split(".")[-1]
-                if combine_dtype is not None
-                else str(dtype).split(".")[-1]
-            ),
-            "quant_type": quant_type,
-            "num_qp": num_qp,
-            "hidden_dim": hidden_dim,
-        },
-        metrics={
-            "dispatch_rdma_bw_gbps": _best_bw(disp_rdma),
-            "dispatch_xgmi_bw_gbps": _best_bw(disp_xgmi),
-            "dispatch_ll_bw_gbps": _best_bw(disp_ll),
-            "dispatch_lat_us": _avg_lat(disp_lat),
-            "combine_rdma_bw_gbps": _best_bw(comb_rdma),
-            "combine_xgmi_bw_gbps": _best_bw(comb_xgmi),
-            "combine_ll_bw_gbps": _best_bw(comb_ll),
-            "combine_lat_us": _avg_lat(comb_lat),
-        },
-    )
+        perf_report.record_perf(
+            category="internode_ep",
+            params={
+                "world_size": world_size,
+                "max_tokens": max_tokens,
+                "kernel_type": kernel_type,
+                "dtype": perf_report.dtype_label(dtype),
+                "combine_dtype": perf_report.dtype_label(
+                    dtype if combine_dtype is None else combine_dtype
+                ),
+                "quant_type": quant_type,
+                "num_qp": num_qp,
+                "hidden_dim": hidden_dim,
+            },
+            metrics={
+                "dispatch_rdma_bw_gbps": _best_bw(disp_rdma),
+                "dispatch_xgmi_bw_gbps": _best_bw(disp_xgmi),
+                "dispatch_ll_bw_gbps": _best_bw(disp_ll),
+                "dispatch_lat_us": _avg_lat(disp_lat),
+                "combine_rdma_bw_gbps": _best_bw(comb_rdma),
+                "combine_xgmi_bw_gbps": _best_bw(comb_xgmi),
+                "combine_ll_bw_gbps": _best_bw(comb_ll),
+                "combine_lat_us": _avg_lat(comb_lat),
+            },
+        )
+    except Exception as exc:  # pragma: no cover
+        print(f"[perf_report] internode emit failed: {exc}")
 
 
 def _is_fp4x2_dtype(dtype):

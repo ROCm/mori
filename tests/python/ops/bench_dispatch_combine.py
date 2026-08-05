@@ -30,7 +30,7 @@ from tests.python.ops.dispatch_combine_test_utils import (
     format_scale_stats_report,
 )
 from tests.python.utils import TorchDistContext, get_free_port
-from tests.python.perf_report import record_perf
+from tests.python.perf_report import dtype_label, record_perf
 import torch
 import torch.distributed as dist
 import os
@@ -38,10 +38,6 @@ import os
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
 _BW_NOISE_MARGIN = 1.0
-
-
-def _dtype_label(dtype):
-    return str(dtype).split(".")[-1]
 
 
 def _emit_intra_perf(
@@ -68,8 +64,8 @@ def _emit_intra_perf(
             "world_size": world_size,
             "max_tokens": max_num_inp_token_per_rank,
             "hidden_dim": hidden_dim,
-            "dtype": _dtype_label(data_type),
-            "combine_dtype": _dtype_label(combine_data_type),
+            "dtype": dtype_label(data_type),
+            "combine_dtype": dtype_label(combine_data_type),
             "quant_type": quant_type,
             "zero_copy": bool(zero_copy),
             "num_experts_per_rank": num_experts_per_rank,

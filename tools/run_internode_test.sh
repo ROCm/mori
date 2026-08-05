@@ -23,25 +23,19 @@ NUM_QP=2
 MAX_TOKENS=""
 QUANT_TYPE=""
 DTYPE=""
-BLOCK_NUM=""
-WARP_PER_BLOCK=""
-RDMA_BLOCK_NUM=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --rank)           RANK="$2";           shift 2 ;;
-    --master-addr)    MASTER_ADDR="$2";    shift 2 ;;
-    --master-port)    MASTER_PORT="$2";    shift 2 ;;
-    --ifname)         IFNAME="$2";         shift 2 ;;
-    --cmd)            CMD="$2";            shift 2 ;;
-    --kernel-type)    KERNEL_TYPE="$2";    shift 2 ;;
-    --num-qp)         NUM_QP="$2";         shift 2 ;;
-    --max-tokens)     MAX_TOKENS="$2";     shift 2 ;;
-    --quant-type)     QUANT_TYPE="$2";     shift 2 ;;
-    --dtype)          DTYPE="$2";          shift 2 ;;
-    --block-num)      BLOCK_NUM="$2";      shift 2 ;;
-    --warp-per-block) WARP_PER_BLOCK="$2"; shift 2 ;;
-    --rdma-block-num) RDMA_BLOCK_NUM="$2"; shift 2 ;;
+    --rank)         RANK="$2";         shift 2 ;;
+    --master-addr)  MASTER_ADDR="$2";  shift 2 ;;
+    --master-port)  MASTER_PORT="$2";  shift 2 ;;
+    --ifname)       IFNAME="$2";       shift 2 ;;
+    --cmd)          CMD="$2";          shift 2 ;;
+    --kernel-type)  KERNEL_TYPE="$2";  shift 2 ;;
+    --num-qp)       NUM_QP="$2";       shift 2 ;;
+    --max-tokens)   MAX_TOKENS="$2";   shift 2 ;;
+    --quant-type)   QUANT_TYPE="$2";   shift 2 ;;
+    --dtype)        DTYPE="$2";        shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -57,11 +51,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 EXTRA_ARGS=()
-[[ -n "$QUANT_TYPE" ]]      && EXTRA_ARGS+=(--quant-type "$QUANT_TYPE")
-[[ -n "$DTYPE" ]]          && EXTRA_ARGS+=(--dtype "$DTYPE")
-[[ -n "$BLOCK_NUM" ]]      && EXTRA_ARGS+=(--block-num "$BLOCK_NUM")
-[[ -n "$WARP_PER_BLOCK" ]] && EXTRA_ARGS+=(--warp-per-block "$WARP_PER_BLOCK")
-[[ -n "$RDMA_BLOCK_NUM" ]] && EXTRA_ARGS+=(--rdma-block-num "$RDMA_BLOCK_NUM")
+[[ -n "$QUANT_TYPE" ]] && EXTRA_ARGS+=(--quant-type "$QUANT_TYPE")
+[[ -n "$DTYPE" ]]       && EXTRA_ARGS+=(--dtype "$DTYPE")
 
 exec timeout "${MORI_INTERNODE_TIMEOUT:-120}" torchrun \
   --nnodes=2 \

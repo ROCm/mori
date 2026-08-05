@@ -47,8 +47,6 @@ import html
 import json
 import os
 
-CATEGORY_ORDER = ["intra_ep", "internode_ep", "io"]
-
 # Kernel display + sort order for the EP tables.
 _KERNEL_TYPE_LABEL = {"v0": "V0", "v1": "V1", "v1_ll": "V1-LL", "async_ll": "ASYNC-LL"}
 _KERNEL_TYPE_ORDER = {"v0": 3, "v1": 1, "v1_ll": 2, "async_ll": 4}

@@ -52,12 +52,12 @@ import json
 import os
 import time
 
-__all__ = ["perf_enabled", "record_perf"]
+__all__ = ["dtype_label", "record_perf"]
 
 
-def perf_enabled() -> bool:
-    """Return True when perf recording is enabled (``MORI_PERF_OUT`` is set)."""
-    return bool(os.environ.get("MORI_PERF_OUT"))
+def dtype_label(dtype) -> str:
+    """Short label for a torch dtype, e.g. ``torch.bfloat16`` -> ``bfloat16``."""
+    return str(dtype).split(".")[-1]
 
 
 def record_perf(category: str, params: dict, metrics: dict) -> None:
