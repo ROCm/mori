@@ -40,6 +40,7 @@
 #include "mori/io/engine.hpp"
 #include "src/io/rdma/common.hpp"
 #include "src/io/rdma/executor.hpp"
+#include "src/io/rdma/telemetry.hpp"
 
 namespace mori {
 namespace io {
@@ -68,7 +69,8 @@ EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
 /* ---------------------------------------------------------------------------------------------- */
 class RdmaManager {
  public:
-  RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* ctx);
+  RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* ctx,
+              TelemetryRegistry* telemetry = nullptr);
   ~RdmaManager();
 
   application::RdmaEndpointConfig GetRdmaEndpointConfig(int devId);
@@ -124,6 +126,7 @@ class RdmaManager {
   std::atomic<uint32_t> roundRobinCounter{0};
 
   std::unique_ptr<RdmaAsyncEventMonitor> asyncEventMonitor_;
+  TelemetryRegistry* telemetry_{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -131,7 +134,7 @@ class RdmaManager {
 /* ---------------------------------------------------------------------------------------------- */
 class NotifManager {
  public:
-  NotifManager(RdmaManager*, const RdmaBackendConfig&);
+  NotifManager(RdmaManager*, const RdmaBackendConfig&, TelemetryRegistry* telemetry = nullptr);
   ~NotifManager();
 
   void RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt);
@@ -204,6 +207,7 @@ class NotifManager {
   // Accessed only by the single NotifManager poll loop thread to rate-limit
   // repeated summaries for the same consecutive flush episode.
   uint64_t flushSummaryStreak_{0};
+  TelemetryRegistry* telemetry_{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -270,7 +274,8 @@ class RdmaBackendSession : public BackendSession {
   RdmaBackendSession(const RdmaBackendConfig& config,
                      std::vector<application::RdmaMemoryRegion> localMrPerEp,
                      std::vector<application::RdmaMemoryRegion> remoteMrPerEp, const EpPairVec& eps,
-                     Executor* executor, MemoryLocationType localLoc = MemoryLocationType::CPU);
+                     Executor* executor, MemoryLocationType localLoc = MemoryLocationType::CPU,
+                     TelemetryRegistry* telemetry = nullptr);
   ~RdmaBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -291,6 +296,7 @@ class RdmaBackendSession : public BackendSession {
   MemoryLocationType localLoc_{MemoryLocationType::CPU};
   std::shared_ptr<std::atomic<bool>> warnedChunkedWorkerFallback_{
       std::make_shared<std::atomic<bool>>(false)};
+  TelemetryRegistry* telemetry_{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -324,6 +330,7 @@ class RdmaBackend : public Backend {
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
+  TelemetrySnapshot GetTelemetrySnapshot() const override;
 
  private:
   void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);
@@ -382,6 +389,7 @@ class RdmaBackend : public Backend {
   std::mutex sessionCacheMu;
   std::mutex connBuildMapMu_;
   std::unordered_map<ConnBuildKey, std::shared_ptr<std::mutex>, ConnBuildKeyHash> connBuildMu_;
+  std::unique_ptr<TelemetryRegistry> telemetry_;
 };
 
 }  // namespace io

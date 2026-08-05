@@ -25,6 +25,7 @@
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <x86intrin.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -39,6 +40,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "src/io/rdma/telemetry.hpp"
 
 namespace mori {
 namespace io {
@@ -303,6 +305,9 @@ static bool TryReserveSqDepthSpin(const EpPair& ep, int wrCount, int epId, const
       MORI_IO_WARN(
           "SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us (backoff={})",
           opTag, epId, cur, wrCount, ep.maxSqDepth, kBackoffTimeoutUs, backoff);
+      if (MORI_IO_TELEM_UNLIKELY(ep.telem)) {
+        ep.telem->counters.sq_full_events.fetch_add(1, std::memory_order_relaxed);
+      }
       if (errMsg) {
         *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
                   " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
@@ -377,6 +382,9 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
       const int cur = ep.sqDepth->load(kSqAdmissionOrder);
       MORI_IO_WARN("SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us", opTag,
                    epId, cur, wrCount, ep.maxSqDepth, timeoutUs);
+      if (MORI_IO_TELEM_UNLIKELY(ep.telem)) {
+        ep.telem->counters.sq_full_events.fetch_add(1, std::memory_order_relaxed);
+      }
       if (errMsg) {
         *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
                   " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
@@ -654,6 +662,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   thread_local std::vector<ChunkedSgeSegment> tlChunkPlan;
   thread_local std::vector<int> tlEpWrsSinceSignal;
   thread_local std::vector<size_t> tlEpMergedSinceSignal;
+  thread_local std::vector<uint64_t> tlEpBytesSinceSignal;
   thread_local int reentryDepth = 0;
 
   struct ReentryGuard {
@@ -670,6 +679,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   std::vector<ChunkedSgeSegment> localChunkPlan;
   std::vector<int> localEpWrsSinceSignal;
   std::vector<size_t> localEpMergedSinceSignal;
+  std::vector<uint64_t> localEpBytesSinceSignal;
 
   std::vector<size_t>& indices = usePool ? tlIndices : localIndices;
   std::vector<MergedWorkRequest>& mergedPool = usePool ? tlMergedPool : localMergedPool;
@@ -678,6 +688,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   std::vector<int>& epWrsSinceSignal = usePool ? tlEpWrsSinceSignal : localEpWrsSinceSignal;
   std::vector<size_t>& epMergedSinceSignal =
       usePool ? tlEpMergedSinceSignal : localEpMergedSinceSignal;
+  std::vector<uint64_t>& epBytesSinceSignal =
+      usePool ? tlEpBytesSinceSignal : localEpBytesSinceSignal;
 
   // Bound peak retained memory: if an earlier very large batch grew the pools far
   // beyond the current need, release the excess so it doesn't stay resident.
@@ -881,8 +893,11 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   if (postBatchSize <= 0) postBatchSize = 1;
   int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
 
+  // Per-EP state for adaptive signaling: track WRs, merged requests, and bytes
+  // accumulated since the last signaled WR on each EP.
   epWrsSinceSignal.assign(epNum, 0);
   epMergedSinceSignal.assign(epNum, 0);
+  epBytesSinceSignal.assign(epNum, 0);
 
   // Rotate the starting EP by transfer id so single-segment (single WR)
   // transfers spread evenly across all QPs instead of always landing on eps[0].
@@ -905,6 +920,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     const auto& localMr = localMrPerEp[epId];
     const auto& remoteMr = remoteMrPerEp[epId];
     size_t mergedReqSize = 0;
+    uint64_t batchBytes = 0;
     for (int j = st; j < end; j++) {
       MergedWorkRequest& mergedWr = mergedWrs[j];
       for (auto& sge : mergedWr.sges) sge.lkey = localMr.lkey;
@@ -915,10 +931,12 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       wr.wr_id = 0;
       wr.next = (j + 1 < end) ? &mergedWrs[j + 1].wr : nullptr;
       mergedReqSize += mergedWr.mergedRequests;
+      batchBytes += mergedWr.totalRemoteLength;
     }
 
     epWrsSinceSignal[epId] += batchWrNum;
     epMergedSinceSignal[epId] += mergedReqSize;
+    epBytesSinceSignal[epId] += batchBytes;
 
     bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
     bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
@@ -933,7 +951,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                 "submission ledger is not initialized for signaled WR tracking"};
       }
       recordId = eps[epId].ledger->Insert(epWrsSinceSignal[epId], true, callbackMeta,
-                                          static_cast<int>(epMergedSinceSignal[epId]));
+                                          static_cast<int>(epMergedSinceSignal[epId]),
+                                          epBytesSinceSignal[epId]);
       last.wr_id = recordId;
       last.send_flags = IBV_SEND_SIGNALED;
     }
@@ -941,6 +960,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     struct ibv_send_wr* badWr = nullptr;
     int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
     if (ret != 0) {
+      if (MORI_IO_TELEM_UNLIKELY(eps[epId].telem)) {
+        eps[epId].telem->counters.post_send_errors.fetch_add(1, std::memory_order_relaxed);
+      }
+
       int postedCount = 0;
       if (badWr != nullptr) {
         struct ibv_send_wr* cur = &mergedWrs[st].wr;
@@ -956,13 +979,20 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         epWrsSinceSignal[epId] = std::max(0, epWrsSinceSignal[epId] - unpostedCount);
 
         size_t mergedUnposted = 0;
+        uint64_t bytesUnposted = 0;
         for (int j = st + postedCount; j < end; ++j) {
           mergedUnposted += mergedWrs[j].mergedRequests;
+          bytesUnposted += mergedWrs[j].totalRemoteLength;
         }
         if (epMergedSinceSignal[epId] >= mergedUnposted) {
           epMergedSinceSignal[epId] -= mergedUnposted;
         } else {
           epMergedSinceSignal[epId] = 0;
+        }
+        if (epBytesSinceSignal[epId] >= bytesUnposted) {
+          epBytesSinceSignal[epId] -= bytesUnposted;
+        } else {
+          epBytesSinceSignal[epId] = 0;
         }
       }
 
@@ -981,7 +1011,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
             postedCount, batchWrNum, epId);
         if (eps[epId].ledger) {
           eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
-                                           static_cast<int>(epMergedSinceSignal[epId]));
+                                           static_cast<int>(epMergedSinceSignal[epId]),
+                                           epBytesSinceSignal[epId]);
         }
         if (eps[epId].degraded) {
           eps[epId].degraded->store(true, kSqAdmissionOrder);
@@ -998,7 +1029,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
             epId, otherEpId, epWrsSinceSignal[otherEpId], epMergedSinceSignal[otherEpId]);
         if (eps[otherEpId].ledger) {
           eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
-                                                static_cast<int>(epMergedSinceSignal[otherEpId]));
+                                                static_cast<int>(epMergedSinceSignal[otherEpId]),
+                                                epBytesSinceSignal[otherEpId]);
         } else {
           MORI_IO_WARN(
               "EP {} has pending unsignaled WRs but no submission ledger; "
@@ -1019,9 +1051,34 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       return {StatusCode::ERR_RDMA_OP, std::move(message)};
     }
 
+    // ── Telemetry: successful ibv_post_send ──
+    if (MORI_IO_TELEM_UNLIKELY(callbackMeta->telem)) {
+      uint64_t now = __rdtsc();
+      uint64_t cur = callbackMeta->telem->first_post_tsc.load(std::memory_order_relaxed);
+      while (now < cur && !callbackMeta->telem->first_post_tsc.compare_exchange_weak(
+                              cur, now, std::memory_order_relaxed)) {
+      }
+    }
+
+    if (EpTelemetryState* telem = eps[epId].telem.get(); needSignal && telem) {
+      telem->counters.bytes_posted.fetch_add(epBytesSinceSignal[epId], std::memory_order_relaxed);
+      telem->counters.ops_posted.fetch_add(epMergedSinceSignal[epId], std::memory_order_relaxed);
+
+      eps[epId].ledger->RecordPostTimestamp(recordId, __rdtsc());
+
+      if (eps[epId].sqDepth) {
+        int depth = eps[epId].sqDepth->load(std::memory_order_relaxed);
+        int hwm = telem->counters.sq_depth_hwm.load(std::memory_order_relaxed);
+        while (depth > hwm && !telem->counters.sq_depth_hwm.compare_exchange_weak(
+                                  hwm, depth, std::memory_order_relaxed)) {
+        }
+      }
+    }
+
     if (needSignal) {
       epWrsSinceSignal[epId] = 0;
       epMergedSinceSignal[epId] = 0;
+      epBytesSinceSignal[epId] = 0;
     }
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
