@@ -66,11 +66,12 @@
 #include <dlfcn.h>
 
 #include <cstdint>
-#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
+
+#include "mori/utils/env_utils.hpp"
 
 namespace mori {
 namespace io {
@@ -84,13 +85,6 @@ using roctx_range_id_t = std::uint64_t;
 using roctx_range_start_t = roctx_range_id_t (*)(const char*);
 using roctx_range_stop_t = void (*)(roctx_range_id_t);
 
-inline bool GateOn(const char* name) {
-  const char* g = std::getenv(name);
-  if (g == nullptr) return false;
-  const char c = g[0];
-  return (c == '1' || c == 't' || c == 'T' || c == 'y' || c == 'Y' || c == 'o' || c == 'O');
-}
-
 struct RoctxApi {
   bool enabled = false;           // MORI_ROCTX: push/pop host-post anchors
   bool transfer_enabled = false;  // MORI_ROCTX_TRANSFER: post-to-completion ranges
@@ -101,8 +95,8 @@ struct RoctxApi {
   roctx_range_stop_t range_stop = nullptr;
 
   RoctxApi() {
-    const bool want_post = GateOn("MORI_ROCTX");
-    const bool want_transfer = GateOn("MORI_ROCTX_TRANSFER");
+    const bool want_post = mori::env::IsEnvVarEnabled("MORI_ROCTX");
+    const bool want_transfer = mori::env::IsEnvVarEnabled("MORI_ROCTX_TRANSFER");
     if (!want_post && !want_transfer) return;
     // sdk-roctx ONLY (the lib rocprofv3 --marker-trace intercepts).
     void* h = dlopen("librocprofiler-sdk-roctx.so", RTLD_NOW | RTLD_GLOBAL);
