@@ -34,14 +34,29 @@ namespace mori::umbp::segment {
 struct PreparedRecord {
   std::vector<char> record;
   WriteReservation reservation;
+  uint32_t crc32 = 0;  // set by Build, consumed by Reserve
 };
 
 class Writer {
  public:
   explicit Writer(StorageIoDriver& io_driver) : io_driver_(io_driver) {}
 
-  // Phase 1 (caller holds mu_): prepare record buffer and reserve index space.
-  // Returns false if capacity is exhausted.
+  // Phase 1a (NO lock held): checksum the record and assemble its on-disk bytes.
+  // Pure CPU over caller-owned memory — it touches no Index or Meta state, so it
+  // must run outside the tier mutex.  This is the expensive half (a CRC and a
+  // full copy of the value); keeping it under the lock would block every
+  // concurrent reader on the same drive for the duration of the batch.
+  // `generation` is left zero and stamped by Reserve.
+  void Build(const std::string& key, const void* data, size_t size, PreparedRecord* out) const;
+
+  // Phase 1b (caller holds mu_): reserve index/segment space for an already-built
+  // record and stamp the header field that depends on the reservation.  Cheap:
+  // no checksum, no payload copy.  Returns false if capacity is exhausted.
+  bool Reserve(const std::string& key, size_t size, Meta* segment_meta, Index& index,
+               PreparedRecord* out) const;
+
+  // Build + Reserve in one call, for callers already holding mu_.  Prefer the
+  // split form on any path where the lock is contended.
   bool Prepare(const std::string& key, const void* data, size_t size, Meta* segment_meta,
                Index& index, PreparedRecord* out) const;
 

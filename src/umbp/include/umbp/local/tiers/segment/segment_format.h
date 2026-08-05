@@ -28,7 +28,11 @@
 namespace mori::umbp::segment {
 
 constexpr uint32_t kRecordMagic = 0x554D4250;  // "UMBP"
-constexpr uint16_t kRecordVersion = 1;
+// v2 switched the record checksum from CRC-32/ISO-HDLC to CRC-32C so it can use
+// the SSE4.2 crc32 instruction. The checksum values differ, so v1 records must
+// not be verified with the v2 routine; the scanner drops them on version
+// mismatch and the segment is refilled.
+constexpr uint16_t kRecordVersion = 2;
 constexpr uint16_t kFlagCommitted = 1;
 
 struct RecordHeader {
@@ -43,6 +47,9 @@ struct RecordHeader {
 };
 static_assert(sizeof(RecordHeader) == 32, "unexpected padding in RecordHeader");
 
+// Streaming CRC-32C update; hardware-accelerated where SSE4.2 is available and
+// bit-identical on the portable fallback. Not complemented -- callers finish a
+// digest by inverting the returned value, as ComputeRecordCrc32 does.
 uint32_t CrcUpdate(const void* data, size_t size, uint32_t crc = 0xFFFFFFFFu);
 uint32_t ComputeRecordCrc32(const std::string& key, const void* value, size_t value_size);
 std::string BuildFileName(uint64_t segment_id);

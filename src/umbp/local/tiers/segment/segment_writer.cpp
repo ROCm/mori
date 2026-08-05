@@ -21,17 +21,16 @@
 // SOFTWARE.
 #include "umbp/local/tiers/segment/segment_writer.h"
 
+#include <cstddef>
+
 namespace mori::umbp::segment {
 
-bool Writer::Prepare(const std::string& key, const void* data, size_t size, Meta* segment_meta,
-                     Index& index, PreparedRecord* out) const {
-  if (!segment_meta || !out) return false;
+void Writer::Build(const std::string& key, const void* data, size_t size,
+                   PreparedRecord* out) const {
+  if (!out) return;
 
   const size_t record_size = sizeof(RecordHeader) + key.size() + size;
-  const uint32_t crc32 = ComputeRecordCrc32(key, data, size);
-
-  if (!index.PrepareWrite(key, size, key.size(), crc32, segment_meta, &out->reservation))
-    return false;
+  out->crc32 = ComputeRecordCrc32(key, data, size);
 
   RecordHeader hdr;
   hdr.magic = kRecordMagic;
@@ -39,14 +38,36 @@ bool Writer::Prepare(const std::string& key, const void* data, size_t size, Meta
   hdr.flags = kFlagCommitted;
   hdr.key_len = static_cast<uint32_t>(key.size());
   hdr.value_size = static_cast<uint32_t>(size);
-  hdr.crc32 = crc32;
-  hdr.generation = out->reservation.meta.generation;
+  hdr.crc32 = out->crc32;
+  hdr.generation = 0;  // stamped by Reserve, which allocates the generation
 
   out->record.resize(record_size);
   std::memcpy(out->record.data(), &hdr, sizeof(hdr));
   std::memcpy(out->record.data() + sizeof(hdr), key.data(), key.size());
   std::memcpy(out->record.data() + sizeof(hdr) + key.size(), data, size);
+}
+
+bool Writer::Reserve(const std::string& key, size_t size, Meta* segment_meta, Index& index,
+                     PreparedRecord* out) const {
+  if (!segment_meta || !out) return false;
+  if (out->record.size() < sizeof(RecordHeader)) return false;  // Build() not run
+
+  if (!index.PrepareWrite(key, size, key.size(), out->crc32, segment_meta, &out->reservation))
+    return false;
+
+  // Patch the one header field the reservation produces, in place, instead of
+  // rebuilding the whole record.
+  const uint64_t generation = out->reservation.meta.generation;
+  std::memcpy(out->record.data() + offsetof(RecordHeader, generation), &generation,
+              sizeof(generation));
   return true;
+}
+
+bool Writer::Prepare(const std::string& key, const void* data, size_t size, Meta* segment_meta,
+                     Index& index, PreparedRecord* out) const {
+  if (!segment_meta || !out) return false;
+  Build(key, data, size, out);
+  return Reserve(key, size, segment_meta, index, out);
 }
 
 IoStatus Writer::WriteRecord(int fd, const PreparedRecord& pr, bool should_sync) const {
