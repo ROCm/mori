@@ -30,6 +30,7 @@ from tests.python.ops.dispatch_combine_test_utils import (
     format_scale_stats_report,
 )
 from tests.python.utils import TorchDistContext, get_free_port
+from tests.python.perf_report import dtype_label, record_perf
 import torch
 import torch.distributed as dist
 import os
@@ -37,6 +38,46 @@ import os
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
 _BW_NOISE_MARGIN = 1.0
+
+
+def _emit_intra_perf(
+    bench_stats,
+    world_size,
+    max_num_inp_token_per_rank,
+    hidden_dim,
+    data_type,
+    combine_data_type,
+    quant_type,
+    zero_copy,
+    num_experts_per_rank,
+    num_experts_per_token,
+):
+    """Emit an intra-node EP dispatch/combine perf record (rank 0 only).
+
+    ``bench_stats`` is the tuple returned by ``EpDispatchCombineBenchmark.run``:
+    ``(max_disp_algo_bw, max_comb_algo_bw, min_disp_latency_us, min_comb_latency_us)``.
+    """
+    disp_bw, comb_bw, disp_lat, comb_lat = bench_stats
+    record_perf(
+        category="intra_ep",
+        params={
+            "world_size": world_size,
+            "max_tokens": max_num_inp_token_per_rank,
+            "hidden_dim": hidden_dim,
+            "dtype": dtype_label(data_type),
+            "combine_dtype": dtype_label(combine_data_type),
+            "quant_type": quant_type,
+            "zero_copy": bool(zero_copy),
+            "num_experts_per_rank": num_experts_per_rank,
+            "num_experts_per_token": num_experts_per_token,
+        },
+        metrics={
+            "dispatch_bw_gbps": round(float(disp_bw), 2),
+            "combine_bw_gbps": round(float(comb_bw), 2),
+            "dispatch_lat_us": round(float(disp_lat), 2),
+            "combine_lat_us": round(float(comb_lat), 2),
+        },
+    )
 
 
 class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
@@ -1021,7 +1062,7 @@ def _bench_dispatch_combine(
                     f"Benchmarking with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
                 )
                 print(f"{'=' * 60}")
-            benchmark.run(
+            bench_stats = benchmark.run(
                 op,
                 dispatch_block_num=dispatch_block_num,
                 dispatch_warp_per_block=dispatch_warp_per_block,
@@ -1033,6 +1074,19 @@ def _bench_dispatch_combine(
                     warmup=warmup, iters=iters, graph_replay_iters=graph_replay_iters
                 ),
             )
+            if rank == 0 and bench_stats is not None:
+                _emit_intra_perf(
+                    bench_stats,
+                    world_size=world_size,
+                    max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+                    hidden_dim=hidden_dim,
+                    data_type=data_type,
+                    combine_data_type=combine_data_type,
+                    quant_type=quant_type,
+                    zero_copy=zero_copy,
+                    num_experts_per_rank=num_experts_per_rank,
+                    num_experts_per_token=num_experts_per_token,
+                )
 
         elif cmd == "stress":
             # Stress test
