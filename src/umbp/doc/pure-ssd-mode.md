@@ -1,5 +1,9 @@
 # Pure-SSD mode and multi-drive SSD tiers
 
+> New to this? [pure-ssd-multi-drive-explained.md](pure-ssd-multi-drive-explained.md)
+> covers the same mechanisms — multi-drive sharding, same-key single-flight,
+> and CPU/thread contention — without assuming storage or RDMA background.
+
 Run a UMBP node with **no host-DRAM tier**, SSD carrying the whole cache, with
 one node's SSD tier spanning **several drives** at once.
 
@@ -56,14 +60,18 @@ export UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES=1
 
 Deliberately **not** in that list: `UMBP_SSD_TIMING=1`. It is a diagnostic, not a
 production setting — it prints several `[SsdPerf/*]` lines per batch, which on a
-busy node is a lot of log. Turn it on when investigating, off again after. See
-[Checking your fan-out](#checking-your-fan-out).
+busy node is a lot of log. Turn it on when investigating throughput, off again
+after; see [runtime-env-vars.md](runtime-env-vars.md) for what it reports.
 
 **Env var, on `umbp_master` — not the engine:**
 
 ```bash
 export UMBP_ROUTE_PUT_SELECT_ALGO=random   # see "Spreading writes"
 ```
+
+**Prerequisite, on every node before launching anything:** reserve hugepages —
+`sudo sysctl -w vm.nr_hugepages=350000` — or engine/worker startup fails with
+`RegisterRdmaMemoryRegionAuto failed ... errno:12 (Cannot allocate memory)`.
 
 ## Enabling the mode
 
@@ -132,68 +140,38 @@ far slower, and the tier warns about it.
 | `UMBP_SSD_SHARD_IO_THREADS` | `0` | Parallelism **across drives**. `0` = one per drive; leave it there unless CPU-bound. |
 | `UMBP_SSD_DURABILITY` | `strict` | With direct I/O on, strict costs ~1.4% instead of 42%. Little reason to relax it. |
 
-Measured on ext4/nvme1n1, 64 × 4 MiB, io_uring (MB/s):
-
-| Config | Write | ReadBatch | Device r/w (MiB) |
-|---|---|---|---|
-| buffered / crc-on / 4t | 1551 | 7503 | **0 / 0** |
-| direct / crc-on / 4t | 1954 | 5356 | 5633 / 6150 |
-| direct / crc-off / 4t | 2004 | 6002 | — |
-| direct / crc-on / 1t | 2063 | 3772 | — |
-
 **Confirm it is on**: run `iostat -x 1` during a read-heavy phase. Buffered shows
 ~1% device utilisation while reporting absurd bandwidth; direct shows the drives
 busy at something near their rating.
 
-## Checking your fan-out
+## Storage-only nodes (no engine, no GPU)
 
-`UMBP_SSD_TIMING=1` prints per-phase timing (`[SsdPerf/*]`: device read/write,
-CRC, RDMA, staging) — the first thing to reach for when throughput is low.
-`UMBP_LOCAL_COPY_TIMING=1` does the same for node-local traffic. Both are read
-**once at startup and cached**, so changing either needs a restart, and both are
-off unless explicitly set (`0`, `false` and `off` also count as off).
+To add SSD capacity to the pool from a node that isn't running an SGLang
+engine — a dedicated storage box, or extra drives on a node already busy with
+compute — join it as a bare `UMBPStore` client instead:
 
-Reading a `[SsdPerf/shard]` line: `overlap` is the one to watch — sum of
-per-drive time over wall time, so ~1.0 means the drives ran one after another
-and ~N means all N were busy at once. The per-drive `sN:keys/bytes/ms` fields
-next to it show whether one drive is dragging the batch.
+```bash
+python tests/python/umbp/umbp_store_node.py \
+  --hicache-storage-backend-extra-config \
+  '{"master_address": "<UMBP_MASTER>", "node_id": "ssd-node-1",
+    "node_address": "<NODE_IP>", "dram_capacity_bytes": 0,
+    "ssd_enabled": true, "ssd_storage_dir": "/mnt/nvme0,/mnt/nvme1",
+    "ssd_capacity_bytes": 1000000000000}'
+```
 
-### Same-key fan-out: single flight and the RDMA push
+It registers with `umbp_master`, heartbeats, and idles — same config surface
+(JSON `extra_config` or the matching `UMBP_*` env vars) as an engine's
+`UMBPStore`, just with `mem_pool_host=None`. Run it in the same
+image/container as the engine (needs sglang + mori importable). Ctrl-C /
+`SIGTERM` flushes and exits cleanly; there is no remote-clear signal wired up,
+so clearing one means restarting the process.
 
-MLA + TP makes every attention-TP rank ask for a byte-identical key, so one
-logical page is requested `tp_size` times at once. Single flight already
-collapses that to one device read (`[SsdPerf/peer] GET`'s `dup` / `merged` /
-`max_concurrent`), with the leader serving the rest. What that leader *does* for
-the followers is the second-order cost, and the same log line reports both
-mechanisms:
-
-* `fanout_ms` / `fanout_bytes` / `fanout_count` — the classic path: one
-  single-threaded `memcpy` per follower into that follower's private staging
-  slot, which it then pulls over RDMA. On a measured Kimi-K2 L3 reload this was
-  68% of leader time, twice the device read itself.
-* `pushed` / `push_bytes` — the fast path: the leader RDMA-WRITEs straight into
-  the follower's own destination buffer, so no copy, no staging slot, and no
-  pull. `push_total` / `push_failed_total` are the process-wide running counts
-  (also exported as `ssd_read_total{status="pushed"|"push_failed"}`).
-
-On the reader side `[SsdPerf/remote] GET` reports the same split as
-`staged=` (pulled) vs `pushed=`.
-
-**`pushed` flatlining at 0 under a same-key workload means the fast path is
-silently falling back**, not that there is no fan-out. It is opt-in and degrades
-to the classic path whenever it cannot resolve a destination — check the peer's
-log for `push registration ... expired` or `push target out of bounds`, and see
-`UMBP_PUSH_TARGET_TTL_MS` in [runtime-env-vars.md](runtime-env-vars.md). The
-fallback is always correct; it just costs the copy back.
-
-There is also per-node/tier placement accounting behind `UMBP_PUT_DIST_LOG` /
-`UMBP_GET_DIST_LOG`, which answers "are writes actually spreading?" directly.
-Its log lines are **commented out in the source** — one line per batch is too
-chatty to ship — so using it means uncommenting the `MORI_UMBP_INFO` in
-`LogBatchPutDistribution` / `LogBatchGetDistribution` /
-`ConfigurableRoutePutStrategy::LogBatchDistribution` and rebuilding. The number
-to watch is `cumulative_max_share`: `100/N%` over N targets is a perfect spread,
-100% means everything landed on one node.
+If you want compute nodes to contribute *no* cache capacity of their own —
+all SSD capacity coming from dedicated storage nodes instead — set the
+engine's own `ssd_capacity_bytes` to something unusably tiny (e.g. `1048576`,
+1 MB) rather than disabling its SSD tier: `ssd_enabled: true` is still needed
+for HiCache's L3 path to initialize, but `random` routing skips any node that
+"cannot fit a block," so a 1 MB node is never chosen as a put target.
 
 ## Troubleshooting
 
@@ -208,6 +186,9 @@ to watch is `cumulative_max_share`: `100/N%` over N targets is a perfect spread,
 | Tier fills far earlier than expected | Capacity is charged in padded bytes — small values pay up to 16× |
 | Startup rejects `dram_capacity_bytes: 0` | No SSD tier configured, so no tier could accept a put |
 | A config key seems to do nothing | `extra_config` is an allow-list; unknown or wrong-mode keys are ignored with a warning. Grep the engine log for `UMBPStore:` |
+| Reads keep missing after killing/relaunching a node several times | Master registry doesn't expire dead clients — stale entries stay capacity-weighted and `random` can still pick them. Restart `umbp_master` along with every engine/worker whenever node topology (count, capacity, drives) changes |
+| Near-100% misses (`NO_SLOT`/lease-expired in the log) right after adding capacity per node | Staging slots didn't scale with the new concurrent load. `ssd_staging_buffer_slots`/`ssd_write_staging_slots` need to grow with how many concurrent callers can hit one node, not just with data volume |
+| Resend right after a write misses instead of hitting | Write-through acks drain asynchronously; a flush/resend that lands before the SSD write actually completes evicts the key with no L3 trace. Give it a moment (scales with value size) before flushing/resending |
 
 ## Notes
 

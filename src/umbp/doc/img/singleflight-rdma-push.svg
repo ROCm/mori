@@ -1,0 +1,101 @@
+<svg viewBox="0 0 1160 560" xmlns="http://www.w3.org/2000/svg" role="img"
+  aria-label="Four ranks asking for the same key: without coordination each hits the drive separately. With single-flight, only the first request reads the drive; the rest wait and are then served either by a slow serial CPU copy or, on the fast path, in parallel over RDMA with no CPU copy at all.">
+  <title>Single-flight de-dup and the RDMA push fast path</title>
+  <defs>
+    <pattern id="grid02" width="20" height="20" patternUnits="userSpaceOnUse">
+      <path d="M20 0H0V20" fill="none" stroke="#c3d0ce" stroke-width="1"/>
+    </pattern>
+    <marker id="arrBrick02" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#a8402f"/>
+    </marker>
+    <marker id="arrBlue02" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#2569a6"/>
+    </marker>
+    <marker id="dot02" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <circle cx="5" cy="5" r="4" fill="#55696c"/>
+    </marker>
+  </defs>
+  <rect width="1160" height="560" fill="#e8edec"/>
+  <rect width="1160" height="560" fill="url(#grid02)" opacity="0.5"/>
+  <rect x="0.5" y="0.5" width="1159" height="559" fill="none" stroke="#16232a" stroke-opacity="0.25"/>
+
+  <text x="40" y="36" font-family="ui-monospace,Consolas,monospace" font-size="12.5" font-weight="700" letter-spacing="1" fill="#a8402f">BEFORE — NO COORDINATION</text>
+
+  <g font-family="ui-monospace,Consolas,monospace" font-size="12" fill="#16232a">
+    <rect x="60" y="54" width="110" height="36" rx="5" fill="#dfe6e4" stroke="#16232a"/>
+    <text x="115" y="76" text-anchor="middle">R0</text>
+    <rect x="60" y="104" width="110" height="36" rx="5" fill="#dfe6e4" stroke="#16232a"/>
+    <text x="115" y="126" text-anchor="middle">R1</text>
+    <rect x="60" y="154" width="110" height="36" rx="5" fill="#dfe6e4" stroke="#16232a"/>
+    <text x="115" y="176" text-anchor="middle">R2</text>
+    <rect x="60" y="204" width="110" height="36" rx="5" fill="#dfe6e4" stroke="#16232a"/>
+    <text x="115" y="226" text-anchor="middle">R3</text>
+  </g>
+
+  <line x1="170" y1="72" x2="560" y2="140" stroke="#a8402f" stroke-width="1.5" marker-end="url(#arrBrick02)"/>
+  <line x1="170" y1="122" x2="560" y2="145" stroke="#a8402f" stroke-width="1.5" marker-end="url(#arrBrick02)"/>
+  <line x1="170" y1="172" x2="560" y2="150" stroke="#a8402f" stroke-width="1.5" marker-end="url(#arrBrick02)"/>
+  <line x1="170" y1="222" x2="560" y2="155" stroke="#a8402f" stroke-width="1.5" marker-end="url(#arrBrick02)"/>
+  <text x="330" y="90" font-family="ui-monospace,Consolas,monospace" font-size="11" font-style="italic" fill="#a8402f">4 separate device reads</text>
+
+  <rect x="560" y="90" width="140" height="110" rx="8" fill="#dfe6e4" stroke="#a8402f" stroke-width="2.25"/>
+  <text x="630" y="150" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="13" font-weight="700" fill="#16232a">SSD</text>
+  <path d="M672 108 L690 96 M680 112 L700 104 M676 122 L698 118" stroke="#a8402f" stroke-width="1.5"/>
+  <text x="630" y="222" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="12.5" font-weight="700" fill="#a8402f">×4 READS</text>
+
+  <line x1="40" y1="254" x2="1120" y2="254" stroke="#55696c" stroke-dasharray="4 4"/>
+
+  <text x="40" y="288" font-family="ui-monospace,Consolas,monospace" font-size="12.5" font-weight="700" letter-spacing="1" fill="#2569a6">AFTER — SINGLE FLIGHT</text>
+
+  <g font-family="ui-monospace,Consolas,monospace" font-size="11.5" fill="#16232a">
+    <rect x="60" y="306" width="130" height="40" rx="5" fill="#dfe6e4" stroke="#2569a6" stroke-width="2"/>
+    <text x="125" y="330" text-anchor="middle">R0 — LEADER</text>
+    <rect x="60" y="366" width="130" height="36" rx="5" fill="#dfe6e4" stroke="#16232a"/>
+    <text x="125" y="388" text-anchor="middle">R1 — WAIT</text>
+    <rect x="60" y="416" width="130" height="36" rx="5" fill="#dfe6e4" stroke="#16232a"/>
+    <text x="125" y="438" text-anchor="middle">R2 — WAIT</text>
+    <rect x="60" y="466" width="130" height="36" rx="5" fill="#dfe6e4" stroke="#16232a"/>
+    <text x="125" y="488" text-anchor="middle">R3 — WAIT</text>
+  </g>
+
+  <path d="M60 384 C20 384 20 326 58 326" fill="none" stroke="#55696c" stroke-width="1.25" stroke-dasharray="2 4" marker-end="url(#dot02)"/>
+  <path d="M60 434 C10 434 10 326 58 326" fill="none" stroke="#55696c" stroke-width="1.25" stroke-dasharray="2 4" marker-end="url(#dot02)"/>
+  <path d="M60 484 C0 484 0 326 58 326" fill="none" stroke="#55696c" stroke-width="1.25" stroke-dasharray="2 4" marker-end="url(#dot02)"/>
+  <text x="30" y="308" font-family="ui-monospace,Consolas,monospace" font-size="10" fill="#55696c">register + wait</text>
+
+  <line x1="190" y1="326" x2="560" y2="355" stroke="#2569a6" stroke-width="2.25" marker-end="url(#arrBlue02)"/>
+  <text x="330" y="342" font-family="ui-monospace,Consolas,monospace" font-size="11" fill="#2569a6">1 device read</text>
+
+  <rect x="560" y="300" width="140" height="110" rx="8" fill="#dfe6e4" stroke="#16232a" stroke-width="1.5"/>
+  <text x="630" y="360" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="13" font-weight="700" fill="#16232a">SSD</text>
+  <text x="630" y="432" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="12.5" font-weight="700" fill="#2569a6">1 READ</text>
+
+  <text x="760" y="290" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700" fill="#a8402f">MEMCPY — SERIAL</text>
+  <circle cx="762" cy="330" r="4" fill="#16232a"/>
+  <rect x="825" y="316" width="70" height="30" rx="5" fill="#dfe6e4" stroke="#a8402f" stroke-width="1.5"/>
+  <text x="860" y="336" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="10.5" fill="#16232a">1 CORE</text>
+  <line x1="762" y1="330" x2="823" y2="331" stroke="#a8402f" stroke-width="1.5" marker-end="url(#arrBrick02)"/>
+  <line x1="895" y1="322" x2="1000" y2="300" stroke="#a8402f" stroke-width="1.5" marker-end="url(#arrBrick02)"/>
+  <line x1="895" y1="331" x2="1000" y2="340" stroke="#a8402f" stroke-width="1.5" marker-end="url(#arrBrick02)"/>
+  <line x1="895" y1="340" x2="1000" y2="380" stroke="#a8402f" stroke-width="1.5" marker-end="url(#arrBrick02)"/>
+  <text x="1005" y="303" font-family="ui-monospace,Consolas,monospace" font-size="10.5" fill="#16232a">① → R1</text>
+  <text x="1005" y="343" font-family="ui-monospace,Consolas,monospace" font-size="10.5" fill="#16232a">② → R2</text>
+  <text x="1005" y="383" font-family="ui-monospace,Consolas,monospace" font-size="10.5" fill="#16232a">③ → R3</text>
+  <text x="825" y="405" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700" fill="#a8402f">Σ ≈ 68% of leader's time</text>
+
+  <text x="760" y="440" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700" fill="#2569a6">RDMA WRITE — PARALLEL</text>
+  <circle cx="762" cy="475" r="4" fill="#16232a"/>
+  <rect x="825" y="461" width="70" height="30" rx="5" fill="#dfe6e4" stroke="#2569a6" stroke-width="1.5"/>
+  <text x="860" y="481" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="10.5" fill="#16232a">NIC</text>
+  <line x1="762" y1="475" x2="823" y2="476" stroke="#2569a6" stroke-width="1.5" marker-end="url(#arrBlue02)"/>
+  <line x1="895" y1="467" x2="1000" y2="445" stroke="#2569a6" stroke-width="1.5" marker-end="url(#arrBlue02)"/>
+  <line x1="895" y1="476" x2="1000" y2="476" stroke="#2569a6" stroke-width="1.5" marker-end="url(#arrBlue02)"/>
+  <line x1="895" y1="485" x2="1000" y2="507" stroke="#2569a6" stroke-width="1.5" marker-end="url(#arrBlue02)"/>
+  <text x="1005" y="448" font-family="ui-monospace,Consolas,monospace" font-size="10.5" fill="#16232a">→ R1</text>
+  <text x="1005" y="480" font-family="ui-monospace,Consolas,monospace" font-size="10.5" fill="#16232a">→ R2</text>
+  <text x="1005" y="510" font-family="ui-monospace,Consolas,monospace" font-size="10.5" fill="#16232a">→ R3</text>
+  <text x="825" y="530" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700" fill="#2569a6">0 CPU copies — all at once</text>
+
+  <text x="1120" y="538" text-anchor="end" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700" fill="#16232a">02 — SINGLE-FLIGHT + RDMA PUSH</text>
+  <text x="1120" y="554" text-anchor="end" font-family="ui-monospace,Consolas,monospace" font-size="10.5" fill="#55696c">peer_ssd_manager.cpp · PrepareReadBatch, PushFanout</text>
+</svg>

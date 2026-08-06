@@ -1,0 +1,51 @@
+<svg viewBox="0 0 1160 380" xmlns="http://www.w3.org/2000/svg" role="img"
+  aria-label="One GET request flows from GPU ranks through single-flight merging, parallel sharded drives, parallel checksum workers, and RDMA push fan-out, back to every rank's own buffer.">
+  <title>How the three mechanisms combine on one read</title>
+  <defs>
+    <pattern id="grid04" width="20" height="20" patternUnits="userSpaceOnUse">
+      <path d="M20 0H0V20" fill="none" stroke="#c3d0ce" stroke-width="1"/>
+    </pattern>
+    <marker id="arrInk04" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#16232a"/>
+    </marker>
+  </defs>
+  <rect width="1160" height="380" fill="#e8edec"/>
+  <rect width="1160" height="380" fill="url(#grid04)" opacity="0.5"/>
+  <rect x="0.5" y="0.5" width="1159" height="379" fill="none" stroke="#16232a" stroke-opacity="0.25"/>
+
+  <g font-family="ui-monospace,Consolas,monospace" fill="#16232a">
+    <rect x="115" y="140" width="150" height="90" rx="8" fill="#dfe6e4" stroke="#16232a" stroke-width="1.5"/>
+    <text x="190" y="180" text-anchor="middle" font-size="12.5" font-weight="700">GPU RANKS</text>
+    <text x="190" y="198" text-anchor="middle" font-size="10.5" fill="#55696c">(0..N)</text>
+
+    <rect x="310" y="140" width="150" height="90" rx="8" fill="#dfe6e4" stroke="#2569a6" stroke-width="2"/>
+    <text x="385" y="176" text-anchor="middle" font-size="12" font-weight="700">SINGLE-FLIGHT</text>
+    <text x="385" y="192" text-anchor="middle" font-size="12" font-weight="700">MERGE</text>
+    <text x="385" y="210" text-anchor="middle" font-size="10.5" fill="#2569a6">see 02</text>
+
+    <rect x="505" y="140" width="150" height="90" rx="8" fill="#dfe6e4" stroke="#cc7a1f" stroke-width="2"/>
+    <text x="580" y="176" text-anchor="middle" font-size="12" font-weight="700">SHARDED DRIVES</text>
+    <text x="580" y="192" text-anchor="middle" font-size="10.5" fill="#55696c">parallel</text>
+    <text x="580" y="210" text-anchor="middle" font-size="10.5" fill="#cc7a1f">see 01</text>
+
+    <rect x="700" y="140" width="150" height="90" rx="8" fill="#dfe6e4" stroke="#2569a6" stroke-width="2"/>
+    <text x="775" y="176" text-anchor="middle" font-size="12" font-weight="700">CHECKSUM</text>
+    <text x="775" y="192" text-anchor="middle" font-size="12" font-weight="700">WORKERS</text>
+    <text x="775" y="210" text-anchor="middle" font-size="10.5" fill="#2569a6">parallel — see 03</text>
+
+    <rect x="895" y="140" width="150" height="90" rx="8" fill="#dfe6e4" stroke="#2569a6" stroke-width="2"/>
+    <text x="970" y="176" text-anchor="middle" font-size="12" font-weight="700">RDMA PUSH</text>
+    <text x="970" y="192" text-anchor="middle" font-size="12" font-weight="700">FAN-OUT</text>
+    <text x="970" y="210" text-anchor="middle" font-size="10.5" fill="#2569a6">see 02</text>
+  </g>
+
+  <line x1="265" y1="185" x2="305" y2="185" stroke="#16232a" stroke-width="1.75" marker-end="url(#arrInk04)"/>
+  <line x1="460" y1="185" x2="500" y2="185" stroke="#16232a" stroke-width="1.75" marker-end="url(#arrInk04)"/>
+  <line x1="655" y1="185" x2="695" y2="185" stroke="#16232a" stroke-width="1.75" marker-end="url(#arrInk04)"/>
+  <line x1="850" y1="185" x2="890" y2="185" stroke="#16232a" stroke-width="1.75" marker-end="url(#arrInk04)"/>
+
+  <path d="M970 232 C970 300 190 300 190 232" fill="none" stroke="#55696c" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#arrInk04)"/>
+  <text x="580" y="322" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="11.5" fill="#55696c">every rank's own buffer filled</text>
+
+  <text x="1120" y="352" text-anchor="end" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700" fill="#16232a">04 — END-TO-END READ PATH</text>
+</svg>

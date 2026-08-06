@@ -1,0 +1,184 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 812 512" width="812" height="512" role="img" aria-label="UMBP architecture block diagram">
+  <title>UMBP Architecture — block diagram</title>
+  <desc>Peers hold the KV data in DRAM/HBM and SSD and report it by heartbeat. Stateless master replicas expose a peer-facing API, a router and eviction over one metadata interface. All metadata lives in an external Redis / Dragonfly / Valkey store shared by every replica.</desc>
+
+  <style>
+    text  { font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; fill: #1d2530; }
+
+    .h1   { font-size: 16px; font-weight: 700; }
+    .card { font-size: 13px; font-weight: 700; }
+    .name { font-size: 11px; font-weight: 700; }
+    .sub  { font-size: 8.5px; }
+    .box  { stroke-width: 1.2; }
+
+    .bg     { fill: #ffffff; }
+    .dim    { fill: #667383; }
+    .m-card { fill: #f6f8fc; stroke: #8ba6c6; stroke-width: 1.6; }
+    .m-ghost{ fill: #f6f8fc; stroke: #8ba6c6; stroke-width: 1.2; opacity: .55; }
+    .p-card { fill: #f4faf6; stroke: #86b39d; stroke-width: 1.6; }
+    .s-card { fill: #f7f4fd; stroke: #a692cf; stroke-width: 1.6; }
+    .m-head { fill: #2b4f78; }
+    .p-head { fill: #1f5f4a; }
+    .s-head { fill: #4c3a7a; }
+
+    .b { fill: #eaf1f9; stroke: #b9cfe4; }  .b-t { fill: #244d76; }
+    .g { fill: #e9f4ee; stroke: #b0d7c5; }  .g-t { fill: #1c5b46; }
+    .a { fill: #fdf4e5; stroke: #e2c895; }  .a-t { fill: #7a5314; }
+    .r { fill: #fdeeee; stroke: #e6b8b8; }  .r-t { fill: #8a3535; }
+    .v { fill: #eee9fa; stroke: #c6b9e6; }  .v-t { fill: #4c3a7a; }
+    .n { fill: #f1f3f6; stroke: #d3d9e0; }
+    .i { fill: #f1f3f6; stroke: #97a3b0; stroke-dasharray: 5 3; }
+
+    .edge { stroke: #5f6b78; stroke-width: 1.3; fill: none; }
+    .mk   { fill: #5f6b78; }
+    .elbl { font-size: 9px; font-weight: 700; fill: #5f6b78; }
+
+    @media (prefers-color-scheme: dark) {
+      text     { fill: #d7dee6; }
+      .bg      { fill: #0f1319; }
+      .dim     { fill: #93a0ad; }
+      .m-card  { fill: #131a23; stroke: #2f4258; }
+      .m-ghost { fill: #131a23; stroke: #2f4258; }
+      .p-card  { fill: #111c18; stroke: #2d4c40; }
+      .s-card  { fill: #171321; stroke: #453a68; }
+      .m-head  { fill: #8ab6e2; }
+      .p-head  { fill: #7ed0af; }
+      .s-head  { fill: #b6a2e2; }
+
+      .b { fill: #17222e; stroke: #2f4459; }  .b-t { fill: #93bde6; }
+      .g { fill: #152420; stroke: #2c4c40; }  .g-t { fill: #82ceac; }
+      .a { fill: #2a2115; stroke: #574326; }  .a-t { fill: #dcae64; }
+      .r { fill: #2a1719; stroke: #5a2f33; }  .r-t { fill: #e39093; }
+      .v { fill: #211a30; stroke: #45385f; }  .v-t { fill: #b6a2e2; }
+      .n { fill: #161b22; stroke: #2a323c; }
+      .i { fill: #161b22; stroke: #55606c; }
+
+      .edge { stroke: #8d9aa8; }
+      .mk   { fill: #8d9aa8; }
+      .elbl { fill: #a8b4c0; }
+    }
+  </style>
+
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path class="mk" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="812" height="512"/>
+
+  <text class="h1" x="24" y="30">UMBP Architecture</text>
+  <text class="sub dim" x="24" y="49">peers hold the data · masters are stateless API replicas · all metadata lives in one external store</text>
+
+  <rect class="box g" x="430" y="20" width="11" height="11" rx="2"/>
+  <text class="sub dim" x="447" y="29">DRAM / HBM</text>
+  <rect class="box a" x="526" y="20" width="11" height="11" rx="2"/>
+  <text class="sub dim" x="543" y="29">SSD</text>
+
+  <!-- ─────────── Peer A ─────────── -->
+  <rect class="p-card" x="24" y="76" width="210" height="184" rx="9"/>
+  <text class="card p-head" x="129" y="99" text-anchor="middle">Peer A</text>
+  <rect class="box g" x="38" y="108" width="182" height="30" rx="5"/>
+  <text class="name g-t" x="129" y="121" text-anchor="middle">DRAM / HBM</text>
+  <text class="sub dim" x="129" y="132" text-anchor="middle">holds the KV pages</text>
+  <rect class="box a" x="38" y="144" width="182" height="30" rx="5"/>
+  <text class="name a-t" x="129" y="157" text-anchor="middle">SSD</text>
+  <text class="sub dim" x="129" y="168" text-anchor="middle">cold copies</text>
+  <rect class="box n" x="38" y="180" width="182" height="30" rx="5"/>
+  <text class="name" x="129" y="193" text-anchor="middle">peer service</text>
+  <text class="sub dim" x="129" y="204" text-anchor="middle">serves reads &amp; writes</text>
+  <rect class="box n" x="38" y="216" width="182" height="30" rx="5"/>
+  <text class="name" x="129" y="229" text-anchor="middle">heartbeat</text>
+  <text class="sub dim" x="129" y="240" text-anchor="middle">reports what it holds</text>
+
+  <!-- ─────────── Peer B ─────────── -->
+  <rect class="p-card" x="24" y="300" width="210" height="184" rx="9"/>
+  <text class="card p-head" x="129" y="323" text-anchor="middle">Peer B</text>
+  <rect class="box g" x="38" y="332" width="182" height="30" rx="5"/>
+  <text class="name g-t" x="129" y="345" text-anchor="middle">DRAM / HBM</text>
+  <text class="sub dim" x="129" y="356" text-anchor="middle">holds the KV pages</text>
+  <rect class="box a" x="38" y="368" width="182" height="30" rx="5"/>
+  <text class="name a-t" x="129" y="381" text-anchor="middle">SSD</text>
+  <text class="sub dim" x="129" y="392" text-anchor="middle">cold copies</text>
+  <rect class="box n" x="38" y="404" width="182" height="30" rx="5"/>
+  <text class="name" x="129" y="417" text-anchor="middle">peer service</text>
+  <text class="sub dim" x="129" y="428" text-anchor="middle">serves reads &amp; writes</text>
+  <rect class="box n" x="38" y="440" width="182" height="30" rx="5"/>
+  <text class="name" x="129" y="453" text-anchor="middle">heartbeat</text>
+  <text class="sub dim" x="129" y="464" text-anchor="middle">reports what it holds</text>
+
+  <!-- peer ⇄ peer data path -->
+  <line class="edge" x1="56" y1="296" x2="56" y2="264" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <text class="elbl" x="70" y="275">RDMA — the KV data itself</text>
+  <text class="sub dim" x="70" y="288">never passes through a master</text>
+
+  <!-- ─────────── stateless master replicas ─────────── -->
+  <rect class="m-ghost" x="312" y="74" width="260" height="348" rx="9"/>
+  <rect class="m-ghost" x="307" y="81" width="260" height="348" rx="9"/>
+  <rect class="m-card"  x="302" y="88" width="260" height="348" rx="9"/>
+  <text class="card m-head" x="320" y="114">Master × N</text>
+  <text class="sub dim" x="320" y="130">stateless — add or drop replicas freely</text>
+
+  <rect class="box b" x="320" y="140" width="224" height="46" rx="6"/>
+  <text class="name b-t" x="432" y="158" text-anchor="middle">peer-facing API</text>
+  <text class="sub dim" x="432" y="171" text-anchor="middle">heartbeat · lookup · route</text>
+
+  <rect class="box b" x="320" y="196" width="224" height="46" rx="6"/>
+  <text class="name b-t" x="432" y="214" text-anchor="middle">router</text>
+  <text class="sub dim" x="432" y="227" text-anchor="middle">where to put / get</text>
+
+  <rect class="box r" x="320" y="252" width="224" height="46" rx="6"/>
+  <text class="name r-t" x="432" y="270" text-anchor="middle">eviction</text>
+  <text class="sub dim" x="432" y="283" text-anchor="middle">watermark → free space</text>
+
+  <line class="edge" x1="432" y1="298" x2="432" y2="316" marker-end="url(#arr)"/>
+
+  <rect class="box i" x="320" y="318" width="224" height="46" rx="6"/>
+  <text class="name" x="432" y="336" text-anchor="middle">metadata interface</text>
+  <text class="sub dim" x="432" y="349" text-anchor="middle">the only state a master touches</text>
+
+  <text class="sub dim" x="320" y="388">nothing kept in the process —</text>
+  <text class="sub dim" x="320" y="402">any replica answers any request</text>
+  <text class="sub dim" x="320" y="420">+ optional metrics endpoint</text>
+
+  <!-- ─────────── external metadata store ─────────── -->
+  <rect class="s-card" x="604" y="88" width="186" height="348" rx="9"/>
+  <text class="card s-head" x="620" y="114">external store</text>
+  <text class="sub dim" x="620" y="130">Redis / Dragonfly /</text>
+  <text class="sub dim" x="620" y="142">Valkey · persistent</text>
+
+  <rect class="box v" x="620" y="158" width="154" height="50" rx="6"/>
+  <text class="name v-t" x="697" y="178" text-anchor="middle">nodes</text>
+  <text class="sub dim" x="697" y="191" text-anchor="middle">membership · capacity</text>
+
+  <rect class="box v" x="620" y="228" width="154" height="50" rx="6"/>
+  <text class="name v-t" x="697" y="248" text-anchor="middle">blocks</text>
+  <text class="sub dim" x="697" y="261" text-anchor="middle">key → node · tier · size</text>
+
+  <rect class="box v" x="620" y="298" width="154" height="50" rx="6"/>
+  <text class="name v-t" x="697" y="318" text-anchor="middle">engine-reported</text>
+  <text class="sub dim" x="697" y="331" text-anchor="middle">blocks UMBP does not own</text>
+
+  <rect class="box n" x="620" y="368" width="154" height="50" rx="6"/>
+  <text class="name" x="697" y="388" text-anchor="middle">replica</text>
+  <text class="sub dim" x="697" y="401" text-anchor="middle">replication + snapshot</text>
+
+  <line class="edge" x1="566" y1="341" x2="602" y2="341" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <text class="elbl" x="584" y="333" text-anchor="middle">read</text>
+  <text class="elbl" x="584" y="356" text-anchor="middle">write</text>
+
+  <!-- peer ⇄ master -->
+  <line class="edge" x1="234" y1="130" x2="298" y2="130" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <text class="elbl" x="266" y="124" text-anchor="middle">heartbeat</text>
+  <line class="edge" x1="234" y1="164" x2="298" y2="164" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <text class="elbl" x="266" y="158" text-anchor="middle">route</text>
+  <line class="edge" x1="298" y1="198" x2="236" y2="198" marker-end="url(#arr)"/>
+  <text class="elbl" x="266" y="192" text-anchor="middle">evict</text>
+
+  <line class="edge" x1="234" y1="340" x2="298" y2="340" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <text class="elbl" x="266" y="334" text-anchor="middle">heartbeat</text>
+  <line class="edge" x1="234" y1="374" x2="298" y2="374" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <text class="elbl" x="266" y="368" text-anchor="middle">route</text>
+  <line class="edge" x1="298" y1="408" x2="236" y2="408" marker-end="url(#arr)"/>
+  <text class="elbl" x="266" y="402" text-anchor="middle">evict</text>
+</svg>

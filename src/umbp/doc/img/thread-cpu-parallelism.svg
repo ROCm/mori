@@ -1,0 +1,71 @@
+<svg viewBox="0 0 1160 460" xmlns="http://www.w3.org/2000/svg" role="img"
+  aria-label="Checksum verification over a batch of keys is split across four worker threads instead of run as one long serial pass, finishing about 42 percent faster. Separately, bypassing the page cache with O_DIRECT makes every read a real device read instead of possibly zero.">
+  <title>Splitting CPU-bound checksum work across threads, and bypassing the page cache</title>
+  <defs>
+    <pattern id="grid03" width="20" height="20" patternUnits="userSpaceOnUse">
+      <path d="M20 0H0V20" fill="none" stroke="#c3d0ce" stroke-width="1"/>
+    </pattern>
+    <marker id="arrInk03" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#16232a"/>
+    </marker>
+    <marker id="arrBlue03" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#2569a6"/>
+    </marker>
+  </defs>
+  <rect width="1160" height="460" fill="#e8edec"/>
+  <rect width="1160" height="460" fill="url(#grid03)" opacity="0.5"/>
+  <rect x="0.5" y="0.5" width="1159" height="459" fill="none" stroke="#16232a" stroke-opacity="0.25"/>
+
+  <text x="40" y="34" font-family="ui-monospace,Consolas,monospace" font-size="13" fill="#16232a">CHECKSUM VERIFY — 64 KEYS RETURNED FROM DISK</text>
+
+  <text x="190" y="82" text-anchor="end" font-family="ui-monospace,Consolas,monospace" font-size="12" fill="#a8402f">1 WORKER</text>
+  <rect x="200" y="64" width="880" height="26" fill="#a8402f"/>
+  <g stroke="#f3f5f2" stroke-width="1" opacity="0.65">
+    <line x1="255" y1="64" x2="255" y2="90"/><line x1="310" y1="64" x2="310" y2="90"/>
+    <line x1="365" y1="64" x2="365" y2="90"/><line x1="420" y1="64" x2="420" y2="90"/>
+    <line x1="475" y1="64" x2="475" y2="90"/><line x1="530" y1="64" x2="530" y2="90"/>
+    <line x1="585" y1="64" x2="585" y2="90"/><line x1="640" y1="64" x2="640" y2="90"/>
+    <line x1="695" y1="64" x2="695" y2="90"/><line x1="750" y1="64" x2="750" y2="90"/>
+    <line x1="805" y1="64" x2="805" y2="90"/><line x1="860" y1="64" x2="860" y2="90"/>
+    <line x1="915" y1="64" x2="915" y2="90"/><line x1="970" y1="64" x2="970" y2="90"/>
+    <line x1="1025" y1="64" x2="1025" y2="90"/>
+  </g>
+  <text x="1092" y="82" font-family="ui-monospace,Consolas,monospace" font-size="12" fill="#16232a">T</text>
+
+  <text x="190" y="122" text-anchor="end" font-family="ui-monospace,Consolas,monospace" font-size="12" fill="#2569a6">4 WORKERS</text>
+  <rect x="200" y="104" width="510" height="12" fill="#2569a6"/>
+  <rect x="200" y="120" width="510" height="12" fill="#2569a6"/>
+  <rect x="200" y="136" width="510" height="12" fill="#2569a6"/>
+  <rect x="200" y="152" width="510" height="12" fill="#2569a6"/>
+
+  <line x1="710" y1="58" x2="710" y2="172" stroke="#55696c" stroke-width="1" stroke-dasharray="3 3"/>
+  <line x1="1080" y1="58" x2="1080" y2="172" stroke="#55696c" stroke-width="1" stroke-dasharray="3 3"/>
+  <text x="710" y="190" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="11" fill="#16232a">≈0.58T</text>
+
+  <text x="200" y="222" font-family="ui-monospace,Consolas,monospace" font-size="13" font-weight="700" fill="#2569a6">~42% faster (measured, 4 threads vs 1)</text>
+
+  <line x1="40" y1="248" x2="1120" y2="248" stroke="#55696c" stroke-dasharray="4 4"/>
+
+  <text x="60" y="280" font-family="ui-monospace,Consolas,monospace" font-size="12.5" font-weight="700" fill="#a8402f">BUFFERED (default)</text>
+  <rect x="60" y="296" width="110" height="50" rx="6" fill="#dfe6e4" stroke="#16232a"/>
+  <text x="115" y="326" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="12" fill="#16232a">DRIVE</text>
+  <line x1="170" y1="321" x2="228" y2="321" stroke="#16232a" stroke-width="1.5" marker-end="url(#arrInk03)"/>
+  <rect x="230" y="296" width="150" height="50" rx="6" fill="#dfe6e4" stroke="#16232a"/>
+  <text x="305" y="326" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="11.5" fill="#16232a">PAGE CACHE</text>
+  <path d="M300 296 C300 268 380 268 380 296" fill="none" stroke="#a8402f" stroke-width="1.25" marker-end="url(#arrInk03)"/>
+  <line x1="380" y1="321" x2="438" y2="321" stroke="#16232a" stroke-width="1.5" marker-end="url(#arrInk03)"/>
+  <rect x="440" y="296" width="110" height="50" rx="6" fill="#dfe6e4" stroke="#16232a"/>
+  <text x="495" y="326" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="12" fill="#16232a">APP</text>
+  <text x="60" y="372" font-family="ui-monospace,Consolas,monospace" font-size="11.5" fill="#a8402f">0 bytes may touch the device</text>
+
+  <text x="650" y="280" font-family="ui-monospace,Consolas,monospace" font-size="12.5" font-weight="700" fill="#2569a6">O_DIRECT</text>
+  <rect x="650" y="296" width="110" height="50" rx="6" fill="#dfe6e4" stroke="#16232a"/>
+  <text x="705" y="326" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="12" fill="#16232a">DRIVE</text>
+  <line x1="760" y1="321" x2="938" y2="321" stroke="#2569a6" stroke-width="1.75" marker-end="url(#arrBlue03)"/>
+  <rect x="940" y="296" width="110" height="50" rx="6" fill="#dfe6e4" stroke="#16232a"/>
+  <text x="995" y="326" text-anchor="middle" font-family="ui-monospace,Consolas,monospace" font-size="12" fill="#16232a">APP</text>
+  <text x="650" y="372" font-family="ui-monospace,Consolas,monospace" font-size="11.5" fill="#2569a6">every read = real device I/O</text>
+
+  <text x="1120" y="428" text-anchor="end" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700" fill="#16232a">03 — THREAD-LEVEL PARALLELISM</text>
+  <text x="1120" y="444" text-anchor="end" font-family="ui-monospace,Consolas,monospace" font-size="10.5" fill="#55696c">ssd_tier.cpp · ParallelFor, TierThreads, O_DIRECT</text>
+</svg>
