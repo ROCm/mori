@@ -284,9 +284,11 @@ void RecordMergeability(const std::vector<CopyJob*>& jobs, hipMemcpyKind kind) {
 }
 
 // Times mu_ acquisition and the critical section, then reports periodically.
+template <typename Lock>
 class ProfiledLock {
  public:
-  ProfiledLock(std::mutex& mutex, LockStats& stats, size_t objects)
+  template <typename Mutex>
+  ProfiledLock(Mutex& mutex, LockStats& stats, size_t objects)
       : lock_(mutex, std::defer_lock), stats_(stats), objects_(objects) {
     if (!ProfileEnabled()) {
       lock_.lock();
@@ -307,13 +309,16 @@ class ProfiledLock {
   }
 
  private:
-  std::unique_lock<std::mutex> lock_;
+  Lock lock_;
   LockStats& stats_;
   size_t objects_;
   bool profiling_{false};
   uint64_t wait_us_{0};
   std::chrono::steady_clock::time_point acquired_{};
 };
+
+using ProfiledSharedLock = ProfiledLock<std::shared_lock<std::shared_mutex>>;
+using ProfiledUniqueLock = ProfiledLock<std::unique_lock<std::shared_mutex>>;
 
 void CopyHostJobs(const std::vector<CopyJob*>& jobs, int num_threads) {
   if (jobs.empty()) return;
@@ -390,9 +395,8 @@ void CopyDeviceJobs(const std::vector<CopyJob*>& jobs, int device_id, hipMemcpyK
   // sends offloads in GPU-address order, which makes the tier's slot layout
   // mirror the GPU layout -- see UMBP_STANDALONE_PROCESS_DESIGN.md 11.2.
   std::vector<CopyJob*> ordered(jobs.begin(), jobs.end());
-  std::sort(ordered.begin(), ordered.end(), [](const CopyJob* a, const CopyJob* b) {
-    return a->src < b->src;
-  });
+  std::sort(ordered.begin(), ordered.end(),
+            [](const CopyJob* a, const CopyJob* b) { return a->src < b->src; });
 
   hipError_t status = hipSuccess;
   bool enqueued_all = true;
@@ -589,6 +593,7 @@ void DRAMTier::TouchLRU(const std::string& key) {
 }
 
 void DRAMTier::EvictLRU() {
+  std::lock_guard<std::mutex> lru_lock(lru_mu_);
   if (lru_list_.empty()) return;
 
   const std::string& victim = lru_list_.back();
@@ -603,7 +608,7 @@ void DRAMTier::EvictLRU() {
 }
 
 bool DRAMTier::Write(const std::string& key, const void* data, size_t size) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::unique_lock<std::shared_mutex> lock(mu_);
 
   // If key already exists, free its old slot first
   auto existing = slots_.find(key);
@@ -611,10 +616,13 @@ bool DRAMTier::Write(const std::string& key, const void* data, size_t size) {
     Deallocate(existing->second.offset, existing->second.size);
     used_ -= existing->second.size;
     slots_.erase(existing);
-    auto lru_it = lru_map_.find(key);
-    if (lru_it != lru_map_.end()) {
-      lru_list_.erase(lru_it->second);
-      lru_map_.erase(lru_it);
+    {
+      std::lock_guard<std::mutex> lru_lock(lru_mu_);
+      auto lru_it = lru_map_.find(key);
+      if (lru_it != lru_map_.end()) {
+        lru_list_.erase(lru_it->second);
+        lru_map_.erase(lru_it);
+      }
     }
   }
 
@@ -638,12 +646,15 @@ bool DRAMTier::Write(const std::string& key, const void* data, size_t size) {
   }
   slots_[key] = {offset, size};
   used_ += size;
-  TouchLRU(key);
+  {
+    std::lock_guard<std::mutex> lru_lock(lru_mu_);
+    TouchLRU(key);
+  }
   return true;
 }
 
 bool DRAMTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(mu_);
 
   auto it = slots_.find(key);
   if (it == slots_.end()) return false;
@@ -665,7 +676,10 @@ bool DRAMTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t siz
   } else {
     std::memcpy(dst, static_cast<char*>(base_ptr_) + it->second.offset, size);
   }
-  TouchLRU(key);
+  {
+    std::lock_guard<std::mutex> lru_lock(lru_mu_);
+    TouchLRU(key);
+  }
   return true;
 }
 
@@ -676,16 +690,11 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
   std::vector<bool> results(n, false);
   if (n == 0) return results;
 
-  // Hold mu_ for the whole batch. This tier uses a single mutex (reads and
-  // writes are mutually exclusive), so holding it keeps slot offsets valid
-  // during the parallel copy without a use-after-free against Write/Evict/
-  // Clear. The per-block copies still run in parallel within the batch, which
-  // is what breaks the single-core memcpy ceiling on cold DRAM.
-  //
-  // This whole-batch hold is what serializes concurrent clients; ProfiledLock
-  // quantifies it under UMBP_DRAM_PROFILE=1.
+  // Hold shared ownership for the whole batch so slot offsets remain valid
+  // during CopyJobs. Other readers may proceed concurrently; writers and
+  // eviction wait until every copy has finished.
   ScopedInFlight in_flight;
-  ProfiledLock lock(mu_, ReadLockStats(), n);
+  ProfiledSharedLock lock(mu_, ReadLockStats(), n);
 
   std::vector<CopyJob> jobs;
   jobs.reserve(n);
@@ -699,10 +708,15 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
   }
 
   CopyJobs(&jobs, read_threads_, hipMemcpyHostToDevice);
-  for (const auto& job : jobs) {
-    if (!job.copied) continue;
-    results[job.idx] = true;
-    TouchLRU(keys[job.idx]);
+  if (!jobs.empty()) {
+    // One acquisition per batch avoids recreating the per-object lock convoy
+    // that the server-side range-resolution change removes.
+    std::lock_guard<std::mutex> lru_lock(lru_mu_);
+    for (const auto& job : jobs) {
+      if (!job.copied) continue;
+      results[job.idx] = true;
+      TouchLRU(keys[job.idx]);
+    }
   }
   return results;
 }
@@ -714,16 +728,15 @@ std::vector<bool> DRAMTier::BatchWrite(const std::vector<std::string>& keys,
   std::vector<bool> results(n, false);
   if (n == 0) return results;
 
-  // Hold mu_ for the whole batch (single-mutex model: serializes against other
-  // reads/writes). Slot allocation mutates free_list_/slots_ and must be serial;
-  // only the per-block payload copies run in parallel, which is what breaks the
-  // single-core memcpy ceiling on the backup path.
+  // Hold unique ownership for the whole batch. Slot allocation and payload
+  // publication mutate shared state, and reserved slots must not be reused
+  // while CopyJobs is filling them.
   //
   // Phase 2 could in principle run outside the lock (the reserved-but-
   // unregistered region is unreachable to other threads); ProfiledLock measures
   // what that would be worth. See UMBP_STANDALONE_PROCESS_DESIGN.md 11.1.
   ScopedInFlight in_flight;
-  ProfiledLock lock(mu_, WriteLockStats(), n);
+  ProfiledUniqueLock lock(mu_, WriteLockStats(), n);
 
   struct WriteJob {
     CopyJob copy;
@@ -736,23 +749,26 @@ std::vector<bool> DRAMTier::BatchWrite(const std::vector<std::string>& keys,
   // Phase 1 (serial): free any existing slot for the key, then allocate. Does
   // NOT self-evict — a key that doesn't fit is left false so the upper layer
   // (LocalStorageManager) can demote LRU keys and retry per-key.
-  for (size_t i = 0; i < n; ++i) {
-    auto existing = slots_.find(keys[i]);
-    if (existing != slots_.end()) {
-      Deallocate(existing->second.offset, existing->second.size);
-      used_ -= existing->second.size;
-      slots_.erase(existing);
-      auto lru_it = lru_map_.find(keys[i]);
-      if (lru_it != lru_map_.end()) {
-        lru_list_.erase(lru_it->second);
-        lru_map_.erase(lru_it);
+  {
+    std::lock_guard<std::mutex> lru_lock(lru_mu_);
+    for (size_t i = 0; i < n; ++i) {
+      auto existing = slots_.find(keys[i]);
+      if (existing != slots_.end()) {
+        Deallocate(existing->second.offset, existing->second.size);
+        used_ -= existing->second.size;
+        slots_.erase(existing);
+        auto lru_it = lru_map_.find(keys[i]);
+        if (lru_it != lru_map_.end()) {
+          lru_list_.erase(lru_it->second);
+          lru_map_.erase(lru_it);
+        }
       }
+      size_t offset = Allocate(sizes[i]);
+      if (offset == static_cast<size_t>(-1)) continue;
+      write_jobs.push_back(
+          {{static_cast<char*>(base_ptr_) + offset, data_ptrs[i], data_ptrs[i], sizes[i], i, false},
+           offset});
     }
-    size_t offset = Allocate(sizes[i]);
-    if (offset == static_cast<size_t>(-1)) continue;
-    write_jobs.push_back(
-        {{static_cast<char*>(base_ptr_) + offset, data_ptrs[i], data_ptrs[i], sizes[i], i, false},
-         offset});
   }
 
   // Phase 2: preserve the existing parallel host path; GPU jobs are grouped by
@@ -762,34 +778,40 @@ std::vector<bool> DRAMTier::BatchWrite(const std::vector<std::string>& keys,
   CopyJobs(&copy_jobs, write_threads_, hipMemcpyDeviceToHost);
 
   // Phase 3 (serial): register slots + LRU, mark successes.
-  for (size_t i = 0; i < write_jobs.size(); ++i) {
-    const WriteJob& write_job = write_jobs[i];
-    const CopyJob& copy_job = copy_jobs[i];
-    if (!copy_job.copied) {
-      Deallocate(write_job.offset, copy_job.size);
-      continue;
+  {
+    std::lock_guard<std::mutex> lru_lock(lru_mu_);
+    for (size_t i = 0; i < write_jobs.size(); ++i) {
+      const WriteJob& write_job = write_jobs[i];
+      const CopyJob& copy_job = copy_jobs[i];
+      if (!copy_job.copied) {
+        Deallocate(write_job.offset, copy_job.size);
+        continue;
+      }
+      slots_[keys[copy_job.idx]] = {write_job.offset, copy_job.size};
+      used_ += copy_job.size;
+      TouchLRU(keys[copy_job.idx]);
+      results[copy_job.idx] = true;
     }
-    slots_[keys[copy_job.idx]] = {write_job.offset, copy_job.size};
-    used_ += copy_job.size;
-    TouchLRU(keys[copy_job.idx]);
-    results[copy_job.idx] = true;
   }
   return results;
 }
 
 const void* DRAMTier::ReadPtr(const std::string& key, size_t* out_size) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(mu_);
 
   auto it = slots_.find(key);
   if (it == slots_.end()) return nullptr;
 
   if (out_size) *out_size = it->second.size;
-  TouchLRU(key);
+  {
+    std::lock_guard<std::mutex> lru_lock(lru_mu_);
+    TouchLRU(key);
+  }
   return static_cast<char*>(base_ptr_) + it->second.offset;
 }
 
 std::vector<char> DRAMTier::Read(const std::string& key) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(mu_);
 
   auto it = slots_.find(key);
   if (it == slots_.end()) return {};
@@ -797,7 +819,10 @@ std::vector<char> DRAMTier::Read(const std::string& key) {
   size_t sz = it->second.size;
   std::vector<char> buf(sz);
   std::memcpy(buf.data(), static_cast<char*>(base_ptr_) + it->second.offset, sz);
-  TouchLRU(key);
+  {
+    std::lock_guard<std::mutex> lru_lock(lru_mu_);
+    TouchLRU(key);
+  }
   return buf;
 }
 
@@ -810,12 +835,12 @@ TierCapabilities DRAMTier::Capabilities() const {
 }
 
 bool DRAMTier::Exists(const std::string& key) const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(mu_);
   return slots_.count(key) > 0;
 }
 
 bool DRAMTier::Evict(const std::string& key) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::unique_lock<std::shared_mutex> lock(mu_);
 
   auto it = slots_.find(key);
   if (it == slots_.end()) return false;
@@ -824,21 +849,25 @@ bool DRAMTier::Evict(const std::string& key) {
   used_ -= it->second.size;
   slots_.erase(it);
 
-  auto lru_it = lru_map_.find(key);
-  if (lru_it != lru_map_.end()) {
-    lru_list_.erase(lru_it->second);
-    lru_map_.erase(lru_it);
+  {
+    std::lock_guard<std::mutex> lru_lock(lru_mu_);
+    auto lru_it = lru_map_.find(key);
+    if (lru_it != lru_map_.end()) {
+      lru_list_.erase(lru_it->second);
+      lru_map_.erase(lru_it);
+    }
   }
   return true;
 }
 
 std::pair<size_t, size_t> DRAMTier::Capacity() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(mu_);
   return {used_, capacity_};
 }
 
 void DRAMTier::Clear() {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::unique_lock<std::shared_mutex> lock(mu_);
+  std::lock_guard<std::mutex> lru_lock(lru_mu_);
   slots_.clear();
   lru_list_.clear();
   lru_map_.clear();
@@ -849,7 +878,8 @@ void DRAMTier::Clear() {
 
 std::vector<std::string> DRAMTier::GetLRUCandidates(size_t max_candidates) const {
   if (max_candidates == 0) max_candidates = 1;
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(mu_);
+  std::lock_guard<std::mutex> lru_lock(lru_mu_);
   std::vector<std::string> result;
   result.reserve(std::min(max_candidates, lru_list_.size()));
   // Walk from the back (LRU end) up to max_candidates entries.
@@ -861,13 +891,14 @@ std::vector<std::string> DRAMTier::GetLRUCandidates(size_t max_candidates) const
 }
 
 std::string DRAMTier::GetLRUKey() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(mu_);
+  std::lock_guard<std::mutex> lru_lock(lru_mu_);
   if (lru_list_.empty()) return "";
   return lru_list_.back();
 }
 
 std::optional<size_t> DRAMTier::GetSlotOffset(const std::string& key) const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(mu_);
   auto it = slots_.find(key);
   if (it == slots_.end()) return std::nullopt;
   return it->second.offset;

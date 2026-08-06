@@ -26,6 +26,7 @@
 #include <list>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -126,7 +127,8 @@ class DRAMTier : public TierBackend {
   };
   std::list<FreeBlock> free_list_;
 
-  mutable std::mutex mu_;
+  mutable std::shared_mutex mu_;  // slots_, free_list_, used_
+  mutable std::mutex lru_mu_;     // lru_list_, lru_map_
 
   // Threads used by ReadBatchIntoPtr for parallel CopyBlock. Default 8, override
   // via env UMBP_DRAM_READ_THREADS, capped to hardware concurrency. >1 breaks
@@ -140,8 +142,8 @@ class DRAMTier : public TierBackend {
 
   size_t Allocate(size_t size);                 // Allocate from free_list_
   void Deallocate(size_t offset, size_t size);  // Return to free_list_
-  void EvictLRU();                              // Evict least recently used
-  void TouchLRU(const std::string& key);        // Update LRU position
+  void EvictLRU();                              // mu_ held; locks lru_mu_
+  void TouchLRU(const std::string& key);        // Caller holds lru_mu_
 };
 
 }  // namespace mori::umbp

@@ -16,6 +16,13 @@ add_executable(test_umbp_local_client test_umbp_client.cpp)
 target_link_libraries(test_umbp_local_client PRIVATE umbp_core)
 add_test(NAME umbp_local_client COMMAND test_umbp_local_client)
 
+add_executable(test_umbp_dram_tier_concurrency test_dram_tier_concurrency.cpp)
+target_link_libraries(test_umbp_dram_tier_concurrency PRIVATE umbp_core
+                                                              GTest::gtest_main)
+target_compile_features(test_umbp_dram_tier_concurrency PRIVATE cxx_std_17)
+add_test(NAME umbp_dram_tier_concurrency
+         COMMAND test_umbp_dram_tier_concurrency)
+
 add_executable(test_umbp_local_follower_mode test_follower_mode.cpp)
 target_link_libraries(test_umbp_local_follower_mode PRIVATE umbp_core)
 add_test(NAME umbp_local_follower_mode COMMAND test_umbp_local_follower_mode)
