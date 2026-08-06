@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "umbp/common/config.h"
+#include "umbp/common/env_time.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/peer/peer_service.h"
@@ -351,6 +352,59 @@ TEST_F(PeerServiceSlotTest, ReadSlotTtlReclaim) {
   auto status = stub_->PrepareSsdRead(&ctx, req, &resp);
   ASSERT_TRUE(status.ok());
   EXPECT_EQ(resp.status(), ::umbp::SSD_READ_OK) << "Should succeed after TTL reclaim";
+}
+
+// ---- sync-server poller sizing ----------------------------------------------
+//
+// The values themselves only surface as RPC latency under fan-in, which a unit
+// test cannot observe; what is testable is that the env plumbing resolves and
+// that an inconsistent pair can never reach gRPC, which requires max >= min.
+
+class PeerPollerConfigTest : public ::testing::Test {
+ protected:
+  void SetUp() override { Clear(); }
+  void TearDown() override { Clear(); }
+  static void Clear() {
+    ::unsetenv("UMBP_PEER_MIN_POLLERS");
+    ::unsetenv("UMBP_PEER_MAX_POLLERS");
+    ResetEnvWarnStateForTesting();
+  }
+};
+
+TEST_F(PeerPollerConfigTest, DefaultsCoverTpFanIn) {
+  const PeerPollerConfig cfg = ResolvePeerPollerConfig();
+  // >= 8 so a TP8 rank group asking for the same MLA key does not serialize on
+  // thread spawns, which is the whole point of overriding gRPC's 1/2.
+  EXPECT_GE(cfg.min_pollers, 8);
+  EXPECT_GE(cfg.max_pollers, cfg.min_pollers);
+}
+
+TEST_F(PeerPollerConfigTest, EnvOverridesBothBounds) {
+  ::setenv("UMBP_PEER_MIN_POLLERS", "3", 1);
+  ::setenv("UMBP_PEER_MAX_POLLERS", "17", 1);
+  const PeerPollerConfig cfg = ResolvePeerPollerConfig();
+  EXPECT_EQ(cfg.min_pollers, 3);
+  EXPECT_EQ(cfg.max_pollers, 17);
+}
+
+TEST_F(PeerPollerConfigTest, MaxIsRaisedToMinWhenInverted) {
+  ::setenv("UMBP_PEER_MIN_POLLERS", "12", 1);
+  ::setenv("UMBP_PEER_MAX_POLLERS", "4", 1);
+  const PeerPollerConfig cfg = ResolvePeerPollerConfig();
+  EXPECT_EQ(cfg.min_pollers, 12);
+  EXPECT_EQ(cfg.max_pollers, 12) << "gRPC requires max >= min";
+}
+
+TEST_F(PeerPollerConfigTest, InvalidValuesFallBackToDefaults) {
+  const PeerPollerConfig def = ResolvePeerPollerConfig();
+  ResetEnvWarnStateForTesting();
+  // 0 is below min_allowed=1; "abc" does not parse.  Neither may produce a
+  // pool that cannot serve, so both must land back on the default.
+  ::setenv("UMBP_PEER_MIN_POLLERS", "0", 1);
+  ::setenv("UMBP_PEER_MAX_POLLERS", "abc", 1);
+  const PeerPollerConfig cfg = ResolvePeerPollerConfig();
+  EXPECT_EQ(cfg.min_pollers, def.min_pollers);
+  EXPECT_EQ(cfg.max_pollers, def.max_pollers);
 }
 
 }  // namespace

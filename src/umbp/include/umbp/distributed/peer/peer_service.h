@@ -64,6 +64,33 @@ struct SsdWriteStagingConfig {
   size_t region_size = 0;
 };
 
+// Sync-server poller/handler thread pool sizing for the peer service.
+//
+// gRPC's defaults (MIN_POLLERS=1, MAX_POLLERS=2) assume short handlers.  The
+// peer's are the opposite: BatchPrepareSsdRead holds its thread for the whole
+// SSD read (tens of ms), and with single-flight on, every follower blocks in
+// the handler until its leader finishes.  A ThreadManager thread that completes
+// work only resumes polling while pollers < max_pollers and otherwise exits, so
+// at MAX_POLLERS=2 every concurrent request past the second costs a thread
+// spawn — not once at warmup, but on every request, forever.
+//
+// That is invisible on an idle storage node and expensive on a node that is
+// also running inference: measured on a 2-node pure-SSD run, reads served by a
+// sibling rank on the *same* host carried ~8ms more RPC overhead than reads
+// pulled across the network from an idle storage node, flat over the whole run.
+// Sizing the pool to the expected fan-in (>= tp_size, since MLA + TP has every
+// rank ask for the same key) keeps threads resident and removes the spawn.
+struct PeerPollerConfig {
+  int min_pollers = 8;
+  int max_pollers = 64;
+};
+
+// Resolve from UMBP_PEER_MIN_POLLERS / UMBP_PEER_MAX_POLLERS, defaults above.
+// max is raised to min when a caller sets them inconsistently, since gRPC
+// requires max >= min.  Re-reads the environment on every call (not cached):
+// Start() runs once per process, and the tests depend on it.
+PeerPollerConfig ResolvePeerPollerConfig();
+
 class PeerServiceServer {
  public:
   // `dram_alloc` is non-owning and may be null when the host process has

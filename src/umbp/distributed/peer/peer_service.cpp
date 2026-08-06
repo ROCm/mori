@@ -951,10 +951,30 @@ size_t PeerServiceServer::SnapshotWriteSlotsInUse() const {
   return service_ ? service_->WriteSlotsInUse() : 0;
 }
 
+PeerPollerConfig ResolvePeerPollerConfig() {
+  PeerPollerConfig cfg;
+  cfg.min_pollers =
+      static_cast<int>(GetEnvUint32("UMBP_PEER_MIN_POLLERS", static_cast<uint32_t>(cfg.min_pollers),
+                                    /*min_allowed=*/1));
+  cfg.max_pollers =
+      static_cast<int>(GetEnvUint32("UMBP_PEER_MAX_POLLERS", static_cast<uint32_t>(cfg.max_pollers),
+                                    /*min_allowed=*/1));
+  if (cfg.max_pollers < cfg.min_pollers) cfg.max_pollers = cfg.min_pollers;
+  return cfg;
+}
+
 bool PeerServiceServer::Start(uint16_t port) {
   std::string address = "0.0.0.0:" + std::to_string(port);
 
+  const PeerPollerConfig pollers = ResolvePeerPollerConfig();
+
   grpc::ServerBuilder builder;
+  // See PeerPollerConfig: the defaults gRPC ships are sized for sub-millisecond
+  // handlers, and this service's are not.
+  builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MIN_POLLERS,
+                              pollers.min_pollers);
+  builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MAX_POLLERS,
+                              pollers.max_pollers);
   builder.AddListeningPort(address, grpc::InsecureServerCredentials());
   builder.RegisterService(service_.get());
   server_ = builder.BuildAndStart();
@@ -963,7 +983,10 @@ bool PeerServiceServer::Start(uint16_t port) {
     MORI_UMBP_ERROR("[PeerService] Failed to start on {} (port may be in use)", address);
     return false;
   }
-  MORI_UMBP_INFO("[PeerService] Listening on {}", address);
+  // Logged, not silent: the sizing only shows up as RPC latency, so a run's log
+  // has to be able to prove which values were actually in effect.
+  MORI_UMBP_INFO("[PeerService] Listening on {} (pollers min={} max={})", address,
+                 pollers.min_pollers, pollers.max_pollers);
   return true;
 }
 
