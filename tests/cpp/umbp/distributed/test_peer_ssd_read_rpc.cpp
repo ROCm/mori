@@ -29,6 +29,8 @@
 // is read directly); the full BatchGet -> RDMA path needs a live cluster.
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -55,8 +57,30 @@ constexpr size_t kStagingSize = 4096;
 constexpr int kNumReadSlots = 4;  // -> 1024 B per slot
 constexpr int kLeaseTimeoutS = 2;
 
+// Ask the kernel for a currently-free ephemeral port instead of walking a
+// hard-coded range.  A fixed base collides with whatever already holds that
+// port on a shared host — an unrelated process's ephemeral port is enough — and
+// the collision surfaces as ASSERT_TRUE(server_->Start(port_)) failing in
+// SetUp, which reads as a bogus failure of whichever test happened to land on
+// it rather than as "port in use".  Mirrors test_peer_service.cpp's AllocPort.
 uint16_t AllocPort() {
-  static std::atomic<uint16_t> next{51300};
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd >= 0) {
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = 0;
+    socklen_t len = sizeof(addr);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
+      uint16_t port = ntohs(addr.sin_port);
+      ::close(fd);
+      return port;
+    }
+    ::close(fd);
+  }
+  static std::atomic<uint16_t> next{
+      static_cast<uint16_t>(51300 + (static_cast<unsigned>(::getpid()) % 4000))};
   return next.fetch_add(1);
 }
 
