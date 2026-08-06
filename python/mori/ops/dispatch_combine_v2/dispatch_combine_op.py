@@ -358,9 +358,9 @@ class EpDispatchCombineConfig:
         if self.is_fp4:
             # fp4 dispatch + non-fp4 combine (asymmetric) moves 2 B/elem on the
             # combine side, so it needs the bf16 combine geometry, not the
-            # fp4-combine one -> its own "fp4_asym" tuning key.
+            # fp4-combine one -> its own "fp4_disp_bf16_comb" tuning key.
             if self.combine_dtype != torch.float4_e2m1fn_x2:
-                return "fp4_asym"
+                return "fp4_disp_bf16_comb"
             return "fp4"
         if self.is_fp8:
             return "fp8"

@@ -124,7 +124,7 @@ _MI355X_SCHED_FP4 = (
 # geometry from the fp4 sweep, combine geometry from bf16 -- combine moves 2 B/elem
 # here, not 0.5, so the fp4-combine geometry above does not apply. Thresholds are
 # the union of both schedules' buckets. Mirrors what _MI355X_SCHED_FP8 already does.
-_MI355X_SCHED_FP4_ASYM = (
+_MI355X_SCHED_FP4_DISP_BF16_COMB = (
     # MEASURED 2026-08-03: 2-pass block x warp sweep, EP8 gfx950, fp4 dispatch +
     # bf16 combine, hidden=7168 topk=6 (DSv4-Pro, 384 experts). Large buckets want
     # dispatch warp=4 (not 8: 8192 551->481us, 4096 300->271us); small buckets need
@@ -137,7 +137,7 @@ _MI355X_SCHED_FP4_ASYM = (
 # fp4 dispatch + bf16 combine, RE-TUNED 2026-08-04 specifically for topk=6
 # (DSv4-Pro, hidden=7168, 384 experts, EP8 gfx950). 2-pass block x warp sweep
 # (public op.dispatch/op.combine API, fp4-asym), 2x-unroll production kernel.
-# Supersedes the shared _MI355X_SCHED_FP4_ASYM for topk=6. Key fixes vs that table:
+# Supersedes the shared _MI355X_SCHED_FP4_DISP_BF16_COMB for topk=6. Key fixes vs that table:
 #   ct=2048 dispatch 144x8 was the WORST geometry in-bucket (138 GB/s); 96x8 -> 205
 #           GB/s (+47%). ct=4096 dispatch 128x4 224 -> 96x8 265 GB/s (+18%): the
 #           large buckets want block 96 / warp 8, not block 128-144.
@@ -148,7 +148,7 @@ _MI355X_SCHED_FP4_ASYM = (
 # one plan (96,8,32,16) -> collapsed into the None bucket. Verified end-to-end on
 # DSv4-Pro 8k/1k c256: 32.8k tok/s (== baseline, tune is e2e-neutral since
 # dispatch/combine are BW-bound and a small fraction of the decode/prefill step).
-_MI355X_SCHED_FP4_ASYM_T6 = (
+_MI355X_SCHED_FP4_DISP_BF16_COMB_T6 = (
     (128, 96, 4, 160, 16),
     (256, 160, 4, 48, 8),
     (None, 96, 8, 32, 16),
@@ -165,13 +165,13 @@ _MI355X_TABLE = {
         "bf16": _MI355X_SCHED_BF16,
         "fp8": _MI355X_SCHED_FP8,
         "fp4": _MI355X_SCHED_FP4,
-        "fp4_asym": _MI355X_SCHED_FP4_ASYM,
+        "fp4_disp_bf16_comb": _MI355X_SCHED_FP4_DISP_BF16_COMB,
     },
     (8, 7168, 6): {
         "bf16": _MI355X_SCHED_BF16,
         "fp8": _MI355X_SCHED_FP8,
         "fp4": _MI355X_SCHED_FP4,
-        "fp4_asym": _MI355X_SCHED_FP4_ASYM_T6,
+        "fp4_disp_bf16_comb": _MI355X_SCHED_FP4_DISP_BF16_COMB_T6,
     },
 }
 
