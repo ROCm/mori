@@ -21,11 +21,14 @@
 // SOFTWARE.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "umbp/common/env_time.h"
@@ -652,6 +655,106 @@ TEST(GetEnvEnum, ResolvesValidEmptyAndUnknown) {
   EXPECT_EQ(GetEnvEnum(kName, "none", {"none", "same", "local"}), "none");
 
   ::unsetenv(kName);
+}
+
+// ---- round_robin: even placement without relying on the capacity snapshot ----
+//
+// Motivation: most_available and random both decide from a heartbeat-aged
+// snapshot that resets every batch, so neither remembers where the previous
+// batches went.  Random therefore spreads only in expectation, and its variance
+// is a straggler — one node absorbs a disproportionate share of a burst and the
+// whole transfer waits on it (measured ~2x slower end to end).
+
+TEST(RoundRobinRoutePut, ConsecutivePutsRotateAcrossNodes) {
+  ConfigurableRoutePutStrategy strat(Algo::kRoundRobin, Affinity::kNone);
+  std::vector<ClientRecord> clients{DramClient("a", 100 * GB), DramClient("b", 100 * GB),
+                                    DramClient("c", 100 * GB)};
+  auto out = strat.SelectBatch("req", std::vector<uint64_t>(6, 1 * GB), NoDedup(6), clients, {});
+  ASSERT_EQ(out.size(), 6u);
+  std::vector<std::string> got;
+  for (const auto& r : out) {
+    ASSERT_TRUE(r.has_value());
+    got.push_back(r->node_id);
+  }
+  // Exactly two full turns, in sorted-node order, with no repeat inside a turn.
+  EXPECT_EQ(got, (std::vector<std::string>{"a", "b", "c", "a", "b", "c"}));
+}
+
+// The cursor is process-lifetime, not per-batch: separate batches keep rotating
+// rather than both starting at the same node.  This is the property the
+// capacity snapshot cannot provide, and the actual fix for the straggler.
+TEST(RoundRobinRoutePut, RotationContinuesAcrossBatches) {
+  ConfigurableRoutePutStrategy strat(Algo::kRoundRobin, Affinity::kNone);
+  std::vector<ClientRecord> clients{DramClient("a", 100 * GB), DramClient("b", 100 * GB)};
+  auto first = strat.SelectBatch("req", {1 * GB}, NoDedup(1), clients, {});
+  auto second = strat.SelectBatch("req", {1 * GB}, NoDedup(1), clients, {});
+  ASSERT_TRUE(first[0].has_value());
+  ASSERT_TRUE(second[0].has_value());
+  EXPECT_NE(first[0]->node_id, second[0]->node_id);
+}
+
+// Even placement is worthless if it overfills a node.  Capacity still gates:
+// a node that cannot hold the block is skipped, not handed its turn.
+TEST(RoundRobinRoutePut, SkipsNodesThatCannotFit) {
+  ConfigurableRoutePutStrategy strat(Algo::kRoundRobin, Affinity::kNone);
+  std::vector<ClientRecord> clients{DramClient("a", 1 * GB), DramClient("b", 100 * GB)};
+  for (int i = 0; i < 4; ++i) {
+    auto out = strat.SelectBatch("req", {8 * GB}, NoDedup(1), clients, {});
+    ASSERT_TRUE(out[0].has_value()) << "iteration " << i;
+    EXPECT_EQ(out[0]->node_id, "b") << "iteration " << i;
+  }
+}
+
+TEST(RoundRobinRoutePut, RespectsExcludeNodes) {
+  ConfigurableRoutePutStrategy strat(Algo::kRoundRobin, Affinity::kNone);
+  std::vector<ClientRecord> clients{DramClient("a", 100 * GB), DramClient("b", 100 * GB)};
+  for (int i = 0; i < 4; ++i) {
+    auto out = strat.SelectBatch("req", {1 * GB}, NoDedup(1), clients, {"a"});
+    ASSERT_TRUE(out[0].has_value());
+    EXPECT_EQ(out[0]->node_id, "b");
+  }
+}
+
+// The straggler property itself: over a burst, no node may take a
+// disproportionate share.  Round robin is exactly balanced; the same burst
+// under random is not, which is what made the slowest node the bottleneck.
+TEST(RoundRobinRoutePut, BurstIsExactlyBalancedUnlikeRandom) {
+  constexpr int kNodes = 8;
+  constexpr int kPuts = 800;
+  std::vector<ClientRecord> clients;
+  for (int i = 0; i < kNodes; ++i) {
+    clients.push_back(DramClient(std::string("n") + static_cast<char>('a' + i), 10000 * GB));
+  }
+
+  auto share = [&](Algo algo) {
+    ConfigurableRoutePutStrategy strat(algo, Affinity::kNone, /*rng_seed=*/1234u);
+    std::map<std::string, int> hits;
+    for (int i = 0; i < kPuts; ++i) {
+      auto out = strat.SelectBatch("req", {1 * GB}, NoDedup(1), clients, {});
+      if (out[0].has_value()) ++hits[out[0]->node_id];
+    }
+    int lo = kPuts, hi = 0;
+    for (const auto& [node, n] : hits) {
+      lo = std::min(lo, n);
+      hi = std::max(hi, n);
+    }
+    return std::make_pair(lo, hi);
+  };
+
+  auto [rr_lo, rr_hi] = share(Algo::kRoundRobin);
+  EXPECT_EQ(rr_lo, kPuts / kNodes);
+  EXPECT_EQ(rr_hi, kPuts / kNodes) << "round robin must be exactly even";
+
+  // Random over the same burst is not: the busiest node takes strictly more
+  // than the quietest, and that spread is the straggler.
+  auto [rnd_lo, rnd_hi] = share(Algo::kRandom);
+  EXPECT_GT(rnd_hi, rnd_lo) << "sanity: random is expected to be uneven";
+  EXPECT_GT(rnd_hi - rnd_lo, rr_hi - rr_lo);
+}
+
+TEST(RoundRobinRoutePut, DescribeReportsAlgo) {
+  ConfigurableRoutePutStrategy strat(Algo::kRoundRobin, Affinity::kNone);
+  EXPECT_EQ(strat.Describe().rfind("round_robin/", 0), 0u);
 }
 
 }  // namespace

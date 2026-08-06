@@ -223,7 +223,19 @@ bool ConfigurableRoutePutStrategy::TierEligibleOnNode(const ClientRecord& client
 }
 
 std::string ConfigurableRoutePutStrategy::Describe() const {
-  std::string out = (algo_ == SelectAlgo::kRandom) ? "random" : "most_available";
+  std::string out;
+  switch (algo_) {
+    case SelectAlgo::kRandom:
+      out = "random";
+      break;
+    case SelectAlgo::kRoundRobin:
+      out = "round_robin";
+      break;
+    case SelectAlgo::kMostAvailable:
+    default:
+      out = "most_available";
+      break;
+  }
   out += '/';
   switch (affinity_) {
     case NodeAffinity::kSame:
@@ -251,6 +263,14 @@ std::string ConfigurableRoutePutStrategy::Describe() const {
       break;
   }
   return out;
+}
+
+size_t ConfigurableRoutePutStrategy::NextRoundRobin(size_t n) {
+  if (n == 0) return 0;
+  // relaxed: the cursor only has to be unique per call, not ordered against
+  // any other memory.  Two concurrent puts may land in either order; what
+  // matters is that they take different slots.
+  return static_cast<size_t>(rr_cursor_.fetch_add(1, std::memory_order_relaxed) % n);
 }
 
 size_t ConfigurableRoutePutStrategy::PickWeighted(const std::vector<uint64_t>& weights) {
@@ -319,6 +339,17 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::SelectByAlgo(
       weights.reserve(eligible.size());
       for (size_t idx : eligible) weights.push_back(available(idx));
       chosen = eligible[PickWeighted(weights)];
+    } else if (algo_ == SelectAlgo::kRoundRobin) {
+      // Rotate over a node_id-sorted view, not over `eligible` as returned.
+      // `candidates` comes from the registry and its order is not guaranteed
+      // stable across calls; rotating over an unstable order would revisit the
+      // same node while skipping others — exactly the clumping being removed.
+      // Sorting by node_id makes the rotation reproducible and node-count small
+      // enough (one entry per peer) that the sort is free.
+      std::vector<size_t> ordered = eligible;
+      std::sort(ordered.begin(), ordered.end(),
+                [&](size_t a, size_t b) { return candidates[a].node_id < candidates[b].node_id; });
+      chosen = ordered[NextRoundRobin(ordered.size())];
     } else {
       for (size_t idx : eligible) {
         if (available(idx) > available(chosen)) chosen = idx;

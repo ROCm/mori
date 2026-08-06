@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -116,7 +117,20 @@ enum class SsdPutMode {
 /// the registry.
 class ConfigurableRoutePutStrategy : public RoutePutStrategy {
  public:
-  enum class SelectAlgo { kMostAvailable, kRandom };
+  /// kMostAvailable — largest free space wins.
+  /// kRandom        — draw weighted by free space.
+  /// kRoundRobin    — deterministic rotation over the eligible nodes.
+  ///
+  /// Both kMostAvailable and kRandom decide from the capacity snapshot alone,
+  /// and that snapshot is heartbeat-aged and reset every batch (projected
+  /// deductions are batch-local, see LogBatchDistribution).  So neither carries
+  /// memory of where the *previous* batches went: random spreads only in
+  /// expectation, and its variance shows up as stragglers — one node draws a
+  /// disproportionate share of a burst and the whole transfer waits on it.
+  /// kRoundRobin removes the variance instead of averaging it away: a
+  /// process-lifetime cursor guarantees consecutive puts land on different
+  /// nodes regardless of what the capacity snapshot says.
+  enum class SelectAlgo { kMostAvailable, kRandom, kRoundRobin };
   enum class NodeAffinity { kNone, kSame, kLocal };
 
   ConfigurableRoutePutStrategy(SelectAlgo algo, NodeAffinity affinity,
@@ -176,6 +190,16 @@ class ConfigurableRoutePutStrategy : public RoutePutStrategy {
   /// Draw an index in [0, weights.size()) with probability proportional to the
   /// weights.  Uses the pinned RNG when seeded, else a thread_local RNG.
   size_t PickWeighted(const std::vector<uint64_t>& weights);
+
+  /// Next slot in the rotation, modulo @p n.  Advances the shared cursor, so
+  /// consecutive calls — within a batch and across batches, from any thread —
+  /// return successive slots.  That cross-call memory is the whole point: it is
+  /// what the capacity snapshot cannot provide.
+  size_t NextRoundRobin(size_t n);
+
+  /// Rotation cursor, shared by every caller.  Deliberately process-lifetime:
+  /// resetting it per batch would reintroduce the clumping this replaces.
+  std::atomic<uint64_t> rr_cursor_{0};
 
   /// One-line "where did this batch land" summary, emitted at the end of every
   /// SelectBatch (gated by UMBP_PUT_DIST_LOG, see PutDistLogEvery()).  Reports

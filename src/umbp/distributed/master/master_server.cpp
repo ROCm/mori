@@ -170,8 +170,8 @@ MasterServerConfig MasterServerConfig::FromEnvironment() {
   cfg.registry_config = ClientRegistryConfig::FromEnvironment();
   cfg.eviction_config = EvictionConfig::FromEnvironment();
 
-  cfg.route_put_algo =
-      GetEnvEnum("UMBP_ROUTE_PUT_SELECT_ALGO", "most_available", {"most_available", "random"});
+  cfg.route_put_algo = GetEnvEnum("UMBP_ROUTE_PUT_SELECT_ALGO", "most_available",
+                                  {"most_available", "random", "round_robin"});
   cfg.route_put_affinity =
       GetEnvEnum("UMBP_ROUTE_PUT_NODE_AFFINITY", "none", {"none", "same", "local"});
   cfg.route_put_ssd_mode =
@@ -179,7 +179,12 @@ MasterServerConfig MasterServerConfig::FromEnvironment() {
 
   using Algo = ConfigurableRoutePutStrategy::SelectAlgo;
   using Affinity = ConfigurableRoutePutStrategy::NodeAffinity;
-  const Algo algo = cfg.route_put_algo == "random" ? Algo::kRandom : Algo::kMostAvailable;
+  Algo algo = Algo::kMostAvailable;
+  if (cfg.route_put_algo == "random") {
+    algo = Algo::kRandom;
+  } else if (cfg.route_put_algo == "round_robin") {
+    algo = Algo::kRoundRobin;
+  }
   Affinity affinity = Affinity::kNone;
   if (cfg.route_put_affinity == "same") {
     affinity = Affinity::kSame;
