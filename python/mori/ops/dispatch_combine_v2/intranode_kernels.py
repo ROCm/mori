@@ -559,6 +559,12 @@ def _accum_funcs_int(hidden_elem_size, fp8_direct_cast=False):
     return to_accum, from_accum, zero_accum
 
 
+# Fixed size of the per-block xdb flag counter array for the gather combine entry
+# barrier: one i64 per block. 256 == the CU count (the max combine block_num), so
+# block_num never exceeds it. Deliberately a hard-coded compile-time constant.
+xdb_flag_slots = 256
+
+
 def make_combine(
     *,
     rank,
@@ -572,7 +578,6 @@ def make_combine(
     warp_num_per_block,
     off_out_tok,
     off_xdb_mem,
-    max_block_num=None,
     off_out_wts=0,
     enable_weights=True,
     fp8_direct_cast=False,
@@ -581,11 +586,6 @@ def make_combine(
     _s3_cache=2,
     _unroll=4,
 ):
-    # Size of the per-block xdb flag counter array (>= block_num). All variants
-    # sharing the flag buffer pass the same max_block_num so the tail counters
-    # stay in lockstep across calls that pick different block_num.
-    if max_block_num is None:
-        max_block_num = block_num
     # Transport dtype = external dtype, except fp8_direct_cast wires fp8 while
     # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit). fp4: i32 = 8 fp4.
     _to_accum2, _from_accum2, _zero_accum = _accum_funcs(
@@ -648,15 +648,23 @@ def make_combine(
             buffer_store(
                 phase + arith.constant(1, type=T.i64()), rsrc_xdb_flag, bid
             )
-            # the last block also advances the unused tail counters so a later
-            # call that picks a larger block_num still reads synced counters.
-            if const_expr(max_block_num > block_num):
-                if bid == block_num - 1:
-                    for j in range_constexpr(max_block_num - block_num):
+        # block 0 fills the unused tail counters [block_num, xdb_flag_slots) in
+        # parallel so a later call that picks a larger block_num still reads
+        # synced counters. Nobody reads these slots this call => no cross-block
+        # race. block 0 has warp_num_per_block*WAVE threads, which can be < the
+        # tail (e.g. WAVE=32, warp=4 => 128 threads < 256-block_num), so stride
+        # over the tail in a compile-time-fixed number of rounds (1-2 in practice).
+        if const_expr(xdb_flag_slots > block_num):
+            if bid == 0:
+                _tail = xdb_flag_slots - block_num
+                _nthr = warp_num_per_block * WAVE
+                for r in range_constexpr((_tail + _nthr - 1) // _nthr):
+                    idx = tid + r * _nthr
+                    if idx < _tail:
                         buffer_store(
                             phase + arith.constant(1, type=T.i64()),
                             rsrc_xdb_flag,
-                            block_num + j,
+                            block_num + idx,
                         )
         # every block independently polls the shared local slots (local reads).
         # Use >= (not ==): every block — including late-scheduled ones — reads the
