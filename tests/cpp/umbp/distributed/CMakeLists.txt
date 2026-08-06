@@ -298,6 +298,13 @@ target_link_libraries(test_peer_ssd_eviction PRIVATE umbp_common
 target_compile_features(test_peer_ssd_eviction PRIVATE cxx_std_17)
 add_test(NAME test_peer_ssd_eviction COMMAND test_peer_ssd_eviction)
 
+# test_peer_ssd_single_flight — same-key read coalescing (MLA + TP fan-out)
+add_executable(test_peer_ssd_single_flight test_peer_ssd_single_flight.cpp)
+target_link_libraries(test_peer_ssd_single_flight PRIVATE umbp_common
+                                                          GTest::gtest_main)
+target_compile_features(test_peer_ssd_single_flight PRIVATE cxx_std_17)
+add_test(NAME test_peer_ssd_single_flight COMMAND test_peer_ssd_single_flight)
+
 # test_ssd_copy_pipeline — DramCopyPin + async copy-on-commit pipeline
 add_executable(test_ssd_copy_pipeline test_ssd_copy_pipeline.cpp)
 target_link_libraries(test_ssd_copy_pipeline PRIVATE umbp_common

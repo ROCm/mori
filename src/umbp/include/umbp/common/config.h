@@ -117,6 +117,23 @@ struct UMBPSsdConfig {
   // with a warning rather than failing to come up.
   bool direct_io = false;
 
+  // Coalesce concurrent reads of the same key ("single flight").  When several
+  // requesters ask for one key while a device read is already outstanding, only
+  // the first touches the drive; the rest are served by memcpy from its buffer.
+  //
+  // This exists for MLA + TP, where every attention-TP rank GETs a
+  // byte-identical key, so one logical page is read tp_size times over.  MHA
+  // keys carry a per-rank suffix and never collide, so this is a no-op there.
+  // NOTE: UMBP_SSD_SINGLE_FLIGHT below only reaches configs built by
+  // UMBPConfig::FromEnvironment(), i.e. the standalone server binary.  sglang's
+  // UMBPStore constructs UMBPConfig directly, so turning this off there needs
+  // the same treatment ssd_direct_io got: a pybind def_readwrite plus an
+  // extra_config allow-list/parser entry in umbp_store.py.  Until that exists,
+  // the sglang path is always coalesced — do not read an unchanged benchmark as
+  // "single flight made no difference".  The [SsdPerf/peer] GET line reports
+  // merged= and merged_total=, which is what actually tells you.
+  bool single_flight_reads = true;
+
   // Compute checksums on write and verify them on read.  On by default; turning
   // it off is for isolating how much of the SSD path's cost is integrity work
   // rather than storage, since the DRAM tier does no checksumming at all and an
@@ -506,6 +523,8 @@ struct UMBPConfig {
     cfg.ssd.shard_io_threads = getenv_int("UMBP_SSD_SHARD_IO_THREADS", cfg.ssd.shard_io_threads);
     cfg.ssd.tier_io_threads = getenv_int("UMBP_SSD_TIER_IO_THREADS", cfg.ssd.tier_io_threads);
     cfg.ssd.direct_io = getenv_int("UMBP_SSD_DIRECT_IO", cfg.ssd.direct_io ? 1 : 0) != 0;
+    cfg.ssd.single_flight_reads =
+        getenv_int("UMBP_SSD_SINGLE_FLIGHT", cfg.ssd.single_flight_reads ? 1 : 0) != 0;
     cfg.ssd.verify_crc = getenv_int("UMBP_SSD_VERIFY_CRC", cfg.ssd.verify_crc ? 1 : 0) != 0;
     // Durability of the SSD cache tier.  "strict" (default) fdatasync()s every
     // batch write; "relaxed" leaves the data in the page cache and lets the

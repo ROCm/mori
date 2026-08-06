@@ -62,7 +62,8 @@ class PeerSsdManager : public OwnedLocationSource {
   // Test-only: inject a ready-made backend and explicit watermarks so unit
   // tests can drive eviction with a controllable (e.g. blocking) fake backend.
   // Production code must use the config constructor.
-  PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark, double low_watermark);
+  PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark, double low_watermark,
+                 bool single_flight = true);
 
   ~PeerSsdManager() override;
 
@@ -173,6 +174,10 @@ class PeerSsdManager : public OwnedLocationSource {
     return metrics_.read_size_too_large.load(std::memory_order_relaxed);
   }
   uint64_t ReadError() const { return metrics_.read_error.load(std::memory_order_relaxed); }
+  // Single-flight probe (see read_lead / read_dup below).
+  uint64_t ReadLead() const { return metrics_.read_lead.load(std::memory_order_relaxed); }
+  uint64_t ReadDup() const { return metrics_.read_dup.load(std::memory_order_relaxed); }
+  uint64_t ReadMerged() const { return metrics_.read_merged.load(std::memory_order_relaxed); }
   // Byte counters for SSD IO bandwidth (rate() in Grafana = bytes/s).
   uint64_t CopyBytes() const { return metrics_.copy_bytes.load(std::memory_order_relaxed); }
   uint64_t ReadBytes() const { return metrics_.read_bytes.load(std::memory_order_relaxed); }
@@ -221,14 +226,63 @@ class PeerSsdManager : public OwnedLocationSource {
   std::list<std::string> lru_;  // front = most-recently-used, back = LRU
   std::vector<KvEvent> pending_events_;
 
-  // Read priority + eviction coordination (all guarded by mutex_):
-  //   inflight_reads_: key -> active PrepareRead count (entry exists only while
-  //     > 0).  Eviction skips keys with a live read.
+  // Per-key state for one or more concurrent reads.  Serves two purposes:
+  //
+  //  1. Read priority / eviction safety (the original role): an entry exists
+  //     exactly while refs > 0, and eviction skips any key with a live read.
+  //
+  //  2. Single flight: the first requester of a key becomes the *leader* and is
+  //     the only one to touch the drive.  Requesters that arrive while it is
+  //     still reading become *followers* — they register a destination buffer,
+  //     block on cv, and are filled by memcpy from the leader's buffer when it
+  //     completes.  This is what collapses the tp_size-way read fan-out that
+  //     MLA + TP produces (every attention-TP rank GETs a byte-identical key).
+  //
+  // A requester that arrives after the leader has sealed its follower snapshot
+  // is *independent*: it missed the merge window and issues its own read, which
+  // is exactly the pre-single-flight behaviour and always correct.
+  //
+  // Buffer lifetime: both leader and followers are blocked inside
+  // PrepareRead/PrepareReadBatch for the whole copy, so neither side's staging
+  // slot can be recycled underneath the memcpy.
+  // One leader's read, from claim to fan-out.  Followers capture a shared_ptr
+  // at attach time and wait on *this* object, never on mutable per-key state:
+  // otherwise a leader that finishes and is immediately replaced by a new
+  // leader on the same key would reset the flag a not-yet-woken follower is
+  // waiting on, and that follower would silently start tracking a read whose
+  // fan-out list it is not in.  Holding the shared_ptr also lets the episode
+  // outlive its slot, so the last follower to wake still finds valid state.
+  struct ReadEpisode {
+    bool sealed = false;  // snapshot taken; late arrivals must not attach
+    bool done = false;    // leader finished (read + fan-out)
+    bool ok = false;      // leader's read outcome, published to followers
+    std::vector<std::pair<void*, size_t>> followers;  // {dst, cap}
+    std::condition_variable cv;                       // waited on under mutex_
+  };
+
+  struct InflightRead {
+    int refs = 0;  // leader + followers + independents holding this key
+    // Non-null exactly while a leader is mid-read; the leader clears it on
+    // completion so the next arrival starts a fresh episode.
+    std::shared_ptr<ReadEpisode> episode;
+  };
+
+  //   inflight_reads_: key -> InflightRead (entry exists only while refs > 0).
   //   evicting_: keys currently inside Evict's backend-evict window; new reads
   //     of these miss (kNotFound) and SelectVictims skips them.
-  std::unordered_map<std::string, int> inflight_reads_;
+  std::unordered_map<std::string, std::unique_ptr<InflightRead>> inflight_reads_;
   std::unordered_set<std::string> evicting_;
   std::condition_variable reads_drained_cv_;  // notified when inflight_reads_ empties
+
+  // Coalesce concurrent same-key reads (UMBPSsdConfig::single_flight_reads).
+  // Off => every requester reads the device, and read_dup still reports the
+  // headroom that turning it on would recover.
+  bool single_flight_ = true;
+
+  // Cap on how long a follower waits for its leader.  A wedged or crashed
+  // leader must surface as a read error rather than hanging the RPC; the caller
+  // treats it as a miss and refetches from source.
+  static constexpr int kFollowerWaitSeconds = 30;
 
   // Prometheus-only observability counters: relaxed atomics bumped at discrete
   // events, read once per metrics tick.  NOT correctness state
@@ -238,6 +292,20 @@ class PeerSsdManager : public OwnedLocationSource {
     std::atomic<uint64_t> read_not_found{0};
     std::atomic<uint64_t> read_size_too_large{0};
     std::atomic<uint64_t> read_error{0};
+    // Single-flight probe.  A read that finds inflight_reads_[key] == 0 "leads"
+    // (it is the one that would issue device IO under single-flight); one that
+    // finds > 0 is a "dup" — a concurrent request for the identical key that
+    // could have attached to the in-flight read instead of issuing its own.
+    // Today every requester reads, so read_dup counts device reads that a
+    // single-flight merge would eliminate.  MLA + TP is the case that produces
+    // them (all attention-TP ranks GET a byte-identical key); MHA keys carry a
+    // per-rank suffix and should never dup.
+    std::atomic<uint64_t> read_lead{0};
+    std::atomic<uint64_t> read_dup{0};
+    // Of the read_dup requests, those actually served by memcpy from a leader
+    // (single_flight_ on and the merge window not missed).  read_dup minus this
+    // is the residue that still hit the drive.
+    std::atomic<uint64_t> read_merged{0};
     std::atomic<uint64_t> copy_bytes{0};  // bytes written to SSD (write IO)
     std::atomic<uint64_t> read_bytes{0};  // bytes read from SSD (read IO)
     std::atomic<uint64_t> evict_rounds{0};

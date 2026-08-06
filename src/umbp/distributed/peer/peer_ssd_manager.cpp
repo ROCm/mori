@@ -21,9 +21,14 @@
 // SOFTWARE.
 #include "umbp/distributed/peer/peer_ssd_manager.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <tuple>
+#include <utility>
+#include <vector>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/ssd_perf.h"
@@ -60,6 +65,7 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
   }
   high_watermark_ = ssd.high_watermark;
   low_watermark_ = ssd.low_watermark;
+  single_flight_ = ssd.single_flight_reads;
 
   // Explicit backend selection — an unknown value is a configuration error, not
   // a reason to silently fall back to the file backend.
@@ -98,8 +104,9 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
 }
 
 PeerSsdManager::PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark,
-                               double low_watermark)
+                               double low_watermark, bool single_flight)
     : backend_(std::move(backend)), high_watermark_(high_watermark), low_watermark_(low_watermark) {
+  single_flight_ = single_flight;
   if (!WatermarksValid(high_watermark_, low_watermark_)) {
     throw std::runtime_error(
         "[PeerSsdManager] invalid SSD watermarks (require 0 < low_watermark < "
@@ -485,6 +492,9 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
   // Resolve size and mark the read in flight under the lock, then run the
   // blocking SSD IO outside it (so a concurrent copy Write is not serialized).
   size_t size = 0;
+  bool leading = false;    // we own the device read and the fan-out
+  bool following = false;  // a leader will fill our buffer; we only wait
+  std::shared_ptr<ReadEpisode> episode;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = owned_.find(key);
@@ -509,17 +519,74 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
           key, size, staging_cap);
       return SsdReadOutcome{SsdReadStatus::kSizeTooLarge, size};
     }
-    ++inflight_reads_[key];
+    // Same leader/follower protocol as PrepareReadBatch, over the same map, so
+    // a single-key read and a batched one coalesce with each other.  No log
+    // here: this path is one key per call, so the counters are the only sane
+    // reporting channel.
+    auto& slot = inflight_reads_[key];
+    if (!slot) slot = std::make_unique<InflightRead>();
+    const int prior = slot->refs++;
+    metrics_.read_dup.fetch_add(prior > 0 ? 1 : 0, std::memory_order_relaxed);
+    metrics_.read_lead.fetch_add(prior > 0 ? 0 : 1, std::memory_order_relaxed);
+    if (!slot->episode) {
+      slot->episode = std::make_shared<ReadEpisode>();
+      episode = slot->episode;
+      leading = true;
+    } else if (single_flight_ && !slot->episode->sealed) {
+      slot->episode->followers.emplace_back(staging_ptr, staging_cap);
+      episode = slot->episode;
+      following = true;
+      metrics_.read_merged.fetch_add(1, std::memory_order_relaxed);
+    }
+    // else: missed the merge window — fall through and read it ourselves.
   }
 
-  bool read_ok = backend_->ReadIntoPtr(key, reinterpret_cast<uintptr_t>(staging_ptr), size);
+  bool read_ok = false;
+  if (following) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    const bool signalled = episode->cv.wait_for(lock, std::chrono::seconds(kFollowerWaitSeconds),
+                                                [&episode] { return episode->done; });
+    if (!signalled) {
+      MORI_UMBP_WARN(
+          "[PeerSsdManager] single-flight follower timed out after {}s waiting on leader key={}",
+          kFollowerWaitSeconds, key);
+    }
+    read_ok = signalled && episode->ok;
+  } else {
+    read_ok = backend_->ReadIntoPtr(key, reinterpret_cast<uintptr_t>(staging_ptr), size);
+    if (leading) {
+      // Publish to whoever attached while we were on the device.  Failures are
+      // published too, so a follower is never left to time out.
+      std::vector<std::pair<void*, size_t>> fanout;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        episode->sealed = true;
+        episode->ok = read_ok;
+        fanout.swap(episode->followers);
+        auto it = inflight_reads_.find(key);
+        if (it != inflight_reads_.end() && it->second->episode == episode) {
+          it->second->episode.reset();
+        }
+      }
+      if (read_ok) {
+        for (const auto& f : fanout) {
+          std::memcpy(f.first, staging_ptr, std::min(size, f.second));
+        }
+      }
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        episode->done = true;
+        episode->cv.notify_all();
+      }
+    }
+  }
 
   // Always release the in-flight mark (even on error), refresh LRU on success,
   // and wake a waiting ClearLocal once the last read drains.
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto rit = inflight_reads_.find(key);
-    if (rit != inflight_reads_.end() && --rit->second <= 0) inflight_reads_.erase(rit);
+    if (rit != inflight_reads_.end() && --rit->second->refs <= 0) inflight_reads_.erase(rit);
     if (read_ok && owned_.find(key) != owned_.end()) TouchLocked(key);
     if (inflight_reads_.empty()) reads_drained_cv_.notify_all();
   }
@@ -559,8 +626,18 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
 
   // Pass 1 — resolve sizes and mark every servable key in flight under ONE lock
   // acquisition (the per-key path pays two per key).
-  std::vector<size_t> todo;
+  std::vector<size_t> todo;   // I lead (or independently read) these
+  std::vector<size_t> waits;  // I follow these; a leader will fill my buffer
+  std::vector<bool> is_leader(keys.size(), false);
+  // Per-request handle on the episode we lead or follow.  Held as a shared_ptr
+  // so it stays valid even after the slot moves on to a new leader.
+  std::vector<std::shared_ptr<ReadEpisode>> episodes(keys.size());
   todo.reserve(keys.size());
+  // dup = requests that found an identical read already in flight;
+  // merged = those actually served without touching the drive;
+  // max_concurrent = largest same-key fan-out seen this batch.
+  size_t dup = 0, merged = 0;
+  int max_concurrent = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -580,13 +657,38 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
         continue;
       }
       out[i].size = size;
-      ++inflight_reads_[keys[i]];
-      todo.push_back(i);
+      auto& slot = inflight_reads_[keys[i]];
+      if (!slot) slot = std::make_unique<InflightRead>();
+      const int prior = slot->refs++;
+      if (prior > 0) {
+        ++dup;
+        if (prior > max_concurrent) max_concurrent = prior;
+      }
+      if (!slot->episode) {
+        // First in: this request owns the device read and the fan-out.
+        slot->episode = std::make_shared<ReadEpisode>();
+        episodes[i] = slot->episode;
+        is_leader[i] = true;
+        todo.push_back(i);
+      } else if (single_flight_ && !slot->episode->sealed) {
+        // Merge window open: hand the leader our buffer and wait on its episode.
+        slot->episode->followers.emplace_back(dsts[i], caps[i]);
+        episodes[i] = slot->episode;
+        waits.push_back(i);
+        ++merged;
+      } else {
+        // Missed the window (or single flight off): read it ourselves.  This is
+        // the pre-single-flight path and is always correct, just not merged.
+        todo.push_back(i);
+      }
     }
   }
   resolve_ms = ssdperf::MsSince(t_begin);
-  const size_t not_owned = keys.size() - todo.size();
-  if (todo.empty()) {
+  metrics_.read_dup.fetch_add(dup, std::memory_order_relaxed);
+  metrics_.read_merged.fetch_add(merged, std::memory_order_relaxed);
+  metrics_.read_lead.fetch_add(todo.size() + waits.size() - dup, std::memory_order_relaxed);
+  const size_t not_owned = keys.size() - todo.size() - waits.size();
+  if (todo.empty() && waits.empty()) {
     if (ssdperf::Enabled()) {
       MORI_UMBP_INFO(
           "[SsdPerf/peer] GET keys={} served=0 not_owned={} total_ms={:.3f} | resolve={:.3f}ms "
@@ -609,10 +711,66 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
     d.push_back(reinterpret_cast<uintptr_t>(dsts[i]));
     z.push_back(out[i].size);
   }
-  const auto t_backend = ssdperf::Now();
-  auto ok = backend_->BatchReadIntoPtr(k, d, z);
-  ok.resize(todo.size(), false);
-  backend_ms = ssdperf::MsSince(t_backend);
+  std::vector<bool> ok;
+  if (!todo.empty()) {
+    const auto t_backend = ssdperf::Now();
+    ok = backend_->BatchReadIntoPtr(k, d, z);
+    ok.resize(todo.size(), false);
+    backend_ms = ssdperf::MsSince(t_backend);
+  }
+
+  // Pass 2b — fan out to followers.  MUST run before Pass 2c: if this batch
+  // leads key A while another thread leads B and follows A, waiting first would
+  // close a cycle.  Issuing all our own reads and publishing their results
+  // before we block on anyone else's makes that cycle impossible.
+  //
+  // A leader whose read FAILED still publishes (ok=false) — followers must be
+  // released with an error, never left to time out.
+  for (size_t j = 0; j < todo.size(); ++j) {
+    const size_t i = todo[j];
+    if (!is_leader[i]) continue;  // independent read: nobody is waiting on it
+    const auto& ep = episodes[i];
+    std::vector<std::pair<void*, size_t>> fanout;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ep->sealed = true;  // late arrivals now go independent instead of waiting
+      ep->ok = ok[j];
+      fanout.swap(ep->followers);
+      // Retire the episode so the next arrival starts a fresh one rather than
+      // attaching to a read that is already past its snapshot.
+      auto it = inflight_reads_.find(keys[i]);
+      if (it != inflight_reads_.end() && it->second->episode == ep) it->second->episode.reset();
+    }
+    // Copy outside the lock: this is host DRAM and page-sized, but holding
+    // mutex_ across it would stall every other read/evict on this manager.
+    if (ok[j]) {
+      for (const auto& f : fanout) {
+        std::memcpy(f.first, dsts[i], std::min(out[i].size, f.second));
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ep->done = true;
+      ep->cv.notify_all();
+    }
+  }
+
+  // Pass 2c — collect the keys we followed.  Our staging buffer is still alive
+  // (we never returned), so the leader's memcpy landed in a valid destination.
+  std::vector<bool> wait_ok(waits.size(), false);
+  for (size_t w = 0; w < waits.size(); ++w) {
+    const size_t i = waits[w];
+    const auto& ep = episodes[i];
+    std::unique_lock<std::mutex> lock(mutex_);
+    const bool signalled = ep->cv.wait_for(lock, std::chrono::seconds(kFollowerWaitSeconds),
+                                           [&ep] { return ep->done; });
+    if (!signalled) {
+      MORI_UMBP_WARN(
+          "[PeerSsdManager] single-flight follower timed out after {}s waiting on leader key={}",
+          kFollowerWaitSeconds, keys[i]);
+    }
+    wait_ok[w] = signalled && ep->ok;
+  }
 
   // Pass 3 — release the in-flight marks, refresh LRU for the reads that landed,
   // and wake a waiting ClearLocal once the last read drains.
@@ -620,30 +778,34 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
   uint64_t read_bytes = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (size_t j = 0; j < todo.size(); ++j) {
-      const size_t i = todo[j];
-      auto rit = inflight_reads_.find(keys[i]);
-      if (rit != inflight_reads_.end() && --rit->second <= 0) inflight_reads_.erase(rit);
-      if (ok[j] && owned_.find(keys[i]) != owned_.end()) TouchLocked(keys[i]);
-    }
+    auto release = [&](const std::string& key, bool landed) {
+      auto rit = inflight_reads_.find(key);
+      if (rit != inflight_reads_.end() && --rit->second->refs <= 0) inflight_reads_.erase(rit);
+      if (landed && owned_.find(key) != owned_.end()) TouchLocked(key);
+    };
+    for (size_t j = 0; j < todo.size(); ++j) release(keys[todo[j]], ok[j]);
+    for (size_t w = 0; w < waits.size(); ++w) release(keys[waits[w]], wait_ok[w]);
     if (inflight_reads_.empty()) reads_drained_cv_.notify_all();
   }
 
-  for (size_t j = 0; j < todo.size(); ++j) {
-    const size_t i = todo[j];
-    if (ok[j]) {
+  auto record = [&](size_t i, bool landed, bool from_device) {
+    if (landed) {
       out[i].status = SsdReadStatus::kOk;
-      read_bytes += out[i].size;
+      // read_bytes is device traffic only, so merged reads are excluded — the
+      // counter stays a true measure of what the drive moved.
+      if (from_device) read_bytes += out[i].size;
       metrics_.read_ok.fetch_add(1, std::memory_order_relaxed);
     } else {
-      // owned_ had the key but the backend couldn't serve it (a local evict
-      // raced us, or a corrupt record): kError, not a definitive miss.
+      // owned_ had the key but it couldn't be served (a local evict raced us, a
+      // corrupt record, or our leader failed): kError, not a definitive miss.
       out[i].status = SsdReadStatus::kError;
       metrics_.read_error.fetch_add(1, std::memory_order_relaxed);
-      MORI_UMBP_WARN("[PeerSsdManager] PrepareReadBatch backend read failed key={} size={}",
-                     keys[i], out[i].size);
+      MORI_UMBP_WARN("[PeerSsdManager] PrepareReadBatch read failed key={} size={} (merged={})",
+                     keys[i], out[i].size, !from_device);
     }
-  }
+  };
+  for (size_t j = 0; j < todo.size(); ++j) record(todo[j], ok[j], /*from_device=*/true);
+  for (size_t w = 0; w < waits.size(); ++w) record(waits[w], wait_ok[w], /*from_device=*/false);
   metrics_.read_bytes.fetch_add(read_bytes, std::memory_order_relaxed);
   release_ms = ssdperf::MsSince(t_release);
 
@@ -653,12 +815,23 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
     for (size_t j = 0; j < todo.size(); ++j) {
       if (ok[j]) ++served;
     }
+    for (size_t w = 0; w < waits.size(); ++w) {
+      if (wait_ok[w]) ++served;
+    }
+    const uint64_t dup_total = metrics_.read_dup.load(std::memory_order_relaxed);
+    const uint64_t lead_total = metrics_.read_lead.load(std::memory_order_relaxed);
+    const uint64_t merged_total = metrics_.read_merged.load(std::memory_order_relaxed);
+    const uint64_t probe_total = dup_total + lead_total;
     MORI_UMBP_INFO(
-        "[SsdPerf/peer] GET keys={} attempted={} served={} not_owned={} bytes={} total_ms={:.3f} "
-        "GB_s={:.2f} | resolve={:.3f}ms backend={:.3f}ms ({:.0f}%) release_lru={:.3f}ms",
+        "[SsdPerf/peer] GET keys={} device_reads={} served={} not_owned={} bytes={} "
+        "total_ms={:.3f} GB_s={:.2f} | resolve={:.3f}ms backend={:.3f}ms ({:.0f}%) "
+        "release_lru={:.3f}ms | singleflight={} dup={} merged={} max_concurrent={} "
+        "dup_total={}/{} ({:.1f}%) merged_total={}",
         keys.size(), todo.size(), served, not_owned, read_bytes, total_ms,
         ssdperf::GbPerSec(read_bytes, total_ms), resolve_ms, backend_ms,
-        ssdperf::Pct(backend_ms, total_ms), release_ms);
+        ssdperf::Pct(backend_ms, total_ms), release_ms, single_flight_ ? "on" : "off", dup, merged,
+        max_concurrent, dup_total, probe_total,
+        ssdperf::Pct(static_cast<double>(dup_total), probe_total), merged_total);
   }
   return out;
 }
