@@ -46,8 +46,10 @@ Recurring conventions used throughout:
 """
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, T, vector
-from flydsl.expr.buffer_ops import (
+from flydsl.expr import arith, const_expr, range_constexpr
+from .flydsl_compat import (  # flydsl 0.2.x / 0.3.x differences live here
+    T,
+    vector,
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
