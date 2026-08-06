@@ -61,8 +61,12 @@
 // docs/MORI-IO-BENCHMARK.md for the two-node walkthrough.
 
 #include <hip/hip_runtime.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -114,7 +118,7 @@ namespace {
 class BenchBuffer {
  public:
   BenchBuffer(IOEngine& engine, size_t bytes, int device, MemoryLocationType loc)
-      : engine(engine), cpu(loc == MemoryLocationType::CPU) {
+      : engine(engine), cpu(loc == MemoryLocationType::CPU), device(device) {
     if (cpu)
       HIP_CHECK(hipHostMalloc(&ptr, bytes, 0));
     else
@@ -150,15 +154,24 @@ class BenchBuffer {
  private:
   void Free() {
     if (!ptr) return;
+    // Restore the owning device first. Allocation sets it explicitly, but the
+    // destructor runs at scope exit under whatever device is current then --
+    // with two buffers on two GPUs (--xgmi-single-process) that is the wrong one
+    // for at least one of them.
+    int prev = -1;
+    const bool switched = !cpu && hipGetDevice(&prev) == hipSuccess && prev != device &&
+                          hipSetDevice(device) == hipSuccess;
     hipError_t e = cpu ? hipHostFree(ptr) : hipFree(ptr);
     if (e != hipSuccess) {
       std::cerr << "buffer free failed: " << hipGetErrorString(e) << std::endl;
     }
+    if (switched) (void)hipSetDevice(prev);
     ptr = nullptr;
   }
 
   IOEngine& engine;
   const bool cpu;
+  const int device;
   void* ptr{nullptr};
   bool registered{false};
   MemoryDesc desc;
@@ -223,42 +236,63 @@ std::vector<uint64_t> SlotChecksums(const void* buf, const SizeVec& offsets, siz
 // Both ranks derive the same UniqueId from the master endpoint, so nothing has to
 // carry it between them. The bootstrap picks its own local interface; set
 // MORI_SOCKET_IFNAME when that choice has no route to the peer.
+//
+// World size is a runtime value, not a constant: with --num-initiator-dev N /
+// --num-target-dev N there are N processes per node, one per GPU, and the world
+// is numInitiatorDev + numTargetDev ranks. Global ranks are laid out initiators
+// first, so initiator local i is global i and target local i is global
+// numInitiatorDev + i -- the same numbering the Python bench gives torch.dist
+// (benchmark.py _setup_rdma), which keeps the two directly comparable.
 class Rendezvous {
  public:
-  Rendezvous(int rank, const std::string& masterIp, uint16_t port)
-      : boot(mori::application::SocketBootstrapNetwork::GenerateUniqueId(masterIp, port), rank,
-             kWorldSize),
-        myRank(rank) {
+  Rendezvous(int globalRank, int worldSize, int peerRank, const std::string& masterIp,
+             uint16_t port)
+      : boot(mori::application::SocketBootstrapNetwork::GenerateUniqueId(masterIp, port),
+             globalRank, worldSize),
+        myRank(globalRank),
+        worldSize(worldSize),
+        peerRank(peerRank) {
     boot.Initialize();
   }
 
-  // Contribute this rank's blob, return the peer's. Allgather is fixed-size while
-  // packed descriptors are not, so sizes go first and the payload round pads every
-  // rank up to the larger of the two.
-  std::string ExchangeBlob(const std::string& mine) {
-    uint64_t sizes[kWorldSize] = {};
+  // Contribute this rank's blob, return every rank's, indexed by global rank.
+  // Allgather is fixed-size while packed descriptors are not, so sizes go first
+  // and the payload round pads every rank up to the largest of them.
+  std::vector<std::string> AllgatherBlobs(const std::string& mine) {
+    std::vector<uint64_t> sizes(static_cast<size_t>(worldSize), 0);
     uint64_t mySize = mine.size();
-    boot.Allgather(&mySize, sizes, sizeof(mySize));
+    boot.Allgather(&mySize, sizes.data(), sizeof(mySize));
 
-    const size_t stride = std::max(sizes[0], sizes[1]);
-    if (stride == 0) return {};
+    const size_t stride = *std::max_element(sizes.begin(), sizes.end());
+    std::vector<std::string> out(static_cast<size_t>(worldSize));
+    if (stride == 0) return out;
 
-    std::vector<char> sendBuf(stride, 0), recvBuf(stride * kWorldSize, 0);
+    std::vector<char> sendBuf(stride, 0), recvBuf(stride * static_cast<size_t>(worldSize), 0);
     std::memcpy(sendBuf.data(), mine.data(), mine.size());
     boot.Allgather(sendBuf.data(), recvBuf.data(), stride);
 
-    const int peer = 1 - myRank;
-    return std::string(recvBuf.data() + peer * stride, sizes[peer]);
+    for (int r = 0; r < worldSize; ++r) {
+      out[static_cast<size_t>(r)] = std::string(recvBuf.data() + r * stride, sizes[r]);
+    }
+    return out;
+  }
+
+  // Contribute this rank's blob, return the paired rank's. Every rank still
+  // takes part in the underlying allgather -- it is a collective, so a rank that
+  // sat one out would leave the rest blocked until the bootstrap timeout.
+  std::string ExchangeBlob(const std::string& mine) {
+    return AllgatherBlobs(mine)[static_cast<size_t>(peerRank)];
   }
 
   void Barrier() { boot.Barrier(); }
 
- private:
-  // Rank 0 initiates, rank 1 targets.
-  static constexpr int kWorldSize = 2;
+  int WorldSize() const { return worldSize; }
 
+ private:
   mori::application::SocketBootstrapNetwork boot;
   const int myRank;
+  const int worldSize;
+  const int peerRank;
 };
 
 template <typename T>
@@ -283,43 +317,54 @@ T Unpack(const std::string& b) {
 // contributes an empty checksum vector rather than skipping the call, which also
 // makes the flag safe to pass to only one side -- either empty vector downgrades
 // the run to "skipped" instead of hanging or reporting a bogus failure.
-bool ValidateTransfer(Rendezvous& rdv, const void* buf, size_t msg, int batch, bool batched,
-                      bool batchContiguous, int rank, bool wanted) {
-  std::vector<uint64_t> mine;
-  if (wanted) {
-    // Mirror the offsets the sweep actually used: the batched path strides by
-    // msg+1 unless --batch-contiguous, while the singles path is always
-    // contiguous (same asymmetry as the Python bench's run_single_once).
-    const size_t stride = batched ? (batchContiguous ? msg : msg + 1) : msg;
-    SizeVec offsets(static_cast<size_t>(batch));
-    for (int i = 0; i < batch; ++i) offsets[i] = static_cast<size_t>(i) * stride;
-    mine = SlotChecksums(buf, offsets, msg);
-  }
+// Checksums of the slots the sweep actually touched, or an empty vector when the
+// caller opted out with --skip-validate.
+std::vector<uint64_t> TransferChecksums(const void* buf, size_t msg, int batch, bool batched,
+                                        bool batchContiguous, bool wanted) {
+  if (!wanted) return {};
+  // Mirror the offsets the sweep actually used: the batched path strides by
+  // msg+1 unless --batch-contiguous, while the singles path is always
+  // contiguous (same asymmetry as the Python bench's run_single_once).
+  const size_t stride = batched ? (batchContiguous ? msg : msg + 1) : msg;
+  SizeVec offsets(static_cast<size_t>(batch));
+  for (int i = 0; i < batch; ++i) offsets[i] = static_cast<size_t>(i) * stride;
+  return SlotChecksums(buf, offsets, msg);
+}
 
-  const auto peer = Unpack<std::vector<uint64_t>>(rdv.ExchangeBlob(Pack(mine)));
-  if (rank != 0) return true;
-
+// Compare two checksum vectors and report. `label` prefixes every line so the
+// output stays readable when N initiator ranks report concurrently.
+bool CompareChecksums(const std::vector<uint64_t>& mine, const std::vector<uint64_t>& peer,
+                      size_t msg, int batch, const std::string& label) {
   if (mine.empty() || peer.empty()) {
-    std::cout << "validation: skipped"
+    std::cout << label << "validation: skipped"
               << (mine.empty() ? "" : " (peer opted out with --skip-validate)") << std::endl;
     return true;
   }
   if (peer.size() != mine.size()) {
-    std::cerr << "VALIDATION FAILED: peer returned " << peer.size() << " checksums, expected "
-              << mine.size() << std::endl;
+    std::cerr << label << "VALIDATION FAILED: peer returned " << peer.size()
+              << " checksums, expected " << mine.size() << std::endl;
     return false;
   }
   for (size_t i = 0; i < mine.size(); ++i) {
     if (mine[i] != peer[i]) {
-      std::cerr << "VALIDATION FAILED: slot " << i << " of " << mine.size()
+      std::cerr << label << "VALIDATION FAILED: slot " << i << " of " << mine.size()
                 << " differs at msg=" << msg << " batch=" << batch << " (initiator " << std::hex
                 << mine[i] << " vs target " << peer[i] << std::dec << ")" << std::endl;
       return false;
     }
   }
-  std::cout << "validation: OK (" << batch << " slot(s) x " << msg << " B byte-identical)"
+  std::cout << label << "validation: OK (" << batch << " slot(s) x " << msg << " B byte-identical)"
             << std::endl;
   return true;
+}
+
+bool ValidateTransfer(Rendezvous& rdv, const void* buf, size_t msg, int batch, bool batched,
+                      bool batchContiguous, bool isInitiator, bool wanted,
+                      const std::string& label) {
+  const auto mine = TransferChecksums(buf, msg, batch, batched, batchContiguous, wanted);
+  const auto peer = Unpack<std::vector<uint64_t>>(rdv.ExchangeBlob(Pack(mine)));
+  if (!isInitiator) return true;
+  return CompareChecksums(mine, peer, msg, batch, label);
 }
 
 // ------------------------------- config ------------------------------------
@@ -330,10 +375,23 @@ struct Args {
   std::string master_ip;  // bootstrap root (rank 0's data IP); both ranks pass the same
   std::string self_ip;    // this rank's own reachable IP (advertised in EngineDesc)
   uint16_t port = 18515;
-  int gpu = 0;
-  int target_dev_offset = 0;     // --target-dev-offset (target GPU = (gpu+offset)%ndev)
+  int gpu = 0;                // --gpu / --src-gpu
+  int dst_gpu = -1;           // --dst-gpu (-1 = derive from --target-dev-offset)
+  int target_dev_offset = 0;  // --target-dev-offset (target GPU = (gpu+offset)%ndev)
+
+  // Multi-device fan-out (Python --num-initiator-dev / --num-target-dev): each
+  // side forks one process per GPU, initiator local i pairing with target local
+  // i. Must be equal, as in the Python bench.
+  int num_initiator_dev = 1;
+  int num_target_dev = 1;
+
   std::string op = "write";      // write|read
-  std::string backend = "rdma";  // --backend rdma|xgmi (xgmi = intra-node GPU<->GPU)
+  std::string backend = "rdma";  // --backend rdma|xgmi|fabric
+  // --xgmi-single-process: run BOTH sides in one process over two local GPUs, no
+  // rendezvous (the Python bench's default XGMI mode). The normal two-rank path
+  // is already what Python calls --xgmi-multiprocess.
+  bool xgmi_single_process = false;
+  bool xgmi_multiprocess = false;  // accepted for parity; already the default
 
   // Sweep control (Python parity). --all sweeps message size; --all-batch sweeps
   // batch size. Neither set => single run at (buffer_size, batch).
@@ -402,7 +460,7 @@ void PrintUsage(const char* argv0) {
       "\n"
       "Workload:\n"
       "  --op <write|read>        transfer direction (default: write)\n"
-      "  --backend <rdma|xgmi>    (default: rdma)\n"
+      "  --backend <rdma|xgmi|fabric>  (default: rdma; fabric = UALink scale-up vPOD)\n"
       "  --buffer-size N          message size in bytes when not sweeping (default: 32768)\n"
       "  --transfer-batch-size N  transfers per iteration (default: 1)\n"
       "  --enable-batch-transfer  one N-descriptor batch request per iteration (default)\n"
@@ -424,8 +482,16 @@ void PrintUsage(const char* argv0) {
       "  --mem-type <gpu|cpu>     (default: gpu)\n"
       "  --initiator-mem-type T   overrides --mem-type on rank 0\n"
       "  --target-mem-type T      overrides --mem-type on rank 1\n"
-      "  --gpu N                  local device ordinal (default: 0)\n"
+      "  --gpu N                  local device ordinal (default: 0); alias --src-gpu\n"
+      "  --dst-gpu N              peer device ordinal; sets --target-dev-offset (dst - gpu),\n"
+      "                           and is the destination GPU under --xgmi-single-process\n"
       "  --target-dev-offset N    target GPU = (gpu + offset) %% device count\n"
+      "\n"
+      "Multi-device (one process per GPU, initiator i <-> target i):\n"
+      "  --num-initiator-dev N    GPUs/processes on rank 0 (default: 1)\n"
+      "  --num-target-dev N       GPUs/processes on rank 1 (default: 1; must equal the above)\n"
+      "                           Rank r's process i drives GPU (gpu + i) and reports its own\n"
+      "                           row; rank 0 also prints an AGGREGATE line summing all pairs.\n"
       "\n"
       "RDMA tuning:\n"
       "  --num-qp-per-transfer N  (default: 4)\n"
@@ -439,9 +505,15 @@ void PrintUsage(const char* argv0) {
       "  --max-cqe-num N          0 = backend default\n"
       "  --max-msg-sge N          0 = backend default\n"
       "\n"
-      "XGMI tuning:\n"
+      "XGMI / FABRIC tuning:\n"
       "  --num-streams N          (default: 64)\n"
       "  --num-events N           (default: 64)\n"
+      "  --xgmi-single-process    run both sides in ONE process over --src-gpu/--dst-gpu with\n"
+      "                           no rendezvous (Python's default XGMI mode). Without it the\n"
+      "                           usual two-rank path runs, which is already Python's\n"
+      "                           --xgmi-multiprocess (distinct engine keys => HIP IPC).\n"
+      "  --xgmi-multiprocess      accepted for Python parity; this is the default, so it only\n"
+      "                           documents intent (rejected with --xgmi-single-process)\n"
       "\n"
       "Other:\n"
       "  --skip-validate          skip the post-sweep checksum comparison\n"
@@ -465,16 +537,26 @@ Args ParseArgs(int argc, char** argv) {
       a.help = true;
     else if (k == "--rank")
       a.rank = std::stoi(next());
-    else if (k == "--master-ip")
+    else if (k == "--master-ip" || k == "--host")  // --host: Python spelling
       a.master_ip = next();
     else if (k == "--self-ip")
       a.self_ip = next();
     else if (k == "--port")
       a.port = static_cast<uint16_t>(std::stoi(next()));
-    else if (k == "--gpu")
+    else if (k == "--gpu" || k == "--src-gpu")
       a.gpu = std::stoi(next());
+    else if (k == "--dst-gpu")
+      a.dst_gpu = std::stoi(next());
     else if (k == "--target-dev-offset")
       a.target_dev_offset = std::stoi(next());
+    else if (k == "--num-initiator-dev")
+      a.num_initiator_dev = std::stoi(next());
+    else if (k == "--num-target-dev")
+      a.num_target_dev = std::stoi(next());
+    else if (k == "--xgmi-single-process")
+      a.xgmi_single_process = true;
+    else if (k == "--xgmi-multiprocess")
+      a.xgmi_multiprocess = true;
     else if (k == "--op" || k == "--op-type")
       a.op = next();
     else if (k == "--backend")
@@ -547,26 +629,17 @@ Args ParseArgs(int argc, char** argv) {
   return a;
 }
 
-// ------------------------------ main ---------------------------------------
-int RunBenchmark(int argc, char** argv) {
-  Args a = ParseArgs(argc, argv);
-  if (a.help) {
-    PrintUsage(argv[0]);
-    return 0;
-  }
-  SetLogLevel(a.log_level);
-
-  // Rejected up front because each of these either corrupts the run or reports a
-  // number for something the caller did not ask for: rank feeds the two-rank
-  // bootstrap's peer indexing, iters and batch are divisors of the reported
-  // latency, a zero message size makes the geometric sweep loop forever, and an
-  // unrecognised op or memory type would otherwise fall back silently to
-  // write/GPU.
+// Rejected up front because each of these either corrupts the run or reports a
+// number for something the caller did not ask for: rank feeds the bootstrap's
+// peer indexing, iters and batch are divisors of the reported latency, a zero
+// message size makes the geometric sweep loop forever, and an unrecognised op or
+// memory type would otherwise fall back silently to write/GPU.
+void ValidateArgs(Args& a) {
   if (a.rank != 0 && a.rank != 1) {
     throw std::invalid_argument("--rank must be 0 (initiator) or 1 (target)");
   }
-  if (a.backend != "rdma" && a.backend != "xgmi") {
-    throw std::invalid_argument("--backend must be rdma or xgmi (got " + a.backend + ")");
+  if (a.backend != "rdma" && a.backend != "xgmi" && a.backend != "fabric") {
+    throw std::invalid_argument("--backend must be rdma, xgmi or fabric (got " + a.backend + ")");
   }
   if (a.op != "read" && a.op != "write") {
     throw std::invalid_argument("--op must be read or write (got " + a.op + ")");
@@ -582,26 +655,55 @@ int RunBenchmark(int argc, char** argv) {
       throw std::invalid_argument("memory type must be gpu or cpu (got " + m + ")");
     }
   }
-
-  // Per-role memory type: initiator (rank 0) / target (rank 1) may override the
-  // shared --mem-type, enabling mixed CPU<->GPU transfers. Each process only
-  // allocates its own side, so no cross-node coupling is needed.
-  const std::string myMem = (a.rank == 0)
-                                ? (!a.init_mem_type.empty() ? a.init_mem_type : a.mem_type)
-                                : (!a.target_mem_type.empty() ? a.target_mem_type : a.mem_type);
-  const bool cpuMem = (myMem == "cpu");
-  const MemoryLocationType memLoc = cpuMem ? MemoryLocationType::CPU : MemoryLocationType::GPU;
-
-  // Target GPU shift for cross-rail pairing (GPU memory only, matches Python).
-  int gpu = a.gpu;
-  if (a.rank == 1 && !cpuMem && a.target_dev_offset != 0) {
-    int ndev = 0;
-    HIP_CHECK(hipGetDeviceCount(&ndev));
-    if (ndev > 0) gpu = (a.gpu + a.target_dev_offset) % ndev;
+  // FABRIC is a GPU scale-up transport (UALink vPOD); it has no host-memory path,
+  // and the Python bench rejects the combination the same way.
+  if (a.backend == "fabric") {
+    for (const std::string& m : {a.mem_type, a.init_mem_type, a.target_mem_type}) {
+      if (m == "cpu") throw std::invalid_argument("--backend fabric supports GPU memory only");
+    }
   }
-  HIP_CHECK(hipSetDevice(gpu));  // valid device context needed even for host mem
+  if (a.num_initiator_dev < 1 || a.num_target_dev < 1) {
+    throw std::invalid_argument("--num-initiator-dev / --num-target-dev must be >= 1");
+  }
+  // Same restriction the Python bench asserts: the two sides pair up one-to-one,
+  // so an unequal split would leave processes without a partner, blocked in the
+  // bootstrap until it times out.
+  if (a.num_initiator_dev != a.num_target_dev) {
+    throw std::invalid_argument("--num-initiator-dev must equal --num-target-dev (got " +
+                                std::to_string(a.num_initiator_dev) + " vs " +
+                                std::to_string(a.num_target_dev) + ")");
+  }
+  if (a.xgmi_single_process && a.xgmi_multiprocess) {
+    throw std::invalid_argument("--xgmi-single-process and --xgmi-multiprocess are exclusive");
+  }
+  if (a.xgmi_single_process && a.backend != "xgmi") {
+    throw std::invalid_argument("--xgmi-single-process requires --backend xgmi");
+  }
+  if (a.xgmi_single_process && a.num_initiator_dev != 1) {
+    throw std::invalid_argument("--xgmi-single-process runs one process; drop --num-*-dev");
+  }
+  // Rejected rather than ignored: a two-node launcher that keeps --rank 1 on the
+  // second node would otherwise run a full, independent GPU0->GPU1 benchmark on
+  // BOTH hosts, print a plausible-looking table on each, and transfer nothing
+  // between them -- a wrong answer that reads as a successful run.
+  if (a.xgmi_single_process && a.rank != 0) {
+    throw std::invalid_argument(
+        "--xgmi-single-process is a single-node, single-process mode; --rank 1 is meaningless "
+        "(drop --rank, or drop --xgmi-single-process for the two-rank XGMI path)");
+  }
+  // --dst-gpu is the Python spelling of a destination ordinal; the two-rank path
+  // expresses the same thing as an offset, so fold one into the other rather than
+  // carrying two sources of truth into the run.
+  if (a.dst_gpu >= 0 && !a.xgmi_single_process) {
+    if (a.target_dev_offset != 0 && a.target_dev_offset != a.dst_gpu - a.gpu) {
+      throw std::invalid_argument("--dst-gpu and --target-dev-offset disagree");
+    }
+    a.target_dev_offset = a.dst_gpu - a.gpu;
+  }
+}
 
-  // Build the run plan: a list of (msgSize, batch) points.
+// Build the run plan: a list of (msgSize, batch) points.
+std::vector<std::pair<size_t, int>> BuildPlan(const Args& a) {
   //   --all       => sweep message size (geometric x2, or linear when --sweep-step>0),
   //                  batch fixed at --transfer-batch-size.
   //   --all-batch => msg fixed at --buffer-size, batch = 1,2,4,...,32768.
@@ -622,10 +724,13 @@ int RunBenchmark(int argc, char** argv) {
   if (plan.empty()) {
     throw std::invalid_argument("empty sweep: --sweep-start exceeds --sweep-max");
   }
+  return plan;
+}
 
-  // Buffer must hold the largest single REQUEST across the whole plan. Strided
-  // batch (default) needs (msg+1)*batch to keep slots non-adjacent; contiguous
-  // needs msg*batch.
+// Buffer must hold the largest single REQUEST across the whole plan. Strided
+// batch (default) needs (msg+1)*batch to keep slots non-adjacent; contiguous
+// needs msg*batch.
+size_t PlanBufferBytes(const Args& a, const std::vector<std::pair<size_t, int>>& plan) {
   size_t bufBytes = 0;
   for (auto& planEntry : plan) {
     const size_t msg = planEntry.first;
@@ -635,81 +740,60 @@ int RunBenchmark(int argc, char** argv) {
     const size_t need = pBatched ? slotStride * static_cast<size_t>(b) : msg;
     bufBytes = std::max(bufBytes, need);
   }
+  return bufBytes;
+}
 
-  // Out-of-band control endpoint for the MORI engine. host MUST be an IP the
-  // peer can reach (advertised via EngineDesc for RDMA QP setup). Defaults to
-  // master_ip: correct for rank 0 (it IS the master); rank 1 should pass
-  // --self-ip when its reachable IP differs from the master's.
-  IOEngineConfig cfg;
-  cfg.host = !a.self_ip.empty() ? a.self_ip : a.master_ip;
-  cfg.port = static_cast<uint16_t>(a.port + 1 + a.rank);  // distinct per rank
-  std::string key = a.rank == 0 ? "initiator" : "target";
-  IOEngine engine(key, cfg);
-
-  // XGMI moves data over Infinity Fabric between two GPUs on the SAME host, so
-  // its knobs are stream/event depth rather than QPs and chunking. The RDMA-only
-  // flags above are simply unused on that path.
-  if (a.backend == "xgmi") {
-    XgmiBackendConfig xgmiCfg{};
-    xgmiCfg.numStreams = a.num_streams;
-    xgmiCfg.numEvents = a.num_events;
-    engine.CreateBackend(BackendType::XGMI, xgmiCfg);
-  } else {
-    RdmaBackendConfig rdmaCfg{};
-    rdmaCfg.qpPerTransfer = a.qp_per_transfer;
-    rdmaCfg.postBatchSize = a.post_batch_size;
-    rdmaCfg.numWorkerThreads = a.worker_threads;
-    rdmaCfg.pollCqMode = (a.poll_cq_mode == "event") ? PollCqMode::EVENT : PollCqMode::POLLING;
-    rdmaCfg.enableNotification = false;                    // match MORI Python bench RDMA path
-    rdmaCfg.enableTransferChunking = !a.disable_chunking;  // chunking ON by default (Python parity)
-    rdmaCfg.chunkBytes = a.chunk_bytes;
-    rdmaCfg.maxChunksPerTransfer = a.max_chunks;
-    if (a.max_send_wr > 0) rdmaCfg.maxSendWr = a.max_send_wr;
-    if (a.max_cqe_num > 0) rdmaCfg.maxCqeNum = a.max_cqe_num;
-    if (a.max_msg_sge > 0) rdmaCfg.maxMsgSge = a.max_msg_sge;
-    engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+// XGMI moves data over Infinity Fabric between two GPUs on the SAME host and
+// FABRIC over UALink between hosts in one vPOD, so both take stream/event depth
+// rather than QPs and chunking. The RDMA-only flags are simply unused there.
+void CreateBackendFor(IOEngine& engine, const Args& a) {
+  if (a.backend == "xgmi" || a.backend == "fabric") {
+    if (a.backend == "xgmi") {
+      XgmiBackendConfig xgmiCfg{};
+      xgmiCfg.numStreams = a.num_streams;
+      xgmiCfg.numEvents = a.num_events;
+      engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+    } else {
+      FabricBackendConfig fabricCfg{};
+      fabricCfg.numStreams = a.num_streams;
+      fabricCfg.numEvents = a.num_events;
+      engine.CreateBackend(BackendType::FABRIC, fabricCfg);
+    }
+    return;
   }
+  RdmaBackendConfig rdmaCfg{};
+  rdmaCfg.qpPerTransfer = a.qp_per_transfer;
+  rdmaCfg.postBatchSize = a.post_batch_size;
+  rdmaCfg.numWorkerThreads = a.worker_threads;
+  rdmaCfg.pollCqMode = (a.poll_cq_mode == "event") ? PollCqMode::EVENT : PollCqMode::POLLING;
+  rdmaCfg.enableNotification = false;                    // match MORI Python bench RDMA path
+  rdmaCfg.enableTransferChunking = !a.disable_chunking;  // chunking ON by default (Python parity)
+  rdmaCfg.chunkBytes = a.chunk_bytes;
+  rdmaCfg.maxChunksPerTransfer = a.max_chunks;
+  if (a.max_send_wr > 0) rdmaCfg.maxSendWr = a.max_send_wr;
+  if (a.max_cqe_num > 0) rdmaCfg.maxCqeNum = a.max_cqe_num;
+  if (a.max_msg_sge > 0) rdmaCfg.maxMsgSge = a.max_msg_sge;
+  engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+}
 
-  // Declared after the engine so it is destroyed first, i.e. the MR is dropped
-  // while the engine that owns it is still alive.
-  BenchBuffer buffer(engine, bufBytes, gpu, memLoc);
-  void* buf = buffer.Data();
-  const MemoryDesc& localMem = buffer.Desc();
+// One row of the report. Kept per sweep point so the multi-device path can sum
+// bandwidth across GPU pairs after the fact.
+struct SweepResult {
+  size_t msg;
+  int batch;
+  double bw;   // GB/s, GB=10^9
+  double lat;  // us per single transfer
+  double dur;  // us, whole timed loop
+  MSGPACK_DEFINE(msg, batch, bw, lat, dur);
+};
 
-  // Rank-dependent seed pattern rather than zeros, so the post-sweep validation
-  // can tell "the transfer moved my bytes" from "both buffers happened to match".
-  if (a.skip_validate) {
-    HIP_CHECK(hipMemset(buf, 0, bufBytes));
-  } else {
-    FillPattern(buf, bufBytes, a.rank);
-  }
-
-  // --- rendezvous over MORI's socket bootstrap ------------------------------
-  Rendezvous rdv(a.rank, a.master_ip, a.port);
-
-  // Exchange EngineDesc then register the remote engine.
-  EngineDesc myEng = engine.GetEngineDesc();
-  EngineDesc peerEng = Unpack<EngineDesc>(rdv.ExchangeBlob(Pack(myEng)));
-  engine.RegisterRemoteEngine(peerEng);
-
-  // Exchange MemoryDesc.
-  MemoryDesc peerMem = Unpack<MemoryDesc>(rdv.ExchangeBlob(Pack(localMem)));
-
-  rdv.Barrier();
-
-  if (a.rank == 1) {
-    // Target: nothing to drive. RDMA one-sided ops complete without target CPU.
-    // Just hold memory registered until the initiator says it's done.
-    rdv.Barrier();  // wait for initiator to finish the whole sweep
-    // Collective with the initiator's call below, so it runs even under
-    // --skip-validate; the target only contributes checksums and does not report.
-    const auto& last = plan.back();
-    ValidateTransfer(rdv, buf, last.first, last.second, a.enable_batch_transfer && last.second > 1,
-                     a.batch_contiguous, a.rank, !a.skip_validate);
-    return 0;
-  }
-
-  // -------------------- initiator: run the sweep ---------------------------
+// Drive every point in `plan` from localMem into peerMem and print one row each.
+// `label` prefixes every row, so N initiator processes writing to the same
+// terminal stay attributable.
+std::vector<SweepResult> RunSweep(const Args& a, IOEngine& engine, const MemoryDesc& localMem,
+                                  const MemoryDesc& peerMem,
+                                  const std::vector<std::pair<size_t, int>>& plan,
+                                  const std::string& label) {
   // Session fast-path (matches MORI --enable-sess). When --disable-sess, we call
   // the engine batch/single APIs directly with explicit MemoryDesc + uid vecs.
   const bool useSess = a.enable_sess;
@@ -722,7 +806,8 @@ int RunBenchmark(int argc, char** argv) {
   }
   const bool isRead = (a.op == "read");
 
-  std::cout << "MsgSize(B)  Batch  Iters  AvgBW(GB/s)  AvgLat(us)  TotalDur(us)" << std::endl;
+  std::vector<SweepResult> results;
+  results.reserve(plan.size());
 
   for (auto& planEntry : plan) {
     const size_t msg = planEntry.first;
@@ -860,12 +945,144 @@ int RunBenchmark(int argc, char** argv) {
     double avg_bw = (total_bytes / 1e9) / (total_us / 1e6);  // GB/s, GB=10^9
     double avg_lat = total_us / numXfers;                    // us per single transfer
 
-    std::printf("%-11zu %-6d %-6d %-12.2f %-11.2f %-.1f\n", msg, curBatch, a.iters, avg_bw, avg_lat,
-                total_us);
+    std::printf("%s%-11zu %-6d %-6d %-12.2f %-11.2f %-.1f\n", label.c_str(), msg, curBatch, a.iters,
+                avg_bw, avg_lat, total_us);
     std::fflush(stdout);
+    results.push_back(SweepResult{msg, curBatch, avg_bw, avg_lat, total_us});
   }
 
-  rdv.Barrier();  // tell target we're done
+  return results;
+}
+
+// ---------------------- driver: two-node, N GPUs a side ---------------------
+// One process per GPU. Global ranks are initiators first, so initiator local i
+// is global i and target local i is global numInitiatorDev + i, and the pair
+// (i, numInitiatorDev + i) shares a session. With the defaults this is exactly
+// the original two-rank run.
+int RunDistributed(const Args& a, int localRank) {
+  const bool isInitiator = (a.rank == 0);
+  const int worldSize = a.num_initiator_dev + a.num_target_dev;
+  const int globalRank = isInitiator ? localRank : a.num_initiator_dev + localRank;
+  const int peerRank = isInitiator ? a.num_initiator_dev + localRank : localRank;
+  const bool multiDev = worldSize > 2;
+
+  // Per-role memory type: initiator (rank 0) / target (rank 1) may override the
+  // shared --mem-type, enabling mixed CPU<->GPU transfers. Each process only
+  // allocates its own side, so no cross-node coupling is needed.
+  const std::string myMem = isInitiator
+                                ? (!a.init_mem_type.empty() ? a.init_mem_type : a.mem_type)
+                                : (!a.target_mem_type.empty() ? a.target_mem_type : a.mem_type);
+  const bool cpuMem = (myMem == "cpu");
+  const MemoryLocationType memLoc = cpuMem ? MemoryLocationType::CPU : MemoryLocationType::GPU;
+
+  // Process i of a side drives GPU (--gpu + i); the target additionally shifts by
+  // --target-dev-offset for cross-rail pairing (GPU memory only, matches Python).
+  int ndev = 0;
+  HIP_CHECK(hipGetDeviceCount(&ndev));
+  const int numDev = isInitiator ? a.num_initiator_dev : a.num_target_dev;
+  if (ndev > 0 && a.gpu + numDev > ndev) {
+    throw std::invalid_argument("--gpu " + std::to_string(a.gpu) + " + " + std::to_string(numDev) +
+                                " devices exceeds the " + std::to_string(ndev) + " visible GPUs");
+  }
+  int gpu = a.gpu + localRank;
+  if (!isInitiator && !cpuMem && a.target_dev_offset != 0 && ndev > 0) {
+    // Floored modulo: C++ % truncates toward zero, so a negative offset (legal,
+    // and what --dst-gpu produces when it names a lower ordinal) would otherwise
+    // yield a negative device and fail in hipSetDevice -- after the peer has
+    // already entered the bootstrap, leaving it to block until the timeout.
+    const int shifted = a.gpu + localRank + a.target_dev_offset;
+    gpu = ((shifted % ndev) + ndev) % ndev;
+  }
+  HIP_CHECK(hipSetDevice(gpu));  // valid device context needed even for host mem
+
+  const std::string label = multiDev ? ("[gpu " + std::to_string(gpu) + "] ") : std::string();
+
+  const auto plan = BuildPlan(a);
+  const size_t bufBytes = PlanBufferBytes(a, plan);
+
+  // Out-of-band control endpoint for the MORI engine. host MUST be an IP the
+  // peer can reach (advertised via EngineDesc for RDMA QP setup). Defaults to
+  // master_ip: correct for rank 0 (it IS the master); rank 1 should pass
+  // --self-ip when its reachable IP differs from the master's.
+  //
+  // Both the port and the engine key have to vary per process: with N processes
+  // per node, a per-side constant would have every local process binding the
+  // same port and advertising the same key, and peers would resolve to whichever
+  // registered last. The port uses the global rank so it is unique across both
+  // nodes; the key uses the local rank because the role prefix already separates
+  // the sides, which also matches the Python bench's f"{role.name}-{role_rank}".
+  IOEngineConfig cfg;
+  cfg.host = !a.self_ip.empty() ? a.self_ip : a.master_ip;
+  cfg.port = static_cast<uint16_t>(a.port + 1 + globalRank);
+  const std::string key = (isInitiator ? "initiator-" : "target-") + std::to_string(localRank);
+  IOEngine engine(key, cfg);
+
+  CreateBackendFor(engine, a);
+
+  // Declared after the engine so it is destroyed first, i.e. the MR is dropped
+  // while the engine that owns it is still alive.
+  BenchBuffer buffer(engine, bufBytes, gpu, memLoc);
+  void* buf = buffer.Data();
+  const MemoryDesc& localMem = buffer.Desc();
+
+  // Rank-dependent seed pattern rather than zeros, so the post-sweep validation
+  // can tell "the transfer moved my bytes" from "both buffers happened to match".
+  if (a.skip_validate) {
+    HIP_CHECK(hipMemset(buf, 0, bufBytes));
+  } else {
+    FillPattern(buf, bufBytes, a.rank);
+  }
+
+  // --- rendezvous over MORI's socket bootstrap ------------------------------
+  Rendezvous rdv(globalRank, worldSize, peerRank, a.master_ip, a.port);
+
+  // Exchange EngineDesc then register the remote engine.
+  EngineDesc myEng = engine.GetEngineDesc();
+  EngineDesc peerEng = Unpack<EngineDesc>(rdv.ExchangeBlob(Pack(myEng)));
+  engine.RegisterRemoteEngine(peerEng);
+
+  // Exchange MemoryDesc.
+  MemoryDesc peerMem = Unpack<MemoryDesc>(rdv.ExchangeBlob(Pack(localMem)));
+
+  rdv.Barrier();
+
+  // Every collective below runs on BOTH sides in the same order: the target has
+  // no transfers to drive, but skipping a barrier or an allgather would leave the
+  // initiators blocked until the bootstrap timeout.
+  std::vector<SweepResult> mine;
+  if (isInitiator) {
+    if (globalRank == 0) {
+      std::cout << "MsgSize(B)  Batch  Iters  AvgBW(GB/s)  AvgLat(us)  TotalDur(us)" << std::endl;
+    }
+    mine = RunSweep(a, engine, localMem, peerMem, plan, label);
+  }
+
+  rdv.Barrier();  // initiators done sweeping
+
+  // Aggregate: sum bandwidth over the initiator ranks, point by point. A single
+  // pair already reports its own number, so only fan-out runs print this.
+  const auto allBlobs = rdv.AllgatherBlobs(Pack(mine));
+  if (multiDev && globalRank == 0) {
+    std::vector<std::vector<SweepResult>> perRank;
+    for (int r = 0; r < a.num_initiator_dev; ++r) {
+      perRank.push_back(Unpack<std::vector<SweepResult>>(allBlobs[static_cast<size_t>(r)]));
+    }
+    std::cout << "--- AGGREGATE over " << a.num_initiator_dev << " GPU pairs ---" << std::endl;
+    for (size_t p = 0; p < plan.size(); ++p) {
+      double sumBw = 0, sumLat = 0;
+      int n = 0;
+      for (const auto& rows : perRank) {
+        if (p >= rows.size()) continue;
+        sumBw += rows[p].bw;
+        sumLat += rows[p].lat;
+        ++n;
+      }
+      if (n == 0) continue;
+      std::printf("[AGGREGATE] %-11zu %-6d %-6d %-12.2f %-11.2f (mean lat over %d pairs)\n",
+                  plan[p].first, plan[p].second, a.iters, sumBw, sumLat / n, n);
+    }
+    std::fflush(stdout);
+  }
 
   // Correctness check on the last sweep point, matching the Python benchmark's
   // always-on validation. Runs after the timed region so it cannot perturb the
@@ -873,8 +1090,146 @@ int RunBenchmark(int argc, char** argv) {
   const auto& last = plan.back();
   const bool valid = ValidateTransfer(rdv, buf, last.first, last.second,
                                       a.enable_batch_transfer && last.second > 1,
-                                      a.batch_contiguous, a.rank, !a.skip_validate);
+                                      a.batch_contiguous, isInitiator, !a.skip_validate, label);
   return valid ? 0 : 1;
+}
+
+// ------------------ driver: XGMI, both sides in one process -----------------
+// The Python bench's DEFAULT xgmi mode: one process owns both GPUs, so there is
+// no rendezvous, no remote engine, and no IPC -- source and destination are two
+// registrations against the same engine. (The two-rank path above is already
+// what Python calls --xgmi-multiprocess: distinct engine keys make the backend
+// take its hipIpc* route.)
+int RunXgmiSingleProcess(const Args& a) {
+  int ndev = 0;
+  HIP_CHECK(hipGetDeviceCount(&ndev));
+  const int src = a.gpu;
+  const int dst = (a.dst_gpu >= 0) ? a.dst_gpu : a.gpu + 1;
+  if (src == dst) throw std::invalid_argument("--src-gpu and --dst-gpu must differ");
+  if (src < 0 || dst < 0 || src >= ndev || dst >= ndev) {
+    throw std::invalid_argument("--src-gpu/--dst-gpu out of range (" + std::to_string(ndev) +
+                                " visible GPUs)");
+  }
+
+  const auto plan = BuildPlan(a);
+  const size_t bufBytes = PlanBufferBytes(a, plan);
+
+  HIP_CHECK(hipSetDevice(src));
+
+  // No peer ever dials in, but the engine still wants an endpoint; the XGMI
+  // backend never binds it.
+  IOEngineConfig cfg;
+  cfg.host = !a.self_ip.empty() ? a.self_ip : (!a.master_ip.empty() ? a.master_ip : "127.0.0.1");
+  cfg.port = static_cast<uint16_t>(a.port + 1);
+  IOEngine engine("xgmi-benchmark", cfg);
+  CreateBackendFor(engine, a);
+
+  // hipMalloc lands on the CURRENT device, so the device has to be switched
+  // around each allocation rather than set once up front.
+  HIP_CHECK(hipSetDevice(src));
+  BenchBuffer srcBuf(engine, bufBytes, src, MemoryLocationType::GPU);
+  HIP_CHECK(hipSetDevice(dst));
+  BenchBuffer dstBuf(engine, bufBytes, dst, MemoryLocationType::GPU);
+  HIP_CHECK(hipSetDevice(src));
+
+  // Same two-sided seeding as the distributed path, so a transfer that never
+  // happened cannot pass validation.
+  if (a.skip_validate) {
+    HIP_CHECK(hipMemset(srcBuf.Data(), 0, bufBytes));
+    HIP_CHECK(hipMemset(dstBuf.Data(), 0, bufBytes));
+  } else {
+    FillPattern(srcBuf.Data(), bufBytes, 0);
+    FillPattern(dstBuf.Data(), bufBytes, 1);
+  }
+
+  std::cout << "XGMI single-process: GPU" << src << " -> GPU" << dst << std::endl;
+  std::cout << "MsgSize(B)  Batch  Iters  AvgBW(GB/s)  AvgLat(us)  TotalDur(us)" << std::endl;
+  RunSweep(a, engine, srcBuf.Desc(), dstBuf.Desc(), plan, "");
+
+  // Both buffers are local, so the checksums compare directly -- no exchange.
+  const auto& last = plan.back();
+  const bool batched = a.enable_batch_transfer && last.second > 1;
+  const bool wanted = !a.skip_validate;
+  const auto mine = TransferChecksums(srcBuf.Data(), last.first, last.second, batched,
+                                      a.batch_contiguous, wanted);
+  const auto peer = TransferChecksums(dstBuf.Data(), last.first, last.second, batched,
+                                      a.batch_contiguous, wanted);
+  return CompareChecksums(mine, peer, last.first, last.second, "") ? 0 : 1;
+}
+
+// ------------------------------ main ---------------------------------------
+int RunBenchmark(int argc, char** argv) {
+  Args a = ParseArgs(argc, argv);
+  if (a.help) {
+    PrintUsage(argv[0]);
+    return 0;
+  }
+  SetLogLevel(a.log_level);
+  ValidateArgs(a);
+
+  if (a.xgmi_single_process) return RunXgmiSingleProcess(a);
+
+  const int numDev = (a.rank == 0) ? a.num_initiator_dev : a.num_target_dev;
+  if (numDev == 1) return RunDistributed(a, 0);
+
+  // One process per GPU, forked BEFORE any HIP call so each child builds its own
+  // device context and its own engine: the RDMA backend's queues, worker threads
+  // and MRs are per-process state that does not survive being shared, which is
+  // why this fans out with processes rather than threads (and why the Python
+  // bench uses mp.spawn rather than a thread pool).
+  std::vector<pid_t> kids;
+  kids.reserve(static_cast<size_t>(numDev - 1));
+  for (int i = 1; i < numDev; ++i) {
+    const pid_t pid = fork();
+    if (pid < 0) {
+      // Reap after signalling, for the same reason the loop below does: an
+      // unreaped child keeps its bootstrap port and fails the next launch with
+      // "Address already in use". The peer node still has to wait out its own
+      // bootstrap timeout -- nothing here can tell it the ring will never close.
+      const int err = errno;
+      for (pid_t k : kids) kill(k, SIGTERM);
+      for (pid_t k : kids) {
+        int status = 0;
+        waitpid(k, &status, 0);
+      }
+      throw std::runtime_error(std::string("fork failed: ") + std::strerror(err));
+    }
+    if (pid == 0) {
+      // Child. _exit rather than return: RunDistributed has already run its
+      // destructors, and unwinding back through main would flush the parent's
+      // inherited stdio buffers a second time.
+      int rc = 1;
+      try {
+        rc = RunDistributed(a, i);
+      } catch (const std::exception& e) {
+        // Labelled by local index, not GPU ordinal: the ordinal is only valid
+        // once the device-count check inside RunDistributed has passed, and
+        // naming a GPU that does not exist is exactly the confusing case.
+        std::cerr << "bench_engine[dev " << i << "]: " << e.what() << std::endl;
+      }
+      _exit(rc);
+    }
+    kids.push_back(pid);
+  }
+
+  int rc = 1;
+  try {
+    rc = RunDistributed(a, 0);
+  } catch (const std::exception& e) {
+    std::cerr << "bench_engine[dev 0]: " << e.what() << std::endl;
+  }
+
+  // Reap every child even after a local failure, so a partial run does not leave
+  // processes holding their bootstrap ports against the next launch.
+  for (pid_t k : kids) {
+    int status = 0;
+    if (waitpid(k, &status, 0) < 0) {
+      rc = 1;
+      continue;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) rc = 1;
+  }
+  return rc;
 }
 
 }  // namespace

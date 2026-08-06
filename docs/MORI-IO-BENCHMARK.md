@@ -177,11 +177,14 @@ Most flags share names with the Python benchmark (`--op-type`/`--op`,
 | Python | C++ (nixl-style) | Notes |
 |--------|------------------|-------|
 | `torchrun ... --node_rank` | `--rank 0` / `--rank 1` | C++ rendezvous runs over MORI's socket bootstrap; rank 0 is the root, and the second process must arrive within `MORI_BOOTSTRAP_TIMEOUT`. |
-| `--host` | `--master-ip` + `--self-ip` | `--master-ip` = rank 0's IP, same on both ranks; `--self-ip` = the control-plane IP each rank advertises to the peer. |
+| `--host` | `--master-ip` + `--self-ip` | `--host` is accepted as a spelling of `--master-ip`. `--master-ip` = rank 0's IP, same on both ranks; `--self-ip` = the control-plane IP each rank advertises to the peer, which Python does not need because torchrun supplies it. |
+| `--src-gpu` / `--dst-gpu` | `--gpu` / `--target-dev-offset` | Python's names are accepted: `--src-gpu` is `--gpu`, and `--dst-gpu N` sets `--target-dev-offset` to `N - gpu` (passing both a conflicting `--dst-gpu` and `--target-dev-offset` is rejected). Under `--xgmi-single-process` they are the two local GPUs directly. |
+| `--num-initiator-dev` / `--num-target-dev` | same | One process per GPU on each side, forked before any HIP call; initiator local *i* pairs with target local *i*, driving GPU `--gpu + i`. The two counts must be equal, as Python asserts. Each pair prints its own `[gpu N]`-prefixed row and rank 0 adds an `[AGGREGATE]` line summing bandwidth across pairs — Python prints per-rank tables with no aggregate. |
 | `--enable-batch-transfer` (default OFF) | `--enable-batch-transfer` / `--disable-batch-transfer` (C++ default **ON**) | Same meaning as Python: **ON** = one N-descriptor batch request (the nixl-equivalent; nixl always batches); **OFF** = `--transfer-batch-size` N *individual* single-transfer submissions per iteration (Python `run_single_once`). The C++ tool defaults **ON** so the out-of-the-box run and `--all-batch` sweep are nixl-comparable; pass `--disable-batch-transfer` for the Python single-submission path. |
 | `--iters` (default `128`) | `--iters` (default `500`), plus `--warmup-iters` | Only the warmup flag is new: it runs untimed iterations before the timed region, matching nixl's `--warmup_iter`. |
 | `--sweep-start-size` / `--sweep-max-size` | `--sweep-start` / `--sweep-max` (long names also accepted) | Names only; `--sweep-step` (`0` = geometric ×2, `>0` = linear) behaves the same in both. |
-| `--backend rdma\|xgmi\|fabric` | `--backend rdma\|xgmi` | C++ has no `fabric` path. `--num-streams` / `--num-events` size the XGMI HIP pools, as in Python. |
+| `--backend rdma\|xgmi\|fabric` | same | `--num-streams` / `--num-events` size the XGMI **and** FABRIC HIP pools, as in Python. `fabric` (UALink scale-up, GPU memory only) needs a host whose GPUs expose `/sys/bus/pci/devices/*/ualink`; on RoCE-only hardware the engine reports `No available backend found` at the first transfer. |
+| `--xgmi-multiprocess` (default OFF) | `--xgmi-single-process` (default OFF, i.e. multiprocess) | The defaults are **opposite**. The C++ tool's two-rank path is already Python's `--xgmi-multiprocess`: two processes with distinct engine keys, so the backend takes its `hipIpc*` route. `--xgmi-single-process` adds Python's *default* instead — one process owning both GPUs, no rendezvous and no IPC. `--xgmi-multiprocess` is accepted to document intent but is a no-op. |
 | *(always on)* | `--skip-validate` | Both tools verify transferred data as part of the run. Python compares the target's buffer byte-for-byte over gloo; the C++ tool seeds a rank- and offset-dependent pattern and exchanges one checksum per transferred slot after the sweep (so the check is O(batch) on the wire but still covers every byte), printing `validation: OK` or naming the first mismatching slot and exiting non-zero. `--skip-validate` opts out; passing it to only one rank is safe — that rank contributes nothing and the run reports `validation: skipped` rather than hanging. |
 
 > `--self-ip` must be an address the peer can reach over TCP, since it becomes the
@@ -201,10 +204,19 @@ Most flags share names with the Python benchmark (`--op-type`/`--op`,
 > For `--backend xgmi`, run both ranks on the **same** host with different `--gpu`
 > (XGMI is intra-node) and the same `--master-ip`/`--self-ip`; their engine control
 > ports still differ because those are derived from the rank. The backend is
-> created explicitly, so no env var is needed. Note this measures the
-> *cross-process* XGMI path, since the C++ tool is always two processes; the Python
-> benchmark's default single-process mode avoids cross-process overhead entirely,
-> so the two are not directly comparable at small message sizes.
+> created explicitly, so no env var is needed. That two-rank form measures the
+> *cross-process* XGMI path (distinct engine keys ⇒ `hipIpc*`). To measure what the
+> Python benchmark measures by default, pass `--xgmi-single-process` with
+> `--src-gpu`/`--dst-gpu`: one process owns both GPUs, there is no rendezvous and no
+> IPC, so `--rank`/`--master-ip` are not needed and small-message numbers become
+> directly comparable to Python's.
+>
+> For multi-GPU runs (`--num-initiator-dev N --num-target-dev N`) the bootstrap
+> world is `2N` ranks, laid out initiators first. Engine control ports are derived
+> from the **global** rank, so `--port P` reserves `P` for the bootstrap and
+> `P+1 … P+2N` for the engines — leave that range free. Each side forks `N-1`
+> children before touching HIP, so a failure in one pair still reaps the others
+> rather than leaving them holding ports.
 
 ## Benchmark Arguments
 
