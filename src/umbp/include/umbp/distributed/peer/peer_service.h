@@ -31,6 +31,10 @@
 #include <string>
 #include <vector>
 
+namespace mori::io {
+class IOEngine;
+}
+
 namespace mori::umbp {
 
 class PeerDramAllocator;
@@ -91,6 +95,21 @@ struct PeerPollerConfig {
 // Start() runs once per process, and the tests depend on it.
 PeerPollerConfig ResolvePeerPollerConfig();
 
+// How long a client's push registration (engine + destination buffers, learned
+// from its GetPeerInfo) stays usable without being refreshed.  Every
+// BatchPrepareSsdRead from that client refreshes it, so an active client never
+// ages out; only one that has gone silent — crashed, killed, restarted — does.
+//
+// This bound matters because the push path makes the peer an RDMA initiator
+// against the client role, which is the short-lived, restart-prone side: a
+// client that dies and comes back with the same node_id gets the same
+// per-process MemoryUniqueId sequence, so without expiry the peer could resolve
+// a push against a registration belonging to the dead instance.  Expiry fails
+// safe (fall back to memcpy + pull), never into a misdirected write.
+//
+// Resolved from UMBP_PUSH_TARGET_TTL_MS.  Re-reads the environment per call.
+std::chrono::milliseconds ResolveClientPushTtl();
+
 class PeerServiceServer {
  public:
   // `dram_alloc` is non-owning and may be null when the host process has
@@ -113,13 +132,22 @@ class PeerServiceServer {
   // `write_staging` carves the direct-SSD put region out of the same buffer
   // (see SsdWriteStagingConfig); default-constructed means the peer accepts no
   // direct SSD writes.
+  //
+  // `io_engine` (non-owning, may be null) is what lets the peer *initiate* RDMA
+  // instead of only serving as a target — the SSD read fan-out push.  It is used
+  // for two things: registering a client's engine at GetPeerInfo time, and
+  // (indirectly, via the same engine handed to PeerSsdManager) posting the
+  // pushes.  Null leaves every read on the classic staging+pull path.  On the
+  // PoolClient side the engine is constructed well before this server, so
+  // passing it costs nothing.
   PeerServiceServer(PeerDramAllocator* dram_alloc, PeerSsdManager* peer_ssd = nullptr,
                     void* ssd_staging_base = nullptr, size_t ssd_staging_size = 0,
                     std::vector<uint8_t> ssd_staging_mem_desc_bytes = {}, int num_read_slots = 16,
                     std::chrono::milliseconds lease_timeout = std::chrono::milliseconds{3000},
                     std::vector<uint8_t> engine_desc_bytes = {},
                     MasterClient* master_client = nullptr, SsdCopyPipeline* copy_pipeline = nullptr,
-                    SsdWriteStagingConfig write_staging = {});
+                    SsdWriteStagingConfig write_staging = {},
+                    mori::io::IOEngine* io_engine = nullptr);
   ~PeerServiceServer();
 
   bool Start(uint16_t port);
@@ -135,6 +163,11 @@ class PeerServiceServer {
   // is disabled.
   size_t SnapshotWriteSlotsInUse() const;
 
+  // Live (non-expired) client push registrations.  Test/observability hook: it
+  // is the only external way to see that a handshake landed and that a dead
+  // client's entry actually ages out.
+  size_t SnapshotClientPushTargets() const;
+
   // Read-only access for the heartbeat shipper (lives in MasterClient
   // / PoolClient).  Never null after construction with a non-null
   // allocator argument.
@@ -148,6 +181,7 @@ class PeerServiceServer {
   PeerDramAllocator* dram_alloc_;
   MasterClient* master_client_;
   SsdCopyPipeline* copy_pipeline_ = nullptr;
+  mori::io::IOEngine* io_engine_ = nullptr;
 
   StagingMetrics metrics_;
 

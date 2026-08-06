@@ -482,7 +482,11 @@ bool PoolClient::Init() {
   // pipeline below populates it.  Clear() quiesces the pipeline and clears
   // peer_ssd_ alongside peer_alloc_.
   if (config_.ssd.enabled) {
-    peer_ssd_ = std::make_unique<PeerSsdManager>(config_.ssd);
+    // io_engine_ (built above) also lets the manager RDMA-WRITE a leader's
+    // just-read bytes straight into a follower client's destination buffer
+    // instead of memcpy-ing into that follower's staging slot.  Null here (no
+    // IO engine configured) leaves it memcpy-only.
+    peer_ssd_ = std::make_unique<PeerSsdManager>(config_.ssd, io_engine_.get());
     // Crash-restart leftover (discard): wipe stale SSD bytes before the
     // pipeline starts so used capacity and the empty owned_ map start consistent
     // (env-gated; see SsdStartupDiscardEnabled / DiscardLeftoverOnStartup).
@@ -556,7 +560,12 @@ bool PoolClient::Init() {
         peer_alloc_.get(), peer_ssd_.get(), ssd_staging_buffer_.ptr,
         ssd_staging_buffer_.valid() ? ssd_staging_total_bytes_ : 0, ssd_staging_mem_desc_bytes_,
         config_.ssd_staging_buffer_slots, SsdReadLeaseTtl(), engine_desc_bytes,
-        master_client_.get(), ssd_copy_pipeline_.get(), write_staging);
+        master_client_.get(), ssd_copy_pipeline_.get(), write_staging,
+        // The peer service needs the engine to register a client's engine desc
+        // at handshake time (the one path where this process initiates RDMA
+        // against a client).  Already constructed above — see the IOEngine
+        // block at the top of Init.
+        io_engine_.get());
     if (!peer_service_->Start(config_.peer_service_port)) {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
                       config_.peer_service_port);
@@ -735,7 +744,7 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size) {
     MORI_UMBP_DEBUG("[PoolClient] RegisterMemory: {} ({}B) is device memory on GPU {}", ptr, size,
                     mem_desc.deviceId);
   }
-  registered_regions_.push_back({ptr, size, mem_desc});
+  registered_regions_.push_back({ptr, size, mem_desc, next_region_id_++});
   // NOTE: true here means "the region is recorded and will be used zero-copy",
   // not "an MR exists".  RegisterMemory has no failure channel to forward --
   // IOEngine::RegisterMemory always returns a desc and the backends'
@@ -756,17 +765,32 @@ void PoolClient::DeregisterMemory(void* ptr) {
   }
 }
 
-std::optional<std::pair<mori::io::MemoryDesc, size_t>> PoolClient::FindRegisteredMemory(
-    const void* ptr, size_t size) {
+std::optional<PoolClient::RegionMatch> PoolClient::FindRegisteredRegion(const void* ptr,
+                                                                        size_t size) {
   auto addr = reinterpret_cast<uintptr_t>(ptr);
   std::lock_guard<std::mutex> lock(registered_mem_mutex_);
   for (auto& reg : registered_regions_) {
     auto base = reinterpret_cast<uintptr_t>(reg.base);
     if (addr >= base && size <= reg.size && (addr - base) <= reg.size - size) {
-      return std::pair{reg.mem_desc, static_cast<size_t>(addr - base)};
+      return RegionMatch{reg.mem_desc, static_cast<size_t>(addr - base), reg.id};
     }
   }
   return std::nullopt;
+}
+
+std::vector<std::pair<uint64_t, mori::io::MemoryDesc>> PoolClient::SnapshotRegisteredRegions() {
+  std::vector<std::pair<uint64_t, mori::io::MemoryDesc>> out;
+  std::lock_guard<std::mutex> lock(registered_mem_mutex_);
+  out.reserve(registered_regions_.size());
+  for (const auto& reg : registered_regions_) out.emplace_back(reg.id, reg.mem_desc);
+  return out;
+}
+
+std::optional<std::pair<mori::io::MemoryDesc, size_t>> PoolClient::FindRegisteredMemory(
+    const void* ptr, size_t size) {
+  auto match = FindRegisteredRegion(ptr, size);
+  if (!match) return std::nullopt;
+  return std::pair{match->mem_desc, match->offset};
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,19 +1221,15 @@ void PoolClient::LogBatchGetDistribution(const BatchGetPlan& plan, size_t total_
     cumulative_max_share = BatchDistMaxShare(get_dist_cumulative_, cumulative_keys);
   }
 
-  // Muted: fires once per BatchGet.  Everything from here down is log-only --
-  // the straggler pass sorts the per-target timings and formats a string on
-  // every batch -- so it is commented out as a block rather than left running
-  // to feed a call that no longer prints.  The cumulative accounting above
-  // still runs; uncomment this block to get the read fan-out view back (see
-  // doc/pure-ssd-mode.md, "Observability").
-  //
-  // const double elapsed_ms = elapsed_seconds * 1000.0;
-  // const double gb_s =
-  //     elapsed_seconds > 0.0
-  //         ? static_cast<double>(planned_bytes) / elapsed_seconds / (1000.0 * 1000.0 * 1000.0)
-  //         : 0.0;
-  //
+  // Fires once per BatchGet (or every Nth, per UMBP_GET_DIST_LOG). Everything
+  // from here down is log-only -- the straggler pass sorts the per-target
+  // timings and formats a string on every batch. See doc/pure-ssd-mode.md,
+  // "Observability".
+  const double elapsed_ms = elapsed_seconds * 1000.0;
+  const double gb_s = elapsed_seconds > 0.0 ? static_cast<double>(planned_bytes) / elapsed_seconds /
+                                                  (1000.0 * 1000.0 * 1000.0)
+                                            : 0.0;
+
   // Straggler accounting.  Every remote worker starts together and the batch
   // blocks until the LAST one returns, so:
   //   tail_ms   = slowest - median : wall time the batch spent waiting on the
@@ -1220,51 +1240,43 @@ void PoolClient::LogBatchGetDistribution(const BatchGetPlan& plan, size_t total_
   //               finished at the median. The gap between GB_s and this is the
   //               straggler cost, measured on this batch, not inferred from a
   //               p99 over unrelated calls.
-  // std::string straggler = "n/a";
-  // if (!timings.empty()) {
-  //   std::vector<double> ms;
-  //   ms.reserve(timings.size());
-  //   for (const auto& t : timings) ms.push_back(t.ms);
-  //   std::sort(ms.begin(), ms.end());
-  //   const double slowest = ms.back();
-  //   const double median = ms[ms.size() / 2];
-  //   const double fastest = ms.front();
-  //   const double tail_ms = slowest - median;
-  //   const double tail_pct = elapsed_ms > 0.0 ? 100.0 * tail_ms / elapsed_ms : 0.0;
-  //   const double nostall_s = elapsed_seconds - (tail_ms / 1000.0);
-  //   const double nostall_gb_s =
-  //       nostall_s > 0.0 ? static_cast<double>(planned_bytes) / nostall_s / 1e9 : 0.0;
-  //   // Name the straggler: a node that is repeatedly slowest is a different
-  //   // problem (bad drive, hot node) from a randomly-rotating one (queueing).
-  //   const auto* worst = &timings.front();
-  //   for (const auto& t : timings) {
-  //     if (t.ms > worst->ms) worst = &t;
-  //   }
-  //   std::ostringstream oss;
-  //   oss << std::fixed << std::setprecision(2) << "slowest=" << slowest << "ms@"
-  //       << (worst->node_id.empty() ? "<unknown>" : worst->node_id) << " median=" << median
-  //       << "ms fastest=" << fastest << "ms spread=" << (median > 0.0 ? slowest / median : 0.0)
-  //       << "x tail_ms=" << tail_ms << " tail_pct=" << std::setprecision(1) << tail_pct
-  //       << "% nostall_GB_s=" << std::setprecision(2) << nostall_gb_s;
-  //   straggler = oss.str();
-  // }
-  //
-  // MORI_UMBP_INFO(
-  //     "[PoolClient] get_dist #{} keys={} planned={} missing={} remote_ssd_workers={} bytes={} "
-  //     "elapsed_ms={:.3f} GB_s={:.2f} straggler=[{}] batch=[{}] batch_max_share={:.1f}% "
-  //     "cumulative_keys={} cumulative=[{}] cumulative_max_share={:.1f}%",
-  //     batch_index, total_keys, planned_keys, total_keys - planned_keys, ssd_workers,
-  //     planned_bytes, elapsed_ms, gb_s, straggler, FormatBatchDist(batch, planned_keys),
-  //     BatchDistMaxShare(batch, planned_keys), cumulative_keys, cumulative_str,
-  //     cumulative_max_share);
-  (void)total_keys;
-  (void)elapsed_seconds;
-  (void)timings;
-  (void)planned_keys;
-  (void)planned_bytes;
-  (void)ssd_workers;
-  (void)cumulative_str;
-  (void)cumulative_max_share;
+  std::string straggler = "n/a";
+  if (!timings.empty()) {
+    std::vector<double> ms;
+    ms.reserve(timings.size());
+    for (const auto& t : timings) ms.push_back(t.ms);
+    std::sort(ms.begin(), ms.end());
+    const double slowest = ms.back();
+    const double median = ms[ms.size() / 2];
+    const double fastest = ms.front();
+    const double tail_ms = slowest - median;
+    const double tail_pct = elapsed_ms > 0.0 ? 100.0 * tail_ms / elapsed_ms : 0.0;
+    const double nostall_s = elapsed_seconds - (tail_ms / 1000.0);
+    const double nostall_gb_s =
+        nostall_s > 0.0 ? static_cast<double>(planned_bytes) / nostall_s / 1e9 : 0.0;
+    // Name the straggler: a node that is repeatedly slowest is a different
+    // problem (bad drive, hot node) from a randomly-rotating one (queueing).
+    const auto* worst = &timings.front();
+    for (const auto& t : timings) {
+      if (t.ms > worst->ms) worst = &t;
+    }
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2) << "slowest=" << slowest << "ms@"
+        << (worst->node_id.empty() ? "<unknown>" : worst->node_id) << " median=" << median
+        << "ms fastest=" << fastest << "ms spread=" << (median > 0.0 ? slowest / median : 0.0)
+        << "x tail_ms=" << tail_ms << " tail_pct=" << std::setprecision(1) << tail_pct
+        << "% nostall_GB_s=" << std::setprecision(2) << nostall_gb_s;
+    straggler = oss.str();
+  }
+
+  MORI_UMBP_INFO(
+      "[PoolClient] get_dist #{} keys={} planned={} missing={} remote_ssd_workers={} bytes={} "
+      "elapsed_ms={:.3f} GB_s={:.2f} straggler=[{}] batch=[{}] batch_max_share={:.1f}% "
+      "cumulative_keys={} cumulative=[{}] cumulative_max_share={:.1f}%",
+      batch_index, total_keys, planned_keys, total_keys - planned_keys, ssd_workers, planned_bytes,
+      elapsed_ms, gb_s, straggler, FormatBatchDist(batch, planned_keys),
+      BatchDistMaxShare(batch, planned_keys), cumulative_keys, cumulative_str,
+      cumulative_max_share);
 }
 
 PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
@@ -3068,6 +3080,28 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
 
   auto hydrate_from_peer = [&](::umbp::UMBPPeer::Stub* stub) -> bool {
     ::umbp::GetPeerInfoRequest req;
+    // Outbound half: tell the peer who we are, how to reach our IO engine, and
+    // which of our buffers it may RDMA-WRITE into.  This is what lets the peer
+    // serve us a single-flight follower read by pushing straight into our
+    // destination instead of memcpy-ing into a staging slot we then pull from.
+    // A pure TP-rank client has peer_service_port == 0 and so no listener the
+    // peer could call back into; this request is the only channel.
+    //
+    // Sending nothing (no engine, no registered regions) is legal and simply
+    // leaves us on the classic pull path.
+    if (io_engine_) {
+      msgpack::sbuffer sbuf;
+      msgpack::pack(sbuf, io_engine_->GetEngineDesc());
+      req.set_engine_desc(std::string(sbuf.data(), sbuf.size()));
+      req.set_node_id(config_.master_config.node_id);
+      for (const auto& [region_id, desc] : SnapshotRegisteredRegions()) {
+        msgpack::sbuffer dbuf;
+        msgpack::pack(dbuf, desc);
+        auto* out = req.add_dst_buffers();
+        out->set_region_id(region_id);
+        out->set_desc(std::string(dbuf.data(), dbuf.size()));
+      }
+    }
     ::umbp::GetPeerInfoResponse resp;
     grpc::ClientContext ctx;
     auto status = stub->GetPeerInfo(&ctx, req, &resp);
@@ -3076,6 +3110,7 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
                       status.error_message());
       return false;
     }
+    peer.push_reregister_needed = false;
 
     if (!resp.engine_desc().empty()) {
       auto handle = msgpack::unpack(resp.engine_desc().data(), resp.engine_desc().size());
@@ -3110,9 +3145,20 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
   };
 
   if (peer.peer_stub) {
-    if (!peer.engine_registered && io_engine_) {
+    // Re-handshake when the engine is not registered yet, or when the peer told
+    // us it lost/never had our push registration.  The latter is a pure
+    // optimisation recovery — failing it leaves us on the pull path, so it must
+    // not tear down a working connection.
+    if ((!peer.engine_registered && io_engine_) || peer.push_reregister_needed) {
+      const bool was_registered = peer.engine_registered;
       auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
       if (!hydrate_from_peer(stub)) {
+        if (was_registered) {
+          // Connection is otherwise healthy; just stop retrying the re-register
+          // on every batch until the peer asks again.
+          peer.push_reregister_needed = false;
+          return true;
+        }
         peer.peer_stub.reset();
         peer.engine_registered = false;
         return false;
@@ -3376,9 +3422,17 @@ std::vector<size_t> PoolClient::RemoteSsdBatchReadOnce(PeerConnection& peer,
   if (rpc_timeout.count() == 0) rpc_timeout = SsdReadLeaseTtl();
 
   ::umbp::BatchPrepareSsdReadRequest req;
+  req.set_requester_node_id(config_.master_config.node_id);
   for (const auto& item : items) {
     req.add_keys(*item.key);
     req.add_max_sizes(item.size);
+    // Push destination for this key.  We send it for every key because we do
+    // not know which of them the peer will end up serving us as a single-flight
+    // follower — the only case where it is consulted.  An unregistered
+    // destination sends region_id 0, which the peer reads as "not eligible".
+    auto reg = FindRegisteredRegion(item.dst, item.size);
+    req.add_dst_region_id(reg ? reg->region_id : 0);
+    req.add_dst_offset(reg ? reg->offset : 0);
   }
   // Stage timers for the [SsdPerf/remote] breakdown (no-ops unless
   // UMBP_SSD_TIMING is set).  `prepare_rpc` covers the peer's whole SSD read
@@ -3400,10 +3454,19 @@ std::vector<size_t> PoolClient::RemoteSsdBatchReadOnce(PeerConnection& peer,
     }
   }
 
+  // The peer could not resolve our push registration.  Re-handshake before the
+  // next batch; this round already fell back to the pull path server-side, so
+  // there is nothing to redo here.
+  if (resp.push_registration_stale()) peer.push_reregister_needed = true;
+
   // Sort the per-key outcomes.  Only OK entries get an RDMA; NO_SLOT goes back
   // to the caller for the next round; everything else is done (miss or error).
   std::vector<size_t> staged;  // index into items
   std::vector<uint64_t> leases;
+  size_t pushed_count = 0;
+  auto was_pushed = [&](size_t i) {
+    return i < static_cast<size_t>(resp.pushed_size()) && resp.pushed(i);
+  };
   for (size_t i = 0; i < items.size() && i < static_cast<size_t>(resp.status_size()); ++i) {
     switch (resp.status(i)) {
       case ::umbp::SSD_READ_OK:
@@ -3411,6 +3474,17 @@ std::vector<size_t> PoolClient::RemoteSsdBatchReadOnce(PeerConnection& peer,
           MORI_UMBP_WARN("[PoolClient] Remote SSD get key='{}' size mismatch (wanted {}, got {})",
                          *items[i].key, items[i].size, resp.size(i));
           leases.push_back(resp.lease_id(i));  // release without reading
+          break;
+        }
+        // Already delivered: the peer RDMA-WROTE these bytes into our own
+        // destination buffer while serving us as a single-flight follower.  No
+        // staging offset to pull from, no lease held on our behalf, and no
+        // lease-window gating to apply — the write completed before the peer
+        // answered this RPC.  An old peer never sets this, so this stays false
+        // and every key takes the branch below.
+        if (was_pushed(i)) {
+          (*per_item_ok)[slots[i]] = 1;
+          ++pushed_count;
           break;
         }
         staged.push_back(i);
@@ -3573,12 +3647,23 @@ std::vector<size_t> PoolClient::RemoteSsdBatchReadOnce(PeerConnection& peer,
     // no_slot > 0 means the peer's read-staging pool (ssd_staging_buffer_slots)
     // capped this round: only `staged` keys of `items` could be served at once,
     // regardless of how many drives back the tier.
+    // pushed = keys the peer delivered by RDMA WRITE into our own buffer while
+    // serving us as a single-flight follower; they cost us no staging slot, no
+    // pull and no lease.  pushed staying 0 under a same-key fan-out workload
+    // means the fast path is silently falling back — check the peer's log for a
+    // stale/unresolvable registration.
+    uint64_t pushed_bytes = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+      if (was_pushed(i)) pushed_bytes += items[i].size;
+    }
     MORI_UMBP_INFO(
-        "[SsdPerf/remote] GET peer={} asked={} staged={} no_slot={} not_found={} "
-        "asked_bytes={} staged_bytes={} total_ms={:.3f} GB_s={:.2f} | prepare_rpc={:.3f}ms "
-        "({:.0f}%) rdma={:.3f}ms ({:.0f}%) release={:.3f}ms | rdma_GB_s={:.2f}",
-        peer.peer_address, items.size(), staged.size(), no_slot, not_found, asked_bytes,
-        staged_bytes, total_ms, ssdperf::GbPerSec(staged_bytes, total_ms), prepare_rpc_ms,
+        "[SsdPerf/remote] GET peer={} asked={} staged={} pushed={} no_slot={} not_found={} "
+        "asked_bytes={} staged_bytes={} pushed_bytes={} total_ms={:.3f} GB_s={:.2f} | "
+        "prepare_rpc={:.3f}ms ({:.0f}%) rdma={:.3f}ms ({:.0f}%) release={:.3f}ms | "
+        "rdma_GB_s={:.2f}",
+        peer.peer_address, items.size(), staged.size(), pushed_count, no_slot, not_found,
+        asked_bytes, staged_bytes, pushed_bytes, total_ms,
+        ssdperf::GbPerSec(staged_bytes + pushed_bytes, total_ms), prepare_rpc_ms,
         ssdperf::Pct(prepare_rpc_ms, total_ms), rdma_ms, ssdperf::Pct(rdma_ms, total_ms),
         release_ms, ssdperf::GbPerSec(staged_bytes, rdma_ms));
   }
@@ -3646,6 +3731,16 @@ void PoolClient::PublishSsdMetrics() {
                  ssd_metrics_last_.read_size_too_large);
     ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
                  {{"status", "error"}}, peer_ssd_->ReadError(), ssd_metrics_last_.read_error);
+    // Fan-out push: reads we served a follower by RDMA-WRITE-ing into its own
+    // buffer, and those whose write did not complete (that follower alone sees a
+    // read error).  Both are already counted under status=ok / status=error;
+    // these break out the delivery mechanism so a silent fallback to memcpy is
+    // visible as pushed flatlining, not just as slower reads.
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
+                 {{"status", "pushed"}}, peer_ssd_->ReadPushed(), ssd_metrics_last_.read_pushed);
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
+                 {{"status", "push_failed"}}, peer_ssd_->ReadPushFailed(),
+                 ssd_metrics_last_.read_push_failed);
 
     // SSD IO byte counters -> bandwidth via rate() in Grafana.
     ship_counter(MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL, MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL_HELP,

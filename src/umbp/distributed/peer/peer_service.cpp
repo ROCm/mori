@@ -26,8 +26,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <msgpack.hpp>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
+#include "mori/io/engine.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_client.h"
@@ -113,6 +118,32 @@ int FindSlotByLeaseId(const std::vector<StagingSlot>& slots, uint64_t lease_id) 
   }
   return -1;
 }
+
+// One client's RDMA push registration for the SSD read fan-out, learned from
+// its GetPeerInfo.
+//
+// `dst_buffers` is keyed by the client's STABLE region id, never by a vector
+// position: PoolClient::DeregisterMemory erases from the middle of its
+// registration vector, so a positional handle would silently re-point at a
+// different buffer after any deregister+register cycle.
+//
+// `refreshed_at` anchors the TTL (ResolveClientPushTtl).  It is bumped by every
+// BatchPrepareSsdRead from this client — a client making requests is
+// demonstrably alive — so an active registration never goes stale mid-use.
+struct ClientPushTarget {
+  mori::io::EngineDesc engine_desc;
+  std::unordered_map<uint64_t, mori::io::MemoryDesc> dst_buffers;
+  std::chrono::steady_clock::time_point refreshed_at;
+};
+
+// A push destination resolved for one key, as plain data.  Built while
+// client_push_mutex_ is held and consumed after it is released, so that lock is
+// never held across a PeerSsdManager call.
+struct ResolvedPushTarget {
+  bool valid = false;
+  mori::io::MemoryDesc remote{};
+  uint64_t remote_offset = 0;
+};
 }  // namespace
 
 namespace {
@@ -191,7 +222,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                       MasterClient* master_client, StagingMetrics& metrics, int num_read_slots,
                       std::chrono::milliseconds lease_timeout,
                       const std::vector<uint8_t>& engine_desc_bytes, SsdCopyPipeline* copy_pipeline,
-                      const SsdWriteStagingConfig& write_staging)
+                      const SsdWriteStagingConfig& write_staging, mori::io::IOEngine* io_engine)
       : ssd_staging_base_(ssd_staging_base),
         ssd_staging_size_(ssd_staging_size),
         ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes),
@@ -218,7 +249,9 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                              ? write_staging.region_size / static_cast<size_t>(write_staging.slots)
                              : 0),
         write_slots_(static_cast<size_t>(std::max(write_staging.slots, 0))),
-        master_client_(master_client) {
+        master_client_(master_client),
+        io_engine_(io_engine),
+        client_push_ttl_(ResolveClientPushTtl()) {
     if (num_read_slots <= 0) {
       MORI_UMBP_ERROR("[PeerService] num_read_slots={} invalid, clamped to 1", num_read_slots);
     }
@@ -227,11 +260,39 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
           "[PeerService] direct-SSD put enabled: {} write slot(s) x {}B at buffer offset {}",
           num_write_slots_, write_slot_size_, write_region_base_);
     }
+    // The staging buffer's own descriptor is the RDMA *source* for every push we
+    // lead.  We already ship it packed (GetPeerInfo), so unpack that rather than
+    // taking it as a second constructor argument that could drift out of sync.
+    // A caller that passed placeholder bytes (some tests do) simply gets no push
+    // source, which disables the fast path exactly like a null engine.
+    if (io_engine_ != nullptr && !ssd_staging_mem_desc_bytes_.empty()) {
+      try {
+        auto handle =
+            msgpack::unpack(reinterpret_cast<const char*>(ssd_staging_mem_desc_bytes_.data()),
+                            ssd_staging_mem_desc_bytes_.size());
+        ssd_staging_mem_ = handle.get().as<mori::io::MemoryDesc>();
+        push_source_ready_ = ssd_staging_mem_.size > 0;
+      } catch (const std::exception& e) {
+        MORI_UMBP_WARN(
+            "[PeerService] SSD staging MemoryDesc did not unpack ({}); read fan-out push disabled, "
+            "reads fall back to staging+pull",
+            e.what());
+      }
+    }
+    MORI_UMBP_INFO("[PeerService] SSD read fan-out push {} (ttl={}ms)",
+                   PushAvailable() ? "enabled" : "disabled", client_push_ttl_.count());
   }
 
   grpc::Status GetPeerInfo(grpc::ServerContext* /*context*/,
-                           const ::umbp::GetPeerInfoRequest* /*request*/,
+                           const ::umbp::GetPeerInfoRequest* request,
                            ::umbp::GetPeerInfoResponse* response) override {
+    // Inbound half (new): the caller's own engine + destination buffers, so we
+    // can RDMA-WRITE into it later (SSD read fan-out push).  A pure TP-rank
+    // client has no gRPC listener of its own, so this call — which it always
+    // initiates on first contact — is the only channel for that direction.
+    // proto3 defaults make an old client's empty request a silent no-op.
+    RegisterClientPushTarget(*request);
+
     response->set_ssd_staging_mem_desc(
         std::string(ssd_staging_mem_desc_bytes_.begin(), ssd_staging_mem_desc_bytes_.end()));
     response->set_ssd_staging_size(ssd_staging_size_);
@@ -362,6 +423,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       response->add_staging_offset(0);
       response->add_size(0);
       response->add_lease_id(0);
+      response->add_pushed(false);
     }
     response->set_lease_ttl_ms(static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(lease_timeout_).count()));
@@ -418,14 +480,40 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       offsets.push_back(offset);
     }
 
-    auto outcomes = peer_ssd_->PrepareReadBatch(keys, dsts, caps);
+    // Resolve the caller's push destinations BEFORE calling into PeerSsdManager,
+    // and hand them down as plain data — client_push_mutex_ is released by the
+    // time the manager's own mutex_ (or read_slots_mutex_) is taken again.
+    bool push_stale = false;
+    auto push_targets = ResolvePushTargets(*request, claimed_idx, caps, &push_stale);
+    std::vector<ReadPushSlot> push_slots;
+    if (PushAvailable()) {
+      push_slots.resize(claimed_idx.size());
+      for (size_t j = 0; j < claimed_idx.size(); ++j) {
+        // The source half is ours and identical for every key: our staging
+        // region, at this key's slot offset.  The destination half is the
+        // caller's, and only present for keys it registered.
+        push_slots[j].local_desc = ssd_staging_mem_;
+        push_slots[j].local_offset = offsets[j];
+        push_slots[j].push_eligible = push_targets[j].valid;
+        push_slots[j].remote_desc = push_targets[j].remote;
+        push_slots[j].remote_offset = push_targets[j].remote_offset;
+      }
+    }
+
+    std::vector<bool> pushed;
+    auto outcomes = peer_ssd_->PrepareReadBatch(keys, dsts, caps, push_slots, &pushed);
+    pushed.resize(claimed_idx.size(), false);
 
     // Promote the slots that hold data to Leased; hand the rest straight back.
+    // A pushed key is in the "hand it back" group even though it succeeded: its
+    // bytes went straight into the caller's buffer, so the slot we claimed for
+    // it up front (before anyone knew it would follow) holds nothing and there
+    // is no lease for the caller to release.
     {
       std::lock_guard<std::mutex> lock(read_slots_mutex_);
       for (size_t j = 0; j < claimed_idx.size(); ++j) {
         auto& slot = read_slots_[claimed_slot[j]];
-        if (outcomes[j].status == SsdReadStatus::kOk) {
+        if (outcomes[j].status == SsdReadStatus::kOk && !pushed[j]) {
           slot.state = SlotState::kLeased;
           slot.leased_at = received_at;
           slot.allocated_size = outcomes[j].size;
@@ -434,16 +522,24 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         }
       }
     }
+    size_t pushed_count = 0;
     for (size_t j = 0; j < claimed_idx.size(); ++j) {
       const int i = claimed_idx[j];
       response->set_status(i, ToProtoReadStatus(outcomes[j].status));
       response->set_size(i, outcomes[j].size);
-      if (outcomes[j].status == SsdReadStatus::kOk) {
-        response->set_staging_offset(i, offsets[j]);
-        response->set_lease_id(i, claimed_lease[j]);
+      if (outcomes[j].status != SsdReadStatus::kOk) continue;
+      if (pushed[j]) {
+        // No staging_offset, no lease_id: nothing to pull, nothing to release.
+        response->set_pushed(i, true);
+        ++pushed_count;
+        continue;
       }
+      response->set_staging_offset(i, offsets[j]);
+      response->set_lease_id(i, claimed_lease[j]);
     }
-    MORI_UMBP_DEBUG("[PeerService] BatchPrepareSsdRead: keys={} claimed={}", n, claimed_idx.size());
+    if (push_stale) response->set_push_registration_stale(true);
+    MORI_UMBP_DEBUG("[PeerService] BatchPrepareSsdRead: keys={} claimed={} pushed={} stale={}", n,
+                    claimed_idx.size(), pushed_count, push_stale);
     return grpc::Status::OK;
   }
 
@@ -839,6 +935,127 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     return peer_ssd_ != nullptr && ssd_staging_base_ != nullptr && ssd_staging_size_ > 0;
   }
 
+  // The fan-out push additionally needs an engine to post with and our own
+  // staging region as a registered RDMA source.  Missing either leaves every
+  // read on the classic staging + client-pull path.
+  bool PushAvailable() const { return io_engine_ != nullptr && push_source_ready_; }
+
+  // ---- Client push registry (see ClientPushTarget / ResolveClientPushTtl) ----
+
+  // Record (or refresh) the caller's engine + destination buffers from its
+  // GetPeerInfo.  Registering the remote engine here is what makes the later
+  // BatchWrite resolvable; it is idempotent in the IO engine, and a client that
+  // reconnects after a restart re-runs it with its new descriptor, replacing the
+  // dead instance's entry wholesale rather than merging into it.
+  void RegisterClientPushTarget(const ::umbp::GetPeerInfoRequest& request) {
+    if (!PushAvailable()) return;
+    if (request.node_id().empty() || request.engine_desc().empty()) return;
+
+    ClientPushTarget target;
+    try {
+      auto handle = msgpack::unpack(request.engine_desc().data(), request.engine_desc().size());
+      target.engine_desc = handle.get().as<mori::io::EngineDesc>();
+      for (const auto& b : request.dst_buffers()) {
+        if (b.desc().empty() || b.region_id() == 0) continue;  // 0 is reserved for "none"
+        auto h = msgpack::unpack(b.desc().data(), b.desc().size());
+        auto desc = h.get().as<mori::io::MemoryDesc>();
+        if (desc.size == 0) continue;
+        target.dst_buffers.emplace(b.region_id(), desc);
+      }
+    } catch (const std::exception& e) {
+      MORI_UMBP_WARN("[PeerService] GetPeerInfo push registration from '{}' did not unpack ({})",
+                     request.node_id(), e.what());
+      return;
+    }
+    if (target.dst_buffers.empty()) return;
+
+    io_engine_->RegisterRemoteEngine(target.engine_desc);
+    target.refreshed_at = std::chrono::steady_clock::now();
+    const size_t buffers = target.dst_buffers.size();
+    {
+      std::lock_guard<std::mutex> lock(client_push_mutex_);
+      client_push_targets_[request.node_id()] = std::move(target);
+    }
+    MORI_UMBP_INFO("[PeerService] registered push target node='{}' buffers={}", request.node_id(),
+                   buffers);
+  }
+
+  // Resolve one batch's push destinations and refresh the caller's TTL.
+  //
+  // Returns targets parallel to the request's keys; `*stale` reports that the
+  // caller asked for push but we could not resolve it (never registered,
+  // TTL-expired, or a region id registered after its handshake), which the
+  // client answers by re-running the handshake.  Every failure mode here simply
+  // yields an invalid target — the key then takes the memcpy path, so this is
+  // never a correctness fork.
+  //
+  // Lock discipline: client_push_mutex_ is taken only to copy plain data out,
+  // and is released before PeerSsdManager (or read_slots_mutex_) is touched.  No
+  // new lock nesting is introduced anywhere in this file.
+  std::vector<ResolvedPushTarget> ResolvePushTargets(
+      const ::umbp::BatchPrepareSsdReadRequest& request, const std::vector<int>& claimed_idx,
+      const std::vector<size_t>& caps, bool* stale) {
+    std::vector<ResolvedPushTarget> targets(claimed_idx.size());
+    if (!PushAvailable() || request.requester_node_id().empty()) return targets;
+
+    const int n = request.keys_size();
+    if (request.dst_region_id_size() != n || request.dst_offset_size() != n) {
+      // An old client, or a malformed one.  Either way: no push, no complaint
+      // back (nothing for the client to re-register), just the classic path.
+      return targets;
+    }
+
+    std::lock_guard<std::mutex> lock(client_push_mutex_);
+    auto it = client_push_targets_.find(request.requester_node_id());
+    const auto now = std::chrono::steady_clock::now();
+    if (it == client_push_targets_.end()) {
+      *stale = true;
+      return targets;
+    }
+    // Inline expiry, matching ClaimStagingSlot's pattern: no reaper thread, the
+    // check rides the next lookup.  A dead client's entry is dropped here rather
+    // than being resolved against a restarted instance's memory.
+    if (now - it->second.refreshed_at > client_push_ttl_) {
+      MORI_UMBP_WARN(
+          "[PeerService] push registration for '{}' expired after {}ms of silence; dropping it "
+          "(reads fall back to staging+pull until the client re-registers)",
+          request.requester_node_id(), client_push_ttl_.count());
+      client_push_targets_.erase(it);
+      *stale = true;
+      return targets;
+    }
+    // The client is demonstrably alive: it is making requests.
+    it->second.refreshed_at = now;
+
+    for (size_t j = 0; j < claimed_idx.size(); ++j) {
+      const int i = claimed_idx[j];
+      const uint64_t region_id = request.dst_region_id(i);
+      if (region_id == 0) continue;  // this key opted out; not a staleness signal
+      auto buf = it->second.dst_buffers.find(region_id);
+      if (buf == it->second.dst_buffers.end()) {
+        *stale = true;  // registered later than the handshake, most likely
+        continue;
+      }
+      // Server-side bounds check.  The addressing above already rules out the
+      // same-process index-collision class of bug, but a malformed or
+      // out-of-date request must never turn into a write past the end of a
+      // registered region.
+      const uint64_t offset = request.dst_offset(i);
+      const size_t want = caps[j];
+      if (offset > buf->second.size || want > buf->second.size - offset) {
+        MORI_UMBP_WARN(
+            "[PeerService] push target out of bounds for '{}' region={} offset={} size={} "
+            "region_size={}; falling back to staging+pull for this key",
+            request.requester_node_id(), region_id, offset, want, buf->second.size);
+        continue;
+      }
+      targets[j].valid = true;
+      targets[j].remote = buf->second;
+      targets[j].remote_offset = offset;
+    }
+    return targets;
+  }
+
   // Direct-SSD put additionally needs a carved write region; without one the
   // peer advertises zero write slots and rejects the write RPCs.
   bool SsdWriteRpcAvailable() const {
@@ -896,6 +1113,15 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 
   std::atomic<uint64_t> next_lease_id_{1};
 
+  // SSD read fan-out push.  io_engine_ makes this peer an RDMA *initiator* —
+  // the only path in UMBP where the peer role does that.
+  mori::io::IOEngine* io_engine_ = nullptr;
+  mori::io::MemoryDesc ssd_staging_mem_{};  // RDMA source for pushes we lead
+  bool push_source_ready_ = false;
+  const std::chrono::milliseconds client_push_ttl_;
+  std::mutex client_push_mutex_;
+  std::unordered_map<std::string, ClientPushTarget> client_push_targets_;
+
  public:
   // SSD read staging slots currently busy (Preparing or Leased).  Sampled once
   // per metrics flush by PoolClient's provider; a brief lock + small scan
@@ -917,6 +1143,19 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     }
     return in_use;
   }
+
+  // Live registrations only: an entry past its TTL is not counted (and is
+  // dropped on the next resolve).  Lets a test assert that a killed client's
+  // registration actually ages out rather than lingering.
+  size_t LiveClientPushTargets() {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(client_push_mutex_);
+    size_t live = 0;
+    for (const auto& [node_id, target] : client_push_targets_) {
+      if (now - target.refreshed_at <= client_push_ttl_) ++live;
+    }
+    return live;
+  }
 };
 
 PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc, PeerSsdManager* peer_ssd,
@@ -925,7 +1164,8 @@ PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc, PeerSsdManag
                                      int num_read_slots, std::chrono::milliseconds lease_timeout,
                                      std::vector<uint8_t> engine_desc_bytes,
                                      MasterClient* master_client, SsdCopyPipeline* copy_pipeline,
-                                     SsdWriteStagingConfig write_staging)
+                                     SsdWriteStagingConfig write_staging,
+                                     mori::io::IOEngine* io_engine)
     : ssd_staging_base_(ssd_staging_base),
       ssd_staging_size_(ssd_staging_size),
       write_staging_(write_staging),
@@ -933,12 +1173,13 @@ PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc, PeerSsdManag
       dram_alloc_(dram_alloc),
       master_client_(master_client),
       copy_pipeline_(copy_pipeline),
+      io_engine_(io_engine),
       ssd_staging_mem_desc_bytes_(std::move(ssd_staging_mem_desc_bytes)),
       engine_desc_bytes_(std::move(engine_desc_bytes)) {
   service_ = std::make_unique<UMBPPeerServiceImpl>(
       ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, peer_ssd_, dram_alloc_,
       master_client_, metrics_, num_read_slots, lease_timeout, engine_desc_bytes_, copy_pipeline_,
-      write_staging_);
+      write_staging_, io_engine_);
 }
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }
@@ -949,6 +1190,19 @@ size_t PeerServiceServer::SnapshotReadSlotsInUse() const {
 
 size_t PeerServiceServer::SnapshotWriteSlotsInUse() const {
   return service_ ? service_->WriteSlotsInUse() : 0;
+}
+
+size_t PeerServiceServer::SnapshotClientPushTargets() const {
+  return service_ ? service_->LiveClientPushTargets() : 0;
+}
+
+std::chrono::milliseconds ResolveClientPushTtl() {
+  // 30s: two orders of magnitude longer than a healthy request gap (every batch
+  // refreshes the entry), and short enough that a crashed client's registration
+  // is gone long before anyone would notice the fallback.  min 1s so a
+  // misconfigured 0 cannot expire every entry the instant it is written.
+  return GetEnvMilliseconds("UMBP_PUSH_TARGET_TTL_MS", std::chrono::milliseconds{30000},
+                            /*min_allowed=*/1000);
 }
 
 PeerPollerConfig ResolvePeerPollerConfig() {

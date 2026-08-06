@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "mori/io/engine.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/ssd_perf.h"
 #include "umbp/local/tiers/spdk_proxy_tier.h"
@@ -45,13 +46,18 @@ namespace {
 bool WatermarksValid(double high, double low) {
   return high > 0.0 && high <= 1.0 && low > 0.0 && low < high;
 }
+
+// A default-constructed MemoryDesc has size 0 and addresses nothing.  Same test
+// PoolClient uses for "this descriptor was actually hydrated".
+bool IsValidDesc(const mori::io::MemoryDesc& d) { return d.size > 0; }
 }  // namespace
 
 // ---------------------------------------------------------------------------
 //  Construction
 // ---------------------------------------------------------------------------
 
-PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
+PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg, mori::io::IOEngine* io_engine)
+    : io_engine_(io_engine) {
   if (!cfg.enabled) {
     MORI_UMBP_INFO("[PeerSsdManager] constructed disabled (no SSD backend)");
     return;
@@ -104,9 +110,11 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
 }
 
 PeerSsdManager::PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark,
-                               double low_watermark, bool single_flight)
+                               double low_watermark, bool single_flight,
+                               mori::io::IOEngine* io_engine)
     : backend_(std::move(backend)), high_watermark_(high_watermark), low_watermark_(low_watermark) {
   single_flight_ = single_flight;
+  io_engine_ = io_engine;
   if (!WatermarksValid(high_watermark_, low_watermark_)) {
     throw std::runtime_error(
         "[PeerSsdManager] invalid SSD watermarks (require 0 < low_watermark < "
@@ -495,6 +503,9 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
   bool leading = false;    // we own the device read and the fan-out
   bool following = false;  // a leader will fill our buffer; we only wait
   std::shared_ptr<ReadEpisode> episode;
+  // Our own slot in the leader's fan-out list, kept because the leader swaps
+  // that list out of the episode when it seals.
+  std::shared_ptr<FollowerTarget> my_target;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = owned_.find(key);
@@ -533,7 +544,13 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
       episode = slot->episode;
       leading = true;
     } else if (single_flight_ && !slot->episode->sealed) {
-      slot->episode->followers.emplace_back(staging_ptr, staging_cap);
+      // Single-key requesters never register a push destination (see the
+      // "explicit scope" note on PrepareReadBatch): they attach as a plain
+      // memcpy follower into their own staging slot.
+      my_target = std::make_shared<FollowerTarget>();
+      my_target->dst = staging_ptr;
+      my_target->cap = staging_cap;
+      slot->episode->followers.push_back(my_target);
       episode = slot->episode;
       following = true;
       metrics_.read_merged.fetch_add(1, std::memory_order_relaxed);
@@ -551,27 +568,29 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
           "[PeerSsdManager] single-flight follower timed out after {}s waiting on leader key={}",
           kFollowerWaitSeconds, key);
     }
-    read_ok = signalled && episode->ok;
+    read_ok = signalled && my_target->ok;
   } else {
     read_ok = backend_->ReadIntoPtr(key, reinterpret_cast<uintptr_t>(staging_ptr), size);
     if (leading) {
       // Publish to whoever attached while we were on the device.  Failures are
       // published too, so a follower is never left to time out.
-      std::vector<std::pair<void*, size_t>> fanout;
+      std::vector<std::shared_ptr<FollowerTarget>> fanout;
       {
         std::lock_guard<std::mutex> lock(mutex_);
         episode->sealed = true;
-        episode->ok = read_ok;
         fanout.swap(episode->followers);
         auto it = inflight_reads_.find(key);
         if (it != inflight_reads_.end() && it->second->episode == episode) {
           it->second->episode.reset();
         }
       }
-      if (read_ok) {
-        for (const auto& f : fanout) {
-          std::memcpy(f.first, staging_ptr, std::min(size, f.second));
-        }
+      // memcpy only: this path has no RDMA source of its own (staging_ptr's
+      // MemoryDesc is not plumbed through the single-key RPC), so even a
+      // follower that wanted a push is served the classic way and told so.
+      for (const auto& f : fanout) {
+        f->ok = read_ok;
+        f->pushed = false;
+        if (read_ok) std::memcpy(f->dst, staging_ptr, std::min(size, f->cap));
       }
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -603,10 +622,77 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
   return SsdReadOutcome{SsdReadStatus::kOk, size};
 }
 
-std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<std::string>& keys,
-                                                             const std::vector<void*>& dsts,
-                                                             const std::vector<size_t>& caps) {
+// RDMA-WRITE the leader's just-read bytes into each push-follower's own
+// destination buffer.  This is the whole point of the fast path: a WR post costs
+// microseconds where the memcpy it replaces costs a full page copy per follower,
+// serialized on one thread.
+//
+// Every follower gets its OWN TransferStatus and is waited individually.  An
+// aggregate "first failure wins" wait would let one dead remote QP fail
+// destinations that actually landed — and, worse, would leave the caller unable
+// to say which. The leader's own read outcome is not represented here at all;
+// it already succeeded or this function was not called.
+size_t PeerSsdManager::PushFanout(const std::vector<std::shared_ptr<FollowerTarget>>& fanout,
+                                  const ReadPushSlot& leader_slot, size_t size,
+                                  uint64_t* pushed_bytes) {
+  const size_t n = fanout.size();
+  // One transfer per follower.  They share a local descriptor (the leader's
+  // staging region) but each has a distinct remote descriptor, and BatchWrite
+  // pairs the two vectors element-wise, so grouping buys nothing here.
+  mori::io::MemDescVec local_descs(n, leader_slot.local_desc);
+  mori::io::MemDescVec remote_descs;
+  mori::io::BatchSizeVec local_offsets(n), remote_offsets(n), sizes(n);
+  remote_descs.reserve(n);
+  std::vector<size_t> bytes(n, 0);
+  for (size_t k = 0; k < n; ++k) {
+    const auto& f = fanout[k];
+    bytes[k] = std::min(size, f->cap);
+    remote_descs.push_back(f->remote);
+    local_offsets[k].push_back(leader_slot.local_offset);
+    remote_offsets[k].push_back(f->remote_offset);
+    sizes[k].push_back(bytes[k]);
+  }
+
+  std::vector<mori::io::TransferStatus> statuses(n);
+  mori::io::TransferStatusPtrVec status_ptrs(n);
+  mori::io::TransferUniqueIdVec ids(n);
+  for (size_t k = 0; k < n; ++k) {
+    status_ptrs[k] = &statuses[k];
+    ids[k] = io_engine_->AllocateTransferUniqueId();
+  }
+  io_engine_->BatchWrite(local_descs, local_offsets, remote_descs, remote_offsets, sizes,
+                         status_ptrs, ids);
+
+  size_t ok_count = 0;
+  for (size_t k = 0; k < n; ++k) {
+    statuses[k].Wait();
+    const bool ok = statuses[k].Succeeded();
+    fanout[k]->ok = ok;
+    // pushed reflects the delivery mechanism, and is meaningful only alongside
+    // ok: a failed push is reported to that follower as a read error, and it
+    // must NOT then go looking in a staging slot nobody filled.
+    fanout[k]->pushed = ok;
+    if (ok) {
+      ++ok_count;
+      if (pushed_bytes) *pushed_bytes += bytes[k];
+    } else {
+      metrics_.read_push_failed.fetch_add(1, std::memory_order_relaxed);
+      MORI_UMBP_WARN(
+          "[PeerSsdManager] fan-out push failed for one follower (size={}B); that requester gets a "
+          "read error, the leader and every other follower are unaffected",
+          bytes[k]);
+    }
+  }
+  metrics_.read_pushed.fetch_add(ok_count, std::memory_order_relaxed);
+  return ok_count;
+}
+
+std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(
+    const std::vector<std::string>& keys, const std::vector<void*>& dsts,
+    const std::vector<size_t>& caps, const std::vector<ReadPushSlot>& push_slots,
+    std::vector<bool>* pushed) {
   std::vector<SsdReadOutcome> out(keys.size(), SsdReadOutcome{SsdReadStatus::kNotFound, 0});
+  if (pushed) pushed->assign(keys.size(), false);
   if (keys.empty()) return out;
   if (!backend_) {
     metrics_.read_not_found.fetch_add(keys.size(), std::memory_order_relaxed);
@@ -618,11 +704,36 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
     for (auto& o : out) o = SsdReadOutcome{SsdReadStatus::kError, 0};
     return out;
   }
+  // Push is strictly opt-in and strictly additive: no engine, no slots, or a
+  // wrong-length slot vector all mean "memcpy exactly as before".  A length
+  // mismatch is a caller bug, so say so rather than silently half-pushing.
+  bool push_enabled = io_engine_ != nullptr && !push_slots.empty();
+  if (!push_slots.empty() && push_slots.size() != keys.size()) {
+    MORI_UMBP_ERROR("[PeerSsdManager] PrepareReadBatch: push_slots={} but keys={}; push disabled",
+                    push_slots.size(), keys.size());
+    push_enabled = false;
+  }
+  const ReadPushSlot kNoPush{};
+  auto slot_for = [&](size_t i) -> const ReadPushSlot& {
+    return push_enabled ? push_slots[i] : kNoPush;
+  };
 
   // Stage timers for the [SsdPerf/peer] GET breakdown (no-ops unless
   // UMBP_SSD_TIMING is set).
   const auto t_begin = ssdperf::Now();
   double resolve_ms = 0.0, backend_ms = 0.0, release_ms = 0.0;
+  // fanout_ms: Pass 2b, single-threaded memcpy + per-key lock/unlock/notify_all
+  // serving OTHER concurrent callers' follower reads off of our own device read.
+  // wait_ms: Pass 2c, time spent blocked on someone else's episode as a follower.
+  // Both are 0 for calls that neither lead anyone nor follow anyone.
+  double fanout_ms = 0.0, wait_ms = 0.0;
+  uint64_t fanout_bytes = 0;
+  size_t fanout_count = 0;
+  // Of fanout_count, the followers served by RDMA WRITE instead of memcpy.
+  // pushed_here counts what THIS call pushed as a leader; followed_pushed counts
+  // the keys THIS call had pushed to it as a follower (what the RPC reports).
+  uint64_t push_bytes = 0;
+  size_t pushed_here = 0, followed_pushed = 0;
 
   // Pass 1 — resolve sizes and mark every servable key in flight under ONE lock
   // acquisition (the per-key path pays two per key).
@@ -632,6 +743,11 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
   // Per-request handle on the episode we lead or follow.  Held as a shared_ptr
   // so it stays valid even after the slot moves on to a new leader.
   std::vector<std::shared_ptr<ReadEpisode>> episodes(keys.size());
+  // Our own entry in a leader's fan-out list, for the keys we follow.  Kept
+  // per-request because the leader swaps its list out of the episode on seal,
+  // and because each follower's outcome is now its own (RDMA WRITE can fail for
+  // one destination and succeed for another).
+  std::vector<std::shared_ptr<FollowerTarget>> my_targets(keys.size());
   todo.reserve(keys.size());
   // dup = requests that found an identical read already in flight;
   // merged = those actually served without touching the drive;
@@ -672,7 +788,18 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
         todo.push_back(i);
       } else if (single_flight_ && !slot->episode->sealed) {
         // Merge window open: hand the leader our buffer and wait on its episode.
-        slot->episode->followers.emplace_back(dsts[i], caps[i]);
+        // We always hand it a memcpy destination (our staging slot), and
+        // additionally a push destination when we have one — the leader picks,
+        // and tells us which it used, so a leader that cannot push still serves
+        // us correctly.
+        const auto& ps = slot_for(i);
+        my_targets[i] = std::make_shared<FollowerTarget>();
+        my_targets[i]->dst = dsts[i];
+        my_targets[i]->cap = caps[i];
+        my_targets[i]->wants_push = ps.push_eligible;
+        my_targets[i]->remote = ps.remote_desc;
+        my_targets[i]->remote_offset = ps.remote_offset;
+        slot->episode->followers.push_back(my_targets[i]);
         episodes[i] = slot->episode;
         waits.push_back(i);
         ++merged;
@@ -726,26 +853,59 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
   //
   // A leader whose read FAILED still publishes (ok=false) — followers must be
   // released with an error, never left to time out.
+  const auto t_fanout = ssdperf::Now();
   for (size_t j = 0; j < todo.size(); ++j) {
     const size_t i = todo[j];
     if (!is_leader[i]) continue;  // independent read: nobody is waiting on it
     const auto& ep = episodes[i];
-    std::vector<std::pair<void*, size_t>> fanout;
+    std::vector<std::shared_ptr<FollowerTarget>> fanout;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       ep->sealed = true;  // late arrivals now go independent instead of waiting
-      ep->ok = ok[j];
       fanout.swap(ep->followers);
       // Retire the episode so the next arrival starts a fresh one rather than
       // attaching to a read that is already past its snapshot.
       auto it = inflight_reads_.find(keys[i]);
       if (it != inflight_reads_.end() && it->second->episode == ep) it->second->episode.reset();
     }
-    // Copy outside the lock: this is host DRAM and page-sized, but holding
-    // mutex_ across it would stall every other read/evict on this manager.
-    if (ok[j]) {
+    // Deliver outside the lock: holding mutex_ across a page-sized memcpy (let
+    // alone an RDMA round trip) would stall every other read/evict here.
+    //
+    // Our read failed: publish the failure to everyone and post nothing.  A
+    // follower must be released with an error, never left to time out, and a
+    // BatchWrite of bytes we never read would be worse than useless.
+    if (!ok[j]) {
       for (const auto& f : fanout) {
-        std::memcpy(f.first, dsts[i], std::min(out[i].size, f.second));
+        f->ok = false;
+        f->pushed = false;
+      }
+    } else {
+      // Split the fan-out.  A follower is pushed only if it asked to be AND we
+      // can be an RDMA source (engine present, our own staging pointer
+      // registered); otherwise it drops into the unchanged memcpy loop below.
+      const auto& lead_slot = slot_for(i);
+      const bool can_push = io_engine_ != nullptr && IsValidDesc(lead_slot.local_desc);
+      std::vector<std::shared_ptr<FollowerTarget>> push_group;
+      for (const auto& f : fanout) {
+        if (can_push && f->wants_push && IsValidDesc(f->remote)) {
+          push_group.push_back(f);
+          continue;
+        }
+        // Unchanged path: single-threaded memcpy into the follower's own slot.
+        const size_t n = std::min(out[i].size, f->cap);
+        std::memcpy(f->dst, dsts[i], n);
+        f->ok = true;
+        f->pushed = false;
+        fanout_bytes += n;
+        ++fanout_count;
+      }
+      // One BatchWrite for this key's whole push group; each posted transfer is
+      // waited individually so one bad destination cannot fail the others.
+      // fanout_bytes/fanout_count deliberately stay memcpy-only: they exist to
+      // measure the copy cost this path is here to remove, so pushed followers
+      // are reported under pushed/push_bytes instead.
+      if (!push_group.empty()) {
+        pushed_here += PushFanout(push_group, lead_slot, out[i].size, &push_bytes);
       }
     }
     {
@@ -754,9 +914,14 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
       ep->cv.notify_all();
     }
   }
+  fanout_ms = ssdperf::MsSince(t_fanout);
 
   // Pass 2c — collect the keys we followed.  Our staging buffer is still alive
-  // (we never returned), so the leader's memcpy landed in a valid destination.
+  // (we never returned), so a leader's memcpy landed in a valid destination; so
+  // did an RDMA WRITE into our own registered destination buffer, which we also
+  // never released.  Read our OWN target's outcome, not the episode's: with push
+  // in play the leader's read can succeed while one destination's write fails.
+  const auto t_wait = ssdperf::Now();
   std::vector<bool> wait_ok(waits.size(), false);
   for (size_t w = 0; w < waits.size(); ++w) {
     const size_t i = waits[w];
@@ -769,8 +934,13 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
           "[PeerSsdManager] single-flight follower timed out after {}s waiting on leader key={}",
           kFollowerWaitSeconds, keys[i]);
     }
-    wait_ok[w] = signalled && ep->ok;
+    wait_ok[w] = signalled && my_targets[i]->ok;
+    if (wait_ok[w] && my_targets[i]->pushed) {
+      if (pushed) (*pushed)[i] = true;
+      ++followed_pushed;
+    }
   }
+  wait_ms = ssdperf::MsSince(t_wait);
 
   // Pass 3 — release the in-flight marks, refresh LRU for the reads that landed,
   // and wake a waiting ClearLocal once the last read drains.
@@ -825,12 +995,19 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
     MORI_UMBP_INFO(
         "[SsdPerf/peer] GET keys={} device_reads={} served={} not_owned={} bytes={} "
         "total_ms={:.3f} GB_s={:.2f} | resolve={:.3f}ms backend={:.3f}ms ({:.0f}%) "
-        "release_lru={:.3f}ms | singleflight={} dup={} merged={} max_concurrent={} "
+        "fanout={:.3f}ms ({:.0f}%) wait={:.3f}ms ({:.0f}%) release_lru={:.3f}ms | "
+        "fanout_bytes={} fanout_count={} fanout_GB_s={:.2f} | "
+        "pushed={} push_bytes={} followed_pushed={} push_total={} push_failed_total={} | "
+        "singleflight={} dup={} merged={} max_concurrent={} "
         "dup_total={}/{} ({:.1f}%) merged_total={}",
         keys.size(), todo.size(), served, not_owned, read_bytes, total_ms,
         ssdperf::GbPerSec(read_bytes, total_ms), resolve_ms, backend_ms,
-        ssdperf::Pct(backend_ms, total_ms), release_ms, single_flight_ ? "on" : "off", dup, merged,
-        max_concurrent, dup_total, probe_total,
+        ssdperf::Pct(backend_ms, total_ms), fanout_ms, ssdperf::Pct(fanout_ms, total_ms), wait_ms,
+        ssdperf::Pct(wait_ms, total_ms), release_ms, fanout_bytes, fanout_count,
+        ssdperf::GbPerSec(fanout_bytes, fanout_ms), pushed_here, push_bytes, followed_pushed,
+        metrics_.read_pushed.load(std::memory_order_relaxed),
+        metrics_.read_push_failed.load(std::memory_order_relaxed), single_flight_ ? "on" : "off",
+        dup, merged, max_concurrent, dup_total, probe_total,
         ssdperf::Pct(static_cast<double>(dup_total), probe_total), merged_total);
   }
   return out;

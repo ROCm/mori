@@ -217,6 +217,12 @@ class PoolClient {
     // tier must fail rather than RDMA into a region that does not exist.
     size_t ssd_write_staging_slots = 0;
     size_t ssd_write_staging_slot_size = 0;
+    // Set when this peer reported it could not resolve our push registration
+    // (we never registered, our entry aged out while we were idle, or we
+    // registered a buffer after the handshake).  Re-runs GetPeerInfo on the next
+    // EnsurePeerServiceConnection.  Purely an optimisation signal: until it is
+    // cleared the reads simply take the classic staging + pull path.
+    bool push_reregister_needed = false;
   };
   std::mutex peers_mutex_;
   std::unordered_map<std::string, std::unique_ptr<PeerConnection>> peers_;
@@ -270,9 +276,34 @@ class PoolClient {
     void* base;
     size_t size;
     mori::io::MemoryDesc mem_desc;
+    // Stable, monotonic, never-reused handle for this registration.  Position in
+    // registered_regions_ is NOT usable as one: DeregisterMemory erases from the
+    // middle, shifting every later entry down, so a peer that cached "region 3"
+    // would silently start addressing a different buffer after any
+    // deregister+register cycle.  The SSD read-fan-out push path publishes this
+    // id to peers (see PushBufferDesc), so it must outlive vector churn.
+    uint64_t id = 0;
   };
   std::mutex registered_mem_mutex_;
   std::vector<RegisteredRegion> registered_regions_;
+  // Never reset, never reused; 0 stays reserved for "no region".
+  uint64_t next_region_id_ = 1;
+
+  // One resolved registration: the descriptor to RDMA against, the byte offset
+  // of the queried pointer inside it, and the region's stable id.
+  struct RegionMatch {
+    mori::io::MemoryDesc mem_desc;
+    size_t offset = 0;
+    uint64_t region_id = 0;
+  };
+  std::optional<RegionMatch> FindRegisteredRegion(const void* ptr, size_t size);
+  // Every current registration as {stable id, descriptor}, for the GetPeerInfo
+  // push handshake.  A region registered after a handshake is simply absent from
+  // that peer's registry; the peer flags it (push_registration_stale) and we
+  // re-handshake, so the list never has to be pushed eagerly on registration.
+  std::vector<std::pair<uint64_t, mori::io::MemoryDesc>> SnapshotRegisteredRegions();
+  // Descriptor + offset only; the long-standing hot-path shape.  Thin wrapper
+  // over FindRegisteredRegion so there is one lookup rule, not two.
   std::optional<std::pair<mori::io::MemoryDesc, size_t>> FindRegisteredMemory(const void* ptr,
                                                                               size_t size);
 
@@ -536,6 +567,7 @@ class PoolClient {
     uint64_t copy_dropped_queue_full = 0, copy_dropped_stopped = 0;
     uint64_t read_ok = 0, read_not_found = 0, read_size_too_large = 0, read_error = 0;
     uint64_t read_no_slot = 0;
+    uint64_t read_pushed = 0, read_push_failed = 0;
     uint64_t copy_bytes = 0, read_bytes = 0;
     uint64_t evict_rounds = 0, evict_victims = 0, evict_bytes_freed = 0, evict_backend_failed = 0;
     uint64_t staging_expired_reclaims = 0, staging_slot_full_rejects = 0;

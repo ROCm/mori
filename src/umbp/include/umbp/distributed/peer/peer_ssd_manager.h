@@ -34,9 +34,14 @@
 #include <utility>
 #include <vector>
 
+#include "mori/io/common.hpp"         // MemoryDesc (push fan-out destinations)
 #include "umbp/distributed/config.h"  // PeerSsdConfig
 #include "umbp/distributed/peer/owned_location_source.h"
 #include "umbp/distributed/types.h"
+
+namespace mori::io {
+class IOEngine;
+}
 
 namespace mori::umbp {
 
@@ -48,6 +53,31 @@ struct SsdReadOutcome {
   size_t size = 0;
 };
 
+// Per-key RDMA plumbing for the single-flight fan-out push (see
+// PrepareReadBatch).  Every field is per-key and supplied by every caller,
+// because a caller does not know before the call which of its keys it will lead
+// and which it will follow:
+//
+//   * local_desc/local_offset describe where THIS caller's own dsts[i] lives.
+//     Used when this caller ends up LEADING: they are the RDMA source of the
+//     push to its followers.
+//   * remote_desc/remote_offset describe where THIS caller ultimately wants the
+//     bytes.  Used when this caller ends up FOLLOWING: they are the RDMA
+//     destination its leader writes into, instead of memcpy-ing into dsts[i].
+//
+// push_eligible == false (the default) opts the key out entirely and is the
+// exact pre-push behaviour: the caller is memcpy-served into dsts[i] and pulls
+// from there.  Anything unresolvable upstream (unknown node, stale region id,
+// expired registration, no IO engine) must arrive here as push_eligible=false
+// rather than as an invalid descriptor.
+struct ReadPushSlot {
+  bool push_eligible = false;
+  mori::io::MemoryDesc local_desc{};
+  size_t local_offset = 0;
+  mori::io::MemoryDesc remote_desc{};
+  size_t remote_offset = 0;
+};
+
 // Peer-side owner of the local SSD tier in the master-as-advisor design.
 // Single responsibility: manage one SSD TierBackend + the key->SSD-location
 // map + capacity + the owned-location event outbox + the read-prepare and
@@ -57,13 +87,17 @@ struct SsdReadOutcome {
 // PeerDramAllocator and two DRAM concepts would scramble ownership.
 class PeerSsdManager : public OwnedLocationSource {
  public:
-  explicit PeerSsdManager(const PeerSsdConfig& cfg);
+  // @p io_engine (non-owning, may be null) enables the RDMA-WRITE fan-out push
+  // in PrepareReadBatch.  Null — the default, and what every existing caller and
+  // test gets — leaves the manager memcpy-only, byte-for-byte the prior
+  // behaviour.  PoolClient owns the engine and constructs it before this.
+  explicit PeerSsdManager(const PeerSsdConfig& cfg, mori::io::IOEngine* io_engine = nullptr);
 
   // Test-only: inject a ready-made backend and explicit watermarks so unit
   // tests can drive eviction with a controllable (e.g. blocking) fake backend.
   // Production code must use the config constructor.
   PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark, double low_watermark,
-                 bool single_flight = true);
+                 bool single_flight = true, mori::io::IOEngine* io_engine = nullptr);
 
   ~PeerSsdManager() override;
 
@@ -147,9 +181,21 @@ class PeerSsdManager : public OwnedLocationSource {
   // kSizeTooLarge rejected before any device IO.
   //
   // @p dsts and @p caps are parallel to @p keys; the result is too.
+  //
+  // Fan-out push (opt-in): when @p push_slots is non-empty (parallel to @p keys)
+  // and an IOEngine was supplied, a key this call FOLLOWS whose slot is
+  // push_eligible is served by the leader RDMA-WRITE-ing straight into
+  // push_slots[i].remote_desc instead of memcpy-ing into dsts[i].  @p pushed (if
+  // non-null, sized to @p keys) reports which keys took that path: those keys'
+  // dsts[i] were never touched, so the caller must not pull from them — and the
+  // staging slot it claimed for them holds nothing and can be released.
+  // Anything not push-eligible, unresolvable, or not followed falls through to
+  // the unchanged memcpy path.
   std::vector<SsdReadOutcome> PrepareReadBatch(const std::vector<std::string>& keys,
                                                const std::vector<void*>& dsts,
-                                               const std::vector<size_t>& caps);
+                                               const std::vector<size_t>& caps,
+                                               const std::vector<ReadPushSlot>& push_slots = {},
+                                               std::vector<bool>* pushed = nullptr);
 
   // OwnedLocationSource — all events carry TierType::SSD.
   std::vector<KvEvent> DrainPendingEvents() override;
@@ -178,6 +224,14 @@ class PeerSsdManager : public OwnedLocationSource {
   uint64_t ReadLead() const { return metrics_.read_lead.load(std::memory_order_relaxed); }
   uint64_t ReadDup() const { return metrics_.read_dup.load(std::memory_order_relaxed); }
   uint64_t ReadMerged() const { return metrics_.read_merged.load(std::memory_order_relaxed); }
+  // Of the merged (follower-served) reads, those delivered by RDMA WRITE
+  // straight into the requester's buffer rather than by memcpy into its staging
+  // slot.  read_pushed_failed counts push transfers that were posted and did not
+  // complete — those followers get a read error, nobody else is affected.
+  uint64_t ReadPushed() const { return metrics_.read_pushed.load(std::memory_order_relaxed); }
+  uint64_t ReadPushFailed() const {
+    return metrics_.read_push_failed.load(std::memory_order_relaxed);
+  }
   // Byte counters for SSD IO bandwidth (rate() in Grafana = bytes/s).
   uint64_t CopyBytes() const { return metrics_.copy_bytes.load(std::memory_order_relaxed); }
   uint64_t ReadBytes() const { return metrics_.read_bytes.load(std::memory_order_relaxed); }
@@ -234,9 +288,12 @@ class PeerSsdManager : public OwnedLocationSource {
   //  2. Single flight: the first requester of a key becomes the *leader* and is
   //     the only one to touch the drive.  Requesters that arrive while it is
   //     still reading become *followers* — they register a destination buffer,
-  //     block on cv, and are filled by memcpy from the leader's buffer when it
-  //     completes.  This is what collapses the tp_size-way read fan-out that
-  //     MLA + TP produces (every attention-TP rank GETs a byte-identical key).
+  //     block on cv, and are filled from the leader's buffer when it completes:
+  //     by memcpy into their own staging slot, or (when they registered a push
+  //     destination and the leader can post RDMA) by a WRITE straight into their
+  //     final buffer, which skips the copy and the pull entirely.  This is what
+  //     collapses the tp_size-way read fan-out that MLA + TP produces (every
+  //     attention-TP rank GETs a byte-identical key).
   //
   // A requester that arrives after the leader has sealed its follower snapshot
   // is *independent*: it missed the merge window and issues its own read, which
@@ -252,12 +309,46 @@ class PeerSsdManager : public OwnedLocationSource {
   // waiting on, and that follower would silently start tracking a read whose
   // fan-out list it is not in.  Holding the shared_ptr also lets the episode
   // outlive its slot, so the last follower to wake still finds valid state.
+  // One follower attached to a leader's read.
+  //
+  // Delivery is either a memcpy into {dst, cap} (the original path) or an RDMA
+  // WRITE into {remote, remote_offset} capped at `cap` (the push path).
+  //
+  // `ok` is PER FOLLOWER, not shared.  With memcpy a shared episode-level bit
+  // was safe: copying from valid host memory cannot fail for one follower and
+  // succeed for another.  An RDMA WRITE can — a remote QP can be down or an
+  // rkey stale for exactly one destination — so one push-follower's failure
+  // must not be allowed to taint the leader's own result, the other
+  // push-followers, or the memcpy-followers on the same episode.
+  //
+  // Held by shared_ptr on both sides: the leader swaps the follower list out of
+  // the episode when it seals, so a follower cannot read its own outcome out of
+  // that list afterwards — it keeps its own handle instead.
+  struct FollowerTarget {
+    bool wants_push = false;        // requester registered a push destination
+    void* dst = nullptr;            // memcpy path; ALWAYS valid, push or not
+    size_t cap = 0;                 // byte cap for both paths
+    mori::io::MemoryDesc remote{};  // push path
+    size_t remote_offset = 0;
+    // Both written by the leader before it sets episode->done, and read by the
+    // follower after it wakes.  `pushed` reports what the leader ACTUALLY did,
+    // not what the follower asked for: a leader with no IO engine or no
+    // registered source (e.g. the single-key PrepareRead path, which never
+    // pushes) serves a push-wanting follower by memcpy into `dst` and reports
+    // pushed=false.  The follower must never assume delivery it did not get.
+    bool ok = false;
+    bool pushed = false;
+  };
+
+  // Note there is deliberately no episode-level `ok`.  The leader's read outcome
+  // reaches each follower through that follower's own FollowerTarget::ok, so a
+  // per-destination delivery failure cannot be confused with the read result —
+  // see FollowerTarget.  `done` is the only thing followers wait on.
   struct ReadEpisode {
     bool sealed = false;  // snapshot taken; late arrivals must not attach
     bool done = false;    // leader finished (read + fan-out)
-    bool ok = false;      // leader's read outcome, published to followers
-    std::vector<std::pair<void*, size_t>> followers;  // {dst, cap}
-    std::condition_variable cv;                       // waited on under mutex_
+    std::vector<std::shared_ptr<FollowerTarget>> followers;
+    std::condition_variable cv;  // waited on under mutex_
   };
 
   struct InflightRead {
@@ -278,6 +369,19 @@ class PeerSsdManager : public OwnedLocationSource {
   // Off => every requester reads the device, and read_dup still reports the
   // headroom that turning it on would recover.
   bool single_flight_ = true;
+
+  // Non-owning; null disables the fan-out push entirely (memcpy-only).  The peer
+  // is an RDMA *initiator* through this handle — the one place in UMBP where
+  // that direction is used.
+  mori::io::IOEngine* io_engine_ = nullptr;
+
+  // Post one BatchWrite for every push-follower in @p fanout and wait each
+  // posted transfer INDIVIDUALLY, setting that follower's own `ok`.  Returns the
+  // number of followers actually pushed.  Never throws to the caller: a failure
+  // to post leaves the affected followers ok=false, which the caller surfaces as
+  // that follower's own read error.
+  size_t PushFanout(const std::vector<std::shared_ptr<FollowerTarget>>& fanout,
+                    const ReadPushSlot& leader_slot, size_t size, uint64_t* pushed_bytes);
 
   // Cap on how long a follower waits for its leader.  A wedged or crashed
   // leader must surface as a read error rather than hanging the RPC; the caller
@@ -306,6 +410,10 @@ class PeerSsdManager : public OwnedLocationSource {
     // (single_flight_ on and the merge window not missed).  read_dup minus this
     // is the residue that still hit the drive.
     std::atomic<uint64_t> read_merged{0};
+    // Of read_merged, the followers served by RDMA WRITE instead of memcpy, and
+    // the subset whose write did not complete.
+    std::atomic<uint64_t> read_pushed{0};
+    std::atomic<uint64_t> read_push_failed{0};
     std::atomic<uint64_t> copy_bytes{0};  // bytes written to SSD (write IO)
     std::atomic<uint64_t> read_bytes{0};  // bytes read from SSD (read IO)
     std::atomic<uint64_t> evict_rounds{0};

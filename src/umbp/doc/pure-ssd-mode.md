@@ -158,6 +158,34 @@ per-drive time over wall time, so ~1.0 means the drives ran one after another
 and ~N means all N were busy at once. The per-drive `sN:keys/bytes/ms` fields
 next to it show whether one drive is dragging the batch.
 
+### Same-key fan-out: single flight and the RDMA push
+
+MLA + TP makes every attention-TP rank ask for a byte-identical key, so one
+logical page is requested `tp_size` times at once. Single flight already
+collapses that to one device read (`[SsdPerf/peer] GET`'s `dup` / `merged` /
+`max_concurrent`), with the leader serving the rest. What that leader *does* for
+the followers is the second-order cost, and the same log line reports both
+mechanisms:
+
+* `fanout_ms` / `fanout_bytes` / `fanout_count` — the classic path: one
+  single-threaded `memcpy` per follower into that follower's private staging
+  slot, which it then pulls over RDMA. On a measured Kimi-K2 L3 reload this was
+  68% of leader time, twice the device read itself.
+* `pushed` / `push_bytes` — the fast path: the leader RDMA-WRITEs straight into
+  the follower's own destination buffer, so no copy, no staging slot, and no
+  pull. `push_total` / `push_failed_total` are the process-wide running counts
+  (also exported as `ssd_read_total{status="pushed"|"push_failed"}`).
+
+On the reader side `[SsdPerf/remote] GET` reports the same split as
+`staged=` (pulled) vs `pushed=`.
+
+**`pushed` flatlining at 0 under a same-key workload means the fast path is
+silently falling back**, not that there is no fan-out. It is opt-in and degrades
+to the classic path whenever it cannot resolve a destination — check the peer's
+log for `push registration ... expired` or `push target out of bounds`, and see
+`UMBP_PUSH_TARGET_TTL_MS` in [runtime-env-vars.md](runtime-env-vars.md). The
+fallback is always correct; it just costs the copy back.
+
 There is also per-node/tier placement accounting behind `UMBP_PUT_DIST_LOG` /
 `UMBP_GET_DIST_LOG`, which answers "are writes actually spreading?" directly.
 Its log lines are **commented out in the source** — one line per batch is too

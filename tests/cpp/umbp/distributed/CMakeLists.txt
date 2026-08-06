@@ -331,6 +331,22 @@ target_link_libraries(
 target_compile_features(test_peer_ssd_read_rpc PRIVATE cxx_std_17)
 add_test(NAME test_peer_ssd_read_rpc COMMAND test_peer_ssd_read_rpc)
 
+# test_peer_ssd_push — RDMA-WRITE fan-out push for single-flight followers.
+# Unlike the other peer-SSD tests this one posts REAL transfers (two in-process
+# IO engines standing in for storage node and TP-rank client), so it needs a
+# working RDMA device and is labelled "integration" alongside the other
+# transport-dependent tests below.
+add_executable(test_peer_ssd_push test_peer_ssd_push.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_peer_ssd_push PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_peer_ssd_push PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
+                             ${_TEST_GRPCPP_LIB} GTest::gtest_main)
+target_compile_features(test_peer_ssd_push PRIVATE cxx_std_17)
+add_test(NAME test_peer_ssd_push COMMAND test_peer_ssd_push)
+set_tests_properties(test_peer_ssd_push PROPERTIES LABELS "integration")
+
 # test_ssd_read_lease_gating — pure reader-side lease gating decision logic
 # (ssd_read_lease.h). Header-only under test (no gRPC / RDMA deps).
 add_executable(test_ssd_read_lease_gating test_ssd_read_lease_gating.cpp)

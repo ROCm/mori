@@ -52,7 +52,29 @@ service UMBPPeer {
 //  Handshake
 // ============================================================
 
-message GetPeerInfoRequest {}
+// One of the caller's RDMA-registered destination buffers, keyed by a STABLE
+// per-process region id (never reused, independent of any vector position — see
+// PoolClient::RegisteredRegion::id).  A vector index would silently re-point at
+// a different buffer after a deregister+register cycle; the peer resolves push
+// destinations by this id precisely so that cannot happen.
+message PushBufferDesc {
+  uint64 region_id = 1;
+  bytes  desc      = 2;  // msgpack-packed mori::io::MemoryDesc
+}
+
+// GetPeerInfo is peer->client information today.  The SSD read-fan-out push
+// path needs the reverse direction as well (the peer becomes an RDMA
+// *initiator* against the client), and a pure TP-rank client typically runs
+// with peer_service_port == 0 — no gRPC listener the peer could call back into.
+// So the client's own engine + destination buffers ride on this request, which
+// the client already initiates on first contact.  proto3 defaults ("" / []) make
+// an old client's empty request mean "no push registration", which is exactly
+// the pre-push behaviour.
+message GetPeerInfoRequest {
+  bytes  engine_desc = 1;  // msgpack-packed mori::io::EngineDesc of the CALLER
+  string node_id     = 2;  // caller's node id; empty disables push registration
+  repeated PushBufferDesc dst_buffers = 3;
+}
 message GetPeerInfoResponse {
   bytes  engine_desc           = 1;
   // SSD capacity is reported via heartbeat tier_capacities, not here.
@@ -114,9 +136,26 @@ message ReleaseSsdLeaseResponse {
 // Batched SSD read.  The peer claims a slot per key (as many as are free — a
 // short response is normal, the reader loops for the rest), issues ONE batch
 // read across the tier's drives, and returns per-key status/offset/lease.
+//
+// The requester_node_id / dst_region_id / dst_offset trio is the RDMA-WRITE
+// push fast path.  When several clients ask for the same key at once (MLA + TP
+// makes every attention rank ask for a byte-identical key), one becomes the
+// single-flight leader and the rest follow.  Rather than the leader memcpy-ing
+// its just-read bytes into each follower's private staging slot — single
+// threaded, and measured at 2x the device read itself — it RDMA-WRITEs straight
+// into the follower's own destination buffer.
+//
+// Every caller sends these fields because no caller knows, before the call,
+// whether it will lead or follow.  They are only consulted for keys that end up
+// following.  dst_region_id == 0 (or an id the peer cannot resolve) means "not
+// push-eligible" and falls back to today's memcpy + staging-slot + pull path.
 message BatchPrepareSsdReadRequest {
   repeated string keys      = 1;
   repeated uint64 max_sizes = 2;  // parallel to keys
+
+  string          requester_node_id = 3;  // matches the node_id sent to GetPeerInfo
+  repeated uint64 dst_region_id     = 4;  // parallel to keys; stable region id, 0 = none
+  repeated uint64 dst_offset        = 5;  // parallel to keys; byte offset within that region
 }
 // Per-key entry, parallel to request.keys.  A key the peer could not claim a
 // slot for reports SSD_READ_NO_SLOT (transient, retryable — never a miss).
@@ -126,6 +165,20 @@ message BatchPrepareSsdReadResponse {
   repeated uint64        size           = 3;
   repeated uint64        lease_id       = 4;
   uint64                 lease_ttl_ms   = 5;  // batch-invariant
+
+  // True for keys whose bytes the peer already RDMA-WROTE into the caller's own
+  // destination buffer.  Those entries carry no staging_offset and no lease_id:
+  // there is nothing to pull and no slot held.  An old peer never sets this, so
+  // a new client reads the proto3 default (false) and pulls exactly as today.
+  repeated bool pushed = 6;
+
+  // Set when requester_node_id was non-empty but the peer could not resolve the
+  // caller's push registration (never registered, TTL-expired after the client
+  // went silent, or a region id registered after the handshake).  The caller
+  // re-runs the GetPeerInfo handshake before its next batch; until then it just
+  // takes the pull path, so this is an optimisation signal, never a correctness
+  // one.
+  bool push_registration_stale = 7;
 }
 
 message BatchReleaseSsdLeasesRequest {
