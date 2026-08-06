@@ -635,9 +635,7 @@ def make_combine(
         # cross-call race) and no block-0 funnel; the monotonic flag needs no
         # reset. Polling is local (peer pushes into our slots), so the extra
         # per-block spins add no remote traffic.
-        phase = fx.Int64(
-            buffer_load(rsrc_xdb_flag, bid, vec_width=1, dtype=T.i64())
-        )
+        phase = fx.Int64(buffer_load(rsrc_xdb_flag, bid, vec_width=1, dtype=T.i64()))
         if grid_thread_id < npes:
             xdb_remote = fx.Int64(
                 window.lsa_ptr(grid_thread_id, off_xdb_mem)
@@ -645,9 +643,7 @@ def make_combine(
             P.store_i64_system(xdb_remote, arith.constant(0), phase)
         # advance this block's private counter for the next call (single writer)
         if tid == 0:
-            buffer_store(
-                phase + arith.constant(1, type=T.i64()), rsrc_xdb_flag, bid
-            )
+            buffer_store(phase + arith.constant(1, type=T.i64()), rsrc_xdb_flag, bid)
         # block 0 fills the unused tail counters [block_num, xdb_flag_slots) in
         # parallel so a later call that picks a larger block_num still reads
         # synced counters. Nobody reads these slots this call => no cross-block

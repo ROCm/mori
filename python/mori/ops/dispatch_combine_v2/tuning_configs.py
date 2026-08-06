@@ -181,11 +181,35 @@ _GFX1250_DEFAULT = dict(
 # Measured GB/s (disp/comb): 256=140/155 1024=428/378 4096=756/741 8192=968/968
 # 16384=1108/1149.
 _GFX1250_SCHED_BF16_T6 = (
-    (256, 128, 16, 64, 4),  # <=256:  disp orig latency-flat ~140; comb small-block 64/4=156
-    (512, 192, 32, 128, 4),  # <=1024: disp orig warp32=433 (192x32==256x32, min block); comb 128/8=409
-    (1024, 192, 32, 128, 8),  # <=1024: disp orig warp32=433 (192x32==256x32, min block); comb 128/8=409
+    (
+        256,
+        128,
+        16,
+        64,
+        4,
+    ),  # <=256:  disp orig latency-flat ~140; comb small-block 64/4=156
+    (
+        512,
+        192,
+        32,
+        128,
+        4,
+    ),  # <=1024: disp orig warp32=433 (192x32==256x32, min block); comb 128/8=409
+    (
+        1024,
+        192,
+        32,
+        128,
+        8,
+    ),  # <=1024: disp orig warp32=433 (192x32==256x32, min block); comb 128/8=409
     (4096, 256, 32, 256, 16),  # <=4096: disp orig 256x32=756; comb 256/16=865
-    (None, 256, 8, 256, 16),  # >4096:  disp load-once 256x8; comb 256x16 (1062@8192, 1225@16384)
+    (
+        None,
+        256,
+        8,
+        256,
+        16,
+    ),  # >4096:  disp load-once 256x8; comb 256x16 (1062@8192, 1225@16384)
 )
 # EP8 (world_size=8) RE-TUNED 2026-07-13 on gfx1250 CROSS-NODE (2 nodes x 4 GPUs
 # over the UALink fabric), bf16, with the vec4 combine-gather kernel, full 2-pass
