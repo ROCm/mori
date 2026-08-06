@@ -212,6 +212,7 @@
 <li class="toctree-l2"><a class="reference internal" href="#python-api-quick-reference">Python API Quick Reference</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#example-basic-read-write">Example: Basic Read/Write</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#profiling-mori-io-with-roctx-markers">Profiling MORI-IO with ROCTX Markers</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a></li>
 </ul>
 </li>
@@ -361,6 +362,7 @@
 <li><p><a class="reference internal" href="#python-api-quick-reference"><span class="xref myst">Python API Quick Reference</span></a></p></li>
 <li><p><a class="reference internal" href="#example-basic-readwrite"><span class="xref myst">Example: Basic Read/Write</span></a></p></li>
 <li><p><a class="reference internal" href="#environment--configuration"><span class="xref myst">Environment &amp; Configuration</span></a></p></li>
+<li><p><a class="reference internal" href="#profiling-mori-io-with-roctx-markers"><span class="xref myst">Profiling MORI-IO with ROCTX Markers</span></a></p></li>
 <li><p><a class="reference internal" href="#source-files"><span class="xref myst">Source Files</span></a></p></li>
 </ul>
 </section>
@@ -653,6 +655,35 @@
 <p>UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
 env vars for distributed master / pool client / SPDK proxy timing. Those are
 out of scope for MORI-IO; see <span class="xref myst"><code class="docutils literal notranslate"><span class="pre">src/umbp/doc/runtime-env-vars.md</span></code></span>.</p>
+</section>
+<section id="profiling-mori-io-with-roctx-markers">
+<h2>Profiling MORI-IO with ROCTX Markers<a class="headerlink" href="#profiling-mori-io-with-roctx-markers" title="Link to this heading"></a></h2>
+<p>MORI-IO provides optional, runtime-gated ROCTX timeline markers for use with
+<code class="docutils literal notranslate"><span class="pre">rocprofv3</span> <span class="pre">--marker-trace</span></code>. The following variables are disabled by default and
+operate independently:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">MORI_ROCTX</span></code> enables same-thread host submission ranges around MORI-IO
+batch-write dispatch and RDMA posting paths. They measure host-side submission
+and post work only, not completion latency.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">MORI_ROCTX_TRANSFER</span></code> enables process-wide ranges that begin immediately
+before posting a signaled RDMA work request and end on the CQ polling thread
+after its CQE is observed. They measure post-to-completion latency.</p></li>
+</ul>
+<p>Marker fields <code class="docutils literal notranslate"><span class="pre">bytes=</span></code> and <code class="docutils literal notranslate"><span class="pre">id=</span></code> identify application payload bytes (not
+physical RoCE wire bytes) and MORI’s logical transfer ID, respectively. Key host
+marker families are <code class="docutils literal notranslate"><span class="pre">mori.io.*</span></code> and <code class="docutils literal notranslate"><span class="pre">mori.rdma.batch_post.*</span></code>; transfer markers
+use <code class="docutils literal notranslate"><span class="pre">mori.rdma.io_transfer[.read]</span></code>.</p>
+<p>Although generic to MORI-IO, these markers can help observe KV-cache
+post-to-completion latency in prefill/decode-disaggregated vLLM or SGLang
+deployments configured to use MORI-IO.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MORI_ROCTX</span><span class="o">=</span><span class="m">1</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">MORI_ROCTX_TRANSFER</span><span class="o">=</span><span class="m">1</span>
+rocprofv3<span class="w"> </span>--marker-trace<span class="w"> </span>--<span class="w"> </span>&lt;your<span class="w"> </span>MORI<span class="w"> </span>command&gt;
+</pre></div>
+</div>
+<p>Either variable can be enabled alone. Enabled values include <code class="docutils literal notranslate"><span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">on</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">true</span></code>; disable a variable by unsetting it or setting it to <code class="docutils literal notranslate"><span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">off</span></code>, or
+<code class="docutils literal notranslate"><span class="pre">false</span></code>.</p>
 </section>
 <section id="source-files">
 <h2>Source Files<a class="headerlink" href="#source-files" title="Link to this heading"></a></h2>
