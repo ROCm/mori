@@ -169,17 +169,16 @@ _GFX1250_DEFAULT = dict(
 # bf16 with the LOAD-ONCE/store-many + 4-way dispatch kernel (host-selected by
 # load_once_threshold=4096: tokens >4096 take load-once, tokens <=4096 the original
 # per-(token,expert) path). Full block x warp sweep (tok 256..16384), disp/comb each.
-# Key lessons: (a) dispatch load-once has a SHARP resonance at block=256 (== the
-# 256-CU grid, 1 block/CU) + warp 8 for large tok — 8192 256x8w=968, peaks ~1108 @16384;
-# the disp column flips 256x32 (original, many warps to fill the grid) -> 256x8
-# (load-once) exactly across the 4096 threshold. (b) below the threshold 256x32w wins
-# (4096=756, 1024=428); <=256 tok is latency-flat (~140, any geom). (c) COMBINE also
+# Key lessons: (a) dispatch wants block=256 + warp 32 at every size >1024 (256x32 vs
+# 256x8: 731 vs 327 @8192, 816 vs 359 @16384); <=256 tok is latency-flat (~140, any
+# geom). The load-once kernel that would flip this to warp 8 above 4096 is not in
+# tree yet. (b) COMBINE also
 # wants block=256 (=CU): the old "<CU, 192 ceiling" guardrail was too conservative —
 # 256 blocks stay co-resident (1/CU) and win big: 8192 256x8w=968 vs 192x16=816 (+19%),
 # 16384 256x8w=1149 vs 192x8=953 (+21%); warp ramps 4->8 (1024 wants 256x4=378). Only
 # tiny tok (<=256) still wants a small block (64x4=155; a 256-block starves it, ->92).
-# Measured GB/s (disp/comb): 256=140/155 1024=428/378 4096=756/741 8192=968/968
-# 16384=1108/1149.
+# Measured GB/s (disp/comb): 256=138/154 1024=402/389 4096=618/858 8192=731/1053
+# 16384=816/1211.
 _GFX1250_SCHED_BF16_T6 = (
     (
         256,
@@ -202,14 +201,7 @@ _GFX1250_SCHED_BF16_T6 = (
         128,
         8,
     ),  # <=1024: disp orig warp32=433 (192x32==256x32, min block); comb 128/8=409
-    (4096, 256, 32, 256, 16),  # <=4096: disp orig 256x32=756; comb 256/16=865
-    (
-        None,
-        256,
-        8,
-        256,
-        16,
-    ),  # >4096:  disp load-once 256x8; comb 256x16 (1062@8192, 1225@16384)
+    (None, 256, 32, 256, 16),  # >1024: disp 256x32; comb 256x16
 )
 # EP8 (world_size=8) RE-TUNED 2026-07-13 on gfx1250 CROSS-NODE (2 nodes x 4 GPUs
 # over the UALink fabric), bf16, with the vec4 combine-gather kernel, full 2-pass
