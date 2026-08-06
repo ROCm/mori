@@ -50,10 +50,14 @@ export UMBP_SSD_VERIFY_CRC=0         # skip checksums, matching the DRAM tier
 export UMBP_SSD_TIER_IO_THREADS=4
 export UMBP_SSD_DURABILITY=strict    # ~free once direct I/O is on
 export UMBP_SSD_READ_LEASE_MS=30000
-export UMBP_SSD_TIMING=1             # per-phase timing; off by default
 export UMBP_DRAM_USE_HUGEPAGES=1
 export UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES=1
 ```
+
+Deliberately **not** in that list: `UMBP_SSD_TIMING=1`. It is a diagnostic, not a
+production setting — it prints several `[SsdPerf/*]` lines per batch, which on a
+busy node is a lot of log. Turn it on when investigating, off again after. See
+[Checking your fan-out](#checking-your-fan-out).
 
 **Env var, on `umbp_master` — not the engine:**
 
@@ -145,7 +149,14 @@ busy at something near their rating.
 
 `UMBP_SSD_TIMING=1` prints per-phase timing (`[SsdPerf/*]`: device read/write,
 CRC, RDMA, staging) — the first thing to reach for when throughput is low.
-`UMBP_LOCAL_COPY_TIMING=1` does the same for node-local traffic.
+`UMBP_LOCAL_COPY_TIMING=1` does the same for node-local traffic. Both are read
+**once at startup and cached**, so changing either needs a restart, and both are
+off unless explicitly set (`0`, `false` and `off` also count as off).
+
+Reading a `[SsdPerf/shard]` line: `overlap` is the one to watch — sum of
+per-drive time over wall time, so ~1.0 means the drives ran one after another
+and ~N means all N were busy at once. The per-drive `sN:keys/bytes/ms` fields
+next to it show whether one drive is dragging the batch.
 
 There is also per-node/tier placement accounting behind `UMBP_PUT_DIST_LOG` /
 `UMBP_GET_DIST_LOG`, which answers "are writes actually spreading?" directly.
