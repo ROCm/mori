@@ -287,6 +287,32 @@ def _profiler_defines() -> list[str]:
     return ["-DENABLE_PROFILER"] if is_profiler_enabled() else []
 
 
+# Prefix rather than an enumeration: this tracks the kernel-side #if (MORI_TDM_OK in
+# src/ops/dispatch_combine/intranode.hpp, which tests the gfx125x arch macros), and a new member of
+# that family should not need a second edit here to be recognised. The launch path reads it to size
+# combine's LDS and to pick PUSH vs PULL, both of which have to agree with what the device compiled.
+_FASTPATH_ARCH_PREFIX = "gfx125"
+_arch_cache: str | None = None
+
+
+def _target_arch() -> str:
+    """The arch the JIT will compile for, or "" when it cannot be determined.
+
+    detect_gpu_arch() rather than get_build_config(): the latter also insists on hipcc and the LLVM
+    tools, and this is called from the LAUNCH path (the LDS budget in ops/dispatch_combine.py) where
+    a missing compiler must not raise. Any failure degrades to "", i.e. no fast path, never a crash.
+    """
+    global _arch_cache
+    if _arch_cache is None:
+        try:
+            from .config import detect_gpu_arch
+
+            _arch_cache = detect_gpu_arch(os.environ.get("ROCM_PATH", "/opt/rocm"))
+        except Exception:
+            _arch_cache = ""
+    return _arch_cache
+
+
 def _ocp_fp_defines(arch: str) -> list[str]:
     """Enable the native gfx950 OCP FP4/FP8 conversion instructions (cvt_scalef32_pk_*) used by
     the fp4_blockwise combine's E2M1 quant/dequant helpers. Without this the helpers fall back to
@@ -405,6 +431,19 @@ def _build_bitcode(
     print(f"[mori-jit] Cached: {output}")
 
 
+def _tunable_defines() -> list[str]:
+    """Every -D whose value depends on the environment or the target arch.
+
+    Empty: the dispatch/combine kernels used to take their transport configuration from here as a
+    set of MORI_COMB_* / MORI_DISP_* flags, and now carry it themselves, keyed on the arch macros the
+    device compiler already defines (MORI_TDM_OK in intranode.hpp). The hook stays because it is also
+    what cache.get_cache_dir keys the build on, so a future value-carrying -D has one place to go and
+    cannot end up in the compile without being in the key -- which is the bug that made a run with
+    the quantise pass deleted load the full build's object and report the full build's time.
+    """
+    return []
+
+
 def _hipcc_genco(
     cfg: BuildConfig,
     source: Path,
@@ -425,6 +464,7 @@ def _hipcc_genco(
         *_ccqe_defines(),
         *_profiler_defines(),
         *_ocp_fp_defines(cfg.arch),
+        *_tunable_defines(),
     ]
 
     for d in include_dirs:

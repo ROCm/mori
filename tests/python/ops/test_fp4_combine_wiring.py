@@ -38,18 +38,18 @@ def test_fp4_blockwise_registered_in_quant_type_map():
     )
 
 
-def test_fp8bwq_to_fp4bwq_kernel_name_mapping():
-    # Mirrors the launch-time selection: kernel_name.replace("_fp8bwq", "_fp4bwq").
-    # Every fp8bwq combine variant must have a matching fp4bwq name (registered in
+def test_fp8_blockwise_to_fp4_blockwise_kernel_name_mapping():
+    # Mirrors the launch-time selection: kernel_name.replace("_fp8_blockwise", "_fp4_blockwise").
+    # Every fp8_blockwise combine variant must have a matching fp4_blockwise name (registered in
     # ep_intranode.hip) so the mapping never yields an unregistered symbol.
     fp8_variants = [
-        "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq",
-        "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8",
-        "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8",
-        "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8_top9",
-        "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8_top9",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block128_vec8",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block256_vec8",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block128_vec8_top9",
+        "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block256_vec8_top9",
     ]
     for name in fp8_variants:
-        mapped = name.replace("_fp8bwq", "_fp4bwq")
-        assert "_fp8bwq" not in mapped
-        assert mapped.count("_fp4bwq") == 1
+        mapped = name.replace("_fp8_blockwise", "_fp4_blockwise")
+        assert "_fp8_blockwise" not in mapped
+        assert mapped.count("_fp4_blockwise") == 1
