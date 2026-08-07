@@ -448,11 +448,10 @@ _PTR_SIZE = 8
 # its tiles against that number, and this function reserves for whichever one it will pick.
 _COMB_LDS_BUDGET = 327680
 
-# The QUAD gather's tile-buffer count and tile subdivision, i.e. MORI_COMB_QUAD and MORI_COMB_QSPLIT
-# in that same header. Repeated here rather than derived because the reservation below has to
-# describe the layout the DEVICE compiled, and these two decide its size to the byte.
+# The QUAD gather's tile-buffer count, i.e. MORI_COMB_QUAD in that same header. Repeated here rather
+# than derived because the reservation below has to describe the layout the DEVICE compiled, and
+# this decides its size to the byte.
 _QUAD_DEPTH = 2
-_QUAD_SPLIT = 1
 
 
 def _is_gfx125x():
@@ -1006,9 +1005,8 @@ class EpDispatchCombineOp:
                 tiles_per_warp = world if (world <= 4 and world < topk) else topk
                 # QUAD (MORI_COMB_QUAD in intranode_1250x.hpp) turns the decomposition 90 degrees:
                 # one warp owns one SOURCE and reads that source's token, so a warp needs one tile
-                # instead of one per source. It gets _QUAD_DEPTH of them, each hidden/_QUAD_SPLIT
-                # elements, and the two trade off exactly: D*(hidden/S)*elem*wpb bytes buy D-1
-                # reads in flight at (hidden/S)*elem bytes each.
+                # instead of one per source. It gets _QUAD_DEPTH of them, each a whole token:
+                # D*hidden*elem*wpb bytes buy D-1 reads in flight at hidden*elem bytes each.
                 #
                 # QUAD serves blockwise too (the kernel gate takes _cPullBwq), and `elem` above is
                 # already 1 there, so the tiles reserved here are the fp8 ones the kernel lays out.
@@ -1020,7 +1018,7 @@ class EpDispatchCombineOp:
                 if _qpull_bwq and _qd < 4:
                     _qd = 0
                 if _qd >= 2:
-                    tile_elems = hidden // _QUAD_SPLIT
+                    tile_elems = hidden
                     tiles_per_warp = _qd
                     tile_bytes = warp_per_block * tiles_per_warp * tile_elems * elem
                     # ... plus one int per (warp, buffer) for the source-count ring that follows the
