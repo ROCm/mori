@@ -281,7 +281,6 @@ __device__ __forceinline__ void WarpScaleCopy(uint8_t* dst, const uint8_t* src, 
 inline __device__ int CombSlotOffset(const EpDispatchCombineConfig& config, int pe, int slotId) {
   return SendBufSlotOffset(config, pe, slotId);
 }
-#define MORI_COMB_PUSH_TARGET_DECL(dpe, mpe) const index_t _pushPe = (dpe), _pushRow = (mpe)
 // How the QUAD fold's finished output leaves LDS. 0 stores straight to global from the fold; 1 folds
 // into an LDS slice per warp and lets the engine ship it; 2 lays the GROUP's slices out contiguously
 // so the whole token is one descriptor shipped by _qLane 0.
@@ -820,7 +819,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     const int perTokM = tkM * 4 + tkM * 4 + sBytesM + 4;
     // 512B of slack covers rounding each of the 4 field regions up to a 128B LDS boundary.
     const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 512) / perTokM) : 0;
-#define _MHTS(i) do {} while (0)
     if (tokCapM > 0) {
       uint8_t* _m4 = reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * mtileBytesM;
       // Only npes runs exist per block but there are warpNum warps, so cut each peer's run into
@@ -898,17 +896,13 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   } while (0)
           _MHT_REM(reinterpret_cast<int*>(dI), reinterpret_cast<int*>(sI), spI.head, spI.body,
                    nIdxB);
-          _MHTS(0);
           if (dW)
             _MHT_REM(reinterpret_cast<int*>(dW), reinterpret_cast<int*>(sW), spW.head, spW.body,
                      nWtB);
-          _MHTS(1);
           if (dS)
             _MHT_REM(reinterpret_cast<int*>(dS), reinterpret_cast<int*>(sS), spS.head, spS.body,
                      nScIB);
-          _MHTS(2);
           _MHT_REM(dR, sR, spR.head, spR.body, cc);
-          _MHTS(3);
 #undef _MHT_REM
           if (spI.body || spW.body || spS.body || spR.body) {
             __builtin_amdgcn_s_wait_tensorcnt(0);
@@ -1205,9 +1199,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       index_t destTokId = localSrcMap[tokenIdx];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
       index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
-      MORI_COMB_PUSH_TARGET_DECL(destPe, myPe);
-      uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(_pushPe) +
-                                CombSlotOffset(config, _pushRow, destLocalTokId) * combXferBytes;
+      uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
+                                CombSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
       if constexpr (UseFp8BlockwiseQuant) {
         core::WarpQuantizeToCombineBlockwise<UseFp4Combine, core::CombineInternalFp8>(
             reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
@@ -1230,10 +1223,9 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
           index_t destTokId = localSrcMap[tokenIdx];
           index_t destPe = PeFromFlatTokenIndex(config, destTokId);
           index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
-          MORI_COMB_PUSH_TARGET_DECL(destPe, myPe);
           uint8_t* destStagingPtr =
-              args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(_pushPe) +
-              CombSlotOffset(config, _pushRow, destLocalTokId) * combXferBytes;
+              args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
+              CombSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
           core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes + scaleBytes),
                          args.weightsBuf + tokenIdx * config.numExpertPerToken,
                          config.numExpertPerToken);
@@ -1261,9 +1253,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       index_t destTokId = localSrcMap[tokenIdx];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
       index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
-      MORI_COMB_PUSH_TARGET_DECL(destPe, myPe);
-      uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(_pushPe) +
-                                CombSlotOffset(config, _pushRow, destLocalTokId) * combXferBytes;
+      uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
+                                CombSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
       if constexpr (UseFp8BlockwiseQuant) {
         core::WarpQuantizeToCombineBlockwise<UseFp4Combine, core::CombineInternalFp8>(
             reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
@@ -1468,7 +1459,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   const bool _cGatherOk = _cPullOk && !UseP2PRead && (_cPullSrcMax == config.worldSize) &&
                           ((combXferBytes % sizeof(TokT)) == 0);
 #endif
-#define _CSTAMP(acc) do { } while (0)
   const int _cRedEnd = (int)(args.curRankNumToken * mwIter.warpsPerItem);
 #if defined(MORI_TDM_OK)
   // ---------------------------------------------------------------------------------------------
@@ -1973,7 +1963,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                hiddenDimOffset;
     }
 #endif
-    _CSTAMP(_cSetup);
 
 
     // _cPullBwq steers blockwise AWAY from these helpers and into the TDM tile path in the else
@@ -2145,9 +2134,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                                  _pg1);
             }
           }
-          _CSTAMP(_cIssue);
           __builtin_amdgcn_s_wait_tensorcnt(0);
-          _CSTAMP(_cWait);
           const int _nRed = _rowCnt;
           // Row _j is real when the mask says so under the gather, and when its compacted pointer is
           // non-null otherwise. A gathered row that is not in the mask holds whatever the previous
@@ -2336,7 +2323,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             outPtr[_off + _e] = T(_acc);
           }
 #undef _CROW_DEAD
-          _CSTAMP(_cRed);
         }
           _pullDone = true;
         }
@@ -2360,7 +2346,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       // Charged to cRed so a gate-off run stays comparable, but on this path the peer reads ARE the
       // transport, so cRed here is transport+fold together and cWait stays empty. That is the whole
       // reason the TDM path can be decomposed at all and this one cannot.
-      _CSTAMP(_cRed);
     }
 
     if constexpr (UseWeights) {
@@ -2373,14 +2358,12 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
     }
   }
-#undef _CSTAMP
 }
 
-#define _MORI_COMB_LB_ATTR
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
           int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false>
-__global__ void _MORI_COMB_LB_ATTR EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
+__global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast, UseFp8BlockwiseQuant,
                                 UseWeights, Vec8Top8BlockElems, Vec8AccumNum, UseFp4Combine>(args);
 }
