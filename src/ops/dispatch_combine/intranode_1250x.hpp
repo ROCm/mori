@@ -81,24 +81,10 @@ __device__ __forceinline__ uint32_t MoriPackTo2(float a, float b) {
 // assemble), so the backend open-codes it as a 16-bit shift for the low half and a mask for the
 // high one, then needs v_mov_b16 shuffles to land the results in the register PAIRS v_pk_add_f32
 // wants.
-template <bool HI>
-__device__ __forceinline__ float MoriFmaMixBf16(uint32_t src, float acc) {
-  float r;
-  if constexpr (HI) {
-    asm("v_fma_mix_f32_bf16 %0, %1, 1.0, %2 op_sel:[1,0,0] op_sel_hi:[1,0,0]"
-        : "=v"(r)
-        : "v"(src), "v"(acc));
-  } else {
-    asm("v_fma_mix_f32_bf16 %0, %1, 1.0, %2 op_sel:[0,0,0] op_sel_hi:[1,0,0]"
-        : "=v"(r)
-        : "v"(src), "v"(acc));
-  }
-  return r;
-}
-// The same instruction with the 1.0 replaced by a register. Not an extra multiply: src1 was already
-// an operand of the fma and 1.0 was merely the inline constant sitting in it, so the encoding, the
-// instruction count and the single rounding are all unchanged. op_sel_hi[1] stays 0, which is what
-// says "src1 is a whole f32 dword" rather than a half of one -- only src0 is the bf16 operand.
+// src1 carries the per-row multiplier rather than an inline 1.0, which costs nothing: it was
+// already an operand of the fma either way, so the encoding, the instruction count and the single
+// rounding are all the same as the constant form. op_sel_hi[1] stays 0, which is what says "src1 is
+// a whole f32 dword" rather than a half of one -- only src0 is the bf16 operand.
 template <bool HI>
 __device__ __forceinline__ float MoriFmaMixBf16M(uint32_t src, float mul, float acc) {
   float r;
@@ -253,48 +239,6 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape2D(int dim0, int dim1) {
   g1.tileDim1(dim1);
   return g1;
 }
-// gfx1250 TDM tensor_load_to_lds fast-dim row must be >= 128B (evidence: _ct_real.sh TW=112 bf16
-// row=224B -> ~500 GB/s vs TW=128 row=256B -> ~1500; for dataSize=2 meta ints that is
-// tensorDim0>=32).
-__device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShapeMeta(int nElems, int preferDim0) {
-  constexpr int kMinFastDim = 32;  // 32 x 4B = 128B minimum LOAD row
-  int bestD0 = 0, bestD1 = 0;
-  auto tryPair = [&](int d0, int d1) {
-    if (d0 < 2 || d1 < 2 || d0 * d1 != nElems || d0 < kMinFastDim) return;
-    if (!bestD0) { bestD0 = d0; bestD1 = d1; return; }
-    int curGap = (bestD0 > bestD1) ? (bestD0 - bestD1) : (bestD1 - bestD0);
-    int newGap = (d0 > d1) ? (d0 - d1) : (d1 - d0);
-    if (newGap < curGap || (newGap == curGap && d0 > bestD0)) {
-      bestD0 = d0;
-      bestD1 = d1;
-    }
-  };
-  if (preferDim0 >= kMinFastDim) tryPair(preferDim0, nElems / preferDim0);
-  tryPair(kMinFastDim, nElems / kMinFastDim);
-  // Search outward from sqrt(nElems) instead of the O(nElems) linear scan this replaced: for d0 <=
-  // sqrt(nElems), gap=|d0-nElems/d0| increases monotonically as d0 decreases, and for d0 >
-  // sqrt(nElems) it increases monotonically as d0 increases -- so the first divisor found scanning
-  // outward in each direction is that direction's best, and tryPair's existing gap comparison
-  // (unchanged above) picks the same global winner an exhaustive scan would.
-  int sqLo = 1, sqHi = nElems;
-  while (sqLo < sqHi) {
-    int mid = sqLo + (sqHi - sqLo + 1) / 2;
-    if ((long long)mid * mid <= nElems) sqLo = mid; else sqHi = mid - 1;
-  }
-  int lo = sqLo;
-  while (lo >= kMinFastDim) {
-    if (nElems % lo == 0) { tryPair(lo, nElems / lo); break; }
-    --lo;
-  }
-  int hi = sqLo + 1;
-  if (hi < kMinFastDim) hi = kMinFastDim;
-  while (hi <= nElems / 2) {
-    if (nElems % hi == 0) { tryPair(hi, nElems / hi); break; }
-    ++hi;
-  }
-  if (!bestD0) return TdmShape2D(2, 2);  // unreachable if TdmMetaTileOk(nElems)
-  return TdmShape2D(bestD0, bestD1);
-}
 // 128B-ALIGNED split for a contiguous run of 4B elements, for the meta path where the run start is
 // a remote-atomic-derived slot index and therefore has an arbitrary 128B phase.
 struct TdmSplit128 {
@@ -311,18 +255,11 @@ __device__ __forceinline__ TdmSplit128 TdmAlignSplit128(size_t phase, int nElems
   return TdmSplit128{head, rows * P, rows};
 }
 
-__device__ __forceinline__ bool TdmMetaTileOk(int nElems) {
-  constexpr int kMinFastDim = 32;
-  if (nElems < kMinFastDim * 2) return false;  // need 32x2=64 elems minimum
-  if (nElems % kMinFastDim == 0 && nElems / kMinFastDim >= 2) return true;
-  for (int d0 = nElems / 2; d0 >= kMinFastDim; --d0)
-    if (nElems % d0 == 0 && nElems / d0 >= 2) return true;
-  return false;
-}
-
 // Legal whole-run tile geometry by closed form: try tensorDim1 = 8, 4, 2 (largest first, so the row
 // stays as narrow as the >=128B floor allows) and take the first exact divisor whose row reaches
-// the 32-element floor.
+// the 32-element floor. The floor is measured, not guessed: _ct_real.sh gets ~500 GB/s at TW=112
+// bf16 (row 224B) against ~1500 at TW=128 (row 256B), and for the dataSize=2 meta ints a 128B row
+// is tensorDim0 >= 32.
 __device__ __forceinline__ int TdmCheapDim1(int nElems) {
   if ((nElems & 7) == 0 && (nElems >> 3) >= 32) return 8;
   if ((nElems & 3) == 0 && (nElems >> 2) >= 32) return 4;
