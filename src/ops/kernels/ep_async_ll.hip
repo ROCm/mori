@@ -20,6 +20,6 @@ MORI_FP8_ANY(WRAP_BOOL(EpCombineLowLatencyAsyncRecvCopy, bf16_fp8cast, hip_bfloa
 MORI_FP8_ANY(WRAP_BOOL(EpCombineLowLatencyAsyncRecvTransfer, bf16_fp8cast, hip_bfloat16, true))
 
 // Blockwise-FP8 combine variants (bf16 in/out, fp8 on the wire): UseFp8DirectCast=false, UseFp8BlockwiseQuant=true.
-MORI_FP8_ANY(WRAP_BOOL2(EpCombineLowLatencyAsyncSendCopy, bf16_fp8bwq, hip_bfloat16, false, true))
-MORI_FP8_ANY(WRAP_BOOL2(EpCombineLowLatencyAsyncSendTransfer, bf16_fp8bwq, hip_bfloat16, false, true))
-MORI_FP8_ANY(WRAP_BOOL2(EpCombineLowLatencyAsyncRecvCopy, bf16_fp8bwq, hip_bfloat16, false, true))
+MORI_FP8_ANY(WRAP_BOOL2(EpCombineLowLatencyAsyncSendCopy, bf16_fp8_blockwise, hip_bfloat16, false, true))
+MORI_FP8_ANY(WRAP_BOOL2(EpCombineLowLatencyAsyncSendTransfer, bf16_fp8_blockwise, hip_bfloat16, false, true))
+MORI_FP8_ANY(WRAP_BOOL2(EpCombineLowLatencyAsyncRecvCopy, bf16_fp8_blockwise, hip_bfloat16, false, true))
