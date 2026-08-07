@@ -17,7 +17,7 @@
 #include "src/ops/dispatch_combine/common.hpp"
 #include "src/ops/dispatch_combine/convert.hpp"
 #include "src/ops/dispatch_combine/internode.hpp"
-#include "src/ops/dispatch_combine/intranode.hpp"
+#include "src/ops/dispatch_combine/intranode_entry.hpp"
 #include "src/ops/dispatch_combine/intranode_ll.hpp"
 
 #define MORI_JIT_GENCO
@@ -126,3 +126,55 @@ using namespace mori::moe;
   MORI_FP8_OCP(WRAP_BOOL3(kernel, fp8_ocp##bool_suffix, __hip_fp8_e4m3, B1, B2, B3))        \
   MORI_FP4(WRAP_BOOL3(kernel, fp4##bool_suffix, mori::mori_fp4x2_e2m1, B1, B2, B3))         \
   WRAP_BOOL3(kernel, f32##bool_suffix, float, B1, B2, B3)
+
+// ---------------------------------------------------------------------------
+// Wrapper macros, _ENTRY flavour
+// ---------------------------------------------------------------------------
+// Identical to the above except that the launch symbol forwards to kernel##_entry instead of
+// kernel##_body. Use these for a kernel that has more than one implementation to pick from, so
+// that *_entry can make the choice and the implementations themselves stay unaware of each other
+// (see intranode_entry.hpp, the only user today). Everything else keeps calling *_body directly.
+
+#define WRAP_BOOL_ENTRY(kernel, suffix, T, B)                                   \
+  extern "C" __global__ void kernel##_##suffix(EpDispatchCombineArgs<T> args) { \
+    kernel##_entry<T, B>(args);                                                 \
+  }
+
+#define WRAP_BOOL3_ENTRY(kernel, suffix, T, B1, B2, B3)                         \
+  extern "C" __global__ void kernel##_##suffix(EpDispatchCombineArgs<T> args) { \
+    kernel##_entry<T, B1, B2, B3>(args);                                        \
+  }
+
+#define WRAP_BOOL4_ENTRY(kernel, suffix, T, B1, B2, B3, B4)                     \
+  extern "C" __global__ void kernel##_##suffix(EpDispatchCombineArgs<T> args) { \
+    kernel##_entry<T, B1, B2, B3, B4>(args);                                    \
+  }
+
+#define WRAP_BOOL6_ENTRY(kernel, suffix, T, B1, B2, B3, B4, B5, B6)             \
+  extern "C" __global__ void kernel##_##suffix(EpDispatchCombineArgs<T> args) { \
+    kernel##_entry<T, B1, B2, B3, B4, B5, B6>(args);                            \
+  }
+
+#define WRAP_BOOL7_ENTRY(kernel, suffix, T, B1, B2, B3, B4, B5, B6, B7)         \
+  extern "C" __global__ void kernel##_##suffix(EpDispatchCombineArgs<T> args) { \
+    kernel##_entry<T, B1, B2, B3, B4, B5, B6, B7>(args);                        \
+  }
+
+#define WRAP_BOOL8_ENTRY(kernel, suffix, T, B1, B2, B3, B4, B5, B6, B7, B8)     \
+  extern "C" __global__ void kernel##_##suffix(EpDispatchCombineArgs<T> args) { \
+    kernel##_entry<T, B1, B2, B3, B4, B5, B6, B7, B8>(args);                    \
+  }
+
+#define WRAP_ALL_TYPES_BOOL_ENTRY(kernel, bool_suffix, B)                               \
+  WRAP_BOOL_ENTRY(kernel, bf16##bool_suffix, hip_bfloat16, B)                           \
+  MORI_FP8_FNUZ(WRAP_BOOL_ENTRY(kernel, fp8_fnuz##bool_suffix, __hip_fp8_e4m3_fnuz, B)) \
+  MORI_FP8_OCP(WRAP_BOOL_ENTRY(kernel, fp8_ocp##bool_suffix, __hip_fp8_e4m3, B))        \
+  MORI_FP4(WRAP_BOOL_ENTRY(kernel, fp4##bool_suffix, mori::mori_fp4x2_e2m1, B))         \
+  WRAP_BOOL_ENTRY(kernel, f32##bool_suffix, float, B)
+
+#define WRAP_ALL_TYPES_BOOL3_ENTRY(kernel, bool_suffix, B1, B2, B3)                               \
+  WRAP_BOOL3_ENTRY(kernel, bf16##bool_suffix, hip_bfloat16, B1, B2, B3)                           \
+  MORI_FP8_FNUZ(WRAP_BOOL3_ENTRY(kernel, fp8_fnuz##bool_suffix, __hip_fp8_e4m3_fnuz, B1, B2, B3)) \
+  MORI_FP8_OCP(WRAP_BOOL3_ENTRY(kernel, fp8_ocp##bool_suffix, __hip_fp8_e4m3, B1, B2, B3))        \
+  MORI_FP4(WRAP_BOOL3_ENTRY(kernel, fp4##bool_suffix, mori::mori_fp4x2_e2m1, B1, B2, B3))         \
+  WRAP_BOOL3_ENTRY(kernel, f32##bool_suffix, float, B1, B2, B3)

@@ -287,10 +287,11 @@ def _profiler_defines() -> list[str]:
     return ["-DENABLE_PROFILER"] if is_profiler_enabled() else []
 
 
-# Prefix rather than an enumeration: this tracks the kernel-side #if (MORI_TDM_OK in
-# src/ops/dispatch_combine/intranode.hpp, which tests the gfx125x arch macros), and a new member of
-# that family should not need a second edit here to be recognised. The launch path reads it to size
-# combine's LDS and to pick PUSH vs PULL, both of which have to agree with what the device compiled.
+# Prefix rather than an enumeration: this tracks the kernel-side #if in
+# src/ops/dispatch_combine/intranode_entry.hpp, which tests the gfx125x arch macros to pick a body,
+# and a new member of that family should not need a second edit here to be recognised. The launch
+# path reads it to size combine's LDS and to pick PUSH vs PULL, both of which have to agree with
+# what the device compiled.
 _FASTPATH_ARCH_PREFIX = "gfx125"
 _arch_cache: str | None = None
 
@@ -435,9 +436,9 @@ def _tunable_defines() -> list[str]:
     """Every -D whose value depends on the environment or the target arch.
 
     Empty: the dispatch/combine kernels used to take their transport configuration from here as a
-    set of MORI_COMB_* / MORI_DISP_* flags, and now carry it themselves, keyed on the arch macros the
-    device compiler already defines (MORI_TDM_OK in intranode.hpp). The hook stays because it is also
-    what cache.get_cache_dir keys the build on, so a future value-carrying -D has one place to go and
+    set of MORI_COMB_* / MORI_DISP_* flags, and now carry it themselves, keyed on the arch macros
+    the device compiler already defines. The hook stays because it is also what
+    cache.get_cache_dir keys the build on, so a future value-carrying -D has one place to go and
     cannot end up in the compile without being in the key -- which is the bug that made a run with
     the quantise pass deleted load the full build's object and report the full build's time.
     """

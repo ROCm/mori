@@ -444,8 +444,8 @@ except AttributeError:
 _PTR_SIZE = 8
 
 # Dynamic LDS a block may reserve on gfx125x, measured. Must equal MORI_COMB_LDS_BUDGET in
-# src/ops/dispatch_combine/intranode.hpp: the kernel picks its combine transport by testing its
-# tiles against that number, and this function reserves for whichever one it will pick.
+# src/ops/dispatch_combine/intranode_1250x.hpp: the kernel picks its combine transport by testing
+# its tiles against that number, and this function reserves for whichever one it will pick.
 _COMB_LDS_BUDGET = 327680
 
 # The QUAD gather's tile-buffer count and tile subdivision, i.e. MORI_COMB_QUAD and MORI_COMB_QSPLIT
@@ -597,7 +597,7 @@ class EpDispatchCombineOp:
                     f"instead on this device."
                 )
 
-        # Dispatch metadata staging capacity. The scratch in intranode.hpp is a fixed pool
+        # Dispatch metadata staging capacity. The scratch in intranode_1250x.hpp is a fixed pool
         # (CUSPLIT_POOL_SLOTS) split by world_size at runtime, and destTokId spans the destination
         # peer's WHOLE recv space, so the slice has to cover MaxNumTokensToRecv().
         #
@@ -628,7 +628,7 @@ class EpDispatchCombineOp:
                     f"world_size={config.world_size}, but this config needs {_slots_needed} "
                     f"(max_num_inp_token_per_rank={config.max_num_inp_token_per_rank}, "
                     f"max_total_recv_tokens={config.max_total_recv_tokens}). Raise "
-                    f"CUSPLIT_POOL_SLOTS in src/ops/dispatch_combine/intranode.hpp and this "
+                    f"CUSPLIT_POOL_SLOTS in src/ops/dispatch_combine/intranode_1250x.hpp and this "
                     f"check, or lower max_num_inp_token_per_rank."
                 )
 
@@ -762,10 +762,11 @@ class EpDispatchCombineOp:
     def _intranode_dispatch_default_launch(self):
         """Per-body default (block_num, warp_per_block) for the IntraNode dispatch kernel.
 
-        Split on the ARCH, matching the #if that picks the body in intranode.hpp. gfx125x runs
-        EpDispatchIntraNodeKernel_body and takes 64x8; every other arch runs the WarpCopy body,
-        which interleaves scattered per-token metadata with the payload and needs the wide grid to
-        hide that, so it keeps its historical 256x16.
+        Split on the ARCH, matching the #if that picks the body in intranode_entry.hpp. gfx125x
+        runs EpDispatchIntraNodeKernel_1250x_body and takes 64x8; every other arch runs the
+        portable EpDispatchIntraNodeKernel_body in intranode.hpp, which interleaves scattered
+        per-token metadata with the payload and needs the wide grid to hide that, so it keeps its
+        historical 256x16.
 
         The gfx125x body batches metadata into one TDM copy per (block, peer) run. That argues for
         a narrow grid where each block owns a large contiguous run, and 64 blocks came from that
@@ -907,16 +908,17 @@ class EpDispatchCombineOp:
         # shared. Here warp_per_block is the DEVICE warp count per block (block = warpSize*wpb).
         # Everywhere else the WarpCopy body runs, which stages nothing and needs only `base`.
         #
-        # This tests the ARCH, matching the #if that selects the body in intranode.hpp. It used to
-        # test MORI_DISP_TDM, which meant an unset env reserved `base` for a kernel that stages
-        # 14KB tiles per warp into that reservation.
+        # This tests the ARCH, matching the #if that selects the body in intranode_entry.hpp. It
+        # used to test MORI_DISP_TDM, which meant an unset env reserved `base` for a kernel that
+        # stages 14KB tiles per warp into that reservation.
         if _is_gfx125x():
             # One FULL token tile per warp = hidden*elemSize bytes (14KB at hidden 7168 bf16), so
             # wpb<=16 stays inside the 320KB gfx1250 LDS budget. A second tile per warp for payload
             # double-buffering is not worth its 229KB (measured 1280.8 vs 1280.7 GB/s, see the drain
-            # comment in intranode.hpp's payload loop).
-            # The default dispatch body reuses this same per-warp tile for its batched metadata
-            # send (see the tokCapM computation in intranode.hpp), so no extra budget is needed.
+            # comment in intranode_1250x.hpp's payload loop).
+            # The gfx125x dispatch body reuses this same per-warp tile for its batched metadata
+            # send (see the tokCapM computation in intranode_1250x.hpp), so no extra budget is
+            # needed.
             tile = (
                 warp_per_block
                 * int(self.config.hidden_dim)
@@ -926,9 +928,9 @@ class EpDispatchCombineOp:
         return base
 
     def _intranode_dispatch_kernel(self, sfx, stdmoe=False):
-        """Intra-node dispatch. One launch symbol, one body: EpDispatchIntraNodeKernel_body in
-        intranode.hpp."""
-        name = f"EpDispatchIntraNodeBatchKernel_{sfx}"
+        """Intra-node dispatch. One launch symbol; which body it reaches is decided on the device
+        side by EpDispatchIntraNodeKernel_entry in intranode_entry.hpp."""
+        name = f"EpDispatchIntraNodeKernel_{sfx}"
         if stdmoe:
             name += "_stdmoe"
         return name
@@ -947,8 +949,8 @@ class EpDispatchCombineOp:
         )
         # The combine token goes through TDM on gfx125x, which needs per-warp LDS tiles holding one
         # chunk of a token. The kernel places them right AFTER the pointer arrays above, so this is a
-        # sum and not a max, and chunk_elems must match _cTileElems/_cPullTileElems in intranode.hpp:
-        # chunk rounded up to a whole 128B TDM row.
+        # sum and not a max, and chunk_elems must match _cTileElems/_cPullTileElems in
+        # intranode_1250x.hpp: chunk rounded up to a whole 128B TDM row.
         #
         # The two transports need different tile counts, and which one is compiled follows the same
         # flag that picks the kernel: use_external_inp_buf=True -> _nop2p -> PUSH (one tile per warp,
@@ -959,9 +961,10 @@ class EpDispatchCombineOp:
         # !UseFp8BlockwiseQuant -- allocating a tile there would only shrink occupancy, and could
         # trip the budget check below on a configuration that never runs TDM at all.
         #
-        # MORI_COMB_TDM in intranode.hpp, the chunk count. Reserving for the tiles requires knowing
-        # whether the device compiled them at all, which is the MORI_TDM_OK arch test and nothing
-        # else -- see _is_gfx125x for why all three host-side answers come from one place.
+        # MORI_COMB_TDM in intranode_1250x.hpp, the chunk count. Reserving for the tiles requires
+        # knowing whether the device compiled them at all, which is the arch test in
+        # intranode_entry.hpp and nothing else -- see _is_gfx125x for why all three host-side
+        # answers come from one place.
         chunks = 2 if _is_gfx125x() else 0
         # ...that exclusion held only while blockwise was PUSH-only. Under MORI_COMB_QPULL the
         # kernel runs _p2p and _cPullBwq lets blockwise onto the tile path, so the tiles have to be
@@ -996,23 +999,23 @@ class EpDispatchCombineOp:
                 # total, so whole tokens would not fit. The source count is min(topk, world_size), not
                 # topk: dispatch dedups a token's experts by destination PE and combine compacts the
                 # survivors, so one survives per distinct PE. Must match _cPullSrcMax in
-                # intranode.hpp, including the world_size <= 4 condition -- that is where the
+                # intranode_1250x.hpp, including the world_size <= 4 condition -- that is where the
                 # compaction that makes the tile indices dense runs.
                 tile_elems = -(-hidden // chunks)
                 tile_elems = -(-tile_elems // row_elems) * row_elems
                 tiles_per_warp = world if (world <= 4 and world < topk) else topk
-                # QUAD (MORI_COMB_QUAD in intranode.hpp) turns the decomposition 90 degrees: one warp
-                # owns one SOURCE and reads that source's token, so a warp needs one tile instead of
-                # one per source. It gets _QUAD_DEPTH of them, each hidden/_QUAD_SPLIT elements, and
-                # the two trade off exactly: D*(hidden/S)*elem*wpb bytes buy D-1 reads in flight at
-                # (hidden/S)*elem bytes each.
+                # QUAD (MORI_COMB_QUAD in intranode_1250x.hpp) turns the decomposition 90 degrees:
+                # one warp owns one SOURCE and reads that source's token, so a warp needs one tile
+                # instead of one per source. It gets _QUAD_DEPTH of them, each hidden/_QUAD_SPLIT
+                # elements, and the two trade off exactly: D*(hidden/S)*elem*wpb bytes buy D-1
+                # reads in flight at (hidden/S)*elem bytes each.
                 #
                 # QUAD serves blockwise too (the kernel gate takes _cPullBwq), and `elem` above is
                 # already 1 there, so the tiles reserved here are the fp8 ones the kernel lays out.
                 # Getting this wrong in either direction is a silent layout mismatch, not a slowdown:
                 # host and kernel must agree on the tile size to the byte -- which is why the depth-4
-                # floor below is repeated from intranode.hpp rather than assumed. See there for why
-                # blockwise refuses depth 2 (wrong results, cause not yet found).
+                # floor below is repeated from intranode_1250x.hpp rather than assumed. See there
+                # for why blockwise refuses depth 2 (wrong results, cause not yet found).
                 _qd = _QUAD_DEPTH if chunks else 0
                 if _qpull_bwq and _qd < 4:
                     _qd = 0
@@ -1033,8 +1036,9 @@ class EpDispatchCombineOp:
                     tile_bytes = (tile_bytes + 127) & ~127
                     tile_bytes += warp_per_block * _qd * (tile_elems // world) * elem
                     total = ((base + 127) & ~127) + tile_bytes
-                    # Mirrors the _qLdsNeed guard in intranode.hpp, which declines QUAD at a width
-                    # whose tiles do not fit and lets the token fall through to the chunked gather.
+                    # Mirrors the _qLdsNeed guard in intranode_1250x.hpp, which declines QUAD at a
+                    # width whose tiles do not fit and lets the token fall through to the chunked
+                    # gather.
                     # Reserving QUAD's footprint here while the kernel runs the chunked path (or the
                     # reverse) is a silent layout mismatch, so the two predicates are the same one.
                     if total <= _COMB_LDS_BUDGET:
@@ -1062,9 +1066,9 @@ class EpDispatchCombineOp:
                     f"tile_elems={tile_elems}) but the budget is {_COMB_LDS_BUDGET} B. "
                     f"Lower warp_per_block."
                 )
-            # Else: arch default at a width the tiles do not fit. _cPullOk in intranode.hpp fails
-            # the same test and the gather falls back to WarpAccumLF, which needs no tiles, so the
-            # reservation stays at the pointer arrays.
+            # Else: arch default at a width the tiles do not fit. _cPullOk in intranode_1250x.hpp
+            # fails the same test and the gather falls back to WarpAccumLF, which needs no tiles,
+            # so the reservation stays at the pointer arrays.
         return base
 
     _launch_traced = set()
