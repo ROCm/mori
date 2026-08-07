@@ -96,6 +96,9 @@ COMB_BLOCK = int(os.environ.get("COMB_BLOCK", os.environ.get("BLOCK_NUM", 80)))
 WARP_NUM = int(os.environ.get("WARP_NUM", 16))
 # combine's K-deep per-lane MLP saturates with few warps.
 COMB_WARP = int(os.environ.get("COMB_WARP", WARP_NUM))
+# Non-AUTO dispatch algorithm: 1 = load-once/store-many + 4-way; 0 = original
+# per-(token,expert) 2-way. AUTO picks per token count via cfg.load_once_threshold.
+LOAD_ONCE = int(os.environ.get("LOAD_ONCE", 1))
 # AUTO=1: build the plain config (no pinned geometry) so __post_init__ auto-pulls
 # the tuned schedule, and pick the disp/comb variant per token count via op._pick.
 AUTO = int(os.environ.get("AUTO", 0))
@@ -255,7 +258,7 @@ def main():
                     flush=True,
                 )
         else:
-            disp_kern = op._dispatch_variants[(DISP_BLOCK, WARP_NUM)]
+            disp_kern = op._dispatch_variants[(DISP_BLOCK, WARP_NUM, bool(LOAD_ONCE))]
             comb_kern = op._combine_variants[(COMB_BLOCK, COMB_WARP)]
 
         # Launch on the CURRENT stream each call: under torch.cuda.graph capture

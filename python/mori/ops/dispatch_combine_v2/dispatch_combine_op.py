@@ -32,12 +32,14 @@ import flydsl.expr as fx
 from mori.tensor_utils import from_gpu_ptr
 
 from .intranode_kernels import (
+    xdb_flag_slots,
     make_dispatch,
     make_combine,
     make_combine_scatter,
     make_convert_dispatch_output,
     make_convert_combine_input,
     make_local_expert_count,
+    _COMB_NSTREAMS,
 )
 
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
@@ -138,6 +140,13 @@ class EpDispatchCombineConfig:
     # distinct (block, warp) variants and picks one at runtime from
     # cur_rank_num_token. None => auto (from tuning_configs) or single-shot fallback.
     schedule: tuple = None
+    # Dispatch algorithm switch by token count (host-side, at launch): tokens
+    # STRICTLY GREATER than this use the load-once/store-many + 4-way kernel
+    # (big win at large batches); tokens <= it use the original per-(token,
+    # expert) 2-way kernel (finer granularity fills the grid at small/mid
+    # batches). Both variants are precompiled lazily (compiled on first launch,
+    # so an unused algorithm never pays JIT cost).
+    load_once_threshold: int = 4096
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
 
@@ -508,7 +517,13 @@ class EpDispatchCombineOp:
         self.dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self.total_recv = torch.zeros(1, dtype=torch.int32, device=device)
         self.combine_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        self.cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
+        # Per-block xdb flag counters for the gather combine entry barrier: one
+        # i64 per block, fixed at xdb_flag_slots (== CU count, the max combine
+        # block_num). Every block owns a private counter and block 0 fills the
+        # unused tail so all stay in lockstep across calls with different block_num.
+        self.cross_device_flag = torch.ones(
+            xdb_flag_slots, dtype=torch.int64, device=device
+        )
         c_dt = cfg.combine_dtype  # combine output dtype
         c_elem = cfg.combine_elem_size
         if c_dt == torch.float4_e2m1fn_x2:  # fp4 combine outputs fp4 (hidden/2 B/token)
@@ -565,14 +580,21 @@ class EpDispatchCombineOp:
             scale_type_size=cfg.scale_type_size,
             fp4=is_fp4,
         )
-        # (block, warp) -> compiled dispatch / combine kernel.
+        # (block, warp, load_once) -> compiled dispatch kernel. Both algorithm
+        # variants are constructed here but JIT-compiled lazily (on first launch),
+        # so a token distribution that only ever hits one side of
+        # load_once_threshold never pays the other variant's compile cost.
         self._dispatch_variants = {
-            (b, w): make_dispatch(
-                block_num=b, warp_num_per_block=w, **self._dispatch_kwargs
+            (b, w, lo): make_dispatch(
+                block_num=b,
+                warp_num_per_block=w,
+                load_once=lo,
+                **self._dispatch_kwargs,
             )
             for (b, w) in dispatch_specs
+            for lo in (True, False)
         }
-        self._dispatch_replay_variants = {}  # lazily compiled per (block, warp)
+        self._dispatch_replay_variants = {}  # lazily built per (block, warp, load_once)
         if cfg.is_scatter:
             self._combine_variants = {
                 (b, w): make_combine_scatter(
@@ -598,6 +620,7 @@ class EpDispatchCombineOp:
                     fp8_blockwise=cfg.fp8_blockwise,
                     scale_dim=cfg.combine_scale_dim,
                     reset_total_recv=False,
+                    _unroll=_COMB_NSTREAMS,
                 )
                 for (b, w) in combine_specs
             }
@@ -618,6 +641,7 @@ class EpDispatchCombineOp:
                     off_out_wts=arena.offset("out_wts"),
                     reset_total_recv=True,
                     fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
+                    _unroll=_COMB_NSTREAMS,
                 )
                 for (b, w) in combine_specs
             }
@@ -793,27 +817,33 @@ class EpDispatchCombineOp:
         )
 
     def _pick(self, num_tokens):
-        """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
-        count via the per-token schedule; falls back to the single-shot specs
-        otherwise. Returned specs are clamped to the precompiled variants."""
+        """((disp_block, disp_warp, load_once), (comb_block, comb_warp)) for a
+        runtime token count. The (block, warp) geometry comes from the per-token
+        schedule (or single-shot specs), and load_once selects the dispatch
+        algorithm by token count (> cfg.load_once_threshold => load-once/4-way,
+        else the original per-(token,expert) path). Specs are clamped to the
+        precompiled variants."""
         schedule = self.cfg.schedule
-        disp_spec = comb_spec = None
+        disp_bw = comb_spec = None
         if schedule:
             for bucket in schedule:
                 max_tok = bucket[0]
                 if max_tok is None or num_tokens <= max_tok:
-                    disp_spec, comb_spec = (bucket[1], bucket[2]), (
+                    disp_bw, comb_spec = (bucket[1], bucket[2]), (
                         bucket[3],
                         bucket[4],
                     )
                     break
-            if disp_spec is None:
+            if disp_bw is None:
                 last = schedule[-1]
-                disp_spec, comb_spec = (last[1], last[2]), (last[3], last[4])
+                disp_bw, comb_spec = (last[1], last[2]), (last[3], last[4])
         else:
-            disp_spec, comb_spec = self._dispatch_specs[0], self._combine_specs[0]
+            disp_bw, comb_spec = self._dispatch_specs[0], self._combine_specs[0]
+        load_once = num_tokens > self.cfg.load_once_threshold
+        disp_spec = (disp_bw[0], disp_bw[1], load_once)
         if disp_spec not in self._dispatch_variants:
-            disp_spec = self._dispatch_specs[-1]
+            fallback = self._dispatch_specs[-1]
+            disp_spec = (fallback[0], fallback[1], load_once)
         if comb_spec not in self._combine_variants:
             comb_spec = self._combine_specs[-1]
         return disp_spec, comb_spec
@@ -849,6 +879,7 @@ class EpDispatchCombineOp:
                     replay=True,
                     block_num=disp_spec[0],
                     warp_num_per_block=disp_spec[1],
+                    load_once=disp_spec[2],
                     **self._dispatch_kwargs,
                 )
             dest_map_ptr = routing.disp_dest_tok_id_map.data_ptr()
