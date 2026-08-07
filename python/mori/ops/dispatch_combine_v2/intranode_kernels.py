@@ -123,6 +123,8 @@ def make_dispatch(
     enable_signal=True,
     replay=False,
     fp4=False,
+    hoist_lsa_base=False,
+    global_lsa_metadata=False,
 ):
     # fp4 (e2m1) packs 2 values per byte, so a token is hidden_dim/2 bytes; dispatch
     # is a pure byte mover (no fp4 decode), matching mori v1's plain-fp4 path.
@@ -136,6 +138,8 @@ def make_dispatch(
     scale_bytes = scale_dim * scale_type_size
     scale_num_i32 = (scale_bytes + 3) // 4
     enable_scales = scale_bytes > 0
+    if global_lsa_metadata and not hoist_lsa_base:
+        raise ValueError("global_lsa_metadata requires hoist_lsa_base=True")
 
     @flyc.kernel(known_block_size=[warp_num_per_block * WAVE, 1, 1])
     def ep_dispatch(
@@ -187,6 +191,18 @@ def make_dispatch(
             )
             dest_pe = dest_expert // experts_per_rank
             lane_dest_pe = lane_expert // experts_per_rank
+            # A/B path: lsa_ptr() reloads ccoWindowDevice.winBase/stride4G.
+            # Hoist that metadata load once for all regions touched by this
+            # (src token, destination PE) work item.
+            peer_base = (
+                (
+                    P.lsa_ptr_global(arena, dest_pe, fx.Int64(0))
+                    if global_lsa_metadata
+                    else fx.Int64(window.lsa_ptr(dest_pe, 0))
+                )
+                if hoist_lsa_base
+                else fx.Int64(0)
+            )
             dup_per_lane = arith.select(
                 lane_dest_pe == dest_pe, arith.select(lane < k_slot, lane, WAVE), WAVE
             )
@@ -203,7 +219,11 @@ def make_dispatch(
                 dest_tok_lane0 = arith.constant(0)
                 if lane == 0:
                     if dup_ballot == 0:
-                        peer_tok_off = fx.Int64(window.lsa_ptr(dest_pe, off_tok_off))
+                        peer_tok_off = (
+                            peer_base + fx.Int64(off_tok_off)
+                            if hoist_lsa_base
+                            else fx.Int64(window.lsa_ptr(dest_pe, off_tok_off))
+                        )
                         dest_tok_lane0 = P.atomic_add_global(peer_tok_off, fx.Int32(1))
                 dest_tok_id = readlane(T.i32(), dest_tok_lane0, 0)
                 overflow = dest_tok_id >= max_recv
@@ -222,7 +242,11 @@ def make_dispatch(
                     # publish this recv slot's origin into the dest peer's tis
                     # (recv slot -> global source token id) for combine routing.
                     src_tok_encoded = rank * max_tok_per_rank + src_tok
-                    peer_tis = fx.Int64(window.lsa_ptr(dest_pe, off_tis))
+                    peer_tis = (
+                        peer_base + fx.Int64(off_tis)
+                        if hoist_lsa_base
+                        else fx.Int64(window.lsa_ptr(dest_pe, off_tis))
+                    )
                     buffer_store(
                         src_tok_encoded,
                         create_buffer_resource_from_addr(peer_tis),
@@ -244,13 +268,21 @@ def make_dispatch(
                         rsrc_inp_idx, weight_src_off, vec_width=1, dtype=T.i32()
                     )
                     dest_slot = dest_tok_id * experts_per_token + lane
-                    peer_wts = fx.Int64(window.lsa_ptr(dest_pe, off_out_wts))
+                    peer_wts = (
+                        peer_base + fx.Int64(off_out_wts)
+                        if hoist_lsa_base
+                        else fx.Int64(window.lsa_ptr(dest_pe, off_out_wts))
+                    )
                     buffer_store(
                         arith.bitcast(T.i32(), weight_val),
                         create_buffer_resource_from_addr(peer_wts),
                         dest_slot,
                     )
-                    peer_idx = fx.Int64(window.lsa_ptr(dest_pe, off_out_idx))
+                    peer_idx = (
+                        peer_base + fx.Int64(off_out_idx)
+                        if hoist_lsa_base
+                        else fx.Int64(window.lsa_ptr(dest_pe, off_out_idx))
+                    )
                     buffer_store(
                         idx_val, create_buffer_resource_from_addr(peer_idx), dest_slot
                     )
@@ -261,7 +293,11 @@ def make_dispatch(
             if const_expr(enable_scales):
                 if do_publish:
                     rsrc_inp_scales = create_buffer_resource_from_addr(addr_inp_scales)
-                    peer_scales = fx.Int64(window.lsa_ptr(dest_pe, off_out_scales))
+                    peer_scales = (
+                        peer_base + fx.Int64(off_out_scales)
+                        if hoist_lsa_base
+                        else fx.Int64(window.lsa_ptr(dest_pe, off_out_scales))
+                    )
                     rsrc_peer_scales = create_buffer_resource_from_addr(peer_scales)
                     for k_off in range(lane, scale_num_i32, WAVE):
                         scale_val = buffer_load(
@@ -280,7 +316,11 @@ def make_dispatch(
             # (chunk and chunk+_LANE_STRIDE_I32, stride _MAIN_STRIDE_I32) for
             # memory-level parallelism; a one-stream tail covers the remainder.
             # Dropped slots (dup/overflow) set copy_end == lane_i32_off → no-op.
-            peer_tok_base = fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
+            peer_tok_base = (
+                peer_base + fx.Int64(off_out_tok)
+                if hoist_lsa_base
+                else fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
+            )
             remote_tok_addr = peer_tok_base + fx.Int64(dest_tok_id) * fx.Int64(nbytes)
             local_tok_addr = fx.Int64(addr_inp_tok) + fx.Int64(src_tok) * fx.Int64(
                 nbytes

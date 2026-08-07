@@ -107,6 +107,8 @@ DTYPE = os.environ.get("DTYPE", "bf16")  # bf16 | f32
 COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
 QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast (scatter only)
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = forward per-token scales
+HOIST_LSA_BASE = int(os.environ.get("HOIST_LSA_BASE", 0))
+GLOBAL_LSA_METADATA = int(os.environ.get("GLOBAL_LSA_METADATA", 0))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,2048").split(",")]
 
 # fp8 flavor is arch-specific: OCP e4m3 on gfx950/gfx1250, fnuz on gfx942.
@@ -221,6 +223,8 @@ def main():
             scale_dim=SCALE_DIM,
             scale_type_size=1 if SCALE_DIM else 0,
             enable_std_moe=bool(STDMOE),
+            hoist_lsa_base=bool(HOIST_LSA_BASE),
+            global_lsa_metadata=bool(GLOBAL_LSA_METADATA),
         )
         if not AUTO:
             # pin the swept geometry (single-shot); AUTO => leave unset so the
@@ -502,8 +506,9 @@ def main():
                     f"(recv={recv}, scale_dim={SCALE_DIM}, {_sc_n_i32} dwords/tok)",
                     flush=True,
                 )
-            d.shutdown()
-            return
+            # Keep running the performance section after validating scale
+            # forwarding so HOIST_LSA_BASE and other dispatch A/B options can be
+            # measured on the scale-carrying path as well.
 
         eager = MODE in ("eager", "both")
         graph = MODE in ("graph", "both")
@@ -515,7 +520,9 @@ def main():
             )
             print(
                 f"# EP{npes} hidden={HIDDEN} topk={K} experts={num_experts} "
-                f"{_geom}  iters={ITERS}",
+                f"dtype={DTYPE} combine={COMBINE} quant={QUANT} scale_dim={SCALE_DIM} "
+                f"{_geom} hoist_lsa_base={bool(HOIST_LSA_BASE)} "
+                f"global_lsa_metadata={bool(GLOBAL_LSA_METADATA)} iters={ITERS}",
                 flush=True,
             )
         verify(min(SWEEP))  # correctness pass during warmup

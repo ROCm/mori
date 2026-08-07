@@ -31,7 +31,7 @@ dtype-aware tuning table. Not done: `skip_stage1` (FlyDSL-only).
 
 | file | role |
 |---|---|
-| `flydsl_prims.py` | device primitives: system atomics / ordered stores / fences / volatile-spin waits |
+| `flydsl_prims.py` | device primitives: system atomics / ordered stores / fences / volatile-spin waits / addrspace(1) CCO metadata load |
 | `intranode_kernels.py` | all FlyDSL intranode kernel factories: `make_dispatch` (+scales/replay), `make_combine` (gather) / `make_combine_scatter` (`_nop2p`, bf16/f32/fp8/fp4), `make_convert_dispatch_output` / `make_convert_combine_input` (StdMoE), `make_local_expert_count` |
 | `dispatch_combine_op.py` | `SymmArena` + `EpDispatchCombineOp` / `EpDispatchCombineConfig` (+`.tuned()`) / `EpDispatchRoutingHandle` — mori-parity host op-layer (scales, scatter/quant combine, StdMoE, recv cap, LEC, reset, replay) |
 | `tuning_configs.py` | per-(world,hidden,topk) block/warp lookup |
@@ -42,7 +42,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 |---|---|
 | `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
-| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED` |
+| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED`, `HOIST_LSA_BASE`, `GLOBAL_LSA_METADATA` |
 | `run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
@@ -62,6 +62,9 @@ torchrun --standalone --nproc_per_node=8 bench_dispatch_combine.py    # perf + e
 
 Config via env: `HIDDEN`, `TOPK`, `EPR`, `SWEEP`, `DTYPE`, `COMBINE`, `QUANT`,
 `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE=eager|graph|both`, `TUNED`.
+Set `HOIST_LSA_BASE=1` to reuse one peer base per dispatch work item; optionally add
+`GLOBAL_LSA_METADATA=1` to load its `{winBase, stride4G}` through LLVM global
+`addrspace(1)` instead of the generic-pointer CCO extern.
 
 ## Design notes
 

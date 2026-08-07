@@ -101,6 +101,8 @@ SCALE_DIM = int(
 )  # >0 = also verify per-token scales forwarding
 COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
 QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast | fp8_blockwise
+HOIST_LSA_BASE = int(os.environ.get("HOIST_LSA_BASE", 0))
+GLOBAL_LSA_METADATA = int(os.environ.get("GLOBAL_LSA_METADATA", 0))
 # Scale the input up so per-token/-block amax exceeds the fp8 max -> exercises the
 # fp8_blockwise per-block scaling branch (randn ~N(0,1) never triggers it).
 INSCALE = float(os.environ.get("INSCALE", 1))
@@ -161,6 +163,8 @@ def main():
             combine_mode=COMBINE,
             quant_type=QUANT,
             max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
+            hoist_lsa_base=bool(HOIST_LSA_BASE),
+            global_lsa_metadata=bool(GLOBAL_LSA_METADATA),
         )
         if int(os.environ.get("TUNED", 0)):
             from mori.ops.dispatch_combine_v2.tuning_configs import lookup

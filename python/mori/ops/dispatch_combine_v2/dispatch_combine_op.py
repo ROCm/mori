@@ -140,8 +140,17 @@ class EpDispatchCombineConfig:
     schedule: tuple = None
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
+    # A/B switch for dispatch address generation. When enabled, load a peer's
+    # CCO window base/stride once per routing work item and derive all named
+    # region addresses with scalar adds, instead of calling lsa_ptr per region.
+    hoist_lsa_base: bool = False
+    # Experimental nested A/B switch: load ccoWindowDevice metadata through
+    # LLVM global addrspace(1), rather than the generic-pointer CCO extern.
+    global_lsa_metadata: bool = False
 
     def __post_init__(self):
+        if self.global_lsa_metadata and not self.hoist_lsa_base:
+            raise ValueError("global_lsa_metadata requires hoist_lsa_base=True")
         # all-or-none: setting only one silently defaults the other to data_type.
         if (self.dispatch_data_type is None) != (self.combine_data_type is None):
             raise ValueError(
@@ -564,6 +573,8 @@ class EpDispatchCombineOp:
             scale_dim=cfg.scale_dim,
             scale_type_size=cfg.scale_type_size,
             fp4=is_fp4,
+            hoist_lsa_base=cfg.hoist_lsa_base,
+            global_lsa_metadata=cfg.global_lsa_metadata,
         )
         # (block, warp) -> compiled dispatch / combine kernel.
         self._dispatch_variants = {

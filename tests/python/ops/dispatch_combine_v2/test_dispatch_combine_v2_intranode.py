@@ -99,6 +99,19 @@ _skip_fp4 = pytest.mark.skipif(not _IS_GFX950, reason="fp4 is gfx950-only")
 def _cases():
     # dtype x combine (non-quant)
     yield pytest.param({"DTYPE": "bf16", "COMBINE": "gather"}, id="bf16-gather")
+    yield pytest.param(
+        {"DTYPE": "bf16", "COMBINE": "gather", "HOIST_LSA_BASE": 1},
+        id="bf16-gather-hoist",
+    )
+    yield pytest.param(
+        {
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "HOIST_LSA_BASE": 1,
+            "GLOBAL_LSA_METADATA": 1,
+        },
+        id="bf16-gather-hoist-global-meta",
+    )
     yield pytest.param({"DTYPE": "bf16", "COMBINE": "scatter"}, id="bf16-scatter")
     yield pytest.param({"DTYPE": "f32", "COMBINE": "gather"}, id="f32-gather")
     yield pytest.param({"DTYPE": "f32", "COMBINE": "scatter"}, id="f32-scatter")

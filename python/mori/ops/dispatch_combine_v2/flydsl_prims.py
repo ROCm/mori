@@ -42,6 +42,10 @@ def _I32():
     return ir.IntegerType.get_signless(32)
 
 
+def _V3I32():
+    return ir.VectorType.get([3], _I32())
+
+
 def _NUW():
     return ir.Attribute.parse("#llvm.overflow<none>")
 
@@ -60,6 +64,44 @@ def _addr_plus(base_i64, offset, elem_bytes):
     eb = _llvm_d.ConstantOp(_I64(), ir.IntegerAttr.get(_I64(), elem_bytes)).result
     byte_off = _llvm_d.MulOp(off64, eb, _NUW()).result
     return _llvm_d.AddOp(base, byte_off, _NUW()).result
+
+
+def lsa_ptr_global(window_i64, peer_i32, offset_i64):
+    """Compute a CCO peer VA while loading window metadata from addrspace(1).
+
+    ccoWindowDevice starts with {i64 winBase, i32 stride4G}. Loading it as
+    vector<3xi32> keeps the 12-byte access vectorized and lets AMDGPU select
+    global_load_dwordx3 instead of the generic-address flat_load_dwordx3 emitted
+    by the linked cco_lsa_ptr extern.
+    """
+    meta = _llvm_d.LoadOp(
+        _V3I32(), _gptr(window_i64), alignment=8
+    ).res
+    indices = [
+        _llvm_d.ConstantOp(_I64(), ir.IntegerAttr.get(_I64(), i)).result
+        for i in range(3)
+    ]
+    win_lo = _llvm_d.ExtractElementOp(meta, indices[0]).res
+    win_hi = _llvm_d.ExtractElementOp(meta, indices[1]).res
+    stride = _llvm_d.ExtractElementOp(meta, indices[2]).res
+    win_lo64 = _llvm_d.ZExtOp(_I64(), win_lo).res
+    win_hi64 = _llvm_d.ZExtOp(_I64(), win_hi).res
+    stride64 = _llvm_d.ZExtOp(_I64(), stride).res
+    peer = arith.unwrap(peer_i32)
+    peer64 = _llvm_d.ZExtOp(_I64(), peer).res if peer.type == _I32() else peer
+    offset = arith.unwrap(offset_i64)
+    offset64 = (
+        _llvm_d.ZExtOp(_I64(), offset).res if offset.type == _I32() else offset
+    )
+    shift32 = _llvm_d.ConstantOp(
+        _I64(), ir.IntegerAttr.get(_I64(), 32)
+    ).result
+    win_hi_shifted = _llvm_d.ShlOp(win_hi64, shift32, _NUW()).res
+    win_base = _llvm_d.OrOp(win_lo64, win_hi_shifted).res
+    peer_stride = _llvm_d.MulOp(peer64, stride64, _NUW()).res
+    peer_stride = _llvm_d.ShlOp(peer_stride, shift32, _NUW()).res
+    peer_base = _llvm_d.AddOp(win_base, peer_stride, _NUW()).res
+    return fx.Int64(_llvm_d.AddOp(peer_base, offset64, _NUW()).res)
 
 
 def atomic_add_global(addr_i64, val):
