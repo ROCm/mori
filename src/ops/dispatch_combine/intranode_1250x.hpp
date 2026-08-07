@@ -23,15 +23,16 @@
 
 // The gfx125x implementation of intra-node dispatch and combine.
 //
-// This file is reached only from intranode.hpp, and only from inside its
+// This file is reached only from intranode_entry.hpp, and only from inside its
 // `#if defined(__gfx1250__) || defined(__gfx1251__)', so nothing here tests the target
 // architecture: every line is already known to be compiling for a card that has the TDM engine.
 // That is the whole point of the split -- arch tests interleaved with the code they guard is how a
 // transport and the values it is compiled with drift apart. If you find yourself wanting an arch
 // #if here, the code you are adding belongs in intranode.hpp instead.
 //
-// PREREQUISITES from the includer, which is why this is not a standalone header: MAX_GPUS_PER_NODE,
-// and everything src/ops/dispatch_combine/common.hpp provides.
+// PREREQUISITES from the includer, which is why this is not a standalone header: MAX_GPUS_PER_NODE
+// and the barrier from intranode.hpp, plus everything src/ops/dispatch_combine/common.hpp
+// provides.
 
 #include <hip/amd_detail/amd_gfx1250_TDM.h>
 
@@ -349,7 +350,7 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmSplitShape(const TdmSplit128& s
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*             EpDispatchIntraNodeKernel_body (DEFAULT: narrow grid, batched metadata)              */
+/*          EpDispatchIntraNodeKernel_1250x_body (narrow grid, batched metadata, TDM)             */
 /* ---------------------------------------------------------------------------------------------- */
 // The dispatch body. Launch geometry is 64 blocks x 8 warps (see _resolve_launch_params in
 // python/mori/ops/dispatch_combine.py).
@@ -384,9 +385,9 @@ constexpr int kMetaFields = 4;
 
 // The dispatch body for this architecture: block-local exact count, one remote fetch_add(N) per
 // destPe, local slot distribution, and metadata plus payload moved by the TDM engine. Selected by
-// EpDispatchIntraNodeBatchKernel_body in intranode.hpp, which sends every other target to
-// EpDispatchIntraNodeKernel_warpcopy_body. Launch geometry is 64 blocks x 8 warps, fixed in
-// _resolve_launch_params (python/mori/ops/dispatch_combine.py).
+// EpDispatchIntraNodeKernel_entry in intranode_entry.hpp, which sends every other target to
+// EpDispatchIntraNodeKernel_body in intranode.hpp. Launch geometry is 64 blocks x 8 warps, fixed
+// in _resolve_launch_params (python/mori/ops/dispatch_combine.py).
 template <typename T, bool EnableStdMoE = false>
 __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
@@ -803,7 +804,7 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                              EpCombineIntraNodeKernel_1250x_body                                 */
+/*                              EpCombineIntraNodeKernel_1250x_body                               */
 /* ---------------------------------------------------------------------------------------------- */
 // The combine body for this architecture. Note what it still contains: the peer vector-load gather.
 // That is not a leftover. Of the combine symbols ep_intranode.hip registers, only bf16/f32 _p2p and
@@ -1103,11 +1104,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_1250x_body(EpDispatchCo
                    scalePtrArrayOffset * warpNum * config.numExpertPerToken +
                    warpId * config.numExpertPerToken;
   }
-
-  // The reduce half indexes over ITS OWN warps, not the block's. Unlike the send side, which draws
-  // work from an LDS queue and needs no remapping, this loop is `for (i = globalWarpId; i < end; i
-  // += globalWarpNum)`, so leaving the full-block ids in place would have eight warps step by
-  // sixteen and reduce half the tokens -- reading as a 2x speedup that is really a 2x deletion.
 
   MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
 

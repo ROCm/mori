@@ -33,10 +33,11 @@
 #ifdef ENABLE_PROFILER
 #include "mori/profiler/profiler.hpp"
 #endif
-#define MAX_GPUS_PER_NODE 8
 
 namespace mori {
 namespace moe {
+
+#define MAX_GPUS_PER_NODE 8
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BarrierKernel                                         */
@@ -88,23 +89,8 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   __syncthreads();
 }
 
-}  // namespace moe
-}  // namespace mori
-
-// gfx125x targets have their own dispatch and combine, written against the TDM engine, and they
-// live entirely in this header. Nothing else in this file knows about them: the only other mention
-// of the architecture is the one line in each body that hands the token over. Included from here,
-// in the middle of a header, rather than at the top, because it is not standalone -- it is written
-// against MAX_GPUS_PER_NODE and the barrier above.
-#if defined(__gfx1250__) || defined(__gfx1251__)
-#include "src/ops/dispatch_combine/intranode_1250x.hpp"
-#endif
-
-namespace mori {
-namespace moe {
-
 /* ---------------------------------------------------------------------------------------------- */
-/*                                 EpDispatchIntraNodeKernel_body                                   */
+/*                                 EpDispatchIntraNodeKernel_body                                 */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool EnableStdMoE = false>
 __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
@@ -250,24 +236,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #endif
 }
 
-
-// The extern-C launch symbol EpDispatchIntraNodeBatchKernel_<dtype> calls *_body directly (see
-// WRAP_BOOL in ep_common.hip) and bypasses the __global__ wrapper below, so the architecture choice
-// has to be made under this name.
-template <typename T, bool EnableStdMoE = false>
-__device__ void EpDispatchIntraNodeBatchKernel_body(EpDispatchCombineArgs<T> args) {
-#if defined(__gfx1250__) || defined(__gfx1251__)
-  EpDispatchIntraNodeKernel_1250x_body<T, EnableStdMoE>(args);
-#else
-  EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
-#endif
-}
-
-template <typename T, bool EnableStdMoE = false>
-__global__ void EpDispatchIntraNodeBatchKernel(EpDispatchCombineArgs<T> args) {
-  EpDispatchIntraNodeBatchKernel_body<T, EnableStdMoE>(args);
-}
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                               EpCombineQuantizeInputKernel (pre-pass)                          */
 /* ---------------------------------------------------------------------------------------------- */
@@ -302,11 +270,6 @@ template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
           int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false>
 __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
-#if defined(__gfx1250__) || defined(__gfx1251__)
-  EpCombineIntraNodeKernel_1250x_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast,
-                                      UseFp8BlockwiseQuant, UseWeights, Vec8Top8BlockElems,
-                                      Vec8AccumNum, UseFp4Combine>(args);
-#else
   using TokT =
       std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant, core::CombineInternalFp8, T>;
   // UseFp4Combine reuses the FP8-blockwise staging/scale layout but transports each element as
@@ -455,8 +418,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                                                   args.inpTokenBuf + tokenIdx * hiddenDim,
                                                   hiddenDim, laneId);
       } else {
-          core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
-                         args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim);
+        core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
+                       args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim);
       }
       if constexpr (UseWeights) {
         if (args.weightsBuf) {
@@ -555,11 +518,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                    warpId * config.numExpertPerToken;
   }
 
-  // The reduce half indexes over ITS OWN warps, not the block's. Unlike the send side, which draws
-  // work from an LDS queue and needs no remapping, this loop is `for (i = globalWarpId; i < end; i
-  // += globalWarpNum)`, so leaving the full-block ids in place would have eight warps step by
-  // sixteen and reduce half the tokens -- reading as a 2x speedup that is really a 2x deletion.
-
   MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
 
   assert(config.numExpertPerToken < warpSize);
@@ -645,7 +603,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
     }
 
-
     if constexpr (UseFp8BlockwiseQuant) {
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
       if constexpr (Vec8Top8BlockElems != 0) {
@@ -702,15 +659,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
     }
   }
-#endif
-}
-
-template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
-          bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false>
-__global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
-  EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast, UseFp8BlockwiseQuant,
-                                UseWeights, Vec8Top8BlockElems, Vec8AccumNum, UseFp4Combine>(args);
 }
 
 }  // namespace moe

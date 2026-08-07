@@ -160,7 +160,7 @@ Python dispatch_combine.py
   │     └── C++: new EpDispatchCombineArgsRaw(GetArgsRaw(handle, ...))
   │
   ├── sfx = _DTYPE_SUFFIX[input.dtype]                   # "bf16", "f32", ...
-  ├── kernel_name = f"EpDispatchIntraNodeBatchKernel_{sfx}"  # Python selects
+  ├── kernel_name = f"EpDispatchIntraNodeKernel_{sfx}"  # Python selects
   ├── grid  = (block_num,)                                # Python computes
   ├── block = (WARP_SIZE * warp_per_block,)
   ├── shared_mem = dispatch_shared_mem(warp_per_block)
@@ -177,9 +177,9 @@ Dtype suffix mapping:
 
 | PyTorch dtype | Suffix | Kernel example |
 |---------------|--------|----------------|
-| `torch.bfloat16` | `bf16` | `EpDispatchIntraNodeBatchKernel_bf16` |
+| `torch.bfloat16` | `bf16` | `EpDispatchIntraNodeKernel_bf16` |
 | `torch.float32` | `f32` | `EpCombineInterNodeKernel_f32` |
-| `torch.float8_e4m3fn` | `fp8_ocp` | `EpDispatchIntraNodeBatchKernel_fp8_ocp` |
+| `torch.float8_e4m3fn` | `fp8_ocp` | `EpDispatchIntraNodeKernel_fp8_ocp` |
 | `torch.float8_e4m3fnuz` | `fp8_fnuz` | `EpCombineIntraNodeKernel_fp8_fnuz_nop2p` |
 
 ## HIP Driver API (Python ctypes)

@@ -441,9 +441,9 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
   unsigned int block_x = WARP_SIZE * wpb;
   int smem = dispatch_shared_mem(handle.config, wpb);
   // The gfx125x dispatch body stages each token payload through ONE per-warp LDS tile; size the
-  // dynamic shared to warpNum * hiddenDim * elemSize (see intranode.hpp). gfx1250 has 320KB LDS/CU,
-  // so a 14KB bf16 tile lets ~22 warps/CU stay resident. Other arches take the WarpCopy body, which
-  // stages nothing and keeps the index-array reservation above.
+  // dynamic shared to warpNum * hiddenDim * elemSize (see intranode_1250x.hpp). gfx1250 has 320KB
+  // LDS/CU, so a 14KB bf16 tile lets ~22 warps/CU stay resident. Other arches take the WarpCopy
+  // body, which stages nothing and keeps the index-array reservation above.
   //
   // Keyed on the RUNTIME arch, not on a build macro. It used to be #ifdef MORI_DISP_TDM, which is
   // the same condition the kernel used to compile its body under; now that the body is selected by
@@ -466,11 +466,10 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
 
   switch (handle.config.kernelType) {
     case KernelType::IntraNode: {
-      // Intra-node dispatch: only the BATCH kernel is kept (block-local exact count +
-      // batched remote reservation + 1D TDM payload, ~980 GB/s EP4-4K). The legacy and
-      // NOTIFY/CNT2 kernels were removed.
-      reg.Launch(std::string("EpDispatchIntraNodeBatchKernel_") + sfx, bn, block_x, smem, stream,
-                 &args, args_size);
+      // Intra-node dispatch: one launch symbol (block-local exact count + batched remote
+      // reservation + payload). The legacy and NOTIFY/CNT2 kernels were removed.
+      reg.Launch(std::string("EpDispatchIntraNodeKernel_") + sfx, bn, block_x, smem, stream, &args,
+                 args_size);
       break;
     }
     case KernelType::InterNode:
