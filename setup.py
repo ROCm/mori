@@ -365,6 +365,7 @@ class CMakeBuild(build_ext):
         cmake_args = [
             "cmake",
             "-DUSE_ROCM=ON",
+            f"-DCMAKE_PREFIX_PATH={os.environ.get('ROCM_PATH', '/opt/rocm')};{os.environ.get('ROCM_PATH', '/opt/rocm')}/lib/rocm_sysdeps",
             f"-DCMAKE_BUILD_TYPE={build_type}",
             f"-DWARP_ACCUM_UNROLL={unroll_value}",
             f"-DBUILD_SHMEM_DEVICE_WRAPPER={build_shmem_device_wrapper}",
