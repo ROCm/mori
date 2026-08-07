@@ -33,6 +33,8 @@
 #ifdef ENABLE_PROFILER
 #include "mori/profiler/profiler.hpp"
 #endif
+// The one spelling of the arch test. Everything below asks for MORI_TDM_OK rather than the target
+// macros directly, so the TDM bodies and the values they are compiled with cannot drift apart.
 #if defined(__gfx1250__) || defined(__gfx1251__)
 #define MORI_TDM_OK 1
 #endif
@@ -458,9 +460,6 @@ __device__ void EpDispatchIntraNodeKernel_warpcopy_body(EpDispatchCombineArgs<T>
   __shared__ index_t s_base[kMaxNpes];  // reserved contiguous base slot on destPe
   __shared__ index_t s_run[kMaxNpes];   // block-local running distribution index
 
-#define _BPTS(i) do {} while (0)
-  _BPTS(0);  // kernel entry
-
   // ---- Phase 1: block-local count committed tokens per destPe (+ drop sentinels) ----
   for (int p = thdId; p < npes; p += blockDim.x) { s_N[p] = 0; s_run[p] = 0; }
   __syncthreads();
@@ -491,7 +490,6 @@ __device__ void EpDispatchIntraNodeKernel_warpcopy_body(EpDispatchCombineArgs<T>
   }
   __syncthreads();
 
-  _BPTS(1);  // <- phase1 count (block-local histogram)
   // ---- Phase 2: reserve N contiguous slots per destPe with ONE remote atomic each ----
   for (int p = thdId; p < npes; p += blockDim.x) {
     if (s_N[p] > 0) {
@@ -503,7 +501,6 @@ __device__ void EpDispatchIntraNodeKernel_warpcopy_body(EpDispatchCombineArgs<T>
   }
   __syncthreads();
 
-  _BPTS(2);  // <- phase2 reserve (npes remote atomicAdd(N))
   // ---- Phase 3: distribute LOCAL slots + copy metadata and payload, per (token, peer) pair ----
   if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
     for (int i = globalWarpId; i < Npair; i += globalWarpNum) {
@@ -553,15 +550,12 @@ __device__ void EpDispatchIntraNodeKernel_warpcopy_body(EpDispatchCombineArgs<T>
     }
   }
   __syncthreads();
-  _BPTS(3);  // <- phase3 payload copy (Part B)
-
   // ---- Completion (identical to the TDM body): all blocks arrive, then per-peer release-signal --
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
-      _BPTS(4);  // <- grid barrier satisfied (all local blocks arrived)
       __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
@@ -569,7 +563,6 @@ __device__ void EpDispatchIntraNodeKernel_warpcopy_body(EpDispatchCombineArgs<T>
       __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
-    _BPTS(5);  // <- all per-peer completion signals sent
   }
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
@@ -583,9 +576,7 @@ __device__ void EpDispatchIntraNodeKernel_warpcopy_body(EpDispatchCombineArgs<T>
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
     }
-    _BPTS(6);  // <- all peers' signals received (completion done)
   }
-#undef _BPTS
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   if constexpr (EnableStdMoE) {
     InvokeConvertDispatchOutput<T>(args, myPe);
@@ -654,7 +645,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const int _eLane = (_tpi > 1) ? (laneId - _sLane * topk) : laneId;
   const bool _laneAct = (_tpi > 1) ? (_sLane < _tpi) : (laneId < topk);
 
-#if defined(__gfx1250__) || defined(__gfx1251__)
+#if defined(MORI_TDM_OK)
   extern __shared__ char _tdmBatchSmem[];
   T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem) + (size_t)warpId * hiddenDim;
   const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
@@ -662,10 +653,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 
   constexpr int kMaxNpes = MAX_GPUS_PER_NODE;
 
-#define _BPTS(i) do {} while (0)
-  _BPTS(0);  // kernel entry
-
-#if defined(__gfx1250__) || defined(__gfx1251__)
+#if defined(MORI_TDM_OK)
   // ==== Phases (TDM-only, decentralized): Phase 1 block-local COUNT (LDS histogram, like CLEAN);
   // Phase 2 per-block RESERVE (each block one remote atomic per peer -> its own contiguous slot
   // range on the peer, s_base) -- fully decentralized, NO grid barrier; FINALIZE assigns destTokId
@@ -703,8 +691,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     }
   }
   __syncthreads();  // all warps in this block done counting before pushing s_N to global
-  _BPTS(1);  // <- phase1 count (block-local LDS histogram)
-
   // ---- Phase 2: per-block RESERVE. Each block does ONE remote atomic per active peer against
   // dispTokOffsetMemObj[p], the returned old value is this block's own contiguous slot base on that
   // peer (s_base[p]) -- fully decentralized like CLEAN, so NO grid barrier is needed here
@@ -720,8 +706,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     }
   }
   __syncthreads();  // s_base visible to all threads in this block
-  _BPTS(2);         // <- reserve bucket: per-block remote atomic (no barrier)
-
   // ---- FINALIZE: recompute routing (cheap ALU); destTokId = this block's remote base (s_base)
   // plus a block-local running index (s_run, LDS atomic). No cross-block collision: each block
   // owns a disjoint [s_base, s_base+s_N) range carved out by its own remote atomic above. ----
@@ -808,7 +792,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
     }
   }
-  _BPTS(7);  // <- finalize done (all blocks), right before payload/meta grid barrier
   // ---- No grid barrier here: each block is self-contained -- it routes its own tokens (FINALIZE)
   // then sends only those tokens' meta+payload, reading only its OWN dispDestTokIdMap / staging /
   // blkBase / blkCount (same aWarps stride).
@@ -819,7 +802,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 // for meta's cross-GPU writes, so by the time the completion cross-rank signal fires, meta fabric
 // traffic is long gone and no longer queues ahead of the (small) signal atomic on the sender's
 // outbound fabric -- which is what made cwait spin ~ms when meta trailed payload into completion.
-#if defined(__gfx1250__) || defined(__gfx1251__)
+#if defined(MORI_TDM_OK)
   bool _mPend = false;
   if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
     const int tkM = config.numExpertPerToken;
@@ -988,7 +971,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #endif  // gfx125x (per-block meta send)
 
 
-#if defined(__gfx1250__) || defined(__gfx1251__)
+#if defined(MORI_TDM_OK)
   // ---- Phase 3b: payload copy, driven by the slot map (dispDestTokIdMap, own-block). ----
   if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
     // Reuses aWarp/aWarps rather than recomputing them: the block-level __syncthreads() above
@@ -1029,8 +1012,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   }
 #endif  // gfx125x (payload group)
   __syncthreads();
-  _BPTS(3);  // <- phase3 payload copy (Part B: 1D TDM)
-
   // ---- Completion (identical to legacy): all blocks arrive, then per-peer release-signal ---- One
   // shared counter, not per-block flags.
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
@@ -1038,7 +1019,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
-      _BPTS(4);  // <- grid barrier satisfied (all local blocks arrived)
       __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
@@ -1046,7 +1026,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
-    _BPTS(5);  // <- all per-peer completion signals sent
   }
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
@@ -1060,9 +1039,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
     }
-    _BPTS(6);  // <- all peers' signals received (completion done)
   }
-#undef _BPTS
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   if constexpr (EnableStdMoE) {
     InvokeConvertDispatchOutput<T>(args, myPe);
@@ -1075,7 +1052,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 // switch has to live here.
 template <typename T, bool EnableStdMoE = false>
 __device__ void EpDispatchIntraNodeBatchKernel_body(EpDispatchCombineArgs<T> args) {
-#if defined(__gfx1250__) || defined(__gfx1251__)
+#if defined(MORI_TDM_OK)
   EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
 #else
   EpDispatchIntraNodeKernel_warpcopy_body<T, EnableStdMoE>(args);
@@ -1168,7 +1145,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   const size_t scaleBytes =
       UseFp8BlockwiseQuant ? static_cast<size_t>(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
                            : 0;
-#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
+#if defined(MORI_TDM_OK)
   // A TDM store needs its destination on a 128B row boundary, and what decides that for slot k is
   // the slot stride: hidden 7168 bf16 + 8 weights = 14368 B is only 32B-aligned, so every other
   // slot would land off-row.
@@ -1264,7 +1241,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
     }
 #else
-#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
+#if defined(MORI_TDM_OK)
     // ---- TDM push, same shape as the dispatch payload phase (Phase 3b) ---- One TDM load stages
     // the token into a per-warp LDS tile, one TDM store lands it in the peer's slot.
     extern __shared__ char sharedMem[];
@@ -1298,7 +1275,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                                                   args.inpTokenBuf + tokenIdx * hiddenDim,
                                                   hiddenDim, laneId);
       } else {
-#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
+#if defined(MORI_TDM_OK)
         if (combSlotOn128B) {
           TokT* _dst = reinterpret_cast<TokT*>(destStagingPtr);
           TokT* _src = reinterpret_cast<TokT*>(args.inpTokenBuf) + (size_t)tokenIdx * hiddenDim;
@@ -1382,7 +1359,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
       __syncthreads();  // s_rrIdx is reused by the next tile
     }
-#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
+#if defined(MORI_TDM_OK)
     // Mandatory: the deferred drain above only runs when a warp has another token to send, so the
     // last store of every warp can still be in flight here. The cross-device barrier below orders
     // memory, not the TDM engine, so without this a peer could read a half-written slot.
@@ -1434,7 +1411,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   // Whether the combine TDM tile path is COMPILED at all. Declared out here, not inside the #if
   // below, because _cPullBwq is read by the reduce chain further down, which is NOT inside any TDM
   // block -- and it is read there to steer blockwise AWAY from the scalar dequant helpers.
-#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
+#if defined(MORI_TDM_OK)
   constexpr bool _cCombTdmBuilt = true;
 #else
   constexpr bool _cCombTdmBuilt = false;
@@ -1442,11 +1419,11 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   constexpr bool _cPullBwq = _cCombTdmBuilt && UseFp8BlockwiseQuant && !UseFp4Combine &&
                              UseP2PRead && (sizeof(TokT) == 1);
 
-#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
+#if defined(MORI_TDM_OK)
   // ---- TDM pull, the P2P-read counterpart of the TDM push above ---- Here the cross-card traffic
   // is the gather, not the send: srcPtrs[] point into up to topk PEER buffers and the default path
   // reads them with 16B per-lane vector loads.
-  constexpr int _cPullChunks = ((MORI_COMB_TDM) > 0) ? (MORI_COMB_TDM) : 1;
+  constexpr int _cPullChunks = MORI_COMB_TDM;
   constexpr bool _cPullType = (std::is_same_v<T, TokT> && !UseFp8BlockwiseQuant &&
                                (sizeof(TokT) == 2 || sizeof(TokT) == 4)) ||
                               _cPullBwq;
@@ -1977,7 +1954,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         }
       }
     }
-#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
+#if defined(MORI_TDM_OK)
     // [L2] Which of the worldSize rows the one gather brings back are real contributions.
     int _peMask = 0;
     const TokT* _gBase = nullptr;
@@ -2045,7 +2022,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                                               validAccumCount, laneId, hiddenDimSize);
     } else {
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
-#if defined(MORI_COMB_TDM) && defined(MORI_TDM_OK)
+#if defined(MORI_TDM_OK)
       // if constexpr, not a plain if: this body is only well-formed for a 2/4-byte T==TokT. A
       // runtime if still instantiates it for every TokT the kernel is built with, and the fp4
       // combine instantiation (TokT = mori_fp4x2_e2m1, 1 byte) has no conversion to float -- which
