@@ -32,6 +32,7 @@ import flydsl.expr as fx
 from mori.tensor_utils import from_gpu_ptr
 
 from .intranode_kernels import (
+    xdb_flag_slots,
     make_dispatch,
     make_combine,
     make_combine_scatter,
@@ -508,7 +509,13 @@ class EpDispatchCombineOp:
         self.dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self.total_recv = torch.zeros(1, dtype=torch.int32, device=device)
         self.combine_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        self.cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
+        # Per-block xdb flag counters for the gather combine entry barrier: one
+        # i64 per block, fixed at xdb_flag_slots (== CU count, the max combine
+        # block_num). Every block owns a private counter and block 0 fills the
+        # unused tail so all stay in lockstep across calls with different block_num.
+        self.cross_device_flag = torch.ones(
+            xdb_flag_slots, dtype=torch.int64, device=device
+        )
         c_dt = cfg.combine_dtype  # combine output dtype
         c_elem = cfg.combine_elem_size
         if c_dt == torch.float4_e2m1fn_x2:  # fp4 combine outputs fp4 (hidden/2 B/token)
