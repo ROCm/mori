@@ -1162,7 +1162,8 @@ def _bench_dispatch_combine(
             if rank == 0:
                 print(f"\n{'=' * 60}")
                 print(
-                    f"Profiling with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
+                    f"Profiling with dispatch {_fmt_geo(dispatch_block_num, dispatch_warp_per_block)}, "
+                    f"combine {_fmt_geo(combine_block_num, combine_warp_per_block)}"
                 )
                 print(f"{'=' * 60}")
             benchmark.profile(
