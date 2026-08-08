@@ -148,76 +148,6 @@ _QUANT_TYPE_MAP = {
 # Blockwise combine quant types share the staging/scale layout and kernel launch config; only the
 # element codec (and staging slot size) differ, so kernel selection treats them together and then
 # swaps the codec token (fp8_blockwise <-> fp4_blockwise) in the kernel name.
-def _comb_pull_mode() -> str:
-    """How a CALLER-OWNED (use_external_inp_buf) combine input reaches the PULL gather.
-
-    PULL is the fast transport -- each consumer bulk-reads its peers' buffers instead of having
-    every producer scatter per-lane writes across the fabric -- but the kernel can only read a
-    peer's buffer if the bytes are IN a symmetric buffer, and a caller-owned tensor is not one.
-    That is the whole reason use_external_inp_buf has been pinned to PUSH. The bytes therefore
-    have to be staged into the registered buffer first, and this picks who does it:
-
-      "host"   -- a d2d copy on the caller's stream before launch. The kernel then runs the
-                  ordinary zero-copy _p2p path unchanged, so correctness is inherited from the
-                  path that already passes. MEASURED 64x8 EP4 bf16, check armed, rc=0:
-                  236.7us / 896.9 GB/s against PUSH 318.8us / 666.0 GB/s. The 67.7us over the
-                  169.0us zero-copy reference is the copy, 424 MB of local traffic at 6.3 TB/s.
-      "kernel" -- KNOWN WRONG, kept only to name what was tried. The kernel stages the token
-                  itself and then reads peers, which is what blockwise does under QPULL, and it
-                  fails the correctness check at EP4 (rc=1, max diff 3.75 against tol 0.159 on
-                  3 of 4 ranks). Two candidate causes are already excluded by measurement rather
-                  than argument: MORI_COMB_RELFENCE (a per-block release fence) does not fix it,
-                  and MORI_COMB_FASTPATH=0 does not either, so it is neither cross-card
-                  visibility nor the QUAD/TDM gather.
-      "both"   -- DIAGNOSTIC: host copy AND the in-kernel staging, which rewrites the same bytes.
-                  Isolates the staging loop, the one thing that differs between host and kernel.
-      "off"    -- keep PUSH.
-
-    Default is set by measurement in _comb_pull_default(); MORI_COMB_PULL overrides.
-    """
-    val = os.environ.get("MORI_COMB_PULL", "").strip().lower()
-    if val in ("host", "kernel", "both", "off"):
-        return val
-    if val in ("1", "true", "on", "yes"):
-        return "host"
-    if val in ("0", "false", "no"):
-        return "off"
-    return _comb_pull_default()
-
-
-def _comb_pull_default() -> str:
-    """Transport for a caller-owned combine input when MORI_COMB_PULL is unset.
-
-    PUSH everywhere, again. gfx125x staged-and-pulled for a while because PUSH cost 25.8% of
-    combine (318.8us against 236.7us at 64x8 EP4) for a property of the allocation rather than
-    anything about the data -- but that comparison was between two EIGHT-warp runs, and eight
-    warps is a width the two transports do not deserve equally.
-
-    MEASURED 2026-08-04, EP4 bf16 hidden 7168, 64 blocks, check armed (rc=0 on every row):
-
-        transport                    wpb 8     wpb 16
-        PUSH  (this default)         288.2     221.2      <- 959.9 GB/s
-        host d2d + PULL              234.2     cannot     <- what this used to return
-        zero copy PULL (ZC=1)        168.5     cannot
-
-    "cannot" is not untried. PULL's gather needs one LDS tile PER SOURCE, so 16 warps want 458 KB
-    against a 320 KB budget; the reservation silently declines and the kernel falls back to the
-    lane gather, which reads 1166.4us. Halving the tiles (MORI_COMB_TDM=4) does fit -- and still
-    loses, 186.4 against 167.3, because a cross-card read that is already at the fabric ceiling
-    only gets slower when it is chopped into smaller descriptors. PUSH scales instead because its
-    fold ALIASES the send tile, one per warp, and because half its work (the fold) is a LOCAL read
-    at 2793 GB/s rather than a cross-card one: 8 -> 16 warps buys the push phase 7.9% and the fold
-    phase 42.9%.
-
-    So the width, not the transport, was carrying the old result. _intranode_combine_default_launch
-    gives PUSH the 16 it can use; the two changes are one change and must not be split.
-
-    ZC=1 is still 24% faster than this and still the right thing for a caller who can hand over a
-    registered buffer. This is only about the caller who cannot.
-    """
-    return "off"
-
-
 _BLOCKWISE_COMBINE_QUANT_TYPES = (
     EpDispatchCombineQuantType.Fp8BlockwiseQuant,
     EpDispatchCombineQuantType.Fp4BlockwiseQuant,
@@ -754,10 +684,21 @@ class EpDispatchCombineOp:
         transport existed; the width only matters where the TDM transports exist at all.
 
         PUSH is the exception and gets 16, because the two transports scale oppositely with width
-        and 8 is PULL's number. See _comb_pull_default() for the table; the short version is
-        288.2 -> 221.2us at 64 blocks, check armed, with PULL unable to use 16 at all. is_push is
-        passed in rather than re-derived here because it depends on force_pull, which the caller
-        has already resolved by the time launch params are picked.
+        and 8 is PULL's number. MEASURED 2026-08-04, EP4 bf16 hidden 7168, 64 blocks, check armed
+        (rc=0 on every row):
+
+            transport                wpb 8     wpb 16
+            PUSH (caller-owned inp)  288.2     221.2      <- 959.9 GB/s
+            zero copy PULL           168.5     cannot
+
+        "cannot" is not untried: PULL's gather needs one LDS tile per source, so 16 warps want
+        458 KB against a 320 KB budget, the reservation declines and the kernel falls back to the
+        lane gather at 1166.4us. PUSH scales instead because its fold ALIASES the send tile, one
+        per warp, and because half its work is a LOCAL read at 2793 GB/s rather than a cross-card
+        one: 8 -> 16 warps buys the push phase 7.9% and the fold phase 42.9%.
+
+        Zero copy is still 24% faster and still the right thing for a caller who can hand over a
+        registered buffer; this is only about the caller who cannot.
 
         QUAD needs one whole-token tile per warp, double buffered, plus an output tile: at hidden
         7168 bf16 that is 287,872 B at 8 warps against a 327,680 B budget, and 574,976 at 16. So the
@@ -870,7 +811,7 @@ class EpDispatchCombineOp:
             name += "_stdmoe"
         return name
 
-    def _combine_shared_mem(self, warp_per_block, use_weights=True, force_pull=False):
+    def _combine_shared_mem(self, warp_per_block, use_weights=True):
         """Shared memory for combine kernels."""
         quant_type = _normalize_quant_type(self.config.quant_type)
         num_ptr_arrays = 1 + int(bool(use_weights))
@@ -908,10 +849,7 @@ class EpDispatchCombineOp:
             hidden = int(self.config.hidden_dim)
             topk = int(self.config.num_experts_per_token)
             world = int(self.config.world_size)
-            # force_pull is the one case where the buffer flag and the transport disagree: the
-            # caller owns the input buffer but its bytes were staged into the registered one
-            # before launch, so the kernel is a _p2p kernel and needs PULL tiles.
-            if self.config.use_external_inp_buf and not force_pull:
+            if self.config.use_external_inp_buf:
                 # PUSH never splits a token and never holds more than one: one warp sends one whole
                 # token to its one destination PE, so the tile is exactly hiddenDim elements and
                 # MORI_COMB_TDM only gates TDM on/off there.
@@ -969,13 +907,12 @@ class EpDispatchCombineOp:
             total = ((base + 127) & ~127) + tile_bytes
             if total <= _COMB_LDS_BUDGET:
                 base = total
-            elif self.config.use_external_inp_buf and not force_pull:
+            elif self.config.use_external_inp_buf:
                 # PUSH has no fallback in the kernel -- its fold aliases the send tile rather than
-                # allocating one -- so an overflow there is fatal. The buffer flag alone does not
-                # mean PUSH: under force_pull the caller owns the input while the kernel compiled
-                # is _p2p, and _cPullOk there declines the tiles and gathers without them. Raising
-                # on that turned a fallback into a crash, which is how a 16-warp PULL with two tile
-                # sets per warp behaves -- 458 KB of tiles against a 320 KB budget.
+                # allocating one -- so an overflow there is fatal. PULL is the opposite: _cPullOk
+                # declines the tiles and gathers without them, so raising on that would turn a
+                # fallback into a crash, which is how a 16-warp PULL with two tile sets per warp
+                # behaves -- 458 KB of tiles against a 320 KB budget.
                 raise ValueError(
                     f"The combine TDM push needs {total} B of LDS "
                     f"(warp_per_block={warp_per_block}, tiles/warp={tiles_per_warp}, "
@@ -987,28 +924,7 @@ class EpDispatchCombineOp:
             # so the reservation stays at the pointer arrays.
         return base
 
-    _launch_traced = set()
-
     def _launch(self, func_name, grid, block, shared_mem, stream, args_ptr):
-        # MORI_EP_TRACE_LAUNCH=1 prints each distinct (symbol, geometry, LDS) once. Which symbol a
-        # config lands on, and how much LDS it asked for, decide which in-kernel transport is
-        # eligible -- the tile paths all carry a runtime budget check and fall back silently when
-        # it fails -- and reading that off the source means tracking arch defaults through three
-        # files. One line of output settles it instead.
-        if os.environ.get("MORI_EP_TRACE_LAUNCH", "").strip().lower() in (
-            "1",
-            "true",
-            "on",
-            "yes",
-        ):
-            key = (func_name, grid[0], block[0], shared_mem)
-            if key not in EpDispatchCombineOp._launch_traced:
-                EpDispatchCombineOp._launch_traced.add(key)
-                print(
-                    f"[EPLAUNCH] {func_name} grid={grid[0]} block={block[0]} "
-                    f"lds={shared_mem}",
-                    flush=True,
-                )
         func = self._get_func(func_name)
         func.launch_struct(grid, block, shared_mem, stream, args_ptr)
 
@@ -1457,52 +1373,17 @@ class EpDispatchCombineOp:
             else int(self.config.use_external_inp_buf)
         )
         is_zero_copy = not actual_use_ext
-        # "PULL + caller-owned input", host route: stage the caller's bytes into the registered
-        # buffer here, on their stream, then run the ordinary zero-copy _p2p kernel untouched.
-        # The stream orders the copy before the launch, so the kernel's existing producer/consumer
-        # barrier remains the only cross-card edge -- exactly the situation true zero copy is in,
-        # which is why this inherits its correctness rather than needing a new argument for it.
-        # Restricted to unquantised intranode combine: no quantizing combine has a _p2p kernel
-        # to fall into on gfx125x any more.
-        force_pull = False
-        if (
-            actual_use_ext
-            and self.config.kernel_type.value
-            == EpDispatchCombineKernelType.IntraNode.value
-            and _normalize_quant_type(self.config.quant_type)
-            == EpDispatchCombineQuantType.None_
-        ):
-            _pm = _comb_pull_mode()
-            if _pm in ("host", "both"):
-                reg = self.get_registered_combine_input_buffer(input.dtype, hidden_dim)
-                reg[: input.size(0)].copy_(input)
-                force_pull = True
-                if _pm == "host":
-                    # From here on this call is indistinguishable from a zero-copy one, which is
-                    # the point: no kernel, no argument and no tile size differs from the path
-                    # that already passes. "both" deliberately leaves the flag set instead, so
-                    # the kernel also stages, and the only live difference is that loop.
-                    use_external_inp_buf = 0
-                    actual_use_ext = 0
-                    is_zero_copy = True
-            elif _pm == "kernel":
-                # The buffer flag stays set -- that is what makes the kernel run its own staging
-                # arm -- while the kernel compiled is the PULL one, so the transport follows the
-                # kernel and not the flag.
-                force_pull = True
         cur_n = (
             self._routing_source_token_count(routing)
             if routing is not None
             else self._get_cur_rank_num_token(self._handle)
         )
-        # The width default follows the TRANSPORT, and this is the first point at which the
-        # transport is settled: force_pull above can turn a caller-owned buffer into a _p2p launch.
-        # Same three conditions the _tr suffix is chosen by at the launch below, and deliberately
-        # not "actual_use_ext" alone -- blockwise and direct_cast own their input too, reach the
-        # gather by other routes, and have no 16-warp measurement behind them.
+        # The width default follows the TRANSPORT. Same three conditions the _nop2p suffix is
+        # chosen by at the launch below, and deliberately not "actual_use_ext" alone -- blockwise
+        # and direct_cast own their input too, reach the gather by other routes, and have no
+        # 16-warp measurement behind them.
         is_push = bool(
             actual_use_ext
-            and not force_pull
             and self.config.kernel_type.value
             == EpDispatchCombineKernelType.IntraNode.value
             and _normalize_quant_type(self.config.quant_type)
@@ -1555,7 +1436,7 @@ class EpDispatchCombineOp:
         block = (self._warp_size * actual_wpb,)
         kt = self.config.kernel_type.value
         quant_type = _normalize_quant_type(self.config.quant_type)
-        shared_mem = self._combine_shared_mem(actual_wpb, force_pull=force_pull)
+        shared_mem = self._combine_shared_mem(actual_wpb)
 
         if quant_type in _BLOCKWISE_COMBINE_QUANT_TYPES:
             label = (
@@ -1705,12 +1586,8 @@ class EpDispatchCombineOp:
                         args_ptr,
                     )
                 else:
-                    # force_pull here means MORI_COMB_PULL=kernel: caller still owns the input
-                    # buffer, but the kernel stages it into combineInp itself and the peers read
-                    # that, so the _p2p symbol is the right one despite the flag.
-                    _tr = "_p2p" if force_pull else "_nop2p"
                     self._launch(
-                        f"EpCombineIntraNodeKernel_{sfx}{_tr}",
+                        f"EpCombineIntraNodeKernel_{sfx}_nop2p",
                         grid,
                         block,
                         shared_mem,
