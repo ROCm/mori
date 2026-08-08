@@ -896,12 +896,60 @@ def _optional_kwargs(**kwargs):
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
+def _fmt_geo(block_num, warp_per_block):
+    """Render a geometry for the banner, which prints before anything has been resolved.
+
+    0 is not a grid, it is the caller declining to pick one, and printing it as a number reads as
+    if the kernel were launched with no blocks. What the library chose instead is only known once
+    a launch has gone through, so it is reported after the run rather than guessed at here.
+    """
+    if block_num > 0 and warp_per_block > 0:
+        return f"{block_num}x{warp_per_block}"
+    return "library default"
+
+
+def _print_resolved_geo(op):
+    """The geometry a run actually used, read back from the launch path that resolved it.
+
+    Recomputing it here would mean restating _resolve_launch_params' inputs -- including the
+    is_push test, which reads use_ext, kernel_type and quant_type together -- and a restatement is
+    what put an unlaunchable 192x32 in the default table to begin with.
+    """
+    d = getattr(op, "_cached_dispatch_launch", None)
+    c = getattr(op, "_cached_combine_launch", None)
+    if d is None and c is None:
+        return
+    parts = []
+    if d is not None:
+        parts.append(f"dispatch {d[0]}x{d[2]}")
+    if c is not None:
+        parts.append(f"combine {c[0]}x{c[2]}")
+    print(f"Resolved launch geometry: {', '.join(parts)}")
+
+
 def _get_default_launch_config(
     world_size,
     max_num_inp_token_per_rank,
     use_external_inp_buf,
 ):
     zero_copy = not use_external_inp_buf
+    # Every number below was tuned on gfx942. gfx125x keeps its geometry in the library instead --
+    # _intranode_{dispatch,combine}_default_launch, keyed on the same arch test the kernel uses to
+    # pick its body -- and 0 is how a caller tells _resolve_launch_params it has no opinion and
+    # reaches them. So this table is not consulted there at all, rather than being consulted and
+    # then corrected in one of its cells.
+    #
+    # It was corrected in one cell, and both halves of that went wrong. The zero-copy cell was given
+    # 192x32, true when written, then dispatch moved to the TDM body that stages one token tile per
+    # warp and 32 warps became a 458,752 B request against a 327,680 B budget -- a default that
+    # cannot launch. The other cell was left alone and still hands gfx1250 a 256x14 combine, which
+    # measures 219.4us / 967.5 GB/s against the library default's 191.1us / 1111.0 GB/s at EP4 4K
+    # bf16 hidden 7168, both check-armed. A per-arch exception inside a per-arch table is the shape
+    # of the mistake; the arch owns its defaults or it does not.
+    from mori.ops.dispatch_combine import _is_gfx125x
+
+    if _is_gfx125x():
+        return LaunchConfig(0, 0, 0, 0)
     if world_size <= 4:
         if max_num_inp_token_per_rank > 128:
             return (
@@ -1010,7 +1058,8 @@ def _bench_dispatch_combine(
         kernel_type=kernel_type_enum,
     )
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
-        mori.shmem.shmem_torch_process_group_init("default")
+        if os.environ.get("MORI_EP_COMM", "").strip().lower() != "cco":
+            mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
         # For fp8_blockwise, plumb the kernel-internal scale_dim into the
         # benchmark so force_scale_active sentinels and report_scale_stats
@@ -1059,7 +1108,8 @@ def _bench_dispatch_combine(
             if rank == 0:
                 print(f"\n{'=' * 60}")
                 print(
-                    f"Benchmarking with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
+                    f"Benchmarking with dispatch {_fmt_geo(dispatch_block_num, dispatch_warp_per_block)}, "
+                    f"combine {_fmt_geo(combine_block_num, combine_warp_per_block)}"
                 )
                 print(f"{'=' * 60}")
             bench_stats = benchmark.run(
@@ -1074,6 +1124,8 @@ def _bench_dispatch_combine(
                     warmup=warmup, iters=iters, graph_replay_iters=graph_replay_iters
                 ),
             )
+            if rank == 0:
+                _print_resolved_geo(op)
             if rank == 0 and bench_stats is not None:
                 _emit_intra_perf(
                     bench_stats,
@@ -1093,7 +1145,8 @@ def _bench_dispatch_combine(
             if rank == 0:
                 print(f"\n{'=' * 60}")
                 print(
-                    f"Stress testing with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
+                    f"Stress testing with dispatch {_fmt_geo(dispatch_block_num, dispatch_warp_per_block)}, "
+                    f"combine {_fmt_geo(combine_block_num, combine_warp_per_block)}"
                 )
                 print(f"{'=' * 60}")
             benchmark.stress(
@@ -1109,7 +1162,8 @@ def _bench_dispatch_combine(
             if rank == 0:
                 print(f"\n{'=' * 60}")
                 print(
-                    f"Profiling with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
+                    f"Profiling with dispatch {_fmt_geo(dispatch_block_num, dispatch_warp_per_block)}, "
+                    f"combine {_fmt_geo(combine_block_num, combine_warp_per_block)}"
                 )
                 print(f"{'=' * 60}")
             benchmark.profile(

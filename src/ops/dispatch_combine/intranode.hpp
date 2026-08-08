@@ -53,6 +53,9 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   int globalWarpNum = gridDim.x * warpNum;
 
   __syncthreads();
+  // Release side, deliberately left alone: the fence at ~396 runs only on block 0's first worldSize
+  // threads, so on paper another block's stores could still be in flight when the peer flag goes
+  // up.
   if (thdId == 0) atomicAdd(args.combineGridBarrier, 1);
 
   if (globalThdId < args.config.worldSize) {
@@ -70,116 +73,113 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 
   uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
   if (thdId < args.config.worldSize) {
+    // Backoff in the cross-device wait: the empty tight spin livelocks the cco/xGMI fabric under
+    // CNT2's timing and never re-observes the peer's flag write -> combine hangs (plain's slower
+    // timing happens to dodge it). s_sleep throttles the poll (matches GridBarrier's spin) and lets
+    // the peer flag become visible.
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
+      __builtin_amdgcn_s_sleep(1);
     }
+    // Acquire here, inside the wait, instead of after a block-wide rendezvous. worldSize <=
+    // warpSize, so these threads are all in wave 0 and the wave does not leave the loop above until
+    // every one of its active lanes has seen its own flag -- which is exactly the condition the
+    // extra __syncthreads used to buy.
+    __threadfence_system();
   }
   __syncthreads();
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                    EpDispatchIntraNodeKernel                                   */
+/*                                 EpDispatchIntraNodeKernel_body                                 */
 /* ---------------------------------------------------------------------------------------------- */
-
 template <typename T, bool EnableStdMoE = false>
 __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
-
   int thdId = threadIdx.x;
-  int thdNum = blockDim.x;
-
   int laneId = threadIdx.x & (warpSize - 1);
   int warpId = thdId / warpSize;
   int warpNum = blockDim.x / warpSize;
-
   int globalWarpId = blockIdx.x * warpNum + warpId;
   int globalWarpNum = gridDim.x * warpNum;
-
   int myPe = config.rank;
   int npes = config.worldSize;
   size_t hiddenDim = config.HiddenDimSz();
+  const int topk = config.numExpertPerToken;
+  const int Npair = args.curRankNumToken * topk;
 
-  IF_ENABLE_PROFILER(
-      INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SEQ(seq, profiler);
-  MORI_TRACE_NEXT(seq, Slot::DispatchSendTokens);
+  constexpr int kMaxNpes = MAX_GPUS_PER_NODE;
+  __shared__ index_t s_N[kMaxNpes];     // block's committed count per destPe
+  __shared__ index_t s_base[kMaxNpes];  // reserved contiguous base slot on destPe
+  __shared__ index_t s_run[kMaxNpes];   // block-local running distribution index
 
-  if (args.tokenIndices && args.inpTokenBuf) {
-    // Phase1: send token
-    // Each warp compute token offset on destinition PE
-    for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
-         i += globalWarpNum) {
-      index_t srcTokId = i / config.numExpertPerToken;
-      index_t destPe;
-      index_t destTokId = 0;
-
-      if (!args.replayMode) {
-        // Cache routing: decide where this (token, top-k) pair goes via
-        // atomicAdd-based slot assignment. Records the routing into dispDestTokIdMap
-        // (and the symmetric local view via dispTokIdToSrcTokIdMemObj on the
-        // destination PE) so a later replay-routing dispatch / combine can reuse
-        // the same layout deterministically.
-        index_t destExpert = args.tokenIndices[i];
-        // Routing sentinel: a negative expert id means "drop this top-k slot".
-        // Skip the dispatch entirely and write the existing combine-side null sentinel
-        // (PE == worldSize) into dispDestTokIdMap so combine treats this slot as nullptr.
-        if (destExpert < 0) {
-          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-          continue;
-        }
-        destPe = destExpert / config.numExpertPerRank;
-        // Out-of-range expert id guard: destPe is warp-uniform here (one
-        // token-expert per warp) and indexes GetAs(destPe) / destPeTokenCounter
-        // below. An out-of-range id (e.g. an EPLB physical id
-        // >= worldSize*numExpertPerRank) would index those out of bounds (the
-        // assert at dispatch is stripped under NDEBUG) -> HSA page fault. Drop it
-        // via the same overflow sentinel the dedup path uses; the whole warp
-        // skips coherently.
-        if (destPe < 0 || destPe >= config.worldSize) {
-          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-          continue;
-        }
-
-        // Deduplicate
-        assert(config.numExpertPerToken < warpSize);
-        int condition = 0;
-        if (laneId < (i % config.numExpertPerToken)) {
-          index_t otherExpert = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-          condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
-        }
-        if (__any(condition)) {
-          // Indicate that this token is already sent to the destination PE by setting an overflow
-          // token index
-          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-          continue;
-        }
-
-        if (laneId == 0) {
-          // decide token id in dest pe
-          destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-          assert(destTokId < config.MaxNumTokensToRecv() &&
-                 "Total recv token overflow: increase maxTotalRecvTokens");
-          atomicAdd(args.destPeTokenCounter + destPe, 1);
-          // In dispDestTokIdMap, record the destination slot for this token-expert pair (flat index
-          // into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE, record
-          // which global source token occupies this slot (for combine-phase routing)
-          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-              FlatTokenIndex(config, myPe, srcTokId);
-        }
-        destTokId = __shfl(destTokId, 0);
-      } else {
-        // Replay routing: caller already supplied a populated dispDestTokIdMap
-        // from a matching cache-routing dispatch. Recover (destPe, destTokId) directly
-        // and skip CAS / dedup / cross-rank src-id writes. The sentinel slot
-        // (destPe == worldSize) means the original cache-routing dispatch dropped or deduped
-        // this top-k slot, so we skip transmitting payload as well.
-        index_t flat = args.dispDestTokIdMap[i];
-        destPe = PeFromFlatTokenIndex(config, flat);
-        if (destPe >= config.worldSize) continue;
-        destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
+  // ---- Phase 1: block-local count committed tokens per destPe (+ drop sentinels) ----
+  for (int p = thdId; p < npes; p += blockDim.x) {
+    s_N[p] = 0;
+    s_run[p] = 0;
+  }
+  __syncthreads();
+  if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
+    for (int i = globalWarpId; i < Npair; i += globalWarpNum) {
+      index_t destExpert = args.tokenIndices[i];
+      if (destExpert < 0) {
+        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+        continue;
       }
+      index_t destPe = destExpert / config.numExpertPerRank;
+      if (destPe < 0 || destPe >= config.worldSize) {
+        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+        continue;
+      }
+      index_t srcTokId = i / topk;
+      int condition = 0;
+      if (laneId < (i % topk)) {
+        index_t otherExpert = args.tokenIndices[srcTokId * topk + laneId];
+        condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
+      }
+      if (__any(condition)) {
+        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+        continue;
+      }
+      if (laneId == 0) atomicAdd(&s_N[destPe], 1);
+    }
+  }
+  __syncthreads();
 
-      // Write weights and indices
+  // ---- Phase 2: reserve N contiguous slots per destPe with ONE remote atomic each ----
+  for (int p = thdId; p < npes; p += blockDim.x) {
+    if (s_N[p] > 0) {
+      s_base[p] = __hip_atomic_fetch_add(args.dispTokOffsetMemObj->template GetAs<index_t*>(p),
+                                         s_N[p], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      atomicAdd(args.destPeTokenCounter + p, s_N[p]);
+    }
+  }
+  __syncthreads();
+
+  // ---- Phase 3: distribute LOCAL slots + copy metadata and payload, per (token, peer) pair ----
+  if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
+    for (int i = globalWarpId; i < Npair; i += globalWarpNum) {
+      index_t destExpert = args.tokenIndices[i];
+      if (destExpert < 0) continue;
+      index_t destPe = destExpert / config.numExpertPerRank;
+      if (destPe < 0 || destPe >= config.worldSize) continue;
+      index_t srcTokId = i / topk;
+      int condition = 0;
+      if (laneId < (i % topk)) {
+        index_t otherExpert = args.tokenIndices[srcTokId * topk + laneId];
+        condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
+      }
+      if (__any(condition)) continue;
+
+      index_t destTokId = 0;
+      if (laneId == 0) {
+        index_t j = atomicAdd(&s_run[destPe], 1);  // fast LDS slot (was remote)
+        destTokId = s_base[destPe] + j;
+        args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
+        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+            FlatTokenIndex(config, myPe, srcTokId);
+      }
+      destTokId = __shfl(destTokId, 0);
+
       if (laneId < config.numExpertPerToken) {
         if (args.weightsBuf) {
           args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
@@ -190,8 +190,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
             destPe)[destTokId * config.numExpertPerToken + laneId] =
             args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
       }
-
-      // Write scales
       if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
         size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
         size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
@@ -199,64 +197,45 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
             args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
             args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
       }
-
-      size_t srcTokOffset = srcTokId * hiddenDim;
-      size_t destTokOffset = destTokId * hiddenDim;
-
-      core::WarpCopy(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-                     args.inpTokenBuf + srcTokOffset, hiddenDim);
+      size_t destTokOffset = (size_t)destTokId * hiddenDim;
+      core::WarpCopy<T, 8>(
+          args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
+          args.inpTokenBuf + (size_t)srcTokId * hiddenDim, hiddenDim);
     }
   }
   __syncthreads();
+  // ---- Completion: all blocks arrive, then per-peer release-signal ----------------------------
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
-
-  // Send token num & token to expert mapping to other ranks
-  MORI_TRACE_NEXT(seq, Slot::DispatchNotifyPeer);
+  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      // Wait until all tokens are sent
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
       __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-
-      // Add 1 so that when token number == 0, receiver side still know the signal is sent
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
+      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
   }
-
-  // Phase 2: recv token
-  // Each warp wait until sender finished by waiting token number signal
-  MORI_TRACE_NEXT(seq, Slot::DispatchWaitPeerToken);
-  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       index_t* signal = recvTokenNums + destPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-
-      // reset local counter
       args.destPeTokenCounter[destPe] = 0;
     }
-
-    // reset counter
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
     }
   }
-
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   if constexpr (EnableStdMoE) {
     InvokeConvertDispatchOutput<T>(args, myPe);
   }
 #endif
-}
-
-template <typename T, bool EnableStdMoE = false>
-__global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
-  EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -357,6 +336,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         args.dispTokIdToSrcTokIdLocal != nullptr
             ? args.dispTokIdToSrcTokIdLocal
             : args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe);
+    const decltype(totalRecvTokenNum) _cPushEnd = totalRecvTokenNum;
 #ifdef ENABLE_PROFILER
     for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
       index_t destTokId = localSrcMap[tokenIdx];
@@ -396,7 +376,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
     }
 #else
-    for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
+    auto _cSendTok = [&](const int tokenIdx) {
       index_t destTokId = localSrcMap[tokenIdx];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
       index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
@@ -423,10 +403,76 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                          config.numExpertPerToken);
         }
       }
+    };
+
+    constexpr int kRRTile = 512;
+    __shared__ int s_rrIdx[kRRTile];
+    __shared__ int s_rrCnt[MAX_GPUS_PER_NODE];
+    __shared__ int s_rrOff[MAX_GPUS_PER_NODE];
+    __shared__ int s_rrFill[MAX_GPUS_PER_NODE];
+    __shared__ int s_rrTake[MAX_GPUS_PER_NODE];
+    const int _rrEnd = (int)_cPushEnd;
+    const int _rrMine =
+        (_rrEnd > (int)blockIdx.x) ? ((_rrEnd - 1 - (int)blockIdx.x) / (int)gridDim.x + 1) : 0;
+    // Tiles interleave the block's subset rather than cutting consecutive chunks from it, so that
+    // every tile still spans the whole recv space once the share outgrows kRRTile. Recv space is
+    // clustered by source rank, which is exactly the destination peer here, so a tile covering only
+    // part of it holds no token at all for some peers and drives 2-3 links instead of 4. The share
+    // is ~0.0565 * maxtok at EP4 / 64 blocks, so a consecutive cut first bites between maxtok 8192
+    // and 10240; at 16384 it cost the push phase 822.0us against 497.7us for this form. _rrNT is 1
+    // whenever the share fits one tile, and this then reduces to the plain strided draw.
+    const int _rrNT = (_rrMine + kRRTile - 1) / kRRTile;
+    for (int _rrT = 0; _rrT < _rrNT; ++_rrT) {
+      const int _rrTileN = (_rrMine - _rrT + _rrNT - 1) / _rrNT;
+      for (int p = thdId; p < npes; p += blockDim.x) {
+        s_rrCnt[p] = 0;
+        s_rrFill[p] = 0;
+        s_rrTake[p] = 0;
+      }
+      __syncthreads();
+      for (int i = thdId; i < _rrTileN; i += blockDim.x) {
+        const int t = (int)blockIdx.x + (_rrT + i * _rrNT) * (int)gridDim.x;
+        atomicAdd(&s_rrCnt[(int)PeFromFlatTokenIndex(config, localSrcMap[t])], 1);
+      }
+      __syncthreads();
+      if (thdId == 0) {
+        int acc = 0;
+        for (int p = 0; p < npes; ++p) {
+          s_rrOff[p] = acc;
+          acc += s_rrCnt[p];
+        }
+      }
+      __syncthreads();
+      for (int i = thdId; i < _rrTileN; i += blockDim.x) {
+        const int t = (int)blockIdx.x + (_rrT + i * _rrNT) * (int)gridDim.x;
+        const int p = (int)PeFromFlatTokenIndex(config, localSrcMap[t]);
+        s_rrIdx[s_rrOff[p] + atomicAdd(&s_rrFill[p], 1)] = t;
+      }
+      __syncthreads();
+      for (int _rrIter = 0;; ++_rrIter) {
+        int _rrGot = -1;
+        if (laneId == 0) {
+          for (int s = 0; s < npes; ++s) {
+            const int p = (warpId + _rrIter + s) % npes;
+            const int e = atomicAdd(&s_rrTake[p], 1);
+            if (e < s_rrCnt[p]) {
+              _rrGot = s_rrOff[p] + e;
+              break;
+            }
+          }
+        }
+        _rrGot = __shfl(_rrGot, 0);
+        if (_rrGot < 0) break;
+        _cSendTok(s_rrIdx[_rrGot]);
+      }
+      __syncthreads();  // s_rrIdx is reused by the next tile
     }
 #endif
   }
 
+  if constexpr (UseP2PRead) {
+    if (args.config.useExternalInpBuffer) __threadfence_system();
+  }
   // Make sure copy on all GPUs are finished
   MORI_TRACE_NEXT(seq, Slot::CombineBarrier);
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
@@ -581,7 +627,9 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                                               validAccumCount, laneId, hiddenDimSize);
     } else {
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
-      core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
+      // 16B vec load + load-first/unroll gather: keep AccumNum*Unroll remote peer reads in flight
+      // to hide the interconnect latency.
+      core::WarpAccumLF<T, 16>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
     }
 
     if constexpr (UseWeights) {
@@ -594,14 +642,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
     }
   }
-}
-
-template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
-          bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false>
-__global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
-  EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast, UseFp8BlockwiseQuant,
-                                UseWeights, Vec8Top8BlockElems, Vec8AccumNum, UseFp4Combine>(args);
 }
 
 }  // namespace moe

@@ -785,6 +785,120 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
 #undef WARP_ACCUM_CASE
 }
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                        Load-first + unroll combine gather (v2-style)                           */
+/* ---------------------------------------------------------------------------------------------- */
+// Issues ALL AccumNum*Unroll vector loads for a warp's Unroll consecutive
+// vec-chunks BEFORE any accumulate, so up to AccumNum*Unroll remote (xGMI/CCO
+// peer) reads are in flight at once — hiding the high peer-read latency that
+// caps the intra-node combine gather. Mirrors the v2/FlyDSL vec gather schedule.
+// The default WarpAccumImpl only keeps AccumNum reads in flight (load-first over
+// experts, but one vec-chunk per iter); this adds the Unroll dimension.
+template <typename T, int VecBytes, int AccumNum, int Unroll>
+__forceinline__ __device__ void WarpAccumLFImpl(T* __restrict__ dest, T* const* __restrict__ srcs,
+                                                const float* __restrict__ srcScales, size_t& offset,
+                                                size_t nelems) {
+  constexpr int vecSize = VecBytes / sizeof(T);
+  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
+
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const size_t laneOffset = laneId * vecSize;
+  const int elemsPerWarp = Unroll * warpSize * vecSize;
+  const size_t numIters = (nelems - offset) / elemsPerWarp;
+
+  float scales[AccumNum];
+  const T* csrcs[AccumNum];
+#pragma unroll AccumNum
+  for (int i = 0; i < AccumNum; ++i) {
+    scales[i] = (srcScales == nullptr) ? 1.0f : srcScales[i];
+    csrcs[i] = srcs[i];
+  }
+
+  for (size_t iter = 0; iter < numIters; ++iter) {
+    DataType vals[Unroll][AccumNum];
+    // Load-first: issue every load before touching the accumulators.
+#pragma unroll Unroll
+    for (int u = 0; u < Unroll; ++u) {
+#pragma unroll AccumNum
+      for (int i = 0; i < AccumNum; ++i) {
+        if (csrcs[i] != nullptr)
+          vals[u][i] = load<VecBytes>(csrcs[i] + offset + laneOffset + u * warpSize * vecSize);
+      }
+    }
+
+    AccumFp32Type acc[Unroll][vecSize];
+#pragma unroll Unroll
+    for (int u = 0; u < Unroll; ++u) {
+#pragma unroll vecSize
+      for (int j = 0; j < vecSize; ++j) acc[u][j] = AccumFp32Type{0};
+    }
+#pragma unroll Unroll
+    for (int u = 0; u < Unroll; ++u) {
+#pragma unroll AccumNum
+      for (int i = 0; i < AccumNum; ++i) {
+        if (csrcs[i] == nullptr) continue;
+#pragma unroll vecSize
+        for (int j = 0; j < vecSize; ++j)
+          acc[u][j] += AccumFp32Type(reinterpret_cast<const T*>(&vals[u][i])[j]) * scales[i];
+      }
+    }
+
+    union {
+      DataType outVec[Unroll];
+      T outVal[Unroll][vecSize];
+    };
+#pragma unroll Unroll
+    for (int u = 0; u < Unroll; ++u) {
+#pragma unroll vecSize
+      for (int j = 0; j < vecSize; ++j) outVal[u][j] = T(acc[u][j]);
+      store<VecBytes>(dest + offset + laneOffset + u * warpSize * vecSize, outVec[u]);
+    }
+    offset += elemsPerWarp;
+  }
+}
+
+template <typename T, int VecBytes>
+__forceinline__ __device__ void WarpAccumLF(T* __restrict__ dest, T* const* __restrict__ srcs,
+                                            const float* __restrict__ srcScales, size_t accumNum,
+                                            size_t nelems) {
+  static_assert((VecBytes <= 16) && (VecBytes >= 4) && IsPowerOf2(VecBytes));
+  size_t offset = 0;
+#define WARP_ACCUM_LF_CASE(AccumNum)                                                         \
+  case AccumNum:                                                                             \
+    WarpAccumLFImpl<T, VecBytes, AccumNum, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, offset, \
+                                                              nelems);                       \
+    break;
+  switch (accumNum) {
+    WARP_ACCUM_LF_CASE(1)
+    WARP_ACCUM_LF_CASE(2)
+    WARP_ACCUM_LF_CASE(4)
+    WARP_ACCUM_LF_CASE(6)
+    WARP_ACCUM_LF_CASE(8)
+    WARP_ACCUM_LF_CASE(10)
+    default:
+      WarpAccumDynamic<T, VecBytes>(dest, srcs, srcScales, accumNum, nelems);
+      return;
+  }
+#undef WARP_ACCUM_LF_CASE
+
+  // Scalar remainder for the tail that doesn't fill Unroll*warpSize*vecSize.
+  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
+  const int laneId = threadIdx.x & (warpSize - 1);
+  offset += laneId;
+  while (offset < nelems) {
+    AccumFp32Type accumValFp32 = AccumFp32Type{0};
+    for (int i = 0; i < static_cast<int>(accumNum); ++i) {
+      const T* srcPtr = srcs[i];
+      if (srcPtr == nullptr) continue;
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+      accumValFp32 += AccumFp32Type(srcPtr[offset]) * srcScale;
+    }
+    dest[offset] = T(accumValFp32);
+    offset += warpSize;
+  }
+}
+
 #if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
 #if defined(MORI_FP8_TYPE_OCP_ENABLED)
 static constexpr float kCombineInternalFp8MaxFinite = 448.0f;
@@ -808,6 +922,20 @@ template <int Width>
 __device__ __forceinline__ uint32_t SubwarpReduceMaxU32(uint32_t val) {
   for (int delta = (Width >> 1); delta > 0; delta >>= 1) {
     const int other = __shfl_down(static_cast<int>(val), delta, Width);
+    const int cur = static_cast<int>(val);
+    val = static_cast<uint32_t>((cur > other) ? cur : other);
+  }
+  return val;
+}
+
+// Same reduction, butterfly instead of tree, so EVERY lane of the subwarp ends with the max rather
+// than only lane 0. Same instruction count; what it saves is the caller's broadcast afterwards, and
+// then the scale can be derived on every lane instead of on lane 0 and broadcast again. Two
+// cross-lane ops per scale block, and the blockwise quantise pass runs 28 of those per token.
+template <int Width>
+__device__ __forceinline__ uint32_t SubwarpAllReduceMaxU32(uint32_t val) {
+  for (int delta = (Width >> 1); delta > 0; delta >>= 1) {
+    const int other = __shfl_xor(static_cast<int>(val), delta, Width);
     const int cur = static_cast<int>(val);
     val = static_cast<uint32_t>((cur > other) ? cur : other);
   }
@@ -1056,6 +1184,14 @@ struct Bf16Vec<16> {
   }
 };
 
+// How many scale blocks this warp keeps in flight in the exact-fit path below. 1 restores the old
+// one-block-at-a-time chain, which MEASURED at 64x8 EP4 costs 718.8us against 410.5 at 7 (the
+// gather's 630.0us subtracted off to leave this pass alone); 4 reads 444.9. 7 is where it flattens,
+// and 56 scale blocks over 2 subwarps makes it an exact fit with no tail.
+#ifndef MORI_COMB_QSTGU
+#define MORI_COMB_QSTGU 7
+#endif
+
 template <int SubwarpSize, int InVecBytes, int MaxCacheIters, typename Fp8T>
 __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
     Fp8T* __restrict__ dstToken, float* __restrict__ dstScales,
@@ -1079,8 +1215,68 @@ __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
   const int maxIters = (blockElems + kStrideElems - 1) / kStrideElems;
 
   bool subwarpScaled = false;
+  // Block 0's scale, kept on lane 0 by the exact-fit path so the sign flip at the end of the
+  // function does not have to read it back. dstScales lives in hipDeviceMallocUncached memory
+  // (dispatch_combine.cpp), so that read-back is a full memory round trip per token for one float.
+  float sb0Scale = 0.0f;
+  bool sb0Cached = false;
 
-  for (int sbBase = 0; sbBase < scaleDim; sbBase += kSubwarpsPerWarp) {
+  int sbStart = 0;
+  // EXACT-FIT PATH: one subwarp covers one scale block in one vector, and every block is full.
+  // True for the shipping shape -- hidden 7168, scaleDim 56, blockElems 128 == SubwarpSize(16) *
+  // kVecElems(8) -- and the general loop below still handles everything else.
+  //
+  // The general loop is one dependent chain per block: load 16 B, subwarp-max it, broadcast the
+  // scale, convert, store, and only then issue the next block's load. Nothing covers the load
+  // latency. Occupancy cannot cover it either -- the combine kernel reserves 116 KB of LDS for the
+  // gather tiles, so a CU holds one 8-warp block and a SIMD holds two waves. MEASURED at 64x8 EP4
+  // fp8_blockwise (full 1409.5us, MORI_COMB_NOQUANT 631.1us, so this pass alone is 778us): 14813
+  // tokens over 512 warps is 29 tokens each, 28 blocks per token, 812 chained iterations, which is
+  // ~1900 cycles apiece -- a load latency, not work.
+  //
+  // So issue MORI_COMB_QSTGU blocks' loads before reducing any of them. The reduce, the divide and
+  // the store are unchanged and still happen per block; only the order changes, so the bytes and
+  // the arithmetic are identical to the loop below and this is not an approximation of it.
+  // MEASURED, check armed, this pass isolated by subtracting the 630.0us gather: depth 1 718.8us,
+  // depth 4 444.9, depth 7 410.5. It flattens at 7, which is also the exact fit -- 56 scale blocks
+  // over 2 subwarps is 28 iterations, and 28/7 leaves no tail for the general loop below.
+  if (maxIters == 1 && blockElems == kStrideElems && blockElems * scaleDim == hiddenDim) {
+    constexpr int kU = (MORI_COMB_QSTGU) < 1 ? 1 : (MORI_COMB_QSTGU);
+    constexpr int kStep = kSubwarpsPerWarp * kU;
+    for (; sbStart + kStep <= scaleDim; sbStart += kStep) {
+      typename Bf16Vec<InVecBytes>::LoadT cached[kU];
+      int bases[kU];
+#pragma unroll
+      for (int u = 0; u < kU; ++u) {
+        bases[u] =
+            (sbStart + u * kSubwarpsPerWarp + subWarpId) * blockElems + subLaneId * kVecElems;
+        cached[u] = load<InVecBytes>(srcToken + bases[u]);
+      }
+#pragma unroll
+      for (int u = 0; u < kU; ++u) {
+        const int sb = sbStart + u * kSubwarpsPerWarp + subWarpId;
+        // Butterfly, so the two broadcasts the tree reduction needs -- one for the max, one for the
+        // scale computed on lane 0 -- both go away and every lane derives the scale itself.
+        const uint32_t maxBits =
+            SubwarpAllReduceMaxU32<SubwarpSize>(Bf16Vec<InVecBytes>::MaxAbsBits(cached[u]));
+        const float maxAbs = Bf16BitsToF32(static_cast<uint16_t>(maxBits));
+        const bool sbScaled = (maxAbs > fp8Max);
+        subwarpScaled = subwarpScaled || sbScaled;
+        const float invScale = sbScaled ? (fp8Max / maxAbs) : 1.0f;
+        const float s = sbScaled ? (maxAbs * invFp8Max) : 1.0f;
+        if (subLaneId == 0) {
+          dstScales[sb] = s;
+          if (sb == 0) {
+            sb0Scale = s;
+            sb0Cached = true;
+          }
+        }
+        Bf16Vec<InVecBytes>::template QuantizeStore<Fp8T>(dstBytes, bases[u], cached[u], invScale);
+      }
+    }
+  }
+
+  for (int sbBase = sbStart; sbBase < scaleDim; sbBase += kSubwarpsPerWarp) {
     const int sb = sbBase + subWarpId;
     if (sb >= scaleDim) continue;
 
@@ -1213,7 +1409,7 @@ __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
   }
 
   const int anyScaled = __any(static_cast<int>(subwarpScaled));
-  if (laneId == 0 && anyScaled) dstScales[0] = -dstScales[0];
+  if (laneId == 0 && anyScaled) dstScales[0] = -(sb0Cached ? sb0Scale : dstScales[0]);
 }
 
 }  // namespace detail
@@ -1257,6 +1453,42 @@ __device__ __forceinline__ void WarpQuantizeToFp8Blockwise(Fp8T* __restrict__ ds
       }
       if (blockAligned2 && srcAligned4 && ((dstPtr & 0x1) == 0)) {
         detail::WarpQuantizeBf16ToFp8BlockwiseVec<32, 4, 4, Fp8T>(
+            dstToken, dstScales, reinterpret_cast<const hip_bfloat16*>(srcToken), hiddenDim,
+            scaleDim);
+        return;
+      }
+    }
+
+    // Wave32 (gfx125x) analogue of the block above, and it exists because that block is dead there
+    // while the generic tail below is actively bad: it picks SubwarpSize == warpSize == 32, so
+    // kStrideElems (32 lanes x 8 elems = 256) overshoots a 128-element block and lanes 16-31 find
+    // hasVec false and idle, AND kSubwarpsPerWarp collapses to 1 so the outer loop runs scaleDim
+    // times instead of scaleDim/2. For the shipping shape (hidden 7168, scaleDim 56, blockElems
+    // 128) that is 56 iterations at 16/32 lanes where this branch gives 28 at 32/32. Same intent as
+    // the wave64 block -- size the subwarp to one block so a warp carries several blocks at once --
+    // only the arithmetic differs. Guarded on the subwarp actually being covered, so a block too
+    // short to fill 16 lanes keeps the old path rather than idling even more of them.
+    //
+    // MEASURED, fp8_blockwise EP4 bf16 hidden 7168 4096 tokens, combine 64x8 ZC=0, check armed
+    // (rc=0 both): the push phase priced by MORI_COMB_PUSHONLY minus MORI_COMB_PUSHONLY+NOPUSH goes
+    // 4902.1us -> 2472.6us, a factor 1.98 against the 2.0 the iteration/lane counts predict, and
+    // the whole combine goes 6037.6us -> 3679.2us. Geometry untouched -- this buys nothing extra
+    // from the machine, it just stops half the wave idling.
+    if ((warpSize == 32) && (scaleDim > 1)) {
+      if (blockAligned8 && srcAligned8 && dstAligned8 && (blockElems >= 16 * 8)) {
+        detail::WarpQuantizeBf16ToFp8BlockwiseVec<16, 16, 4, Fp8T>(
+            dstToken, dstScales, reinterpret_cast<const hip_bfloat16*>(srcToken), hiddenDim,
+            scaleDim);
+        return;
+      }
+      if (blockAligned4 && srcAligned8 && dstAligned4 && (blockElems >= 16 * 4)) {
+        detail::WarpQuantizeBf16ToFp8BlockwiseVec<16, 8, 4, Fp8T>(
+            dstToken, dstScales, reinterpret_cast<const hip_bfloat16*>(srcToken), hiddenDim,
+            scaleDim);
+        return;
+      }
+      if (blockAligned2 && srcAligned4 && ((dstPtr & 0x1) == 0) && (blockElems >= 16 * 2)) {
+        detail::WarpQuantizeBf16ToFp8BlockwiseVec<16, 4, 4, Fp8T>(
             dstToken, dstScales, reinterpret_cast<const hip_bfloat16*>(srcToken), hiddenDim,
             scaleDim);
         return;
@@ -2246,7 +2478,7 @@ __device__ __forceinline__ void WarpQuantizeToFp4Blockwise(PackedT* __restrict__
                                                        scaleDim);
     return;
   }
-  // Fast path: 64-lane warp, blockElems == 256 == 8 subwarps * 32 elems (mirrors the fp8bwq
+  // Fast path: 64-lane warp, blockElems == 256 == 8 subwarps * 32 elems (mirrors the fp8_blockwise
   // block256 vec8 variant so block256 configs are not left on the scalar path).
   if (warpSize == 64 && blockElems == 256 && (hiddenDim % 256) == 0 &&
       std::is_same_v<InT, hip_bfloat16>) {

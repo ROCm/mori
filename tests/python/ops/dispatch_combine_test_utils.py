@@ -346,9 +346,27 @@ def assert_worker_results(manager, world_size):
         rank, result = manager.result_queue.get()
         results.append((rank, result))
 
-    for _, result in sorted(results, key=lambda item: item[0]):
-        if result is not None:
-            pytest.assume(False, result)
+    failures = [
+        (rank, result)
+        for rank, result in sorted(results, key=lambda item: item[0])
+        if result is not None
+    ]
+    if not failures:
+        return
+
+    # pytest.assume needs pytest-assume, which requirements-build.txt asks for but a test
+    # environment can still be missing. Without this fallback its absence raises AttributeError
+    # from inside the reporting path, and the worker's message -- the only description of what
+    # actually failed -- is replaced by a complaint about the reporter. Reported once with every
+    # rank's message, so a failure that hits some ranks and not others is still legible.
+    assume = getattr(pytest, "assume", None)
+    if assume is None:
+        report = "\n".join(f"[rank {rank}] {result}" for rank, result in failures)
+        pytest.fail(
+            f"{len(failures)} of {world_size} ranks failed:\n{report}", pytrace=False
+        )
+    for _, result in failures:
+        assume(False, result)
 
 
 class EpDispatchCombineTestCase:
