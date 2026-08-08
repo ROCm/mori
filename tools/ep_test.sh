@@ -23,6 +23,14 @@
 # 113us there against 231us by deletion) and the TIMING build is itself ~2x slower overall. Price
 # phases by deleting them from a noTIMING build and diffing, never by reading the buckets.
 #
+# ⚠ GATES REACH NOTHING IN THIS TREE. jit/core.py:_tunable_defines() returns [] -- the MORI_COMB_* /
+# MORI_DISP_* env-to--D route was removed when the kernels took their transport configuration into
+# the arch macros, so `SPECS="a=; b=MORI_COMB_NOPUSH=1"` now compiles ONE kernel and prints two rows
+# of the same number. That reads as "the gate is worth nothing" when it means "the gate is not
+# there". A gate-based A/B needs the -D put back in _tunable_defines() first, which is also what
+# keys the build cache, so it cannot be compiled in without being in the key. The SPECS machinery is
+# kept because that is the one place it has to go back.
+#
 # Optional overrides:
 #   SPECS="tag=GATES; tag2=GATES2"   one table per spec; MORI_BENCH_SKIPCHECK=1 unless tag ends in '!'
 #   tag ending in '!'                run this spec WITH the correctness check (rc=0 is the pass).
@@ -85,13 +93,13 @@ WS="${WS:-4}"           # peer count; 2 is the case where round-robin has the le
 # and the knob are gone (bed30dcf). ZC=0 or ZC=1 alone still works and leaves the other column empty.
 ZCS="${ZCS:-${ZC:-0 1}}"
 QT="${QT:-none}"        # none / fp8_blockwise / fp8_direct_cast; blockwise only pairs with ZC=0
-# BARSLEEP is deliberately NOT set here. It used to default to 127 in this script, which silently
-# overrode the library's own default of 15 (jit/core.py) and cost 2.2us on every PULL reading:
-# 127 was tuned on the PUSH path where the barrier is ~58us, but QUAD PULL waits only 7.6us, so the
-# backoff oversleeps. MEASURED 64x8 ZC=1 bf16 EP4, check armed: nothing set 169.4us / 1195 GB/s,
-# RUNRR alone 168.9 / 1199, RUNRR+BARSLEEP=127 171.1 / 1183. Passing it explicitly here made every
-# geometry in this script read ~2us slow and produced a phantom "regression" against the recorded
-# 168.9 / 1199 baseline. Set it per-spec if a run is actually studying the barrier.
+# BARSLEEP is deliberately NOT set here, and as of the cleanup it could not be set from here anyway:
+# it is now the compile-time `#define MORI_COMB_BARSLEEP 15` at intranode_1250x.hpp:58. This script
+# used to pass 127, which cost 2.2us on every PULL reading -- 127 was tuned on the PUSH path where
+# the barrier is ~58us, but QUAD PULL waits only 7.6us, so the backoff oversleeps. MEASURED 64x8
+# ZC=1 bf16 EP4, check armed: nothing set 169.4us / 1195 GB/s, RUNRR alone 168.9 / 1199,
+# RUNRR+BARSLEEP=127 171.1 / 1183 -- a phantom "regression" against the recorded 168.9 / 1199.
+# Studying the barrier now means editing that define and rebuilding, not setting a variable.
 # BASE is empty on purpose. It used to carry MORI_COMB_RUNRR=1, which was worth 22% on PUSH and so
 # looked mandatory; the push loop now always uses that ordering (the queued variant, measured better
 # at both EP2 and EP4), so there is nothing left to pass. Anything set here applies to every spec.
