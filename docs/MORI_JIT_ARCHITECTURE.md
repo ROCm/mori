@@ -160,7 +160,7 @@ Python dispatch_combine.py
   │     └── C++: new EpDispatchCombineArgsRaw(GetArgsRaw(handle, ...))
   │
   ├── sfx = _DTYPE_SUFFIX[input.dtype]                   # "bf16", "f32", ...
-  ├── kernel_name = f"EpDispatchIntraNodeKernel_{sfx}"  # Python selects
+  ├── kernel_name = f"EpDispatchIntraNodeKernel_{sfx}"    # Python selects
   ├── grid  = (block_num,)                                # Python computes
   ├── block = (WARP_SIZE * warp_per_block,)
   ├── shared_mem = dispatch_shared_mem(warp_per_block)
