@@ -822,12 +822,6 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   accessDesc.location.type = hipMemLocationTypeDevice;
   accessDesc.location.id = comm->hipDev;
   accessDesc.flags = hipMemAccessFlagsProtReadWrite;
-  {
-    int _curDev = -1;
-    (void)hipGetDevice(&_curDev);
-    MORI_SHMEM_ERROR("ccoMemAlloc DIAG: hipDev={} curDev={} localVa={} alignedSize={} handleType={}",
-                     comm->hipDev, _curDev, localVa, alignedSize, comm->handleType);
-  }
   for (int retry = 0; retry < 5; retry++) {
     {
       vmmProcessLock vmmLock;
