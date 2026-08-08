@@ -412,8 +412,16 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
     const int _rrEnd = (int)_cPushEnd;
     const int _rrMine =
         (_rrEnd > (int)blockIdx.x) ? ((_rrEnd - 1 - (int)blockIdx.x) / (int)gridDim.x + 1) : 0;
-    for (int _rrK0 = 0; _rrK0 < _rrMine; _rrK0 += kRRTile) {
-      const int _rrTileN = ((_rrMine - _rrK0) < kRRTile) ? (_rrMine - _rrK0) : kRRTile;
+    // Tiles interleave the block's subset rather than cutting consecutive chunks from it, so that
+    // every tile still spans the whole recv space once the share outgrows kRRTile. Recv space is
+    // clustered by source rank, which is exactly the destination peer here, so a tile covering only
+    // part of it holds no token at all for some peers and drives 2-3 links instead of 4. The share
+    // is ~0.0565 * maxtok at EP4 / 64 blocks, so a consecutive cut first bites between maxtok 8192
+    // and 10240; at 16384 it cost the push phase 822.0us against 497.7us for this form. _rrNT is 1
+    // whenever the share fits one tile, and this then reduces to the plain strided draw.
+    const int _rrNT = (_rrMine + kRRTile - 1) / kRRTile;
+    for (int _rrT = 0; _rrT < _rrNT; ++_rrT) {
+      const int _rrTileN = (_rrMine - _rrT + _rrNT - 1) / _rrNT;
       for (int p = thdId; p < npes; p += blockDim.x) {
         s_rrCnt[p] = 0;
         s_rrFill[p] = 0;
@@ -421,7 +429,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
       __syncthreads();
       for (int i = thdId; i < _rrTileN; i += blockDim.x) {
-        const int t = (int)blockIdx.x + (_rrK0 + i) * (int)gridDim.x;
+        const int t = (int)blockIdx.x + (_rrT + i * _rrNT) * (int)gridDim.x;
         atomicAdd(&s_rrCnt[(int)PeFromFlatTokenIndex(config, localSrcMap[t])], 1);
       }
       __syncthreads();
@@ -434,7 +442,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
       __syncthreads();
       for (int i = thdId; i < _rrTileN; i += blockDim.x) {
-        const int t = (int)blockIdx.x + (_rrK0 + i) * (int)gridDim.x;
+        const int t = (int)blockIdx.x + (_rrT + i * _rrNT) * (int)gridDim.x;
         const int p = (int)PeFromFlatTokenIndex(config, localSrcMap[t]);
         s_rrIdx[s_rrOff[p] + atomicAdd(&s_rrFill[p], 1)] = t;
       }
